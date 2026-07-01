@@ -1,6 +1,6 @@
 (** Pre-typecheck rewrite: subscript-read syntax → bounds-checked call.
 
-    Runs AFTER parse (and after [Interp_parser.transform_program])
+    Runs AFTER parse and string interpolation lowering
     and BEFORE [Typecheck]. Rewrites:
 
     - [x[i]]              → [checked_get(x, i)]
@@ -138,6 +138,6 @@ let rec transform_decl (decl : decl) : decl =
   | DType _ | DRecord _ | DImport _ | DTypeAlias _ -> decl
 
 (** Transform a full program. Must be called {b after}
-    [Interp_parser.transform_program] and {b before} [Typecheck]. *)
+    string interpolation lowering and {b before} [Typecheck]. *)
 let transform_program (program : program) : program =
   List.map transform_decl program

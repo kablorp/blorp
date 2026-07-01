@@ -51,6 +51,25 @@ val typecheck_only_typed :
     validated typed program, so missing expression types and unfinalized
     inference metavariables are rejected at the typecheck boundary. *)
 
+val typecheck_only_parsed :
+  filename:string ->
+  program:Ast.program ->
+  ?debug:bool ->
+  unit ->
+  (Ast.program, Ast.compiler_error list) result
+(** Load modules and type-check a program that has already passed through
+    parser finalization. This is used by the Blorp-owned CLI/frontend bridge
+    after OCaml restores comments, parses interpolations, and hoists nested
+    declarations. Prefer [typecheck_only_typed_parsed] for new callers. *)
+
+val typecheck_only_typed_parsed :
+  filename:string ->
+  program:Ast.program ->
+  ?debug:bool ->
+  unit ->
+  (Typed_ast.program, Ast.compiler_error list) result
+(** Typed-AST variant of [typecheck_only_parsed]. *)
+
 val typecheck_module_only :
   filename:string ->
   source:string ->
@@ -145,6 +164,29 @@ val compile :
     [Core_error]-tagged diagnostic. Off by default (the checks have
     non-trivial cost on large programs); enable it when debugging
     pipeline drift or before risky refactors. *)
+
+val compile_parsed :
+  ?debug:bool ->
+  ?allow_debug_only_calls:bool ->
+  ?retain_debug_blocks:bool ->
+  ?embed_runtime:bool ->
+  ?require_main:bool ->
+  ?profile:bool ->
+  ?on_frontend_phase:(frontend_phase -> unit) ->
+  ?on_stage:Core_pipeline.on_stage_callback ->
+  ?on_stage_event:Core_pipeline.on_stage_event ->
+  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
+  ?tail_observation_stages:Core_stage.t list ->
+  ?program_observation:Core_pipeline.program_observation ->
+  ?check_invariants:bool ->
+  filename:string ->
+  program:Ast.program ->
+  unit ->
+  (compile_outcome, Ast.compiler_error list) result
+(** Compile a program that has already passed through parser finalization.
+    This follows the same module-load, typecheck, and Core/codegen path as
+    [compile]; only the initial source read and parse are supplied by the
+    caller. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->

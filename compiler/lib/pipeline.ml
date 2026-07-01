@@ -27,6 +27,13 @@ let frontend_phase_to_string = function
   | ModuleTypecheck -> "module_typecheck"
   | MainTypecheck -> "main_typecheck"
 
+let bridge_can_read_matching_source ~filename source =
+  try
+    Sys.file_exists filename
+    && (not (Sys.is_directory filename))
+    && String.equal (Modules.read_file filename) source
+  with Sys_error _ -> false
+
 (** Outcome of [compile]. See [pipeline.mli] for rationale. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
 
@@ -66,21 +73,33 @@ let missing_main_error ~filename =
   }
 
 (** Parse source and load imports. Shared by [typecheck_only] and [compile]. *)
-let parse_and_load_modules ?on_frontend_phase ~filename source =
+let load_modules_after_parse ?on_frontend_phase ~filename program =
   let record phase =
     match on_frontend_phase with Some f -> f phase | None -> ()
   in
-  match Modules.parse_source ~filename source with
+  record Parse;
+  let base_dir = Modules.extract_directory filename in
+  let _ = Modules.load_imports program base_dir in
+  record ModuleLoad;
+  let mod_errors = module_load_errors () in
+  if mod_errors <> [] then Error mod_errors else Ok (program, base_dir)
+
+let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
+    ~filename source =
+  let record phase =
+    match on_frontend_phase with Some f -> f phase | None -> ()
+  in
+  let bridge_read_file =
+    match source_kind with
+    | User_source -> bridge_can_read_matching_source ~filename source
+    | Generated_test_harness -> false
+  in
+  match Modules.parse_source ~filename ~bridge_read_file source with
   | Error err ->
       record Parse;
       Error [ err ]
   | Ok program ->
-      record Parse;
-      let base_dir = Modules.extract_directory filename in
-      let _ = Modules.load_imports program base_dir in
-      record ModuleLoad;
-      let mod_errors = module_load_errors () in
-      if mod_errors <> [] then Error mod_errors else Ok (program, base_dir)
+      load_modules_after_parse ?on_frontend_phase ~filename program
 
 let fresh_builtins_env () = Env_builtins.with_builtins (Env.empty ())
 
@@ -417,46 +436,60 @@ let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
   (match (parent.Session.std_override_active, parent.std_override_dir) with
   | true, Some dir -> Modules.set_std_override ~sess dir
   | _ -> ());
+  if Compiler_blorp_bridge.compiler_bootstrap_menhir_parser_requested () then
+    Session.set_parser_frontend sess Session.BootstrapMenhirParser;
   Session.with_current sess (fun () ->
       Modules.init_module_paths (Modules.extract_directory filename);
       Option.iter (fun configure -> configure sess) configure_session;
       k ())
 
+let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
+    =
+  (* Type-check loaded modules and surface genuine errors *)
+  let module_errors = check_modules ~debug ~allow_debug_only_calls:debug () in
+  if module_errors <> [] then Error module_errors
+  else
+    let module_origin = Modules.module_origin_for_source_file filename in
+    let module_name = target_module_name filename in
+    match
+      Typecheck.typecheck_typed ~module_origin ~module_name
+        ~allow_debug_only_calls:debug program
+    with
+    | Error errors -> Error errors
+    | Ok typed_program ->
+        let import_errors =
+          unused_import_errors
+            ~scope:(Explicit_target { module_name; source_kind })
+            program
+        in
+        if import_errors <> [] then Error import_errors else Ok typed_program
+
 let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
     =
   with_fresh_session filename (fun () ->
-      match parse_and_load_modules ~filename source with
+      match parse_and_load_modules ~source_kind ~filename source with
       | Error _ as e -> e
-      | Ok (program, _base_dir) -> (
-          (* Type-check loaded modules and surface genuine errors *)
-          let module_errors =
-            check_modules ~debug ~allow_debug_only_calls:debug ()
-          in
-          if module_errors <> [] then Error module_errors
-          else
-            let module_origin =
-              Modules.module_origin_for_source_file filename
-            in
-            let module_name = target_module_name filename in
-            match
-              Typecheck.typecheck_typed ~module_origin ~module_name
-                ~allow_debug_only_calls:debug program
-            with
-            | Error errors -> Error errors
-            | Ok typed_program ->
-                let import_errors =
-                  unused_import_errors
-                    ~scope:(Explicit_target { module_name; source_kind })
-                    program
-                in
-                if import_errors <> [] then Error import_errors
-                else Ok typed_program))
+      | Ok (program, _base_dir) ->
+          typecheck_loaded_program ~source_kind ~filename ~program ~debug ())
+
+let typecheck_only_typed_parsed ~filename ~program ?(debug = false) () =
+  with_fresh_session filename (fun () ->
+      match load_modules_after_parse ~filename program with
+      | Error _ as e -> e
+      | Ok (program, _base_dir) ->
+          typecheck_loaded_program ~source_kind:User_source ~filename ~program
+            ~debug ())
 
 let typecheck_only_typed ~filename ~source ?(debug = false) () =
   typecheck_only_typed_impl ~source_kind:User_source ~filename ~source ~debug ()
 
 let typecheck_only ~filename ~source ?(debug = false) () =
   match typecheck_only_typed ~filename ~source ~debug () with
+  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
+  | Error _ as e -> e
+
+let typecheck_only_parsed ~filename ~program ?(debug = false) () =
+  match typecheck_only_typed_parsed ~filename ~program ~debug () with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
@@ -506,6 +539,90 @@ let typecheck_module_only ~filename ~source =
   | Ok (state, typed_program) -> Ok (state, Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
+let compile_loaded_program ~source_kind ?(debug = false)
+    ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
+    ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
+    ?on_stage_event ?on_stage_json ?tail_observation_stages
+    ?program_observation ?(check_invariants = false) ~filename ~program () =
+  let allow_debug_only_calls =
+    Option.value allow_debug_only_calls ~default:debug
+  in
+  let retain_debug_blocks = Option.value retain_debug_blocks ~default:debug in
+  let record_frontend phase =
+    match on_frontend_phase with Some f -> f phase | None -> ()
+  in
+  (* Type-check all loaded modules and surface genuine errors *)
+  let module_errors = check_modules ~debug ~allow_debug_only_calls () in
+  record_frontend ModuleTypecheck;
+  if module_errors <> [] then Error module_errors
+  else
+    let module_origin = Modules.module_origin_for_source_file filename in
+    let module_name = target_module_name filename in
+    match
+      Typecheck.typecheck_with_state_typed ~module_origin
+        ~allow_debug_only_calls ~module_name program
+    with
+    | Error blocking_errors ->
+        record_frontend MainTypecheck;
+        Error blocking_errors
+    | Ok (main_state, typed_program) -> (
+        record_frontend MainTypecheck;
+        let import_errors =
+          unused_import_errors
+            ~scope:(Explicit_target { module_name; source_kind })
+            program
+        in
+        if import_errors <> [] then Error import_errors
+        else if require_main && not (program_has_top_level_main program) then
+          Error [ missing_main_error ~filename ]
+        else
+          try
+            let c_code, link_flags, include_dirs =
+              Core_pipeline.compile_typed_with_modules
+                ~main_import_bindings:
+                  (List.rev main_state.Typecheck.import_bindings)
+                ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
+                ?on_stage_event ?on_stage_json ?tail_observation_stages
+                ?program_observation ~check_invariants typed_program
+            in
+            Ok
+              (Compiled
+                 { program; typed_program; c_code; link_flags; include_dirs })
+          with
+          (* [Core_pipeline.Stopped_after] is raised by a caller-supplied
+             [on_stage] callback to request early termination from
+             [--stop-after=<stage>]. Convert to a tagged outcome so callers
+             pattern-match instead of handling an out-of-band exception. *)
+          | Core_pipeline.Stopped_after s -> Ok (Stopped_at s)
+          | Core_error.Core_error { phase; msg; loc; hint } ->
+              let hint_str =
+                match hint with Some h -> " (hint: " ^ h ^ ")" | None -> ""
+              in
+              let tag = Core_error.phase_tag_to_string phase in
+              Error
+                [
+                  {
+                    message = Printf.sprintf "[%s] %s%s" tag msg hint_str;
+                    loc;
+                    phase = Codegen;
+                    kind = OtherError;
+                    notes = [];
+                    help = None;
+                  };
+                ]
+          | Failure msg ->
+              Error
+                [
+                  {
+                    message = "(internal error) " ^ msg;
+                    loc = Ast.dummy_loc;
+                    phase = Codegen;
+                    kind = OtherError;
+                    notes = [];
+                    help = None;
+                  };
+                ])
+
 (** Compile a source file through all phases.
     Returns either the compiled result or a list of errors.
 
@@ -517,101 +634,29 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
     ?(profile = false) ?on_frontend_phase ?on_stage ?on_stage_event
     ?on_stage_json ?tail_observation_stages ?program_observation
     ?(check_invariants = false) ~filename ~source () =
-  let allow_debug_only_calls =
-    Option.value allow_debug_only_calls ~default:debug
-  in
-  let retain_debug_blocks = Option.value retain_debug_blocks ~default:debug in
-  let record_frontend phase =
-    match on_frontend_phase with Some f -> f phase | None -> ()
-  in
   with_fresh_session filename (fun () ->
-      match parse_and_load_modules ?on_frontend_phase ~filename source with
+      match parse_and_load_modules ?on_frontend_phase ~source_kind ~filename source with
       | Error _ as e -> e
-      | Ok (program, _base_dir) -> (
-          (* Type-check all loaded modules and surface genuine errors *)
-          let module_errors = check_modules ~debug ~allow_debug_only_calls () in
-          record_frontend ModuleTypecheck;
-          if module_errors <> [] then Error module_errors
-          else
-            let module_origin =
-              Modules.module_origin_for_source_file filename
-            in
-            let module_name = target_module_name filename in
-            match
-              Typecheck.typecheck_with_state_typed ~module_origin
-                ~allow_debug_only_calls ~module_name program
-            with
-            | Error blocking_errors ->
-                record_frontend MainTypecheck;
-                Error blocking_errors
-            | Ok (main_state, typed_program) -> (
-                record_frontend MainTypecheck;
-                let import_errors =
-                  unused_import_errors
-                    ~scope:(Explicit_target { module_name; source_kind })
-                    program
-                in
-                if import_errors <> [] then Error import_errors
-                else if require_main && not (program_has_top_level_main program)
-                then Error [ missing_main_error ~filename ]
-                else
-                  try
-                    let c_code, link_flags, include_dirs =
-                      Core_pipeline.compile_typed_with_modules
-                        ~main_import_bindings:
-                          (List.rev main_state.Typecheck.import_bindings)
-                        ~embed_runtime ~profile ~debug:retain_debug_blocks
-                        ?on_stage ?on_stage_event ?on_stage_json
-                        ?tail_observation_stages ?program_observation
-                        ~check_invariants
-                        typed_program
-                    in
-                    Ok
-                      (Compiled
-                         {
-                           program;
-                           typed_program;
-                           c_code;
-                           link_flags;
-                           include_dirs;
-                         })
-                  with
-                  (* [Core_pipeline.Stopped_after] is raised by a caller-supplied [on_stage]
-           callback to request early termination from [--stop-after=<stage>].
-           Convert to a tagged outcome so callers pattern-match instead of
-           handling an out-of-band exception. *)
-                  | Core_pipeline.Stopped_after s -> Ok (Stopped_at s)
-                  | Core_error.Core_error { phase; msg; loc; hint } ->
-                      let hint_str =
-                        match hint with
-                        | Some h -> " (hint: " ^ h ^ ")"
-                        | None -> ""
-                      in
-                      let tag = Core_error.phase_tag_to_string phase in
-                      Error
-                        [
-                          {
-                            message =
-                              Printf.sprintf "[%s] %s%s" tag msg hint_str;
-                            loc;
-                            phase = Codegen;
-                            kind = OtherError;
-                            notes = [];
-                            help = None;
-                          };
-                        ]
-                  | Failure msg ->
-                      Error
-                        [
-                          {
-                            message = "(internal error) " ^ msg;
-                            loc = Ast.dummy_loc;
-                            phase = Codegen;
-                            kind = OtherError;
-                            notes = [];
-                            help = None;
-                          };
-                        ])))
+      | Ok (program, _base_dir) ->
+          compile_loaded_program ~source_kind ~debug ?allow_debug_only_calls
+            ?retain_debug_blocks ~embed_runtime ~require_main ~profile
+            ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+            ?tail_observation_stages ?program_observation ~check_invariants
+            ~filename ~program ())
+
+let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
+    ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
+    ?on_stage_event ?on_stage_json ?tail_observation_stages
+    ?program_observation ?check_invariants ~filename ~program () =
+  with_fresh_session filename (fun () ->
+      match load_modules_after_parse ?on_frontend_phase ~filename program with
+      | Error _ as e -> e
+      | Ok (program, _base_dir) ->
+          compile_loaded_program ~source_kind:User_source ?debug
+            ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
+            ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
+            ?on_stage_json ?tail_observation_stages ?program_observation
+            ?check_invariants ~filename ~program ())
 
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
     ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event

@@ -1,3 +1,7 @@
+open Blorp
+
+module Bridge = Blorp.Compiler_blorp_bridge
+
 let contains haystack needle =
   let haystack_len = String.length haystack in
   let needle_len = String.length needle in
@@ -8,6 +12,185 @@ let contains haystack needle =
     else loop (index + 1)
   in
   loop 0
+
+let parse_json_exn text =
+  try Lsp_json.parse text
+  with Lsp_json.Parse_error message -> Alcotest.fail ("invalid JSON: " ^ message)
+
+let object_fields = function
+  | Lsp_json.Object fields -> fields
+  | _ -> Alcotest.fail "expected JSON object"
+
+let field name value =
+  match List.assoc_opt name (object_fields value) with
+  | Some field -> field
+  | None -> Alcotest.fail ("missing JSON field " ^ name)
+
+let string_field name value =
+  match field name value with
+  | Lsp_json.String text -> text
+  | _ -> Alcotest.fail ("expected string JSON field " ^ name)
+
+let bool_field name value =
+  match field name value with
+  | Lsp_json.Bool flag -> flag
+  | _ -> Alcotest.fail ("expected bool JSON field " ^ name)
+
+let array_field name value =
+  match field name value with
+  | Lsp_json.Array items -> items
+  | _ -> Alcotest.fail ("expected array JSON field " ^ name)
+
+let expect_invalid_response_contains expected = function
+  | Ok _ -> Alcotest.fail "expected invalid bridge response"
+  | Error ("invalid_response", message) ->
+      if not (contains message expected) then
+        Alcotest.fail
+          ("expected invalid response containing " ^ expected ^ ", got " ^ message)
+  | Error (code, message) ->
+      Alcotest.fail
+        ("expected invalid_response, got " ^ code ^ ": " ^ message)
+
+let with_env name value f =
+  let old = Sys.getenv_opt name in
+  Unix.putenv name value;
+  Fun.protect
+    ~finally:(fun () ->
+      match old with
+      | Some previous -> Unix.putenv name previous
+      | None -> Unix.putenv name "")
+    f
+
+let parsed_program_json ?(diagnostics = []) decls =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "parsed_program");
+      ( "source",
+        Lsp_json.Object
+          [
+            ("kind", Lsp_json.String "source_file");
+            ("path", Lsp_json.String "main.brp");
+            ("module", Lsp_json.String "main");
+            ("text", Lsp_json.String "");
+          ] );
+      ("decls", Lsp_json.Array decls);
+      ("diagnostics", Lsp_json.Array diagnostics);
+    ]
+
+let span_json ?(path = "main.brp") ?(module_name = "main") start_offset
+    start_column end_offset end_column =
+  Lsp_json.Object
+    [
+      ("path", Lsp_json.String path);
+      ("module", Lsp_json.String module_name);
+      ("start_offset", Lsp_json.Int start_offset);
+      ("start_line", Lsp_json.Int 1);
+      ("start_column", Lsp_json.Int start_column);
+      ("end_offset", Lsp_json.Int end_offset);
+      ("end_line", Lsp_json.Int 1);
+      ("end_column", Lsp_json.Int end_column);
+    ]
+
+let diagnostic_json ?(severity = "error") ?(expected = []) ?help ~message
+    span =
+  Lsp_json.Object
+    [
+      ("severity", Lsp_json.String severity);
+      ("span", span);
+      ("message", Lsp_json.String message);
+      ("expected", Lsp_json.Array (List.map (fun s -> Lsp_json.String s) expected));
+      ( "help",
+        match help with
+        | Some text -> Lsp_json.String text
+        | None -> Lsp_json.Null );
+    ]
+
+let bridge_success_json artifact =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int Blorp.Compiler_blorp_bridge.schema_version);
+         ("ok", Lsp_json.Bool true);
+         ("artifact", artifact);
+       ])
+
+let parsed_ast_artifact ?comments program =
+  let fields =
+    match comments with
+    | Some values -> [ ("parsed_ast", program); ("comments", Lsp_json.Array values) ]
+    | None -> [ ("parsed_ast", program) ]
+  in
+  Lsp_json.Object fields
+
+let string_array values = Lsp_json.Array (List.map (fun s -> Lsp_json.String s) values)
+
+let check_options_json paths =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "check");
+      ("dump_ast", Lsp_json.Bool false);
+      ("dump_typed_ast", Lsp_json.Bool false);
+      ("debug", Lsp_json.Bool false);
+      ("no_format", Lsp_json.Bool true);
+      ("std_dir", Lsp_json.Null);
+      ("paths", string_array paths);
+    ]
+
+let compile_options_json files =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "compile");
+      ("ast_only", Lsp_json.Bool false);
+      ("dump_ast", Lsp_json.Bool false);
+      ("dump_typed_ast", Lsp_json.Bool false);
+      ("dump_core_after", Lsp_json.Array []);
+      ("dump_file", Lsp_json.Null);
+      ("stop_after", Lsp_json.Null);
+      ("time_phases", Lsp_json.Bool false);
+      ("check_invariants", Lsp_json.Bool false);
+      ("debug", Lsp_json.Bool false);
+      ("no_format", Lsp_json.Bool true);
+      ("embed_runtime", Lsp_json.Bool true);
+      ("std_dir", Lsp_json.Null);
+      ("output", Lsp_json.Null);
+      ("files", string_array files);
+    ]
+
+let test_options_json paths =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "test");
+      ("profile", Lsp_json.Bool true);
+      ("debug", Lsp_json.Bool true);
+      ("sanitizer", Lsp_json.String "undefined");
+      ("leak_check", Lsp_json.Bool true);
+      ("no_format", Lsp_json.Bool true);
+      ("timeout", Lsp_json.Int 5);
+      ("jobs", Lsp_json.Int 8);
+      ("repeat", Lsp_json.Int 3);
+      ("mode", Lsp_json.String "doc");
+      ("cache", Lsp_json.Bool false);
+      ("std_dir", Lsp_json.String "custom-std");
+      ("paths", string_array paths);
+    ]
+
+let purify_options_json paths =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "purify");
+      ("dry_run", Lsp_json.Bool true);
+      ("verbose", Lsp_json.Bool true);
+      ("paths", string_array paths);
+    ]
+
+let comment_json ~text ~line ~column ~trailing =
+  Lsp_json.Object
+    [
+      ("text", Lsp_json.String text);
+      ("line", Lsp_json.Int line);
+      ("column", Lsp_json.Int column);
+      ("trailing", Lsp_json.Bool trailing);
+    ]
 
 let test_renderer_bridge_compile_renames_generated_main () =
   let args =
@@ -50,6 +233,616 @@ let test_renderer_bridge_wrapper_sets_explicit_stack () =
   Alcotest.(check bool)
     "calls renamed generated entrypoint" true
     (contains source Blorp.Compiler_blorp_bridge.renderer_bridge_user_main_symbol)
+
+let test_bridge_helper_compile_marks_bootstrap_parser_mode () =
+  let env = Blorp.Compiler_blorp_bridge.bridge_helper_compile_env in
+  Alcotest.(check (option string))
+    "renderer helper marker" (Some "1")
+    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
+  Alcotest.(check (option string))
+    "bootstrap parser marker" (Some "1")
+    (List.assoc_opt
+       Blorp.Compiler_blorp_bridge.compiler_bootstrap_menhir_parser_env
+       env)
+
+let test_parser_bridge_compile_marks_bootstrap_parser_mode () =
+  let env = Blorp.Compiler_blorp_bridge.parser_bridge_helper_compile_env in
+  Alcotest.(check (option string))
+    "renderer helper marker" (Some "1")
+    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
+  Alcotest.(check (option string))
+    "bootstrap parser marker" (Some "1")
+    (List.assoc_opt
+       Blorp.Compiler_blorp_bridge.compiler_bootstrap_menhir_parser_env
+       env)
+
+let test_bootstrap_parser_request_requires_both_markers () =
+  let renderer_env = Bridge.renderer_bridge_helper_env in
+  let bootstrap_env = Bridge.compiler_bootstrap_menhir_parser_env in
+  let check_case label renderer_value bootstrap_value expected =
+    with_env renderer_env renderer_value (fun () ->
+        with_env bootstrap_env bootstrap_value (fun () ->
+            let actual = Bridge.compiler_bootstrap_menhir_parser_requested () in
+            Alcotest.(check bool) label expected actual))
+  in
+  check_case "no markers" "" "" false;
+  check_case "renderer marker alone" "1" "" false;
+  check_case "bootstrap marker alone" "" "1" false;
+  check_case "both markers" "1" "1" true
+
+let test_parse_source_request_uses_bridge_envelope () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_source_request_json ~path:"src/main.brp"
+      ~module_name:"main" ~text:"func main(): 0"
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string)
+    "action" "parse_source" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "path" "src/main.brp" (string_field "path" payload);
+  Alcotest.(check string) "module" "main" (string_field "module" payload);
+  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload)
+
+let test_parse_source_file_request_omits_source_text () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_source_file_request_json
+      ~path:"src/main.brp" ~module_name:"main"
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string)
+    "action" "parse_source" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "path" "src/main.brp" (string_field "path" payload);
+  Alcotest.(check string) "module" "main" (string_field "module" payload);
+  match List.assoc_opt "text" (object_fields payload) with
+  | None -> ()
+  | Some _ -> Alcotest.fail "path-only parse request must omit source text"
+
+let test_parse_sources_request_uses_bridge_envelope () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_sources_request_json
+      [
+        {
+          Bridge.batch_parse_path = "src/a.brp";
+          batch_parse_module_name = "a";
+          batch_parse_text = "a = 1";
+        };
+        {
+          Bridge.batch_parse_path = "src/b.brp";
+          batch_parse_module_name = "b";
+          batch_parse_text = "b = 2";
+        };
+      ]
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string)
+    "action" "parse_sources" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check bool)
+    "batch parse omits comments" false
+    (bool_field "include_comments" payload);
+  match array_field "sources" payload with
+  | [ first; second ] ->
+      Alcotest.(check string)
+        "first path" "src/a.brp" (string_field "path" first);
+      Alcotest.(check string) "first module" "a" (string_field "module" first);
+      Alcotest.(check string) "first text" "a = 1" (string_field "text" first);
+      Alcotest.(check string)
+        "second path" "src/b.brp" (string_field "path" second);
+      Alcotest.(check string)
+        "second module" "b" (string_field "module" second);
+      Alcotest.(check string)
+        "second text" "b = 2" (string_field "text" second)
+  | _ -> Alcotest.fail "expected two parse source request items"
+
+let test_cli_run_request_uses_bridge_envelope () =
+  let request =
+    Blorp.Compiler_blorp_bridge.cli_run_request_json
+      [ "format"; "--check"; "main.brp" ]
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string) "action" "run_cli" (string_field "action" request);
+  let payload = field "payload" request in
+  match array_field "args" payload with
+  | [ Lsp_json.String "format"; Lsp_json.String "--check"; Lsp_json.String "main.brp" ] ->
+      ()
+  | _ -> Alcotest.fail "expected CLI args in payload"
+
+let test_cli_run_request_can_include_version_context () =
+  let request =
+    Blorp.Compiler_blorp_bridge.cli_run_request_json ~version:"blorp test"
+      [ "--version" ]
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string) "action" "run_cli" (string_field "action" request);
+  let payload = field "payload" request in
+  match array_field "args" payload with
+  | [ Lsp_json.String "--version" ] ->
+      Alcotest.(check string) "version" "blorp test"
+        (string_field "version" payload)
+  | _ -> Alcotest.fail "expected CLI args in payload"
+
+let test_parse_source_response_decodes_parsed_ast_artifact () =
+  let response = bridge_success_json (parsed_ast_artifact (parsed_program_json [])) in
+  match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.ParsedSource
+        { parsed_program = []; parsed_comments = [] }) ->
+      ()
+  | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
+      Alcotest.fail "expected empty decoded program"
+  | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
+      Alcotest.fail "expected decoded program, got diagnostics"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_parse_source_response_decodes_comments () =
+  let response =
+    bridge_success_json
+      (parsed_ast_artifact
+         ~comments:[ comment_json ~text:"-- note" ~line:2 ~column:3 ~trailing:false ]
+         (parsed_program_json []))
+  in
+  match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.ParsedSource
+        { parsed_program = []; parsed_comments = [ comment ] }) ->
+      Alcotest.(check string) "comment text" "-- note" comment.Lexer.cc_text;
+      Alcotest.(check int) "comment line" 2 comment.Lexer.cc_line;
+      Alcotest.(check int) "comment column" 3 comment.Lexer.cc_col;
+      Alcotest.(check bool) "comment trailing" false comment.Lexer.cc_trailing
+  | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
+      Alcotest.fail "expected one decoded comment"
+  | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
+      Alcotest.fail "expected decoded program, got diagnostics"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_parse_source_response_returns_diagnostics () =
+  let response =
+    bridge_success_json
+      (parsed_ast_artifact
+         (parsed_program_json
+            ~diagnostics:
+              [
+                diagnostic_json
+                  ~message:"Expected ':' after if condition"
+                  ~expected:[ ":" ]
+                  ~help:"add `:` after the condition"
+                  (span_json 3 4 5 6);
+              ]
+            []))
+  in
+  match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
+  | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics [ err ]) ->
+      Alcotest.(check string)
+        "message" "Expected ':' after if condition" err.Ast.message;
+      Alcotest.(check int) "line" 1 err.loc.line;
+      Alcotest.(check int) "column" 4 err.loc.column;
+      Alcotest.(check (option string))
+        "help" (Some "add `:` after the condition") err.help
+  | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
+      Alcotest.fail "expected exactly one diagnostic"
+  | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
+      Alcotest.fail "expected parse diagnostics"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_parse_sources_response_decodes_items () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ( "sources",
+             Lsp_json.Array
+               [
+                 Lsp_json.Object
+                   [
+                     ("path", Lsp_json.String "src/a.brp");
+                     ("module", Lsp_json.String "a");
+                     ("parsed_ast", parsed_program_json []);
+                     ( "comments",
+                       Lsp_json.Array
+                         [
+                           comment_json ~text:"-- batch" ~line:2 ~column:1
+                             ~trailing:false;
+                         ] );
+                   ];
+                 Lsp_json.Object
+                   [
+                     ("path", Lsp_json.String "src/b.brp");
+                     ("module", Lsp_json.String "b");
+                     ( "parsed_ast",
+                       parsed_program_json
+                         ~diagnostics:
+                           [
+                             diagnostic_json ~message:"Expected expression"
+                               (span_json 1 2 3 4);
+                           ]
+                         [] );
+                     ("comments", Lsp_json.Array []);
+                   ];
+               ] );
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.parse_sources_response_json response with
+  | Ok
+      [
+        {
+          Bridge.batch_parsed_path = "src/a.brp";
+          batch_parsed_module_name = "a";
+          batch_parsed_response =
+            Bridge.ParsedSource
+              { parsed_program = []; parsed_comments = [ comment ] };
+        };
+        {
+          Bridge.batch_parsed_path = "src/b.brp";
+          batch_parsed_module_name = "b";
+          batch_parsed_response = Bridge.ParseSourceDiagnostics [ err ];
+        };
+      ] ->
+      Alcotest.(check string) "comment text" "-- batch" comment.Lexer.cc_text;
+      Alcotest.(check string) "diagnostic" "Expected expression" err.Ast.message
+  | Ok _ -> Alcotest.fail "expected one parsed item and one diagnostic item"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_handled () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "handled");
+           ("status", Lsp_json.Int 1);
+           ("stdout", Lsp_json.String "");
+           ("stderr", Lsp_json.String "unknown format option: --bogus\n");
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunHandled
+        {
+          cli_run_status = 1;
+          cli_run_stdout = "";
+          cli_run_stderr = "unknown format option: --bogus\n";
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI handled result"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_delegate () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "delegate");
+           ("args", string_array [ "repl" ]);
+           ("io", Lsp_json.String "terminal");
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunDelegate
+        {
+          cli_run_delegate_args = [ "repl" ];
+          cli_run_delegate_io =
+            Blorp.Compiler_blorp_bridge.CliFrontendTerminalDelegation;
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI delegate"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_test_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "test");
+           ( "args",
+             string_array
+               [
+                 "test";
+                 "--doc";
+                 "--repeat";
+                 "3";
+                 "-j";
+                 "8";
+                 "--no-cache";
+                 "--sanitize=undefined";
+                 "--timeout";
+                 "5";
+                 "--std-dir";
+                 "custom-std";
+                 "--no-format";
+                 "tests";
+               ] );
+           ("options", test_options_json [ "tests" ]);
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunTestOptions
+        (Blorp.Compiler_blorp_bridge.CliTestRunOptions options)) ->
+      Alcotest.(check (list string))
+        "raw args"
+        [
+          "test";
+          "--doc";
+          "--repeat";
+          "3";
+          "-j";
+          "8";
+          "--no-cache";
+          "--sanitize=undefined";
+          "--timeout";
+          "5";
+          "--std-dir";
+          "custom-std";
+          "--no-format";
+          "tests";
+        ]
+        options.cli_test_raw_args;
+      Alcotest.(check bool) "profile" true options.cli_test_profile;
+      Alcotest.(check bool) "debug" true options.cli_test_debug;
+      Alcotest.(check bool) "leak check" true options.cli_test_leak_check;
+      Alcotest.(check bool) "no format" true options.cli_test_no_format;
+      Alcotest.(check (option int)) "timeout" (Some 5) options.cli_test_timeout;
+      Alcotest.(check int) "jobs" 8 options.cli_test_jobs;
+      Alcotest.(check int) "repeat" 3 options.cli_test_repeat;
+      Alcotest.(check bool) "cache" false options.cli_test_cache;
+      Alcotest.(check (option string))
+        "std dir" (Some "custom-std") options.cli_test_std_dir;
+      Alcotest.(check (list string)) "paths" [ "tests" ] options.cli_test_paths;
+      Alcotest.(check bool)
+        "sanitizer"
+        true
+        (options.cli_test_sanitizer
+        = Some Blorp.Compiler_blorp_bridge.CliFrontendSanitizeUndefined);
+      Alcotest.(check bool)
+        "mode"
+        true
+        (options.cli_test_mode
+        = Blorp.Compiler_blorp_bridge.CliFrontendTestDocOnly)
+  | Ok _ -> Alcotest.fail "expected decoded CLI test options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_parsed_source () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "parsed_source");
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "compile"; "--no-format"; "main.brp" ]);
+           ("options", compile_options_json [ "main.brp" ]);
+           ( "source",
+             Lsp_json.Object
+               [
+                 ("path", Lsp_json.String "main.brp");
+                 ("module", Lsp_json.String "main");
+                 ("parsed_source", parsed_ast_artifact (parsed_program_json []));
+               ] );
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunParsedSource
+        {
+          cli_frontend_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
+          cli_frontend_args = [ "compile"; "--no-format"; "main.brp" ];
+          cli_frontend_options =
+            Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
+              {
+                cli_compile_no_format = true;
+                cli_compile_files = [ "main.brp" ];
+                cli_compile_output = None;
+                cli_compile_dump_core_after = [];
+                cli_compile_stop_after = None;
+                _;
+              };
+          cli_frontend_path = "main.brp";
+          cli_frontend_module_name = "main";
+          cli_frontend_parsed_response =
+            Blorp.Compiler_blorp_bridge.ParsedSource
+              { parsed_program = []; parsed_comments = [] };
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI run parsed source"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_frontend_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_options");
+           ("command", Lsp_json.String "check");
+           ( "args",
+             string_array [ "check"; "--no-format"; "a.brp"; "b.brp" ] );
+           ("options", check_options_json [ "a.brp"; "b.brp" ]);
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunFrontendOptions
+        {
+          cli_frontend_options_command = Blorp.Compiler_blorp_bridge.CliFrontendCheck;
+          cli_frontend_options_args =
+            [ "check"; "--no-format"; "a.brp"; "b.brp" ];
+          cli_frontend_options =
+            Blorp.Compiler_blorp_bridge.CliFrontendCheckOptions
+              {
+                cli_check_no_format = true;
+                cli_check_paths = [ "a.brp"; "b.brp" ];
+                _;
+              };
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI frontend options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_purify_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "purify");
+           ( "args",
+             string_array [ "purify"; "--dry-run"; "--verbose"; "src" ] );
+           ("options", purify_options_json [ "src" ]);
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunPurifyOptions
+        {
+          cli_purify_raw_args = [ "purify"; "--dry-run"; "--verbose"; "src" ];
+          cli_purify_dry_run = true;
+          cli_purify_verbose = true;
+          cli_purify_paths = [ "src" ];
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI purify options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_repl_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "repl");
+           ("args", string_array [ "repl"; "--debug" ]);
+           ("debug", Lsp_json.Bool true);
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunReplOptions
+        { cli_repl_raw_args = [ "repl"; "--debug" ]; cli_repl_debug = true }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI repl options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_lsp_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [ ("kind", Lsp_json.String "lsp"); ("args", string_array [ "lsp" ]) ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunLspOptions
+        { cli_lsp_raw_args = [ "lsp" ] }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI lsp options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_package_pack_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "package");
+           ("args", string_array [ "package"; "pack"; "pkg"; "-o"; "pkg.blp" ]);
+           ( "command",
+             Lsp_json.Object
+               [
+                 ("kind", Lsp_json.String "pack");
+                 ("path", Lsp_json.String "pkg");
+                 ("output", Lsp_json.String "pkg.blp");
+               ] );
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunPackageOptions
+        {
+          cli_package_raw_args = [ "package"; "pack"; "pkg"; "-o"; "pkg.blp" ];
+          cli_package_command =
+            Blorp.Compiler_blorp_bridge.CliPackagePack
+              { path = "pkg"; output = "pkg.blp" };
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI package pack options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_decodes_package_vendor_options () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "package");
+           ("args", string_array [ "package"; "vendor"; "hash" ]);
+           ( "command",
+             Lsp_json.Object
+               [
+                 ("kind", Lsp_json.String "vendor_target");
+                 ("target", Lsp_json.String "hash");
+                 ("dest", Lsp_json.Null);
+               ] );
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunPackageOptions
+        {
+          cli_package_raw_args = [ "package"; "vendor"; "hash" ];
+          cli_package_command =
+            Blorp.Compiler_blorp_bridge.CliPackageVendorTarget
+              { target = "hash"; dest = None };
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded CLI package vendor options"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_rejects_mismatched_frontend_args () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_options");
+           ("command", Lsp_json.String "check");
+           ("args", string_array [ "compile"; "a.brp" ]);
+           ("options", check_options_json [ "a.brp" ]);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains "expected `check`"
+
+let test_cli_run_response_rejects_mismatched_repl_args () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "repl");
+           ("args", string_array [ "lsp" ]);
+           ("debug", Lsp_json.Bool false);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains "expected `repl`"
+
+let test_cli_run_response_rejects_mismatched_package_args () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "package");
+           ("args", string_array [ "package"; "vendor"; "hash" ]);
+           ( "command",
+             Lsp_json.Object
+               [
+                 ("kind", Lsp_json.String "pack");
+                 ("path", Lsp_json.String "pkg");
+                 ("output", Lsp_json.String "pkg.blp");
+               ] );
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains "expected `pack`"
 
 let write_file path contents =
   let channel = open_out_bin path in
@@ -104,6 +897,157 @@ let test_renderer_bridge_default_respects_explicit_override () =
       Alcotest.(check string) "explicit bridge binary" "/tmp/custom-blorp" path
   | None -> Alcotest.fail "expected explicit bridge binary to win"
 
+let test_parser_bridge_uses_pinned_bootstrap_over_workspace_blorp () =
+  with_temp_dir (fun root ->
+      let scripts_dir = Filename.concat root "scripts" in
+      let nested_dir = Filename.concat root "nested" in
+      let deeper_dir = Filename.concat nested_dir "deeper" in
+      let bootstrap =
+        Filename.concat scripts_dir "blorp-compiler-bootstrap"
+      in
+      let workspace_blorp = Filename.concat root "blorp" in
+      mkdir scripts_dir;
+      mkdir nested_dir;
+      mkdir deeper_dir;
+      write_file bootstrap "#!/usr/bin/env bash\n";
+      write_file workspace_blorp "#!/usr/bin/env bash\n";
+      match
+        Blorp.Compiler_blorp_bridge.command_program_for_parser_bridge
+          ~bridge_bin:None [ deeper_dir ]
+      with
+      | Some path -> Alcotest.(check string) "pinned bootstrap" bootstrap path
+      | None -> Alcotest.fail "expected pinned bootstrap to be discovered")
+
+let test_parser_bridge_respects_explicit_override () =
+  match
+    Blorp.Compiler_blorp_bridge.command_program_for_parser_bridge
+      ~bridge_bin:(Some "/tmp/custom-blorp") [ "/does/not/exist" ]
+  with
+  | Some path ->
+      Alcotest.(check string) "explicit bridge binary" "/tmp/custom-blorp" path
+  | None -> Alcotest.fail "expected explicit bridge binary to win"
+
+let test_bridge_cache_key_includes_helper_entrypoint () =
+  with_temp_dir (fun root ->
+      let compiler_dir = Filename.concat root "compiler" in
+      let blorp_dir = Filename.concat compiler_dir "blorp" in
+      let program = Filename.concat root "blorp" in
+      let backend_source = Filename.concat blorp_dir "compiler_bridge_cli.brp" in
+      let parser_source =
+        Filename.concat blorp_dir "compiler_parser_bridge_cli.brp"
+      in
+      mkdir compiler_dir;
+      mkdir blorp_dir;
+      write_file program "#!/usr/bin/env bash\n";
+      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file parser_source "func main(args: List[String]) -> Int: 0\n";
+      let backend =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+      in
+      let parser =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:parser_source
+      in
+      Alcotest.(check bool)
+        "backend and parser helpers use distinct cache keys" true
+        (backend.bridge_key <> parser.bridge_key))
+
+let test_prepared_bridge_binary_env_accepts_existing_file () =
+  with_temp_dir (fun root ->
+      let bin = Filename.concat root "prepared-bridge.bin" in
+      write_file bin "#!/usr/bin/env bash\n";
+      with_env Bridge.prepared_renderer_bridge_bin_env bin (fun () ->
+          match
+            Bridge.prepared_bridge_binary_from_env
+              Bridge.prepared_renderer_bridge_bin_env
+          with
+          | Some (Ok path) ->
+              Alcotest.(check string) "prepared bridge path" bin path
+          | Some (Error message) ->
+              Alcotest.fail ("unexpected prepared bridge error: " ^ message)
+          | None -> Alcotest.fail "expected prepared bridge env to be used"))
+
+let test_prepared_bridge_binary_env_rejects_missing_file () =
+  let missing = "/tmp/blorp-prepared-bridge-does-not-exist" in
+  with_env Bridge.prepared_renderer_bridge_bin_env missing (fun () ->
+      match
+        Bridge.prepared_bridge_binary_from_env
+          Bridge.prepared_renderer_bridge_bin_env
+      with
+      | Some (Error message) ->
+          Alcotest.(check bool)
+            "mentions missing prepared bridge" true
+            (contains message "missing Blorp bridge helper binary")
+      | Some (Ok path) ->
+          Alcotest.fail ("unexpected prepared bridge path: " ^ path)
+      | None -> Alcotest.fail "expected prepared bridge env to be checked")
+
+let test_renderer_bridge_binary_prefers_prepared_env () =
+  with_temp_dir (fun root ->
+      let bin = Filename.concat root "prepared-renderer.bin" in
+      write_file bin "#!/usr/bin/env bash\n";
+      with_env Bridge.prepared_renderer_bridge_bin_env bin (fun () ->
+          match Bridge.renderer_bridge_binary () with
+          | Ok path -> Alcotest.(check string) "prepared renderer path" bin path
+          | Error message ->
+              Alcotest.fail ("unexpected prepared renderer error: " ^ message)))
+
+let test_renderer_bridge_binary_requires_prepared_env () =
+  with_env Bridge.require_prepared_bridge_env "1" (fun () ->
+      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
+          match Bridge.renderer_bridge_binary () with
+          | Error message ->
+              Alcotest.(check bool)
+                "reports missing required prepared renderer" true
+                (contains message Bridge.prepared_renderer_bridge_bin_env)
+          | Ok path ->
+              Alcotest.fail
+                ("unexpected fallback renderer helper path: " ^ path)))
+
+let test_generated_c_bootstrap_compatibility_adds_forward_typedefs () =
+  let source =
+    String.concat "\n"
+      [
+        "typedef struct compiler_parsed_ast__ParsedMatchCase {";
+        "  compiler_parsed_ast__ParsedExpr* body;";
+        "} compiler_parsed_ast__ParsedMatchCase;";
+        "typedef struct compiler_parsed_ast__ParsedExpr {";
+        "  long tag;";
+        "} compiler_parsed_ast__ParsedExpr;";
+        "";
+      ]
+  in
+  let rewritten = Bridge.generated_c_with_bootstrap_compatibility source in
+  Alcotest.(check bool)
+    "adds forward typedef for referenced generated type" true
+    (contains rewritten
+       "typedef struct compiler_parsed_ast__ParsedExpr \
+        compiler_parsed_ast__ParsedExpr;");
+  Alcotest.(check bool)
+    "preserves original struct definition" true
+    (contains rewritten "typedef struct compiler_parsed_ast__ParsedExpr {")
+
+let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
+    =
+  let source =
+    String.concat "\n"
+      [
+        "#define __def_527932_ColonSymbol 7L";
+        "bool check(void* token) {";
+        "  return (((compiler_token__CompilerSymbol*)((compiler_token__CompilerTokenKind*)token)->data.SymbolToken.field0)->tag == TAG_compiler_token__CompilerSymbol_ColonSymbol);";
+        "}";
+        "";
+      ]
+  in
+  let rewritten = Bridge.generated_c_with_bootstrap_compatibility source in
+  Alcotest.(check bool)
+    "removes old pointer tag check" false
+    (contains rewritten "TAG_compiler_token__CompilerSymbol_ColonSymbol");
+  Alcotest.(check bool)
+    "compares stack enum payload value" true
+    (contains rewritten
+       "((long)(long)((compiler_token__CompilerTokenKind*)token)->data.SymbolToken.field0 \
+        == __def_527932_ColonSymbol)")
+
 let suite =
   [
     ( "renderer_bridge_build",
@@ -114,9 +1058,78 @@ let suite =
           test_renderer_bridge_link_uses_wrapper_main;
         Alcotest.test_case "wrapper sets explicit stack" `Quick
           test_renderer_bridge_wrapper_sets_explicit_stack;
+        Alcotest.test_case "helper compile marks bootstrap parser mode" `Quick
+          test_bridge_helper_compile_marks_bootstrap_parser_mode;
+        Alcotest.test_case "parser helper marks bootstrap parser mode" `Quick
+          test_parser_bridge_compile_marks_bootstrap_parser_mode;
+        Alcotest.test_case "bootstrap parser request requires both markers"
+          `Quick test_bootstrap_parser_request_requires_both_markers;
+        Alcotest.test_case "parse_source request uses bridge envelope" `Quick
+          test_parse_source_request_uses_bridge_envelope;
+        Alcotest.test_case "parse_source file request omits source text" `Quick
+          test_parse_source_file_request_omits_source_text;
+        Alcotest.test_case "parse_sources request uses bridge envelope" `Quick
+          test_parse_sources_request_uses_bridge_envelope;
+        Alcotest.test_case "CLI run request uses bridge envelope" `Quick
+          test_cli_run_request_uses_bridge_envelope;
+        Alcotest.test_case "CLI run request can include version context" `Quick
+          test_cli_run_request_can_include_version_context;
+        Alcotest.test_case "parse_source response decodes parsed AST artifact"
+          `Quick test_parse_source_response_decodes_parsed_ast_artifact;
+        Alcotest.test_case "parse_source response decodes comments" `Quick
+          test_parse_source_response_decodes_comments;
+        Alcotest.test_case "parse_source response returns diagnostics" `Quick
+          test_parse_source_response_returns_diagnostics;
+        Alcotest.test_case "parse_sources response decodes items" `Quick
+          test_parse_sources_response_decodes_items;
+        Alcotest.test_case "CLI run response decodes handled" `Quick
+          test_cli_run_response_decodes_handled;
+        Alcotest.test_case "CLI run response decodes delegate" `Quick
+          test_cli_run_response_decodes_delegate;
+        Alcotest.test_case "CLI run response decodes test options" `Quick
+          test_cli_run_response_decodes_test_options;
+        Alcotest.test_case "CLI run response decodes parsed source" `Quick
+          test_cli_run_response_decodes_parsed_source;
+        Alcotest.test_case "CLI run response decodes frontend options" `Quick
+          test_cli_run_response_decodes_frontend_options;
+        Alcotest.test_case "CLI run response decodes purify options" `Quick
+          test_cli_run_response_decodes_purify_options;
+        Alcotest.test_case "CLI run response decodes repl options" `Quick
+          test_cli_run_response_decodes_repl_options;
+        Alcotest.test_case "CLI run response decodes lsp options" `Quick
+          test_cli_run_response_decodes_lsp_options;
+        Alcotest.test_case "CLI run response decodes package pack options" `Quick
+          test_cli_run_response_decodes_package_pack_options;
+        Alcotest.test_case "CLI run response decodes package vendor options"
+          `Quick test_cli_run_response_decodes_package_vendor_options;
+        Alcotest.test_case "CLI run response rejects mismatched frontend args"
+          `Quick test_cli_run_response_rejects_mismatched_frontend_args;
+        Alcotest.test_case "CLI run response rejects mismatched repl args"
+          `Quick test_cli_run_response_rejects_mismatched_repl_args;
+        Alcotest.test_case "CLI run response rejects mismatched package args"
+          `Quick test_cli_run_response_rejects_mismatched_package_args;
         Alcotest.test_case "default uses pinned bootstrap" `Quick
           test_renderer_bridge_default_prefers_pinned_bootstrap;
         Alcotest.test_case "default respects explicit override" `Quick
           test_renderer_bridge_default_respects_explicit_override;
+        Alcotest.test_case "parser helper uses pinned bootstrap" `Quick
+          test_parser_bridge_uses_pinned_bootstrap_over_workspace_blorp;
+        Alcotest.test_case "parser helper respects explicit override" `Quick
+          test_parser_bridge_respects_explicit_override;
+        Alcotest.test_case "cache key includes helper entrypoint" `Quick
+          test_bridge_cache_key_includes_helper_entrypoint;
+        Alcotest.test_case "prepared env accepts existing helper" `Quick
+          test_prepared_bridge_binary_env_accepts_existing_file;
+        Alcotest.test_case "prepared env rejects missing helper" `Quick
+          test_prepared_bridge_binary_env_rejects_missing_file;
+        Alcotest.test_case "renderer helper prefers prepared env" `Quick
+          test_renderer_bridge_binary_prefers_prepared_env;
+        Alcotest.test_case "renderer helper requires prepared env" `Quick
+          test_renderer_bridge_binary_requires_prepared_env;
+        Alcotest.test_case "bootstrap compatibility adds forward typedefs"
+          `Quick test_generated_c_bootstrap_compatibility_adds_forward_typedefs;
+        Alcotest.test_case "bootstrap compatibility rewrites enum payload checks"
+          `Quick
+          test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks;
       ] );
   ]

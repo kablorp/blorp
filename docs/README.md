@@ -27,9 +27,10 @@ for history.
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) tracks active compiler cleanup,
   call-resolution, performance, and native-boundary work.
 - [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) tracks the
-  aggressive OCaml-to-Blorp compiler migration, including the single JSON
-  transfer point, current Blorp-owned Core tail, and deletion-first merge
-  points.
+  aggressive OCaml-to-Blorp compiler migration, including explicit JSON
+  boundaries, current Blorp-owned Core tail, and deletion-first merge points.
+- [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md) tracks the cursor/span parser
+  utility redesign and the first Blorp-owned frontend parser slices.
 
 ## Runtime And Resources
 

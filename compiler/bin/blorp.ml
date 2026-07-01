@@ -21,31 +21,24 @@ module StringMap = Map.Make (String)
 module IntSet = Set.Make (Int)
 module IntMap = Map.Make (Int)
 
-type purify_func_key = string * int * int * int * int * string option
-
-module PurifyFuncKey = struct
-  type t = purify_func_key
-
-  let compare = compare
-end
-
-module PurifyFuncKeySet = Set.Make (PurifyFuncKey)
-
 type purify_candidate = {
   candidate_id : int;
   candidate_name : string;
-  candidate_key : purify_func_key;
+  candidate_decl_loc : Ast.loc;
   candidate_signature : Typecheck.checked_func_signature;
   candidate_func : Ast.func_decl;
   candidate_body : Ast.expr;
 }
 
-let purify_func_key ~name (loc : Ast.loc) =
-  (name, loc.line, loc.column, loc.end_line, loc.end_column, loc.loc_file)
-
 let read_file = Modules.read_file
 let extract_directory = Modules.extract_directory
 let init_module_paths = Modules.init_module_paths
+
+let write_file path contents =
+  let channel = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr channel)
+    (fun () -> output_string channel contents)
 
 let read_all_channel channel =
   let buffer = Buffer.create 4096 in
@@ -74,17 +67,36 @@ let run_compiler_bridge_command args =
   print_endline response_json;
   0
 
+let run_compiler_bridge_prepare_command args =
+  match args with
+  | [ out_dir ] -> (
+      match Compiler_blorp_bridge.prepare_bridge_binaries ~out_dir with
+      | Ok prepared ->
+          Printf.printf "%s=%s\n"
+            Compiler_blorp_bridge.prepared_renderer_bridge_bin_env
+            prepared.prepared_renderer_bridge_bin;
+          Printf.printf "%s=%s\n"
+            Compiler_blorp_bridge.prepared_parser_bridge_bin_env
+            prepared.prepared_parser_bridge_bin;
+          0
+      | Error message ->
+          prerr_endline ("Error: " ^ message);
+          1)
+  | _ ->
+      prerr_endline "Usage: blorp __compiler-bridge-prepare <out-dir>";
+      1
+
 (** Format a list of pipeline errors for display *)
 let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
-(** Parse a blorp file and return the AST (for --ast mode only) *)
-let parse_file filename =
-  let input = read_file filename in
-  let base_dir = extract_directory filename in
-  init_module_paths base_dir;
-  match Modules.parse_source input with
-  | Ok program -> Ok (program, base_dir)
-  | Error err -> Error (Diagnostics.format_error ~file:filename err)
+let finalize_cli_frontend_parsed_response ~path ~module_name = function
+  | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics -> Error diagnostics
+  | Compiler_blorp_bridge.ParsedSource parsed_source -> (
+      match
+        Modules.finalize_blorp_parsed_source ~path ~module_name parsed_source
+      with
+      | Error errors -> Error errors
+      | Ok program -> Ok program)
 
 let type_expr_to_string = Types.type_to_string
 
@@ -154,14 +166,6 @@ let parse_sanitizer_mode_source source value =
         source;
       exit 1
 
-let parse_sanitizer_option arg =
-  match String.split_on_char '=' arg with
-  | [ "--sanitize" ] -> Some Test_runner.SanitizerAddressUndefined
-  | [ "--sanitize"; value ] -> Some (parse_sanitizer_mode_source arg value)
-  | _ ->
-      Printf.eprintf "Error: %s must be --sanitize or --sanitize=<mode>\n" arg;
-      exit 1
-
 let resolve_sanitizer_mode cli_sanitizer_mode =
   match cli_sanitizer_mode with
   | Some mode -> mode
@@ -177,7 +181,7 @@ let resolve_no_format cli_no_format =
   cli_no_format || Sys.getenv_opt "BLORP_NO_FORMAT" = Some "1"
 
 (** Auto-format a .brp file in place before compilation.
-    Uses the format cache to skip already-formatted files.
+    Uses the Blorp-owned formatter bridge.
     Does NOT format std library files. *)
 let auto_format_user_file filename =
   (* Skip std library files *)
@@ -186,7 +190,97 @@ let auto_format_user_file filename =
       ~dir:(Filename.concat (Sys.getcwd ()) "std")
       filename
   in
-  if not is_std then Fmt.auto_format filename
+  if not is_std then
+    match Compiler_blorp_bridge.cli_run_via_command [ "format"; filename ] with
+    | Ok _ | Error _ -> ()
+
+let line_start_offsets source =
+  let starts = ref [ 0 ] in
+  String.iteri
+    (fun index ch ->
+      if ch = '\n' then starts := (index + 1) :: !starts)
+    source;
+  Array.of_list (List.rev !starts)
+
+let offset_of_loc source line_starts (loc : Ast.loc) =
+  if loc.line <= 0 || loc.line > Array.length line_starts then 0
+  else
+    let line_start = line_starts.(loc.line - 1) in
+    min (String.length source) (line_start + max 0 (loc.column - 1))
+
+let is_identifier_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+  | _ -> false
+
+let keyword_at source offset keyword =
+  let source_len = String.length source in
+  let keyword_len = String.length keyword in
+  let next = offset + keyword_len in
+  if offset < 0 || next > source_len then false
+  else
+    let left_boundary =
+      offset = 0 || not (is_identifier_char source.[offset - 1])
+    in
+    let right_boundary =
+      next >= source_len || not (is_identifier_char source.[next])
+    in
+    String.sub source offset keyword_len = keyword
+    && left_boundary && right_boundary
+
+let find_last_keyword_between source ~start ~stop keyword =
+  let source_len = String.length source in
+  let keyword_len = String.length keyword in
+  let start = max 0 (min source_len start) in
+  let stop = max start (min source_len stop) in
+  let rec loop offset found =
+    if offset + keyword_len > stop then found
+    else
+      let found =
+        if keyword_at source offset keyword then Some offset else found
+      in
+      loop (offset + 1) found
+  in
+  loop start None
+
+let purify_candidate_func_offset source line_starts candidate =
+  let start = offset_of_loc source line_starts candidate.candidate_decl_loc in
+  let stop = offset_of_loc source line_starts candidate.candidate_body.expr_loc in
+  (* Declaration locs may start at docstrings or annotations. The body loc is
+     after the header, so the last `func` keyword in this bounded range is the
+     declaration keyword we need to mark pure. *)
+  match find_last_keyword_between source ~start ~stop "func" with
+  | Some offset -> Ok offset
+  | None ->
+      Error
+        (Printf.sprintf
+           "could not locate `func` keyword for purify candidate `%s` near \
+            %d:%d"
+           candidate.candidate_name candidate.candidate_decl_loc.line
+           candidate.candidate_decl_loc.column)
+
+let purify_rewrite_offsets source candidates =
+  let line_starts = line_start_offsets source in
+  let rec collect offsets = function
+    | [] -> Ok (List.sort_uniq compare offsets |> List.rev)
+    | candidate :: rest -> (
+        match purify_candidate_func_offset source line_starts candidate with
+        | Ok offset -> collect (offset :: offsets) rest
+        | Error _ as error -> error)
+  in
+  collect [] candidates
+
+let insert_pure_markers source offsets =
+  List.fold_left
+    (fun current offset ->
+      String.sub current 0 offset
+      ^ "pure "
+      ^ String.sub current offset (String.length current - offset))
+    source offsets
+
+let rewrite_source_with_pure_markers source candidates =
+  match purify_rewrite_offsets source candidates with
+  | Error _ as error -> error
+  | Ok offsets -> Ok (insert_pure_markers source offsets)
 
 (** Purify a file by automatically marking eligible functions as 'pure'. *)
 let purify_file ?(dry_run = false) ?(verbose = false) filename =
@@ -305,7 +399,7 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
                     {
                       candidate_id = id;
                       candidate_name = name;
-                      candidate_key = purify_func_key ~name loc;
+                      candidate_decl_loc = loc;
                       candidate_signature = signature;
                       candidate_func = func;
                       candidate_body = body;
@@ -321,12 +415,6 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
           IntSet.empty local_candidates
       in
       let local_candidate_id_list = IntSet.elements local_candidate_ids in
-      let local_candidate_key_by_id =
-        List.fold_left
-          (fun keys candidate ->
-            IntMap.add candidate.candidate_id candidate.candidate_key keys)
-          IntMap.empty local_candidates
-      in
       let local_candidate_id_by_name =
         List.fold_left
           (fun ids candidate ->
@@ -399,20 +487,13 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
         if IntSet.equal next viable then viable else prune_by_dependencies next
       in
       let purifiable_ids = prune_by_dependencies externally_viable in
-      let purifiable_keys =
-        IntSet.fold
-          (fun id keys ->
-            match IntMap.find_opt id local_candidate_key_by_id with
-            | Some key -> PurifyFuncKeySet.add key keys
-            | None -> keys)
-          purifiable_ids PurifyFuncKeySet.empty
+      let purifiable_candidates =
+        local_candidates
+        |> List.filter (fun candidate ->
+               IntSet.mem candidate.candidate_id purifiable_ids)
       in
       let ordered_names =
-        local_candidates
-        |> List.filter_map (fun candidate ->
-            if IntSet.mem candidate.candidate_id purifiable_ids then
-              Some candidate.candidate_name
-            else None)
+        purifiable_candidates |> List.map (fun candidate -> candidate.candidate_name)
       in
 
       match ordered_names with
@@ -428,55 +509,26 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
             List.length names
           end
           else
-            match Modules.parse_source ~filename source with
-            | Error err ->
-                prerr_endline (format_pipeline_errors ~file:filename [ err ]);
+            match rewrite_source_with_pure_markers source purifiable_candidates with
+            | Error message ->
+                prerr_endline message;
                 -1
-            | Ok source_program -> (
-                let comments = Lexer.get_comments () in
-                let rec purify_decl decl =
-                  match decl.Ast.decl_desc with
-                  | Ast.DFunc f ->
-                      let f =
-                        match f.Ast.func_name with
-                        | Some name
-                          when PurifyFuncKeySet.mem
-                                 (purify_func_key ~name decl.Ast.decl_loc)
-                                 purifiable_keys ->
-                            { f with Ast.func_is_pure = true }
-                        | _ -> f
-                      in
-                      { decl with Ast.decl_desc = Ast.DFunc f }
-                  | Ast.DPrivate inner ->
-                      {
-                        decl with
-                        Ast.decl_desc = Ast.DPrivate (purify_decl inner);
-                      }
-                  | _ -> decl
-                in
-                let new_program = List.map purify_decl source_program in
+            | Ok rewritten -> (
                 match
-                  Fmt.format_program_with_comments ~comments new_program
+                  Pipeline.typecheck_module_only_typed ~filename ~source:rewritten
                 with
-                | Error msg ->
-                    prerr_endline msg;
+                | Error errors ->
+                    prerr_endline (format_pipeline_errors ~file:filename errors);
                     -1
-                | Ok formatted -> (
-                    match
-                      Pipeline.typecheck_module_only_typed ~filename
-                        ~source:formatted
-                    with
-                    | Error errors ->
-                        prerr_endline
-                          (format_pipeline_errors ~file:filename errors);
-                        -1
-                    | Ok _ ->
-                        let oc = open_out filename in
-                        output_string oc formatted;
-                        close_out oc;
-                        Printf.printf "Purified %d function(s) in %s\n"
-                          (List.length names) filename;
-                        List.length names))))
+                | Ok _ ->
+                    (* Preserve the user's source layout and comments. The full
+                       formatter is available as an explicit `blorp format`
+                       command; purify only needs to insert proven-safe `pure`
+                       markers. *)
+                    write_file filename rewritten;
+                    Printf.printf "Purified %d function(s) in %s\n"
+                      (List.length names) filename;
+                    List.length names)))
 
 type compile_opts = {
   no_emit : bool;
@@ -691,28 +743,19 @@ let build_on_stage ?source_file opts : obs =
         cleanup = close_once;
       }
 
-let check_file_with_opts opts filename =
-  if not opts.no_format then auto_format_user_file filename;
+let check_file_with_opts ~frontend_program opts filename =
   if opts.ast_only then
-    begin match parse_file filename with
-    | Error msg ->
-        prerr_endline msg;
-        1
-    | Ok (program, _) ->
-        print_endline (program_to_string program);
-        0
+    begin
+      print_endline (program_to_string frontend_program);
+      0
     end
-  else
-    let source = read_file filename in
+  else begin
     init_module_paths (extract_directory filename);
-    if opts.dump_ast then
-      begin match parse_file filename with
-      | Error msg -> prerr_endline msg
-      | Ok (program, _) -> print_endline (program_to_string program)
-      end;
+    if opts.dump_ast then print_endline (program_to_string frontend_program);
     if opts.dump_typed_ast then (
       match
-        Pipeline.typecheck_only_typed ~filename ~source ~debug:opts.debug ()
+        Pipeline.typecheck_only_typed_parsed ~filename ~program:frontend_program
+          ~debug:opts.debug ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -722,13 +765,17 @@ let check_file_with_opts opts filename =
           print_endline "Type checking succeeded.";
           0)
     else
-      match Pipeline.typecheck_only ~filename ~source ~debug:opts.debug () with
+      match
+        Pipeline.typecheck_only_parsed ~filename ~program:frontend_program
+          ~debug:opts.debug ()
+      with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
           1
       | Ok _program ->
           print_endline "Type checking succeeded.";
           0
+  end
 
 let write_compile_output opts filename c_code =
   let base = Filename.remove_extension filename in
@@ -740,31 +787,21 @@ let write_compile_output opts filename c_code =
   Printf.printf "Generated %s\n" c_file;
   0
 
-let compile_file_with_opts opts filename =
-  if opts.no_emit then check_file_with_opts opts filename
+let compile_file_with_opts ~frontend_program opts filename =
+  if opts.no_emit then check_file_with_opts ~frontend_program opts filename
   else begin
-    if not opts.no_format then auto_format_user_file filename;
     if opts.ast_only then
-      begin match parse_file filename with
-      | Error msg ->
-          prerr_endline msg;
-          1
-      | Ok (program, _) ->
-          print_endline (program_to_string program);
-          0
+      begin
+        print_endline (program_to_string frontend_program);
+        0
       end
-    else
-      let source = read_file filename in
+    else begin
       init_module_paths (extract_directory filename);
       (* --dump-ast prints the parsed AST before any further work, then
          continues with the rest of the pipeline. Unlike --ast (which stops
          after parse), it's non-destructive and composes with --dump-core,
          --time-phases, etc. *)
-      if opts.dump_ast then
-        begin match parse_file filename with
-        | Error msg -> prerr_endline msg
-        | Ok (program, _) -> print_endline (program_to_string program)
-        end;
+      if opts.dump_ast then print_endline (program_to_string frontend_program);
       let obs = build_on_stage ~source_file:filename opts in
       let print_profile () =
         match obs.profiler with
@@ -774,21 +811,21 @@ let compile_file_with_opts opts filename =
       Fun.protect ~finally:obs.cleanup (fun () ->
           let result =
             match
-              Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
-                ?on_stage_event:obs.core_stage_event
+              Pipeline.compile_parsed ~debug:opts.debug
+                ?on_stage:obs.callback ?on_stage_event:obs.core_stage_event
                 ?on_stage_json:obs.tail_json_callback
                 ~tail_observation_stages:obs.tail_observation_stages
                 ~program_observation:obs.program_observation
                 ~check_invariants:opts.check_invariants
                 ~embed_runtime:opts.embed_runtime
-                ?on_frontend_phase:obs.frontend_callback ~filename ~source ()
+                ?on_frontend_phase:obs.frontend_callback ~filename
+                ~program:frontend_program ()
             with
             | Error errors ->
                 prerr_endline (format_pipeline_errors ~file:filename errors);
                 1
             | Ok (Pipeline.Stopped_at s) ->
-                Printf.eprintf "stopped after %s\n"
-                  (Blorp.Core_stage.to_string s);
+                Printf.eprintf "stopped after %s\n" (Blorp.Core_stage.to_string s);
                 0
             | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
                 if opts.dump_typed_ast then
@@ -797,12 +834,30 @@ let compile_file_with_opts opts filename =
           in
           print_profile ();
           result)
+    end
   end
+
+let compile_bootstrap_file_with_opts opts filename =
+  if not opts.no_format then auto_format_user_file filename;
+  init_module_paths (extract_directory filename);
+  let source = read_file filename in
+  match
+    Pipeline.compile ~debug:opts.debug ~embed_runtime:opts.embed_runtime
+      ~filename ~source ()
+  with
+  | Error errors ->
+      prerr_endline (format_pipeline_errors ~file:filename errors);
+      1
+  | Ok (Pipeline.Stopped_at s) ->
+      Printf.eprintf "stopped after %s\n" (Blorp.Core_stage.to_string s);
+      0
+  | Ok (Pipeline.Compiled { c_code; _ }) -> write_compile_output opts filename c_code
 
 (** Compile and run a blorp file *)
 let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(run_mode = Compile_profile.Fast)
-    ~timeout ?(no_format = false) ?(user_args = []) filename =
+    ~timeout ?(user_args = []) ~frontend_program
+    filename =
   Test_runner.with_run_artifacts (fun () ->
       let sanitizer_mode =
         match sanitizer_mode with
@@ -812,8 +867,6 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
             else Test_runner.SanitizerOff
       in
       let sanitize = Test_runner.sanitizer_enabled sanitizer_mode in
-      if not no_format then auto_format_user_file filename;
-      let source = read_file filename in
       init_module_paths (extract_directory filename);
       let opt = Compile_profile.opt_level_for_run ~sanitize run_mode in
       let precompiled =
@@ -821,8 +874,8 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
       in
       let embed_runtime = precompiled = None in
       match
-        Pipeline.compile ~profile ~debug ~embed_runtime ~require_main:true
-          ~filename ~source ()
+        Pipeline.compile_parsed ~profile ~debug ~embed_runtime ~require_main:true
+          ~filename ~program:frontend_program ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -909,178 +962,6 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
             end
             else result
           end)
-
-(** Print usage *)
-let usage () =
-  print_endline "blorp - Blorp Compiler";
-  print_endline "";
-  print_endline "Usage: blorp <command> [options] [args]";
-  print_endline "";
-  print_endline "Commands:";
-  print_endline "  check      Parse, import, and type check .brp files";
-  print_endline "  compile    Compile a .brp file to C";
-  print_endline "  run        Compile and run a .brp file";
-  print_endline "  test       Run tests (file or directory)";
-  print_endline "  format     Format source files";
-  print_endline "  package    Validate source packages";
-  print_endline "  lsp        Start LSP server";
-  print_endline "  repl       Interactive REPL";
-  print_endline "  purify     Automatically mark pure functions";
-  print_endline "";
-  print_endline "Flags:";
-  print_endline "  --version  Show version";
-  print_endline "  --help     Show this help";
-  print_endline "";
-  print_endline
-    "Run 'blorp <command> --help' for details on a specific command.";
-  print_endline "";
-  print_endline "Project config:";
-  print_endline
-    "  blorp.toml          Optional project config; [std].path sets std \
-     directory";
-  print_endline "";
-  print_endline "Environment:";
-  print_endline
-    "  BLORP_STD=<path>      Use std directory (--std-dir overrides; beats \
-     blorp.toml)";
-  print_endline "  BLORP_TIMEOUT=N       Default timeout (CLI flag overrides)";
-  print_endline
-    "  BLORP_TEST_TIMEOUT=N  Default test timeout (test --timeout overrides)";
-  print_endline "  BLORP_SANITIZE=1|address|undefined";
-  print_endline
-    "                         Enable sanitizers (CLI flag overrides)";
-  print_endline
-    "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
-  print_endline "  BLORP_TLS_BACKEND=unsupported|openssl";
-  print_endline
-    "                         Select runtime TLS backend profile (default: \
-     unsupported)";
-  print_endline
-    "  BLORP_THREADS=N       Runtime worker thread pool size (run --threads \
-     overrides)";
-  print_endline
-    "  BLORP_NO_FORMAT=1     Skip auto-formatting (CLI flag overrides)"
-
-type repl_cli_action =
-  | ReplHelp
-  | ReplRun of { repl_debug : bool }
-  | ReplArgError of string
-
-type lsp_cli_action = LspHelp | LspRun | LspArgError of string
-type format_cli_mode = FormatWrite | FormatCheck of { show_diff : bool }
-
-type format_cli_action =
-  | FormatHelp
-  | FormatFiles of { mode : format_cli_mode; paths : string list }
-  | FormatEmitProgramJson of string
-  | FormatArgError of string
-
-type format_parse_state =
-  | FormatSourceState of { mode : format_cli_mode; paths_rev : string list }
-  | FormatProgramJsonState of { paths_rev : string list }
-
-let repl_usage () =
-  print_endline "Usage: blorp repl [options]";
-  print_endline "";
-  print_endline "Options:";
-  print_endline "  --debug      Enable debug functions";
-  print_endline "  --help, -h   Show this help"
-
-let lsp_usage () =
-  print_endline "Usage: blorp lsp";
-  print_endline "";
-  print_endline "Starts the Language Server Protocol server over stdin/stdout.";
-  print_endline "";
-  print_endline "Options:";
-  print_endline "  --help, -h   Show this help"
-
-let format_usage () =
-  print_endline "Usage: blorp format [options] <file.brp|dir>";
-  print_endline "";
-  print_endline "Options:";
-  print_endline "  --check        Check if file is formatted (exit 1 if not)";
-  print_endline
-    "  --diff         Show diff for unformatted files (implies --check)";
-  print_endline
-    "  --emit-program-json Print formatter full-program JSON for one file \
-     (internal)";
-  print_endline "";
-  print_endline "Accepts files or directories (recursively finds .brp files)."
-
-let package_usage () =
-  print_endline "Usage: blorp package <command> [args]";
-  print_endline "";
-  print_endline "Commands:";
-  print_endline
-    "  check <path>          Validate a portable source package directory";
-  print_endline
-    "  hash <path>           Print a portable source package BLAKE3 hash";
-  print_endline
-    "  pack <path> -o <file> Write a deterministic .blorpkg artifact";
-  print_endline
-    "  fetch [hash-or-alias [from ...]] Cache verified package artifacts";
-  print_endline
-    "  vendor [hash-or-alias [path]] Copy cached packages into vendor dirs";
-  print_endline "";
-  print_endline "A source package contains package.toml plus src/*.brp files.";
-  print_endline
-    "Package code may import only std modules and modules from the same \
-     package."
-
-let package_check_usage () =
-  print_endline "Usage: blorp package check <path>";
-  print_endline "";
-  print_endline
-    "Validates package.toml, exported source files, imports, and the";
-  print_endline
-    "portable-source policy: no foreign declarations and no builtin use."
-
-let package_hash_usage () =
-  print_endline "Usage: blorp package hash <path>";
-  print_endline "";
-  print_endline
-    "Validates a source package and prints its canonical BLAKE3 content hash."
-
-let package_pack_usage () =
-  print_endline "Usage: blorp package pack <path> -o <file>";
-  print_endline "";
-  print_endline
-    "Validates a source package and writes a deterministic source artifact."
-
-let package_fetch_usage () =
-  print_endline "Usage: blorp package fetch";
-  print_endline "       blorp package fetch <alias>";
-  print_endline "       blorp package fetch <hash> <from>...";
-  print_endline "";
-  print_endline
-    "Without arguments, fetches all downloadable packages from blorp.toml.";
-  print_endline "With explicit locations, installs the first matching artifact.";
-  print_endline
-    "With an alias, reads hash and from from the nearest blorp.toml.";
-  print_endline
-    "Locations may be local paths, file:// URLs, or HTTP(S) artifact URLs."
-
-let package_vendor_usage () =
-  print_endline "Usage: blorp package vendor";
-  print_endline "       blorp package vendor <hash> <path>";
-  print_endline "       blorp package vendor <alias> [path]";
-  print_endline "";
-  print_endline
-    "Without arguments, vendors cached packages from blorp.toml to \
-     vendor/<alias>.";
-  print_endline "With an alias, reads the nearest blorp.toml.";
-  print_endline "With a hash, pass an explicit destination path."
-
-let parse_package_pack_args args =
-  let rec loop path output = function
-    | [] -> (path, output)
-    | ("--output" | "-o") :: value :: rest -> loop path (Some value) rest
-    | ("--output" | "-o") :: [] -> (path, None)
-    | arg :: rest when String.starts_with ~prefix:"-" arg ->
-        loop path output rest
-    | arg :: rest -> loop (Some arg) output rest
-  in
-  loop None None args
 
 let package_pin_overlap left right =
   match
@@ -1392,80 +1273,6 @@ let package_vendor_all_from_config () =
           | error :: rest -> Error (String.concat "\n" (error :: rest))
           | [] -> Ok (List.rev !vendored, List.rev !skipped_local)))
 
-let parse_repl_cli_args args =
-  let rec loop debug = function
-    | [] -> ReplRun { repl_debug = debug }
-    | ("--help" | "-h") :: _ -> ReplHelp
-    | "--debug" :: rest -> loop true rest
-    | arg :: _ -> ReplArgError (Printf.sprintf "Unknown repl option: %s" arg)
-  in
-  loop false args
-
-let parse_lsp_cli_args = function
-  | [] -> LspRun
-  | [ "--help" ] | [ "-h" ] -> LspHelp
-  | arg :: _ -> LspArgError (Printf.sprintf "Unknown lsp option: %s" arg)
-
-let format_state_add_path path = function
-  | FormatSourceState { mode; paths_rev } ->
-      FormatSourceState { mode; paths_rev = path :: paths_rev }
-  | FormatProgramJsonState { paths_rev } ->
-      FormatProgramJsonState { paths_rev = path :: paths_rev }
-
-let parse_format_cli_args args =
-  let rec loop state = function
-    | [] -> (
-        match state with
-        | FormatSourceState { mode; paths_rev } -> (
-            match List.rev paths_rev with
-            | [] ->
-                FormatArgError
-                  "no files specified. Usage: blorp format [--check] \
-                   <file.brp|dir>"
-            | paths -> FormatFiles { mode; paths })
-        | FormatProgramJsonState { paths_rev } -> (
-            match List.rev paths_rev with
-            | [ filename ] -> FormatEmitProgramJson filename
-            | _ ->
-                FormatArgError
-                  "--emit-program-json accepts exactly one .brp file"))
-    | ("--help" | "-h") :: _ -> FormatHelp
-    | "--check" :: rest -> (
-        match state with
-        | FormatSourceState { mode; paths_rev } ->
-            let mode =
-              match mode with
-              | FormatWrite -> FormatCheck { show_diff = false }
-              | FormatCheck _ -> mode
-            in
-            loop (FormatSourceState { mode; paths_rev }) rest
-        | FormatProgramJsonState _ ->
-            FormatArgError "--emit-program-json cannot be combined with --check"
-        )
-    | "--diff" :: rest -> (
-        match state with
-        | FormatSourceState { paths_rev; _ } ->
-            loop
-              (FormatSourceState
-                 { mode = FormatCheck { show_diff = true }; paths_rev })
-              rest
-        | FormatProgramJsonState _ ->
-            FormatArgError "--emit-program-json cannot be combined with --diff")
-    | "--emit-program-json" :: rest -> (
-        match state with
-        | FormatSourceState { mode = FormatWrite; paths_rev } ->
-            loop (FormatProgramJsonState { paths_rev }) rest
-        | FormatSourceState { mode = FormatCheck _; _ } ->
-            FormatArgError
-              "--emit-program-json cannot be combined with --check or --diff"
-        | FormatProgramJsonState _ ->
-            FormatArgError "--emit-program-json was specified more than once")
-    | option :: _ when String.starts_with ~prefix:"-" option ->
-        FormatArgError (Printf.sprintf "unknown format option: %s" option)
-    | file :: rest -> loop (format_state_add_path file state) rest
-  in
-  loop (FormatSourceState { mode = FormatWrite; paths_rev = [] }) args
-
 (** Recursively collect .brp files from paths (files or directories) *)
 let rec collect_brp_files path =
   if Sys.is_directory path then
@@ -1479,6 +1286,110 @@ let rec collect_brp_files path =
 let expand_check_path path =
   if Sys.is_directory path then collect_brp_files path else [ path ]
 
+let module_name_for_cli_source_file path =
+  match Modules.module_name_for_source_file path with
+  | Some name -> name
+  | None ->
+      let base = Filename.basename path in
+      if Filename.check_suffix base ".brp" then
+        String.sub base 0 (String.length base - 4)
+      else base
+
+type parsed_cli_file = {
+  parsed_cli_path : string;
+  parsed_cli_program : Ast.program option;
+}
+
+let parsed_cli_success path program =
+  { parsed_cli_path = path; parsed_cli_program = Some program }
+
+let parsed_cli_failure path =
+  { parsed_cli_path = path; parsed_cli_program = None }
+
+let parse_cli_file_request path =
+  init_module_paths (extract_directory path);
+  {
+    Compiler_blorp_bridge.batch_parse_path = path;
+    batch_parse_module_name = module_name_for_cli_source_file path;
+    batch_parse_text = read_file path;
+  }
+
+let print_parse_diagnostics ~file diagnostics =
+  prerr_endline (format_pipeline_errors ~file diagnostics)
+
+let print_batch_parse_size_mismatch
+    (request : Compiler_blorp_bridge.parse_source_batch_request) =
+  Printf.eprintf
+    "%s:1:1: error: Blorp parser bridge returned a mismatched batch size \
+     while parsing checked files\n"
+    request.Compiler_blorp_bridge.batch_parse_path
+
+let print_batch_parse_mismatch
+    ~(expected : Compiler_blorp_bridge.parse_source_batch_request)
+    (actual : Compiler_blorp_bridge.parse_source_batch_response) =
+  Printf.eprintf
+    "%s:1:1: error: Blorp parser bridge returned artifact for '%s' at '%s' \
+     while parsing '%s' at '%s'\n"
+    expected.Compiler_blorp_bridge.batch_parse_path
+    actual.Compiler_blorp_bridge.batch_parsed_module_name
+    actual.batch_parsed_path expected.batch_parse_module_name
+    expected.batch_parse_path
+
+let finalize_cli_parse_response
+    (request : Compiler_blorp_bridge.parse_source_batch_request)
+    (response : Compiler_blorp_bridge.parse_source_batch_response) =
+  if
+    response.Compiler_blorp_bridge.batch_parsed_path <> request.batch_parse_path
+    || response.batch_parsed_module_name <> request.batch_parse_module_name
+  then begin
+    print_batch_parse_mismatch ~expected:request response;
+    parsed_cli_failure request.batch_parse_path
+  end
+  else
+    match
+      finalize_cli_frontend_parsed_response ~path:request.batch_parse_path
+        ~module_name:request.batch_parse_module_name
+        response.batch_parsed_response
+    with
+    | Error diagnostics ->
+        print_parse_diagnostics ~file:request.batch_parse_path diagnostics;
+        parsed_cli_failure request.batch_parse_path
+    | Ok program -> parsed_cli_success request.batch_parse_path program
+
+let rec finalize_cli_parse_response_pairs requests responses =
+  match (requests, responses) with
+  | [], [] -> []
+  | request :: rest_requests, response :: rest_responses ->
+      finalize_cli_parse_response request response
+      :: finalize_cli_parse_response_pairs rest_requests rest_responses
+  | _ -> []
+
+let finalize_cli_parse_responses requests responses =
+  if List.length requests <> List.length responses then
+    List.map
+      (fun request ->
+        print_batch_parse_size_mismatch request;
+        parsed_cli_failure request.batch_parse_path)
+      requests
+  else finalize_cli_parse_response_pairs requests responses
+
+let parse_cli_files_with_blorp files =
+  let requests = List.map parse_cli_file_request files in
+  match Compiler_blorp_bridge.parse_sources_via_command requests with
+  | Ok responses -> finalize_cli_parse_responses requests responses
+  | Error (_, message) ->
+      List.map
+        (fun (request : Compiler_blorp_bridge.parse_source_batch_request) ->
+          Printf.eprintf "%s:1:1: error: %s\n" request.batch_parse_path message;
+          parsed_cli_failure request.batch_parse_path)
+        requests
+
+let parse_cli_file_with_blorp ?(format_first = false) file =
+  if format_first then auto_format_user_file file;
+  match parse_cli_files_with_blorp [ file ] with
+  | [ { parsed_cli_program = Some program; _ } ] -> Some program
+  | _ -> None
+
 let check_paths_with_opts opts paths =
   let files = List.concat_map expand_check_path paths in
   if files = [] then begin
@@ -1487,854 +1398,458 @@ let check_paths_with_opts opts paths =
   end
   else
     let multiple = match files with [ _ ] -> false | _ -> true in
+    if not opts.no_format then List.iter auto_format_user_file files;
+    let parsed_files = parse_cli_files_with_blorp files in
     let failed = ref false in
     List.iter
-      (fun file ->
+      (fun parsed ->
+        let file = parsed.parsed_cli_path in
         if multiple then Printf.printf "Checking %s\n" file;
-        if check_file_with_opts opts file <> 0 then failed := true)
-      files;
+        match parsed.parsed_cli_program with
+        | Some program ->
+            if check_file_with_opts ~frontend_program:program opts file <> 0 then
+              failed := true
+        | None -> failed := true)
+      parsed_files;
     if !failed then 1 else 0
+
+type blorp_cli_frontier =
+  | BlorpCliDelegate of string list
+  | BlorpCliCheck of Ast.program option * Compiler_blorp_bridge.cli_check_options
+  | BlorpCliCompile of
+      Ast.program option * Compiler_blorp_bridge.cli_compile_options
+  | BlorpCliRun of Ast.program option * Compiler_blorp_bridge.cli_run_options
+  | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
+  | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
+  | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
+  | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
+  | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
+
+let cli_frontier_of_frontend_options ?frontend_program =
+  let open Compiler_blorp_bridge in
+  function
+  | CliFrontendCheckOptions options ->
+      BlorpCliCheck (frontend_program, options)
+  | CliFrontendCompileOptions options ->
+      BlorpCliCompile (frontend_program, options)
+  | CliFrontendRunOptions options -> BlorpCliRun (frontend_program, options)
+
+let cli_frontier_parsed_program parsed =
+  match
+    finalize_cli_frontend_parsed_response ~path:parsed.Compiler_blorp_bridge.cli_frontend_path
+      ~module_name:parsed.Compiler_blorp_bridge.cli_frontend_module_name
+      parsed.Compiler_blorp_bridge.cli_frontend_parsed_response
+  with
+  | Error errors ->
+      prerr_endline
+        (format_pipeline_errors ~file:parsed.Compiler_blorp_bridge.cli_frontend_path errors);
+      exit 1
+  | Ok program ->
+      cli_frontier_of_frontend_options ~frontend_program:program
+        parsed.Compiler_blorp_bridge.cli_frontend_options
+
+let set_std_override_option = function
+  | Some dir -> Modules.set_std_override dir
+  | None -> ()
+
+let frontend_program_or_parse ?frontend_program ~no_format file =
+  match frontend_program with
+  | Some program -> Some program
+  | None -> parse_cli_file_with_blorp ~format_first:(not no_format) file
+
+let compile_opts_of_cli_check
+    (options : Compiler_blorp_bridge.cli_check_options) =
+  {
+    default_compile_opts with
+    no_emit = true;
+    dump_ast = options.cli_check_dump_ast;
+    dump_typed_ast = options.cli_check_dump_typed_ast;
+    debug = options.cli_check_debug;
+    no_format = resolve_no_format options.cli_check_no_format;
+  }
+
+let compile_opts_of_cli_compile
+    (options : Compiler_blorp_bridge.cli_compile_options) =
+  {
+    default_compile_opts with
+    ast_only = options.cli_compile_ast_only;
+    dump_ast = options.cli_compile_dump_ast;
+    dump_typed_ast = options.cli_compile_dump_typed_ast;
+    dump_core_after = options.cli_compile_dump_core_after;
+    dump_file = options.cli_compile_dump_file;
+    stop_after = options.cli_compile_stop_after;
+    time_phases = options.cli_compile_time_phases;
+    check_invariants = options.cli_compile_check_invariants;
+    debug = options.cli_compile_debug;
+    no_format = resolve_no_format options.cli_compile_no_format;
+    embed_runtime = options.cli_compile_embed_runtime;
+    output = options.cli_compile_output;
+  }
+
+let sanitizer_mode_of_cli_frontend =
+  let open Compiler_blorp_bridge in
+  function
+  | CliFrontendSanitizeOff -> Test_runner.SanitizerOff
+  | CliFrontendSanitizeAddressUndefined ->
+      Test_runner.SanitizerAddressUndefined
+  | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
+
+let run_check_from_frontier_options ?frontend_program
+    (options : Compiler_blorp_bridge.cli_check_options) =
+  let opts = compile_opts_of_cli_check options in
+  set_std_override_option options.cli_check_std_dir;
+  match options.cli_check_paths with
+  | [] ->
+      prerr_endline "Error: No input file specified";
+      1
+  | [ file ] when not (Sys.is_directory file) -> (
+      match frontend_program_or_parse ?frontend_program ~no_format:opts.no_format file with
+      | Some program -> check_file_with_opts ~frontend_program:program opts file
+      | None -> 1)
+  | paths -> check_paths_with_opts opts paths
+
+let run_compile_from_frontier_options ?frontend_program
+    (options : Compiler_blorp_bridge.cli_compile_options) =
+  let opts = compile_opts_of_cli_compile options in
+  set_std_override_option options.cli_compile_std_dir;
+  match options.cli_compile_files with
+  | [ file ] -> (
+      match frontend_program_or_parse ?frontend_program ~no_format:opts.no_format file with
+      | Some program -> compile_file_with_opts ~frontend_program:program opts file
+      | None -> 1)
+  | [] ->
+      prerr_endline "Error: No input file specified";
+      1
+  | _ ->
+      prerr_endline "Error: Multiple input files not supported";
+      1
+
+let bootstrap_compile_opts args =
+  let rec parse args opts files =
+    match args with
+    | [] -> (
+        match (opts.output, List.rev files) with
+        | Some _, [ file ] -> Ok (opts, file)
+        | None, _ -> Error "Error: bootstrap compile requires -o <file>"
+        | _, [] -> Error "Error: bootstrap compile requires an input file"
+        | _, _ -> Error "Error: bootstrap compile accepts exactly one input file")
+    | "--no-format" :: rest -> parse rest { opts with no_format = true } files
+    | "-o" :: out :: rest -> parse rest { opts with output = Some out } files
+    | [ "-o" ] -> Error "Error: -o requires a value"
+    | arg :: _ when String.length arg > 0 && arg.[0] = '-' ->
+        Error ("Error: unsupported bootstrap compile option: " ^ arg)
+    | file :: rest -> parse rest opts (file :: files)
+  in
+  parse args default_compile_opts []
+
+let run_bootstrap_compile_command rest =
+  match bootstrap_compile_opts rest with
+  | Ok (opts, file) -> compile_bootstrap_file_with_opts opts file
+  | Error message ->
+      prerr_endline message;
+      1
+
+let run_file_from_frontier_options ?frontend_program
+    (options : Compiler_blorp_bridge.cli_run_options) =
+  let timeout = resolve_timeout options.cli_run_timeout in
+  let sanitizer_mode =
+    options.cli_run_sanitizer
+    |> Option.map sanitizer_mode_of_cli_frontend
+    |> resolve_sanitizer_mode
+  in
+  let leak_check = resolve_leak_check options.cli_run_leak_check in
+  let no_format = resolve_no_format options.cli_run_no_format in
+  let run_mode =
+    if options.cli_run_release then Compile_profile.Release
+    else Compile_profile.Fast
+  in
+  set_std_override_option options.cli_run_std_dir;
+  (match options.cli_run_threads with
+  | Some n -> Unix.putenv "BLORP_THREADS" (string_of_int n)
+  | None -> ());
+  match options.cli_run_files with
+  | [ file ] -> (
+      match frontend_program_or_parse ?frontend_program ~no_format file with
+      | Some program ->
+          run_file ~profile:options.cli_run_profile ~debug:options.cli_run_debug
+            ~sanitizer_mode ~leak_check ~timeout ~run_mode
+            ~user_args:options.cli_run_user_args ~frontend_program:program file
+      | None -> 1)
+  | [] ->
+      prerr_endline "Error: No input file specified";
+      1
+  | _ ->
+      prerr_endline "Error: Multiple input files not supported";
+      1
+
+let test_mode_of_cli_frontend =
+  let open Compiler_blorp_bridge in
+  function
+  | CliFrontendTestAll -> Test_runner.TestAll
+  | CliFrontendTestDocOnly -> Test_runner.DocOnly
+  | CliFrontendTestSuiteOnly -> Test_runner.SuiteOnly
+
+let auto_format_test_path path =
+  if Sys.is_directory path then
+    Array.iter
+      (fun file ->
+        if Filename.check_suffix file ".brp" then
+          auto_format_user_file (Filename.concat path file))
+      (Sys.readdir path)
+  else auto_format_user_file path
+
+let warmup_test_artifacts () =
+  Test_runner.with_run_artifacts (fun () ->
+      ignore (Test_runner.precompile_runtime ()));
+  0
+
+let run_test_from_frontier_options
+    (options : Compiler_blorp_bridge.cli_test_options) =
+  match options with
+  | Compiler_blorp_bridge.CliTestWarmupOnlyOptions _ ->
+      warmup_test_artifacts ()
+  | Compiler_blorp_bridge.CliTestRunOptions options ->
+      let timeout =
+        match resolve_test_timeout options.cli_test_timeout with
+        | Some _ as timeout -> timeout
+        | None -> Some 30
+      in
+      let sanitizer_mode =
+        options.cli_test_sanitizer
+        |> Option.map sanitizer_mode_of_cli_frontend
+        |> resolve_sanitizer_mode
+      in
+      let leak_check = resolve_leak_check options.cli_test_leak_check in
+      let no_format = resolve_no_format options.cli_test_no_format in
+      let mode = test_mode_of_cli_frontend options.cli_test_mode in
+      if not no_format then List.iter auto_format_test_path options.cli_test_paths;
+      set_std_override_option options.cli_test_std_dir;
+      match options.cli_test_paths with
+      | [ path ] ->
+          Test_runner.run_tests ~profile:options.cli_test_profile
+            ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
+            ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
+            ~repeat:options.cli_test_repeat path
+      | [] ->
+          prerr_endline "Error: No test path specified";
+          1
+      | paths ->
+          Test_runner.run_tests_paths ~profile:options.cli_test_profile
+            ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
+            ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
+            ~repeat:options.cli_test_repeat paths
+
+let run_purify_from_frontier_options
+    (options : Compiler_blorp_bridge.cli_purify_options) =
+  let all_files =
+    List.map collect_brp_files options.cli_purify_paths |> List.flatten
+  in
+  match all_files with
+  | [] ->
+      prerr_endline "Error: No input files specified";
+      1
+  | files ->
+      let results =
+        List.map
+          (purify_file ~dry_run:options.cli_purify_dry_run
+             ~verbose:options.cli_purify_verbose)
+          files
+      in
+      let total_purified =
+        List.fold_left (fun acc r -> acc + max 0 r) 0 results
+      in
+      let files_modified =
+        List.filter (fun r -> r > 0) results |> List.length
+      in
+      if
+        (not options.cli_purify_dry_run)
+        && (files_modified > 1 || (files_modified = 1 && List.length files > 1))
+      then
+        Printf.printf "Total: Purified %d function(s) across %d file(s).\n"
+          total_purified files_modified;
+      if List.exists (fun r -> r < 0) results then 1 else 0
+
+let run_package_from_frontier_options
+    (options : Compiler_blorp_bridge.cli_package_options) =
+  let open Compiler_blorp_bridge in
+  match options.cli_package_command with
+  | CliPackageCheck path -> (
+      match Package_check.check path with
+      | Ok result ->
+          Printf.printf "Package %s: ok (%d source files checked)\n"
+            result.Package_check.manifest.Package_manifest.name
+            (List.length result.Package_check.source_files);
+          0
+      | Error errors ->
+          prerr_endline (Package_check.render_errors errors);
+          1)
+  | CliPackageHash path -> (
+      match Package_check.check path with
+      | Error errors ->
+          prerr_endline (Package_check.render_errors errors);
+          1
+      | Ok result -> (
+          match
+            Package_hash.hash_checked_package ~root:path
+              ~source_files:result.Package_check.source_files
+          with
+          | Ok hash ->
+              print_endline hash;
+              0
+          | Error errors ->
+              prerr_endline (Package_hash.render_errors errors);
+              1))
+  | CliPackagePack { path; output } -> (
+      match Package_check.check path with
+      | Error errors ->
+          prerr_endline (Package_check.render_errors errors);
+          1
+      | Ok result -> (
+          match
+            Package_artifact.write_checked_package ~root:path
+              ~source_files:result.Package_check.source_files ~output
+          with
+          | Ok hash ->
+              Printf.printf "Wrote %s\nHash %s\n" output hash;
+              0
+          | Error errors ->
+              prerr_endline (Package_artifact.render_errors errors);
+              1))
+  | CliPackageFetchAll -> (
+      match package_fetch_all_from_config () with
+      | Ok (fetched, cached, skipped_local) ->
+          List.iter
+            (fun (alias, cached_package) ->
+              Printf.printf "Fetched %s\nHash %s\nCache %s\n" alias
+                cached_package.Package_cache.hash cached_package.Package_cache.path)
+            fetched;
+          List.iter
+            (fun (alias, cached_package) ->
+              Printf.printf "Already cached %s\nHash %s\nCache %s\n" alias
+                cached_package.Package_cache.hash cached_package.Package_cache.path)
+            cached;
+          List.iter
+            (fun alias -> Printf.printf "Skipped local package %s\n" alias)
+            skipped_local;
+          if fetched = [] && cached = [] && skipped_local = [] then
+            print_endline "No packages declared";
+          0
+      | Error message ->
+          prerr_endline message;
+          1)
+  | CliPackageFetchTarget { target; from } -> (
+      let result =
+        match from with
+        | [] -> package_fetch_from_config target
+        | _ -> package_fetch_explicit target from
+      in
+      match result with
+      | Ok (alias, fetch_result) ->
+          print_package_fetch_result alias fetch_result;
+          0
+      | Error message ->
+          prerr_endline message;
+          1)
+  | CliPackageVendorAll -> (
+      match package_vendor_all_from_config () with
+      | Ok (vendored, skipped_local) ->
+          List.iter print_package_vendor_result vendored;
+          List.iter
+            (fun alias -> Printf.printf "Skipped local package %s\n" alias)
+            skipped_local;
+          if vendored = [] && skipped_local = [] then
+            print_endline "No packages declared";
+          0
+      | Error message ->
+          prerr_endline message;
+          1)
+  | CliPackageVendorTarget { target; dest } -> (
+      match package_vendor_target target dest with
+      | Ok result ->
+          print_package_vendor_result result;
+          0
+      | Error message ->
+          prerr_endline message;
+          1)
+
+let is_internal_compiler_command = function
+  | "__compiler-tests" :: _
+  | "__compiler-bridge" :: _
+  | "__compiler-bridge-prepare" :: _ ->
+      true
+  | _ -> false
+
+let compiling_blorp_bridge_helper () =
+  Sys.getenv_opt Compiler_blorp_bridge.renderer_bridge_helper_env = Some "1"
+  || Sys.getenv_opt Compiler_blorp_bridge.compiler_bootstrap_menhir_parser_env
+     = Some "1"
+
+let apply_blorp_cli_frontier args =
+  if is_internal_compiler_command args || compiling_blorp_bridge_helper () then
+    BlorpCliDelegate args
+  else
+    match
+      Compiler_blorp_bridge.cli_run_via_command ~version:(Version.describe ())
+        args
+    with
+    | Ok (Compiler_blorp_bridge.CliRunHandled result) ->
+        print_string result.Compiler_blorp_bridge.cli_run_stdout;
+        prerr_string result.Compiler_blorp_bridge.cli_run_stderr;
+        exit result.Compiler_blorp_bridge.cli_run_status
+    | Ok (Compiler_blorp_bridge.CliRunParsedSource parsed) ->
+        cli_frontier_parsed_program parsed
+    | Ok (Compiler_blorp_bridge.CliRunFrontendOptions options) ->
+        cli_frontier_of_frontend_options options.cli_frontend_options
+    | Ok (Compiler_blorp_bridge.CliRunTestOptions options) ->
+        BlorpCliTest options
+    | Ok (Compiler_blorp_bridge.CliRunPurifyOptions options) ->
+        BlorpCliPurify options
+    | Ok (Compiler_blorp_bridge.CliRunReplOptions options) ->
+        BlorpCliRepl options
+    | Ok (Compiler_blorp_bridge.CliRunLspOptions options) ->
+        BlorpCliLsp options
+    | Ok (Compiler_blorp_bridge.CliRunPackageOptions options) ->
+        BlorpCliPackage options
+    | Ok (Compiler_blorp_bridge.CliRunDelegate delegated) ->
+        BlorpCliDelegate delegated.cli_run_delegate_args
+    | Error (_, message) ->
+        prerr_endline message;
+        exit 1
+
+let command_line_args () =
+  match Array.to_list Sys.argv with _ :: args -> args | [] -> []
+
+let run_delegate_command args =
+  match args with
+  | "__compiler-tests" :: rest -> exit (Compiler_test_runner.run_cli rest)
+  | "__compiler-bridge" :: rest -> exit (run_compiler_bridge_command rest)
+  | "__compiler-bridge-prepare" :: rest ->
+      exit (run_compiler_bridge_prepare_command rest)
+  | "compile" :: rest when compiling_blorp_bridge_helper () ->
+      exit (run_bootstrap_compile_command rest)
+  | _ ->
+      prerr_endline
+        "Internal error: CLI command reached the OCaml delegate path";
+      exit 1
 
 (** Main entry point *)
 let () =
   try
-    let args = Array.to_list Sys.argv |> List.tl in
-
-    match args with
-    | [] ->
-        usage ();
-        exit 1
-    | [ "--help" ] | [ "-h" ] ->
-        usage ();
+    match command_line_args () |> apply_blorp_cli_frontier with
+    | BlorpCliDelegate args -> run_delegate_command args
+    | BlorpCliCheck (frontend_program, options) ->
+        exit (run_check_from_frontier_options ?frontend_program options)
+    | BlorpCliCompile (frontend_program, options) ->
+        exit (run_compile_from_frontier_options ?frontend_program options)
+    | BlorpCliRun (frontend_program, options) ->
+        exit (run_file_from_frontier_options ?frontend_program options)
+    | BlorpCliTest options -> exit (run_test_from_frontier_options options)
+    | BlorpCliPurify options -> exit (run_purify_from_frontier_options options)
+    | BlorpCliRepl options ->
+        Repl.run ~debug:options.Compiler_blorp_bridge.cli_repl_debug;
         exit 0
-    | [ "--version" ] | [ "-v" ] ->
-        Printf.printf "%s\n" (Version.describe ());
-        exit 0
-    | "__compiler-tests" :: rest -> exit (Compiler_test_runner.run_cli rest)
-    | "__compiler-bridge" :: rest -> exit (run_compiler_bridge_command rest)
-    | "lsp" :: rest -> (
-        match parse_lsp_cli_args rest with
-        | LspHelp ->
-            lsp_usage ();
-            exit 0
-        | LspRun -> Lsp_server.run ()
-        | LspArgError msg ->
-            prerr_endline ("Error: " ^ msg);
-            lsp_usage ();
-            exit 1)
-    | "repl" :: rest -> (
-        match parse_repl_cli_args rest with
-        | ReplHelp ->
-            repl_usage ();
-            exit 0
-        | ReplRun { repl_debug } ->
-            Repl.run ~debug:repl_debug;
-            exit 0
-        | ReplArgError msg ->
-            prerr_endline ("Error: " ^ msg);
-            repl_usage ();
-            exit 1)
-    | "format" :: rest ->
-        let action = parse_format_cli_args rest in
-        begin match action with
-        | FormatHelp ->
-            format_usage ();
-            exit 0
-        | FormatArgError msg ->
-            Printf.eprintf "Error: %s\n" msg;
-            exit 1
-        | FormatEmitProgramJson filename -> (
-            match Fmt.format_program_json_file filename with
-            | Ok json ->
-                print_endline json;
-                exit 0
-            | Error msg ->
-                Printf.eprintf "%s: %s\n" filename msg;
-                exit 1)
-        | FormatFiles { mode; paths } ->
-            let files = List.map collect_brp_files paths |> List.flatten in
-            if files = [] then begin
-              Printf.eprintf "Error: no .brp files found\n";
-              exit 1
-            end;
-            let check, fmt_mode =
-              match mode with
-              | FormatWrite -> (false, Fmt.Write)
-              | FormatCheck { show_diff } -> (true, Fmt.Check { show_diff })
-            in
-            begin match
-              Fmt.format_files_with_blorp_renderer ~mode:fmt_mode files
-            with
-            | Error msg ->
-                prerr_endline msg;
-                exit 1
-            | Ok results ->
-                let had_error = ref false in
-                List.iter
-                  (fun result ->
-                    match result with
-                    | Fmt.Unchanged file when check ->
-                        Printf.printf "%s: ok\n" file
-                    | Fmt.WouldChange { file; diff } when check ->
-                        Printf.printf "%s: needs formatting\n" file;
-                        Option.iter print_string diff;
-                        had_error := true
-                    | Fmt.Unchanged _ | Fmt.Written _ | Fmt.WouldChange _ -> ())
-                  results;
-                if !had_error then exit 1
-            end
-        end
-    | "package" :: rest -> (
-        match rest with
-        | [] | [ "--help" ] | [ "-h" ] ->
-            package_usage ();
-            exit 0
-        | [ "check"; "--help" ] | [ "check"; "-h" ] ->
-            package_check_usage ();
-            exit 0
-        | [ "check"; path ] -> (
-            match Package_check.check path with
-            | Ok result ->
-                Printf.printf "Package %s: ok (%d source files checked)\n"
-                  result.Package_check.manifest.Package_manifest.name
-                  (List.length result.Package_check.source_files);
-                exit 0
-            | Error errors ->
-                prerr_endline (Package_check.render_errors errors);
-                exit 1)
-        | "check" :: [] ->
-            prerr_endline "Error: package check requires a path";
-            package_check_usage ();
-            exit 1
-        | "check" :: _ ->
-            prerr_endline "Error: package check accepts exactly one path";
-            package_check_usage ();
-            exit 1
-        | [ "hash"; "--help" ] | [ "hash"; "-h" ] ->
-            package_hash_usage ();
-            exit 0
-        | [ "hash"; path ] -> (
-            match Package_check.check path with
-            | Error errors ->
-                prerr_endline (Package_check.render_errors errors);
-                exit 1
-            | Ok result -> (
-                match
-                  Package_hash.hash_checked_package ~root:path
-                    ~source_files:result.Package_check.source_files
-                with
-                | Ok hash ->
-                    print_endline hash;
-                    exit 0
-                | Error errors ->
-                    prerr_endline (Package_hash.render_errors errors);
-                    exit 1))
-        | "hash" :: [] ->
-            prerr_endline "Error: package hash requires a path";
-            package_hash_usage ();
-            exit 1
-        | "hash" :: _ ->
-            prerr_endline "Error: package hash accepts exactly one path";
-            package_hash_usage ();
-            exit 1
-        | [ "pack"; "--help" ] | [ "pack"; "-h" ] ->
-            package_pack_usage ();
-            exit 0
-        | "pack" :: args -> (
-            match parse_package_pack_args args with
-            | Some path, Some output -> (
-                match Package_check.check path with
-                | Error errors ->
-                    prerr_endline (Package_check.render_errors errors);
-                    exit 1
-                | Ok result -> (
-                    match
-                      Package_artifact.write_checked_package ~root:path
-                        ~source_files:result.Package_check.source_files ~output
-                    with
-                    | Ok hash ->
-                        Printf.printf "Wrote %s\nHash %s\n" output hash;
-                        exit 0
-                    | Error errors ->
-                        prerr_endline (Package_artifact.render_errors errors);
-                        exit 1))
-            | _ ->
-                prerr_endline
-                  "Error: package pack requires a package path and -o <file>";
-                package_pack_usage ();
-                exit 1)
-        | [ "fetch"; "--help" ] | [ "fetch"; "-h" ] ->
-            package_fetch_usage ();
-            exit 0
-        | [ "fetch" ] -> (
-            match package_fetch_all_from_config () with
-            | Ok (fetched, cached, skipped_local) ->
-                List.iter
-                  (fun (alias, cached_package) ->
-                    Printf.printf "Fetched %s\nHash %s\nCache %s\n" alias
-                      cached_package.Package_cache.hash
-                      cached_package.Package_cache.path)
-                  fetched;
-                List.iter
-                  (fun (alias, cached_package) ->
-                    Printf.printf "Already cached %s\nHash %s\nCache %s\n" alias
-                      cached_package.Package_cache.hash
-                      cached_package.Package_cache.path)
-                  cached;
-                List.iter
-                  (fun alias ->
-                    Printf.printf "Skipped local package %s\n" alias)
-                  skipped_local;
-                if fetched = [] && cached = [] && skipped_local = [] then
-                  print_endline "No packages declared";
-                exit 0
-            | Error message ->
-                prerr_endline message;
-                exit 1)
-        | "fetch" :: target :: from -> (
-            let result =
-              match from with
-              | [] -> package_fetch_from_config target
-              | _ -> package_fetch_explicit target from
-            in
-            match result with
-            | Ok (alias, fetch_result) ->
-                print_package_fetch_result alias fetch_result;
-                exit 0
-            | Error message ->
-                prerr_endline message;
-                exit 1)
-        | [ "vendor"; "--help" ] | [ "vendor"; "-h" ] ->
-            package_vendor_usage ();
-            exit 0
-        | [ "vendor" ] -> (
-            match package_vendor_all_from_config () with
-            | Ok (vendored, skipped_local) ->
-                List.iter print_package_vendor_result vendored;
-                List.iter
-                  (fun alias ->
-                    Printf.printf "Skipped local package %s\n" alias)
-                  skipped_local;
-                if vendored = [] && skipped_local = [] then
-                  print_endline "No packages declared";
-                exit 0
-            | Error message ->
-                prerr_endline message;
-                exit 1)
-        | [ "vendor"; target ] -> (
-            match package_vendor_target target None with
-            | Ok result ->
-                print_package_vendor_result result;
-                exit 0
-            | Error message ->
-                prerr_endline message;
-                exit 1)
-        | [ "vendor"; target; dest ] -> (
-            match package_vendor_target target (Some dest) with
-            | Ok result ->
-                print_package_vendor_result result;
-                exit 0
-            | Error message ->
-                prerr_endline message;
-                exit 1)
-        | "vendor" :: _ ->
-            prerr_endline "Error: package vendor requires a hash and path";
-            package_vendor_usage ();
-            exit 1
-        | command :: _ ->
-            Printf.eprintf "Error: unknown package command: %s\n" command;
-            package_usage ();
-            exit 1)
-    | "check" :: rest -> (
-        let rec parse_check_args args opts std_dir files =
-          match args with
-          | [] -> (opts, std_dir, List.rev files)
-          | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp check [options] <file.brp|dir> [...]";
-              print_endline "";
-              print_endline "Options:";
-              print_endline
-                "  --dump-ast                Print AST summary and continue \
-                 checking";
-              print_endline
-                "  --dump-typed-ast          Print typed AST and continue \
-                 checking";
-              print_endline "  --debug                   Enable debug functions";
-              print_endline "  --no-format               Skip auto-formatting";
-              print_endline
-                "  --std-dir <d>             Use std library from directory";
-              print_endline "";
-              print_endline
-                "Accepts files or directories (recursively finds .brp files).";
-              exit 0
-          | "--dump-ast" :: rest ->
-              parse_check_args rest { opts with dump_ast = true } std_dir files
-          | "--dump-typed-ast" :: rest ->
-              parse_check_args rest
-                { opts with dump_typed_ast = true }
-                std_dir files
-          | "--debug" :: rest ->
-              parse_check_args rest { opts with debug = true } std_dir files
-          | "--no-format" :: rest ->
-              parse_check_args rest { opts with no_format = true } std_dir files
-          | "--std-dir" :: dir :: rest ->
-              parse_check_args rest opts (Some dir) files
-          | file :: rest -> parse_check_args rest opts std_dir (file :: files)
-        in
-        let base_opts = { default_compile_opts with no_emit = true } in
-        let opts, std_dir, files = parse_check_args rest base_opts None [] in
-        let opts = { opts with no_format = resolve_no_format opts.no_format } in
-        (match std_dir with
-        | Some dir -> Modules.set_std_override dir
-        | None -> ());
-        match files with
-        | [] ->
-            prerr_endline "Error: No input file specified";
-            exit 1
-        | paths -> exit (check_paths_with_opts opts paths))
-    | "compile" :: rest -> (
-        let parse_stage_arg flag value =
-          match Blorp.Core_stage.of_string value with
-          | Ok s -> s
-          | Error msg ->
-              Printf.eprintf "%s: %s\n" flag msg;
-              exit 1
-        in
-        let parse_stage_list_arg flag value =
-          match Blorp.Core_stage.of_string_list value with
-          | Ok ss -> ss
-          | Error msg ->
-              Printf.eprintf "%s: %s\n" flag msg;
-              exit 1
-        in
-        let split_eq s =
-          match String.index_opt s '=' with
-          | Some i ->
-              Some
-                ( String.sub s 0 i,
-                  String.sub s (i + 1) (String.length s - i - 1) )
-          | None -> None
-        in
-        let rec parse_compile_args args opts std_dir files =
-          match args with
-          | [] -> (opts, std_dir, List.rev files)
-          | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp compile [options] <file.brp>";
-              print_endline "";
-              print_endline "Options:";
-              print_endline
-                "  --ast                     Print AST and exit (no typecheck, \
-                 no emit)";
-              print_endline
-                "  --dump-ast                Print AST summary and continue \
-                 compiling";
-              print_endline
-                "  --dump-typed-ast          Print typed AST and continue \
-                 compiling";
-              print_endline
-                "  --dump-core               Dump Core IR at the final stage";
-              print_endline "  --dump-core-after=STAGE[,STAGE…]";
-              print_endline
-                "                            Dump Core IR after the given \
-                 stage(s);";
-              print_endline
-                "                            repeatable and comma-separated \
-                 both work";
-              print_endline
-                "  --dump-core-file=PATH     Redirect --dump-core output to \
-                 PATH";
-              print_endline
-                "  --stop-after=STAGE        Stop after the given stage \
-                 (implies no emit)";
-              print_endline
-                "                            STAGE: lower, debug, desugar, \
-                 mono, synth, match,";
-              print_endline
-                "                                   trait_resolve, resolve, \
-                 std_inline, tailrec, fusion,";
-              print_endline
-                "                                   specialize, dce, perceus, \
-                 reuse, closure, final";
-              print_endline
-                "  --time-phases             Print per-phase compiler wall \
-                 time to stderr";
-              print_endline
-                "  --check-invariants        Run post-stage IR invariant \
-                 checks (slower; use for debugging)";
-              print_endline "  --debug                   Enable debug functions";
-              print_endline "  --no-format               Skip auto-formatting";
-              print_endline
-                "  --no-embed-runtime        Emit C that expects an external \
-                 runtime declaration/header";
-              print_endline
-                "  --std-dir <d>             Use std library from directory";
-              print_endline "  -o <file>                 Output C file path";
-              exit 0
-          | "--ast" :: rest ->
-              parse_compile_args rest
-                { opts with ast_only = true }
-                std_dir files
-          | "--dump-ast" :: rest ->
-              parse_compile_args rest
-                { opts with dump_ast = true }
-                std_dir files
-          | "--dump-typed-ast" :: rest ->
-              parse_compile_args rest
-                { opts with dump_typed_ast = true }
-                std_dir files
-          | "--dump-core" :: rest ->
-              parse_compile_args rest
-                {
-                  opts with
-                  dump_core_after =
-                    Blorp.Core_stage.Final :: opts.dump_core_after;
-                }
-                std_dir files
-          | arg :: rest
-            when match split_eq arg with
-                 | Some ("--dump-core-after", _) -> true
-                 | _ -> false ->
-              let _, v = Option.get (split_eq arg) in
-              let ss = parse_stage_list_arg "--dump-core-after" v in
-              parse_compile_args rest
-                { opts with dump_core_after = opts.dump_core_after @ ss }
-                std_dir files
-          | "--dump-core-after" :: v :: rest ->
-              let ss = parse_stage_list_arg "--dump-core-after" v in
-              parse_compile_args rest
-                { opts with dump_core_after = opts.dump_core_after @ ss }
-                std_dir files
-          | arg :: rest
-            when match split_eq arg with
-                 | Some ("--stop-after", _) -> true
-                 | _ -> false ->
-              let _, v = Option.get (split_eq arg) in
-              let s = parse_stage_arg "--stop-after" v in
-              parse_compile_args rest
-                { opts with stop_after = Some s }
-                std_dir files
-          | "--stop-after" :: v :: rest ->
-              let s = parse_stage_arg "--stop-after" v in
-              parse_compile_args rest
-                { opts with stop_after = Some s }
-                std_dir files
-          | arg :: rest
-            when match split_eq arg with
-                 | Some ("--dump-core-file", _) -> true
-                 | _ -> false ->
-              let _, v = Option.get (split_eq arg) in
-              parse_compile_args rest
-                { opts with dump_file = Some v }
-                std_dir files
-          | "--dump-core-file" :: v :: rest ->
-              parse_compile_args rest
-                { opts with dump_file = Some v }
-                std_dir files
-          | "--time-phases" :: rest ->
-              parse_compile_args rest
-                { opts with time_phases = true }
-                std_dir files
-          | "--check-invariants" :: rest ->
-              parse_compile_args rest
-                { opts with check_invariants = true }
-                std_dir files
-          | "--debug" :: rest ->
-              parse_compile_args rest { opts with debug = true } std_dir files
-          | "--no-format" :: rest ->
-              parse_compile_args rest
-                { opts with no_format = true }
-                std_dir files
-          | "--no-embed-runtime" :: rest ->
-              parse_compile_args rest
-                { opts with embed_runtime = false }
-                std_dir files
-          | "--std-dir" :: dir :: rest ->
-              parse_compile_args rest opts (Some dir) files
-          | "-o" :: o :: rest ->
-              parse_compile_args rest
-                { opts with output = Some o }
-                std_dir files
-          | arg :: _ when String.length arg > 0 && arg.[0] = '-' ->
-              prerr_endline ("Error: unknown compile option: " ^ arg);
-              exit 1
-          | file :: rest -> parse_compile_args rest opts std_dir (file :: files)
-        in
-        let opts, std_dir, files =
-          parse_compile_args rest default_compile_opts None []
-        in
-        (* --stop-after=S auto-enables --dump-core-after=S unless the user
-         asked for a different dump target. The 95% case: if you're
-         stopping the pipeline, you want to see what got produced. *)
-        let opts =
-          match (opts.stop_after, opts.dump_core_after) with
-          | Some s, [] -> { opts with dump_core_after = [ s ] }
-          | _ -> opts
-        in
-        let opts = { opts with no_format = resolve_no_format opts.no_format } in
-        (match std_dir with
-        | Some dir -> Modules.set_std_override dir
-        | None -> ());
-        match files with
-        | [ file ] -> exit (compile_file_with_opts opts file)
-        | [] ->
-            prerr_endline "Error: No input file specified";
-            exit 1
-        | _ ->
-            prerr_endline "Error: Multiple input files not supported";
-            exit 1)
-    | "run" :: rest -> (
-        let rec parse_run_args args profile debug sanitizer_mode leak_check
-            release no_format timeout threads std_dir files user_args =
-          match args with
-          | [] ->
-              ( profile,
-                debug,
-                sanitizer_mode,
-                leak_check,
-                release,
-                no_format,
-                timeout,
-                threads,
-                std_dir,
-                List.rev files,
-                List.rev user_args )
-          | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp run [options] <file.brp> [-- args...]";
-              print_endline "";
-              print_endline "Options:";
-              print_endline "  --profile      Run with profiling";
-              print_endline "  --release      Compile generated C with -O2";
-              print_endline "  --debug        Enable debug functions";
-              print_endline
-                "  --sanitize     Compile with AddressSanitizer + UBSan";
-              print_endline "  --sanitize=undefined";
-              print_endline
-                "                 Compile with UBSan only (useful for \
-                 fiber-heavy runs on Darwin)";
-              print_endline "  --leak-check   Report leaked objects on exit";
-              print_endline "  --no-format    Skip auto-formatting";
-              print_endline "  --timeout N    Kill after N seconds";
-              print_endline "  --threads N    Set max thread pool size";
-              print_endline "  --std-dir <d>  Use std library from directory";
-              exit 0
-          | "--" :: rest ->
-              ( profile,
-                debug,
-                sanitizer_mode,
-                leak_check,
-                release,
-                no_format,
-                timeout,
-                threads,
-                std_dir,
-                List.rev files,
-                rest )
-          | "--profile" :: rest ->
-              parse_run_args rest true debug sanitizer_mode leak_check release
-                no_format timeout threads std_dir files user_args
-          | "--release" :: rest ->
-              parse_run_args rest profile debug sanitizer_mode leak_check true
-                no_format timeout threads std_dir files user_args
-          | "--debug" :: rest ->
-              parse_run_args rest profile true sanitizer_mode leak_check release
-                no_format timeout threads std_dir files user_args
-          | "--sanitize" :: rest ->
-              parse_run_args rest profile debug
-                (Some Test_runner.SanitizerAddressUndefined) leak_check release
-                no_format timeout threads std_dir files user_args
-          | arg :: rest when String.starts_with ~prefix:"--sanitize=" arg ->
-              parse_run_args rest profile debug
-                (parse_sanitizer_option arg)
-                leak_check release no_format timeout threads std_dir files
-                user_args
-          | "--leak-check" :: rest ->
-              parse_run_args rest profile debug sanitizer_mode true release
-                no_format timeout threads std_dir files user_args
-          | "--no-format" :: rest ->
-              parse_run_args rest profile debug sanitizer_mode leak_check
-                release true timeout threads std_dir files user_args
-          | "--std-dir" :: dir :: rest ->
-              parse_run_args rest profile debug sanitizer_mode leak_check
-                release no_format timeout threads (Some dir) files user_args
-          | "--timeout" :: n :: rest -> (
-              match int_of_string_opt n with
-              | Some v ->
-                  parse_run_args rest profile debug sanitizer_mode leak_check
-                    release no_format (Some v) threads std_dir files user_args
-              | None ->
-                  prerr_endline "Error: --timeout requires an integer";
-                  exit 1)
-          | "--threads" :: n :: rest -> (
-              match int_of_string_opt n with
-              | Some v ->
-                  parse_run_args rest profile debug sanitizer_mode leak_check
-                    release no_format timeout (Some v) std_dir files user_args
-              | None ->
-                  prerr_endline "Error: --threads requires an integer";
-                  exit 1)
-          | file :: rest ->
-              parse_run_args rest profile debug sanitizer_mode leak_check
-                release no_format timeout threads std_dir (file :: files)
-                user_args
-        in
-        let ( profile,
-              debug,
-              cli_sanitizer_mode,
-              cli_leak_check,
-              cli_release,
-              cli_no_format,
-              cli_timeout,
-              cli_threads,
-              std_dir,
-              files,
-              user_args ) =
-          parse_run_args rest false false None false false false None None None
-            [] []
-        in
-        let timeout = resolve_timeout cli_timeout in
-        let sanitizer_mode = resolve_sanitizer_mode cli_sanitizer_mode in
-        let leak_check = resolve_leak_check cli_leak_check in
-        let no_format = resolve_no_format cli_no_format in
-        let run_mode =
-          if cli_release then Compile_profile.Release else Compile_profile.Fast
-        in
-        (match std_dir with
-        | Some dir -> Modules.set_std_override dir
-        | None -> ());
-        (match cli_threads with
-        | Some n -> Unix.putenv "BLORP_THREADS" (string_of_int n)
-        | None -> ());
-        match files with
-        | [ file ] ->
-            exit
-              (run_file ~profile ~debug ~sanitizer_mode ~leak_check ~timeout
-                 ~run_mode ~no_format ~user_args file)
-        | [] ->
-            prerr_endline "Error: No input file specified";
-            exit 1
-        | _ ->
-            prerr_endline "Error: Multiple input files not supported";
-            exit 1)
-    | "test" :: rest -> (
-        let rec parse_test_args args profile debug sanitizer_mode leak_check
-            no_format timeout jobs repeat mode cache std_dir paths =
-          match args with
-          | [] ->
-              ( profile,
-                debug,
-                sanitizer_mode,
-                leak_check,
-                no_format,
-                timeout,
-                jobs,
-                repeat,
-                mode,
-                cache,
-                std_dir,
-                List.rev paths )
-          | "--help" :: _ | "-h" :: _ ->
-              print_endline
-                "Usage: blorp test [options] <file.brp | directory> ...";
-              print_endline "";
-              print_endline "Options:";
-              print_endline "  --profile      Run with profiling";
-              print_endline "  --debug        Enable debug functions";
-              print_endline "  --sanitize     Run with AddressSanitizer + UBSan";
-              print_endline "  --sanitize=undefined";
-              print_endline
-                "                 Run with UBSan only (useful for fiber-heavy \
-                 tests on Darwin)";
-              print_endline "  --leak-check   Report leaked objects on exit";
-              print_endline
-                "  --timeout N    Kill each test after N seconds (default: \
-                 BLORP_TEST_TIMEOUT, BLORP_TIMEOUT, or 30; 0 disables)";
-              print_endline
-                "  --repeat N     Run selected tests N times; disables result \
-                 caching for this run";
-              print_endline "  -j N           Run tests with N parallel workers";
-              print_endline "  --doc          Run only doctests";
-              print_endline "  --suite        Run only TestSuite tests";
-              print_endline "  --no-format    Skip auto-formatting before test";
-              print_endline "  --no-cache     Disable test result caching";
-              print_endline "  --std-dir <d>  Use std library from directory";
-              exit 0
-          | "--profile" :: rest ->
-              parse_test_args rest true debug sanitizer_mode leak_check
-                no_format timeout jobs repeat mode cache std_dir paths
-          | "--debug" :: rest ->
-              parse_test_args rest profile true sanitizer_mode leak_check
-                no_format timeout jobs repeat mode cache std_dir paths
-          | "--sanitize" :: rest ->
-              parse_test_args rest profile debug
-                (Some Test_runner.SanitizerAddressUndefined) leak_check
-                no_format timeout jobs repeat mode cache std_dir paths
-          | arg :: rest when String.starts_with ~prefix:"--sanitize=" arg ->
-              parse_test_args rest profile debug
-                (parse_sanitizer_option arg)
-                leak_check no_format timeout jobs repeat mode cache std_dir
-                paths
-          | "--leak-check" :: rest ->
-              parse_test_args rest profile debug sanitizer_mode true no_format
-                timeout jobs repeat mode cache std_dir paths
-          | "--no-cache" :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check
-                no_format timeout jobs repeat mode false std_dir paths
-          | "--no-format" :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check true
-                timeout jobs repeat mode cache std_dir paths
-          | "--warmup-only" :: _ ->
-              (* Pre-warm the precompiled runtime cache, then exit *)
-              Test_runner.with_run_artifacts (fun () ->
-                  ignore (Test_runner.precompile_runtime ()));
-              exit 0
-          | "--doc" :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check
-                no_format timeout jobs repeat Test_runner.DocOnly cache std_dir
-                paths
-          | "--suite" :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check
-                no_format timeout jobs repeat Test_runner.SuiteOnly cache
-                std_dir paths
-          | "--std-dir" :: dir :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check
-                no_format timeout jobs repeat mode cache (Some dir) paths
-          | "--timeout" :: n :: rest -> (
-              match int_of_string_opt n with
-              | Some v ->
-                  parse_test_args rest profile debug sanitizer_mode leak_check
-                    no_format (Some v) jobs repeat mode cache std_dir paths
-              | None ->
-                  prerr_endline "Error: --timeout requires an integer";
-                  exit 1)
-          | [ "--repeat" ] ->
-              prerr_endline "Error: --repeat requires a value";
-              exit 1
-          | "--repeat" :: n :: rest -> (
-              match int_of_string_opt n with
-              | Some v when v > 0 ->
-                  parse_test_args rest profile debug sanitizer_mode leak_check
-                    no_format timeout jobs v mode cache std_dir paths
-              | _ ->
-                  prerr_endline "Error: --repeat requires a positive integer";
-                  exit 1)
-          | [ "-j" ] ->
-              prerr_endline "Error: -j requires a value";
-              exit 1
-          | "-j" :: n :: rest -> (
-              match int_of_string_opt n with
-              | Some v ->
-                  parse_test_args rest profile debug sanitizer_mode leak_check
-                    no_format timeout v repeat mode cache std_dir paths
-              | None ->
-                  prerr_endline "Error: -j requires an integer";
-                  exit 1)
-          | arg :: _ when String.length arg > 0 && arg.[0] = '-' ->
-              prerr_endline ("Error: unknown test option: " ^ arg);
-              exit 1
-          | path :: rest ->
-              parse_test_args rest profile debug sanitizer_mode leak_check
-                no_format timeout jobs repeat mode cache std_dir (path :: paths)
-        in
-        let ( profile,
-              debug,
-              cli_sanitizer_mode,
-              cli_leak_check,
-              cli_no_format,
-              cli_timeout,
-              jobs,
-              repeat,
-              mode,
-              cache,
-              std_dir,
-              paths ) =
-          parse_test_args rest false false None false false None 0 1
-            Test_runner.TestAll true None []
-        in
-        let timeout =
-          match resolve_test_timeout cli_timeout with
-          | Some _ as timeout -> timeout
-          | None -> Some 30
-        in
-        let sanitizer_mode = resolve_sanitizer_mode cli_sanitizer_mode in
-        let leak_check = resolve_leak_check cli_leak_check in
-        let no_format = resolve_no_format cli_no_format in
-        (* Auto-format test files before running *)
-        if not no_format then
-          List.iter
-            (fun path ->
-              if Sys.is_directory path then
-                Array.iter
-                  (fun f ->
-                    if Filename.check_suffix f ".brp" then
-                      auto_format_user_file (Filename.concat path f))
-                  (Sys.readdir path)
-              else auto_format_user_file path)
-            paths;
-        (match std_dir with
-        | Some dir -> Modules.set_std_override dir
-        | None -> ());
-        match paths with
-        | [ path ] ->
-            exit
-              (Test_runner.run_tests ~profile ~debug ~sanitizer_mode ~leak_check
-                 ~mode ~timeout ~jobs ~cache ~repeat path)
-        | [] ->
-            prerr_endline "Error: No test path specified";
-            exit 1
-        | _ ->
-            exit
-              (Test_runner.run_tests_paths ~profile ~debug ~sanitizer_mode
-                 ~leak_check ~mode ~timeout ~jobs ~cache ~repeat paths))
-    | "purify" :: rest -> (
-        let rec parse_purify_args args dry_run verbose files =
-          match args with
-          | [] -> (dry_run, verbose, List.rev files)
-          | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp purify [options] <file.brp|dir>";
-              print_endline "";
-              print_endline "Options:";
-              print_endline
-                "  --dry-run      Show which functions would be purified \
-                 without modifying the file";
-              print_endline
-                "  --verbose, -v  Show detailed purification progress";
-              exit 0
-          | "--dry-run" :: rest -> parse_purify_args rest true verbose files
-          | "--verbose" :: rest | "-v" :: rest ->
-              parse_purify_args rest dry_run true files
-          | file :: rest ->
-              parse_purify_args rest dry_run verbose (file :: files)
-        in
-        let dry_run, verbose, paths = parse_purify_args rest false false [] in
-        let all_files = List.map collect_brp_files paths |> List.flatten in
-        match all_files with
-        | [] ->
-            prerr_endline "Error: No input files specified";
-            exit 1
-        | files ->
-            let results = List.map (purify_file ~dry_run ~verbose) files in
-            let total_purified =
-              List.fold_left (fun acc r -> acc + max 0 r) 0 results
-            in
-            let files_modified =
-              List.filter (fun r -> r > 0) results |> List.length
-            in
-            if
-              (not dry_run)
-              && (files_modified > 1
-                 || (files_modified = 1 && List.length files > 1))
-            then
-              Printf.printf
-                "Total: Purified %d function(s) across %d file(s).\n"
-                total_purified files_modified;
-            let exit_code =
-              if List.exists (fun r -> r < 0) results then 1 else 0
-            in
-            exit exit_code)
-    | _ ->
-        prerr_endline "Error: Unknown command";
-        usage ();
-        exit 1
+    | BlorpCliLsp _ -> Lsp_server.run ()
+    | BlorpCliPackage options -> exit (run_package_from_frontier_options options)
   with
   | Sys_error msg ->
       Printf.eprintf "Error: %s\n" msg;

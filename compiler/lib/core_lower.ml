@@ -835,7 +835,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
   | TA.EStringInterpRaw _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
         ~hint:
-          "run Interp_parser.transform_program before typechecking and Core \
+          "run string interpolation lowering before typechecking and Core \
            lowering so raw interpolation is parsed into EStringInterp parts."
         "EStringInterpRaw reached lowering"
   | TA.EQuestionBind _ ->

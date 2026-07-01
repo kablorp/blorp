@@ -426,6 +426,27 @@ let with_env name value f =
       | None -> Unix.putenv name "")
     f
 
+let default_bridge_cache_dir () =
+  match
+    Sys.getenv_opt Blorp.Compiler_blorp_bridge.renderer_bridge_cache_dir_env
+  with
+  | Some path when path <> "" -> path
+  | _ ->
+      let cache_base =
+        match Sys.getenv_opt "XDG_CACHE_HOME" with
+        | Some path when path <> "" -> path
+        | _ -> (
+            match Sys.getenv_opt "HOME" with
+            | Some path when path <> "" -> Filename.concat path ".cache"
+            | _ -> Filename.concat (Filename.get_temp_dir_name ()) ".cache")
+      in
+      Filename.concat (Filename.concat cache_base "blorp") "compiler-bridge"
+
+let with_isolated_home_preserving_bridge_cache home f =
+  let bridge_cache = default_bridge_cache_dir () in
+  with_env Blorp.Compiler_blorp_bridge.renderer_bridge_cache_dir_env bridge_cache
+    (fun () -> with_env "HOME" home f)
+
 let shell_quote s =
   "'" ^ String.concat "'\\''" (String.split_on_char '\'' s) ^ "'"
 
@@ -694,27 +715,6 @@ let test_suite_run_all_harness_calls_generated_functions () =
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
 
-let test_suite_run_all_batch_timeout_scales_by_suite_count () =
-  let suite_count = 64 in
-  let per_suite_timeout_seconds = 30 in
-  let expected_batch_timeout_seconds =
-    suite_count * per_suite_timeout_seconds
-  in
-  Alcotest.(check (option int))
-    "disabled timeout remains disabled" None
-    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count None);
-  Alcotest.(check (option int))
-    "zero timeout remains disabled" (Some 0)
-    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count (Some 0));
-  Alcotest.(check (option int))
-    "single suite timeout is unchanged" (Some per_suite_timeout_seconds)
-    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count:1
-       (Some per_suite_timeout_seconds));
-  Alcotest.(check (option int))
-    "batch timeout scales by suite count" (Some expected_batch_timeout_seconds)
-    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count
-       (Some per_suite_timeout_seconds))
-
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
   Alcotest.(check bool)
@@ -748,6 +748,28 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
     "ordinary type suite is not process isolated" false
     (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
+
+let test_source_text_cache_guard_uses_current_file_contents () =
+  with_temp_dir "blorp-source-cache-guard-" (fun dir ->
+      let path = Filename.concat dir "sample.brp" in
+      write_file path "func main(args: List[String]) -> Int: 0\n";
+      Alcotest.(check bool)
+        "matching source can use cache" true
+        (Blorp.Test_runner.source_text_matches_current_file path
+           (Some "func main(args: List[String]) -> Int: 0\n"));
+      write_file path "func main(args: List[String]) -> Int: 1\n";
+      Alcotest.(check bool)
+        "stale source cannot use cache" false
+        (Blorp.Test_runner.source_text_matches_current_file path
+           (Some "func main(args: List[String]) -> Int: 0\n"));
+      Alcotest.(check bool)
+        "uncached source path remains cache eligible" true
+        (Blorp.Test_runner.source_text_matches_current_file path None);
+      Sys.remove path;
+      Alcotest.(check bool)
+        "deleted file cannot use stale source cache" false
+        (Blorp.Test_runner.source_text_matches_current_file path
+           (Some "func main(args: List[String]) -> Int: 1\n")))
 
 let test_suite_harness_runs_combined_without_result_cache () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
@@ -786,7 +808,7 @@ tests: TestSuite = {
         ~finally:(fun () -> Sys.chdir old_cwd)
         (fun () ->
           Sys.chdir dir;
-          with_env "HOME" home (fun () ->
+          with_isolated_home_preserving_bridge_cache home (fun () ->
               let code =
                 Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
                   ~cache:true "."
@@ -838,7 +860,7 @@ tests: TestSuite = {
         ~finally:(fun () -> Sys.chdir old_cwd)
         (fun () ->
           Sys.chdir parent;
-          with_env "HOME" home (fun () ->
+          with_isolated_home_preserving_bridge_cache home (fun () ->
               let code =
                 Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
                   ~cache:false basename
@@ -964,12 +986,12 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
-        Alcotest.test_case "run_all_batch_timeout" `Quick
-          test_suite_run_all_batch_timeout_scales_by_suite_count;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
           test_runtime_sensitive_suite_paths_require_process_isolation;
+        Alcotest.test_case "source_text_cache_guard" `Quick
+          test_source_text_cache_guard_uses_current_file_contents;
         Alcotest.test_case "combined_harness_skips_result_cache" `Quick
           test_suite_harness_runs_combined_without_result_cache;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick

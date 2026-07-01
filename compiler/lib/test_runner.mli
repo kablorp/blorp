@@ -185,17 +185,16 @@ val generate_suite_run_all_harness : string list -> string
 (** Generate a multi-suite harness that imports each test file once and runs
     ordinary suites through generated suite functions. Exposed for tests. *)
 
-val timeout_for_suite_run_all_batch :
-  suite_count:int -> int option -> int option
-(** Scale the per-suite timeout to preserve timeout budget when multiple suites
-    run in one aggregate process. Exposed for tests. *)
-
 val requires_filesystem_isolation : string -> bool
 (** True when a test path is configured for isolated process filesystem state. *)
 
 val requires_process_isolation : string -> bool
 (** True when a test path is configured to stay out of aggregate run-all
     harnesses because it exercises process-global runtime state. *)
+
+val source_text_matches_current_file : string -> string option -> bool
+(** True when cached source text, if supplied, still matches the current file
+    contents. Used to avoid saving cache entries for stale classified source. *)
 
 val raylib_linker_flags : unit -> string
 (** Platform-specific linker flags for raylib *)

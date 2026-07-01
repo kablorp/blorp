@@ -100,6 +100,51 @@ let test_typecheck_only_typed_returns_typed_program () =
             ("expected successful typed typecheck, got:\n"
            ^ format_errors errors))
 
+let test_compile_parsed_accepts_finalized_bridge_artifact () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_parsed" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let source =
+            "func main(args: List[String]) -> Int:\n\
+            \    print(\"value ${1 + 1}\")\n\
+            \    0\n"
+          in
+          write_file main_path source;
+          let module_name = "main" in
+          match
+            Compiler_blorp_bridge.parse_source_file_via_command ~path:main_path
+              ~module_name
+          with
+          | Error (_, message) ->
+              Alcotest.fail ("expected Blorp parse bridge artifact: " ^ message)
+          | Ok (Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics) ->
+              Alcotest.fail
+                ("expected parsed bridge artifact, got diagnostics:\n"
+               ^ format_errors diagnostics)
+          | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) -> (
+              match
+                Modules.finalize_blorp_parsed_source ~path:main_path ~module_name
+                  parsed_source
+              with
+              | Error errors ->
+                  Alcotest.fail
+                    ("expected finalized parsed program:\n" ^ format_errors errors)
+              | Ok program -> (
+                  match
+                    Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
+                      ~program ()
+                  with
+                  | Ok (Pipeline.Compiled { c_code; _ }) ->
+                      Alcotest.(check bool)
+                        "generated C contains interpolated string literal" true
+                        (contains c_code "value")
+                  | Ok (Pipeline.Stopped_at _) ->
+                      Alcotest.fail "compile_parsed unexpectedly stopped early"
+                  | Error errors ->
+                      Alcotest.fail
+                        ("expected compile_parsed success:\n"
+                       ^ format_errors errors)))))
+
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
       let source = "func helper() -> Int:\n    x: Int = 1\n    x + 1\n" in
@@ -993,6 +1038,8 @@ let suite =
           test_typecheck_only_returns_typed_program;
         Alcotest.test_case "typecheck_only_typed returns typed program" `Quick
           test_typecheck_only_typed_returns_typed_program;
+        Alcotest.test_case "compile_parsed accepts finalized bridge artifact"
+          `Quick test_compile_parsed_accepts_finalized_bridge_artifact;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"

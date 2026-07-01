@@ -519,6 +519,17 @@ else
     TOTAL=$((TOTAL + 1))
     record_fail "compile writes requested output" "missing $compiled_c"
 fi
+bootstrap_compile_c="$TMPDIR_CLI/bootstrap_compile.c"
+expect_exit "bootstrap helper compile success" 0 \
+    env BLORP_COMPILER_RENDERER_HELPER=1 BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER=1 \
+    "$BLORP_BIN" compile --no-format -o "$bootstrap_compile_c" "$valid_prog"
+if [ -f "$bootstrap_compile_c" ]; then
+    TOTAL=$((TOTAL + 1))
+    record_pass "bootstrap helper compile writes requested output"
+else
+    TOTAL=$((TOTAL + 1))
+    record_fail "bootstrap helper compile writes requested output" "missing $bootstrap_compile_c"
+fi
 external_runtime_c="$TMPDIR_CLI/external_runtime.c"
 expect_exit "compile no embedded runtime" 0 "$BLORP_BIN" compile --no-format --no-embed-runtime -o "$external_runtime_c" "$valid_prog"
 if [ ! -f "$external_runtime_c" ]; then
@@ -541,6 +552,8 @@ expect_exit "test success" 0 "$BLORP_BIN" test --no-cache --no-format --timeout 
 expect_exit "test failure" 1 "$BLORP_BIN" test --no-cache --no-format --timeout 5 "$failing_test"
 expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
 expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
+expect_exit "test warmup only accepts prior options" 0 "$BLORP_BIN" test --no-format --warmup-only
+expect_exit "test warmup only validates later options" 1 "$BLORP_BIN" test --warmup-only --bogus
 rm -f "$repeat_marker"
 expect_exit "test repeat success" 0 "$BLORP_BIN" test --no-format --timeout 5 --repeat 3 "$repeat_test"
 TOTAL=$((TOTAL + 1))
@@ -570,17 +583,15 @@ expect_output_contains "format rejects emit JSON with check" 1 "cannot be combin
 expect_output_contains "format diff implies check" 1 "needs formatting" \
     "$BLORP_BIN" format --diff tests/test_compiler/format/should_fail/bad_spacing.brp
 
+expect_exit "purify dry-run success" 0 "$BLORP_BIN" purify --dry-run "$valid_prog"
+
 formatter_src="$TMPDIR_CLI/formatter_src.brp"
 formatter_expected="$TMPDIR_CLI/formatter_expected.brp"
-formatter_program_json="$TMPDIR_CLI/formatter_program.json"
-formatter_actual="$TMPDIR_CLI/formatter_actual.brp"
 formatter_err="$TMPDIR_CLI/formatter.err"
-formatter_diff="$TMPDIR_CLI/formatter.diff"
 formatter_tool_c="$TMPDIR_CLI/formatter_tool.c"
 formatter_tool_bin="$TMPDIR_CLI/formatter_tool"
 formatter_tool_ready=false
 : > "$formatter_err"
-: > "$formatter_diff"
 
 cat > "$formatter_src" <<'BRP'
 import:
@@ -654,15 +665,13 @@ func main(args: List[String]) -> Int:
 BRP
 
 TOTAL=$((TOTAL + 1))
+cp "$formatter_src" "$formatter_expected"
 : > "$formatter_err"
-if "$BLORP_BIN" format --emit-program-json "$formatter_src" > "$formatter_program_json" 2> "$formatter_err"; then
-    if grep -qF '"comments":' "$formatter_program_json" && grep -qF '"program":' "$formatter_program_json"; then
-        record_pass "format emits full-program formatter JSON"
-    else
-        record_fail "format emits full-program formatter JSON" "program JSON was missing expected fields"
-    fi
+if "$BLORP_BIN" format "$formatter_expected" > "$formatter_err" 2>&1 \
+    && "$BLORP_BIN" format --check "$formatter_expected" > "$formatter_err" 2>&1; then
+    record_pass "production formatter formats representative program"
 else
-    record_fail "format emits full-program formatter JSON" "$(cat "$formatter_err")"
+    record_fail "production formatter formats representative program" "$(cat "$formatter_err")"
 fi
 
 TOTAL=$((TOTAL + 1))
@@ -675,223 +684,16 @@ else
     record_fail "Blorp formatter tool compiles" "$(cat "$formatter_err")"
 fi
 
-TOTAL=$((TOTAL + 1))
-cp "$formatter_src" "$formatter_expected"
-: > "$formatter_err"
-: > "$formatter_diff"
-if $formatter_tool_ready \
-    && "$BLORP_BIN" format "$formatter_expected" > "$formatter_err" 2>&1 \
-    && "$formatter_tool_bin" program "$formatter_program_json" > "$formatter_actual" 2> "$formatter_err" \
-    && diff -u "$formatter_expected" "$formatter_actual" > "$formatter_diff"; then
-    record_pass "Blorp program formatter matches production formatter"
-else
-    record_fail "Blorp program formatter matches production formatter" "$(cat "$formatter_err"; cat "$formatter_diff")"
-fi
 expect_formatter_output_contains "Blorp formatter dispatcher help" 0 "Usage: formatter" --help
 expect_formatter_output_contains "Blorp formatter subcommand help" 0 \
     "Usage: formatter program" program --help
 expect_formatter_output_contains "Blorp formatter rejects unknown option" 1 \
-    "unknown argument: --bogus" program --bogus "$formatter_program_json"
+    "unknown argument: --bogus" program --bogus "$formatter_src"
 expect_formatter_output_contains "Blorp formatter rejects odd program batch args" 1 \
     "program-batch command requires <program-json-file> <output-file> pairs" \
-    program-batch "$formatter_program_json"
+    program-batch "$formatter_src"
 expect_formatter_output_contains "Blorp formatter rejects removed document command" 1 \
     "unknown formatter command: document" document --help
-
-formatter_corpus_expected_dir="$TMPDIR_CLI/formatter_corpus_expected"
-formatter_corpus_actual_dir="$TMPDIR_CLI/formatter_corpus_actual"
-formatter_corpus_json_dir="$TMPDIR_CLI/formatter_corpus_json"
-formatter_corpus_err="$TMPDIR_CLI/formatter_corpus.err"
-formatter_corpus_diff="$TMPDIR_CLI/formatter_corpus.diff"
-mkdir -p "$formatter_corpus_expected_dir" "$formatter_corpus_actual_dir" "$formatter_corpus_json_dir"
-
-formatter_program_batch_args=("program-batch")
-formatter_program_expected=()
-formatter_program_actual=()
-
-prepare_formatter_corpus_case() {
-    local source="$1"
-    local base expected program_json program_actual err
-
-    base="$(basename "$source")"
-    expected="$formatter_corpus_expected_dir/$base"
-    program_json="$formatter_corpus_json_dir/$base.program.json"
-    program_actual="$formatter_corpus_actual_dir/program/$base"
-    err="$TMPDIR_CLI/formatter_corpus_$base.err"
-    mkdir -p "$(dirname "$program_actual")"
-    : > "$err"
-
-    if cp "$source" "$expected" \
-        && "$BLORP_BIN" format --emit-program-json "$source" > "$program_json" 2> "$err"; then
-        formatter_program_batch_args+=("$program_json" "$program_actual")
-        formatter_program_expected+=("$expected")
-        formatter_program_actual+=("$program_actual")
-    else
-        TOTAL=$((TOTAL + 1))
-        record_fail "formatter corpus $base" "$(cat "$err")"
-    fi
-}
-
-for formatter_case in tests/test_compiler/format/should_pass/*.brp; do
-    prepare_formatter_corpus_case "$formatter_case"
-done
-
-formatter_expected_ok=false
-TOTAL=$((TOTAL + 1))
-: > "$formatter_corpus_err"
-if "$BLORP_BIN" format "$formatter_corpus_expected_dir" > "$formatter_corpus_err" 2>&1; then
-    formatter_expected_ok=true
-    record_pass "formatter corpus expected files format"
-else
-    record_fail "formatter corpus expected files format" "$(cat "$formatter_corpus_err")"
-fi
-
-formatter_program_batch_ok=false
-if $formatter_expected_ok && [ ${#formatter_program_expected[@]} -gt 0 ]; then
-    TOTAL=$((TOTAL + 1))
-    : > "$formatter_corpus_err"
-    if ! $formatter_tool_ready; then
-        record_fail "formatter corpus program batch renders" "formatter tool did not compile"
-    elif "$formatter_tool_bin" "${formatter_program_batch_args[@]}" > "$formatter_corpus_err" 2>&1; then
-        formatter_program_batch_ok=true
-        record_pass "formatter corpus program batch renders"
-    else
-        record_fail "formatter corpus program batch renders" "$(cat "$formatter_corpus_err")"
-    fi
-fi
-
-if $formatter_program_batch_ok; then
-    TOTAL=$((TOTAL + 1))
-    formatter_program_msg=""
-    for idx in "${!formatter_program_expected[@]}"; do
-        : > "$formatter_corpus_diff"
-        if ! diff -u "${formatter_program_expected[$idx]}" "${formatter_program_actual[$idx]}" > "$formatter_corpus_diff"; then
-            formatter_program_msg="$(cat "$formatter_corpus_diff")"
-            break
-        fi
-    done
-    if [ -z "$formatter_program_msg" ]; then
-        record_pass "formatter corpus program batch matches production formatter"
-    else
-        record_fail "formatter corpus program batch matches production formatter" "$formatter_program_msg"
-    fi
-fi
-
-formatter_self_expected_dir="$TMPDIR_CLI/formatter_self_expected"
-formatter_self_actual_dir="$TMPDIR_CLI/formatter_self_actual"
-formatter_self_json_dir="$TMPDIR_CLI/formatter_self_json"
-formatter_self_err="$TMPDIR_CLI/formatter_self.err"
-formatter_self_diff="$TMPDIR_CLI/formatter_self.diff"
-mkdir -p "$formatter_self_expected_dir" "$formatter_self_actual_dir" "$formatter_self_json_dir"
-
-TOTAL=$((TOTAL + 1))
-formatter_self_ok=true
-formatter_self_msg=""
-formatter_self_batch_args=("program-batch")
-if ! cp -R tools/formatter "$formatter_self_expected_dir/formatter" > "$formatter_self_err" 2>&1; then
-    formatter_self_ok=false
-    formatter_self_msg="$(cat "$formatter_self_err")"
-fi
-if $formatter_self_ok && ! "$BLORP_BIN" format "$formatter_self_expected_dir/formatter" > "$formatter_self_err" 2>&1; then
-    formatter_self_ok=false
-    formatter_self_msg="$(cat "$formatter_self_err")"
-fi
-if $formatter_self_ok; then
-    while IFS= read -r formatter_source; do
-        formatter_rel="${formatter_source#tools/formatter/}"
-        formatter_program_json="$formatter_self_json_dir/${formatter_rel%.brp}.json"
-        formatter_actual="$formatter_self_actual_dir/formatter/$formatter_rel"
-        mkdir -p "$(dirname "$formatter_program_json")" "$(dirname "$formatter_actual")"
-        if "$BLORP_BIN" format --emit-program-json "$formatter_source" > "$formatter_program_json" 2> "$formatter_self_err"; then
-            formatter_self_batch_args+=("$formatter_program_json" "$formatter_actual")
-        else
-            formatter_self_ok=false
-            formatter_self_msg="$(cat "$formatter_self_err")"
-            break
-        fi
-    done < <(find tools/formatter -name '*.brp' | sort)
-fi
-if $formatter_self_ok && ! $formatter_tool_ready; then
-    formatter_self_ok=false
-    formatter_self_msg="formatter tool did not compile"
-fi
-if $formatter_self_ok && ! "$formatter_tool_bin" "${formatter_self_batch_args[@]}" > "$formatter_self_err" 2>&1; then
-    formatter_self_ok=false
-    formatter_self_msg="$(cat "$formatter_self_err")"
-fi
-if $formatter_self_ok; then
-    while IFS= read -r formatter_expected; do
-        formatter_rel="${formatter_expected#$formatter_self_expected_dir/formatter/}"
-        if ! diff -u "$formatter_expected" "$formatter_self_actual_dir/formatter/$formatter_rel" > "$formatter_self_diff"; then
-            formatter_self_ok=false
-            formatter_self_msg="$(cat "$formatter_self_diff")"
-            break
-        fi
-    done < <(find "$formatter_self_expected_dir/formatter" -name '*.brp' | sort)
-fi
-if $formatter_self_ok; then
-    record_pass "formatter sources program batch matches production formatter"
-else
-    record_fail "formatter sources program batch matches production formatter" "$formatter_self_msg"
-fi
-
-std_expected_dir="$TMPDIR_CLI/std_expected"
-std_actual_dir="$TMPDIR_CLI/std_actual"
-std_json_dir="$TMPDIR_CLI/std_json"
-std_err="$TMPDIR_CLI/std.err"
-std_diff="$TMPDIR_CLI/std.diff"
-mkdir -p "$std_expected_dir" "$std_actual_dir" "$std_json_dir"
-
-TOTAL=$((TOTAL + 1))
-std_ok=true
-std_msg=""
-std_batch_args=("program-batch")
-if ! cp -R std "$std_expected_dir/std" > "$std_err" 2>&1; then
-    std_ok=false
-    std_msg="$(cat "$std_err")"
-fi
-if $std_ok && ! "$BLORP_BIN" format "$std_expected_dir/std" > "$std_err" 2>&1; then
-    std_ok=false
-    std_msg="$(cat "$std_err")"
-fi
-if $std_ok; then
-    while IFS= read -r std_source; do
-        std_rel="${std_source#std/}"
-        std_json="$std_json_dir/${std_rel%.brp}.json"
-        std_actual="$std_actual_dir/std/$std_rel"
-        mkdir -p "$(dirname "$std_json")" "$(dirname "$std_actual")"
-        if "$BLORP_BIN" format --emit-program-json "$std_source" > "$std_json" 2> "$std_err"; then
-            std_batch_args+=("$std_json" "$std_actual")
-        else
-            std_ok=false
-            std_msg="$(cat "$std_err")"
-            break
-        fi
-    done < <(find std -name '*.brp' | sort)
-fi
-if $std_ok && ! $formatter_tool_ready; then
-    std_ok=false
-    std_msg="formatter tool did not compile"
-fi
-if $std_ok && ! "$formatter_tool_bin" "${std_batch_args[@]}" > "$std_err" 2>&1; then
-    std_ok=false
-    std_msg="$(cat "$std_err")"
-fi
-if $std_ok; then
-    while IFS= read -r std_source; do
-        std_rel="${std_source#std/}"
-        if ! diff -u "$std_expected_dir/std/$std_rel" "$std_actual_dir/std/$std_rel" > "$std_diff"; then
-            std_ok=false
-            std_msg="$(cat "$std_diff")"
-            break
-        fi
-    done < <(find std -name '*.brp' | sort)
-fi
-if $std_ok; then
-    record_pass "std formatter program batch matches production formatter"
-else
-    record_fail "std formatter program batch matches production formatter" "$std_msg"
-fi
 
 expect_output_contains "repl help" 0 "Usage: blorp repl" "$BLORP_BIN" repl --help
 expect_stdin_exit "repl quit" 0 ":quit

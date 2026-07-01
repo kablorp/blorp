@@ -57,6 +57,13 @@ let has_top_level_main_source source =
       let trimmed = String.trim line in
       starts_with trimmed "func main(")
 
+let source_declares_testsuite source =
+  contains_substring source "tests: TestSuite"
+  || contains_substring source "tests:TestSuite"
+
+let source_mentions_doctests source =
+  contains_substring source "---" && contains_substring source "doctests:"
+
 (** Get current time in seconds *)
 let get_time () = Unix.gettimeofday ()
 
@@ -950,6 +957,29 @@ let requires_filesystem_isolation filename =
   let path = normalized_relative_test_path filename in
   List.exists (fun root -> path_under root path) filesystem_isolated_suite_roots
 
+type test_file_info = {
+  test_file_path : string;
+  test_file_source : string;
+  test_file_has_main : bool;
+  test_file_is_suite : bool;
+  test_file_has_doctests : bool;
+  test_file_requires_process_isolation : bool;
+  test_file_requires_filesystem_isolation : bool;
+}
+
+let classify_test_file filename =
+  let source = read_file filename in
+  {
+    test_file_path = filename;
+    test_file_source = source;
+    test_file_has_main = has_top_level_main_source source;
+    test_file_is_suite = source_declares_testsuite source;
+    test_file_has_doctests = source_mentions_doctests source;
+    test_file_requires_process_isolation = requires_process_isolation filename;
+    test_file_requires_filesystem_isolation =
+      requires_filesystem_isolation filename;
+  }
+
 let isolated_test_environment cwd = [ ("TMPDIR", cwd) ]
 
 let isolated_test_cwd filename =
@@ -1401,13 +1431,6 @@ let extract_all_doctests ?(source_text = "") program =
   in
   List.concat_map extract_from_decl program
 
-(** Check if a file has doctests (quick string check) *)
-let has_doctests filename =
-  try
-    let content = read_file filename in
-    contains_substring content "---" && contains_substring content "doctests:"
-  with _ -> false
-
 (* ============================================================================
    Test File Helpers
    ============================================================================ *)
@@ -1757,29 +1780,17 @@ let generate_doctest_program_with_map ~source_path ~source_text program =
   let doctests = extract_all_doctests ~source_text program in
   generate_doctest_program_with_map_impl source_path program doctests
 
-(** Check if a file is a TestSuite test file *)
-let is_testsuite_file filename =
-  try
-    let content = read_file filename in
-    contains_substring content "tests: TestSuite"
-    || contains_substring content "tests:TestSuite"
-  with _ -> false
-
 (** Check if a file looks like a valid test *)
-let is_valid_test_file filename =
+let is_valid_test_info info =
+  info.test_file_has_main || info.test_file_is_suite
+  || info.test_file_has_doctests
+  || contains_substring info.test_file_source "std/test"
+
+let classify_valid_test_file filename =
   try
-    let content = read_file filename in
-    let has_main = has_top_level_main_source content in
-    let has_testsuite =
-      contains_substring content "tests: TestSuite"
-      || contains_substring content "tests:TestSuite"
-      || contains_substring content "std/test"
-    in
-    let has_docs =
-      contains_substring content "---" && contains_substring content "doctests:"
-    in
-    has_main || has_testsuite || has_docs
-  with _ -> false
+    let info = classify_test_file filename in
+    if is_valid_test_info info then Some info else None
+  with _ -> None
 
 (** Directories to skip when searching for test files *)
 let skip_directories =
@@ -1789,7 +1800,7 @@ let skip_directories =
 let sorted_directory_entries path =
   Sys.readdir path |> Array.to_list |> List.sort String.compare
 
-let find_brp_files dir =
+let find_brp_file_infos dir =
   let rec walk acc path =
     if Sys.is_directory path then
       let dirname = Filename.basename path in
@@ -1799,11 +1810,23 @@ let find_brp_files dir =
           (fun acc name -> walk acc (Filename.concat path name))
           acc
           (sorted_directory_entries path)
-    else if Filename.check_suffix path ".brp" && is_valid_test_file path then
-      path :: acc
+    else if Filename.check_suffix path ".brp" then
+      match classify_valid_test_file path with
+      | Some info -> info :: acc
+      | None -> acc
     else acc
   in
   List.rev (walk [] dir)
+
+let find_brp_files dir =
+  List.map (fun info -> info.test_file_path) (find_brp_file_infos dir)
+
+let collect_test_file_infos paths =
+  let infos_for_path path =
+    if is_directory path then find_brp_file_infos path
+    else [ classify_test_file path ]
+  in
+  List.fold_right (fun path acc -> infos_for_path path @ acc) paths []
 
 let collect_test_files paths =
   let files_for_path path =
@@ -2018,8 +2041,7 @@ let generate_suite_run_all_harness test_files =
    ============================================================================ *)
 
 (** Parse a blorp file and return the AST *)
-let parse_file filename =
-  let input = read_file filename in
+let parse_file_source filename input =
   let base_dir = extract_directory filename in
   init_module_paths base_dir;
   match Modules.parse_source input with
@@ -2106,7 +2128,8 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = [])
 
 let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
     ?precompiled ?(leak_check = false) ?(isolate_filesystem = false)
-    ?(cache_result = true) ?loc_remap ?module_base_dir ~timeout filename =
+    ?(cache_result = true) ?loc_remap ?module_base_dir ?source_text
+    ?suite_file ~timeout filename =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     {
@@ -2121,17 +2144,24 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
   Modules.reset ();
   Lexer.reset_state ();
 
+  let raw_source =
+    match source_text with Some source -> source | None -> read_file filename
+  in
+  (* Skip the TestSuite→main rewriter when the source already has
+     its own [main]. This is important for doctest temp files: the
+     doctest generator emits [main] inline so the synthetic→original
+     loc remap stays valid. If [generate_test_wrapper] ran here it
+     would move the [tests:] block inside a newly-synthesized
+     [main] and invalidate the remap. *)
+  let generated_suite_wrapper =
+    (match suite_file with
+    | Some value -> value
+    | None -> source_declares_testsuite raw_source)
+    && not (has_top_level_main_source raw_source)
+  in
   let source =
-    let raw = read_file filename in
-    (* Skip the TestSuite→main rewriter when the source already has
-       its own [main]. This is important for doctest temp files: the
-       doctest generator emits [main] inline so the synthetic→original
-       loc remap stays valid. If [generate_test_wrapper] ran here it
-       would move the [tests:] block inside a newly-synthesized
-       [main] and invalidate the remap. *)
-    if is_testsuite_file filename && not (has_top_level_main_source raw) then
-      generate_test_wrapper ~leak_check raw
-    else raw
+    if generated_suite_wrapper then generate_test_wrapper ~leak_check raw_source
+    else raw_source
   in
   (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
   | Some path ->
@@ -2147,12 +2177,12 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
 
   let embed_runtime = Option.is_none precompiled in
   let compile_result =
-    match loc_remap with
-    | Some _ ->
+    match (loc_remap, generated_suite_wrapper) with
+    | Some _, _ | None, true ->
         Pipeline.compile_generated_test_harness ~debug
           ~allow_debug_only_calls:true ~retain_debug_blocks:true ~embed_runtime
           ~filename ~source ()
-    | None ->
+    | None, false ->
         Pipeline.compile ~debug ~allow_debug_only_calls:true
           ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
   in
@@ -2254,8 +2284,15 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
 
 (** Run doctests from a source file. *)
 let run_doctests ?(debug = false) ?(sanitize = false) ?sanitizer_mode
-    ?precompiled ~timeout source_filename =
-  match parse_file source_filename with
+    ?precompiled ?source_text ~timeout source_filename =
+  let source_text_result =
+    match source_text with
+    | Some source -> Ok source
+    | None -> (
+        try Ok (read_file source_filename)
+        with exn -> Error (Printexc.to_string exn))
+  in
+  match source_text_result with
   | Error msg ->
       [
         {
@@ -2266,56 +2303,67 @@ let run_doctests ?(debug = false) ?(sanitize = false) ?sanitizer_mode
           error_detail = msg;
         };
       ]
-  | Ok (program, _base_dir) ->
-      let source_text = try read_file source_filename with _ -> "" in
-      let test_source, remap =
-        generate_doctest_program_with_map ~source_path:source_filename
-          ~source_text program
-      in
-      if
-        Hashtbl.length remap = 0
-        && extract_all_doctests ~source_text program = []
-      then []
-      else begin
-        let tmp_base =
-          ".blorp_doctest_"
-          ^ Filename.basename (Filename.remove_extension source_filename)
-        in
-        let tmp_file =
-          run_artifact_path ~kind:"doctests" ~prefix:tmp_base ~suffix:".brp"
-        in
-        Fun.protect
-          ~finally:(fun () -> try Sys.remove tmp_file with _ -> ())
-          (fun () ->
-            let oc = open_out tmp_file in
-            Fun.protect
-              ~finally:(fun () -> close_out oc)
-              (fun () -> output_string oc test_source);
-            (* Threading [~loc_remap] into [run_test_result] is what
-             converts synthetic temp-file locs into their original-
-             source counterparts before errors get rendered. Earlier
-             iterations did a post-hoc string replace on rendered
-             error text to swap the file path — the loc number and
-             snippet stayed synthetic, so users saw a path from
-             their file with line numbers from the temp file. The
-             current approach rewrites the loc object pre-render,
-             so the snippet, line-number gutter, column marker, and
-             file path all agree with the user's real source. *)
-            let r =
-              run_test_result ~debug ~sanitize ?sanitizer_mode ?precompiled
-                ~loc_remap:remap
-                ~module_base_dir:(extract_directory source_filename)
-                ~timeout tmp_file
+  | Ok source_text -> (
+      match parse_file_source source_filename source_text with
+      | Error msg ->
+          [
+            {
+              file = source_filename;
+              passed = false;
+              duration = 0.0;
+              output = "";
+              error_detail = msg;
+            };
+          ]
+      | Ok (program, _base_dir) ->
+          let test_source, remap =
+            generate_doctest_program_with_map ~source_path:source_filename
+              ~source_text program
+          in
+          if
+            Hashtbl.length remap = 0
+            && extract_all_doctests ~source_text program = []
+          then []
+          else begin
+            let tmp_base =
+              ".blorp_doctest_"
+              ^ Filename.basename (Filename.remove_extension source_filename)
             in
-            let cleaned_detail = r.error_detail in
-            [
-              {
-                r with
-                file = source_filename ^ " (doctests)";
-                error_detail = cleaned_detail;
-              };
-            ])
-      end
+            let tmp_file =
+              run_artifact_path ~kind:"doctests" ~prefix:tmp_base ~suffix:".brp"
+            in
+            Fun.protect
+              ~finally:(fun () -> try Sys.remove tmp_file with _ -> ())
+              (fun () ->
+                let oc = open_out tmp_file in
+                Fun.protect
+                  ~finally:(fun () -> close_out oc)
+                  (fun () -> output_string oc test_source);
+                (* Threading [~loc_remap] into [run_test_result] is what
+                 converts synthetic temp-file locs into their original-
+                 source counterparts before errors get rendered. Earlier
+                 iterations did a post-hoc string replace on rendered
+                 error text to swap the file path — the loc number and
+                 snippet stayed synthetic, so users saw a path from
+                 their file with line numbers from the temp file. The
+                 current approach rewrites the loc object pre-render,
+                 so the snippet, line-number gutter, column marker, and
+                 file path all agree with the user's real source. *)
+                let r =
+                  run_test_result ~debug ~sanitize ?sanitizer_mode ?precompiled
+                    ~loc_remap:remap
+                    ~module_base_dir:(extract_directory source_filename)
+                    ~timeout tmp_file
+                in
+                let cleaned_detail = r.error_detail in
+                [
+                  {
+                    r with
+                    file = source_filename ^ " (doctests)";
+                    error_detail = cleaned_detail;
+                  };
+                ])
+          end)
 
 (* ============================================================================
    Result Reporting
@@ -2341,37 +2389,45 @@ let print_test_result ?(profile = false) ?(leak_check = false) r =
   end
 
 (** Run a suite test, checking cache first *)
+let source_text_matches_current_file filename = function
+  | None -> true
+  | Some source -> file_content_hash filename = Digest.to_hex (Digest.string source)
+
 let run_suite_test_cached ?(debug = false) ?(sanitize = false) ?sanitizer_mode
     ?precompiled ?(leak_check = false) ?(isolate_filesystem = false) ~timeout
-    filename =
-  match if isolate_filesystem then None else check_test_cache filename with
+    ?source_text ?suite_file filename =
+  let cache_allowed =
+    (not isolate_filesystem)
+    && source_text_matches_current_file filename source_text
+  in
+  match if cache_allowed then check_test_cache filename else None with
   | Some cached -> cached
   | None ->
       run_test_result ~debug ~sanitize ?sanitizer_mode ?precompiled ~leak_check
-        ~isolate_filesystem ~cache_result:(not isolate_filesystem) ~timeout
-        filename
+        ~isolate_filesystem ~cache_result:cache_allowed ~timeout
+        ?source_text ?suite_file filename
 
 (** Run a single test file with mode dispatch *)
-let run_test_with_mode ?(debug = false) ?(sanitize = false) ?sanitizer_mode
-    ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout filename =
+let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
+    ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout info =
+  let filename = info.test_file_path in
   let isolate_filesystem =
-    leak_check || requires_filesystem_isolation filename
+    leak_check || info.test_file_requires_filesystem_isolation
   in
-  let is_suite_file =
-    is_testsuite_file filename
-    || has_top_level_main_source (try read_file filename with _ -> "")
-  in
+  let is_suite_file = info.test_file_is_suite || info.test_file_has_main in
   match mode with
   | DocOnly ->
-      if has_doctests filename then
+      if info.test_file_has_doctests then
         run_doctests ~debug ~sanitize ?sanitizer_mode ?precompiled ~timeout
-          filename
+          ~source_text:info.test_file_source filename
       else []
   | SuiteOnly ->
       if is_suite_file then
         [
           run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
-            ~leak_check ~isolate_filesystem ~timeout filename;
+            ~leak_check ~isolate_filesystem ~timeout
+            ~source_text:info.test_file_source
+            ~suite_file:info.test_file_is_suite filename;
         ]
       else []
   | TestAll ->
@@ -2379,14 +2435,16 @@ let run_test_with_mode ?(debug = false) ?(sanitize = false) ?sanitizer_mode
         if is_suite_file then
           [
             run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
-              ~leak_check ~isolate_filesystem ~timeout filename;
+              ~leak_check ~isolate_filesystem ~timeout
+              ~source_text:info.test_file_source
+              ~suite_file:info.test_file_is_suite filename;
           ]
         else []
       in
       let doc_results =
-        if has_doctests filename then
+        if info.test_file_has_doctests then
           run_doctests ~debug ~sanitize ?sanitizer_mode ?precompiled ~timeout
-            filename
+            ~source_text:info.test_file_source filename
         else []
       in
       suite_results @ doc_results
@@ -2558,16 +2616,8 @@ let suite_run_all_results_from_output ~elapsed files output =
       (List.init expected_count (fun index ->
            Hashtbl.find results_by_index index))
 
-let timeout_for_suite_run_all_batch ~suite_count timeout =
-  match timeout with
-  | None | Some 0 -> timeout
-  | Some seconds -> Some (seconds * max 1 suite_count)
-
 let run_suite_run_all_case ~timeout ~bin_file ~files =
   let start_time = get_time () in
-  let batch_timeout =
-    timeout_for_suite_run_all_batch ~suite_count:(List.length files) timeout
-  in
   let make_harness_result ?(output = "") ?(error_detail = "") passed =
     [
       {
@@ -2580,7 +2630,7 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
     ]
   in
   let result, output =
-    run_process_capture_timeout ~timeout:batch_timeout bin_file []
+    run_process_capture_timeout ~timeout bin_file []
   in
   let elapsed = get_time () -. start_time in
   match result with
@@ -2593,7 +2643,7 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
   | 99 ->
       make_harness_result ~output ~error_detail:"(leak detected at exit)" false
   | 124 ->
-      let secs = match batch_timeout with Some s -> s | None -> 0 in
+      let secs = match timeout with Some s -> s | None -> 0 in
       make_harness_result ~output
         ~error_detail:(Printf.sprintf "(timed out after %ds)" secs)
         false
@@ -2610,25 +2660,28 @@ let importable_test_module filename =
        (Filename.remove_extension filename)
        (Sys.getcwd () ^ Filename.dir_sep)
 
-let suite_selector_eligible mode filename =
+let suite_selector_eligible_info mode info =
   match mode with
   | DocOnly -> false
   | SuiteOnly ->
-      importable_test_module filename
-      && is_testsuite_file filename
-      && not (has_top_level_main_source (try read_file filename with _ -> ""))
+      importable_test_module info.test_file_path
+      && info.test_file_is_suite
+      && not info.test_file_has_main
   | TestAll ->
-      importable_test_module filename
-      && is_testsuite_file filename
-      && (not (has_doctests filename))
-      && not (has_top_level_main_source (try read_file filename with _ -> ""))
+      importable_test_module info.test_file_path
+      && info.test_file_is_suite
+      && (not info.test_file_has_doctests)
+      && not info.test_file_has_main
 
-let suite_run_all_eligible ~leak_check mode filename =
+let suite_run_all_eligible_info ~leak_check mode info =
   (not leak_check)
-  && suite_selector_eligible mode filename
-  && not (requires_process_isolation filename)
+  && suite_selector_eligible_info mode info
+  && not info.test_file_requires_process_isolation
 
-let run_all_suite_batch_size = 64
+(* Keep combined TestSuite harnesses below the size where process-exit cleanup
+   can fail after all suites pass. This still avoids per-file compilation for
+   small compiler-owned suites while keeping the generated harness bounded. *)
+let run_all_suite_batch_size = 8
 
 let chunk_by_count size items =
   let rec take remaining count taken =
@@ -2808,15 +2861,21 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
 
 let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
     ?(sanitize = false) ?sanitizer_mode ?precompiled ?(leak_check = false)
-    ?(mode = TestAll) ~timeout files =
-  let run_all_files =
-    List.filter (suite_run_all_eligible ~leak_check mode) files
+    ?(mode = TestAll) ~timeout infos =
+  let files = List.map (fun info -> info.test_file_path) infos in
+  let run_all_infos =
+    List.filter (suite_run_all_eligible_info ~leak_check mode) infos
+  in
+  let run_all_files = List.map (fun info -> info.test_file_path) run_all_infos in
+  let selector_infos =
+    List.filter
+      (fun info ->
+        suite_selector_eligible_info mode info
+        && not (List.mem info.test_file_path run_all_files))
+      infos
   in
   let selector_files =
-    List.filter
-      (fun file ->
-        suite_selector_eligible mode file && not (List.mem file run_all_files))
-      files
+    List.map (fun info -> info.test_file_path) selector_infos
   in
   if List.length run_all_files < 2 && List.length selector_files < 2 then None
   else begin
@@ -2887,30 +2946,33 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
               ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
               (fun () ->
                 List.iteri
-                  (fun index file ->
+                  (fun index info ->
+                    let file = info.test_file_path in
                     let cwd =
-                      if leak_check || requires_filesystem_isolation file then
+                      if leak_check || info.test_file_requires_filesystem_isolation
+                      then
                         Some (isolated_test_cwd file)
                       else None
                     in
                     record_result
                       (run_suite_selector_case ~cwd ~timeout ~bin_file ~file
                          ~index))
-                  selector_files)
+                  selector_infos)
       end
     in
     run_all_combined ();
     run_selector_combined ();
     List.iter
-      (fun file ->
+      (fun info ->
+        let file = info.test_file_path in
         if
           (not (Hashtbl.mem handled_files file))
           && not (Hashtbl.mem result_by_file file)
         then
           record_results
-            (run_test_with_mode ~debug ~sanitize ?sanitizer_mode ?precompiled
-               ~leak_check ~mode ~timeout file))
-      files;
+            (run_test_with_info ~debug ~sanitize ?sanitizer_mode ?precompiled
+               ~leak_check ~mode ~timeout info))
+      infos;
     let ordered_results =
       List.filter_map (fun file -> Hashtbl.find_opt result_by_file file) files
       @ List.rev !extra_results
@@ -2929,17 +2991,18 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
 
 let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?precompiled ?(leak_check = false) ?(mode = TestAll)
-    ~timeout files =
+    ~timeout infos =
   let start_time = get_time () in
   let passed = ref 0 in
   let failed = ref 0 in
   let all_results = ref [] in
   List.iter
-    (fun file ->
+    (fun info ->
+      let file = info.test_file_path in
       print_test_start file;
       let results =
-        run_test_with_mode ~debug ~sanitize ?sanitizer_mode ?precompiled
-          ~leak_check ~mode ~timeout file
+        run_test_with_info ~debug ~sanitize ?sanitizer_mode ?precompiled
+          ~leak_check ~mode ~timeout info
       in
       List.iter
         (fun r ->
@@ -2947,7 +3010,7 @@ let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
           if r.passed then incr passed else incr failed;
           all_results := r :: !all_results)
         results)
-    files;
+    infos;
   let elapsed = get_time () -. start_time in
   print_results_summary ~profile elapsed !passed !failed (List.rev !all_results);
   if !failed > 0 then 1 else 0
@@ -2955,24 +3018,23 @@ let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
 (** Run tests in parallel using fork *)
 let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?precompiled ?(leak_check = false) ?(mode = TestAll)
-    ~timeout ~num_workers files =
+    ~timeout ~num_workers infos =
   let start_time = get_time () in
-  let n = min num_workers (List.length files) in
+  let files = List.map (fun info -> info.test_file_path) infos in
+  let n = min num_workers (List.length infos) in
 
   prewarm_parse_cache ();
 
-  let sized_files =
+  let sized_infos =
     List.map
-      (fun f ->
-        let size = try (Unix.stat f).st_size with _ -> 0 in
-        (size, f))
-      files
+      (fun info -> (String.length info.test_file_source, info))
+      infos
   in
-  let sorted_files =
-    List.map snd (List.sort (fun (a, _) (b, _) -> compare b a) sized_files)
+  let sorted_infos =
+    List.map snd (List.sort (fun (a, _) (b, _) -> compare b a) sized_infos)
   in
 
-  let chunks = split_work sorted_files n in
+  let chunks = split_work sorted_infos n in
 
   let child_pids = ref [] in
   let old_handler =
@@ -3006,14 +3068,16 @@ let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
             let results =
               try
                 List.concat_map
-                  (fun file ->
+                  (fun info ->
+                    let file = info.test_file_path in
                     print_test_start ~worker:(worker_idx + 1) file;
-                    run_test_with_mode ~debug ~sanitize ?sanitizer_mode
-                      ?precompiled ~leak_check ~mode ~timeout file)
+                    run_test_with_info ~debug ~sanitize ?sanitizer_mode
+                      ?precompiled ~leak_check ~mode ~timeout info)
                   tests
               with exn ->
                 List.map
-                  (fun file ->
+                  (fun info ->
+                    let file = info.test_file_path in
                     {
                       file;
                       passed = false;
@@ -3080,12 +3144,13 @@ let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
   if failed > 0 then 1 else 0
 
 (** Run tests: dispatches to sequential or parallel *)
-let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
+let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
-    ?(cache = true) ?(repeat = 1) files =
+    ?(cache = true) ?(repeat = 1) test_infos =
   with_run_artifacts (fun () ->
       let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
       let sanitize = sanitizer_enabled sanitizer_mode in
+      let files = List.map (fun info -> info.test_file_path) test_infos in
       (* Warn if std/ sources are newer than the compiler binary *)
       check_stale_std ();
       (* Set leak check env var at top level — inherited by forked workers *)
@@ -3112,16 +3177,17 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
         if repeat > 1 then Printf.printf "\nRepeat %d/%d\n%!" iteration repeat;
         match
           try_run_suite_selector_tests ~profile ~debug ~sanitizer_mode
-            ?precompiled ~leak_check ~mode ~timeout files
+            ?precompiled ~leak_check ~mode ~timeout test_infos
         with
         | Some result -> result
         | None ->
             if effective_jobs = 1 then
               run_tests_sequential ~profile ~debug ~sanitizer_mode ?precompiled
-                ~leak_check ~mode ~timeout files
+                ~leak_check ~mode ~timeout test_infos
             else
               run_tests_parallel ~profile ~debug ~sanitizer_mode ?precompiled
-                ~leak_check ~mode ~timeout ~num_workers:effective_jobs files
+                ~leak_check ~mode ~timeout ~num_workers:effective_jobs
+                test_infos
       in
       let rec loop iteration =
         let result = run_once iteration in
@@ -3134,12 +3200,12 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
 let run_tests ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
     ?(cache = true) ?(repeat = 1) path =
-  run_test_files ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
+  run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
     ~timeout ~jobs ~cache ~repeat
-    (collect_test_files [ path ])
+    (collect_test_file_infos [ path ])
 
 let run_tests_paths ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
     ?(cache = true) ?(repeat = 1) paths =
-  run_test_files ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
-    ~timeout ~jobs ~cache ~repeat (collect_test_files paths)
+  run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
+    ~timeout ~jobs ~cache ~repeat (collect_test_file_infos paths)

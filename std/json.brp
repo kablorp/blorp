@@ -1,13 +1,13 @@
 import:
 	float: is_finite
-	parser: ParseResult(Failure, Success)
+	parser: Cursor, ParseError, ParseResult(ParseFailed, Parsed), make_span
 	set: set
 	string: from_char, is_digit, string as make_string
 
 
 -- JSON Parser
 -- Built around an indexed scanner. `parse` adapts the scanner to ParseResult
--- for callers that need remaining-input behavior.
+-- for callers that need cursor-based composition.
 -- JsonValue.to_string emits valid JSON for all JsonValue values. Since JSON
 -- has no NaN or infinity literals, non-finite JsonNumber values serialize as
 -- null.
@@ -122,17 +122,6 @@ private pure func append_unicode_escape(result: String, code: Int) -> String:
 	out
 
 
-private pure func suffix_at(input: String, start: Int) -> String:
-	len: Int = input.length()
-
-	if start <= 0:
-		input
-	else if start >= len:
-		""
-	else:
-		input.substring(start, len - start)
-
-
 -- ============================================================================
 -- Indexed strict JSON parser
 -- ============================================================================
@@ -154,6 +143,28 @@ private JSON_SCANNER: JsonScanner = {
 	line = 1,
 	column = 1
 }
+
+
+private pure func parser_cursor(s: JsonScanner) -> Cursor:
+	{
+		offset = s.pos,
+		line = s.line,
+		column = s.column
+	}
+
+
+private pure func parser_error(failure: JsonScanFailure) -> ParseError:
+	cursor: Cursor = {
+		offset = failure.pos,
+		line = failure.error.line,
+		column = failure.error.column
+	}
+	{
+		span = make_span(cursor, cursor),
+		message = failure.error.message,
+		expected = [],
+		committed = False
+	}
 
 
 private pure func scanner_at_end(input: String, s: JsonScanner) -> Bool:
@@ -706,31 +717,25 @@ private pure func scanner_parse_object(
 
 
 ---
-Parse one JSON value and return the remaining input.
-This is a compatibility entry point for code that composes parsers. It uses the
-same scanner as `parse_json`, but it does not require the scanner to consume the
-full input.
+Parse one JSON value and return the cursor after that value.
+This is the cursor-based entry point for code that composes parsers. It uses
+the same scanner as `parse_json`, but it does not require the scanner to consume
+the full input.
 
 doctests:
-    :: Parse preserves trailing input
+    :: Parse preserves trailing cursor
     match parse("true false"):
-        Success(JsonBool(True), rest):
-            rest == " false"
+        Parsed(JsonBool(True), cursor):
+            cursor.offset == 4
         _:
             False
 ---
 pure func parse(input: String) -> ParseResult[JsonValue]:
 	match scanner_parse_value(input, JSON_SCANNER):
 		Ok((value, rest)):
-			Success(
-				value,
-				suffix_at(input, rest.pos),
-			)
+			Parsed(value, parser_cursor(rest))
 		Err(failure):
-			Failure(
-				failure.error.format_error(),
-				suffix_at(input, failure.pos),
-			)
+			ParseFailed(parser_error(failure))
 
 
 ---

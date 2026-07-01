@@ -44,6 +44,58 @@ let test_resolve_imported_name_handles_aliases_and_constructors () =
   let qualified = import_decl "dict" in
   check_imported_name qualified "get" (Some "get")
 
+let loc file ~line ~column =
+  {
+    Ast.line = line;
+    column;
+    end_line = line;
+    end_column = column + 1;
+    loc_file = Some file;
+  }
+
+let ident_expr file name ~line ~column =
+  Ast.untyped_expr ~loc:(loc file ~line ~column) (Ast.EIdent name)
+
+let var_decl file name value =
+  let value_loc = (value : Ast.expr).expr_loc in
+  {
+    Ast.decl_desc =
+      Ast.DVar
+        {
+          var_name = Some name;
+          var_pattern = None;
+          var_type = None;
+          var_value = value;
+          var_is_mutable = false;
+          var_is_const = false;
+        };
+    decl_loc = loc file ~line:value_loc.line ~column:1;
+    decl_doc = None;
+  }
+
+let ident_name = function
+  | Some { Ast.expr_desc = Ast.EIdent name; _ } -> Some name
+  | _ -> None
+
+let test_find_expr_at_filters_by_file () =
+  let source_expr = ident_expr "source.brp" "source_value" ~line:1 ~column:5 in
+  let imported_expr = ident_expr "std/prelude.brp" "imported_value" ~line:1 ~column:9 in
+  let program =
+    [
+      var_decl "source.brp" "source_value" source_expr;
+      var_decl "std/prelude.brp" "imported_value" imported_expr;
+    ]
+  in
+  Alcotest.(check (option string))
+    "unfiltered lookup keeps closest expression"
+    (Some "imported_value")
+    (Lsp_position.find_expr_at program ~line:0 ~col:12 |> ident_name);
+  Alcotest.(check (option string))
+    "file-filtered lookup ignores imported expression"
+    (Some "source_value")
+    (Lsp_position.find_expr_at program ~file:"source.brp" ~line:0 ~col:12
+    |> ident_name)
+
 let suite =
   [
     ( "position",
@@ -52,5 +104,7 @@ let suite =
           test_word_at_finds_identifier_boundaries;
         Alcotest.test_case "resolve_imported_name handles import forms" `Quick
           test_resolve_imported_name_handles_aliases_and_constructors;
+        Alcotest.test_case "find_expr_at filters by file" `Quick
+          test_find_expr_at_filters_by_file;
       ] );
   ]

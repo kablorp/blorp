@@ -152,6 +152,294 @@ let module_origin_for_source_file ?sess path =
 let is_directory path =
   try Sys.file_exists path && Sys.is_directory path with _ -> false
 
+let session_uses_bootstrap_menhir_parser sess =
+  match Session.parser_frontend sess with
+  | Session.BlorpParserBridge -> false
+  | Session.BootstrapMenhirParser -> true
+
+let bridge_module_name_for_path path =
+  match module_name_for_source_file path with
+  | Some name -> name
+  | None ->
+      let base = Filename.basename path in
+      if Filename.check_suffix base ".brp" then
+        String.sub base 0 (String.length base - 4)
+      else base
+
+let parse_error_for_message ?filename message =
+  let loc =
+    match filename with
+    | Some file -> Ast.point_loc_in ~file ~line:1 ~column:1
+    | None -> Ast.point_loc ~line:1 ~column:1
+  in
+  {
+    Ast.message = message;
+    loc;
+    phase = Ast.Parse;
+    kind = Ast.OtherError;
+    notes = [];
+    help = None;
+  }
+
+type bridge_parse_error =
+  | BridgeParseMessage of string
+  | BridgeParseCompilerErrors of Ast.compiler_error list
+
+let compiler_error_of_interp_parse_error ~path message loc =
+  let loc =
+    match loc.Ast.loc_file with
+    | None -> { loc with loc_file = Some path }
+    | Some _ -> loc
+  in
+  {
+    Ast.message;
+    loc;
+    phase = Ast.Parse;
+    kind = Ast.OtherError;
+    notes = [];
+    help = None;
+  }
+
+let finalize_parsed_program ~hoist_nested program =
+  if hoist_nested then
+    try Ok (Nested_hoist.hoist_program program)
+    with Nested_hoist.Capture_error err -> Error err
+  else Ok program
+
+let set_lexbuf_filename (lexbuf : Lexing.lexbuf) (path : string) =
+  lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with pos_fname = path };
+  lexbuf.lex_start_p <- { lexbuf.lex_start_p with pos_fname = path }
+
+let parse_source_with_bootstrap_menhir ?filename ~hoist_nested source =
+  Lexer.reset_state ();
+  let lexbuf = Lexing.from_string source in
+  Option.iter (set_lexbuf_filename lexbuf) filename;
+  try
+    let program = Parser.program Lexer.next_token lexbuf in
+    let program =
+      Interp_parser.transform_program_with_bootstrap_menhir_expr_parser program
+    in
+    finalize_parsed_program ~hoist_nested program
+  with
+  | Lexer.LexError (msg, line, col) ->
+      Error
+        {
+          Ast.message = msg;
+          loc =
+            (match filename with
+            | Some file -> Ast.point_loc_in ~file ~line ~column:col
+            | None -> Ast.point_loc ~line ~column:col);
+          phase = Ast.Parse;
+          kind = Ast.OtherError;
+          notes = [];
+          help = None;
+        }
+  | Ast.Parse_error_at (loc, msg) ->
+      let loc =
+        match (filename, loc.Ast.loc_file) with
+        | Some file, None -> { loc with Ast.loc_file = Some file }
+        | _ -> loc
+      in
+      Error
+        {
+          Ast.message = msg;
+          loc;
+          phase = Ast.Parse;
+          kind = Ast.OtherError;
+          notes = [];
+          help = None;
+        }
+  | Parser.Error ->
+      let line, col = Lexer.current_pos () in
+      let message =
+        match Lexer.last_token () with
+        | Some tok ->
+            Printf.sprintf "Parse error: unexpected %s"
+              (Lexer.token_to_string tok)
+        | None -> "Parse error"
+      in
+      Error
+        {
+          Ast.message = message;
+          loc =
+            (match filename with
+            | Some file -> Ast.point_loc_in ~file ~line ~column:col
+            | None -> Ast.point_loc ~line ~column:col);
+          phase = Ast.Parse;
+          kind = Ast.OtherError;
+          notes = [];
+          help = None;
+        }
+  | Interp_parser.InterpParseError (msg, loc) ->
+      let loc =
+        match (filename, loc.Ast.loc_file) with
+        | Some file, None -> { loc with Ast.loc_file = Some file }
+        | _ -> loc
+      in
+      Error
+        {
+          Ast.message = msg;
+          loc;
+          phase = Ast.Parse;
+          kind = Ast.OtherError;
+          notes = [];
+          help = None;
+        }
+
+let request_at_index requests index =
+  let rec loop i = function
+    | [] -> None
+    | request :: rest -> if i = index then Some request else loop (i + 1) rest
+  in
+  loop 0 requests
+
+let interp_error_loc_for_diagnostic requests (err : Ast.compiler_error) =
+  match request_at_index requests (max 0 (err.loc.line - 1)) with
+  | Some request -> request.Interp_parser.loc
+  | None -> err.loc
+
+let interp_wrapper_var_name index = Printf.sprintf "___interp_%d" index
+
+let interp_wrapper_var_index name =
+  let prefix = "___interp_" in
+  let prefix_len = String.length prefix in
+  if
+    String.length name > prefix_len
+    && String.sub name 0 prefix_len = prefix
+  then int_of_string_opt (String.sub name prefix_len (String.length name - prefix_len))
+  else None
+
+let rec parse_interpolated_exprs_with_blorp_bridge ~path ~module_name requests =
+  let saved_comments = Lexer.get_comments () in
+  Fun.protect
+    ~finally:(fun () -> Lexer.restore_comments saved_comments)
+    (fun () ->
+      let request_count = List.length requests in
+      let wrapper =
+        requests
+        |> List.mapi (fun index request ->
+               Printf.sprintf "%s = %s\n" (interp_wrapper_var_name index)
+                 request.Interp_parser.text)
+        |> String.concat ""
+      in
+      let first_request_loc =
+        match requests with
+        | request :: _ -> request.Interp_parser.loc
+        | [] -> Ast.point_loc_in ~file:path ~line:1 ~column:1
+      in
+      let fail request =
+        raise
+          (Interp_parser.InterpParseError
+             ( Printf.sprintf "Failed to parse interpolated expression: %s"
+                 request.Interp_parser.text,
+               request.Interp_parser.loc ))
+      in
+      let fail_at_start message =
+        raise
+          (Interp_parser.InterpParseError (message, first_request_loc))
+      in
+      let extract decls =
+        let parsed_by_index = Hashtbl.create request_count in
+        let record_decl decl =
+          match decl.Ast.decl_desc with
+          | Ast.DVar { var_name = Some name; var_value; _ } -> (
+              match interp_wrapper_var_index name with
+              | Some index when index >= 0 && index < request_count ->
+                  if Hashtbl.mem parsed_by_index index then
+                    fail_at_start
+                      "interpolation expression parser returned duplicate \
+                       expressions"
+                  else Hashtbl.add parsed_by_index index var_value
+              | _ ->
+                  fail_at_start
+                    "interpolation expression parser returned an unexpected \
+                     declaration")
+          | _ ->
+              fail_at_start
+                "interpolation expression parser returned an unexpected \
+                 declaration"
+        in
+        List.iter record_decl decls;
+        List.mapi
+          (fun index request ->
+            match Hashtbl.find_opt parsed_by_index index with
+            | Some expr -> expr
+            | None -> fail request)
+          requests
+      in
+      if request_count = 0 then []
+      else
+        match
+          parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:false
+            ~bridge_read_file:false wrapper
+        with
+        | Ok decls -> extract decls
+        | Error (BridgeParseCompilerErrors (err :: _)) ->
+            raise
+              (Interp_parser.InterpParseError
+                 ( Printf.sprintf
+                     "Parse error in interpolated expression: %s"
+                     err.Ast.message,
+                   interp_error_loc_for_diagnostic requests err ))
+        | Error (BridgeParseCompilerErrors []) ->
+            raise
+              (Interp_parser.InterpParseError
+                 ( "Parse error in interpolated expression",
+                   first_request_loc ))
+        | Error (BridgeParseMessage message) ->
+            raise
+              (Interp_parser.InterpParseError
+                 ( Printf.sprintf
+                     "Parse error in interpolated expression: %s" message,
+                   first_request_loc )))
+
+and parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
+    ~bridge_read_file source =
+  let parse_result =
+    if bridge_read_file then
+      Compiler_blorp_bridge.parse_source_file_via_command ~path ~module_name
+    else
+      Compiler_blorp_bridge.parse_source_via_command ~path ~module_name
+        ~text:source
+  in
+  match
+    parse_result
+  with
+  | Error (_, message) -> Error (BridgeParseMessage message)
+  | Ok (Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics) ->
+      Error (BridgeParseCompilerErrors diagnostics)
+  | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) ->
+      finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
+        parsed_source
+
+and finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
+    (parsed_source : Compiler_blorp_bridge.parsed_source) =
+  Lexer.restore_comments parsed_source.parsed_comments;
+  try
+    let program =
+      Interp_parser.transform_program_with_expr_batch_parser
+        (parse_interpolated_exprs_with_blorp_bridge ~path ~module_name)
+        parsed_source.parsed_program
+    in
+    match finalize_parsed_program ~hoist_nested program with
+    | Ok program -> Ok program
+    | Error err -> Error (BridgeParseCompilerErrors [ err ])
+  with Interp_parser.InterpParseError (message, loc) ->
+    Error
+      (BridgeParseCompilerErrors
+         [ compiler_error_of_interp_parse_error ~path message loc ])
+
+let finalize_blorp_parsed_source ~path ~module_name ?(hoist_nested = true)
+    parsed_source =
+  match
+    finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
+      parsed_source
+  with
+  | Ok program -> Ok program
+  | Error (BridgeParseCompilerErrors errors) -> Error errors
+  | Error (BridgeParseMessage message) ->
+      Error [ parse_error_for_message ~filename:path message ]
+
 (** Record the explicit filesystem std directory for this session. *)
 let record_std_source_dir (s : Session.t) dir =
   let dir = canonical_dir dir in
@@ -274,6 +562,9 @@ let eager_typecheck_support_modules =
     "io";
     "system";
     "prelude";
+    "parallel_list";
+    "parallel_vector";
+    "parallel_matrix";
   ]
 
 let find_cached_by_path (sess : Session.t) (path : string) :
@@ -697,6 +988,370 @@ let std_module_available ~(sess : Session.t) ~base_dir module_name =
      | Some path -> is_std_source_file ~sess path
      | None -> false)
 
+let record_module_parse_message ~(sess : Session.t) ~path ~line ~col msg =
+  (* Collect into the session's [load_errors] list so the pipeline can surface
+     parse failures through the normal diagnostic channel. The parser must not
+     print directly to stderr — that bypasses formatting and breaks structured
+     error consumers. *)
+  let file_msg = Printf.sprintf "%s\n   --> %s:%d:%d" msg path line col in
+  let err =
+    {
+      Ast.message = file_msg;
+      loc = Ast.point_loc_in ~file:path ~line ~column:col;
+      phase = Ast.ModuleLoad;
+      kind = Ast.OtherError;
+      notes = [];
+      help = None;
+    }
+  in
+  sess.Session.load_errors <- err :: sess.load_errors
+
+let cache_parsed_module_source ~(sess : Session.t) ~module_name ~path ~origin
+    ~source decls =
+  let exports = collect_exports decls in
+  let entry : Session.parsed_module_cache_entry =
+    {
+      parsed_path = path;
+      parsed_origin = origin;
+      parsed_source_hash = source_hash source;
+      parsed_decls = decls;
+      parsed_exports = exports;
+    }
+  in
+  Hashtbl.replace sess.parse_cache module_name entry;
+  (path, origin, decls, exports)
+
+type module_parse_batch_item = {
+  module_parse_name : string;
+  module_parse_path : string;
+  module_parse_origin : Session.module_origin;
+  module_parse_source : string;
+}
+
+type module_preload_candidate = {
+  preload_module_name : string;
+  preload_base_dir : string;
+}
+
+type module_parse_preload_result = {
+  preload_failed_modules : string list;
+  preload_cached_items : module_parse_batch_item list;
+}
+
+let empty_module_parse_preload_result =
+  { preload_failed_modules = []; preload_cached_items = [] }
+
+(* Batch enough small modules to avoid process overhead, but cap source bytes
+   so generated AST JSON for large compiler-owned modules does not turn one
+   bridge request into a long-running memory-heavy response. *)
+let module_parse_batch_max_items = 64
+let module_parse_batch_max_source_bytes = 256 * 1024
+
+let combine_module_parse_preload_results left right =
+  {
+    preload_failed_modules =
+      List.rev_append left.preload_failed_modules right.preload_failed_modules;
+    preload_cached_items =
+      List.rev_append left.preload_cached_items right.preload_cached_items;
+  }
+
+let fresh_module_parse_batch_item ~(sess : Session.t) ~base_dir module_name =
+  let from_embedded =
+    if has_prefix "std/" module_name && not sess.std_override_active then
+      match Embedded_std.find module_name with
+      | Some source ->
+          Some
+            {
+              module_parse_name = module_name;
+              module_parse_path = Printf.sprintf "<embedded:%s>" module_name;
+              module_parse_origin = Session.Stdlib_module;
+              module_parse_source = source;
+            }
+      | None -> None
+    else None
+  in
+  match from_embedded with
+  | Some _ as item -> item
+  | None -> (
+      match resolve_module_file ~sess base_dir module_name with
+      | None -> None
+      | Some resolved -> (
+          match read_file resolved.resolved_path with
+          | exception Sys_error _ -> None
+          | source ->
+              Some
+                {
+                  module_parse_name = module_name;
+                  module_parse_path = resolved.resolved_path;
+                  module_parse_origin = resolved.resolved_origin;
+                  module_parse_source = source;
+                }))
+
+let module_parse_batch_item ~(sess : Session.t) ~base_dir module_name =
+  if Hashtbl.mem sess.module_cache module_name then None
+  else
+    match Hashtbl.find_opt sess.parse_cache module_name with
+    | Some entry -> (
+        match cached_parse_entry ~sess ~base_dir ~module_name entry with
+        | Some (Cached_current _) -> None
+        | Some (Cached_changed_source source) ->
+            Hashtbl.remove sess.parse_cache module_name;
+            Some
+              {
+                module_parse_name = module_name;
+                module_parse_path = entry.parsed_path;
+                module_parse_origin = entry.parsed_origin;
+                module_parse_source = source;
+              }
+        | None ->
+            Hashtbl.remove sess.parse_cache module_name;
+            fresh_module_parse_batch_item ~sess ~base_dir module_name)
+    | None -> fresh_module_parse_batch_item ~sess ~base_dir module_name
+
+let bridge_batch_request_of_module_parse item :
+    Compiler_blorp_bridge.parse_source_batch_request =
+  {
+    Compiler_blorp_bridge.batch_parse_path = item.module_parse_path;
+    batch_parse_module_name = item.module_parse_name;
+    batch_parse_text = item.module_parse_source;
+  }
+
+let record_batch_parse_errors ~(sess : Session.t) ~path = function
+  | BridgeParseCompilerErrors errors ->
+      sess.load_errors <- List.rev_append errors sess.load_errors
+  | BridgeParseMessage message ->
+      record_module_parse_message ~sess ~path ~line:1 ~col:1 message
+
+type module_parse_apply_result =
+  | ModuleParseCached of module_parse_batch_item
+  | ModuleParseFailed of string
+
+let apply_module_parse_batch_response ~(sess : Session.t) item response =
+  let {
+    Compiler_blorp_bridge.batch_parsed_path;
+    batch_parsed_module_name;
+    batch_parsed_response;
+  } =
+    response
+  in
+  if
+    batch_parsed_path <> item.module_parse_path
+    || batch_parsed_module_name <> item.module_parse_name
+  then (
+    record_module_parse_message ~sess ~path:item.module_parse_path ~line:1
+      ~col:1
+      (Printf.sprintf
+         "Blorp parser bridge returned artifact for '%s' at '%s' while parsing \
+          '%s' at '%s'"
+         batch_parsed_module_name batch_parsed_path item.module_parse_name
+         item.module_parse_path);
+    ModuleParseFailed item.module_parse_name)
+  else
+    match batch_parsed_response with
+    | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics ->
+        sess.load_errors <- List.rev_append diagnostics sess.load_errors;
+        ModuleParseFailed item.module_parse_name
+    | Compiler_blorp_bridge.ParsedSource parsed_source -> (
+        match
+          finalize_blorp_parsed_source_for_bridge ~path:item.module_parse_path
+            ~module_name:item.module_parse_name ~hoist_nested:true
+            parsed_source
+        with
+        | Ok decls ->
+            ignore
+               (cache_parsed_module_source ~sess
+                  ~module_name:item.module_parse_name ~path:item.module_parse_path
+                  ~origin:item.module_parse_origin ~source:item.module_parse_source
+                  decls);
+            ModuleParseCached item
+        | Error error ->
+            record_batch_parse_errors ~sess ~path:item.module_parse_path error;
+            ModuleParseFailed item.module_parse_name)
+
+let apply_module_parse_batch_responses ~(sess : Session.t) items responses =
+  let rec loop result items responses =
+    match (items, responses) with
+    | [], [] -> result
+    | item :: rest_items, response :: rest_responses -> (
+        match apply_module_parse_batch_response ~sess item response with
+        | ModuleParseFailed failed_module ->
+            loop
+              {
+                result with
+                preload_failed_modules =
+                  failed_module :: result.preload_failed_modules;
+              }
+              rest_items rest_responses
+        | ModuleParseCached cached_item ->
+            loop
+              {
+                result with
+                preload_cached_items = cached_item :: result.preload_cached_items;
+              }
+              rest_items rest_responses)
+    | _ -> result
+  in
+  loop empty_module_parse_preload_result items responses
+
+let module_parse_batch_chunks items =
+  let item_source_bytes item = String.length item.module_parse_source in
+  let flush chunks chunk =
+    match chunk with
+    | [] -> chunks
+    | _ -> List.rev chunk :: chunks
+  in
+  let rec loop chunks chunk chunk_items chunk_bytes = function
+    | [] -> List.rev (flush chunks chunk)
+    | item :: rest ->
+        let item_bytes = item_source_bytes item in
+        let exceeds_count = chunk_items >= module_parse_batch_max_items in
+        let exceeds_bytes =
+          chunk <> []
+          && chunk_bytes + item_bytes > module_parse_batch_max_source_bytes
+        in
+        if exceeds_count || exceeds_bytes then
+          loop (flush chunks chunk) [ item ] 1 item_bytes rest
+        else
+          loop chunks (item :: chunk) (chunk_items + 1)
+            (chunk_bytes + item_bytes) rest
+  in
+  loop [] [] 0 0 items
+
+let preload_module_parse_cache_chunk_with_blorp_bridge ~(sess : Session.t) items
+    =
+  match items with
+  | [] -> empty_module_parse_preload_result
+  | _ -> (
+      let requests = List.map bridge_batch_request_of_module_parse items in
+      match Compiler_blorp_bridge.parse_sources_via_command requests with
+      | Error _ -> empty_module_parse_preload_result
+      | Ok responses ->
+          if List.length responses <> List.length items then
+            empty_module_parse_preload_result
+          else apply_module_parse_batch_responses ~sess items responses)
+
+let preload_module_parse_cache_with_blorp_bridge ~(sess : Session.t) items =
+  items |> module_parse_batch_chunks
+  |> List.fold_left
+       (fun acc chunk ->
+         combine_module_parse_preload_results acc
+           (preload_module_parse_cache_chunk_with_blorp_bridge ~sess chunk))
+       empty_module_parse_preload_result
+
+let std_support_module_name name =
+  if has_prefix "std/" name then name else "std/" ^ name
+
+let canonical_module_name_for_preload ~(sess : Session.t) ~base_dir module_name =
+  let is_relative =
+    has_prefix "./" module_name || has_prefix "../" module_name
+  in
+  let is_bare =
+    (not (has_prefix "std/" module_name))
+    && (not (has_prefix "pkg/" module_name))
+    && not is_relative
+  in
+  let bare_std_name = "std/" ^ module_name in
+  if
+    is_bare
+    && (Hashtbl.mem sess.module_cache bare_std_name
+       || std_module_available ~sess ~base_dir bare_std_name)
+  then bare_std_name
+  else module_name
+
+let module_preload_candidate ~base_dir module_name =
+  { preload_module_name = module_name; preload_base_dir = base_dir }
+
+let import_module_names_from_decls decls =
+  decls
+  |> List.filter_map (fun decl ->
+         match decl.decl_desc with
+         | DImport imp -> Some imp.import_module
+         | _ -> None)
+
+let module_parse_import_base_dir ~fallback_base_dir item =
+  if embedded_module_path item.module_parse_path then fallback_base_dir
+  else extract_directory item.module_parse_path
+
+let module_preload_candidate_key candidate =
+  candidate.preload_base_dir ^ "\000" ^ candidate.preload_module_name
+
+let add_module_preload_candidate ~(sess : Session.t) seen candidate acc =
+  let module_name =
+    canonical_module_name_for_preload ~sess
+      ~base_dir:candidate.preload_base_dir candidate.preload_module_name
+  in
+  let candidate = { candidate with preload_module_name = module_name } in
+  let key = module_preload_candidate_key candidate in
+  if Hashtbl.mem seen key then acc
+  else begin
+    Hashtbl.add seen key ();
+    candidate :: acc
+  end
+
+let import_candidates_from_cached_item ~(sess : Session.t) ~fallback_base_dir
+    seen item acc =
+  match Hashtbl.find_opt sess.parse_cache item.module_parse_name with
+  | None -> acc
+  | Some entry ->
+      let import_base_dir =
+        module_parse_import_base_dir ~fallback_base_dir item
+      in
+      entry.parsed_decls |> import_module_names_from_decls
+      |> List.fold_left
+           (fun acc module_name ->
+             add_module_preload_candidate ~sess seen
+               (module_preload_candidate ~base_dir:import_base_dir module_name)
+               acc)
+           acc
+
+let preload_module_import_closure ~(sess : Session.t) ~base_dir candidates =
+  if session_uses_bootstrap_menhir_parser sess then []
+  else
+    let seen = Hashtbl.create 32 in
+    let initial =
+      List.fold_left
+        (fun acc candidate -> add_module_preload_candidate ~sess seen candidate acc)
+        [] candidates
+      |> List.rev
+    in
+    let rec loop failed pending =
+      match pending with
+      | [] -> failed
+      | _ ->
+          let items =
+            pending
+            |> List.filter_map (fun candidate ->
+                   module_parse_batch_item ~sess
+                     ~base_dir:candidate.preload_base_dir
+                     candidate.preload_module_name)
+          in
+          let result =
+            preload_module_parse_cache_with_blorp_bridge ~sess items
+          in
+          let next =
+            List.fold_left
+              (fun acc item ->
+                import_candidates_from_cached_item ~sess ~fallback_base_dir:base_dir
+                  seen item acc)
+              [] result.preload_cached_items
+            |> List.rev
+          in
+          loop
+            (List.rev_append result.preload_failed_modules failed)
+            next
+    in
+    loop [] initial
+
+let eager_typecheck_support_candidates base_dir =
+  eager_typecheck_support_modules
+  |> List.map (fun module_name ->
+         module_preload_candidate ~base_dir
+           (std_support_module_name module_name))
+
+let import_preload_candidates base_dir decls =
+  decls |> import_module_names_from_decls
+  |> List.map (module_preload_candidate ~base_dir)
+
 (** Load a module by name
     @param module_name Module name like "std/List"
     @param base_dir Directory of the importing file
@@ -773,86 +1428,35 @@ let rec load_module ?sess module_name base_dir =
       | Some m -> Some m
       | None -> load_bare_or_direct ())
 
-(** Stamp the filename onto a lexbuf so positions recorded by the parser
-    (and thus [Ast.loc.loc_file]) carry the source file they came from. *)
-and set_lexbuf_filename (lexbuf : Lexing.lexbuf) (path : string) =
-  lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with pos_fname = path };
-  lexbuf.lex_start_p <- { lexbuf.lex_start_p with pos_fname = path }
-
 (** Parse source text for a module, caching the result.
     Shared by embedded and filesystem module loading. *)
 and parse_module_source ~(sess : Session.t) ~module_name ~path ~origin source =
-  Lexer.reset_state ();
-  let lexbuf = Lexing.from_string source in
-  set_lexbuf_filename lexbuf path;
-  let record_err ~line ~col msg =
-    (* Collect into the session's [load_errors] list so the pipeline
-       can surface parse failures through the normal diagnostic
-       channel (see [Pipeline.module_load_errors]). The parser must
-       not print directly to stderr — that bypasses formatting and
-       breaks structured error consumers. The message carries the
-       module path and real source position so downstream formatters
-       can render the same source-snippet style they use for other
-       errors. *)
-    let file_msg = Printf.sprintf "%s\n   --> %s:%d:%d" msg path line col in
-    let err =
-      {
-        Ast.message = file_msg;
-        loc = Ast.point_loc_in ~file:path ~line ~column:col;
-        phase = Ast.ModuleLoad;
-        kind = Ast.OtherError;
-        notes = [];
-        help = None;
-      }
-    in
-    sess.Session.load_errors <- err :: sess.load_errors;
-    None
-  in
-  try
-    let decls = Parser.program Lexer.next_token lexbuf in
-    let decls = Interp_parser.transform_program decls in
-    (* Keep imported modules on the same parse-postprocess path as the
-       main source. After this point no [EFuncDecl] should survive into
-       typecheck/Core lowering. Subscript desugaring still belongs to the
-       typecheck pipeline so formatting can preserve the user's [x[i]]
-       syntax. *)
+  if session_uses_bootstrap_menhir_parser sess then
     match
-      try Ok (Nested_hoist.hoist_program decls)
-      with Nested_hoist.Capture_error err -> Error err
+      parse_source_with_bootstrap_menhir ~filename:path ~hoist_nested:true source
     with
     | Ok decls ->
-        let exports = collect_exports decls in
-        let entry : Session.parsed_module_cache_entry =
-          {
-            parsed_path = path;
-            parsed_origin = origin;
-            parsed_source_hash = source_hash source;
-            parsed_decls = decls;
-            parsed_exports = exports;
-          }
-        in
-        Hashtbl.replace sess.parse_cache module_name entry;
-        Some (path, origin, decls, exports)
+        Some
+          (cache_parsed_module_source ~sess ~module_name ~path ~origin ~source
+             decls)
     | Error err ->
-        sess.load_errors <- err :: sess.load_errors;
+        record_module_parse_message ~sess ~path ~line:err.loc.line
+          ~col:err.loc.column err.message;
         None
-  with
-  | Lexer.LexError (msg, line, col) -> record_err ~line ~col msg
-  | Ast.Parse_error_at (loc, msg) ->
-      record_err ~line:loc.line ~col:loc.column msg
-  | Parser.Error ->
-      let line, col = Lexer.current_pos () in
-      let token_info =
-        match Lexer.last_token () with
-        | Some tok ->
-            Printf.sprintf "Parse error in module '%s': unexpected %s"
-              module_name
-              (Lexer.token_to_string tok)
-        | None -> Printf.sprintf "Parse error in module '%s'" module_name
-      in
-      record_err ~line ~col token_info
-  | Interp_parser.InterpParseError (msg, loc) ->
-      record_err ~line:loc.line ~col:loc.column msg
+  else
+    match parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:true
+            ~bridge_read_file:(not (embedded_module_path path)) source
+    with
+    | Ok decls ->
+        Some
+          (cache_parsed_module_source ~sess ~module_name ~path ~origin ~source
+             decls)
+    | Error (BridgeParseCompilerErrors errors) ->
+        sess.load_errors <- List.rev_append errors sess.load_errors;
+        None
+    | Error (BridgeParseMessage message) ->
+        record_module_parse_message ~sess ~path ~line:1 ~col:1 message;
+        None
 
 and load_module_inner ~(sess : Session.t) module_name base_dir =
   match Hashtbl.find_opt sess.Session.module_cache module_name with
@@ -1047,16 +1651,33 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
     that uses these prelude types without explicit imports. *)
 and load_imports ?sess decls base_dir =
   let sess = sess_of ?sess () in
+  let preload_candidates =
+    if not sess.prelude_modules_loaded then
+      eager_typecheck_support_candidates base_dir
+      @ import_preload_candidates base_dir decls
+    else import_preload_candidates base_dir decls
+  in
+  let failed_preloaded_modules =
+    preload_module_import_closure ~sess ~base_dir preload_candidates
+  in
   if not sess.prelude_modules_loaded then begin
     sess.prelude_modules_loaded <- true;
     List.iter
-      (fun m -> ignore (load_module ~sess m base_dir))
+      (fun m ->
+        let canonical_name = std_support_module_name m in
+        if not (List.mem canonical_name failed_preloaded_modules) then
+          ignore (load_module ~sess m base_dir))
       eager_typecheck_support_modules
   end;
   List.filter_map
     (fun decl ->
       match decl.decl_desc with
-      | DImport imp -> load_module ~sess imp.import_module base_dir
+      | DImport imp ->
+          let canonical_name =
+            canonical_module_name_for_preload ~sess ~base_dir imp.import_module
+          in
+          if List.mem canonical_name failed_preloaded_modules then None
+          else load_module ~sess imp.import_module base_dir
       | _ -> None)
     decls
 
@@ -1423,189 +2044,24 @@ let init_module_paths ?sess base_dir =
     Resets lexer state, runs the parser, and applies string interpolation
     transform. Catches all known parse exceptions and returns a structured
     error on failure. *)
-let parse_source ?sess ?filename ?(hoist_nested = true) source =
-  let _ = sess_of ?sess () in
-  (* Acknowledge ambient; lexer state still module-level in Phase 2.1a *)
-  Lexer.reset_state ();
-  let lexbuf = Lexing.from_string source in
-  Option.iter (set_lexbuf_filename lexbuf) filename;
-  try
-    let program = Parser.program Lexer.next_token lexbuf in
-    let program = Interp_parser.transform_program program in
-    (* Compiler callers hoist nested [func] declarations out of function
-       bodies into top-level [DFunc]s. Formatters and source-inspection tools
-       can opt out so they preserve parser-level [EFuncDecl] nodes. See
-       [nested_hoist.ml] for the compiler lowering behavior. *)
-    let hoisted =
-      if hoist_nested then
-        try Ok (Nested_hoist.hoist_program program)
-        with Nested_hoist.Capture_error err -> Error err
-      else Ok program
-    in
-    match hoisted with
-    | Ok program ->
-        (* See note in [load_module_once] — subscript desugaring is
-            applied by the typecheck pipeline, not here. *)
-        Ok program
-    | Error err -> Error err
-  with
-  | Parser.Error ->
-      let line, col = Lexer.current_pos () in
-      let msg =
-        match Lexer.last_token () with
-        | Some tok ->
-            Printf.sprintf "Parse error: unexpected %s"
-              (Lexer.token_to_string tok)
-        | None -> "Parse error"
-      in
-      (* Scan the source line for common keywords/patterns from other languages *)
-      let help =
-        let lines = String.split_on_char '\n' source in
-        if line >= 1 && line <= List.length lines then
-          let source_line = String.trim (List.nth lines (line - 1)) in
-          let first_word =
-            match String.index_opt source_line ' ' with
-            | Some i -> String.sub source_line 0 i
-            | None -> source_line
-          in
-          (* First: check first-word keywords from other languages *)
-          match first_word with
-          | "def" ->
-              Some
-                "blorp uses 'func' instead of 'def'. Write 'func name(params) \
-                 -> ReturnType:'"
-          | "fn" ->
-              Some
-                "blorp uses 'func' instead of 'fn'. Write 'func name(params) \
-                 -> ReturnType:'"
-          | "fun" ->
-              Some
-                "blorp uses 'func' instead of 'fun'. Write 'func name(params) \
-                 -> ReturnType:'"
-          | "class" ->
-              Some
-                "blorp uses 'record' for data types and 'union' for algebraic \
-                 types, not 'class'"
-          | "elif" -> Some "blorp uses 'else if' instead of 'elif'"
-          | "elsif" -> Some "blorp uses 'else if' instead of 'elsif'"
-          | "switch" ->
-              Some "blorp uses 'match' instead of 'switch'. Write 'match expr:'"
-          | _ -> (
-              if
-                (* Second: check for token patterns in the source line *)
-                contains source_line "=>"
-              then
-                Some
-                  "blorp uses 'func(x): body' for lambdas, not '=>' arrow \
-                   syntax"
-              else if contains source_line ":=" then
-                Some "blorp uses '=' for assignment, not ':='"
-              else if
-                (* Third: check for lambda-like syntax without func keyword *)
-                contains source_line "-> Int:"
-                || contains source_line "-> String:"
-                || contains source_line "-> Float:"
-                || contains source_line "-> Bool:"
-                || contains source_line "-> Void:"
-              then
-                match Lexer.last_token () with
-                | Some Parser.COLON ->
-                    Some
-                      "lambdas require the 'func' keyword: func(x: Int) -> \
-                       Int: body"
-                | _ -> None
-              else
-                (* Fourth: check the unexpected token itself *)
-                match Lexer.last_token () with
-                | Some Parser.LBRACE ->
-                    Some
-                      "blorp uses colon + indentation for blocks, not curly \
-                       braces"
-                | Some Parser.NEWLINE ->
-                    (* Check if previous line looks like a func signature missing ':' *)
-                    let prev_line =
-                      if line >= 2 && line - 1 <= List.length lines then
-                        String.trim (List.nth lines (line - 2))
-                      else ""
-                    in
-                    if contains prev_line "->" && contains prev_line "func "
-                    then Some "Expected ':' after function signature"
-                    else None
-                | _ -> None)
-        else None
-      in
-      let mk_loc line col =
-        match filename with
-        | Some f -> Ast.point_loc_in ~file:f ~line ~column:col
-        | None -> Ast.point_loc ~line ~column:col
-      in
-      Error
-        {
-          Ast.message = msg;
-          loc = mk_loc line col;
-          phase = Parse;
-          kind = OtherError;
-          notes = [];
-          help;
-        }
-  | Lexer.LexError (msg, line, col) ->
-      let loc =
-        match filename with
-        | Some f -> Ast.point_loc_in ~file:f ~line ~column:col
-        | None -> Ast.point_loc ~line ~column:col
-      in
-      Error
-        {
-          Ast.message = msg;
-          loc;
-          phase = Parse;
-          kind = OtherError;
-          notes = [];
-          help = None;
-        }
-  | Interp_parser.InterpParseError (msg, loc) ->
-      let loc =
-        match (filename, loc.loc_file) with
-        | Some f, None -> { loc with loc_file = Some f }
-        | _ -> loc
-      in
-      Error
-        {
-          Ast.message = msg;
-          loc;
-          phase = Parse;
-          kind = OtherError;
-          notes = [];
-          help = None;
-        }
-  | Ast.Parse_error_at (loc, msg) ->
-      let loc =
-        match (filename, loc.loc_file) with
-        | Some f, None -> { loc with loc_file = Some f }
-        | _ -> loc
-      in
-      Error
-        {
-          Ast.message = msg;
-          loc;
-          phase = Parse;
-          kind = OtherError;
-          notes = [];
-          help = None;
-        }
-  | Failure msg ->
-      let line, col = Lexer.current_pos () in
-      let loc =
-        match filename with
-        | Some f -> Ast.point_loc_in ~file:f ~line ~column:col
-        | None -> Ast.point_loc ~line ~column:col
-      in
-      Error
-        {
-          Ast.message = msg;
-          loc;
-          phase = Parse;
-          kind = OtherError;
-          notes = [];
-          help = None;
-        }
+let parse_source ?sess ?filename ?(hoist_nested = true)
+    ?(bridge_read_file = false) source =
+  let sess = sess_of ?sess () in
+  let path = Option.value filename ~default:"<source>" in
+  let module_name = bridge_module_name_for_path path in
+  if session_uses_bootstrap_menhir_parser sess then
+    parse_source_with_bootstrap_menhir ?filename ~hoist_nested source
+  else
+    match
+      parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
+        ~bridge_read_file:(bridge_read_file && not (String.equal path "<source>"))
+        source
+    with
+    | Ok program -> Ok program
+    | Error (BridgeParseCompilerErrors (err :: _)) -> Error err
+    | Error (BridgeParseCompilerErrors []) ->
+        Error
+          (parse_error_for_message ?filename
+             "Blorp parser returned no program and no diagnostics")
+    | Error (BridgeParseMessage message) ->
+        Error (parse_error_for_message ?filename message)

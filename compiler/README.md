@@ -1,6 +1,8 @@
 # blorp Compiler
 
-This directory contains the OCaml implementation of the blorp compiler.
+This directory contains the compiler implementation. The Core pipeline and
+runtime shell are still largely OCaml, while the source formatter and growing
+CLI/frontend slices live in `compiler/blorp/`.
 
 ## Quick Start
 
@@ -29,6 +31,7 @@ scripts/test unit compiler
 ```
 compiler/
 ├── bin/blorp.ml              # Main unified CLI
+├── blorp/                    # Blorp-owned compiler/frontend slices
 ├── lib/
 │   ├── ast.ml                # Source AST definitions
 │   ├── lexer.mll             # OCamllex lexer
@@ -45,7 +48,6 @@ compiler/
 │   ├── core_emit*.ml         # Core → C emission helpers
 │   ├── core_*.ml             # Other Core lowering, transforms, and layout passes
 │   ├── codegen/              # Shared backend naming/type/builtin helpers
-│   ├── fmt/                  # Formatter implementation
 │   ├── lsp/                  # Language server implementation
 │   ├── runtime.c             # Embedded default C runtime
 │   ├── runtime_decl.c        # Runtime forward declarations

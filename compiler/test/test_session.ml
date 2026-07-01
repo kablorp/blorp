@@ -45,6 +45,23 @@ let test_reset_meta_clears_only_that_session () =
   Alcotest.(check int) "s1 reset" 0 s1.fresh_meta_counter;
   Alcotest.(check int) "s2 untouched by s1 reset" 1 s2.fresh_meta_counter
 
+let test_parser_frontend_defaults_to_blorp_bridge () =
+  let sess = Session.create () in
+  Alcotest.(check bool)
+    "normal sessions use Blorp parser bridge" true
+    (Session.parser_frontend sess = Session.BlorpParserBridge)
+
+let test_parser_frontend_is_session_local () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  Session.set_parser_frontend s1 Session.BootstrapMenhirParser;
+  Alcotest.(check bool)
+    "s1 uses bootstrap parser" true
+    (Session.parser_frontend s1 = Session.BootstrapMenhirParser);
+  Alcotest.(check bool)
+    "s2 stays on Blorp bridge" true
+    (Session.parser_frontend s2 = Session.BlorpParserBridge)
+
 (* ============================================================================
    Module-cache isolation
    ============================================================================ *)
@@ -386,6 +403,34 @@ let test_source_origin_uses_configured_std_root () =
         "outside file is user origin" true
         (Modules.module_origin_for_source_file ~sess user_file
         = Session.User_module))
+
+let test_import_parse_error_does_not_block_sibling_import () =
+  with_temp_dir "blorp_import_batch_error" (fun dir ->
+      write_file
+        (Filename.concat dir "sample.brp")
+        "import:\n\t./bad\n\t./good\n";
+      write_file (Filename.concat dir "bad.brp") "func broken(\n";
+      write_file (Filename.concat dir "good.brp") "good_value = 1\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess dir;
+      match Modules.load_module ~sess "sample" dir with
+      | None -> Alcotest.fail "expected parent module to load"
+      | Some _ ->
+          Alcotest.(check bool)
+            "good sibling import loaded" true
+            (Option.is_some (Modules.find_cached ~sess "./good"));
+          Alcotest.(check bool)
+            "bad import is not cached" false
+            (Option.is_some (Modules.find_cached ~sess "./bad"));
+          let errors = Modules.get_load_errors ~sess () in
+          Alcotest.(check bool)
+            "bad import produced a diagnostic" true
+            (List.exists
+               (fun (err : Ast.compiler_error) ->
+                 match err.loc.loc_file with
+                 | Some file -> Filename.basename file = "bad.brp"
+                 | None -> false)
+               errors))
 
 let package_name_of_origin = function
   | Session.Native_package_module id -> Some (Session.package_id_name id)
@@ -1231,6 +1276,10 @@ let suite =
         Alcotest.test_case "meta_env" `Quick test_meta_env_isolated;
         Alcotest.test_case "reset_meta" `Quick
           test_reset_meta_clears_only_that_session;
+        Alcotest.test_case "parser frontend defaults to bridge" `Quick
+          test_parser_frontend_defaults_to_blorp_bridge;
+        Alcotest.test_case "parser frontend is session local" `Quick
+          test_parser_frontend_is_session_local;
       ] );
     ( "modules_isolation",
       [
@@ -1257,6 +1306,8 @@ let suite =
           test_std_dir_is_not_guessed_without_explicit_config;
         Alcotest.test_case "source origin uses configured std root" `Quick
           test_source_origin_uses_configured_std_root;
+        Alcotest.test_case "import parse error keeps sibling imports" `Quick
+          test_import_parse_error_does_not_block_sibling_import;
         Alcotest.test_case "source package alias resolves" `Quick
           test_blorp_toml_source_package_alias_resolves;
         Alcotest.test_case "source package alias can differ from name" `Quick

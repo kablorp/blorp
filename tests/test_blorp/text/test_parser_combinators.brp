@@ -1,83 +1,287 @@
--- Test parser combinators
+-- Test cursor-based parser primitives and combinators
 import:
 	parser:
-		ParseResult(Failure, Success),
+		Cursor,
+		ParseResult(ParseFailed, Parsed),
+		Parser,
+		Source,
+		Span,
+		any_char,
+		at_end,
+		between,
+		char,
+		commit,
+		cursor_at,
+		cursor_column,
+		cursor_line,
+		cursor_offset,
+		digit,
 		end_of_input,
+		expected_contains,
+		format_error,
 		is_success,
 		literal,
+		make_span,
+		many,
+		many1,
 		optional,
+		or_else,
+		run,
 		sep_by,
+		source,
+		source_with_path,
+		span_text,
+		start,
 		take_while1,
 	string: is_digit
 	test: TestSuite
 
 
--- Helper: parse a number as String (avoids Char generic issue in sep_by)
-pure func parse_num(input: String) -> ParseResult[String]:
-	take_while1(is_digit, input)
+pure func parse_digits(src: Source, cur: Cursor) -> ParseResult[Span]:
+	take_while1(src, cur, "digit", is_digit)
 
 
--- Helper: parse comma as String
-pure func comma_str(input: String) -> ParseResult[String]:
-	literal(",", input)
+pure func parse_comma(src: Source, cur: Cursor) -> ParseResult[Span]:
+	literal(src, cur, ",")
 
 
-func test_sep_by_comma_ints() -> Bool:
-	match sep_by(parse_num, comma_str, "1,22,333"):
-		Success(items, rest):
-			items.length() == 3 and rest == ""
-		Failure(_, _): False
+pure func parse_digit_char(src: Source, cur: Cursor) -> ParseResult[Char]:
+	digit(src, cur)
 
 
-func test_sep_by_single() -> Bool:
-	match sep_by(parse_num, comma_str, "42"):
-		Success(items, rest):
-			items.length() == 1 and rest == ""
-		Failure(_, _): False
+pure func parse_x(src: Source, cur: Cursor) -> ParseResult[Char]:
+	char(src, cur, 'x')
 
 
-func test_sep_by_empty() -> Bool:
-	match sep_by(parse_num, comma_str, "abc"):
-		Success(items, rest):
-			items.length() == 0 and rest == "abc"
-		Failure(_, _): False
+pure func parse_open_paren(src: Source, cur: Cursor) -> ParseResult[Char]:
+	char(src, cur, '(')
 
 
-func test_sep_by_trailing() -> Bool:
-	match sep_by(parse_num, comma_str, "1,2 rest"):
-		Success(items, rest):
-			items.length() == 2 and rest == " rest"
-		Failure(_, _): False
+pure func parse_close_paren(src: Source, cur: Cursor) -> ParseResult[Char]:
+	char(src, cur, ')')
 
 
-func test_optional_present() -> Bool:
-	-- optional always returns Success, check that it succeeds
-	is_success(optional(parse_num, "5abc"))
+pure func no_progress_span(_: Source, cur: Cursor) -> ParseResult[Span]:
+	Parsed(
+		make_span(cur, cur),
+		cur,
+	)
 
 
-func test_optional_absent() -> Bool:
-	-- optional with non-matching input still succeeds (returns None)
-	is_success(optional(parse_num, "abc"))
+func test_literal_returns_span_and_cursor() -> Bool:
+	src: Source = source("hello world")
+
+	match literal(src, start(src), "hello"):
+		Parsed(sp, cur):
+			(
+				span_text(src, sp) == "hello"
+				and cursor_offset(cur) == 5
+				and cursor_line(cur) == 1
+				and cursor_column(cur) == 6
+			)
+		ParseFailed(_):
+			False
 
 
-func test_end_of_input_empty() -> Bool:
-	is_success(end_of_input(""))
+func test_cursor_tracks_newline() -> Bool:
+	src: Source = source("a\nb")
+	first: ParseResult[Char] = any_char(src, start(src))
+
+	match first:
+		Parsed(_, after_a):
+			match any_char(src, after_a):
+				Parsed(_, after_newline):
+					(
+						cursor_offset(after_newline) == 2
+						and cursor_line(after_newline) == 2
+						and cursor_column(after_newline) == 1
+					)
+				ParseFailed(_):
+					False
+		ParseFailed(_):
+			False
 
 
-func test_end_of_input_not_empty() -> Bool:
-	not is_success(end_of_input("abc"))
+func test_cursor_at_reconstructs_position() -> Bool:
+	src: Source = source("a\nbc\ndef")
+	cur: Cursor = cursor_at(src, 5)
+	cursor_offset(cur) == 5 and cursor_line(cur) == 3 and cursor_column(cur) == 1
+
+
+func test_take_while1_reports_expected_label() -> Bool:
+	src: Source = source("abc")
+
+	match take_while1(src, start(src), "digit", is_digit):
+		Parsed(_, _):
+			False
+		ParseFailed(err):
+			(
+				expected_contains(err, "digit")
+				and err.span.start_offset == 0
+				and err.span.end_offset == 0
+			)
+
+
+func test_format_error_includes_path_and_position() -> Bool:
+	src: Source = source_with_path("abc", "sample.brp")
+
+	match take_while1(src, start(src), "digit", is_digit):
+		Parsed(_, _):
+			False
+		ParseFailed(err):
+			message: String = format_error(src, err)
+
+			(
+				message.contains("sample.brp")
+				and message.contains("line 1")
+				and message.contains("column 1")
+				and message.contains("digit")
+			)
+
+
+func test_sep_by_comma_spans() -> Bool:
+	src: Source = source("1,22,333 rest")
+	parser: Parser[List[Span]] = sep_by(parse_digits, parse_comma)
+
+	match parser(src, start(src)):
+		Parsed(items, cur):
+			empty: Span = make_span(cur, cur)
+			first_ok: Bool = span_text(
+				src,
+				items.get_or(0, empty),
+			) == "1"
+			second_ok: Bool = span_text(
+				src,
+				items.get_or(1, empty),
+			) == "22"
+			third_ok: Bool = span_text(
+				src,
+				items.get_or(2, empty),
+			) == "333"
+			items.length() == 3 and first_ok and second_ok and third_ok and cursor_offset(cur) == 8
+		ParseFailed(_):
+			False
+
+
+func test_sep_by_empty_keeps_cursor() -> Bool:
+	src: Source = source("abc")
+	parser: Parser[List[Span]] = sep_by(parse_digits, parse_comma)
+
+	match parser(src, start(src)):
+		Parsed(items, cur):
+			items.length() == 0 and cursor_offset(cur) == 0
+		ParseFailed(_):
+			False
+
+
+func test_optional_absent_does_not_advance() -> Bool:
+	src: Source = source("abc")
+	parser: Parser[Option[Span]] = optional(parse_digits)
+
+	match parser(src, start(src)):
+		Parsed(value, cur):
+			match value:
+				None:
+					cursor_offset(cur) == 0
+				Some(_):
+					False
+		ParseFailed(_):
+			False
+
+
+func test_many_rejects_no_progress() -> Bool:
+	src: Source = source("abc")
+	parser: Parser[List[Span]] = many(no_progress_span)
+
+	match parser(src, start(src)):
+		Parsed(_, _):
+			False
+		ParseFailed(err):
+			err.message == "parser succeeded without consuming input"
+
+
+func test_many1_repeats_until_failure() -> Bool:
+	src: Source = source("123abc")
+	parser: Parser[List[Char]] = many1(parse_digit_char)
+
+	match parser(src, start(src)):
+		Parsed(items, cur):
+			items.length() == 3 and cursor_offset(cur) == 3
+		ParseFailed(_):
+			False
+
+
+func test_or_else_uses_second_parser() -> Bool:
+	src: Source = source("7")
+	parser: Parser[Char] = or_else(parse_x, parse_digit_char)
+
+	match parser(src, start(src)):
+		Parsed(ch, cur):
+			ch == '7' and cursor_offset(cur) == 1
+		ParseFailed(_):
+			False
+
+
+func test_commit_prevents_fallback() -> Bool:
+	src: Source = source("7")
+	parser: Parser[Char] = or_else(commit(parse_x), parse_digit_char)
+
+	match parser(src, start(src)):
+		Parsed(_, _):
+			False
+		ParseFailed(err):
+			err.committed and expected_contains(err, "'x'")
+
+
+func test_run_returns_result() -> Bool:
+	src: Source = source("123")
+
+	match run(parse_digits, src):
+		Ok(sp):
+			span_text(src, sp) == "123"
+		Err(_):
+			False
+
+
+func test_between_is_pure_composable() -> Bool:
+	src: Source = source("(123) rest")
+	parser: Parser[Span] = between(parse_open_paren, parse_digits, parse_close_paren)
+
+	match parser(src, start(src)):
+		Parsed(sp, cur):
+			span_text(src, sp) == "123" and cursor_offset(cur) == 5
+		ParseFailed(_):
+			False
+
+
+func test_end_of_input() -> Bool:
+	src: Source = source("")
+	is_success(end_of_input(src, start(src))) and at_end(src, start(src))
+
+
+func test_end_of_input_failure() -> Bool:
+	src: Source = source("abc")
+	not is_success(end_of_input(src, start(src)))
 
 
 tests: TestSuite = {
 	description = "Parser combinators",
 	tests = [
-		("sep_by comma ints", test_sep_by_comma_ints),
-		("sep_by single", test_sep_by_single),
-		("sep_by empty", test_sep_by_empty),
-		("sep_by trailing", test_sep_by_trailing),
-		("optional present", test_optional_present),
-		("optional absent", test_optional_absent),
-		("end_of_input empty", test_end_of_input_empty),
-		("end_of_input not empty", test_end_of_input_not_empty),
+		("literal returns span and cursor", test_literal_returns_span_and_cursor),
+		("cursor tracks newline", test_cursor_tracks_newline),
+		("cursor_at reconstructs position", test_cursor_at_reconstructs_position),
+		("take_while1 reports expected label", test_take_while1_reports_expected_label),
+		("format_error includes path and position", test_format_error_includes_path_and_position),
+		("sep_by comma spans", test_sep_by_comma_spans),
+		("sep_by empty keeps cursor", test_sep_by_empty_keeps_cursor),
+		("optional absent does not advance", test_optional_absent_does_not_advance),
+		("many rejects no progress", test_many_rejects_no_progress),
+		("many1 repeats until failure", test_many1_repeats_until_failure),
+		("or_else uses second parser", test_or_else_uses_second_parser),
+		("commit prevents fallback", test_commit_prevents_fallback),
+		("run returns result", test_run_returns_result),
+		("between is pure composable", test_between_is_pure_composable),
+		("end_of_input", test_end_of_input),
+		("end_of_input failure", test_end_of_input_failure),
 	]
 }

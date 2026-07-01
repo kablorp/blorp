@@ -151,13 +151,27 @@ val parse_source :
   ?sess:Session.t ->
   ?filename:string ->
   ?hoist_nested:bool ->
+  ?bridge_read_file:bool ->
   string ->
   (Ast.program, Ast.compiler_error) result
-(** Parse source text into an AST program.
-    Resets lexer state, runs the parser + interpolation transform, and hoists
-    nested function declarations by default. Formatters and source-preserving
-    tools can pass [~hoist_nested:false] to retain parser-level [EFuncDecl]
-    nodes. Returns structured error on parse failure. *)
+(** Parse source text into an AST program through the Blorp parser bridge,
+    apply interpolation transform, and hoist nested function declarations by
+    default. Formatters and source-preserving tools can pass
+    [~hoist_nested:false] to retain parser-level [EFuncDecl] nodes.
+    Filesystem-backed compiler pipeline callers can pass [~bridge_read_file:true]
+    to let the Blorp bridge executable read the source file before parsing.
+    Returns structured error on parse failure. *)
+
+val finalize_blorp_parsed_source :
+  path:string ->
+  module_name:string ->
+  ?hoist_nested:bool ->
+  Compiler_blorp_bridge.parsed_source ->
+  (Ast.program, Ast.compiler_error list) result
+(** Apply the OCaml-owned post-parser frontend work to a raw Blorp parser
+    bridge artifact: restore lexer comments, parse interpolated expressions,
+    and hoist nested declarations by default. This is the single boundary for
+    callers that receive parser JSON directly from the Blorp bridge. *)
 
 val collect_private_names : Ast.program -> (string * Ast.decl) list
 (** Collect names of private declarations from a program. *)

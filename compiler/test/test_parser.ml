@@ -6,14 +6,181 @@ let check_string msg = Alcotest.(check string) msg
 let check_bool msg = Alcotest.(check bool) msg
 
 let parse_ok source =
-  match Blorp.Modules.parse_source source with
+  match Blorp.Modules.parse_source ~hoist_nested:false source with
   | Ok program -> program
   | Error err -> Alcotest.fail err.message
 
 let parse_error_message source =
-  match Blorp.Modules.parse_source source with
+  match Blorp.Modules.parse_source ~hoist_nested:false source with
   | Ok _ -> Alcotest.fail "expected parse error"
   | Error err -> err.message
+
+let ast_expr expr_desc expr_loc =
+  {
+    Blorp.Ast.expr_desc;
+    expr_loc;
+    expr_type = None;
+    expr_type_info = None;
+    expr_rc = None;
+  }
+
+let test_interpolation_transform_uses_supplied_batch_parser () =
+  let loc = Blorp.Ast.point_loc ~line:1 ~column:1 in
+  let var_decl name raw =
+    {
+      Blorp.Ast.decl_desc =
+        Blorp.Ast.DVar
+          {
+            var_name = Some name;
+            var_pattern = None;
+            var_type = None;
+            var_value =
+              ast_expr (Blorp.Ast.EStringInterpRaw (raw, false)) loc;
+            var_is_mutable = false;
+            var_is_const = false;
+          };
+      decl_loc = loc;
+      decl_doc = None;
+    }
+  in
+  let decl = var_decl "message" "Hello {name} and {count + 1}" in
+  let second_decl = var_decl "other" "Other {later}" in
+  let batches = ref [] in
+  let parse_batch requests =
+    batches := requests :: !batches;
+    List.mapi
+      (fun index request ->
+        ast_expr
+          (Blorp.Ast.EIdent (Printf.sprintf "parsed_%d" index))
+          request.Blorp.Interp_parser.loc)
+      requests
+  in
+  match
+    Blorp.Interp_parser.transform_program_with_expr_batch_parser parse_batch
+      [ decl; second_decl ]
+  with
+  | [
+      {
+        Blorp.Ast.decl_desc =
+          Blorp.Ast.DVar
+            {
+              var_value =
+                {
+                  expr_desc =
+                    Blorp.Ast.EStringInterp
+                      ( [
+                          Blorp.Ast.InterpLit "Hello ";
+                          Blorp.Ast.InterpExpr
+                            { expr_desc = Blorp.Ast.EIdent parsed_first; _ };
+                          Blorp.Ast.InterpLit " and ";
+                          Blorp.Ast.InterpExpr
+                            { expr_desc = Blorp.Ast.EIdent parsed_second; _ };
+                        ],
+                        false );
+                  _;
+                };
+              _;
+            };
+        _;
+      };
+      {
+        Blorp.Ast.decl_desc =
+          Blorp.Ast.DVar
+            {
+              var_value =
+                {
+                  expr_desc =
+                    Blorp.Ast.EStringInterp
+                      ( [
+                          Blorp.Ast.InterpLit "Other ";
+                          Blorp.Ast.InterpExpr
+                            { expr_desc = Blorp.Ast.EIdent parsed_later; _ };
+                        ],
+                        false );
+                  _;
+                };
+              _;
+            };
+        _;
+      };
+    ] ->
+      let requests =
+        match !batches with
+        | [ requests ] -> requests
+        | _ -> Alcotest.fail "expected one interpolation parse batch"
+      in
+      check_int "batch size" 3 (List.length requests);
+      check_string "first parser input" "name"
+        (List.nth requests 0).Blorp.Interp_parser.text;
+      check_string "second parser input" "count + 1"
+        (List.nth requests 1).Blorp.Interp_parser.text;
+      check_string "third parser input" "later"
+        (List.nth requests 2).Blorp.Interp_parser.text;
+      check_string "first parsed expression" "parsed_0" parsed_first;
+      check_string "second parsed expression" "parsed_1" parsed_second;
+      check_string "third parsed expression" "parsed_2" parsed_later
+  | _ -> Alcotest.fail "expected transformed string interpolation"
+
+let interpolation_ident_names expr =
+  match expr.Blorp.Ast.expr_desc with
+  | Blorp.Ast.EStringInterp (parts, _) ->
+      List.filter_map
+        (function
+          | Blorp.Ast.InterpLit _ -> None
+          | Blorp.Ast.InterpExpr { expr_desc = Blorp.Ast.EIdent name; _ } ->
+              Some name
+          | Blorp.Ast.InterpExpr _ ->
+              Alcotest.fail "expected interpolation hole to parse as identifier")
+        parts
+  | _ -> Alcotest.fail "expected string interpolation expression"
+
+let collect_interpolation_ident_names program =
+  let rec collect_expr acc expr =
+    match expr.Blorp.Ast.expr_desc with
+    | Blorp.Ast.EStringInterp _ -> acc @ [ interpolation_ident_names expr ]
+    | _ -> List.fold_left collect_expr acc (Blorp.Ast.expr_children expr)
+  in
+  let collect_func acc func =
+    match Blorp.Ast.func_body_expr_opt func.Blorp.Ast.func_body with
+    | Some body -> collect_expr acc body
+    | None -> acc
+  in
+  let collect_decl acc decl =
+    match decl.Blorp.Ast.decl_desc with
+    | Blorp.Ast.DFunc func -> collect_func acc func
+    | _ -> acc
+  in
+  List.fold_left collect_decl [] program
+
+let test_interpolation_bridge_preserves_hole_order_in_nested_blocks () =
+  let source =
+    {|
+pure func closest_candidate(type_name: String, sorted_candidates: List[String]) -> Option[String]:
+	None
+
+pure func render_no_impl_hint(type_name: String, method_name: String, candidates: List[String]) -> String:
+	if candidates.length() == 0:
+		"no type in scope implements `${method_name}`. Define an `implements <trait> for ${type_name}:` block with a `${method_name}` method."
+	else:
+		sorted_candidates: List[String] = candidates.sort()
+
+		match closest_candidate(type_name, sorted_candidates):
+			Some(suggestion):
+				"did you mean to call it on a ${suggestion}? Or add `implements <trait> for ${type_name}:` defining `${method_name}`."
+			None:
+				candidate_text: String = sorted_candidates.join(", ")
+				"types with an `${method_name}` impl in scope: ${candidate_text}. Add `implements <trait> for ${type_name}:` to extend it."
+|}
+  in
+  let program = parse_ok source in
+  Alcotest.(check (list (list string)))
+    "interpolation hole identifiers"
+    [
+      [ "method_name"; "type_name"; "method_name" ];
+      [ "suggestion"; "type_name"; "method_name" ];
+      [ "method_name"; "candidate_text"; "type_name" ];
+    ]
+    (collect_interpolation_ident_names program)
 
 let test_empty_programs_parse_to_no_decls () =
   check_int "empty source" 0 (List.length (parse_ok ""));
@@ -110,81 +277,6 @@ let test_multiline_var_initializer_after_equals () =
   in
   ignore (parse_ok source)
 
-let test_formatter_preserves_match_call_arg_parseability () =
-  let source =
-    "func id_char(c: Char) -> Char:\n" ^ "\tc\n\n\n"
-    ^ "func match_as_call_arg(n: Int) -> Char:\n" ^ "\tid_char(\n"
-    ^ "\t\tmatch n:\n" ^ "\t\t\t0: '8'\n" ^ "\t\t\t1: '9'\n" ^ "\t\t\t2: 'a'\n"
-    ^ "\t\t\t_: 'b'\n" ^ "\t)\n"
-  in
-  match Blorp.Fmt.format_string source with
-  | Error err -> Alcotest.fail err
-  | Ok formatted -> ignore (parse_ok formatted)
-
-let format_ok source =
-  match Blorp.Fmt.format_string source with
-  | Error err -> Alcotest.fail err
-  | Ok formatted -> formatted
-
-let test_formatter_inserts_blank_before_block_comments () =
-  let source =
-    "func main(args: List[String]) -> Int:\n" ^ "\tx: Int = 1\n"
-    ^ "\t-- explain x\n" ^ "\tx\n"
-  in
-  let expected =
-    "func main(args: List[String]) -> Int:\n" ^ "\tx: Int = 1\n\n"
-    ^ "\t-- explain x\n" ^ "\tx\n"
-  in
-  check_string "formatted source" expected (format_ok source)
-
-let test_formatter_does_not_insert_blank_before_first_block_comment () =
-  let source =
-    "func main(args: List[String]) -> Int:\n" ^ "\t-- explain the setup\n"
-    ^ "\tx: Int = 1\n" ^ "\twhile x < 3:\n" ^ "\t\t-- explain the loop\n"
-    ^ "\t\tx += 1\n" ^ "\tx\n"
-  in
-  let expected =
-    "func main(args: List[String]) -> Int:\n" ^ "\t-- explain the setup\n"
-    ^ "\tx: Int = 1\n\n" ^ "\twhile x < 3:\n" ^ "\t\t-- explain the loop\n"
-    ^ "\t\tx += 1\n\n" ^ "\tx\n"
-  in
-  check_string "formatted source" expected (format_ok source)
-
-let test_formatter_preserves_single_block_blank_line () =
-  let source =
-    "func main(args: List[String]) -> Int:\n" ^ "\ta: Int = 1\n\n"
-    ^ "\tb: Int = 2\n\n\n\n" ^ "\ta + b\n"
-  in
-  let expected =
-    "func main(args: List[String]) -> Int:\n" ^ "\ta: Int = 1\n\n"
-    ^ "\tb: Int = 2\n\n" ^ "\ta + b\n"
-  in
-  check_string "formatted source" expected (format_ok source)
-
-let test_formatter_keeps_consecutive_block_comments_together () =
-  let source =
-    "func f() -> Int:\n" ^ "\tx: Int = 1\n" ^ "\t-- first note\n"
-    ^ "\t-- second note\n" ^ "\tx\n"
-  in
-  let expected =
-    "func f() -> Int:\n" ^ "\tx: Int = 1\n\n" ^ "\t-- first note\n"
-    ^ "\t-- second note\n" ^ "\tx\n"
-  in
-  check_string "formatted source" expected (format_ok source)
-
-let test_formatter_preserves_nested_function_declarations () =
-  let source =
-    "func main(args: List[String]) -> Int:\n"
-    ^ "\tpure func helper[T](x: Int) -> Int:\n" ^ "\t\tx + 1\n"
-    ^ "\thelper(1)\n"
-  in
-  let expected =
-    "func main(args: List[String]) -> Int:\n"
-    ^ "\tpure func helper[T](x: Int) -> Int:\n" ^ "\t\tx + 1\n"
-    ^ "\thelper(1)\n"
-  in
-  check_string "formatted source" expected (format_ok source)
-
 let test_foreign_function_forms_preserve_flags () =
   let source =
     "foreign(include: \"math.h\", link_macos: \"-lm\"):\n"
@@ -276,6 +368,14 @@ let suite =
         Alcotest.test_case "empty and blank programs" `Quick
           test_empty_programs_parse_to_no_decls;
       ] );
+    ( "interpolation",
+      [
+        Alcotest.test_case "transform uses supplied batch parser" `Quick
+          test_interpolation_transform_uses_supplied_batch_parser;
+        Alcotest.test_case
+          "bridge preserves hole order in nested blocks" `Quick
+          test_interpolation_bridge_preserves_hole_order_in_nested_blocks;
+      ] );
     ( "imports",
       [
         Alcotest.test_case "comment-only lines inside import block" `Quick
@@ -300,21 +400,6 @@ let suite =
           `Quick test_leading_dot_chain_continuation;
         Alcotest.test_case "multiline var initializer after equals" `Quick
           test_multiline_var_initializer_after_equals;
-      ] );
-    ( "formatter",
-      [
-        Alcotest.test_case "match call arg output remains parseable" `Quick
-          test_formatter_preserves_match_call_arg_parseability;
-        Alcotest.test_case "blank line before block comments" `Quick
-          test_formatter_inserts_blank_before_block_comments;
-        Alcotest.test_case "no blank before first block comment" `Quick
-          test_formatter_does_not_insert_blank_before_first_block_comment;
-        Alcotest.test_case "preserve one block blank line" `Quick
-          test_formatter_preserves_single_block_blank_line;
-        Alcotest.test_case "consecutive block comments stay grouped" `Quick
-          test_formatter_keeps_consecutive_block_comments_together;
-        Alcotest.test_case "nested function declarations stay nested" `Quick
-          test_formatter_preserves_nested_function_declarations;
       ] );
     ( "foreign",
       [

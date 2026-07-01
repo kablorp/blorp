@@ -161,7 +161,7 @@ let handle_hover (state : Lsp_state.state) params =
             match (doc.program, doc.env) with
             | Some program, Some env -> (
                 match
-                  Lsp_position.find_expr_at program ~line:pos.line
+                  Lsp_position.find_expr_at program ~file ~line:pos.line
                     ~col:pos.character
                 with
                 | Some expr -> Lsp_hover.hover_info_for_expr env expr
@@ -254,9 +254,9 @@ let handle_hover (state : Lsp_state.state) params =
               typed_record_field_hover;
               record_field_assignment_hover;
               type_param_hover;
+              typed_param_hover;
               type_name_hover;
               expr_hover;
-              typed_param_hover;
               typed_decl_hover;
               source_decl_hover;
             ]

@@ -90,14 +90,15 @@ There are still important OCaml paths around that default:
   bridge client wrapper, and some validation/subset logic. It is bridge code,
   not the desired long-term compiler implementation.
 
-The Blorp bridge currently supports these actions in
-`compiler/blorp/compiler_bridge.brp`:
+The Blorp bridge protocol currently supports these actions across the backend
+and parser bridge dispatchers:
 
 | Action | Current purpose | Desired long-term status |
 | --- | --- | --- |
 | `emit_post_closure_c` | Current production tail handoff | Move left as more stages port |
 | `prepare_and_emit_c` | Compatibility entrypoint for the pinned compiler bootstrap's older post-closure handoff | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `run_core_pipeline` | Core JSON -> Core JSON for one tail stage | Expand into the main stage parity mechanism |
+| `parse_source` | Source text or path/module metadata -> parsed AST JSON through `compiler_parser_bridge.brp` | Expand into the frontend handoff until Blorp owns module loading/typecheck |
 | `render_many` | Temporary non-emission table/diagnostic requests | Delete from production compile path |
 | `renderer_templates` | Compatibility metadata query for the pinned compiler bootstrap's renderer arity checks | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `lower_and_compile` | Declared, unsupported | Implement when Core lowering ports |
@@ -108,14 +109,15 @@ Current OCaml-to-Blorp calls outside the main backend handoff are:
 
 | OCaml site | Why it calls Blorp today | Roadmap treatment |
 | --- | --- | --- |
-| `compiler/bin/blorp.ml` | Hidden `__compiler-bridge` command | Keep as the command perimeter while OCaml is the outer shell |
+| `compiler/bin/blorp.ml` | Hidden `__compiler-bridge` and `__compiler-bridge-prepare` commands | Keep as the command perimeter while OCaml is the outer shell |
+| `compiler/lib/modules.ml` | Filesystem-backed parse requests can call Blorp `parse_source`; path-only requests let the parser bridge CLI read the file | Collapse into the main frontend boundary when module loading/typecheck move |
 | `compiler/lib/core_pipeline.ml` | Default C backend handoff | Keep, but move the input boundary left over time |
 | `compiler/lib/core_emit_blorp_c.ml` | Core JSON projection, bridge request, subset validation | Shrink to the single bridge shim; delete subset logic as stages move |
 | `compiler/lib/core_fairness.ml` | OCaml final-tail observability path reads Blorp policy rows | Delete when final tail is fully Blorp-observed |
 | `compiler/lib/language_surface.ml` | Typecheck/LSP/parser-adjacent tables live in Blorp | Remove as a runtime bridge call until typecheck is Blorp-owned |
 | `compiler/lib/core_trait_resolve.ml` | Diagnostic hint rendering | Subsumed when trait resolve ports |
 | `compiler/lib/core_profile.ml` | Profile text rendering and lightweight stage-event timing | Subsumed when profiling/reporting ports or made static |
-| `compiler/lib/compiler_blorp_bridge.ml` | Stage/error renderers and bridge process management | Reduce to request/response and helper-cache plumbing |
+| `compiler/lib/compiler_blorp_bridge.ml` | Stage/error renderers, prepared helper binaries, and bridge process management | Reduce to request/response and startup helper preparation plumbing |
 
 The earliest current Blorp call is the source-language surface table lookup from
 OCaml typecheck/LSP-adjacent code. That call is not part of a contiguous
@@ -123,6 +125,13 @@ compiler tail. It should not drive the next big porting slice. Near-term, it
 should either become compile-time/generated static data on the OCaml side or be
 allowed only behind a documented bridge exception until typecheck moves into
 Blorp.
+
+The frontend parser migration is a temporary exception to the "one boundary per
+compile" target: while OCaml still owns module loading, inference, typecheck,
+and the Core middle, production parses can enter Blorp through the same compiler
+bridge protocol and later enter Blorp again for the Core tail. That is accepted
+only as migration debt for moving source reads and parsing into Blorp without
+adding side channels.
 
 ## Target Architecture
 
@@ -230,10 +239,12 @@ Implementation:
   bootstrap exception, observability exception, or table/diagnostic exception.
 - Add or maintain a hygiene check that rejects new bridge call sites unless this
   roadmap is updated.
-- Ensure bridge cache keys are content-derived from the relevant Blorp compiler
-  source and do not include tests unless the helper actually needs tests.
+- Prepare the bridge helper binaries once at process-harness startup when a
+  harness such as `scripts/test` controls many compiler invocations. Keep the
+  content-keyed helper cache only as an ad-hoc fallback for standalone compiler
+  invocations.
 - Keep `compiler/lib/compiler_blorp_bridge.ml` focused on JSON request/response,
-  subprocess/cache management, and typed response decoding.
+  subprocess/helper management, and typed response decoding.
 
 Deletion:
 
@@ -670,7 +681,8 @@ Deletion:
 
 - Delete OCaml lexer/parser/AST/desugar code after parser fixtures and formatter
   projection use Blorp source data.
-- Delete OCaml formatter JSON projection that only adapts OCaml AST to Blorp.
+- Done: the OCaml formatter JSON projection has been deleted; formatting now
+  uses Blorp-owned parse/projection/render code through the compiler bridge.
 
 Validation:
 

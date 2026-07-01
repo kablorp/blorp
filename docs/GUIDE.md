@@ -3328,7 +3328,7 @@ import:
 
 Single-file module: the `JsonValue` union, structured `JsonError` parse
 errors, scanner-backed `parse_json_detailed` / `parse_json` entry points, a
-`parse` compatibility adapter that preserves remaining input, and an
+`parse` adapter that preserves the cursor after the parsed value, and an
 escape-aware `Stringable` implementation. For
 format-agnostic decoding pipelines (JSON + TOML + YAML + CSV composed under
 one decoder), use `std/codec` and bridge with
@@ -3383,7 +3383,8 @@ It uses an indexed scanner for strict whole-input parsing. `parse_json`
 preserves the older `Result[JsonValue, String]` surface by formatting
 `JsonError`. The lower-level `parse` returns
 `parser.ParseResult[JsonValue]` from the same scanner and is mainly useful when
-composing parser-like flows because it preserves the remaining input.
+composing parser-like flows because it returns the cursor after the parsed
+value.
 
 ### std/codec
 
@@ -3538,10 +3539,12 @@ conventions when choosing APIs:
   `yaml.format_error`, `toml.TomlDecodeError` via `toml.format_error`,
   `codec.DecodeError` via `codec.format_error`, and `validation.Invalid` via
   `validation.format_error`.
-- Low-level parser combinators use
-  `parser.ParseResult[T] = Success(T, remaining) | Failure(message, remaining)`.
-  Use them when building parsers or when you need the unconsumed suffix; prefer
-  the format module's `Result` wrapper for application code.
+- Low-level parser combinators use a stable `parser.Source`, explicit
+  `parser.Cursor` values, spans, and
+  `parser.ParseResult[T] = Parsed(T, Cursor) | ParseFailed(ParseError)`. Use
+  them when building parsers or when you need to compose scanners without
+  allocating unconsumed suffix strings; prefer the format module's `Result`
+  wrapper for application code.
 - Validation should accumulate domain failures in `validation.Invalid` instead
   of flattening them early. Use `validation.and_validate` to bridge a
   `Result[T, String]` parse/coercion step into validation checks.

@@ -1,5 +1,5 @@
-(** Single JSON transfer point for Blorp-owned compiler policies and downstream
-    compile artifacts.
+(** Single JSON transfer point for Blorp-owned compiler policies, parser
+    artifacts, and downstream compile artifacts.
 
     Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
     through the hidden bridge command. During a cold bridge-helper compile,
@@ -17,6 +17,174 @@ let language_surface_renderer = "language_surface"
 
 let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
+
+type parsed_source = {
+  parsed_program : Ast.program;
+  parsed_comments : Lexer.collected_comment list;
+}
+
+type parse_source_response =
+  | ParsedSource of parsed_source
+  | ParseSourceDiagnostics of Ast.compiler_error list
+
+type parse_source_batch_request = {
+  batch_parse_path : string;
+  batch_parse_module_name : string;
+  batch_parse_text : string;
+}
+
+type parse_source_batch_response = {
+  batch_parsed_path : string;
+  batch_parsed_module_name : string;
+  batch_parsed_response : parse_source_response;
+}
+
+type cli_frontend_command =
+  | CliFrontendCheck
+  | CliFrontendCompile
+  | CliFrontendRun
+
+type cli_frontend_delegation_io =
+  | CliFrontendBatchDelegation
+  | CliFrontendTerminalDelegation
+
+type cli_frontend_sanitizer_mode =
+  | CliFrontendSanitizeOff
+  | CliFrontendSanitizeAddressUndefined
+  | CliFrontendSanitizeUndefined
+
+type cli_check_options = {
+  cli_check_dump_ast : bool;
+  cli_check_dump_typed_ast : bool;
+  cli_check_debug : bool;
+  cli_check_no_format : bool;
+  cli_check_std_dir : string option;
+  cli_check_paths : string list;
+}
+
+type cli_compile_options = {
+  cli_compile_ast_only : bool;
+  cli_compile_dump_ast : bool;
+  cli_compile_dump_typed_ast : bool;
+  cli_compile_dump_core_after : Core_stage.t list;
+  cli_compile_dump_file : string option;
+  cli_compile_stop_after : Core_stage.t option;
+  cli_compile_time_phases : bool;
+  cli_compile_check_invariants : bool;
+  cli_compile_debug : bool;
+  cli_compile_no_format : bool;
+  cli_compile_embed_runtime : bool;
+  cli_compile_std_dir : string option;
+  cli_compile_output : string option;
+  cli_compile_files : string list;
+}
+
+type cli_run_options = {
+  cli_run_profile : bool;
+  cli_run_debug : bool;
+  cli_run_sanitizer : cli_frontend_sanitizer_mode option;
+  cli_run_leak_check : bool;
+  cli_run_release : bool;
+  cli_run_no_format : bool;
+  cli_run_timeout : int option;
+  cli_run_threads : int option;
+  cli_run_std_dir : string option;
+  cli_run_files : string list;
+  cli_run_user_args : string list;
+}
+
+type cli_test_mode =
+  | CliFrontendTestAll
+  | CliFrontendTestDocOnly
+  | CliFrontendTestSuiteOnly
+
+type cli_test_run_options = {
+  cli_test_raw_args : string list;
+  cli_test_profile : bool;
+  cli_test_debug : bool;
+  cli_test_sanitizer : cli_frontend_sanitizer_mode option;
+  cli_test_leak_check : bool;
+  cli_test_no_format : bool;
+  cli_test_timeout : int option;
+  cli_test_jobs : int;
+  cli_test_repeat : int;
+  cli_test_mode : cli_test_mode;
+  cli_test_cache : bool;
+  cli_test_std_dir : string option;
+  cli_test_paths : string list;
+}
+
+type cli_test_options =
+  | CliTestRunOptions of cli_test_run_options
+  | CliTestWarmupOnlyOptions of { cli_test_warmup_raw_args : string list }
+
+type cli_purify_options = {
+  cli_purify_raw_args : string list;
+  cli_purify_dry_run : bool;
+  cli_purify_verbose : bool;
+  cli_purify_paths : string list;
+}
+
+type cli_repl_options = {
+  cli_repl_raw_args : string list;
+  cli_repl_debug : bool;
+}
+
+type cli_lsp_options = { cli_lsp_raw_args : string list }
+
+type cli_package_command =
+  | CliPackageCheck of string
+  | CliPackageHash of string
+  | CliPackagePack of { path : string; output : string }
+  | CliPackageFetchAll
+  | CliPackageFetchTarget of { target : string; from : string list }
+  | CliPackageVendorAll
+  | CliPackageVendorTarget of { target : string; dest : string option }
+
+type cli_package_options = {
+  cli_package_raw_args : string list;
+  cli_package_command : cli_package_command;
+}
+
+type cli_frontend_options =
+  | CliFrontendCheckOptions of cli_check_options
+  | CliFrontendCompileOptions of cli_compile_options
+  | CliFrontendRunOptions of cli_run_options
+
+type cli_frontend_parsed = {
+  cli_frontend_command : cli_frontend_command;
+  cli_frontend_args : string list;
+  cli_frontend_options : cli_frontend_options;
+  cli_frontend_path : string;
+  cli_frontend_module_name : string;
+  cli_frontend_parsed_response : parse_source_response;
+}
+
+type cli_frontend_options_plan = {
+  cli_frontend_options_command : cli_frontend_command;
+  cli_frontend_options_args : string list;
+  cli_frontend_options : cli_frontend_options;
+}
+
+type cli_run_handled_result = {
+  cli_run_status : int;
+  cli_run_stdout : string;
+  cli_run_stderr : string;
+}
+
+type cli_run_result =
+  | CliRunHandled of cli_run_handled_result
+  | CliRunParsedSource of cli_frontend_parsed
+  | CliRunFrontendOptions of cli_frontend_options_plan
+  | CliRunTestOptions of cli_test_options
+  | CliRunPurifyOptions of cli_purify_options
+  | CliRunReplOptions of cli_repl_options
+  | CliRunLspOptions of cli_lsp_options
+  | CliRunPackageOptions of cli_package_options
+  | CliRunDelegate of {
+      cli_run_delegate_args : string list;
+      cli_run_delegate_io : cli_frontend_delegation_io;
+    }
 
 let rec find_upwards start name =
   let candidate = Filename.concat start name in
@@ -221,6 +389,82 @@ let run_core_pipeline_request_json ~stage core_json =
              [ ("stage", Lsp_json.String stage); ("core", core_json) ] );
        ])
 
+let parse_source_request_json ~path ~module_name ~text =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "parse_source");
+         ( "payload",
+           Lsp_json.Object
+             [
+               ("path", Lsp_json.String path);
+               ("module", Lsp_json.String module_name);
+               ("text", Lsp_json.String text);
+             ] );
+       ])
+
+let parse_source_file_request_json ~path ~module_name =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "parse_source");
+         ( "payload",
+           Lsp_json.Object
+             [
+               ("path", Lsp_json.String path);
+               ("module", Lsp_json.String module_name);
+             ] );
+       ])
+
+let parse_source_batch_item_json item =
+  Lsp_json.Object
+    [
+      ("path", Lsp_json.String item.batch_parse_path);
+      ("module", Lsp_json.String item.batch_parse_module_name);
+      ("text", Lsp_json.String item.batch_parse_text);
+    ]
+
+let parse_sources_request_json items =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "parse_sources");
+         ( "payload",
+           Lsp_json.Object
+             [
+               ("include_comments", Lsp_json.Bool false);
+               ( "sources",
+                 Lsp_json.Array (List.map parse_source_batch_item_json items) );
+             ] );
+       ])
+
+let cli_run_request_json ?version args =
+  let version_fields =
+    match version with
+    | Some value -> [ ("version", Lsp_json.String value) ]
+    | None -> []
+  in
+  let payload_fields =
+    [
+      ("args", Lsp_json.Array (List.map (fun arg -> Lsp_json.String arg) args));
+    ]
+    @ version_fields
+  in
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "run_cli");
+         ("payload", Lsp_json.Object payload_fields);
+       ])
+
 let parse_response_json response_json =
   try Ok (Lsp_json.parse response_json)
   with Lsp_json.Parse_error message -> Error ("invalid_response", message)
@@ -238,6 +482,10 @@ let json_response_field name = function
       match List.assoc_opt name fields with
       | Some value -> Ok value
       | None -> Error ("invalid_response", "missing JSON field `" ^ name ^ "`"))
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let optional_json_response_field name = function
+  | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let render_many_response_field = function
@@ -298,12 +546,681 @@ let string_array_field name = function
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
+let int_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some (Lsp_json.Int value) -> Ok value
+      | Some (Lsp_json.Float value) -> Ok (int_of_float value)
+      | Some _ ->
+          Error ("invalid_response", "field `" ^ name ^ "` must be a number")
+      | None -> Error ("invalid_response", "missing number field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let bool_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some (Lsp_json.Bool value) -> Ok value
+      | Some _ ->
+          Error ("invalid_response", "field `" ^ name ^ "` must be a boolean")
+      | None -> Error ("invalid_response", "missing boolean field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let optional_string_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some Lsp_json.Null -> Ok None
+      | Some (Lsp_json.String value) -> Ok (Some value)
+      | Some _ ->
+          Error
+            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
+      | None ->
+          Error
+            ("invalid_response", "missing optional string field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let optional_int_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some Lsp_json.Null -> Ok None
+      | Some (Lsp_json.Int value) -> Ok (Some value)
+      | Some (Lsp_json.Float value) -> Ok (Some (int_of_float value))
+      | Some _ ->
+          Error
+            ("invalid_response", "field `" ^ name ^ "` must be a number or null")
+      | None ->
+          Error
+            ("invalid_response", "missing optional number field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
 let c_artifact_response_field response =
   let* artifact = json_response_field "artifact" response in
   let* c_code = string_response_field "c_code" artifact in
   let* link_flags = string_array_field "link_flags" artifact in
   let* include_dirs = string_array_field "include_dirs" artifact in
   Ok { c_code; link_flags; include_dirs }
+
+let compiler_error_of_parse_diagnostic
+    (diagnostic : Parsed_ast_json.parsed_diagnostic) =
+  {
+    Ast.message = diagnostic.parsed_diagnostic_message;
+    loc = diagnostic.parsed_diagnostic_span;
+    phase = Ast.Parse;
+    kind = Ast.OtherError;
+    notes = [];
+    help = diagnostic.parsed_diagnostic_help;
+  }
+
+let compiler_error_of_decode_error (err : Parsed_ast_json.decode_error) =
+  match err.loc with
+  | Some loc ->
+      Some
+        {
+          Ast.message = err.message;
+          loc;
+          phase = Ast.Parse;
+          kind = Ast.OtherError;
+          notes = [];
+          help = None;
+        }
+  | None -> None
+
+let int_json_field name fields =
+  match List.assoc_opt name fields with
+  | Some (Lsp_json.Int value) -> Ok value
+  | Some (Lsp_json.Float value) -> Ok (int_of_float value)
+  | Some _ ->
+      Error ("invalid_response", "comment field `" ^ name ^ "` must be a number")
+  | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
+
+let string_json_field name fields =
+  match List.assoc_opt name fields with
+  | Some (Lsp_json.String value) -> Ok value
+  | Some _ ->
+      Error ("invalid_response", "comment field `" ^ name ^ "` must be a string")
+  | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
+
+let bool_json_field name fields =
+  match List.assoc_opt name fields with
+  | Some (Lsp_json.Bool value) -> Ok value
+  | Some _ ->
+      Error
+        ("invalid_response", "comment field `" ^ name ^ "` must be a boolean")
+  | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
+
+let decode_parse_comment = function
+  | Lsp_json.Object fields ->
+      let* cc_text = string_json_field "text" fields in
+      let* cc_line = int_json_field "line" fields in
+      let* cc_col = int_json_field "column" fields in
+      let* cc_trailing = bool_json_field "trailing" fields in
+      Ok { Lexer.cc_text = cc_text; cc_line; cc_col; cc_trailing }
+  | _ -> Error ("invalid_response", "parse comments must be JSON objects")
+
+let parse_comments_response_field artifact =
+  let* comments = optional_json_response_field "comments" artifact in
+  match comments with
+  | None -> Ok []
+  | Some (Lsp_json.Array values) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | value :: rest ->
+            let* comment = decode_parse_comment value in
+            collect (comment :: acc) rest
+      in
+      collect [] values
+  | Some _ -> Error ("invalid_response", "field `comments` must be an array")
+
+let parsed_ast_artifact_field artifact =
+  let* comments = parse_comments_response_field artifact in
+  let* parsed_ast = json_response_field "parsed_ast" artifact in
+  match Parsed_ast_json.decode_parse_diagnostics parsed_ast with
+  | Error err ->
+      Error
+        ( "invalid_response",
+          Parsed_ast_json.decode_error_to_string err )
+  | Ok (_ :: _ as diagnostics) ->
+      Ok
+        (ParseSourceDiagnostics
+           (List.map compiler_error_of_parse_diagnostic diagnostics))
+  | Ok [] -> (
+      match Parsed_ast_json.decode_program parsed_ast with
+      | Ok program ->
+          Ok
+            (ParsedSource { parsed_program = program; parsed_comments = comments })
+      | Error err -> (
+          match compiler_error_of_decode_error err with
+          | Some compiler_error -> Ok (ParseSourceDiagnostics [ compiler_error ])
+          | None ->
+              Error
+                ( "invalid_response",
+                  Parsed_ast_json.decode_error_to_string err )))
+
+let parsed_ast_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  parsed_ast_artifact_field artifact
+
+let parse_source_response_json response_json =
+  response_result response_json parsed_ast_response_field
+
+let parse_source_batch_item_response = function
+  | Lsp_json.Object _ as item ->
+      let* path = string_response_field "path" item in
+      let* module_name = string_response_field "module" item in
+      let* parsed_response = parsed_ast_artifact_field item in
+      Ok
+        {
+          batch_parsed_path = path;
+          batch_parsed_module_name = module_name;
+          batch_parsed_response = parsed_response;
+        }
+  | _ -> Error ("invalid_response", "parse_sources items must be JSON objects")
+
+let parse_sources_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  match json_response_field "sources" artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array values) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | value :: rest ->
+            let* item = parse_source_batch_item_response value in
+            collect (item :: acc) rest
+      in
+      collect [] values
+  | Ok _ -> Error ("invalid_response", "field `sources` must be an array")
+
+let parse_sources_response_json response_json =
+  response_result response_json parse_sources_response_field
+
+let cli_frontend_command_of_string = function
+  | "check" -> Ok CliFrontendCheck
+  | "compile" -> Ok CliFrontendCompile
+  | "run" -> Ok CliFrontendRun
+  | command ->
+      Error ("invalid_response", "unsupported CLI frontend command `" ^ command ^ "`")
+
+let cli_frontend_command_name = function
+  | CliFrontendCheck -> "check"
+  | CliFrontendCompile -> "compile"
+  | CliFrontendRun -> "run"
+
+let validate_cli_artifact_command artifact_kind expected args =
+  match args with
+  | command :: _ when String.equal command expected -> Ok ()
+  | command :: _ ->
+      Error
+        ( "invalid_response",
+          "CLI " ^ artifact_kind ^ " artifact args start with `" ^ command
+          ^ "`, expected `" ^ expected ^ "`" )
+  | [] ->
+      Error
+        ( "invalid_response",
+          "CLI " ^ artifact_kind ^ " artifact args must start with `"
+          ^ expected ^ "`" )
+
+let validate_cli_artifact_args_exact artifact_kind expected args =
+  if args = expected then Ok ()
+  else
+    Error
+      ( "invalid_response",
+        "CLI " ^ artifact_kind ^ " artifact args do not match command payload" )
+
+let validate_cli_artifact_subcommand artifact_kind expected args =
+  match args with
+  | _ :: subcommand :: _ when String.equal subcommand expected -> Ok ()
+  | _ :: subcommand :: _ ->
+      Error
+        ( "invalid_response",
+          "CLI " ^ artifact_kind ^ " artifact subcommand is `" ^ subcommand
+          ^ "`, expected `" ^ expected ^ "`" )
+  | _ ->
+      Error
+        ( "invalid_response",
+          "CLI " ^ artifact_kind ^ " artifact args must include subcommand `"
+          ^ expected ^ "`" )
+
+let decode_package_pack_args_from_raw args =
+  let rec loop path output = function
+    | [] -> (path, output)
+    | ("-o" | "--output") :: value :: rest -> loop path (Some value) rest
+    | ("-o" | "--output") :: [] -> (path, None)
+    | arg :: rest when string_starts_with ~prefix:"-" arg -> loop path output rest
+    | arg :: rest -> loop (Some arg) output rest
+  in
+  match args with
+  | "package" :: "pack" :: rest -> loop None None rest
+  | _ -> (None, None)
+
+let validate_cli_package_pack_args path output args =
+  match decode_package_pack_args_from_raw args with
+  | Some raw_path, Some raw_output
+    when String.equal raw_path path && String.equal raw_output output ->
+      Ok ()
+  | _ ->
+      Error
+        ( "invalid_response",
+          "CLI package pack artifact args do not match command payload" )
+
+let cli_frontend_delegation_io_of_string = function
+  | "batch" -> Ok CliFrontendBatchDelegation
+  | "terminal" -> Ok CliFrontendTerminalDelegation
+  | io ->
+      Error ("invalid_response", "unsupported CLI frontend delegation IO `" ^ io ^ "`")
+
+let cli_frontend_sanitizer_mode_of_string = function
+  | "off" -> Ok CliFrontendSanitizeOff
+  | "address_undefined" -> Ok CliFrontendSanitizeAddressUndefined
+  | "undefined" -> Ok CliFrontendSanitizeUndefined
+  | mode ->
+      Error ("invalid_response", "unsupported CLI sanitizer mode `" ^ mode ^ "`")
+
+let cli_test_mode_of_string = function
+  | "all" -> Ok CliFrontendTestAll
+  | "doc" -> Ok CliFrontendTestDocOnly
+  | "suite" -> Ok CliFrontendTestSuiteOnly
+  | mode ->
+      Error ("invalid_response", "unsupported CLI test mode `" ^ mode ^ "`")
+
+let optional_sanitizer_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some Lsp_json.Null -> Ok None
+      | Some (Lsp_json.String value) ->
+          let* mode = cli_frontend_sanitizer_mode_of_string value in
+          Ok (Some mode)
+      | Some _ ->
+          Error
+            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
+      | None ->
+          Error
+            ("invalid_response", "missing optional sanitizer field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let core_stage_of_cli_string field_name stage_name =
+  match Core_stage.of_string stage_name with
+  | Ok stage -> Ok stage
+  | Error message ->
+      Error
+        ( "invalid_response",
+          "field `" ^ field_name ^ "` has unsupported stage `" ^ stage_name
+          ^ "`: " ^ message )
+
+let core_stage_array_field name value =
+  let* stage_names = string_array_field name value in
+  let rec collect acc = function
+    | [] -> Ok (List.rev acc)
+    | stage_name :: rest ->
+        let* stage = core_stage_of_cli_string name stage_name in
+        collect (stage :: acc) rest
+  in
+  collect [] stage_names
+
+let optional_core_stage_response_field name value =
+  let* stage_name = optional_string_response_field name value in
+  match stage_name with
+  | None -> Ok None
+  | Some stage_name ->
+      let* stage = core_stage_of_cli_string name stage_name in
+      Ok (Some stage)
+
+let require_options_kind expected options =
+  let* kind = string_response_field "kind" options in
+  if kind = expected then Ok ()
+  else
+    Error
+      ( "invalid_response",
+        "CLI options kind `" ^ kind ^ "` did not match expected `" ^ expected
+        ^ "`" )
+
+let decode_cli_check_options options =
+  let* () = require_options_kind "check" options in
+  let* cli_check_dump_ast = bool_response_field "dump_ast" options in
+  let* cli_check_dump_typed_ast =
+    bool_response_field "dump_typed_ast" options
+  in
+  let* cli_check_debug = bool_response_field "debug" options in
+  let* cli_check_no_format = bool_response_field "no_format" options in
+  let* cli_check_std_dir = optional_string_response_field "std_dir" options in
+  let* cli_check_paths = string_array_field "paths" options in
+  Ok
+    (CliFrontendCheckOptions
+       {
+         cli_check_dump_ast;
+         cli_check_dump_typed_ast;
+         cli_check_debug;
+         cli_check_no_format;
+         cli_check_std_dir;
+         cli_check_paths;
+       })
+
+let decode_cli_compile_options options =
+  let* () = require_options_kind "compile" options in
+  let* cli_compile_ast_only = bool_response_field "ast_only" options in
+  let* cli_compile_dump_ast = bool_response_field "dump_ast" options in
+  let* cli_compile_dump_typed_ast =
+    bool_response_field "dump_typed_ast" options
+  in
+  let* cli_compile_dump_core_after =
+    core_stage_array_field "dump_core_after" options
+  in
+  let* cli_compile_dump_file =
+    optional_string_response_field "dump_file" options
+  in
+  let* cli_compile_stop_after =
+    optional_core_stage_response_field "stop_after" options
+  in
+  let* cli_compile_time_phases = bool_response_field "time_phases" options in
+  let* cli_compile_check_invariants =
+    bool_response_field "check_invariants" options
+  in
+  let* cli_compile_debug = bool_response_field "debug" options in
+  let* cli_compile_no_format = bool_response_field "no_format" options in
+  let* cli_compile_embed_runtime =
+    bool_response_field "embed_runtime" options
+  in
+  let* cli_compile_std_dir =
+    optional_string_response_field "std_dir" options
+  in
+  let* cli_compile_output = optional_string_response_field "output" options in
+  let* cli_compile_files = string_array_field "files" options in
+  Ok
+    (CliFrontendCompileOptions
+       {
+         cli_compile_ast_only;
+         cli_compile_dump_ast;
+         cli_compile_dump_typed_ast;
+         cli_compile_dump_core_after;
+         cli_compile_dump_file;
+         cli_compile_stop_after;
+         cli_compile_time_phases;
+         cli_compile_check_invariants;
+         cli_compile_debug;
+         cli_compile_no_format;
+         cli_compile_embed_runtime;
+         cli_compile_std_dir;
+         cli_compile_output;
+         cli_compile_files;
+       })
+
+let decode_cli_run_options options =
+  let* () = require_options_kind "run" options in
+  let* cli_run_profile = bool_response_field "profile" options in
+  let* cli_run_debug = bool_response_field "debug" options in
+  let* cli_run_sanitizer = optional_sanitizer_response_field "sanitizer" options in
+  let* cli_run_leak_check = bool_response_field "leak_check" options in
+  let* cli_run_release = bool_response_field "release" options in
+  let* cli_run_no_format = bool_response_field "no_format" options in
+  let* cli_run_timeout = optional_int_response_field "timeout" options in
+  let* cli_run_threads = optional_int_response_field "threads" options in
+  let* cli_run_std_dir = optional_string_response_field "std_dir" options in
+  let* cli_run_files = string_array_field "files" options in
+  let* cli_run_user_args = string_array_field "user_args" options in
+  Ok
+    (CliFrontendRunOptions
+       {
+         cli_run_profile;
+         cli_run_debug;
+         cli_run_sanitizer;
+         cli_run_leak_check;
+         cli_run_release;
+         cli_run_no_format;
+         cli_run_timeout;
+         cli_run_threads;
+         cli_run_std_dir;
+         cli_run_files;
+         cli_run_user_args;
+       })
+
+let decode_cli_test_run_options cli_test_raw_args options =
+  let* () = require_options_kind "test" options in
+  let* cli_test_profile = bool_response_field "profile" options in
+  let* cli_test_debug = bool_response_field "debug" options in
+  let* cli_test_sanitizer = optional_sanitizer_response_field "sanitizer" options in
+  let* cli_test_leak_check = bool_response_field "leak_check" options in
+  let* cli_test_no_format = bool_response_field "no_format" options in
+  let* cli_test_timeout = optional_int_response_field "timeout" options in
+  let* cli_test_jobs = int_response_field "jobs" options in
+  let* cli_test_repeat = int_response_field "repeat" options in
+  let* mode_text = string_response_field "mode" options in
+  let* cli_test_mode = cli_test_mode_of_string mode_text in
+  let* cli_test_cache = bool_response_field "cache" options in
+  let* cli_test_std_dir = optional_string_response_field "std_dir" options in
+  let* cli_test_paths = string_array_field "paths" options in
+  Ok
+    (CliTestRunOptions
+       {
+         cli_test_raw_args;
+         cli_test_profile;
+         cli_test_debug;
+         cli_test_sanitizer;
+         cli_test_leak_check;
+         cli_test_no_format;
+         cli_test_timeout;
+         cli_test_jobs;
+         cli_test_repeat;
+         cli_test_mode;
+         cli_test_cache;
+         cli_test_std_dir;
+         cli_test_paths;
+       })
+
+let decode_cli_test_options cli_test_raw_args options =
+  let* kind = string_response_field "kind" options in
+  match kind with
+  | "test" -> decode_cli_test_run_options cli_test_raw_args options
+  | "test_warmup" ->
+      Ok (CliTestWarmupOnlyOptions { cli_test_warmup_raw_args = cli_test_raw_args })
+  | other ->
+      Error
+        ( "invalid_response",
+          "unsupported CLI test options kind `" ^ other ^ "`" )
+
+let decode_cli_purify_options cli_purify_raw_args options =
+  let* () = require_options_kind "purify" options in
+  let* cli_purify_dry_run = bool_response_field "dry_run" options in
+  let* cli_purify_verbose = bool_response_field "verbose" options in
+  let* cli_purify_paths = string_array_field "paths" options in
+  Ok
+    {
+      cli_purify_raw_args;
+      cli_purify_dry_run;
+      cli_purify_verbose;
+      cli_purify_paths;
+    }
+
+let decode_cli_frontend_options command options =
+  match command with
+  | CliFrontendCheck -> decode_cli_check_options options
+  | CliFrontendCompile -> decode_cli_compile_options options
+  | CliFrontendRun -> decode_cli_run_options options
+
+let cli_frontend_parsed_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* cli_frontend_command = cli_frontend_command_of_string command_text in
+  let* cli_frontend_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "parsed_source" command_text cli_frontend_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_frontend_options =
+    decode_cli_frontend_options cli_frontend_command options
+  in
+  let* source = json_response_field "source" artifact in
+  let* cli_frontend_path = string_response_field "path" source in
+  let* cli_frontend_module_name = string_response_field "module" source in
+  let* parsed_source = json_response_field "parsed_source" source in
+  let* cli_frontend_parsed_response = parsed_ast_artifact_field parsed_source in
+  Ok
+    {
+      cli_frontend_command;
+      cli_frontend_args;
+      cli_frontend_options;
+      cli_frontend_path;
+      cli_frontend_module_name;
+      cli_frontend_parsed_response;
+    }
+
+let cli_frontend_options_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* cli_frontend_options_command =
+    cli_frontend_command_of_string command_text
+  in
+  let* cli_frontend_options_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "frontend_options" command_text
+      cli_frontend_options_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_frontend_options =
+    decode_cli_frontend_options cli_frontend_options_command options
+  in
+  Ok
+    {
+      cli_frontend_options_command;
+      cli_frontend_options_args;
+      cli_frontend_options;
+    }
+
+let cli_run_handled_response_field artifact =
+  let* cli_run_status = int_response_field "status" artifact in
+  let* cli_run_stdout = string_response_field "stdout" artifact in
+  let* cli_run_stderr = string_response_field "stderr" artifact in
+  Ok (CliRunHandled { cli_run_status; cli_run_stdout; cli_run_stderr })
+
+let cli_run_delegate_response_field artifact =
+  let* cli_run_delegate_args = string_array_field "args" artifact in
+  let* io = string_response_field "io" artifact in
+  let* cli_run_delegate_io = cli_frontend_delegation_io_of_string io in
+  Ok (CliRunDelegate { cli_run_delegate_args; cli_run_delegate_io })
+
+let cli_run_test_response_field artifact =
+  let* cli_test_raw_args = string_array_field "args" artifact in
+  let* () = validate_cli_artifact_command "test" "test" cli_test_raw_args in
+  let* options = json_response_field "options" artifact in
+  let* cli_test_options = decode_cli_test_options cli_test_raw_args options in
+  Ok (CliRunTestOptions cli_test_options)
+
+let cli_run_purify_response_field artifact =
+  let* cli_purify_raw_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "purify" "purify" cli_purify_raw_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_purify_options =
+    decode_cli_purify_options cli_purify_raw_args options
+  in
+  Ok (CliRunPurifyOptions cli_purify_options)
+
+let cli_run_repl_response_field artifact =
+  let* cli_repl_raw_args = string_array_field "args" artifact in
+  let* () = validate_cli_artifact_command "repl" "repl" cli_repl_raw_args in
+  let* cli_repl_debug = bool_response_field "debug" artifact in
+  Ok (CliRunReplOptions { cli_repl_raw_args; cli_repl_debug })
+
+let cli_run_lsp_response_field artifact =
+  let* cli_lsp_raw_args = string_array_field "args" artifact in
+  let* () = validate_cli_artifact_args_exact "lsp" [ "lsp" ] cli_lsp_raw_args in
+  Ok (CliRunLspOptions { cli_lsp_raw_args })
+
+let cli_package_command_response_field command =
+  let* kind = string_response_field "kind" command in
+  match kind with
+  | "check" ->
+      let* path = string_response_field "path" command in
+      Ok (CliPackageCheck path)
+  | "hash" ->
+      let* path = string_response_field "path" command in
+      Ok (CliPackageHash path)
+  | "pack" ->
+      let* path = string_response_field "path" command in
+      let* output = string_response_field "output" command in
+      Ok (CliPackagePack { path; output })
+  | "fetch_all" -> Ok CliPackageFetchAll
+  | "fetch_target" ->
+      let* target = string_response_field "target" command in
+      let* from = string_array_field "from" command in
+      Ok (CliPackageFetchTarget { target; from })
+  | "vendor_all" -> Ok CliPackageVendorAll
+  | "vendor_target" ->
+      let* target = string_response_field "target" command in
+      let* dest = optional_string_response_field "dest" command in
+      Ok (CliPackageVendorTarget { target; dest })
+  | other ->
+      Error
+        ( "invalid_response",
+          "unsupported CLI package command kind `" ^ other ^ "`" )
+
+let validate_cli_package_command_args command args =
+  let* () = validate_cli_artifact_command "package" "package" args in
+  match command with
+  | CliPackageCheck path ->
+      validate_cli_artifact_args_exact "package check"
+        [ "package"; "check"; path ]
+        args
+  | CliPackageHash path ->
+      validate_cli_artifact_args_exact "package hash"
+        [ "package"; "hash"; path ]
+        args
+  | CliPackagePack { path; output } ->
+      let* () = validate_cli_artifact_subcommand "package pack" "pack" args in
+      validate_cli_package_pack_args path output args
+  | CliPackageFetchAll ->
+      validate_cli_artifact_args_exact "package fetch" [ "package"; "fetch" ] args
+  | CliPackageFetchTarget { target; from } ->
+      validate_cli_artifact_args_exact "package fetch"
+        ([ "package"; "fetch"; target ] @ from)
+        args
+  | CliPackageVendorAll ->
+      validate_cli_artifact_args_exact "package vendor"
+        [ "package"; "vendor" ]
+        args
+  | CliPackageVendorTarget { target; dest } -> (
+      match dest with
+      | Some path ->
+          validate_cli_artifact_args_exact "package vendor"
+            [ "package"; "vendor"; target; path ]
+            args
+      | None ->
+          validate_cli_artifact_args_exact "package vendor"
+            [ "package"; "vendor"; target ]
+            args)
+
+let cli_run_package_response_field artifact =
+  let* cli_package_raw_args = string_array_field "args" artifact in
+  let* command_json = json_response_field "command" artifact in
+  let* cli_package_command = cli_package_command_response_field command_json in
+  let* () =
+    validate_cli_package_command_args cli_package_command cli_package_raw_args
+  in
+  Ok (CliRunPackageOptions { cli_package_raw_args; cli_package_command })
+
+let cli_run_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  let* kind = string_response_field "kind" artifact in
+  match kind with
+  | "handled" -> cli_run_handled_response_field artifact
+  | "parsed_source" ->
+      let* parsed = cli_frontend_parsed_response_field artifact in
+      Ok (CliRunParsedSource parsed)
+  | "frontend_options" ->
+      let* options = cli_frontend_options_response_field artifact in
+      Ok (CliRunFrontendOptions options)
+  | "delegate" -> cli_run_delegate_response_field artifact
+  | "test" -> cli_run_test_response_field artifact
+  | "purify" -> cli_run_purify_response_field artifact
+  | "repl" -> cli_run_repl_response_field artifact
+  | "lsp" -> cli_run_lsp_response_field artifact
+  | "package" -> cli_run_package_response_field artifact
+  | other ->
+      Error ("invalid_response", "unsupported CLI run artifact kind `" ^ other ^ "`")
+
+let cli_run_response_json response_json =
+  response_result response_json cli_run_response_field
 
 let language_surface_bootstrap_rows =
   [
@@ -353,11 +1270,29 @@ let render_many_for_renderer_helper_exn ~renderer items =
      ^ " is not available while compiling the Blorp bridge helper")
 
 let renderer_bridge_helper_env = "BLORP_COMPILER_RENDERER_HELPER"
+let compiler_bootstrap_menhir_parser_env =
+  "BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER"
+
 let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
 let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
+let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
+let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
+let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
 let renderer_bridge_source_name = "compiler/blorp/compiler_bridge_cli.brp"
+let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
+let bridge_helper_compile_env =
+  [
+    (renderer_bridge_helper_env, "1");
+    (compiler_bootstrap_menhir_parser_env, "1");
+  ]
+
+let parser_bridge_helper_compile_env = bridge_helper_compile_env
 
 let renderer_bridge_cache :
+    (string * string * string * string * string) option ref =
+  ref None
+
+let parser_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
@@ -368,6 +1303,14 @@ let bridge_temp_retry_limit = 32
 let running_inside_renderer_bridge_helper () =
   match Sys.getenv_opt renderer_bridge_helper_env with
   | Some "1" -> true
+  | _ -> false
+
+let compiler_bootstrap_menhir_parser_requested () =
+  match
+    ( Sys.getenv_opt renderer_bridge_helper_env,
+      Sys.getenv_opt compiler_bootstrap_menhir_parser_env )
+  with
+  | Some "1", Some "1" -> true
   | _ -> false
 
 let read_all_fd fd =
@@ -393,6 +1336,23 @@ let read_file_if_exists path =
       (fun () ->
         let len = in_channel_length channel in
         really_input_string channel len)
+
+let string_starts_with_at value index prefix =
+  let prefix_len = String.length prefix in
+  index >= 0
+  && index + prefix_len <= String.length value
+  && String.sub value index prefix_len = prefix
+
+let string_contains_substring value needle =
+  let value_len = String.length value in
+  let needle_len = String.length needle in
+  if needle_len = 0 then true
+  else
+    let rec loop index =
+      index + needle_len <= value_len
+      && (String.sub value index needle_len = needle || loop (index + 1))
+    in
+    loop 0
 
 let rec waitpid_retry pid =
   try snd (Unix.waitpid [] pid)
@@ -503,6 +1463,10 @@ let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge
   | Some path when path <> "" -> Some path
   | _ -> find_upwards_from starts compiler_bootstrap_script_name
 
+let command_program_for_parser_bridge ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
+    starts =
+  locate_default_command_program ~bridge_bin starts
+
 let run_process_capture ?(env = []) ?(unset_env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
   let stderr_path, stderr_fd =
@@ -537,6 +1501,17 @@ let default_command_program () =
       invalid_arg
         (Printf.sprintf
            "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
+           explicit blorp binary"
+           compiler_bootstrap_script_name compiler_bridge_bin_env)
+
+let parser_bridge_command_program () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  match command_program_for_parser_bridge starts with
+  | Some path -> path
+  | None ->
+      invalid_arg
+        (Printf.sprintf
+           "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
             explicit blorp binary"
            compiler_bootstrap_script_name compiler_bridge_bin_env)
 
@@ -551,6 +1526,15 @@ let renderer_bridge_source_path () =
           invalid_arg
             (Printf.sprintf "cannot locate Blorp renderer bridge source %s"
                renderer_bridge_source_name))
+
+let parser_bridge_source_path () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  match find_upwards_from starts parser_bridge_source_name with
+  | Some path -> path
+  | None ->
+      invalid_arg
+        (Printf.sprintf "cannot locate Blorp parser bridge source %s"
+           parser_bridge_source_name)
 
 let renderer_bridge_temp_dir_retry_limit = 32
 
@@ -636,6 +1620,7 @@ let renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path =
 
 type renderer_bridge_cache_parts = {
   bridge_key : string;
+  bridge_entrypoint : string;
   bridge_source_digest : string;
   bridge_program_digest : string;
   bridge_cc_digest : string;
@@ -664,6 +1649,7 @@ let renderer_bridge_cache_root () =
   root
 
 let renderer_bridge_cache_parts ~program ~source_path =
+  let entrypoint = Filename.basename source_path in
   let source_digest = bridge_source_tree_digest source_path in
   let program_digest = file_digest program in
   let cc_digest = string_digest (Lazy.force renderer_bridge_cc_identity) in
@@ -675,7 +1661,8 @@ let renderer_bridge_cache_parts ~program ~source_path =
     string_digest
       (String.concat "\000"
          [
-           "compiler-renderer-bridge-cache-v2";
+           "compiler-renderer-bridge-cache-v4";
+           entrypoint;
            source_digest;
            program_digest;
            cc_digest;
@@ -685,6 +1672,7 @@ let renderer_bridge_cache_parts ~program ~source_path =
   in
   {
     bridge_key;
+    bridge_entrypoint = entrypoint;
     bridge_source_digest = source_digest;
     bridge_program_digest = program_digest;
     bridge_cc_digest = cc_digest;
@@ -701,12 +1689,15 @@ let renderer_bridge_obj_path dir = Filename.concat dir "bridge.o"
 let renderer_bridge_wrapper_path dir = Filename.concat dir "bridge_main.c"
 let renderer_bridge_manifest_path dir = Filename.concat dir "MANIFEST"
 let renderer_bridge_ready_path dir = Filename.concat dir "READY"
+let renderer_bridge_lock_path cache_root key =
+  Filename.concat cache_root (".compiler-renderer-bridge-" ^ key ^ ".lock")
 
 let renderer_bridge_manifest parts ~binary_path =
   String.concat "\n"
     [
-      "compiler-renderer-bridge-cache-v2";
+      "compiler-renderer-bridge-cache-v4";
       "key=" ^ parts.bridge_key;
+      "entrypoint=" ^ parts.bridge_entrypoint;
       "source=" ^ parts.bridge_source_digest;
       "program=" ^ parts.bridge_program_digest;
       "cc=" ^ parts.bridge_cc_digest;
@@ -780,75 +1771,298 @@ let publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir =
   in
   publish 0
 
-let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
+let generated_c_struct_typedef_name line =
+  let prefix = "typedef struct " in
+  if not (string_starts_with_at line 0 prefix) then None
+  else
+    let rest_start = String.length prefix in
+    let rec find_name_end index =
+      if index >= String.length line then index
+      else
+        match line.[index] with
+        | ' ' | '\t' | '{' -> index
+        | _ -> find_name_end (index + 1)
+    in
+    let name_end = find_name_end rest_start in
+    if name_end <= rest_start then None
+    else
+      let name = String.sub line rest_start (name_end - rest_start) in
+      if string_contains_substring name "__" then Some name
+      else None
+
+let generated_c_with_forward_typedefs c_code =
+  let lines = String.split_on_char '\n' c_code in
+  let names =
+    List.fold_left
+      (fun acc line ->
+        match generated_c_struct_typedef_name line with
+        | Some name -> name :: acc
+        | _ -> acc)
+      [] lines
+    |> List.sort_uniq String.compare
+  in
+  if names = [] then c_code
+  else
+    let declarations =
+      "/* Blorp bridge bootstrap compatibility: older pinned compilers can\n\
+       emit mutually recursive heap type declarations before their forward\n\
+       typedefs. */\n"
+      ^ (names
+        |> List.map (fun name -> "typedef struct " ^ name ^ " " ^ name ^ ";")
+        |> String.concat "\n")
+      ^ "\n\n"
+    in
+    declarations ^ c_code
+
+let generated_c_variant_defs c_code =
+  let add_define acc line =
+    let prefix = "#define " in
+    if not (string_starts_with_at line 0 prefix) then acc
+    else
+      let rest_start = String.length prefix in
+      match String.index_from_opt line rest_start ' ' with
+      | None -> acc
+      | Some name_end ->
+          let def_name = String.sub line rest_start (name_end - rest_start) in
+          if not (string_starts_with_at def_name 0 "__def_") then acc
+          else (
+            match String.rindex_opt def_name '_' with
+            | None -> acc
+            | Some variant_start when variant_start + 1 >= String.length def_name
+              ->
+                acc
+            | Some variant_start ->
+                let variant =
+                  String.sub def_name (variant_start + 1)
+                    (String.length def_name - variant_start - 1)
+                in
+                match List.assoc_opt variant acc with
+                | None -> (variant, Some def_name) :: acc
+                | Some (Some existing) when String.equal existing def_name -> acc
+                | Some _ ->
+                    (variant, None)
+                    :: List.remove_assoc variant acc)
+  in
+  String.split_on_char '\n' c_code
+  |> List.fold_left add_define []
+
+let is_ident_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+  | _ -> false
+
+let find_casted_enum_tag_check_end c_code expr_start tag_prefix =
+  let len = String.length c_code in
+  let tag_marker = ")->tag == " ^ tag_prefix in
+  let marker_len = String.length tag_marker in
+  let rec scan index depth =
+    if index + marker_len > len then None
+    else
+      match c_code.[index] with
+      | ')' when depth = 0 && string_starts_with_at c_code index tag_marker ->
+          let variant_start = index + marker_len in
+          let rec variant_end cursor =
+            if cursor < len && is_ident_char c_code.[cursor] then
+              variant_end (cursor + 1)
+            else cursor
+          in
+          let variant_stop = variant_end variant_start in
+          if variant_stop = variant_start then None
+          else
+            let stop =
+              if variant_stop < len && c_code.[variant_stop] = ')' then
+                variant_stop + 1
+              else variant_stop
+            in
+            Some (index, variant_start, variant_stop, stop)
+      | '(' -> scan (index + 1) (depth + 1)
+      | ')' when depth > 0 -> scan (index + 1) (depth - 1)
+      | _ -> scan (index + 1) depth
+  in
+  scan expr_start 0
+
+let rewrite_casted_enum_tag_checks c_code ~type_name ~tag_prefix variant_defs =
+  let cast_prefix = "(((" ^ type_name ^ "*)" in
+  let cast_prefix_len = String.length cast_prefix in
+  let len = String.length c_code in
+  let buffer = Buffer.create len in
+  let add_original from_ until_ =
+    if until_ > from_ then
+      Buffer.add_substring buffer c_code from_ (until_ - from_)
+  in
+  let rec loop cursor search_from =
+    if search_from >= len then add_original cursor len
+    else
+      match
+        let rec find index =
+          if index + cast_prefix_len > len then None
+          else if string_starts_with_at c_code index cast_prefix then Some index
+          else find (index + 1)
+        in
+        find search_from
+      with
+      | None -> add_original cursor len
+      | Some start -> (
+          let expr_start = start + cast_prefix_len in
+          match find_casted_enum_tag_check_end c_code expr_start tag_prefix with
+          | None -> loop cursor expr_start
+          | Some (expr_end, variant_start, variant_stop, stop) -> (
+              let variant =
+                String.sub c_code variant_start (variant_stop - variant_start)
+              in
+              match List.assoc_opt variant variant_defs with
+              | Some (Some def_name) ->
+                  add_original cursor start;
+                  Buffer.add_string buffer "((long)(long)";
+                  Buffer.add_substring buffer c_code expr_start
+                    (expr_end - expr_start);
+                  Buffer.add_string buffer " == ";
+                  Buffer.add_string buffer def_name;
+                  Buffer.add_char buffer ')';
+                  loop stop stop
+              | _ -> loop cursor stop))
+  in
+  loop 0 0;
+  Buffer.contents buffer
+
+let generated_c_with_stack_enum_payload_patterns c_code =
+  let variant_defs = generated_c_variant_defs c_code in
+  c_code
+  |> fun code ->
+  rewrite_casted_enum_tag_checks code
+    ~type_name:"compiler_token__CompilerSymbol"
+    ~tag_prefix:"TAG_compiler_token__CompilerSymbol_" variant_defs
+  |> fun code ->
+  rewrite_casted_enum_tag_checks code
+    ~type_name:"compiler_token__CompilerKeyword"
+    ~tag_prefix:"TAG_compiler_token__CompilerKeyword_" variant_defs
+
+let generated_c_with_bootstrap_compatibility c_code =
+  c_code
+  |> generated_c_with_forward_typedefs
+  |> generated_c_with_stack_enum_payload_patterns
+
+let apply_generated_c_bootstrap_compatibility path =
+  let original = read_file path in
+  let rewritten = generated_c_with_bootstrap_compatibility original in
+  if not (String.equal original rewritten) then write_file path rewritten
+
+let compile_bridge_binary_in_stage ~program ~source_path ~compile_env ~stage_dir
+    ~bin_path =
+  let c_path = renderer_bridge_c_path stage_dir in
+  let obj_path = renderer_bridge_obj_path stage_dir in
+  let wrapper_path = renderer_bridge_wrapper_path stage_dir in
+  Fun.protect
+    ~finally:(fun () ->
+      List.iter
+        (fun path -> try Sys.remove path with _ -> ())
+        [ c_path; obj_path; wrapper_path ])
+    (fun () ->
+      let compile_code, compile_output, compile_stderr =
+        run_process_capture program
+          ~env:compile_env
+          ~unset_env:
+            [
+              compiler_bridge_bin_env;
+              prepared_renderer_bridge_bin_env;
+              prepared_parser_bridge_bin_env;
+            ]
+          [ "compile"; "--no-format"; "-o"; c_path; source_path ]
+      in
+      if compile_code <> 0 then
+        Error
+          (Printf.sprintf "failed to compile Blorp bridge helper %s: %s"
+             source_path
+             (String.trim (compile_output ^ compile_stderr)))
+      else
+        let () = apply_generated_c_bootstrap_compatibility c_path in
+        let () = write_file wrapper_path (renderer_bridge_wrapper_source ()) in
+        let obj_code, obj_output, obj_stderr =
+          run_process_capture "cc"
+            (renderer_bridge_compile_object_args ~c_path ~obj_path)
+        in
+        if obj_code <> 0 then
+          Error
+            (Printf.sprintf
+               "failed to compile Blorp bridge helper object %s: %s"
+               source_path
+               (String.trim (obj_output ^ obj_stderr)))
+        else
+          let cc_code, cc_output, cc_stderr =
+            run_process_capture "cc"
+              (renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path)
+          in
+          if cc_code <> 0 then
+            Error
+              (Printf.sprintf
+                 "failed to link Blorp bridge helper binary %s: %s" source_path
+                 (String.trim (cc_output ^ cc_stderr)))
+          else Ok bin_path)
+
+let compile_bridge_binary_to_path ~program ~source_path ~compile_env ~work_root
+    ~bin_path =
+  ensure_dir work_root;
+  ensure_dir (Filename.dirname bin_path);
+  let stage_dir =
+    create_renderer_bridge_stage_dir work_root renderer_bridge_temp_dir_retry_limit
+  in
+  Fun.protect
+    ~finally:(fun () -> remove_path_noerr stage_dir)
+    (fun () ->
+      let stage_bin = renderer_bridge_bin_path stage_dir in
+      match
+        compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+          ~stage_dir ~bin_path:stage_bin
+      with
+      | Error _ as error -> error
+      | Ok _ ->
+          (try Sys.remove bin_path with _ -> ());
+          Unix.rename stage_bin bin_path;
+          Ok bin_path)
+
+let rec lockf_retry fd command size =
+  try Unix.lockf fd command size
+  with Unix.Unix_error (Unix.EINTR, _, _) -> lockf_retry fd command size
+
+let with_renderer_bridge_cache_lock cache_root key f =
+  let lock_path = renderer_bridge_lock_path cache_root key in
+  let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () ->
+      lockf_retry fd Unix.F_LOCK 0;
+      Fun.protect
+        ~finally:(fun () ->
+          try lockf_retry fd Unix.F_ULOCK 0 with _ -> ())
+        f)
+
+let compile_renderer_bridge_binary ~program ~source_path ~cache_root
+    ~compile_env parts =
   let final_dir = renderer_bridge_cache_dir cache_root parts.bridge_key in
   if renderer_bridge_cache_verified parts final_dir then
     Ok (renderer_bridge_bin_path final_dir)
-  else
+  else with_renderer_bridge_cache_lock cache_root parts.bridge_key (fun () ->
+    if renderer_bridge_cache_verified parts final_dir then
+      Ok (renderer_bridge_bin_path final_dir)
+    else
     let stage_dir =
       create_renderer_bridge_stage_dir cache_root
         renderer_bridge_temp_dir_retry_limit
     in
-    let c_path = renderer_bridge_c_path stage_dir in
-    let obj_path = renderer_bridge_obj_path stage_dir in
-    let wrapper_path = renderer_bridge_wrapper_path stage_dir in
     let bin_path = renderer_bridge_bin_path stage_dir in
-    Fun.protect
-      ~finally:(fun () ->
-        List.iter
-          (fun path -> try Sys.remove path with _ -> ())
-          [ c_path; obj_path; wrapper_path ])
-      (fun () ->
-        let compile_code, compile_output, compile_stderr =
-          run_process_capture program
-            ~env:[ (renderer_bridge_helper_env, "1") ]
-            ~unset_env:[ compiler_bridge_bin_env ]
-            [ "compile"; "--no-format"; "-o"; c_path; source_path ]
-        in
-        if compile_code <> 0 then begin
-          remove_path_noerr stage_dir;
-          Error
-            (Printf.sprintf "failed to compile Blorp renderer bridge: %s"
-               (String.trim (compile_output ^ compile_stderr)))
-        end
-        else
-          let () = write_file wrapper_path (renderer_bridge_wrapper_source ()) in
-          let obj_code, obj_output, obj_stderr =
-            run_process_capture "cc"
-              (renderer_bridge_compile_object_args ~c_path ~obj_path)
-          in
-          if obj_code <> 0 then begin
-            remove_path_noerr stage_dir;
-            Error
-              (Printf.sprintf
-                 "failed to compile Blorp renderer bridge object: %s"
-                 (String.trim (obj_output ^ obj_stderr)))
-          end
-          else
-            let cc_code, cc_output, cc_stderr =
-              run_process_capture "cc"
-                (renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path)
-            in
-            if cc_code <> 0 then begin
-              remove_path_noerr stage_dir;
-              Error
-                (Printf.sprintf
-                   "failed to build Blorp renderer bridge binary: %s"
-                   (String.trim (cc_output ^ cc_stderr)))
-            end
-            else begin
-              List.iter
-                (fun path -> try Sys.remove path with _ -> ())
-                [ c_path; obj_path; wrapper_path ];
-              write_renderer_bridge_cache_markers parts stage_dir;
-              publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir
-            end)
+    match
+      compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+        ~stage_dir ~bin_path
+    with
+    | Error message ->
+        remove_path_noerr stage_dir;
+        Error message
+    | Ok _ ->
+        write_renderer_bridge_cache_markers parts stage_dir;
+        publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir)
 
-let renderer_bridge_binary () =
-  let program = default_command_program () in
-  let source_path = renderer_bridge_source_path () in
+let bridge_binary_for_source cache_ref ~program ~source_path ~compile_env =
   let cache_root = renderer_bridge_cache_root () in
-  match !renderer_bridge_cache with
+  match !cache_ref with
   | Some (cached_program, cached_source, cached_root, _cached_key, cached_binary)
     when String.equal cached_program program
          && String.equal cached_source source_path
@@ -859,17 +2073,88 @@ let renderer_bridge_binary () =
       let cache_parts = renderer_bridge_cache_parts ~program ~source_path in
       match
         compile_renderer_bridge_binary ~program ~source_path ~cache_root
-          cache_parts
+          ~compile_env cache_parts
       with
       | Ok binary ->
-          renderer_bridge_cache :=
+          cache_ref :=
             Some
               (program, source_path, cache_root, cache_parts.bridge_key, binary);
           Ok binary
       | Error _ as error -> error)
 
-let run_renderer_request_via_blorp request_json =
-  match renderer_bridge_binary () with
+let prepared_bridge_binary_from_env env_name =
+  match Sys.getenv_opt env_name with
+  | Some path when path <> "" ->
+      if Sys.file_exists path && not (Sys.is_directory path) then Some (Ok path)
+      else
+        Some
+          (Error
+             (Printf.sprintf
+                "%s points to missing Blorp bridge helper binary: %s" env_name
+                path))
+  | _ -> None
+
+let prepared_bridge_required () =
+  match Sys.getenv_opt require_prepared_bridge_env with Some "1" -> true | _ -> false
+
+let missing_prepared_bridge_error env_name =
+  Error
+    (Printf.sprintf
+       "%s=1 requires %s to point to a prepared Blorp bridge helper binary"
+       require_prepared_bridge_env env_name)
+
+let renderer_bridge_binary () =
+  match prepared_bridge_binary_from_env prepared_renderer_bridge_bin_env with
+  | Some result -> result
+  | None when prepared_bridge_required () ->
+      missing_prepared_bridge_error prepared_renderer_bridge_bin_env
+  | None ->
+      bridge_binary_for_source renderer_bridge_cache
+        ~program:(default_command_program ())
+        ~source_path:(renderer_bridge_source_path ())
+        ~compile_env:bridge_helper_compile_env
+
+let parser_bridge_binary () =
+  match prepared_bridge_binary_from_env prepared_parser_bridge_bin_env with
+  | Some result -> result
+  | None when prepared_bridge_required () ->
+      missing_prepared_bridge_error prepared_parser_bridge_bin_env
+  | None ->
+      bridge_binary_for_source parser_bridge_cache
+        ~program:(parser_bridge_command_program ())
+        ~source_path:(parser_bridge_source_path ())
+        ~compile_env:parser_bridge_helper_compile_env
+
+type prepared_bridge_binaries = {
+  prepared_renderer_bridge_bin : string;
+  prepared_parser_bridge_bin : string;
+}
+
+let prepare_bridge_binaries ~out_dir =
+  ensure_dir out_dir;
+  let program = default_command_program () in
+  let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
+  let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
+  let* renderer_path =
+    compile_bridge_binary_to_path ~program
+      ~source_path:(renderer_bridge_source_path ())
+      ~compile_env:bridge_helper_compile_env ~work_root:out_dir
+      ~bin_path:renderer_bin
+  in
+  let* parser_path =
+    compile_bridge_binary_to_path ~program
+      ~source_path:(parser_bridge_source_path ())
+      ~compile_env:parser_bridge_helper_compile_env ~work_root:out_dir
+      ~bin_path:parser_bin
+  in
+  Ok
+    {
+      prepared_renderer_bridge_bin = renderer_path;
+      prepared_parser_bridge_bin = parser_path;
+    }
+
+let run_request_via_blorp_binary bridge_binary request_json =
+  match bridge_binary () with
   | Error message -> error_response "bridge_command_failed" message
   | Ok bridge_binary ->
       let request_path = write_temp_request request_json in
@@ -897,6 +2182,15 @@ let run_renderer_request_via_blorp request_json =
                  (String.trim (output ^ stderr_output))
                  kept_request
                  (bridge_error_excerpt request_json)))
+
+let run_renderer_request_via_blorp request_json =
+  run_request_via_blorp_binary renderer_bridge_binary request_json
+
+let run_parser_request_via_blorp request_json =
+  run_request_via_blorp_binary parser_bridge_binary request_json
+
+let run_cli_request_via_blorp ?version args =
+  run_parser_request_via_blorp (cli_run_request_json ?version args)
 
 let render_cache_key ~renderer ~op args =
   let buf = Buffer.create 128 in
@@ -965,6 +2259,61 @@ let run_core_pipeline_core_json_exn ~stage core_json =
   match response_result response_json (json_response_field "core") with
   | Ok transformed_core -> transformed_core
   | Error (_, message) -> invalid_arg message
+
+let parse_source_via_command_exn ~path ~module_name ~text =
+  let response_json =
+    run_parser_request_via_blorp
+      (parse_source_request_json ~path ~module_name ~text)
+  in
+  match parse_source_response_json response_json with
+  | Ok (ParsedSource parsed) ->
+      Lexer.restore_comments parsed.parsed_comments;
+      parsed.parsed_program
+  | Ok (ParseSourceDiagnostics diagnostics) ->
+      let message =
+        diagnostics |> List.map (fun err -> err.Ast.message) |> String.concat "\n"
+      in
+      invalid_arg message
+  | Error (_, message) -> invalid_arg message
+
+let parse_source_file_via_command_exn ~path ~module_name =
+  let response_json =
+    run_parser_request_via_blorp
+      (parse_source_file_request_json ~path ~module_name)
+  in
+  match parse_source_response_json response_json with
+  | Ok (ParsedSource parsed) ->
+      Lexer.restore_comments parsed.parsed_comments;
+      parsed.parsed_program
+  | Ok (ParseSourceDiagnostics diagnostics) ->
+      let message =
+        diagnostics |> List.map (fun err -> err.Ast.message) |> String.concat "\n"
+      in
+      invalid_arg message
+  | Error (_, message) -> invalid_arg message
+
+let parse_source_via_command ~path ~module_name ~text =
+  let response_json =
+    run_parser_request_via_blorp
+      (parse_source_request_json ~path ~module_name ~text)
+  in
+  parse_source_response_json response_json
+
+let parse_sources_via_command items =
+  let response_json =
+    run_parser_request_via_blorp (parse_sources_request_json items)
+  in
+  parse_sources_response_json response_json
+
+let parse_source_file_via_command ~path ~module_name =
+  let response_json =
+    run_parser_request_via_blorp
+      (parse_source_file_request_json ~path ~module_name)
+  in
+  parse_source_response_json response_json
+
+let cli_run_via_command ?version args =
+  run_cli_request_via_blorp ?version args |> cli_run_response_json
 
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer

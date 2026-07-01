@@ -1,512 +1,686 @@
 import:
-	slice: StringSlice, from_string
 	string: is_alpha, is_digit, is_whitespace
 
 
+private NO_PROGRESS_MESSAGE: String = "parser succeeded without consuming input"
+
+private EXPECTED_END: String = "end of input"
+
+private EXPECTED_CHARACTER: String = "character"
+
+private EXPECTED_DIGIT: String = "digit"
+
+private EXPECTED_LETTER: String = "letter"
+
+private EXPECTED_WHITESPACE: String = "whitespace"
+
+
 -- Parser Combinator Library
--- Functional parsing with composable parsers
--- Parse result: either success with value and remaining input, or failure with message
+--
+-- Parsers work over a stable Source and explicit Cursor. Primitive parsers
+-- return spans instead of substrings so scanning does not allocate unless the
+-- caller asks for text with span_text.
+record Source {
+	text: String,
+	path: Option[String]
+}
+
+
+record Cursor {
+	offset: Int,
+	line: Int,
+	column: Int
+}
+
+
+record Span {
+	start_offset: Int,
+	start_line: Int,
+	start_column: Int,
+	end_offset: Int,
+	end_line: Int,
+	end_column: Int
+}
+
+
+record ParseError {
+	span: Span,
+	message: String,
+	expected: List[String],
+	committed: Bool
+}
+
+
 union ParseResult[T]:
-	Success(T, String)
-	Failure(String, String)
+	Parsed(T, Cursor)
+	ParseFailed(ParseError)
+
+
+type alias Parser[T] = pure (Source, Cursor) -> ParseResult[T]
+
+
+pure func source(text: String) -> Source:
+	{
+		text = text,
+		path = None
+	}
+
+
+pure func source_with_path(text: String, path: String) -> Source:
+	{
+		text = text,
+		path = Some(path)
+	}
+
+
+pure func start(_: Source) -> Cursor:
+	{
+		offset = 0,
+		line = 1,
+		column = 1
+	}
+
+
+pure func cursor_offset(cursor: Cursor) -> Int:
+	cursor.offset
+
+
+pure func cursor_line(cursor: Cursor) -> Int:
+	cursor.line
+
+
+pure func cursor_column(cursor: Cursor) -> Int:
+	cursor.column
+
+
+pure func make_span(start_cursor: Cursor, end_cursor: Cursor) -> Span:
+	{
+		start_offset = start_cursor.offset,
+		start_line = start_cursor.line,
+		start_column = start_cursor.column,
+		end_offset = end_cursor.offset,
+		end_line = end_cursor.line,
+		end_column = end_cursor.column
+	}
+
+
+pure func span_start(span: Span) -> Cursor:
+	{
+		offset = span.start_offset,
+		line = span.start_line,
+		column = span.start_column
+	}
+
+
+pure func span_end(span: Span) -> Cursor:
+	{
+		offset = span.end_offset,
+		line = span.end_line,
+		column = span.end_column
+	}
+
+
+pure func span_start_offset(span: Span) -> Int:
+	span.start_offset
+
+
+pure func span_end_offset(span: Span) -> Int:
+	span.end_offset
+
+
+pure func at_end(src: Source, cursor: Cursor) -> Bool:
+	cursor.offset >= src.text.length()
+
+
+pure func peek(src: Source, cursor: Cursor) -> Option[Char]:
+	src.text.get(cursor.offset)
+
+
+pure func advance(src: Source, cursor: Cursor) -> Cursor:
+	match peek(src, cursor):
+		Some('\n'):
+			{
+				offset = cursor.offset + 1,
+				line = cursor.line + 1,
+				column = 1
+			}
+		Some(_):
+			{
+				offset = cursor.offset + 1,
+				line = cursor.line,
+				column = cursor.column + 1
+			}
+		None:
+			cursor
+
+
+pure func cursor_at(src: Source, offset: Int) -> Cursor:
+	target: Int = if offset < 0:
+		0
+	else if offset > src.text.length():
+		src.text.length()
+	else:
+		offset
+
+	var cursor: Cursor = start(src)
+
+	while cursor.offset < target:
+		cursor = advance(src, cursor)
+
+	cursor
+
+
+pure func span_text(src: Source, span: Span) -> String:
+	src.text.substring(span.start_offset, span.end_offset - span.start_offset)
+
+
+private pure func empty_span(cursor: Cursor) -> Span:
+	make_span(cursor, cursor)
+
+
+private pure func span_from(start_cursor: Cursor, end_cursor: Cursor) -> Span:
+	make_span(start_cursor, end_cursor)
+
+
+private pure func expected_list(expected: String) -> List[String]:
+	if expected.length() == 0:
+		[]
+	else:
+		[expected]
+
+
+pure func expected_contains(error: ParseError, expected: String) -> Bool:
+	error.expected.contains(expected)
+
+
+private pure func expected_message(expected: String) -> String:
+	if expected.length() == 0:
+		"parse error"
+	else:
+		"expected " + expected
+
+
+private pure func error_at(cursor: Cursor, expected: String) -> ParseError:
+	{
+		span = empty_span(cursor),
+		message = expected_message(expected),
+		expected = expected_list(expected),
+		committed = False
+	}
+
+
+private pure func message_error(cursor: Cursor, message: String) -> ParseError:
+	{
+		span = empty_span(cursor),
+		message = message,
+		expected = [],
+		committed = False
+	}
+
+
+private pure func add_expected_unique(items: List[String], expected: String) -> List[String]:
+	if expected.length() == 0 or items.contains(expected):
+		items
+	else:
+		items.append(expected)
+
+
+private pure func merge_expected(left: List[String], right: List[String]) -> List[String]:
+	var merged: List[String] = left
+
+	for item in right:
+		merged = add_expected_unique(merged, item)
+
+	merged
+
+
+private pure func merge_errors(first: ParseError, second: ParseError) -> ParseError:
+	if first.span.start_offset > second.span.start_offset:
+		first
+	else if second.span.start_offset > first.span.start_offset:
+		second
+	else:
+		message: String = if first.message.length() > 0:
+			first.message
+		else:
+			second.message
+
+		{
+			span = first.span,
+			message = message,
+			expected = merge_expected(first.expected, second.expected),
+			committed = first.committed or second.committed
+		}
+
+
+private pure func expected_summary(expected: List[String]) -> String:
+	if expected.length() == 0:
+		""
+	else:
+		var text: String = ""
+		var i: Int = 0
+
+		while i < expected.length():
+			if i == 0:
+				text = expected.get_or(i, "")
+			else:
+				text = text + ", " + expected.get_or(i, "")
+
+			i += 1
+
+		text
+
+
+pure func format_error(src: Source, error: ParseError) -> String:
+	location_prefix: String = match src.path:
+		Some(path):
+			path + ":"
+		None:
+			""
+
+	expected: String = expected_summary(error.expected)
+	duplicate_single_expected: Bool = (
+		error.expected.length() == 1
+		and error.message == expected_message(error.expected.get_or(0, ""))
+	)
+
+	expected_part: String = if expected.length() == 0 or duplicate_single_expected:
+		""
+	else:
+		" expected " + expected
+
+	location: String = "line " + error.span.start_line.to_string() + ", column " + error.span.start_column.to_string()
+	location_prefix + location + ": " + error.message + expected_part
 
 
 pure func is_success[T](result: ParseResult[T]) -> Bool:
 	match result:
-		Success(_, _):
+		Parsed(_, _):
 			True
-		Failure(_, _):
+		ParseFailed(_):
 			False
 
 
-pure func get_value[T](result: ParseResult[T]) -> Option[T]:
+pure func parsed_value[T](result: ParseResult[T]) -> Option[T]:
 	match result:
-		Success(v, _):
-			Some(v)
-		Failure(_, _):
+		Parsed(value, _):
+			Some(value)
+		ParseFailed(_):
 			None
 
 
-pure func get_remaining[T](result: ParseResult[T]) -> Option[String]:
+pure func parsed_cursor[T](result: ParseResult[T]) -> Option[Cursor]:
 	match result:
-		Success(_, r):
-			Some(r)
-		Failure(_, _):
+		Parsed(_, cursor):
+			Some(cursor)
+		ParseFailed(_):
 			None
 
 
-pure func get_error[T](result: ParseResult[T]) -> Option[String]:
+pure func parse_failed[T](result: ParseResult[T]) -> Option[ParseError]:
 	match result:
-		Success(_, _):
+		Parsed(_, _):
 			None
-		Failure(e, _):
-			Some(e)
+		ParseFailed(error):
+			Some(error)
 
 
-pure func map[A, B](
-	result: ParseResult[A],
-	f: pure (A) -> B,
-) -> ParseResult[B]:
-	match result:
-		Success(v, rest):
-			Success(f(v), rest)
-		Failure(e, pos):
-			Failure(e, pos)
+pure func run[T](parser: Parser[T], src: Source) -> Result[T, ParseError]:
+	match parser(src, start(src)):
+		Parsed(value, _):
+			Ok(value)
+		ParseFailed(error):
+			Err(error)
 
 
-pure func flat_map[A, B](
-	result: ParseResult[A],
-	f: pure (A, String) -> ParseResult[B],
-) -> ParseResult[B]:
-	match result:
-		Success(v, rest):
-			f(v, rest)
-		Failure(e, pos):
-			Failure(e, pos)
-
-
-pure func is_letter(c: Char) -> Bool:
-	is_alpha(c)
-
-
-pure func char_to_string(c: Char) -> String:
-	from_char(c)
-
-
-pure func any_char(input: String) -> ParseResult[Char]:
-	match input.get(0):
+pure func any_char(src: Source, cursor: Cursor) -> ParseResult[Char]:
+	match peek(src, cursor):
 		Some(c):
-			Success(
+			Parsed(
 				c,
-				input.substring(1, input.length()),
+				advance(src, cursor),
 			)
 		None:
-			Failure("unexpected end of input", input)
+			ParseFailed(error_at(cursor, EXPECTED_CHARACTER))
 
 
 pure func satisfy(
+	src: Source,
+	cursor: Cursor,
+	expected: String,
 	pred: pure (Char) -> Bool,
-	input: String,
 ) -> ParseResult[Char]:
-	match input.get(0):
+	match peek(src, cursor):
 		Some(c):
 			if pred(c):
-				Success(
+				Parsed(
 					c,
-					input.substring(1, input.length()),
+					advance(src, cursor),
 				)
 			else:
-				Failure("character did not match", input)
+				ParseFailed(error_at(cursor, expected))
 		None:
-			Failure("unexpected end of input", input)
+			ParseFailed(error_at(cursor, expected))
 
 
-pure func char(expected: Char, input: String) -> ParseResult[Char]:
-	match input.get(0):
+private pure func char_label(expected: Char) -> String:
+	"'" + expected.to_string() + "'"
+
+
+pure func char(src: Source, cursor: Cursor, expected: Char) -> ParseResult[Char]:
+	match peek(src, cursor):
 		Some(c):
 			if c == expected:
-				Success(
+				Parsed(
 					c,
-					input.substring(1, input.length()),
+					advance(src, cursor),
 				)
 			else:
-				Failure("expected character", input)
+				ParseFailed(error_at(cursor, char_label(expected)))
 		None:
-			Failure("unexpected end of input", input)
+			ParseFailed(error_at(cursor, char_label(expected)))
 
 
-pure func literal(expected: String, input: String) -> ParseResult[String]:
-	if input.starts_with(expected):
-		Success(
-			expected,
-			input.substring(expected.length(), input.length()),
+private pure func advance_count(src: Source, cursor: Cursor, count: Int) -> Cursor:
+	var current: Cursor = cursor
+	var remaining: Int = count
+
+	while remaining > 0:
+		current = advance(src, current)
+		remaining -= 1
+
+	current
+
+
+pure func literal(src: Source, cursor: Cursor, expected: String) -> ParseResult[Span]:
+	if src.text.substring(cursor.offset, expected.length()) == expected:
+		end_cursor: Cursor = advance_count(src, cursor, expected.length())
+		Parsed(
+			span_from(cursor, end_cursor),
+			end_cursor,
 		)
 	else:
-		Failure("expected string", input)
-
-
-pure func digit(input: String) -> ParseResult[Char]:
-	satisfy(is_digit, input)
-
-
-pure func letter(input: String) -> ParseResult[Char]:
-	satisfy(is_letter, input)
-
-
-pure func whitespace(input: String) -> ParseResult[Char]:
-	satisfy(is_whitespace, input)
-
-
-pure func or_else[A](
-	p1: pure (String) -> ParseResult[A],
-	p2: pure (String) -> ParseResult[A],
-	input: String,
-) -> ParseResult[A]:
-	match p1(input):
-		Success(v, rest):
-			Success(v, rest)
-		Failure(_, _):
-			p2(input)
-
-
-pure func many[A](
-	parser: pure (String) -> ParseResult[A],
-	input: String,
-) -> ParseResult[List[A]]:
-	var results: List[A] = []
-	var current: String = input
-	var done: Bool = False
-
-	while not done:
-		match parser(current):
-			Success(v, rest):
-				results = results.append(v)
-				current = rest
-			Failure(_, _):
-				done = True
-
-	Success(results, current)
-
-
-pure func many1[A](
-	parser: pure (String) -> ParseResult[A],
-	input: String,
-) -> ParseResult[List[A]]:
-	match parser(input):
-		Success(first, rest):
-			var results: List[A] = [first]
-			var current: String = rest
-			var done: Bool = False
-
-			while not done:
-				match parser(current):
-					Success(v, rest2):
-						results = results.append(v)
-						current = rest2
-					Failure(_, _):
-						done = True
-
-			Success(results, current)
-		Failure(e, pos):
-			fail: ParseResult[List[A]] = Failure(e, pos)
-			fail
-
-
-pure func skip_whitespace(input: String) -> ParseResult[String]:
-	var current: String = input
-	var cont: Bool = True
-
-	while cont:
-		match current.get(0):
-			Some(c):
-				if is_whitespace(c):
-					current = current.substring(1, current.length())
-				else:
-					cont = False
-			None:
-				cont = False
-
-	Success("", current)
+		ParseFailed(error_at(cursor, "\"" + expected + "\""))
 
 
 pure func take_while(
+	src: Source,
+	cursor: Cursor,
 	pred: pure (Char) -> Bool,
-	input: String,
-) -> ParseResult[String]:
-	var result: String = ""
-	var i: Int = 0
-	var cont: Bool = True
+) -> ParseResult[Span]:
+	var current: Cursor = cursor
+	var done: Bool = False
 
-	while cont:
-		match input.get(i):
+	while not done:
+		match peek(src, current):
 			Some(c):
 				if pred(c):
-					result += from_char(c)
-					i += 1
+					current = advance(src, current)
 				else:
-					cont = False
+					done = True
 			None:
-				cont = False
+				done = True
 
-	Success(
-		result,
-		input.substring(i, input.length()),
+	Parsed(
+		span_from(cursor, current),
+		current,
 	)
 
 
 pure func take_while1(
+	src: Source,
+	cursor: Cursor,
+	expected: String,
 	pred: pure (Char) -> Bool,
-	input: String,
-) -> ParseResult[String]:
-	match input.get(0):
-		Some(c):
-			if pred(c):
-				take_while(pred, input)
+) -> ParseResult[Span]:
+	match take_while(src, cursor, pred):
+		Parsed(span, next):
+			if next.offset > cursor.offset:
+				Parsed(span, next)
 			else:
-				Failure("expected at least one matching character", input)
-		None:
-			Failure("expected at least one matching character", input)
+				ParseFailed(error_at(cursor, expected))
+		ParseFailed(error):
+			ParseFailed(error)
 
 
-pure func then[A, B](
-	p1: pure (String) -> ParseResult[A],
-	p2: pure (String) -> ParseResult[B],
-	input: String,
-) -> ParseResult[B]:
-	p1(input).flat_map(pure func(_: A, rest: String): p2(rest))
+pure func digit(src: Source, cursor: Cursor) -> ParseResult[Char]:
+	satisfy(src, cursor, EXPECTED_DIGIT, is_digit)
 
 
-pure func skip[A, B](
-	p1: pure (String) -> ParseResult[A],
-	p2: pure (String) -> ParseResult[B],
-	input: String,
-) -> ParseResult[A]:
-	match p1(input):
-		Success(v, rest):
-			match p2(rest):
-				Success(_, rest2):
-					Success(v, rest2)
-				Failure(e, pos):
-					Failure(e, pos)
-		Failure(e, pos):
-			Failure(e, pos)
+pure func letter(src: Source, cursor: Cursor) -> ParseResult[Char]:
+	satisfy(src, cursor, EXPECTED_LETTER, is_alpha)
 
 
-func between[A, O, C](
-	open: pure (String) -> ParseResult[O],
-	p: pure (String) -> ParseResult[A],
-	close: pure (String) -> ParseResult[C],
-	input: String,
-) -> ParseResult[A]:
-	match open(input):
-		Success(_, rest1):
-			match p(rest1):
-				Success(v, rest2):
-					match close(rest2):
-						Success(_, rest3):
-							Success(v, rest3)
-						Failure(e, pos):
-							Failure(e, pos)
-				Failure(e, pos):
-					Failure(e, pos)
-		Failure(e, pos):
-			Failure(e, pos)
+pure func whitespace(src: Source, cursor: Cursor) -> ParseResult[Char]:
+	satisfy(src, cursor, EXPECTED_WHITESPACE, is_whitespace)
 
 
-pure func sep_by[A, S](
-	item: pure (String) -> ParseResult[A],
-	sep: pure (String) -> ParseResult[S],
-	input: String,
-) -> ParseResult[List[A]]:
-	match item(input):
-		Failure(_, _):
-			empty: List[A] = []
-			Success(empty, input)
-		Success(first, rest):
-			var results: List[A] = [first]
-			var current: String = rest
-			var done: Bool = False
+pure func skip_whitespace(src: Source, cursor: Cursor) -> ParseResult[Span]:
+	take_while(src, cursor, is_whitespace)
 
-			while not done:
-				match sep(current):
-					Success(_, sep_rest):
-						match item(sep_rest):
-							Success(v, item_rest):
-								results = results.append(v)
-								current = item_rest
-							Failure(_, _):
-								done = True
-					Failure(_, _):
+
+pure func end_of_input(src: Source, cursor: Cursor) -> ParseResult[Cursor]:
+	if at_end(src, cursor):
+		Parsed(cursor, cursor)
+	else:
+		ParseFailed(error_at(cursor, EXPECTED_END))
+
+
+pure func label[T](parser: Parser[T], expected: String) -> Parser[T]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[T]:
+		match parser(src, cursor):
+			Parsed(value, next):
+				Parsed(value, next)
+			ParseFailed(error):
+				ParseFailed({ error |
+						message = expected_message(expected),
+						expected = expected_list(expected)
+					})
+
+
+pure func commit[T](parser: Parser[T]) -> Parser[T]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[T]:
+		match parser(src, cursor):
+			Parsed(value, next):
+				Parsed(value, next)
+			ParseFailed(error):
+				ParseFailed({ error | committed = True })
+
+
+pure func or_else[T](first: Parser[T], second: Parser[T]) -> Parser[T]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[T]:
+		match first(src, cursor):
+			Parsed(value, next):
+				Parsed(value, next)
+			ParseFailed(first_error):
+				if first_error.committed:
+					ParseFailed(first_error)
+				else:
+					match second(src, cursor):
+						Parsed(value, next):
+							Parsed(value, next)
+						ParseFailed(second_error):
+							ParseFailed(merge_errors(first_error, second_error))
+
+
+pure func optional[T](parser: Parser[T]) -> Parser[Option[T]]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[Option[T]]:
+		match parser(src, cursor):
+			Parsed(value, next):
+				Parsed(Some(value), next)
+			ParseFailed(error):
+				if error.committed:
+					ParseFailed(error)
+				else:
+					Parsed(None, cursor)
+
+
+private pure func no_progress_error(cursor: Cursor) -> ParseError:
+	message_error(cursor, NO_PROGRESS_MESSAGE)
+
+
+pure func many[T](parser: Parser[T]) -> Parser[List[T]]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[List[T]]:
+		var items: List[T] = []
+		var current: Cursor = cursor
+		var done: Bool = False
+		var failed: Bool = False
+		var failure: ParseError = no_progress_error(cursor)
+
+		while not done:
+			match parser(src, current):
+				Parsed(value, next):
+					if next.offset <= current.offset:
+						failed = True
+						failure = no_progress_error(current)
 						done = True
+					else:
+						items = items.append(value)
+						current = next
+				ParseFailed(error):
+					if error.committed:
+						failed = True
+						failure = error
 
-			Success(results, current)
+					done = True
 
-
-pure func optional[A](
-	parser: pure (String) -> ParseResult[A],
-	input: String,
-) -> ParseResult[Option[A]]:
-	match parser(input):
-		Success(v, rest):
-			Success(Some(v), rest)
-		Failure(_, _):
-			result: ParseResult[Option[A]] = Success(None, input)
-			result
-
-
-pure func end_of_input(input: String) -> ParseResult[String]:
-	if input.length() == 0:
-		Success("", input)
-	else:
-		Failure("expected end of input", input)
+		if failed:
+			ParseFailed(failure)
+		else:
+			Parsed(items, current)
 
 
-union SliceParseResult[T]:
-	SliceSuccess(T, StringSlice)
-	SliceFailure(String, StringSlice)
-
-
-pure func slice_is_success[T](result: SliceParseResult[T]) -> Bool:
-	match result:
-		SliceSuccess(_, _):
-			True
-		SliceFailure(_, _):
-			False
-
-
-pure func slice_get_value[T](result: SliceParseResult[T]) -> Option[T]:
-	match result:
-		SliceSuccess(v, _):
-			Some(v)
-		SliceFailure(_, _):
-			None
-
-
-func slice_map[A, B](
-	result: SliceParseResult[A],
-	f: (A) -> B,
-) -> SliceParseResult[B]:
-pure func slice_map[A, B](
-	result: SliceParseResult[A],
-	f: pure (A) -> B,
-) -> SliceParseResult[B]:
-	match result:
-		SliceSuccess(v, rest):
-			SliceSuccess(f(v), rest)
-		SliceFailure(e, pos):
-			SliceFailure(e, pos)
-
-
-pure func any_char_slice(input: StringSlice) -> SliceParseResult[Char]:
-	match input.get(0):
-		Some(c):
-			SliceSuccess(
-				c,
-				input.substring(1, input.length() - 1),
-			)
-		None:
-			SliceFailure("unexpected end of input", input)
-
-
-pure func satisfy_slice(
-	pred: pure (Char) -> Bool,
-	input: StringSlice,
-) -> SliceParseResult[Char]:
-	match input.get(0):
-		Some(c):
-			if pred(c):
-				SliceSuccess(
-					c,
-					input.substring(1, input.length() - 1),
-				)
-			else:
-				SliceFailure("character did not match", input)
-		None:
-			SliceFailure("unexpected end of input", input)
-
-
-pure func char_slice(expected: Char, input: StringSlice) -> SliceParseResult[Char]:
-	match input.get(0):
-		Some(c):
-			if c == expected:
-				SliceSuccess(
-					c,
-					input.substring(1, input.length() - 1),
-				)
-			else:
-				SliceFailure("expected character", input)
-		None:
-			SliceFailure("unexpected end of input", input)
-
-
-pure func literal_slice(expected: String, input: StringSlice) -> SliceParseResult[StringSlice]:
-	if input.starts_with(expected):
-		matched: StringSlice = input.substring(0, expected.length())
-		SliceSuccess(
-			matched,
-			input.substring(expected.length(), input.length() - expected.length()),
-		)
-	else:
-		SliceFailure("expected string", input)
-
-
-pure func take_while_slice(
-	pred: pure (Char) -> Bool,
-	input: StringSlice,
-) -> SliceParseResult[StringSlice]:
-	var i: Int = 0
-	slen: Int = input.length()
-	var cont: Bool = True
-
-	while cont:
-		match input.get(i):
-			Some(c):
-				if pred(c):
-					i += 1
+pure func many1[T](parser: Parser[T]) -> Parser[List[T]]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[List[T]]:
+		match parser(src, cursor):
+			Parsed(first, after_first):
+				if after_first.offset <= cursor.offset:
+					ParseFailed(no_progress_error(cursor))
 				else:
-					cont = False
-			None:
-				cont = False
+					var items: List[T] = [first]
+					var current: Cursor = after_first
+					var done: Bool = False
+					var failed: Bool = False
+					var failure: ParseError = no_progress_error(cursor)
 
-	matched: StringSlice = input.substring(0, i)
-	rest: StringSlice = input.substring(i, slen - i)
-	SliceSuccess(matched, rest)
+					while not done:
+						match parser(src, current):
+							Parsed(value, next):
+								if next.offset <= current.offset:
+									failed = True
+									failure = no_progress_error(current)
+									done = True
+								else:
+									items = items.append(value)
+									current = next
+							ParseFailed(error):
+								if error.committed:
+									failed = True
+									failure = error
+
+								done = True
+
+					if failed:
+						ParseFailed(failure)
+					else:
+						Parsed(items, current)
+			ParseFailed(error):
+				ParseFailed(error)
 
 
-pure func take_while1_slice(
-	pred: pure (Char) -> Bool,
-	input: StringSlice,
-) -> SliceParseResult[StringSlice]:
-	match input.get(0):
-		Some(c):
-			if pred(c):
-				take_while_slice(pred, input)
-			else:
-				SliceFailure("expected at least one matching character", input)
-		None:
-			SliceFailure("expected at least one matching character", input)
+pure func then[A, B](first: Parser[A], second: Parser[B]) -> Parser[B]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[B]:
+		match first(src, cursor):
+			Parsed(_, after_first):
+				second(src, after_first)
+			ParseFailed(error):
+				ParseFailed(error)
 
 
-pure func skip_whitespace_slice(input: StringSlice) -> SliceParseResult[StringSlice]:
-	var i: Int = 0
-	slen: Int = input.length()
-	var cont: Bool = True
+pure func skip[A, B](first: Parser[A], second: Parser[B]) -> Parser[A]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[A]:
+		match first(src, cursor):
+			Parsed(value, after_first):
+				match second(src, after_first):
+					Parsed(_, after_second):
+						Parsed(value, after_second)
+					ParseFailed(error):
+						ParseFailed(error)
+			ParseFailed(error):
+				ParseFailed(error)
 
-	while cont:
-		match input.get(i):
-			Some(c):
-				if is_whitespace(c):
-					i += 1
+
+pure func between[T, A, B](
+	open_parser: Parser[A],
+	item_parser: Parser[T],
+	close_parser: Parser[B],
+) -> Parser[T]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[T]:
+		match open_parser(src, cursor):
+			Parsed(_, after_open):
+				match item_parser(src, after_open):
+					Parsed(value, after_item):
+						match close_parser(src, after_item):
+							Parsed(_, after_close):
+								Parsed(value, after_close)
+							ParseFailed(error):
+								ParseFailed(error)
+					ParseFailed(error):
+						ParseFailed(error)
+			ParseFailed(error):
+				ParseFailed(error)
+
+
+pure func sep_by[T, S](item: Parser[T], sep: Parser[S]) -> Parser[List[T]]:
+	pure func(src: Source, cursor: Cursor) -> ParseResult[List[T]]:
+		match item(src, cursor):
+			ParseFailed(error):
+				if error.committed:
+					ParseFailed(error)
 				else:
-					cont = False
-			None:
-				cont = False
+					empty: List[T] = []
+					Parsed(empty, cursor)
+			Parsed(first, after_first):
+				if after_first.offset <= cursor.offset:
+					ParseFailed(no_progress_error(cursor))
+				else:
+					var items: List[T] = [first]
+					var current: Cursor = after_first
+					var done: Bool = False
+					var failed: Bool = False
+					var failure: ParseError = no_progress_error(cursor)
 
-	SliceSuccess(
-		input.substring(0, i),
-		input.substring(i, slen - i),
-	)
+					while not done:
+						match sep(src, current):
+							Parsed(_, after_sep):
+								if after_sep.offset <= current.offset:
+									failed = True
+									failure = no_progress_error(current)
+									done = True
+								else:
+									match item(src, after_sep):
+										Parsed(value, after_item):
+											if after_item.offset <= after_sep.offset:
+												failed = True
+												failure = no_progress_error(after_sep)
+												done = True
+											else:
+												items = items.append(value)
+												current = after_item
+										ParseFailed(error):
+											if error.committed:
+												failed = True
+												failure = error
 
+											done = True
+							ParseFailed(error):
+								if error.committed:
+									failed = True
+									failure = error
 
-pure func slice_result_to_string_result[T](result: SliceParseResult[T]) -> ParseResult[T]:
-	match result:
-		SliceSuccess(v, rest):
-			Success(v, rest.to_string())
-		SliceFailure(e, pos):
-			Failure(e, pos.to_string())
+								done = True
 
-
-pure func to_slice(s: String) -> StringSlice:
-	from_string(s)
-
-
-pure func digit_slice(input: StringSlice) -> SliceParseResult[Char]:
-	satisfy_slice(is_digit, input)
-
-
-pure func letter_slice(input: StringSlice) -> SliceParseResult[Char]:
-	satisfy_slice(is_letter, input)
-
-
-pure func whitespace_slice(input: StringSlice) -> SliceParseResult[Char]:
-	satisfy_slice(is_whitespace, input)
+					if failed:
+						ParseFailed(failure)
+					else:
+						Parsed(items, current)

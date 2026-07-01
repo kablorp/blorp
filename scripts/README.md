@@ -9,9 +9,10 @@ lower-level test runners directly.
 `scripts/test` is the main local test entrypoint.
 
 ```bash
-scripts/test                    # all gates
+scripts/test                    # default local gates
 scripts/test compiler-unit      # compiler-internal OCaml/Alcotest tests
-scripts/test compiler           # compiler fixtures, codegen audit, compiler/blorp TestSuites
+scripts/test compiler           # fast compiler surface fixtures
+scripts/test compiler-deep      # generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
@@ -52,7 +53,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial`
+- `scripts/test --serial compiler-unit compiler compiler-deep runtime leak doctest cli`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -109,7 +110,7 @@ locked dependencies rebuilds the switch once.
 
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
 and `scripts/premerge-gate` use it automatically so concurrent local runs do not
-race on Dune state, generated runtime caches, or formatter/std embedding.
+race on Dune state, generated runtime caches, or std embedding.
 
 Manual use:
 
@@ -117,20 +118,54 @@ Manual use:
 scripts/with-build-lock make quality
 ```
 
-## Compiler Bridge Cache
+## Compiler Bridge Helpers
 
-Renderer requests use a compiled `compiler/blorp/compiler_bridge_cli.brp`
-helper. The helper binary is cached under `$HOME/.cache/blorp/compiler-bridge`,
-or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when set. The cache key is derived from the
-production `compiler/blorp` source tree, the pinned compiler bootstrap command,
-the C compiler identity, and the OS.
+Backend renderer/Core requests use a compiled
+`compiler/blorp/compiler_bridge_cli.brp` helper. Parser requests use
+`compiler/blorp/compiler_parser_bridge_cli.brp`, which carries the parser-heavy
+imports separately so the backend helper stays bootstrap-small.
 
-Compiler-owned Blorp sources are compiled with `scripts/blorp-compiler-bootstrap`
-by default, not the just-built workspace `./blorp`. That wrapper downloads and
-verifies the pinned dev release `dev-33e00c2b94df` into
+`scripts/test` prepares both helper binaries once at startup for gates that run
+Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, and `cli`).
+Pure `compiler-unit` runs skip this setup. When preparation is needed, the
+harness runs it after building `./blorp` and before std preflight. It writes the
+helpers into a run-local temporary directory, then exports
+`BLORP_COMPILER_RENDERER_BRIDGE_BIN` and `BLORP_COMPILER_PARSER_BRIDGE_BIN` so
+preflight and every gate execute those prepared helpers directly. Individual
+tests should not compile either helper on first use; the harness also sets
+`BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
+instead of falling back to lazy helper compilation.
+
+Ad-hoc compiler invocations still have a fallback helper cache under
+`$HOME/.cache/blorp/compiler-bridge`, or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when
+set. The cache key is derived from the production `compiler/blorp` source tree,
+the helper entrypoint, the Blorp executable used to compile the helper, the C
+compiler identity, and the OS. Cold cache construction is protected by a per-key
+file lock, so parallel non-harness compiler processes do not compile the same
+helper more than once.
+
+The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
+explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
+which downloads and verifies the pinned dev release `dev-33e00c2b94df` into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Update the tag, version, and target checksums in that script together
-when intentionally moving the compiler bootstrap forward.
+when intentionally moving the fallback bootstrap forward.
+
+Both helper builds set `BLORP_COMPILER_RENDERER_HELPER=1` and the private
+`BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER=1` bootstrap marker. The marker is
+converted into a session-local parser mode when the fresh compiler session is
+created; helper compilation never depends on either bridge helper already
+existing. Normal compiler source parsing does not read the old
+`BLORP_FRONTEND_PARSER` selector. The bootstrap wrapper sets that retired knob
+only for pinned external bootstrap binaries that still read it.
+
+When helper preparation is needed, `scripts/test` resolves
+`BLORP_COMPILER_BRIDGE_BIN` to the verified pinned bootstrap binary path when no
+explicit override is present. The startup prepare step uses that pinned compiler
+to build the two helpers. Set
+`BLORP_COMPILER_BRIDGE_STARTUP_DIR` to keep the prepared helper binaries in a
+specific directory for inspection; otherwise the run-local directory is removed
+when the test script exits.
 
 Useful compiler bootstrap commands:
 
@@ -141,9 +176,9 @@ scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/compiler_bri
 ```
 
 `BLORP_COMPILER_BRIDGE_BIN` remains the explicit escape hatch for testing or
-bisecting with another Blorp executable. It selects the compiler used for the
-top-level bridge build; bridge builds clear that override for nested bridge
-requests so an override cannot recursively select itself.
+bisecting with another Blorp executable. Backend helper builds clear that
+override for nested bridge requests so an override cannot recursively select
+itself.
 
 ## Drift Checks
 

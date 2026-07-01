@@ -10,6 +10,40 @@ backend route owns a real Core tail: `compiler_core_resource.brp`,
 `compiler_core_fairness.brp`, `compiler_core_prepare.brp`, then
 `compiler_core_emit.brp`.
 
+The frontend migration has a live hoisted parser path backed by
+`compiler_source.brp`, `compiler_parse_diagnostic.brp`, `compiler_token.brp`,
+`compiler_lexer.brp`, `compiler_parser.brp`, and `compiler_parsed_ast.brp`.
+These modules define pure data-model and helper APIs for Blorp-owned lexing and
+parsing, and the production compiler now routes hoisted source parsing through
+the existing bridge protocol by default. Filesystem-backed compiler parses whose
+supplied source matches the file on disk send path-only parse requests so the
+Blorp parser bridge executable reads the source file before parsing; synthetic parser
+calls still send source text directly.
+Source-preserving callers pass `hoist_nested=false` to retain parser-level
+nested function declarations without selecting a different frontend parser.
+The lexer currently covers the structural token stream, ordinary line comments,
+docstrings, ordinary/raw strings, pipe strings, interpolation payloads, char
+literals, and lambda-body newline behavior inside grouping tokens. The parser
+currently covers an initial function-declaration slice with type parameters,
+parameters, return types, docstrings, purity metadata, declaration diagnostics,
+and a precedence expression core for literals, names, unary/binary/logical
+operators, ranges, calls, fields, subscripts, list literals, tuple expressions,
+record literals, record updates, dict literals, vector/tensor literals,
+indented block bodies, `if`/`else`, simple `match` cases with qualified
+constructor patterns, lambda expressions with optional parameter and return
+annotations, function annotations, qualified type names, `while`, `for`,
+`break`/`continue`, void primaries, local `var`
+declarations, typed bindings, assignments, compound assignments, `?=`
+bindings, builtin function-body markers, bounded generic parameters, dimension
+parameters, tensor array/range/function/tuple types, import blocks, records,
+structs, unions, enums, builtin/resource type declarations, simple type
+aliases, foreign blocks, trait and impl declarations, and top-level var/const
+declarations. Private declaration wrappers are represented explicitly.
+Structured concurrency coverage includes `concurrent:` blocks,
+`for ... concurrently(...)` loops, `detach`, and `select:` blocks. The parser
+also represents `with` resource blocks and `debug:` blocks explicitly. Broader
+parity fixtures remain a later frontend slice.
+
 New work in this directory should usually expand that production path and delete
 or shrink the matching OCaml implementation in the same slice. Avoid adding
 standalone wrapper programs, optional compilation paths, or parallel tool

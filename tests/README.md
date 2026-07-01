@@ -3,12 +3,13 @@
 ## Running Tests
 
 ```bash
-# Run all test gates
+# Run default local test gates
 scripts/test
 
 # Run specific gates
 scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
-scripts/test compiler           # Compiler tests (should_pass/should_fail)
+scripts/test compiler           # Fast compiler surface tests
+scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
@@ -49,7 +50,7 @@ top-level gate summary. `./blorp test` emits the line only when
 ## Terminology
 
 - A **gate** is a top-level validation entry such as `compiler-unit`, `compiler`,
-  `runtime`, `leak`, `doctest`, or `cli`.
+  `compiler-deep`, `runtime`, `leak`, `doctest`, or `cli`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
   `tests: TestSuite` value.

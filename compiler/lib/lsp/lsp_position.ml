@@ -169,6 +169,9 @@ let is_type_name_context_at (text : string) ~(line : int) ~(col : int) =
   | None -> false
   | Some line_text -> is_type_name_context line_text col
 
+let loc_matches_file ?file (loc : loc) =
+  match file with None -> true | Some expected -> loc.loc_file = Some expected
+
 (* ============================================================================
    Expression lookup — find the deepest expression at a cursor position
    ============================================================================ *)
@@ -176,7 +179,8 @@ let is_type_name_context_at (text : string) ~(line : int) ~(col : int) =
 (** Find the expression at a given position (0-based line and column).
     Uses closest-start-position heuristic: walk AST depth-first,
     find the expr with matching line and largest column <= target. *)
-let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
+let find_expr_at ?file (program : program) ~(line : int) ~(col : int) :
+    expr option =
   let target_line = line + 1 in
   let target_col = col + 1 in
   let best = ref None in
@@ -184,7 +188,8 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
 
   let check_expr (e : expr) =
     if
-      e.expr_loc.line = target_line
+      loc_matches_file ?file e.expr_loc
+      && e.expr_loc.line = target_line
       && e.expr_loc.column <= target_col
       && e.expr_loc.column >= !best_col
     then begin
@@ -199,34 +204,27 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
   in
 
   let rec walk_decl (d : decl) =
-    match d.decl_desc with
-    | DFunc fd -> (
-        match func_body_expr_opt fd.func_body with
-        | Some b -> walk_expr b
-        | None -> ())
-    | DVar vd -> walk_expr vd.var_value
-    | DImpl impl ->
-        List.iter
-          (fun fd ->
-            match func_body_expr_opt fd.func_body with
-            | Some b -> walk_expr b
-            | None -> ())
-          impl.impl_methods
-    | DPrivate d2 -> walk_decl d2
-    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
+    if not (loc_matches_file ?file d.decl_loc) then ()
+    else
+      match d.decl_desc with
+      | DFunc fd -> (
+          match func_body_expr_opt fd.func_body with
+          | Some b -> walk_expr b
+          | None -> ())
+      | DVar vd -> walk_expr vd.var_value
+      | DImpl impl ->
+          List.iter
+            (fun fd ->
+              match func_body_expr_opt fd.func_body with
+              | Some b -> walk_expr b
+              | None -> ())
+            impl.impl_methods
+      | DPrivate d2 -> walk_decl d2
+      | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
   in
 
   List.iter walk_decl program;
   !best
-
-(** Find a declaration at a given line (0-based).
-
-    When [file] is provided, declarations from injected or imported programs
-    are intentionally ignored. LSP hover operates on a single open document;
-    same-line declarations from prelude/module loading must not shadow source
-    declarations in that document. *)
-let loc_matches_file ?file (loc : loc) =
-  match file with None -> true | Some expected -> loc.loc_file = Some expected
 
 let loc_same_position a b =
   a.line = b.line && a.column = b.column

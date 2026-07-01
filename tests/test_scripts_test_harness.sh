@@ -45,7 +45,12 @@ chmod +x "$TMP_HARNESS/blorp"
 output_file="$TMP_HARNESS/output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 BLORP_TEST_PREFLIGHT_CACHE=0 bash scripts/test runtime --serial
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_PREFLIGHT_CACHE=0 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test runtime --serial
 ) > "$output_file" 2>&1
 status=$?
 
@@ -74,3 +79,40 @@ if grep -Eq 'Runtime[[:space:]]+PASS' "$output_file"; then
 fi
 
 echo "PASS: scripts/test reports nonzero gate commands as failed"
+
+mkdir -p "$TMP_HARNESS/tests/test_compiler"
+cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh" <<'SH'
+#!/usr/bin/env bash
+echo "Error: simulated infrastructure failure"
+exit 1
+SH
+chmod +x "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh"
+
+compiler_output_file="$TMP_HARNESS/compiler-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_PREFLIGHT_CACHE=0 \
+		bash scripts/test compiler --serial
+) > "$compiler_output_file" 2>&1
+compiler_status=$?
+
+if [ "$compiler_status" -eq 0 ]; then
+	echo "FAIL: scripts/test compiler should exit nonzero when the compiler runner exits nonzero"
+	cat "$compiler_output_file"
+	exit 1
+fi
+
+if ! grep -Fq 'Error: simulated infrastructure failure' "$compiler_output_file"; then
+	echo "FAIL: scripts/test should show capitalized infrastructure errors in failure excerpts"
+	cat "$compiler_output_file"
+	exit 1
+fi
+
+if ! grep -Fq 'compiler gate exited before reporting a summary' "$compiler_output_file"; then
+	echo "FAIL: scripts/test should still report the missing compiler summary"
+	cat "$compiler_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test shows compiler infrastructure failures"

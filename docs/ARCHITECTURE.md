@@ -426,14 +426,6 @@ compiler/
 │   ├── interp_parser.ml   # String interpolation parser
 │   ├── repl.ml            # REPL implementation
 │   ├── line_editor.ml     # Terminal line editor for REPL
-│   ├── fmt/               # Formatter
-│   │   ├── fmt.ml             # Format orchestration and Blorp renderer bridge
-│   │   ├── fmt_comment.ml     # Comment collection helpers
-│   │   ├── fmt_decl_json.ml   # Declaration/program JSON projection
-│   │   ├── fmt_docstring_json.ml # Docstring JSON projection
-│   │   ├── fmt_expr_json.ml   # Expression/type JSON projection
-│   │   ├── fmt_json.ml        # Shared JSON escaping helpers
-│   │   └── fmt_source_span.ml # Formatter source span helpers
 │   └── lsp/               # Language Server Protocol
 │       ├── lsp_server.ml      # LSP main loop
 │       ├── lsp_completion.ml  # Autocomplete

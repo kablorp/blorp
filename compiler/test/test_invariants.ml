@@ -1558,7 +1558,10 @@ let lower_source src =
   Blorp.Lexer.reset_state ();
   let lexbuf = Lexing.from_string src in
   let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-  let program = Blorp.Interp_parser.transform_program program in
+  let program =
+    Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
+      program
+  in
   match Blorp.Typecheck.typecheck_typed program with
   | Ok typed_program -> typed_program
   | Error errors ->

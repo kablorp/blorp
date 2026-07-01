@@ -134,6 +134,10 @@ type parsed_module_cache_entry = {
   parsed_exports : (string * decl) list;
 }
 
+type parser_frontend =
+  | BlorpParserBridge
+  | BootstrapMenhirParser
+
 type source_package = {
   source_package_alias : string;
   source_package_name : string;
@@ -207,6 +211,11 @@ type t = {
       [BLORP_STD], or [blorp.toml]. [None] means std imports use the embedded
       library; tools that need source files should not guess a filesystem std
       path. *)
+  mutable parser_frontend : parser_frontend;
+      (** Source parser used by this session. Normal sessions use the Blorp
+      parser bridge. [BootstrapMenhirParser] is reserved for the private
+      cold-start path that compiles the parser bridge helper before that helper
+      exists. *)
   mutable load_errors : compiler_error list;
       (** Errors accumulated during module loading. Surfaced to the CLI. *)
   mutable prelude_modules_loaded : bool;
@@ -317,6 +326,7 @@ let create () : t =
     std_override_dir = None;
     std_override_active = false;
     std_source_dir = None;
+    parser_frontend = BlorpParserBridge;
     load_errors = [];
     prelude_modules_loaded = false;
     overloads = Hashtbl.create 32;
@@ -336,6 +346,9 @@ let create () : t =
     desugar_counter = 0;
     ssa_mut_counter = 0;
   }
+
+let parser_frontend sess = sess.parser_frontend
+let set_parser_frontend sess frontend = sess.parser_frontend <- frontend
 
 (** Reset per-compilation counters. Called by [Core_pipeline] at the
     start of each compile so fresh-name generation doesn't accumulate

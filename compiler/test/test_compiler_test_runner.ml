@@ -44,8 +44,56 @@ let test_codegen_audit_nonzero_before_cases_counts_runner_failure () =
         (String.concat "; " details)
   | None -> Alcotest.fail "expected runner failure details"
 
+let expectations_for source =
+  Blorp.Compiler_test_runner.parse_expectation_groups source
+  |> Blorp.Compiler_test_runner.expectations_for_blorp_frontend
+
+let check_expectations label expected actual =
+  Alcotest.(check (list string)) (label ^ " exact") expected.Blorp.Compiler_test_runner.exact actual.Blorp.Compiler_test_runner.exact;
+  Alcotest.(check (list string)) (label ^ " contains") expected.contains actual.contains;
+  Alcotest.(check (list string)) (label ^ " not_contains") expected.not_contains actual.not_contains
+
+let expectation ~exact ~contains ~not_contains =
+  { Blorp.Compiler_test_runner.exact; contains; not_contains }
+
+let test_expectations_use_generic_when_frontend_has_no_override () =
+  let source =
+    "-- EXPECT: error: generic\n\
+     -- EXPECT-CONTAINS: shared substring\n\
+     -- EXPECT-NOT-CONTAINS: forbidden substring\n"
+  in
+  let expected =
+    expectation ~exact:[ "error: generic" ]
+      ~contains:[ "shared substring" ]
+      ~not_contains:[ "forbidden substring" ]
+  in
+  check_expectations "blorp fallback" expected
+    (expectations_for source)
+
+let test_expectations_use_blorp_override_when_present () =
+  let source =
+    "-- EXPECT: error: generic\n\
+     -- EXPECT-BLORP: error: blorp-specific\n\
+     -- EXPECT-BLORP-CONTAINS: blorp substring\n\
+     -- EXPECT-BLORP-NOT-CONTAINS: blorp forbidden\n"
+  in
+  let expected =
+    expectation ~exact:[ "error: blorp-specific" ]
+      ~contains:[ "blorp substring" ]
+      ~not_contains:[ "blorp forbidden" ]
+  in
+  check_expectations "blorp override" expected
+    (expectations_for source)
+
 let suite =
   [
+    ( "expectations",
+      [
+        Alcotest.test_case "generic fallback" `Quick
+          test_expectations_use_generic_when_frontend_has_no_override;
+        Alcotest.test_case "blorp override" `Quick
+          test_expectations_use_blorp_override_when_present;
+      ] );
     ( "codegen_audit",
       [
         Alcotest.test_case "nonzero after passes" `Quick

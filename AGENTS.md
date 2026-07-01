@@ -226,12 +226,13 @@ don't want subtle bugs to remain simmering under the surface.
 # Build the compiler (outputs ./blorp in project root)
 make
 
-# Run ALL tests (compiler-unit + compiler + runtime + leak + doctest + cli)
+# Run default local tests (compiler-unit + compiler + runtime + leak + doctest + cli)
 scripts/test
 
 # Run specific test gates
 scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
-scripts/test compiler           # Compiler tests (should_pass/should_fail)
+scripts/test compiler           # Fast compiler surface tests
+scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # Runtime .brp tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
@@ -267,6 +268,7 @@ failure.
 make
 scripts/test compiler-unit
 scripts/test compiler
+scripts/test compiler-deep
 scripts/test runtime
 scripts/test leak
 scripts/test doctest
@@ -479,14 +481,6 @@ compiler/            # OCaml compiler implementation
       codegen_names.ml     # C name mangling (UFCS, modules)
       codegen_types.ml     # Type classification and AST → C type mapping
       codegen_builtins.ml  # Builtin function registry
-    fmt/          # Formatter
-      fmt.ml            # Format orchestration
-      fmt_comment.ml    # Comment preservation
-      fmt_decl_json.ml  # Declaration/program JSON projection
-      fmt_docstring_json.ml  # Docstring JSON projection
-      fmt_expr_json.ml  # Expression/type JSON projection
-      fmt_json.ml       # Shared JSON escaping helpers
-      fmt_source_span.ml  # Formatter source span helpers
     lsp/          # Language Server Protocol
       lsp_server.ml     # LSP main loop
       lsp_completion.ml # Autocomplete
@@ -740,7 +734,7 @@ Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github
 
 **Structure:**
 - `compiler/test/run_tests.ml` — Main runner, aggregates all test suites
-- `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, formatter helpers, and LSP behavior
+- `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, CLI bridges, and LSP behavior
 
 **Running:**
 ```bash

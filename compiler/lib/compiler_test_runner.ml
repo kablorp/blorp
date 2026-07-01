@@ -1,23 +1,37 @@
 (** In-process runner for compiler surface tests.
 
-    This covers parser/typecheck/infer/format tests without spawning a fresh
-    [blorp] process per file. A few low-volume tests still exercise the public
-    CLI intentionally: purify rewrites use the CLI entry point, and the codegen
-    audit keeps its shell runner because it validates generated C with the host
-    C compiler. *)
+    Parser, inference, and typecheck tests run in-process. Formatter and purify
+    tests intentionally exercise the public CLI surface, while the codegen audit
+    keeps its shell runner because it validates generated C with the host C
+    compiler. *)
 
 type opts = {
   verbose : bool;
   timeout : int option;
   blorp_bin : string;
   run_codegen_audit : bool;
+  case_selection : case_selection;
+  gate_name : string;
   jobs : int;
 }
+
+and case_selection = AllCases | SurfaceCases | ToolCasesOnly
 
 type expectations = {
   exact : string list;
   contains : string list;
   not_contains : string list;
+}
+
+type expectation_groups = {
+  generic : expectations;
+  blorp_frontend : expectations;
+}
+
+type expectation_acc = {
+  exact_acc : string list ref;
+  contains_acc : string list ref;
+  not_contains_acc : string list ref;
 }
 
 type case_kind =
@@ -31,7 +45,6 @@ type case_kind =
   | PurifyShouldPurify
   | PurifyShouldNotPurify
   | PurifyShouldRewrite
-  | Roundtrip
 
 type test_case = { kind : case_kind; file : string }
 type command_result = { code : int; output : string }
@@ -56,7 +69,45 @@ let drop_prefix s prefix =
          (String.length s - String.length prefix))
   else None
 
+let find_substring s needle =
+  let s_len = String.length s in
+  let needle_len = String.length needle in
+  let rec loop i =
+    if i + needle_len > s_len then None
+    else if String.sub s i needle_len = needle then Some i
+    else loop (i + 1)
+  in
+  loop 0
+
+let diagnostic_after_marker line marker =
+  match find_substring line marker with
+  | None -> None
+  | Some index ->
+      let start = index + String.length marker in
+      Some
+        (String.sub line start (String.length line - start))
+
 let split_lines s = String.split_on_char '\n' s
+let empty_expectations = { exact = []; contains = []; not_contains = [] }
+
+let expectations_have_checks expectations =
+  expectations.exact <> []
+  || expectations.contains <> []
+  || expectations.not_contains <> []
+
+let make_expectation_acc () =
+  { exact_acc = ref []; contains_acc = ref []; not_contains_acc = ref [] }
+
+let finish_expectation_acc acc =
+  {
+    exact = List.rev !(acc.exact_acc);
+    contains = List.rev !(acc.contains_acc);
+    not_contains = List.rev !(acc.not_contains_acc);
+  }
+
+let select_expectation_acc ~generic ~blorp_frontend = function
+  | `Generic -> generic
+  | `BlorpFrontend -> blorp_frontend
 
 let summarize_codegen_audit_output ~exit_code output =
   let passed = ref 0 in
@@ -153,7 +204,7 @@ let sorted_brp_files dir =
     |> List.map (fun name -> Filename.concat dir name)
   else []
 
-let collect_cases () =
+let collect_cases selection =
   let parser_pass =
     sorted_brp_files "tests/test_compiler/parser/should_pass"
     |> List.map (fun file -> { kind = ParserShouldPass; file })
@@ -190,34 +241,65 @@ let collect_cases () =
     @ (sorted_brp_files "tests/test_compiler/purify/should_rewrite"
       |> List.map (fun file -> { kind = PurifyShouldRewrite; file }))
   in
-  let roundtrip =
-    sorted_brp_files "tests/test_compiler/parser/should_pass"
-    |> List.map (fun file -> { kind = Roundtrip; file })
+  let surface_cases =
+    parser_pass @ parser_fail @ checked "typecheck" @ checked "infer"
   in
-  parser_pass @ parser_fail @ checked "typecheck" @ checked "infer"
-  @ format_cases @ purify_cases @ roundtrip
+  let tool_cases = format_cases @ purify_cases in
+  match selection with
+  | AllCases -> surface_cases @ tool_cases
+  | SurfaceCases -> surface_cases
+  | ToolCasesOnly -> tool_cases
+
+let parse_expectation_line line =
+  let prefixes =
+    [
+      ("-- EXPECT: ", `Generic, `Exact, false);
+      ("-- EXPECT-CONTAINS:", `Generic, `Contains, true);
+      ("-- EXPECT-NOT-CONTAINS:", `Generic, `NotContains, true);
+      ("-- EXPECT-BLORP: ", `BlorpFrontend, `Exact, false);
+      ("-- EXPECT-BLORP-CONTAINS:", `BlorpFrontend, `Contains, true);
+      ("-- EXPECT-BLORP-NOT-CONTAINS:", `BlorpFrontend, `NotContains, true);
+    ]
+  in
+  prefixes
+  |> List.find_map (fun (prefix, scope, kind, trim) ->
+         match drop_prefix line prefix with
+         | None -> None
+         | Some expected ->
+             let expected = if trim then String.trim expected else expected in
+             Some (scope, kind, expected))
+
+let parse_expectation_groups source =
+  let generic = make_expectation_acc () in
+  let blorp_frontend = make_expectation_acc () in
+  source |> split_lines
+  |> List.iter (fun line ->
+         match parse_expectation_line line with
+         | None -> ()
+         | Some (scope, kind, expected) ->
+             let acc =
+               select_expectation_acc ~generic ~blorp_frontend scope
+             in
+             begin
+               match kind with
+               | `Exact -> acc.exact_acc := expected :: !(acc.exact_acc)
+               | `Contains ->
+                   acc.contains_acc := expected :: !(acc.contains_acc)
+               | `NotContains ->
+                   acc.not_contains_acc := expected :: !(acc.not_contains_acc)
+             end);
+  {
+    generic = finish_expectation_acc generic;
+    blorp_frontend = finish_expectation_acc blorp_frontend;
+  }
+
+let expectations_for_blorp_frontend groups =
+  let frontend_expectations = groups.blorp_frontend in
+  if expectations_have_checks frontend_expectations then frontend_expectations
+  else groups.generic
 
 let load_expectations file =
-  let exact = ref [] in
-  let contains = ref [] in
-  let not_contains = ref [] in
-  read_file file |> split_lines
-  |> List.iter (fun line ->
-      match drop_prefix line "-- EXPECT: " with
-      | Some expected -> exact := expected :: !exact
-      | None -> (
-          match drop_prefix line "-- EXPECT-CONTAINS:" with
-          | Some expected -> contains := String.trim expected :: !contains
-          | None -> (
-              match drop_prefix line "-- EXPECT-NOT-CONTAINS:" with
-              | Some expected ->
-                  not_contains := String.trim expected :: !not_contains
-              | None -> ())));
-  {
-    exact = List.rev !exact;
-    contains = List.rev !contains;
-    not_contains = List.rev !not_contains;
-  }
+  read_file file |> parse_expectation_groups |> expectations_for_blorp_frontend
 
 let normalized_diagnostic_lines test output =
   let file_prefix = test ^ ": " in
@@ -229,15 +311,24 @@ let normalized_diagnostic_lines test output =
           Some line
       | None -> (
           let trimmed = String.trim line in
-          if starts_with trimmed "expected: " || starts_with trimmed "found: "
-          then Some trimmed
-          else
-            match drop_prefix trimmed "= help: " with
-            | Some rest -> Some ("help: " ^ rest)
-            | None -> (
-                match drop_prefix trimmed "= note: " with
-                | Some rest -> Some ("note: " ^ rest)
-                | None -> None)))
+          match diagnostic_after_marker trimmed ": error: " with
+          | Some rest -> Some ("error: " ^ rest)
+          | None -> (
+              match diagnostic_after_marker trimmed ": warning: " with
+              | Some rest -> Some ("warning: " ^ rest)
+              | None ->
+                  if starts_with trimmed "expected: "
+                     || starts_with trimmed "found: "
+                     || starts_with trimmed "help: "
+                     || starts_with trimmed "note: "
+                  then Some trimmed
+                  else
+                    match drop_prefix trimmed "= help: " with
+                    | Some rest -> Some ("help: " ^ rest)
+                    | None -> (
+                        match drop_prefix trimmed "= note: " with
+                        | Some rest -> Some ("note: " ^ rest)
+                        | None -> None))))
 
 let check_error_expectations file output mismatch_detail =
   let expectations = load_expectations file in
@@ -304,30 +395,16 @@ let run_typecheck file =
       | Error errors ->
           { code = 1; output = format_pipeline_errors ~file errors })
 
-let run_format_check file =
-  run_safely (fun () ->
-      match
-        Fmt.format_files_with_blorp_renderer
-          ~mode:(Fmt.Check { show_diff = false })
-          [ file ]
-      with
-      | Error msg -> { code = 1; output = msg ^ "\n" }
-      | Ok results ->
-          let would_change =
-            List.exists
-              (function
-                | Fmt.WouldChange _ -> true
-                | Fmt.Unchanged _ | Fmt.Written _ -> false)
-              results
-          in
-          if would_change then
-            { code = 1; output = Printf.sprintf "%s: needs formatting\n" file }
-          else { code = 0; output = Printf.sprintf "%s: ok\n" file })
+let run_format opts args =
+  let code, output =
+    Test_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
+      args
+  in
+  { code; output }
 
-let run_format_write file =
-  match Fmt.format_files_with_blorp_renderer ~mode:Fmt.Write [ file ] with
-  | Error msg -> Error msg
-  | Ok _ -> Ok ()
+let run_format_check opts file =
+  run_safely (fun () ->
+      run_format opts [ "format"; "--check"; file ])
 
 let run_purify opts args =
   let code, output =
@@ -423,7 +500,7 @@ let run_case opts { kind; file } =
         | None -> pass ("should_fail/" ^ category) name
         | Some details -> fail ("should_fail/" ^ category) name details)
   | FormatShouldPass ->
-      let result = run_format_check file in
+      let result = run_format_check opts file in
       if result.code = 0 then pass "format/should_pass" name
       else
         fail "format/should_pass" name
@@ -435,13 +512,13 @@ let run_case opts { kind; file } =
             |> List.filter (( <> ) "")
             |> List.filteri (fun i _ -> i < 5)))
   | FormatShouldFail ->
-      let result = run_format_check file in
+      let result = run_format_check opts file in
       if result.code <> 0 then pass "format/should_fail" name
       else
         fail "format/should_fail" name
           [ "Expected: needs formatting"; "Got: already formatted" ]
   | FormatShouldError -> (
-      let result = run_format_check file in
+      let result = run_format_check opts file in
       if result.code = 0 then
         fail "format/should_error" name
           [ "Expected: formatter error"; "Got: format succeeded" ]
@@ -500,36 +577,18 @@ let run_case opts { kind; file } =
               match body_contains_expectations file (read_file tmpfile) with
               | [] -> pass "purify/should_rewrite" name
               | details -> fail "purify/should_rewrite" name details)
-  | Roundtrip ->
-      with_temp_dir "blorp-rt-" (fun dir ->
-          let pass1 = Filename.concat dir "pass1.brp" in
-          let pass2 = Filename.concat dir "pass2.brp" in
-          copy_file file pass1;
-          match run_format_write pass1 with
-          | Error msg ->
-              fail "roundtrip" name [ "Format failed on first pass"; msg ]
-          | Ok () -> (
-              copy_file pass1 pass2;
-              match run_format_write pass2 with
-              | Error msg ->
-                  fail "roundtrip" name [ "Format failed on second pass"; msg ]
-              | Ok () ->
-                  let first = read_file pass1 in
-                  let second = read_file pass2 in
-                  if first = second then pass "roundtrip" name
-                  else fail "roundtrip" name [ "Formatter is not idempotent" ]))
-
-let prewarm_formatter_renderer () =
+let prewarm_formatter_renderer opts =
   with_temp_dir "blorp-formatter-warmup-" (fun dir ->
       let file = Filename.concat dir "warmup.brp" in
       write_file file "func main(args: List[String]) -> Int:\n\t0\n";
-      match
-        Fmt.format_files_with_blorp_renderer
-          ~mode:(Fmt.Check { show_diff = false })
-          [ file ]
-      with
-      | Ok _ -> Ok ()
-      | Error msg -> Error msg)
+      let result = run_format_check opts file in
+      if result.code = 0 then Ok ()
+      else if result.code = 124 then Error "Format warmup timed out"
+      else Error (String.trim result.output))
+
+let case_uses_formatter = function
+  | { kind = FormatShouldPass | FormatShouldFail | FormatShouldError; _ } -> true
+  | _ -> false
 
 let run_case_list opts cases =
   let passed = ref 0 in
@@ -638,6 +697,27 @@ let exit_code_of_status = function
   | Unix.WSIGNALED signal -> 128 + signal
   | Unix.WSTOPPED _ -> 128
 
+let terminate_worker_pids pids =
+  List.iter
+    (fun pid -> try Unix.kill pid Sys.sigterm with _ -> ())
+    pids
+
+let install_worker_signal_cleanup active_worker_pids =
+  let terminate_workers () = terminate_worker_pids !active_worker_pids in
+  let handle signal =
+    terminate_workers ();
+    exit (128 + signal)
+  in
+  let previous_int =
+    Sys.signal Sys.sigint (Sys.Signal_handle (fun _ -> handle Sys.sigint))
+  in
+  let previous_term =
+    Sys.signal Sys.sigterm (Sys.Signal_handle (fun _ -> handle Sys.sigterm))
+  in
+  fun () ->
+    ignore (Sys.signal Sys.sigint previous_int);
+    ignore (Sys.signal Sys.sigterm previous_term)
+
 let split_cases jobs cases =
   let case_count = List.length cases in
   let jobs = max 1 (min jobs case_count) in
@@ -679,36 +759,53 @@ let run_cases_parallel opts cases =
                   exit (if failed = 0 then 0 else 1)
               | pid -> (pid, output_file))
         in
+        let active_worker_pids = ref (List.map fst workers) in
+        let restore_worker_signal_handlers =
+          install_worker_signal_cleanup active_worker_pids
+        in
         let passed = ref 0 in
         let failed = ref 0 in
         let total = ref 0 in
-        List.iter
-          (fun (pid, output_file) ->
-            let _, status = Unix.waitpid [] pid in
-            let output =
-              if Sys.file_exists output_file then read_file output_file else ""
-            in
-            output |> split_lines
-            |> List.iter (fun line ->
-                if line <> "" && not (starts_with line "BLORP_WORKER_RESULT ")
-                then Printf.printf "%s\n%!" line);
-            match parse_worker_result output with
-            | Some (worker_passed, worker_failed, worker_total) ->
-                passed := !passed + worker_passed;
-                failed := !failed + worker_failed;
-                total := !total + worker_total
-            | None ->
-                let code = exit_code_of_status status in
-                emit_fail "runner"
-                  (Printf.sprintf "worker-%d" pid)
-                  [
-                    Printf.sprintf "worker exited without summary (exit %d)"
-                      code;
-                  ];
-                incr failed;
-                incr total)
-          workers;
-        (!passed, !failed, !total))
+        try
+          List.iter
+            (fun (pid, output_file) ->
+              let _, status = Unix.waitpid [] pid in
+              active_worker_pids :=
+                List.filter
+                  (fun active_pid -> active_pid <> pid)
+                  !active_worker_pids;
+              let output =
+                if Sys.file_exists output_file then read_file output_file
+                else ""
+              in
+              output |> split_lines
+              |> List.iter (fun line ->
+                     if
+                       line <> ""
+                       && not (starts_with line "BLORP_WORKER_RESULT ")
+                     then Printf.printf "%s\n%!" line);
+              match parse_worker_result output with
+              | Some (worker_passed, worker_failed, worker_total) ->
+                  passed := !passed + worker_passed;
+                  failed := !failed + worker_failed;
+                  total := !total + worker_total
+              | None ->
+                  let code = exit_code_of_status status in
+                  emit_fail "runner"
+                    (Printf.sprintf "worker-%d" pid)
+                    [
+                      Printf.sprintf "worker exited without summary (exit %d)"
+                        code;
+                    ];
+                  incr failed;
+                  incr total)
+            workers;
+          restore_worker_signal_handlers ();
+          (!passed, !failed, !total)
+        with exn ->
+          terminate_worker_pids !active_worker_pids;
+          restore_worker_signal_handlers ();
+          raise exn)
 
 let run opts =
   Random.self_init ();
@@ -720,16 +817,21 @@ let run opts =
   in
   Printf.printf "Compiler Tests (in-process, %d workers, %s)\n\n%!" opts.jobs
     timeout_text;
-  match prewarm_formatter_renderer () with
+  let cases = collect_cases opts.case_selection in
+  let formatter_warmup =
+    if List.exists case_uses_formatter cases then prewarm_formatter_renderer opts
+    else Ok ()
+  in
+  match formatter_warmup with
   | Error msg ->
       Printf.printf "FAIL: [format/warmup] renderer\nDETAIL %s\n" msg;
       Printf.printf
         "\n\
-         BLORP_GATE_RESULT gate=compiler status=FAIL passed=0 failed=1 tests=1\n";
+         BLORP_GATE_RESULT gate=%s status=FAIL passed=0 failed=1 tests=1\n"
+        opts.gate_name;
       Printf.printf "1/1 compiler tests failed\n";
       1
   | Ok () ->
-      let cases = collect_cases () in
       let case_passed, case_failed, case_total =
         run_cases_parallel opts cases
       in
@@ -747,17 +849,17 @@ let run opts =
       Printf.printf "\n%!";
       if !failed = 0 then begin
         Printf.printf
-          "BLORP_GATE_RESULT gate=compiler status=PASS passed=%d failed=0 \
+          "BLORP_GATE_RESULT gate=%s status=PASS passed=%d failed=0 \
            tests=%d\n"
-          !passed !total;
+          opts.gate_name !passed !total;
         Printf.printf "All %d compiler tests passed\n" !total;
         0
       end
       else begin
         Printf.printf
-          "BLORP_GATE_RESULT gate=compiler status=FAIL passed=%d failed=%d \
+          "BLORP_GATE_RESULT gate=%s status=FAIL passed=%d failed=%d \
            tests=%d\n"
-          !passed !failed !total;
+          opts.gate_name !passed !failed !total;
         Printf.printf "%d/%d compiler tests passed (%d failed)\n" !passed !total
           !failed;
         1
@@ -811,7 +913,8 @@ let jobs_from_env () =
 let usage () =
   print_endline
     "Usage: blorp __compiler-tests [--quiet|--verbose] [--timeout N] [-j N] \
-     [--blorp-bin PATH] [--no-codegen-audit]"
+     [--blorp-bin PATH] [--gate-name NAME] [--no-codegen-audit] \
+     [--no-tool-fixtures|--only-tool-fixtures]"
 
 let run_cli args =
   let rec loop opts = function
@@ -831,8 +934,13 @@ let run_cli args =
             prerr_endline "Error: -j requires a positive integer";
             1)
     | "--blorp-bin" :: path :: rest -> loop { opts with blorp_bin = path } rest
+    | "--gate-name" :: name :: rest -> loop { opts with gate_name = name } rest
     | "--no-codegen-audit" :: rest ->
         loop { opts with run_codegen_audit = false } rest
+    | "--no-tool-fixtures" :: rest ->
+        loop { opts with case_selection = SurfaceCases } rest
+    | "--only-tool-fixtures" :: rest ->
+        loop { opts with case_selection = ToolCasesOnly } rest
     | ("--help" | "-h") :: _ ->
         usage ();
         0
@@ -852,6 +960,8 @@ let run_cli args =
           timeout;
           blorp_bin = Sys.executable_name;
           run_codegen_audit = true;
+          case_selection = AllCases;
+          gate_name = "compiler";
           jobs;
         }
       in

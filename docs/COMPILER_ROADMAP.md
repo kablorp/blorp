@@ -7,9 +7,9 @@ Use [ARCHITECTURE.md](ARCHITECTURE.md) for the live compiler pipeline and
 the next compiler work that is still valuable enough to keep visible.
 
 Use [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
-detailed OCaml-to-Blorp port plan, including the single JSON transfer point,
-incremental deletion merge points, and the expectation that compiler stage logic
-is implemented as pure functions wherever possible.
+detailed OCaml-to-Blorp port plan, including explicit JSON boundaries,
+incremental deletion merge points, and the expectation that compiler stage
+logic is implemented as pure functions wherever possible.
 
 ## Goals
 
