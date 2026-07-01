@@ -1480,11 +1480,6 @@ let key_as_ptr ?reg ?as_ty (key : core) : core =
   Core_layout_type.hash_key_pointer_argument ?reg key_ty |> fun layout ->
   pointer_argument_as_ptr layout key key_ty
 
-let value_as_ptr ?reg ?as_ty (value : core) : core =
-  let value_ty = Option.value as_ty ~default:value.ty in
-  Core_layout_type.boxed_storage_value_pointer_argument ?reg value_ty
-  |> fun layout -> pointer_argument_as_ptr layout value value_ty
-
 let boxed_value_pointer_temp_requires_release ?reg value_ty loc =
   match Core_layout_type.boxed_storage_value_pointer_argument ?reg value_ty with
   | Core_layout_type.PointerArgumentBox -> (

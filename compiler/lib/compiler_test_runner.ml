@@ -88,7 +88,6 @@ let diagnostic_after_marker line marker =
         (String.sub line start (String.length line - start))
 
 let split_lines s = String.split_on_char '\n' s
-let empty_expectations = { exact = []; contains = []; not_contains = [] }
 
 let expectations_have_checks expectations =
   expectations.exact <> []

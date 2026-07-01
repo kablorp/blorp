@@ -743,11 +743,6 @@ let cli_frontend_command_of_string = function
   | command ->
       Error ("invalid_response", "unsupported CLI frontend command `" ^ command ^ "`")
 
-let cli_frontend_command_name = function
-  | CliFrontendCheck -> "check"
-  | CliFrontendCompile -> "compile"
-  | CliFrontendRun -> "run"
-
 let validate_cli_artifact_command artifact_kind expected args =
   match args with
   | command :: _ when String.equal command expected -> Ok ()
@@ -2258,38 +2253,6 @@ let run_core_pipeline_core_json_exn ~stage core_json =
   in
   match response_result response_json (json_response_field "core") with
   | Ok transformed_core -> transformed_core
-  | Error (_, message) -> invalid_arg message
-
-let parse_source_via_command_exn ~path ~module_name ~text =
-  let response_json =
-    run_parser_request_via_blorp
-      (parse_source_request_json ~path ~module_name ~text)
-  in
-  match parse_source_response_json response_json with
-  | Ok (ParsedSource parsed) ->
-      Lexer.restore_comments parsed.parsed_comments;
-      parsed.parsed_program
-  | Ok (ParseSourceDiagnostics diagnostics) ->
-      let message =
-        diagnostics |> List.map (fun err -> err.Ast.message) |> String.concat "\n"
-      in
-      invalid_arg message
-  | Error (_, message) -> invalid_arg message
-
-let parse_source_file_via_command_exn ~path ~module_name =
-  let response_json =
-    run_parser_request_via_blorp
-      (parse_source_file_request_json ~path ~module_name)
-  in
-  match parse_source_response_json response_json with
-  | Ok (ParsedSource parsed) ->
-      Lexer.restore_comments parsed.parsed_comments;
-      parsed.parsed_program
-  | Ok (ParseSourceDiagnostics diagnostics) ->
-      let message =
-        diagnostics |> List.map (fun err -> err.Ast.message) |> String.concat "\n"
-      in
-      invalid_arg message
   | Error (_, message) -> invalid_arg message
 
 let parse_source_via_command ~path ~module_name ~text =

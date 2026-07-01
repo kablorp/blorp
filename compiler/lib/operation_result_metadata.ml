@@ -139,9 +139,6 @@ let rec accepted_type_shape_matches shape ty =
 let success_payload_accepts_type payload ty =
   accepted_type_shape_matches payload.accepted_type ty
 
-let success_payload_expected_type payload =
-  accepted_type_shape_to_string payload.accepted_type
-
 let tcp_error_mapping =
   {
     accepted_type_names =
@@ -563,9 +560,6 @@ let terminal_is_cancellation_point (terminal : fallible_stream_terminal) =
 
 let terminal_parks_fiber (terminal : fallible_stream_terminal) =
   wait_behavior_parks_fiber terminal.wait_behavior
-
-let terminal_blocks_os_worker (terminal : fallible_stream_terminal) =
-  wait_behavior_blocks_os_worker terminal.wait_behavior
 
 let tcp_bridge ?(wait_behavior = DoesNotWait) builtin_name runtime_result_c_type
     success arguments =

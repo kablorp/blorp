@@ -574,9 +574,6 @@ let string_starts_with ~prefix value =
   let prefix_len = String.length prefix in
   String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
 
-let std_builtin_identity_to_string identity =
-  identity.std_builtin_module_path ^ "." ^ identity.std_builtin_func_name
-
 let parse_std_builtin_identity name =
   if not (string_starts_with ~prefix:"std/" name) then None
   else

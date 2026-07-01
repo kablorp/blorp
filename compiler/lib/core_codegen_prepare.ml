@@ -20,9 +20,6 @@ let boxed_storage_needs_release ~reg ty loc =
 
 let canonical_type ~reg ty = Core_layout_type.canonical_type ~reg ty
 
-let type_requires_retain ~reg ty loc =
-  Core_layout_type.source_value_requires_retain_or_error ~phase ~reg ty loc
-
 let classify_box_kind ~reg ty loc =
   Core_layout_type.box_kind_of_type ~phase ~reg ty loc
 

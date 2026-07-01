@@ -98,9 +98,6 @@ let expanded_payload_is_stack_erased meta = function
   | Ast.TyConstInt _ | Ast.TyDimOp _ -> true
   | _ -> false
 
-let payload_is_stack_erased meta payload_ty =
-  expanded_payload_is_stack_erased meta (expand_aliases meta [] payload_ty)
-
 let is_builtin_managed_payload_name = function
   | "String" | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix"
   | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix" | "Bytes" | "Fixed"

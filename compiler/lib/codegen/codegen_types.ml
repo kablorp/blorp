@@ -413,15 +413,6 @@ let create_registry () : registry =
     type_aliases = Hashtbl.create 16;
   }
 
-(** Clear all tables in [reg] so it can be reused for a fresh compilation. *)
-let reset_registry (reg : registry) : unit =
-  Hashtbl.clear reg.value_records;
-  Hashtbl.clear reg.enum_types;
-  Hashtbl.clear reg.union_variants;
-  Hashtbl.clear reg.union_payload_storage;
-  Hashtbl.clear reg.managed_types;
-  Hashtbl.clear reg.type_aliases
-
 let register_union_variants reg name variants =
   let by_name =
     match Hashtbl.find_opt reg.union_variants name with
@@ -566,9 +557,6 @@ let primitive_stack_option_c_type_of_expanded_type = function
 let primitive_stack_option_c_type_of_payload payload =
   primitive_stack_option_c_type_of_expanded_type
     (TyNamed ("Option", [ payload ]))
-
-let is_primitive_stack_option_payload payload =
-  primitive_stack_option_c_type_of_payload payload <> None
 
 let generated_stack_option_c_type_name payload_name =
   let payload_name =

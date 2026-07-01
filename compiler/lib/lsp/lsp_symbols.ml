@@ -11,7 +11,6 @@ open Lsp_json
    ============================================================================ *)
 
 let kind_class = 5
-let kind_namespace = 3
 let kind_method = 6
 let kind_property = 7
 let kind_interface = 8

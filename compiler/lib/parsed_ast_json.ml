@@ -1577,9 +1577,3 @@ let decode_program value =
       decode_list (path ^ ".decls") decode_decl_group decls_json
     in
     Ok (List.concat decl_groups)
-
-let decode_program_string source =
-  match Lsp_json.parse source with
-  | json -> decode_program json
-  | exception Lsp_json.Parse_error message ->
-      error "$" ("invalid JSON: " ^ message)

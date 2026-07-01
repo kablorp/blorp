@@ -137,11 +137,6 @@ let expect_typed_decl_error decl check =
   | Ok _ -> Alcotest.fail "expected test declaration to fail Typed_ast"
   | Error err -> check err
 
-let expect_typed_program_error program check =
-  match Blorp.Typed_ast.of_ast_program program with
-  | Ok _ -> Alcotest.fail "expected test program to fail Typed_ast"
-  | Error err -> check err
-
 let lower_valid_expr expr =
   Blorp.Core_lower.lower_typed_expr (expect_valid_typed_expr expr)
 

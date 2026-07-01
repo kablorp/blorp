@@ -237,17 +237,9 @@ let list_storage_layout_release_hint =
   "list element release policy should be fixed when Core_list_layout builds \
    the storage descriptor"
 
-let list_storage_layout_retain_hint =
-  "list element retain policy should be fixed when Core_list_layout builds the \
-   storage descriptor"
-
 let list_storage_layout_requires_release_or_error ~phase ~loc layout =
   storage_policy_requires_release_or_error ~phase ~loc ~subject:"list element"
     ~hint:list_storage_layout_release_hint layout.lsl_policy
-
-let list_storage_layout_requires_retain_or_error ~phase ~loc layout =
-  storage_policy_requires_retain_or_error ~phase ~loc ~subject:"list element"
-    ~hint:list_storage_layout_retain_hint layout.lsl_policy
 
 let list_inline_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) width =
   list_storage_layout ?elem_ty ~value_layout:(ListElementInlineBits width)
@@ -1161,10 +1153,7 @@ let borrowed_match_binding_pairs bindings =
 let owned_match_binding mb_var mb_accessor =
   match_binding ~mode:MatchOwn mb_var mb_accessor
 
-let match_binding_var binding = binding.mb_var
-let match_binding_accessor binding = binding.mb_accessor
 let match_binding_is_borrowed binding = binding.mb_mode = MatchBorrow
-let match_binding_is_owned binding = binding.mb_mode = MatchOwn
 let match_binding_name binding = binding.mb_var.vname
 let match_binding_pair binding = (binding.mb_var, binding.mb_accessor)
 let match_binding_shadows name binding = binding.mb_var.vname = name
@@ -1173,10 +1162,6 @@ let match_bindings_shadow name bindings =
   List.exists (match_binding_shadows name) bindings
 
 let match_binding_names bindings = List.map match_binding_name bindings
-
-let match_binding_mode_str = function
-  | MatchBorrow -> "borrow"
-  | MatchOwn -> "own"
 
 (* ============================================================================
    Smart constructors
@@ -1197,7 +1182,6 @@ let task_copy_captures captures = List.map task_copy_capture captures
 let task_capture_binding capture =
   (capture.task_capture_name, capture.task_capture_ty)
 
-let task_capture_bindings captures = List.map task_capture_binding captures
 let root_task_scope_id = TaskScopeId 0
 let task_scope_id_to_int (TaskScopeId id) = id
 

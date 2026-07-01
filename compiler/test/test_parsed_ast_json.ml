@@ -29,14 +29,6 @@ let int_expr_json value start_offset start_column end_offset end_column =
       ("span", span_json start_offset start_column end_offset end_column);
     ]
 
-let bool_expr_json value start_offset start_column end_offset end_column =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "bool_literal");
-      ("value", Lsp_json.Bool value);
-      ("span", span_json start_offset start_column end_offset end_column);
-    ]
-
 let char_expr_json value start_offset start_column end_offset end_column =
   Lsp_json.Object
     [

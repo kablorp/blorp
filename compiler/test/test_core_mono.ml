@@ -27,9 +27,6 @@ let cstr s =
 
 let cvar n t = mk (CVar (Var.named n)) t
 
-let cvar_with_def_id n id t =
-  mk (CVar { (Var.named n) with vdef_id = Some id }) t
-
 let clist elems =
   CList { ll_layout = list_pointer_storage (); ll_elems = elems }
 

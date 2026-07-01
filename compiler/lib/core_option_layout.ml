@@ -199,9 +199,6 @@ let classify_expanded_payload meta payload_ty =
           | Core_type_layout.Unknown_named name -> Unknown_named name
           | Core_type_layout.Invalid_value_type msg -> Invalid_option_type msg))
 
-let classify_payload meta payload_ty =
-  classify_expanded_payload meta (expand_aliases meta [] payload_ty)
-
 let classify (meta : Core_type_layout.metadata) (option_ty : Ast.type_expr) :
     classification =
   match expand_aliases meta [] option_ty with

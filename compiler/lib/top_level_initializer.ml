@@ -74,5 +74,3 @@ let collect_startup_work (expr : expr) : startup_work list =
     | _ -> List.concat_map walk (expr_children expr)
   in
   walk expr
-
-let requires_compile_time_evaluation expr = collect_startup_work expr <> []

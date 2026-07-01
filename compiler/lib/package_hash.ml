@@ -84,11 +84,6 @@ let hash_entries entries =
     entries;
   Blake3.hash_string_hex (Buffer.contents buffer)
 
-let hash_files ~root files =
-  match read_entries ~root files with
-  | Error _ as err -> err
-  | Ok entries -> Ok (hash_entries entries)
-
 let package_files ~root ~source_files =
   let manifest_path = Filename.concat root Package_manifest.manifest_filename in
   manifest_path :: source_files
