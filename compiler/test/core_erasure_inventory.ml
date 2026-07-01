@@ -5,6 +5,12 @@
     ABI work can replace each category with a typed representation without
     relying on name or shape heuristics. *)
 
+open Blorp.Core
+module Ast = Blorp.Ast
+module Codegen_types = Blorp.Codegen_types
+module Core_layout_type = Blorp.Core_layout_type
+module Types = Blorp.Types
+
 type severity =
   | ExplicitBoundary
       (** A generic or intentionally opaque boundary. This is real erasure, but
@@ -43,8 +49,6 @@ type site = {
   severity : severity;
   reason : string;
 }
-
-open Core
 
 let site_kind_to_string = function
   | BoxToErasedStorage -> "box-to-erased-storage"
@@ -139,13 +143,13 @@ let make_site ~reg ~kind ~loc ty =
   let ty, severity, reason = classify_type ~reg ty in
   { kind; ty; loc; severity; reason }
 
-let box_site ~reg ~kind ~loc (box : Core.box_op) =
+let box_site ~reg ~kind ~loc (box : box_op) =
   make_site ~reg ~kind ~loc box.box_source_ty
 
-let unbox_site ~reg ~loc (unbox : Core.unbox_op) =
+let unbox_site ~reg ~loc (unbox : unbox_op) =
   make_site ~reg ~kind:UnboxFromErasedStorage ~loc unbox.unbox_target_ty
 
-let boxed_storage_site ~reg ~kind ~loc (value : Core.boxed_storage_value) =
+let boxed_storage_site ~reg ~kind ~loc (value : boxed_storage_value) =
   box_site ~reg ~kind ~loc value.bsv_box
 
 let add_boxed_storage_site ~reg ~kind ~loc value acc =
@@ -170,14 +174,14 @@ let add_list_pointer_storage_site ~reg ~loc list_ty acc =
   | None -> acc
   | Some elem -> make_site ~reg ~kind:ListPointerElementStorage ~loc elem :: acc
 
-let collect_task_closure ~reg ~loc (task : Core.task_closure) acc =
+let collect_task_closure ~reg ~loc (task : task_closure) acc =
   let acc =
     if is_void_type ~reg task.tc_return_ty then acc
     else make_site ~reg ~kind:TaskReturn ~loc task.tc_return_ty :: acc
   in
   List.fold_left
     (fun acc capture ->
-      let name, ty = Core.task_capture_binding capture in
+      let name, ty = task_capture_binding capture in
       make_site ~reg ~kind:(TaskCapture name) ~loc ty :: acc)
     acc task.tc_captures
 
@@ -186,7 +190,7 @@ let collect_optional_task_closure ~reg ~loc task acc =
   | None -> acc
   | Some task -> collect_task_closure ~reg ~loc task acc
 
-let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
+let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : core) =
   let loc = expr.loc in
   match expr.desc with
   | CBox (_, source_ty) ->
@@ -273,9 +277,9 @@ let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
   | _ -> acc
 
 let collect_expr ~reg acc expr =
-  Core.fold_tree (collect_expr_sites ~reg) acc expr
+  fold_tree (collect_expr_sites ~reg) acc expr
 
-let collect_closure_abi ~reg ~loc ~return_ty (abi : Core.closure_abi) acc =
+let collect_closure_abi ~reg ~loc ~return_ty (abi : closure_abi) acc =
   let acc =
     if is_void_type ~reg return_ty then acc
     else make_site ~reg ~kind:ClosureReturn ~loc return_ty :: acc
@@ -283,7 +287,7 @@ let collect_closure_abi ~reg ~loc ~return_ty (abi : Core.closure_abi) acc =
   let acc =
     List.fold_left
       (fun acc (param, ty) ->
-        make_site ~reg ~kind:(ClosureParam (Core.Var.to_string param)) ~loc ty
+        make_site ~reg ~kind:(ClosureParam (Var.to_string param)) ~loc ty
         :: acc)
       acc abi.ca_params
   in
@@ -292,7 +296,7 @@ let collect_closure_abi ~reg ~loc ~return_ty (abi : Core.closure_abi) acc =
       make_site ~reg ~kind:(ClosureCapture name) ~loc ty :: acc)
     acc abi.ca_captures
 
-let rec collect_decl ~reg acc (decl : Core.core_decl) =
+let rec collect_decl ~reg acc (decl : core_decl) =
   match decl.cd_desc with
   | CDFunc fn ->
       let acc =
@@ -317,5 +321,5 @@ let rec collect_decl ~reg acc (decl : Core.core_decl) =
   | CDTrait _ | CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _ -> acc
 
 let collect_program ~(reg : Codegen_types.registry)
-    (program : Core.core_program) =
+    (program : core_program) =
   List.fold_left (collect_decl ~reg) [] program |> List.rev

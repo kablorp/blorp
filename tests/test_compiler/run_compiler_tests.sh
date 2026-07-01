@@ -1,7 +1,7 @@
 #!/bin/bash
-# Thin wrapper for compiler tests. The actual runner lives in
-# `blorp __compiler-tests` so the test selection, diagnostics, timeout handling,
-# and result accounting have a single implementation.
+# Thin wrapper for compiler tests. The actual runner lives in a test-only Dune
+# executable so the shipped `blorp` CLI does not expose compiler fixture
+# plumbing.
 
 cd "$(dirname "$0")/../.."
 REPO_ROOT=$(pwd -P)
@@ -87,7 +87,7 @@ case "$compiler_test_timeout" in
         ;;
 esac
 
-runner_args=(__compiler-tests --blorp-bin "$BLORP_BIN" --timeout "$compiler_test_timeout" --gate-name "$gate_name")
+runner_args=(--blorp-bin "$BLORP_BIN" --timeout "$compiler_test_timeout" --gate-name "$gate_name")
 
 if $verbose; then
     runner_args+=(--verbose)
@@ -108,4 +108,5 @@ case "$case_selection" in
         ;;
 esac
 
-exec "$BLORP_BIN" "${runner_args[@]}" "${jobs_args[@]}"
+(cd "$REPO_ROOT/compiler" && dune build ./test/runner/compiler_fixture_runner.exe)
+exec "$REPO_ROOT/compiler/_build/default/test/runner/compiler_fixture_runner.exe" "${runner_args[@]}" "${jobs_args[@]}"

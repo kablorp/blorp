@@ -5,6 +5,8 @@
     keeps its shell runner because it validates generated C with the host C
     compiler. *)
 
+open Blorp
+
 type opts = {
   verbose : bool;
   timeout : int option;
@@ -911,7 +913,7 @@ let jobs_from_env () =
 
 let usage () =
   print_endline
-    "Usage: blorp __compiler-tests [--quiet|--verbose] [--timeout N] [-j N] \
+    "Usage: compiler_fixture_runner [--quiet|--verbose] [--timeout N] [-j N] \
      [--blorp-bin PATH] [--gate-name NAME] [--no-codegen-audit] \
      [--no-tool-fixtures|--only-tool-fixtures]"
 
@@ -944,7 +946,7 @@ let run_cli args =
         usage ();
         0
     | arg :: _ ->
-        prerr_endline ("Error: unknown __compiler-tests option: " ^ arg);
+        prerr_endline ("Error: unknown compiler fixture runner option: " ^ arg);
         usage ();
         1
   in

@@ -36,7 +36,10 @@
       actually a union / that the patterns exhaustive-match — those
       are upstream concerns. *)
 
-open Core
+open Blorp.Core
+module Ast = Blorp.Ast
+module Core_ownership = Blorp.Core_ownership
+module Core_perceus = Blorp.Core_perceus
 
 type state = { mutable rc : int; mutable errors : string list }
 (** A single-variable refcount state. *)

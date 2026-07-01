@@ -7,7 +7,7 @@
 open Blorp
 open Blorp.Ast
 open Blorp.Core
-module I = Blorp.Core_erasure_inventory
+module I = Core_erasure_inventory
 
 let loc =
   { line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }

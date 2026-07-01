@@ -10,7 +10,7 @@
 
 open Blorp.Ast
 open Blorp.Core
-open Blorp.Core_perceus_check
+open Core_perceus_check
 
 let loc =
   { line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }

@@ -457,8 +457,6 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     "Core_type_layout.is_arc_boxed_storage_value_type";
   guard [] "Core_type_layout.destructor_policy_for_record";
   guard [] "Core_type_layout.destructor_policy_for_union";
-  guard [] "Core_erased_storage_layout.box_kind";
-  guard [] "Core_erased_storage_layout.unbox_kind";
   guard
     [ "compiler/lib/core_list_layout.ml" ]
     "Core_layout_type.classify_erased_storage";
@@ -542,7 +540,7 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
       "Infer should consume debug heap classification facts from \
        Core_type_layout instead of duplicating is_heap value-record logic.";
   let erasure_inventory =
-    find_project_file "compiler/lib/core_erasure_inventory.ml"
+    find_project_file "compiler/test/core_erasure_inventory.ml"
     |> read_file |> strip_comments_and_strings
   in
   if contains_substring erasure_inventory "Core_option_layout." then

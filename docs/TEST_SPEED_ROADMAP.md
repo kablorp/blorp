@@ -217,9 +217,9 @@ The first high-leverage split is implemented:
    for the full audit, format/purify coverage, and compiler-owned Blorp
    coverage.
 4. The runner docs and command references expose the distinction.
-5. `tests/test_compiler/run_compiler_tests.sh` is now a thin wrapper around
-   `blorp __compiler-tests`; the old duplicate shell runner and legacy env
-   escape are removed.
+5. `tests/test_compiler/run_compiler_tests.sh` is now a thin wrapper around a
+   test-only Dune executable; the shipped `blorp` CLI no longer exposes
+   compiler fixture plumbing.
 6. The compiler runner now terminates active worker processes on SIGTERM/SIGINT,
    and `scripts/test` failure excerpts include infrastructure errors such as
    `Error:` lines instead of printing an empty failure block.

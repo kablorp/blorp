@@ -201,6 +201,14 @@ allowed in `std/`.
 port inventory, the single hidden bridge command boundary, and the current
 direct-template access allowlist. `make hygiene-check` runs it automatically.
 
+## Optional Native TLS Check
+
+`scripts/test-tls-openssl-local` is a manual integration check for the opt-in
+OpenSSL TLS runtime backend. It creates a local self-signed TLS endpoint and
+runs a Blorp TLS client against it with `BLORP_TLS_BACKEND=openssl`. It is not
+part of the default gate because it requires host OpenSSL headers/libraries and
+the `openssl` command-line tool.
+
 
 ## Release Helpers
 
