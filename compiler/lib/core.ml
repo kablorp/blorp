@@ -100,7 +100,7 @@ type core_param = { cp_name : var; cp_ty : Ast.type_expr; cp_loc : Ast.loc }
     for reads and the producer allocates fresh output storage.
 
     [ConsumeReuse] is introduced only after Perceus has produced a matching
-    source-owner [CDrop] and [Core_reuse] consumes that drop. It lets emission
+    source-owner [CDrop] and the reuse pass consumes that drop. It lets emission
     use a runtime-guarded reuse boundary while preserving value semantics. *)
 type handoff_mode = BorrowFresh | ConsumeReuse
 
@@ -658,7 +658,7 @@ and desc =
           resource finalization, distinct from ARC release/drop. *)
   | CResourceCleanupExit of resource_cleanup_exit
       (** Explicit cleanup edge before nonlocal loop control leaves one or
-          more active resource scopes. Produced by [Core_resource] after the
+          more active resource scopes. Produced by the resource pass after the
           normal Core passes know which [break]/[continue] nodes are not
           captured by an inner loop. *)
   | CSeq of core * core  (** [e1; e2] — both evaluated, result is [e2] *)
@@ -749,7 +749,7 @@ and desc =
       (** Internal producer/fusion handoff for
                                          list pipelines. Starts in
                                          [BorrowFresh] mode and may be upgraded
-                                         to [ConsumeReuse] by [Core_reuse]
+                                         to [ConsumeReuse] by the reuse pass
                                          after Perceus proves last use of the
                                          source owner. *)
 

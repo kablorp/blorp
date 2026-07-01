@@ -112,7 +112,6 @@ val compile :
   ?on_stage_event:Core_pipeline.on_stage_event ->
   ?on_stage_json:Core_pipeline.on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
-  ?program_observation:Core_pipeline.program_observation ->
   ?check_invariants:bool ->
   filename:string ->
   source:string ->
@@ -148,12 +147,6 @@ val compile :
     [tail_observation_stages]. These observations are bridge JSON because OCaml
     no longer owns authoritative Core values after the post-Perceus handoff.
 
-    [program_observation] controls how far [on_stage] receives Core program
-    snapshots. The default preserves the legacy all-stage behavior. CLI paths
-    that only need earlier stages can use
-    [Core_pipeline.ObservePreBackendProgramStages] to avoid forcing the old
-    OCaml final-tail snapshot.
-
     [require_main] rejects user sources that do not declare a top-level
     [main] function before Core/codegen. It is intended for runnable entry
     points such as [blorp run]; analysis-only and C-emission callers can leave
@@ -177,7 +170,6 @@ val compile_parsed :
   ?on_stage_event:Core_pipeline.on_stage_event ->
   ?on_stage_json:Core_pipeline.on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
-  ?program_observation:Core_pipeline.program_observation ->
   ?check_invariants:bool ->
   filename:string ->
   program:Ast.program ->

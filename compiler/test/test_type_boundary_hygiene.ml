@@ -463,7 +463,6 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
   guard
     [
       "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_reuse.ml";
       "compiler/lib/core_specialize.ml";
     ]
     "Core_layout_type.boxed_storage_requires_release_or_error";

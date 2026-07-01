@@ -2,8 +2,9 @@
 
 This document defines the compiler-facing ownership model for managed values,
 Perceus reference-count insertion, and copy-on-write (COW). It is the semantic
-contract that `core_ownership.ml`, `core_perceus.ml`, `core_reuse.ml`,
-`core_codegen_prepare.ml`, Core intrinsics, and the C runtime must implement.
+contract that `core_ownership.ml`, `core_perceus.ml`,
+`compiler_core_reuse.brp`, `core_codegen_prepare.ml`, Core intrinsics, and the
+C runtime must implement.
 
 The user-facing memory model is documented in `docs/MEMORY_MODEL.md`. This file
 is lower level: it defines the ownership ABI used by compiler phases.

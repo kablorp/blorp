@@ -1,63 +1,19 @@
-(** Closure conversion: hoist [CLambda] bodies to top-level functions,
-    replace use sites with [CClosureCreate] nodes.
+(** First-class function value normalization.
 
-    Runs after Perceus (which needs [CLambda] structure for capture
-    use counting) and before backend handoff.
-
-    Each [CLambda] is transformed into:
-    1. A hoisted [CDFunc] with [cf_closure_abi = Some _] and a void*
-       calling convention (emitter generates the unboxing preamble).
-    2. A [CClosureCreate] node at the original site that references
-       the hoisted function and lists captured variables.
-
-    [CConcurrent], [CDetach], and [CConcurrentlyLoop] task bodies are also
-    hoisted here so the task ABI, captures, and DefIds are visible in Core
-    before emission. Bare top-level function references are adapted into
-    explicit eta closure adapters before Perceus so ownership-sensitive
-    arguments are visible in Core and emitters only lower declared closure
-    ABI shapes. *)
+    Bare top-level function references are adapted into explicit eta closure
+    adapters before Perceus so ownership-sensitive arguments are visible in
+    Core and emitters only lower declared closure ABI shapes. Blorp owns
+    lambda/task closure conversion in the backend tail. *)
 
 open Core
 
-(** Drop declarations that are compile-time templates after mono.
-
-    The emitter already skips generic functions and generic impls. Closure
-    conversion must do the same before hoisting lambdas; otherwise lambdas
-    inside skipped generic templates become fresh non-generic closure-body
-    functions and leak TyVar/TyMeta metadata into runtime ownership/codegen.
-    Specialized concrete copies remain in the program and are converted
-    normally. *)
-let rec prune_non_runtime_templates_decl (d : core_decl) : core_decl option =
-  match d.cd_desc with
-  | CDFunc f when f.cf_type_params <> [] -> None
-  | CDImpl i when Codegen_types.has_type_vars i.ci_for_type -> None
-  | CDImpl i ->
-      let methods =
-        List.filter (fun (m : core_func) -> m.cf_type_params = []) i.ci_methods
-      in
-      if methods = [] then None
-      else Some { d with cd_desc = CDImpl { i with ci_methods = methods } }
-  | CDPrivate inner -> (
-      match prune_non_runtime_templates_decl inner with
-      | Some inner' -> Some { d with cd_desc = CDPrivate inner' }
-      | None -> None)
-  | CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _ | CDTrait _ | CDFunc _
-  | CDVar _ ->
-      Some d
-
-let prune_non_runtime_templates (prog : core_program) : core_program =
-  List.filter_map prune_non_runtime_templates_decl prog
-
 type state = {
   mutable counter : int;
-  mutable task_counter : int;
   mutable hoisted : core_decl list;
   mutable current_module : string option;
-  perceus_env : Core_perceus.type_env;
   constructor_names : (string, unit) Hashtbl.t;
   global_function_refs : (string, function_ref_target) Hashtbl.t;
   global_function_refs_by_def_id : (int, function_ref_target) Hashtbl.t;
-  wrap_function_refs : bool;
 }
 
 and function_ref_target =
@@ -65,7 +21,7 @@ and function_ref_target =
   | FunctionRefBuiltin of string
   | FunctionRefForeign of foreign_call
 
-(** Mutable state for the conversion pass. *)
+(** Mutable state for eta-adapter synthesis. *)
 
 module StringSet = Set.Make (String)
 
@@ -105,200 +61,6 @@ let function_ref_target (state : state) (v : var) : function_ref_target option =
       | None -> function_ref_target_by_name state v.vname)
   | None -> function_ref_target_by_name state v.vname
 
-(** Collect free variables in a Core expression, filtering out
-    constructor names and global function names. Returns a sorted
-    list of (name, type) pairs.
-
-    This mirrors the remaining late-backend free-var helper but operates on
-    [core] directly without emission context. *)
-let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
-    (body : core) (params : (var * Ast.type_expr) list) :
-    (string * Ast.type_expr) list =
-  let module SS = Set.Make (String) in
-  let module SM = Map.Make (String) in
-  let rec go_ctree bound = function
-    | CTLeaf { ct_bindings; ct_body } ->
-        let inner =
-          List.fold_left
-            (fun s binding -> SS.add binding.mb_var.vname s)
-            bound ct_bindings
-        in
-        go inner ct_body
-    | CTFail -> SM.empty
-    | CTSwitchTag { cts_cases; cts_default; _ } ->
-        let cases =
-          List.fold_left
-            (fun acc (_, sub) ->
-              SM.union (fun _ a _ -> Some a) acc (go_ctree bound sub))
-            SM.empty cts_cases
-        in
-        let default =
-          match cts_default with Some d -> go_ctree bound d | None -> SM.empty
-        in
-        SM.union (fun _ a _ -> Some a) cases default
-    | CTSwitchLit { ctl_cases; ctl_default; _ } ->
-        let cases =
-          List.fold_left
-            (fun acc (_, sub) ->
-              SM.union (fun _ a _ -> Some a) acc (go_ctree bound sub))
-            SM.empty ctl_cases
-        in
-        SM.union (fun _ a _ -> Some a) cases (go_ctree bound ctl_default)
-    | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-        let cases =
-          List.fold_left
-            (fun acc (_, sub) ->
-              SM.union (fun _ a _ -> Some a) acc (go_ctree bound sub))
-            SM.empty ctl_len_cases
-        in
-        let geq =
-          match ctl_len_geq with
-          | Some (_, sub) -> go_ctree bound sub
-          | None -> SM.empty
-        in
-        let default =
-          match ctl_len_default with
-          | Some d -> go_ctree bound d
-          | None -> SM.empty
-        in
-        SM.union
-          (fun _ a _ -> Some a)
-          cases
-          (SM.union (fun _ a _ -> Some a) geq default)
-  and go bound e =
-    match e.desc with
-    | CVar v ->
-        if SS.mem v.vname bound then SM.empty
-        else if StringSet.mem v.vname capturable then SM.singleton v.vname e.ty
-        else if Hashtbl.mem state.constructor_names v.vname then SM.empty
-        else if Option.is_some (function_ref_target state v) then SM.empty
-        else SM.singleton v.vname e.ty
-    | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> SM.empty
-    | CLambda lam ->
-        let inner =
-          List.fold_left (fun s (v, _) -> SS.add v.vname s) bound lam.lam_params
-        in
-        go inner lam.lam_body
-    | CClosureCreate cc ->
-        List.fold_left
-          (fun acc (n, ty) -> if SS.mem n bound then acc else SM.add n ty acc)
-          SM.empty cc.cc_captures
-    | CLet (b, body) ->
-        let rhs = go bound b.bind_rhs in
-        let body = go (SS.add b.bind_var.vname bound) body in
-        SM.union (fun _ a _ -> Some a) rhs body
-    | CBorrowLet (b, body) ->
-        let rhs = go bound b.borrow_rhs in
-        let body = go (SS.add b.borrow_var.vname bound) body in
-        SM.union (fun _ a _ -> Some a) rhs body
-    | CResourceScope s ->
-        let acquire = go bound s.rs_acquire in
-        let scoped_bound = SS.add s.rs_var.vname bound in
-        let body = go scoped_bound s.rs_body in
-        let cleanup = go scoped_bound s.rs_cleanup in
-        SM.union
-          (fun _ a _ -> Some a)
-          acquire
-          (SM.union (fun _ a _ -> Some a) body cleanup)
-    | CCall (kind, callee, args) ->
-        let callee_fv =
-          match kind with
-          | CKUnknown | CKClosure -> go bound callee
-          | CKSelectedDirect _ | CKUser _ | CKForeign _ | CKBuiltin _
-          | CKIntrinsic _ ->
-              SM.empty
-        in
-        List.fold_left
-          (fun acc a -> SM.union (fun _ a _ -> Some a) acc (go bound a))
-          callee_fv args
-    | CMatch (scrut, tree) ->
-        SM.union (fun _ a _ -> Some a) (go bound scrut) (go_ctree bound tree)
-    | CFor (binder, iter, body) ->
-        let iter_fv = go bound iter in
-        let body_fv = go (SS.add binder.loop_var.vname bound) body in
-        SM.union (fun _ a _ -> Some a) iter_fv body_fv
-    | CListHandoff h ->
-        let source_fv = go bound h.lh_source in
-        let capacity_fv = go bound h.lh_capacity in
-        let inner =
-          bound
-          |> SS.add h.lh_source_var.vname
-          |> SS.add h.lh_result_var.vname
-          |> SS.add h.lh_len_var.vname |> SS.add h.lh_out_var.vname
-        in
-        let body_fv = go inner h.lh_body in
-        SM.union
-          (fun _ a _ -> Some a)
-          source_fv
-          (SM.union (fun _ a _ -> Some a) capacity_fv body_fv)
-    | CConcurrent block ->
-        let rhs_fv =
-          List.fold_left
-            (fun acc (b : conc_binding) ->
-              SM.union (fun _ a _ -> Some a) acc (go bound b.cb_rhs))
-            SM.empty block.conc_bindings
-        in
-        let body_bound =
-          List.fold_left
-            (fun acc (b : conc_binding) -> SS.add b.cb_var.vname acc)
-            bound block.conc_bindings
-        in
-        let body_fv = go body_bound block.conc_body in
-        let timeout_fv =
-          match block.conc_timeout with
-          | Some timeout -> go bound timeout
-          | None -> SM.empty
-        in
-        SM.union
-          (fun _ a _ -> Some a)
-          rhs_fv
-          (SM.union (fun _ a _ -> Some a) body_fv timeout_fv)
-    | CConcurrentlyLoop cf ->
-        let iter_fv = go bound cf.cf_iter in
-        let body_fv = go (SS.add cf.cf_var.vname bound) cf.cf_body in
-        let timeout_fv =
-          match cf.cf_timeout with
-          | Some timeout -> go bound timeout
-          | None -> SM.empty
-        in
-        let width_fv =
-          match cf.cf_width with ConcurrentlyLoopLimit limit -> go bound limit
-        in
-        SM.union
-          (fun _ a _ -> Some a)
-          iter_fv
-          (SM.union
-             (fun _ a _ -> Some a)
-             body_fv
-             (SM.union (fun _ a _ -> Some a) timeout_fv width_fv))
-    | CMatchArms (scrut, arms) ->
-        let scrut_fv = go bound scrut in
-        List.fold_left
-          (fun acc (pat, body) ->
-            let pat_vars = Ast.collect_pattern_vars pat in
-            let inner = List.fold_left (fun s n -> SS.add n s) bound pat_vars in
-            SM.union (fun _ a _ -> Some a) acc (go inner body))
-          scrut_fv arms
-    | CIf (cond, then_, else_) ->
-        let c = go bound cond in
-        let t = go bound then_ in
-        let e = go bound else_ in
-        SM.union (fun _ a _ -> Some a) c (SM.union (fun _ a _ -> Some a) t e)
-    | CSeq (a, b) -> SM.union (fun _ a _ -> Some a) (go bound a) (go bound b)
-    | CWhile (cond, body) ->
-        SM.union (fun _ a _ -> Some a) (go bound cond) (go bound body)
-    | _ ->
-        (* For all other nodes, fold over children *)
-        fold_immediate_children
-          (fun acc child -> SM.union (fun _ a _ -> Some a) acc (go bound child))
-          SM.empty e
-  in
-  let param_names =
-    List.fold_left (fun s (v, _) -> SS.add v.vname s) SS.empty params
-  in
-  let fv_map = go param_names body in
-  SM.bindings fv_map |> List.sort (fun (a, _) (b, _) -> String.compare a b)
-
 (** [wrap_fn_ref_as_closure state arg] — if [arg] is a bare [CVar]
     referring to a top-level function (not a local binding or a
     constructor) and its type is [TyFunc], synthesize an eta-expansion
@@ -311,8 +73,8 @@ let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
     Passing the raw function pointer at the call site would have the
     callee interpret it as a closure struct pointer and crash.
 
-    This mirrors the lambda-hoisting path, so all callbacks at emit
-time flow through [CClosureCreate]. *)
+    This keeps callbacks flowing through [CClosureCreate] before backend
+    handoff. *)
 let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
     core =
   match (arg.desc, arg.ty) with
@@ -390,91 +152,6 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
                 { cc_func = name; cc_def_id = def_id; cc_captures = [] };
           })
   | _ -> arg
-
-let task_capture_moves_env_slot (capture : task_capture) : bool =
-  match capture.task_capture_kind with
-  | TaskCopyCapture | TaskMoveResourceItem -> true
-  | TaskStructuredTaskBorrow -> false
-
-let balance_task_copy_capture (state : state) ~(loc : Ast.loc)
-    (capture : task_capture) (body : core) : core =
-  match capture.task_capture_kind with
-  | TaskCopyCapture ->
-      let param =
-        {
-          cp_name = Var.named capture.task_capture_name;
-          cp_ty = capture.task_capture_ty;
-          cp_loc = loc;
-        }
-      in
-      Core_perceus.balance_consumed_param_body state.perceus_env param body
-  | TaskMoveResourceItem | TaskStructuredTaskBorrow -> body
-
-let balance_task_copy_captures (state : state) ~(loc : Ast.loc)
-    (captures : task_capture list) (body : core) : core =
-  List.fold_right (balance_task_copy_capture state ~loc) captures body
-
-let hoist_task_closure ?(capture_kind_of = fun _ -> TaskCopyCapture)
-    (state : state) ~(loc : Ast.loc) ~(capturable : StringSet.t) ~(body : core)
-    ~(return_ty : Ast.type_expr) : task_closure =
-  let captures = collect_free_vars_filtered state ~capturable body [] in
-  let task_captures =
-    List.map
-      (fun (name, ty) ->
-        {
-          task_capture_name = name;
-          task_capture_ty = ty;
-          task_capture_kind = capture_kind_of name;
-        })
-      captures
-  in
-  let body = balance_task_copy_captures state ~loc task_captures body in
-  let moved_captures =
-    task_captures
-    |> List.filter_map (fun capture ->
-        if task_capture_moves_env_slot capture then
-          Some capture.task_capture_name
-        else None)
-  in
-  let id = state.task_counter in
-  state.task_counter <- id + 1;
-  let name = Printf.sprintf "_blorp_task_%d" id in
-  let def_id = Session.mint_def_id (Session.current ()) in
-  let hoisted_func =
-    {
-      cf_name = name;
-      cf_module = state.current_module;
-      cf_type_params = [];
-      cf_params = [];
-      cf_return_ty = return_ty;
-      cf_body = Some body;
-      cf_is_pure = false;
-      cf_kind =
-        CFClosureBody
-          {
-            ca_params = [];
-            ca_captures = captures;
-            ca_moved_captures = moved_captures;
-            ca_task_abi = true;
-          };
-      cf_def_id = def_id;
-    }
-  in
-  state.hoisted <-
-    { cd_desc = CDFunc hoisted_func; cd_loc = loc; cd_doc = None }
-    :: state.hoisted;
-  {
-    tc_func = name;
-    tc_def_id = def_id;
-    tc_captures = task_captures;
-    tc_return_ty = return_ty;
-  }
-
-let maybe_wrap_fn_ref_as_closure (state : state) ~(wrap_fn_refs : bool)
-    ~(bound : StringSet.t) (arg : core) : core =
-  if wrap_fn_refs && state.wrap_function_refs then
-    wrap_fn_ref_as_closure state ~bound arg
-  else arg
 
 let rec adapt_function_refs_ctree (state : state) (bound : StringSet.t)
     (tree : ctree) : ctree =
@@ -714,335 +391,7 @@ let rec adapt_function_refs_decl (state : state) (d : core_decl) : core_decl =
   in
   { d with cd_desc = desc' }
 
-(** Convert a single expression, hoisting any [CLambda] nodes. Bottom-up:
-    nested lambdas are converted first. Standalone tests may enable
-    function-reference wrapping here, but the main pipeline creates those
-    adapters before Perceus via [adapt_function_refs_program]. *)
-let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
-    ?(bound = StringSet.empty) (e : core) : core =
-  (* Recurse into children with context-aware wrapping. When function-reference
-     wrapping is enabled for standalone tests, direct-call callees stay bare
-     while first-class value positions are adapted. *)
-  let e =
-    match e.desc with
-    | CLambda lam ->
-        let body_bound = add_bound_typed_vars bound lam.lam_params in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound lam.lam_body)
-        in
-        { e with desc = CLambda { lam with lam_body = body' } }
-    | CCall (kind, callee, args) ->
-        let callee' = convert_expr state ~wrap_fn_refs ~bound callee in
-        let args' =
-          List.map
-            (fun a ->
-              maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-                (convert_expr state ~wrap_fn_refs ~bound a))
-            args
-        in
-        { e with desc = CCall (kind, callee', args') }
-    | CConcurrent block ->
-        let bindings' =
-          List.map
-            (fun (b : conc_binding) ->
-              let rhs' =
-                maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-                  (convert_expr state ~wrap_fn_refs ~bound b.cb_rhs)
-              in
-              let task' =
-                match b.cb_task with
-                | Some task -> Some task
-                | None ->
-                    Some
-                      (hoist_task_closure state ~loc:b.cb_rhs.loc
-                         ~capturable:bound ~body:rhs' ~return_ty:rhs'.ty)
-              in
-              { b with cb_rhs = rhs'; cb_task = task' })
-            block.conc_bindings
-        in
-        let body_bound =
-          List.fold_left
-            (fun acc (b : conc_binding) -> add_bound_var acc b.cb_var)
-            bound block.conc_bindings
-        in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound block.conc_body)
-        in
-        let timeout' =
-          Option.map
-            (fun timeout ->
-              maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-                (convert_expr state ~wrap_fn_refs ~bound timeout))
-            block.conc_timeout
-        in
-        {
-          e with
-          desc =
-            CConcurrent
-              {
-                block with
-                conc_bindings = bindings';
-                conc_body = body';
-                conc_timeout = timeout';
-              };
-        }
-    | CDetach detach ->
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound detach.detach_body)
-        in
-        let task' =
-          match detach.detach_task with
-          | Some task -> Some task
-          | None ->
-              Some
-                (hoist_task_closure state ~loc:detach.detach_body.loc
-                   ~capturable:bound ~body:body'
-                   ~return_ty:(Ast.TyNamed ("Void", [])))
-        in
-        { e with desc = CDetach { detach_body = body'; detach_task = task' } }
-    | CConcurrentlyLoop cf ->
-        let iter' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound cf.cf_iter)
-        in
-        let body_bound = add_bound_var bound cf.cf_var in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound cf.cf_body)
-        in
-        let timeout' =
-          Option.map
-            (fun timeout ->
-              maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-                (convert_expr state ~wrap_fn_refs ~bound timeout))
-            cf.cf_timeout
-        in
-        let width' =
-          Core.map_loop_width
-            (fun limit ->
-              maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-                (convert_expr state ~wrap_fn_refs ~bound limit))
-            cf.cf_width
-        in
-        let task' =
-          match cf.cf_task with
-          | Some task -> Some task
-          | None ->
-              let capture_kind_of name =
-                match cf.cf_item_mode with
-                | ConcurrentlyLoopMoveResourceItem _ when name = cf.cf_var.vname
-                  ->
-                    TaskMoveResourceItem
-                | ConcurrentlyLoopCopyItem | ConcurrentlyLoopMoveResourceItem _
-                  ->
-                    TaskCopyCapture
-              in
-              Some
-                (hoist_task_closure state ~loc:cf.cf_body.loc ~body:body'
-                   ~capturable:body_bound ~return_ty:body'.ty ~capture_kind_of)
-        in
-        {
-          e with
-          desc =
-            CConcurrentlyLoop
-              {
-                cf with
-                cf_iter = iter';
-                cf_body = body';
-                cf_timeout = timeout';
-                cf_width = width';
-                cf_task = task';
-              };
-        }
-    | CLet (b, body) ->
-        let rhs' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound b.bind_rhs)
-        in
-        let body_bound = add_bound_var bound b.bind_var in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound body)
-        in
-        { e with desc = CLet ({ b with bind_rhs = rhs' }, body') }
-    | CBorrowLet (b, body) ->
-        let rhs' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound b.borrow_rhs)
-        in
-        let body_bound = add_bound_var bound b.borrow_var in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound body)
-        in
-        { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
-    | CResourceScope s ->
-        let acquire' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound s.rs_acquire)
-        in
-        let body_bound = add_bound_var bound s.rs_var in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound s.rs_body)
-        in
-        let cleanup' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound s.rs_cleanup)
-        in
-        {
-          e with
-          desc =
-            CResourceScope
-              {
-                s with
-                rs_acquire = acquire';
-                rs_body = body';
-                rs_cleanup = cleanup';
-              };
-        }
-    | CFor (binder, iter, body) ->
-        let iter' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound iter)
-        in
-        let body_bound = add_bound_var bound binder.loop_var in
-        let body' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
-            (convert_expr state ~wrap_fn_refs ~bound:body_bound body)
-        in
-        { e with desc = CFor (binder, iter', body') }
-    | CMatchArms (scrut, arms) ->
-        let scrut' =
-          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-            (convert_expr state ~wrap_fn_refs ~bound scrut)
-        in
-        let arms' =
-          List.map
-            (fun (pat, body) ->
-              let arm_bound =
-                add_bound_names bound (Ast.collect_pattern_vars pat)
-              in
-              let body' =
-                maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs
-                  ~bound:arm_bound
-                  (convert_expr state ~wrap_fn_refs ~bound:arm_bound body)
-              in
-              (pat, body'))
-            arms
-        in
-        { e with desc = CMatchArms (scrut', arms') }
-    | _ ->
-        map_children
-          (fun c ->
-            maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
-              (convert_expr state ~wrap_fn_refs ~bound c))
-          e
-  in
-  match e.desc with
-  | CLambda lam ->
-      let captures =
-        collect_free_vars_filtered state ~capturable:bound lam.lam_body
-          lam.lam_params
-      in
-      let id = state.counter in
-      state.counter <- id + 1;
-      let name = Printf.sprintf "_blorp_clambda_%d" id in
-      let def_id = Session.mint_def_id (Session.current ()) in
-      (* Hoist the function body as a CDFunc with closure ABI *)
-      let hoisted_func =
-        {
-          cf_name = name;
-          cf_module = state.current_module;
-          cf_type_params = [];
-          cf_params = [];
-          cf_return_ty = lam.lam_return_ty;
-          cf_body = Some lam.lam_body;
-          cf_is_pure = lam.lam_is_pure;
-          cf_kind =
-            CFClosureBody
-              {
-                ca_params = lam.lam_params;
-                ca_captures = captures;
-                ca_moved_captures = [];
-                ca_task_abi = false;
-              };
-          cf_def_id = def_id;
-        }
-      in
-      state.hoisted <-
-        { cd_desc = CDFunc hoisted_func; cd_loc = e.loc; cd_doc = None }
-        :: state.hoisted;
-      {
-        e with
-        desc =
-          CClosureCreate
-            { cc_func = name; cc_def_id = def_id; cc_captures = captures };
-      }
-  | _ -> e
-
-(** Convert lambdas in a function body. *)
-let convert_func (state : state) ~(wrap_fn_refs : bool) (f : core_func) :
-    core_func =
-  match f.cf_body with
-  | None -> f
-  | Some body ->
-      let prev_module = state.current_module in
-      state.current_module <- f.cf_module;
-      let body' =
-        maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:StringSet.empty
-          (convert_expr state ~wrap_fn_refs ~bound:StringSet.empty body)
-      in
-      let result = { f with cf_body = Some body' } in
-      state.current_module <- prev_module;
-      result
-
-(** Convert lambdas in a variable initializer. *)
-let convert_var (state : state) (v : core_var) : core_var =
-  let prev_module = state.current_module in
-  state.current_module <- v.cv_module;
-  let result =
-    {
-      v with
-      cv_init =
-        maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs:true
-          ~bound:StringSet.empty
-          (convert_expr state ~wrap_fn_refs:true ~bound:StringSet.empty
-             v.cv_init);
-    }
-  in
-  state.current_module <- prev_module;
-  result
-
-(** Convert lambdas in impl methods. *)
-let convert_impl (state : state) (i : core_impl) : core_impl =
-  {
-    i with
-    ci_methods = List.map (convert_func state ~wrap_fn_refs:true) i.ci_methods;
-  }
-
-(** Convert lambdas in all declarations. The main pipeline disables function-ref
-    wrapping here because [adapt_function_refs_program] already created those
-    adapters before Perceus. *)
-let rec convert_decl (state : state) (d : core_decl) : core_decl =
-  let desc' =
-    match d.cd_desc with
-    | CDFunc f -> CDFunc (convert_func state ~wrap_fn_refs:true f)
-    | CDVar v -> CDVar (convert_var state v)
-    | CDImpl i -> CDImpl (convert_impl state i)
-    | CDPrivate inner -> CDPrivate (convert_decl state inner)
-    | (CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _ | CDTrait _) as other
-      ->
-        other
-  in
-  { d with cd_desc = desc' }
-
-(** Scan program for constructor and global function names.
-    Needed to filter free variables (constructors and globals
-    are not captures). *)
+(** Scan program for constructor and global function names. *)
 let starts_with s prefix =
   let slen = String.length s in
   let plen = String.length prefix in
@@ -1150,20 +499,15 @@ let scan_names (prog : core_program) :
     prog;
   (ctors, function_refs, function_refs_by_def_id)
 
-let make_state ?(wrap_function_refs = true) (prog : core_program) : state =
+let make_state (prog : core_program) : state =
   let ctors, function_refs, function_refs_by_def_id = scan_names prog in
-  let perceus_env = Core_perceus.build_type_env prog in
-  Core_perceus.populate_user_call_contracts perceus_env prog;
   {
     counter = 0;
-    task_counter = 0;
     hoisted = [];
     current_module = None;
-    perceus_env;
     constructor_names = ctors;
     global_function_refs = function_refs;
     global_function_refs_by_def_id = function_refs_by_def_id;
-    wrap_function_refs;
   }
 
 (** Rewrite bare global function references into explicit closure eta adapters
@@ -1173,15 +517,3 @@ let adapt_function_refs_program (prog : core_program) : core_program =
   let state = make_state prog in
   let adapted = List.map (adapt_function_refs_decl state) prog in
   adapted @ List.rev state.hoisted
-
-(** Convert all [CLambda] nodes in a program to [CClosureCreate] + hoisted
-    [CDFunc] declarations. Returns the program with hoisted functions
-    prepended. *)
-let convert_program ?(wrap_function_refs = true) (prog : core_program) :
-    core_program =
-  let prog = prune_non_runtime_templates prog in
-  let state = make_state ~wrap_function_refs prog in
-  let converted = List.map (convert_decl state) prog in
-  (* Append hoisted lambda functions after the main program —
-     they reference module functions that must be forward-declared first *)
-  converted @ List.rev state.hoisted

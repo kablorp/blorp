@@ -1592,7 +1592,7 @@ let check_cooperative_checkpoints_at (stage : Core_stage.t)
   let violation e acc =
     violation_at stage e.Core.loc
       ~hint:
-        "Core_fairness is the only pass that should create \
+        "the fairness pass is the only pass that should create \
          CCooperativeCheckpoint, and it may appear only as the first \
          expression in a loop body. Use source-level yield_now() for explicit \
          user handoff."

@@ -543,7 +543,7 @@ let compile_loaded_program ~source_kind ?(debug = false)
     ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?program_observation ?(check_invariants = false) ~filename ~program () =
+    ?(check_invariants = false) ~filename ~program () =
   let allow_debug_only_calls =
     Option.value allow_debug_only_calls ~default:debug
   in
@@ -583,7 +583,7 @@ let compile_loaded_program ~source_kind ?(debug = false)
                   (List.rev main_state.Typecheck.import_bindings)
                 ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
                 ?on_stage_event ?on_stage_json ?tail_observation_stages
-                ?program_observation ~check_invariants typed_program
+                ~check_invariants typed_program
             in
             Ok
               (Compiled
@@ -632,8 +632,8 @@ let compile_loaded_program ~source_kind ?(debug = false)
 let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
     ?retain_debug_blocks ?(embed_runtime = true) ?(require_main = false)
     ?(profile = false) ?on_frontend_phase ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ?program_observation
-    ?(check_invariants = false) ~filename ~source () =
+    ?on_stage_json ?tail_observation_stages ?(check_invariants = false)
+    ~filename ~source () =
   with_fresh_session filename (fun () ->
       match parse_and_load_modules ?on_frontend_phase ~source_kind ~filename source with
       | Error _ as e -> e
@@ -641,13 +641,12 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
           compile_loaded_program ~source_kind ~debug ?allow_debug_only_calls
             ?retain_debug_blocks ~embed_runtime ~require_main ~profile
             ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-            ?tail_observation_stages ?program_observation ~check_invariants
-            ~filename ~program ())
+            ?tail_observation_stages ~check_invariants ~filename ~program ())
 
 let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
     ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?program_observation ?check_invariants ~filename ~program () =
+    ?check_invariants ~filename ~program () =
   with_fresh_session filename (fun () ->
       match load_modules_after_parse ?on_frontend_phase ~filename program with
       | Error _ as e -> e
@@ -655,18 +654,17 @@ let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
           compile_loaded_program ~source_kind:User_source ?debug
             ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
             ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
-            ?on_stage_json ?tail_observation_stages ?program_observation
-            ?check_invariants ~filename ~program ())
+            ?on_stage_json ?tail_observation_stages ?check_invariants ~filename
+            ~program ())
 
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
     ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ?program_observation
-    ?check_invariants ~filename ~source () =
+    ?on_stage_json ?tail_observation_stages ?check_invariants ~filename ~source
+    () =
   compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?program_observation ?check_invariants ~filename
-    ~source ()
+    ?tail_observation_stages ?check_invariants ~filename ~source ()
 
 let compile_generated_test_harness ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ~filename ~source () =
