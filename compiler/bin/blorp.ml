@@ -1759,9 +1759,7 @@ let run_package_from_frontier_options
           1)
 
 let is_internal_compiler_command = function
-  | "__compiler-tests" :: _
-  | "__compiler-bridge" :: _
-  | "__compiler-bridge-prepare" :: _ ->
+  | "__compiler-bridge" :: _ | "__compiler-bridge-prepare" :: _ ->
       true
   | _ -> false
 
@@ -1807,7 +1805,6 @@ let command_line_args () =
 
 let run_delegate_command args =
   match args with
-  | "__compiler-tests" :: rest -> exit (Compiler_test_runner.run_cli rest)
   | "__compiler-bridge" :: rest -> exit (run_compiler_bridge_command rest)
   | "__compiler-bridge-prepare" :: rest ->
       exit (run_compiler_bridge_prepare_command rest)

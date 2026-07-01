@@ -468,10 +468,9 @@ compiler/            # OCaml compiler implementation
     core_resource.ml  # Resource-scope cleanup-exit lowering
     core_fairness.ml  # Cooperative loop checkpoint insertion
     core_codegen_prepare.ml  # Final Core representation preparation
-    core_emit.ml      # Core IR → C emission
-    core_emit_c.ml    # Default C backend wrapper
+    core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client
     core_pipeline.ml  # Core IR pipeline orchestration
-    core_emit_context.ml  # Core emission state
+    core_emit_util.ml, core_emit_layout.ml  # Shared late-backend helpers
     core_intrinsics.ml  # IR body synthesis for builtins/intrinsics
     core_intrinsic_registry.ml  # Intrinsic manifest and contracts
     core_invariants.ml  # Stage-boundary invariant checks
@@ -559,7 +558,7 @@ tests/
     format/       # Formatter tests (should_pass/should_fail/should_error)
     purify/       # Auto-purify tests (should_purify/should_not_purify/should_rewrite)
     codegen_audit/  # Codegen correctness tests
-  stages/         # Golden tests (lexer/parser/typecheck/codegen snapshots)
+  stages/         # Historical golden fixtures used as migration inputs
 
 editor/             # IDE/editor support
   vscode/           # VSCode extension (TextMate grammar, language config)

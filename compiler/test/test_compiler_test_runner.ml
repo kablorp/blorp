@@ -1,6 +1,8 @@
+module Runner = Blorp_compiler_fixture_runner.Compiler_test_runner
+
 let test_codegen_audit_nonzero_after_passes_counts_runner_failure () =
   let summary =
-    Blorp.Compiler_test_runner.summarize_codegen_audit_output ~exit_code:1
+    Runner.summarize_codegen_audit_output ~exit_code:1
       "PASS: generated_ok.brp\nResults: 1 passed, 0 failed\n"
   in
   Alcotest.(check int) "case pass count" 1 summary.codegen_passed;
@@ -19,7 +21,7 @@ let test_codegen_audit_nonzero_after_passes_counts_runner_failure () =
 
 let test_codegen_audit_zero_exit_after_passes_has_no_runner_failure () =
   let summary =
-    Blorp.Compiler_test_runner.summarize_codegen_audit_output ~exit_code:0
+    Runner.summarize_codegen_audit_output ~exit_code:0
       "PASS: generated_ok.brp\nResults: 1 passed, 0 failed\n"
   in
   Alcotest.(check int) "case pass count" 1 summary.codegen_passed;
@@ -31,7 +33,7 @@ let test_codegen_audit_zero_exit_after_passes_has_no_runner_failure () =
 
 let test_codegen_audit_nonzero_before_cases_counts_runner_failure () =
   let summary =
-    Blorp.Compiler_test_runner.summarize_codegen_audit_output ~exit_code:118
+    Runner.summarize_codegen_audit_output ~exit_code:118
       "internal compiler error\n"
   in
   Alcotest.(check int) "no case pass count" 0 summary.codegen_passed;
@@ -45,16 +47,19 @@ let test_codegen_audit_nonzero_before_cases_counts_runner_failure () =
   | None -> Alcotest.fail "expected runner failure details"
 
 let expectations_for source =
-  Blorp.Compiler_test_runner.parse_expectation_groups source
-  |> Blorp.Compiler_test_runner.expectations_for_blorp_frontend
+  Runner.parse_expectation_groups source
+  |> Runner.expectations_for_blorp_frontend
 
 let check_expectations label expected actual =
-  Alcotest.(check (list string)) (label ^ " exact") expected.Blorp.Compiler_test_runner.exact actual.Blorp.Compiler_test_runner.exact;
-  Alcotest.(check (list string)) (label ^ " contains") expected.contains actual.contains;
-  Alcotest.(check (list string)) (label ^ " not_contains") expected.not_contains actual.not_contains
+  Alcotest.(check (list string)) (label ^ " exact") expected.Runner.exact
+    actual.Runner.exact;
+  Alcotest.(check (list string)) (label ^ " contains") expected.contains
+    actual.contains;
+  Alcotest.(check (list string)) (label ^ " not_contains")
+    expected.not_contains actual.not_contains
 
 let expectation ~exact ~contains ~not_contains =
-  { Blorp.Compiler_test_runner.exact; contains; not_contains }
+  { Runner.exact; contains; not_contains }
 
 let test_expectations_use_generic_when_frontend_has_no_override () =
   let source =

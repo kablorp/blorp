@@ -367,7 +367,6 @@ compiler/
 │   ├── core_option_layout.ml # Option representation selection
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
-│   ├── core_layout_type.ml  # Shared layout metadata types
 │   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
 │   ├── core_emit_util.ml  # Shared late-backend helper utilities
 │   ├── core_intrinsics.ml # IR body synthesis for builtins/intrinsics

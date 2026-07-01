@@ -93,7 +93,7 @@ tests/
 ├── test_lsp.sh            # LSP protocol integration smoke run by test_cli.sh
 ├── test_repl.sh, test_auto_format.sh, test_leak_report.sh
 │                           # Standalone smoke tests, not part of scripts/test
-├── stages/                # Historical golden fixtures; runners need refresh before use
+├── stages/                # Historical golden fixtures used as migration inputs
 └── test_compiler/         # Compiler behavior tests
     ├── parser/            # Parser/lexer tests
     │   ├── should_pass/   # Valid syntax that must parse
