@@ -426,7 +426,8 @@ Acceptance criteria:
 - Existing parser fixtures pass through Blorp parser parity:
   `tests/test_compiler/parser/should_pass` and
   `tests/test_compiler/parser/should_fail`.
-- AST parity covers the stage parser fixtures in `tests/stages/parser/ast`.
+- AST parity is covered by current compiler parser fixtures and focused
+  `compiler/blorp/tests` parser suites, not retired stage goldens.
 - Error substring and representative line/column assertions match current
   behavior.
 
