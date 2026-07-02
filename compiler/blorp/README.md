@@ -10,6 +10,9 @@ backend route owns a real Core tail: `compiler_core_reuse.brp`,
 `compiler_core_closure.brp`, `compiler_core_resource.brp`,
 `compiler_core_fairness.brp`, `compiler_core_prepare.brp`, then
 `compiler_core_emit.brp`.
+Shared shallow Core expression traversal helpers live in
+`compiler_core_traverse.brp`; pipeline passes still own their phase-specific
+recursive rules.
 
 The frontend migration has a live hoisted parser path backed by
 `compiler_source.brp`, `compiler_parse_diagnostic.brp`, `compiler_token.brp`,

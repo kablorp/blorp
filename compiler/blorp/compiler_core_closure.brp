@@ -44,6 +44,7 @@ import:
 		),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
 		CoreDictEntry,
+		CoreDictLiteralEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			AssignExpr,
@@ -61,6 +62,7 @@ import:
 			CooperativeCheckpointExpr,
 			DetachExpr,
 			DictConstructExpr,
+			DictExpr,
 			DropExpr,
 			DupExpr,
 			FieldExpr,
@@ -123,6 +125,7 @@ import:
 			UnionReuseConstructExpr,
 			UnboxExpr,
 			VarExpr,
+			VectorExpr,
 			VoidExpr,
 			WhileExpr,
 		),
@@ -269,6 +272,12 @@ record ConvertedRecordFields {
 record ConvertedDictEntries {
 	state: ClosureState,
 	entries: List[CoreDictEntry]
+}
+
+
+record ConvertedDictLiteralEntries {
+	state: ClosureState,
+	entries: List[CoreDictLiteralEntry]
 }
 
 
@@ -726,6 +735,25 @@ private pure func max_optional_expr_def_id(current: Int, expr: Option[CoreExpr])
 			current
 
 
+private pure func max_dict_literal_entry_def_id(current: Int, entry: CoreDictLiteralEntry) -> Int:
+	max_expr_def_id(
+		max_expr_def_id(current, entry.key),
+		entry.value,
+	)
+
+
+private pure func max_dict_literal_entries_def_id(
+	current: Int,
+	entries: List[CoreDictLiteralEntry],
+) -> Int:
+	var result: Int = current
+
+	for entry in entries:
+		result = max_dict_literal_entry_def_id(result, entry)
+
+	result
+
+
 private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -772,6 +800,8 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 			max_exprs_def_id(current, items)
 		TupleConstructExpr(tuple_construct, typ, loc):
 			max_tuple_elements_def_id(current, tuple_construct.elements)
+		VectorExpr(items, typ, loc):
+			max_exprs_def_id(current, items)
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			max_expr_def_id(current, lambda_body)
 		ClosureCreateExpr(closure, typ, loc):
@@ -846,6 +876,8 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 			var result: Int = max_var_def_id(current, binding.variable)
 			result = max_expr_def_id(result, binding.source)
 			max_expr_def_id(result, body)
+		DictExpr(entries, typ, loc):
+			max_dict_literal_entries_def_id(current, entries)
 		DictConstructExpr(construct, typ, loc):
 			max_dict_entries_def_id(current, construct.entries)
 		SetAllocExpr(alloc, typ, loc):
@@ -1166,6 +1198,26 @@ private pure func free_vars_dict_entries(
 	result
 
 
+private pure func free_vars_dict_literal_entries(
+	state: ClosureState,
+	bound: List[String],
+	entries: List[CoreDictLiteralEntry],
+) -> List[FreeVar]:
+	var result: List[FreeVar] = []
+
+	for entry in entries:
+		result = merge_free_vars(
+			result,
+			free_vars_expr(state, bound, entry.key),
+		)
+		result = merge_free_vars(
+			result,
+			free_vars_expr(state, bound, entry.value),
+		)
+
+	result
+
+
 private pure func free_vars_tensor_payload(
 	state: ClosureState,
 	bound: List[String],
@@ -1417,10 +1469,12 @@ private pure func free_vars_expr(
 			else if contains_name(state.function_names, variable.name):
 				[]
 			else:
-				[{
+				[
+					{
 						name = variable.name,
 						typ = typ
-					}]
+					},
+				]
 		LiteralExpr(literal, typ, loc):
 			[]
 		VoidExpr(typ, loc):
@@ -1465,6 +1519,8 @@ private pure func free_vars_expr(
 			free_vars_exprs(state, bound, items)
 		TupleConstructExpr(tuple_construct, typ, loc):
 			free_vars_tuple_elements(state, bound, tuple_construct.elements)
+		VectorExpr(items, typ, loc):
+			free_vars_exprs(state, bound, items)
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			free_vars_expr(
 				state,
@@ -1595,6 +1651,8 @@ private pure func free_vars_expr(
 					body,
 				),
 			)
+		DictExpr(entries, typ, loc):
+			free_vars_dict_literal_entries(state, bound, entries)
 		DictConstructExpr(construct, typ, loc):
 			free_vars_dict_entries(state, bound, construct.entries)
 		SetAllocExpr(alloc, typ, loc):
@@ -2038,6 +2096,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		TupleConstructExpr(tuple_construct, typ, loc):
 			typ
+		VectorExpr(items, typ, loc):
+			typ
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			typ
 		ClosureCreateExpr(closure, typ, loc):
@@ -2075,6 +2135,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		TensorRawWriteExpr(write, typ, loc):
 			typ
 		TensorRawViewLetExpr(binding, body, typ, loc):
+			typ
+		DictExpr(entries, typ, loc):
 			typ
 		DictConstructExpr(construct, typ, loc):
 			typ
@@ -2259,6 +2321,8 @@ private pure func expr_is_var_ref(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		TupleConstructExpr(tuple_construct, typ, loc):
 			False
+		VectorExpr(items, typ, loc):
+			False
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			False
 		ClosureCreateExpr(closure, typ, loc):
@@ -2302,6 +2366,8 @@ private pure func expr_is_var_ref(expr: CoreExpr, variable: CoreVar) -> Bool:
 		TensorRawWriteExpr(write, typ, loc):
 			False
 		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictExpr(entries, typ, loc):
 			False
 		DictConstructExpr(construct, typ, loc):
 			False
@@ -2541,6 +2607,25 @@ private pure func dict_entries_consume_var(entries: List[CoreDictEntry], variabl
 	found
 
 
+private pure func dict_literal_entries_consume_var(
+	entries: List[CoreDictLiteralEntry],
+	variable: CoreVar,
+) -> Bool:
+	var found: Bool = False
+
+	for entry in entries:
+		if expr_consumes_var(entry.key, variable):
+			found = True
+			break
+		else if expr_consumes_var(entry.value, variable):
+			found = True
+			break
+		else:
+			void
+
+	found
+
+
 private pure func tensor_payload_consumes_var(
 	payload: CoreTensorLiteralPayload,
 	variable: CoreVar,
@@ -2580,7 +2665,7 @@ private pure func core_type_is_void(typ: CoreType) -> Bool:
 			False
 		RangeType:
 			False
-		TensorType:
+		TensorType(info):
 			False
 		TupleType(items):
 			False
@@ -3135,6 +3220,8 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			exprs_consume_var(items, variable)
 		TupleConstructExpr(tuple_construct, typ, loc):
 			tuple_elements_consume_var(tuple_construct.elements, variable)
+		VectorExpr(items, typ, loc):
+			exprs_consume_var(items, variable)
 		ClosureCreateExpr(closure, typ, loc):
 			False
 		ListConstructExpr(construct, typ, loc):
@@ -3203,6 +3290,8 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			expr_consumes_var(read.index, variable)
 		TensorRawWriteExpr(write, typ, loc):
 			expr_consumes_var(write.index, variable) or expr_consumes_var(write.value, variable)
+		DictExpr(entries, typ, loc):
+			dict_literal_entries_consume_var(entries, variable)
 		DictConstructExpr(construct, typ, loc):
 			dict_entries_consume_var(construct.entries, variable)
 		SetAllocExpr(alloc, typ, loc):
@@ -3612,6 +3701,29 @@ private pure func convert_dict_entries(
 		result = result.append({
 			key = key.value,
 			value = value.value,
+		})
+
+	{
+		state = current,
+		entries = result
+	}
+
+
+private pure func convert_dict_literal_entries(
+	state: ClosureState,
+	bound: List[String],
+	entries: List[CoreDictLiteralEntry],
+) -> ConvertedDictLiteralEntries:
+	var current: ClosureState = state
+	var result: List[CoreDictLiteralEntry] = []
+
+	for entry in entries:
+		key: ConvertedExpr = convert_expr(current, bound, entry.key)
+		value: ConvertedExpr = convert_expr(key.state, bound, entry.value)
+		current = value.state
+		result = result.append({
+			key = key.expr,
+			value = value.expr,
 		})
 
 	{
@@ -4063,6 +4175,12 @@ private pure func convert_expr(
 					loc,
 				)
 			}
+		VectorExpr(items, typ, loc):
+			converted: ConvertedExprs = convert_exprs(state, bound, items)
+			{
+				state = converted.state,
+				expr = VectorExpr(converted.exprs, typ, loc)
+			}
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			body_bound: List[String] = add_bound_params(bound, params)
 			body_converted: ConvertedExpr = convert_expr(state, body_bound, body)
@@ -4343,6 +4461,16 @@ private pure func convert_expr(
 			{
 				state = converted.state,
 				expr = DictConstructExpr({ construct | entries = converted.entries }, typ, loc)
+			}
+		DictExpr(entries, typ, loc):
+			converted: ConvertedDictLiteralEntries = convert_dict_literal_entries(
+				state,
+				bound,
+				entries,
+			)
+			{
+				state = converted.state,
+				expr = DictExpr(converted.entries, typ, loc)
 			}
 		SetAllocExpr(alloc, typ, loc):
 			{

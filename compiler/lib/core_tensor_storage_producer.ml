@@ -5,8 +5,8 @@
     is known by the compiler.
 
     Calls still arrive here as [CKBuiltin] C names. That string boundary is
-    transitional and intentionally isolated here so [Core_codegen_prepare] can
-    consume a typed contract instead of carrying ad hoc name lists. *)
+    transitional and intentionally isolated here so late layout users consume a
+    typed contract instead of carrying ad hoc name lists. *)
 
 type source_arg = SourceArg0 | SourceArg1 | SourceArg2
 type storage_rule = KnownResultLayout | PreservesArgLayout of source_arg

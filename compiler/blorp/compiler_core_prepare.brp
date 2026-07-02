@@ -53,6 +53,7 @@ import:
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
 		CoreDictConstruct,
 		CoreDictEntry,
+		CoreDictLiteralEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			AssignExpr,
@@ -69,6 +70,7 @@ import:
 			ContinueExpr,
 			CooperativeCheckpointExpr,
 			DetachExpr,
+			DictExpr,
 			DictConstructExpr,
 			DupExpr,
 			DropExpr,
@@ -131,11 +133,18 @@ import:
 			UnionConstructExpr,
 			UnionReuseConstructExpr,
 			VarExpr,
+			VectorExpr,
 			VoidExpr,
 			WhileExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			FloatHashContainerConstructor,
+			GenericHashContainerConstructor,
+			StringHashContainerConstructor,
+		),
 		CoreHeapRecordDecl,
 		CoreListAlloc,
 		CoreListConstruct,
@@ -185,9 +194,11 @@ import:
 		CoreTailrecListSpreadLoop,
 		CoreTailrecListSpreadRebind,
 		CoreTensorBoxedLiteral,
+		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
 		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTensorLiteral,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreTensorLiteralShape(TensorStaticShape, TensorVectorLength),
 		CoreTensorPackedLiteral,
 		CoreTensorRawFill,
 		CoreTensorRawRead,
@@ -231,6 +242,7 @@ import:
 		CoreValueRecordDecl,
 		CoreVar,
 		clone_tensor_for_element_storage,
+	compiler_core_traverse as CoreTraverse
 
 
 record PreparedTupleLiteral {
@@ -390,7 +402,7 @@ private pure func order_heap_record_fields(
 
 
 private pure func prepare_exprs(decls: List[CoreDecl], exprs: List[CoreExpr]) -> List[CoreExpr]:
-	exprs.map(func(expr): prepare_expr(decls, expr))
+	CoreTraverse.map_core_exprs(exprs, func(expr): prepare_expr(decls, expr))
 
 
 private pure func prepare_tailrec_list_spread_rebind(
@@ -459,6 +471,8 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		TupleConstructExpr(tuple_construct, typ, loc):
 			typ
+		VectorExpr(items, typ, loc):
+			typ
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			typ
 		ClosureCreateExpr(closure, typ, loc):
@@ -502,6 +516,8 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 		TensorRawWriteExpr(write, typ, loc):
 			typ
 		TensorRawViewLetExpr(binding, body, typ, loc):
+			typ
+		DictExpr(entries, typ, loc):
 			typ
 		DictConstructExpr(construct, typ, loc):
 			typ
@@ -636,7 +652,7 @@ private pure func primitive_box_type(typ: CoreType) -> Bool:
 			False
 		UnionType(name):
 			False
-		TensorType:
+		TensorType(info):
 			False
 		TupleType(items):
 			False
@@ -745,7 +761,7 @@ private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 			True
 		TupleType(items):
 			True
-		TensorType:
+		TensorType(info):
 			True
 		VoidType:
 			False
@@ -757,7 +773,7 @@ private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 			False
 
 
-private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBoxKind) -> Bool:
+private pure func boxed_storage_type_needs_release(typ: CoreType, kind: CoreBoxKind) -> Bool:
 	match kind:
 		StructBox(c_type):
 			True
@@ -766,7 +782,7 @@ private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBo
 		UInt128Box:
 			True
 		PointerBox:
-			pointer_box_storage_needs_release_type(expr_type(expr))
+			pointer_box_storage_needs_release_type(typ)
 		FloatBox:
 			False
 		Float32Box:
@@ -777,6 +793,10 @@ private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBo
 			False
 		VoidBox:
 			False
+
+
+private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBoxKind) -> Bool:
+	boxed_storage_type_needs_release(expr_type(expr), kind)
 
 
 private pure func boxed_storage_value_for_expr(expr: CoreExpr) -> CoreBoxedStorageValue:
@@ -1129,11 +1149,7 @@ private pure func prepare_optional_expr(
 	decls: List[CoreDecl],
 	expr: Option[CoreExpr],
 ) -> Option[CoreExpr]:
-	match expr:
-		Some(value):
-			Some(prepare_expr(decls, value))
-		None:
-			None
+	CoreTraverse.map_core_optional_expr(expr, func(value): prepare_expr(decls, value))
 
 
 private pure func prepare_concurrently_loop(
@@ -1251,7 +1267,7 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		RangeType:
 			True
-		TensorType:
+		TensorType(info):
 			False
 		TupleType(items):
 			False
@@ -1304,7 +1320,7 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		RangeType:
 			False
-		TensorType:
+		TensorType(info):
 			True
 
 
@@ -1330,7 +1346,7 @@ private pure func is_unmanaged_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		RangeType:
 			False
-		TensorType:
+		TensorType(info):
 			False
 
 
@@ -1371,7 +1387,7 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 			None
 		RangeType:
 			None
-		TensorType:
+		TensorType(info):
 			None
 		TupleType(items):
 			None
@@ -1392,7 +1408,7 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			True
 		TupleType(items):
 			True
-		TensorType:
+		TensorType(info):
 			True
 		StackResultType(ok_type, err_type):
 			False
@@ -1435,7 +1451,7 @@ private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[C
 			None
 		RangeType:
 			None
-		TensorType:
+		TensorType(info):
 			None
 		TupleType(items):
 			None
@@ -1540,10 +1556,12 @@ private pure func tensor_storage_env_add(
 	variable: CoreVar,
 	raw_kind: CoreTensorRawScalarKind,
 ) -> List[TensorStorageBinding]:
-	[{
+	[
+		{
 			variable = variable,
 			raw_kind = raw_kind
-		}] + tensor_storage_env_without(env, variable)
+		},
+	] + tensor_storage_env_without(env, variable)
 
 
 private pure func tensor_fill_raw_kind(name: String) -> Option[CoreTensorRawScalarKind]:
@@ -1896,6 +1914,8 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 		TupleConstructExpr(tuple_construct, typ, loc):
 			False
+		VectorExpr(items, typ, loc):
+			False
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			False
 		ClosureCreateExpr(closure, typ, loc):
@@ -1937,6 +1957,8 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 		TensorRawWriteExpr(write, typ, loc):
 			False
 		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictExpr(entries, typ, loc):
 			False
 		DictConstructExpr(construct, typ, loc):
 			False
@@ -2087,7 +2109,7 @@ private pure func prepared_tuple_literal(
 
 							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
-						TensorType:
+						TensorType(info):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
@@ -2170,10 +2192,493 @@ private pure func prepare_tuple_expr(
 			TupleExpr(prepared_items, typ, loc)
 		RangeType:
 			TupleExpr(prepared_items, typ, loc)
-		TensorType:
+		TensorType(info):
 			TupleExpr(prepared_items, typ, loc)
 		VoidType:
 			TupleExpr(prepared_items, typ, loc)
+
+
+private pure func vector_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		TensorType(info):
+			Some(info.element_type)
+		NamedType(name, args):
+			if name == "Vector" or name == "Tensor":
+				match args:
+					[elem_type]:
+						Some(elem_type)
+					[elem_type, ...dims]:
+						Some(elem_type)
+					[]:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func vector_literal_element_type(
+	typ: CoreType,
+	items: List[CoreExpr],
+) -> Option[CoreType]:
+	vector_element_type(typ)
+
+
+private pure func static_tensor_dims(dims: List[CoreTensorDim]) -> Option[List[Int]]:
+	var values: List[Int] = []
+	var all_static: Bool = True
+
+	for dim in dims:
+		match dim:
+			TensorStaticDim(value):
+				values = values.append(value)
+			TensorRuntimeDim(name):
+				all_static = False
+				break
+
+	if all_static:
+		Some(values)
+	else:
+		None
+
+
+private pure func tensor_static_shape_from_dims(dims: List[Int]) -> CoreTensorLiteralShape:
+	match dims:
+		[length]:
+			TensorVectorLength(length)
+		_:
+			TensorStaticShape(dims)
+
+
+private pure func vector_literal_shape(
+	typ: CoreType,
+	flattened_items: FlattenedVectorItems,
+) -> CoreTensorLiteralShape:
+	match typ:
+		TensorType(info):
+			match static_tensor_dims(info.dims):
+				Some(dims):
+					tensor_static_shape_from_dims(dims)
+				None:
+					flattened_items.shape
+		_:
+			flattened_items.shape
+
+
+private pure func raw_scalar_kind_for_tensor_element_type(
+	elem_type: CoreType,
+) -> Option[CoreTensorRawScalarKind]:
+	match elem_type:
+		NamedType(name, args):
+			if name == "Float" and args.length() == 0:
+				Some(TensorFloat64Elements)
+			else if name == "Float32" and args.length() == 0:
+				Some(TensorFloat32Elements)
+			else if name == "Int" and args.length() == 0:
+				Some(TensorInt64Elements)
+			else:
+				None
+		_:
+			None
+
+
+private pure func boxed_values_need_release(values: List[CoreBoxedStorageValue]) -> Bool:
+	var result: Bool = False
+
+	for value in values:
+		if value.needs_release:
+			result = True
+			break
+
+	result
+
+
+private record TensorLiteralRow {
+	elements: List[CoreExpr],
+	length: Int
+}
+
+
+private record FlattenedVectorItems {
+	elements: List[CoreExpr],
+	shape: CoreTensorLiteralShape
+}
+
+
+private pure func int_product_from_first(first: Int, rest: List[Int]) -> Int:
+	var total: Int = first
+
+	for value in rest:
+		total *= value
+
+	total
+
+
+private pure func tensor_literal_shape_total_length(shape: CoreTensorLiteralShape) -> Option[Int]:
+	match shape:
+		TensorVectorLength(length):
+			Some(length)
+		TensorStaticShape(dims):
+			match dims:
+				[]:
+					Some(0)
+				[first, ...rest]:
+					Some(int_product_from_first(first, rest))
+
+
+private pure func boxed_storage_value_exprs(values: List[CoreBoxedStorageValue]) -> List[CoreExpr]:
+	var result: List[CoreExpr] = []
+
+	for value in values:
+		result = result.append(value.value)
+
+	result
+
+
+private pure func tensor_literal_row(expr: CoreExpr) -> Option[TensorLiteralRow]:
+	match expr:
+		TensorLiteralExpr(literal, typ, loc):
+			length ?= tensor_literal_shape_total_length(literal.shape)
+
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					Some({
+						elements = raw.elements,
+						length = length,
+					})
+				TensorInlineStructLiteralPayload(inline_struct):
+					Some({
+						elements = inline_struct.elements,
+						length = length,
+					})
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			length ?= tensor_literal_shape_total_length(literal.shape)
+
+			Some({
+				elements = boxed_storage_value_exprs(literal.elements),
+				length = length,
+			})
+		TensorPackedLiteralExpr(literal, typ, loc):
+			length ?= tensor_literal_shape_total_length(literal.shape)
+
+			Some({
+				elements = literal.elements,
+				length = length,
+			})
+		_:
+			None
+
+
+private pure func append_exprs(target: List[CoreExpr], values: List[CoreExpr]) -> List[CoreExpr]:
+	var result: List[CoreExpr] = target
+
+	for value in values:
+		result = result.append(value)
+
+	result
+
+
+private pure func flatten_vector_literal_items(items: List[CoreExpr]) -> FlattenedVectorItems:
+	var flattened: List[CoreExpr] = []
+	var expected_row_length: Option[Int] = None
+	var is_ranked: Bool = items.length() > 0
+
+	for item in items:
+		if is_ranked:
+			match tensor_literal_row(item):
+				Some(row):
+					match expected_row_length:
+						Some(length):
+							if length == row.length:
+								flattened = append_exprs(flattened, row.elements)
+							else:
+								is_ranked = False
+						None:
+							expected_row_length = Some(row.length)
+							flattened = append_exprs(flattened, row.elements)
+				None:
+					is_ranked = False
+
+	if is_ranked:
+		match expected_row_length:
+			Some(row_length):
+				{
+					elements = flattened,
+					shape = TensorStaticShape([items.length(), row_length])
+				}
+			None:
+				{
+					elements = items,
+					shape = TensorVectorLength(items.length())
+				}
+	else:
+		{
+			elements = items,
+			shape = TensorVectorLength(items.length())
+		}
+
+
+private pure func prepare_vector_expr(
+	decls: List[CoreDecl],
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
+	flattened_items: FlattenedVectorItems = flatten_vector_literal_items(prepared_items)
+	literal_shape: CoreTensorLiteralShape = vector_literal_shape(typ, flattened_items)
+
+	match vector_literal_element_type(typ, flattened_items.elements):
+		Some(elem_type):
+			match raw_scalar_kind_for_tensor_element_type(elem_type):
+				Some(raw_kind):
+					TensorLiteralExpr(
+						{
+							shape = literal_shape,
+							payload = TensorRawLiteralPayload({
+								raw_kind = raw_kind,
+								elements = flattened_items.elements,
+							})
+						},
+						typ,
+						loc,
+					)
+				None:
+					match elem_type:
+						NamedType(name, args):
+							if name == "Bool" and args.length() == 0:
+								TensorPackedLiteralExpr(
+									{
+										shape = literal_shape,
+										elem_size = 1,
+										elements = flattened_items.elements
+									},
+									typ,
+									loc,
+								)
+							else:
+								boxed_values: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
+									flattened_items.elements,
+								)
+								TensorBoxedLiteralExpr(
+									{
+										shape = literal_shape,
+										elements = boxed_values,
+										elem_needs_release = boxed_values_need_release(boxed_values)
+									},
+									typ,
+									loc,
+								)
+						ValueRecordType(name):
+							TensorLiteralExpr(
+								{
+									shape = literal_shape,
+									payload = TensorInlineStructLiteralPayload({
+										struct_c_type = name,
+										elements = flattened_items.elements,
+									})
+								},
+								typ,
+								loc,
+							)
+						_:
+							boxed_values: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
+								flattened_items.elements,
+							)
+							TensorBoxedLiteralExpr(
+								{
+									shape = literal_shape,
+									elements = boxed_values,
+									elem_needs_release = boxed_values_need_release(boxed_values)
+								},
+								typ,
+								loc,
+							)
+		None:
+			VectorExpr(prepared_items, typ, loc)
+
+
+private record DictKeyValueTypes {
+	key_type: CoreType,
+	value_type: CoreType
+}
+
+
+private pure func dict_key_value_types(typ: CoreType) -> Option[DictKeyValueTypes]:
+	match typ:
+		NamedType(name, args):
+			if name == "Dict":
+				match args:
+					[key_type, value_type]:
+						Some({
+							key_type = key_type,
+							value_type = value_type,
+						})
+					_:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func generic_hash_container_type_name(name: String) -> Bool:
+	match name:
+		"Int":
+			True
+		"Int8":
+			True
+		"Int16":
+			True
+		"Int32":
+			True
+		"Int64":
+			True
+		"Int128":
+			True
+		"UInt8":
+			True
+		"UInt16":
+			True
+		"UInt32":
+			True
+		"UInt64":
+			True
+		"UInt128":
+			True
+		"Bool":
+			True
+		"Char":
+			True
+		"Option":
+			True
+		"Result":
+			True
+		"List":
+			True
+		"Dict":
+			True
+		"Set":
+			True
+		"Tensor":
+			True
+		"Vector":
+			True
+		"Matrix":
+			True
+		"Bytes":
+			True
+		"Tuple2":
+			True
+		"Tuple3":
+			True
+		"Tuple4":
+			True
+		"LiteralString":
+			True
+		"StringSlice":
+			True
+		_:
+			False
+
+
+private pure func enum_decl_name_matches(decl: CoreDecl, name: String) -> Bool:
+	match decl:
+		EnumDecl(enum_decl):
+			enum_decl.name == name
+		_:
+			False
+
+
+private pure func has_enum_decl(decls: List[CoreDecl], name: String) -> Bool:
+	var result: Bool = False
+
+	for decl in decls:
+		if enum_decl_name_matches(decl, name):
+			result = True
+			break
+
+	result
+
+
+private pure func hash_container_constructor_for_key_type(
+	decls: List[CoreDecl],
+	key_type: CoreType,
+) -> CoreHashContainerConstructor:
+	match key_type:
+		NamedType(name, args):
+			if name == "String" and args.length() == 0:
+				StringHashContainerConstructor
+			else if (
+				(name == "Float" or name == "Float32" or name == "Float16")
+				and args.length() == 0
+			):
+				FloatHashContainerConstructor
+			else if has_enum_decl(decls, name) or generic_hash_container_type_name(name):
+				GenericHashContainerConstructor
+			else:
+				CustomHashContainerConstructor(
+					"Hashable_hash_" + name,
+					"Equatable_equals_" + name,
+					pointer_box_storage_needs_release_type(key_type),
+				)
+		EnumType(name):
+			GenericHashContainerConstructor
+		ValueRecordType(name):
+			CustomHashContainerConstructor(
+				"Hashable_hash_" + name,
+				"Equatable_equals_" + name,
+				False,
+			)
+		_:
+			GenericHashContainerConstructor
+
+
+private pure func prepare_dict_literal_entry(
+	decls: List[CoreDecl],
+	entry: CoreDictLiteralEntry,
+) -> CoreDictEntry:
+	prepared_key: CoreExpr = prepare_expr(decls, entry.key)
+	prepared_value: CoreExpr = prepare_expr(decls, entry.value)
+
+	{
+		key = boxed_storage_value_for_expr(prepared_key),
+		value = boxed_storage_value_for_expr(prepared_value)
+	}
+
+
+private pure func prepare_dict_literal_entries(
+	decls: List[CoreDecl],
+	entries: List[CoreDictLiteralEntry],
+) -> List[CoreDictEntry]:
+	entries.map(func(entry): prepare_dict_literal_entry(decls, entry))
+
+
+private pure func prepare_dict_expr(
+	decls: List[CoreDecl],
+	entries: List[CoreDictLiteralEntry],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_entries: List[CoreDictEntry] = prepare_dict_literal_entries(decls, entries)
+
+	match dict_key_value_types(typ):
+		Some(types):
+			value_kind: CoreBoxKind = boxed_kind_for_type(types.value_type)
+			DictConstructExpr(
+				{
+					constructor = hash_container_constructor_for_key_type(decls, types.key_type),
+					entries = prepared_entries,
+					value_needs_release = boxed_storage_type_needs_release(
+						types.value_type,
+						value_kind,
+					)
+				},
+				typ,
+				loc,
+			)
+		None:
+			DictExpr(entries, typ, loc)
 
 
 private pure func prepare_record_fields(
@@ -2229,7 +2734,7 @@ private pure func prepare_record_expr(
 			RecordExpr(prepared_fields, typ, loc)
 		RangeType:
 			RecordExpr(prepared_fields, typ, loc)
-		TensorType:
+		TensorType(info):
 			RecordExpr(prepared_fields, typ, loc)
 		VoidType:
 			RecordExpr(prepared_fields, typ, loc)
@@ -2279,7 +2784,7 @@ private pure func prepare_record_construct_expr(
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
 		RangeType:
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
-		TensorType:
+		TensorType(info):
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
 		VoidType:
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
@@ -2347,7 +2852,7 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 			None
 		RangeType:
 			Some("blorp_StackOption_Range")
-		TensorType:
+		TensorType(info):
 			None
 		TupleType(items):
 			None
@@ -2380,7 +2885,7 @@ private pure func stack_option_none_value(payload: CoreType) -> String:
 			"0"
 		RangeType:
 			"0"
-		TensorType:
+		TensorType(info):
 			"0"
 		TupleType(items):
 			"0"
@@ -2591,7 +3096,7 @@ private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> 
 			True
 		RangeType:
 			True
-		TensorType:
+		TensorType(info):
 			True
 		StackResultType(ok_type, err_type):
 			True
@@ -2835,7 +3340,7 @@ private pure func prepare_union_construct(
 			None
 		RangeType:
 			None
-		TensorType:
+		TensorType(info):
 			None
 		TupleType(items):
 			None
@@ -3109,6 +3614,8 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				typ,
 				loc,
 			)
+		VectorExpr(items, typ, loc):
+			prepare_vector_expr(decls, items, typ, loc)
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			LambdaExpr(
 				lambda_params,
@@ -3223,6 +3730,8 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				typ,
 				loc,
 			)
+		DictExpr(entries, typ, loc):
+			prepare_dict_expr(decls, entries, typ, loc)
 		DictConstructExpr(construct, typ, loc):
 			DictConstructExpr(
 				prepare_dict_construct(decls, construct),

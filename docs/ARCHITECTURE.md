@@ -232,9 +232,9 @@ Observed Core snapshot
   After prefixing, no downstream pass needs module awareness.
 - **Explicit erased-storage boundaries** — intentionally dynamic runtime slots
   use `void*`, but the choice of how a typed value crosses that boundary is
-  centralized in `core_layout_type.ml`. `Core_codegen_prepare`
-  rewrites final Core to explicit `CBoxTyped` / `CUnboxTyped` nodes before
-  emission, and final invariants reject unresolved fallback boxing.
+  centralized in `core_layout_type.ml`. `compiler_core_prepare.brp` rewrites
+  final Core to explicit box/unbox nodes before emission; the JSON bridge gets
+  the remaining projection-time layout facts from `core_emit_layout.ml`.
 
 The emitter contract follows from those principles: backend-specific emission
 must consume explicit Core nodes and metadata rather than recovering layout,
@@ -270,7 +270,6 @@ boxing, or ownership behavior from source spelling.
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
-| `core_codegen_prepare.ml` | OCaml helpers and focused tests for final Core preparation; supported Blorp backend route uses `compiler_core_prepare.brp` |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
@@ -278,7 +277,7 @@ boxing, or ownership behavior from source spelling.
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `core_closure.ml` | First-class function reference eta-adapter synthesis before the Blorp closure tail |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
-| `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation helpers still used by the bridge projector |
+| `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
 | `core_invariants.ml` | Stage-boundary invariant checks |
 | `core_pipeline.ml` | Pipeline orchestration, module assembly |
@@ -292,6 +291,7 @@ boxing, or ownership behavior from source spelling.
 |------|---------|
 | `compiler/blorp/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
 | `compiler/blorp/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
+| `compiler/blorp/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
 | `compiler/blorp/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
 | `compiler/blorp/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
@@ -361,7 +361,6 @@ compiler/
 │   ├── core_perceus.ml    # Core IR Perceus RC insertion
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_closure.ml    # Function-reference eta adapters
-│   ├── core_codegen_prepare.ml # Final Core preparation helpers/tests
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_layout_type.ml # Layout metadata and erased-storage policy
 │   ├── core_option_layout.ml # Option representation selection
@@ -402,6 +401,7 @@ compiler/
 compiler/blorp/            # Blorp-authored compiler implementation slices
 ├── compiler_bridge.brp    # Single JSON bridge dispatcher
 ├── compiler_core_json.brp # Current Core JSON transfer model
+├── compiler_core_traverse.brp # Shared shallow Core expression traversal helpers
 ├── compiler_core_resource.brp # Blorp-owned supported resource cleanup pass
 ├── compiler_core_fairness.brp # Blorp-owned supported fairness pass
 ├── compiler_core_prepare.brp # Blorp-owned supported final-preparation pass

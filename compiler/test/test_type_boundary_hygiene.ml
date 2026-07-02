@@ -347,21 +347,15 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
   guard [] "Core_array_layout.tensor_storage_for_elem";
   guard
       [
-        "compiler/lib/core_codegen_prepare.ml";
         "compiler/lib/core_emit_layout.ml";
         "compiler/lib/core_emit_layout.mli";
         "compiler/lib/core_specialize.ml";
       ]
     "Core_layout_type.tensor_element_storage";
   guard
-      [
-        "compiler/lib/core_codegen_prepare.ml";
-        "compiler/lib/core_emit_layout.ml";
-      ]
+      [ "compiler/lib/core_emit_layout.ml" ]
     "Core_layout_type.tensor_storage_layout_of_type";
-  guard
-    [ "compiler/lib/core_codegen_prepare.ml" ]
-    "Core_layout_type.tensor_storage_layout_of_elem";
+  guard [] "Core_layout_type.tensor_storage_layout_of_elem";
   guard [] "let tensor_for_in_raw_storage ";
   guard [] "let tensor_for_in_raw_storage_of_layout";
   guard [] "let tensor_producer_builtin_storage_rule ";
@@ -432,13 +426,13 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     [ "compiler/lib/core_mono.ml" ]
     "Codegen_types.normalize_type (Codegen_types.expand_alias";
   guard [] "Codegen_types.expand_alias ~reg:ctx.reg parent_ty";
-  let final_prep =
-    find_project_file "compiler/lib/core_codegen_prepare.ml"
+  let emit_layout =
+    find_project_file "compiler/lib/core_emit_layout.ml"
     |> read_file |> strip_comments_and_strings
   in
-  if contains_substring final_prep "Codegen_types.normalize_type" then
+  if contains_substring emit_layout "Codegen_types.normalize_type" then
     Alcotest.fail
-      "Core_codegen_prepare should consume late-layout canonical facts through \
+      "Core_emit_layout should consume late-layout canonical facts through \
        Core_layout_type/Core_tensor_type rather than raw Codegen_types \
        normalization.";
   let tailrec =
@@ -462,7 +456,7 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     "Core_layout_type.classify_erased_storage";
   guard
     [
-      "compiler/lib/core_codegen_prepare.ml";
+      "compiler/lib/core_emit_layout.ml";
       "compiler/lib/core_specialize.ml";
     ]
     "Core_layout_type.boxed_storage_requires_release_or_error";
