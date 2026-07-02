@@ -67,27 +67,26 @@ doctests:
             False
 ---
 pure func decode_geometry(json: Value) -> Result[Geometry, String]:
-	match json.get_field("type"):
-		Some(type_val):
-			match type_val.as_string():
-				Some(geo_type):
-					match geo_type:
-						"Point":
-							decode_point(json)
-						"LineString":
-							decode_linestring(json)
-						"Polygon":
-							decode_polygon(json)
-						"MultiPoint":
-							decode_multipoint(json)
-						"MultiPolygon":
-							decode_multipolygon(json)
-						_:
-							Err("Unknown geometry type: " + geo_type)
-				None:
-					Err("Geometry type is not a string")
-		None:
-			Err("Missing 'type' field in geometry")
+	type_val ?= json
+		.get_field("type")
+		.to_result("Missing 'type' field in geometry")
+	geo_type ?= type_val
+		.as_string()
+		.to_result("Geometry type is not a string")
+
+	match geo_type:
+		"Point":
+			decode_point(json)
+		"LineString":
+			decode_linestring(json)
+		"Polygon":
+			decode_polygon(json)
+		"MultiPoint":
+			decode_multipoint(json)
+		"MultiPolygon":
+			decode_multipolygon(json)
+		_:
+			Err("Unknown geometry type: ${geo_type}")
 
 
 ---
@@ -113,33 +112,31 @@ doctests:
 ---
 pure func decode_feature(json: Value) -> Result[Feature, String]:
 	-- Validate type field (RFC 7946 section 3.2)
-	match json.get_field("type"):
-		Some(type_val):
-			match type_val.as_string():
-				Some(t):
-					if t != "Feature":
-						Err("Expected type 'Feature', got '" + t + "'")
-					else:
-						match json.get_field("geometry"):
-							Some(geom_json):
-								geom ?= decode_geometry(geom_json)
+	type_val ?= json
+		.get_field("type")
+		.to_result("Missing 'type' field in feature")
+	feature_type ?= type_val
+		.as_string()
+		.to_result("Feature 'type' is not a string")
 
-								props: List[(String, Value)] = match json.get_field("properties"):
-									Some(VRecord(pairs)):
-										pairs
-									_:
-										[]
+	if feature_type != "Feature":
+		Err("Expected type 'Feature', got '${feature_type}'")
+	else:
+		geom_json ?= json
+			.get_field("geometry")
+			.to_result("Missing 'geometry' field in feature")
+		geom ?= decode_geometry(geom_json)
 
-								Ok({
-									geometry = geom,
-									properties = props,
-								})
-							None:
-								Err("Missing 'geometry' field in feature")
-				None:
-					Err("Feature 'type' is not a string")
-		None:
-			Err("Missing 'type' field in feature")
+		props: List[(String, Value)] = match json.get_field("properties"):
+			Some(VRecord(pairs)):
+				pairs
+			_:
+				[]
+
+		Ok({
+			geometry = geom,
+			properties = props,
+		})
 
 
 ---
@@ -147,52 +144,50 @@ Decode a codec Value into a FeatureCollection.
 ---
 pure func decode_feature_collection(json: Value) -> Result[FeatureCollection, String]:
 	-- Validate type field (RFC 7946 section 3.3)
-	match json.get_field("type"):
-		Some(type_val):
-			match type_val.as_string():
-				Some(t):
-					if t != "FeatureCollection":
-						Err("Expected type 'FeatureCollection', got '" + t + "'")
-					else:
-						decode_features_array(json)
-				None:
-					Err("FeatureCollection 'type' is not a string")
-		None:
-			Err("Missing 'type' field in FeatureCollection")
+	type_val ?= json
+		.get_field("type")
+		.to_result("Missing 'type' field in FeatureCollection")
+	collection_type ?= type_val
+		.as_string()
+		.to_result("FeatureCollection 'type' is not a string")
+
+	if collection_type != "FeatureCollection":
+		Err("Expected type 'FeatureCollection', got '${collection_type}'")
+	else:
+		decode_features_array(json)
 
 
 private pure func decode_features_array(json: Value) -> Result[FeatureCollection, String]:
-	match json.get_field("features"):
-		Some(features_json):
-			match features_json.as_list():
-				Some(arr):
-					var features: List[Feature] = []
-					var i: Int = 0
-					var error_msg: String = ""
-					var has_error: Bool = False
+	features_json ?= json
+		.get_field("features")
+		.to_result("Missing 'features' field")
+	arr ?= features_json
+		.as_list()
+		.to_result("'features' is not an array")
 
-					while i < arr.length() and not has_error:
-						match arr.get(i):
-							Some(feat_json):
-								match decode_feature(feat_json):
-									Ok(feat):
-										features = features.append(feat)
-									Err(e):
-										error_msg = "Feature " + i.to_string() + ": " + e
-										has_error = True
-							None:
-								void
+	var features: List[Feature] = []
+	var i: Int = 0
+	var error_msg: String = ""
+	var has_error: Bool = False
 
-						i += 1
+	while i < arr.length() and not has_error:
+		match arr.get(i):
+			Some(feat_json):
+				match decode_feature(feat_json):
+					Ok(feat):
+						features = features.append(feat)
+					Err(e):
+						error_msg = "Feature ${i.to_string()}: ${e}"
+						has_error = True
+			None:
+				void
 
-					if has_error:
-						Err(error_msg)
-					else:
-						Ok({features = features})
-				None:
-					Err("'features' is not an array")
-		None:
-			Err("Missing 'features' field")
+		i += 1
+
+	if has_error:
+		Err(error_msg)
+	else:
+		Ok({features = features})
 
 
 ---
@@ -209,11 +204,8 @@ doctests:
             False
 ---
 pure func parse_geojson(json_str: String) -> Result[FeatureCollection, String]:
-	match parse_json(json_str):
-		Ok(jv):
-			decode_feature_collection(jv.json_to_value())
-		Err(err):
-			Err("JSON parse error: " + err)
+	jv ?= parse_json(json_str).map_err(func(err: String): "JSON parse error: ${err}")
+	decode_feature_collection(jv.json_to_value())
 
 
 -- ============================================================================
@@ -364,208 +356,189 @@ private pure func encode_coord_list(coords: List[Coord]) -> Value:
 
 
 private pure func decode_coord(json: Value) -> Result[Coord, String]:
-	match json.as_list():
-		Some(arr):
-			if arr.length() < 2:
-				Err("Coordinate needs at least 2 values")
-			else:
-				match arr.get(0):
-					Some(lon_val):
-						match lon_val.as_float():
-							Some(lon):
-								match arr.get(1):
-									Some(lat_val):
-										match lat_val.as_float():
-											Some(lat):
-												Ok(coord(lon, lat))
-											None:
-												Err("Coordinate lat is not a number")
-									None:
-										Err("Missing lat in coordinate")
-							None:
-								Err("Coordinate lon is not a number")
-					None:
-						Err("Missing lon in coordinate")
-		None:
-			Err("Coordinate is not an array")
+	arr ?= json
+		.as_list()
+		.to_result("Coordinate is not an array")
+
+	if arr.length() < 2:
+		Err("Coordinate needs at least 2 values")
+	else:
+		lon_val ?= arr
+			.get(0)
+			.to_result("Missing lon in coordinate")
+		lon ?= lon_val
+			.as_float()
+			.to_result("Coordinate lon is not a number")
+		lat_val ?= arr
+			.get(1)
+			.to_result("Missing lat in coordinate")
+		lat ?= lat_val
+			.as_float()
+			.to_result("Coordinate lat is not a number")
+		Ok(coord(lon, lat))
 
 
 private pure func decode_coord_list(json: Value) -> Result[List[Coord], String]:
-	match json.as_list():
-		Some(arr):
-			var coords: List[Coord] = []
-			var i: Int = 0
-			var has_error: Bool = False
-			var error_msg: String = ""
+	arr ?= json
+		.as_list()
+		.to_result("Expected array of coordinates")
 
-			while i < arr.length() and not has_error:
-				match arr.get(i):
-					Some(coord_json):
-						match decode_coord(coord_json):
-							Ok(c):
-								coords = coords.append(c)
-							Err(e):
-								has_error = True
-								error_msg = e
-					None:
-						void
+	var coords: List[Coord] = []
+	var i: Int = 0
+	var has_error: Bool = False
+	var error_msg: String = ""
 
-				i += 1
+	while i < arr.length() and not has_error:
+		match arr.get(i):
+			Some(coord_json):
+				match decode_coord(coord_json):
+					Ok(c):
+						coords = coords.append(c)
+					Err(e):
+						has_error = True
+						error_msg = e
+			None:
+				void
 
-			if has_error:
-				Err(error_msg)
-			else:
-				Ok(coords)
-		None:
-			Err("Expected array of coordinates")
+		i += 1
+
+	if has_error:
+		Err(error_msg)
+	else:
+		Ok(coords)
 
 
 private pure func decode_point(json: Value) -> Result[Geometry, String]:
-	match json.get_field("coordinates"):
-		Some(coords_json):
-			c ?= decode_coord(coords_json)
-			Ok(GeoPoint(c))
-		None:
-			Err("Missing 'coordinates' in Point")
+	coords_json ?= json
+		.get_field("coordinates")
+		.to_result("Missing 'coordinates' in Point")
+	c ?= decode_coord(coords_json)
+	Ok(GeoPoint(c))
 
 
 private pure func decode_linestring(json: Value) -> Result[Geometry, String]:
-	match json.get_field("coordinates"):
-		Some(coords_json):
-			coords ?= decode_coord_list(coords_json)
-			Ok(GeoLineString(line_string(coords)))
-		None:
-			Err("Missing 'coordinates' in LineString")
+	coords_json ?= json
+		.get_field("coordinates")
+		.to_result("Missing 'coordinates' in LineString")
+	coords ?= decode_coord_list(coords_json)
+	Ok(GeoLineString(line_string(coords)))
 
 
 private pure func decode_polygon(json: Value) -> Result[Geometry, String]:
-	match json.get_field("coordinates"):
-		Some(coords_json):
-			match coords_json.as_list():
-				Some(rings):
-					if rings.length() == 0:
-						Err("Polygon needs at least one ring")
-					else:
-						match rings.get(0):
-							Some(ext_json):
-								exterior ?= decode_coord_list(ext_json)
-								var holes: List[List[Coord]] = []
-								var i: Int = 1
-								var has_error: Bool = False
-								var error_msg: String = ""
+	coords_json ?= json
+		.get_field("coordinates")
+		.to_result("Missing 'coordinates' in Polygon")
+	rings ?= coords_json
+		.as_list()
+		.to_result("Polygon coordinates is not an array")
 
-								while i < rings.length() and not has_error:
-									match rings.get(i):
-										Some(hole_json):
-											match decode_coord_list(hole_json):
-												Ok(hole_coords):
-													holes = holes.append(hole_coords)
-												Err(e):
-													has_error = True
-													error_msg = e
-										None:
-											void
+	if rings.length() == 0:
+		Err("Polygon needs at least one ring")
+	else:
+		ext_json ?= rings
+			.get(0)
+			.to_result("Missing exterior ring")
+		exterior ?= decode_coord_list(ext_json)
+		var holes: List[List[Coord]] = []
+		var i: Int = 1
+		var has_error: Bool = False
+		var error_msg: String = ""
 
-									i += 1
-
-								if has_error:
-									Err(error_msg)
-								else if holes.length() == 0:
-									Ok(GeoPolygon(polygon(exterior)))
-								else:
-									Ok(GeoPolygon(polygon_with_holes(exterior, holes)))
-							None:
-								Err("Missing exterior ring")
+		while i < rings.length() and not has_error:
+			match rings.get(i):
+				Some(hole_json):
+					match decode_coord_list(hole_json):
+						Ok(hole_coords):
+							holes = holes.append(hole_coords)
+						Err(e):
+							has_error = True
+							error_msg = e
 				None:
-					Err("Polygon coordinates is not an array")
-		None:
-			Err("Missing 'coordinates' in Polygon")
+					void
+
+			i += 1
+
+		if has_error:
+			Err(error_msg)
+		else if holes.length() == 0:
+			Ok(GeoPolygon(polygon(exterior)))
+		else:
+			Ok(GeoPolygon(polygon_with_holes(exterior, holes)))
 
 
 private pure func decode_multipoint(json: Value) -> Result[Geometry, String]:
-	match json.get_field("coordinates"):
-		Some(coords_json):
-			coords ?= decode_coord_list(coords_json)
-			Ok(GeoMultiPoint({points = coords}))
-		None:
-			Err("Missing 'coordinates' in MultiPoint")
+	coords_json ?= json
+		.get_field("coordinates")
+		.to_result("Missing 'coordinates' in MultiPoint")
+	coords ?= decode_coord_list(coords_json)
+	Ok(GeoMultiPoint({points = coords}))
 
 
 private pure func decode_multipolygon(json: Value) -> Result[Geometry, String]:
-	match json.get_field("coordinates"):
-		Some(coords_json):
-			match coords_json.as_list():
-				Some(poly_arr):
-					var polygons: List[Polygon] = []
-					var i: Int = 0
-					var has_error: Bool = False
-					var error_msg: String = ""
+	coords_json ?= json
+		.get_field("coordinates")
+		.to_result("Missing 'coordinates' in MultiPolygon")
+	poly_arr ?= coords_json
+		.as_list()
+		.to_result("MultiPolygon coordinates is not an array")
 
-					while i < poly_arr.length() and not has_error:
-						match poly_arr.get(i):
-							Some(poly_json):
-								-- Each polygon is an array of rings
-								match poly_json.as_list():
-									Some(rings):
-										if rings.length() > 0:
-											match rings.get(0):
-												Some(ext_json):
-													match decode_coord_list(ext_json):
-														Ok(exterior):
-															var holes: List[List[Coord]] = []
-															var j: Int = 1
+	var polygons: List[Polygon] = []
+	var i: Int = 0
+	var has_error: Bool = False
+	var error_msg: String = ""
 
-															while (
-																j < rings.length()
-																and not has_error
-															):
-																match rings.get(j):
-																	Some(hole_json):
-																		match decode_coord_list(
-																			hole_json,
-																		):
-																			Ok(hc):
-																				holes = holes.append(
-																					hc,
-																				)
-																			Err(e):
-																				has_error = True
-																				error_msg = e
-																	None:
-																		void
+	while i < poly_arr.length() and not has_error:
+		match poly_arr.get(i):
+			Some(poly_json):
+				-- Each polygon is an array of rings
+				match poly_json.as_list():
+					Some(rings):
+						if rings.length() > 0:
+							match rings.get(0):
+								Some(ext_json):
+									match decode_coord_list(ext_json):
+										Ok(exterior):
+											var holes: List[List[Coord]] = []
+											var j: Int = 1
 
-																j += 1
+											while j < rings.length() and not has_error:
+												match rings.get(j):
+													Some(hole_json):
+														match decode_coord_list(hole_json):
+															Ok(hc):
+																holes = holes.append(hc)
+															Err(e):
+																has_error = True
+																error_msg = e
+													None:
+														void
 
-															if not has_error:
-																if holes.length() == 0:
-																	polygons = polygons.append(
-																		polygon(exterior),
-																	)
-																else:
-																	polygons = polygons.append(
-																		polygon_with_holes(
-																			exterior,
-																			holes,
-																		),
-																	)
-														Err(e):
-															has_error = True
-															error_msg = e
-												None:
-													void
-									None:
-										has_error = True
-										error_msg = "MultiPolygon element is not an array"
-							None:
-								void
+												j += 1
 
-						i += 1
+											if not has_error:
+												if holes.length() == 0:
+													polygons = polygons.append(polygon(exterior))
+												else:
+													polygons = polygons.append(
+														polygon_with_holes(
+															exterior,
+															holes,
+														),
+													)
+										Err(e):
+											has_error = True
+											error_msg = e
+								None:
+									void
+					None:
+						has_error = True
+						error_msg = "MultiPolygon element is not an array"
+			None:
+				void
 
-					if has_error:
-						Err(error_msg)
-					else:
-						Ok(GeoMultiPolygon({polygons = polygons}))
-				None:
-					Err("MultiPolygon coordinates is not an array")
-		None:
-			Err("Missing 'coordinates' in MultiPolygon")
+		i += 1
+
+	if has_error:
+		Err(error_msg)
+	else:
+		Ok(GeoMultiPolygon({polygons = polygons}))

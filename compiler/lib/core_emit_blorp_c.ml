@@ -779,24 +779,8 @@ let channel_semantic_builtin_supported = function
       true
   | name -> channel_attempt_builtin_supported name
 
-let release_policy_tag ~reg (ty : Ast.type_expr) =
-  if
-    not
-      (Core_layout_type.source_value_requires_release_or_error
-         ~phase:Core_error.Emit ~reg ty Ast.dummy_loc)
-  then "none"
-  else if Core_layout_type.is_stack_result_type ~reg ty then "stack_result"
-  else
-    let layout =
-      Core_layout_type.source_value_layout_of_type ~phase:Core_error.Emit ~reg
-        ty Ast.dummy_loc
-    in
-    match Core_layout_type.source_value_release_path layout with
-    | Core_layout_type.SourceValueArcReleaseOnly -> "arc_only"
-    | Core_layout_type.SourceValueArcReleaseWithDestructor -> "arc"
-    | Core_layout_type.SourceValueNoRelease -> "none"
-
-let release_policy_json ~reg ty = str (release_policy_tag ~reg ty)
+let release_policy_json ~reg ty =
+  str (Core_emit_layout.release_policy_tag ~reg ty)
 
 let trait_method_c_name_for_type path trait_name method_name ty =
   match Codegen_types.type_key_for_impl ty with
@@ -822,7 +806,7 @@ let custom_hash_container_constructor_json ~reg path loc key_ty =
          ("equals_fn", str equals_fn);
          ( "elem_needs_release",
            bool
-             (Core_codegen_prepare.boxed_storage_needs_release ~reg key_ty loc)
+             (Core_emit_layout.boxed_storage_needs_release ~reg key_ty loc)
          );
        ])
 
@@ -834,30 +818,13 @@ let union_payload_storage_json storage =
 let union_payload_storage_json_for_type ~reg type_name =
   union_payload_storage_json (Codegen_types.union_payload_storage reg type_name)
 
-let union_field_release_policy_tag ~reg payload_storage field_ty loc =
-  match payload_storage with
-  | Codegen_types.TypedUnionPayloadStorage -> release_policy_tag ~reg field_ty
-  | Codegen_types.ErasedUnionPayloadStorage
-    when match field_ty with Ast.TyVar _ | Ast.TyBoundVar _ -> true | _ -> false
-    ->
-      "arc"
-  | Codegen_types.ErasedUnionPayloadStorage ->
-      if Core_codegen_prepare.boxed_storage_needs_release ~reg field_ty loc then "arc"
-      else "none"
-
 let union_field_release_policy_json ~reg payload_storage field_ty loc =
-  str (union_field_release_policy_tag ~reg payload_storage field_ty loc)
+  str
+    (Core_emit_layout.union_field_release_policy_tag ~reg payload_storage
+       field_ty loc)
 
-let retain_policy_tag ~reg (ty : Ast.type_expr) =
-  if
-    not
-      (Core_layout_type.source_value_requires_retain_or_error
-         ~phase:Core_error.Emit ~reg ty Ast.dummy_loc)
-  then "none"
-  else if Core_layout_type.is_stack_result_type ~reg ty then "stack_result"
-  else "arc"
-
-let retain_policy_json ~reg ty = str (retain_policy_tag ~reg ty)
+let retain_policy_json ~reg ty =
+  str (Core_emit_layout.retain_policy_tag ~reg ty)
 
 let result_list values f =
   let rec collect acc index = function
@@ -978,6 +945,26 @@ let primitive_type_names =
 
 let primitive_type_name name = StringSet.mem name primitive_type_names
 
+let tensor_static_dim_json value =
+  kind "static" [ ("value", int value) ]
+
+let tensor_runtime_dim_json dim_ty =
+  kind "runtime" [ ("name", str (Types.type_to_string dim_ty)) ]
+
+let tensor_dim_json dim_ty =
+  match Types.Dim.normalize dim_ty with
+  | Ast.TyConstInt value -> Ok (tensor_static_dim_json value)
+  | Ast.TyVar name when Types.Dim.is_var_name name ->
+      Ok (tensor_runtime_dim_json (Ast.TyVar name))
+  | Ast.TyNamed (name, []) when Types.Dim.is_var_name name ->
+      Ok (tensor_runtime_dim_json (Ast.TyNamed (name, [])))
+  | Ast.TyDimOp _ as dim -> Ok (tensor_runtime_dim_json dim)
+  | Ast.TyVarDims name -> Ok (tensor_runtime_dim_json (Ast.TyVarDims name))
+  | dim -> Ok (tensor_runtime_dim_json dim)
+
+let tensor_dims_json dims =
+  result_list dims (fun _index dim -> tensor_dim_json dim)
+
 let rec type_json ~reg enum_names value_record_names heap_record_names union_names path
     (ty : Ast.type_expr) =
   let ty = Codegen_types.expand_alias ~reg ty in
@@ -1047,7 +1034,18 @@ let rec type_json ~reg enum_names value_record_names heap_record_names union_nam
               item)
       in
       Ok (kind "tuple" [ ("items", item_values) ])
-  | Ast.TyArray _ -> Ok (kind "tensor" [])
+  | Ast.TyArray (elem_ty, dims) ->
+      let* elem_json =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".info.element_type") elem_ty
+      in
+      let* dims_json = tensor_dims_json dims in
+      Ok
+        (kind "tensor"
+           [
+             ( "info",
+               obj [ ("element_type", elem_json); ("dims", dims_json) ] );
+           ])
   | Ast.TyFunc _ ->
       Ok (kind "named" [ ("name", str "Closure"); ("args", arr []) ])
   | Ast.TyVar name when Types.Dim.is_var_name name ->
@@ -2017,7 +2015,7 @@ let is_option_type = function
 let is_result_type ~reg ty =
   Core_layout_type.is_stack_result_type ~reg ty
   ||
-  match Core_codegen_prepare.canonical_type ~reg ty with
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed ("Result", [ _; _ ]) -> true
   | _ -> false
 
@@ -2296,7 +2294,7 @@ let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_t
       in
       Ok (kind "list_to_string" [ ("callback_name", str callback_name) ])
   | Core.CKBuiltin "blorp_dict_with_capacity_custom", [ _capacity ] -> (
-      match Core_codegen_prepare.canonical_type ~reg result_ty with
+      match Core_emit_layout.canonical_type ~reg result_ty with
       | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]) ->
           let* constructor_json =
             custom_hash_container_constructor_json ~reg
@@ -2628,14 +2626,14 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       Ok (kind "call" fields)
   | Core.CCall (Core.CKBuiltin "blorp_dict_new_custom", _callee, _args) -> (
-      match Core_codegen_prepare.canonical_type ~reg expr.ty with
+      match Core_emit_layout.canonical_type ~reg expr.ty with
       | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]) ->
           let construct =
             {
               Core.dc_constructor = Core.DictCustom key_ty;
               dc_entries = [];
               dc_value_needs_release =
-                Core_codegen_prepare.dict_value_needs_release ~reg expr.ty
+                Core_emit_layout.dict_value_needs_release ~reg expr.ty
                   expr.loc;
             }
           in
@@ -2651,7 +2649,7 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
             (Printf.sprintf "blorp_dict_new_custom on non-Dict type %s"
                (Types.type_to_string other)))
   | Core.CCall (Core.CKBuiltin "blorp_set_new_custom", _callee, _args) -> (
-      match Core_codegen_prepare.canonical_type ~reg expr.ty with
+      match Core_emit_layout.canonical_type ~reg expr.ty with
       | Ast.TyNamed ("Set", [ elem_ty ]) ->
           let alloc = { Core.sa_constructor = Core.SetCustom elem_ty } in
           let* alloc_json = set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc in
@@ -4116,7 +4114,7 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       let* fields = typed [ ("items", items_value) ] in
       Ok (kind "tuple" fields)
   | Core.CRecord fields -> (
-      match (Core_codegen_prepare.canonical_type ~reg expr.ty, fields) with
+      match (Core_emit_layout.canonical_type ~reg expr.ty, fields) with
       | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]), [] ->
           let construct =
             {
@@ -4124,7 +4122,7 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
                 Core_hash_container_layout.dict_constructor_kind ~reg key_ty;
               dc_entries = [];
               dc_value_needs_release =
-                Core_codegen_prepare.dict_value_needs_release ~reg expr.ty
+                Core_emit_layout.dict_value_needs_release ~reg expr.ty
                   expr.loc;
             }
           in
@@ -4265,13 +4263,16 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       let* fields = typed [ ("construct", construct) ] in
       Ok (kind "list_construct" fields)
-  | Core.CVector _ -> (
-      match Core_codegen_prepare.prepare_expr ~reg expr with
-      | { Core.desc = Core.CVector _; _ } ->
-          unsupported path "vector literal"
-      | prepared ->
-          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-            enum_constructors path prepared)
+  | Core.CVector items ->
+      let* items_json =
+        result_list items (fun index item ->
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
+              enum_constructors
+              (Printf.sprintf "%s.items[%d]" path index)
+              item)
+      in
+      let* fields = typed [ ("items", items_json) ] in
+      Ok (kind "vector" fields)
   | Core.CTensorLiteral literal -> (
       match literal.tl_payload with
       | Core.TensorBoxedElements elements ->
@@ -4302,12 +4303,24 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
           let* fields = typed [ ("literal", literal_json) ] in
           Ok (kind "tensor_literal" fields)
       | Core.TensorWordElements _ -> unsupported path "word tensor literal")
-  | Core.CDict _ -> (
-      match Core_codegen_prepare.prepare_expr ~reg expr with
-      | { Core.desc = Core.CDict _; _ } -> unsupported path "dict literal"
-      | prepared ->
-          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-            enum_constructors path prepared)
+  | Core.CDict entries ->
+      let* entries_json =
+        result_list entries (fun index (key, value) ->
+            let entry_path = Printf.sprintf "%s.entries[%d]" path index in
+            let* key_json =
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                heap_record_names union_names enum_constructors
+                (entry_path ^ ".key") key
+            in
+            let* value_json =
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                heap_record_names union_names enum_constructors
+                (entry_path ^ ".value") value
+            in
+            Ok (obj [ ("key", key_json); ("value", value_json) ]))
+      in
+      let* fields = typed [ ("entries", entries_json) ] in
+      Ok (kind "dict" fields)
   | Core.CDictConstruct dc ->
       let* construct =
         dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -4465,7 +4478,7 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       let* fields = typed [ ("select", select_json) ] in
       Ok (kind "select" fields)
   | Core.CBox (value, source_ty) ->
-      let box = Core_codegen_prepare.make_box_op ~reg value source_ty in
+      let box = Core_emit_layout.make_box_op ~reg value source_ty in
       let* box_json =
         box_op_json ~function_names ~consumed_params ~reg enum_names
           value_record_names heap_record_names union_names enum_constructors
@@ -4643,7 +4656,7 @@ and borrowed_list_iterable (expr : Core.core) =
   | _ -> false
 
 and iterable_release_policy_json ~reg (iter : Core.core) =
-  if Core_codegen_prepare.boxed_expr_transfers_ownership ~reg iter then
+  if Core_emit_layout.boxed_expr_transfers_ownership ~reg iter then
     release_policy_json ~reg iter.ty
   else str "none"
 
@@ -5397,7 +5410,7 @@ and list_literal_json ~function_names ~consumed_params ~reg enum_names value_rec
     enum_constructors path loc (lit : Core.list_literal) =
   let* layout = list_storage_layout_json lit.ll_layout in
   let elems =
-    List.map (Core_codegen_prepare.boxed_storage_value ~reg) lit.ll_elems
+    List.map (Core_emit_layout.boxed_storage_value ~reg) lit.ll_elems
   in
   let* elements =
     boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -5777,7 +5790,7 @@ and unbox_json ~function_names ~consumed_params ~reg enum_names value_record_nam
 and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (layout : Core.list_storage_layout) list index value
     =
-  let boxed_value = Core_codegen_prepare.boxed_storage_value ~reg value in
+  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
   let* () = require_list_set_layout path layout boxed_value in
   let* layout_json = list_storage_layout_json layout in
   let* list_json =
@@ -5830,7 +5843,7 @@ and list_swap_json ~function_names ~consumed_params ~reg enum_names value_record
 
 and list_retain_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path list value =
-  let boxed_value = Core_codegen_prepare.boxed_storage_value ~reg value in
+  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
   let* list_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list
@@ -5976,7 +5989,7 @@ and union_construct_json ~function_names ~consumed_params ~reg enum_names value_
         (not (Codegen_types.union_uses_typed_payload_storage reg uc.uc_type_name))
         && List.exists
              (fun field_ty ->
-               Core_codegen_prepare.boxed_storage_needs_release ~reg field_ty
+               Core_emit_layout.boxed_storage_needs_release ~reg field_ty
                  variant.variant_loc)
              variant.variant_fields
     | None -> uc.uc_release_mask <> 0)
@@ -6276,6 +6289,7 @@ let rec require_simple_expr path (expr : Core.core) =
       require_simple_expr (path ^ ".expr") inner
   | Core.CTuple items -> require_tuple_literal path expr.ty items
   | Core.CTupleConstruct tc -> require_tuple_construct path tc
+  | Core.CVector items -> require_raw_vector_literal path items
   | Core.CList lit -> require_list_literal path lit
   | Core.CListAlloc alloc -> require_list_alloc path alloc
   | Core.CListGet get -> require_list_get path get
@@ -6290,6 +6304,7 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CTensorRawViewLet (binding, body) ->
       let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
       require_simple_expr (path ^ ".body") body
+  | Core.CDict entries -> require_raw_dict_literal path entries
   | Core.CDictConstruct construct -> require_dict_construct path construct
   | Core.CSetAlloc alloc -> require_set_alloc path alloc
   | Core.CListConstruct lc -> require_list_construct path lc
@@ -6326,6 +6341,28 @@ and require_simple_args path args =
         check (index + 1) rest
   in
   check 0 args
+
+and require_raw_vector_literal path items =
+  let rec check index = function
+    | [] -> Ok ()
+    | item :: rest ->
+        let* () =
+          require_simple_expr (Printf.sprintf "%s.items[%d]" path index) item
+        in
+        check (index + 1) rest
+  in
+  check 0 items
+
+and require_raw_dict_literal path entries =
+  let rec check index = function
+    | [] -> Ok ()
+    | (key, value) :: rest ->
+        let entry_path = Printf.sprintf "%s.entries[%d]" path index in
+        let* () = require_simple_expr (entry_path ^ ".key") key in
+        let* () = require_simple_expr (entry_path ^ ".value") value in
+        check (index + 1) rest
+  in
+  check 0 entries
 
 and require_tensor_literal path (literal : Core.tensor_literal) =
   if not (Core.tensor_literal_layout_matches_payload literal.tl_layout literal.tl_payload)
@@ -6605,7 +6642,7 @@ and require_list_literal_body ~reg union_names path (lit : Core.list_literal) =
   | Core.ListPointerStorage | Core.ListInlineStorage _ ->
       let* _ = list_storage_layout_json lit.ll_layout in
       let elems =
-        List.map (Core_codegen_prepare.boxed_storage_value ~reg) lit.ll_elems
+        List.map (Core_emit_layout.boxed_storage_value ~reg) lit.ll_elems
       in
       let rec check index = function
         | [] -> Ok ()
@@ -7106,14 +7143,8 @@ and require_function_body ~reg union_names path (expr : Core.core) =
         tls_list_param.cp_ty tls_return_ty tls_body
   | Core.CTailrecRecur _ ->
       unsupported path "tail-recursive recur outside tail-recursive loop"
-  | Core.CVector _ -> (
-      match Core_codegen_prepare.prepare_expr ~reg expr with
-      | { Core.desc = Core.CVector _; _ } -> unsupported path "vector literal"
-      | prepared -> require_function_body ~reg union_names path prepared)
-  | Core.CDict _ -> (
-      match Core_codegen_prepare.prepare_expr ~reg expr with
-      | { Core.desc = Core.CDict _; _ } -> unsupported path "dict literal"
-      | prepared -> require_function_body ~reg union_names path prepared)
+  | Core.CVector items -> require_raw_vector_literal path items
+  | Core.CDict entries -> require_raw_dict_literal path entries
   | Core.CTuple items ->
       require_tuple_literal_body ~reg union_names path expr.ty items
   | Core.CTupleConstruct tc ->
@@ -7365,10 +7396,10 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
       require_function_body ~reg union_names (path ^ ".body") body
   | Core.CDup (_variable, value_ty, body) ->
-      let _retain_policy = retain_policy_tag ~reg value_ty in
+      let _retain_policy = Core_emit_layout.retain_policy_tag ~reg value_ty in
       require_function_body ~reg union_names (path ^ ".body") body
   | Core.CDrop (_variable, value_ty, body) ->
-      let _release_policy = release_policy_tag ~reg value_ty in
+      let _release_policy = Core_emit_layout.release_policy_tag ~reg value_ty in
       require_function_body ~reg union_names (path ^ ".body") body
   | _ -> require_simple_expr path expr
 
@@ -7469,10 +7500,10 @@ and require_tailrec_tail ~reg union_names path return_ty (expr : Core.core) =
       let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
       require_tailrec_tail ~reg union_names (path ^ ".body") return_ty body
   | Core.CDup (_variable, value_ty, body) ->
-      let _retain_policy = retain_policy_tag ~reg value_ty in
+      let _retain_policy = Core_emit_layout.retain_policy_tag ~reg value_ty in
       require_tailrec_tail ~reg union_names (path ^ ".body") return_ty body
   | Core.CDrop (_variable, value_ty, body) ->
-      let _release_policy = release_policy_tag ~reg value_ty in
+      let _release_policy = Core_emit_layout.release_policy_tag ~reg value_ty in
       require_tailrec_tail ~reg union_names (path ^ ".body") return_ty body
 	  | _ ->
 	      if is_void_type return_ty then
@@ -7542,11 +7573,11 @@ and require_tailrec_tail ~reg union_names path return_ty (expr : Core.core) =
 	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
 	        list_ty return_ty body
 	  | Core.CDup (_variable, value_ty, body) ->
-	      let _retain_policy = retain_policy_tag ~reg value_ty in
+	      let _retain_policy = Core_emit_layout.retain_policy_tag ~reg value_ty in
 	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
 	        list_ty return_ty body
 	  | Core.CDrop (_variable, value_ty, body) ->
-	      let _release_policy = release_policy_tag ~reg value_ty in
+	      let _release_policy = Core_emit_layout.release_policy_tag ~reg value_ty in
 	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
 	        list_ty return_ty body
 	  | _ ->

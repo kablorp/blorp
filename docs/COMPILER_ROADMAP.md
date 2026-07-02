@@ -346,7 +346,7 @@ Implementation order:
 2. Expand the Blorp C artifact path by backend family, deleting matching OCaml
    helpers as each family becomes authoritative.
 3. Finish the supported final-preparation subset in Blorp, then shrink or
-   delete matching `core_codegen_prepare.ml` logic.
+   delete matching OCaml bridge projection helpers.
 4. Keep Blorp-owned resource/fairness passes observable through the bridge now
    that the OCaml compatibility path has been deleted.
 5. Move the JSON boundary left through the ownership tail before starting broad

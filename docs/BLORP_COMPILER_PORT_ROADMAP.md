@@ -259,10 +259,8 @@ Validation:
 Goal: make the current post-closure handoff a truly contiguous Blorp tail, with
 no duplicate OCaml final-tail implementation needed for production observation.
 
-Direct OCaml slice to mirror:
-
-- `compiler/lib/core_codegen_prepare.ml`
-- final-stage observability in `compiler/lib/core_pipeline.ml`
+Historical OCaml slice now reduced to final-stage observability in
+`compiler/lib/core_pipeline.ml`.
 
 Implementation:
 
@@ -290,8 +288,9 @@ Deletion:
 
 - Done: deleted `core_resource.ml`, `core_fairness.ml`, and `core_reuse.ml`
   after the supported route and tail observation moved to Blorp.
-- Shrink `core_codegen_prepare.ml` to only earlier-stage facts that still have
-  OCaml callers; delete final-preparation functions as Blorp owns them.
+- Done: folded the remaining bridge-side layout/boxing facts into
+  `core_emit_layout.ml`; deleted the standalone final-preparation helper
+  module now that Blorp owns final preparation.
 
 Validation:
 

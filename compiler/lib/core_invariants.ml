@@ -125,7 +125,7 @@ let check_no_layoutless_list_alloc_at (stage : Core_stage.t)
           let v =
             violation_at stage e.loc
               ~hint:
-                "Core_specialize/Core_codegen_prepare should rewrite list \
+                "Core_specialize/compiler_core_prepare should rewrite list \
                  allocations into CListAlloc nodes, which carry an explicit \
                  list storage layout for codegen."
               (Printf.sprintf
@@ -157,7 +157,7 @@ let check_no_codegen_unprepared_forms_at (stage : Core_stage.t)
             violation_at stage e.loc
               ~hint:
                 (Printf.sprintf
-                   "Core_codegen_prepare should rewrite %s into an explicit \
+                   "compiler_core_prepare should rewrite %s into an explicit \
                     final-Core constructor before emission. Do not recover \
                     this layout or boxing decision in the emitter."
                    n)
@@ -187,7 +187,7 @@ let check_no_raw_string_byte_intrinsics_at (stage : Core_stage.t)
           let v =
             violation_at stage e.loc
               ~hint:
-                "Core_codegen_prepare should rewrite unchecked string byte \
+                "compiler_core_prepare should rewrite unchecked string byte \
                  intrinsics into proof-carrying Core nodes before final Core. \
                  Add an explicit \
                  CStringByteRead/CStringByteWrite/CStringByteCopy/CStringSetLen \
@@ -663,7 +663,7 @@ let check_void_boxed_builtin_args_explicit_at (stage : Core_stage.t)
                         violation_at stage arg.loc
                           ~hint:
                             "Core_specialize should insert CBox for runtime \
-                             void* arguments and Core_codegen_prepare should \
+                             void* arguments and compiler_core_prepare should \
                              rewrite it to CBoxTyped before final Core. Do not \
                              rely on backend emission as a fallback."
                           (Printf.sprintf
@@ -2103,7 +2103,7 @@ let check_tensor_literal_layouts_at (stage : Core_stage.t)
           let v =
             violation_at stage e.loc
               ~hint:
-                "Core_codegen_prepare must construct tensor literals with one \
+                "compiler_core_prepare must construct tensor literals with one \
                  authoritative storage layout. Later passes should consume \
                  tl_layout instead of recovering representation from payload \
                  variants."
@@ -2121,7 +2121,7 @@ let check_tensor_loop_storage_provenance_at (stage : Core_stage.t)
     (prog : Core.core_program) : Core_error.t list =
   let reg = registry_for_program prog in
   let hint =
-    "Core_codegen_prepare must attach tensor loop storage proofs only when the \
+    "compiler_core_prepare must attach tensor loop storage proofs only when the \
      loop source's runtime storage layout is known. Unknown-boundary tensors \
      should keep TensorStorageUnknown so emission uses a layout-safe runtime \
      reader."

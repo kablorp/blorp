@@ -58,6 +58,10 @@ private RANGE_TYPE_TAG: String = "range"
 
 private TENSOR_TYPE_TAG: String = "tensor"
 
+private TENSOR_STATIC_DIM_TAG: String = "static"
+
+private TENSOR_RUNTIME_DIM_TAG: String = "runtime"
+
 private TUPLE_TYPE_TAG: String = "tuple"
 
 private INT_LITERAL_TAG: String = "int"
@@ -200,6 +204,8 @@ private TUPLE_EXPR_TAG: String = "tuple"
 
 private TUPLE_CONSTRUCT_EXPR_TAG: String = "tuple_construct"
 
+private VECTOR_EXPR_TAG: String = "vector"
+
 private LAMBDA_EXPR_TAG: String = "lambda"
 
 private CLOSURE_CREATE_EXPR_TAG: String = "closure_create"
@@ -229,6 +235,8 @@ private TENSOR_RAW_READ_EXPR_TAG: String = "tensor_raw_read"
 private TENSOR_RAW_WRITE_EXPR_TAG: String = "tensor_raw_write"
 
 private TENSOR_RAW_VIEW_LET_EXPR_TAG: String = "tensor_raw_view_let"
+
+private DICT_EXPR_TAG: String = "dict"
 
 private BORROW_LET_EXPR_TAG: String = "borrow_let"
 
@@ -610,8 +618,19 @@ union CoreType:
 	HeapRecordType(String)
 	UnionType(String)
 	RangeType
-	TensorType
+	TensorType(CoreTensorTypeInfo)
 	TupleType(List[CoreType])
+
+
+union CoreTensorDim:
+	TensorStaticDim(Int)
+	TensorRuntimeDim(String)
+
+
+record CoreTensorTypeInfo {
+	element_type: CoreType,
+	dims: List[CoreTensorDim]
+}
 
 
 union CoreLiteral:
@@ -916,6 +935,7 @@ union CoreExpr:
 	TupleFieldExpr(CoreExpr, Int, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
+	VectorExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	LambdaExpr(List[CoreParam], CoreType, CoreExpr, Bool, CoreType, CoreSourceLoc)
 	ClosureCreateExpr(CoreClosureCreate, CoreType, CoreSourceLoc)
 	ListConstructExpr(CoreListConstruct, CoreType, CoreSourceLoc)
@@ -935,6 +955,7 @@ union CoreExpr:
 	TensorRawReadExpr(CoreTensorRawRead, CoreType, CoreSourceLoc)
 	TensorRawWriteExpr(CoreTensorRawWrite, CoreType, CoreSourceLoc)
 	TensorRawViewLetExpr(CoreTensorRawViewBinding, CoreExpr, CoreType, CoreSourceLoc)
+	DictExpr(List[CoreDictLiteralEntry], CoreType, CoreSourceLoc)
 	DictConstructExpr(CoreDictConstruct, CoreType, CoreSourceLoc)
 	SetAllocExpr(CoreSetAlloc, CoreType, CoreSourceLoc)
 	ListRetainExpr(CoreListRetain, CoreType, CoreSourceLoc)
@@ -1076,6 +1097,12 @@ union CoreHashContainerConstructor:
 record CoreDictEntry {
 	key: CoreBoxedStorageValue,
 	value: CoreBoxedStorageValue
+}
+
+
+record CoreDictLiteralEntry {
+	key: CoreExpr,
+	value: CoreExpr
 }
 
 
@@ -2167,6 +2194,36 @@ private pure func core_type_list_to_json(items: List[CoreType]) -> JsonValue:
 	JsonVector(values)
 
 
+private pure func core_tensor_dim_to_json(dim: CoreTensorDim) -> JsonValue:
+	match dim:
+		TensorStaticDim(value):
+			JsonObject([
+				(KIND_FIELD, JsonString(TENSOR_STATIC_DIM_TAG)),
+				("value", json_int(value)),
+			])
+		TensorRuntimeDim(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(TENSOR_RUNTIME_DIM_TAG)),
+				("name", JsonString(name)),
+			])
+
+
+private pure func core_tensor_dims_to_json(dims: List[CoreTensorDim]) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for dim in dims:
+		values = values.append(core_tensor_dim_to_json(dim))
+
+	JsonVector(values)
+
+
+private pure func core_tensor_type_info_to_json(info: CoreTensorTypeInfo) -> JsonValue:
+	JsonObject([
+		("element_type", core_type_to_json(info.element_type)),
+		("dims", core_tensor_dims_to_json(info.dims)),
+	])
+
+
 pure func core_type_to_json(typ: CoreType) -> JsonValue:
 	match typ:
 		VoidType:
@@ -2211,8 +2268,11 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 			])
 		RangeType:
 			JsonObject([(KIND_FIELD, JsonString(RANGE_TYPE_TAG))])
-		TensorType:
-			JsonObject([(KIND_FIELD, JsonString(TENSOR_TYPE_TAG))])
+		TensorType(info):
+			JsonObject([
+				(KIND_FIELD, JsonString(TENSOR_TYPE_TAG)),
+				("info", core_tensor_type_info_to_json(info)),
+			])
 		TupleType(items):
 			JsonObject([
 				(KIND_FIELD, JsonString(TUPLE_TYPE_TAG)),
@@ -2254,6 +2314,75 @@ private pure func decode_core_type_list(
 			Err(existing_error)
 		None:
 			Ok(result)
+
+
+private pure func decode_core_tensor_dim_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreTensorDim, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == TENSOR_STATIC_DIM_TAG:
+		dim_value ?= int_field(value, path, "value")
+		Ok(TensorStaticDim(dim_value))
+	else if tag == TENSOR_RUNTIME_DIM_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(TensorRuntimeDim(name))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+private pure func decode_core_tensor_dims_json(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreTensorDim], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreTensorDim] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_tensor_dim_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(dim):
+						result = result.append(dim)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+private pure func decode_core_tensor_type_info_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreTensorTypeInfo, CoreJsonError]:
+	element_type_json ?= object_field(value, path, "element_type")
+	element_type ?= decode_core_type_json(
+		element_type_json,
+		path_field(path, "element_type"),
+	)
+	dims ?= decode_core_tensor_dims_json(value, path, "dims")
+
+	Ok({
+		element_type = element_type,
+		dims = dims,
+	})
 
 
 pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreType, CoreJsonError]:
@@ -2304,7 +2433,12 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 	else if tag == RANGE_TYPE_TAG:
 		Ok(RangeType)
 	else if tag == TENSOR_TYPE_TAG:
-		Ok(TensorType)
+		info_json ?= object_field(value, path, "info")
+		info ?= decode_core_tensor_type_info_json(
+			info_json,
+			path_field(path, "info"),
+		)
+		Ok(TensorType(info))
 	else if tag == TUPLE_TYPE_TAG:
 		items ?= decode_core_type_list(value, path, "items")
 		Ok(TupleType(items))
@@ -7922,6 +8056,19 @@ private pure func core_expr_tuple_construct_to_json(
 	])
 
 
+private pure func core_expr_vector_to_json(
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(VECTOR_EXPR_TAG)),
+		("items", core_expr_list_to_json(items)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_lambda_to_json(
 	params: List[CoreParam],
 	return_type: CoreType,
@@ -8172,6 +8319,37 @@ private pure func core_expr_tensor_raw_view_let_to_json(
 		(KIND_FIELD, JsonString(TENSOR_RAW_VIEW_LET_EXPR_TAG)),
 		("binding", core_tensor_raw_view_binding_to_json(binding)),
 		("body", core_expr_to_json(body)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
+private pure func core_dict_literal_entry_to_json(entry: CoreDictLiteralEntry) -> JsonValue:
+	JsonObject([
+		("key", core_expr_to_json(entry.key)),
+		("value", core_expr_to_json(entry.value)),
+	])
+
+
+private pure func core_dict_literal_entries_to_json(
+	entries: List[CoreDictLiteralEntry],
+) -> JsonValue:
+	var items: List[JsonValue] = []
+
+	for entry in entries:
+		items = items.append(core_dict_literal_entry_to_json(entry))
+
+	JsonVector(items)
+
+
+private pure func core_expr_dict_to_json(
+	entries: List[CoreDictLiteralEntry],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(DICT_EXPR_TAG)),
+		("entries", core_dict_literal_entries_to_json(entries)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -8844,6 +9022,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_tuple_to_json(items, typ, loc)
 		TupleConstructExpr(tuple_construct, typ, loc):
 			core_expr_tuple_construct_to_json(tuple_construct, typ, loc)
+		VectorExpr(items, typ, loc):
+			core_expr_vector_to_json(items, typ, loc)
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			core_expr_lambda_to_json(params, return_type, body, is_pure, typ, loc)
 		ClosureCreateExpr(closure, typ, loc):
@@ -8882,6 +9062,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_tensor_raw_write_to_json(write, typ, loc)
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			core_expr_tensor_raw_view_let_to_json(binding, body, typ, loc)
+		DictExpr(entries, typ, loc):
+			core_expr_dict_to_json(entries, typ, loc)
 		DictConstructExpr(construct, typ, loc):
 			core_expr_dict_construct_to_json(construct, typ, loc)
 		SetAllocExpr(alloc, typ, loc):
@@ -9412,6 +9594,24 @@ private pure func decode_core_expr_tuple_construct_from_json(
 	Ok(TupleConstructExpr(tuple_construct, typ, loc))
 
 
+private pure func decode_core_expr_vector_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	items ?= decode_core_expr_list(value, path, "items")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(VectorExpr(items, typ, loc))
+
+
 private pure func decode_core_expr_lambda_from_json(
 	value: JsonValue,
 	path: String,
@@ -9840,6 +10040,80 @@ private pure func decode_core_expr_tensor_raw_view_let_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(TensorRawViewLetExpr(binding, body, typ, loc))
+
+
+private pure func decode_core_dict_literal_entry_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreDictLiteralEntry, CoreJsonError]:
+	key_json ?= object_field(value, path, "key")
+	key ?= decode_core_expr_json(
+		key_json,
+		path_field(path, "key"),
+	)
+	value_json ?= object_field(value, path, "value")
+	entry_value ?= decode_core_expr_json(
+		value_json,
+		path_field(path, "value"),
+	)
+	Ok({
+		key = key,
+		value = entry_value,
+	})
+
+
+private pure func decode_core_dict_literal_entries(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreDictLiteralEntry], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreDictLiteralEntry] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(_):
+				void
+			None:
+				match decode_core_dict_literal_entry_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(entry):
+						result = result.append(entry)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(err):
+			Err(err)
+		None:
+			Ok(result)
+
+
+private pure func decode_core_expr_dict_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	entries ?= decode_core_dict_literal_entries(value, path, "entries")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(DictExpr(entries, typ, loc))
 
 
 private pure func decode_core_expr_dict_construct_from_json(
@@ -10947,6 +11221,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_tuple_from_json(value, path)
 	else if tag == TUPLE_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_tuple_construct_from_json(value, path)
+	else if tag == VECTOR_EXPR_TAG:
+		decode_core_expr_vector_from_json(value, path)
 	else if tag == LAMBDA_EXPR_TAG:
 		decode_core_expr_lambda_from_json(value, path)
 	else if tag == CLOSURE_CREATE_EXPR_TAG:
@@ -10985,6 +11261,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_tensor_raw_write_from_json(value, path)
 	else if tag == TENSOR_RAW_VIEW_LET_EXPR_TAG:
 		decode_core_expr_tensor_raw_view_let_from_json(value, path)
+	else if tag == DICT_EXPR_TAG:
+		decode_core_expr_dict_from_json(value, path)
 	else if tag == DICT_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_dict_construct_from_json(value, path)
 	else if tag == SET_ALLOC_EXPR_TAG:
