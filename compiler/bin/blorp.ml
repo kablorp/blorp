@@ -1415,116 +1415,75 @@ let cli_frontier_of_frontend_options ?frontend_program =
       BlorpCliCompile (frontend_program, [], options)
   | CliFrontendRunOptions options -> BlorpCliRun (frontend_program, [], options)
 
-let cli_frontier_parsed_program parsed =
-  match
-    finalize_cli_frontend_parsed_response ~path:parsed.Compiler_blorp_bridge.cli_frontend_path
-      ~module_name:parsed.Compiler_blorp_bridge.cli_frontend_module_name
-      parsed.Compiler_blorp_bridge.cli_frontend_parsed_response
-  with
-  | Error errors ->
-      prerr_endline
-        (format_pipeline_errors ~file:parsed.Compiler_blorp_bridge.cli_frontend_path errors);
-      exit 1
-  | Ok program -> (
-      match parsed.Compiler_blorp_bridge.cli_frontend_options with
-      | Compiler_blorp_bridge.CliFrontendCheckOptions options ->
-          BlorpCliCheck
-            ( [
-                parsed_cli_success
-                  parsed.Compiler_blorp_bridge.cli_frontend_path program;
-              ],
-              [],
-              options )
-      | _ ->
-          cli_frontier_of_frontend_options ~frontend_program:program
-            parsed.Compiler_blorp_bridge.cli_frontend_options)
-
-let finalize_cli_check_batch_source
-    (source : Compiler_blorp_bridge.parse_source_batch_response) =
-  match
-    finalize_cli_frontend_parsed_response ~path:source.batch_parsed_path
-      ~module_name:source.batch_parsed_module_name source.batch_parsed_response
-  with
-  | Error diagnostics ->
-      print_parse_diagnostics ~file:source.batch_parsed_path diagnostics;
-      parsed_cli_failure source.batch_parsed_path
-  | Ok program -> parsed_cli_success source.batch_parsed_path program
-
-let cli_frontier_parsed_check_batch
-    (batch : Compiler_blorp_bridge.cli_check_source_batch) =
-  let parsed_roots =
-    List.map finalize_cli_check_batch_source
-      batch.Compiler_blorp_bridge.cli_check_batch_sources
-  in
-  BlorpCliCheck (parsed_roots, [], batch.cli_check_batch_options)
-
-type finalized_cli_source_graph_source = {
+type finalized_cli_frontend_graph_source = {
   finalized_parsed_file : parsed_cli_file;
   finalized_preloaded_source : Modules.preloaded_parsed_source;
 }
 
-let module_name_has_prefix prefix name =
-  String.length name >= String.length prefix
-  && String.sub name 0 (String.length prefix) = prefix
+let module_origin_of_cli_frontend_module_origin =
+  let open Compiler_blorp_bridge in
+  function
+  | CliFrontendUserModule -> Session.User_module
+  | CliFrontendStdModule -> Session.Stdlib_module
+  | CliFrontendPkgModule package_id -> Session.native_package_origin package_id
+  | CliFrontendSourcePackageModule package_alias ->
+      Session.package_origin package_alias
 
-let graph_source_origin
-    (source : Compiler_blorp_bridge.cli_source_graph_source) =
-  if module_name_has_prefix "std/" source.cli_source_graph_module_name then
-    Session.Stdlib_module
-  else Modules.module_origin_for_source_file source.cli_source_graph_path
-
-let finalize_cli_source_graph_source
-    (source : Compiler_blorp_bridge.cli_source_graph_source) =
+let finalize_cli_frontend_graph_source
+    (source : Compiler_blorp_bridge.cli_frontend_graph_source) =
   match
-    finalize_cli_frontend_parsed_response ~path:source.cli_source_graph_path
-      ~module_name:source.cli_source_graph_module_name
-      source.cli_source_graph_parsed_response
+    finalize_cli_frontend_parsed_response ~path:source.cli_frontend_graph_path
+      ~module_name:source.cli_frontend_graph_module_name
+      source.cli_frontend_graph_parsed_response
   with
   | Error diagnostics ->
-      print_parse_diagnostics ~file:source.cli_source_graph_path diagnostics;
+      print_parse_diagnostics ~file:source.cli_frontend_graph_path diagnostics;
       Error ()
   | Ok program ->
       Ok
         {
           finalized_parsed_file =
-            parsed_cli_success source.cli_source_graph_path program;
+            parsed_cli_success source.cli_frontend_graph_path program;
           finalized_preloaded_source =
             {
-              Modules.preload_module_name = source.cli_source_graph_module_name;
-              preload_path = source.cli_source_graph_path;
-              preload_origin = graph_source_origin source;
-              preload_source = source.cli_source_graph_source_text;
+              Modules.preload_module_name =
+                source.cli_frontend_graph_module_name;
+              preload_path = source.cli_frontend_graph_path;
+              preload_origin =
+                module_origin_of_cli_frontend_module_origin
+                  source.cli_frontend_graph_origin;
+              preload_source = source.cli_frontend_graph_source_text;
               preload_decls = program;
             };
         }
 
-let finalized_cli_source_graph_sources_or_exit sources =
+let finalized_cli_frontend_graph_sources_or_exit sources =
   let rec loop acc = function
     | [] -> List.rev acc
     | source :: rest -> (
-        match finalize_cli_source_graph_source source with
+        match finalize_cli_frontend_graph_source source with
         | Ok finalized -> loop (finalized :: acc) rest
         | Error () -> exit 1)
   in
   loop [] sources
 
-let init_module_paths_for_source_graph_roots roots =
+let init_module_paths_for_frontend_graph_roots roots =
   List.iter
-    (fun (source : Compiler_blorp_bridge.cli_source_graph_source) ->
-      Modules.init_module_paths (Filename.dirname source.cli_source_graph_path))
+    (fun (source : Compiler_blorp_bridge.cli_frontend_graph_source) ->
+      Modules.init_module_paths (Filename.dirname source.cli_frontend_graph_path))
     roots
 
-let cli_frontier_parsed_source_graph
-    (graph : Compiler_blorp_bridge.cli_source_graph) =
-  init_module_paths_for_source_graph_roots
-    graph.Compiler_blorp_bridge.cli_source_graph_roots;
+let cli_frontier_frontend_module_graph
+    (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
+  init_module_paths_for_frontend_graph_roots
+    graph.Compiler_blorp_bridge.cli_frontend_graph_roots;
   let roots =
-    finalized_cli_source_graph_sources_or_exit
-      graph.Compiler_blorp_bridge.cli_source_graph_roots
+    finalized_cli_frontend_graph_sources_or_exit
+      graph.Compiler_blorp_bridge.cli_frontend_graph_roots
   in
   let modules =
-    finalized_cli_source_graph_sources_or_exit
-      graph.Compiler_blorp_bridge.cli_source_graph_modules
+    finalized_cli_frontend_graph_sources_or_exit
+      graph.Compiler_blorp_bridge.cli_frontend_graph_modules
   in
   let preloaded_parsed_sources =
     List.map
@@ -1534,7 +1493,7 @@ let cli_frontier_parsed_source_graph
   let parsed_roots =
     List.map (fun source -> source.finalized_parsed_file) roots
   in
-  match graph.Compiler_blorp_bridge.cli_source_graph_options with
+  match graph.Compiler_blorp_bridge.cli_frontend_graph_options with
   | Compiler_blorp_bridge.CliFrontendCheckOptions options ->
       BlorpCliCheck (parsed_roots, preloaded_parsed_sources, options)
   | Compiler_blorp_bridge.CliFrontendCompileOptions options -> (
@@ -1546,7 +1505,7 @@ let cli_frontier_parsed_source_graph
               options )
       | _ ->
           prerr_endline
-            "Error: compile source graph must contain exactly one root";
+            "Error: compile frontend module graph must contain exactly one root";
           exit 1)
   | Compiler_blorp_bridge.CliFrontendRunOptions options -> (
       match roots with
@@ -1556,7 +1515,8 @@ let cli_frontier_parsed_source_graph
               preloaded_parsed_sources,
               options )
       | _ ->
-          prerr_endline "Error: run source graph must contain exactly one root";
+          prerr_endline
+            "Error: run frontend module graph must contain exactly one root";
           exit 1)
 
 let set_std_override_option = function
@@ -1873,12 +1833,8 @@ let apply_blorp_cli_frontier args =
         print_string result.Compiler_blorp_bridge.cli_run_stdout;
         prerr_string result.Compiler_blorp_bridge.cli_run_stderr;
         exit result.Compiler_blorp_bridge.cli_run_status
-    | Ok (Compiler_blorp_bridge.CliRunParsedSource parsed) ->
-        cli_frontier_parsed_program parsed
-    | Ok (Compiler_blorp_bridge.CliRunParsedSourceBatch batch) ->
-        cli_frontier_parsed_check_batch batch
-    | Ok (Compiler_blorp_bridge.CliRunParsedSourceGraph graph) ->
-        cli_frontier_parsed_source_graph graph
+    | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
+        cli_frontier_frontend_module_graph graph
     | Ok (Compiler_blorp_bridge.CliRunFrontendOptions options) ->
         cli_frontier_of_frontend_options options.cli_frontend_options
     | Ok (Compiler_blorp_bridge.CliRunTestOptions options) ->

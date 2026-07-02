@@ -10,11 +10,18 @@ import:
 		CliTestArgs,
 		CliTestMode(CliTestAll, CliTestDocOnly, CliTestSuiteOnly),
 	compiler_cli_plan:
-		CliCheckSourceBatch,
 		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
 		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(
+			CliFrontendPkgModule,
+			CliFrontendSourcePackageModule,
+			CliFrontendStdModule,
+			CliFrontendUserModule,
+		),
 		CliFrontendOptionsPlan,
-		CliFrontendParsedSource,
 		CliLspRunPlan,
 		CliPackageRunCommand(
 			CliPackageRunCheck,
@@ -26,17 +33,15 @@ import:
 			CliPackageRunVendorTarget,
 		),
 		CliPackageRunPlan,
-		CliParsedSourceFile,
 		CliPurifyRunPlan,
 		CliReplRunPlan,
 		CliRunPlan(
 			CliRunDelegate,
+			CliRunFrontendModuleGraph,
 			CliRunFrontendOptions,
 			CliRunHandled,
 			CliRunLsp,
 			CliRunPackage,
-			CliRunParsedSource,
-			CliRunParsedSourceBatch,
 			CliRunPurify,
 			CliRunRepl,
 			CliRunTest,
@@ -77,6 +82,34 @@ private pure func json_optional_string(value: Option[String]) -> JsonValue:
 	match value:
 		Some(text):
 			JsonString(text)
+		None:
+			JsonNull
+
+
+private pure func frontend_module_origin_json(origin: CliFrontendModuleOrigin) -> JsonValue:
+	match origin:
+		CliFrontendUserModule:
+			JsonObject([("kind", JsonString("user"))])
+		CliFrontendStdModule:
+			JsonObject([("kind", JsonString("std"))])
+		CliFrontendSourcePackageModule(package_alias):
+			JsonObject([
+				("kind", JsonString("source_package")),
+				("package", JsonString(package_alias)),
+			])
+		CliFrontendPkgModule(package_id):
+			JsonObject([
+				("kind", JsonString("pkg")),
+				("package", JsonString(package_id)),
+			])
+
+
+private pure func json_optional_frontend_module_origin(
+	value: Option[CliFrontendModuleOrigin],
+) -> JsonValue:
+	match value:
+		Some(origin):
+			frontend_module_origin_json(origin)
 		None:
 			JsonNull
 
@@ -197,62 +230,64 @@ pure func cli_purify_options_json(args: CliPurifyArgs) -> JsonValue:
 	])
 
 
-pure func cli_parsed_source_file_json(source: CliParsedSourceFile) -> JsonValue:
+private pure func cli_frontend_graph_source_json(source: CliFrontendGraphSource) -> JsonValue:
 	JsonObject([
 		("path", JsonString(source.path)),
 		("module", JsonString(source.module_name)),
 		("source_text", JsonString(source.source_text)),
 		("parsed_source", source.parsed_source),
+		("origin", frontend_module_origin_json(source.origin)),
 	])
 
 
-private pure func cli_parsed_source_files_json(sources: List[CliParsedSourceFile]) -> JsonValue:
+private pure func cli_frontend_graph_sources_json(
+	sources: List[CliFrontendGraphSource],
+) -> JsonValue:
 	var items: List[JsonValue] = []
 
 	for source in sources:
-		items = items.append(cli_parsed_source_file_json(source))
+		items = items.append(cli_frontend_graph_source_json(source))
 
 	JsonVector(items)
 
 
-pure func cli_check_source_batch_artifact_json(batch: CliCheckSourceBatch) -> JsonValue:
-	if batch.modules.length() > 0:
-		JsonObject([
-			("kind", JsonString("parsed_source_graph")),
-			("command", JsonString("check")),
-			("args", json_string_list(batch.args)),
-			("options", batch.options),
-			("roots", cli_parsed_source_files_json(batch.sources)),
-			("modules", cli_parsed_source_files_json(batch.modules)),
-		])
-	else:
-		JsonObject([
-			("kind", JsonString("parsed_source_batch")),
-			("command", JsonString("check")),
-			("args", json_string_list(batch.args)),
-			("options", batch.options),
-			("sources", cli_parsed_source_files_json(batch.sources)),
-		])
+private pure func cli_frontend_import_edge_json(edge: CliFrontendImportEdge) -> JsonValue:
+	JsonObject([
+		("from_path", JsonString(edge.from_path)),
+		("from_module", JsonString(edge.from_module)),
+		("import_path", JsonString(edge.import_path)),
+		("resolved_path", json_optional_string(edge.resolved_path)),
+		("resolved_module", json_optional_string(edge.resolved_module)),
+		("resolved_origin", json_optional_frontend_module_origin(edge.resolved_origin)),
+	])
 
 
-private pure func cli_frontend_parsed_artifact_json(parsed: CliFrontendParsedSource) -> JsonValue:
-	if parsed.modules.length() > 0:
-		JsonObject([
-			("kind", JsonString("parsed_source_graph")),
-			("command", JsonString(cli_frontend_command_name(parsed.command))),
-			("args", json_string_list(parsed.args)),
-			("options", parsed.options),
-			("roots", cli_parsed_source_files_json([parsed.source])),
-			("modules", cli_parsed_source_files_json(parsed.modules)),
-		])
-	else:
-		JsonObject([
-			("kind", JsonString("parsed_source")),
-			("command", JsonString(cli_frontend_command_name(parsed.command))),
-			("args", json_string_list(parsed.args)),
-			("options", parsed.options),
-			("source", cli_parsed_source_file_json(parsed.source)),
-		])
+private pure func cli_frontend_import_edges_json(edges: List[CliFrontendImportEdge]) -> JsonValue:
+	var items: List[JsonValue] = []
+
+	for edge in edges:
+		items = items.append(cli_frontend_import_edge_json(edge))
+
+	JsonVector(items)
+
+
+private pure func cli_frontend_graph_diagnostics_json(diagnostics: List[String]) -> JsonValue:
+	json_string_list(diagnostics)
+
+
+private pure func cli_frontend_module_graph_artifact_json(
+	graph: CliFrontendModuleGraph,
+) -> JsonValue:
+	JsonObject([
+		("kind", JsonString("frontend_module_graph")),
+		("command", JsonString(cli_frontend_command_name(graph.command))),
+		("args", json_string_list(graph.args)),
+		("options", graph.options),
+		("roots", cli_frontend_graph_sources_json(graph.roots)),
+		("modules", cli_frontend_graph_sources_json(graph.modules)),
+		("imports", cli_frontend_import_edges_json(graph.import_edges)),
+		("diagnostics", cli_frontend_graph_diagnostics_json(graph.diagnostics)),
+	])
 
 
 private pure func cli_frontend_options_artifact_json(plan: CliFrontendOptionsPlan) -> JsonValue:
@@ -372,10 +407,8 @@ pure func cli_run_plan_to_json(plan: CliRunPlan) -> JsonValue:
 			]))
 		CliRunDelegate(delegation):
 			bridge_success_json(cli_delegation_artifact_json(delegation))
-		CliRunParsedSource(parsed):
-			bridge_success_json(cli_frontend_parsed_artifact_json(parsed))
-		CliRunParsedSourceBatch(batch):
-			bridge_success_json(cli_check_source_batch_artifact_json(batch))
+		CliRunFrontendModuleGraph(graph):
+			bridge_success_json(cli_frontend_module_graph_artifact_json(graph))
 		CliRunFrontendOptions(frontend_options):
 			bridge_success_json(cli_frontend_options_artifact_json(frontend_options))
 		CliRunTest(test_plan):

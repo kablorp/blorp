@@ -594,180 +594,163 @@ let test_cli_run_response_decodes_test_options () =
   | Ok _ -> Alcotest.fail "expected decoded CLI test options"
   | Error (_, message) -> Alcotest.fail message
 
-let test_cli_run_response_decodes_parsed_source () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "parsed_source");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "compile"; "--no-format"; "main.brp" ]);
-           ("options", compile_options_json [ "main.brp" ]);
-           ( "source",
-             Lsp_json.Object
-               [
-                 ("path", Lsp_json.String "main.brp");
-                 ("module", Lsp_json.String "main");
-                 ("parsed_source", parsed_ast_artifact (parsed_program_json []));
-               ] );
-         ])
+let frontend_origin_json ?package kind =
+  let fields =
+    [ ("kind", Lsp_json.String kind) ]
+    @
+    match package with
+    | Some value -> [ ("package", Lsp_json.String value) ]
+    | None -> []
   in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunParsedSource
-        {
-          cli_frontend_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
-          cli_frontend_args = [ "compile"; "--no-format"; "main.brp" ];
-          cli_frontend_options =
-            Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
-              {
-                cli_compile_no_format = true;
-                cli_compile_files = [ "main.brp" ];
-                cli_compile_output = None;
-                cli_compile_dump_core_after = [];
-                cli_compile_stop_after = None;
-                _;
-              };
-          cli_frontend_path = "main.brp";
-          cli_frontend_module_name = "main";
-          cli_frontend_source_text = None;
-          cli_frontend_parsed_response =
-            Blorp.Compiler_blorp_bridge.ParsedSource
-              { parsed_program = []; parsed_comments = [] };
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI run parsed source"
-  | Error (_, message) -> Alcotest.fail message
+  Lsp_json.Object fields
 
-let test_cli_run_response_decodes_parsed_source_batch () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "parsed_source_batch");
-           ("command", Lsp_json.String "check");
-           ("args", string_array [ "check"; "--no-format"; "src" ]);
-           ("options", check_options_json [ "src" ]);
-           ( "sources",
-             Lsp_json.Array
-               [
-                 Lsp_json.Object
-                   [
-                     ("path", Lsp_json.String "src/a.brp");
-                     ("module", Lsp_json.String "a");
-                     ("parsed_source", parsed_ast_artifact (parsed_program_json []));
-                   ];
-                 Lsp_json.Object
-                   [
-                     ("path", Lsp_json.String "src/b.brp");
-                     ("module", Lsp_json.String "b");
-                     ("parsed_source", parsed_ast_artifact (parsed_program_json []));
-                   ];
-               ] );
-         ])
-  in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunParsedSourceBatch
-        {
-          cli_check_batch_args = [ "check"; "--no-format"; "src" ];
-          cli_check_batch_options =
-            { cli_check_no_format = true; cli_check_paths = [ "src" ]; _ };
-          cli_check_batch_sources =
-            [
-              {
-                batch_parsed_path = "src/a.brp";
-                batch_parsed_module_name = "a";
-                batch_parsed_response =
-                  Blorp.Compiler_blorp_bridge.ParsedSource
-                    { parsed_program = []; parsed_comments = [] };
-              };
-              {
-                batch_parsed_path = "src/b.brp";
-                batch_parsed_module_name = "b";
-                batch_parsed_response =
-                  Blorp.Compiler_blorp_bridge.ParsedSource
-                    { parsed_program = []; parsed_comments = [] };
-              };
-            ];
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI run parsed source batch"
-  | Error (_, message) -> Alcotest.fail message
+let frontend_graph_source ?(origin = frontend_origin_json "user") path
+    module_name text =
+  Lsp_json.Object
+    [
+      ("path", Lsp_json.String path);
+      ("module", Lsp_json.String module_name);
+      ("source_text", Lsp_json.String text);
+      ("parsed_source", parsed_ast_artifact (parsed_program_json []));
+      ("origin", origin);
+    ]
 
-let test_cli_run_response_decodes_parsed_source_graph () =
-  let source path module_name text =
-    Lsp_json.Object
-      [
-        ("path", Lsp_json.String path);
-        ("module", Lsp_json.String module_name);
-        ("source_text", Lsp_json.String text);
-        ("parsed_source", parsed_ast_artifact (parsed_program_json []));
-      ]
-  in
+let frontend_import_edge ?resolved_path ?resolved_module ?resolved_origin
+    ~from_path ~from_module ~import_path () =
+  Lsp_json.Object
+    [
+      ("from_path", Lsp_json.String from_path);
+      ("from_module", Lsp_json.String from_module);
+      ("import_path", Lsp_json.String import_path);
+      ( "resolved_path",
+        match resolved_path with
+        | Some path -> Lsp_json.String path
+        | None -> Lsp_json.Null );
+      ( "resolved_module",
+        match resolved_module with
+        | Some module_name -> Lsp_json.String module_name
+        | None -> Lsp_json.Null );
+      ( "resolved_origin",
+        match resolved_origin with
+        | Some origin -> origin
+        | None -> Lsp_json.Null );
+    ]
+
+let test_cli_run_response_decodes_frontend_module_graph () =
   let response =
     bridge_success_json
       (Lsp_json.Object
          [
-           ("kind", Lsp_json.String "parsed_source_graph");
+           ("kind", Lsp_json.String "frontend_module_graph");
            ("command", Lsp_json.String "compile");
            ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
            ("options", compile_options_json [ "src/main.brp" ]);
-           ("roots", Lsp_json.Array [ source "src/main.brp" "main" "root" ]);
+           ( "roots",
+             Lsp_json.Array
+               [
+                 frontend_graph_source "src/main.brp" "main"
+                   "import:\n\t./dep";
+               ] );
            ( "modules",
-             Lsp_json.Array [ source "src/dep.brp" "./dep" "dep source" ] );
+             Lsp_json.Array
+               [
+                 frontend_graph_source "src/dep.brp" "./dep" "func dep(): 1";
+               ] );
+           ( "imports",
+             Lsp_json.Array
+               [
+                 frontend_import_edge ~from_path:"src/main.brp"
+                   ~from_module:"main" ~import_path:"./dep"
+                   ~resolved_path:"src/dep.brp" ~resolved_module:"./dep"
+                   ~resolved_origin:(frontend_origin_json "user") ();
+               ] );
+           ("diagnostics", Lsp_json.Array []);
          ])
   in
   match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
   | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunParsedSourceGraph
+      (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
         {
-          cli_source_graph_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
-          cli_source_graph_args = [ "compile"; "--no-format"; "src/main.brp" ];
-          cli_source_graph_options =
+          cli_frontend_graph_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
+          cli_frontend_graph_args = [ "compile"; "--no-format"; "src/main.brp" ];
+          cli_frontend_graph_options =
             Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
               { cli_compile_files = [ "src/main.brp" ]; _ };
-          cli_source_graph_roots =
+          cli_frontend_graph_roots =
             [
               {
-                cli_source_graph_path = "src/main.brp";
-                cli_source_graph_module_name = "main";
-                cli_source_graph_source_text = "root";
-                cli_source_graph_parsed_response =
-                  Blorp.Compiler_blorp_bridge.ParsedSource
-                    { parsed_program = []; parsed_comments = [] };
+                cli_frontend_graph_path = "src/main.brp";
+                cli_frontend_graph_module_name = "main";
+                cli_frontend_graph_origin =
+                  Blorp.Compiler_blorp_bridge.CliFrontendUserModule;
+                _;
               };
             ];
-          cli_source_graph_modules =
+          cli_frontend_graph_modules =
             [
               {
-                cli_source_graph_path = "src/dep.brp";
-                cli_source_graph_module_name = "./dep";
-                cli_source_graph_source_text = "dep source";
-                cli_source_graph_parsed_response =
-                  Blorp.Compiler_blorp_bridge.ParsedSource
-                    { parsed_program = []; parsed_comments = [] };
+                cli_frontend_graph_path = "src/dep.brp";
+                cli_frontend_graph_module_name = "./dep";
+                cli_frontend_graph_origin =
+                  Blorp.Compiler_blorp_bridge.CliFrontendUserModule;
+                _;
               };
             ];
+          cli_frontend_graph_imports =
+            [
+              {
+                cli_frontend_import_from_module = "main";
+                cli_frontend_import_path = "./dep";
+                cli_frontend_import_resolved_path = Some "src/dep.brp";
+                cli_frontend_import_resolved_module = Some "./dep";
+                _;
+              };
+            ];
+          cli_frontend_graph_diagnostics = [];
         }) ->
       ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI parsed source graph"
+  | Ok _ -> Alcotest.fail "expected decoded frontend module graph"
   | Error (_, message) -> Alcotest.fail message
 
-let test_cli_run_response_rejects_wrong_parsed_source_batch_command () =
+let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
+           ("options", compile_options_json [ "src/main.brp" ]);
+           ( "roots",
+             Lsp_json.Array
+               [ frontend_graph_source "src/main.brp" "main" "import:\n\t./dep" ]
+           );
+           ("modules", Lsp_json.Array []);
+           ( "imports",
+             Lsp_json.Array
+               [
+                 frontend_import_edge ~from_path:"src/main.brp"
+                   ~from_module:"main" ~import_path:"./dep"
+                   ~resolved_path:"src/dep.brp" ~resolved_module:"./dep"
+                   ~resolved_origin:(frontend_origin_json "user") ();
+               ] );
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains "absent from the graph"
+
+let test_cli_run_response_rejects_legacy_parsed_source_artifact () =
   let response =
     bridge_success_json
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "parsed_source_batch");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "check"; "src" ]);
-           ("options", check_options_json [ "src" ]);
-           ("sources", Lsp_json.Array []);
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "expected `check`"
+  |> expect_invalid_response_contains
+       "unsupported CLI run artifact kind `parsed_source_batch`"
 
 let test_cli_run_response_decodes_frontend_options () =
   let response =
@@ -1216,15 +1199,14 @@ let suite =
           test_cli_run_response_decodes_delegate;
         Alcotest.test_case "CLI run response decodes test options" `Quick
           test_cli_run_response_decodes_test_options;
-        Alcotest.test_case "CLI run response decodes parsed source" `Quick
-          test_cli_run_response_decodes_parsed_source;
-        Alcotest.test_case "CLI run response decodes parsed source batch"
-          `Quick test_cli_run_response_decodes_parsed_source_batch;
-        Alcotest.test_case "CLI run response decodes parsed source graph"
-          `Quick test_cli_run_response_decodes_parsed_source_graph;
+        Alcotest.test_case "CLI run response decodes frontend module graph"
+          `Quick test_cli_run_response_decodes_frontend_module_graph;
         Alcotest.test_case
-          "CLI run response rejects wrong parsed source batch command" `Quick
-          test_cli_run_response_rejects_wrong_parsed_source_batch_command;
+          "CLI run response rejects frontend graph missing resolved target" `Quick
+          test_cli_run_response_rejects_frontend_graph_missing_resolved_target;
+        Alcotest.test_case
+          "CLI run response rejects legacy parsed source artifact" `Quick
+          test_cli_run_response_rejects_legacy_parsed_source_artifact;
         Alcotest.test_case "CLI run response decodes frontend options" `Quick
           test_cli_run_response_decodes_frontend_options;
         Alcotest.test_case "CLI run response decodes purify options" `Quick

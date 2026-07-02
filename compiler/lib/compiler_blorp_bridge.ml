@@ -151,35 +151,37 @@ type cli_frontend_options =
   | CliFrontendCompileOptions of cli_compile_options
   | CliFrontendRunOptions of cli_run_options
 
-type cli_frontend_parsed = {
-  cli_frontend_command : cli_frontend_command;
-  cli_frontend_args : string list;
-  cli_frontend_options : cli_frontend_options;
-  cli_frontend_path : string;
-  cli_frontend_module_name : string;
-  cli_frontend_source_text : string option;
-  cli_frontend_parsed_response : parse_source_response;
+type cli_frontend_module_origin =
+  | CliFrontendUserModule
+  | CliFrontendStdModule
+  | CliFrontendSourcePackageModule of string
+  | CliFrontendPkgModule of string
+
+type cli_frontend_graph_source = {
+  cli_frontend_graph_path : string;
+  cli_frontend_graph_module_name : string;
+  cli_frontend_graph_source_text : string;
+  cli_frontend_graph_parsed_response : parse_source_response;
+  cli_frontend_graph_origin : cli_frontend_module_origin;
 }
 
-type cli_check_source_batch = {
-  cli_check_batch_args : string list;
-  cli_check_batch_options : cli_check_options;
-  cli_check_batch_sources : parse_source_batch_response list;
+type cli_frontend_import_edge = {
+  cli_frontend_import_from_path : string;
+  cli_frontend_import_from_module : string;
+  cli_frontend_import_path : string;
+  cli_frontend_import_resolved_path : string option;
+  cli_frontend_import_resolved_module : string option;
+  cli_frontend_import_resolved_origin : cli_frontend_module_origin option;
 }
 
-type cli_source_graph_source = {
-  cli_source_graph_path : string;
-  cli_source_graph_module_name : string;
-  cli_source_graph_source_text : string;
-  cli_source_graph_parsed_response : parse_source_response;
-}
-
-type cli_source_graph = {
-  cli_source_graph_command : cli_frontend_command;
-  cli_source_graph_args : string list;
-  cli_source_graph_options : cli_frontend_options;
-  cli_source_graph_roots : cli_source_graph_source list;
-  cli_source_graph_modules : cli_source_graph_source list;
+type cli_frontend_module_graph = {
+  cli_frontend_graph_command : cli_frontend_command;
+  cli_frontend_graph_args : string list;
+  cli_frontend_graph_options : cli_frontend_options;
+  cli_frontend_graph_roots : cli_frontend_graph_source list;
+  cli_frontend_graph_modules : cli_frontend_graph_source list;
+  cli_frontend_graph_imports : cli_frontend_import_edge list;
+  cli_frontend_graph_diagnostics : string list;
 }
 
 type cli_frontend_options_plan = {
@@ -196,9 +198,7 @@ type cli_run_handled_result = {
 
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
-  | CliRunParsedSource of cli_frontend_parsed
-  | CliRunParsedSourceBatch of cli_check_source_batch
-  | CliRunParsedSourceGraph of cli_source_graph
+  | CliRunFrontendModuleGraph of cli_frontend_module_graph
   | CliRunFrontendOptions of cli_frontend_options_plan
   | CliRunTestOptions of cli_test_options
   | CliRunPurifyOptions of cli_purify_options
@@ -1069,156 +1069,179 @@ let decode_cli_frontend_options command options =
   | CliFrontendCompile -> decode_cli_compile_options options
   | CliFrontendRun -> decode_cli_run_options options
 
-let cli_frontend_parsed_response_field artifact =
-  let* command_text = string_response_field "command" artifact in
-  let* cli_frontend_command = cli_frontend_command_of_string command_text in
-  let* cli_frontend_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "parsed_source" command_text cli_frontend_args
-  in
-  let* options = json_response_field "options" artifact in
-  let* cli_frontend_options =
-    decode_cli_frontend_options cli_frontend_command options
-  in
-  let* source = json_response_field "source" artifact in
-  let* cli_frontend_path = string_response_field "path" source in
-  let* cli_frontend_module_name = string_response_field "module" source in
-  let* cli_frontend_source_text =
-    optional_missing_string_response_field "source_text" source
-  in
-  let* parsed_source = json_response_field "parsed_source" source in
-  let* cli_frontend_parsed_response = parsed_ast_artifact_field parsed_source in
-  Ok
-    {
-      cli_frontend_command;
-      cli_frontend_args;
-      cli_frontend_options;
-      cli_frontend_path;
-      cli_frontend_module_name;
-      cli_frontend_source_text;
-      cli_frontend_parsed_response;
-    }
-
-let cli_check_source_batch_source_response_field source =
-  let* batch_parsed_path = string_response_field "path" source in
-  let* batch_parsed_module_name = string_response_field "module" source in
-  let* parsed_source = json_response_field "parsed_source" source in
-  let* batch_parsed_response = parsed_ast_artifact_field parsed_source in
-  Ok
-    {
-      batch_parsed_path;
-      batch_parsed_module_name;
-      batch_parsed_response;
-    }
-
-let cli_check_source_batch_sources_field artifact =
-  match json_response_field "sources" artifact with
-  | Error _ as error -> error
-  | Ok (Lsp_json.Array sources) ->
-      let rec collect acc = function
-        | [] -> Ok (List.rev acc)
-        | source :: rest ->
-            let* parsed = cli_check_source_batch_source_response_field source in
-            collect (parsed :: acc) rest
-      in
-      collect [] sources
-  | Ok _ -> Error ("invalid_response", "field `sources` must be an array")
-
-let cli_check_source_batch_response_field artifact =
-  let* command_text = string_response_field "command" artifact in
-  let* () =
-    if String.equal command_text "check" then Ok ()
-    else
+let cli_frontend_module_origin_field origin =
+  let* kind = string_response_field "kind" origin in
+  match kind with
+  | "user" -> Ok CliFrontendUserModule
+  | "std" -> Ok CliFrontendStdModule
+  | "source_package" ->
+      let* package_alias = string_response_field "package" origin in
+      Ok (CliFrontendSourcePackageModule package_alias)
+  | "pkg" ->
+      let* package_id = string_response_field "package" origin in
+      Ok (CliFrontendPkgModule package_id)
+  | other ->
       Error
         ( "invalid_response",
-          "CLI parsed_source_batch artifact command is `" ^ command_text
-          ^ "`, expected `check`" )
-  in
-  let* cli_check_batch_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "parsed_source_batch" "check"
-      cli_check_batch_args
-  in
-  let* options = json_response_field "options" artifact in
-  let* cli_frontend_options = decode_cli_check_options options in
-  let* cli_check_batch_options =
-    match cli_frontend_options with
-    | CliFrontendCheckOptions options -> Ok options
-    | _ ->
-        Error
-          ( "invalid_response",
-            "CLI parsed_source_batch options must be check options" )
-  in
-  let* cli_check_batch_sources =
-    cli_check_source_batch_sources_field artifact
-  in
-  Ok
-    (CliRunParsedSourceBatch
-       {
-         cli_check_batch_args;
-         cli_check_batch_options;
-         cli_check_batch_sources;
-       })
+          "unsupported frontend module origin `" ^ other ^ "`" )
 
-let cli_source_graph_source_field source =
-  let* cli_source_graph_path = string_response_field "path" source in
-  let* cli_source_graph_module_name = string_response_field "module" source in
-  let* cli_source_graph_source_text =
+let optional_cli_frontend_module_origin_field name value =
+  match optional_json_response_field name value with
+  | Error _ as error -> error
+  | Ok None | Ok (Some Lsp_json.Null) -> Ok None
+  | Ok (Some origin) ->
+      let* decoded = cli_frontend_module_origin_field origin in
+      Ok (Some decoded)
+
+let cli_frontend_graph_source_field source =
+  let* cli_frontend_graph_path = string_response_field "path" source in
+  let* cli_frontend_graph_module_name = string_response_field "module" source in
+  let* cli_frontend_graph_source_text =
     string_response_field "source_text" source
   in
   let* parsed_source = json_response_field "parsed_source" source in
-  let* cli_source_graph_parsed_response =
+  let* cli_frontend_graph_parsed_response =
     parsed_ast_artifact_field parsed_source
   in
+  let* origin = json_response_field "origin" source in
+  let* cli_frontend_graph_origin = cli_frontend_module_origin_field origin in
   Ok
     {
-      cli_source_graph_path;
-      cli_source_graph_module_name;
-      cli_source_graph_source_text;
-      cli_source_graph_parsed_response;
+      cli_frontend_graph_path;
+      cli_frontend_graph_module_name;
+      cli_frontend_graph_source_text;
+      cli_frontend_graph_parsed_response;
+      cli_frontend_graph_origin;
     }
 
-let cli_source_graph_source_list_field name artifact =
+let cli_frontend_graph_source_list_field name artifact =
   match json_response_field name artifact with
   | Error _ as error -> error
   | Ok (Lsp_json.Array sources) ->
       let rec collect acc = function
         | [] -> Ok (List.rev acc)
         | source :: rest ->
-            let* parsed = cli_source_graph_source_field source in
+            let* parsed = cli_frontend_graph_source_field source in
             collect (parsed :: acc) rest
       in
       collect [] sources
   | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
 
-let cli_source_graph_response_field artifact =
-  let* command_text = string_response_field "command" artifact in
-  let* cli_source_graph_command =
-    cli_frontend_command_of_string command_text
+let cli_frontend_import_edge_field edge =
+  let* cli_frontend_import_from_path = string_response_field "from_path" edge in
+  let* cli_frontend_import_from_module =
+    string_response_field "from_module" edge
   in
-  let* cli_source_graph_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "parsed_source_graph" command_text
-      cli_source_graph_args
+  let* cli_frontend_import_path = string_response_field "import_path" edge in
+  let* cli_frontend_import_resolved_path =
+    optional_string_response_field "resolved_path" edge
   in
-  let* options = json_response_field "options" artifact in
-  let* cli_source_graph_options =
-    decode_cli_frontend_options cli_source_graph_command options
+  let* cli_frontend_import_resolved_module =
+    optional_string_response_field "resolved_module" edge
   in
-  let* cli_source_graph_roots =
-    cli_source_graph_source_list_field "roots" artifact
-  in
-  let* cli_source_graph_modules =
-    cli_source_graph_source_list_field "modules" artifact
+  let* cli_frontend_import_resolved_origin =
+    optional_cli_frontend_module_origin_field "resolved_origin" edge
   in
   Ok
-    (CliRunParsedSourceGraph
+    {
+      cli_frontend_import_from_path;
+      cli_frontend_import_from_module;
+      cli_frontend_import_path;
+      cli_frontend_import_resolved_path;
+      cli_frontend_import_resolved_module;
+      cli_frontend_import_resolved_origin;
+    }
+
+let cli_frontend_import_edges_field artifact =
+  match json_response_field "imports" artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array edges) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | edge :: rest ->
+            let* parsed = cli_frontend_import_edge_field edge in
+            collect (parsed :: acc) rest
+      in
+      collect [] edges
+  | Ok _ -> Error ("invalid_response", "field `imports` must be an array")
+
+let cli_frontend_graph_diagnostics_field artifact =
+  string_array_field "diagnostics" artifact
+
+let cli_frontend_graph_contains_source sources path module_name =
+  List.exists
+    (fun source ->
+      source.cli_frontend_graph_path = path
+      && source.cli_frontend_graph_module_name = module_name)
+    sources
+
+let validate_cli_frontend_import_edges ~sources edges =
+  let validate_edge edge =
+    match
+      ( edge.cli_frontend_import_resolved_path,
+        edge.cli_frontend_import_resolved_module )
+    with
+    | None, None -> Ok ()
+    | Some path, Some module_name ->
+        if cli_frontend_graph_contains_source sources path module_name then Ok ()
+        else
+          Error
+            ( "invalid_response",
+              "frontend import edge resolved to `" ^ module_name ^ "` at `"
+              ^ path ^ "` but that source is absent from the graph" )
+    | _ ->
+        Error
+          ( "invalid_response",
+            "frontend import edge must provide both resolved_path and \
+             resolved_module, or neither" )
+  in
+  let rec loop = function
+    | [] -> Ok ()
+    | edge :: rest ->
+        let* () = validate_edge edge in
+        loop rest
+  in
+  loop edges
+
+let cli_frontend_module_graph_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* cli_frontend_graph_command =
+    cli_frontend_command_of_string command_text
+  in
+  let* cli_frontend_graph_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "frontend_module_graph" command_text
+      cli_frontend_graph_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_frontend_graph_options =
+    decode_cli_frontend_options cli_frontend_graph_command options
+  in
+  let* cli_frontend_graph_roots =
+    cli_frontend_graph_source_list_field "roots" artifact
+  in
+  let* cli_frontend_graph_modules =
+    cli_frontend_graph_source_list_field "modules" artifact
+  in
+  let* cli_frontend_graph_imports = cli_frontend_import_edges_field artifact in
+  let* cli_frontend_graph_diagnostics =
+    cli_frontend_graph_diagnostics_field artifact
+  in
+  let* () =
+    validate_cli_frontend_import_edges
+      ~sources:(cli_frontend_graph_roots @ cli_frontend_graph_modules)
+      cli_frontend_graph_imports
+  in
+  Ok
+    (CliRunFrontendModuleGraph
        {
-         cli_source_graph_command;
-         cli_source_graph_args;
-         cli_source_graph_options;
-         cli_source_graph_roots;
-         cli_source_graph_modules;
+         cli_frontend_graph_command;
+         cli_frontend_graph_args;
+         cli_frontend_graph_options;
+         cli_frontend_graph_roots;
+         cli_frontend_graph_modules;
+         cli_frontend_graph_imports;
+         cli_frontend_graph_diagnostics;
        })
 
 let cli_frontend_options_response_field artifact =
@@ -1360,11 +1383,7 @@ let cli_run_response_field response =
   let* kind = string_response_field "kind" artifact in
   match kind with
   | "handled" -> cli_run_handled_response_field artifact
-  | "parsed_source" ->
-      let* parsed = cli_frontend_parsed_response_field artifact in
-      Ok (CliRunParsedSource parsed)
-  | "parsed_source_batch" -> cli_check_source_batch_response_field artifact
-  | "parsed_source_graph" -> cli_source_graph_response_field artifact
+  | "frontend_module_graph" -> cli_frontend_module_graph_response_field artifact
   | "frontend_options" ->
       let* options = cli_frontend_options_response_field artifact in
       Ok (CliRunFrontendOptions options)

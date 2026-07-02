@@ -5,7 +5,16 @@ import:
 	compiler_cli_artifact_json: cli_compile_options_json, cli_run_options_json
 	compiler_cli_plan:
 		CliCheckTargetExpansion,
-		CliFrontendCommand(CliFrontendCompile, CliFrontendRun),
+		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(
+			CliFrontendPkgModule,
+			CliFrontendSourcePackageModule,
+			CliFrontendStdModule,
+			CliFrontendUserModule,
+		),
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
@@ -461,9 +470,16 @@ record CliSourceGraphContext {
 }
 
 
+private record CliSourceIdentity {
+	path: String,
+	module_name: String
+}
+
+
 record CliSourceGraphDiscovery {
 	sources: List[CliSourceFile],
-	seen_paths: List[String]
+	seen_sources: List[CliSourceIdentity],
+	import_edges: List[CliFrontendImportEdge]
 }
 
 
@@ -1116,11 +1132,15 @@ private func source_graph_context_for_sources(
 	}
 
 
-private pure func source_path_seen(paths: List[String], path: String) -> Bool:
+private pure func source_identity_seen(
+	sources: List[CliSourceIdentity],
+	path: String,
+	module_name: String,
+) -> Bool:
 	var seen: Bool = False
 
-	for item in paths:
-		if item == path:
+	for source in sources:
+		if source.path == path and source.module_name == module_name:
 			seen = True
 			break
 
@@ -1145,18 +1165,117 @@ private pure func split_module_ref(module_path: String) -> Option[(String, Strin
 				Some((head, rest.join("/")))
 
 
-private func source_package_for_base_dir(
+private func source_package_for_path(
 	context: CliSourceGraphContext,
-	base_dir: String,
+	path: String,
 ) -> Option[CliSourcePackage]:
 	var result: Option[CliSourcePackage] = None
+	absolute: String = absolute_path(path)
 
 	for package in context.source_packages:
-		if is_path_under_dir(package.source_dir, absolute_path(base_dir)):
+		if is_path_under_dir(package.source_dir, absolute):
 			result = Some(package)
 			break
 
 	result
+
+
+private func frontend_module_origin_for_path(
+	context: CliSourceGraphContext,
+	path: String,
+	module_name: String,
+) -> CliFrontendModuleOrigin:
+	if module_name.starts_with("std/"):
+		CliFrontendStdModule
+	else if module_name.starts_with("pkg/"):
+		match split_module_ref(strip_prefix("pkg/", module_name)):
+			Some((package_id, _)):
+				CliFrontendPkgModule(package_id)
+			None:
+				CliFrontendPkgModule("pkg")
+	else:
+		match source_package_for_path(context, path):
+			Some(package):
+				CliFrontendSourcePackageModule(package.package_alias)
+			None:
+				CliFrontendUserModule
+
+
+private func frontend_graph_source(
+	context: CliSourceGraphContext,
+	source: CliParsedSourceFile,
+) -> CliFrontendGraphSource:
+	{
+		path = source.path,
+		module_name = source.module_name,
+		source_text = source.source_text,
+		parsed_source = source.parsed_source,
+		origin = frontend_module_origin_for_path(context, source.path, source.module_name)
+	}
+
+
+private func frontend_graph_sources(
+	context: CliSourceGraphContext,
+	sources: List[CliParsedSourceFile],
+) -> List[CliFrontendGraphSource]:
+	var graph_sources: List[CliFrontendGraphSource] = []
+
+	for source in sources:
+		graph_sources = graph_sources.append(frontend_graph_source(context, source))
+
+	graph_sources
+
+
+private func resolved_import_origin(
+	context: CliSourceGraphContext,
+	resolved: CliResolvedImportSource,
+) -> CliFrontendModuleOrigin:
+	frontend_module_origin_for_path(context, resolved.path, resolved.module_name)
+
+
+private pure func resolved_import_path(resolved: Option[CliResolvedImportSource]) -> Option[String]:
+	match resolved:
+		Some(source):
+			Some(source.path)
+		None:
+			None
+
+
+private pure func resolved_import_module(
+	resolved: Option[CliResolvedImportSource],
+) -> Option[String]:
+	match resolved:
+		Some(source):
+			Some(source.module_name)
+		None:
+			None
+
+
+private func resolved_import_module_origin(
+	context: CliSourceGraphContext,
+	resolved: Option[CliResolvedImportSource],
+) -> Option[CliFrontendModuleOrigin]:
+	match resolved:
+		Some(source):
+			Some(resolved_import_origin(context, source))
+		None:
+			None
+
+
+private func frontend_import_edge(
+	context: CliSourceGraphContext,
+	source: CliParsedSourceFile,
+	module_path: String,
+	resolved: Option[CliResolvedImportSource],
+) -> CliFrontendImportEdge:
+	{
+		from_path = source.path,
+		from_module = source.module_name,
+		import_path = module_path,
+		resolved_path = resolved_import_path(resolved),
+		resolved_module = resolved_import_module(resolved),
+		resolved_origin = resolved_import_module_origin(context, resolved)
+	}
 
 
 private pure func source_package_export_for_alias(
@@ -1296,7 +1415,7 @@ private func resolve_import_source_path(
 	base_dir: String,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
-	current_package: Option[CliSourcePackage] = source_package_for_base_dir(context, base_dir)
+	current_package: Option[CliSourcePackage] = source_package_for_path(context, base_dir)
 
 	if module_path.starts_with("pkg/"):
 		resolve_pkg_import_source_path(context, current_package, base_dir, module_path)
@@ -1385,10 +1504,11 @@ private func read_cli_import_source(
 private func discover_import_sources_for_parsed_source(
 	context: CliSourceGraphContext,
 	source: CliParsedSourceFile,
-	seen_paths: List[String],
+	seen_sources: List[CliSourceIdentity],
 ) -> Result[CliSourceGraphDiscovery, String]:
 	var sources: List[CliSourceFile] = []
-	var seen: List[String] = seen_paths
+	var seen: List[CliSourceIdentity] = seen_sources
+	var import_edges: List[CliFrontendImportEdge] = []
 	var error: Option[String] = None
 	base_dir: String = dirname(source.path)
 
@@ -1397,12 +1517,29 @@ private func discover_import_sources_for_parsed_source(
 			Some(_):
 				break
 			None:
-				match resolve_import_source_path(context, base_dir, module_path):
+				resolved: Option[CliResolvedImportSource] = resolve_import_source_path(
+					context,
+					base_dir,
+					module_path,
+				)
+				import_edges = import_edges.append(
+					frontend_import_edge(
+						context,
+						source,
+						module_path,
+						resolved,
+					),
+				)
+
+				match resolved:
 					Some(resolved):
-						if not source_path_seen(seen, resolved.path):
+						if not source_identity_seen(seen, resolved.path, resolved.module_name):
 							match read_cli_import_source(resolved):
 								Ok(Some(import_source)):
-									seen = seen.append(import_source.path)
+									seen = seen.append({
+										path = import_source.path,
+										module_name = import_source.module_name,
+									})
 									sources = sources.append(import_source)
 								Ok(None):
 									void
@@ -1417,17 +1554,19 @@ private func discover_import_sources_for_parsed_source(
 		None:
 			Ok({
 				sources = sources,
-				seen_paths = seen,
+				seen_sources = seen,
+				import_edges = import_edges,
 			})
 
 
 private func discover_import_sources_for_parsed_sources(
 	context: CliSourceGraphContext,
 	parsed_sources: List[CliParsedSourceFile],
-	seen_paths: List[String],
+	seen_sources: List[CliSourceIdentity],
 ) -> Result[CliSourceGraphDiscovery, String]:
 	var sources: List[CliSourceFile] = []
-	var seen: List[String] = seen_paths
+	var seen: List[CliSourceIdentity] = seen_sources
+	var import_edges: List[CliFrontendImportEdge] = []
 	var error: Option[String] = None
 
 	for source in parsed_sources:
@@ -1437,8 +1576,9 @@ private func discover_import_sources_for_parsed_sources(
 			None:
 				match discover_import_sources_for_parsed_source(context, source, seen):
 					Ok(discovery):
-						seen = discovery.seen_paths
+						seen = discovery.seen_sources
 						sources = sources.concat(discovery.sources)
+						import_edges = import_edges.concat(discovery.import_edges)
 					Err(message):
 						error = Some(message)
 
@@ -1448,28 +1588,42 @@ private func discover_import_sources_for_parsed_sources(
 		None:
 			Ok({
 				sources = sources,
-				seen_paths = seen,
+				seen_sources = seen,
+				import_edges = import_edges,
 			})
 
 
-private pure func parsed_source_paths(sources: List[CliParsedSourceFile]) -> List[String]:
-	var paths: List[String] = []
+private pure func parsed_source_identities(
+	sources: List[CliParsedSourceFile],
+) -> List[CliSourceIdentity]:
+	var identities: List[CliSourceIdentity] = []
 
 	for source in sources:
-		paths = paths.append(source.path)
+		identities = identities.append({
+			path = source.path,
+			module_name = source.module_name,
+		})
 
-	paths
+	identities
 
 
-func source_graph_modules_for_roots(
+record CliSourceGraphWalk {
+	modules: List[CliParsedSourceFile],
+	import_edges: List[CliFrontendImportEdge]
+}
+
+
+private func source_graph_walk_for_roots(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
-) -> Result[List[CliParsedSourceFile], String]:
+) -> Result[CliSourceGraphWalk, String]:
 	var modules: List[CliParsedSourceFile] = []
-	var seen_paths: List[String] = parsed_source_paths(roots)
+	var import_edges: List[CliFrontendImportEdge] = []
+	var seen_sources: List[CliSourceIdentity] = parsed_source_identities(roots)
 	context: CliSourceGraphContext = source_graph_context_for_sources(action, roots)
-	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_paths)
-	seen_paths = initial.seen_paths
+	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_sources)
+	seen_sources = initial.seen_sources
+	import_edges = import_edges.concat(initial.import_edges)
 	var pending: List[CliSourceFile] = initial.sources
 	var error: Option[String] = None
 
@@ -1485,10 +1639,11 @@ func source_graph_modules_for_roots(
 						match discover_import_sources_for_parsed_sources(
 							context,
 							parsed_batch,
-							seen_paths,
+							seen_sources,
 						):
 							Ok(discovery):
-								seen_paths = discovery.seen_paths
+								seen_sources = discovery.seen_sources
+								import_edges = import_edges.concat(discovery.import_edges)
 								pending = discovery.sources
 							Err(message):
 								error = Some(message)
@@ -1499,7 +1654,39 @@ func source_graph_modules_for_roots(
 		Some(message):
 			Err(message)
 		None:
-			Ok(modules)
+			Ok({
+				modules = modules,
+				import_edges = import_edges,
+			})
+
+
+func source_graph_modules_for_roots(
+	action: CliAction,
+	roots: List[CliParsedSourceFile],
+) -> Result[List[CliParsedSourceFile], String]:
+	walk ?= source_graph_walk_for_roots(action, roots)
+	Ok(walk.modules)
+
+
+func frontend_module_graph_for_roots(
+	action: CliAction,
+	command: CliFrontendCommand,
+	user_args: List[String],
+	options: JsonValue,
+	roots: List[CliParsedSourceFile],
+) -> Result[CliFrontendModuleGraph, String]:
+	context: CliSourceGraphContext = source_graph_context_for_sources(action, roots)
+	walk ?= source_graph_walk_for_roots(action, roots)
+
+	Ok({
+		command = command,
+		args = user_args,
+		options = options,
+		roots = frontend_graph_sources(context, roots),
+		modules = frontend_graph_sources(context, walk.modules),
+		import_edges = walk.import_edges,
+		diagnostics = [],
+	})
 
 
 func parse_cli_source_file_for_action(
