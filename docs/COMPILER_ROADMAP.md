@@ -1,6 +1,6 @@
 # Compiler Roadmap
 
-Status: active roadmap, reviewed 2026-06-12.
+Status: active roadmap, reviewed 2026-07-02.
 
 Use [ARCHITECTURE.md](ARCHITECTURE.md) for the live compiler pipeline and
 [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the ownership ABI. This file tracks
@@ -40,12 +40,14 @@ implemented:
   `BorrowFresh` and `ConsumeReuse`, and the runtime has matching handoff
   helpers. Reuse work should extend and measure this path, not rediscover reuse
   from arbitrary loops.
-- The self-hosting path is active in `compiler/blorp`: the supported backend
-  route now owns a contiguous Core tail through resource cleanup rewriting,
-  fairness checkpoint insertion, final-preparation subset, and C artifact
-  emission subset. Further migration should expand that production path and
-  delete the matching OCaml implementation, not add more optional renderer-only
-  scaffolding.
+- The self-hosting path is active in `compiler/blorp` at both ends of the
+  compiler. The left edge owns CLI planning, source target expansion, source
+  graph discovery, source reads, lexing, parsing, and parsed-source artifact
+  encoding for the main source commands. The right edge owns the supported Core
+  tail through reuse, closure conversion, resource cleanup rewriting, fairness
+  checkpoint insertion, final preparation, prepared-union reuse, and C artifact
+  emission. Further migration should expand one of those production edges and
+  delete the matching OCaml implementation, not add optional parallel paths.
 
 ## Active Workstreams
 
@@ -318,39 +320,42 @@ explicit internal Core boundary.
 
 Current state:
 
-- `compiler/blorp` now contains the active bridge dispatcher, typed Core JSON
-  codecs, renderer modules, and a supported Core-tail path: resource cleanup
-  rewriting, cooperative checkpoint insertion, final Core preparation subset,
-  and C artifact emission subset.
-- OCaml still owns the frontend, most Core stages, most representation/layout
-  decisions, most C emission, and fallback paths for unsupported Core shapes.
-- `compiler/blorp/tests` checks renderer behavior and direct compiler-slice
-  behavior. The detailed deletion-first port plan lives in
-  [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
+- `compiler/blorp` contains the active bridge dispatchers, typed Core JSON
+  codecs, renderer modules, the Blorp CLI planner/source graph frontier, the
+  Blorp lexer/parser, and the supported Core-tail path.
+- OCaml still owns command execution, artifact writing, C compiler invocation,
+  module validation, embedded std/package authority, inference/typecheck, Core
+  lowering, and the middle Core pipeline through Perceus.
+- `compiler/blorp/tests` checks parser, CLI frontier, bridge, renderer, and
+  direct compiler-slice behavior. The detailed deletion-first port plan lives
+  in [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
 
 Direction:
 
 - Stop treating Blorp compiler code as optional helper code. New slices should
   expand a contiguous production pipeline region and delete the corresponding
   OCaml implementation where practical.
-- Keep one JSON transfer point. Moving the boundary left is preferred over
-  adding new bridge side channels or renderer-specific protocols.
-- Prefer adjacent late-Core work before broad frontend ports, because the
-  current handoff already carries Core facts and the deletion path is clearer.
+- Keep one bridge subsystem and one protocol envelope. The current compile path
+  can cross it at the Blorp parser/source frontier and again at the Blorp Core
+  tail while the OCaml middle remains, but new side channels are migration debt.
+- Prefer work that shrinks the OCaml middle from either contiguous edge:
+  parser/source-AST cleanup and typecheck frontier work on the left, or
+  ownership/middle-Core work on the right.
 - Choose slices by OCaml deletion potential, not by ease of adding more Blorp
   scaffolding.
 
 Implementation order:
 
-1. Delete remaining manifest/template bootstrap debt from the bridge.
-2. Expand the Blorp C artifact path by backend family, deleting matching OCaml
-   helpers as each family becomes authoritative.
-3. Finish the supported final-preparation subset in Blorp, then shrink or
-   delete matching OCaml bridge projection helpers.
-4. Keep Blorp-owned resource/fairness passes observable through the bridge now
-   that the OCaml compatibility path has been deleted.
-5. Move the JSON boundary left through the ownership tail before starting broad
-   parser/typechecker migration.
+1. Finish parser/source-AST cleanup by retiring remaining parser-adjacent OCaml
+   transforms or making their boundaries explicit.
+2. Move module validation and type infrastructure toward consuming the Blorp
+   frontend module graph directly.
+3. Continue the backend edge through consume-specialize and Perceus so the Core
+   tail handoff can move before ownership insertion.
+4. Delete bridge/bootstrap/template compatibility debt as soon as no active
+   production caller needs it.
+5. Keep stage observation and test-speed work aligned with the production path,
+   not with retired optional implementations.
 
 ### Native Boundary And Security
 
@@ -391,15 +396,16 @@ invariants.
 
 ## Near-Term Queue
 
-1. Continue self-hosting by expanding the contiguous Blorp Core-tail path and
-   deleting matching OCaml code in the same slice.
-2. Delete remaining bridge/manifest/template compatibility helpers once
-   production callers no longer need them; keep hygiene tests narrow enough that
-   they catch real regressions.
-3. Move the JSON boundary left through final preparation and the ownership tail
-   before starting broad parser/typechecker migration.
+1. Finish the parser/source-AST ownership cleanup named in
+   [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md): interpolation-hole parsing,
+   subscript desugar, AST finalization, comments, and spans.
+2. Start moving module/type infrastructure behind the Blorp frontend module
+   graph boundary, with direct parity tests before deleting OCaml modules.
+3. Continue the backend edge by completing the Perceus/consume-specialize port
+   and moving the default Core handoff left when leak and stage-parity tests are
+   ready.
 4. Baseline `compiler_ast`, `compiler_symbols`, and `compiler_emit` with timing
-   and allocation counters before large Core-tail ports.
+   and allocation counters before large Core or frontend ports.
 5. Add resolver/emitter tests that make accidental `CKUser (_, None)` fallback
    visible for ordinary source calls.
 6. Audit remaining UFCS DefId suffix paths and decide which source-call shapes

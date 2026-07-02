@@ -18,8 +18,8 @@ The frontend migration has a live hoisted parser path backed by
 `compiler_source.brp`, `compiler_parse_diagnostic.brp`, `compiler_token.brp`,
 `compiler_lexer.brp`, `compiler_parser.brp`, and `compiler_parsed_ast.brp`.
 These modules define pure data-model and helper APIs for Blorp-owned lexing and
-parsing, and the production compiler now routes hoisted source parsing through
-the existing bridge protocol by default. Filesystem-backed compiler parses whose
+parsing, and the production compiler routes source parsing through the existing
+bridge protocol. Filesystem-backed compiler parses whose
 supplied source matches the file on disk send path-only parse requests so the
 Blorp parser bridge executable reads the source file before parsing; synthetic parser
 calls still send source text directly.
@@ -45,8 +45,10 @@ aliases, foreign blocks, trait and impl declarations, and top-level var/const
 declarations. Private declaration wrappers are represented explicitly.
 Structured concurrency coverage includes `concurrent:` blocks,
 `for ... concurrently(...)` loops, `detach`, and `select:` blocks. The parser
-also represents `with` resource blocks and `debug:` blocks explicitly. Broader
-parity fixtures remain a later frontend slice.
+also represents `with` resource blocks and `debug:` blocks explicitly. Remaining
+frontend cleanup should retire parser-adjacent OCaml transforms, expand focused
+fixture coverage for current syntax, and keep parser/source-AST ownership
+contiguous with the CLI source-graph frontier.
 
 The Blorp-owned CLI surface is split by responsibility: `compiler_cli.brp`
 owns top-level planning and dispatch, `compiler_cli_args.brp` owns pure argument

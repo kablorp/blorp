@@ -1,5 +1,7 @@
 # Test Speed Roadmap
 
+Status checked against code on 2026-07-02.
+
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
 hide failures behind caches or looser gates. The goal is to keep the normal loop
@@ -24,9 +26,10 @@ Recent measurements on this branch showed:
 - Full codegen audit adds one Blorp compile plus one host C compiler invocation
   per audit file. At the time of measurement, that was 193 Blorp compiles and
   193 `cc` invocations.
-- `compiler/blorp/tests` are important for expanding Blorp's compiler footprint,
-  but they are expensive because they do substantial bridge/rendering/compiler
-  work.
+- `compiler/blorp/tests` are important for expanding Blorp's compiler footprint
+  and now cover parser, CLI frontier, bridge, renderer, and Core-tail slices.
+  They remain more expensive than plain parser/typecheck fixtures because many
+  cases exercise bridge/rendering/compiler work.
 - Bridge helper preparation still costs roughly 16-21 seconds per `scripts/test`
   run when it recompiles helper binaries instead of reusing the existing
   content-addressed helper cache.
@@ -65,7 +68,7 @@ Deep or premerge gates should own broad sweeps:
 - Expensive `compiler/blorp/tests` subsets that are not needed in every local
   iteration.
 
-## Roadmap
+## Active Roadmap
 
 ### 1. Split Fast and Deep Compiler Gates
 
@@ -114,8 +117,9 @@ as part of test harness cleanup.
 
 ### 3. Move Formatter and Purify Tests In Process or Batch Them
 
-The compiler runner still shells out for formatter and purify cases because the
-public CLI is the available interface.
+Formatter and purify tool fixtures live in `compiler-deep`, not the default
+compiler gate. They still shell out because the public CLI is the available
+interface.
 
 Preferred long-term shape:
 
@@ -149,7 +153,8 @@ merge and release.
 ### 5. Batch Compiler Blorp Bridge Work
 
 `compiler/blorp/tests` are architecturally important, but expensive because they
-exercise the Blorp-owned compiler surface through bridge/rendering paths.
+exercise the Blorp-owned compiler surface through parser, CLI frontier,
+bridge/rendering, and Core-tail paths.
 
 Improve by:
 
@@ -266,14 +271,13 @@ Post-wrapper-simplification verification:
 Continue with the next low-risk cleanup:
 
 1. Measure `scripts/test compiler` and `scripts/test compiler-deep` separately.
-2. Decide whether the default compiler gate needs a tiny named generated-C smoke
-   subset, or whether the existing runtime/compiler checks already cover enough
-   generated-C behavior for local confidence.
-3. Profile the remaining parser/infer/typecheck fixture runner and identify
+2. Profile the remaining parser/infer/typecheck fixture runner and identify
    whether the hot path is repeated module loading, type environment setup, or
    expensive fixture-specific work.
-4. Keep only focused formatter fixtures and a small CLI smoke in the default
-   path.
+3. Keep formatter/purify fixtures in `compiler-deep` until there is an
+   in-process or batched interface that reduces work instead of hiding it.
+4. Measure whether bridge-helper preparation is still a material part of full
+   local runs after the source-graph/parser frontier changes.
 
 ## Success Metrics
 

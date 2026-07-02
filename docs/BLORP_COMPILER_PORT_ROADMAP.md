@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-01.
+Status checked against code on 2026-07-02.
 
 This roadmap is for replacing the OCaml compiler implementation with Blorp
 source. The guiding strategy is direct porting first: copy the OCaml call graph,
@@ -10,10 +10,13 @@ until after the apples-to-apples port for a slice is authoritative.
 
 ## Current Verified State
 
-The current production compile path is mixed:
+The current production compile path has two Blorp-owned islands around an
+OCaml-owned middle:
 
 ```text
-OCaml CLI / module loading / typecheck
+Blorp CLI planning / source graph discovery / source reads / parse
+  -> JSON handoff carrying explicit frontend module graph data
+  -> OCaml command execution / module validation / typecheck
   -> OCaml Core lowering and early Core setup
   -> OCaml Core pipeline through Perceus
   -> JSON handoff
@@ -64,6 +67,18 @@ compiler_core_emit.try_emit_prepared_core_program_c_artifact_with_options
 
 There are still important OCaml paths around that default:
 
+- `compiler/bin/blorp.ml` remains the command execution shell. It invokes the
+  Blorp CLI planner, decodes CLI artifacts, runs the OCaml typechecker and
+  middle pipeline, writes C artifacts, invokes the host C compiler, and owns
+  REPL/LSP/test/package command loops that have not been ported.
+- `compiler/blorp/compiler_cli*.brp` owns user-argument planning for the main
+  command families, source target expansion, auto-format decisions, source
+  reads, source graph discovery, and frontend module graph artifact encoding for
+  `check`, `compile`, and `run`.
+- `compiler/lib/modules.ml` now consumes Blorp-parsed roots and preloaded source
+  graph modules, but still owns authoritative module validation, embedded std
+  policy, import origin checks, cycles, package policy, and the parse-cache
+  interface used by the OCaml typechecker.
 - `core_pipeline.ml` still owns the front half of the Core pipeline through
   Perceus, then hands post-Perceus Core to the Blorp backend tail.
 - Timing-only stage observation uses a lightweight event callback. It does not
@@ -93,19 +108,20 @@ and parser bridge dispatchers:
 | `emit_post_closure_c` | Current production tail handoff | Move left as more stages port |
 | `prepare_and_emit_c` | Compatibility entrypoint for the pinned compiler bootstrap's older post-closure handoff | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `run_core_pipeline` | Core JSON -> Core JSON for one tail stage | Expand into the main stage parity mechanism |
-| `parse_source` | Source text or path/module metadata -> parsed AST JSON through `compiler_parser_bridge.brp` | Expand into the frontend handoff until Blorp owns module loading/typecheck |
+| `parse_source` | Source text or path/module metadata -> parsed AST JSON through `compiler_parser_bridge.brp` | Keep as the source parse entry until frontend module graphs feed a Blorp-owned typechecker |
+| `parse_sources` | Batch source parse for CLI/source-graph discovery waves | Keep while Blorp-owned CLI graph discovery parses multiple files |
 | `render_many` | Temporary non-emission table/diagnostic requests | Delete from production compile path |
 | `renderer_templates` | Compatibility metadata query for the pinned compiler bootstrap's renderer arity checks | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `lower_and_compile` | Declared, unsupported | Implement when Core lowering ports |
 | `typecheck_and_compile` | Declared, unsupported | Implement when typecheck ports |
-| `compile_source` | Declared, unsupported | Implement when parser/source loading ports |
+| `compile_source` | Declared, unsupported | Replace with the frontend-module/typecheck boundary or delete when no bootstrap caller needs the declared action |
 
 Current OCaml-to-Blorp calls outside the main backend handoff are:
 
 | OCaml site | Why it calls Blorp today | Roadmap treatment |
 | --- | --- | --- |
-| `compiler/bin/blorp.ml` | Hidden `__compiler-bridge` and `__compiler-bridge-prepare` commands | Keep as the command perimeter while OCaml is the outer shell |
-| `compiler/lib/modules.ml` | Filesystem-backed parse requests can call Blorp `parse_source`; path-only requests let the parser bridge CLI read the file | Collapse into the main frontend boundary when module loading/typecheck move |
+| `compiler/bin/blorp.ml` | Hidden bridge commands, CLI artifact decoding, command execution, artifact writing, C compiler invocation, and still-OCaml command loops | Keep only as the impure shell while compiler semantics move to Blorp |
+| `compiler/lib/modules.ml` | Finalizes Blorp parsed AST artifacts, preloads source graph modules, and still owns module validation/typecheck-facing cache policy | Collapse into the Blorp frontend/typechecker boundary when module loading/typecheck move |
 | `compiler/lib/core_pipeline.ml` | Default C backend handoff and OCaml-owned early Core passes | Keep, but move the input boundary left over time |
 | `compiler/lib/core_emit_blorp_c.ml` | Core JSON projection, bridge request, subset validation | Shrink to the single bridge shim; delete subset logic as stages move |
 | `compiler/lib/language_surface.ml` | Typecheck/LSP/parser-adjacent tables live in Blorp | Remove as a runtime bridge call until typecheck is Blorp-owned |
@@ -113,24 +129,20 @@ Current OCaml-to-Blorp calls outside the main backend handoff are:
 | `compiler/lib/core_profile.ml` | Profile text rendering and lightweight stage-event timing | Subsumed when profiling/reporting ports or made static |
 | `compiler/lib/compiler_blorp_bridge.ml` | Stage/error renderers, prepared helper binaries, and bridge process management | Reduce to request/response and startup helper preparation plumbing |
 
-The earliest current Blorp call is the source-language surface table lookup from
-OCaml typecheck/LSP-adjacent code. That call is not part of a contiguous
-compiler tail. It should not drive the next big porting slice. Near-term, it
-should either become compile-time/generated static data on the OCaml side or be
-allowed only behind a documented bridge exception until typecheck moves into
-Blorp.
+The source-language surface table lookup from OCaml typecheck/LSP-adjacent code
+is still a documented bridge exception. It is not a contiguous compiler-stage
+handoff and should either become static generated data on the OCaml side or
+disappear when typecheck moves into Blorp.
 
-The frontend parser migration is a temporary exception to the "one boundary per
-compile" target: while OCaml still owns module loading, inference, typecheck,
-and the Core middle, production parses can enter Blorp through the same compiler
-bridge protocol and later enter Blorp again for the Core tail. That is accepted
-only as migration debt for moving source reads and parsing into Blorp without
-adding side channels.
+The current compile path can cross the bridge twice: once for Blorp-owned CLI
+source graph/read/parse work and once for the Blorp-owned Core tail. That is
+accepted migration debt while the OCaml middle remains. It must not grow into
+additional side channels. The next structural goal is to make one of those
+islands absorb adjacent OCaml code until the middle collapses.
 
 ## Target Architecture
 
-During the transition, each production compile should have one OCaml-to-Blorp
-transfer point:
+The final transition target is one OCaml-to-Blorp transfer point:
 
 ```text
 OCaml owns everything before the boundary
@@ -139,19 +151,19 @@ OCaml owns everything before the boundary
   -> one JSON response containing diagnostics, stage observations, or artifact
 ```
 
-The boundary should move left in this order:
+The active ownership edges are:
 
-| Boundary | Blorp owns after handoff | Status |
+| Edge input | Blorp-owned region | Status |
 | --- | --- | --- |
+| Source text / source graph | CLI planning, target expansion, source reads, import discovery, parse | Completed for `check`, `compile`, and `run` roots plus readable filesystem imports |
+| Frontend module graph | module validation, inference, typecheck, Core lowering onward | Next frontend edge |
+| Typed AST | Core lowering onward | Later frontend-to-Core checkpoint |
+| Lowered Core | all Core optimization/lowering passes after lowering | Middle-Core checkpoint |
+| Post-DCE / post-specialize Core | consume specialize onward | Late ownership checkpoint |
+| Post-consume-specialize Core | Perceus, reuse, closure, final tail, emit | Next backend boundary after Perceus port |
+| Post-Perceus Core | reuse, closure, final tail, emit | Current default backend boundary |
 | Post-closure Core | resource, fairness, prepare, emit | Completed as the first Blorp tail |
 | Post-reuse / pre-closure Core | closure, resource, fairness, prepare, emit | Completed for default emission |
-| Post-Perceus Core | reuse, closure, final tail, emit | Current default emission boundary |
-| Post-consume-specialize Core | Perceus, reuse, closure, final tail, emit | Next production boundary after Perceus port |
-| Post-DCE / post-specialize Core | consume specialize onward | Late ownership checkpoint |
-| Lowered Core | all Core optimization/lowering passes after lowering | Middle-Core checkpoint |
-| Typed AST | Core lowering onward | Lowering checkpoint |
-| Parsed source graph | typecheck onward | Frontend checkpoint |
-| Source graph or source text | parse onward | Full compiler ownership |
 
 The final compiler should look like this:
 
@@ -168,17 +180,16 @@ impure CLI / tool shell
   -> impure artifact writing / C compiler invocation
 ```
 
-The formatter and LSP should eventually share the same Blorp compiler library,
-but they are not the lowest-friction route to reducing OCaml in the compile
-pipeline. Treat them as later consolidation unless they block the compiler
-boundary.
+The formatter and LSP should share the same Blorp source model. They should not
+be separate compiler frontends or reasons to preserve an OCaml parser path.
 
 ## Non-Negotiables
 
 - Direct port first. Preserve the OCaml module call graph, function boundaries,
   stage order, and tests until the Blorp slice is proven equivalent.
-- One production JSON boundary. Temporary renderer/snippet calls are migration
-  debt, not the architecture.
+- One bridge subsystem and one protocol envelope. The final architecture should
+  have one production JSON boundary; the current parser/source and Core-tail
+  handoffs are temporary migration debt, not a reason to add side channels.
 - Delete OCaml with each authoritative Blorp slice. A port is incomplete if both
   languages still implement the same production stage.
 - Prefer strict data over strings. Use enums/unions/records/structs so illegal
@@ -197,7 +208,7 @@ boundary.
 
 Use this procedure for every slice:
 
-1. Pick an adjacent OCaml slice immediately to the left of the current boundary.
+1. Pick an adjacent OCaml slice at one active ownership edge.
 2. List the OCaml entry points, private helper graph, important local types, and
    current tests. Avoid redesigning the slice at this step.
 3. Add or port failing Blorp tests that describe the OCaml behavior. Keep test
@@ -604,7 +615,7 @@ Validation:
 
 ## Checkpoint 9: Move Boundary Left Through Type Infrastructure And Typecheck
 
-Goal: make parsed source graph JSON the boundary and let Blorp own type
+Goal: make frontend module graph JSON the boundary and let Blorp own type
 inference, checking, trait resolution inputs, and typed AST output.
 
 Direct OCaml slices to mirror:
@@ -643,9 +654,15 @@ Validation:
 - Existing infer/typecheck should-pass and should-fail fixtures pass.
 - Error text tests cover user-facing diagnostics.
 
-## Checkpoint 10: Move Boundary Left Through Parser And Source AST
+## Checkpoint 10: Finish Parser And Source-AST Ownership
 
-Goal: make source text or source graph the only input to the Blorp compiler.
+Goal: make Blorp frontend module graph data the only parser/source-AST input to
+the compiler and delete parser-adjacent OCaml that no longer owns semantics.
+
+Status: the production source lex/parse path is Blorp-owned through the parser
+bridge. The old parser selector/fallback model is gone. `check`, `compile`, and
+`run` use Blorp CLI/source graph/read/parse artifacts packaged as a
+`frontend_module_graph` before handing parsed data to the OCaml middle.
 
 Direct OCaml slices to mirror:
 
@@ -657,17 +674,23 @@ Direct OCaml slices to mirror:
 
 Implementation:
 
-- Port lexing, indentation, tokens, parser grammar, interpolation parsing, and
-  desugaring directly before changing grammar behavior.
-- Keep removed-syntax diagnostics that improve first-time user experience.
-- Return comments and spans as explicit parse output data.
-- Update `docs/GRAMMAR.md` and parser docs in the same change if behavior
+- Keep lexing, indentation, tokens, parser grammar, comments, spans, and
+  top-level source reads in Blorp.
+- Remove or port the remaining parser-adjacent OCaml transforms in a way that
+  keeps phase ownership clear. Interpolation-hole parsing and subscript
+  desugaring should not be hidden inside typecheck if their representation can
+  be made explicit earlier.
+- Keep comments and spans as explicit parse output data; do not reintroduce
+  global lexer/comment stores.
+- Preserve only current syntax. Removed forms should fail normally unless a
+  targeted diagnostic materially improves first-time user experience.
+- Update `docs/GRAMMAR.md` and parser docs in the same change when behavior
   changes.
 
 Deletion:
 
-- Delete OCaml lexer/parser/AST/desugar code after parser fixtures and formatter
-  projection use Blorp source data.
+- Delete OCaml parser/source-AST/desugar code after parser fixtures, formatter
+  projection, and the OCaml middle consume the Blorp source model directly.
 - Done: the OCaml formatter JSON projection has been deleted; formatting now
   uses Blorp-owned parse/projection/render code through the compiler bridge.
 
@@ -696,12 +719,18 @@ Implementation:
 - Keep impure shell responsibilities explicit: args/env, file IO, subprocesses,
   editor protocol streams, artifact writing, and C compiler invocation.
 - Done: `compiler/blorp/compiler_cli_args.brp` owns pure CLI argument parsing as
-  data for the main command families. The OCaml CLI still executes those parsed
-  actions until the impure shell boundary moves.
-- Done: `compiler/blorp/compiler_cli.brp` adds the first Blorp outer-wrapper
-  model. It parses user argv and plans delegation by command shape as pure data.
-  It deliberately does not install a runnable replacement binary or expose a
-  user-facing legacy-executable option in this checkpoint.
+  data for the main command families. The OCaml command shell still executes
+  those parsed actions until the impure shell boundary moves.
+- Done: the Blorp CLI surface is split by responsibility:
+  `compiler_cli.brp` owns top-level planning/dispatch,
+  `compiler_cli_args.brp` owns pure argument parsing,
+  `compiler_cli_plan.brp` owns shared plan data,
+  `compiler_cli_source_graph.brp` owns source reading/import graph/package
+  source discovery, and `compiler_cli_artifact_json.brp` owns bridge artifact
+  encoding.
+- Done: `check`, `compile`, and `run` can enter the OCaml middle with
+  `frontend_module_graph` artifacts instead of frontend option fallbacks for
+  normal source command shapes.
 - Make each shell call the pure Blorp compiler library rather than embedding
   compiler semantics.
 - Treat formatter/LSP as consumers of the same compiler data model, not separate
@@ -778,20 +807,14 @@ that scaffolding down.
 
 ## Near-Term Execution Order
 
-1. Close the current-tail parity gap, especially prepared union reuse and final
-   observability. This is the most direct route to deleting late OCaml tail code.
-2. Delete snippet-style emission helpers and bootstrap-only renderer fallbacks so
-   production emission is one Blorp artifact request.
-3. Port closure conversion directly and move the main boundary to
-   post-reuse/pre-closure Core.
-4. Port Perceus next, then make consume-specialize plus Perceus the
-   authoritative ownership tail, with leak tests and stage parity before moving
-   the default boundary.
-5. Continue left through the middle-Core passes in the exact order used by
-   `core_pipeline.ml`, deleting each OCaml module as soon as Blorp is
-   authoritative.
+There are now two useful contiguous edges:
 
-The next implementation slice should therefore start with Checkpoint 1, not with
-parser/typechecker work and not with formatter cleanup. It is adjacent to the
-current boundary, has clear OCaml modules to copy, and can produce immediate
-OCaml deletion.
+1. Frontend edge: finish parser/source-AST ownership by retiring remaining
+   parser-adjacent OCaml, then move frontend module graph validation and type
+   infrastructure into Blorp.
+2. Backend edge: continue Perceus and consume-specialization until the default
+   backend handoff can move before ownership insertion.
+
+Pick slices by deletion potential and boundary clarity. A slice is preferred
+when it removes OCaml code from one of those edges, avoids new bridge actions,
+and leaves a smaller middle rather than another optional Blorp implementation.

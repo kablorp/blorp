@@ -1,12 +1,13 @@
 import:
 	../compiler_bridge_protocol: BridgeAction(RunCliAction), BridgeEnvelope
 	../compiler_cli: handle_cli_run_envelope, run_cli, run_cli_with_version
-	../compiler_cli_artifact_json: cli_check_source_batch_artifact_json, cli_parsed_source_file_json
 	../compiler_cli_plan:
-		CliCheckSourceBatch,
 		CliCheckTargetExpansion,
 		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
 		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendSourcePackageModule),
 		CliPackageRunCommand(
 			CliPackageRunCheck,
 			CliPackageRunFetchTarget,
@@ -16,12 +17,11 @@ import:
 		CliParsedSourceFile,
 		CliRunPlan(
 			CliRunDelegate,
+			CliRunFrontendModuleGraph,
 			CliRunFrontendOptions,
 			CliRunHandled,
 			CliRunLsp,
 			CliRunPackage,
-			CliRunParsedSource,
-			CliRunParsedSourceBatch,
 			CliRunPurify,
 			CliRunRepl,
 			CliRunTest,
@@ -112,6 +112,64 @@ pure func parsed_source_diagnostic_count(source: CliParsedSourceFile) -> Int:
 			json_array_length_field(parsed_ast, "diagnostics")
 		None:
 			-1
+
+
+pure func graph_source_decl_count(source: CliFrontendGraphSource) -> Int:
+	match get_field(source.parsed_source, "parsed_ast"):
+		Some(parsed_ast):
+			json_array_length_field(parsed_ast, "decls")
+		None:
+			-1
+
+
+pure func graph_source_diagnostic_count(source: CliFrontendGraphSource) -> Int:
+	match get_field(source.parsed_source, "parsed_ast"):
+		Some(parsed_ast):
+			json_array_length_field(parsed_ast, "diagnostics")
+		None:
+			-1
+
+
+pure func graph_root_at(
+	graph: CliFrontendModuleGraph,
+	index: Int,
+) -> Option[CliFrontendGraphSource]:
+	graph.roots.get(index)
+
+
+pure func graph_module_at(
+	graph: CliFrontendModuleGraph,
+	index: Int,
+) -> Option[CliFrontendGraphSource]:
+	graph.modules.get(index)
+
+
+pure func graph_has_single_root(
+	graph: CliFrontendModuleGraph,
+	command: CliFrontendCommand,
+	path: String,
+) -> Bool:
+	match graph.roots:
+		[root]:
+			graph.command == command and root.path == path
+		_:
+			False
+
+
+pure func is_source_package_origin(source: CliFrontendGraphSource, package_alias: String) -> Bool:
+	match source.origin:
+		CliFrontendSourcePackageModule(actual_package_alias):
+			actual_package_alias == package_alias
+		_:
+			False
+
+
+pure func is_pkg_origin(source: CliFrontendGraphSource, package_id: String) -> Bool:
+	match source.origin:
+		CliFrontendPkgModule(actual_package_id):
+			actual_package_id == package_id
+		_:
+			False
 
 
 func write_text_ok(path: String, text: String) -> Bool:
@@ -317,106 +375,7 @@ func test_expand_check_targets_reports_missing_targets() -> Bool:
 			)
 
 
-func test_cli_parsed_source_file_json_encodes_identity() -> Bool:
-	parsed_file: CliParsedSourceFile = {
-		path = "src/main.brp",
-		module_name = "main",
-		source_text = "func main(args: List[String]) -> Int: 0",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))])
-	}
-	source_json: JsonValue = cli_parsed_source_file_json(parsed_file)
-
-	(
-		json_string_field(source_json, "path") == "src/main.brp"
-		and json_string_field(source_json, "module") == "main"
-		and json_string_field(
-			source_json,
-			"source_text",
-		) == "func main(args: List[String]) -> Int: 0"
-		and json_field(source_json, "parsed_source") != None
-	)
-
-
-func test_cli_check_source_batch_json_encodes_sources() -> Bool:
-	first: CliParsedSourceFile = {
-		path = "src/main.brp",
-		module_name = "main",
-		source_text = "func main(args: List[String]) -> Int: 0",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))])
-	}
-	second: CliParsedSourceFile = {
-		path = "src/helper.brp",
-		module_name = "helper",
-		source_text = "func helper() -> Int: 1",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))])
-	}
-	batch: CliCheckSourceBatch = {
-		args = ["check", "src"],
-		options = JsonObject([("kind", JsonString("check"))]),
-		sources = [first, second],
-		modules = []
-	}
-	artifact: JsonValue = cli_check_source_batch_artifact_json(batch)
-
-	first_source_ok: Bool = match json_array_item_field(artifact, "sources", 0):
-		Some(source):
-			(
-				json_string_field(source, "path") == "src/main.brp"
-				and json_string_field(source, "module") == "main"
-			)
-		None:
-			False
-
-	(
-		json_string_field(artifact, "kind") == "parsed_source_batch"
-		and json_string_field(artifact, "command") == "check"
-		and json_array_length_field(artifact, "args") == 2
-		and json_array_length_field(artifact, "sources") == 2
-		and first_source_ok
-	)
-
-
-func test_cli_check_source_batch_json_encodes_source_graph_modules() -> Bool:
-	root: CliParsedSourceFile = {
-		path = "src/main.brp",
-		module_name = "main",
-		source_text = "import:\n\t./helper\n",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))])
-	}
-	module: CliParsedSourceFile = {
-		path = "src/helper.brp",
-		module_name = "./helper",
-		source_text = "func helper() -> Int: 1",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))])
-	}
-	batch: CliCheckSourceBatch = {
-		args = ["check", "src"],
-		options = JsonObject([("kind", JsonString("check"))]),
-		sources = [root],
-		modules = [module]
-	}
-	artifact: JsonValue = cli_check_source_batch_artifact_json(batch)
-
-	root_ok: Bool = match json_array_item_field(artifact, "roots", 0):
-		Some(source):
-			json_string_field(source, "path") == "src/main.brp"
-		None:
-			False
-
-	module_ok: Bool = match json_array_item_field(artifact, "modules", 0):
-		Some(source):
-			(
-				json_string_field(source, "path") == "src/helper.brp"
-				and json_string_field(source, "module") == "./helper"
-				and json_string_field(source, "source_text") == "func helper() -> Int: 1"
-			)
-		None:
-			False
-
-	json_string_field(artifact, "kind") == "parsed_source_graph" and root_ok and module_ok
-
-
-func test_run_cli_returns_parsed_batch_for_multi_file_check() -> Bool:
+func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 	first_path: String = temp_dir() + "/blorp_cli_check_multi_a.brp"
 	second_path: String = temp_dir() + "/blorp_cli_check_multi_b.brp"
 	_ = remove_file(first_path)
@@ -438,43 +397,44 @@ func test_run_cli_returns_parsed_batch_for_multi_file_check() -> Bool:
 		_ = remove_file(second_path)
 
 		match plan:
-			CliRunParsedSourceBatch(batch):
-				first_ok: Bool = match batch.sources.get(0):
+			CliRunFrontendModuleGraph(graph):
+				first_ok: Bool = match graph.roots.get(0):
 					Some(source):
 						(
 							source.path == first_path
 							and source.module_name == "blorp_cli_check_multi_a"
-							and parsed_source_decl_count(source) == 1
-							and parsed_source_diagnostic_count(source) == 0
+							and graph_source_decl_count(source) == 1
+							and graph_source_diagnostic_count(source) == 0
 						)
 					None:
 						False
 
-				second_ok: Bool = match batch.sources.get(1):
+				second_ok: Bool = match graph.roots.get(1):
 					Some(source):
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_multi_b"
-							and parsed_source_decl_count(source) == 1
-							and parsed_source_diagnostic_count(source) == 0
+							and graph_source_decl_count(source) == 1
+							and graph_source_diagnostic_count(source) == 0
 						)
 					None:
 						False
 
 				(
-					batch.args == ["check", "--no-format", first_path, second_path]
-					and json_string_field(batch.options, "kind") == "check"
-					and json_bool_field(batch.options, "no_format")
-					and json_array_length_field(batch.options, "paths") == 2
-					and batch.sources.length() == 2
+					graph.command == CliFrontendCheck
+					and graph.args == ["check", "--no-format", first_path, second_path]
+					and json_string_field(graph.options, "kind") == "check"
+					and json_bool_field(graph.options, "no_format")
+					and json_array_length_field(graph.options, "paths") == 2
+					and graph.roots.length() == 2
+					and graph.modules.length() == 0
+					and graph.import_edges.length() == 0
 					and first_ok
 					and second_ok
 				)
 			CliRunDelegate(_):
 				False
 			CliRunHandled(_):
-				False
-			CliRunParsedSource(_):
 				False
 			CliRunFrontendOptions(_):
 				False
@@ -490,7 +450,7 @@ func test_run_cli_returns_parsed_batch_for_multi_file_check() -> Bool:
 				False
 
 
-func test_run_cli_returns_parsed_batch_for_directory_check() -> Bool:
+func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 	root: String = temp_dir() + "/blorp_cli_check_single_file_dir"
 	nested: String = root + "/nested"
 	cleanup_check_expansion_tree(root, nested)
@@ -504,30 +464,30 @@ func test_run_cli_returns_parsed_batch_for_directory_check() -> Bool:
 		False
 	else:
 		match plan:
-			CliRunParsedSourceBatch(batch):
-				source_ok: Bool = match batch.sources.get(0):
+			CliRunFrontendModuleGraph(graph):
+				source_ok: Bool = match graph.roots.get(0):
 					Some(source):
 						(
 							source.path == root + "/a.brp"
 							and source.module_name == "a"
-							and parsed_source_decl_count(source) == 1
-							and parsed_source_diagnostic_count(source) == 0
+							and graph_source_decl_count(source) == 1
+							and graph_source_diagnostic_count(source) == 0
 						)
 					None:
 						False
 
 				(
-					batch.args == ["check", "--no-format", root]
-					and json_string_field(batch.options, "kind") == "check"
-					and json_array_length_field(batch.options, "paths") == 1
-					and batch.sources.length() == 1
+					graph.command == CliFrontendCheck
+					and graph.args == ["check", "--no-format", root]
+					and json_string_field(graph.options, "kind") == "check"
+					and json_array_length_field(graph.options, "paths") == 1
+					and graph.roots.length() == 1
+					and graph.modules.length() == 0
 					and source_ok
 				)
 			CliRunDelegate(_):
 				False
 			CliRunHandled(_):
-				False
-			CliRunParsedSource(_):
 				False
 			CliRunFrontendOptions(_):
 				False
@@ -543,7 +503,7 @@ func test_run_cli_returns_parsed_batch_for_directory_check() -> Bool:
 				False
 
 
-func test_run_cli_parsed_batch_preserves_parse_diagnostics() -> Bool:
+func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 	first_path: String = temp_dir() + "/blorp_cli_check_diag_a.brp"
 	second_path: String = temp_dir() + "/blorp_cli_check_diag_b.brp"
 	_ = remove_file(first_path)
@@ -565,23 +525,25 @@ func test_run_cli_parsed_batch_preserves_parse_diagnostics() -> Bool:
 		_ = remove_file(second_path)
 
 		match plan:
-			CliRunParsedSourceBatch(batch):
-				failing_source_ok: Bool = match batch.sources.get(1):
+			CliRunFrontendModuleGraph(graph):
+				failing_source_ok: Bool = match graph.roots.get(1):
 					Some(source):
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_diag_b"
-							and parsed_source_diagnostic_count(source) > 0
+							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
 						False
 
-				batch.sources.length() == 2 and failing_source_ok
+				(
+					graph.command == CliFrontendCheck
+					and graph.roots.length() == 2
+					and failing_source_ok
+				)
 			CliRunDelegate(_):
 				False
 			CliRunHandled(_):
-				False
-			CliRunParsedSource(_):
 				False
 			CliRunFrontendOptions(_):
 				False
@@ -610,10 +572,8 @@ func test_run_cli_formats_check_source_before_read() -> Bool:
 		_ = remove_file(path)
 
 		plan_ok: Bool = match plan:
-			CliRunParsedSource(parsed):
-				parsed.command == CliFrontendCheck and parsed.source.path == path
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				graph_has_single_root(graph, CliFrontendCheck, path)
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -647,10 +607,8 @@ func test_run_cli_no_format_preserves_check_source() -> Bool:
 		_ = remove_file(path)
 
 		plan_ok: Bool = match plan:
-			CliRunParsedSource(parsed):
-				parsed.command == CliFrontendCheck and parsed.source.path == path
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				graph_has_single_root(graph, CliFrontendCheck, path)
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -685,10 +643,8 @@ func test_run_cli_env_no_format_preserves_check_source() -> Bool:
 		_ = remove_file(path)
 
 		plan_ok: Bool = match plan:
-			CliRunParsedSource(parsed):
-				parsed.command == CliFrontendCheck and parsed.source.path == path
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				graph_has_single_root(graph, CliFrontendCheck, path)
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -722,10 +678,8 @@ func test_run_cli_skips_std_check_source_formatting() -> Bool:
 		_ = remove_file(path)
 
 		plan_ok: Bool = match plan:
-			CliRunParsedSource(parsed):
-				parsed.command == CliFrontendCheck and parsed.source.path == path
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				graph_has_single_root(graph, CliFrontendCheck, path)
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -767,32 +721,29 @@ func test_run_cli_formats_directory_check_sources_before_batch_parse() -> Bool:
 		False
 	else:
 		plan_ok: Bool = match plan:
-			CliRunParsedSourceBatch(batch):
-				first_ok: Bool = match batch.sources.get(0):
+			CliRunFrontendModuleGraph(graph):
+				first_ok: Bool = match graph.roots.get(0):
 					Some(source):
-						parsed_source_diagnostic_count(source) == 0
+						graph_source_diagnostic_count(source) == 0
 					None:
 						False
 
-				second_ok: Bool = match batch.sources.get(1):
+				second_ok: Bool = match graph.roots.get(1):
 					Some(source):
-						parsed_source_diagnostic_count(source) == 0
+						graph_source_diagnostic_count(source) == 0
 					None:
 						False
 
 				(
-					batch.args == ["check", root]
-					and batch.sources.length() == 2
+					graph.command == CliFrontendCheck
+					and graph.args == ["check", root]
+					and graph.roots.length() == 2
 					and first_ok
 					and second_ok
 				)
 			CliRunDelegate(_):
 				False
 			CliRunHandled(_):
-				False
-			CliRunParsedSource(_):
-				False
-			CliRunParsedSourceBatch(_):
 				False
 			CliRunFrontendOptions(_):
 				False
@@ -822,15 +773,13 @@ func test_run_cli_reports_check_format_errors() -> Bool:
 		_ = remove_file(path)
 
 		match plan:
+			CliRunFrontendModuleGraph(_):
+				False
 			CliRunHandled(result):
 				result.status == 1 and result.stderr != ""
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
-				False
-			CliRunParsedSource(_):
-				False
-			CliRunParsedSourceBatch(_):
 				False
 			CliRunTest(_):
 				False
@@ -849,6 +798,8 @@ func test_run_cli_reports_missing_check_target() -> Bool:
 	_ = remove_file(path)
 
 	match run_cli(["check", "--no-format", path]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 1
@@ -860,10 +811,6 @@ func test_run_cli_reports_missing_check_target() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -890,6 +837,8 @@ func test_run_cli_reports_empty_check_directory() -> Bool:
 		False
 	else:
 		match plan:
+			CliRunFrontendModuleGraph(_):
+				False
 			CliRunHandled(result):
 				(
 					result.status == 1
@@ -899,10 +848,6 @@ func test_run_cli_reports_empty_check_directory() -> Bool:
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
-				False
-			CliRunParsedSource(_):
-				False
-			CliRunParsedSourceBatch(_):
 				False
 			CliRunTest(_):
 				False
@@ -918,6 +863,8 @@ func test_run_cli_reports_empty_check_directory() -> Bool:
 
 func test_run_cli_handles_format_help() -> Bool:
 	match run_cli(["format", "--help"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -927,10 +874,6 @@ func test_run_cli_handles_format_help() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -946,6 +889,8 @@ func test_run_cli_handles_format_help() -> Bool:
 
 func test_run_cli_handles_top_level_usage() -> Bool:
 	help_ok: Bool = match run_cli(["--help"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -956,10 +901,6 @@ func test_run_cli_handles_top_level_usage() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -973,6 +914,8 @@ func test_run_cli_handles_top_level_usage() -> Bool:
 			False
 
 	missing_ok: Bool = match run_cli([]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 1
@@ -982,10 +925,6 @@ func test_run_cli_handles_top_level_usage() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1003,15 +942,13 @@ func test_run_cli_handles_top_level_usage() -> Bool:
 
 func test_run_cli_handles_version_with_context() -> Bool:
 	handled_ok: Bool = match run_cli_with_version(["--version"], "blorp test-version"):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			result.status == 0 and result.stdout == "blorp test-version\n" and result.stderr == ""
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1025,15 +962,13 @@ func test_run_cli_handles_version_with_context() -> Bool:
 			False
 
 	delegate_without_context_ok: Bool = match run_cli(["--version"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunDelegate(delegation):
 			delegation.args == ["--version"] and delegation.io == BatchCliDelegation
 		CliRunHandled(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1078,6 +1013,8 @@ func test_cli_run_envelope_handles_version_payload() -> Bool:
 
 func test_run_cli_handles_command_help() -> Bool:
 	check_ok: Bool = match run_cli(["check", "--help"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -1087,10 +1024,6 @@ func test_run_cli_handles_command_help() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1104,6 +1037,8 @@ func test_run_cli_handles_command_help() -> Bool:
 			False
 
 	repl_ok: Bool = match run_cli(["repl", "--help"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -1113,10 +1048,6 @@ func test_run_cli_handles_command_help() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1134,6 +1065,8 @@ func test_run_cli_handles_command_help() -> Bool:
 
 func test_run_cli_handles_package_help() -> Bool:
 	package_ok: Bool = match run_cli(["package"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -1143,10 +1076,6 @@ func test_run_cli_handles_package_help() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1160,6 +1089,8 @@ func test_run_cli_handles_package_help() -> Bool:
 			False
 
 	vendor_ok: Bool = match run_cli(["package", "vendor", "--help"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			(
 				result.status == 0
@@ -1169,10 +1100,6 @@ func test_run_cli_handles_package_help() -> Bool:
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1190,6 +1117,8 @@ func test_run_cli_handles_package_help() -> Bool:
 
 func test_run_cli_plans_package_command() -> Bool:
 	check_ok: Bool = match run_cli(["package", "check", "pkg"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunPackage(package_plan):
 			command_ok: Bool = match package_plan.command:
 				CliPackageRunCheck(path):
@@ -1206,10 +1135,6 @@ func test_run_cli_plans_package_command() -> Bool:
 			False
 		CliRunLsp(_):
 			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
-			False
 		CliRunPurify(_):
 			False
 		CliRunRepl(_):
@@ -1224,6 +1149,8 @@ func test_run_cli_plans_package_command() -> Bool:
 		"-o",
 		"pkg.blp",
 	]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunPackage(package_plan):
 			match package_plan.command:
 				CliPackageRunPack(path, output):
@@ -1238,10 +1165,6 @@ func test_run_cli_plans_package_command() -> Bool:
 			False
 		CliRunLsp(_):
 			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
-			False
 		CliRunPurify(_):
 			False
 		CliRunRepl(_):
@@ -1255,6 +1178,8 @@ func test_run_cli_plans_package_command() -> Bool:
 		"hash",
 		"https://example.invalid/pkg",
 	]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunPackage(package_plan):
 			match package_plan.command:
 				CliPackageRunFetchTarget(target, locations):
@@ -1269,10 +1194,6 @@ func test_run_cli_plans_package_command() -> Bool:
 			False
 		CliRunLsp(_):
 			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
-			False
 		CliRunPurify(_):
 			False
 		CliRunRepl(_):
@@ -1286,6 +1207,8 @@ func test_run_cli_plans_package_command() -> Bool:
 		"hash",
 		"vendor/hash",
 	]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunPackage(package_plan):
 			match package_plan.command:
 				CliPackageRunVendorTarget(target, dest):
@@ -1299,10 +1222,6 @@ func test_run_cli_plans_package_command() -> Bool:
 		CliRunHandled(_):
 			False
 		CliRunLsp(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunPurify(_):
 			False
@@ -1324,20 +1243,19 @@ func test_run_cli_parses_compile_source_before_delegation() -> Bool:
 			_ = remove_file(path)
 
 			match plan:
-				CliRunParsedSource(parsed):
-					match get_field(parsed.source.parsed_source, "parsed_ast"):
-						Some(parsed_ast):
+				CliRunFrontendModuleGraph(graph):
+					match graph.roots.get(0):
+						Some(source):
 							(
-								parsed.command == CliFrontendCompile
-								and parsed.source.path == path
-								and parsed.source.module_name == "blorp_cli_run_compile_frontier"
-								and json_array_length_field(parsed_ast, "decls") == 1
-								and json_array_length_field(parsed_ast, "diagnostics") == 0
+								graph.command == CliFrontendCompile
+								and source.path == path
+								and source.module_name == "blorp_cli_run_compile_frontier"
+								and graph_source_decl_count(source) == 1
+								and graph_source_diagnostic_count(source) == 0
+								and graph.modules.length() == 0
 							)
 						None:
 							False
-				CliRunParsedSourceBatch(_):
-					False
 				CliRunDelegate(_):
 					False
 				CliRunFrontendOptions(_):
@@ -1380,20 +1298,21 @@ func test_run_cli_discovers_compile_import_source_graph() -> Bool:
 		_ = remove_file(dep_path)
 
 		match plan:
-			CliRunParsedSource(parsed):
-				match parsed.modules.get(0):
+			CliRunFrontendModuleGraph(graph):
+				match graph.modules.get(0):
 					Some(module):
 						(
-							parsed.modules.length() == 1
+							graph.command == CliFrontendCompile
+							and graph.roots.length() == 1
+							and graph.modules.length() == 1
+							and graph.import_edges.length() == 1
 							and module.path.ends_with("/blorp_cli_compile_graph_dep.brp")
 							and module.module_name == "./blorp_cli_compile_graph_dep"
 							and module.source_text == dep_source
-							and parsed_source_decl_count(module) == 1
+							and graph_source_decl_count(module) == 1
 						)
 					None:
 						False
-			CliRunParsedSourceBatch(_):
-				False
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -1486,22 +1405,31 @@ func test_run_cli_discovers_package_alias_source_graph() -> Bool:
 		cleanup_package_graph_project(root)
 
 		match plan:
-			CliRunParsedSource(parsed):
+			CliRunFrontendModuleGraph(graph):
 				var saw_alias: Bool = False
 				var saw_internal: Bool = False
 
-				for module in parsed.modules:
+				for module in graph.modules:
 					if module.module_name == "sample_v1":
-						saw_alias = module.path.ends_with("/vendor/sample/src/sample.brp")
+						saw_alias = (
+							module.path.ends_with("/vendor/sample/src/sample.brp")
+							and is_source_package_origin(module, "sample_v1")
+						)
 					else if module.module_name == "sample/internal":
 						saw_internal = (
 							module.path.ends_with("/vendor/sample/src/sample/internal.brp")
 							and module.source_text == internal_source
+							and is_source_package_origin(module, "sample_v1")
 						)
 
-				parsed.modules.length() == 2 and saw_alias and saw_internal
-			CliRunParsedSourceBatch(_):
-				False
+				(
+					graph.command == CliFrontendCompile
+					and graph.roots.length() == 1
+					and graph.modules.length() == 2
+					and graph.import_edges.length() == 2
+					and saw_alias
+					and saw_internal
+				)
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -1559,19 +1487,21 @@ func test_run_cli_discovers_pkg_root_source_graph() -> Bool:
 		cleanup_pkg_root_graph_project(root)
 
 		match plan:
-			CliRunParsedSource(parsed):
-				match parsed.modules.get(0):
+			CliRunFrontendModuleGraph(graph):
+				match graph.modules.get(0):
 					Some(module):
 						(
-							parsed.modules.length() == 1
+							graph.command == CliFrontendCompile
+							and graph.roots.length() == 1
+							and graph.modules.length() == 1
+							and graph.import_edges.length() == 1
 							and module.module_name == "pkg/local_math"
 							and module.path.ends_with("/pkg/local_math.brp")
 							and module.source_text == pkg_source
+							and is_pkg_origin(module, "local_math")
 						)
 					None:
 						False
-			CliRunParsedSourceBatch(_):
-				False
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -1607,10 +1537,8 @@ func test_run_cli_formats_compile_source_before_parse() -> Bool:
 			_ = remove_file(path)
 
 			plan_ok: Bool = match plan:
-				CliRunParsedSource(parsed):
-					parsed.command == CliFrontendCompile and parsed.source.path == path
-				CliRunParsedSourceBatch(_):
-					False
+				CliRunFrontendModuleGraph(graph):
+					graph_has_single_root(graph, CliFrontendCompile, path)
 				CliRunDelegate(_):
 					False
 				CliRunFrontendOptions(_):
@@ -1649,22 +1577,20 @@ func test_run_cli_parses_run_source_before_delegation() -> Bool:
 			_ = remove_file(path)
 
 			match plan:
-				CliRunParsedSource(parsed):
-					match get_field(parsed.source.parsed_source, "parsed_ast"):
-						Some(parsed_ast):
+				CliRunFrontendModuleGraph(graph):
+					match graph.roots.get(0):
+						Some(source):
 							(
-								parsed.command == CliFrontendRun
-								and parsed.source.path == path
-								and parsed.source.module_name == "blorp_cli_run_frontier"
-								and json_array_length_field(parsed_ast, "decls") == 1
-								and json_array_length_field(parsed_ast, "diagnostics") == 0
-								and json_string_field(parsed.options, "kind") == "run"
-								and json_int_field(parsed.options, "timeout") == 5
+								graph.command == CliFrontendRun
+								and source.path == path
+								and source.module_name == "blorp_cli_run_frontier"
+								and graph_source_decl_count(source) == 1
+								and graph_source_diagnostic_count(source) == 0
+								and json_string_field(graph.options, "kind") == "run"
+								and json_int_field(graph.options, "timeout") == 5
 							)
 						None:
 							False
-				CliRunParsedSourceBatch(_):
-					False
 				CliRunDelegate(_):
 					False
 				CliRunFrontendOptions(_):
@@ -1702,10 +1628,8 @@ func test_run_cli_formats_run_source_before_parse() -> Bool:
 			_ = remove_file(path)
 
 			plan_ok: Bool = match plan:
-				CliRunParsedSource(parsed):
-					parsed.command == CliFrontendRun and parsed.source.path == path
-				CliRunParsedSourceBatch(_):
-					False
+				CliRunFrontendModuleGraph(graph):
+					graph_has_single_root(graph, CliFrontendRun, path)
 				CliRunDelegate(_):
 					False
 				CliRunFrontendOptions(_):
@@ -1739,15 +1663,18 @@ func test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 		_ = remove_file(path)
 
 		match plan:
-			CliRunParsedSource(parsed):
-				(
-					parsed.command == CliFrontendCompile
-					and parsed.source.path == path
-					and parsed.source.module_name == "blorp_cli_compile_diag"
-					and parsed_source_diagnostic_count(parsed.source) > 0
-				)
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				source_ok: Bool = match graph.roots.get(0):
+					Some(source):
+						(
+							source.path == path
+							and source.module_name == "blorp_cli_compile_diag"
+							and graph_source_diagnostic_count(source) > 0
+						)
+					None:
+						False
+
+				graph.command == CliFrontendCompile and graph.roots.length() == 1 and source_ok
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -1777,15 +1704,18 @@ func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 		_ = remove_file(path)
 
 		match plan:
-			CliRunParsedSource(parsed):
-				(
-					parsed.command == CliFrontendRun
-					and parsed.source.path == path
-					and parsed.source.module_name == "blorp_cli_run_diag"
-					and parsed_source_diagnostic_count(parsed.source) > 0
-				)
-			CliRunParsedSourceBatch(_):
-				False
+			CliRunFrontendModuleGraph(graph):
+				source_ok: Bool = match graph.roots.get(0):
+					Some(source):
+						(
+							source.path == path
+							and source.module_name == "blorp_cli_run_diag"
+							and graph_source_diagnostic_count(source) > 0
+						)
+					None:
+						False
+
+				graph.command == CliFrontendRun and graph.roots.length() == 1 and source_ok
 			CliRunDelegate(_):
 				False
 			CliRunFrontendOptions(_):
@@ -1821,6 +1751,8 @@ func test_run_cli_plans_test_command() -> Bool:
 		"--no-format",
 		"tests",
 	]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunTest(test_plan):
 			options: JsonValue = test_plan.options
 
@@ -1858,10 +1790,6 @@ func test_run_cli_plans_test_command() -> Bool:
 			False
 		CliRunHandled(_):
 			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
-			False
 		CliRunPurify(_):
 			False
 		CliRunRepl(_):
@@ -1872,6 +1800,8 @@ func test_run_cli_plans_test_command() -> Bool:
 			False
 
 	warmup_ok: Bool = match run_cli(["test", "--warmup-only"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunTest(test_plan):
 			(
 				test_plan.args == ["test", "--warmup-only"]
@@ -1882,10 +1812,6 @@ func test_run_cli_plans_test_command() -> Bool:
 		CliRunFrontendOptions(_):
 			False
 		CliRunHandled(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunPurify(_):
 			False
@@ -1906,6 +1832,8 @@ func test_run_cli_plans_purify_command() -> Bool:
 		"--verbose",
 		"src",
 	]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunPurify(purify_plan):
 			options: JsonValue = purify_plan.options
 
@@ -1922,10 +1850,6 @@ func test_run_cli_plans_purify_command() -> Bool:
 			False
 		CliRunHandled(_):
 			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
-			False
 		CliRunTest(_):
 			False
 		CliRunRepl(_):
@@ -1938,6 +1862,8 @@ func test_run_cli_plans_purify_command() -> Bool:
 
 func test_run_cli_plans_terminal_commands() -> Bool:
 	repl_ok: Bool = match run_cli(["repl", "--debug"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunRepl(repl_plan):
 			repl_plan.args == ["repl", "--debug"] and repl_plan.debug
 		CliRunDelegate(_):
@@ -1945,10 +1871,6 @@ func test_run_cli_plans_terminal_commands() -> Bool:
 		CliRunFrontendOptions(_):
 			False
 		CliRunHandled(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1960,6 +1882,8 @@ func test_run_cli_plans_terminal_commands() -> Bool:
 			False
 
 	lsp_ok: Bool = match run_cli(["lsp"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunLsp(lsp_plan):
 			lsp_plan.args == ["lsp"]
 		CliRunDelegate(_):
@@ -1967,10 +1891,6 @@ func test_run_cli_plans_terminal_commands() -> Bool:
 		CliRunFrontendOptions(_):
 			False
 		CliRunHandled(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -1986,15 +1906,13 @@ func test_run_cli_plans_terminal_commands() -> Bool:
 
 func test_run_cli_handles_format_errors() -> Bool:
 	match run_cli(["format", "--bogus"]):
+		CliRunFrontendModuleGraph(_):
+			False
 		CliRunHandled(result):
 			result.status == 1 and result.stderr.contains("unknown format option")
 		CliRunDelegate(_):
 			False
 		CliRunFrontendOptions(_):
-			False
-		CliRunParsedSource(_):
-			False
-		CliRunParsedSourceBatch(_):
 			False
 		CliRunTest(_):
 			False
@@ -2036,28 +1954,16 @@ tests: TestSuite = {
 			test_expand_check_targets_reports_missing_targets,
 		),
 		(
-			"CLI parsed source file JSON encodes identity",
-			test_cli_parsed_source_file_json_encodes_identity,
+			"run CLI returns frontend graph for multi-file check",
+			test_run_cli_returns_frontend_graph_for_multi_file_check,
 		),
 		(
-			"CLI check source batch JSON encodes sources",
-			test_cli_check_source_batch_json_encodes_sources,
+			"run CLI returns frontend graph for directory check",
+			test_run_cli_returns_frontend_graph_for_directory_check,
 		),
 		(
-			"CLI check source batch JSON encodes source graph modules",
-			test_cli_check_source_batch_json_encodes_source_graph_modules,
-		),
-		(
-			"run CLI returns parsed batch for multi-file check",
-			test_run_cli_returns_parsed_batch_for_multi_file_check,
-		),
-		(
-			"run CLI returns parsed batch for directory check",
-			test_run_cli_returns_parsed_batch_for_directory_check,
-		),
-		(
-			"run CLI parsed batch preserves parse diagnostics",
-			test_run_cli_parsed_batch_preserves_parse_diagnostics,
+			"run CLI frontend graph preserves parse diagnostics",
+			test_run_cli_frontend_graph_preserves_parse_diagnostics,
 		),
 		("run CLI formats check source before read", test_run_cli_formats_check_source_before_read),
 		("run CLI no-format preserves check source", test_run_cli_no_format_preserves_check_source),
