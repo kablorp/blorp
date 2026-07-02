@@ -1794,7 +1794,7 @@ let classify_valid_test_file filename =
 
 (** Directories to skip when searching for test files *)
 let skip_directories =
-  [ "stages"; "test_compiler"; "should_fail"; "should_pass"; "traits" ]
+  [ "test_compiler"; "should_fail"; "should_pass" ]
 
 (** Find all .brp test files in a directory *)
 let sorted_directory_entries path =
@@ -2142,7 +2142,6 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
   in
 
   Modules.reset ();
-  Lexer.reset_state ();
 
   let raw_source =
     match source_text with Some source -> source | None -> read_file filename
@@ -2463,7 +2462,6 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
       close_out oc
   | None -> ());
   Modules.full_reset ();
-  Lexer.reset_state ();
   let cwd = Sys.getcwd () in
   init_module_paths cwd;
   let filename = Filename.concat cwd filename_base in

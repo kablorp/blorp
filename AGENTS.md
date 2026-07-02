@@ -413,6 +413,7 @@ Notes:
 
 ```
 compiler/            # OCaml compiler implementation
+  blorp/          # Blorp-owned compiler frontend/backend slices
   bin/            # CLI executables
     blorp.ml      # Main unified CLI
   test/           # Compiler-internal OCaml/Alcotest tests
@@ -421,8 +422,6 @@ compiler/            # OCaml compiler implementation
     test_env.ml   # Env module tests
   lib/            # Compiler library
     ast.ml        # AST type definitions
-    lexer.mll     # OCamllex lexer
-    parser.mly    # Menhir parser
     typecheck.ml  # Type checker
     infer.ml      # Type inference
     types.ml      # Type utilities
@@ -557,7 +556,6 @@ tests/
     format/       # Formatter tests (should_pass/should_fail/should_error)
     purify/       # Auto-purify tests (should_purify/should_not_purify/should_rewrite)
     codegen_audit/  # Codegen correctness tests
-  stages/         # Historical golden fixtures used as migration inputs
 
 editor/             # IDE/editor support
   vscode/           # VSCode extension (TextMate grammar, language config)

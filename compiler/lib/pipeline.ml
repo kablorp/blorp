@@ -436,8 +436,6 @@ let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
   (match (parent.Session.std_override_active, parent.std_override_dir) with
   | true, Some dir -> Modules.set_std_override ~sess dir
   | _ -> ());
-  if Compiler_blorp_bridge.compiler_bootstrap_menhir_parser_requested () then
-    Session.set_parser_frontend sess Session.BootstrapMenhirParser;
   Session.with_current sess (fun () ->
       Modules.init_module_paths (Modules.extract_directory filename);
       Option.iter (fun configure -> configure sess) configure_session;
@@ -472,8 +470,14 @@ let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~source_kind ~filename ~program ~debug ())
 
-let typecheck_only_typed_parsed ~filename ~program ?(debug = false) () =
+let preload_cli_parsed_sources = function
+  | [] -> ()
+  | sources -> Modules.preload_parsed_sources sources
+
+let typecheck_only_typed_parsed ~filename ~program
+    ?(preloaded_parsed_sources = []) ?(debug = false) () =
   with_fresh_session filename (fun () ->
+      preload_cli_parsed_sources preloaded_parsed_sources;
       match load_modules_after_parse ~filename program with
       | Error _ as e -> e
       | Ok (program, _base_dir) ->
@@ -488,8 +492,12 @@ let typecheck_only ~filename ~source ?(debug = false) () =
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
-let typecheck_only_parsed ~filename ~program ?(debug = false) () =
-  match typecheck_only_typed_parsed ~filename ~program ~debug () with
+let typecheck_only_parsed ~filename ~program ?preloaded_parsed_sources
+    ?(debug = false) () =
+  match
+    typecheck_only_typed_parsed ~filename ~program
+      ?preloaded_parsed_sources ~debug ()
+  with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
@@ -646,8 +654,9 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
 let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
     ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?check_invariants ~filename ~program () =
+    ?check_invariants ~filename ~program ?(preloaded_parsed_sources = []) () =
   with_fresh_session filename (fun () ->
+      preload_cli_parsed_sources preloaded_parsed_sources;
       match load_modules_after_parse ?on_frontend_phase ~filename program with
       | Error _ as e -> e
       | Ok (program, _base_dir) ->

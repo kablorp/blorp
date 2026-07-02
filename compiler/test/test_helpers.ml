@@ -50,6 +50,12 @@ let with_isolated_env (f : unit -> 'a) : 'a =
    Parse + typecheck entry point
    ============================================================================ *)
 
+let parse_program ?(filename = "test_input.brp") ?(hoist_nested = false) source =
+  match Blorp.Modules.parse_source ~filename ~hoist_nested source with
+  | Ok program -> program
+  | Error err ->
+      Alcotest.failf "expected source to parse, got: %s" err.Blorp.Ast.message
+
 let parse_and_typecheck source =
   match
     Blorp.Pipeline.typecheck_module_only ~filename:"test_input.brp" ~source

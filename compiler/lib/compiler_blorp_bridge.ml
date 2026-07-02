@@ -20,7 +20,7 @@ let ( let* ) result f =
 
 type parsed_source = {
   parsed_program : Ast.program;
-  parsed_comments : Lexer.collected_comment list;
+  parsed_comments : Parse_comments.collected_comment list;
 }
 
 type parse_source_response =
@@ -157,7 +157,29 @@ type cli_frontend_parsed = {
   cli_frontend_options : cli_frontend_options;
   cli_frontend_path : string;
   cli_frontend_module_name : string;
+  cli_frontend_source_text : string option;
   cli_frontend_parsed_response : parse_source_response;
+}
+
+type cli_check_source_batch = {
+  cli_check_batch_args : string list;
+  cli_check_batch_options : cli_check_options;
+  cli_check_batch_sources : parse_source_batch_response list;
+}
+
+type cli_source_graph_source = {
+  cli_source_graph_path : string;
+  cli_source_graph_module_name : string;
+  cli_source_graph_source_text : string;
+  cli_source_graph_parsed_response : parse_source_response;
+}
+
+type cli_source_graph = {
+  cli_source_graph_command : cli_frontend_command;
+  cli_source_graph_args : string list;
+  cli_source_graph_options : cli_frontend_options;
+  cli_source_graph_roots : cli_source_graph_source list;
+  cli_source_graph_modules : cli_source_graph_source list;
 }
 
 type cli_frontend_options_plan = {
@@ -175,6 +197,8 @@ type cli_run_handled_result = {
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunParsedSource of cli_frontend_parsed
+  | CliRunParsedSourceBatch of cli_check_source_batch
+  | CliRunParsedSourceGraph of cli_source_graph
   | CliRunFrontendOptions of cli_frontend_options_plan
   | CliRunTestOptions of cli_test_options
   | CliRunPurifyOptions of cli_purify_options
@@ -581,6 +605,17 @@ let optional_string_response_field name = function
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
+let optional_missing_string_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | None | Some Lsp_json.Null -> Ok None
+      | Some (Lsp_json.String value) -> Ok (Some value)
+      | Some _ ->
+          Error
+            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
 let optional_int_response_field name = function
   | Lsp_json.Object fields -> (
       match List.assoc_opt name fields with
@@ -657,7 +692,7 @@ let decode_parse_comment = function
       let* cc_line = int_json_field "line" fields in
       let* cc_col = int_json_field "column" fields in
       let* cc_trailing = bool_json_field "trailing" fields in
-      Ok { Lexer.cc_text = cc_text; cc_line; cc_col; cc_trailing }
+      Ok { Parse_comments.cc_text = cc_text; cc_line; cc_col; cc_trailing }
   | _ -> Error ("invalid_response", "parse comments must be JSON objects")
 
 let parse_comments_response_field artifact =
@@ -1048,6 +1083,9 @@ let cli_frontend_parsed_response_field artifact =
   let* source = json_response_field "source" artifact in
   let* cli_frontend_path = string_response_field "path" source in
   let* cli_frontend_module_name = string_response_field "module" source in
+  let* cli_frontend_source_text =
+    optional_missing_string_response_field "source_text" source
+  in
   let* parsed_source = json_response_field "parsed_source" source in
   let* cli_frontend_parsed_response = parsed_ast_artifact_field parsed_source in
   Ok
@@ -1057,8 +1095,131 @@ let cli_frontend_parsed_response_field artifact =
       cli_frontend_options;
       cli_frontend_path;
       cli_frontend_module_name;
+      cli_frontend_source_text;
       cli_frontend_parsed_response;
     }
+
+let cli_check_source_batch_source_response_field source =
+  let* batch_parsed_path = string_response_field "path" source in
+  let* batch_parsed_module_name = string_response_field "module" source in
+  let* parsed_source = json_response_field "parsed_source" source in
+  let* batch_parsed_response = parsed_ast_artifact_field parsed_source in
+  Ok
+    {
+      batch_parsed_path;
+      batch_parsed_module_name;
+      batch_parsed_response;
+    }
+
+let cli_check_source_batch_sources_field artifact =
+  match json_response_field "sources" artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array sources) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | source :: rest ->
+            let* parsed = cli_check_source_batch_source_response_field source in
+            collect (parsed :: acc) rest
+      in
+      collect [] sources
+  | Ok _ -> Error ("invalid_response", "field `sources` must be an array")
+
+let cli_check_source_batch_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* () =
+    if String.equal command_text "check" then Ok ()
+    else
+      Error
+        ( "invalid_response",
+          "CLI parsed_source_batch artifact command is `" ^ command_text
+          ^ "`, expected `check`" )
+  in
+  let* cli_check_batch_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "parsed_source_batch" "check"
+      cli_check_batch_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_frontend_options = decode_cli_check_options options in
+  let* cli_check_batch_options =
+    match cli_frontend_options with
+    | CliFrontendCheckOptions options -> Ok options
+    | _ ->
+        Error
+          ( "invalid_response",
+            "CLI parsed_source_batch options must be check options" )
+  in
+  let* cli_check_batch_sources =
+    cli_check_source_batch_sources_field artifact
+  in
+  Ok
+    (CliRunParsedSourceBatch
+       {
+         cli_check_batch_args;
+         cli_check_batch_options;
+         cli_check_batch_sources;
+       })
+
+let cli_source_graph_source_field source =
+  let* cli_source_graph_path = string_response_field "path" source in
+  let* cli_source_graph_module_name = string_response_field "module" source in
+  let* cli_source_graph_source_text =
+    string_response_field "source_text" source
+  in
+  let* parsed_source = json_response_field "parsed_source" source in
+  let* cli_source_graph_parsed_response =
+    parsed_ast_artifact_field parsed_source
+  in
+  Ok
+    {
+      cli_source_graph_path;
+      cli_source_graph_module_name;
+      cli_source_graph_source_text;
+      cli_source_graph_parsed_response;
+    }
+
+let cli_source_graph_source_list_field name artifact =
+  match json_response_field name artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array sources) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | source :: rest ->
+            let* parsed = cli_source_graph_source_field source in
+            collect (parsed :: acc) rest
+      in
+      collect [] sources
+  | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
+
+let cli_source_graph_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* cli_source_graph_command =
+    cli_frontend_command_of_string command_text
+  in
+  let* cli_source_graph_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "parsed_source_graph" command_text
+      cli_source_graph_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_source_graph_options =
+    decode_cli_frontend_options cli_source_graph_command options
+  in
+  let* cli_source_graph_roots =
+    cli_source_graph_source_list_field "roots" artifact
+  in
+  let* cli_source_graph_modules =
+    cli_source_graph_source_list_field "modules" artifact
+  in
+  Ok
+    (CliRunParsedSourceGraph
+       {
+         cli_source_graph_command;
+         cli_source_graph_args;
+         cli_source_graph_options;
+         cli_source_graph_roots;
+         cli_source_graph_modules;
+       })
 
 let cli_frontend_options_response_field artifact =
   let* command_text = string_response_field "command" artifact in
@@ -1202,6 +1363,8 @@ let cli_run_response_field response =
   | "parsed_source" ->
       let* parsed = cli_frontend_parsed_response_field artifact in
       Ok (CliRunParsedSource parsed)
+  | "parsed_source_batch" -> cli_check_source_batch_response_field artifact
+  | "parsed_source_graph" -> cli_source_graph_response_field artifact
   | "frontend_options" ->
       let* options = cli_frontend_options_response_field artifact in
       Ok (CliRunFrontendOptions options)
@@ -1265,9 +1428,6 @@ let render_many_for_renderer_helper_exn ~renderer items =
      ^ " is not available while compiling the Blorp bridge helper")
 
 let renderer_bridge_helper_env = "BLORP_COMPILER_RENDERER_HELPER"
-let compiler_bootstrap_menhir_parser_env =
-  "BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER"
-
 let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
 let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
@@ -1278,7 +1438,10 @@ let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");
-    (compiler_bootstrap_menhir_parser_env, "1");
+    (* Only pinned external bootstrap binaries read this retired selector.
+       Current compiler sessions do not use it, but direct bootstrap-binary
+       helper builds still need to stay on the bootstrap's built-in parser. *)
+    ("BLORP_FRONTEND_PARSER", "ocaml");
   ]
 
 let parser_bridge_helper_compile_env = bridge_helper_compile_env
@@ -1298,14 +1461,6 @@ let bridge_temp_retry_limit = 32
 let running_inside_renderer_bridge_helper () =
   match Sys.getenv_opt renderer_bridge_helper_env with
   | Some "1" -> true
-  | _ -> false
-
-let compiler_bootstrap_menhir_parser_requested () =
-  match
-    ( Sys.getenv_opt renderer_bridge_helper_env,
-      Sys.getenv_opt compiler_bootstrap_menhir_parser_env )
-  with
-  | Some "1", Some "1" -> true
   | _ -> false
 
 let read_all_fd fd =
@@ -1452,6 +1607,15 @@ let exec_program prog args envp =
 let compiler_bridge_bin_env = "BLORP_COMPILER_BRIDGE_BIN"
 let compiler_bootstrap_script_name = "scripts/blorp-compiler-bootstrap"
 
+type bridge_helper_compiler_source =
+  | PinnedBootstrapScript
+  | ExplicitBootstrapOverride
+
+type bridge_helper_compiler = {
+  helper_compiler_path : string;
+  helper_compiler_source : bridge_helper_compiler_source;
+}
+
 let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
     starts =
   match bridge_bin with
@@ -1461,6 +1625,65 @@ let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge
 let command_program_for_parser_bridge ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
     starts =
   locate_default_command_program ~bridge_bin starts
+
+let existing_executable_candidates prog =
+  executable_candidates prog |> List.filter Sys.file_exists
+
+let file_identity path =
+  try
+    let st = Unix.stat path in
+    Some (st.Unix.st_dev, st.Unix.st_ino)
+  with _ -> None
+
+let same_file left right =
+  match (file_identity left, file_identity right) with
+  | Some left_id, Some right_id -> left_id = right_id
+  | _ -> false
+
+let explicit_override_is_current_executable path =
+  let current_candidates = existing_executable_candidates Sys.executable_name in
+  let override_candidates = existing_executable_candidates path in
+  List.exists
+    (fun override ->
+      List.exists (fun current -> same_file override current) current_candidates)
+    override_candidates
+
+let validate_explicit_bridge_helper_override path =
+  if explicit_override_is_current_executable path then
+    Error
+      (Printf.sprintf
+         "%s must point to a bootstrap-capable Blorp compiler, not the current \
+          compiler executable `%s`. Provide prepared helper binaries with %s \
+          and %s, or unset %s to use %s."
+         compiler_bridge_bin_env path prepared_renderer_bridge_bin_env
+         prepared_parser_bridge_bin_env compiler_bridge_bin_env
+         compiler_bootstrap_script_name)
+  else Ok ()
+
+let locate_bridge_helper_compiler ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
+    starts =
+  match bridge_bin with
+  | Some path when path <> "" ->
+      let* () = validate_explicit_bridge_helper_override path in
+      Ok
+        {
+          helper_compiler_path = path;
+          helper_compiler_source = ExplicitBootstrapOverride;
+        }
+  | _ -> (
+      match find_upwards_from starts compiler_bootstrap_script_name with
+      | Some path ->
+          Ok
+            {
+              helper_compiler_path = path;
+              helper_compiler_source = PinnedBootstrapScript;
+            }
+      | None ->
+          Error
+            (Printf.sprintf
+               "cannot locate pinned Blorp compiler bootstrap %s; set %s to a \
+                bootstrap-capable blorp binary"
+               compiler_bootstrap_script_name compiler_bridge_bin_env))
 
 let run_process_capture ?(env = []) ?(unset_env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
@@ -1490,14 +1713,17 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
 
 let default_command_program () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match locate_default_command_program starts with
-  | Some path -> path
-  | None ->
-      invalid_arg
-        (Printf.sprintf
-           "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
-           explicit blorp binary"
-           compiler_bootstrap_script_name compiler_bridge_bin_env)
+  match locate_bridge_helper_compiler starts with
+  | Ok compiler -> compiler.helper_compiler_path
+  | Error message -> invalid_arg message
+
+let default_bridge_helper_compiler () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  locate_bridge_helper_compiler starts
+
+let parser_bridge_helper_compiler () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  locate_bridge_helper_compiler starts
 
 let parser_bridge_command_program () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -1507,7 +1733,7 @@ let parser_bridge_command_program () =
       invalid_arg
         (Printf.sprintf
            "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
-            explicit blorp binary"
+           explicit blorp binary"
            compiler_bootstrap_script_name compiler_bridge_bin_env)
 
 let renderer_bridge_source_path () =
@@ -1941,8 +2167,9 @@ let apply_generated_c_bootstrap_compatibility path =
   let rewritten = generated_c_with_bootstrap_compatibility original in
   if not (String.equal original rewritten) then write_file path rewritten
 
-let compile_bridge_binary_in_stage ~program ~source_path ~compile_env ~stage_dir
+let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_dir
     ~bin_path =
+  let program = compiler.helper_compiler_path in
   let c_path = renderer_bridge_c_path stage_dir in
   let obj_path = renderer_bridge_obj_path stage_dir in
   let wrapper_path = renderer_bridge_wrapper_path stage_dir in
@@ -1993,7 +2220,7 @@ let compile_bridge_binary_in_stage ~program ~source_path ~compile_env ~stage_dir
                  (String.trim (cc_output ^ cc_stderr)))
           else Ok bin_path)
 
-let compile_bridge_binary_to_path ~program ~source_path ~compile_env ~work_root
+let compile_bridge_binary_to_path ~compiler ~source_path ~compile_env ~work_root
     ~bin_path =
   ensure_dir work_root;
   ensure_dir (Filename.dirname bin_path);
@@ -2005,7 +2232,7 @@ let compile_bridge_binary_to_path ~program ~source_path ~compile_env ~work_root
     (fun () ->
       let stage_bin = renderer_bridge_bin_path stage_dir in
       match
-        compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+        compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
           ~stage_dir ~bin_path:stage_bin
       with
       | Error _ as error -> error
@@ -2030,7 +2257,7 @@ let with_renderer_bridge_cache_lock cache_root key f =
           try lockf_retry fd Unix.F_ULOCK 0 with _ -> ())
         f)
 
-let compile_renderer_bridge_binary ~program ~source_path ~cache_root
+let compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
     ~compile_env parts =
   let final_dir = renderer_bridge_cache_dir cache_root parts.bridge_key in
   if renderer_bridge_cache_verified parts final_dir then
@@ -2045,7 +2272,7 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root
     in
     let bin_path = renderer_bridge_bin_path stage_dir in
     match
-      compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+      compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
         ~stage_dir ~bin_path
     with
     | Error message ->
@@ -2055,8 +2282,9 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root
         write_renderer_bridge_cache_markers parts stage_dir;
         publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir)
 
-let bridge_binary_for_source cache_ref ~program ~source_path ~compile_env =
+let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
   let cache_root = renderer_bridge_cache_root () in
+  let program = compiler.helper_compiler_path in
   match !cache_ref with
   | Some (cached_program, cached_source, cached_root, _cached_key, cached_binary)
     when String.equal cached_program program
@@ -2067,7 +2295,7 @@ let bridge_binary_for_source cache_ref ~program ~source_path ~compile_env =
   | _ -> (
       let cache_parts = renderer_bridge_cache_parts ~program ~source_path in
       match
-        compile_renderer_bridge_binary ~program ~source_path ~cache_root
+        compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
           ~compile_env cache_parts
       with
       | Ok binary ->
@@ -2104,8 +2332,8 @@ let renderer_bridge_binary () =
   | None when prepared_bridge_required () ->
       missing_prepared_bridge_error prepared_renderer_bridge_bin_env
   | None ->
-      bridge_binary_for_source renderer_bridge_cache
-        ~program:(default_command_program ())
+      let* compiler = default_bridge_helper_compiler () in
+      bridge_binary_for_source renderer_bridge_cache ~compiler
         ~source_path:(renderer_bridge_source_path ())
         ~compile_env:bridge_helper_compile_env
 
@@ -2115,8 +2343,8 @@ let parser_bridge_binary () =
   | None when prepared_bridge_required () ->
       missing_prepared_bridge_error prepared_parser_bridge_bin_env
   | None ->
-      bridge_binary_for_source parser_bridge_cache
-        ~program:(parser_bridge_command_program ())
+      let* compiler = parser_bridge_helper_compiler () in
+      bridge_binary_for_source parser_bridge_cache ~compiler
         ~source_path:(parser_bridge_source_path ())
         ~compile_env:parser_bridge_helper_compile_env
 
@@ -2127,17 +2355,17 @@ type prepared_bridge_binaries = {
 
 let prepare_bridge_binaries ~out_dir =
   ensure_dir out_dir;
-  let program = default_command_program () in
+  let* compiler = default_bridge_helper_compiler () in
   let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
   let* renderer_path =
-    compile_bridge_binary_to_path ~program
+    compile_bridge_binary_to_path ~compiler
       ~source_path:(renderer_bridge_source_path ())
       ~compile_env:bridge_helper_compile_env ~work_root:out_dir
       ~bin_path:renderer_bin
   in
   let* parser_path =
-    compile_bridge_binary_to_path ~program
+    compile_bridge_binary_to_path ~compiler
       ~source_path:(parser_bridge_source_path ())
       ~compile_env:parser_bridge_helper_compile_env ~work_root:out_dir
       ~bin_path:parser_bin

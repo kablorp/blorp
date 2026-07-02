@@ -48,6 +48,18 @@ type source_package = Session.source_package = {
 (** A root-project source package alias. These are configured from
     [blorp.toml] or directly by package tooling. *)
 
+type preloaded_parsed_source = {
+  preload_module_name : string;
+  preload_path : string;
+  preload_origin : Session.module_origin;
+  preload_source : string;
+  preload_decls : Ast.program;
+}
+(** Parsed source supplied by the Blorp CLI frontend for the current compiler
+    invocation. The module loader still resolves imports through its normal
+    rules, but matching entries can reuse this AST without rereading or reparsing
+    source text. *)
+
 val add_source_package : ?sess:Session.t -> source_package -> unit
 (** Add or replace a source package alias in the active session. *)
 
@@ -88,6 +100,11 @@ val load_imports :
   ?sess:Session.t -> Ast.program -> string -> loaded_module list
 (** Load all imports from a list of declarations.
     Returns the list of successfully loaded modules. *)
+
+val preload_parsed_sources :
+  ?sess:Session.t -> preloaded_parsed_source list -> unit
+(** Seed the current session's parse cache with frontend-owned parsed source.
+    Intended for one-shot CLI source graphs. *)
 
 val get_all_modules : ?sess:Session.t -> unit -> loaded_module list
 (** Get all loaded modules in dependency order. *)
@@ -169,9 +186,10 @@ val finalize_blorp_parsed_source :
   Compiler_blorp_bridge.parsed_source ->
   (Ast.program, Ast.compiler_error list) result
 (** Apply the OCaml-owned post-parser frontend work to a raw Blorp parser
-    bridge artifact: restore lexer comments, parse interpolated expressions,
-    and hoist nested declarations by default. This is the single boundary for
-    callers that receive parser JSON directly from the Blorp bridge. *)
+    bridge artifact: parse interpolated expressions and hoist nested
+    declarations by default. Comments remain explicit parser artifact data. This
+    is the single boundary for callers that receive parser JSON directly from
+    the Blorp bridge. *)
 
 val collect_private_names : Ast.program -> (string * Ast.decl) list
 (** Collect names of private declarations from a program. *)

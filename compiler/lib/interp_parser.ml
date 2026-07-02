@@ -171,40 +171,6 @@ let split_interpolated_string ~(base_loc : loc) (s : string) :
   flush_lit ();
   List.rev !parts
 
-(** Parse a single expression string into an AST expression using the legacy
-    Menhir parser. This is kept for bootstrap paths where the Blorp parser
-    helper cannot exist yet. Normal source parsing injects the Blorp parser
-    bridge instead. *)
-let parse_expr_string_with_menhir (s : string) (base_loc : loc) : expr =
-  try
-    (* Parse just a single expression - we need to handle this specially
-       since Parser.program expects declarations.
-       For interpolation, we create a temporary wrapper and extract the expr. *)
-    let wrapper = Printf.sprintf "___interp_temp = %s\n" s in
-    let saved_comments = Lexer.get_comments () in
-    Lexer.reset_state ();
-    let lexbuf = Lexing.from_string wrapper in
-    let program = Parser.program Lexer.next_token lexbuf in
-    Lexer.restore_comments saved_comments;
-    match program with
-    | [ { decl_desc = DVar { var_value; _ }; _ } ] -> var_value
-    | _ ->
-        raise
-          (InterpParseError
-             ( Printf.sprintf "Failed to parse interpolated expression: %s" s,
-               base_loc ))
-  with
-  | Parser.Error ->
-      raise
-        (InterpParseError
-           ( Printf.sprintf "Parse error in interpolated expression: %s" s,
-             base_loc ))
-  | Lexer.LexError (msg, _, _) ->
-      raise
-        (InterpParseError
-           ( Printf.sprintf "Lexer error in interpolated expression: %s" msg,
-             base_loc ))
-
 (** Collect interpolation expression parse requests in source order. *)
 let requests_for_raw_string loc raw_str =
   split_interpolated_string ~base_loc:loc raw_str
@@ -403,7 +369,3 @@ let transform_program_with_expr_parser parse_expr (program : program) : program 
     (fun requests ->
       List.map (fun request -> parse_expr request.text request.loc) requests)
     program
-
-let transform_program_with_bootstrap_menhir_expr_parser (program : program) :
-    program =
-  transform_program_with_expr_parser parse_expr_string_with_menhir program

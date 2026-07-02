@@ -649,8 +649,7 @@ Goal: make source text or source graph the only input to the Blorp compiler.
 
 Direct OCaml slices to mirror:
 
-- `lexer.mll`
-- `parser.mly`
+- Blorp lexer/parser sources under `compiler/blorp/`
 - `ast.ml`
 - `interp_parser.ml`
 - `subscript_desugar.ml`

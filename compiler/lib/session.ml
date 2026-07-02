@@ -3,9 +3,7 @@
     A [Session.t] holds the per-compilation state that used to live as
     module-level mutable refs in [Types] (meta-env) and [Modules]
     (module cache, parse cache, search paths, load errors, std
-    override, prelude-loaded flag). Lexer state is a known exception
-    and stays module-level for now — see the comment above the record
-    definition.
+    override, prelude-loaded flag).
 
     Replacing those refs with a session unlocks:
 
@@ -44,22 +42,6 @@
     original name. *)
 
 open Ast
-
-(* ============================================================================
-   Lexer state — DEFERRED
-   ============================================================================
-
-   Blorp's lexer still owns a module-level mutable state, reset by
-   every parse entry via [Lexer.reset_state ()]. The ownership model
-   is "one parse at a time per process" which holds today (CLI,
-   REPL, LSP, test runner all run parses sequentially within a
-   process).
-
-   True session-owned lexer state requires parameterizing ocamllex
-   rules ([rule next_token state = parse ...]) and threading state
-   through [Parser.program] via a closure. Deferred until a concrete
-   concurrent-parse use case emerges (e.g. OCaml 5 domain-local
-   parallel compile jobs within a single process). *)
 
 (* ============================================================================
    Module loading state (was [Modules.loaded_module])
@@ -130,13 +112,10 @@ type parsed_module_cache_entry = {
   parsed_path : string;
   parsed_origin : module_origin;
   parsed_source_hash : string;
+  parsed_trust_current_source : bool;
   parsed_decls : program;
   parsed_exports : (string * decl) list;
 }
-
-type parser_frontend =
-  | BlorpParserBridge
-  | BootstrapMenhirParser
 
 type source_package = {
   source_package_alias : string;
@@ -211,11 +190,6 @@ type t = {
       [BLORP_STD], or [blorp.toml]. [None] means std imports use the embedded
       library; tools that need source files should not guess a filesystem std
       path. *)
-  mutable parser_frontend : parser_frontend;
-      (** Source parser used by this session. Normal sessions use the Blorp
-      parser bridge. [BootstrapMenhirParser] is reserved for the private
-      cold-start path that compiles the parser bridge helper before that helper
-      exists. *)
   mutable load_errors : compiler_error list;
       (** Errors accumulated during module loading. Surfaced to the CLI. *)
   mutable prelude_modules_loaded : bool;
@@ -326,7 +300,6 @@ let create () : t =
     std_override_dir = None;
     std_override_active = false;
     std_source_dir = None;
-    parser_frontend = BlorpParserBridge;
     load_errors = [];
     prelude_modules_loaded = false;
     overloads = Hashtbl.create 32;
@@ -346,9 +319,6 @@ let create () : t =
     desugar_counter = 0;
     ssa_mut_counter = 0;
   }
-
-let parser_frontend sess = sess.parser_frontend
-let set_parser_frontend sess frontend = sess.parser_frontend <- frontend
 
 (** Reset per-compilation counters. Called by [Core_pipeline] at the
     start of each compile so fresh-name generation doesn't accumulate

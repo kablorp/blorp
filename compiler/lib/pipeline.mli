@@ -54,17 +54,19 @@ val typecheck_only_typed :
 val typecheck_only_parsed :
   filename:string ->
   program:Ast.program ->
+  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   ?debug:bool ->
   unit ->
   (Ast.program, Ast.compiler_error list) result
 (** Load modules and type-check a program that has already passed through
     parser finalization. This is used by the Blorp-owned CLI/frontend bridge
-    after OCaml restores comments, parses interpolations, and hoists nested
+    after OCaml parses interpolations and hoists nested
     declarations. Prefer [typecheck_only_typed_parsed] for new callers. *)
 
 val typecheck_only_typed_parsed :
   filename:string ->
   program:Ast.program ->
+  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   ?debug:bool ->
   unit ->
   (Typed_ast.program, Ast.compiler_error list) result
@@ -173,6 +175,7 @@ val compile_parsed :
   ?check_invariants:bool ->
   filename:string ->
   program:Ast.program ->
+  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
 (** Compile a program that has already passed through parser finalization.

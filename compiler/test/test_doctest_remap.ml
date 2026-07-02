@@ -324,9 +324,8 @@ let test_generate_program_emits_colon_imports () =
 
    Until this suite existed, the function's parser-position assumption
    was only tested transitively through extract/generate. These tests
-   pin the actual input→output behavior so future parser changes
-   (e.g. Menhir rule reshuffling that moves [$symbolstartpos] around)
-   surface here instead of as mysterious mis-mapped error locations. *)
+   pin the actual input-output behavior so future parser/span changes surface
+   here instead of as mysterious mis-mapped error locations. *)
 
 let test_find_standard_shape () =
   (* Typical shape: preamble, blank, ---, content, ---, decl.
