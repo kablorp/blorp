@@ -19,10 +19,3 @@ val transform_program_with_expr_parser :
   (string -> Ast.loc -> Ast.expr) -> Ast.program -> Ast.program
 (** Transform all interpolated strings in a program using the supplied parser
     for expression text inside interpolation holes. *)
-
-val transform_program_with_bootstrap_menhir_expr_parser :
-  Ast.program -> Ast.program
-(** Transform all interpolated strings in a program through the legacy Menhir
-    expression parser. This exists only for the private parser-bridge bootstrap
-    path and low-level legacy parser fixtures. Normal source parsing must inject
-    the Blorp parser bridge with [transform_program_with_expr_batch_parser]. *)

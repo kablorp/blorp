@@ -151,13 +151,11 @@ which downloads and verifies the pinned dev release `dev-33e00c2b94df` into
 when set. Update the tag, version, and target checksums in that script together
 when intentionally moving the fallback bootstrap forward.
 
-Both helper builds set `BLORP_COMPILER_RENDERER_HELPER=1` and the private
-`BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER=1` bootstrap marker. The marker is
-converted into a session-local parser mode when the fresh compiler session is
-created; helper compilation never depends on either bridge helper already
-existing. Normal compiler source parsing does not read the old
-`BLORP_FRONTEND_PARSER` selector. The bootstrap wrapper sets that retired knob
-only for pinned external bootstrap binaries that still read it.
+Both helper builds call the normal `compile` command with
+`BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
+the old `BLORP_FRONTEND_PARSER` selector. The bootstrap wrapper sets that
+retired knob only for pinned external bootstrap binaries that still read it, so
+those binaries stay on their built-in parser while compiling bridge helpers.
 
 When helper preparation is needed, `scripts/test` resolves
 `BLORP_COMPILER_BRIDGE_BIN` to the verified pinned bootstrap binary path when no

@@ -79,7 +79,7 @@ let try_compile_and_run ~debug source =
   Test_runner.with_run_artifacts (fun () ->
       if debug then Printf.eprintf "[repl] source:\n%s\n%!" source;
       Modules.full_reset ();
-      Lexer.reset_state ();
+      Parse_comments.reset ();
       Modules.init_module_paths (Sys.getcwd ());
       let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
       let embed_runtime = precompiled = None in
@@ -319,7 +319,7 @@ let handle_import state name =
       let module_path = "std/" ^ rel in
       (* Load the module to get exports *)
       Modules.full_reset ();
-      Lexer.reset_state ();
+      Parse_comments.reset ();
       Modules.init_module_paths (Sys.getcwd ());
       match Modules.load_module module_path (Sys.getcwd ()) with
       | None ->
@@ -448,7 +448,7 @@ let infer_expr_type state expr_text =
     Buffer.contents buf
   in
   Modules.full_reset ();
-  Lexer.reset_state ();
+  Parse_comments.reset ();
   Modules.init_module_paths (Sys.getcwd ());
   match Pipeline.typecheck_module_only ~filename:"<repl>" ~source with
   | Ok (state_result, _) -> (

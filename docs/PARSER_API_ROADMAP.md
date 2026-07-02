@@ -455,17 +455,14 @@ emitter paths.
 The production bridge keeps one OCaml bridge layer and one protocol envelope,
 but it intentionally builds two helper binaries while the compiler is still
 bootstrapping itself. Backend/Core requests use the bootstrap-small
-`compiler_bridge_cli.brp` helper, which is compiled by the pinned bootstrap by
-default in renderer-helper mode with the private
-`BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER=1` marker. Parser requests use
-`compiler_parser_bridge_cli.brp`,
-which carries the parser-heavy imports and is also compiled by the pinned
-bootstrap with the same helper-mode markers. This lets both helpers be built
-without recursively requiring either helper to already exist. The
-production bridge remains one subsystem and one protocol envelope, not
-parser-specific handoff logic. The marker is interpreted once at the fresh
-compilation-session boundary and becomes a session-local bootstrap parser mode;
-`Modules.parse_source` does not read process environment to choose a frontend.
+`compiler_bridge_cli.brp` helper, which is compiled by the pinned bootstrap in
+renderer-helper mode. Parser requests use `compiler_parser_bridge_cli.brp`,
+which carries the parser-heavy imports and is compiled the same way. This lets
+both helpers be built without recursively requiring either helper to already
+exist. The production bridge remains one subsystem and one protocol envelope,
+not parser-specific handoff logic. Normal fresh compilation sessions have no
+parser selector and `Modules.parse_source` does not read process environment to
+choose a frontend.
 Until the bootstrap pin advances past the parser-bridge split, the bootstrap
 wrapper sets the retired `BLORP_FRONTEND_PARSER=ocaml` knob only for that pinned
 external binary while it is in renderer-helper mode; normal current-compiler
@@ -504,8 +501,8 @@ Acceptance criteria:
   dispatchers from accidentally growing into each other's action surface.
 - Production `check`, `compile`, `run`, `test`, formatter entry points, and LSP
   entry points use the Blorp parser bridge for source parsing.
-- Remaining direct legacy Menhir parser/lexer users are bounded helper
-  utilities and low-level unit-test fixtures, not frontend fallback selectors.
+- The legacy Menhir/ocamllex parser sources and fallback selector paths have
+  been removed.
 - The active compiler port roadmap is updated with the new boundary.
 
 ## Performance Notes
@@ -551,5 +548,4 @@ For the compiler parser migration:
 - Parser builds parsed AST without typed payloads.
 - Bridge action returns parsed AST JSON.
 - Parser fixture parity is green.
-- Legacy Menhir lexer/parser selector paths are deleted; remaining direct
-  parser users are explicitly bounded until they can be ported.
+- Legacy Menhir lexer/parser selector paths are deleted.

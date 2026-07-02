@@ -1773,13 +1773,7 @@ func main(args: List[String]) -> Int:
     a(1) + b(2) + c()
 |}
         in
-        Blorp.Lexer.reset_state ();
-        let lexbuf = Lexing.from_string source in
-        let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-        let program =
-          Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
-            program
-        in
+        let program = Test_helpers.parse_program source in
         let typed, errors = Blorp.Typecheck.typecheck program in
         Alcotest.(check int) "no type errors" 0 (List.length errors);
         let cprog = lower_program typed in
@@ -1812,13 +1806,7 @@ func caller() -> Int:
     inc(41)
 |}
         in
-        Blorp.Lexer.reset_state ();
-        let lexbuf = Lexing.from_string source in
-        let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-        let program =
-          Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
-            program
-        in
+        let program = Test_helpers.parse_program source in
         let typed =
           match Blorp.Typecheck.typecheck_with_state_typed program with
           | Ok (_state, typed) -> typed
@@ -2084,13 +2072,7 @@ func main(args: List[String]) -> Int:
     inc(41)
 |}
   in
-  Blorp.Lexer.reset_state ();
-  let lexbuf = Lexing.from_string source in
-  let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-  let program =
-    Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
-      program
-  in
+  let program = Test_helpers.parse_program source in
   let typed_program, errors = Blorp.Typecheck.typecheck program in
   Alcotest.(check int) "no type errors" 0 (List.length errors);
   let cprog = lower_program typed_program in

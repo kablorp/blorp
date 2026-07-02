@@ -188,6 +188,7 @@ expect_formatter_output_contains() {
 valid_prog="$TMPDIR_CLI/valid.brp"
 empty_prog="$TMPDIR_CLI/empty.brp"
 invalid_prog="$TMPDIR_CLI/invalid.brp"
+parse_invalid_prog="$TMPDIR_CLI/parse_invalid.brp"
 failing_test="$TMPDIR_CLI/failing_test.brp"
 timeout_test="$TMPDIR_CLI/timeout_test.brp"
 repeat_test="$TMPDIR_CLI/repeat_test.brp"
@@ -195,6 +196,7 @@ repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
+check_dir_empty="$TMPDIR_CLI/check_dir_empty"
 package_ok="$TMPDIR_CLI/package_ok"
 package_bad="$TMPDIR_CLI/package_bad"
 package_project="$TMPDIR_CLI/package_project"
@@ -210,7 +212,7 @@ package_missing_cache="$TMPDIR_CLI/package_missing_cache"
 package_artifact="$TMPDIR_CLI/sample.blorpkg"
 package_vendor="$TMPDIR_CLI/vendor_sample"
 
-mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested"
+mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested" "$check_dir_empty"
 mkdir -p "$package_ok/src/sample" "$package_bad/src"
 mkdir -p "$package_project/app" "$package_project/vendor"
 mkdir -p "$package_alias_project/app" "$package_alias_project/vendor"
@@ -229,6 +231,10 @@ BRP
 cat > "$invalid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	"not an int"
+BRP
+
+cat > "$parse_invalid_prog" <<'BRP'
+func bad(
 BRP
 
 cp "$valid_prog" "$check_dir_ok/root.brp"
@@ -371,7 +377,15 @@ expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
 
 expect_exit "check success" 0 "$BLORP_BIN" check --no-format "$valid_prog"
 expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
+expect_output_contains "check multi-file success" 0 "Checking " \
+    "$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
+expect_output_contains "check directory dump ast" 0 "Func main" \
+    "$BLORP_BIN" check --no-format --dump-ast "$check_dir_ok"
+expect_output_contains "check directory dump typed ast" 0 "Type checking succeeded." \
+    "$BLORP_BIN" check --no-format --dump-typed-ast "$check_dir_ok"
 expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
+expect_output_contains "check empty directory" 1 "no .brp files found" \
+    "$BLORP_BIN" check --no-format "$check_dir_empty"
 expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 expect_output_contains "package help" 0 "Usage: blorp package" \
@@ -519,17 +533,6 @@ else
     TOTAL=$((TOTAL + 1))
     record_fail "compile writes requested output" "missing $compiled_c"
 fi
-bootstrap_compile_c="$TMPDIR_CLI/bootstrap_compile.c"
-expect_exit "bootstrap helper compile success" 0 \
-    env BLORP_COMPILER_RENDERER_HELPER=1 BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER=1 \
-    "$BLORP_BIN" compile --no-format -o "$bootstrap_compile_c" "$valid_prog"
-if [ -f "$bootstrap_compile_c" ]; then
-    TOTAL=$((TOTAL + 1))
-    record_pass "bootstrap helper compile writes requested output"
-else
-    TOTAL=$((TOTAL + 1))
-    record_fail "bootstrap helper compile writes requested output" "missing $bootstrap_compile_c"
-fi
 external_runtime_c="$TMPDIR_CLI/external_runtime.c"
 expect_exit "compile no embedded runtime" 0 "$BLORP_BIN" compile --no-format --no-embed-runtime -o "$external_runtime_c" "$valid_prog"
 if [ ! -f "$external_runtime_c" ]; then
@@ -543,9 +546,13 @@ else
     record_pass "compile no embedded runtime omits runtime body"
 fi
 expect_exit "compile type failure" 1 "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/invalid.c" "$invalid_prog"
+expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
+    "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"
+expect_output_contains "run parse failure" 1 'expected `)` after function parameters' \
+    "$BLORP_BIN" run --no-format --timeout 5 "$parse_invalid_prog"
 expect_exit "run bad timeout" 1 "$BLORP_BIN" run --timeout not-an-int "$valid_prog"
 
 expect_exit "test success" 0 "$BLORP_BIN" test --no-cache --no-format --timeout 5 tests/test_blorp/types/test_bool.brp

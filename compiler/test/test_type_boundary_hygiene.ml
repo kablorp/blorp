@@ -100,7 +100,12 @@ let rec walk_files dir =
       else if has_suffix path ".ml" || has_suffix path ".mli" then [ path ]
       else [])
 
-let parser_sources () = [ find_project_file "compiler/lib/parser.mly" ]
+let parser_sources () =
+  [
+    find_project_file "compiler/blorp/compiler_parser.brp";
+    find_project_file "compiler/blorp/compiler_parsed_ast.brp";
+    find_project_file "compiler/blorp/compiler_parsed_ast_json.brp";
+  ]
 
 let strip_comments_and_strings source =
   let len = String.length source in
@@ -581,7 +586,9 @@ let test_type_param_bound_string_parsing_stays_inventoried () =
 
 let test_ast_decl_type_params_are_structured () =
   let ast_source = read_file (find_project_file "compiler/lib/ast.ml") in
-  let parser_source = read_file (find_project_file "compiler/lib/parser.mly") in
+  let parser_source =
+    parser_sources () |> List.map read_file |> String.concat "\n"
+  in
   if contains_substring parser_source "type_params_of_parser_strings" then
     Alcotest.fail
       "parser declaration generic params must construct structured params \

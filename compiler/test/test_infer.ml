@@ -140,23 +140,11 @@ let with_isolated_env (f : unit -> 'a) : 'a =
   Blorp.Session.with_current sess f
 
 let parse_and_typecheck source =
-  Blorp.Lexer.reset_state ();
-  let lexbuf = Lexing.from_string source in
-  let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-  let program =
-    Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
-      program
-  in
+  let program = Test_helpers.parse_program source in
   Blorp.Typecheck.typecheck program
 
 let parse_and_typecheck_std_with_env source =
-  Blorp.Lexer.reset_state ();
-  let lexbuf = Lexing.from_string source in
-  let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-  let program =
-    Blorp.Interp_parser.transform_program_with_bootstrap_menhir_expr_parser
-      program
-  in
+  let program = Test_helpers.parse_program source in
   Blorp.Typecheck.typecheck_with_env ~module_origin:Blorp.Session.Stdlib_module
     program
 

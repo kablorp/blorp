@@ -7,12 +7,12 @@ Source (.brp)
     |
     v
 +--------+
-| Lexer  |  Tokenization (lexer.mll - OCamllex)
+| Lexer  |  Tokenization (compiler/blorp/compiler_lexer.brp)
 +--------+
     |
     v
 +--------+
-| Parser |  AST construction (parser.mly - Menhir)
+| Parser |  AST construction (compiler/blorp/compiler_parser.brp)
 +--------+
     |
     v
@@ -320,8 +320,6 @@ compiler/
 │   └── blorp.ml           # Main unified CLI
 ├── lib/                   # Compiler library
 │   ├── ast.ml             # AST type definitions
-│   ├── lexer.mll          # OCamllex lexer specification
-│   ├── parser.mly         # Menhir parser specification
 │   ├── types.ml           # Type utilities (substitution, equality)
 │   ├── env.ml             # Symbol table / environment
 │   ├── env_builtins.ml    # Builtin type/function registration
@@ -470,24 +468,23 @@ tests/
 
 ## Frontend
 
-### Lexer (`lexer.mll`)
+### Blorp Lexer (`compiler/blorp/compiler_lexer.brp`)
 
-OCamllex specification that tokenizes source text:
+Blorp source lexer that tokenizes source text and emits spans, comments, and
+docstrings for the parser bridge:
 
 **Key features**:
 - Significant whitespace (Python-style indentation)
-- `INDENT` / `DEDENT` tokens for blocks
+- indent / dedent tokens for blocks
 - String interpolation (`"Hello ${name}!"`)
 - All keywords and operators
 
-**Token types** include:
-- Keywords: `FUNC`, `PURE`, `UNION`, `RECORD`, `MATCH`, etc.
-- Literals: `INT`, `FLOAT`, `STRING`, `CHAR`
-- Operators: `PLUS`, `ARROW`, `EQEQ`, etc.
+Token and keyword shapes are defined in `compiler/blorp/compiler_token.brp`.
 
-### Parser (`parser.mly`)
+### Blorp Parser (`compiler/blorp/compiler_parser.brp`)
 
-Menhir parser specification that builds the AST:
+Blorp parser that builds the parsed source AST used by the OCaml middle
+pipeline:
 
 **Key rules**:
 - `program` - Top-level declarations
@@ -498,8 +495,13 @@ Menhir parser specification that builds the AST:
 
 **Operator desugaring**: Binary operators become function calls:
 ```blorp
-a + b  →  add(a, b)
+a + b -> add(a, b)
 ```
+
+The parser helper serializes parsed AST artifacts through
+`compiler/blorp/compiler_parsed_ast_json.brp`; OCaml decodes them in
+`compiler/lib/parsed_ast_json.ml` and continues with module loading,
+typechecking, Core lowering, and later stages.
 
 ### AST (`ast.ml`)
 
@@ -727,12 +729,11 @@ Unified CLI with subcommands:
 
 ### Adding a New Keyword
 
-1. **Lexer** (`lexer.mll`):
-   - Add keyword to the keyword table
-   - Return appropriate token
+1. **Lexer** (`compiler/blorp/compiler_lexer.brp`):
+   - Add keyword handling.
+   - Return the appropriate `compiler_token` value.
 
-2. **Parser** (`parser.mly`):
-   - Add token declaration
+2. **Parser** (`compiler/blorp/compiler_parser.brp`):
    - Add grammar rules
 
 3. **Shared language surface and editor metadata**:
@@ -785,7 +786,7 @@ Unified CLI with subcommands:
 1. **AST** (`ast.ml`):
    - Add type representation if needed
 
-2. **Parser** (`parser.mly`):
+2. **Parser** (`compiler/blorp/compiler_parser.brp`):
    - Handle in type parsing rules
 
 3. **Types** (`types.ml`):

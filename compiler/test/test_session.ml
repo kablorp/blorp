@@ -45,22 +45,17 @@ let test_reset_meta_clears_only_that_session () =
   Alcotest.(check int) "s1 reset" 0 s1.fresh_meta_counter;
   Alcotest.(check int) "s2 untouched by s1 reset" 1 s2.fresh_meta_counter
 
-let test_parser_frontend_defaults_to_blorp_bridge () =
+let test_parse_source_uses_session_without_frontend_selector () =
   let sess = Session.create () in
-  Alcotest.(check bool)
-    "normal sessions use Blorp parser bridge" true
-    (Session.parser_frontend sess = Session.BlorpParserBridge)
-
-let test_parser_frontend_is_session_local () =
-  let s1 = Session.create () in
-  let s2 = Session.create () in
-  Session.set_parser_frontend s1 Session.BootstrapMenhirParser;
-  Alcotest.(check bool)
-    "s1 uses bootstrap parser" true
-    (Session.parser_frontend s1 = Session.BootstrapMenhirParser);
-  Alcotest.(check bool)
-    "s2 stays on Blorp bridge" true
-    (Session.parser_frontend s2 = Session.BlorpParserBridge)
+  Session.with_current sess (fun () ->
+      match
+        Modules.parse_source ~filename:"session_parse.brp" ~hoist_nested:false
+          "func main(args: List[String]) -> Int:\n    0\n"
+      with
+      | Ok [ { Ast.decl_desc = Ast.DFunc { func_name = Some "main"; _ }; _ } ] ->
+          ()
+      | Ok _ -> Alcotest.fail "expected parsed main function"
+      | Error err -> Alcotest.failf "parse failed: %s" err.Ast.message)
 
 (* ============================================================================
    Module-cache isolation
@@ -431,6 +426,42 @@ let test_import_parse_error_does_not_block_sibling_import () =
                  | Some file -> Filename.basename file = "bad.brp"
                  | None -> false)
                errors))
+
+let test_trusted_preloaded_parse_cache_skips_source_reread () =
+  with_temp_dir "blorp_trusted_preload" (fun dir ->
+      let dep_path = Filename.concat dir "dep.brp" in
+      let original_source = "dep_value = 1\n" in
+      write_file dep_path original_source;
+      let decls =
+        match
+          Modules.parse_source ~filename:dep_path ~bridge_read_file:false
+            original_source
+        with
+        | Ok decls -> decls
+        | Error err -> Alcotest.fail ("unexpected parse error: " ^ err.message)
+      in
+      write_file dep_path "func broken(\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess dir;
+      Modules.preload_parsed_sources ~sess
+        [
+          {
+            Modules.preload_module_name = "./dep";
+            preload_path = dep_path;
+            preload_origin = Session.User_module;
+            preload_source = original_source;
+            preload_decls = decls;
+          };
+        ];
+      match Modules.load_module ~sess "./dep" dir with
+      | None -> Alcotest.fail "expected trusted preloaded module to load"
+      | Some loaded ->
+          Alcotest.(check int)
+            "loaded original parsed decl" 1
+            (List.length loaded.decls);
+          Alcotest.(check int)
+            "no parse errors from overwritten source" 0
+            (List.length (Modules.get_load_errors ~sess ())))
 
 let package_name_of_origin = function
   | Session.Native_package_module id -> Some (Session.package_id_name id)
@@ -1276,10 +1307,8 @@ let suite =
         Alcotest.test_case "meta_env" `Quick test_meta_env_isolated;
         Alcotest.test_case "reset_meta" `Quick
           test_reset_meta_clears_only_that_session;
-        Alcotest.test_case "parser frontend defaults to bridge" `Quick
-          test_parser_frontend_defaults_to_blorp_bridge;
-        Alcotest.test_case "parser frontend is session local" `Quick
-          test_parser_frontend_is_session_local;
+        Alcotest.test_case "source parse has no frontend selector" `Quick
+          test_parse_source_uses_session_without_frontend_selector;
       ] );
     ( "modules_isolation",
       [
@@ -1308,6 +1337,8 @@ let suite =
           test_source_origin_uses_configured_std_root;
         Alcotest.test_case "import parse error keeps sibling imports" `Quick
           test_import_parse_error_does_not_block_sibling_import;
+        Alcotest.test_case "trusted preloaded parse cache skips source reread"
+          `Quick test_trusted_preloaded_parse_cache_skips_source_reread;
         Alcotest.test_case "source package alias resolves" `Quick
           test_blorp_toml_source_package_alias_resolves;
         Alcotest.test_case "source package alias can differ from name" `Quick

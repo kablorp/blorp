@@ -20,7 +20,7 @@ let ( let* ) result f =
 
 type parsed_source = {
   parsed_program : Ast.program;
-  parsed_comments : Lexer.collected_comment list;
+  parsed_comments : Parse_comments.collected_comment list;
 }
 
 type parse_source_response =
@@ -157,7 +157,29 @@ type cli_frontend_parsed = {
   cli_frontend_options : cli_frontend_options;
   cli_frontend_path : string;
   cli_frontend_module_name : string;
+  cli_frontend_source_text : string option;
   cli_frontend_parsed_response : parse_source_response;
+}
+
+type cli_check_source_batch = {
+  cli_check_batch_args : string list;
+  cli_check_batch_options : cli_check_options;
+  cli_check_batch_sources : parse_source_batch_response list;
+}
+
+type cli_source_graph_source = {
+  cli_source_graph_path : string;
+  cli_source_graph_module_name : string;
+  cli_source_graph_source_text : string;
+  cli_source_graph_parsed_response : parse_source_response;
+}
+
+type cli_source_graph = {
+  cli_source_graph_command : cli_frontend_command;
+  cli_source_graph_args : string list;
+  cli_source_graph_options : cli_frontend_options;
+  cli_source_graph_roots : cli_source_graph_source list;
+  cli_source_graph_modules : cli_source_graph_source list;
 }
 
 type cli_frontend_options_plan = {
@@ -175,6 +197,8 @@ type cli_run_handled_result = {
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunParsedSource of cli_frontend_parsed
+  | CliRunParsedSourceBatch of cli_check_source_batch
+  | CliRunParsedSourceGraph of cli_source_graph
   | CliRunFrontendOptions of cli_frontend_options_plan
   | CliRunTestOptions of cli_test_options
   | CliRunPurifyOptions of cli_purify_options
@@ -581,6 +605,17 @@ let optional_string_response_field name = function
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
+let optional_missing_string_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | None | Some Lsp_json.Null -> Ok None
+      | Some (Lsp_json.String value) -> Ok (Some value)
+      | Some _ ->
+          Error
+            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
 let optional_int_response_field name = function
   | Lsp_json.Object fields -> (
       match List.assoc_opt name fields with
@@ -657,7 +692,7 @@ let decode_parse_comment = function
       let* cc_line = int_json_field "line" fields in
       let* cc_col = int_json_field "column" fields in
       let* cc_trailing = bool_json_field "trailing" fields in
-      Ok { Lexer.cc_text = cc_text; cc_line; cc_col; cc_trailing }
+      Ok { Parse_comments.cc_text = cc_text; cc_line; cc_col; cc_trailing }
   | _ -> Error ("invalid_response", "parse comments must be JSON objects")
 
 let parse_comments_response_field artifact =
@@ -1048,6 +1083,9 @@ let cli_frontend_parsed_response_field artifact =
   let* source = json_response_field "source" artifact in
   let* cli_frontend_path = string_response_field "path" source in
   let* cli_frontend_module_name = string_response_field "module" source in
+  let* cli_frontend_source_text =
+    optional_missing_string_response_field "source_text" source
+  in
   let* parsed_source = json_response_field "parsed_source" source in
   let* cli_frontend_parsed_response = parsed_ast_artifact_field parsed_source in
   Ok
@@ -1057,8 +1095,131 @@ let cli_frontend_parsed_response_field artifact =
       cli_frontend_options;
       cli_frontend_path;
       cli_frontend_module_name;
+      cli_frontend_source_text;
       cli_frontend_parsed_response;
     }
+
+let cli_check_source_batch_source_response_field source =
+  let* batch_parsed_path = string_response_field "path" source in
+  let* batch_parsed_module_name = string_response_field "module" source in
+  let* parsed_source = json_response_field "parsed_source" source in
+  let* batch_parsed_response = parsed_ast_artifact_field parsed_source in
+  Ok
+    {
+      batch_parsed_path;
+      batch_parsed_module_name;
+      batch_parsed_response;
+    }
+
+let cli_check_source_batch_sources_field artifact =
+  match json_response_field "sources" artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array sources) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | source :: rest ->
+            let* parsed = cli_check_source_batch_source_response_field source in
+            collect (parsed :: acc) rest
+      in
+      collect [] sources
+  | Ok _ -> Error ("invalid_response", "field `sources` must be an array")
+
+let cli_check_source_batch_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* () =
+    if String.equal command_text "check" then Ok ()
+    else
+      Error
+        ( "invalid_response",
+          "CLI parsed_source_batch artifact command is `" ^ command_text
+          ^ "`, expected `check`" )
+  in
+  let* cli_check_batch_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "parsed_source_batch" "check"
+      cli_check_batch_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_frontend_options = decode_cli_check_options options in
+  let* cli_check_batch_options =
+    match cli_frontend_options with
+    | CliFrontendCheckOptions options -> Ok options
+    | _ ->
+        Error
+          ( "invalid_response",
+            "CLI parsed_source_batch options must be check options" )
+  in
+  let* cli_check_batch_sources =
+    cli_check_source_batch_sources_field artifact
+  in
+  Ok
+    (CliRunParsedSourceBatch
+       {
+         cli_check_batch_args;
+         cli_check_batch_options;
+         cli_check_batch_sources;
+       })
+
+let cli_source_graph_source_field source =
+  let* cli_source_graph_path = string_response_field "path" source in
+  let* cli_source_graph_module_name = string_response_field "module" source in
+  let* cli_source_graph_source_text =
+    string_response_field "source_text" source
+  in
+  let* parsed_source = json_response_field "parsed_source" source in
+  let* cli_source_graph_parsed_response =
+    parsed_ast_artifact_field parsed_source
+  in
+  Ok
+    {
+      cli_source_graph_path;
+      cli_source_graph_module_name;
+      cli_source_graph_source_text;
+      cli_source_graph_parsed_response;
+    }
+
+let cli_source_graph_source_list_field name artifact =
+  match json_response_field name artifact with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array sources) ->
+      let rec collect acc = function
+        | [] -> Ok (List.rev acc)
+        | source :: rest ->
+            let* parsed = cli_source_graph_source_field source in
+            collect (parsed :: acc) rest
+      in
+      collect [] sources
+  | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
+
+let cli_source_graph_response_field artifact =
+  let* command_text = string_response_field "command" artifact in
+  let* cli_source_graph_command =
+    cli_frontend_command_of_string command_text
+  in
+  let* cli_source_graph_args = string_array_field "args" artifact in
+  let* () =
+    validate_cli_artifact_command "parsed_source_graph" command_text
+      cli_source_graph_args
+  in
+  let* options = json_response_field "options" artifact in
+  let* cli_source_graph_options =
+    decode_cli_frontend_options cli_source_graph_command options
+  in
+  let* cli_source_graph_roots =
+    cli_source_graph_source_list_field "roots" artifact
+  in
+  let* cli_source_graph_modules =
+    cli_source_graph_source_list_field "modules" artifact
+  in
+  Ok
+    (CliRunParsedSourceGraph
+       {
+         cli_source_graph_command;
+         cli_source_graph_args;
+         cli_source_graph_options;
+         cli_source_graph_roots;
+         cli_source_graph_modules;
+       })
 
 let cli_frontend_options_response_field artifact =
   let* command_text = string_response_field "command" artifact in
@@ -1202,6 +1363,8 @@ let cli_run_response_field response =
   | "parsed_source" ->
       let* parsed = cli_frontend_parsed_response_field artifact in
       Ok (CliRunParsedSource parsed)
+  | "parsed_source_batch" -> cli_check_source_batch_response_field artifact
+  | "parsed_source_graph" -> cli_source_graph_response_field artifact
   | "frontend_options" ->
       let* options = cli_frontend_options_response_field artifact in
       Ok (CliRunFrontendOptions options)
@@ -1265,9 +1428,6 @@ let render_many_for_renderer_helper_exn ~renderer items =
      ^ " is not available while compiling the Blorp bridge helper")
 
 let renderer_bridge_helper_env = "BLORP_COMPILER_RENDERER_HELPER"
-let compiler_bootstrap_menhir_parser_env =
-  "BLORP_COMPILER_BOOTSTRAP_MENHIR_PARSER"
-
 let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
 let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
@@ -1278,7 +1438,10 @@ let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");
-    (compiler_bootstrap_menhir_parser_env, "1");
+    (* Only pinned external bootstrap binaries read this retired selector.
+       Current compiler sessions do not use it, but direct bootstrap-binary
+       helper builds still need to stay on the bootstrap's built-in parser. *)
+    ("BLORP_FRONTEND_PARSER", "ocaml");
   ]
 
 let parser_bridge_helper_compile_env = bridge_helper_compile_env
@@ -1298,14 +1461,6 @@ let bridge_temp_retry_limit = 32
 let running_inside_renderer_bridge_helper () =
   match Sys.getenv_opt renderer_bridge_helper_env with
   | Some "1" -> true
-  | _ -> false
-
-let compiler_bootstrap_menhir_parser_requested () =
-  match
-    ( Sys.getenv_opt renderer_bridge_helper_env,
-      Sys.getenv_opt compiler_bootstrap_menhir_parser_env )
-  with
-  | Some "1", Some "1" -> true
   | _ -> false
 
 let read_all_fd fd =

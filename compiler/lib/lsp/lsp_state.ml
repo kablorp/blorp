@@ -167,7 +167,7 @@ let analyze (_state : state) (doc : document) : unit =
       let (), elapsed =
         timed (fun () ->
             Modules.reset ();
-            Lexer.reset_state ())
+            Parse_comments.reset ())
       in
       reset_ms := elapsed;
 

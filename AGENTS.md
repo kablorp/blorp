@@ -413,6 +413,7 @@ Notes:
 
 ```
 compiler/            # OCaml compiler implementation
+  blorp/          # Blorp-owned compiler frontend/backend slices
   bin/            # CLI executables
     blorp.ml      # Main unified CLI
   test/           # Compiler-internal OCaml/Alcotest tests
@@ -421,8 +422,6 @@ compiler/            # OCaml compiler implementation
     test_env.ml   # Env module tests
   lib/            # Compiler library
     ast.ml        # AST type definitions
-    lexer.mll     # OCamllex lexer
-    parser.mly    # Menhir parser
     typecheck.ml  # Type checker
     infer.ml      # Type inference
     types.ml      # Type utilities

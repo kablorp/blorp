@@ -31,11 +31,9 @@ scripts/test unit compiler
 ```
 compiler/
 ├── bin/blorp.ml              # Main unified CLI
-├── blorp/                    # Blorp-owned compiler/frontend slices
+├── blorp/                    # Blorp-owned compiler/frontend/backend slices
 ├── lib/
 │   ├── ast.ml                # Source AST definitions
-│   ├── lexer.mll             # OCamllex lexer
-│   ├── parser.mly            # Menhir parser
 │   ├── modules.ml            # Import resolution and module loading
 │   ├── infer.ml              # Bidirectional type inference
 │   ├── typecheck.ml          # Type checking, purity, exhaustiveness
