@@ -60,7 +60,7 @@ val typecheck_only_parsed :
   (Ast.program, Ast.compiler_error list) result
 (** Load modules and type-check a program that has already passed through
     parser finalization. This is used by the Blorp-owned CLI/frontend bridge
-    after OCaml restores comments, parses interpolations, and hoists nested
+    after OCaml parses interpolations and hoists nested
     declarations. Prefer [typecheck_only_typed_parsed] for new callers. *)
 
 val typecheck_only_typed_parsed :

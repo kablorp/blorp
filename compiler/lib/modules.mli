@@ -186,9 +186,10 @@ val finalize_blorp_parsed_source :
   Compiler_blorp_bridge.parsed_source ->
   (Ast.program, Ast.compiler_error list) result
 (** Apply the OCaml-owned post-parser frontend work to a raw Blorp parser
-    bridge artifact: restore lexer comments, parse interpolated expressions,
-    and hoist nested declarations by default. This is the single boundary for
-    callers that receive parser JSON directly from the Blorp bridge. *)
+    bridge artifact: parse interpolated expressions and hoist nested
+    declarations by default. Comments remain explicit parser artifact data. This
+    is the single boundary for callers that receive parser JSON directly from
+    the Blorp bridge. *)
 
 val collect_private_names : Ast.program -> (string * Ast.decl) list
 (** Collect names of private declarations from a program. *)

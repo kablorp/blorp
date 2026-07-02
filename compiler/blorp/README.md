@@ -45,6 +45,12 @@ Structured concurrency coverage includes `concurrent:` blocks,
 also represents `with` resource blocks and `debug:` blocks explicitly. Broader
 parity fixtures remain a later frontend slice.
 
+The Blorp-owned CLI surface is split by responsibility: `compiler_cli.brp`
+owns top-level planning and dispatch, `compiler_cli_args.brp` owns pure argument
+parsing, `compiler_cli_plan.brp` owns shared plan data, `compiler_cli_source_graph.brp`
+owns source reading/import graph/package source discovery, and
+`compiler_cli_artifact_json.brp` owns bridge artifact encoding.
+
 New work in this directory should usually expand that production path and delete
 or shrink the matching OCaml implementation in the same slice. Avoid adding
 standalone wrapper programs, optional compilation paths, or parallel tool

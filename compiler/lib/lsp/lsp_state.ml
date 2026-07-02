@@ -165,9 +165,7 @@ let analyze (_state : state) (doc : document) : unit =
       (* Reset the active graph, but keep source-stamped parsed modules. Each
          filesystem cache hit validates the current source hash before reuse. *)
       let (), elapsed =
-        timed (fun () ->
-            Modules.reset ();
-            Parse_comments.reset ())
+        timed (fun () -> Modules.reset ())
       in
       reset_ms := elapsed;
 

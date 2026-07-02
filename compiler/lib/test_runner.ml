@@ -2142,7 +2142,6 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
   in
 
   Modules.reset ();
-  Parse_comments.reset ();
 
   let raw_source =
     match source_text with Some source -> source | None -> read_file filename
@@ -2463,7 +2462,6 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
       close_out oc
   | None -> ());
   Modules.full_reset ();
-  Parse_comments.reset ();
   let cwd = Sys.getcwd () in
   init_module_paths cwd;
   let filename = Filename.concat cwd filename_base in

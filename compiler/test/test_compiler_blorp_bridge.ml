@@ -1043,6 +1043,20 @@ let test_parser_bridge_respects_explicit_override () =
       Alcotest.(check string) "explicit bridge binary" "/tmp/custom-blorp" path
   | None -> Alcotest.fail "expected explicit bridge binary to win"
 
+let test_bridge_helper_compiler_rejects_current_executable_override () =
+  match
+    Blorp.Compiler_blorp_bridge.locate_bridge_helper_compiler
+      ~bridge_bin:(Some Sys.executable_name) [ "/does/not/exist" ]
+  with
+  | Ok compiler ->
+      Alcotest.fail
+        ("expected current executable override to be rejected, got "
+       ^ compiler.Blorp.Compiler_blorp_bridge.helper_compiler_path)
+  | Error message ->
+      Alcotest.(check bool)
+        "mentions current executable" true
+        (contains message "current compiler executable")
+
 let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
       let compiler_dir = Filename.concat root "compiler" in
@@ -1237,6 +1251,8 @@ let suite =
           test_parser_bridge_uses_pinned_bootstrap_over_workspace_blorp;
         Alcotest.test_case "parser helper respects explicit override" `Quick
           test_parser_bridge_respects_explicit_override;
+        Alcotest.test_case "helper compiler rejects current executable override"
+          `Quick test_bridge_helper_compiler_rejects_current_executable_override;
         Alcotest.test_case "cache key includes helper entrypoint" `Quick
           test_bridge_cache_key_includes_helper_entrypoint;
         Alcotest.test_case "prepared env accepts existing helper" `Quick

@@ -1607,6 +1607,15 @@ let exec_program prog args envp =
 let compiler_bridge_bin_env = "BLORP_COMPILER_BRIDGE_BIN"
 let compiler_bootstrap_script_name = "scripts/blorp-compiler-bootstrap"
 
+type bridge_helper_compiler_source =
+  | PinnedBootstrapScript
+  | ExplicitBootstrapOverride
+
+type bridge_helper_compiler = {
+  helper_compiler_path : string;
+  helper_compiler_source : bridge_helper_compiler_source;
+}
+
 let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
     starts =
   match bridge_bin with
@@ -1616,6 +1625,65 @@ let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge
 let command_program_for_parser_bridge ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
     starts =
   locate_default_command_program ~bridge_bin starts
+
+let existing_executable_candidates prog =
+  executable_candidates prog |> List.filter Sys.file_exists
+
+let file_identity path =
+  try
+    let st = Unix.stat path in
+    Some (st.Unix.st_dev, st.Unix.st_ino)
+  with _ -> None
+
+let same_file left right =
+  match (file_identity left, file_identity right) with
+  | Some left_id, Some right_id -> left_id = right_id
+  | _ -> false
+
+let explicit_override_is_current_executable path =
+  let current_candidates = existing_executable_candidates Sys.executable_name in
+  let override_candidates = existing_executable_candidates path in
+  List.exists
+    (fun override ->
+      List.exists (fun current -> same_file override current) current_candidates)
+    override_candidates
+
+let validate_explicit_bridge_helper_override path =
+  if explicit_override_is_current_executable path then
+    Error
+      (Printf.sprintf
+         "%s must point to a bootstrap-capable Blorp compiler, not the current \
+          compiler executable `%s`. Provide prepared helper binaries with %s \
+          and %s, or unset %s to use %s."
+         compiler_bridge_bin_env path prepared_renderer_bridge_bin_env
+         prepared_parser_bridge_bin_env compiler_bridge_bin_env
+         compiler_bootstrap_script_name)
+  else Ok ()
+
+let locate_bridge_helper_compiler ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
+    starts =
+  match bridge_bin with
+  | Some path when path <> "" ->
+      let* () = validate_explicit_bridge_helper_override path in
+      Ok
+        {
+          helper_compiler_path = path;
+          helper_compiler_source = ExplicitBootstrapOverride;
+        }
+  | _ -> (
+      match find_upwards_from starts compiler_bootstrap_script_name with
+      | Some path ->
+          Ok
+            {
+              helper_compiler_path = path;
+              helper_compiler_source = PinnedBootstrapScript;
+            }
+      | None ->
+          Error
+            (Printf.sprintf
+               "cannot locate pinned Blorp compiler bootstrap %s; set %s to a \
+                bootstrap-capable blorp binary"
+               compiler_bootstrap_script_name compiler_bridge_bin_env))
 
 let run_process_capture ?(env = []) ?(unset_env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
@@ -1645,14 +1713,17 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
 
 let default_command_program () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match locate_default_command_program starts with
-  | Some path -> path
-  | None ->
-      invalid_arg
-        (Printf.sprintf
-           "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
-           explicit blorp binary"
-           compiler_bootstrap_script_name compiler_bridge_bin_env)
+  match locate_bridge_helper_compiler starts with
+  | Ok compiler -> compiler.helper_compiler_path
+  | Error message -> invalid_arg message
+
+let default_bridge_helper_compiler () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  locate_bridge_helper_compiler starts
+
+let parser_bridge_helper_compiler () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  locate_bridge_helper_compiler starts
 
 let parser_bridge_command_program () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -1662,7 +1733,7 @@ let parser_bridge_command_program () =
       invalid_arg
         (Printf.sprintf
            "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
-            explicit blorp binary"
+           explicit blorp binary"
            compiler_bootstrap_script_name compiler_bridge_bin_env)
 
 let renderer_bridge_source_path () =
@@ -2096,8 +2167,9 @@ let apply_generated_c_bootstrap_compatibility path =
   let rewritten = generated_c_with_bootstrap_compatibility original in
   if not (String.equal original rewritten) then write_file path rewritten
 
-let compile_bridge_binary_in_stage ~program ~source_path ~compile_env ~stage_dir
+let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_dir
     ~bin_path =
+  let program = compiler.helper_compiler_path in
   let c_path = renderer_bridge_c_path stage_dir in
   let obj_path = renderer_bridge_obj_path stage_dir in
   let wrapper_path = renderer_bridge_wrapper_path stage_dir in
@@ -2148,7 +2220,7 @@ let compile_bridge_binary_in_stage ~program ~source_path ~compile_env ~stage_dir
                  (String.trim (cc_output ^ cc_stderr)))
           else Ok bin_path)
 
-let compile_bridge_binary_to_path ~program ~source_path ~compile_env ~work_root
+let compile_bridge_binary_to_path ~compiler ~source_path ~compile_env ~work_root
     ~bin_path =
   ensure_dir work_root;
   ensure_dir (Filename.dirname bin_path);
@@ -2160,7 +2232,7 @@ let compile_bridge_binary_to_path ~program ~source_path ~compile_env ~work_root
     (fun () ->
       let stage_bin = renderer_bridge_bin_path stage_dir in
       match
-        compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+        compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
           ~stage_dir ~bin_path:stage_bin
       with
       | Error _ as error -> error
@@ -2185,7 +2257,7 @@ let with_renderer_bridge_cache_lock cache_root key f =
           try lockf_retry fd Unix.F_ULOCK 0 with _ -> ())
         f)
 
-let compile_renderer_bridge_binary ~program ~source_path ~cache_root
+let compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
     ~compile_env parts =
   let final_dir = renderer_bridge_cache_dir cache_root parts.bridge_key in
   if renderer_bridge_cache_verified parts final_dir then
@@ -2200,7 +2272,7 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root
     in
     let bin_path = renderer_bridge_bin_path stage_dir in
     match
-      compile_bridge_binary_in_stage ~program ~source_path ~compile_env
+      compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
         ~stage_dir ~bin_path
     with
     | Error message ->
@@ -2210,8 +2282,9 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root
         write_renderer_bridge_cache_markers parts stage_dir;
         publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir)
 
-let bridge_binary_for_source cache_ref ~program ~source_path ~compile_env =
+let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
   let cache_root = renderer_bridge_cache_root () in
+  let program = compiler.helper_compiler_path in
   match !cache_ref with
   | Some (cached_program, cached_source, cached_root, _cached_key, cached_binary)
     when String.equal cached_program program
@@ -2222,7 +2295,7 @@ let bridge_binary_for_source cache_ref ~program ~source_path ~compile_env =
   | _ -> (
       let cache_parts = renderer_bridge_cache_parts ~program ~source_path in
       match
-        compile_renderer_bridge_binary ~program ~source_path ~cache_root
+        compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
           ~compile_env cache_parts
       with
       | Ok binary ->
@@ -2259,8 +2332,8 @@ let renderer_bridge_binary () =
   | None when prepared_bridge_required () ->
       missing_prepared_bridge_error prepared_renderer_bridge_bin_env
   | None ->
-      bridge_binary_for_source renderer_bridge_cache
-        ~program:(default_command_program ())
+      let* compiler = default_bridge_helper_compiler () in
+      bridge_binary_for_source renderer_bridge_cache ~compiler
         ~source_path:(renderer_bridge_source_path ())
         ~compile_env:bridge_helper_compile_env
 
@@ -2270,8 +2343,8 @@ let parser_bridge_binary () =
   | None when prepared_bridge_required () ->
       missing_prepared_bridge_error prepared_parser_bridge_bin_env
   | None ->
-      bridge_binary_for_source parser_bridge_cache
-        ~program:(parser_bridge_command_program ())
+      let* compiler = parser_bridge_helper_compiler () in
+      bridge_binary_for_source parser_bridge_cache ~compiler
         ~source_path:(parser_bridge_source_path ())
         ~compile_env:parser_bridge_helper_compile_env
 
@@ -2282,17 +2355,17 @@ type prepared_bridge_binaries = {
 
 let prepare_bridge_binaries ~out_dir =
   ensure_dir out_dir;
-  let program = default_command_program () in
+  let* compiler = default_bridge_helper_compiler () in
   let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
   let* renderer_path =
-    compile_bridge_binary_to_path ~program
+    compile_bridge_binary_to_path ~compiler
       ~source_path:(renderer_bridge_source_path ())
       ~compile_env:bridge_helper_compile_env ~work_root:out_dir
       ~bin_path:renderer_bin
   in
   let* parser_path =
-    compile_bridge_binary_to_path ~program
+    compile_bridge_binary_to_path ~compiler
       ~source_path:(parser_bridge_source_path ())
       ~compile_env:parser_bridge_helper_compile_env ~work_root:out_dir
       ~bin_path:parser_bin

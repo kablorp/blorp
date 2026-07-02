@@ -1,8 +1,8 @@
-(** Parsed source comments collected for formatter-compatible frontend artifacts.
+(** Parsed source comments carried by parser bridge artifacts.
 
-    The legacy OCaml lexer and the Blorp parser bridge both produce this
-    shape. Keeping it outside [Lexer] prevents bridge artifacts from depending
-    on the OCaml lexer module while that lexer is being retired. *)
+    Comments are explicit parse output data. They are not stored in process-global
+    lexer state; callers that need comments should keep the parser artifact or
+    pass the comment list directly. *)
 
 type collected_comment = {
   cc_text : string;
@@ -11,8 +11,3 @@ type collected_comment = {
   cc_trailing : bool;
       (** True when source code preceded the comment on the same line. *)
 }
-
-val reset : unit -> unit
-val get : unit -> collected_comment list
-val restore : collected_comment list -> unit
-val add : collected_comment -> unit

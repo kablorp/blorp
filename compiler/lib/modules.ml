@@ -233,88 +233,80 @@ let interp_wrapper_var_index name =
   else None
 
 let rec parse_interpolated_exprs_with_blorp_bridge ~path ~module_name requests =
-  let saved_comments = Parse_comments.get () in
-  Fun.protect
-    ~finally:(fun () -> Parse_comments.restore saved_comments)
-    (fun () ->
-      let request_count = List.length requests in
-      let wrapper =
-        requests
-        |> List.mapi (fun index request ->
-               Printf.sprintf "%s = %s\n" (interp_wrapper_var_name index)
-                 request.Interp_parser.text)
-        |> String.concat ""
-      in
-      let first_request_loc =
-        match requests with
-        | request :: _ -> request.Interp_parser.loc
-        | [] -> Ast.point_loc_in ~file:path ~line:1 ~column:1
-      in
-      let fail request =
-        raise
-          (Interp_parser.InterpParseError
-             ( Printf.sprintf "Failed to parse interpolated expression: %s"
-                 request.Interp_parser.text,
-               request.Interp_parser.loc ))
-      in
-      let fail_at_start message =
-        raise
-          (Interp_parser.InterpParseError (message, first_request_loc))
-      in
-      let extract decls =
-        let parsed_by_index = Hashtbl.create request_count in
-        let record_decl decl =
-          match decl.Ast.decl_desc with
-          | Ast.DVar { var_name = Some name; var_value; _ } -> (
-              match interp_wrapper_var_index name with
-              | Some index when index >= 0 && index < request_count ->
-                  if Hashtbl.mem parsed_by_index index then
-                    fail_at_start
-                      "interpolation expression parser returned duplicate \
-                       expressions"
-                  else Hashtbl.add parsed_by_index index var_value
-              | _ ->
-                  fail_at_start
-                    "interpolation expression parser returned an unexpected \
-                     declaration")
+  let request_count = List.length requests in
+  let wrapper =
+    requests
+    |> List.mapi (fun index request ->
+           Printf.sprintf "%s = %s\n" (interp_wrapper_var_name index)
+             request.Interp_parser.text)
+    |> String.concat ""
+  in
+  let first_request_loc =
+    match requests with
+    | request :: _ -> request.Interp_parser.loc
+    | [] -> Ast.point_loc_in ~file:path ~line:1 ~column:1
+  in
+  let fail request =
+    raise
+      (Interp_parser.InterpParseError
+         ( Printf.sprintf "Failed to parse interpolated expression: %s"
+             request.Interp_parser.text,
+           request.Interp_parser.loc ))
+  in
+  let fail_at_start message =
+    raise (Interp_parser.InterpParseError (message, first_request_loc))
+  in
+  let extract decls =
+    let parsed_by_index = Hashtbl.create request_count in
+    let record_decl decl =
+      match decl.Ast.decl_desc with
+      | Ast.DVar { var_name = Some name; var_value; _ } -> (
+          match interp_wrapper_var_index name with
+          | Some index when index >= 0 && index < request_count ->
+              if Hashtbl.mem parsed_by_index index then
+                fail_at_start
+                  "interpolation expression parser returned duplicate \
+                   expressions"
+              else Hashtbl.add parsed_by_index index var_value
           | _ ->
               fail_at_start
                 "interpolation expression parser returned an unexpected \
-                 declaration"
-        in
-        List.iter record_decl decls;
-        List.mapi
-          (fun index request ->
-            match Hashtbl.find_opt parsed_by_index index with
-            | Some expr -> expr
-            | None -> fail request)
-          requests
-      in
-      if request_count = 0 then []
-      else
-        match
-          parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:false
-            ~bridge_read_file:false wrapper
-        with
-        | Ok decls -> extract decls
-        | Error (BridgeParseCompilerErrors (err :: _)) ->
-            raise
-              (Interp_parser.InterpParseError
-                 ( Printf.sprintf
-                     "Parse error in interpolated expression: %s"
-                     err.Ast.message,
-                   interp_error_loc_for_diagnostic requests err ))
-        | Error (BridgeParseCompilerErrors []) ->
-            raise
-              (Interp_parser.InterpParseError
-                 ( "Parse error in interpolated expression",
-                   first_request_loc ))
-        | Error (BridgeParseMessage message) ->
-            raise
-              (Interp_parser.InterpParseError
-                 ( Printf.sprintf
-                     "Parse error in interpolated expression: %s" message,
-                   first_request_loc )))
+                 declaration")
+      | _ ->
+          fail_at_start
+            "interpolation expression parser returned an unexpected declaration"
+    in
+    List.iter record_decl decls;
+    List.mapi
+      (fun index request ->
+        match Hashtbl.find_opt parsed_by_index index with
+        | Some expr -> expr
+        | None -> fail request)
+      requests
+  in
+  if request_count = 0 then []
+  else
+    match
+      parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:false
+        ~bridge_read_file:false wrapper
+    with
+    | Ok decls -> extract decls
+    | Error (BridgeParseCompilerErrors (err :: _)) ->
+        raise
+          (Interp_parser.InterpParseError
+             ( Printf.sprintf "Parse error in interpolated expression: %s"
+                 err.Ast.message,
+               interp_error_loc_for_diagnostic requests err ))
+    | Error (BridgeParseCompilerErrors []) ->
+        raise
+          (Interp_parser.InterpParseError
+             ("Parse error in interpolated expression", first_request_loc))
+    | Error (BridgeParseMessage message) ->
+        raise
+          (Interp_parser.InterpParseError
+             ( Printf.sprintf "Parse error in interpolated expression: %s"
+                 message,
+               first_request_loc ))
 
 and parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
     ~bridge_read_file source =
@@ -337,7 +329,6 @@ and parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
 
 and finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
     (parsed_source : Compiler_blorp_bridge.parsed_source) =
-  Parse_comments.restore parsed_source.parsed_comments;
   try
     let program =
       Interp_parser.transform_program_with_expr_batch_parser
