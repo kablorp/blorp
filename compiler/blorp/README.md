@@ -106,6 +106,41 @@ argument policy, special inference hooks, and loop-producer metadata.
 entrypoints over the Blorp Env: qualified module aliases, optional owner
 qualification, nominal dimension disambiguation, and alias expansion or
 preservation.
+`compiler_typecheck_types.brp` projects parsed source type syntax into the
+semantic `CompilerType` model used by Env/typecheck. It covers named and
+qualified types, arrays/tensors, ranges, tuples, function types, dimension
+expressions, variadic dimensions, and parsed generic bounds; later resolution
+still owns alias expansion and module-owner qualification.
+`compiler_typecheck_state.brp` starts the declaration-indexing checkpoint by
+modeling the OCaml `check_state` boundary as pure Blorp data: module aliases,
+selective import bindings, imported modules, module-origin policy, private
+impls, known type/resource names, top-level namespace names, per-module type
+homes, callable ids, and the ephemeral type-shape memo slots later inference
+will share. It also exposes type-home matching and private impl conflict lookup
+so declaration registration can enforce source-level coherence without hidden
+side tables.
+`compiler_typecheck_decl.brp` starts the AST-driven first-pass walkers. It
+currently ports the top-level pre-scan that records known type names, resource
+type names, constructor names, function/variable/trait namespace entries,
+foreign-block functions, and private-wrapper contents before import or
+signature registration runs. It also owns the first semantic declaration
+registration slices for local union/enum, builtin/resource type,
+record/struct, type-alias, global variable, source function, foreign function,
+trait, and impl declarations. Those slices populate Env
+type/record/alias/constructor facts, function and variable facts, callable ids,
+trait defs, bare trait-method bindings, public/private impl indexes, type homes,
+simple enum/struct/trait/foreign-origin boundary errors, source impl conflict
+errors, orphan impl errors when homes are known, conservative
+resource-containing aggregate metadata, and first-pass resource function
+boundary diagnostics. Imported semantic Env effects still require loaded typed
+export declarations; the syntactic module surface intentionally does not invent
+that information.
+`compiler_imports.brp` ports pure import-registration bookkeeping over parsed
+imports and module surfaces: imported modules, qualified aliases, selective and
+renamed imports, private/missing symbol diagnostics, duplicate local-name
+diagnostics, imported-name bindings for later Core flattening, and imported
+type homes. It deliberately does not mutate semantic Env data yet; declaration
+registration of imported Env facts remains later typecheck-first-pass work.
 `compiler_context.brp` is the first explicit per-compilation context model for
 the Blorp-owned frontend. It carries module-origin policy, type-home ambiguity,
 resource cleanup metadata, trait-home conflict reporting, definition-id counters,

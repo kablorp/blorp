@@ -166,9 +166,6 @@ let () =
         (fun (name, cases) -> ("CoreConsumeSpecialize." ^ name, cases))
         Test_core_consume_specialize.suite
     @ List.map
-        (fun (name, cases) -> ("CoreTensorStorageProducer." ^ name, cases))
-        Test_core_tensor_storage_producer.suite
-    @ List.map
         (fun (name, cases) -> ("CoreTensorType." ^ name, cases))
         Test_core_tensor_type.suite
     @ List.map

@@ -737,6 +737,35 @@ Deletion point:
 Goal: port declaration-boundary checks and environment construction before
 expression inference.
 
+Status: complete for the Blorp-owned first-pass/indexing scope. The explicit
+Blorp typecheck state substrate is in place in
+`compiler/blorp/compiler_typecheck_state.brp`, with focused tests for
+module-origin policy, import binding deduplication, module-alias/selective
+import namespace collisions, known type/resource pre-scan state, type-home
+precedence, callable ids, private impl tracking, type-home matching, and private
+impl conflict lookup. The top-level pre-scan is also in place in
+`compiler/blorp/compiler_typecheck_decl.brp`, covering known type/resource
+names, constructor names, function/variable/trait namespace entries,
+foreign-block functions, and private wrappers. Pure import registration is in
+place in `compiler/blorp/compiler_imports.brp`, covering qualified aliases,
+selective and renamed imports, private/missing symbol diagnostics, duplicate
+local-name diagnostics, import bindings, and imported type homes over Blorp
+module surfaces. Source type-expression projection is in place in
+`compiler/blorp/compiler_typecheck_types.brp`. Semantic
+declaration-registration slices are in place for local union/enum,
+builtin/resource type, record/struct, type-alias, global variable, source
+function, foreign function, trait, and source impl declarations. These slices
+populate Env type/record/alias/constructor/function/variable/trait/impl facts,
+record and trait type homes, callable ids, bare trait-method bindings, public
+impl indexes, private impl indexes, simple enum/struct/trait boundary errors,
+foreign-origin errors, source-level impl coherence errors, orphan impl errors
+when both homes are known, conservative resource-containing aggregate metadata,
+and first-pass resource function boundary diagnostics. Unannotated function
+return and parameter slots currently project to `Void` until the inference slice
+owns source signatures. Imported declaration Env effects that require full
+typed export declarations remain part of the loaded-module/signature bridge
+rather than the syntactic module-surface import slice.
+
 OCaml references:
 
 - `compiler/lib/typecheck.ml`
@@ -780,22 +809,27 @@ OCaml references:
 
 Blorp references:
 
-- future `compiler_typecheck_state.brp`
-- future `compiler_typecheck_decl.brp`
-- future `compiler_imports.brp`
-- future `compiler_trait_env.brp`
+- `compiler/blorp/compiler_typecheck_state.brp`
+- `compiler/blorp/compiler_typecheck_types.brp`
+- `compiler/blorp/compiler_typecheck_decl.brp`
+- `compiler/blorp/compiler_imports.brp`
 
 Implementation steps:
 
 - Port `check_state` as explicit Blorp data. Keep module aliases, imported
   names, import bindings, module origin, private impls, known type names,
   known resource types, top-level names, type homes, callable ids, and
-  type-shape memo in one state value.
-- Port top-level pre-scans before imports:
+  type-shape memo in one state value. This state substrate is implemented in
+  `compiler_typecheck_state.brp`.
+- Port top-level pre-scans before imports. This is implemented in
+  `compiler_typecheck_decl.brp`:
   - known type names,
   - resource type names,
   - top-level namespace names,
-  - builtin/resource legality by module origin.
+  - foreign-block function names,
+  - private-wrapper contents.
+  Builtin/resource legality by module origin remains part of semantic
+  declaration registration.
 - Port import registration using the Blorp module graph:
   - qualified aliases,
   - selective imports,
@@ -803,6 +837,8 @@ Implementation steps:
   - private symbol rejection,
   - duplicate local names,
   - import bindings for Core flattening.
+  This pure bookkeeping slice is implemented in `compiler_imports.brp`; imported
+  declaration Env effects remain part of semantic declaration registration.
 - Port declaration registration in the current `first_pass` order:
   - records/structs,
   - unions/enums/resource/builtin types,
@@ -810,12 +846,22 @@ Implementation steps:
   - globals,
   - functions,
   - foreign functions,
-  - traits,
-  - impl headers and methods,
-  - private wrappers.
-- Port trait/impl registration with context-owned indexes.
+  - traits.
+  These local Env-registration slices are implemented in
+  `compiler_typecheck_decl.brp`; source-signature inference remains part of
+  checkpoint 6, and imported declaration Env effects require the loaded-module
+  signature bridge.
+- Port impl registration with context-owned indexes. Trait definition indexing
+  and collision-checked bare method registration are covered by
+  `compiler_typecheck_decl.brp`. Source impl headers now register public impl
+  instances, private impl instances, exact source-level coherence conflicts, and
+  orphan diagnostics when the trait and type homes are both known. Full impl
+  method validation and default-method synthesis remain checkpoint 6 work,
+  matching the OCaml second-pass boundary.
 - Port orphan/coherence checks and cross-module coherence over source-level
-  impls.
+  impls. Source-module orphan and exact duplicate checks are implemented for
+  first-pass registration. Whole-graph cross-module coherence remains tied to
+  typed loaded-module signatures.
 - Port prelude import insertion with self-import guards.
 - Keep typechecking loaded modules separate from typechecking the explicit
   target until the whole module graph is Blorp-owned.
@@ -846,7 +892,12 @@ Tests:
 - `tests/test_compiler/typecheck/should_fail/visibility_*.brp`
 - `tests/test_compiler/typecheck/should_fail/orphan*.brp`
 - `tests/test_compiler/typecheck/should_pass/std_builtin_declarations.brp`
-- New Blorp tests for declaration indexing and import registration.
+- `compiler/blorp/tests/test_compiler_typecheck_state.brp`
+- `compiler/blorp/tests/test_compiler_typecheck_types.brp`
+- `compiler/blorp/tests/test_compiler_typecheck_decl.brp`
+- `compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp`
+- `compiler/blorp/tests/test_zz_compiler_typecheck_resource_decl.brp`
+- `compiler/blorp/tests/test_compiler_imports.brp`
 
 Deletion point:
 
@@ -1305,7 +1356,6 @@ Tests:
   - `compiler/test/test_core_collection_pipeline.ml`
   - `compiler/test/test_core_parallel_tensor_pipeline.ml`
   - `compiler/test/test_core_tensor_type.ml`
-  - `compiler/test/test_core_tensor_storage_producer.ml`
   - `compiler/test/test_core_tuple_sroa.ml`
   - `compiler/test/test_core_specialize.ml`
   - `compiler/test/test_core_dce.ml`
@@ -1507,7 +1557,6 @@ OCaml references:
 - `compiler/lib/package_artifact.ml`
 - `compiler/lib/package_cache*.ml`
 - `compiler/lib/package_config.ml`
-- `compiler/lib/embedded_formatter.ml`
 
 Blorp references:
 

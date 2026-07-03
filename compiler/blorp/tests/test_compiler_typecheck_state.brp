@@ -1,0 +1,247 @@
+import:
+	../compiler_context: CompilerModuleOrigin(CompilerSourcePackageModule)
+	../compiler_env: compiler_impl_instance
+	../compiler_type: compiler_type_int
+	../compiler_typecheck_state:
+		CompilerTopLevelNameKind(
+			CompilerTopLevelFunction,
+			CompilerTopLevelTrait,
+			CompilerTopLevelType,
+		),
+		compiler_callable_source_loc,
+		compiler_func_callable_key,
+		compiler_top_level_name_kind_label,
+		compiler_typecheck_state_add_import_binding,
+		compiler_typecheck_state_add_imported_module,
+		compiler_typecheck_state_add_known_resource_type_name,
+		compiler_typecheck_state_add_known_type_name,
+		compiler_typecheck_state_add_private_impl,
+		compiler_typecheck_state_allows_builtin,
+		compiler_typecheck_state_allows_foreign,
+		compiler_typecheck_state_empty,
+		compiler_typecheck_state_find_func_callable_id,
+		compiler_typecheck_state_find_module_alias,
+		compiler_typecheck_state_find_private_impl_conflict,
+		compiler_typecheck_state_find_top_level_name,
+		compiler_typecheck_state_find_type_home,
+		compiler_typecheck_state_for_origin,
+		compiler_typecheck_state_has_import_binding,
+		compiler_typecheck_state_has_imported_module,
+		compiler_typecheck_state_has_known_resource_type_name,
+		compiler_typecheck_state_has_known_type_name,
+		compiler_typecheck_state_is_stdlib,
+		compiler_typecheck_state_record_func_callable_id,
+		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_register_imported_name,
+		compiler_typecheck_state_register_module_alias,
+		compiler_typecheck_state_remember_top_level_name,
+		compiler_typecheck_state_stdlib,
+		compiler_typecheck_state_type_home_matches,
+		compiler_typecheck_state_with_debug_calls,
+	test: TestSuite
+
+
+func test_state_initialization_and_origin_policy() -> Bool:
+	user_state = compiler_typecheck_state_empty()
+	std_state = compiler_typecheck_state_stdlib()
+	source_package_state = compiler_typecheck_state_for_origin(
+		CompilerSourcePackageModule("pkg/demo"),
+	)
+	debug_state = compiler_typecheck_state_with_debug_calls(user_state, True)
+
+	(
+		not compiler_typecheck_state_allows_builtin(user_state)
+		and compiler_typecheck_state_allows_foreign(user_state)
+		and compiler_typecheck_state_allows_builtin(std_state)
+		and not compiler_typecheck_state_allows_foreign(std_state)
+		and not compiler_typecheck_state_allows_builtin(source_package_state)
+		and not compiler_typecheck_state_allows_foreign(source_package_state)
+		and not user_state.allow_debug_only_calls
+		and debug_state.allow_debug_only_calls
+		and compiler_typecheck_state_is_stdlib(std_state)
+	)
+
+
+func test_imported_modules_and_import_bindings_are_deduped() -> Bool:
+	state = compiler_typecheck_state_empty()
+	var with_modules = compiler_typecheck_state_add_imported_module(state, "std/list")
+	with_modules = compiler_typecheck_state_add_imported_module(with_modules, "std/list")
+	with_modules = compiler_typecheck_state_add_imported_module(with_modules, "std/string")
+
+	var with_bindings = compiler_typecheck_state_add_import_binding(
+		with_modules,
+		"List",
+		"std/list",
+		None,
+	)
+	with_bindings = compiler_typecheck_state_add_import_binding(
+		with_bindings,
+		"List",
+		"std/list",
+		None,
+	)
+	with_bindings = compiler_typecheck_state_add_import_binding(
+		with_bindings,
+		"map",
+		"std/list",
+		Some("map"),
+	)
+
+	(
+		with_bindings.imported_modules.length() == 2
+		and compiler_typecheck_state_has_imported_module(with_bindings, "std/list")
+		and compiler_typecheck_state_has_imported_module(with_bindings, "std/string")
+		and with_bindings.import_bindings.length() == 2
+		and compiler_typecheck_state_has_import_binding(with_bindings, "List", "std/list", None)
+		and compiler_typecheck_state_has_import_binding(
+			with_bindings,
+			"map",
+			"std/list",
+			Some("map"),
+		)
+	)
+
+
+func test_module_alias_and_imported_name_namespace_collisions() -> Bool:
+	with_top_level = compiler_typecheck_state_remember_top_level_name(
+		compiler_typecheck_state_empty(),
+		"Result",
+		CompilerTopLevelType,
+	)
+	alias_conflict = compiler_typecheck_state_register_module_alias(
+		with_top_level,
+		"Result",
+		"std/result",
+	)
+	alias_ok = compiler_typecheck_state_register_module_alias(with_top_level, "List", "std/list")
+	alias_repeat = compiler_typecheck_state_register_module_alias(alias_ok, "List", "std/list")
+	alias_rebind = compiler_typecheck_state_register_module_alias(
+		alias_repeat,
+		"List",
+		"other/list",
+	)
+	import_conflict = compiler_typecheck_state_register_imported_name(
+		alias_ok,
+		"List",
+		"std/list",
+		"List",
+	)
+	import_ok = compiler_typecheck_state_register_imported_name(alias_ok, "map", "std/list", "map")
+	import_duplicate = compiler_typecheck_state_register_imported_name(
+		import_ok.state,
+		"map",
+		"std/list",
+		"map",
+	)
+
+	(
+		compiler_typecheck_state_find_top_level_name(
+			with_top_level,
+			"Result",
+		) == Some(CompilerTopLevelType)
+		and compiler_top_level_name_kind_label(CompilerTopLevelTrait) == "trait"
+		and alias_conflict.errors.length() == 1
+		and compiler_typecheck_state_find_module_alias(alias_ok, "List") == Some("std/list")
+		and alias_repeat.errors.length() == 0
+		and alias_repeat.module_aliases.length() == 1
+		and alias_rebind.errors.length() == 1
+		and import_conflict.registered == False
+		and import_conflict.state.errors.length() == 1
+		and import_ok.registered
+		and import_ok.state.imported_names.length() == 1
+		and import_duplicate.registered == False
+		and import_duplicate.state.errors.length() == 1
+	)
+
+
+func test_known_names_and_type_home_precedence() -> Bool:
+	var state = compiler_typecheck_state_add_known_type_name(
+		compiler_typecheck_state_empty(),
+		"Widget",
+	)
+	state = compiler_typecheck_state_add_known_resource_type_name(state, "Reader")
+	state = compiler_typecheck_state_remember_top_level_name(
+		state,
+		"main",
+		CompilerTopLevelFunction,
+	)
+	imported_home = compiler_typecheck_state_record_type_home(state, "Widget", "pkg/widgets", True)
+	ignored_import = compiler_typecheck_state_record_type_home(
+		imported_home,
+		"Widget",
+		"pkg/other_widgets",
+		True,
+	)
+	local_home = compiler_typecheck_state_record_type_home(
+		ignored_import,
+		"Widget",
+		"app/main",
+		False,
+	)
+
+	(
+		compiler_typecheck_state_has_known_type_name(local_home, "Widget")
+		and compiler_typecheck_state_has_known_type_name(local_home, "Reader")
+		and compiler_typecheck_state_has_known_resource_type_name(local_home, "Reader")
+		and compiler_typecheck_state_find_top_level_name(
+			local_home,
+			"main",
+		) == Some(CompilerTopLevelFunction)
+		and compiler_typecheck_state_find_type_home(imported_home, "Widget") == Some("pkg/widgets")
+		and compiler_typecheck_state_find_type_home(ignored_import, "Widget") == Some("pkg/widgets")
+		and compiler_typecheck_state_find_type_home(local_home, "Widget") == Some("app/main")
+		and compiler_typecheck_state_type_home_matches(local_home, "Widget", "app/main")
+	)
+
+
+func test_callable_ids_and_private_impls_are_state_local() -> Bool:
+	key = compiler_func_callable_key(
+		"render",
+		compiler_callable_source_loc(10, 2, 12, 1, Some("app.brp")),
+	)
+	other_key = compiler_func_callable_key(
+		"render",
+		compiler_callable_source_loc(20, 2, 22, 1, Some("app.brp")),
+	)
+	instance = compiler_impl_instance(7, "Display", compiler_type_int(), [], False)
+	var with_id = compiler_typecheck_state_record_func_callable_id(
+		compiler_typecheck_state_empty(),
+		key,
+		4,
+	)
+	with_id = compiler_typecheck_state_record_func_callable_id(with_id, key, 5)
+	with_id = compiler_typecheck_state_record_func_callable_id(with_id, other_key, 6)
+	with_id = compiler_typecheck_state_add_private_impl(with_id, instance)
+	conflict = compiler_typecheck_state_find_private_impl_conflict(with_id, instance)
+
+	(
+		compiler_typecheck_state_find_func_callable_id(with_id, key) == Some(5)
+		and compiler_typecheck_state_find_func_callable_id(with_id, other_key) == Some(6)
+		and with_id.func_callable_ids.length() == 2
+		and with_id.private_impls.length() == 1
+		and with_id.private_impls
+			.get(0)
+			.get_or(instance).def_id == 7
+		and conflict.is_some()
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler typecheck state substrate",
+	tests = [
+		("state initialization and origin policy", test_state_initialization_and_origin_policy),
+		(
+			"imported modules and import bindings are deduped",
+			test_imported_modules_and_import_bindings_are_deduped,
+		),
+		(
+			"module alias and imported name namespace collisions",
+			test_module_alias_and_imported_name_namespace_collisions,
+		),
+		("known names and type home precedence", test_known_names_and_type_home_precedence),
+		(
+			"callable ids and private impls are state local",
+			test_callable_ids_and_private_impls_are_state_local,
+		),
+	]
+}

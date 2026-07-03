@@ -1,0 +1,1128 @@
+-- First-pass declaration helpers for Blorp-owned typechecking.
+--
+-- This module owns AST walking. The state module stays a plain value model.
+import:
+	compiler_env:
+		CompilerEnv,
+		CompilerFieldDecl,
+		CompilerFuncOrigin(CompilerForeignFunc, CompilerUserDefinedFunc),
+		CompilerImplInstance,
+		CompilerPurity(CompilerImpure, CompilerPure),
+		CompilerResourceArgPolicy(CompilerAllowResourceArgs, CompilerRejectResourceArgs),
+		CompilerResourceResultPolicy(CompilerResourceResultDependent, CompilerResourceResultOrdinary),
+		CompilerTraitMethodSig,
+		CompilerTypeKind(
+			CompilerTypeBuiltin,
+			CompilerTypeEnum,
+			CompilerTypeResource,
+			CompilerTypeUnion,
+		),
+		CompilerVarMutability(CompilerImmutableBinding, CompilerMutableBinding),
+		CompilerVarOrigin(CompilerLetBinding),
+		CompilerVariantDef,
+		compiler_env_add_alias,
+		compiler_env_add_func_with_info,
+		compiler_env_add_impl,
+		compiler_env_add_opaque_alias,
+		compiler_env_add_record,
+		compiler_env_add_trait,
+		compiler_env_add_trait_function,
+		compiler_env_add_type,
+		compiler_env_add_var_with_details,
+		compiler_env_find_conflicting_impl,
+		compiler_env_get_function_trait,
+		compiler_env_get_trait,
+		compiler_env_mint_def_id,
+		compiler_env_trait_function_collision,
+		compiler_env_trait_methods_with_declaring_trait,
+		compiler_func_symbol,
+		compiler_impl_instance,
+		compiler_trait_def_with_details,
+		compiler_trait_method_sig_with_details,
+	compiler_parsed_ast:
+		ParsedBuiltinTypeDecl,
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			ParsedErrorDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedDimConstraint,
+		ParsedFieldDecl,
+		ParsedForeignFunctionDecl,
+		ParsedFunctionAnnotation(ParsedDebugOnlyAnnotation, ParsedResourceResultOrdinaryAnnotation),
+		ParsedFunctionDecl,
+		ParsedImplDecl,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
+		ParsedProgram,
+		ParsedExpr(ParsedBuiltinExpr),
+		ParsedRecordDecl,
+		ParsedTraitDecl,
+		ParsedTraitMethodDecl,
+		ParsedTypeAliasDecl,
+		ParsedTypeExpr,
+		ParsedTypeParamDecl,
+		ParsedUnionDecl,
+		ParsedVarDecl,
+		ParsedVariantDecl,
+	compiler_refinement: compiler_unrefined_binding
+	compiler_source: CompilerSourceSpan
+	compiler_type:
+		CompilerType(
+			CompilerArrayType,
+			CompilerDimOpType,
+			CompilerFunctionType,
+			CompilerNamedType,
+			CompilerRangeType,
+			CompilerTupleType,
+		),
+		compiler_type_void,
+	compiler_typecheck_state:
+		CompilerCallableSourceLoc,
+		CompilerFuncCallableKey,
+		CompilerTopLevelNameKind(
+			CompilerTopLevelConstructor,
+			CompilerTopLevelFunction,
+			CompilerTopLevelTrait,
+			CompilerTopLevelType,
+			CompilerTopLevelVariable,
+		),
+		CompilerTypecheckState,
+		compiler_callable_source_loc,
+		compiler_func_callable_key,
+		compiler_typecheck_state_add_error,
+		compiler_typecheck_state_add_known_resource_type_name,
+		compiler_typecheck_state_add_known_type_name,
+		compiler_typecheck_state_add_private_impl,
+		compiler_typecheck_state_allows_builtin,
+		compiler_typecheck_state_allows_foreign,
+		compiler_typecheck_state_find_private_impl_conflict,
+		compiler_typecheck_state_find_type_home,
+		compiler_typecheck_state_has_known_resource_type_name,
+		compiler_typecheck_state_is_stdlib,
+		compiler_typecheck_state_record_func_callable_id,
+		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_remember_top_level_name,
+		compiler_typecheck_state_type_home_matches,
+	compiler_typecheck_types:
+		compiler_bound_type_params_from_parsed,
+		compiler_type_from_parsed_type_expr,
+		compiler_type_param_names,
+
+
+private pure func compiler_typecheck_state_with_env(
+	state: CompilerTypecheckState,
+	env: CompilerEnv,
+) -> CompilerTypecheckState:
+	{ state | env = env }
+
+
+private pure func compiler_typecheck_type_contains_resource(
+	state: CompilerTypecheckState,
+	typ: CompilerType,
+) -> Bool:
+	match typ:
+		CompilerNamedType(name, args):
+			(
+				compiler_typecheck_state_has_known_resource_type_name(state, name)
+				or args.any(func(arg): compiler_typecheck_type_contains_resource(state, arg))
+			)
+		CompilerArrayType(element, dims):
+			(
+				compiler_typecheck_type_contains_resource(state, element)
+				or dims.any(func(dim): compiler_typecheck_type_contains_resource(state, dim))
+			)
+		CompilerFunctionType(_, params, return_type):
+			(
+				params.any(func(param): compiler_typecheck_type_contains_resource(state, param))
+				or compiler_typecheck_type_contains_resource(state, return_type)
+			)
+		CompilerTupleType(elements):
+			elements.any(func(element): compiler_typecheck_type_contains_resource(state, element))
+		CompilerRangeType(inner):
+			compiler_typecheck_type_contains_resource(state, inner)
+		CompilerDimOpType(_, left, right):
+			(
+				compiler_typecheck_type_contains_resource(state, left)
+				or compiler_typecheck_type_contains_resource(state, right)
+			)
+		_:
+			False
+
+
+private pure func compiler_field_from_parsed(field: ParsedFieldDecl) -> CompilerFieldDecl:
+	{
+		name = field.name.text,
+		field_type = compiler_type_from_parsed_type_expr(field.type_expr)
+	}
+
+
+private pure func compiler_variant_from_parsed(
+	variant: ParsedVariantDecl,
+	tag: Int,
+) -> CompilerVariantDef:
+	{
+		name = variant.name.text,
+		fields = variant.fields.map(compiler_type_from_parsed_type_expr),
+		tag = tag
+	}
+
+
+private pure func compiler_variants_from_parsed(
+	variants: List[ParsedVariantDecl],
+) -> List[CompilerVariantDef]:
+	var result: List[CompilerVariantDef] = []
+	var tag: Int = 0
+
+	for variant in variants:
+		result = result.append(compiler_variant_from_parsed(variant, tag))
+		tag += 1
+
+	result
+
+
+private pure func compiler_variant_contains_resource(
+	state: CompilerTypecheckState,
+	variant: CompilerVariantDef,
+) -> Bool:
+	variant.fields.any(func(field): compiler_typecheck_type_contains_resource(state, field))
+
+
+private pure func compiler_variants_contain_resource(
+	state: CompilerTypecheckState,
+	variants: List[CompilerVariantDef],
+) -> Bool:
+	var result: Bool = False
+
+	for variant in variants:
+		if compiler_variant_contains_resource(state, variant):
+			result = True
+			break
+
+	result
+
+
+private pure func compiler_fields_contain_resource(
+	state: CompilerTypecheckState,
+	fields: List[CompilerFieldDecl],
+) -> Bool:
+	fields.any(func(field): compiler_typecheck_type_contains_resource(state, field.field_type))
+
+
+private pure func compiler_type_from_optional_parsed_type_expr(
+	type_expr: Option[ParsedTypeExpr],
+) -> CompilerType:
+	match type_expr:
+		Some(typ):
+			compiler_type_from_parsed_type_expr(typ)
+		None:
+			compiler_type_void()
+
+
+private pure func compiler_param_type_from_parsed(param: ParsedParam) -> CompilerType:
+	compiler_type_from_optional_parsed_type_expr(param.type_expr)
+
+
+private pure func compiler_param_name_from_parsed(param: ParsedParam) -> Option[String]:
+	match param.binder:
+		ParsedParamNameBinder(name):
+			Some(name.text)
+		ParsedParamWildcardBinder(_):
+			None
+		ParsedParamTupleBinder(_, _):
+			None
+
+
+private pure func compiler_param_types_from_parsed(params: List[ParsedParam]) -> List[CompilerType]:
+	params.map(compiler_param_type_from_parsed)
+
+
+private pure func compiler_param_names_from_parsed(
+	params: List[ParsedParam],
+) -> List[Option[String]]:
+	params.map(compiler_param_name_from_parsed)
+
+
+private pure func compiler_typed_param_types_from_parsed(
+	params: List[ParsedParam],
+) -> List[CompilerType]:
+	params.filter_map(func(param):
+		match param.type_expr:
+			Some(type_expr):
+				Some(compiler_type_from_parsed_type_expr(type_expr))
+			None:
+				None
+	)
+
+
+private pure func compiler_dim_constraint_from_parsed(
+	constraint: ParsedDimConstraint,
+) -> (CompilerType, CompilerType):
+	(
+		compiler_type_from_parsed_type_expr(constraint.left),
+		compiler_type_from_parsed_type_expr(constraint.right),
+	)
+
+
+private pure func compiler_dim_constraints_from_parsed(
+	constraints: List[ParsedDimConstraint],
+) -> List[(CompilerType, CompilerType)]:
+	constraints.map(compiler_dim_constraint_from_parsed)
+
+
+private pure func compiler_purity_from_parsed(is_pure: Bool) -> CompilerPurity:
+	if is_pure:
+		CompilerPure
+	else:
+		CompilerImpure
+
+
+private pure func compiler_function_debug_only(annotations: List[ParsedFunctionAnnotation]) -> Bool:
+	annotations.contains(ParsedDebugOnlyAnnotation)
+
+
+private pure func compiler_function_resource_result_ordinary(
+	annotations: List[ParsedFunctionAnnotation],
+) -> Bool:
+	annotations.contains(ParsedResourceResultOrdinaryAnnotation)
+
+
+private pure func compiler_function_has_builtin_body(body: Option[ParsedExpr]) -> Bool:
+	match body:
+		Some(ParsedBuiltinExpr(_, _)):
+			True
+		_:
+			False
+
+
+private pure func compiler_function_resource_arg_policy(
+	state: CompilerTypecheckState,
+	param_types: List[CompilerType],
+	annotations: List[ParsedFunctionAnnotation],
+	body: Option[ParsedExpr],
+) -> CompilerResourceArgPolicy:
+	if (
+		compiler_function_has_builtin_body(body)
+		and param_types.any(func(param_type): compiler_typecheck_type_contains_resource(state, param_type))
+	):
+		result_policy: CompilerResourceResultPolicy = if compiler_function_resource_result_ordinary(
+			annotations,
+		):
+			CompilerResourceResultOrdinary
+		else:
+			CompilerResourceResultDependent
+
+		CompilerAllowResourceArgs(result_policy)
+	else:
+		CompilerRejectResourceArgs
+
+
+private pure func compiler_validate_resource_result_annotation(
+	state: CompilerTypecheckState,
+	name: String,
+	param_types: List[CompilerType],
+	return_type: CompilerType,
+	annotations: List[ParsedFunctionAnnotation],
+	body: Option[ParsedExpr],
+) -> CompilerTypecheckState:
+	if not compiler_function_resource_result_ordinary(annotations):
+		state
+	else if not compiler_function_has_builtin_body(body):
+		compiler_typecheck_state_add_error(
+			state,
+			"@resource_result_ordinary can only be used on builtin resource operation declarations",
+		)
+	else if compiler_typecheck_type_contains_resource(state, return_type):
+		compiler_typecheck_state_add_error(
+			state,
+			"@resource_result_ordinary cannot be used on builtin '" + name + "' because its return type contains a resource",
+		)
+	else if not param_types.any(func(param_type): compiler_typecheck_type_contains_resource(state, param_type)):
+		compiler_typecheck_state_add_error(
+			state,
+			"@resource_result_ordinary requires builtin '" + name + "' to have a direct resource parameter",
+		)
+	else:
+		state
+
+
+private pure func compiler_validate_resource_signature_boundary(
+	state: CompilerTypecheckState,
+	name: String,
+	params: List[ParsedParam],
+	return_type: CompilerType,
+	body: Option[ParsedExpr],
+) -> CompilerTypecheckState:
+	if compiler_function_has_builtin_body(body):
+		state
+	else:
+		var next = state
+
+		for param in params:
+			param_type = compiler_param_type_from_parsed(param)
+			if compiler_typecheck_type_contains_resource(next, param_type):
+				param_name: String = compiler_param_name_from_parsed(param).get_or("_")
+				next = compiler_typecheck_state_add_error(
+					next,
+					"Function '" + name + "' parameter '" + param_name + "' cannot contain a resource type",
+				)
+
+		if compiler_typecheck_type_contains_resource(next, return_type):
+			compiler_typecheck_state_add_error(
+				next,
+				"Function '" + name + "' return type cannot contain a resource type",
+			)
+		else:
+			next
+
+
+private pure func compiler_callable_loc_from_span(
+	span: CompilerSourceSpan,
+) -> CompilerCallableSourceLoc:
+	compiler_callable_source_loc(
+		span.start_line,
+		span.start_column,
+		span.end_line,
+		span.end_column,
+		Some(span.path),
+	)
+
+
+private pure func compiler_callable_key_from_span(
+	name: String,
+	span: CompilerSourceSpan,
+) -> CompilerFuncCallableKey:
+	compiler_func_callable_key(name, compiler_callable_loc_from_span(span))
+
+
+private pure func compiler_supertrait_names_from_parsed(
+	supertraits: List[ParsedIdentifier],
+) -> List[String]:
+	supertraits.map(func(name): name.text)
+
+
+private pure func compiler_trait_method_from_parsed(
+	method: ParsedTraitMethodDecl,
+) -> CompilerTraitMethodSig:
+	compiler_trait_method_sig_with_details(
+		method.name.text,
+		compiler_typed_param_types_from_parsed(method.params),
+		compiler_type_from_optional_parsed_type_expr(method.return_type),
+		method.is_pure,
+		method.body.is_some(),
+		compiler_param_names_from_parsed(method.params),
+	)
+
+
+private pure func compiler_trait_methods_from_parsed(
+	methods: List[ParsedTraitMethodDecl],
+) -> List[CompilerTraitMethodSig]:
+	methods.map(compiler_trait_method_from_parsed)
+
+
+pure func compiler_typecheck_prescan_decl(
+	state: CompilerTypecheckState,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		RecordParsedDecl(record_decl):
+			compiler_typecheck_state_remember_top_level_name(
+				compiler_typecheck_state_add_known_type_name(state, record_decl.name.text),
+				record_decl.name.text,
+				CompilerTopLevelType,
+			)
+		UnionParsedDecl(union_decl):
+			var next = compiler_typecheck_state_remember_top_level_name(
+				compiler_typecheck_state_add_known_type_name(state, union_decl.name.text),
+				union_decl.name.text,
+				CompilerTopLevelType,
+			)
+
+			for variant in union_decl.variants:
+				next = compiler_typecheck_state_remember_top_level_name(
+					next,
+					variant.name.text,
+					CompilerTopLevelConstructor,
+				)
+
+			next
+		BuiltinTypeParsedDecl(type_decl):
+			with_type = if type_decl.is_resource:
+				compiler_typecheck_state_add_known_resource_type_name(state, type_decl.name.text)
+			else:
+				compiler_typecheck_state_add_known_type_name(state, type_decl.name.text)
+
+			compiler_typecheck_state_remember_top_level_name(
+				with_type,
+				type_decl.name.text,
+				CompilerTopLevelType,
+			)
+		TypeAliasParsedDecl(alias_decl):
+			compiler_typecheck_state_remember_top_level_name(
+				compiler_typecheck_state_add_known_type_name(state, alias_decl.name.text),
+				alias_decl.name.text,
+				CompilerTopLevelType,
+			)
+		FunctionParsedDecl(function_decl):
+			compiler_typecheck_state_remember_top_level_name(
+				state,
+				function_decl.name.text,
+				CompilerTopLevelFunction,
+			)
+		VarParsedDecl(var_decl):
+			compiler_typecheck_state_remember_top_level_name(
+				state,
+				var_decl.name.text,
+				CompilerTopLevelVariable,
+			)
+		TraitParsedDecl(trait_decl):
+			compiler_typecheck_state_remember_top_level_name(
+				state,
+				trait_decl.name.text,
+				CompilerTopLevelTrait,
+			)
+		ForeignBlockParsedDecl(_, functions, _):
+			var next = state
+
+			for function_decl in functions:
+				next = compiler_typecheck_state_remember_top_level_name(
+					next,
+					function_decl.name.text,
+					CompilerTopLevelFunction,
+				)
+
+			next
+		PrivateParsedDecl(inner, _):
+			compiler_typecheck_prescan_decl(state, inner)
+		ImportBlockParsedDecl(_, _):
+			state
+		ImplParsedDecl(_):
+			state
+		ParsedErrorDecl(_):
+			state
+
+
+pure func compiler_typecheck_prescan_decls(
+	state: CompilerTypecheckState,
+	decls: List[ParsedDecl],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for decl in decls:
+		next = compiler_typecheck_prescan_decl(next, decl)
+
+	next
+
+
+pure func compiler_typecheck_prescan_program(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	compiler_typecheck_prescan_decls(state, program.decls)
+
+
+private pure func compiler_register_union_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	union_decl: ParsedUnionDecl,
+) -> CompilerTypecheckState:
+	var next = if union_decl.is_enum and union_decl.type_params.length() > 0:
+		compiler_typecheck_state_add_error(
+			state,
+			"Enum '" + union_decl.name.text + "' cannot have type parameters",
+		)
+	else:
+		state
+
+	if union_decl.is_enum:
+		for variant in union_decl.variants:
+			if variant.fields.length() > 0:
+				next = compiler_typecheck_state_add_error(
+					next,
+					"Enum variant '" + variant.name.text + "' cannot have fields; use 'union' instead",
+				)
+
+	variants: List[CompilerVariantDef] = compiler_variants_from_parsed(union_decl.variants)
+
+	type_kind: CompilerTypeKind = if union_decl.is_enum:
+		CompilerTypeEnum
+	else:
+		CompilerTypeUnion
+
+	contains_resource: Bool = compiler_variants_contain_resource(next, variants)
+	env: CompilerEnv = compiler_env_add_type(
+		next.env,
+		union_decl.name.text,
+		compiler_type_param_names(union_decl.type_params),
+		variants,
+		type_kind,
+		contains_resource,
+		True,
+	)
+	with_env = compiler_typecheck_state_with_env(next, env)
+	compiler_typecheck_state_record_type_home(with_env, union_decl.name.text, module_path, False)
+
+
+private pure func compiler_register_builtin_type_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	type_decl: ParsedBuiltinTypeDecl,
+) -> CompilerTypecheckState:
+	var next = if compiler_typecheck_state_allows_builtin(state):
+		state
+	else:
+		prefix: String = if type_decl.is_resource:
+			"resource type "
+		else:
+			"type "
+
+		compiler_typecheck_state_add_error(
+			state,
+			"'" + prefix + type_decl.name.text + " = builtin' can only be used in the standard library",
+		)
+
+	next = if type_decl.is_resource:
+		compiler_typecheck_state_add_known_resource_type_name(next, type_decl.name.text)
+	else:
+		compiler_typecheck_state_add_known_type_name(next, type_decl.name.text)
+
+	type_kind: CompilerTypeKind = if type_decl.is_resource:
+		CompilerTypeResource
+	else:
+		CompilerTypeBuiltin
+
+	env: CompilerEnv = compiler_env_add_type(
+		next.env,
+		type_decl.name.text,
+		compiler_type_param_names(type_decl.type_params),
+		[],
+		type_kind,
+		type_decl.is_resource,
+		False,
+	)
+	with_env = compiler_typecheck_state_with_env(next, env)
+	compiler_typecheck_state_record_type_home(with_env, type_decl.name.text, module_path, False)
+
+
+private pure func compiler_register_record_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	record_decl: ParsedRecordDecl,
+) -> CompilerTypecheckState:
+	var next = state
+
+	if record_decl.is_struct and record_decl.type_params.length() > 0:
+		next = compiler_typecheck_state_add_error(
+			next,
+			"Struct '" + record_decl.name.text + "' cannot have type parameters",
+		)
+
+	if record_decl.is_struct and record_decl.fields.length() == 0:
+		next = compiler_typecheck_state_add_error(
+			next,
+			"Struct '" + record_decl.name.text + "' must have at least one field",
+		)
+
+	fields: List[CompilerFieldDecl] = record_decl.fields.map(compiler_field_from_parsed)
+	env: CompilerEnv = compiler_env_add_record(
+		next.env,
+		record_decl.name.text,
+		compiler_type_param_names(record_decl.type_params),
+		fields,
+		record_decl.is_struct,
+		compiler_fields_contain_resource(next, fields),
+	)
+	with_env = compiler_typecheck_state_with_env(next, env)
+	compiler_typecheck_state_record_type_home(with_env, record_decl.name.text, module_path, False)
+
+
+private pure func compiler_register_type_alias_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	alias_decl: ParsedTypeAliasDecl,
+) -> CompilerTypecheckState:
+	target = compiler_type_from_parsed_type_expr(alias_decl.target)
+
+	env: CompilerEnv = if alias_decl.is_opaque:
+		compiler_env_add_opaque_alias(
+			state.env,
+			alias_decl.name.text,
+			compiler_type_param_names(alias_decl.type_params),
+			target,
+			Some(module_path),
+		)
+	else:
+		compiler_env_add_alias(
+			state.env,
+			alias_decl.name.text,
+			compiler_type_param_names(alias_decl.type_params),
+			target,
+		)
+
+	with_env = compiler_typecheck_state_with_env(
+		compiler_typecheck_state_add_known_type_name(state, alias_decl.name.text),
+		env,
+	)
+
+	if alias_decl.is_opaque:
+		compiler_typecheck_state_record_type_home(
+			with_env,
+			alias_decl.name.text,
+			module_path,
+			False,
+		)
+	else:
+		with_env
+
+
+pure func compiler_typecheck_register_type_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		RecordParsedDecl(record_decl):
+			compiler_register_record_decl(state, module_path, record_decl)
+		UnionParsedDecl(union_decl):
+			compiler_register_union_decl(state, module_path, union_decl)
+		BuiltinTypeParsedDecl(type_decl):
+			compiler_register_builtin_type_decl(state, module_path, type_decl)
+		TypeAliasParsedDecl(alias_decl):
+			compiler_register_type_alias_decl(state, module_path, alias_decl)
+		PrivateParsedDecl(inner, _):
+			compiler_typecheck_register_type_decl(state, module_path, inner)
+		_:
+			state
+
+
+pure func compiler_typecheck_register_type_decls(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for decl in decls:
+		next = compiler_typecheck_register_type_decl(next, module_path, decl)
+
+	next
+
+
+pure func compiler_typecheck_register_program_type_decls(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	compiler_typecheck_register_type_decls(state, program.source.module_name, program.decls)
+
+
+private pure func compiler_register_var_decl(
+	state: CompilerTypecheckState,
+	var_decl: ParsedVarDecl,
+) -> CompilerTypecheckState:
+	var_type: CompilerType = compiler_type_from_optional_parsed_type_expr(var_decl.type_expr)
+
+	source_type: Option[CompilerType] = match var_decl.type_expr:
+		Some(_):
+			Some(var_type)
+		None:
+			None
+
+	mutability: CompilerVarMutability = if var_decl.is_mutable:
+		CompilerMutableBinding
+	else:
+		CompilerImmutableBinding
+
+	env: CompilerEnv = compiler_env_add_var_with_details(
+		state.env,
+		var_decl.name.text,
+		var_type,
+		source_type,
+		mutability,
+		CompilerLetBinding,
+		compiler_unrefined_binding(),
+	)
+
+	compiler_typecheck_state_with_env(state, env)
+
+
+private pure func compiler_register_function_signature(
+	state: CompilerTypecheckState,
+	name: String,
+	params: List[ParsedParam],
+	return_type: CompilerType,
+	type_params: List[ParsedTypeParamDecl],
+	dim_constraints: List[ParsedDimConstraint],
+	is_pure: Bool,
+	annotations: List[ParsedFunctionAnnotation],
+	body: Option[ParsedExpr],
+	span: CompilerSourceSpan,
+	origin: CompilerFuncOrigin,
+) -> CompilerTypecheckState:
+	param_types: List[CompilerType] = compiler_param_types_from_parsed(params)
+	func_type: CompilerType = CompilerFunctionType(is_pure, param_types, return_type)
+	var next = compiler_validate_resource_result_annotation(
+		state,
+		name,
+		param_types,
+		return_type,
+		annotations,
+		body,
+	)
+	next = compiler_validate_resource_signature_boundary(next, name, params, return_type, body)
+
+	match compiler_env_mint_def_id(next.env):
+		(next_env, def_id):
+			env: CompilerEnv = compiler_env_add_func_with_info(
+				next_env,
+				name,
+				compiler_func_symbol(
+					def_id,
+					func_type,
+					compiler_bound_type_params_from_parsed(type_params),
+					compiler_param_names_from_parsed(params),
+					compiler_purity_from_parsed(is_pure),
+					origin,
+					compiler_function_resource_arg_policy(next, param_types, annotations, body),
+					None,
+					compiler_dim_constraints_from_parsed(dim_constraints),
+					None,
+					compiler_function_debug_only(annotations),
+				),
+			)
+			with_env = compiler_typecheck_state_with_env(next, env)
+			compiler_typecheck_state_record_func_callable_id(
+				with_env,
+				compiler_callable_key_from_span(name, span),
+				def_id,
+			)
+
+
+private pure func compiler_register_function_decl(
+	state: CompilerTypecheckState,
+	function_decl: ParsedFunctionDecl,
+) -> CompilerTypecheckState:
+	compiler_register_function_signature(
+		state,
+		function_decl.name.text,
+		function_decl.params,
+		compiler_type_from_optional_parsed_type_expr(function_decl.return_type),
+		function_decl.type_params,
+		function_decl.dim_constraints,
+		function_decl.is_pure,
+		function_decl.annotations,
+		function_decl.body,
+		function_decl.span,
+		CompilerUserDefinedFunc,
+	)
+
+
+private pure func compiler_register_foreign_function_decl(
+	state: CompilerTypecheckState,
+	function_decl: ParsedForeignFunctionDecl,
+) -> CompilerTypecheckState:
+	next = if compiler_typecheck_state_allows_foreign(state):
+		state
+	else:
+		message: String = if compiler_typecheck_state_is_stdlib(state):
+			"'foreign' declarations cannot be used in the standard library"
+		else:
+			"'foreign' declarations cannot be used in source packages"
+
+		compiler_typecheck_state_add_error(state, message)
+
+	compiler_register_function_signature(
+		next,
+		function_decl.name.text,
+		function_decl.params,
+		compiler_type_from_parsed_type_expr(function_decl.return_type),
+		[],
+		[],
+		function_decl.is_pure,
+		function_decl.annotations,
+		None,
+		function_decl.span,
+		CompilerForeignFunc,
+	)
+
+
+private pure func compiler_add_trait_function_checked(
+	state: CompilerTypecheckState,
+	func_name: String,
+	trait_name: String,
+) -> CompilerTypecheckState:
+	match compiler_env_trait_function_collision(state.env, func_name, trait_name):
+		Some(existing_trait):
+			compiler_typecheck_state_add_error(
+				state,
+				"method '" + func_name + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + trait_name + "'",
+			)
+		None:
+			if compiler_env_get_function_trait(state.env, func_name) == Some(trait_name):
+				state
+			else:
+				compiler_typecheck_state_with_env(
+					state,
+					compiler_env_add_trait_function(state.env, func_name, trait_name),
+				)
+
+
+private pure func compiler_validate_trait_method_param_types(
+	state: CompilerTypecheckState,
+	trait_decl: ParsedTraitDecl,
+) -> CompilerTypecheckState:
+	var next = state
+
+	for method in trait_decl.methods:
+		for param in method.params:
+			if param.type_expr.is_none():
+				param_name: String = compiler_param_name_from_parsed(param).get_or("_")
+				next = compiler_typecheck_state_add_error(
+					next,
+					"trait " + trait_decl.name.text + " method '" + method.name.text + "': parameter '" + param_name + "' must have an explicit type",
+				)
+
+	next
+
+
+private pure func compiler_register_trait_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	trait_decl: ParsedTraitDecl,
+) -> CompilerTypecheckState:
+	next = compiler_validate_trait_method_param_types(state, trait_decl)
+
+	match compiler_env_mint_def_id(next.env):
+		(next_env, def_id):
+			trait_def = compiler_trait_def_with_details(
+				def_id,
+				trait_decl.name.text,
+				compiler_type_param_names(trait_decl.type_params),
+				compiler_supertrait_names_from_parsed(trait_decl.supertraits),
+				compiler_trait_methods_from_parsed(trait_decl.methods),
+				Some(module_path),
+			)
+			env_with_trait = compiler_env_add_trait(next_env, trait_def)
+			var with_trait = compiler_typecheck_state_with_env(next, env_with_trait)
+
+			for method in trait_decl.methods:
+				with_trait = compiler_add_trait_function_checked(
+					with_trait,
+					method.name.text,
+					trait_decl.name.text,
+				)
+
+			for pair in compiler_env_trait_methods_with_declaring_trait(
+				with_trait.env,
+				trait_decl.name.text,
+			):
+				if pair[1] != trait_decl.name.text:
+					with_trait = compiler_add_trait_function_checked(with_trait, pair[0], pair[1])
+
+			with_trait
+
+
+private pure func compiler_impl_type_head_name(for_type: CompilerType) -> Option[String]:
+	match for_type:
+		CompilerNamedType(name, _):
+			Some(name)
+		_:
+			None
+
+
+private pure func compiler_impl_target_label(for_type: CompilerType) -> String:
+	compiler_impl_type_head_name(for_type).get_or("<non-named type>")
+
+
+private pure func compiler_impl_orphan_error_message(
+	state: CompilerTypecheckState,
+	module_path: String,
+	impl_decl: ParsedImplDecl,
+	for_type: CompilerType,
+) -> Option[String]:
+	trait_home: Option[String] = match compiler_env_get_trait(state.env, impl_decl.trait_name.text):
+		Some(trait_def):
+			trait_def.module_path
+		None:
+			None
+
+	type_home: Option[String] = match compiler_impl_type_head_name(for_type):
+		Some(type_name):
+			compiler_typecheck_state_find_type_home(state, type_name)
+		None:
+			None
+
+	match (trait_home, type_home):
+		(Some(trait_module), Some(type_module)):
+			if (
+				trait_module == module_path
+				or compiler_typecheck_state_type_home_matches(
+					state,
+					compiler_impl_target_label(for_type),
+					module_path,
+				)
+			):
+				None
+			else:
+				Some(
+					"orphan impl: '" + impl_decl.trait_name.text + " for " + compiler_impl_target_label(
+						for_type,
+					) + "' is not in the trait's module '" + trait_module + "' or the type's module '" + type_module + "'",
+				)
+		_:
+			None
+
+
+private pure func compiler_impl_conflict_message(
+	instance: CompilerImplInstance,
+) -> String:
+	"conflicting implementation of trait '" + instance.trait_name + "' for type '" + compiler_impl_target_label(
+		instance.for_type,
+	) + "'"
+
+
+private pure func compiler_add_source_impl_checked(
+	state: CompilerTypecheckState,
+	instance: CompilerImplInstance,
+) -> CompilerTypecheckState:
+	match compiler_env_find_conflicting_impl(state.env, instance):
+		Some(_):
+			compiler_typecheck_state_add_error(state, compiler_impl_conflict_message(instance))
+		None:
+			compiler_typecheck_state_with_env(state, compiler_env_add_impl(state.env, instance))
+
+
+private pure func compiler_add_private_impl_checked(
+	state: CompilerTypecheckState,
+	instance: CompilerImplInstance,
+) -> CompilerTypecheckState:
+	match compiler_env_find_conflicting_impl(state.env, instance):
+		Some(_):
+			compiler_typecheck_state_add_error(state, compiler_impl_conflict_message(instance))
+		None:
+			match compiler_typecheck_state_find_private_impl_conflict(state, instance):
+				Some(_):
+					compiler_typecheck_state_add_error(state, compiler_impl_conflict_message(instance))
+				None:
+					compiler_typecheck_state_add_private_impl(state, instance)
+
+
+private pure func compiler_register_impl_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	impl_decl: ParsedImplDecl,
+	is_private: Bool,
+) -> CompilerTypecheckState:
+	for_type: CompilerType = compiler_type_from_parsed_type_expr(impl_decl.for_type)
+	var next = match compiler_impl_orphan_error_message(state, module_path, impl_decl, for_type):
+		Some(message):
+			compiler_typecheck_state_add_error(state, message)
+		None:
+			state
+
+	match compiler_env_mint_def_id(next.env):
+		(next_env, def_id):
+			instance = compiler_impl_instance(
+				def_id,
+				impl_decl.trait_name.text,
+				for_type,
+				[],
+				False,
+			)
+			with_minted_env = compiler_typecheck_state_with_env(next, next_env)
+
+			if is_private:
+				compiler_add_private_impl_checked(with_minted_env, instance)
+			else:
+				compiler_add_source_impl_checked(with_minted_env, instance)
+
+
+pure func compiler_typecheck_register_signature_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			compiler_register_function_decl(state, function_decl)
+		VarParsedDecl(var_decl):
+			compiler_register_var_decl(state, var_decl)
+		ForeignBlockParsedDecl(_, functions, _):
+			var next = state
+
+			for function_decl in functions:
+				next = compiler_register_foreign_function_decl(next, function_decl)
+
+			next
+		TraitParsedDecl(trait_decl):
+			compiler_register_trait_decl(state, module_path, trait_decl)
+		PrivateParsedDecl(inner, _):
+			compiler_typecheck_register_signature_decl(state, module_path, inner)
+		_:
+			state
+
+
+pure func compiler_typecheck_register_signature_decls(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for decl in decls:
+		next = compiler_typecheck_register_signature_decl(next, module_path, decl)
+
+	next
+
+
+pure func compiler_typecheck_register_program_signature_decls(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	compiler_typecheck_register_signature_decls(state, program.source.module_name, program.decls)
+
+
+pure func compiler_typecheck_register_impl_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		ImplParsedDecl(impl_decl):
+			compiler_register_impl_decl(state, module_path, impl_decl, False)
+		PrivateParsedDecl(inner, _):
+			match inner:
+				ImplParsedDecl(impl_decl):
+					compiler_register_impl_decl(state, module_path, impl_decl, True)
+				_:
+					state
+		_:
+			state
+
+
+pure func compiler_typecheck_register_impl_decls(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for decl in decls:
+		next = compiler_typecheck_register_impl_decl(next, module_path, decl)
+
+	next
+
+
+pure func compiler_typecheck_register_program_impl_decls(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	compiler_typecheck_register_impl_decls(state, program.source.module_name, program.decls)

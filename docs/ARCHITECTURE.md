@@ -264,7 +264,6 @@ boxing, or ownership behavior from source spelling.
 | `core_list_layout.ml` | Final list storage layout annotations used by specialization and emit |
 | `core_parallel_tensor_pipeline.ml` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
-| `core_tensor_storage_producer.ml` | Tensor storage provenance and raw-write producer helpers |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
@@ -350,7 +349,6 @@ compiler/
 │   ├── core_list_pipeline.ml # List-specific pipeline rewrite helpers
 │   ├── core_parallel_tensor_pipeline.ml # Scoped vector/matrix pipeline fusion
 │   ├── core_tensor_fusion.ml # Tensor update fusion
-│   ├── core_tensor_storage_producer.ml # Tensor storage producer/provenance helpers
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
