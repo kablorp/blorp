@@ -3,6 +3,7 @@
 .PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage c-static-analysis security-check hygiene-check quality docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
+FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -54,8 +55,12 @@ warm-formatter: install
 compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp && mv $@.tmp $@
 
+# Generate embedded formatter bundle from tools/formatter/**/*.brp
+compiler/lib/embedded_formatter.ml: compiler/tools/gen_embed_formatter.ml $(FORMATTER_SOURCES)
+	ocaml compiler/tools/gen_embed_formatter.ml tools/formatter > $@.tmp && mv $@.tmp $@
+
 # Build the OCaml compiler
-build: compiler/lib/embedded_std.ml
+build: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune build
 
 # Run the top-level local test gate
@@ -71,7 +76,7 @@ smoke: all
 	scripts/test compiler-unit compiler
 
 # Run compiler-internal OCaml/Alcotest tests
-compiler-unit-test: compiler/lib/embedded_std.ml
+compiler-unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune runtest
 
 # Legacy alias for compiler-unit-test
@@ -171,4 +176,4 @@ docker-premerge-gate-all:
 # Clean build artifacts
 clean:
 	cd compiler && dune clean
-	rm -f ./blorp compiler/lib/embedded_std.ml
+	rm -f ./blorp compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml

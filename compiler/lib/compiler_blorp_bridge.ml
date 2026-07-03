@@ -319,6 +319,27 @@ let relative_to ~root path =
       (String.length path - String.length prefix)
   else Filename.basename path
 
+let existing_directory path =
+  try Sys.file_exists path && Sys.is_directory path with _ -> false
+
+let labeled_relative_to ~root ~label path =
+  let rel = relative_to ~root path in
+  if label = "" then rel else Filename.concat label rel
+
+(* [compiler/blorp/compiler_format_projection.brp] imports self-hosted formatter
+   modules from [tools/formatter], so formatter source edits must also
+   invalidate the compiler bridge helper cache. *)
+let compiler_bridge_extra_source_roots source_root =
+  let compiler_dir = Filename.dirname source_root in
+  let workspace_root = Filename.dirname compiler_dir in
+  let formatter_root = Filename.concat workspace_root "tools/formatter" in
+  if
+    String.equal (Filename.basename source_root) "blorp"
+    && String.equal (Filename.basename compiler_dir) "compiler"
+    && existing_directory formatter_root
+  then [ ("tools/formatter", formatter_root) ]
+  else []
+
 let bridge_source_tree_digest source_path =
   let root = Filename.dirname source_path in
   let rec collect dir =
@@ -332,21 +353,27 @@ let bridge_source_tree_digest source_path =
            else acc)
          []
   in
-  let files = collect root |> List.sort String.compare in
   let buf = Buffer.create 4096 in
+  let add_root ~label source_root =
+    let files = collect source_root |> List.sort String.compare in
+    List.iter
+      (fun path ->
+        let rel = labeled_relative_to ~root:source_root ~label path in
+        let contents = read_file path in
+        Buffer.add_string buf (string_of_int (String.length rel));
+        Buffer.add_char buf ':';
+        Buffer.add_string buf rel;
+        Buffer.add_char buf '\000';
+        Buffer.add_string buf (string_of_int (String.length contents));
+        Buffer.add_char buf ':';
+        Buffer.add_string buf contents;
+        Buffer.add_char buf '\000')
+      files
+  in
+  add_root ~label:"compiler/blorp" root;
   List.iter
-    (fun path ->
-      let rel = relative_to ~root path in
-      let contents = read_file path in
-      Buffer.add_string buf (string_of_int (String.length rel));
-      Buffer.add_char buf ':';
-      Buffer.add_string buf rel;
-      Buffer.add_char buf '\000';
-      Buffer.add_string buf (string_of_int (String.length contents));
-      Buffer.add_char buf ':';
-      Buffer.add_string buf contents;
-      Buffer.add_char buf '\000')
-    files;
+    (fun (label, source_root) -> add_root ~label source_root)
+    (compiler_bridge_extra_source_roots root);
   string_digest (Buffer.contents buf)
 
 let json_string s = Lsp_json.String s

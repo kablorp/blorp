@@ -464,9 +464,15 @@ record CliResolvedImportSource {
 }
 
 
+private record CliSourceIdentity {
+	path: String,
+	module_name: String
+}
+
+
 record CliSourceGraphDiscovery {
 	sources: List[CliSourceFile],
-	seen_paths: List[String],
+	seen_sources: List[CliSourceIdentity],
 	import_edges: List[CliFrontendImportEdge]
 }
 
@@ -1158,11 +1164,15 @@ private func source_graph_context_for_sources(
 	}
 
 
-private pure func source_path_seen(paths: List[String], path: String) -> Bool:
+private pure func source_identity_seen(
+	sources: List[CliSourceIdentity],
+	path: String,
+	module_name: String,
+) -> Bool:
 	var seen: Bool = False
 
-	for item in paths:
-		if item == path:
+	for source in sources:
+		if source.path == path and source.module_name == module_name:
 			seen = True
 			break
 
@@ -1526,10 +1536,10 @@ private func read_cli_import_source(
 private func discover_import_sources_for_parsed_source(
 	context: CliFrontendGraphContext,
 	source: CliParsedSourceFile,
-	seen_paths: List[String],
+	seen_sources: List[CliSourceIdentity],
 ) -> Result[CliSourceGraphDiscovery, String]:
 	var sources: List[CliSourceFile] = []
-	var seen: List[String] = seen_paths
+	var seen: List[CliSourceIdentity] = seen_sources
 	var import_edges: List[CliFrontendImportEdge] = []
 	var error: Option[String] = None
 	base_dir: String = dirname(source.path)
@@ -1556,10 +1566,13 @@ private func discover_import_sources_for_parsed_source(
 
 				match resolved:
 					Some(resolved):
-						if not source_path_seen(seen, resolved.path):
+						if not source_identity_seen(seen, resolved.path, resolved.module_name):
 							match read_cli_import_source(resolved):
 								Ok(Some(import_source)):
-									seen = seen.append(import_source.path)
+									seen = seen.append({
+										path = import_source.path,
+										module_name = import_source.module_name,
+									})
 									sources = sources.append(import_source)
 								Ok(None):
 									void
@@ -1574,7 +1587,7 @@ private func discover_import_sources_for_parsed_source(
 		None:
 			Ok({
 				sources = sources,
-				seen_paths = seen,
+				seen_sources = seen,
 				import_edges = import_edges,
 			})
 
@@ -1582,10 +1595,10 @@ private func discover_import_sources_for_parsed_source(
 private func discover_import_sources_for_parsed_sources(
 	context: CliFrontendGraphContext,
 	parsed_sources: List[CliParsedSourceFile],
-	seen_paths: List[String],
+	seen_sources: List[CliSourceIdentity],
 ) -> Result[CliSourceGraphDiscovery, String]:
 	var sources: List[CliSourceFile] = []
-	var seen: List[String] = seen_paths
+	var seen: List[CliSourceIdentity] = seen_sources
 	var import_edges: List[CliFrontendImportEdge] = []
 	var error: Option[String] = None
 
@@ -1596,7 +1609,7 @@ private func discover_import_sources_for_parsed_sources(
 			None:
 				match discover_import_sources_for_parsed_source(context, source, seen):
 					Ok(discovery):
-						seen = discovery.seen_paths
+						seen = discovery.seen_sources
 						sources = sources.concat(discovery.sources)
 						import_edges = import_edges.concat(discovery.import_edges)
 					Err(message):
@@ -1608,18 +1621,23 @@ private func discover_import_sources_for_parsed_sources(
 		None:
 			Ok({
 				sources = sources,
-				seen_paths = seen,
+				seen_sources = seen,
 				import_edges = import_edges,
 			})
 
 
-private pure func parsed_source_paths(sources: List[CliParsedSourceFile]) -> List[String]:
-	var paths: List[String] = []
+private pure func parsed_source_identities(
+	sources: List[CliParsedSourceFile],
+) -> List[CliSourceIdentity]:
+	var identities: List[CliSourceIdentity] = []
 
 	for source in sources:
-		paths = paths.append(source.path)
+		identities = identities.append({
+			path = source.path,
+			module_name = source.module_name,
+		})
 
-	paths
+	identities
 
 
 record CliSourceGraphWalk {
@@ -1634,10 +1652,10 @@ private func source_graph_walk_for_roots(
 ) -> Result[CliSourceGraphWalk, String]:
 	var modules: List[CliParsedSourceFile] = []
 	var import_edges: List[CliFrontendImportEdge] = []
-	var seen_paths: List[String] = parsed_source_paths(roots)
 	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
-	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_paths)
-	seen_paths = initial.seen_paths
+	var seen_sources: List[CliSourceIdentity] = parsed_source_identities(roots)
+	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_sources)
+	seen_sources = initial.seen_sources
 	import_edges = import_edges.concat(initial.import_edges)
 	var pending: List[CliSourceFile] = initial.sources
 	var error: Option[String] = None
@@ -1654,10 +1672,10 @@ private func source_graph_walk_for_roots(
 						match discover_import_sources_for_parsed_sources(
 							context,
 							parsed_batch,
-							seen_paths,
+							seen_sources,
 						):
 							Ok(discovery):
-								seen_paths = discovery.seen_paths
+								seen_sources = discovery.seen_sources
 								import_edges = import_edges.concat(discovery.import_edges)
 								pending = discovery.sources
 							Err(message):
