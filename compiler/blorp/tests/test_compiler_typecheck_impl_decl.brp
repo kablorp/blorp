@@ -1,0 +1,231 @@
+import:
+	../compiler_env: CompilerImplInstance, compiler_env_get_trait
+	../compiler_parsed_ast:
+		ParsedDecl(ImplParsedDecl, PrivateParsedDecl, RecordParsedDecl, TraitParsedDecl),
+		ParsedIdentifier,
+		ParsedProgram,
+		ParsedTypeExpr(ParsedNamedType),
+		parsed_identifier,
+	../compiler_source:
+		CompilerCursor,
+		CompilerSourceFile,
+		CompilerSourceSpan,
+		compiler_source_cursor_at,
+		compiler_source_file,
+		compiler_source_span,
+	../compiler_type: CompilerType(CompilerNamedType), compiler_types_equal
+	../compiler_typecheck_decl:
+		compiler_typecheck_prescan_program,
+		compiler_typecheck_register_program_impl_decls,
+		compiler_typecheck_register_program_signature_decls,
+		compiler_typecheck_register_program_type_decls,
+	../compiler_typecheck_state:
+		CompilerTypecheckState,
+		compiler_typecheck_state_empty,
+		compiler_typecheck_state_record_type_home,
+	test: TestSuite
+
+
+pure func source_file_named(module_name: String) -> CompilerSourceFile:
+	compiler_source_file(module_name + ".brp", module_name, "func main(): 1")
+
+
+pure func source_span() -> CompilerSourceSpan:
+	src: CompilerSourceFile = source_file_named("decl")
+	cursor: CompilerCursor = compiler_source_cursor_at(src, 0)
+	compiler_source_span(src, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], source_span())
+
+
+pure func record_decl(name: String) -> ParsedDecl:
+	RecordParsedDecl({
+		name = ident(name),
+		type_params = [],
+		fields = [],
+		is_struct = False,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func trait_decl(name: String) -> ParsedDecl:
+	TraitParsedDecl({
+		name = ident(name),
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func impl_decl(trait_name: String, for_type: ParsedTypeExpr) -> ParsedDecl:
+	ImplParsedDecl({
+		trait_name = ident(trait_name),
+		for_type = for_type,
+		methods = [],
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func private_impl_decl(trait_name: String, for_type: ParsedTypeExpr) -> ParsedDecl:
+	PrivateParsedDecl(
+		impl_decl(trait_name, for_type),
+		source_span(),
+	)
+
+
+pure func program_named(module_name: String, decls: List[ParsedDecl]) -> ParsedProgram:
+	{
+		source = source_file_named(module_name),
+		decls = decls,
+		diagnostics = []
+	}
+
+
+pure func program(decls: List[ParsedDecl]) -> ParsedProgram:
+	program_named("decl", decls)
+
+
+pure func has_impl_for_type(
+	instances: List[CompilerImplInstance],
+	trait_name: String,
+	for_type: CompilerType,
+) -> Bool:
+	var found = False
+
+	for instance in instances:
+		if (
+			instance.trait_name == trait_name
+			and not instance.is_builtin
+			and compiler_types_equal(instance.for_type, for_type)
+		):
+			found = True
+			break
+
+	found
+
+
+pure func index_types_and_signatures(source_program: ParsedProgram) -> CompilerTypecheckState:
+	compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+			source_program,
+		),
+		source_program,
+	)
+
+
+func test_registers_public_and_private_impl_headers() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointDisplay"),
+		trait_decl("CheckpointHidden"),
+		record_decl("CheckpointWidget"),
+		record_decl("CheckpointSecret"),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+		private_impl_decl("CheckpointHidden", named_type("CheckpointSecret")),
+	])
+	base_state = index_types_and_signatures(source_program)
+	state = compiler_typecheck_register_program_impl_decls(base_state, source_program)
+
+	trait_home_ok: Bool = match compiler_env_get_trait(state.env, "CheckpointDisplay"):
+		Some(trait_def):
+			trait_def.module_path == Some("decl")
+		None:
+			False
+
+	(
+		state.errors.length() == 0
+		and state.env.impls.length() == base_state.env.impls.length() + 1
+		and state.private_impls.length() == 1
+		and trait_home_ok
+		and has_impl_for_type(
+			state.env.impls,
+			"CheckpointDisplay",
+			CompilerNamedType("CheckpointWidget", []),
+		)
+		and has_impl_for_type(
+			state.private_impls,
+			"CheckpointHidden",
+			CompilerNamedType("CheckpointSecret", []),
+		)
+	)
+
+
+func test_impl_registration_reports_public_and_private_conflicts() -> Bool:
+	public_program = program([
+		trait_decl("CheckpointDisplay"),
+		record_decl("CheckpointWidget"),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+	])
+	public_base = index_types_and_signatures(public_program)
+	public_state = compiler_typecheck_register_program_impl_decls(public_base, public_program)
+
+	private_program = program([
+		trait_decl("CheckpointHidden"),
+		record_decl("CheckpointSecret"),
+		private_impl_decl("CheckpointHidden", named_type("CheckpointSecret")),
+		private_impl_decl("CheckpointHidden", named_type("CheckpointSecret")),
+	])
+	private_base = index_types_and_signatures(private_program)
+	private_state = compiler_typecheck_register_program_impl_decls(private_base, private_program)
+
+	(
+		public_state.env.impls.length() == public_base.env.impls.length() + 1
+		and public_state.errors.length() == 1
+		and public_state.errors
+			.get_or(0, "")
+			.contains("conflicting implementation of trait 'CheckpointDisplay'")
+		and private_state.private_impls.length() == 1
+		and private_state.errors.length() == 1
+		and private_state.errors
+			.get_or(0, "")
+			.contains("conflicting implementation of trait 'CheckpointHidden'")
+	)
+
+
+func test_impl_registration_reports_orphan_impls_when_homes_are_known() -> Bool:
+	trait_program = program_named("other/traits", [trait_decl("ExternalTrait")])
+	var state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), trait_program),
+		trait_program,
+	)
+	state = compiler_typecheck_state_record_type_home(state, "ExternalBox", "other/types", True)
+	base_impl_count = state.env.impls.length()
+	impl_program = program_named(
+		"local/app",
+		[impl_decl("ExternalTrait", named_type("ExternalBox"))],
+	)
+	state = compiler_typecheck_register_program_impl_decls(state, impl_program)
+
+	state.errors.length() == 1 and state.errors
+		.get_or(0, "")
+		.contains("orphan impl") and state.env.impls.length() == base_impl_count + 1
+
+
+tests: TestSuite = {
+	description = "Compiler typecheck impl declaration indexing",
+	tests = [
+		(
+			"registers public and private impl headers",
+			test_registers_public_and_private_impl_headers,
+		),
+		(
+			"impl registration reports public and private conflicts",
+			test_impl_registration_reports_public_and_private_conflicts,
+		),
+		(
+			"impl registration reports orphan impls when homes are known",
+			test_impl_registration_reports_orphan_impls_when_homes_are_known,
+		),
+	]
+}

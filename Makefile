@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage c-static-analysis security-check hygiene-check quality docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
@@ -80,6 +80,8 @@ unit-test: compiler-unit-test
 quality:
 	$(MAKE) hygiene-check
 	$(MAKE) c-static-analysis
+
+quality-full: quality
 
 hygiene-check:
 	@if [ -d ocaml ]; then \

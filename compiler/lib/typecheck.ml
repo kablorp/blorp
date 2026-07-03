@@ -493,20 +493,6 @@ let record_type_home ?(imported = false) (state : check_state) ~(name : string)
 let lookup_type_home (state : check_state) (name : string) : string option =
   Hashtbl.find_opt state.type_home name
 
-(** Collect record/union/type-alias names declared by a module. Imported
-    signatures and impls need owner-qualified type identity; otherwise two
-    modules that each declare [record Widget] collapse to one bare [Widget]. *)
-let module_local_type_names_from_decls (decls : Ast.program) : string list =
-  let rec collect acc decl =
-    match decl.decl_desc with
-    | DPrivate inner -> collect acc inner
-    | DRecord r -> r.record_name :: acc
-    | DType t -> t.type_name :: acc
-    | DTypeAlias a -> a.alias_name :: acc
-    | _ -> acc
-  in
-  List.fold_left collect [] decls |> List.sort_uniq String.compare
-
 type module_resource_type_metadata = {
   mrt_name : string;
   mrt_type_params : string list;
@@ -557,7 +543,7 @@ let qualify_imported_type_expr ~(module_path : string option) ty =
   | Some module_path ->
       let local_type_names =
         module_decls_for_type_metadata module_path
-        |> module_local_type_names_from_decls
+        |> Module_type_identity.local_type_names_from_decls
       in
       Types.qualify_module_local_types ~module_path local_type_names ty
 
@@ -2544,7 +2530,9 @@ let try_add_private_impl (state : check_state) (loc : loc)
 (** Register trait impls from a module's declarations *)
 let register_module_impls ~(module_path : string) (state : check_state)
     (decls : program) : check_state =
-  let local_type_names = module_local_type_names_from_decls decls in
+  let local_type_names =
+    Module_type_identity.local_type_names_from_decls decls
+  in
   let qualify_impl impl =
     {
       impl with
@@ -4926,7 +4914,7 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
   let state =
     match var_decl.var_type with
     | Some ty -> (
-        match Types.validate_tensor_dims (Env.get_type_params state.env) ty with
+        match Types.validate_array_dims (Env.get_type_params state.env) ty with
         | Some msg -> add_error state (error_at loc msg)
         | None -> state)
     | None -> state
@@ -5129,7 +5117,7 @@ let rec second_pass (state : check_state) (decls : program) :
               @ Env.get_type_params state.env
             in
             let validate_annotation st ty =
-              match Types.validate_tensor_dims func_tp ty with
+              match Types.validate_array_dims func_tp ty with
               | Some msg -> add_error st (error_at loc msg)
               | None -> st
             in

@@ -1,0 +1,365 @@
+-- Pure import registration substrate for the Blorp-owned typecheck pass.
+--
+-- This consumes parsed import declarations and already-loaded module surfaces.
+-- It intentionally records only import bookkeeping here: imported modules,
+-- aliases, imported-name bindings, imported type homes, and diagnostics. The
+-- semantic env effects for imported declarations belong to the declaration
+-- registration slice, matching the current OCaml phase boundary.
+import:
+	compiler_context: CompilerModuleOrigin, compiler_module_origin_is_package
+	compiler_module_surface:
+		ModuleSurface,
+		ModuleSurfaceSymbol,
+		ModuleSurfaceSymbolKind(RecordSurfaceSymbol, TypeAliasSurfaceSymbol, TypeSurfaceSymbol),
+	compiler_parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl),
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
+	compiler_typecheck_state:
+		CompilerTypecheckState,
+		compiler_typecheck_state_add_error,
+		compiler_typecheck_state_add_imported_module,
+		compiler_typecheck_state_add_known_type_name,
+		compiler_typecheck_state_has_imported_module,
+		compiler_typecheck_state_is_stdlib,
+		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_register_imported_name,
+		compiler_typecheck_state_register_module_alias,
+
+
+record CompilerImportableModuleSurface {
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	surface: ModuleSurface
+}
+
+
+pure func compiler_importable_module_surface(
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	surface: ModuleSurface,
+) -> CompilerImportableModuleSurface:
+	{
+		module_path = module_path,
+		origin = origin,
+		surface = surface
+	}
+
+
+pure func compiler_import_default_alias(module_path: String) -> String:
+	parts: List[String] = module_path.split("/")
+
+	raw_name: String = match parts.last():
+		Some(name):
+			name
+		None:
+			module_path
+
+	if raw_name.ends_with(".brp"):
+		raw_name.substring(0, raw_name.length() - 4)
+	else:
+		raw_name
+
+
+private pure func compiler_import_module_matches(
+	imported_module: CompilerImportableModuleSurface,
+	requested_path: String,
+) -> Bool:
+	(
+		imported_module.module_path == requested_path
+		or imported_module.surface.module_name == requested_path
+	)
+
+
+private pure func compiler_find_importable_module(
+	modules: List[CompilerImportableModuleSurface],
+	requested_path: String,
+) -> Option[CompilerImportableModuleSurface]:
+	var result: Option[CompilerImportableModuleSurface] = None
+
+	for imported_module in modules:
+		if compiler_import_module_matches(imported_module, requested_path):
+			result = Some(imported_module)
+			break
+
+	result
+
+
+private pure func compiler_find_surface_symbol(
+	symbols: List[ModuleSurfaceSymbol],
+	name: String,
+) -> Option[ModuleSurfaceSymbol]:
+	var result: Option[ModuleSurfaceSymbol] = None
+
+	for symbol in symbols:
+		if symbol.name == name:
+			result = Some(symbol)
+			break
+
+	result
+
+
+private pure func compiler_import_symbol_kind_is_type_like(kind: ModuleSurfaceSymbolKind) -> Bool:
+	match kind:
+		TypeSurfaceSymbol:
+			True
+		RecordSurfaceSymbol:
+			True
+		TypeAliasSurfaceSymbol:
+			True
+		_:
+			False
+
+
+private pure func compiler_import_symbol_is_type_like(symbol: ModuleSurfaceSymbol) -> Bool:
+	compiler_import_symbol_kind_is_type_like(symbol.kind)
+
+
+private pure func compiler_import_symbol_local_name(symbol: ParsedImportSymbol) -> String:
+	match symbol.symbol_alias:
+		Some(alias_name):
+			alias_name.text
+		None:
+			symbol.name.text
+
+
+private pure func compiler_import_decl_explicit_alias(decl: ParsedImportDecl) -> Option[String]:
+	match decl.module_alias:
+		Some(alias_name):
+			Some(alias_name.text)
+		None:
+			None
+
+
+private pure func compiler_import_not_loaded_error(
+	state: CompilerTypecheckState,
+	module_path: String,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"module '" + module_path + "' is not loaded for import registration",
+	)
+
+
+private pure func compiler_import_duplicate_module_error(
+	state: CompilerTypecheckState,
+	module_path: String,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"module '" + compiler_import_default_alias(module_path) + "' is already imported",
+	)
+
+
+private pure func compiler_import_std_package_error(
+	state: CompilerTypecheckState,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"standard library modules cannot import package modules",
+	)
+
+
+private pure func compiler_import_private_symbol_error(
+	state: CompilerTypecheckState,
+	module_path: String,
+	symbol_name: String,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"'" + symbol_name + "' is private in module '" + module_path + "' and cannot be imported",
+	)
+
+
+private pure func compiler_import_missing_symbol_error(
+	state: CompilerTypecheckState,
+	module_path: String,
+	symbol_name: String,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"'" + symbol_name + "' is not exported by module '" + module_path + "'",
+	)
+
+
+private pure func compiler_import_duplicate_symbol_error(
+	state: CompilerTypecheckState,
+	local_name: String,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_add_error(
+		state,
+		"'" + local_name + "' is already imported from this module",
+	)
+
+
+private pure func compiler_record_imported_type_symbol(
+	state: CompilerTypecheckState,
+	module_path: String,
+	local_name: String,
+	symbol: ModuleSurfaceSymbol,
+) -> CompilerTypecheckState:
+	if compiler_import_symbol_is_type_like(symbol):
+		compiler_typecheck_state_record_type_home(
+			compiler_typecheck_state_add_known_type_name(state, local_name),
+			local_name,
+			module_path,
+			True,
+		)
+	else:
+		state
+
+
+private pure func compiler_register_import_symbol(
+	state: CompilerTypecheckState,
+	imported_module: CompilerImportableModuleSurface,
+	symbol: ParsedImportSymbol,
+) -> CompilerTypecheckState:
+	module_path: String = imported_module.module_path
+	original_name: String = symbol.name.text
+	local_name: String = compiler_import_symbol_local_name(symbol)
+
+	match compiler_find_surface_symbol(imported_module.surface.exports, original_name):
+		Some(exported_symbol):
+			registration = compiler_typecheck_state_register_imported_name(
+				state,
+				local_name,
+				module_path,
+				original_name,
+			)
+
+			if registration.registered:
+				compiler_record_imported_type_symbol(
+					registration.state,
+					module_path,
+					local_name,
+					exported_symbol,
+				)
+			else:
+				registration.state
+		None:
+			match compiler_find_surface_symbol(
+				imported_module.surface.private_names,
+				original_name,
+			):
+				Some(_):
+					compiler_import_private_symbol_error(state, module_path, original_name)
+				None:
+					compiler_import_missing_symbol_error(state, module_path, original_name)
+
+
+private pure func compiler_register_import_symbols(
+	state: CompilerTypecheckState,
+	imported_module: CompilerImportableModuleSurface,
+	symbols: List[ParsedImportSymbol],
+) -> CompilerTypecheckState:
+	var current: CompilerTypecheckState = state
+	var seen_local_names: List[String] = []
+
+	for symbol in symbols:
+		local_name: String = compiler_import_symbol_local_name(symbol)
+
+		if seen_local_names.contains(local_name):
+			current = compiler_import_duplicate_symbol_error(current, local_name)
+		else:
+			seen_local_names = seen_local_names.append(local_name)
+			current = compiler_register_import_symbol(current, imported_module, symbol)
+
+	current
+
+
+private pure func compiler_register_import_alias_if_present(
+	state: CompilerTypecheckState,
+	imported_module: CompilerImportableModuleSurface,
+	maybe_alias: Option[String],
+) -> CompilerTypecheckState:
+	match maybe_alias:
+		Some(alias_name):
+			compiler_typecheck_state_register_module_alias(
+				state,
+				alias_name,
+				imported_module.module_path,
+			)
+		None:
+			state
+
+
+pure func compiler_register_import_decl(
+	state: CompilerTypecheckState,
+	modules: List[CompilerImportableModuleSurface],
+	decl: ParsedImportDecl,
+) -> CompilerTypecheckState:
+	match compiler_find_importable_module(modules, decl.module_path):
+		None:
+			compiler_import_not_loaded_error(state, decl.module_path)
+		Some(imported_module):
+			if (
+				compiler_typecheck_state_is_stdlib(state)
+				and compiler_module_origin_is_package(imported_module.origin)
+			):
+				compiler_import_std_package_error(state)
+			else if compiler_typecheck_state_has_imported_module(
+				state,
+				imported_module.module_path,
+			):
+				compiler_import_duplicate_module_error(state, decl.module_path)
+			else:
+				with_module = compiler_typecheck_state_add_imported_module(
+					state,
+					imported_module.module_path,
+				)
+
+				match decl.symbols:
+					Some(symbols):
+						with_symbols = compiler_register_import_symbols(
+							with_module,
+							imported_module,
+							symbols,
+						)
+						compiler_register_import_alias_if_present(
+							with_symbols,
+							imported_module,
+							compiler_import_decl_explicit_alias(decl),
+						)
+					None:
+						alias_name: String = match compiler_import_decl_explicit_alias(decl):
+							Some(explicit_alias):
+								explicit_alias
+							None:
+								compiler_import_default_alias(decl.module_path)
+
+						compiler_typecheck_state_register_module_alias(
+							with_module,
+							alias_name,
+							imported_module.module_path,
+						)
+
+
+pure func compiler_register_import_decls(
+	state: CompilerTypecheckState,
+	modules: List[CompilerImportableModuleSurface],
+	imports: List[ParsedImportDecl],
+) -> CompilerTypecheckState:
+	var current: CompilerTypecheckState = state
+
+	for import_decl in imports:
+		current = compiler_register_import_decl(current, modules, import_decl)
+
+	current
+
+
+pure func compiler_register_program_imports(
+	state: CompilerTypecheckState,
+	modules: List[CompilerImportableModuleSurface],
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	var current: CompilerTypecheckState = state
+
+	for decl in program.decls:
+		match decl:
+			ImportBlockParsedDecl(imports, _):
+				current = compiler_register_import_decls(current, modules, imports)
+			_:
+				void
+
+	current

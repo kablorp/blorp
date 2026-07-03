@@ -2712,20 +2712,6 @@ let check_no_redeclaration (env : env) (name : string) (loc : loc) :
                      name))
         | _ -> Ok ())
 
-(** Collect record/union/type-alias names declared by a module. Used when a
-    public signature crosses a module boundary: bare local names in that
-    signature must become canonical owner-qualified frontend type identities. *)
-let module_local_type_names_from_decls (decls : Ast.program) : string list =
-  let rec collect acc decl =
-    match decl.decl_desc with
-    | DPrivate inner -> collect acc inner
-    | DRecord r -> r.record_name :: acc
-    | DType t -> t.type_name :: acc
-    | DTypeAlias a -> a.alias_name :: acc
-    | _ -> acc
-  in
-  List.fold_left collect [] decls |> List.sort_uniq String.compare
-
 type module_func_resolution = {
   module_func_type : type_expr;
   module_func_callable_id : int option;
@@ -2752,7 +2738,7 @@ let lookup_module_func_resolution module_path func_name =
         | None -> m.decls
       in
       let local_type_names =
-        module_local_type_names_from_decls decls_for_types
+        Module_type_identity.local_type_names_from_decls decls_for_types
       in
       let qualify ty =
         Types.qualify_module_local_types ~module_path:m.name local_type_names ty
@@ -2869,7 +2855,7 @@ let lookup_module_var_type module_path var_name =
         | None -> m.decls
       in
       let local_type_names =
-        module_local_type_names_from_decls decls_for_types
+        Module_type_identity.local_type_names_from_decls decls_for_types
       in
       let qualify ty =
         Types.qualify_module_local_types ~module_path:m.name local_type_names ty
@@ -2962,7 +2948,9 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
                 | _ -> None)
               decls
           in
-          let local_type_names = module_local_type_names_from_decls decls in
+          let local_type_names =
+            Module_type_identity.local_type_names_from_decls decls
+          in
           let qualify ty =
             Types.qualify_module_local_types ~module_path:m.name
               local_type_names ty
@@ -3092,7 +3080,9 @@ let resolve_record_field_types_uncached env type_name type_args =
       | Some td -> Typed_ast.program_ast td
       | None -> m.decls
     in
-    let local_type_names = module_local_type_names_from_decls decls in
+    let local_type_names =
+      Module_type_identity.local_type_names_from_decls decls
+    in
     let qualify ty =
       Types.qualify_module_local_types ~module_path:m.name local_type_names ty
     in

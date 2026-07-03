@@ -413,8 +413,72 @@ pure func helper() -> Int:
 |};
       Alcotest.(check (list string))
         "valid test files from each root"
-        [ std_a_file; std_z_file; pkg_file ]
+        [ std_a_file; std_z_file ]
         (Blorp.Test_runner.collect_test_files [ std_dir; pkg_dir ]))
+
+let test_main_only_file_is_not_runnable_test () =
+  with_temp_dir "blorp-main-only-test-" (fun dir ->
+      let file = Filename.concat dir "main_only.brp" in
+      write_file file
+        {|
+func main(args: List[String]) -> Int:
+    0
+|};
+      Blorp.Test_runner.with_run_artifacts (fun () ->
+          let code =
+            Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+              ~cache:false file
+          in
+          Alcotest.(check int) "main-only file is not a test" 1 code))
+
+let test_testsuite_file_remains_runnable_test () =
+  with_temp_dir "blorp-suite-test-" (fun dir ->
+      let file = Filename.concat dir "suite.brp" in
+      write_file file
+        {|
+import:
+    test: TestSuite
+
+func passes() -> Bool:
+    True
+
+tests: TestSuite = {
+    description = "suite",
+    tests = [("passes", passes)]
+}
+|};
+      Blorp.Test_runner.with_run_artifacts (fun () ->
+          let code =
+            Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+              ~cache:false file
+          in
+          Alcotest.(check int) "suite file runs" 0 code))
+
+let test_testsuite_file_with_main_is_invalid_test () =
+  with_temp_dir "blorp-suite-with-main-test-" (fun dir ->
+      let file = Filename.concat dir "suite_with_main.brp" in
+      write_file file
+        {|
+import:
+    test: TestSuite
+
+func passes() -> Bool:
+    True
+
+tests: TestSuite = {
+    description = "suite",
+    tests = [("passes", passes)]
+}
+
+func main(args: List[String]) -> Int:
+    0
+|};
+      Blorp.Test_runner.with_run_artifacts (fun () ->
+          let code =
+            Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+              ~cache:false file
+          in
+          Alcotest.(check int) "suite file main is not used" 1 code))
 
 let with_env name value f =
   let old = Sys.getenv_opt name in
@@ -982,6 +1046,12 @@ let suite =
       [
         Alcotest.test_case "collects_multi_root_files" `Quick
           test_collect_test_files_preserves_multi_root_order;
+        Alcotest.test_case "main_only_not_runnable" `Quick
+          test_main_only_file_is_not_runnable_test;
+        Alcotest.test_case "testsuite_file_runnable" `Quick
+          test_testsuite_file_remains_runnable_test;
+        Alcotest.test_case "testsuite_with_main_invalid" `Quick
+          test_testsuite_file_with_main_is_invalid_test;
         Alcotest.test_case "dispatches_by_index" `Quick
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick

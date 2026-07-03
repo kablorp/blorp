@@ -1,0 +1,1357 @@
+-- Explicit per-compilation context for the Blorp-owned frontend.
+--
+-- The OCaml compiler still owns the mutable production session today. This
+-- module models the Blorp side as an ordinary value so later typecheck/env
+-- slices can thread state explicitly instead of growing another ambient
+-- session.
+import:
+	compiler_dim_solver:
+		CompilerDimSolveResult(
+			CompilerDimBindMeta,
+			CompilerDimBindVar,
+			CompilerDimContradiction,
+			CompilerDimSolved,
+			CompilerDimStuck,
+		),
+		compiler_dim_solve,
+	compiler_type:
+		CompilerType(
+			CompilerArrayType,
+			CompilerConstIntType,
+			CompilerDimOpType,
+			CompilerFunctionType,
+			CompilerMetaType,
+			CompilerNamedType,
+			CompilerRangeType,
+			CompilerSelfType,
+			CompilerTupleType,
+			CompilerTypeVar,
+			CompilerVarDimsType,
+		),
+		CompilerTypeSubstEntry,
+		compiler_array_type_parts,
+		compiler_is_dim_var_name,
+		compiler_normalize_dim,
+		compiler_normalize_type_name,
+		compiler_occurs_in,
+		compiler_strip_type_param_bounds,
+		compiler_type_subst_entry,
+		compiler_types_equal,
+
+
+union CompilerModuleOrigin:
+	CompilerStdlibModule
+	CompilerNativePackageModule(String)
+	CompilerSourcePackageModule(String)
+	CompilerUserModule
+
+
+record CompilerSourcePackage {
+	package_alias: String,
+	package_name: String,
+	package_root: String,
+	source_dir: String,
+	exports: List[String]
+}
+
+
+record CompilerTypeHomeEntry {
+	type_name: String,
+	modules: List[String]
+}
+
+
+record CompilerResourceCleanupEntry {
+	type_name: String,
+	cleanup_function: String
+}
+
+
+record CompilerTraitHomeEntry {
+	trait_name: String,
+	module_name: String
+}
+
+
+record CompilerTraitHomeConflictInfo {
+	trait_name: String,
+	existing_module: String,
+	new_module: String
+}
+
+
+record CompilerMetaOriginEntry {
+	meta_id: Int,
+	origin: String
+}
+
+
+record CompilerMetaBindingEntry {
+	meta_id: Int,
+	binding: CompilerType
+}
+
+
+record CompilerContext {
+	search_paths: List[String],
+	package_roots: List[String],
+	source_packages: List[CompilerSourcePackage],
+	type_homes: List[CompilerTypeHomeEntry],
+	resource_cleanups: List[CompilerResourceCleanupEntry],
+	trait_homes: List[CompilerTraitHomeEntry],
+	meta_origins: List[CompilerMetaOriginEntry],
+	meta_bindings: List[CompilerMetaBindingEntry],
+	def_id_counter: Int,
+	fresh_meta_counter: Int,
+	lower_destruct_counter: Int,
+	lower_param_counter: Int,
+	lower_question_bind_counter: Int,
+	lower_resource_counter: Int,
+	lower_task_scope_counter: Int,
+	lower_current_task_scope_id: Int,
+	desugar_counter: Int,
+	ssa_mut_counter: Int
+}
+
+
+union CompilerRegisterTraitHomeResult:
+	CompilerTraitHomeRegistered(CompilerContext)
+	CompilerTraitHomeConflict(CompilerTraitHomeConflictInfo)
+
+
+record CompilerDefIdStep {
+	context: CompilerContext,
+	def_id: Int
+}
+
+
+record CompilerFreshMetaStep {
+	context: CompilerContext,
+	meta_type: CompilerType
+}
+
+
+record CompilerUnifyStep {
+	context: CompilerContext,
+	subst: List[CompilerTypeSubstEntry]
+}
+
+
+private record CompilerUnifyOptions {
+	symmetric: Bool,
+	type_params: List[String],
+	rigid_vars: List[String]
+}
+
+
+pure func compiler_context_empty() -> CompilerContext:
+	{
+		search_paths = [],
+		package_roots = [],
+		source_packages = [],
+		type_homes = [],
+		resource_cleanups = [],
+		trait_homes = [],
+		meta_origins = [],
+		meta_bindings = [],
+		def_id_counter = 0,
+		fresh_meta_counter = 0,
+		lower_destruct_counter = 0,
+		lower_param_counter = 0,
+		lower_question_bind_counter = 0,
+		lower_resource_counter = 0,
+		lower_task_scope_counter = 1,
+		lower_current_task_scope_id = 0,
+		desugar_counter = 0,
+		ssa_mut_counter = 0
+	}
+
+
+pure func compiler_source_package_origin(name: String) -> Option[CompilerModuleOrigin]:
+	trimmed: String = name.trim()
+
+	if trimmed.length() == 0:
+		None
+	else:
+		Some(CompilerSourcePackageModule(trimmed))
+
+
+pure func compiler_native_package_origin(name: String) -> Option[CompilerModuleOrigin]:
+	trimmed: String = name.trim()
+
+	if trimmed.length() == 0:
+		None
+	else:
+		Some(CompilerNativePackageModule(trimmed))
+
+
+pure func compiler_module_origin_is_std(origin: CompilerModuleOrigin) -> Bool:
+	match origin:
+		CompilerStdlibModule:
+			True
+		_:
+			False
+
+
+pure func compiler_module_origin_is_package(origin: CompilerModuleOrigin) -> Bool:
+	match origin:
+		CompilerNativePackageModule(_):
+			True
+		CompilerSourcePackageModule(_):
+			True
+		_:
+			False
+
+
+pure func compiler_module_origin_allows_builtin(origin: CompilerModuleOrigin) -> Bool:
+	match origin:
+		CompilerStdlibModule:
+			True
+		_:
+			False
+
+
+pure func compiler_module_origin_allows_foreign(origin: CompilerModuleOrigin) -> Bool:
+	match origin:
+		CompilerNativePackageModule(_):
+			True
+		CompilerUserModule:
+			True
+		_:
+			False
+
+
+pure func compiler_module_origin_label(origin: CompilerModuleOrigin) -> String:
+	match origin:
+		CompilerStdlibModule:
+			"standard library"
+		CompilerUserModule:
+			"user module"
+		CompilerNativePackageModule(package_id):
+			"native package '" + package_id + "'"
+		CompilerSourcePackageModule(package_id):
+			"source package '" + package_id + "'"
+
+
+private pure func compiler_add_unique_sorted_string(
+	values: List[String],
+	value: String,
+) -> List[String]:
+	if values.contains(value):
+		values
+	else:
+		values
+			.append(value)
+			.sort()
+
+
+private pure func compiler_find_type_home_entry(
+	context: CompilerContext,
+	type_name: String,
+) -> Option[CompilerTypeHomeEntry]:
+	var result: Option[CompilerTypeHomeEntry] = None
+
+	for entry in context.type_homes:
+		if entry.type_name == type_name:
+			result = Some(entry)
+			break
+
+	result
+
+
+private pure func compiler_replace_type_home_entry(
+	entries: List[CompilerTypeHomeEntry],
+	replacement: CompilerTypeHomeEntry,
+) -> List[CompilerTypeHomeEntry]:
+	var result: List[CompilerTypeHomeEntry] = []
+	var replaced: Bool = False
+
+	for entry in entries:
+		if entry.type_name == replacement.type_name:
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(entry)
+
+	if replaced:
+		result
+	else:
+		result.append(replacement)
+
+
+pure func compiler_register_type_home(
+	context: CompilerContext,
+	type_name: String,
+	module_name: String,
+) -> CompilerContext:
+	next_entry: CompilerTypeHomeEntry = match compiler_find_type_home_entry(context, type_name):
+		Some(entry):
+			{ entry | modules = compiler_add_unique_sorted_string(entry.modules, module_name) }
+		None:
+			{
+				type_name = type_name,
+				modules = [module_name]
+			}
+
+	{ context | type_homes = compiler_replace_type_home_entry(context.type_homes, next_entry) }
+
+
+pure func compiler_find_type_homes(context: CompilerContext, type_name: String) -> List[String]:
+	match compiler_find_type_home_entry(context, type_name):
+		Some(entry):
+			entry.modules
+		None:
+			[]
+
+
+pure func compiler_find_type_home(context: CompilerContext, type_name: String) -> Option[String]:
+	homes: List[String] = compiler_find_type_homes(context, type_name)
+
+	if homes.length() == 1:
+		homes.get(0)
+	else:
+		None
+
+
+private pure func compiler_replace_resource_cleanup_entry(
+	entries: List[CompilerResourceCleanupEntry],
+	replacement: CompilerResourceCleanupEntry,
+) -> List[CompilerResourceCleanupEntry]:
+	var result: List[CompilerResourceCleanupEntry] = []
+	var replaced: Bool = False
+
+	for entry in entries:
+		if entry.type_name == replacement.type_name:
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(entry)
+
+	if replaced:
+		result
+	else:
+		result.append(replacement)
+
+
+pure func compiler_register_resource_cleanup(
+	context: CompilerContext,
+	type_name: String,
+	cleanup_function: String,
+) -> CompilerContext:
+	entry: CompilerResourceCleanupEntry = {
+		type_name = type_name,
+		cleanup_function = cleanup_function
+	}
+	{ context |
+		resource_cleanups = compiler_replace_resource_cleanup_entry(
+			context.resource_cleanups,
+			entry,
+		)
+	}
+
+
+pure func compiler_find_resource_cleanup(
+	context: CompilerContext,
+	type_name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for entry in context.resource_cleanups:
+		if entry.type_name == type_name:
+			result = Some(entry.cleanup_function)
+			break
+
+	result
+
+
+pure func compiler_find_trait_home(context: CompilerContext, trait_name: String) -> Option[String]:
+	var result: Option[String] = None
+
+	for entry in context.trait_homes:
+		if entry.trait_name == trait_name:
+			result = Some(entry.module_name)
+			break
+
+	result
+
+
+pure func compiler_register_trait_home(
+	context: CompilerContext,
+	trait_name: String,
+	module_name: String,
+) -> CompilerRegisterTraitHomeResult:
+	match compiler_find_trait_home(context, trait_name):
+		Some(existing_module):
+			if existing_module == module_name:
+				CompilerTraitHomeRegistered(context)
+			else:
+				CompilerTraitHomeConflict({
+					trait_name = trait_name,
+					existing_module = existing_module,
+					new_module = module_name,
+				})
+		None:
+			entry: CompilerTraitHomeEntry = {
+				trait_name = trait_name,
+				module_name = module_name
+			}
+			CompilerTraitHomeRegistered(
+				{ context | trait_homes = context.trait_homes.append(entry) },
+			)
+
+
+private pure func compiler_find_meta_origin_entry(
+	context: CompilerContext,
+	meta_id: Int,
+) -> Option[CompilerMetaOriginEntry]:
+	var result: Option[CompilerMetaOriginEntry] = None
+
+	for entry in context.meta_origins:
+		if entry.meta_id == meta_id:
+			result = Some(entry)
+			break
+
+	result
+
+
+pure func compiler_meta_origin_name(context: CompilerContext, meta_id: Int) -> String:
+	match compiler_find_meta_origin_entry(context, meta_id):
+		Some(entry):
+			entry.origin
+		None:
+			"?m" + meta_id.to_string()
+
+
+private pure func compiler_find_meta_binding_entry(
+	context: CompilerContext,
+	meta_id: Int,
+) -> Option[CompilerMetaBindingEntry]:
+	var result: Option[CompilerMetaBindingEntry] = None
+
+	for entry in context.meta_bindings:
+		if entry.meta_id == meta_id:
+			result = Some(entry)
+			break
+
+	result
+
+
+pure func compiler_lookup_meta(context: CompilerContext, meta_id: Int) -> Option[CompilerType]:
+	match compiler_find_meta_binding_entry(context, meta_id):
+		Some(entry):
+			Some(entry.binding)
+		None:
+			None
+
+
+private pure func compiler_context_dim_meta_bindings(
+	context: CompilerContext,
+) -> List[(Int, CompilerType)]:
+	var result: List[(Int, CompilerType)] = []
+
+	for entry in context.meta_bindings:
+		result = result.append((entry.meta_id, entry.binding))
+
+	result
+
+
+private pure func compiler_replace_meta_binding_entry(
+	entries: List[CompilerMetaBindingEntry],
+	replacement: CompilerMetaBindingEntry,
+) -> List[CompilerMetaBindingEntry]:
+	var result: List[CompilerMetaBindingEntry] = []
+	var replaced: Bool = False
+
+	for entry in entries:
+		if entry.meta_id == replacement.meta_id:
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(entry)
+
+	if replaced:
+		result
+	else:
+		result.append(replacement)
+
+
+pure func compiler_bind_meta(
+	context: CompilerContext,
+	meta_id: Int,
+	typ: CompilerType,
+) -> CompilerContext:
+	entry: CompilerMetaBindingEntry = {
+		meta_id = meta_id,
+		binding = typ
+	}
+
+	{ context | meta_bindings = compiler_replace_meta_binding_entry(context.meta_bindings, entry) }
+
+
+private pure func compiler_head_resolve_seen(
+	context: CompilerContext,
+	seen: List[Int],
+	typ: CompilerType,
+) -> CompilerType:
+	match typ:
+		CompilerMetaType(meta_id):
+			if seen.contains(meta_id):
+				typ
+			else:
+				match compiler_lookup_meta(context, meta_id):
+					Some(binding):
+						compiler_head_resolve_seen(
+							context,
+							seen.append(meta_id),
+							binding,
+						)
+					None:
+						typ
+		_:
+			typ
+
+
+pure func compiler_head_resolve(context: CompilerContext, typ: CompilerType) -> CompilerType:
+	compiler_head_resolve_seen(context, [], typ)
+
+
+private pure func compiler_occurs_meta_in_list(
+	context: CompilerContext,
+	target_meta_id: Int,
+	seen: List[Int],
+	types: List[CompilerType],
+) -> Bool:
+	var result: Bool = False
+
+	for typ in types:
+		if compiler_occurs_meta_seen(context, target_meta_id, seen, typ):
+			result = True
+			break
+
+	result
+
+
+private pure func compiler_occurs_meta_seen(
+	context: CompilerContext,
+	target_meta_id: Int,
+	seen: List[Int],
+	typ: CompilerType,
+) -> Bool:
+	match typ:
+		CompilerMetaType(meta_id):
+			if meta_id == target_meta_id:
+				True
+			else if seen.contains(meta_id):
+				False
+			else:
+				match compiler_lookup_meta(context, meta_id):
+					Some(binding):
+						compiler_occurs_meta_seen(
+							context,
+							target_meta_id,
+							seen.append(meta_id),
+							binding,
+						)
+					None:
+						False
+		CompilerNamedType(_, args):
+			compiler_occurs_meta_in_list(context, target_meta_id, seen, args)
+		CompilerArrayType(element, dims):
+			(
+				compiler_occurs_meta_seen(context, target_meta_id, seen, element)
+				or compiler_occurs_meta_in_list(context, target_meta_id, seen, dims)
+			)
+		CompilerFunctionType(_, params, return_type):
+			(
+				compiler_occurs_meta_in_list(context, target_meta_id, seen, params)
+				or compiler_occurs_meta_seen(context, target_meta_id, seen, return_type)
+			)
+		CompilerTupleType(elements):
+			compiler_occurs_meta_in_list(context, target_meta_id, seen, elements)
+		CompilerRangeType(inner):
+			compiler_occurs_meta_seen(context, target_meta_id, seen, inner)
+		CompilerDimOpType(_, left, right):
+			(
+				compiler_occurs_meta_seen(context, target_meta_id, seen, left)
+				or compiler_occurs_meta_seen(context, target_meta_id, seen, right)
+			)
+		_:
+			False
+
+
+pure func compiler_occurs_meta(
+	context: CompilerContext,
+	target_meta_id: Int,
+	typ: CompilerType,
+) -> Bool:
+	compiler_occurs_meta_seen(context, target_meta_id, [], typ)
+
+
+private pure func compiler_zonk_type_list(
+	context: CompilerContext,
+	seen: List[Int],
+	types: List[CompilerType],
+) -> List[CompilerType]:
+	var result: List[CompilerType] = []
+
+	for typ in types:
+		result = result.append(compiler_zonk_type_seen(context, seen, typ))
+
+	result
+
+
+private pure func compiler_zonk_type_seen(
+	context: CompilerContext,
+	seen: List[Int],
+	typ: CompilerType,
+) -> CompilerType:
+	match typ:
+		CompilerMetaType(meta_id):
+			if seen.contains(meta_id):
+				CompilerTypeVar(compiler_meta_origin_name(context, meta_id))
+			else:
+				match compiler_lookup_meta(context, meta_id):
+					Some(binding):
+						compiler_zonk_type_seen(
+							context,
+							seen.append(meta_id),
+							binding,
+						)
+					None:
+						CompilerTypeVar(compiler_meta_origin_name(context, meta_id))
+		CompilerNamedType(name, args):
+			CompilerNamedType(
+				name,
+				compiler_zonk_type_list(context, seen, args),
+			)
+		CompilerArrayType(element, dims):
+			CompilerArrayType(
+				compiler_zonk_type_seen(context, seen, element),
+				compiler_zonk_type_list(context, seen, dims),
+			)
+		CompilerFunctionType(is_pure, params, return_type):
+			CompilerFunctionType(
+				is_pure,
+				compiler_zonk_type_list(context, seen, params),
+				compiler_zonk_type_seen(context, seen, return_type),
+			)
+		CompilerTupleType(elements):
+			CompilerTupleType(compiler_zonk_type_list(context, seen, elements))
+		CompilerRangeType(inner):
+			CompilerRangeType(compiler_zonk_type_seen(context, seen, inner))
+		CompilerDimOpType(op, left, right):
+			CompilerDimOpType(
+				op,
+				compiler_zonk_type_seen(context, seen, left),
+				compiler_zonk_type_seen(context, seen, right),
+			)
+		_:
+			typ
+
+
+pure func compiler_zonk_type(context: CompilerContext, typ: CompilerType) -> CompilerType:
+	compiler_zonk_type_seen(context, [], typ)
+
+
+private pure func compiler_unify_options(
+	symmetric: Bool,
+	type_params: List[String],
+	rigid_vars: List[String],
+) -> CompilerUnifyOptions:
+	{
+		symmetric = symmetric,
+		type_params = type_params,
+		rigid_vars = rigid_vars
+	}
+
+
+private pure func compiler_unify_subst_list_lookup(
+	subst: List[CompilerTypeSubstEntry],
+	name: String,
+) -> Option[CompilerType]:
+	var result: Option[CompilerType] = None
+
+	for entry in subst:
+		if entry.var_name == name:
+			result = Some(entry.concrete_type)
+			break
+
+	result
+
+
+pure func compiler_unify_subst_lookup(
+	step: CompilerUnifyStep,
+	name: String,
+) -> Option[CompilerType]:
+	compiler_unify_subst_list_lookup(step.subst, name)
+
+
+private pure func compiler_unify_param_name_is_var(
+	options: CompilerUnifyOptions,
+	name: String,
+) -> Bool:
+	stripped_name: String = compiler_strip_type_param_bounds(name)
+	var found: Bool = False
+
+	for param in options.type_params:
+		stripped_param: String = compiler_strip_type_param_bounds(param)
+
+		if stripped_param == stripped_name:
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_unify_name_is_rigid(options: CompilerUnifyOptions, name: String) -> Bool:
+	stripped_name: String = compiler_strip_type_param_bounds(name)
+	var found: Bool = False
+
+	for rigid in options.rigid_vars:
+		stripped_rigid: String = compiler_strip_type_param_bounds(rigid)
+
+		if rigid == name or stripped_rigid == stripped_name:
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_unify_is_int_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerNamedType(name, args):
+			name == "Int" and args.length() == 0
+		_:
+			False
+
+
+private pure func compiler_unify_is_literal_string_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerNamedType(name, args):
+			name == "LiteralString" and args.length() == 0
+		_:
+			False
+
+
+private pure func compiler_unify_is_string_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerNamedType(name, args):
+			name == "String" and args.length() == 0
+		_:
+			False
+
+
+private pure func compiler_unify_is_variadic_dims(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerVarDimsType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_unify_try_bind(
+	step: CompilerUnifyStep,
+	name: String,
+	typ: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match compiler_unify_subst_list_lookup(step.subst, name):
+		Some(existing):
+			if compiler_types_equal(existing, typ):
+				Some(step)
+			else:
+				None
+		None:
+			if compiler_occurs_in(name, typ):
+				None
+			else:
+				Some({ step | subst = step.subst.append(compiler_type_subst_entry(name, typ)) })
+
+
+private pure func compiler_unify_bind_meta(
+	step: CompilerUnifyStep,
+	meta_id: Int,
+	typ: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	if compiler_occurs_meta(step.context, meta_id, typ):
+		None
+	else:
+		Some({ step | context = compiler_bind_meta(step.context, meta_id, typ) })
+
+
+private pure func compiler_unify_args_at(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left_args: List[CompilerType],
+	right_args: List[CompilerType],
+	left_index: Int,
+	right_index: Int,
+) -> Option[CompilerUnifyStep]:
+	if left_index == left_args.length() and right_index == right_args.length():
+		Some(step)
+	else if left_index < left_args.length():
+		match left_args.get(left_index):
+			Some(left):
+				if compiler_unify_is_variadic_dims(left) and left_index == left_args.length() - 1:
+					Some(step)
+				else if right_index < right_args.length():
+					match right_args.get(right_index):
+						Some(right):
+							if (
+								options.symmetric
+								and compiler_unify_is_variadic_dims(right)
+								and right_index == right_args.length() - 1
+							):
+								Some(step)
+							else:
+								match compiler_unify_go(options, step, left, right):
+									Some(next_step):
+										compiler_unify_args_at(
+											options,
+											next_step,
+											left_args,
+											right_args,
+											left_index + 1,
+											right_index + 1,
+										)
+									None:
+										None
+						None:
+							None
+				else:
+					None
+			None:
+				None
+	else if options.symmetric and right_index < right_args.length():
+		match right_args.get(right_index):
+			Some(right):
+				if (
+					compiler_unify_is_variadic_dims(right)
+					and right_index == right_args.length() - 1
+				):
+					Some(step)
+				else:
+					None
+			None:
+				None
+	else:
+		None
+
+
+private pure func compiler_unify_args(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left_args: List[CompilerType],
+	right_args: List[CompilerType],
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_args_at(options, step, left_args, right_args, 0, 0)
+
+
+private pure func compiler_unify_arrays(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match (compiler_array_type_parts(left), compiler_array_type_parts(right)):
+		(Some(left_parts), Some(right_parts)):
+			match compiler_unify_go(options, step, left_parts[0], right_parts[0]):
+				Some(element_step):
+					compiler_unify_args(options, element_step, left_parts[1], right_parts[1])
+				None:
+					None
+		_:
+			None
+
+
+private pure func compiler_unify_range_types(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match (left, right):
+		(CompilerRangeType(CompilerConstIntType(left_value)), CompilerRangeType(CompilerConstIntType(right_value))):
+			if right_value <= left_value:
+				Some(step)
+			else:
+				None
+		(CompilerRangeType(left_inner), CompilerRangeType(right_inner)):
+			compiler_unify_go(options, step, left_inner, right_inner)
+		_:
+			None
+
+
+private pure func compiler_unify_named_types(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left_name: String,
+	left_args: List[CompilerType],
+	right_name: String,
+	right_args: List[CompilerType],
+) -> Option[CompilerUnifyStep]:
+	if compiler_normalize_type_name(left_name) != compiler_normalize_type_name(right_name):
+		None
+	else:
+		compiler_unify_args(options, step, left_args, right_args)
+
+
+private pure func compiler_unify_tuples(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left_elements: List[CompilerType],
+	right_elements: List[CompilerType],
+) -> Option[CompilerUnifyStep]:
+	if left_elements.length() != right_elements.length():
+		None
+	else:
+		compiler_unify_args(options, step, left_elements, right_elements)
+
+
+private pure func compiler_unify_functions(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left_is_pure: Bool,
+	left_params: List[CompilerType],
+	left_return: CompilerType,
+	right_is_pure: Bool,
+	right_params: List[CompilerType],
+	right_return: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	if left_is_pure and not right_is_pure:
+		None
+	else if left_params.length() != right_params.length():
+		None
+	else:
+		match compiler_unify_args(options, step, left_params, right_params):
+			Some(params_step):
+				compiler_unify_go(options, params_step, left_return, right_return)
+			None:
+				None
+
+
+private pure func compiler_unify_dim_arithmetic(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match compiler_dim_solve(compiler_context_dim_meta_bindings(step.context), left, right):
+		CompilerDimSolved:
+			Some(step)
+		CompilerDimBindMeta(meta_id, value):
+			compiler_unify_bind_meta(step, meta_id, value)
+		CompilerDimBindVar(name, value):
+			compiler_unify_try_bind(step, name, value)
+		CompilerDimContradiction:
+			None
+		CompilerDimStuck:
+			normalized_left: CompilerType = compiler_normalize_dim(left)
+			normalized_right: CompilerType = compiler_normalize_dim(right)
+
+			if compiler_types_equal(normalized_left, normalized_right):
+				Some(step)
+			else if (
+				not compiler_types_equal(normalized_left, left)
+				or not compiler_types_equal(normalized_right, right)
+			):
+				compiler_unify_go(options, step, normalized_left, normalized_right)
+			else:
+				None
+
+
+private pure func compiler_unify_left_named(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	left_name: String,
+	left_args: List[CompilerType],
+	other: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	if left_args.length() == 0 and compiler_unify_param_name_is_var(options, left_name):
+		compiler_unify_try_bind(step, left_name, other)
+	else if left_args.length() == 0 and compiler_unify_name_is_rigid(options, left_name):
+		None
+	else:
+		match other:
+			CompilerNamedType(right_name, right_args):
+				if (
+					options.symmetric
+					and right_args.length() == 0
+					and compiler_unify_param_name_is_var(options, right_name)
+				):
+					compiler_unify_try_bind(step, right_name, left)
+				else if (
+					right_args.length() == 0
+					and compiler_unify_name_is_rigid(options, right_name)
+				):
+					None
+				else:
+					compiler_unify_named_types(
+						options,
+						step,
+						left_name,
+						left_args,
+						right_name,
+						right_args,
+					)
+			CompilerTupleType(right_elements):
+				if left_name == "Tuple":
+					compiler_unify_tuples(options, step, left_args, right_elements)
+				else:
+					compiler_unify_arrays(options, step, left, other)
+			CompilerRangeType(_):
+				if compiler_unify_is_int_type(left):
+					Some(step)
+				else:
+					compiler_unify_arrays(options, step, left, other)
+			_:
+				compiler_unify_arrays(options, step, left, other)
+
+
+private pure func compiler_unify_right_named(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	other: CompilerType,
+	right: CompilerType,
+	right_name: String,
+	right_args: List[CompilerType],
+) -> Option[CompilerUnifyStep]:
+	if (
+		options.symmetric
+		and right_args.length() == 0
+		and compiler_unify_param_name_is_var(options, right_name)
+	):
+		compiler_unify_try_bind(step, right_name, other)
+	else if right_args.length() == 0 and compiler_unify_name_is_rigid(options, right_name):
+		None
+	else:
+		match other:
+			CompilerRangeType(_):
+				if options.symmetric and compiler_unify_is_int_type(right):
+					Some(step)
+				else:
+					compiler_unify_arrays(options, step, other, right)
+			CompilerTupleType(left_elements):
+				if right_name == "Tuple":
+					compiler_unify_tuples(options, step, left_elements, right_args)
+				else:
+					compiler_unify_arrays(options, step, other, right)
+			_:
+				compiler_unify_arrays(options, step, other, right)
+
+
+private pure func compiler_unify_structural(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match left:
+		CompilerNamedType(left_name, left_args):
+			compiler_unify_left_named(options, step, left, left_name, left_args, right)
+		_:
+			match right:
+				CompilerNamedType(right_name, right_args):
+					compiler_unify_right_named(options, step, left, right, right_name, right_args)
+				_:
+					match (left, right):
+						(CompilerArrayType(_, _), CompilerArrayType(_, _)):
+							compiler_unify_arrays(options, step, left, right)
+						(CompilerFunctionType(left_is_pure, left_params, left_return), CompilerFunctionType(right_is_pure, right_params, right_return)):
+							compiler_unify_functions(
+								options,
+								step,
+								left_is_pure,
+								left_params,
+								left_return,
+								right_is_pure,
+								right_params,
+								right_return,
+							)
+						(CompilerTupleType(left_elements), CompilerTupleType(right_elements)):
+							compiler_unify_tuples(options, step, left_elements, right_elements)
+						(CompilerRangeType(_), CompilerRangeType(_)):
+							compiler_unify_range_types(options, step, left, right)
+						(_, CompilerRangeType(_)):
+							if compiler_unify_is_int_type(left):
+								Some(step)
+							else:
+								None
+						(CompilerRangeType(_), _):
+							if options.symmetric and compiler_unify_is_int_type(right):
+								Some(step)
+							else:
+								None
+						(CompilerSelfType, CompilerSelfType):
+							Some(step)
+						_:
+							None
+
+
+private pure func compiler_unify_right_or_structural(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	match right:
+		CompilerMetaType(meta_id):
+			compiler_unify_bind_meta(step, meta_id, left)
+		CompilerTypeVar(name):
+			if compiler_unify_name_is_rigid(options, name):
+				if compiler_is_dim_var_name(name) and compiler_unify_is_int_type(left):
+					Some(step)
+				else:
+					None
+			else:
+				if options.symmetric:
+					compiler_unify_try_bind(step, name, left)
+				else:
+					None
+		_:
+			compiler_unify_structural(options, step, left, right)
+
+
+private pure func compiler_unify_go(
+	options: CompilerUnifyOptions,
+	step: CompilerUnifyStep,
+	raw_left: CompilerType,
+	raw_right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	left: CompilerType = compiler_head_resolve(step.context, raw_left)
+	right: CompilerType = compiler_head_resolve(step.context, raw_right)
+
+	if compiler_types_equal(left, right):
+		Some(step)
+	else if compiler_unify_is_string_type(left) and compiler_unify_is_literal_string_type(right):
+		Some(step)
+	else if (
+		options.symmetric
+		and compiler_unify_is_literal_string_type(left)
+		and compiler_unify_is_string_type(right)
+	):
+		Some(step)
+	else if compiler_unify_is_int_type(left) and compiler_unify_is_dim_var_type(right):
+		Some(step)
+	else if (
+		options.symmetric
+		and compiler_unify_is_dim_var_type(left)
+		and compiler_unify_is_int_type(right)
+	):
+		Some(step)
+	else if compiler_unify_is_int_type(left) and compiler_unify_is_const_int_type(right):
+		Some(step)
+	else if (
+		options.symmetric
+		and compiler_unify_is_const_int_type(left)
+		and compiler_unify_is_int_type(right)
+	):
+		Some(step)
+	else if compiler_unify_is_dim_expr_type(left) or compiler_unify_is_dim_expr_type(right):
+		compiler_unify_dim_arithmetic(options, step, left, right)
+	else:
+		match left:
+			CompilerMetaType(meta_id):
+				compiler_unify_bind_meta(step, meta_id, right)
+			CompilerTypeVar(name):
+				if compiler_unify_name_is_rigid(options, name):
+					if compiler_is_dim_var_name(name) and compiler_unify_is_int_type(right):
+						Some(step)
+					else:
+						None
+				else:
+					compiler_unify_try_bind(step, name, right)
+			_:
+				compiler_unify_right_or_structural(options, step, left, right)
+
+
+private pure func compiler_unify_is_dim_var_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerTypeVar(name):
+			compiler_is_dim_var_name(name)
+		CompilerNamedType(name, args):
+			args.length() == 0 and compiler_is_dim_var_name(name)
+		_:
+			False
+
+
+private pure func compiler_unify_is_const_int_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerConstIntType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_unify_is_dim_expr_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerDimOpType(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func compiler_unify_with_options(
+	context: CompilerContext,
+	options: CompilerUnifyOptions,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_go(
+		options,
+		{
+			context = context,
+			subst = []
+		},
+		left,
+		right,
+	)
+
+
+pure func compiler_unify(
+	context: CompilerContext,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_with_options(
+		context,
+		compiler_unify_options(False, [], []),
+		left,
+		right,
+	)
+
+
+pure func compiler_unify_symmetric(
+	context: CompilerContext,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_with_options(
+		context,
+		compiler_unify_options(True, [], []),
+		left,
+		right,
+	)
+
+
+pure func compiler_unify_with_type_params(
+	context: CompilerContext,
+	type_params: List[String],
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_with_options(
+		context,
+		compiler_unify_options(False, type_params, []),
+		left,
+		right,
+	)
+
+
+pure func compiler_unify_symmetric_with_type_params(
+	context: CompilerContext,
+	type_params: List[String],
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerUnifyStep]:
+	compiler_unify_with_options(
+		context,
+		compiler_unify_options(True, type_params, []),
+		left,
+		right,
+	)
+
+
+pure func compiler_types_compatible_in_context(
+	context: CompilerContext,
+	expected: CompilerType,
+	actual: CompilerType,
+) -> Bool:
+	compiler_unify(context, expected, actual) != None
+
+
+pure func compiler_types_compatible_with_params_in_context(
+	context: CompilerContext,
+	type_params: List[String],
+	expected: CompilerType,
+	actual: CompilerType,
+) -> Bool:
+	compiler_unify_with_type_params(context, type_params, expected, actual) != None
+
+
+pure func compiler_types_bidirectional_in_context(
+	context: CompilerContext,
+	left: CompilerType,
+	right: CompilerType,
+) -> Bool:
+	compiler_unify_symmetric(context, left, right) != None
+
+
+pure func compiler_types_compatible_rigid_in_context(
+	context: CompilerContext,
+	rigid_vars: List[String],
+	expected: CompilerType,
+	actual: CompilerType,
+) -> Bool:
+	compiler_unify_with_options(
+		context,
+		compiler_unify_options(False, [], rigid_vars),
+		expected,
+		actual,
+	) != None
+
+
+pure func compiler_mint_def_id(context: CompilerContext) -> CompilerDefIdStep:
+	{
+		context = { context | def_id_counter = context.def_id_counter + 1 },
+		def_id = context.def_id_counter
+	}
+
+
+pure func compiler_fresh_meta_with_origin(
+	context: CompilerContext,
+	origin: String,
+) -> CompilerFreshMetaStep:
+	meta_id: Int = context.fresh_meta_counter
+
+	meta_origin: String = if origin.length() == 0:
+		"?"
+	else:
+		origin
+
+	{
+		context = { context |
+			fresh_meta_counter = meta_id + 1,
+			meta_origins = context.meta_origins.append({
+				meta_id = meta_id,
+				origin = meta_origin,
+			})
+		},
+		meta_type = CompilerMetaType(meta_id)
+	}
+
+
+pure func compiler_fresh_meta(context: CompilerContext) -> CompilerFreshMetaStep:
+	compiler_fresh_meta_with_origin(context, "?")
+
+
+pure func compiler_reset_meta(context: CompilerContext) -> CompilerContext:
+	{ context |
+		fresh_meta_counter = 0,
+		meta_origins = [],
+		meta_bindings = []
+	}
+
+
+pure func compiler_reset_core_counters(context: CompilerContext) -> CompilerContext:
+	{ context |
+		def_id_counter = 0,
+		lower_destruct_counter = 0,
+		lower_param_counter = 0,
+		lower_question_bind_counter = 0,
+		lower_resource_counter = 0,
+		lower_task_scope_counter = 1,
+		lower_current_task_scope_id = 0,
+		desugar_counter = 0,
+		ssa_mut_counter = 0
+	}

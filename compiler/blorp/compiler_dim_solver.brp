@@ -1,0 +1,705 @@
+-- Canonical dimension constraint solving for the Blorp-owned frontend.
+--
+-- Dimension expressions are normalized to a sum-of-products form so
+-- commutativity, associativity, distributivity, and exact constant division are
+-- handled before type unification decides whether two dimensions are
+-- compatible.
+import:
+	compiler_type:
+		CompilerDimOp(CompilerDimAdd, CompilerDimDivide, CompilerDimMultiply, CompilerDimSubtract),
+		CompilerType(CompilerConstIntType, CompilerDimOpType, CompilerMetaType, CompilerTypeVar),
+		compiler_is_dim_var_name,
+		compiler_type_to_string,
+
+
+private record CompilerDimMonomial {
+	coeff: Int,
+	vars: List[String]
+}
+
+
+private record CompilerDimCanonical {
+	const_value: Int,
+	terms: List[CompilerDimMonomial]
+}
+
+
+union CompilerDimSolveResult:
+	CompilerDimSolved
+	CompilerDimBindMeta(Int, CompilerType)
+	CompilerDimBindVar(String, CompilerType)
+	CompilerDimContradiction
+	CompilerDimStuck
+
+
+private pure func compiler_dim_monomial(coeff: Int, vars: List[String]) -> CompilerDimMonomial:
+	{
+		coeff = coeff,
+		vars = vars
+	}
+
+
+private pure func compiler_dim_const(value: Int) -> CompilerDimCanonical:
+	{
+		const_value = value,
+		terms = []
+	}
+
+
+private pure func compiler_dim_var(name: String) -> CompilerDimCanonical:
+	{
+		const_value = 0,
+		terms = [compiler_dim_monomial(1, [name])]
+	}
+
+
+private pure func compiler_dim_type_const(value: Int) -> CompilerType:
+	CompilerConstIntType(value)
+
+
+private pure func compiler_dim_type_var(name: String) -> CompilerType:
+	if compiler_dim_is_meta_name(name):
+		id_text: String = name.substring(2, name.length() - 2)
+
+		match id_text.parse_int():
+			Some(meta_id):
+				CompilerMetaType(meta_id)
+			None:
+				CompilerTypeVar(name)
+	else:
+		CompilerTypeVar(name)
+
+
+private pure func compiler_dim_compare_strings(left: String, right: String) -> Int:
+	if left < right:
+		-1
+	else if left > right:
+		1
+	else:
+		0
+
+
+private pure func compiler_dim_compare_var_lists(left: List[String], right: List[String]) -> Int:
+	var index: Int = 0
+	var result: Int = 0
+
+	while (
+		index < left.length()
+		and index < right.length()
+		and result == 0
+	):
+		match (left.get(index), right.get(index)):
+			(Some(left_var), Some(right_var)):
+				result = compiler_dim_compare_strings(left_var, right_var)
+			_:
+				void
+
+		index += 1
+
+	if result != 0:
+		result
+	else if left.length() < right.length():
+		-1
+	else if left.length() > right.length():
+		1
+	else:
+		0
+
+
+private pure func compiler_dim_insert_sorted_monomial(
+	sorted: List[CompilerDimMonomial],
+	term: CompilerDimMonomial,
+) -> List[CompilerDimMonomial]:
+	var result: List[CompilerDimMonomial] = []
+	var inserted: Bool = False
+
+	for existing in sorted:
+		if not inserted and compiler_dim_compare_var_lists(term.vars, existing.vars) <= 0:
+			result = result.append(term)
+			inserted = True
+
+		result = result.append(existing)
+
+	if inserted:
+		result
+	else:
+		result.append(term)
+
+
+private pure func compiler_dim_sort_terms(
+	terms: List[CompilerDimMonomial],
+) -> List[CompilerDimMonomial]:
+	var result: List[CompilerDimMonomial] = []
+
+	for term in terms:
+		result = compiler_dim_insert_sorted_monomial(result, term)
+
+	result
+
+
+private pure func compiler_dim_append_nonzero(
+	terms: List[CompilerDimMonomial],
+	term: CompilerDimMonomial,
+) -> List[CompilerDimMonomial]:
+	if term.coeff == 0:
+		terms
+	else:
+		terms.append(term)
+
+
+private pure func compiler_dim_negate_monomial(term: CompilerDimMonomial) -> CompilerDimMonomial:
+	{
+		coeff = 0 - term.coeff,
+		vars = term.vars
+	}
+
+
+private pure func compiler_dim_merge_terms(
+	terms: List[CompilerDimMonomial],
+) -> List[CompilerDimMonomial]:
+	sorted: List[CompilerDimMonomial] = compiler_dim_sort_terms(terms)
+	var result: List[CompilerDimMonomial] = []
+	var current: Option[CompilerDimMonomial] = None
+
+	for term in sorted:
+		match current:
+			Some(existing):
+				if existing.vars == term.vars:
+					current = Some({ existing | coeff = existing.coeff + term.coeff })
+				else:
+					result = compiler_dim_append_nonzero(result, existing)
+					current = Some(term)
+			None:
+				current = Some(term)
+
+	match current:
+		Some(term):
+			compiler_dim_append_nonzero(result, term)
+		None:
+			result
+
+
+private pure func compiler_dim_negate(canonical: CompilerDimCanonical) -> CompilerDimCanonical:
+	{
+		const_value = 0 - canonical.const_value,
+		terms = canonical.terms.map(compiler_dim_negate_monomial)
+	}
+
+
+private pure func compiler_dim_add(
+	left: CompilerDimCanonical,
+	right: CompilerDimCanonical,
+) -> CompilerDimCanonical:
+	{
+		const_value = left.const_value + right.const_value,
+		terms = compiler_dim_merge_terms(left.terms.concat(right.terms))
+	}
+
+
+private pure func compiler_dim_subtract(
+	left: CompilerDimCanonical,
+	right: CompilerDimCanonical,
+) -> CompilerDimCanonical:
+	compiler_dim_add(left, compiler_dim_negate(right))
+
+
+private pure func compiler_dim_multiply(
+	left: CompilerDimCanonical,
+	right: CompilerDimCanonical,
+) -> CompilerDimCanonical:
+	var cross_terms: List[CompilerDimMonomial] = []
+
+	if right.const_value != 0:
+		for term in left.terms:
+			cross_terms = cross_terms.append({ term | coeff = term.coeff * right.const_value })
+
+	if left.const_value != 0:
+		for term in right.terms:
+			cross_terms = cross_terms.append({ term | coeff = term.coeff * left.const_value })
+
+	for left_term in left.terms:
+		for right_term in right.terms:
+			product_vars: List[String] = left_term.vars
+				.concat(right_term.vars)
+				.sort()
+			cross_terms = cross_terms.append(
+				compiler_dim_monomial(
+					left_term.coeff * right_term.coeff,
+					product_vars,
+				),
+			)
+
+	{
+		const_value = left.const_value * right.const_value,
+		terms = compiler_dim_merge_terms(cross_terms)
+	}
+
+
+private pure func compiler_dim_try_div_const(
+	canonical: CompilerDimCanonical,
+	divisor: Int,
+) -> Option[CompilerDimCanonical]:
+	if divisor == 0 or canonical.const_value % divisor != 0:
+		None
+	else:
+		var divided_terms: List[CompilerDimMonomial] = []
+		var divides_evenly: Bool = True
+
+		for term in canonical.terms:
+			if term.coeff % divisor != 0:
+				divides_evenly = False
+			else:
+				divided_terms = divided_terms.append({ term | coeff = term.coeff / divisor })
+
+		if divides_evenly:
+			Some({
+				const_value = canonical.const_value / divisor,
+				terms = compiler_dim_merge_terms(divided_terms),
+			})
+		else:
+			None
+
+
+private pure func compiler_dim_lookup_meta(
+	meta_bindings: List[(Int, CompilerType)],
+	meta_id: Int,
+) -> Option[CompilerType]:
+	var result: Option[CompilerType] = None
+
+	for entry in meta_bindings:
+		if entry[0] == meta_id:
+			result = Some(entry[1])
+			break
+
+	result
+
+
+private pure func compiler_dim_canonical_to_debug(canonical: CompilerDimCanonical) -> String:
+	var parts: List[String] = []
+
+	if canonical.const_value != 0:
+		parts = parts.append(canonical.const_value.to_string())
+
+	for term in canonical.terms:
+		vars_text: String = term.vars.join("*")
+
+		if term.coeff == 1:
+			parts = parts.append(vars_text)
+		else:
+			parts = parts.append(term.coeff.to_string() + "*" + vars_text)
+
+	if parts.length() == 0:
+		"0"
+	else:
+		parts.join("+")
+
+
+private pure func compiler_dim_divide_to_canonical(
+	meta_bindings: List[(Int, CompilerType)],
+	left: CompilerType,
+	right: CompilerType,
+) -> CompilerDimCanonical:
+	left_canonical: CompilerDimCanonical = compiler_dim_to_canonical(meta_bindings, left)
+	right_canonical: CompilerDimCanonical = compiler_dim_to_canonical(meta_bindings, right)
+
+	if right_canonical.terms.length() == 0 and right_canonical.const_value > 0:
+		match compiler_dim_try_div_const(left_canonical, right_canonical.const_value):
+			Some(divided):
+				divided
+			None:
+				compiler_dim_var(
+					"__div(" + compiler_dim_canonical_to_debug(
+						left_canonical,
+					) + "," + right_canonical.const_value.to_string() + ")",
+				)
+	else:
+		compiler_dim_var(
+			"__div(" + compiler_dim_canonical_to_debug(
+				left_canonical,
+			) + "," + compiler_dim_canonical_to_debug(right_canonical) + ")",
+		)
+
+
+private pure func compiler_dim_to_canonical(
+	meta_bindings: List[(Int, CompilerType)],
+	typ: CompilerType,
+) -> CompilerDimCanonical:
+	match typ:
+		CompilerConstIntType(value):
+			compiler_dim_const(value)
+		CompilerTypeVar(name):
+			compiler_dim_var(name)
+		CompilerMetaType(meta_id):
+			match compiler_dim_lookup_meta(meta_bindings, meta_id):
+				Some(binding):
+					compiler_dim_to_canonical(meta_bindings, binding)
+				None:
+					compiler_dim_var("?m" + meta_id.to_string())
+		CompilerDimOpType(op, left, right):
+			match op:
+				CompilerDimAdd:
+					compiler_dim_add(
+						compiler_dim_to_canonical(meta_bindings, left),
+						compiler_dim_to_canonical(meta_bindings, right),
+					)
+				CompilerDimSubtract:
+					compiler_dim_subtract(
+						compiler_dim_to_canonical(meta_bindings, left),
+						compiler_dim_to_canonical(meta_bindings, right),
+					)
+				CompilerDimMultiply:
+					compiler_dim_multiply(
+						compiler_dim_to_canonical(meta_bindings, left),
+						compiler_dim_to_canonical(meta_bindings, right),
+					)
+				CompilerDimDivide:
+					compiler_dim_divide_to_canonical(meta_bindings, left, right)
+		_:
+			compiler_dim_var("__opaque(" + compiler_type_to_string(typ) + ")")
+
+
+private pure func compiler_dim_term_to_type(term: CompilerDimMonomial) -> CompilerType:
+	if term.vars.length() == 0:
+		compiler_dim_type_const(term.coeff)
+	else:
+		var result: CompilerType = compiler_dim_type_var(term.vars.get_or(0, ""))
+		var index: Int = 1
+
+		while index < term.vars.length():
+			result = CompilerDimOpType(
+				CompilerDimMultiply,
+				result,
+				compiler_dim_type_var(term.vars.get_or(index, "")),
+			)
+			index += 1
+
+		if term.coeff == 1:
+			result
+		else:
+			CompilerDimOpType(CompilerDimMultiply, compiler_dim_type_const(term.coeff), result)
+
+
+private pure func compiler_dim_from_canonical(canonical: CompilerDimCanonical) -> CompilerType:
+	var parts: List[CompilerType] = []
+
+	if canonical.const_value != 0:
+		parts = parts.append(compiler_dim_type_const(canonical.const_value))
+
+	for term in canonical.terms:
+		parts = parts.append(compiler_dim_term_to_type(term))
+
+	if parts.length() == 0:
+		compiler_dim_type_const(0)
+	else:
+		var result: CompilerType = parts.get_or(0, compiler_dim_type_const(0))
+		var index: Int = 1
+
+		while index < parts.length():
+			result = CompilerDimOpType(
+				CompilerDimAdd,
+				result,
+				parts.get_or(index, compiler_dim_type_const(0)),
+			)
+			index += 1
+
+		result
+
+
+private pure func compiler_dim_canonical_equal(
+	left: CompilerDimCanonical,
+	right: CompilerDimCanonical,
+) -> Bool:
+	left.const_value == right.const_value and left.terms == right.terms
+
+
+private pure func compiler_dim_is_meta_name(name: String) -> Bool:
+	name.length() > 2 and name.get_or(0, ' ') == '?' and name.get_or(1, ' ') == 'm'
+
+
+private pure func compiler_dim_meta_id_from_name(name: String) -> Option[Int]:
+	if compiler_dim_is_meta_name(name):
+		name
+			.substring(2, name.length() - 2)
+			.parse_int()
+	else:
+		None
+
+
+private pure func compiler_dim_is_solvable_name(name: String) -> Bool:
+	compiler_dim_is_meta_name(name) or compiler_is_dim_var_name(name)
+
+
+private pure func compiler_dim_is_solvable_type(
+	meta_bindings: List[(Int, CompilerType)],
+	typ: CompilerType,
+) -> Bool:
+	match typ:
+		CompilerMetaType(meta_id):
+			compiler_dim_lookup_meta(meta_bindings, meta_id) == None
+		CompilerTypeVar(name):
+			compiler_is_dim_var_name(name)
+		_:
+			False
+
+
+private pure func compiler_dim_bind_name(
+	name: String,
+	value: CompilerType,
+) -> CompilerDimSolveResult:
+	match compiler_dim_meta_id_from_name(name):
+		Some(meta_id):
+			CompilerDimBindMeta(meta_id, value)
+		None:
+			CompilerDimBindVar(name, value)
+
+
+private pure func compiler_dim_bind_type(
+	variable: CompilerType,
+	value: CompilerType,
+) -> CompilerDimSolveResult:
+	match variable:
+		CompilerMetaType(meta_id):
+			CompilerDimBindMeta(meta_id, value)
+		CompilerTypeVar(name):
+			CompilerDimBindVar(name, value)
+		_:
+			CompilerDimStuck
+
+
+private pure func compiler_dim_rest_terms(
+	terms: List[CompilerDimMonomial],
+	candidate: CompilerDimMonomial,
+) -> List[CompilerDimMonomial]:
+	var result: List[CompilerDimMonomial] = []
+
+	for term in terms:
+		if term.vars != candidate.vars or term.coeff != candidate.coeff:
+			result = result.append(term)
+
+	result
+
+
+private pure func compiler_dim_try_isolate(
+	diff_const: Int,
+	candidate: CompilerDimMonomial,
+	rest_terms: List[CompilerDimMonomial],
+) -> Option[CompilerDimSolveResult]:
+	if candidate.vars.length() != 1 or candidate.coeff == 0:
+		None
+	else:
+		single_var: String = candidate.vars.get_or(0, "")
+
+		if not compiler_dim_is_solvable_name(single_var):
+			None
+		else:
+			rest_canonical: CompilerDimCanonical = {
+				const_value = diff_const,
+				terms = rest_terms
+			}
+
+			match compiler_dim_try_div_const(compiler_dim_negate(rest_canonical), candidate.coeff):
+				Some(value):
+					Some(compiler_dim_bind_name(single_var, compiler_dim_from_canonical(value)))
+				None:
+					None
+
+
+private pure func compiler_dim_monomial_has_meta(term: CompilerDimMonomial) -> Bool:
+	var found: Bool = False
+
+	for var_name in term.vars:
+		if compiler_dim_is_meta_name(var_name):
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_dim_solve_multiple_terms(
+	diff: CompilerDimCanonical,
+) -> CompilerDimSolveResult:
+	var meta_terms: List[CompilerDimMonomial] = []
+	var other_terms: List[CompilerDimMonomial] = []
+
+	for term in diff.terms:
+		if compiler_dim_monomial_has_meta(term):
+			meta_terms = meta_terms.append(term)
+		else:
+			other_terms = other_terms.append(term)
+
+	candidates: List[CompilerDimMonomial] = meta_terms.concat(other_terms)
+	var result: Option[CompilerDimSolveResult] = None
+
+	for candidate in candidates:
+		if result == None:
+			result = compiler_dim_try_isolate(
+				diff.const_value,
+				candidate,
+				compiler_dim_rest_terms(diff.terms, candidate),
+			)
+
+	match result:
+		Some(solved):
+			solved
+		None:
+			CompilerDimStuck
+
+
+private pure func compiler_dim_solve_single_term(
+	diff_const: Int,
+	term: CompilerDimMonomial,
+) -> CompilerDimSolveResult:
+	if term.vars.length() != 1:
+		CompilerDimStuck
+	else:
+		single_var: String = term.vars.get_or(0, "")
+
+		if not compiler_dim_is_solvable_name(single_var):
+			CompilerDimStuck
+		else if term.coeff == 0:
+			if diff_const == 0:
+				CompilerDimSolved
+			else:
+				CompilerDimContradiction
+		else if diff_const % term.coeff != 0:
+			CompilerDimStuck
+		else:
+			value: Int = (0 - diff_const) / term.coeff
+
+			if value <= 0:
+				CompilerDimStuck
+			else:
+				compiler_dim_bind_name(single_var, compiler_dim_type_const(value))
+
+
+private pure func compiler_dim_solve_diff(diff: CompilerDimCanonical) -> CompilerDimSolveResult:
+	if diff.terms.length() == 0:
+		if diff.const_value == 0:
+			CompilerDimSolved
+		else:
+			CompilerDimContradiction
+	else if diff.terms.length() == 1:
+		compiler_dim_solve_single_term(
+			diff.const_value,
+			diff.terms.get_or(
+				0,
+				compiler_dim_monomial(0, []),
+			),
+		)
+	else:
+		compiler_dim_solve_multiple_terms(diff)
+
+
+private pure func compiler_dim_try_divisor_var_case(
+	meta_bindings: List[(Int, CompilerType)],
+	dividend: CompilerType,
+	divisor: CompilerType,
+	rhs_expr: CompilerType,
+) -> Option[CompilerDimSolveResult]:
+	if not compiler_dim_is_solvable_type(meta_bindings, divisor):
+		None
+	else:
+		dividend_canonical: CompilerDimCanonical = compiler_dim_to_canonical(
+			meta_bindings,
+			dividend,
+		)
+		rhs_canonical: CompilerDimCanonical = compiler_dim_to_canonical(meta_bindings, rhs_expr)
+
+		if (
+			dividend_canonical.terms.length() == 0
+			and rhs_canonical.terms.length() == 0
+			and rhs_canonical.const_value > 0
+			and dividend_canonical.const_value % rhs_canonical.const_value == 0
+		):
+			Some(
+				compiler_dim_bind_type(
+					divisor,
+					compiler_dim_type_const(
+						dividend_canonical.const_value / rhs_canonical.const_value,
+					),
+				),
+			)
+		else:
+			None
+
+
+private pure func compiler_dim_try_dividend_var_case(
+	meta_bindings: List[(Int, CompilerType)],
+	dividend: CompilerType,
+	divisor: CompilerType,
+	rhs_expr: CompilerType,
+) -> Option[CompilerDimSolveResult]:
+	match divisor:
+		CompilerConstIntType(divisor_value):
+			if divisor_value <= 0:
+				None
+			else:
+				rhs_canonical: CompilerDimCanonical = compiler_dim_to_canonical(
+					meta_bindings,
+					rhs_expr,
+				)
+				product: CompilerDimCanonical = compiler_dim_multiply(
+					rhs_canonical,
+					compiler_dim_const(divisor_value),
+				)
+				dividend_canonical: CompilerDimCanonical = compiler_dim_to_canonical(
+					meta_bindings,
+					dividend,
+				)
+
+				Some(compiler_dim_solve_diff(compiler_dim_subtract(dividend_canonical, product)))
+		_:
+			None
+
+
+private pure func compiler_dim_check_division_special(
+	meta_bindings: List[(Int, CompilerType)],
+	dividend: CompilerType,
+	divisor: CompilerType,
+	rhs_expr: CompilerType,
+) -> Option[CompilerDimSolveResult]:
+	match compiler_dim_try_divisor_var_case(meta_bindings, dividend, divisor, rhs_expr):
+		Some(result):
+			Some(result)
+		None:
+			compiler_dim_try_dividend_var_case(meta_bindings, dividend, divisor, rhs_expr)
+
+
+private pure func compiler_dim_try_division_special(
+	meta_bindings: List[(Int, CompilerType)],
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerDimSolveResult]:
+	match left:
+		CompilerDimOpType(left_op, dividend, divisor):
+			if left_op == CompilerDimDivide:
+				compiler_dim_check_division_special(meta_bindings, dividend, divisor, right)
+			else:
+				None
+		_:
+			match right:
+				CompilerDimOpType(right_op, dividend, divisor):
+					if right_op == CompilerDimDivide:
+						compiler_dim_check_division_special(meta_bindings, dividend, divisor, left)
+					else:
+						None
+				_:
+					None
+
+
+pure func compiler_dim_solve(
+	meta_bindings: List[(Int, CompilerType)],
+	left: CompilerType,
+	right: CompilerType,
+) -> CompilerDimSolveResult:
+	match compiler_dim_try_division_special(meta_bindings, left, right):
+		Some(result):
+			result
+		None:
+			left_canonical: CompilerDimCanonical = compiler_dim_to_canonical(meta_bindings, left)
+			right_canonical: CompilerDimCanonical = compiler_dim_to_canonical(meta_bindings, right)
+
+			if compiler_dim_canonical_equal(left_canonical, right_canonical):
+				CompilerDimSolved
+			else:
+				compiler_dim_solve_diff(compiler_dim_subtract(left_canonical, right_canonical))

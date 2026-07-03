@@ -1,0 +1,936 @@
+-- Range/subscript proof metadata for the Blorp-owned frontend.
+--
+-- These types keep proof facts explicit and separate from ordinary type data.
+-- Inference can attach the facts to binding or expression metadata without
+-- relying on ambient proof-env lookups after the fact.
+import:
+	string: string
+
+
+record CompilerCollectionIdentity {
+	name: String
+}
+
+
+record CompilerDimensionIdentity {
+	name: String
+}
+
+
+union CompilerProvenCollection:
+	CompilerCollVar(CompilerCollectionIdentity)
+	CompilerCollSubscript(CompilerProvenCollection, CompilerCollectionIdentity)
+	CompilerCollDim(Int)
+
+
+union CompilerRangeUpper:
+	CompilerRangeUpperLit(Int)
+	CompilerRangeUpperDimension(CompilerDimensionIdentity)
+	CompilerRangeUpperLengthMinus(CompilerCollectionIdentity, Int)
+	CompilerRangeUpperAtMostLength(CompilerCollectionIdentity)
+
+
+enum CompilerProofSource:
+	CompilerProofSourceUnknown
+	CompilerProofSourceLoopRange
+	CompilerProofSourceLoopIndices
+	CompilerProofSourceLoopEnumerate
+	CompilerProofSourceCondition
+	CompilerProofSourceRangeTypeFallback
+
+
+record CompilerRangeProof {
+	range_start: Int,
+	range_upper: CompilerRangeUpper,
+	range_source: CompilerProofSource
+}
+
+
+record CompilerSubscriptProof {
+	subscript_collection: CompilerProvenCollection,
+	subscript_source: CompilerProofSource
+}
+
+
+record CompilerValueProofs {
+	range: Option[CompilerRangeProof],
+	subscript: Option[CompilerSubscriptProof]
+}
+
+
+union CompilerSubscriptBound:
+	CompilerConstantDim(Int)
+	CompilerDimensionBound(CompilerDimensionIdentity)
+	CompilerCollectionLength(CompilerCollectionIdentity)
+
+
+record CompilerSubscriptBounds {
+	constant_dims: List[Int],
+	dimension_bounds: List[CompilerDimensionIdentity],
+	collection_lengths: List[CompilerCollectionIdentity]
+}
+
+
+union CompilerOffsetRejection:
+	CompilerOffsetNoMatchingBound
+	CompilerOffsetOutOfBounds(String)
+
+
+union CompilerOffsetSubscriptProof:
+	CompilerOffsetProven
+	CompilerOffsetRejected(CompilerOffsetRejection)
+
+
+record CompilerIndexSpan {
+	min_index: Int,
+	max_index: Int
+}
+
+
+record CompilerProofEnv {
+	subscript_proofs: List[(CompilerCollectionIdentity, CompilerSubscriptProof)],
+	range_proofs: List[(CompilerCollectionIdentity, CompilerRangeProof)]
+}
+
+
+union CompilerNarrowedSubject:
+	CompilerNarrowedBinding(CompilerCollectionIdentity)
+	CompilerNarrowedAlias(CompilerCollectionIdentity, CompilerCollectionIdentity)
+
+
+union CompilerBranchSubject:
+	CompilerImmutableSubject(CompilerNarrowedSubject)
+	CompilerMutableSubject(CompilerCollectionIdentity)
+
+
+record CompilerBranchRangeProof {
+	subject: CompilerNarrowedSubject,
+	proof: CompilerRangeProof
+}
+
+
+enum CompilerBranchProofRejection:
+	CompilerMutableSubjectCannotNarrow
+	CompilerInvalidRangeBounds
+
+
+pure func compiler_collection_identities_equal(
+	left: CompilerCollectionIdentity,
+	right: CompilerCollectionIdentity,
+) -> Bool:
+	left.name == right.name
+
+
+pure func compiler_dimension_identities_equal(
+	left: CompilerDimensionIdentity,
+	right: CompilerDimensionIdentity,
+) -> Bool:
+	left.name == right.name
+
+
+pure func compiler_proof_sources_equal(
+	left: CompilerProofSource,
+	right: CompilerProofSource,
+) -> Bool:
+	match left:
+		CompilerProofSourceUnknown:
+			match right:
+				CompilerProofSourceUnknown:
+					True
+				_:
+					False
+		CompilerProofSourceLoopRange:
+			match right:
+				CompilerProofSourceLoopRange:
+					True
+				_:
+					False
+		CompilerProofSourceLoopIndices:
+			match right:
+				CompilerProofSourceLoopIndices:
+					True
+				_:
+					False
+		CompilerProofSourceLoopEnumerate:
+			match right:
+				CompilerProofSourceLoopEnumerate:
+					True
+				_:
+					False
+		CompilerProofSourceCondition:
+			match right:
+				CompilerProofSourceCondition:
+					True
+				_:
+					False
+		CompilerProofSourceRangeTypeFallback:
+			match right:
+				CompilerProofSourceRangeTypeFallback:
+					True
+				_:
+					False
+
+
+pure func compiler_proven_collections_equal(
+	left: CompilerProvenCollection,
+	right: CompilerProvenCollection,
+) -> Bool:
+	match left:
+		CompilerCollVar(left_id):
+			match right:
+				CompilerCollVar(right_id):
+					compiler_collection_identities_equal(left_id, right_id)
+				_:
+					False
+		CompilerCollSubscript(left_collection, left_index):
+			match right:
+				CompilerCollSubscript(right_collection, right_index):
+					(
+						compiler_collection_identities_equal(left_index, right_index)
+						and compiler_proven_collections_equal(left_collection, right_collection)
+					)
+				_:
+					False
+		CompilerCollDim(left_dim):
+			match right:
+				CompilerCollDim(right_dim):
+					left_dim == right_dim
+				_:
+					False
+
+
+private pure func compiler_valid_identity(name: String) -> Bool:
+	name.trim() == name and name.length() > 0
+
+
+private pure func compiler_is_dim_var_name(name: String) -> Bool:
+	name.length() > 0 and name.get_or(0, ' ') == '#'
+
+
+pure func compiler_collection_identity(name: String) -> Option[CompilerCollectionIdentity]:
+	if compiler_valid_identity(name):
+		Some({name = name})
+	else:
+		None
+
+
+pure func compiler_dimension_identity(name: String) -> Option[CompilerDimensionIdentity]:
+	if compiler_is_dim_var_name(name):
+		Some({name = name})
+	else:
+		None
+
+
+pure func compiler_collection_identity_name(identity: CompilerCollectionIdentity) -> String:
+	identity.name
+
+
+pure func compiler_dimension_identity_name(identity: CompilerDimensionIdentity) -> String:
+	identity.name
+
+
+pure func compiler_collection_var(identity: CompilerCollectionIdentity) -> CompilerProvenCollection:
+	CompilerCollVar(identity)
+
+
+pure func compiler_collection_subscript(
+	collection: CompilerProvenCollection,
+	index: CompilerCollectionIdentity,
+) -> CompilerProvenCollection:
+	CompilerCollSubscript(collection, index)
+
+
+pure func compiler_collection_dim(dim: Int) -> Option[CompilerProvenCollection]:
+	if dim < 0:
+		None
+	else:
+		Some(CompilerCollDim(dim))
+
+
+pure func compiler_direct_collection_var(
+	collection: CompilerProvenCollection,
+) -> Option[CompilerCollectionIdentity]:
+	match collection:
+		CompilerCollVar(identity):
+			Some(identity)
+		_:
+			None
+
+
+pure func compiler_collection_dim_at_most(collection: CompilerProvenCollection, size: Int) -> Bool:
+	match collection:
+		CompilerCollDim(dim):
+			size >= 0 and dim <= size
+		_:
+			False
+
+
+pure func compiler_range_upper_lit(upper: Int) -> Option[CompilerRangeUpper]:
+	if upper < 0:
+		None
+	else:
+		Some(CompilerRangeUpperLit(upper))
+
+
+pure func compiler_range_upper_dimension(dim: CompilerDimensionIdentity) -> CompilerRangeUpper:
+	CompilerRangeUpperDimension(dim)
+
+
+pure func compiler_range_upper_length_minus(
+	coll: CompilerCollectionIdentity,
+	end_offset: Int,
+) -> Option[CompilerRangeUpper]:
+	if end_offset < 0:
+		None
+	else:
+		Some(CompilerRangeUpperLengthMinus(coll, end_offset))
+
+
+pure func compiler_range_upper_at_most_length(
+	coll: CompilerCollectionIdentity,
+) -> CompilerRangeUpper:
+	CompilerRangeUpperAtMostLength(coll)
+
+
+private pure func compiler_valid_upper(range_start: Int, upper: CompilerRangeUpper) -> Bool:
+	match upper:
+		CompilerRangeUpperLit(value):
+			value >= 0 and value >= range_start
+		CompilerRangeUpperDimension(_):
+			range_start >= 0
+		CompilerRangeUpperLengthMinus(_, end_offset):
+			end_offset >= 0
+		CompilerRangeUpperAtMostLength(_):
+			True
+
+
+pure func compiler_make_range_proof_with_source(
+	range_start: Int,
+	range_upper: CompilerRangeUpper,
+	source: CompilerProofSource,
+) -> Option[CompilerRangeProof]:
+	if range_start < 0 or not compiler_valid_upper(range_start, range_upper):
+		None
+	else:
+		Some({
+			range_start = range_start,
+			range_upper = range_upper,
+			range_source = source,
+		})
+
+
+pure func compiler_make_range_proof(
+	range_start: Int,
+	range_upper: CompilerRangeUpper,
+) -> Option[CompilerRangeProof]:
+	compiler_make_range_proof_with_source(range_start, range_upper, CompilerProofSourceUnknown)
+
+
+pure func compiler_range_proof_source(proof: CompilerRangeProof) -> CompilerProofSource:
+	proof.range_source
+
+
+pure func compiler_make_subscript_proof(
+	collection: CompilerProvenCollection,
+	source: CompilerProofSource,
+) -> CompilerSubscriptProof:
+	{
+		subscript_collection = collection,
+		subscript_source = source
+	}
+
+
+pure func compiler_subscript_proof_collection(
+	proof: CompilerSubscriptProof,
+) -> CompilerProvenCollection:
+	proof.subscript_collection
+
+
+pure func compiler_subscript_proof_source(proof: CompilerSubscriptProof) -> CompilerProofSource:
+	proof.subscript_source
+
+
+pure func compiler_no_proofs() -> CompilerValueProofs:
+	{
+		range = None,
+		subscript = None
+	}
+
+
+pure func compiler_unrefined_binding() -> CompilerValueProofs:
+	compiler_no_proofs()
+
+
+pure func compiler_unproven_expr() -> CompilerValueProofs:
+	compiler_no_proofs()
+
+
+pure func compiler_expr_proofs_of_binding(binding: CompilerValueProofs) -> CompilerValueProofs:
+	binding
+
+
+pure func compiler_binding_refinement_of_expr_proofs(
+	proofs: CompilerValueProofs,
+) -> CompilerValueProofs:
+	proofs
+
+
+pure func compiler_range_binding(proof: CompilerRangeProof) -> CompilerValueProofs:
+	{
+		range = Some(proof),
+		subscript = None
+	}
+
+
+pure func compiler_binding_add_range_proof(
+	binding: CompilerValueProofs,
+	proof: CompilerRangeProof,
+) -> CompilerValueProofs:
+	{ binding | range = Some(proof) }
+
+
+pure func compiler_binding_add_subscript_proof(
+	binding: CompilerValueProofs,
+	collection: CompilerProvenCollection,
+	source: CompilerProofSource,
+) -> CompilerValueProofs:
+	{ binding | subscript = Some(compiler_make_subscript_proof(collection, source)) }
+
+
+pure func compiler_binding_range_proof(binding: CompilerValueProofs) -> Option[CompilerRangeProof]:
+	binding.range
+
+
+pure func compiler_binding_proves_subscript(
+	binding: CompilerValueProofs,
+	collection: CompilerProvenCollection,
+) -> Bool:
+	match binding.subscript:
+		Some(proof):
+			compiler_proven_collections_equal(proof.subscript_collection, collection)
+		None:
+			False
+
+
+pure func compiler_binding_proves_dim_at_most(binding: CompilerValueProofs, size: Int) -> Bool:
+	match binding.subscript:
+		Some(proof):
+			compiler_collection_dim_at_most(proof.subscript_collection, size)
+		None:
+			False
+
+
+pure func compiler_binding_direct_collection_vars(
+	binding: CompilerValueProofs,
+) -> List[CompilerCollectionIdentity]:
+	match binding.subscript:
+		Some(proof):
+			match compiler_direct_collection_var(proof.subscript_collection):
+				Some(identity):
+					[identity]
+				None:
+					[]
+		None:
+			[]
+
+
+pure func compiler_constant_dim_bound(dim: Int) -> Option[CompilerSubscriptBound]:
+	if dim < 0:
+		None
+	else:
+		Some(CompilerConstantDim(dim))
+
+
+pure func compiler_dimension_bound(dim: CompilerDimensionIdentity) -> CompilerSubscriptBound:
+	CompilerDimensionBound(dim)
+
+
+pure func compiler_collection_length_bound(
+	coll: CompilerCollectionIdentity,
+) -> CompilerSubscriptBound:
+	CompilerCollectionLength(coll)
+
+
+pure func compiler_empty_subscript_bounds() -> CompilerSubscriptBounds:
+	{
+		constant_dims = [],
+		dimension_bounds = [],
+		collection_lengths = []
+	}
+
+
+private pure func compiler_add_subscript_bound(
+	bounds: CompilerSubscriptBounds,
+	bound: CompilerSubscriptBound,
+) -> CompilerSubscriptBounds:
+	match bound:
+		CompilerConstantDim(dim):
+			{ bounds | constant_dims = bounds.constant_dims.append(dim) }
+		CompilerDimensionBound(dim):
+			{ bounds | dimension_bounds = bounds.dimension_bounds.append(dim) }
+		CompilerCollectionLength(coll):
+			{ bounds | collection_lengths = bounds.collection_lengths.append(coll) }
+
+
+pure func compiler_subscript_bounds(
+	bounds: List[CompilerSubscriptBound],
+) -> CompilerSubscriptBounds:
+	var result: CompilerSubscriptBounds = compiler_empty_subscript_bounds()
+
+	for bound in bounds:
+		result = compiler_add_subscript_bound(result, bound)
+
+	result
+
+
+pure func compiler_covers_const_dim(proof: CompilerRangeProof, dim: Int) -> Bool:
+	match proof.range_upper:
+		CompilerRangeUpperLit(upper):
+			proof.range_start >= 0 and upper <= dim
+		_:
+			False
+
+
+pure func compiler_covers_dimension(
+	proof: CompilerRangeProof,
+	dim: CompilerDimensionIdentity,
+) -> Bool:
+	match proof.range_upper:
+		CompilerRangeUpperDimension(bounded_dim):
+			proof.range_start >= 0 and compiler_dimension_identities_equal(bounded_dim, dim)
+		_:
+			False
+
+
+pure func compiler_covers_same_collection(
+	proof: CompilerRangeProof,
+	coll: CompilerCollectionIdentity,
+) -> Bool:
+	match proof.range_upper:
+		CompilerRangeUpperLengthMinus(bounded_coll, _):
+			proof.range_start >= 0 and compiler_collection_identities_equal(bounded_coll, coll)
+		CompilerRangeUpperAtMostLength(bounded_coll):
+			proof.range_start >= 0 and compiler_collection_identities_equal(bounded_coll, coll)
+		_:
+			False
+
+
+private pure func compiler_literal_offset_span(
+	proof: CompilerRangeProof,
+	upper: Int,
+	offset: Int,
+) -> Option[CompilerIndexSpan]:
+	if upper <= proof.range_start:
+		None
+	else:
+		Some({
+			min_index = proof.range_start + offset,
+			max_index = upper - 1 + offset,
+		})
+
+
+private pure func compiler_offset_span_fits(dim: Int, span: CompilerIndexSpan) -> Bool:
+	span.min_index >= 0 and span.max_index >= 0 and span.max_index < dim
+
+
+private pure func compiler_offset_span_error(dim: Int, span: CompilerIndexSpan) -> String:
+	var message: String = string(128)
+	message = message.append_str("index range [")
+	message = message.append_int(span.min_index)
+	message = message.append_str(", ")
+	message = message.append_int(span.max_index)
+	message = message.append_str("] exceeds dimension of size ")
+	message = message.append_int(dim)
+	message = message.append_str(". Adjust loop bounds to ensure all accesses are in [0, ")
+	message = message.append_int(dim)
+	message = message.append_str(")")
+
+	message
+
+
+pure func compiler_covers_const_dim_with_offset(
+	proof: CompilerRangeProof,
+	dim: Int,
+	offset: Int,
+) -> Result[Void, String]:
+	match proof.range_upper:
+		CompilerRangeUpperLit(upper):
+			match compiler_literal_offset_span(proof, upper, offset):
+				None:
+					Ok(void)
+				Some(span):
+					if compiler_offset_span_fits(dim, span):
+						Ok(void)
+					else:
+						Err(compiler_offset_span_error(dim, span))
+		_:
+			Err("")
+
+
+pure func compiler_covers_same_collection_with_offset(
+	proof: CompilerRangeProof,
+	coll: CompilerCollectionIdentity,
+	offset: Int,
+) -> Bool:
+	match proof.range_upper:
+		CompilerRangeUpperLengthMinus(bounded_coll, end_offset):
+			(
+				compiler_collection_identities_equal(bounded_coll, coll)
+				and proof.range_start + offset >= 0
+				and offset <= end_offset
+			)
+		_:
+			False
+
+
+pure func compiler_proves_direct_subscript_with_bounds(
+	proof: CompilerRangeProof,
+	bounds: CompilerSubscriptBounds,
+) -> Bool:
+	match proof.range_upper:
+		CompilerRangeUpperLit(_):
+			var proven: Bool = False
+
+			for dim in bounds.constant_dims:
+				if compiler_covers_const_dim(proof, dim):
+					proven = True
+					break
+
+			proven
+		CompilerRangeUpperDimension(_):
+			var proven: Bool = False
+
+			for dim in bounds.dimension_bounds:
+				if compiler_covers_dimension(proof, dim):
+					proven = True
+					break
+
+			proven
+		CompilerRangeUpperLengthMinus(_, _):
+			var proven: Bool = False
+
+			for coll in bounds.collection_lengths:
+				if compiler_covers_same_collection(proof, coll):
+					proven = True
+					break
+
+			proven
+		CompilerRangeUpperAtMostLength(_):
+			var proven: Bool = False
+
+			for coll in bounds.collection_lengths:
+				if compiler_covers_same_collection(proof, coll):
+					proven = True
+					break
+
+			proven
+
+
+pure func compiler_proves_direct_subscript(
+	proof: CompilerRangeProof,
+	bounds: List[CompilerSubscriptBound],
+) -> Bool:
+	compiler_proves_direct_subscript_with_bounds(proof, compiler_subscript_bounds(bounds))
+
+
+private pure func compiler_preserve_first_offset_error(
+	current: CompilerOffsetRejection,
+	message: String,
+) -> CompilerOffsetRejection:
+	if message.length() == 0:
+		current
+	else:
+		match current:
+			CompilerOffsetOutOfBounds(_):
+				current
+			CompilerOffsetNoMatchingBound:
+				CompilerOffsetOutOfBounds(message)
+
+
+private pure func compiler_proves_literal_offset_subscript(
+	proof: CompilerRangeProof,
+	dims: List[Int],
+	offset: Int,
+) -> CompilerOffsetSubscriptProof:
+	var result: CompilerOffsetSubscriptProof = CompilerOffsetRejected(CompilerOffsetNoMatchingBound)
+	var first_error: CompilerOffsetRejection = CompilerOffsetNoMatchingBound
+
+	for dim in dims:
+		match result:
+			CompilerOffsetProven:
+				void
+			CompilerOffsetRejected(_):
+				match compiler_covers_const_dim_with_offset(proof, dim, offset):
+					Ok(_):
+						result = CompilerOffsetProven
+					Err(message):
+						first_error = compiler_preserve_first_offset_error(first_error, message)
+
+	match result:
+		CompilerOffsetProven:
+			CompilerOffsetProven
+		CompilerOffsetRejected(_):
+			CompilerOffsetRejected(first_error)
+
+
+pure func compiler_proves_offset_subscript_with_bounds(
+	proof: CompilerRangeProof,
+	bounds: CompilerSubscriptBounds,
+	offset: Int,
+) -> CompilerOffsetSubscriptProof:
+	match proof.range_upper:
+		CompilerRangeUpperLit(_):
+			compiler_proves_literal_offset_subscript(proof, bounds.constant_dims, offset)
+		CompilerRangeUpperDimension(_):
+			CompilerOffsetRejected(CompilerOffsetNoMatchingBound)
+		CompilerRangeUpperLengthMinus(_, _):
+			var proven: Bool = False
+
+			for coll in bounds.collection_lengths:
+				if compiler_covers_same_collection_with_offset(proof, coll, offset):
+					proven = True
+					break
+
+			if proven:
+				CompilerOffsetProven
+			else:
+				CompilerOffsetRejected(CompilerOffsetNoMatchingBound)
+		CompilerRangeUpperAtMostLength(_):
+			CompilerOffsetRejected(CompilerOffsetNoMatchingBound)
+
+
+pure func compiler_proves_offset_subscript(
+	proof: CompilerRangeProof,
+	bounds: List[CompilerSubscriptBound],
+	offset: Int,
+) -> CompilerOffsetSubscriptProof:
+	compiler_proves_offset_subscript_with_bounds(proof, compiler_subscript_bounds(bounds), offset)
+
+
+pure func compiler_binding_proves_direct_range(
+	binding: CompilerValueProofs,
+	bounds: List[CompilerSubscriptBound],
+) -> Bool:
+	match binding.range:
+		Some(proof):
+			compiler_proves_direct_subscript(proof, bounds)
+		None:
+			False
+
+
+pure func compiler_binding_proves_offset_range(
+	binding: CompilerValueProofs,
+	bounds: List[CompilerSubscriptBound],
+	offset: Int,
+) -> CompilerOffsetSubscriptProof:
+	match binding.range:
+		Some(proof):
+			compiler_proves_offset_subscript(proof, bounds, offset)
+		None:
+			compiler_offset_no_matching_bound()
+
+
+pure func compiler_offset_no_matching_bound() -> CompilerOffsetSubscriptProof:
+	CompilerOffsetRejected(CompilerOffsetNoMatchingBound)
+
+
+pure func compiler_empty_proof_env() -> CompilerProofEnv:
+	{
+		subscript_proofs = [],
+		range_proofs = []
+	}
+
+
+private pure func compiler_remove_subscript_proofs_for_var(
+	var_id: CompilerCollectionIdentity,
+	proofs: List[(CompilerCollectionIdentity, CompilerSubscriptProof)],
+) -> List[(CompilerCollectionIdentity, CompilerSubscriptProof)]:
+	var result: List[(CompilerCollectionIdentity, CompilerSubscriptProof)] = []
+
+	for entry in proofs:
+		if not compiler_collection_identities_equal(entry[0], var_id):
+			result = result.append(entry)
+
+	result
+
+
+private pure func compiler_remove_range_proofs_for_var(
+	var_id: CompilerCollectionIdentity,
+	proofs: List[(CompilerCollectionIdentity, CompilerRangeProof)],
+) -> List[(CompilerCollectionIdentity, CompilerRangeProof)]:
+	var result: List[(CompilerCollectionIdentity, CompilerRangeProof)] = []
+
+	for entry in proofs:
+		if not compiler_collection_identities_equal(entry[0], var_id):
+			result = result.append(entry)
+
+	result
+
+
+private pure func compiler_find_subscript_proof_for_var(
+	var_id: CompilerCollectionIdentity,
+	proofs: List[(CompilerCollectionIdentity, CompilerSubscriptProof)],
+) -> Option[CompilerSubscriptProof]:
+	var result: Option[CompilerSubscriptProof] = None
+
+	for entry in proofs:
+		if compiler_collection_identities_equal(entry[0], var_id):
+			result = Some(entry[1])
+			break
+
+	result
+
+
+private pure func compiler_find_range_proof_for_var(
+	var_id: CompilerCollectionIdentity,
+	proofs: List[(CompilerCollectionIdentity, CompilerRangeProof)],
+) -> Option[CompilerRangeProof]:
+	var result: Option[CompilerRangeProof] = None
+
+	for entry in proofs:
+		if compiler_collection_identities_equal(entry[0], var_id):
+			result = Some(entry[1])
+			break
+
+	result
+
+
+pure func compiler_proof_env_without_subscript(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+) -> CompilerProofEnv:
+	{ env |
+		subscript_proofs = compiler_remove_subscript_proofs_for_var(var_id, env.subscript_proofs)
+	}
+
+
+pure func compiler_proof_env_without_range(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+) -> CompilerProofEnv:
+	{ env | range_proofs = compiler_remove_range_proofs_for_var(var_id, env.range_proofs) }
+
+
+pure func compiler_proof_env_add_subscript(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+	collection: CompilerProvenCollection,
+	source: CompilerProofSource,
+) -> CompilerProofEnv:
+	{ env |
+		subscript_proofs = compiler_remove_subscript_proofs_for_var(
+			var_id,
+			env.subscript_proofs,
+		).append((var_id, compiler_make_subscript_proof(collection, source)))
+	}
+
+
+pure func compiler_proof_env_apply_subscript_to_binding(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+	binding: CompilerValueProofs,
+) -> CompilerValueProofs:
+	match compiler_find_subscript_proof_for_var(var_id, env.subscript_proofs):
+		Some(proof):
+			compiler_binding_add_subscript_proof(
+				binding,
+				proof.subscript_collection,
+				proof.subscript_source,
+			)
+		None:
+			binding
+
+
+private pure func compiler_proof_env_add_range_proof(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+	proof: CompilerRangeProof,
+) -> CompilerProofEnv:
+	{ env |
+		range_proofs = compiler_remove_range_proofs_for_var(
+			var_id,
+			env.range_proofs,
+		).append((var_id, proof))
+	}
+
+
+pure func compiler_proof_env_add_range_bounds(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+	range_start: Int,
+	range_upper: CompilerRangeUpper,
+	source: CompilerProofSource,
+) -> CompilerProofEnv:
+	match compiler_make_range_proof_with_source(range_start, range_upper, source):
+		Some(proof):
+			compiler_proof_env_add_range_proof(env, var_id, proof)
+		None:
+			compiler_proof_env_without_range(env, var_id)
+
+
+pure func compiler_proof_env_find_range(
+	env: CompilerProofEnv,
+	var_id: CompilerCollectionIdentity,
+) -> Option[CompilerRangeProof]:
+	compiler_find_range_proof_for_var(var_id, env.range_proofs)
+
+
+pure func compiler_immutable_subject(name: String) -> Option[CompilerBranchSubject]:
+	match compiler_collection_identity(name):
+		Some(identity):
+			Some(CompilerImmutableSubject(CompilerNarrowedBinding(identity)))
+		None:
+			None
+
+
+pure func compiler_immutable_alias_subject(
+	alias_name: String,
+	target_name: String,
+) -> Option[CompilerBranchSubject]:
+	match (compiler_collection_identity(alias_name), compiler_collection_identity(target_name)):
+		(Some(alias_id), Some(target_id)):
+			if compiler_collection_identities_equal(alias_id, target_id):
+				None
+			else:
+				Some(CompilerImmutableSubject(CompilerNarrowedAlias(alias_id, target_id)))
+		_:
+			None
+
+
+pure func compiler_mutable_subject(name: String) -> Option[CompilerBranchSubject]:
+	match compiler_collection_identity(name):
+		Some(identity):
+			Some(CompilerMutableSubject(identity))
+		None:
+			None
+
+
+pure func compiler_make_branch_range_proof(
+	subject: CompilerBranchSubject,
+	range_start: Int,
+	range_upper: CompilerRangeUpper,
+) -> Result[CompilerBranchRangeProof, CompilerBranchProofRejection]:
+	match subject:
+		CompilerMutableSubject(_):
+			Err(CompilerMutableSubjectCannotNarrow)
+		CompilerImmutableSubject(narrowed_subject):
+			match compiler_make_range_proof_with_source(
+				range_start,
+				range_upper,
+				CompilerProofSourceCondition,
+			):
+				Some(proof):
+					Ok({
+						subject = narrowed_subject,
+						proof = proof,
+					})
+				None:
+					Err(CompilerInvalidRangeBounds)
+
+
+pure func compiler_branch_range_subject(proof: CompilerBranchRangeProof) -> CompilerNarrowedSubject:
+	proof.subject
+
+
+pure func compiler_branch_range_proof(proof: CompilerBranchRangeProof) -> CompilerRangeProof:
+	proof.proof

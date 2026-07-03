@@ -962,10 +962,17 @@ type test_file_info = {
   test_file_source : string;
   test_file_has_main : bool;
   test_file_is_suite : bool;
+  test_file_is_leak_baseline_program : bool;
   test_file_has_doctests : bool;
   test_file_requires_process_isolation : bool;
   test_file_requires_filesystem_isolation : bool;
 }
+
+let leak_baseline_root = "tests/test_blorp/memory/leak_check_baselines"
+
+let is_leak_baseline_program filename =
+  let path = normalized_relative_test_path filename in
+  path_under leak_baseline_root path && Filename.check_suffix path ".brp"
 
 let classify_test_file filename =
   let source = read_file filename in
@@ -974,6 +981,7 @@ let classify_test_file filename =
     test_file_source = source;
     test_file_has_main = has_top_level_main_source source;
     test_file_is_suite = source_declares_testsuite source;
+    test_file_is_leak_baseline_program = is_leak_baseline_program filename;
     test_file_has_doctests = source_mentions_doctests source;
     test_file_requires_process_isolation = requires_process_isolation filename;
     test_file_requires_filesystem_isolation =
@@ -1781,16 +1789,16 @@ let generate_doctest_program_with_map ~source_path ~source_text program =
   generate_doctest_program_with_map_impl source_path program doctests
 
 (** Check if a file looks like a valid test *)
-let is_valid_test_info info =
-  info.test_file_has_main || info.test_file_is_suite
-  || info.test_file_has_doctests
-  || contains_substring info.test_file_source "std/test"
+let is_valid_test_info ~leak_check info =
+  info.test_file_is_suite || info.test_file_has_doctests
+  || (leak_check && info.test_file_is_leak_baseline_program)
 
-let classify_valid_test_file filename =
-  try
-    let info = classify_test_file filename in
-    if is_valid_test_info info then Some info else None
-  with _ -> None
+let classify_valid_test_file ~leak_check filename =
+  let info = classify_test_file filename in
+  if is_valid_test_info ~leak_check info then Some info else None
+
+let classify_discovered_test_file ~leak_check filename =
+  try classify_valid_test_file ~leak_check filename with _ -> None
 
 (** Directories to skip when searching for test files *)
 let skip_directories =
@@ -1800,7 +1808,7 @@ let skip_directories =
 let sorted_directory_entries path =
   Sys.readdir path |> Array.to_list |> List.sort String.compare
 
-let find_brp_file_infos dir =
+let find_brp_file_infos ~leak_check dir =
   let rec walk acc path =
     if Sys.is_directory path then
       let dirname = Filename.basename path in
@@ -1811,26 +1819,35 @@ let find_brp_file_infos dir =
           acc
           (sorted_directory_entries path)
     else if Filename.check_suffix path ".brp" then
-      match classify_valid_test_file path with
+      match classify_discovered_test_file ~leak_check path with
       | Some info -> info :: acc
       | None -> acc
     else acc
   in
   List.rev (walk [] dir)
 
-let find_brp_files dir =
-  List.map (fun info -> info.test_file_path) (find_brp_file_infos dir)
+let find_brp_files ?(leak_check = false) dir =
+  List.map
+    (fun info -> info.test_file_path)
+    (find_brp_file_infos ~leak_check dir)
 
-let collect_test_file_infos paths =
+let collect_test_file_infos ~leak_check paths =
   let infos_for_path path =
-    if is_directory path then find_brp_file_infos path
-    else [ classify_test_file path ]
+    if is_directory path then find_brp_file_infos ~leak_check path
+    else
+      match classify_valid_test_file ~leak_check path with
+      | Some info -> [ info ]
+      | None -> []
   in
   List.fold_right (fun path acc -> infos_for_path path @ acc) paths []
 
 let collect_test_files paths =
   let files_for_path path =
-    if is_directory path then find_brp_files path else [ path ]
+    if is_directory path then find_brp_files path
+    else
+      match classify_valid_test_file ~leak_check:false path with
+      | Some info -> [ info.test_file_path ]
+      | None -> []
   in
   List.fold_right (fun path acc -> files_for_path path @ acc) paths []
 
@@ -2413,7 +2430,21 @@ let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
   let isolate_filesystem =
     leak_check || info.test_file_requires_filesystem_isolation
   in
-  let is_suite_file = info.test_file_is_suite || info.test_file_has_main in
+  let invalid_suite_main_result () =
+    {
+      file = filename;
+      passed = false;
+      duration = 0.0;
+      output = "";
+      error_detail =
+        "(invalid test file: TestSuite files must not define func main)";
+    }
+  in
+  let is_leak_baseline_program =
+    leak_check && info.test_file_is_leak_baseline_program
+  in
+  let is_suite_file = info.test_file_is_suite && not info.test_file_has_main in
+  let is_runnable_file = is_suite_file || is_leak_baseline_program in
   match mode with
   | DocOnly ->
       if info.test_file_has_doctests then
@@ -2421,7 +2452,9 @@ let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
           ~source_text:info.test_file_source filename
       else []
   | SuiteOnly ->
-      if is_suite_file then
+      if info.test_file_is_suite && info.test_file_has_main then
+        [ invalid_suite_main_result () ]
+      else if is_runnable_file then
         [
           run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
             ~leak_check ~isolate_filesystem ~timeout
@@ -2431,7 +2464,7 @@ let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
       else []
   | TestAll ->
       let suite_results =
-        if is_suite_file then
+        if is_runnable_file then
           [
             run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
               ~leak_check ~isolate_filesystem ~timeout
@@ -2446,7 +2479,12 @@ let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
             ~source_text:info.test_file_source filename
         else []
       in
-      suite_results @ doc_results
+      let invalid_results =
+        if info.test_file_is_suite && info.test_file_has_main then
+          [ invalid_suite_main_result () ]
+        else []
+      in
+      invalid_results @ suite_results @ doc_results
 
 let print_test_start ?worker file =
   match worker with
@@ -3146,6 +3184,11 @@ let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
     ?(cache = true) ?(repeat = 1) test_infos =
   with_run_artifacts (fun () ->
+      if test_infos = [] then begin
+        prerr_endline "Error: no runnable tests found";
+        1
+      end
+      else
       let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
       let sanitize = sanitizer_enabled sanitizer_mode in
       let files = List.map (fun info -> info.test_file_path) test_infos in
@@ -3200,10 +3243,10 @@ let run_tests ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(cache = true) ?(repeat = 1) path =
   run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
     ~timeout ~jobs ~cache ~repeat
-    (collect_test_file_infos [ path ])
+    (collect_test_file_infos ~leak_check [ path ])
 
 let run_tests_paths ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
     ?(cache = true) ?(repeat = 1) paths =
   run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
-    ~timeout ~jobs ~cache ~repeat (collect_test_file_infos paths)
+    ~timeout ~jobs ~cache ~repeat (collect_test_file_infos ~leak_check paths)

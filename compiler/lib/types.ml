@@ -1101,8 +1101,6 @@ let validate_array_dims ?sess (type_params : string list) (ty : type_expr) :
               else None)
       | _ -> None)
 
-let validate_tensor_dims = validate_array_dims
-
 (** Check if a type contains TyVarDims (variadic dims like #N...) anywhere.
     Used to reject variadic dims in positions where concrete dimensions are required
     (variable declarations, record fields). Variadic dims are only valid in function

@@ -51,6 +51,9 @@ let () =
         (fun (name, cases) -> ("Diagnostics." ^ name, cases))
         Test_diagnostics.suite
     @ List.map
+        (fun (name, cases) -> ("LanguageSurface." ^ name, cases))
+        Test_language_surface.suite
+    @ List.map
         (fun (name, cases) -> ("LspSignature." ^ name, cases))
         Test_lsp_signature.suite
     @ List.map
@@ -93,6 +96,9 @@ let () =
     @ List.map
         (fun (name, cases) -> ("ModuleSurface." ^ name, cases))
         Test_module_surface.suite
+    @ List.map
+        (fun (name, cases) -> ("ModuleTypeIdentity." ^ name, cases))
+        Test_module_type_identity.suite
     @ List.map
         (fun (name, cases) -> ("ParsedAstJson." ^ name, cases))
         Test_parsed_ast_json.suite
@@ -159,9 +165,6 @@ let () =
     @ List.map
         (fun (name, cases) -> ("CoreConsumeSpecialize." ^ name, cases))
         Test_core_consume_specialize.suite
-    @ List.map
-        (fun (name, cases) -> ("CoreTensorStorageProducer." ^ name, cases))
-        Test_core_tensor_storage_producer.suite
     @ List.map
         (fun (name, cases) -> ("CoreTensorType." ^ name, cases))
         Test_core_tensor_type.suite

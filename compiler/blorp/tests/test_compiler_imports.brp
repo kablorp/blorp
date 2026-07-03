@@ -1,0 +1,258 @@
+import:
+	../compiler_context:
+		CompilerModuleOrigin(CompilerSourcePackageModule, CompilerStdlibModule, CompilerUserModule),
+	../compiler_imports:
+		CompilerImportableModuleSurface,
+		compiler_import_default_alias,
+		compiler_importable_module_surface,
+		compiler_register_import_decls,
+	../compiler_module_surface: module_surface_for_program
+	../compiler_parsed_ast: ParsedDecl(ImportBlockParsedDecl), ParsedImportDecl, ParsedProgram
+	../compiler_parser: parse_compiler_source
+	../compiler_source: CompilerSourceFile, compiler_source_file
+	../compiler_source_ast_finalize: finalize_typecheck_source_program
+	../compiler_typecheck_state:
+		CompilerTypecheckState,
+		compiler_typecheck_state_empty,
+		compiler_typecheck_state_find_module_alias,
+		compiler_typecheck_state_find_type_home,
+		compiler_typecheck_state_has_import_binding,
+		compiler_typecheck_state_has_imported_module,
+		compiler_typecheck_state_has_known_type_name,
+		compiler_typecheck_state_stdlib,
+	test: TestSuite
+
+
+pure func source_file(module_name: String, text: String) -> CompilerSourceFile:
+	compiler_source_file(module_name + ".brp", module_name, text)
+
+
+pure func parsed_program(module_name: String, text: String) -> ParsedProgram:
+	program = parse_compiler_source(source_file(module_name, text))
+	finalize_typecheck_source_program(program)
+
+
+pure func import_decls(text: String) -> List[ParsedImportDecl]:
+	program = parsed_program("imports", text)
+
+	match program.decls.get(0):
+		Some(ImportBlockParsedDecl(imports, _)):
+			imports
+		_:
+			[]
+
+
+pure func importable_module(
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	text: String,
+) -> CompilerImportableModuleSurface:
+	compiler_importable_module_surface(
+		module_path,
+		origin,
+		module_surface_for_program(parsed_program(module_path, text)),
+	)
+
+
+pure func register_import_source(
+	state: CompilerTypecheckState,
+	modules: List[CompilerImportableModuleSurface],
+	text: String,
+) -> CompilerTypecheckState:
+	compiler_register_import_decls(state, modules, import_decls(text))
+
+
+pure func has_imported_name(
+	state: CompilerTypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for binding in state.imported_names:
+		if (
+			binding.local_name == local_name
+			and binding.module_path == module_path
+			and binding.original_name == original_name
+		):
+			found = True
+			break
+
+	found
+
+
+pure func errors_contain(state: CompilerTypecheckState, needle: String) -> Bool:
+	var found: Bool = False
+
+	for error in state.errors:
+		if error.contains(needle):
+			found = True
+			break
+
+	found
+
+
+func test_registers_qualified_import_alias() -> Bool:
+	state = register_import_source(
+		compiler_typecheck_state_empty(),
+		[
+			importable_module(
+				"dict",
+				CompilerStdlibModule,
+				"record Dict {size: Int}\n\nfunc empty() -> Int:\n\t0",
+			),
+		],
+		"import:\n\tdict as D\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and compiler_typecheck_state_has_imported_module(state, "dict")
+		and compiler_typecheck_state_find_module_alias(state, "D") == Some("dict")
+		and compiler_typecheck_state_has_import_binding(state, "D", "dict", None)
+	)
+
+
+func test_registers_default_alias_from_path() -> Bool:
+	state = register_import_source(
+		compiler_typecheck_state_empty(),
+		[importable_module("./helpers/local", CompilerUserModule, "func value() -> Int:\n\t1")],
+		"import:\n\t./helpers/local\n\nfunc main(): 0",
+	)
+
+	(
+		compiler_import_default_alias("./helpers/local.brp") == "local"
+		and state.errors.length() == 0
+		and compiler_typecheck_state_find_module_alias(state, "local") == Some("./helpers/local")
+	)
+
+
+func test_registers_selective_imports_and_type_homes() -> Bool:
+	state = register_import_source(
+		compiler_typecheck_state_empty(),
+		[
+			importable_module(
+				"json",
+				CompilerStdlibModule,
+				"record Token {value: Int}\n\nfunc parse() -> Int:\n\t1",
+			),
+		],
+		"import:\n\tjson: parse as parse_json, Token\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and has_imported_name(state, "parse_json", "json", "parse")
+		and has_imported_name(state, "Token", "json", "Token")
+		and compiler_typecheck_state_has_import_binding(state, "parse_json", "json", Some("parse"))
+		and compiler_typecheck_state_has_known_type_name(state, "Token")
+		and compiler_typecheck_state_find_type_home(state, "Token") == Some("json")
+	)
+
+
+func test_combined_import_registers_symbols_and_module_alias() -> Bool:
+	state = register_import_source(
+		compiler_typecheck_state_empty(),
+		[
+			importable_module(
+				"heap",
+				CompilerStdlibModule,
+				"record Heap {size: Int}\n\nfunc push() -> Int:\n\t1",
+			),
+		],
+		"import:\n\theap as H: Heap\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and has_imported_name(state, "Heap", "heap", "Heap")
+		and compiler_typecheck_state_find_module_alias(state, "H") == Some("heap")
+		and compiler_typecheck_state_has_import_binding(state, "H", "heap", None)
+	)
+
+
+func test_rejects_private_missing_and_duplicate_selective_imports() -> Bool:
+	modules = [
+		importable_module(
+			"secrets",
+			CompilerUserModule,
+			"private func hidden() -> Int:\n\t0\n\nfunc parse() -> Int:\n\t1\n\nfunc render() -> Int:\n\t2",
+		),
+	]
+	private_state = register_import_source(
+		compiler_typecheck_state_empty(),
+		modules,
+		"import:\n\tsecrets: hidden\n\nfunc main(): 0",
+	)
+	missing_state = register_import_source(
+		compiler_typecheck_state_empty(),
+		modules,
+		"import:\n\tsecrets: missing\n\nfunc main(): 0",
+	)
+	duplicate_state = register_import_source(
+		compiler_typecheck_state_empty(),
+		modules,
+		"import:\n\tsecrets: parse as same, render as same\n\nfunc main(): 0",
+	)
+
+	(
+		private_state.errors_contain("private in module 'secrets'")
+		and missing_state.errors_contain("not exported by module 'secrets'")
+		and duplicate_state.errors_contain("already imported from this module")
+		and duplicate_state.imported_names.length() == 1
+	)
+
+
+func test_rejects_duplicate_module_imports_and_std_package_imports() -> Bool:
+	duplicate_state = register_import_source(
+		compiler_typecheck_state_empty(),
+		[importable_module("dict", CompilerStdlibModule, "record Dict {size: Int}")],
+		"import:\n\tdict as D\n\tdict as D2\n\nfunc main(): 0",
+	)
+	std_package_state = register_import_source(
+		compiler_typecheck_state_stdlib(),
+		[
+			importable_module(
+				"sample",
+				CompilerSourcePackageModule("sample"),
+				"func value() -> Int:\n\t1",
+			),
+		],
+		"import:\n\tsample\n\nfunc main(): 0",
+	)
+
+	(
+		duplicate_state.errors_contain("already imported")
+		and compiler_typecheck_state_find_module_alias(duplicate_state, "D") == Some("dict")
+		and compiler_typecheck_state_find_module_alias(duplicate_state, "D2") == None
+		and std_package_state.errors_contain(
+			"standard library modules cannot import package modules",
+		)
+		and not compiler_typecheck_state_has_imported_module(std_package_state, "sample")
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler import registration substrate",
+	tests = [
+		("registers qualified import alias", test_registers_qualified_import_alias),
+		("registers default alias from path", test_registers_default_alias_from_path),
+		(
+			"registers selective imports and type homes",
+			test_registers_selective_imports_and_type_homes,
+		),
+		(
+			"combined import registers symbols and module alias",
+			test_combined_import_registers_symbols_and_module_alias,
+		),
+		(
+			"rejects private missing and duplicate selective imports",
+			test_rejects_private_missing_and_duplicate_selective_imports,
+		),
+		(
+			"rejects duplicate module imports and std package imports",
+			test_rejects_duplicate_module_imports_and_std_package_imports,
+		),
+	]
+}
