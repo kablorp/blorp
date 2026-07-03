@@ -114,15 +114,62 @@ let bridge_success_json artifact =
          ("artifact", artifact);
        ])
 
-let parsed_ast_artifact ?comments program =
+let string_array values = Lsp_json.Array (List.map (fun s -> Lsp_json.String s) values)
+
+let module_surface_symbol_source_json ?method_index kind decl_index =
   let fields =
-    match comments with
-    | Some values -> [ ("parsed_ast", program); ("comments", Lsp_json.Array values) ]
-    | None -> [ ("parsed_ast", program) ]
+    [ ("kind", Lsp_json.String kind); ("decl_index", Lsp_json.Int decl_index) ]
+    @
+    match method_index with
+    | Some value -> [ ("method_index", Lsp_json.Int value) ]
+    | None -> []
   in
   Lsp_json.Object fields
 
-let string_array values = Lsp_json.Array (List.map (fun s -> Lsp_json.String s) values)
+let module_surface_symbol_json ?(kind = "function") ?(source_kind = "decl")
+    ?method_index ?(decl_index = 0) name =
+  Lsp_json.Object
+    [
+      ("name", Lsp_json.String name);
+      ("kind", Lsp_json.String kind);
+      ( "source",
+        module_surface_symbol_source_json ?method_index source_kind decl_index );
+    ]
+
+let module_surface_import_json module_path =
+  Lsp_json.Object [ ("module_path", Lsp_json.String module_path) ]
+
+let module_surface_json ?(imports = []) ?(exports = [])
+    ?(private_names = []) ?(private_traits = []) module_name =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "module_surface");
+      ("module", Lsp_json.String module_name);
+      ("imports", Lsp_json.Array (List.map module_surface_import_json imports));
+      ("exports", Lsp_json.Array exports);
+      ("private_names", Lsp_json.Array private_names);
+      ("private_traits", string_array private_traits);
+    ]
+
+let parsed_ast_artifact ?(ast_phase = "raw_parse") ?comments ?module_surface
+    program =
+  let base_fields =
+    match comments with
+    | Some values ->
+        [
+          ("ast_phase", Lsp_json.String ast_phase);
+          ("parsed_ast", program);
+          ("comments", Lsp_json.Array values);
+        ]
+    | None ->
+        [ ("ast_phase", Lsp_json.String ast_phase); ("parsed_ast", program) ]
+  in
+  let fields =
+    match module_surface with
+    | Some surface -> base_fields @ [ ("module_surface", surface) ]
+    | None -> base_fields
+  in
+  Lsp_json.Object fields
 
 let check_options_json paths =
   Lsp_json.Object
@@ -265,7 +312,9 @@ let test_parse_source_request_uses_bridge_envelope () =
   Alcotest.(check string)
     "path" "src/main.brp" (string_field "path" payload);
   Alcotest.(check string) "module" "main" (string_field "module" payload);
-  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload)
+  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload);
+  Alcotest.(check string)
+    "phase" "raw_parse" (string_field "ast_phase" payload)
 
 let test_parse_source_file_request_omits_source_text () =
   let request =
@@ -280,9 +329,33 @@ let test_parse_source_file_request_omits_source_text () =
   Alcotest.(check string)
     "path" "src/main.brp" (string_field "path" payload);
   Alcotest.(check string) "module" "main" (string_field "module" payload);
+  Alcotest.(check string)
+    "phase" "raw_parse" (string_field "ast_phase" payload);
   match List.assoc_opt "text" (object_fields payload) with
   | None -> ()
   | Some _ -> Alcotest.fail "path-only parse request must omit source text"
+
+let test_parse_source_request_can_use_typecheck_phase () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_source_request_json_at_phase
+      ~phase:Blorp.Compiler_blorp_bridge.TypecheckSourceProgram
+      ~path:"src/main.brp" ~module_name:"main" ~text:"func main(): 0"
+    |> parse_json_exn
+  in
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "phase" "typecheck_source" (string_field "ast_phase" payload)
+
+let test_parse_source_file_request_can_use_typecheck_phase () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_source_file_request_json_at_phase
+      ~phase:Blorp.Compiler_blorp_bridge.TypecheckSourceProgram
+      ~path:"src/main.brp" ~module_name:"main"
+    |> parse_json_exn
+  in
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "phase" "typecheck_source" (string_field "ast_phase" payload)
 
 let test_parse_sources_request_uses_bridge_envelope () =
   let request =
@@ -315,12 +388,36 @@ let test_parse_sources_request_uses_bridge_envelope () =
       Alcotest.(check string) "first module" "a" (string_field "module" first);
       Alcotest.(check string) "first text" "a = 1" (string_field "text" first);
       Alcotest.(check string)
+        "first phase" "raw_parse" (string_field "ast_phase" first);
+      Alcotest.(check string)
         "second path" "src/b.brp" (string_field "path" second);
       Alcotest.(check string)
         "second module" "b" (string_field "module" second);
       Alcotest.(check string)
-        "second text" "b = 2" (string_field "text" second)
+        "second text" "b = 2" (string_field "text" second);
+      Alcotest.(check string)
+        "second phase" "raw_parse" (string_field "ast_phase" second)
   | _ -> Alcotest.fail "expected two parse source request items"
+
+let test_parse_sources_request_can_use_typecheck_phase () =
+  let request =
+    Blorp.Compiler_blorp_bridge.parse_sources_request_json
+      ~phase:Blorp.Compiler_blorp_bridge.TypecheckSourceProgram
+      [
+        {
+          Bridge.batch_parse_path = "src/a.brp";
+          batch_parse_module_name = "a";
+          batch_parse_text = "a = 1";
+        };
+      ]
+    |> parse_json_exn
+  in
+  let payload = field "payload" request in
+  match array_field "sources" payload with
+  | [ first ] ->
+      Alcotest.(check string)
+        "phase" "typecheck_source" (string_field "ast_phase" first)
+  | _ -> Alcotest.fail "expected one parse source request item"
 
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
@@ -356,7 +453,12 @@ let test_parse_source_response_decodes_parsed_ast_artifact () =
   match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
   | Ok
       (Blorp.Compiler_blorp_bridge.ParsedSource
-        { parsed_program = []; parsed_comments = [] }) ->
+        {
+          parsed_program = [];
+          parsed_comments = [];
+          parsed_phase = Blorp.Compiler_blorp_bridge.RawParsedProgram;
+          parsed_module_surface = None;
+        }) ->
       ()
   | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
       Alcotest.fail "expected empty decoded program"
@@ -374,7 +476,12 @@ let test_parse_source_response_decodes_comments () =
   match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
   | Ok
       (Blorp.Compiler_blorp_bridge.ParsedSource
-        { parsed_program = []; parsed_comments = [ comment ] }) ->
+        {
+          parsed_program = [];
+          parsed_comments = [ comment ];
+          parsed_phase = Blorp.Compiler_blorp_bridge.RawParsedProgram;
+          parsed_module_surface = None;
+        }) ->
       Alcotest.(check string)
         "comment text" "-- note" comment.Parse_comments.cc_text;
       Alcotest.(check int) "comment line" 2 comment.Parse_comments.cc_line;
@@ -386,6 +493,50 @@ let test_parse_source_response_decodes_comments () =
   | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
       Alcotest.fail "expected decoded program, got diagnostics"
   | Error (_, message) -> Alcotest.fail message
+
+let test_parse_source_response_decodes_module_surface () =
+  let response =
+    bridge_success_json
+      (parsed_ast_artifact
+         ~module_surface:
+           (module_surface_json ~imports:[ "option" ]
+              ~exports:
+                [
+                  module_surface_symbol_json "main";
+                  module_surface_symbol_json ~kind:"trait_method"
+                    ~source_kind:"trait_method" ~decl_index:1 ~method_index:0
+                    "render";
+                ]
+              "main")
+         (parsed_program_json []))
+  in
+  match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.ParsedSource
+        { parsed_module_surface = Some surface; _ }) ->
+      Alcotest.(check string) "module" "main" surface.Module_surface.module_name;
+      Alcotest.(check (list string))
+        "imports" [ "option" ] (Module_surface.import_module_names surface);
+      Alcotest.(check (list string))
+        "exports" [ "main"; "render" ] (Module_surface.export_names surface)
+  | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
+      Alcotest.fail "expected decoded module surface"
+  | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
+      Alcotest.fail "expected decoded program, got diagnostics"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_parse_source_response_rejects_invalid_module_surface_kind () =
+  let response =
+    bridge_success_json
+      (parsed_ast_artifact
+         ~module_surface:
+           (module_surface_json
+              ~exports:[ module_surface_symbol_json ~kind:"mystery" "main" ]
+              "main")
+         (parsed_program_json []))
+  in
+  Blorp.Compiler_blorp_bridge.parse_source_response_json response
+  |> expect_invalid_response_contains "unsupported module surface symbol kind"
 
 let test_parse_source_response_returns_diagnostics () =
   let response =
@@ -426,6 +577,7 @@ let test_parse_sources_response_decodes_items () =
                [
                  Lsp_json.Object
                    [
+                     ("ast_phase", Lsp_json.String "raw_parse");
                      ("path", Lsp_json.String "src/a.brp");
                      ("module", Lsp_json.String "a");
                      ("parsed_ast", parsed_program_json []);
@@ -438,6 +590,7 @@ let test_parse_sources_response_decodes_items () =
                    ];
                  Lsp_json.Object
                    [
+                     ("ast_phase", Lsp_json.String "raw_parse");
                      ("path", Lsp_json.String "src/b.brp");
                      ("module", Lsp_json.String "b");
                      ( "parsed_ast",
@@ -461,7 +614,12 @@ let test_parse_sources_response_decodes_items () =
           batch_parsed_module_name = "a";
           batch_parsed_response =
             Bridge.ParsedSource
-              { parsed_program = []; parsed_comments = [ comment ] };
+              {
+                parsed_program = [];
+                parsed_comments = [ comment ];
+                parsed_phase = Bridge.RawParsedProgram;
+                parsed_module_surface = None;
+              };
         };
         {
           Bridge.batch_parsed_path = "src/b.brp";
@@ -604,15 +762,46 @@ let frontend_origin_json ?package kind =
   in
   Lsp_json.Object fields
 
-let frontend_graph_source ?(origin = frontend_origin_json "user") path
-    module_name text =
+let frontend_graph_source ?(ast_phase = "typecheck_source")
+    ?(origin = frontend_origin_json "user") ?(include_module_surface = true)
+    path module_name text =
+  let module_surface =
+    if include_module_surface then Some (module_surface_json module_name)
+    else None
+  in
   Lsp_json.Object
     [
       ("path", Lsp_json.String path);
       ("module", Lsp_json.String module_name);
       ("source_text", Lsp_json.String text);
-      ("parsed_source", parsed_ast_artifact (parsed_program_json []));
+      ( "parsed_source",
+        parsed_ast_artifact ~ast_phase ?module_surface (parsed_program_json [])
+      );
       ("origin", origin);
+    ]
+
+let frontend_source_package_json ?(alias = "sample") ?(name = "sample")
+    ?(root = "vendor/sample") ?(source_dir = "vendor/sample/src")
+    ?(exports = [ "sample" ]) () =
+  Lsp_json.Object
+    [
+      ("alias", Lsp_json.String alias);
+      ("name", Lsp_json.String name);
+      ("root", Lsp_json.String root);
+      ("source_dir", Lsp_json.String source_dir);
+      ("exports", string_array exports);
+    ]
+
+let frontend_graph_context_json ?std_dir ?(source_packages = [])
+    ?(package_roots = []) () =
+  Lsp_json.Object
+    [
+      ( "std_dir",
+        match std_dir with
+        | Some path -> Lsp_json.String path
+        | None -> Lsp_json.Null );
+      ("source_packages", Lsp_json.Array source_packages);
+      ("package_roots", string_array package_roots);
     ]
 
 let frontend_import_edge ?resolved_path ?resolved_module ?resolved_origin
@@ -645,6 +834,10 @@ let test_cli_run_response_decodes_frontend_module_graph () =
            ("command", Lsp_json.String "compile");
            ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
            ("options", compile_options_json [ "src/main.brp" ]);
+           ( "context",
+             frontend_graph_context_json ~std_dir:"custom-std"
+               ~source_packages:[ frontend_source_package_json () ]
+               ~package_roots:[ "pkg" ] () );
            ( "roots",
              Lsp_json.Array
                [
@@ -676,6 +869,22 @@ let test_cli_run_response_decodes_frontend_module_graph () =
           cli_frontend_graph_options =
             Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
               { cli_compile_files = [ "src/main.brp" ]; _ };
+          cli_frontend_graph_context =
+            {
+              cli_frontend_context_std_dir = Some "custom-std";
+              cli_frontend_context_source_packages =
+                [
+                  {
+                    cli_frontend_source_package_alias = "sample";
+                    cli_frontend_source_package_name = "sample";
+                    cli_frontend_source_package_root = "vendor/sample";
+                    cli_frontend_source_package_source_dir =
+                      "vendor/sample/src";
+                    cli_frontend_source_package_exports = [ "sample" ];
+                  };
+                ];
+              cli_frontend_context_package_roots = [ "pkg" ];
+            };
           cli_frontend_graph_roots =
             [
               {
@@ -721,6 +930,7 @@ let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
            ("command", Lsp_json.String "compile");
            ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
            ("options", compile_options_json [ "src/main.brp" ]);
+           ("context", frontend_graph_context_json ());
            ( "roots",
              Lsp_json.Array
                [ frontend_graph_source "src/main.brp" "main" "import:\n\t./dep" ]
@@ -739,6 +949,56 @@ let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
   |> expect_invalid_response_contains "absent from the graph"
+
+let test_cli_run_response_rejects_raw_frontend_graph_source () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
+           ("options", compile_options_json [ "src/main.brp" ]);
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [
+                 frontend_graph_source ~ast_phase:"raw_parse" "src/main.brp"
+                   "main" "func main(args: List[String]) -> Int: 0";
+               ] );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains "frontend module graph source must be typecheck_source"
+
+let test_cli_run_response_rejects_frontend_graph_missing_module_surface () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
+           ("options", compile_options_json [ "src/main.brp" ]);
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [
+                 frontend_graph_source ~include_module_surface:false
+                   "src/main.brp" "main"
+                   "func main(args: List[String]) -> Int: 0";
+               ] );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains
+       "frontend module graph source must include module_surface"
 
 let test_cli_run_response_rejects_legacy_parsed_source_artifact () =
   let response =
@@ -1179,8 +1439,15 @@ let suite =
           test_parse_source_request_uses_bridge_envelope;
         Alcotest.test_case "parse_source file request omits source text" `Quick
           test_parse_source_file_request_omits_source_text;
+        Alcotest.test_case "parse_source request can use typecheck phase" `Quick
+          test_parse_source_request_can_use_typecheck_phase;
+        Alcotest.test_case
+          "parse_source file request can use typecheck phase" `Quick
+          test_parse_source_file_request_can_use_typecheck_phase;
         Alcotest.test_case "parse_sources request uses bridge envelope" `Quick
           test_parse_sources_request_uses_bridge_envelope;
+        Alcotest.test_case "parse_sources request can use typecheck phase"
+          `Quick test_parse_sources_request_can_use_typecheck_phase;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
@@ -1189,6 +1456,11 @@ let suite =
           `Quick test_parse_source_response_decodes_parsed_ast_artifact;
         Alcotest.test_case "parse_source response decodes comments" `Quick
           test_parse_source_response_decodes_comments;
+        Alcotest.test_case "parse_source response decodes module surface"
+          `Quick test_parse_source_response_decodes_module_surface;
+        Alcotest.test_case
+          "parse_source response rejects invalid module surface kind" `Quick
+          test_parse_source_response_rejects_invalid_module_surface_kind;
         Alcotest.test_case "parse_source response returns diagnostics" `Quick
           test_parse_source_response_returns_diagnostics;
         Alcotest.test_case "parse_sources response decodes items" `Quick
@@ -1204,6 +1476,13 @@ let suite =
         Alcotest.test_case
           "CLI run response rejects frontend graph missing resolved target" `Quick
           test_cli_run_response_rejects_frontend_graph_missing_resolved_target;
+        Alcotest.test_case
+          "CLI run response rejects raw frontend graph source" `Quick
+          test_cli_run_response_rejects_raw_frontend_graph_source;
+        Alcotest.test_case
+          "CLI run response rejects frontend graph missing module surface"
+          `Quick
+          test_cli_run_response_rejects_frontend_graph_missing_module_surface;
         Alcotest.test_case
           "CLI run response rejects legacy parsed source artifact" `Quick
           test_cli_run_response_rejects_legacy_parsed_source_artifact;

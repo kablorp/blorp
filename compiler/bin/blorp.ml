@@ -89,14 +89,10 @@ let run_compiler_bridge_prepare_command args =
 (** Format a list of pipeline errors for display *)
 let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
-let finalize_cli_frontend_parsed_response ~path ~module_name = function
+let finalize_cli_frontend_parsed_response = function
   | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics -> Error diagnostics
-  | Compiler_blorp_bridge.ParsedSource parsed_source -> (
-      match
-        Modules.finalize_blorp_parsed_source ~path ~module_name parsed_source
-      with
-      | Error errors -> Error errors
-      | Ok program -> Ok program)
+  | Compiler_blorp_bridge.ParsedSource parsed_source ->
+      Ok parsed_source.Compiler_blorp_bridge.parsed_program
 
 let type_expr_to_string = Types.type_to_string
 
@@ -1318,9 +1314,7 @@ let finalize_cli_parse_response
   end
   else
     match
-      finalize_cli_frontend_parsed_response ~path:request.batch_parse_path
-        ~module_name:request.batch_parse_module_name
-        response.batch_parsed_response
+      finalize_cli_frontend_parsed_response response.batch_parsed_response
     with
     | Error diagnostics ->
         print_parse_diagnostics ~file:request.batch_parse_path diagnostics;
@@ -1432,8 +1426,7 @@ let module_origin_of_cli_frontend_module_origin =
 let finalize_cli_frontend_graph_source
     (source : Compiler_blorp_bridge.cli_frontend_graph_source) =
   match
-    finalize_cli_frontend_parsed_response ~path:source.cli_frontend_graph_path
-      ~module_name:source.cli_frontend_graph_module_name
+    finalize_cli_frontend_parsed_response
       source.cli_frontend_graph_parsed_response
   with
   | Error diagnostics ->
@@ -1454,6 +1447,11 @@ let finalize_cli_frontend_graph_source
                   source.cli_frontend_graph_origin;
               preload_source = source.cli_frontend_graph_source_text;
               preload_decls = program;
+              preload_surface =
+                (match source.cli_frontend_graph_parsed_response with
+                | Compiler_blorp_bridge.ParsedSource parsed_source ->
+                    parsed_source.parsed_module_surface
+                | Compiler_blorp_bridge.ParseSourceDiagnostics _ -> None);
             };
         }
 
@@ -1467,16 +1465,32 @@ let finalized_cli_frontend_graph_sources_or_exit sources =
   in
   loop [] sources
 
-let init_module_paths_for_frontend_graph_roots roots =
+let source_package_of_cli_frontend_source_package
+    (pkg : Compiler_blorp_bridge.cli_frontend_source_package) :
+    Modules.source_package =
+  {
+    Modules.source_package_alias = pkg.cli_frontend_source_package_alias;
+    source_package_name = pkg.cli_frontend_source_package_name;
+    source_package_root = pkg.cli_frontend_source_package_root;
+    source_package_source_dir = pkg.cli_frontend_source_package_source_dir;
+    source_package_exports = pkg.cli_frontend_source_package_exports;
+  }
+
+let apply_cli_frontend_graph_context
+    (context : Compiler_blorp_bridge.cli_frontend_graph_context) =
+  Option.iter Modules.set_std_override context.cli_frontend_context_std_dir;
+  List.iter Modules.add_package_root context.cli_frontend_context_package_roots;
   List.iter
-    (fun (source : Compiler_blorp_bridge.cli_frontend_graph_source) ->
-      Modules.init_module_paths (Filename.dirname source.cli_frontend_graph_path))
-    roots
+    (fun pkg ->
+      Modules.add_source_package
+        (source_package_of_cli_frontend_source_package pkg))
+    context.cli_frontend_context_source_packages;
+  Modules.add_search_path (Sys.getcwd ())
 
 let cli_frontier_frontend_module_graph
     (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
-  init_module_paths_for_frontend_graph_roots
-    graph.Compiler_blorp_bridge.cli_frontend_graph_roots;
+  apply_cli_frontend_graph_context
+    graph.Compiler_blorp_bridge.cli_frontend_graph_context;
   let roots =
     finalized_cli_frontend_graph_sources_or_exit
       graph.Compiler_blorp_bridge.cli_frontend_graph_roots

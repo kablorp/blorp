@@ -45,6 +45,23 @@ let string_expr_json value start_offset start_column end_offset end_column =
       ("span", span_json start_offset start_column end_offset end_column);
     ]
 
+let string_interp_literal_part_json value =
+  Lsp_json.Object
+    [ ("kind", Lsp_json.String "literal"); ("value", Lsp_json.String value) ]
+
+let string_interp_expr_part_json expr =
+  Lsp_json.Object [ ("kind", Lsp_json.String "expr"); ("expr", expr) ]
+
+let string_interp_expr_json ?(is_multiline = false) parts start_offset start_column
+    end_offset end_column =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "string_interp");
+      ("parts", Lsp_json.Array parts);
+      ("multiline", Lsp_json.Bool is_multiline);
+      ("span", span_json start_offset start_column end_offset end_column);
+    ]
+
 let name_expr_json name start_offset start_column end_offset end_column =
   Lsp_json.Object
     [
@@ -1275,6 +1292,28 @@ let test_decodes_data_match_and_lambda_expressions () =
       Alcotest.(check int) "lambda params" 1 (List.length lambda_decl.func_params)
   | _ -> Alcotest.fail "expected decoded data/match/lambda expressions"
 
+let test_decodes_finalized_string_interpolation_expression () =
+  let body =
+    string_interp_expr_json
+      [
+        string_interp_literal_part_json "Hello ";
+        string_interp_expr_part_json (name_expr_json "name" 9 10 13 14);
+        string_interp_literal_part_json "!";
+      ]
+      0 1 16 17
+  in
+  let decoded = decode_ok (program_json [ function_json ~body:(Some body) () ] []) in
+  match (function_body_expr decoded).Ast.expr_desc with
+  | Ast.EStringInterp
+      ( [
+          Ast.InterpLit "Hello ";
+          Ast.InterpExpr { Ast.expr_desc = Ast.EIdent "name"; _ };
+          Ast.InterpLit "!";
+        ],
+        false ) ->
+      ()
+  | _ -> Alcotest.fail "expected finalized string interpolation"
+
 let test_decodes_resource_select_and_concurrency_expressions () =
   let void_body = block_expr_json [] 0 1 8 9 in
   let with_expr =
@@ -1568,11 +1607,13 @@ let suite =
           test_decodes_trait_and_impl_declarations;
         Alcotest.test_case "data, match, and lambda expressions" `Quick
           test_decodes_data_match_and_lambda_expressions;
-	        Alcotest.test_case "resource, select, and concurrency expressions" `Quick
-	          test_decodes_resource_select_and_concurrency_expressions;
+        Alcotest.test_case "finalized string interpolation expression" `Quick
+          test_decodes_finalized_string_interpolation_expression;
+        Alcotest.test_case "resource, select, and concurrency expressions" `Quick
+          test_decodes_resource_select_and_concurrency_expressions;
         Alcotest.test_case "concurrent validation keeps source loc" `Quick
           test_concurrent_param_validation_errors_keep_source_loc;
-	        Alcotest.test_case "for loop binders" `Quick test_decodes_for_loop_binders;
+        Alcotest.test_case "for loop binders" `Quick test_decodes_for_loop_binders;
         Alcotest.test_case "tuple destruct assignment" `Quick
           test_decodes_tuple_destruct_assignment;
         Alcotest.test_case "subscript assignment" `Quick

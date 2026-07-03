@@ -73,8 +73,8 @@ There are still important OCaml paths around that default:
   REPL/LSP/test/package command loops that have not been ported.
 - `compiler/blorp/compiler_cli*.brp` owns user-argument planning for the main
   command families, source target expansion, auto-format decisions, source
-  reads, source graph discovery, and frontend module graph artifact encoding for
-  `check`, `compile`, and `run`.
+  reads, source graph discovery, source-package/pkg-root context discovery, and
+  frontend module graph artifact encoding for `check`, `compile`, and `run`.
 - `compiler/lib/modules.ml` now consumes Blorp-parsed roots and preloaded source
   graph modules, but still owns authoritative module validation, embedded std
   policy, import origin checks, cycles, package policy, and the parse-cache
@@ -659,27 +659,33 @@ Validation:
 Goal: make Blorp frontend module graph data the only parser/source-AST input to
 the compiler and delete parser-adjacent OCaml that no longer owns semantics.
 
+Detailed execution plan:
+[FRONTEND_SOURCE_AST_ROADMAP.md](FRONTEND_SOURCE_AST_ROADMAP.md).
+
 Status: the production source lex/parse path is Blorp-owned through the parser
 bridge. The old parser selector/fallback model is gone. `check`, `compile`, and
 `run` use Blorp CLI/source graph/read/parse artifacts packaged as a
-`frontend_module_graph` before handing parsed data to the OCaml middle.
+`frontend_module_graph` before handing parsed data to the OCaml middle. Parser
+artifacts now include a Blorp-owned syntactic `module_surface`; CLI source graph
+import discovery and the OCaml module parse cache consume that surface instead
+of rediscovering imports and syntactic exports from parsed-AST JSON. The
+`frontend_module_graph` also carries the explicit std override,
+source-package aliases, and local `pkg/` roots that the Blorp graph used to
+resolve imports; the OCaml CLI frontier applies those facts before module
+preloading rather than independently rediscovering them.
 
 Direct OCaml slices to mirror:
 
 - Blorp lexer/parser sources under `compiler/blorp/`
 - `ast.ml`
-- `interp_parser.ml`
-- `subscript_desugar.ml`
 - parser diagnostics and comment/source-span handling
 
 Implementation:
 
 - Keep lexing, indentation, tokens, parser grammar, comments, spans, and
   top-level source reads in Blorp.
-- Remove or port the remaining parser-adjacent OCaml transforms in a way that
-  keeps phase ownership clear. Interpolation-hole parsing and subscript
-  desugaring should not be hidden inside typecheck if their representation can
-  be made explicit earlier.
+- Keep parser-adjacent rewrites in the Blorp `typecheck_source` phase rather
+  than hiding them inside OCaml typecheck.
 - Keep comments and spans as explicit parse output data; do not reintroduce
   global lexer/comment stores.
 - Preserve only current syntax. Removed forms should fail normally unless a
@@ -731,6 +737,9 @@ Implementation:
 - Done: `check`, `compile`, and `run` can enter the OCaml middle with
   `frontend_module_graph` artifacts instead of frontend option fallbacks for
   normal source command shapes.
+- Done: `frontend_module_graph` carries graph context for std overrides,
+  source-package aliases, and local `pkg/` roots, and the OCaml frontier applies
+  that context before consuming preloaded parsed sources.
 - Make each shell call the pure Blorp compiler library rather than embedding
   compiler semantics.
 - Treat formatter/LSP as consumers of the same compiler data model, not separate

@@ -4487,18 +4487,17 @@ and zonk_expr_desc = function
       EVarDecl (n, Option.map Types.zonk_type ty, zonk_expr v, m)
   | ETupleDestruct (ns, v) -> ETupleDestruct (ns, zonk_expr v)
   | ERange (a, b) -> ERange (zonk_expr a, zonk_expr b)
-  (* [ESubscript]/[ESubscriptMulti] are rewritten to call syntax by
-     [Subscript_desugar] before typecheck and rejected by
-     [infer_expr_desc] if they somehow survive. Reaching them here
-     would be a symmetric invariant violation — kept in lockstep with
-     infer so a bug in either phase surfaces with a clear message
-     rather than silently traversing. [ESubscriptAssign] stays
-     through zonking by design (Phase 2.3 keeps it in infer for the
-     mutability check). *)
+  (* [ESubscript]/[ESubscriptMulti] are rewritten to call syntax by the
+     Blorp typecheck-source finalizer and rejected by [infer_expr_desc] if
+     they somehow survive. Reaching them here would be a symmetric invariant
+     violation — kept in lockstep with infer so a bug in either phase surfaces
+     with a clear message rather than silently traversing. [ESubscriptAssign]
+     stays through zonking by design so infer can run the mutability check. *)
   | ESubscript (_, _) | ESubscriptMulti (_, _) ->
       failwith
-        "internal: subscript-read node reached zonk; Subscript_desugar should \
-         have rewritten it, or infer should have rejected it before zonking"
+        "internal: subscript-read node reached zonk; the Blorp \
+         typecheck-source finalizer should have rewritten it, or infer should \
+         have rejected it before zonking"
   | ESubscriptAssign (c, is, v) ->
       ESubscriptAssign (zonk_expr c, List.map zonk_expr is, zonk_expr v)
   | EStringInterp (parts, multiline) ->
@@ -6667,18 +6666,17 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               with_inferred_type
                 { expr with expr_desc = EStringInterp (parts', is_multiline) }
                 ty_string ))
-  (* Subscript reads (ESubscript, ESubscriptMulti) are rewritten to
-     call syntax by [Subscript_desugar] before typecheck. Reaching
-     them here means the pass didn't run. *)
+  (* Subscript reads (ESubscript, ESubscriptMulti) are rewritten to call syntax
+     by the Blorp typecheck-source finalizer. Reaching them here means the
+     source AST phase boundary was bypassed. *)
   | ESubscript (_, _) | ESubscriptMulti (_, _) ->
       error loc
-        "internal: subscript-read node reached typecheck; Subscript_desugar \
-         should have rewritten it to a \
+        "internal: subscript-read node reached typecheck; the Blorp \
+         typecheck-source finalizer should have rewritten it to a \
          checked_get/checked_slice/matrix_checked_get call"
   (* Subscript assignment: tensor[i, ...] = val — desugars to checked_set etc.
-     Deliberately kept here (not moved into [Subscript_desugar]) so
-     the mutability check below can run with env access. See
-     [Subscript_desugar]'s header docstring. *)
+     Deliberately kept here so the mutability check below can run with env
+     access. *)
   | ESubscriptAssign (coll, indices, value) ->
       (* Check mutability: subscript assignment requires a mutable variable.
          Recurse through field accesses to find the root variable. *)

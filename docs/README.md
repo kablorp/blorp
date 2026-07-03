@@ -30,6 +30,13 @@ for history.
   aggressive OCaml-to-Blorp compiler migration, including explicit JSON
   boundaries, current Blorp-owned CLI/parser and Core-tail edges, and
   deletion-first merge points.
+- [FRONTEND_SOURCE_AST_ROADMAP.md](FRONTEND_SOURCE_AST_ROADMAP.md) details the
+  next contiguous frontend slice: raw parse vs typecheck-ready source AST,
+  interpolation finalization, nested function hoisting, and subscript-read
+  desugaring.
+- [FRONTEND_MODULE_SURFACE_ROADMAP.md](FRONTEND_MODULE_SURFACE_ROADMAP.md)
+  tracks the next contiguous frontend slice: Blorp-owned syntactic module
+  imports, exports, private names, and bridge/cache consumption.
 - [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md) records the completed
   cursor/span parser utility migration, current Blorp frontend parser status,
   and remaining parser/source-AST cleanup.

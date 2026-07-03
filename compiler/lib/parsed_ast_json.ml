@@ -620,6 +620,14 @@ and decode_expr path value =
       let* is_multiline = bool_field path "multiline" value in
       let* loc = span_field path "span" value in
       Ok (expr loc (Ast.EStringInterpRaw (text, is_multiline)))
+  | "string_interp" ->
+      let* parts_json = array_field path "parts" value in
+      let* parts =
+        decode_list (path ^ ".parts") decode_string_interp_part parts_json
+      in
+      let* is_multiline = bool_field path "multiline" value in
+      let* loc = span_field path "span" value in
+      Ok (expr loc (Ast.EStringInterp (parts, is_multiline)))
   | "bool_literal" ->
       let* value_bool = bool_field path "value" value in
       let* loc = span_field path "span" value in
@@ -939,6 +947,19 @@ and decode_expr path value =
       Ok (expr loc Ast.EVoid)
   | "missing" -> error path "missing expression cannot be decoded as AST"
   | kind -> error path ("unsupported parsed expression kind `" ^ kind ^ "`")
+
+and decode_string_interp_part path value =
+  let* kind = kind_field path value in
+  match kind with
+  | "literal" ->
+      let* text = string_field path "value" value in
+      Ok (Ast.InterpLit text)
+  | "expr" ->
+      let* expr_json = field path "expr" value in
+      let* inner = decode_expr (path ^ ".expr") expr_json in
+      Ok (Ast.InterpExpr inner)
+  | kind ->
+      error path ("unsupported string interpolation part kind `" ^ kind ^ "`")
 
 and decode_record_expr_field path value =
   let* name_json = field path "name" value in

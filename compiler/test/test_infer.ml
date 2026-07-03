@@ -1051,6 +1051,7 @@ let test_ambiguous_bare_record_field_reports_modules () =
           origin = Blorp.Session.User_module;
           decls;
           exports = [];
+          surface = None;
           typed_decls = None;
           typed_import_bindings = None;
         }

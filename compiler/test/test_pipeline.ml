@@ -45,6 +45,7 @@ let mk_loaded_module ~name ~decls : Session.loaded_module =
     origin = Session.User_module;
     decls;
     exports = [];
+    surface = None;
     typed_decls = None;
     typed_import_bindings = None;
   }
@@ -112,8 +113,9 @@ let test_compile_parsed_accepts_finalized_bridge_artifact () =
           write_file main_path source;
           let module_name = "main" in
           match
-            Compiler_blorp_bridge.parse_source_file_via_command ~path:main_path
-              ~module_name
+            Compiler_blorp_bridge.parse_source_file_via_command_at_phase
+              ~phase:Compiler_blorp_bridge.TypecheckSourceProgram
+              ~path:main_path ~module_name
           with
           | Error (_, message) ->
               Alcotest.fail ("expected Blorp parse bridge artifact: " ^ message)
@@ -121,29 +123,21 @@ let test_compile_parsed_accepts_finalized_bridge_artifact () =
               Alcotest.fail
                 ("expected parsed bridge artifact, got diagnostics:\n"
                ^ format_errors diagnostics)
-          | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) -> (
+          | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) ->
+              let program = parsed_source.parsed_program in
               match
-                Modules.finalize_blorp_parsed_source ~path:main_path ~module_name
-                  parsed_source
+                Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
+                  ~program ()
               with
+              | Ok (Pipeline.Compiled { c_code; _ }) ->
+                  Alcotest.(check bool)
+                    "generated C contains interpolated string literal" true
+                    (contains c_code "value")
+              | Ok (Pipeline.Stopped_at _) ->
+                  Alcotest.fail "compile_parsed unexpectedly stopped early"
               | Error errors ->
                   Alcotest.fail
-                    ("expected finalized parsed program:\n" ^ format_errors errors)
-              | Ok program -> (
-                  match
-                    Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
-                      ~program ()
-                  with
-                  | Ok (Pipeline.Compiled { c_code; _ }) ->
-                      Alcotest.(check bool)
-                        "generated C contains interpolated string literal" true
-                        (contains c_code "value")
-                  | Ok (Pipeline.Stopped_at _) ->
-                      Alcotest.fail "compile_parsed unexpectedly stopped early"
-                  | Error errors ->
-                      Alcotest.fail
-                        ("expected compile_parsed success:\n"
-                       ^ format_errors errors)))))
+                    ("expected compile_parsed success:\n" ^ format_errors errors)))
 
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -375,9 +369,9 @@ let test_bare_local_import_does_not_keep_failed_std_probe () =
                 ("bare local import kept failed std probe diagnostics:\n"
                ^ format_errors errors)))
 
-let test_imported_module_runs_nested_hoist () =
+let test_imported_module_uses_typecheck_source_finalization () =
   Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_imported_nested_hoist" (fun dir ->
+      with_temp_dir "blorp_pipeline_imported_source_finalization" (fun dir ->
           write_file
             (Filename.concat dir "helper.brp")
             "func outer(x: Int) -> Int:\n\
@@ -395,7 +389,7 @@ let test_imported_module_runs_nested_hoist () =
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
-                ("imported module did not run nested-hoist:\n"
+                ("imported module did not use typecheck-source finalization:\n"
                ^ format_errors errors)))
 
 let test_qualified_only_import_does_not_suppress_bare_missing_name () =
@@ -1061,8 +1055,8 @@ let suite =
           test_configured_std_source_rejects_package_import;
         Alcotest.test_case "bare local import does not keep failed std probe"
           `Quick test_bare_local_import_does_not_keep_failed_std_probe;
-        Alcotest.test_case "imported module runs nested hoist" `Quick
-          test_imported_module_runs_nested_hoist;
+        Alcotest.test_case "imported module uses typecheck-source finalization"
+          `Quick test_imported_module_uses_typecheck_source_finalization;
         Alcotest.test_case
           "qualified-only import does not suppress bare missing name" `Quick
           test_qualified_only_import_does_not_suppress_bare_missing_name;

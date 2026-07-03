@@ -34,23 +34,23 @@ let source_call_name_for_diagnostic callee resolved =
       | EFieldAccess (_, name) -> name
       | _ -> "<expression>")
 
-(* Subscript_desugar runs before typecheck and currently rewrites source
-   subscripts to ordinary helper calls without preserving a source-syntax tag.
-   Keep these helper names isolated so diagnostics can report source-level
-   subscript failures instead of exposing the helper calls. *)
-let is_subscript_desugar_call_name = function
+(* The Blorp typecheck-source finalizer rewrites source subscripts to ordinary
+   helper calls before typecheck without preserving a source-syntax tag. Keep
+   these helper names isolated so diagnostics can report source-level subscript
+   failures instead of exposing the helper calls. *)
+let is_source_subscript_helper_call_name = function
   | "checked_get" | "checked_slice" | "tensor_peel" | "matrix_checked_get"
   | "tensor3_checked_get" | "tensor4_checked_get" | "tensor5_checked_get" ->
       true
   | _ -> false
 
-let resolved_call_is_subscript_desugar resolved =
+let resolved_call_is_source_subscript_helper resolved =
   match resolved with
   | Some { call_target = CallDirect { source_name; _ }; _ } ->
-      is_subscript_desugar_call_name
+      is_source_subscript_helper_call_name
         (Purity_analysis.source_call_name source_name)
   | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
-      is_subscript_desugar_call_name
+      is_source_subscript_helper_call_name
         (Purity_analysis.source_call_name method_name)
   | Some { call_target = CallClosure _; _ } | None -> false
 
@@ -62,7 +62,7 @@ let collect_startup_work (expr : expr) : startup_work list =
         let resolved = expr_resolved_call expr in
         let nested = List.concat_map walk (callee :: args) in
         if resolved_call_is_constructor resolved then nested
-        else if resolved_call_is_subscript_desugar resolved then
+        else if resolved_call_is_source_subscript_helper resolved then
           StartupSubscript { subscript_loc = expr.expr_loc } :: nested
         else
           StartupCall

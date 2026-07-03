@@ -1,0 +1,339 @@
+import:
+	../compiler_module_surface:
+		ModuleSurface,
+		ModuleSurfaceSymbol,
+		ModuleSurfaceSymbolKind(
+			FunctionSurfaceSymbol,
+			ImplMethodSurfaceSymbol,
+			TraitMethodSurfaceSymbol,
+			TraitSurfaceSymbol,
+		),
+		ModuleSurfaceSymbolSource(
+			DeclSurfaceSource,
+			ImplMethodSurfaceSource,
+			PrivateDeclSurfaceSource,
+			PrivateImplMethodSurfaceSource,
+			TraitMethodSurfaceSource,
+		),
+		module_surface_for_program
+	../compiler_parser: parse_compiler_source
+	../compiler_source: CompilerSourceFile, compiler_source_file
+	../compiler_source_ast_finalize: finalize_typecheck_source_program
+	test: TestSuite
+
+
+pure func source(text: String) -> CompilerSourceFile:
+	compiler_source_file("module_surface.brp", "module_surface", text)
+
+
+pure func parsed_surface(program_source: String) -> ModuleSurface:
+	program = parse_compiler_source(source(program_source))
+	module_surface_for_program(finalize_typecheck_source_program(program))
+
+
+pure func symbol_names(symbols: List[ModuleSurfaceSymbol]) -> List[String]:
+	var names: List[String] = []
+
+	for symbol in symbols:
+		names = names.append(symbol.name)
+
+	names.sort()
+
+
+pure func names_match(symbols: List[ModuleSurfaceSymbol], expected: List[String]) -> Bool:
+	symbols.symbol_names() == expected.sort()
+
+
+pure func symbol_count(
+	symbols: List[ModuleSurfaceSymbol],
+	name: String,
+	kind: ModuleSurfaceSymbolKind,
+) -> Int:
+	var count: Int = 0
+
+	for symbol in symbols:
+		if symbol.name == name and symbol.kind == kind:
+			count += 1
+
+	count
+
+
+pure func first_symbol_source_kind(
+	symbols: List[ModuleSurfaceSymbol],
+	name: String,
+) -> String:
+	var result: String = ""
+
+	for symbol in symbols:
+		if result == "" and symbol.name == name:
+			result = match symbol.source:
+				DeclSurfaceSource(_):
+					"decl"
+				TraitMethodSurfaceSource(_, _):
+					"trait_method"
+				ImplMethodSurfaceSource(_, _):
+					"impl_method"
+				PrivateDeclSurfaceSource(_):
+					"private_decl"
+				PrivateImplMethodSurfaceSource(_, _):
+					"private_impl_method"
+				_:
+					"other"
+
+	result
+
+
+func test_exports_public_declarations() -> Bool:
+	surface = parsed_surface(
+		"func public_func() -> Int:\n"
+			+ "\t1\n\n"
+			+ "answer: Int = 42\n\n"
+			+ "union Maybe:\n"
+			+ "\tSome(Int)\n"
+			+ "\tNone\n\n"
+			+ "record Point {x: Int}\n\n"
+			+ "struct Pair {left: Int, right: Int}\n\n"
+			+ "type alias UserId = Int\n\n"
+			+ "type NativeHandle = builtin",
+	)
+
+	surface.exports.names_match([
+		"Maybe",
+		"NativeHandle",
+		"Pair",
+		"Point",
+		"UserId",
+		"answer",
+		"public_func",
+	])
+
+
+func test_exports_trait_name_and_methods() -> Bool:
+	surface = parsed_surface(
+		"trait Renderable:\n"
+			+ "\tpure func render(value: Self) -> String\n"
+			+ "\tpure func label(value: Self) -> String:\n"
+			+ "\t\t\"label\"",
+	)
+
+	(
+		surface.exports.names_match(["Renderable", "label", "render"])
+		and symbol_count(surface.exports, "Renderable", TraitSurfaceSymbol) == 1
+		and symbol_count(surface.exports, "render", TraitMethodSurfaceSymbol) == 1
+	)
+
+
+func test_exports_impl_methods() -> Bool:
+	surface = parsed_surface(
+		"trait Renderable:\n"
+			+ "\tpure func render(value: Self) -> String\n\n"
+			+ "record Box {value: Int}\n\n"
+			+ "implements Renderable for Box:\n"
+			+ "\tpure func render(value: Box) -> String:\n"
+			+ "\t\t\"box\"",
+	)
+
+	(
+		symbol_count(surface.exports, "render", TraitMethodSurfaceSymbol) == 1
+		and symbol_count(surface.exports, "render", ImplMethodSurfaceSymbol) == 1
+	)
+
+
+func test_private_declarations_are_not_exports() -> Bool:
+	surface = parsed_surface(
+		"private func hidden_func() -> Int:\n"
+			+ "\t1\n\n"
+			+ "private union HiddenUnion:\n"
+			+ "\tHiddenCase\n\n"
+			+ "private record HiddenRecord {value: Int}\n\n"
+			+ "private trait HiddenTrait:\n"
+			+ "\tpure func hidden_method(value: Self) -> String\n\n"
+			+ "func visible() -> Int:\n"
+			+ "\t2",
+	)
+
+	surface.exports.names_match(["visible"])
+
+
+func test_private_names_track_inner_decl_surface() -> Bool:
+	surface = parsed_surface(
+		"private func hidden_func() -> Int:\n"
+			+ "\t1\n\n"
+			+ "private trait HiddenTrait:\n"
+			+ "\tpure func hidden_method(value: Self) -> String\n\n"
+			+ "record Gadget {name: String}\n\n"
+			+ "private implements HiddenTrait for Gadget:\n"
+			+ "\tpure func hidden_impl(value: Gadget) -> String:\n"
+			+ "\t\tvalue.name",
+	)
+
+	(
+		surface.private_names.names_match([
+			"HiddenTrait",
+			"hidden_func",
+			"hidden_impl",
+			"hidden_method",
+		])
+		and first_symbol_source_kind(surface.private_names, "HiddenTrait") == "private_decl"
+		and first_symbol_source_kind(surface.private_names, "hidden_impl") == "private_impl_method"
+	)
+
+
+func test_private_trait_suppresses_impl_exports() -> Bool:
+	surface = parsed_surface(
+		"private trait SecretTrait:\n"
+			+ "\tpure func reveal(value: Self) -> String\n\n"
+			+ "record Gadget {name: String}\n\n"
+			+ "implements SecretTrait for Gadget:\n"
+			+ "\tpure func reveal(value: Gadget) -> String:\n"
+			+ "\t\tvalue.name",
+	)
+
+	(
+		surface.exports.names_match(["Gadget"])
+		and surface.private_traits.length() == 1
+		and surface.private_traits.get(0).get_or("") == "SecretTrait"
+	)
+
+
+func test_import_blocks_flatten_module_paths() -> Bool:
+	surface = parsed_surface(
+		"import:\n"
+			+ "\toption: Option(Some, None)\n"
+			+ "\tjson as Json\n\n"
+			+ "func main(args: List[String]) -> Int:\n"
+			+ "\t0",
+	)
+
+	var paths: List[String] = []
+
+	for import_item in surface.imports:
+		paths = paths.append(import_item.module_path)
+
+	actual: List[String] = paths.sort()
+	expected: List[String] = ["json", "option"].sort()
+
+	actual == expected
+
+
+func test_symbol_sources_are_stable_indexes() -> Bool:
+	surface = parsed_surface(
+		"func first() -> Int:\n"
+			+ "\t1\n\n"
+			+ "trait Renderable:\n"
+			+ "\tpure func render(value: Self) -> String\n\n"
+			+ "record Box {value: Int}\n\n"
+			+ "implements Renderable for Box:\n"
+			+ "\tpure func render(value: Box) -> String:\n"
+			+ "\t\t\"box\"",
+	)
+
+	var function_ok: Bool = False
+	var trait_method_ok: Bool = False
+	var impl_method_ok: Bool = False
+
+	for symbol in surface.exports:
+		if symbol.name == "first":
+			match symbol.source:
+				DeclSurfaceSource(0):
+					function_ok = True
+				_:
+					void
+		else if symbol.name == "render" and symbol.kind == TraitMethodSurfaceSymbol:
+			match symbol.source:
+				TraitMethodSurfaceSource(1, 0):
+					trait_method_ok = True
+				_:
+					void
+		else if symbol.name == "render" and symbol.kind == ImplMethodSurfaceSymbol:
+			match symbol.source:
+				ImplMethodSurfaceSource(3, 0):
+					impl_method_ok = True
+				_:
+					void
+
+	function_ok and trait_method_ok and impl_method_ok
+
+
+func test_symbol_sources_use_decoded_ast_indexes_after_import_block() -> Bool:
+	surface = parsed_surface(
+		"import:\n"
+			+ "\toption\n"
+			+ "\tresult\n\n"
+			+ "func main(args: List[String]) -> Int:\n"
+			+ "\t0",
+	)
+
+	var main_ok: Bool = False
+
+	for symbol in surface.exports:
+		if symbol.name == "main":
+			match symbol.source:
+				DeclSurfaceSource(2):
+					main_ok = True
+				_:
+					void
+
+	main_ok
+
+
+func test_foreign_block_exports_use_decoded_ast_indexes() -> Bool:
+	surface = parsed_surface(
+		"foreign:\n"
+			+ "\tfunc floor(x: Float) -> Float = \"floor\"\n"
+			+ "\tfunc ceil(x: Float) -> Float = \"ceil\"\n\n"
+			+ "func after() -> Int:\n"
+			+ "\t0",
+	)
+
+	var floor_ok: Bool = False
+	var ceil_ok: Bool = False
+	var after_ok: Bool = False
+
+	for symbol in surface.exports:
+		if symbol.name == "floor":
+			match symbol.source:
+				DeclSurfaceSource(0):
+					floor_ok = True
+				_:
+					void
+		else if symbol.name == "ceil":
+			match symbol.source:
+				DeclSurfaceSource(1):
+					ceil_ok = True
+				_:
+					void
+		else if symbol.name == "after":
+			match symbol.source:
+				DeclSurfaceSource(2):
+					after_ok = True
+				_:
+					void
+
+	floor_ok and ceil_ok and after_ok
+
+
+tests: TestSuite = {
+	description = "Compiler module surface extraction",
+	tests = [
+		("exports public declarations", test_exports_public_declarations),
+		("exports trait name and methods", test_exports_trait_name_and_methods),
+		("exports impl methods", test_exports_impl_methods),
+		("private declarations are not exports", test_private_declarations_are_not_exports),
+		(
+			"private names track inner decl surface",
+			test_private_names_track_inner_decl_surface,
+		),
+		("private trait suppresses impl exports", test_private_trait_suppresses_impl_exports),
+		("import blocks flatten module paths", test_import_blocks_flatten_module_paths),
+		("symbol sources are stable indexes", test_symbol_sources_are_stable_indexes),
+		(
+			"symbol sources use decoded AST indexes after import block",
+			test_symbol_sources_use_decoded_ast_indexes_after_import_block,
+		),
+		(
+			"foreign block exports use decoded AST indexes",
+			test_foreign_block_exports_use_decoded_ast_indexes,
+		),
+	]
+}

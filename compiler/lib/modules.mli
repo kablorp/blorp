@@ -19,6 +19,7 @@ type loaded_module = Session.loaded_module = {
   origin : Session.module_origin;
   decls : Ast.program;
   exports : (string * Ast.decl) list;
+  surface : Module_surface.t option;
   mutable typed_decls : Typed_ast.program option;
   mutable typed_import_bindings : Session.import_binding list option;
 }
@@ -54,11 +55,13 @@ type preloaded_parsed_source = {
   preload_origin : Session.module_origin;
   preload_source : string;
   preload_decls : Ast.program;
+  preload_surface : Module_surface.t option;
 }
 (** Parsed source supplied by the Blorp CLI frontend for the current compiler
     invocation. The module loader still resolves imports through its normal
-    rules, but matching entries can reuse this AST without rereading or reparsing
-    source text. *)
+    rules, but matching entries can reuse this finalized source AST and module
+    surface without rereading, reparsing, or rediscovering syntactic module
+    facts from declarations. *)
 
 val add_source_package : ?sess:Session.t -> source_package -> unit
 (** Add or replace a source package alias in the active session. *)
@@ -97,7 +100,11 @@ val load_module : ?sess:Session.t -> string -> string -> loaded_module option
     Returns [None] if the module cannot be found or parsed. *)
 
 val load_imports :
-  ?sess:Session.t -> Ast.program -> string -> loaded_module list
+  ?sess:Session.t ->
+  ?surface:Module_surface.t ->
+  Ast.program ->
+  string ->
+  loaded_module list
 (** Load all imports from a list of declarations.
     Returns the list of successfully loaded modules. *)
 
@@ -167,29 +174,26 @@ val std_source_dir : ?sess:Session.t -> unit -> string option
 val parse_source :
   ?sess:Session.t ->
   ?filename:string ->
-  ?hoist_nested:bool ->
   ?bridge_read_file:bool ->
   string ->
   (Ast.program, Ast.compiler_error) result
 (** Parse source text into an AST program through the Blorp parser bridge,
-    apply interpolation transform, and hoist nested function declarations by
-    default. Formatters and source-preserving tools can pass
-    [~hoist_nested:false] to retain parser-level [EFuncDecl] nodes.
-    Filesystem-backed compiler pipeline callers can pass [~bridge_read_file:true]
-    to let the Blorp bridge executable read the source file before parsing.
-    Returns structured error on parse failure. *)
+    preserving raw parser-level forms. Raw parse never hoists nested functions;
+    callers that need typecheck-ready source should use
+    {!parse_typecheck_source}. Filesystem-backed callers can pass
+    [~bridge_read_file:true] to let the Blorp bridge executable read the source
+    file before parsing. Returns structured error on parse failure. *)
 
-val finalize_blorp_parsed_source :
-  path:string ->
-  module_name:string ->
-  ?hoist_nested:bool ->
-  Compiler_blorp_bridge.parsed_source ->
-  (Ast.program, Ast.compiler_error list) result
-(** Apply the OCaml-owned post-parser frontend work to a raw Blorp parser
-    bridge artifact: parse interpolated expressions and hoist nested
-    declarations by default. Comments remain explicit parser artifact data. This
-    is the single boundary for callers that receive parser JSON directly from
-    the Blorp bridge. *)
+val parse_typecheck_source :
+  ?sess:Session.t ->
+  ?filename:string ->
+  ?bridge_read_file:bool ->
+  string ->
+  (Ast.program, Ast.compiler_error) result
+(** Parse source text into the source AST shape expected by typechecking.
+    This requests the Blorp bridge's [typecheck_source] phase so parser-owned
+    rewrites such as interpolation finalization, nested-function hoisting, and
+    subscript-read lowering happen before semantic analysis. *)
 
 val collect_private_names : Ast.program -> (string * Ast.decl) list
 (** Collect names of private declarations from a program. *)

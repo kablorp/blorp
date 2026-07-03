@@ -85,22 +85,18 @@ The compiler parser should continue using explicit scanner plus
 recursive-descent/Pratt parser code in hot paths. Parser combinators are useful
 for small parsers, tests, and user code, not for the whole compiler grammar.
 
-## Remaining Work
+## Current Status
 
-The parser/lexer phase is close, but not completely free of OCaml-adjacent
-frontend work. The remaining cleanup should be done in small slices:
+The parser/lexer phase and parser-adjacent source-AST finalization now live on
+the Blorp side of the bridge. Raw parser consumers request raw parse output;
+compile/check/run request the `typecheck_source` phase, which finalizes string
+interpolation, nested functions, and subscript reads before the OCaml middle.
 
-1. Audit and retire parser-adjacent OCaml that still transforms parsed source:
-   `interp_parser.ml`, `subscript_desugar.ml`, and AST-finalization helpers.
-   Porting is preferable when the transform is still semantically needed;
-   deletion is preferable when the Blorp parser can represent the current
-   syntax directly.
-2. Keep interpolation-hole parsing explicit. Do not hide a second parser inside
-   typecheck. If interpolation holes remain a separate transform for now, make
-   that boundary explicit in the source model and tests.
-3. Keep comments and source spans flowing as data through parser, formatter,
+Remaining work:
+
+1. Keep comments and source spans flowing as data through parser, formatter,
    LSP, and diagnostics. Do not reintroduce process-global parser state.
-4. Expand parser fixture coverage only where it protects current syntax or a
+2. Expand parser fixture coverage only where it protects current syntax or a
    known regression. Avoid rebuilding retired stage-golden systems.
 5. Add focused parser performance measurements for lexing, parsing, AST JSON
    projection, and complete `Blorp parse -> OCaml middle -> Blorp backend`
