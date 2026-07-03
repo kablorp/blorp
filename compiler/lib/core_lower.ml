@@ -911,16 +911,16 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       mk (CDetach { detach_body = lower_child_expr inner; detach_task = None })
   (* Subscript forms should never reach core_lower:
      - ESubscript / ESubscriptMulti are rewritten to calls by
-       [Subscript_desugar] before typecheck (Phase 2.3).
+       the Blorp typecheck-source finalizer before typecheck.
      - ESubscriptAssign is rewritten to an explicit call by infer.ml
        during type-checking (the mutability-checked [ESubscriptAssign]
        handler produces a typed [ECall] node). *)
   | TA.ESubscript _ | TA.ESubscriptMulti _ | TA.ESubscriptAssign _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
         ~hint:
-          "Subscript_desugar (ESubscript/ESubscriptMulti) or infer.ml's \
-           ESubscriptAssign handler should have rewritten this to a \
-           checked_get/checked_set call before lowering."
+          "The Blorp typecheck-source finalizer (ESubscript/ESubscriptMulti) \
+           or infer.ml's ESubscriptAssign handler should have rewritten this \
+           to a checked_get/checked_set call before lowering."
         "subscript node survived to core_lower"
   | TA.EFuncDecl _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Lower) loc

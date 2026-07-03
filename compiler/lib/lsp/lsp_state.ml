@@ -173,7 +173,7 @@ let analyze (_state : state) (doc : document) : unit =
       let parse_result, elapsed =
         timed (fun () ->
             match
-              Modules.parse_source ~filename:path ~hoist_nested:false doc.text
+              Modules.parse_source ~filename:path doc.text
             with
             | Ok program -> Ok program
             | Error err -> Error [ err ])

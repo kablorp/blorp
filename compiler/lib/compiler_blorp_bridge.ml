@@ -18,9 +18,25 @@ let language_surface_renderer = "language_surface"
 let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
 
+type parsed_source_phase =
+  | RawParsedProgram
+  | TypecheckSourceProgram
+
+let parsed_source_phase_name = function
+  | RawParsedProgram -> "raw_parse"
+  | TypecheckSourceProgram -> "typecheck_source"
+
+let parsed_source_phase_of_string = function
+  | "raw_parse" -> Ok RawParsedProgram
+  | "typecheck_source" -> Ok TypecheckSourceProgram
+  | other ->
+      Error ("invalid_response", "unsupported parser AST phase `" ^ other ^ "`")
+
 type parsed_source = {
   parsed_program : Ast.program;
   parsed_comments : Parse_comments.collected_comment list;
+  parsed_phase : parsed_source_phase;
+  parsed_module_surface : Module_surface.t option;
 }
 
 type parse_source_response =
@@ -157,6 +173,20 @@ type cli_frontend_module_origin =
   | CliFrontendSourcePackageModule of string
   | CliFrontendPkgModule of string
 
+type cli_frontend_source_package = {
+  cli_frontend_source_package_alias : string;
+  cli_frontend_source_package_name : string;
+  cli_frontend_source_package_root : string;
+  cli_frontend_source_package_source_dir : string;
+  cli_frontend_source_package_exports : string list;
+}
+
+type cli_frontend_graph_context = {
+  cli_frontend_context_std_dir : string option;
+  cli_frontend_context_source_packages : cli_frontend_source_package list;
+  cli_frontend_context_package_roots : string list;
+}
+
 type cli_frontend_graph_source = {
   cli_frontend_graph_path : string;
   cli_frontend_graph_module_name : string;
@@ -178,6 +208,7 @@ type cli_frontend_module_graph = {
   cli_frontend_graph_command : cli_frontend_command;
   cli_frontend_graph_args : string list;
   cli_frontend_graph_options : cli_frontend_options;
+  cli_frontend_graph_context : cli_frontend_graph_context;
   cli_frontend_graph_roots : cli_frontend_graph_source list;
   cli_frontend_graph_modules : cli_frontend_graph_source list;
   cli_frontend_graph_imports : cli_frontend_import_edge list;
@@ -413,7 +444,7 @@ let run_core_pipeline_request_json ~stage core_json =
              [ ("stage", Lsp_json.String stage); ("core", core_json) ] );
        ])
 
-let parse_source_request_json ~path ~module_name ~text =
+let parse_source_request_json_at_phase ~phase ~path ~module_name ~text =
   Lsp_json.to_string
     (Lsp_json.Object
        [
@@ -426,10 +457,16 @@ let parse_source_request_json ~path ~module_name ~text =
                ("path", Lsp_json.String path);
                ("module", Lsp_json.String module_name);
                ("text", Lsp_json.String text);
+               ( "ast_phase",
+                 Lsp_json.String (parsed_source_phase_name phase) );
              ] );
        ])
 
-let parse_source_file_request_json ~path ~module_name =
+let parse_source_request_json ~path ~module_name ~text =
+  parse_source_request_json_at_phase ~phase:RawParsedProgram ~path
+    ~module_name ~text
+
+let parse_source_file_request_json_at_phase ~phase ~path ~module_name =
   Lsp_json.to_string
     (Lsp_json.Object
        [
@@ -441,18 +478,25 @@ let parse_source_file_request_json ~path ~module_name =
              [
                ("path", Lsp_json.String path);
                ("module", Lsp_json.String module_name);
+               ( "ast_phase",
+                 Lsp_json.String (parsed_source_phase_name phase) );
              ] );
        ])
 
-let parse_source_batch_item_json item =
+let parse_source_file_request_json ~path ~module_name =
+  parse_source_file_request_json_at_phase ~phase:RawParsedProgram ~path
+    ~module_name
+
+let parse_source_batch_item_json ?(phase = RawParsedProgram) item =
   Lsp_json.Object
     [
       ("path", Lsp_json.String item.batch_parse_path);
       ("module", Lsp_json.String item.batch_parse_module_name);
       ("text", Lsp_json.String item.batch_parse_text);
+      ("ast_phase", Lsp_json.String (parsed_source_phase_name phase));
     ]
 
-let parse_sources_request_json items =
+let parse_sources_request_json ?(phase = RawParsedProgram) items =
   Lsp_json.to_string
     (Lsp_json.Object
        [
@@ -464,7 +508,8 @@ let parse_sources_request_json items =
              [
                ("include_comments", Lsp_json.Bool false);
                ( "sources",
-                 Lsp_json.Array (List.map parse_source_batch_item_json items) );
+                 Lsp_json.Array
+                   (List.map (parse_source_batch_item_json ~phase) items) );
              ] );
        ])
 
@@ -507,6 +552,25 @@ let json_response_field name = function
       | Some value -> Ok value
       | None -> Error ("invalid_response", "missing JSON field `" ^ name ^ "`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let array_response_field (name : string) (value : Lsp_json.json) :
+    (Lsp_json.json list, string * string) result =
+  match json_response_field name value with
+  | Error _ as error -> error
+  | Ok (Lsp_json.Array items) -> Ok items
+  | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
+
+let array_response_field_map (name : string)
+    (decode : Lsp_json.json -> ('a, string * string) result)
+    (value : Lsp_json.json) : ('a list, string * string) result =
+  let* items = array_response_field name value in
+  let rec collect acc = function
+    | [] -> Ok (List.rev acc)
+    | item :: rest ->
+        let* decoded = decode item in
+        collect (decoded :: acc) rest
+  in
+  collect [] items
 
 let optional_json_response_field name = function
   | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
@@ -709,8 +773,99 @@ let parse_comments_response_field artifact =
       collect [] values
   | Some _ -> Error ("invalid_response", "field `comments` must be an array")
 
+let parsed_source_phase_response_field artifact =
+  match optional_json_response_field "ast_phase" artifact with
+  | Error _ as error -> error
+  | Ok None -> Ok RawParsedProgram
+  | Ok (Some (Lsp_json.String phase)) -> parsed_source_phase_of_string phase
+  | Ok (Some _) ->
+      Error ("invalid_response", "field `ast_phase` must be a string")
+
+let module_surface_symbol_kind_field value =
+  let* kind = string_response_field "kind" value in
+  match Module_surface.symbol_kind_of_string kind with
+  | Ok kind -> Ok kind
+  | Error message -> Error ("invalid_response", message)
+
+let module_surface_symbol_source_field value =
+  let* kind = string_response_field "kind" value in
+  let* decl_index = int_response_field "decl_index" value in
+  match kind with
+  | "decl" -> Ok (Module_surface.Decl decl_index)
+  | "trait_method" ->
+      let* method_index = int_response_field "method_index" value in
+      Ok (Module_surface.TraitMethod (decl_index, method_index))
+  | "impl_method" ->
+      let* method_index = int_response_field "method_index" value in
+      Ok (Module_surface.ImplMethod (decl_index, method_index))
+  | "private_decl" -> Ok (Module_surface.PrivateDecl decl_index)
+  | "private_trait_method" ->
+      let* method_index = int_response_field "method_index" value in
+      Ok (Module_surface.PrivateTraitMethod (decl_index, method_index))
+  | "private_impl_method" ->
+      let* method_index = int_response_field "method_index" value in
+      Ok (Module_surface.PrivateImplMethod (decl_index, method_index))
+  | other ->
+      Error
+        ( "invalid_response",
+          "unsupported module surface symbol source kind `" ^ other ^ "`" )
+
+let module_surface_symbol_field = function
+  | Lsp_json.Object _ as value ->
+      let* name = string_response_field "name" value in
+      let* kind = module_surface_symbol_kind_field value in
+      let* source = json_response_field "source" value in
+      let* source = module_surface_symbol_source_field source in
+      Ok { Module_surface.name; kind; source }
+  | _ ->
+      Error ("invalid_response", "module surface symbols must be JSON objects")
+
+let module_surface_import_field = function
+  | Lsp_json.Object _ as value ->
+      let* module_path = string_response_field "module_path" value in
+      Ok { Module_surface.module_path }
+  | _ ->
+      Error ("invalid_response", "module surface imports must be JSON objects")
+
+let module_surface_field value =
+  let* kind = string_response_field "kind" value in
+  if kind <> "module_surface" then
+    Error
+      ( "invalid_response",
+        "expected module_surface, got `" ^ kind ^ "`" )
+  else
+    let* module_name = string_response_field "module" value in
+    let* imports =
+      array_response_field_map "imports" module_surface_import_field value
+    in
+    let* exports =
+      array_response_field_map "exports" module_surface_symbol_field value
+    in
+    let* private_names =
+      array_response_field_map "private_names" module_surface_symbol_field value
+    in
+    let* private_traits = string_array_field "private_traits" value in
+    Ok
+      {
+        Module_surface.module_name;
+        imports;
+        exports;
+        private_names;
+        private_traits;
+      }
+
+let module_surface_artifact_field artifact =
+  match optional_json_response_field "module_surface" artifact with
+  | Error _ as error -> error
+  | Ok None | Ok (Some Lsp_json.Null) -> Ok None
+  | Ok (Some surface) ->
+      let* decoded = module_surface_field surface in
+      Ok (Some decoded)
+
 let parsed_ast_artifact_field artifact =
+  let* parsed_phase = parsed_source_phase_response_field artifact in
   let* comments = parse_comments_response_field artifact in
+  let* parsed_module_surface = module_surface_artifact_field artifact in
   let* parsed_ast = json_response_field "parsed_ast" artifact in
   match Parsed_ast_json.decode_parse_diagnostics parsed_ast with
   | Error err ->
@@ -725,7 +880,13 @@ let parsed_ast_artifact_field artifact =
       match Parsed_ast_json.decode_program parsed_ast with
       | Ok program ->
           Ok
-            (ParsedSource { parsed_program = program; parsed_comments = comments })
+            (ParsedSource
+               {
+                 parsed_program = program;
+                 parsed_comments = comments;
+                 parsed_phase;
+                 parsed_module_surface;
+               })
       | Error err -> (
           match compiler_error_of_decode_error err with
           | Some compiler_error -> Ok (ParseSourceDiagnostics [ compiler_error ])
@@ -756,17 +917,7 @@ let parse_source_batch_item_response = function
 
 let parse_sources_response_field response =
   let* artifact = json_response_field "artifact" response in
-  match json_response_field "sources" artifact with
-  | Error _ as error -> error
-  | Ok (Lsp_json.Array values) ->
-      let rec collect acc = function
-        | [] -> Ok (List.rev acc)
-        | value :: rest ->
-            let* item = parse_source_batch_item_response value in
-            collect (item :: acc) rest
-      in
-      collect [] values
-  | Ok _ -> Error ("invalid_response", "field `sources` must be an array")
+  array_response_field_map "sources" parse_source_batch_item_response artifact
 
 let parse_sources_response_json response_json =
   response_result response_json parse_sources_response_field
@@ -1093,15 +1244,82 @@ let optional_cli_frontend_module_origin_field name value =
       let* decoded = cli_frontend_module_origin_field origin in
       Ok (Some decoded)
 
-let cli_frontend_graph_source_field source =
+let cli_frontend_source_package_field (package : Lsp_json.json) :
+    (cli_frontend_source_package, string * string) result =
+  let* cli_frontend_source_package_alias =
+    string_response_field "alias" package
+  in
+  let* cli_frontend_source_package_name = string_response_field "name" package in
+  let* cli_frontend_source_package_root = string_response_field "root" package in
+  let* cli_frontend_source_package_source_dir =
+    string_response_field "source_dir" package
+  in
+  let* cli_frontend_source_package_exports =
+    string_array_field "exports" package
+  in
+  Ok
+    {
+      cli_frontend_source_package_alias;
+      cli_frontend_source_package_name;
+      cli_frontend_source_package_root;
+      cli_frontend_source_package_source_dir;
+      cli_frontend_source_package_exports;
+    }
+
+let cli_frontend_source_package_list_field (name : string)
+    (value : Lsp_json.json) :
+    (cli_frontend_source_package list, string * string) result =
+  array_response_field_map name cli_frontend_source_package_field value
+
+let cli_frontend_graph_context_field (artifact : Lsp_json.json) :
+    (cli_frontend_graph_context, string * string) result =
+  let* context = json_response_field "context" artifact in
+  let* cli_frontend_context_std_dir =
+    optional_string_response_field "std_dir" context
+  in
+  let* cli_frontend_context_source_packages =
+    cli_frontend_source_package_list_field "source_packages" context
+  in
+  let* cli_frontend_context_package_roots =
+    string_array_field "package_roots" context
+  in
+  Ok
+    {
+      cli_frontend_context_std_dir;
+      cli_frontend_context_source_packages;
+      cli_frontend_context_package_roots;
+    }
+
+let cli_frontend_graph_source_field (source : Lsp_json.json) :
+    (cli_frontend_graph_source, string * string) result =
   let* cli_frontend_graph_path = string_response_field "path" source in
   let* cli_frontend_graph_module_name = string_response_field "module" source in
   let* cli_frontend_graph_source_text =
     string_response_field "source_text" source
   in
   let* parsed_source = json_response_field "parsed_source" source in
+  let* parsed_source_phase = parsed_source_phase_response_field parsed_source in
+  let* () =
+    match parsed_source_phase with
+    | TypecheckSourceProgram -> Ok ()
+    | RawParsedProgram ->
+        Error
+          ( "invalid_response",
+            "frontend module graph source must be typecheck_source, got raw_parse"
+          )
+  in
   let* cli_frontend_graph_parsed_response =
     parsed_ast_artifact_field parsed_source
+  in
+  let* () =
+    match cli_frontend_graph_parsed_response with
+    | ParsedSource { parsed_module_surface = Some _; _ }
+    | ParseSourceDiagnostics _ ->
+        Ok ()
+    | ParsedSource { parsed_module_surface = None; _ } ->
+        Error
+          ( "invalid_response",
+            "frontend module graph source must include module_surface" )
   in
   let* origin = json_response_field "origin" source in
   let* cli_frontend_graph_origin = cli_frontend_module_origin_field origin in
@@ -1114,20 +1332,13 @@ let cli_frontend_graph_source_field source =
       cli_frontend_graph_origin;
     }
 
-let cli_frontend_graph_source_list_field name artifact =
-  match json_response_field name artifact with
-  | Error _ as error -> error
-  | Ok (Lsp_json.Array sources) ->
-      let rec collect acc = function
-        | [] -> Ok (List.rev acc)
-        | source :: rest ->
-            let* parsed = cli_frontend_graph_source_field source in
-            collect (parsed :: acc) rest
-      in
-      collect [] sources
-  | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
+let cli_frontend_graph_source_list_field (name : string)
+    (artifact : Lsp_json.json) :
+    (cli_frontend_graph_source list, string * string) result =
+  array_response_field_map name cli_frontend_graph_source_field artifact
 
-let cli_frontend_import_edge_field edge =
+let cli_frontend_import_edge_field (edge : Lsp_json.json) :
+    (cli_frontend_import_edge, string * string) result =
   let* cli_frontend_import_from_path = string_response_field "from_path" edge in
   let* cli_frontend_import_from_module =
     string_response_field "from_module" edge
@@ -1152,18 +1363,9 @@ let cli_frontend_import_edge_field edge =
       cli_frontend_import_resolved_origin;
     }
 
-let cli_frontend_import_edges_field artifact =
-  match json_response_field "imports" artifact with
-  | Error _ as error -> error
-  | Ok (Lsp_json.Array edges) ->
-      let rec collect acc = function
-        | [] -> Ok (List.rev acc)
-        | edge :: rest ->
-            let* parsed = cli_frontend_import_edge_field edge in
-            collect (parsed :: acc) rest
-      in
-      collect [] edges
-  | Ok _ -> Error ("invalid_response", "field `imports` must be an array")
+let cli_frontend_import_edges_field (artifact : Lsp_json.json) :
+    (cli_frontend_import_edge list, string * string) result =
+  array_response_field_map "imports" cli_frontend_import_edge_field artifact
 
 let cli_frontend_graph_diagnostics_field artifact =
   string_array_field "diagnostics" artifact
@@ -1217,6 +1419,9 @@ let cli_frontend_module_graph_response_field artifact =
   let* cli_frontend_graph_options =
     decode_cli_frontend_options cli_frontend_graph_command options
   in
+  let* cli_frontend_graph_context =
+    cli_frontend_graph_context_field artifact
+  in
   let* cli_frontend_graph_roots =
     cli_frontend_graph_source_list_field "roots" artifact
   in
@@ -1238,6 +1443,7 @@ let cli_frontend_module_graph_response_field artifact =
          cli_frontend_graph_command;
          cli_frontend_graph_args;
          cli_frontend_graph_options;
+         cli_frontend_graph_context;
          cli_frontend_graph_roots;
          cli_frontend_graph_modules;
          cli_frontend_graph_imports;
@@ -2502,25 +2708,33 @@ let run_core_pipeline_core_json_exn ~stage core_json =
   | Ok transformed_core -> transformed_core
   | Error (_, message) -> invalid_arg message
 
-let parse_source_via_command ~path ~module_name ~text =
+let parse_source_via_command_at_phase ~phase ~path ~module_name ~text =
   let response_json =
     run_parser_request_via_blorp
-      (parse_source_request_json ~path ~module_name ~text)
+      (parse_source_request_json_at_phase ~phase ~path ~module_name ~text)
   in
   parse_source_response_json response_json
 
-let parse_sources_via_command items =
+let parse_source_via_command ~path ~module_name ~text =
+  parse_source_via_command_at_phase ~phase:RawParsedProgram ~path ~module_name
+    ~text
+
+let parse_sources_via_command ?(phase = RawParsedProgram) items =
   let response_json =
-    run_parser_request_via_blorp (parse_sources_request_json items)
+    run_parser_request_via_blorp (parse_sources_request_json ~phase items)
   in
   parse_sources_response_json response_json
 
-let parse_source_file_via_command ~path ~module_name =
+let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
   let response_json =
     run_parser_request_via_blorp
-      (parse_source_file_request_json ~path ~module_name)
+      (parse_source_file_request_json_at_phase ~phase ~path ~module_name)
   in
   parse_source_response_json response_json
+
+let parse_source_file_via_command ~path ~module_name =
+  parse_source_file_via_command_at_phase ~phase:RawParsedProgram ~path
+    ~module_name
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json

@@ -54,10 +54,12 @@ type import_binding = {
 }
 (** A module loaded and parsed during compilation.
 
-    Load-bearing invariant: [decls] is raw post-parse (pre-subscript-
-    desugar); [typed_decls] is desugared + typed and validated through
-    [Typed_ast]. The formatter reads [decls]; all typecheck-downstream
-    consumers read [typed_decls]. *)
+    Load-bearing invariant: [decls] is the parser bridge's
+    [typecheck_source] source AST, after Blorp-owned parser-adjacent
+    finalization such as interpolation, nested-function hoisting, and
+    subscript-read lowering. [surface] is the Blorp-owned syntactic module
+    surface for the same AST when the bridge supplied one. [typed_decls] is
+    typed and validated through [Typed_ast]. *)
 
 type package_id = Package_id of string
 
@@ -104,6 +106,7 @@ type loaded_module = {
   origin : module_origin;
   decls : program;
   exports : (string * decl) list;
+  surface : Module_surface.t option;
   mutable typed_decls : Typed_ast.program option;
   mutable typed_import_bindings : import_binding list option;
 }
@@ -115,6 +118,7 @@ type parsed_module_cache_entry = {
   parsed_trust_current_source : bool;
   parsed_decls : program;
   parsed_exports : (string * decl) list;
+  parsed_surface : Module_surface.t option;
 }
 
 type source_package = {

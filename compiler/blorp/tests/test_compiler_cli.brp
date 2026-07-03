@@ -130,6 +130,18 @@ pure func graph_source_diagnostic_count(source: CliFrontendGraphSource) -> Int:
 			-1
 
 
+pure func graph_source_ast_phase(source: CliFrontendGraphSource) -> String:
+	json_string_field(source.parsed_source, "ast_phase")
+
+
+pure func graph_source_has_module_surface(source: CliFrontendGraphSource) -> Bool:
+	match get_field(source.parsed_source, "module_surface"):
+		Some(_):
+			True
+		None:
+			False
+
+
 pure func graph_root_at(
 	graph: CliFrontendModuleGraph,
 	index: Int,
@@ -170,6 +182,38 @@ pure func is_pkg_origin(source: CliFrontendGraphSource, package_id: String) -> B
 			actual_package_id == package_id
 		_:
 			False
+
+
+pure func graph_has_source_package_context(
+	graph: CliFrontendModuleGraph,
+	package_alias: String,
+	source_dir_suffix: String,
+) -> Bool:
+	var found: Bool = False
+
+	for package in graph.context.source_packages:
+		if (
+			package.package_alias == package_alias
+			and package.source_dir.ends_with(source_dir_suffix)
+		):
+			found = True
+			break
+
+	found
+
+
+pure func graph_has_package_root_context(
+	graph: CliFrontendModuleGraph,
+	root_suffix: String,
+) -> Bool:
+	var found: Bool = False
+
+	for package_root in graph.context.package_roots:
+		if package_root.ends_with(root_suffix):
+			found = True
+			break
+
+	found
 
 
 func write_text_ok(path: String, text: String) -> Bool:
@@ -403,6 +447,7 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 						(
 							source.path == first_path
 							and source.module_name == "blorp_cli_check_multi_a"
+							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -414,6 +459,7 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_multi_b"
+							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -470,6 +516,7 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 						(
 							source.path == root + "/a.brp"
 							and source.module_name == "a"
+							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -531,6 +578,7 @@ func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_diag_b"
+							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
@@ -1011,6 +1059,50 @@ func test_cli_run_envelope_handles_version_payload() -> Bool:
 				False
 
 
+func test_cli_run_envelope_frontend_graph_includes_context() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_envelope_graph_context.brp"
+	source: String =
+		|func main(args: List[String]) -> Int:
+		|	0
+
+	match write_file(path, source):
+		Ok(_):
+			envelope: BridgeEnvelope = {
+				schema = 1,
+				domain = "compiler",
+				action = RunCliAction,
+				action_name = "run_cli",
+				payload = JsonObject([
+					("args", JsonVector([
+							JsonString("compile"),
+							JsonString("--no-format"),
+							JsonString(path),
+						])),
+				])
+			}
+			response: JsonValue = handle_cli_run_envelope(envelope)
+			_ = remove_file(path)
+
+			if not json_bool_field(response, "ok"):
+				False
+			else:
+				match get_field(response, "artifact"):
+					Some(artifact):
+						match get_field(artifact, "context"):
+							Some(context):
+								(
+									json_string_field(artifact, "kind") == "frontend_module_graph"
+									and json_array_length_field(context, "source_packages") == 0
+									and json_array_length_field(context, "package_roots") >= 0
+								)
+							None:
+								False
+					None:
+						False
+		Err(_):
+			False
+
+
 func test_run_cli_handles_command_help() -> Bool:
 	check_ok: Bool = match run_cli(["check", "--help"]):
 		CliRunFrontendModuleGraph(_):
@@ -1250,6 +1342,7 @@ func test_run_cli_parses_compile_source_before_delegation() -> Bool:
 								graph.command == CliFrontendCompile
 								and source.path == path
 								and source.module_name == "blorp_cli_run_compile_frontier"
+								and graph_source_ast_phase(source) == "typecheck_source"
 								and graph_source_decl_count(source) == 1
 								and graph_source_diagnostic_count(source) == 0
 								and graph.modules.length() == 0
@@ -1299,19 +1392,22 @@ func test_run_cli_discovers_compile_import_source_graph() -> Bool:
 
 		match plan:
 			CliRunFrontendModuleGraph(graph):
-				match graph.modules.get(0):
-					Some(module):
+				match (graph.roots.get(0), graph.modules.get(0)):
+					(Some(root), Some(module)):
 						(
 							graph.command == CliFrontendCompile
 							and graph.roots.length() == 1
 							and graph.modules.length() == 1
 							and graph.import_edges.length() == 1
+							and graph_source_has_module_surface(root)
+							and graph_source_has_module_surface(module)
 							and module.path.ends_with("/blorp_cli_compile_graph_dep.brp")
 							and module.module_name == "./blorp_cli_compile_graph_dep"
 							and module.source_text == dep_source
+							and graph_source_ast_phase(module) == "typecheck_source"
 							and graph_source_decl_count(module) == 1
 						)
-					None:
+					_:
 						False
 			CliRunDelegate(_):
 				False
@@ -1427,6 +1523,7 @@ func test_run_cli_discovers_package_alias_source_graph() -> Bool:
 					and graph.roots.length() == 1
 					and graph.modules.length() == 2
 					and graph.import_edges.length() == 2
+					and graph_has_source_package_context(graph, "sample_v1", "/vendor/sample/src")
 					and saw_alias
 					and saw_internal
 				)
@@ -1499,7 +1596,69 @@ func test_run_cli_discovers_pkg_root_source_graph() -> Bool:
 							and module.path.ends_with("/pkg/local_math.brp")
 							and module.source_text == pkg_source
 							and is_pkg_origin(module, "local_math")
+							and graph_has_package_root_context(graph, "/pkg")
 						)
+					None:
+						False
+			CliRunDelegate(_):
+				False
+			CliRunFrontendOptions(_):
+				False
+			CliRunHandled(_):
+				False
+			CliRunTest(_):
+				False
+			CliRunPurify(_):
+				False
+			CliRunRepl(_):
+				False
+			CliRunLsp(_):
+				False
+			CliRunPackage(_):
+				False
+
+
+func cleanup_std_context_graph_project(root: String) -> Void:
+	_ = remove_file(root + "/app/main.brp")
+	_ = remove_file(root + "/blorp.toml")
+	_ = remove_dir(root + "/custom_std")
+	_ = remove_dir(root + "/app")
+	_ = remove_dir(root)
+
+
+func test_run_cli_carries_config_std_context() -> Bool:
+	root: String = temp_dir() + "/blorp_cli_std_context_graph"
+	app_dir: String = root + "/app"
+	std_dir: String = root + "/custom_std"
+	main_path: String = app_dir + "/main.brp"
+
+	cleanup_std_context_graph_project(root)
+
+	source: String =
+		|func main(args: List[String]) -> Int:
+		|	0
+	config: String =
+		|[std]
+		|path = "custom_std"
+
+	if not ((
+		mkdir(root)
+		and mkdir(app_dir)
+		and mkdir(std_dir)
+		and write_text_ok(root + "/blorp.toml", config)
+		and write_text_ok(main_path, source)
+	)):
+		cleanup_std_context_graph_project(root)
+		False
+	else:
+		plan: CliRunPlan = run_cli(["compile", "--no-format", main_path])
+		cleanup_std_context_graph_project(root)
+
+		match plan:
+			CliRunFrontendModuleGraph(graph):
+				match graph.context.std_dir:
+					Some(actual_std_dir):
+						actual_std_dir.ends_with("/custom_std")
 					None:
 						False
 			CliRunDelegate(_):
@@ -1986,6 +2145,10 @@ tests: TestSuite = {
 		("run CLI handles top-level usage", test_run_cli_handles_top_level_usage),
 		("run CLI handles version with context", test_run_cli_handles_version_with_context),
 		("CLI run envelope handles version payload", test_cli_run_envelope_handles_version_payload),
+		(
+			"CLI run envelope frontend graph includes context",
+			test_cli_run_envelope_frontend_graph_includes_context,
+		),
 		("run CLI handles command help", test_run_cli_handles_command_help),
 		("run CLI handles package help", test_run_cli_handles_package_help),
 		("run CLI plans package command", test_run_cli_plans_package_command),
@@ -2002,6 +2165,7 @@ tests: TestSuite = {
 			test_run_cli_discovers_package_alias_source_graph,
 		),
 		("run CLI discovers pkg root source graph", test_run_cli_discovers_pkg_root_source_graph),
+		("run CLI carries config std context", test_run_cli_carries_config_std_context),
 		(
 			"run CLI formats compile source before parse",
 			test_run_cli_formats_compile_source_before_parse,

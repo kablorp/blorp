@@ -91,6 +91,9 @@ let () =
         (fun (name, cases) -> ("Parser." ^ name, cases))
         Test_parser.suite
     @ List.map
+        (fun (name, cases) -> ("ModuleSurface." ^ name, cases))
+        Test_module_surface.suite
+    @ List.map
         (fun (name, cases) -> ("ParsedAstJson." ^ name, cases))
         Test_parsed_ast_json.suite
     @ List.map

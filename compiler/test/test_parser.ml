@@ -6,181 +6,99 @@ let check_string msg = Alcotest.(check string) msg
 let check_bool msg = Alcotest.(check bool) msg
 
 let parse_ok source =
-  match Blorp.Modules.parse_source ~hoist_nested:false source with
+  match Blorp.Modules.parse_source source with
   | Ok program -> program
   | Error err -> Alcotest.fail err.message
 
 let parse_error_message source =
-  match Blorp.Modules.parse_source ~hoist_nested:false source with
+  match Blorp.Modules.parse_source source with
   | Ok _ -> Alcotest.fail "expected parse error"
   | Error err -> err.message
 
-let ast_expr expr_desc expr_loc =
-  {
-    Blorp.Ast.expr_desc;
-    expr_loc;
-    expr_type = None;
-    expr_type_info = None;
-    expr_rc = None;
-  }
+let parse_typecheck_ok source =
+  match Blorp.Modules.parse_typecheck_source source with
+  | Ok program -> program
+  | Error err -> Alcotest.fail err.message
 
-let test_interpolation_transform_uses_supplied_batch_parser () =
-  let loc = Blorp.Ast.point_loc ~line:1 ~column:1 in
-  let var_decl name raw =
-    {
-      Blorp.Ast.decl_desc =
-        Blorp.Ast.DVar
-          {
-            var_name = Some name;
-            var_pattern = None;
-            var_type = None;
-            var_value =
-              ast_expr (Blorp.Ast.EStringInterpRaw (raw, false)) loc;
-            var_is_mutable = false;
-            var_is_const = false;
-          };
-      decl_loc = loc;
-      decl_doc = None;
-    }
-  in
-  let decl = var_decl "message" "Hello {name} and {count + 1}" in
-  let second_decl = var_decl "other" "Other {later}" in
-  let batches = ref [] in
-  let parse_batch requests =
-    batches := requests :: !batches;
-    List.mapi
-      (fun index request ->
-        ast_expr
-          (Blorp.Ast.EIdent (Printf.sprintf "parsed_%d" index))
-          request.Blorp.Interp_parser.loc)
-      requests
-  in
-  match
-    Blorp.Interp_parser.transform_program_with_expr_batch_parser parse_batch
-      [ decl; second_decl ]
-  with
-  | [
-      {
-        Blorp.Ast.decl_desc =
-          Blorp.Ast.DVar
-            {
-              var_value =
-                {
-                  expr_desc =
-                    Blorp.Ast.EStringInterp
-                      ( [
-                          Blorp.Ast.InterpLit "Hello ";
-                          Blorp.Ast.InterpExpr
-                            { expr_desc = Blorp.Ast.EIdent parsed_first; _ };
-                          Blorp.Ast.InterpLit " and ";
-                          Blorp.Ast.InterpExpr
-                            { expr_desc = Blorp.Ast.EIdent parsed_second; _ };
-                        ],
-                        false );
-                  _;
-                };
-              _;
-            };
-        _;
-      };
-      {
-        Blorp.Ast.decl_desc =
-          Blorp.Ast.DVar
-            {
-              var_value =
-                {
-                  expr_desc =
-                    Blorp.Ast.EStringInterp
-                      ( [
-                          Blorp.Ast.InterpLit "Other ";
-                          Blorp.Ast.InterpExpr
-                            { expr_desc = Blorp.Ast.EIdent parsed_later; _ };
-                        ],
-                        false );
-                  _;
-                };
-              _;
-            };
-        _;
-      };
-    ] ->
-      let requests =
-        match !batches with
-        | [ requests ] -> requests
-        | _ -> Alcotest.fail "expected one interpolation parse batch"
-      in
-      check_int "batch size" 3 (List.length requests);
-      check_string "first parser input" "name"
-        (List.nth requests 0).Blorp.Interp_parser.text;
-      check_string "second parser input" "count + 1"
-        (List.nth requests 1).Blorp.Interp_parser.text;
-      check_string "third parser input" "later"
-        (List.nth requests 2).Blorp.Interp_parser.text;
-      check_string "first parsed expression" "parsed_0" parsed_first;
-      check_string "second parsed expression" "parsed_1" parsed_second;
-      check_string "third parsed expression" "parsed_2" parsed_later
-  | _ -> Alcotest.fail "expected transformed string interpolation"
+let rec expr_exists pred expr =
+  pred expr || List.exists (expr_exists pred) (Blorp.Ast.expr_children expr)
 
-let interpolation_ident_names expr =
+let func_exists_expr pred func =
+  match Blorp.Ast.func_body_expr_opt func.Blorp.Ast.func_body with
+  | Some body -> expr_exists pred body
+  | None -> false
+
+let rec decl_exists_expr pred decl =
+  match decl.Blorp.Ast.decl_desc with
+  | Blorp.Ast.DFunc func -> func_exists_expr pred func
+  | Blorp.Ast.DVar var -> expr_exists pred var.Blorp.Ast.var_value
+  | Blorp.Ast.DPrivate inner -> decl_exists_expr pred inner
+  | Blorp.Ast.DImpl impl -> List.exists (func_exists_expr pred) impl.impl_methods
+  | Blorp.Ast.DTrait trait_decl ->
+      List.exists
+        (fun method_decl ->
+          match method_decl.Blorp.Ast.method_default_body with
+          | Some body -> expr_exists pred body
+          | None -> false)
+        trait_decl.trait_methods
+  | Blorp.Ast.DType _ | Blorp.Ast.DRecord _ | Blorp.Ast.DImport _
+  | Blorp.Ast.DTypeAlias _ ->
+      false
+
+let program_exists_expr pred program = List.exists (decl_exists_expr pred) program
+
+let is_raw_interpolation expr =
   match expr.Blorp.Ast.expr_desc with
-  | Blorp.Ast.EStringInterp (parts, _) ->
-      List.filter_map
-        (function
-          | Blorp.Ast.InterpLit _ -> None
-          | Blorp.Ast.InterpExpr { expr_desc = Blorp.Ast.EIdent name; _ } ->
-              Some name
-          | Blorp.Ast.InterpExpr _ ->
-              Alcotest.fail "expected interpolation hole to parse as identifier")
-        parts
-  | _ -> Alcotest.fail "expected string interpolation expression"
+  | Blorp.Ast.EStringInterpRaw _ -> true
+  | _ -> false
 
-let collect_interpolation_ident_names program =
-  let rec collect_expr acc expr =
-    match expr.Blorp.Ast.expr_desc with
-    | Blorp.Ast.EStringInterp _ -> acc @ [ interpolation_ident_names expr ]
-    | _ -> List.fold_left collect_expr acc (Blorp.Ast.expr_children expr)
-  in
-  let collect_func acc func =
-    match Blorp.Ast.func_body_expr_opt func.Blorp.Ast.func_body with
-    | Some body -> collect_expr acc body
-    | None -> acc
-  in
-  let collect_decl acc decl =
-    match decl.Blorp.Ast.decl_desc with
-    | Blorp.Ast.DFunc func -> collect_func acc func
-    | _ -> acc
-  in
-  List.fold_left collect_decl [] program
+let is_final_interpolation expr =
+  match expr.Blorp.Ast.expr_desc with
+  | Blorp.Ast.EStringInterp _ -> true
+  | _ -> false
 
-let test_interpolation_bridge_preserves_hole_order_in_nested_blocks () =
+let is_nested_function_expr expr =
+  match expr.Blorp.Ast.expr_desc with
+  | Blorp.Ast.EFuncDecl _ -> true
+  | _ -> false
+
+let is_subscript_read expr =
+  match expr.Blorp.Ast.expr_desc with
+  | Blorp.Ast.ESubscript _ | Blorp.Ast.ESubscriptMulti _ -> true
+  | _ -> false
+
+let is_checked_get_call expr =
+  match expr.Blorp.Ast.expr_desc with
+  | Blorp.Ast.ECall ({ expr_desc = Blorp.Ast.EIdent "checked_get"; _ }, _) ->
+      true
+  | _ -> false
+
+let test_raw_and_typecheck_source_phases_are_distinct () =
   let source =
-    {|
-pure func closest_candidate(type_name: String, sorted_candidates: List[String]) -> Option[String]:
-	None
-
-pure func render_no_impl_hint(type_name: String, method_name: String, candidates: List[String]) -> String:
-	if candidates.length() == 0:
-		"no type in scope implements `${method_name}`. Define an `implements <trait> for ${type_name}:` block with a `${method_name}` method."
-	else:
-		sorted_candidates: List[String] = candidates.sort()
-
-		match closest_candidate(type_name, sorted_candidates):
-			Some(suggestion):
-				"did you mean to call it on a ${suggestion}? Or add `implements <trait> for ${type_name}:` defining `${method_name}`."
-			None:
-				candidate_text: String = sorted_candidates.join(", ")
-				"types with an `${method_name}` impl in scope: ${candidate_text}. Add `implements <trait> for ${type_name}:` to extend it."
-|}
+    "message = \"hello ${name}\"\n\n\
+     func outer(x: Int) -> Int:\n\
+    \    func inner(y: Int) -> Int:\n\
+    \        y + 1\n\
+    \    inner(x)\n\n\
+     func item(v: Int[#3]) -> Int:\n\
+    \    v[0]\n"
   in
-  let program = parse_ok source in
-  Alcotest.(check (list (list string)))
-    "interpolation hole identifiers"
-    [
-      [ "method_name"; "type_name"; "method_name" ];
-      [ "suggestion"; "type_name"; "method_name" ];
-      [ "method_name"; "candidate_text"; "type_name" ];
-    ]
-    (collect_interpolation_ident_names program)
+  let raw_program = parse_ok source in
+  let typecheck_program = parse_typecheck_ok source in
+  check_bool "raw keeps raw interpolation" true
+    (program_exists_expr is_raw_interpolation raw_program);
+  check_bool "raw keeps nested function expression" true
+    (program_exists_expr is_nested_function_expr raw_program);
+  check_bool "raw keeps subscript read" true
+    (program_exists_expr is_subscript_read raw_program);
+  check_bool "typecheck finalizes interpolation" true
+    (program_exists_expr is_final_interpolation typecheck_program);
+  check_bool "typecheck hoists nested function expressions" false
+    (program_exists_expr is_nested_function_expr typecheck_program);
+  check_bool "typecheck rewrites subscript read" false
+    (program_exists_expr is_subscript_read typecheck_program);
+  check_bool "typecheck emits checked_get call" true
+    (program_exists_expr is_checked_get_call typecheck_program)
 
 let test_empty_programs_parse_to_no_decls () =
   check_int "empty source" 0 (List.length (parse_ok ""));
@@ -367,14 +285,8 @@ let suite =
       [
         Alcotest.test_case "empty and blank programs" `Quick
           test_empty_programs_parse_to_no_decls;
-      ] );
-    ( "interpolation",
-      [
-        Alcotest.test_case "transform uses supplied batch parser" `Quick
-          test_interpolation_transform_uses_supplied_batch_parser;
-        Alcotest.test_case
-          "bridge preserves hole order in nested blocks" `Quick
-          test_interpolation_bridge_preserves_hole_order_in_nested_blocks;
+        Alcotest.test_case "raw and typecheck source phases are distinct" `Quick
+          test_raw_and_typecheck_source_phases_are_distinct;
       ] );
     ( "imports",
       [

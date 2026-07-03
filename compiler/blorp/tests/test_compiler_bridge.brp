@@ -613,6 +613,19 @@ pure func parsed_ast_field(value: JsonValue) -> Option[JsonValue]:
 	get_field(artifact, "parsed_ast")
 
 
+pure func module_surface_field(value: JsonValue) -> Option[JsonValue]:
+	artifact ?= get_field(value, "artifact")
+	get_field(artifact, "module_surface")
+
+
+pure func parsed_ast_text(value: JsonValue) -> String:
+	match parsed_ast_field(value):
+		Some(parsed_ast):
+			parsed_ast.to_string()
+		None:
+			""
+
+
 pure func artifact_sources(value: JsonValue) -> Option[List[JsonValue]]:
 	artifact ?= get_field(value, "artifact")
 	sources_value ?= get_field(artifact, "sources")
@@ -629,6 +642,77 @@ pure func json_array_length(value: JsonValue, name: String) -> Int:
 					-1
 		None:
 			-1
+
+
+pure func json_string_array_field(value: JsonValue, name: String) -> List[String]:
+	match get_field(value, name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					var strings: List[String] = []
+
+					for item in items:
+						match as_string(item):
+							Some(text):
+								strings = strings.append(text)
+							None:
+								void
+
+					strings
+				None:
+					[]
+		None:
+			[]
+
+
+pure func module_surface_symbol_names(surface: JsonValue, field_name: String) -> List[String]:
+	match get_field(surface, field_name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					var names: List[String] = []
+
+					for item in items:
+						match get_field(item, "name"):
+							Some(name_value):
+								match as_string(name_value):
+									Some(name):
+										names = names.append(name)
+									None:
+										void
+							None:
+								void
+
+					names
+				None:
+					[]
+		None:
+			[]
+
+
+pure func module_surface_import_paths(surface: JsonValue) -> List[String]:
+	match get_field(surface, "imports"):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					var paths: List[String] = []
+
+					for item in items:
+						match get_field(item, "module_path"):
+							Some(path_value):
+								match as_string(path_value):
+									Some(path):
+										paths = paths.append(path)
+									None:
+										void
+							None:
+								void
+
+					paths
+				None:
+					[]
+		None:
+			[]
 
 
 pure func utf8_e_acute() -> String:
@@ -669,7 +753,178 @@ pure func test_parse_source_returns_parsed_ast_artifact() -> Bool:
 					False
 
 			ok: Bool = bool_field(response, "ok")
-			ok and parsed_ast_ok
+			ok and parsed_ast_ok and artifact_string_field(response, "ast_phase") == "raw_parse"
+		None:
+			False
+
+
+pure func test_parse_source_typecheck_artifact_includes_module_surface() -> Bool:
+	source: String = (
+		"import:\n"
+		+ "\toption: Option(Some, None)\n\n"
+		+ "trait Renderable:\n"
+		+ "\tpure func render(value: Self) -> String"
+	)
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("ast_phase", JsonString("typecheck_source")),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			match module_surface_field(response):
+				Some(surface):
+					exports: List[String] = module_surface_symbol_names(surface, "exports")
+					imports: List[String] = module_surface_import_paths(surface)
+
+					(
+						bool_field(response, "ok")
+						and string_field(surface, "kind") == "module_surface"
+						and string_field(surface, "module") == "main"
+						and imports.length() == 1
+						and imports.get(0).get_or("") == "option"
+						and exports.contains("Renderable")
+						and exports.contains("render")
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_parse_source_accepts_typecheck_ast_phase() -> Bool:
+	source: String = "func message(name: String): \"Hello " + "$" + "{name}!\""
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("ast_phase", JsonString("typecheck_source")),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "typecheck_source"
+				and ast_text.contains("\"kind\":\"string_interp\"")
+				and not ast_text.contains("string_interp_raw")
+			)
+		None:
+			False
+
+
+pure func test_parse_source_raw_phase_keeps_raw_string_interpolation() -> Bool:
+	source: String = "func message(name: String): \"Hello " + "$" + "{name}!\""
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "raw_parse"
+				and ast_text.contains("string_interp_raw")
+			)
+		None:
+			False
+
+
+pure func test_parse_source_typecheck_phase_hoists_nested_function() -> Bool:
+	source: String = "func outer(x: Int) -> Int:\n\tfunc inner(y: Int) -> Int:\n\t\ty + 1\n\tinner(x)"
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("ast_phase", JsonString("typecheck_source")),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "typecheck_source"
+				and ast_text.contains("__nested_outer_inner_0")
+				and not ast_text.contains("\"kind\":\"function_decl\"")
+			)
+		None:
+			False
+
+
+pure func test_parse_source_raw_phase_keeps_nested_function() -> Bool:
+	source: String = "func outer(x: Int) -> Int:\n\tfunc inner(y: Int) -> Int:\n\t\ty + 1\n\tinner(x)"
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "raw_parse"
+				and ast_text.contains("\"kind\":\"function_decl\"")
+				and not ast_text.contains("__nested_outer_inner_0")
+			)
+		None:
+			False
+
+
+pure func test_parse_source_typecheck_phase_rewrites_subscript_read() -> Bool:
+	source: String = "func first(values: Int[#3]) -> Int:\n\tvalues[0]"
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("ast_phase", JsonString("typecheck_source")),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "typecheck_source"
+				and ast_text.contains("\"kind\":\"call\"")
+				and ast_text.contains("\"text\":\"checked_get\"")
+				and not ast_text.contains("\"kind\":\"subscript\"")
+			)
+		None:
+			False
+
+
+pure func test_parse_source_raw_phase_keeps_subscript_read() -> Bool:
+	source: String = "func first(values: Int[#3]) -> Int:\n\tvalues[0]"
+	request: String = request_json("parse_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+		]))
+
+	match parser_response_value(request):
+		Some(response):
+			ast_text: String = parsed_ast_text(response)
+
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ast_phase") == "raw_parse"
+				and ast_text.contains("\"kind\":\"subscript\"")
+				and not ast_text.contains("\"text\":\"checked_get\"")
+			)
 		None:
 			False
 
@@ -726,7 +981,9 @@ pure func test_parse_sources_returns_ordered_ast_artifacts() -> Bool:
 										(
 											sources.length() == 2
 											and string_field(first, "path") == "a.brp"
+											and string_field(first, "ast_phase") == "raw_parse"
 											and string_field(second, "module") == "b"
+											and string_field(second, "ast_phase") == "raw_parse"
 											and json_array_length(first_ast, "decls") == 1
 											and json_array_length(second_ast, "decls") == 1
 										)
@@ -736,6 +993,82 @@ pure func test_parse_sources_returns_ordered_ast_artifacts() -> Bool:
 								False
 					None:
 						False
+		None:
+			False
+
+
+pure func test_parse_sources_typecheck_artifacts_include_module_surface() -> Bool:
+	request: String = request_json(
+		"parse_sources",
+		JsonObject([
+			("ast_phase", JsonString("typecheck_source")),
+			("sources", JsonVector([JsonObject([
+						("path", JsonString("a.brp")),
+						("module", JsonString("a")),
+						("text", JsonString("func a() -> Int:\n\t1")),
+					]), JsonObject([
+						("path", JsonString("b.brp")),
+						("module", JsonString("b")),
+						("text", JsonString("func b() -> Int:\n\t2")),
+					])])),
+		]),
+	)
+
+	match parser_response_value(request):
+		Some(response):
+			match artifact_sources(response):
+				Some(sources):
+					match (sources.get(0), sources.get(1)):
+						(Some(first), Some(second)):
+							match (get_field(first, "module_surface"), get_field(second, "module_surface")):
+								(Some(first_surface), Some(second_surface)):
+									(
+										string_field(first_surface, "module") == "a"
+										and string_field(second_surface, "module") == "b"
+										and module_surface_symbol_names(first_surface, "exports").contains("a")
+										and module_surface_symbol_names(second_surface, "exports").contains("b")
+									)
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		None:
+			False
+
+
+pure func test_parse_sources_accepts_shared_typecheck_ast_phase() -> Bool:
+	request: String = request_json(
+		"parse_sources",
+		JsonObject([
+			("ast_phase", JsonString("typecheck_source")),
+			("sources", JsonVector([JsonObject([
+						("path", JsonString("a.brp")),
+						("module", JsonString("a")),
+						("text", JsonString("a = 1")),
+					]), JsonObject([
+						("path", JsonString("b.brp")),
+						("module", JsonString("b")),
+						("text", JsonString("b = 2")),
+					])])),
+		]),
+	)
+
+	match parser_response_value(request):
+		Some(response):
+			match artifact_sources(response):
+				Some(sources):
+					match (sources.get(0), sources.get(1)):
+						(Some(first), Some(second)):
+							(
+								string_field(first, "ast_phase") == "typecheck_source"
+								and string_field(second, "ast_phase") == "typecheck_source"
+							)
+						_:
+							False
+				None:
+					False
 		None:
 			False
 
@@ -856,8 +1189,41 @@ tests: TestSuite = {
 			test_parse_source_preserves_raw_utf8_string_literals,
 		),
 		(
+			"parse_source typecheck artifact includes module surface",
+			test_parse_source_typecheck_artifact_includes_module_surface,
+		),
+		("parse_source accepts typecheck AST phase", test_parse_source_accepts_typecheck_ast_phase),
+		(
+			"parse_source raw phase keeps raw string interpolation",
+			test_parse_source_raw_phase_keeps_raw_string_interpolation,
+		),
+		(
+			"parse_source typecheck phase hoists nested function",
+			test_parse_source_typecheck_phase_hoists_nested_function,
+		),
+		(
+			"parse_source raw phase keeps nested function",
+			test_parse_source_raw_phase_keeps_nested_function,
+		),
+		(
+			"parse_source typecheck phase rewrites subscript read",
+			test_parse_source_typecheck_phase_rewrites_subscript_read,
+		),
+		(
+			"parse_source raw phase keeps subscript read",
+			test_parse_source_raw_phase_keeps_subscript_read,
+		),
+		(
 			"parse_sources returns ordered AST artifacts",
 			test_parse_sources_returns_ordered_ast_artifacts,
+		),
+		(
+			"parse_sources typecheck artifacts include module surface",
+			test_parse_sources_typecheck_artifacts_include_module_surface,
+		),
+		(
+			"parse_sources accepts shared typecheck AST phase",
+			test_parse_sources_accepts_shared_typecheck_ast_phase,
 		),
 		("CLI parse_source reads path payload", test_cli_parse_source_reads_path_payload),
 		("CLI parse_source reports missing path", test_cli_parse_source_reports_missing_path),

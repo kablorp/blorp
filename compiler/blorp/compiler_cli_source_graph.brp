@@ -6,6 +6,7 @@ import:
 	compiler_cli_plan:
 		CliCheckTargetExpansion,
 		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
+		CliFrontendGraphContext,
 		CliFrontendGraphSource,
 		CliFrontendImportEdge,
 		CliFrontendModuleGraph,
@@ -15,10 +16,12 @@ import:
 			CliFrontendStdModule,
 			CliFrontendUserModule,
 		),
+		CliFrontendSourcePackage,
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 	compiler_format: FormatCommandResult, run_format_command
+	compiler_parsed_ast: ParsedProgramPhase(TypecheckSourceProgram), parsed_program_phase_name
 	compiler_parser_bridge as ParserBridge
 	fs: message, open_read
 	json:
@@ -32,6 +35,10 @@ import:
 
 
 private CURRENT_PACKAGE_STD_COMPAT: String = "preview-1"
+
+
+private pure func cli_frontend_ast_phase_name() -> String:
+	parsed_program_phase_name(TypecheckSourceProgram)
 
 
 private pure func absolute_normalized_path(cwd: String, path: String) -> String:
@@ -288,6 +295,7 @@ private pure func parse_source_request_value(
 				("path", JsonString(path)),
 				("module", JsonString(module_name)),
 				("text", JsonString(source)),
+				("ast_phase", JsonString(cli_frontend_ast_phase_name())),
 			])),
 	])
 
@@ -316,6 +324,7 @@ private pure func parse_sources_request_value(sources: List[CliSourceFile]) -> J
 		("action", JsonString("parse_sources")),
 		("payload", JsonObject([
 				("include_comments", JsonBool(False)),
+				("ast_phase", JsonString(cli_frontend_ast_phase_name())),
 				("sources", parse_source_item_request_values(sources)),
 			])),
 	])
@@ -455,21 +464,6 @@ record CliResolvedImportSource {
 }
 
 
-record CliSourcePackage {
-	package_alias: String,
-	package_name: String,
-	source_dir: String,
-	exports: List[String]
-}
-
-
-record CliSourceGraphContext {
-	std_dir: Option[String],
-	source_packages: List[CliSourcePackage],
-	package_roots: List[String]
-}
-
-
 record CliSourceGraphDiscovery {
 	sources: List[CliSourceFile],
 	seen_paths: List[String],
@@ -477,69 +471,72 @@ record CliSourceGraphDiscovery {
 }
 
 
-private pure func json_array_field_or_empty(value: JsonValue, name: String) -> List[JsonValue]:
+private pure func json_array_field(
+	value: JsonValue,
+	name: String,
+) -> Result[List[JsonValue], String]:
 	match get_field(value, name):
 		Some(field):
 			match as_array(field):
 				Some(items):
-					items
+					Ok(items)
 				None:
-					[]
+					Err("module surface field `" + name + "` was not an array")
 		None:
-			[]
+			Err("module surface missing field `" + name + "`")
 
 
-private pure func json_string_field_or_none(value: JsonValue, name: String) -> Option[String]:
+private pure func json_string_field(value: JsonValue, name: String) -> Result[String, String]:
 	match get_field(value, name):
 		Some(field):
-			as_string(field)
+			match as_string(field):
+				Some(text):
+					Ok(text)
+				None:
+					Err("module surface field `" + name + "` was not a string")
 		None:
-			None
+			Err("module surface missing field `" + name + "`")
 
 
-private pure func parsed_import_paths_from_imports(imports_value: JsonValue) -> List[String]:
+private pure func module_surface_import_paths_json(surface: JsonValue) -> Result[List[String], String]:
 	var imports: List[String] = []
+	var error: Option[String] = None
 
-	match as_array(imports_value):
-		Some(items):
-			for item in items:
-				match json_string_field_or_none(item, "module_path"):
-					Some(module_path):
+	items ?= json_array_field(surface, "imports")
+
+	for item in items:
+		match error:
+			Some(_):
+				break
+			None:
+				match json_string_field(item, "module_path"):
+					Ok(module_path):
 						imports = imports.append(module_path)
-					None:
-						void
+					Err(message):
+						error = Some(message)
+
+	match error:
+		Some(message):
+			Err(message)
 		None:
-			void
-
-	imports
+			Ok(imports)
 
 
-private pure func parsed_import_paths_from_decl(decl: JsonValue) -> List[String]:
-	match json_string_field_or_none(decl, "kind"):
-		Some(kind):
-			if kind == "import_block":
-				match get_field(decl, "imports"):
-					Some(imports_value):
-						parsed_import_paths_from_imports(imports_value)
-					None:
-						[]
-			else:
-				[]
+private pure func parsed_source_module_surface(
+	source: CliParsedSourceFile,
+) -> Result[JsonValue, String]:
+	match get_field(source.parsed_source, "module_surface"):
+		Some(surface):
+			Ok(surface)
 		None:
-			[]
+			Err("parsed source `" + source.path + "` missing module_surface")
 
 
-private pure func parsed_source_import_paths(source: CliParsedSourceFile) -> List[String]:
-	match get_field(source.parsed_source, "parsed_ast"):
-		Some(parsed_ast):
-			var imports: List[String] = []
-
-			for decl in json_array_field_or_empty(parsed_ast, "decls"):
-				imports = imports.concat(parsed_import_paths_from_decl(decl))
-
-			imports
-		None:
-			[]
+private pure func parsed_source_import_paths(
+	source: CliParsedSourceFile,
+) -> Result[List[String], String]:
+	surface ?= parsed_source_module_surface(source)
+	module_surface_import_paths_json(surface)
 
 
 private pure func action_std_dir(action: CliAction) -> Option[String]:
@@ -556,7 +553,7 @@ private pure func action_std_dir(action: CliAction) -> Option[String]:
 			None
 
 
-private func graph_std_dir(action: CliAction) -> Option[String]:
+private func action_or_env_std_dir(action: CliAction) -> Option[String]:
 	match action_std_dir(action):
 		Some(path):
 			Some(path)
@@ -912,6 +909,12 @@ record CliPackageManifest {
 }
 
 
+record CliSourceGraphConfig {
+	std_dir: Option[String],
+	source_packages: List[CliFrontendSourcePackage]
+}
+
+
 private pure func package_manifest_from_toml(toml: TomlValue) -> Option[CliPackageManifest]:
 	name ?= toml_string_at(toml, "package.name")
 	std_compat ?= toml_string_at(toml, "compat.std")
@@ -945,13 +948,14 @@ private func package_exports_exist(source_dir: String, exports: List[String]) ->
 private func read_source_package(
 	package_alias: String,
 	package_root: String,
-) -> Option[CliSourcePackage]:
-	source_dir: String = normalize(join(package_root, "src"))
+) -> Option[CliFrontendSourcePackage]:
+	normalized_root: String = normalize(package_root)
+	source_dir: String = normalize(join(normalized_root, "src"))
 
 	if not is_directory(source_dir):
 		None
 	else:
-		match read_text_file(join(package_root, "package.toml")):
+		match read_text_file(join(normalized_root, "package.toml")):
 			Ok(source):
 				match parse_toml(source):
 					Ok(toml):
@@ -961,6 +965,7 @@ private func read_source_package(
 									Some({
 										package_alias = package_alias,
 										package_name = manifest.name,
+										package_root = normalized_root,
 										source_dir = source_dir,
 										exports = manifest.exports,
 									})
@@ -997,7 +1002,7 @@ private func find_blorp_config_from_dir(base_dir: String) -> Option[String]:
 
 
 private pure func source_package_seen(
-	packages: List[CliSourcePackage],
+	packages: List[CliFrontendSourcePackage],
 	package_alias: String,
 	source_dir: String,
 ) -> Bool:
@@ -1011,44 +1016,60 @@ private pure func source_package_seen(
 	seen
 
 
-private func source_packages_from_config(config_path: String) -> List[CliSourcePackage]:
+private pure func config_std_dir_from_toml(
+	config_dir: String,
+	toml: TomlValue,
+) -> Option[String]:
+	match toml_string_at(toml, "std.path"):
+		Some(path):
+			if path.trim().length() == 0:
+				None
+			else:
+				Some(config_relative_path(config_dir, path))
+		None:
+			None
+
+
+private func source_packages_from_config_toml(
+	config_dir: String,
+	toml: TomlValue,
+) -> List[CliFrontendSourcePackage]:
+	var packages: List[CliFrontendSourcePackage] = []
+
+	for package_alias in package_aliases_from_toml(toml):
+		match package_root_for_alias(config_dir, toml, package_alias):
+			Some(package_root):
+				match read_source_package(package_alias, package_root):
+					Some(package):
+						if not source_package_seen(
+							packages,
+							package.package_alias,
+							package.source_dir,
+						):
+							packages = packages.append(package)
+					None:
+						void
+			None:
+				void
+
+	packages
+
+
+private func source_graph_config(config_path: String) -> CliSourceGraphConfig:
 	config_dir: String = dirname(config_path)
 
 	match read_text_file(config_path):
 		Ok(source):
 			match parse_toml(source):
 				Ok(toml):
-					var packages: List[CliSourcePackage] = []
-
-					for package_alias in package_aliases_from_toml(toml):
-						match package_root_for_alias(config_dir, toml, package_alias):
-							Some(package_root):
-								match read_source_package(package_alias, package_root):
-									Some(package):
-										if not source_package_seen(
-											packages,
-											package.package_alias,
-											package.source_dir,
-										):
-											packages = packages.append(package)
-									None:
-										void
-							None:
-								void
-
-					packages
+					{
+						std_dir = config_std_dir_from_toml(config_dir, toml),
+						source_packages = source_packages_from_config_toml(config_dir, toml)
+					}
 				Err(_):
-					[]
+					{std_dir = None, source_packages = []}
 		Err(_):
-			[]
-
-
-private func source_packages_from_base_dir(base_dir: String) -> List[CliSourcePackage]:
-	match find_blorp_config_from_dir(base_dir):
-		Some(config_path):
-			source_packages_from_config(config_path)
-		None:
-			[]
+			{std_dir = None, source_packages = []}
 
 
 private func find_pkg_root_from_dir(base_dir: String) -> Option[String]:
@@ -1074,9 +1095,9 @@ private func find_pkg_root_from_dir(base_dir: String) -> Option[String]:
 
 
 private pure func append_unique_package(
-	packages: List[CliSourcePackage],
-	package: CliSourcePackage,
-) -> List[CliSourcePackage]:
+	packages: List[CliFrontendSourcePackage],
+	package: CliFrontendSourcePackage,
+) -> List[CliFrontendSourcePackage]:
 	if source_package_seen(packages, package.package_alias, package.source_dir):
 		packages
 	else:
@@ -1084,10 +1105,10 @@ private pure func append_unique_package(
 
 
 private pure func append_unique_packages(
-	packages: List[CliSourcePackage],
-	more: List[CliSourcePackage],
-) -> List[CliSourcePackage]:
-	var result: List[CliSourcePackage] = packages
+	packages: List[CliFrontendSourcePackage],
+	more: List[CliFrontendSourcePackage],
+) -> List[CliFrontendSourcePackage]:
+	var result: List[CliFrontendSourcePackage] = packages
 
 	for package in more:
 		result = append_unique_package(result, package)
@@ -1098,8 +1119,9 @@ private pure func append_unique_packages(
 private func source_graph_context_for_sources(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
-) -> CliSourceGraphContext:
-	var source_packages: List[CliSourcePackage] = []
+) -> CliFrontendGraphContext:
+	var std_dir: Option[String] = action_or_env_std_dir(action)
+	var source_packages: List[CliFrontendSourcePackage] = []
 	var package_roots: List[String] = []
 	cwd_pkg: String = join(getcwd(), "pkg")
 
@@ -1108,10 +1130,20 @@ private func source_graph_context_for_sources(
 
 	for root in roots:
 		base_dir: String = dirname(root.path)
-		source_packages = append_unique_packages(
-			source_packages,
-			source_packages_from_base_dir(base_dir),
-		)
+
+		match find_blorp_config_from_dir(base_dir):
+			Some(config_path):
+				config: CliSourceGraphConfig = source_graph_config(config_path)
+
+				if std_dir.is_none():
+					std_dir = config.std_dir
+
+				source_packages = append_unique_packages(
+					source_packages,
+					config.source_packages,
+				)
+			None:
+				void
 
 		match find_pkg_root_from_dir(base_dir):
 			Some(pkg_root):
@@ -1120,7 +1152,7 @@ private func source_graph_context_for_sources(
 				void
 
 	{
-		std_dir = graph_std_dir(action),
+		std_dir = std_dir,
 		source_packages = source_packages,
 		package_roots = package_roots
 	}
@@ -1156,10 +1188,10 @@ private pure func split_module_ref(module_path: String) -> Option[(String, Strin
 
 
 private func source_package_for_path(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	path: String,
-) -> Option[CliSourcePackage]:
-	var result: Option[CliSourcePackage] = None
+) -> Option[CliFrontendSourcePackage]:
+	var result: Option[CliFrontendSourcePackage] = None
 	absolute: String = absolute_path(path)
 
 	for package in context.source_packages:
@@ -1171,7 +1203,7 @@ private func source_package_for_path(
 
 
 private func frontend_module_origin_for_path(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	path: String,
 	module_name: String,
 ) -> CliFrontendModuleOrigin:
@@ -1192,7 +1224,7 @@ private func frontend_module_origin_for_path(
 
 
 private func frontend_graph_source(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	source: CliParsedSourceFile,
 ) -> CliFrontendGraphSource:
 	{
@@ -1205,7 +1237,7 @@ private func frontend_graph_source(
 
 
 private func frontend_graph_sources(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	sources: List[CliParsedSourceFile],
 ) -> List[CliFrontendGraphSource]:
 	var graph_sources: List[CliFrontendGraphSource] = []
@@ -1217,7 +1249,7 @@ private func frontend_graph_sources(
 
 
 private func resolved_import_origin(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	resolved: CliResolvedImportSource,
 ) -> CliFrontendModuleOrigin:
 	frontend_module_origin_for_path(context, resolved.path, resolved.module_name)
@@ -1242,7 +1274,7 @@ private pure func resolved_import_module(
 
 
 private func resolved_import_module_origin(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	resolved: Option[CliResolvedImportSource],
 ) -> Option[CliFrontendModuleOrigin]:
 	match resolved:
@@ -1253,7 +1285,7 @@ private func resolved_import_module_origin(
 
 
 private func frontend_import_edge(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	source: CliParsedSourceFile,
 	module_path: String,
 	resolved: Option[CliResolvedImportSource],
@@ -1269,7 +1301,7 @@ private func frontend_import_edge(
 
 
 private pure func source_package_export_for_alias(
-	package: CliSourcePackage,
+	package: CliFrontendSourcePackage,
 	module_path: String,
 ) -> Option[String]:
 	match split_module_ref(module_path):
@@ -1291,7 +1323,7 @@ private pure func source_package_export_for_alias(
 
 
 private func resolve_source_package_alias_import(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	var result: Option[CliResolvedImportSource] = None
@@ -1316,7 +1348,7 @@ private func resolve_source_package_alias_import(
 
 
 private func resolve_source_package_internal_import(
-	package: CliSourcePackage,
+	package: CliFrontendSourcePackage,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	if module_path == package.package_name or module_path.starts_with(package.package_name + "/"):
@@ -1334,7 +1366,7 @@ private func resolve_source_package_internal_import(
 
 
 private pure func relative_import_allowed(
-	current_package: Option[CliSourcePackage],
+	current_package: Option[CliFrontendSourcePackage],
 	candidate: String,
 ) -> Bool:
 	match current_package:
@@ -1345,7 +1377,7 @@ private pure func relative_import_allowed(
 
 
 private func resolve_relative_import_source(
-	current_package: Option[CliSourcePackage],
+	current_package: Option[CliFrontendSourcePackage],
 	base_dir: String,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
@@ -1365,8 +1397,8 @@ private func resolve_relative_import_source(
 
 
 private func resolve_pkg_import_source_path(
-	context: CliSourceGraphContext,
-	current_package: Option[CliSourcePackage],
+	context: CliFrontendGraphContext,
+	current_package: Option[CliFrontendSourcePackage],
 	base_dir: String,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
@@ -1401,11 +1433,11 @@ private func resolve_pkg_import_source_path(
 
 
 private func resolve_import_source_path(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	base_dir: String,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
-	current_package: Option[CliSourcePackage] = source_package_for_path(context, base_dir)
+	current_package: Option[CliFrontendSourcePackage] = source_package_for_path(context, base_dir)
 
 	if module_path.starts_with("pkg/"):
 		resolve_pkg_import_source_path(context, current_package, base_dir, module_path)
@@ -1492,7 +1524,7 @@ private func read_cli_import_source(
 
 
 private func discover_import_sources_for_parsed_source(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	source: CliParsedSourceFile,
 	seen_paths: List[String],
 ) -> Result[CliSourceGraphDiscovery, String]:
@@ -1501,8 +1533,9 @@ private func discover_import_sources_for_parsed_source(
 	var import_edges: List[CliFrontendImportEdge] = []
 	var error: Option[String] = None
 	base_dir: String = dirname(source.path)
+	import_paths ?= parsed_source_import_paths(source)
 
-	for module_path in parsed_source_import_paths(source):
+	for module_path in import_paths:
 		match error:
 			Some(_):
 				break
@@ -1547,7 +1580,7 @@ private func discover_import_sources_for_parsed_source(
 
 
 private func discover_import_sources_for_parsed_sources(
-	context: CliSourceGraphContext,
+	context: CliFrontendGraphContext,
 	parsed_sources: List[CliParsedSourceFile],
 	seen_paths: List[String],
 ) -> Result[CliSourceGraphDiscovery, String]:
@@ -1602,7 +1635,7 @@ private func source_graph_walk_for_roots(
 	var modules: List[CliParsedSourceFile] = []
 	var import_edges: List[CliFrontendImportEdge] = []
 	var seen_paths: List[String] = parsed_source_paths(roots)
-	context: CliSourceGraphContext = source_graph_context_for_sources(action, roots)
+	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
 	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_paths)
 	seen_paths = initial.seen_paths
 	import_edges = import_edges.concat(initial.import_edges)
@@ -1657,13 +1690,14 @@ func frontend_module_graph_for_roots(
 	options: JsonValue,
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
-	context: CliSourceGraphContext = source_graph_context_for_sources(action, roots)
+	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
 	walk ?= source_graph_walk_for_roots(action, roots)
 
 	Ok({
 		command = command,
 		args = user_args,
 		options = options,
+		context = context,
 		roots = frontend_graph_sources(context, roots),
 		modules = frontend_graph_sources(context, walk.modules),
 		import_edges = walk.import_edges,

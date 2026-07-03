@@ -21,10 +21,15 @@ These modules define pure data-model and helper APIs for Blorp-owned lexing and
 parsing, and the production compiler routes source parsing through the existing
 bridge protocol. Filesystem-backed compiler parses whose
 supplied source matches the file on disk send path-only parse requests so the
-Blorp parser bridge executable reads the source file before parsing; synthetic parser
-calls still send source text directly.
-Source-preserving callers pass `hoist_nested=false` to retain parser-level
-nested function declarations without selecting a different frontend parser.
+Blorp parser bridge executable reads the source file before parsing; synthetic
+parser calls still send source text directly. Source-preserving callers request
+the raw parse phase; compile/check/run request the `typecheck_source` phase,
+which finalizes interpolation, nested functions, and subscript reads before the
+OCaml middle consumes the source AST. Parser bridge artifacts also include a
+Blorp-owned syntactic module surface from `compiler_module_surface.brp` and
+`compiler_module_surface_json.brp`; the CLI source graph uses that surface for
+import discovery, and OCaml validates it before storing parser results in the
+module parse cache.
 The lexer currently covers the structural token stream, ordinary line comments,
 docstrings, ordinary/raw strings, pipe strings, interpolation payloads, char
 literals, and lambda-body newline behavior inside grouping tokens. The parser

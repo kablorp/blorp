@@ -565,6 +565,7 @@ let test_get_trait_falls_back_to_session () =
       decls =
         [ { decl_desc = DTrait trait; decl_loc = dummy_loc; decl_doc = None } ];
       exports = [];
+      surface = None;
       typed_decls = None;
       typed_import_bindings = None;
     }
@@ -869,6 +870,7 @@ let test_env_traits_win_over_session_fallback () =
           };
         ];
       exports = [];
+      surface = None;
       typed_decls = None;
       typed_import_bindings = None;
     }

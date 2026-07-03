@@ -49,7 +49,7 @@ let test_parse_source_uses_session_without_frontend_selector () =
   let sess = Session.create () in
   Session.with_current sess (fun () ->
       match
-        Modules.parse_source ~filename:"session_parse.brp" ~hoist_nested:false
+        Modules.parse_source ~filename:"session_parse.brp"
           "func main(args: List[String]) -> Int:\n    0\n"
       with
       | Ok [ { Ast.decl_desc = Ast.DFunc { func_name = Some "main"; _ }; _ } ] ->
@@ -72,6 +72,7 @@ let test_module_cache_independent () =
       origin = Session.User_module;
       decls = [];
       exports = [];
+      surface = None;
       typed_decls = None;
       typed_import_bindings = None;
     }
@@ -432,11 +433,11 @@ let test_trusted_preloaded_parse_cache_skips_source_reread () =
       let dep_path = Filename.concat dir "dep.brp" in
       let original_source = "dep_value = 1\n" in
       write_file dep_path original_source;
-      let decls =
-        match
-          Modules.parse_source ~filename:dep_path ~bridge_read_file:false
-            original_source
-        with
+	    let decls =
+	      match
+	        Modules.parse_typecheck_source ~filename:dep_path ~bridge_read_file:false
+	          original_source
+	      with
         | Ok decls -> decls
         | Error err -> Alcotest.fail ("unexpected parse error: " ^ err.message)
       in
@@ -451,6 +452,7 @@ let test_trusted_preloaded_parse_cache_skips_source_reread () =
             preload_origin = Session.User_module;
             preload_source = original_source;
             preload_decls = decls;
+            preload_surface = None;
           };
         ];
       match Modules.load_module ~sess "./dep" dir with
@@ -459,9 +461,106 @@ let test_trusted_preloaded_parse_cache_skips_source_reread () =
           Alcotest.(check int)
             "loaded original parsed decl" 1
             (List.length loaded.decls);
-          Alcotest.(check int)
-            "no parse errors from overwritten source" 0
-            (List.length (Modules.get_load_errors ~sess ())))
+          let load_errors = Modules.get_load_errors ~sess () in
+          if load_errors <> [] then
+            Alcotest.fail
+              ("expected no parse errors from overwritten source, got:\n"
+             ^ String.concat "\n"
+                 (List.map (fun (err : Ast.compiler_error) -> err.message)
+                    load_errors)))
+
+let dep_value_surface ?(name = "dep_value") () : Module_surface.t =
+  {
+    module_name = "./dep";
+    imports = [];
+    exports =
+      [
+        {
+          name;
+          kind = Module_surface.Variable;
+          source = Module_surface.Decl 0;
+        };
+      ];
+    private_names = [];
+    private_traits = [];
+  }
+
+let test_preloaded_parse_cache_preserves_module_surface () =
+  with_temp_dir "blorp_trusted_preload_surface" (fun dir ->
+      let dep_path = Filename.concat dir "dep.brp" in
+      let original_source = "dep_value = 1\n" in
+      write_file dep_path original_source;
+      let decls =
+        match
+          Modules.parse_typecheck_source ~filename:dep_path
+            ~bridge_read_file:false original_source
+        with
+        | Ok decls -> decls
+        | Error err -> Alcotest.fail ("unexpected parse error: " ^ err.message)
+      in
+      let surface = dep_value_surface () in
+      write_file dep_path "func broken(\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess dir;
+      Modules.preload_parsed_sources ~sess
+        [
+          {
+            Modules.preload_module_name = "./dep";
+            preload_path = dep_path;
+            preload_origin = Session.User_module;
+            preload_source = original_source;
+            preload_decls = decls;
+            preload_surface = Some surface;
+          };
+        ];
+      let entry = Hashtbl.find sess.parse_cache "./dep" in
+      Alcotest.(check (list string))
+        "cached surface exports" [ "dep_value" ]
+        (Option.value ~default:[]
+           (Option.map Module_surface.export_names entry.parsed_surface));
+      match Modules.load_module ~sess "./dep" dir with
+      | None -> Alcotest.fail "expected trusted preloaded module to load"
+      | Some loaded ->
+          Alcotest.(check (list string))
+            "loaded surface exports" [ "dep_value" ]
+            (Option.value ~default:[]
+               (Option.map Module_surface.export_names loaded.surface)))
+
+let test_preloaded_parse_cache_rejects_invalid_module_surface () =
+  with_temp_dir "blorp_invalid_preload_surface" (fun dir ->
+      let dep_path = Filename.concat dir "dep.brp" in
+      let original_source = "dep_value = 1\n" in
+      write_file dep_path original_source;
+      let decls =
+        match
+          Modules.parse_typecheck_source ~filename:dep_path
+            ~bridge_read_file:false original_source
+        with
+        | Ok decls -> decls
+        | Error err -> Alcotest.fail ("unexpected parse error: " ^ err.message)
+      in
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess dir;
+      Modules.preload_parsed_sources ~sess
+        [
+          {
+            Modules.preload_module_name = "./dep";
+            preload_path = dep_path;
+            preload_origin = Session.User_module;
+            preload_source = original_source;
+            preload_decls = decls;
+            preload_surface = Some (dep_value_surface ~name:"wrong_name" ());
+          };
+        ];
+      Alcotest.(check bool)
+        "invalid surface not cached" false
+        (Hashtbl.mem sess.parse_cache "./dep");
+      Alcotest.(check bool)
+        "invalid surface diagnostic" true
+        (List.exists
+           (fun (err : Ast.compiler_error) ->
+             mentions err.message "invalid module surface")
+           (Modules.get_load_errors ~sess ())))
 
 let package_name_of_origin = function
   | Session.Native_package_module id -> Some (Session.package_id_name id)
@@ -1111,6 +1210,7 @@ let mk_loaded_module ~name ~decls : Session.loaded_module =
     origin = Session.User_module;
     decls;
     exports = [];
+    surface = None;
     typed_decls = None;
     typed_import_bindings = None;
   }
@@ -1339,6 +1439,10 @@ let suite =
           test_import_parse_error_does_not_block_sibling_import;
         Alcotest.test_case "trusted preloaded parse cache skips source reread"
           `Quick test_trusted_preloaded_parse_cache_skips_source_reread;
+        Alcotest.test_case "preloaded parse cache preserves module surface"
+          `Quick test_preloaded_parse_cache_preserves_module_surface;
+        Alcotest.test_case "preloaded parse cache rejects invalid module surface"
+          `Quick test_preloaded_parse_cache_rejects_invalid_module_surface;
         Alcotest.test_case "source package alias resolves" `Quick
           test_blorp_toml_source_package_alias_resolves;
         Alcotest.test_case "source package alias can differ from name" `Quick

@@ -5733,11 +5733,6 @@ let prepend_prelude_imports ?(current_module = "") (program : program) : program
 let typecheck_with_state_and_source ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
     check_state * program * program =
-  (* Phase 2.3: subscript-read desugar runs at the typecheck entry
-     rather than inside [Modules.parse_source], so the formatter
-     (which also parses) can still see the user's raw [x[i]]
-     syntax. *)
-  let program = Subscript_desugar.transform_program program in
   (* Auto-prelude: prepend [std/prelude.brp]'s [import:] statements to
      the main program so names like [print], [read_file] resolve without
      the caller writing the import explicitly. Stdlib modules that need
@@ -5979,8 +5974,6 @@ let check_private_type_leakage (state : check_state) (decls : program) :
 let typecheck_module_with_state_and_source ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (env : env) (decls : program) :
     check_state * program * program =
-  (* See Phase 2.3 note in [typecheck_with_env]. *)
-  let decls = Subscript_desugar.transform_program decls in
   (* Auto-prelude: inject [std/prelude.brp]'s imports into this module's
      decls too, so stdlib code (e.g., [std/memory.brp]) can use [print]
      without writing [import: io: print] at the top of every file.

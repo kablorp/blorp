@@ -2044,7 +2044,7 @@ let generate_suite_run_all_harness test_files =
 let parse_file_source filename input =
   let base_dir = extract_directory filename in
   init_module_paths base_dir;
-  match Modules.parse_source input with
+  match Modules.parse_typecheck_source ~filename input with
   | Ok program -> Ok (program, base_dir)
   | Error err -> Error (Diagnostics.format_error ~file:filename err)
 

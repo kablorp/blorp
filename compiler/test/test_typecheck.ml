@@ -54,7 +54,7 @@ let expect_origin_error src ~module_origin ~message =
       let sess = Blorp.Session.current () in
       Blorp.Modules.init_module_paths ~sess (Sys.getcwd ());
       match
-        Blorp.Modules.parse_source ~sess ~filename:"origin_policy.brp" src
+        Blorp.Modules.parse_typecheck_source ~sess ~filename:"origin_policy.brp" src
       with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program ->
@@ -80,7 +80,7 @@ let expect_origin_ok src ~module_origin =
       let sess = Blorp.Session.current () in
       Blorp.Modules.init_module_paths ~sess (Sys.getcwd ());
       match
-        Blorp.Modules.parse_source ~sess ~filename:"origin_policy.brp" src
+        Blorp.Modules.parse_typecheck_source ~sess ~filename:"origin_policy.brp" src
       with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program ->
@@ -143,7 +143,7 @@ let test_typecheck_typed_returns_valid_program () =
 func main(args: List[String]) -> Int:
     0
 |} in
-      match Blorp.Modules.parse_source ~filename:"typed_api.brp" src with
+      match Blorp.Modules.parse_typecheck_source ~filename:"typed_api.brp" src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
           match Blorp.Typecheck.typecheck_typed program with
@@ -163,7 +163,7 @@ let test_typecheck_typed_returns_errors_without_program () =
 func main(args: List[String]) -> Int:
     "not an int"
 |} in
-      match Blorp.Modules.parse_source ~filename:"typed_api_error.brp" src with
+      match Blorp.Modules.parse_typecheck_source ~filename:"typed_api_error.brp" src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
           match Blorp.Typecheck.typecheck_typed program with
@@ -185,7 +185,7 @@ pure func same(x: String) -> String:
 |}
       in
       match
-        Blorp.Modules.parse_source ~filename:"callable_overloads.brp" src
+        Blorp.Modules.parse_typecheck_source ~filename:"callable_overloads.brp" src
       with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
@@ -221,7 +221,7 @@ let expect_typed_program ~filename src =
   Test_helpers.with_isolated_env (fun () ->
       let sess = Blorp.Session.current () in
       Blorp.Modules.init_module_paths ~sess (Sys.getcwd ());
-      match Blorp.Modules.parse_source ~filename src with
+      match Blorp.Modules.parse_typecheck_source ~filename src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
           match Blorp.Typecheck.typecheck_typed program with
@@ -1115,7 +1115,7 @@ func main(args: List[String]) -> Int:
     helper() + 1
 |}
       in
-      match Blorp.Modules.parse_source ~filename:"typed_env_api.brp" src with
+      match Blorp.Modules.parse_typecheck_source ~filename:"typed_env_api.brp" src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
           match Blorp.Typecheck.typecheck_with_env_typed program with
@@ -1139,7 +1139,7 @@ func main(args: List[String]) -> Int:
     "not an int"
 |} in
       match
-        Blorp.Modules.parse_source ~filename:"typed_env_api_error.brp" src
+        Blorp.Modules.parse_typecheck_source ~filename:"typed_env_api_error.brp" src
       with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (

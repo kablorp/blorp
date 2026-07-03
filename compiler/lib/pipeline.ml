@@ -94,7 +94,7 @@ let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
     | User_source -> bridge_can_read_matching_source ~filename source
     | Generated_test_harness -> false
   in
-  match Modules.parse_source ~filename ~bridge_read_file source with
+  match Modules.parse_typecheck_source ~filename ~bridge_read_file source with
   | Error err ->
       record Parse;
       Error [ err ]

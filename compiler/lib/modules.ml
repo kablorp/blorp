@@ -23,6 +23,7 @@ type loaded_module = Session.loaded_module = {
   origin : Session.module_origin;
   decls : program;
   exports : (string * decl) list;
+  surface : Module_surface.t option;
   mutable typed_decls : Typed_ast.program option;
   mutable typed_import_bindings : Session.import_binding list option;
 }
@@ -36,6 +37,7 @@ type preloaded_parsed_source = {
   preload_origin : Session.module_origin;
   preload_source : string;
   preload_decls : Ast.program;
+  preload_surface : Module_surface.t option;
 }
 
 (** Resolve the session to operate on: explicit if passed, else the
@@ -188,134 +190,16 @@ type bridge_parse_error =
   | BridgeParseMessage of string
   | BridgeParseCompilerErrors of Ast.compiler_error list
 
-let compiler_error_of_interp_parse_error ~path message loc =
-  let loc =
-    match loc.Ast.loc_file with
-    | None -> { loc with loc_file = Some path }
-    | Some _ -> loc
-  in
-  {
-    Ast.message;
-    loc;
-    phase = Ast.Parse;
-    kind = Ast.OtherError;
-    notes = [];
-    help = None;
-  }
-
-let finalize_parsed_program ~hoist_nested program =
-  if hoist_nested then
-    try Ok (Nested_hoist.hoist_program program)
-    with Nested_hoist.Capture_error err -> Error err
-  else Ok program
-
-let request_at_index requests index =
-  let rec loop i = function
-    | [] -> None
-    | request :: rest -> if i = index then Some request else loop (i + 1) rest
-  in
-  loop 0 requests
-
-let interp_error_loc_for_diagnostic requests (err : Ast.compiler_error) =
-  match request_at_index requests (max 0 (err.loc.line - 1)) with
-  | Some request -> request.Interp_parser.loc
-  | None -> err.loc
-
-let interp_wrapper_var_name index = Printf.sprintf "___interp_%d" index
-
-let interp_wrapper_var_index name =
-  let prefix = "___interp_" in
-  let prefix_len = String.length prefix in
-  if
-    String.length name > prefix_len
-    && String.sub name 0 prefix_len = prefix
-  then int_of_string_opt (String.sub name prefix_len (String.length name - prefix_len))
-  else None
-
-let rec parse_interpolated_exprs_with_blorp_bridge ~path ~module_name requests =
-  let request_count = List.length requests in
-  let wrapper =
-    requests
-    |> List.mapi (fun index request ->
-           Printf.sprintf "%s = %s\n" (interp_wrapper_var_name index)
-             request.Interp_parser.text)
-    |> String.concat ""
-  in
-  let first_request_loc =
-    match requests with
-    | request :: _ -> request.Interp_parser.loc
-    | [] -> Ast.point_loc_in ~file:path ~line:1 ~column:1
-  in
-  let fail request =
-    raise
-      (Interp_parser.InterpParseError
-         ( Printf.sprintf "Failed to parse interpolated expression: %s"
-             request.Interp_parser.text,
-           request.Interp_parser.loc ))
-  in
-  let fail_at_start message =
-    raise (Interp_parser.InterpParseError (message, first_request_loc))
-  in
-  let extract decls =
-    let parsed_by_index = Hashtbl.create request_count in
-    let record_decl decl =
-      match decl.Ast.decl_desc with
-      | Ast.DVar { var_name = Some name; var_value; _ } -> (
-          match interp_wrapper_var_index name with
-          | Some index when index >= 0 && index < request_count ->
-              if Hashtbl.mem parsed_by_index index then
-                fail_at_start
-                  "interpolation expression parser returned duplicate \
-                   expressions"
-              else Hashtbl.add parsed_by_index index var_value
-          | _ ->
-              fail_at_start
-                "interpolation expression parser returned an unexpected \
-                 declaration")
-      | _ ->
-          fail_at_start
-            "interpolation expression parser returned an unexpected declaration"
-    in
-    List.iter record_decl decls;
-    List.mapi
-      (fun index request ->
-        match Hashtbl.find_opt parsed_by_index index with
-        | Some expr -> expr
-        | None -> fail request)
-      requests
-  in
-  if request_count = 0 then []
-  else
-    match
-      parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:false
-        ~bridge_read_file:false wrapper
-    with
-    | Ok decls -> extract decls
-    | Error (BridgeParseCompilerErrors (err :: _)) ->
-        raise
-          (Interp_parser.InterpParseError
-             ( Printf.sprintf "Parse error in interpolated expression: %s"
-                 err.Ast.message,
-               interp_error_loc_for_diagnostic requests err ))
-    | Error (BridgeParseCompilerErrors []) ->
-        raise
-          (Interp_parser.InterpParseError
-             ("Parse error in interpolated expression", first_request_loc))
-    | Error (BridgeParseMessage message) ->
-        raise
-          (Interp_parser.InterpParseError
-             ( Printf.sprintf "Parse error in interpolated expression: %s"
-                 message,
-               first_request_loc ))
-
-and parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
+let parse_source_artifact_with_blorp_bridge
+    ?(phase = Compiler_blorp_bridge.RawParsedProgram) ~path ~module_name
     ~bridge_read_file source =
   let parse_result =
     if bridge_read_file then
-      Compiler_blorp_bridge.parse_source_file_via_command ~path ~module_name
+      Compiler_blorp_bridge.parse_source_file_via_command_at_phase ~phase ~path
+        ~module_name
     else
-      Compiler_blorp_bridge.parse_source_via_command ~path ~module_name
-        ~text:source
+      Compiler_blorp_bridge.parse_source_via_command_at_phase ~phase ~path
+        ~module_name ~text:source
   in
   match
     parse_result
@@ -324,35 +208,16 @@ and parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
   | Ok (Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics) ->
       Error (BridgeParseCompilerErrors diagnostics)
   | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) ->
-      finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
-        parsed_source
+      Ok parsed_source
 
-and finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
-    (parsed_source : Compiler_blorp_bridge.parsed_source) =
-  try
-    let program =
-      Interp_parser.transform_program_with_expr_batch_parser
-        (parse_interpolated_exprs_with_blorp_bridge ~path ~module_name)
-        parsed_source.parsed_program
-    in
-    match finalize_parsed_program ~hoist_nested program with
-    | Ok program -> Ok program
-    | Error err -> Error (BridgeParseCompilerErrors [ err ])
-  with Interp_parser.InterpParseError (message, loc) ->
-    Error
-      (BridgeParseCompilerErrors
-         [ compiler_error_of_interp_parse_error ~path message loc ])
-
-let finalize_blorp_parsed_source ~path ~module_name ?(hoist_nested = true)
-    parsed_source =
+let parse_source_with_blorp_bridge ?phase ~path ~module_name ~bridge_read_file
+    source =
   match
-    finalize_blorp_parsed_source_for_bridge ~path ~module_name ~hoist_nested
-      parsed_source
+    parse_source_artifact_with_blorp_bridge ?phase ~path ~module_name
+      ~bridge_read_file source
   with
-  | Ok program -> Ok program
-  | Error (BridgeParseCompilerErrors errors) -> Error errors
-  | Error (BridgeParseMessage message) ->
-      Error [ parse_error_for_message ~filename:path message ]
+  | Ok parsed_source -> Ok parsed_source.parsed_program
+  | Error _ as error -> error
 
 (** Record the explicit filesystem std directory for this session. *)
 let record_std_source_dir (s : Session.t) dir =
@@ -731,11 +596,23 @@ let read_file path =
 let source_hash source = Digest.to_hex (Digest.string source)
 let embedded_module_path path = has_prefix "<embedded:" path
 
-let parsed_entry_tuple (entry : Session.parsed_module_cache_entry) =
-  ( entry.parsed_path,
-    entry.parsed_origin,
-    entry.parsed_decls,
-    entry.parsed_exports )
+type cached_module_source = {
+  cached_path : string;
+  cached_origin : Session.module_origin;
+  cached_decls : program;
+  cached_exports : (string * decl) list;
+  cached_surface : Module_surface.t option;
+}
+
+let cached_module_source_of_entry
+    (entry : Session.parsed_module_cache_entry) =
+  {
+    cached_path = entry.parsed_path;
+    cached_origin = entry.parsed_origin;
+    cached_decls = entry.parsed_decls;
+    cached_exports = entry.parsed_exports;
+    cached_surface = entry.parsed_surface;
+  }
 
 let resolved_origin_equal left right =
   match (left, right) with
@@ -751,8 +628,7 @@ let resolved_origin_equal left right =
       false
 
 type cached_parse_result =
-  | Cached_current of
-      (string * Session.module_origin * program * (string * decl) list)
+  | Cached_current of cached_module_source
   | Cached_changed_source of string
 
 let cached_filesystem_entry_is_current ~sess ~base_dir ~module_name
@@ -770,7 +646,7 @@ let cached_filesystem_entry_is_current ~sess ~base_dir ~module_name
       | exception Sys_error _ -> None
       | source ->
           if source_hash source = entry.parsed_source_hash then
-            Some (Cached_current (parsed_entry_tuple entry))
+            Some (Cached_current (cached_module_source_of_entry entry))
           else Some (Cached_changed_source source))
 
 let cached_entry_resolution_matches ~sess ~base_dir ~module_name
@@ -786,10 +662,10 @@ let cached_parse_entry ~sess ~base_dir ~module_name
   if
     embedded_module_path entry.parsed_path
     && not sess.Session.std_override_active
-  then Some (Cached_current (parsed_entry_tuple entry))
+  then Some (Cached_current (cached_module_source_of_entry entry))
   else if entry.parsed_trust_current_source then
     if cached_entry_resolution_matches ~sess ~base_dir ~module_name entry then
-      Some (Cached_current (parsed_entry_tuple entry))
+      Some (Cached_current (cached_module_source_of_entry entry))
     else None
   else cached_filesystem_entry_is_current ~sess ~base_dir ~module_name entry
 
@@ -932,21 +808,41 @@ let record_module_parse_message ~(sess : Session.t) ~path ~line ~col msg =
   in
   sess.Session.load_errors <- err :: sess.load_errors
 
-let cache_parsed_module_source ?(trust_current_source = false)
+let exports_for_cached_source decls = function
+  | Some surface -> Module_surface.exports_as_ast_pairs decls surface
+  | None -> collect_exports decls
+
+let cache_parsed_module_source ?(trust_current_source = false) ?surface
     ~(sess : Session.t) ~module_name ~path ~origin ~source decls =
-  let exports = collect_exports decls in
-  let entry : Session.parsed_module_cache_entry =
-    {
-      parsed_path = path;
-      parsed_origin = origin;
-      parsed_source_hash = source_hash source;
-      parsed_trust_current_source = trust_current_source;
-      parsed_decls = decls;
-      parsed_exports = exports;
-    }
-  in
-  Hashtbl.replace sess.parse_cache module_name entry;
-  (path, origin, decls, exports)
+  match
+    Option.map (Module_surface.validate_against_program decls) surface
+  with
+  | Some (Error message) ->
+      record_module_parse_message ~sess ~path ~line:1 ~col:1
+        ("invalid module surface from parser bridge: " ^ message);
+      None
+  | None | Some (Ok ()) ->
+      let exports = exports_for_cached_source decls surface in
+      let entry : Session.parsed_module_cache_entry =
+        {
+          parsed_path = path;
+          parsed_origin = origin;
+          parsed_source_hash = source_hash source;
+          parsed_trust_current_source = trust_current_source;
+          parsed_decls = decls;
+          parsed_exports = exports;
+          parsed_surface = surface;
+        }
+      in
+      Hashtbl.replace sess.parse_cache module_name entry;
+      Some
+        {
+          cached_path = path;
+          cached_origin = origin;
+          cached_decls = decls;
+          cached_exports = exports;
+          cached_surface = surface;
+        }
 
 let preload_parsed_sources ?sess sources =
   let sess = sess_of ?sess () in
@@ -956,6 +852,7 @@ let preload_parsed_sources ?sess sources =
         (cache_parsed_module_source ~trust_current_source:true ~sess
            ~module_name:source.preload_module_name ~path:source.preload_path
            ~origin:source.preload_origin ~source:source.preload_source
+           ?surface:source.preload_surface
            source.preload_decls))
     sources
 
@@ -1054,12 +951,6 @@ let bridge_batch_request_of_module_parse item :
     batch_parse_text = item.module_parse_source;
   }
 
-let record_batch_parse_errors ~(sess : Session.t) ~path = function
-  | BridgeParseCompilerErrors errors ->
-      sess.load_errors <- List.rev_append errors sess.load_errors
-  | BridgeParseMessage message ->
-      record_module_parse_message ~sess ~path ~line:1 ~col:1 message
-
 type module_parse_apply_result =
   | ModuleParseCached of module_parse_batch_item
   | ModuleParseFailed of string
@@ -1091,20 +982,14 @@ let apply_module_parse_batch_response ~(sess : Session.t) item response =
         ModuleParseFailed item.module_parse_name
     | Compiler_blorp_bridge.ParsedSource parsed_source -> (
         match
-          finalize_blorp_parsed_source_for_bridge ~path:item.module_parse_path
-            ~module_name:item.module_parse_name ~hoist_nested:true
-            parsed_source
+          cache_parsed_module_source ~sess ~module_name:item.module_parse_name
+            ~path:item.module_parse_path ~origin:item.module_parse_origin
+            ~source:item.module_parse_source
+            ?surface:parsed_source.parsed_module_surface
+            parsed_source.parsed_program
         with
-        | Ok decls ->
-            ignore
-               (cache_parsed_module_source ~sess
-                  ~module_name:item.module_parse_name ~path:item.module_parse_path
-                  ~origin:item.module_parse_origin ~source:item.module_parse_source
-                  decls);
-            ModuleParseCached item
-        | Error error ->
-            record_batch_parse_errors ~sess ~path:item.module_parse_path error;
-            ModuleParseFailed item.module_parse_name)
+        | Some _ -> ModuleParseCached item
+        | None -> ModuleParseFailed item.module_parse_name)
 
 let apply_module_parse_batch_responses ~(sess : Session.t) items responses =
   let rec loop result items responses =
@@ -1161,7 +1046,10 @@ let preload_module_parse_cache_chunk_with_blorp_bridge ~(sess : Session.t) items
   | [] -> empty_module_parse_preload_result
   | _ -> (
       let requests = List.map bridge_batch_request_of_module_parse items in
-      match Compiler_blorp_bridge.parse_sources_via_command requests with
+      match
+        Compiler_blorp_bridge.parse_sources_via_command
+          ~phase:Compiler_blorp_bridge.TypecheckSourceProgram requests
+      with
       | Error _ -> empty_module_parse_preload_result
       | Ok responses ->
           if List.length responses <> List.length items then
@@ -1206,6 +1094,11 @@ let import_module_names_from_decls decls =
          | DImport imp -> Some imp.import_module
          | _ -> None)
 
+let module_import_names ?surface decls =
+  match surface with
+  | Some surface -> Module_surface.import_module_names surface
+  | None -> import_module_names_from_decls decls
+
 let module_parse_import_base_dir ~fallback_base_dir item =
   if embedded_module_path item.module_parse_path then fallback_base_dir
   else extract_directory item.module_parse_path
@@ -1234,7 +1127,7 @@ let import_candidates_from_cached_item ~(sess : Session.t) ~fallback_base_dir
       let import_base_dir =
         module_parse_import_base_dir ~fallback_base_dir item
       in
-      entry.parsed_decls |> import_module_names_from_decls
+      module_import_names ?surface:entry.parsed_surface entry.parsed_decls
       |> List.fold_left
            (fun acc module_name ->
              add_module_preload_candidate ~sess seen
@@ -1280,8 +1173,8 @@ let eager_typecheck_support_candidates base_dir =
          module_preload_candidate ~base_dir
            (std_support_module_name module_name))
 
-let import_preload_candidates base_dir decls =
-  decls |> import_module_names_from_decls
+let import_preload_candidates ?surface base_dir decls =
+  decls |> module_import_names ?surface
   |> List.map (module_preload_candidate ~base_dir)
 
 (** Load a module by name
@@ -1364,13 +1257,14 @@ let rec load_module ?sess module_name base_dir =
     Shared by embedded and filesystem module loading. *)
 and parse_module_source ~(sess : Session.t) ~module_name ~path ~origin source =
   match
-    parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested:true
+    parse_source_artifact_with_blorp_bridge ~path ~module_name
+      ~phase:Compiler_blorp_bridge.TypecheckSourceProgram
       ~bridge_read_file:(not (embedded_module_path path)) source
   with
-  | Ok decls ->
-      Some
-        (cache_parsed_module_source ~sess ~module_name ~path ~origin ~source
-           decls)
+  | Ok parsed_source ->
+      cache_parsed_module_source ~sess ~module_name ~path ~origin ~source
+        ?surface:parsed_source.parsed_module_surface
+        parsed_source.parsed_program
   | Error (BridgeParseCompilerErrors errors) ->
       sess.load_errors <- List.rev_append errors sess.load_errors;
       None
@@ -1536,15 +1430,16 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
       in
       match parsed with
       | None -> None
-      | Some (path, origin, decls, exports) ->
+      | Some { cached_path; cached_origin; cached_decls; cached_exports; cached_surface } ->
           (* Create module and add to active cache *)
           let m =
             {
               name = module_name;
-              path;
-              origin;
-              decls;
-              exports;
+              path = cached_path;
+              origin = cached_origin;
+              decls = cached_decls;
+              exports = cached_exports;
+              surface = cached_surface;
               typed_decls = None;
               typed_import_bindings = None;
             }
@@ -1561,21 +1456,22 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
              constructor and type references (Track B). *)
           Session.register_module_types sess m;
           (* Recursively load this module's imports into active cache *)
-          let module_dir = extract_directory path in
-          let _ = load_imports ~sess decls module_dir in
+          let module_dir = extract_directory cached_path in
+          let _ = load_imports ~sess ?surface:cached_surface cached_decls module_dir in
           Some m)
 
 (** Load all imports from a list of declarations.
     Ensures prelude modules (option, result) are loaded on first call,
     since their type definitions are needed by codegen for any program
     that uses these prelude types without explicit imports. *)
-and load_imports ?sess decls base_dir =
+and load_imports ?sess ?surface decls base_dir =
   let sess = sess_of ?sess () in
+  let import_names = module_import_names ?surface decls in
   let preload_candidates =
     if not sess.prelude_modules_loaded then
       eager_typecheck_support_candidates base_dir
-      @ import_preload_candidates base_dir decls
-    else import_preload_candidates base_dir decls
+      @ import_preload_candidates ?surface base_dir decls
+    else import_preload_candidates ?surface base_dir decls
   in
   let failed_preloaded_modules =
     preload_module_import_closure ~sess ~base_dir preload_candidates
@@ -1590,25 +1486,17 @@ and load_imports ?sess decls base_dir =
       eager_typecheck_support_modules
   end;
   List.filter_map
-    (fun decl ->
-      match decl.decl_desc with
-      | DImport imp ->
-          let canonical_name =
-            canonical_module_name_for_preload ~sess ~base_dir imp.import_module
-          in
-          if List.mem canonical_name failed_preloaded_modules then None
-          else load_module ~sess imp.import_module base_dir
-      | _ -> None)
-    decls
+    (fun import_module ->
+      let canonical_name =
+        canonical_module_name_for_preload ~sess ~base_dir import_module
+      in
+      if List.mem canonical_name failed_preloaded_modules then None
+      else load_module ~sess import_module base_dir)
+    import_names
 
 (** Get module dependencies (names of modules it imports) *)
 let get_dependencies m =
-  List.filter_map
-    (fun decl ->
-      match decl.decl_desc with
-      | DImport imp -> Some imp.import_module
-      | _ -> None)
-    m.decls
+  module_import_names ?surface:m.surface m.decls
 
 (** Prelude modules whose type definitions must be emitted before all others.
     These are auto-loaded by load_imports and must come first in the codegen
@@ -1962,12 +1850,12 @@ let init_module_paths ?sess base_dir =
 
 (** Parse source text into an AST program.
     Runs the Blorp parser bridge and returns a structured error on failure. *)
-let parse_source ?sess ?filename ?(hoist_nested = true)
-    ?(bridge_read_file = false) source =
+let parse_source_at_phase ?sess ?filename ?(bridge_read_file = false) ~phase
+    source =
   let path = Option.value filename ~default:"<source>" in
   let module_name = bridge_module_name_for_path ?sess path in
   match
-    parse_source_with_blorp_bridge ~path ~module_name ~hoist_nested
+    parse_source_with_blorp_bridge ~phase ~path ~module_name
       ~bridge_read_file:(bridge_read_file && not (String.equal path "<source>"))
       source
   with
@@ -1979,3 +1867,11 @@ let parse_source ?sess ?filename ?(hoist_nested = true)
            "Blorp parser returned no program and no diagnostics")
   | Error (BridgeParseMessage message) ->
       Error (parse_error_for_message ?filename message)
+
+let parse_source ?sess ?filename ?(bridge_read_file = false) source =
+  parse_source_at_phase ?sess ?filename ~bridge_read_file
+    ~phase:Compiler_blorp_bridge.RawParsedProgram source
+
+let parse_typecheck_source ?sess ?filename ?(bridge_read_file = false) source =
+  parse_source_at_phase ?sess ?filename ~bridge_read_file
+    ~phase:Compiler_blorp_bridge.TypecheckSourceProgram source

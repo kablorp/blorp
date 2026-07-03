@@ -396,9 +396,9 @@ invariants.
 
 ## Near-Term Queue
 
-1. Finish the parser/source-AST ownership cleanup named in
-   [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md): interpolation-hole parsing,
-   subscript desugar, AST finalization, comments, and spans.
+1. Build on the completed parser/source-AST ownership cleanup named in
+   [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md) by moving the next semantic
+   frontend boundary into Blorp.
 2. Start moving module/type infrastructure behind the Blorp frontend module
    graph boundary, with direct parity tests before deleting OCaml modules.
 3. Continue the backend edge by completing the Perceus/consume-specialize port

@@ -59,7 +59,7 @@ let std_source_path_for_module module_path = module_path ^ ".brp"
 let std_source_decls path =
   let source = read_file (find_project_file path) in
   match
-    Blorp.Modules.parse_source ~filename:path ~hoist_nested:false source
+    Blorp.Modules.parse_source ~filename:path source
   with
   | Ok decls -> decls
   | Error err -> Alcotest.failf "failed to parse %s: %s" path err.message

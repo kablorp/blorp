@@ -1,0 +1,418 @@
+import:
+	../compiler_parse_diagnostic: compiler_parse_diagnostic_is_error
+	../compiler_parsed_ast:
+		ParsedDecl(FunctionParsedDecl),
+		ParsedExpr(
+			ParsedBlockExpr,
+			ParsedCallExpr,
+			ParsedNameExpr,
+			ParsedStringInterpolationPartsExpr,
+			ParsedSubscriptAssignExpr,
+			ParsedSubscriptExpr,
+			ParsedVoidExpr,
+		),
+		ParsedProgram,
+		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
+	../compiler_parser: parse_compiler_source
+	../compiler_source:
+		CompilerSourceFile,
+		CompilerSourceSpan,
+		compiler_source_cursor_at,
+		compiler_source_file,
+		compiler_source_span,
+	../compiler_source_ast_finalize:
+		StringInterpolationRawPart(InterpolationExprText, InterpolationLiteralText),
+		finalize_interpolation_program,
+		finalize_nested_functions_program,
+		finalize_typecheck_source_program,
+		split_interpolated_string,
+	test: TestSuite
+
+
+pure func source(text: String) -> CompilerSourceFile:
+	compiler_source_file("demo.brp", "demo", text)
+
+
+pure func full_span(src: CompilerSourceFile) -> CompilerSourceSpan:
+	compiler_source_span(
+		src,
+		compiler_source_cursor_at(src, 0),
+		compiler_source_cursor_at(src, src.text.length()),
+	)
+
+
+pure func first_function_body(program: ParsedProgram) -> Option[ParsedExpr]:
+	match program.decls.get(0):
+		Some(FunctionParsedDecl(function_decl)):
+			function_decl.body
+		_:
+			None
+
+
+pure func function_name_at(program: ParsedProgram, index: Int) -> String:
+	match program.decls.get(index):
+		Some(FunctionParsedDecl(function_decl)):
+			function_decl.name.text
+		_:
+			""
+
+
+pure func function_body_at(program: ParsedProgram, index: Int) -> Option[ParsedExpr]:
+	match program.decls.get(index):
+		Some(FunctionParsedDecl(function_decl)):
+			function_decl.body
+		_:
+			None
+
+
+pure func function_body_item_at(
+	program: ParsedProgram,
+	function_index: Int,
+	item_index: Int,
+) -> Option[ParsedExpr]:
+	match function_body_at(program, function_index):
+		Some(ParsedBlockExpr(items, _)):
+			items.get(item_index)
+		_:
+			None
+
+
+pure func call_callee_name(expr: ParsedExpr) -> String:
+	match expr:
+		ParsedCallExpr(ParsedNameExpr(name), _, _):
+			name.text
+		_:
+			""
+
+
+pure func raw_literal_at(parts: List[StringInterpolationRawPart], index: Int) -> String:
+	match parts.get(index):
+		Some(InterpolationLiteralText(value)):
+			value
+		_:
+			""
+
+
+pure func raw_expr_at(parts: List[StringInterpolationRawPart], index: Int) -> String:
+	match parts.get(index):
+		Some(InterpolationExprText(value)):
+			value
+		_:
+			""
+
+
+pure func interpolation_literal_at(
+	parts: List[ParsedStringInterpolationPart],
+	index: Int,
+) -> String:
+	match parts.get(index):
+		Some(ParsedInterpolationLiteral(value)):
+			value
+		_:
+			""
+
+
+pure func interpolation_expr_name_at(
+	parts: List[ParsedStringInterpolationPart],
+	index: Int,
+) -> String:
+	match parts.get(index):
+		Some(ParsedInterpolationExpr(ParsedNameExpr(name))):
+			name.text
+		_:
+			""
+
+
+func test_split_interpolated_string_splits_literal_and_expr() -> Bool:
+	src: CompilerSourceFile = source("demo")
+
+	match split_interpolated_string(full_span(src), "Hello {name}!"):
+		Ok(parts):
+			(
+				parts.length() == 3
+				and raw_literal_at(parts, 0) == "Hello "
+				and raw_expr_at(parts, 1) == "name"
+				and raw_literal_at(parts, 2) == "!"
+			)
+		Err(_):
+			False
+
+
+func test_split_interpolated_string_unescapes_literal_braces() -> Bool:
+	src: CompilerSourceFile = source("demo")
+
+	match split_interpolated_string(full_span(src), "Hello \\{name\\} {value}"):
+		Ok(parts):
+			(
+				parts.length() == 2
+				and raw_literal_at(parts, 0) == "Hello {name} "
+				and raw_expr_at(parts, 1) == "value"
+			)
+		Err(_):
+			False
+
+
+func test_split_interpolated_string_reports_unclosed_expr() -> Bool:
+	src: CompilerSourceFile = source("demo")
+
+	match split_interpolated_string(full_span(src), "Hello {name"):
+		Ok(_):
+			False
+		Err(diagnostic):
+			(
+				compiler_parse_diagnostic_is_error(diagnostic)
+				and diagnostic.message.contains("Unclosed")
+			)
+
+
+func test_finalize_interpolation_program_rewrites_raw_string() -> Bool:
+	program_source: String = "func message(name: String): \"Hello " + "$" + "{name}!\""
+	program: ParsedProgram = finalize_interpolation_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match first_function_body(program):
+		Some(ParsedStringInterpolationPartsExpr(parts, is_multiline, _)):
+			(
+				not is_multiline
+				and parts.length() == 3
+				and interpolation_literal_at(parts, 0) == "Hello "
+				and interpolation_expr_name_at(parts, 1) == "name"
+				and interpolation_literal_at(parts, 2) == "!"
+				and program.diagnostics.length() == 0
+			)
+		_:
+			False
+
+
+func test_finalize_interpolation_program_preserves_duplicate_hole_order() -> Bool:
+	program_source: String = "func message(name: String): \"" + "$" + "{name}" + "$" + "{name}\""
+	program: ParsedProgram = finalize_interpolation_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match first_function_body(program):
+		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
+			(
+				parts.length() == 2
+				and interpolation_expr_name_at(parts, 0) == "name"
+				and interpolation_expr_name_at(parts, 1) == "name"
+				and program.diagnostics.length() == 0
+			)
+		_:
+			False
+
+
+func test_finalize_nested_functions_program_hoists_simple_nested_function() -> Bool:
+	program_source: String = "func outer(x: Int) -> Int:\n\tfunc inner(y: Int) -> Int:\n\t\ty + 1\n\tinner(x)"
+	program: ParsedProgram = finalize_nested_functions_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	first_body_ok: Bool = match function_body_item_at(program, 1, 0):
+		Some(ParsedVoidExpr(_)):
+			True
+		_:
+			False
+
+	call_ok: Bool = match function_body_item_at(program, 1, 1):
+		Some(expr):
+			call_callee_name(expr) == "__nested_outer_inner_0"
+		_:
+			False
+
+	(
+		program.diagnostics.length() == 0
+		and program.decls.length() == 2
+		and function_name_at(program, 0) == "__nested_outer_inner_0"
+		and function_name_at(program, 1) == "outer"
+		and first_body_ok
+		and call_ok
+	)
+
+
+func test_finalize_nested_functions_program_hoists_nested_inside_nested() -> Bool:
+	program_source: String = "func outer() -> Int:\n\tfunc middle() -> Int:\n\t\tfunc inner() -> Int:\n\t\t\t1\n\t\tinner()\n\tmiddle()"
+	program: ParsedProgram = finalize_nested_functions_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	middle_calls_inner: Bool = match function_body_item_at(program, 1, 1):
+		Some(expr):
+			call_callee_name(expr) == "__nested___nested_outer_middle_0_inner_1"
+		_:
+			False
+
+	outer_calls_middle: Bool = match function_body_item_at(program, 2, 1):
+		Some(expr):
+			call_callee_name(expr) == "__nested_outer_middle_0"
+		_:
+			False
+
+	(
+		program.diagnostics.length() == 0
+		and program.decls.length() == 3
+		and function_name_at(program, 0) == "__nested___nested_outer_middle_0_inner_1"
+		and function_name_at(program, 1) == "__nested_outer_middle_0"
+		and function_name_at(program, 2) == "outer"
+		and middle_calls_inner
+		and outer_calls_middle
+	)
+
+
+func test_finalize_nested_functions_program_reports_parent_capture() -> Bool:
+	program_source: String = "func outer() -> String:\n\tgreeting: String = \"hello\"\n\tfunc shout() -> String:\n\t\tgreeting + \"!\"\n\tshout()"
+	program: ParsedProgram = finalize_nested_functions_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match program.diagnostics.get(0):
+		Some(diagnostic):
+			(
+				compiler_parse_diagnostic_is_error(diagnostic)
+				and diagnostic.message.contains(
+					"Nested function 'shout' cannot capture parent-scope identifier 'greeting'",
+				)
+			)
+		None:
+			False
+
+
+func test_finalize_typecheck_source_program_composes_interpolation_and_hoist() -> Bool:
+	program_source: String = "func outer(name: String) -> String:\n\tfunc message(value: String) -> String:\n\t\t\"Hello " + "$" + "{value}!\"\n\tmessage(name)"
+	program: ParsedProgram = finalize_typecheck_source_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	helper_body_ok: Bool = match function_body_item_at(program, 0, 0):
+		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
+			parts.length() == 3
+		_:
+			False
+
+	outer_call_ok: Bool = match function_body_item_at(program, 1, 1):
+		Some(expr):
+			call_callee_name(expr) == "__nested_outer_message_0"
+		_:
+			False
+
+	(
+		program.diagnostics.length() == 0
+		and function_name_at(program, 0) == "__nested_outer_message_0"
+		and function_name_at(program, 1) == "outer"
+		and helper_body_ok
+		and outer_call_ok
+	)
+
+
+func test_finalize_typecheck_source_program_rewrites_one_index_subscript_read() -> Bool:
+	program_source: String = "func first(values: Int[#3]) -> Int:\n\tvalues[0]"
+	program: ParsedProgram = finalize_typecheck_source_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match function_body_item_at(program, 0, 0):
+		Some(expr):
+			call_callee_name(expr) == "checked_get"
+		_:
+			False
+
+
+func test_finalize_typecheck_source_program_rewrites_range_subscript_read() -> Bool:
+	program_source: String = "func part(values: Int[#4]) -> Int[#2]:\n\tvalues[1..3]"
+	program: ParsedProgram = finalize_typecheck_source_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match function_body_item_at(program, 0, 0):
+		Some(expr):
+			call_callee_name(expr) == "checked_slice"
+		_:
+			False
+
+
+func test_finalize_typecheck_source_program_rewrites_matrix_subscript_read() -> Bool:
+	program_source: String = "func cell(values: Int[#2, #2]) -> Int:\n\tvalues[0, 1]"
+	program: ParsedProgram = finalize_typecheck_source_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match function_body_item_at(program, 0, 0):
+		Some(expr):
+			call_callee_name(expr) == "matrix_checked_get"
+		_:
+			False
+
+
+func test_finalize_typecheck_source_program_keeps_subscript_assignment() -> Bool:
+	program_source: String = "func write(values: Int[#3]):\n\tvalues[0] = 1"
+	program: ParsedProgram = finalize_typecheck_source_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match function_body_item_at(program, 0, 0):
+		Some(ParsedSubscriptAssignExpr(_, indices, _, _)):
+			indices.length() == 1
+		Some(ParsedSubscriptExpr(_, _, _)):
+			False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler source AST finalization",
+	tests = [
+		(
+			"split interpolated string splits literal and expr",
+			test_split_interpolated_string_splits_literal_and_expr,
+		),
+		(
+			"split interpolated string unescapes literal braces",
+			test_split_interpolated_string_unescapes_literal_braces,
+		),
+		(
+			"split interpolated string reports unclosed expr",
+			test_split_interpolated_string_reports_unclosed_expr,
+		),
+		(
+			"finalize interpolation program rewrites raw string",
+			test_finalize_interpolation_program_rewrites_raw_string,
+		),
+		(
+			"finalize interpolation program preserves duplicate hole order",
+			test_finalize_interpolation_program_preserves_duplicate_hole_order,
+		),
+		(
+			"finalize nested functions program hoists simple nested function",
+			test_finalize_nested_functions_program_hoists_simple_nested_function,
+		),
+		(
+			"finalize nested functions program hoists nested inside nested",
+			test_finalize_nested_functions_program_hoists_nested_inside_nested,
+		),
+		(
+			"finalize nested functions program reports parent capture",
+			test_finalize_nested_functions_program_reports_parent_capture,
+		),
+		(
+			"finalize typecheck source program composes interpolation and hoist",
+			test_finalize_typecheck_source_program_composes_interpolation_and_hoist,
+		),
+		(
+			"finalize typecheck source program rewrites one-index subscript read",
+			test_finalize_typecheck_source_program_rewrites_one_index_subscript_read,
+		),
+		(
+			"finalize typecheck source program rewrites range subscript read",
+			test_finalize_typecheck_source_program_rewrites_range_subscript_read,
+		),
+		(
+			"finalize typecheck source program rewrites matrix subscript read",
+			test_finalize_typecheck_source_program_rewrites_matrix_subscript_read,
+		),
+		(
+			"finalize typecheck source program keeps subscript assignment",
+			test_finalize_typecheck_source_program_keeps_subscript_assignment,
+		),
+	]
+}
