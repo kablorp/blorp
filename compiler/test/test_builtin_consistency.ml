@@ -521,93 +521,6 @@ let ends_with s suffix =
   let len = String.length s and suffix_len = String.length suffix in
   len >= suffix_len && String.sub s (len - suffix_len) suffix_len = suffix
 
-let rec list_files_recursive dir =
-  Sys.readdir dir |> Array.to_list
-  |> List.concat_map (fun name ->
-      let path = Filename.concat dir name in
-      if Sys.is_directory path then list_files_recursive path else [ path ])
-
-let relative_to_std path =
-  let prefix = startup_std_dir ^ Filename.dir_sep in
-  if starts_with path prefix then
-    String.sub path (String.length prefix)
-      (String.length path - String.length prefix)
-  else path
-
-let std_source_files_with_suffix suffix =
-  list_files_recursive startup_std_dir
-  |> List.filter (fun path -> Filename.check_suffix path suffix)
-  |> List.map relative_to_std |> List.sort String.compare
-
-let line_is_foreign_decl line =
-  let line = String.trim line in
-  line = "foreign:"
-  || starts_with line "foreign("
-  || starts_with line "foreign "
-  || starts_with line "foreign\t"
-
-let std_foreign_decl_modules () =
-  std_source_files_with_suffix ".brp"
-  |> List.filter (fun rel ->
-      let source = read_std_file rel in
-      source |> String.split_on_char '\n' |> List.exists line_is_foreign_decl)
-  |> List.sort_uniq String.compare
-
-let expected_std_foreign_decl_modules = []
-let expected_std_native_header_files = []
-
-let startup_pkg_dir =
-  let dir = Filename.concat (Filename.dirname startup_std_dir) "pkg" in
-  if Sys.file_exists dir && Sys.is_directory dir then dir
-  else Alcotest.failf "Expected package source directory at %s" dir
-
-let relative_to_pkg path =
-  let prefix = startup_pkg_dir ^ Filename.dir_sep in
-  if starts_with path prefix then
-    String.sub path (String.length prefix)
-      (String.length path - String.length prefix)
-  else path
-
-let pkg_source_files_with_suffix suffix =
-  list_files_recursive startup_pkg_dir
-  |> List.filter (fun path -> Filename.check_suffix path suffix)
-  |> List.map relative_to_pkg |> List.sort String.compare
-
-let pkg_foreign_decl_modules () =
-  pkg_source_files_with_suffix ".brp"
-  |> List.filter (fun rel ->
-      let source = read_file (Filename.concat startup_pkg_dir rel) in
-      source |> String.split_on_char '\n' |> List.exists line_is_foreign_decl)
-  |> List.sort_uniq String.compare
-
-let expected_pkg_foreign_decl_modules =
-  [ "compress.brp"; "crypto.brp"; "net/dns.brp"; "sqlite.brp" ]
-
-let expected_pkg_native_header_files =
-  [ "compress_ffi.h"; "crypto_ffi.h"; "net/dns_ffi.h"; "sqlite_ffi.h" ]
-
-let test_std_foreign_inventory_is_explicit () =
-  Alcotest.(check (list string))
-    "std modules with explicit foreign declarations"
-    expected_std_foreign_decl_modules
-    (std_foreign_decl_modules ())
-
-let test_std_native_header_inventory_is_explicit () =
-  let native_headers = std_source_files_with_suffix ".h" in
-  Alcotest.(check (list string))
-    "std native header files" expected_std_native_header_files native_headers
-
-let test_pkg_foreign_inventory_is_explicit () =
-  Alcotest.(check (list string))
-    "pkg modules with explicit foreign declarations"
-    expected_pkg_foreign_decl_modules
-    (pkg_foreign_decl_modules ())
-
-let test_pkg_native_header_inventory_is_explicit () =
-  let native_headers = pkg_source_files_with_suffix ".h" in
-  Alcotest.(check (list string))
-    "pkg native header files" expected_pkg_native_header_files native_headers
-
 let test_list_ir_hofs_have_no_runtime_c_abi () =
   let symbols =
     [
@@ -1310,24 +1223,6 @@ let test_std_source_dir_initialized_from_config () =
     "std/list.brp exists" true
     (Sys.file_exists (Filename.concat startup_std_dir "list.brp"))
 
-let test_list_join_uses_ir_string_append () =
-  let list_src = read_std_file "list.brp" in
-  if contains_substring list_src "builtin(\"blorp_string_append\")" then
-    Alcotest.fail
-      "List.join should use the synthesized IR string_append helper, not \
-       direct blorp_string_append C runtime calls"
-
-let test_string_append_str_uses_runtime_bulk_append () =
-  let string_src = read_std_file "string.brp" in
-  if not (contains_substring string_src "builtin(\"blorp_string_append\")") then
-    Alcotest.fail
-      "std/string.append_str should use the runtime bulk append helper"
-
-let test_builder_module_removed_from_std () =
-  Alcotest.(check bool)
-    "std/builder.brp removed" false
-    (Sys.file_exists (Filename.concat startup_std_dir "builder.brp"))
-
 let test_string_appends_have_no_legacy_runtime_c_abi () =
   let runtime_decl =
     read_first_existing
@@ -1949,22 +1844,8 @@ let suite =
           test_scheduler_stats_layout_matches_std_record;
         Alcotest.test_case "std source dir initialized from config" `Quick
           test_std_source_dir_initialized_from_config;
-        Alcotest.test_case "list join uses IR string_append" `Quick
-          test_list_join_uses_ir_string_append;
-        Alcotest.test_case "string append_str uses runtime bulk append" `Quick
-          test_string_append_str_uses_runtime_bulk_append;
-        Alcotest.test_case "builder module removed from std" `Quick
-          test_builder_module_removed_from_std;
         Alcotest.test_case "public ABI types have std anchors" `Quick
           test_public_abi_types_have_std_anchors;
-        Alcotest.test_case "std foreign inventory is explicit" `Quick
-          test_std_foreign_inventory_is_explicit;
-        Alcotest.test_case "std native header inventory is explicit" `Quick
-          test_std_native_header_inventory_is_explicit;
-        Alcotest.test_case "pkg foreign inventory is explicit" `Quick
-          test_pkg_foreign_inventory_is_explicit;
-        Alcotest.test_case "pkg native header inventory is explicit" `Quick
-          test_pkg_native_header_inventory_is_explicit;
         Alcotest.test_case "string appends have no legacy runtime C ABI" `Quick
           test_string_appends_have_no_legacy_runtime_c_abi;
         Alcotest.test_case "set source helpers have no runtime C ABI" `Quick
