@@ -896,7 +896,7 @@ Tests:
 - `compiler/blorp/tests/test_compiler_typecheck_types.brp`
 - `compiler/blorp/tests/test_compiler_typecheck_decl.brp`
 - `compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp`
-- `compiler/blorp/tests/test_zz_compiler_typecheck_resource_decl.brp`
+- `compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp`
 - `compiler/blorp/tests/test_compiler_imports.brp`
 
 Deletion point:
