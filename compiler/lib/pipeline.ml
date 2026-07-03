@@ -288,21 +288,6 @@ let ensure_modules_typed ?(debug = false) ?(allow_debug_only_calls = false) () =
   loop ();
   List.rev !module_errors
 
-(** Collect record/union/type-alias names declared by a module. The
-    cross-module coherence pass works from source declarations, so it must
-    apply the same module-local type identity rewrite that import lookup uses
-    for public signatures. *)
-let module_local_type_names_from_decls (decls : Ast.program) : string list =
-  let rec collect acc decl =
-    match decl.decl_desc with
-    | DPrivate inner -> collect acc inner
-    | DRecord r -> r.record_name :: acc
-    | DType t -> t.type_name :: acc
-    | DTypeAlias a -> a.alias_name :: acc
-    | _ -> acc
-  in
-  List.fold_left collect [] decls |> List.sort_uniq String.compare
-
 (* Two source-level impls from different modules overlap iff they'd emit
    the same C symbol. [Typecheck.try_add_source_impl] catches overlaps
    within a single compilation unit, but each [check_modules] iteration
@@ -393,7 +378,9 @@ let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
              intentionally skipped: they're module-local and never collide
              across modules at link time because the C symbols aren't
              exported. *)
-            let local_type_names = module_local_type_names_from_decls m.decls in
+            let local_type_names =
+              Module_type_identity.local_type_names_from_decls m.decls
+            in
             List.iter
               (fun d ->
                 match collect_impl m local_type_names d with

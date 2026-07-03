@@ -631,22 +631,133 @@ Direct OCaml slices to mirror:
 - purity, tailrec, unused-import, and typed-AST validation helpers
 - module graph resolution that is pure over already-loaded source data
 
-Implementation:
+OCaml structure read-through, checked on 2026-07-03:
+
+- `compiler/lib/types.ml` is the semantic type utility hub over
+  `Ast.type_expr`. It owns type pretty-printing, structural equality, named
+  type identity normalization, type parameter syntax predicates, substitution,
+  HM-style `TyMeta` creation/binding/zonking through `Session.t`, compatibility
+  and bidirectional unification, array/dimension validation, primitive type
+  constants, module-owned type-name qualification, and the nested `Types.Dim`
+  facade.
+- `compiler/lib/dim_solver.ml` is a small pure polynomial solver for dimension
+  equalities. It canonicalizes `TyConstInt`, `TyVar`, `TyMeta`, and `TyDimOp`
+  expressions, then reports `Solved`, `BindMeta`, `BindVar`, `Contradiction`,
+  or `Stuck`.
+- `compiler/lib/type_resolution.ml` is a narrow facade for source annotation
+  resolution. It applies module-alias qualification, nominal dimension
+  disambiguation, and alias policy through named use cases such as
+  `function_parameter_annotation`, `record_field_type`, and
+  `type_alias_target`.
+- `compiler/lib/type_widening.ml` is a pure value-slot policy module. It
+  preserves the distinction between semantic type and runtime value type for
+  singleton integers, dimension operands, mutable bindings, function arguments,
+  collection elements, bitwise operands, and method receivers.
+- `compiler/lib/refinement.ml` plus `Type_proof_metadata` owns proof
+  construction for bounded subscript/range facts. The inference code consumes
+  these proofs; callers should not fabricate record-shaped proofs directly.
+- `compiler/lib/env_types.ml` breaks a cycle between `Session` and `Env` by
+  holding `def_id`, purity/origin enums, resource argument policy, loop-producer
+  identity, bound type parameters, overload entries, and impl instances.
+- `compiler/lib/env.ml` is both a lexical environment and a session-connected
+  registry. Lexical scopes, `type_index`, variables, functions, constructors,
+  records, aliases, type params, trait functions, and traits are value data on
+  `Env.env`. Impl and UFCS method indexes alias `Session.current ()`, while
+  overloads are intentionally per-env/import-scope. A Blorp port should make
+  this sharing explicit in a compiler context value instead of recreating the
+  ambient-session coupling.
+- `compiler/lib/env_builtins.ml`, `builtin_metadata.ml`, and
+  `generic_params.ml` populate the built-in type/function/trait surface. They
+  are not just std docs: typecheck depends on these registrations for purity,
+  special inference, resource policies, trait bounds, loop producers, and UFCS.
+- `compiler/lib/language_surface.ml` is already a bridge facade over
+  `compiler/blorp/language_surface_manifest.brp`. It currently serves OCaml LSP
+  and prelude import helpers. It should disappear once the corresponding
+  typecheck/tooling consumers read the Blorp data directly or from generated
+  static data.
+- `compiler/lib/typed_ast.ml` is the post-inference boundary wrapper. It
+  validates that every consumed expression has finalized type info, no
+  inference metas, source/semantic/value type slots, widening metadata, proofs,
+  and resolved-call metadata. Core lowering and CTFE already prefer
+  `Typed_ast.program` over raw `Ast.program`.
+- `compiler/lib/call_resolution.ml` and `purity_analysis.ml` are smaller
+  helper islands extracted from `infer.ml` / `typecheck.ml`. They are good
+  early ports after `Env` exists because they mostly compute metadata from
+  typed callee shapes and environment facts.
+- `compiler/lib/typecheck.ml` has no `.mli`; it is currently the broad boundary
+  module. Its major phases are: `check_state`; type/resource annotation
+  canonicalization; import and alias registration; declaration registration for
+  types, records, aliases, functions, traits, and impls; orphan/coherence and
+  UFCS registration; `first_pass`; pattern exhaustiveness; function-scope setup
+  and body checking; purity/tailrec/match/debug/resource/startup validation;
+  global var checking; `second_pass`; prelude insertion; typed-AST conversion;
+  private type leakage checks; and module-typecheck entry points.
+- `compiler/lib/infer.ml` is the largest remaining frontend module. Important
+  internal islands include: inference context and expected-context handling;
+  type-shape memoization for resource/source/stream checks; refinement proof
+  propagation; undefined identifier diagnostics; binding/free-variable helpers;
+  module function/var/impl-method resolution; record field resolution; primitive
+  and builtin call inference; resolved-call metadata; opaque conversions;
+  subscript assignment handling; collection/tensor constructors; branch
+  narrowing; block/statement inference; match/case/pattern binding; lambdas;
+  and final `zonk_expr`.
+- `compiler/lib/pipeline.ml` still orchestrates module loading, imported module
+  typechecking, cross-module coherence, main typechecking, unused-import
+  checks, and handoff to Core. Some of that remains impure or session-oriented;
+  do not fold it into the first Blorp type utility slice.
+
+Implementation sequence:
 
 - Split impure file discovery/loading from pure module resolution.
-- Port type environments as explicit values.
+- Port type environments as explicit values, including the current
+  session-backed impl/UFCS indexes as named context fields rather than hidden
+  ambient state.
 - Port diagnostics with structured code, message, notes, and help.
 - Eliminate the runtime `language_surface.ml` bridge call by either making the
   data internal to the Blorp typechecker or generating static OCaml data until
   this checkpoint lands.
 - Keep source-language facts in typed metadata where downstream stages depend on
   them.
+- Start with the pure substrate: semantic type model, type pretty-printing,
+  equality, substitution, metas/zonking API shape, dimension solver,
+  `Type_widening`, `Type_resolution`, and `Refinement`.
+- Then port environment data: `Env_types`, lexical scopes, type index, trait
+  definitions, impl instances, overload entries, UFCS method lookup, and
+  built-in registrations.
+- Then port declaration indexing/first pass over a `frontend_module_graph`:
+  module aliases/imports, type/record/alias registration, function signatures,
+  trait definitions, impl headers, module export facts, and prelude imports.
+- Only after the environment and first pass exist in Blorp, port expression
+  inference in small groups: literals/names, calls/overloads, records/unions,
+  blocks/control flow, pattern matching, lambdas, generics/traits, resources,
+  concurrency, globals/startup, and final `Typed_ast` construction.
+- Keep one handoff while OCaml middle remains: Blorp emits a typed-program
+  artifact that OCaml validates and lowers. Do not add parallel handoffs for
+  individual inference subfeatures.
 
 Deletion:
 
 - Delete OCaml inference/typecheck/type utility modules after `check` and
   compile use the Blorp typed-program output.
 - Delete early table/diagnostic bridge exceptions subsumed by typecheck.
+- Cleanup already applied from the 2026-07-03 read-through:
+  - `module_local_type_names_from_decls` was centralized as
+    `Module_type_identity.local_type_names_from_decls` and removed from
+    `typecheck.ml`, `infer.ml`, and `pipeline.ml`.
+  - The legacy `Types.validate_tensor_dims` alias was removed; remaining
+    callers use `Types.validate_array_dims` directly.
+- Remaining cleanup candidates found during the 2026-07-03 read-through:
+  - `Types.normalize_type_name` still maps legacy `Vector`/`Matrix` names to
+    `Tensor` and is tested directly. Keep it until old nominal vector/matrix
+    internal paths are either proven gone or represented explicitly in the type
+    model; then delete the compatibility normalizer and its test.
+  - `BLORP_FRONTEND_PARSER=ocaml` is retained only for pinned external
+    bootstrap binaries that still read the retired selector. It is not a
+    production source-parser selector anymore. Delete the env knob, docs, and
+    bridge-env tests once the pinned bootstrap no longer needs it.
+  - `language_surface.ml` is a transitional OCaml facade over Blorp-owned data.
+    Delete it when typecheck/LSP/tooling no longer need an OCaml bridge call for
+    source-language tables.
 
 Validation:
 

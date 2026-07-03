@@ -80,10 +80,6 @@ val validate_array_dims :
 (** Validate array dimension arguments. Returns None if valid,
     Some error_message if any dimension arg is not a valid dimension type. *)
 
-val validate_tensor_dims :
-  ?sess:Session.t -> string list -> type_expr -> string option
-(** Legacy alias retained while downstream passes are ported. *)
-
 val collect_type_vars : type_expr -> string list
 (** Collect free type variable names from a type expression *)
 

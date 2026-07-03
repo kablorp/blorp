@@ -51,7 +51,7 @@ Current active functions:
   - `parsed_program_to_json`
   - `parsed_expr_to_json`
 
-The graph is decoded by OCaml and then finalized:
+The graph is decoded by OCaml and then consumed by the OCaml middle:
 
 - `compiler/lib/compiler_blorp_bridge.ml`
   - `parse_source_request_json`
@@ -67,50 +67,30 @@ The graph is decoded by OCaml and then finalized:
   - `module_origin_of_cli_frontend_module_origin`
 - `compiler/lib/modules.ml`
   - `parse_source_with_blorp_bridge`
-  - `finalize_blorp_parsed_source_for_bridge`
-  - `finalize_blorp_parsed_source`
-  - `parse_interpolated_exprs_with_blorp_bridge`
-  - `finalize_parsed_program`
-- `compiler/lib/interp_parser.ml`
-  - `split_interpolated_string`
-  - `requests_for_raw_string`
-  - `collect_program_requests`
-  - `transform_program_with_expr_batch_parser`
-  - `transform_program_with_expr_parser`
-- `compiler/lib/nested_hoist.ml`
-  - `mangle`
-  - `rewrite_ident`
-  - `free_idents_of`
-  - `find_capture`
-  - `capture_error`
-  - `hoist_body`
-  - `hoist_func`
-  - `hoist_impl_method`
-  - `hoist_program`
-- `compiler/lib/subscript_desugar.ml`
-  - `mk_call`
-  - `nd_get_name`
-  - `rewrite_node`
-  - `transform_expr`
-  - `transform_decl`
-  - `transform_program`
+  - `parse_typecheck_source`
+  - module parse-cache preload and validation helpers
 - `compiler/lib/typecheck.ml`
   - `typecheck_with_state_and_source`
   - `typecheck_module_with_state_and_source`
 
-The parser-adjacent OCaml semantics targeted by this roadmap were:
+The parser-adjacent OCaml semantics targeted by this roadmap have moved:
 
-- String interpolation raw text is split in OCaml, then each hole is reparsed by
-  calling the Blorp parser bridge again.
-- Nested function declarations are hoisted in OCaml before inference.
-- Subscript reads were syntactically rewritten in OCaml at the typecheck entry.
-  Slice 3 moved that rewrite into the Blorp typecheck-source finalizer and
-  deleted the unused OCaml transform. Subscript assignment remains in inference
-  because it needs type and mutability context.
+- String interpolation raw text is now split in Blorp, and interpolation holes
+  are parsed during the Blorp `typecheck_source` finalization phase.
+- Nested function declarations are now hoisted in Blorp before the OCaml
+  typechecker consumes the source AST.
+- Subscript reads are now rewritten by the Blorp typecheck-source finalizer.
+  Subscript assignment remains in inference because it needs type and
+  mutability context.
+
+Current remaining OCaml ownership starts after this source-AST boundary:
+module validation, type environment construction, inference/typechecking,
+typed-AST validation, and Core lowering still consume OCaml `Ast.program` /
+`Typed_ast.program` values.
 
 ## Completion Criteria
 
-This chunk is complete when:
+This chunk is complete:
 
 - `frontend_module_graph` sources for `check`, `compile`, and `run` carry an
   explicitly typecheck-ready source AST.
@@ -119,12 +99,13 @@ This chunk is complete when:
 - OCaml no longer owns interpolation splitting/hole reparsing, nested function
   hoisting, or subscript-read desugaring for production compile/check/run.
 - `compiler/lib/interp_parser.ml`, `compiler/lib/interp_parser.mli`,
-  `compiler/lib/nested_hoist.ml`, and `compiler/lib/subscript_desugar.ml` are
-  deleted or reduced to no-production-use stubs with a dated deletion reason.
-- `Modules.finalize_blorp_parsed_source_for_bridge` is reduced to strict
-  decode/diagnostic plumbing, or is deleted if the call site no longer needs it.
-- No new bridge action is introduced. Extend the existing `parse_source` and
-  `parse_sources` payloads with an explicit AST phase if needed.
+  `compiler/lib/nested_hoist.ml`, and `compiler/lib/subscript_desugar.ml` have
+  been deleted.
+- The old `Modules.finalize_blorp_parsed_source*` helpers are gone; remaining
+  module parse entry points request either raw parse or `typecheck_source`
+  explicitly.
+- No new bridge action was introduced. The existing `parse_source` and
+  `parse_sources` payloads carry the explicit AST phase.
 
 ## Non-Goals
 
