@@ -177,8 +177,8 @@ Status: closed for normal source commands. The OCaml shell validates and
 executes a decoded `frontend_module_graph` for `check`, `compile`, and `run`;
 it no longer rediscovers roots, rereads sources, reparses roots, or rebuilds
 source-package context for those commands. The legacy `frontend_options`
-artifact may still be decoded as protocol compatibility, but the shell rejects
-it for normal source execution.
+artifact is rejected as an unsupported legacy artifact rather than decoded for
+source execution.
 
 OCaml references:
 
@@ -232,9 +232,8 @@ Implementation steps:
 - Make `run_check_from_frontier_options`, `run_compile_from_frontier_options`,
   and `run_file_from_frontier_options` call the parsed/graph pipeline entry
   points only.
-- Do not reintroduce `frontend_options` execution for source commands. If the
-  bridge decoder must accept that artifact for pinned bootstrap compatibility,
-  reject it at the OCaml shell boundary.
+- Do not reintroduce `frontend_options` execution for source commands. Treat it
+  as an unsupported legacy artifact at the bridge decoder boundary.
 
 Edge cases:
 
@@ -910,6 +909,35 @@ Deletion point:
 Goal: port expression inference, function/global body checking, purity,
 tailrec, resources, concurrency, and final typed AST construction.
 
+Status: in progress with the expression-inference substrate in place.
+`compiler/blorp/compiler_infer.brp` now covers literals, identifiers, local
+`var` declarations, block scoping, expected value slots, value ascription flow,
+primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
+record literals, record/tuple field access, ranges, `if`, `while`, simple
+`for`, and `break`/`continue` loop-context checks. The current slices preserve
+typed-expression metadata for source type, semantic type, value type, widening
+decision, refinement proofs, and resolved-call placeholder data, and they
+include explicit copy boundaries for type and infer-context values to avoid
+generated ARC aliasing. Direct calls currently cover function-typed callees,
+exact arity, expected argument slots, value-type argument checking, and
+resolved callable metadata for named functions; overloads, UFCS,
+module-qualified calls, generic substitution, and trait-bound enforcement remain
+future call slices. Collection literals currently support expected-type empty
+lists/dicts, non-empty inference, collection-element widening for singleton
+integer literals, and explicit heterogeneous diagnostics. Record literals
+support expected-record checking, unique field-set inference, field-wise
+expected typing/widening, missing/unknown-field diagnostics, and ambiguous
+field-set diagnostics. Branch/control-flow coverage currently handles common
+const-int branch result typing, non-`Bool` conditions, value-producing `if`
+without `else`, simple loop-only `break`/`continue` validation, and simple
+name-bound `for` loops over `Range`, `List`, `Vector`, `Set`, `String`, and
+array/tensor-shaped values. The remaining checkpoint-6 slices still need to
+port generic calls, overloads, UFCS, module-qualified calls, record updates,
+structs/unions/enums/aliases/opaque conversions, sets/strings/tensors beyond
+loop element typing, tuple `for` binders, match inference, pattern binding,
+exhaustiveness, resources, concurrency, function/global body checking, purity,
+tailrec, and final zonking.
+
 OCaml references:
 
 - `compiler/lib/infer.ml`
@@ -989,7 +1017,7 @@ OCaml references:
 
 Blorp references:
 
-- future `compiler_infer.brp`
+- `compiler/blorp/compiler_infer.brp`
 - future `compiler_infer_call.brp`
 - future `compiler_infer_resource.brp`
 - future `compiler_infer_concurrency.brp`
@@ -1060,6 +1088,7 @@ Tests:
 - `tests/test_blorp/concurrency`
 - `tests/test_blorp/sys`
 - New Blorp unit tests for each inference slice.
+- `compiler/blorp/tests/test_compiler_infer.brp`
 
 Deletion point:
 

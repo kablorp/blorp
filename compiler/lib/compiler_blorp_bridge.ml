@@ -215,12 +215,6 @@ type cli_frontend_module_graph = {
   cli_frontend_graph_diagnostics : string list;
 }
 
-type cli_frontend_options_plan = {
-  cli_frontend_options_command : cli_frontend_command;
-  cli_frontend_options_args : string list;
-  cli_frontend_options : cli_frontend_options;
-}
-
 type cli_run_handled_result = {
   cli_run_status : int;
   cli_run_stdout : string;
@@ -230,7 +224,6 @@ type cli_run_handled_result = {
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunFrontendModuleGraph of cli_frontend_module_graph
-  | CliRunFrontendOptions of cli_frontend_options_plan
   | CliRunTestOptions of cli_test_options
   | CliRunPurifyOptions of cli_purify_options
   | CliRunReplOptions of cli_repl_options
@@ -1477,27 +1470,6 @@ let cli_frontend_module_graph_response_field artifact =
          cli_frontend_graph_diagnostics;
        })
 
-let cli_frontend_options_response_field artifact =
-  let* command_text = string_response_field "command" artifact in
-  let* cli_frontend_options_command =
-    cli_frontend_command_of_string command_text
-  in
-  let* cli_frontend_options_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "frontend_options" command_text
-      cli_frontend_options_args
-  in
-  let* options = json_response_field "options" artifact in
-  let* cli_frontend_options =
-    decode_cli_frontend_options cli_frontend_options_command options
-  in
-  Ok
-    {
-      cli_frontend_options_command;
-      cli_frontend_options_args;
-      cli_frontend_options;
-    }
-
 let cli_run_handled_response_field artifact =
   let* cli_run_status = int_response_field "status" artifact in
   let* cli_run_stdout = string_response_field "stdout" artifact in
@@ -1617,9 +1589,6 @@ let cli_run_response_field response =
   match kind with
   | "handled" -> cli_run_handled_response_field artifact
   | "frontend_module_graph" -> cli_frontend_module_graph_response_field artifact
-  | "frontend_options" ->
-      let* options = cli_frontend_options_response_field artifact in
-      Ok (CliRunFrontendOptions options)
   | "delegate" -> cli_run_delegate_response_field artifact
   | "test" -> cli_run_test_response_field artifact
   | "purify" -> cli_run_purify_response_field artifact

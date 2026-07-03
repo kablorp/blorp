@@ -1012,7 +1012,7 @@ let test_cli_run_response_rejects_legacy_parsed_source_artifact () =
   |> expect_invalid_response_contains
        "unsupported CLI run artifact kind `parsed_source_batch`"
 
-let test_cli_run_response_decodes_frontend_options () =
+let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
   let response =
     bridge_success_json
       (Lsp_json.Object
@@ -1024,24 +1024,9 @@ let test_cli_run_response_decodes_frontend_options () =
            ("options", check_options_json [ "a.brp"; "b.brp" ]);
          ])
   in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunFrontendOptions
-        {
-          cli_frontend_options_command = Blorp.Compiler_blorp_bridge.CliFrontendCheck;
-          cli_frontend_options_args =
-            [ "check"; "--no-format"; "a.brp"; "b.brp" ];
-          cli_frontend_options =
-            Blorp.Compiler_blorp_bridge.CliFrontendCheckOptions
-              {
-                cli_check_no_format = true;
-                cli_check_paths = [ "a.brp"; "b.brp" ];
-                _;
-              };
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI frontend options"
-  | Error (_, message) -> Alcotest.fail message
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains
+       "unsupported CLI run artifact kind `frontend_options`"
 
 let test_cli_run_response_decodes_purify_options () =
   let response =
@@ -1162,10 +1147,20 @@ let test_cli_run_response_rejects_mismatched_frontend_args () =
     bridge_success_json
       (Lsp_json.Object
          [
-           ("kind", Lsp_json.String "frontend_options");
+           ("kind", Lsp_json.String "frontend_module_graph");
            ("command", Lsp_json.String "check");
            ("args", string_array [ "compile"; "a.brp" ]);
            ("options", check_options_json [ "a.brp" ]);
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [
+                 frontend_graph_source "a.brp" "a"
+                   "func main(args: List[String]) -> Int: 0";
+               ] );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
@@ -1486,8 +1481,9 @@ let suite =
         Alcotest.test_case
           "CLI run response rejects legacy parsed source artifact" `Quick
           test_cli_run_response_rejects_legacy_parsed_source_artifact;
-        Alcotest.test_case "CLI run response decodes frontend options" `Quick
-          test_cli_run_response_decodes_frontend_options;
+        Alcotest.test_case
+          "CLI run response rejects legacy frontend options artifact" `Quick
+          test_cli_run_response_rejects_legacy_frontend_options_artifact;
         Alcotest.test_case "CLI run response decodes purify options" `Quick
           test_cli_run_response_decodes_purify_options;
         Alcotest.test_case "CLI run response decodes repl options" `Quick
