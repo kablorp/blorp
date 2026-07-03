@@ -51,6 +51,9 @@ let () =
         (fun (name, cases) -> ("Diagnostics." ^ name, cases))
         Test_diagnostics.suite
     @ List.map
+        (fun (name, cases) -> ("LanguageSurface." ^ name, cases))
+        Test_language_surface.suite
+    @ List.map
         (fun (name, cases) -> ("LspSignature." ^ name, cases))
         Test_lsp_signature.suite
     @ List.map

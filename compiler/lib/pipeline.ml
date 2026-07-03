@@ -84,6 +84,18 @@ let load_modules_after_parse ?on_frontend_phase ~filename program =
   let mod_errors = module_load_errors () in
   if mod_errors <> [] then Error mod_errors else Ok (program, base_dir)
 
+let load_modules_after_preloaded_graph ?on_frontend_phase ~filename ~program
+    graph =
+  let record phase =
+    match on_frontend_phase with Some f -> f phase | None -> ()
+  in
+  record Parse;
+  Modules.load_preloaded_module_graph ~target_path:filename graph;
+  record ModuleLoad;
+  let mod_errors = module_load_errors () in
+  if mod_errors <> [] then Error mod_errors
+  else Ok (program, Modules.extract_directory filename)
+
 let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
     ~filename source =
   let record phase =
@@ -462,10 +474,18 @@ let preload_cli_parsed_sources = function
   | sources -> Modules.preload_parsed_sources sources
 
 let typecheck_only_typed_parsed ~filename ~program
-    ?(preloaded_parsed_sources = []) ?(debug = false) () =
+    ?(preloaded_parsed_sources = []) ?preloaded_module_graph ?(debug = false)
+    () =
   with_fresh_session filename (fun () ->
-      preload_cli_parsed_sources preloaded_parsed_sources;
-      match load_modules_after_parse ~filename program with
+      let loaded =
+        match preloaded_module_graph with
+        | Some graph ->
+            load_modules_after_preloaded_graph ~filename ~program graph
+        | None ->
+            preload_cli_parsed_sources preloaded_parsed_sources;
+            load_modules_after_parse ~filename program
+      in
+      match loaded with
       | Error _ as e -> e
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~source_kind:User_source ~filename ~program
@@ -480,10 +500,10 @@ let typecheck_only ~filename ~source ?(debug = false) () =
   | Error _ as e -> e
 
 let typecheck_only_parsed ~filename ~program ?preloaded_parsed_sources
-    ?(debug = false) () =
+    ?preloaded_module_graph ?(debug = false) () =
   match
     typecheck_only_typed_parsed ~filename ~program
-      ?preloaded_parsed_sources ~debug ()
+      ?preloaded_parsed_sources ?preloaded_module_graph ~debug ()
   with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
@@ -641,10 +661,19 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
 let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
     ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?check_invariants ~filename ~program ?(preloaded_parsed_sources = []) () =
+    ?check_invariants ~filename ~program ?(preloaded_parsed_sources = [])
+    ?preloaded_module_graph () =
   with_fresh_session filename (fun () ->
-      preload_cli_parsed_sources preloaded_parsed_sources;
-      match load_modules_after_parse ?on_frontend_phase ~filename program with
+      let loaded =
+        match preloaded_module_graph with
+        | Some graph ->
+            load_modules_after_preloaded_graph ?on_frontend_phase ~filename
+              ~program graph
+        | None ->
+            preload_cli_parsed_sources preloaded_parsed_sources;
+            load_modules_after_parse ?on_frontend_phase ~filename program
+      in
+      match loaded with
       | Error _ as e -> e
       | Ok (program, _base_dir) ->
           compile_loaded_program ~source_kind:User_source ?debug

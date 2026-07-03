@@ -535,7 +535,6 @@ type compile_opts = {
       (** --dump-typed-ast: prints typed AST and continues compiling *)
   debug : bool;
   output : string option;
-  no_format : bool;
   embed_runtime : bool;
   dump_core_after : Blorp.Core_stage.t list;
       (** --dump-core / --dump-core-after=STAGE[,STAGE…]; repeatable *)
@@ -554,7 +553,6 @@ let default_compile_opts =
     dump_typed_ast = false;
     debug = false;
     output = None;
-    no_format = false;
     embed_runtime = true;
     dump_core_after = [];
     stop_after = None;
@@ -726,8 +724,7 @@ let build_on_stage ?source_file opts : obs =
         cleanup = close_once;
       }
 
-let check_file_with_opts ~frontend_program
-    ?(preloaded_parsed_sources = []) opts filename =
+let check_file_with_opts ~frontend_program ?preloaded_module_graph opts filename =
   if opts.ast_only then
     begin
       print_endline (program_to_string frontend_program);
@@ -739,7 +736,7 @@ let check_file_with_opts ~frontend_program
     if opts.dump_typed_ast then (
       match
         Pipeline.typecheck_only_typed_parsed ~filename ~program:frontend_program
-          ~preloaded_parsed_sources ~debug:opts.debug ()
+          ?preloaded_module_graph ~debug:opts.debug ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -751,7 +748,7 @@ let check_file_with_opts ~frontend_program
     else
       match
         Pipeline.typecheck_only_parsed ~filename ~program:frontend_program
-          ~preloaded_parsed_sources ~debug:opts.debug ()
+          ?preloaded_module_graph ~debug:opts.debug ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -771,11 +768,10 @@ let write_compile_output opts filename c_code =
   Printf.printf "Generated %s\n" c_file;
   0
 
-let compile_file_with_opts ~frontend_program
-    ?(preloaded_parsed_sources = []) opts filename =
+let compile_file_with_opts ~frontend_program ?preloaded_module_graph opts
+    filename =
   if opts.no_emit then
-    check_file_with_opts ~frontend_program ~preloaded_parsed_sources opts
-      filename
+    check_file_with_opts ~frontend_program ?preloaded_module_graph opts filename
   else begin
     if opts.ast_only then
       begin
@@ -805,7 +801,7 @@ let compile_file_with_opts ~frontend_program
                 ~check_invariants:opts.check_invariants
                 ~embed_runtime:opts.embed_runtime
                 ?on_frontend_phase:obs.frontend_callback ~filename
-                ~program:frontend_program ~preloaded_parsed_sources ()
+                ~program:frontend_program ?preloaded_module_graph ()
             with
             | Error errors ->
                 prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -826,8 +822,7 @@ let compile_file_with_opts ~frontend_program
 (** Compile and run a blorp file *)
 let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(run_mode = Compile_profile.Fast)
-    ~timeout ?(user_args = []) ?(preloaded_parsed_sources = [])
-    ~frontend_program
+    ~timeout ?(user_args = []) ?preloaded_module_graph ~frontend_program
     filename =
   Test_runner.with_run_artifacts (fun () ->
       let sanitizer_mode =
@@ -846,7 +841,7 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
       let embed_runtime = precompiled = None in
       match
         Pipeline.compile_parsed ~profile ~debug ~embed_runtime ~require_main:true
-          ~filename ~program:frontend_program ~preloaded_parsed_sources ()
+          ~filename ~program:frontend_program ?preloaded_module_graph ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -1253,110 +1248,18 @@ let rec collect_brp_files path =
   else if Filename.check_suffix path ".brp" then [ path ]
   else []
 
-let module_name_for_cli_source_file path =
-  match Modules.module_name_for_source_file path with
-  | Some name -> name
-  | None ->
-      let base = Filename.basename path in
-      if Filename.check_suffix base ".brp" then
-        String.sub base 0 (String.length base - 4)
-      else base
-
 type parsed_cli_file = {
   parsed_cli_path : string;
-  parsed_cli_program : Ast.program option;
+  parsed_cli_program : Ast.program;
 }
 
 let parsed_cli_success path program =
-  { parsed_cli_path = path; parsed_cli_program = Some program }
-
-let parsed_cli_failure path =
-  { parsed_cli_path = path; parsed_cli_program = None }
-
-let parse_cli_file_request path =
-  init_module_paths (extract_directory path);
-  {
-    Compiler_blorp_bridge.batch_parse_path = path;
-    batch_parse_module_name = module_name_for_cli_source_file path;
-    batch_parse_text = read_file path;
-  }
+  { parsed_cli_path = path; parsed_cli_program = program }
 
 let print_parse_diagnostics ~file diagnostics =
   prerr_endline (format_pipeline_errors ~file diagnostics)
 
-let print_batch_parse_size_mismatch
-    (request : Compiler_blorp_bridge.parse_source_batch_request) =
-  Printf.eprintf
-    "%s:1:1: error: Blorp parser bridge returned a mismatched batch size \
-     while parsing checked files\n"
-    request.Compiler_blorp_bridge.batch_parse_path
-
-let print_batch_parse_mismatch
-    ~(expected : Compiler_blorp_bridge.parse_source_batch_request)
-    (actual : Compiler_blorp_bridge.parse_source_batch_response) =
-  Printf.eprintf
-    "%s:1:1: error: Blorp parser bridge returned artifact for '%s' at '%s' \
-     while parsing '%s' at '%s'\n"
-    expected.Compiler_blorp_bridge.batch_parse_path
-    actual.Compiler_blorp_bridge.batch_parsed_module_name
-    actual.batch_parsed_path expected.batch_parse_module_name
-    expected.batch_parse_path
-
-let finalize_cli_parse_response
-    (request : Compiler_blorp_bridge.parse_source_batch_request)
-    (response : Compiler_blorp_bridge.parse_source_batch_response) =
-  if
-    response.Compiler_blorp_bridge.batch_parsed_path <> request.batch_parse_path
-    || response.batch_parsed_module_name <> request.batch_parse_module_name
-  then begin
-    print_batch_parse_mismatch ~expected:request response;
-    parsed_cli_failure request.batch_parse_path
-  end
-  else
-    match
-      finalize_cli_frontend_parsed_response response.batch_parsed_response
-    with
-    | Error diagnostics ->
-        print_parse_diagnostics ~file:request.batch_parse_path diagnostics;
-        parsed_cli_failure request.batch_parse_path
-    | Ok program -> parsed_cli_success request.batch_parse_path program
-
-let rec finalize_cli_parse_response_pairs requests responses =
-  match (requests, responses) with
-  | [], [] -> []
-  | request :: rest_requests, response :: rest_responses ->
-      finalize_cli_parse_response request response
-      :: finalize_cli_parse_response_pairs rest_requests rest_responses
-  | _ -> []
-
-let finalize_cli_parse_responses requests responses =
-  if List.length requests <> List.length responses then
-    List.map
-      (fun request ->
-        print_batch_parse_size_mismatch request;
-        parsed_cli_failure request.batch_parse_path)
-      requests
-  else finalize_cli_parse_response_pairs requests responses
-
-let parse_cli_files_with_blorp files =
-  let requests = List.map parse_cli_file_request files in
-  match Compiler_blorp_bridge.parse_sources_via_command requests with
-  | Ok responses -> finalize_cli_parse_responses requests responses
-  | Error (_, message) ->
-      List.map
-        (fun (request : Compiler_blorp_bridge.parse_source_batch_request) ->
-          Printf.eprintf "%s:1:1: error: %s\n" request.batch_parse_path message;
-          parsed_cli_failure request.batch_parse_path)
-        requests
-
-let parse_cli_file_with_blorp ?(format_first = false) file =
-  if format_first then auto_format_user_file file;
-  match parse_cli_files_with_blorp [ file ] with
-  | [ { parsed_cli_program = Some program; _ } ] -> Some program
-  | _ -> None
-
-let check_parsed_files_with_opts ?(preloaded_parsed_sources = []) opts
-    parsed_files =
+let check_parsed_files_with_opts ~preloaded_module_graph opts parsed_files =
   if parsed_files = [] then begin
     prerr_endline "Error: no .brp files found";
     1
@@ -1368,15 +1271,12 @@ let check_parsed_files_with_opts ?(preloaded_parsed_sources = []) opts
       (fun parsed ->
         let file = parsed.parsed_cli_path in
         if multiple then Printf.printf "Checking %s\n" file;
-        match parsed.parsed_cli_program with
-        | Some program ->
-            if
-              check_file_with_opts ~frontend_program:program
-                ~preloaded_parsed_sources opts file
-              <> 0
-            then
-              failed := true
-        | None -> failed := true)
+        if
+          check_file_with_opts ~frontend_program:parsed.parsed_cli_program
+            ~preloaded_module_graph opts file
+          <> 0
+        then
+          failed := true)
       parsed_files;
     if !failed then 1 else 0
 
@@ -1384,30 +1284,21 @@ type blorp_cli_frontier =
   | BlorpCliDelegate of string list
   | BlorpCliCheck of
       parsed_cli_file list
-      * Modules.preloaded_parsed_source list
+      * Modules.preloaded_module_graph
       * Compiler_blorp_bridge.cli_check_options
   | BlorpCliCompile of
-      Ast.program option
-      * Modules.preloaded_parsed_source list
+      Ast.program
+      * Modules.preloaded_module_graph
       * Compiler_blorp_bridge.cli_compile_options
   | BlorpCliRun of
-      Ast.program option
-      * Modules.preloaded_parsed_source list
+      Ast.program
+      * Modules.preloaded_module_graph
       * Compiler_blorp_bridge.cli_run_options
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
   | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
   | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
-
-let cli_frontier_of_frontend_options ?frontend_program =
-  let open Compiler_blorp_bridge in
-  function
-  | CliFrontendCheckOptions options ->
-      BlorpCliCheck ([], [], options)
-  | CliFrontendCompileOptions options ->
-      BlorpCliCompile (frontend_program, [], options)
-  | CliFrontendRunOptions options -> BlorpCliRun (frontend_program, [], options)
 
 type finalized_cli_frontend_graph_source = {
   finalized_parsed_file : parsed_cli_file;
@@ -1476,6 +1367,18 @@ let source_package_of_cli_frontend_source_package
     source_package_exports = pkg.cli_frontend_source_package_exports;
   }
 
+let preloaded_graph_context_of_cli_frontend_context
+    (context : Compiler_blorp_bridge.cli_frontend_graph_context) :
+    Modules.preloaded_module_graph_context =
+  {
+    Modules.preload_graph_std_dir =
+      context.cli_frontend_context_std_dir;
+    preload_graph_source_packages =
+      List.map source_package_of_cli_frontend_source_package
+        context.cli_frontend_context_source_packages;
+    preload_graph_package_roots = context.cli_frontend_context_package_roots;
+  }
+
 let apply_cli_frontend_graph_context
     (context : Compiler_blorp_bridge.cli_frontend_graph_context) =
   Option.iter Modules.set_std_override context.cli_frontend_context_std_dir;
@@ -1486,6 +1389,33 @@ let apply_cli_frontend_graph_context
         (source_package_of_cli_frontend_source_package pkg))
     context.cli_frontend_context_source_packages;
   Modules.add_search_path (Sys.getcwd ())
+
+let preloaded_import_edge_of_cli_frontend_import
+    (edge : Compiler_blorp_bridge.cli_frontend_import_edge) :
+    Modules.preloaded_import_edge =
+  {
+    Modules.preload_import_from_path =
+      edge.cli_frontend_import_from_path;
+    preload_import_from_module = edge.cli_frontend_import_from_module;
+    preload_import_path = edge.cli_frontend_import_path;
+    preload_import_resolved_path = edge.cli_frontend_import_resolved_path;
+    preload_import_resolved_module = edge.cli_frontend_import_resolved_module;
+    preload_import_resolved_origin =
+      Option.map module_origin_of_cli_frontend_module_origin
+        edge.cli_frontend_import_resolved_origin;
+  }
+
+let preloaded_module_graph_of_cli_frontend_graph graph sources :
+    Modules.preloaded_module_graph =
+  {
+    Modules.preload_graph_context =
+      preloaded_graph_context_of_cli_frontend_context
+        graph.Compiler_blorp_bridge.cli_frontend_graph_context;
+    preload_graph_sources = sources;
+    preload_graph_imports =
+      List.map preloaded_import_edge_of_cli_frontend_import
+        graph.cli_frontend_graph_imports;
+  }
 
 let cli_frontier_frontend_module_graph
     (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
@@ -1504,18 +1434,21 @@ let cli_frontier_frontend_module_graph
       (fun source -> source.finalized_preloaded_source)
       (roots @ modules)
   in
+  let preloaded_module_graph =
+    preloaded_module_graph_of_cli_frontend_graph graph preloaded_parsed_sources
+  in
   let parsed_roots =
     List.map (fun source -> source.finalized_parsed_file) roots
   in
   match graph.Compiler_blorp_bridge.cli_frontend_graph_options with
   | Compiler_blorp_bridge.CliFrontendCheckOptions options ->
-      BlorpCliCheck (parsed_roots, preloaded_parsed_sources, options)
+      BlorpCliCheck (parsed_roots, preloaded_module_graph, options)
   | Compiler_blorp_bridge.CliFrontendCompileOptions options -> (
       match roots with
       | [ root ] ->
           BlorpCliCompile
             ( root.finalized_parsed_file.parsed_cli_program,
-              preloaded_parsed_sources,
+              preloaded_module_graph,
               options )
       | _ ->
           prerr_endline
@@ -1526,7 +1459,7 @@ let cli_frontier_frontend_module_graph
       | [ root ] ->
           BlorpCliRun
             ( root.finalized_parsed_file.parsed_cli_program,
-              preloaded_parsed_sources,
+              preloaded_module_graph,
               options )
       | _ ->
           prerr_endline
@@ -1537,11 +1470,6 @@ let set_std_override_option = function
   | Some dir -> Modules.set_std_override dir
   | None -> ()
 
-let frontend_program_or_parse ?frontend_program ~no_format file =
-  match frontend_program with
-  | Some program -> Some program
-  | None -> parse_cli_file_with_blorp ~format_first:(not no_format) file
-
 let compile_opts_of_cli_check
     (options : Compiler_blorp_bridge.cli_check_options) =
   {
@@ -1550,7 +1478,6 @@ let compile_opts_of_cli_check
     dump_ast = options.cli_check_dump_ast;
     dump_typed_ast = options.cli_check_dump_typed_ast;
     debug = options.cli_check_debug;
-    no_format = resolve_no_format options.cli_check_no_format;
   }
 
 let compile_opts_of_cli_compile
@@ -1566,7 +1493,6 @@ let compile_opts_of_cli_compile
     time_phases = options.cli_compile_time_phases;
     check_invariants = options.cli_compile_check_invariants;
     debug = options.cli_compile_debug;
-    no_format = resolve_no_format options.cli_compile_no_format;
     embed_runtime = options.cli_compile_embed_runtime;
     output = options.cli_compile_output;
   }
@@ -1579,25 +1505,20 @@ let sanitizer_mode_of_cli_frontend =
       Test_runner.SanitizerAddressUndefined
   | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
 
-let run_check_from_frontier_options ?(preloaded_parsed_sources = [])
-    parsed_files
+let run_check_from_frontier_options ~preloaded_module_graph parsed_files
     (options : Compiler_blorp_bridge.cli_check_options) =
   let opts = compile_opts_of_cli_check options in
   set_std_override_option options.cli_check_std_dir;
-  check_parsed_files_with_opts ~preloaded_parsed_sources opts parsed_files
+  check_parsed_files_with_opts ~preloaded_module_graph opts parsed_files
 
-let run_compile_from_frontier_options ?frontend_program
-    ?(preloaded_parsed_sources = [])
+let run_compile_from_frontier_options ~frontend_program
+    ~preloaded_module_graph
     (options : Compiler_blorp_bridge.cli_compile_options) =
   let opts = compile_opts_of_cli_compile options in
   set_std_override_option options.cli_compile_std_dir;
   match options.cli_compile_files with
-  | [ file ] -> (
-      match frontend_program_or_parse ?frontend_program ~no_format:opts.no_format file with
-      | Some program ->
-          compile_file_with_opts ~frontend_program:program
-            ~preloaded_parsed_sources opts file
-      | None -> 1)
+  | [ file ] ->
+      compile_file_with_opts ~frontend_program ~preloaded_module_graph opts file
   | [] ->
       prerr_endline "Error: No input file specified";
       1
@@ -1605,8 +1526,8 @@ let run_compile_from_frontier_options ?frontend_program
       prerr_endline "Error: Multiple input files not supported";
       1
 
-let run_file_from_frontier_options ?frontend_program
-    ?(preloaded_parsed_sources = [])
+let run_file_from_frontier_options ~frontend_program
+    ~preloaded_module_graph
     (options : Compiler_blorp_bridge.cli_run_options) =
   let timeout = resolve_timeout options.cli_run_timeout in
   let sanitizer_mode =
@@ -1615,7 +1536,6 @@ let run_file_from_frontier_options ?frontend_program
     |> resolve_sanitizer_mode
   in
   let leak_check = resolve_leak_check options.cli_run_leak_check in
-  let no_format = resolve_no_format options.cli_run_no_format in
   let run_mode =
     if options.cli_run_release then Compile_profile.Release
     else Compile_profile.Fast
@@ -1625,14 +1545,11 @@ let run_file_from_frontier_options ?frontend_program
   | Some n -> Unix.putenv "BLORP_THREADS" (string_of_int n)
   | None -> ());
   match options.cli_run_files with
-  | [ file ] -> (
-      match frontend_program_or_parse ?frontend_program ~no_format file with
-      | Some program ->
-          run_file ~profile:options.cli_run_profile ~debug:options.cli_run_debug
-            ~sanitizer_mode ~leak_check ~timeout ~run_mode
-            ~user_args:options.cli_run_user_args ~preloaded_parsed_sources
-            ~frontend_program:program file
-      | None -> 1)
+  | [ file ] ->
+      run_file ~profile:options.cli_run_profile ~debug:options.cli_run_debug
+        ~sanitizer_mode ~leak_check ~timeout ~run_mode
+        ~user_args:options.cli_run_user_args ~preloaded_module_graph
+        ~frontend_program file
   | [] ->
       prerr_endline "Error: No input file specified";
       1
@@ -1849,8 +1766,11 @@ let apply_blorp_cli_frontier args =
         exit result.Compiler_blorp_bridge.cli_run_status
     | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
         cli_frontier_frontend_module_graph graph
-    | Ok (Compiler_blorp_bridge.CliRunFrontendOptions options) ->
-        cli_frontier_of_frontend_options options.cli_frontend_options
+    | Ok (Compiler_blorp_bridge.CliRunFrontendOptions _) ->
+        prerr_endline
+          "Error: legacy frontend_options CLI artifact is no longer supported; \
+           frontend_module_graph is required";
+        exit 1
     | Ok (Compiler_blorp_bridge.CliRunTestOptions options) ->
         BlorpCliTest options
     | Ok (Compiler_blorp_bridge.CliRunPurifyOptions options) ->
@@ -1885,18 +1805,18 @@ let () =
   try
     match command_line_args () |> apply_blorp_cli_frontier with
     | BlorpCliDelegate args -> run_delegate_command args
-    | BlorpCliCheck (parsed_files, preloaded_parsed_sources, options) ->
+    | BlorpCliCheck (parsed_files, preloaded_module_graph, options) ->
         exit
-          (run_check_from_frontier_options ~preloaded_parsed_sources
-             parsed_files options)
-    | BlorpCliCompile (frontend_program, preloaded_parsed_sources, options) ->
+          (run_check_from_frontier_options ~preloaded_module_graph parsed_files
+             options)
+    | BlorpCliCompile (frontend_program, preloaded_module_graph, options) ->
         exit
-          (run_compile_from_frontier_options ?frontend_program
-             ~preloaded_parsed_sources options)
-    | BlorpCliRun (frontend_program, preloaded_parsed_sources, options) ->
+          (run_compile_from_frontier_options ~frontend_program
+             ~preloaded_module_graph options)
+    | BlorpCliRun (frontend_program, preloaded_module_graph, options) ->
         exit
-          (run_file_from_frontier_options ?frontend_program
-             ~preloaded_parsed_sources options)
+          (run_file_from_frontier_options ~frontend_program
+             ~preloaded_module_graph options)
     | BlorpCliTest options -> exit (run_test_from_frontier_options options)
     | BlorpCliPurify options -> exit (run_purify_from_frontier_options options)
     | BlorpCliRepl options ->

@@ -139,6 +139,162 @@ let test_compile_parsed_accepts_finalized_bridge_artifact () =
                   Alcotest.fail
                     ("expected compile_parsed success:\n" ^ format_errors errors)))
 
+let parse_typecheck_source_for_test ~path ~module_name =
+  match
+    Compiler_blorp_bridge.parse_source_file_via_command_at_phase
+      ~phase:Compiler_blorp_bridge.TypecheckSourceProgram ~path ~module_name
+  with
+  | Error (_, message) ->
+      Alcotest.fail ("expected Blorp parse bridge artifact: " ^ message)
+  | Ok (Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics) ->
+      Alcotest.fail
+        ("expected parsed bridge artifact, got diagnostics:\n"
+       ^ format_errors diagnostics)
+  | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) -> parsed_source
+
+let preloaded_source_for_test ~path ~module_name ~source parsed_source :
+    Modules.preloaded_parsed_source =
+  {
+    Modules.preload_module_name = module_name;
+    preload_path = path;
+    preload_origin = Session.User_module;
+    preload_source = source;
+    preload_decls = parsed_source.Compiler_blorp_bridge.parsed_program;
+    preload_surface = parsed_source.parsed_module_surface;
+  }
+
+let test_compile_parsed_uses_preloaded_module_graph_without_rereading_import ()
+    =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_graph_preload" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    ./dep: dep_value\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    dep_value()\n"
+          in
+          let dep_source = "pure func dep_value() -> Int: 7\n" in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"./dep"
+          in
+          Sys.remove dep_path;
+          let preloaded_module_graph : Modules.preloaded_module_graph =
+            {
+              preload_graph_context =
+                {
+                  preload_graph_std_dir = None;
+                  preload_graph_source_packages = [];
+                  preload_graph_package_roots = [];
+                };
+              preload_graph_sources =
+                [
+                  preloaded_source_for_test ~path:main_path ~module_name:"main"
+                    ~source:main_source main_parsed;
+                  preloaded_source_for_test ~path:dep_path
+                    ~module_name:"./dep" ~source:dep_source dep_parsed;
+                ];
+              preload_graph_imports =
+                [
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "./dep";
+                    preload_import_resolved_path = Some dep_path;
+                    preload_import_resolved_module = Some "./dep";
+                    preload_import_resolved_origin = Some Session.User_module;
+                  };
+                ];
+            }
+          in
+          match
+            Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
+              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+          with
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "generated C uses graph-loaded dependency" true
+                (contains c_code "dep_value")
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail "compile_parsed unexpectedly stopped early"
+          | Error errors ->
+              Alcotest.fail
+                ("expected compile_parsed to use preloaded module graph:\n"
+               ^ format_errors errors)))
+
+let test_compile_parsed_uses_graph_import_spelling_alias () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_graph_import_alias" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "canonical_dep.brp" in
+          let main_source =
+            "import:\n\
+            \    alias_dep: dep_value\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    dep_value()\n"
+          in
+          let dep_source = "pure func dep_value() -> Int: 9\n" in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"canonical_dep"
+          in
+          Sys.remove dep_path;
+          let preloaded_module_graph : Modules.preloaded_module_graph =
+            {
+              preload_graph_context =
+                {
+                  preload_graph_std_dir = None;
+                  preload_graph_source_packages = [];
+                  preload_graph_package_roots = [];
+                };
+              preload_graph_sources =
+                [
+                  preloaded_source_for_test ~path:main_path ~module_name:"main"
+                    ~source:main_source main_parsed;
+                  preloaded_source_for_test ~path:dep_path
+                    ~module_name:"canonical_dep" ~source:dep_source dep_parsed;
+                ];
+              preload_graph_imports =
+                [
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "alias_dep";
+                    preload_import_resolved_path = Some dep_path;
+                    preload_import_resolved_module = Some "canonical_dep";
+                    preload_import_resolved_origin = Some Session.User_module;
+                  };
+                ];
+            }
+          in
+          match
+            Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
+              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+          with
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "generated C uses graph dependency imported by source spelling"
+                true
+                (contains c_code "dep_value")
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail "compile_parsed unexpectedly stopped early"
+          | Error errors ->
+              Alcotest.fail
+                ("expected compile_parsed to cache graph import spelling:\n"
+               ^ format_errors errors)))
+
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
       let source = "func helper() -> Int:\n    x: Int = 1\n    x + 1\n" in
@@ -1034,6 +1190,12 @@ let suite =
           test_typecheck_only_typed_returns_typed_program;
         Alcotest.test_case "compile_parsed accepts finalized bridge artifact"
           `Quick test_compile_parsed_accepts_finalized_bridge_artifact;
+        Alcotest.test_case
+          "compile_parsed uses preloaded module graph without rereading import"
+          `Quick
+          test_compile_parsed_uses_preloaded_module_graph_without_rereading_import;
+        Alcotest.test_case "compile_parsed caches graph import spelling" `Quick
+          test_compile_parsed_uses_graph_import_spelling_alias;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"

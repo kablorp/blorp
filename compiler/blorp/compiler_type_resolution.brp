@@ -1,0 +1,305 @@
+import:
+	compiler_env:
+		CompilerEnv,
+		compiler_env_disambiguate_nominal_dim_application,
+		compiler_env_resolve_alias,
+	compiler_type:
+		CompilerType(
+			CompilerArrayType,
+			CompilerDimOpType,
+			CompilerFunctionType,
+			CompilerNamedType,
+			CompilerRangeType,
+			CompilerTupleType,
+		),
+		compiler_canonical_module_type_name,
+
+
+enum CompilerAliasPolicy:
+	CompilerExpandAliases
+	CompilerPreserveAliasSource
+
+
+record CompilerTypeResolutionContext {
+	env: CompilerEnv,
+	module_aliases: List[(String, String)],
+	alias_policy: CompilerAliasPolicy
+}
+
+
+record CompilerResolvedType {
+	source: CompilerType,
+	canonical: CompilerType
+}
+
+
+pure func compiler_type_resolution_context(
+	env: CompilerEnv,
+	module_aliases: List[(String, String)],
+) -> CompilerTypeResolutionContext:
+	{
+		env = env,
+		module_aliases = module_aliases,
+		alias_policy = CompilerExpandAliases
+	}
+
+
+pure func compiler_type_resolution_context_with_alias_policy(
+	env: CompilerEnv,
+	module_aliases: List[(String, String)],
+	alias_policy: CompilerAliasPolicy,
+) -> CompilerTypeResolutionContext:
+	{
+		env = env,
+		module_aliases = module_aliases,
+		alias_policy = alias_policy
+	}
+
+
+private pure func compiler_find_module_alias(
+	module_aliases: List[(String, String)],
+	alias_name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for pair in module_aliases:
+		if pair[0] == alias_name:
+			result = Some(pair[1])
+			break
+
+	result
+
+
+private pure func compiler_resolve_qualified_type_name(
+	module_aliases: List[(String, String)],
+	name: String,
+) -> String:
+	dot_index: Int = name.raw_index_of(".")
+
+	if dot_index < 0:
+		name
+	else:
+		alias_name: String = name.substring(0, dot_index)
+		local_name: String = name.substring(dot_index + 1, name.length() - dot_index - 1)
+
+		match compiler_find_module_alias(module_aliases, alias_name):
+			Some(module_path):
+				compiler_canonical_module_type_name(module_path, local_name)
+			None:
+				name
+
+
+pure func compiler_resolve_qualified_type_names(
+	module_aliases: List[(String, String)],
+	typ: CompilerType,
+) -> CompilerType:
+	match typ:
+		CompilerNamedType(name, args):
+			CompilerNamedType(
+				compiler_resolve_qualified_type_name(module_aliases, name),
+				args.map(func(arg): compiler_resolve_qualified_type_names(module_aliases, arg)),
+			)
+		CompilerArrayType(element, dims):
+			CompilerArrayType(
+				compiler_resolve_qualified_type_names(module_aliases, element),
+				dims.map(func(dim): compiler_resolve_qualified_type_names(module_aliases, dim)),
+			)
+		CompilerFunctionType(is_pure, params, return_type):
+			CompilerFunctionType(
+				is_pure,
+				params.map(
+					func(param): compiler_resolve_qualified_type_names(module_aliases, param),
+				),
+				compiler_resolve_qualified_type_names(module_aliases, return_type),
+			)
+		CompilerTupleType(elements):
+			CompilerTupleType(elements.map(
+				func(element): compiler_resolve_qualified_type_names(module_aliases, element),
+			))
+		CompilerRangeType(inner):
+			CompilerRangeType(compiler_resolve_qualified_type_names(module_aliases, inner))
+		CompilerDimOpType(op, left, right):
+			CompilerDimOpType(
+				op,
+				compiler_resolve_qualified_type_names(module_aliases, left),
+				compiler_resolve_qualified_type_names(module_aliases, right),
+			)
+		_:
+			typ
+
+
+private pure func compiler_apply_alias_policy(
+	context: CompilerTypeResolutionContext,
+	typ: CompilerType,
+) -> CompilerType:
+	match context.alias_policy:
+		CompilerExpandAliases:
+			compiler_env_resolve_alias(context.env, typ)
+		CompilerPreserveAliasSource:
+			typ
+
+
+private pure func compiler_identity_type(typ: CompilerType) -> CompilerType:
+	typ
+
+
+pure func compiler_resolve_type(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+	qualify_owner: pure (CompilerType) -> CompilerType,
+) -> CompilerResolvedType:
+	qualified: CompilerType = compiler_resolve_qualified_type_names(context.module_aliases, source)
+	owned: CompilerType = qualify_owner(qualified)
+	nominal: CompilerType = compiler_env_disambiguate_nominal_dim_application(context.env, owned)
+	aliased: CompilerType = compiler_apply_alias_policy(context, nominal)
+	canonical: CompilerType = compiler_resolve_qualified_type_names(context.module_aliases, aliased)
+
+	{
+		source = source,
+		canonical = canonical
+	}
+
+
+pure func compiler_resolve_type_default(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type(context, source, compiler_identity_type)
+
+
+pure func compiler_resolved_type_source(resolved: CompilerResolvedType) -> CompilerType:
+	resolved.source
+
+
+pure func compiler_resolved_type_canonical(resolved: CompilerResolvedType) -> CompilerType:
+	resolved.canonical
+
+
+pure func compiler_annotation(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_annotation_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_annotation(context, source).canonical
+
+
+pure func compiler_value_ascription(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_value_ascription_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_value_ascription(context, source).canonical
+
+
+pure func compiler_local_binding_annotation(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_local_binding_annotation_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_local_binding_annotation(context, source).canonical
+
+
+pure func compiler_function_parameter_annotation(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+	qualify_owner: pure (CompilerType) -> CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type(context, source, qualify_owner)
+
+
+pure func compiler_function_parameter_annotation_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+	qualify_owner: pure (CompilerType) -> CompilerType,
+) -> CompilerType:
+	compiler_function_parameter_annotation(context, source, qualify_owner).canonical
+
+
+pure func compiler_function_return_annotation(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+	qualify_owner: pure (CompilerType) -> CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type(context, source, qualify_owner)
+
+
+pure func compiler_function_return_annotation_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+	qualify_owner: pure (CompilerType) -> CompilerType,
+) -> CompilerType:
+	compiler_function_return_annotation(context, source, qualify_owner).canonical
+
+
+pure func compiler_imported_signature(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_imported_signature_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_imported_signature(context, source).canonical
+
+
+pure func compiler_record_field_type(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_record_field_type_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_record_field_type(context, source).canonical
+
+
+pure func compiler_variant_field_type(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_variant_field_type_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_variant_field_type(context, source).canonical
+
+
+pure func compiler_type_alias_target(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerResolvedType:
+	compiler_resolve_type_default(context, source)
+
+
+pure func compiler_type_alias_target_canonical(
+	context: CompilerTypeResolutionContext,
+	source: CompilerType,
+) -> CompilerType:
+	compiler_type_alias_target(context, source).canonical

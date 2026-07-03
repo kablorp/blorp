@@ -1,0 +1,220 @@
+import:
+	../compiler_env: CompilerEnv, compiler_env_add_alias, compiler_env_empty
+	../compiler_type:
+		CompilerDimOp(CompilerDimAdd),
+		CompilerType(
+			CompilerArrayType,
+			CompilerConstIntType,
+			CompilerDimOpType,
+			CompilerFunctionType,
+			CompilerNamedType,
+			CompilerRangeType,
+			CompilerTupleType,
+			CompilerTypeVar,
+		),
+		compiler_type_float,
+		compiler_type_int,
+		compiler_types_equal,
+	../compiler_type_resolution:
+		CompilerAliasPolicy(CompilerExpandAliases, CompilerPreserveAliasSource),
+		CompilerResolvedType,
+		compiler_function_parameter_annotation,
+		compiler_function_return_annotation,
+		compiler_imported_signature_canonical,
+		compiler_record_field_type_canonical,
+		compiler_resolved_type_canonical,
+		compiler_resolved_type_source,
+		compiler_type_resolution_context,
+		compiler_type_resolution_context_with_alias_policy,
+		compiler_value_ascription,
+	test: TestSuite
+
+
+pure func qualify_local(typ: CompilerType) -> CompilerType:
+	match typ:
+		CompilerNamedType("Local", args):
+			CompilerNamedType(
+				"mod/a::Local",
+				args.map(qualify_local),
+			)
+		CompilerNamedType(name, args):
+			CompilerNamedType(
+				name,
+				args.map(qualify_local),
+			)
+		CompilerArrayType(element, dims):
+			CompilerArrayType(
+				element.qualify_local(),
+				dims.map(qualify_local),
+			)
+		CompilerFunctionType(is_pure, params, return_type):
+			CompilerFunctionType(
+				is_pure,
+				params.map(qualify_local),
+				return_type.qualify_local(),
+			)
+		CompilerTupleType(elements):
+			CompilerTupleType(elements.map(qualify_local))
+		CompilerRangeType(inner):
+			CompilerRangeType(inner.qualify_local())
+		CompilerDimOpType(op, left, right):
+			CompilerDimOpType(op, left.qualify_local(), right.qualify_local())
+		_:
+			typ
+
+
+func test_resolves_qualified_names_recursively() -> Bool:
+	ctx = compiler_type_resolution_context(
+		compiler_env_empty(),
+		[("G", "std/geometry"), ("D", "std/dimensions")],
+	)
+	source: CompilerType = CompilerTupleType([
+		CompilerFunctionType(
+			True,
+			[CompilerNamedType("G.Point", []), CompilerRangeType(CompilerNamedType("D.Width", []))],
+			CompilerArrayType(
+				CompilerNamedType("G.Direction", []),
+				[CompilerDimOpType(
+						CompilerDimAdd,
+						CompilerNamedType("D.Width", []),
+						CompilerNamedType("D.Height", []),
+					)],
+			),
+		),
+	])
+	expected: CompilerType = CompilerTupleType([
+		CompilerFunctionType(
+			True,
+			[
+				CompilerNamedType("std/geometry::Point", []),
+				CompilerRangeType(CompilerNamedType("std/dimensions::Width", [])),
+			],
+			CompilerArrayType(
+				CompilerNamedType("std/geometry::Direction", []),
+				[CompilerDimOpType(
+						CompilerDimAdd,
+						CompilerNamedType("std/dimensions::Width", []),
+						CompilerNamedType("std/dimensions::Height", []),
+					)],
+			),
+		),
+	])
+
+	compiler_types_equal(
+		compiler_imported_signature_canonical(ctx, source),
+		expected,
+	)
+
+
+func test_resolution_composes_owner_qualification_and_aliases() -> Bool:
+	env: CompilerEnv = compiler_env_add_alias(
+		compiler_env_empty(),
+		"LocalHit",
+		[],
+		CompilerNamedType("G.Hit", []),
+	)
+	ctx = compiler_type_resolution_context(env, [("G", "std/geometry")])
+	source: CompilerType = CompilerFunctionType(
+		True,
+		[CompilerNamedType("Local", []), CompilerNamedType("LocalHit", [])],
+		CompilerNamedType(
+			"Local",
+			[],
+		),
+	)
+	resolved: CompilerResolvedType = compiler_function_parameter_annotation(
+		ctx,
+		source,
+		qualify_local,
+	)
+	expected: CompilerType = CompilerFunctionType(
+		True,
+		[CompilerNamedType("mod/a::Local", []), CompilerNamedType("std/geometry::Hit", [])],
+		CompilerNamedType(
+			"mod/a::Local",
+			[],
+		),
+	)
+
+	(
+		compiler_types_equal(compiler_resolved_type_source(resolved), source)
+		and compiler_types_equal(compiler_resolved_type_canonical(resolved), expected)
+	)
+
+
+func test_nominal_dim_alias_and_alias_preservation() -> Bool:
+	env: CompilerEnv = compiler_env_add_alias(
+		compiler_env_empty(),
+		"FloatRow",
+		["#N"],
+		CompilerArrayType(compiler_type_float(), [CompilerTypeVar("#N")]),
+	)
+	expand_ctx = compiler_type_resolution_context(env, [])
+	preserve_ctx = compiler_type_resolution_context_with_alias_policy(
+		env,
+		[],
+		CompilerPreserveAliasSource,
+	)
+	source: CompilerType = CompilerArrayType(
+		CompilerNamedType("FloatRow", []),
+		[CompilerConstIntType(8)],
+	)
+	expanded: CompilerType = compiler_record_field_type_canonical(expand_ctx, source)
+	preserved: CompilerType = compiler_record_field_type_canonical(preserve_ctx, source)
+
+	compiler_types_equal(
+		expanded,
+		CompilerArrayType(compiler_type_float(), [CompilerConstIntType(8)]),
+	) and compiler_types_equal(
+		preserved,
+		CompilerNamedType("FloatRow", [CompilerConstIntType(8)]),
+	)
+
+
+func test_entrypoints_share_resolution_pipeline() -> Bool:
+	env: CompilerEnv = compiler_env_add_alias(
+		compiler_env_empty(),
+		"Row",
+		["#N"],
+		CompilerArrayType(compiler_type_int(), [CompilerTypeVar("#N")]),
+	)
+	ctx = compiler_type_resolution_context(env, [("M", "pkg/math")])
+	source: CompilerType = CompilerFunctionType(
+		True,
+		[CompilerArrayType(
+				CompilerNamedType("Row", []),
+				[CompilerConstIntType(4)],
+			)],
+		CompilerNamedType("M.Result", []),
+	)
+	expected: CompilerType = CompilerFunctionType(
+		True,
+		[CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)])],
+		CompilerNamedType("pkg/math::Result", []),
+	)
+	value_resolved = compiler_value_ascription(ctx, source)
+	return_resolved = compiler_function_return_annotation(
+		ctx,
+		source,
+		func(typ: CompilerType): typ,
+	)
+
+	(
+		compiler_types_equal(compiler_resolved_type_source(value_resolved), source)
+		and compiler_types_equal(compiler_resolved_type_canonical(value_resolved), expected)
+		and compiler_types_equal(compiler_resolved_type_canonical(return_resolved), expected)
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler type resolution",
+	tests = [
+		("resolves qualified names recursively", test_resolves_qualified_names_recursively),
+		(
+			"composes owner qualification and aliases",
+			test_resolution_composes_owner_qualification_and_aliases,
+		),
+		("nominal dim alias and alias preservation", test_nominal_dim_alias_and_alias_preservation),
+		("entrypoints share resolution pipeline", test_entrypoints_share_resolution_pipeline),
+	]
+}

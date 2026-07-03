@@ -55,6 +55,7 @@ val typecheck_only_parsed :
   filename:string ->
   program:Ast.program ->
   ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
+  ?preloaded_module_graph:Modules.preloaded_module_graph ->
   ?debug:bool ->
   unit ->
   (Ast.program, Ast.compiler_error list) result
@@ -67,6 +68,7 @@ val typecheck_only_typed_parsed :
   filename:string ->
   program:Ast.program ->
   ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
+  ?preloaded_module_graph:Modules.preloaded_module_graph ->
   ?debug:bool ->
   unit ->
   (Typed_ast.program, Ast.compiler_error list) result
@@ -176,6 +178,7 @@ val compile_parsed :
   filename:string ->
   program:Ast.program ->
   ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
+  ?preloaded_module_graph:Modules.preloaded_module_graph ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
 (** Compile a program that has already passed through parser finalization.

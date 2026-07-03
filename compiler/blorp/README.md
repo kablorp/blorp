@@ -55,6 +55,65 @@ frontend cleanup should retire parser-adjacent OCaml transforms, expand focused
 fixture coverage for current syntax, and keep parser/source-AST ownership
 contiguous with the CLI source-graph frontier.
 
+`compiler_diagnostic.brp` is the general pure diagnostic renderer for the
+Blorp-owned compiler substrate. It renders Rust-style source diagnostics from
+explicit source text rather than reading files during formatting, so later
+typecheck and environment slices can keep error rendering deterministic and
+phase-local.
+`compiler_type.brp` is the first semantic type substrate: it mirrors the
+current OCaml type constructors for named, array/tensor, function, tuple,
+dimension, range, `Self`, and inference-meta forms, and provides pure display,
+structural equality, tensor-name normalization, array decomposition, and numeric
+or dimension predicates. It also provides type-parameter bound stripping,
+occurs checks, cycle-safe substitution, dimension arithmetic normalization, and
+array/tensor dimension validation. `compiler_context.brp` owns the baseline
+context-threaded unifier over this type model.
+`compiler_dim_solver.brp` ports the canonical sum-of-products dimension solver:
+it handles commutative/associative/distributive dimension expressions, exact
+constant division, contradictions, and simple meta or `#` dimension-variable
+bindings. `compiler_context.brp` delegates dimension arithmetic to that solver;
+production typecheck integration remains a later checkpoint-4 slice.
+`compiler_type_widening.brp` ports the explicit value-slot widening decisions
+from the OCaml frontend. It keeps semantic type and runtime value type separate
+for mutable bindings, arguments, collection elements, bitwise operands, method
+receivers, and numeric operands.
+`compiler_refinement.brp` ports the range/subscript proof metadata and
+proof-env helpers used by inference. It keeps collection identities, dimension
+identities, range bounds, offset checks, branch narrowing, and binding/expr
+proof payloads explicit instead of encoding them as ad hoc strings or side
+tables.
+`compiler_module_type_identity.brp` ports the local type-name identity helper
+used by module loading. It extracts record, union/enum, and type-alias names
+from parsed declarations, treating `private` wrappers as transparent and
+returning a sorted unique list.
+`compiler_generic_params.brp` ports structured generic-parameter helpers:
+trait references, bounded type parameters, parser-source spelling, and param
+name extraction. Later Env/typecheck slices should use this representation
+instead of encoding bounds in raw strings.
+`compiler_type_metadata.brp` ports type-policy facts used by typecheck and Core
+resolution: recursion storage, primitive module homes, struct scalar eligibility,
+native operator fast paths, builtin to-string fallbacks, and constructor-space
+classification.
+`compiler_env.brp` ports the explicit frontend environment substrate as a pure
+value: lexical scopes, symbols, aliases, type/record/constructor lookup,
+trait functions, trait defs, impls, overloads, UFCS methods, resource policies,
+proof metadata attachment points, and alias/nominal-dimension resolution.
+`compiler_builtins.brp` ports compiler-visible builtin metadata and core Env
+population for primitive types, `Option`/`Result` constructors, foundational
+traits/impls, builtin functions, purity/effect classification, resource
+argument policy, special inference hooks, and loop-producer metadata.
+`compiler_type_resolution.brp` ports the named source-annotation resolution
+entrypoints over the Blorp Env: qualified module aliases, optional owner
+qualification, nominal dimension disambiguation, and alias expansion or
+preservation.
+`compiler_context.brp` is the first explicit per-compilation context model for
+the Blorp-owned frontend. It carries module-origin policy, type-home ambiguity,
+resource cleanup metadata, trait-home conflict reporting, definition-id counters,
+meta origins/bindings with head resolution and zonking, baseline unification
+with explicit substitutions, and Core lowering counters as ordinary values. The
+production OCaml session still owns mutable compiler execution today; new Blorp
+frontend slices should extend this value instead of introducing ambient state.
+
 The Blorp-owned CLI surface is split by responsibility: `compiler_cli.brp`
 owns top-level planning and dispatch, `compiler_cli_args.brp` owns pure argument
 parsing, `compiler_cli_plan.brp` owns shared plan data, `compiler_cli_source_graph.brp`

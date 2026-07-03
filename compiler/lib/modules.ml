@@ -40,6 +40,15 @@ type preloaded_parsed_source = {
   preload_surface : Module_surface.t option;
 }
 
+type preloaded_import_edge = {
+  preload_import_from_path : string;
+  preload_import_from_module : string;
+  preload_import_path : string;
+  preload_import_resolved_path : string option;
+  preload_import_resolved_module : string option;
+  preload_import_resolved_origin : Session.module_origin option;
+}
+
 (** Resolve the session to operate on: explicit if passed, else the
     ambient current session. Every stateful function in this module
     uses this pattern so callers that don't carry a session in scope
@@ -243,6 +252,18 @@ type source_package = Session.source_package = {
   source_package_root : string;
   source_package_source_dir : string;
   source_package_exports : string list;
+}
+
+type preloaded_module_graph_context = {
+  preload_graph_std_dir : string option;
+  preload_graph_source_packages : source_package list;
+  preload_graph_package_roots : string list;
+}
+
+type preloaded_module_graph = {
+  preload_graph_context : preloaded_module_graph_context;
+  preload_graph_sources : preloaded_parsed_source list;
+  preload_graph_imports : preloaded_import_edge list;
 }
 
 let add_source_package ?sess (pkg : source_package) =
@@ -1493,6 +1514,204 @@ and load_imports ?sess ?surface decls base_dir =
       if List.mem canonical_name failed_preloaded_modules then None
       else load_module ~sess import_module base_dir)
     import_names
+
+let record_graph_load_error ~(sess : Session.t) ~path message =
+  let err =
+    {
+      Ast.message;
+      loc = Ast.point_loc_in ~file:path ~line:1 ~column:1;
+      phase = Ast.ModuleLoad;
+      kind = Ast.OtherError;
+      notes = [];
+      help = None;
+    }
+  in
+  sess.load_errors <- err :: sess.load_errors
+
+let apply_preloaded_module_graph_context ~(sess : Session.t)
+    (context : preloaded_module_graph_context) =
+  Option.iter (set_std_override ~sess) context.preload_graph_std_dir;
+  List.iter (add_source_package ~sess) context.preload_graph_source_packages;
+  List.iter (add_package_root ~sess) context.preload_graph_package_roots;
+  add_search_path ~sess (Sys.getcwd ())
+
+let preloaded_source_key path module_name = path ^ "\000" ^ module_name
+
+let find_preloaded_source (sources : preloaded_parsed_source list) path
+    module_name =
+  List.find_opt
+    (fun source ->
+      source.preload_path = path && source.preload_module_name = module_name)
+    sources
+
+let preloaded_sources_for_path (sources : preloaded_parsed_source list) path =
+  List.filter (fun source -> source.preload_path = path) sources
+
+let load_preloaded_source_module ~(sess : Session.t)
+    (source : preloaded_parsed_source) =
+  match Hashtbl.find_opt sess.module_cache source.preload_module_name with
+  | Some _ -> ()
+  | None -> (
+      match find_cached_by_path sess source.preload_path with
+      | Some m ->
+          Hashtbl.replace sess.module_cache source.preload_module_name m
+      | None -> (
+          match
+            cache_parsed_module_source ~trust_current_source:true ~sess
+              ~module_name:source.preload_module_name ~path:source.preload_path
+              ~origin:source.preload_origin ~source:source.preload_source
+              ?surface:source.preload_surface
+              source.preload_decls
+          with
+          | None -> ()
+          | Some
+              {
+                cached_path;
+                cached_origin;
+                cached_decls;
+                cached_exports;
+                cached_surface;
+              } ->
+              let m =
+                {
+                  name = source.preload_module_name;
+                  path = cached_path;
+                  origin = cached_origin;
+                  decls = cached_decls;
+                  exports = cached_exports;
+                  surface = cached_surface;
+                  typed_decls = None;
+                  typed_import_bindings = None;
+                }
+              in
+              Hashtbl.replace sess.module_cache source.preload_module_name m;
+              Session.register_module_traits sess m;
+              Session.register_module_types sess m))
+
+let embedded_std_load_name_for_graph_import ~(sess : Session.t) import_path =
+  if sess.std_override_active then None
+  else if has_prefix "std/" import_path then
+    Option.map (fun _ -> import_path) (Embedded_std.find import_path)
+  else
+    let is_relative =
+      has_prefix "./" import_path || has_prefix "../" import_path
+    in
+    let is_bare =
+      (not (has_prefix "pkg/" import_path)) && not is_relative
+    in
+    if is_bare then
+      let std_name = "std/" ^ import_path in
+      Option.map (fun _ -> import_path) (Embedded_std.find std_name)
+    else None
+
+let graph_unresolved_import_message ~(sess : Session.t) ~base_dir import_path =
+  match source_package_alias_load_error sess import_path with
+  | Some message -> message
+  | None when has_prefix "pkg/" import_path ->
+      let roots =
+        match List.rev sess.package_roots with
+        | [] -> "<none>"
+        | roots -> String.concat ", " roots
+      in
+      Printf.sprintf
+        "Could not find package module '%s'\n\
+        \  = help: Package imports resolve only from local package roots. \
+         Create %s.brp under a local pkg/ directory or add a package root.\n\
+        \  Package roots: %s"
+        import_path import_path roots
+  | None -> (
+      match source_package_for_base_dir sess base_dir with
+      | Some current_pkg ->
+          Printf.sprintf
+            "source packages may import only std modules or modules inside \
+             their own package; package %S tried to import %S"
+            current_pkg.source_package_alias import_path
+      | None ->
+          Printf.sprintf "Could not find module '%s'\n  Search paths: %s"
+            import_path
+            (String.concat ", " sess.search_paths))
+
+let graph_edges_from graph path module_name =
+  List.filter
+    (fun edge ->
+      edge.preload_import_from_path = path
+      && edge.preload_import_from_module = module_name)
+    graph.preload_graph_imports
+
+let cache_preloaded_graph_import_alias ~(sess : Session.t) ~import_path
+    ~resolved_module =
+  if import_path <> resolved_module then
+    match Hashtbl.find_opt sess.module_cache resolved_module with
+    | Some m -> Hashtbl.replace sess.module_cache import_path m
+    | None -> ()
+
+let load_preloaded_graph_std_support ~(sess : Session.t) base_dir =
+  if not sess.prelude_modules_loaded then begin
+    sess.prelude_modules_loaded <- true;
+    List.iter
+      (fun module_name ->
+        ignore (load_module ~sess module_name base_dir))
+      eager_typecheck_support_modules
+  end
+
+let load_preloaded_module_graph ?sess ~target_path graph =
+  let sess = sess_of ?sess () in
+  apply_preloaded_module_graph_context ~sess graph.preload_graph_context;
+  let target_base_dir = extract_directory target_path in
+  load_preloaded_graph_std_support ~sess target_base_dir;
+  let visited = Hashtbl.create 32 in
+  let rec visit_source ~load_current path module_name =
+    let key = preloaded_source_key path module_name in
+    if not (Hashtbl.mem visited key) then begin
+      Hashtbl.add visited key ();
+      match find_preloaded_source graph.preload_graph_sources path module_name with
+      | None ->
+          record_graph_load_error ~sess ~path
+            (Printf.sprintf
+               "frontend module graph referenced `%s` at `%s`, but that \
+                source was not supplied"
+               module_name path)
+      | Some source ->
+          if load_current then load_preloaded_source_module ~sess source;
+          let base_dir = extract_directory source.preload_path in
+          graph_edges_from graph source.preload_path source.preload_module_name
+          |> List.iter (fun edge ->
+                 match
+                   ( edge.preload_import_resolved_path,
+                     edge.preload_import_resolved_module )
+                 with
+                 | Some resolved_path, Some resolved_module ->
+                     visit_source ~load_current:true resolved_path
+                       resolved_module;
+                     cache_preloaded_graph_import_alias ~sess
+                       ~import_path:edge.preload_import_path ~resolved_module
+                 | None, None -> (
+                     match
+                       embedded_std_load_name_for_graph_import ~sess
+                         edge.preload_import_path
+                     with
+                     | Some load_name ->
+                         ignore (load_module ~sess load_name base_dir)
+                     | None ->
+                         record_graph_load_error ~sess ~path:source.preload_path
+                           (graph_unresolved_import_message ~sess ~base_dir
+                              edge.preload_import_path))
+                 | _ ->
+                     record_graph_load_error ~sess ~path:source.preload_path
+                       "frontend module graph import edge had an incomplete \
+                        resolved target")
+    end
+  in
+  match preloaded_sources_for_path graph.preload_graph_sources target_path with
+  | [] ->
+      record_graph_load_error ~sess ~path:target_path
+        "frontend module graph did not contain the target source"
+  | roots ->
+      List.iter
+        (fun root ->
+          visit_source ~load_current:false root.preload_path
+            root.preload_module_name)
+        roots
 
 (** Get module dependencies (names of modules it imports) *)
 let get_dependencies m =

@@ -1,0 +1,366 @@
+import:
+	compiler_source: CompilerSourceFile, CompilerSourceSpan
+	string: string
+
+
+enum CompilerDiagnosticSeverity:
+	CompilerErrorSeverity
+	CompilerWarningSeverity
+	CompilerNoteSeverity
+
+
+enum CompilerDiagnosticLabelStyle:
+	PrimaryDiagnosticLabel
+	SecondaryDiagnosticLabel
+
+
+record CompilerDiagnosticLoc {
+	path: String,
+	line: Int,
+	column: Int,
+	end_line: Int,
+	end_column: Int,
+	source_text: Option[String]
+}
+
+
+record CompilerDiagnosticLabel {
+	loc: CompilerDiagnosticLoc,
+	message: String,
+	style: CompilerDiagnosticLabelStyle
+}
+
+
+record CompilerDiagnostic {
+	severity: CompilerDiagnosticSeverity,
+	message: String,
+	labels: List[CompilerDiagnosticLabel],
+	notes: List[String],
+	help: Option[String]
+}
+
+
+pure func compiler_diagnostic_loc(
+	path: String,
+	line: Int,
+	column: Int,
+	end_line: Int,
+	end_column: Int,
+	source_text: Option[String],
+) -> CompilerDiagnosticLoc:
+	{
+		path = path,
+		line = line,
+		column = column,
+		end_line = end_line,
+		end_column = end_column,
+		source_text = source_text
+	}
+
+
+pure func compiler_diagnostic_loc_from_span(
+	source: CompilerSourceFile,
+	span: CompilerSourceSpan,
+) -> CompilerDiagnosticLoc:
+	compiler_diagnostic_loc(
+		span.path,
+		span.start_line,
+		span.start_column,
+		span.end_line,
+		span.end_column,
+		Some(source.text),
+	)
+
+
+pure func compiler_diagnostic_synthetic_loc(path: String) -> CompilerDiagnosticLoc:
+	compiler_diagnostic_loc(path, 0, 0, 0, 0, None)
+
+
+pure func compiler_diagnostic_label(
+	loc: CompilerDiagnosticLoc,
+	message: String,
+	style: CompilerDiagnosticLabelStyle,
+) -> CompilerDiagnosticLabel:
+	{
+		loc = loc,
+		message = message,
+		style = style
+	}
+
+
+pure func compiler_diagnostic_primary_label(loc: CompilerDiagnosticLoc) -> CompilerDiagnosticLabel:
+	compiler_diagnostic_label(loc, "", PrimaryDiagnosticLabel)
+
+
+pure func compiler_diagnostic(
+	severity: CompilerDiagnosticSeverity,
+	message: String,
+	labels: List[CompilerDiagnosticLabel],
+	notes: List[String],
+	help: Option[String],
+) -> CompilerDiagnostic:
+	{
+		severity = severity,
+		message = message,
+		labels = labels,
+		notes = notes,
+		help = help
+	}
+
+
+pure func compiler_diagnostic_error(
+	message: String,
+	label: CompilerDiagnosticLabel,
+	notes: List[String],
+	help: Option[String],
+) -> CompilerDiagnostic:
+	compiler_diagnostic(CompilerErrorSeverity, message, [label], notes, help)
+
+
+pure func compiler_diagnostic_severity_text(severity: CompilerDiagnosticSeverity) -> String:
+	match severity:
+		CompilerErrorSeverity:
+			"error"
+		CompilerWarningSeverity:
+			"warning"
+		CompilerNoteSeverity:
+			"note"
+
+
+private pure func diagnostic_line_text(text: String, line: Int) -> Option[String]:
+	if line <= 0:
+		None
+	else:
+		lines: List[String] = text.lines()
+		lines.get(line - 1)
+
+
+private pure func primary_label(
+	labels: List[CompilerDiagnosticLabel],
+) -> Option[CompilerDiagnosticLabel]:
+	var result: Option[CompilerDiagnosticLabel] = None
+	var i: Int = 0
+
+	while i < labels.length():
+		match labels.get(i):
+			Some(label):
+				match label.style:
+					PrimaryDiagnosticLabel:
+						result = Some(label)
+						break
+					SecondaryDiagnosticLabel:
+						void
+			None:
+				void
+
+		i += 1
+
+	result
+
+
+private pure func max_label_line(labels: List[CompilerDiagnosticLabel]) -> Int:
+	var max_line: Int = 0
+
+	for label in labels:
+		if label.loc.line > max_line:
+			max_line = label.loc.line
+
+		if label.loc.end_line > max_line:
+			max_line = label.loc.end_line
+
+	max_line
+
+
+private pure func gutter_width(labels: List[CompilerDiagnosticLabel]) -> Int:
+	width: Int = max_label_line(labels)
+		.to_string()
+		.length()
+
+	if width < 1:
+		1
+	else:
+		width
+
+
+private pure func line_number_text(line: Int, width: Int) -> String:
+	text: String = line.to_string()
+	pad_count: Int = width - text.length()
+
+	if pad_count <= 0:
+		text
+	else:
+		" ".repeat(pad_count) + text
+
+
+private pure func gutter_pad(width: Int) -> String:
+	" ".repeat(width)
+
+
+private pure func gutter_bar(width: Int) -> String:
+	" " + gutter_pad(width) + " |"
+
+
+private pure func underline_width(loc: CompilerDiagnosticLoc) -> Int:
+	if loc.end_line == loc.line and loc.end_column > loc.column:
+		loc.end_column - loc.column
+	else:
+		1
+
+
+private pure func underline_for_label(label: CompilerDiagnosticLabel) -> String:
+	match label.style:
+		PrimaryDiagnosticLabel:
+			"^".repeat(underline_width(label.loc))
+		SecondaryDiagnosticLabel:
+			"-".repeat(underline_width(label.loc))
+
+
+private pure func underline_padding(column: Int, source_line: String) -> String:
+	target: Int = if column <= 1:
+		0
+	else:
+		column - 1
+
+	var padding: String = string(target)
+	var i: Int = 0
+
+	while i < target and i < source_line.length():
+		match source_line.get(i):
+			Some('\t'):
+				padding = padding.append_char('\t')
+			Some(_):
+				padding = padding.append_char(' ')
+			None:
+				void
+
+		i += 1
+
+	while padding.length() < target:
+		padding = padding.append_char(' ')
+
+	padding
+
+
+private pure func render_message_header(
+	severity: CompilerDiagnosticSeverity,
+	message: String,
+) -> String:
+	severity_text: String = compiler_diagnostic_severity_text(severity)
+	lines: List[String] = message.split("\n")
+
+	if lines.length() == 0:
+		severity_text + ":"
+	else:
+		var text: String = severity_text + ": " + lines.get_or(0, "")
+		var i: Int = 1
+
+		while i < lines.length():
+			text = text + "\n    " + lines.get_or(i, "")
+			i += 1
+
+		text
+
+
+private pure func render_location_arrow(
+	width: Int,
+	label: Option[CompilerDiagnosticLabel],
+) -> String:
+	match label:
+		Some(lbl):
+			prefix: String = " " + gutter_pad(width) + "--> "
+
+			if lbl.loc.line > 0:
+				prefix + lbl.loc.path + ":" + lbl.loc.line.to_string() + ":" + lbl.loc.column.to_string()
+			else:
+				prefix + lbl.loc.path
+		None:
+			""
+
+
+private pure func source_line_for_label(label: CompilerDiagnosticLabel) -> Option[String]:
+	match label.loc.source_text:
+		Some(text):
+			diagnostic_line_text(text, label.loc.line)
+		None:
+			None
+
+
+private pure func label_message_suffix(label: CompilerDiagnosticLabel) -> String:
+	if label.message.length() == 0:
+		""
+	else:
+		" " + label.message
+
+
+private pure func render_label_line(width: Int, label: CompilerDiagnosticLabel) -> Option[String]:
+	src_line ?= source_line_for_label(label)
+
+	line_text: String = " " + line_number_text(label.loc.line, width) + " | " + src_line
+	underline_prefix: String = " " + gutter_pad(width) + " |"
+	underline: String = underline_prefix + underline_padding(
+		label.loc.column,
+		src_line,
+	) + underline_for_label(label) + label_message_suffix(label)
+
+	Some(line_text + "\n" + underline)
+
+
+private pure func render_label_lines(width: Int, labels: List[CompilerDiagnosticLabel]) -> String:
+	var text: String = ""
+	var has_rendered: Bool = False
+
+	for label in labels:
+		match render_label_line(width, label):
+			Some(line_text):
+				if has_rendered:
+					text += "\n"
+
+				text += line_text
+				has_rendered = True
+			None:
+				void
+
+	text
+
+
+private pure func render_notes_and_help(
+	width: Int,
+	notes: List[String],
+	help: Option[String],
+) -> String:
+	var text: String = ""
+
+	for note in notes:
+		text = text + "\n " + gutter_pad(width) + " = note: " + note
+
+	match help:
+		Some(help_text):
+			text + "\n " + gutter_pad(width) + " = help: " + help_text
+		None:
+			text
+
+
+pure func compiler_diagnostic_render(diagnostic: CompilerDiagnostic) -> String:
+	width: Int = gutter_width(diagnostic.labels)
+	header: String = render_message_header(diagnostic.severity, diagnostic.message)
+	arrow: String = render_location_arrow(width, primary_label(diagnostic.labels))
+	label_lines: String = render_label_lines(width, diagnostic.labels)
+	footer: String = render_notes_and_help(width, diagnostic.notes, diagnostic.help)
+
+	var rendered: String = header
+
+	if arrow.length() > 0:
+		rendered = rendered + "\n" + arrow
+
+	if label_lines.length() > 0:
+		bar: String = gutter_bar(width)
+		rendered = rendered + "\n" + bar + "\n" + label_lines + "\n" + bar
+
+	if (
+		label_lines.length() == 0
+		and footer.length() == 0
+		and arrow.length() > 0
+	):
+		rendered + "\n"
+	else:
+		rendered + footer

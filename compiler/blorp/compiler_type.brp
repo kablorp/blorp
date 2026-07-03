@@ -1,0 +1,1062 @@
+enum CompilerDimOp:
+	CompilerDimAdd
+	CompilerDimSubtract
+	CompilerDimMultiply
+	CompilerDimDivide
+
+
+union CompilerType:
+	CompilerNamedType(String, List[CompilerType])
+	CompilerArrayType(CompilerType, List[CompilerType])
+	CompilerFunctionType(Bool, List[CompilerType], CompilerType)
+	CompilerTypeVar(String)
+	CompilerConstIntType(Int)
+	CompilerTupleType(List[CompilerType])
+	CompilerSelfType
+	CompilerVarDimsType(String)
+	CompilerRangeType(CompilerType)
+	CompilerDimOpType(CompilerDimOp, CompilerType, CompilerType)
+	CompilerMetaType(Int)
+
+
+record CompilerTypeSubstEntry {
+	var_name: String,
+	concrete_type: CompilerType
+}
+
+
+TYPE_NAME_INT: String = "Int"
+
+TYPE_NAME_FLOAT: String = "Float"
+
+TYPE_NAME_STRING: String = "String"
+
+TYPE_NAME_BOOL: String = "Bool"
+
+TYPE_NAME_CHAR: String = "Char"
+
+TYPE_NAME_VOID: String = "Void"
+
+TYPE_NAME_TENSOR: String = "Tensor"
+
+TYPE_NAME_VECTOR: String = "Vector"
+
+TYPE_NAME_MATRIX: String = "Matrix"
+
+TYPE_NAME_TUPLE: String = "Tuple"
+
+CANONICAL_MODULE_TYPE_SEPARATOR: String = "::"
+
+
+pure func compiler_named_type(name: String, args: List[CompilerType]) -> CompilerType:
+	CompilerNamedType(name, args)
+
+
+pure func compiler_array_type(element: CompilerType, dims: List[CompilerType]) -> CompilerType:
+	if dims.length() == 0:
+		element
+	else:
+		CompilerArrayType(element, dims)
+
+
+pure func compiler_function_type(
+	is_pure: Bool,
+	params: List[CompilerType],
+	return_type: CompilerType,
+) -> CompilerType:
+	CompilerFunctionType(is_pure, params, return_type)
+
+
+pure func compiler_type_int() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_INT, [])
+
+
+pure func compiler_type_float() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_FLOAT, [])
+
+
+pure func compiler_type_string() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_STRING, [])
+
+
+pure func compiler_type_bool() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_BOOL, [])
+
+
+pure func compiler_type_char() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_CHAR, [])
+
+
+pure func compiler_type_void() -> CompilerType:
+	CompilerNamedType(TYPE_NAME_VOID, [])
+
+
+pure func compiler_type_list(element: CompilerType) -> CompilerType:
+	CompilerNamedType("List", [element])
+
+
+pure func compiler_normalize_type_name(name: String) -> String:
+	if name == TYPE_NAME_VECTOR or name == TYPE_NAME_MATRIX:
+		TYPE_NAME_TENSOR
+	else:
+		name
+
+
+pure func compiler_is_dim_var_name(name: String) -> Bool:
+	name.length() > 0 and name.get_or(0, ' ') == '#'
+
+
+pure func compiler_strip_type_param_bounds(name: String) -> String:
+	bounds_index: Int = name.raw_index_of(":")
+
+	if bounds_index < 0:
+		name
+	else:
+		name.substring(0, bounds_index)
+
+
+pure func compiler_is_legacy_single_letter_type_param(name: String) -> Bool:
+	if name.length() != 1:
+		False
+	else:
+		ch: Char = name.get_or(0, ' ')
+		ch >= 'A' and ch <= 'Z'
+
+
+pure func compiler_is_type_param_name(name: String) -> Bool:
+	(
+		name.raw_index_of(":") >= 0
+		or compiler_is_legacy_single_letter_type_param(compiler_strip_type_param_bounds(name))
+	)
+
+
+pure func compiler_type_subst_entry(
+	var_name: String,
+	concrete_type: CompilerType,
+) -> CompilerTypeSubstEntry:
+	{
+		var_name = var_name,
+		concrete_type = concrete_type
+	}
+
+
+private pure func compiler_lookup_subst_key(
+	key: String,
+	subst: List[CompilerTypeSubstEntry],
+) -> Option[CompilerType]:
+	var index: Int = 0
+	var result: Option[CompilerType] = None
+
+	while index < subst.length() and result == None:
+		match subst.get(index):
+			Some(entry):
+				if entry.var_name == key:
+					result = Some(entry.concrete_type)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+pure func compiler_lookup_subst(
+	name: String,
+	subst: List[CompilerTypeSubstEntry],
+) -> Option[CompilerType]:
+	match compiler_lookup_subst_key(name, subst):
+		Some(replacement):
+			Some(replacement)
+		None:
+			stripped: String = compiler_strip_type_param_bounds(name)
+
+			if stripped != name:
+				compiler_lookup_subst_key(stripped, subst)
+			else:
+				None
+
+
+private pure func split_canonical_module_type_name(name: String) -> Option[(String, String)]:
+	index: Int = name.raw_index_of(CANONICAL_MODULE_TYPE_SEPARATOR)
+
+	if index < 0:
+		None
+	else:
+		module_path: String = name.substring(0, index)
+		type_name: String = name.substring(
+			index + CANONICAL_MODULE_TYPE_SEPARATOR.length(),
+			name.length() - index - CANONICAL_MODULE_TYPE_SEPARATOR.length(),
+		)
+		Some((module_path, type_name))
+
+
+pure func compiler_canonical_module_type_name(module_path: String, type_name: String) -> String:
+	module_path + CANONICAL_MODULE_TYPE_SEPARATOR + type_name
+
+
+pure func compiler_display_type_name(name: String) -> String:
+	match split_canonical_module_type_name(name):
+		Some((module_path, type_name)):
+			module_path + "." + type_name
+		None:
+			name
+
+
+private pure func compiler_dim_op_to_string(op: CompilerDimOp) -> String:
+	match op:
+		CompilerDimAdd:
+			" + "
+		CompilerDimSubtract:
+			" - "
+		CompilerDimMultiply:
+			" * "
+		CompilerDimDivide:
+			" / "
+
+
+private pure func compiler_type_list_to_string(types: List[CompilerType]) -> String:
+	types
+		.map(compiler_type_to_string)
+		.join(", ")
+
+
+pure func compiler_type_to_string(typ: CompilerType) -> String:
+	match typ:
+		CompilerNamedType(name, args):
+			if args.length() == 0:
+				compiler_display_type_name(name)
+			else if name == TYPE_NAME_TUPLE and args.length() >= 2:
+				"(" + compiler_type_list_to_string(args) + ")"
+			else:
+				compiler_display_type_name(name) + "[" + compiler_type_list_to_string(args) + "]"
+		CompilerArrayType(element, dims):
+			element_text: String = match element:
+				CompilerFunctionType(_, _, _):
+					"(" + compiler_type_to_string(element) + ")"
+				_:
+					compiler_type_to_string(element)
+
+			element_text + "[" + compiler_type_list_to_string(dims) + "]"
+		CompilerFunctionType(is_pure, params, return_type):
+			prefix: String = if is_pure:
+				"pure "
+			else:
+				""
+
+			params_text: String = compiler_type_list_to_string(params)
+			return_text: String = compiler_type_to_string(return_type)
+
+			prefix + "(" + params_text + ") -> " + return_text
+		CompilerTypeVar(name):
+			name
+		CompilerConstIntType(value):
+			"#" + value.to_string()
+		CompilerTupleType(elements):
+			"(" + compiler_type_list_to_string(elements) + ")"
+		CompilerSelfType:
+			"Self"
+		CompilerVarDimsType(name):
+			name + "..."
+		CompilerRangeType(inner):
+			".." + compiler_type_to_string(inner)
+		CompilerDimOpType(op, left, right):
+			left_text: String = compiler_type_to_string(left)
+			right_text: String = compiler_type_to_string(right)
+
+			left_text + compiler_dim_op_to_string(op) + right_text
+		CompilerMetaType(id):
+			"?m" + id.to_string()
+
+
+private pure func compiler_type_lists_equal(
+	left: List[CompilerType],
+	right: List[CompilerType],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var equal: Bool = True
+
+		while index < left.length() and equal:
+			match (left.get(index), right.get(index)):
+				(Some(left_item), Some(right_item)):
+					equal = compiler_types_equal(left_item, right_item)
+				_:
+					equal = False
+
+			index += 1
+
+		equal
+
+
+pure func compiler_array_type_parts(
+	typ: CompilerType,
+) -> Option[(CompilerType, List[CompilerType])]:
+	match typ:
+		CompilerArrayType(element, dims):
+			Some((element, dims))
+		CompilerNamedType(name, args):
+			if (
+				(name == TYPE_NAME_TENSOR or name == TYPE_NAME_VECTOR or name == TYPE_NAME_MATRIX)
+				and args.length() >= 2
+			):
+				match args.get(0):
+					Some(element):
+						var dims: List[CompilerType] = []
+						var index: Int = 1
+
+						while index < args.length():
+							match args.get(index):
+								Some(dim):
+									dims = dims.append(dim)
+								None:
+									void
+
+							index += 1
+
+						Some((element, dims))
+					None:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func compiler_array_types_equal(left: CompilerType, right: CompilerType) -> Bool:
+	match (compiler_array_type_parts(left), compiler_array_type_parts(right)):
+		(Some(left_parts), Some(right_parts)):
+			(
+				compiler_types_equal(left_parts[0], right_parts[0])
+				and compiler_type_lists_equal(left_parts[1], right_parts[1])
+			)
+		_:
+			False
+
+
+private pure func compiler_is_tensor_family_name(name: String) -> Bool:
+	name == TYPE_NAME_TENSOR or name == TYPE_NAME_VECTOR or name == TYPE_NAME_MATRIX
+
+
+private pure func compiler_zero_dim_tensor_element(typ: CompilerType) -> Option[CompilerType]:
+	match typ:
+		CompilerNamedType(name, args):
+			if compiler_is_tensor_family_name(name) and args.length() == 1:
+				args.get(0)
+			else:
+				None
+		_:
+			None
+
+
+pure func compiler_types_equal(left: CompilerType, right: CompilerType) -> Bool:
+	if compiler_array_types_equal(left, right):
+		True
+	else:
+		match compiler_zero_dim_tensor_element(left):
+			Some(element):
+				compiler_types_equal(element, right)
+			None:
+				match compiler_zero_dim_tensor_element(right):
+					Some(element):
+						compiler_types_equal(left, element)
+					None:
+						match left:
+							CompilerNamedType(left_name, left_args):
+								match right:
+									CompilerNamedType(right_name, right_args):
+										(
+											compiler_normalize_type_name(
+												left_name,
+											) == compiler_normalize_type_name(right_name)
+											and compiler_type_lists_equal(left_args, right_args)
+										)
+									CompilerTupleType(right_elements):
+										(
+											left_name == TYPE_NAME_TUPLE
+											and compiler_type_lists_equal(left_args, right_elements)
+										)
+									_:
+										False
+							CompilerTypeVar(left_name):
+								match right:
+									CompilerTypeVar(right_name):
+										left_name == right_name
+									_:
+										False
+							CompilerConstIntType(left_value):
+								match right:
+									CompilerConstIntType(right_value):
+										left_value == right_value
+									_:
+										False
+							CompilerTupleType(left_elements):
+								match right:
+									CompilerTupleType(right_elements):
+										compiler_type_lists_equal(left_elements, right_elements)
+									CompilerNamedType(right_name, right_elements):
+										(
+											right_name == TYPE_NAME_TUPLE
+											and compiler_type_lists_equal(
+												left_elements,
+												right_elements,
+											)
+										)
+									_:
+										False
+							CompilerFunctionType(left_pure, left_params, left_return):
+								match right:
+									CompilerFunctionType(right_pure, right_params, right_return):
+										(
+											left_pure == right_pure
+											and compiler_type_lists_equal(left_params, right_params)
+											and compiler_types_equal(left_return, right_return)
+										)
+									_:
+										False
+							CompilerSelfType:
+								match right:
+									CompilerSelfType:
+										True
+									_:
+										False
+							CompilerVarDimsType(left_name):
+								match right:
+									CompilerVarDimsType(right_name):
+										left_name == right_name
+									_:
+										False
+							CompilerRangeType(left_inner):
+								match right:
+									CompilerRangeType(right_inner):
+										compiler_types_equal(left_inner, right_inner)
+									_:
+										False
+							CompilerDimOpType(left_op, left_a, left_b):
+								match right:
+									CompilerDimOpType(right_op, right_a, right_b):
+										(
+											left_op == right_op
+											and compiler_types_equal(left_a, right_a)
+											and compiler_types_equal(left_b, right_b)
+										)
+									_:
+										False
+							CompilerMetaType(left_id):
+								match right:
+									CompilerMetaType(right_id):
+										left_id == right_id
+									_:
+										False
+							CompilerArrayType(_, _):
+								False
+
+
+private pure func compiler_type_list_occurs_in(var_name: String, types: List[CompilerType]) -> Bool:
+	var index: Int = 0
+	var found: Bool = False
+
+	while index < types.length() and not found:
+		match types.get(index):
+			Some(typ):
+				found = compiler_occurs_in(var_name, typ)
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+pure func compiler_occurs_in(var_name: String, typ: CompilerType) -> Bool:
+	stripped_var: String = compiler_strip_type_param_bounds(var_name)
+
+	match typ:
+		CompilerTypeVar(name):
+			name == var_name or compiler_strip_type_param_bounds(name) == stripped_var
+		CompilerNamedType(name, args):
+			if args.length() == 0:
+				name == var_name or compiler_strip_type_param_bounds(name) == stripped_var
+			else:
+				compiler_type_list_occurs_in(var_name, args)
+		CompilerArrayType(element, dims):
+			compiler_occurs_in(var_name, element) or compiler_type_list_occurs_in(var_name, dims)
+		CompilerFunctionType(_, params, return_type):
+			(
+				compiler_type_list_occurs_in(var_name, params)
+				or compiler_occurs_in(var_name, return_type)
+			)
+		CompilerTupleType(elements):
+			compiler_type_list_occurs_in(var_name, elements)
+		CompilerRangeType(inner):
+			compiler_occurs_in(var_name, inner)
+		CompilerDimOpType(_, left, right):
+			compiler_occurs_in(var_name, left) or compiler_occurs_in(var_name, right)
+		_:
+			False
+
+
+private pure func compiler_normalize_dim_op(
+	op: CompilerDimOp,
+	left: CompilerType,
+	right: CompilerType,
+) -> CompilerType:
+	match (left, right):
+		(CompilerConstIntType(left_value), CompilerConstIntType(right_value)):
+			match op:
+				CompilerDimAdd:
+					CompilerConstIntType(left_value + right_value)
+				CompilerDimSubtract:
+					CompilerConstIntType(left_value - right_value)
+				CompilerDimMultiply:
+					CompilerConstIntType(left_value * right_value)
+				CompilerDimDivide:
+					if right_value > 0 and left_value % right_value == 0:
+						CompilerConstIntType(left_value / right_value)
+					else:
+						CompilerDimOpType(op, left, right)
+		_:
+			match op:
+				CompilerDimAdd:
+					if compiler_types_equal(left, CompilerConstIntType(0)):
+						right
+					else if compiler_types_equal(right, CompilerConstIntType(0)):
+						left
+					else:
+						CompilerDimOpType(op, left, right)
+				CompilerDimSubtract:
+					if compiler_types_equal(left, right):
+						CompilerConstIntType(0)
+					else if compiler_types_equal(right, CompilerConstIntType(0)):
+						left
+					else:
+						CompilerDimOpType(op, left, right)
+				CompilerDimMultiply:
+					if (
+						compiler_types_equal(left, CompilerConstIntType(0))
+						or compiler_types_equal(right, CompilerConstIntType(0))
+					):
+						CompilerConstIntType(0)
+					else if compiler_types_equal(left, CompilerConstIntType(1)):
+						right
+					else if compiler_types_equal(right, CompilerConstIntType(1)):
+						left
+					else:
+						CompilerDimOpType(op, left, right)
+				CompilerDimDivide:
+					if compiler_types_equal(left, CompilerConstIntType(0)):
+						CompilerConstIntType(0)
+					else if compiler_types_equal(right, CompilerConstIntType(1)):
+						left
+					else:
+						CompilerDimOpType(op, left, right)
+
+
+pure func compiler_normalize_dim(typ: CompilerType) -> CompilerType:
+	match typ:
+		CompilerDimOpType(op, left, right):
+			compiler_normalize_dim_op(
+				op,
+				compiler_normalize_dim(left),
+				compiler_normalize_dim(right),
+			)
+		_:
+			typ
+
+
+private pure func compiler_find_non_positive_dim_in_list(types: List[CompilerType]) -> Option[Int]:
+	var index: Int = 0
+	var result: Option[Int] = None
+
+	while index < types.length() and result == None:
+		match types.get(index):
+			Some(typ):
+				result = compiler_find_non_positive_dim(typ)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+pure func compiler_find_non_positive_dim(typ: CompilerType) -> Option[Int]:
+	match compiler_normalize_dim(typ):
+		CompilerConstIntType(value):
+			if value <= 0:
+				Some(value)
+			else:
+				None
+		CompilerNamedType(_, args):
+			compiler_find_non_positive_dim_in_list(args)
+		CompilerArrayType(element, dims):
+			match compiler_find_non_positive_dim(element):
+				Some(value):
+					Some(value)
+				None:
+					compiler_find_non_positive_dim_in_list(dims)
+		CompilerFunctionType(_, params, return_type):
+			match compiler_find_non_positive_dim_in_list(params):
+				Some(value):
+					Some(value)
+				None:
+					compiler_find_non_positive_dim(return_type)
+		CompilerTupleType(elements):
+			compiler_find_non_positive_dim_in_list(elements)
+		CompilerRangeType(inner):
+			compiler_find_non_positive_dim(inner)
+		CompilerDimOpType(_, left, right):
+			match compiler_find_non_positive_dim(left):
+				Some(value):
+					Some(value)
+				None:
+					compiler_find_non_positive_dim(right)
+		_:
+			None
+
+
+private pure func compiler_visit_subst_name(visited: List[String], name: String) -> List[String]:
+	stripped: String = compiler_strip_type_param_bounds(name)
+	with_name: List[String] = visited.append(name)
+
+	if stripped != name:
+		with_name.append(stripped)
+	else:
+		with_name
+
+
+private pure func compiler_subst_visited_contains(visited: List[String], name: String) -> Bool:
+	stripped: String = compiler_strip_type_param_bounds(name)
+	visited.contains(name) or visited.contains(stripped)
+
+
+private pure func compiler_try_apply_subst_name(
+	subst: List[CompilerTypeSubstEntry],
+	visited: List[String],
+	name: String,
+	original: CompilerType,
+) -> CompilerType:
+	if compiler_subst_visited_contains(visited, name):
+		original
+	else:
+		match compiler_lookup_subst(name, subst):
+			Some(replacement):
+				stripped: String = compiler_strip_type_param_bounds(name)
+
+				if (
+					compiler_occurs_in(name, replacement)
+					or compiler_occurs_in(stripped, replacement)
+				):
+					replacement
+				else:
+					compiler_apply_subst_with_visited(
+						subst,
+						compiler_visit_subst_name(visited, name),
+						replacement,
+					)
+			None:
+				original
+
+
+private pure func compiler_apply_subst_list(
+	subst: List[CompilerTypeSubstEntry],
+	visited: List[String],
+	types: List[CompilerType],
+) -> List[CompilerType]:
+	var result: List[CompilerType] = []
+
+	for typ in types:
+		result = result.append(compiler_apply_subst_with_visited(subst, visited, typ))
+
+	result
+
+
+private pure func compiler_apply_subst_with_visited(
+	subst: List[CompilerTypeSubstEntry],
+	visited: List[String],
+	typ: CompilerType,
+) -> CompilerType:
+	match typ:
+		CompilerTypeVar(name):
+			compiler_try_apply_subst_name(subst, visited, name, typ)
+		CompilerNamedType(name, args):
+			if args.length() == 0:
+				compiler_try_apply_subst_name(subst, visited, name, typ)
+			else:
+				CompilerNamedType(
+					name,
+					compiler_apply_subst_list(subst, visited, args),
+				)
+		CompilerArrayType(element, dims):
+			CompilerArrayType(
+				compiler_apply_subst_with_visited(subst, visited, element),
+				compiler_apply_subst_list(subst, visited, dims),
+			)
+		CompilerFunctionType(is_pure, params, return_type):
+			CompilerFunctionType(
+				is_pure,
+				compiler_apply_subst_list(subst, visited, params),
+				compiler_apply_subst_with_visited(subst, visited, return_type),
+			)
+		CompilerTupleType(elements):
+			CompilerTupleType(compiler_apply_subst_list(subst, visited, elements))
+		CompilerSelfType:
+			compiler_try_apply_subst_name(subst, visited, "Self", typ)
+		CompilerRangeType(inner):
+			CompilerRangeType(compiler_apply_subst_with_visited(subst, visited, inner))
+		CompilerDimOpType(op, left, right):
+			compiler_normalize_dim(
+				CompilerDimOpType(
+					op,
+					compiler_apply_subst_with_visited(subst, visited, left),
+					compiler_apply_subst_with_visited(subst, visited, right),
+				),
+			)
+		_:
+			typ
+
+
+pure func compiler_apply_subst(
+	subst: List[CompilerTypeSubstEntry],
+	typ: CompilerType,
+) -> CompilerType:
+	compiler_apply_subst_with_visited(subst, [], typ)
+
+
+private pure func compiler_is_signed_integer_type_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "Int128"
+	)
+
+
+private pure func compiler_is_unsigned_integer_type_name(name: String) -> Bool:
+	name == "UInt8" or name == "UInt16" or name == "UInt32" or name == "UInt64" or name == "UInt128"
+
+
+private pure func compiler_is_float_type_name(name: String) -> Bool:
+	name == "Float" or name == "Float32" or name == "Float16"
+
+
+private pure func compiler_named_type_name(typ: CompilerType) -> Option[String]:
+	match typ:
+		CompilerNamedType(name, args):
+			if args.length() == 0:
+				Some(name)
+			else:
+				None
+		_:
+			None
+
+
+pure func compiler_is_any_integer_type(typ: CompilerType) -> Bool:
+	match compiler_named_type_name(typ):
+		Some(name):
+			(
+				compiler_is_signed_integer_type_name(name)
+				or compiler_is_unsigned_integer_type_name(name)
+			)
+		None:
+			False
+
+
+pure func compiler_is_signed_integer_type(typ: CompilerType) -> Bool:
+	match compiler_named_type_name(typ):
+		Some(name):
+			compiler_is_signed_integer_type_name(name)
+		None:
+			False
+
+
+pure func compiler_is_unsigned_integer_type(typ: CompilerType) -> Bool:
+	match compiler_named_type_name(typ):
+		Some(name):
+			compiler_is_unsigned_integer_type_name(name)
+		None:
+			False
+
+
+pure func compiler_is_any_float_type(typ: CompilerType) -> Bool:
+	match compiler_named_type_name(typ):
+		Some(name):
+			compiler_is_float_type_name(name)
+		None:
+			False
+
+
+private pure func compiler_type_params_include_dim_name(
+	type_params: List[String],
+	name: String,
+) -> Bool:
+	var index: Int = 0
+	var found: Bool = False
+
+	while index < type_params.length() and not found:
+		match type_params.get(index):
+			Some(param):
+				stripped: String = compiler_strip_type_param_bounds(param)
+				found = stripped == name and compiler_is_dim_var_name(stripped)
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+pure func compiler_is_dim_type_with_params(type_params: List[String], typ: CompilerType) -> Bool:
+	match typ:
+		CompilerConstIntType(_):
+			True
+		CompilerTypeVar(name):
+			(
+				compiler_is_dim_var_name(name)
+				or compiler_type_params_include_dim_name(type_params, name)
+			)
+		CompilerNamedType(name, args):
+			(
+				args.length() == 0
+				and ((
+					compiler_is_dim_var_name(name)
+					or compiler_type_params_include_dim_name(type_params, name)
+				))
+			)
+		CompilerVarDimsType(_):
+			True
+		CompilerRangeType(_):
+			True
+		CompilerDimOpType(_, left, right):
+			(
+				compiler_is_dim_type_with_params(type_params, left)
+				and compiler_is_dim_type_with_params(type_params, right)
+			)
+		_:
+			False
+
+
+pure func compiler_is_dim_type(typ: CompilerType) -> Bool:
+	compiler_is_dim_type_with_params([], typ)
+
+
+private pure func compiler_collect_type_vars_from_list(types: List[CompilerType]) -> List[String]:
+	var result: List[String] = []
+
+	for typ in types:
+		result = result.concat(compiler_collect_type_vars(typ))
+
+	result
+
+
+pure func compiler_collect_type_vars(typ: CompilerType) -> List[String]:
+	match typ:
+		CompilerTypeVar(name):
+			[name]
+		CompilerVarDimsType(name):
+			[name]
+		CompilerNamedType(name, args):
+			if args.length() == 0 and compiler_is_legacy_single_letter_type_param(name):
+				[name]
+			else:
+				compiler_collect_type_vars_from_list(args)
+		CompilerArrayType(element, dims):
+			compiler_collect_type_vars(element).concat(compiler_collect_type_vars_from_list(dims))
+		CompilerFunctionType(_, params, return_type):
+			compiler_collect_type_vars_from_list(
+				params,
+			).concat(compiler_collect_type_vars(return_type))
+		CompilerTupleType(elements):
+			compiler_collect_type_vars_from_list(elements)
+		CompilerRangeType(inner):
+			compiler_collect_type_vars(inner)
+		CompilerDimOpType(_, left, right):
+			compiler_collect_type_vars(left).concat(compiler_collect_type_vars(right))
+		_:
+			[]
+
+
+pure func compiler_is_scalar_int_value_type(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerRangeType(_):
+			True
+		CompilerConstIntType(_):
+			True
+		CompilerDimOpType(_, _, _):
+			True
+		CompilerTypeVar(name):
+			compiler_is_dim_var_name(name)
+		CompilerNamedType(name, args):
+			args.length() == 0 and compiler_is_dim_var_name(name)
+		_:
+			False
+
+
+pure func compiler_scalar_int_value_type(typ: CompilerType) -> CompilerType:
+	if compiler_is_scalar_int_value_type(typ):
+		compiler_type_int()
+	else:
+		typ
+
+
+private pure func compiler_is_scalar_array_element_name(name: String) -> Bool:
+	(
+		compiler_is_signed_integer_type_name(name)
+		or compiler_is_unsigned_integer_type_name(name)
+		or compiler_is_float_type_name(name)
+		or name == "Bool"
+		or name == "Char"
+		or name == "String"
+		or name == "Fixed"
+	)
+
+
+private pure func compiler_is_variadic_dim(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerVarDimsType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_first_invalid_dim(
+	type_params: List[String],
+	dims: List[CompilerType],
+) -> Option[CompilerType]:
+	var index: Int = 0
+	var result: Option[CompilerType] = None
+
+	while index < dims.length() and result == None:
+		match dims.get(index):
+			Some(dim):
+				if not compiler_is_dim_type_with_params(type_params, dim):
+					result = Some(dim)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+private pure func compiler_variadic_dim_count(dims: List[CompilerType]) -> Int:
+	var count: Int = 0
+
+	for dim in dims:
+		if compiler_is_variadic_dim(dim):
+			count += 1
+
+	count
+
+
+private pure func compiler_has_variadic_dim(dims: List[CompilerType]) -> Bool:
+	compiler_variadic_dim_count(dims) > 0
+
+
+private pure func compiler_last_dim_is_variadic(dims: List[CompilerType]) -> Bool:
+	if dims.length() == 0:
+		False
+	else:
+		match dims.get(dims.length() - 1):
+			Some(dim):
+				compiler_is_variadic_dim(dim)
+			None:
+				False
+
+
+private pure func compiler_dimension_error_prefix(type_name: String) -> String:
+	if type_name.length() == 0:
+		"Array"
+	else:
+		type_name
+
+
+private pure func compiler_invalid_dim_message(type_name: String, bad: CompilerType) -> String:
+	compiler_dimension_error_prefix(
+		type_name,
+	) + " dimension argument must be a dimension type (#N, #3, #Ds...), got " + compiler_type_to_string(
+		bad,
+	)
+
+
+private pure func compiler_validate_variadic_dims(
+	type_name: String,
+	dims: List[CompilerType],
+) -> Option[String]:
+	if (
+		(type_name == TYPE_NAME_VECTOR or type_name == TYPE_NAME_MATRIX)
+		and compiler_has_variadic_dim(dims)
+	):
+		Some(type_name + " does not support variadic dimensions (#N...). Use T[#Ds...] instead")
+	else if compiler_variadic_dim_count(dims) > 1:
+		if type_name.length() == 0:
+			Some((
+					"Array type cannot have multiple variadic dims - use a single #N... as the last "
+					+ "dimension"
+				))
+		else:
+			Some(
+				type_name + " cannot have multiple variadic dims - use a single #N... as the last dimension",
+			)
+	else if compiler_has_variadic_dim(dims) and not compiler_last_dim_is_variadic(dims):
+		if type_name.length() == 0:
+			Some("Array type: variadic dimension (#N...) must be the last dimension argument")
+		else:
+			Some(type_name + ": variadic dimension (#N...) must be the last dimension argument")
+	else:
+		None
+
+
+private pure func compiler_validate_dim_list(
+	type_params: List[String],
+	type_name: String,
+	dims: List[CompilerType],
+) -> Option[String]:
+	match compiler_first_invalid_dim(type_params, dims):
+		Some(bad):
+			Some(compiler_invalid_dim_message(type_name, bad))
+		None:
+			compiler_validate_variadic_dims(type_name, dims)
+
+
+pure func compiler_validate_array_dims(
+	type_params: List[String],
+	typ: CompilerType,
+) -> Option[String]:
+	match compiler_find_non_positive_dim(typ):
+		Some(value):
+			Some(
+				"Dimension arithmetic produces non-positive result: " + value.to_string() + " (dimensions must be >= 1)",
+			)
+		None:
+			match typ:
+				CompilerNamedType(name, args):
+					if compiler_is_scalar_array_element_name(name) and args.length() > 0:
+						match args.get(0):
+							Some(bad):
+								Some(compiler_invalid_dim_message("", bad))
+							None:
+								None
+					else if compiler_is_tensor_family_name(name) and args.length() > 1:
+						var dims: List[CompilerType] = []
+						var index: Int = 1
+
+						while index < args.length():
+							match args.get(index):
+								Some(dim):
+									dims = dims.append(dim)
+								None:
+									void
+
+							index += 1
+
+						compiler_validate_dim_list(type_params, name, dims)
+					else:
+						None
+				CompilerArrayType(_, dims):
+					compiler_validate_dim_list(type_params, "", dims)
+				_:
+					None
