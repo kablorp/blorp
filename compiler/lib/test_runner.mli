@@ -46,8 +46,9 @@ val run_tests :
 (** Run tests: dispatches to sequential or parallel based on job count *)
 
 val collect_test_files : string list -> string list
-(** Collect valid .brp test files from one or more file/directory roots,
-    preserving root order. *)
+(** Collect runnable .brp test files from one or more file/directory roots,
+    preserving root order. Runnable files declare [tests: TestSuite] or
+    doctests; ordinary programs with [func main] are not tests. *)
 
 val run_tests_paths :
   ?profile:bool ->
