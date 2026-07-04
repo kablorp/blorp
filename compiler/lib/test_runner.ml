@@ -942,6 +942,12 @@ let path_under root path =
 
 let process_isolated_suite_roots =
   [
+    (* This Blorp compiler suite imports compiler_infer as part of second-pass
+       body checking. When the generated run-all harness imports it before the
+       compiler_infer suite, the current module-init path can exit before
+       main. Keep this file out of run-all batching until that harness/module
+       initialization issue is fixed. *)
+    "compiler/blorp/tests/test_compiler_typecheck_decl.brp";
     "tests/test_blorp/concurrency";
     "tests/test_blorp/memory";
     "tests/test_blorp/sys";

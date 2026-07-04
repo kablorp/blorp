@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-03.
+Status checked against code on 2026-07-04.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -913,30 +913,107 @@ Status: in progress with the expression-inference substrate in place.
 `compiler/blorp/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
 primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
-record literals, record/tuple field access, ranges, `if`, `while`, simple
-`for`, and `break`/`continue` loop-context checks. The current slices preserve
+basic vector/tensor literals, record literals, record updates, record/tuple
+field access, typed string interpolation parts, lambdas with annotated or
+expected parameter/return types, tuple destructuring, ranges, `if`, conservative
+`match` inference for wildcard/name/literal patterns with Bool exhaustiveness,
+constant-index tuple and tensor/array subscript reads, full-rank constant-index
+tensor/array subscript assignment, `while`, simple `for`, tuple `for` binders,
+debug blocks, and
+`break`/`continue` loop-context checks. Plain assignment support covers discard
+assignment, implicit immutable local binding, mutable local reassignment,
+annotated literal initializer widening, and assignment-target diagnostics for
+immutable variables and non-variable symbols. Compound assignment desugars
+through plain assignment before typed lowering, preserving the same target
+diagnostics. Direct and subscript assignment now carry explicit local-vs-module
+target metadata from inference so later purity checks do not guess from source
+names. The current slices preserve
 typed-expression metadata for source type, semantic type, value type, widening
 decision, refinement proofs, and resolved-call placeholder data, and they
 include explicit copy boundaries for type and infer-context values to avoid
 generated ARC aliasing. Direct calls currently cover function-typed callees,
-exact arity, expected argument slots, value-type argument checking, and
-resolved callable metadata for named functions; overloads, UFCS,
-module-qualified calls, generic substitution, and trait-bound enforcement remain
-future call slices. Collection literals currently support expected-type empty
-lists/dicts, non-empty inference, collection-element widening for singleton
-integer literals, and explicit heterogeneous diagnostics. Record literals
-support expected-record checking, unique field-set inference, field-wise
-expected typing/widening, missing/unknown-field diagnostics, and ambiguous
-field-set diagnostics. Branch/control-flow coverage currently handles common
-const-int branch result typing, non-`Bool` conditions, value-producing `if`
-without `else`, simple loop-only `break`/`continue` validation, and simple
-name-bound `for` loops over `Range`, `List`, `Vector`, `Set`, `String`, and
-array/tensor-shaped values. The remaining checkpoint-6 slices still need to
-port generic calls, overloads, UFCS, module-qualified calls, record updates,
-structs/unions/enums/aliases/opaque conversions, sets/strings/tensors beyond
-loop element typing, tuple `for` binders, match inference, pattern binding,
-exhaustiveness, resources, concurrency, function/global body checking, purity,
-tailrec, and final zonking.
+exact arity, expected argument slots, value-type argument checking, resolved
+callable metadata for named functions, and simple type-variable substitution
+from argument types into return types. Bare overload-only calls now use Env's
+first-argument exact-type overload resolver, preserve selected callable
+id/purity metadata, and report a targeted no-match diagnostic. UFCS method
+syntax now uses Env's exact receiver-type UFCS index, prepends the typed
+receiver as the first call argument, and checks non-receiver arity.
+Module-qualified function calls through registered module aliases now resolve
+before ordinary field access and preserve the selected callable id/purity
+metadata. Full multi-argument overload ranking, pure/impure overload tiebreaks,
+generic UFCS receiver binding, module-qualified variables, module-qualified
+impl-method dispatch, generic trait-bound enforcement, generic dim constraints,
+and expected-return-only generic inference remain future call slices. Collection literals
+currently support expected-type empty lists/dicts/vector tensors, non-empty
+inference, collection-element widening for singleton integer literals, and
+explicit heterogeneous diagnostics. Vector/tensor literal support currently
+covers scalar elements and expected empty tensors; full nested tensor shape
+validation remains with the tensor/subscript slice. Record literals support expected-record checking,
+unique field-set inference, field-wise expected typing/widening,
+missing/unknown-field diagnostics, and ambiguous field-set diagnostics. Record
+updates preserve the base record type, validate update fields, and apply
+field-wise expected typing/widening. Branch/control-flow coverage currently
+handles common const-int branch result typing, non-`Bool` conditions,
+value-producing `if` without `else`, simple match branch convergence,
+Bool-match exhaustiveness, simple loop-only `break`/`continue`
+validation, name-bound `for` loops over `Range`, `List`, `Vector`, `Set`,
+`String`, and array/tensor-shaped values, and tuple binders over `Dict` and
+iterables of tuples. Tuple destructuring now validates RHS tuple shape, binds
+names into block scope, and rejects arity mismatches, non-tuple RHS values, and
+same-scope redeclarations. Subscript reads currently infer tuple literal-index
+access, first-dimension tensor/array peeling, full multi-index tensor element
+access, constant-index bounds diagnostics, and explicit List/String runtime
+indexing guidance. Subscript assignment currently covers mutable-root checking,
+full-rank tensor/array writes, constant-index bounds diagnostics, element type
+checking, and unsupported-target diagnostics; range-refined loop-variable
+proofs for reads and writes remain with the refinement/subscript slice.
+`compiler/blorp/compiler_typecheck_decl.brp` now has an explicit second-pass
+body-check API for source functions and global variables. Function bodies are
+checked with parameters in a scoped body environment and declared return types
+as expected value slots; value-producing functions without return annotations
+are rejected. The body checker also validates `main` signatures, accepting
+`func main(args: List[String]) -> Int`, omitted-return `Void`, and explicit
+`-> Void`, while preserving the OCaml diagnostics for wrong parameter, return,
+and arity shapes. Function symbol registration now deep-copies function type
+payloads before storing them in Env so compound signatures such as
+`List[String]` are owned by the Env entry. Global initializers are inferred
+against declared annotations when present, and unannotated global variables are
+re-registered with their inferred type after checking. Mutable global
+initializers also reject startup function calls and subscript expressions while
+skipping lambda bodies, matching the OCaml "work before main" boundary. This is
+intentionally still the conservative body-check slice: it does not yet port
+resource-body rules, trait/default method bodies, or final typed AST
+materialization.
+The conservative purity slice is also in place: typed expression traversal now
+collects resolved impure calls, pure source function body checking reports
+direct impure calls by callee name after expression inference, pure callback
+parameter types are rejected on pure functions, and pure lambdas nested inside
+any function body are checked independently of the outer function's purity.
+Impure lambda bodies are intentionally not traversed as pure work. Pure
+functions now also reject direct and subscript assignment to module-level
+mutable variables while allowing same-name local mutable shadowing. Lambda
+inference now rejects closure capture of mutable outer variables, including
+multiple captures and assignment to an outer mutable binding, while allowing
+immutable captures and parameter/local shadowing. Debug-block validation now
+rejects impure calls and assignment work inside inferred `debug:` bodies.
+Impl method body checking now reuses the same function-body, purity, debug,
+module-assignment, and tail-recursive validation path while deliberately
+skipping `main` entrypoint signature validation for methods.
+Tail-recursive validation is now also present for inferred
+source function bodies: the typed expression traversal detects recursive calls
+used outside tail position and reports `@tail_recursive` violations for
+operands/arguments/non-tail block items while allowing direct tail calls.
+Block expressions now preserve their final expression's full typed metadata,
+including target-typed value slots, so function body checks can accept a block
+ending in a target-widened literal. The
+remaining checkpoint-6 slices still need to port full overload ranking,
+generic UFCS receiver binding, module-qualified variable lookup and impl-method dispatch,
+structs/unions/enums/aliases/opaque conversions, set ambiguity, nested tensor
+shape checks, constructor/list/tuple/or pattern inference, full exhaustiveness,
+resources, concurrency, trait default-body synthesis/checking, generic impl
+method bounds, resource/stream closure-capture restrictions, and final
+zonking/typed AST construction.
 
 OCaml references:
 
@@ -1050,15 +1127,18 @@ Implementation steps:
   and `resolved_call` slots on every typed expression.
 - Keep `?=` propagation explicit and expression-oriented. Do not introduce
   exception-like control flow.
-- Port compile-time validation that rejects startup function calls outside
-  `main`.
+- Continue tightening compile-time validation that rejects startup work outside
+  `main`; mutable top-level initializer calls and subscript expressions are
+  already covered in the Blorp declaration checker.
 - Port error text and help for user-facing type errors before deleting OCaml
   diagnostics.
 
 Edge cases:
 
 - Local mutation is allowed in pure functions; impure calls are not.
-- Closures cannot capture mutable variables.
+- Closures cannot capture mutable variables; Blorp inference now covers this
+  for mutable bindings. Resource, resource-derived, stream, and source capture
+  restrictions remain in the resource slice.
 - Pure callbacks and impure callback parameters affect purity.
 - Exhaustiveness must cover wildcard, nullary constructors, list patterns,
   nested patterns, and unreachable cases.
