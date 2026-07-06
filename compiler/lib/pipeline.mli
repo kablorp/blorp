@@ -51,6 +51,27 @@ val typecheck_only_typed :
     validated typed program, so missing expression types and unfinalized
     inference metavariables are rejected at the typecheck boundary. *)
 
+val typecheck_only_reusing_session :
+  sess:Session.t ->
+  filename:string ->
+  source:string ->
+  ?debug:bool ->
+  unit ->
+  (Ast.program, Ast.compiler_error list) result
+(** Like [typecheck_only], but reuses [sess]'s validated parse cache across
+    calls while resetting all semantic compilation state before each run.
+    Intended for batch test/tool workers that typecheck many independent files
+    in one process. *)
+
+val typecheck_only_typed_reusing_session :
+  sess:Session.t ->
+  filename:string ->
+  source:string ->
+  ?debug:bool ->
+  unit ->
+  (Typed_ast.program, Ast.compiler_error list) result
+(** Typed-AST variant of [typecheck_only_reusing_session]. *)
+
 val typecheck_only_parsed :
   filename:string ->
   program:Ast.program ->

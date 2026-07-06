@@ -326,18 +326,30 @@ let labeled_relative_to ~root ~label path =
   let rel = relative_to ~root path in
   if label = "" then rel else Filename.concat label rel
 
-(* [compiler/blorp/compiler_format_projection.brp] imports self-hosted formatter
-   modules from [tools/formatter], so formatter source edits must also
-   invalidate the compiler bridge helper cache. *)
+(* Bridge helper binaries are compiled as normal Blorp programs. Their cache key
+   must include source roots that can affect generated C, not just the helper
+   entrypoint: std edits can change imported library code, and
+   [compiler/blorp/compiler_format_projection.brp] imports self-hosted formatter
+   modules from [tools/formatter]. *)
 let compiler_bridge_extra_source_roots source_root =
   let compiler_dir = Filename.dirname source_root in
   let workspace_root = Filename.dirname compiler_dir in
+  let std_root = Filename.concat workspace_root "std" in
   let formatter_root = Filename.concat workspace_root "tools/formatter" in
   if
     String.equal (Filename.basename source_root) "blorp"
     && String.equal (Filename.basename compiler_dir) "compiler"
-    && existing_directory formatter_root
-  then [ ("tools/formatter", formatter_root) ]
+  then
+    let roots = [] in
+    let roots =
+      if existing_directory std_root then ("std", std_root) :: roots else roots
+    in
+    let roots =
+      if existing_directory formatter_root then
+        ("tools/formatter", formatter_root) :: roots
+      else roots
+    in
+    List.rev roots
   else []
 
 let bridge_source_tree_digest source_path =
@@ -2461,26 +2473,48 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
                  (String.trim (cc_output ^ cc_stderr)))
           else Ok bin_path)
 
-let compile_bridge_binary_to_path ~compiler ~source_path ~compile_env ~work_root
-    ~bin_path =
-  ensure_dir work_root;
-  ensure_dir (Filename.dirname bin_path);
-  let stage_dir =
-    create_renderer_bridge_stage_dir work_root renderer_bridge_temp_dir_retry_limit
+let copy_binary_to_path ~source_path ~dest_path =
+  let dest_dir = Filename.dirname dest_path in
+  ensure_dir dest_dir;
+  let temp_path =
+    Filename.concat dest_dir
+      (Printf.sprintf ".%s.%d-%d.tmp" (Filename.basename dest_path)
+         (Unix.getpid ())
+         (Random.bits () land 0x3fffffff))
   in
-  Fun.protect
-    ~finally:(fun () -> remove_path_noerr stage_dir)
-    (fun () ->
-      let stage_bin = renderer_bridge_bin_path stage_dir in
-      match
-        compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
-          ~stage_dir ~bin_path:stage_bin
-      with
-      | Error _ as error -> error
-      | Ok _ ->
-          (try Sys.remove bin_path with _ -> ());
-          Unix.rename stage_bin bin_path;
-          Ok bin_path)
+  let published = ref false in
+  try
+    Fun.protect
+      ~finally:(fun () ->
+        if not !published then try Sys.remove temp_path with _ -> ())
+      (fun () ->
+        let input_channel = open_in_bin source_path in
+        Fun.protect
+          ~finally:(fun () -> close_in_noerr input_channel)
+          (fun () ->
+            let output_channel = open_out_bin temp_path in
+            Fun.protect
+              ~finally:(fun () -> close_out_noerr output_channel)
+              (fun () ->
+                let buffer = Bytes.create 65536 in
+                let rec copy_loop () =
+                  match
+                    input input_channel buffer 0 (Bytes.length buffer)
+                  with
+                  | 0 -> ()
+                  | count ->
+                      output output_channel buffer 0 count;
+                      copy_loop ()
+                in
+                copy_loop ()));
+        Unix.chmod temp_path 0o755;
+        Unix.rename temp_path dest_path;
+        published := true;
+        Ok dest_path)
+  with exn ->
+    Error
+      (Printf.sprintf "failed to copy prepared Blorp bridge helper %s to %s: %s"
+         source_path dest_path (Printexc.to_string exn))
 
 let rec lockf_retry fd command size =
   try Unix.lockf fd command size
@@ -2599,17 +2633,22 @@ let prepare_bridge_binaries ~out_dir =
   let* compiler = default_bridge_helper_compiler () in
   let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
-  let* renderer_path =
-    compile_bridge_binary_to_path ~compiler
+  let* cached_renderer_path =
+    bridge_binary_for_source renderer_bridge_cache ~compiler
       ~source_path:(renderer_bridge_source_path ())
-      ~compile_env:bridge_helper_compile_env ~work_root:out_dir
-      ~bin_path:renderer_bin
+      ~compile_env:bridge_helper_compile_env
+  in
+  let* cached_parser_path =
+    bridge_binary_for_source parser_bridge_cache ~compiler
+      ~source_path:(parser_bridge_source_path ())
+      ~compile_env:parser_bridge_helper_compile_env
+  in
+  let* renderer_path =
+    copy_binary_to_path ~source_path:cached_renderer_path
+      ~dest_path:renderer_bin
   in
   let* parser_path =
-    compile_bridge_binary_to_path ~compiler
-      ~source_path:(parser_bridge_source_path ())
-      ~compile_env:parser_bridge_helper_compile_env ~work_root:out_dir
-      ~bin_path:parser_bin
+    copy_binary_to_path ~source_path:cached_parser_path ~dest_path:parser_bin
   in
   Ok
     {

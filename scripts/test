@@ -3,7 +3,8 @@
 #
 # Usage:
 #   scripts/test                    # Run default test gates
-#   scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests only
+#   scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
+#   scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 #   scripts/test compiler           # Fast compiler surface tests
 #   scripts/test compiler-deep      # Full codegen audit + compiler/blorp TestSuites
 #   scripts/test runtime            # Runtime .brp tests (language features)
@@ -14,6 +15,7 @@
 #   scripts/test compiler-unit compiler  # Multiple gates
 #   scripts/test --serial           # Run selected gates one at a time
 #   scripts/test --coverage         # Compiler-unit coverage report
+#   scripts/test --timings          # Print slow compiler-unit/inner-integration cases
 #   scripts/test --verbose          # Print every child-runner line
 #   scripts/test --log-dir logs     # Save premerge gate logs
 
@@ -28,6 +30,7 @@ cd "$script_dir/.."
 runner_label="scripts/test"
 script_start_seconds=$(date +%s)
 std_preflight_cache_version="blorp-std-preflight-v1"
+compiler_unit_timing_run_id="scripts-test-$script_start_seconds-$$"
 
 now_seconds() {
     date +%s
@@ -122,18 +125,20 @@ std_preflight_cache_file() {
 }
 
 usage() {
-    echo "Usage: $runner_label [options] [compiler-unit] [compiler] [compiler-deep] [runtime] [leak] [doctest] [cli] [cli-deep]"
+    echo "Usage: $runner_label [options] [compiler-unit] [compiler-unit-deep] [compiler] [compiler-deep] [runtime] [leak] [doctest] [cli] [cli-deep]"
     cat <<'EOF'
 
 Options:
   --serial       Run selected gates one at a time.
   --coverage     Run compiler-unit tests with coverage instrumentation.
+  --timings      Print slow compiler-unit and compiler-unit-deep cases.
   --verbose      Stream full child-runner output, including passing tests.
   --quiet        Suppress passing-test output (default).
   --log-dir DIR  Copy each gate's full captured output into DIR.
 
 Legacy aliases:
   unit           Alias for compiler-unit.
+  unit-deep      Alias for compiler-unit-deep.
 EOF
 }
 
@@ -142,12 +147,14 @@ gates=()
 coverage=false
 serial=false
 verbose=false
+timings=false
 log_dir=""
 while [ $# -gt 0 ]; do
     arg="$1"
     shift
     case "$arg" in
         --coverage) coverage=true ;;
+        --timings) timings=true ;;
         --serial) serial=true ;;
         --verbose) verbose=true ;;
         --quiet) verbose=false ;;
@@ -165,6 +172,7 @@ while [ $# -gt 0 ]; do
             exit 0
             ;;
         compiler-unit|unit) gates+=("unit") ;;
+        compiler-unit-deep|unit-deep) gates+=("unit_deep") ;;
         compiler-deep) gates+=("compiler_deep") ;;
         cli-deep) gates+=("cli_deep") ;;
         compiler|runtime|leak|doctest|cli) gates+=("$arg") ;;
@@ -406,6 +414,7 @@ fi
 # ─── Result tracking (bash 3.2 compatible) ──────────────────────────
 # Each gate gets: _status, _passed, _failed, _tests, _failures (newline-separated list)
 unit_status="SKIP"; unit_passed=0; unit_failed=0; unit_tests=0; unit_failures=""
+unit_deep_status="SKIP"; unit_deep_passed=0; unit_deep_failed=0; unit_deep_tests=0; unit_deep_failures=""
 compiler_status="SKIP"; compiler_passed=0; compiler_failed=0; compiler_tests=0; compiler_failures=""
 compiler_deep_status="SKIP"; compiler_deep_passed=0; compiler_deep_failed=0; compiler_deep_tests=0; compiler_deep_failures=""
 compiler_deep_tools_status="SKIP"; compiler_deep_tools_passed=0; compiler_deep_tools_failed=0; compiler_deep_tools_tests=0; compiler_deep_tools_failures=""
@@ -417,6 +426,7 @@ cli_status="SKIP"; cli_passed=0; cli_failed=0; cli_tests=0; cli_failures=""
 cli_deep_status="SKIP"; cli_deep_passed=0; cli_deep_failed=0; cli_deep_tests=0; cli_deep_failures=""
 
 unit_seconds=0
+unit_deep_seconds=0
 compiler_seconds=0
 compiler_deep_seconds=0
 runtime_seconds=0
@@ -500,12 +510,13 @@ mark_gate_process_failure() {
     fi
 }
 
-parse_unit() {
+parse_alcotest_gate() {
     local output="$1"
+    local key="$2"
     # Alcotest:
     #   "Test Successful in 0.014s. 71 tests run."
     #   "6 failures! in 3.666s. 734 tests run."
-    local tests_line failures_line tests failures
+    local tests_line failures_line tests failures failure_list
     tests_line=$(echo "$output" | grep -o '[0-9][0-9]* tests run' | tail -1)
     failures_line=$(echo "$output" | grep -o '[0-9][0-9]* failures!' | tail -1)
     tests=0
@@ -519,20 +530,29 @@ parse_unit() {
     fi
 
     if [ "$tests" -eq 0 ] && [ "$failures" -eq 0 ]; then
-        unit_tests=1
-        unit_failed=1
-        unit_passed=0
+        eval "${key}_tests=1"
+        eval "${key}_failed=1"
+        eval "${key}_passed=0"
     else
-        unit_tests=$tests
-        unit_failed=$failures
-        unit_passed=$((tests - failures))
+        eval "${key}_tests=\$tests"
+        eval "${key}_failed=\$failures"
+        eval "${key}_passed=$((tests - failures))"
     fi
     if [ "$failures" -eq 0 ] && [ "$tests" -gt 0 ]; then
-        unit_status="PASS"
+        eval "${key}_status=PASS"
     else
-        unit_status="FAIL"
-        unit_failures=$(echo "$output" | grep '\[FAIL\]' | sed -E 's/.*\[FAIL\][[:space:]]*//; s/[[:space:]]*│$//; s/[.]+$//')
+        eval "${key}_status=FAIL"
+        failure_list=$(echo "$output" | grep '\[FAIL\]' | sed -E 's/.*\[FAIL\][[:space:]]*//; s/[[:space:]]*│$//; s/[.]+$//')
+        eval "${key}_failures=\$failure_list"
     fi
+}
+
+parse_unit() {
+    parse_alcotest_gate "$1" "unit"
+}
+
+parse_unit_deep() {
+    parse_alcotest_gate "$1" "unit_deep"
 }
 
 parse_compiler() {
@@ -846,6 +866,67 @@ record_gate_log() {
     fi
 }
 
+run_compiler_unit_scope_command() {
+    local scope="$1"
+    if $timings; then
+        (cd compiler && exec env BLORP_COMPILER_UNIT_TIMINGS=1 BLORP_COMPILER_UNIT_TIMING_RUN_ID="$compiler_unit_timing_run_id" BLORP_COMPILER_UNIT_SCOPE="$scope" dune exec test/run_tests.exe)
+    else
+        (cd compiler && exec env BLORP_COMPILER_UNIT_SCOPE="$scope" dune exec test/run_tests.exe)
+    fi
+}
+
+run_compiler_unit_coverage_command() {
+    if $timings; then
+        env BLORP_COMPILER_UNIT_TIMINGS=1 BLORP_COMPILER_UNIT_TIMING_RUN_ID="$compiler_unit_timing_run_id" make coverage
+    else
+        make coverage
+    fi
+}
+
+print_compiler_unit_timing_summary() {
+    local gate="$1"
+    local output_file="$2"
+    local label scope slow_file timing_input
+
+    $timings || return 0
+    case "$gate" in
+        unit)
+            label="compiler-unit"
+            scope="default"
+            ;;
+        unit_deep)
+            label="compiler-unit-deep"
+            scope="deep"
+            ;;
+        *) return 0 ;;
+    esac
+
+    slow_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_timings.XXXXXX") || exit 1
+    timing_input=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_timing_input.XXXXXX") || {
+        rm -f "$slow_file"
+        exit 1
+    }
+    cat "$output_file" > "$timing_input"
+    if [ -d compiler/_build/_tests/blorp ]; then
+        while IFS= read -r case_output_file; do
+            cat "$case_output_file" >> "$timing_input"
+        done < <(find -L compiler/_build/_tests/blorp -name '*.output' -type f 2>/dev/null)
+    fi
+    awk -F '\t' '
+        $1 == "BLORP_COMPILER_UNIT_TIMING" && $2 == run_id && $3 == scope && NF >= 6 {
+            printf "%010.6f\t%s\t%s\n", $6, $4, $5
+        }
+    ' run_id="$compiler_unit_timing_run_id" scope="$scope" "$timing_input" |
+        sort -r | head -10 > "$slow_file"
+
+    if [ -s "$slow_file" ]; then
+        echo "Slow $label cases:"
+        awk -F '\t' '{ printf "  %.3fs  %s :: %s\n", $1 + 0, $2, $3 }' "$slow_file"
+        echo ""
+    fi
+    rm -f "$slow_file" "$timing_input"
+}
+
 print_failure_excerpt() {
     local gate="$1"
     local output_file="$2"
@@ -1056,20 +1137,46 @@ run_unit() {
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit.XXXXXX") || exit 1
     if $coverage; then
-        capture_stream "$output_file" make coverage
+        capture_stream "$output_file" run_compiler_unit_coverage_command
         exit_code=$?
     else
-        capture_stream "$output_file" bash -c 'cd compiler && dune runtest --force'
+        capture_stream "$output_file" run_compiler_unit_scope_command default
         exit_code=$?
     fi
     output=$(cat "$output_file")
     record_gate_log "compiler-unit" "$output_file"
     maybe_print_failure_excerpt "compiler-unit" "$output_file" "$exit_code"
+    print_compiler_unit_timing_summary "unit" "$output_file"
     rm -f "$output_file"
     unit_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_unit "$output"
     mark_gate_process_failure "unit" "$exit_code"
+    return $exit_code
+}
+
+run_unit_deep() {
+    echo "═══ Compiler Unit Deep Tests (OCaml/Alcotest integration) ═══"
+    echo ""
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
+    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_deep.XXXXXX") || exit 1
+    if $coverage; then
+        echo "Error: --coverage is only supported for compiler-unit, not compiler-unit-deep." > "$output_file"
+        exit_code=2
+    else
+        capture_stream "$output_file" run_compiler_unit_scope_command deep
+        exit_code=$?
+    fi
+    output=$(cat "$output_file")
+    record_gate_log "compiler-unit-deep" "$output_file"
+    maybe_print_failure_excerpt "compiler-unit-deep" "$output_file" "$exit_code"
+    print_compiler_unit_timing_summary "unit_deep" "$output_file"
+    rm -f "$output_file"
+    unit_deep_seconds=$(elapsed_since "$start_seconds")
+    echo ""
+    parse_unit_deep "$output"
+    mark_gate_process_failure "unit_deep" "$exit_code"
     return $exit_code
 }
 
@@ -1255,6 +1362,12 @@ init_gate_output() {
                 echo ""
             } > "$outfile"
             ;;
+        unit_deep)
+            {
+                echo "═══ Compiler Unit Deep Tests (OCaml/Alcotest integration) ═══"
+                echo ""
+            } > "$outfile"
+            ;;
         compiler)
             {
                 echo "═══ Compiler Tests (fast fixtures) ═══"
@@ -1306,9 +1419,17 @@ run_gate_to_file() {
     case "$gate" in
         unit)
             if $coverage; then
-                make coverage >> "$outfile" 2>&1
+                run_compiler_unit_coverage_command >> "$outfile" 2>&1
             else
-                (cd compiler && exec dune runtest --force) >> "$outfile" 2>&1
+                run_compiler_unit_scope_command default >> "$outfile" 2>&1
+            fi
+            ;;
+        unit_deep)
+            if $coverage; then
+                echo "Error: --coverage is only supported for compiler-unit, not compiler-unit-deep." >> "$outfile"
+                return 2
+            else
+                run_compiler_unit_scope_command deep >> "$outfile" 2>&1
             fi
             ;;
         compiler)
@@ -1391,10 +1512,14 @@ collect_gate_worker() {
     elif [ -f "$outfile" ] && [ "$local_exit" != "0" ]; then
         print_failure_excerpt "$gate" "$outfile"
     fi
+    if [ -f "$outfile" ]; then
+        print_compiler_unit_timing_summary "$gate" "$outfile"
+    fi
 
     [ -f "$outfile" ] && local_output=$(cat "$outfile")
     case "$gate" in
         unit)     parse_unit "$local_output" ;;
+        unit_deep) parse_unit_deep "$local_output" ;;
         compiler) parse_compiler_gate_output "$local_output" ;;
         compiler_deep) parse_compiler_deep_gate_output "$local_output" ;;
         runtime)  parse_blorp_output "$local_output" "runtime" ;;
@@ -1460,6 +1585,7 @@ elif $serial || [ ${#parallel_gates[@]} -le 1 ]; then
     for gate in "${parallel_gates[@]}"; do
         case "$gate" in
             unit)     run_unit     || any_failed=true ;;
+            unit_deep) run_unit_deep || any_failed=true ;;
             compiler) run_compiler || any_failed=true ;;
             compiler_deep) run_compiler_deep || any_failed=true ;;
             runtime)  run_runtime  || any_failed=true ;;
@@ -1480,6 +1606,7 @@ else
     gate_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_gates.XXXXXX")
 
     run_gate_wave "compiler-unit" unit
+    run_gate_wave "compiler-unit-deep" unit_deep
     run_gate_wave "compiler" compiler
     run_gate_wave "compiler-deep" compiler_deep
     run_gate_wave "runtime" runtime
@@ -1523,6 +1650,7 @@ for s in "${gates[@]}"; do
     sec=$(eval echo "\$${s}_seconds")
     case "$s" in
         unit)     label="Compiler-unit" ;;
+        unit_deep) label="Compiler-unit-deep" ;;
         compiler) label="Compiler" ;;
         compiler_deep) label="Compiler-deep" ;;
         runtime)  label="Runtime" ;;
@@ -1552,6 +1680,6 @@ if [ "$overall" = "FAIL" ]; then
     done
 fi
 
-if $any_failed; then
+if $any_failed || [ "$overall" = "FAIL" ]; then
     exit 1
 fi

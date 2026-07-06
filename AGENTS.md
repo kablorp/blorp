@@ -230,7 +230,8 @@ make
 scripts/test
 
 # Run specific test gates
-scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
+scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
+scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # Fast compiler surface tests
 scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # Runtime .brp tests
@@ -240,6 +241,7 @@ scripts/test cli                # CLI smoke and exit-code checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
 scripts/test --coverage         # Compiler-unit coverage report
+scripts/test --timings          # Print slow compiler-unit/deep Alcotest cases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -249,7 +251,8 @@ scripts/test --log-dir logs     # Save complete gate logs with compact console o
 # Makefile shortcuts
 make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
-make compiler-unit-test           # Compiler-internal OCaml/Alcotest tests only
+make compiler-unit-test           # Compiler-internal OCaml/Alcotest unit-shaped tests
+make compiler-unit-deep-test      # Compiler-internal integration-shaped Alcotest tests
 make coverage                     # Compiler-unit coverage
 make quality                      # Hygiene + C static analysis
 make docker-gate                  # Normal test gate in Ubuntu Docker (linux/amd64)
@@ -267,6 +270,7 @@ failure.
 ```bash
 make
 scripts/test compiler-unit
+scripts/test compiler-unit-deep
 scripts/test compiler
 scripts/test compiler-deep
 scripts/test runtime
@@ -726,16 +730,17 @@ Do not write tests arbitrarily — understand what is already tested before addi
 
 ### Compiler Unit Tests
 
-Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and test compiler internals directly in OCaml (no `.brp` compilation needed).
+Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and test compiler internals directly in OCaml.
 
 **Structure:**
-- `compiler/test/run_tests.ml` — Main runner, aggregates all test suites
+- `compiler/test/run_tests.ml` — Main runner, aggregates default unit-shaped suites and named deep/internal-integration suites
 - `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, CLI bridges, and LSP behavior
 
 **Running:**
 ```bash
-make compiler-unit-test # Run all compiler-internal OCaml/Alcotest tests
-make coverage           # Run with coverage, report in compiler/_coverage/index.html
+make compiler-unit-test      # Run phase-local compiler-internal OCaml/Alcotest tests
+make compiler-unit-deep-test # Run internal integration-shaped Alcotest tests
+make coverage                # Run default compiler-unit coverage, report in compiler/_coverage/index.html
 ```
 
 **Writing new tests:**

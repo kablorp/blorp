@@ -116,3 +116,82 @@ if ! grep -Fq 'compiler gate exited before reporting a summary' "$compiler_outpu
 fi
 
 echo "PASS: scripts/test shows compiler infrastructure failures"
+
+mkdir -p "$TMP_HARNESS/compiler" "$TMP_HARNESS/bin"
+
+cat > "$TMP_HARNESS/bin/dune" <<'SH'
+#!/usr/bin/env bash
+if [ "${BLORP_COMPILER_UNIT_TIMINGS:-}" != "1" ]; then
+	echo "missing compiler unit timing env" >&2
+	exit 3
+fi
+if [ -z "${BLORP_COMPILER_UNIT_TIMING_RUN_ID:-}" ]; then
+	echo "missing compiler unit timing run id" >&2
+	exit 3
+fi
+printf 'BLORP_COMPILER_UNIT_TIMING\t%s\tdefault\tSlowSuite.group\tcase one\t1.234000\n' "$BLORP_COMPILER_UNIT_TIMING_RUN_ID"
+echo "Test Successful in 0.001s. 1 tests run."
+exit 0
+SH
+chmod +x "$TMP_HARNESS/bin/dune"
+
+timing_output_file="$TMP_HARNESS/unit-timing-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_PREFLIGHT_CACHE=0 \
+		PATH="$TMP_HARNESS/bin:$PATH" \
+		bash scripts/test compiler-unit --serial --timings
+) > "$timing_output_file" 2>&1
+timing_status=$?
+
+if [ "$timing_status" -ne 0 ]; then
+	echo "FAIL: scripts/test compiler-unit --timings should pass through timing env"
+	cat "$timing_output_file"
+	exit 1
+fi
+
+if ! grep -Fq 'Slow compiler-unit cases:' "$timing_output_file"; then
+	echo "FAIL: scripts/test --timings should print a slow case summary"
+	cat "$timing_output_file"
+	exit 1
+fi
+
+if ! grep -Fq '1.234s  SlowSuite.group :: case one' "$timing_output_file"; then
+	echo "FAIL: scripts/test --timings should include the slow timed case"
+	cat "$timing_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test prints compiler-unit timing summaries"
+
+cat > "$TMP_HARNESS/bin/dune" <<'SH'
+#!/usr/bin/env bash
+echo "Testing \`blorp'."
+exit 0
+SH
+chmod +x "$TMP_HARNESS/bin/dune"
+
+unit_output_file="$TMP_HARNESS/unit-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_PREFLIGHT_CACHE=0 \
+		PATH="$TMP_HARNESS/bin:$PATH" \
+		bash scripts/test compiler-unit --serial
+) > "$unit_output_file" 2>&1
+unit_status=$?
+
+if [ "$unit_status" -eq 0 ]; then
+	echo "FAIL: scripts/test compiler-unit should exit nonzero when Alcotest summary parsing fails"
+	cat "$unit_output_file"
+	exit 1
+fi
+
+if ! grep -Eq 'Compiler-unit[[:space:]]+FAIL' "$unit_output_file"; then
+	echo "FAIL: scripts/test should render compiler-unit as FAIL when no Alcotest summary is parsed"
+	cat "$unit_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test exits nonzero when gate summary parsing fails"

@@ -1227,6 +1227,107 @@ let mk_record_decl name : Ast.decl =
   in
   { decl_desc = Ast.DRecord record; decl_loc = Ast.dummy_loc; decl_doc = None }
 
+let test_reusable_reset_preserves_only_parse_cache () =
+  let s = Session.create () in
+  let parsed_entry : Session.parsed_module_cache_entry =
+    {
+      parsed_path = "<cached>";
+      parsed_origin = Session.User_module;
+      parsed_source_hash = "hash";
+      parsed_trust_current_source = true;
+      parsed_decls = [];
+      parsed_exports = [];
+      parsed_surface = None;
+    }
+  in
+  let pkg : Session.source_package =
+    {
+      source_package_alias = "demo";
+      source_package_name = "demo";
+      source_package_root = "/tmp/demo";
+      source_package_source_dir = "/tmp/demo/src";
+      source_package_exports = [];
+    }
+  in
+  s.search_paths <- [ "/tmp/search" ];
+  s.package_roots <- [ "/tmp/pkg" ];
+  s.source_packages <- [ pkg ];
+  Hashtbl.add s.module_cache "demo/mod" (mk_loaded_module ~name:"demo/mod" ~decls:[]);
+  Hashtbl.add s.parse_cache "demo/mod" parsed_entry;
+  Hashtbl.add s.type_index "Widget" (Session.UniqueTypeHome "demo/mod");
+  Hashtbl.add s.resource_cleanup_index "Widget"
+    (Ast.ResourceCleanupBuiltin "cleanup_widget");
+  Hashtbl.add s.trait_index "Renderable" "demo/mod";
+  s.std_override_dir <- Some "/tmp/std";
+  s.std_override_active <- true;
+  s.std_source_dir <- Some "/tmp/std";
+  s.load_errors <-
+    [
+      {
+        Ast.message = "stale";
+        loc = Ast.dummy_loc;
+        phase = Ast.TypeCheck;
+        kind = Ast.OtherError;
+        notes = [];
+        help = None;
+      };
+    ];
+  s.prelude_modules_loaded <- true;
+  Hashtbl.add s.overloads "f" [];
+  Hashtbl.add s.impl_index "Renderable" [];
+  Hashtbl.add s.ufcs_methods "label" [];
+  s.builtins_populated <- true;
+  s.def_id_counter <- 5;
+  s.fresh_meta_counter <- 3;
+  s.meta_origin <- [ (1, "T") ];
+  Hashtbl.add s.meta_env 1 Types.ty_int;
+  s.lower_destruct_counter <- 1;
+  s.lower_param_counter <- 1;
+  s.lower_question_bind_counter <- 1;
+  s.lower_resource_counter <- 1;
+  s.lower_task_scope_counter <- 4;
+  s.lower_current_task_scope_id <- 2;
+  s.desugar_counter <- 1;
+  s.ssa_mut_counter <- 1;
+  Session.reset_compilation_state_preserving_parse_cache s;
+  Alcotest.(check bool)
+    "parse cache preserved" true
+    (Hashtbl.find_opt s.parse_cache "demo/mod" = Some parsed_entry);
+  Alcotest.(check int) "module cache cleared" 0 (Hashtbl.length s.module_cache);
+  Alcotest.(check int) "type index cleared" 0 (Hashtbl.length s.type_index);
+  Alcotest.(check int)
+    "resource cleanup index cleared" 0
+    (Hashtbl.length s.resource_cleanup_index);
+  Alcotest.(check int) "trait index cleared" 0 (Hashtbl.length s.trait_index);
+  Alcotest.(check (list string)) "search paths cleared" [] s.search_paths;
+  Alcotest.(check int) "package roots cleared" 0 (List.length s.package_roots);
+  Alcotest.(check int)
+    "source packages cleared" 0
+    (List.length s.source_packages);
+  Alcotest.(check bool) "std override inactive" false s.std_override_active;
+  Alcotest.(check (option string)) "std dir cleared" None s.std_override_dir;
+  Alcotest.(check (option string)) "std source cleared" None s.std_source_dir;
+  Alcotest.(check int) "load errors cleared" 0 (List.length s.load_errors);
+  Alcotest.(check bool)
+    "prelude flag cleared" false s.prelude_modules_loaded;
+  Alcotest.(check int) "overloads cleared" 0 (Hashtbl.length s.overloads);
+  Alcotest.(check int) "impls cleared" 0 (Hashtbl.length s.impl_index);
+  Alcotest.(check int) "ufcs cleared" 0 (Hashtbl.length s.ufcs_methods);
+  Alcotest.(check bool) "builtins flag cleared" false s.builtins_populated;
+  Alcotest.(check int) "def ids reset" 0 s.def_id_counter;
+  Alcotest.(check int) "meta counter reset" 0 s.fresh_meta_counter;
+  Alcotest.(check int) "meta origins cleared" 0 (List.length s.meta_origin);
+  Alcotest.(check int) "meta env cleared" 0 (Hashtbl.length s.meta_env);
+  Alcotest.(check int) "lower destruct reset" 0 s.lower_destruct_counter;
+  Alcotest.(check int) "lower param reset" 0 s.lower_param_counter;
+  Alcotest.(check int)
+    "question bind reset" 0 s.lower_question_bind_counter;
+  Alcotest.(check int) "resource reset" 0 s.lower_resource_counter;
+  Alcotest.(check int) "task counter reset" 1 s.lower_task_scope_counter;
+  Alcotest.(check int) "task scope reset" 0 s.lower_current_task_scope_id;
+  Alcotest.(check int) "desugar reset" 0 s.desugar_counter;
+  Alcotest.(check int) "ssa reset" 0 s.ssa_mut_counter
+
 let test_modules_reset_clears_type_index () =
   let s = Session.create () in
   let m =
@@ -1417,6 +1518,8 @@ let suite =
         Alcotest.test_case "module origin policy" `Quick
           test_module_origin_policy_helpers;
         Alcotest.test_case "search_paths" `Quick test_search_paths_independent;
+        Alcotest.test_case "reusable reset preserves only parse cache" `Quick
+          test_reusable_reset_preserves_only_parse_cache;
         Alcotest.test_case "reset clears type index" `Quick
           test_modules_reset_clears_type_index;
         Alcotest.test_case "ambiguous type homes" `Quick

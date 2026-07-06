@@ -34,38 +34,33 @@ let write_file path contents =
     ~finally:(fun () -> close_out oc)
     (fun () -> output_string oc contents)
 
-let write_package root =
+let package_manifest_text =
+  "[package]\n\
+   name = \"sample\"\n\n\
+   [compat]\n\
+   std = \"preview-1\"\n\n\
+   [exports]\n\
+   modules = [\"sample\"]\n"
+
+let sample_source answer =
+  Printf.sprintf "pure func answer() -> Int:\n    %d\n" answer
+
+let package_entries answer : Blorp.Package_hash.entry list =
+  [
+    { rel_path = "package.toml"; contents = package_manifest_text };
+    { rel_path = "src/sample.brp"; contents = sample_source answer };
+  ]
+
+let write_package_contents root answer =
   let src = Filename.concat root "src" in
   ensure_dir src;
-  write_file
-    (Filename.concat root "package.toml")
-    "[package]\n\
-     name = \"sample\"\n\n\
-     [compat]\n\
-     std = \"preview-1\"\n\n\
-     [exports]\n\
-     modules = [\"sample\"]\n";
-  write_file
-    (Filename.concat src "sample.brp")
-    "pure func answer() -> Int:\n    42\n"
+  write_file (Filename.concat root "package.toml") package_manifest_text;
+  write_file (Filename.concat src "sample.brp") (sample_source answer)
 
-let checked_package root =
-  match Blorp.Package_check.check root with
-  | Ok checked -> checked
-  | Error errors ->
-      Alcotest.failf "package check failed:\n%s"
-        (Blorp.Package_check.render_errors errors)
-
-let pack_package ~root ~output =
-  let checked = checked_package root in
-  match
-    Blorp.Package_artifact.write_checked_package ~root
-      ~source_files:checked.Blorp.Package_check.source_files ~output
-  with
-  | Ok hash -> hash
-  | Error errors ->
-      Alcotest.failf "package pack failed:\n%s"
-        (Blorp.Package_artifact.render_errors errors)
+let write_package_artifact path answer =
+  let entries = package_entries answer in
+  write_file path (Blorp.Package_artifact.artifact_bytes entries);
+  Blorp.Package_hash.hash_entries entries
 
 let cache_hash_dirs () =
   let dir = Blorp.Package_cache_layout.algorithm_dir () in
@@ -83,30 +78,12 @@ let write_matching_cache_marker hash ~ready =
     write_file (Blorp.Package_cache_layout.ready_file final_dir) "ready\n";
   final_dir
 
-let write_package_contents root answer =
-  let src = Filename.concat root "src" in
-  ensure_dir src;
-  write_file
-    (Filename.concat root "package.toml")
-    "[package]\n\
-     name = \"sample\"\n\n\
-     [compat]\n\
-     std = \"preview-1\"\n\n\
-     [exports]\n\
-     modules = [\"sample\"]\n";
-  write_file
-    (Filename.concat src "sample.brp")
-    (Printf.sprintf "pure func answer() -> Int:\n    %d\n" answer)
-
 let test_fetch_installs_verified_cache_entry () =
   with_temp_dir "blorp_package_cache" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
           | Error errors ->
@@ -122,13 +99,10 @@ let test_fetch_installs_verified_cache_entry () =
 
 let test_fetch_accepts_matching_prefix_pin () =
   with_temp_dir "blorp_package_cache_prefix" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       let prefix = String.sub hash 0 16 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match Blorp.Package_cache.fetch ~expected_pin:prefix [ artifact ] with
@@ -143,13 +117,10 @@ let test_fetch_accepts_matching_prefix_pin () =
 
 let test_fetch_replaces_matching_incomplete_cache_entry () =
   with_temp_dir "blorp_package_cache_incomplete" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           let final_dir = write_matching_cache_marker hash ~ready:false in
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
@@ -169,13 +140,10 @@ let test_fetch_replaces_matching_incomplete_cache_entry () =
 
 let test_fetch_replaces_matching_invalid_cache_entry () =
   with_temp_dir "blorp_package_cache_invalid" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           let final_dir = write_matching_cache_marker hash ~ready:true in
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
@@ -191,13 +159,10 @@ let test_fetch_replaces_matching_invalid_cache_entry () =
 
 let test_fetch_replaces_forged_matching_hash_cache_entry () =
   with_temp_dir "blorp_package_cache_forged" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           let final_dir = write_matching_cache_marker hash ~ready:true in
           write_package_contents final_dir 99;
@@ -219,13 +184,10 @@ let test_fetch_replaces_forged_matching_hash_cache_entry () =
 
 let test_find_cached_rejects_tampered_cache_contents () =
   with_temp_dir "blorp_package_cache_tampered_find" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
           | Error errors ->
@@ -244,13 +206,10 @@ let test_find_cached_rejects_tampered_cache_contents () =
 
 let test_fetch_rejects_hash_mismatch () =
   with_temp_dir "blorp_package_cache_mismatch" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match
             Blorp.Package_cache.fetch ~expected_pin:"ffffffffffffffff"
@@ -288,15 +247,12 @@ let test_fetch_rejects_corrupt_artifact_without_cache_entry () =
 let test_hash_only_alias_resolves_from_cache () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_package_cache_alias" (fun dir ->
-          let package_dir = Filename.concat dir "package" in
           let cache_dir = Filename.concat dir "cache" in
           let project_dir = Filename.concat dir "project" in
           let artifact = Filename.concat dir "sample.blorpkg" in
-          Unix.mkdir package_dir 0o700;
           Unix.mkdir cache_dir 0o700;
           Unix.mkdir project_dir 0o700;
-          write_package package_dir;
-          let hash = pack_package ~root:package_dir ~output:artifact in
+          let hash = write_package_artifact artifact 42 in
           with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
               match
                 Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ]
@@ -330,14 +286,11 @@ let test_hash_only_alias_resolves_from_cache () =
 
 let test_vendor_rejects_tampered_cache_without_writing_destination () =
   with_temp_dir "blorp_package_vendor_tampered" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let vendor_dir = Filename.concat dir "vendor/sample" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
           | Error errors ->
@@ -359,14 +312,11 @@ let test_vendor_rejects_tampered_cache_without_writing_destination () =
 
 let test_vendor_copies_cached_package () =
   with_temp_dir "blorp_package_vendor" (fun dir ->
-      let package_dir = Filename.concat dir "package" in
       let cache_dir = Filename.concat dir "cache" in
       let vendor_dir = Filename.concat dir "vendor/sample" in
       let artifact = Filename.concat dir "sample.blorpkg" in
-      Unix.mkdir package_dir 0o700;
       Unix.mkdir cache_dir 0o700;
-      write_package package_dir;
-      let hash = pack_package ~root:package_dir ~output:artifact in
+      let hash = write_package_artifact artifact 42 in
       with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
           match Blorp.Package_cache.fetch ~expected_pin:hash [ artifact ] with
           | Error errors ->

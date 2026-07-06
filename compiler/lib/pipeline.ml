@@ -440,6 +440,22 @@ let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
       Option.iter (fun configure -> configure sess) configure_session;
       k ())
 
+let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a)
+    : 'a =
+  let parent = Session.current () in
+  let inherited_std_override =
+    if parent == sess then None
+    else
+      match (parent.Session.std_override_active, parent.std_override_dir) with
+      | true, Some dir -> Some dir
+      | _ -> None
+  in
+  Session.reset_compilation_state_preserving_parse_cache sess;
+  Option.iter (Modules.set_std_override ~sess) inherited_std_override;
+  Session.with_current sess (fun () ->
+      Modules.init_module_paths (Modules.extract_directory filename);
+      k ())
+
 let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
     =
   (* Type-check loaded modules and surface genuine errors *)
@@ -496,6 +512,23 @@ let typecheck_only_typed ~filename ~source ?(debug = false) () =
 
 let typecheck_only ~filename ~source ?(debug = false) () =
   match typecheck_only_typed ~filename ~source ~debug () with
+  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
+  | Error _ as e -> e
+
+let typecheck_only_typed_reusing_session ~sess ~filename ~source
+    ?(debug = false) () =
+  with_reusable_typecheck_session ~sess filename (fun () ->
+      match parse_and_load_modules ~source_kind:User_source ~filename source with
+      | Error _ as e -> e
+      | Ok (program, _base_dir) ->
+          typecheck_loaded_program ~source_kind:User_source ~filename ~program
+            ~debug ())
+
+let typecheck_only_reusing_session ~sess ~filename ~source ?(debug = false) ()
+    =
+  match
+    typecheck_only_typed_reusing_session ~sess ~filename ~source ~debug ()
+  with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 

@@ -51,6 +51,8 @@ type case_kind =
 type test_case = { kind : case_kind; file : string }
 type command_result = { code : int; output : string }
 
+type run_context = { typecheck_session : Session.t }
+
 type codegen_audit_summary = {
   codegen_passed : int;
   codegen_failed : int;
@@ -388,10 +390,15 @@ let run_parse file =
 
 let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
-let run_typecheck file =
+let create_run_context () = { typecheck_session = Session.create () }
+
+let run_typecheck context file =
   run_safely (fun () ->
       let source = read_file file in
-      match Pipeline.typecheck_only ~filename:file ~source ~debug:false () with
+      match
+        Pipeline.typecheck_only_reusing_session ~sess:context.typecheck_session
+          ~filename:file ~source ~debug:false ()
+      with
       | Ok _ -> { code = 0; output = "Type checking succeeded.\n" }
       | Error errors ->
           { code = 1; output = format_pipeline_errors ~file errors })
@@ -451,7 +458,7 @@ let fail suite testname details = `Fail (suite, testname, details)
 let pass suite testname = `Pass (suite, testname)
 let testname file = Filename.basename file
 
-let run_case opts { kind; file } =
+let run_case opts context { kind; file } =
   let name = testname file in
   match kind with
   | ParserShouldPass ->
@@ -476,7 +483,7 @@ let run_case opts { kind; file } =
         | None -> pass "should_fail/parser" name
         | Some details -> fail "should_fail/parser" name details)
   | TypecheckShouldPass category ->
-      let result = run_typecheck file in
+      let result = run_typecheck context file in
       if result.code = 0 then pass ("should_pass/" ^ category) name
       else
         fail
@@ -487,7 +494,7 @@ let run_case opts { kind; file } =
             |> List.filter (( <> ) "")
             |> List.filteri (fun i _ -> i < 5)))
   | TypecheckShouldFail category -> (
-      let result = run_typecheck file in
+      let result = run_typecheck context file in
       if result.code = 0 then
         fail
           ("should_fail/" ^ category)
@@ -569,7 +576,7 @@ let run_case opts { kind; file } =
               ("Purify failed"
               :: (result.output |> split_lines |> List.filter (( <> ) "")))
           else
-            let check = run_typecheck tmpfile in
+            let check = run_typecheck context tmpfile in
             if check.code <> 0 then
               fail "purify/should_rewrite" name
                 ("Rewritten file did not typecheck"
@@ -592,13 +599,14 @@ let case_uses_formatter = function
   | _ -> false
 
 let run_case_list opts cases =
+  let context = create_run_context () in
   let passed = ref 0 in
   let failed = ref 0 in
   let total = ref 0 in
   List.iter
     (fun case ->
       incr total;
-      match run_case opts case with
+      match run_case opts context case with
       | `Pass (suite, name) ->
           incr passed;
           emit_pass opts suite name

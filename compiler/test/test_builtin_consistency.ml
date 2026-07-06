@@ -1633,22 +1633,125 @@ let all_std_blorp_files () =
   in
   collect startup_std_dir
 
-let std_declared_type_names () =
+type std_parse_item = {
+  std_parse_path : string;
+  std_parse_module_name : string;
+  std_parse_source : string;
+}
+
+type direct_runtime_option_return =
+  string * string * string * string
+  (** source path, source function name, runtime symbol, expected C return type *)
+
+type std_source_inventory = {
+  declared_type_names : (string, unit) Hashtbl.t;
+  direct_runtime_option_returns : direct_runtime_option_return list;
+}
+
+let std_module_name_for_path path =
+  let root_prefix = startup_std_dir ^ Filename.dir_sep in
+  let rel =
+    if
+      String.length path >= String.length root_prefix
+      && String.sub path 0 (String.length root_prefix) = root_prefix
+    then
+      String.sub path (String.length root_prefix)
+        (String.length path - String.length root_prefix)
+    else Filename.basename path
+  in
+  "std/" ^ Filename.remove_extension rel
+
+let std_parse_item path =
+  {
+    std_parse_path = path;
+    std_parse_module_name = std_module_name_for_path path;
+    std_parse_source = read_file path;
+  }
+
+let std_batch_parse_request item :
+    Blorp.Compiler_blorp_bridge.parse_source_batch_request =
+  {
+    batch_parse_path = item.std_parse_path;
+    batch_parse_module_name = item.std_parse_module_name;
+    batch_parse_text = item.std_parse_source;
+  }
+
+let parse_std_inventory_sources items =
+  let requests = List.map std_batch_parse_request items in
+  match Blorp.Compiler_blorp_bridge.parse_sources_via_command requests with
+  | Error (_, message) ->
+      Alcotest.failf "failed to batch parse std inventory sources: %s" message
+  | Ok responses ->
+      if List.length responses <> List.length items then
+        Alcotest.failf
+          "std inventory parser returned %d responses for %d sources"
+          (List.length responses) (List.length items);
+      List.map2
+        (fun item response ->
+          let (response :
+                Blorp.Compiler_blorp_bridge.parse_source_batch_response) =
+            response
+          in
+          if
+            response.batch_parsed_path <> item.std_parse_path
+            || response.batch_parsed_module_name <> item.std_parse_module_name
+          then
+            Alcotest.failf
+              "std inventory parser returned %s/%s while parsing %s/%s"
+              response.batch_parsed_path response.batch_parsed_module_name
+              item.std_parse_path item.std_parse_module_name;
+          match response.batch_parsed_response with
+          | ParsedSource parsed -> (item.std_parse_path, parsed.parsed_program)
+          | ParseSourceDiagnostics diagnostics ->
+              let rendered =
+                diagnostics
+                |> List.map (fun err -> err.Blorp.Ast.message)
+                |> String.concat "\n"
+              in
+              Alcotest.failf "failed to parse %s:\n%s" item.std_parse_path
+                rendered)
+        items responses
+
+let build_std_source_inventory () =
   let names = Hashtbl.create 64 in
-  let rec add_decl decl =
+  let reg = Blorp.Codegen_types.create_registry () in
+  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
+  let direct_option_returns = ref [] in
+  let rec record_decl path ~public decl =
     match (decl : Blorp.Ast.decl).decl_desc with
     | DType t -> Hashtbl.replace names t.type_name ()
     | DRecord r -> Hashtbl.replace names r.record_name ()
     | DTypeAlias a -> Hashtbl.replace names a.alias_name ()
-    | DPrivate inner -> add_decl inner
+    | DFunc
+        {
+          func_name = Some func_name;
+          func_return_type = Some return_ty;
+          func_body = FuncBuiltinBody (BuiltinRuntimeHelper symbol, _);
+          _;
+        }
+      when public -> (
+        match optimized_option_policy_c_return reg meta return_ty with
+        | Some expected_c_return ->
+            direct_option_returns :=
+              (path, func_name, symbol, expected_c_return)
+              :: !direct_option_returns
+        | None -> ())
+    | DPrivate inner -> record_decl path ~public:false inner
     | _ -> ()
   in
-  all_std_blorp_files ()
-  |> List.iter (fun path ->
-      match Blorp.Modules.parse_source ~filename:path (read_file path) with
-      | Error err -> Alcotest.fail err.message
-      | Ok decls -> List.iter add_decl decls);
-  names
+  all_std_blorp_files () |> List.map std_parse_item
+  |> parse_std_inventory_sources
+  |> List.iter (fun (path, decls) ->
+      List.iter (record_decl path ~public:true) decls);
+  {
+    declared_type_names = names;
+    direct_runtime_option_returns = List.rev !direct_option_returns;
+  }
+
+let std_source_inventory = lazy (build_std_source_inventory ())
+
+let std_declared_type_names () =
+  (Lazy.force std_source_inventory).declared_type_names
 
 let test_public_abi_types_have_std_anchors () =
   (* LiteralString is intentionally omitted: it is a compile-time refinement
@@ -1702,34 +1805,7 @@ let test_public_abi_types_have_std_anchors () =
       (String.concat "\n  " missing)
 
 let direct_runtime_option_returns_in_std () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
-  all_std_blorp_files ()
-  |> List.concat_map (fun path ->
-      match Blorp.Modules.parse_source ~filename:path (read_file path) with
-      | Error err -> Alcotest.fail err.message
-      | Ok decls ->
-          List.filter_map
-            (function
-              | {
-                  Blorp.Ast.decl_desc =
-                    Blorp.Ast.DFunc
-                      {
-                        func_name = Some func_name;
-                        func_return_type = Some return_ty;
-                        func_body =
-                          Blorp.Ast.FuncBuiltinBody
-                            (Blorp.Ast.BuiltinRuntimeHelper symbol, _);
-                        _;
-                      };
-                  _;
-                } -> (
-                  match optimized_option_policy_c_return reg meta return_ty with
-                  | Some expected_c_return ->
-                      Some (path, func_name, symbol, expected_c_return)
-                  | None -> None)
-              | _ -> None)
-            decls)
+  (Lazy.force std_source_inventory).direct_runtime_option_returns
 
 let test_optimized_option_runtime_builtins_have_matching_c_abi () =
   let runtime_decl =

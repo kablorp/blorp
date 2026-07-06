@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
@@ -72,7 +72,11 @@ smoke: all
 
 # Run compiler-internal OCaml/Alcotest tests
 compiler-unit-test: compiler/lib/embedded_std.ml
-	cd compiler && dune runtest
+	cd compiler && BLORP_COMPILER_UNIT_SCOPE=default dune exec test/run_tests.exe
+
+# Run integration-shaped compiler-internal OCaml/Alcotest tests
+compiler-unit-deep-test: compiler/lib/embedded_std.ml
+	cd compiler && BLORP_COMPILER_UNIT_SCOPE=deep dune exec test/run_tests.exe
 
 # Legacy alias for compiler-unit-test
 unit-test: compiler-unit-test

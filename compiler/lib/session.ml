@@ -360,6 +360,33 @@ let reset_meta (s : t) : unit =
   s.meta_origin <- [];
   Hashtbl.clear s.meta_env
 
+(** Reset one compilation's semantic state while keeping parsed module artifacts.
+
+    This is intentionally stronger than [Modules.reset]. [Modules.reset] only
+    clears the loaded module graph; a long-lived batch worker also has to clear
+    env tables, package/search configuration, std override state, fresh ids, and
+    inference scratch. The parse cache is the only preserved field because its
+    entries are source-hash validated by [Modules] before reuse. *)
+let reset_compilation_state_preserving_parse_cache (s : t) : unit =
+  s.search_paths <- [];
+  s.package_roots <- [];
+  s.source_packages <- [];
+  Hashtbl.clear s.module_cache;
+  Hashtbl.clear s.type_index;
+  Hashtbl.clear s.resource_cleanup_index;
+  Hashtbl.clear s.trait_index;
+  s.std_override_dir <- None;
+  s.std_override_active <- false;
+  s.std_source_dir <- None;
+  s.load_errors <- [];
+  s.prelude_modules_loaded <- false;
+  Hashtbl.clear s.overloads;
+  Hashtbl.clear s.impl_index;
+  Hashtbl.clear s.ufcs_methods;
+  s.builtins_populated <- false;
+  reset_meta s;
+  reset_core_counters s
+
 (* ============================================================================
    Trait registry
    ============================================================================

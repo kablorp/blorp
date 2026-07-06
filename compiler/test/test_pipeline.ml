@@ -358,6 +358,79 @@ let test_typecheck_only_zonks_global_function_reference_initializer () =
             ("expected global function reference initializer to typecheck, got:\n"
            ^ format_errors errors))
 
+let test_reusable_typecheck_session_clears_semantic_state () =
+  Test_helpers.with_isolated_env (fun () ->
+      let sess = Session.create () in
+      let first_source =
+        "trait ReusableMarker:\n\
+        \    pure func marker(value: Self) -> Int\n\n\
+         record ReusableToken {value: Int}\n\n\
+         implements ReusableMarker for ReusableToken:\n\
+        \    pure func marker(value: ReusableToken) -> Int:\n\
+        \        value.value\n"
+      in
+      let second_source =
+        "record IndependentToken {value: Int}\n\n\
+         pure func value_of(token: IndependentToken) -> Int:\n\
+        \    token.value\n"
+      in
+      let run filename source =
+        Pipeline.typecheck_only_typed_reusing_session ~sess ~filename ~source ()
+      in
+      match run "reusable_first.brp" first_source with
+      | Error errors ->
+          Alcotest.fail
+            ("expected first reusable typecheck to succeed:\n"
+           ^ format_errors errors)
+      | Ok _ -> (
+          Alcotest.(check bool)
+            "custom impl registered during first typecheck" true
+            (Hashtbl.mem sess.impl_index "ReusableMarker");
+          match run "reusable_second.brp" second_source with
+          | Error errors ->
+              Alcotest.fail
+                ("expected second reusable typecheck to succeed:\n"
+               ^ format_errors errors)
+          | Ok _ ->
+              Alcotest.(check bool)
+                "custom impl cleared before second typecheck" false
+                (Hashtbl.mem sess.impl_index "ReusableMarker")))
+
+let test_reusable_typecheck_session_reuses_parse_cache () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_reusable_parse_cache" (fun dir ->
+          let sess = Session.create () in
+          let helper_path = Filename.concat dir "helper.brp" in
+          write_file helper_path "pure func helper_value() -> Int:\n    7\n";
+          let main_path = Filename.concat dir "main.brp" in
+          let source =
+            "import:\n\
+            \    ./helper: helper_value\n\n\
+             pure func use_helper() -> Int:\n\
+            \    helper_value()\n"
+          in
+          let run () =
+            Pipeline.typecheck_only_typed_reusing_session ~sess
+              ~filename:main_path ~source ()
+          in
+          match run () with
+          | Error errors ->
+              Alcotest.fail
+                ("expected first reusable typecheck to succeed:\n"
+               ^ format_errors errors)
+          | Ok _ -> (
+              let first_entry = Hashtbl.find sess.parse_cache "./helper" in
+              match run () with
+              | Error errors ->
+                  Alcotest.fail
+                    ("expected second reusable typecheck to succeed:\n"
+                   ^ format_errors errors)
+              | Ok _ ->
+                  let second_entry = Hashtbl.find sess.parse_cache "./helper" in
+                  Alcotest.(check bool)
+                    "parse cache entry reused by identity" true
+                    (first_entry == second_entry))))
+
 let test_direct_std_source_check_does_not_conflict_with_embedded_std () =
   Test_helpers.with_isolated_env (fun () ->
       Modules.init_module_paths (Sys.getcwd ());
@@ -1203,6 +1276,10 @@ let suite =
         Alcotest.test_case
           "typecheck_only zonks global function reference initializer" `Quick
           test_typecheck_only_zonks_global_function_reference_initializer;
+        Alcotest.test_case "reusable typecheck clears semantic state" `Quick
+          test_reusable_typecheck_session_clears_semantic_state;
+        Alcotest.test_case "reusable typecheck reuses parse cache" `Quick
+          test_reusable_typecheck_session_reuses_parse_cache;
         Alcotest.test_case "explicit std source reports unused import" `Quick
           test_explicit_std_source_check_reports_unused_import_error;
         Alcotest.test_case "std prelude re-export skips unused imports" `Quick
