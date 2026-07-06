@@ -942,6 +942,21 @@ let path_under root path =
 
 let process_isolated_suite_roots =
   [
+    (* This Blorp compiler suite imports compiler_infer as part of second-pass
+       body checking. When the generated run-all harness imports it before the
+       compiler_infer suite, the current module-init path can exit before
+	       main. Keep this file out of run-all batching until that harness/module
+	       initialization issue is fixed. *)
+	    "compiler/blorp/tests/test_compiler_typecheck_decl.brp";
+	    (* Impl-declaration tests exercise the same declaration-checker import
+	       graph and can fail in a combined run-all harness with neighboring
+	       typecheck-state/typecheck-types suites. *)
+	    "compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp";
+	    (* This suite shares the typecheck declaration path above and can exit
+	       before main when imported in the same run-all harness as neighboring
+	       typecheck-state tests. Run it through the ordinary one-file wrapper so
+       module initialization is scoped to the test that needs it. *)
+    "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp";
     "tests/test_blorp/concurrency";
     "tests/test_blorp/memory";
     "tests/test_blorp/sys";
@@ -2714,10 +2729,11 @@ let suite_run_all_eligible_info ~leak_check mode info =
   && suite_selector_eligible_info mode info
   && not info.test_file_requires_process_isolation
 
-(* Keep combined TestSuite harnesses below the size where process-exit cleanup
-   can fail after all suites pass. This still avoids per-file compilation for
-   small compiler-owned suites while keeping the generated harness bounded. *)
-let run_all_suite_batch_size = 8
+(* Keep combined TestSuite harnesses below the size where module initialization
+   and process-exit cleanup can fail before or after all suites pass. Four is
+   the largest currently-safe batch for the compiler-owned Blorp suites while
+   still avoiding one compile per small suite. *)
+let run_all_suite_batch_size = 4
 
 let chunk_by_count size items =
   let rec take remaining count taken =
@@ -2907,7 +2923,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
     List.filter
       (fun info ->
         suite_selector_eligible_info mode info
-        && not (List.mem info.test_file_path run_all_files))
+        && not (List.mem info.test_file_path run_all_files)
+        && not info.test_file_requires_process_isolation)
       infos
   in
   let selector_files =

@@ -808,9 +808,17 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
     "system resource suites are process isolated" true
     (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/sys/test_file_resource.brp");
-  Alcotest.(check bool)
-    "ordinary type suite is not process isolated" false
-    (Blorp.Test_runner.requires_process_isolation
+	  Alcotest.(check bool)
+	    "compiler resource declaration suite is process isolated" true
+	    (Blorp.Test_runner.requires_process_isolation
+	       "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp");
+	  Alcotest.(check bool)
+	    "compiler impl declaration suite is process isolated" true
+	    (Blorp.Test_runner.requires_process_isolation
+	       "compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp");
+	  Alcotest.(check bool)
+	    "ordinary type suite is not process isolated" false
+	    (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
 
 let test_source_text_cache_guard_uses_current_file_contents () =

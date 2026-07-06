@@ -1,0 +1,396 @@
+import:
+	../compiler_typecheck_bridge: handle_request
+	json:
+		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_array,
+		as_bool,
+		as_string,
+		get_field,
+		parse_json,
+	test: TestSuite
+
+
+pure func request_json(action: String, payload: JsonValue) -> String:
+	JsonObject([
+		("schema", JsonNumber(1.0)),
+		("domain", JsonString("compiler")),
+		("action", JsonString(action)),
+		("payload", payload),
+	]).to_string()
+
+
+pure func response_value(source: String) -> Option[JsonValue]:
+	match parse_json(handle_request(source)):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
+
+pure func bool_field(value: JsonValue, name: String) -> Bool:
+	match get_field(value, name):
+		Some(field):
+			as_bool(field).get_or(False)
+		None:
+			False
+
+
+pure func string_field(value: JsonValue, name: String) -> String:
+	match get_field(value, name):
+		Some(field):
+			as_string(field).get_or("")
+		None:
+			""
+
+
+pure func artifact_field(value: JsonValue, name: String) -> Option[JsonValue]:
+	artifact ?= get_field(value, "artifact")
+	get_field(artifact, name)
+
+
+pure func artifact_string_field(value: JsonValue, name: String) -> String:
+	match get_field(value, "artifact"):
+		Some(artifact):
+			string_field(artifact, name)
+		None:
+			""
+
+
+pure func json_array_length(value: JsonValue, name: String) -> Int:
+	match get_field(value, name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					items.length()
+				None:
+					-1
+		None:
+			-1
+
+
+pure func artifact_array_length(value: JsonValue, name: String) -> Int:
+	match get_field(value, "artifact"):
+		Some(artifact):
+			json_array_length(artifact, name)
+		None:
+			-1
+
+
+pure func optional_string_field(value: JsonValue, name: String) -> Option[String]:
+	field ?= get_field(value, name)
+	as_string(field)
+
+
+pure func artifact_array_field(value: JsonValue, name: String) -> List[JsonValue]:
+	match get_field(value, "artifact"):
+		Some(artifact):
+			match get_field(artifact, name):
+				Some(field):
+					as_array(field).get_or([])
+				None:
+					[]
+		None:
+			[]
+
+
+pure func import_binding_exists(
+	bindings: List[JsonValue],
+	local_name: String,
+	module_path: String,
+	original_name: Option[String],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if (
+			string_field(binding, "local_name") == local_name
+			and string_field(binding, "module_path") == module_path
+			and optional_string_field(binding, "original_name") == original_name
+		):
+			found = True
+			break
+
+	found
+
+
+pure func error_code(value: JsonValue) -> String:
+	match get_field(value, "error"):
+		Some(error):
+			string_field(error, "code")
+		None:
+			""
+
+
+pure func typecheck_source_request(source: String) -> String:
+	request_json("typecheck_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+		]))
+
+
+pure func import_module_json(module_path: String, module_name: String, text: String) -> JsonValue:
+	JsonObject([
+		("path", JsonString(module_name + ".brp")),
+		("module", JsonString(module_name)),
+		("module_path", JsonString(module_path)),
+		("text", JsonString(text)),
+		("origin", JsonObject([("kind", JsonString("std"))])),
+	])
+
+
+pure func typecheck_source_request_with_imports(
+	source: String,
+	import_modules: List[JsonValue],
+) -> String:
+	request_json("typecheck_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("import_modules", JsonVector(import_modules)),
+		]))
+
+
+pure func json_string_array_contains(items: List[JsonValue], needle: String) -> Bool:
+	var found: Bool = False
+
+	for item in items:
+		match as_string(item):
+			Some(text):
+				if text.contains(needle):
+					found = True
+					break
+			None:
+				void
+
+	found
+
+
+pure func test_typecheck_source_returns_typed_program_artifact() -> Bool:
+	source: String = "func identity(value: Int) -> Int:\n\tvalue"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			match artifact_field(response, "typed_program"):
+				Some(typed_program):
+					(
+						bool_field(response, "ok")
+						and artifact_string_field(response, "ast_phase") == "typecheck_source"
+						and string_field(typed_program, "kind") == "typed_program"
+						and json_array_length(typed_program, "decls") == 1
+						and json_array_length(typed_program, "diagnostics") == 0
+						and artifact_array_length(response, "type_errors") == 0
+						and typed_program
+							.to_string()
+							.contains("identity")
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_typecheck_source_reports_type_errors() -> Bool:
+	source: String = "func bad() -> Int:\n\t\"no\""
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_array_length(response, "type_errors") > 0
+				and artifact_field(response, "typed_program").is_some()
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_returns_import_bindings() -> Bool:
+	source: String = "import:\n\toption: Option(Some, None)\n\tfile as File\n\nfunc main():\n\tvoid"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bindings: List[JsonValue] = artifact_array_field(response, "import_bindings")
+
+			(
+				bool_field(response, "ok")
+				and bindings.length() == 4
+				and import_binding_exists(bindings, "Option", "option", Some("Option"))
+				and import_binding_exists(bindings, "Some", "option", Some("Some"))
+				and import_binding_exists(bindings, "None", "option", Some("None"))
+				and import_binding_exists(bindings, "File", "file", None)
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_validates_import_modules() -> Bool:
+	source: String = "import:\n\tdep: Missing\n\nfunc identity(value: Int) -> Int:\n\tvalue"
+	dep_text: String = "record Token {value: Int}"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(errors, "'Missing' is not exported by module 'dep'")
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_qualified_imported_function() -> Bool:
+	source: String = "import:\n\tdep as Dep\n\nfunc identity() -> Int:\n\tDep.answer()"
+	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_selectively_imported_function() -> Bool:
+	source: String = "import:\n\tdep: answer\n\nfunc identity() -> Int:\n\tanswer()"
+	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_aliased_imported_function() -> Bool:
+	source: String = "import:\n\tdep: answer as calc\n\nfunc identity() -> Int:\n\tcalc()"
+	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_rejects_bare_qualified_only_import() -> Bool:
+	source: String = "import:\n\tdep as Dep\n\nfunc identity() -> Int:\n\tanswer()"
+	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(errors, "Unbound value `answer`")
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_rejects_private_qualified_import() -> Bool:
+	source: String = "import:\n\tdep as Dep\n\nfunc identity() -> Int:\n\tDep.secret()"
+	dep_text: String = "private pure func secret() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(errors, "has no function `secret`")
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_rejects_wrong_action() -> Bool:
+	request: String = request_json("parse_source", JsonObject([]))
+
+	match response_value(request):
+		Some(response):
+			not bool_field(response, "ok") and error_code(response) == "unsupported_action"
+		None:
+			False
+
+
+pure func test_typecheck_source_requires_text() -> Bool:
+	request: String = request_json("typecheck_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+		]))
+
+	match response_value(request):
+		Some(response):
+			not bool_field(response, "ok") and error_code(response) == "invalid_request"
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler typecheck bridge",
+	tests = [
+		(
+			"typecheck_source returns typed program artifact",
+			test_typecheck_source_returns_typed_program_artifact,
+		),
+		("typecheck_source reports type errors", test_typecheck_source_reports_type_errors),
+		("typecheck_source returns import bindings", test_typecheck_source_returns_import_bindings),
+		(
+			"typecheck_source validates import modules",
+			test_typecheck_source_validates_import_modules,
+		),
+		(
+			"typecheck_source uses qualified imported function",
+			test_typecheck_source_uses_qualified_imported_function,
+		),
+		(
+			"typecheck_source uses selectively imported function",
+			test_typecheck_source_uses_selectively_imported_function,
+		),
+		(
+			"typecheck_source uses aliased imported function",
+			test_typecheck_source_uses_aliased_imported_function,
+		),
+		(
+			"typecheck_source rejects bare qualified-only import",
+			test_typecheck_source_rejects_bare_qualified_only_import,
+		),
+		(
+			"typecheck_source rejects private qualified import",
+			test_typecheck_source_rejects_private_qualified_import,
+		),
+		("typecheck bridge rejects wrong action", test_typecheck_source_rejects_wrong_action),
+		("typecheck_source requires text", test_typecheck_source_requires_text),
+	]
+}

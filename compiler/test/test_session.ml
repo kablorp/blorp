@@ -488,7 +488,7 @@ let dep_value_surface ?(name = "dep_value") () : Module_surface.t =
 let test_preloaded_parse_cache_preserves_module_surface () =
   with_temp_dir "blorp_trusted_preload_surface" (fun dir ->
       let dep_path = Filename.concat dir "dep.brp" in
-      let original_source = "dep_value = 1\n" in
+      let original_source = "dep_value = 1\nother_value = 2\n" in
       write_file dep_path original_source;
       let decls =
         match
@@ -518,9 +518,15 @@ let test_preloaded_parse_cache_preserves_module_surface () =
         "cached surface exports" [ "dep_value" ]
         (Option.value ~default:[]
            (Option.map Module_surface.export_names entry.parsed_surface));
+      Alcotest.(check (list string))
+        "cached exports are surface-backed" [ "dep_value" ]
+        (List.map fst entry.parsed_exports);
       match Modules.load_module ~sess "./dep" dir with
       | None -> Alcotest.fail "expected trusted preloaded module to load"
       | Some loaded ->
+          Alcotest.(check (list string))
+            "loaded exports are surface-backed" [ "dep_value" ]
+            (List.map fst loaded.exports);
           Alcotest.(check (list string))
             "loaded surface exports" [ "dep_value" ]
             (Option.value ~default:[]

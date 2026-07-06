@@ -95,6 +95,68 @@ pure func compiler_type_list(element: CompilerType) -> CompilerType:
 	CompilerNamedType("List", [element])
 
 
+pure func compiler_type_copy(typ: CompilerType) -> CompilerType:
+	match typ:
+		CompilerNamedType(name, args):
+			CompilerNamedType(
+				name,
+				args.map(compiler_type_copy),
+			)
+		CompilerArrayType(element, dims):
+			CompilerArrayType(
+				compiler_type_copy(element),
+				dims.map(compiler_type_copy),
+			)
+		CompilerFunctionType(is_pure, params, return_type):
+			CompilerFunctionType(
+				is_pure,
+				params.map(compiler_type_copy),
+				compiler_type_copy(return_type),
+			)
+		CompilerTypeVar(name):
+			CompilerTypeVar(name)
+		CompilerConstIntType(value):
+			CompilerConstIntType(value)
+		CompilerTupleType(elements):
+			CompilerTupleType(elements.map(compiler_type_copy))
+		CompilerSelfType:
+			CompilerSelfType
+		CompilerVarDimsType(name):
+			CompilerVarDimsType(name)
+		CompilerRangeType(inner):
+			CompilerRangeType(compiler_type_copy(inner))
+		CompilerDimOpType(op, left, right):
+			CompilerDimOpType(op, compiler_type_copy(left), compiler_type_copy(right))
+		CompilerMetaType(meta_id):
+			CompilerMetaType(meta_id)
+
+
+pure func compiler_type_contains_meta(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerNamedType(_, args):
+			args.any(compiler_type_contains_meta)
+		CompilerArrayType(element, dims):
+			compiler_type_contains_meta(element) or dims.any(compiler_type_contains_meta)
+		CompilerFunctionType(_, params, return_type):
+			params.any(compiler_type_contains_meta) or compiler_type_contains_meta(return_type)
+		CompilerTypeVar(_):
+			False
+		CompilerConstIntType(_):
+			False
+		CompilerTupleType(elements):
+			elements.any(compiler_type_contains_meta)
+		CompilerSelfType:
+			False
+		CompilerVarDimsType(_):
+			False
+		CompilerRangeType(inner):
+			compiler_type_contains_meta(inner)
+		CompilerDimOpType(_, left, right):
+			compiler_type_contains_meta(left) or compiler_type_contains_meta(right)
+		CompilerMetaType(_):
+			True
+
+
 pure func compiler_normalize_type_name(name: String) -> String:
 	if name == TYPE_NAME_VECTOR or name == TYPE_NAME_MATRIX:
 		TYPE_NAME_TENSOR
@@ -451,6 +513,166 @@ pure func compiler_types_equal(left: CompilerType, right: CompilerType) -> Bool:
 										False
 							CompilerArrayType(_, _):
 								False
+
+
+private pure func compiler_type_param_names_include(
+	type_params: List[String],
+	name: String,
+) -> Bool:
+	stripped_name: String = compiler_strip_type_param_bounds(name)
+	var index: Int = 0
+	var found: Bool = False
+
+	while index < type_params.length() and not found:
+		match type_params.get(index):
+			Some(param):
+				found = compiler_strip_type_param_bounds(param) == stripped_name
+			None:
+				void
+
+		index += 1
+
+	found
+
+
+private pure func compiler_type_lists_compatible_with_params(
+	type_params: List[String],
+	expected: List[CompilerType],
+	actual: List[CompilerType],
+) -> Bool:
+	if expected.length() != actual.length():
+		False
+	else:
+		var index: Int = 0
+		var compatible: Bool = True
+
+		while index < expected.length() and compatible:
+			match (expected.get(index), actual.get(index)):
+				(Some(expected_item), Some(actual_item)):
+					compatible = compiler_types_compatible_with_params(
+						type_params,
+						expected_item,
+						actual_item,
+					)
+				_:
+					compatible = False
+
+			index += 1
+
+		compatible
+
+
+pure func compiler_types_compatible_with_params(
+	type_params: List[String],
+	expected: CompilerType,
+	actual: CompilerType,
+) -> Bool:
+	if compiler_types_equal(expected, actual):
+		True
+	else:
+		match expected:
+			CompilerTypeVar(name):
+				compiler_type_param_names_include(type_params, name)
+			CompilerNamedType(expected_name, expected_args):
+				if (
+					expected_args.length() == 0
+					and compiler_type_param_names_include(type_params, expected_name)
+				):
+					True
+				else:
+					match actual:
+						CompilerConstIntType(_):
+							expected_name == TYPE_NAME_INT and expected_args.length() == 0
+						CompilerNamedType(actual_name, actual_args):
+							(
+								compiler_normalize_type_name(
+									expected_name,
+								) == compiler_normalize_type_name(actual_name)
+								and compiler_type_lists_compatible_with_params(
+									type_params,
+									expected_args,
+									actual_args,
+								)
+							)
+						CompilerTupleType(actual_elements):
+							(
+								expected_name == TYPE_NAME_TUPLE
+								and compiler_type_lists_compatible_with_params(
+									type_params,
+									expected_args,
+									actual_elements,
+								)
+							)
+						_:
+							False
+			CompilerArrayType(expected_element, expected_dims):
+				match compiler_array_type_parts(actual):
+					Some((actual_element, actual_dims)):
+						(
+							compiler_types_compatible_with_params(
+								type_params,
+								expected_element,
+								actual_element,
+							)
+							and compiler_type_lists_compatible_with_params(
+								type_params,
+								expected_dims,
+								actual_dims,
+							)
+						)
+					None:
+						False
+			CompilerTupleType(expected_elements):
+				match actual:
+					CompilerTupleType(actual_elements):
+						compiler_type_lists_compatible_with_params(
+							type_params,
+							expected_elements,
+							actual_elements,
+						)
+					CompilerNamedType(actual_name, actual_elements):
+						(
+							actual_name == TYPE_NAME_TUPLE
+							and compiler_type_lists_compatible_with_params(
+								type_params,
+								expected_elements,
+								actual_elements,
+							)
+						)
+					_:
+						False
+			CompilerFunctionType(expected_pure, expected_params, expected_return):
+				match actual:
+					CompilerFunctionType(actual_pure, actual_params, actual_return):
+						(
+							(not expected_pure or actual_pure)
+							and compiler_type_lists_compatible_with_params(
+								type_params,
+								expected_params,
+								actual_params,
+							)
+							and compiler_types_compatible_with_params(
+								type_params,
+								expected_return,
+								actual_return,
+							)
+						)
+					_:
+						False
+			CompilerRangeType(expected_inner):
+				match actual:
+					CompilerRangeType(actual_inner):
+						compiler_types_compatible_with_params(
+							type_params,
+							expected_inner,
+							actual_inner,
+						)
+					_:
+						False
+			CompilerVarDimsType(name):
+				compiler_type_param_names_include(type_params, name)
+			_:
+				False
 
 
 private pure func compiler_type_list_occurs_in(var_name: String, types: List[CompilerType]) -> Bool:

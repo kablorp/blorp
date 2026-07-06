@@ -3137,7 +3137,9 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
                       exports
                   in
                   if matching = [] then
-                    let private_names = Modules.collect_private_names m.decls in
+                    let private_names =
+                      Modules.private_names_for_import_diagnostics m
+                    in
                     let is_private =
                       List.exists
                         (fun (name, _) -> name = sym.sym_name)

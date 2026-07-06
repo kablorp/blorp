@@ -36,6 +36,7 @@ let suite_group prefix suite =
 
 let default_suites =
   suite_group "TypedAst" Test_typed_ast.suite
+  @ suite_group "TypedAstJson" Test_typed_ast_json.suite
   @ suite_group "CtfeIntrinsic" Test_ctfe_intrinsic.suite
   @ suite_group "CtfeIr" Test_ctfe_ir.suite
   @ suite_group "CtfeMaterialize" Test_ctfe_materialize.suite

@@ -769,6 +769,11 @@ let collect_private_names decls =
       | _ -> [])
     decls
 
+let private_names_for_import_diagnostics (m : loaded_module) =
+  match m.surface with
+  | Some surface -> Module_surface.private_names_as_ast_pairs m.decls surface
+  | None -> collect_private_names m.decls
+
 (** Suggest a similar export name for typo correction.
     Uses simple Levenshtein-like matching on module exports. *)
 let suggest_export (m : loaded_module) (name : string) : string option =
