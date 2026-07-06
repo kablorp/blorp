@@ -1490,6 +1490,31 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
         "parser and typecheck helpers use distinct cache keys" true
         (parser.bridge_key <> typecheck.bridge_key))
 
+let test_bridge_cache_key_includes_std_sources () =
+  with_temp_dir (fun root ->
+      let compiler_dir = Filename.concat root "compiler" in
+      let blorp_dir = Filename.concat compiler_dir "blorp" in
+      let std_dir = Filename.concat root "std" in
+      let program = Filename.concat root "blorp" in
+      let backend_source = Filename.concat blorp_dir "compiler_bridge_cli.brp" in
+      let std_source = Filename.concat std_dir "prelude.brp" in
+      mkdir compiler_dir;
+      mkdir blorp_dir;
+      mkdir std_dir;
+      write_file program "#!/usr/bin/env bash\n";
+      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file std_source "pure func helper() -> Int: 1\n";
+      let before =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+      in
+      write_file std_source "pure func helper() -> Int: 2\n";
+      let after =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+      in
+      Alcotest.(check bool)
+        "std source edits invalidate helper cache" true
+        (before.bridge_key <> after.bridge_key))
+
 let test_prepared_bridge_binary_env_accepts_existing_file () =
   with_temp_dir (fun root ->
       let bin = Filename.concat root "prepared-bridge.bin" in
@@ -1697,6 +1722,8 @@ let suite =
           `Quick test_bridge_helper_compiler_rejects_current_executable_override;
         Alcotest.test_case "cache key includes helper entrypoint" `Quick
           test_bridge_cache_key_includes_helper_entrypoint;
+        Alcotest.test_case "cache key includes std sources" `Quick
+          test_bridge_cache_key_includes_std_sources;
         Alcotest.test_case "prepared env accepts existing helper" `Quick
           test_prepared_bridge_binary_env_accepts_existing_file;
         Alcotest.test_case "prepared env rejects missing helper" `Quick

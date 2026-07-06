@@ -8,17 +8,23 @@
 let contains_substring haystack needle =
   let hlen = String.length haystack in
   let nlen = String.length needle in
+  let rec matches_at i j =
+    j = nlen || (haystack.[i + j] = needle.[j] && matches_at i (j + 1))
+  in
   let rec loop i =
-    i + nlen <= hlen && (String.sub haystack i nlen = needle || loop (i + 1))
+    i + nlen <= hlen && (matches_at i 0 || loop (i + 1))
   in
   nlen = 0 || loop 0
 
 let count_substring haystack needle =
   let hlen = String.length haystack in
   let nlen = String.length needle in
+  let rec matches_at i j =
+    j = nlen || (haystack.[i + j] = needle.[j] && matches_at i (j + 1))
+  in
   let rec loop count i =
     if nlen = 0 || i + nlen > hlen then count
-    else if String.sub haystack i nlen = needle then loop (count + 1) (i + nlen)
+    else if matches_at i 0 then loop (count + 1) (i + nlen)
     else loop count (i + 1)
   in
   loop 0 0
@@ -32,6 +38,9 @@ let contains_token haystack needle =
   let nlen = String.length needle in
   let token_ends_ident = nlen > 0 && is_ident_char needle.[nlen - 1] in
   let token_starts_ident = nlen > 0 && is_ident_char needle.[0] in
+  let rec matches_at i j =
+    j = nlen || (haystack.[i + j] = needle.[j] && matches_at i (j + 1))
+  in
   let left_boundary i =
     i = 0 || (not token_starts_ident) || not (is_ident_char haystack.[i - 1])
   in
@@ -42,7 +51,7 @@ let contains_token haystack needle =
   in
   let rec loop i =
     i + nlen <= hlen
-    && (String.sub haystack i nlen = needle
+    && (matches_at i 0
         && left_boundary i && right_boundary i
        || loop (i + 1))
   in
@@ -140,14 +149,26 @@ let repo_rel path =
   then String.sub path prefix_len (String.length path - prefix_len)
   else path
 
-let lib_sources () = walk_files (find_project_file "compiler/lib")
+let lib_source_paths = lazy (walk_files (find_project_file "compiler/lib"))
+
+let lib_sources () = Lazy.force lib_source_paths
+
+let stripped_source_cache : (string, string) Hashtbl.t = Hashtbl.create 128
+
+let stripped_file_source path =
+  match Hashtbl.find_opt stripped_source_cache path with
+  | Some content -> content
+  | None ->
+      let content = strip_comments_and_strings (read_file path) in
+      Hashtbl.replace stripped_source_cache path content;
+      content
 
 let assert_token_only_in_files ~paths ~allowed_files token =
   paths
   |> List.iter (fun path ->
       let rel = repo_rel path in
       if not (List.mem rel allowed_files) then
-        let content = strip_comments_and_strings (read_file path) in
+        let content = stripped_file_source path in
         if contains_token content token then
           Alcotest.failf
             "%s uses %s directly; route through the explicit boundary" rel token)

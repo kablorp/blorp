@@ -7,15 +7,18 @@
 scripts/test
 
 # Run specific gates
-scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
+scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
+scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # Fast compiler surface tests
 scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
+scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --coverage         # Compiler-unit coverage report
+scripts/test --timings          # Print slow compiler-unit/deep Alcotest cases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -31,6 +34,9 @@ scripts/test runtime
 and the final summary, while failures print the failing cases and a short
 excerpt. Use `--verbose` when debugging runner behavior or when you need the old
 pass-by-pass stream.
+Use `--timings` when investigating slow `compiler-unit` or
+`compiler-unit-deep` runs; the harness prints the slowest cases and stores
+stable `BLORP_COMPILER_UNIT_TIMING` records in logs saved with `--log-dir`.
 
 `scripts/test` also holds a per-worktree build lock for the duration of the
 gate. This keeps concurrent local invocations from racing on Dune build state,
@@ -49,8 +55,9 @@ top-level gate summary. `./blorp test` emits the line only when
 
 ## Terminology
 
-- A **gate** is a top-level validation entry such as `compiler-unit`, `compiler`,
-  `compiler-deep`, `runtime`, `leak`, `doctest`, or `cli`.
+- A **gate** is a top-level validation entry such as `compiler-unit`,
+  `compiler-unit-deep`, `compiler`, `compiler-deep`, `runtime`, `leak`,
+  `doctest`, `cli`, or `cli-deep`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
   `tests: TestSuite` value.
@@ -111,7 +118,11 @@ tests/
 
 ### Compiler Unit Tests
 
-Add tests in `compiler/test/test_*.ml`. See `test_types.ml` for examples. Run with `make compiler-unit-test`.
+Add tests in `compiler/test/test_*.ml`. See `test_types.ml` for examples. Use
+`compiler-unit` for phase-local compiler logic and `compiler-unit-deep` for
+internal integration tests that cross session, LSP, package, pipeline, test
+runner, or bridge boundaries. Run with `make compiler-unit-test` or
+`make compiler-unit-deep-test`.
 
 ### Runtime Tests (TestSuite)
 
@@ -141,7 +152,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
 ## Adding Tests
 
 1. Choose the right location:
-   - Compiler internals → `compiler/test/` (compiler-unit tests)
+   - Compiler internals → `compiler/test/` (`compiler-unit` or `compiler-unit-deep`)
    - New syntax → `test_compiler/parser/`
    - Type inference behavior → `test_compiler/infer/`
    - Type checking rules → `test_compiler/typecheck/`
@@ -149,7 +160,8 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh`
+   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh --smoke`
+   - Full CLI package/formatter integration behavior → `tests/test_cli.sh --all`
    - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
      marker comments and a neighboring JSON spec
    - Standard library examples → doctests in `std/`

@@ -5,11 +5,53 @@ set -u
 
 cd "$(dirname "$0")/.."
 
+usage() {
+    cat <<'EOF'
+Usage: tests/test_cli.sh [--all|--smoke]
+
+Options:
+  --all     Run the full CLI integration set, including package lifecycle and formatter tool checks.
+  --smoke   Run public command-surface smoke checks only.
+EOF
+}
+
+CLI_MODE="all"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)
+            CLI_MODE="all"
+            shift
+            ;;
+        --smoke)
+            CLI_MODE="smoke"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
 BLORP_BIN="${BLORP_BIN:-./blorp}"
 if [[ "$BLORP_BIN" = /* ]]; then
     BLORP_BIN_ABS="$BLORP_BIN"
 else
     BLORP_BIN_ABS="$PWD/${BLORP_BIN#./}"
+fi
+CLI_GATE_NAME="${BLORP_CLI_GATE_NAME:-cli}"
+# Smoke mode is the default local-loop shape used by scripts/test. The full
+# mode keeps package cache/vendor workflows and self-hosted formatter checks
+# available for premerge, where broader process/compiler integration is useful
+# enough to justify the extra work.
+run_deep_checks=true
+if [ "$CLI_MODE" = "smoke" ]; then
+    run_deep_checks=false
 fi
 # Cold self-hosted formatter startup may need to compile the embedded Blorp
 # formatter before the format checks can run.
@@ -392,71 +434,75 @@ expect_output_contains "package help" 0 "Usage: blorp package" \
     "$BLORP_BIN" package --help
 expect_output_contains "package check success" 0 "Package sample: ok" \
     "$BLORP_BIN" package check "$package_ok"
-TOTAL=$((TOTAL + 1))
-if run_capture "" "$BLORP_BIN" package hash "$package_ok" \
-    && [[ "$RUN_OUTPUT" =~ ^[0-9a-f]{64}$ ]]; then
-    record_pass "package hash success"
-    package_hash="$RUN_OUTPUT"
-else
-    record_fail "package hash success" \
-        "expected 64 lowercase hex characters, got: $RUN_OUTPUT"
-    package_hash=""
-fi
-if [ -n "$package_hash" ]; then
-    expect_output_contains "package pack success" 0 "Hash $package_hash" \
-        "$BLORP_BIN" package pack "$package_ok" -o "$package_artifact"
-    cat > "$package_cache_project/blorp.toml" <<TOML
+expect_output_contains "package check rejects external import" 1 "may import only std modules" \
+    "$BLORP_BIN" package check "$package_bad"
+
+if $run_deep_checks; then
+    TOTAL=$((TOTAL + 1))
+    if run_capture "" "$BLORP_BIN" package hash "$package_ok" \
+        && [[ "$RUN_OUTPUT" =~ ^[0-9a-f]{64}$ ]]; then
+        record_pass "package hash success"
+        package_hash="$RUN_OUTPUT"
+    else
+        record_fail "package hash success" \
+            "expected 64 lowercase hex characters, got: $RUN_OUTPUT"
+        package_hash=""
+    fi
+    if [ -n "$package_hash" ]; then
+        expect_output_contains "package pack success" 0 "Hash $package_hash" \
+            "$BLORP_BIN" package pack "$package_ok" -o "$package_artifact"
+        cat > "$package_cache_project/blorp.toml" <<TOML
 [packages]
 sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
-    cat > "$package_cache_alias_project/blorp.toml" <<TOML
+        cat > "$package_cache_alias_project/blorp.toml" <<TOML
 [packages]
 sample_v1 = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
-    expect_output_contains "package fetch success" 0 "Hash $package_hash" \
-        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-    expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-    expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    expect_output_contains "package fetch renamed alias success" 0 "Hash $package_hash" \
-        env BLORP_PACKAGE_CACHE="$package_alias_cache" bash -c 'cd "$1" && "$2" package fetch sample_v1' bash "$package_cache_alias_project" "$BLORP_BIN_ABS"
-    expect_output_contains "check cached package alias missing cache suggests fetch" 1 "blorp package fetch sample" \
-        env BLORP_PACKAGE_CACHE="$package_missing_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
-    expect_output_contains "package fetch all success" 0 "Fetched sample" \
-        env BLORP_PACKAGE_CACHE="$package_fetch_all_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    cat > "$package_ambiguous_project/blorp.toml" <<TOML
+        expect_output_contains "package fetch success" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+        expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+        expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+        expect_output_contains "package fetch renamed alias success" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_alias_cache" bash -c 'cd "$1" && "$2" package fetch sample_v1' bash "$package_cache_alias_project" "$BLORP_BIN_ABS"
+        expect_output_contains "check cached package alias missing cache suggests fetch" 1 "blorp package fetch sample" \
+            env BLORP_PACKAGE_CACHE="$package_missing_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
+        expect_output_contains "package fetch all success" 0 "Fetched sample" \
+            env BLORP_PACKAGE_CACHE="$package_fetch_all_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_cache_project" "$BLORP_BIN_ABS"
+        cat > "$package_ambiguous_project/blorp.toml" <<TOML
 [packages]
 sample_a = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 sample_b = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
-    cat > "$package_vendor_all_project/blorp.toml" <<TOML
+        cat > "$package_vendor_all_project/blorp.toml" <<TOML
 [packages]
 sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
-    expect_output_contains "package vendor all success" 0 "Vendored sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
-    expect_output_contains "package vendor all idempotent" 0 "Already vendored sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
-    if [ -f "$package_vendor_all_project/vendor/sample/src/sample.brp" ]; then
-        TOTAL=$((TOTAL + 1))
-        record_pass "package vendor all writes source"
-    else
-        TOTAL=$((TOTAL + 1))
-        record_fail "package vendor all writes source" \
-            "missing $package_vendor_all_project/vendor/sample/src/sample.brp"
-    fi
-    expect_output_contains "package fetch hash ambiguity" 1 "matches multiple aliases" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch "$3"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}"
-    expect_output_contains "package vendor explicit hash ignores config ambiguity" 0 "Vendored sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor "$3" "$4"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}" "$TMPDIR_CLI/package_vendor_hash_explicit"
-    if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-        package_http_dir="$TMPDIR_CLI/package_http"
-        package_http_port_file="$TMPDIR_CLI/package_http_port"
-        package_http_cache="$TMPDIR_CLI/package_http_cache"
-        mkdir -p "$package_http_dir" "$package_http_cache"
-        cp "$package_artifact" "$package_http_dir/sample.blorpkg"
-        python3 - "$package_http_dir" "$package_http_port_file" <<'PY' &
+        expect_output_contains "package vendor all success" 0 "Vendored sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
+        expect_output_contains "package vendor all idempotent" 0 "Already vendored sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
+        if [ -f "$package_vendor_all_project/vendor/sample/src/sample.brp" ]; then
+            TOTAL=$((TOTAL + 1))
+            record_pass "package vendor all writes source"
+        else
+            TOTAL=$((TOTAL + 1))
+            record_fail "package vendor all writes source" \
+                "missing $package_vendor_all_project/vendor/sample/src/sample.brp"
+        fi
+        expect_output_contains "package fetch hash ambiguity" 1 "matches multiple aliases" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch "$3"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}"
+        expect_output_contains "package vendor explicit hash ignores config ambiguity" 0 "Vendored sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor "$3" "$4"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}" "$TMPDIR_CLI/package_vendor_hash_explicit"
+        if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+            package_http_dir="$TMPDIR_CLI/package_http"
+            package_http_port_file="$TMPDIR_CLI/package_http_port"
+            package_http_cache="$TMPDIR_CLI/package_http_cache"
+            mkdir -p "$package_http_dir" "$package_http_cache"
+            cp "$package_artifact" "$package_http_dir/sample.blorpkg"
+            python3 - "$package_http_dir" "$package_http_port_file" <<'PY' &
 import http.server
 import socketserver
 import sys
@@ -479,51 +525,50 @@ with QuietTCPServer(("127.0.0.1", 0), QuietHandler) as httpd:
         f.write(str(httpd.server_address[1]))
     httpd.serve_forever()
 PY
-        package_http_pid=$!
-        CHILD_PIDS+=("$package_http_pid")
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            [ -f "$package_http_port_file" ] && break
-            sleep 0.1
-        done
-        if [ -f "$package_http_port_file" ]; then
-            package_http_port=$(cat "$package_http_port_file")
-            expect_output_contains "package fetch http success" 0 "Hash $package_hash" \
-                env BLORP_PACKAGE_CACHE="$package_http_cache" "$BLORP_BIN" package fetch "$package_hash" "http://127.0.0.1:$package_http_port/sample.blorpkg"
+            package_http_pid=$!
+            CHILD_PIDS+=("$package_http_pid")
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                [ -f "$package_http_port_file" ] && break
+                sleep 0.1
+            done
+            if [ -f "$package_http_port_file" ]; then
+                package_http_port=$(cat "$package_http_port_file")
+                expect_output_contains "package fetch http success" 0 "Hash $package_hash" \
+                    env BLORP_PACKAGE_CACHE="$package_http_cache" "$BLORP_BIN" package fetch "$package_hash" "http://127.0.0.1:$package_http_port/sample.blorpkg"
+            else
+                TOTAL=$((TOTAL + 1))
+                record_fail "package fetch http success" "local http server did not start"
+            fi
+        fi
+        expect_exit "check cached package alias project" 0 \
+            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
+        expect_exit "check cached package renamed alias project" 0 \
+            env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
+        expect_output_contains "package vendor success" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
+        expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+        expect_output_contains "package vendor alias idempotent" 0 "Already vendored sample" \
+            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+        if [ -f "$package_vendor/src/sample.brp" ]; then
+            TOTAL=$((TOTAL + 1))
+            record_pass "package vendor writes source"
         else
             TOTAL=$((TOTAL + 1))
-            record_fail "package fetch http success" "local http server did not start"
+            record_fail "package vendor writes source" "missing $package_vendor/src/sample.brp"
+        fi
+        if [ -f "$package_cache_project/vendor/sample/src/sample.brp" ]; then
+            TOTAL=$((TOTAL + 1))
+            record_pass "package vendor alias writes source"
+        else
+            TOTAL=$((TOTAL + 1))
+            record_fail "package vendor alias writes source" \
+                "missing $package_cache_project/vendor/sample/src/sample.brp"
         fi
     fi
-    expect_exit "check cached package alias project" 0 \
-        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
-    expect_exit "check cached package renamed alias project" 0 \
-        env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
-    expect_output_contains "package vendor success" 0 "Hash $package_hash" \
-        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
-    expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    expect_output_contains "package vendor alias idempotent" 0 "Already vendored sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    if [ -f "$package_vendor/src/sample.brp" ]; then
-        TOTAL=$((TOTAL + 1))
-        record_pass "package vendor writes source"
-    else
-        TOTAL=$((TOTAL + 1))
-        record_fail "package vendor writes source" "missing $package_vendor/src/sample.brp"
-    fi
-    if [ -f "$package_cache_project/vendor/sample/src/sample.brp" ]; then
-        TOTAL=$((TOTAL + 1))
-        record_pass "package vendor alias writes source"
-    else
-        TOTAL=$((TOTAL + 1))
-        record_fail "package vendor alias writes source" \
-            "missing $package_cache_project/vendor/sample/src/sample.brp"
-    fi
+    expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
+    expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
 fi
-expect_output_contains "package check rejects external import" 1 "may import only std modules" \
-    "$BLORP_BIN" package check "$package_bad"
-expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
-expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
 if [ -f "$compiled_c" ]; then
@@ -592,15 +637,16 @@ expect_output_contains "format diff implies check" 1 "needs formatting" \
 
 expect_exit "purify dry-run success" 0 "$BLORP_BIN" purify --dry-run "$valid_prog"
 
-formatter_src="$TMPDIR_CLI/formatter_src.brp"
-formatter_expected="$TMPDIR_CLI/formatter_expected.brp"
-formatter_err="$TMPDIR_CLI/formatter.err"
-formatter_tool_c="$TMPDIR_CLI/formatter_tool.c"
-formatter_tool_bin="$TMPDIR_CLI/formatter_tool"
-formatter_tool_ready=false
-: > "$formatter_err"
+if $run_deep_checks; then
+    formatter_src="$TMPDIR_CLI/formatter_src.brp"
+    formatter_expected="$TMPDIR_CLI/formatter_expected.brp"
+    formatter_err="$TMPDIR_CLI/formatter.err"
+    formatter_tool_c="$TMPDIR_CLI/formatter_tool.c"
+    formatter_tool_bin="$TMPDIR_CLI/formatter_tool"
+    formatter_tool_ready=false
+    : > "$formatter_err"
 
-cat > "$formatter_src" <<'BRP'
+    cat > "$formatter_src" <<'BRP'
 import:
     dict as D
     list: get, append
@@ -671,36 +717,37 @@ func main(args: List[String]) -> Int:
     0
 BRP
 
-TOTAL=$((TOTAL + 1))
-cp "$formatter_src" "$formatter_expected"
-: > "$formatter_err"
-if "$BLORP_BIN" format "$formatter_expected" > "$formatter_err" 2>&1 \
-    && "$BLORP_BIN" format --check "$formatter_expected" > "$formatter_err" 2>&1; then
-    record_pass "production formatter formats representative program"
-else
-    record_fail "production formatter formats representative program" "$(cat "$formatter_err")"
-fi
+    TOTAL=$((TOTAL + 1))
+    cp "$formatter_src" "$formatter_expected"
+    : > "$formatter_err"
+    if "$BLORP_BIN" format "$formatter_expected" > "$formatter_err" 2>&1 \
+        && "$BLORP_BIN" format --check "$formatter_expected" > "$formatter_err" 2>&1; then
+        record_pass "production formatter formats representative program"
+    else
+        record_fail "production formatter formats representative program" "$(cat "$formatter_err")"
+    fi
 
-TOTAL=$((TOTAL + 1))
-: > "$formatter_err"
-if "$BLORP_BIN" compile --no-format -o "$formatter_tool_c" tools/formatter/formatter.brp > "$formatter_err" 2>&1 \
-    && "${CC:-cc}" -O2 -fwrapv -w "$formatter_tool_c" -lm -lpthread -o "$formatter_tool_bin" >> "$formatter_err" 2>&1; then
-    formatter_tool_ready=true
-    record_pass "Blorp formatter tool compiles"
-else
-    record_fail "Blorp formatter tool compiles" "$(cat "$formatter_err")"
-fi
+    TOTAL=$((TOTAL + 1))
+    : > "$formatter_err"
+    if "$BLORP_BIN" compile --no-format -o "$formatter_tool_c" tools/formatter/formatter.brp > "$formatter_err" 2>&1 \
+        && "${CC:-cc}" -O2 -fwrapv -w "$formatter_tool_c" -lm -lpthread -o "$formatter_tool_bin" >> "$formatter_err" 2>&1; then
+        formatter_tool_ready=true
+        record_pass "Blorp formatter tool compiles"
+    else
+        record_fail "Blorp formatter tool compiles" "$(cat "$formatter_err")"
+    fi
 
-expect_formatter_output_contains "Blorp formatter dispatcher help" 0 "Usage: formatter" --help
-expect_formatter_output_contains "Blorp formatter subcommand help" 0 \
-    "Usage: formatter program" program --help
-expect_formatter_output_contains "Blorp formatter rejects unknown option" 1 \
-    "unknown argument: --bogus" program --bogus "$formatter_src"
-expect_formatter_output_contains "Blorp formatter rejects odd program batch args" 1 \
-    "program-batch command requires <program-json-file> <output-file> pairs" \
-    program-batch "$formatter_src"
-expect_formatter_output_contains "Blorp formatter rejects removed document command" 1 \
-    "unknown formatter command: document" document --help
+    expect_formatter_output_contains "Blorp formatter dispatcher help" 0 "Usage: formatter" --help
+    expect_formatter_output_contains "Blorp formatter subcommand help" 0 \
+        "Usage: formatter program" program --help
+    expect_formatter_output_contains "Blorp formatter rejects unknown option" 1 \
+        "unknown argument: --bogus" program --bogus "$formatter_src"
+    expect_formatter_output_contains "Blorp formatter rejects odd program batch args" 1 \
+        "program-batch command requires <program-json-file> <output-file> pairs" \
+        program-batch "$formatter_src"
+    expect_formatter_output_contains "Blorp formatter rejects removed document command" 1 \
+        "unknown formatter command: document" document --help
+fi
 
 expect_output_contains "repl help" 0 "Usage: blorp repl" "$BLORP_BIN" repl --help
 expect_stdin_exit "repl quit" 0 ":quit
@@ -714,9 +761,9 @@ expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus
 echo ""
 echo "Results: $PASS passed, $FAIL failed ($TOTAL CLI checks)"
 if [ "$FAIL" -gt 0 ]; then
-    echo "BLORP_GATE_RESULT gate=cli status=FAIL passed=$PASS failed=$FAIL tests=$TOTAL"
+    echo "BLORP_GATE_RESULT gate=$CLI_GATE_NAME status=FAIL passed=$PASS failed=$FAIL tests=$TOTAL"
 else
-    echo "BLORP_GATE_RESULT gate=cli status=PASS passed=$PASS failed=0 tests=$TOTAL"
+    echo "BLORP_GATE_RESULT gate=$CLI_GATE_NAME status=PASS passed=$PASS failed=0 tests=$TOTAL"
 fi
 
 if [ "$FAIL" -gt 0 ]; then

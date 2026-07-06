@@ -10,13 +10,15 @@ lower-level test runners directly.
 
 ```bash
 scripts/test                    # default local gates
-scripts/test compiler-unit      # compiler-internal OCaml/Alcotest tests
+scripts/test compiler-unit      # compiler-internal OCaml/Alcotest unit-shaped tests
+scripts/test compiler-unit-deep # compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # fast compiler surface fixtures
 scripts/test compiler-deep      # generated-C audit, format/purify, compiler/blorp
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
 scripts/test cli                # public CLI, REPL, and LSP smoke tests
+scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test compiler-unit compiler  # multiple selected gates
 ```
 
@@ -27,19 +29,37 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --coverage         # compiler-unit coverage
+scripts/test --timings          # print slow compiler-unit/deep Alcotest cases
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
 per-gate timing, total wall-clock time, and build/std-preflight setup timing;
 failures print focused excerpts and can save full logs with `--log-dir`.
-After setup preflight, multiple selected gates run in parallel by default. Use
+Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
+slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
+`BLORP_COMPILER_UNIT_TIMING` records in saved logs.
+After setup preflight, multiple selected gates run in fixed waves by default:
+
+```text
+compiler-unit
+compiler-unit-deep
+compiler
+compiler-deep
+runtime
+leak + doctest + cli
+cli-deep
+```
+
+Waves skip gates you did not select. The policy is intentionally static: the
+heavy gates already do their own internal work scheduling, and a shell-level
+resource scheduler would be harder to reason about than the tests it runs. Use
 `--serial` when you need one gate at a time.
 
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
-- In multi-gate parallel runs, the leak-check gate scales the built-in default
+- In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.
 - `BLORP_TEST_PREFLIGHT_CACHE=0` disables the content-addressed std preflight
@@ -53,7 +73,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-unit compiler compiler-deep runtime leak doctest cli`
+- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep runtime leak doctest cli-deep`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -127,24 +147,28 @@ use `compiler/blorp/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
 imports stay separate so the backend helper stays bootstrap-small.
 
 `scripts/test` prepares these helper binaries once at startup for gates that run
-Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, and `cli`).
-Pure `compiler-unit` runs skip this setup. When preparation is needed, the
-harness runs it after building `./blorp` and before std preflight. It writes the
-helpers into a run-local temporary directory, then exports
+Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, `cli`, and
+`cli-deep`).
+Pure `compiler-unit` and `compiler-unit-deep` runs skip this setup. When
+preparation is needed, the harness runs it after building `./blorp` and before
+std preflight. The prepare step resolves helpers through the shared
+content-addressed bridge cache, then copies the verified helper binaries into a
+run-local temporary directory and exports
 `BLORP_COMPILER_RENDERER_BRIDGE_BIN`, `BLORP_COMPILER_PARSER_BRIDGE_BIN`, and
 `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` so preflight and every gate execute those
-prepared helpers directly. Individual tests should not compile a helper on first
-use; the harness also sets
+prepared helpers directly. Individual tests should not compile any helper on
+first use; the harness also sets
 `BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
 instead of falling back to lazy helper compilation.
 
 Ad-hoc compiler invocations still have a fallback helper cache under
 `$HOME/.cache/blorp/compiler-bridge`, or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when
 set. The cache key is derived from the production `compiler/blorp` source tree,
-the helper entrypoint, the Blorp executable used to compile the helper, the C
-compiler identity, and the OS. Cold cache construction is protected by a per-key
-file lock, so parallel non-harness compiler processes do not compile the same
-helper more than once.
+the shipped `std/` sources, formatter sources imported by compiler-owned Blorp
+code, the helper entrypoint, the Blorp executable used to compile the helper,
+the C compiler identity, link flags, and the OS. Cold cache construction is
+protected by a per-key file lock, so parallel compiler processes do not compile
+the same helper more than once.
 
 The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
 explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
@@ -162,7 +186,7 @@ those binaries stay on their built-in parser while compiling bridge helpers.
 When helper preparation is needed, `scripts/test` resolves
 `BLORP_COMPILER_BRIDGE_BIN` to the verified pinned bootstrap binary path when no
 explicit override is present. The startup prepare step uses that pinned compiler
-to build the two helpers. Set
+to resolve or build the two cached helpers. Set
 `BLORP_COMPILER_BRIDGE_STARTUP_DIR` to keep the prepared helper binaries in a
 specific directory for inspection; otherwise the run-local directory is removed
 when the test script exits.
