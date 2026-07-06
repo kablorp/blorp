@@ -26,6 +26,9 @@ cat > "$TMP_HARNESS/blorp" <<'SH'
 set -u
 
 if [ "${1:-}" = "check" ]; then
+	if [ -n "${BLORP_FAKE_CHECK_LOG:-}" ]; then
+		echo "$*" >> "$BLORP_FAKE_CHECK_LOG"
+	fi
 	exit 0
 fi
 
@@ -43,10 +46,11 @@ SH
 chmod +x "$TMP_HARNESS/blorp"
 
 output_file="$TMP_HARNESS/output.txt"
+check_log="$TMP_HARNESS/check-log.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_PREFLIGHT_CACHE=0 \
+		BLORP_FAKE_CHECK_LOG="$check_log" \
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
@@ -81,6 +85,47 @@ fi
 
 echo "PASS: scripts/test reports nonzero gate commands as failed"
 
+if [ -f "$check_log" ]; then
+	echo "FAIL: scripts/test runtime should not run a hidden std check"
+	cat "$output_file"
+	cat "$check_log"
+	exit 1
+fi
+
+std_check_output_file="$TMP_HARNESS/std-check-output.txt"
+std_check_log="$TMP_HARNESS/std-check-log.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_FAKE_CHECK_LOG="$std_check_log" \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test std-check --serial
+) > "$std_check_output_file" 2>&1
+std_check_status=$?
+
+if [ "$std_check_status" -ne 0 ]; then
+	echo "FAIL: scripts/test std-check should pass when blorp check std passes"
+	cat "$std_check_output_file"
+	exit 1
+fi
+
+if ! grep -Eq 'Std-check[[:space:]]+PASS' "$std_check_output_file"; then
+	echo "FAIL: scripts/test std-check should render an explicit std-check gate"
+	cat "$std_check_output_file"
+	exit 1
+fi
+
+if ! grep -Fxq 'check --no-format std' "$std_check_log"; then
+	echo "FAIL: scripts/test std-check should call blorp check --no-format std"
+	cat "$std_check_output_file"
+	cat "$std_check_log"
+	exit 1
+fi
+
+echo "PASS: scripts/test std-check is explicit"
+
 mkdir -p "$TMP_HARNESS/tests/test_compiler"
 cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh" <<'SH'
 #!/usr/bin/env bash
@@ -93,7 +138,6 @@ compiler_output_file="$TMP_HARNESS/compiler-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_PREFLIGHT_CACHE=0 \
 		bash scripts/test compiler --serial
 ) > "$compiler_output_file" 2>&1
 compiler_status=$?
@@ -140,7 +184,6 @@ timing_output_file="$TMP_HARNESS/unit-timing-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_PREFLIGHT_CACHE=0 \
 		PATH="$TMP_HARNESS/bin:$PATH" \
 		bash scripts/test compiler-unit --serial --timings
 ) > "$timing_output_file" 2>&1
@@ -177,7 +220,6 @@ unit_output_file="$TMP_HARNESS/unit-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_PREFLIGHT_CACHE=0 \
 		PATH="$TMP_HARNESS/bin:$PATH" \
 		bash scripts/test compiler-unit --serial
 ) > "$unit_output_file" 2>&1

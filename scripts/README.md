@@ -14,6 +14,7 @@ scripts/test compiler-unit      # compiler-internal OCaml/Alcotest unit-shaped t
 scripts/test compiler-unit-deep # compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # fast compiler surface fixtures
 scripts/test compiler-deep      # generated-C audit, format/purify, compiler/blorp
+scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
@@ -33,18 +34,19 @@ scripts/test --timings          # print slow compiler-unit/deep Alcotest cases
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
-per-gate timing, total wall-clock time, and build/std-preflight setup timing;
-failures print focused excerpts and can save full logs with `--log-dir`.
+per-gate timing, total wall-clock time, and setup timing; failures print focused
+excerpts and can save full logs with `--log-dir`.
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.
-After setup preflight, multiple selected gates run in fixed waves by default:
+After setup, multiple selected gates run in fixed waves by default:
 
 ```text
 compiler-unit
 compiler-unit-deep
 compiler
 compiler-deep
+std-check
 runtime
 leak + doctest + cli
 cli-deep
@@ -62,9 +64,6 @@ Timeouts:
 - In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.
-- `BLORP_TEST_PREFLIGHT_CACHE=0` disables the content-addressed std preflight
-  cache. The default cache key includes `./blorp`, local `std/*.brp` contents,
-  and the `BLORP_STD` tree when an override is set.
 
 ## Premerge Gate
 
@@ -73,7 +72,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep runtime leak doctest cli-deep`
+- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep std-check runtime leak doctest cli-deep`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -146,16 +145,16 @@ Backend renderer/Core requests use a compiled
 use `compiler/blorp/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
 imports stay separate so the backend helper stays bootstrap-small.
 
-`scripts/test` prepares these helper binaries once at startup for gates that run
-Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, `cli`, and
-`cli-deep`).
-Pure `compiler-unit` and `compiler-unit-deep` runs skip this setup. When
-preparation is needed, the harness runs it after building `./blorp` and before
-std preflight. The prepare step resolves helpers through the shared
-content-addressed bridge cache, then copies the verified helper binaries into a
-run-local temporary directory and exports
-`BLORP_COMPILER_RENDERER_BRIDGE_BIN`, `BLORP_COMPILER_PARSER_BRIDGE_BIN`, and
-`BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` so preflight and every gate execute those
+`scripts/test` prepares these helper binaries once at startup for selected gates
+that need compiler bridge helpers (`compiler-deep`, `std-check`, `runtime`,
+`leak`, `doctest`, `cli`, and `cli-deep`). Pure `compiler-unit`,
+`compiler-unit-deep`, and fast `compiler` runs skip this setup. When preparation
+is needed, the harness runs it after building `./blorp` and before selected
+gates. The prepare step resolves helpers through the shared content-addressed
+bridge cache, then copies the verified helper binaries into a run-local
+temporary directory and exports `BLORP_COMPILER_RENDERER_BRIDGE_BIN`,
+`BLORP_COMPILER_PARSER_BRIDGE_BIN`, and
+`BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` so every selected gate executes those
 prepared helpers directly. Individual tests should not compile any helper on
 first use; the harness also sets
 `BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
