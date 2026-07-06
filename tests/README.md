@@ -11,6 +11,7 @@ scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped t
 scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # Fast compiler surface tests
 scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
+scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
@@ -56,8 +57,8 @@ top-level gate summary. `./blorp test` emits the line only when
 ## Terminology
 
 - A **gate** is a top-level validation entry such as `compiler-unit`,
-  `compiler-unit-deep`, `compiler`, `compiler-deep`, `runtime`, `leak`,
-  `doctest`, `cli`, or `cli-deep`.
+  `compiler-unit-deep`, `compiler`, `compiler-deep`, `std-check`, `runtime`,
+  `leak`, `doctest`, `cli`, or `cli-deep`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
   `tests: TestSuite` value.

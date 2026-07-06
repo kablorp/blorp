@@ -78,6 +78,9 @@ let run_compiler_bridge_prepare_command args =
           Printf.printf "%s=%s\n"
             Compiler_blorp_bridge.prepared_parser_bridge_bin_env
             prepared.prepared_parser_bridge_bin;
+          Printf.printf "%s=%s\n"
+            Compiler_blorp_bridge.prepared_typecheck_bridge_bin_env
+            prepared.prepared_typecheck_bridge_bin;
           0
       | Error message ->
           prerr_endline ("Error: " ^ message);
@@ -1766,11 +1769,6 @@ let apply_blorp_cli_frontier args =
         exit result.Compiler_blorp_bridge.cli_run_status
     | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
         cli_frontier_frontend_module_graph graph
-    | Ok (Compiler_blorp_bridge.CliRunFrontendOptions _) ->
-        prerr_endline
-          "Error: legacy frontend_options CLI artifact is no longer supported; \
-           frontend_module_graph is required";
-        exit 1
     | Ok (Compiler_blorp_bridge.CliRunTestOptions options) ->
         BlorpCliTest options
     | Ok (Compiler_blorp_bridge.CliRunPurifyOptions options) ->

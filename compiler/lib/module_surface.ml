@@ -300,7 +300,7 @@ let validate_against_program program surface =
   | Error _ as error -> error
   | Ok () -> validate_symbols surface.private_names
 
-let decl_for_impl_method decl method_index =
+let impl_method_export_decl decl ~method_index =
   match decl.Ast.decl_desc with
   | Ast.DImpl impl -> (
       match method_at impl.impl_methods method_index with
@@ -319,7 +319,7 @@ let decl_for_symbol_source program source =
       | _ -> None)
   | ImplMethod (index, method_index) -> (
       match decl_at program index with
-      | Some decl -> decl_for_impl_method decl method_index
+      | Some decl -> impl_method_export_decl decl ~method_index
       | None -> None)
   | PrivateDecl index -> (
       match decl_at program index with
@@ -337,7 +337,7 @@ let decl_for_symbol_source program source =
   | PrivateImplMethod (index, method_index) -> (
       match decl_at program index with
       | Some { Ast.decl_desc = Ast.DPrivate inner; _ } ->
-          decl_for_impl_method inner method_index
+          impl_method_export_decl inner ~method_index
       | _ -> None)
 
 let symbols_as_ast_pairs program symbols =

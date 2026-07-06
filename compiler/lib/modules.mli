@@ -239,6 +239,12 @@ val collect_private_names : Ast.program -> (string * Ast.decl) list
 val collect_exports : Ast.program -> (string * Ast.decl) list
 (** Collect public exports from a parsed or typed program. *)
 
+val private_names_for_import_diagnostics :
+  loaded_module -> (string * Ast.decl) list
+(** Collect private names for selective-import diagnostics. Surface-backed
+    modules use the parser bridge surface; legacy modules fall back to scanning
+    parsed declarations. *)
+
 val exported_func_is_debug_only : string -> string -> bool
 (** True when the cached module exports [func_name] as a function explicitly
     declared [@debug_only]. Typed exports are preferred when available. *)

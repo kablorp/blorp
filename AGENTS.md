@@ -234,6 +234,7 @@ scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped t
 scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # Fast compiler surface tests
 scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
+scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime .brp tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
@@ -273,6 +274,7 @@ scripts/test compiler-unit
 scripts/test compiler-unit-deep
 scripts/test compiler
 scripts/test compiler-deep
+scripts/test std-check
 scripts/test runtime
 scripts/test leak
 scripts/test doctest

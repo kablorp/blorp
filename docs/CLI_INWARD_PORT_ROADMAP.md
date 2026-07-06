@@ -329,9 +329,8 @@ Implementation:
   - runtime args for `run`;
   - sanitizer, leak-check, timeout, thread, profile, debug, and release flags.
 - Avoid creating compile/run-specific file readers unless behavior truly differs.
-- The bridge still accepts legacy `frontend_options` artifacts defensively, but
-  the Blorp CLI planner no longer emits them for normal `check`, `compile`, or
-  `run` command shapes.
+- The bridge rejects legacy `frontend_options` artifacts; normal `check`,
+  `compile`, and `run` command shapes must use `frontend_module_graph`.
 
 Tests:
 

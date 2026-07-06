@@ -281,6 +281,11 @@ The first high-leverage split is implemented:
     imported module parse artifacts can be reused without leaking impls, UFCS
     methods, module caches, package config, std override state, inference metas,
     or fresh ids across independent fixtures.
+16. The broad `./blorp check --no-format std` sweep is no longer a hidden setup
+    preflight. It is an explicit `scripts/test std-check` gate, and
+    `scripts/premerge-gate` names that gate directly. The reason is clarity:
+    setup should prepare shared infrastructure, while broad source validation
+    should be visible as coverage with its own result row.
 
 This removes the largest redundant default-local sweep without deleting the
 coverage.
@@ -387,6 +392,15 @@ Compiler fixture reusable typecheck-session verification:
   parallel workers while avoiding repeated parse/module setup inside each
   worker.
 
+Explicit std-check verification:
+
+- `scripts/test std-check --log-dir scratch/test-std-check-explicit-20260706`
+- 1 passed, 0 failed
+- 1m15s std-check gate time
+- 1m16s wall time
+- This replaces the hidden std typecheck setup stage with visible coverage that
+  premerge names directly.
+
 Compiler-unit deep verification:
 
 - `scripts/test compiler-unit-deep --log-dir scratch/test-unit-split-deep-20260706`
@@ -432,7 +446,7 @@ Continue with the next low-risk cleanup:
 ## Success Metrics
 
 - Normal `scripts/test compiler` avoids full codegen audit, bridge-helper
-  preparation, std preflight, format/purify tool fixtures, and broad
+  preparation, std-check, format/purify tool fixtures, and broad
   compiler-owned Blorp sweeps.
 - Default full `scripts/test` avoids pathological gate contention without adding
   adaptive scheduling logic.

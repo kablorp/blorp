@@ -1,10 +1,23 @@
 import:
 	../compiler_env: CompilerImplInstance, compiler_env_get_trait
+	../compiler_generic_params: compiler_bound_type_param_name
 	../compiler_parsed_ast:
-		ParsedDecl(ImplParsedDecl, PrivateParsedDecl, RecordParsedDecl, TraitParsedDecl),
+		ParsedDecl(
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+		),
+		ParsedExpr(ParsedCallExpr, ParsedIntLiteralExpr, ParsedNameExpr, ParsedStringLiteralExpr),
+		ParsedFunctionDecl,
 		ParsedIdentifier,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder),
 		ParsedProgram,
-		ParsedTypeExpr(ParsedNamedType),
+		ParsedStringLiteralForm(ParsedPlainStringLiteral),
+		ParsedTraitMethodDecl,
+		ParsedTypeExpr(ParsedBoundedType, ParsedNamedType),
 		parsed_identifier,
 	../compiler_source:
 		CompilerCursor,
@@ -13,8 +26,9 @@ import:
 		compiler_source_cursor_at,
 		compiler_source_file,
 		compiler_source_span,
-	../compiler_type: CompilerType(CompilerNamedType), compiler_types_equal
+	../compiler_type: CompilerType(CompilerNamedType, CompilerTypeVar), compiler_types_equal
 	../compiler_typecheck_decl:
+		compiler_typecheck_check_program_bodies,
 		compiler_typecheck_prescan_program,
 		compiler_typecheck_register_program_impl_decls,
 		compiler_typecheck_register_program_signature_decls,
@@ -44,6 +58,81 @@ pure func named_type(name: String) -> ParsedTypeExpr:
 	ParsedNamedType(ident(name), [], source_span())
 
 
+pure func generic_named_type(name: String, args: List[ParsedTypeExpr]) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), args, source_span())
+
+
+pure func bounded_type(name: String, bounds: List[String]) -> ParsedTypeExpr:
+	ParsedBoundedType(
+		ident(name),
+		bounds.map(ident),
+		source_span(),
+	)
+
+
+pure func int_type() -> ParsedTypeExpr:
+	named_type("Int")
+
+
+pure func string_type() -> ParsedTypeExpr:
+	named_type("String")
+
+
+pure func int_expr() -> ParsedExpr:
+	ParsedIntLiteralExpr("1", source_span())
+
+
+pure func string_expr() -> ParsedExpr:
+	ParsedStringLiteralExpr("text", ParsedPlainStringLiteral, source_span())
+
+
+pure func name_expr(name: String) -> ParsedExpr:
+	ParsedNameExpr(ident(name))
+
+
+pure func call_expr(name: String, args: List[ParsedExpr]) -> ParsedExpr:
+	ParsedCallExpr(name_expr(name), args, source_span())
+
+
+pure func named_param(name: String, type_expr: ParsedTypeExpr) -> ParsedParam:
+	{
+		binder = ParsedParamNameBinder(ident(name)),
+		type_expr = Some(type_expr),
+		span = source_span()
+	}
+
+
+pure func function_decl_with_body(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: ParsedExpr,
+	is_pure: Bool,
+) -> ParsedFunctionDecl:
+	{
+		name = ident(name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = Some(body),
+		is_pure = is_pure,
+		annotations = [],
+		doc = None,
+		span = source_span()
+	}
+
+
+pure func function_decl_parsed(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: ParsedExpr,
+	is_pure: Bool,
+) -> ParsedDecl:
+	FunctionParsedDecl(function_decl_with_body(name, params, return_type, body, is_pure))
+
+
 pure func record_decl(name: String) -> ParsedDecl:
 	RecordParsedDecl({
 		name = ident(name),
@@ -56,24 +145,62 @@ pure func record_decl(name: String) -> ParsedDecl:
 
 
 pure func trait_decl(name: String) -> ParsedDecl:
+	trait_decl_with_details(name, [], [])
+
+
+pure func trait_method_decl(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	is_pure: Bool,
+	has_default: Bool,
+) -> ParsedTraitMethodDecl:
+	body: Option[ParsedExpr] = if has_default:
+		Some(int_expr())
+	else:
+		None
+
+	{
+		name = ident(name),
+		params = params,
+		return_type = return_type,
+		body = body,
+		is_pure = is_pure,
+		span = source_span()
+	}
+
+
+pure func trait_decl_with_details(
+	name: String,
+	supertraits: List[String],
+	methods: List[ParsedTraitMethodDecl],
+) -> ParsedDecl:
 	TraitParsedDecl({
 		name = ident(name),
 		type_params = [],
-		supertraits = [],
-		methods = [],
+		supertraits = supertraits.map(ident),
+		methods = methods,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func impl_decl_with_methods(
+	trait_name: String,
+	for_type: ParsedTypeExpr,
+	methods: List[ParsedFunctionDecl],
+) -> ParsedDecl:
+	ImplParsedDecl({
+		trait_name = ident(trait_name),
+		for_type = for_type,
+		methods = methods,
 		doc = None,
 		span = source_span(),
 	})
 
 
 pure func impl_decl(trait_name: String, for_type: ParsedTypeExpr) -> ParsedDecl:
-	ImplParsedDecl({
-		trait_name = ident(trait_name),
-		for_type = for_type,
-		methods = [],
-		doc = None,
-		span = source_span(),
-	})
+	impl_decl_with_methods(trait_name, for_type, [])
 
 
 pure func private_impl_decl(trait_name: String, for_type: ParsedTypeExpr) -> ParsedDecl:
@@ -114,12 +241,71 @@ pure func has_impl_for_type(
 	found
 
 
+pure func has_impl_with_bound(
+	instances: List[CompilerImplInstance],
+	trait_name: String,
+	for_type: CompilerType,
+	bound_name: String,
+) -> Bool:
+	var found = False
+
+	for instance in instances:
+		if (
+			instance.trait_name == trait_name
+			and not instance.is_builtin
+			and compiler_types_equal(instance.for_type, for_type)
+			and instance.bounds.map(compiler_bound_type_param_name) == [bound_name]
+		):
+			found = True
+			break
+
+	found
+
+
+pure func has_impl_with_trait_bound(
+	instances: List[CompilerImplInstance],
+	trait_name: String,
+	for_type: CompilerType,
+	bound_name: String,
+	required_trait: String,
+) -> Bool:
+	var found = False
+
+	for instance in instances:
+		if (
+			instance.trait_name == trait_name
+			and not instance.is_builtin
+			and compiler_types_equal(instance.for_type, for_type)
+			and instance.bounds.length() == 1
+		):
+			match instance.bounds.get(0):
+				Some(bound):
+					found = (
+						bound.name == bound_name
+						and bound.bounds.map(func(trait_ref): trait_ref.name) == [required_trait]
+					)
+				None:
+					void
+
+		if found:
+			break
+
+	found
+
+
 pure func index_types_and_signatures(source_program: ParsedProgram) -> CompilerTypecheckState:
 	compiler_typecheck_register_program_signature_decls(
 		compiler_typecheck_register_program_type_decls(
 			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
 			source_program,
 		),
+		source_program,
+	)
+
+
+pure func index_program_headers(source_program: ParsedProgram) -> CompilerTypecheckState:
+	compiler_typecheck_register_program_impl_decls(
+		index_types_and_signatures(source_program),
 		source_program,
 	)
 
@@ -157,6 +343,48 @@ func test_registers_public_and_private_impl_headers() -> Bool:
 			"CheckpointHidden",
 			CompilerNamedType("CheckpointSecret", []),
 		)
+	)
+
+
+func test_registers_generic_impl_bounds_from_for_type() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointPrintable"),
+		record_decl("CheckpointBox"),
+		impl_decl(
+			"CheckpointPrintable",
+			generic_named_type("CheckpointBox", [named_type("T")]),
+		),
+	])
+	base_state = index_types_and_signatures(source_program)
+	state = compiler_typecheck_register_program_impl_decls(base_state, source_program)
+
+	state.errors.length() == 0 and has_impl_with_bound(
+		state.env.impls,
+		"CheckpointPrintable",
+		CompilerNamedType("CheckpointBox", [CompilerNamedType("T", [])]),
+		"T",
+	)
+
+
+func test_registers_generic_impl_inline_trait_bounds() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointPrintable"),
+		trait_decl("CheckpointShowable"),
+		record_decl("CheckpointBox"),
+		impl_decl(
+			"CheckpointPrintable",
+			generic_named_type("CheckpointBox", [bounded_type("T", ["CheckpointShowable"])]),
+		),
+	])
+	base_state = index_types_and_signatures(source_program)
+	state = compiler_typecheck_register_program_impl_decls(base_state, source_program)
+
+	state.errors.length() == 0 and has_impl_with_trait_bound(
+		state.env.impls,
+		"CheckpointPrintable",
+		CompilerNamedType("CheckpointBox", [CompilerTypeVar("T")]),
+		"T",
+		"CheckpointShowable",
 	)
 
 
@@ -212,6 +440,189 @@ func test_impl_registration_reports_orphan_impls_when_homes_are_known() -> Bool:
 		.contains("orphan impl") and state.env.impls.length() == base_impl_count + 1
 
 
+func test_impl_method_body_reports_wrong_return_type() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointDisplay"),
+		record_decl("CheckpointWidget"),
+		impl_decl_with_methods(
+			"CheckpointDisplay",
+			named_type("CheckpointWidget"),
+			[
+				function_decl_with_body(
+					"show",
+					[named_param("value", named_type("CheckpointWidget"))],
+					Some(int_type()),
+					string_expr(),
+					False,
+				),
+			],
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 1 and state.errors
+		.get_or(0, "")
+		.contains("Function 'show' returns wrong type")
+
+
+func test_pure_impl_method_body_rejects_impure_call() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointDisplay"),
+		record_decl("CheckpointWidget"),
+		function_decl_parsed("impure_value", [], Some(int_type()), int_expr(), False),
+		impl_decl_with_methods(
+			"CheckpointDisplay",
+			named_type("CheckpointWidget"),
+			[function_decl_with_body(
+					"show",
+					[named_param("value", named_type("CheckpointWidget"))],
+					Some(int_type()),
+					call_expr("impure_value", []),
+					True,
+				)],
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 1 and state.errors
+		.get_or(0, "")
+		.contains("Pure function 'show' cannot call impure function 'impure_value'")
+
+
+func test_impl_validation_reports_missing_required_method() -> Bool:
+	source_program = program([
+		trait_decl_with_details(
+			"CheckpointDisplay",
+			[],
+			[
+				trait_method_decl(
+					"show",
+					[named_param("value", named_type("Self"))],
+					Some(string_type()),
+					True,
+					False,
+				),
+			],
+		),
+		record_decl("CheckpointWidget"),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 1 and state.errors
+		.get_or(0, "")
+		.contains("impl CheckpointDisplay for CheckpointWidget: missing required method 'show'")
+
+
+func test_impl_validation_reports_unsatisfied_supertrait() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointStringable"),
+		trait_decl_with_details("CheckpointDisplay", ["CheckpointStringable"], []),
+		record_decl("CheckpointWidget"),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 1 and state.errors
+		.get_or(0, "")
+		.contains((
+				"impl CheckpointDisplay for CheckpointWidget: supertrait 'CheckpointStringable' "
+				+ "is not implemented"
+			))
+
+
+func test_impl_validation_accepts_explicit_supertrait_impl() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointStringable"),
+		trait_decl_with_details("CheckpointDisplay", ["CheckpointStringable"], []),
+		record_decl("CheckpointWidget"),
+		impl_decl("CheckpointStringable", named_type("CheckpointWidget")),
+		impl_decl("CheckpointDisplay", named_type("CheckpointWidget")),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 0
+
+
+func test_impl_validation_accepts_supertrait_from_inline_bound() -> Bool:
+	source_program = program([
+		trait_decl("CheckpointStringable"),
+		trait_decl_with_details("CheckpointDisplay", ["CheckpointStringable"], []),
+		impl_decl(
+			"CheckpointDisplay",
+			bounded_type("T", ["CheckpointStringable"]),
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 0
+
+
+func test_impl_validation_reports_method_signature_mismatch() -> Bool:
+	source_program = program([
+		trait_decl_with_details(
+			"CheckpointDisplay",
+			[],
+			[
+				trait_method_decl(
+					"show",
+					[named_param("value", named_type("Self"))],
+					Some(string_type()),
+					True,
+					False,
+				),
+			],
+		),
+		record_decl("CheckpointWidget"),
+		impl_decl_with_methods(
+			"CheckpointDisplay",
+			named_type("CheckpointWidget"),
+			[
+				function_decl_with_body(
+					"show",
+					[named_param("value", int_type())],
+					Some(string_type()),
+					string_expr(),
+					False,
+				),
+			],
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		index_program_headers(source_program),
+		source_program,
+	)
+
+	state.errors.length() == 2 and state.errors
+		.get_or(0, "")
+		.contains(
+			"impl CheckpointDisplay for CheckpointWidget: method 'show' must be pure",
+		) and state.errors
+		.get_or(1, "")
+		.contains((
+				"impl CheckpointDisplay for CheckpointWidget: method 'show' parameter 'value' "
+				+ "has type Int, trait requires CheckpointWidget"
+			))
+
+
 tests: TestSuite = {
 	description = "Compiler typecheck impl declaration indexing",
 	tests = [
@@ -220,12 +631,48 @@ tests: TestSuite = {
 			test_registers_public_and_private_impl_headers,
 		),
 		(
+			"registers generic impl bounds from for type",
+			test_registers_generic_impl_bounds_from_for_type,
+		),
+		(
+			"registers generic impl inline trait bounds",
+			test_registers_generic_impl_inline_trait_bounds,
+		),
+		(
 			"impl registration reports public and private conflicts",
 			test_impl_registration_reports_public_and_private_conflicts,
 		),
 		(
 			"impl registration reports orphan impls when homes are known",
 			test_impl_registration_reports_orphan_impls_when_homes_are_known,
+		),
+		(
+			"impl method body reports wrong return type",
+			test_impl_method_body_reports_wrong_return_type,
+		),
+		(
+			"pure impl method body rejects impure call",
+			test_pure_impl_method_body_rejects_impure_call,
+		),
+		(
+			"impl validation reports missing required method",
+			test_impl_validation_reports_missing_required_method,
+		),
+		(
+			"impl validation reports unsatisfied supertrait",
+			test_impl_validation_reports_unsatisfied_supertrait,
+		),
+		(
+			"impl validation accepts explicit supertrait impl",
+			test_impl_validation_accepts_explicit_supertrait_impl,
+		),
+		(
+			"impl validation accepts supertrait from inline bound",
+			test_impl_validation_accepts_supertrait_from_inline_bound,
+		),
+		(
+			"impl validation reports method signature mismatch",
+			test_impl_validation_reports_method_signature_mismatch,
 		),
 	]
 }
