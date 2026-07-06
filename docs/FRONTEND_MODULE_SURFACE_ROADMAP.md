@@ -526,6 +526,12 @@ Acceptance:
 
 ## Checkpoint 8: Move CLI Source Graph Import Discovery To Surface
 
+Status: implemented on 2026-07-06. `compiler_cli_source_graph.brp` discovers
+imports from `module_surface.imports` and threads missing/malformed surface
+errors through source-graph discovery. `test_compiler_cli.brp` now covers
+surface-based discovery, missing `module_surface` rejection, and independence
+from parsed-AST import-block shape.
+
 Stop the Blorp CLI source graph from extracting imports through ad hoc parsed
 AST JSON walking.
 
