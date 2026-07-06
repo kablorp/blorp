@@ -14,6 +14,7 @@ scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
+scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --coverage         # Compiler-unit coverage report
 scripts/test --verbose          # Print pass-by-pass child-runner output
@@ -50,7 +51,7 @@ top-level gate summary. `./blorp test` emits the line only when
 ## Terminology
 
 - A **gate** is a top-level validation entry such as `compiler-unit`, `compiler`,
-  `compiler-deep`, `runtime`, `leak`, `doctest`, or `cli`.
+  `compiler-deep`, `runtime`, `leak`, `doctest`, `cli`, or `cli-deep`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
   `tests: TestSuite` value.
@@ -149,7 +150,8 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh`
+   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh --smoke`
+   - Full CLI package/formatter integration behavior → `tests/test_cli.sh --all`
    - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
      marker comments and a neighboring JSON spec
    - Standard library examples → doctests in `std/`

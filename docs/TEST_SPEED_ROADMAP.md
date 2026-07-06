@@ -1,6 +1,6 @@
 # Test Speed Roadmap
 
-Status checked against code on 2026-07-02.
+Status checked against code on 2026-07-06.
 
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
@@ -11,30 +11,28 @@ boundaries without adding proportional signal.
 
 ## Current Diagnosis
 
-The chief culprit is the compiler gate.
+The default local gate is slow for two related reasons: it does too much broad
+integration work by default, and running every top-level gate at once
+oversubscribes the machine.
 
 Recent measurements on this branch showed:
 
-- Runtime/std tests are no longer the dominant issue. They are still substantial,
-  but most remaining subprocess use there directly tests process, system, IO, or
-  runtime behavior.
-- CLI smoke is mostly command-surface integration. It should stay small and
-  should not own broad formatter/std corpus sweeps.
-- Compiler surface tests without codegen audit took about 216 seconds wall time
-  and about 1793 seconds of user CPU. That makes the compiler gate highly
-  CPU-bound even before the full generated-C audit is added.
-- Full codegen audit adds one Blorp compile plus one host C compiler invocation
-  per audit file. At the time of measurement, that was 193 Blorp compiles and
-  193 `cc` invocations.
-- `compiler/blorp/tests` are important for expanding Blorp's compiler footprint
-  and now cover parser, CLI frontier, bridge, renderer, and Core-tail slices.
-  They remain more expensive than plain parser/typecheck fixtures because many
-  cases exercise bridge/rendering/compiler work.
+- A warm default `scripts/test` run took 9m15s wall time. Individual gate times
+  were much worse under contention: compiler-unit 8m55s, runtime 6m59s,
+  compiler 6m16s, CLI 4m19s.
+- The same gates are materially faster in isolation. Runtime alone took 2m07s
+  gate time. Compiler alone took 4m17s gate time. Compiler-unit alone took about
+  4m18s.
+- The compiler fixture gate is highly CPU-bound: the isolated compiler gate used
+  about 2034 seconds of user CPU for 4m17s of wall time. Running it beside
+  runtime and compiler-unit slows the other gates substantially.
+- Compiler-unit is a single serial Alcotest executable. It is not the only
+  problem, but it becomes the longest tail when run under full-gate contention.
+- Before the CLI split, CLI smoke was broader than command-surface smoke: it
+  covered package fetch/vendor flows, compile/run/test, formatter tooling, REPL,
+  and LSP.
 - Bridge helper preparation still costs roughly 16-21 seconds per `scripts/test`
-  run when it recompiles helper binaries instead of reusing the existing
-  content-addressed helper cache.
-- Running all gates concurrently can oversubscribe the machine because several
-  gates also parallelize internally.
+  run when helper binaries are prepared into a fresh startup directory.
 
 ## Principles
 
@@ -181,18 +179,21 @@ affect the helper binary.
 
 ### 7. Reduce Full-Run Oversubscription
 
-The full gate currently runs multiple top-level gates in parallel, and some of
-those gates also run internal workers.
+The full gate used to run every selected top-level gate in parallel, while some
+of those gates also ran internal workers. That was simple in the shell but
+expensive in practice: runtime and compiler-unit became several times slower
+when competing with the CPU-heavy compiler fixture runner.
 
-Improve by:
+The current approach is deliberately simpler than a scheduler:
 
-- Capping per-gate worker counts when multiple gates run together.
-- Avoiding concurrent execution of the heaviest CPU-bound gates.
-- Reporting both gate wall time and aggregate user CPU so oversubscription is
-  visible.
+- Run selected gates in fixed waves: `compiler-unit`, `compiler`,
+  `compiler-deep`, `runtime`, then `leak + doctest + cli`.
+- Keep each gate responsible for its own internal strategy.
+- Do not infer CPU needs from names, timings, or machine load.
 
-Expected impact: better full-run wall time and fewer flaky timeout failures under
-load.
+Expected impact: more predictable full-run behavior and fewer timeout flakes
+under load. This may trade some best-case wall time for clarity until the
+default gate is slimmed down further.
 
 ### 8. Keep Runtime Process Tests Narrow
 
@@ -228,6 +229,15 @@ The first high-leverage split is implemented:
 6. The compiler runner now terminates active worker processes on SIGTERM/SIGINT,
    and `scripts/test` failure excerpts include infrastructure errors such as
    `Error:` lines instead of printing an empty failure block.
+7. Multi-gate `scripts/test` now uses fixed waves instead of launching every
+   selected gate at once. The reason is predictability: the heavyweight gates
+   already perform internal parallel work, so the top-level harness should avoid
+   making contention worse instead of becoming a second scheduler.
+8. `scripts/test cli` is now smoke-only, while `scripts/test cli-deep` preserves
+   the full package lifecycle and formatter-tool integration coverage for
+   premerge. The reason is ownership clarity: checking public command contracts
+   is a different job from exercising package cache/vendor workflows and
+   compiling the self-hosted formatter tool.
 
 This removes the largest redundant default-local sweep without deleting the
 coverage.
@@ -270,21 +280,21 @@ Post-wrapper-simplification verification:
 
 Continue with the next low-risk cleanup:
 
-1. Measure `scripts/test compiler` and `scripts/test compiler-deep` separately.
-2. Profile the remaining parser/infer/typecheck fixture runner and identify
-   whether the hot path is repeated module loading, type environment setup, or
-   expensive fixture-specific work.
+1. Decide whether all compiler-unit suites belong in the default local gate, or
+   whether pipeline/session/package/LSP-style internal integration coverage
+   should move to an explicit internal-deep gate.
+2. Reuse prepared bridge helpers instead of preparing fresh helper binaries per
+   `scripts/test` invocation.
 3. Keep formatter/purify fixtures in `compiler-deep` until there is an
    in-process or batched interface that reduces work instead of hiding it.
-4. Measure whether bridge-helper preparation is still a material part of full
-   local runs after the source-graph/parser frontier changes.
 
 ## Success Metrics
 
 - Normal `scripts/test compiler` avoids full codegen audit, bridge-helper
   preparation, std preflight, format/purify tool fixtures, and broad
   compiler-owned Blorp sweeps.
-- Default full `scripts/test` wall time drops without increasing flakiness.
+- Default full `scripts/test` avoids pathological gate contention without adding
+  adaptive scheduling logic.
 - Deep/premerge still runs the expensive coverage explicitly.
 - Test summaries make it obvious which expensive coverage did or did not run.
 - Runtime/std tests do not contain broad nested compiler tests.

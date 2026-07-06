@@ -17,6 +17,7 @@ scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
 scripts/test cli                # public CLI, REPL, and LSP smoke tests
+scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test compiler-unit compiler  # multiple selected gates
 ```
 
@@ -32,14 +33,27 @@ scripts/test --coverage         # compiler-unit coverage
 `scripts/test` is quiet by default. Successful runs print a gate summary with
 per-gate timing, total wall-clock time, and build/std-preflight setup timing;
 failures print focused excerpts and can save full logs with `--log-dir`.
-After setup preflight, multiple selected gates run in parallel by default. Use
+After setup preflight, multiple selected gates run in fixed waves by default:
+
+```text
+compiler-unit
+compiler
+compiler-deep
+runtime
+leak + doctest + cli
+cli-deep
+```
+
+Waves skip gates you did not select. The policy is intentionally static: the
+heavy gates already do their own internal work scheduling, and a shell-level
+resource scheduler would be harder to reason about than the tests it runs. Use
 `--serial` when you need one gate at a time.
 
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
-- In multi-gate parallel runs, the leak-check gate scales the built-in default
+- In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.
 - `BLORP_TEST_PREFLIGHT_CACHE=0` disables the content-addressed std preflight
@@ -53,7 +67,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-unit compiler compiler-deep runtime leak doctest cli`
+- `scripts/test --serial compiler-unit compiler compiler-deep runtime leak doctest cli-deep`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -126,7 +140,8 @@ Backend renderer/Core requests use a compiled
 imports separately so the backend helper stays bootstrap-small.
 
 `scripts/test` prepares both helper binaries once at startup for gates that run
-Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, and `cli`).
+Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, `cli`, and
+`cli-deep`).
 Pure `compiler-unit` runs skip this setup. When preparation is needed, the
 harness runs it after building `./blorp` and before std preflight. It writes the
 helpers into a run-local temporary directory, then exports
