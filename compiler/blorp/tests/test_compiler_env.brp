@@ -13,7 +13,13 @@ import:
 		),
 		CompilerTypeKind(CompilerTypeBuiltin, CompilerTypeResource, CompilerTypeUnion),
 		CompilerVarMutability(CompilerImmutableBinding),
-		CompilerVarOrigin(CompilerFuncParam, CompilerScopedResourceDerived),
+		CompilerVarOrigin(
+			CompilerFuncParam,
+			CompilerLetBinding,
+			CompilerScopedResource,
+			CompilerScopedResourceDerived,
+			CompilerScopedResourceUnavailable,
+		),
 		compiler_env_add_alias,
 		compiler_env_add_func,
 		compiler_env_add_func_with_info,
@@ -26,6 +32,7 @@ import:
 		compiler_env_add_ufcs_method,
 		compiler_env_add_var,
 		compiler_env_add_var_with_details,
+		compiler_env_add_var_with_module_details,
 		compiler_env_disambiguate_nominal_dim_application,
 		compiler_env_empty,
 		compiler_env_find_conflicting_impl,
@@ -34,8 +41,9 @@ import:
 		compiler_env_get_alias,
 		compiler_env_get_constructor,
 		compiler_env_get_func_info,
-		compiler_env_get_module_func_symbol,
 		compiler_env_get_function_trait,
+		compiler_env_get_module_func_symbol,
+		compiler_env_get_module_var_symbol,
 		compiler_env_get_overloads,
 		compiler_env_get_record,
 		compiler_env_get_type_decl,
@@ -45,23 +53,29 @@ import:
 		compiler_env_has_ufcs_method,
 		compiler_env_is_func_param,
 		compiler_env_is_local_func,
+		compiler_env_is_scoped_resource_derived_var,
 		compiler_env_is_scoped_resource_related_var,
-		compiler_env_lookup_is_outermost_scope,
-		compiler_env_lookup_with_scope_depth,
+		compiler_env_is_scoped_resource_var,
 		compiler_env_lookup_in_current_scope,
+		compiler_env_lookup_is_outermost_scope,
+		compiler_env_lookup_module_ufcs_methods,
 		compiler_env_lookup_ufcs_methods,
-		compiler_func_symbol,
+		compiler_env_lookup_with_scope_depth,
 		compiler_env_push_scope,
 		compiler_env_resolve_alias,
 		compiler_env_resolve_overload,
 		compiler_env_resolve_trait_obligation,
+		compiler_env_scoped_resource_unavailable_owner,
+		compiler_env_select_overload_for_args,
 		compiler_env_set_type_param_bounds,
 		compiler_env_trait_function_collision,
 		compiler_env_trait_has_supertrait,
 		compiler_env_trait_method_names_transitive,
 		compiler_env_trait_methods_with_declaring_trait,
+		compiler_func_symbol,
 		compiler_impl_instance,
 		compiler_overload_type_param_names,
+		compiler_resolve_self,
 		compiler_trait_def,
 		compiler_trait_method_sig,
 		compiler_trait_obligation,
@@ -74,9 +88,11 @@ import:
 			CompilerFunctionType,
 			CompilerMetaType,
 			CompilerNamedType,
+			CompilerSelfType,
 			CompilerTypeVar,
 		),
 		compiler_type_bool,
+		compiler_type_copy,
 		compiler_type_float,
 		compiler_type_int,
 		compiler_type_string,
@@ -93,6 +109,52 @@ pure func overload_entry(
 		def_id = def_id,
 		func_type = CompilerFunctionType(True, [first_type], return_type),
 		type_params = [],
+		param_names = [Some("value")],
+		purity = CompilerPure,
+		origin = CompilerUserDefinedFunc,
+		resource_args = CompilerRejectResourceArgs,
+		module_path = None,
+		dim_constraints = [],
+		loop_producer = None,
+		debug_only = False
+	}
+
+
+pure func two_arg_overload_entry(
+	def_id: Int,
+	first_type: CompilerType,
+	second_type: CompilerType,
+	return_type: CompilerType,
+) -> CompilerOverloadEntry:
+	{
+		def_id = def_id,
+		func_type = CompilerFunctionType(
+			True,
+			[first_type, second_type],
+			return_type,
+		),
+		type_params = [],
+		param_names = [Some("left"), Some("right")],
+		purity = CompilerPure,
+		origin = CompilerUserDefinedFunc,
+		resource_args = CompilerRejectResourceArgs,
+		module_path = None,
+		dim_constraints = [],
+		loop_producer = None,
+		debug_only = False
+	}
+
+
+pure func generic_overload_entry(
+	def_id: Int,
+	param_type: CompilerType,
+	return_type: CompilerType,
+	type_param_name: String,
+) -> CompilerOverloadEntry:
+	{
+		def_id = def_id,
+		func_type = CompilerFunctionType(True, [param_type], return_type),
+		type_params = [compiler_make_bound_type_param(type_param_name, [])],
 		param_names = [Some("value")],
 		purity = CompilerPure,
 		origin = CompilerUserDefinedFunc,
@@ -126,12 +188,30 @@ func test_scope_lookup_and_shadowing() -> Bool:
 		CompilerScopedResourceDerived,
 		compiler_unrefined_binding(),
 	)
+	with_scoped_reader = compiler_env_add_var_with_details(
+		with_resource,
+		"reader",
+		compiler_type_string(),
+		None,
+		CompilerImmutableBinding,
+		CompilerScopedResource,
+		compiler_unrefined_binding(),
+	)
+	with_unavailable_reader = compiler_env_add_var_with_details(
+		with_scoped_reader,
+		"parent_reader",
+		compiler_type_string(),
+		None,
+		CompilerImmutableBinding,
+		CompilerScopedResourceUnavailable("child"),
+		compiler_unrefined_binding(),
+	)
 	outer_lookup = compiler_env_lookup_with_scope_depth(inner, "x")
-	shadow_lookup = compiler_env_lookup_with_scope_depth(with_resource, "x")
+	shadow_lookup = compiler_env_lookup_with_scope_depth(with_unavailable_reader, "x")
 
 	match (
-		compiler_env_get_var_type(with_resource, "x"),
-		compiler_env_lookup_in_current_scope(with_resource, "x"),
+		compiler_env_get_var_type(with_unavailable_reader, "x"),
+		compiler_env_lookup_in_current_scope(with_unavailable_reader, "x"),
 		outer_lookup,
 		shadow_lookup,
 	):
@@ -139,8 +219,25 @@ func test_scope_lookup_and_shadowing() -> Bool:
 			(
 				compiler_types_equal(shadow_type, compiler_type_string())
 				and current_symbol.name == "x"
-				and compiler_env_is_func_param(with_resource, "x")
-				and compiler_env_is_scoped_resource_related_var(with_resource, "reader_line")
+				and compiler_env_is_func_param(with_unavailable_reader, "x")
+				and compiler_env_is_scoped_resource_related_var(
+					with_unavailable_reader,
+					"reader_line",
+				)
+				and compiler_env_is_scoped_resource_derived_var(
+					with_unavailable_reader,
+					"reader_line",
+				)
+				and compiler_env_is_scoped_resource_related_var(with_unavailable_reader, "reader")
+				and compiler_env_is_scoped_resource_var(with_unavailable_reader, "reader")
+				and compiler_env_is_scoped_resource_related_var(
+					with_unavailable_reader,
+					"parent_reader",
+				)
+				and compiler_env_scoped_resource_unavailable_owner(
+					with_unavailable_reader,
+					"parent_reader",
+				) == Some("child")
 				and compiler_env_get_var_type(base, "x").is_none()
 				and outer.scope_depth == 1
 				and compiler_env_lookup_is_outermost_scope(inner, outer)
@@ -266,8 +363,24 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 	)
 	int_entry = overload_entry(10, compiler_type_int(), compiler_type_string())
 	string_entry = overload_entry(11, compiler_type_string(), compiler_type_string())
+	int_string_entry = two_arg_overload_entry(
+		13,
+		compiler_type_int(),
+		compiler_type_string(),
+		compiler_type_string(),
+	)
+	int_bool_entry = two_arg_overload_entry(
+		14,
+		compiler_type_int(),
+		compiler_type_bool(),
+		compiler_type_bool(),
+	)
 	env = compiler_env_add_overload(env, "show", int_entry)
 	env = compiler_env_add_overload(env, "show", string_entry)
+	selected_two_arg = compiler_env_select_overload_for_args(
+		[int_string_entry, int_bool_entry],
+		[compiler_type_int(), compiler_type_bool()],
+	)
 	windowed_entry: CompilerOverloadEntry = {
 		def_id = 12,
 		func_type = string_entry.func_type,
@@ -325,6 +438,11 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 						existing.def_id == 3
 						and resolved_overload.def_id == 11
 						and found_overload.def_id == 10
+						and match selected_two_arg:
+							Some(entry):
+								entry.def_id == 14
+							None:
+								False
 						and ufcs_entry.def_id == 12
 						and compiler_env_has_ufcs_method(env, "windowed")
 						and compiler_env_get_overloads(env, "show").length() == 2
@@ -366,6 +484,168 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 					)
 				None:
 					False
+		_:
+			False
+
+
+func test_resolve_self_returns_owned_types() -> Bool:
+	concrete = CompilerNamedType("Widget", [])
+	source = CompilerFunctionType(
+		True,
+		[CompilerSelfType, CompilerArrayType(CompilerSelfType, [CompilerConstIntType(2)])],
+		CompilerSelfType,
+	)
+	resolved = compiler_resolve_self(compiler_type_copy(concrete), source)
+	copied = compiler_type_copy(resolved)
+	expected = CompilerFunctionType(
+		True,
+		[CompilerNamedType("Widget", []), CompilerArrayType(
+				CompilerNamedType("Widget", []),
+				[CompilerConstIntType(2)],
+			)],
+		CompilerNamedType(
+			"Widget",
+			[],
+		),
+	)
+
+	compiler_types_equal(
+		concrete,
+		CompilerNamedType("Widget", []),
+	) and compiler_types_equal(resolved, expected) and compiler_types_equal(copied, expected)
+
+
+func test_generic_impl_satisfies_concrete_trait_obligation() -> Bool:
+	var env: CompilerEnv = compiler_env_empty()
+	env = compiler_env_add_trait(
+		env,
+		compiler_trait_def(40, "Printable", [], []),
+	)
+	env = compiler_env_add_impl(
+		env,
+		compiler_impl_instance(
+			41,
+			"Printable",
+			CompilerNamedType("Box", [CompilerNamedType("T", [])]),
+			[compiler_make_bound_type_param("T", [])],
+			False,
+		),
+	)
+
+	compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Box", [compiler_type_int()]),
+			"Printable",
+		),
+	) == CompilerTraitObligationSatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Other", [compiler_type_int()]),
+			"Printable",
+		),
+	) == CompilerTraitObligationUnsatisfied
+
+
+func test_overload_ranking_prefers_concrete_over_generic() -> Bool:
+	generic_entry = generic_overload_entry(60, CompilerTypeVar("T"), compiler_type_string(), "T")
+	int_entry = overload_entry(61, compiler_type_int(), compiler_type_int())
+	env = compiler_env_add_overload(
+		compiler_env_add_overload(compiler_env_empty(), "rank", generic_entry),
+		"rank",
+		int_entry,
+	)
+
+	match (compiler_env_select_overload_for_args(
+			compiler_env_get_overloads(env, "rank"),
+			[compiler_type_int()],
+		), compiler_env_resolve_overload(env, "rank", compiler_type_int())):
+		(Some(selected), Some(resolved)):
+			selected.def_id == 61 and resolved.def_id == 61
+		_:
+			False
+
+
+func test_generic_impl_requires_concrete_type_to_satisfy_bounds() -> Bool:
+	var env: CompilerEnv = compiler_env_empty()
+	env = compiler_env_add_trait(
+		env,
+		compiler_trait_def(42, "Showable", [], []),
+	)
+	env = compiler_env_add_trait(
+		env,
+		compiler_trait_def(43, "Printable", [], []),
+	)
+	env = compiler_env_add_impl(
+		env,
+		compiler_impl_instance(44, "Showable", compiler_type_int(), [], False),
+	)
+	env = compiler_env_add_impl(
+		env,
+		compiler_impl_instance(
+			45,
+			"Printable",
+			CompilerNamedType("Box", [CompilerNamedType("T", [])]),
+			[compiler_make_bound_type_param("T", ["Showable"])],
+			False,
+		),
+	)
+	bounded_env = compiler_env_set_type_param_bounds(
+		env,
+		[compiler_make_bound_type_param("T", ["Showable"])],
+	)
+
+	compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Box", [compiler_type_int()]),
+			"Printable",
+		),
+	) == CompilerTraitObligationSatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Box", [compiler_type_string()]),
+			"Printable",
+		),
+	) == CompilerTraitObligationUnsatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Box", [CompilerNamedType("T", [])]),
+			"Printable",
+		),
+	) == CompilerTraitObligationUnsatisfied and compiler_env_resolve_trait_obligation(
+		bounded_env,
+		compiler_trait_obligation(
+			CompilerNamedType("Box", [CompilerNamedType("T", [])]),
+			"Printable",
+		),
+	) == CompilerTraitObligationSatisfied
+
+
+func test_generic_impl_conflicts_with_specific_impl() -> Bool:
+	generic_impl = compiler_impl_instance(
+		50,
+		"Printable",
+		CompilerNamedType("Box", [CompilerNamedType("T", [])]),
+		[compiler_make_bound_type_param("T", [])],
+		False,
+	)
+	specific_impl = compiler_impl_instance(
+		51,
+		"Printable",
+		CompilerNamedType("Box", [compiler_type_int()]),
+		[],
+		False,
+	)
+	env_with_generic = compiler_env_add_impl(compiler_env_empty(), generic_impl)
+	env_with_specific = compiler_env_add_impl(compiler_env_empty(), specific_impl)
+
+	match (
+		compiler_env_find_conflicting_impl(env_with_generic, specific_impl),
+		compiler_env_find_conflicting_impl(env_with_specific, generic_impl),
+	):
+		(Some(left_conflict), Some(right_conflict)):
+			left_conflict.def_id == 50 and right_conflict.def_id == 51
 		_:
 			False
 
@@ -414,6 +694,79 @@ func test_module_function_lookup_uses_module_path() -> Bool:
 			False
 
 
+func test_module_ufcs_lookup_filters_module_and_receiver() -> Bool:
+	string_entry = { overload_entry(20, compiler_type_string(), compiler_type_int()) |
+		module_path = Some("std/text")
+	}
+	int_entry = { overload_entry(21, compiler_type_int(), compiler_type_float()) |
+		module_path = Some("std/text")
+	}
+	other_module_entry = { overload_entry(22, compiler_type_string(), compiler_type_bool()) |
+		module_path = Some("other")
+	}
+	env = compiler_env_add_ufcs_method(
+		compiler_env_add_ufcs_method(
+			compiler_env_add_ufcs_method(compiler_env_empty(), "size", string_entry),
+			"size",
+			int_entry,
+		),
+		"size",
+		other_module_entry,
+	)
+	matches = compiler_env_lookup_module_ufcs_methods(
+		env,
+		"std/text",
+		"size",
+		compiler_type_string(),
+	)
+	wrong_receiver = compiler_env_lookup_module_ufcs_methods(
+		env,
+		"std/text",
+		"size",
+		compiler_type_bool(),
+	)
+	wrong_module = compiler_env_lookup_module_ufcs_methods(
+		env,
+		"missing",
+		"size",
+		compiler_type_string(),
+	)
+
+	match matches.get(0):
+		Some(entry):
+			(
+				matches.length() == 1
+				and entry.def_id == 20
+				and wrong_receiver.length() == 0
+				and wrong_module.length() == 0
+			)
+		None:
+			False
+
+
+func test_module_variable_lookup_uses_module_path() -> Bool:
+	env = compiler_env_add_var_with_module_details(
+		compiler_env_add_var(compiler_env_empty(), "version", compiler_type_int()),
+		"version",
+		compiler_type_string(),
+		Some(compiler_type_string()),
+		CompilerImmutableBinding,
+		CompilerLetBinding,
+		compiler_unrefined_binding(),
+		Some("std/build"),
+	)
+
+	match compiler_env_get_module_var_symbol(env, "std/build", "version"):
+		Some(var_symbol):
+			(
+				compiler_types_equal(var_symbol.var_type, compiler_type_string())
+				and compiler_env_get_module_var_symbol(env, "other", "version").is_none()
+				and compiler_env_get_module_var_symbol(env, "std/build", "missing").is_none()
+			)
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler env substrate",
 	tests = [
@@ -423,6 +776,28 @@ tests: TestSuite = {
 			test_type_record_alias_and_nominal_dim_resolution,
 		),
 		("traits impls overloads and ufcs", test_traits_impls_overloads_and_ufcs),
+		(
+			"overload ranking prefers concrete over generic",
+			test_overload_ranking_prefers_concrete_over_generic,
+		),
+		("resolve self returns owned types", test_resolve_self_returns_owned_types),
+		(
+			"generic impl satisfies concrete trait obligation",
+			test_generic_impl_satisfies_concrete_trait_obligation,
+		),
+		(
+			"generic impl requires concrete type to satisfy bounds",
+			test_generic_impl_requires_concrete_type_to_satisfy_bounds,
+		),
+		(
+			"generic impl conflicts with specific impl",
+			test_generic_impl_conflicts_with_specific_impl,
+		),
 		("module function lookup uses module path", test_module_function_lookup_uses_module_path),
+		(
+			"module ufcs lookup filters module and receiver",
+			test_module_ufcs_lookup_filters_module_and_receiver,
+		),
+		("module variable lookup uses module path", test_module_variable_lookup_uses_module_path),
 	]
 }

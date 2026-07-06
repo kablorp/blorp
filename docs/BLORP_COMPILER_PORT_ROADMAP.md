@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-04.
+Status checked against code on 2026-07-05.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -853,14 +853,14 @@ Implementation steps:
 - Port impl registration with context-owned indexes. Trait definition indexing
   and collision-checked bare method registration are covered by
   `compiler_typecheck_decl.brp`. Source impl headers now register public impl
-  instances, private impl instances, exact source-level coherence conflicts, and
-  orphan diagnostics when the trait and type homes are both known. Full impl
-  method validation and default-method synthesis remain checkpoint 6 work,
-  matching the OCaml second-pass boundary.
+  instances, private impl instances, source-level coherence conflicts, inline
+  and implicit generic impl bounds collected from the `for` type, and orphan
+  diagnostics when the trait and type homes are both known. Full default-method
+  synthesis remains checkpoint 6 work, matching the OCaml second-pass boundary.
 - Port orphan/coherence checks and cross-module coherence over source-level
-  impls. Source-module orphan and exact duplicate checks are implemented for
-  first-pass registration. Whole-graph cross-module coherence remains tied to
-  typed loaded-module signatures.
+  impls. Source-module orphan and structural generic/specific overlap checks
+  are implemented for first-pass registration. Whole-graph cross-module
+  coherence remains tied to typed loaded-module signatures.
 - Port prelude import insertion with self-import guards.
 - Keep typechecking loaded modules separate from typechecking the explicit
   target until the whole module graph is Blorp-owned.
@@ -920,43 +920,73 @@ expected parameter/return types, tuple destructuring, ranges, `if`, conservative
 constant-index tuple and tensor/array subscript reads, full-rank constant-index
 tensor/array subscript assignment, `while`, simple `for`, tuple `for` binders,
 debug blocks, and
-`break`/`continue` loop-context checks. Plain assignment support covers discard
+`break`/`continue` loop-context checks. Direct `?=` statement inference now
+validates Option/Result carrier compatibility against the enclosing block,
+binds the unwrapped value for following statements, rejects loop-body and final
+statement uses, and preserves continuation-shaped typed nodes for lowering.
+Plain assignment support covers discard
 assignment, implicit immutable local binding, mutable local reassignment,
 annotated literal initializer widening, and assignment-target diagnostics for
 immutable variables and non-variable symbols. Compound assignment desugars
 through plain assignment before typed lowering, preserving the same target
 diagnostics. Direct and subscript assignment now carry explicit local-vs-module
 target metadata from inference so later purity checks do not guess from source
-names. The current slices preserve
+names. Opaque `into`/`from` conversions now validate source/target direction,
+generic opaque alias substitution, aliases to opaque types, and module-private
+opaque conversion boundaries. The current slices preserve
 typed-expression metadata for source type, semantic type, value type, widening
 decision, refinement proofs, and resolved-call placeholder data, and they
 include explicit copy boundaries for type and infer-context values to avoid
 generated ARC aliasing. Direct calls currently cover function-typed callees,
 exact arity, expected argument slots, value-type argument checking, resolved
 callable metadata for named functions, and simple type-variable substitution
-from argument types into return types. Bare overload-only calls now use Env's
-first-argument exact-type overload resolver, preserve selected callable
-id/purity metadata, and report a targeted no-match diagnostic. UFCS method
-syntax now uses Env's exact receiver-type UFCS index, prepends the typed
-receiver as the first call argument, and checks non-receiver arity.
+from argument types into return types. Direct generic calls also enforce
+callee-declared trait bounds for concrete substitutions and for caller type
+parameters that already carry the required bound. Bare overload-only calls now
+use Env's all-argument resolver when argument probing can disambiguate,
+including structural matching under the overload entry's type parameters and
+pure-callback-slot specificity, preserve selected callable id/purity metadata,
+specialize generic returns, enforce selected overload entry trait bounds, and
+use expected return type slots to bind otherwise-unconstrained generic return
+parameters. Overload misses report targeted no-match diagnostics. UFCS method syntax now uses Env's receiver-type UFCS index,
+including structural matching under the method entry's type parameters, binds
+receiver-derived generic substitutions before checking explicit method
+arguments, prepends the typed receiver as the first call argument, specializes
+generic returns, enforces selected UFCS entry trait bounds, and checks
+non-receiver arity.
 Module-qualified function calls through registered module aliases now resolve
 before ordinary field access and preserve the selected callable id/purity
-metadata. Full multi-argument overload ranking, pure/impure overload tiebreaks,
-generic UFCS receiver binding, module-qualified variables, module-qualified
-impl-method dispatch, generic trait-bound enforcement, generic dim constraints,
-and expected-return-only generic inference remain future call slices. Collection literals
-currently support expected-type empty lists/dicts/vector tensors, non-empty
+metadata. Module-qualified variable access now resolves through explicit
+module ownership on Env variable symbols, so `Alias.value` does not fall back
+to an unrelated unqualified local. Module-qualified impl-method calls now
+resolve `Alias.method(value, ...)` through module-owned UFCS overload entries,
+using the first call argument as the receiver and preserving the selected
+callable id/purity metadata. Generic source impl bounds are now extracted from
+inline `T: Trait` syntax and inferred from bare type variables in the impl `for`
+type, stored on impl instances, checked against concrete substitutions during
+structural trait obligation resolution, and used for generic versus specific
+impl coherence checks. Direct and UFCS calls now check callee-declared generic
+dimension constraints after argument and expected-return substitution, keeping
+dimension literals exact instead of widening them through ordinary generic
+binding.
+Collection literals
+currently support expected-type empty lists/dicts/sets/vector tensors, non-empty
 inference, collection-element widening for singleton integer literals, and
 explicit heterogeneous diagnostics. Vector/tensor literal support currently
-covers scalar elements and expected empty tensors; full nested tensor shape
-validation remains with the tensor/subscript slice. Record literals support expected-record checking,
+covers scalar elements, expected empty tensors, nested literal dimension
+flattening, ragged nested literal rejection through element type checking, and
+rejection of multidimensional tensor construction from tensor variables. Record literals support expected-record checking,
 unique field-set inference, field-wise expected typing/widening,
-missing/unknown-field diagnostics, and ambiguous field-set diagnostics. Record
-updates preserve the base record type, validate update fields, and apply
+missing/unknown-field diagnostics, and ambiguous field-set diagnostics. Empty
+`{}` record syntax now respects expected `Dict[K, V]` and `Set[T]` collection
+types while continuing to require record context for empty record inference.
+Record updates preserve the base record type, validate update fields, and apply
 field-wise expected typing/widening. Branch/control-flow coverage currently
 handles common const-int branch result typing, non-`Bool` conditions,
 value-producing `if` without `else`, simple match branch convergence,
-Bool-match exhaustiveness, simple loop-only `break`/`continue`
+Bool, open-scalar, named-constructor, and list-pattern exhaustiveness,
+constructor/tuple/list/or pattern binding,
+simple loop-only `break`/`continue`
 validation, name-bound `for` loops over `Range`, `List`, `Vector`, `Set`,
 `String`, and array/tensor-shaped values, and tuple binders over `Dict` and
 iterables of tuples. Tuple destructuring now validates RHS tuple shape, binds
@@ -979,12 +1009,15 @@ and arity shapes. Function symbol registration now deep-copies function type
 payloads before storing them in Env so compound signatures such as
 `List[String]` are owned by the Env entry. Global initializers are inferred
 against declared annotations when present, and unannotated global variables are
-re-registered with their inferred type after checking. Mutable global
-initializers also reject startup function calls and subscript expressions while
-skipping lambda bodies, matching the OCaml "work before main" boundary. This is
-intentionally still the conservative body-check slice: it does not yet port
-resource-body rules, trait/default method bodies, or final typed AST
-materialization.
+re-registered with their inferred type after checking. Global variables retain
+their module owner metadata through both first-pass registration and checked
+body re-registration. Mutable global initializers also reject startup function
+calls and subscript expressions while skipping lambda bodies, matching the
+OCaml "work before main" boundary. This is intentionally still the
+conservative body-check slice: it does not yet port full resource-body rules
+or final typed AST materialization. Closure-capture restrictions for mutable
+values, scoped resources, scoped-resource-derived values, one-shot streams,
+and resource sources now live in inference.
 The conservative purity slice is also in place: typed expression traversal now
 collects resolved impure calls, pure source function body checking reports
 direct impure calls by callee name after expression inference, pure callback
@@ -995,25 +1028,102 @@ functions now also reject direct and subscript assignment to module-level
 mutable variables while allowing same-name local mutable shadowing. Lambda
 inference now rejects closure capture of mutable outer variables, including
 multiple captures and assignment to an outer mutable binding, while allowing
-immutable captures and parameter/local shadowing. Debug-block validation now
-rejects impure calls and assignment work inside inferred `debug:` bodies.
+immutable captures and parameter/local shadowing. The parsed free-variable
+walker used by closure/task capture checks now covers newer expression forms
+including `select`, `with`, `concurrent`, `for ... concurrently`, `detach`,
+and direct `?=` sequence bindings. Debug-block validation now rejects impure
+calls and assignment work inside inferred `debug:` bodies.
+`detach` and basic `concurrent:` block expressions now have explicit typed
+expression nodes instead of falling through to unsupported expressions. The
+Blorp inference pass type-checks `max_threads`/`timeout` concurrent parameters
+as integer expressions, rejects unknown or duplicate concurrent parameter
+names, rejects duplicate fixed-task result names, rejects sibling fixed-task
+result references, rejects mutable/resource-like task captures for fixed
+tasks and detached work, infers the nested body, returns `Void`, and keeps the
+new nodes visible to impure-call, module-assignment, startup-call,
+startup-subscript, tail-recursion, pure-lambda, and debug-block traversals.
+Full concurrent binding result leakage, concurrent timeout lowering, and
+deeper resource ownership transfer remain in later concurrency/resource
+slices.
+`select:` now has explicit typed select-arm nodes in the Blorp inference pass
+for receive, sealed, and after arms. The first slice keeps `select` statement
+only, rejects empty select blocks, validates receive/sealed waitables as
+`Channel[T]`, binds receive values only inside the selected arm body, accepts
+integer and `Duration` timeout expressions for after arms, returns `Void`, and
+keeps select waitables and arm bodies visible to purity/startup/tailrec/debug
+traversals. Resource-producing waitables, operation-result waitables, selected
+branch resource ownership, and Core lowering remain in later
+concurrency/resource slices.
+`for ... concurrently` now has an explicit typed node in Blorp inference. The
+first slice keeps it statement-only, checks `limit` as `Int`, accepts integer
+and `Duration` timeout expressions, infers `List[T]`/`ResourceSource[T]`
+element bindings in a scoped loop body, treats the construct itself as an
+impure operation, returns `Void`, and keeps its iterable, params, and body
+visible to the same purity/startup/tailrec/debug traversals. Task capture
+checking now allows the loop item while rejecting mutable/resource-like
+captures from the parent scope. Core lowering, resource-source ownership
+details, and more precise data-race diagnostics remain in later
+concurrency/resource slices.
+`with` expressions now have explicit typed binding/error-map nodes in Blorp
+inference. The first slice validates plain resource acquisitions against
+known resource type names, unwraps `Option`/`Result` `with ?=` acquisitions
+using the enclosing expected carrier, type-checks `Result` error mappers,
+binds scoped resources only inside the body, rejects resource-containing body
+results from escaping, and keeps acquisitions, mappers, and bodies visible to
+purity/startup/tailrec/debug traversals. The resource hardening slice adds
+stable typed-expression resource dependency metadata, marks immutable
+locals initialized from scoped-resource-dependent expressions as derived,
+rejects scoped-resource-derived final `with` results, enforces compiler-owned
+resource-operation call boundaries, and shadows parent resources as unavailable
+while dependent nested resources are in scope. Lambda inference now also
+rejects captures of scoped resources, scoped-resource-derived values,
+one-shot streams, and resource sources. Local binding checks now reject
+one-shot stream/resource-source ordinary carriers, function carriers that hide
+those carriers, mutable direct resource-source bindings, and copies of
+existing resource-source bindings. Aggregate storage checks now reject
+stream/source values in tuple/list/tensor/dict literals, record fields, and
+record updates. Core resource lowering and deeper resource ownership rules
+remain in later resource slices.
 Impl method body checking now reuses the same function-body, purity, debug,
 module-assignment, and tail-recursive validation path while deliberately
-skipping `main` entrypoint signature validation for methods.
+skipping `main` entrypoint signature validation for methods. Impl method body
+checking also extends the method's scoped type parameters with the implicit
+type parameters inferred from the enclosing impl `for` type. Impl declaration
+validation now checks required trait methods, supertrait obligations, method
+purity, arity, return types, and parameter types with `Self` resolved to the
+impl receiver type. Missing concrete impl methods with trait default bodies
+are checked directly from the parsed trait declaration using the same
+function-like body path instead of synthesizing temporary parsed function
+declarations. `Self` resolution now returns owned type copies so resolved
+signatures do not retain aliases into resolver-local values. Supertrait
+validation uses direct trait evidence so a candidate subtrait impl cannot
+prove its own supertrait.
 Tail-recursive validation is now also present for inferred
 source function bodies: the typed expression traversal detects recursive calls
 used outside tail position and reports `@tail_recursive` violations for
 operands/arguments/non-tail block items while allowing direct tail calls.
 Block expressions now preserve their final expression's full typed metadata,
 including target-typed value slots, so function body checks can accept a block
-ending in a target-widened literal. The
-remaining checkpoint-6 slices still need to port full overload ranking,
-generic UFCS receiver binding, module-qualified variable lookup and impl-method dispatch,
-structs/unions/enums/aliases/opaque conversions, set ambiguity, nested tensor
-shape checks, constructor/list/tuple/or pattern inference, full exhaustiveness,
-resources, concurrency, trait default-body synthesis/checking, generic impl
-method bounds, resource/stream closure-capture restrictions, and final
-zonking/typed AST construction.
+ending in a target-widened literal. Function-body checks now consume a
+finalized infer result: typed-expression finalization structurally zonks
+source/semantic/value types, annotations, widening slots, resolved-call dim
+constraints, patterns, and all nested typed child expressions through the
+inference context's meta bindings. Bare overload resolution now ranks
+compatible candidates by parameter specificity, preferring exact concrete
+matches over concrete-compatible matches over generic matches, while keeping
+the pure-callback preference as a tiebreaker. Bare union constructors now
+participate in expression inference: nullary constructors use the expected
+parent type when present, fielded constructors infer pure constructor
+functions, generic field types specialize through ordinary call substitution,
+and constructor calls preserve callable metadata for later handoff.
+Module-qualified constructor expressions now resolve through module aliases
+and recorded parent type homes, including collision cases where another type
+has a same-named constructor.
+The
+remaining checkpoint-6 slices still need to port the rest of the
+struct/union/enum/alias surface, resources, advanced concurrency,
+resource/stream lowering restrictions, and final typed-program
+materialization.
 
 OCaml references:
 
@@ -1095,6 +1205,7 @@ OCaml references:
 Blorp references:
 
 - `compiler/blorp/compiler_infer.brp`
+- `compiler/blorp/compiler_typecheck_decl.brp`
 - future `compiler_infer_call.brp`
 - future `compiler_infer_resource.brp`
 - future `compiler_infer_concurrency.brp`
@@ -1136,9 +1247,10 @@ Implementation steps:
 Edge cases:
 
 - Local mutation is allowed in pure functions; impure calls are not.
-- Closures cannot capture mutable variables; Blorp inference now covers this
-  for mutable bindings. Resource, resource-derived, stream, and source capture
-  restrictions remain in the resource slice.
+- Closures and concurrent task boundaries cannot capture mutable variables.
+  Blorp inference also rejects resource, resource-derived, stream, and source
+  captures at closure/task boundaries; deeper resource transfer semantics
+  remain in the resource slice.
 - Pure callbacks and impure callback parameters affect purity.
 - Exhaustiveness must cover wildcard, nullary constructors, list patterns,
   nested patterns, and unreachable cases.
