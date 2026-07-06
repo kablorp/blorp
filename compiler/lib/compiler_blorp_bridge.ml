@@ -43,6 +43,15 @@ type parse_source_response =
   | ParsedSource of parsed_source
   | ParseSourceDiagnostics of Ast.compiler_error list
 
+type typechecked_source = {
+  typechecked_program : Typed_ast.program;
+  typechecked_errors : string list;
+  typechecked_import_bindings : Session.import_binding list;
+  typechecked_comments : Parse_comments.collected_comment list;
+  typechecked_phase : parsed_source_phase;
+  typechecked_module_surface : Module_surface.t option;
+}
+
 type parse_source_batch_request = {
   batch_parse_path : string;
   batch_parse_module_name : string;
@@ -172,6 +181,14 @@ type cli_frontend_module_origin =
   | CliFrontendStdModule
   | CliFrontendSourcePackageModule of string
   | CliFrontendPkgModule of string
+
+type typecheck_import_module = {
+  typecheck_import_path : string;
+  typecheck_import_module_name : string;
+  typecheck_import_module_path : string;
+  typecheck_import_text : string;
+  typecheck_import_origin : cli_frontend_module_origin;
+}
 
 type cli_frontend_source_package = {
   cli_frontend_source_package_alias : string;
@@ -532,6 +549,86 @@ let parse_sources_request_json ?(phase = RawParsedProgram) items =
                    (List.map (parse_source_batch_item_json ~phase) items) );
              ] );
        ])
+
+let cli_frontend_module_origin_json = function
+  | CliFrontendUserModule -> Lsp_json.Object [ ("kind", Lsp_json.String "user") ]
+  | CliFrontendStdModule -> Lsp_json.Object [ ("kind", Lsp_json.String "std") ]
+  | CliFrontendSourcePackageModule package ->
+      Lsp_json.Object
+        [
+          ("kind", Lsp_json.String "source_package");
+          ("package", Lsp_json.String package);
+        ]
+  | CliFrontendPkgModule package ->
+      Lsp_json.Object
+        [
+          ("kind", Lsp_json.String "pkg"); ("package", Lsp_json.String package);
+        ]
+
+let typecheck_import_module_json item =
+  Lsp_json.Object
+    [
+      ("path", Lsp_json.String item.typecheck_import_path);
+      ("module", Lsp_json.String item.typecheck_import_module_name);
+      ("module_path", Lsp_json.String item.typecheck_import_module_path);
+      ("text", Lsp_json.String item.typecheck_import_text);
+      ( "origin",
+        cli_frontend_module_origin_json item.typecheck_import_origin );
+    ]
+
+let typecheck_import_modules_field import_modules =
+  match import_modules with
+  | [] -> []
+  | _ ->
+      [
+        ( "import_modules",
+          Lsp_json.Array (List.map typecheck_import_module_json import_modules)
+        );
+      ]
+
+let typecheck_source_request_json_with_imports ~import_modules ~path
+    ~module_name ~text =
+  let payload_fields =
+    [
+      ("path", Lsp_json.String path);
+      ("module", Lsp_json.String module_name);
+      ("text", Lsp_json.String text);
+    ]
+    @ typecheck_import_modules_field import_modules
+  in
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "typecheck_source");
+         ("payload", Lsp_json.Object payload_fields);
+       ])
+
+let typecheck_source_request_json ~path ~module_name ~text =
+  typecheck_source_request_json_with_imports ~import_modules:[] ~path
+    ~module_name ~text
+
+let typecheck_source_file_request_json_with_imports ~import_modules ~path
+    ~module_name =
+  let payload_fields =
+    [
+      ("path", Lsp_json.String path); ("module", Lsp_json.String module_name);
+    ]
+    @ typecheck_import_modules_field import_modules
+  in
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "typecheck_source");
+         ("payload", Lsp_json.Object payload_fields);
+       ])
+
+let typecheck_source_file_request_json ~path ~module_name =
+  typecheck_source_file_request_json_with_imports ~import_modules:[] ~path
+    ~module_name
 
 let cli_run_request_json ?version args =
   let version_fields =
@@ -941,6 +1038,58 @@ let parse_sources_response_field response =
 
 let parse_sources_response_json response_json =
   response_result response_json parse_sources_response_field
+
+let require_typecheck_source_phase artifact =
+  let* phase = parsed_source_phase_response_field artifact in
+  match phase with
+  | TypecheckSourceProgram -> Ok phase
+  | RawParsedProgram ->
+      Error
+        ( "invalid_response",
+          "typecheck_source artifact must have ast_phase typecheck_source" )
+
+let import_binding_response_field = function
+  | Lsp_json.Object _ as value ->
+      let* local_name = string_response_field "local_name" value in
+      let* module_path = string_response_field "module_path" value in
+      let* original_name = optional_string_response_field "original_name" value in
+      Ok Session.{ local_name; module_path; original_name }
+  | _ ->
+      Error
+        ("invalid_response", "import_bindings items must be JSON objects")
+
+let typechecked_source_artifact_field artifact =
+  let* typechecked_phase = require_typecheck_source_phase artifact in
+  let* typechecked_comments = parse_comments_response_field artifact in
+  let* typechecked_module_surface = module_surface_artifact_field artifact in
+  let* typechecked_errors = string_array_field "type_errors" artifact in
+  let* typechecked_import_bindings =
+    array_response_field_map "import_bindings" import_binding_response_field
+      artifact
+  in
+  let* typed_program_json = json_response_field "typed_program" artifact in
+  match Typed_ast_json.decode_typed_program typed_program_json with
+  | Ok typechecked_program ->
+      Ok
+        {
+          typechecked_program;
+          typechecked_errors;
+          typechecked_import_bindings;
+          typechecked_comments;
+          typechecked_phase;
+          typechecked_module_surface;
+        }
+  | Error err ->
+      Error
+        ( "invalid_response",
+          Typed_ast_json.decode_error_to_string err )
+
+let typecheck_source_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  typechecked_source_artifact_field artifact
+
+let typecheck_source_response_json response_json =
+  response_result response_json typecheck_source_response_field
 
 let cli_frontend_command_of_string = function
   | "check" -> Ok CliFrontendCheck
@@ -1642,9 +1791,12 @@ let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
 let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
+let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
 let renderer_bridge_source_name = "compiler/blorp/compiler_bridge_cli.brp"
 let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
+let typecheck_bridge_source_name =
+  "compiler/blorp/compiler_typecheck_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");
@@ -1655,12 +1807,17 @@ let bridge_helper_compile_env =
   ]
 
 let parser_bridge_helper_compile_env = bridge_helper_compile_env
+let typecheck_bridge_helper_compile_env = bridge_helper_compile_env
 
 let renderer_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
 let parser_bridge_cache :
+    (string * string * string * string * string) option ref =
+  ref None
+
+let typecheck_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
@@ -1863,10 +2020,11 @@ let validate_explicit_bridge_helper_override path =
     Error
       (Printf.sprintf
          "%s must point to a bootstrap-capable Blorp compiler, not the current \
-          compiler executable `%s`. Provide prepared helper binaries with %s \
-          and %s, or unset %s to use %s."
+          compiler executable `%s`. Provide prepared helper binaries with %s, \
+          %s, and %s, or unset %s to use %s."
          compiler_bridge_bin_env path prepared_renderer_bridge_bin_env
-         prepared_parser_bridge_bin_env compiler_bridge_bin_env
+         prepared_parser_bridge_bin_env prepared_typecheck_bridge_bin_env
+         compiler_bridge_bin_env
          compiler_bootstrap_script_name)
   else Ok ()
 
@@ -1966,6 +2124,15 @@ let parser_bridge_source_path () =
       invalid_arg
         (Printf.sprintf "cannot locate Blorp parser bridge source %s"
            parser_bridge_source_name)
+
+let typecheck_bridge_source_path () =
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  match find_upwards_from starts typecheck_bridge_source_name with
+  | Some path -> path
+  | None ->
+      invalid_arg
+        (Printf.sprintf "cannot locate Blorp typecheck bridge source %s"
+           typecheck_bridge_source_name)
 
 let renderer_bridge_temp_dir_retry_limit = 32
 
@@ -2397,6 +2564,7 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
               compiler_bridge_bin_env;
               prepared_renderer_bridge_bin_env;
               prepared_parser_bridge_bin_env;
+              prepared_typecheck_bridge_bin_env;
             ]
           [ "compile"; "--no-format"; "-o"; c_path; source_path ]
       in
@@ -2558,9 +2726,21 @@ let parser_bridge_binary () =
         ~source_path:(parser_bridge_source_path ())
         ~compile_env:parser_bridge_helper_compile_env
 
+let typecheck_bridge_binary () =
+  match prepared_bridge_binary_from_env prepared_typecheck_bridge_bin_env with
+  | Some result -> result
+  | None when prepared_bridge_required () ->
+      missing_prepared_bridge_error prepared_typecheck_bridge_bin_env
+  | None ->
+      let* compiler = parser_bridge_helper_compiler () in
+      bridge_binary_for_source typecheck_bridge_cache ~compiler
+        ~source_path:(typecheck_bridge_source_path ())
+        ~compile_env:typecheck_bridge_helper_compile_env
+
 type prepared_bridge_binaries = {
   prepared_renderer_bridge_bin : string;
   prepared_parser_bridge_bin : string;
+  prepared_typecheck_bridge_bin : string;
 }
 
 let prepare_bridge_binaries ~out_dir =
@@ -2568,6 +2748,7 @@ let prepare_bridge_binaries ~out_dir =
   let* compiler = default_bridge_helper_compiler () in
   let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
+  let typecheck_bin = Filename.concat out_dir "compiler_typecheck_bridge.bin" in
   let* renderer_path =
     compile_bridge_binary_to_path ~compiler
       ~source_path:(renderer_bridge_source_path ())
@@ -2580,10 +2761,17 @@ let prepare_bridge_binaries ~out_dir =
       ~compile_env:parser_bridge_helper_compile_env ~work_root:out_dir
       ~bin_path:parser_bin
   in
+  let* typecheck_path =
+    compile_bridge_binary_to_path ~compiler
+      ~source_path:(typecheck_bridge_source_path ())
+      ~compile_env:typecheck_bridge_helper_compile_env ~work_root:out_dir
+      ~bin_path:typecheck_bin
+  in
   Ok
     {
       prepared_renderer_bridge_bin = renderer_path;
       prepared_parser_bridge_bin = parser_path;
+      prepared_typecheck_bridge_bin = typecheck_path;
     }
 
 let run_request_via_blorp_binary bridge_binary request_json =
@@ -2621,6 +2809,9 @@ let run_renderer_request_via_blorp request_json =
 
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
+
+let run_typecheck_request_via_blorp request_json =
+  run_request_via_blorp_binary typecheck_bridge_binary request_json
 
 let run_cli_request_via_blorp ?version args =
   run_parser_request_via_blorp (cli_run_request_json ?version args)
@@ -2720,6 +2911,20 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
 let parse_source_file_via_command ~path ~module_name =
   parse_source_file_via_command_at_phase ~phase:RawParsedProgram ~path
     ~module_name
+
+let typecheck_source_via_command ~path ~module_name ~text =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_source_request_json ~path ~module_name ~text)
+  in
+  typecheck_source_response_json response_json
+
+let typecheck_source_file_via_command ~path ~module_name =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_source_file_request_json ~path ~module_name)
+  in
+  typecheck_source_response_json response_json
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json

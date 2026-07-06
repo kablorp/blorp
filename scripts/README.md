@@ -122,17 +122,19 @@ scripts/with-build-lock make quality
 
 Backend renderer/Core requests use a compiled
 `compiler/blorp/compiler_bridge_cli.brp` helper. Parser requests use
-`compiler/blorp/compiler_parser_bridge_cli.brp`, which carries the parser-heavy
-imports separately so the backend helper stays bootstrap-small.
+`compiler/blorp/compiler_parser_bridge_cli.brp`, and typed-frontend requests
+use `compiler/blorp/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
+imports stay separate so the backend helper stays bootstrap-small.
 
-`scripts/test` prepares both helper binaries once at startup for gates that run
+`scripts/test` prepares these helper binaries once at startup for gates that run
 Blorp compiler commands (`compiler`, `runtime`, `leak`, `doctest`, and `cli`).
 Pure `compiler-unit` runs skip this setup. When preparation is needed, the
 harness runs it after building `./blorp` and before std preflight. It writes the
 helpers into a run-local temporary directory, then exports
-`BLORP_COMPILER_RENDERER_BRIDGE_BIN` and `BLORP_COMPILER_PARSER_BRIDGE_BIN` so
-preflight and every gate execute those prepared helpers directly. Individual
-tests should not compile either helper on first use; the harness also sets
+`BLORP_COMPILER_RENDERER_BRIDGE_BIN`, `BLORP_COMPILER_PARSER_BRIDGE_BIN`, and
+`BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` so preflight and every gate execute those
+prepared helpers directly. Individual tests should not compile a helper on first
+use; the harness also sets
 `BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
 instead of falling back to lazy helper compilation.
 

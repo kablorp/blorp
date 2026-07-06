@@ -1,5 +1,5 @@
 import:
-	../compiler_context: CompilerModuleOrigin(CompilerSourcePackageModule)
+	../compiler_context: CompilerModuleOrigin(CompilerSourcePackageModule, CompilerStdlibModule)
 	../compiler_env:
 		CompilerFuncOrigin(CompilerForeignFunc, CompilerUserDefinedFunc),
 		CompilerPurity(CompilerImpure, CompilerPure),
@@ -19,12 +19,21 @@ import:
 		compiler_env_get_type_kind,
 		compiler_env_get_var_type,
 		compiler_env_lookup,
+	../compiler_imports: CompilerImportableModuleSurface, compiler_importable_module_surface
+	../compiler_infer:
+		CompilerExprTypeOrigin(CompilerInferredOrigin),
+		CompilerTypedExpr(CompilerTypedIntLiteralExpr),
+		CompilerTypedExprInfo,
+		compiler_typed_expr_semantic_type,
+	../compiler_module_surface: module_surface_for_program
 	../compiler_parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
 			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
 			PrivateParsedDecl,
 			RecordParsedDecl,
 			TraitParsedDecl,
@@ -50,7 +59,10 @@ import:
 		),
 		ParsedFieldDecl,
 		ParsedFunctionAnnotation(ParsedDebugOnlyAnnotation, ParsedTailRecursiveAnnotation),
+		ParsedFunctionDecl,
 		ParsedIdentifier,
+		ParsedImportDecl,
+		ParsedImportSymbol,
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamWildcardBinder),
 		ParsedProgram,
@@ -59,6 +71,7 @@ import:
 		ParsedTypeExpr(ParsedArrayType, ParsedDimLiteralType, ParsedFunctionType, ParsedNamedType),
 		ParsedTypeParamDecl,
 		parsed_identifier,
+	../compiler_refinement: compiler_unrefined_binding
 	../compiler_source:
 		CompilerCursor,
 		CompilerSourceFile,
@@ -67,18 +80,39 @@ import:
 		compiler_source_file,
 		compiler_source_span,
 	../compiler_type:
-		CompilerType(CompilerFunctionType),
+		CompilerType(CompilerFunctionType, CompilerMetaType),
 		compiler_type_bool,
 		compiler_type_int,
 		compiler_type_string,
 		compiler_type_void,
 		compiler_types_equal,
+	../compiler_type_widening: CompilerTypeWideningDecision(CompilerTypeKeep), CompilerValueSlot
 	../compiler_typecheck_decl:
+		CompilerTypecheckProgramResult,
+		CompilerTypedDecl(
+			CompilerTypedFunctionDecl,
+			CompilerTypedGlobalVarDecl,
+			CompilerTypedImplDecl,
+			CompilerTypedParsedDecl,
+			CompilerTypedPrivateDecl,
+			CompilerTypedRecordDecl,
+			CompilerTypedTypeAliasDecl,
+		),
+		CompilerTypedGlobalVarInfo,
+		CompilerTypedProgram,
+		CompilerTypedRecordFieldInfo,
+		CompilerTypedRecordInfo,
 		compiler_typecheck_check_function_body,
 		compiler_typecheck_check_program_bodies,
+		compiler_typecheck_materialize_program_bodies,
 		compiler_typecheck_prescan_program,
+		compiler_typecheck_program,
+		compiler_typecheck_program_with_import_surfaces,
+		compiler_typecheck_register_program_impl_decls,
+		compiler_typecheck_register_program_import_decls,
 		compiler_typecheck_register_program_signature_decls,
 		compiler_typecheck_register_program_type_decls,
+		compiler_typecheck_validate_typed_program,
 	../compiler_typecheck_state:
 		CompilerTopLevelNameKind(
 			CompilerTopLevelConstructor,
@@ -88,9 +122,12 @@ import:
 			CompilerTopLevelVariable,
 		),
 		compiler_typecheck_state_empty,
+		compiler_typecheck_state_find_module_alias,
 		compiler_typecheck_state_find_top_level_name,
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_for_origin,
+		compiler_typecheck_state_has_import_binding,
+		compiler_typecheck_state_has_imported_module,
 		compiler_typecheck_state_has_known_resource_type_name,
 		compiler_typecheck_state_has_known_type_name,
 		compiler_typecheck_state_stdlib,
@@ -113,6 +150,10 @@ pure func ident(text: String) -> ParsedIdentifier:
 
 pure func int_type() -> ParsedTypeExpr:
 	ParsedNamedType(ident("Int"), [], source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], source_span())
 
 
 pure func dim_literal_type(text: String) -> ParsedTypeExpr:
@@ -317,6 +358,26 @@ pure func function_body_decl_with_annotations(
 	})
 
 
+pure func method_body_decl(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+) -> ParsedFunctionDecl:
+	{
+		name = ident(name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = body,
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = source_span()
+	}
+
+
 pure func function_signature_decl(
 	name: String,
 	params: List[ParsedParam],
@@ -507,6 +568,20 @@ pure func trait_decl(name: String) -> ParsedDecl:
 	})
 
 
+pure func impl_decl_with_methods(
+	trait_name: String,
+	for_type: ParsedTypeExpr,
+	methods: List[ParsedFunctionDecl],
+) -> ParsedDecl:
+	ImplParsedDecl({
+		trait_name = ident(trait_name),
+		for_type = for_type,
+		methods = methods,
+		doc = None,
+		span = source_span(),
+	})
+
+
 pure func foreign_block_decl(function_name: String) -> ParsedDecl:
 	ForeignBlockParsedDecl(
 		[],
@@ -526,12 +601,53 @@ pure func foreign_block_decl(function_name: String) -> ParsedDecl:
 	)
 
 
+pure func import_symbol(
+	name: String,
+	symbol_alias: Option[String],
+	constructors: List[String],
+) -> ParsedImportSymbol:
+	{
+		name = ident(name),
+		symbol_alias = symbol_alias.map(func(alias_name): ident(alias_name)),
+		constructors = constructors.map(func(constructor_name): ident(constructor_name)),
+		span = source_span()
+	}
+
+
+pure func import_decl(
+	module_path: String,
+	module_alias: Option[String],
+	symbols: Option[List[ParsedImportSymbol]],
+) -> ParsedImportDecl:
+	{
+		module_path = module_path,
+		module_alias = module_alias.map(func(alias_name): ident(alias_name)),
+		symbols = symbols,
+		span = source_span()
+	}
+
+
+pure func import_block_decl(imports: List[ParsedImportDecl]) -> ParsedDecl:
+	ImportBlockParsedDecl(imports, source_span())
+
+
 pure func program(decls: List[ParsedDecl]) -> ParsedProgram:
 	{
 		source = source_file(),
 		decls = decls,
 		diagnostics = []
 	}
+
+
+pure func importable_surface(
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerImportableModuleSurface:
+	compiler_importable_module_surface(
+		module_path,
+		CompilerStdlibModule,
+		module_surface_for_program(program(decls)),
+	)
 
 
 func test_prescan_collects_top_level_names_and_resources() -> Bool:
@@ -609,6 +725,122 @@ func test_prescan_records_foreign_block_functions() -> Bool:
 		state,
 		"native_hash",
 	) == Some(CompilerTopLevelFunction)
+
+
+func test_register_imports_records_qualified_module_alias() -> Bool:
+	source_program = program([import_block_decl([
+			import_decl("std/file", Some("File"), None),
+			import_decl("json", None, None),
+		])])
+	state = compiler_typecheck_register_program_import_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+
+	(
+		compiler_typecheck_state_find_module_alias(state, "File") == Some("std/file")
+		and compiler_typecheck_state_find_module_alias(state, "json") == Some("json")
+		and compiler_typecheck_state_has_imported_module(state, "std/file")
+		and compiler_typecheck_state_has_import_binding(state, "File", "std/file", None)
+		and compiler_typecheck_state_has_import_binding(state, "json", "json", None)
+	)
+
+
+func test_register_imports_records_selective_symbols_and_constructors() -> Bool:
+	source_program = program([
+		import_block_decl([
+			import_decl(
+				"option",
+				None,
+				Some([
+					import_symbol(
+						"Option",
+						None,
+						["Some", "None"],
+					),
+					import_symbol("map", Some("option_map"), []),
+				]),
+			),
+		]),
+	])
+	state = compiler_typecheck_register_program_import_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+
+	(
+		compiler_typecheck_state_has_import_binding(state, "Option", "option", Some("Option"))
+		and compiler_typecheck_state_has_import_binding(state, "Some", "option", Some("Some"))
+		and compiler_typecheck_state_has_import_binding(state, "None", "option", Some("None"))
+		and compiler_typecheck_state_has_import_binding(state, "option_map", "option", Some("map"))
+		and compiler_typecheck_state_find_module_alias(state, "option").is_none()
+	)
+
+
+func test_register_imports_records_combined_alias_and_symbols() -> Bool:
+	source_program = program(
+		[
+			import_block_decl(
+				[import_decl("heap", Some("H"), Some([import_symbol("Heap", None, [])]))],
+			),
+		],
+	)
+	state = compiler_typecheck_register_program_import_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+
+	(
+		compiler_typecheck_state_find_module_alias(state, "H") == Some("heap")
+		and compiler_typecheck_state_has_import_binding(state, "H", "heap", None)
+		and compiler_typecheck_state_has_import_binding(state, "Heap", "heap", Some("Heap"))
+	)
+
+
+func test_register_imports_reports_namespace_collisions() -> Bool:
+	source_program = program([function_decl("File"), import_block_decl([
+			import_decl("std/file", Some("File"), None),
+			import_decl("math", None, Some([import_symbol("File", None, [])])),
+		])])
+	state = compiler_typecheck_register_program_import_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+
+	state.errors.length() == 2 and state.errors
+		.get_or(0, "")
+		.contains("module alias 'File' conflicts with function 'File'") and state.errors
+		.get_or(1, "")
+		.contains("imported name 'File' conflicts with function 'File'")
+
+
+func test_typecheck_program_with_import_surfaces_validates_imports() -> Bool:
+	modules = [importable_surface("json", [record_decl("Token")])]
+	valid_program = program([
+		import_block_decl([import_decl("json", None, Some([import_symbol("Token", None, [])]))]),
+		function_body_decl(
+			"identity",
+			[named_param("value", int_type())],
+			Some(int_type()),
+			Some(decl_name_expr("value")),
+		),
+	])
+	valid_result = compiler_typecheck_program_with_import_surfaces(
+		compiler_typecheck_state_empty(),
+		valid_program,
+		modules,
+	)
+
+	(
+		valid_result.state.errors.length() == 0
+		and compiler_typecheck_state_has_import_binding(
+			valid_result.state,
+			"Token",
+			"json",
+			Some("Token"),
+		)
+		and compiler_typecheck_state_find_type_home(valid_result.state, "Token") == Some("json")
+	)
 
 
 func test_registers_type_record_alias_and_constructors() -> Bool:
@@ -1015,6 +1247,385 @@ func test_check_function_bodies_accepts_named_params() -> Bool:
 	)
 
 	state.errors.length() == 0
+
+
+func test_materialize_program_bodies_carries_typed_function_and_global() -> Bool:
+	source_program = program([
+		function_body_decl(
+			"identity",
+			[named_param("value", int_type())],
+			Some(int_type()),
+			Some(decl_name_expr("value")),
+		),
+		var_body_decl("answer", Some(int_type()), int_expr()),
+	])
+	base_state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	function_ok = match result.program.decls.get(0):
+		Some(CompilerTypedFunctionDecl(info)):
+			param_ok = match info.param_types.get(0):
+				Some(param_type):
+					compiler_types_equal(param_type, compiler_type_int())
+				None:
+					False
+
+			source_return_ok = match info.source_return_type:
+				Some(return_type):
+					compiler_types_equal(return_type, compiler_type_int())
+				None:
+					False
+
+			semantic_return_ok = compiler_types_equal(
+				info.semantic_return_type,
+				compiler_type_int(),
+			)
+
+			body_ok = match info.body:
+				Some(body):
+					compiler_types_equal(
+						compiler_typed_expr_semantic_type(body),
+						compiler_type_int(),
+					)
+				None:
+					False
+
+			(
+				info.decl.name.text == "identity"
+				and param_ok
+				and source_return_ok
+				and semantic_return_ok
+				and body_ok
+			)
+		_:
+			False
+
+	global_ok = match result.program.decls.get(1):
+		Some(CompilerTypedGlobalVarDecl(info)):
+			source_ok = match info.source_type:
+				Some(source_type):
+					compiler_types_equal(source_type, compiler_type_int())
+				None:
+					False
+
+			(
+				info.decl.name.text == "answer"
+				and compiler_types_equal(info.binding_type, compiler_type_int())
+				and source_ok
+			)
+		_:
+			False
+
+	(
+		result.state.errors.length() == 0
+		and result.program.decls.length() == 2
+		and function_ok
+		and global_ok
+	)
+
+
+func test_materialize_program_bodies_carries_typed_decl_shapes() -> Bool:
+	source_program = program([
+		record_with_fields_decl("Widget", [int_type()]),
+		type_alias_decl("WidgetId", False),
+		trait_decl_with_methods(
+			"Display",
+			[],
+			[],
+			[
+				trait_method_decl(
+					"display",
+					[named_param("value", named_type("Widget"))],
+					Some(int_type()),
+					False,
+					False,
+				),
+			],
+		),
+		impl_decl_with_methods(
+			"Display",
+			named_type("Widget"),
+			[
+				method_body_decl(
+					"display",
+					[named_param("value", named_type("Widget"))],
+					Some(int_type()),
+					Some(int_expr()),
+				),
+			],
+		),
+		PrivateParsedDecl(
+			type_alias_decl("PrivateId", False),
+			source_span(),
+		),
+	])
+	with_types = compiler_typecheck_register_program_type_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+	with_signatures = compiler_typecheck_register_program_signature_decls(
+		with_types,
+		source_program,
+	)
+	base_state = compiler_typecheck_register_program_impl_decls(with_signatures, source_program)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	record_ok = match result.program.decls.get(0):
+		Some(CompilerTypedRecordDecl(info)):
+			field_ok = match info.fields.get(0):
+				Some(field):
+					(
+						field.name == "field"
+						and compiler_types_equal(field.source_type, compiler_type_int())
+						and compiler_types_equal(field.semantic_type, compiler_type_int())
+					)
+				None:
+					False
+
+			info.decl.name.text == "Widget" and info.fields.length() == 1 and field_ok
+		_:
+			False
+
+	alias_ok = match result.program.decls.get(1):
+		Some(CompilerTypedTypeAliasDecl(info)):
+			(
+				info.decl.name.text == "WidgetId"
+				and compiler_types_equal(info.source_target_type, compiler_type_int())
+				and compiler_types_equal(info.semantic_target_type, compiler_type_int())
+			)
+		_:
+			False
+
+	trait_passthrough_ok = match result.program.decls.get(2):
+		Some(CompilerTypedParsedDecl(TraitParsedDecl(trait_info))):
+			trait_info.name.text == "Display"
+		_:
+			False
+
+	impl_ok = match result.program.decls.get(3):
+		Some(CompilerTypedImplDecl(info)):
+			method_ok = match info.methods.get(0):
+				Some(method_info):
+					source_return_ok = match method_info.source_return_type:
+						Some(return_type):
+							compiler_types_equal(return_type, compiler_type_int())
+						None:
+							False
+
+					(
+						method_info.decl.name.text == "display"
+						and source_return_ok
+						and compiler_types_equal(
+							method_info.semantic_return_type,
+							compiler_type_int(),
+						)
+						and method_info.body.is_some()
+					)
+				None:
+					False
+
+			info.decl.trait_name.text == "Display" and info.methods.length() == 1 and method_ok
+		_:
+			False
+
+	private_ok = match result.program.decls.get(4):
+		Some(CompilerTypedPrivateDecl(CompilerTypedTypeAliasDecl(info))):
+			info.decl.name.text == "PrivateId"
+		_:
+			False
+
+	(
+		result.state.errors.length() == 0
+		and result.program.decls.length() == 5
+		and record_ok
+		and alias_ok
+		and trait_passthrough_ok
+		and impl_ok
+		and private_ok
+	)
+
+
+func test_typecheck_program_runs_full_decl_pipeline() -> Bool:
+	source_program = program([
+		record_with_fields_decl("Widget", [int_type()]),
+		trait_decl_with_methods(
+			"Display",
+			[],
+			[],
+			[
+				trait_method_decl(
+					"display",
+					[named_param("value", named_type("Widget"))],
+					Some(int_type()),
+					False,
+					False,
+				),
+			],
+		),
+		impl_decl_with_methods(
+			"Display",
+			named_type("Widget"),
+			[
+				method_body_decl(
+					"display",
+					[named_param("value", named_type("Widget"))],
+					Some(int_type()),
+					Some(int_expr()),
+				),
+			],
+		),
+		function_body_decl(
+			"identity",
+			[named_param("value", int_type())],
+			Some(int_type()),
+			Some(decl_name_expr("value")),
+		),
+		var_body_decl("answer", Some(int_type()), int_expr()),
+	])
+	base_state = compiler_typecheck_state_empty()
+	result = compiler_typecheck_program(base_state, source_program)
+
+	record_ok = match result.program.decls.get(0):
+		Some(CompilerTypedRecordDecl(info)):
+			info.decl.name.text == "Widget" and info.fields.length() == 1
+		_:
+			False
+
+	impl_ok = match result.program.decls.get(2):
+		Some(CompilerTypedImplDecl(info)):
+			info.decl.trait_name.text == "Display" and info.methods.length() == 1
+		_:
+			False
+
+	function_ok = match result.program.decls.get(3):
+		Some(CompilerTypedFunctionDecl(info)):
+			body_ok = match info.body:
+				Some(body):
+					compiler_types_equal(
+						compiler_typed_expr_semantic_type(body),
+						compiler_type_int(),
+					)
+				None:
+					False
+
+			info.decl.name.text == "identity" and info.param_types.length() == 1 and body_ok
+		_:
+			False
+
+	global_ok = match result.program.decls.get(4):
+		Some(CompilerTypedGlobalVarDecl(info)):
+			(
+				info.decl.name.text == "answer"
+				and compiler_types_equal(info.binding_type, compiler_type_int())
+			)
+		_:
+			False
+
+	(
+		result.state.errors.length() == 0
+		and result.state.env.impls.length() == base_state.env.impls.length() + 1
+		and result.program.source.module_name == "decl"
+		and result.program.diagnostics.length() == 0
+		and result.program.decls.length() == 5
+		and compiler_typecheck_state_find_top_level_name(
+			result.state,
+			"Display",
+		) == Some(CompilerTopLevelTrait)
+		and record_ok
+		and impl_ok
+		and function_ok
+		and global_ok
+	)
+
+
+func test_validate_typed_program_rejects_unfinalized_meta() -> Bool:
+	source_decl = record_with_fields_decl("Broken", [int_type()])
+
+	match source_decl:
+		RecordParsedDecl(record_decl):
+			typed_field: CompilerTypedRecordFieldInfo = {
+				name = "field",
+				source_type = CompilerMetaType(7),
+				semantic_type = compiler_type_int()
+			}
+			typed_record: CompilerTypedRecordInfo = {
+				decl = record_decl,
+				fields = [typed_field]
+			}
+			typed_program: CompilerTypedProgram = {
+				source = source_file(),
+				decls = [CompilerTypedRecordDecl(typed_record)],
+				diagnostics = []
+			}
+			result: CompilerTypecheckProgramResult = compiler_typecheck_validate_typed_program({
+				state = compiler_typecheck_state_empty(),
+				program = typed_program,
+			})
+
+			result.state.errors.length() == 1 and result.state.errors
+				.get_or(0, "")
+				.contains((
+						"typed program contains unfinalized inference meta in record 'Broken' field "
+						+ "'field' source type"
+					))
+		_:
+			False
+
+
+pure func incoherent_typed_int_expr() -> CompilerTypedExpr:
+	value_slot: CompilerValueSlot = {
+		semantic_type = compiler_type_int(),
+		decision = CompilerTypeKeep(compiler_type_int())
+	}
+	info: CompilerTypedExprInfo = {
+		source_type = None,
+		semantic_type = compiler_type_int(),
+		value_type = compiler_type_string(),
+		origin = CompilerInferredOrigin,
+		value_slot = value_slot,
+		proofs = compiler_unrefined_binding(),
+		resolved_call = None,
+		resource_dependencies = []
+	}
+
+	CompilerTypedIntLiteralExpr("1", source_span(), info)
+
+
+func test_validate_typed_program_rejects_incoherent_expr_info() -> Bool:
+	source_decl = var_body_decl("broken", Some(int_type()), int_expr())
+
+	match source_decl:
+		VarParsedDecl(var_decl):
+			typed_global: CompilerTypedGlobalVarInfo = {
+				decl = var_decl,
+				binding_type = compiler_type_int(),
+				source_type = Some(compiler_type_int()),
+				value = incoherent_typed_int_expr()
+			}
+			typed_program: CompilerTypedProgram = {
+				source = source_file(),
+				decls = [CompilerTypedGlobalVarDecl(typed_global)],
+				diagnostics = []
+			}
+			result: CompilerTypecheckProgramResult = compiler_typecheck_validate_typed_program({
+				state = compiler_typecheck_state_empty(),
+				program = typed_program,
+			})
+
+			result.state.errors.length() == 1 and result.state.errors
+				.get_or(0, "")
+				.contains((
+						"typed expression has incoherent type info in global 'broken' value: kept "
+						+ "widening decision must match value type"
+					))
+		_:
+			False
 
 
 func test_check_function_body_reports_wrong_return_type() -> Bool:
@@ -1682,6 +2293,26 @@ tests: TestSuite = {
 		),
 		("prescan records foreign block functions", test_prescan_records_foreign_block_functions),
 		(
+			"register imports records qualified module alias",
+			test_register_imports_records_qualified_module_alias,
+		),
+		(
+			"register imports records selective symbols and constructors",
+			test_register_imports_records_selective_symbols_and_constructors,
+		),
+		(
+			"register imports records combined alias and symbols",
+			test_register_imports_records_combined_alias_and_symbols,
+		),
+		(
+			"register imports reports namespace collisions",
+			test_register_imports_reports_namespace_collisions,
+		),
+		(
+			"typecheck program with import surfaces validates imports",
+			test_typecheck_program_with_import_surfaces_validates_imports,
+		),
+		(
 			"registers type record alias and constructors",
 			test_registers_type_record_alias_and_constructors,
 		),
@@ -1714,6 +2345,26 @@ tests: TestSuite = {
 		(
 			"check function bodies accepts named params",
 			test_check_function_bodies_accepts_named_params,
+		),
+		(
+			"materialize program bodies carries typed function and global",
+			test_materialize_program_bodies_carries_typed_function_and_global,
+		),
+		(
+			"materialize program bodies carries typed decl shapes",
+			test_materialize_program_bodies_carries_typed_decl_shapes,
+		),
+		(
+			"typecheck program runs full decl pipeline",
+			test_typecheck_program_runs_full_decl_pipeline,
+		),
+		(
+			"validate typed program rejects unfinalized meta",
+			test_validate_typed_program_rejects_unfinalized_meta,
+		),
+		(
+			"validate typed program rejects incoherent expr info",
+			test_validate_typed_program_rejects_incoherent_expr_info,
 		),
 		(
 			"check function body reports wrong return type",

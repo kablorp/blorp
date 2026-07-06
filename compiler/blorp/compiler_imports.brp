@@ -1,10 +1,13 @@
 -- Pure import registration substrate for the Blorp-owned typecheck pass.
 --
--- This consumes parsed import declarations and already-loaded module surfaces.
--- It intentionally records only import bookkeeping here: imported modules,
--- aliases, imported-name bindings, imported type homes, and diagnostics. The
--- semantic env effects for imported declarations belong to the declaration
--- registration slice, matching the current OCaml phase boundary.
+-- This consumes parsed import declarations. The syntax-only collector records
+-- source import bindings for single-source bridge artifacts; the graph-aware
+-- collector additionally validates against already-loaded module surfaces.
+-- Both paths intentionally record only import bookkeeping here: imported
+-- modules, aliases, imported-name bindings, imported type homes, and
+-- diagnostics. The semantic env effects for imported declarations belong to
+-- the declaration registration slice, matching the current OCaml phase
+-- boundary.
 import:
 	compiler_context: CompilerModuleOrigin, compiler_module_origin_is_package
 	compiler_module_surface:
@@ -12,7 +15,8 @@ import:
 		ModuleSurfaceSymbol,
 		ModuleSurfaceSymbolKind(RecordSurfaceSymbol, TypeAliasSurfaceSymbol, TypeSurfaceSymbol),
 	compiler_parsed_ast:
-		ParsedDecl(ImportBlockParsedDecl),
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl),
+		ParsedIdentifier,
 		ParsedImportDecl,
 		ParsedImportSymbol,
 		ParsedProgram,
@@ -35,6 +39,14 @@ record CompilerImportableModuleSurface {
 }
 
 
+record CompilerImportableModule {
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	surface: ModuleSurface,
+	decls: List[ParsedDecl]
+}
+
+
 pure func compiler_importable_module_surface(
 	module_path: String,
 	origin: CompilerModuleOrigin,
@@ -45,6 +57,26 @@ pure func compiler_importable_module_surface(
 		origin = origin,
 		surface = surface
 	}
+
+
+pure func compiler_importable_module(
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	surface: ModuleSurface,
+	decls: List[ParsedDecl],
+) -> CompilerImportableModule:
+	{
+		module_path = module_path,
+		origin = origin,
+		surface = surface,
+		decls = decls
+	}
+
+
+pure func compiler_importable_module_to_surface(
+	module: CompilerImportableModule,
+) -> CompilerImportableModuleSurface:
+	compiler_importable_module_surface(module.module_path, module.origin, module.surface)
 
 
 pure func compiler_import_default_alias(module_path: String) -> String:
@@ -130,6 +162,109 @@ private pure func compiler_import_decl_explicit_alias(decl: ParsedImportDecl) ->
 			Some(alias_name.text)
 		None:
 			None
+
+
+private pure func compiler_register_import_symbol_syntax(
+	state: CompilerTypecheckState,
+	module_path: String,
+	symbol: ParsedImportSymbol,
+) -> CompilerTypecheckState:
+	registration = compiler_typecheck_state_register_imported_name(
+		state,
+		compiler_import_symbol_local_name(symbol),
+		module_path,
+		symbol.name.text,
+	)
+	var next: CompilerTypecheckState = registration.state
+
+	if registration.registered:
+		for constructor in symbol.constructors:
+			next = compiler_register_import_constructor(
+				next,
+				module_path,
+				constructor,
+			)
+
+	next
+
+
+private pure func compiler_register_import_constructor(
+	state: CompilerTypecheckState,
+	module_path: String,
+	constructor: ParsedIdentifier,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_register_imported_name(
+		state,
+		constructor.text,
+		module_path,
+		constructor.text,
+	).state
+
+
+private pure func compiler_register_import_symbols_syntax(
+	state: CompilerTypecheckState,
+	module_path: String,
+	symbols: List[ParsedImportSymbol],
+) -> CompilerTypecheckState:
+	var next: CompilerTypecheckState = state
+
+	for symbol in symbols:
+		next = compiler_register_import_symbol_syntax(next, module_path, symbol)
+
+	next
+
+
+pure func compiler_register_import_decl_syntax(
+	state: CompilerTypecheckState,
+	import_decl: ParsedImportDecl,
+) -> CompilerTypecheckState:
+	module_path: String = import_decl.module_path
+	var next: CompilerTypecheckState = compiler_typecheck_state_add_imported_module(state, module_path)
+
+	match import_decl.symbols:
+		Some(symbols):
+			next = compiler_register_import_symbols_syntax(next, module_path, symbols)
+
+			match compiler_import_decl_explicit_alias(import_decl):
+				Some(alias_name):
+					compiler_typecheck_state_register_module_alias(next, alias_name, module_path)
+				None:
+					next
+		None:
+			alias_name: String = compiler_import_decl_explicit_alias(import_decl)
+				.get_or(compiler_import_default_alias(module_path))
+
+			compiler_typecheck_state_register_module_alias(next, alias_name, module_path)
+
+
+private pure func compiler_register_imports_decl_syntax(
+	state: CompilerTypecheckState,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var next: CompilerTypecheckState = state
+
+			for import_decl in imports:
+				next = compiler_register_import_decl_syntax(next, import_decl)
+
+			next
+		PrivateParsedDecl(inner, _):
+			compiler_register_imports_decl_syntax(state, inner)
+		_:
+			state
+
+
+pure func compiler_register_program_import_syntax(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	var current: CompilerTypecheckState = state
+
+	for decl in program.decls:
+		current = compiler_register_imports_decl_syntax(current, decl)
+
+	current
 
 
 private pure func compiler_import_not_loaded_error(
@@ -229,12 +364,21 @@ private pure func compiler_register_import_symbol(
 			)
 
 			if registration.registered:
-				compiler_record_imported_type_symbol(
+				var next: CompilerTypecheckState = compiler_record_imported_type_symbol(
 					registration.state,
 					module_path,
 					local_name,
 					exported_symbol,
 				)
+
+				for constructor in symbol.constructors:
+					next = compiler_register_import_constructor(
+						next,
+						module_path,
+						constructor,
+					)
+
+				next
 			else:
 				registration.state
 		None:

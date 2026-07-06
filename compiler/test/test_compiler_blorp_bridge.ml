@@ -77,6 +77,22 @@ let parsed_program_json ?(diagnostics = []) decls =
       ("diagnostics", Lsp_json.Array diagnostics);
     ]
 
+let typed_program_json ?(diagnostics = []) decls =
+  Lsp_json.Object
+    [
+      ("kind", Lsp_json.String "typed_program");
+      ( "source",
+        Lsp_json.Object
+          [
+            ("kind", Lsp_json.String "source_file");
+            ("path", Lsp_json.String "main.brp");
+            ("module", Lsp_json.String "main");
+            ("text", Lsp_json.String "");
+          ] );
+      ("decls", Lsp_json.Array decls);
+      ("diagnostics", Lsp_json.Array diagnostics);
+    ]
+
 let span_json ?(path = "main.brp") ?(module_name = "main") start_offset
     start_column end_offset end_column =
   Lsp_json.Object
@@ -299,6 +315,15 @@ let test_parser_bridge_compile_env_supports_pinned_bootstrap () =
     "retired bootstrap parser selector" (Some "ocaml")
     (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
 
+let test_typecheck_bridge_compile_env_supports_pinned_bootstrap () =
+  let env = Blorp.Compiler_blorp_bridge.typecheck_bridge_helper_compile_env in
+  Alcotest.(check (option string))
+    "renderer helper marker" (Some "1")
+    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
+  Alcotest.(check (option string))
+    "retired bootstrap parser selector" (Some "ocaml")
+    (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
+
 let test_parse_source_request_uses_bridge_envelope () =
   let request =
     Blorp.Compiler_blorp_bridge.parse_source_request_json ~path:"src/main.brp"
@@ -418,6 +443,69 @@ let test_parse_sources_request_can_use_typecheck_phase () =
       Alcotest.(check string)
         "phase" "typecheck_source" (string_field "ast_phase" first)
   | _ -> Alcotest.fail "expected one parse source request item"
+
+let test_typecheck_source_request_uses_bridge_envelope () =
+  let request =
+    Blorp.Compiler_blorp_bridge.typecheck_source_request_json
+      ~path:"src/main.brp" ~module_name:"main" ~text:"func main(): 0"
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string)
+    "action" "typecheck_source" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "path" "src/main.brp" (string_field "path" payload);
+  Alcotest.(check string) "module" "main" (string_field "module" payload);
+  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload)
+
+let test_typecheck_source_request_can_include_import_modules () =
+  let import_module =
+    {
+      Bridge.typecheck_import_path = "std/option.brp";
+      typecheck_import_module_name = "option";
+      typecheck_import_module_path = "option";
+      typecheck_import_text = "union Option[T]:\n\tSome(T)\n\tNone\n";
+      typecheck_import_origin = Bridge.CliFrontendStdModule;
+    }
+  in
+  let request =
+    Bridge.typecheck_source_request_json_with_imports ~path:"src/main.brp"
+      ~module_name:"main" ~text:"import:\n\toption: Option\n"
+      ~import_modules:[ import_module ]
+    |> parse_json_exn
+  in
+  let payload = field "payload" request in
+  match array_field "import_modules" payload with
+  | [ first ] ->
+      Alcotest.(check string)
+        "path" "std/option.brp" (string_field "path" first);
+      Alcotest.(check string) "module" "option" (string_field "module" first);
+      Alcotest.(check string)
+        "module_path" "option" (string_field "module_path" first);
+      Alcotest.(check string)
+        "text" "union Option[T]:\n\tSome(T)\n\tNone\n"
+        (string_field "text" first);
+      Alcotest.(check string)
+        "origin" "std" (string_field "kind" (field "origin" first))
+  | _ -> Alcotest.fail "expected one typecheck import module"
+
+let test_typecheck_source_file_request_omits_source_text () =
+  let request =
+    Blorp.Compiler_blorp_bridge.typecheck_source_file_request_json
+      ~path:"src/main.brp" ~module_name:"main"
+    |> parse_json_exn
+  in
+  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
+  Alcotest.(check string)
+    "action" "typecheck_source" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "path" "src/main.brp" (string_field "path" payload);
+  Alcotest.(check string) "module" "main" (string_field "module" payload);
+  match List.assoc_opt "text" (object_fields payload) with
+  | None -> ()
+  | Some _ -> Alcotest.fail "path-only typecheck request must omit source text"
 
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
@@ -566,6 +654,79 @@ let test_parse_source_response_returns_diagnostics () =
   | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
       Alcotest.fail "expected parse diagnostics"
   | Error (_, message) -> Alcotest.fail message
+
+let import_binding_json ?original_name local_name module_path =
+  Lsp_json.Object
+    [
+      ("local_name", Lsp_json.String local_name);
+      ("module_path", Lsp_json.String module_path);
+      ( "original_name",
+        match original_name with
+        | Some value -> Lsp_json.String value
+        | None -> Lsp_json.Null );
+    ]
+
+let typecheck_artifact ?(ast_phase = "typecheck_source") ?(type_errors = [])
+    ?(import_bindings = []) ?comments ?module_surface typed_program =
+  let optional_fields =
+    (match comments with Some value -> [ ("comments", Lsp_json.Array value) ] | None -> [])
+    @
+    match module_surface with
+    | Some value -> [ ("module_surface", value) ]
+    | None -> []
+  in
+  Lsp_json.Object
+    ([
+       ("ast_phase", Lsp_json.String ast_phase);
+       ("typed_program", typed_program);
+       ("type_errors", string_array type_errors);
+       ("import_bindings", Lsp_json.Array import_bindings);
+     ]
+    @ optional_fields)
+
+let test_typecheck_source_response_decodes_typed_program_artifact () =
+  let response =
+    bridge_success_json
+      (typecheck_artifact
+         ~type_errors:[ "type mismatch" ]
+         ~import_bindings:
+           [
+             import_binding_json ~original_name:"Option" "Option" "option";
+             import_binding_json "File" "std/file";
+           ]
+         ~comments:[ comment_json ~text:"-- typed" ~line:2 ~column:3 ~trailing:false ]
+         ~module_surface:(module_surface_json ~exports:[ module_surface_symbol_json "main" ] "main")
+         (typed_program_json []))
+  in
+  match Blorp.Compiler_blorp_bridge.typecheck_source_response_json response with
+  | Ok
+      {
+        Bridge.typechecked_program;
+        typechecked_errors = [ "type mismatch" ];
+        typechecked_import_bindings =
+          [
+            { local_name = "Option"; module_path = "option"; original_name = Some "Option" };
+            { local_name = "File"; module_path = "std/file"; original_name = None };
+          ];
+        typechecked_comments = [ comment ];
+        typechecked_phase = Bridge.TypecheckSourceProgram;
+        typechecked_module_surface = Some surface;
+      } ->
+      Alcotest.(check int)
+        "decls" 0
+        (List.length (Blorp.Typed_ast.program_decls typechecked_program));
+      Alcotest.(check string)
+        "comment text" "-- typed" comment.Parse_comments.cc_text;
+      Alcotest.(check string) "surface module" "main" surface.Module_surface.module_name
+  | Ok _ -> Alcotest.fail "expected decoded typecheck artifact"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_typecheck_source_response_rejects_raw_phase () =
+  bridge_success_json
+    (typecheck_artifact ~ast_phase:"raw_parse" (typed_program_json []))
+  |> Blorp.Compiler_blorp_bridge.typecheck_source_response_json
+  |> expect_invalid_response_contains
+       "typecheck_source artifact must have ast_phase typecheck_source"
 
 let test_parse_sources_response_decodes_items () =
   let response =
@@ -1304,20 +1465,30 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       let parser_source =
         Filename.concat blorp_dir "compiler_parser_bridge_cli.brp"
       in
+      let typecheck_source =
+        Filename.concat blorp_dir "compiler_typecheck_bridge_cli.brp"
+      in
       mkdir compiler_dir;
       mkdir blorp_dir;
       write_file program "#!/usr/bin/env bash\n";
       write_file backend_source "func main(args: List[String]) -> Int: 0\n";
       write_file parser_source "func main(args: List[String]) -> Int: 0\n";
+      write_file typecheck_source "func main(args: List[String]) -> Int: 0\n";
       let backend =
         Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
       in
       let parser =
         Bridge.renderer_bridge_cache_parts ~program ~source_path:parser_source
       in
+      let typecheck =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:typecheck_source
+      in
       Alcotest.(check bool)
         "backend and parser helpers use distinct cache keys" true
-        (backend.bridge_key <> parser.bridge_key))
+        (backend.bridge_key <> parser.bridge_key);
+      Alcotest.(check bool)
+        "parser and typecheck helpers use distinct cache keys" true
+        (parser.bridge_key <> typecheck.bridge_key))
 
 let test_prepared_bridge_binary_env_accepts_existing_file () =
   with_temp_dir (fun root ->
@@ -1430,6 +1601,8 @@ let suite =
           test_bridge_helper_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "parser helper env supports pinned bootstrap" `Quick
           test_parser_bridge_compile_env_supports_pinned_bootstrap;
+        Alcotest.test_case "typecheck helper env supports pinned bootstrap"
+          `Quick test_typecheck_bridge_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "parse_source request uses bridge envelope" `Quick
           test_parse_source_request_uses_bridge_envelope;
         Alcotest.test_case "parse_source file request omits source text" `Quick
@@ -1443,6 +1616,13 @@ let suite =
           test_parse_sources_request_uses_bridge_envelope;
         Alcotest.test_case "parse_sources request can use typecheck phase"
           `Quick test_parse_sources_request_can_use_typecheck_phase;
+        Alcotest.test_case "typecheck_source request uses bridge envelope" `Quick
+          test_typecheck_source_request_uses_bridge_envelope;
+        Alcotest.test_case "typecheck_source request can include imports" `Quick
+          test_typecheck_source_request_can_include_import_modules;
+        Alcotest.test_case
+          "typecheck_source file request omits source text" `Quick
+          test_typecheck_source_file_request_omits_source_text;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
@@ -1458,6 +1638,11 @@ let suite =
           test_parse_source_response_rejects_invalid_module_surface_kind;
         Alcotest.test_case "parse_source response returns diagnostics" `Quick
           test_parse_source_response_returns_diagnostics;
+        Alcotest.test_case
+          "typecheck_source response decodes typed program artifact" `Quick
+          test_typecheck_source_response_decodes_typed_program_artifact;
+        Alcotest.test_case "typecheck_source response rejects raw phase" `Quick
+          test_typecheck_source_response_rejects_raw_phase;
         Alcotest.test_case "parse_sources response decodes items" `Quick
           test_parse_sources_response_decodes_items;
         Alcotest.test_case "CLI run response decodes handled" `Quick

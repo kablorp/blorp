@@ -9,6 +9,9 @@ let () =
         (fun (name, cases) -> ("TypedAst." ^ name, cases))
         Test_typed_ast.suite
     @ List.map
+        (fun (name, cases) -> ("TypedAstJson." ^ name, cases))
+        Test_typed_ast_json.suite
+    @ List.map
         (fun (name, cases) -> ("CtfeIntrinsic." ^ name, cases))
         Test_ctfe_intrinsic.suite
     @ List.map

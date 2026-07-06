@@ -34,8 +34,13 @@ import:
 	../compiler_generic_params: compiler_make_bound_type_param
 	../compiler_infer:
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
-		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin),
-		CompilerTypedExpr(CompilerTypedBlockExpr),
+		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
+		CompilerTypedExpr(
+			CompilerTypedBlockExpr,
+			CompilerTypedCallExpr,
+			CompilerTypedIntLiteralExpr,
+		),
+		CompilerTypedExprInfo,
 		compiler_finalize_infer_result,
 		compiler_infer_context,
 		compiler_infer_expr,
@@ -44,16 +49,19 @@ import:
 		compiler_typed_expr_binary_left_widening,
 		compiler_typed_expr_binary_right_widening,
 		compiler_typed_expr_call_arg_widening,
+		compiler_typed_expr_contains_meta,
 		compiler_typed_expr_dict_key_widening,
 		compiler_typed_expr_dict_value_widening,
 		compiler_typed_expr_field_access_receiver_type,
 		compiler_typed_expr_impure_call_names,
+		compiler_typed_expr_info,
 		compiler_typed_expr_list_item_widening,
 		compiler_typed_expr_origin,
 		compiler_typed_expr_record_field_widening,
 		compiler_typed_expr_resolved_call,
 		compiler_typed_expr_semantic_type,
 		compiler_typed_expr_source_type,
+		compiler_typed_expr_type_error,
 		compiler_typed_expr_value_type,
 		compiler_typed_expr_var_initializer_widening,
 		compiler_typed_expr_vector_item_widening,
@@ -80,6 +88,7 @@ import:
 			ParsedDetachExpr,
 			ParsedFieldAccessExpr,
 			ParsedForExpr,
+			ParsedFunctionDeclExpr,
 			ParsedIfExpr,
 			ParsedIntLiteralExpr,
 			ParsedLambdaExpr,
@@ -114,10 +123,13 @@ import:
 		ParsedMatchCase,
 		ParsedPattern(
 			ParsedBoolPattern,
+			ParsedConstructorPattern,
+			ParsedFloatPattern,
 			ParsedIntPattern,
 			ParsedListPattern,
 			ParsedNamePattern,
 			ParsedOrPattern,
+			ParsedQualifiedConstructorPattern,
 			ParsedTuplePattern,
 			ParsedWildcardPattern,
 		),
@@ -166,6 +178,7 @@ import:
 			CompilerMutableBinding,
 			CompilerNumericOperator,
 		),
+		CompilerValueSlot,
 		compiler_widening_reasons_equal,
 	../compiler_typecheck_state:
 		CompilerTypecheckState,
@@ -224,6 +237,21 @@ pure func bool_expr(value: Bool) -> ParsedExpr:
 
 pure func float_expr(text: String) -> ParsedExpr:
 	ParsedFloatLiteralExpr(text, source_span())
+
+
+pure func function_decl_expr(name: String, body: ParsedExpr) -> ParsedExpr:
+	ParsedFunctionDeclExpr({
+		name = ident(name),
+		type_params = [],
+		params = [],
+		return_type = Some(named_type("Int")),
+		dim_constraints = [],
+		body = Some(body),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = source_span(),
+	})
 
 
 pure func binary_expr(op: ParsedBinaryOp, left: ParsedExpr, right: ParsedExpr) -> ParsedExpr:
@@ -1445,6 +1473,20 @@ func test_unknown_identifier_records_error() -> Bool:
 		.contains("Unbound value `missing`")
 
 
+func test_raw_nested_function_decl_reports_finalization_gap() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		function_decl_expr("helper", int_expr("1")),
+	)
+
+	result.context.state.errors.length() == 1 and result.context.state.errors
+		.get_or(0, "")
+		.contains((
+				"Nested function declaration `helper` reached expression inference before source "
+				+ "finalization"
+			))
+
+
 func test_var_decl_updates_environment_and_widens_mutable_initializer() -> Bool:
 	decl_expr = ParsedVarDeclExpr(ident("x"), None, int_expr("1"), True, source_span())
 	result = compiler_infer_expr(
@@ -1549,6 +1591,8 @@ func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
 			compiler_typed_expr_semantic_type(result.expr),
 			CompilerMetaType(0),
 		)
+		and compiler_typed_expr_contains_meta(result.expr)
+		and not compiler_typed_expr_contains_meta(finalized.expr)
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(finalized.expr),
 			compiler_type_int(),
@@ -1566,6 +1610,26 @@ func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
 			_:
 				False
 	)
+
+
+func test_typed_expr_type_error_rejects_incoherent_value_slot() -> Bool:
+	value_slot: CompilerValueSlot = {
+		semantic_type = compiler_type_int(),
+		decision = CompilerTypeKeep(compiler_type_int())
+	}
+	info: CompilerTypedExprInfo = {
+		source_type = None,
+		semantic_type = compiler_type_int(),
+		value_type = compiler_type_string(),
+		origin = CompilerInferredOrigin,
+		value_slot = value_slot,
+		proofs = compiler_unrefined_binding(),
+		resolved_call = None,
+		resource_dependencies = []
+	}
+	expr = CompilerTypedIntLiteralExpr("1", source_span(), info)
+
+	compiler_typed_expr_type_error(expr) == Some("kept widening decision must match value type")
 
 
 func test_debug_block_checks_body_and_returns_void() -> Bool:
@@ -3039,10 +3103,44 @@ func test_direct_call_records_resolved_metadata() -> Bool:
 					_:
 						False
 
-				info.callee_name == "add_one" and callable_ok and purity_ok
+				(
+					info.callee_name == "add_one"
+					and callable_ok
+					and purity_ok
+					and match compiler_typed_expr_type_error(result.expr):
+						None:
+							True
+						Some(_):
+							False
+				)
 			None:
 				False
 	)
+
+
+func test_typed_expr_type_error_rejects_missing_call_metadata() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_add_one_func()),
+		call_expr(ParsedNameExpr(ident("add_one")), [int_expr("1")]),
+	)
+
+	bad_expr = match result.expr:
+		CompilerTypedCallExpr(callee, args, span, _):
+			info = compiler_typed_expr_info(result.expr)
+			CompilerTypedCallExpr(callee, args, span, { info | resolved_call = None })
+		_:
+			result.expr
+
+	result.context.state.errors.length() == 0 and match compiler_typed_expr_type_error(result.expr):
+		None:
+			True
+		Some(_):
+			(
+				False
+				and compiler_typed_expr_type_error(
+					bad_expr,
+				) == Some("call expression missing resolved-call metadata from callee")
+			)
 
 
 func test_qualified_module_call_records_resolved_metadata() -> Bool:
@@ -5210,6 +5308,43 @@ func test_match_bool_patterns_infer_common_type() -> Bool:
 	)
 
 
+func test_match_float_pattern_checks_scrutinee_type() -> Bool:
+	ok_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedMatchExpr(
+			float_expr("1.5"),
+			[match_case(
+					ParsedFloatPattern("1.5", source_span()),
+					int_expr("1"),
+				), match_case(ParsedWildcardPattern(source_span()), int_expr("0"))],
+			source_span(),
+		),
+	)
+	error_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedMatchExpr(
+			int_expr("1"),
+			[match_case(
+					ParsedFloatPattern("1.5", source_span()),
+					int_expr("1"),
+				), match_case(ParsedWildcardPattern(source_span()), int_expr("0"))],
+			source_span(),
+		),
+	)
+
+	(
+		ok_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(ok_result.expr),
+			compiler_type_int(),
+		)
+		and error_result.context.state.errors.length() == 1
+		and error_result.context.state.errors
+			.get_or(0, "")
+			.contains("Float pattern requires Float scrutinee, got #1")
+	)
+
+
 func test_match_name_pattern_binds_inside_case_only() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -5351,6 +5486,37 @@ func test_match_constructor_patterns_bind_fields() -> Bool:
 		)
 		and compiler_env_get_var_type(result.context.state.env, "value") == None
 		and compiler_env_get_var_type(result.context.state.env, "None") == None
+	)
+
+
+func test_match_qualified_constructor_pattern_uses_type_home() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_shadowed_module_option_constructors()),
+		ParsedMatchExpr(
+			ParsedNameExpr(ident("maybe")),
+			[match_case(
+					ParsedQualifiedConstructorPattern(
+						ident("O"),
+						ident("Some"),
+						[ParsedNamePattern(ident("value"))],
+						source_span(),
+					),
+					ParsedNameExpr(ident("value")),
+				), match_case(
+					ParsedQualifiedConstructorPattern(ident("O"), ident("None"), [], source_span()),
+					int_expr("0"),
+				)],
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+		and compiler_env_get_var_type(result.context.state.env, "value") == None
 	)
 
 
@@ -5808,6 +5974,10 @@ tests: TestSuite = {
 		("identifier lookup preserves source type", test_identifier_lookup_preserves_source_type),
 		("unknown identifier records error", test_unknown_identifier_records_error),
 		(
+			"raw nested function decl reports finalization gap",
+			test_raw_nested_function_decl_reports_finalization_gap,
+		),
+		(
 			"var decl updates environment and widens mutable initializer",
 			test_var_decl_updates_environment_and_widens_mutable_initializer,
 		),
@@ -5826,6 +5996,10 @@ tests: TestSuite = {
 		(
 			"finalize infer result zonks bound meta tree",
 			test_finalize_infer_result_zonks_bound_meta_tree,
+		),
+		(
+			"typed expr type error rejects incoherent value slot",
+			test_typed_expr_type_error_rejects_incoherent_value_slot,
 		),
 		("debug block checks body and returns void", test_debug_block_checks_body_and_returns_void),
 		("detach checks body and returns void", test_detach_checks_body_and_returns_void),
@@ -5973,6 +6147,10 @@ tests: TestSuite = {
 		("direct call infers return type", test_direct_call_infers_return_type),
 		("direct call widens argument", test_direct_call_widens_argument),
 		("direct call records resolved metadata", test_direct_call_records_resolved_metadata),
+		(
+			"typed expr type error rejects missing call metadata",
+			test_typed_expr_type_error_rejects_missing_call_metadata,
+		),
 		(
 			"qualified module call records resolved metadata",
 			test_qualified_module_call_records_resolved_metadata,
@@ -6231,6 +6409,10 @@ tests: TestSuite = {
 		),
 		("match bool patterns infer common type", test_match_bool_patterns_infer_common_type),
 		(
+			"match float pattern checks scrutinee type",
+			test_match_float_pattern_checks_scrutinee_type,
+		),
+		(
 			"match name pattern binds inside case only",
 			test_match_name_pattern_binds_inside_case_only,
 		),
@@ -6241,6 +6423,10 @@ tests: TestSuite = {
 		),
 		("match or pattern combines bool coverage", test_match_or_pattern_combines_bool_coverage),
 		("match constructor patterns bind fields", test_match_constructor_patterns_bind_fields),
+		(
+			"match qualified constructor pattern uses type home",
+			test_match_qualified_constructor_pattern_uses_type_home,
+		),
 		(
 			"match constructor pattern errors are specific",
 			test_match_constructor_pattern_errors_are_specific,
