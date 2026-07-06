@@ -460,6 +460,12 @@ Acceptance:
 
 ## Checkpoint 7: Use Surface For Syntactic Exports
 
+Status: implemented on 2026-07-06. Cached/preloaded modules derive syntactic
+exports from `Module_surface` when present, private import diagnostics go
+through a surface-backed helper with an explicit legacy fallback, and tests
+cover surface export mapping for trait methods, impl methods, selective imports,
+and private-name diagnostics.
+
 Make loaded module syntactic exports come from the Blorp surface while keeping
 typed semantic exports in OCaml.
 

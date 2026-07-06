@@ -163,6 +163,37 @@ let preloaded_source_for_test ~path ~module_name ~source parsed_source :
     preload_surface = parsed_source.parsed_module_surface;
   }
 
+let empty_preloaded_graph_context : Modules.preloaded_module_graph_context =
+  {
+    preload_graph_std_dir = None;
+    preload_graph_source_packages = [];
+    preload_graph_package_roots = [];
+  }
+
+let preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+    ~dep_path ~dep_source ~dep_parsed : Modules.preloaded_module_graph =
+  {
+    preload_graph_context = empty_preloaded_graph_context;
+    preload_graph_sources =
+      [
+        preloaded_source_for_test ~path:main_path ~module_name:"main"
+          ~source:main_source main_parsed;
+        preloaded_source_for_test ~path:dep_path ~module_name:"./dep"
+          ~source:dep_source dep_parsed;
+      ];
+    preload_graph_imports =
+      [
+        {
+          preload_import_from_path = main_path;
+          preload_import_from_module = "main";
+          preload_import_path = "./dep";
+          preload_import_resolved_path = Some dep_path;
+          preload_import_resolved_module = Some "./dep";
+          preload_import_resolved_origin = Some Session.User_module;
+        };
+      ];
+  }
+
 let test_compile_parsed_uses_preloaded_module_graph_without_rereading_import ()
     =
   Test_helpers.with_isolated_env (fun () ->
@@ -186,33 +217,9 @@ let test_compile_parsed_uses_preloaded_module_graph_without_rereading_import ()
               ~module_name:"./dep"
           in
           Sys.remove dep_path;
-          let preloaded_module_graph : Modules.preloaded_module_graph =
-            {
-              preload_graph_context =
-                {
-                  preload_graph_std_dir = None;
-                  preload_graph_source_packages = [];
-                  preload_graph_package_roots = [];
-                };
-              preload_graph_sources =
-                [
-                  preloaded_source_for_test ~path:main_path ~module_name:"main"
-                    ~source:main_source main_parsed;
-                  preloaded_source_for_test ~path:dep_path
-                    ~module_name:"./dep" ~source:dep_source dep_parsed;
-                ];
-              preload_graph_imports =
-                [
-                  {
-                    preload_import_from_path = main_path;
-                    preload_import_from_module = "main";
-                    preload_import_path = "./dep";
-                    preload_import_resolved_path = Some dep_path;
-                    preload_import_resolved_module = Some "./dep";
-                    preload_import_resolved_origin = Some Session.User_module;
-                  };
-                ];
-            }
+          let preloaded_module_graph =
+            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+              ~dep_path ~dep_source ~dep_parsed
           in
           match
             Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
@@ -228,6 +235,99 @@ let test_compile_parsed_uses_preloaded_module_graph_without_rereading_import ()
               Alcotest.fail
                 ("expected compile_parsed to use preloaded module graph:\n"
                ^ format_errors errors)))
+
+let test_surface_backed_exports_support_selective_imports () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_surface_exports" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    ./dep: Box, dep_value, label\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    box: Box = {label = \"box\"}\n\
+            \    if dep_value() == 7 and label(box) == \"box\":\n\
+            \        0\n\
+            \    else:\n\
+            \        1\n"
+          in
+          let dep_source =
+            "trait Labeled:\n\
+            \    pure func label(value: Self) -> String\n\n\
+             record Box {label: String}\n\n\
+             implements Labeled for Box:\n\
+            \    pure func label(value: Box) -> String:\n\
+            \        value.label\n\n\
+             pure func dep_value() -> Int:\n\
+            \    7\n"
+          in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"./dep"
+          in
+          Sys.remove dep_path;
+          let preloaded_module_graph =
+            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+              ~dep_path ~dep_source ~dep_parsed
+          in
+          match
+            Pipeline.typecheck_only_parsed ~filename:main_path
+              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+          with
+          | Ok _ -> ()
+          | Error errors ->
+              Alcotest.fail
+                ("surface-backed selective imports failed:\n"
+               ^ format_errors errors)))
+
+let test_surface_backed_private_names_report_private_import () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_surface_private" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    ./dep: hidden\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    hidden()\n"
+          in
+          let dep_source =
+            "private func hidden() -> Int:\n\
+            \    1\n\n\
+             func visible() -> Int:\n\
+            \    2\n"
+          in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"./dep"
+          in
+          Sys.remove dep_path;
+          let preloaded_module_graph =
+            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+              ~dep_path ~dep_source ~dep_parsed
+          in
+          match
+            Pipeline.typecheck_only_parsed ~filename:main_path
+              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+          with
+          | Ok _ -> Alcotest.fail "expected private import diagnostic"
+          | Error errors ->
+              let messages = format_errors errors in
+              Alcotest.(check bool)
+                "private import diagnostic" true
+                (contains messages
+                   "'hidden' is private in module './dep' and cannot be \
+                    imported")))
 
 let test_compile_parsed_uses_graph_import_spelling_alias () =
   Test_helpers.with_isolated_env (fun () ->
@@ -1267,6 +1367,12 @@ let suite =
           "compile_parsed uses preloaded module graph without rereading import"
           `Quick
           test_compile_parsed_uses_preloaded_module_graph_without_rereading_import;
+        Alcotest.test_case
+          "surface backed exports support selective imports" `Quick
+          test_surface_backed_exports_support_selective_imports;
+        Alcotest.test_case
+          "surface backed private names report private import" `Quick
+          test_surface_backed_private_names_report_private_import;
         Alcotest.test_case "compile_parsed caches graph import spelling" `Quick
           test_compile_parsed_uses_graph_import_spelling_alias;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
