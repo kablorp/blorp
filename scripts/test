@@ -7,6 +7,7 @@
 #   scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 #   scripts/test compiler           # Fast compiler surface tests
 #   scripts/test compiler-deep      # Full codegen audit + compiler/blorp TestSuites
+#   scripts/test std-check          # Broad std/ typecheck sweep
 #   scripts/test runtime            # Runtime .brp tests (language features)
 #   scripts/test leak               # Focused --leak-check suites and leak diagnostics
 #   scripts/test doctest            # Doctests only (std/ library)
@@ -29,7 +30,6 @@ cd "$script_dir/.."
 
 runner_label="scripts/test"
 script_start_seconds=$(date +%s)
-std_preflight_cache_version="blorp-std-preflight-v1"
 compiler_unit_timing_run_id="scripts-test-$script_start_seconds-$$"
 
 now_seconds() {
@@ -52,80 +52,8 @@ format_seconds() {
     fi
 }
 
-hash_stream() {
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum
-    else
-        return 1
-    fi
-}
-
-hash_stdin_key() {
-    local output_file key
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_hash.XXXXXX") || return 1
-    if ! hash_stream > "$output_file"; then
-        rm -f "$output_file"
-        return 1
-    fi
-    key=$(awk '{print $1}' "$output_file")
-    rm -f "$output_file"
-    [ -n "$key" ] || return 1
-    printf '%s\n' "$key"
-}
-
-hash_file() {
-    local file="$1"
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file"
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file"
-    else
-        return 1
-    fi
-}
-
-hash_blorp_source_tree() {
-    local root="$1"
-    [ -d "$root" ] || return 0
-    while IFS= read -r file; do
-        hash_file "$file" || return 1
-    done < <(find "$root" -name '*.brp' -type f | LC_ALL=C sort)
-}
-
-std_preflight_cache_key() {
-    local input_file key
-    input_file=$(mktemp "${TMPDIR:-/tmp}/blorp_std_preflight_key.XXXXXX") || return 1
-    if ! {
-        printf '%s\n' "$std_preflight_cache_version" &&
-            printf 'BLORP_STD=%s\n' "${BLORP_STD:-}" &&
-            hash_file ./blorp &&
-            hash_blorp_source_tree std &&
-            { [ -z "${BLORP_STD:-}" ] || hash_blorp_source_tree "$BLORP_STD"; }
-    } > "$input_file"; then
-        rm -f "$input_file"
-        return 1
-    fi
-    key=$(hash_stdin_key < "$input_file") || {
-        rm -f "$input_file"
-        return 1
-    }
-    rm -f "$input_file"
-    printf '%s\n' "$key"
-}
-
-std_preflight_cache_file() {
-    local key="$1"
-    local repo_key cache_root
-    repo_key=$(printf '%s\n' "$(pwd -P)" | hash_stdin_key) || return 1
-    cache_root="${TMPDIR:-/tmp}/blorp-std-preflight-${repo_key}"
-    mkdir -p "$cache_root"
-    printf '%s/%s.ok\n' "$cache_root" "$key"
-}
-
 usage() {
-    echo "Usage: $runner_label [options] [compiler-unit] [compiler-unit-deep] [compiler] [compiler-deep] [runtime] [leak] [doctest] [cli] [cli-deep]"
+    echo "Usage: $runner_label [options] [compiler-unit] [compiler-unit-deep] [compiler] [compiler-deep] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep]"
     cat <<'EOF'
 
 Options:
@@ -174,6 +102,7 @@ while [ $# -gt 0 ]; do
         compiler-unit|unit) gates+=("unit") ;;
         compiler-unit-deep|unit-deep) gates+=("unit_deep") ;;
         compiler-deep) gates+=("compiler_deep") ;;
+        std-check) gates+=("std_check") ;;
         cli-deep) gates+=("cli_deep") ;;
         compiler|runtime|leak|doctest|cli) gates+=("$arg") ;;
         *)
@@ -400,7 +329,7 @@ EOF
 needs_compiler_bridge_helpers=false
 for gate in "${gates[@]}"; do
     case "$gate" in
-        compiler_deep|runtime|leak|doctest|cli|cli_deep)
+        compiler_deep|std_check|runtime|leak|doctest|cli|cli_deep)
             needs_compiler_bridge_helpers=true
             ;;
     esac
@@ -419,6 +348,7 @@ compiler_status="SKIP"; compiler_passed=0; compiler_failed=0; compiler_tests=0; 
 compiler_deep_status="SKIP"; compiler_deep_passed=0; compiler_deep_failed=0; compiler_deep_tests=0; compiler_deep_failures=""
 compiler_deep_tools_status="SKIP"; compiler_deep_tools_passed=0; compiler_deep_tools_failed=0; compiler_deep_tools_tests=0; compiler_deep_tools_failures=""
 compiler_deep_blorp_status="SKIP"; compiler_deep_blorp_passed=0; compiler_deep_blorp_failed=0; compiler_deep_blorp_tests=0; compiler_deep_blorp_failures=""
+std_check_status="SKIP"; std_check_passed=0; std_check_failed=0; std_check_tests=0; std_check_failures=""
 runtime_status="SKIP"; runtime_passed=0; runtime_failed=0; runtime_tests=0; runtime_failures=""
 leak_status="SKIP"; leak_passed=0; leak_failed=0; leak_tests=0; leak_failures=""
 doctest_status="SKIP"; doctest_passed=0; doctest_failed=0; doctest_tests=0; doctest_failures=""
@@ -429,12 +359,12 @@ unit_seconds=0
 unit_deep_seconds=0
 compiler_seconds=0
 compiler_deep_seconds=0
+std_check_seconds=0
 runtime_seconds=0
 leak_seconds=0
 doctest_seconds=0
 cli_seconds=0
 cli_deep_seconds=0
-std_preflight_seconds=0
 
 # ─── Parsers ────────────────────────────────────────────────────────
 
@@ -1070,63 +1000,37 @@ parse_compiler_gate_output() {
     parse_compiler "$output"
 }
 
-run_std_typecheck_preflight() {
-    echo "═══ Std Typecheck Preflight ═══"
-    echo ""
-
-    local checked output_file start_seconds cache_key cache_file tmp_cache_file
-    start_seconds=$(now_seconds)
-    checked=$(find std -name '*.brp' | wc -l | tr -d ' ')
-
-    if [ "${BLORP_TEST_PREFLIGHT_CACHE:-1}" != "0" ]; then
-        cache_key=$(std_preflight_cache_key || true)
-        if [ -n "$cache_key" ]; then
-            cache_file=$(std_preflight_cache_file "$cache_key")
-            if [ -f "$cache_file" ]; then
-                std_preflight_seconds=$(elapsed_since "$start_seconds")
-                echo "Std typecheck preflight cached ($checked modules, $(format_seconds "$std_preflight_seconds"))."
-                echo ""
-                return 0
-            fi
+parse_std_check_gate_output() {
+    local output="$1"
+    if parse_structured_gate_result "$output" "std_check"; then
+        if [ "$std_check_status" = "FAIL" ]; then
+            std_check_failures=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
         fi
+        return
     fi
 
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_std_typecheck.XXXXXX") || exit 1
-
-    if ! {
-        ./blorp check --no-format std
-    } > "$output_file" 2>&1; then
-        std_preflight_seconds=$(elapsed_since "$start_seconds")
-        echo "FAIL: std typecheck preflight"
-        sed -n '1,80p' "$output_file"
-        rm -f "$output_file"
-        return 1
-    fi
-
-    std_preflight_seconds=$(elapsed_since "$start_seconds")
-    if [ -n "${cache_file:-}" ]; then
-        tmp_cache_file="${cache_file}.$$"
-        printf 'ok\nmodules=%s\n' "$checked" > "$tmp_cache_file"
-        mv "$tmp_cache_file" "$cache_file"
-    fi
-    rm -f "$output_file"
-    echo "Std typecheck preflight passed ($checked modules, $(format_seconds "$std_preflight_seconds"))."
-    echo ""
-    return 0
+    std_check_status="FAIL"
+    std_check_passed=0
+    std_check_failed=1
+    std_check_tests=1
+    std_check_failures="std-check gate exited before reporting a summary"
 }
 
-needs_std_typecheck_preflight=false
-for gate in "${gates[@]}"; do
-    case "$gate" in
-        compiler_deep|runtime|leak|doctest)
-            needs_std_typecheck_preflight=true
-            ;;
-    esac
-done
+run_std_check_gate_commands() {
+    local output_file="$1"
+    local checked
+    checked=$(find std -name '*.brp' | wc -l | tr -d ' ')
 
-if $needs_std_typecheck_preflight; then
-    run_std_typecheck_preflight || exit 1
-fi
+    if ./blorp check --no-format std >> "$output_file" 2>&1; then
+        echo "PASS: std typecheck ($checked modules)" >> "$output_file"
+        echo "BLORP_GATE_RESULT gate=std_check status=PASS passed=1 failed=0 tests=1" >> "$output_file"
+        return 0
+    fi
+
+    echo "FAIL: std typecheck ($checked modules)" >> "$output_file"
+    echo "BLORP_GATE_RESULT gate=std_check status=FAIL passed=0 failed=1 tests=1" >> "$output_file"
+    return 1
+}
 
 # ─── Gate runners ───────────────────────────────────────────────────
 
@@ -1217,6 +1121,26 @@ run_compiler_deep() {
     echo ""
     parse_compiler_deep_gate_output "$output"
     mark_gate_process_failure "compiler_deep" "$exit_code"
+    return $exit_code
+}
+
+run_std_check() {
+    echo "═══ Std Typecheck Check ═══"
+    echo ""
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
+    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_std_check.XXXXXX") || exit 1
+    : > "$output_file"
+    run_std_check_gate_commands "$output_file"
+    exit_code=$?
+    output=$(cat "$output_file")
+    record_gate_log "std-check" "$output_file"
+    maybe_print_failure_excerpt "std-check" "$output_file" "$exit_code"
+    rm -f "$output_file"
+    std_check_seconds=$(elapsed_since "$start_seconds")
+    echo ""
+    parse_std_check_gate_output "$output"
+    mark_gate_process_failure "std_check" "$exit_code"
     return $exit_code
 }
 
@@ -1380,6 +1304,12 @@ init_gate_output() {
                 echo ""
             } > "$outfile"
             ;;
+        std_check)
+            {
+                echo "═══ Std Typecheck Check ═══"
+                echo ""
+            } > "$outfile"
+            ;;
         runtime)
             {
                 echo "═══ Runtime Tests (.brp) ═══"
@@ -1437,6 +1367,9 @@ run_gate_to_file() {
             ;;
         compiler_deep)
             run_compiler_deep_gate_commands "$outfile" false
+            ;;
+        std_check)
+            run_std_check_gate_commands "$outfile"
             ;;
         runtime)
             env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1
@@ -1522,6 +1455,7 @@ collect_gate_worker() {
         unit_deep) parse_unit_deep "$local_output" ;;
         compiler) parse_compiler_gate_output "$local_output" ;;
         compiler_deep) parse_compiler_deep_gate_output "$local_output" ;;
+        std_check) parse_std_check_gate_output "$local_output" ;;
         runtime)  parse_blorp_output "$local_output" "runtime" ;;
         leak)     parse_blorp_output "$local_output" "leak" ;;
         doctest)  parse_blorp_output "$local_output" "doctest" ;;
@@ -1588,6 +1522,7 @@ elif $serial || [ ${#parallel_gates[@]} -le 1 ]; then
             unit_deep) run_unit_deep || any_failed=true ;;
             compiler) run_compiler || any_failed=true ;;
             compiler_deep) run_compiler_deep || any_failed=true ;;
+            std_check) run_std_check || any_failed=true ;;
             runtime)  run_runtime  || any_failed=true ;;
             leak)     run_leak     || any_failed=true ;;
             doctest)  run_doctest  || any_failed=true ;;
@@ -1609,6 +1544,7 @@ else
     run_gate_wave "compiler-unit-deep" unit_deep
     run_gate_wave "compiler" compiler
     run_gate_wave "compiler-deep" compiler_deep
+    run_gate_wave "std-check" std_check
     run_gate_wave "runtime" runtime
     run_gate_wave "tail" leak doctest cli
     run_gate_wave "cli-deep" cli_deep
@@ -1653,6 +1589,7 @@ for s in "${gates[@]}"; do
         unit_deep) label="Compiler-unit-deep" ;;
         compiler) label="Compiler" ;;
         compiler_deep) label="Compiler-deep" ;;
+        std_check) label="Std-check" ;;
         runtime)  label="Runtime" ;;
         leak)     label="Leak-check" ;;
         doctest)  label="Doctests" ;;
@@ -1664,7 +1601,7 @@ done
 echo "──────────────────────────────────────────────────────────"
 printf "  %-13s %-6s %8d %7d %7d %8s\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests" "$(format_seconds "$total_wall_seconds")"
 echo "══════════════════════════════════════════════════════════"
-echo "Setup: build $(format_seconds "$build_seconds"), bridge prepare $(format_seconds "$bridge_prepare_seconds"), std preflight $(format_seconds "$std_preflight_seconds"), gate-sum $(format_seconds "$total_gate_seconds")."
+echo "Setup: build $(format_seconds "$build_seconds"), bridge prepare $(format_seconds "$bridge_prepare_seconds"), gate-sum $(format_seconds "$total_gate_seconds")."
 
 # List failing tests if any
 if [ "$overall" = "FAIL" ]; then
