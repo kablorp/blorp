@@ -145,6 +145,13 @@ let user_call_kind_by_def_id ?callee ?(args = []) (env : env)
                 None
             | _ -> Some (CKUser (name, Some id)))
 
+let prefixed_runtime_builtin_call_kind (callee : core) : call_kind option =
+  match callee.desc with
+  | CVar v ->
+      Codegen_builtins.lookup_prefixed v.vname
+      |> Option.map (fun c_name -> CKBuiltin c_name)
+  | _ -> None
+
 let starts_with s prefix =
   let slen = String.length s in
   let plen = String.length prefix in
@@ -895,11 +902,17 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
         | Some kind -> kind
         | None -> (
             match
-              user_call_kind_by_def_id ~callee:callee' ~args:args' env
-                (Some selected_id)
+              prefixed_runtime_builtin_call_kind callee'
             with
             | Some kind -> kind
-            | None -> resolve_call_kind ~module_path ~bound env callee' args')
+            | None -> (
+                match
+                  user_call_kind_by_def_id ~callee:callee' ~args:args' env
+                    (Some selected_id)
+                with
+                | Some kind -> kind
+                | None ->
+                    resolve_call_kind ~module_path ~bound env callee' args'))
       in
       { e with desc = CCall (kind, callee', args') }
   | CCall (CKUnknown, callee, args) ->

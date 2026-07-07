@@ -1458,6 +1458,62 @@ let test_resolve_prefixed_runtime_builtin_beats_std_signature () =
       expect_builtin_call "std_stream__from_list" "blorp_stream_from_list" body
   | _ -> Alcotest.fail "expected std signature plus function"
 
+let test_resolve_selected_direct_prefixed_runtime_builtin_beats_std_signature ()
+    =
+  (* Selected-call ids can survive monomorphization on runtime-backed generic
+     std calls that do not need specialization, such as [std/tensor.length].
+     The selected id points at the source signature, but the callable target is
+     still the runtime builtin. *)
+  let tensor_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
+  let length_ty =
+    TyFunc { params = [ tensor_int_3 ]; return = ty_int; is_pure = true }
+  in
+  let call =
+    mk
+      (CCall
+         ( CKSelectedDirect 336309,
+           cvar "std_tensor__length" length_ty,
+           [ cvar "values" tensor_int_3 ] ))
+      ty_int
+  in
+  let std_sig : core_func =
+    {
+      cf_name = "std_tensor__length";
+      cf_type_params = tparams [ "T" ];
+      cf_params = [];
+      cf_module = Some "std/tensor";
+      cf_return_ty = ty_int;
+      cf_body = None;
+      cf_is_pure = true;
+      cf_kind = CFBuiltin;
+      cf_def_id = 336309;
+    }
+  in
+  let body_func : core_func =
+    {
+      cf_name = "f";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = ty_int;
+      cf_body = Some call;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc std_sig; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc body_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  match resolved with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+      expect_builtin_call "selected std_tensor__length" "blorp_vector_len" body
+  | _ -> Alcotest.fail "expected std signature plus function"
+
 let test_resolve_synthesized_monomorphic_runtime_builtin_stays_builtin () =
   (* Core_synth gives monomorphized runtime-backed std wrappers a body before
      this pass. Even if they no longer carry CFBuiltin by then, they must still
@@ -2420,6 +2476,9 @@ let suite =
           test_resolve_selective_import_alias_builtin;
         Alcotest.test_case "prefixed_runtime_builtin_beats_std_signature" `Quick
           test_resolve_prefixed_runtime_builtin_beats_std_signature;
+        Alcotest.test_case
+          "selected_direct_prefixed_runtime_builtin_beats_std_signature" `Quick
+          test_resolve_selected_direct_prefixed_runtime_builtin_beats_std_signature;
         Alcotest.test_case "synthesized_mono_runtime_builtin_stays_builtin"
           `Quick
           test_resolve_synthesized_monomorphic_runtime_builtin_stays_builtin;

@@ -1012,6 +1012,142 @@ let test_mono_selected_direct_requires_matching_signature () =
         "keeps current callee for later resolve" "std_string__split" v.vname
   | _ -> Alcotest.fail "expected unchanged selected call"
 
+let test_mono_signature_guard_allows_dimension_params () =
+  let vector_generic = TyArray (TyVar "T", [ TyVar "#N" ]) in
+  let vector_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
+  let set_all =
+    mk_func ~type_params:[ "T"; "#N" ] ~module_path:(Some "std/tensor")
+      "std_tensor__set_all"
+      [ ("arr", vector_generic); ("val", TyVar "T") ]
+      vector_generic (cvar "arr" vector_generic)
+  in
+  let call_ty =
+    TyFunc
+      {
+        params = [ vector_int_3; ty_int ];
+        return = vector_int_3;
+        is_pure = true;
+      }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "__ufcs_std$tensor__set_all" call_ty,
+           [ cvar "values" vector_int_3; cint 0 ] ))
+      vector_int_3
+  in
+  let main_fn = mk_func "main" [ ("values", vector_int_3) ] vector_int_3 main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program [ mk_decl set_all; mk_decl main_fn ]
+  in
+  Alcotest.(check bool)
+    "emits tensor specialization with dimension argument" true
+    (List.exists
+       (function
+         | { cd_desc = CDFunc f; _ } ->
+             contains_substring f.cf_name "std_tensor__set_all__mono"
+         | _ -> false)
+       result);
+  let main_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
+      result
+  in
+  match main_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      Alcotest.(check bool)
+        "rewrites UFCS tensor call to specialized callee" true
+        (contains_substring v.vname "std_tensor__set_all__mono")
+  | _ -> Alcotest.fail "expected rewritten main call"
+
+let test_mono_signature_guard_allows_wildcard_dim_pack () =
+  let tensor_any_rank = TyArray (TyVar "T", [ TyVarDims "#_" ]) in
+  let vector_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
+  let is_empty =
+    mk_func ~type_params:[ "T" ] ~module_path:(Some "std/tensor")
+      "std_tensor__is_empty" [ ("arr", tensor_any_rank) ] ty_bool
+      (mk (CLit (LitBool false)) ty_bool)
+  in
+  let call_ty =
+    TyFunc { params = [ vector_int_3 ]; return = ty_bool; is_pure = true }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "std_tensor__is_empty" call_ty,
+           [ cvar "values" vector_int_3 ] ))
+      ty_bool
+  in
+  let main_fn = mk_func "main" [ ("values", vector_int_3) ] ty_bool main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program [ mk_decl is_empty; mk_decl main_fn ]
+  in
+  Alcotest.(check bool)
+    "emits tensor wildcard-rank specialization" true
+    (List.exists
+       (function
+         | { cd_desc = CDFunc f; _ } ->
+             contains_substring f.cf_name "std_tensor__is_empty__mono_Int"
+         | _ -> false)
+       result);
+  let main_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
+      result
+  in
+  match main_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      Alcotest.(check bool)
+        "rewrites wildcard-rank tensor call to specialized callee" true
+        (contains_substring v.vname "std_tensor__is_empty__mono_Int")
+  | _ -> Alcotest.fail "expected rewritten main call"
+
+let test_mono_prefixed_runtime_backed_call_resolves_without_mono () =
+  let tensor_any = TyArray (TyVar "T", [ TyVarDims "#_" ]) in
+  let tensor_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
+  let length_func : core_func =
+    {
+      cf_name = "std_tensor__length";
+      cf_module = Some "std/tensor";
+      cf_type_params = tparams [ "T" ];
+      cf_params =
+        [
+          { cp_name = Var.named "arr"; cp_ty = tensor_any; cp_loc = loc };
+        ];
+      cf_return_ty = ty_int;
+      cf_body = None;
+      cf_is_pure = true;
+      cf_kind = CFBuiltin;
+      cf_def_id = 91;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ tensor_int_3 ]; return = ty_int; is_pure = true }
+  in
+  let body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "std_tensor__length" call_ty,
+           [ cvar "values" tensor_int_3 ] ))
+      ty_int
+  in
+  let caller =
+    {
+      (mk_func ~module_path:(Some "std/tensor") "std_tensor__uses_length"
+         [ ("values", tensor_int_3) ]
+         ty_int body)
+      with
+      cf_def_id = 92;
+    }
+  in
+  ignore
+    (Blorp.Core_mono.monomorphize_program [ mk_decl length_func; mk_decl caller ])
+
 let test_mono_fuses_option_get_or_call () =
   let option_t = TyNamed ("Option", [ TyVar "T" ]) in
   let option_int = TyNamed ("Option", [ ty_int ]) in
@@ -2131,6 +2267,13 @@ let suite =
           `Quick test_mono_qualified_call_prefers_selected_direct_kind_generic;
         Alcotest.test_case "selected direct requires matching signature" `Quick
           test_mono_selected_direct_requires_matching_signature;
+        Alcotest.test_case "signature guard allows dimension params" `Quick
+          test_mono_signature_guard_allows_dimension_params;
+        Alcotest.test_case "signature guard allows wildcard dim pack" `Quick
+          test_mono_signature_guard_allows_wildcard_dim_pack;
+        Alcotest.test_case
+          "prefixed runtime-backed call resolves without mono" `Quick
+          test_mono_prefixed_runtime_backed_call_resolves_without_mono;
         Alcotest.test_case "option_get_or_call_fused" `Quick
           test_mono_fuses_option_get_or_call;
         Alcotest.test_case "option_get_or_else_call_fused" `Quick

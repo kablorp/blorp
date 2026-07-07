@@ -702,15 +702,64 @@ let concrete_subst_for_call (state : mono_state) ~(func_name : string)
     |> Codegen_types.expand_alias ~reg:state.reg
     |> Codegen_types.normalize_type |> erase_function_purity
   in
-  let compatible expected actual =
+  let is_declared_param name = List.mem (type_param_name name) type_param_names in
+  let is_anonymous_dim_wildcard name = type_param_name name = "#_" in
+  let rec guard_has_declared_param ty =
+    match normalize_for_signature_guard ty with
+    | Ast.TyVar name | Ast.TyNamed (name, []) -> is_declared_param name
+    | Ast.TyBoundVar param -> is_declared_param param.param_name
+    | Ast.TyVarDims name -> is_declared_param name
+    | Ast.TyNamed (_, args) -> List.exists guard_has_declared_param args
+    | Ast.TyArray (elem, dims) ->
+        guard_has_declared_param elem || List.exists guard_has_declared_param dims
+    | Ast.TyTuple elems -> List.exists guard_has_declared_param elems
+    | Ast.TyFunc fn ->
+        List.exists guard_has_declared_param fn.params
+        || guard_has_declared_param fn.return
+    | Ast.TyRange inner -> guard_has_declared_param inner
+    | Ast.TyDimOp (_, a, b) ->
+        guard_has_declared_param a || guard_has_declared_param b
+    | _ -> false
+  in
+  let rec compatible_args expected actual =
+    match (expected, actual) with
+    | [], [] -> true
+    | [ Ast.TyVarDims name ], _ when is_declared_param name -> true
+    | [ Ast.TyVarDims name ], _ when is_anonymous_dim_wildcard name -> true
+    | e :: expected, a :: actual ->
+        compatible e a && compatible_args expected actual
+    | _ -> false
+  and compatible expected actual =
     (* This guard exists to reject stale selected IDs and unrelated same-ID
-       generics before substitution. Purity has already been checked by the
-       frontend, and bridge-produced Core can conservatively type inline
-       lambdas as impure. Keep mono's guard structural so valid HOF calls still
-       specialize. *)
-    Types.types_compatible ~type_params:type_param_names
-      (normalize_for_signature_guard expected)
-      (normalize_for_signature_guard actual)
+       generics before substitution. It must stay generic-aware: type params,
+       bounded params, dimension params, and dim expressions containing them are
+       provisional matches here. [collect_subst] below is the source of truth for
+       producing concrete substitutions. Purity has already been checked by the
+       frontend, and bridge-produced Core can conservatively type inline lambdas
+       as impure, so purity is erased for this structural guard. *)
+    let expected = normalize_for_signature_guard expected in
+    let actual = normalize_for_signature_guard actual in
+    match (expected, actual) with
+    | Ast.TyVar name, _ when is_declared_param name -> true
+    | Ast.TyBoundVar param, _ when is_declared_param param.param_name -> true
+    | Ast.TyNamed (name, []), _ when is_declared_param name -> true
+    | Ast.TyVarDims name, _ when is_declared_param name -> true
+    | Ast.TyVarDims name, _ when is_anonymous_dim_wildcard name -> true
+    | Ast.TyDimOp _, _ when guard_has_declared_param expected -> true
+    | Ast.TyRange inner, _ when guard_has_declared_param inner -> true
+    | Ast.TyNamed (expected_name, expected_args), Ast.TyNamed (actual_name, actual_args)
+      when expected_name = actual_name && not (is_declared_param expected_name) ->
+        compatible_args expected_args actual_args
+    | Ast.TyArray (expected_elem, expected_dims), Ast.TyArray (actual_elem, actual_dims) ->
+        compatible_args (expected_elem :: expected_dims) (actual_elem :: actual_dims)
+    | Ast.TyTuple expected_elems, Ast.TyTuple actual_elems ->
+        compatible_args expected_elems actual_elems
+    | Ast.TyFunc expected_fn, Ast.TyFunc actual_fn ->
+        compatible_args expected_fn.params actual_fn.params
+        && compatible expected_fn.return actual_fn.return
+    | Ast.TyRange expected_inner, Ast.TyRange actual_inner ->
+        compatible expected_inner actual_inner
+    | _ -> Types.types_compatible expected actual
   in
   let signature_accepts_call =
     try
@@ -1335,16 +1384,35 @@ let lookup_generic_module_func (state : mono_state) (mod_path : string)
           | Some _ as found -> found
           | None -> try_lookup_module_owned (orig_name ^ "__pure")))
 
+let source_name_for_module_call (mod_path : string) (name : string) : string =
+  let prefix = sanitize_module_name mod_path ^ "__" in
+  let source_name =
+    if starts_with name prefix then
+      String.sub name (String.length prefix) (String.length name - String.length prefix)
+    else name
+  in
+  let pure_suffix = "__pure" in
+  if ends_with source_name pure_suffix then
+    String.sub source_name 0 (String.length source_name - String.length pure_suffix)
+  else source_name
+
 let qualified_call_resolves_without_mono (mod_path : string) (field : string)
     (args : core list) : bool =
-  Codegen_builtins.lookup mod_path field <> None
-  ||
-  match args with
-  | receiver :: _ ->
-      Core_intrinsic_registry.lookup_ir_backed_std_function ~mod_path
-        ~func_name:field ~arity:(List.length args) ~receiver_ty:receiver.ty
-      <> None
-  | [] -> false
+  let source_name = source_name_for_module_call mod_path field in
+  let names =
+    if source_name = field then [ field ] else [ field; source_name ]
+  in
+  List.exists
+    (fun name ->
+      Codegen_builtins.lookup mod_path name <> None
+      ||
+      match args with
+      | receiver :: _ ->
+          Core_intrinsic_registry.lookup_ir_backed_std_function ~mod_path
+            ~func_name:name ~arity:(List.length args) ~receiver_ty:receiver.ty
+          <> None
+      | [] -> false)
+    names
 
 module StringSet = Set.Make (String)
 
@@ -1489,6 +1557,20 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
                     gh_source_name = post_mono_synthesis_name gf;
                   }
             | Some owner, current when owner = current ->
+                Some
+                  {
+                    gh_name = hit_name;
+                    gh_func = gf;
+                    gh_module_path = Some owner;
+                    gh_source_name = post_mono_synthesis_name gf;
+                  }
+            | Some owner, _ when
+                hit_name
+                = module_qualified_name owner (post_mono_synthesis_name gf) ->
+                (* Imported calls can arrive after child CVar rewriting as the
+                   flattened canonical function name, e.g.
+                   [std_tensor__is_empty]. That name is globally addressable
+                   Core, unlike an unprefixed module-local source name. *)
                 Some
                   {
                     gh_name = hit_name;
