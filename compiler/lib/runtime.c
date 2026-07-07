@@ -37641,6 +37641,76 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     return (void*)res;
 }
 
+void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args) {
+    if (!program || program->len == 0) {
+        return (void*)blorp_result_err((void*)blorp_string_literal("empty program"));
+    }
+
+    long argc = args ? args->len : 0;
+    if (argc < 0 || argc > (long)(SIZE_MAX / sizeof(char*) - 2)) {
+        return (void*)blorp_result_err((void*)blorp_string_literal("too many process arguments"));
+    }
+    char** argv = (char**)malloc(sizeof(char*) * ((size_t)argc + 2));
+    if (!argv) return (void*)blorp_result_err((void*)blorp_string_literal("out of memory"));
+
+    blorp_Result* cstr_err = NULL;
+    char* prog = blorp_os_cstring_or_null(program, "process program", &cstr_err);
+    if (!prog) {
+        free(argv);
+        return (void*)cstr_err;
+    }
+    argv[0] = prog;
+
+    for (long i = 0; i < argc; i++) {
+        blorp_String* s = (blorp_String*)blorp_list_get((blorp_List*)args, i);
+        char* a = blorp_os_cstring_or_null(s, "process argument", &cstr_err);
+        if (!a) {
+            __free_argv(argv, i + 1);
+            return (void*)cstr_err;
+        }
+        argv[i + 1] = a;
+    }
+    argv[argc + 1] = NULL;
+
+    if (!__process_program_is_resolvable(prog)) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err((void*)blorp_string_literal("program not found"));
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+
+    pid_t pid;
+    int err = posix_spawnp(&pid, prog, NULL, NULL, argv, environ);
+    if (err != 0) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err((void*)blorp_string_literal("spawn failed"));
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    __free_argv(argv, argc + 1);
+
+    if (waited != pid) {
+        return (void*)blorp_result_err((void*)blorp_string_literal("process wait failed"));
+    }
+
+    long exit_code = -1;
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        exit_code = 128 + WTERMSIG(status);
+    }
+
+    blorp_Result* res = blorp_result_ok((void*)exit_code);
+    res->release_mask = 0UL;
+    return (void*)res;
+}
+
 // Shell convenience: run via /bin/sh -c
 void* blorp_process_shell(const blorp_String* command) {
     blorp_String* sh = blorp_string_literal("/bin/sh");

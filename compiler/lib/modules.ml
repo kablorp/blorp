@@ -40,6 +40,11 @@ type preloaded_parsed_source = {
   preload_surface : Module_surface.t option;
 }
 
+type parsed_source_artifact = {
+  source_artifact_program : Ast.program;
+  source_artifact_surface : Module_surface.t option;
+}
+
 type preloaded_import_edge = {
   preload_import_from_path : string;
   preload_import_from_module : string;
@@ -219,14 +224,12 @@ let parse_source_artifact_with_blorp_bridge
   | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) ->
       Ok parsed_source
 
-let parse_source_with_blorp_bridge ?phase ~path ~module_name ~bridge_read_file
-    source =
-  match
-    parse_source_artifact_with_blorp_bridge ?phase ~path ~module_name
-      ~bridge_read_file source
-  with
-  | Ok parsed_source -> Ok parsed_source.parsed_program
-  | Error _ as error -> error
+let parse_bridge_error_to_compiler_error ?filename = function
+  | BridgeParseCompilerErrors (err :: _) -> err
+  | BridgeParseCompilerErrors [] ->
+      parse_error_for_message ?filename
+        "Blorp parser returned no program and no diagnostics"
+  | BridgeParseMessage message -> parse_error_for_message ?filename message
 
 (** Record the explicit filesystem std directory for this session. *)
 let record_std_source_dir (s : Session.t) dir =
@@ -720,11 +723,7 @@ let extract_export_names _decl inner_decl =
         impl.impl_methods
   | DImport _ | DPrivate _ -> []
 
-(** Collect exported declarations from a program.
-    All top-level declarations are exported by default, except:
-    - DPrivate: explicitly excluded
-    - DImport: module-internal, not re-exported *)
-let collect_exports decls =
+let collect_export_pairs_from_ast decls =
   let private_traits =
     List.filter_map
       (fun d ->
@@ -742,13 +741,21 @@ let collect_exports decls =
       | _ -> extract_export_names decl decl)
     decls
 
+let collect_syntactic_exports_from_ast_for_fallback =
+  collect_export_pairs_from_ast
+
+(** Convert a semantic typed export program into module export pairs. This stays
+    exported while OCaml owns typed semantic exports; syntactic module exports
+    should come from Blorp module surfaces on production parse/cache paths. *)
+let semantic_exports_from_program = collect_export_pairs_from_ast
+
 let exported_func_is_debug_only module_path func_name =
   match Hashtbl.find_opt (sess_of ()).module_cache module_path with
   | None -> false
   | Some m ->
       let exports =
         match get_typed_decls m.name with
-        | Some typed -> collect_exports (Typed_ast.program_ast typed)
+        | Some typed -> semantic_exports_from_program (Typed_ast.program_ast typed)
         | None -> m.exports
       in
       List.exists
@@ -760,8 +767,7 @@ let exported_func_is_debug_only module_path func_name =
           | _ -> false)
         exports
 
-(** Collect names of private declarations (for better error messages). *)
-let collect_private_names decls =
+let collect_private_names_from_ast_for_fallback decls =
   List.concat_map
     (fun decl ->
       match decl.decl_desc with
@@ -772,7 +778,7 @@ let collect_private_names decls =
 let private_names_for_import_diagnostics (m : loaded_module) =
   match m.surface with
   | Some surface -> Module_surface.private_names_as_ast_pairs m.decls surface
-  | None -> collect_private_names m.decls
+  | None -> collect_private_names_from_ast_for_fallback m.decls
 
 (** Suggest a similar export name for typo correction.
     Uses simple Levenshtein-like matching on module exports. *)
@@ -836,7 +842,7 @@ let record_module_parse_message ~(sess : Session.t) ~path ~line ~col msg =
 
 let exports_for_cached_source decls = function
   | Some surface -> Module_surface.exports_as_ast_pairs decls surface
-  | None -> collect_exports decls
+  | None -> collect_syntactic_exports_from_ast_for_fallback decls
 
 let cache_parsed_module_source ?(trust_current_source = false) ?surface
     ~(sess : Session.t) ~module_name ~path ~origin ~source decls =
@@ -869,18 +875,6 @@ let cache_parsed_module_source ?(trust_current_source = false) ?surface
           cached_exports = exports;
           cached_surface = surface;
         }
-
-let preload_parsed_sources ?sess sources =
-  let sess = sess_of ?sess () in
-  List.iter
-    (fun source ->
-      ignore
-        (cache_parsed_module_source ~trust_current_source:true ~sess
-           ~module_name:source.preload_module_name ~path:source.preload_path
-           ~origin:source.preload_origin ~source:source.preload_source
-           ?surface:source.preload_surface
-           source.preload_decls))
-    sources
 
 type module_parse_batch_item = {
   module_parse_name : string;
@@ -1113,7 +1107,7 @@ let canonical_module_name_for_preload ~(sess : Session.t) ~base_dir module_name 
 let module_preload_candidate ~base_dir module_name =
   { preload_module_name = module_name; preload_base_dir = base_dir }
 
-let import_module_names_from_decls decls =
+let import_module_names_from_ast_for_fallback decls =
   decls
   |> List.filter_map (fun decl ->
          match decl.decl_desc with
@@ -1123,7 +1117,7 @@ let import_module_names_from_decls decls =
 let module_import_names ?surface decls =
   match surface with
   | Some surface -> Module_surface.import_module_names surface
-  | None -> import_module_names_from_decls decls
+  | None -> import_module_names_from_ast_for_fallback decls
 
 let module_parse_import_base_dir ~fallback_base_dir item =
   if embedded_module_path item.module_parse_path then fallback_base_dir
@@ -1199,9 +1193,8 @@ let eager_typecheck_support_candidates base_dir =
          module_preload_candidate ~base_dir
            (std_support_module_name module_name))
 
-let import_preload_candidates ?surface base_dir decls =
-  decls |> module_import_names ?surface
-  |> List.map (module_preload_candidate ~base_dir)
+let import_preload_candidates base_dir import_names =
+  import_names |> List.map (module_preload_candidate ~base_dir)
 
 (** Load a module by name
     @param module_name Module name like "std/List"
@@ -1493,11 +1486,11 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
 and load_imports ?sess ?surface decls base_dir =
   let sess = sess_of ?sess () in
   let import_names = module_import_names ?surface decls in
+  let import_preloads = import_preload_candidates base_dir import_names in
   let preload_candidates =
     if not sess.prelude_modules_loaded then
-      eager_typecheck_support_candidates base_dir
-      @ import_preload_candidates ?surface base_dir decls
-    else import_preload_candidates ?surface base_dir decls
+      eager_typecheck_support_candidates base_dir @ import_preloads
+    else import_preloads
   in
   let failed_preloaded_modules =
     preload_module_import_closure ~sess ~base_dir preload_candidates
@@ -2072,29 +2065,47 @@ let init_module_paths ?sess base_dir =
   Option.iter (add_package_root ~sess) (find_pkg_root_from abs_base_dir 0);
   add_search_path ~sess (Sys.getcwd ())
 
-(** Parse source text into an AST program.
+(** Parse source text into an AST program and module surface.
     Runs the Blorp parser bridge and returns a structured error on failure. *)
-let parse_source_at_phase ?sess ?filename ?(bridge_read_file = false) ~phase
-    source =
+let parse_source_artifact_at_phase ?sess ?filename
+    ?(bridge_read_file = false) ~phase source =
   let path = Option.value filename ~default:"<source>" in
   let module_name = bridge_module_name_for_path ?sess path in
   match
-    parse_source_with_blorp_bridge ~phase ~path ~module_name
+    parse_source_artifact_with_blorp_bridge ~phase ~path ~module_name
       ~bridge_read_file:(bridge_read_file && not (String.equal path "<source>"))
       source
   with
-  | Ok program -> Ok program
-  | Error (BridgeParseCompilerErrors (err :: _)) -> Error err
-  | Error (BridgeParseCompilerErrors []) ->
-      Error
-        (parse_error_for_message ?filename
-           "Blorp parser returned no program and no diagnostics")
-  | Error (BridgeParseMessage message) ->
-      Error (parse_error_for_message ?filename message)
+  | Ok parsed_source ->
+      Ok
+        {
+          source_artifact_program = parsed_source.parsed_program;
+          source_artifact_surface = parsed_source.parsed_module_surface;
+        }
+  | Error error -> Error (parse_bridge_error_to_compiler_error ?filename error)
 
-let parse_source ?sess ?filename ?(bridge_read_file = false) source =
+let parse_source_at_phase ?sess ?filename ?(bridge_read_file = false) ~phase
+    source =
+  match
+    parse_source_artifact_at_phase ?sess ?filename ~bridge_read_file ~phase
+      source
+  with
+  | Ok artifact -> Ok artifact.source_artifact_program
+  | Error _ as error -> error
+
+let parse_raw_source_artifact ?sess ?filename ?(bridge_read_file = false)
+    source =
+  parse_source_artifact_at_phase ?sess ?filename ~bridge_read_file
+    ~phase:Compiler_blorp_bridge.RawParsedProgram source
+
+let parse_raw_source ?sess ?filename ?(bridge_read_file = false) source =
   parse_source_at_phase ?sess ?filename ~bridge_read_file
     ~phase:Compiler_blorp_bridge.RawParsedProgram source
+
+let parse_typecheck_source_artifact ?sess ?filename
+    ?(bridge_read_file = false) source =
+  parse_source_artifact_at_phase ?sess ?filename ~bridge_read_file
+    ~phase:Compiler_blorp_bridge.TypecheckSourceProgram source
 
 let parse_typecheck_source ?sess ?filename ?(bridge_read_file = false) source =
   parse_source_at_phase ?sess ?filename ~bridge_read_file

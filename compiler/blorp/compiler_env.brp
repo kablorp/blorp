@@ -255,11 +255,24 @@ record CompilerTraitDef {
 }
 
 
+record CompilerImplMethodInfo {
+	name: String,
+	func_type: CompilerType,
+	type_params: List[CompilerBoundTypeParam],
+	param_names: List[Option[String]],
+	purity: CompilerPurity,
+	resource_args: CompilerResourceArgPolicy,
+	dim_constraints: List[(CompilerType, CompilerType)],
+	debug_only: Bool
+}
+
+
 record CompilerImplInstance {
 	def_id: Int,
 	trait_name: String,
 	for_type: CompilerType,
 	bounds: List[CompilerBoundTypeParam],
+	methods: List[CompilerImplMethodInfo],
 	is_builtin: Bool
 }
 
@@ -302,6 +315,37 @@ record CompilerEnv {
 
 private pure func compiler_empty_scope() -> CompilerScope:
 	{symbols = []}
+
+
+private pure func compiler_env_copy_string(value: String) -> String:
+	value.substring(0, value.length())
+
+
+private pure func compiler_env_copy_strings(values: List[String]) -> List[String]:
+	values.map(compiler_env_copy_string)
+
+
+private pure func compiler_string_lists_equal(left: List[String], right: List[String]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var equal: Bool = True
+
+		while index < left.length() and equal:
+			equal = left.get_or(index, "") == right.get_or(index, "")
+			index += 1
+
+		equal
+
+
+private pure func compiler_env_copy_optional_string(value: Option[String]) -> Option[String]:
+	match value:
+		Some(text):
+			Some(compiler_env_copy_string(text))
+		None:
+			empty: Option[String] = None
+			empty
 
 
 pure func compiler_env_empty() -> CompilerEnv:
@@ -682,6 +726,39 @@ private pure func compiler_env_dim_constraint_copy(
 	(compiler_type_copy(constraint[0]), compiler_type_copy(constraint[1]))
 
 
+private pure func compiler_env_trait_ref_copy(trait_ref: CompilerTraitRef) -> CompilerTraitRef:
+	compiler_trait_ref(trait_ref.name)
+
+
+private pure func compiler_env_bound_type_param_copy(
+	param: CompilerBoundTypeParam,
+) -> CompilerBoundTypeParam:
+	{
+		name = param.name,
+		bounds = param.bounds.map(compiler_env_trait_ref_copy)
+	}
+
+
+private pure func compiler_env_bound_type_param_list_copy(
+	params: List[CompilerBoundTypeParam],
+) -> List[CompilerBoundTypeParam]:
+	params.map(compiler_env_bound_type_param_copy)
+
+
+private pure func compiler_env_optional_string_copy(value: Option[String]) -> Option[String]:
+	match value:
+		Some(text):
+			Some(text)
+		None:
+			None
+
+
+private pure func compiler_env_optional_param_name_copy(
+	value: Option[String],
+) -> Option[String]:
+	compiler_env_optional_string_copy(value)
+
+
 pure func compiler_func_symbol(
 	callable_id: Int,
 	func_type: CompilerType,
@@ -710,6 +787,70 @@ pure func compiler_func_symbol(
 	}
 
 
+private pure func compiler_func_symbol_copy(info: CompilerFuncSymbol) -> CompilerFuncSymbol:
+	compiler_func_symbol(
+		info.callable_id,
+		info.func_type,
+		info.type_params.map(compiler_env_bound_type_param_copy),
+		info.param_names.map(compiler_env_optional_param_name_copy),
+		info.purity,
+		info.origin,
+		info.resource_args,
+		compiler_env_optional_string_copy(info.module_path),
+		info.dim_constraints.map(compiler_env_dim_constraint_copy),
+		info.loop_producer,
+		info.debug_only,
+	)
+
+
+pure func compiler_overload_entry_from_func_symbol(
+	info: CompilerFuncSymbol,
+) -> CompilerOverloadEntry:
+	{
+		def_id = info.callable_id,
+		func_type = compiler_type_copy(info.func_type),
+		type_params = info.type_params.map(compiler_env_bound_type_param_copy),
+		param_names = info.param_names.map(compiler_env_optional_param_name_copy),
+		purity = info.purity,
+		origin = info.origin,
+		resource_args = info.resource_args,
+		module_path = compiler_env_optional_string_copy(info.module_path),
+		dim_constraints = info.dim_constraints.map(compiler_env_dim_constraint_copy),
+		loop_producer = info.loop_producer,
+		debug_only = info.debug_only
+	}
+
+
+private pure func compiler_overload_entry_copy(entry: CompilerOverloadEntry) -> CompilerOverloadEntry:
+	{
+		def_id = entry.def_id,
+		func_type = compiler_type_copy(entry.func_type),
+		type_params = entry.type_params.map(compiler_env_bound_type_param_copy),
+		param_names = entry.param_names.map(compiler_env_optional_param_name_copy),
+		purity = entry.purity,
+		origin = entry.origin,
+		resource_args = entry.resource_args,
+		module_path = compiler_env_optional_string_copy(entry.module_path),
+		dim_constraints = entry.dim_constraints.map(compiler_env_dim_constraint_copy),
+		loop_producer = entry.loop_producer,
+		debug_only = entry.debug_only
+	}
+
+
+private pure func compiler_overload_entry_list_copy(
+	entries: List[CompilerOverloadEntry],
+) -> List[CompilerOverloadEntry]:
+	entries.map(compiler_overload_entry_copy)
+
+
+private pure func compiler_func_symbol_supports_ufcs(info: CompilerFuncSymbol) -> Bool:
+	match info.func_type:
+		CompilerFunctionType(_, params, _):
+			params.length() > 0
+		_:
+			False
+
+
 pure func compiler_env_add_func_with_info(
 	env: CompilerEnv,
 	name: String,
@@ -719,7 +860,7 @@ pure func compiler_env_add_func_with_info(
 		env,
 		{
 			name = name,
-			kind = CompilerFuncSymbolKind(info)
+			kind = CompilerFuncSymbolKind(compiler_func_symbol_copy(info))
 		},
 	)
 
@@ -1031,31 +1172,53 @@ pure func compiler_env_get_alias(
 	env: CompilerEnv,
 	name: String,
 ) -> Option[(List[String], CompilerType)]:
-	match compiler_env_find_type_binding(env, name):
-		Some(CompilerAliasTypeBinding(alias_symbol)):
-			Some((alias_symbol.type_params, alias_symbol.target))
+	match compiler_env_lookup(env, name):
+		Some(symbol):
+			match symbol.kind:
+				CompilerAliasSymbolKind(alias_symbol):
+					Some((
+						compiler_env_copy_strings(alias_symbol.type_params),
+						compiler_env_copy_type(alias_symbol.target),
+					))
+				_:
+					empty: Option[(List[String], CompilerType)] = None
+					empty
 		_:
-			None
+			empty: Option[(List[String], CompilerType)] = None
+			empty
 
 
 pure func compiler_env_get_opaque_alias(
 	env: CompilerEnv,
 	name: String,
 ) -> Option[(List[String], CompilerType, Option[String])]:
-	match compiler_env_find_type_binding(env, name):
-		Some(CompilerOpaqueAliasTypeBinding(alias_symbol)):
-			Some((alias_symbol.type_params, alias_symbol.target, alias_symbol.home_module))
+	match compiler_env_lookup(env, name):
+		Some(symbol):
+			match symbol.kind:
+				CompilerOpaqueAliasSymbolKind(alias_symbol):
+					Some((
+						compiler_env_copy_strings(alias_symbol.type_params),
+						compiler_env_copy_type(alias_symbol.target),
+						compiler_env_copy_optional_string(alias_symbol.home_module),
+					))
+				_:
+					empty: Option[(List[String], CompilerType, Option[String])] = None
+					empty
 		_:
-			None
+			empty: Option[(List[String], CompilerType, Option[String])] = None
+			empty
 
 
 private pure func compiler_field_names_match(
 	fields: List[CompilerFieldDecl],
 	names: List[String],
 ) -> Bool:
-	fields
-		.map(func(field): field.name)
-		.sort() == names.sort()
+	compiler_string_lists_equal(
+		fields
+			.map(func(field): field.name)
+			.sort(),
+		names.sort(),
+	)
 
 
 pure func compiler_env_find_records_with_fields(
@@ -1387,19 +1550,43 @@ pure func compiler_trait_def_with_details(
 	}
 
 
+private pure func compiler_trait_method_sig_copy(
+	method: CompilerTraitMethodSig,
+) -> CompilerTraitMethodSig:
+	compiler_trait_method_sig_with_details(
+		method.name,
+		method.params.map(compiler_type_copy),
+		compiler_type_copy(method.return_type),
+		method.is_pure,
+		method.has_default,
+		method.param_names.map(compiler_env_optional_param_name_copy),
+	)
+
+
+private pure func compiler_trait_def_copy(trait_def: CompilerTraitDef) -> CompilerTraitDef:
+	compiler_trait_def_with_details(
+		trait_def.def_id,
+		trait_def.name,
+		compiler_string_list_copy(trait_def.type_params),
+		compiler_string_list_copy(trait_def.supertraits),
+		trait_def.methods.map(compiler_trait_method_sig_copy),
+		compiler_env_optional_string_copy(trait_def.module_path),
+	)
+
+
 pure func compiler_env_add_trait(env: CompilerEnv, trait_def: CompilerTraitDef) -> CompilerEnv:
 	var traits: List[CompilerTraitDef] = []
 	var replaced: Bool = False
 
 	for existing in env.traits:
 		if existing.name == trait_def.name:
-			traits = traits.append(trait_def)
+			traits = traits.append(compiler_trait_def_copy(trait_def))
 			replaced = True
 		else:
 			traits = traits.append(existing)
 
 	if not replaced:
-		traits = traits.append(trait_def)
+		traits = traits.append(compiler_trait_def_copy(trait_def))
 
 	{ env | traits = traits }
 
@@ -1409,7 +1596,7 @@ pure func compiler_env_get_trait(env: CompilerEnv, name: String) -> Option[Compi
 
 	for trait_def in env.traits:
 		if trait_def.name == name:
-			result = Some(trait_def)
+			result = Some(compiler_trait_def_copy(trait_def))
 			break
 
 	result
@@ -1536,6 +1723,69 @@ pure func compiler_env_trait_methods_with_declaring_trait(
 	compiler_trait_methods_with_declaring_trait_seen(env, [], trait_name)
 
 
+private pure func compiler_env_find_trait_method_seen(
+	env: CompilerEnv,
+	seen: List[String],
+	trait_name: String,
+	method_name: String,
+) -> Option[(CompilerTraitMethodSig, String)]:
+	if seen.contains(trait_name):
+		None
+	else:
+		match compiler_env_get_trait(env, trait_name):
+			Some(trait_def):
+				var result: Option[(CompilerTraitMethodSig, String)] = None
+
+				for method in trait_def.methods:
+					if method.name == method_name:
+						result = Some((compiler_trait_method_sig_copy(method), trait_name))
+						break
+
+				if result.is_none():
+					for supertrait in trait_def.supertraits:
+						match compiler_env_find_trait_method_seen(
+							env,
+							seen.append(trait_name),
+							supertrait,
+							method_name,
+						):
+							Some(found):
+								result = Some(found)
+								break
+							None:
+								void
+
+				result
+			None:
+				None
+
+
+pure func compiler_env_find_trait_method(
+	env: CompilerEnv,
+	trait_name: String,
+	method_name: String,
+) -> Option[(CompilerTraitMethodSig, String)]:
+	compiler_env_find_trait_method_seen(env, [], trait_name, method_name)
+
+
+pure func compiler_env_find_trait_method_for_param(
+	env: CompilerEnv,
+	param_name: String,
+	method_name: String,
+) -> Option[(CompilerTraitMethodSig, String)]:
+	var result: Option[(CompilerTraitMethodSig, String)] = None
+
+	for bound in compiler_env_get_type_param_bounds(env, param_name):
+		match compiler_env_find_trait_method(env, bound, method_name):
+			Some(found):
+				result = Some(found)
+				break
+			None:
+				void
+
+	result
+
+
 pure func compiler_env_has_trait_bound_transitive(
 	env: CompilerEnv,
 	param_name: String,
@@ -1622,17 +1872,90 @@ pure func compiler_impl_instance(
 	bounds: List[CompilerBoundTypeParam],
 	is_builtin: Bool,
 ) -> CompilerImplInstance:
+	compiler_impl_instance_with_methods(def_id, trait_name, for_type, bounds, [], is_builtin)
+
+
+pure func compiler_impl_method_info(
+	name: String,
+	func_type: CompilerType,
+	type_params: List[CompilerBoundTypeParam],
+	param_names: List[Option[String]],
+	purity: CompilerPurity,
+	resource_args: CompilerResourceArgPolicy,
+	dim_constraints: List[(CompilerType, CompilerType)],
+	debug_only: Bool,
+) -> CompilerImplMethodInfo:
+	{
+		name = name,
+		func_type = compiler_type_copy(func_type),
+		type_params = type_params.map(compiler_env_bound_type_param_copy),
+		param_names = param_names.map(compiler_env_optional_param_name_copy),
+		purity = purity,
+		resource_args = resource_args,
+		dim_constraints = dim_constraints.map(compiler_env_dim_constraint_copy),
+		debug_only = debug_only
+	}
+
+
+private pure func compiler_impl_method_info_copy(
+	info: CompilerImplMethodInfo,
+) -> CompilerImplMethodInfo:
+	compiler_impl_method_info(
+		info.name,
+		info.func_type,
+		info.type_params,
+		info.param_names,
+		info.purity,
+		info.resource_args,
+		info.dim_constraints,
+		info.debug_only,
+	)
+
+
+pure func compiler_impl_instance_with_methods(
+	def_id: Int,
+	trait_name: String,
+	for_type: CompilerType,
+	bounds: List[CompilerBoundTypeParam],
+	methods: List[CompilerImplMethodInfo],
+	is_builtin: Bool,
+) -> CompilerImplInstance:
 	{
 		def_id = def_id,
 		trait_name = trait_name,
-		for_type = for_type,
-		bounds = bounds,
+		for_type = compiler_type_copy(for_type),
+		bounds = bounds.map(compiler_env_bound_type_param_copy),
+		methods = methods.map(compiler_impl_method_info_copy),
 		is_builtin = is_builtin
 	}
 
 
 pure func compiler_env_add_impl(env: CompilerEnv, impl: CompilerImplInstance) -> CompilerEnv:
 	{ env | impls = env.impls.append(impl) }
+
+
+pure func compiler_env_find_impl_method_info(
+	env: CompilerEnv,
+	trait_name: String,
+	method_name: String,
+	receiver_type: CompilerType,
+) -> Option[CompilerImplMethodInfo]:
+	var result: Option[CompilerImplMethodInfo] = None
+
+	for impl in env.impls:
+		if (
+			compiler_impl_satisfies_trait(env, impl, trait_name)
+			and compiler_impl_matches_type(env, impl, receiver_type)
+		):
+			for method in impl.methods:
+				if method.name == method_name:
+					result = Some(compiler_impl_method_info_copy(method))
+					break
+
+		if result.is_some():
+			break
+
+	result
 
 
 private pure func compiler_impl_matches_type(
@@ -2189,6 +2512,20 @@ pure func compiler_resolve_self(concrete_type: CompilerType, typ: CompilerType) 
 			compiler_type_copy(typ)
 
 
+pure func compiler_env_resolve_trait_method_sig(
+	method: CompilerTraitMethodSig,
+	concrete_type: CompilerType,
+) -> CompilerTraitMethodSig:
+	compiler_trait_method_sig_with_details(
+		method.name,
+		method.params.map(func(param): compiler_resolve_self(concrete_type, param)),
+		compiler_resolve_self(concrete_type, method.return_type),
+		method.is_pure,
+		method.has_default,
+		method.param_names.map(compiler_env_optional_param_name_copy),
+	)
+
+
 pure func compiler_overload_type_param_names(entry: CompilerOverloadEntry) -> List[String]:
 	entry.type_params.map(compiler_bound_type_param_name)
 
@@ -2241,9 +2578,9 @@ pure func compiler_env_add_overload(
 ) -> CompilerEnv:
 	entries: List[CompilerOverloadEntry] = match compiler_find_overload_set(env.overloads, name):
 		Some(set):
-			set.entries.append(entry)
+			set.entries.append(compiler_overload_entry_copy(entry))
 		None:
-			[entry]
+			[compiler_overload_entry_copy(entry)]
 
 	{ env | overloads = compiler_replace_overload_set(env.overloads, name, entries) }
 
@@ -2251,7 +2588,7 @@ pure func compiler_env_add_overload(
 pure func compiler_env_get_overloads(env: CompilerEnv, name: String) -> List[CompilerOverloadEntry]:
 	match compiler_find_overload_set(env.overloads, name):
 		Some(set):
-			set.entries
+			compiler_overload_entry_list_copy(set.entries)
 		None:
 			[]
 
@@ -2265,7 +2602,7 @@ private pure func compiler_find_entry_by_def_id(
 	for set in sets:
 		for entry in set.entries:
 			if entry.def_id == def_id:
-				result = Some(entry)
+				result = Some(compiler_overload_entry_copy(entry))
 				break
 
 		if result.is_some():
@@ -2285,7 +2622,117 @@ pure func compiler_env_find_ufcs_method_by_def_id(
 	env: CompilerEnv,
 	def_id: Int,
 ) -> Option[CompilerOverloadEntry]:
-	compiler_find_entry_by_def_id(env.ufcs_methods, def_id)
+	match compiler_find_entry_by_def_id(env.ufcs_methods, def_id):
+		Some(entry):
+			Some(entry)
+		None:
+			match compiler_env_find_func_by_def_id(env, def_id):
+				Some(func_symbol):
+					if compiler_func_symbol_supports_ufcs(func_symbol):
+						Some(compiler_overload_entry_from_func_symbol(func_symbol))
+					else:
+						None
+				None:
+					None
+
+
+pure func compiler_env_find_func_by_def_id(
+	env: CompilerEnv,
+	def_id: Int,
+) -> Option[CompilerFuncSymbol]:
+	var result: Option[CompilerFuncSymbol] = None
+
+	for scope in env.scopes:
+		for symbol in scope.symbols:
+			match symbol.kind:
+				CompilerFuncSymbolKind(func_symbol):
+					if func_symbol.callable_id == def_id:
+						result = Some(compiler_func_symbol_copy(func_symbol))
+						break
+				_:
+					void
+
+		if result.is_some():
+			break
+
+	result
+
+
+private pure func compiler_find_overload_type_params_by_def_id(
+	sets: List[CompilerOverloadSet],
+	def_id: Int,
+) -> Option[List[CompilerBoundTypeParam]]:
+	var result: Option[List[CompilerBoundTypeParam]] = None
+
+	for set in sets:
+		for entry in set.entries:
+			if entry.def_id == def_id:
+				result = Some(compiler_env_bound_type_param_list_copy(entry.type_params))
+				break
+
+		if result.is_some():
+			break
+
+	result
+
+
+pure func compiler_env_find_callable_type_params_by_def_id(
+	env: CompilerEnv,
+	def_id: Int,
+) -> Option[List[CompilerBoundTypeParam]]:
+	match compiler_find_overload_type_params_by_def_id(env.overloads, def_id):
+		Some(params):
+			Some(params)
+		None:
+			match compiler_find_overload_type_params_by_def_id(env.ufcs_methods, def_id):
+				Some(params):
+					Some(params)
+				None:
+					match compiler_env_find_func_by_def_id(env, def_id):
+						Some(func_symbol):
+							if compiler_func_symbol_supports_ufcs(func_symbol):
+								Some(
+									compiler_env_bound_type_param_list_copy(
+										func_symbol.type_params,
+									),
+								)
+							else:
+								None
+						None:
+							None
+
+
+private pure func compiler_find_overload_debug_only_by_def_id(
+	sets: List[CompilerOverloadSet],
+	def_id: Int,
+) -> Option[Bool]:
+	var result: Option[Bool] = None
+
+	for set in sets:
+		for entry in set.entries:
+			if entry.def_id == def_id:
+				result = Some(entry.debug_only)
+				break
+
+		if result.is_some():
+			break
+
+	result
+
+
+pure func compiler_env_find_callable_debug_only_by_def_id(
+	env: CompilerEnv,
+	def_id: Int,
+) -> Option[Bool]:
+	match compiler_env_find_func_by_def_id(env, def_id):
+		Some(func_symbol):
+			Some(func_symbol.debug_only)
+		None:
+			match compiler_find_overload_debug_only_by_def_id(env.overloads, def_id):
+				Some(debug_only):
+					Some(debug_only)
+				None:
+					compiler_find_overload_debug_only_by_def_id(env.ufcs_methods, def_id)
 
 
 private pure func compiler_function_first_param_type(
@@ -2480,7 +2927,7 @@ private pure func compiler_select_unique_best_overload(
 	for entry in entries:
 		score = compiler_overload_selection_score(entry, arg_types)
 		if score > best_score:
-			best = Some(entry)
+			best = Some(compiler_overload_entry_copy(entry))
 			best_score = score
 			tied = False
 		else if score == best_score:
@@ -2497,13 +2944,17 @@ pure func compiler_env_select_overload_for_args(
 	arg_types: List[CompilerType],
 ) -> Option[CompilerOverloadEntry]:
 	if entries.length() == 1:
-		entries.get(0)
+		match entries.get(0):
+			Some(entry):
+				Some(compiler_overload_entry_copy(entry))
+			None:
+				None
 	else:
 		var matches: List[CompilerOverloadEntry] = []
 
 		for entry in entries:
 			if compiler_overload_arg_types_match(entry, arg_types):
-				matches = matches.append(entry)
+				matches = matches.append(compiler_overload_entry_copy(entry))
 
 		compiler_select_unique_best_overload(matches, arg_types)
 
@@ -2517,7 +2968,7 @@ pure func compiler_env_resolve_overload(
 
 	for entry in compiler_env_get_overloads(env, name):
 		if compiler_overload_first_param_matches(entry, first_arg_type):
-			matches = matches.append(entry)
+			matches = matches.append(compiler_overload_entry_copy(entry))
 
 	if matches.length() == 1:
 		matches.get(0)
@@ -2532,11 +2983,59 @@ pure func compiler_env_add_ufcs_method(
 ) -> CompilerEnv:
 	entries: List[CompilerOverloadEntry] = match compiler_find_overload_set(env.ufcs_methods, name):
 		Some(set):
-			set.entries.append(entry)
+			set.entries.append(compiler_overload_entry_copy(entry))
 		None:
-			[entry]
+			[compiler_overload_entry_copy(entry)]
 
 	{ env | ufcs_methods = compiler_replace_overload_set(env.ufcs_methods, name, entries) }
+
+
+private pure func compiler_env_lookup_function_ufcs_methods(
+	env: CompilerEnv,
+	name: String,
+	first_arg_type: CompilerType,
+) -> List[CompilerOverloadEntry]:
+	var result: List[CompilerOverloadEntry] = []
+
+	for scope in env.scopes:
+		for symbol in scope.symbols:
+			if symbol.name == name:
+				match symbol.kind:
+					CompilerFuncSymbolKind(func_symbol):
+						if compiler_func_symbol_supports_ufcs(func_symbol):
+							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+							if compiler_overload_first_param_matches(entry, first_arg_type):
+								result = result.append(entry)
+					_:
+						void
+
+	result
+
+
+private pure func compiler_env_lookup_module_function_ufcs_methods(
+	env: CompilerEnv,
+	module_path: String,
+	name: String,
+	first_arg_type: CompilerType,
+) -> List[CompilerOverloadEntry]:
+	var result: List[CompilerOverloadEntry] = []
+
+	for scope in env.scopes:
+		for symbol in scope.symbols:
+			if symbol.name == name:
+				match symbol.kind:
+					CompilerFuncSymbolKind(func_symbol):
+						if (
+							func_symbol.module_path == Some(module_path)
+							and compiler_func_symbol_supports_ufcs(func_symbol)
+						):
+							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+							if compiler_overload_first_param_matches(entry, first_arg_type):
+								result = result.append(entry)
+					_:
+						void
+
+	result
 
 
 pure func compiler_env_lookup_ufcs_methods(
@@ -2544,7 +3043,11 @@ pure func compiler_env_lookup_ufcs_methods(
 	name: String,
 	first_arg_type: CompilerType,
 ) -> List[CompilerOverloadEntry]:
-	var result: List[CompilerOverloadEntry] = []
+	var result: List[CompilerOverloadEntry] = compiler_env_lookup_function_ufcs_methods(
+		env,
+		name,
+		first_arg_type,
+	)
 
 	match compiler_find_overload_set(env.ufcs_methods, name):
 		Some(set):
@@ -2563,7 +3066,12 @@ pure func compiler_env_lookup_module_ufcs_methods(
 	name: String,
 	first_arg_type: CompilerType,
 ) -> List[CompilerOverloadEntry]:
-	var result: List[CompilerOverloadEntry] = []
+	var result: List[CompilerOverloadEntry] = compiler_env_lookup_module_function_ufcs_methods(
+		env,
+		module_path,
+		name,
+		first_arg_type,
+	)
 
 	match compiler_find_overload_set(env.ufcs_methods, name):
 		Some(set):
@@ -2584,7 +3092,23 @@ pure func compiler_env_has_ufcs_method(env: CompilerEnv, name: String) -> Bool:
 		Some(set):
 			set.entries.length() > 0
 		None:
-			False
+			var found: Bool = False
+
+			for scope in env.scopes:
+				for symbol in scope.symbols:
+					if symbol.name == name:
+						match symbol.kind:
+							CompilerFuncSymbolKind(func_symbol):
+								if compiler_func_symbol_supports_ufcs(func_symbol):
+									found = True
+									break
+							_:
+								void
+
+				if found:
+					break
+
+			found
 
 
 pure func compiler_env_find_similar(env: CompilerEnv, name: String) -> Option[String]:

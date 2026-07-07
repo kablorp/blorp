@@ -1,8 +1,14 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-blorp-cli install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
+OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
+ROOT_OCAML_HOST := ./blorp-ocaml-host
+BLORP_CLI_SOURCE := compiler/blorp/compiler_cli_main.brp
+BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
+BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
+BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -33,13 +39,18 @@ SECURITY_LEAK_TESTS := \
 # formatter command path so the first interactive format is fast.
 all: install warm-formatter
 
-# Only copy when Dune produced a newer binary. The installed root binary may be
-# ad-hoc signed on macOS, so byte-for-byte comparison against the unsigned Dune
-# output would recopy on every make and invalidate mtime-based caches.
-install: build
-	@if [ ! -f ./blorp ] || [ compiler/_build/default/bin/blorp.exe -nt ./blorp ]; then \
+# Only copy when build outputs are newer. Installed root binaries may be
+# ad-hoc signed on macOS, so byte-for-byte comparison against unsigned outputs
+# would recopy on every make and invalidate mtime-based caches.
+install: build-blorp-cli
+	@if [ ! -f "$(ROOT_OCAML_HOST)" ] || [ "$(OCAML_HOST)" -nt "$(ROOT_OCAML_HOST)" ]; then \
+		rm -f "$(ROOT_OCAML_HOST)"; \
+		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
+		codesign -s - "$(ROOT_OCAML_HOST)" 2>/dev/null || true; \
+	fi
+	@if [ ! -f ./blorp ] || [ "$(BLORP_CLI_BIN)" -nt ./blorp ]; then \
 		rm -f ./blorp; \
-		cp compiler/_build/default/bin/blorp.exe ./blorp; \
+		cp "$(BLORP_CLI_BIN)" ./blorp; \
 		codesign -s - ./blorp 2>/dev/null || true; \
 	fi
 
@@ -57,6 +68,13 @@ compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
 	cd compiler && dune build
+
+# Build the public Blorp executable. The OCaml binary remains as a private host
+# for compiler stages that have not yet moved across the boundary.
+build-blorp-cli: build $(BLORP_CLI_SOURCE)
+	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
+	"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"
+	cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$(BLORP_CLI_BIN)"
 
 # Run the top-level local test gate
 test:
@@ -177,4 +195,5 @@ docker-premerge-gate-all:
 # Clean build artifacts
 clean:
 	cd compiler && dune clean
-	rm -f ./blorp compiler/lib/embedded_std.ml
+	rm -rf "$(BLORP_CLI_BUILD_DIR)"
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" compiler/lib/embedded_std.ml

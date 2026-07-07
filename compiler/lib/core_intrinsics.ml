@@ -431,6 +431,7 @@ let std_body_specs =
         "cbrt";
         "floor";
         "ceil";
+        "round";
         "trunc";
       ]
       1
@@ -8372,15 +8373,17 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
        WASM backend: f64.sin         — native WASM instruction
        LLVM backend: @llvm.sin.f64   — LLVM intrinsic
 
-     abs/min/max/round are excluded — they're polymorphic (Int + Float)
-     and stay CKBuiltin with type dispatch in core_specialize.
+     abs/min/max are excluded — they're polymorphic (Int + Float) and stay
+     CKBuiltin with type dispatch in core_specialize. Float round is included
+     here as math_round; integer rounding does not use this intrinsic.
 
      When called with a tensor arg, core_specialize rewrites
      CKIntrinsic "math_sqrt" → CKBuiltin "blorp_vector_sqrt" (tensor lift). *)
   (* Unary math: Float -> Float (also handles Float32/Float16 via cast) *)
   | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
   | "asinh" | "acosh" | "atanh" | "exp" | "exp2" | "expm1" | "log" | "log2"
-  | "log10" | "log1p" | "sqrt" | "cbrt" | "floor" | "ceil" | "trunc"
+  | "log10" | "log1p" | "sqrt" | "cbrt" | "floor" | "ceil" | "round"
+  | "trunc"
     when match params with
          | [ { cp_ty = Ast.TyNamed (("Float" | "Float32" | "Float16"), _); _ } ]
            ->

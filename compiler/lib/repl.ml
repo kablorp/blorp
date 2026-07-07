@@ -29,7 +29,7 @@ let classify_input text =
   else if String.length trimmed > 0 && (trimmed.[0] = ':' || trimmed.[0] = '/')
   then Command trimmed
   else
-    match Modules.parse_source text with
+    match Modules.parse_raw_source text with
     | Ok program when program <> [] -> Declarations (program, text)
     | Ok _ -> Empty
     | Error _ -> (
@@ -38,7 +38,7 @@ let classify_input text =
           ^ String.concat "\n    " (String.split_on_char '\n' text)
           ^ "\n"
         in
-        match Modules.parse_source wrapped with
+        match Modules.parse_raw_source wrapped with
         | Ok _ -> Expression text
         | Error err ->
             ParseError (Printf.sprintf "Parse error: %s" err.Ast.message))

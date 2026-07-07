@@ -613,15 +613,38 @@ Handles imports and module loading:
 
 ```ocaml
 val init_module_paths : ?sess:Session.t -> string -> unit
+val parse_raw_source_artifact :
+  ?sess:Session.t ->
+  ?filename:string ->
+  ?bridge_read_file:bool ->
+  string ->
+  (parsed_source_artifact, Ast.compiler_error) result
+val parse_typecheck_source_artifact :
+  ?sess:Session.t ->
+  ?filename:string ->
+  ?bridge_read_file:bool ->
+  string ->
+  (parsed_source_artifact, Ast.compiler_error) result
 val load_imports :
-  ?sess:Session.t -> Ast.program -> string -> loaded_module list
+  ?sess:Session.t ->
+  ?surface:Module_surface.t ->
+  Ast.program ->
+  string ->
+  loaded_module list
 val load_module : ?sess:Session.t -> string -> string -> loaded_module option
 val get_all_modules : ?sess:Session.t -> unit -> loaded_module list
 ```
 
-Loaded modules store both the parsed declarations and an optional typed program
-in `loaded_module.typed_decls`; `Pipeline` is responsible for ensuring loaded
-modules are typed before Core lowering.
+Parser artifact helpers preserve the Blorp parser bridge's module surface
+alongside the AST. Raw parser callers use `parse_raw_source*`; typecheck-facing
+callers use `parse_typecheck_source*`. Callers that parse and immediately load
+imports should pass that surface to `load_imports`, so import discovery and
+parsed-module exports come from the authoritative Blorp surface instead of
+fallback AST scanning.
+
+Loaded modules store parsed declarations, an optional module surface, and an
+optional typed program in `loaded_module.typed_decls`; `Pipeline` is responsible
+for ensuring loaded modules are typed before Core lowering.
 
 **Import types** (all inside `import:` block):
 - Selective: `std/option: Option(Some, None)`

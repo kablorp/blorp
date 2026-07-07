@@ -322,7 +322,15 @@ let typed_ident_expr ~(loc : Ast.loc) (name : string) (ty : type_expr) : TA.expr
 
 let direct_call_core_def_id (call : resolved_call) : int option =
   match call.call_target with
-  | CallDirect { callable_id; _ } -> Some callable_id
+  | CallDirect { callable_id; origin = CallableLocal; _ } -> Some callable_id
+  | CallDirect
+      {
+        origin =
+          ( CallableImported _ | CallableBuiltin | CallableForeign
+          | CallableConstructor _ | CallableImplMethod );
+        _;
+      } ->
+      None
   | CallTraitMethod { callable_id = Some callable_id; _ } -> Some callable_id
   | CallTraitMethod { callable_id = None; _ } | CallClosure _ -> None
 

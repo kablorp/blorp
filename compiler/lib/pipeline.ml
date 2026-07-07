@@ -47,6 +47,16 @@ let module_load_errors () = List.rev (Modules.get_load_errors ())
 let target_module_name filename =
   Option.value ~default:"" (Modules.module_name_for_source_file filename)
 
+let bridge_module_origin_of_session_origin = function
+  | Session.User_module -> Compiler_blorp_bridge.CliFrontendUserModule
+  | Session.Stdlib_module -> Compiler_blorp_bridge.CliFrontendStdModule
+  | Session.Native_package_module package ->
+      Compiler_blorp_bridge.CliFrontendPkgModule
+        (Session.package_id_name package)
+  | Session.Package_module package ->
+      Compiler_blorp_bridge.CliFrontendSourcePackageModule
+        (Session.package_id_name package)
+
 let program_has_top_level_main (program : Ast.program) : bool =
   List.exists
     (fun decl ->
@@ -72,14 +82,21 @@ let missing_main_error ~filename =
          or `func main(args: List[String]):` for an implicit zero exit.";
   }
 
-(** Parse source and load imports. Shared by [typecheck_only] and [compile]. *)
-let load_modules_after_parse ?on_frontend_phase ~filename program =
+(** Load imports from an already parsed program without a preloaded frontend
+    graph.
+
+    This is the legacy compatibility path for direct source/tooling entry
+    points that do not yet have a Blorp-discovered import closure. Normal CLI
+    compile/check/run paths should pass a [preloaded_module_graph] and use the
+    single frontend graph handoff instead. *)
+let load_modules_after_parse_with_legacy_imports ?on_frontend_phase ?surface
+    ~filename program =
   let record phase =
     match on_frontend_phase with Some f -> f phase | None -> ()
   in
   record Parse;
   let base_dir = Modules.extract_directory filename in
-  let _ = Modules.load_imports program base_dir in
+  let _ = Modules.load_imports ?surface program base_dir in
   record ModuleLoad;
   let mod_errors = module_load_errors () in
   if mod_errors <> [] then Error mod_errors else Ok (program, base_dir)
@@ -96,6 +113,212 @@ let load_modules_after_preloaded_graph ?on_frontend_phase ~filename ~program
   if mod_errors <> [] then Error mod_errors
   else Ok (program, Modules.extract_directory filename)
 
+let bridge_error ~filename ?(phase = Ast.TypeCheck) message =
+  {
+    message;
+    loc = Ast.point_loc_in ~file:filename ~line:1 ~column:1;
+    phase;
+    kind = Ast.OtherError;
+    notes = [];
+    help = None;
+  }
+
+let bridge_errors ~filename errors =
+  List.map (bridge_error ~filename) errors
+
+let find_graph_source graph ~path ~module_name =
+  List.find_opt
+    (fun source ->
+      String.equal source.Modules.preload_path path
+      && String.equal source.preload_module_name module_name)
+    graph.Modules.preload_graph_sources
+
+let find_first_graph_source_for_path graph path =
+  List.find_opt
+    (fun source -> String.equal source.Modules.preload_path path)
+    graph.Modules.preload_graph_sources
+
+let string_starts_with ~prefix text =
+  let prefix_len = String.length prefix in
+  String.length text >= prefix_len
+  && String.sub text 0 prefix_len = prefix
+
+let string_ends_with ~suffix text =
+  let suffix_len = String.length suffix in
+  let text_len = String.length text in
+  text_len >= suffix_len
+  && String.sub text (text_len - suffix_len) suffix_len = suffix
+
+let embedded_std_name_from_path path =
+  let prefix = "<embedded:" in
+  if string_starts_with ~prefix path && string_ends_with ~suffix:">" path then
+    let start = String.length prefix in
+    Some (String.sub path start (String.length path - start - 1))
+  else None
+
+let embedded_std_source_for_loaded_module (m : Modules.loaded_module) =
+  match Embedded_std.find m.name with
+  | Some _ as source -> source
+  | None ->
+      let std_name =
+        if string_starts_with ~prefix:"std/" m.name then m.name
+        else "std/" ^ m.name
+      in
+      (match Embedded_std.find std_name with
+      | Some _ as source -> source
+      | None -> (
+          match embedded_std_name_from_path m.path with
+          | Some embedded_name -> Embedded_std.find embedded_name
+          | None -> None))
+
+let loaded_module_source_text_for_bridge graph (m : Modules.loaded_module) =
+  match find_graph_source graph ~path:m.path ~module_name:m.name with
+  | Some source -> Some source.Modules.preload_source
+  | None -> (
+      match embedded_std_source_for_loaded_module m with
+      | Some source -> Some source
+      | None -> (
+          try Some (Modules.read_file m.path) with Sys_error _ -> None))
+
+let typecheck_import_module_for_loaded_module graph (m : Modules.loaded_module)
+    =
+  Option.map
+    (fun source ->
+      {
+        Compiler_blorp_bridge.typecheck_import_path = m.path;
+        typecheck_import_module_name = m.name;
+        typecheck_import_module_path = m.name;
+        typecheck_import_text = source;
+        typecheck_import_origin =
+          bridge_module_origin_of_session_origin m.origin;
+      })
+    (loaded_module_source_text_for_bridge graph m)
+
+let typecheck_import_modules_for_loaded_modules ?exclude_path ?exclude_module
+    graph =
+  let seen = Hashtbl.create 64 in
+  let excluded (m : Modules.loaded_module) =
+    match (exclude_path, exclude_module) with
+    | Some path, Some module_name ->
+        String.equal m.path path && String.equal m.name module_name
+    | Some path, None -> String.equal m.path path
+    | None, Some module_name -> String.equal m.name module_name
+    | None, None -> false
+  in
+  Modules.get_all_modules ()
+  |> List.fold_left
+       (fun acc (m : Modules.loaded_module) ->
+         if excluded m || Hashtbl.mem seen m.name then acc
+         else
+           match typecheck_import_module_for_loaded_module graph m with
+           | None -> acc
+           | Some import_module ->
+               Hashtbl.add seen m.name ();
+               import_module :: acc)
+       []
+  |> List.rev
+
+let typecheck_resolved_imports_for_graph graph =
+  graph.Modules.preload_graph_imports
+  |> List.filter_map (fun edge ->
+         match edge.Modules.preload_import_resolved_module with
+         | Some resolved_module ->
+             Some
+               {
+                 Compiler_blorp_bridge.typecheck_resolved_import_from_path =
+                   edge.preload_import_from_path;
+                 typecheck_resolved_import_from_module =
+                   edge.preload_import_from_module;
+                 typecheck_resolved_import_path = edge.preload_import_path;
+                 typecheck_resolved_import_module = resolved_module;
+               }
+         | None -> None)
+
+let typecheck_graph_source_with_blorp_bridge ~allow_debug_only_calls
+    ~import_modules ~resolved_imports source =
+  match
+    Compiler_blorp_bridge.typecheck_source_via_command_with_imports_policy
+      ~allow_debug_only_calls ~import_modules ~resolved_imports
+      ~origin:
+        (bridge_module_origin_of_session_origin source.Modules.preload_origin)
+      ~path:source.Modules.preload_path
+      ~module_name:source.preload_module_name ~text:source.preload_source
+  with
+  | Error (_code, message) ->
+      Error
+        [ bridge_error ~filename:source.preload_path ~phase:Ast.Parse message ]
+  | Ok artifact -> (
+      match artifact.typechecked_errors with
+      | [] ->
+          Ok (artifact.typechecked_program, artifact.typechecked_import_bindings)
+      | errors -> Error (bridge_errors ~filename:source.preload_path errors))
+
+let evaluate_blorp_bridge_typed_program ~import_bindings typed_program =
+  Ctfe.evaluate_program ~import_bindings typed_program
+
+(** Phase 2.1: each top-level [Pipeline] entry point runs in its own
+    [Session.t] so two compiles/checks in a single process can't leak state
+    (module_cache, prelude_modules_loaded, load_errors, search_paths,
+    fresh-name counters) into each other. The CLI's pre-call
+    [init_module_paths] writes to the long-lived process-default session and is
+    harmless (the new session re-inits its own paths). *)
+let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
+    'a =
+  let parent = Session.current () in
+  let sess = Session.create () in
+  (match (parent.Session.std_override_active, parent.std_override_dir) with
+  | true, Some dir -> Modules.set_std_override ~sess dir
+  | _ -> ());
+  Session.with_current sess (fun () ->
+      Modules.init_module_paths (Modules.extract_directory filename);
+      Option.iter (fun configure -> configure sess) configure_session;
+      k ())
+
+let typecheck_loaded_graph_modules_with_blorp_bridge
+    ~allow_debug_only_calls graph =
+  let errors = ref [] in
+  let typed_modules = ref [] in
+  let loaded_modules = Modules.get_all_modules () in
+  loaded_modules
+  |> List.iter (fun (m : Modules.loaded_module) ->
+         match Modules.get_typed_decls m.name with
+         | Some _ -> ()
+         | None -> (
+             match find_graph_source graph ~path:m.path ~module_name:m.name with
+             | None -> ()
+             | Some source -> (
+                 let import_modules =
+                   typecheck_import_modules_for_loaded_modules
+                     ~exclude_path:m.path ~exclude_module:m.name graph
+                 in
+                 let resolved_imports = typecheck_resolved_imports_for_graph graph in
+                 match
+                   typecheck_graph_source_with_blorp_bridge
+                     ~allow_debug_only_calls ~import_modules ~resolved_imports
+                     source
+                 with
+                 | Ok (typed_decls, import_bindings) ->
+                     Modules.set_typed_decls m.name typed_decls;
+                     Modules.set_typed_import_bindings m.name import_bindings;
+                     typed_modules :=
+                       (m.name, typed_decls, import_bindings)
+                       :: !typed_modules
+                 | Error module_errors ->
+                     errors := module_errors @ !errors)));
+  match List.rev !errors with
+  | _ :: _ as errors -> errors
+  | [] ->
+      let ctfe_errors = ref [] in
+      List.rev !typed_modules
+      |> List.iter (fun (module_name, typed_decls, import_bindings) ->
+             match
+               evaluate_blorp_bridge_typed_program ~import_bindings typed_decls
+             with
+             | Ok evaluated -> Modules.set_typed_decls module_name evaluated
+             | Error module_errors ->
+                 ctfe_errors := module_errors @ !ctfe_errors);
+      List.rev !ctfe_errors
+
 let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
     ~filename source =
   let record phase =
@@ -106,12 +329,16 @@ let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
     | User_source -> bridge_can_read_matching_source ~filename source
     | Generated_test_harness -> false
   in
-  match Modules.parse_typecheck_source ~filename ~bridge_read_file source with
+  match
+    Modules.parse_typecheck_source_artifact ~filename ~bridge_read_file source
+  with
   | Error err ->
       record Parse;
       Error [ err ]
-  | Ok program ->
-      load_modules_after_parse ?on_frontend_phase ~filename program
+  | Ok artifact ->
+      load_modules_after_parse_with_legacy_imports ?on_frontend_phase
+        ?surface:artifact.Modules.source_artifact_surface ~filename
+        artifact.source_artifact_program
 
 let fresh_builtins_env () = Env_builtins.with_builtins (Env.empty ())
 
@@ -326,6 +553,33 @@ let check_cross_module_coherence (env : Env.env)
   pairs collected;
   List.rev !errs
 
+let source_impls_from_loaded_modules () =
+  let collect_impl (m : Modules.loaded_module) local_type_names d =
+    match d.Ast.decl_desc with
+    | Ast.DImpl impl ->
+        let impl =
+          {
+            impl with
+            impl_for_type =
+              Types.qualify_module_local_types ~module_path:m.Modules.name
+                local_type_names impl.impl_for_type;
+          }
+        in
+        Some (m.name, Typecheck.make_impl_instance ~loc:d.decl_loc impl)
+    | _ -> None
+  in
+  Modules.get_all_modules ()
+  |> List.concat_map (fun (m : Modules.loaded_module) ->
+         let local_type_names =
+           Module_type_identity.local_type_names_from_decls m.decls
+         in
+         List.filter_map (collect_impl m local_type_names) m.decls)
+
+let loaded_module_coherence_errors () =
+  let env_for_diag = fresh_builtins_env () in
+  check_cross_module_coherence env_for_diag
+    (source_impls_from_loaded_modules ())
+
 (** Type-check all loaded modules and return their errors. Historically this
     discarded purity/type-mismatch errors as "likely false positives from
     the incomplete builtins-only env", but the 28 hidden errors identified
@@ -340,22 +594,7 @@ let check_cross_module_coherence (env : Env.env)
     here rather than leaking to the C linker. *)
 let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
   let module_errors = ref [] in
-  let all_source_impls = ref [] in
   let attempted = Hashtbl.create 16 in
-  let collect_impl m local_type_names d =
-    match d.Ast.decl_desc with
-    | Ast.DImpl impl ->
-        let impl =
-          {
-            impl with
-            impl_for_type =
-              Types.qualify_module_local_types ~module_path:m.Modules.name
-                local_type_names impl.impl_for_type;
-          }
-        in
-        Some (Typecheck.make_impl_instance ~loc:d.decl_loc impl)
-    | _ -> None
-  in
   List.iter
     (fun (m : Modules.loaded_module) ->
       match Modules.get_typed_decls m.name with
@@ -382,24 +621,6 @@ let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
             let module_result =
               typecheck_loaded_module ~debug ~allow_debug_only_calls m
             in
-            (* Collect the impls this module directly declares — NOT those
-             inherited via [register_module_impls] for imports. Walking
-             [state.env.impls] would double-count: an impl imported by both
-             module A and module B would appear in both states and match
-             itself as a spurious cross-module conflict. Private impls are
-             intentionally skipped: they're module-local and never collide
-             across modules at link time because the C symbols aren't
-             exported. *)
-            let local_type_names =
-              Module_type_identity.local_type_names_from_decls m.decls
-            in
-            List.iter
-              (fun d ->
-                match collect_impl m local_type_names d with
-                | Some ii ->
-                    all_source_impls := (m.name, ii) :: !all_source_impls
-                | None -> ())
-              m.decls;
             match module_result with
             | LoadedModuleTyped { typed_decls; import_bindings } ->
                 Modules.set_typed_decls m.name typed_decls;
@@ -416,29 +637,103 @@ let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
      [describe_impl]) — stdlib traits are present there, which covers
      the common case of two modules conflicting on e.g. [Equatable for
      Int]. *)
-  let env_for_diag = fresh_builtins_env () in
-  let cross_module_errs =
-    check_cross_module_coherence env_for_diag !all_source_impls
-  in
+  let cross_module_errs = loaded_module_coherence_errors () in
   List.rev (List.rev_append cross_module_errs !module_errors)
 
-(** Phase 2.1: each top-level [Pipeline] entry point runs in its own
-    [Session.t] so two compiles in a single process can't leak state
-    (module_cache, prelude_modules_loaded, load_errors, search_paths,
-    fresh-name counters) into each other. The CLI's pre-call
-    [init_module_paths] writes to the long-lived process-default
-    session and is harmless (the new session re-inits its own paths). *)
-let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
-    'a =
-  let parent = Session.current () in
-  let sess = Session.create () in
-  (match (parent.Session.std_override_active, parent.std_override_dir) with
-  | true, Some dir -> Modules.set_std_override ~sess dir
-  | _ -> ());
-  Session.with_current sess (fun () ->
-      Modules.init_module_paths (Modules.extract_directory filename);
-      Option.iter (fun configure -> configure sess) configure_session;
-      k ())
+type blorp_bridge_typecheck_result = {
+  blorp_bridge_source_program : Ast.program;
+  blorp_bridge_typed_program : Typed_ast.program;
+  blorp_bridge_import_bindings : Session.import_binding list;
+}
+
+let typecheck_graph_with_blorp_bridge_policy ~debug
+    ~allow_debug_only_calls
+    ~on_frontend_phase ~filename ~preloaded_module_graph =
+  let record_frontend phase =
+    match on_frontend_phase with Some f -> f phase | None -> ()
+  in
+  let target_source =
+    find_first_graph_source_for_path preloaded_module_graph filename
+  in
+  match target_source with
+  | None ->
+      Error
+        [
+          bridge_error ~filename
+            "frontend module graph did not contain the target source";
+        ]
+  | Some target ->
+      match
+        load_modules_after_preloaded_graph ~filename
+          ~program:target.preload_decls preloaded_module_graph
+      with
+      | Error _ as error ->
+          record_frontend ModuleLoad;
+          error
+      | Ok _ ->
+          record_frontend ModuleLoad;
+          let module_errors =
+            typecheck_loaded_graph_modules_with_blorp_bridge
+              ~allow_debug_only_calls
+              preloaded_module_graph
+          in
+          let module_errors =
+            match module_errors with
+            | _ :: _ -> module_errors
+            | [] ->
+                ensure_modules_typed ~debug ~allow_debug_only_calls ()
+          in
+          if module_errors <> [] then begin
+              record_frontend ModuleTypecheck;
+              Error module_errors
+          end
+          else
+              match loaded_module_coherence_errors () with
+              | _ :: _ as errors ->
+                  record_frontend ModuleTypecheck;
+                  Error errors
+              | [] ->
+                  record_frontend ModuleTypecheck;
+                  let import_modules =
+                    typecheck_import_modules_for_loaded_modules
+                      ~exclude_path:target.preload_path
+                      ~exclude_module:target.preload_module_name
+                      preloaded_module_graph
+                  in
+                  let resolved_imports =
+                    typecheck_resolved_imports_for_graph preloaded_module_graph
+                  in
+                  match
+                    typecheck_graph_source_with_blorp_bridge
+                      ~allow_debug_only_calls ~import_modules ~resolved_imports
+                      target
+                  with
+                  | Error _ as error ->
+                      record_frontend MainTypecheck;
+                      error
+                  | Ok (typed_program, import_bindings) ->
+                      record_frontend MainTypecheck;
+                      evaluate_blorp_bridge_typed_program ~import_bindings
+                        typed_program
+                      |> Result.map (fun evaluated ->
+                             {
+                               blorp_bridge_source_program =
+                                 target.preload_decls;
+                               blorp_bridge_typed_program = evaluated;
+                               blorp_bridge_import_bindings = import_bindings;
+                             })
+
+let typecheck_only_typed_with_blorp_bridge_policy ~debug
+    ~allow_debug_only_calls ~filename ~preloaded_module_graph =
+  with_fresh_session filename (fun () ->
+      typecheck_graph_with_blorp_bridge_policy ~debug ~allow_debug_only_calls
+        ~on_frontend_phase:None ~filename ~preloaded_module_graph
+      |> Result.map (fun result -> result.blorp_bridge_typed_program))
+
+let typecheck_only_typed_with_blorp_bridge ~filename ~preloaded_module_graph =
+  typecheck_only_typed_with_blorp_bridge_policy ~debug:false
+    ~allow_debug_only_calls:false ~filename
+    ~preloaded_module_graph
 
 let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a)
     : 'a =
@@ -485,21 +780,14 @@ let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~source_kind ~filename ~program ~debug ())
 
-let preload_cli_parsed_sources = function
-  | [] -> ()
-  | sources -> Modules.preload_parsed_sources sources
-
 let typecheck_only_typed_parsed ~filename ~program
-    ?(preloaded_parsed_sources = []) ?preloaded_module_graph ?(debug = false)
-    () =
+    ?preloaded_module_graph ?(debug = false) () =
   with_fresh_session filename (fun () ->
       let loaded =
         match preloaded_module_graph with
         | Some graph ->
             load_modules_after_preloaded_graph ~filename ~program graph
-        | None ->
-            preload_cli_parsed_sources preloaded_parsed_sources;
-            load_modules_after_parse ~filename program
+        | None -> load_modules_after_parse_with_legacy_imports ~filename program
       in
       match loaded with
       | Error _ as e -> e
@@ -532,11 +820,11 @@ let typecheck_only_reusing_session ~sess ~filename ~source ?(debug = false) ()
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
-let typecheck_only_parsed ~filename ~program ?preloaded_parsed_sources
-    ?preloaded_module_graph ?(debug = false) () =
+let typecheck_only_parsed ~filename ~program ?preloaded_module_graph
+    ?(debug = false) () =
   match
     typecheck_only_typed_parsed ~filename ~program
-      ?preloaded_parsed_sources ?preloaded_module_graph ~debug ()
+      ?preloaded_module_graph ~debug ()
   with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
@@ -587,6 +875,62 @@ let typecheck_module_only ~filename ~source =
   | Ok (state, typed_program) -> Ok (state, Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
+let compile_typechecked_program ~source_kind ~retain_debug_blocks
+    ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
+    ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
+    ~program ~typed_program ~main_import_bindings () =
+  let module_name = target_module_name filename in
+  let import_errors =
+    unused_import_errors ~scope:(Explicit_target { module_name; source_kind })
+      program
+  in
+  if import_errors <> [] then Error import_errors
+  else if require_main && not (program_has_top_level_main program) then
+    Error [ missing_main_error ~filename ]
+  else
+    try
+      let c_code, link_flags, include_dirs =
+        Core_pipeline.compile_typed_with_modules ~main_import_bindings
+          ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
+          ?on_stage_event ?on_stage_json ?tail_observation_stages
+          ~check_invariants typed_program
+      in
+      Ok (Compiled { program; typed_program; c_code; link_flags; include_dirs })
+    with
+    (* [Core_pipeline.Stopped_after] is raised by a caller-supplied
+       [on_stage] callback to request early termination from
+       [--stop-after=<stage>]. Convert to a tagged outcome so callers
+       pattern-match instead of handling an out-of-band exception. *)
+    | Core_pipeline.Stopped_after s -> Ok (Stopped_at s)
+    | Core_error.Core_error { phase; msg; loc; hint } ->
+        let hint_str =
+          match hint with Some h -> " (hint: " ^ h ^ ")" | None -> ""
+        in
+        let tag = Core_error.phase_tag_to_string phase in
+        Error
+          [
+            {
+              message = Printf.sprintf "[%s] %s%s" tag msg hint_str;
+              loc;
+              phase = Codegen;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            };
+          ]
+    | Failure msg ->
+        Error
+          [
+            {
+              message = "(internal error) " ^ msg;
+              loc = Ast.dummy_loc;
+              phase = Codegen;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            };
+          ]
+
 let compile_loaded_program ~source_kind ?(debug = false)
     ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
@@ -613,63 +957,14 @@ let compile_loaded_program ~source_kind ?(debug = false)
     | Error blocking_errors ->
         record_frontend MainTypecheck;
         Error blocking_errors
-    | Ok (main_state, typed_program) -> (
+    | Ok (main_state, typed_program) ->
         record_frontend MainTypecheck;
-        let import_errors =
-          unused_import_errors
-            ~scope:(Explicit_target { module_name; source_kind })
-            program
-        in
-        if import_errors <> [] then Error import_errors
-        else if require_main && not (program_has_top_level_main program) then
-          Error [ missing_main_error ~filename ]
-        else
-          try
-            let c_code, link_flags, include_dirs =
-              Core_pipeline.compile_typed_with_modules
-                ~main_import_bindings:
-                  (List.rev main_state.Typecheck.import_bindings)
-                ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
-                ?on_stage_event ?on_stage_json ?tail_observation_stages
-                ~check_invariants typed_program
-            in
-            Ok
-              (Compiled
-                 { program; typed_program; c_code; link_flags; include_dirs })
-          with
-          (* [Core_pipeline.Stopped_after] is raised by a caller-supplied
-             [on_stage] callback to request early termination from
-             [--stop-after=<stage>]. Convert to a tagged outcome so callers
-             pattern-match instead of handling an out-of-band exception. *)
-          | Core_pipeline.Stopped_after s -> Ok (Stopped_at s)
-          | Core_error.Core_error { phase; msg; loc; hint } ->
-              let hint_str =
-                match hint with Some h -> " (hint: " ^ h ^ ")" | None -> ""
-              in
-              let tag = Core_error.phase_tag_to_string phase in
-              Error
-                [
-                  {
-                    message = Printf.sprintf "[%s] %s%s" tag msg hint_str;
-                    loc;
-                    phase = Codegen;
-                    kind = OtherError;
-                    notes = [];
-                    help = None;
-                  };
-                ]
-          | Failure msg ->
-              Error
-                [
-                  {
-                    message = "(internal error) " ^ msg;
-                    loc = Ast.dummy_loc;
-                    phase = Codegen;
-                    kind = OtherError;
-                    notes = [];
-                    help = None;
-                  };
-                ])
+        compile_typechecked_program ~source_kind ~retain_debug_blocks
+          ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
+          ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
+          ~program ~typed_program
+          ~main_import_bindings:(List.rev main_state.Typecheck.import_bindings)
+          ()
 
 (** Compile a source file through all phases.
     Returns either the compiled result or a list of errors.
@@ -694,8 +989,7 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
 let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
     ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?check_invariants ~filename ~program ?(preloaded_parsed_sources = [])
-    ?preloaded_module_graph () =
+    ?check_invariants ~filename ~program ?preloaded_module_graph () =
   with_fresh_session filename (fun () ->
       let loaded =
         match preloaded_module_graph with
@@ -703,8 +997,8 @@ let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
             load_modules_after_preloaded_graph ?on_frontend_phase ~filename
               ~program graph
         | None ->
-            preload_cli_parsed_sources preloaded_parsed_sources;
-            load_modules_after_parse ?on_frontend_phase ~filename program
+            load_modules_after_parse_with_legacy_imports ?on_frontend_phase
+              ~filename program
       in
       match loaded with
       | Error _ as e -> e
@@ -714,6 +1008,31 @@ let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
             ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
             ?on_stage_json ?tail_observation_stages ?check_invariants ~filename
             ~program ())
+
+let compile_preloaded_graph_with_blorp_bridge ?(debug = false)
+    ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
+    ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
+    ?on_stage_event ?on_stage_json ?tail_observation_stages
+    ?(check_invariants = false) ~filename ~preloaded_module_graph () =
+  let retain_debug_blocks = Option.value retain_debug_blocks ~default:debug in
+  with_fresh_session filename (fun () ->
+      let allow_debug_only_calls =
+        Option.value allow_debug_only_calls ~default:debug
+      in
+      match
+        typecheck_graph_with_blorp_bridge_policy ~debug
+          ~allow_debug_only_calls ~filename ~on_frontend_phase
+          ~preloaded_module_graph
+      with
+      | Error _ as error -> error
+      | Ok result ->
+          compile_typechecked_program ~source_kind:User_source
+            ~retain_debug_blocks ~embed_runtime ~require_main ~profile
+            ?on_stage ?on_stage_event ?on_stage_json ?tail_observation_stages
+            ~check_invariants ~filename
+            ~program:result.blorp_bridge_source_program
+            ~typed_program:result.blorp_bridge_typed_program
+            ~main_import_bindings:result.blorp_bridge_import_bindings ())
 
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
     ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event

@@ -173,9 +173,9 @@ let analyze (_state : state) (doc : document) : unit =
       let parse_result, elapsed =
         timed (fun () ->
             match
-              Modules.parse_source ~filename:path doc.text
+              Modules.parse_raw_source_artifact ~filename:path doc.text
             with
-            | Ok program -> Ok program
+            | Ok artifact -> Ok artifact
             | Error err -> Error [ err ])
       in
       parse_ms := elapsed;
@@ -189,7 +189,9 @@ let analyze (_state : state) (doc : document) : unit =
             timed (fun () -> Modules.prune_parse_cache_to_loaded_modules ())
           in
           prune_ms := elapsed
-      | Ok program ->
+      | Ok artifact ->
+          let program = artifact.Modules.source_artifact_program in
+          let surface = artifact.Modules.source_artifact_surface in
           doc.parse_errors <- [];
           doc.source_program <- Some program;
           doc.program <- Some program;
@@ -201,7 +203,7 @@ let analyze (_state : state) (doc : document) : unit =
           let module_origin = Modules.module_origin_for_source_file path in
           let module_name = target_module_name path in
           let _modules, elapsed =
-            timed (fun () -> Modules.load_imports program base_dir)
+            timed (fun () -> Modules.load_imports ?surface program base_dir)
           in
           load_ms := elapsed;
           let module_errors = List.rev (Modules.get_load_errors ()) in

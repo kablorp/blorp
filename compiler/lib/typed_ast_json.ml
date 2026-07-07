@@ -18,7 +18,9 @@ type decoded_value_slot = {
 
 type decoded_resolved_call_info = {
   callee_name : string;
+  source_name : string;
   callable_id : int option;
+  trait_name : string option;
   purity : Env_types.purity;
   origin : Ast.callable_origin;
   instantiated_params : Ast.type_expr list;
@@ -36,6 +38,20 @@ type decoded_typed_expr_info = {
   proofs : Type_proof_metadata.expr_proofs;
   resolved_call : decoded_resolved_call_info option;
   resource_dependencies : string list;
+}
+
+type decoded_for_binder =
+  | DecodedForNameBinder of string
+  | DecodedForTupleBinder of string list
+
+type decoded_concurrently_loop_params = {
+  loop_timeout : Typed_ast.expr option;
+  loop_limit : int;
+}
+
+type decoded_concurrent_block_params = {
+  block_timeout : Typed_ast.expr option;
+  block_max_threads : int option;
 }
 
 let decode_error_to_string err = err.path ^ ": " ^ err.message
@@ -186,10 +202,42 @@ let decode_parsed_impl_decl path value =
   | Ok _ -> error path "decoded parsed declaration was not an impl"
   | Error err -> Error err
 
+let decode_parsed_var_decl path value =
+  let wrapped =
+    Lsp_json.Object [ ("kind", Lsp_json.String "var"); ("var", value) ]
+  in
+  match parsed_decode_result (Parsed_ast_json.decode_decl_group path wrapped) with
+  | Ok [ ({ Ast.decl_desc = Ast.DVar _; _ } as decl) ] -> Ok decl
+  | Ok [ _ ] -> error path "decoded parsed declaration was not a global variable"
+  | Ok _ -> error path "decoded global variable produced unexpected declaration count"
+  | Error err -> Error err
+
 let typed_decl_of_ast_decl path ast_decl =
   match Typed_ast.of_ast_decl ast_decl with
   | Ok decl -> Ok decl
   | Error _ -> error path "decoded parsed declaration failed typed-AST validation"
+
+let rec decorate_typed_passthrough_decl (decl : Ast.decl) : Ast.decl =
+  let desc =
+    match decl.decl_desc with
+    | Ast.DType type_decl ->
+        let variants =
+          List.mapi
+            (fun tag (variant : Ast.variant) ->
+              {
+                variant with
+                variant_tag = tag;
+                variant_def_id =
+                  Some (Session.mint_def_id (Session.current ()));
+              })
+            type_decl.type_variants
+        in
+        Ast.DType { type_decl with type_variants = variants }
+    | Ast.DPrivate inner ->
+        Ast.DPrivate (decorate_typed_passthrough_decl inner)
+    | other -> other
+  in
+  { decl with decl_desc = desc }
 
 let decode_parsed_typed_decl_group path value =
   let* ast_decls =
@@ -200,6 +248,7 @@ let decode_parsed_typed_decl_group path value =
     | [] -> Ok (List.rev acc)
     | ast_decl :: rest ->
         let item_path = Printf.sprintf "%s[%d]" path index in
+        let ast_decl = decorate_typed_passthrough_decl ast_decl in
         let* typed_decl = typed_decl_of_ast_decl item_path ast_decl in
         loop (typed_decl :: acc) (index + 1) rest
   in
@@ -651,8 +700,11 @@ let decode_dim_constraint path value =
 
 let decode_resolved_call_info path value =
   let* callee_name = string_field path "callee_name" value in
+  let* source_name_opt = option_string_field path "source_name" value in
+  let source_name = Option.value ~default:callee_name source_name_opt in
   let* callable_id_json = field path "callable_id" value in
   let* callable_id = option_int_value (path ^ ".callable_id") callable_id_json in
+  let* trait_name = option_string_field path "trait_name" value in
   let* purity_text = string_field path "purity" value in
   let* purity = decode_purity (path ^ ".purity") purity_text in
   let* origin_json = field path "origin" value in
@@ -678,7 +730,9 @@ let decode_resolved_call_info path value =
   Ok
     {
       callee_name;
+      source_name;
       callable_id;
+      trait_name;
       purity;
       origin;
       instantiated_params;
@@ -791,6 +845,23 @@ let call_pure_of_purity = function
   | Env_types.Pure -> true
   | Env_types.Impure -> false
 
+let encode_ufcs_module_part module_path =
+  String.map (fun c -> if c = '/' then '$' else c) module_path
+
+let bridge_ufcs_name module_path source_name =
+  Codegen_names.ufcs_prefix ^ encode_ufcs_module_part module_path ^ "__"
+  ^ source_name
+
+let normalize_imported_bare_call_desc
+    (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
+  match (desc, info.resolved_call) with
+  | ( Ast.ECall (({ Ast.expr_desc = Ast.EIdent _; _ } as callee), args),
+      Some { origin = Ast.CallableImported module_path; source_name; _ } ) ->
+      Ast.ECall
+        ( { callee with expr_desc = Ast.EIdent (bridge_ufcs_name module_path source_name) },
+          args )
+  | _ -> desc
+
 let call_syntax_of_decoded_desc origin desc =
   match desc with
   | Ast.ECall
@@ -807,15 +878,42 @@ let call_syntax_of_decoded_desc origin desc =
       Ast.CallMethod
   | _ -> Ast.CallBare
 
-let materialize_resolved_call path desc = function
+let materialize_resolved_call path desc
+    (info_opt : decoded_resolved_call_info option) =
+  match info_opt with
   | None -> Ok None
   | Some info -> (
-      match info.callable_id with
-      | None ->
-          error
-            (path ^ ".callable_id")
-            "direct resolved call metadata requires callable_id"
-      | Some callable_id ->
+      match info.origin with
+      | Ast.CallableImplMethod -> (
+          match info.trait_name with
+          | None ->
+              error
+                (path ^ ".trait_name")
+                "impl-method resolved call metadata requires trait_name"
+          | Some trait_name ->
+              Ok
+                (Some
+                   {
+                     Ast.call_syntax =
+                       call_syntax_of_decoded_desc info.origin desc;
+                     call_target =
+                       Ast.CallTraitMethod
+                         {
+                           trait_name;
+                           method_name = info.source_name;
+                           call_pure = call_pure_of_purity info.purity;
+                           callable_id = info.callable_id;
+                         };
+                     instantiated_params = info.instantiated_params;
+                     instantiated_return = info.instantiated_return;
+                   }))
+      | _ -> (
+          match info.callable_id with
+          | None ->
+              error
+                (path ^ ".callable_id")
+                "direct resolved call metadata requires callable_id"
+          | Some callable_id ->
           Ok
             (Some
                {
@@ -823,17 +921,18 @@ let materialize_resolved_call path desc = function
                    call_syntax_of_decoded_desc info.origin desc;
                  call_target =
                    Ast.CallDirect
-                     {
-                       callable_id;
-                       source_name = info.callee_name;
-                       call_pure = call_pure_of_purity info.purity;
+                       {
+                         callable_id;
+                         source_name = info.source_name;
+                         call_pure = call_pure_of_purity info.purity;
                        origin = info.origin;
                      };
                  instantiated_params = info.instantiated_params;
                  instantiated_return = info.instantiated_return;
-               }))
+               })))
 
 let make_typed_expr path loc info desc =
+  let desc = normalize_imported_bare_call_desc info desc in
   let* resolved_call =
     materialize_resolved_call (path ^ ".info.resolved_call") desc
       info.resolved_call
@@ -874,6 +973,269 @@ and decode_typed_record_field path value =
   let* value_json = field path "value" value in
   let* value_expr = decode_typed_expr (path ^ ".value") value_json in
   Ok (name, Typed_ast.ast value_expr)
+
+and decode_typed_match_case path value =
+  let* pattern_json = field path "pattern" value in
+  let* pattern = decode_pattern (path ^ ".pattern") pattern_json in
+  let* body_json = field path "body" value in
+  let* body = decode_typed_expr (path ^ ".body") body_json in
+  let* loc = span_field path "span" value in
+  Ok
+    {
+      Ast.case_pattern = pattern;
+      case_body = Typed_ast.ast body;
+      case_loc = loc;
+    }
+
+and decode_typed_string_interpolation_part path value =
+  let* kind = kind_field path value in
+  match kind with
+  | "literal" ->
+      let* text = string_field path "text" value in
+      Ok (Ast.InterpLit text)
+  | "expr" ->
+      let* expr_json = field path "expr" value in
+      let* expr = decode_typed_expr (path ^ ".expr") expr_json in
+      Ok (Ast.InterpExpr (Typed_ast.ast expr))
+  | _ ->
+      error
+        (path ^ ".kind")
+        ("unsupported typed string interpolation part kind `" ^ kind ^ "`")
+
+and decode_typed_lambda_param path value =
+  let* name_json = field path "name" value in
+  let* name = decode_identifier (path ^ ".name") name_json in
+  let* loc = span_field (path ^ ".name") "span" name_json in
+  let* _source_type_json = field path "source_type" value in
+  let* param_type_json = field path "param_type" value in
+  let* param_type = decode_type (path ^ ".param_type") param_type_json in
+  Ok
+    {
+      Ast.param_name = Some name;
+      param_pattern = None;
+      param_type = Some param_type;
+      param_loc = loc;
+    }
+
+and decode_for_binder path value =
+  let* kind = kind_field path value in
+  match kind with
+  | "name" ->
+      let* name_json = field path "name" value in
+      let* name = decode_identifier (path ^ ".name") name_json in
+      Ok (DecodedForNameBinder name)
+  | "tuple" ->
+      let* names_json = field path "names" value in
+      let* names = decode_identifier_list (path ^ ".names") names_json in
+      let count = List.length names in
+      if count < 2 || count > 4 then
+        error path "for tuple binder must have 2-4 names"
+      else Ok (DecodedForTupleBinder names)
+  | _ -> error path ("unsupported for binder kind `" ^ kind ^ "`")
+
+and channel_elem_type path channel =
+  match Typed_ast.semantic_type channel with
+  | Ast.TyNamed ("Channel", [ elem_ty ])
+  | Ast.TyNamed ("std/channel::Channel", [ elem_ty ])
+  | Ast.TyNamed ("std_channel__Channel", [ elem_ty ]) ->
+      Ok elem_ty
+  | _ -> error path "select receive arm expected Channel[T]"
+
+and decode_typed_select_arm_kind path value =
+  let* kind = kind_field path value in
+  match kind with
+  | "receive" ->
+      let* name_json = field path "name" value in
+      let* name = decode_identifier (path ^ ".name") name_json in
+      let* elem_type_json = field path "elem_type" value in
+      let* expected_elem_type =
+        decode_type (path ^ ".elem_type") elem_type_json
+      in
+      let* channel_json = field path "channel" value in
+      let* channel = decode_typed_expr (path ^ ".channel") channel_json in
+      let* actual_elem_type = channel_elem_type (path ^ ".channel") channel in
+      if not (Types.types_equal expected_elem_type actual_elem_type) then
+        error (path ^ ".elem_type")
+          "select receive element type does not match channel type"
+      else
+        Ok
+          (Ast.SelectRecv
+             { select_bind = name; select_channel = Typed_ast.ast channel })
+  | "sealed" ->
+      let* elem_type_json = field path "elem_type" value in
+      let* expected_elem_type =
+        decode_type (path ^ ".elem_type") elem_type_json
+      in
+      let* channel_json = field path "channel" value in
+      let* channel = decode_typed_expr (path ^ ".channel") channel_json in
+      let* actual_elem_type = channel_elem_type (path ^ ".channel") channel in
+      if not (Types.types_equal expected_elem_type actual_elem_type) then
+        error (path ^ ".elem_type")
+          "select sealed element type does not match channel type"
+      else Ok (Ast.SelectSealed (Typed_ast.ast channel))
+  | "after" ->
+      let* timeout_json = field path "timeout" value in
+      let* timeout = decode_typed_expr (path ^ ".timeout") timeout_json in
+      Ok (Ast.SelectAfter (Typed_ast.ast timeout))
+  | _ -> error path ("unsupported select arm kind `" ^ kind ^ "`")
+
+and decode_typed_select_arm path value =
+  let* kind_json = field path "kind" value in
+  let* kind = decode_typed_select_arm_kind (path ^ ".kind") kind_json in
+  let* body_json = field path "body" value in
+  let* body = decode_typed_expr (path ^ ".body") body_json in
+  let* loc = span_field path "span" value in
+  Ok
+    {
+      Ast.select_arm_kind = kind;
+      select_arm_body = Typed_ast.ast body;
+      select_arm_loc = loc;
+    }
+
+and decode_typed_with_error_map path value =
+  let* name_json = field path "name" value in
+  let* name = decode_identifier (path ^ ".name") name_json in
+  let* value_json = field path "value" value in
+  let* mapped = decode_typed_expr (path ^ ".value") value_json in
+  Ok
+    {
+      Ast.with_error_name = name;
+      with_error_value = Typed_ast.ast mapped;
+    }
+
+and decode_optional_typed_with_error_map path = function
+  | Lsp_json.Null -> Ok None
+  | value ->
+      let* decoded = decode_typed_with_error_map path value in
+      Ok (Some decoded)
+
+and decode_typed_with_binding path value =
+  let* name_json = field path "name" value in
+  let* name = decode_identifier (path ^ ".name") name_json in
+  let* annotation_json = field path "annotation" value in
+  let* annotation = decode_optional_type (path ^ ".annotation") annotation_json in
+  let* value_json = field path "value" value in
+  let* binding_value = decode_typed_expr (path ^ ".value") value_json in
+  let* kind_name = string_field path "kind" value in
+  let* kind =
+    match kind_name with
+    | "plain" -> Ok Ast.WithPlain
+    | "try" -> Ok Ast.WithTry
+    | _ ->
+        error (path ^ ".kind")
+          ("unsupported with binding kind `" ^ kind_name ^ "`")
+  in
+  let* error_map_json = field path "error_map" value in
+  let* error_map =
+    decode_optional_typed_with_error_map (path ^ ".error_map") error_map_json
+  in
+  Ok
+    {
+      Ast.with_name = name;
+      with_type = annotation;
+      with_value = Typed_ast.ast binding_value;
+      with_kind = kind;
+      with_error_map = error_map;
+    }
+
+and decode_typed_concurrent_param path value =
+  let* name_json = field path "name" value in
+  let* name = decode_identifier (path ^ ".name") name_json in
+  let* param_value_json = field path "value" value in
+  let* param_value = decode_typed_expr (path ^ ".value") param_value_json in
+  Ok (name, param_value)
+
+and positive_int_literal_from_typed_expr path label expr =
+  match (Typed_ast.ast expr).Ast.expr_desc with
+  | Ast.ELiteral (Ast.LitInt value) ->
+      if Int64.compare value 0L <= 0 then
+        error path (label ^ " must be positive")
+      else if Int64.compare value (Int64.of_int max_int) > 0 then
+        error path (label ^ " is too large")
+      else Ok (Int64.to_int value)
+  | _ -> error path (label ^ " must be an integer literal")
+
+and decode_concurrently_loop_params path values =
+  let rec loop index timeout limit = function
+    | [] -> (
+        match limit with
+        | Some loop_limit -> Ok { loop_timeout = timeout; loop_limit }
+        | None -> error path "`for ... concurrently(...)` requires `limit: N`")
+    | value :: rest ->
+        let item_path = Printf.sprintf "%s[%d]" path index in
+        let* name, param_value = decode_typed_concurrent_param item_path value in
+        (match name with
+        | "timeout" -> (
+            match timeout with
+            | Some _ -> error item_path "duplicate timeout parameter"
+            | None -> loop (index + 1) (Some param_value) limit rest)
+        | "limit" -> (
+            match limit with
+            | Some _ -> error item_path "duplicate concurrently limit"
+            | None ->
+                let* limit_value =
+                  positive_int_literal_from_typed_expr (item_path ^ ".value")
+                    "concurrently limit" param_value
+                in
+                loop (index + 1) timeout (Some limit_value) rest)
+        | "max_threads" ->
+            error item_path
+              "use `limit: N` in `concurrently(...)`; `max_threads` is only \
+               valid on `concurrent(...)` blocks"
+        | _ ->
+            error item_path
+              ("unknown concurrently parameter `" ^ name
+             ^ "` (expected `limit` or `timeout`)"))
+  in
+  loop 0 None None values
+
+and decode_concurrent_block_params path values =
+  let rec loop index timeout max_threads = function
+    | [] -> Ok { block_timeout = timeout; block_max_threads = max_threads }
+    | value :: rest ->
+        let item_path = Printf.sprintf "%s[%d]" path index in
+        let* name, param_value = decode_typed_concurrent_param item_path value in
+        (match name with
+        | "timeout" -> (
+            match timeout with
+            | Some _ -> error item_path "duplicate timeout parameter"
+            | None -> loop (index + 1) (Some param_value) max_threads rest)
+        | "max_threads" -> (
+            match max_threads with
+            | Some _ -> error item_path "duplicate max_threads parameter"
+            | None ->
+                let* max_threads_value =
+                  positive_int_literal_from_typed_expr (item_path ^ ".value")
+                    "max_threads" param_value
+                in
+                loop (index + 1) timeout (Some max_threads_value) rest)
+        | "limit" ->
+            error item_path
+              "use `max_threads: N` on `concurrent(...)` blocks; `limit` is \
+               only valid on `for ... concurrently(...)`"
+        | _ ->
+            error item_path
+              ("unknown concurrent parameter `" ^ name
+             ^ "` (expected `max_threads` or `timeout`)"))
+  in
+  loop 0 None None values
+
+and concurrent_bindings_from_block path body =
+  match (Typed_ast.ast body).Ast.expr_desc with
+  | Ast.EBlock items ->
+      let rec loop index acc = function
+        | [] -> Ok (List.rev acc)
+        | item :: rest -> (
+            match item.Ast.expr_desc with
+            | Ast.EConcurrentBind _ -> loop (index + 1) (item :: acc) rest
+            | _ ->
+                error
+                  (Printf.sprintf "%s.body.items[%d]" path index)
+                  "concurrent block body must contain only concurrent_bind \
+                   nodes")
+      in
+      loop 0 [] items
+  | _ -> error (path ^ ".body") "concurrent block body must be a block"
 
 and subscript_desc path receiver indices =
   match indices with
@@ -919,6 +1281,18 @@ and decode_typed_expr path value =
         (Ast.ELiteral
            (Ast.LitString
               (text, { Ast.sf_multiline = false; sf_raw = false })))
+  | "string_interpolation_raw" ->
+      let* text = string_field path "value" value in
+      let* is_multiline = bool_field path "raw" value in
+      decode_common (Ast.EStringInterpRaw (text, is_multiline))
+  | "string_interpolation" ->
+      let* parts_json = array_field path "parts" value in
+      let* parts =
+        decode_list (path ^ ".parts") decode_typed_string_interpolation_part
+          parts_json
+      in
+      let* is_multiline = bool_field path "multiline" value in
+      decode_common (Ast.EStringInterp (parts, is_multiline))
   | "bool_literal" ->
       let* value_bool = bool_field path "value" value in
       decode_common (Ast.ELiteral (Ast.LitBool value_bool))
@@ -1037,6 +1411,34 @@ and decode_typed_expr path value =
         decode_list (path ^ ".fields") decode_typed_record_field fields_json
       in
       decode_common (Ast.ERecordUpdate (Typed_ast.ast receiver, fields))
+  | "lambda" ->
+      let* is_pure = bool_field path "is_pure" value in
+      let* params_json = array_field path "params" value in
+      let* params =
+        decode_list (path ^ ".params") decode_typed_lambda_param params_json
+      in
+      let* return_json = field path "return_annotation" value in
+      let* return_annotation =
+        decode_optional_type (path ^ ".return_annotation") return_json
+      in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      let func =
+        {
+          Ast.func_name = None;
+          func_type_params = [];
+          func_params = params;
+          func_return_type = return_annotation;
+          func_body = Ast.FuncBodyExpr (Typed_ast.ast body);
+          func_is_pure = is_pure;
+          func_is_tailrec = false;
+          func_no_copy = false;
+          func_debug_only = false;
+          func_resource_result_ordinary = false;
+          func_dim_constraints = [];
+        }
+      in
+      decode_common (Ast.ELambda func)
   | "block" ->
       let* items = decode_expr_items path value in
       decode_common (Ast.EBlock (List.map Typed_ast.ast items))
@@ -1056,6 +1458,85 @@ and decode_typed_expr path value =
            ( Typed_ast.ast condition,
              Typed_ast.ast then_branch,
              Option.map Typed_ast.ast else_branch ))
+  | "match" ->
+      let* scrutinee_json = field path "scrutinee" value in
+      let* scrutinee = decode_typed_expr (path ^ ".scrutinee") scrutinee_json in
+      let* cases_json = array_field path "cases" value in
+      let* cases =
+        decode_list (path ^ ".cases") decode_typed_match_case cases_json
+      in
+      decode_common (Ast.EMatch (Typed_ast.ast scrutinee, cases))
+  | "select" ->
+      let* arms_json = array_field path "arms" value in
+      let* arms =
+        decode_list (path ^ ".arms") decode_typed_select_arm arms_json
+      in
+      decode_common (Ast.ESelect arms)
+  | "while" ->
+      let* condition_json = field path "condition" value in
+      let* condition =
+        decode_typed_expr (path ^ ".condition") condition_json
+      in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      decode_common (Ast.EWhile (Typed_ast.ast condition, Typed_ast.ast body))
+  | "for" ->
+      let* binder_json = field path "binder" value in
+      let* binder = decode_for_binder (path ^ ".binder") binder_json in
+      let* iterable_json = field path "iterable" value in
+      let* iterable = decode_typed_expr (path ^ ".iterable") iterable_json in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      let desc =
+        match binder with
+        | DecodedForNameBinder name ->
+            Ast.EFor (name, Typed_ast.ast iterable, Typed_ast.ast body)
+        | DecodedForTupleBinder names ->
+            Ast.EForTuple (names, Typed_ast.ast iterable, Typed_ast.ast body)
+      in
+      decode_common desc
+  | "concurrent_for" ->
+      let* name_json = field path "name" value in
+      let* name = decode_identifier (path ^ ".name") name_json in
+      let* iterable_json = field path "iterable" value in
+      let* iterable = decode_typed_expr (path ^ ".iterable") iterable_json in
+      let* params_json = array_field path "params" value in
+      let* params =
+        decode_concurrently_loop_params (path ^ ".params") params_json
+      in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      decode_common
+        (Ast.EConcurrentlyLoop
+           ( name,
+             Typed_ast.ast iterable,
+             Typed_ast.ast body,
+             Option.map Typed_ast.ast params.loop_timeout,
+             Ast.ConcurrentlyLoopLimit params.loop_limit ))
+  | "concurrent_bind" ->
+      let* name_json = field path "name" value in
+      let* name = decode_identifier (path ^ ".name") name_json in
+      let* annotation_json = field path "annotation" value in
+      let* annotation = decode_optional_type (path ^ ".annotation") annotation_json in
+      let* value_json = field path "value" value in
+      let* binding_value = decode_typed_expr (path ^ ".value") value_json in
+      decode_common
+        (Ast.EConcurrentBind (name, annotation, Typed_ast.ast binding_value))
+  | "concurrent_block" ->
+      let* params_json = array_field path "params" value in
+      let* params = decode_concurrent_block_params (path ^ ".params") params_json in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      let* bindings = concurrent_bindings_from_block path body in
+      decode_common
+        (Ast.EConcurrent
+           ( bindings,
+             Option.map Typed_ast.ast params.block_timeout,
+             params.block_max_threads ))
+  | "detach" ->
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      decode_common (Ast.EDetach (Typed_ast.ast body))
   | "range" ->
       let* start_json = field path "start" value in
       let* start_expr = decode_typed_expr (path ^ ".start") start_json in
@@ -1074,6 +1555,12 @@ and decode_typed_expr path value =
       let* target_json = field path "target_type" value in
       let* target_type = decode_type (path ^ ".target_type") target_json in
       decode_common (Ast.EAscription (Typed_ast.ast inner, target_type))
+  | "with" ->
+      let* binding_json = field path "binding" value in
+      let* binding = decode_typed_with_binding (path ^ ".binding") binding_json in
+      let* body_json = field path "body" value in
+      let* body = decode_typed_expr (path ^ ".body") body_json in
+      decode_common (Ast.EWith (binding, Typed_ast.ast body))
   | "debug_block" ->
       let* body_json = field path "body" value in
       let* body = decode_typed_expr (path ^ ".body") body_json in
@@ -1517,11 +2004,13 @@ let optional_type_field path name value =
 let decode_typed_global_var_info path value =
   let* decl_json = field path "decl" value in
   let decl_path = path ^ ".decl" in
-  let* name_json = field decl_path "name" decl_json in
-  let* name = decode_identifier (decl_path ^ ".name") name_json in
-  let* loc = span_field decl_path "span" decl_json in
-  let* source_type = optional_type_field decl_path "type" decl_json in
-  let* is_mutable = bool_field decl_path "is_mutable" decl_json in
+  let* source_decl = decode_parsed_var_decl decl_path decl_json in
+  let* source_var =
+    match source_decl.Ast.decl_desc with
+    | Ast.DVar var -> Ok var
+    | _ -> error decl_path "decoded parsed declaration was not a global variable"
+  in
+  let source_type = source_var.Ast.var_type in
   let* binding_type_json = field path "binding_type" value in
   let* binding_type = decode_type (path ^ ".binding_type") binding_type_json in
   let* source_type_json = field path "source_type" value in
@@ -1541,16 +2030,17 @@ let decode_typed_global_var_info path value =
   else
     let ast_var =
       {
-        Ast.var_name = Some name;
-        var_pattern = None;
+        source_var with
         var_type = typed_source_type;
         var_value = Typed_ast.ast typed_value;
-        var_is_mutable = is_mutable;
-        var_is_const = not is_mutable;
       }
     in
     let ast_decl =
-      { Ast.decl_desc = Ast.DVar ast_var; decl_loc = loc; decl_doc = None }
+      {
+        Ast.decl_desc = Ast.DVar ast_var;
+        decl_loc = source_decl.decl_loc;
+        decl_doc = source_decl.decl_doc;
+      }
     in
     match Typed_ast.of_ast_var_decl ast_var with
     | Ok typed_var ->

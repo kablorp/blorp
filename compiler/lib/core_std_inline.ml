@@ -26,6 +26,8 @@ type target = {
   body : core;
 }
 
+type target_key = string * int
+
 let starts_with s prefix =
   let slen = String.length s in
   let plen = String.length prefix in
@@ -96,20 +98,22 @@ let compiler_owned_module = function
       starts_with module_path "std/" || starts_with module_path "pkg/"
   | None -> false
 
-let collect_targets (prog : core_program) : (int, target) Hashtbl.t =
+let func_key (f : core_func) : target_key = (f.cf_name, f.cf_def_id)
+
+let collect_targets (prog : core_program) : (target_key, target) Hashtbl.t =
   let targets = Hashtbl.create 16 in
   let remember_func (f : core_func) =
     match (f.cf_module, f.cf_body, f.cf_type_params) with
     | Some "std/list", Some body, [] -> (
         match std_list_arg_bindings (source_name f) f.cf_params with
         | Some arg_bindings ->
-            Hashtbl.replace targets f.cf_def_id
+            Hashtbl.replace targets (func_key f)
               { params = f.cf_params; arg_bindings; body }
         | None -> ())
     | Some "std/tensor", Some body, [] -> (
         match std_tensor_arg_bindings (source_name f) f.cf_params with
         | Some arg_bindings ->
-            Hashtbl.replace targets f.cf_def_id
+            Hashtbl.replace targets (func_key f)
               { params = f.cf_params; arg_bindings; body }
         | None -> ())
     | _ -> ()
@@ -448,8 +452,8 @@ let rewrite_expr targets e =
   let rec rewrite e =
     let e = map_children rewrite e in
     match e.desc with
-    | CCall (CKUser (_, Some def_id), _, args) -> (
-        match Hashtbl.find_opt targets def_id with
+    | CCall (CKUser (name, Some def_id), _, args) -> (
+        match Hashtbl.find_opt targets (name, def_id) with
         | Some target -> (
             match expand_call state target args e.loc with
             | Some expanded -> expanded
@@ -460,7 +464,7 @@ let rewrite_expr targets e =
   rewrite e
 
 let rewrite_func targets (f : core_func) : core_func =
-  if Hashtbl.mem targets f.cf_def_id || compiler_owned_module f.cf_module then f
+  if Hashtbl.mem targets (func_key f) || compiler_owned_module f.cf_module then f
   else { f with cf_body = Option.map (rewrite_expr targets) f.cf_body }
 
 let rewrite_decl targets d =

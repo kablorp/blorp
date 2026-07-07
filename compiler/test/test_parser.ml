@@ -7,7 +7,7 @@
 let check_bool msg = Alcotest.(check bool) msg
 
 let parse_ok source =
-  match Blorp.Modules.parse_source source with
+  match Blorp.Modules.parse_raw_source source with
   | Ok program -> program
   | Error err -> Alcotest.fail err.message
 

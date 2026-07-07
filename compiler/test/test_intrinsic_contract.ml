@@ -43,7 +43,9 @@ let test_every_entry_declares_arity () =
 let test_math_intrinsics_marked_pure () =
   (* All math_* intrinsics are mathematically pure — no I/O, no hidden
      state. Sanity-check by sampling common ones. *)
-  let math_names = [ "math_sin"; "math_cos"; "math_sqrt"; "math_log" ] in
+  let math_names =
+    [ "math_sin"; "math_cos"; "math_sqrt"; "math_round"; "math_log" ]
+  in
   List.iter
     (fun name ->
       match
@@ -73,7 +75,9 @@ let test_list_get_is_not_elementwise () =
 let test_math_unary_is_elementwise () =
   (* Phase 4.2 will auto-lift math_sqrt(vec) → map(vec, math_sqrt).
      Require math_sqrt / math_log / etc. to be marked elementwise. *)
-  let elementwise_math = [ "math_sqrt"; "math_log"; "math_sin" ] in
+  let elementwise_math =
+    [ "math_sqrt"; "math_round"; "math_log"; "math_sin" ]
+  in
   List.iter
     (fun name ->
       match
