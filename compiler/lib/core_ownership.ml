@@ -345,8 +345,9 @@ let intrinsic_contract name arity =
   | "math_atan" | "math_sinh" | "math_cosh" | "math_tanh" | "math_asinh"
   | "math_acosh" | "math_atanh" | "math_exp" | "math_exp2" | "math_expm1"
   | "math_log" | "math_log2" | "math_log10" | "math_log1p" | "math_sqrt"
-  | "math_cbrt" | "math_floor" | "math_ceil" | "math_trunc" | "math_is_nan"
-  | "math_is_inf" | "math_is_finite" | "bit_not" ->
+  | "math_cbrt" | "math_floor" | "math_ceil" | "math_round"
+  | "math_trunc" | "math_is_nan" | "math_is_inf" | "math_is_finite"
+  | "bit_not" ->
       borrowed 1 ReturnPrimitive
   | "math_pow" | "math_atan2" | "math_hypot" | "math_fmod" | "math_copysign"
   | "bit_and" | "bit_or" | "bit_xor" | "shift_left" | "shift_right" ->
@@ -586,7 +587,9 @@ let builtin_contract_table =
         [ "blorp_file_size"; "blorp_file_modified"; "blorp_mkstemp_path" ]
         (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_getcwd"; "blorp_temp_dir" ] (bfixed [] ReturnOwned);
-      builtins [ "blorp_process_run" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_process_run"; "blorp_process_run_inherit" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_process_shell" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_exec" ] (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_exec_output" ] (bfixed [ Borrow ] ReturnOwned);

@@ -9,10 +9,14 @@ let loc =
 let ty_int = TyNamed ("Int", [])
 let ty_float = TyNamed ("Float", [])
 let ty_string = TyNamed ("String", [])
+let ty_bool = TyNamed ("Bool", [])
 let ty_void = TyNamed ("Void", [])
 let str_flags = { sf_multiline = false; sf_raw = false }
 let mk d t = { desc = d; ty = t; loc }
 let cvar n t = mk (CVar (Var.named n)) t
+let cvar_def n def_id t =
+  mk (CVar { (Var.named n) with vdef_id = Some def_id }) t
+
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string
 let fn_ty params return is_pure = TyFunc { params; return; is_pure }
@@ -309,6 +313,61 @@ let test_module_fn_ref_retains_consumed_managed_arg () =
               (pp_to_string_indented body)
         | None -> Alcotest.fail "missing eta body"))
 
+let test_function_ref_def_id_collision_uses_name_identity () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let ty_span = TyNamed ("CompilerSourceSpan", []) in
+        let ty_json = TyNamed ("JsonValue", []) in
+        let ty_action = TyNamed ("CliAction", []) in
+        let span_to_json_ty = fn_ty [ ty_span ] ty_json true in
+        let span_to_json =
+          mk_func ~is_pure:true "parsed_source_span_to_json"
+            [ ("span", ty_span) ]
+            ty_json
+            (Some (cvar "json" ty_json))
+            77
+        in
+        let action_uses_auto_format =
+          mk_func "action_uses_auto_format"
+            [ ("action", ty_action) ]
+            ty_bool
+            (Some (cvar "flag" ty_bool))
+            77
+        in
+        let get_span_to_json =
+          mk_func "get_span_to_json" [] span_to_json_ty
+            (Some (cvar_def "parsed_source_span_to_json" 77 span_to_json_ty))
+            78
+        in
+        let converted =
+          Blorp.Core_closure.adapt_function_refs_program
+            [
+              decl span_to_json;
+              decl action_uses_auto_format;
+              decl get_span_to_json;
+            ]
+        in
+        let eta = require_func "_blorp_eta_0" converted in
+        match eta.cf_body with
+        | Some
+            {
+              desc =
+                CCall
+                  ( CKUser ("parsed_source_span_to_json", Some 77),
+                    _,
+                    [ { ty = arg_ty; _ } ] );
+              ty = return_ty;
+              _;
+            } ->
+            Alcotest.(check bool) "eta argument type preserved" true
+              (Blorp.Types.types_equal arg_ty ty_span);
+            Alcotest.(check bool) "eta return type preserved" true
+              (Blorp.Types.types_equal return_ty ty_json)
+        | Some body ->
+            Alcotest.failf "eta adapter selected wrong target:\n%s"
+              (pp_to_string_indented body)
+        | None -> Alcotest.fail "missing eta body"))
+
 let test_eta_adapter_does_not_retain_borrowed_managed_arg () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -500,6 +559,8 @@ let suite =
           test_eta_adapter_retains_consumed_managed_arg;
         Alcotest.test_case "module_fn_ref_retains_consumed_managed_arg" `Quick
           test_module_fn_ref_retains_consumed_managed_arg;
+        Alcotest.test_case "function_ref_def_id_collision_uses_name_identity"
+          `Quick test_function_ref_def_id_collision_uses_name_identity;
         Alcotest.test_case "eta_adapter_does_not_retain_borrowed_managed_arg"
           `Quick test_eta_adapter_does_not_retain_borrowed_managed_arg;
         Alcotest.test_case "eta_adapter_retains_builtin_consumed_managed_args"

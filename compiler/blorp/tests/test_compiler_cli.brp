@@ -1,13 +1,18 @@
 import:
 	../compiler_bridge_protocol: BridgeAction(RunCliAction), BridgeEnvelope
 	../compiler_cli: handle_cli_run_envelope, run_cli, run_cli_with_version
+	../compiler_cli_args: CliAction(CliCheck)
 	../compiler_cli_plan:
 		CliCheckTargetExpansion,
 		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
 		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
 		CliFrontendGraphSource,
 		CliFrontendModuleGraph,
-		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendSourcePackageModule),
+		CliFrontendModuleOrigin(
+			CliFrontendPkgModule,
+			CliFrontendSourcePackageModule,
+			CliFrontendUserModule,
+		),
 		CliPackageRunCommand(
 			CliPackageRunCheck,
 			CliPackageRunFetchTarget,
@@ -27,7 +32,7 @@ import:
 		),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-	../compiler_cli_source_graph: expand_check_targets
+	../compiler_cli_source_graph: expand_check_targets, source_graph_modules_for_roots
 	json:
 		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -139,6 +144,74 @@ pure func graph_source_has_module_surface(source: CliFrontendGraphSource) -> Boo
 			True
 		None:
 			False
+
+
+pure func module_surface_json_with_imports(imports: List[String]) -> JsonValue:
+	JsonObject([
+		("kind", JsonString("module_surface")),
+		("module", JsonString("synthetic")),
+		(
+			"imports",
+			JsonVector(
+				imports.map(func(module_path: String):
+					JsonObject([("module_path", JsonString(module_path))])
+				),
+			),
+		),
+		("exports", JsonVector([])),
+		("private_names", JsonVector([])),
+		("private_traits", JsonVector([])),
+	])
+
+
+pure func parsed_source_json_with_surface(imports: List[String]) -> JsonValue:
+	JsonObject([("parsed_ast", JsonObject([
+				("kind", JsonString("parsed_program")),
+				("decls", JsonVector([])),
+				("diagnostics", JsonVector([])),
+			])), (
+			"module_surface",
+			module_surface_json_with_imports(
+				imports,
+			),
+		), ("ast_phase", JsonString("typecheck_source"))])
+
+
+pure func parsed_source_json_with_surface_and_ast_import(
+	surface_imports: List[String],
+	ast_import_path: String,
+) -> JsonValue:
+	JsonObject([
+		(
+			"parsed_ast",
+			JsonObject([("kind", JsonString("parsed_program")), ("decls", JsonVector([JsonObject([
+							("kind", JsonString("import_block")),
+							(
+								"imports",
+								JsonVector(
+									[
+										JsonObject(
+											[("module_path", JsonString(ast_import_path))],
+										),
+									],
+								),
+							),
+						])])), ("diagnostics", JsonVector([]))]),
+		),
+		("module_surface", module_surface_json_with_imports(surface_imports)),
+		("ast_phase", JsonString("typecheck_source")),
+	])
+
+
+pure func source_graph_test_check_action(root_path: String) -> CliAction:
+	CliCheck({
+		dump_ast = False,
+		dump_typed_ast = False,
+		debug = False,
+		no_format = True,
+		std_dir = None,
+		paths = [root_path],
+	})
 
 
 pure func graph_root_at(
@@ -277,6 +350,111 @@ func test_cli_source_models_represent_targets_and_files() -> Bool:
 		and parsed_file.path == "src/main.brp"
 		and parsed_file.module_name == "main"
 	)
+
+
+func test_source_graph_discovers_imports_from_module_surface() -> Bool:
+	root_path: String = temp_dir() + "/blorp_cli_surface_root.brp"
+	dep_path: String = temp_dir() + "/blorp_cli_surface_dep.brp"
+	_ = remove_file(root_path)
+	_ = remove_file(dep_path)
+
+	root: CliParsedSourceFile = {
+		path = root_path,
+		module_name = "surface_root",
+		source_text = "",
+		parsed_source = parsed_source_json_with_surface(["./blorp_cli_surface_dep"])
+	}
+	dep_source: String = "pure func surface_dep_value() -> Int: 11\n"
+
+	if not write_text_ok(dep_path, dep_source):
+		False
+	else:
+		result: Result[List[CliParsedSourceFile], String] = source_graph_modules_for_roots(
+			source_graph_test_check_action(root_path),
+			[root],
+		)
+		_ = remove_file(dep_path)
+
+		match result:
+			Ok(modules):
+				match modules:
+					[module]:
+						(
+							module.path.ends_with("/blorp_cli_surface_dep.brp")
+							and module.module_name == "./blorp_cli_surface_dep"
+							and module.source_text == dep_source
+							and graph_source_has_module_surface({
+								path = module.path,
+								module_name = module.module_name,
+								source_text = module.source_text,
+								parsed_source = module.parsed_source,
+								origin = CliFrontendUserModule,
+							})
+						)
+					_:
+						False
+			Err(_):
+				False
+
+
+func test_source_graph_rejects_parsed_source_missing_module_surface() -> Bool:
+	root_path: String = temp_dir() + "/blorp_cli_surface_missing_root.brp"
+	root: CliParsedSourceFile = {
+		path = root_path,
+		module_name = "surface_missing_root",
+		source_text = "",
+		parsed_source = JsonObject([("parsed_ast", JsonObject([
+					("kind", JsonString("parsed_program")),
+					("decls", JsonVector([])),
+					("diagnostics", JsonVector([])),
+				])), ("ast_phase", JsonString("typecheck_source"))])
+	}
+
+	match source_graph_modules_for_roots(source_graph_test_check_action(root_path), [root]):
+		Ok(_):
+			False
+		Err(message):
+			message.contains("missing module_surface")
+
+
+func test_source_graph_no_longer_depends_on_parsed_ast_import_shape() -> Bool:
+	root_path: String = temp_dir() + "/blorp_cli_surface_ast_root.brp"
+	dep_path: String = temp_dir() + "/blorp_cli_surface_real_dep.brp"
+	_ = remove_file(root_path)
+	_ = remove_file(dep_path)
+
+	root: CliParsedSourceFile = {
+		path = root_path,
+		module_name = "surface_ast_root",
+		source_text = "",
+		parsed_source = parsed_source_json_with_surface_and_ast_import(
+			["./blorp_cli_surface_real_dep"],
+			"./blorp_cli_surface_wrong_dep",
+		)
+	}
+	dep_source: String = "pure func real_dep_value() -> Int: 12\n"
+
+	if not write_text_ok(dep_path, dep_source):
+		False
+	else:
+		result: Result[List[CliParsedSourceFile], String] = source_graph_modules_for_roots(
+			source_graph_test_check_action(root_path),
+			[root],
+		)
+		_ = remove_file(dep_path)
+
+		match result:
+			Ok(modules):
+				match modules:
+					[module]:
+						(
+							module.path.ends_with("/blorp_cli_surface_real_dep.brp")
+							and module.module_name == "./blorp_cli_surface_real_dep"
+						)
+					_:
+						False
+			Err(_):
+				False
 
 
 func test_expand_check_targets_discovers_sorted_directory_sources() -> Bool:
@@ -2093,6 +2271,18 @@ tests: TestSuite = {
 		(
 			"CLI source models represent targets and files",
 			test_cli_source_models_represent_targets_and_files,
+		),
+		(
+			"frontend graph discovers imports from module surface",
+			test_source_graph_discovers_imports_from_module_surface,
+		),
+		(
+			"frontend graph rejects parsed source missing module surface",
+			test_source_graph_rejects_parsed_source_missing_module_surface,
+		),
+		(
+			"frontend graph no longer depends on parsed_ast imports shape",
+			test_source_graph_no_longer_depends_on_parsed_ast_import_shape,
 		),
 		(
 			"expand check targets discovers sorted directory sources",

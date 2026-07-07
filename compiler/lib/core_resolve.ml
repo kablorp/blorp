@@ -39,6 +39,7 @@ open Core
 type env = {
   user_funcs : (string, int) Hashtbl.t;
   user_func_names_by_id : (int, string) Hashtbl.t;
+  user_func_sigs_by_id : (int, core_func) Hashtbl.t;
   ambiguous_user_func_ids : (int, unit) Hashtbl.t;
   module_funcs : (string * string, string * int) Hashtbl.t;
   user_value_types : (string, Ast.type_expr) Hashtbl.t;
@@ -62,6 +63,11 @@ type env = {
       spelling such as [map] with the selected id for [map__pure]. Only callable
       definitions are indexed here; global values are tracked separately so a
       value def-id can never become a call target.
+    - [user_func_sigs_by_id]: signature table for the same selected-id path.
+      Blorp bridge/typecheck runs can allocate ids locally per module; after
+      modules are flattened into one Core program, a carried id may point at an
+      unrelated current-program function. Signature validation prevents that
+      stale metadata from overriding a concrete callee name.
     - [module_funcs]: module path + source function name → actual emitted
       Core function name and [cf_def_id]. This keeps module-owned wrappers that
       intentionally remain unprefixed, such as [std/fixed.fixed], addressable
@@ -89,11 +95,16 @@ let remember_user_func_id (env : env) (name : string) (def_id : int) : unit =
   | Some existing when existing = name -> ()
   | Some _ ->
       Hashtbl.remove env.user_func_names_by_id def_id;
+      Hashtbl.remove env.user_func_sigs_by_id def_id;
       Hashtbl.replace env.ambiguous_user_func_ids def_id ()
 
 let register_user_func (env : env) (name : string) (def_id : int) : unit =
   Hashtbl.replace env.user_funcs name def_id;
   remember_user_func_id env name def_id
+
+let remember_user_func_signature (env : env) (f : core_func) : unit =
+  if not (Hashtbl.mem env.ambiguous_user_func_ids f.cf_def_id) then
+    Hashtbl.replace env.user_func_sigs_by_id f.cf_def_id f
 
 let register_module_func (env : env) ~(module_path : string)
     ~(source_name : string) ~(actual_name : string) ~(def_id : int) : unit =
@@ -101,16 +112,45 @@ let register_module_func (env : env) ~(module_path : string)
     (actual_name, def_id);
   remember_user_func_id env actual_name def_id
 
-let user_call_kind_by_def_id (env : env) (def_id : int option) :
-    call_kind option =
+let type_matches_selected_signature expected actual =
+  Codegen_types.has_type_vars expected || Codegen_types.has_type_vars actual
+  || Types.types_bidirectional expected actual
+
+let selected_signature_matches_call (f : core_func) (callee : core)
+    (args : core list) : bool =
+  List.length f.cf_params = List.length args
+  && List.for_all2
+       (fun (param : core_param) arg ->
+         type_matches_selected_signature param.cp_ty arg.ty)
+       f.cf_params args
+  &&
+  match Codegen_types.normalize_type callee.ty with
+  | Ast.TyFunc { return; _ } ->
+      type_matches_selected_signature f.cf_return_ty return
+  | _ -> true
+
+let user_call_kind_by_def_id ?callee ?(args = []) (env : env)
+    (def_id : int option) : call_kind option =
   match def_id with
   | None -> None
   | Some id ->
       if Hashtbl.mem env.ambiguous_user_func_ids id then None
       else
-        Option.map
-          (fun name -> CKUser (name, Some id))
-          (Hashtbl.find_opt env.user_func_names_by_id id)
+        match Hashtbl.find_opt env.user_func_names_by_id id with
+        | None -> None
+        | Some name -> (
+            match (callee, Hashtbl.find_opt env.user_func_sigs_by_id id) with
+            | Some callee, Some f
+              when not (selected_signature_matches_call f callee args) ->
+                None
+            | _ -> Some (CKUser (name, Some id)))
+
+let prefixed_runtime_builtin_call_kind (callee : core) : call_kind option =
+  match callee.desc with
+  | CVar v ->
+      Codegen_builtins.lookup_prefixed v.vname
+      |> Option.map (fun c_name -> CKBuiltin c_name)
+  | _ -> None
 
 let starts_with s prefix =
   let slen = String.length s in
@@ -158,6 +198,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
     {
       user_funcs = Hashtbl.create 64;
       user_func_names_by_id = Hashtbl.create 64;
+      user_func_sigs_by_id = Hashtbl.create 64;
       ambiguous_user_func_ids = Hashtbl.create 8;
       module_funcs = Hashtbl.create 64;
       user_value_types = Hashtbl.create 32;
@@ -199,9 +240,12 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
                 let source_name = source_name_for_builtin_lookup f in
                 register_module_func env ~module_path ~source_name
                   ~actual_name:f.cf_name ~def_id:f.cf_def_id;
+                remember_user_func_signature env f;
                 if f.cf_name <> source_name then
                   register_user_func env f.cf_name f.cf_def_id
-            | None -> register_user_func env f.cf_name f.cf_def_id))
+            | None ->
+                register_user_func env f.cf_name f.cf_def_id;
+                remember_user_func_signature env f))
     | CDFunc f -> (
         match f.cf_kind with
         | CFForeign { c_name; arg_passing; _ } ->
@@ -425,6 +469,15 @@ let try_resolve_module_func_call (env : env) mod_path func_name
       | Some kind -> Some kind
       | None -> try_resolve_module_func env mod_path func_name)
 
+let try_resolve_explicit_ufcs_call (env : env) (callee : core)
+    (args : core list) : call_kind option =
+  match callee.desc with
+  | CVar v -> (
+      match Codegen_names.parse_ufcs_name v.vname with
+      | Some (mp, fn) -> try_resolve_module_func_call env mp fn args
+      | None -> None)
+  | _ -> None
+
 let try_resolve_debug_reflection_intrinsic name args =
   Core_intrinsic_registry.lookup_debug_reflection_intrinsic ~mod_path:None ~name
     ~arity:(List.length args)
@@ -505,7 +558,7 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
       in
       let carried_target =
         match obj.desc with
-        | CVar v -> user_call_kind_by_def_id env v.vdef_id
+        | CVar v -> user_call_kind_by_def_id ~callee ~args env v.vdef_id
         | _ -> None
       in
       let alias_module_path =
@@ -575,11 +628,20 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
             with
             | Some c_name -> CKBuiltin c_name
             | None -> (
-                (* 2. User-defined. Prefer a carried [vdef_id] from typed call
-         metadata when present; it recovers the canonical post-flatten name
-         for pure overloads and imported selections. Otherwise use the
-         name-indexed [collect_env] table. *)
-                match user_call_kind_by_def_id env v.vdef_id with
+                (* 2. Explicit UFCS names already carry their module and source
+                   function identity. Resolve that structured target before
+                   trusting a carried [vdef_id]: bridge-selected IDs are local
+                   to a typecheck run and can be stale once a larger module
+                   graph is lowered together. *)
+                match try_resolve_explicit_ufcs_call env callee args with
+                | Some kind -> kind
+                | None -> (
+                    (* 3. User-defined. Prefer a carried [vdef_id] from typed
+                       call metadata for non-UFCS names; it recovers the
+                       canonical post-flatten name for pure overloads and
+                       direct imported selections. Otherwise use the
+                       name-indexed [collect_env] table. *)
+                    match user_call_kind_by_def_id ~callee ~args env v.vdef_id with
                 | Some kind -> kind
                 | None -> (
                     match Hashtbl.find_opt env.user_funcs name with
@@ -720,7 +782,7 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
                                                   else
                                                     match callee.ty with
                                                     | Ast.TyFunc _ -> CKClosure
-                                                    | _ -> CKUnknown)))))))))))
+                                                    | _ -> CKUnknown))))))))))))
   | _ -> ( match callee.ty with Ast.TyFunc _ -> CKClosure | _ -> CKUnknown)
 
 (** Rewrite a bare [CVar] that refers to a globally-imported value (e.g.
@@ -836,9 +898,21 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
       let callee' = resolve_same callee in
       let args' = List.map resolve_same args in
       let kind =
-        match user_call_kind_by_def_id env (Some selected_id) with
+        match try_resolve_explicit_ufcs_call env callee' args' with
         | Some kind -> kind
-        | None -> resolve_call_kind ~module_path ~bound env callee' args'
+        | None -> (
+            match
+              prefixed_runtime_builtin_call_kind callee'
+            with
+            | Some kind -> kind
+            | None -> (
+                match
+                  user_call_kind_by_def_id ~callee:callee' ~args:args' env
+                    (Some selected_id)
+                with
+                | Some kind -> kind
+                | None ->
+                    resolve_call_kind ~module_path ~bound env callee' args'))
       in
       { e with desc = CCall (kind, callee', args') }
   | CCall (CKUnknown, callee, args) ->

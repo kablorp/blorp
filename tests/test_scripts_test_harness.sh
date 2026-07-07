@@ -32,6 +32,19 @@ if [ "${1:-}" = "check" ]; then
 	exit 0
 fi
 
+if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
+	prepare_dir="${2:-}"
+	if [ -z "$prepare_dir" ]; then
+		echo "missing prepare directory" >&2
+		exit 2
+	fi
+	mkdir -p "$prepare_dir"
+	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=$prepare_dir/compiler_renderer_bridge.bin"
+	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=$prepare_dir/compiler_parser_bridge.bin"
+	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=$prepare_dir/compiler_typecheck_bridge.bin"
+	exit 0
+fi
+
 if [ "${1:-}" = "test" ]; then
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "${BLORP_GATE_RESULT:-}" ]; then

@@ -57,11 +57,20 @@ type preloaded_parsed_source = {
   preload_decls : Ast.program;
   preload_surface : Module_surface.t option;
 }
-(** Parsed source supplied by the Blorp CLI frontend for the current compiler
-    invocation. The module loader still resolves imports through its normal
-    rules, but matching entries can reuse this finalized source AST and module
+(** Parsed source supplied by the Blorp CLI frontend graph for the current
+    compiler invocation. Graph loading resolves imports from explicit graph
+    edges; matching entries can reuse this finalized source AST and module
     surface without rereading, reparsing, or rediscovering syntactic module
     facts from declarations. *)
+
+type parsed_source_artifact = {
+  source_artifact_program : Ast.program;
+  source_artifact_surface : Module_surface.t option;
+}
+(** Parsed source plus the syntactic module surface produced by the Blorp parser
+    bridge. Prefer this over plain AST parsing when the caller will immediately
+    load imports, because the surface is the authoritative source of syntactic
+    import/export/private-name facts. *)
 
 type preloaded_import_edge = {
   preload_import_from_path : string;
@@ -136,13 +145,11 @@ val load_imports :
   Ast.program ->
   string ->
   loaded_module list
-(** Load all imports from a list of declarations.
-    Returns the list of successfully loaded modules. *)
+(** Load all imports for a parsed module.
 
-val preload_parsed_sources :
-  ?sess:Session.t -> preloaded_parsed_source list -> unit
-(** Seed the current session's parse cache with frontend-owned parsed source.
-    Intended for one-shot CLI source graphs. *)
+    When [surface] is present, its Blorp-produced import list is authoritative;
+    [decls] is only a legacy fallback for non-surface callers.
+    Returns the list of successfully loaded modules. *)
 
 val load_preloaded_module_graph :
   ?sess:Session.t -> target_path:string -> preloaded_module_graph -> unit
@@ -209,18 +216,28 @@ val std_source_dir : ?sess:Session.t -> unit -> string option
     {!set_std_override}. Source-inspection tools should use this instead of
     deriving [std/] paths from their current working directory. *)
 
-val parse_source :
+val parse_raw_source :
   ?sess:Session.t ->
   ?filename:string ->
   ?bridge_read_file:bool ->
   string ->
   (Ast.program, Ast.compiler_error) result
-(** Parse source text into an AST program through the Blorp parser bridge,
-    preserving raw parser-level forms. Raw parse never hoists nested functions;
-    callers that need typecheck-ready source should use
-    {!parse_typecheck_source}. Filesystem-backed callers can pass
-    [~bridge_read_file:true] to let the Blorp bridge executable read the source
-    file before parsing. Returns structured error on parse failure. *)
+(** Parse source text into a raw AST program through the Blorp parser bridge,
+    preserving parser-level forms for parse-only tooling. Raw parse never
+    finalizes interpolation, hoists nested functions, or lowers subscript reads;
+    callers that need typecheck-ready source must use {!parse_typecheck_source}.
+    Filesystem-backed callers can pass [~bridge_read_file:true] to let the
+    Blorp bridge executable read the source file before parsing. Returns a
+    structured error on parse failure. *)
+
+val parse_raw_source_artifact :
+  ?sess:Session.t ->
+  ?filename:string ->
+  ?bridge_read_file:bool ->
+  string ->
+  (parsed_source_artifact, Ast.compiler_error) result
+(** Like {!parse_raw_source}, but preserves the parser bridge module surface
+    for raw tooling callers that need import information. *)
 
 val parse_typecheck_source :
   ?sess:Session.t ->
@@ -233,17 +250,27 @@ val parse_typecheck_source :
     rewrites such as interpolation finalization, nested-function hoisting, and
     subscript-read lowering happen before semantic analysis. *)
 
-val collect_private_names : Ast.program -> (string * Ast.decl) list
-(** Collect names of private declarations from a program. *)
+val parse_typecheck_source_artifact :
+  ?sess:Session.t ->
+  ?filename:string ->
+  ?bridge_read_file:bool ->
+  string ->
+  (parsed_source_artifact, Ast.compiler_error) result
+(** Like {!parse_typecheck_source}, but preserves the parser bridge module
+    surface for module loading. *)
 
-val collect_exports : Ast.program -> (string * Ast.decl) list
-(** Collect public exports from a parsed or typed program. *)
+val semantic_exports_from_program : Ast.program -> (string * Ast.decl) list
+(** Convert a semantic typed export program into module export pairs.
+
+    Syntactic exports for parsed modules come from the Blorp module surface on
+    production parse/cache paths; AST scanning remains an internal fallback for
+    legacy non-surface callers. *)
 
 val private_names_for_import_diagnostics :
   loaded_module -> (string * Ast.decl) list
 (** Collect private names for selective-import diagnostics. Surface-backed
-    modules use the parser bridge surface; legacy modules fall back to scanning
-    parsed declarations. *)
+    modules use the parser bridge surface. Legacy non-surface callers fall back
+    to an internal AST scanner. *)
 
 val exported_func_is_debug_only : string -> string -> bool
 (** True when the cached module exports [func_name] as a function explicitly

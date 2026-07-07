@@ -13,7 +13,10 @@ type state = {
   mutable current_module : string option;
   constructor_names : (string, unit) Hashtbl.t;
   global_function_refs : (string, function_ref_target) Hashtbl.t;
-  global_function_refs_by_def_id : (int, function_ref_target) Hashtbl.t;
+  global_function_refs_by_identity :
+    (string * int, function_ref_target) Hashtbl.t;
+  global_function_refs_by_unambiguous_def_id :
+    (int, function_ref_target option) Hashtbl.t;
 }
 
 and function_ref_target =
@@ -56,9 +59,21 @@ let function_ref_target_by_name (state : state) (name : string) :
 let function_ref_target (state : state) (v : var) : function_ref_target option =
   match v.vdef_id with
   | Some def_id -> (
-      match Hashtbl.find_opt state.global_function_refs_by_def_id def_id with
+      match
+        Hashtbl.find_opt state.global_function_refs_by_identity
+          (v.vname, def_id)
+      with
       | Some _ as hit -> hit
-      | None -> function_ref_target_by_name state v.vname)
+      | None -> (
+          (* DefIds are not globally unique across modules in current Core.
+             Exact [name, id] identity is authoritative; raw-id fallback is
+             only valid while the scanned program proves that id unambiguous. *)
+          match
+            Hashtbl.find_opt state.global_function_refs_by_unambiguous_def_id
+              def_id
+          with
+          | Some (Some target) -> Some target
+          | Some None | None -> function_ref_target_by_name state v.vname))
   | None -> function_ref_target_by_name state v.vname
 
 (** [wrap_fn_ref_as_closure state arg] — if [arg] is a bare [CVar]
@@ -441,13 +456,32 @@ let builtin_c_name_for_func (f : core_func) : string option =
 let scan_names (prog : core_program) :
     (string, unit) Hashtbl.t
     * (string, function_ref_target) Hashtbl.t
-    * (int, function_ref_target) Hashtbl.t =
+    * ((string * int), function_ref_target) Hashtbl.t
+    * (int, function_ref_target option) Hashtbl.t =
   let ctors = Hashtbl.create 32 in
   let function_refs = Hashtbl.create 64 in
-  let function_refs_by_def_id = Hashtbl.create 64 in
+  let function_refs_by_identity = Hashtbl.create 64 in
+  let function_refs_by_unambiguous_def_id = Hashtbl.create 64 in
+  let target_same_identity a b =
+    match (a, b) with
+    | FunctionRefUser fa, FunctionRefUser fb ->
+        fa.cf_name = fb.cf_name && fa.cf_def_id = fb.cf_def_id
+    | FunctionRefBuiltin ca, FunctionRefBuiltin cb -> ca = cb
+    | FunctionRefForeign fa, FunctionRefForeign fb ->
+        fa.fc_c_name = fb.fc_c_name && fa.fc_arg_passing = fb.fc_arg_passing
+    | _ -> false
+  in
   let register_target (f : core_func) target =
     Hashtbl.replace function_refs f.cf_name target;
-    Hashtbl.replace function_refs_by_def_id f.cf_def_id target
+    Hashtbl.replace function_refs_by_identity (f.cf_name, f.cf_def_id) target;
+    match Hashtbl.find_opt function_refs_by_unambiguous_def_id f.cf_def_id with
+    | None ->
+        Hashtbl.replace function_refs_by_unambiguous_def_id f.cf_def_id
+          (Some target)
+    | Some (Some existing) when target_same_identity existing target -> ()
+    | Some (Some _) ->
+        Hashtbl.replace function_refs_by_unambiguous_def_id f.cf_def_id None
+    | Some None -> ()
   in
   let register_user_func (f : core_func) =
     register_target f (FunctionRefUser f)
@@ -497,17 +531,27 @@ let scan_names (prog : core_program) :
       in
       visit d)
     prog;
-  (ctors, function_refs, function_refs_by_def_id)
+  ( ctors,
+    function_refs,
+    function_refs_by_identity,
+    function_refs_by_unambiguous_def_id )
 
 let make_state (prog : core_program) : state =
-  let ctors, function_refs, function_refs_by_def_id = scan_names prog in
+  let ( ctors,
+        function_refs,
+        function_refs_by_identity,
+        function_refs_by_unambiguous_def_id ) =
+    scan_names prog
+  in
   {
     counter = 0;
     hoisted = [];
     current_module = None;
     constructor_names = ctors;
     global_function_refs = function_refs;
-    global_function_refs_by_def_id = function_refs_by_def_id;
+    global_function_refs_by_identity = function_refs_by_identity;
+    global_function_refs_by_unambiguous_def_id =
+      function_refs_by_unambiguous_def_id;
   }
 
 (** Rewrite bare global function references into explicit closure eta adapters

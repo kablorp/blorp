@@ -20,6 +20,22 @@ let unsupported_to_string error =
   Printf.sprintf "unsupported Blorp C backend Core subset at %s: %s" error.path
     error.reason
 
+let truncate_diagnostic max_len text =
+  if String.length text <= max_len then text
+  else String.sub text 0 max_len ^ "..."
+
+let rec compact_callee_label (callee : Core.core) =
+  let label =
+    match callee.desc with
+    | Core.CVar variable -> Core.Var.to_string variable
+    | Core.CField (receiver, field) ->
+        compact_callee_label receiver ^ "." ^ field
+    | Core.CCall (_call_kind, inner, _args) ->
+        "call(" ^ compact_callee_label inner ^ ")"
+    | _ -> Core.pp_to_string callee
+  in
+  truncate_diagnostic 180 label
+
 let obj fields = Lsp_json.Object fields
 let arr values = Lsp_json.Array values
 let str value = Lsp_json.String value
@@ -452,6 +468,7 @@ let supported_primitive_runtime_builtins =
       "blorp_print_error";
       "blorp_print_live_object_summary";
       "blorp_process_run";
+      "blorp_process_run_inherit";
       "blorp_process_shell";
       "blorp_puts";
       "blorp_refcount";
@@ -490,6 +507,7 @@ let supported_primitive_runtime_builtins =
       "blorp_sha512_bytes";
       "blorp_signal_hangup";
       "blorp_signal_interrupt";
+      "blorp_signal_on";
       "blorp_signal_received";
       "blorp_signal_raise";
       "blorp_signal_terminate";
@@ -2285,7 +2303,7 @@ let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
   | Core.CKSelectedDirect _ -> unsupported path "selected direct call kind"
 
 let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_ty
-    ~loc call_kind (args : Core.core list) =
+    ~loc ~callee call_kind (args : Core.core list) =
   match (call_kind, args) with
   | Core.CKBuiltin "blorp_list_to_string_cb", [ list_arg ] ->
       let* callback_name =
@@ -2305,6 +2323,9 @@ let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_t
           unsupported path
             (Printf.sprintf "blorp_dict_with_capacity_custom on non-Dict type %s"
                (Types.type_to_string other)))
+  | Core.CKUnknown, _ ->
+      unsupported path
+        ("unresolved call kind for callee `" ^ compact_callee_label callee ^ "`")
   | _ -> call_kind_json ~consumed_params ~reg path ~result_ty ~loc call_kind
 
 let require_closure_create ~reg path (closure : Core.closure_create) =
@@ -2662,7 +2683,8 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
   | Core.CCall (call_kind, callee, args) ->
       let* call_kind_value =
         call_kind_json_for_call ~function_names ~consumed_params ~reg
-          (path ^ ".call_kind") ~result_ty:expr.ty ~loc:expr.loc call_kind
+          (path ^ ".call_kind") ~result_ty:expr.ty ~loc:expr.loc ~callee
+          call_kind
           args
       in
       let* callee_value =
@@ -6110,7 +6132,7 @@ let require_core_arity path name expected args =
       (Printf.sprintf "intrinsic call %s expected %d arg(s), got %d" name
          expected actual)
 
-let require_simple_call_kind path ~result_ty call_kind args =
+let require_simple_call_kind path ~result_ty ~callee call_kind args =
   match call_kind with
   | Core.CKUser ("Some", _) when is_option_type result_ty ->
       require_core_arity path "Some" 1 args
@@ -6155,7 +6177,9 @@ let require_simple_call_kind path ~result_ty call_kind args =
           | _ -> unsupported path ("builtin call " ^ name)))
   | Core.CKIntrinsic _ -> Ok ()
   | Core.CKClosure -> Ok ()
-  | Core.CKUnknown -> unsupported path "unresolved call kind"
+  | Core.CKUnknown ->
+      unsupported path
+        ("unresolved call kind for callee `" ^ compact_callee_label callee ^ "`")
   | Core.CKSelectedDirect _ -> unsupported path "selected direct call kind"
 
 let rec require_simple_expr path (expr : Core.core) =
@@ -6261,10 +6285,10 @@ let rec require_simple_expr path (expr : Core.core) =
         _callee,
         _args ) ->
       Ok ()
-  | Core.CCall (call_kind, _callee, args) ->
+  | Core.CCall (call_kind, callee, args) ->
       let* () =
         require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
-          call_kind args
+          ~callee call_kind args
       in
       require_simple_args path args
   | Core.CBin (op, left, right) ->
@@ -7225,19 +7249,19 @@ and require_function_body ~reg union_names path (expr : Core.core) =
   | Core.CCall (Core.CKBuiltin name, _callee, _args)
     when is_ranked_tensor_fill_factory_name name ->
       require_simple_expr path expr
-  | Core.CCall (Core.CKBuiltin name as call_kind, _callee, args)
+  | Core.CCall (Core.CKBuiltin name as call_kind, callee, args)
     when Option.is_some (Operation_result_metadata.find_result_bridge name) ->
       let* () =
         require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
-          call_kind args
+          ~callee call_kind args
       in
       require_call_args_body ~reg union_names path args
-  | Core.CCall (Core.CKBuiltin name as call_kind, _callee, args)
+  | Core.CCall (Core.CKBuiltin name as call_kind, callee, args)
     when Option.is_some
            (Operation_result_metadata.find_fallible_stream_terminal name) ->
       let* () =
         require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
-          call_kind args
+          ~callee call_kind args
       in
       require_call_args_body ~reg union_names path args
   | Core.CCall
@@ -7246,10 +7270,10 @@ and require_function_body ~reg union_names path (expr : Core.core) =
         _callee,
         _args ) ->
       require_simple_expr path expr
-  | Core.CCall (call_kind, _callee, args) ->
+  | Core.CCall (call_kind, callee, args) ->
       let* () =
         require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
-          call_kind args
+          ~callee call_kind args
       in
       require_call_args_body ~reg union_names path args
   | Core.CSeq (first, second) ->

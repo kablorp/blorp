@@ -64,7 +64,7 @@ let std_source_decls path =
   | Some decls -> decls
   | None -> (
       let source = read_file (find_project_file path) in
-      match Blorp.Modules.parse_source ~filename:path source with
+      match Blorp.Modules.parse_raw_source ~filename:path source with
       | Ok decls ->
           Hashtbl.replace std_source_decls_cache path decls;
           decls

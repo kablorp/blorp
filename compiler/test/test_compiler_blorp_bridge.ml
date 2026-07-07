@@ -457,7 +457,10 @@ let test_typecheck_source_request_uses_bridge_envelope () =
   Alcotest.(check string)
     "path" "src/main.brp" (string_field "path" payload);
   Alcotest.(check string) "module" "main" (string_field "module" payload);
-  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload)
+  Alcotest.(check string) "text" "func main(): 0" (string_field "text" payload);
+  Alcotest.(check bool)
+    "allow debug-only calls" false
+    (bool_field "allow_debug_only_calls" payload)
 
 let test_typecheck_source_request_can_include_import_modules () =
   let import_module =
@@ -470,12 +473,19 @@ let test_typecheck_source_request_can_include_import_modules () =
     }
   in
   let request =
-    Bridge.typecheck_source_request_json_with_imports ~path:"src/main.brp"
-      ~module_name:"main" ~text:"import:\n\toption: Option\n"
-      ~import_modules:[ import_module ]
+    Bridge.typecheck_source_request_json_with_imports_policy
+      ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+      ~allow_debug_only_calls:true
+      ~path:"src/main.brp" ~module_name:"main"
+      ~text:"import:\n\toption: Option\n" ~import_modules:[ import_module ]
     |> parse_json_exn
   in
   let payload = field "payload" request in
+  Alcotest.(check bool)
+    "allow debug-only calls" true
+    (bool_field "allow_debug_only_calls" payload);
+  Alcotest.(check string)
+    "target origin" "user" (string_field "kind" (field "origin" payload));
   match array_field "import_modules" payload with
   | [ first ] ->
       Alcotest.(check string)
@@ -721,12 +731,130 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
   | Ok _ -> Alcotest.fail "expected decoded typecheck artifact"
   | Error (_, message) -> Alcotest.fail message
 
+let test_typecheck_source_response_preserves_errors_for_invalid_typed_tree ()
+    =
+  let invalid_typed_program =
+    typed_program_json
+      [
+        Lsp_json.Object
+          [ ("kind", Lsp_json.String "not_a_decodable_typed_decl") ];
+      ]
+  in
+  let response =
+    bridge_success_json
+      (typecheck_artifact
+         ~type_errors:[ "Function 'bad' returns wrong type" ]
+         invalid_typed_program)
+  in
+  match Blorp.Compiler_blorp_bridge.typecheck_source_response_json response with
+  | Ok
+      {
+        Bridge.typechecked_errors =
+          [ "Function 'bad' returns wrong type" ];
+        typechecked_program;
+        _;
+      } ->
+      Alcotest.(check int)
+        "fallback typed program decls" 0
+        (List.length (Blorp.Typed_ast.program_decls typechecked_program))
+  | Ok _ -> Alcotest.fail "expected typecheck errors to be preserved"
+  | Error (_, message) -> Alcotest.fail message
+
 let test_typecheck_source_response_rejects_raw_phase () =
   bridge_success_json
     (typecheck_artifact ~ast_phase:"raw_parse" (typed_program_json []))
   |> Blorp.Compiler_blorp_bridge.typecheck_source_response_json
   |> expect_invalid_response_contains
        "typecheck_source artifact must have ast_phase typecheck_source"
+
+let check_typechecked_success result =
+  match result with
+  | Ok artifact -> (
+      match artifact.Bridge.typechecked_errors with
+      | [] -> artifact
+      | errors ->
+          Alcotest.fail
+            ("expected typecheck bridge success, got errors:\n"
+           ^ String.concat "\n" errors))
+  | Error (code, message) ->
+      Alcotest.fail
+        ("expected typecheck bridge success, got " ^ code ^ ": " ^ message)
+
+let test_typecheck_source_command_decodes_typed_artifact () =
+  let source =
+    "func identity(value: Int) -> Int:\n\
+    \    value\n"
+  in
+  let artifact =
+    check_typechecked_success
+      (Bridge.typecheck_source_via_command ~path:"main.brp"
+         ~module_name:"main" ~text:source)
+  in
+  Alcotest.(check int)
+    "typed decl count" 1
+    (List.length (Blorp.Typed_ast.program_decls artifact.typechecked_program));
+  Alcotest.(check bool)
+    "typecheck phase" true
+    (artifact.typechecked_phase = Bridge.TypecheckSourceProgram);
+  match artifact.typechecked_module_surface with
+  | Some surface ->
+      Alcotest.(check string)
+        "surface module" "main" surface.Module_surface.module_name
+  | None -> Alcotest.fail "expected typecheck artifact to include module surface"
+
+let test_typecheck_source_command_decodes_pure_literal_return () =
+  let source = "pure func answer() -> Int:\n    1\n" in
+  let artifact =
+    check_typechecked_success
+      (Bridge.typecheck_source_via_command ~path:"dep.brp"
+         ~module_name:"./dep" ~text:source)
+  in
+  Alcotest.(check int)
+    "typed decl count" 1
+    (List.length (Blorp.Typed_ast.program_decls artifact.typechecked_program))
+
+let test_typecheck_source_command_decodes_annotated_global () =
+  let source = "VALUE: Int = 1\n" in
+  let artifact =
+    check_typechecked_success
+      (Bridge.typecheck_source_via_command ~path:"main.brp"
+         ~module_name:"main" ~text:source)
+  in
+  Alcotest.(check int)
+    "typed decl count" 1
+    (List.length (Blorp.Typed_ast.program_decls artifact.typechecked_program))
+
+let test_typecheck_source_command_uses_import_modules () =
+  let import_module =
+    {
+      Bridge.typecheck_import_path = "dep.brp";
+      typecheck_import_module_name = "dep";
+      typecheck_import_module_path = "dep";
+      typecheck_import_text = "pure func answer() -> Int:\n    1\n";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let source =
+    "import:\n\
+    \    dep as Dep\n\n\
+     func identity() -> Int:\n\
+    \    Dep.answer()\n"
+  in
+  let artifact =
+    check_typechecked_success
+      (Bridge.typecheck_source_via_command_with_imports
+         ~import_modules:[ import_module ] ~path:"main.brp"
+         ~module_name:"main" ~text:source)
+  in
+  let has_alias_binding =
+    List.exists
+      (fun (binding : Blorp.Session.import_binding) ->
+        String.equal binding.local_name "Dep"
+        && String.equal binding.module_path "dep"
+        && binding.original_name = None)
+      artifact.typechecked_import_bindings
+  in
+  Alcotest.(check bool) "import alias binding" true has_alias_binding
 
 let test_parse_sources_response_decodes_items () =
   let response =
@@ -1666,8 +1794,23 @@ let suite =
         Alcotest.test_case
           "typecheck_source response decodes typed program artifact" `Quick
           test_typecheck_source_response_decodes_typed_program_artifact;
+        Alcotest.test_case
+          "typecheck_source response preserves errors for invalid typed tree"
+          `Quick
+          test_typecheck_source_response_preserves_errors_for_invalid_typed_tree;
         Alcotest.test_case "typecheck_source response rejects raw phase" `Quick
           test_typecheck_source_response_rejects_raw_phase;
+        Alcotest.test_case
+          "typecheck_source command decodes typed artifact" `Quick
+          test_typecheck_source_command_decodes_typed_artifact;
+        Alcotest.test_case
+          "typecheck_source command decodes pure literal return" `Quick
+          test_typecheck_source_command_decodes_pure_literal_return;
+        Alcotest.test_case
+          "typecheck_source command decodes annotated global" `Quick
+          test_typecheck_source_command_decodes_annotated_global;
+        Alcotest.test_case "typecheck_source command uses import modules"
+          `Quick test_typecheck_source_command_uses_import_modules;
         Alcotest.test_case "parse_sources response decodes items" `Quick
           test_parse_sources_response_decodes_items;
         Alcotest.test_case "CLI run response decodes handled" `Quick

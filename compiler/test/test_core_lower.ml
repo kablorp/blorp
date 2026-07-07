@@ -1924,10 +1924,10 @@ let test_core_lower_call_uses_resolved_call_def_id () =
               "callee vdef_id remains local to callee identity" None v.vdef_id
         | _ -> Alcotest.fail "expected CCall with CVar callee"))
 
-(** Phase 6 bridge: qualified calls must keep the module-field shape for
-    monomorphization and intrinsic dispatch, but still carry the selected
-    callable id for later Core resolution without mutating the module alias. *)
-let test_core_lower_qualified_call_carries_selected_call_kind () =
+(** Bridge-selected IDs are local to a typecheck request. Imported qualified
+    calls must keep the module-field shape for monomorphization and intrinsic
+    dispatch, then let module-aware Core resolution choose the target. *)
+let test_core_lower_qualified_imported_call_ignores_selected_call_id () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
         let module_ty = TyNamed ("Module", []) in
@@ -1963,7 +1963,7 @@ let test_core_lower_qualified_call_carries_selected_call_kind () =
         let core = lower_expr call in
         match core.desc with
         | CCall
-            ( CKSelectedDirect 654,
+            ( CKUnknown,
               {
                 desc =
                   CField
@@ -1975,14 +1975,13 @@ let test_core_lower_qualified_call_carries_selected_call_kind () =
             ()
         | _ ->
             Alcotest.fail
-              "expected qualified call to preserve CField and carry selected \
-               callable id on call kind"))
+              "expected imported qualified call to preserve CField without \
+               trusting bridge-local callable id"))
 
 (** Annotated local bindings rewrap the initializer with the declared slot type.
-    That must not discard resolved-call metadata, or qualified imported calls
-    lower as closure field dispatch (e.g. [F->fixed]) instead of the selected
-    function. *)
-let test_core_lower_annotated_binding_preserves_resolved_call_def_id () =
+    That must keep the imported module-field callee shape so the later
+    module-aware resolver does not mistake it for closure field dispatch. *)
+let test_core_lower_annotated_binding_preserves_imported_call_shape () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
         let module_ty = TyNamed ("Module", []) in
@@ -2023,7 +2022,7 @@ let test_core_lower_annotated_binding_preserves_resolved_call_def_id () =
                   {
                     desc =
                       CCall
-                        ( CKSelectedDirect 777,
+                        ( CKUnknown,
                           {
                             desc =
                               CField
@@ -2381,10 +2380,10 @@ let suite =
           test_core_lower_ufcs_no_suffix;
         Alcotest.test_case "core_lower call uses resolved_call def_id" `Quick
           test_core_lower_call_uses_resolved_call_def_id;
-        Alcotest.test_case "core_lower qualified call carries selected kind"
-          `Quick test_core_lower_qualified_call_carries_selected_call_kind;
-        Alcotest.test_case "annotated binding preserves resolved call" `Quick
-          test_core_lower_annotated_binding_preserves_resolved_call_def_id;
+        Alcotest.test_case "core_lower qualified import ignores selected id"
+          `Quick test_core_lower_qualified_imported_call_ignores_selected_call_id;
+        Alcotest.test_case "annotated binding preserves imported call shape" `Quick
+          test_core_lower_annotated_binding_preserves_imported_call_shape;
         Alcotest.test_case "non-ufcs ident has no vdef_id" `Quick
           test_core_lower_non_ufcs_ident_has_no_def_id;
       ] );

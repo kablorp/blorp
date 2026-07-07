@@ -66,7 +66,10 @@ The graph is decoded by OCaml and then consumed by the OCaml middle:
   - `finalized_cli_frontend_graph_sources_or_exit`
   - `module_origin_of_cli_frontend_module_origin`
 - `compiler/lib/modules.ml`
-  - `parse_source_with_blorp_bridge`
+  - `parse_source_artifact_with_blorp_bridge`
+  - `parse_raw_source_artifact`
+  - `parse_typecheck_source_artifact`
+  - `parse_raw_source`
   - `parse_typecheck_source`
   - module parse-cache preload and validation helpers
 - `compiler/lib/typecheck.ml`
@@ -554,8 +557,8 @@ Functions to change:
   - `cli_frontier_frontend_module_graph` should preserve preloaded finalized
     programs exactly as provided by the graph
 - `compiler/lib/modules.ml`
-  - `parse_source_with_blorp_bridge` should request the correct AST phase based
-    on caller intent
+  - `parse_source_artifact_at_phase` should request the correct AST phase based
+    on caller intent and preserve the parser-produced module surface
   - direct typecheck callers should request typecheck source
   - raw parser/tooling callers should request raw parse
 
@@ -689,9 +692,11 @@ Functions to audit:
   - `compiler/lib/lsp/lsp_completion.ml`
   - `compiler/lib/lsp/lsp_references.ml`
   - `compiler/lib/lsp/lsp_inlay_hint.ml`
-- Shared parse entry:
-  - `Modules.parse_source`
-  - any direct callers that need raw source should opt into raw phase explicitly
+- Shared raw parse entry:
+  - `Modules.parse_raw_source`
+  - `Modules.parse_raw_source_artifact`
+  - direct callers that need raw source should make that raw phase visible in
+    the helper name at the call site
 
 Tests to add or update:
 

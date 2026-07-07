@@ -26,13 +26,21 @@ import:
 	compiler_lexer: compiler_lex
 	compiler_module_surface: module_surface_for_program
 	compiler_module_surface_json: module_surface_to_json
-	compiler_parsed_ast: ParsedProgramPhase(TypecheckSourceProgram), parsed_program_phase_name
+	compiler_parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl),
+		ParsedImportDecl,
+		ParsedProgram,
+		ParsedProgramPhase(TypecheckSourceProgram),
+		parsed_program_phase_name
 	compiler_parser: parse_compiler_source
 	compiler_source: CompilerSourceFile, compiler_source_file
 	compiler_source_ast_finalize: finalize_typecheck_source_program
 	compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
 	compiler_typecheck_decl: compiler_typecheck_program, compiler_typecheck_program_with_import_modules
-	compiler_typecheck_state: CompilerImportBinding, compiler_typecheck_state_empty
+	compiler_typecheck_state:
+		CompilerImportBinding,
+		compiler_typecheck_state_for_origin,
+		compiler_typecheck_state_with_debug_calls
 	compiler_typed_ast_json: compiler_typed_program_to_json
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -55,6 +63,14 @@ record TypecheckImportModule {
 	module_path: String,
 	text: String,
 	origin: CompilerModuleOrigin
+}
+
+
+record TypecheckResolvedImport {
+	from_path: String,
+	from_module: String,
+	import_path: String,
+	resolved_module: String
 }
 
 
@@ -216,6 +232,55 @@ private pure func import_modules_field(
 					Ok(modules)
 
 
+private pure func resolved_import_from_json(
+	value: JsonValue,
+) -> Result[TypecheckResolvedImport, TypecheckBridgeDispatchError]:
+	match value:
+		JsonObject(_):
+			from_path ?= string_field(value, "from_path")
+			from_module ?= string_field(value, "from_module")
+			import_path ?= string_field(value, "import_path")
+			resolved_module ?= string_field(value, "resolved_module")
+
+			Ok({
+				from_path = from_path,
+				from_module = from_module,
+				import_path = import_path,
+				resolved_module = resolved_module
+			})
+		_:
+			Err(ExpectedRequestField("resolved_imports item", "an object"))
+
+
+private pure func resolved_imports_field(
+	value: JsonValue,
+) -> Result[List[TypecheckResolvedImport], TypecheckBridgeDispatchError]:
+	match get_field(value, "resolved_imports"):
+		None:
+			Ok([])
+		Some(field):
+			items ?= as_array(field).to_result(ExpectedRequestField("resolved_imports", "an array"))
+			var imports: List[TypecheckResolvedImport] = []
+			var error: Option[TypecheckBridgeDispatchError] = None
+
+			for item in items:
+				match error:
+					Some(_):
+						break
+					None:
+						match resolved_import_from_json(item):
+							Ok(resolved):
+								imports = imports.append(resolved)
+							Err(err):
+								error = Some(err)
+
+			match error:
+				Some(err):
+					Err(err)
+				None:
+					Ok(imports)
+
+
 private pure func comment_json(trivia: CompilerTrivia, trailing: Bool) -> JsonValue:
 	JsonObject([
 		("text", JsonString(trivia.text)),
@@ -258,14 +323,6 @@ private pure func source_comment_jsons(source: CompilerSourceFile) -> JsonValue:
 	JsonVector(comments)
 
 
-private pure func strings_to_json(items: List[String]) -> JsonValue:
-	var values: List[JsonValue] = []
-
-	for item in items:
-		values = values.append(JsonString(item))
-
-	JsonVector(values)
-
 
 private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
 	match value:
@@ -283,21 +340,123 @@ private pure func import_binding_to_json(binding: CompilerImportBinding) -> Json
 	])
 
 
-private pure func import_bindings_to_json(bindings: List[CompilerImportBinding]) -> JsonValue:
-	var values: List[JsonValue] = []
+private pure func owned_parsed_decl(decl: ParsedDecl) -> ParsedDecl:
+	decl
 
-	for binding in bindings:
-		values = values.append(import_binding_to_json(binding))
 
-	JsonVector(values)
+private pure func parsed_program_with_owned_decls(program: ParsedProgram) -> ParsedProgram:
+	{
+		source = program.source,
+		decls = program.decls.map(owned_parsed_decl),
+		diagnostics = program.diagnostics
+	}
+
+
+private pure func resolved_module_for_import(
+	from_path: String,
+	from_module: String,
+	resolved_imports: List[TypecheckResolvedImport],
+	import_path: String,
+) -> String:
+	var result: String = import_path
+
+	for resolved in resolved_imports:
+		if (
+			resolved.from_path == from_path
+			and resolved.from_module == from_module
+			and resolved.import_path == import_path
+		):
+			result = resolved.resolved_module
+			break
+
+	result
+
+
+private pure func rewrite_import_decl_path(
+	from_path: String,
+	from_module: String,
+	resolved_imports: List[TypecheckResolvedImport],
+	import_decl: ParsedImportDecl,
+) -> ParsedImportDecl:
+	{ import_decl |
+		module_path = resolved_module_for_import(
+			from_path,
+			from_module,
+			resolved_imports,
+			import_decl.module_path,
+		)
+	}
+
+
+private pure func rewrite_import_decl_paths(
+	from_path: String,
+	from_module: String,
+	resolved_imports: List[TypecheckResolvedImport],
+	imports: List[ParsedImportDecl],
+) -> List[ParsedImportDecl]:
+	imports.map(
+		func(import_decl): rewrite_import_decl_path(
+			from_path,
+			from_module,
+			resolved_imports,
+			import_decl,
+		),
+	)
+
+
+private pure func rewrite_decl_import_paths(
+	from_path: String,
+	from_module: String,
+	resolved_imports: List[TypecheckResolvedImport],
+	decl: ParsedDecl,
+) -> ParsedDecl:
+	match decl:
+		ImportBlockParsedDecl(imports, span):
+			ImportBlockParsedDecl(
+				rewrite_import_decl_paths(from_path, from_module, resolved_imports, imports),
+				span,
+			)
+		PrivateParsedDecl(inner, span):
+			PrivateParsedDecl(
+				rewrite_decl_import_paths(from_path, from_module, resolved_imports, inner),
+				span,
+			)
+		_:
+			decl
+
+
+private pure func rewrite_program_import_paths(
+	from_path: String,
+	from_module: String,
+	resolved_imports: List[TypecheckResolvedImport],
+	program: ParsedProgram,
+) -> ParsedProgram:
+	{ program |
+		decls = program.decls.map(
+			func(decl): rewrite_decl_import_paths(
+				from_path,
+				from_module,
+				resolved_imports,
+				decl,
+			),
+		)
+	}
+
 
 
 private pure func importable_module_from_request(
 	module: TypecheckImportModule,
+	resolved_imports: List[TypecheckResolvedImport],
 ) -> CompilerImportableModule:
 	source = compiler_source_file(module.path, module.module_name, module.text)
 	raw_program = parse_compiler_source(source)
-	final_program = finalize_typecheck_source_program(raw_program)
+	rewritten = rewrite_program_import_paths(
+		module.path,
+		module.module_name,
+		resolved_imports,
+		raw_program,
+	)
+	final_program = parsed_program_with_owned_decls(finalize_typecheck_source_program(rewritten))
 
 	compiler_importable_module(
 		module.module_path,
@@ -309,8 +468,9 @@ private pure func importable_module_from_request(
 
 private pure func importable_modules_from_request(
 	modules: List[TypecheckImportModule],
+	resolved_imports: List[TypecheckResolvedImport],
 ) -> List[CompilerImportableModule]:
-	modules.map(importable_module_from_request)
+	modules.map(func(module): importable_module_from_request(module, resolved_imports))
 
 
 private pure func typed_source_artifact(
@@ -318,18 +478,26 @@ private pure func typed_source_artifact(
 	module_name: String,
 	text: String,
 	include_comments: Bool,
+	allow_debug_only_calls: Bool,
+	origin: CompilerModuleOrigin,
 	import_modules: List[TypecheckImportModule],
+	resolved_imports: List[TypecheckResolvedImport],
 ) -> JsonValue:
 	source = compiler_source_file(path, module_name, text)
 	raw_program = parse_compiler_source(source)
-	final_program = finalize_typecheck_source_program(raw_program)
+	rewritten = rewrite_program_import_paths(path, module_name, resolved_imports, raw_program)
+	final_program = finalize_typecheck_source_program(rewritten)
+	initial_state = compiler_typecheck_state_with_debug_calls(
+		compiler_typecheck_state_for_origin(origin),
+		allow_debug_only_calls,
+	)
 	typed_result = if import_modules.length() == 0:
-		compiler_typecheck_program(compiler_typecheck_state_empty(), final_program)
+		compiler_typecheck_program(initial_state, final_program)
 	else:
 		compiler_typecheck_program_with_import_modules(
-			compiler_typecheck_state_empty(),
+			initial_state,
 			final_program,
-			importable_modules_from_request(import_modules),
+			importable_modules_from_request(import_modules, resolved_imports),
 		)
 
 	var fields: List[(String, JsonValue)] = [
@@ -337,8 +505,8 @@ private pure func typed_source_artifact(
 		("module", JsonString(module_name)),
 		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
 		("typed_program", compiler_typed_program_to_json(typed_result.program)),
-		("type_errors", strings_to_json(typed_result.state.errors)),
-		("import_bindings", import_bindings_to_json(typed_result.state.import_bindings)),
+		("type_errors", JsonVector(typed_result.state.errors.map(func(item: String): JsonString(item)))),
+		("import_bindings", JsonVector(typed_result.state.import_bindings.map(import_binding_to_json))),
 		("module_surface", module_surface_to_json(module_surface_for_program(final_program))),
 	]
 
@@ -355,14 +523,20 @@ private pure func handle_typecheck_source(
 	module_name ?= string_field(body, "module")
 	text ?= string_field(body, "text")
 	import_modules ?= import_modules_field(body)
+	resolved_imports ?= resolved_imports_field(body)
 	include_comments = optional_bool_field(body, "include_comments", True)
+	allow_debug_only_calls = optional_bool_field(body, "allow_debug_only_calls", False)
+	origin ?= optional_origin_field(body)
 
 	Ok(bridge_success_json(typed_source_artifact(
 			path,
 			module_name,
 			text,
 			include_comments,
+			allow_debug_only_calls,
+			origin,
 			import_modules,
+			resolved_imports,
 		)))
 
 

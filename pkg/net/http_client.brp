@@ -2,20 +2,7 @@ import:
 	bytes as B
 	net/http: Header, Response, get_header
 	net/tcp as TCP
-	net/tls as TLS
 	net/url as U: effective_port, is_https
-
-
-private func tcp_port_for_message(port_num: Int, context: String) -> Result[TCP.Port, String]:
-	match TCP.port(port_num):
-		Ok(remote): Ok(remote)
-		Err(err): Err(context + ": " + TCP.message(err))
-
-
-private func tcp_dns_name_for_message(host: String, context: String) -> Result[TCP.DnsName, String]:
-	match TCP.dns_name(host):
-		Ok(name): Ok(name)
-		Err(err): Err(context + ": " + TCP.message(err))
 
 
 ---
@@ -72,11 +59,14 @@ private func request_with_redirects(
 					match get_header(resp.headers, "Location"):
 						Some(location):
 							var new_url: String = location.substring(0, location.length())
+
 							if not location.starts_with("http"):
 								match U.parse(url):
 									Ok(parsed):
 										new_url = parsed.scheme + "://" + parsed.host + location
-									Err(_): void
+									Err(_):
+										void
+
 							request_with_redirects(
 								method,
 								new_url,
@@ -99,14 +89,19 @@ private pure func has_crlf(s: String) -> Bool:
 private pure func validate_headers(headers: List[Header]) -> Result[Bool, String]:
 	var j: Int = 0
 	var valid: Bool = True
+
 	while j < headers.length() and valid:
 		match headers.get(j):
 			Some(hdr):
 				h: Header = hdr
+
 				if has_crlf(h.name) or has_crlf(h.value):
 					valid = False
-			None: void
+			None:
+				void
+
 		j += 1
+
 	if valid:
 		Ok(True)
 	else:
@@ -120,10 +115,12 @@ private func do_request(
 	body: Option[String],
 ) -> Result[Response, String]:
 	match U.parse(url):
-		Err(e): Err(e)
+		Err(e):
+			Err(e)
 		Ok(parsed):
 			port: Int = effective_port(parsed)
 			host: String = parsed.host.substring(0, parsed.host.length())
+
 			if (
 				has_crlf(parsed.path)
 				or has_crlf(parsed.query)
@@ -132,41 +129,58 @@ private func do_request(
 				Err("invalid URL: contains CR/LF")
 			else:
 				match validate_headers(headers):
-					Err(e): Err(e)
+					Err(e):
+						Err(e)
 					Ok(_):
 						var path: String = "/"
+
 						if parsed.path.length() > 0:
 							path = parsed.path.substring(0, parsed.path.length())
+
 						var query_part: String = ""
+
 						if parsed.query.length() > 0:
 							query_part = "?" + parsed.query
+
 						request_line: String = method + " " + path + query_part + " HTTP/1.1\r\n"
 						var header_str: String = request_line
 						header_str = header_str + "Host: " + host + "\r\n"
 						header_str += "Connection: close\r\n"
 						header_str += "User-Agent: blorp/1.0\r\n"
+
 						match body:
 							Some(b):
 								header_str = header_str + "Content-Length: " + to_string(
 									b.length(),
 								) + "\r\n"
-							None: void
+							None:
+								void
+
 						var i: Int = 0
+
 						while i < headers.length():
 							match headers.get(i):
 								Some(h):
 									hdr: Header = h
 									header_str = header_str + hdr.name + ": " + hdr.value + "\r\n"
-								None: void
+								None:
+									void
+
 							i += 1
+
 						header_str += "\r\n"
 						var request_data: Bytes = header_str.to_bytes()
+
 						match body:
 							Some(b):
 								request_data = B.append(request_data, b.to_bytes())
-							None: void
+							None:
+								void
+
 						if is_https(parsed):
-							do_tls_request(host, port, request_data)
+							Err(
+								"HTTPS is not implemented in pkg/net/http_client; use " + "std/net/tls scoped sessions",
+							)
 						else:
 							do_tcp_request(host, port, request_data)
 
@@ -177,99 +191,10 @@ private func do_tcp_request(
 	request_data: Bytes,
 ) -> Result[Response, String]:
 	match tcp_request_bytes(host, port, request_data):
-		Ok(raw): parse_http_response(raw)
-		Err(e): Err("TCP request failed: " + TCP.message(e))
-
-
-private func do_tls_request(
-	host: String,
-	port: Int,
-	request_data: Bytes,
-) -> Result[Response, String]:
-	if not TLS.native_available():
-		Err("HTTPS requires TLS resource support: native TLS support is not implemented yet")
-	else:
-		match tls_request_bytes(host, port, request_data):
-			Ok(raw): parse_http_response(raw)
-			Err(e): Err(e)
-
-
-private func tls_request_bytes(
-	host: String,
-	port: Int,
-	request_data: Bytes,
-) -> Result[Bytes, String]:
-	remote ?= tcp_port_for_message(port, "HTTPS TCP connect failed")
-	match TCP.parse_ip(host):
-		Ok(address):
-			with stream ?= TCP.connect_ip(
-				address,
-				remote,
-			) on err => "HTTPS TCP connect failed: " + TCP.message(err):
-				with session ?= TLS.connect(
-					stream,
-					host,
-				) on err => "HTTPS requires TLS resource support: " + TLS.message(err):
-					var write_error: Option[String] = None
-					match TLS.write_all(session, request_data):
-						Ok(_): void
-						Err(e): write_error = Some("HTTPS TLS write failed: " + TLS.message(e))
-					match write_error:
-						Some(e): Err(e)
-						None:
-							var buf: Bytes = B.bytes(0)
-							var done: Bool = False
-							var read_error: Option[String] = None
-							while not done:
-								match TLS.read(session, 8192):
-									Ok(chunk):
-										if B.length(chunk) == 0:
-											done = True
-										else:
-											buf = B.append(buf, chunk)
-									Err(e):
-										read_error = Some(
-											"HTTPS TLS read failed: " + TLS.message(e),
-										)
-										done = True
-							match read_error:
-								Some(e): Err(e)
-								None: Ok(buf)
-		Err(_):
-			name ?= tcp_dns_name_for_message(host, "HTTPS TCP connect failed")
-			with stream ?= TCP.connect_name(
-				name,
-				remote,
-			) on err => "HTTPS TCP connect failed: " + TCP.message(err):
-				with session ?= TLS.connect(
-					stream,
-					host,
-				) on err => "HTTPS requires TLS resource support: " + TLS.message(err):
-					var write_error: Option[String] = None
-					match TLS.write_all(session, request_data):
-						Ok(_): void
-						Err(e): write_error = Some("HTTPS TLS write failed: " + TLS.message(e))
-					match write_error:
-						Some(e): Err(e)
-						None:
-							var buf: Bytes = B.bytes(0)
-							var done: Bool = False
-							var read_error: Option[String] = None
-							while not done:
-								match TLS.read(session, 8192):
-									Ok(chunk):
-										if B.length(chunk) == 0:
-											done = True
-										else:
-											buf = B.append(buf, chunk)
-									Err(e):
-										read_error = Some(
-											"HTTPS TLS read failed: " + TLS.message(e),
-										)
-										done = True
-							match read_error:
-								Some(e): Err(e)
-								None: Ok(buf)
+		Ok(raw):
+			parse_http_response(raw)
+		Err(e):
+			Err("TCP request failed: " + TCP.message(e))
 
 
 private func tcp_request_bytes(
@@ -278,19 +203,26 @@ private func tcp_request_bytes(
 	request_data: Bytes,
 ) -> Result[Bytes, TCP.TcpError]:
 	remote ?= TCP.port(port)
+
 	match TCP.parse_ip(host):
 		Ok(address):
 			with stream ?= TCP.connect_ip(address, remote):
 				var write_error: Option[TCP.TcpError] = None
+
 				match TCP.write_all(stream, request_data):
-					Ok(_): void
-					Err(e): write_error = Some(e)
+					Ok(_):
+						void
+					Err(e):
+						write_error = Some(e)
+
 				match write_error:
-					Some(e): Err(e)
+					Some(e):
+						Err(e)
 					None:
 						var buf: Bytes = B.bytes(0)
 						var done: Bool = False
 						var read_error: Option[TCP.TcpError] = None
+
 						while not done:
 							match TCP.read(stream, 8192):
 								Ok(chunk):
@@ -301,22 +233,32 @@ private func tcp_request_bytes(
 								Err(e):
 									read_error = Some(e)
 									done = True
+
 						match read_error:
-							Some(e): Err(e)
-							None: Ok(buf)
+							Some(e):
+								Err(e)
+							None:
+								Ok(buf)
 		Err(_):
 			name ?= TCP.dns_name(host)
+
 			with stream ?= TCP.connect_name(name, remote):
 				var write_error: Option[TCP.TcpError] = None
+
 				match TCP.write_all(stream, request_data):
-					Ok(_): void
-					Err(e): write_error = Some(e)
+					Ok(_):
+						void
+					Err(e):
+						write_error = Some(e)
+
 				match write_error:
-					Some(e): Err(e)
+					Some(e):
+						Err(e)
 					None:
 						var buf: Bytes = B.bytes(0)
 						var done: Bool = False
 						var read_error: Option[TCP.TcpError] = None
+
 						while not done:
 							match TCP.read(stream, 8192):
 								Ok(chunk):
@@ -327,23 +269,30 @@ private func tcp_request_bytes(
 								Err(e):
 									read_error = Some(e)
 									done = True
+
 						match read_error:
-							Some(e): Err(e)
-							None: Ok(buf)
+							Some(e):
+								Err(e)
+							None:
+								Ok(buf)
 
 
 private func parse_http_response(raw: Bytes) -> Result[Response, String]:
 	raw_str: String = B.to_string(raw)
 	sep_idx: Int = raw_str.raw_index_of("\r\n\r\n")
+
 	if sep_idx == -1:
 		Err("malformed response: missing header terminator")
 	else:
 		header_section: String = raw_str.substring(0, sep_idx)
 		body_start: Int = sep_idx + 4
 		var body_bytes: Bytes = B.bytes(0)
+
 		if body_start < B.length(raw):
 			body_bytes = B.slice(raw, body_start, B.length(raw) - body_start)
+
 		header_lines: List[String] = header_section.split("\r\n")
+
 		if header_lines.length() == 0:
 			Err("malformed response: empty headers")
 		else:
@@ -360,6 +309,7 @@ private func parse_status_line(
 	body_bytes: Bytes,
 ) -> Result[Response, String]:
 	first_space: Int = status_line.raw_index_of(" ")
+
 	if first_space == -1:
 		Err("malformed status line")
 	else:
@@ -370,6 +320,7 @@ private func parse_status_line(
 		second_space: Int = after_version.raw_index_of(" ")
 		var code_str: String = ""
 		var reason: String = ""
+
 		if second_space == -1:
 			code_str = after_version.substring(0, after_version.length())
 			reason = ""
@@ -379,14 +330,17 @@ private func parse_status_line(
 				second_space + 1,
 				after_version.length() - second_space - 1,
 			)
+
 		match code_str.parse_int():
 			Some(code):
 				var hdrs: List[Header] = []
 				var i: Int = 1
+
 				while i < header_lines.length():
 					match header_lines.get(i):
 						Some(line):
 							colon_idx: Int = line.raw_index_of(": ")
+
 							if colon_idx > 0:
 								hname: String = line.substring(0, colon_idx)
 								hvalue: String = line.substring(
@@ -397,8 +351,11 @@ private func parse_status_line(
 									name = hname,
 									value = hvalue,
 								})
-						None: void
+						None:
+							void
+
 					i += 1
+
 				resp: Response = {
 					status_code = code,
 					status_text = reason,

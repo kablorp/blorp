@@ -323,6 +323,41 @@ let test_inlines_append_with_substituted_variable_receiver () =
        (fun name -> String.starts_with ~prefix:"__std_inline_self" name)
        (borrow_c_names body))
 
+let test_ignores_unrelated_call_with_same_def_id () =
+  let call =
+    user_call ~def_id:(Some 12) "PrivateImplMethodSurfaceSource"
+      [ int 1; int 2 ] ty_int
+  in
+  let body =
+    rewritten_body [ decl_func (target_append ()); decl_func (caller call) ]
+  in
+  match body.desc with
+  | CCall (CKUser ("PrivateImplMethodSurfaceSource", Some 12), _, _) -> ()
+  | _ ->
+      Alcotest.failf "expected unrelated call to remain unchanged:\n%s"
+        (Blorp.Core.pp_to_string body)
+
+let test_same_def_id_caller_still_rewrites_body () =
+  let call =
+    user_call ~def_id:(Some 10) "std_list__get_or__mono_Int"
+      [ var "xs" (ty_list ty_int); int 0; int 99 ]
+      ty_int
+  in
+  let same_id_caller =
+    func ~name:"unrelated_same_id" ~def_id:10 ~params:[] ~body:call
+      ~return_ty:ty_int ()
+  in
+  let rewritten =
+    Blorp.Core_std_inline.rewrite_program
+      [ decl_func (target_get_or ()); decl_func same_id_caller ]
+  in
+  match find_func_body "unrelated_same_id" rewritten with
+  | Some body ->
+      Alcotest.(check int)
+        "same-def-id non-target caller still rewrites target calls in its body" 0
+        (count_target_calls body)
+  | None -> Alcotest.fail "expected same-def-id caller body"
+
 let test_clones_resource_scope_binding_hygienically () =
   let target_body =
     resource_scope "default" ty_int (var "default" ty_int)
@@ -457,6 +492,10 @@ let suite =
           test_does_not_inline_inside_std_list_module;
         Alcotest.test_case "inlines_append_with_substituted_variable_receiver"
           `Quick test_inlines_append_with_substituted_variable_receiver;
+        Alcotest.test_case "ignores_unrelated_call_with_same_def_id" `Quick
+          test_ignores_unrelated_call_with_same_def_id;
+        Alcotest.test_case "same_def_id_caller_still_rewrites_body" `Quick
+          test_same_def_id_caller_still_rewrites_body;
         Alcotest.test_case "clones_resource_scope_binding_hygienically" `Quick
           test_clones_resource_scope_binding_hygienically;
         Alcotest.test_case "pipeline_expands_real_std_list_calls" `Quick

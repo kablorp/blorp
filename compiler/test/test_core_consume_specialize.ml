@@ -381,6 +381,31 @@ let test_rewrites_safe_self_replacement_call () =
         (clone_body_drops_param clone)
   | None -> Alcotest.fail "expected consuming clone"
 
+let test_clone_identity_uses_name_and_def_id () =
+  let reg = expr_reg () in
+  let other =
+    func ~def_id:10 "other_rewrite"
+      [ param "expr" ty_expr; param "pass" ty_int ]
+      ty_expr (lit_expr 99)
+  in
+  let rewritten =
+    Blorp.Core_consume_specialize.rewrite_program ~reg
+      [
+        expr_type_decl_core;
+        func_decl other;
+        func_decl (rewrite_func (lit_expr 7));
+        func_decl (run_func ());
+      ]
+  in
+  Alcotest.(check (list string))
+    "clone inserted only for named target"
+    [ "other_rewrite"; "rewrite_expr"; "rewrite_expr__consume_arg0"; "run" ]
+    (function_names rewritten);
+  Alcotest.(check (list string))
+    "assignment calls named target clone"
+    [ "rewrite_expr__consume_arg0" ]
+    (assignment_call_names rewritten)
+
 let test_consuming_clone_owns_recursive_match_fields () =
   let _, rewritten = rewrite_program (recursive_rewrite_body ()) in
   match find_func "rewrite_expr__consume_arg0" rewritten with
@@ -466,6 +491,8 @@ let suite =
       [
         Alcotest.test_case "safe self replacement call" `Quick
           test_rewrites_safe_self_replacement_call;
+        Alcotest.test_case "clone identity uses name and def id" `Quick
+          test_clone_identity_uses_name_and_def_id;
         Alcotest.test_case "clone owns recursive match fields" `Quick
           test_consuming_clone_owns_recursive_match_fields;
         Alcotest.test_case "clone owns branch-swapped recursive match fields"

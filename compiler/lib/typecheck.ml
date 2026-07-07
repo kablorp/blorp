@@ -2818,7 +2818,7 @@ let module_exports_for_import (m : Modules.loaded_module) : (string * decl) list
     =
   match Modules.get_typed_decls m.name with
   | Some typed_decls ->
-      Modules.collect_exports (semantic_export_program typed_decls)
+      Modules.semantic_exports_from_program (semantic_export_program typed_decls)
   | None -> m.exports
 
 (** Process a selectively imported trait or trait method.

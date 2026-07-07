@@ -1,7 +1,7 @@
 import:
 	../compiler_typecheck_bridge: handle_request
 	json:
-		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
 		as_bool,
 		as_string,
@@ -93,6 +93,106 @@ pure func artifact_array_field(value: JsonValue, name: String) -> List[JsonValue
 			[]
 
 
+pure func typed_program_decls(value: JsonValue) -> List[JsonValue]:
+	match artifact_field(value, "typed_program"):
+		Some(typed_program):
+			match get_field(typed_program, "decls"):
+				Some(decls):
+					as_array(decls).get_or([])
+				None:
+					[]
+		None:
+			[]
+
+
+pure func json_is_non_null(value: JsonValue) -> Bool:
+	match value:
+		JsonNull:
+			False
+		_:
+			True
+
+
+pure func typed_program_has_impl_method_body(value: JsonValue) -> Bool:
+	var found: Bool = False
+
+	for decl in typed_program_decls(value):
+		if string_field(decl, "kind") == "impl":
+			match get_field(decl, "info"):
+				Some(info):
+					match get_field(info, "methods"):
+						Some(methods_value):
+							methods: List[JsonValue] = as_array(methods_value).get_or([])
+
+							for method in methods:
+								match get_field(method, "body"):
+									Some(body):
+										if json_is_non_null(body):
+											found = True
+											break
+									None:
+										void
+						None:
+							void
+				None:
+					void
+
+		if found:
+			break
+
+	found
+
+
+pure func resolved_call_has_alias_source(
+	value: JsonValue,
+	callee_name: String,
+	source_name: String,
+) -> Bool:
+	(
+		string_field(value, "callee_name") == callee_name
+		and string_field(value, "source_name") == source_name
+	)
+
+
+pure func typed_program_body_call_has_alias_source(
+	value: JsonValue,
+	callee_name: String,
+	source_name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for decl in typed_program_decls(value):
+		if string_field(decl, "kind") == "function":
+			match get_field(decl, "info"):
+				Some(info):
+					match get_field(info, "body"):
+						Some(body):
+							match get_field(body, "info"):
+								Some(expr_info):
+									match get_field(expr_info, "resolved_call"):
+										Some(resolved_call):
+											if resolved_call_has_alias_source(
+												resolved_call,
+												callee_name,
+												source_name,
+											):
+												found = True
+												break
+										None:
+											void
+								None:
+									void
+						None:
+							void
+				None:
+					void
+
+		if found:
+			break
+
+	found
+
+
 pure func import_binding_exists(
 	bindings: List[JsonValue],
 	local_name: String,
@@ -151,6 +251,18 @@ pure func typecheck_source_request_with_imports(
 		]))
 
 
+pure func typecheck_source_request_with_debug(
+	source: String,
+	allow_debug_only_calls: Bool,
+) -> String:
+	request_json("typecheck_source", JsonObject([
+			("path", JsonString("main.brp")),
+			("module", JsonString("main")),
+			("text", JsonString(source)),
+			("allow_debug_only_calls", JsonBool(allow_debug_only_calls)),
+		]))
+
+
 pure func json_string_array_contains(items: List[JsonValue], needle: String) -> Bool:
 	var found: Bool = False
 
@@ -190,6 +302,24 @@ pure func test_typecheck_source_returns_typed_program_artifact() -> Bool:
 			False
 
 
+pure func test_typecheck_source_accepts_main_args_signature() -> Bool:
+	source: String = "func main(args: List[String]) -> Int:\n\t0"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			match artifact_field(response, "typed_program"):
+				Some(typed_program):
+					(
+						bool_field(response, "ok")
+						and json_array_length(typed_program, "decls") == 1
+						and artifact_array_length(response, "type_errors") == 0
+					)
+				None:
+					False
+		None:
+			False
+
+
 pure func test_typecheck_source_reports_type_errors() -> Bool:
 	source: String = "func bad() -> Int:\n\t\"no\""
 
@@ -200,6 +330,36 @@ pure func test_typecheck_source_reports_type_errors() -> Bool:
 				and artifact_array_length(response, "type_errors") > 0
 				and artifact_field(response, "typed_program").is_some()
 			)
+		None:
+			False
+
+
+pure func test_typecheck_source_sees_global_conversion_builtins() -> Bool:
+	source: String = "pure func convert(value: Int) -> Float:\n\tto_float(value)\n\npure func narrow(value: Float) -> Int:\n\tto_int(value)"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_handles_tuple_subscript_rewrite() -> Bool:
+	source: String = "pure func second(pair: (String, Int)) -> Int:\n\tpair[1]"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_allows_bounded_type_param_equality() -> Bool:
+	source: String = "pure func same[T: Equatable](left: T, right: T) -> Bool:\n\tleft == right"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
 		None:
 			False
 
@@ -276,9 +436,181 @@ pure func test_typecheck_source_uses_selectively_imported_function() -> Bool:
 			False
 
 
+pure func test_typecheck_source_matches_std_shorthand_import_path() -> Bool:
+	source: String = "import:\n\tio: answer\n\nfunc identity() -> Int:\n\tanswer()"
+	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("std/io", "std/io", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_imported_generic_function() -> Bool:
+	source: String = "import:\n\tdep: identity\n\nfunc use_identity() -> String:\n\tidentity(\"ok\")"
+	dep_text: String = "pure func identity[T](value: T) -> T:\n\tvalue"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_accepts_imported_generic_return_signature() -> Bool:
+	source: String = "func main(args: List[String]) -> Int:\n\t0"
+	dep_text: String = "pure func values[T]() -> List[T]:\n\tbuiltin(\"test_values\")"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
 pure func test_typecheck_source_uses_aliased_imported_function() -> Bool:
 	source: String = "import:\n\tdep: answer as calc\n\nfunc identity() -> Int:\n\tcalc()"
 	dep_text: String = "pure func answer() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_array_length(response, "type_errors") == 0
+				and typed_program_body_call_has_alias_source(response, "calc", "answer")
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_materializes_imported_trait_impl_method() -> Bool:
+	source: String = "import:\n\tdep: Same\n\nrecord Box {value: Int}\n\nimplements Same for Box:\n\tpure func same(a: Box, b: Box) -> Bool:\n\t\tTrue"
+	dep_text: String = "trait Same:\n\tpure func same(a: Self, b: Self) -> Bool"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_array_length(response, "type_errors") == 0
+				and typed_program_has_impl_method_body(response)
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_imported_nullary_trait_method() -> Bool:
+	source: String = "import:\n\tdep: HasZero, zero\n\npure func empty[T: HasZero]() -> T:\n\tzero()"
+	dep_text: String = "trait HasZero:\n\tpure func zero() -> Self"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_imported_trait_method_as_ufcs() -> Bool:
+	source: String = "import:\n\tdep: Reader, read_text\n\nfunc read(reader: Reader) -> String:\n\treader.read_text()"
+	dep_text: String = "trait TextReader:\n\tfunc read_text(value: Self) -> String\n\nrecord Reader {value: String}\n\nimplements TextReader for Reader:\n\tfunc read_text(reader: Reader) -> String:\n\t\treader.value"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func resource_trait_dep_text() -> String:
+	"resource type Handle = builtin(\"close_handle\")\n\nunion IOError:\n\tOther(String)\n\ntrait Readable:\n\tfunc read_text(handle: Self) -> Result[String, IOError]\n\nfunc open_handle(path: String) -> Result[Handle, IOError]:\n\tbuiltin(\"open_handle\")\n\nimplements Readable for Handle:\n\t@resource_result_ordinary\n\tfunc read_text(handle: Handle) -> Result[String, IOError]:\n\t\tbuiltin(\"read_handle\")"
+
+
+pure func test_typecheck_source_preserves_resource_policy_for_trait_method_ufcs() -> Bool:
+	source: String = "import:\n\tdep: Handle, IOError, open_handle, read_text\n\nfunc read(path: String) -> Result[String, IOError]:\n\twith handle ?= open_handle(path):\n\t\thandle.read_text()"
+	dep_text: String = resource_trait_dep_text()
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_preserves_resource_policy_for_direct_trait_method() -> Bool:
+	source: String = "import:\n\tdep: Handle, IOError, open_handle, read_text\n\nfunc read(path: String) -> Result[String, IOError]:\n\twith handle ?= open_handle(path):\n\t\tread_text(handle)"
+	dep_text: String = resource_trait_dep_text()
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_trait_bounded_generic_arithmetic() -> Bool:
+	source: String = "import:\n\tdep: Addable, HasZero, zero\n\npure func add_from_zero[T: Addable + HasZero](left: T, right: T) -> T:\n\tvar total: T = zero()\n\ttotal = total + left\n\ttotal + right"
+	dep_text: String = "trait Addable:\n\tpure func add(a: Self, b: Self) -> Self\n\ntrait HasZero:\n\tpure func zero() -> Self"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_accepts_generic_impl_method_signature() -> Bool:
+	source: String = "import:\n\tdep: Stringable\n\nrecord Box[T] {value: T}\n\nimplements Stringable for Box[T:Stringable]:\n\tpure func to_string[T](self: Box[T]) -> String:\n\t\t\"box\""
+	dep_text: String = "trait Stringable:\n\tpure func to_string(value: Self) -> String"
 
 	match response_value(
 		typecheck_source_request_with_imports(
@@ -334,6 +666,44 @@ pure func test_typecheck_source_rejects_private_qualified_import() -> Bool:
 			False
 
 
+pure func debug_only_source() -> String:
+	"@debug_only\npure func inspect() -> Int:\n\t1\n\nfunc use_it() -> Int:\n\tinspect()"
+
+
+pure func test_typecheck_source_rejects_debug_only_call_by_default() -> Bool:
+	match response_value(typecheck_source_request(debug_only_source())):
+		Some(response):
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			(
+				bool_field(response, "ok")
+				and json_string_array_contains(
+					errors,
+					"debug-only function 'inspect' can only be used inside a debug: block",
+				)
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_allows_debug_only_call_when_enabled() -> Bool:
+	match response_value(typecheck_source_request_with_debug(debug_only_source(), True)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_allows_debug_only_call_inside_debug_block() -> Bool:
+	source: String = "@debug_only\npure func inspect() -> Int:\n\t1\n\nfunc use_it() -> Int:\n\tdebug:\n\t\tinspect()\n\t0"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
 pure func test_typecheck_source_rejects_wrong_action() -> Bool:
 	request: String = request_json("parse_source", JsonObject([]))
 
@@ -364,7 +734,23 @@ tests: TestSuite = {
 			"typecheck_source returns typed program artifact",
 			test_typecheck_source_returns_typed_program_artifact,
 		),
+		(
+			"typecheck_source accepts main args signature",
+			test_typecheck_source_accepts_main_args_signature,
+		),
 		("typecheck_source reports type errors", test_typecheck_source_reports_type_errors),
+		(
+			"typecheck_source sees global conversion builtins",
+			test_typecheck_source_sees_global_conversion_builtins,
+		),
+		(
+			"typecheck_source handles tuple subscript rewrite",
+			test_typecheck_source_handles_tuple_subscript_rewrite,
+		),
+		(
+			"typecheck_source allows bounded type param equality",
+			test_typecheck_source_allows_bounded_type_param_equality,
+		),
 		("typecheck_source returns import bindings", test_typecheck_source_returns_import_bindings),
 		(
 			"typecheck_source validates import modules",
@@ -379,8 +765,48 @@ tests: TestSuite = {
 			test_typecheck_source_uses_selectively_imported_function,
 		),
 		(
+			"typecheck_source matches std shorthand import path",
+			test_typecheck_source_matches_std_shorthand_import_path,
+		),
+		(
+			"typecheck_source uses imported generic function",
+			test_typecheck_source_uses_imported_generic_function,
+		),
+		(
+			"typecheck_source accepts imported generic return signature",
+			test_typecheck_source_accepts_imported_generic_return_signature,
+		),
+		(
 			"typecheck_source uses aliased imported function",
 			test_typecheck_source_uses_aliased_imported_function,
+		),
+		(
+			"typecheck_source materializes imported trait impl method",
+			test_typecheck_source_materializes_imported_trait_impl_method,
+		),
+		(
+			"typecheck_source uses imported nullary trait method",
+			test_typecheck_source_uses_imported_nullary_trait_method,
+		),
+		(
+			"typecheck_source uses imported trait method as UFCS",
+			test_typecheck_source_uses_imported_trait_method_as_ufcs,
+		),
+		(
+			"typecheck_source preserves resource policy for trait method UFCS",
+			test_typecheck_source_preserves_resource_policy_for_trait_method_ufcs,
+		),
+		(
+			"typecheck_source preserves resource policy for direct trait method",
+			test_typecheck_source_preserves_resource_policy_for_direct_trait_method,
+		),
+		(
+			"typecheck_source uses trait-bounded generic arithmetic",
+			test_typecheck_source_uses_trait_bounded_generic_arithmetic,
+		),
+		(
+			"typecheck_source accepts generic impl method signature",
+			test_typecheck_source_accepts_generic_impl_method_signature,
 		),
 		(
 			"typecheck_source rejects bare qualified-only import",
@@ -389,6 +815,18 @@ tests: TestSuite = {
 		(
 			"typecheck_source rejects private qualified import",
 			test_typecheck_source_rejects_private_qualified_import,
+		),
+		(
+			"typecheck_source rejects debug-only call by default",
+			test_typecheck_source_rejects_debug_only_call_by_default,
+		),
+		(
+			"typecheck_source allows debug-only call when enabled",
+			test_typecheck_source_allows_debug_only_call_when_enabled,
+		),
+		(
+			"typecheck_source allows debug-only call inside debug block",
+			test_typecheck_source_allows_debug_only_call_inside_debug_block,
 		),
 		("typecheck bridge rejects wrong action", test_typecheck_source_rejects_wrong_action),
 		("typecheck_source requires text", test_typecheck_source_requires_text),
