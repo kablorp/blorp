@@ -104,6 +104,9 @@ let const_int value =
 let var_dims name =
   Object [ ("kind", String "var_dims"); ("name", String name) ]
 
+let type_var name =
+  Object [ ("kind", String "type_var"); ("name", String name) ]
+
 let ident text = Object [ ("text", String text) ]
 
 let keep ty = Object [ ("kind", String "keep"); ("type", ty) ]
@@ -136,7 +139,9 @@ let resolved_call_info =
   Object
     [
       ("callee_name", String "read_chunk_at");
+      ("source_name", String "read_chunk_at");
       ("callable_id", Int 42);
+      ("trait_name", Null);
       ("purity", String "impure");
       ( "origin",
         Object
@@ -161,6 +166,41 @@ let resolved_call_info =
                 ("right", const_int 4096);
               ];
           ] );
+    ]
+
+let imported_string_split_resolved_call_info =
+  Object
+    [
+      ("callee_name", String "make_string");
+      ("source_name", String "string");
+      ("callable_id", Int 123);
+      ("trait_name", Null);
+      ("purity", String "pure");
+      ( "origin",
+        Object
+          [
+            ("kind", String "imported");
+            ("module", String "std/string");
+          ] );
+      ("instantiated_params", Array [ named "Int" ]);
+      ("instantiated_return", named "String");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let trait_resolved_call_info =
+  Object
+    [
+      ("callee_name", String "zero");
+      ("source_name", String "zero");
+      ("callable_id", Null);
+      ("trait_name", String "HasZero");
+      ("purity", String "pure");
+      ("origin", Object [ ("kind", String "impl_method") ]);
+      ("instantiated_params", Array []);
+      ("instantiated_return", type_var "T");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
     ]
 
 let span_json =
@@ -225,6 +265,42 @@ let typed_name name =
       ("name", ident_at name);
       ("info", expr_info (named "Int"));
     ]
+
+let typed_name_with_type name ty =
+  Object
+    [
+      ("kind", String "name");
+      ("name", ident_at name);
+      ("info", expr_info ty);
+    ]
+
+let typed_void = typed_node ~info:(expr_info (named "Void")) "void" []
+
+let typed_bool_literal value =
+  Object
+    [
+      ("kind", String "bool_literal");
+      ("span", span_json);
+      ("info", expr_info (named "Bool"));
+      ("value", Bool value);
+    ]
+
+let typed_int_list items =
+  typed_node
+    ~info:(expr_info (named ~args:[ named "Int" ] "List"))
+    "list"
+    [ ("items", Array items) ]
+
+let typed_concurrent_param name value =
+  Object
+    [
+      ("name", ident_at name);
+      ("value", value);
+      ("span", span_json);
+    ]
+
+let typed_task_result ty =
+  named ~args:[ ty; named "ConcurrencyError" ] "Result"
 
 let parsed_int_literal value =
   Object
@@ -748,6 +824,25 @@ let test_decode_typed_expr_structural_forms () =
                   ("receiver", typed_name "box");
                   ("fields", Array [ field_value ]);
                 ];
+              typed_node "match"
+                [
+                  ("scrutinee", typed_name "value");
+                  ( "cases",
+                    Array
+                      [
+                        Object
+                          [
+                            ( "pattern",
+                              Object
+                                [
+                                  ("kind", String "int");
+                                  ("value", String "1");
+                                ] );
+                            ("body", typed_int_literal "10");
+                            ("span", span_json);
+                          ];
+                      ] );
+                ];
               typed_node "range"
                 [
                   ("start", typed_int_literal "0");
@@ -781,12 +876,206 @@ let test_decode_typed_expr_structural_forms () =
         { expr_desc = EOpaqueFrom _; _ };
         { expr_desc = ERecord [ ("value", _) ]; _ };
         { expr_desc = ERecordUpdate (_, [ ("value", _) ]); _ };
+        { expr_desc = EMatch (_, [ { case_pattern = PatLiteral (LitInt 1L); _ } ]); _ };
         { expr_desc = ERange _; _ };
         { expr_desc = EAscription _; _ };
         { expr_desc = EDebugBlock [ _ ]; _ };
         { expr_desc = EQuestionBind ("maybe", Some _, _); _ };
       ] -> ()
   | _ -> Alcotest.fail "structural typed expression forms did not decode"
+
+let test_decode_typed_expr_control_and_resource_forms () =
+  let int_list = typed_int_list [ typed_int_literal "1"; typed_int_literal "2" ] in
+  let channel =
+    typed_name_with_type "ch" (named ~args:[ named "Int" ] "Channel")
+  in
+  let control_block =
+    typed_node
+      ~info:(expr_info (named "Void"))
+      "block"
+      [
+        ( "items",
+          Array
+            [
+              typed_node
+                ~info:(expr_info (named "String"))
+                "string_interpolation"
+                [
+                  ( "parts",
+                    Array
+                      [
+                        Object
+                          [
+                            ("kind", String "literal");
+                            ("text", String "value ");
+                          ];
+                        Object
+                          [
+                            ("kind", String "expr");
+                            ("expr", typed_int_literal "7");
+                          ];
+                      ] );
+                  ("multiline", Bool false);
+                ];
+              typed_node
+                ~info:
+                  (expr_info
+                     (function_type [ named "Int" ] (named "Int")))
+                "lambda"
+                [
+                  ("is_pure", Bool true);
+                  ( "params",
+                    Array
+                      [
+                        Object
+                          [
+                            ("name", ident_at "x");
+                            ("source_type", Null);
+                            ("param_type", named "Int");
+                          ];
+                      ] );
+                  ("return_annotation", Null);
+                  ("body", typed_int_literal "1");
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "select"
+                [
+                  ( "arms",
+                    Array
+                      [
+                        Object
+                          [
+                            ( "kind",
+                              Object
+                                [
+                                  ("kind", String "receive");
+                                  ("name", ident_at "message");
+                                  ("elem_type", named "Int");
+                                  ("channel", channel);
+                                ] );
+                            ("body", typed_void);
+                            ("span", span_json);
+                          ];
+                      ] );
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "while"
+                [
+                  ("condition", typed_bool_literal true);
+                  ("body", typed_void);
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "for"
+                [
+                  ( "binder",
+                    Object
+                      [
+                        ("kind", String "name");
+                        ("name", ident_at "item");
+                      ] );
+                  ("iterable", int_list);
+                  ("body", typed_void);
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "for"
+                [
+                  ( "binder",
+                    Object
+                      [
+                        ("kind", String "tuple");
+                        ("names", Array [ ident_at "key"; ident_at "value" ]);
+                        ("span", span_json);
+                      ] );
+                  ("iterable", int_list);
+                  ("body", typed_void);
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "with"
+                [
+                  ( "binding",
+                    Object
+                      [
+                        ("name", ident_at "reader");
+                        ("annotation", named "Int");
+                        ("value", typed_int_literal "1");
+                        ("kind", String "plain");
+                        ("error_map", Null);
+                        ("span", span_json);
+                      ] );
+                  ("body", typed_void);
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "concurrent_block"
+                [
+                  ( "params",
+                    Array
+                      [
+                        typed_concurrent_param "max_threads"
+                          (typed_int_literal "2");
+                        typed_concurrent_param "timeout" (typed_int_literal "50");
+                      ] );
+                  ( "body",
+                    typed_node
+                      ~info:(expr_info (named "Void"))
+                      "block"
+                      [
+                        ( "items",
+                          Array
+                            [
+                              typed_node
+                                ~info:(expr_info (typed_task_result (named "Int")))
+                                "concurrent_bind"
+                                [
+                                  ("name", ident_at "answer");
+                                  ("annotation", Null);
+                                  ("value", typed_int_literal "1");
+                                ];
+                            ] );
+                      ] );
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "concurrent_for"
+                [
+                  ("name", ident_at "item");
+                  ("iterable", int_list);
+                  ( "params",
+                    Array
+                      [
+                        typed_concurrent_param "limit" (typed_int_literal "4");
+                        typed_concurrent_param "timeout" (typed_int_literal "50");
+                      ] );
+                  ("body", typed_void);
+                ];
+              typed_node
+                ~info:(expr_info (named "Void"))
+                "detach"
+                [ ("body", typed_void) ];
+            ] );
+      ]
+  in
+  let typed = expect_typed_expr control_block in
+  match (Typed.ast typed).expr_desc with
+  | EBlock
+      [
+        { expr_desc = EStringInterp ([ InterpLit "value "; InterpExpr _ ], false); _ };
+        { expr_desc = ELambda { func_params = [ { param_name = Some "x"; _ } ]; _ }; _ };
+        { expr_desc = ESelect [ { select_arm_kind = SelectRecv { select_bind = "message"; _ }; _ } ]; _ };
+        { expr_desc = EWhile _; _ };
+        { expr_desc = EFor ("item", _, _); _ };
+        { expr_desc = EForTuple ([ "key"; "value" ], _, _); _ };
+        { expr_desc = EWith ({ with_name = "reader"; with_kind = WithPlain; _ }, _); _ };
+        { expr_desc = EConcurrent ([ { expr_desc = EConcurrentBind ("answer", None, _); _ } ], Some _, Some 2); _ };
+        { expr_desc = EConcurrentlyLoop ("item", _, _, Some _, ConcurrentlyLoopLimit 4); _ };
+        { expr_desc = EDetach _; _ };
+      ] -> ()
+  | _ -> Alcotest.fail "control/resource typed expression forms did not decode"
 
 let typed_global_var_decl =
   Object
@@ -952,6 +1241,41 @@ let typed_parsed_trait_decl =
                   ("type_params", Array []);
                   ("supertraits", Array []);
                   ("methods", Array []);
+                  ("doc", Null);
+                  ("span", span_json);
+                ] );
+          ] );
+    ]
+
+let parsed_variant name =
+  Object
+    [
+      ("name", ident_at name);
+      ("fields", Array []);
+      ("span", span_json);
+    ]
+
+let typed_parsed_enum_decl =
+  Object
+    [
+      ("kind", String "parsed");
+      ( "decl",
+        Object
+          [
+            ("kind", String "union");
+            ( "union",
+              Object
+                [
+                  ("name", ident_at "Color");
+                  ("type_params", Array []);
+                  ( "variants",
+                    Array
+                      [
+                        parsed_variant "Red";
+                        parsed_variant "Green";
+                        parsed_variant "Blue";
+                      ] );
+                  ("is_enum", Bool true);
                   ("doc", Null);
                   ("span", span_json);
                 ] );
@@ -1130,7 +1454,37 @@ let test_decode_typed_program_parsed_trait_decl () =
       match Typed.decl_ast decl with
       | { decl_desc = DTrait trait; _ } ->
           Alcotest.(check string) "trait name" "Show" trait.trait_name
-      | _ -> Alcotest.fail "expected parsed trait declaration")
+	      | _ -> Alcotest.fail "expected parsed trait declaration")
+  | _ -> Alcotest.fail "expected one typed declaration"
+
+let test_decode_typed_program_decorates_parsed_enum_decl () =
+  let program =
+    expect_typed_program
+      (Object
+         [
+           ("kind", String "typed_program");
+           ("source", Object []);
+           ("decls", Array [ typed_parsed_enum_decl ]);
+           ("diagnostics", Array []);
+         ])
+  in
+  match Typed.program_decls program with
+  | [ decl ] -> (
+      match Typed.decl_ast decl with
+      | { decl_desc = DType type_decl; _ } ->
+          Alcotest.(check string) "enum name" "Color" type_decl.type_name;
+          let variant_tags =
+            List.map (fun variant -> variant.variant_tag) type_decl.type_variants
+          in
+          Alcotest.(check (list int)) "variant tags" [ 0; 1; 2 ] variant_tags;
+          let variant_ids =
+            List.map
+              (fun variant -> Option.is_some variant.variant_def_id)
+              type_decl.type_variants
+          in
+          Alcotest.(check (list bool))
+            "variant ids" [ true; true; true ] variant_ids
+      | _ -> Alcotest.fail "expected parsed enum declaration")
   | _ -> Alcotest.fail "expected one typed declaration"
 
 let test_decode_typed_program_flattens_parsed_import_block () =
@@ -1190,7 +1544,7 @@ let test_decode_typed_expr_resolved_call_metadata () =
            ("args", Array []);
          ])
   in
-  match Typed.expr_resolved_call typed with
+  (match Typed.expr_resolved_call typed with
   | Some
       {
         call_syntax = CallQualified "std/file";
@@ -1209,7 +1563,73 @@ let test_decode_typed_expr_resolved_call_metadata () =
       check_type "resolved offset param" (TyNamed ("Int", [])) offset_ty;
       check_type "resolved return" (TyNamed ("String", [])) instantiated_return
   | Some _ -> Alcotest.fail "resolved call metadata was not materialized"
-  | None -> Alcotest.fail "expected resolved call metadata"
+  | None -> Alcotest.fail "expected resolved call metadata");
+
+  let trait_callee =
+    Object
+      [
+        ("kind", String "name");
+        ("name", ident_at "zero");
+        ("info", expr_info ~resolved_call:trait_resolved_call_info (function_type [] (type_var "T")));
+      ]
+  in
+  let trait_typed =
+    expect_typed_expr
+      (Object
+         [
+           ("kind", String "call");
+           ("span", span_json);
+           ("info", expr_info ~resolved_call:trait_resolved_call_info (type_var "T"));
+           ("callee", trait_callee);
+           ("args", Array []);
+         ])
+  in
+  match Typed.expr_resolved_call trait_typed with
+  | Some
+      {
+        call_syntax = CallBare;
+        call_target =
+          CallTraitMethod
+            {
+              trait_name = "HasZero";
+              method_name = "zero";
+              call_pure = true;
+              callable_id = None;
+            };
+        instantiated_params = [];
+        instantiated_return;
+      } ->
+      check_type "trait return" (TyVar "T") instantiated_return
+  | Some _ -> Alcotest.fail "trait resolved call metadata was not materialized"
+  | None -> Alcotest.fail "expected trait resolved call metadata"
+
+let test_decode_imported_bare_call_uses_ufcs_callee () =
+  let callee =
+    Object
+      [
+        ("kind", String "name");
+        ("name", ident_at "make_string");
+        ( "info",
+          expr_info
+            (function_type ~pure:true [ named "Int" ] (named "String")) );
+      ]
+  in
+  let typed =
+    expect_typed_expr
+      (Object
+         [
+           ("kind", String "call");
+           ("span", span_json);
+           ( "info",
+             expr_info ~resolved_call:imported_string_split_resolved_call_info
+               (named "String") );
+           ("callee", callee);
+           ("args", Array [ typed_int_literal "16" ]);
+         ])
+  in
+  match (Typed.ast typed).expr_desc with
+  | ECall ({ expr_desc = EIdent "__ufcs_std$string__string"; _ }, _) -> ()
+  | _ -> Alcotest.fail "imported bare call did not decode to UFCS callee"
 
 let test_decode_rejects_unsupported_pattern () =
   match
@@ -1259,6 +1679,8 @@ let suite =
           test_decode_typed_expr_subset;
         Alcotest.test_case "typed expr structural forms" `Quick
           test_decode_typed_expr_structural_forms;
+        Alcotest.test_case "typed expr control/resource forms" `Quick
+          test_decode_typed_expr_control_and_resource_forms;
         Alcotest.test_case "typed program global var" `Quick
           test_decode_typed_program_global_var;
         Alcotest.test_case "typed program function" `Quick
@@ -1269,10 +1691,14 @@ let suite =
           test_decode_typed_program_impl_decl;
         Alcotest.test_case "typed program parsed passthrough" `Quick
           test_decode_typed_program_parsed_trait_decl;
+        Alcotest.test_case "typed program parsed enum metadata" `Quick
+          test_decode_typed_program_decorates_parsed_enum_decl;
         Alcotest.test_case "typed program parsed import block" `Quick
           test_decode_typed_program_flattens_parsed_import_block;
         Alcotest.test_case "typed expr resolved call metadata" `Quick
           test_decode_typed_expr_resolved_call_metadata;
+        Alcotest.test_case "imported bare call uses UFCS callee" `Quick
+          test_decode_imported_bare_call_uses_ufcs_callee;
         Alcotest.test_case "unsupported pattern" `Quick
           test_decode_rejects_unsupported_pattern;
         Alcotest.test_case "unknown kind" `Quick test_decode_rejects_unknown_kind;

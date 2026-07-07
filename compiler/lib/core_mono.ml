@@ -676,6 +676,52 @@ let register_generic_body_id (state : mono_state) (f : core_func) : unit =
 let concrete_subst_for_call (state : mono_state) ~(func_name : string)
     (gf : core_func) (node : core) (args : core list) : mono_subst option =
   let type_params = gf.cf_type_params in
+  let type_param_names = type_param_decl_names type_params in
+  let rec erase_function_purity ty =
+    match ty with
+    | Ast.TyFunc fn ->
+        Ast.TyFunc
+          {
+            is_pure = false;
+            params = List.map erase_function_purity fn.params;
+            return = erase_function_purity fn.return;
+          }
+    | Ast.TyNamed (name, args) ->
+        Ast.TyNamed (name, List.map erase_function_purity args)
+    | Ast.TyArray (elem, dims) ->
+        Ast.TyArray
+          (erase_function_purity elem, List.map erase_function_purity dims)
+    | Ast.TyTuple elems -> Ast.TyTuple (List.map erase_function_purity elems)
+    | Ast.TyRange inner -> Ast.TyRange (erase_function_purity inner)
+    | Ast.TyDimOp (op, a, b) ->
+        Ast.TyDimOp (op, erase_function_purity a, erase_function_purity b)
+    | other -> other
+  in
+  let normalize_for_signature_guard ty =
+    ty
+    |> Codegen_types.expand_alias ~reg:state.reg
+    |> Codegen_types.normalize_type |> erase_function_purity
+  in
+  let compatible expected actual =
+    (* This guard exists to reject stale selected IDs and unrelated same-ID
+       generics before substitution. Purity has already been checked by the
+       frontend, and bridge-produced Core can conservatively type inline
+       lambdas as impure. Keep mono's guard structural so valid HOF calls still
+       specialize. *)
+    Types.types_compatible ~type_params:type_param_names
+      (normalize_for_signature_guard expected)
+      (normalize_for_signature_guard actual)
+  in
+  let signature_accepts_call =
+    try
+      List.for_all2
+        (fun (p : core_param) arg -> compatible p.cp_ty arg.ty)
+        gf.cf_params args
+      && compatible gf.cf_return_ty node.ty
+    with Invalid_argument _ -> false
+  in
+  if not signature_accepts_call then None
+  else
   let raw_subst =
     try
       Some

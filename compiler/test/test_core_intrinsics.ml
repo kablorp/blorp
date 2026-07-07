@@ -297,6 +297,26 @@ let expect_builtin_synthesis ?arg_count ~module_path func_name params return_ty
             1
             (count_builtin_call_with_arg_count c_name expected body))
 
+let expect_intrinsic_synthesis ~module_path func_name params return_ty
+    intrinsic_name =
+  match
+    Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path ~params
+      ~return_ty
+  with
+  | None ->
+      Alcotest.failf "%s.%s should synthesize an intrinsic body" module_path
+        func_name
+  | Some body ->
+      Alcotest.(check int)
+        (Printf.sprintf "%s.%s synthesizes %s" module_path func_name
+           intrinsic_name)
+        1
+        (count_intrinsic intrinsic_name body)
+
+let test_std_float_round_synthesizes_math_round () =
+  expect_intrinsic_synthesis ~module_path:"std/float" "round"
+    [ param "x" ty_float ] ty_float "math_round"
+
 let test_list_synthesis_rejects_malformed_signatures () =
   let list_int = ty_list ty_int in
   let stream_int = TyNamed ("Stream", [ ty_int ]) in
@@ -3699,6 +3719,8 @@ let suite =
           test_list_synthesis_rejects_malformed_signatures;
         Alcotest.test_case "std_synthesis_rejects_malformed_signatures" `Quick
           test_std_synthesis_rejects_malformed_signatures;
+        Alcotest.test_case "std_float_round_synthesizes_math_round" `Quick
+          test_std_float_round_synthesizes_math_round;
         Alcotest.test_case "hash_wrappers_synthesize_from_specs" `Quick
           test_hash_wrappers_synthesize_from_specs;
         Alcotest.test_case "time_and_system_wrappers_synthesize_from_specs"

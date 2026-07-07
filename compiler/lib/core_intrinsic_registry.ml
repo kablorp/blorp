@@ -553,8 +553,10 @@ let fixed_intrinsics =
     emit @llvm.sin.f64. These are the same operations on every platform;
     only the emission differs.
 
-    NOT included: abs/min/max/round — these are polymorphic (Int + Float)
-    and stay as CKBuiltin with type dispatch in core_specialize. *)
+    NOT included: abs/min/max — these are polymorphic (Int + Float)
+    and stay as CKBuiltin with type dispatch in core_specialize. Float
+    [round] is represented as [math_round]; integer rounding does not use
+    this intrinsic. *)
 
 let math_intrinsics =
   let mk_unary name doc =
@@ -588,6 +590,7 @@ let math_intrinsics =
     mk_unary "math_cbrt" "cbrt(x)";
     mk_unary "math_floor" "floor(x)";
     mk_unary "math_ceil" "ceil(x)";
+    mk_unary "math_round" "round(x)";
     mk_unary "math_trunc" "trunc(x)";
     (* Binary: Float * Float -> Float — elementwise only if both operands
      are same-shape tensors or scalar-with-tensor. Marking liftable lets

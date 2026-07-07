@@ -18,21 +18,14 @@
 
 open Core
 
-module IntPairTbl = Hashtbl.Make (struct
-  type t = int * int
-
-  let equal (a_fn, a_arg) (b_fn, b_arg) = a_fn = b_fn && a_arg = b_arg
-  let hash = Hashtbl.hash
-end)
-
 module StringSet = Set.Make (String)
 
 type clone_request = { original : core_func; clone : core_func }
 
 type state = {
   reg : Codegen_types.registry;
-  funcs_by_id : (int, core_func) Hashtbl.t;
-  clones_by_key : clone_request IntPairTbl.t;
+  funcs_by_identity : (string * int, core_func) Hashtbl.t;
+  clones_by_key : (string * int * int, clone_request) Hashtbl.t;
 }
 
 let source_managed_type_name (reg : Codegen_types.registry) (ty : Ast.type_expr)
@@ -784,13 +777,13 @@ let make_consuming_clone state original arg_index =
   { clone with cf_body = Some clone_body }
 
 let clone_for state original arg_index =
-  let key = (original.cf_def_id, arg_index) in
-  match IntPairTbl.find_opt state.clones_by_key key with
+  let key = (original.cf_name, original.cf_def_id, arg_index) in
+  match Hashtbl.find_opt state.clones_by_key key with
   | Some request -> request.clone
   | None ->
       let clone = make_consuming_clone state original arg_index in
       let request = { original; clone } in
-      IntPairTbl.add state.clones_by_key key request;
+      Hashtbl.add state.clones_by_key key request;
       clone
 
 let call_arg_consumes_target state target target_ty kind args =
@@ -806,8 +799,8 @@ let call_arg_consumes_target state target target_ty kind args =
   match candidate_indices with
   | [ arg_index ] -> (
       match kind with
-      | CKUser (_, Some def_id) -> (
-          match Hashtbl.find_opt state.funcs_by_id def_id with
+      | CKUser (call_name, Some def_id) -> (
+          match Hashtbl.find_opt state.funcs_by_identity (call_name, def_id) with
           | Some f -> (
               match List.nth_opt f.cf_params arg_index with
               | Some param
@@ -851,23 +844,26 @@ let rewrite_func state f =
 
 let rec collect_function_map funcs_by_id decl =
   match decl.cd_desc with
-  | CDFunc f -> Hashtbl.replace funcs_by_id f.cf_def_id f
+  | CDFunc f -> Hashtbl.replace funcs_by_id (f.cf_name, f.cf_def_id) f
   | CDPrivate inner -> collect_function_map funcs_by_id inner
   | CDImpl impl ->
       List.iter
-        (fun f -> Hashtbl.replace funcs_by_id f.cf_def_id f)
+        (fun f -> Hashtbl.replace funcs_by_id (f.cf_name, f.cf_def_id) f)
         impl.ci_methods
   | _ -> ()
 
 let make_state reg prog =
-  let funcs_by_id = Hashtbl.create 128 in
-  List.iter (collect_function_map funcs_by_id) prog;
-  { reg; funcs_by_id; clones_by_key = IntPairTbl.create 32 }
+  let funcs_by_identity = Hashtbl.create 128 in
+  List.iter (collect_function_map funcs_by_identity) prog;
+  { reg; funcs_by_identity; clones_by_key = Hashtbl.create 32 }
 
 let clone_decls_after state decl f =
-  IntPairTbl.fold
-    (fun (_, _) request acc ->
-      if request.original.cf_def_id = f.cf_def_id then
+  Hashtbl.fold
+    (fun _key request acc ->
+      if
+        request.original.cf_name = f.cf_name
+        && request.original.cf_def_id = f.cf_def_id
+      then
         { cd_desc = CDFunc request.clone; cd_loc = decl.cd_loc; cd_doc = None }
         :: acc
       else acc)

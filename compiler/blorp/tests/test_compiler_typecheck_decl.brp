@@ -19,12 +19,17 @@ import:
 		compiler_env_get_type_kind,
 		compiler_env_get_var_type,
 		compiler_env_lookup,
-	../compiler_imports: CompilerImportableModuleSurface, compiler_importable_module_surface
+	../compiler_imports:
+		CompilerImportableModule,
+		CompilerImportableModuleSurface,
+		compiler_importable_module,
+		compiler_importable_module_surface,
 	../compiler_infer:
 		CompilerExprTypeOrigin(CompilerInferredOrigin),
 		CompilerTypedExpr(CompilerTypedIntLiteralExpr),
 		CompilerTypedExprInfo,
 		compiler_typed_expr_semantic_type,
+		compiler_typed_expr_value_type,
 	../compiler_module_surface: module_surface_for_program
 	../compiler_parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
@@ -45,11 +50,13 @@ import:
 			ParsedAssignExpr,
 			ParsedBinaryExpr,
 			ParsedBlockExpr,
+			ParsedBuiltinExpr,
 			ParsedCallExpr,
 			ParsedDebugBlockExpr,
 			ParsedIntLiteralExpr,
 			ParsedLambdaExpr,
 			ParsedNameExpr,
+			ParsedRecordExpr,
 			ParsedStringLiteralExpr,
 			ParsedSubscriptExpr,
 			ParsedSubscriptAssignExpr,
@@ -66,6 +73,7 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamWildcardBinder),
 		ParsedProgram,
+		ParsedRecordExprField,
 		ParsedStringLiteralForm(ParsedPlainStringLiteral),
 		ParsedTraitMethodDecl,
 		ParsedTypeExpr(ParsedArrayType, ParsedDimLiteralType, ParsedFunctionType, ParsedNamedType),
@@ -80,7 +88,8 @@ import:
 		compiler_source_file,
 		compiler_source_span,
 	../compiler_type:
-		CompilerType(CompilerFunctionType, CompilerMetaType),
+		CompilerType(CompilerFunctionType, CompilerMetaType, CompilerNamedType),
+		compiler_canonical_module_type_name,
 		compiler_type_bool,
 		compiler_type_int,
 		compiler_type_string,
@@ -107,6 +116,7 @@ import:
 		compiler_typecheck_materialize_program_bodies,
 		compiler_typecheck_prescan_program,
 		compiler_typecheck_program,
+		compiler_typecheck_program_with_import_modules,
 		compiler_typecheck_program_with_import_surfaces,
 		compiler_typecheck_register_program_impl_decls,
 		compiler_typecheck_register_program_import_decls,
@@ -184,6 +194,10 @@ pure func decl_call_expr(name: String, args: List[ParsedExpr]) -> ParsedExpr:
 	ParsedCallExpr(decl_name_expr(name), args, source_span())
 
 
+pure func decl_field_access_expr(receiver: ParsedExpr, field: String) -> ParsedExpr:
+	ParsedFieldAccessExpr(receiver, ident(field), source_span())
+
+
 pure func decl_add_expr(left: ParsedExpr, right: ParsedExpr) -> ParsedExpr:
 	ParsedBinaryExpr(ParsedAddOp, left, right, source_span())
 
@@ -194,6 +208,18 @@ pure func decl_assign_expr(name: String, value: ParsedExpr) -> ParsedExpr:
 
 pure func decl_vector_expr(items: List[ParsedExpr]) -> ParsedExpr:
 	ParsedVectorExpr(items, source_span())
+
+
+pure func decl_record_field(name: String, value: ParsedExpr) -> ParsedRecordExprField:
+	{
+		name = ident(name),
+		value = value,
+		span = source_span()
+	}
+
+
+pure func decl_record_expr(fields: List[ParsedRecordExprField]) -> ParsedExpr:
+	ParsedRecordExpr(fields, source_span())
 
 
 pure func decl_subscript_assign_expr(
@@ -226,6 +252,17 @@ pure func bool_type() -> ParsedTypeExpr:
 
 pure func string_type() -> ParsedTypeExpr:
 	ParsedNamedType(ident("String"), [], source_span())
+
+
+pure func generic_named_type(name: String, args: List[ParsedTypeExpr]) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), args, source_span())
+
+
+pure func result_type(ok_type: ParsedTypeExpr, error_type: ParsedTypeExpr) -> ParsedTypeExpr:
+	generic_named_type(
+		"Result",
+		[ok_type, error_type],
+	)
 
 
 pure func list_string_type() -> ParsedTypeExpr:
@@ -353,6 +390,28 @@ pure func function_body_decl_with_annotations(
 		body = body,
 		is_pure = is_pure,
 		annotations = annotations,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func generic_function_body_decl(
+	name: String,
+	type_params: List[ParsedTypeParamDecl],
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+	is_pure: Bool,
+) -> ParsedDecl:
+	FunctionParsedDecl({
+		name = ident(name),
+		type_params = type_params,
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = body,
+		is_pure = is_pure,
+		annotations = [],
 		doc = None,
 		span = source_span(),
 	})
@@ -514,6 +573,49 @@ pure func union_decl(name: String, variants: List[String]) -> ParsedDecl:
 	})
 
 
+pure func union_decl_with_variant_fields(
+	name: String,
+	variant_name: String,
+	field_types: List[ParsedTypeExpr],
+) -> ParsedDecl:
+	UnionParsedDecl({
+		name = ident(name),
+		type_params = [],
+		variants = [
+			{
+				name = ident(variant_name),
+				fields = field_types,
+				span = source_span()
+			},
+		],
+		is_enum = False,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func result_union_decl() -> ParsedDecl:
+	UnionParsedDecl({
+		name = ident("Result"),
+		type_params = [type_param("T"), type_param("E")],
+		variants = [
+			{
+				name = ident("Ok"),
+				fields = [named_type("T")],
+				span = source_span()
+			},
+			{
+				name = ident("Err"),
+				fields = [named_type("E")],
+				span = source_span()
+			},
+		],
+		is_enum = False,
+		doc = None,
+		span = source_span(),
+	})
+
+
 pure func enum_decl(
 	name: String,
 	type_params: List[ParsedTypeParamDecl],
@@ -552,6 +654,17 @@ pure func type_alias_decl(name: String, is_opaque: Bool) -> ParsedDecl:
 		type_params = [],
 		target = int_type(),
 		is_opaque = is_opaque,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func type_alias_decl_with_target(name: String, target: ParsedTypeExpr) -> ParsedDecl:
+	TypeAliasParsedDecl({
+		name = ident(name),
+		type_params = [],
+		target = target,
+		is_opaque = False,
 		doc = None,
 		span = source_span(),
 	})
@@ -647,6 +760,18 @@ pure func importable_surface(
 		module_path,
 		CompilerStdlibModule,
 		module_surface_for_program(program(decls)),
+	)
+
+
+pure func importable_module(
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerImportableModule:
+	compiler_importable_module(
+		module_path,
+		CompilerSourcePackageModule("test"),
+		module_surface_for_program(program(decls)),
+		decls,
 	)
 
 
@@ -841,6 +966,324 @@ func test_typecheck_program_with_import_surfaces_validates_imports() -> Bool:
 		)
 		and compiler_typecheck_state_find_type_home(valid_result.state, "Token") == Some("json")
 	)
+
+
+func test_import_modules_register_canonical_type_payloads() -> Bool:
+	module_decls = [
+		record_with_fields_decl("Payload", [int_type()]),
+		union_decl_with_variant_fields("Message", "WithPayload", [named_type("Payload")]),
+	]
+	source_program = program(
+		[
+			import_block_decl(
+				[
+					import_decl(
+						"model",
+						None,
+						Some([import_symbol("Message", None, ["WithPayload"])]),
+					),
+				],
+			),
+		],
+	)
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("model", module_decls)],
+	)
+	canonical_message = compiler_canonical_module_type_name("model", "Message")
+	canonical_payload = compiler_canonical_module_type_name("model", "Payload")
+
+	match (
+		compiler_env_get_type_decl(result.state.env, canonical_message),
+		compiler_env_get_record(result.state.env, canonical_payload),
+		compiler_env_get_alias(result.state.env, "Message"),
+		compiler_env_get_alias(result.state.env, "Payload"),
+	):
+		(Some((_, variants)), Some(_), Some((_, CompilerNamedType(alias_target, _))), None):
+			match variants.get(0):
+				Some(variant):
+					match variant.fields.get(0):
+						Some(CompilerNamedType(payload_name, _)):
+							(
+								result.state.errors.length() == 0
+								and alias_target == canonical_message
+								and payload_name == canonical_payload
+							)
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+
+func test_import_modules_register_canonical_signature_types() -> Bool:
+	module_decls = [
+		record_with_fields_decl("Token", [int_type()]),
+		function_body_decl_with_purity(
+			"make_token",
+			[],
+			Some(named_type("Token")),
+			Some(int_expr()),
+			True,
+		),
+		function_body_decl_with_purity(
+			"use_token",
+			[named_param("token", named_type("Token"))],
+			Some(named_type("Token")),
+			Some(decl_name_expr("token")),
+			True,
+		),
+		var_body_decl("default_token", Some(named_type("Token")), int_expr()),
+	]
+	source_program = program([import_block_decl([import_decl("model", None, Some([
+					import_symbol("Token", None, []),
+					import_symbol("make_token", None, []),
+					import_symbol("use_token", None, []),
+					import_symbol("default_token", None, []),
+				]))])])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("model", module_decls)],
+	)
+	canonical_token = compiler_canonical_module_type_name("model", "Token")
+	expected_token = CompilerNamedType(canonical_token, [])
+
+	match (
+		compiler_env_get_func_info(result.state.env, "make_token"),
+		compiler_env_get_func_info(result.state.env, "use_token"),
+		compiler_env_get_var_type(result.state.env, "default_token"),
+	):
+		(Some((make_type, _, _)), Some((use_type, _, _)), Some(var_type)):
+			result.state.errors.length() == 0 and compiler_types_equal(
+				make_type,
+				CompilerFunctionType(True, [], expected_token),
+			) and compiler_types_equal(
+				use_type,
+				CompilerFunctionType(True, [expected_token], expected_token),
+			) and compiler_types_equal(var_type, expected_token)
+		_:
+			False
+
+
+func test_import_modules_resolve_import_aliases_to_loaded_module_path() -> Bool:
+	module_decls = [
+		RecordParsedDecl({
+			name = ident("Cursor"),
+			type_params = [],
+			fields = [
+				field_decl("offset", int_type()),
+				field_decl("line", int_type()),
+				field_decl("column", int_type()),
+			],
+			is_struct = False,
+			doc = None,
+			span = source_span(),
+		}),
+		function_body_decl_with_purity(
+			"make_span",
+			[
+				named_param("start", named_type("Cursor")),
+				named_param("finish", named_type("Cursor")),
+			],
+			Some(named_type("Cursor")),
+			Some(decl_name_expr("start")),
+			True,
+		),
+	]
+	source_program = program([
+		import_block_decl([import_decl("parser", None, Some([
+					import_symbol("Cursor", None, []),
+					import_symbol("make_span", None, []),
+				]))]),
+		function_body_decl_with_purity(
+			"identity_cursor",
+			[named_param("cursor", named_type("Cursor"))],
+			Some(named_type("Cursor")),
+			Some(
+				decl_call_expr(
+					"make_span",
+					[decl_name_expr("cursor"), decl_name_expr("cursor")],
+				),
+			),
+			True,
+		),
+		function_body_decl_with_purity(
+			"literal_cursor",
+			[],
+			Some(named_type("Cursor")),
+			Some(decl_record_expr([
+				decl_record_field("offset", int_expr()),
+				decl_record_field("line", int_expr()),
+				decl_record_field("column", int_expr()),
+			])),
+			True,
+		),
+		RecordParsedDecl({
+			name = ident("CursorBox"),
+			type_params = [],
+			fields = [field_decl("cursor", named_type("Cursor"))],
+			is_struct = False,
+			doc = None,
+			span = source_span(),
+		}),
+		function_body_decl_with_purity(
+			"box_cursor",
+			[named_param("cursor", named_type("Cursor"))],
+			Some(named_type("CursorBox")),
+			Some(decl_record_expr([decl_record_field("cursor", decl_name_expr("cursor"))])),
+			True,
+		),
+	])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("std/parser", module_decls)],
+	)
+	canonical_cursor = compiler_canonical_module_type_name("std/parser", "Cursor")
+
+	match (
+		compiler_env_get_alias(result.state.env, "Cursor"),
+		compiler_env_get_record(result.state.env, "CursorBox"),
+	):
+		(Some((_, CompilerNamedType(alias_target, _))), Some((_, fields))):
+			match fields.get(0):
+				Some(field):
+					match field.field_type:
+						CompilerNamedType(field_type_name, _):
+							(
+								result.state.errors.length() == 0
+								and alias_target == canonical_cursor
+								and field_type_name == canonical_cursor
+							)
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+
+func test_import_modules_canonicalize_dependency_types_inside_imported_decls() -> Bool:
+	source_decls = [record_with_fields_decl("Span", [int_type()])]
+	ast_decls = [
+		import_block_decl([import_decl("source", None, Some([import_symbol("Span", None, [])]))]),
+		record_with_fields_decl("Node", [named_type("Span")]),
+		union_decl_with_variant_fields("Expr", "WithSpan", [named_type("Span")]),
+	]
+	source_program = program([import_block_decl([import_decl("ast", None, Some([
+					import_symbol("Node", None, []),
+					import_symbol("Expr", None, ["WithSpan"]),
+				]))])])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("source", source_decls), importable_module("ast", ast_decls)],
+	)
+	canonical_span = compiler_canonical_module_type_name("source", "Span")
+	canonical_node = compiler_canonical_module_type_name("ast", "Node")
+	canonical_expr = compiler_canonical_module_type_name("ast", "Expr")
+
+	match (
+		compiler_env_get_record(result.state.env, canonical_node),
+		compiler_env_get_type_decl(result.state.env, canonical_expr),
+	):
+		(Some((_, fields)), Some((_, variants))):
+			record_ok = match fields.get(0):
+				Some(field):
+					match field.field_type:
+						CompilerNamedType(type_name, _):
+							type_name == canonical_span
+						_:
+							False
+				None:
+					False
+
+			variant_ok = match variants.get(0):
+				Some(variant):
+					match variant.fields.get(0):
+						Some(CompilerNamedType(type_name, _)):
+							type_name == canonical_span
+						_:
+							False
+				None:
+					False
+
+			result.state.errors.length() == 0 and record_ok and variant_ok
+		_:
+			False
+
+
+func test_imported_function_return_record_supports_field_access_without_type_import() -> Bool:
+	model_decls = [RecordParsedDecl({
+			name = ident("Entry"),
+			type_params = [],
+			fields = [field_decl("name", string_type())],
+			is_struct = False,
+			doc = None,
+			span = source_span(),
+		}), function_body_decl_with_purity(
+			"make_entry",
+			[],
+			Some(named_type("Entry")),
+			Some(decl_record_expr([decl_record_field("name", decl_string_expr())])),
+			True,
+		)]
+	source_program = program([
+		import_block_decl(
+			[import_decl("model", None, Some([import_symbol("make_entry", None, [])]))],
+		),
+		function_body_decl_with_purity(
+			"entry_name",
+			[],
+			Some(string_type()),
+			Some(decl_field_access_expr(decl_call_expr("make_entry", []), "name")),
+			True,
+		),
+	])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("model", model_decls)],
+	)
+
+	result.state.errors.length() == 0
+
+
+func test_imported_global_abi_record_supports_field_access() -> Bool:
+	fs_decls = [RecordParsedDecl({
+			name = ident("DirectoryEntry"),
+			type_params = [],
+			fields = [field_decl("name", string_type())],
+			is_struct = False,
+			doc = None,
+			span = source_span(),
+		}), function_body_decl_with_purity(
+			"make_entry",
+			[],
+			Some(named_type("DirectoryEntry")),
+			Some(decl_record_expr([decl_record_field("name", decl_string_expr())])),
+			True,
+		)]
+	source_program = program([import_block_decl([import_decl("fs", None, Some([
+					import_symbol("DirectoryEntry", None, []),
+					import_symbol("make_entry", None, []),
+				]))]), function_body_decl_with_purity(
+			"entry_name",
+			[],
+			Some(string_type()),
+			Some(decl_field_access_expr(decl_call_expr("make_entry", []), "name")),
+			True,
+		)])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("std/fs", fs_decls)],
+	)
+
+	result.state.errors.length() == 0
 
 
 func test_registers_type_record_alias_and_constructors() -> Bool:
@@ -1330,6 +1773,92 @@ func test_materialize_program_bodies_carries_typed_function_and_global() -> Bool
 	)
 
 
+func test_materialize_program_bodies_resolves_function_alias_return_metadata() -> Bool:
+	source_program = program([
+		type_alias_decl_with_target(
+			"IntThunk",
+			function_type(True, [], int_type()),
+		),
+		function_body_decl_with_purity(
+			"make",
+			[],
+			Some(named_type("IntThunk")),
+			Some(decl_lambda_expr(True, int_expr())),
+			True,
+		),
+	])
+	base_state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match result.program.decls.get(1):
+		Some(CompilerTypedFunctionDecl(info)):
+			source_return_ok = match info.source_return_type:
+				Some(return_type):
+					compiler_types_equal(
+						return_type,
+						CompilerNamedType("IntThunk", []),
+					)
+				None:
+					False
+
+			expected_semantic = CompilerFunctionType(True, [], compiler_type_int())
+
+			body_ok = match info.body:
+				Some(body):
+					compiler_types_equal(compiler_typed_expr_semantic_type(body), expected_semantic)
+				None:
+					False
+
+			(
+				result.state.errors.length() == 0
+				and source_return_ok
+				and compiler_types_equal(info.semantic_return_type, expected_semantic)
+				and body_ok
+			)
+		_:
+			False
+
+
+func test_materialize_program_bodies_materializes_declared_literal_return() -> Bool:
+	source_program = program(
+		[function_body_decl_with_purity("answer", [], Some(int_type()), Some(int_expr()), True)],
+	)
+	base_state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match result.program.decls.get(0):
+		Some(CompilerTypedFunctionDecl(info)):
+			match info.body:
+				Some(body):
+					(
+						result.state.errors.length() == 0
+						and compiler_types_equal(
+							compiler_typed_expr_semantic_type(body),
+							compiler_type_int(),
+						)
+						and compiler_types_equal(
+							compiler_typed_expr_value_type(body),
+							compiler_type_int(),
+						)
+					)
+				None:
+					False
+		_:
+			False
+
+
 func test_materialize_program_bodies_carries_typed_decl_shapes() -> Bool:
 	source_program = program([
 		record_with_fields_decl("Widget", [int_type()]),
@@ -1652,6 +2181,66 @@ func test_check_function_body_reports_wrong_return_type() -> Bool:
 		.contains("expected: Bool")
 
 
+func test_check_function_body_accepts_function_alias_return() -> Bool:
+	source_program = program([
+		type_alias_decl_with_target(
+			"IntThunk",
+			function_type(True, [], int_type()),
+		),
+		function_body_decl_with_purity(
+			"make",
+			[],
+			Some(named_type("IntThunk")),
+			Some(decl_lambda_expr(True, int_expr())),
+			True,
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+
+	state.errors.length() == 0
+
+
+func test_check_generic_function_body_uses_expected_return_for_constructor_call() -> Bool:
+	source_program = program([
+		result_union_decl(),
+		generic_function_body_decl(
+			"fail",
+			[type_param("T")],
+			[named_param("error", string_type())],
+			Some(result_type(named_type("T"), string_type())),
+			Some(decl_call_expr("Err", [decl_name_expr("error")])),
+			True,
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+
+	state.errors.length() == 0
+
+
 func test_check_function_body_requires_return_annotation_for_values() -> Bool:
 	source_program = program([
 		function_body_decl("value", [], None, Some(int_expr())),
@@ -1676,6 +2265,23 @@ func test_check_function_body_requires_return_annotation_for_values() -> Bool:
 		.contains("Function 'value' body has type") and state.errors
 		.get_or(0, "")
 		.contains("no return type is declared")
+
+
+func test_check_function_body_skips_block_wrapped_builtin_body() -> Bool:
+	match function_body_decl(
+		"read_line",
+		[],
+		Some(string_type()),
+		Some(decl_block_expr([ParsedBuiltinExpr(Some("blorp_read_line"), source_span())])),
+	):
+		FunctionParsedDecl(function_decl):
+			state = compiler_typecheck_check_function_body(
+				compiler_typecheck_state_empty(),
+				function_decl,
+			)
+			state.errors.length() == 0
+		_:
+			False
 
 
 func test_check_main_signature_accepts_int_form() -> Bool:
@@ -2313,6 +2919,30 @@ tests: TestSuite = {
 			test_typecheck_program_with_import_surfaces_validates_imports,
 		),
 		(
+			"import modules register canonical type payloads",
+			test_import_modules_register_canonical_type_payloads,
+		),
+		(
+			"import modules register canonical signature types",
+			test_import_modules_register_canonical_signature_types,
+		),
+		(
+			"import modules resolve import aliases to loaded module path",
+			test_import_modules_resolve_import_aliases_to_loaded_module_path,
+		),
+		(
+			"import modules canonicalize dependency types inside imported decls",
+			test_import_modules_canonicalize_dependency_types_inside_imported_decls,
+		),
+		(
+			"imported function return record supports field access without type import",
+			test_imported_function_return_record_supports_field_access_without_type_import,
+		),
+		(
+			"imported global abi record supports field access",
+			test_imported_global_abi_record_supports_field_access,
+		),
+		(
 			"registers type record alias and constructors",
 			test_registers_type_record_alias_and_constructors,
 		),
@@ -2351,6 +2981,14 @@ tests: TestSuite = {
 			test_materialize_program_bodies_carries_typed_function_and_global,
 		),
 		(
+			"materialize program bodies resolves function alias return metadata",
+			test_materialize_program_bodies_resolves_function_alias_return_metadata,
+		),
+		(
+			"materialize program bodies materializes declared literal return",
+			test_materialize_program_bodies_materializes_declared_literal_return,
+		),
+		(
 			"materialize program bodies carries typed decl shapes",
 			test_materialize_program_bodies_carries_typed_decl_shapes,
 		),
@@ -2371,8 +3009,20 @@ tests: TestSuite = {
 			test_check_function_body_reports_wrong_return_type,
 		),
 		(
+			"check function body accepts function alias return",
+			test_check_function_body_accepts_function_alias_return,
+		),
+		(
+			"check generic function body uses expected return for constructor call",
+			test_check_generic_function_body_uses_expected_return_for_constructor_call,
+		),
+		(
 			"check function body requires return annotation for values",
 			test_check_function_body_requires_return_annotation_for_values,
+		),
+		(
+			"check function body skips block-wrapped builtin body",
+			test_check_function_body_skips_block_wrapped_builtin_body,
 		),
 		("check main signature accepts int form", test_check_main_signature_accepts_int_form),
 		("check main signature accepts void form", test_check_main_signature_accepts_void_form),

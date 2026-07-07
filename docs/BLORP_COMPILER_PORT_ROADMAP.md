@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-06.
+Status checked against code on 2026-07-07.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -16,13 +16,13 @@ point where OCaml code can be deleted.
 ## Current Production Path
 
 The current production `check`, `compile`, and `run` path already starts in
-Blorp and ends in Blorp, with an OCaml middle:
+the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
-Blorp CLI planning / source graph discovery / source reads / parse
-  -> JSON frontend module graph
-  -> OCaml command shell / module validation / typecheck / CTFE
-  -> OCaml typed AST -> Core lowering
+Blorp executable / CLI planning / source graph discovery / source reads / parse
+  -> JSON frontend module graph and typed-program bridge
+  -> OCaml host command execution / module validation / CTFE
+  -> decoded Blorp typed AST -> OCaml Core lowering
   -> OCaml Core pipeline through Perceus
   -> JSON post-Perceus Core
   -> Blorp reuse / closure / resource / fairness / prepare / prepared reuse
@@ -32,6 +32,7 @@ Blorp CLI planning / source graph discovery / source reads / parse
 
 Current source-frontier Blorp files:
 
+- `compiler/blorp/compiler_cli_main.brp`
 - `compiler/blorp/compiler_cli.brp`
 - `compiler/blorp/compiler_cli_args.brp`
 - `compiler/blorp/compiler_cli_plan.brp`
@@ -133,8 +134,10 @@ Implementation steps:
   bridge client.
 - Keep `emit_post_closure_c` and `run_core_pipeline` as the backend-tail
   boundary while OCaml still owns earlier Core stages.
-- Keep `parse_source` and `parse_sources` as the frontend parser boundary while
-  OCaml still consumes parsed AST values.
+- Keep the bridge `parse_source` / `parse_sources` actions as the frontend
+  parser boundary while OCaml still consumes parsed AST values. OCaml raw
+  parser consumers should go through `Modules.parse_raw_source*` so raw output
+  is explicit at call sites.
 - Delete snippet-style bridge renderers once their OCaml callers disappear.
 - Keep `BLORP_COMPILER_RENDERER_HELPER=1` limited to static bootstrap table
   support.
@@ -293,8 +296,11 @@ OCaml references:
   - `private_names_as_ast_pairs`
 - `compiler/lib/modules.ml`
   - `parse_source_artifact_with_blorp_bridge`
-  - `parse_source_with_blorp_bridge`
+  - `parse_source_artifact_at_phase`
+  - `parse_raw_source_artifact`
+  - `parse_typecheck_source_artifact`
   - `parse_source_at_phase`
+  - `parse_raw_source`
   - `parse_typecheck_source`
 
 Blorp references:
@@ -374,11 +380,13 @@ Graph-resolved modules are cached under both the canonical resolved module name
 and the original import spelling so existing import/typecheck code sees the same
 module identities that `load_module` used to provide.
 
-Remaining compatibility: `Modules.load_imports` and the old parse-cache preload
-helpers still exist for non-graph callers, LSP/tooling paths that have not been
-ported to the source-command graph contract, and embedded std/bootstrap support.
-Those are deletion targets for later checkpoints, not part of the production
-source-command handoff.
+Remaining compatibility: `Modules.load_imports` still owns import loading for
+non-graph callers, LSP/tooling paths that have not been ported to the
+source-command graph contract, and embedded std/bootstrap support. Its internal
+import-closure preloader still batches source parsing through the Blorp parser
+bridge, but it is no longer a separate CLI source handoff. This is a deletion
+target for later checkpoints, not part of the production source-command
+handoff.
 
 OCaml references:
 
@@ -406,7 +414,7 @@ OCaml references:
     - `load_module_inner`
     - `parse_module_source`
     - `load_imports`
-    - `preload_parsed_sources`
+    - `load_preloaded_module_graph`
     - `preload_module_import_closure`
     - `preload_module_parse_cache_with_blorp_bridge`
     - `import_preload_candidates`
@@ -415,9 +423,10 @@ OCaml references:
     - `cached_parse_entry`
     - `cached_filesystem_entry_is_current`
     - `prune_parse_cache_to_loaded_modules`
-  - legacy syntactic exports:
-    - `collect_exports`
-    - `collect_private_names`
+  - legacy syntactic fallback helpers:
+    - `collect_syntactic_exports_from_ast_for_fallback`
+    - `collect_private_names_from_ast_for_fallback`
+    - `import_module_names_from_ast_for_fallback`
 - `compiler/lib/session.ml`
   - `loaded_module`
   - `parsed_module_cache_entry`
@@ -909,7 +918,14 @@ Deletion point:
 Goal: port expression inference, function/global body checking, purity,
 tailrec, resources, concurrency, and final typed AST construction.
 
-Status: in progress with the expression-inference substrate in place.
+Status: closed at the typecheck boundary. Blorp owns the expression-inference
+and second-pass typecheck substrate and can materialize a validated
+typed-program artifact. Production `check`, `compile`, and `run` source
+commands consume that artifact through the single frontend graph handoff before
+OCaml CTFE and Core lowering. Legacy direct `Pipeline.compile` /
+`Pipeline.typecheck_only` APIs and some tooling/test paths can still use the
+OCaml parser/typechecker until their callers move to an explicit Blorp frontend
+graph.
 `compiler/blorp/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
 primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
@@ -953,7 +969,9 @@ including structural matching under the method entry's type parameters, binds
 receiver-derived generic substitutions before checking explicit method
 arguments, prepends the typed receiver as the first call argument, specializes
 generic returns, enforces selected UFCS entry trait bounds, and checks
-non-receiver arity.
+non-receiver arity. Imported trait methods also resolve through
+receiver-method syntax and direct calls while preserving the concrete impl
+method's compiler-owned resource-operation policy.
 Module-qualified function calls through registered module aliases now resolve
 before ordinary field access and preserve the selected callable id/purity
 metadata. Module-qualified variable access now resolves through explicit
@@ -1387,17 +1405,17 @@ Current status:
   builtin, foreign, constructor, and impl-method calls so later Core and CTFE
   stages do not infer call provenance from names.
 - Blorp now has structured typed expression, typed declaration, and
-  `CompilerTypedProgram` JSON projections. These are not yet wired into the
-  production compile path; they define the temporary handoff artifact shape that
-  the OCaml Core-lowering decoder can consume next. Typed function metadata now
-  carries the registered callable id, so decoded function declarations preserve
-  the same direct-call identity Core lowering expects.
+  `CompilerTypedProgram` JSON projections. The production source-command path
+  now consumes this temporary handoff artifact before OCaml CTFE and Core
+  lowering. Typed function metadata now carries the registered callable id, so
+  decoded function declarations preserve the same direct-call identity Core
+  lowering expects.
 - Blorp now has a dedicated `typecheck_source` bridge artifact producer in
   `compiler_typecheck_bridge.brp`. It typechecks a single finalized source
   program and returns `typed_program`, `type_errors`, and `module_surface`
-  fields. This bridge is not yet the production compile path; it exists to
-  exercise and stabilize the typed-program boundary before the OCaml decoder is
-  wired in.
+  fields. The production source-command path uses this bridge through
+  graph-aware request payloads; direct source/tooling APIs still need explicit
+  frontend graphs before they can use the same boundary.
 - OCaml now has a `Typed_ast_json` decoder layer for source spans, structured
   `CompilerType` JSON, typed expression metadata, proof facts, resolved-call
   bridge metadata including callable origin, value slots, and typed patterns
@@ -1418,17 +1436,29 @@ Current status:
   expression/declaration coverage remains.
   The OCaml decoder independently rejects incoherent explicit-origin and
   value-slot metadata before those artifacts can reach Core lowering.
+- The OCaml typed-program decoder now also materializes typed string
+  interpolation parts, lambdas, `select`, `while`, ordinary `for` loops
+  including tuple binders, `for ... concurrently(...)`, `detach`, and `with`
+  expressions. `concurrent:` block decoding still needs a bridge shape that
+  carries explicit concurrent binding result metadata instead of only a typed
+  body block; do not decode it by guessing from body statements.
 - OCaml now also has an explicit `typecheck_source` bridge client path:
   request builders, typed-program artifact decoding through `Typed_ast_json`,
   path-only request helpers, and a dedicated prepared
   `compiler_typecheck_bridge_cli.brp` helper binary. `scripts/test` prepares
   this helper alongside the renderer and parser helpers, so typed-frontend
   bridge calls do not fall back to lazy helper compilation during test gates.
+  The OCaml client also exposes command helpers for graph-style typed-source
+  requests with explicit imported modules, with integration tests that execute
+  the bridge and decode both standalone and imported-module typed artifacts.
+  Typecheck response decoding surfaces `type_errors` even when the best-effort
+  typed tree attached to an error artifact fails typed-AST validation;
+  successful artifacts still must decode as coherent typed programs.
   The request protocol also has an explicit `import_modules` field for callers
   that already own graph context: each supplied module is parsed into a Blorp
   module surface and passed through `compiler_typecheck_program_with_import_surfaces`.
-  This is still a handoff boundary only; normal `check`, `compile`, and `run`
-  have not yet been switched to consume the Blorp typed-program artifact.
+  This is the normal source-command handoff boundary for `check`, `compile`,
+  and `run`; CTFE and Core lowering remain on the OCaml side of that boundary.
 - Blorp typechecking now centralizes import bookkeeping in
   `compiler_imports.brp`. The single-source typed bridge uses the explicit
   syntax-only import collector so it can report qualified module aliases,
@@ -1452,11 +1482,26 @@ Current status:
   typecheck through the Blorp bridge. Bare lookup is scoped: declarations made
   available only through a module alias do not leak as unqualified values, and
   private imported declarations are skipped.
-- Remaining checkpoint work is CTFE, graph-aware/module-scoped Blorp
-  typechecking, and wiring the temporary typed-program JSON handoff to OCaml
-  Core lowering. Production `check`, `compile`, and `run` should not switch to
-  the single-source typed bridge until imported-module environments are scoped
-  enough to avoid accepting names that were never imported.
+- `Pipeline.typecheck_only_typed_with_blorp_bridge` is the graph-backed Blorp
+  typecheck handoff used by source-command checks. It builds explicit
+  import-module payloads from graph edges, materializes graph-loaded dependency
+  module typed declarations/import bindings into `Modules`, and runs OCaml CTFE
+  over decoded dependency and target typed programs before returning either the
+  post-CTFE target typed program or Blorp typecheck/CTFE diagnostics.
+- `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
+  compile boundary: it consumes the same Blorp frontend graph, decodes the
+  Blorp typed-program artifact, runs CTFE, populates dependency typed-module
+  caches, and then enters the shared OCaml Core/codegen handoff without
+  returning to the OCaml typechecker.
+- The Blorp executable (`compiler_cli_main.brp`) now runs CLI planning and
+  source graph construction directly, writes the existing CLI plan JSON
+  artifact to a temporary file, and invokes the private OCaml host only to
+  execute that plan. The host no longer needs to ask a Blorp helper to interpret
+  normal user CLI arguments.
+- Remaining checkpoint work is CTFE and final typed AST ownership: OCaml still
+  evaluates compile-time values after decoding the Blorp typed artifact, and
+  legacy direct pipeline APIs still need explicit frontend graphs before their
+  OCaml typechecker path can be retired.
 
 Edge cases:
 
@@ -2008,6 +2053,10 @@ make docker-premerge-gate
 
 - `module_local_type_names_from_decls` was centralized as
   `Module_type_identity.local_type_names_from_decls`.
+- Blorp module surfaces are the production owner for syntactic module
+  imports, exports, and private names. OCaml AST scanners for those facts are
+  private fallback helpers; typed semantic export conversion remains exposed
+  while OCaml owns typecheck.
 - The old `Types.validate_tensor_dims` alias was removed; callers use
   `Types.validate_array_dims`.
 - Keep `Types.normalize_type_name` until legacy `Vector`/`Matrix` nominal

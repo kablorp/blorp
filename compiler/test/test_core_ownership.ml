@@ -75,6 +75,11 @@ let test_list_len_borrows () =
     { args = [ Borrow ]; result = ReturnPrimitive }
     (intrinsic_contract "list_len" 1)
 
+let test_math_round_intrinsic_borrows () =
+  check_contract "math_round"
+    { args = [ Borrow ]; result = ReturnPrimitive }
+    (intrinsic_contract "math_round" 1)
+
 let test_list_get_returns_alias () =
   check_contract "list_get"
     { args = [ Borrow; Borrow ]; result = ReturnAliasOfArg 0 }
@@ -1484,6 +1489,8 @@ let suite =
           test_tensor_linear_algebra_borrows_inputs;
         Alcotest.test_case "vector_specialized_reads_borrow_inputs" `Quick
           test_vector_specialized_reads_borrow_inputs;
+        Alcotest.test_case "math_round_intrinsic_borrows" `Quick
+          test_math_round_intrinsic_borrows;
         Alcotest.test_case "to_string_runtime_builtins_borrow_inputs" `Quick
           test_to_string_runtime_builtins_borrow_inputs;
         Alcotest.test_case "generated_enum_vector_to_string_contract" `Quick

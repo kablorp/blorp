@@ -2340,6 +2340,7 @@ void* blorp_mkstemp_path(const blorp_String* prefix);
 // (removed blorp_walk_dir — now IR intrinsic)
 void* blorp_exec_output(const blorp_String* cmd);
 void* blorp_process_run(const blorp_String* program, const blorp_List* args);
+void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args);
 void* blorp_process_shell(const blorp_String* command);
 
 // Hashing / Crypto

@@ -190,6 +190,13 @@ type typecheck_import_module = {
   typecheck_import_origin : cli_frontend_module_origin;
 }
 
+type typecheck_resolved_import = {
+  typecheck_resolved_import_from_path : string;
+  typecheck_resolved_import_from_module : string;
+  typecheck_resolved_import_path : string;
+  typecheck_resolved_import_module : string;
+}
+
 type cli_frontend_source_package = {
   cli_frontend_source_package_alias : string;
   cli_frontend_source_package_name : string;
@@ -598,15 +605,37 @@ let typecheck_import_modules_field import_modules =
         );
       ]
 
-let typecheck_source_request_json_with_imports ~import_modules ~path
-    ~module_name ~text =
+let typecheck_resolved_import_json item =
+  Lsp_json.Object
+    [
+      ("from_path", Lsp_json.String item.typecheck_resolved_import_from_path);
+      ("from_module", Lsp_json.String item.typecheck_resolved_import_from_module);
+      ("import_path", Lsp_json.String item.typecheck_resolved_import_path);
+      ("resolved_module", Lsp_json.String item.typecheck_resolved_import_module);
+    ]
+
+let typecheck_resolved_imports_field resolved_imports =
+  match resolved_imports with
+  | [] -> []
+  | _ ->
+      [
+        ( "resolved_imports",
+          Lsp_json.Array
+            (List.map typecheck_resolved_import_json resolved_imports) );
+      ]
+
+let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
+    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
   let payload_fields =
     [
       ("path", Lsp_json.String path);
       ("module", Lsp_json.String module_name);
       ("text", Lsp_json.String text);
+      ("origin", cli_frontend_module_origin_json origin);
+      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
     ]
     @ typecheck_import_modules_field import_modules
+    @ typecheck_resolved_imports_field resolved_imports
   in
   Lsp_json.to_string
     (Lsp_json.Object
@@ -616,16 +645,24 @@ let typecheck_source_request_json_with_imports ~import_modules ~path
          ("action", Lsp_json.String "typecheck_source");
          ("payload", Lsp_json.Object payload_fields);
        ])
+
+let typecheck_source_request_json_with_imports ~import_modules ~path
+    ~module_name ~text =
+  typecheck_source_request_json_with_imports_policy
+    ~resolved_imports:[] ~origin:CliFrontendUserModule
+    ~allow_debug_only_calls:false ~import_modules ~path ~module_name ~text
 
 let typecheck_source_request_json ~path ~module_name ~text =
   typecheck_source_request_json_with_imports ~import_modules:[] ~path
     ~module_name ~text
 
-let typecheck_source_file_request_json_with_imports ~import_modules ~path
-    ~module_name =
+let typecheck_source_file_request_json_with_imports_policy ~origin
+    ~allow_debug_only_calls ~import_modules ~path ~module_name =
   let payload_fields =
     [
       ("path", Lsp_json.String path); ("module", Lsp_json.String module_name);
+      ("origin", cli_frontend_module_origin_json origin);
+      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
     ]
     @ typecheck_import_modules_field import_modules
   in
@@ -637,6 +674,12 @@ let typecheck_source_file_request_json_with_imports ~import_modules ~path
          ("action", Lsp_json.String "typecheck_source");
          ("payload", Lsp_json.Object payload_fields);
        ])
+
+let typecheck_source_file_request_json_with_imports ~import_modules ~path
+    ~module_name =
+  typecheck_source_file_request_json_with_imports_policy
+    ~origin:CliFrontendUserModule ~allow_debug_only_calls:false
+    ~import_modules ~path ~module_name
 
 let typecheck_source_file_request_json ~path ~module_name =
   typecheck_source_file_request_json_with_imports ~import_modules:[] ~path
@@ -1092,9 +1135,23 @@ let typechecked_source_artifact_field artifact =
           typechecked_module_surface;
         }
   | Error err ->
-      Error
-        ( "invalid_response",
-          Typed_ast_json.decode_error_to_string err )
+      (* Error artifacts may include a best-effort typed tree that failed
+         validation while the typechecker was collecting diagnostics. Surface
+         the diagnostics first; successful artifacts must still decode fully. *)
+      if typechecked_errors <> [] then
+        Ok
+          {
+            typechecked_program = Typed_ast.make_program [];
+            typechecked_errors;
+            typechecked_import_bindings;
+            typechecked_comments;
+            typechecked_phase;
+            typechecked_module_surface;
+          }
+      else
+        Error
+          ( "invalid_response",
+            Typed_ast_json.decode_error_to_string err )
 
 let typecheck_source_response_field response =
   let* artifact = json_response_field "artifact" response in
@@ -2954,19 +3011,64 @@ let parse_source_file_via_command ~path ~module_name =
   parse_source_file_via_command_at_phase ~phase:RawParsedProgram ~path
     ~module_name
 
-let typecheck_source_via_command ~path ~module_name ~text =
+let typecheck_source_via_command_with_policy ~origin ~allow_debug_only_calls
+    ~path ~module_name ~text =
   let response_json =
     run_typecheck_request_via_blorp
-      (typecheck_source_request_json ~path ~module_name ~text)
+      (typecheck_source_request_json_with_imports_policy
+         ~resolved_imports:[] ~origin ~allow_debug_only_calls ~import_modules:[] ~path
+         ~module_name ~text)
+  in
+  typecheck_source_response_json response_json
+
+let typecheck_source_via_command ~path ~module_name ~text =
+  typecheck_source_via_command_with_policy ~origin:CliFrontendUserModule
+    ~allow_debug_only_calls:false ~path ~module_name ~text
+
+let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
+    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_source_request_json_with_imports_policy
+         ~resolved_imports ~origin ~allow_debug_only_calls ~import_modules
+         ~path ~module_name ~text)
+  in
+  typecheck_source_response_json response_json
+
+let typecheck_source_via_command_with_imports ~import_modules ~path
+    ~module_name ~text =
+  typecheck_source_via_command_with_imports_policy
+    ~resolved_imports:[] ~origin:CliFrontendUserModule
+    ~allow_debug_only_calls:false ~import_modules ~path ~module_name ~text
+
+let typecheck_source_file_via_command_with_policy ~origin
+    ~allow_debug_only_calls ~path ~module_name =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_source_file_request_json_with_imports_policy
+         ~origin ~allow_debug_only_calls ~import_modules:[] ~path
+         ~module_name)
   in
   typecheck_source_response_json response_json
 
 let typecheck_source_file_via_command ~path ~module_name =
+  typecheck_source_file_via_command_with_policy ~origin:CliFrontendUserModule
+    ~allow_debug_only_calls:false ~path ~module_name
+
+let typecheck_source_file_via_command_with_imports_policy ~origin
+    ~allow_debug_only_calls ~import_modules ~path ~module_name =
   let response_json =
     run_typecheck_request_via_blorp
-      (typecheck_source_file_request_json ~path ~module_name)
+      (typecheck_source_file_request_json_with_imports_policy
+         ~origin ~allow_debug_only_calls ~import_modules ~path ~module_name)
   in
   typecheck_source_response_json response_json
+
+let typecheck_source_file_via_command_with_imports ~import_modules ~path
+    ~module_name =
+  typecheck_source_file_via_command_with_imports_policy
+    ~origin:CliFrontendUserModule ~allow_debug_only_calls:false
+    ~import_modules ~path ~module_name
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json

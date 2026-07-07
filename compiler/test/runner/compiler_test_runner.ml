@@ -383,7 +383,7 @@ let run_parse file =
       let sess = Session.create () in
       Session.with_current sess (fun () ->
           Modules.init_module_paths (Modules.extract_directory file);
-          match Modules.parse_source ~filename:file source with
+          match Modules.parse_raw_source ~filename:file source with
           | Ok _ -> { code = 0; output = "" }
           | Error err ->
               { code = 1; output = Diagnostics.format_error ~file err }))

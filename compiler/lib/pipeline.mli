@@ -75,25 +75,55 @@ val typecheck_only_typed_reusing_session :
 val typecheck_only_parsed :
   filename:string ->
   program:Ast.program ->
-  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   ?preloaded_module_graph:Modules.preloaded_module_graph ->
   ?debug:bool ->
   unit ->
   (Ast.program, Ast.compiler_error list) result
 (** Load modules and type-check a program that has already passed through
     parser finalization. This is used by the Blorp-owned CLI/frontend bridge
-    after OCaml parses interpolations and hoists nested
-    declarations. Prefer [typecheck_only_typed_parsed] for new callers. *)
+    after the Blorp parser bridge has finalized interpolation, nested
+    declarations, and other parser-adjacent source rewrites. When the caller
+    already owns the Blorp frontend import closure, [preloaded_module_graph]
+    supplies the single graph handoff for module loading. Production CLI
+    source commands should pass that graph; omitting it uses the legacy
+    direct-import-loading path for tests and standalone tooling. Prefer
+    [typecheck_only_typed_parsed] for new callers. *)
 
 val typecheck_only_typed_parsed :
   filename:string ->
   program:Ast.program ->
-  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   ?preloaded_module_graph:Modules.preloaded_module_graph ->
   ?debug:bool ->
   unit ->
   (Typed_ast.program, Ast.compiler_error list) result
 (** Typed-AST variant of [typecheck_only_parsed]. *)
+
+val typecheck_only_typed_with_blorp_bridge :
+  filename:string ->
+  preloaded_module_graph:Modules.preloaded_module_graph ->
+  (Typed_ast.program, Ast.compiler_error list) result
+(** Typecheck through the Blorp-owned typed-source bridge for a frontend module
+    graph.
+
+    This asks the Blorp typecheck bridge to typecheck the target source using
+    graph-provided import modules and decodes the temporary typed-program
+    artifact. Graph-loaded dependency modules are decoded, CTFE-evaluated, and
+    cached inside the fresh pipeline session used for this check. The default
+    wrapper rejects direct [@debug_only] calls; use
+    [typecheck_only_typed_with_blorp_bridge_policy] for command paths that
+    need to honor [--debug]. Production source-command checks use this graph
+    handoff; direct source APIs without a preloaded graph still use the legacy
+    OCaml path until those callers are migrated. *)
+
+val typecheck_only_typed_with_blorp_bridge_policy :
+  debug:bool ->
+  allow_debug_only_calls:bool ->
+  filename:string ->
+  preloaded_module_graph:Modules.preloaded_module_graph ->
+  (Typed_ast.program, Ast.compiler_error list) result
+(** Policy-explicit variant of [typecheck_only_typed_with_blorp_bridge] for
+    command paths that need to honor [--debug] or intentionally permit
+    [@debug_only] calls in test harnesses. *)
 
 val typecheck_module_only :
   filename:string ->
@@ -198,14 +228,42 @@ val compile_parsed :
   ?check_invariants:bool ->
   filename:string ->
   program:Ast.program ->
-  ?preloaded_parsed_sources:Modules.preloaded_parsed_source list ->
   ?preloaded_module_graph:Modules.preloaded_module_graph ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
 (** Compile a program that has already passed through parser finalization.
     This follows the same module-load, typecheck, and Core/codegen path as
     [compile]; only the initial source read and parse are supplied by the
-    caller. *)
+    caller. When present, [preloaded_module_graph] is the single frontend
+    bridge handoff for already discovered roots, imports, and module surfaces.
+    Production CLI source commands should pass that graph; omitting it uses
+    the legacy direct-import-loading path for tests and standalone tooling. *)
+
+val compile_preloaded_graph_with_blorp_bridge :
+  ?debug:bool ->
+  ?allow_debug_only_calls:bool ->
+  ?retain_debug_blocks:bool ->
+  ?embed_runtime:bool ->
+  ?require_main:bool ->
+  ?profile:bool ->
+  ?on_frontend_phase:(frontend_phase -> unit) ->
+  ?on_stage:Core_pipeline.on_stage_callback ->
+  ?on_stage_event:Core_pipeline.on_stage_event ->
+  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
+  ?tail_observation_stages:Core_stage.t list ->
+  ?check_invariants:bool ->
+  filename:string ->
+  preloaded_module_graph:Modules.preloaded_module_graph ->
+  unit ->
+  (compile_outcome, Ast.compiler_error list) result
+(** Compile through the Blorp-owned source/typecheck frontier.
+
+    This consumes a Blorp frontend module graph, obtains the decoded Blorp
+    typed-program artifact, runs CTFE, populates dependency typed-module caches,
+    and then enters the same Core/codegen handoff used by [compile_parsed].
+    Production source-command compilation uses this path. Direct source APIs
+    without a preloaded frontend graph still use [compile]/[compile_parsed]
+    until their callers are migrated to the single frontend graph handoff. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->

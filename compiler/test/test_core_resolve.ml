@@ -851,6 +851,175 @@ let test_resolve_qualified_call_prefers_carried_def_id_name () =
       Alcotest.(check (option int)) "selected def id" (Some 77) def_id
   | _ -> Alcotest.fail "expected qualified CKUser selected by carried def id"
 
+let test_resolve_ufcs_name_ignores_stale_carried_def_id () =
+  let ty_string = TyNamed ("String", []) in
+  let ty_list_string = TyNamed ("List", [ ty_string ]) in
+  let split_func : core_func =
+    {
+      cf_name = "std_string__split";
+      cf_type_params = [];
+      cf_module = Some "std/string";
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = ty_string; cp_loc = loc };
+          { cp_name = Var.named "delim"; cp_ty = ty_string; cp_loc = loc };
+        ];
+      cf_return_ty = ty_list_string;
+      cf_body = Some (mk CVoid ty_void);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1652;
+    }
+  in
+  let stale_target : core_func =
+    {
+      cf_name = "std_list____unsafe_list_remove__mono_String";
+      cf_type_params = [];
+      cf_module = Some "std/list";
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = ty_list_string; cp_loc = loc };
+          { cp_name = Var.named "index"; cp_ty = ty_int; cp_loc = loc };
+        ];
+      cf_return_ty = ty_list_string;
+      cf_body = Some (mk CVoid ty_void);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 447;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_string; ty_string ]; return = ty_list_string; is_pure = true }
+  in
+  let callee =
+    mk
+      (CVar { (Var.named "__ufcs_std$string__split") with vdef_id = Some 447 })
+      call_ty
+  in
+  let call =
+    mk (CCall (CKSelectedDirect 447, callee, [ cstr "a\nb"; cstr "\n" ]))
+      ty_list_string
+  in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_list_string;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc split_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc stale_target; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let main_resolved =
+    match resolved with
+    | [ _; _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected std/string split, stale target, and main"
+  in
+  match main_resolved.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string) "explicit UFCS target" "std_string__split" name;
+      Alcotest.(check (option int)) "explicit UFCS def id" (Some 1652) def_id
+  | _ -> Alcotest.fail "expected explicit UFCS name to beat stale vdef_id"
+
+let test_resolve_selected_direct_rejects_stale_signature () =
+  let ty_string = TyNamed ("String", []) in
+  let ty_list_string = TyNamed ("List", [ ty_string ]) in
+  let split_func : core_func =
+    {
+      cf_name = "std_string__split";
+      cf_type_params = [];
+      cf_module = Some "std/string";
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = ty_string; cp_loc = loc };
+          { cp_name = Var.named "delim"; cp_ty = ty_string; cp_loc = loc };
+        ];
+      cf_return_ty = ty_list_string;
+      cf_body = Some (mk CVoid ty_void);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1652;
+    }
+  in
+  let stale_target : core_func =
+    {
+      cf_name = "std_list____unsafe_list_remove__mono_String";
+      cf_type_params = [];
+      cf_module = Some "std/list";
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = ty_list_string; cp_loc = loc };
+          { cp_name = Var.named "index"; cp_ty = ty_int; cp_loc = loc };
+        ];
+      cf_return_ty = ty_list_string;
+      cf_body = Some (mk CVoid ty_void);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 447;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_string; ty_string ]; return = ty_list_string; is_pure = true }
+  in
+  let callee =
+    mk
+      (CVar { (Var.named "std_string__split") with vdef_id = Some 447 })
+      call_ty
+  in
+  let call =
+    mk (CCall (CKSelectedDirect 447, callee, [ cstr "a\nb"; cstr "\n" ]))
+      ty_list_string
+  in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_list_string;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc split_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc stale_target; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let main_resolved =
+    match resolved with
+    | [ _; _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected split, stale target, and main"
+  in
+  match main_resolved.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string)
+        "current-program callee name" "std_string__split" name;
+      Alcotest.(check (option int)) "current-program def id" (Some 1652) def_id
+  | _ -> Alcotest.fail "expected stale selected id to fall back to callee name"
+
 let test_resolve_local_value_shadows_module_alias_call () =
   (* If a local value has the same spelling as an imported module alias,
      qualified field calls on the local value must remain closure calls. The
@@ -2229,6 +2398,10 @@ let suite =
           test_resolve_qualified_module_alias_builtin;
         Alcotest.test_case "qualified_call_prefers_carried_def_id_name" `Quick
           test_resolve_qualified_call_prefers_carried_def_id_name;
+        Alcotest.test_case "ufcs_name_ignores_stale_carried_def_id" `Quick
+          test_resolve_ufcs_name_ignores_stale_carried_def_id;
+        Alcotest.test_case "selected_direct_rejects_stale_signature" `Quick
+          test_resolve_selected_direct_rejects_stale_signature;
         Alcotest.test_case "local_value_shadows_module_alias_call" `Quick
           test_resolve_local_value_shadows_module_alias_call;
         Alcotest.test_case "resource_scope_shadows_module_alias_call" `Quick

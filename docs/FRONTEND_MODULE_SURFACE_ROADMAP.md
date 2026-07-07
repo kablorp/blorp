@@ -20,11 +20,13 @@ typechecking:
 
 - `compiler/lib/modules.ml`
   - `extract_export_names`
-  - `collect_exports`
-  - `collect_private_names`
-  - `import_module_names_from_decls`
+  - `collect_syntactic_exports_from_ast_for_fallback`
+  - `collect_private_names_from_ast_for_fallback`
+  - `import_module_names_from_ast_for_fallback`
+  - `semantic_exports_from_program`
   - `cache_parsed_module_source`
-  - `preload_parsed_sources`
+  - `load_preloaded_source_module`
+  - `load_preloaded_module_graph`
   - `preload_module_import_closure`
   - `parse_module_source`
   - `load_imports`
@@ -32,9 +34,9 @@ typechecking:
   - `preloaded_parsed_source`
   - `load_module`
   - `load_imports`
-  - `preload_parsed_sources`
-  - `collect_exports`
-  - `collect_private_names`
+  - `load_preloaded_module_graph`
+  - `semantic_exports_from_program`
+  - `private_names_for_import_diagnostics`
 - `compiler/lib/session.ml`
   - `parsed_module_cache_entry`
   - `loaded_module`
@@ -68,15 +70,15 @@ The OCaml syntactic export rules are:
 - Import declarations are not re-exported.
 - Private declarations are not exported.
 - Impl methods for a private trait are not exported.
-- `collect_private_names` applies the same extraction rules to the inner
+- the private-name fallback applies the same extraction rules to the inner
   declaration of each private declaration so import errors can distinguish
-  "missing" from "private".
+  "missing" from "private" when no Blorp surface is available.
 
 The typed import path is intentionally different. After a module has typed
 declarations, `typecheck.ml` uses `semantic_export_program` and
-`semantic_export_decl` before calling `Modules.collect_exports`. That semantic
-export layer carries inferred type information and must stay in OCaml until
-typechecking moves.
+`semantic_export_decl` before calling `Modules.semantic_exports_from_program`.
+That semantic export layer carries inferred type information and must stay in
+OCaml until typechecking moves.
 
 ## Design Target
 
@@ -167,12 +169,14 @@ Tests:
   - Verifies private function/type/trait names are absent from exports.
 - `private_names_track_inner_decl_surface`
   - Verifies private trait methods and private impl methods appear in
-    `collect_private_names`.
+    the old private-name scanner. These direct scanner tests were removed in
+    checkpoint 9 after the Blorp surface became the production owner.
 - `private_trait_suppresses_impl_method_exports`
   - Verifies an impl for a private trait does not export methods.
 - `import_blocks_flatten_module_paths`
-  - Verifies `import_module_names_from_decls` sees each import path in an
-    import block.
+  - Verifies the old AST import scanner sees each import path in an import
+    block. These direct scanner tests were removed in checkpoint 9 after the
+    Blorp surface became the production owner.
 
 Commands:
 
@@ -213,8 +217,8 @@ Functions in `compiler_module_surface.brp`:
 
 Implementation notes:
 
-- Match the OCaml behavior from `Modules.collect_exports` and
-  `Modules.collect_private_names`.
+- Match the OCaml behavior from the syntactic export and private-name fallback
+  helpers that were public before module surfaces became authoritative.
 - Do not inspect JSON in this module. It should use `ParsedProgram` and
   `ParsedDecl` directly.
 - Preserve declaration indexes and method indexes so OCaml can map symbols back
@@ -386,9 +390,10 @@ Function changes:
 - `cache_parsed_module_source`
   - Accept `?surface`.
   - Validate `surface` with `Module_surface.validate_against_program`.
-  - Continue storing `exports = collect_exports decls` for this checkpoint.
-- `preload_parsed_sources`
-  - Pass decoded `parsed_module_surface` into `cache_parsed_module_source`.
+  - Continue storing exports from the AST fallback for this checkpoint.
+- `load_preloaded_source_module`
+  - Pass decoded `parsed_module_surface` from graph sources into
+    `cache_parsed_module_source`.
 - `parse_module_source`
   - Pass decoded `parsed_module_surface` from `Compiler_blorp_bridge`.
 - `apply_module_parse_batch_response`
@@ -399,7 +404,7 @@ Function changes:
 Tests:
 
 - `preloaded parsed source stores module surface`
-- `trusted preloaded parse cache preserves surface`
+- `trusted preloaded module graph preserves surface`
 - `module parse batch stores decoded surface`
 - `surface mismatch reports bridge validation error`
 
@@ -418,6 +423,10 @@ Acceptance:
 
 ## Checkpoint 6: Use Surface For Import Discovery
 
+Status: implemented. Production frontend graph and module preload paths prefer
+the Blorp module surface for import names; the remaining AST import scanner is
+private and named as a fallback for non-surface callers.
+
 Replace syntactic import scanning in module preload with the decoded surface.
 
 Files:
@@ -428,11 +437,10 @@ Files:
 
 Function changes:
 
-- Replace uses of `import_module_names_from_decls` in parse-cache preload paths
-  with:
+- Replace uses of the AST import scanner in parse-cache preload paths with:
   - `Module_surface.import_module_names surface` when a surface is available.
-  - `import_module_names_from_decls decls` only as a fallback for non-bridge
-    tests or transitional call sites.
+  - `import_module_names_from_ast_for_fallback decls` only as a fallback for
+    non-surface callers.
 - In `preload_module_import_closure`, prefer cached entry surfaces for import
   closure expansion.
 - In `load_imports`, use the loaded module surface where available for direct
@@ -490,14 +498,15 @@ Function changes:
 - `cache_parsed_module_source`
   - If `surface` is present, set `exports` with
     `Module_surface.exports_as_ast_pairs decls surface`.
-  - If no surface is present, use `collect_exports decls`.
-- `collect_private_names`
-  - Keep the existing function for typed semantic exports and fallback paths.
+  - If no surface is present, use
+    `collect_syntactic_exports_from_ast_for_fallback decls`.
+- private-name fallback
+  - Keep the AST fallback private for non-surface paths.
   - Add a surface-backed private-name helper for module import diagnostics.
 - `typecheck.ml`
   - Keep `module_exports_for_import` semantic behavior:
     - typed module available: use `semantic_export_program` and
-      `Modules.collect_exports`.
+      `Modules.semantic_exports_from_program`.
     - untyped module with surface-backed exports: use `m.exports`.
 
 Tests:
@@ -573,6 +582,12 @@ Acceptance:
 
 ## Checkpoint 9: Delete Or Narrow OCaml Fallbacks
 
+Status: implemented on 2026-07-06. OCaml syntactic import/export/private-name
+scanners are no longer exposed as ordinary module APIs. The remaining AST
+scanners are private fallback helpers for modules without a surface, and typed
+semantic export conversion is exposed separately as
+`semantic_exports_from_program` while OCaml still owns typed exports.
+
 After normal compile/check/run/test paths use surfaces, remove duplicated OCaml
 code where it is no longer needed.
 
@@ -585,13 +600,17 @@ Files:
 
 Deletion/narrowing plan:
 
-- Keep `collect_exports` only for typed semantic export conversion and explicit
-  fallback tests.
-- Rename fallback helpers if needed:
+- Keep typed semantic export conversion separate from syntactic module surface
+  discovery via `semantic_exports_from_program`.
+- Keep fallback helpers private and explicitly named:
   - `collect_syntactic_exports_from_ast_for_fallback`
   - `collect_private_names_from_ast_for_fallback`
-- Remove direct production uses of `import_module_names_from_decls` when a
-  module surface is available.
+  - `import_module_names_from_ast_for_fallback`
+- Remove direct production uses of AST import scanning when a module surface is
+  available.
+- Keep the Pipeline parsed-entry boundary single-source: callers pass the
+  Blorp-produced `preloaded_module_graph`, not a separate parsed-source preload
+  list.
 - Remove tests that only duplicate the Blorp surface suite and keep cross-bridge
   parity tests.
 
@@ -609,6 +628,10 @@ Acceptance:
 - The production path has one clear surface owner: Blorp.
 
 ## Checkpoint 10: Documentation And Architecture Update
+
+Status: implemented on 2026-07-06. The architecture docs, Blorp compiler
+README, session comments, and module interface comments now describe the parser
+artifact/module-surface contract and the remaining OCaml typed-export boundary.
 
 Document the new bridge contract and update stale comments.
 

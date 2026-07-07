@@ -160,7 +160,7 @@ let rec check_decl ~manifest ~source_dir ~file_path decl =
 let check_source_file ~manifest ~source_dir file_path =
   try
     let source = Modules.read_file file_path in
-    match Modules.parse_source ~filename:file_path source with
+    match Modules.parse_raw_source ~filename:file_path source with
     | Error err ->
         [
           make_error ~path:file_path ~line:err.Ast.loc.Ast.line err.Ast.message;
