@@ -780,21 +780,6 @@ let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~source_kind ~filename ~program ~debug ())
 
-let typecheck_only_typed_parsed ~filename ~program
-    ?preloaded_module_graph ?(debug = false) () =
-  with_fresh_session filename (fun () ->
-      let loaded =
-        match preloaded_module_graph with
-        | Some graph ->
-            load_modules_after_preloaded_graph ~filename ~program graph
-        | None -> load_modules_after_parse_with_legacy_imports ~filename program
-      in
-      match loaded with
-      | Error _ as e -> e
-      | Ok (program, _base_dir) ->
-          typecheck_loaded_program ~source_kind:User_source ~filename ~program
-            ~debug ())
-
 let typecheck_only_typed ~filename ~source ?(debug = false) () =
   typecheck_only_typed_impl ~source_kind:User_source ~filename ~source ~debug ()
 
@@ -816,15 +801,6 @@ let typecheck_only_reusing_session ~sess ~filename ~source ?(debug = false) ()
     =
   match
     typecheck_only_typed_reusing_session ~sess ~filename ~source ~debug ()
-  with
-  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
-  | Error _ as e -> e
-
-let typecheck_only_parsed ~filename ~program ?preloaded_module_graph
-    ?(debug = false) () =
-  match
-    typecheck_only_typed_parsed ~filename ~program
-      ?preloaded_module_graph ~debug ()
   with
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e

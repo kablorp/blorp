@@ -54,10 +54,10 @@ Current active functions:
 The graph is decoded by OCaml and then consumed by the OCaml middle:
 
 - `compiler/lib/compiler_blorp_bridge.ml`
-  - `parse_source_request_json`
+  - `parse_source_request_json_at_phase`
   - `parse_sources_request_json`
-  - `parse_source_via_command`
-  - `parse_source_file_via_command`
+  - `parse_source_via_command_at_phase`
+  - `parse_source_file_via_command_at_phase`
   - `parse_sources_via_command`
   - `cli_frontend_module_graph_response_field`
 - `compiler/bin/blorp.ml`
@@ -203,7 +203,7 @@ Functions to change or add:
 - `compiler/lib/compiler_blorp_bridge.ml`
   - add a `parsed_source_phase` type
   - decode and validate `ast_phase`
-  - update `parse_source_request_json`
+  - update `parse_source_request_json_at_phase`
   - update `parse_sources_request_json`
   - update `cli_frontend_graph_source_list_field`
 - `compiler/bin/blorp.ml`

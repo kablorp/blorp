@@ -200,7 +200,7 @@ OCaml references:
   - `compile_file_with_opts`
   - `run_file`
 - `compiler/lib/pipeline.ml`
-  - `typecheck_only_typed_parsed`
+  - `typecheck_only_typed_with_blorp_bridge`
   - `compile_parsed`
   - `compile_loaded_program`
 
@@ -267,7 +267,8 @@ Closed deletion point:
 - OCaml root expansion, source reads, and parser fallback code for normal
   `check`, `compile`, and `run` have been deleted from the shell path. The
   remaining source-command shell code assumes a Blorp-produced graph before it
-  enters `Pipeline.typecheck_only_typed_parsed` or `Pipeline.compile_parsed`.
+  enters `Pipeline.typecheck_only_typed_with_blorp_bridge` or
+  `Pipeline.compile_parsed`.
 
 ## Checkpoint 2: Source Model, Parser, And Source-AST Finalization
 
@@ -501,9 +502,10 @@ Tests:
 Deletion point:
 
 - Delete OCaml module path resolution/loading/cache code after
-  `Pipeline.compile_parsed` and `Pipeline.typecheck_only_typed_parsed` consume
-  a Blorp-validated module graph for every production/tooling caller and no
-  longer need `Modules.load_imports` for non-graph entry points.
+  `Pipeline.compile_parsed` and
+  `Pipeline.typecheck_only_typed_with_blorp_bridge` consume a Blorp-validated
+  module graph for every production/tooling caller and no longer need
+  `Modules.load_imports` for non-graph entry points.
 
 ## Checkpoint 4: Diagnostics, Session, Types, Env, And Builtins
 
