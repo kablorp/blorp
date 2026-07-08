@@ -1,0 +1,255 @@
+import:
+	../compiler_ctfe_context:
+		compiler_ctfe_context_constructor_arity,
+		compiler_ctfe_context_constructor_info,
+		compiler_ctfe_context_constructor_is_nullary,
+		compiler_ctfe_context_empty,
+		compiler_ctfe_context_from_program,
+		compiler_ctfe_context_function_by_callable_id,
+		compiler_ctfe_context_imported_functions_by_source,
+		compiler_ctfe_context_module_global_value,
+		compiler_ctfe_context_module_has_global_binding,
+		compiler_ctfe_context_nullary_constructor_reference,
+		compiler_ctfe_context_with_module_global_env,
+	compiler_ctfe_env: compiler_ctfe_bind_global_value, compiler_ctfe_env_empty
+	compiler_ctfe_value: CompilerCtfeValue, compiler_ctfe_int, compiler_ctfe_values_equal
+	compiler_parsed_ast:
+		ParsedDecl(PrivateParsedDecl, UnionParsedDecl),
+		ParsedFunctionDecl,
+		ParsedIdentifier,
+		ParsedTypeExpr(ParsedNamedType),
+		ParsedUnionDecl,
+		ParsedVariantDecl,
+		parsed_identifier,
+	compiler_source:
+		CompilerCursor,
+		CompilerSourceFile,
+		CompilerSourceSpan,
+		compiler_source_cursor_at,
+		compiler_source_file,
+		compiler_source_span,
+	compiler_type: compiler_type_int
+	compiler_typecheck_decl:
+		CompilerTypedDecl(
+			CompilerTypedFunctionDecl,
+			CompilerTypedParsedDecl,
+			CompilerTypedPrivateDecl,
+		),
+		CompilerTypedFunctionInfo,
+		CompilerTypedProgram,
+	test: TestSuite
+
+
+pure func source_file() -> CompilerSourceFile:
+	compiler_source_file("ctfe_context.brp", "ctfe_context", "func main(): 0")
+
+
+pure func source_span() -> CompilerSourceSpan:
+	src: CompilerSourceFile = source_file()
+	cursor: CompilerCursor = compiler_source_cursor_at(src, 0)
+	compiler_source_span(src, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], source_span())
+
+
+pure func parsed_function(name: String) -> ParsedFunctionDecl:
+	{
+		name = ident(name),
+		type_params = [],
+		params = [],
+		return_type = Some(named_type("Int")),
+		dim_constraints = [],
+		body = None,
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = source_span()
+	}
+
+
+pure func typed_function(name: String, callable_id: Option[Int]) -> CompilerTypedFunctionInfo:
+	{
+		decl = parsed_function(name),
+		callable_id = callable_id,
+		param_types = [],
+		source_return_type = Some(compiler_type_int()),
+		semantic_return_type = compiler_type_int(),
+		body = None
+	}
+
+
+pure func parsed_variant(name: String, fields: List[ParsedTypeExpr]) -> ParsedVariantDecl:
+	{
+		name = ident(name),
+		fields = fields,
+		span = source_span()
+	}
+
+
+pure func parsed_union(name: String, variants: List[ParsedVariantDecl]) -> ParsedUnionDecl:
+	{
+		name = ident(name),
+		type_params = [],
+		variants = variants,
+		is_enum = False,
+		doc = None,
+		span = source_span()
+	}
+
+
+pure func typed_program(decls: List[CompilerTypedDecl]) -> CompilerTypedProgram:
+	{
+		source = source_file(),
+		decls = decls,
+		diagnostics = []
+	}
+
+
+pure func int_value(value: Int) -> CompilerCtfeValue:
+	compiler_ctfe_int(source_span(), value)
+
+
+func test_context_collects_constructors_and_nullary_refs() -> Bool:
+	program = typed_program([
+		CompilerTypedParsedDecl(
+			UnionParsedDecl(
+				parsed_union(
+					"Maybe",
+					[parsed_variant("None", []), parsed_variant("Some", [named_type("Int")])],
+				),
+			),
+		),
+	])
+	context = compiler_ctfe_context_from_program(program, [])
+
+	match compiler_ctfe_context_nullary_constructor_reference(context, "None"):
+		Some(ref):
+			(
+				compiler_ctfe_context_constructor_arity(context, "None") == Some(0)
+				and compiler_ctfe_context_constructor_arity(context, "Some") == Some(1)
+				and compiler_ctfe_context_constructor_is_nullary(context, "None")
+				and not compiler_ctfe_context_constructor_is_nullary(context, "Some")
+				and ref.name == "None"
+				and ref.parent_type == "Maybe"
+				and ref.callable_id == None
+			)
+		None:
+			False
+
+
+func test_context_collects_private_union_constructors() -> Bool:
+	private_decl = PrivateParsedDecl(
+		UnionParsedDecl(parsed_union("Status", [parsed_variant("Ready", [])])),
+		source_span(),
+	)
+	program = typed_program([CompilerTypedPrivateDecl(CompilerTypedParsedDecl(private_decl))])
+	context = compiler_ctfe_context_from_program(program, [])
+
+	match compiler_ctfe_context_constructor_info(context, "Ready"):
+		Some(info):
+			info.parent_type == "Status" and info.arity == 0
+		None:
+			False
+
+
+func test_context_collects_functions_by_callable_id() -> Bool:
+	program = typed_program([
+		CompilerTypedFunctionDecl(typed_function("top", Some(10))),
+		CompilerTypedFunctionDecl(typed_function("ignored", None)),
+		CompilerTypedPrivateDecl(CompilerTypedFunctionDecl(typed_function("hidden", Some(11)))),
+	])
+	context = compiler_ctfe_context_from_program(program, [])
+
+	match (
+		compiler_ctfe_context_function_by_callable_id(context, 10),
+		compiler_ctfe_context_function_by_callable_id(context, 11),
+		compiler_ctfe_context_function_by_callable_id(context, 12),
+	):
+		(Some(top), Some(hidden), None):
+			top.source_name == "top" and hidden.source_name == "hidden"
+		_:
+			False
+
+
+func test_context_groups_imported_functions_by_module_and_source() -> Bool:
+	imported_program = typed_program([
+		CompilerTypedFunctionDecl(typed_function("render", Some(20))),
+		CompilerTypedFunctionDecl(typed_function("render", Some(21))),
+		CompilerTypedFunctionDecl(typed_function("parse", Some(22))),
+	])
+	context = compiler_ctfe_context_from_program(
+		typed_program([]),
+		[
+			{
+				module_path = "dep",
+				program = imported_program
+			},
+		],
+	)
+	render_functions = compiler_ctfe_context_imported_functions_by_source(context, "dep", "render")
+	missing_functions = compiler_ctfe_context_imported_functions_by_source(
+		context,
+		"other",
+		"render",
+	)
+	var first_function_matches: Bool = False
+
+	match render_functions.get(0):
+		Some(ctfe_function):
+			first_function_matches = (
+				ctfe_function.source_name == "render"
+				and ctfe_function.module_path == Some("dep")
+			)
+		None:
+			void
+
+	render_functions.length() == 2 and missing_functions.length() == 0 and first_function_matches
+
+
+func test_context_module_global_env_lookup() -> Bool:
+	env = compiler_ctfe_bind_global_value(compiler_ctfe_env_empty(), "LIMIT", int_value(42))
+	context = compiler_ctfe_context_with_module_global_env(
+		compiler_ctfe_context_empty(),
+		"dep",
+		env,
+	)
+
+	match compiler_ctfe_context_module_global_value(context, "dep", "LIMIT"):
+		Some(value):
+			(
+				compiler_ctfe_values_equal(value, int_value(42))
+				and compiler_ctfe_context_module_has_global_binding(context, "dep", "LIMIT")
+				and not compiler_ctfe_context_module_has_global_binding(context, "dep", "MISSING")
+			)
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler CTFE context",
+	tests = [
+		(
+			"context collects constructors and nullary refs",
+			test_context_collects_constructors_and_nullary_refs,
+		),
+		(
+			"context collects private union constructors",
+			test_context_collects_private_union_constructors,
+		),
+		(
+			"context collects functions by callable id",
+			test_context_collects_functions_by_callable_id,
+		),
+		(
+			"context groups imported functions by module and source",
+			test_context_groups_imported_functions_by_module_and_source,
+		),
+		("context module global env lookup", test_context_module_global_env_lookup),
+	]
+}

@@ -1525,6 +1525,50 @@ Current status:
   parsing and typechecking. A compiler-unit regression pins that the
   graph-backed compile bridge consumes the preloaded target source rather than
   rereading a changed file from disk.
+- Blorp now has the first CTFE value/operator foundation in
+  `compiler_ctfe_value.brp`: typed compile-time values, constructor payload
+  metadata, structural equality, expectation helpers, and primitive unary/binary
+  operation semantics for Int, Float, Bool, and String values. This is
+  deliberately not wired into production evaluation yet; it is the data/runtime
+  surface the later Blorp CTFE evaluator and materializer should build on.
+- Blorp now also has `compiler_ctfe_env.brp`, the first lexical/global
+  environment layer for CTFE. It models global/local bindings, unavailable
+  global reasons, immutable-assignment rejection, mutable local assignment as an
+  explicit updated environment, and user-facing environment error messages
+  without copying OCaml's mutable-cell implementation detail.
+- Blorp now also has `compiler_ctfe_context.brp`, the metadata context layer
+  for CTFE. It indexes typed functions by callable id, imported function groups
+  by module/source name, union constructor arities/nullary references, and
+  module global environments from `CompilerTypedProgram` values. It deliberately
+  does not evaluate expressions yet; it gives the upcoming evaluator a typed,
+  test-covered lookup surface instead of reaching into the typed AST ad hoc.
+- Blorp now also has `compiler_ctfe_globals.brp`, the source-order global
+  availability layer for CTFE. It identifies typed global declarations,
+  preserves private-global metadata, treats mutable top-level `var` bindings as
+  runtime-initialized, binds immutable globals as later CTFE candidates, and can
+  answer whether imported typed programs declare a global by module path/name.
+- Blorp now also has the first `compiler_ctfe_ir.brp` slice: a normalized,
+  typed CTFE expression IR for literals, names/reference kinds, transparent
+  wrappers, unary/binary/logical expressions, tuples, lists, vectors, records,
+  dicts, block expressions with local `let`/`var` bindings and local
+  assignment items, tuple-destructuring block items, and void. Unsupported
+  forms fail at the translation boundary with a structured error, matching the
+  OCaml CTFE architecture and giving later evaluator work a smaller target than
+  `CompilerTypedExpr`.
+- Blorp now also has the first `compiler_ctfe_eval.brp` slice: an evaluator for
+  the supported CTFE IR subset. It evaluates literals, environment lookups,
+  nullary constructors, transparent wrappers, unary/binary/logical expressions
+  with short-circuiting, `if`, ranges, record field access, record updates,
+  tuples, lists, vectors, records, dicts, block-local bindings, local
+  assignment updates, tuple destructuring, and void while preserving separate
+  translation, environment, value/operator, invalid-value, and unsupported
+  error categories.
+- Blorp now also evaluates source-order global CTFE environments in
+  `compiler_ctfe_globals.brp`. Immutable globals are evaluated against an
+  environment that marks the current binding as self-unavailable, earlier
+  evaluated globals as available, later globals as unavailable, and mutable
+  top-level `var` bindings as runtime-initialized. Imported typed programs can
+  be evaluated into module global envs and attached back to `CompilerCtfeContext`.
 - The Blorp executable (`compiler_cli_main.brp`) now runs CLI planning and
   source graph construction directly, writes the existing CLI plan JSON
   artifact to a temporary file, and invokes the private OCaml host only to

@@ -1,0 +1,303 @@
+import:
+	../compiler_ctfe_context:
+		CompilerCtfeContext,
+		CompilerCtfeImportedProgram,
+		compiler_ctfe_context_empty,
+		compiler_ctfe_context_module_global_value,
+	../compiler_ctfe_env: CompilerCtfeEnv, compiler_ctfe_env_empty, compiler_ctfe_lookup_value
+	../compiler_ctfe_eval: CompilerCtfeEvalError, compiler_ctfe_eval_error_message
+	../compiler_ctfe_globals:
+		compiler_ctfe_eval_imported_program_global_envs,
+		compiler_ctfe_eval_program_global_env,
+	../compiler_ctfe_value: compiler_ctfe_int, compiler_ctfe_values_equal
+	../compiler_infer:
+		CompilerExprTypeOrigin(CompilerSynthesizedOrigin),
+		CompilerTypedExpr(
+			CompilerTypedBinaryExpr,
+			CompilerTypedIntLiteralExpr,
+			CompilerTypedNameExpr,
+		),
+		CompilerTypedExprInfo,
+	../compiler_parsed_ast:
+		ParsedBinaryOp(ParsedAddOp),
+		ParsedExpr(ParsedIntLiteralExpr),
+		ParsedIdentifier,
+		ParsedTypeExpr(ParsedNamedType),
+		ParsedVarDecl,
+		parsed_identifier,
+	../compiler_refinement: compiler_unrefined_binding
+	../compiler_source:
+		CompilerCursor,
+		CompilerSourceFile,
+		CompilerSourceSpan,
+		compiler_source_cursor_at,
+		compiler_source_file,
+		compiler_source_span,
+	../compiler_type: compiler_type_int
+	../compiler_type_widening: CompilerTypeWideningDecision(CompilerTypeKeep)
+	../compiler_typecheck_decl:
+		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
+		CompilerTypedGlobalVarInfo,
+		CompilerTypedProgram,
+	test: TestSuite
+
+
+pure func source_file() -> CompilerSourceFile:
+	compiler_source_file("ctfe_global_eval.brp", "ctfe_global_eval", "VALUE = 1")
+
+
+pure func source_span() -> CompilerSourceSpan:
+	src: CompilerSourceFile = source_file()
+	cursor: CompilerCursor = compiler_source_cursor_at(src, 0)
+	compiler_source_span(src, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], source_span())
+
+
+pure func parsed_var(name: String, is_mutable: Bool) -> ParsedVarDecl:
+	{
+		name = ident(name),
+		type_expr = Some(named_type("Int")),
+		value = ParsedIntLiteralExpr("0", source_span()),
+		is_mutable = is_mutable,
+		span = source_span()
+	}
+
+
+pure func expr_info() -> CompilerTypedExprInfo:
+	{
+		source_type = None,
+		semantic_type = compiler_type_int(),
+		value_type = compiler_type_int(),
+		origin = CompilerSynthesizedOrigin("ctfe_global_eval_test"),
+		value_slot = {
+			semantic_type = compiler_type_int(),
+			decision = CompilerTypeKeep(compiler_type_int())
+		},
+		proofs = compiler_unrefined_binding(),
+		resolved_call = None,
+		resource_dependencies = []
+	}
+
+
+pure func int_expr(text: String) -> CompilerTypedExpr:
+	CompilerTypedIntLiteralExpr(text, source_span(), expr_info())
+
+
+pure func name_expr(name: String) -> CompilerTypedExpr:
+	CompilerTypedNameExpr(ident(name), expr_info())
+
+
+pure func add_expr(left: CompilerTypedExpr, right: CompilerTypedExpr) -> CompilerTypedExpr:
+	CompilerTypedBinaryExpr(ParsedAddOp, left, right, source_span(), expr_info())
+
+
+pure func typed_global(
+	name: String,
+	is_mutable: Bool,
+	value: CompilerTypedExpr,
+) -> CompilerTypedGlobalVarInfo:
+	{
+		decl = parsed_var(name, is_mutable),
+		binding_type = compiler_type_int(),
+		source_type = Some(compiler_type_int()),
+		value = value
+	}
+
+
+pure func typed_global_decl(
+	name: String,
+	is_mutable: Bool,
+	value: CompilerTypedExpr,
+) -> CompilerTypedDecl:
+	CompilerTypedGlobalVarDecl(typed_global(name, is_mutable, value))
+
+
+pure func private_typed_global_decl(
+	name: String,
+	is_mutable: Bool,
+	value: CompilerTypedExpr,
+) -> CompilerTypedDecl:
+	CompilerTypedPrivateDecl(typed_global_decl(name, is_mutable, value))
+
+
+pure func typed_program(decls: List[CompilerTypedDecl]) -> CompilerTypedProgram:
+	{
+		source = source_file(),
+		decls = decls,
+		diagnostics = []
+	}
+
+
+pure func lookup_equals(env: CompilerCtfeEnv, name: String, expected: Int) -> Bool:
+	match compiler_ctfe_lookup_value(env, name):
+		Ok(value):
+			compiler_ctfe_values_equal(
+				value,
+				compiler_ctfe_int(source_span(), expected),
+			)
+		Err(_):
+			False
+
+
+pure func result_lookup_equals(
+	result: Result[CompilerCtfeEnv, CompilerCtfeEvalError],
+	name: String,
+	expected: Int,
+) -> Bool:
+	match result:
+		Ok(env):
+			lookup_equals(env, name, expected)
+		Err(_):
+			False
+
+
+pure func result_error_message(result: Result[CompilerCtfeEnv, CompilerCtfeEvalError]) -> String:
+	match result:
+		Err(error):
+			compiler_ctfe_eval_error_message(error)
+		Ok(_):
+			""
+
+
+func test_eval_program_globals_in_source_order() -> Bool:
+	program = typed_program([
+		typed_global_decl("A", False, int_expr("1")),
+		typed_global_decl(
+			"B",
+			False,
+			add_expr(name_expr("A"), int_expr("2")),
+		),
+	])
+	result = compiler_ctfe_eval_program_global_env(
+		compiler_ctfe_context_empty(),
+		compiler_ctfe_env_empty(),
+		program,
+	)
+
+	match result:
+		Ok(env):
+			lookup_equals(env, "A", 1) and lookup_equals(env, "B", 3)
+		Err(_):
+			False
+
+
+func test_eval_program_rejects_later_global_reference() -> Bool:
+	program = typed_program([
+		typed_global_decl("A", False, name_expr("B")),
+		typed_global_decl("B", False, int_expr("2")),
+	])
+
+	result_error_message(
+		compiler_ctfe_eval_program_global_env(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			program,
+		),
+	) == "global constant initializer cannot reference later global constant 'B'"
+
+
+func test_eval_program_rejects_self_reference() -> Bool:
+	program = typed_program([typed_global_decl("A", False, name_expr("A"))])
+
+	result_error_message(
+		compiler_ctfe_eval_program_global_env(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			program,
+		),
+	) == "global constant initializer cannot reference itself: 'A'"
+
+
+func test_eval_program_keeps_mutable_global_runtime_initialized() -> Bool:
+	program = typed_program([
+		typed_global_decl("RUNTIME", True, int_expr("1")),
+		typed_global_decl("A", False, name_expr("RUNTIME")),
+	])
+
+	result_error_message(
+		compiler_ctfe_eval_program_global_env(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			program,
+		),
+	) == (
+		"global constant initializer cannot reference global 'RUNTIME' because it is not "
+		+ "a compile-time constant"
+	)
+
+
+func test_eval_program_evaluates_private_globals() -> Bool:
+	program = typed_program([
+		private_typed_global_decl("HIDDEN", False, int_expr("5")),
+		typed_global_decl(
+			"PUBLIC",
+			False,
+			add_expr(name_expr("HIDDEN"), int_expr("1")),
+		),
+	])
+	result = compiler_ctfe_eval_program_global_env(
+		compiler_ctfe_context_empty(),
+		compiler_ctfe_env_empty(),
+		program,
+	)
+
+	match result:
+		Ok(env):
+			lookup_equals(env, "HIDDEN", 5) and lookup_equals(env, "PUBLIC", 6)
+		Err(_):
+			False
+
+
+func test_eval_imported_program_global_envs_attach_to_context() -> Bool:
+	imported_programs: List[CompilerCtfeImportedProgram] = [
+		{
+			module_path = "dep",
+			program = typed_program([typed_global_decl("VALUE", False, int_expr("42"))])
+		},
+	]
+	result: Result[CompilerCtfeContext, CompilerCtfeEvalError] = compiler_ctfe_eval_imported_program_global_envs(
+		compiler_ctfe_context_empty(),
+		imported_programs,
+	)
+
+	match result:
+		Ok(context):
+			match compiler_ctfe_context_module_global_value(context, "dep", "VALUE"):
+				Some(value):
+					compiler_ctfe_values_equal(
+						value,
+						compiler_ctfe_int(source_span(), 42),
+					)
+				None:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler CTFE global eval",
+	tests = [
+		("eval program globals in source order", test_eval_program_globals_in_source_order),
+		(
+			"eval program rejects later global reference",
+			test_eval_program_rejects_later_global_reference,
+		),
+		("eval program rejects self reference", test_eval_program_rejects_self_reference),
+		(
+			"eval program keeps mutable global runtime initialized",
+			test_eval_program_keeps_mutable_global_runtime_initialized,
+		),
+		("eval program evaluates private globals", test_eval_program_evaluates_private_globals),
+		(
+			"eval imported program global envs attach to context",
+			test_eval_imported_program_global_envs_attach_to_context,
+		),
+	]
+}
