@@ -72,32 +72,6 @@ val typecheck_only_typed_reusing_session :
   (Typed_ast.program, Ast.compiler_error list) result
 (** Typed-AST variant of [typecheck_only_reusing_session]. *)
 
-val typecheck_only_parsed :
-  filename:string ->
-  program:Ast.program ->
-  ?preloaded_module_graph:Modules.preloaded_module_graph ->
-  ?debug:bool ->
-  unit ->
-  (Ast.program, Ast.compiler_error list) result
-(** Load modules and type-check a program that has already passed through
-    parser finalization. This is used by the Blorp-owned CLI/frontend bridge
-    after the Blorp parser bridge has finalized interpolation, nested
-    declarations, and other parser-adjacent source rewrites. When the caller
-    already owns the Blorp frontend import closure, [preloaded_module_graph]
-    supplies the single graph handoff for module loading. Production CLI
-    source commands should pass that graph; omitting it uses the legacy
-    direct-import-loading path for tests and standalone tooling. Prefer
-    [typecheck_only_typed_parsed] for new callers. *)
-
-val typecheck_only_typed_parsed :
-  filename:string ->
-  program:Ast.program ->
-  ?preloaded_module_graph:Modules.preloaded_module_graph ->
-  ?debug:bool ->
-  unit ->
-  (Typed_ast.program, Ast.compiler_error list) result
-(** Typed-AST variant of [typecheck_only_parsed]. *)
-
 val typecheck_only_typed_with_blorp_bridge :
   filename:string ->
   preloaded_module_graph:Modules.preloaded_module_graph ->

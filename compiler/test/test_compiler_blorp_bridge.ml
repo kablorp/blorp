@@ -326,8 +326,9 @@ let test_typecheck_bridge_compile_env_supports_pinned_bootstrap () =
 
 let test_parse_source_request_uses_bridge_envelope () =
   let request =
-    Blorp.Compiler_blorp_bridge.parse_source_request_json ~path:"src/main.brp"
-      ~module_name:"main" ~text:"func main(): 0"
+    Blorp.Compiler_blorp_bridge.parse_source_request_json_at_phase
+      ~phase:Blorp.Compiler_blorp_bridge.RawParsedProgram
+      ~path:"src/main.brp" ~module_name:"main" ~text:"func main(): 0"
     |> parse_json_exn
   in
   Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
@@ -343,7 +344,8 @@ let test_parse_source_request_uses_bridge_envelope () =
 
 let test_parse_source_file_request_omits_source_text () =
   let request =
-    Blorp.Compiler_blorp_bridge.parse_source_file_request_json
+    Blorp.Compiler_blorp_bridge.parse_source_file_request_json_at_phase
+      ~phase:Blorp.Compiler_blorp_bridge.RawParsedProgram
       ~path:"src/main.brp" ~module_name:"main"
     |> parse_json_exn
   in
@@ -446,7 +448,9 @@ let test_parse_sources_request_can_use_typecheck_phase () =
 
 let test_typecheck_source_request_uses_bridge_envelope () =
   let request =
-    Blorp.Compiler_blorp_bridge.typecheck_source_request_json
+    Bridge.typecheck_source_request_json_with_imports_policy
+      ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+      ~allow_debug_only_calls:false ~import_modules:[]
       ~path:"src/main.brp" ~module_name:"main" ~text:"func main(): 0"
     |> parse_json_exn
   in
@@ -499,23 +503,6 @@ let test_typecheck_source_request_can_include_import_modules () =
       Alcotest.(check string)
         "origin" "std" (string_field "kind" (field "origin" first))
   | _ -> Alcotest.fail "expected one typecheck import module"
-
-let test_typecheck_source_file_request_omits_source_text () =
-  let request =
-    Blorp.Compiler_blorp_bridge.typecheck_source_file_request_json
-      ~path:"src/main.brp" ~module_name:"main"
-    |> parse_json_exn
-  in
-  Alcotest.(check string) "domain" "compiler" (string_field "domain" request);
-  Alcotest.(check string)
-    "action" "typecheck_source" (string_field "action" request);
-  let payload = field "payload" request in
-  Alcotest.(check string)
-    "path" "src/main.brp" (string_field "path" payload);
-  Alcotest.(check string) "module" "main" (string_field "module" payload);
-  match List.assoc_opt "text" (object_fields payload) with
-  | None -> ()
-  | Some _ -> Alcotest.fail "path-only typecheck request must omit source text"
 
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
@@ -787,7 +774,10 @@ let test_typecheck_source_command_decodes_typed_artifact () =
   in
   let artifact =
     check_typechecked_success
-      (Bridge.typecheck_source_via_command ~path:"main.brp"
+      (Bridge.typecheck_source_via_command_with_imports_policy
+         ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+         ~allow_debug_only_calls:false ~import_modules:[]
+         ~path:"main.brp"
          ~module_name:"main" ~text:source)
   in
   Alcotest.(check int)
@@ -806,7 +796,10 @@ let test_typecheck_source_command_decodes_pure_literal_return () =
   let source = "pure func answer() -> Int:\n    1\n" in
   let artifact =
     check_typechecked_success
-      (Bridge.typecheck_source_via_command ~path:"dep.brp"
+      (Bridge.typecheck_source_via_command_with_imports_policy
+         ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+         ~allow_debug_only_calls:false ~import_modules:[]
+         ~path:"dep.brp"
          ~module_name:"./dep" ~text:source)
   in
   Alcotest.(check int)
@@ -817,7 +810,10 @@ let test_typecheck_source_command_decodes_annotated_global () =
   let source = "VALUE: Int = 1\n" in
   let artifact =
     check_typechecked_success
-      (Bridge.typecheck_source_via_command ~path:"main.brp"
+      (Bridge.typecheck_source_via_command_with_imports_policy
+         ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+         ~allow_debug_only_calls:false ~import_modules:[]
+         ~path:"main.brp"
          ~module_name:"main" ~text:source)
   in
   Alcotest.(check int)
@@ -842,8 +838,10 @@ let test_typecheck_source_command_uses_import_modules () =
   in
   let artifact =
     check_typechecked_success
-      (Bridge.typecheck_source_via_command_with_imports
-         ~import_modules:[ import_module ] ~path:"main.brp"
+      (Bridge.typecheck_source_via_command_with_imports_policy
+         ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+         ~allow_debug_only_calls:false ~import_modules:[ import_module ]
+         ~path:"main.brp"
          ~module_name:"main" ~text:source)
   in
   let has_alias_binding =
@@ -1773,9 +1771,6 @@ let suite =
           test_typecheck_source_request_uses_bridge_envelope;
         Alcotest.test_case "typecheck_source request can include imports" `Quick
           test_typecheck_source_request_can_include_import_modules;
-        Alcotest.test_case
-          "typecheck_source file request omits source text" `Quick
-          test_typecheck_source_file_request_omits_source_text;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick

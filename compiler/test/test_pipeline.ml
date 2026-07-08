@@ -524,8 +524,8 @@ let test_surface_backed_exports_support_selective_imports () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_parsed ~filename:main_path
-              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+              ~preloaded_module_graph
           with
           | Ok _ -> ()
           | Error errors ->
@@ -565,8 +565,8 @@ let test_surface_backed_private_names_report_private_import () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_parsed ~filename:main_path
-              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
+            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+              ~preloaded_module_graph
           with
           | Ok _ -> Alcotest.fail "expected private import diagnostic"
           | Error errors ->

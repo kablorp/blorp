@@ -64,6 +64,11 @@ let expect_typed_expr json =
   | Ok expr -> expr
   | Error err -> Alcotest.fail (Blorp.Typed_ast_json.decode_error_to_string err)
 
+let expect_typed_expr_error json =
+  match Blorp.Typed_ast_json.decode_typed_expr "$" json with
+  | Ok _ -> Alcotest.fail "expected typed expression decode error"
+  | Error err -> err
+
 let expect_typed_program json =
   match Blorp.Typed_ast_json.decode_typed_program json with
   | Ok program -> program
@@ -301,6 +306,16 @@ let typed_concurrent_param name value =
 
 let typed_task_result ty =
   named ~args:[ ty; named "ConcurrencyError" ] "Result"
+
+let typed_concurrent_bind name value =
+  typed_node
+    ~info:(expr_info (typed_task_result (named "Int")))
+    "concurrent_bind"
+    [
+      ("name", ident_at name);
+      ("annotation", Null);
+      ("value", value);
+    ]
 
 let parsed_int_literal value =
   Object
@@ -1020,6 +1035,8 @@ let test_decode_typed_expr_control_and_resource_forms () =
                           (typed_int_literal "2");
                         typed_concurrent_param "timeout" (typed_int_literal "50");
                       ] );
+                  ( "bindings",
+                    Array [ typed_concurrent_bind "answer" (typed_int_literal "1") ] );
                   ( "body",
                     typed_node
                       ~info:(expr_info (named "Void"))
@@ -1028,14 +1045,8 @@ let test_decode_typed_expr_control_and_resource_forms () =
                         ( "items",
                           Array
                             [
-                              typed_node
-                                ~info:(expr_info (typed_task_result (named "Int")))
-                                "concurrent_bind"
-                                [
-                                  ("name", ident_at "answer");
-                                  ("annotation", Null);
-                                  ("value", typed_int_literal "1");
-                                ];
+                              typed_concurrent_bind "answer"
+                                (typed_int_literal "1");
                             ] );
                       ] );
                 ];
@@ -1076,6 +1087,31 @@ let test_decode_typed_expr_control_and_resource_forms () =
         { expr_desc = EDetach _; _ };
       ] -> ()
   | _ -> Alcotest.fail "control/resource typed expression forms did not decode"
+
+let test_decode_concurrent_block_requires_explicit_bindings () =
+  let concurrent_block =
+    typed_node
+      ~info:(expr_info (named "Void"))
+      "concurrent_block"
+      [
+        ("params", Array []);
+        ( "body",
+          typed_node
+            ~info:(expr_info (named "Void"))
+            "block"
+            [
+              ( "items",
+                Array
+                  [ typed_concurrent_bind "answer" (typed_int_literal "1") ] );
+            ] );
+      ]
+  in
+  let err = expect_typed_expr_error concurrent_block in
+  Alcotest.(check string) "path" "$" err.path;
+  Alcotest.(check bool)
+    "message names missing bindings" true
+    (String.contains err.message '`'
+    && String.starts_with ~prefix:"missing field" err.message)
 
 let typed_global_var_decl =
   Object
@@ -1681,6 +1717,8 @@ let suite =
           test_decode_typed_expr_structural_forms;
         Alcotest.test_case "typed expr control/resource forms" `Quick
           test_decode_typed_expr_control_and_resource_forms;
+        Alcotest.test_case "concurrent block requires explicit bindings" `Quick
+          test_decode_concurrent_block_requires_explicit_bindings;
         Alcotest.test_case "typed program global var" `Quick
           test_decode_typed_program_global_var;
         Alcotest.test_case "typed program function" `Quick

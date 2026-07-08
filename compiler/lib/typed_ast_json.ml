@@ -1220,22 +1220,11 @@ and decode_concurrent_block_params path values =
   in
   loop 0 None None values
 
-and concurrent_bindings_from_block path body =
-  match (Typed_ast.ast body).Ast.expr_desc with
-  | Ast.EBlock items ->
-      let rec loop index acc = function
-        | [] -> Ok (List.rev acc)
-        | item :: rest -> (
-            match item.Ast.expr_desc with
-            | Ast.EConcurrentBind _ -> loop (index + 1) (item :: acc) rest
-            | _ ->
-                error
-                  (Printf.sprintf "%s.body.items[%d]" path index)
-                  "concurrent block body must contain only concurrent_bind \
-                   nodes")
-      in
-      loop 0 [] items
-  | _ -> error (path ^ ".body") "concurrent block body must be a block"
+and decode_concurrent_binding path value =
+  let* binding = decode_typed_expr path value in
+  match (Typed_ast.ast binding).Ast.expr_desc with
+  | Ast.EConcurrentBind _ -> Ok (Typed_ast.ast binding)
+  | _ -> error path "concurrent block binding must be a concurrent_bind node"
 
 and subscript_desc path receiver indices =
   match indices with
@@ -1525,9 +1514,10 @@ and decode_typed_expr path value =
   | "concurrent_block" ->
       let* params_json = array_field path "params" value in
       let* params = decode_concurrent_block_params (path ^ ".params") params_json in
-      let* body_json = field path "body" value in
-      let* body = decode_typed_expr (path ^ ".body") body_json in
-      let* bindings = concurrent_bindings_from_block path body in
+      let* bindings_json = array_field path "bindings" value in
+      let* bindings =
+        decode_list (path ^ ".bindings") decode_concurrent_binding bindings_json
+      in
       decode_common
         (Ast.EConcurrent
            ( bindings,

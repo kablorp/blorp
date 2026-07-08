@@ -518,10 +518,6 @@ let parse_source_request_json_at_phase ~phase ~path ~module_name ~text =
              ] );
        ])
 
-let parse_source_request_json ~path ~module_name ~text =
-  parse_source_request_json_at_phase ~phase:RawParsedProgram ~path
-    ~module_name ~text
-
 let parse_source_file_request_json_at_phase ~phase ~path ~module_name =
   Lsp_json.to_string
     (Lsp_json.Object
@@ -538,10 +534,6 @@ let parse_source_file_request_json_at_phase ~phase ~path ~module_name =
                  Lsp_json.String (parsed_source_phase_name phase) );
              ] );
        ])
-
-let parse_source_file_request_json ~path ~module_name =
-  parse_source_file_request_json_at_phase ~phase:RawParsedProgram ~path
-    ~module_name
 
 let parse_source_batch_item_json ?(phase = RawParsedProgram) item =
   Lsp_json.Object
@@ -645,45 +637,6 @@ let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
          ("action", Lsp_json.String "typecheck_source");
          ("payload", Lsp_json.Object payload_fields);
        ])
-
-let typecheck_source_request_json_with_imports ~import_modules ~path
-    ~module_name ~text =
-  typecheck_source_request_json_with_imports_policy
-    ~resolved_imports:[] ~origin:CliFrontendUserModule
-    ~allow_debug_only_calls:false ~import_modules ~path ~module_name ~text
-
-let typecheck_source_request_json ~path ~module_name ~text =
-  typecheck_source_request_json_with_imports ~import_modules:[] ~path
-    ~module_name ~text
-
-let typecheck_source_file_request_json_with_imports_policy ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name =
-  let payload_fields =
-    [
-      ("path", Lsp_json.String path); ("module", Lsp_json.String module_name);
-      ("origin", cli_frontend_module_origin_json origin);
-      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
-    ]
-    @ typecheck_import_modules_field import_modules
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "typecheck_source");
-         ("payload", Lsp_json.Object payload_fields);
-       ])
-
-let typecheck_source_file_request_json_with_imports ~import_modules ~path
-    ~module_name =
-  typecheck_source_file_request_json_with_imports_policy
-    ~origin:CliFrontendUserModule ~allow_debug_only_calls:false
-    ~import_modules ~path ~module_name
-
-let typecheck_source_file_request_json ~path ~module_name =
-  typecheck_source_file_request_json_with_imports ~import_modules:[] ~path
-    ~module_name
 
 let cli_run_request_json ?version args =
   let version_fields =
@@ -838,17 +791,6 @@ let optional_string_response_field name = function
       | None ->
           Error
             ("invalid_response", "missing optional string field `" ^ name ^ "`")
-      )
-  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let optional_missing_string_response_field name = function
-  | Lsp_json.Object fields -> (
-      match List.assoc_opt name fields with
-      | None | Some Lsp_json.Null -> Ok None
-      | Some (Lsp_json.String value) -> Ok (Some value)
-      | Some _ ->
-          Error
-            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
@@ -2148,12 +2090,6 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       (try Sys.remove stderr_path with _ -> ());
       (exit_code_of_status status, output, stderr_output)
 
-let default_command_program () =
-  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match locate_bridge_helper_compiler starts with
-  | Ok compiler -> compiler.helper_compiler_path
-  | Error message -> invalid_arg message
-
 let default_bridge_helper_compiler () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
   locate_bridge_helper_compiler starts
@@ -2161,17 +2097,6 @@ let default_bridge_helper_compiler () =
 let parser_bridge_helper_compiler () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
   locate_bridge_helper_compiler starts
-
-let parser_bridge_command_program () =
-  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match command_program_for_parser_bridge starts with
-  | Some path -> path
-  | None ->
-      invalid_arg
-        (Printf.sprintf
-           "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
-           explicit blorp binary"
-           compiler_bootstrap_script_name compiler_bridge_bin_env)
 
 let renderer_bridge_source_path () =
   match Sys.getenv_opt renderer_bridge_source_env with
@@ -2954,17 +2879,6 @@ let render_via_command_exn ~renderer ~op args =
              ^ op)
         | Error (_, message) -> invalid_arg message)
 
-let render_many_via_command_exn ~renderer items =
-  if running_inside_renderer_bridge_helper () then
-    render_many_for_renderer_helper_exn ~renderer items
-  else
-    let response_json =
-      run_renderer_request_via_blorp (render_many_request_json ~renderer items)
-    in
-    match response_result response_json render_many_response_field with
-    | Ok rendered -> rendered
-    | Error (_, message) -> invalid_arg message
-
 let emit_post_closure_c_artifact_exn ?(profile = false) core_json =
   let response_json =
     run_renderer_request_via_blorp
@@ -2990,10 +2904,6 @@ let parse_source_via_command_at_phase ~phase ~path ~module_name ~text =
   in
   parse_source_response_json response_json
 
-let parse_source_via_command ~path ~module_name ~text =
-  parse_source_via_command_at_phase ~phase:RawParsedProgram ~path ~module_name
-    ~text
-
 let parse_sources_via_command ?(phase = RawParsedProgram) items =
   let response_json =
     run_parser_request_via_blorp (parse_sources_request_json ~phase items)
@@ -3007,24 +2917,6 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
   in
   parse_source_response_json response_json
 
-let parse_source_file_via_command ~path ~module_name =
-  parse_source_file_via_command_at_phase ~phase:RawParsedProgram ~path
-    ~module_name
-
-let typecheck_source_via_command_with_policy ~origin ~allow_debug_only_calls
-    ~path ~module_name ~text =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_source_request_json_with_imports_policy
-         ~resolved_imports:[] ~origin ~allow_debug_only_calls ~import_modules:[] ~path
-         ~module_name ~text)
-  in
-  typecheck_source_response_json response_json
-
-let typecheck_source_via_command ~path ~module_name ~text =
-  typecheck_source_via_command_with_policy ~origin:CliFrontendUserModule
-    ~allow_debug_only_calls:false ~path ~module_name ~text
-
 let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
     ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
   let response_json =
@@ -3034,41 +2926,6 @@ let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
          ~path ~module_name ~text)
   in
   typecheck_source_response_json response_json
-
-let typecheck_source_via_command_with_imports ~import_modules ~path
-    ~module_name ~text =
-  typecheck_source_via_command_with_imports_policy
-    ~resolved_imports:[] ~origin:CliFrontendUserModule
-    ~allow_debug_only_calls:false ~import_modules ~path ~module_name ~text
-
-let typecheck_source_file_via_command_with_policy ~origin
-    ~allow_debug_only_calls ~path ~module_name =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_source_file_request_json_with_imports_policy
-         ~origin ~allow_debug_only_calls ~import_modules:[] ~path
-         ~module_name)
-  in
-  typecheck_source_response_json response_json
-
-let typecheck_source_file_via_command ~path ~module_name =
-  typecheck_source_file_via_command_with_policy ~origin:CliFrontendUserModule
-    ~allow_debug_only_calls:false ~path ~module_name
-
-let typecheck_source_file_via_command_with_imports_policy ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_source_file_request_json_with_imports_policy
-         ~origin ~allow_debug_only_calls ~import_modules ~path ~module_name)
-  in
-  typecheck_source_response_json response_json
-
-let typecheck_source_file_via_command_with_imports ~import_modules ~path
-    ~module_name =
-  typecheck_source_file_via_command_with_imports_policy
-    ~origin:CliFrontendUserModule ~allow_debug_only_calls:false
-    ~import_modules ~path ~module_name
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json
