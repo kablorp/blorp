@@ -1,6 +1,10 @@
 # CLI-Inward Compiler Port Roadmap
 
-Status checked against code on 2026-07-01.
+Status: historical roadmap. It records the CLI-inward slices that led to the
+current frontend graph boundary; use `BLORP_COMPILER_PORT_ROADMAP.md` as the
+current production-boundary source of truth.
+
+Last checked against code on 2026-07-01.
 
 This roadmap covers expanding Blorp ownership from the command-line entry point
 inward. The goal is not to port every command at once. The goal is to make the
@@ -59,9 +63,10 @@ inward in small, authoritative slices, then delete the replaced OCaml code.
   returns a `parsed_source_batch` CLI artifact. OCaml decodes and finalizes that
   batch, then typechecks those explicit roots without rediscovering or reparsing
   them.
-- `compiler/bin/blorp.ml` still owns command execution, artifact writing,
-  C compiler invocation, REPL/LSP runtime loops, test execution, package command
-  execution, and the final execution of multi-path/directory checks.
+- `compiler/bin/blorp_ocaml_host.ml` still owns command execution, artifact
+  writing, C compiler invocation, REPL/LSP runtime loops, test execution,
+  package command execution, and the final execution of multi-path/directory
+  checks.
 - Single-root `check`, `compile`, and `run` can cross the bridge with a parsed
   source artifact. Multi-root and directory `check` now validate, expand,
   auto-format, read, and parse root sources in Blorp, then typecheck the decoded
@@ -78,9 +83,10 @@ inward in small, authoritative slices, then delete the replaced OCaml code.
   same-invocation source. OCaml still applies the existing import resolution,
   origin, cycle, and typecheck rules, but matching graph entries do not reread
   or reparse source text.
-- `compiler/bin/blorp.ml` no longer expands, reads, or parses explicit `check`
-  root targets. Check execution consumes parsed root artifacts; an empty parsed
-  root list is treated as an error instead of falling back to OCaml discovery.
+- `compiler/bin/blorp_ocaml_host.ml` no longer expands, reads, or parses
+  explicit `check` root targets. Check execution consumes parsed root
+  artifacts; an empty parsed root list is treated as an error instead of
+  falling back to OCaml discovery.
 - The bridge protocol already contains `parse_sources`; use that for batched
   root parsing instead of adding a parallel batch parser path.
 

@@ -1,6 +1,11 @@
 # Frontend Source-AST Ownership Roadmap
 
-Status checked against code on 2026-07-02.
+Status: historical roadmap. It records the source-AST ownership slices that led
+to the current frontend graph and typed-program bridge; use
+`BLORP_COMPILER_PORT_ROADMAP.md` as the current production-boundary source of
+truth.
+
+Last checked against code on 2026-07-02.
 
 This is the next contiguous OCaml-to-Blorp compiler chunk. The goal is to finish
 the source parser and source-AST ownership boundary from the Blorp CLI/source
@@ -60,7 +65,7 @@ The graph is decoded by OCaml and then consumed by the OCaml middle:
   - `parse_source_file_via_command_at_phase`
   - `parse_sources_via_command`
   - `cli_frontend_module_graph_response_field`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `cli_frontier_frontend_module_graph`
   - `finalize_cli_frontend_graph_source`
   - `finalized_cli_frontend_graph_sources_or_exit`
@@ -206,7 +211,7 @@ Functions to change or add:
   - update `parse_source_request_json_at_phase`
   - update `parse_sources_request_json`
   - update `cli_frontend_graph_source_list_field`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - make `finalize_cli_frontend_graph_source` reject raw parse artifacts for
     compile/check/run once the typecheck phase exists
 
@@ -551,7 +556,7 @@ Functions to change:
 - `compiler/lib/compiler_blorp_bridge.ml`
   - `cli_frontend_module_graph_response_field` should validate graph source phase
   - `validate_cli_frontend_import_edges` remains edge validation only
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `finalize_cli_frontend_graph_source` should become strict decode and
     diagnostic rendering, not semantic transformation
   - `cli_frontier_frontend_module_graph` should preserve preloaded finalized

@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-07.
+Status checked against code on 2026-07-08.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -63,7 +63,7 @@ Current backend-tail Blorp files:
 
 Current OCaml bridge and orchestration files:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
 - `compiler/lib/modules.ml`
 - `compiler/lib/pipeline.ml`
@@ -73,6 +73,11 @@ Current OCaml bridge and orchestration files:
 - `compiler/lib/core_lower.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
+
+The public executable is Blorp-owned through
+`compiler/blorp/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
+private execution shell for decoded Blorp plans, temporary typed-program
+handoffs, artifact writing, host C invocation, and still-OCaml compiler stages.
 
 ## Migration Rules
 
@@ -109,7 +114,7 @@ OCaml references:
 
 - `compiler/lib/compiler_blorp_bridge.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
 - `compiler/lib/modules.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/language_surface.ml`
@@ -138,9 +143,12 @@ Implementation steps:
   parser boundary while OCaml still consumes parsed AST values. OCaml raw
   parser consumers should go through `Modules.parse_raw_source*` so raw output
   is explicit at call sites.
-- Delete snippet-style bridge renderers once their OCaml callers disappear.
-- Keep `BLORP_COMPILER_RENDERER_HELPER=1` limited to static bootstrap table
-  support.
+- Prepared backend/list/tensor codegen renderers are typed-only. Call sites use
+  `render_prepared_*_op` over explicit operation variants; do not reintroduce
+  name/arity template registries or snippet-style adapters for those surfaces.
+- Keep `BLORP_COMPILER_RENDERER_HELPER=1` limited to static bootstrap table,
+  manifest, and diagnostic rendering support while those temporary callers
+  remain.
 
 Edge cases:
 
@@ -185,7 +193,7 @@ source execution.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `apply_blorp_cli_frontier`
   - `cli_frontier_frontend_module_graph`
   - `finalize_cli_frontend_graph_source`
@@ -1500,10 +1508,27 @@ Current status:
   artifact to a temporary file, and invokes the private OCaml host only to
   execute that plan. The host no longer needs to ask a Blorp helper to interpret
   normal user CLI arguments.
-- Remaining checkpoint work is CTFE and final typed AST ownership: OCaml still
-  evaluates compile-time values after decoding the Blorp typed artifact, and
-  legacy direct pipeline APIs still need explicit frontend graphs before their
-  OCaml typechecker path can be retired.
+- Immediate remaining checkpoint work is typed-frontier closure, then CTFE and
+  final typed AST ownership. OCaml still evaluates compile-time values after
+  decoding the Blorp typed artifact, and legacy direct pipeline APIs still need
+  explicit frontend graphs or explicit legacy/tooling classification before
+  their OCaml typechecker paths can be retired.
+
+Typed frontier closure before CTFE:
+
+- Close or explicitly classify residual OCaml typecheck/parser consumers:
+  `Pipeline.compile`, `Pipeline.typecheck_only`,
+  `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
+  test runner, and LSP/tooling helpers.
+- Normal source execution must enter through the Blorp frontend graph and
+  `typecheck_source` bridge. If a direct pipeline API remains, document it as a
+  temporary legacy/tooling route with a deletion condition rather than allowing
+  it to silently re-enter OCaml typecheck.
+- Close the known `concurrent:` typed-decoder caveat by adding explicit
+  concurrent binding result metadata to the typed handoff. Do not infer that
+  metadata from body statements.
+- Keep trait-dispatch and closure-call metadata represented explicitly in the
+  typed artifact before relying on the handoff for Core lowering.
 
 Edge cases:
 
@@ -1580,6 +1605,9 @@ Blorp references:
 
 Implementation steps:
 
+- Do not start Blorp Core lowering from an OCaml-post-CTFE typed AST unless we
+  deliberately accept another temporary bridge. CTFE/final typed-AST ownership
+  is the step that keeps the source-to-Core boundary contiguous.
 - Port `Core` data constructors needed by lowering before lowering logic.
 - Port lowering mechanically from typed expression shapes to Core:
   identifiers, literals, calls, fields, control flow, matches, loops, blocks,
@@ -1754,7 +1782,9 @@ post-Perceus OCaml boundary.
 
 Status: `Core_consume_specialize` is partially ported, ownership contracts are
 partially ported, Perceus is partially ported, and the post-Perceus tail through
-C artifact emission is Blorp-owned for the supported route.
+C artifact emission is Blorp-owned for the supported route. Prepared
+backend/list/tensor renderers are now typed operation renderers only; the old
+string-template adapters are no longer part of this boundary.
 
 OCaml references:
 
@@ -1793,7 +1823,8 @@ Blorp references:
 - `compiler/blorp/compiler_core_prepare.brp`
 - `compiler/blorp/compiler_core_emit.brp`
 - `compiler/blorp/compiler_core_emit_type_layout.brp`
-- `compiler/blorp/codegen_*_renderer.brp`
+- `compiler/blorp/codegen_*_renderer.brp` for typed static data, diagnostics,
+  and prepared-operation rendering
 
 Implementation steps:
 
@@ -1819,6 +1850,9 @@ Implementation steps:
   backend tail.
 - Keep Blorp emission the only C artifact generator. Do not add new OCaml
   emission helpers.
+- If backend deletion is prioritized before the frontend reaches Core lowering,
+  move the Perceus/ownership boundary leftward. Otherwise keep the next major
+  contiguous step on Checkpoint 7/8 so source-to-Core stays a single Blorp path.
 
 Edge cases:
 
@@ -1857,7 +1891,7 @@ impure shell responsibilities.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `write_file`
   - `write_compile_output`
   - `run_file`
@@ -1918,7 +1952,7 @@ are Blorp-owned.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `purify_file`
   - package command helpers
   - `run_test_from_frontier_options`
@@ -1975,8 +2009,9 @@ Implementation steps:
   - inlay hints,
   - formatting.
 - Port REPL and line editor last unless they become necessary for dogfooding.
-- Delete `compiler/bin/blorp.ml` only after an equivalent Blorp CLI handles all
-  supported public commands and hidden bootstrap commands have retired.
+- Delete `compiler/bin/blorp_ocaml_host.ml` only after the Blorp executable
+  handles all supported public commands and hidden bootstrap commands have
+  retired.
 
 Edge cases:
 
@@ -2065,6 +2100,14 @@ make docker-premerge-gate
   paths are proven gone or represented explicitly.
 - Keep `BLORP_FRONTEND_PARSER=ocaml` only while pinned external bootstrap
   binaries require the selector.
+- Replace references to the old OCaml CLI filename with
+  `compiler/bin/blorp_ocaml_host.ml`; the Blorp CLI executable is
+  `compiler_cli_main.brp`, and the OCaml file is now only the private host
+  shell.
+- Prepared codegen renderers are typed-only. Do not reintroduce backend/list/
+  tensor name/arity template registries.
+- Older CLI-inward and frontend source-AST roadmaps are historical; use this
+  roadmap as the current production-boundary source of truth.
 - Delete `language_surface.ml` when typecheck/LSP/tooling no longer need an
   OCaml facade over Blorp-owned language-surface data.
 

@@ -316,7 +316,9 @@ For compiler debugging, prefer Core dumps:
 ```
 compiler/
 ├── bin/                   # CLI executables
-│   └── blorp.ml           # Main unified CLI
+│   └── blorp_ocaml_host.ml # Private host shell for decoded Blorp CLI plans
+├── blorp/                 # Blorp-owned compiler and CLI slices
+│   └── compiler_cli_main.brp # Public executable entry point
 ├── lib/                   # Compiler library
 │   ├── ast.ml             # AST type definitions
 │   ├── types.ml           # Type utilities (substitution, equality)
@@ -739,9 +741,16 @@ translation units.
 
 ## CLI
 
-### Main Entry Point (`blorp.ml`)
+### Main Entry Point
 
-Unified CLI with subcommands:
+The public `./blorp` executable is built from the Blorp CLI entry point in
+`compiler/blorp/compiler_cli_main.brp`. It performs user-facing command
+planning, source discovery, source reads, parsing, and current frontend graph
+handoffs before invoking the private OCaml host shell
+`compiler/bin/blorp_ocaml_host.ml` for the compiler stages and impure host
+actions that have not yet migrated.
+
+User-facing subcommands:
 
 ```bash
 ./blorp compile program.brp      # Compile to generated C
