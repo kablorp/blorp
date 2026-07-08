@@ -63,7 +63,6 @@ import:
 		compiler_env_find_trait_method,
 		compiler_env_find_unsatisfied_trait_obligation,
 		compiler_env_get_constructor,
-		compiler_env_get_constructor_callable_id,
 		compiler_env_get_constructors,
 		compiler_env_get_func_info,
 		compiler_env_get_function_trait,
@@ -295,13 +294,18 @@ union CompilerCallableOrigin:
 	CompilerCallableImplMethod
 
 
+union CompilerResolvedCallTarget:
+	CompilerResolvedDirectCall(Int, CompilerCallableOrigin)
+	CompilerResolvedTraitMethodCall(String, Option[Int])
+	CompilerResolvedIntrinsicCall
+	CompilerResolvedClosureCall
+
+
 record CompilerResolvedCallInfo {
 	callee_name: String,
 	source_name: String,
-	callable_id: Option[Int],
-	trait_name: Option[String],
 	purity: CompilerPurity,
-	origin: CompilerCallableOrigin,
+	target: CompilerResolvedCallTarget,
 	instantiated_params: List[CompilerType],
 	instantiated_return: CompilerType,
 	resource_args: CompilerResourceArgPolicy,
@@ -417,6 +421,15 @@ record CompilerTypedConcurrentParam {
 }
 
 
+record CompilerTypedConcurrentBinding {
+	name: ParsedIdentifier,
+	annotation: Option[CompilerType],
+	value: CompilerTypedExpr,
+	span: CompilerSourceSpan,
+	info: CompilerTypedExprInfo
+}
+
+
 record CompilerTypedWithErrorMap {
 	name: ParsedIdentifier,
 	value: CompilerTypedExpr,
@@ -467,8 +480,7 @@ union CompilerTypedExpr:
 	CompilerTypedSelectExpr(List[CompilerTypedSelectArm], CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedWhileExpr(CompilerTypedExpr, CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedForExpr(ParsedForBinder, CompilerTypedExpr, CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
-	CompilerTypedConcurrentBlockExpr(List[CompilerTypedConcurrentParam], CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
-	CompilerTypedConcurrentBindExpr(ParsedIdentifier, Option[CompilerType], CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
+	CompilerTypedConcurrentBlockExpr(List[CompilerTypedConcurrentParam], List[CompilerTypedConcurrentBinding], CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedConcurrentForExpr(ParsedIdentifier, CompilerTypedExpr, List[CompilerTypedConcurrentParam], CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedDetachExpr(CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedAscriptionExpr(CompilerTypedExpr, CompilerType, CompilerSourceSpan, CompilerTypedExprInfo)
@@ -869,10 +881,8 @@ private pure func compiler_resolved_call_info_copy(
 	{
 		callee_name = info.callee_name,
 		source_name = info.source_name,
-		callable_id = info.callable_id,
-		trait_name = info.trait_name,
 		purity = info.purity,
-		origin = info.origin,
+		target = compiler_resolved_call_target_copy(info.target),
 		instantiated_params = compiler_type_list_copy(info.instantiated_params),
 		instantiated_return = compiler_type_copy(info.instantiated_return),
 		resource_args = info.resource_args,
@@ -1046,6 +1056,52 @@ private pure func compiler_callable_origin_from_func(
 			CompilerCallableForeign
 
 
+private pure func compiler_resolved_call_target_copy(
+	target: CompilerResolvedCallTarget,
+) -> CompilerResolvedCallTarget:
+	match target:
+		CompilerResolvedDirectCall(callable_id, origin):
+			CompilerResolvedDirectCall(callable_id, origin)
+		CompilerResolvedTraitMethodCall(trait_name, callable_id):
+			CompilerResolvedTraitMethodCall(trait_name, callable_id)
+		CompilerResolvedIntrinsicCall:
+			CompilerResolvedIntrinsicCall
+		CompilerResolvedClosureCall:
+			CompilerResolvedClosureCall
+
+
+pure func compiler_resolved_call_callable_id(info: CompilerResolvedCallInfo) -> Option[Int]:
+	match info.target:
+		CompilerResolvedDirectCall(callable_id, _):
+			Some(callable_id)
+		CompilerResolvedTraitMethodCall(_, callable_id):
+			callable_id
+		CompilerResolvedIntrinsicCall:
+			None
+		CompilerResolvedClosureCall:
+			None
+
+
+private pure func compiler_resolved_call_is_trait_target(
+	info: CompilerResolvedCallInfo,
+) -> Bool:
+	match info.target:
+		CompilerResolvedTraitMethodCall(_, _):
+			True
+		_:
+			False
+
+
+private pure func compiler_resolved_call_trait_name(
+	info: CompilerResolvedCallInfo,
+) -> Option[String]:
+	match info.target:
+		CompilerResolvedTraitMethodCall(trait_name, _):
+			Some(trait_name)
+		_:
+			None
+
+
 private pure func compiler_purity_from_bool(is_pure: Bool) -> CompilerPurity:
 	if is_pure:
 		CompilerPure
@@ -1087,12 +1143,27 @@ private pure func compiler_resolved_call_from_trait_method_callee(
 	{
 		callee_name = callee.method_name,
 		source_name = callee.source_name,
-		callable_id = None,
-		trait_name = Some(callee.trait_name),
 		purity = compiler_purity_from_bool(callee.method.is_pure),
-		origin = CompilerCallableImplMethod,
+		target = CompilerResolvedTraitMethodCall(callee.trait_name, None),
 		instantiated_params = callee.method.params.map(compiler_type_copy),
 		instantiated_return = compiler_type_copy(callee.method.return_type),
+		resource_args = CompilerRejectResourceArgs,
+		dim_constraints = []
+	}
+
+
+private pure func compiler_resolved_call_from_closure(
+	is_pure: Bool,
+	params: List[CompilerType],
+	return_type: CompilerType,
+) -> CompilerResolvedCallInfo:
+	{
+		callee_name = "<closure>",
+		source_name = "<closure>",
+		purity = compiler_purity_from_bool(is_pure),
+		target = CompilerResolvedClosureCall,
+		instantiated_params = compiler_type_list_copy(params),
+		instantiated_return = compiler_type_copy(return_type),
 		resource_args = CompilerRejectResourceArgs,
 		dim_constraints = []
 	}
@@ -1132,10 +1203,11 @@ private pure func compiler_resolved_call_from_func_symbol_with_source(
 	{
 		callee_name = callee_name,
 		source_name = source_name,
-		callable_id = Some(func_symbol.callable_id),
-		trait_name = None,
 		purity = func_symbol.purity,
-		origin = compiler_callable_origin_from_func(func_symbol.origin, func_symbol.module_path),
+		target = CompilerResolvedDirectCall(
+			func_symbol.callable_id,
+			compiler_callable_origin_from_func(func_symbol.origin, func_symbol.module_path),
+		),
 		instantiated_params = compiler_resolved_call_params_from_type(func_symbol.func_type),
 		instantiated_return = compiler_resolved_call_return_from_type(func_symbol.func_type),
 		resource_args = func_symbol.resource_args,
@@ -1162,10 +1234,11 @@ private pure func compiler_resolved_call_from_overload_entry(
 	{
 		callee_name = callee_name,
 		source_name = source_name,
-		callable_id = Some(entry.def_id),
-		trait_name = None,
 		purity = entry.purity,
-		origin = compiler_callable_origin_from_func(entry.origin, entry.module_path),
+		target = CompilerResolvedDirectCall(
+			entry.def_id,
+			compiler_callable_origin_from_func(entry.origin, entry.module_path),
+		),
 		instantiated_params = compiler_resolved_call_params_from_type(entry.func_type),
 		instantiated_return = compiler_resolved_call_return_from_type(entry.func_type),
 		resource_args = entry.resource_args,
@@ -1182,17 +1255,15 @@ private pure func compiler_resolved_call_from_named_overload_entry(
 
 private pure func compiler_resolved_call_from_constructor(
 	callee_name: String,
-	callable_id: Option[Int],
+	callable_id: Int,
 	parent_type: String,
 	constructor_type: CompilerType,
 ) -> CompilerResolvedCallInfo:
 	{
 		callee_name = callee_name,
 		source_name = callee_name,
-		callable_id = callable_id,
-		trait_name = None,
 		purity = CompilerPure,
-		origin = CompilerCallableConstructor(parent_type),
+		target = CompilerResolvedDirectCall(callable_id, CompilerCallableConstructor(parent_type)),
 		instantiated_params = compiler_resolved_call_params_from_type(constructor_type),
 		instantiated_return = compiler_resolved_call_return_from_type(constructor_type),
 		resource_args = CompilerRejectResourceArgs,
@@ -1280,8 +1351,6 @@ pure func compiler_typed_expr_info(expr: CompilerTypedExpr) -> CompilerTypedExpr
 		CompilerTypedForExpr(_, _, _, _, info):
 			info
 		CompilerTypedConcurrentBlockExpr(_, _, _, info):
-			info
-		CompilerTypedConcurrentBindExpr(_, _, _, _, info):
 			info
 		CompilerTypedConcurrentForExpr(_, _, _, _, _, info):
 			info
@@ -1382,10 +1451,8 @@ private pure func compiler_typed_expr_with_info(
 			CompilerTypedWhileExpr(condition, body, span, info)
 		CompilerTypedForExpr(binder, iterable, body, span, _):
 			CompilerTypedForExpr(binder, iterable, body, span, info)
-		CompilerTypedConcurrentBlockExpr(params, body, span, _):
-			CompilerTypedConcurrentBlockExpr(params, body, span, info)
-		CompilerTypedConcurrentBindExpr(name, annotation, value, span, _):
-			CompilerTypedConcurrentBindExpr(name, annotation, value, span, info)
+		CompilerTypedConcurrentBlockExpr(params, bindings, span, _):
+			CompilerTypedConcurrentBlockExpr(params, bindings, span, info)
 		CompilerTypedConcurrentForExpr(name, iterable, params, body, span, _):
 			CompilerTypedConcurrentForExpr(name, iterable, params, body, span, info)
 		CompilerTypedDetachExpr(body, span, _):
@@ -1655,6 +1722,37 @@ private pure func compiler_callable_origins_equal(
 					False
 
 
+private pure func compiler_resolved_call_targets_equal(
+	left: CompilerResolvedCallTarget,
+	right: CompilerResolvedCallTarget,
+) -> Bool:
+	match left:
+		CompilerResolvedDirectCall(left_id, left_origin):
+			match right:
+				CompilerResolvedDirectCall(right_id, right_origin):
+					left_id == right_id and compiler_callable_origins_equal(left_origin, right_origin)
+				_:
+					False
+		CompilerResolvedTraitMethodCall(left_trait, left_id):
+			match right:
+				CompilerResolvedTraitMethodCall(right_trait, right_id):
+					left_trait == right_trait and left_id == right_id
+				_:
+					False
+		CompilerResolvedIntrinsicCall:
+			match right:
+				CompilerResolvedIntrinsicCall:
+					True
+				_:
+					False
+		CompilerResolvedClosureCall:
+			match right:
+				CompilerResolvedClosureCall:
+					True
+				_:
+					False
+
+
 private pure func compiler_resolved_call_infos_equal(
 	left: CompilerResolvedCallInfo,
 	right: CompilerResolvedCallInfo,
@@ -1662,10 +1760,8 @@ private pure func compiler_resolved_call_infos_equal(
 	(
 		left.callee_name == right.callee_name
 		and left.source_name == right.source_name
-		and left.callable_id == right.callable_id
-		and left.trait_name == right.trait_name
 		and compiler_purities_equal(left.purity, right.purity)
-		and compiler_callable_origins_equal(left.origin, right.origin)
+		and compiler_resolved_call_targets_equal(left.target, right.target)
 		and compiler_resource_arg_policies_equal(left.resource_args, right.resource_args)
 		and compiler_dim_constraints_equal(left.dim_constraints, right.dim_constraints)
 	)
@@ -1857,6 +1953,12 @@ private pure func compiler_typed_concurrent_param_type_error(
 	compiler_typed_expr_type_error(param.value)
 
 
+private pure func compiler_typed_concurrent_binding_type_error(
+	binding: CompilerTypedConcurrentBinding,
+) -> Option[String]:
+	compiler_typed_expr_type_error(binding.value)
+
+
 private pure func compiler_typed_concurrent_params_type_error(
 	params: List[CompilerTypedConcurrentParam],
 ) -> Option[String]:
@@ -1868,6 +1970,21 @@ private pure func compiler_typed_concurrent_params_type_error(
 				break
 			None:
 				result = compiler_typed_concurrent_param_type_error(param)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_type_error(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for binding in bindings:
+		match result:
+			Some(_):
+				break
+			None:
+				result = compiler_typed_concurrent_binding_type_error(binding)
 
 	result
 
@@ -2030,14 +2147,12 @@ pure func compiler_typed_expr_type_error(expr: CompilerTypedExpr) -> Option[Stri
 							Some(message)
 						None:
 							compiler_typed_expr_type_error(body)
-				CompilerTypedConcurrentBlockExpr(params, body, _, _):
+				CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 					match compiler_typed_concurrent_params_type_error(params):
 						Some(message):
 							Some(message)
 						None:
-							compiler_typed_expr_type_error(body)
-				CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-					compiler_typed_expr_type_error(value)
+							compiler_typed_concurrent_bindings_type_error(bindings)
 				CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 					match compiler_typed_expr_type_error(iterable):
 						Some(message):
@@ -2169,6 +2284,15 @@ private pure func compiler_typed_concurrent_param_contains_meta(
 	param: CompilerTypedConcurrentParam,
 ) -> Bool:
 	compiler_typed_expr_contains_meta(param.value)
+
+
+private pure func compiler_typed_concurrent_binding_contains_meta(
+	binding: CompilerTypedConcurrentBinding,
+) -> Bool:
+	(
+		compiler_optional_type_contains_meta(binding.annotation)
+		or compiler_typed_expr_contains_meta(binding.value)
+	)
 
 
 private pure func compiler_typed_with_error_map_contains_meta(
@@ -2312,15 +2436,10 @@ pure func compiler_typed_expr_contains_meta(expr: CompilerTypedExpr) -> Bool:
 					compiler_typed_expr_contains_meta(iterable)
 					or compiler_typed_expr_contains_meta(body)
 				)
-			CompilerTypedConcurrentBlockExpr(params, body, _, _):
+			CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 				(
 					params.any(compiler_typed_concurrent_param_contains_meta)
-					or compiler_typed_expr_contains_meta(body)
-				)
-			CompilerTypedConcurrentBindExpr(_, annotation, value, _, _):
-				(
-					compiler_optional_type_contains_meta(annotation)
-					or compiler_typed_expr_contains_meta(value)
+					or bindings.any(compiler_typed_concurrent_binding_contains_meta)
 				)
 			CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 				(
@@ -2414,10 +2533,8 @@ private pure func compiler_zonk_resolved_call_info(
 	{
 		callee_name = info.callee_name,
 		source_name = info.source_name,
-		callable_id = info.callable_id,
-		trait_name = info.trait_name,
 		purity = info.purity,
-		origin = info.origin,
+		target = compiler_resolved_call_target_copy(info.target),
 		instantiated_params = compiler_zonk_types(context, info.instantiated_params),
 		instantiated_return = compiler_zonk_type(context, info.instantiated_return),
 		resource_args = info.resource_args,
@@ -2638,6 +2755,19 @@ private pure func compiler_zonk_typed_concurrent_param(
 		name = param.name,
 		value = compiler_zonk_typed_expr(context, param.value),
 		span = param.span
+	}
+
+
+private pure func compiler_zonk_typed_concurrent_binding(
+	context: CompilerContext,
+	binding: CompilerTypedConcurrentBinding,
+) -> CompilerTypedConcurrentBinding:
+	{
+		name = binding.name,
+		annotation = compiler_zonk_optional_type(context, binding.annotation),
+		value = compiler_zonk_typed_expr(context, binding.value),
+		span = binding.span,
+		info = compiler_zonk_typed_expr_info(context, binding.info),
 	}
 
 
@@ -2876,18 +3006,12 @@ pure func compiler_zonk_typed_expr(
 				span,
 				info,
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, span, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, span, _):
 			CompilerTypedConcurrentBlockExpr(
 				params.map(func(param): compiler_zonk_typed_concurrent_param(context, param)),
-				compiler_zonk_typed_expr(context, body),
-				span,
-				info,
-			)
-		CompilerTypedConcurrentBindExpr(name, annotation, value, span, _):
-			CompilerTypedConcurrentBindExpr(
-				name,
-				compiler_zonk_optional_type(context, annotation),
-				compiler_zonk_typed_expr(context, value),
+				bindings.map(func(binding):
+					compiler_zonk_typed_concurrent_binding(context, binding)
+				),
 				span,
 				info,
 			)
@@ -3088,6 +3212,21 @@ private pure func compiler_typed_interpolation_parts_resource_dependency_refs(
 	result
 
 
+private pure func compiler_typed_concurrent_bindings_resource_dependency_refs(
+	context: CompilerInferContext,
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_resource_refs(
+			result,
+			compiler_typed_expr_resource_dependency_refs(context, binding.value),
+		)
+
+	result
+
+
 private pure func compiler_typed_block_result_expr(
 	items: List[CompilerTypedExpr],
 ) -> Option[CompilerTypedExpr]:
@@ -3187,8 +3326,8 @@ private pure func compiler_typed_expr_resource_dependency_refs(
 					compiler_typed_expr_resource_dependency_refs(context, result_expr)
 				None:
 					[]
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_resource_dependency_refs(context, value)
+		CompilerTypedConcurrentBlockExpr(_, bindings, _, _):
+			compiler_typed_concurrent_bindings_resource_dependency_refs(context, bindings)
 		CompilerTypedWithExpr(_, body, _, _):
 			compiler_typed_expr_resource_dependency_refs(context, body)
 		CompilerTypedStringInterpolationPartsExpr(parts, _, _, _):
@@ -3285,6 +3424,20 @@ private pure func compiler_typed_concurrent_params_impure_call_names(
 		result = compiler_append_impure_call_names(
 			result,
 			compiler_typed_expr_impure_call_names(param.value),
+		)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_impure_call_names(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_impure_call_names(
+			result,
+			compiler_typed_expr_impure_call_names(binding.value),
 		)
 
 	result
@@ -3480,13 +3633,11 @@ pure func compiler_typed_expr_impure_call_names(expr: CompilerTypedExpr) -> List
 				compiler_typed_expr_impure_call_names(iterable),
 				compiler_typed_expr_impure_call_names(body),
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			compiler_append_impure_call_names(
 				compiler_typed_concurrent_params_impure_call_names(params),
-				compiler_typed_expr_impure_call_names(body),
+				compiler_typed_concurrent_bindings_impure_call_names(bindings),
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_impure_call_names(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = compiler_append_impure_call_names(
 				["for ... concurrently"],
@@ -3594,6 +3745,20 @@ private pure func compiler_typed_concurrent_params_module_assign_names(
 		result = compiler_append_module_assign_names(
 			result,
 			compiler_typed_expr_module_assign_names(param.value),
+		)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_module_assign_names(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_module_assign_names(
+			result,
+			compiler_typed_expr_module_assign_names(binding.value),
 		)
 
 	result
@@ -3793,13 +3958,11 @@ pure func compiler_typed_expr_module_assign_names(expr: CompilerTypedExpr) -> Li
 				compiler_typed_expr_module_assign_names(iterable),
 				compiler_typed_expr_module_assign_names(body),
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			compiler_append_module_assign_names(
 				compiler_typed_concurrent_params_module_assign_names(params),
-				compiler_typed_expr_module_assign_names(body),
+				compiler_typed_concurrent_bindings_module_assign_names(bindings),
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_module_assign_names(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = compiler_typed_expr_module_assign_names(iterable)
 			with_params = compiler_append_module_assign_names(
@@ -3904,6 +4067,20 @@ private pure func compiler_typed_concurrent_params_startup_call_names(
 		result = compiler_append_startup_call_names(
 			result,
 			compiler_typed_expr_startup_call_names(param.value),
+		)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_startup_call_names(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_startup_call_names(
+			result,
+			compiler_typed_expr_startup_call_names(binding.value),
 		)
 
 	result
@@ -4099,13 +4276,11 @@ pure func compiler_typed_expr_startup_call_names(expr: CompilerTypedExpr) -> Lis
 				compiler_typed_expr_startup_call_names(iterable),
 				compiler_typed_expr_startup_call_names(body),
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			compiler_append_startup_call_names(
 				compiler_typed_concurrent_params_startup_call_names(params),
-				compiler_typed_expr_startup_call_names(body),
+				compiler_typed_concurrent_bindings_startup_call_names(bindings),
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_startup_call_names(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = compiler_typed_expr_startup_call_names(iterable)
 			with_params = compiler_append_startup_call_names(
@@ -4192,6 +4367,19 @@ private pure func compiler_typed_concurrent_params_have_startup_subscript(
 
 	for param in params:
 		if compiler_typed_expr_has_startup_subscript(param.value):
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_typed_concurrent_bindings_have_startup_subscript(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if compiler_typed_expr_has_startup_subscript(binding.value):
 			found = True
 			break
 
@@ -4347,13 +4535,11 @@ pure func compiler_typed_expr_has_startup_subscript(expr: CompilerTypedExpr) -> 
 				compiler_typed_expr_has_startup_subscript(iterable)
 				or compiler_typed_expr_has_startup_subscript(body)
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			(
 				compiler_typed_concurrent_params_have_startup_subscript(params)
-				or compiler_typed_expr_has_startup_subscript(body)
+				or compiler_typed_concurrent_bindings_have_startup_subscript(bindings)
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_has_startup_subscript(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			(
 				compiler_typed_expr_has_startup_subscript(iterable)
@@ -4452,6 +4638,24 @@ private pure func compiler_typed_concurrent_params_have_non_tail_recursive_call(
 
 	for param in params:
 		if compiler_typed_expr_has_non_tail_recursive_call_inner(param.value, function_name, False):
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_typed_concurrent_bindings_have_non_tail_recursive_call(
+	bindings: List[CompilerTypedConcurrentBinding],
+	function_name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if compiler_typed_expr_has_non_tail_recursive_call_inner(
+			binding.value,
+			function_name,
+			False,
+		):
 			found = True
 			break
 
@@ -4743,13 +4947,14 @@ private pure func compiler_typed_expr_has_non_tail_recursive_call_inner(
 				)
 				or compiler_typed_expr_has_non_tail_recursive_call_inner(body, function_name, False)
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			(
 				compiler_typed_concurrent_params_have_non_tail_recursive_call(params, function_name)
-				or compiler_typed_expr_has_non_tail_recursive_call_inner(body, function_name, False)
+				or compiler_typed_concurrent_bindings_have_non_tail_recursive_call(
+					bindings,
+					function_name,
+				)
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_has_non_tail_recursive_call_inner(value, function_name, False)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			(
 				compiler_typed_expr_has_non_tail_recursive_call_inner(
@@ -4867,6 +5072,20 @@ private pure func compiler_typed_concurrent_params_pure_lambda_impure_call_names
 		result = compiler_append_pure_lambda_impure_call_names(
 			result,
 			compiler_typed_expr_pure_lambda_impure_call_names(param.value),
+		)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_pure_lambda_impure_call_names(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_pure_lambda_impure_call_names(
+			result,
+			compiler_typed_expr_pure_lambda_impure_call_names(binding.value),
 		)
 
 	result
@@ -5050,13 +5269,11 @@ pure func compiler_typed_expr_pure_lambda_impure_call_names(
 				compiler_typed_expr_pure_lambda_impure_call_names(iterable),
 				compiler_typed_expr_pure_lambda_impure_call_names(body),
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			compiler_append_pure_lambda_impure_call_names(
 				compiler_typed_concurrent_params_pure_lambda_impure_call_names(params),
-				compiler_typed_expr_pure_lambda_impure_call_names(body),
+				compiler_typed_concurrent_bindings_pure_lambda_impure_call_names(bindings),
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_pure_lambda_impure_call_names(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = compiler_append_pure_lambda_impure_call_names(
 				["for ... concurrently"],
@@ -5152,6 +5369,20 @@ private pure func compiler_typed_concurrent_params_debug_block_impure_call_names
 		result = compiler_append_impure_call_names(
 			result,
 			compiler_typed_expr_debug_block_impure_call_names(param.value),
+		)
+
+	result
+
+
+private pure func compiler_typed_concurrent_bindings_debug_block_impure_call_names(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = []
+
+	for binding in bindings:
+		result = compiler_append_impure_call_names(
+			result,
+			compiler_typed_expr_debug_block_impure_call_names(binding.value),
 		)
 
 	result
@@ -5314,13 +5545,11 @@ pure func compiler_typed_expr_debug_block_impure_call_names(
 				compiler_typed_expr_debug_block_impure_call_names(iterable),
 				compiler_typed_expr_debug_block_impure_call_names(body),
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			compiler_append_impure_call_names(
 				compiler_typed_concurrent_params_debug_block_impure_call_names(params),
-				compiler_typed_expr_debug_block_impure_call_names(body),
+				compiler_typed_concurrent_bindings_debug_block_impure_call_names(bindings),
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_debug_block_impure_call_names(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = compiler_append_impure_call_names(
 				["for ... concurrently"],
@@ -5466,13 +5695,11 @@ private pure func compiler_typed_expr_has_assignment_inside_debug_block(
 				compiler_typed_expr_has_assignment_inside_debug_block(iterable)
 				or compiler_typed_expr_has_assignment_inside_debug_block(body)
 			)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			(
 				compiler_typed_concurrent_params_have_assignment_inside_debug_block(params)
-				or compiler_typed_expr_has_assignment_inside_debug_block(body)
+				or compiler_typed_concurrent_bindings_have_assignment_inside_debug_block(bindings)
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_has_assignment_inside_debug_block(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			(
 				compiler_typed_expr_has_assignment_inside_debug_block(iterable)
@@ -5541,6 +5768,19 @@ private pure func compiler_typed_concurrent_params_have_assignment_inside_debug_
 
 	for param in params:
 		if compiler_typed_expr_has_assignment_inside_debug_block(param.value):
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_typed_concurrent_bindings_have_assignment_inside_debug_block(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if compiler_typed_expr_has_assignment_inside_debug_block(binding.value):
 			found = True
 			break
 
@@ -5626,13 +5866,11 @@ pure func compiler_typed_expr_has_debug_block_assignment(expr: CompilerTypedExpr
 			compiler_typed_expr_has_debug_block_assignment(body)
 		CompilerTypedBlockExpr(items, _, _):
 			compiler_typed_expr_list_has_debug_block_assignment(items)
-		CompilerTypedConcurrentBlockExpr(params, body, _, _):
+		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			(
 				compiler_typed_concurrent_params_have_debug_block_assignment(params)
-				or compiler_typed_expr_has_debug_block_assignment(body)
+				or compiler_typed_concurrent_bindings_have_debug_block_assignment(bindings)
 			)
-		CompilerTypedConcurrentBindExpr(_, _, value, _, _):
-			compiler_typed_expr_has_debug_block_assignment(value)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
 			(
 				compiler_typed_expr_has_debug_block_assignment(iterable)
@@ -5727,6 +5965,19 @@ private pure func compiler_typed_concurrent_params_have_debug_block_assignment(
 
 	for param in params:
 		if compiler_typed_expr_has_debug_block_assignment(param.value):
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_typed_concurrent_bindings_have_debug_block_assignment(
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if compiler_typed_expr_has_debug_block_assignment(binding.value):
 			found = True
 			break
 
@@ -6635,22 +6886,19 @@ private pure func compiler_constructor_expr_type(
 private pure func compiler_infer_constructor_name_expr(
 	context: CompilerInferContext,
 	name: ParsedIdentifier,
-	parent_type: String,
-	type_params: List[String],
-	field_types: List[CompilerType],
+	ctor: CompilerConstructorSymbol,
 ) -> CompilerInferResult:
-	callable_id = compiler_env_get_constructor_callable_id(context.state.env, name.text)
 	constructor_type = compiler_constructor_expr_type(
 		context,
-		parent_type,
-		type_params,
-		field_types,
+		ctor.parent_type,
+		ctor.type_params,
+		ctor.field_types,
 	)
 	resolved_call = Some(
 		compiler_resolved_call_from_constructor(
 			name.text,
-			callable_id,
-			parent_type,
+			ctor.constructor_id,
+			ctor.parent_type,
 			constructor_type,
 		),
 	)
@@ -7017,13 +7265,11 @@ private pure func compiler_infer_name_expr(
 					compiler_infer_result(next_context, expr)
 				_:
 					match compiler_env_get_constructor(context.state.env, name.text):
-						Some((parent_type, type_params, field_types, _)):
+						Some(ctor):
 							compiler_infer_constructor_name_expr(
 								context,
 								name,
-								parent_type,
-								type_params,
-								field_types,
+								ctor,
 							)
 						None:
 							next = compiler_infer_error(
@@ -7043,13 +7289,11 @@ private pure func compiler_infer_name_expr(
 					compiler_infer_trait_method_name_expr(context, name, callee)
 				None:
 					match compiler_env_get_constructor(context.state.env, name.text):
-						Some((parent_type, type_params, field_types, _)):
+						Some(ctor):
 							compiler_infer_constructor_name_expr(
 								context,
 								name,
-								parent_type,
-								type_params,
-								field_types,
+								ctor,
 							)
 						None:
 							next = compiler_infer_error(
@@ -8217,7 +8461,7 @@ private pure func compiler_typed_qualified_module_constructor_expr(
 		Some(
 			compiler_resolved_call_from_constructor(
 				field.text,
-				Some(ctor.constructor_id),
+				ctor.constructor_id,
 				ctor.parent_type,
 				constructor_type,
 			),
@@ -8661,7 +8905,7 @@ private pure func compiler_resolved_entry_bound_type_params(
 	context: CompilerInferContext,
 	resolved_call: CompilerResolvedCallInfo,
 ) -> Option[List[CompilerBoundTypeParam]]:
-	match resolved_call.callable_id:
+	match compiler_resolved_call_callable_id(resolved_call):
 		Some(callable_id):
 			compiler_env_find_callable_type_params_by_def_id(context.state.env, callable_id)
 		None:
@@ -8793,11 +9037,7 @@ private pure func compiler_resolved_call_is_trait_method(
 ) -> Bool:
 	match resolved_call:
 		Some(call):
-			match call.origin:
-				CompilerCallableImplMethod:
-					True
-				_:
-					False
+			compiler_resolved_call_is_trait_target(call)
 		None:
 			False
 
@@ -8832,26 +9072,22 @@ private pure func compiler_check_trait_method_self_bound(
 ) -> CompilerInferContext:
 	match resolved_call:
 		Some(call):
-			match call.origin:
-				CompilerCallableImplMethod:
-					match compiler_env_get_function_trait(context.state.env, call.callee_name):
-						Some(trait_name):
-							match compiler_env_find_unsatisfied_trait_obligation(
-								context.state.env,
-								[compiler_trait_obligation(self_type, trait_name)],
-							):
-								Some(obligation):
-									compiler_call_trait_bound_error(
-										context,
-										call.callee_name,
-										self_type,
-										obligation.obligation_trait.name,
-									)
-								None:
-									context
+			match compiler_resolved_call_trait_name(call):
+				Some(trait_name):
+					match compiler_env_find_unsatisfied_trait_obligation(
+						context.state.env,
+						[compiler_trait_obligation(self_type, trait_name)],
+					):
+						Some(obligation):
+							compiler_call_trait_bound_error(
+								context,
+								call.callee_name,
+								self_type,
+								obligation.obligation_trait.name,
+							)
 						None:
 							context
-				_:
+				None:
 					context
 		None:
 			context
@@ -8888,20 +9124,16 @@ private pure func compiler_resolve_trait_self_call(
 				)
 				resource_args = match updated_resolved_call:
 					Some(call):
-						match call.origin:
-							CompilerCallableImplMethod:
-								match call.trait_name:
-									Some(trait_name):
-										compiler_trait_method_resource_args_for_type(
-											context,
-											trait_name,
-											call.callee_name,
-											self_type,
-											call.resource_args,
-										)
-									None:
-										call.resource_args
-							_:
+						match compiler_resolved_call_trait_name(call):
+							Some(trait_name):
+								compiler_trait_method_resource_args_for_type(
+									context,
+									trait_name,
+									call.callee_name,
+									self_type,
+									call.resource_args,
+								)
+							None:
 								call.resource_args
 					None:
 						CompilerRejectResourceArgs
@@ -9046,7 +9278,7 @@ private pure func compiler_resolved_call_is_debug_only(
 ) -> Bool:
 	match resolved_call:
 		Some(call):
-			match call.callable_id:
+			match compiler_resolved_call_callable_id(call):
 				Some(callable_id):
 					match compiler_env_find_callable_debug_only_by_def_id(
 						context.state.env,
@@ -9232,6 +9464,17 @@ private pure func compiler_infer_call_with_callee_result(
 
 	match callee_type:
 		CompilerFunctionType(is_pure, raw_params, raw_return_type):
+			initial_resolved_call = match resolved_call:
+				Some(_):
+					resolved_call
+				None:
+					Some(
+						compiler_resolved_call_from_closure(
+							is_pure,
+							raw_params,
+							raw_return_type,
+						),
+					)
 			self_resolution = compiler_resolve_trait_self_call(
 				compiler_infer_context_with_state(context, callee_result.context.state),
 				callee_result.expr,
@@ -9239,7 +9482,7 @@ private pure func compiler_infer_call_with_callee_result(
 				is_pure,
 				raw_params,
 				raw_return_type,
-				resolved_call,
+				initial_resolved_call,
 			)
 			params = self_resolution.params
 			return_type = self_resolution.return_type
@@ -13639,10 +13882,8 @@ private pure func compiler_builtin_resolved_call(
 	{
 		callee_name = name,
 		source_name = name,
-		callable_id = None,
-		trait_name = None,
 		purity = CompilerPure,
-		origin = CompilerCallableBuiltin,
+		target = CompilerResolvedIntrinsicCall,
 		instantiated_params = compiler_type_list_copy(params),
 		instantiated_return = compiler_type_copy(return_type),
 		resource_args = CompilerRejectResourceArgs,
@@ -14517,15 +14758,15 @@ private pure func compiler_infer_constructor_pattern(
 	scrutinee_type: CompilerType,
 ) -> CompilerInferPatternResult:
 	match compiler_env_get_constructor(env, constructor_name.text):
-		Some((parent_type, type_params, field_types, _)):
+		Some(ctor):
 			compiler_infer_known_constructor_pattern(
 				context,
 				env,
 				constructor_name,
 				constructor_name.text,
-				parent_type,
-				type_params,
-				field_types,
+				ctor.parent_type,
+				ctor.type_params,
+				ctor.field_types,
 				fields,
 				span,
 				scrutinee_type,
@@ -17007,20 +17248,6 @@ private pure func compiler_skip_concurrent_body_inference(
 	checked_context.state.errors.length() > params_context.state.errors.length()
 
 
-private pure func compiler_empty_typed_block_result(
-	context: CompilerInferContext,
-	span: CompilerSourceSpan,
-) -> CompilerInferResult:
-	compiler_infer_result(
-		context,
-		CompilerTypedBlockExpr(
-			[],
-			span,
-			compiler_inferred_info(context, compiler_type_void()),
-		),
-	)
-
-
 private pure func compiler_type_concurrency_error() -> CompilerType:
 	CompilerNamedType("ConcurrencyError", [])
 
@@ -17119,21 +17346,37 @@ private pure func compiler_add_concurrent_result_binding(
 		)
 
 
+record CompilerInferConcurrentBindingsResult {
+	context: CompilerInferContext,
+	bindings: List[CompilerTypedConcurrentBinding]
+}
+
+
+private pure func compiler_infer_concurrent_bindings_result(
+	context: CompilerInferContext,
+	bindings: List[CompilerTypedConcurrentBinding],
+) -> CompilerInferConcurrentBindingsResult:
+	{
+		context = compiler_infer_context_copy(context),
+		bindings = bindings
+	}
+
+
+private pure func compiler_empty_typed_concurrent_bindings_result(
+	context: CompilerInferContext,
+) -> CompilerInferConcurrentBindingsResult:
+	compiler_infer_concurrent_bindings_result(context, [])
+
+
 private pure func compiler_infer_concurrent_bindings_from_items(
 	context: CompilerInferContext,
 	items: List[ParsedExpr],
 	index: Int,
 	base_env: CompilerEnv,
-	typed_items: List[CompilerTypedExpr],
-	block_span: CompilerSourceSpan,
-) -> CompilerInferResult:
+	typed_bindings: List[CompilerTypedConcurrentBinding],
+) -> CompilerInferConcurrentBindingsResult:
 	if index >= items.length():
-		typed = CompilerTypedBlockExpr(
-			typed_items,
-			block_span,
-			compiler_inferred_info(context, compiler_type_void()),
-		)
-		compiler_infer_result(context, typed)
+		compiler_infer_concurrent_bindings_result(context, typed_bindings)
 	else:
 		match items.get(index):
 			Some(item):
@@ -17190,56 +17433,42 @@ private pure func compiler_infer_concurrent_bindings_from_items(
 							result_env,
 						)
 						next_context = compiler_infer_context_with_state(context, next_state)
-						typed = CompilerTypedConcurrentBindExpr(
-							name,
-							compiler_optional_type_copy(annotation_type),
-							value_result.expr,
-							compiler_concurrent_binding_span(item),
-							compiler_inferred_info(next_context, result_type),
-						)
+						typed: CompilerTypedConcurrentBinding = {
+							name = name,
+							annotation = compiler_optional_type_copy(annotation_type),
+							value = value_result.expr,
+							span = compiler_concurrent_binding_span(item),
+							info = compiler_inferred_info(next_context, result_type),
+						}
 						compiler_infer_concurrent_bindings_from_items(
 							next_context,
 							items,
 							index + 1,
 							base_env,
-							typed_items.append(typed),
-							block_span,
+							typed_bindings.append(typed),
 						)
 					_:
-						compiler_empty_typed_block_result(
-							context,
-							compiler_concurrent_binding_span(item),
-						)
+						compiler_empty_typed_concurrent_bindings_result(context)
 			None:
-				compiler_empty_typed_block_result(context, block_span)
+				compiler_empty_typed_concurrent_bindings_result(context)
 
 
-private pure func compiler_infer_concurrent_block_body(
+private pure func compiler_infer_concurrent_block_bindings(
 	context: CompilerInferContext,
 	body: ParsedExpr,
-) -> CompilerInferResult:
+) -> CompilerInferConcurrentBindingsResult:
 	match body:
-		ParsedBlockExpr(items, block_span):
+		ParsedBlockExpr(items, _):
 			base_env = context.state.env
-			result = compiler_infer_concurrent_bindings_from_items(
+			compiler_infer_concurrent_bindings_from_items(
 				context,
 				items,
 				0,
 				base_env,
 				[],
-				block_span,
 			)
-
-			match result.expr:
-				CompilerTypedBlockExpr(items, _, info):
-					compiler_infer_result(
-						result.context,
-						CompilerTypedBlockExpr(items, block_span, info),
-					)
-				_:
-					result
 		_:
-			compiler_empty_typed_block_result(context, parsed_expr_span(body))
+			compiler_empty_typed_concurrent_bindings_result(context)
 
 
 private pure func compiler_infer_concurrent_block_expr(
@@ -17255,18 +17484,18 @@ private pure func compiler_infer_concurrent_block_expr(
 	checked_context = compiler_check_concurrent_body_shape(params_result.context, body)
 	task_context = compiler_check_concurrent_block_task_rules(checked_context, body)
 
-	body_result = if compiler_skip_concurrent_body_inference(params_result.context, task_context):
-		compiler_empty_typed_block_result(task_context, parsed_expr_span(body))
+	bindings_result = if compiler_skip_concurrent_body_inference(params_result.context, task_context):
+		compiler_empty_typed_concurrent_bindings_result(task_context)
 	else:
-		compiler_infer_concurrent_block_body(
+		compiler_infer_concurrent_block_bindings(
 			compiler_infer_without_expected(task_context),
 			body,
 		)
 
-	result_context = compiler_infer_context_with_state(context, body_result.context.state)
+	result_context = compiler_infer_context_with_state(context, bindings_result.context.state)
 	typed = CompilerTypedConcurrentBlockExpr(
 		params_result.params,
-		body_result.expr,
+		bindings_result.bindings,
 		span,
 		compiler_inferred_info(result_context, compiler_type_void()),
 	)

@@ -83,7 +83,8 @@ let try_compile_and_run ~debug source =
       let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
       let embed_runtime = precompiled = None in
       match
-        Pipeline.compile ~debug ~embed_runtime ~filename:"<repl>" ~source ()
+        Pipeline.compile_legacy_direct_source ~debug ~embed_runtime
+          ~filename:"<repl>" ~source ()
       with
       | Error errors -> Error (Diagnostics.format_errors ~file:"<repl>" errors)
       | Ok (Pipeline.Stopped_at _) ->

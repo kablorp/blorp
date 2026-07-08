@@ -106,7 +106,7 @@ val cc_is_clang : bool Lazy.t
 (** Whether the system C compiler is Clang (vs GCC). Lazy-evaluated. *)
 
 val has_raylib_import : unit -> bool
-(** Check if raylib was imported (must be called after Pipeline.compile) *)
+(** Check if raylib was imported after a pipeline compile run. *)
 
 val has_top_level_main_source : string -> bool
 (** True when source contains an actual top-level [func main(...)] declaration.

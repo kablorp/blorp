@@ -772,6 +772,9 @@ let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
         in
         if import_errors <> [] then Error import_errors else Ok typed_program
 
+(* Legacy direct-source/typechecking route for tooling and tests that still
+   pass raw source instead of a Blorp frontend graph. Normal source-command
+   checks enter through [typecheck_only_typed_with_blorp_bridge_policy]. *)
 let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
     =
   with_fresh_session filename (fun () ->
@@ -942,7 +945,10 @@ let compile_loaded_program ~source_kind ?(debug = false)
           ~main_import_bindings:(List.rev main_state.Typecheck.import_bindings)
           ()
 
-(** Compile a source file through all phases.
+(** Legacy direct-source compile route for callers that still pass raw source.
+    Normal source commands use [compile_preloaded_graph_with_blorp_bridge] so
+    the Blorp frontend graph owns parse/module/typecheck.
+
     Returns either the compiled result or a list of errors.
 
     [embed_runtime] — when [true] (the default), the generated C embeds
@@ -1010,11 +1016,20 @@ let compile_preloaded_graph_with_blorp_bridge ?(debug = false)
             ~typed_program:result.blorp_bridge_typed_program
             ~main_import_bindings:result.blorp_bridge_import_bindings ())
 
+let compile_legacy_direct_source ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
+    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+    ?tail_observation_stages ?check_invariants ~filename ~source () =
+  compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
+    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+    ?tail_observation_stages ?check_invariants ~filename ~source ()
+
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
     ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
     ?on_stage_json ?tail_observation_stages ?check_invariants ~filename ~source
     () =
-  compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
+  compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source ()

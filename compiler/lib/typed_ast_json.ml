@@ -16,13 +16,23 @@ type decoded_value_slot = {
   value_slot_decision : Ast.type_widening_decision;
 }
 
+type decoded_resolved_call_target =
+  | DecodedDirectCall of {
+      callable_id : int;
+      origin : Ast.callable_origin;
+    }
+  | DecodedTraitMethodCall of {
+      trait_name : string;
+      callable_id : int option;
+    }
+  | DecodedIntrinsicCall
+  | DecodedClosureCall
+
 type decoded_resolved_call_info = {
   callee_name : string;
   source_name : string;
-  callable_id : int option;
-  trait_name : string option;
   purity : Env_types.purity;
-  origin : Ast.callable_origin;
+  target : decoded_resolved_call_target;
   instantiated_params : Ast.type_expr list;
   instantiated_return : Ast.type_expr;
   resource_args : Env_types.resource_arg_policy;
@@ -698,17 +708,35 @@ let decode_dim_constraint path value =
   let* right = decode_type (path ^ ".right") right_json in
   Ok (left, right)
 
+let decode_resolved_call_target path value =
+  let* kind = kind_field path value in
+  match kind with
+  | "direct" ->
+      let* callable_id = int_field path "callable_id" value in
+      let* origin_json = field path "origin" value in
+      let* origin = decode_callable_origin (path ^ ".origin") origin_json in
+      Ok (DecodedDirectCall { callable_id; origin })
+  | "trait_method" ->
+      let* trait_name = string_field path "trait_name" value in
+      let* callable_id_json = field path "callable_id" value in
+      let* callable_id =
+        option_int_value (path ^ ".callable_id") callable_id_json
+      in
+      Ok (DecodedTraitMethodCall { trait_name; callable_id })
+  | "intrinsic" -> Ok DecodedIntrinsicCall
+  | "closure" -> Ok DecodedClosureCall
+  | _ ->
+      error (path ^ ".kind")
+        ("unsupported resolved call target kind `" ^ kind ^ "`")
+
 let decode_resolved_call_info path value =
   let* callee_name = string_field path "callee_name" value in
   let* source_name_opt = option_string_field path "source_name" value in
   let source_name = Option.value ~default:callee_name source_name_opt in
-  let* callable_id_json = field path "callable_id" value in
-  let* callable_id = option_int_value (path ^ ".callable_id") callable_id_json in
-  let* trait_name = option_string_field path "trait_name" value in
   let* purity_text = string_field path "purity" value in
   let* purity = decode_purity (path ^ ".purity") purity_text in
-  let* origin_json = field path "origin" value in
-  let* origin = decode_callable_origin (path ^ ".origin") origin_json in
+  let* target_json = field path "target" value in
+  let* target = decode_resolved_call_target (path ^ ".target") target_json in
   let* instantiated_params_json = array_field path "instantiated_params" value in
   let* instantiated_params =
     decode_list (path ^ ".instantiated_params") decode_type
@@ -731,10 +759,8 @@ let decode_resolved_call_info path value =
     {
       callee_name;
       source_name;
-      callable_id;
-      trait_name;
       purity;
-      origin;
+      target;
       instantiated_params;
       instantiated_return;
       resource_args;
@@ -856,13 +882,22 @@ let normalize_imported_bare_call_desc
     (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
   match (desc, info.resolved_call) with
   | ( Ast.ECall (({ Ast.expr_desc = Ast.EIdent _; _ } as callee), args),
-      Some { origin = Ast.CallableImported module_path; source_name; _ } ) ->
+      Some
+        {
+          target =
+            DecodedDirectCall
+              { origin = Ast.CallableImported module_path; _ };
+          source_name;
+          _;
+        } ) ->
       Ast.ECall
-        ( { callee with expr_desc = Ast.EIdent (bridge_ufcs_name module_path source_name) },
+        ( { callee with
+            expr_desc = Ast.EIdent (bridge_ufcs_name module_path source_name);
+          },
           args )
   | _ -> desc
 
-let call_syntax_of_decoded_desc origin desc =
+let call_syntax_of_direct_desc origin desc =
   match desc with
   | Ast.ECall
       ( { Ast.expr_desc = Ast.EFieldAccess ({ expr_desc = Ast.EIdent _; _ }, _);
@@ -878,58 +913,63 @@ let call_syntax_of_decoded_desc origin desc =
       Ast.CallMethod
   | _ -> Ast.CallBare
 
-let materialize_resolved_call path desc
+let call_syntax_of_decoded_target target desc =
+  match target with
+  | DecodedIntrinsicCall -> Ast.CallBare
+  | DecodedClosureCall -> Ast.CallClosureSyntax
+  | DecodedTraitMethodCall _ ->
+      call_syntax_of_direct_desc Ast.CallableImplMethod desc
+  | DecodedDirectCall { origin; _ } -> call_syntax_of_direct_desc origin desc
+
+let materialize_resolved_call _path desc
     (info_opt : decoded_resolved_call_info option) =
   match info_opt with
   | None -> Ok None
   | Some info -> (
-      match info.origin with
-      | Ast.CallableImplMethod -> (
-          match info.trait_name with
-          | None ->
-              error
-                (path ^ ".trait_name")
-                "impl-method resolved call metadata requires trait_name"
-          | Some trait_name ->
-              Ok
-                (Some
-                   {
-                     Ast.call_syntax =
-                       call_syntax_of_decoded_desc info.origin desc;
-                     call_target =
-                       Ast.CallTraitMethod
-                         {
-                           trait_name;
-                           method_name = info.source_name;
-                           call_pure = call_pure_of_purity info.purity;
-                           callable_id = info.callable_id;
-                         };
-                     instantiated_params = info.instantiated_params;
-                     instantiated_return = info.instantiated_return;
-                   }))
-      | _ -> (
-          match info.callable_id with
-          | None ->
-              error
-                (path ^ ".callable_id")
-                "direct resolved call metadata requires callable_id"
-          | Some callable_id ->
+      match info.target with
+      | DecodedIntrinsicCall -> Ok None
+      | DecodedClosureCall ->
           Ok
             (Some
                {
-                 Ast.call_syntax =
-                   call_syntax_of_decoded_desc info.origin desc;
+                 Ast.call_syntax = Ast.CallClosureSyntax;
                  call_target =
-                   Ast.CallDirect
-                       {
-                         callable_id;
-                         source_name = info.source_name;
-                         call_pure = call_pure_of_purity info.purity;
-                       origin = info.origin;
+                   Ast.CallClosure { call_pure = call_pure_of_purity info.purity };
+                 instantiated_params = info.instantiated_params;
+                 instantiated_return = info.instantiated_return;
+               })
+      | DecodedTraitMethodCall { trait_name; callable_id } ->
+          Ok
+            (Some
+               {
+                 Ast.call_syntax = call_syntax_of_decoded_target info.target desc;
+                 call_target =
+                   Ast.CallTraitMethod
+                     {
+                       trait_name;
+                       method_name = info.source_name;
+                       call_pure = call_pure_of_purity info.purity;
+                       callable_id;
                      };
                  instantiated_params = info.instantiated_params;
                  instantiated_return = info.instantiated_return;
-               })))
+               })
+      | DecodedDirectCall { callable_id; origin } ->
+          Ok
+            (Some
+               {
+                 Ast.call_syntax = call_syntax_of_decoded_target info.target desc;
+                 call_target =
+                   Ast.CallDirect
+                     {
+                       callable_id;
+                       source_name = info.source_name;
+                       call_pure = call_pure_of_purity info.purity;
+                       origin;
+                     };
+                 instantiated_params = info.instantiated_params;
+                 instantiated_return = info.instantiated_return;
+               }))
 
 let make_typed_expr path loc info desc =
   let desc = normalize_imported_bare_call_desc info desc in

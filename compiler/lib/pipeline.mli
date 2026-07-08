@@ -39,7 +39,12 @@ val typecheck_only :
   (Ast.program, Ast.compiler_error list) result
 (** Parse, load modules, and type-check only (no codegen). Returns the
     type-checked AST compatibility view or a list of errors. Prefer
-    [typecheck_only_typed] for new compiler callers. *)
+    [typecheck_only_typed] for new compiler callers.
+
+    This is a legacy direct-source/tooling entrypoint: it owns parsing and
+    import loading in OCaml because the caller has not supplied a Blorp
+    frontend graph. Normal source-command checks should use
+    [typecheck_only_typed_with_blorp_bridge] instead. *)
 
 val typecheck_only_typed :
   filename:string ->
@@ -49,7 +54,11 @@ val typecheck_only_typed :
   (Typed_ast.program, Ast.compiler_error list) result
 (** Parse, load modules, and type-check only (no codegen). Returns a
     validated typed program, so missing expression types and unfinalized
-    inference metavariables are rejected at the typecheck boundary. *)
+    inference metavariables are rejected at the typecheck boundary.
+
+    This is the typed variant of the legacy direct-source/tooling entrypoint.
+    Normal source-command checks should enter through the Blorp frontend graph
+    and [typecheck_only_typed_with_blorp_bridge]. *)
 
 val typecheck_only_reusing_session :
   sess:Session.t ->
@@ -112,7 +121,11 @@ val typecheck_module_only_typed :
   source:string ->
   (Typecheck.check_state * Typed_ast.program, Ast.compiler_error list) result
 (** Parse and type-check a module, returning the final state and a validated
-    typed program. *)
+    typed program.
+
+    This is still a direct-source module analysis path for tooling/package
+    checks. It should be retired or given an explicit Blorp graph handoff once
+    those callers move to the contiguous Blorp frontend. *)
 
 val typecheck_source_package_module_only_typed :
   source_package:Session.source_package ->
@@ -129,7 +142,7 @@ val check_modules :
     their typed declarations and import bindings. This is the dependency
     typecheck stage used before checking a target module. *)
 
-val compile :
+val compile_legacy_direct_source :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->
   ?retain_debug_blocks:bool ->
@@ -185,7 +198,35 @@ val compile :
     [Core_invariants]. If any check fires, compilation fails with a
     [Core_error]-tagged diagnostic. Off by default (the checks have
     non-trivial cost on large programs); enable it when debugging
-    pipeline drift or before risky refactors. *)
+    pipeline drift or before risky refactors.
+
+    This direct-source API is a legacy/tooling route. Production source
+    commands should use [compile_preloaded_graph_with_blorp_bridge], which
+    consumes the single Blorp frontend graph and does not return to OCaml
+    parsing/typechecking. Keep new source-command work off this entrypoint. *)
+
+val compile :
+  ?debug:bool ->
+  ?allow_debug_only_calls:bool ->
+  ?retain_debug_blocks:bool ->
+  ?embed_runtime:bool ->
+  ?require_main:bool ->
+  ?profile:bool ->
+  ?on_frontend_phase:(frontend_phase -> unit) ->
+  ?on_stage:Core_pipeline.on_stage_callback ->
+  ?on_stage_event:Core_pipeline.on_stage_event ->
+  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
+  ?tail_observation_stages:Core_stage.t list ->
+  ?check_invariants:bool ->
+  filename:string ->
+  source:string ->
+  unit ->
+  (compile_outcome, Ast.compiler_error list) result
+(** Compatibility alias for [compile_legacy_direct_source]. Existing tests and
+    tooling still use this public name, but new compiler code should choose
+    either [compile_preloaded_graph_with_blorp_bridge] for source commands or
+    [compile_legacy_direct_source] when the legacy direct-source route is
+    intentional. *)
 
 val compile_parsed :
   ?debug:bool ->

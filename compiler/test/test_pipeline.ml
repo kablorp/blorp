@@ -450,6 +450,40 @@ let test_blorp_bridge_compile_reaches_core () =
                 ("expected Blorp bridge compile preview to reach Core:\n"
                ^ format_errors errors)))
 
+let test_blorp_bridge_compile_uses_preloaded_target_source () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_bridge_target_source" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let main_source =
+            "func main(args: List[String]) -> Int:\n\
+            \    0\n"
+          in
+          write_file main_path main_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let preloaded_module_graph =
+            preloaded_graph_for_single_source ~path:main_path
+              ~source:main_source ~parsed:main_parsed
+          in
+          write_file main_path "func main(args: List[String]) -> Int:\n    nope\n";
+          match
+            Pipeline.compile_preloaded_graph_with_blorp_bridge
+              ~embed_runtime:false ~filename:main_path ~preloaded_module_graph
+              ()
+          with
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "generated C comes from preloaded source" true
+                (contains c_code "blorp_main")
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail
+                "Blorp bridge compile preview unexpectedly stopped early"
+          | Error errors ->
+              Alcotest.fail
+                ("expected Blorp bridge compile to use preloaded target \
+                  source:\n" ^ format_errors errors)))
+
 let test_blorp_bridge_compile_types_std_support_modules () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_pipeline_compile_bridge_std_support" (fun dir ->
@@ -1627,6 +1661,9 @@ let suite =
           test_blorp_bridge_typecheck_runs_ctfe;
         Alcotest.test_case "Blorp bridge compile reaches Core" `Quick
           test_blorp_bridge_compile_reaches_core;
+        Alcotest.test_case
+          "Blorp bridge compile uses preloaded target source" `Quick
+          test_blorp_bridge_compile_uses_preloaded_target_source;
         Alcotest.test_case
           "surface backed exports support selective imports" `Quick
           test_surface_backed_exports_support_selective_imports;

@@ -1449,9 +1449,23 @@ Current status:
 - The OCaml typed-program decoder now also materializes typed string
   interpolation parts, lambdas, `select`, `while`, ordinary `for` loops
   including tuple binders, `for ... concurrently(...)`, `detach`, and `with`
-  expressions. `concurrent:` block decoding still needs a bridge shape that
-  carries explicit concurrent binding result metadata instead of only a typed
-  body block; do not decode it by guessing from body statements.
+  expressions. `concurrent:` block typed handoff now carries explicit
+  concurrent binding records with result metadata; OCaml decodes the
+  `bindings` field directly instead of reconstructing bindings from a body
+  block shape.
+- Resolved-call metadata now carries an explicit target object in the Blorp
+  typed handoff: direct callable, trait method, or closure call. This removes
+  the previous flat optional-field coupling for trait calls and makes closure
+  calls first-class in the typed artifact instead of relying on the absence of
+  direct-call metadata.
+- Direct-call targets now require a concrete callable id in the Blorp typed
+  handoff. Compiler-synthesized calls that do not yet have a callable id are
+  represented as explicit intrinsic targets instead of overloading
+  `direct.callable_id = null`; the OCaml decoder preserves intrinsic metadata as
+  bridge-only facts and does not materialize fake legacy direct calls.
+- The temporary OCaml typed-program decoder now requires the structured
+  `resolved_call.target` object. It no longer accepts the older flat
+  `callable_id`/`trait_name`/`origin` bridge shape.
 - OCaml now also has an explicit `typecheck_source` bridge client path:
   request builders, typed-program artifact decoding through `Typed_ast_json`,
   path-only request helpers, and a dedicated prepared
@@ -1503,6 +1517,14 @@ Current status:
   Blorp typed-program artifact, runs CTFE, populates dependency typed-module
   caches, and then enters the shared OCaml Core/codegen handoff without
   returning to the OCaml typechecker.
+- Direct-source `Pipeline.compile`, `Pipeline.typecheck_only`,
+  `Pipeline.typecheck_only_typed`, and module-only typecheck APIs are now
+  documented in code as legacy/tooling routes. The raw-source compile route is
+  also exposed as `Pipeline.compile_legacy_direct_source`, and the REPL/test
+  runner use that explicit name where they intentionally still depend on OCaml
+  parsing and typechecking. A compiler-unit regression pins that the
+  graph-backed compile bridge consumes the preloaded target source rather than
+  rereading a changed file from disk.
 - The Blorp executable (`compiler_cli_main.brp`) now runs CLI planning and
   source graph construction directly, writes the existing CLI plan JSON
   artifact to a temporary file, and invokes the private OCaml host only to
@@ -1513,6 +1535,12 @@ Current status:
   decoding the Blorp typed artifact, and legacy direct pipeline APIs still need
   explicit frontend graphs or explicit legacy/tooling classification before
   their OCaml typechecker paths can be retired.
+- The OCaml test runner remains one of those classified legacy paths. It
+  discovers test files, rewrites `TestSuite` and doctest harnesses, and compiles
+  generated sources after CLI planning has already delegated to test mode. Do
+  not duplicate frontend graph construction inside the OCaml runner; move this
+  only with a Blorp-owned test runner or an explicit Blorp test source-graph
+  handoff.
 
 Typed frontier closure before CTFE:
 
@@ -1524,9 +1552,8 @@ Typed frontier closure before CTFE:
   `typecheck_source` bridge. If a direct pipeline API remains, document it as a
   temporary legacy/tooling route with a deletion condition rather than allowing
   it to silently re-enter OCaml typecheck.
-- Close the known `concurrent:` typed-decoder caveat by adding explicit
-  concurrent binding result metadata to the typed handoff. Do not infer that
-  metadata from body statements.
+- Keep `concurrent:` typed handoff explicit: binding result metadata belongs in
+  the `bindings` field and must not be inferred from body statements.
 - Keep trait-dispatch and closure-call metadata represented explicitly in the
   typed artifact before relying on the handoff for Core lowering.
 
@@ -1539,7 +1566,7 @@ Edge cases:
   strings, tuples, and float16/float32 values must remain materializable.
 - Typed AST output must preserve callable ids and import bindings for Core
   flattening and call resolution.
-- Trait-dispatch and closure-call metadata still need explicit bridge fields;
+- Trait-dispatch, closure-call, and intrinsic-call metadata must stay explicit;
   do not infer those targets from callee names or expression shapes.
 
 Tests:
