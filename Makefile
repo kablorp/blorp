@@ -5,7 +5,7 @@
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
-BLORP_CLI_SOURCE := compiler/blorp/compiler_cli_main.brp
+BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
@@ -75,7 +75,7 @@ build: compiler/lib/embedded_std.ml
 build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@new_hash=$$( { \
-		find compiler/blorp -path 'compiler/blorp/tests' -prune -o -name '*.brp' -type f -print; \
+		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		printf '%s\n' "$(OCAML_HOST)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \

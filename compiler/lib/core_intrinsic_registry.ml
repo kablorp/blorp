@@ -13,7 +13,7 @@
 
     Every intrinsic listed here MUST have:
     - A Blorp-owned renderer entry in
-      [compiler/blorp/codegen_intrinsic_renderer.brp]
+      [compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp]
     - Documentation of its semantics (what it does, not how)
 
     IR bodies in [core_intrinsics.ml] compose these primitives into
@@ -24,7 +24,7 @@
 
     1. Add the entry here with name, arg types, return type, and semantics.
     2. Add the Blorp renderer case in
-       [compiler/blorp/codegen_intrinsic_renderer.brp].
+       [compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp].
     3. Use it in [core_intrinsics.ml] IR bodies via [intr "name" args ty].
 
     C emission for these intrinsics is owned by the Blorp emitter through the

@@ -22,7 +22,7 @@ The original parser utility migration is complete:
 
 The compiler source parser is also production-active:
 
-- `compiler/blorp/compiler_source.brp`,
+- `compiler/blorp/src/stage_01_file_io/compiler_source.brp`,
   `compiler_parse_diagnostic.brp`, `compiler_token.brp`,
   `compiler_lexer.brp`, `compiler_parser.brp`, and
   `compiler_parsed_ast.brp` define the Blorp-owned source model, diagnostics,

@@ -1,0 +1,1076 @@
+-- Normalized expression representation for compile-time evaluation.
+--
+-- This IR is intentionally smaller than CompilerTypedExpr. Translation keeps
+-- the typed facts CTFE needs and rejects unsupported expression forms at a
+-- named boundary instead of letting evaluation guess from typed-AST shapes.
+import:
+	compiler_ctfe_context:
+		CompilerCtfeContext,
+		CompilerCtfeNullaryConstructorReference,
+		compiler_ctfe_context_empty,
+		compiler_ctfe_context_module_alias,
+		compiler_ctfe_context_module_has_global_binding,
+		compiler_ctfe_context_nullary_constructor_reference,
+	../stage_05_types/compiler_env: CompilerPurity(CompilerImpure, CompilerPure), compiler_purities_equal
+	../stage_06_typecheck/compiler_infer:
+		CompilerCallableOrigin(
+			CompilerCallableBuiltin,
+			CompilerCallableConstructor,
+			CompilerCallableForeign,
+			CompilerCallableImported,
+			CompilerCallableImplMethod,
+			CompilerCallableLocal,
+		),
+		CompilerResolvedCallInfo,
+		CompilerResolvedCallTarget(
+			CompilerResolvedClosureCall,
+			CompilerResolvedDirectCall,
+			CompilerResolvedIntrinsicCall,
+			CompilerResolvedTraitMethodCall,
+		),
+		CompilerTypedAssignScope(CompilerLocalAssignScope, CompilerModuleAssignScope),
+		CompilerTypedDictEntry,
+		CompilerTypedExpr(
+			CompilerTypedAscriptionExpr,
+			CompilerTypedAssignExpr,
+			CompilerTypedBinaryExpr,
+			CompilerTypedBlockExpr,
+			CompilerTypedBoolLiteralExpr,
+			CompilerTypedBreakExpr,
+			CompilerTypedBuiltinExpr,
+			CompilerTypedCallExpr,
+			CompilerTypedCharLiteralExpr,
+			CompilerTypedConcurrentBlockExpr,
+			CompilerTypedConcurrentForExpr,
+			CompilerTypedContinueExpr,
+			CompilerTypedDebugBlockExpr,
+			CompilerTypedDetachExpr,
+			CompilerTypedDictExpr,
+			CompilerTypedFieldAccessExpr,
+			CompilerTypedFloatLiteralExpr,
+			CompilerTypedForExpr,
+			CompilerTypedIfExpr,
+			CompilerTypedIntLiteralExpr,
+			CompilerTypedLambdaExpr,
+			CompilerTypedListExpr,
+			CompilerTypedLogicalExpr,
+			CompilerTypedMatchExpr,
+			CompilerTypedMissingExpr,
+			CompilerTypedNameExpr,
+			CompilerTypedOpaqueFromExpr,
+			CompilerTypedOpaqueIntoExpr,
+			CompilerTypedQuestionBindExpr,
+			CompilerTypedRangeExpr,
+			CompilerTypedRecordExpr,
+			CompilerTypedRecordUpdateExpr,
+			CompilerTypedSelectExpr,
+			CompilerTypedStringInterpolationExpr,
+			CompilerTypedStringInterpolationPartsExpr,
+			CompilerTypedStringLiteralExpr,
+			CompilerTypedSubscriptAssignExpr,
+			CompilerTypedSubscriptExpr,
+			CompilerTypedTupleDestructExpr,
+			CompilerTypedTupleExpr,
+			CompilerTypedUnaryExpr,
+			CompilerTypedUnsupportedExpr,
+			CompilerTypedVarDeclExpr,
+			CompilerTypedVectorExpr,
+			CompilerTypedVoidExpr,
+			CompilerTypedWhileExpr,
+			CompilerTypedWithExpr,
+		),
+		CompilerTypedMatchCase,
+		CompilerTypedPattern,
+		CompilerTypedRecordField,
+		CompilerTypedStringInterpolationPart(
+			CompilerTypedInterpolationExpr,
+			CompilerTypedInterpolationLiteral,
+		),
+		compiler_typed_expr_resolved_call,
+		compiler_typed_expr_value_type,
+	../stage_03_parse/compiler_parsed_ast:
+		ParsedBinaryOp,
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
+		ParsedIdentifier,
+		ParsedLogicalOp,
+		ParsedUnaryOp
+	../stage_01_file_io/compiler_source: CompilerSourceSpan
+	../stage_05_types/compiler_type: CompilerType(CompilerNamedType, CompilerRangeType, CompilerTupleType)
+
+
+union CompilerCtfeIrLiteral:
+	CompilerCtfeIrIntLiteral(String)
+	CompilerCtfeIrFloatLiteral(String)
+	CompilerCtfeIrStringLiteral(String)
+	CompilerCtfeIrBoolLiteral(Bool)
+	CompilerCtfeIrCharLiteral(Int)
+
+
+record CompilerCtfeIrDirectCall {
+	callable_id: Int,
+	source_name: String,
+	is_pure: Bool
+}
+
+
+union CompilerCtfeIrReferenceKind:
+	CompilerCtfeIrValueReference
+	CompilerCtfeIrLocalFunctionReference(CompilerCtfeIrDirectCall)
+	CompilerCtfeIrNullaryConstructorReference(CompilerCtfeNullaryConstructorReference)
+	CompilerCtfeIrUnsupportedFunctionReference(String)
+	CompilerCtfeIrImpureFunctionReference
+
+
+record CompilerCtfeIrIdentifier {
+	name: String,
+	reference_kind: CompilerCtfeIrReferenceKind
+}
+
+
+union CompilerCtfeIrCallKind:
+	CompilerCtfeIrUnresolvedCall
+	CompilerCtfeIrLocalCall(CompilerCtfeIrDirectCall)
+	CompilerCtfeIrImportedCall(CompilerCtfeIrDirectCall, String)
+	CompilerCtfeIrConstructorCall(CompilerCtfeIrDirectCall, String)
+	CompilerCtfeIrUnsupportedCall(String)
+	CompilerCtfeIrImpureCall
+
+
+record CompilerCtfeIrCall {
+	kind: CompilerCtfeIrCallKind,
+	callee: CompilerCtfeIrExpr,
+	args: List[CompilerCtfeIrExpr]
+}
+
+
+record CompilerCtfeIrField {
+	name: String,
+	value: CompilerCtfeIrExpr
+}
+
+
+record CompilerCtfeIrDictEntry {
+	key: CompilerCtfeIrExpr,
+	value: CompilerCtfeIrExpr
+}
+
+
+record CompilerCtfeIrBlock {
+	items: List[CompilerCtfeIrBlockItem],
+	result: CompilerCtfeIrExpr
+}
+
+
+union CompilerCtfeIrAssignTarget:
+	CompilerCtfeIrDiscardAssign
+	CompilerCtfeIrLocalAssign(String)
+	CompilerCtfeIrModuleAssign(String)
+
+
+union CompilerCtfeIrBlockItem:
+	CompilerCtfeIrDiscardItem(CompilerCtfeIrExpr)
+	CompilerCtfeIrBindValueItem(String, Option[CompilerType], CompilerCtfeIrExpr, Bool)
+	CompilerCtfeIrBindTupleItem(List[String], CompilerCtfeIrExpr)
+	CompilerCtfeIrBindQuestionItem(String, Option[CompilerType], CompilerCtfeIrExpr)
+	CompilerCtfeIrAssignItem(CompilerCtfeIrAssignTarget, CompilerCtfeIrExpr, CompilerSourceSpan)
+
+
+union CompilerCtfeIrStringPart:
+	CompilerCtfeIrStringText(String)
+	CompilerCtfeIrStringExpr(CompilerCtfeIrExpr)
+
+
+union CompilerCtfeIrFieldAccessKind:
+	CompilerCtfeIrRecordField(String)
+	CompilerCtfeIrTupleField(Int, String)
+	CompilerCtfeIrTupleInvalidField(String)
+	CompilerCtfeIrRangeStartField
+	CompilerCtfeIrRangeEndField
+	CompilerCtfeIrRangeInvalidField(String)
+
+
+record CompilerCtfeIrFieldAccess {
+	receiver: CompilerCtfeIrExpr,
+	kind: CompilerCtfeIrFieldAccessKind
+}
+
+
+record CompilerCtfeIrImportedGlobal {
+	module_path: String,
+	name: String
+}
+
+
+record CompilerCtfeIrMatchCase {
+	pattern: CompilerTypedPattern,
+	body: CompilerCtfeIrExpr
+}
+
+
+union CompilerCtfeIrExprDesc:
+	CompilerCtfeIrLiteralExpr(CompilerCtfeIrLiteral)
+	CompilerCtfeIrIdentExpr(CompilerCtfeIrIdentifier)
+	CompilerCtfeIrTransparentExpr(CompilerCtfeIrExpr)
+	CompilerCtfeIrUnaryExpr(ParsedUnaryOp, CompilerCtfeIrExpr)
+	CompilerCtfeIrBinaryExpr(ParsedBinaryOp, CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrLogicalExpr(ParsedLogicalOp, CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrIfExpr(CompilerCtfeIrExpr, CompilerCtfeIrExpr, Option[CompilerCtfeIrExpr])
+	CompilerCtfeIrCallExpr(CompilerCtfeIrCall)
+	CompilerCtfeIrTupleExpr(List[CompilerCtfeIrExpr])
+	CompilerCtfeIrListExpr(List[CompilerCtfeIrExpr])
+	CompilerCtfeIrVectorExpr(List[CompilerCtfeIrExpr])
+	CompilerCtfeIrRecordExpr(List[CompilerCtfeIrField])
+	CompilerCtfeIrRecordUpdateExpr(CompilerCtfeIrExpr, List[CompilerCtfeIrField])
+	CompilerCtfeIrDictExpr(List[CompilerCtfeIrDictEntry])
+	CompilerCtfeIrFieldAccessExpr(CompilerCtfeIrFieldAccess)
+	CompilerCtfeIrImportedGlobalExpr(CompilerCtfeIrImportedGlobal)
+	CompilerCtfeIrRangeExpr(CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrMatchExpr(CompilerCtfeIrExpr, List[CompilerCtfeIrMatchCase])
+	CompilerCtfeIrWhileExpr(CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrForExpr(String, CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrForTupleExpr(List[String], CompilerCtfeIrExpr, CompilerCtfeIrExpr)
+	CompilerCtfeIrBreakExpr
+	CompilerCtfeIrContinueExpr
+	CompilerCtfeIrBlockExpr(CompilerCtfeIrBlock)
+	CompilerCtfeIrStringInterpolationExpr(List[CompilerCtfeIrStringPart], Bool)
+	CompilerCtfeIrVoidExpr
+
+
+record CompilerCtfeIrExpr {
+	span: CompilerSourceSpan,
+	value_type: CompilerType,
+	desc: CompilerCtfeIrExprDesc
+}
+
+
+union CompilerCtfeIrTranslateError:
+	CompilerCtfeIrUnsupported(CompilerSourceSpan, String)
+
+
+pure func compiler_ctfe_ir_translate_error_message(error: CompilerCtfeIrTranslateError) -> String:
+	match error:
+		CompilerCtfeIrUnsupported(_, form):
+			"compile-time constant evaluation does not support " + form + " yet"
+
+
+private pure func compiler_ctfe_ir_expr_span(expr: CompilerTypedExpr) -> CompilerSourceSpan:
+	match expr:
+		CompilerTypedNameExpr(name, _):
+			name.span
+		CompilerTypedIntLiteralExpr(_, span, _):
+			span
+		CompilerTypedFloatLiteralExpr(_, span, _):
+			span
+		CompilerTypedStringLiteralExpr(_, span, _):
+			span
+		CompilerTypedStringInterpolationExpr(_, _, span, _):
+			span
+		CompilerTypedStringInterpolationPartsExpr(_, _, span, _):
+			span
+		CompilerTypedBoolLiteralExpr(_, span, _):
+			span
+		CompilerTypedCharLiteralExpr(_, span, _):
+			span
+		CompilerTypedUnaryExpr(_, _, span, _):
+			span
+		CompilerTypedBinaryExpr(_, _, _, span, _):
+			span
+		CompilerTypedLogicalExpr(_, _, _, span, _):
+			span
+		CompilerTypedCallExpr(_, _, span, _):
+			span
+		CompilerTypedTupleExpr(_, span, _):
+			span
+		CompilerTypedTupleDestructExpr(_, _, span, _):
+			span
+		CompilerTypedAssignExpr(_, _, _, span, _):
+			span
+		CompilerTypedSubscriptExpr(_, _, span, _):
+			span
+		CompilerTypedSubscriptAssignExpr(_, _, _, _, span, _):
+			span
+		CompilerTypedListExpr(_, span, _):
+			span
+		CompilerTypedVectorExpr(_, span, _):
+			span
+		CompilerTypedDictExpr(_, span, _):
+			span
+		CompilerTypedOpaqueIntoExpr(_, _, span, _):
+			span
+		CompilerTypedOpaqueFromExpr(_, _, span, _):
+			span
+		CompilerTypedRecordExpr(_, span, _):
+			span
+		CompilerTypedRecordUpdateExpr(_, _, span, _):
+			span
+		CompilerTypedFieldAccessExpr(_, _, span, _):
+			span
+		CompilerTypedLambdaExpr(_, _, _, _, span, _):
+			span
+		CompilerTypedRangeExpr(_, _, span, _):
+			span
+		CompilerTypedIfExpr(_, _, _, span, _):
+			span
+		CompilerTypedMatchExpr(_, _, span, _):
+			span
+		CompilerTypedSelectExpr(_, span, _):
+			span
+		CompilerTypedWhileExpr(_, _, span, _):
+			span
+		CompilerTypedForExpr(_, _, _, span, _):
+			span
+		CompilerTypedConcurrentBlockExpr(_, _, span, _):
+			span
+		CompilerTypedConcurrentForExpr(_, _, _, _, span, _):
+			span
+		CompilerTypedDetachExpr(_, span, _):
+			span
+		CompilerTypedAscriptionExpr(_, _, span, _):
+			span
+		CompilerTypedBlockExpr(_, span, _):
+			span
+		CompilerTypedWithExpr(_, _, span, _):
+			span
+		CompilerTypedDebugBlockExpr(_, span, _):
+			span
+		CompilerTypedVarDeclExpr(payload, _):
+			payload.span
+		CompilerTypedQuestionBindExpr(_, _, _, span, _):
+			span
+		CompilerTypedBreakExpr(span, _):
+			span
+		CompilerTypedContinueExpr(span, _):
+			span
+		CompilerTypedVoidExpr(span, _):
+			span
+		CompilerTypedBuiltinExpr(_, span, _):
+			span
+		CompilerTypedMissingExpr(span, _):
+			span
+		CompilerTypedUnsupportedExpr(_, span, _):
+			span
+
+
+private pure func compiler_ctfe_ir_expr(
+	source: CompilerTypedExpr,
+	desc: CompilerCtfeIrExprDesc,
+) -> CompilerCtfeIrExpr:
+	{
+		span = compiler_ctfe_ir_expr_span(source),
+		value_type = compiler_typed_expr_value_type(source),
+		desc = desc
+	}
+
+
+private pure func compiler_ctfe_ir_unsupported(
+	expr: CompilerTypedExpr,
+	form: String,
+) -> Result[CompilerCtfeIrExpr, CompilerCtfeIrTranslateError]:
+	Err(CompilerCtfeIrUnsupported(compiler_ctfe_ir_expr_span(expr), form))
+
+
+private pure func compiler_ctfe_ir_clean_source_name(name: String) -> String:
+	match name.index_of("#"):
+		Some(index):
+			name.substring(0, index)
+		None:
+			name
+
+
+private pure func compiler_ctfe_ir_is_pure(purity: CompilerPurity) -> Bool:
+	compiler_purities_equal(purity, CompilerPure)
+
+
+private pure func compiler_ctfe_ir_direct_call(
+	callable_id: Int,
+	source_name: String,
+	purity: CompilerPurity,
+) -> CompilerCtfeIrDirectCall:
+	{
+		callable_id = callable_id,
+		source_name = compiler_ctfe_ir_clean_source_name(source_name),
+		is_pure = compiler_ctfe_ir_is_pure(purity)
+	}
+
+
+private pure func compiler_ctfe_ir_is_local_origin(origin: CompilerCallableOrigin) -> Bool:
+	match origin:
+		CompilerCallableLocal:
+			True
+		_:
+			False
+
+
+private pure func compiler_ctfe_ir_reference_kind(
+	context: CompilerCtfeContext,
+	name: String,
+	resolved_call: Option[CompilerResolvedCallInfo],
+) -> CompilerCtfeIrReferenceKind:
+	match resolved_call:
+		Some(call):
+			match call.target:
+				CompilerResolvedDirectCall(callable_id, origin):
+					if (
+						compiler_ctfe_ir_is_local_origin(origin)
+						and compiler_ctfe_ir_is_pure(call.purity)
+					):
+						CompilerCtfeIrLocalFunctionReference(
+							compiler_ctfe_ir_direct_call(
+								callable_id,
+								call.source_name,
+								call.purity,
+							),
+						)
+					else if compiler_ctfe_ir_is_pure(call.purity):
+						CompilerCtfeIrUnsupportedFunctionReference(
+							compiler_ctfe_ir_clean_source_name(call.source_name),
+						)
+					else:
+						CompilerCtfeIrImpureFunctionReference
+				_:
+					CompilerCtfeIrUnsupportedFunctionReference(
+						compiler_ctfe_ir_clean_source_name(call.source_name),
+					)
+		None:
+			match compiler_ctfe_context_nullary_constructor_reference(context, name):
+				Some(constructor):
+					CompilerCtfeIrNullaryConstructorReference(constructor)
+				None:
+					CompilerCtfeIrValueReference
+
+
+private pure func compiler_ctfe_ir_call_kind(
+	resolved_call: Option[CompilerResolvedCallInfo],
+) -> CompilerCtfeIrCallKind:
+	match resolved_call:
+		Some(call):
+			match call.target:
+				CompilerResolvedDirectCall(callable_id, origin):
+					if not compiler_ctfe_ir_is_pure(call.purity):
+						CompilerCtfeIrImpureCall
+					else:
+						match origin:
+							CompilerCallableLocal:
+								CompilerCtfeIrLocalCall(
+									compiler_ctfe_ir_direct_call(
+										callable_id,
+										call.source_name,
+										call.purity,
+									),
+								)
+							CompilerCallableConstructor(parent_type):
+								CompilerCtfeIrConstructorCall(
+									compiler_ctfe_ir_direct_call(
+										callable_id,
+										call.source_name,
+										call.purity,
+									),
+									parent_type,
+								)
+							CompilerCallableImported(module_path):
+								CompilerCtfeIrImportedCall(
+									compiler_ctfe_ir_direct_call(
+										callable_id,
+										call.source_name,
+										call.purity,
+									),
+									module_path,
+								)
+							CompilerCallableBuiltin:
+								CompilerCtfeIrUnsupportedCall(
+									compiler_ctfe_ir_clean_source_name(call.source_name),
+								)
+							CompilerCallableForeign:
+								CompilerCtfeIrUnsupportedCall("foreign function calls")
+							CompilerCallableImplMethod:
+								CompilerCtfeIrUnsupportedCall("impl method calls")
+				CompilerResolvedTraitMethodCall(_, _):
+					CompilerCtfeIrUnsupportedCall("trait method calls")
+				CompilerResolvedIntrinsicCall:
+					CompilerCtfeIrUnsupportedCall("intrinsic function calls")
+				CompilerResolvedClosureCall:
+					CompilerCtfeIrUnsupportedCall("closure calls")
+		None:
+			CompilerCtfeIrUnresolvedCall
+
+
+private pure func compiler_ctfe_ir_exprs_from_typed(
+	context: CompilerCtfeContext,
+	items: List[CompilerTypedExpr],
+) -> Result[List[CompilerCtfeIrExpr], CompilerCtfeIrTranslateError]:
+	var result: List[CompilerCtfeIrExpr] = []
+	var failure: Option[CompilerCtfeIrTranslateError] = None
+
+	for item in items:
+		match compiler_ctfe_ir_from_typed_expr(context, item):
+			Ok(converted):
+				result = result.append(converted)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_ir_optional_expr_from_typed(
+	context: CompilerCtfeContext,
+	expr: Option[CompilerTypedExpr],
+) -> Result[Option[CompilerCtfeIrExpr], CompilerCtfeIrTranslateError]:
+	match expr:
+		Some(value):
+			converted ?= compiler_ctfe_ir_from_typed_expr(context, value)
+			Ok(Some(converted))
+		None:
+			Ok(None)
+
+
+private pure func compiler_ctfe_ir_tuple_field_kind(
+	field: String,
+	arity: Int,
+) -> CompilerCtfeIrFieldAccessKind:
+	match field.parse_int():
+		Some(index):
+			if index >= 0 and index < arity:
+				CompilerCtfeIrTupleField(index, field)
+			else:
+				CompilerCtfeIrTupleInvalidField(field)
+		None:
+			CompilerCtfeIrTupleInvalidField(field)
+
+
+private pure func compiler_ctfe_ir_range_field_kind(field: String) -> CompilerCtfeIrFieldAccessKind:
+	if field == "start":
+		CompilerCtfeIrRangeStartField
+	else if field == "end":
+		CompilerCtfeIrRangeEndField
+	else:
+		CompilerCtfeIrRangeInvalidField(field)
+
+
+private pure func compiler_ctfe_ir_field_access_kind(
+	receiver_type: CompilerType,
+	field: String,
+) -> CompilerCtfeIrFieldAccessKind:
+	match receiver_type:
+		CompilerTupleType(elements):
+			compiler_ctfe_ir_tuple_field_kind(field, elements.length())
+		CompilerNamedType("Tuple", elements):
+			compiler_ctfe_ir_tuple_field_kind(field, elements.length())
+		CompilerRangeType(_):
+			compiler_ctfe_ir_range_field_kind(field)
+		_:
+			CompilerCtfeIrRecordField(field)
+
+
+private pure func compiler_ctfe_ir_imported_global_expr(
+	module_path: String,
+	name: String,
+) -> CompilerCtfeIrExprDesc:
+	CompilerCtfeIrImportedGlobalExpr({
+		module_path = module_path,
+		name = name,
+	})
+
+
+private pure func compiler_ctfe_ir_qualified_field_expr(
+	context: CompilerCtfeContext,
+	receiver: CompilerTypedExpr,
+	field: ParsedIdentifier,
+) -> Option[CompilerCtfeIrExprDesc]:
+	match receiver:
+		CompilerTypedNameExpr(receiver_name, _):
+			match compiler_ctfe_context_module_alias(context, receiver_name.text):
+				Some(module_path):
+					if compiler_ctfe_context_module_has_global_binding(
+						context,
+						module_path,
+						field.text,
+					):
+						Some(compiler_ctfe_ir_imported_global_expr(module_path, field.text))
+					else:
+						match compiler_ctfe_context_nullary_constructor_reference(
+							context,
+							field.text,
+						):
+							Some(constructor):
+								Some(CompilerCtfeIrIdentExpr({
+									name = field.text,
+									reference_kind = CompilerCtfeIrNullaryConstructorReference(
+										constructor,
+									),
+								}))
+							None:
+								Some(compiler_ctfe_ir_imported_global_expr(module_path, field.text))
+				None:
+					None
+		_:
+			None
+
+
+private pure func compiler_ctfe_ir_assign_target(
+	name: String,
+	scope: CompilerTypedAssignScope,
+) -> CompilerCtfeIrAssignTarget:
+	if name == "_":
+		CompilerCtfeIrDiscardAssign
+	else:
+		match scope:
+			CompilerLocalAssignScope:
+				CompilerCtfeIrLocalAssign(name)
+			CompilerModuleAssignScope:
+				CompilerCtfeIrModuleAssign(name)
+
+
+private pure func compiler_ctfe_ir_block_item_from_typed(
+	context: CompilerCtfeContext,
+	expr: CompilerTypedExpr,
+) -> Result[CompilerCtfeIrBlockItem, CompilerCtfeIrTranslateError]:
+	match expr:
+		CompilerTypedVarDeclExpr(payload, _):
+			init ?= compiler_ctfe_ir_from_typed_expr(context, payload.initializer)
+			Ok(
+				CompilerCtfeIrBindValueItem(
+					payload.name.text,
+					payload.annotation,
+					init,
+					payload.is_mutable,
+				),
+			)
+		CompilerTypedAssignExpr(name, scope, value, span, _):
+			value_ir ?= compiler_ctfe_ir_from_typed_expr(context, value)
+			Ok(
+				CompilerCtfeIrAssignItem(
+					compiler_ctfe_ir_assign_target(name.text, scope),
+					value_ir,
+					span,
+				),
+			)
+		CompilerTypedTupleDestructExpr(names, init, _, _):
+			init_ir ?= compiler_ctfe_ir_from_typed_expr(context, init)
+			Ok(CompilerCtfeIrBindTupleItem(names.map(
+						func(name: ParsedIdentifier): name.text,
+					), init_ir))
+		CompilerTypedQuestionBindExpr(name, annotation, value, _, _):
+			value_ir ?= compiler_ctfe_ir_from_typed_expr(context, value)
+			Ok(CompilerCtfeIrBindQuestionItem(name.text, annotation, value_ir))
+		_:
+			discard ?= compiler_ctfe_ir_from_typed_expr(context, expr)
+			Ok(CompilerCtfeIrDiscardItem(discard))
+
+
+private pure func compiler_ctfe_ir_block_item_has_void_result(expr: CompilerTypedExpr) -> Bool:
+	match expr:
+		CompilerTypedAssignExpr(_, _, _, _, _):
+			True
+		CompilerTypedTupleDestructExpr(_, _, _, _):
+			True
+		CompilerTypedQuestionBindExpr(_, _, _, _, _):
+			True
+		CompilerTypedVarDeclExpr(_, _):
+			True
+		_:
+			False
+
+
+private pure func compiler_ctfe_ir_block_from_typed(
+	context: CompilerCtfeContext,
+	source: CompilerTypedExpr,
+	items: List[CompilerTypedExpr],
+) -> Result[CompilerCtfeIrBlock, CompilerCtfeIrTranslateError]:
+	if items.length() == 0:
+		Err(CompilerCtfeIrUnsupported(compiler_ctfe_ir_expr_span(source), "empty blocks"))
+	else:
+		var block_items: List[CompilerCtfeIrBlockItem] = []
+		var result: Option[CompilerCtfeIrExpr] = None
+		var failure: Option[CompilerCtfeIrTranslateError] = None
+		var index: Int = 0
+		last_index: Int = items.length() - 1
+
+		for item in items:
+			if index == last_index:
+				if compiler_ctfe_ir_block_item_has_void_result(item):
+					match compiler_ctfe_ir_block_item_from_typed(context, item):
+						Ok(block_item):
+							block_items = block_items.append(block_item)
+							result = Some(compiler_ctfe_ir_expr(item, CompilerCtfeIrVoidExpr))
+						Err(error):
+							failure = Some(error)
+							break
+				else:
+					match compiler_ctfe_ir_from_typed_expr(context, item):
+						Ok(converted):
+							result = Some(converted)
+						Err(error):
+							failure = Some(error)
+							break
+			else:
+				match compiler_ctfe_ir_block_item_from_typed(context, item):
+					Ok(block_item):
+						block_items = block_items.append(block_item)
+					Err(error):
+						failure = Some(error)
+						break
+
+			index += 1
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				match result:
+					Some(result_expr):
+						Ok({
+							items = block_items,
+							result = result_expr,
+						})
+					None:
+						Err(
+							CompilerCtfeIrUnsupported(
+								compiler_ctfe_ir_expr_span(source),
+								"empty blocks",
+							),
+						)
+
+
+private pure func compiler_ctfe_ir_record_fields_from_typed(
+	context: CompilerCtfeContext,
+	fields: List[CompilerTypedRecordField],
+) -> Result[List[CompilerCtfeIrField], CompilerCtfeIrTranslateError]:
+	var result: List[CompilerCtfeIrField] = []
+	var failure: Option[CompilerCtfeIrTranslateError] = None
+
+	for field in fields:
+		match compiler_ctfe_ir_from_typed_expr(context, field.value):
+			Ok(value):
+				result = result.append({
+					name = field.name.text,
+					value = value,
+				})
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_ir_dict_entries_from_typed(
+	context: CompilerCtfeContext,
+	entries: List[CompilerTypedDictEntry],
+) -> Result[List[CompilerCtfeIrDictEntry], CompilerCtfeIrTranslateError]:
+	var result: List[CompilerCtfeIrDictEntry] = []
+	var failure: Option[CompilerCtfeIrTranslateError] = None
+
+	for entry in entries:
+		match compiler_ctfe_ir_from_typed_expr(context, entry.key):
+			Ok(key):
+				match compiler_ctfe_ir_from_typed_expr(context, entry.value):
+					Ok(value):
+						result = result.append({
+							key = key,
+							value = value,
+						})
+					Err(error):
+						failure = Some(error)
+						break
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_ir_string_part_from_typed(
+	context: CompilerCtfeContext,
+	part: CompilerTypedStringInterpolationPart,
+) -> Result[CompilerCtfeIrStringPart, CompilerCtfeIrTranslateError]:
+	match part:
+		CompilerTypedInterpolationLiteral(text):
+			Ok(CompilerCtfeIrStringText(text))
+		CompilerTypedInterpolationExpr(expr):
+			value ?= compiler_ctfe_ir_from_typed_expr(context, expr)
+			Ok(CompilerCtfeIrStringExpr(value))
+
+
+private pure func compiler_ctfe_ir_string_parts_from_typed(
+	context: CompilerCtfeContext,
+	parts: List[CompilerTypedStringInterpolationPart],
+) -> Result[List[CompilerCtfeIrStringPart], CompilerCtfeIrTranslateError]:
+	var result: List[CompilerCtfeIrStringPart] = []
+	var failure: Option[CompilerCtfeIrTranslateError] = None
+
+	for part in parts:
+		match compiler_ctfe_ir_string_part_from_typed(context, part):
+			Ok(converted):
+				result = result.append(converted)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_ir_match_case_from_typed(
+	context: CompilerCtfeContext,
+	case: CompilerTypedMatchCase,
+) -> Result[CompilerCtfeIrMatchCase, CompilerCtfeIrTranslateError]:
+	body ?= compiler_ctfe_ir_from_typed_expr(context, case.body)
+	Ok({
+		pattern = case.pattern,
+		body = body,
+	})
+
+
+private pure func compiler_ctfe_ir_match_cases_from_typed(
+	context: CompilerCtfeContext,
+	cases: List[CompilerTypedMatchCase],
+) -> Result[List[CompilerCtfeIrMatchCase], CompilerCtfeIrTranslateError]:
+	var result: List[CompilerCtfeIrMatchCase] = []
+	var failure: Option[CompilerCtfeIrTranslateError] = None
+
+	for case in cases:
+		match compiler_ctfe_ir_match_case_from_typed(context, case):
+			Ok(converted):
+				result = result.append(converted)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+pure func compiler_ctfe_ir_from_typed_expr(
+	context: CompilerCtfeContext,
+	expr: CompilerTypedExpr,
+) -> Result[CompilerCtfeIrExpr, CompilerCtfeIrTranslateError]:
+	match expr:
+		CompilerTypedNameExpr(name, _):
+			Ok(compiler_ctfe_ir_expr(
+				expr,
+				CompilerCtfeIrIdentExpr({
+					name = name.text,
+					reference_kind = compiler_ctfe_ir_reference_kind(
+						context,
+						name.text,
+						compiler_typed_expr_resolved_call(expr),
+					),
+				}),
+			))
+		CompilerTypedIntLiteralExpr(text, _, _):
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrLiteralExpr(CompilerCtfeIrIntLiteral(text)),
+				),
+			)
+		CompilerTypedFloatLiteralExpr(text, _, _):
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrLiteralExpr(CompilerCtfeIrFloatLiteral(text)),
+				),
+			)
+		CompilerTypedStringLiteralExpr(text, _, _):
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrLiteralExpr(CompilerCtfeIrStringLiteral(text)),
+				),
+			)
+		CompilerTypedBoolLiteralExpr(value, _, _):
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrLiteralExpr(CompilerCtfeIrBoolLiteral(value)),
+				),
+			)
+		CompilerTypedCharLiteralExpr(value, _, _):
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrLiteralExpr(CompilerCtfeIrCharLiteral(value)),
+				),
+			)
+		CompilerTypedUnaryExpr(op, inner, _, _):
+			inner_ir ?= compiler_ctfe_ir_from_typed_expr(context, inner)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrUnaryExpr(op, inner_ir)))
+		CompilerTypedBinaryExpr(op, left, right, _, _):
+			left_ir ?= compiler_ctfe_ir_from_typed_expr(context, left)
+			right_ir ?= compiler_ctfe_ir_from_typed_expr(context, right)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrBinaryExpr(op, left_ir, right_ir)))
+		CompilerTypedLogicalExpr(op, left, right, _, _):
+			left_ir ?= compiler_ctfe_ir_from_typed_expr(context, left)
+			right_ir ?= compiler_ctfe_ir_from_typed_expr(context, right)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrLogicalExpr(op, left_ir, right_ir)))
+		CompilerTypedIfExpr(condition, then_expr, else_expr, _, _):
+			condition_ir ?= compiler_ctfe_ir_from_typed_expr(context, condition)
+			then_ir ?= compiler_ctfe_ir_from_typed_expr(context, then_expr)
+			else_ir ?= compiler_ctfe_ir_optional_expr_from_typed(context, else_expr)
+
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrIfExpr(condition_ir, then_ir, else_ir)))
+		CompilerTypedTupleExpr(items, _, _):
+			items_ir ?= compiler_ctfe_ir_exprs_from_typed(context, items)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrTupleExpr(items_ir)))
+		CompilerTypedListExpr(items, _, _):
+			items_ir ?= compiler_ctfe_ir_exprs_from_typed(context, items)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrListExpr(items_ir)))
+		CompilerTypedVectorExpr(items, _, _):
+			items_ir ?= compiler_ctfe_ir_exprs_from_typed(context, items)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrVectorExpr(items_ir)))
+		CompilerTypedRecordExpr(fields, _, _):
+			fields_ir ?= compiler_ctfe_ir_record_fields_from_typed(context, fields)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrRecordExpr(fields_ir)))
+		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+			base_ir ?= compiler_ctfe_ir_from_typed_expr(context, base)
+			fields_ir ?= compiler_ctfe_ir_record_fields_from_typed(context, fields)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrRecordUpdateExpr(base_ir, fields_ir)))
+		CompilerTypedDictExpr(entries, _, _):
+			entries_ir ?= compiler_ctfe_ir_dict_entries_from_typed(context, entries)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrDictExpr(entries_ir)))
+		CompilerTypedFieldAccessExpr(receiver, field, _, _):
+			match compiler_ctfe_ir_qualified_field_expr(context, receiver, field):
+				Some(desc):
+					Ok(compiler_ctfe_ir_expr(expr, desc))
+				None:
+					receiver_ir ?= compiler_ctfe_ir_from_typed_expr(context, receiver)
+					Ok(compiler_ctfe_ir_expr(
+						expr,
+						CompilerCtfeIrFieldAccessExpr({
+							receiver = receiver_ir,
+							kind = compiler_ctfe_ir_field_access_kind(
+								receiver_ir.value_type,
+								field.text,
+							),
+						}),
+					))
+		CompilerTypedRangeExpr(start_expr, end_expr, _, _):
+			start_ir ?= compiler_ctfe_ir_from_typed_expr(context, start_expr)
+			end_ir ?= compiler_ctfe_ir_from_typed_expr(context, end_expr)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrRangeExpr(start_ir, end_ir)))
+		CompilerTypedBlockExpr(items, _, _):
+			block ?= compiler_ctfe_ir_block_from_typed(context, expr, items)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrBlockExpr(block)))
+		CompilerTypedAscriptionExpr(inner, _, _, _):
+			inner_ir ?= compiler_ctfe_ir_from_typed_expr(context, inner)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrTransparentExpr(inner_ir)))
+		CompilerTypedOpaqueIntoExpr(_, inner, _, _):
+			inner_ir ?= compiler_ctfe_ir_from_typed_expr(context, inner)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrTransparentExpr(inner_ir)))
+		CompilerTypedOpaqueFromExpr(_, inner, _, _):
+			inner_ir ?= compiler_ctfe_ir_from_typed_expr(context, inner)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrTransparentExpr(inner_ir)))
+		CompilerTypedVoidExpr(_, _):
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrVoidExpr))
+		CompilerTypedStringInterpolationExpr(_, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "string interpolation")
+		CompilerTypedStringInterpolationPartsExpr(parts, is_multiline, _, _):
+			parts_ir ?= compiler_ctfe_ir_string_parts_from_typed(context, parts)
+			Ok(
+				compiler_ctfe_ir_expr(
+					expr,
+					CompilerCtfeIrStringInterpolationExpr(parts_ir, is_multiline),
+				),
+			)
+		CompilerTypedMatchExpr(scrutinee, cases, _, _):
+			scrutinee_ir ?= compiler_ctfe_ir_from_typed_expr(context, scrutinee)
+			cases_ir ?= compiler_ctfe_ir_match_cases_from_typed(context, cases)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrMatchExpr(scrutinee_ir, cases_ir)))
+		CompilerTypedCallExpr(callee, args, _, _):
+			callee_ir ?= compiler_ctfe_ir_from_typed_expr(context, callee)
+			args_ir ?= compiler_ctfe_ir_exprs_from_typed(context, args)
+			Ok(compiler_ctfe_ir_expr(
+				expr,
+				CompilerCtfeIrCallExpr({
+					kind = compiler_ctfe_ir_call_kind(compiler_typed_expr_resolved_call(expr)),
+					callee = callee_ir,
+					args = args_ir,
+				}),
+			))
+		CompilerTypedTupleDestructExpr(_, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "tuple destructuring as a value")
+		CompilerTypedAssignExpr(_, _, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "assignments")
+		CompilerTypedSubscriptExpr(_, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "subscript expressions")
+		CompilerTypedSubscriptAssignExpr(_, _, _, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "subscript assignments")
+		CompilerTypedLambdaExpr(_, _, _, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "lambdas")
+		CompilerTypedSelectExpr(_, _, _):
+			compiler_ctfe_ir_unsupported(expr, "select expressions")
+		CompilerTypedWhileExpr(condition, body, _, _):
+			condition_ir ?= compiler_ctfe_ir_from_typed_expr(context, condition)
+			body_ir ?= compiler_ctfe_ir_from_typed_expr(context, body)
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrWhileExpr(condition_ir, body_ir)))
+		CompilerTypedForExpr(binder, iterable, body, _, _):
+			iterable_ir ?= compiler_ctfe_ir_from_typed_expr(context, iterable)
+			body_ir ?= compiler_ctfe_ir_from_typed_expr(context, body)
+
+			match binder:
+				ParsedForNameBinder(name):
+					Ok(
+						compiler_ctfe_ir_expr(
+							expr,
+							CompilerCtfeIrForExpr(name.text, iterable_ir, body_ir),
+						),
+					)
+				ParsedForTupleBinder(names, _):
+					Ok(
+						compiler_ctfe_ir_expr(
+							expr,
+							CompilerCtfeIrForTupleExpr(
+								names.map(func(name: ParsedIdentifier): name.text),
+								iterable_ir,
+								body_ir,
+							),
+						),
+					)
+		CompilerTypedConcurrentBlockExpr(_, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "concurrent blocks")
+		CompilerTypedConcurrentForExpr(_, _, _, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "concurrently loops")
+		CompilerTypedDetachExpr(_, _, _):
+			compiler_ctfe_ir_unsupported(expr, "detach expressions")
+		CompilerTypedWithExpr(_, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "resource with expressions")
+		CompilerTypedDebugBlockExpr(_, _, _):
+			compiler_ctfe_ir_unsupported(expr, "debug blocks")
+		CompilerTypedVarDeclExpr(_, _):
+			compiler_ctfe_ir_unsupported(expr, "block binding as a value")
+		CompilerTypedQuestionBindExpr(_, _, _, _, _):
+			compiler_ctfe_ir_unsupported(expr, "?= bindings")
+		CompilerTypedBreakExpr(_, _):
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrBreakExpr))
+		CompilerTypedContinueExpr(_, _):
+			Ok(compiler_ctfe_ir_expr(expr, CompilerCtfeIrContinueExpr))
+		CompilerTypedBuiltinExpr(_, _, _):
+			compiler_ctfe_ir_unsupported(expr, "builtin expressions")
+		CompilerTypedMissingExpr(_, _):
+			compiler_ctfe_ir_unsupported(expr, "missing expressions")
+		CompilerTypedUnsupportedExpr(message, _, _):
+			compiler_ctfe_ir_unsupported(expr, message)
+
+
+pure func compiler_ctfe_ir_from_typed_expr_without_context(
+	expr: CompilerTypedExpr,
+) -> Result[CompilerCtfeIrExpr, CompilerCtfeIrTranslateError]:
+	compiler_ctfe_ir_from_typed_expr(compiler_ctfe_context_empty(), expr)

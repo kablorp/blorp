@@ -32,34 +32,34 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
 
 Current source-frontier Blorp files:
 
-- `compiler/blorp/compiler_cli_main.brp`
-- `compiler/blorp/compiler_cli.brp`
-- `compiler/blorp/compiler_cli_args.brp`
-- `compiler/blorp/compiler_cli_plan.brp`
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_cli_artifact_json.brp`
-- `compiler/blorp/compiler_source.brp`
-- `compiler/blorp/compiler_lexer.brp`
-- `compiler/blorp/compiler_parser.brp`
-- `compiler/blorp/compiler_parsed_ast.brp`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
-- `compiler/blorp/compiler_source_ast_finalize.brp`
-- `compiler/blorp/compiler_module_surface.brp`
-- `compiler/blorp/compiler_module_surface_json.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
+- `compiler/blorp/src/stage_01_file_io/compiler_source.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_lexer.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface_json.brp`
 
 Current backend-tail Blorp files:
 
-- `compiler/blorp/compiler_core_json.brp`
-- `compiler/blorp/compiler_core_pipeline.brp`
-- `compiler/blorp/compiler_core_consume_specialize.brp`
-- `compiler/blorp/compiler_core_ownership.brp`
-- `compiler/blorp/compiler_core_perceus.brp`
-- `compiler/blorp/compiler_core_reuse.brp`
-- `compiler/blorp/compiler_core_closure.brp`
-- `compiler/blorp/compiler_core_resource.brp`
-- `compiler/blorp/compiler_core_fairness.brp`
-- `compiler/blorp/compiler_core_prepare.brp`
-- `compiler/blorp/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 
 Current OCaml bridge and orchestration files:
 
@@ -75,7 +75,7 @@ Current OCaml bridge and orchestration files:
 - `compiler/lib/core_emit_blorp_c.ml`
 
 The public executable is Blorp-owned through
-`compiler/blorp/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
 private execution shell for decoded Blorp plans, temporary typed-program
 handoffs, artifact writing, host C invocation, and still-OCaml compiler stages.
 
@@ -123,10 +123,10 @@ OCaml references still needed at this checkpoint:
 
 Blorp references:
 
-- `compiler/blorp/compiler_bridge.brp`
-- `compiler/blorp/compiler_bridge_protocol.brp`
-- `compiler/blorp/compiler_bridge_cli.brp`
-- `compiler/blorp/ocaml_port_inventory.tsv`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge_protocol.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp`
+- `compiler/blorp/src/stage_99_meta/ocaml_port_inventory.tsv`
 
 Implementation steps:
 
@@ -214,11 +214,11 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_cli.brp`
-- `compiler/blorp/compiler_cli_args.brp`
-- `compiler/blorp/compiler_cli_plan.brp`
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_cli_artifact_json.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
 
 Implementation steps:
 
@@ -314,17 +314,17 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_token.brp`
-- `compiler/blorp/compiler_lexer.brp`
-- `compiler/blorp/compiler_parser.brp`
-- `compiler/blorp/compiler_parsed_ast.brp`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
-- `compiler/blorp/compiler_parse_diagnostic.brp`
-- `compiler/blorp/compiler_source_ast_finalize.brp`
-- `compiler/blorp/compiler_module_surface.brp`
-- `compiler/blorp/compiler_module_surface_json.brp`
-- `compiler/blorp/compiler_format.brp`
-- `compiler/blorp/compiler_format_projection.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_token.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_lexer.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_parse_diagnostic.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface_json.brp`
+- `compiler/blorp/src/stage_11_format/compiler_format.brp`
+- `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
 
 Implementation steps:
 
@@ -448,8 +448,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
 - future `compiler_module_graph.brp`
 - future `compiler_module_resolution.brp`
 
@@ -523,16 +523,16 @@ expression inference.
 Status: complete for the pure frontend substrate. Production typecheck and
 inference still switch over in later checkpoints, but the checkpoint-4 data
 models and helper APIs now exist in Blorp with focused tests.
-`compiler/blorp/language_surface_manifest.brp` remains the source of truth for
+`compiler/blorp/src/stage_05_types/language_surface_manifest.brp` remains the source of truth for
 source-language keyword and prelude UFCS tables, while Dune generates
 `Language_surface_data` for OCaml consumers at build time. This removes the
 runtime bridge call from `compiler/lib/language_surface.ml` and keeps the
 renderer-helper bootstrap rows on the same generated data.
-`compiler/blorp/compiler_diagnostic.brp`
+`compiler/blorp/src/stage_01_file_io/compiler_diagnostic.brp`
 defines pure Rust-style diagnostic data and rendering over explicit source text,
 with parity tests for tab padding, synthetic locations, notes/help, and
 secondary labels. The semantic type slice is in place:
-`compiler/blorp/compiler_type.brp` defines the Blorp `CompilerType` model plus
+`compiler/blorp/src/stage_05_types/compiler_type.brp` defines the Blorp `CompilerType` model plus
 pure display, structural equality, tensor-name normalization, array/tensor
 decomposition, numeric predicates, dimension-form predicates, type-parameter
 bound stripping, occurs checks, cycle-safe substitution, and dimension
@@ -540,7 +540,7 @@ arithmetic normalization. It also carries the first Blorp-owned array/tensor
 dimension validator, including non-positive concrete dimension checks,
 dimension-argument validation, and variadic-dimension placement rules. It
 also has the first explicit Blorp context model in
-`compiler/blorp/compiler_context.brp`, covering module-origin policy, type-home
+`compiler/blorp/src/stage_05_types/compiler_context.brp`, covering module-origin policy, type-home
 ambiguity, resource cleanup entries, trait-home conflict reporting, definition
 ids, meta origins/bindings, head resolution, zonking, and Core lowering
 counters as ordinary values. The context model now also owns the baseline
@@ -548,35 +548,35 @@ unifier: meta binding with occurs checks, one-way and symmetric type-variable
 binding, explicit type-parameter binding, rigid variables, function purity,
 tuple/array/tensor matching, range/Int compatibility, LiteralString/String
 compatibility, and dimension arithmetic through the canonical solver in
-`compiler/blorp/compiler_dim_solver.brp`. That solver ports the
+`compiler/blorp/src/stage_05_types/compiler_dim_solver.brp`. That solver ports the
 sum-of-products normalization from `compiler/lib/dim_solver.ml`, including
 commutativity/associativity/distributivity, exact constant division,
 contradictions, and simple meta or `#` dimension-variable bindings. It
-also now includes `compiler/blorp/compiler_type_widening.brp`, which ports the
+also now includes `compiler/blorp/src/stage_05_types/compiler_type_widening.brp`, which ports the
 explicit value-slot widening decisions from `compiler/lib/type_widening.ml` for
 mutable bindings, arguments, collection elements, bitwise operands, method
 receivers, and numeric operands. The pure
 range/subscript proof substrate is also now covered by
-`compiler/blorp/compiler_refinement.brp`, which ports collection/dimension
+`compiler/blorp/src/stage_05_types/compiler_refinement.brp`, which ports collection/dimension
 identities, range upper bounds, subscript bounds, offset checks, proof sources,
 binding/expr proof payloads, proof-env replacement, and branch narrowing. The
 first module-loading identity helper is also in place:
-`compiler/blorp/compiler_module_type_identity.brp` ports local type-name
+`compiler/blorp/src/stage_04_modules/compiler_module_type_identity.brp` ports local type-name
 collection from parsed declarations, including private-wrapper transparency and
 sorted unique output for records, unions/enums, and type aliases. Structured
 generic-parameter helpers are now also ported in
-`compiler/blorp/compiler_generic_params.brp`, covering trait refs, bounded type
+`compiler/blorp/src/stage_05_types/compiler_generic_params.brp`, covering trait refs, bounded type
 params, parser-source spelling, and param-name extraction. The first
 type-policy metadata slice is also available in
-`compiler/blorp/compiler_type_metadata.brp`, covering recursion storage,
+`compiler/blorp/src/stage_05_types/compiler_type_metadata.brp`, covering recursion storage,
 primitive homes, struct scalar fields, native operator fast paths, builtin
 to-string fallbacks, and constructor-space classification. The remaining
-checkpoint-4 pieces are also now present: `compiler/blorp/compiler_env.brp`
+checkpoint-4 pieces are also now present: `compiler/blorp/src/stage_05_types/compiler_env.brp`
 ports the lexical environment, symbols, aliases, type/record/constructor lookup,
 trait functions, trait defs, impls, overloads, UFCS methods, resource policies,
 proof metadata attachment points, and alias/nominal-dimension resolution;
-`compiler/blorp/compiler_builtins.brp` ports compiler-visible builtin metadata
-and core Env population; and `compiler/blorp/compiler_type_resolution.brp`
+`compiler/blorp/src/stage_05_types/compiler_builtins.brp` ports compiler-visible builtin metadata
+and core Env population; and `compiler/blorp/src/stage_05_types/compiler_type_resolution.brp`
 ports the named annotation-resolution entrypoints over module aliases, owner
 qualification, nominal dimension disambiguation, and alias policy.
 
@@ -625,19 +625,19 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/language_surface_manifest.brp`
-- `compiler/blorp/compiler_type.brp`
-- `compiler/blorp/compiler_context.brp`
-- `compiler/blorp/compiler_dim_solver.brp`
-- `compiler/blorp/compiler_type_widening.brp`
-- `compiler/blorp/compiler_refinement.brp`
-- `compiler/blorp/compiler_module_type_identity.brp`
-- `compiler/blorp/compiler_generic_params.brp`
-- `compiler/blorp/compiler_type_metadata.brp`
-- `compiler/blorp/compiler_env.brp`
-- `compiler/blorp/compiler_builtins.brp`
-- `compiler/blorp/compiler_type_resolution.brp`
-- `compiler/blorp/compiler_diagnostic.brp`
+- `compiler/blorp/src/stage_05_types/language_surface_manifest.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type.brp`
+- `compiler/blorp/src/stage_05_types/compiler_context.brp`
+- `compiler/blorp/src/stage_05_types/compiler_dim_solver.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_widening.brp`
+- `compiler/blorp/src/stage_05_types/compiler_refinement.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_type_identity.brp`
+- `compiler/blorp/src/stage_05_types/compiler_generic_params.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_metadata.brp`
+- `compiler/blorp/src/stage_05_types/compiler_env.brp`
+- `compiler/blorp/src/stage_05_types/compiler_builtins.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_resolution.brp`
+- `compiler/blorp/src/stage_01_file_io/compiler_diagnostic.brp`
 
 Implementation steps:
 
@@ -757,19 +757,19 @@ expression inference.
 
 Status: complete for the Blorp-owned first-pass/indexing scope. The explicit
 Blorp typecheck state substrate is in place in
-`compiler/blorp/compiler_typecheck_state.brp`, with focused tests for
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_state.brp`, with focused tests for
 module-origin policy, import binding deduplication, module-alias/selective
 import namespace collisions, known type/resource pre-scan state, type-home
 precedence, callable ids, private impl tracking, type-home matching, and private
 impl conflict lookup. The top-level pre-scan is also in place in
-`compiler/blorp/compiler_typecheck_decl.brp`, covering known type/resource
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`, covering known type/resource
 names, constructor names, function/variable/trait namespace entries,
 foreign-block functions, and private wrappers. Pure import registration is in
-place in `compiler/blorp/compiler_imports.brp`, covering qualified aliases,
+place in `compiler/blorp/src/stage_06_typecheck/compiler_imports.brp`, covering qualified aliases,
 selective and renamed imports, private/missing symbol diagnostics, duplicate
 local-name diagnostics, import bindings, and imported type homes over Blorp
 module surfaces. Source type-expression projection is in place in
-`compiler/blorp/compiler_typecheck_types.brp`. Semantic
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_types.brp`. Semantic
 declaration-registration slices are in place for local union/enum,
 builtin/resource type, record/struct, type-alias, global variable, source
 function, foreign function, trait, and source impl declarations. These slices
@@ -827,10 +827,10 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_typecheck_state.brp`
-- `compiler/blorp/compiler_typecheck_types.brp`
-- `compiler/blorp/compiler_typecheck_decl.brp`
-- `compiler/blorp/compiler_imports.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_state.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_types.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_imports.brp`
 
 Implementation steps:
 
@@ -936,7 +936,7 @@ Core lowering. Legacy direct `Pipeline.compile` /
 `Pipeline.typecheck_only` APIs and some tooling/test paths can still use the
 OCaml parser/typechecker until their callers move to an explicit Blorp frontend
 graph.
-`compiler/blorp/compiler_infer.brp` now covers literals, identifiers, local
+`compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
 primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
 basic vector/tensor literals, record literals, record updates, record/tuple
@@ -1026,7 +1026,7 @@ indexing guidance. Subscript assignment currently covers mutable-root checking,
 full-rank tensor/array writes, constant-index bounds diagnostics, element type
 checking, and unsupported-target diagnostics; range-refined loop-variable
 proofs for reads and writes remain with the refinement/subscript slice.
-`compiler/blorp/compiler_typecheck_decl.brp` now has an explicit second-pass
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp` now has an explicit second-pass
 body-check API for source functions and global variables. Function bodies are
 checked with parameters in a scoped body environment and declared return types
 as expected value slots; value-producing functions without return annotations
@@ -1243,8 +1243,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_infer.brp`
-- `compiler/blorp/compiler_typecheck_decl.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`
 - future `compiler_infer_call.brp`
 - future `compiler_infer_resource.brp`
 - future `compiler_infer_concurrency.brp`
@@ -1966,18 +1966,18 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_core_consume_specialize.brp`
-- `compiler/blorp/compiler_core_ownership.brp`
-- `compiler/blorp/compiler_core_perceus.brp`
-- `compiler/blorp/compiler_core_reuse.brp`
-- `compiler/blorp/compiler_core_closure.brp`
-- `compiler/blorp/compiler_core_resource.brp`
-- `compiler/blorp/compiler_core_fairness.brp`
-- `compiler/blorp/compiler_core_prepare.brp`
-- `compiler/blorp/compiler_core_emit.brp`
-- `compiler/blorp/compiler_core_emit_type_layout.brp`
-- `compiler/blorp/codegen_*_renderer.brp` for typed static data, diagnostics,
-  and prepared-operation rendering
+- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit_type_layout.brp`
+- `compiler/blorp/src/stage_10_backend/codegen_*_renderer.brp` for typed
+  static data, diagnostics, and prepared-operation rendering
 
 Implementation steps:
 
@@ -2060,8 +2060,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_artifact_json.brp`
-- `compiler/blorp/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 - future `compiler_artifact_writer.brp`
 - future `compiler_host_c.brp`
 
@@ -2126,8 +2126,8 @@ OCaml references:
 Blorp references:
 
 - existing formatter files:
-  - `compiler/blorp/compiler_format.brp`
-  - `compiler/blorp/compiler_format_projection.brp`
+  - `compiler/blorp/src/stage_11_format/compiler_format.brp`
+  - `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
 - future shell/tool files:
   - `compiler_test_runner.brp`
   - `compiler_repl.brp`

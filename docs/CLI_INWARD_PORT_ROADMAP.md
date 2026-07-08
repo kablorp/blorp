@@ -42,23 +42,23 @@ inward in small, authoritative slices, then delete the replaced OCaml code.
 
 ## Current State
 
-- `compiler/blorp/compiler_cli_args.brp` owns pure CLI argument parsing.
-- `compiler/blorp/compiler_cli.brp` owns top-level CLI planning, help/version
+- `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp` owns pure CLI argument parsing.
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp` owns top-level CLI planning, help/version
   output, formatter dispatch, single-file source reads, auto-format decisions,
   and parser-bridge parsing for simple `check`, `compile`, and `run` shapes.
-- `compiler/blorp/compiler_cli.brp` now models CLI source work with
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp` now models CLI source work with
   `CliSourceTarget`, `CliSourceFile`, `CliParsedSourceFile`, and
   `CliCheckSourceBatch`; single parsed-source artifacts are encoded from the
   typed parsed-source record.
-- `compiler/blorp/compiler_cli.brp` expands explicit `check` targets in Blorp.
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp` expands explicit `check` targets in Blorp.
   It validates missing paths, preserves explicit file targets, walks directory
   targets recursively, filters directory contents to `.brp` files, and sorts
   the discovered source paths deterministically.
-- `compiler/blorp/compiler_cli.brp` now formats eligible expanded `check` root
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp` now formats eligible expanded `check` root
   sources, respects `--no-format` and `BLORP_NO_FORMAT=1`, skips files under
   the repository `std/` directory, and reads those sources through typed file
   APIs before handing execution back to OCaml.
-- `compiler/blorp/compiler_cli.brp` now parses non-empty multi-root and
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp` now parses non-empty multi-root and
   directory `check` roots with the existing `parse_sources` bridge action and
   returns a `parsed_source_batch` CLI artifact. OCaml decodes and finalizes that
   batch, then typechecks those explicit roots without rediscovering or reparsing
@@ -400,7 +400,7 @@ Blorp source graph with parsed modules
 Validation:
 
 - `make`
-- `./blorp format --check compiler/blorp/compiler_cli.brp compiler/blorp/tests/test_compiler_cli.brp`
+- `./blorp format --check compiler/blorp/src/stage_12_cli/compiler_cli.brp compiler/blorp/tests/test_compiler_cli.brp`
 - `./blorp test --no-format compiler/blorp/tests/test_compiler_cli.brp`
 - `dune exec -- ./test/run_tests.exe test CompilerBlorpBridge`
 - `dune exec -- ./test/run_tests.exe test Session.modules_isolation`

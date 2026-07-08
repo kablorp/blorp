@@ -1,0 +1,190 @@
+-- Blorp-owned diagnostics for Core trait resolution.
+--
+-- OCaml still owns Core traversal and registry construction. This module owns
+-- the user-facing hint text for trait-method resolution failures.
+import:
+	../stage_10_backend/codegen_template_registry: render_template_arity_error, render_unsupported_template_error
+	string: levenshtein
+
+
+enum CoreTraitResolveTemplate:
+	NoImplHintTemplate
+
+
+record CoreTraitResolveTemplateInfo {
+	template: CoreTraitResolveTemplate,
+	name: String,
+	arity: Int
+}
+
+
+record NoImplHintArgs {
+	method_name: String,
+	type_name: String,
+	candidates: List[String]
+}
+
+
+union CoreTraitResolveRenderError:
+	WrongArity(CoreTraitResolveTemplateInfo, Int)
+	UnsupportedTraitResolveTemplate(String)
+
+
+private pure func templates_by_name(
+	templates: List[CoreTraitResolveTemplateInfo],
+) -> Dict[String, CoreTraitResolveTemplateInfo]:
+	var dict: Dict[String, CoreTraitResolveTemplateInfo] = {}
+
+	for info in templates:
+		dict = dict.set(info.name, info)
+
+	dict
+
+
+ALL_TEMPLATES: List[CoreTraitResolveTemplateInfo] = [
+	{
+		template = NoImplHintTemplate,
+		name = "core_trait_resolve_no_impl_hint",
+		arity = 3
+	},
+]
+
+private TEMPLATES_BY_NAME: Dict[String, CoreTraitResolveTemplateInfo] = templates_by_name(
+	ALL_TEMPLATES,
+)
+
+
+pure func core_trait_resolve_template_name(info: CoreTraitResolveTemplateInfo) -> String:
+	info.name
+
+
+pure func core_trait_resolve_template_arity(info: CoreTraitResolveTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_core_trait_resolve_template(name: String) -> Option[CoreTraitResolveTemplateInfo]:
+	TEMPLATES_BY_NAME.get(name)
+
+
+private pure func wrong_arity_for_args(
+	info: CoreTraitResolveTemplateInfo,
+	args: List[String],
+) -> CoreTraitResolveRenderError:
+	WrongArity(info, args.length())
+
+
+pure func render_error_to_string(error: CoreTraitResolveRenderError) -> String:
+	match error:
+		WrongArity(info, actual):
+			render_template_arity_error(
+				"core trait resolve template",
+				core_trait_resolve_template_name(info),
+				core_trait_resolve_template_arity(info),
+				actual,
+			)
+		UnsupportedTraitResolveTemplate(name):
+			render_unsupported_template_error("core trait resolve template", name)
+
+
+private pure func candidate_text_to_candidates(text: String) -> List[String]:
+	if text == "":
+		[]
+	else:
+		var candidates: List[String] = []
+
+		for candidate in text.split(";"):
+			if candidate != "":
+				candidates = candidates.append(candidate)
+
+		candidates
+
+
+private pure func parse_no_impl_hint_args(
+	info: CoreTraitResolveTemplateInfo,
+	args: List[String],
+) -> Result[NoImplHintArgs, CoreTraitResolveRenderError]:
+	match args:
+		[]:
+			Err(wrong_arity_for_args(info, args))
+		[method_name]:
+			Err(wrong_arity_for_args(info, args))
+		[method_name, type_name]:
+			Err(wrong_arity_for_args(info, args))
+		[method_name, type_name, candidate_text]:
+			Ok({
+				method_name = method_name,
+				type_name = type_name,
+				candidates = candidate_text_to_candidates(candidate_text),
+			})
+		[method_name, type_name, candidate_text, ...rest]:
+			Err(wrong_arity_for_args(info, args))
+
+
+pure func build_core_trait_resolve_no_impl_hint_args(
+	info: CoreTraitResolveTemplateInfo,
+	args: List[String],
+) -> Result[NoImplHintArgs, CoreTraitResolveRenderError]:
+	match info.template:
+		NoImplHintTemplate:
+			parse_no_impl_hint_args(info, args)
+
+
+private pure func suggestion_threshold(name: String) -> Int:
+	threshold: Int = name.length() / 3 + 1
+
+	if threshold > 1:
+		threshold
+	else:
+		1
+
+
+private pure func closest_candidate(
+	type_name: String,
+	sorted_candidates: List[String],
+) -> Option[String]:
+	var best_name: String = ""
+	var best_distance: Int = 0
+	var found: Bool = False
+	threshold: Int = suggestion_threshold(type_name)
+
+	for candidate in sorted_candidates:
+		distance: Int = levenshtein(type_name, candidate)
+
+		if distance <= threshold and (not found or distance < best_distance):
+			best_name = candidate
+			best_distance = distance
+			found = True
+
+	if found:
+		Some(best_name)
+	else:
+		None
+
+
+private pure func render_no_impl_hint(args: NoImplHintArgs) -> String:
+	if args.candidates.length() == 0:
+		"no type in scope implements `${args.method_name}`. Define an `implements <trait> for ${args.type_name}:` block with a `${args.method_name}` method."
+	else:
+		sorted_candidates: List[String] = args.candidates.sort()
+
+		match closest_candidate(args.type_name, sorted_candidates):
+			Some(suggestion):
+				"did you mean to call it on a ${suggestion}? Or add `implements <trait> for ${args.type_name}:` defining `${args.method_name}`."
+			None:
+				candidate_text: String = sorted_candidates.join(", ")
+				"types with an `${args.method_name}` impl in scope: ${candidate_text}. Add `implements <trait> for ${args.type_name}:` to extend it."
+
+
+pure func render_core_trait_resolve(
+	name: String,
+	args: List[String],
+) -> Result[String, CoreTraitResolveRenderError]:
+	match parse_core_trait_resolve_template(name):
+		Some(info):
+			match build_core_trait_resolve_no_impl_hint_args(info, args):
+				Ok(no_impl_hint_args):
+					Ok(render_no_impl_hint(no_impl_hint_args))
+				Err(error):
+					Err(error)
+		None:
+			Err(UnsupportedTraitResolveTemplate(name))

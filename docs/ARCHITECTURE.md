@@ -7,12 +7,12 @@ Source (.brp)
     |
     v
 +--------+
-| Lexer  |  Tokenization (compiler/blorp/compiler_lexer.brp)
+| Lexer  |  Tokenization (compiler/blorp/src/stage_02_lex/compiler_lexer.brp)
 +--------+
     |
     v
 +--------+
-| Parser |  AST construction (compiler/blorp/compiler_parser.brp)
+| Parser |  AST construction (compiler/blorp/src/stage_03_parse/compiler_parser.brp)
 +--------+
     |
     v
@@ -55,12 +55,12 @@ Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the supported default backend route crosses the
 single JSON bridge after `Core_perceus`. On that route,
-`compiler/blorp/compiler_core_reuse.brp`,
-`compiler/blorp/compiler_core_closure.brp`,
-`compiler/blorp/compiler_core_resource.brp`,
-`compiler/blorp/compiler_core_fairness.brp`,
-`compiler/blorp/compiler_core_prepare.brp`, and
-`compiler/blorp/compiler_core_emit.brp` own the contiguous tail through C
+`compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_resource.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`, and
+`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` own the contiguous tail through C
 artifact generation. CLI `reuse`/`closure`/`final` dumps and stops observe the
 Blorp-owned tail as Core JSON through the bridge; OCaml program callbacks stop
 at the post-Perceus handoff. C artifact emission is owned by the Blorp backend
@@ -287,15 +287,15 @@ boxing, or ownership behavior from source spelling.
 
 | File | Purpose |
 |------|---------|
-| `compiler/blorp/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
-| `compiler/blorp/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
-| `compiler/blorp/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
-| `compiler/blorp/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
-| `compiler/blorp/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
-| `compiler/blorp/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
-| `compiler/blorp/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
-| `compiler/blorp/compiler_core_emit.brp` | Supported-route C artifact emission subset |
-| `compiler/blorp/compiler_artifact_json.brp` | Structured C artifact JSON codec |
+| `compiler/blorp/src/stage_12_cli/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
+| `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
+| `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
+| `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
+| `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
+| `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
+| `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
+| `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` | Supported-route C artifact emission subset |
+| `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp` | Structured C artifact JSON codec |
 
 ### Inspecting the Pipeline
 
@@ -396,13 +396,20 @@ compiler/
 └── dune                   # Build configuration
 
 compiler/blorp/            # Blorp-authored compiler implementation slices
-├── compiler_bridge.brp    # Single JSON bridge dispatcher
-├── compiler_core_json.brp # Current Core JSON transfer model
-├── compiler_core_traverse.brp # Shared shallow Core expression traversal helpers
-├── compiler_core_resource.brp # Blorp-owned supported resource cleanup pass
-├── compiler_core_fairness.brp # Blorp-owned supported fairness pass
-├── compiler_core_prepare.brp # Blorp-owned supported final-preparation pass
-├── compiler_core_emit.brp # Blorp-owned supported C artifact emitter
+├── src/
+│   ├── stage_01_file_io/        # Source text, spans, and diagnostics
+│   ├── stage_02_lex/            # Tokens and lexer
+│   ├── stage_03_parse/          # Parser, parsed AST, and parser bridge
+│   ├── stage_04_modules/        # Module surfaces and type identities
+│   ├── stage_05_types/          # Type model, context, Env, and builtins
+│   ├── stage_06_typecheck/      # Imports, inference, typecheck state, bridge
+│   ├── stage_07_ctfe/           # Compile-time evaluation
+│   ├── stage_08_core_lower/     # Typed frontend to Core lowering
+│   ├── stage_09_core/           # Core model, traversal, passes, manifests
+│   ├── stage_10_backend/        # C artifact model, emission, codegen renderers
+│   ├── stage_11_format/         # Formatter implementation
+│   ├── stage_12_cli/            # CLI and bridge entrypoints
+│   └── stage_99_meta/           # Migration inventory metadata
 └── tests/                 # Blorp TestSuite coverage for compiler slices
 
 std/                       # Portable standard library (.brp files)
@@ -467,7 +474,7 @@ tests/
 
 ## Frontend
 
-### Blorp Lexer (`compiler/blorp/compiler_lexer.brp`)
+### Blorp Lexer (`compiler/blorp/src/stage_02_lex/compiler_lexer.brp`)
 
 Blorp source lexer that tokenizes source text and emits spans, comments, and
 docstrings for the parser bridge:
@@ -478,9 +485,9 @@ docstrings for the parser bridge:
 - String interpolation (`"Hello ${name}!"`)
 - All keywords and operators
 
-Token and keyword shapes are defined in `compiler/blorp/compiler_token.brp`.
+Token and keyword shapes are defined in `compiler/blorp/src/stage_02_lex/compiler_token.brp`.
 
-### Blorp Parser (`compiler/blorp/compiler_parser.brp`)
+### Blorp Parser (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`)
 
 Blorp parser that builds the parsed source AST used by the OCaml middle
 pipeline:
@@ -498,7 +505,7 @@ a + b -> add(a, b)
 ```
 
 The parser helper serializes parsed source artifacts through
-`compiler/blorp/compiler_parsed_ast_json.brp`. Each artifact carries
+`compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`. Each artifact carries
 `ast_phase`, `parsed_ast`, a Blorp-owned syntactic `module_surface`, and
 optional `comments`. OCaml decodes the AST in
 `compiler/lib/parsed_ast_json.ml`, decodes and validates the module surface in
@@ -691,7 +698,7 @@ Shared utilities live in `compiler/lib/codegen/`:
 // C: double identity_Float(double x)
 ```
 
-**Closure conversion** (`compiler/blorp/compiler_core_closure.brp`): Lambdas are
+**Closure conversion** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Lambdas are
 hoisted into helper functions in the Blorp-owned backend tail and use the runtime
 closure ABI:
 ```c
@@ -744,7 +751,7 @@ translation units.
 ### Main Entry Point
 
 The public `./blorp` executable is built from the Blorp CLI entry point in
-`compiler/blorp/compiler_cli_main.brp`. It performs user-facing command
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs user-facing command
 planning, source discovery, source reads, parsing, and current frontend graph
 handoffs before invoking the private OCaml host shell
 `compiler/bin/blorp_ocaml_host.ml` for the compiler stages and impure host
@@ -768,11 +775,11 @@ User-facing subcommands:
 
 ### Adding a New Keyword
 
-1. **Lexer** (`compiler/blorp/compiler_lexer.brp`):
+1. **Lexer** (`compiler/blorp/src/stage_02_lex/compiler_lexer.brp`):
    - Add keyword handling.
    - Return the appropriate `compiler_token` value.
 
-2. **Parser** (`compiler/blorp/compiler_parser.brp`):
+2. **Parser** (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`):
    - Add grammar rules
 
 3. **Shared language surface and editor metadata**:
@@ -794,7 +801,7 @@ User-facing subcommands:
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
 
-7. **Core emission** (`compiler/blorp/compiler_core_emit.brp`):
+7. **Core emission** (`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.
 
 ### Adding a New Builtin Function
@@ -825,7 +832,7 @@ User-facing subcommands:
 1. **AST** (`ast.ml`):
    - Add type representation if needed
 
-2. **Parser** (`compiler/blorp/compiler_parser.brp`):
+2. **Parser** (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`):
    - Handle in type parsing rules
 
 3. **Types** (`types.ml`):

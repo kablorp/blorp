@@ -172,11 +172,11 @@ Architecture:
   conventions.
 - Run CTFE after typecheck/purity and before Core lowering. Core and codegen
   should see ordinary immutable global initializers after rewrite.
-- Keep the Blorp CTFE IR in `compiler/blorp/compiler_ctfe_ir.brp` as the
+- Keep the Blorp CTFE IR in `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_ir.brp` as the
   evaluator boundary. Typed AST is still too broad for execution, while full
   Core is broader than CTFE currently needs.
 - Keep compiler-owned std/builtin behavior behind the Blorp CTFE intrinsic
-  layer in `compiler/blorp/compiler_ctfe_intrinsic.brp`. Each supported
+  layer in `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_intrinsic.brp`. Each supported
   operation should have a named intrinsic identity and one evaluator entry.
 - Keep top-level initializer policy centralized in
   `Top_level_initializer`: immutable constants require CTFE; mutable globals
@@ -212,7 +212,7 @@ Current checkpoint:
   counts.
 - Codegen audit coverage checks that CTFE-only builder functions are absent from
   generated C for materialized constants.
-- `compiler/blorp/codegen_intrinsic_renderer.brp` now dogfoods ordinary
+- `compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp` now dogfoods ordinary
   top-level constants for derived intrinsic lookup/manifest data.
 - Static emission currently supports strings, pointer-storage lists whose
   elements are supported static values, integer-like inline primitive literal

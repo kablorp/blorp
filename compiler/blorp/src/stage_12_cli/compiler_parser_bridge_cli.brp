@@ -1,0 +1,151 @@
+import:
+	compiler_bridge_protocol:
+		BRIDGE_SCHEMA_VERSION,
+		BridgeAction(ParseSourceAction, RunCliAction),
+		BridgeEnvelope,
+		BridgeProtocolError(InvalidJson),
+		bridge_error_json,
+		decode_bridge_envelope_value,
+	compiler_cli: handle_cli_run_envelope
+	../stage_03_parse/compiler_parser_bridge: handle_request_value
+	fs: message, open_read, read_text
+	io: print_error
+	json:
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_string,
+		get_field,
+		parse_json,
+
+
+func read_text_file(path: String) -> Result[String, String]:
+	with reader ?= open_read(path) on err => message(err):
+		match reader.read_text():
+			Ok(request):
+				Ok(request)
+			Err(err):
+				Err(message(err))
+
+
+pure func source_read_error_json(path: String, error_message: String) -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))),
+		("ok", JsonBool(False)),
+		("error", JsonObject([
+				("code", JsonString("source_read_error")),
+			("message", JsonString("failed to read source file `" + path + "`: " + error_message)),
+			])),
+	])
+
+
+pure func json_has_field(value: JsonValue, name: String) -> Bool:
+	match get_field(value, name):
+		Some(_):
+			True
+		None:
+			False
+
+
+pure func payload_with_text(payload: JsonValue, text: String) -> JsonValue:
+	match payload:
+		JsonObject(fields):
+			var result: List[(String, JsonValue)] = []
+			var replaced: Bool = False
+
+			for field in fields:
+				if field[0] == "text":
+					result = result.append(("text", JsonString(text)))
+					replaced = True
+				else:
+					result = result.append(field)
+
+			if replaced:
+				JsonObject(result)
+			else:
+				JsonObject(result.append(("text", JsonString(text))))
+		_:
+			payload
+
+
+pure func bridge_root_with_payload(envelope: BridgeEnvelope, payload: JsonValue) -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(envelope.schema))),
+		("domain", JsonString(envelope.domain)),
+		("action", JsonString(envelope.action_name)),
+		("payload", payload),
+	])
+
+
+func enrich_parse_source_request(envelope: BridgeEnvelope) -> Result[JsonValue, JsonValue]:
+	if json_has_field(envelope.payload, "text"):
+		Ok(bridge_root_with_payload(envelope, envelope.payload))
+	else:
+		match get_field(envelope.payload, "path"):
+			Some(path_value):
+				match as_string(path_value):
+					Some(path):
+						match read_text_file(path):
+							Ok(source):
+								Ok(
+									bridge_root_with_payload(
+										envelope,
+										payload_with_text(envelope.payload, source),
+									),
+								)
+							Err(read_error):
+								Err(source_read_error_json(path, read_error))
+					None:
+						Ok(bridge_root_with_payload(envelope, envelope.payload))
+			None:
+				Ok(bridge_root_with_payload(envelope, envelope.payload))
+
+
+func prepare_request_value_for_cli(root: JsonValue) -> Result[JsonValue, JsonValue]:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			if envelope.action == ParseSourceAction:
+				enrich_parse_source_request(envelope)
+			else:
+				Ok(root)
+		Err(_):
+			Ok(root)
+
+
+func handle_cli_request(request: String) -> String:
+	match parse_json(request):
+		Ok(root):
+			match decode_bridge_envelope_value(root):
+				Ok(envelope):
+					if envelope.action == RunCliAction:
+						handle_cli_run_envelope(envelope).to_string()
+					else:
+						match prepare_request_value_for_cli(root):
+							Ok(prepared):
+								handle_request_value(prepared).to_string()
+							Err(error_response):
+								error_response.to_string()
+				Err(_):
+					match prepare_request_value_for_cli(root):
+						Ok(prepared):
+							handle_request_value(prepared).to_string()
+						Err(error_response):
+							error_response.to_string()
+		Err(message):
+			bridge_error_json(InvalidJson(message)).to_string()
+
+
+func main(args: List[String]) -> Int:
+	if args.length() != 2:
+		print_error("Usage: compiler_parser_bridge_cli <request.json>")
+		1
+	else:
+		path: String = args
+			.get(1)
+			.get_or("")
+
+		match read_text_file(path):
+			Ok(request):
+				print(handle_cli_request(request))
+				0
+			Err(message):
+				print_error(message)
+				1

@@ -1641,16 +1641,20 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
       let compiler_dir = Filename.concat root "compiler" in
       let blorp_dir = Filename.concat compiler_dir "blorp" in
+      let src_dir = Filename.concat blorp_dir "src" in
+      let cli_dir = Filename.concat src_dir "stage_12_cli" in
       let program = Filename.concat root "blorp" in
-      let backend_source = Filename.concat blorp_dir "compiler_bridge_cli.brp" in
+      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
       let parser_source =
-        Filename.concat blorp_dir "compiler_parser_bridge_cli.brp"
+        Filename.concat cli_dir "compiler_parser_bridge_cli.brp"
       in
       let typecheck_source =
-        Filename.concat blorp_dir "compiler_typecheck_bridge_cli.brp"
+        Filename.concat cli_dir "compiler_typecheck_bridge_cli.brp"
       in
       mkdir compiler_dir;
       mkdir blorp_dir;
+      mkdir src_dir;
+      mkdir cli_dir;
       write_file program "#!/usr/bin/env bash\n";
       write_file backend_source "func main(args: List[String]) -> Int: 0\n";
       write_file parser_source "func main(args: List[String]) -> Int: 0\n";
@@ -1675,12 +1679,16 @@ let test_bridge_cache_key_includes_std_sources () =
   with_temp_dir (fun root ->
       let compiler_dir = Filename.concat root "compiler" in
       let blorp_dir = Filename.concat compiler_dir "blorp" in
+      let src_dir = Filename.concat blorp_dir "src" in
+      let cli_dir = Filename.concat src_dir "stage_12_cli" in
       let std_dir = Filename.concat root "std" in
       let program = Filename.concat root "blorp" in
-      let backend_source = Filename.concat blorp_dir "compiler_bridge_cli.brp" in
+      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
       let std_source = Filename.concat std_dir "prelude.brp" in
       mkdir compiler_dir;
       mkdir blorp_dir;
+      mkdir src_dir;
+      mkdir cli_dir;
       mkdir std_dir;
       write_file program "#!/usr/bin/env bash\n";
       write_file backend_source "func main(args: List[String]) -> Int: 0\n";
@@ -1694,6 +1702,35 @@ let test_bridge_cache_key_includes_std_sources () =
       in
       Alcotest.(check bool)
         "std source edits invalidate helper cache" true
+        (before.bridge_key <> after.bridge_key))
+
+let test_bridge_cache_key_includes_all_compiler_stages () =
+  with_temp_dir (fun root ->
+      let compiler_dir = Filename.concat root "compiler" in
+      let blorp_dir = Filename.concat compiler_dir "blorp" in
+      let src_dir = Filename.concat blorp_dir "src" in
+      let cli_dir = Filename.concat src_dir "stage_12_cli" in
+      let lex_dir = Filename.concat src_dir "stage_02_lex" in
+      let program = Filename.concat root "blorp" in
+      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
+      let lex_source = Filename.concat lex_dir "compiler_token.brp" in
+      mkdir compiler_dir;
+      mkdir blorp_dir;
+      mkdir src_dir;
+      mkdir cli_dir;
+      mkdir lex_dir;
+      write_file program "#!/usr/bin/env bash\n";
+      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file lex_source "enum TokenA: One\n";
+      let before =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+      in
+      write_file lex_source "enum TokenA: One, Two\n";
+      let after =
+        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+      in
+      Alcotest.(check bool)
+        "non-entrypoint compiler stage edits invalidate helper cache" true
         (before.bridge_key <> after.bridge_key))
 
 let test_prepared_bridge_binary_env_accepts_existing_file () =
@@ -1923,6 +1960,8 @@ let suite =
           test_bridge_cache_key_includes_helper_entrypoint;
         Alcotest.test_case "cache key includes std sources" `Quick
           test_bridge_cache_key_includes_std_sources;
+        Alcotest.test_case "cache key includes all compiler stages" `Quick
+          test_bridge_cache_key_includes_all_compiler_stages;
         Alcotest.test_case "prepared env accepts existing helper" `Quick
           test_prepared_bridge_binary_env_accepts_existing_file;
         Alcotest.test_case "prepared env rejects missing helper" `Quick

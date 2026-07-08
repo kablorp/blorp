@@ -140,9 +140,9 @@ scripts/with-build-lock make quality
 ## Compiler Bridge Helpers
 
 Backend renderer/Core requests use a compiled
-`compiler/blorp/compiler_bridge_cli.brp` helper. Parser requests use
-`compiler/blorp/compiler_parser_bridge_cli.brp`, and typed-frontend requests
-use `compiler/blorp/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
+`compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp` helper. Parser requests use
+`compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp`, and typed-frontend requests
+use `compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
 imports stay separate so the backend helper stays bootstrap-small.
 
 `scripts/test` prepares these helper binaries once at startup for selected gates
@@ -195,7 +195,7 @@ Useful compiler bootstrap commands:
 ```bash
 scripts/blorp-compiler-bootstrap --print-id
 scripts/blorp-compiler-bootstrap --print-path
-scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/compiler_bridge_cli.brp
+scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp
 ```
 
 `BLORP_COMPILER_BRIDGE_BIN` remains the explicit escape hatch for testing or

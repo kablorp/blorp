@@ -95,7 +95,7 @@ must use decoded-AST indexes rather than raw parsed declaration-group indexes.
 OCaml can recover the current `(name * Ast.decl)` export pairs from the parsed
 program while later frontend stages remain OCaml-owned.
 
-Implemented Blorp model in `compiler/blorp/compiler_module_surface.brp`:
+Implemented Blorp model in `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`:
 
 ```blorp
 enum ModuleSurfaceSymbolKind:
@@ -196,7 +196,7 @@ Implement the pure Blorp extractor over the parsed AST.
 
 Files:
 
-- Add `compiler/blorp/compiler_module_surface.brp`
+- Add `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
 - Add `compiler/blorp/tests/test_compiler_module_surface.brp`
 
 Functions in `compiler_module_surface.brp`:
@@ -258,8 +258,8 @@ typecheck-source parsed programs.
 
 Files:
 
-- Update `compiler/blorp/compiler_parser_bridge.brp`
-- Add `compiler/blorp/compiler_module_surface_json.brp`
+- Update `compiler/blorp/src/stage_03_parse/compiler_parser_bridge.brp`
+- Add `compiler/blorp/src/stage_04_modules/compiler_module_surface_json.brp`
 - Update `compiler/blorp/tests/test_compiler_bridge.brp`
 
 Functions in `compiler_module_surface_json.brp`:
@@ -546,7 +546,7 @@ AST JSON walking.
 
 Files:
 
-- Update `compiler/blorp/compiler_cli_source_graph.brp`
+- Update `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
 - Update `compiler/blorp/tests/test_compiler_cli.brp`
 
 Function changes:

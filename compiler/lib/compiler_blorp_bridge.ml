@@ -1,7 +1,7 @@
 (** Single JSON transfer point for Blorp-owned compiler policies, parser
     artifacts, and downstream compile artifacts.
 
-    Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
+    Renderer JSON requests are served by [compiler/blorp/src/stage_12_cli/compiler_bridge.brp]
     through the hidden bridge command. During a cold bridge-helper compile,
     helper mode serves only the narrow OCaml callers that still need static
     table rows before the helper binary exists. *)
@@ -344,18 +344,32 @@ let labeled_relative_to ~root ~label path =
   let rel = relative_to ~root path in
   if label = "" then rel else Filename.concat label rel
 
+let compiler_bridge_source_root source_path =
+  let source_dir = Filename.dirname source_path in
+  let src_dir = Filename.dirname source_dir in
+  let blorp_dir = Filename.dirname src_dir in
+  let compiler_dir = Filename.dirname blorp_dir in
+  if
+    String.equal (Filename.basename src_dir) "src"
+    && String.equal (Filename.basename blorp_dir) "blorp"
+    && String.equal (Filename.basename compiler_dir) "compiler"
+  then src_dir
+  else source_dir
+
 (* Bridge helper binaries are compiled as normal Blorp programs. Their cache key
    must include source roots that can affect generated C, not just the helper
    entrypoint: std edits can change imported library code, and
-   [compiler/blorp/compiler_format_projection.brp] imports self-hosted formatter
+   [compiler/blorp/src/stage_11_format/compiler_format_projection.brp] imports self-hosted formatter
    modules from [tools/formatter]. *)
 let compiler_bridge_extra_source_roots source_root =
-  let compiler_dir = Filename.dirname source_root in
+  let blorp_dir = Filename.dirname source_root in
+  let compiler_dir = Filename.dirname blorp_dir in
   let workspace_root = Filename.dirname compiler_dir in
   let std_root = Filename.concat workspace_root "std" in
   let formatter_root = Filename.concat workspace_root "tools/formatter" in
   if
-    String.equal (Filename.basename source_root) "blorp"
+    String.equal (Filename.basename source_root) "src"
+    && String.equal (Filename.basename blorp_dir) "blorp"
     && String.equal (Filename.basename compiler_dir) "compiler"
   then
     let roots = [] in
@@ -371,7 +385,7 @@ let compiler_bridge_extra_source_roots source_root =
   else []
 
 let bridge_source_tree_digest source_path =
-  let root = Filename.dirname source_path in
+  let root = compiler_bridge_source_root source_path in
   let rec collect dir =
     Sys.readdir dir |> Array.to_list |> List.sort String.compare
     |> List.fold_left
@@ -1821,10 +1835,10 @@ let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
-let renderer_bridge_source_name = "compiler/blorp/compiler_bridge_cli.brp"
-let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
+let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
+let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
 let typecheck_bridge_source_name =
-  "compiler/blorp/compiler_typecheck_bridge_cli.brp"
+  "compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");
