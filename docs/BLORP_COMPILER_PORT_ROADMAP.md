@@ -1731,7 +1731,11 @@ OCaml references:
 
 Blorp references:
 
-- future `compiler_core_lower.brp`
+- `compiler_core_lower.brp`
+  - `compiler_core_lower_type`
+  - `lower_typed_expr`
+  - `lower_typed_decl`
+  - `lower_typed_program`
 - future `compiler_core_flatten.brp`
 - future `compiler_core_ffi_boundary.brp`
 - future `compiler_core_list_layout.brp`
@@ -1756,6 +1760,21 @@ Implementation steps:
   running Core passes.
 - Preserve foreign metadata collection for link flags/include dirs until the
   impure shell moves.
+
+Current progress:
+
+- `compiler_core_lower.brp` owns the first lowering slice for source
+  locations, Core type conversion, stable Core vars, scalar literal/name
+  expressions, unary/binary/logical expressions, tuple expressions, `if`,
+  simple blocks, ascriptions, assignment, field access, ranges, record
+  literals, and simple function/global declarations with explicit lowering
+  context state for Core def ids.
+- Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
+  dropping declarations or falling back implicitly. This keeps the next
+  production boundary strict while expression coverage expands.
+- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
+  Tensor-shaped type lowering exists in the helper, but the runtime test avoids
+  constructing that metadata until backend test emission handles it cheaply.
 
 Edge cases:
 
