@@ -319,10 +319,6 @@ Tests to add or update:
 - `compiler/blorp/tests/test_compiler_bridge.brp`
   - typecheck phase returns final interpolation parts
   - raw phase returns raw interpolation
-- `compiler/test/test_parser.ml`
-  - temporarily keep `test_interpolation_bridge_preserves_hole_order_in_nested_blocks`
-    until Blorp tests and parser fixtures prove parity, then delete the OCaml
-    unit test when `Interp_parser` is gone
 - `tests/test_compiler/parser/should_pass/string_interp_basic.brp`
 - `tests/test_compiler/parser/should_pass/string_interp_expr.brp`
 - `tests/test_compiler/parser/should_pass/string_interp_escape.brp`
@@ -637,8 +633,8 @@ Functions to remove or shrink:
 - `compiler/lib/ast.ml`
   - keep raw source variants while formatter/LSP/typecheck still need the OCaml
     AST, but update comments that name deleted OCaml passes
-- `compiler/lib/typed_ast.ml`, `compiler/lib/core_lower.ml`,
-  `compiler/lib/ctfe_ir.ml`, and invariant comments
+- `compiler/lib/typed_ast.ml`, `compiler/lib/core_lower.ml`, Blorp CTFE IR,
+  and invariant comments
   - keep defensive checks for impossible raw nodes if they still protect the
     OCaml middle
   - update messages to name the Blorp source finalizer instead of deleted OCaml
@@ -646,8 +642,6 @@ Functions to remove or shrink:
 
 Tests to delete or migrate:
 
-- OCaml interpolation unit tests in `compiler/test/test_parser.ml` once covered
-  by `compiler/blorp/tests/test_compiler_source_ast_finalize.brp`
 - OCaml pipeline tests that only prove imported modules run `Nested_hoist`, once
   graph finalization tests prove imported modules are already finalized
 - Any OCaml unit tests whose only subject is deleted finalizer implementation
@@ -710,8 +704,6 @@ Tests to add or update:
 - `tests/test_compiler/format/should_pass/wrapped_string_literals.brp`
 - `tests/test_compiler/parser/should_pass/comment_between_if_else.brp`
 - LSP tests covering comments/spans/nested function symbols if present
-- `compiler/test/test_parser.ml`
-  - keep only raw parser integration tests that cannot live in Blorp yet
 
 Validation:
 

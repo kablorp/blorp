@@ -172,12 +172,12 @@ Architecture:
   conventions.
 - Run CTFE after typecheck/purity and before Core lowering. Core and codegen
   should see ordinary immutable global initializers after rewrite.
-- Keep `compiler/lib/ctfe_ir.ml` as the evaluator boundary. Typed AST is still
-  too broad for execution, while full Core is broader than CTFE currently
-  needs.
-- Keep compiler-owned std/builtin behavior behind `Ctfe_intrinsic` and
-  `Ctfe_std_eval`. Each supported operation should have a named intrinsic
-  identity and one evaluator entry.
+- Keep the Blorp CTFE IR in `compiler/blorp/compiler_ctfe_ir.brp` as the
+  evaluator boundary. Typed AST is still too broad for execution, while full
+  Core is broader than CTFE currently needs.
+- Keep compiler-owned std/builtin behavior behind the Blorp CTFE intrinsic
+  layer in `compiler/blorp/compiler_ctfe_intrinsic.brp`. Each supported
+  operation should have a named intrinsic identity and one evaluator entry.
 - Keep top-level initializer policy centralized in
   `Top_level_initializer`: immutable constants require CTFE; mutable globals
   reject hidden startup calls.
@@ -186,13 +186,14 @@ Architecture:
 
 Current checkpoint:
 
-- `Ctfe.evaluate_program` rewrites source-order immutable globals through one
-  shared CTFE environment.
+- The OCaml CTFE implementation has been retired. The `typecheck_source` bridge
+  rewrites source-order immutable globals through the Blorp CTFE evaluator and
+  reports unsupported CTFE as frontend diagnostics.
 - Immutable globals are semantically required CTFE now; unsupported pure
   operations are compile errors instead of best-effort runtime fallbacks.
 - Private constants referenced only by later constants are treated as CTFE
   scratch and can be omitted from generated runtime data.
-- `Ctfe_ir` classifies expressions, function references, call kinds,
+- `compiler_ctfe_ir.brp` classifies expressions, function references, call kinds,
   constructors, field access, tuple/range access, vectors, lists, dicts,
   records, and control flow before evaluation.
 - CTFE function values wrap typed functions with lazy cached IR bodies, so
@@ -237,7 +238,7 @@ Next implementation slices:
   subset: inline-struct lists, tuple slots that require heap boxes,
   dicts/sets, tensors, and erased dynamic-boundary values where there is an
   explicit typed bridge.
-- Keep moving semantic normalization out of the evaluator and into `Ctfe_ir`
+- Keep moving semantic normalization out of the evaluator and into Blorp CTFE IR
   translation where it can be represented explicitly.
 - Dogfood compiler-owned tables in `compiler/blorp` once ordinary constants can
   express the required data without a special block.

@@ -9,6 +9,9 @@ import:
 	../compiler_ctfe_globals:
 		compiler_ctfe_eval_imported_program_global_envs,
 		compiler_ctfe_eval_program_global_env,
+		compiler_ctfe_evaluate_program_globals,
+		compiler_ctfe_rewrite_program_globals,
+		compiler_ctfe_rewrite_program_globals_with_import_bindings,
 	../compiler_ctfe_value: compiler_ctfe_int, compiler_ctfe_values_equal
 	../compiler_infer:
 		CompilerExprTypeOrigin(CompilerSynthesizedOrigin),
@@ -39,6 +42,7 @@ import:
 		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
 		CompilerTypedGlobalVarInfo,
 		CompilerTypedProgram,
+	../compiler_typecheck_state: CompilerImportBinding
 	test: TestSuite
 
 
@@ -132,6 +136,18 @@ pure func typed_program(decls: List[CompilerTypedDecl]) -> CompilerTypedProgram:
 		source = source_file(),
 		decls = decls,
 		diagnostics = []
+	}
+
+
+pure func import_binding(
+	local_name: String,
+	module_path: String,
+	original_name: Option[String],
+) -> CompilerImportBinding:
+	{
+		local_name = local_name,
+		module_path = module_path,
+		original_name = original_name
 	}
 
 
@@ -281,6 +297,202 @@ func test_eval_imported_program_global_envs_attach_to_context() -> Bool:
 			False
 
 
+pure func rewrite_globals_fixture() -> Result[CompilerTypedProgram, CompilerCtfeEvalError]:
+	program = typed_program([
+		typed_global_decl(
+			"A",
+			False,
+			add_expr(int_expr("1"), int_expr("2")),
+		),
+		typed_global_decl(
+			"RUNTIME",
+			True,
+			add_expr(int_expr("3"), int_expr("4")),
+		),
+	])
+	compiler_ctfe_rewrite_program_globals(
+		compiler_ctfe_context_empty(),
+		compiler_ctfe_env_empty(),
+		program,
+	)
+
+
+func test_rewrite_program_globals_materializes_typed_initializer() -> Bool:
+	result = rewrite_globals_fixture()
+
+	match result:
+		Ok(rewritten):
+			match rewritten.decls.get(0):
+				Some(CompilerTypedGlobalVarDecl(info)):
+					match info.value:
+						CompilerTypedIntLiteralExpr(text, _, _):
+							text == "3"
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_rewrite_program_globals_materializes_parsed_initializer() -> Bool:
+	result = rewrite_globals_fixture()
+
+	match result:
+		Ok(rewritten):
+			match rewritten.decls.get(0):
+				Some(CompilerTypedGlobalVarDecl(info)):
+					match info.decl.value:
+						ParsedIntLiteralExpr(text, _):
+							text == "3"
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_rewrite_program_globals_keeps_materialized_global_immutable() -> Bool:
+	result = rewrite_globals_fixture()
+
+	match result:
+		Ok(rewritten):
+			match rewritten.decls.get(0):
+				Some(CompilerTypedGlobalVarDecl(info)):
+					not info.decl.is_mutable
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_rewrite_program_globals_leaves_mutable_initializer_runtime() -> Bool:
+	result = rewrite_globals_fixture()
+
+	match result:
+		Ok(rewritten):
+			match rewritten.decls.get(1):
+				Some(CompilerTypedGlobalVarDecl(info)):
+					match info.value:
+						CompilerTypedBinaryExpr(_, _, _, _, _):
+							info.decl.is_mutable
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_rewrite_program_globals_uses_selective_imported_constant() -> Bool:
+	imported_programs: List[CompilerCtfeImportedProgram] = [
+		{
+			module_path = "dep",
+			program = typed_program([typed_global_decl("OFFSET", False, int_expr("41"))])
+		},
+	]
+	context_result = compiler_ctfe_eval_imported_program_global_envs(
+		compiler_ctfe_context_empty(),
+		imported_programs,
+	)
+	program = typed_program([typed_global_decl(
+				"ANSWER",
+				False,
+				add_expr(name_expr("OFFSET"), int_expr("1")),
+			)])
+
+	match context_result:
+		Ok(context):
+			result = compiler_ctfe_rewrite_program_globals_with_import_bindings(
+				context,
+				[import_binding("OFFSET", "dep", Some("OFFSET"))],
+				program,
+			)
+
+			match result:
+				Ok(rewritten):
+					match rewritten.decls.get(0):
+						Some(CompilerTypedGlobalVarDecl(info)):
+							match info.value:
+								CompilerTypedIntLiteralExpr(text, _, _):
+									text == "42"
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+func test_rewrite_program_globals_rejects_runtime_initialized_selective_import() -> Bool:
+	imported_programs: List[CompilerCtfeImportedProgram] = [
+		{
+			module_path = "dep",
+			program = typed_program([typed_global_decl("OFFSET", True, int_expr("41"))])
+		},
+	]
+	context_result = compiler_ctfe_eval_imported_program_global_envs(
+		compiler_ctfe_context_empty(),
+		imported_programs,
+	)
+	program = typed_program([typed_global_decl("ANSWER", False, name_expr("OFFSET"))])
+
+	match context_result:
+		Ok(context):
+			result = compiler_ctfe_rewrite_program_globals_with_import_bindings(
+				context,
+				[import_binding("OFFSET", "dep", Some("OFFSET"))],
+				program,
+			)
+
+			match result:
+				Err(error):
+					compiler_ctfe_eval_error_message(error) == (
+						"global constant initializer cannot reference imported value 'dep.OFFSET' "
+						+ "because it is not a compile-time constant"
+					)
+				Ok(_):
+					False
+		Err(_):
+			False
+
+
+func test_evaluate_program_globals_builds_context_and_rewrites_target() -> Bool:
+	imported_programs: List[CompilerCtfeImportedProgram] = [
+		{
+			module_path = "dep",
+			program = typed_program([typed_global_decl("OFFSET", False, int_expr("40"))])
+		},
+	]
+	program = typed_program([typed_global_decl(
+				"ANSWER",
+				False,
+				add_expr(name_expr("OFFSET"), int_expr("2")),
+			)])
+	result = compiler_ctfe_evaluate_program_globals(
+		program,
+		imported_programs,
+		[import_binding("OFFSET", "dep", Some("OFFSET"))],
+	)
+
+	match result:
+		Ok(rewritten):
+			match rewritten.decls.get(0):
+				Some(CompilerTypedGlobalVarDecl(info)):
+					match info.value:
+						CompilerTypedIntLiteralExpr(text, _, _):
+							text == "42"
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler CTFE global eval",
 	tests = [
@@ -298,6 +510,34 @@ tests: TestSuite = {
 		(
 			"eval imported program global envs attach to context",
 			test_eval_imported_program_global_envs_attach_to_context,
+		),
+		(
+			"rewrite program globals materializes typed initializer",
+			test_rewrite_program_globals_materializes_typed_initializer,
+		),
+		(
+			"rewrite program globals materializes parsed initializer",
+			test_rewrite_program_globals_materializes_parsed_initializer,
+		),
+		(
+			"rewrite program globals keeps materialized global immutable",
+			test_rewrite_program_globals_keeps_materialized_global_immutable,
+		),
+		(
+			"rewrite program globals leaves mutable initializer runtime",
+			test_rewrite_program_globals_leaves_mutable_initializer_runtime,
+		),
+		(
+			"rewrite program globals uses selective imported constant",
+			test_rewrite_program_globals_uses_selective_imported_constant,
+		),
+		(
+			"rewrite program globals rejects runtime initialized selective import",
+			test_rewrite_program_globals_rejects_runtime_initialized_selective_import,
+		),
+		(
+			"evaluate program globals builds context and rewrites target",
+			test_evaluate_program_globals_builds_context_and_rewrites_target,
 		),
 	]
 }

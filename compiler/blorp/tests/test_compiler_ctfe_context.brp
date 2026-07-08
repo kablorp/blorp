@@ -7,6 +7,7 @@ import:
 		compiler_ctfe_context_from_program,
 		compiler_ctfe_context_function_by_callable_id,
 		compiler_ctfe_context_imported_functions_by_source,
+		compiler_ctfe_context_module_alias,
 		compiler_ctfe_context_module_global_value,
 		compiler_ctfe_context_module_has_global_binding,
 		compiler_ctfe_context_nullary_constructor_reference,
@@ -14,9 +15,10 @@ import:
 	compiler_ctfe_env: compiler_ctfe_bind_global_value, compiler_ctfe_env_empty
 	compiler_ctfe_value: CompilerCtfeValue, compiler_ctfe_int, compiler_ctfe_values_equal
 	compiler_parsed_ast:
-		ParsedDecl(PrivateParsedDecl, UnionParsedDecl),
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, UnionParsedDecl),
 		ParsedFunctionDecl,
 		ParsedIdentifier,
+		ParsedImportDecl,
 		ParsedTypeExpr(ParsedNamedType),
 		ParsedUnionDecl,
 		ParsedVariantDecl,
@@ -69,6 +71,23 @@ pure func parsed_function(name: String) -> ParsedFunctionDecl:
 		is_pure = True,
 		annotations = [],
 		doc = None,
+		span = source_span()
+	}
+
+
+pure func optional_ident(text: Option[String]) -> Option[ParsedIdentifier]:
+	match text:
+		Some(value):
+			Some(ident(value))
+		None:
+			None
+
+
+pure func parsed_import(module_path: String, alias_name: Option[String]) -> ParsedImportDecl:
+	{
+		module_path = module_path,
+		module_alias = optional_ident(alias_name),
+		symbols = None,
 		span = source_span()
 	}
 
@@ -212,6 +231,56 @@ func test_context_groups_imported_functions_by_module_and_source() -> Bool:
 	render_functions.length() == 2 and missing_functions.length() == 0 and first_function_matches
 
 
+func test_context_groups_private_imported_functions() -> Bool:
+	imported_program = typed_program(
+		[CompilerTypedPrivateDecl(CompilerTypedFunctionDecl(typed_function("helper", Some(23))))],
+	)
+	context = compiler_ctfe_context_from_program(
+		typed_program([]),
+		[
+			{
+				module_path = "dep",
+				program = imported_program
+			},
+		],
+	)
+	helper_functions = compiler_ctfe_context_imported_functions_by_source(context, "dep", "helper")
+
+	match helper_functions.get(0):
+		Some(ctfe_function):
+			helper_functions.length() == 1 and ctfe_function.module_path == Some("dep")
+		None:
+			False
+
+
+func test_context_collects_module_aliases_from_import_blocks() -> Bool:
+	program = typed_program([
+		CompilerTypedParsedDecl(
+			ImportBlockParsedDecl(
+				[parsed_import("std/list", None), parsed_import("dep/math", Some("Math"))],
+				source_span(),
+			),
+		),
+	])
+	context = compiler_ctfe_context_from_program(program, [])
+
+	default_ok = match compiler_ctfe_context_module_alias(context, "list"):
+		Some(module_path):
+			module_path == "std/list"
+		None:
+			False
+
+	explicit_ok = match compiler_ctfe_context_module_alias(context, "Math"):
+		Some(module_path):
+			module_path == "dep/math"
+		None:
+			False
+
+	missing_ok = compiler_ctfe_context_module_alias(context, "dep").is_none()
+
+	default_ok and explicit_ok and missing_ok
+
+
 func test_context_module_global_env_lookup() -> Bool:
 	env = compiler_ctfe_bind_global_value(compiler_ctfe_env_empty(), "LIMIT", int_value(42))
 	context = compiler_ctfe_context_with_module_global_env(
@@ -249,6 +318,14 @@ tests: TestSuite = {
 		(
 			"context groups imported functions by module and source",
 			test_context_groups_imported_functions_by_module_and_source,
+		),
+		(
+			"context groups private imported functions",
+			test_context_groups_private_imported_functions,
+		),
+		(
+			"context collects module aliases from import blocks",
+			test_context_collects_module_aliases_from_import_blocks,
 		),
 		("context module global env lookup", test_context_module_global_env_lookup),
 	]

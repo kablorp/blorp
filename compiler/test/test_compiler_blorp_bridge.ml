@@ -664,9 +664,12 @@ let import_binding_json ?original_name local_name module_path =
     ]
 
 let typecheck_artifact ?(ast_phase = "typecheck_source") ?(type_errors = [])
-    ?(import_bindings = []) ?comments ?module_surface typed_program =
+    ?(import_bindings = []) ?ctfe_status ?comments ?module_surface typed_program =
   let optional_fields =
     (match comments with Some value -> [ ("comments", Lsp_json.Array value) ] | None -> [])
+    @ (match ctfe_status with
+      | Some value -> [ ("ctfe_status", Lsp_json.String value) ]
+      | None -> [])
     @
     match module_surface with
     | Some value -> [ ("module_surface", value) ]
@@ -692,6 +695,7 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
              import_binding_json "File" "std/file";
            ]
          ~comments:[ comment_json ~text:"-- typed" ~line:2 ~column:3 ~trailing:false ]
+         ~ctfe_status:"evaluated"
          ~module_surface:(module_surface_json ~exports:[ module_surface_symbol_json "main" ] "main")
          (typed_program_json []))
   in
@@ -708,6 +712,7 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
         typechecked_comments = [ comment ];
         typechecked_phase = Bridge.TypecheckSourceProgram;
         typechecked_module_surface = Some surface;
+        typechecked_ctfe_evaluated_by_blorp = true;
       } ->
       Alcotest.(check int)
         "decls" 0
@@ -717,6 +722,12 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
       Alcotest.(check string) "surface module" "main" surface.Module_surface.module_name
   | Ok _ -> Alcotest.fail "expected decoded typecheck artifact"
   | Error (_, message) -> Alcotest.fail message
+
+let test_typecheck_source_response_rejects_invalid_ctfe_status () =
+  bridge_success_json
+    (typecheck_artifact ~ctfe_status:"pending_ocaml" (typed_program_json []))
+  |> Blorp.Compiler_blorp_bridge.typecheck_source_response_json
+  |> expect_invalid_response_contains "unsupported ctfe_status `pending_ocaml`"
 
 let test_typecheck_source_response_preserves_errors_for_invalid_typed_tree ()
     =
@@ -739,6 +750,7 @@ let test_typecheck_source_response_preserves_errors_for_invalid_typed_tree ()
         Bridge.typechecked_errors =
           [ "Function 'bad' returns wrong type" ];
         typechecked_program;
+        typechecked_ctfe_evaluated_by_blorp = false;
         _;
       } ->
       Alcotest.(check int)
@@ -766,6 +778,19 @@ let check_typechecked_success result =
   | Error (code, message) ->
       Alcotest.fail
         ("expected typecheck bridge success, got " ^ code ^ ": " ^ message)
+
+let typed_program_global_int_literal typed_program name =
+  Blorp.Typed_ast.program_decls typed_program
+  |> List.find_map (fun decl ->
+         match Blorp.Typed_ast.decl_view decl with
+         | Blorp.Typed_ast.DeclVar var ->
+             let ast_var = Blorp.Typed_ast.var_ast var in
+             if ast_var.Ast.var_name = Some name then
+               match ast_var.var_value.expr_desc with
+               | Ast.ELiteral (Ast.LitInt value) -> Some value
+               | _ -> None
+             else None
+         | _ -> None)
 
 let test_typecheck_source_command_decodes_typed_artifact () =
   let source =
@@ -853,6 +878,36 @@ let test_typecheck_source_command_uses_import_modules () =
       artifact.typechecked_import_bindings
   in
   Alcotest.(check bool) "import alias binding" true has_alias_binding
+
+let test_typecheck_source_command_evaluates_imported_constant_ctfe () =
+  let import_module =
+    {
+      Bridge.typecheck_import_path = "dep.brp";
+      typecheck_import_module_name = "dep";
+      typecheck_import_module_path = "dep";
+      typecheck_import_text = "OFFSET: Int = 41\n";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let source =
+    "import:\n\
+    \    dep: OFFSET\n\n\
+     VALUE: Int = OFFSET + 1\n"
+  in
+  let artifact =
+    check_typechecked_success
+      (Bridge.typecheck_source_via_command_with_imports_policy
+         ~resolved_imports:[] ~origin:Bridge.CliFrontendUserModule
+         ~allow_debug_only_calls:false ~import_modules:[ import_module ]
+         ~path:"main.brp"
+         ~module_name:"main" ~text:source)
+  in
+  Alcotest.(check bool)
+    "ctfe evaluated by Blorp" true
+    artifact.typechecked_ctfe_evaluated_by_blorp;
+  Alcotest.(check (option int64))
+    "imported ctfe value" (Some 42L)
+    (typed_program_global_int_literal artifact.typechecked_program "VALUE")
 
 let test_parse_sources_response_decodes_items () =
   let response =
@@ -1790,6 +1845,9 @@ let suite =
           "typecheck_source response decodes typed program artifact" `Quick
           test_typecheck_source_response_decodes_typed_program_artifact;
         Alcotest.test_case
+          "typecheck_source response rejects invalid CTFE status" `Quick
+          test_typecheck_source_response_rejects_invalid_ctfe_status;
+        Alcotest.test_case
           "typecheck_source response preserves errors for invalid typed tree"
           `Quick
           test_typecheck_source_response_preserves_errors_for_invalid_typed_tree;
@@ -1806,6 +1864,9 @@ let suite =
           test_typecheck_source_command_decodes_annotated_global;
         Alcotest.test_case "typecheck_source command uses import modules"
           `Quick test_typecheck_source_command_uses_import_modules;
+        Alcotest.test_case
+          "typecheck_source command evaluates imported constant CTFE" `Quick
+          test_typecheck_source_command_evaluates_imported_constant_ctfe;
         Alcotest.test_case "parse_sources response decodes items" `Quick
           test_parse_sources_response_decodes_items;
         Alcotest.test_case "CLI run response decodes handled" `Quick

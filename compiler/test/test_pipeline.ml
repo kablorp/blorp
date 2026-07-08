@@ -414,6 +414,91 @@ let test_blorp_bridge_typecheck_runs_ctfe () =
                 ("expected Blorp bridge typecheck to run CTFE:\n"
                ^ format_errors errors)))
 
+let test_blorp_bridge_typecheck_runs_imported_constant_ctfe () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_typecheck_bridge_import_ctfe" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    ./dep: OFFSET\n\n\
+             VALUE: Int = OFFSET + 1\n"
+          in
+          let dep_source = "OFFSET: Int = 41\n" in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"./dep"
+          in
+          let preloaded_module_graph =
+            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+              ~dep_path ~dep_source ~dep_parsed
+          in
+          match
+            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+              ~preloaded_module_graph
+          with
+          | Ok typed_program -> (
+              match typed_program_global_int_literal typed_program "VALUE" with
+              | Some value ->
+                  Alcotest.(check int64) "imported ctfe value" 42L value
+              | None ->
+                  Alcotest.fail
+                    "expected imported constant CTFE to materialize VALUE")
+          | Error errors ->
+              Alcotest.fail
+                ("expected imported constant CTFE to typecheck:\n"
+               ^ format_errors errors)))
+
+let test_blorp_bridge_typecheck_runs_imported_function_ctfe () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_typecheck_bridge_import_fn_ctfe" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    ./dep as Dep\n\n\
+             VALUE: Int = Dep.answer() + 1\n"
+          in
+          let dep_source =
+            "private pure func add_one(value: Int) -> Int:\n\
+            \    value + 1\n\n\
+             pure func answer() -> Int:\n\
+            \    add_one(40)\n"
+          in
+          write_file main_path main_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"./dep"
+          in
+          let preloaded_module_graph =
+            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
+              ~dep_path ~dep_source ~dep_parsed
+          in
+          match
+            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+              ~preloaded_module_graph
+          with
+          | Ok typed_program -> (
+              match typed_program_global_int_literal typed_program "VALUE" with
+              | Some value ->
+                  Alcotest.(check int64) "imported function ctfe value" 42L value
+              | None ->
+                  Alcotest.fail
+                    "expected Blorp CTFE to materialize imported function VALUE")
+          | Error errors ->
+              Alcotest.fail
+                ("expected imported function CTFE to typecheck:\n"
+               ^ format_errors errors)))
+
 let test_blorp_bridge_compile_reaches_core () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_pipeline_compile_bridge_core" (fun dir ->
@@ -490,7 +575,8 @@ let test_blorp_bridge_compile_types_std_support_modules () =
           let main_path = Filename.concat dir "main.brp" in
           let main_source =
             "func main(args: List[String]) -> Int:\n\
-            \    print(True)\n\
+            \    msg: String = to_string(True)\n\
+            \    print(msg)\n\
             \    0\n"
           in
           write_file main_path main_source;
@@ -509,7 +595,7 @@ let test_blorp_bridge_compile_types_std_support_modules () =
           | Ok (Pipeline.Compiled { c_code; _ }) ->
               Alcotest.(check bool)
                 "generated C contains bool support" true
-                (contains c_code "std_bool")
+                (contains c_code "Stringable_to_string_Bool")
           | Ok (Pipeline.Stopped_at _) ->
               Alcotest.fail
                 "Blorp bridge compile preview unexpectedly stopped early"
@@ -1659,6 +1745,12 @@ let suite =
           `Quick test_blorp_bridge_typecheck_reports_type_errors;
         Alcotest.test_case "Blorp bridge typecheck runs CTFE" `Quick
           test_blorp_bridge_typecheck_runs_ctfe;
+        Alcotest.test_case
+          "Blorp bridge typecheck runs imported constant CTFE" `Quick
+          test_blorp_bridge_typecheck_runs_imported_constant_ctfe;
+        Alcotest.test_case
+          "Blorp bridge typecheck runs imported function CTFE" `Quick
+          test_blorp_bridge_typecheck_runs_imported_function_ctfe;
         Alcotest.test_case "Blorp bridge compile reaches Core" `Quick
           test_blorp_bridge_compile_reaches_core;
         Alcotest.test_case

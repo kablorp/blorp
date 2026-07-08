@@ -20,9 +20,9 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
 Blorp executable / CLI planning / source graph discovery / source reads / parse
-  -> JSON frontend module graph and typed-program bridge
-  -> OCaml host command execution / module validation / CTFE
-  -> decoded Blorp typed AST -> OCaml Core lowering
+  -> JSON frontend module graph and Blorp typed-program/CTFE bridge
+  -> OCaml host command execution / module validation / artifact decode
+  -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
   -> OCaml Core pipeline through Perceus
   -> JSON post-Perceus Core
   -> Blorp reuse / closure / resource / fairness / prepare / prepared reuse
@@ -110,7 +110,7 @@ For every checkpoint, use this workflow:
 Goal: make every remaining OCaml-to-Blorp call explicit and prevent new bridge
 side channels while the boundary moves.
 
-OCaml references:
+OCaml references still needed at this checkpoint:
 
 - `compiler/lib/compiler_blorp_bridge.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
@@ -932,7 +932,7 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-OCaml CTFE and Core lowering. Legacy direct `Pipeline.compile` /
+Core lowering. Legacy direct `Pipeline.compile` /
 `Pipeline.typecheck_only` APIs and some tooling/test paths can still use the
 OCaml parser/typechecker until their callers move to an explicit Blorp frontend
 graph.
@@ -1345,28 +1345,20 @@ OCaml references:
   - `of_ast_program`
   - `of_ast_program_with_sources`
 - `compiler/lib/typed_ast_debug.ml`
-- `compiler/lib/ctfe*.ml`
-  - `ctfe.ml`
-  - `ctfe_context.ml`
-  - `ctfe_env.ml`
-  - `ctfe_error.ml`
-  - `ctfe_intrinsic.ml`
-  - `ctfe_ir.ml`
-  - `ctfe_materialize.ml`
-  - `ctfe_operator.ml`
-  - `ctfe_pattern.ml`
-  - `ctfe_std_eval.ml`
-  - `ctfe_value.ml`
-  - `ctfe_value_ops.ml`
 - `compiler/lib/type_metadata_format.ml`
 - `compiler/lib/operation_result_metadata.ml`
+
+Deleted at this checkpoint:
+
+- `compiler/lib/ctfe*.ml`
+- `compiler/test/test_ctfe_*.ml`
 
 Blorp references:
 
 - future `compiler_typed_ast.brp`
 - `compiler_typed_ast_json.brp`
 - `compiler_typecheck_bridge.brp`
-- future `compiler_ctfe*.brp`
+- `compiler_ctfe*.brp`
 - `compiler_type_metadata.brp`
 - future `compiler_type_metadata_format.brp`
 
@@ -1416,10 +1408,9 @@ Current status:
   stages do not infer call provenance from names.
 - Blorp now has structured typed expression, typed declaration, and
   `CompilerTypedProgram` JSON projections. The production source-command path
-  now consumes this temporary handoff artifact before OCaml CTFE and Core
-  lowering. Typed function metadata now carries the registered callable id, so
-  decoded function declarations preserve the same direct-call identity Core
-  lowering expects.
+  now consumes this handoff artifact directly before Core lowering. Typed
+  function metadata now carries the registered callable id, so decoded function
+  declarations preserve the same direct-call identity Core lowering expects.
 - Blorp now has a dedicated `typecheck_source` bridge artifact producer in
   `compiler_typecheck_bridge.brp`. It typechecks a single finalized source
   program and returns `typed_program`, `type_errors`, and `module_surface`
@@ -1481,8 +1472,10 @@ Current status:
   The request protocol also has an explicit `import_modules` field for callers
   that already own graph context: each supplied module is parsed into a Blorp
   module surface and passed through `compiler_typecheck_program_with_import_surfaces`.
-  This is the normal source-command handoff boundary for `check`, `compile`,
-  and `run`; CTFE and Core lowering remain on the OCaml side of that boundary.
+  This was the normal source-command handoff boundary for `check`, `compile`,
+  and `run` before the source-command path moved to the frontend graph bridge.
+  CTFE now runs in the Blorp typed-program bridge; Core lowering is the next
+  OCaml-owned phase on the right side of that boundary.
 - Blorp typechecking now centralizes import bookkeeping in
   `compiler_imports.brp`. The single-source typed bridge uses the explicit
   syntax-only import collector so it can report qualified module aliases,
@@ -1509,13 +1502,13 @@ Current status:
 - `Pipeline.typecheck_only_typed_with_blorp_bridge` is the graph-backed Blorp
   typecheck handoff used by source-command checks. It builds explicit
   import-module payloads from graph edges, materializes graph-loaded dependency
-  module typed declarations/import bindings into `Modules`, and runs OCaml CTFE
-  over decoded dependency and target typed programs before returning either the
-  post-CTFE target typed program or Blorp typecheck/CTFE diagnostics.
+  module typed declarations/import bindings into `Modules`, and requires the
+  decoded Blorp artifact to have already run CTFE before returning the target
+  typed program or Blorp typecheck/CTFE diagnostics.
 - `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
   compile boundary: it consumes the same Blorp frontend graph, decodes the
-  Blorp typed-program artifact, runs CTFE, populates dependency typed-module
-  caches, and then enters the shared OCaml Core/codegen handoff without
+  Blorp typed-program artifact, populates dependency typed-module caches, and
+  then enters the shared OCaml Core/codegen handoff without
   returning to the OCaml typechecker.
 - Direct-source `Pipeline.compile`, `Pipeline.typecheck_only`,
   `Pipeline.typecheck_only_typed`, and module-only typecheck APIs are now
@@ -1535,50 +1528,120 @@ Current status:
   environment layer for CTFE. It models global/local bindings, unavailable
   global reasons, immutable-assignment rejection, mutable local assignment as an
   explicit updated environment, and user-facing environment error messages
-  without copying OCaml's mutable-cell implementation detail.
+  without copying OCaml's mutable-cell implementation detail. It also provides
+  scoped-env projection for loop and branch bodies, preserving updates to
+  pre-existing bindings while dropping locals introduced in the scoped body.
 - Blorp now also has `compiler_ctfe_context.brp`, the metadata context layer
   for CTFE. It indexes typed functions by callable id, imported function groups
-  by module/source name, union constructor arities/nullary references, and
-  module global environments from `CompilerTypedProgram` values. It deliberately
-  does not evaluate expressions yet; it gives the upcoming evaluator a typed,
-  test-covered lookup surface instead of reaching into the typed AST ad hoc.
+  by module/source name, union constructor arities/nullary references, module
+  aliases from import blocks, and module global environments from
+  `CompilerTypedProgram` values. It deliberately does not evaluate expressions
+  yet; it gives the upcoming evaluator a typed, test-covered lookup surface
+  instead of reaching into the typed AST ad hoc.
 - Blorp now also has `compiler_ctfe_globals.brp`, the source-order global
   availability layer for CTFE. It identifies typed global declarations,
   preserves private-global metadata, treats mutable top-level `var` bindings as
   runtime-initialized, binds immutable globals as later CTFE candidates, and can
   answer whether imported typed programs declare a global by module path/name.
+  It also constructs the initial target CTFE environment from explicit
+  `CompilerImportBinding` values, so selective imported constants are available
+  by local name and selected runtime-initialized globals remain unavailable with
+  an imported-global diagnostic.
+- Blorp now also has `compiler_ctfe_value_ops.brp` for shared Option/Result
+  carrier construction and state decoding over CTFE constructor values. This
+  keeps `?=` and later std Option/Result intrinsic evaluation from duplicating
+  constructor-shape checks in the evaluator.
+- Blorp now also has `compiler_ctfe_intrinsic.brp` for centralized admission
+  of compiler-owned std operations during CTFE. The supported subset covers
+  deterministic calls over `std/string`, `std/list`, `std/option`, and
+  `std/result`, including callback-taking list/Option/Result helpers when the
+  callback is a named pure local function reference. Keeping intrinsic
+  admission separate from evaluation keeps future expansion table-driven
+  instead of scattering source-name checks through the evaluator.
+- Blorp now also has `compiler_ctfe_pattern.brp` for matching typed patterns
+  against CTFE values. It covers wildcard/name/literal patterns, tuple/list
+  patterns with spread bindings, constructor and qualified-constructor patterns,
+  nullary-constructor name patterns using `CompilerCtfeContext`, and or-pattern
+  fallback without pushing pattern semantics into expression evaluation.
 - Blorp now also has the first `compiler_ctfe_ir.brp` slice: a normalized,
   typed CTFE expression IR for literals, names/reference kinds, transparent
   wrappers, unary/binary/logical expressions, tuples, lists, vectors, records,
   dicts, block expressions with local `let`/`var` bindings and local
-  assignment items, tuple-destructuring block items, and void. Unsupported
-  forms fail at the translation boundary with a structured error, matching the
-  OCaml CTFE architecture and giving later evaluator work a smaller target than
+  assignment items, tuple-destructuring block items, `?=` block items, and
+  field access classified as record, tuple, range, or imported-global access
+  before evaluation. Imported-global access uses explicit module aliases
+  collected from import blocks in `CompilerCtfeContext`; the evaluator reads
+  those values from attached module-global environments instead of guessing
+  from identifier names. It also translates match expressions into explicit
+  CTFE IR match cases while preserving typed patterns for the dedicated pattern
+  binder, translates `while`, `for`, tuple-binder `for`, `break`, and
+  `continue` into explicit CTFE IR control forms, and translates call
+  expressions into explicit local, imported, constructor, unresolved, impure, or
+  unsupported CTFE call kinds. Unsupported forms fail at the
+  translation boundary with a structured error, preserving the old evaluator
+  boundary while giving later evaluator work a smaller target than
   `CompilerTypedExpr`.
 - Blorp now also has the first `compiler_ctfe_eval.brp` slice: an evaluator for
   the supported CTFE IR subset. It evaluates literals, environment lookups,
   nullary constructors, transparent wrappers, unary/binary/logical expressions
-  with short-circuiting, `if`, ranges, record field access, record updates,
-  tuples, lists, vectors, records, dicts, block-local bindings, local
-  assignment updates, tuple destructuring, and void while preserving separate
-  translation, environment, value/operator, invalid-value, and unsupported
-  error categories.
+  with short-circuiting, `if`, ranges, record/tuple/range field access, record
+  updates, tuples, lists, vectors, records, dicts, block-local bindings, local
+  assignment updates, tuple destructuring, `?=` continuation/propagation for
+  Option and Result constructor values, finalized typed string interpolation
+  over primitive CTFE values, match expressions with pattern-bound case scopes,
+  local and imported pure source function calls with name/wildcard/tuple
+  parameter binding, constructor calls, qualified imported-global reads, and
+  module-global lookup for imported function bodies. It also evaluates the
+  imported std intrinsic subset for strings, lists, Option, and Result while
+  preserving separate translation, environment, value/operator, invalid-value,
+  and unsupported error categories. Named pure local function references now
+  materialize as CTFE function-reference values, so callback-taking std helpers
+  can call them through the ordinary pure local function-call path. The
+  evaluator now also handles `while`, range/list `for`, and tuple-binder
+  list `for` loops with `break`/`continue`, threading explicit value
+  environments through loop bodies so assignments to outer mutable bindings
+  persist without leaking loop-body locals or loop binders. Builtins, trait
+  calls, foreign calls, closures, impl-method calls, and captured lambda
+  callbacks remain unsupported until their values have clean Blorp
+  representations.
+- Blorp now also has `compiler_ctfe_materialize.brp` for materialization from
+  evaluated CTFE values back into source-shaped and typed expressions. It
+  covers scalar literals, tuples, lists, vectors, dicts, records, ranges, void,
+  nullary constructors, and synthesized constructor calls with direct
+  constructor callable metadata. It also materializes named pure local function
+  references back into coherent typed name expressions with direct-call
+  metadata. It can also rebuild coherent `CompilerTypedGlobalVarInfo` values by
+  updating both the parsed initializer and typed initializer.
 - Blorp now also evaluates source-order global CTFE environments in
   `compiler_ctfe_globals.brp`. Immutable globals are evaluated against an
   environment that marks the current binding as self-unavailable, earlier
   evaluated globals as available, later globals as unavailable, and mutable
   top-level `var` bindings as runtime-initialized. Imported typed programs can
-  be evaluated into module global envs and attached back to `CompilerCtfeContext`.
+  be evaluated into module global envs and attached back to
+  `CompilerCtfeContext`. Blorp also has a whole-program global rewrite helper
+  that evaluates immutable global initializers in source order, materializes
+  them back into typed declarations, and leaves mutable top-level `var`
+  declarations on the runtime path. A higher-level helper owns the CTFE global
+  boundary by building context from target/imported typed programs, evaluating
+  imported module global environments, binding target import bindings, and
+  rewriting the target program.
+- The `typecheck_source` bridge now opportunistically runs the Blorp global
+  CTFE rewrite after successful typechecking. It emits a `ctfe_status` protocol
+  field with `evaluated` or `not_run`; successful source-command typecheck
+  artifacts must report `evaluated`. Unsupported CTFE forms surface as Blorp
+  typecheck diagnostics instead of falling back to OCaml. Self-contained
+  immutable globals, selected constants from explicit leaf user-module imports,
+  and imported pure function calls evaluate in Blorp.
 - The Blorp executable (`compiler_cli_main.brp`) now runs CLI planning and
   source graph construction directly, writes the existing CLI plan JSON
   artifact to a temporary file, and invokes the private OCaml host only to
   execute that plan. The host no longer needs to ask a Blorp helper to interpret
   normal user CLI arguments.
-- Immediate remaining checkpoint work is typed-frontier closure, then CTFE and
-  final typed AST ownership. OCaml still evaluates compile-time values after
-  decoding the Blorp typed artifact, and legacy direct pipeline APIs still need
-  explicit frontend graphs or explicit legacy/tooling classification before
-  their OCaml typechecker paths can be retired.
+- Immediate remaining checkpoint work is typed-frontier closure, broader
+  import-aware CTFE parity, and final typed AST ownership. OCaml CTFE has been
+  removed; legacy direct pipeline APIs now produce finalized typed ASTs without
+  a compile-time global rewrite and should continue moving to explicit Blorp
+  frontend graphs.
 - The OCaml test runner remains one of those classified legacy paths. It
   discovers test files, rewrites `TestSuite` and doctest harnesses, and compiles
   generated sources after CLI planning has already delegated to test mode. Do
@@ -1617,7 +1680,7 @@ Tests:
 
 - `compiler/test/test_typed_ast.ml`
 - `compiler/test/test_typed_ast_debug.ml`
-- `compiler/test/test_ctfe_*.ml`
+- `compiler/blorp/tests/test_compiler_ctfe_*.brp`
 - `tests/test_compiler/typecheck/should_pass/compile_time_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/global_constant_*.brp`
 - `compiler/blorp/tests/test_compiler_typecheck_bridge.brp`
@@ -1626,8 +1689,8 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml typed AST construction and CTFE after Blorp typed-program output
-  is authoritative and Core lowering consumes it.
+- Delete remaining OCaml typed AST construction after Blorp typed-program output
+  is authoritative for all source/tooling paths and Core lowering consumes it.
 
 ## Checkpoint 8: Core Lowering, Flattening, FFI Boundary, And Layout Setup
 
@@ -1676,9 +1739,9 @@ Blorp references:
 
 Implementation steps:
 
-- Do not start Blorp Core lowering from an OCaml-post-CTFE typed AST unless we
-  deliberately accept another temporary bridge. CTFE/final typed-AST ownership
-  is the step that keeps the source-to-Core boundary contiguous.
+- Do not start Blorp Core lowering from an OCaml-reconstructed typed AST unless
+  we deliberately accept another temporary bridge. Final typed-AST ownership is
+  the step that keeps the source-to-Core boundary contiguous.
 - Port `Core` data constructors needed by lowering before lowering logic.
 - Port lowering mechanically from typed expression shapes to Core:
   identifiers, literals, calls, fields, control flow, matches, loops, blocks,

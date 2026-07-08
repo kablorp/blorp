@@ -13,7 +13,11 @@ import:
 		CompilerCtfeConstructorInfo,
 		CompilerCtfeValue,
 		compiler_ctfe_constructor_info,
-	compiler_parsed_ast: ParsedDecl(PrivateParsedDecl, UnionParsedDecl), ParsedUnionDecl
+	compiler_imports: compiler_import_default_alias
+	compiler_parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, UnionParsedDecl),
+		ParsedImportDecl,
+		ParsedUnionDecl,
 	compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
@@ -50,6 +54,12 @@ record CompilerCtfeModuleGlobalEnv {
 }
 
 
+record CompilerCtfeModuleAlias {
+	local_name: String,
+	module_path: String
+}
+
+
 record CompilerCtfeNullaryConstructorReference {
 	name: String,
 	parent_type: String,
@@ -61,6 +71,7 @@ record CompilerCtfeContext {
 	functions: List[(Int, CompilerCtfeFunction)],
 	imported_functions: List[CompilerCtfeImportedFunctionGroup],
 	constructors: List[(String, CompilerCtfeConstructorInfo)],
+	module_aliases: List[CompilerCtfeModuleAlias],
 	module_global_envs: List[CompilerCtfeModuleGlobalEnv]
 }
 
@@ -70,6 +81,7 @@ pure func compiler_ctfe_context_empty() -> CompilerCtfeContext:
 		functions = [],
 		imported_functions = [],
 		constructors = [],
+		module_aliases = [],
 		module_global_envs = []
 	}
 
@@ -186,6 +198,20 @@ pure func compiler_ctfe_context_module_global_value(
 			None
 
 
+pure func compiler_ctfe_context_module_alias(
+	context: CompilerCtfeContext,
+	local_name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for module_alias in context.module_aliases:
+		if result.is_none() and module_alias.local_name == local_name:
+			result = Some(module_alias.module_path)
+			break
+
+	result
+
+
 pure func compiler_ctfe_context_module_has_global_binding(
 	context: CompilerCtfeContext,
 	module_path: String,
@@ -195,6 +221,33 @@ pure func compiler_ctfe_context_module_has_global_binding(
 		compiler_ctfe_context_module_global_env(context, module_path),
 		name,
 	)
+
+
+pure func compiler_ctfe_context_with_module_alias(
+	context: CompilerCtfeContext,
+	local_name: String,
+	module_path: String,
+) -> CompilerCtfeContext:
+	var replaced: Bool = False
+	var aliases: List[CompilerCtfeModuleAlias] = []
+
+	for module_alias in context.module_aliases:
+		if not replaced and module_alias.local_name == local_name:
+			aliases = aliases.append({
+				local_name = local_name,
+				module_path = module_path,
+			})
+			replaced = True
+		else:
+			aliases = aliases.append(module_alias)
+
+	if not replaced:
+		aliases = aliases.append({
+			local_name = local_name,
+			module_path = module_path,
+		})
+
+	{ context | module_aliases = aliases }
 
 
 pure func compiler_ctfe_context_with_module_global_env(
@@ -222,6 +275,74 @@ pure func compiler_ctfe_context_with_module_global_env(
 		})
 
 	{ context | module_global_envs = module_envs }
+
+
+private pure func compiler_ctfe_import_alias(import_decl: ParsedImportDecl) -> String:
+	match import_decl.module_alias:
+		Some(alias_name):
+			alias_name.text
+		None:
+			compiler_import_default_alias(import_decl.module_path)
+
+
+private pure func compiler_ctfe_import_registers_module_alias(
+	import_decl: ParsedImportDecl,
+) -> Bool:
+	match import_decl.symbols:
+		Some(_):
+			import_decl.module_alias.is_some()
+		None:
+			True
+
+
+private pure func compiler_ctfe_collect_import_aliases_from_imports(
+	aliases: List[CompilerCtfeModuleAlias],
+	imports: List[ParsedImportDecl],
+) -> List[CompilerCtfeModuleAlias]:
+	var result = aliases
+
+	for import_decl in imports:
+		if compiler_ctfe_import_registers_module_alias(import_decl):
+			result = result.append({
+				local_name = compiler_ctfe_import_alias(import_decl),
+				module_path = import_decl.module_path,
+			})
+
+	result
+
+
+private pure func compiler_ctfe_collect_decl_import_aliases(
+	aliases: List[CompilerCtfeModuleAlias],
+	decl: CompilerTypedDecl,
+) -> List[CompilerCtfeModuleAlias]:
+	match decl:
+		CompilerTypedParsedDecl(parsed_decl):
+			match parsed_decl:
+				ImportBlockParsedDecl(imports, _):
+					compiler_ctfe_collect_import_aliases_from_imports(aliases, imports)
+				PrivateParsedDecl(inner, _):
+					compiler_ctfe_collect_decl_import_aliases(
+						aliases,
+						CompilerTypedParsedDecl(inner),
+					)
+				_:
+					aliases
+		CompilerTypedPrivateDecl(inner):
+			compiler_ctfe_collect_decl_import_aliases(aliases, inner)
+		_:
+			aliases
+
+
+private pure func compiler_ctfe_collect_program_import_aliases(
+	aliases: List[CompilerCtfeModuleAlias],
+	program: CompilerTypedProgram,
+) -> List[CompilerCtfeModuleAlias]:
+	var result = aliases
+
+	for decl in program.decls:
+		result = compiler_ctfe_collect_decl_import_aliases(result, decl)
+
+	result
 
 
 private pure func compiler_ctfe_function_from_info(
@@ -318,21 +439,39 @@ private pure func compiler_ctfe_collect_imported_function_groups(
 	var result = groups
 
 	for decl in imported.program.decls:
-		match decl:
-			CompilerTypedFunctionDecl(info):
-				match compiler_ctfe_function_from_info(info, Some(imported.module_path)):
-					Some(ctfe_function):
-						result = compiler_ctfe_add_imported_function_group(
-							result,
-							imported.module_path,
-							ctfe_function,
-						)
-					None:
-						void
-			_:
-				void
+		result = compiler_ctfe_collect_imported_decl_function_groups(
+			result,
+			imported.module_path,
+			decl,
+		)
 
 	result
+
+
+private pure func compiler_ctfe_collect_imported_decl_function_groups(
+	groups: List[CompilerCtfeImportedFunctionGroup],
+	module_path: String,
+	decl: CompilerTypedDecl,
+) -> List[CompilerCtfeImportedFunctionGroup]:
+	match decl:
+		CompilerTypedFunctionDecl(info):
+			match compiler_ctfe_function_from_info(info, Some(module_path)):
+				Some(ctfe_function):
+					compiler_ctfe_add_imported_function_group(
+						groups,
+						module_path,
+						ctfe_function,
+					)
+				None:
+					groups
+		CompilerTypedPrivateDecl(inner):
+			compiler_ctfe_collect_imported_decl_function_groups(
+				groups,
+				module_path,
+				inner,
+			)
+		_:
+			groups
 
 
 private pure func compiler_ctfe_collect_union_constructors(
@@ -413,9 +552,12 @@ pure func compiler_ctfe_context_from_program(
 	for imported in imported_programs:
 		imported_groups = compiler_ctfe_collect_imported_function_groups(imported_groups, imported)
 
+	aliases = compiler_ctfe_collect_program_import_aliases([], program)
+
 	{
 		functions = functions,
 		imported_functions = imported_groups,
 		constructors = constructors,
+		module_aliases = aliases,
 		module_global_envs = []
 	}

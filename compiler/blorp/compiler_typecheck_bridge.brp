@@ -20,6 +20,9 @@ import:
 			CompilerStdlibModule,
 			CompilerUserModule,
 		),
+	compiler_ctfe_context: CompilerCtfeImportedProgram
+	compiler_ctfe_eval: compiler_ctfe_eval_error_message
+	compiler_ctfe_globals: compiler_ctfe_evaluate_program_globals
 	compiler_imports: CompilerImportableModule, compiler_importable_module
 	compiler_lexer: compiler_lex
 	compiler_module_surface: module_surface_for_program
@@ -29,16 +32,23 @@ import:
 		ParsedImportDecl,
 		ParsedProgram,
 		ParsedProgramPhase(TypecheckSourceProgram),
-		parsed_program_phase_name
+		parsed_program_phase_name,
 	compiler_parser: parse_compiler_source
 	compiler_source: CompilerSourceFile, compiler_source_file
 	compiler_source_ast_finalize: finalize_typecheck_source_program
 	compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
-	compiler_typecheck_decl: compiler_typecheck_program, compiler_typecheck_program_with_import_modules
+	compiler_typecheck_decl:
+		CompilerTypecheckProgramResult,
+		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
+		CompilerTypedProgram,
+		compiler_typecheck_program,
+		compiler_typecheck_program_with_import_modules,
 	compiler_typecheck_state:
 		CompilerImportBinding,
+		CompilerTypecheckState,
+		compiler_typecheck_state_add_error,
 		compiler_typecheck_state_for_origin,
-		compiler_typecheck_state_with_debug_calls
+		compiler_typecheck_state_with_debug_calls,
 	compiler_typed_ast_json: compiler_typed_program_to_json
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -72,6 +82,18 @@ record TypecheckResolvedImport {
 }
 
 
+union TypecheckCtfeStatus:
+	TypecheckCtfeEvaluated
+	TypecheckCtfeNotRun
+
+
+record TypecheckCtfeArtifact {
+	program: CompilerTypedProgram,
+	state: CompilerTypecheckState,
+	status: TypecheckCtfeStatus
+}
+
+
 private pure func owned_string(text: String) -> String:
 	text.substring(0, text.length())
 
@@ -102,9 +124,9 @@ private pure func dispatch_error_message(error: TypecheckBridgeDispatchError) ->
 
 private pure func dispatch_error_json(error: TypecheckBridgeDispatchError) -> JsonValue:
 	JsonObject([("schema", schema_json()), ("ok", JsonBool(False)), ("error", JsonObject([
-				("code", JsonString(dispatch_error_code(error))),
-				("message", JsonString(dispatch_error_message(error))),
-			]))])
+			("code", JsonString(dispatch_error_code(error))),
+			("message", JsonString(dispatch_error_message(error))),
+		]))])
 
 
 private pure func request_body(envelope: BridgeEnvelope) -> JsonValue:
@@ -249,7 +271,7 @@ private pure func resolved_import_from_json(
 				from_path = from_path,
 				from_module = from_module,
 				import_path = import_path,
-				resolved_module = resolved_module
+				resolved_module = resolved_module,
 			})
 		_:
 			Err(ExpectedRequestField("resolved_imports item", "an object"))
@@ -326,7 +348,6 @@ private pure func source_comment_jsons(source: CompilerSourceFile) -> JsonValue:
 	JsonVector(comments)
 
 
-
 private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
 	match value:
 		Some(text):
@@ -398,12 +419,9 @@ private pure func rewrite_import_decl_paths(
 	imports: List[ParsedImportDecl],
 ) -> List[ParsedImportDecl]:
 	imports.map(
-		func(import_decl): rewrite_import_decl_path(
-			from_path,
-			from_module,
-			resolved_imports,
+		func(
 			import_decl,
-		),
+		): rewrite_import_decl_path(from_path, from_module, resolved_imports, import_decl),
 	)
 
 
@@ -436,21 +454,15 @@ private pure func rewrite_program_import_paths(
 ) -> ParsedProgram:
 	{ program |
 		decls = program.decls.map(
-			func(decl): rewrite_decl_import_paths(
-				from_path,
-				from_module,
-				resolved_imports,
-				decl,
-			),
+			func(decl): rewrite_decl_import_paths(from_path, from_module, resolved_imports, decl),
 		)
 	}
 
 
-
-private pure func importable_module_from_request(
+private pure func import_program_from_request(
 	module: TypecheckImportModule,
 	resolved_imports: List[TypecheckResolvedImport],
-) -> CompilerImportableModule:
+) -> ParsedProgram:
 	source = compiler_source_file(module.path, module.module_name, module.text)
 	raw_program = parse_compiler_source(source)
 	rewritten = rewrite_program_import_paths(
@@ -459,7 +471,15 @@ private pure func importable_module_from_request(
 		resolved_imports,
 		raw_program,
 	)
-	final_program = parsed_program_with_owned_decls(finalize_typecheck_source_program(rewritten))
+
+	parsed_program_with_owned_decls(finalize_typecheck_source_program(rewritten))
+
+
+private pure func importable_module_from_request(
+	module: TypecheckImportModule,
+	resolved_imports: List[TypecheckResolvedImport],
+) -> CompilerImportableModule:
+	final_program = import_program_from_request(module, resolved_imports)
 
 	compiler_importable_module(
 		module.module_path,
@@ -476,6 +496,217 @@ private pure func importable_modules_from_request(
 	modules.map(func(module): importable_module_from_request(module, resolved_imports))
 
 
+private pure func typed_decl_has_ctfe_global(decl: CompilerTypedDecl) -> Bool:
+	match decl:
+		CompilerTypedGlobalVarDecl(info):
+			not info.decl.is_mutable
+		CompilerTypedPrivateDecl(inner):
+			typed_decl_has_ctfe_global(inner)
+		_:
+			False
+
+
+private pure func typed_program_has_ctfe_globals(program: CompilerTypedProgram) -> Bool:
+	program.decls.any(typed_decl_has_ctfe_global)
+
+
+private pure func importable_modules_except_path(
+	modules: List[CompilerImportableModule],
+	module_path: String,
+) -> List[CompilerImportableModule]:
+	modules.filter(func(module): module.module_path != module_path)
+
+
+private pure func explicit_import_paths_from_imports(
+	imports: List[ParsedImportDecl],
+) -> List[String]:
+	imports.map(func(import_decl): import_decl.module_path)
+
+
+private pure func explicit_import_paths_from_decl(decl: ParsedDecl) -> List[String]:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			explicit_import_paths_from_imports(imports)
+		PrivateParsedDecl(inner, _):
+			explicit_import_paths_from_decl(inner)
+		_:
+			[]
+
+
+private pure func explicit_import_paths_from_program(program: ParsedProgram) -> List[String]:
+	program.decls.flat_map(explicit_import_paths_from_decl)
+
+
+private pure func ctfe_imported_program_from_request(
+	module: TypecheckImportModule,
+	importable_modules: List[CompilerImportableModule],
+	resolved_imports: List[TypecheckResolvedImport],
+	allow_debug_only_calls: Bool,
+) -> Option[CompilerCtfeImportedProgram]:
+	program = import_program_from_request(module, resolved_imports)
+	state = compiler_typecheck_state_with_debug_calls(
+		compiler_typecheck_state_for_origin(module.origin),
+		allow_debug_only_calls,
+	)
+	typed_result = compiler_typecheck_program_with_import_modules(
+		state,
+		program,
+		importable_modules_except_path(importable_modules, module.module_path),
+	)
+
+	if typed_result.state.errors.length() == 0:
+		Some({
+			module_path = module.module_path,
+			program = typed_result.program,
+		})
+	else:
+		None
+
+
+private pure func ctfe_imported_programs_from_request(
+	modules: List[TypecheckImportModule],
+	importable_modules: List[CompilerImportableModule],
+	resolved_imports: List[TypecheckResolvedImport],
+	allow_debug_only_calls: Bool,
+) -> Option[List[CompilerCtfeImportedProgram]]:
+	var result: List[CompilerCtfeImportedProgram] = []
+	var failed: Bool = False
+
+	for module in modules:
+		match ctfe_imported_program_from_request(
+			module,
+			importable_modules,
+			resolved_imports,
+			allow_debug_only_calls,
+		):
+			Some(imported_program):
+				result = result.append(imported_program)
+			None:
+				failed = True
+				break
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
+private pure func import_module_has_explicit_imports(
+	module: TypecheckImportModule,
+	resolved_imports: List[TypecheckResolvedImport],
+) -> Bool:
+	program = import_program_from_request(module, resolved_imports)
+	explicit_import_paths_from_program(program).length() != 0
+
+
+private pure func import_module_is_explicit_leaf_for_ctfe(
+	module: TypecheckImportModule,
+	explicit_import_paths: List[String],
+	resolved_imports: List[TypecheckResolvedImport],
+) -> Bool:
+	match module.origin:
+		CompilerUserModule:
+			(
+				explicit_import_paths.contains(module.module_path)
+				and not import_module_has_explicit_imports(module, resolved_imports)
+			)
+		_:
+			False
+
+
+private pure func explicit_import_modules_for_ctfe(
+	modules: List[TypecheckImportModule],
+	explicit_import_paths: List[String],
+	resolved_imports: List[TypecheckResolvedImport],
+) -> List[TypecheckImportModule]:
+	var result: List[TypecheckImportModule] = []
+
+	for module in modules:
+		if import_module_is_explicit_leaf_for_ctfe(module, explicit_import_paths, resolved_imports):
+			result = result.append(module)
+
+	result
+
+
+private pure func ctfe_imported_programs_for_artifact(
+	typed_result: CompilerTypecheckProgramResult,
+	modules: List[TypecheckImportModule],
+	importable_modules: List[CompilerImportableModule],
+	resolved_imports: List[TypecheckResolvedImport],
+	explicit_import_paths: List[String],
+	allow_debug_only_calls: Bool,
+) -> Option[List[CompilerCtfeImportedProgram]]:
+	if typed_program_has_ctfe_globals(typed_result.program):
+		if explicit_import_paths.length() == 0:
+			Some([])
+		else:
+			ctfe_modules = explicit_import_modules_for_ctfe(
+				modules,
+				explicit_import_paths,
+				resolved_imports,
+			)
+			ctfe_imported_programs_from_request(
+				ctfe_modules,
+				importable_modules,
+				resolved_imports,
+				allow_debug_only_calls,
+			)
+	else:
+		Some([])
+
+
+private pure func typecheck_ctfe_status_name(status: TypecheckCtfeStatus) -> String:
+	match status:
+		TypecheckCtfeEvaluated:
+			"evaluated"
+		TypecheckCtfeNotRun:
+			"not_run"
+
+
+private pure func typecheck_ctfe_artifact(
+	typed_result: CompilerTypecheckProgramResult,
+	imported_programs: Option[List[CompilerCtfeImportedProgram]],
+) -> TypecheckCtfeArtifact:
+	if typed_result.state.errors.length() != 0:
+		{
+			program = typed_result.program,
+			state = typed_result.state,
+			status = TypecheckCtfeNotRun
+		}
+	else:
+		match imported_programs:
+			Some(programs):
+				match compiler_ctfe_evaluate_program_globals(
+					typed_result.program,
+					programs,
+					typed_result.state.import_bindings,
+				):
+					Ok(program):
+						{
+							program = program,
+							state = typed_result.state,
+							status = TypecheckCtfeEvaluated
+						}
+					Err(error):
+						{
+							program = typed_result.program,
+							status = TypecheckCtfeNotRun,
+							state = compiler_typecheck_state_add_error(
+								typed_result.state,
+								compiler_ctfe_eval_error_message(error),
+							)
+						}
+			None:
+				{
+					program = typed_result.program,
+					state = compiler_typecheck_state_add_error(
+						typed_result.state,
+						"compile-time evaluation could not resolve all imported modules",
+					),
+					status = TypecheckCtfeNotRun
+				}
+
+
 private pure func typed_source_artifact(
 	path: String,
 	module_name: String,
@@ -490,26 +721,45 @@ private pure func typed_source_artifact(
 	raw_program = parse_compiler_source(source)
 	rewritten = rewrite_program_import_paths(path, module_name, resolved_imports, raw_program)
 	final_program = finalize_typecheck_source_program(rewritten)
+	explicit_import_paths = explicit_import_paths_from_program(final_program)
 	initial_state = compiler_typecheck_state_with_debug_calls(
 		compiler_typecheck_state_for_origin(origin),
 		allow_debug_only_calls,
 	)
-	typed_result = if import_modules.length() == 0:
+	importable_modules = importable_modules_from_request(import_modules, resolved_imports)
+
+	typed_result = if importable_modules.length() == 0:
 		compiler_typecheck_program(initial_state, final_program)
 	else:
 		compiler_typecheck_program_with_import_modules(
 			initial_state,
 			final_program,
-			importable_modules_from_request(import_modules, resolved_imports),
+			importable_modules,
 		)
+
+	imported_programs = ctfe_imported_programs_for_artifact(
+		typed_result,
+		import_modules,
+		importable_modules,
+		resolved_imports,
+		explicit_import_paths,
+		allow_debug_only_calls,
+	)
+	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 
 	var fields: List[(String, JsonValue)] = [
 		("path", JsonString(path)),
 		("module", JsonString(module_name)),
 		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
-		("typed_program", compiler_typed_program_to_json(typed_result.program)),
-		("type_errors", JsonVector(typed_result.state.errors.map(func(item: String): JsonString(item)))),
-		("import_bindings", JsonVector(typed_result.state.import_bindings.map(import_binding_to_json))),
+		("typed_program", compiler_typed_program_to_json(ctfe_artifact.program)),
+		("ctfe_status", JsonString(typecheck_ctfe_status_name(ctfe_artifact.status))),
+		("type_errors", JsonVector(ctfe_artifact.state.errors.map(
+				pure func(item: String): JsonString(item),
+			))),
+		(
+			"import_bindings",
+			JsonVector(ctfe_artifact.state.import_bindings.map(import_binding_to_json)),
+		),
 		("module_surface", module_surface_to_json(module_surface_for_program(final_program))),
 	]
 
@@ -534,15 +784,17 @@ private pure func handle_typecheck_source(
 	Ok(
 		bridge_success_json(
 			typed_source_artifact(
-			path,
-			module_name,
-			text,
-			include_comments,
-			allow_debug_only_calls,
-			origin,
-			import_modules,
-			resolved_imports,
-		)))
+				path,
+				module_name,
+				text,
+				include_comments,
+				allow_debug_only_calls,
+				origin,
+				import_modules,
+				resolved_imports,
+			),
+		),
+	)
 
 
 private pure func handle_envelope(

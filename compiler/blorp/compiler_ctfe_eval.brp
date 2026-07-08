@@ -1,10 +1,16 @@
 -- Compile-time evaluator for normalized CTFE IR.
 --
 -- This evaluator covers the expression forms already normalized by
--- compiler_ctfe_ir.brp. Calls, loops, and materialization remain separate
--- slices.
+-- compiler_ctfe_ir.brp. Production materialization remains a separate slice.
 import:
-	compiler_ctfe_context: CompilerCtfeContext
+	compiler_ctfe_context:
+		CompilerCtfeContext,
+		CompilerCtfeFunction,
+		compiler_ctfe_context_empty,
+		compiler_ctfe_context_function_by_callable_id,
+		compiler_ctfe_context_imported_functions_by_source,
+		compiler_ctfe_context_module_global_env,
+		compiler_ctfe_context_module_global_value,
 	compiler_ctfe_env:
 		CompilerCtfeEnv,
 		CompilerCtfeEnvError,
@@ -12,7 +18,70 @@ import:
 		compiler_ctfe_bind_local_value,
 		compiler_ctfe_bind_mutable_local_value,
 		compiler_ctfe_env_error_message,
+		compiler_ctfe_global_bindings,
 		compiler_ctfe_lookup_value,
+		compiler_ctfe_project_existing_bindings,
+	compiler_ctfe_intrinsic:
+		CompilerCtfeImportedIntrinsic(
+			CompilerCtfeImportedListIntrinsic,
+			CompilerCtfeImportedOptionIntrinsic,
+			CompilerCtfeImportedResultIntrinsic,
+			CompilerCtfeImportedStringIntrinsic,
+		),
+		CompilerCtfeListIntrinsic(
+			CompilerCtfeListAll,
+			CompilerCtfeListAppend,
+			CompilerCtfeListAny,
+			CompilerCtfeListConcat,
+			CompilerCtfeListContains,
+			CompilerCtfeListFilter,
+			CompilerCtfeListFilterMap,
+			CompilerCtfeListFlatMap,
+			CompilerCtfeListFoldLeft,
+			CompilerCtfeListFoldRight,
+			CompilerCtfeListGet,
+			CompilerCtfeListGetOr,
+			CompilerCtfeListJoin,
+			CompilerCtfeListLength,
+			CompilerCtfeListMake,
+			CompilerCtfeListMap,
+			CompilerCtfeListMapIndexed,
+			CompilerCtfeListSet,
+		),
+		CompilerCtfeOptionIntrinsic(
+			CompilerCtfeOptionAndThen,
+			CompilerCtfeOptionFilter,
+			CompilerCtfeOptionGetOr,
+			CompilerCtfeOptionGetOrElse,
+			CompilerCtfeOptionIsNone,
+			CompilerCtfeOptionIsSome,
+			CompilerCtfeOptionMap,
+		),
+		CompilerCtfeResultIntrinsic(
+			CompilerCtfeResultAndThen,
+			CompilerCtfeResultGetOr,
+			CompilerCtfeResultGetOrElse,
+			CompilerCtfeResultIsErr,
+			CompilerCtfeResultIsOk,
+			CompilerCtfeResultMap,
+			CompilerCtfeResultMapErr,
+		),
+		CompilerCtfeStringIntrinsic(
+			CompilerCtfeStringContains,
+			CompilerCtfeStringEndsWith,
+			CompilerCtfeStringGet,
+			CompilerCtfeStringGetOr,
+			CompilerCtfeStringIndexOf,
+			CompilerCtfeStringLength,
+			CompilerCtfeStringRawIndexOf,
+			CompilerCtfeStringRepeat,
+			CompilerCtfeStringReplace,
+			CompilerCtfeStringSplit,
+			CompilerCtfeStringStartsWith,
+			CompilerCtfeStringSubstring,
+			CompilerCtfeStringTrim,
+		),
+		compiler_ctfe_imported_intrinsic,
 	compiler_ctfe_ir:
 		CompilerCtfeIrAssignTarget(
 			CompilerCtfeIrDiscardAssign,
@@ -22,33 +91,62 @@ import:
 		CompilerCtfeIrBlock,
 		CompilerCtfeIrBlockItem(
 			CompilerCtfeIrAssignItem,
+			CompilerCtfeIrBindQuestionItem,
 			CompilerCtfeIrBindTupleItem,
 			CompilerCtfeIrBindValueItem,
 			CompilerCtfeIrDiscardItem,
+		),
+		CompilerCtfeIrCall,
+		CompilerCtfeIrCallKind(
+			CompilerCtfeIrConstructorCall,
+			CompilerCtfeIrImpureCall,
+			CompilerCtfeIrImportedCall,
+			CompilerCtfeIrLocalCall,
+			CompilerCtfeIrUnresolvedCall,
+			CompilerCtfeIrUnsupportedCall,
 		),
 		CompilerCtfeIrDictEntry,
 		CompilerCtfeIrExpr,
 		CompilerCtfeIrExprDesc(
 			CompilerCtfeIrBinaryExpr,
 			CompilerCtfeIrBlockExpr,
+			CompilerCtfeIrCallExpr,
 			CompilerCtfeIrDictExpr,
 			CompilerCtfeIrFieldAccessExpr,
+			CompilerCtfeIrForExpr,
+			CompilerCtfeIrForTupleExpr,
 			CompilerCtfeIrIfExpr,
+			CompilerCtfeIrImportedGlobalExpr,
 			CompilerCtfeIrIdentExpr,
 			CompilerCtfeIrListExpr,
 			CompilerCtfeIrLiteralExpr,
 			CompilerCtfeIrLogicalExpr,
+			CompilerCtfeIrMatchExpr,
 			CompilerCtfeIrRecordExpr,
 			CompilerCtfeIrRecordUpdateExpr,
 			CompilerCtfeIrRangeExpr,
+			CompilerCtfeIrBreakExpr,
+			CompilerCtfeIrContinueExpr,
+			CompilerCtfeIrStringInterpolationExpr,
 			CompilerCtfeIrTransparentExpr,
 			CompilerCtfeIrTupleExpr,
 			CompilerCtfeIrUnaryExpr,
 			CompilerCtfeIrVectorExpr,
+			CompilerCtfeIrWhileExpr,
 			CompilerCtfeIrVoidExpr,
 		),
 		CompilerCtfeIrField,
+		CompilerCtfeIrFieldAccess,
+		CompilerCtfeIrFieldAccessKind(
+			CompilerCtfeIrRangeEndField,
+			CompilerCtfeIrRangeInvalidField,
+			CompilerCtfeIrRangeStartField,
+			CompilerCtfeIrRecordField,
+			CompilerCtfeIrTupleField,
+			CompilerCtfeIrTupleInvalidField,
+		),
 		CompilerCtfeIrIdentifier,
+		CompilerCtfeIrImportedGlobal,
 		CompilerCtfeIrLiteral(
 			CompilerCtfeIrBoolLiteral,
 			CompilerCtfeIrCharLiteral,
@@ -56,6 +154,7 @@ import:
 			CompilerCtfeIrIntLiteral,
 			CompilerCtfeIrStringLiteral,
 		),
+		CompilerCtfeIrMatchCase,
 		CompilerCtfeIrReferenceKind(
 			CompilerCtfeIrImpureFunctionReference,
 			CompilerCtfeIrLocalFunctionReference,
@@ -63,15 +162,18 @@ import:
 			CompilerCtfeIrUnsupportedFunctionReference,
 			CompilerCtfeIrValueReference,
 		),
+		CompilerCtfeIrStringPart(CompilerCtfeIrStringExpr, CompilerCtfeIrStringText),
 		CompilerCtfeIrTranslateError,
 		compiler_ctfe_ir_from_typed_expr,
 		compiler_ctfe_ir_translate_error_message,
+	compiler_ctfe_pattern: compiler_ctfe_pattern_bind
 	compiler_ctfe_value:
 		CompilerCtfeError,
 		CompilerCtfeValue,
 		CompilerCtfeValueDesc(
 			CompilerCtfeConstructorValue,
 			CompilerCtfeDictValue,
+			CompilerCtfeFunctionReferenceValue,
 			CompilerCtfeListValue,
 			CompilerCtfeRangeValue,
 			CompilerCtfeRecordValue,
@@ -81,17 +183,37 @@ import:
 		),
 		compiler_ctfe_bool,
 		compiler_ctfe_char,
+		compiler_ctfe_constructor_info,
 		compiler_ctfe_error_message,
 		compiler_ctfe_eval_binary,
 		compiler_ctfe_eval_unary,
 		compiler_ctfe_expect_bool,
+		compiler_ctfe_expect_char,
 		compiler_ctfe_expect_int,
+		compiler_ctfe_expect_string,
 		compiler_ctfe_float,
+		compiler_ctfe_function_reference,
 		compiler_ctfe_int,
 		compiler_ctfe_string,
 		compiler_ctfe_value,
+		compiler_ctfe_values_equal,
+	compiler_ctfe_value_ops:
+		CompilerCtfeOptionState(CompilerCtfeOptionNone, CompilerCtfeOptionSome),
+		CompilerCtfeResultState(CompilerCtfeResultErr, CompilerCtfeResultOk),
+		compiler_ctfe_option_none_value,
+		compiler_ctfe_option_some_value,
+		compiler_ctfe_option_state,
+		compiler_ctfe_result_err_value,
+		compiler_ctfe_result_ok_value,
+		compiler_ctfe_result_state,
+		compiler_ctfe_string_text_of_value,
 	compiler_infer: CompilerTypedExpr
-	compiler_parsed_ast: ParsedBinaryOp, ParsedLogicalOp(ParsedAndOp, ParsedOrOp), ParsedUnaryOp
+	compiler_parsed_ast:
+		ParsedBinaryOp,
+		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
+		ParsedUnaryOp,
 	compiler_source: CompilerSourceSpan
 	compiler_type: CompilerType
 
@@ -102,6 +224,17 @@ union CompilerCtfeEvalError:
 	CompilerCtfeEvalValueError(CompilerCtfeError)
 	CompilerCtfeEvalInvalid(String)
 	CompilerCtfeEvalUnsupported(String)
+
+
+private union CompilerCtfeBlockItemResult:
+	CompilerCtfeBlockItemContinue(CompilerCtfeEnv)
+	CompilerCtfeBlockItemReturn(CompilerCtfeValue)
+
+
+private union CompilerCtfeLoopBodyResult:
+	CompilerCtfeLoopBodyValue(CompilerCtfeEnv, CompilerCtfeValue)
+	CompilerCtfeLoopBodyBreak(CompilerCtfeEnv)
+	CompilerCtfeLoopBodyContinue(CompilerCtfeEnv)
 
 
 pure func compiler_ctfe_eval_error_message(error: CompilerCtfeEvalError) -> String:
@@ -141,6 +274,64 @@ private pure func compiler_ctfe_eval_bool_result(
 private pure func compiler_ctfe_eval_int_result(
 	result: Result[Int, CompilerCtfeError],
 ) -> Result[Int, CompilerCtfeEvalError]:
+	match result:
+		Ok(value):
+			Ok(value)
+		Err(error):
+			Err(CompilerCtfeEvalValueError(error))
+
+
+private pure func compiler_ctfe_eval_void_value(expr: CompilerCtfeIrExpr) -> CompilerCtfeValue:
+	compiler_ctfe_value(
+		compiler_ctfe_ir_eval_type(expr),
+		CompilerCtfeVoidValue,
+		compiler_ctfe_ir_eval_span(expr),
+	)
+
+
+private pure func compiler_ctfe_eval_bindings_result(
+	result: Result[Option[List[(String, CompilerCtfeValue)]], CompilerCtfeError],
+) -> Result[Option[List[(String, CompilerCtfeValue)]], CompilerCtfeEvalError]:
+	match result:
+		Ok(value):
+			Ok(value)
+		Err(error):
+			Err(CompilerCtfeEvalValueError(error))
+
+
+private pure func compiler_ctfe_eval_string_result(
+	result: Result[String, CompilerCtfeError],
+) -> Result[String, CompilerCtfeEvalError]:
+	match result:
+		Ok(value):
+			Ok(value)
+		Err(error):
+			Err(CompilerCtfeEvalValueError(error))
+
+
+private pure func compiler_ctfe_eval_char_result(
+	result: Result[Char, CompilerCtfeError],
+) -> Result[Char, CompilerCtfeEvalError]:
+	match result:
+		Ok(value):
+			Ok(value)
+		Err(error):
+			Err(CompilerCtfeEvalValueError(error))
+
+
+private pure func compiler_ctfe_eval_option_state_result(
+	result: Result[CompilerCtfeOptionState, CompilerCtfeError],
+) -> Result[CompilerCtfeOptionState, CompilerCtfeEvalError]:
+	match result:
+		Ok(value):
+			Ok(value)
+		Err(error):
+			Err(CompilerCtfeEvalValueError(error))
+
+
+private pure func compiler_ctfe_eval_result_state_result(
+	result: Result[CompilerCtfeResultState, CompilerCtfeError],
+) -> Result[CompilerCtfeResultState, CompilerCtfeEvalError]:
 	match result:
 		Ok(value):
 			Ok(value)
@@ -217,7 +408,14 @@ private pure func compiler_ctfe_eval_identifier(
 				compiler_ctfe_ir_eval_span(expr),
 			))
 		CompilerCtfeIrLocalFunctionReference(call):
-			Err(CompilerCtfeEvalUnsupported("function reference '" + call.source_name + "'"))
+			Ok(
+				compiler_ctfe_function_reference(
+					compiler_ctfe_ir_eval_type(expr),
+					compiler_ctfe_ir_eval_span(expr),
+					call.callable_id,
+					call.source_name,
+				),
+			)
 		CompilerCtfeIrUnsupportedFunctionReference(source_name):
 			Err(CompilerCtfeEvalUnsupported("function reference '" + source_name + "'"))
 		CompilerCtfeIrImpureFunctionReference:
@@ -225,6 +423,7 @@ private pure func compiler_ctfe_eval_identifier(
 
 
 private pure func compiler_ctfe_eval_exprs(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	exprs: List[CompilerCtfeIrExpr],
 ) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
@@ -232,7 +431,7 @@ private pure func compiler_ctfe_eval_exprs(
 	var failure: Option[CompilerCtfeEvalError] = None
 
 	for item in exprs:
-		match compiler_ctfe_eval_ir(env, item):
+		match compiler_ctfe_eval_ir_in_context(context, env, item):
 			Ok(value):
 				values = values.append(value)
 			Err(error):
@@ -247,6 +446,7 @@ private pure func compiler_ctfe_eval_exprs(
 
 
 private pure func compiler_ctfe_eval_fields(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	fields: List[CompilerCtfeIrField],
 ) -> Result[List[(String, CompilerCtfeValue)], CompilerCtfeEvalError]:
@@ -254,7 +454,7 @@ private pure func compiler_ctfe_eval_fields(
 	var failure: Option[CompilerCtfeEvalError] = None
 
 	for field in fields:
-		match compiler_ctfe_eval_ir(env, field.value):
+		match compiler_ctfe_eval_ir_in_context(context, env, field.value):
 			Ok(value):
 				values = values.append((field.name, value))
 			Err(error):
@@ -269,6 +469,7 @@ private pure func compiler_ctfe_eval_fields(
 
 
 private pure func compiler_ctfe_eval_dict_entries(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	entries: List[CompilerCtfeIrDictEntry],
 ) -> Result[List[(CompilerCtfeValue, CompilerCtfeValue)], CompilerCtfeEvalError]:
@@ -276,9 +477,9 @@ private pure func compiler_ctfe_eval_dict_entries(
 	var failure: Option[CompilerCtfeEvalError] = None
 
 	for entry in entries:
-		match compiler_ctfe_eval_ir(env, entry.key):
+		match compiler_ctfe_eval_ir_in_context(context, env, entry.key):
 			Ok(key):
-				match compiler_ctfe_eval_ir(env, entry.value):
+				match compiler_ctfe_eval_ir_in_context(context, env, entry.value):
 					Ok(value):
 						values = values.append((key, value))
 					Err(error):
@@ -296,13 +497,14 @@ private pure func compiler_ctfe_eval_dict_entries(
 
 
 private pure func compiler_ctfe_eval_logical(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	expr: CompilerCtfeIrExpr,
 	op: ParsedLogicalOp,
 	left: CompilerCtfeIrExpr,
 	right: CompilerCtfeIrExpr,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	left_value ?= compiler_ctfe_eval_ir(env, left)
+	left_value ?= compiler_ctfe_eval_ir_in_context(context, env, left)
 	left_bool ?= compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(left_value))
 
 	match op:
@@ -310,54 +512,57 @@ private pure func compiler_ctfe_eval_logical(
 			if not left_bool:
 				Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), False))
 			else:
-				right_value ?= compiler_ctfe_eval_ir(env, right)
+				right_value ?= compiler_ctfe_eval_ir_in_context(context, env, right)
 				right_bool ?= compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(right_value))
 				Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), right_bool))
 		ParsedOrOp:
 			if left_bool:
 				Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), True))
 			else:
-				right_value ?= compiler_ctfe_eval_ir(env, right)
+				right_value ?= compiler_ctfe_eval_ir_in_context(context, env, right)
 				right_bool ?= compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(right_value))
 				Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), right_bool))
 
 
 private pure func compiler_ctfe_eval_unary_expr(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	op: ParsedUnaryOp,
 	inner: CompilerCtfeIrExpr,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	value ?= compiler_ctfe_eval_ir(env, inner)
+	value ?= compiler_ctfe_eval_ir_in_context(context, env, inner)
 	compiler_ctfe_eval_value_result(compiler_ctfe_eval_unary(op, value))
 
 
 private pure func compiler_ctfe_eval_binary_expr(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	op: ParsedBinaryOp,
 	left: CompilerCtfeIrExpr,
 	right: CompilerCtfeIrExpr,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	left_value ?= compiler_ctfe_eval_ir(env, left)
-	right_value ?= compiler_ctfe_eval_ir(env, right)
+	left_value ?= compiler_ctfe_eval_ir_in_context(context, env, left)
+	right_value ?= compiler_ctfe_eval_ir_in_context(context, env, right)
 	compiler_ctfe_eval_value_result(compiler_ctfe_eval_binary(op, left_value, right_value))
 
 
 private pure func compiler_ctfe_eval_if(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	expr: CompilerCtfeIrExpr,
 	condition: CompilerCtfeIrExpr,
 	then_expr: CompilerCtfeIrExpr,
 	else_expr: Option[CompilerCtfeIrExpr],
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	condition_value ?= compiler_ctfe_eval_ir(env, condition)
+	condition_value ?= compiler_ctfe_eval_ir_in_context(context, env, condition)
 	condition_bool ?= compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(condition_value))
 
 	if condition_bool:
-		compiler_ctfe_eval_ir(env, then_expr)
+		compiler_ctfe_eval_ir_in_context(context, env, then_expr)
 	else:
 		match else_expr:
 			Some(value):
-				compiler_ctfe_eval_ir(env, value)
+				compiler_ctfe_eval_ir_in_context(context, env, value)
 			None:
 				Ok(
 					compiler_ctfe_value(
@@ -368,33 +573,113 @@ private pure func compiler_ctfe_eval_if(
 				)
 
 
-private pure func compiler_ctfe_eval_field_access(
-	env: CompilerCtfeEnv,
-	receiver: CompilerCtfeIrExpr,
+private pure func compiler_ctfe_eval_record_field(
+	fields: List[(String, CompilerCtfeValue)],
 	field_name: String,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	receiver_value ?= compiler_ctfe_eval_ir(env, receiver)
+	var result: Option[CompilerCtfeValue] = None
 
-	match receiver_value.desc:
-		CompilerCtfeRecordValue(fields):
-			var result: Option[CompilerCtfeValue] = None
+	for (name, value) in fields:
+		if result.is_none() and name == field_name:
+			result = Some(value)
+			break
 
-			for (name, value) in fields:
-				if result.is_none() and name == field_name:
-					result = Some(value)
-					break
+	match result:
+		Some(value):
+			Ok(value)
+		None:
+			Err(
+				CompilerCtfeEvalInvalid(
+					"compile-time record value has no field '" + field_name + "'",
+				),
+			)
 
-			match result:
-				Some(value):
-					Ok(value)
-				None:
+
+private pure func compiler_ctfe_eval_tuple_field(
+	values: List[CompilerCtfeValue],
+	index: Int,
+	field_name: String,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match values.get(index):
+		Some(value):
+			Ok(value)
+		None:
+			Err(
+				CompilerCtfeEvalInvalid(
+					"compile-time tuple value has no field '" + field_name + "'",
+				),
+			)
+
+
+private pure func compiler_ctfe_eval_field_access_kind(
+	kind: CompilerCtfeIrFieldAccessKind,
+	value: CompilerCtfeValue,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match kind:
+		CompilerCtfeIrRecordField(field_name):
+			match value.desc:
+				CompilerCtfeRecordValue(fields):
+					compiler_ctfe_eval_record_field(fields, field_name)
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+		CompilerCtfeIrTupleField(index, field_name):
+			match value.desc:
+				CompilerCtfeTupleValue(values):
+					compiler_ctfe_eval_tuple_field(values, index, field_name)
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+		CompilerCtfeIrTupleInvalidField(field_name):
+			match value.desc:
+				CompilerCtfeTupleValue(_):
+					Err(CompilerCtfeEvalUnsupported("tuple field access '" + field_name + "'"))
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+		CompilerCtfeIrRangeStartField:
+			match value.desc:
+				CompilerCtfeRangeValue(start_value, _):
+					Ok(start_value)
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+		CompilerCtfeIrRangeEndField:
+			match value.desc:
+				CompilerCtfeRangeValue(_, end_value):
+					Ok(end_value)
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+		CompilerCtfeIrRangeInvalidField(field_name):
+			match value.desc:
+				CompilerCtfeRangeValue(_, _):
 					Err(
 						CompilerCtfeEvalInvalid(
-							"compile-time record value has no field '" + field_name + "'",
+							"compile-time Range value has no field '" + field_name + "'",
 						),
 					)
-		_:
-			Err(CompilerCtfeEvalUnsupported("field access on this value"))
+				_:
+					Err(CompilerCtfeEvalUnsupported("field access on this value"))
+
+
+private pure func compiler_ctfe_eval_field_access(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	access: CompilerCtfeIrFieldAccess,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	receiver_value ?= compiler_ctfe_eval_ir_in_context(context, env, access.receiver)
+	compiler_ctfe_eval_field_access_kind(access.kind, receiver_value)
+
+
+private pure func compiler_ctfe_eval_imported_global(
+	context: CompilerCtfeContext,
+	imported: CompilerCtfeIrImportedGlobal,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match compiler_ctfe_context_module_global_value(context, imported.module_path, imported.name):
+		Some(value):
+			Ok(value)
+		None:
+			Err(
+				CompilerCtfeEvalInvalid(
+					"global constant initializer cannot reference imported value '" + imported.module_path + "." + imported.name + "' because it is not a compile-time constant",
+				),
+			)
 
 
 private pure func compiler_ctfe_replace_record_field(
@@ -441,13 +726,14 @@ private pure func compiler_ctfe_apply_record_updates(
 
 
 private pure func compiler_ctfe_eval_record_update(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	expr: CompilerCtfeIrExpr,
 	base: CompilerCtfeIrExpr,
 	updates: List[CompilerCtfeIrField],
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	base_value ?= compiler_ctfe_eval_ir(env, base)
-	update_values ?= compiler_ctfe_eval_fields(env, updates)
+	base_value ?= compiler_ctfe_eval_ir_in_context(context, env, base)
+	update_values ?= compiler_ctfe_eval_fields(context, env, updates)
 
 	match base_value.desc:
 		CompilerCtfeRecordValue(fields):
@@ -464,13 +750,14 @@ private pure func compiler_ctfe_eval_record_update(
 
 
 private pure func compiler_ctfe_eval_range(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	expr: CompilerCtfeIrExpr,
 	start_expr: CompilerCtfeIrExpr,
 	end_expr: CompilerCtfeIrExpr,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
-	start_value ?= compiler_ctfe_eval_ir(env, start_expr)
-	end_value ?= compiler_ctfe_eval_ir(env, end_expr)
+	start_value ?= compiler_ctfe_eval_ir_in_context(context, env, start_expr)
+	end_value ?= compiler_ctfe_eval_ir_in_context(context, env, end_expr)
 	start_int ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(start_value))
 	end_int ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(end_value))
 
@@ -483,23 +770,89 @@ private pure func compiler_ctfe_eval_range(
 	)
 
 
-private pure func compiler_ctfe_eval_block_item(
+private pure func compiler_ctfe_eval_string_interpolation(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	parts: List[CompilerCtfeIrStringPart],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	var text: String = ""
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for part in parts:
+		match part:
+			CompilerCtfeIrStringText(value):
+				text += value
+			CompilerCtfeIrStringExpr(part_expr):
+				match compiler_ctfe_eval_ir_in_context(context, env, part_expr):
+					Ok(value):
+						match compiler_ctfe_eval_string_result(
+							compiler_ctfe_string_text_of_value(value),
+						):
+							Ok(part_text):
+								text += part_text
+							Err(error):
+								failure = Some(error)
+								break
+					Err(error):
+						failure = Some(error)
+						break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
+
+
+private pure func compiler_ctfe_eval_block_item(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	block_expr: CompilerCtfeIrExpr,
 	item: CompilerCtfeIrBlockItem,
-) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+) -> Result[CompilerCtfeBlockItemResult, CompilerCtfeEvalError]:
 	match item:
 		CompilerCtfeIrDiscardItem(expr):
-			ignored ?= compiler_ctfe_eval_ir(env, expr)
-			Ok(env)
+			match expr.desc:
+				CompilerCtfeIrWhileExpr(condition, body):
+					next_env ?= compiler_ctfe_eval_while_env(context, env, condition, body)
+					Ok(CompilerCtfeBlockItemContinue(next_env))
+				CompilerCtfeIrForExpr(name, iterable, body):
+					next_env ?= compiler_ctfe_eval_for_env(context, env, name, iterable, body)
+					Ok(CompilerCtfeBlockItemContinue(next_env))
+				CompilerCtfeIrForTupleExpr(names, iterable, body):
+					next_env ?= compiler_ctfe_eval_for_tuple_env(
+						context,
+						env,
+						names,
+						iterable,
+						body,
+					)
+					Ok(CompilerCtfeBlockItemContinue(next_env))
+				CompilerCtfeIrBreakExpr:
+					Err(CompilerCtfeEvalUnsupported("break expressions"))
+				CompilerCtfeIrContinueExpr:
+					Err(CompilerCtfeEvalUnsupported("continue expressions"))
+				_:
+					ignored ?= compiler_ctfe_eval_ir_in_context(context, env, expr)
+					Ok(CompilerCtfeBlockItemContinue(env))
 		CompilerCtfeIrBindValueItem(name, _, init, is_mutable):
-			value ?= compiler_ctfe_eval_ir(env, init)
+			value ?= compiler_ctfe_eval_ir_in_context(context, env, init)
 
 			if is_mutable:
-				Ok(compiler_ctfe_bind_mutable_local_value(env, name, value))
+				Ok(
+					CompilerCtfeBlockItemContinue(
+						compiler_ctfe_bind_mutable_local_value(
+							env,
+							name,
+							value,
+						),
+					),
+				)
 			else:
-				Ok(compiler_ctfe_bind_local_value(env, name, value))
+				Ok(CompilerCtfeBlockItemContinue(compiler_ctfe_bind_local_value(env, name, value)))
 		CompilerCtfeIrBindTupleItem(names, init):
-			value ?= compiler_ctfe_eval_ir(env, init)
+			value ?= compiler_ctfe_eval_ir_in_context(context, env, init)
 
 			match value.desc:
 				CompilerCtfeTupleValue(values):
@@ -520,7 +873,7 @@ private pure func compiler_ctfe_eval_block_item(
 
 							index += 1
 
-						Ok(next_env)
+						Ok(CompilerCtfeBlockItemContinue(next_env))
 					else:
 						Err(
 							CompilerCtfeEvalInvalid(
@@ -533,16 +886,63 @@ private pure func compiler_ctfe_eval_block_item(
 						)
 				_:
 					Err(CompilerCtfeEvalUnsupported("tuple destructuring on non-tuple values"))
+		CompilerCtfeIrBindQuestionItem(name, _, rhs):
+			carrier ?= compiler_ctfe_eval_ir_in_context(context, env, rhs)
+
+			match compiler_ctfe_option_state(carrier):
+				Ok(CompilerCtfeOptionSome(value)):
+					Ok(
+						CompilerCtfeBlockItemContinue(
+							compiler_ctfe_bind_local_value(
+								env,
+								name,
+								value,
+							),
+						),
+					)
+				Ok(CompilerCtfeOptionNone):
+					Ok(
+						CompilerCtfeBlockItemReturn(
+							compiler_ctfe_option_none_value(
+								compiler_ctfe_ir_eval_type(block_expr),
+								compiler_ctfe_ir_eval_span(block_expr),
+							),
+						),
+					)
+				Err(_):
+					match compiler_ctfe_result_state(carrier):
+						Ok(CompilerCtfeResultOk(value)):
+							Ok(
+								CompilerCtfeBlockItemContinue(
+									compiler_ctfe_bind_local_value(
+										env,
+										name,
+										value,
+									),
+								),
+							)
+						Ok(CompilerCtfeResultErr(error_value)):
+							Ok(
+								CompilerCtfeBlockItemReturn(
+									compiler_ctfe_result_err_value(
+										compiler_ctfe_ir_eval_type(block_expr),
+										compiler_ctfe_ir_eval_span(block_expr),
+										error_value,
+									),
+								),
+							)
+						Err(_):
+							Err(CompilerCtfeEvalUnsupported("?= on non-Option/non-Result values"))
 		CompilerCtfeIrAssignItem(target, value_expr, span):
-			value ?= compiler_ctfe_eval_ir(env, value_expr)
+			value ?= compiler_ctfe_eval_ir_in_context(context, env, value_expr)
 
 			match target:
 				CompilerCtfeIrDiscardAssign:
-					Ok(env)
+					Ok(CompilerCtfeBlockItemContinue(env))
 				CompilerCtfeIrLocalAssign(name):
 					match compiler_ctfe_assign_value(env, span, name, value):
 						Ok(assign_result):
-							Ok(assign_result.env)
+							Ok(CompilerCtfeBlockItemContinue(assign_result.env))
 						Err(error):
 							Err(CompilerCtfeEvalEnvError(error))
 				CompilerCtfeIrModuleAssign(name):
@@ -550,16 +950,22 @@ private pure func compiler_ctfe_eval_block_item(
 
 
 private pure func compiler_ctfe_eval_block(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
+	block_expr: CompilerCtfeIrExpr,
 	block: CompilerCtfeIrBlock,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
 	var block_env = env
 	var failure: Option[CompilerCtfeEvalError] = None
+	var early_return: Option[CompilerCtfeValue] = None
 
 	for item in block.items:
-		match compiler_ctfe_eval_block_item(block_env, item):
-			Ok(next_env):
+		match compiler_ctfe_eval_block_item(context, block_env, block_expr, item):
+			Ok(CompilerCtfeBlockItemContinue(next_env)):
 				block_env = next_env
+			Ok(CompilerCtfeBlockItemReturn(value)):
+				early_return = Some(value)
+				break
 			Err(error):
 				failure = Some(error)
 				break
@@ -568,10 +974,1692 @@ private pure func compiler_ctfe_eval_block(
 		Some(error):
 			Err(error)
 		None:
-			compiler_ctfe_eval_ir(block_env, block.result)
+			match early_return:
+				Some(value):
+					Ok(value)
+				None:
+					compiler_ctfe_eval_ir_in_context(context, block_env, block.result)
 
 
-pure func compiler_ctfe_eval_ir(
+private pure func compiler_ctfe_function_global_env(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	ctfe_function: CompilerCtfeFunction,
+) -> CompilerCtfeEnv:
+	match ctfe_function.module_path:
+		Some(module_path):
+			compiler_ctfe_context_module_global_env(context, module_path)
+		None:
+			{bindings = compiler_ctfe_global_bindings(caller_env)}
+
+
+private pure func compiler_ctfe_bind_tuple_param_values(
+	env: CompilerCtfeEnv,
+	names: List[String],
+	values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	if names.length() != values.length():
+		Err(CompilerCtfeEvalInvalid("compile-time tuple parameter expected " + names
+					.length()
+					.to_string() + " values, found " + values
+					.length()
+					.to_string()))
+	else:
+		var next_env = env
+		var index: Int = 0
+
+		for name in names:
+			match values.get(index):
+				Some(value):
+					next_env = compiler_ctfe_bind_local_value(next_env, name, value)
+				None:
+					void
+
+			index += 1
+
+		Ok(next_env)
+
+
+private pure func compiler_ctfe_bind_function_param(
+	env: CompilerCtfeEnv,
+	param: ParsedParam,
+	value: CompilerCtfeValue,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	match param.binder:
+		ParsedParamNameBinder(name):
+			Ok(compiler_ctfe_bind_local_value(env, name.text, value))
+		ParsedParamWildcardBinder(_):
+			Ok(env)
+		ParsedParamTupleBinder(names, _):
+			match value.desc:
+				CompilerCtfeTupleValue(values):
+					compiler_ctfe_bind_tuple_param_values(
+						env,
+						names.map(func(name): name.text),
+						values,
+					)
+				_:
+					Err(CompilerCtfeEvalUnsupported("tuple parameters on non-tuple values"))
+
+
+private pure func compiler_ctfe_bind_function_params(
+	params: List[ParsedParam],
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	if params.length() != arg_values.length():
+		Err(CompilerCtfeEvalInvalid("compile-time function call expected " + params
+					.length()
+					.to_string() + " argument(s), found " + arg_values
+					.length()
+					.to_string()))
+	else:
+		var env = {bindings = []}
+		var failure: Option[CompilerCtfeEvalError] = None
+		var index: Int = 0
+
+		for param in params:
+			match arg_values.get(index):
+				Some(value):
+					match compiler_ctfe_bind_function_param(env, param, value):
+						Ok(next_env):
+							env = next_env
+						Err(error):
+							failure = Some(error)
+							break
+				None:
+					failure = Some(
+						CompilerCtfeEvalInvalid("compile-time function call missing argument"),
+					)
+					break
+
+			index += 1
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(env)
+
+
+private pure func compiler_ctfe_function_call_env(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	ctfe_function: CompilerCtfeFunction,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	param_env ?= compiler_ctfe_bind_function_params(ctfe_function.info.decl.params, arg_values)
+	global_env = compiler_ctfe_function_global_env(context, caller_env, ctfe_function)
+	Ok({bindings = param_env.bindings + global_env.bindings})
+
+
+private pure func compiler_ctfe_eval_ctfe_function_call(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	ctfe_function: CompilerCtfeFunction,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	if not ctfe_function.info.decl.is_pure:
+		Err(CompilerCtfeEvalUnsupported("impure function calls"))
+	else:
+		match ctfe_function.info.body:
+			Some(body):
+				body_ir ?= match compiler_ctfe_ir_from_typed_expr(context, body):
+					Ok(ir):
+						Ok(ir)
+					Err(error):
+						Err(CompilerCtfeEvalTranslateError(error))
+
+				function_env ?= compiler_ctfe_function_call_env(
+					context,
+					caller_env,
+					ctfe_function,
+					arg_values,
+				)
+				compiler_ctfe_eval_ir_in_context(context, function_env, body_ir)
+			None:
+				Err(CompilerCtfeEvalUnsupported("function declarations without bodies"))
+
+
+private pure func compiler_ctfe_eval_function_call(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	callable_id: Int,
+	source_name: String,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match compiler_ctfe_context_function_by_callable_id(context, callable_id):
+		Some(ctfe_function):
+			compiler_ctfe_eval_ctfe_function_call(context, caller_env, ctfe_function, arg_values)
+		None:
+			Err(
+				CompilerCtfeEvalInvalid(
+					"internal compile-time constant evaluation error: cannot find function '" + source_name + "'",
+				),
+			)
+
+
+private pure func compiler_ctfe_eval_imported_function_call(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	module_path: String,
+	callable_id: Int,
+	source_name: String,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match compiler_ctfe_context_function_by_callable_id(context, callable_id):
+		Some(_):
+			compiler_ctfe_eval_function_call(
+				context,
+				caller_env,
+				callable_id,
+				source_name,
+				arg_values,
+			)
+		None:
+			functions = compiler_ctfe_context_imported_functions_by_source(
+				context,
+				module_path,
+				source_name,
+			)
+
+			if functions.length() == 1:
+				match functions.get(0):
+					Some(ctfe_function):
+						compiler_ctfe_eval_ctfe_function_call(
+							context,
+							caller_env,
+							ctfe_function,
+							arg_values,
+						)
+					None:
+						Err(CompilerCtfeEvalInvalid((
+									"internal compile-time constant evaluation error: imported function group was "
+									+ "empty"
+								)))
+			else if functions.length() == 0:
+				Err(
+					CompilerCtfeEvalUnsupported(
+						"imported function call '" + module_path + "." + source_name + "'",
+					),
+				)
+			else:
+				Err(
+					CompilerCtfeEvalInvalid(
+						"compile-time imported function call '" + module_path + "." + source_name + "' is ambiguous",
+					),
+				)
+
+
+private pure func compiler_ctfe_eval_constructor_call(
+	expr: CompilerCtfeIrExpr,
+	callable_id: Int,
+	source_name: String,
+	parent_type: String,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	Ok(compiler_ctfe_value(
+		compiler_ctfe_ir_eval_type(expr),
+		CompilerCtfeConstructorValue({
+			name = source_name,
+			args = arg_values,
+			constructor_info = compiler_ctfe_constructor_info(
+				parent_type,
+				arg_values.length(),
+				Some(callable_id),
+			),
+		}),
+		compiler_ctfe_ir_eval_span(expr),
+	))
+
+
+private pure func compiler_ctfe_eval_return_value(
+	expr: CompilerCtfeIrExpr,
+	value: CompilerCtfeValue,
+) -> CompilerCtfeValue:
+	{ value |
+		typ = compiler_ctfe_ir_eval_type(expr),
+		span = compiler_ctfe_ir_eval_span(expr)
+	}
+
+
+private pure func compiler_ctfe_eval_expect_list(
+	value: CompilerCtfeValue,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	match value.desc:
+		CompilerCtfeListValue(values):
+			Ok(values)
+		_:
+			Err(CompilerCtfeEvalUnsupported("List intrinsic on non-List values"))
+
+
+private pure func compiler_ctfe_eval_option_value(
+	expr: CompilerCtfeIrExpr,
+	value: Option[CompilerCtfeValue],
+) -> CompilerCtfeValue:
+	match value:
+		Some(inner):
+			compiler_ctfe_option_some_value(
+				compiler_ctfe_ir_eval_type(expr),
+				compiler_ctfe_ir_eval_span(expr),
+				inner,
+			)
+		None:
+			compiler_ctfe_option_none_value(
+				compiler_ctfe_ir_eval_type(expr),
+				compiler_ctfe_ir_eval_span(expr),
+			)
+
+
+private pure func compiler_ctfe_eval_int_option_value(
+	expr: CompilerCtfeIrExpr,
+	value: Option[Int],
+) -> CompilerCtfeValue:
+	match value:
+		Some(inner):
+			compiler_ctfe_eval_option_value(
+				expr,
+				Some(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), inner)),
+			)
+		None:
+			compiler_ctfe_eval_option_value(expr, None)
+
+
+private pure func compiler_ctfe_eval_char_option_value(
+	expr: CompilerCtfeIrExpr,
+	value: Option[Char],
+) -> CompilerCtfeValue:
+	match value:
+		Some(inner):
+			compiler_ctfe_eval_option_value(
+				expr,
+				Some(compiler_ctfe_char(compiler_ctfe_ir_eval_span(expr), inner)),
+			)
+		None:
+			compiler_ctfe_eval_option_value(expr, None)
+
+
+private pure func compiler_ctfe_eval_list_contains(
+	values: List[CompilerCtfeValue],
+	needle: CompilerCtfeValue,
+) -> Bool:
+	values.any(func(value): compiler_ctfe_values_equal(value, needle))
+
+
+private pure func compiler_ctfe_eval_list_join_values(
+	values: List[CompilerCtfeValue],
+	separator: String,
+) -> Result[String, CompilerCtfeEvalError]:
+	var text: String = ""
+	var first: Bool = True
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(value)):
+				Ok(part):
+					if first:
+						text = part
+						first = False
+					else:
+						text = text + separator + part
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(text)
+
+
+private pure func compiler_ctfe_eval_expect_function_reference(
+	value: CompilerCtfeValue,
+) -> Result[(Int, String), CompilerCtfeEvalError]:
+	match value.desc:
+		CompilerCtfeFunctionReferenceValue(reference):
+			Ok((reference.callable_id, reference.source_name))
+		_:
+			Err(CompilerCtfeEvalUnsupported("callback calls on non-function values"))
+
+
+private pure func compiler_ctfe_eval_callback_call(
+	context: CompilerCtfeContext,
+	caller_env: CompilerCtfeEnv,
+	callback: CompilerCtfeValue,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	callback_ref ?= compiler_ctfe_eval_expect_function_reference(callback)
+	(callable_id, source_name) = callback_ref
+	compiler_ctfe_eval_function_call(context, caller_env, callable_id, source_name, arg_values)
+
+
+private pure func compiler_ctfe_eval_list_map_values(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	var mapped: List[CompilerCtfeValue] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(item):
+					mapped = mapped.append(item)
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(mapped)
+
+
+private pure func compiler_ctfe_eval_list_filter_values(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	var filtered: List[CompilerCtfeValue] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(keep_value):
+					match compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(keep_value)):
+						Ok(keep):
+							if keep:
+								filtered = filtered.append(value)
+						Err(error):
+							failure = Some(error)
+							break
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(filtered)
+
+
+private pure func compiler_ctfe_eval_list_filter_map_values(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	var mapped: List[CompilerCtfeValue] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(option_value):
+					match compiler_ctfe_eval_option_state_result(
+						compiler_ctfe_option_state(option_value),
+					):
+						Ok(CompilerCtfeOptionSome(item)):
+							mapped = mapped.append(item)
+						Ok(CompilerCtfeOptionNone):
+							void
+						Err(error):
+							failure = Some(error)
+							break
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(mapped)
+
+
+private pure func compiler_ctfe_eval_list_flat_map_values(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	var mapped: List[CompilerCtfeValue] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(list_value):
+					match compiler_ctfe_eval_expect_list(list_value):
+						Ok(items):
+							mapped += items
+						Err(error):
+							failure = Some(error)
+							break
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(mapped)
+
+
+private pure func compiler_ctfe_eval_list_map_indexed_values(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+	span: CompilerSourceSpan,
+) -> Result[List[CompilerCtfeValue], CompilerCtfeEvalError]:
+	var mapped: List[CompilerCtfeValue] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+	var index: Int = 0
+
+	for value in values:
+		if failure.is_none():
+			index_value = compiler_ctfe_int(span, index)
+
+			match (
+				compiler_ctfe_eval_callback_call(
+					context,
+					env,
+					callback,
+					[index_value, value],
+				)
+			):
+				Ok(item):
+					mapped = mapped.append(item)
+				Err(error):
+					failure = Some(error)
+					break
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(mapped)
+
+
+private pure func compiler_ctfe_eval_list_fold_left_value(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	initial: CompilerCtfeValue,
+	callback: CompilerCtfeValue,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	var acc: CompilerCtfeValue = initial
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none():
+			match (
+				compiler_ctfe_eval_callback_call(
+					context,
+					env,
+					callback,
+					[acc, value],
+				)
+			):
+				Ok(next):
+					acc = next
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(acc)
+
+
+private pure func compiler_ctfe_eval_list_fold_right_value(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	initial: CompilerCtfeValue,
+	callback: CompilerCtfeValue,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	var acc: CompilerCtfeValue = initial
+	var failure: Option[CompilerCtfeEvalError] = None
+	var index: Int = values.length() - 1
+
+	while index >= 0:
+		if failure.is_none():
+			match values.get(index):
+				Some(value):
+					match (
+						compiler_ctfe_eval_callback_call(
+							context,
+							env,
+							callback,
+							[value, acc],
+						)
+					):
+						Ok(next):
+							acc = next
+						Err(error):
+							failure = Some(error)
+							break
+				None:
+					void
+
+		index -= 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(acc)
+
+
+private pure func compiler_ctfe_eval_list_all_value(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[Bool, CompilerCtfeEvalError]:
+	var result: Bool = True
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none() and result:
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(test_value):
+					match compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(test_value)):
+						Ok(keep):
+							if not keep:
+								result = False
+								break
+						Err(error):
+							failure = Some(error)
+							break
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_eval_list_any_value(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	values: List[CompilerCtfeValue],
+	callback: CompilerCtfeValue,
+) -> Result[Bool, CompilerCtfeEvalError]:
+	var result: Bool = False
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		if failure.is_none() and not result:
+			match compiler_ctfe_eval_callback_call(context, env, callback, [value]):
+				Ok(test_value):
+					match compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(test_value)):
+						Ok(keep):
+							if keep:
+								result = True
+								break
+						Err(error):
+							failure = Some(error)
+							break
+				Err(error):
+					failure = Some(error)
+					break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func compiler_ctfe_eval_imported_list_intrinsic(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	op: CompilerCtfeListIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match (op, arg_values):
+		(CompilerCtfeListAll, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			all ?= compiler_ctfe_eval_list_all_value(context, env, values, callback)
+			Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), all))
+		(CompilerCtfeListMake, [capacity]):
+			_capacity ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(capacity))
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue([]),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListAppend, [receiver, elem]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(values.append(elem)),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListAny, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			any ?= compiler_ctfe_eval_list_any_value(context, env, values, callback)
+			Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), any))
+		(CompilerCtfeListConcat, [left, right]):
+			left_values ?= compiler_ctfe_eval_expect_list(left)
+			right_values ?= compiler_ctfe_eval_expect_list(right)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(left_values + right_values),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListContains, [receiver, elem]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			Ok(
+				compiler_ctfe_bool(
+					compiler_ctfe_ir_eval_span(expr),
+					compiler_ctfe_eval_list_contains(values, elem),
+				),
+			)
+		(CompilerCtfeListFilter, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			filtered ?= compiler_ctfe_eval_list_filter_values(context, env, values, callback)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(filtered),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListFilterMap, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			mapped ?= compiler_ctfe_eval_list_filter_map_values(context, env, values, callback)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(mapped),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListFlatMap, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			mapped ?= compiler_ctfe_eval_list_flat_map_values(context, env, values, callback)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(mapped),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListFoldLeft, [receiver, initial, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			result ?= compiler_ctfe_eval_list_fold_left_value(
+				context,
+				env,
+				values,
+				initial,
+				callback,
+			)
+			Ok(compiler_ctfe_eval_return_value(expr, result))
+		(CompilerCtfeListFoldRight, [receiver, initial, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			result ?= compiler_ctfe_eval_list_fold_right_value(
+				context,
+				env,
+				values,
+				initial,
+				callback,
+			)
+			Ok(compiler_ctfe_eval_return_value(expr, result))
+		(CompilerCtfeListGet, [receiver, index_value]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
+			Ok(compiler_ctfe_eval_option_value(expr, values.get(index)))
+		(CompilerCtfeListGetOr, [receiver, index_value, default_value]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
+			Ok(compiler_ctfe_eval_return_value(expr, values.get_or(index, default_value)))
+		(CompilerCtfeListJoin, [receiver, separator_value]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			separator ?= compiler_ctfe_eval_string_result(
+				compiler_ctfe_expect_string(separator_value),
+			)
+			text ?= compiler_ctfe_eval_list_join_values(values, separator)
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
+		(CompilerCtfeListLength, [receiver]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), values.length()))
+		(CompilerCtfeListMap, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			mapped ?= compiler_ctfe_eval_list_map_values(context, env, values, callback)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(mapped),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListMapIndexed, [receiver, callback]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			mapped ?= compiler_ctfe_eval_list_map_indexed_values(
+				context,
+				env,
+				values,
+				callback,
+				compiler_ctfe_ir_eval_span(expr),
+			)
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(mapped),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeListSet, [receiver, index_value, elem]):
+			values ?= compiler_ctfe_eval_expect_list(receiver)
+			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(values.set(index, elem)),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		_:
+			Err(CompilerCtfeEvalUnsupported("std/list compile-time intrinsic call"))
+
+
+private pure func compiler_ctfe_eval_imported_option_intrinsic(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	op: CompilerCtfeOptionIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match (op, arg_values):
+		(CompilerCtfeOptionAndThen, [receiver, callback]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					result ?= compiler_ctfe_eval_callback_call(context, env, callback, [value])
+					Ok(compiler_ctfe_eval_return_value(expr, result))
+				CompilerCtfeOptionNone:
+					Ok(
+						compiler_ctfe_option_none_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+						),
+					)
+		(CompilerCtfeOptionFilter, [receiver, callback]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					keep_value ?= compiler_ctfe_eval_callback_call(context, env, callback, [value])
+					keep ?= compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(keep_value))
+
+					if keep:
+						Ok(compiler_ctfe_eval_return_value(expr, receiver))
+					else:
+						Ok(
+							compiler_ctfe_option_none_value(
+								compiler_ctfe_ir_eval_type(expr),
+								compiler_ctfe_ir_eval_span(expr),
+							),
+						)
+				CompilerCtfeOptionNone:
+					Ok(compiler_ctfe_eval_return_value(expr, receiver))
+		(CompilerCtfeOptionGetOr, [receiver, default_value]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					Ok(compiler_ctfe_eval_return_value(expr, value))
+				CompilerCtfeOptionNone:
+					Ok(compiler_ctfe_eval_return_value(expr, default_value))
+		(CompilerCtfeOptionGetOrElse, [receiver, default_fn]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					Ok(compiler_ctfe_eval_return_value(expr, value))
+				CompilerCtfeOptionNone:
+					result ?= compiler_ctfe_eval_callback_call(context, env, default_fn, [])
+					Ok(compiler_ctfe_eval_return_value(expr, result))
+		(CompilerCtfeOptionIsNone, [receiver]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), False))
+				CompilerCtfeOptionNone:
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), True))
+		(CompilerCtfeOptionIsSome, [receiver]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), True))
+				CompilerCtfeOptionNone:
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), False))
+		(CompilerCtfeOptionMap, [receiver, callback]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					mapped ?= compiler_ctfe_eval_callback_call(context, env, callback, [value])
+					Ok(
+						compiler_ctfe_option_some_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							mapped,
+						),
+					)
+				CompilerCtfeOptionNone:
+					Ok(
+						compiler_ctfe_option_none_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+						),
+					)
+		_:
+			Err(CompilerCtfeEvalUnsupported("std/option compile-time intrinsic call"))
+
+
+private pure func compiler_ctfe_eval_imported_result_intrinsic(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	op: CompilerCtfeResultIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match (op, arg_values):
+		(CompilerCtfeResultAndThen, [receiver, callback]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					result ?= compiler_ctfe_eval_callback_call(context, env, callback, [value])
+					Ok(compiler_ctfe_eval_return_value(expr, result))
+				CompilerCtfeResultErr(error_value):
+					Ok(
+						compiler_ctfe_result_err_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							error_value,
+						),
+					)
+		(CompilerCtfeResultGetOr, [receiver, default_value]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					Ok(compiler_ctfe_eval_return_value(expr, value))
+				CompilerCtfeResultErr(_):
+					Ok(compiler_ctfe_eval_return_value(expr, default_value))
+		(CompilerCtfeResultGetOrElse, [receiver, default_fn]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					Ok(compiler_ctfe_eval_return_value(expr, value))
+				CompilerCtfeResultErr(error_value):
+					result ?= compiler_ctfe_eval_callback_call(
+						context,
+						env,
+						default_fn,
+						[error_value],
+					)
+					Ok(compiler_ctfe_eval_return_value(expr, result))
+		(CompilerCtfeResultIsErr, [receiver]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), False))
+				CompilerCtfeResultErr(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), True))
+		(CompilerCtfeResultIsOk, [receiver]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), True))
+				CompilerCtfeResultErr(_):
+					Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), False))
+		(CompilerCtfeResultMap, [receiver, callback]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					mapped ?= compiler_ctfe_eval_callback_call(context, env, callback, [value])
+					Ok(
+						compiler_ctfe_result_ok_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							mapped,
+						),
+					)
+				CompilerCtfeResultErr(error_value):
+					Ok(
+						compiler_ctfe_result_err_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							error_value,
+						),
+					)
+		(CompilerCtfeResultMapErr, [receiver, callback]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					Ok(
+						compiler_ctfe_result_ok_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							value,
+						),
+					)
+				CompilerCtfeResultErr(error_value):
+					mapped ?= compiler_ctfe_eval_callback_call(
+						context,
+						env,
+						callback,
+						[error_value],
+					)
+					Ok(
+						compiler_ctfe_result_err_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							mapped,
+						),
+					)
+		_:
+			Err(CompilerCtfeEvalUnsupported("std/result compile-time intrinsic call"))
+
+
+private pure func compiler_ctfe_eval_imported_string_intrinsic(
+	expr: CompilerCtfeIrExpr,
+	op: CompilerCtfeStringIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match (op, arg_values):
+		(CompilerCtfeStringContains, [receiver, needle_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			needle ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(needle_value))
+			Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), receiver_text.contains(needle)))
+		(CompilerCtfeStringEndsWith, [receiver, suffix_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			suffix ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(suffix_value))
+			Ok(
+				compiler_ctfe_bool(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.ends_with(suffix),
+				),
+			)
+		(CompilerCtfeStringGet, [receiver, index_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
+			Ok(compiler_ctfe_eval_char_option_value(expr, receiver_text.get(index)))
+		(CompilerCtfeStringGetOr, [receiver, index_value, default_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
+			default_char ?= compiler_ctfe_eval_char_result(compiler_ctfe_expect_char(default_value))
+			Ok(
+				compiler_ctfe_char(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.get_or(index, default_char),
+				),
+			)
+		(CompilerCtfeStringIndexOf, [receiver, needle_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			needle ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(needle_value))
+			Ok(compiler_ctfe_eval_int_option_value(expr, receiver_text.index_of(needle)))
+		(CompilerCtfeStringLength, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), receiver_text.length()))
+		(CompilerCtfeStringRawIndexOf, [receiver, needle_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			needle ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(needle_value))
+			Ok(
+				compiler_ctfe_int(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.raw_index_of(needle),
+				),
+			)
+		(CompilerCtfeStringRepeat, [receiver, count_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.repeat(count)))
+		(CompilerCtfeStringReplace, [receiver, old_value, new_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			old ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(old_value))
+			new_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(new_value))
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.replace(old, new_text),
+				),
+			)
+		(CompilerCtfeStringSplit, [receiver, delimiter_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			delimiter ?= compiler_ctfe_eval_string_result(
+				compiler_ctfe_expect_string(delimiter_value),
+			)
+			values = receiver_text
+				.split(delimiter)
+				.map(func(part): compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), part))
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(values),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeStringStartsWith, [receiver, prefix_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			prefix ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(prefix_value))
+			Ok(
+				compiler_ctfe_bool(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.starts_with(prefix),
+				),
+			)
+		(CompilerCtfeStringSubstring, [receiver, start_value, length_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			start ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(start_value))
+			length ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(length_value))
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.substring(start, length),
+				),
+			)
+		(CompilerCtfeStringTrim, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.trim()))
+		_:
+			Err(CompilerCtfeEvalUnsupported("std/string compile-time intrinsic call"))
+
+
+private pure func compiler_ctfe_eval_imported_intrinsic(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	intrinsic: CompilerCtfeImportedIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match intrinsic:
+		CompilerCtfeImportedListIntrinsic(op):
+			compiler_ctfe_eval_imported_list_intrinsic(context, env, expr, op, arg_values)
+		CompilerCtfeImportedOptionIntrinsic(op):
+			compiler_ctfe_eval_imported_option_intrinsic(context, env, expr, op, arg_values)
+		CompilerCtfeImportedResultIntrinsic(op):
+			compiler_ctfe_eval_imported_result_intrinsic(context, env, expr, op, arg_values)
+		CompilerCtfeImportedStringIntrinsic(op):
+			compiler_ctfe_eval_imported_string_intrinsic(expr, op, arg_values)
+
+
+private pure func compiler_ctfe_eval_call(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+	call: CompilerCtfeIrCall,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match call.kind:
+		CompilerCtfeIrUnresolvedCall:
+			Err(CompilerCtfeEvalUnsupported("unresolved function calls"))
+		CompilerCtfeIrImpureCall:
+			Err(CompilerCtfeEvalUnsupported("impure function calls"))
+		CompilerCtfeIrUnsupportedCall(form):
+			Err(CompilerCtfeEvalUnsupported(form))
+		CompilerCtfeIrLocalCall(direct):
+			if not direct.is_pure:
+				Err(CompilerCtfeEvalUnsupported("impure function calls"))
+			else:
+				arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
+				compiler_ctfe_eval_function_call(
+					context,
+					env,
+					direct.callable_id,
+					direct.source_name,
+					arg_values,
+				)
+		CompilerCtfeIrImportedCall(direct, module_path):
+			if not direct.is_pure:
+				Err(CompilerCtfeEvalUnsupported("impure function calls"))
+			else:
+				arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
+
+				match compiler_ctfe_imported_intrinsic(module_path, direct.source_name):
+					Some(intrinsic):
+						compiler_ctfe_eval_imported_intrinsic(
+							context,
+							env,
+							expr,
+							intrinsic,
+							arg_values,
+						)
+					None:
+						compiler_ctfe_eval_imported_function_call(
+							context,
+							env,
+							module_path,
+							direct.callable_id,
+							direct.source_name,
+							arg_values,
+						)
+		CompilerCtfeIrConstructorCall(direct, parent_type):
+			if not direct.is_pure:
+				Err(CompilerCtfeEvalUnsupported("impure function calls"))
+			else:
+				arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
+				compiler_ctfe_eval_constructor_call(
+					expr,
+					direct.callable_id,
+					direct.source_name,
+					parent_type,
+					arg_values,
+				)
+
+
+private pure func compiler_ctfe_bind_pattern_values(
+	env: CompilerCtfeEnv,
+	bindings: List[(String, CompilerCtfeValue)],
+) -> CompilerCtfeEnv:
+	var next_env = env
+
+	for (name, value) in bindings:
+		next_env = compiler_ctfe_bind_local_value(next_env, name, value)
+
+	next_env
+
+
+private pure func compiler_ctfe_eval_match(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	scrutinee: CompilerCtfeIrExpr,
+	cases: List[CompilerCtfeIrMatchCase],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	scrutinee_value ?= compiler_ctfe_eval_ir_in_context(context, env, scrutinee)
+	var result: Option[CompilerCtfeValue] = None
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for case in cases:
+		if result.is_some():
+			break
+
+		match compiler_ctfe_eval_bindings_result(
+			compiler_ctfe_pattern_bind(
+				context,
+				case.pattern,
+				scrutinee_value,
+			),
+		):
+			Ok(Some(bindings)):
+				case_env = compiler_ctfe_bind_pattern_values(env, bindings)
+
+				match compiler_ctfe_eval_ir_in_context(context, case_env, case.body):
+					Ok(value):
+						result = Some(value)
+					Err(error):
+						failure = Some(error)
+						break
+			Ok(None):
+				void
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			match result:
+				Some(value):
+					Ok(value)
+				None:
+					Err(CompilerCtfeEvalInvalid("compile-time match expression was not exhaustive"))
+
+
+private pure func compiler_ctfe_project_loop_body_result(
+	result: CompilerCtfeLoopBodyResult,
+	base_env: CompilerCtfeEnv,
+) -> CompilerCtfeLoopBodyResult:
+	match result:
+		CompilerCtfeLoopBodyValue(env, value):
+			CompilerCtfeLoopBodyValue(
+				compiler_ctfe_project_existing_bindings(env, base_env),
+				value,
+			)
+		CompilerCtfeLoopBodyBreak(env):
+			CompilerCtfeLoopBodyBreak(compiler_ctfe_project_existing_bindings(env, base_env))
+		CompilerCtfeLoopBodyContinue(env):
+			CompilerCtfeLoopBodyContinue(compiler_ctfe_project_existing_bindings(env, base_env))
+
+
+private pure func compiler_ctfe_eval_loop_match(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	scrutinee: CompilerCtfeIrExpr,
+	cases: List[CompilerCtfeIrMatchCase],
+) -> Result[CompilerCtfeLoopBodyResult, CompilerCtfeEvalError]:
+	scrutinee_value ?= compiler_ctfe_eval_ir_in_context(context, env, scrutinee)
+	var result: Option[CompilerCtfeLoopBodyResult] = None
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for case in cases:
+		if result.is_some():
+			break
+
+		match compiler_ctfe_eval_bindings_result(
+			compiler_ctfe_pattern_bind(
+				context,
+				case.pattern,
+				scrutinee_value,
+			),
+		):
+			Ok(Some(bindings)):
+				case_env = compiler_ctfe_bind_pattern_values(env, bindings)
+
+				match compiler_ctfe_eval_loop_body(context, case_env, case.body):
+					Ok(loop_result):
+						result = Some(compiler_ctfe_project_loop_body_result(loop_result, env))
+						break
+					Err(error):
+						failure = Some(error)
+						break
+			Ok(None):
+				void
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			match result:
+				Some(loop_result):
+					Ok(loop_result)
+				None:
+					Err(CompilerCtfeEvalInvalid("compile-time match expression was not exhaustive"))
+
+
+private pure func compiler_ctfe_eval_loop_block(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	block_expr: CompilerCtfeIrExpr,
+	block: CompilerCtfeIrBlock,
+) -> Result[CompilerCtfeLoopBodyResult, CompilerCtfeEvalError]:
+	var block_env = env
+	var failure: Option[CompilerCtfeEvalError] = None
+	var control: Option[CompilerCtfeLoopBodyResult] = None
+
+	for item in block.items:
+		if control.is_some():
+			break
+
+		match item:
+			CompilerCtfeIrDiscardItem(expr):
+				match compiler_ctfe_eval_loop_body(context, block_env, expr):
+					Ok(CompilerCtfeLoopBodyValue(next_env, _)):
+						block_env = next_env
+					Ok(CompilerCtfeLoopBodyBreak(next_env)):
+						control = Some(CompilerCtfeLoopBodyBreak(next_env))
+						break
+					Ok(CompilerCtfeLoopBodyContinue(next_env)):
+						control = Some(CompilerCtfeLoopBodyContinue(next_env))
+						break
+					Err(error):
+						failure = Some(error)
+						break
+			_:
+				match compiler_ctfe_eval_block_item(context, block_env, block_expr, item):
+					Ok(CompilerCtfeBlockItemContinue(next_env)):
+						block_env = next_env
+					Ok(CompilerCtfeBlockItemReturn(value)):
+						control = Some(CompilerCtfeLoopBodyValue(block_env, value))
+						break
+					Err(error):
+						failure = Some(error)
+						break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			match control:
+				Some(loop_result):
+					Ok(compiler_ctfe_project_loop_body_result(loop_result, env))
+				None:
+					result ?= compiler_ctfe_eval_loop_body(context, block_env, block.result)
+					Ok(compiler_ctfe_project_loop_body_result(result, env))
+
+
+private pure func compiler_ctfe_eval_loop_body(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeLoopBodyResult, CompilerCtfeEvalError]:
+	match expr.desc:
+		CompilerCtfeIrBreakExpr:
+			Ok(CompilerCtfeLoopBodyBreak(env))
+		CompilerCtfeIrContinueExpr:
+			Ok(CompilerCtfeLoopBodyContinue(env))
+		CompilerCtfeIrBlockExpr(block):
+			compiler_ctfe_eval_loop_block(context, env, expr, block)
+		CompilerCtfeIrIfExpr(condition, then_expr, else_expr):
+			condition_value ?= compiler_ctfe_eval_ir_in_context(context, env, condition)
+			condition_bool ?= compiler_ctfe_eval_bool_result(
+				compiler_ctfe_expect_bool(condition_value),
+			)
+
+			if condition_bool:
+				compiler_ctfe_eval_loop_body(context, env, then_expr)
+			else:
+				match else_expr:
+					Some(value):
+						compiler_ctfe_eval_loop_body(context, env, value)
+					None:
+						Ok(CompilerCtfeLoopBodyValue(env, compiler_ctfe_eval_void_value(expr)))
+		CompilerCtfeIrMatchExpr(scrutinee, cases):
+			compiler_ctfe_eval_loop_match(context, env, scrutinee, cases)
+		CompilerCtfeIrWhileExpr(condition, body):
+			next_env ?= compiler_ctfe_eval_while_env(context, env, condition, body)
+			Ok(CompilerCtfeLoopBodyValue(next_env, compiler_ctfe_eval_void_value(expr)))
+		CompilerCtfeIrForExpr(name, iterable, body):
+			next_env ?= compiler_ctfe_eval_for_env(context, env, name, iterable, body)
+			Ok(CompilerCtfeLoopBodyValue(next_env, compiler_ctfe_eval_void_value(expr)))
+		CompilerCtfeIrForTupleExpr(names, iterable, body):
+			next_env ?= compiler_ctfe_eval_for_tuple_env(context, env, names, iterable, body)
+			Ok(CompilerCtfeLoopBodyValue(next_env, compiler_ctfe_eval_void_value(expr)))
+		_:
+			value ?= compiler_ctfe_eval_ir_in_context(context, env, expr)
+			Ok(CompilerCtfeLoopBodyValue(env, value))
+
+
+private pure func compiler_ctfe_eval_while_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	condition: CompilerCtfeIrExpr,
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	var loop_env = env
+	var done: Bool = False
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	while not done and failure.is_none():
+		match compiler_ctfe_eval_ir_in_context(context, loop_env, condition):
+			Ok(condition_value):
+				match compiler_ctfe_eval_bool_result(compiler_ctfe_expect_bool(condition_value)):
+					Ok(keep_going):
+						if keep_going:
+							match compiler_ctfe_eval_loop_body(context, loop_env, body):
+								Ok(CompilerCtfeLoopBodyValue(next_env, _)):
+									loop_env = next_env
+								Ok(CompilerCtfeLoopBodyContinue(next_env)):
+									loop_env = next_env
+								Ok(CompilerCtfeLoopBodyBreak(next_env)):
+									loop_env = next_env
+									done = True
+								Err(error):
+									failure = Some(error)
+						else:
+							done = True
+					Err(error):
+						failure = Some(error)
+			Err(error):
+				failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(loop_env)
+
+
+private pure func compiler_ctfe_eval_for_body_iteration(
+	context: CompilerCtfeContext,
+	outer_env: CompilerCtfeEnv,
+	iteration_env: CompilerCtfeEnv,
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeLoopBodyResult, CompilerCtfeEvalError]:
+	result ?= compiler_ctfe_eval_loop_body(context, iteration_env, body)
+	Ok(compiler_ctfe_project_loop_body_result(result, outer_env))
+
+
+private pure func compiler_ctfe_eval_for_range_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	name: String,
+	iterable: CompilerCtfeIrExpr,
+	start_value: CompilerCtfeValue,
+	end_value: CompilerCtfeValue,
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	start_int ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(start_value))
+	end_int ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(end_value))
+
+	step = if start_int <= end_int:
+		1
+	else:
+		-1
+
+	var current = start_int
+	var loop_env = env
+	var done: Bool = False
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	while not done and failure.is_none():
+		outside_range = if start_int <= end_int:
+			current >= end_int
+		else:
+			current <= end_int
+
+		if outside_range:
+			done = True
+		else:
+			item = compiler_ctfe_int(compiler_ctfe_ir_eval_span(iterable), current)
+			iteration_env = compiler_ctfe_bind_local_value(loop_env, name, item)
+
+			match compiler_ctfe_eval_for_body_iteration(context, loop_env, iteration_env, body):
+				Ok(CompilerCtfeLoopBodyValue(next_env, _)):
+					loop_env = next_env
+					current += step
+				Ok(CompilerCtfeLoopBodyContinue(next_env)):
+					loop_env = next_env
+					current += step
+				Ok(CompilerCtfeLoopBodyBreak(next_env)):
+					loop_env = next_env
+					done = True
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(loop_env)
+
+
+private pure func compiler_ctfe_eval_for_list_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	name: String,
+	values: List[CompilerCtfeValue],
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	var loop_env = env
+	var done: Bool = False
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for item in values:
+		if done or failure.is_some():
+			break
+
+		iteration_env = compiler_ctfe_bind_local_value(loop_env, name, item)
+
+		match compiler_ctfe_eval_for_body_iteration(context, loop_env, iteration_env, body):
+			Ok(CompilerCtfeLoopBodyValue(next_env, _)):
+				loop_env = next_env
+			Ok(CompilerCtfeLoopBodyContinue(next_env)):
+				loop_env = next_env
+			Ok(CompilerCtfeLoopBodyBreak(next_env)):
+				loop_env = next_env
+				done = True
+			Err(error):
+				failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(loop_env)
+
+
+private pure func compiler_ctfe_bind_loop_tuple_values(
+	env: CompilerCtfeEnv,
+	names: List[String],
+	values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	if names.length() != values.length():
+		Err(CompilerCtfeEvalUnsupported("tuple for loops over non-tuples"))
+	else:
+		var next_env = env
+		var index: Int = 0
+		var failure: Option[CompilerCtfeEvalError] = None
+
+		for name in names:
+			match values.get(index):
+				Some(value):
+					next_env = compiler_ctfe_bind_local_value(next_env, name, value)
+				None:
+					failure = Some(CompilerCtfeEvalUnsupported("tuple for loops over non-tuples"))
+					break
+
+			index += 1
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(next_env)
+
+
+private pure func compiler_ctfe_eval_for_tuple_list_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	names: List[String],
+	values: List[CompilerCtfeValue],
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	var loop_env = env
+	var done: Bool = False
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for item in values:
+		if done or failure.is_some():
+			break
+
+		match item.desc:
+			CompilerCtfeTupleValue(items):
+				match compiler_ctfe_bind_loop_tuple_values(loop_env, names, items):
+					Ok(iteration_env):
+						match compiler_ctfe_eval_for_body_iteration(
+							context,
+							loop_env,
+							iteration_env,
+							body,
+						):
+							Ok(CompilerCtfeLoopBodyValue(next_env, _)):
+								loop_env = next_env
+							Ok(CompilerCtfeLoopBodyContinue(next_env)):
+								loop_env = next_env
+							Ok(CompilerCtfeLoopBodyBreak(next_env)):
+								loop_env = next_env
+								done = True
+							Err(error):
+								failure = Some(error)
+					Err(error):
+						failure = Some(error)
+						break
+			_:
+				failure = Some(CompilerCtfeEvalUnsupported("tuple for loops over non-tuples"))
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(loop_env)
+
+
+private pure func compiler_ctfe_eval_for_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	name: String,
+	iterable: CompilerCtfeIrExpr,
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	iterable_value ?= compiler_ctfe_eval_ir_in_context(context, env, iterable)
+
+	match iterable_value.desc:
+		CompilerCtfeRangeValue(start_value, end_value):
+			compiler_ctfe_eval_for_range_env(
+				context,
+				env,
+				name,
+				iterable,
+				start_value,
+				end_value,
+				body,
+			)
+		CompilerCtfeListValue(values):
+			compiler_ctfe_eval_for_list_env(context, env, name, values, body)
+		_:
+			Err(CompilerCtfeEvalUnsupported("for loops over this iterable"))
+
+
+private pure func compiler_ctfe_eval_for_tuple_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	names: List[String],
+	iterable: CompilerCtfeIrExpr,
+	body: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	iterable_value ?= compiler_ctfe_eval_ir_in_context(context, env, iterable)
+
+	match iterable_value.desc:
+		CompilerCtfeListValue(values):
+			compiler_ctfe_eval_for_tuple_list_env(context, env, names, values, body)
+		_:
+			Err(CompilerCtfeEvalUnsupported("tuple for loops over this iterable"))
+
+
+private pure func compiler_ctfe_eval_ir_in_context(
+	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
 	expr: CompilerCtfeIrExpr,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
@@ -581,17 +2669,19 @@ pure func compiler_ctfe_eval_ir(
 		CompilerCtfeIrIdentExpr(identifier):
 			compiler_ctfe_eval_identifier(env, expr, identifier)
 		CompilerCtfeIrTransparentExpr(inner):
-			compiler_ctfe_eval_ir(env, inner)
+			compiler_ctfe_eval_ir_in_context(context, env, inner)
 		CompilerCtfeIrUnaryExpr(op, inner):
-			compiler_ctfe_eval_unary_expr(env, op, inner)
+			compiler_ctfe_eval_unary_expr(context, env, op, inner)
 		CompilerCtfeIrBinaryExpr(op, left, right):
-			compiler_ctfe_eval_binary_expr(env, op, left, right)
+			compiler_ctfe_eval_binary_expr(context, env, op, left, right)
 		CompilerCtfeIrLogicalExpr(op, left, right):
-			compiler_ctfe_eval_logical(env, expr, op, left, right)
+			compiler_ctfe_eval_logical(context, env, expr, op, left, right)
 		CompilerCtfeIrIfExpr(condition, then_expr, else_expr):
-			compiler_ctfe_eval_if(env, expr, condition, then_expr, else_expr)
+			compiler_ctfe_eval_if(context, env, expr, condition, then_expr, else_expr)
+		CompilerCtfeIrCallExpr(call):
+			compiler_ctfe_eval_call(context, env, expr, call)
 		CompilerCtfeIrTupleExpr(items):
-			values ?= compiler_ctfe_eval_exprs(env, items)
+			values ?= compiler_ctfe_eval_exprs(context, env, items)
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),
@@ -600,7 +2690,7 @@ pure func compiler_ctfe_eval_ir(
 				),
 			)
 		CompilerCtfeIrListExpr(items):
-			values ?= compiler_ctfe_eval_exprs(env, items)
+			values ?= compiler_ctfe_eval_exprs(context, env, items)
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),
@@ -609,7 +2699,7 @@ pure func compiler_ctfe_eval_ir(
 				),
 			)
 		CompilerCtfeIrVectorExpr(items):
-			values ?= compiler_ctfe_eval_exprs(env, items)
+			values ?= compiler_ctfe_eval_exprs(context, env, items)
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),
@@ -618,7 +2708,7 @@ pure func compiler_ctfe_eval_ir(
 				),
 			)
 		CompilerCtfeIrRecordExpr(fields):
-			values ?= compiler_ctfe_eval_fields(env, fields)
+			values ?= compiler_ctfe_eval_fields(context, env, fields)
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),
@@ -627,9 +2717,9 @@ pure func compiler_ctfe_eval_ir(
 				),
 			)
 		CompilerCtfeIrRecordUpdateExpr(base, updates):
-			compiler_ctfe_eval_record_update(env, expr, base, updates)
+			compiler_ctfe_eval_record_update(context, env, expr, base, updates)
 		CompilerCtfeIrDictExpr(entries):
-			values ?= compiler_ctfe_eval_dict_entries(env, entries)
+			values ?= compiler_ctfe_eval_dict_entries(context, env, entries)
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),
@@ -637,20 +2727,49 @@ pure func compiler_ctfe_eval_ir(
 					compiler_ctfe_ir_eval_span(expr),
 				),
 			)
-		CompilerCtfeIrFieldAccessExpr(receiver, field_name):
-			compiler_ctfe_eval_field_access(env, receiver, field_name)
+		CompilerCtfeIrFieldAccessExpr(access):
+			compiler_ctfe_eval_field_access(context, env, access)
+		CompilerCtfeIrImportedGlobalExpr(imported):
+			compiler_ctfe_eval_imported_global(context, imported)
 		CompilerCtfeIrRangeExpr(start_expr, end_expr):
-			compiler_ctfe_eval_range(env, expr, start_expr, end_expr)
+			compiler_ctfe_eval_range(context, env, expr, start_expr, end_expr)
+		CompilerCtfeIrMatchExpr(scrutinee, cases):
+			compiler_ctfe_eval_match(context, env, scrutinee, cases)
+		CompilerCtfeIrWhileExpr(condition, body):
+			match compiler_ctfe_eval_while_env(context, env, condition, body):
+				Ok(_):
+					Ok(compiler_ctfe_eval_void_value(expr))
+				Err(error):
+					Err(error)
+		CompilerCtfeIrForExpr(name, iterable, body):
+			match compiler_ctfe_eval_for_env(context, env, name, iterable, body):
+				Ok(_):
+					Ok(compiler_ctfe_eval_void_value(expr))
+				Err(error):
+					Err(error)
+		CompilerCtfeIrForTupleExpr(names, iterable, body):
+			match compiler_ctfe_eval_for_tuple_env(context, env, names, iterable, body):
+				Ok(_):
+					Ok(compiler_ctfe_eval_void_value(expr))
+				Err(error):
+					Err(error)
+		CompilerCtfeIrBreakExpr:
+			Err(CompilerCtfeEvalUnsupported("break expressions"))
+		CompilerCtfeIrContinueExpr:
+			Err(CompilerCtfeEvalUnsupported("continue expressions"))
 		CompilerCtfeIrBlockExpr(block):
-			compiler_ctfe_eval_block(env, block)
+			compiler_ctfe_eval_block(context, env, expr, block)
+		CompilerCtfeIrStringInterpolationExpr(parts, _):
+			compiler_ctfe_eval_string_interpolation(context, env, expr, parts)
 		CompilerCtfeIrVoidExpr:
-			Ok(
-				compiler_ctfe_value(
-					compiler_ctfe_ir_eval_type(expr),
-					CompilerCtfeVoidValue,
-					compiler_ctfe_ir_eval_span(expr),
-				),
-			)
+			Ok(compiler_ctfe_eval_void_value(expr))
+
+
+pure func compiler_ctfe_eval_ir(
+	env: CompilerCtfeEnv,
+	expr: CompilerCtfeIrExpr,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	compiler_ctfe_eval_ir_in_context(compiler_ctfe_context_empty(), env, expr)
 
 
 pure func compiler_ctfe_eval_typed_expr(
@@ -660,6 +2779,6 @@ pure func compiler_ctfe_eval_typed_expr(
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
 	match compiler_ctfe_ir_from_typed_expr(context, expr):
 		Ok(ir):
-			compiler_ctfe_eval_ir(env, ir)
+			compiler_ctfe_eval_ir_in_context(context, env, ir)
 		Err(error):
 			Err(CompilerCtfeEvalTranslateError(error))

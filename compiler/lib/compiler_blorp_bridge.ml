@@ -47,6 +47,7 @@ type typechecked_source = {
   typechecked_program : Typed_ast.program;
   typechecked_errors : string list;
   typechecked_import_bindings : Session.import_binding list;
+  typechecked_ctfe_evaluated_by_blorp : bool;
   typechecked_comments : Parse_comments.collected_comment list;
   typechecked_phase : parsed_source_phase;
   typechecked_module_surface : Module_surface.t option;
@@ -1055,6 +1056,19 @@ let import_binding_response_field = function
       Error
         ("invalid_response", "import_bindings items must be JSON objects")
 
+let typechecked_ctfe_status_field artifact =
+  let* status = optional_json_response_field "ctfe_status" artifact in
+  match status with
+  | None -> Ok false
+  | Some (Lsp_json.String "evaluated") -> Ok true
+  | Some (Lsp_json.String "not_run") -> Ok false
+  | Some (Lsp_json.String other) ->
+      Error
+        ( "invalid_response",
+          "unsupported ctfe_status `" ^ other ^ "`" )
+  | Some _ ->
+      Error ("invalid_response", "field `ctfe_status` must be a string")
+
 let typechecked_source_artifact_field artifact =
   let* typechecked_phase = require_typecheck_source_phase artifact in
   let* typechecked_comments = parse_comments_response_field artifact in
@@ -1064,6 +1078,7 @@ let typechecked_source_artifact_field artifact =
     array_response_field_map "import_bindings" import_binding_response_field
       artifact
   in
+  let* typechecked_ctfe_evaluated_by_blorp = typechecked_ctfe_status_field artifact in
   let* typed_program_json = json_response_field "typed_program" artifact in
   match Typed_ast_json.decode_typed_program typed_program_json with
   | Ok typechecked_program ->
@@ -1072,6 +1087,7 @@ let typechecked_source_artifact_field artifact =
           typechecked_program;
           typechecked_errors;
           typechecked_import_bindings;
+          typechecked_ctfe_evaluated_by_blorp;
           typechecked_comments;
           typechecked_phase;
           typechecked_module_surface;
@@ -1086,6 +1102,7 @@ let typechecked_source_artifact_field artifact =
             typechecked_program = Typed_ast.make_program [];
             typechecked_errors;
             typechecked_import_bindings;
+            typechecked_ctfe_evaluated_by_blorp = false;
             typechecked_comments;
             typechecked_phase;
             typechecked_module_surface;

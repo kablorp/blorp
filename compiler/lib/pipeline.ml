@@ -250,11 +250,17 @@ let typecheck_graph_source_with_blorp_bridge ~allow_debug_only_calls
   | Ok artifact -> (
       match artifact.typechecked_errors with
       | [] ->
-          Ok (artifact.typechecked_program, artifact.typechecked_import_bindings)
+          if artifact.typechecked_ctfe_evaluated_by_blorp then
+            Ok
+              ( artifact.typechecked_program,
+                artifact.typechecked_import_bindings )
+          else
+            Error
+              [
+                bridge_error ~filename:source.preload_path
+                  "typecheck_source bridge completed without evaluating CTFE";
+              ]
       | errors -> Error (bridge_errors ~filename:source.preload_path errors))
-
-let evaluate_blorp_bridge_typed_program ~import_bindings typed_program =
-  Ctfe.evaluate_program ~import_bindings typed_program
 
 (** Phase 2.1: each top-level [Pipeline] entry point runs in its own
     [Session.t] so two compiles/checks in a single process can't leak state
@@ -277,7 +283,6 @@ let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
 let typecheck_loaded_graph_modules_with_blorp_bridge
     ~allow_debug_only_calls graph =
   let errors = ref [] in
-  let typed_modules = ref [] in
   let loaded_modules = Modules.get_all_modules () in
   loaded_modules
   |> List.iter (fun (m : Modules.loaded_module) ->
@@ -299,25 +304,12 @@ let typecheck_loaded_graph_modules_with_blorp_bridge
                  with
                  | Ok (typed_decls, import_bindings) ->
                      Modules.set_typed_decls m.name typed_decls;
-                     Modules.set_typed_import_bindings m.name import_bindings;
-                     typed_modules :=
-                       (m.name, typed_decls, import_bindings)
-                       :: !typed_modules
+                     Modules.set_typed_import_bindings m.name import_bindings
                  | Error module_errors ->
                      errors := module_errors @ !errors)));
   match List.rev !errors with
   | _ :: _ as errors -> errors
-  | [] ->
-      let ctfe_errors = ref [] in
-      List.rev !typed_modules
-      |> List.iter (fun (module_name, typed_decls, import_bindings) ->
-             match
-               evaluate_blorp_bridge_typed_program ~import_bindings typed_decls
-             with
-             | Ok evaluated -> Modules.set_typed_decls module_name evaluated
-             | Error module_errors ->
-                 ctfe_errors := module_errors @ !ctfe_errors);
-      List.rev !ctfe_errors
+  | [] -> []
 
 let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
     ~filename source =
@@ -713,15 +705,12 @@ let typecheck_graph_with_blorp_bridge_policy ~debug
                       error
                   | Ok (typed_program, import_bindings) ->
                       record_frontend MainTypecheck;
-                      evaluate_blorp_bridge_typed_program ~import_bindings
-                        typed_program
-                      |> Result.map (fun evaluated ->
-                             {
-                               blorp_bridge_source_program =
-                                 target.preload_decls;
-                               blorp_bridge_typed_program = evaluated;
-                               blorp_bridge_import_bindings = import_bindings;
-                             })
+                      Ok
+                        {
+                          blorp_bridge_source_program = target.preload_decls;
+                          blorp_bridge_typed_program = typed_program;
+                          blorp_bridge_import_bindings = import_bindings;
+                        }
 
 let typecheck_only_typed_with_blorp_bridge_policy ~debug
     ~allow_debug_only_calls ~filename ~preloaded_module_graph =

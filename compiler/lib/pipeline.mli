@@ -90,9 +90,10 @@ val typecheck_only_typed_with_blorp_bridge :
 
     This asks the Blorp typecheck bridge to typecheck the target source using
     graph-provided import modules and decodes the temporary typed-program
-    artifact. Graph-loaded dependency modules are decoded, CTFE-evaluated, and
-    cached inside the fresh pipeline session used for this check. The default
-    wrapper rejects direct [@debug_only] calls; use
+    artifact. Blorp owns CTFE for the target source and any dependency values
+    it evaluates through the bridge; this OCaml path only decodes the resulting
+    typed program and import bindings. The default wrapper rejects direct
+    [@debug_only] calls; use
     [typecheck_only_typed_with_blorp_bridge_policy] for command paths that
     need to honor [--debug]. Production source-command checks use this graph
     handoff; direct source APIs without a preloaded graph still use the legacy
@@ -273,12 +274,13 @@ val compile_preloaded_graph_with_blorp_bridge :
   (compile_outcome, Ast.compiler_error list) result
 (** Compile through the Blorp-owned source/typecheck frontier.
 
-    This consumes a Blorp frontend module graph, obtains the decoded Blorp
-    typed-program artifact, runs CTFE, populates dependency typed-module caches,
-    and then enters the same Core/codegen handoff used by [compile_parsed].
-    Production source-command compilation uses this path. Direct source APIs
-    without a preloaded frontend graph still use [compile]/[compile_parsed]
-    until their callers are migrated to the single frontend graph handoff. *)
+    This consumes a Blorp frontend module graph, obtains a decoded Blorp
+    typed-program artifact with CTFE already evaluated, populates dependency
+    typed-module caches, and then enters the same Core/codegen handoff used by
+    [compile_parsed]. Production source-command compilation uses this path.
+    Direct source APIs without a preloaded frontend graph still use
+    [compile]/[compile_parsed] until their callers are migrated to the single
+    frontend graph handoff. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->
