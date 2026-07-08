@@ -1764,14 +1764,19 @@ Implementation steps:
 Current progress:
 
 - `compiler_core_lower.brp` owns the first lowering slice for source
-  locations, Core type conversion, stable Core vars, scalar literal/name
-  expressions, unary/binary/logical expressions, tuple expressions, `if`,
-  simple blocks, ascriptions, assignment, field access, ranges, record
-  literals, and simple function/global declarations with explicit lowering
-  context state for Core def ids.
+  locations, Core type conversion, expression value-type lowering after
+  widening, function values as `Closure`, stable Core vars, scalar literal/name
+  expressions, resolved local/trait/intrinsic/closure call expressions,
+  unary/binary/logical expressions, tuple/list/vector/dict expressions, `if`,
+  blocks with local `LetExpr` bindings, ascriptions and opaque wrappers,
+  assignment, field access, ranges, record literals, and simple
+  function/global declarations with explicit lowering context state for Core
+  def ids.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the next
-  production boundary strict while expression coverage expands.
+  production boundary strict while expression coverage expands. Non-local
+  direct call targets still fail closed until imported, builtin, foreign,
+  constructor, and impl-method call kind lowering is explicitly ported.
 - `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
   Tensor-shaped type lowering exists in the helper, but the runtime test avoids
   constructing that metadata until backend test emission handles it cheaply.
@@ -1790,6 +1795,9 @@ Edge cases:
 - Subscript reads should already be calls; subscript assignment should already
   be typechecked into an explicit call.
 - Foreign string/bytes copy/no-copy metadata must be preserved.
+- Record update lowering needs either an early Core sugar variant in the Blorp
+  Core model or a direct lowering target that preserves update semantics across
+  later ownership passes.
 
 Tests:
 

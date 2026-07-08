@@ -19,14 +19,31 @@ import:
 			NotEqualOp,
 			SubtractOp,
 		),
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreBoxedStorageValue,
+		CoreCallKind(ClosureCall, IntrinsicCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreDictLiteralEntry,
 		CoreExpr(
 			BinaryExpr,
 			BreakExpr,
+			CallExpr,
 			ContinueExpr,
 			AssignExpr,
+			DictExpr,
 			FieldExpr,
 			IfExpr,
+			LetExpr,
+			ListConstructExpr,
 			LiteralExpr,
 			LogicalExpr,
 			RangeExpr,
@@ -35,9 +52,12 @@ import:
 			TupleExpr,
 			UnaryExpr,
 			VarExpr,
+			VectorExpr,
 			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
+		CoreListConstruct,
+		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(
 			BoolLiteral,
 			CharLiteral,
@@ -56,6 +76,22 @@ import:
 		CoreUnaryOp(NegateOp, NotOp),
 		CoreVar,
 	../stage_06_typecheck/compiler_infer:
+		CompilerCallableOrigin(
+			CompilerCallableBuiltin,
+			CompilerCallableConstructor,
+			CompilerCallableForeign,
+			CompilerCallableImported,
+			CompilerCallableImplMethod,
+			CompilerCallableLocal,
+		),
+		CompilerResolvedCallInfo,
+		CompilerResolvedCallTarget(
+			CompilerResolvedClosureCall,
+			CompilerResolvedDirectCall,
+			CompilerResolvedIntrinsicCall,
+			CompilerResolvedTraitMethodCall,
+		),
+		CompilerTypedDictEntry,
 		CompilerTypedExpr(
 			CompilerTypedAscriptionExpr,
 			CompilerTypedAssignExpr,
@@ -105,7 +141,8 @@ import:
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedRecordField,
-		compiler_typed_expr_semantic_type,
+		CompilerTypedVarDeclPayload,
+		compiler_typed_expr_value_type,
 	../stage_03_parse/compiler_parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -175,6 +212,7 @@ union CompilerCoreLowerError:
 	CompilerCoreLowerUnsupported(String)
 	CompilerCoreLowerInvalidType(String)
 	CompilerCoreLowerInvalidParam(String)
+	CompilerCoreLowerInvalidCall(String)
 
 
 record CompilerCoreLowerContext {
@@ -203,6 +241,8 @@ pure func compiler_core_lower_error_to_string(error: CompilerCoreLowerError) -> 
 			"invalid Core lowering type: " + message
 		CompilerCoreLowerInvalidParam(message):
 			"invalid Core lowering parameter: " + message
+		CompilerCoreLowerInvalidCall(message):
+			"invalid Core lowering call: " + message
 
 
 pure func compiler_core_lower_context(
@@ -368,13 +408,7 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 						),
 					)
 				CompilerFunctionType(_, _, _):
-					Err(
-						CompilerCoreLowerInvalidType(
-							"function type lowering is not implemented yet: " + compiler_type_to_string(
-								typ,
-							),
-						),
-					)
+					Ok(NamedType("Closure", []))
 				CompilerArrayType(_, _):
 					Err(
 						CompilerCoreLowerInvalidType(
@@ -751,6 +785,175 @@ private pure func lower_typed_exprs(
 			Ok(lowered)
 
 
+private pure func core_primitive_box_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if args.length() != 0:
+				False
+			else if name == "Int":
+				True
+			else if name == "Int8":
+				True
+			else if name == "Int16":
+				True
+			else if name == "Int32":
+				True
+			else if name == "Int64":
+				True
+			else if name == "UInt8":
+				True
+			else if name == "UInt16":
+				True
+			else if name == "UInt32":
+				True
+			else if name == "UInt64":
+				True
+			else if name == "Bool":
+				True
+			else if name == "Char":
+				True
+			else:
+				False
+		RangeType:
+			True
+		_:
+			False
+
+
+private pure func core_box_kind_for_type(typ: CoreType) -> CoreBoxKind:
+	match typ:
+		VoidType:
+			VoidBox
+		NamedType(name, args):
+			if name == "Float" and args.length() == 0:
+				FloatBox
+			else if name == "Float32" and args.length() == 0:
+				Float32Box
+			else if name == "Float16" and args.length() == 0:
+				Float16Box
+			else if name == "Int128" and args.length() == 0:
+				Int128Box
+			else if name == "UInt128" and args.length() == 0:
+				UInt128Box
+			else if core_primitive_box_type(typ):
+				PrimBox
+			else:
+				PointerBox
+		_:
+			if core_primitive_box_type(typ):
+				PrimBox
+			else:
+				PointerBox
+
+
+private pure func core_boxed_value_needs_release_type(typ: CoreType, kind: CoreBoxKind) -> Bool:
+	match kind:
+		PointerBox:
+			match typ:
+				NamedType(name, args):
+					if name == "String" and args.length() == 0:
+						True
+					else if name == "Bytes" and args.length() == 0:
+						True
+					else if name == "Fixed" and args.length() == 0:
+						True
+					else if name == "Closure" and args.length() == 0:
+						True
+					else if name == "List" and args.length() == 1:
+						True
+					else if name == "Dict" and args.length() == 2:
+						True
+					else if name == "Set" and args.length() == 1:
+						True
+					else if name == "Channel" and args.length() == 1:
+						True
+					else if name == "Result" and args.length() == 2:
+						True
+					else:
+						False
+				TupleType(_):
+					True
+				TensorType(_):
+					True
+				_:
+					False
+		Int128Box:
+			True
+		UInt128Box:
+			True
+		_:
+			False
+
+
+private pure func core_boxed_storage_value_for_expr(
+	expr: CoreExpr,
+	typ: CoreType,
+) -> CoreBoxedStorageValue:
+	kind: CoreBoxKind = core_box_kind_for_type(typ)
+
+	{
+		kind = kind,
+		value = expr,
+		needs_release = core_boxed_value_needs_release_type(typ, kind),
+		transfers_ownership = False
+	}
+
+
+private pure func lower_typed_list_items(
+	items: List[CompilerTypedExpr],
+) -> Result[List[CoreBoxedStorageValue], CompilerCoreLowerError]:
+	var lowered: List[CoreBoxedStorageValue] = []
+	var failure: Option[CompilerCoreLowerError] = None
+
+	for item in items:
+		if failure.is_none():
+			match lower_typed_expr(item):
+				Ok(lowered_expr):
+					match compiler_core_lower_type(compiler_typed_expr_value_type(item)):
+						Ok(item_type):
+							lowered = lowered.append(
+								core_boxed_storage_value_for_expr(lowered_expr, item_type),
+							)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(lowered)
+
+
+private pure func lower_typed_dict_entries(
+	entries: List[CompilerTypedDictEntry],
+) -> Result[List[CoreDictLiteralEntry], CompilerCoreLowerError]:
+	var lowered: List[CoreDictLiteralEntry] = []
+	var failure: Option[CompilerCoreLowerError] = None
+
+	for entry in entries:
+		if failure.is_none():
+			match lower_typed_expr(entry.key):
+				Ok(key):
+					match lower_typed_expr(entry.value):
+						Ok(value):
+							lowered = lowered.append({
+								key = key,
+								value = value,
+							})
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(lowered)
+
+
 private pure func lower_typed_record_fields(
 	fields: List[CompilerTypedRecordField],
 ) -> Result[List[CoreRecordFieldValue], CompilerCoreLowerError]:
@@ -775,37 +978,132 @@ private pure func lower_typed_record_fields(
 			Ok(lowered)
 
 
+private pure func lower_typed_var_decl_type(
+	payload: CompilerTypedVarDeclPayload,
+) -> Result[CoreType, CompilerCoreLowerError]:
+	match payload.annotation:
+		Some(annotation):
+			compiler_core_lower_type(annotation)
+		None:
+			compiler_core_lower_type(compiler_typed_expr_value_type(payload.initializer))
+
+
+private pure func compiler_callable_origin_label(origin: CompilerCallableOrigin) -> String:
+	match origin:
+		CompilerCallableLocal:
+			"local"
+		CompilerCallableImported(module_name):
+			"imported " + module_name
+		CompilerCallableBuiltin:
+			"builtin"
+		CompilerCallableForeign:
+			"foreign"
+		CompilerCallableConstructor(parent_type):
+			"constructor " + parent_type
+		CompilerCallableImplMethod:
+			"impl method"
+
+
+private pure func lower_user_call_kind(
+	info: CompilerResolvedCallInfo,
+	callable_id: Int,
+	callee: CoreExpr,
+) -> Result[CoreCallKind, CompilerCoreLowerError]:
+	match callee:
+		VarExpr(variable, _, _):
+			match variable.def_id:
+				Some(existing_id):
+					if existing_id == callable_id:
+						Ok(UserCall(info.callee_name, Some(callable_id), []))
+					else:
+						Err(
+							CompilerCoreLowerInvalidCall(
+								"conflicting callable ids for " + info.callee_name
+									+ ": callee carried " + existing_id.to_string()
+									+ " but resolved_call carried " + callable_id.to_string(),
+							),
+						)
+				None:
+					Ok(UserCall(info.callee_name, Some(callable_id), []))
+		_:
+			Ok(UserCall(info.callee_name, Some(callable_id), []))
+
+
+private pure func lower_resolved_call_kind(
+	resolved: Option[CompilerResolvedCallInfo],
+	callee: CoreExpr,
+) -> Result[CoreCallKind, CompilerCoreLowerError]:
+	match resolved:
+		Some(info):
+			match info.target:
+				CompilerResolvedDirectCall(callable_id, origin):
+					match origin:
+						CompilerCallableLocal:
+							lower_user_call_kind(info, callable_id, callee)
+						_:
+							Err(
+								CompilerCoreLowerUnsupported(
+									"call target " + compiler_callable_origin_label(origin),
+								),
+							)
+				CompilerResolvedTraitMethodCall(_, callable_id):
+					match callable_id:
+						Some(id):
+							lower_user_call_kind(info, id, callee)
+						None:
+							Err(
+								CompilerCoreLowerUnsupported(
+									"trait method call without callable id: " + info.callee_name,
+								),
+							)
+				CompilerResolvedIntrinsicCall:
+					Ok(IntrinsicCall(info.callee_name))
+				CompilerResolvedClosureCall:
+					Ok(ClosureCall)
+		None:
+			Err(CompilerCoreLowerUnsupported("call without resolved metadata"))
+
+
 private pure func lower_typed_block_expr(
 	items: List[CompilerTypedExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CompilerCoreLowerError]:
-	if items.length() == 0:
-		Ok(VoidExpr(typ, loc))
-	else:
-		lowered_items ?= lower_typed_exprs(items)
-		last_index: Int = lowered_items.length() - 1
-		var index: Int = last_index
-		var result: CoreExpr = lowered_items.get_or(
-			last_index,
-			VoidExpr(typ, loc),
-		)
+	match items.get(0):
+		None:
+			Ok(VoidExpr(typ, loc))
+		Some(first):
+			rest: List[CompilerTypedExpr] = items.tail()
 
-		while index > 0:
-			index -= 1
-			result = SeqExpr(
-				lowered_items.get_or(
-					index,
-					VoidExpr(VoidType, loc),
-				),
-				result,
-			)
+			match first:
+				CompilerTypedVarDeclExpr(payload, _):
+					lowered_init ?= lower_typed_expr(payload.initializer)
+					bind_type ?= lower_typed_var_decl_type(payload)
+					body ?= lower_typed_block_expr(
+						rest,
+						typ,
+						compiler_core_source_loc(payload.span),
+					)
 
-		Ok(result)
+					Ok(LetExpr(
+						core_var(payload.name.text, None),
+						payload.is_mutable,
+						bind_type,
+						lowered_init,
+						body,
+					))
+				_:
+					lowered_first ?= lower_typed_expr(first)
+
+					if rest.length() == 0:
+						Ok(lowered_first)
+					else:
+						lowered_rest ?= lower_typed_block_expr(rest, typ, loc)
+						Ok(SeqExpr(lowered_first, lowered_rest))
 
 
 pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, CompilerCoreLowerError]:
-	typ ?= compiler_core_lower_type(compiler_typed_expr_semantic_type(expr))
+	typ ?= compiler_core_lower_type(compiler_typed_expr_value_type(expr))
 	loc: CoreSourceLoc = compiler_core_source_loc(typed_expr_span(expr))
 
 	match expr:
@@ -830,6 +1128,10 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			Ok(ContinueExpr(typ, loc))
 		CompilerTypedAscriptionExpr(inner, _, _, _):
 			lower_typed_expr(inner)
+		CompilerTypedOpaqueIntoExpr(_, inner, _, _):
+			lower_typed_expr(inner)
+		CompilerTypedOpaqueFromExpr(_, inner, _, _):
+			lower_typed_expr(inner)
 		CompilerTypedAssignExpr(name, _, value, _, _):
 			lowered_value ?= lower_typed_expr(value)
 			Ok(AssignExpr(core_var(name.text, None), lowered_value, typ, loc))
@@ -844,9 +1146,30 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			lowered_left ?= lower_typed_expr(left)
 			lowered_right ?= lower_typed_expr(right)
 			Ok(LogicalExpr(compiler_core_logical_op(op), lowered_left, lowered_right, typ, loc))
+		CompilerTypedCallExpr(callee, args, _, info):
+			lowered_callee ?= lower_typed_expr(callee)
+			lowered_args ?= lower_typed_exprs(args)
+			call_kind ?= lower_resolved_call_kind(info.resolved_call, lowered_callee)
+			Ok(CallExpr(call_kind, lowered_callee, lowered_args, typ, loc))
 		CompilerTypedTupleExpr(items, _, _):
 			lowered_items ?= lower_typed_exprs(items)
 			Ok(TupleExpr(lowered_items, typ, loc))
+		CompilerTypedListExpr(items, _, _):
+			lowered_items ?= lower_typed_list_items(items)
+			construct: CoreListConstruct = {
+				layout = PointerListStorage,
+				elements = lowered_items,
+				elem_needs_release = lowered_items.any(
+					func(item: CoreBoxedStorageValue): item.needs_release,
+				)
+			}
+			Ok(ListConstructExpr(construct, typ, loc))
+		CompilerTypedVectorExpr(items, _, _):
+			lowered_items ?= lower_typed_exprs(items)
+			Ok(VectorExpr(lowered_items, typ, loc))
+		CompilerTypedDictExpr(entries, _, _):
+			lowered_entries ?= lower_typed_dict_entries(entries)
+			Ok(DictExpr(lowered_entries, typ, loc))
 		CompilerTypedFieldAccessExpr(receiver, field, _, _):
 			lowered_receiver ?= lower_typed_expr(receiver)
 			Ok(FieldExpr(lowered_receiver, field.text, typ, loc))
@@ -870,6 +1193,8 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			Ok(IfExpr(lowered_condition, lowered_then, lowered_else, typ, loc))
 		CompilerTypedBlockExpr(items, _, _):
 			lower_typed_block_expr(items, typ, loc)
+		CompilerTypedVarDeclExpr(_, _):
+			lower_typed_block_expr([expr], typ, loc)
 		_:
 			Err(CompilerCoreLowerUnsupported(typed_expr_label(expr)))
 
