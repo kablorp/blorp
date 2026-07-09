@@ -2027,10 +2027,6 @@ let decode_typed_impl_info path value =
       | Error _ -> error path "decoded impl failed typed-AST validation")
   | _ -> error path "decoded parsed declaration was not an impl"
 
-let optional_type_field path name value =
-  let* value = field path name value in
-  decode_optional_type (path ^ "." ^ name) value
-
 let decode_typed_global_var_info path value =
   let* decl_json = field path "decl" value in
   let decl_path = path ^ ".decl" in
@@ -2121,10 +2117,6 @@ let rec decode_typed_decl_group path value =
       error
         (path ^ ".kind")
         ("typed declaration kind `" ^ kind ^ "` is not decoded yet")
-
-and decode_typed_decl path value =
-  let* decl_group = decode_typed_decl_group path value in
-  expect_single_typed_decl path decl_group
 
 let decode_typed_program value =
   let path = "$" in

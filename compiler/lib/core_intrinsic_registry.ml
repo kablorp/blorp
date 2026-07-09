@@ -651,15 +651,12 @@ let arc_intrinsics =
    Registry queries
    ================================================================ *)
 
-(** All intrinsics, flat list (used by [is_known]). *)
+(** All intrinsics, flat list. *)
 let all =
   list_intrinsics @ string_intrinsics @ bytes_intrinsics @ dict_intrinsics
   @ set_intrinsics @ slice_intrinsics @ tensor_intrinsics @ fixed_intrinsics
   @ math_intrinsics @ bitwise_intrinsics @ debug_reflection_intrinsics
   @ arc_intrinsics
-
-(** Check if a name is a registered intrinsic (implemented or planned). *)
-let is_known name = List.exists (fun i -> i.name = name) all
 
 let arity_matches expected actual =
   match expected with Fixed n -> n = actual | Variadic -> true
