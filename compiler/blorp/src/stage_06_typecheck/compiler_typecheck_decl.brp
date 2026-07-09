@@ -38,6 +38,8 @@ import:
 		compiler_env_find_conflicting_impl,
 		compiler_env_get_function_trait,
 		compiler_env_get_trait,
+		compiler_env_get_constructor_for_parent,
+		compiler_env_get_type_decl,
 		compiler_env_get_type_params,
 		compiler_env_has_direct_trait_evidence,
 		compiler_env_mint_def_id,
@@ -448,6 +450,20 @@ record CompilerTypedTypeAliasInfo {
 }
 
 
+record CompilerTypedUnionVariantInfo {
+	name: String,
+	fields: List[CompilerType],
+	tag: Int,
+	def_id: Option[Int]
+}
+
+
+record CompilerTypedUnionInfo {
+	decl: ParsedUnionDecl,
+	variants: List[CompilerTypedUnionVariantInfo]
+}
+
+
 record CompilerTypedImplInfo {
 	decl: ParsedImplDecl,
 	for_type: CompilerType,
@@ -460,6 +476,7 @@ union CompilerTypedDecl:
 	CompilerTypedGlobalVarDecl(CompilerTypedGlobalVarInfo)
 	CompilerTypedRecordDecl(CompilerTypedRecordInfo)
 	CompilerTypedTypeAliasDecl(CompilerTypedTypeAliasInfo)
+	CompilerTypedUnionDecl(CompilerTypedUnionInfo)
 	CompilerTypedImplDecl(CompilerTypedImplInfo)
 	CompilerTypedPrivateDecl(CompilerTypedDecl)
 	CompilerTypedParsedDecl(ParsedDecl)
@@ -658,6 +675,27 @@ private pure func compiler_typecheck_validate_typed_alias_info(
 	)
 
 
+private pure func compiler_typecheck_validate_typed_union_info(
+	state: CompilerTypecheckState,
+	label: String,
+	info: CompilerTypedUnionInfo,
+) -> CompilerTypecheckState:
+	var next = state
+
+	for variant in info.variants:
+		var index: Int = 0
+
+		for field in variant.fields:
+			next = compiler_typecheck_unfinalized_type_error(
+				next,
+				label + " variant '" + variant.name + "' field " + index.to_string(),
+				field,
+			)
+			index += 1
+
+	next
+
+
 private pure func compiler_typecheck_validate_typed_impl_info(
 	state: CompilerTypecheckState,
 	label: String,
@@ -708,6 +746,12 @@ private pure func compiler_typecheck_validate_typed_decl(
 			compiler_typecheck_validate_typed_alias_info(
 				state,
 				"type alias '" + info.decl.name.text + "'",
+				info,
+			)
+		CompilerTypedUnionDecl(info):
+			compiler_typecheck_validate_typed_union_info(
+				state,
+				"union '" + info.decl.name.text + "'",
 				info,
 			)
 		CompilerTypedImplDecl(info):
@@ -895,6 +939,58 @@ private pure func compiler_variants_from_parsed(
 		tag += 1
 
 	result
+
+
+private pure func compiler_typed_union_variant_from_def(
+	state: CompilerTypecheckState,
+	parent_type: String,
+	variant: CompilerVariantDef,
+) -> CompilerTypedUnionVariantInfo:
+	def_id: Option[Int] = match compiler_env_get_constructor_for_parent(
+		state.env,
+		parent_type,
+		variant.name,
+	):
+		Some(ctor):
+			Some(ctor.constructor_id)
+		None:
+			None
+
+	{
+		name = variant.name,
+		fields = variant.fields.map(compiler_type_copy),
+		tag = variant.tag,
+		def_id = def_id
+	}
+
+
+private pure func compiler_typed_union_variants_from_defs(
+	state: CompilerTypecheckState,
+	parent_type: String,
+	variants: List[CompilerVariantDef],
+) -> List[CompilerTypedUnionVariantInfo]:
+	variants.map(
+		func(variant): compiler_typed_union_variant_from_def(state, parent_type, variant),
+	)
+
+
+private pure func compiler_typed_union_from_parsed(
+	state: CompilerTypecheckState,
+	union_decl: ParsedUnionDecl,
+) -> CompilerTypedUnionInfo:
+	variants: List[CompilerVariantDef] = match compiler_env_get_type_decl(
+		state.env,
+		union_decl.name.text,
+	):
+		Some(pair):
+			pair[1]
+		None:
+			compiler_variants_from_parsed(state, union_decl.variants)
+
+	{
+		decl = union_decl,
+		variants = compiler_typed_union_variants_from_defs(state, union_decl.name.text, variants)
+	}
 
 
 private pure func compiler_imported_field_from_parsed(
@@ -4857,6 +4953,11 @@ private pure func compiler_typecheck_materialize_decl_body(
 			{
 				state = state,
 				decl = CompilerTypedRecordDecl(compiler_typed_record_from_parsed(state, record_decl))
+			}
+		UnionParsedDecl(union_decl):
+			{
+				state = state,
+				decl = CompilerTypedUnionDecl(compiler_typed_union_from_parsed(state, union_decl))
 			}
 		TypeAliasParsedDecl(alias_decl):
 			{

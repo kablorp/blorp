@@ -1366,12 +1366,56 @@ let typed_parsed_trait_decl =
           ] );
     ]
 
-let parsed_variant name =
+let parsed_variant ?(fields = []) name =
   Object
     [
       ("name", ident_at name);
-      ("fields", Array []);
+      ("fields", Array fields);
       ("span", span_json);
+    ]
+
+let typed_union_variant ?(fields = []) ?def_id name tag =
+  Object
+    [
+      ("name", String name);
+      ("fields", Array fields);
+      ("tag", Int tag);
+      ( "def_id",
+        match def_id with
+        | Some id -> Int id
+        | None -> Null );
+    ]
+
+let typed_union_decl =
+  Object
+    [
+      ("kind", String "union");
+      ( "info",
+        Object
+          [
+            ( "decl",
+              Object
+                [
+                  ("name", ident_at "MaybeName");
+                  ("type_params", Array []);
+                  ( "variants",
+                    Array
+                      [
+                        parsed_variant ~fields:[ parsed_named "Int" ] "SomeName";
+                        parsed_variant "NoName";
+                      ] );
+                  ("is_enum", Bool false);
+                  ("doc", Null);
+                  ("span", span_json);
+                ] );
+            ( "variants",
+              Array
+                [
+                  typed_union_variant ~fields:[ named "String" ] ~def_id:101
+                    "SomeName" 0;
+                  typed_union_variant ~def_id:102 "NoName" 1;
+                ] );
+          ] );
     ]
 
 let typed_parsed_enum_decl =
@@ -1528,6 +1572,44 @@ let test_decode_typed_program_record_and_alias_decls () =
             (Typed.type_alias_semantic_target_type alias)
       | _ -> Alcotest.fail "expected typed type alias declaration")
   | _ -> Alcotest.fail "expected two typed declarations"
+
+let test_decode_typed_program_union_decl () =
+  let program =
+    expect_typed_program
+      (Object
+         [
+           ("kind", String "typed_program");
+           ("source", Object []);
+           ("decls", Array [ typed_union_decl ]);
+           ("diagnostics", Array []);
+         ])
+  in
+  match Typed.program_decls program with
+  | [ decl ] -> (
+      match Typed.decl_ast decl with
+      | { decl_desc = DType type_decl; _ } ->
+          Alcotest.(check string) "union name" "MaybeName" type_decl.type_name;
+          Alcotest.(check bool) "not enum" false type_decl.type_is_enum;
+          (match type_decl.type_variants with
+          | [ some_name; no_name ] ->
+              Alcotest.(check string)
+                "first variant" "SomeName" some_name.variant_name;
+              Alcotest.(check int) "first tag" 0 some_name.variant_tag;
+              Alcotest.(check (option int))
+                "first def id" (Some 101) some_name.variant_def_id;
+              (match some_name.variant_fields with
+              | [ field_ty ] ->
+                  check_type "first field type" (TyNamed ("String", []))
+                    field_ty
+              | _ -> Alcotest.fail "expected one field on first variant");
+              Alcotest.(check string)
+                "second variant" "NoName" no_name.variant_name;
+              Alcotest.(check int) "second tag" 1 no_name.variant_tag;
+              Alcotest.(check (option int))
+                "second def id" (Some 102) no_name.variant_def_id
+          | _ -> Alcotest.fail "expected two variants")
+      | _ -> Alcotest.fail "expected typed union declaration")
+  | _ -> Alcotest.fail "expected one typed declaration"
 
 let test_decode_typed_program_impl_decl () =
   let program =
@@ -1880,6 +1962,8 @@ let suite =
           test_decode_typed_program_function_decl;
         Alcotest.test_case "typed program record and alias" `Quick
           test_decode_typed_program_record_and_alias_decls;
+        Alcotest.test_case "typed program union" `Quick
+          test_decode_typed_program_union_decl;
         Alcotest.test_case "typed program impl" `Quick
           test_decode_typed_program_impl_decl;
         Alcotest.test_case "typed program parsed passthrough" `Quick

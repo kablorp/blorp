@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-08.
+Status checked against code on 2026-07-09.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -1517,6 +1517,11 @@ Current status:
   parsing and typechecking. A compiler-unit regression pins that the
   graph-backed compile bridge consumes the preloaded target source rather than
   rereading a changed file from disk.
+- The compiler port inventory hygiene check now rejects new references to
+  legacy direct-source pipeline entrypoints outside the narrow allowlist
+  (`pipeline`, the private OCaml host tooling commands, package checking, REPL,
+  and test runner). This keeps normal source-command work on the Blorp frontend
+  graph while the remaining tooling paths are migrated deliberately.
 - Blorp now has the first CTFE value/operator foundation in
   `compiler_ctfe_value.brp`: typed compile-time values, constructor payload
   metadata, structural equality, expectation helpers, and primitive unary/binary
@@ -1766,23 +1771,96 @@ Current progress:
   locations, Core type conversion, expression value-type lowering after
   widening, function values as `Closure`, stable Core vars, scalar literal/name
   expressions, resolved local/trait/intrinsic/closure call expressions,
-  unary/binary/logical expressions, tuple/list/vector/dict expressions, `if`,
-  blocks with local `LetExpr` bindings, ascriptions and opaque wrappers,
-  assignment, field access, ranges, record literals, and simple
-  function/global declarations with explicit lowering context state for Core
-  def ids.
+  resolved builtin direct-call expressions, unary/binary/logical expressions,
+  tuple/list/vector/dict expressions, `if`, `while`, lambdas, blocks with local
+  `LetExpr` bindings, tuple destructuring block items, ascriptions and opaque
+  wrappers, assignment, record field access, tuple field access, ranges, record
+  literals, and `detach`, no-parameter `concurrent:` blocks, simple
+  literal/wildcard matches, simple `select:` expressions,
+  simple named-binder
+  range/List/String/Set `for` loops, and function/global/record/enum/union
+  declarations with explicit lowering context state for Core def ids.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the next
-  production boundary strict while expression coverage expands. Non-local
-  direct call targets still fail closed until imported, builtin, foreign,
-  constructor, and impl-method call kind lowering is explicitly ported.
+  production boundary strict while expression coverage expands. Imported,
+  constructor, impl-method, and foreign direct-call origins remain explicitly
+  closed until flattening, constructor lowering, resolve, and FFI
+  argument-passing policy are available at this lowering boundary.
 - `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
   Tensor-shaped type lowering exists in the helper, but the runtime test avoids
   constructing that metadata until backend test emission handles it cheaply.
+- The lowering tests now include a fixture-shaped `CompilerTypedProgram` to
+  Core JSON harness. It starts with a small function fixture and gives future
+  slices a stable place to compare typed-program bridge artifacts against
+  Blorp-lowered Core without threading through the whole production compiler
+  path.
+- `while` and lambda lowering now follow the OCaml lowering shape directly:
+  `while` lowers to `WhileExpr(cond, body)` and lambdas lower to Core lambda
+  nodes over typed lambda parameter records, explicit return type, body, and
+  purity.
+- Record declaration lowering maps typed `struct` declarations to
+  `ValueRecordDecl` and heap `record` declarations to `HeapRecordDecl`.
+  Heap-record field cleanup metadata is derived through the shared backend
+  type-layout policy helper instead of duplicating release-policy logic in the
+  lowerer.
+- `detach` lowers to the pre-closure Core detach form so closure conversion
+  remains the single place that turns detached bodies into task closures.
+- No-parameter `concurrent:` blocks lower to the pre-closure Core concurrent
+  form. When a concurrent block appears at the head of a block expression, the
+  following block tail becomes the concurrent body so task-result bindings
+  scope over their actual uses. Parameterized concurrent blocks stay closed
+  until timeout and `max_threads` normalization are ported.
+- `select:` receive, sealed, integer-timeout, and `Duration`-timeout arms lower
+  to the prepared `SelectExpr` Core shape. Duration timeout lowering now
+  mirrors OCaml's microsecond-to-millisecond conversion, including clamping
+  non-positive values to zero and rounding positive sub-millisecond values up.
+  `concurrent(...)` block parameters now lower `timeout` through that same
+  normalization path and preserve positive-literal `max_threads` in the
+  pre-closure concurrent block. Ordinary list-backed
+  `for ... concurrently(limit: ..., timeout: ...)` loops now lower to the
+  pre-closure concurrent-loop Core shape, preserving positive-literal `limit`,
+  normalized optional timeout, copy-item mode, and discard-output semantics.
+  Resource-source concurrent loops remain closed until the resource ownership
+  lowering slice can port the cleanup-scope behavior from OCaml.
+- Direct block `?=` bindings now lower to a temporary plus prepared
+  `ConstructorMatchExpr` for both `Option[T]` and `Result[T, E]` carriers.
+  The success arm binds the unwrapped payload and lowers the remaining block as
+  the continuation; the failure arm rebuilds the enclosing carrier through the
+  same stack/nullable/boxed carrier tests and accessors used by the backend
+  layout code.
+- Simple `for name in start..end` loops lower directly to the prepared
+  `ForRangeExpr` Core form with a conservative `RangeMayRunBackward` loop
+  binder. Simple `for name in items` loops over `Channel[T]`, `List[T]`,
+  `Stream[T]`, `String`, `Dict[K, V]` keys, and `Set[T]` lower to the
+  explicit prepared Core loop variants with iterable release policy attached
+  where the Core shape requires it. Channel and Stream loops are marked
+  impure during typed-expression purity scanning because they pull from their
+  input source. Dict tuple-pair binders, resource-source, tuple-binder, tensor,
+  vector/array loop-view producers, and any remaining iterable families still
+  need deliberate prepared-loop slices instead of a generic OCaml-style `CFor`
+  node. A first tuple-binder lowering attempt exposed an unsafe generated
+  cleanup shape around synthetic tuple references inside a `?=` path; fix the
+  resource/codegen issue before enabling that path in production lowering.
+- Literal-only matches lower directly to prepared `LiteralMatchExpr` nodes for
+  literal arms plus a wildcard fallback. Binding, constructor, tuple/list, and
+  or-pattern lowering remains deliberately closed until the full match
+  decision-tree port is in place.
+- Expression value-type lowering now treats `CompilerConstIntType` as a Core
+  `Int` value while strict type lowering still rejects dimension literals as
+  standalone Core types. This keeps literal-valued expression nodes from
+  failing lowering before the remaining type-finalization paths are migrated.
+- Enum and union declarations now materialize as `CompilerTypedUnionDecl`
+  instead of parsed passthrough declarations. The typed shape carries canonical
+  variant field types, tags, and constructor def ids from typecheck/env
+  registration. Core lowering consumes that shape to emit `EnumDecl` and
+  `UnionDecl`, including constructor C names, tag names, payload storage, and
+  field release policies. CTFE context construction also reads typed union
+  constructor metadata so compile-time constructor calls retain callable ids.
 
 Edge cases:
 
-- `EQuestionBind` lowering needs block continuation context.
+- `with ?=` resource acquisition still needs resource cleanup metadata from
+  typecheck before it can reuse the direct `?=` carrier lowering safely.
 - `with` resource blocks need cleanup metadata from typecheck.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
@@ -1859,7 +1937,8 @@ Blorp references:
 - existing `compiler_core_traverse.brp`
 - existing `compiler_core_json.brp`
 - future `compiler_core_debug.brp`
-- future `compiler_core_desugar.brp`
+- existing `compiler_core_desugar.brp` for the first prepared-Core-compatible
+  desugar slice
 - future `compiler_core_ssa.brp`
 - future `compiler_core_mono.brp`
 - future `compiler_core_synth.brp`
@@ -1876,6 +1955,13 @@ Implementation steps:
 
 - Port stages in exact `run_core_passes` order. Move the production boundary
   left by one stage or a tightly coupled pair only after parity passes.
+- `compiler_core_desugar.brp` currently ports the string binary-operator slice
+  from `compiler/lib/core_desugar.ml`: string `+`, `==`, and `!=` become
+  `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`.
+  It recursively traverses Core function/global bodies and the prepared
+  container/control-flow nodes available through Core JSON. Record-update and
+  string-interpolation desugaring remain closed until equivalent Blorp Core
+  sugar nodes or direct lowering targets exist.
 - Add `run_core_pipeline` support for each newly ported stage so tests can
   compare one Core JSON input against OCaml and Blorp outputs.
 - Keep public stage names stable: lower, debug, desugar, mono, synth, match,
@@ -1929,6 +2015,7 @@ Tests:
   ports.
 - `tests/test_compiler/codegen_audit/should_pass/core_dce_*.brp`
 - Blorp stage parity tests under `compiler/blorp/tests`.
+- `compiler/blorp/tests/test_compiler_core_desugar.brp`
 
 Deletion point:
 

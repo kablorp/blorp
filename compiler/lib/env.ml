@@ -290,14 +290,14 @@ type env = {
     shared [impl_index] / [ufcs_methods] tables — those are session-owned
     (one set per compile) so impl and method registrations made by earlier
     [typecheck_module] calls within the same compile are visible to later
-    ones, without leaking across independent [Pipeline.compile] invocations
+    ones, without leaking across independent pipeline compile invocations
     in the same OCaml process.
 
     Ordinary overload sets are lexical/import-scope data, so each env gets a
     fresh table. Sharing them at session scope lets one module's selective
     imports influence another module's unrelated name resolution.
 
-    Each [Pipeline.compile] runs inside [Session.with_current
+    Each high-level compile run enters through [Session.with_current
     (Session.create ())], which makes the fresh session's tables the
     ones [Env.empty ()] picks up. Tests that need isolation should
     wrap in [Session.with_current (Session.create ())]; tests that

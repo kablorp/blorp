@@ -205,7 +205,7 @@ type t = {
      module-level [let] binding, which made them process-global. Every
      [Env_builtins.with_builtins Env.empty] call shared the same
      tables, so overload/impl registrations accumulated across
-     independent [Pipeline.compile] invocations — producing
+     independent pipeline compile invocations — producing
      order-dependent failures (e.g. [./blorp test --doc std] failing
      only when multiple std modules' doctests ran in one process).
 
@@ -548,7 +548,7 @@ let find_resource_cleanup (sess : t) (type_name : string) :
 
    Instead, the meta-env-consuming functions in [Types] default to the
    ambient current session when [~sess] is not explicitly passed. The
-   frontend entry points ([Pipeline.compile], [Typecheck.typecheck],
+   frontend entry points (pipeline compile, [Typecheck.typecheck],
    [Lsp_state] per-document handlers) scope their work with
    [with_current] so every nested call sees the right session.
 
