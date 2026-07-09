@@ -194,6 +194,75 @@ let typecheck_import_module_for_loaded_module graph (m : Modules.loaded_module)
       })
     (loaded_module_source_text_for_bridge graph m)
 
+let typecheck_import_module_for_preloaded_source
+    (source : Modules.preloaded_parsed_source) =
+  {
+    Compiler_blorp_bridge.typecheck_import_path = source.preload_path;
+    typecheck_import_module_name = source.preload_module_name;
+    typecheck_import_module_path = source.preload_module_name;
+    typecheck_import_text = source.preload_source;
+    typecheck_import_origin =
+      bridge_module_origin_of_session_origin source.preload_origin;
+  }
+
+let typecheck_batch_source_key path module_name = path ^ "\000" ^ module_name
+
+let dedupe_typecheck_sources sources =
+  let seen = Hashtbl.create 64 in
+  let add_source acc source =
+    let key =
+      typecheck_batch_source_key
+        source.Compiler_blorp_bridge.typecheck_import_path
+        source.typecheck_import_module_name
+    in
+    if Hashtbl.mem seen key then acc
+    else begin
+      Hashtbl.add seen key ();
+      source :: acc
+    end
+  in
+  sources |> List.fold_left add_source [] |> List.rev
+
+let typecheck_batch_targets_for_graph graph target =
+  let target_key =
+    typecheck_batch_source_key target.Modules.preload_path
+      target.preload_module_name
+  in
+  dedupe_typecheck_sources
+    (List.filter
+       (fun source ->
+         not
+           (String.equal
+              (typecheck_batch_source_key source.Modules.preload_path
+                 source.preload_module_name)
+              target_key))
+       graph.Modules.preload_graph_sources
+    |> List.map typecheck_import_module_for_preloaded_source)
+
+let typecheck_batch_import_modules_for_graph graph target =
+  let loaded_sources =
+    Modules.get_all_modules ()
+    |> List.filter_map (typecheck_import_module_for_loaded_module graph)
+  in
+  dedupe_typecheck_sources
+    (typecheck_import_module_for_preloaded_source target :: loaded_sources)
+
+let typecheck_resolved_imports_for_graph graph =
+  graph.Modules.preload_graph_imports
+  |> List.filter_map (fun edge ->
+         match edge.Modules.preload_import_resolved_module with
+         | Some resolved_module ->
+             Some
+               {
+                 Compiler_blorp_bridge.typecheck_resolved_import_from_path =
+                   edge.preload_import_from_path;
+                 typecheck_resolved_import_from_module =
+                   edge.preload_import_from_module;
+                 typecheck_resolved_import_path = edge.preload_import_path;
+                 typecheck_resolved_import_module = resolved_module;
+               }
+         | None -> None)
+
 let typecheck_import_modules_for_loaded_modules ?exclude_path ?exclude_module
     graph =
   let seen = Hashtbl.create 64 in
@@ -217,22 +286,6 @@ let typecheck_import_modules_for_loaded_modules ?exclude_path ?exclude_module
                import_module :: acc)
        []
   |> List.rev
-
-let typecheck_resolved_imports_for_graph graph =
-  graph.Modules.preload_graph_imports
-  |> List.filter_map (fun edge ->
-         match edge.Modules.preload_import_resolved_module with
-         | Some resolved_module ->
-             Some
-               {
-                 Compiler_blorp_bridge.typecheck_resolved_import_from_path =
-                   edge.preload_import_from_path;
-                 typecheck_resolved_import_from_module =
-                   edge.preload_import_from_module;
-                 typecheck_resolved_import_path = edge.preload_import_path;
-                 typecheck_resolved_import_module = resolved_module;
-               }
-         | None -> None)
 
 let typecheck_graph_source_with_blorp_bridge ~allow_debug_only_calls
     ~import_modules ~resolved_imports source =
@@ -638,6 +691,161 @@ type blorp_bridge_typecheck_result = {
   blorp_bridge_import_bindings : Session.import_binding list;
 }
 
+(* The typecheck bridge can handle several artifacts per subprocess, but a
+   single all-module response for compiler/blorp is currently ~100MB and has
+   exposed typed-AST JSON/ownership corruption in generated bridge code. Larger
+   bounded batches also combine the parser-sized artifacts into minute-plus
+   requests. Keep batches narrow until the bridge can stream artifacts or safely
+   share prepared import modules across typecheck calls. *)
+let typecheck_bridge_batch_target_limit = 2
+
+let experimental_typecheck_batch_enabled () =
+  match Sys.getenv_opt "BLORP_COMPILER_TYPECHECK_BATCH" with
+  | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+  | _ -> false
+
+let chunk_list size items =
+  if size <= 0 then invalid_arg "chunk_list size must be positive";
+  let rec take n taken rest =
+    if n = 0 then (List.rev taken, rest)
+    else
+      match rest with
+      | [] -> (List.rev taken, [])
+      | item :: tail -> take (n - 1) (item :: taken) tail
+  in
+  let rec loop acc rest =
+    match rest with
+    | [] -> List.rev acc
+    | _ ->
+        let chunk, next = take size [] rest in
+        loop (chunk :: acc) next
+  in
+  loop [] items
+
+let record_typecheck_bridge_artifact responses_by_key errors ~path ~module_name
+    artifact =
+  Hashtbl.replace responses_by_key (typecheck_batch_source_key path module_name)
+    {
+      Compiler_blorp_bridge.batch_typechecked_path = path;
+      batch_typechecked_module_name = module_name;
+      batch_typechecked_response = artifact;
+    };
+  match artifact.Compiler_blorp_bridge.typechecked_errors with
+  | [] ->
+      if artifact.typechecked_ctfe_evaluated_by_blorp then begin
+        Modules.set_typed_decls module_name artifact.typechecked_program;
+        Modules.set_typed_import_bindings module_name
+          artifact.typechecked_import_bindings
+      end
+      else
+        errors :=
+          bridge_error ~filename:path
+            "typecheck bridge completed without evaluating CTFE"
+          :: !errors
+  | artifact_errors ->
+      errors := bridge_errors ~filename:path artifact_errors @ !errors
+
+let decode_typecheck_batch_responses responses_by_key errors responses =
+  List.iter
+    (fun (response : Compiler_blorp_bridge.typecheck_source_batch_response) ->
+      record_typecheck_bridge_artifact responses_by_key errors
+        ~path:response.batch_typechecked_path
+        ~module_name:response.batch_typechecked_module_name
+        response.batch_typechecked_response)
+    responses
+
+let typecheck_graph_sources_with_blorp_bridge ~allow_debug_only_calls graph
+    target =
+  let targets = typecheck_batch_targets_for_graph graph target in
+  let import_modules = typecheck_batch_import_modules_for_graph graph target in
+  let resolved_imports = typecheck_resolved_imports_for_graph graph in
+  let responses_by_key = Hashtbl.create (List.length targets) in
+  let errors = ref [] in
+  let import_modules_for_source source =
+    List.filter
+      (fun import_module ->
+        not
+          (String.equal import_module.Compiler_blorp_bridge.typecheck_import_module_path
+             source.Compiler_blorp_bridge.typecheck_import_module_path))
+      import_modules
+  in
+  let request_single_source source message =
+    match
+      Compiler_blorp_bridge.typecheck_source_via_command_with_imports_policy
+        ~allow_debug_only_calls ~resolved_imports
+        ~origin:source.Compiler_blorp_bridge.typecheck_import_origin
+        ~import_modules:(import_modules_for_source source)
+        ~path:source.typecheck_import_path
+        ~module_name:source.typecheck_import_module_name
+        ~text:source.typecheck_import_text
+    with
+    | Ok artifact ->
+        record_typecheck_bridge_artifact responses_by_key errors
+          ~path:source.typecheck_import_path
+          ~module_name:source.typecheck_import_module_name artifact
+    | Error (_code, single_message) ->
+        errors :=
+          bridge_error ~filename:source.typecheck_import_path ~phase:Ast.Parse
+            (message ^ "; single-source retry also failed: " ^ single_message)
+          :: !errors
+  in
+  let rec request_batch batch =
+    match
+      Compiler_blorp_bridge.typecheck_sources_via_command_with_imports_policy
+        ~allow_debug_only_calls ~include_comments:false ~resolved_imports
+        ~import_modules ~sources:batch
+    with
+    | Error (_code, message) ->
+        (match batch with
+        | [] -> ()
+        | [ source ] -> request_single_source source message
+        | _ ->
+            (* Some generated bridge/runtime paths still fail on certain pairs
+               of large compiler modules. Split only on failure so the common
+               path remains batched, and leave the root cause visible in CI
+               bridge stats. *)
+            List.iter request_batch (chunk_list 1 batch))
+    | Ok responses ->
+        decode_typecheck_batch_responses responses_by_key errors responses
+  in
+  List.iter request_batch
+    (chunk_list typecheck_bridge_batch_target_limit targets);
+  match List.rev !errors with
+  | _ :: _ as errors -> Error errors
+  | [] ->
+      let target_source = typecheck_import_module_for_preloaded_source target in
+      match
+        Compiler_blorp_bridge.typecheck_source_via_command_with_imports_policy
+          ~allow_debug_only_calls ~resolved_imports
+          ~origin:target_source.typecheck_import_origin
+          ~import_modules:(import_modules_for_source target_source)
+          ~path:target_source.typecheck_import_path
+          ~module_name:target_source.typecheck_import_module_name
+          ~text:target_source.typecheck_import_text
+      with
+      | Error (_code, message) ->
+          Error
+            [ bridge_error ~filename:target.preload_path ~phase:Ast.Parse message ]
+      | Ok artifact -> (
+          match artifact.typechecked_errors with
+          | [] ->
+              if artifact.typechecked_ctfe_evaluated_by_blorp then
+                Ok
+                  {
+                    blorp_bridge_source_program = target.preload_decls;
+                    blorp_bridge_typed_program = artifact.typechecked_program;
+                    blorp_bridge_import_bindings =
+                      artifact.typechecked_import_bindings;
+                  }
+              else
+                Error
+                  [
+                    bridge_error ~filename:target.preload_path
+                      "typecheck_source bridge completed without evaluating CTFE";
+                  ]
+          | artifact_errors ->
+              Error (bridge_errors ~filename:target.preload_path artifact_errors))
+
 let typecheck_graph_with_blorp_bridge_policy ~debug
     ~allow_debug_only_calls
     ~on_frontend_phase ~filename ~preloaded_module_graph =
@@ -664,22 +872,46 @@ let typecheck_graph_with_blorp_bridge_policy ~debug
           error
       | Ok _ ->
           record_frontend ModuleLoad;
-          let module_errors =
-            typecheck_loaded_graph_modules_with_blorp_bridge
-              ~allow_debug_only_calls
-              preloaded_module_graph
-          in
-          let module_errors =
-            match module_errors with
-            | _ :: _ -> module_errors
-            | [] ->
-                ensure_modules_typed ~debug ~allow_debug_only_calls ()
-          in
-          if module_errors <> [] then begin
+          if experimental_typecheck_batch_enabled () then
+            match
+              typecheck_graph_sources_with_blorp_bridge
+                ~allow_debug_only_calls preloaded_module_graph target
+            with
+            | Error errors ->
+                record_frontend ModuleTypecheck;
+                Error errors
+            | Ok result ->
+                let module_errors =
+                  ensure_modules_typed ~debug ~allow_debug_only_calls ()
+                in
+                if module_errors <> [] then begin
+                  record_frontend ModuleTypecheck;
+                  Error module_errors
+                end
+                else
+                  match loaded_module_coherence_errors () with
+                  | _ :: _ as errors ->
+                      record_frontend ModuleTypecheck;
+                      Error errors
+                  | [] ->
+                      record_frontend ModuleTypecheck;
+                      record_frontend MainTypecheck;
+                      Ok result
+          else
+            let module_errors =
+              typecheck_loaded_graph_modules_with_blorp_bridge
+                ~allow_debug_only_calls preloaded_module_graph
+            in
+            let module_errors =
+              match module_errors with
+              | _ :: _ -> module_errors
+              | [] -> ensure_modules_typed ~debug ~allow_debug_only_calls ()
+            in
+            if module_errors <> [] then begin
               record_frontend ModuleTypecheck;
               Error module_errors
-          end
-          else
+            end
+            else
               match loaded_module_coherence_errors () with
               | _ :: _ as errors ->
                   record_frontend ModuleTypecheck;

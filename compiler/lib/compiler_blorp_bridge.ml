@@ -72,6 +72,12 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
+type typecheck_source_batch_response = {
+  batch_typechecked_path : string;
+  batch_typechecked_module_name : string;
+  batch_typechecked_response : typechecked_source;
+}
+
 type cli_frontend_command =
   | CliFrontendCheck
   | CliFrontendCompile
@@ -660,6 +666,27 @@ let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
          ("payload", Lsp_json.Object payload_fields);
        ])
 
+let typecheck_sources_request_json_with_imports_policy ~resolved_imports
+    ~allow_debug_only_calls ~include_comments ~import_modules ~sources =
+  let payload_fields =
+    [
+      ("include_comments", Lsp_json.Bool include_comments);
+      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
+      ( "sources",
+        Lsp_json.Array (List.map typecheck_import_module_json sources) );
+    ]
+    @ typecheck_import_modules_field import_modules
+    @ typecheck_resolved_imports_field resolved_imports
+  in
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "typecheck_sources");
+         ("payload", Lsp_json.Object payload_fields);
+       ])
+
 let cli_run_request_json ?version args =
   let version_fields =
     match version with
@@ -1139,6 +1166,35 @@ let typecheck_source_response_field response =
 
 let typecheck_source_response_json response_json =
   response_result response_json typecheck_source_response_field
+
+let typecheck_source_batch_item_response = function
+  | Lsp_json.Object _ as item ->
+      let* path = string_response_field "path" item in
+      let* module_name = string_response_field "module" item in
+      let* typechecked_response =
+        match typechecked_source_artifact_field item with
+        | Ok _ as ok -> ok
+        | Error (code, message) ->
+            Error
+              ( code,
+                Printf.sprintf "typecheck_sources item %s (%s): %s" module_name
+                  path message )
+      in
+      Ok
+        {
+          batch_typechecked_path = path;
+          batch_typechecked_module_name = module_name;
+          batch_typechecked_response = typechecked_response;
+        }
+  | _ -> Error ("invalid_response", "typecheck_sources items must be JSON objects")
+
+let typecheck_sources_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  array_response_field_map "sources" typecheck_source_batch_item_response
+    artifact
+
+let typecheck_sources_response_json response_json =
+  response_result response_json typecheck_sources_response_field
 
 let cli_frontend_command_of_string = function
   | "check" -> Ok CliFrontendCheck
@@ -2752,6 +2808,29 @@ let prepared_bridge_binary_from_env env_name =
 let prepared_bridge_required () =
   match Sys.getenv_opt require_prepared_bridge_env with Some "1" -> true | _ -> false
 
+let bridge_stats_enabled () =
+  match Sys.getenv_opt "BLORP_COMPILER_BRIDGE_STATS" with
+  | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+  | _ -> false
+
+let bridge_request_action request_json =
+  match Lsp_json.parse request_json with
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt "action" fields with
+      | Some (Lsp_json.String action) -> action
+      | _ -> "unknown")
+  | _ -> "unknown"
+  | exception Lsp_json.Parse_error _ -> "unknown"
+
+let log_bridge_stats ~action ~bridge_binary ~request_bytes ~stdout_bytes
+    ~stderr_bytes ~duration_ms ~exit_code =
+  Printf.eprintf
+    "BLORP_BRIDGE_STATS action=%s helper=%s request_bytes=%d stdout_bytes=%d \
+     stderr_bytes=%d duration_ms=%d exit=%d\n\
+     %!"
+    action (Filename.basename bridge_binary) request_bytes stdout_bytes
+    stderr_bytes duration_ms exit_code
+
 let missing_prepared_bridge_error env_name =
   Error
     (Printf.sprintf
@@ -2841,13 +2920,26 @@ let run_request_via_blorp_binary bridge_binary request_json =
   | Error message -> error_response "bridge_command_failed" message
   | Ok bridge_binary ->
       let request_path = write_temp_request request_json in
+      let stats_enabled = bridge_stats_enabled () in
+      let action =
+        if stats_enabled then bridge_request_action request_json else ""
+      in
+      let request_bytes = String.length request_json in
       Fun.protect
         ~finally:(fun () -> try Sys.remove request_path with _ -> ())
         (fun () ->
+          let started_at = Unix.gettimeofday () in
           let exit_code, output, stderr_output =
             run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
               [ request_path ]
           in
+          if stats_enabled then
+            log_bridge_stats ~action ~bridge_binary ~request_bytes
+              ~stdout_bytes:(String.length output)
+              ~stderr_bytes:(String.length stderr_output)
+              ~duration_ms:
+                (int_of_float ((Unix.gettimeofday () -. started_at) *. 1000.0))
+              ~exit_code;
           if exit_code = 0 then output
           else
             let kept_request =
@@ -2964,6 +3056,15 @@ let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
          ~path ~module_name ~text)
   in
   typecheck_source_response_json response_json
+
+let typecheck_sources_via_command_with_imports_policy ~resolved_imports
+    ~allow_debug_only_calls ~include_comments ~import_modules ~sources =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_sources_request_json_with_imports_policy ~resolved_imports
+         ~allow_debug_only_calls ~include_comments ~import_modules ~sources)
+  in
+  typecheck_sources_response_json response_json
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json
