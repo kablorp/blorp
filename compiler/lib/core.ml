@@ -334,10 +334,6 @@ let tensor_storage_known_producer layout =
   TensorStorageProven
     { tsp_kind = TensorStorageKnownProducer; tsp_layout = layout }
 
-let tensor_storage_preserved_producer layout =
-  TensorStorageProven
-    { tsp_kind = TensorStoragePreservedProducer; tsp_layout = layout }
-
 type loop_range_direction = RangeMayRunBackward | RangeForwardOnly
 
 type loop_binder = {
@@ -1149,9 +1145,6 @@ let borrowed_match_binding_pairs bindings =
   List.map
     (fun (mb_var, mb_accessor) -> borrowed_match_binding mb_var mb_accessor)
     bindings
-
-let owned_match_binding mb_var mb_accessor =
-  match_binding ~mode:MatchOwn mb_var mb_accessor
 
 let match_binding_is_borrowed binding = binding.mb_mode = MatchBorrow
 let match_binding_name binding = binding.mb_var.vname
