@@ -462,6 +462,20 @@ let lookup_union_variant reg type_name variant_name =
   | None -> None
   | Some variants -> Hashtbl.find_opt variants variant_name
 
+let lookup_union_variant_by_def_id reg type_name def_id =
+  match Hashtbl.find_opt reg.union_variants type_name with
+  | None -> None
+  | Some variants ->
+      Hashtbl.fold
+        (fun _name (variant : variant) found ->
+          match found with
+          | Some _ -> found
+          | None -> (
+              match variant.variant_def_id with
+              | Some id when id = def_id -> Some variant
+              | _ -> None))
+        variants None
+
 let union_payload_storage reg name =
   match Hashtbl.find_opt reg.union_payload_storage name with
   | Some storage -> storage

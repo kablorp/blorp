@@ -304,6 +304,31 @@ let lookup_constructor_call_contract (env : type_env) name def_id arg_count =
       Some contract
   | _ -> None
 
+let lookup_return_type_constructor_contract (env : type_env) name def_id
+    arg_count return_ty =
+  match normalize_accessed_type env return_ty with
+  | Ast.TyNamed (type_name, _) -> (
+      let found =
+        match def_id with
+        | Some id ->
+            Codegen_types.lookup_union_variant_by_def_id env.type_registry
+              type_name id
+        | None -> None
+      in
+      let found =
+        match found with
+        | Some _ -> found
+        | None ->
+            Codegen_types.lookup_union_variant env.type_registry type_name name
+      in
+      match found with
+      | Some variant
+        when variant.variant_fields <> []
+             && List.length variant.variant_fields = arg_count ->
+          Some (constructor_contract_for_variant variant)
+      | _ -> None)
+  | _ -> None
+
 let lookup_user_call_contract (env : type_env) name def_id arg_count =
   let found = lookup_constructor_call_contract env name def_id arg_count in
   let found =
@@ -324,12 +349,18 @@ let lookup_user_call_contract (env : type_env) name def_id arg_count =
       Some contract
   | _ -> None
 
-let is_constructor_call (env : type_env) (kind : call_kind) arg_count =
+let is_constructor_call (env : type_env) (kind : call_kind) arg_count return_ty =
   match kind with
   | CKUser (name, def_id) -> (
       match lookup_constructor_call_contract env name def_id arg_count with
       | Some _ -> true
-      | None -> false)
+      | None -> (
+          match
+            lookup_return_type_constructor_contract env name def_id arg_count
+              return_ty
+          with
+          | Some _ -> true
+          | None -> false))
   | _ -> false
 
 let contract_for_call (env : type_env) (kind : call_kind) ~(arg_count : int)
@@ -339,7 +370,13 @@ let contract_for_call (env : type_env) (kind : call_kind) ~(arg_count : int)
   | None -> (
       match kind with
       | CKUser (name, def_id) ->
-          lookup_user_call_contract env name def_id arg_count
+          let constructor_contract =
+            lookup_return_type_constructor_contract env name def_id arg_count
+              return_ty
+          in
+          (match constructor_contract with
+          | Some _ -> constructor_contract
+          | None -> lookup_user_call_contract env name def_id arg_count)
       | CKForeign _ ->
           Some (borrow_contract_for_signature env ~arg_count ~return_ty)
       | CKClosure ->
@@ -2129,7 +2166,7 @@ let rec retain_borrowed_owned_call_args_in_expr (env : type_env)
       let fn' = recur consumed_params borrowed fn in
       let args' = List.map (recur consumed_params borrowed) args in
       let call_borrowed =
-        if is_constructor_call env kind (List.length args') then borrowed
+        if is_constructor_call env kind (List.length args') e.ty then borrowed
         else remove_bound_names consumed_params borrowed
       in
       retain_borrowed_owned_call_arg_aliases env call_borrowed
@@ -2864,10 +2901,22 @@ let release_reassigned_mutable_var (env : type_env)
     Var.named (Printf.sprintf "__assign_%s_%d" target.vname n)
   in
   let void_at loc = { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc } in
+  let protect_self_assignment_rhs rhs =
+    let uses = summarize_linear_ownership_uses env target.vname rhs in
+    (* Reassignment can move one old owner into the replacement value. Only
+       additional consuming uses need duplicate refs here; [required_refs] also
+       includes borrow-only liveness and would leak if retained without a
+       matching consume. *)
+    if uses.consumed_refs > 1 then
+      prepend_dups (uses.consumed_refs - 1) target target_ty rhs
+    else rhs
+  in
   let rec rewrite ?(skip_old_release = false) e =
     match e.desc with
     | CAssign (v, rhs) when v.vname = target.vname ->
-        let rhs = rewrite ~skip_old_release:false rhs in
+        let rhs =
+          rewrite ~skip_old_release:false rhs |> protect_self_assignment_rhs
+        in
         if skip_old_release || expr_consumes_var_owner env target.vname rhs then
           (* If a prior COW-consuming expression already consumed the old slot
              owner, assignment must not drop the target again here. When the RHS

@@ -4315,6 +4315,35 @@ let test_program_constructor_contract_transfers_payload () =
         (List.length other.Blorp.Core_ownership.args)
   | None -> Alcotest.fail "missing Boxed constructor contract"
 
+let test_program_constructor_contract_uses_return_type_registry () =
+  let prog =
+    [
+      {
+        cd_desc = CDType (boxed_string_type_decl ());
+        cd_loc = loc;
+        cd_doc = None;
+      };
+    ]
+  in
+  let env = Blorp.Core_perceus.empty_env () in
+  Blorp.Core_flatten.register_types env.Blorp.Core_perceus.type_registry prog;
+  match
+    Blorp.Core_perceus.contract_for_call env
+      (CKUser ("Boxed", Some 40))
+      ~arg_count:1 ~return_ty:ty_boxed_string
+  with
+  | Some
+      {
+        Blorp.Core_ownership.args = [ Blorp.Core_ownership.Transfer ];
+        result = Blorp.Core_ownership.ReturnOwned;
+      } ->
+      ()
+  | Some other ->
+      Alcotest.failf "unexpected return-type constructor contract: args=%d"
+        (List.length other.Blorp.Core_ownership.args)
+  | None ->
+      Alcotest.fail "missing return-type constructor contract from registry"
+
 let test_program_constructor_retains_borrowed_match_payload () =
   let boxed_ctor_ty = func_ty [ ty_string ] ty_boxed_string in
   let leaf =
@@ -4442,6 +4471,87 @@ let test_program_constructor_retains_borrowed_param () =
       in
       Alcotest.failf "constructor did not retain borrowed function param:\n%s"
         rendered
+
+let test_program_constructor_consumes_owned_local () =
+  let boxed_ctor_ty = func_ty [ ty_string ] ty_boxed_string in
+  let payload_bind =
+    bind_named "payload" ty_string
+      (builtin "blorp_string_concat" [ cstr "pay"; cstr "load" ] ty_string)
+  in
+  let body =
+    mk
+      (CLet
+         ( payload_bind,
+           mk
+             (CCall
+                ( CKUser ("Boxed", Some 40),
+                  cvar "Boxed" boxed_ctor_ty,
+                  [ cvar "payload" ty_string ] ))
+             ty_boxed_string ))
+      ty_boxed_string
+  in
+  let box_local = mk_func ~def_id:44 ~params:[] "box_local" ty_boxed_string body in
+  let prog =
+    [
+      {
+        cd_desc = CDType (boxed_string_type_decl ());
+        cd_loc = loc;
+        cd_doc = None;
+      };
+      { cd_desc = CDFunc box_local; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let transformed = Blorp.Core_perceus.insert_drops_program prog in
+  match transformed with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ]
+    when count_drops_for "payload" body = 0 ->
+      ()
+  | _ ->
+      let rendered =
+        match transformed with
+        | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+            pp_to_string_indented body
+        | _ -> "<unexpected program shape>"
+      in
+      Alcotest.failf "constructor dropped owned local payload:\n%s" rendered
+
+let test_program_constructor_consumes_nested_owned_call_result () =
+  let boxed_ctor_ty = func_ty [ ty_string ] ty_boxed_string in
+  let body =
+    mk
+      (CCall
+         ( CKUser ("Boxed", Some 40),
+           cvar "Boxed" boxed_ctor_ty,
+           [ builtin "blorp_string_concat" [ cstr "pay"; cstr "load" ] ty_string ]
+         ))
+      ty_boxed_string
+  in
+  let box_nested =
+    mk_func ~def_id:45 ~params:[] "box_nested" ty_boxed_string body
+  in
+  let prog =
+    [
+      {
+        cd_desc = CDType (boxed_string_type_decl ());
+        cd_loc = loc;
+        cd_doc = None;
+      };
+      { cd_desc = CDFunc box_nested; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let transformed = Blorp.Core_perceus.insert_drops_program prog in
+  match transformed with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ]
+    when count_drops_for "__borrow_arg_0" body = 0 ->
+      ()
+  | _ ->
+      let rendered =
+        match transformed with
+        | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+            pp_to_string_indented body
+        | _ -> "<unexpected program shape>"
+      in
+      Alcotest.failf "constructor dropped nested owned call result:\n%s" rendered
 
 let test_program_constructor_retains_borrowed_lambda_param () =
   let boxed_ctor_ty = func_ty [ ty_string ] ty_boxed_string in
@@ -4590,6 +4700,131 @@ let test_program_constructor_assignment_retains_mutable_local () =
       Alcotest.failf
         "constructor assignment did not retain mutable local payload:\n%s"
         rendered
+
+let test_mutable_self_assignment_retains_nonfinal_consumes () =
+  let env =
+    Blorp.Core_perceus.build_type_env
+      [
+        {
+          cd_desc = CDType (boxed_string_type_decl ());
+          cd_loc = loc;
+          cd_doc = None;
+        };
+      ]
+  in
+  Hashtbl.replace env.Blorp.Core_perceus.user_call_contracts_by_id 50
+    {
+      Blorp.Core_ownership.args = [ Blorp.Core_ownership.Consume ];
+      result = Blorp.Core_ownership.ReturnOwned;
+    };
+  Hashtbl.replace env.Blorp.Core_perceus.user_call_contracts_by_id 51
+    {
+      Blorp.Core_ownership.args =
+        [ Blorp.Core_ownership.Consume; Blorp.Core_ownership.Consume ];
+      result = Blorp.Core_ownership.ReturnOwned;
+    };
+  let inspect_ty = func_ty [ ty_boxed_string ] ty_string in
+  let replace_ty = func_ty [ ty_string; ty_boxed_string ] ty_boxed_string in
+  let current = Var.named "current" in
+  let initial =
+    mk
+      (CCall
+         ( CKUser ("Boxed", Some 40),
+           cvar "Boxed" (func_ty [ ty_string ] ty_boxed_string),
+           [ cstr "initial" ] ))
+      ty_boxed_string
+  in
+  let inspect_current =
+    mk
+      (CCall
+         ( CKUser ("inspect", Some 50),
+           cvar "inspect" inspect_ty,
+           [ cvar "current" ty_boxed_string ] ))
+      ty_string
+  in
+  let replacement =
+    mk
+      (CCall
+         ( CKUser ("replace", Some 51),
+           cvar "replace" replace_ty,
+           [ inspect_current; cvar "current" ty_boxed_string ] ))
+      ty_boxed_string
+  in
+  let assign = mk (CAssign (current, replacement)) ty_void in
+  let body =
+    mk
+      (CLet
+         ( bind_named ~mut:true "current" ty_boxed_string initial,
+           mk (CSeq (assign, cvar "current" ty_boxed_string)) ty_boxed_string ))
+      ty_boxed_string
+  in
+  let transformed = Blorp.Core_perceus.insert_drops_expr_with_env env body in
+  if count_dups_for "current" transformed = 0 then
+    Alcotest.failf
+      "self-assignment RHS consumed current more than once without retain:\n%s"
+      (pp_to_string_indented transformed)
+
+let test_mutable_self_assignment_does_not_retain_for_late_borrow () =
+  let env =
+    Blorp.Core_perceus.build_type_env
+      [
+        {
+          cd_desc = CDType (boxed_string_type_decl ());
+          cd_loc = loc;
+          cd_doc = None;
+        };
+      ]
+  in
+  Hashtbl.replace env.Blorp.Core_perceus.user_call_contracts_by_id 52
+    {
+      Blorp.Core_ownership.args = [ Blorp.Core_ownership.Borrow ];
+      result = Blorp.Core_ownership.ReturnOwned;
+    };
+  Hashtbl.replace env.Blorp.Core_perceus.user_call_contracts_by_id 53
+    {
+      Blorp.Core_ownership.args =
+        [ Blorp.Core_ownership.Consume; Blorp.Core_ownership.Borrow ];
+      result = Blorp.Core_ownership.ReturnOwned;
+    };
+  let inspect_ty = func_ty [ ty_boxed_string ] ty_string in
+  let replace_ty = func_ty [ ty_boxed_string; ty_string ] ty_boxed_string in
+  let current = Var.named "current" in
+  let initial =
+    mk
+      (CCall
+         ( CKUser ("Boxed", Some 40),
+           cvar "Boxed" (func_ty [ ty_string ] ty_boxed_string),
+           [ cstr "initial" ] ))
+      ty_boxed_string
+  in
+  let inspect_current =
+    mk
+      (CCall
+         ( CKUser ("inspect_borrow", Some 52),
+           cvar "inspect_borrow" inspect_ty,
+           [ cvar "current" ty_boxed_string ] ))
+      ty_string
+  in
+  let replacement =
+    mk
+      (CCall
+         ( CKUser ("replace_after_borrow", Some 53),
+           cvar "replace_after_borrow" replace_ty,
+           [ cvar "current" ty_boxed_string; inspect_current ] ))
+      ty_boxed_string
+  in
+  let assign = mk (CAssign (current, replacement)) ty_void in
+  let body =
+    mk
+      (CLet
+         ( bind_named ~mut:true "current" ty_boxed_string initial,
+           mk (CSeq (assign, cvar "current" ty_boxed_string)) ty_boxed_string ))
+      ty_boxed_string
+  in
+  let transformed = Blorp.Core_perceus.insert_drops_expr_with_env env body in
+  Alcotest.(check int)
+    "borrow-only liveness does not get an unbalanced retain" 0
+    (count_dups_for "current" transformed)
 
 (* ============================================================================
    Test suite
@@ -4868,13 +5103,23 @@ let suite =
           test_program_lambda_field_return_retains_before_closure_conversion;
         Alcotest.test_case "constructor_contract_transfers_payload" `Quick
           test_program_constructor_contract_transfers_payload;
+        Alcotest.test_case "constructor_contract_return_type_registry" `Quick
+          test_program_constructor_contract_uses_return_type_registry;
         Alcotest.test_case "constructor_retains_borrowed_param" `Quick
           test_program_constructor_retains_borrowed_param;
+        Alcotest.test_case "constructor_consumes_owned_local" `Quick
+          test_program_constructor_consumes_owned_local;
+        Alcotest.test_case "constructor_consumes_nested_owned_call_result" `Quick
+          test_program_constructor_consumes_nested_owned_call_result;
         Alcotest.test_case "constructor_retains_borrowed_match_payload" `Quick
           test_program_constructor_retains_borrowed_match_payload;
         Alcotest.test_case "constructor_retains_borrowed_lambda_param" `Quick
           test_program_constructor_retains_borrowed_lambda_param;
         Alcotest.test_case "constructor_assignment_retains_mutable_local" `Quick
           test_program_constructor_assignment_retains_mutable_local;
+        Alcotest.test_case "mutable_self_assignment_retains_nonfinal_consumes"
+          `Quick test_mutable_self_assignment_retains_nonfinal_consumes;
+        Alcotest.test_case "mutable_self_assignment_late_borrow_no_retain" `Quick
+          test_mutable_self_assignment_does_not_retain_for_late_borrow;
       ] );
   ]
