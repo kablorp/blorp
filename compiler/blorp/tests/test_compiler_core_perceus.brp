@@ -1,15 +1,35 @@
 import:
 	../src/stage_09_core/compiler_core_json:
+		CoreAccessor(RootAccessor),
 		CoreBinaryOp(AddOp),
+		CoreBoxKind(PointerBox),
+		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
-		CoreDecl(HeapRecordDecl, UnionDecl),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+		CoreConstructorMatchTest(EnumConstructorTest),
+		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
 			CallExpr,
+			ConstructorMatchExpr,
 			DropExpr,
 			DupExpr,
+			FieldExpr,
+			ForListExpr,
 			IfExpr,
+			LambdaExpr,
 			LetExpr,
 			LiteralExpr,
 			SeqExpr,
@@ -19,7 +39,19 @@ import:
 			WhileExpr,
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunctionKind(UserFunction),
+		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -34,6 +66,7 @@ import:
 		),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionRepresentation(GenericUnionRepresentation),
 		CoreUnionVariant,
 		CoreVar,
 	../src/stage_09_core/compiler_core_ownership:
@@ -54,6 +87,7 @@ import:
 		count_uses,
 		empty_env,
 		insert_drops_expr,
+		insert_drops_program,
 		is_linear,
 		is_managed_type,
 		lookup_constructor_call_contract,
@@ -67,6 +101,52 @@ pure func named_var(name: String) -> CoreVar:
 		uniq = 0,
 		def_id = None
 	}
+
+
+pure func core_param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = named_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func function_body(program: CoreProgram, name: String) -> Option[CoreExpr]:
+	var found: Option[CoreExpr] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				if func_info.name == name:
+					found = func_info.body
+					break
+				else:
+					void
+			_:
+				void
+
+	found
 
 
 pure func int_type() -> CoreType:
@@ -87,6 +167,10 @@ pure func list_int_type() -> CoreType:
 
 pure func list_string_type() -> CoreType:
 	NamedType("List", [string_type()])
+
+
+pure func boxed_string_type() -> CoreType:
+	UnionType("BoxedString")
 
 
 pure func void_type() -> CoreType:
@@ -135,8 +219,141 @@ pure func intrinsic_expr(name: String, args: List[CoreExpr], typ: CoreType) -> C
 	)
 
 
+pure func user_call_expr(
+	name: String,
+	def_id: Option[Int],
+	consumed_args: List[Int],
+	args: List[CoreExpr],
+	typ: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UserCall(name, def_id, consumed_args),
+		var_expr(
+			name,
+			NamedType("Function", []),
+		),
+		args,
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
 pure func tuple_expr(items: List[CoreExpr]) -> CoreExpr:
 	TupleExpr(items, TupleType([string_type(), string_type(), string_type()]), SyntheticSourceLoc)
+
+
+pure func match_binding(name: String, typ: CoreType) -> CoreMatchBinding:
+	{
+		variable = named_var(name),
+		typ = typ,
+		accessor = RootAccessor,
+		mode = MatchBorrowBindingMode
+	}
+
+
+pure func constructor_case(
+	constructor: String,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreConstructorMatchCase:
+	constructor_case_body(constructor, bindings, ConstructorMatchBodyExpr(body))
+
+
+pure func constructor_case_body(
+	constructor: String,
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchCase:
+	{
+		constructor = constructor,
+		accessor = RootAccessor,
+		test = EnumConstructorTest(constructor),
+		bindings = bindings,
+		body = body
+	}
+
+
+pure func literal_case(
+	literal: CoreLiteral,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreLiteralMatchCase:
+	{
+		literal = literal,
+		bindings = bindings,
+		body = body
+	}
+
+
+pure func constructor_literal_body(
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	typ: CoreType,
+) -> CoreConstructorMatchBody:
+	ConstructorMatchBodyLiteral({
+		accessor = RootAccessor,
+		scrutinee_type = int_type(),
+		cases = cases,
+		fallback = fallback,
+		result_type = typ,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func constructor_length_branch(
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorLengthMatchBranch:
+	{
+		bindings = bindings,
+		body = body
+	}
+
+
+pure func constructor_length_body(
+	cases: List[CoreConstructorLengthMatchCase],
+	geq: Option[CoreConstructorLengthMatchGeq],
+	fallback: Option[CoreConstructorLengthMatchBranch],
+	typ: CoreType,
+) -> CoreConstructorMatchBody:
+	ConstructorMatchBodyLength({
+		accessor = RootAccessor,
+		cases = cases,
+		geq = geq,
+		fallback = fallback,
+		result_type = typ,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func constructor_match_expr(
+	cases: List[CoreConstructorMatchCase],
+	fallback_body: CoreExpr,
+	typ: CoreType,
+) -> CoreExpr:
+	ConstructorMatchExpr(
+		var_expr("tag", UnionType("Tag")),
+		NoReleasePolicy,
+		cases,
+		ConstructorMatchFallbackBody(fallback_body),
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func constructor_match_expr_with_fallback(
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+	typ: CoreType,
+) -> CoreExpr:
+	ConstructorMatchExpr(
+		var_expr("tag", UnionType("Tag")),
+		NoReleasePolicy,
+		cases,
+		fallback,
+		typ,
+		SyntheticSourceLoc,
+	)
 
 
 pure func union_field(typ: CoreType) -> CoreUnionField:
@@ -144,6 +361,32 @@ pure func union_field(typ: CoreType) -> CoreUnionField:
 		typ = typ,
 		release_policy = NoReleasePolicy
 	}
+
+
+pure func transferring_boxed_value(value: CoreExpr) -> CoreBoxedStorageValue:
+	{
+		kind = PointerBox,
+		value = value,
+		needs_release = True,
+		transfers_ownership = True
+	}
+
+
+pure func boxed_string_construct(value: CoreExpr) -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "BoxedString",
+			constructor_name = "Node",
+			constructor_c_name = "Node",
+			representation = GenericUnionRepresentation,
+			payload_storage = ErasedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [transferring_boxed_value(value)]
+		},
+		boxed_string_type(),
+		SyntheticSourceLoc,
+	)
 
 
 pure func union_variant(
@@ -182,6 +425,12 @@ pure func decl_env_program() -> CoreProgram:
 						[union_field(string_type()), union_field(string_type())],
 					),
 				],
+				loc = SyntheticSourceLoc,
+			}),
+			UnionDecl({
+				name = "BoxedString",
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Node", 0, Some(99), [union_field(string_type())])],
 				loc = SyntheticSourceLoc,
 			}),
 		],
@@ -368,10 +617,28 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cond,
 			) + drop_count_for(name, then_expr) + drop_count_for(name, else_expr)
+		WhileExpr(cond, body, typ, loc):
+			drop_count_for(name, cond) + drop_count_for(name, body)
+		ForListExpr(loop, typ, loc):
+			drop_count_for(name, loop.iterable) + drop_count_for(name, loop.body)
 		BinaryExpr(op, left, right, typ, loc):
 			drop_count_for(name, left) + drop_count_for(name, right)
 		CallExpr(kind, callee, args, typ, loc):
 			drop_count_for(name, callee) + drop_count_in_args(name, args)
+		AssignExpr(variable, rhs, typ, loc):
+			drop_count_for(name, rhs)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			drop_count_for(name, body)
+		UnionConstructExpr(construct, typ, loc):
+			drop_count_in_boxed_values(name, construct.args)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			drop_count_for(
+				name,
+				scrutinee,
+			) + drop_count_in_constructor_cases(
+				name,
+				cases,
+			) + drop_count_in_constructor_fallback(name, fallback)
 		_:
 			0
 
@@ -383,6 +650,131 @@ pure func drop_count_in_args(name: String, args: List[CoreExpr]) -> Int:
 		total += drop_count_for(name, arg)
 
 	total
+
+
+pure func drop_count_in_boxed_values(name: String, values: List[CoreBoxedStorageValue]) -> Int:
+	var total: Int = 0
+
+	for value in values:
+		total += drop_count_for(name, value.value)
+
+	total
+
+
+pure func drop_count_in_constructor_body(name: String, body: CoreConstructorMatchBody) -> Int:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			drop_count_for(name, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			drop_count_in_constructor_literal_match(name, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			drop_count_in_constructor_length_match(name, match_expr)
+
+
+pure func drop_count_in_literal_cases(name: String, cases: List[CoreLiteralMatchCase]) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += drop_count_for(name, match_case.body)
+
+	total
+
+
+pure func drop_count_in_literal_fallback(name: String, fallback: CoreLiteralMatchFallback) -> Int:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			drop_count_for(name, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			drop_count_for(name, body)
+		LiteralMatchFallbackFail:
+			0
+
+
+pure func drop_count_in_constructor_literal_match(
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Int:
+	drop_count_in_literal_cases(
+		name,
+		match_expr.cases,
+	) + drop_count_in_literal_fallback(name, match_expr.fallback)
+
+
+pure func drop_count_in_constructor_length_branch(
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Int:
+	drop_count_in_constructor_body(name, branch.body)
+
+
+pure func drop_count_in_constructor_length_cases(
+	name: String,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += drop_count_in_constructor_length_branch(name, match_case.branch)
+
+	total
+
+
+pure func drop_count_in_constructor_length_geq(
+	name: String,
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Int:
+	match geq:
+		Some(match_case):
+			drop_count_in_constructor_length_branch(name, match_case.branch)
+		None:
+			0
+
+
+pure func drop_count_in_constructor_length_fallback(
+	name: String,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Int:
+	match fallback:
+		Some(branch):
+			drop_count_in_constructor_length_branch(name, branch)
+		None:
+			0
+
+
+pure func drop_count_in_constructor_length_match(
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Int:
+	drop_count_in_constructor_length_cases(
+		name,
+		match_expr.cases,
+	) + drop_count_in_constructor_length_geq(
+		name,
+		match_expr.geq,
+	) + drop_count_in_constructor_length_fallback(name, match_expr.fallback)
+
+
+pure func drop_count_in_constructor_cases(
+	name: String,
+	cases: List[CoreConstructorMatchCase],
+) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += drop_count_in_constructor_body(name, match_case.body)
+
+	total
+
+
+pure func drop_count_in_constructor_fallback(
+	name: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Int:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			drop_count_for(name, body)
+		_:
+			0
 
 
 pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
@@ -405,10 +797,30 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cond,
 			) + dup_count_for(name, then_expr) + dup_count_for(name, else_expr)
+		WhileExpr(cond, body, typ, loc):
+			dup_count_for(name, cond) + dup_count_for(name, body)
+		ForListExpr(loop, typ, loc):
+			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
 		BinaryExpr(op, left, right, typ, loc):
 			dup_count_for(name, left) + dup_count_for(name, right)
 		CallExpr(kind, callee, args, typ, loc):
 			dup_count_for(name, callee) + dup_count_in_args(name, args)
+		AssignExpr(variable, rhs, typ, loc):
+			dup_count_for(name, rhs)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			dup_count_for(name, body)
+		UnionConstructExpr(construct, typ, loc):
+			dup_count_in_boxed_values(name, construct.args)
+		TupleExpr(items, typ, loc):
+			dup_count_in_args(name, items)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			dup_count_for(
+				name,
+				scrutinee,
+			) + dup_count_in_constructor_cases(
+				name,
+				cases,
+			) + dup_count_in_constructor_fallback(name, fallback)
 		_:
 			0
 
@@ -420,6 +832,131 @@ pure func dup_count_in_args(name: String, args: List[CoreExpr]) -> Int:
 		total += dup_count_for(name, arg)
 
 	total
+
+
+pure func dup_count_in_boxed_values(name: String, values: List[CoreBoxedStorageValue]) -> Int:
+	var total: Int = 0
+
+	for value in values:
+		total += dup_count_for(name, value.value)
+
+	total
+
+
+pure func dup_count_in_constructor_body(name: String, body: CoreConstructorMatchBody) -> Int:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			dup_count_for(name, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			dup_count_in_constructor_literal_match(name, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			dup_count_in_constructor_length_match(name, match_expr)
+
+
+pure func dup_count_in_literal_cases(name: String, cases: List[CoreLiteralMatchCase]) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += dup_count_for(name, match_case.body)
+
+	total
+
+
+pure func dup_count_in_literal_fallback(name: String, fallback: CoreLiteralMatchFallback) -> Int:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			dup_count_for(name, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			dup_count_for(name, body)
+		LiteralMatchFallbackFail:
+			0
+
+
+pure func dup_count_in_constructor_literal_match(
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Int:
+	dup_count_in_literal_cases(
+		name,
+		match_expr.cases,
+	) + dup_count_in_literal_fallback(name, match_expr.fallback)
+
+
+pure func dup_count_in_constructor_length_branch(
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Int:
+	dup_count_in_constructor_body(name, branch.body)
+
+
+pure func dup_count_in_constructor_length_cases(
+	name: String,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += dup_count_in_constructor_length_branch(name, match_case.branch)
+
+	total
+
+
+pure func dup_count_in_constructor_length_geq(
+	name: String,
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Int:
+	match geq:
+		Some(match_case):
+			dup_count_in_constructor_length_branch(name, match_case.branch)
+		None:
+			0
+
+
+pure func dup_count_in_constructor_length_fallback(
+	name: String,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Int:
+	match fallback:
+		Some(branch):
+			dup_count_in_constructor_length_branch(name, branch)
+		None:
+			0
+
+
+pure func dup_count_in_constructor_length_match(
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Int:
+	dup_count_in_constructor_length_cases(
+		name,
+		match_expr.cases,
+	) + dup_count_in_constructor_length_geq(
+		name,
+		match_expr.geq,
+	) + dup_count_in_constructor_length_fallback(name, match_expr.fallback)
+
+
+pure func dup_count_in_constructor_cases(
+	name: String,
+	cases: List[CoreConstructorMatchCase],
+) -> Int:
+	var total: Int = 0
+
+	for match_case in cases:
+		total += dup_count_in_constructor_body(name, match_case.body)
+
+	total
+
+
+pure func dup_count_in_constructor_fallback(
+	name: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Int:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			dup_count_for(name, body)
+		_:
+			0
 
 
 pure func is_post_drop_after_value(name: String, expr: CoreExpr) -> Bool:
@@ -446,6 +983,417 @@ pure func outer_let_body_is_post_drop_after_value(name: String, expr: CoreExpr) 
 	match expr:
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			is_post_drop_after_value(name, body)
+		_:
+			False
+
+
+pure func has_drop_before_assign_for(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		SeqExpr(first, second):
+			match first:
+				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					match second:
+						AssignExpr(target, rhs, assign_type, assign_loc):
+							variable.name == name and target.name == name
+						_:
+							(
+								has_drop_before_assign_for(name, first)
+								or has_drop_before_assign_for(name, second)
+							)
+				_:
+					(
+						has_drop_before_assign_for(name, first)
+						or has_drop_before_assign_for(name, second)
+					)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			has_drop_before_assign_for(name, rhs) or has_drop_before_assign_for(name, body)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			has_drop_before_assign_for(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			has_drop_before_assign_for(name, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				has_drop_before_assign_for(name, cond)
+				or has_drop_before_assign_for(name, then_expr)
+				or has_drop_before_assign_for(name, else_expr)
+			)
+		_:
+			False
+
+
+pure func is_pre_drop_before_int(name: String, expected: Int, expr: CoreExpr) -> Bool:
+	match expr:
+		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
+			match body:
+				LiteralExpr(IntLiteral(value), literal_type, literal_loc):
+					drop_var.name == name and value == expected
+				_:
+					False
+		_:
+			False
+
+
+pure func top_let_if_has_branch_drops(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				IfExpr(cond, then_expr, else_expr, if_type, if_loc):
+					(
+						is_post_drop_after_value(name, then_expr)
+						and is_pre_drop_before_int(name, 0, else_expr)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func expr_has_while_body_dup(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		WhileExpr(cond, loop_body, while_type, loc):
+			dup_count_for(name, loop_body) > 0
+		SeqExpr(first, second):
+			expr_has_while_body_dup(name, first) or expr_has_while_body_dup(name, second)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			expr_has_while_body_dup(name, rhs) or expr_has_while_body_dup(name, body)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			expr_has_while_body_dup(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			expr_has_while_body_dup(name, body)
+		_:
+			False
+
+
+pure func top_let_while_body_has_dup(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			expr_has_while_body_dup(name, body)
+		_:
+			False
+
+
+pure func expr_has_for_list_body_dup(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		ForListExpr(loop, typ, loc):
+			dup_count_for(name, loop.body) > 0
+		SeqExpr(first, second):
+			expr_has_for_list_body_dup(name, first) or expr_has_for_list_body_dup(name, second)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			expr_has_for_list_body_dup(name, rhs) or expr_has_for_list_body_dup(name, body)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			expr_has_for_list_body_dup(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			expr_has_for_list_body_dup(name, body)
+		_:
+			False
+
+
+pure func top_let_for_list_body_has_dup(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			expr_has_for_list_body_dup(name, body)
+		_:
+			False
+
+
+pure func top_let_if_has_borrowed_then_only_drop(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				IfExpr(cond, then_expr, else_expr, if_type, if_loc):
+					(
+						is_post_drop_after_value(name, then_expr)
+						and drop_count_for(name, else_expr) == 0
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func top_let_body_is_constructor_match(expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func top_let_body_is_post_drop_after_constructor_match(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				LetExpr(temp_var, temp_mutable, temp_type, match_body, drop_body):
+					match match_body:
+						ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+							match drop_body:
+								DropExpr(drop_var, value_type, release_policy, returned, drop_type, drop_loc):
+									match returned:
+										VarExpr(result_var, result_type, result_loc):
+											(
+												drop_var.name == name
+												and result_var.name == temp_var.name
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func constructor_body_has_post_drop(name: String, body: CoreConstructorMatchBody) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			is_post_drop_after_value(name, expr)
+		_:
+			False
+
+
+pure func constructor_fallback_has_pre_drop_int(
+	name: String,
+	expected: Int,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(fallback_body):
+			is_pre_drop_before_int(name, expected, fallback_body)
+		_:
+			False
+
+
+pure func constructor_fallback_has_no_drop_or_fail(
+	name: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(fallback_body):
+			drop_count_for(name, fallback_body) == 0
+		ConstructorMatchFallbackFail:
+			True
+		_:
+			False
+
+
+pure func constructor_case_has_branch_drops(
+	name: String,
+	match_case: CoreConstructorMatchCase,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	(
+		constructor_body_has_post_drop(name, match_case.body)
+		and constructor_fallback_has_pre_drop_int(name, 0, fallback)
+	)
+
+
+pure func constructor_case_has_borrowed_case_only_drop(
+	name: String,
+	match_case: CoreConstructorMatchCase,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	(
+		constructor_body_has_post_drop(name, match_case.body)
+		and constructor_fallback_has_no_drop_or_fail(name, fallback)
+	)
+
+
+pure func top_let_constructor_match_has_branch_drops(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases:
+						[match_case]:
+							constructor_case_has_branch_drops(name, match_case, fallback)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func top_let_constructor_match_has_borrowed_case_only_drop(
+	name: String,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases:
+						[match_case]:
+							constructor_case_has_borrowed_case_only_drop(name, match_case, fallback)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func literal_fallback_has_pre_drop_int(
+	name: String,
+	expected: Int,
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	match fallback:
+		LiteralMatchFallbackBody(fallback_body):
+			is_pre_drop_before_int(name, expected, fallback_body)
+		_:
+			False
+
+
+pure func literal_case_has_branch_drops(
+	name: String,
+	match_case: CoreLiteralMatchCase,
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	(
+		is_post_drop_after_value(name, match_case.body)
+		and literal_fallback_has_pre_drop_int(name, 0, fallback)
+	)
+
+
+pure func constructor_literal_match_has_branch_drops(
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Bool:
+	match match_expr.cases:
+		[match_case]:
+			literal_case_has_branch_drops(name, match_case, match_expr.fallback)
+		_:
+			False
+
+
+pure func top_let_constructor_match_has_nested_literal_branch_drops(
+	name: String,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases:
+						[match_case]:
+							match match_case.body:
+								ConstructorMatchBodyLiteral(match_expr):
+									constructor_literal_match_has_branch_drops(name, match_expr)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func constructor_length_branch_has_post_drop(
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	match branch.body:
+		ConstructorMatchBodyExpr(expr):
+			is_post_drop_after_value(name, expr)
+		_:
+			False
+
+
+pure func constructor_length_fallback_has_pre_drop_int(
+	name: String,
+	expected: Int,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Bool:
+	match fallback:
+		Some(branch):
+			match branch.body:
+				ConstructorMatchBodyExpr(expr):
+					is_pre_drop_before_int(name, expected, expr)
+				_:
+					False
+		None:
+			False
+
+
+pure func constructor_length_match_has_branch_drops(
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	match match_expr.cases:
+		[match_case]:
+			(
+				constructor_length_branch_has_post_drop(name, match_case.branch)
+				and constructor_length_fallback_has_pre_drop_int(name, 0, match_expr.fallback)
+			)
+		_:
+			False
+
+
+pure func constructor_length_geq_has_branch_drops(
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	match match_expr.geq:
+		Some(match_case):
+			(
+				constructor_length_branch_has_post_drop(name, match_case.branch)
+				and constructor_length_fallback_has_pre_drop_int(name, 0, match_expr.fallback)
+			)
+		None:
+			False
+
+
+pure func top_let_constructor_match_has_nested_length_branch_drops(
+	name: String,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases:
+						[match_case]:
+							match match_case.body:
+								ConstructorMatchBodyLength(match_expr):
+									constructor_length_match_has_branch_drops(name, match_expr)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func top_let_constructor_match_has_nested_length_geq_branch_drops(
+	name: String,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases:
+						[match_case]:
+							match match_case.body:
+								ConstructorMatchBodyLength(match_expr):
+									constructor_length_geq_has_branch_drops(name, match_expr)
+								_:
+									False
+						_:
+							False
+				_:
+					False
 		_:
 			False
 
@@ -478,6 +1426,9 @@ pure func test_program_decls_extend_managed_types() -> Bool:
 	) and is_managed_type(
 		env,
 		NamedType("Tree", []),
+	) and is_managed_type(
+		env,
+		NamedType("BoxedString", []),
 	) and is_managed_type(
 		env,
 		HeapRecordType("AnyRecord"),
@@ -519,7 +1470,355 @@ pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 		),
 		[TransferArg, TransferArg],
 		ReturnOwned,
-	) and lookup_constructor_call_contract(env, "Node", None, 1) == None
+	) and lookup_constructor_call_contract(env, "Node", None, 3) == None
+
+
+pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
+	env: PerceusEnv = build_env(decl_env_program())
+
+	contract_for_call(
+		env,
+		UserCall("Node", None, []),
+		1,
+		UnionType("Tree"),
+	) == None and contract_is(
+		contract_for_call(
+			env,
+			UserCall("Node", None, []),
+			1,
+			boxed_string_type(),
+		),
+		[TransferArg],
+		ReturnOwned,
+	) and contract_is(
+		contract_for_call(
+			env,
+			UserCall("WrongNameButSameDefId", Some(99), []),
+			1,
+			NamedType("BoxedString", []),
+		),
+		[TransferArg],
+		ReturnOwned,
+	)
+
+
+pure func test_consumed_user_call_contract_transfers_declared_args() -> Bool:
+	env: PerceusEnv = empty_env()
+
+	contract_is(
+		contract_for_call(
+			env,
+			UserCall(
+				"replace_first_and_last",
+				None,
+				[0, 2],
+			),
+			3,
+			list_int_type(),
+		),
+		[TransferArg, BorrowArg, TransferArg],
+		ReturnOwned,
+	)
+
+
+pure func test_borrowed_managed_parameter_return_is_retained() -> Bool:
+	program: CoreProgram = {
+		decls = [function_decl(
+				"identity",
+				80,
+				[core_param("value", list_int_type())],
+				list_int_type(),
+				var_expr("value", list_int_type()),
+			)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "identity"):
+		Some(body):
+			dup_count_for("value", body) == 1 and drop_count_for("value", body) == 0
+		None:
+			False
+
+
+pure func test_borrowed_managed_parameter_field_return_is_retained() -> Bool:
+	field_result: CoreExpr = FieldExpr(
+		var_expr("node", HeapRecordType("Node")),
+		"text",
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [HeapRecordDecl({
+				name = "Node",
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"node_text",
+				85,
+				[core_param("node", HeapRecordType("Node"))],
+				string_type(),
+				field_result,
+			)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "node_text"):
+		Some(body):
+			dup_count_for("__borrowed_result_node_0", body) == 1
+		None:
+			False
+
+
+pure func test_borrowed_parameter_returned_from_branch_is_retained() -> Bool:
+	body: CoreExpr = IfExpr(
+		var_expr("choose_value", bool_type()),
+		var_expr("value", list_int_type()),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"choose",
+				91,
+				[core_param("value", list_int_type()), core_param("choose_value", bool_type())],
+				list_int_type(),
+				body,
+			),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "choose"):
+		Some(rewritten_body):
+			dup_count_for("value", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_borrowed_match_binding_return_is_retained() -> Bool:
+	body: CoreExpr = ConstructorMatchExpr(
+		var_expr("boxed", boxed_string_type()),
+		NoReleasePolicy,
+		[constructor_case(
+				"Boxed",
+				[match_binding("payload", string_type())],
+				var_expr("payload", string_type()),
+			)],
+		ConstructorMatchFallbackFail,
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"unbox",
+				92,
+				[core_param("boxed", boxed_string_type())],
+				string_type(),
+				body,
+			),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "unbox"):
+		Some(rewritten_body):
+			dup_count_for("payload", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_union_construction_retains_borrowed_parameter_payload() -> Bool:
+	program: CoreProgram = {
+		decls = [UnionDecl({
+				name = "BoxedString",
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Node", 0, Some(99), [union_field(string_type())])],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"wrap",
+				86,
+				[core_param("value", string_type())],
+				boxed_string_type(),
+				boxed_string_construct(var_expr("value", string_type())),
+			)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "wrap"):
+		Some(body):
+			dup_count_for("value", body) == 1
+		None:
+			False
+
+
+pure func test_tuple_construction_retains_borrowed_parameter_member() -> Bool:
+	tuple_type: CoreType = TupleType([list_int_type()])
+	program: CoreProgram = {
+		decls = [function_decl(
+				"wrap_tuple",
+				87,
+				[core_param("value", list_int_type())],
+				tuple_type,
+				TupleExpr([var_expr("value", list_int_type())], tuple_type, SyntheticSourceLoc),
+			)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "wrap_tuple"):
+		Some(body):
+			dup_count_for("value", body) == 1
+		None:
+			False
+
+
+pure func test_consuming_user_call_propagates_consumed_parameter() -> Bool:
+	callee: CoreDecl = function_decl(
+		"take",
+		87,
+		[core_param("owned", list_int_type())],
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("owned", list_int_type())], list_int_type()),
+	)
+	forward: CoreDecl = function_decl(
+		"forward",
+		88,
+		[core_param("borrowed", list_int_type())],
+		list_int_type(),
+		user_call_expr(
+			"take",
+			Some(87),
+			[0],
+			[var_expr("borrowed", list_int_type())],
+			list_int_type(),
+		),
+	)
+	program: CoreProgram = {
+		decls = [callee, forward],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "forward"):
+		Some(body):
+			dup_count_for("borrowed", body) == 0 and drop_count_for("borrowed", body) == 0
+		None:
+			False
+
+
+pure func test_program_infers_read_only_user_call_borrows_argument() -> Bool:
+	inspect: CoreDecl = function_decl(
+		"inspect",
+		89,
+		[core_param("value", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("value", list_int_type())], int_type()),
+	)
+	caller_body: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			user_call_expr("inspect", Some(89), [], [var_expr("xs", list_int_type())], int_type()),
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	caller: CoreDecl = function_decl("caller", 90, [], void_type(), caller_body)
+	program: CoreProgram = {
+		decls = [inspect, caller],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "caller"):
+		Some(body):
+			drop_count_for("xs", body) == 1 and dup_count_for("xs", body) == 0
+		None:
+			False
+
+
+pure func test_consumed_managed_parameter_return_transfers_without_retain() -> Bool:
+	callee: CoreDecl = function_decl(
+		"take",
+		81,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("value", list_int_type())], list_int_type()),
+	)
+	caller: CoreDecl = function_decl(
+		"caller",
+		82,
+		[],
+		list_int_type(),
+		user_call_expr(
+			"take",
+			Some(81),
+			[0],
+			[var_expr("source", list_int_type())],
+			list_int_type(),
+		),
+	)
+	program: CoreProgram = {
+		decls = [callee, caller],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "take"):
+		Some(body):
+			dup_count_for("value", body) == 0 and drop_count_for("value", body) == 0
+		None:
+			False
+
+
+pure func test_unused_consumed_managed_parameter_is_dropped() -> Bool:
+	callee: CoreDecl = function_decl(
+		"discard",
+		83,
+		[core_param("value", list_int_type())],
+		int_type(),
+		IfExpr(
+			bool_expr(True),
+			SeqExpr(
+				intrinsic_expr(
+					"list_ensure_unique",
+					[var_expr("value", list_int_type())],
+					list_int_type(),
+				),
+				int_expr(1),
+			),
+			int_expr(0),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"caller",
+		84,
+		[],
+		int_type(),
+		user_call_expr("discard", Some(83), [0], [var_expr("source", list_int_type())], int_type()),
+	)
+	program: CoreProgram = {
+		decls = [callee, caller],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "discard"):
+		Some(body):
+			drop_count_for("value", body) == 1
+		None:
+			False
 
 
 pure func test_builtin_and_intrinsic_contract_lookup() -> Bool:
@@ -608,6 +1907,64 @@ pure func test_count_uses_ignores_assignment_target() -> Bool:
 	count_uses("x", expr) == 0 and count_uses("rhs", expr) == 1
 
 
+pure func test_count_uses_lambda_capture_once_and_respects_shadowing() -> Bool:
+	body: CoreExpr = binary_expr(
+		var_expr("x", int_type()),
+		var_expr("x", int_type()),
+		int_type(),
+	)
+	capturing: CoreExpr = LambdaExpr(
+		[],
+		int_type(),
+		body,
+		True,
+		NamedType("Function", []),
+		SyntheticSourceLoc,
+	)
+	shadowing: CoreExpr = LambdaExpr(
+		[core_param("x", int_type())],
+		int_type(),
+		body,
+		True,
+		NamedType("Function", []),
+		SyntheticSourceLoc,
+	)
+
+	count_uses("x", capturing) == 1 and count_uses("x", shadowing) == 0
+
+
+pure func test_count_uses_constructor_match_takes_branch_maximum() -> Bool:
+	expr: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Left",
+				[],
+				var_expr("x", int_type()),
+			), constructor_case(
+				"Right",
+				[],
+				binary_expr(
+					var_expr("x", int_type()),
+					var_expr("x", int_type()),
+					int_type(),
+				),
+			)],
+		int_expr(0),
+		int_type(),
+	)
+
+	count_uses("x", expr) == 2
+
+
+pure func test_count_uses_constructor_match_respects_binding_shadowing() -> Bool:
+	expr: CoreExpr = constructor_match_expr([constructor_case(
+				"Some",
+				[match_binding("x", int_type())],
+				var_expr("x", int_type()),
+			)], int_expr(0), int_type())
+
+	count_uses("x", expr) == 0
+
+
 pure func test_linearity_accepts_linear_expressions() -> Bool:
 	(
 		is_linear(call_expr("identity", [int_expr(1)], int_type()))
@@ -646,6 +2003,26 @@ pure func test_unused_managed_let_gets_drop() -> Bool:
 	drop_count_for("s", rewritten) == 1 and dup_count_for("s", rewritten) == 0
 
 
+pure func test_managed_let_nested_under_lambda_gets_drop() -> Bool:
+	lambda: CoreExpr = LambdaExpr(
+		[],
+		void_type(),
+		LetExpr(
+			named_var("captured"),
+			False,
+			string_type(),
+			var_expr("source", string_type()),
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+		True,
+		NamedType("Function", []),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), lambda)
+
+	drop_count_for("captured", rewritten) == 1
+
+
 pure func test_unmanaged_let_gets_no_drop() -> Bool:
 	expr: CoreExpr = LetExpr(named_var("n"), False, int_type(), int_expr(1), int_expr(2))
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
@@ -682,6 +2059,384 @@ pure func test_reused_managed_let_gets_one_dup_per_extra_use() -> Bool:
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
 
 	drop_count_for("s", rewritten) == 0 and dup_count_for("s", rewritten) == 2
+
+
+pure func test_mutable_managed_let_drops_final_owner() -> Bool:
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		int_expr(0),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_mutable_assignment_releases_old_and_final_owners() -> Bool:
+	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(0)], list_int_type())
+	body: CoreExpr = AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and has_drop_before_assign_for("xs", rewritten)
+	)
+
+
+pure func test_mutable_cow_assignment_skips_old_owner_release() -> Bool:
+	replacement: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	body: CoreExpr = AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and not has_drop_before_assign_for("xs", rewritten)
+	)
+
+
+pure func test_mutable_self_assignment_retains_additional_consumes() -> Bool:
+	replacement: CoreExpr = user_call_expr(
+		"replace",
+		Some(70),
+		[0, 1],
+		[var_expr("xs", list_int_type()), var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	body: CoreExpr = AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 1
+		and not has_drop_before_assign_for("xs", rewritten)
+	)
+
+
+pure func test_mutable_self_assignment_does_not_retain_late_borrow() -> Bool:
+	inspect: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	replacement: CoreExpr = user_call_expr(
+		"replace_after_borrow",
+		Some(71),
+		[0],
+		[var_expr("xs", list_int_type()), inspect],
+		list_int_type(),
+	)
+	body: CoreExpr = AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and not has_drop_before_assign_for("xs", rewritten)
+	)
+
+
+pure func test_mutable_sequential_assignments_release_each_replaced_owner() -> Bool:
+	first_replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
+	second_replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(2)], list_int_type())
+	body: CoreExpr = SeqExpr(
+		AssignExpr(named_var("xs"), first_replacement, void_type(), SyntheticSourceLoc),
+		AssignExpr(named_var("xs"), second_replacement, void_type(), SyntheticSourceLoc),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 3 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_mutable_assignment_in_branch_releases_replaced_owner() -> Bool:
+	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
+	body: CoreExpr = IfExpr(
+		bool_expr(True),
+		AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and has_drop_before_assign_for("xs", rewritten)
+	)
+
+
+pure func test_mutable_assignment_in_constructor_match_releases_replaced_owner() -> Bool:
+	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[],
+				AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc),
+			)],
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		match_body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 2 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_mutable_assignment_after_cow_consume_skips_old_owner_release() -> Bool:
+	consume_old: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
+	body: CoreExpr = SeqExpr(
+		consume_old,
+		AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and not has_drop_before_assign_for("xs", rewritten)
+
+
+pure func test_borrowed_while_body_drops_owner_after_loop() -> Bool:
+	cond: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	loop_body: CoreExpr = SeqExpr(
+		intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type()),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	loop: CoreExpr = WhileExpr(cond, loop_body, void_type(), SyntheticSourceLoc)
+	body: CoreExpr = SeqExpr(
+		loop,
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_consuming_while_body_retains_owner_for_each_iteration() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	loop_body: CoreExpr = LetExpr(
+		named_var("updated"),
+		False,
+		list_int_type(),
+		consume,
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	loop: CoreExpr = WhileExpr(bool_expr(True), loop_body, void_type(), SyntheticSourceLoc)
+	body: CoreExpr = SeqExpr(
+		loop,
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 1
+		and top_let_while_body_has_dup("xs", rewritten)
+	)
+
+
+pure func test_consuming_match_branch_in_loop_retains_owner_for_each_iteration() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[],
+				LetExpr(
+					named_var("updated"),
+					False,
+					list_int_type(),
+					consume,
+					VoidExpr(void_type(), SyntheticSourceLoc),
+				),
+			)],
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+	)
+	loop: CoreExpr = WhileExpr(bool_expr(True), match_body, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 1
+		and top_let_while_body_has_dup("xs", rewritten)
+	)
+
+
+pure func test_match_binding_shadows_repeated_consume_protection() -> Bool:
+	consume_shadow: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[match_binding("xs", list_int_type())],
+				LetExpr(
+					named_var("updated"),
+					False,
+					list_int_type(),
+					consume_shadow,
+					VoidExpr(void_type(), SyntheticSourceLoc),
+				),
+			)],
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+	)
+	loop: CoreExpr = WhileExpr(bool_expr(True), match_body, void_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_consuming_for_list_body_retains_owner_for_each_iteration() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	loop_body: CoreExpr = LetExpr(
+		named_var("updated"),
+		False,
+		list_int_type(),
+		consume,
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	loop: CoreExpr = ForListExpr(
+		{
+			binder = {
+				variable = named_var("item"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = var_expr("items", list_int_type()),
+			iterable_release_policy = NoReleasePolicy,
+			body = loop_body
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 1
+		and top_let_for_list_body_has_dup("xs", rewritten)
+	)
 
 
 pure func test_borrowed_intrinsic_drops_after_call() -> Bool:
@@ -758,6 +2513,304 @@ pure func test_consume_then_borrow_gets_dup_and_post_drop() -> Bool:
 	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 1
 
 
+pure func test_if_borrowed_branch_drops_after_borrow_and_unused_branch_drops_before_body() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	body: CoreExpr = IfExpr(bool_expr(True), borrow, int_expr(0), int_type(), SyntheticSourceLoc)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_if_has_branch_drops("xs", rewritten)
+	)
+
+
+pure func test_if_borrowed_branch_and_cow_consuming_branch_balance_independently() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	body: CoreExpr = IfExpr(
+		bool_expr(True),
+		borrow,
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_if_has_borrowed_then_only_drop("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_branch_use_prevents_pre_match_drop() -> Bool:
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[],
+				var_expr("s", string_type()),
+			)],
+		var_expr("s", string_type()),
+		string_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("s"),
+		False,
+		string_type(),
+		var_expr("source", string_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	top_let_body_is_constructor_match(rewritten) and drop_count_for("s", rewritten) == 0
+
+
+pure func test_constructor_match_aliasing_scrutinee_drops_owner_after_match() -> Bool:
+	body: CoreExpr = ConstructorMatchExpr(
+		var_expr("tag", UnionType("Tag")),
+		NoReleasePolicy,
+		[constructor_case("Some", [], int_expr(1))],
+		ConstructorMatchFallbackBody(int_expr(0)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("tag"),
+		False,
+		UnionType("Tag"),
+		var_expr("source", UnionType("Tag")),
+		body,
+	)
+	env: PerceusEnv = { empty_env() | managed_type_names = ["Tag"] }
+	rewritten: CoreExpr = insert_drops_expr(env, expr)
+
+	(
+		drop_count_for("tag", rewritten) == 1
+		and dup_count_for("tag", rewritten) == 0
+		and top_let_body_is_post_drop_after_constructor_match("tag", rewritten)
+	)
+
+
+pure func test_constructor_match_borrowed_branch_drops_after_borrow_and_unused_fallback_drops_before_body(
+
+) -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [], borrow)],
+		int_expr(0),
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_branch_drops("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_borrowed_branch_and_cow_fallback_balance_independently() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [], borrow)],
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_borrowed_case_only_drop("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_borrowed_branch_with_fail_fallback_balances_case() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case("Some", [], borrow)],
+		ConstructorMatchFallbackFail,
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_borrowed_case_only_drop("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_nested_literal_body_balances_branches() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[literal_case(IntLiteral(1), [], borrow)],
+		LiteralMatchFallbackBody(int_expr(0)),
+		int_type(),
+	)
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], literal_body)],
+		ConstructorMatchFallbackFail,
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_nested_literal_branch_drops("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_nested_length_body_balances_branches() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	length_body: CoreConstructorMatchBody = constructor_length_body(
+		[
+			{
+				length = 1,
+				branch = constructor_length_branch([], ConstructorMatchBodyExpr(borrow))
+			},
+		],
+		None,
+		Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(0)))),
+		int_type(),
+	)
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], length_body)],
+		ConstructorMatchFallbackFail,
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_nested_length_branch_drops("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_nested_length_geq_body_balances_branches() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	length_body: CoreConstructorMatchBody = constructor_length_body([], Some({
+			minimum_length = 2,
+			branch = constructor_length_branch([], ConstructorMatchBodyExpr(borrow)),
+		}), Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(0)))), int_type())
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], length_body)],
+		ConstructorMatchFallbackFail,
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and dup_count_for("xs", rewritten) == 0
+		and top_let_constructor_match_has_nested_length_geq_branch_drops("xs", rewritten)
+	)
+
+
+pure func test_constructor_match_nested_length_shadowing_stays_conservative() -> Bool:
+	length_body: CoreConstructorMatchBody = constructor_length_body(
+		[
+			{
+				length = 1,
+				branch = constructor_length_branch(
+					[match_binding("xs", list_int_type())],
+					ConstructorMatchBodyExpr(var_expr("xs", list_int_type())),
+				)
+			},
+		],
+		None,
+		Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(0)))),
+		list_int_type(),
+	)
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], length_body)],
+		ConstructorMatchFallbackFail,
+		list_int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	(
+		drop_count_for("xs", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and not top_let_constructor_match_has_nested_length_branch_drops("xs", rewritten)
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -768,6 +2821,54 @@ tests: TestSuite = {
 			"constructor contracts transfer payload fields",
 			test_constructor_contracts_transfer_payload_fields,
 		),
+		(
+			"constructor contracts are scoped by return type",
+			test_constructor_contracts_are_scoped_by_return_type,
+		),
+		(
+			"consumed user call contract transfers declared args",
+			test_consumed_user_call_contract_transfers_declared_args,
+		),
+		(
+			"borrowed managed parameter return is retained",
+			test_borrowed_managed_parameter_return_is_retained,
+		),
+		(
+			"borrowed managed parameter field return is retained",
+			test_borrowed_managed_parameter_field_return_is_retained,
+		),
+		(
+			"borrowed parameter returned from branch is retained",
+			test_borrowed_parameter_returned_from_branch_is_retained,
+		),
+		(
+			"borrowed match binding return is retained",
+			test_borrowed_match_binding_return_is_retained,
+		),
+		(
+			"union construction retains borrowed parameter payload",
+			test_union_construction_retains_borrowed_parameter_payload,
+		),
+		(
+			"tuple construction retains borrowed parameter member",
+			test_tuple_construction_retains_borrowed_parameter_member,
+		),
+		(
+			"consuming user call propagates consumed parameter",
+			test_consuming_user_call_propagates_consumed_parameter,
+		),
+		(
+			"program infers read-only user call borrows argument",
+			test_program_infers_read_only_user_call_borrows_argument,
+		),
+		(
+			"consumed managed parameter return transfers without retain",
+			test_consumed_managed_parameter_return_transfers_without_retain,
+		),
+		(
+			"unused consumed managed parameter is dropped",
+			test_unused_consumed_managed_parameter_is_dropped,
+		),
 		("builtin and intrinsic contract lookup", test_builtin_and_intrinsic_contract_lookup),
 		(
 			"foreign and closure calls borrow arguments",
@@ -777,9 +2878,25 @@ tests: TestSuite = {
 		("count uses respects shadowing", test_count_uses_respects_shadowing),
 		("count uses takes branch maximum", test_count_uses_takes_branch_maximum),
 		("count uses ignores assignment target", test_count_uses_ignores_assignment_target),
+		(
+			"count uses lambda capture once and respects shadowing",
+			test_count_uses_lambda_capture_once_and_respects_shadowing,
+		),
+		(
+			"count uses constructor match takes branch maximum",
+			test_count_uses_constructor_match_takes_branch_maximum,
+		),
+		(
+			"count uses constructor match respects binding shadowing",
+			test_count_uses_constructor_match_respects_binding_shadowing,
+		),
 		("linearity accepts linear expressions", test_linearity_accepts_linear_expressions),
 		("linearity rejects control flow", test_linearity_rejects_control_flow),
 		("unused managed let gets drop", test_unused_managed_let_gets_drop),
+		(
+			"managed let nested under lambda gets drop",
+			test_managed_let_nested_under_lambda_gets_drop,
+		),
 		("unmanaged let gets no drop", test_unmanaged_let_gets_no_drop),
 		(
 			"once-used managed let transfers without dup or drop",
@@ -788,6 +2905,59 @@ tests: TestSuite = {
 		(
 			"reused managed let gets one dup per extra use",
 			test_reused_managed_let_gets_one_dup_per_extra_use,
+		),
+		("mutable managed let drops final owner", test_mutable_managed_let_drops_final_owner),
+		(
+			"mutable assignment releases old and final owners",
+			test_mutable_assignment_releases_old_and_final_owners,
+		),
+		(
+			"mutable COW assignment skips old owner release",
+			test_mutable_cow_assignment_skips_old_owner_release,
+		),
+		(
+			"mutable self-assignment retains additional consumes",
+			test_mutable_self_assignment_retains_additional_consumes,
+		),
+		(
+			"mutable self-assignment does not retain late borrow",
+			test_mutable_self_assignment_does_not_retain_late_borrow,
+		),
+		(
+			"mutable sequential assignments release each replaced owner",
+			test_mutable_sequential_assignments_release_each_replaced_owner,
+		),
+		(
+			"mutable assignment in branch releases replaced owner",
+			test_mutable_assignment_in_branch_releases_replaced_owner,
+		),
+		(
+			"mutable assignment in constructor match releases replaced owner",
+			test_mutable_assignment_in_constructor_match_releases_replaced_owner,
+		),
+		(
+			"mutable assignment after COW consume skips old owner release",
+			test_mutable_assignment_after_cow_consume_skips_old_owner_release,
+		),
+		(
+			"borrowed while body drops owner after loop",
+			test_borrowed_while_body_drops_owner_after_loop,
+		),
+		(
+			"consuming while body retains owner for each iteration",
+			test_consuming_while_body_retains_owner_for_each_iteration,
+		),
+		(
+			"consuming match branch in loop retains owner for each iteration",
+			test_consuming_match_branch_in_loop_retains_owner_for_each_iteration,
+		),
+		(
+			"match binding shadows repeated consume protection",
+			test_match_binding_shadows_repeated_consume_protection,
+		),
+		(
+			"consuming for-list body retains owner for each iteration",
+			test_consuming_for_list_body_retains_owner_for_each_iteration,
 		),
 		("borrowed intrinsic drops after call", test_borrowed_intrinsic_drops_after_call),
 		(
@@ -801,6 +2971,50 @@ tests: TestSuite = {
 		(
 			"consume then borrow gets dup and post-drop",
 			test_consume_then_borrow_gets_dup_and_post_drop,
+		),
+		(
+			"if borrowed branch drops after borrow and unused branch drops before body",
+			test_if_borrowed_branch_drops_after_borrow_and_unused_branch_drops_before_body,
+		),
+		(
+			"if borrowed branch and COW-consuming branch balance independently",
+			test_if_borrowed_branch_and_cow_consuming_branch_balance_independently,
+		),
+		(
+			"constructor match branch use prevents pre-match drop",
+			test_constructor_match_branch_use_prevents_pre_match_drop,
+		),
+		(
+			"constructor match aliasing scrutinee drops owner after match",
+			test_constructor_match_aliasing_scrutinee_drops_owner_after_match,
+		),
+		((
+				"constructor match borrowed branch drops after borrow and unused fallback drops "
+				+ "before body"
+			), test_constructor_match_borrowed_branch_drops_after_borrow_and_unused_fallback_drops_before_body),
+		(
+			"constructor match borrowed branch and COW fallback balance independently",
+			test_constructor_match_borrowed_branch_and_cow_fallback_balance_independently,
+		),
+		(
+			"constructor match borrowed branch with fail fallback balances case",
+			test_constructor_match_borrowed_branch_with_fail_fallback_balances_case,
+		),
+		(
+			"constructor match nested literal body balances branches",
+			test_constructor_match_nested_literal_body_balances_branches,
+		),
+		(
+			"constructor match nested length body balances branches",
+			test_constructor_match_nested_length_body_balances_branches,
+		),
+		(
+			"constructor match nested length >= body balances branches",
+			test_constructor_match_nested_length_geq_body_balances_branches,
+		),
+		(
+			"constructor match nested length shadowing stays conservative",
+			test_constructor_match_nested_length_shadowing_stays_conservative,
 		),
 	]
 }

@@ -34,6 +34,7 @@ import:
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
 		CoreUnionVariant,
 		CoreVar,
+	../src/stage_09_core/compiler_core_perceus: insert_drops_program
 	test: TestSuite
 
 
@@ -321,6 +322,20 @@ pure func assignment_call_name_matches_in_expr(expr: CoreExpr, expected: String)
 					Some(matches)
 				None:
 					assignment_call_name_matches_in_expr(second, expected)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			var found: Option[Bool] = assignment_call_name_matches_in_expr(scrutinee, expected)
+
+			for match_case in cases:
+				if found == None:
+					match match_case.body:
+						ConstructorMatchBodyExpr(body):
+							found = assignment_call_name_matches_in_expr(body, expected)
+						_:
+							void
+				else:
+					void
+
+			found
 		_:
 			None
 
@@ -343,6 +358,51 @@ pure func assignment_call_name_matches(program_value: CoreProgram, expected: Str
 				void
 
 	found.get_or(False)
+
+
+pure func has_old_drop_reassign(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(temp, is_mutable, bind_type, rhs, body):
+			direct_match: Bool = match body:
+				SeqExpr(DropExpr(drop_var, drop_type, release_policy, drop_body, drop_result, drop_loc), AssignExpr(assign_var, VarExpr(assign_rhs, rhs_type, rhs_loc), assign_type, assign_loc)):
+					(
+						drop_var.name == name
+						and assign_var.name == name
+						and assign_rhs.name == temp.name
+					)
+				_:
+					False
+
+			direct_match or has_old_drop_reassign(name, rhs) or has_old_drop_reassign(name, body)
+		SeqExpr(first, second):
+			has_old_drop_reassign(name, first) or has_old_drop_reassign(name, second)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			has_old_drop_reassign(name, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				has_old_drop_reassign(name, cond)
+				or has_old_drop_reassign(name, then_expr)
+				or has_old_drop_reassign(name, else_expr)
+			)
+		_:
+			False
+
+
+pure func function_body(program_value: CoreProgram, name: String) -> Option[CoreExpr]:
+	var found: Option[CoreExpr] = None
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(func_info):
+				if func_info.name == name:
+					found = func_info.body
+					break
+				else:
+					void
+			_:
+				void
+
+	found
 
 
 pure func clone_drops_consumed_param(program_value: CoreProgram, name: String) -> Bool:
@@ -457,6 +517,42 @@ pure func recursive_one_sided_rewrite_body() -> CoreExpr:
 	)
 
 
+pure func recursive_branch_swapped_rewrite_body() -> CoreExpr:
+	left: CoreExpr = var_expr("left", expr_type())
+	right: CoreExpr = var_expr("right", expr_type())
+	left_call: CoreExpr = user_call(
+		"rewrite_expr",
+		10,
+		[left, var_expr("pass", int_type())],
+		expr_type(),
+	)
+	right_call: CoreExpr = user_call(
+		"rewrite_expr",
+		10,
+		[right, var_expr("pass", int_type())],
+		expr_type(),
+	)
+
+	ConstructorMatchExpr(
+		var_expr("expr", expr_type()),
+		NoReleasePolicy,
+		[
+			add_match_case(
+				IfExpr(
+					bool_expr(True),
+					add_expr(left_call, right_call),
+					add_expr(right_call, left_call),
+					expr_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		ConstructorMatchFallbackFail,
+		expr_type(),
+		SyntheticSourceLoc,
+	)
+
+
 pure func owned_binding_names_in_case(match_case: CoreConstructorMatchCase) -> List[String]:
 	var names: List[String] = []
 
@@ -532,6 +628,25 @@ pure func test_rewrites_safe_self_replacement_call() -> Bool:
 	has_functions and retargeted_assignment and clone_drops_param
 
 
+pure func test_clone_identity_uses_name_and_def_id() -> Bool:
+	other: CoreFunction = { rewrite_function(lit_expr(99)) | name = "other_rewrite" }
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(other),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(run_function()),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	function_names_are(
+		rewritten,
+		["other_rewrite", "rewrite_expr", "rewrite_expr__consume_arg0", "run"],
+	) and assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
+
+
 pure func test_does_not_clone_when_result_is_consumed_param() -> Bool:
 	rewritten: CoreProgram = rewritten_program(var_expr("expr", expr_type()))
 	has_functions: Bool = function_names_are(
@@ -569,6 +684,69 @@ pure func test_consuming_clone_owns_recursive_match_fields() -> Bool:
 			False
 
 
+pure func test_consuming_clone_owns_branch_swapped_recursive_fields() -> Bool:
+	rewritten: CoreProgram = rewritten_program(recursive_branch_swapped_rewrite_body())
+
+	match clone_body_summary(rewritten, "rewrite_expr__consume_arg0"):
+		Some(summary):
+			owns_fields: Bool = summary.owned_names == ["left", "right"]
+			rewrites_recursive_calls: Bool = summary.rewrite_calls == [
+				"rewrite_expr__consume_arg0",
+				"rewrite_expr__consume_arg0",
+				"rewrite_expr__consume_arg0",
+				"rewrite_expr__consume_arg0",
+			]
+			owns_fields and rewrites_recursive_calls
+		None:
+			False
+
+
+pure func test_perceus_consuming_clone_skips_old_assignment_drop() -> Bool:
+	perceus: CoreProgram = insert_drops_program(rewritten_program(lit_expr(7)))
+
+	match function_body(perceus, "run"):
+		Some(body):
+			not has_old_drop_reassign("expr", body)
+		None:
+			False
+
+
+pure func test_rewrites_assignment_nested_in_constructor_match() -> Bool:
+	match_body: CoreExpr = ConstructorMatchExpr(
+		var_expr("expr", expr_type()),
+		NoReleasePolicy,
+		[add_match_case(assignment_expr())],
+		ConstructorMatchFallbackFail,
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	match_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				named_var("expr"),
+				True,
+				expr_type(),
+				lit_expr(0),
+				SeqExpr(
+					match_body,
+					var_expr("expr", expr_type()),
+				),
+			),
+		)
+	}
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(match_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
+
+
 pure func test_consuming_clone_rejects_one_sided_recursive_field_use() -> Bool:
 	rewritten: CoreProgram = rewritten_program(recursive_one_sided_rewrite_body())
 
@@ -586,6 +764,7 @@ tests: TestSuite = {
 	description = "Blorp compiler Core consume specialize",
 	tests = [
 		("rewrites safe self-replacement call", test_rewrites_safe_self_replacement_call),
+		("clone identity uses name and def id", test_clone_identity_uses_name_and_def_id),
 		(
 			"does not clone when result is consumed param",
 			test_does_not_clone_when_result_is_consumed_param,
@@ -597,6 +776,18 @@ tests: TestSuite = {
 		(
 			"consuming clone owns recursive match fields",
 			test_consuming_clone_owns_recursive_match_fields,
+		),
+		(
+			"consuming clone owns branch-swapped recursive fields",
+			test_consuming_clone_owns_branch_swapped_recursive_fields,
+		),
+		(
+			"Perceus consuming clone skips old assignment drop",
+			test_perceus_consuming_clone_skips_old_assignment_drop,
+		),
+		(
+			"rewrites assignment nested in constructor match",
+			test_rewrites_assignment_nested_in_constructor_match,
 		),
 		(
 			"consuming clone rejects one-sided recursive field use",
