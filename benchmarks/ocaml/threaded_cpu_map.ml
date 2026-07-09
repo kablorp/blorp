@@ -27,9 +27,14 @@ let () =
   let workers = env_int "BENCH_THREADS" 4 in
   let items = env_int "BENCH_ITEMS" 10_000 in
   let rounds = env_int "BENCH_ROUNDS" 1000 in
-  let domains =
+  let partials = Array.make workers 0 in
+  let threads =
     Array.init workers (fun worker_id ->
-        Domain.spawn (fun () -> worker_sum worker_id workers items rounds))
+        Thread.create
+          (fun () ->
+            partials.(worker_id) <- worker_sum worker_id workers items rounds)
+          ())
   in
-  let checksum = Array.fold_left (fun total domain -> total + Domain.join domain) 0 domains in
+  Array.iter Thread.join threads;
+  let checksum = Array.fold_left ( + ) 0 partials in
   Printf.printf "checksum: %d\n" checksum

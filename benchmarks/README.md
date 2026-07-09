@@ -55,11 +55,11 @@ These run when the filter is omitted or set to `all`.
 | `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Go, OCaml, Python |
 | `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, OCaml, Python |
 | `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, OCaml, Python |
-| `channel_pipeline` | Bounded producer/worker/consumer channel pipeline | blorp, C, Go, OCaml, Python |
+| `channel_pipeline` | Producer/worker/consumer channel pipeline; Blorp currently uses structured concurrent list processing | blorp, C, Go, OCaml, Python |
 | `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | blorp, C, Go, OCaml, Python |
 | `options` | `Option` representation and layout costs | blorp |
-| `simd` | SIMD vector operations with checksum output | blorp, C |
-| `nbody` | Struct-of-arrays N-body planetary simulation | blorp, C, Go, OCaml, Python |
+| `simd` | 16-element numeric tensor add, multiply, sum, and dot kernels | blorp, C |
+| `nbody` | Struct-of-arrays N-body planetary simulation; Blorp currently uses list-backed storage | blorp, C, Go, OCaml, Python |
 | `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, C, Go, OCaml, Python |
 | `fannkuch` | Permutation-heavy integer workload | blorp, C, Go, OCaml, Python |
 | `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | blorp, C, Go, OCaml, Python |
@@ -77,35 +77,8 @@ included in `bench.sh all`.
 
 | Benchmark | What it tests | Languages |
 |-----------|--------------|-----------|
-| `numeric_vector` | Numeric tensor/vector operations and subscript variants | blorp |
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
-| `particle_gravity` | Particle-sim-derived parallel indexed gravity kernel | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
-
-## Standalone Diagnostic Benchmarks
-
-`benchmarks/blorp/list_parallel.brp` isolates `List.parallel` behavior. It does
-not use `bench.sh` because it emits one parseable row per operation, size,
-thread setting, and selectivity case:
-
-```bash
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp -- smoke
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp -- full
-```
-
-Leave `BLORP_THREADS` unset to measure the runtime default. The `smoke` mode
-uses small sizes for harness checks; `full` includes 120k and 1M element cases.
-
-`benchmarks/blorp/vector_parallel.brp` isolates scoped `Vector.parallel`
-pipelines. It covers single `map`, `map.map`, `map_indexed.map`,
-`zip_map.map`, repeated use of a captured same-shape vector, and managed-result
-elements. Each `BENCH` row includes elapsed time, allocation counters, live
-objects, bytes still allocated, and a checksum:
-
-```bash
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- smoke
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- full
-```
 
 ## Timing Model
 

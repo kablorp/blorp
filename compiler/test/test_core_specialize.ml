@@ -172,6 +172,10 @@ let expect_intrinsic_with_reg label reg expected_name e =
       Alcotest.(check string) (label ^ " name") expected_name got_name
   | _ -> Alcotest.failf "%s did not specialize to expected intrinsic" label
 
+let expect_ranked_checked_get_shape_dims label expected_dims args =
+  let got_dims = List.map int_lit (List.filteri (fun i _ -> i >= 1 && i <= 3) args) in
+  Alcotest.(check (list int)) (label ^ " dims") expected_dims got_dims
+
 let count_intrinsic name body =
   fold_tree
     (fun acc node ->
@@ -588,6 +592,42 @@ let test_float64_matrix_checked_get_uses_unboxed_runtime () =
   let col = mk (CLit (LitInt 2L)) ty_int in
   let e = call_builtin "blorp_matrix_checked_get" [ m; row; col ] ty_float in
   expect_builtin "float64 matrix checked_get" "blorp_matrix_checked_get_f64" e
+
+let test_rank3_int_checked_get_injects_shape_and_unboxes () =
+  let t = cvar "t" (tensor ty_int [ 2; 3; 4 ]) in
+  let i = mk (CLit (LitInt 1L)) ty_int in
+  let j = mk (CLit (LitInt 2L)) ty_int in
+  let k = mk (CLit (LitInt 3L)) ty_int in
+  let e = call_builtin "blorp_tensor3_checked_get" [ t; i; j; k ] ty_int in
+  match (specialize e).desc with
+  | CUnbox
+      ( { desc = CCall (CKBuiltin got_name, _, args); ty = TyNamed ("Void", []); _ },
+        TyNamed ("Int", []) ) ->
+      Alcotest.(check string)
+        "rank3 int checked_get builtin" "blorp_tensor3_checked_get_shape"
+        got_name;
+      Alcotest.(check int) "rank3 int checked_get arg count" 7
+        (List.length args);
+      expect_ranked_checked_get_shape_dims "rank3 int checked_get" [ 2; 3; 4 ]
+        args
+  | _ -> Alcotest.fail "rank3 Int checked_get should specialize through CUnbox"
+
+let test_rank3_float_checked_get_uses_shape_f64_runtime () =
+  let t = cvar "t" (tensor ty_float [ 2; 3; 4 ]) in
+  let i = mk (CLit (LitInt 1L)) ty_int in
+  let j = mk (CLit (LitInt 2L)) ty_int in
+  let k = mk (CLit (LitInt 3L)) ty_int in
+  let e = call_builtin "blorp_tensor3_checked_get" [ t; i; j; k ] ty_float in
+  match (specialize e).desc with
+  | CCall (CKBuiltin got_name, _, args) ->
+      Alcotest.(check string)
+        "rank3 float checked_get builtin" "blorp_tensor3_checked_get_shape_f64"
+        got_name;
+      Alcotest.(check int) "rank3 float checked_get arg count" 7
+        (List.length args);
+      expect_ranked_checked_get_shape_dims "rank3 float checked_get" [ 2; 3; 4 ]
+        args
+  | _ -> Alcotest.fail "rank3 Float checked_get should specialize to shape f64"
 
 let test_bounds_proven_tensor_read_uses_typed_raw_view () =
   let values = cvar "values" (tensor ty_float [ 4 ]) in
@@ -1291,6 +1331,10 @@ let suite =
           test_alias_enum_checked_get_uses_layout_intrinsic;
         Alcotest.test_case "float64_matrix_checked_get_unboxed" `Quick
           test_float64_matrix_checked_get_uses_unboxed_runtime;
+        Alcotest.test_case "rank3_int_checked_get_shape_unbox" `Quick
+          test_rank3_int_checked_get_injects_shape_and_unboxes;
+        Alcotest.test_case "rank3_float_checked_get_shape_f64" `Quick
+          test_rank3_float_checked_get_uses_shape_f64_runtime;
         Alcotest.test_case "bounds_proven_tensor_read_typed_raw_view" `Quick
           test_bounds_proven_tensor_read_uses_typed_raw_view;
         Alcotest.test_case "raw_tensor_view_resource_scope_collection" `Quick

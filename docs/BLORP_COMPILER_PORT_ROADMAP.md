@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-07.
+Status checked against code on 2026-07-08.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -20,9 +20,9 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
 Blorp executable / CLI planning / source graph discovery / source reads / parse
-  -> JSON frontend module graph and typed-program bridge
-  -> OCaml host command execution / module validation / CTFE
-  -> decoded Blorp typed AST -> OCaml Core lowering
+  -> JSON frontend module graph and Blorp typed-program/CTFE bridge
+  -> OCaml host command execution / module validation / artifact decode
+  -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
   -> OCaml Core pipeline through Perceus
   -> JSON post-Perceus Core
   -> Blorp reuse / closure / resource / fairness / prepare / prepared reuse
@@ -32,38 +32,38 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
 
 Current source-frontier Blorp files:
 
-- `compiler/blorp/compiler_cli_main.brp`
-- `compiler/blorp/compiler_cli.brp`
-- `compiler/blorp/compiler_cli_args.brp`
-- `compiler/blorp/compiler_cli_plan.brp`
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_cli_artifact_json.brp`
-- `compiler/blorp/compiler_source.brp`
-- `compiler/blorp/compiler_lexer.brp`
-- `compiler/blorp/compiler_parser.brp`
-- `compiler/blorp/compiler_parsed_ast.brp`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
-- `compiler/blorp/compiler_source_ast_finalize.brp`
-- `compiler/blorp/compiler_module_surface.brp`
-- `compiler/blorp/compiler_module_surface_json.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
+- `compiler/blorp/src/stage_01_file_io/compiler_source.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_lexer.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface_json.brp`
 
 Current backend-tail Blorp files:
 
-- `compiler/blorp/compiler_core_json.brp`
-- `compiler/blorp/compiler_core_pipeline.brp`
-- `compiler/blorp/compiler_core_consume_specialize.brp`
-- `compiler/blorp/compiler_core_ownership.brp`
-- `compiler/blorp/compiler_core_perceus.brp`
-- `compiler/blorp/compiler_core_reuse.brp`
-- `compiler/blorp/compiler_core_closure.brp`
-- `compiler/blorp/compiler_core_resource.brp`
-- `compiler/blorp/compiler_core_fairness.brp`
-- `compiler/blorp/compiler_core_prepare.brp`
-- `compiler/blorp/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 
 Current OCaml bridge and orchestration files:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
 - `compiler/lib/modules.ml`
 - `compiler/lib/pipeline.ml`
@@ -73,6 +73,11 @@ Current OCaml bridge and orchestration files:
 - `compiler/lib/core_lower.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
+
+The public executable is Blorp-owned through
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
+private execution shell for decoded Blorp plans, temporary typed-program
+handoffs, artifact writing, host C invocation, and still-OCaml compiler stages.
 
 ## Migration Rules
 
@@ -105,11 +110,11 @@ For every checkpoint, use this workflow:
 Goal: make every remaining OCaml-to-Blorp call explicit and prevent new bridge
 side channels while the boundary moves.
 
-OCaml references:
+OCaml references still needed at this checkpoint:
 
 - `compiler/lib/compiler_blorp_bridge.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
 - `compiler/lib/modules.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/language_surface.ml`
@@ -118,10 +123,10 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_bridge.brp`
-- `compiler/blorp/compiler_bridge_protocol.brp`
-- `compiler/blorp/compiler_bridge_cli.brp`
-- `compiler/blorp/ocaml_port_inventory.tsv`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge_protocol.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp`
+- `compiler/blorp/src/stage_99_meta/ocaml_port_inventory.tsv`
 
 Implementation steps:
 
@@ -138,9 +143,12 @@ Implementation steps:
   parser boundary while OCaml still consumes parsed AST values. OCaml raw
   parser consumers should go through `Modules.parse_raw_source*` so raw output
   is explicit at call sites.
-- Delete snippet-style bridge renderers once their OCaml callers disappear.
-- Keep `BLORP_COMPILER_RENDERER_HELPER=1` limited to static bootstrap table
-  support.
+- Prepared backend/list/tensor codegen renderers are typed-only. Call sites use
+  `render_prepared_*_op` over explicit operation variants; do not reintroduce
+  name/arity template registries or snippet-style adapters for those surfaces.
+- Keep `BLORP_COMPILER_RENDERER_HELPER=1` limited to static bootstrap table,
+  manifest, and diagnostic rendering support while those temporary callers
+  remain.
 
 Edge cases:
 
@@ -185,7 +193,7 @@ source execution.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `apply_blorp_cli_frontier`
   - `cli_frontier_frontend_module_graph`
   - `finalize_cli_frontend_graph_source`
@@ -206,11 +214,11 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_cli.brp`
-- `compiler/blorp/compiler_cli_args.brp`
-- `compiler/blorp/compiler_cli_plan.brp`
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_cli_artifact_json.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
 
 Implementation steps:
 
@@ -290,7 +298,6 @@ OCaml references:
   - `decode_import_decl`
   - `decode_foreign_block_decl`
   - `decode_parse_diagnostics`
-- `compiler/lib/parse_comments.ml`
 - `compiler/lib/module_surface.ml`
   - `validate_against_program`
   - `exports_as_ast_pairs`
@@ -306,17 +313,17 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_token.brp`
-- `compiler/blorp/compiler_lexer.brp`
-- `compiler/blorp/compiler_parser.brp`
-- `compiler/blorp/compiler_parsed_ast.brp`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
-- `compiler/blorp/compiler_parse_diagnostic.brp`
-- `compiler/blorp/compiler_source_ast_finalize.brp`
-- `compiler/blorp/compiler_module_surface.brp`
-- `compiler/blorp/compiler_module_surface_json.brp`
-- `compiler/blorp/compiler_format.brp`
-- `compiler/blorp/compiler_format_projection.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_token.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_lexer.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_parse_diagnostic.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface_json.brp`
+- `compiler/blorp/src/stage_11_format/compiler_format.brp`
+- `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
 
 Implementation steps:
 
@@ -364,8 +371,8 @@ Tests:
 
 Deletion point:
 
-- Delete `parsed_ast_json.ml`, `parse_comments.ml`, and OCaml module-surface
-  validation once no OCaml stage consumes parsed AST JSON.
+- Delete `parsed_ast_json.ml` and OCaml module-surface validation once no OCaml
+  stage consumes parsed AST JSON.
 
 ## Checkpoint 3: Module Graph, Import Resolution, And Package Context
 
@@ -440,8 +447,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_cli_source_graph.brp`
-- `compiler/blorp/compiler_module_surface.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_surface.brp`
 - future `compiler_module_graph.brp`
 - future `compiler_module_resolution.brp`
 
@@ -515,16 +522,16 @@ expression inference.
 Status: complete for the pure frontend substrate. Production typecheck and
 inference still switch over in later checkpoints, but the checkpoint-4 data
 models and helper APIs now exist in Blorp with focused tests.
-`compiler/blorp/language_surface_manifest.brp` remains the source of truth for
+`compiler/blorp/src/stage_05_types/language_surface_manifest.brp` remains the source of truth for
 source-language keyword and prelude UFCS tables, while Dune generates
 `Language_surface_data` for OCaml consumers at build time. This removes the
 runtime bridge call from `compiler/lib/language_surface.ml` and keeps the
 renderer-helper bootstrap rows on the same generated data.
-`compiler/blorp/compiler_diagnostic.brp`
+`compiler/blorp/src/stage_01_file_io/compiler_diagnostic.brp`
 defines pure Rust-style diagnostic data and rendering over explicit source text,
 with parity tests for tab padding, synthetic locations, notes/help, and
 secondary labels. The semantic type slice is in place:
-`compiler/blorp/compiler_type.brp` defines the Blorp `CompilerType` model plus
+`compiler/blorp/src/stage_05_types/compiler_type.brp` defines the Blorp `CompilerType` model plus
 pure display, structural equality, tensor-name normalization, array/tensor
 decomposition, numeric predicates, dimension-form predicates, type-parameter
 bound stripping, occurs checks, cycle-safe substitution, and dimension
@@ -532,7 +539,7 @@ arithmetic normalization. It also carries the first Blorp-owned array/tensor
 dimension validator, including non-positive concrete dimension checks,
 dimension-argument validation, and variadic-dimension placement rules. It
 also has the first explicit Blorp context model in
-`compiler/blorp/compiler_context.brp`, covering module-origin policy, type-home
+`compiler/blorp/src/stage_05_types/compiler_context.brp`, covering module-origin policy, type-home
 ambiguity, resource cleanup entries, trait-home conflict reporting, definition
 ids, meta origins/bindings, head resolution, zonking, and Core lowering
 counters as ordinary values. The context model now also owns the baseline
@@ -540,35 +547,35 @@ unifier: meta binding with occurs checks, one-way and symmetric type-variable
 binding, explicit type-parameter binding, rigid variables, function purity,
 tuple/array/tensor matching, range/Int compatibility, LiteralString/String
 compatibility, and dimension arithmetic through the canonical solver in
-`compiler/blorp/compiler_dim_solver.brp`. That solver ports the
+`compiler/blorp/src/stage_05_types/compiler_dim_solver.brp`. That solver ports the
 sum-of-products normalization from `compiler/lib/dim_solver.ml`, including
 commutativity/associativity/distributivity, exact constant division,
 contradictions, and simple meta or `#` dimension-variable bindings. It
-also now includes `compiler/blorp/compiler_type_widening.brp`, which ports the
+also now includes `compiler/blorp/src/stage_05_types/compiler_type_widening.brp`, which ports the
 explicit value-slot widening decisions from `compiler/lib/type_widening.ml` for
 mutable bindings, arguments, collection elements, bitwise operands, method
 receivers, and numeric operands. The pure
 range/subscript proof substrate is also now covered by
-`compiler/blorp/compiler_refinement.brp`, which ports collection/dimension
+`compiler/blorp/src/stage_05_types/compiler_refinement.brp`, which ports collection/dimension
 identities, range upper bounds, subscript bounds, offset checks, proof sources,
 binding/expr proof payloads, proof-env replacement, and branch narrowing. The
 first module-loading identity helper is also in place:
-`compiler/blorp/compiler_module_type_identity.brp` ports local type-name
+`compiler/blorp/src/stage_04_modules/compiler_module_type_identity.brp` ports local type-name
 collection from parsed declarations, including private-wrapper transparency and
 sorted unique output for records, unions/enums, and type aliases. Structured
 generic-parameter helpers are now also ported in
-`compiler/blorp/compiler_generic_params.brp`, covering trait refs, bounded type
+`compiler/blorp/src/stage_05_types/compiler_generic_params.brp`, covering trait refs, bounded type
 params, parser-source spelling, and param-name extraction. The first
 type-policy metadata slice is also available in
-`compiler/blorp/compiler_type_metadata.brp`, covering recursion storage,
+`compiler/blorp/src/stage_05_types/compiler_type_metadata.brp`, covering recursion storage,
 primitive homes, struct scalar fields, native operator fast paths, builtin
 to-string fallbacks, and constructor-space classification. The remaining
-checkpoint-4 pieces are also now present: `compiler/blorp/compiler_env.brp`
+checkpoint-4 pieces are also now present: `compiler/blorp/src/stage_05_types/compiler_env.brp`
 ports the lexical environment, symbols, aliases, type/record/constructor lookup,
 trait functions, trait defs, impls, overloads, UFCS methods, resource policies,
 proof metadata attachment points, and alias/nominal-dimension resolution;
-`compiler/blorp/compiler_builtins.brp` ports compiler-visible builtin metadata
-and core Env population; and `compiler/blorp/compiler_type_resolution.brp`
+`compiler/blorp/src/stage_05_types/compiler_builtins.brp` ports compiler-visible builtin metadata
+and core Env population; and `compiler/blorp/src/stage_05_types/compiler_type_resolution.brp`
 ports the named annotation-resolution entrypoints over module aliases, owner
 qualification, nominal dimension disambiguation, and alias policy.
 
@@ -617,19 +624,19 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/language_surface_manifest.brp`
-- `compiler/blorp/compiler_type.brp`
-- `compiler/blorp/compiler_context.brp`
-- `compiler/blorp/compiler_dim_solver.brp`
-- `compiler/blorp/compiler_type_widening.brp`
-- `compiler/blorp/compiler_refinement.brp`
-- `compiler/blorp/compiler_module_type_identity.brp`
-- `compiler/blorp/compiler_generic_params.brp`
-- `compiler/blorp/compiler_type_metadata.brp`
-- `compiler/blorp/compiler_env.brp`
-- `compiler/blorp/compiler_builtins.brp`
-- `compiler/blorp/compiler_type_resolution.brp`
-- `compiler/blorp/compiler_diagnostic.brp`
+- `compiler/blorp/src/stage_05_types/language_surface_manifest.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type.brp`
+- `compiler/blorp/src/stage_05_types/compiler_context.brp`
+- `compiler/blorp/src/stage_05_types/compiler_dim_solver.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_widening.brp`
+- `compiler/blorp/src/stage_05_types/compiler_refinement.brp`
+- `compiler/blorp/src/stage_04_modules/compiler_module_type_identity.brp`
+- `compiler/blorp/src/stage_05_types/compiler_generic_params.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_metadata.brp`
+- `compiler/blorp/src/stage_05_types/compiler_env.brp`
+- `compiler/blorp/src/stage_05_types/compiler_builtins.brp`
+- `compiler/blorp/src/stage_05_types/compiler_type_resolution.brp`
+- `compiler/blorp/src/stage_01_file_io/compiler_diagnostic.brp`
 
 Implementation steps:
 
@@ -749,19 +756,19 @@ expression inference.
 
 Status: complete for the Blorp-owned first-pass/indexing scope. The explicit
 Blorp typecheck state substrate is in place in
-`compiler/blorp/compiler_typecheck_state.brp`, with focused tests for
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_state.brp`, with focused tests for
 module-origin policy, import binding deduplication, module-alias/selective
 import namespace collisions, known type/resource pre-scan state, type-home
 precedence, callable ids, private impl tracking, type-home matching, and private
 impl conflict lookup. The top-level pre-scan is also in place in
-`compiler/blorp/compiler_typecheck_decl.brp`, covering known type/resource
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`, covering known type/resource
 names, constructor names, function/variable/trait namespace entries,
 foreign-block functions, and private wrappers. Pure import registration is in
-place in `compiler/blorp/compiler_imports.brp`, covering qualified aliases,
+place in `compiler/blorp/src/stage_06_typecheck/compiler_imports.brp`, covering qualified aliases,
 selective and renamed imports, private/missing symbol diagnostics, duplicate
 local-name diagnostics, import bindings, and imported type homes over Blorp
 module surfaces. Source type-expression projection is in place in
-`compiler/blorp/compiler_typecheck_types.brp`. Semantic
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_types.brp`. Semantic
 declaration-registration slices are in place for local union/enum,
 builtin/resource type, record/struct, type-alias, global variable, source
 function, foreign function, trait, and source impl declarations. These slices
@@ -819,10 +826,10 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_typecheck_state.brp`
-- `compiler/blorp/compiler_typecheck_types.brp`
-- `compiler/blorp/compiler_typecheck_decl.brp`
-- `compiler/blorp/compiler_imports.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_state.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_types.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_imports.brp`
 
 Implementation steps:
 
@@ -924,11 +931,11 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-OCaml CTFE and Core lowering. Legacy direct `Pipeline.compile` /
+Core lowering. Legacy direct `Pipeline.compile` /
 `Pipeline.typecheck_only` APIs and some tooling/test paths can still use the
 OCaml parser/typechecker until their callers move to an explicit Blorp frontend
 graph.
-`compiler/blorp/compiler_infer.brp` now covers literals, identifiers, local
+`compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
 primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
 basic vector/tensor literals, record literals, record updates, record/tuple
@@ -1018,7 +1025,7 @@ indexing guidance. Subscript assignment currently covers mutable-root checking,
 full-rank tensor/array writes, constant-index bounds diagnostics, element type
 checking, and unsupported-target diagnostics; range-refined loop-variable
 proofs for reads and writes remain with the refinement/subscript slice.
-`compiler/blorp/compiler_typecheck_decl.brp` now has an explicit second-pass
+`compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp` now has an explicit second-pass
 body-check API for source functions and global variables. Function bodies are
 checked with parameters in a scoped body environment and declared return types
 as expected value slots; value-producing functions without return annotations
@@ -1235,8 +1242,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_infer.brp`
-- `compiler/blorp/compiler_typecheck_decl.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp`
+- `compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp`
 - future `compiler_infer_call.brp`
 - future `compiler_infer_resource.brp`
 - future `compiler_infer_concurrency.brp`
@@ -1337,28 +1344,20 @@ OCaml references:
   - `of_ast_program`
   - `of_ast_program_with_sources`
 - `compiler/lib/typed_ast_debug.ml`
-- `compiler/lib/ctfe*.ml`
-  - `ctfe.ml`
-  - `ctfe_context.ml`
-  - `ctfe_env.ml`
-  - `ctfe_error.ml`
-  - `ctfe_intrinsic.ml`
-  - `ctfe_ir.ml`
-  - `ctfe_materialize.ml`
-  - `ctfe_operator.ml`
-  - `ctfe_pattern.ml`
-  - `ctfe_std_eval.ml`
-  - `ctfe_value.ml`
-  - `ctfe_value_ops.ml`
 - `compiler/lib/type_metadata_format.ml`
 - `compiler/lib/operation_result_metadata.ml`
+
+Deleted at this checkpoint:
+
+- `compiler/lib/ctfe*.ml`
+- `compiler/test/test_ctfe_*.ml`
 
 Blorp references:
 
 - future `compiler_typed_ast.brp`
 - `compiler_typed_ast_json.brp`
 - `compiler_typecheck_bridge.brp`
-- future `compiler_ctfe*.brp`
+- `compiler_ctfe*.brp`
 - `compiler_type_metadata.brp`
 - future `compiler_type_metadata_format.brp`
 
@@ -1408,10 +1407,9 @@ Current status:
   stages do not infer call provenance from names.
 - Blorp now has structured typed expression, typed declaration, and
   `CompilerTypedProgram` JSON projections. The production source-command path
-  now consumes this temporary handoff artifact before OCaml CTFE and Core
-  lowering. Typed function metadata now carries the registered callable id, so
-  decoded function declarations preserve the same direct-call identity Core
-  lowering expects.
+  now consumes this handoff artifact directly before Core lowering. Typed
+  function metadata now carries the registered callable id, so decoded function
+  declarations preserve the same direct-call identity Core lowering expects.
 - Blorp now has a dedicated `typecheck_source` bridge artifact producer in
   `compiler_typecheck_bridge.brp`. It typechecks a single finalized source
   program and returns `typed_program`, `type_errors`, and `module_surface`
@@ -1441,9 +1439,23 @@ Current status:
 - The OCaml typed-program decoder now also materializes typed string
   interpolation parts, lambdas, `select`, `while`, ordinary `for` loops
   including tuple binders, `for ... concurrently(...)`, `detach`, and `with`
-  expressions. `concurrent:` block decoding still needs a bridge shape that
-  carries explicit concurrent binding result metadata instead of only a typed
-  body block; do not decode it by guessing from body statements.
+  expressions. `concurrent:` block typed handoff now carries explicit
+  concurrent binding records with result metadata; OCaml decodes the
+  `bindings` field directly instead of reconstructing bindings from a body
+  block shape.
+- Resolved-call metadata now carries an explicit target object in the Blorp
+  typed handoff: direct callable, trait method, or closure call. This removes
+  the previous flat optional-field coupling for trait calls and makes closure
+  calls first-class in the typed artifact instead of relying on the absence of
+  direct-call metadata.
+- Direct-call targets now require a concrete callable id in the Blorp typed
+  handoff. Compiler-synthesized calls that do not yet have a callable id are
+  represented as explicit intrinsic targets instead of overloading
+  `direct.callable_id = null`; the OCaml decoder preserves intrinsic metadata as
+  bridge-only facts and does not materialize fake legacy direct calls.
+- The temporary OCaml typed-program decoder now requires the structured
+  `resolved_call.target` object. It no longer accepts the older flat
+  `callable_id`/`trait_name`/`origin` bridge shape.
 - OCaml now also has an explicit `typecheck_source` bridge client path:
   request builders, typed-program artifact decoding through `Typed_ast_json`,
   path-only request helpers, and a dedicated prepared
@@ -1459,8 +1471,10 @@ Current status:
   The request protocol also has an explicit `import_modules` field for callers
   that already own graph context: each supplied module is parsed into a Blorp
   module surface and passed through `compiler_typecheck_program_with_import_surfaces`.
-  This is the normal source-command handoff boundary for `check`, `compile`,
-  and `run`; CTFE and Core lowering remain on the OCaml side of that boundary.
+  This was the normal source-command handoff boundary for `check`, `compile`,
+  and `run` before the source-command path moved to the frontend graph bridge.
+  CTFE now runs in the Blorp typed-program bridge; Core lowering is the next
+  OCaml-owned phase on the right side of that boundary.
 - Blorp typechecking now centralizes import bookkeeping in
   `compiler_imports.brp`. The single-source typed bridge uses the explicit
   syntax-only import collector so it can report qualified module aliases,
@@ -1487,23 +1501,167 @@ Current status:
 - `Pipeline.typecheck_only_typed_with_blorp_bridge` is the graph-backed Blorp
   typecheck handoff used by source-command checks. It builds explicit
   import-module payloads from graph edges, materializes graph-loaded dependency
-  module typed declarations/import bindings into `Modules`, and runs OCaml CTFE
-  over decoded dependency and target typed programs before returning either the
-  post-CTFE target typed program or Blorp typecheck/CTFE diagnostics.
+  module typed declarations/import bindings into `Modules`, and requires the
+  decoded Blorp artifact to have already run CTFE before returning the target
+  typed program or Blorp typecheck/CTFE diagnostics.
 - `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
   compile boundary: it consumes the same Blorp frontend graph, decodes the
-  Blorp typed-program artifact, runs CTFE, populates dependency typed-module
-  caches, and then enters the shared OCaml Core/codegen handoff without
+  Blorp typed-program artifact, populates dependency typed-module caches, and
+  then enters the shared OCaml Core/codegen handoff without
   returning to the OCaml typechecker.
+- Direct-source `Pipeline.compile`, `Pipeline.typecheck_only`,
+  `Pipeline.typecheck_only_typed`, and module-only typecheck APIs are now
+  documented in code as legacy/tooling routes. The raw-source compile route is
+  also exposed as `Pipeline.compile_legacy_direct_source`, and the REPL/test
+  runner use that explicit name where they intentionally still depend on OCaml
+  parsing and typechecking. A compiler-unit regression pins that the
+  graph-backed compile bridge consumes the preloaded target source rather than
+  rereading a changed file from disk.
+- Blorp now has the first CTFE value/operator foundation in
+  `compiler_ctfe_value.brp`: typed compile-time values, constructor payload
+  metadata, structural equality, expectation helpers, and primitive unary/binary
+  operation semantics for Int, Float, Bool, and String values. This is
+  deliberately not wired into production evaluation yet; it is the data/runtime
+  surface the later Blorp CTFE evaluator and materializer should build on.
+- Blorp now also has `compiler_ctfe_env.brp`, the first lexical/global
+  environment layer for CTFE. It models global/local bindings, unavailable
+  global reasons, immutable-assignment rejection, mutable local assignment as an
+  explicit updated environment, and user-facing environment error messages
+  without copying OCaml's mutable-cell implementation detail. It also provides
+  scoped-env projection for loop and branch bodies, preserving updates to
+  pre-existing bindings while dropping locals introduced in the scoped body.
+- Blorp now also has `compiler_ctfe_context.brp`, the metadata context layer
+  for CTFE. It indexes typed functions by callable id, imported function groups
+  by module/source name, union constructor arities/nullary references, module
+  aliases from import blocks, and module global environments from
+  `CompilerTypedProgram` values. It deliberately does not evaluate expressions
+  yet; it gives the upcoming evaluator a typed, test-covered lookup surface
+  instead of reaching into the typed AST ad hoc.
+- Blorp now also has `compiler_ctfe_globals.brp`, the source-order global
+  availability layer for CTFE. It identifies typed global declarations,
+  preserves private-global metadata, treats mutable top-level `var` bindings as
+  runtime-initialized, binds immutable globals as later CTFE candidates, and can
+  answer whether imported typed programs declare a global by module path/name.
+  It also constructs the initial target CTFE environment from explicit
+  `CompilerImportBinding` values, so selective imported constants are available
+  by local name and selected runtime-initialized globals remain unavailable with
+  an imported-global diagnostic.
+- Blorp now also has `compiler_ctfe_value_ops.brp` for shared Option/Result
+  carrier construction and state decoding over CTFE constructor values. This
+  keeps `?=` and later std Option/Result intrinsic evaluation from duplicating
+  constructor-shape checks in the evaluator.
+- Blorp now also has `compiler_ctfe_intrinsic.brp` for centralized admission
+  of compiler-owned std operations during CTFE. The supported subset covers
+  deterministic calls over `std/string`, `std/list`, `std/option`, and
+  `std/result`, including callback-taking list/Option/Result helpers when the
+  callback is a named pure local function reference. Keeping intrinsic
+  admission separate from evaluation keeps future expansion table-driven
+  instead of scattering source-name checks through the evaluator.
+- Blorp now also has `compiler_ctfe_pattern.brp` for matching typed patterns
+  against CTFE values. It covers wildcard/name/literal patterns, tuple/list
+  patterns with spread bindings, constructor and qualified-constructor patterns,
+  nullary-constructor name patterns using `CompilerCtfeContext`, and or-pattern
+  fallback without pushing pattern semantics into expression evaluation.
+- Blorp now also has the first `compiler_ctfe_ir.brp` slice: a normalized,
+  typed CTFE expression IR for literals, names/reference kinds, transparent
+  wrappers, unary/binary/logical expressions, tuples, lists, vectors, records,
+  dicts, block expressions with local `let`/`var` bindings and local
+  assignment items, tuple-destructuring block items, `?=` block items, and
+  field access classified as record, tuple, range, or imported-global access
+  before evaluation. Imported-global access uses explicit module aliases
+  collected from import blocks in `CompilerCtfeContext`; the evaluator reads
+  those values from attached module-global environments instead of guessing
+  from identifier names. It also translates match expressions into explicit
+  CTFE IR match cases while preserving typed patterns for the dedicated pattern
+  binder, translates `while`, `for`, tuple-binder `for`, `break`, and
+  `continue` into explicit CTFE IR control forms, and translates call
+  expressions into explicit local, imported, constructor, unresolved, impure, or
+  unsupported CTFE call kinds. Unsupported forms fail at the
+  translation boundary with a structured error, preserving the old evaluator
+  boundary while giving later evaluator work a smaller target than
+  `CompilerTypedExpr`.
+- Blorp now also has the first `compiler_ctfe_eval.brp` slice: an evaluator for
+  the supported CTFE IR subset. It evaluates literals, environment lookups,
+  nullary constructors, transparent wrappers, unary/binary/logical expressions
+  with short-circuiting, `if`, ranges, record/tuple/range field access, record
+  updates, tuples, lists, vectors, records, dicts, block-local bindings, local
+  assignment updates, tuple destructuring, `?=` continuation/propagation for
+  Option and Result constructor values, finalized typed string interpolation
+  over primitive CTFE values, match expressions with pattern-bound case scopes,
+  local and imported pure source function calls with name/wildcard/tuple
+  parameter binding, constructor calls, qualified imported-global reads, and
+  module-global lookup for imported function bodies. It also evaluates the
+  imported std intrinsic subset for strings, lists, Option, and Result while
+  preserving separate translation, environment, value/operator, invalid-value,
+  and unsupported error categories. Named pure local function references now
+  materialize as CTFE function-reference values, so callback-taking std helpers
+  can call them through the ordinary pure local function-call path. The
+  evaluator now also handles `while`, range/list `for`, and tuple-binder
+  list `for` loops with `break`/`continue`, threading explicit value
+  environments through loop bodies so assignments to outer mutable bindings
+  persist without leaking loop-body locals or loop binders. Builtins, trait
+  calls, foreign calls, closures, impl-method calls, and captured lambda
+  callbacks remain unsupported until their values have clean Blorp
+  representations.
+- Blorp now also has `compiler_ctfe_materialize.brp` for materialization from
+  evaluated CTFE values back into source-shaped and typed expressions. It
+  covers scalar literals, tuples, lists, vectors, dicts, records, ranges, void,
+  nullary constructors, and synthesized constructor calls with direct
+  constructor callable metadata. It also materializes named pure local function
+  references back into coherent typed name expressions with direct-call
+  metadata. It can also rebuild coherent `CompilerTypedGlobalVarInfo` values by
+  updating both the parsed initializer and typed initializer.
+- Blorp now also evaluates source-order global CTFE environments in
+  `compiler_ctfe_globals.brp`. Immutable globals are evaluated against an
+  environment that marks the current binding as self-unavailable, earlier
+  evaluated globals as available, later globals as unavailable, and mutable
+  top-level `var` bindings as runtime-initialized. Imported typed programs can
+  be evaluated into module global envs and attached back to
+  `CompilerCtfeContext`. Blorp also has a whole-program global rewrite helper
+  that evaluates immutable global initializers in source order, materializes
+  them back into typed declarations, and leaves mutable top-level `var`
+  declarations on the runtime path. A higher-level helper owns the CTFE global
+  boundary by building context from target/imported typed programs, evaluating
+  imported module global environments, binding target import bindings, and
+  rewriting the target program.
+- The `typecheck_source` bridge now opportunistically runs the Blorp global
+  CTFE rewrite after successful typechecking. It emits a `ctfe_status` protocol
+  field with `evaluated` or `not_run`; successful source-command typecheck
+  artifacts must report `evaluated`. Unsupported CTFE forms surface as Blorp
+  typecheck diagnostics instead of falling back to OCaml. Self-contained
+  immutable globals, selected constants from explicit leaf user-module imports,
+  and imported pure function calls evaluate in Blorp.
 - The Blorp executable (`compiler_cli_main.brp`) now runs CLI planning and
   source graph construction directly, writes the existing CLI plan JSON
   artifact to a temporary file, and invokes the private OCaml host only to
   execute that plan. The host no longer needs to ask a Blorp helper to interpret
   normal user CLI arguments.
-- Remaining checkpoint work is CTFE and final typed AST ownership: OCaml still
-  evaluates compile-time values after decoding the Blorp typed artifact, and
-  legacy direct pipeline APIs still need explicit frontend graphs before their
-  OCaml typechecker path can be retired.
+- Immediate remaining checkpoint work is typed-frontier closure, broader
+  import-aware CTFE parity, and final typed AST ownership. OCaml CTFE has been
+  removed; legacy direct pipeline APIs now produce finalized typed ASTs without
+  a compile-time global rewrite and should continue moving to explicit Blorp
+  frontend graphs.
+- The OCaml test runner remains one of those classified legacy paths. It
+  discovers test files, rewrites `TestSuite` and doctest harnesses, and compiles
+  generated sources after CLI planning has already delegated to test mode. Do
+  not duplicate frontend graph construction inside the OCaml runner; move this
+  only with a Blorp-owned test runner or an explicit Blorp test source-graph
+  handoff.
+
+Typed frontier closure before CTFE:
+
+- Close or explicitly classify residual OCaml typecheck/parser consumers:
+  `Pipeline.compile`, `Pipeline.typecheck_only`,
+  `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
+  test runner, and LSP/tooling helpers.
+- Normal source execution must enter through the Blorp frontend graph and
+  `typecheck_source` bridge. If a direct pipeline API remains, document it as a
+  temporary legacy/tooling route with a deletion condition rather than allowing
+  it to silently re-enter OCaml typecheck.
+- Keep `concurrent:` typed handoff explicit: binding result metadata belongs in
+  the `bindings` field and must not be inferred from body statements.
+- Keep trait-dispatch and closure-call metadata represented explicitly in the
+  typed artifact before relying on the handoff for Core lowering.
 
 Edge cases:
 
@@ -1514,14 +1672,14 @@ Edge cases:
   strings, tuples, and float16/float32 values must remain materializable.
 - Typed AST output must preserve callable ids and import bindings for Core
   flattening and call resolution.
-- Trait-dispatch and closure-call metadata still need explicit bridge fields;
+- Trait-dispatch, closure-call, and intrinsic-call metadata must stay explicit;
   do not infer those targets from callee names or expression shapes.
 
 Tests:
 
 - `compiler/test/test_typed_ast.ml`
 - `compiler/test/test_typed_ast_debug.ml`
-- `compiler/test/test_ctfe_*.ml`
+- `compiler/blorp/tests/test_compiler_ctfe_*.brp`
 - `tests/test_compiler/typecheck/should_pass/compile_time_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/global_constant_*.brp`
 - `compiler/blorp/tests/test_compiler_typecheck_bridge.brp`
@@ -1530,8 +1688,8 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml typed AST construction and CTFE after Blorp typed-program output
-  is authoritative and Core lowering consumes it.
+- Delete remaining OCaml typed AST construction after Blorp typed-program output
+  is authoritative for all source/tooling paths and Core lowering consumes it.
 
 ## Checkpoint 8: Core Lowering, Flattening, FFI Boundary, And Layout Setup
 
@@ -1572,7 +1730,11 @@ OCaml references:
 
 Blorp references:
 
-- future `compiler_core_lower.brp`
+- `compiler_core_lower.brp`
+  - `compiler_core_lower_type`
+  - `lower_typed_expr`
+  - `lower_typed_decl`
+  - `lower_typed_program`
 - future `compiler_core_flatten.brp`
 - future `compiler_core_ffi_boundary.brp`
 - future `compiler_core_list_layout.brp`
@@ -1580,6 +1742,9 @@ Blorp references:
 
 Implementation steps:
 
+- Do not start Blorp Core lowering from an OCaml-reconstructed typed AST unless
+  we deliberately accept another temporary bridge. Final typed-AST ownership is
+  the step that keeps the source-to-Core boundary contiguous.
 - Port `Core` data constructors needed by lowering before lowering logic.
 - Port lowering mechanically from typed expression shapes to Core:
   identifiers, literals, calls, fields, control flow, matches, loops, blocks,
@@ -1595,6 +1760,26 @@ Implementation steps:
 - Preserve foreign metadata collection for link flags/include dirs until the
   impure shell moves.
 
+Current progress:
+
+- `compiler_core_lower.brp` owns the first lowering slice for source
+  locations, Core type conversion, expression value-type lowering after
+  widening, function values as `Closure`, stable Core vars, scalar literal/name
+  expressions, resolved local/trait/intrinsic/closure call expressions,
+  unary/binary/logical expressions, tuple/list/vector/dict expressions, `if`,
+  blocks with local `LetExpr` bindings, ascriptions and opaque wrappers,
+  assignment, field access, ranges, record literals, and simple
+  function/global declarations with explicit lowering context state for Core
+  def ids.
+- Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
+  dropping declarations or falling back implicitly. This keeps the next
+  production boundary strict while expression coverage expands. Non-local
+  direct call targets still fail closed until imported, builtin, foreign,
+  constructor, and impl-method call kind lowering is explicitly ported.
+- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
+  Tensor-shaped type lowering exists in the helper, but the runtime test avoids
+  constructing that metadata until backend test emission handles it cheaply.
+
 Edge cases:
 
 - `EQuestionBind` lowering needs block continuation context.
@@ -1609,6 +1794,9 @@ Edge cases:
 - Subscript reads should already be calls; subscript assignment should already
   be typechecked into an explicit call.
 - Foreign string/bytes copy/no-copy metadata must be preserved.
+- Record update lowering needs either an early Core sugar variant in the Blorp
+  Core model or a direct lowering target that preserves update semantics across
+  later ownership passes.
 
 Tests:
 
@@ -1754,7 +1942,9 @@ post-Perceus OCaml boundary.
 
 Status: `Core_consume_specialize` is partially ported, ownership contracts are
 partially ported, Perceus is partially ported, and the post-Perceus tail through
-C artifact emission is Blorp-owned for the supported route.
+C artifact emission is Blorp-owned for the supported route. Prepared
+backend/list/tensor renderers are now typed operation renderers only; the old
+string-template adapters are no longer part of this boundary.
 
 OCaml references:
 
@@ -1783,17 +1973,18 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_core_consume_specialize.brp`
-- `compiler/blorp/compiler_core_ownership.brp`
-- `compiler/blorp/compiler_core_perceus.brp`
-- `compiler/blorp/compiler_core_reuse.brp`
-- `compiler/blorp/compiler_core_closure.brp`
-- `compiler/blorp/compiler_core_resource.brp`
-- `compiler/blorp/compiler_core_fairness.brp`
-- `compiler/blorp/compiler_core_prepare.brp`
-- `compiler/blorp/compiler_core_emit.brp`
-- `compiler/blorp/compiler_core_emit_type_layout.brp`
-- `compiler/blorp/codegen_*_renderer.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit_type_layout.brp`
+- `compiler/blorp/src/stage_10_backend/codegen_*_renderer.brp` for typed
+  static data, diagnostics, and prepared-operation rendering
 
 Implementation steps:
 
@@ -1819,6 +2010,9 @@ Implementation steps:
   backend tail.
 - Keep Blorp emission the only C artifact generator. Do not add new OCaml
   emission helpers.
+- If backend deletion is prioritized before the frontend reaches Core lowering,
+  move the Perceus/ownership boundary leftward. Otherwise keep the next major
+  contiguous step on Checkpoint 7/8 so source-to-Core stays a single Blorp path.
 
 Edge cases:
 
@@ -1857,7 +2051,7 @@ impure shell responsibilities.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `write_file`
   - `write_compile_output`
   - `run_file`
@@ -1873,8 +2067,8 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/compiler_artifact_json.brp`
-- `compiler/blorp/compiler_core_emit.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 - future `compiler_artifact_writer.brp`
 - future `compiler_host_c.brp`
 
@@ -1918,7 +2112,7 @@ are Blorp-owned.
 
 OCaml references:
 
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `purify_file`
   - package command helpers
   - `run_test_from_frontier_options`
@@ -1939,8 +2133,8 @@ OCaml references:
 Blorp references:
 
 - existing formatter files:
-  - `compiler/blorp/compiler_format.brp`
-  - `compiler/blorp/compiler_format_projection.brp`
+  - `compiler/blorp/src/stage_11_format/compiler_format.brp`
+  - `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
 - future shell/tool files:
   - `compiler_test_runner.brp`
   - `compiler_repl.brp`
@@ -1975,8 +2169,9 @@ Implementation steps:
   - inlay hints,
   - formatting.
 - Port REPL and line editor last unless they become necessary for dogfooding.
-- Delete `compiler/bin/blorp.ml` only after an equivalent Blorp CLI handles all
-  supported public commands and hidden bootstrap commands have retired.
+- Delete `compiler/bin/blorp_ocaml_host.ml` only after the Blorp executable
+  handles all supported public commands and hidden bootstrap commands have
+  retired.
 
 Edge cases:
 
@@ -2065,6 +2260,14 @@ make docker-premerge-gate
   paths are proven gone or represented explicitly.
 - Keep `BLORP_FRONTEND_PARSER=ocaml` only while pinned external bootstrap
   binaries require the selector.
+- Replace references to the old OCaml CLI filename with
+  `compiler/bin/blorp_ocaml_host.ml`; the Blorp CLI executable is
+  `compiler_cli_main.brp`, and the OCaml file is now only the private host
+  shell.
+- Prepared codegen renderers are typed-only. Do not reintroduce backend/list/
+  tensor name/arity template registries.
+- Older CLI-inward and frontend source-AST roadmaps are historical; use this
+  roadmap as the current production-boundary source of truth.
 - Delete `language_surface.ml` when typecheck/LSP/tooling no longer need an
   OCaml facade over Blorp-owned language-surface data.
 

@@ -1,6 +1,11 @@
 # Frontend Source-AST Ownership Roadmap
 
-Status checked against code on 2026-07-02.
+Status: historical roadmap. It records the source-AST ownership slices that led
+to the current frontend graph and typed-program bridge; use
+`BLORP_COMPILER_PORT_ROADMAP.md` as the current production-boundary source of
+truth.
+
+Last checked against code on 2026-07-02.
 
 This is the next contiguous OCaml-to-Blorp compiler chunk. The goal is to finish
 the source parser and source-AST ownership boundary from the Blorp CLI/source
@@ -28,26 +33,26 @@ read roots, discover source imports, parse sources, and emit a
 
 Current active functions:
 
-- `compiler/blorp/compiler_cli.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli.brp`
   - `run_cli`
   - command branches that call `frontend_module_graph_for_roots`
-- `compiler/blorp/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
   - `frontend_module_graph_for_roots`
   - `parse_source_request_value`
   - `parse_source_item_request_value`
   - `parse_sources_request_value`
   - `parser_artifact`
   - source/import discovery helpers feeding the graph
-- `compiler/blorp/compiler_parser_bridge.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser_bridge.brp`
   - `handle_parse_source`
   - `handle_parse_sources`
   - `parsed_source_artifact`
   - `parse_source_item`
   - `source_comment_jsons`
-- `compiler/blorp/compiler_parser.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser.brp`
   - `parse_compiler_source`
   - parser helpers that emit `ParsedProgram`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
   - `parsed_program_to_json`
   - `parsed_expr_to_json`
 
@@ -60,7 +65,7 @@ The graph is decoded by OCaml and then consumed by the OCaml middle:
   - `parse_source_file_via_command_at_phase`
   - `parse_sources_via_command`
   - `cli_frontend_module_graph_response_field`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `cli_frontier_frontend_module_graph`
   - `finalize_cli_frontend_graph_source`
   - `finalized_cli_frontend_graph_sources_or_exit`
@@ -184,18 +189,18 @@ Stages:
 
 Functions to change or add:
 
-- `compiler/blorp/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
   - add `ParsedProgramPhase`
   - add helpers such as `parsed_program_phase_name`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
   - add `parsed_program_phase_to_json`
   - add `parsed_program_artifact_to_json` if keeping phase outside
     `ParsedProgram`
-- `compiler/blorp/compiler_parser_bridge.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser_bridge.brp`
   - add request decoding for `ast_phase`
   - thread phase through `parsed_source_artifact`
   - keep raw as the default only for parser/formatter callers during transition
-- `compiler/blorp/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
   - update `parse_source_request_value`
   - update `parse_source_item_request_value`
   - update `parse_sources_request_value`
@@ -206,7 +211,7 @@ Functions to change or add:
   - update `parse_source_request_json_at_phase`
   - update `parse_sources_request_json`
   - update `cli_frontend_graph_source_list_field`
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - make `finalize_cli_frontend_graph_source` reject raw parse artifacts for
     compile/check/run once the typecheck phase exists
 
@@ -269,14 +274,14 @@ Current OCaml entry points:
 
 Proposed Blorp data and functions:
 
-- `compiler/blorp/compiler_parsed_ast.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast.brp`
   - add `union ParsedStringInterpolationPart`
     - `ParsedInterpolationLiteral(String)`
     - `ParsedInterpolationExpr(ParsedExpr)`
   - add `ParsedStringInterpolationPartsExpr(List[ParsedStringInterpolationPart], Bool, CompilerSourceSpan)`
     or replace the existing raw interpolation variant with separate raw/final
     variants
-- new `compiler/blorp/compiler_source_ast_finalize.brp`
+- new `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
   - `split_interpolated_string`
   - `interpolation_hole_requests_for_raw_string`
   - `collect_interpolation_hole_requests`
@@ -286,10 +291,10 @@ Proposed Blorp data and functions:
   - `rewrite_interpolation_decl`
   - `rewrite_interpolation_program`
   - `finalize_interpolation_program`
-- `compiler/blorp/compiler_parser_bridge.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parser_bridge.brp`
   - `parsed_source_artifact` should call interpolation finalization when the
     requested phase is `TypecheckSourceProgram`
-- `compiler/blorp/compiler_parsed_ast_json.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`
   - encode final interpolation as `"kind": "string_interp"` with `"parts"`
   - keep raw interpolation as `"kind": "string_interp_raw"` only for raw parse
 - `compiler/lib/parsed_ast_json.ml`
@@ -314,10 +319,6 @@ Tests to add or update:
 - `compiler/blorp/tests/test_compiler_bridge.brp`
   - typecheck phase returns final interpolation parts
   - raw phase returns raw interpolation
-- `compiler/test/test_parser.ml`
-  - temporarily keep `test_interpolation_bridge_preserves_hole_order_in_nested_blocks`
-    until Blorp tests and parser fixtures prove parity, then delete the OCaml
-    unit test when `Interp_parser` is gone
 - `tests/test_compiler/parser/should_pass/string_interp_basic.brp`
 - `tests/test_compiler/parser/should_pass/string_interp_expr.brp`
 - `tests/test_compiler/parser/should_pass/string_interp_escape.brp`
@@ -369,7 +370,7 @@ Current OCaml entry points:
 
 Proposed Blorp functions:
 
-- `compiler/blorp/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
   - `mangle_nested_function_name`
   - `rewrite_identifier_expr`
   - `pattern_bound_names`
@@ -381,7 +382,7 @@ Proposed Blorp functions:
   - `hoist_nested_impl_method`
   - `hoist_nested_program`
   - `finalize_nested_functions_program`
-- `compiler/blorp/compiler_parse_diagnostic.brp`
+- `compiler/blorp/src/stage_02_lex/compiler_parse_diagnostic.brp`
   - add structured diagnostic helpers if needed for capture errors
 
 Implementation notes:
@@ -462,7 +463,7 @@ Former OCaml entry points:
 
 Proposed Blorp functions:
 
-- `compiler/blorp/compiler_source_ast_finalize.brp`
+- `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp`
   - `subscript_get_builtin_name`
   - `make_untyped_call_expr`
   - `rewrite_subscript_read_node`
@@ -543,15 +544,15 @@ with no OCaml finalization pass.
 
 Functions to change:
 
-- `compiler/blorp/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
   - `frontend_module_graph_for_roots`
   - all graph parsing helpers should request typecheck source
-- `compiler/blorp/compiler_cli_artifact_json.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
   - `cli_frontend_module_graph_artifact_json` should emit phase-bearing sources
 - `compiler/lib/compiler_blorp_bridge.ml`
   - `cli_frontend_module_graph_response_field` should validate graph source phase
   - `validate_cli_frontend_import_edges` remains edge validation only
-- `compiler/bin/blorp.ml`
+- `compiler/bin/blorp_ocaml_host.ml`
   - `finalize_cli_frontend_graph_source` should become strict decode and
     diagnostic rendering, not semantic transformation
   - `cli_frontier_frontend_module_graph` should preserve preloaded finalized
@@ -632,8 +633,8 @@ Functions to remove or shrink:
 - `compiler/lib/ast.ml`
   - keep raw source variants while formatter/LSP/typecheck still need the OCaml
     AST, but update comments that name deleted OCaml passes
-- `compiler/lib/typed_ast.ml`, `compiler/lib/core_lower.ml`,
-  `compiler/lib/ctfe_ir.ml`, and invariant comments
+- `compiler/lib/typed_ast.ml`, `compiler/lib/core_lower.ml`, Blorp CTFE IR,
+  and invariant comments
   - keep defensive checks for impossible raw nodes if they still protect the
     OCaml middle
   - update messages to name the Blorp source finalizer instead of deleted OCaml
@@ -641,8 +642,6 @@ Functions to remove or shrink:
 
 Tests to delete or migrate:
 
-- OCaml interpolation unit tests in `compiler/test/test_parser.ml` once covered
-  by `compiler/blorp/tests/test_compiler_source_ast_finalize.brp`
 - OCaml pipeline tests that only prove imported modules run `Nested_hoist`, once
   graph finalization tests prove imported modules are already finalized
 - Any OCaml unit tests whose only subject is deleted finalizer implementation
@@ -684,7 +683,7 @@ parse output rather than depending on the compile/typecheck source phase.
 
 Functions to audit:
 
-- Formatter bridge/code in `compiler/blorp/compiler_format.brp`
+- Formatter bridge/code in `compiler/blorp/src/stage_11_format/compiler_format.brp`
 - Formatter tests in `compiler/blorp/tests/test_compiler_format.brp`
 - OCaml LSP callers:
   - `compiler/lib/lsp/lsp_state.ml`
@@ -705,8 +704,6 @@ Tests to add or update:
 - `tests/test_compiler/format/should_pass/wrapped_string_literals.brp`
 - `tests/test_compiler/parser/should_pass/comment_between_if_else.brp`
 - LSP tests covering comments/spans/nested function symbols if present
-- `compiler/test/test_parser.ml`
-  - keep only raw parser integration tests that cannot live in Blorp yet
 
 Validation:
 

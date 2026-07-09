@@ -161,10 +161,38 @@ let source_package_module_name_for_source_file (s : Session.t) path =
             let without_ext = String.sub rel 0 (String.length rel - 4) in
             Some (normalize_module_path without_ext))
 
+let compiler_blorp_source_root_and_module_name path =
+  let path = canonical_file path in
+  let rec find_src_dir dir =
+    let parent = Filename.dirname dir in
+    let grandparent = Filename.dirname parent in
+    if
+      String.equal (Filename.basename dir) "src"
+      && String.equal (Filename.basename parent) "blorp"
+      && String.equal (Filename.basename grandparent) "compiler"
+    then Some dir
+    else
+      let next = Filename.dirname dir in
+      if String.equal next dir then None else find_src_dir next
+  in
+  match find_src_dir (Filename.dirname path) with
+  | None -> None
+  | Some src_dir -> (
+      match relative_path_under_dir ~dir:src_dir path with
+      | None -> None
+      | Some rel ->
+          if not (Filename.check_suffix rel ".brp") then None
+          else
+            let without_ext = String.sub rel 0 (String.length rel - 4) in
+            Some (src_dir, normalize_module_path without_ext))
+
 let module_name_for_source_file ?sess path =
   match std_module_name_for_source_file ?sess path with
   | Some _ as name -> name
-  | None -> source_package_module_name_for_source_file (sess_of ?sess ()) path
+  | None -> (
+      match compiler_blorp_source_root_and_module_name path with
+      | Some (_, name) -> Some name
+      | None -> source_package_module_name_for_source_file (sess_of ?sess ()) path)
 
 let module_origin_for_source_file ?sess path =
   if is_std_source_file ?sess path then Session.Stdlib_module
@@ -1255,14 +1283,21 @@ let rec load_module ?sess module_name base_dir =
   in
   match local_path_alias with
   | Some resolved_path -> (
+      let canonical_module_name, canonical_base_dir =
+        match compiler_blorp_source_root_and_module_name resolved_path with
+        | Some (source_root, name) -> (name, source_root)
+        | None -> (module_name, base_dir)
+      in
       match find_cached_by_path sess resolved_path with
       | Some m ->
+          Hashtbl.replace sess.module_cache canonical_module_name m;
           Hashtbl.replace sess.module_cache module_name m;
           Some m
       | None -> (
           discard_stale_local_alias resolved_path;
-          match load_bare_or_direct () with
+          match load_module_inner ~sess canonical_module_name canonical_base_dir with
           | Some m ->
+              Hashtbl.replace sess.module_cache canonical_module_name m;
               Hashtbl.replace sess.module_cache resolved_path m;
               Hashtbl.replace sess.module_cache module_name m;
               Some m

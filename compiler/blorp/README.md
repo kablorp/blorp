@@ -4,6 +4,24 @@ This directory contains Blorp modules that are part of the compiler
 implementation. These files should be written as library code with focused
 TestSuite coverage under `compiler/blorp/tests`.
 
+Source code lives under `compiler/blorp/src` in numbered stage directories so
+the filesystem order mirrors the compilation frontier:
+
+- `stage_01_file_io`: source text, source spans, and source-based diagnostics.
+- `stage_02_lex`: tokens, lexical diagnostics, and tokenization.
+- `stage_03_parse`: parsed AST models, parsing, parse JSON, and source-AST finalizing.
+- `stage_04_modules`: syntactic module surfaces and module-local type identities.
+- `stage_05_types`: semantic type, context, Env, builtin, and type-policy substrates.
+- `stage_06_typecheck`: import registration, inference, typecheck state, typed AST JSON,
+  and the typecheck bridge.
+- `stage_07_ctfe`: compile-time evaluation IR, values, environment, and evaluators.
+- `stage_08_core_lower`: typed frontend to Core lowering.
+- `stage_09_core`: Core IR models, shared traversal, owned Core passes, and manifests.
+- `stage_10_backend`: C artifact JSON, Core C emission, and codegen renderers.
+- `stage_11_format`: formatter projection and formatting.
+- `stage_12_cli`: CLI planning, bridge protocols, helper entrypoints, and public main.
+- `stage_99_meta`: migration inventory and other non-stage source metadata.
+
 As the compiler migration progresses, prefer contiguous Blorp-owned pipeline
 slices with one OCaml transfer point at the boundary. The current supported
 backend route owns a real Core tail: `compiler_core_reuse.brp`,

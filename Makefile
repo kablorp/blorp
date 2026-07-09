@@ -5,10 +5,11 @@
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
-BLORP_CLI_SOURCE := compiler/blorp/compiler_cli_main.brp
+BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
+BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -73,8 +74,20 @@ build: compiler/lib/embedded_std.ml
 # for compiler stages that have not yet moved across the boundary.
 build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"
-	cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$(BLORP_CLI_BIN)"
+	@new_hash=$$( { \
+		find compiler/blorp/src -name '*.brp' -type f -print; \
+		find std -name '*.brp' -type f -print; \
+		printf '%s\n' "$(OCAML_HOST)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
+	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
+	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \
+		echo "Building Blorp CLI"; \
+		"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+		cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$(BLORP_CLI_BIN)"; \
+		printf '%s\n' "$$new_hash" > "$(BLORP_CLI_INPUT_HASH)"; \
+	else \
+		echo "Blorp CLI up to date"; \
+	fi
 
 # Run the top-level local test gate
 test:

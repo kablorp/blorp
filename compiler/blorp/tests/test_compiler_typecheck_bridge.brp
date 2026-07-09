@@ -1,5 +1,5 @@
 import:
-	../compiler_typecheck_bridge: handle_request
+	../src/stage_06_typecheck/compiler_typecheck_bridge: handle_request
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -239,6 +239,20 @@ pure func import_module_json(module_path: String, module_name: String, text: Str
 	])
 
 
+pure func user_import_module_json(
+	module_path: String,
+	module_name: String,
+	text: String,
+) -> JsonValue:
+	JsonObject([
+		("path", JsonString(module_name + ".brp")),
+		("module", JsonString(module_name)),
+		("module_path", JsonString(module_path)),
+		("text", JsonString(text)),
+		("origin", JsonObject([("kind", JsonString("user"))])),
+	])
+
+
 pure func typecheck_source_request_with_imports(
 	source: String,
 	import_modules: List[JsonValue],
@@ -329,6 +343,80 @@ pure func test_typecheck_source_reports_type_errors() -> Bool:
 				bool_field(response, "ok")
 				and artifact_array_length(response, "type_errors") > 0
 				and artifact_field(response, "typed_program").is_some()
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_marks_self_contained_ctfe_evaluated() -> Bool:
+	source: String = "VALUE: Int = 1 + 2\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
+	source: String = "import:\n\tdep as Dep\n\nVALUE: String = Dep.answer()\n\nfunc main(args: List[String]) -> Int:\n\t0"
+	dep_text: String = "pure func answer() -> String:\n\t3.to_string()"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[user_import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "not_run"
+				and artifact_array_length(response, "type_errors") > 0
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_evaluates_imported_function_ctfe() -> Bool:
+	source: String = "import:\n\tdep: answer\n\nVALUE: Int = answer() + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
+	dep_text: String = "pure func answer() -> Int:\n\t41"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[user_import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_evaluates_imported_constant_ctfe() -> Bool:
+	source: String = "import:\n\tdep: OFFSET\n\nVALUE: Int = OFFSET + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
+	dep_text: String = "OFFSET: Int = 41"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[user_import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
 			)
 		None:
 			False
@@ -739,6 +827,22 @@ tests: TestSuite = {
 			test_typecheck_source_accepts_main_args_signature,
 		),
 		("typecheck_source reports type errors", test_typecheck_source_reports_type_errors),
+		(
+			"typecheck_source marks self-contained CTFE evaluated",
+			test_typecheck_source_marks_self_contained_ctfe_evaluated,
+		),
+		(
+			"typecheck_source reports unsupported import CTFE",
+			test_typecheck_source_reports_unsupported_import_ctfe,
+		),
+		(
+			"typecheck_source evaluates imported function CTFE",
+			test_typecheck_source_evaluates_imported_function_ctfe,
+		),
+		(
+			"typecheck_source evaluates imported constant CTFE",
+			test_typecheck_source_evaluates_imported_constant_ctfe,
+		),
 		(
 			"typecheck_source sees global conversion builtins",
 			test_typecheck_source_sees_global_conversion_builtins,

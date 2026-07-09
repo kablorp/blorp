@@ -1,7 +1,7 @@
 (** Single JSON transfer point for Blorp-owned compiler policies, parser
     artifacts, and downstream compile artifacts.
 
-    Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
+    Renderer JSON requests are served by [compiler/blorp/src/stage_12_cli/compiler_bridge.brp]
     through the hidden bridge command. During a cold bridge-helper compile,
     helper mode serves only the narrow OCaml callers that still need static
     table rows before the helper binary exists. *)
@@ -32,9 +32,16 @@ let parsed_source_phase_of_string = function
   | other ->
       Error ("invalid_response", "unsupported parser AST phase `" ^ other ^ "`")
 
+type collected_comment = {
+  cc_text : string;
+  cc_line : int;
+  cc_col : int;
+  cc_trailing : bool;
+}
+
 type parsed_source = {
   parsed_program : Ast.program;
-  parsed_comments : Parse_comments.collected_comment list;
+  parsed_comments : collected_comment list;
   parsed_phase : parsed_source_phase;
   parsed_module_surface : Module_surface.t option;
 }
@@ -47,7 +54,8 @@ type typechecked_source = {
   typechecked_program : Typed_ast.program;
   typechecked_errors : string list;
   typechecked_import_bindings : Session.import_binding list;
-  typechecked_comments : Parse_comments.collected_comment list;
+  typechecked_ctfe_evaluated_by_blorp : bool;
+  typechecked_comments : collected_comment list;
   typechecked_phase : parsed_source_phase;
   typechecked_module_surface : Module_surface.t option;
 }
@@ -343,18 +351,32 @@ let labeled_relative_to ~root ~label path =
   let rel = relative_to ~root path in
   if label = "" then rel else Filename.concat label rel
 
+let compiler_bridge_source_root source_path =
+  let source_dir = Filename.dirname source_path in
+  let src_dir = Filename.dirname source_dir in
+  let blorp_dir = Filename.dirname src_dir in
+  let compiler_dir = Filename.dirname blorp_dir in
+  if
+    String.equal (Filename.basename src_dir) "src"
+    && String.equal (Filename.basename blorp_dir) "blorp"
+    && String.equal (Filename.basename compiler_dir) "compiler"
+  then src_dir
+  else source_dir
+
 (* Bridge helper binaries are compiled as normal Blorp programs. Their cache key
    must include source roots that can affect generated C, not just the helper
    entrypoint: std edits can change imported library code, and
-   [compiler/blorp/compiler_format_projection.brp] imports self-hosted formatter
+   [compiler/blorp/src/stage_11_format/compiler_format_projection.brp] imports self-hosted formatter
    modules from [tools/formatter]. *)
 let compiler_bridge_extra_source_roots source_root =
-  let compiler_dir = Filename.dirname source_root in
+  let blorp_dir = Filename.dirname source_root in
+  let compiler_dir = Filename.dirname blorp_dir in
   let workspace_root = Filename.dirname compiler_dir in
   let std_root = Filename.concat workspace_root "std" in
   let formatter_root = Filename.concat workspace_root "tools/formatter" in
   if
-    String.equal (Filename.basename source_root) "blorp"
+    String.equal (Filename.basename source_root) "src"
+    && String.equal (Filename.basename blorp_dir) "blorp"
     && String.equal (Filename.basename compiler_dir) "compiler"
   then
     let roots = [] in
@@ -370,7 +392,7 @@ let compiler_bridge_extra_source_roots source_root =
   else []
 
 let bridge_source_tree_digest source_path =
-  let root = Filename.dirname source_path in
+  let root = compiler_bridge_source_root source_path in
   let rec collect dir =
     Sys.readdir dir |> Array.to_list |> List.sort String.compare
     |> List.fold_left
@@ -870,7 +892,7 @@ let decode_parse_comment = function
       let* cc_line = int_json_field "line" fields in
       let* cc_col = int_json_field "column" fields in
       let* cc_trailing = bool_json_field "trailing" fields in
-      Ok { Parse_comments.cc_text = cc_text; cc_line; cc_col; cc_trailing }
+      Ok { cc_text; cc_line; cc_col; cc_trailing }
   | _ -> Error ("invalid_response", "parse comments must be JSON objects")
 
 let parse_comments_response_field artifact =
@@ -1055,6 +1077,19 @@ let import_binding_response_field = function
       Error
         ("invalid_response", "import_bindings items must be JSON objects")
 
+let typechecked_ctfe_status_field artifact =
+  let* status = optional_json_response_field "ctfe_status" artifact in
+  match status with
+  | None -> Ok false
+  | Some (Lsp_json.String "evaluated") -> Ok true
+  | Some (Lsp_json.String "not_run") -> Ok false
+  | Some (Lsp_json.String other) ->
+      Error
+        ( "invalid_response",
+          "unsupported ctfe_status `" ^ other ^ "`" )
+  | Some _ ->
+      Error ("invalid_response", "field `ctfe_status` must be a string")
+
 let typechecked_source_artifact_field artifact =
   let* typechecked_phase = require_typecheck_source_phase artifact in
   let* typechecked_comments = parse_comments_response_field artifact in
@@ -1064,6 +1099,7 @@ let typechecked_source_artifact_field artifact =
     array_response_field_map "import_bindings" import_binding_response_field
       artifact
   in
+  let* typechecked_ctfe_evaluated_by_blorp = typechecked_ctfe_status_field artifact in
   let* typed_program_json = json_response_field "typed_program" artifact in
   match Typed_ast_json.decode_typed_program typed_program_json with
   | Ok typechecked_program ->
@@ -1072,6 +1108,7 @@ let typechecked_source_artifact_field artifact =
           typechecked_program;
           typechecked_errors;
           typechecked_import_bindings;
+          typechecked_ctfe_evaluated_by_blorp;
           typechecked_comments;
           typechecked_phase;
           typechecked_module_surface;
@@ -1086,6 +1123,7 @@ let typechecked_source_artifact_field artifact =
             typechecked_program = Typed_ast.make_program [];
             typechecked_errors;
             typechecked_import_bindings;
+            typechecked_ctfe_evaluated_by_blorp = false;
             typechecked_comments;
             typechecked_phase;
             typechecked_module_surface;
@@ -1804,10 +1842,10 @@ let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
-let renderer_bridge_source_name = "compiler/blorp/compiler_bridge_cli.brp"
-let parser_bridge_source_name = "compiler/blorp/compiler_parser_bridge_cli.brp"
+let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
+let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
 let typecheck_bridge_source_name =
-  "compiler/blorp/compiler_typecheck_bridge_cli.brp"
+  "compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");

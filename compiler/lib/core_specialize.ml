@@ -2243,6 +2243,68 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       let result_ty = e.ty in
       let is_pointer = is_pointer_type ~reg result_ty in
       let void_ty = Ast.TyNamed ("Void", []) in
+      let mk_int n =
+        {
+          desc = CLit (Ast.LitInt (Int64.of_int n));
+          ty = Ast.TyNamed ("Int", []);
+          loc = e.loc;
+        }
+      in
+      let ranked_checked_get_rank = function
+        | "blorp_tensor3_checked_get" -> Some 3
+        | "blorp_tensor4_checked_get" -> Some 4
+        | "blorp_tensor5_checked_get" -> Some 5
+        | _ -> None
+      in
+      let ranked_checked_get_shape_builtin name =
+        let base =
+          match name with
+          | "blorp_tensor3_checked_get" -> "blorp_tensor3_checked_get_shape"
+          | "blorp_tensor4_checked_get" -> "blorp_tensor4_checked_get_shape"
+          | "blorp_tensor5_checked_get" -> "blorp_tensor5_checked_get_shape"
+          | _ -> name
+        in
+        match normalize_type result_ty with
+        | Ast.TyNamed ("Float", _) -> base ^ "_f64"
+        | Ast.TyNamed ("Float32", _) -> base ^ "_f32"
+        | _ -> base
+      in
+      let static_tensor_dims ty =
+        match tensor_parts ty with
+        | Some (_, dims) ->
+            let rec collect acc = function
+              | [] -> Some (List.rev acc)
+              | Ast.TyConstInt dim :: rest -> collect (dim :: acc) rest
+              | _ -> None
+            in
+            collect [] dims
+        | None -> None
+      in
+      let try_ranked_shape_call () =
+        match (ranked_checked_get_rank c, args) with
+        | Some rank, arr :: indices when List.length indices = rank -> (
+            match static_tensor_dims arr.ty with
+            | Some dims when List.length dims = rank ->
+                let builtin = ranked_checked_get_shape_builtin c in
+                let call_args = arr :: (List.map mk_int dims @ indices) in
+                let returns_primitive =
+                  String.ends_with ~suffix:"_f64" builtin
+                  || String.ends_with ~suffix:"_f32" builtin
+                in
+                let call =
+                  {
+                    e with
+                    desc = CCall (CKBuiltin builtin, callee, call_args);
+                    ty = (if returns_primitive then result_ty else void_ty);
+                  }
+                in
+                if returns_primitive then Some call
+                else if is_pointer then
+                  Some { e with desc = CCast (call, result_ty) }
+                else Some { e with desc = CUnbox (call, result_ty) }
+            | _ -> None)
+        | _ -> None
+      in
       let typed_unchecked_intrinsic =
         Core_layout_type.tensor_checked_get_access_of_type ~reg result_ty
         |> Option.map (fun access -> access.Core_layout_type.tcga_get_intrinsic)
@@ -2302,50 +2364,59 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
           | [ arr; idx ] -> bounds_proven_tensor_read env e arr idx
           | _ -> None
       in
-      match try_unchecked () with
+      match try_ranked_shape_call () with
       | Some optimized -> optimized
       | None -> (
-          match try_bounds_proven_loop_read () with
+          match try_unchecked () with
           | Some optimized -> optimized
           | None -> (
-              match (normalize_type result_ty, c) with
-              | Ast.TyNamed ("Float", _), "blorp_checked_get" ->
-                  {
-                    e with
-                    desc =
-                      CCall (CKBuiltin "blorp_checked_get_f64", callee, args);
-                  }
-              | Ast.TyNamed ("Float", _), "blorp_matrix_checked_get" ->
-                  {
-                    e with
-                    desc =
-                      CCall
-                        (CKBuiltin "blorp_matrix_checked_get_f64", callee, args);
-                  }
-              | Ast.TyNamed ("Float32", _), "blorp_checked_get" ->
-                  {
-                    e with
-                    desc =
-                      CCall (CKBuiltin "blorp_checked_get_f32", callee, args);
-                  }
-              | Ast.TyNamed ("Float32", _), "blorp_matrix_checked_get" ->
-                  {
-                    e with
-                    desc =
-                      CCall
-                        (CKBuiltin "blorp_matrix_checked_get_f32", callee, args);
-                  }
-              | _ ->
-                  let raw_call =
-                    {
-                      e with
-                      desc = CCall (CKBuiltin c, callee, args);
-                      ty = void_ty;
-                    }
-                  in
-                  if is_pointer then
-                    { e with desc = CCast (raw_call, result_ty) }
-                  else { e with desc = CUnbox (raw_call, result_ty) })))
+              match try_bounds_proven_loop_read () with
+              | Some optimized -> optimized
+              | None -> (
+                  match (normalize_type result_ty, c) with
+                  | Ast.TyNamed ("Float", _), "blorp_checked_get" ->
+                      {
+                        e with
+                        desc =
+                          CCall
+                            (CKBuiltin "blorp_checked_get_f64", callee, args);
+                      }
+                  | Ast.TyNamed ("Float", _), "blorp_matrix_checked_get" ->
+                      {
+                        e with
+                        desc =
+                          CCall
+                            ( CKBuiltin "blorp_matrix_checked_get_f64",
+                              callee,
+                              args );
+                      }
+                  | Ast.TyNamed ("Float32", _), "blorp_checked_get" ->
+                      {
+                        e with
+                        desc =
+                          CCall
+                            (CKBuiltin "blorp_checked_get_f32", callee, args);
+                      }
+                  | Ast.TyNamed ("Float32", _), "blorp_matrix_checked_get" ->
+                      {
+                        e with
+                        desc =
+                          CCall
+                            ( CKBuiltin "blorp_matrix_checked_get_f32",
+                              callee,
+                              args );
+                      }
+                  | _ ->
+                      let raw_call =
+                        {
+                          e with
+                          desc = CCall (CKBuiltin c, callee, args);
+                          ty = void_ty;
+                        }
+                      in
+                      if is_pointer then
+                        { e with desc = CCast (raw_call, result_ty) }
+                      else { e with desc = CUnbox (raw_call, result_ty) }))))
   (* multiply: type-dispatch + inject dimension args from types.
      blorp call: multiply(a, b) where a: T[#M,#K], b: T[#K,#N]
      C call: blorp_tensor_matrix_multiply_float(a, b, m, k, n) *)

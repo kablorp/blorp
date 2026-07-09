@@ -4892,7 +4892,7 @@ let validate_main_signature state func loc =
       else state
   | _ -> state
 
-let report_ctfe_impure_initializer state ~message ~binding_name expr =
+let report_impure_constant_initializer state ~message ~binding_name expr =
   let impure_calls =
     collect_impure_calls ~strict:true state.env state.module_aliases expr
   in
@@ -4911,8 +4911,7 @@ let report_ctfe_impure_initializer state ~message ~binding_name expr =
                  pure functions and data only.")))
     state impure_calls
 
-let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
-    =
+let typecheck_global_var_decl state loc var_decl =
   let state =
     match var_decl.var_type with
     | Some ty -> (
@@ -4987,10 +4986,10 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
     | None -> state
   in
   let state =
-    (* Immutable top-level bindings are constants: calls in their initializers
-       are handled by CTFE after typecheck. Mutable globals are not constants,
-       so keep rejecting hidden runtime startup work here. *)
-    match (validate_startup_work && var_decl.var_is_mutable, typed_value) with
+    (* Mutable globals are runtime state, so keep rejecting hidden startup work
+       here. Immutable constant initializers are checked for purity below and
+       evaluated by the Blorp source bridge on production compile/check paths. *)
+    match (var_decl.var_is_mutable, typed_value) with
     | true, Some tv ->
         validate_top_level_initializer_has_no_calls state var_decl.var_name tv
     | _ -> state
@@ -4998,7 +4997,7 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
   let state =
     match typed_value with
     | Some tv when (not var_decl.var_is_mutable) && var_decl.var_is_const ->
-        report_ctfe_impure_initializer state
+        report_impure_constant_initializer state
           ~message:"global constant initializer must be pure"
           ~binding_name:(Option.value var_decl.var_name ~default:"_")
           tv
@@ -5092,15 +5091,6 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
       in
       (state, typed_var)
   | None -> (state, var_decl)
-
-let compile_time_constructor_info env name =
-  match Env.get_constructor env name with
-  | Some (parent_type, _, field_types, _) ->
-      Some
-        (Ctfe.make_constructor_info ~parent_type
-           ~arity:(List.length field_types)
-           ~callable_id:(Env.get_constructor_callable_id env name))
-  | None -> None
 
 let rec second_pass (state : check_state) (decls : program) :
     check_state * program =
@@ -5815,12 +5805,7 @@ let typecheck_with_state_typed ?module_origin ?(module_name = "")
         require_typed_program_for_typecheck ~source_program ~state typed_program
       with
       | Error errors -> Error errors
-      | Ok typed ->
-          Ctfe.evaluate_program
-            ~constructor_info:(compile_time_constructor_info state.env)
-            ~import_bindings:(List.rev state.import_bindings)
-            typed
-          |> Result.map (fun typed -> (state, typed)))
+      | Ok typed -> Ok (state, typed))
 
 let typecheck_typed ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
@@ -5845,15 +5830,7 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
       match
         require_typed_program_for_typecheck ~source_program ~state typed_program
       with
-      | Ok typed -> (
-          match
-            Ctfe.evaluate_program
-              ~constructor_info:(compile_time_constructor_info state.env)
-              ~import_bindings:(List.rev state.import_bindings)
-              typed
-          with
-          | Ok typed -> Ok (typed, state.env)
-          | Error errors -> Error (errors, state.env))
+      | Ok typed -> Ok (typed, state.env)
       | Error errors -> Error (errors, state.env))
 
 let typecheck_with_env ?module_origin ?(module_name = "")
@@ -5998,13 +5975,5 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
         require_typed_program_for_typecheck ~source_program:source_decls ~state
           typed_decls
       with
-      | Ok typed -> (
-          match
-            Ctfe.evaluate_program
-              ~constructor_info:(compile_time_constructor_info state.env)
-              ~import_bindings:(List.rev state.import_bindings)
-              typed
-          with
-          | Ok typed -> Ok (state, typed)
-          | Error errors -> Error (state, errors))
+      | Ok typed -> Ok (state, typed)
       | Error errors -> Error (state, errors))

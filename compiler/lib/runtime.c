@@ -9742,6 +9742,212 @@ float blorp_matrix_checked_get_f32(blorp_Vector* arr, long row, long col) {
     return blorp_vector_read_f32(arr, idx);
 }
 
+static bool blorp_tensor_checked_flat_index(
+    blorp_Vector* arr,
+    const long* dims,
+    const long* indices,
+    long rank,
+    long* out_idx
+) {
+    if (!arr || !dims || !indices || !out_idx || rank <= 0) return false;
+
+    long idx = 0;
+    long total = 1;
+    for (long axis = 0; axis < rank; axis++) {
+        long dim = dims[axis];
+        long index = indices[axis];
+        if (dim <= 0 || index < 0 || index >= dim) return false;
+        if (axis == 0 && index >= arr->len) return false;
+        if (idx > (LONG_MAX - index) / dim) return false;
+        idx = idx * dim + index;
+        if (total > LONG_MAX / dim) return false;
+        total *= dim;
+    }
+
+    if (total > arr->capacity || idx < 0 || idx >= arr->capacity) return false;
+    *out_idx = idx;
+    return true;
+}
+
+static void* blorp_tensor_checked_get_flat(blorp_Vector* arr, long idx) {
+    if (blorp_vector_is_i64_raw(arr)) {
+        return (void*)(intptr_t)((long*)arr->data)[idx];
+    }
+    if (arr->storage_mode == BLORP_VECTOR_STORAGE_PACKED) {
+        return (void*)(intptr_t)blorp_packed_get(arr, idx);
+    }
+    if (arr->storage_mode == BLORP_VECTOR_STORAGE_INLINE) {
+        void* boxed = blorp_alloc(sizeof(blorp_Object) + arr->elem_size);
+        memcpy((char*)boxed + sizeof(blorp_Object),
+               (char*)arr->data + idx * arr->elem_size,
+               arr->elem_size);
+        return boxed;
+    }
+    return arr->data[idx];
+}
+
+void* blorp_tensor3_checked_get_shape(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long i,
+    long j,
+    long k
+) {
+    long dims[3] = {d1, d2, d3};
+    long indices[3] = {i, j, k};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 3, &idx)) return 0;
+    return blorp_tensor_checked_get_flat(arr, idx);
+}
+
+void* blorp_tensor4_checked_get_shape(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long i,
+    long j,
+    long k,
+    long l
+) {
+    long dims[4] = {d1, d2, d3, d4};
+    long indices[4] = {i, j, k, l};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 4, &idx)) return 0;
+    return blorp_tensor_checked_get_flat(arr, idx);
+}
+
+void* blorp_tensor5_checked_get_shape(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long d5,
+    long i,
+    long j,
+    long k,
+    long l,
+    long m
+) {
+    long dims[5] = {d1, d2, d3, d4, d5};
+    long indices[5] = {i, j, k, l, m};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 5, &idx)) return 0;
+    return blorp_tensor_checked_get_flat(arr, idx);
+}
+
+double blorp_tensor3_checked_get_shape_f64(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long i,
+    long j,
+    long k
+) {
+    long dims[3] = {d1, d2, d3};
+    long indices[3] = {i, j, k};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 3, &idx)) return 0.0;
+    return blorp_vector_read_f64(arr, idx);
+}
+
+double blorp_tensor4_checked_get_shape_f64(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long i,
+    long j,
+    long k,
+    long l
+) {
+    long dims[4] = {d1, d2, d3, d4};
+    long indices[4] = {i, j, k, l};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 4, &idx)) return 0.0;
+    return blorp_vector_read_f64(arr, idx);
+}
+
+double blorp_tensor5_checked_get_shape_f64(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long d5,
+    long i,
+    long j,
+    long k,
+    long l,
+    long m
+) {
+    long dims[5] = {d1, d2, d3, d4, d5};
+    long indices[5] = {i, j, k, l, m};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 5, &idx)) return 0.0;
+    return blorp_vector_read_f64(arr, idx);
+}
+
+float blorp_tensor3_checked_get_shape_f32(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long i,
+    long j,
+    long k
+) {
+    long dims[3] = {d1, d2, d3};
+    long indices[3] = {i, j, k};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 3, &idx)) return 0.0f;
+    return blorp_vector_read_f32(arr, idx);
+}
+
+float blorp_tensor4_checked_get_shape_f32(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long i,
+    long j,
+    long k,
+    long l
+) {
+    long dims[4] = {d1, d2, d3, d4};
+    long indices[4] = {i, j, k, l};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 4, &idx)) return 0.0f;
+    return blorp_vector_read_f32(arr, idx);
+}
+
+float blorp_tensor5_checked_get_shape_f32(
+    blorp_Vector* arr,
+    long d1,
+    long d2,
+    long d3,
+    long d4,
+    long d5,
+    long i,
+    long j,
+    long k,
+    long l,
+    long m
+) {
+    long dims[5] = {d1, d2, d3, d4, d5};
+    long indices[5] = {i, j, k, l, m};
+    long idx = 0;
+    if (!blorp_tensor_checked_flat_index(arr, dims, indices, 5, &idx)) return 0.0f;
+    return blorp_vector_read_f32(arr, idx);
+}
+
 // Returns the (possibly newly-allocated) matrix. Does COW + retain/release
 // for RC payloads. Uses row-major flat indexing; cols derived from
 // capacity/rows (len==rows for 2D).

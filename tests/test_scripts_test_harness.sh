@@ -12,7 +12,7 @@ mkdir -p "$TMP_HARNESS/scripts" "$TMP_HARNESS/std" "$TMP_HARNESS/tests/test_blor
 cp scripts/test "$TMP_HARNESS/scripts/test"
 
 cat > "$TMP_HARNESS/Makefile" <<'MAKE'
-all:
+all install:
 	@:
 MAKE
 

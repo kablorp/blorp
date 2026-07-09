@@ -392,16 +392,32 @@ let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
 let create_run_context () = { typecheck_session = Session.create () }
 
-let run_typecheck context file =
+let blorp_check_marker = "-- RUN-BLORP-CHECK"
+
+let run_with_blorp_check opts file =
+  let code, output =
+    Test_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
+      [ "check"; "--no-format"; file ]
+  in
+  { code; output }
+
+let requires_blorp_check file =
+  read_file file |> split_lines
+  |> List.exists (fun line -> String.trim line = blorp_check_marker)
+
+let run_typecheck opts context file =
   run_safely (fun () ->
-      let source = read_file file in
-      match
-        Pipeline.typecheck_only_reusing_session ~sess:context.typecheck_session
-          ~filename:file ~source ~debug:false ()
-      with
-      | Ok _ -> { code = 0; output = "Type checking succeeded.\n" }
-      | Error errors ->
-          { code = 1; output = format_pipeline_errors ~file errors })
+      if requires_blorp_check file then run_with_blorp_check opts file
+      else
+        let source = read_file file in
+        match
+          Pipeline.typecheck_only_reusing_session
+            ~sess:context.typecheck_session ~filename:file ~source
+            ~debug:false ()
+        with
+        | Ok _ -> { code = 0; output = "Type checking succeeded.\n" }
+        | Error errors ->
+            { code = 1; output = format_pipeline_errors ~file errors })
 
 let run_format opts args =
   let code, output =
@@ -483,7 +499,7 @@ let run_case opts context { kind; file } =
         | None -> pass "should_fail/parser" name
         | Some details -> fail "should_fail/parser" name details)
   | TypecheckShouldPass category ->
-      let result = run_typecheck context file in
+      let result = run_typecheck opts context file in
       if result.code = 0 then pass ("should_pass/" ^ category) name
       else
         fail
@@ -494,7 +510,7 @@ let run_case opts context { kind; file } =
             |> List.filter (( <> ) "")
             |> List.filteri (fun i _ -> i < 5)))
   | TypecheckShouldFail category -> (
-      let result = run_typecheck context file in
+      let result = run_typecheck opts context file in
       if result.code = 0 then
         fail
           ("should_fail/" ^ category)
@@ -576,7 +592,7 @@ let run_case opts context { kind; file } =
               ("Purify failed"
               :: (result.output |> split_lines |> List.filter (( <> ) "")))
           else
-            let check = run_typecheck context tmpfile in
+            let check = run_typecheck opts context tmpfile in
             if check.code <> 0 then
               fail "purify/should_rewrite" name
                 ("Rewritten file did not typecheck"

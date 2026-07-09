@@ -1,0 +1,365 @@
+-- Global binding availability for compile-time evaluation.
+--
+-- Immutable top-level initializers are evaluated in source order into the
+-- CTFE global environment. Mutable top-level `var` bindings run at runtime.
+import:
+	compiler_ctfe_context:
+		CompilerCtfeContext,
+		CompilerCtfeImportedProgram,
+		compiler_ctfe_context_from_program,
+		compiler_ctfe_context_module_global_value,
+		compiler_ctfe_context_module_has_global_binding,
+		compiler_ctfe_context_with_module_global_env,
+	compiler_ctfe_env:
+		CompilerCtfeEnv,
+		CompilerCtfeUnavailableGlobalReason(
+			CompilerCtfeCurrentGlobal,
+			CompilerCtfeImportedRuntimeInitializedGlobal,
+			CompilerCtfeLaterGlobal,
+			CompilerCtfeRuntimeInitializedGlobal,
+		),
+		compiler_ctfe_bind_global_value,
+		compiler_ctfe_bind_unavailable_global,
+		compiler_ctfe_env_empty,
+	compiler_ctfe_eval: CompilerCtfeEvalError, compiler_ctfe_eval_typed_expr
+	compiler_ctfe_materialize: compiler_ctfe_materialize_global_var_info
+	../stage_06_typecheck/compiler_typecheck_decl:
+		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
+		CompilerTypedGlobalVarInfo,
+		CompilerTypedProgram,
+	../stage_06_typecheck/compiler_typecheck_state: CompilerImportBinding
+
+
+record CompilerCtfeGlobalDecl {
+	name: String,
+	info: CompilerTypedGlobalVarInfo,
+	is_private: Bool
+}
+
+
+private record CompilerCtfeRewriteDeclResult {
+	env: CompilerCtfeEnv,
+	decl: CompilerTypedDecl
+}
+
+
+pure func compiler_ctfe_global_initializer_runs_at_runtime(
+	info: CompilerTypedGlobalVarInfo,
+) -> Bool:
+	info.decl.is_mutable
+
+
+pure func compiler_ctfe_unavailable_reason_for_global(
+	info: CompilerTypedGlobalVarInfo,
+) -> CompilerCtfeUnavailableGlobalReason:
+	if compiler_ctfe_global_initializer_runs_at_runtime(info):
+		CompilerCtfeRuntimeInitializedGlobal
+	else:
+		CompilerCtfeLaterGlobal
+
+
+private pure func compiler_ctfe_global_decl_from_typed_decl_inner(
+	decl: CompilerTypedDecl,
+	is_private: Bool,
+) -> Option[CompilerCtfeGlobalDecl]:
+	match decl:
+		CompilerTypedGlobalVarDecl(info):
+			Some({
+				name = info.decl.name.text,
+				info = info,
+				is_private = is_private,
+			})
+		CompilerTypedPrivateDecl(inner):
+			compiler_ctfe_global_decl_from_typed_decl_inner(inner, True)
+		_:
+			None
+
+
+pure func compiler_ctfe_global_decl_from_typed_decl(
+	decl: CompilerTypedDecl,
+) -> Option[CompilerCtfeGlobalDecl]:
+	compiler_ctfe_global_decl_from_typed_decl_inner(decl, False)
+
+
+pure func compiler_ctfe_typed_decl_declares_global(decl: CompilerTypedDecl, name: String) -> Bool:
+	match compiler_ctfe_global_decl_from_typed_decl(decl):
+		Some(global_decl):
+			global_decl.name == name
+		None:
+			False
+
+
+pure func compiler_ctfe_program_declares_global(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Bool:
+	program.decls.any(func(decl): compiler_ctfe_typed_decl_declares_global(decl, name))
+
+
+pure func compiler_ctfe_bind_unavailable_decl_globals(
+	env: CompilerCtfeEnv,
+	decl: CompilerTypedDecl,
+) -> CompilerCtfeEnv:
+	match compiler_ctfe_global_decl_from_typed_decl(decl):
+		Some(global_decl):
+			compiler_ctfe_bind_unavailable_global(
+				env,
+				global_decl.name,
+				compiler_ctfe_unavailable_reason_for_global(global_decl.info),
+			)
+		None:
+			env
+
+
+pure func compiler_ctfe_bind_unavailable_program_globals(
+	env: CompilerCtfeEnv,
+	program: CompilerTypedProgram,
+) -> CompilerCtfeEnv:
+	var result = env
+
+	for decl in program.decls:
+		result = compiler_ctfe_bind_unavailable_decl_globals(result, decl)
+
+	result
+
+
+pure func compiler_ctfe_imported_program_declares_global(
+	imported_programs: List[CompilerCtfeImportedProgram],
+	module_path: String,
+	name: String,
+) -> Bool:
+	imported_programs.any(
+		func(
+			imported,
+		): (
+			imported.module_path == module_path
+			and compiler_ctfe_program_declares_global(imported.program, name)
+		),
+	)
+
+
+pure func compiler_ctfe_eval_global_decl(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	global_decl: CompilerCtfeGlobalDecl,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	if compiler_ctfe_global_initializer_runs_at_runtime(global_decl.info):
+		Ok(env)
+	else:
+		eval_env = compiler_ctfe_bind_unavailable_global(
+			env,
+			global_decl.name,
+			CompilerCtfeCurrentGlobal,
+		)
+		value ?= compiler_ctfe_eval_typed_expr(context, eval_env, global_decl.info.value)
+		Ok(compiler_ctfe_bind_global_value(env, global_decl.name, value))
+
+
+private pure func compiler_ctfe_rewrite_global_var_decl(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	info: CompilerTypedGlobalVarInfo,
+) -> Result[CompilerCtfeRewriteDeclResult, CompilerCtfeEvalError]:
+	if compiler_ctfe_global_initializer_runs_at_runtime(info):
+		Ok({
+			env = env,
+			decl = CompilerTypedGlobalVarDecl(info),
+		})
+	else:
+		eval_env = compiler_ctfe_bind_unavailable_global(
+			env,
+			info.decl.name.text,
+			CompilerCtfeCurrentGlobal,
+		)
+		value ?= compiler_ctfe_eval_typed_expr(context, eval_env, info.value)
+		Ok({
+			env = compiler_ctfe_bind_global_value(env, info.decl.name.text, value),
+			decl = CompilerTypedGlobalVarDecl(
+				compiler_ctfe_materialize_global_var_info(
+					info,
+					value,
+				),
+			),
+		})
+
+
+private pure func compiler_ctfe_rewrite_decl_globals(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	decl: CompilerTypedDecl,
+) -> Result[CompilerCtfeRewriteDeclResult, CompilerCtfeEvalError]:
+	match decl:
+		CompilerTypedGlobalVarDecl(info):
+			compiler_ctfe_rewrite_global_var_decl(context, env, info)
+		CompilerTypedPrivateDecl(inner):
+			result ?= compiler_ctfe_rewrite_decl_globals(context, env, inner)
+			Ok({
+				env = result.env,
+				decl = CompilerTypedPrivateDecl(result.decl),
+			})
+		_:
+			Ok({
+				env = env,
+				decl = decl,
+			})
+
+
+pure func compiler_ctfe_eval_decl_global_env(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	decl: CompilerTypedDecl,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	match compiler_ctfe_global_decl_from_typed_decl(decl):
+		Some(global_decl):
+			compiler_ctfe_eval_global_decl(context, env, global_decl)
+		None:
+			Ok(env)
+
+
+pure func compiler_ctfe_eval_program_global_env(
+	context: CompilerCtfeContext,
+	base_env: CompilerCtfeEnv,
+	program: CompilerTypedProgram,
+) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
+	var env = compiler_ctfe_bind_unavailable_program_globals(base_env, program)
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for decl in program.decls:
+		match compiler_ctfe_eval_decl_global_env(context, env, decl):
+			Ok(next_env):
+				env = next_env
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(env)
+
+
+pure func compiler_ctfe_eval_imported_program_global_envs(
+	context: CompilerCtfeContext,
+	imported_programs: List[CompilerCtfeImportedProgram],
+) -> Result[CompilerCtfeContext, CompilerCtfeEvalError]:
+	var result_context = context
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for imported in imported_programs:
+		match compiler_ctfe_eval_program_global_env(
+			result_context,
+			compiler_ctfe_env_empty(),
+			imported.program,
+		):
+			Ok(env):
+				result_context = compiler_ctfe_context_with_module_global_env(
+					result_context,
+					imported.module_path,
+					env,
+				)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result_context)
+
+
+pure func compiler_ctfe_bind_imported_global(
+	context: CompilerCtfeContext,
+	env: CompilerCtfeEnv,
+	binding: CompilerImportBinding,
+) -> CompilerCtfeEnv:
+	match binding.original_name:
+		Some(original_name):
+			match compiler_ctfe_context_module_global_value(
+				context,
+				binding.module_path,
+				original_name,
+			):
+				Some(value):
+					compiler_ctfe_bind_global_value(env, binding.local_name, value)
+				None:
+					if compiler_ctfe_context_module_has_global_binding(
+						context,
+						binding.module_path,
+						original_name,
+					):
+						compiler_ctfe_bind_unavailable_global(
+							env,
+							binding.local_name,
+							CompilerCtfeImportedRuntimeInitializedGlobal(
+								binding.module_path,
+								original_name,
+							),
+						)
+					else:
+						env
+		None:
+			env
+
+
+pure func compiler_ctfe_imported_global_env(
+	context: CompilerCtfeContext,
+	import_bindings: List[CompilerImportBinding],
+) -> CompilerCtfeEnv:
+	var env = compiler_ctfe_env_empty()
+
+	for binding in import_bindings:
+		env = compiler_ctfe_bind_imported_global(context, env, binding)
+
+	env
+
+
+pure func compiler_ctfe_rewrite_program_globals(
+	context: CompilerCtfeContext,
+	base_env: CompilerCtfeEnv,
+	program: CompilerTypedProgram,
+) -> Result[CompilerTypedProgram, CompilerCtfeEvalError]:
+	var env = compiler_ctfe_bind_unavailable_program_globals(base_env, program)
+	var decls: List[CompilerTypedDecl] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for decl in program.decls:
+		match compiler_ctfe_rewrite_decl_globals(context, env, decl):
+			Ok(result):
+				env = result.env
+				decls = decls.append(result.decl)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({ program | decls = decls })
+
+
+pure func compiler_ctfe_rewrite_program_globals_with_import_bindings(
+	context: CompilerCtfeContext,
+	import_bindings: List[CompilerImportBinding],
+	program: CompilerTypedProgram,
+) -> Result[CompilerTypedProgram, CompilerCtfeEvalError]:
+	compiler_ctfe_rewrite_program_globals(
+		context,
+		compiler_ctfe_imported_global_env(context, import_bindings),
+		program,
+	)
+
+
+pure func compiler_ctfe_evaluate_program_globals(
+	program: CompilerTypedProgram,
+	imported_programs: List[CompilerCtfeImportedProgram],
+	import_bindings: List[CompilerImportBinding],
+) -> Result[CompilerTypedProgram, CompilerCtfeEvalError]:
+	context ?= compiler_ctfe_eval_imported_program_global_envs(
+		compiler_ctfe_context_from_program(program, imported_programs),
+		imported_programs,
+	)
+
+	compiler_ctfe_rewrite_program_globals_with_import_bindings(context, import_bindings, program)

@@ -44,6 +44,11 @@ let expect_resolved_call_info json =
   | Ok info -> info
   | Error err -> Alcotest.fail (Blorp.Typed_ast_json.decode_error_to_string err)
 
+let expect_resolved_call_info_error json =
+  match Blorp.Typed_ast_json.decode_resolved_call_info "$" json with
+  | Ok _ -> Alcotest.fail "expected resolved call info decode error"
+  | Error err -> err
+
 let expect_expr_info json =
   match Blorp.Typed_ast_json.decode_typed_expr_info "$" json with
   | Ok info -> info
@@ -145,14 +150,18 @@ let resolved_call_info =
     [
       ("callee_name", String "read_chunk_at");
       ("source_name", String "read_chunk_at");
-      ("callable_id", Int 42);
-      ("trait_name", Null);
       ("purity", String "impure");
-      ( "origin",
+      ( "target",
         Object
           [
-            ("kind", String "imported");
-            ("module", String "std/file");
+            ("kind", String "direct");
+            ("callable_id", Int 42);
+            ( "origin",
+              Object
+                [
+                  ("kind", String "imported");
+                  ("module", String "std/file");
+                ] );
           ] );
       ("instantiated_params", Array [ named "String"; named "Int" ]);
       ("instantiated_return", named "String");
@@ -178,14 +187,18 @@ let imported_string_split_resolved_call_info =
     [
       ("callee_name", String "make_string");
       ("source_name", String "string");
-      ("callable_id", Int 123);
-      ("trait_name", Null);
       ("purity", String "pure");
-      ( "origin",
+      ( "target",
         Object
           [
-            ("kind", String "imported");
-            ("module", String "std/string");
+            ("kind", String "direct");
+            ("callable_id", Int 123);
+            ( "origin",
+              Object
+                [
+                  ("kind", String "imported");
+                  ("module", String "std/string");
+                ] );
           ] );
       ("instantiated_params", Array [ named "Int" ]);
       ("instantiated_return", named "String");
@@ -198,12 +211,75 @@ let trait_resolved_call_info =
     [
       ("callee_name", String "zero");
       ("source_name", String "zero");
-      ("callable_id", Null);
-      ("trait_name", String "HasZero");
       ("purity", String "pure");
-      ("origin", Object [ ("kind", String "impl_method") ]);
+      ( "target",
+        Object
+          [
+            ("kind", String "trait_method");
+            ("trait_name", String "HasZero");
+            ("callable_id", Null);
+          ] );
       ("instantiated_params", Array []);
       ("instantiated_return", type_var "T");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let closure_resolved_call_info =
+  Object
+    [
+      ("callee_name", String "<closure>");
+      ("source_name", String "<closure>");
+      ("purity", String "pure");
+      ("target", Object [ ("kind", String "closure") ]);
+      ("instantiated_params", Array [ named "Int" ]);
+      ("instantiated_return", named "Int");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let intrinsic_resolved_call_info =
+  Object
+    [
+      ("callee_name", String "__checked_get");
+      ("source_name", String "__checked_get");
+      ("purity", String "pure");
+      ("target", Object [ ("kind", String "intrinsic") ]);
+      ("instantiated_params", Array [ named "String"; named "Int" ]);
+      ("instantiated_return", named "String");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let direct_call_with_null_id =
+  Object
+    [
+      ("callee_name", String "bad");
+      ("source_name", String "bad");
+      ("purity", String "pure");
+      ( "target",
+        Object
+          [
+            ("kind", String "direct");
+            ("callable_id", Null);
+            ("origin", Object [ ("kind", String "local") ]);
+          ] );
+      ("instantiated_params", Array []);
+      ("instantiated_return", named "Int");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let resolved_call_without_target =
+  Object
+    [
+      ("callee_name", String "legacy_shape");
+      ("source_name", String "legacy_shape");
+      ("purity", String "pure");
+      ("callable_id", Int 7);
+      ("origin", Object [ ("kind", String "local") ]);
+      ("instantiated_params", Array []);
+      ("instantiated_return", named "Int");
       ("resource_args", Object [ ("kind", String "reject") ]);
       ("dim_constraints", Array []);
     ]
@@ -524,11 +600,12 @@ let test_decode_value_proofs () =
 let test_decode_resolved_call_info () =
   let info = expect_resolved_call_info resolved_call_info in
   Alcotest.(check string) "callee" "read_chunk_at" info.callee_name;
-  Alcotest.(check bool) "callable id" true (info.callable_id = Some 42);
   Alcotest.(check bool) "purity" true (info.purity = Env.Impure);
-  (match info.origin with
-  | CallableImported "std/file" -> ()
-  | _ -> Alcotest.fail "callable origin was not preserved");
+  (match info.target with
+  | Blorp.Typed_ast_json.DecodedDirectCall
+      { callable_id = 42; origin = CallableImported "std/file" } ->
+      ()
+  | _ -> Alcotest.fail "call target was not preserved");
   (match info.instantiated_params with
   | [ path_ty; offset_ty ] ->
       check_type "instantiated path" (TyNamed ("String", [])) path_ty;
@@ -539,6 +616,24 @@ let test_decode_resolved_call_info () =
   (match info.resource_args with
   | Env.AllowResourceArgs Env.ResourceResultDependent -> ()
   | _ -> Alcotest.fail "resource arg policy was not preserved");
+  let intrinsic = expect_resolved_call_info intrinsic_resolved_call_info in
+  (match intrinsic.target with
+  | Blorp.Typed_ast_json.DecodedIntrinsicCall -> ()
+  | _ -> Alcotest.fail "intrinsic target was not preserved");
+  let direct_null_error =
+    expect_resolved_call_info_error direct_call_with_null_id
+  in
+  Alcotest.(check string)
+    "direct callable id error"
+    "$.target.callable_id: expected integer"
+    (Blorp.Typed_ast_json.decode_error_to_string direct_null_error);
+  let missing_target_error =
+    expect_resolved_call_info_error resolved_call_without_target
+  in
+  Alcotest.(check string)
+    "missing target error"
+    "$: missing field `target`"
+    (Blorp.Typed_ast_json.decode_error_to_string missing_target_error);
   match info.dim_constraints with
   | [ (left, right) ] ->
       check_type "constraint left" (TyVarDims "#N") left;
@@ -1037,18 +1132,6 @@ let test_decode_typed_expr_control_and_resource_forms () =
                       ] );
                   ( "bindings",
                     Array [ typed_concurrent_bind "answer" (typed_int_literal "1") ] );
-                  ( "body",
-                    typed_node
-                      ~info:(expr_info (named "Void"))
-                      "block"
-                      [
-                        ( "items",
-                          Array
-                            [
-                              typed_concurrent_bind "answer"
-                                (typed_int_literal "1");
-                            ] );
-                      ] );
                 ];
               typed_node
                 ~info:(expr_info (named "Void"))
@@ -1620,7 +1703,7 @@ let test_decode_typed_expr_resolved_call_metadata () =
            ("args", Array []);
          ])
   in
-  match Typed.expr_resolved_call trait_typed with
+  (match Typed.expr_resolved_call trait_typed with
   | Some
       {
         call_syntax = CallBare;
@@ -1637,7 +1720,79 @@ let test_decode_typed_expr_resolved_call_metadata () =
       } ->
       check_type "trait return" (TyVar "T") instantiated_return
   | Some _ -> Alcotest.fail "trait resolved call metadata was not materialized"
-  | None -> Alcotest.fail "expected trait resolved call metadata"
+  | None -> Alcotest.fail "expected trait resolved call metadata");
+
+  let closure_callee =
+    Object
+      [
+        ("kind", String "lambda");
+        ("span", span_json);
+        ("info", expr_info (function_type [ named "Int" ] (named "Int")));
+        ("is_pure", Bool true);
+        ( "params",
+          Array
+            [
+              Object
+                [
+                  ("name", ident_at "x");
+                  ("source_type", named "Int");
+                  ("param_type", named "Int");
+                ];
+            ] );
+        ("return_annotation", named "Int");
+        ("body", Object [ ("kind", String "name"); ("name", ident_at "x"); ("info", expr_info (named "Int")) ]);
+      ]
+  in
+	  let closure_typed =
+	    expect_typed_expr
+	      (Object
+	         [
+           ("kind", String "call");
+           ("span", span_json);
+           ("info", expr_info ~resolved_call:closure_resolved_call_info (named "Int"));
+           ("callee", closure_callee);
+	           ("args", Array []);
+	         ])
+	  in
+  (match Typed.expr_resolved_call closure_typed with
+  | Some
+      {
+        call_syntax = CallClosureSyntax;
+        call_target = CallClosure { call_pure = true };
+        instantiated_params = [ param_ty ];
+        instantiated_return;
+      } ->
+      check_type "closure param" (TyNamed ("Int", [])) param_ty;
+      check_type "closure return" (TyNamed ("Int", [])) instantiated_return
+  | Some _ -> Alcotest.fail "closure resolved call metadata was not materialized"
+  | None -> Alcotest.fail "expected closure resolved call metadata");
+
+  let intrinsic_callee =
+    Object
+      [
+        ("kind", String "name");
+        ("name", ident_at "__checked_get");
+        ( "info",
+          expr_info ~resolved_call:intrinsic_resolved_call_info
+            (function_type [ named "String"; named "Int" ] (named "String")) );
+      ]
+  in
+  let intrinsic_typed =
+    expect_typed_expr
+      (Object
+         [
+           ("kind", String "call");
+           ("span", span_json);
+           ("info", expr_info ~resolved_call:intrinsic_resolved_call_info (named "String"));
+           ("callee", intrinsic_callee);
+           ("args", Array []);
+         ])
+  in
+  match Typed.expr_resolved_call intrinsic_typed with
+  | None -> ()
+  | Some _ ->
+      Alcotest.fail
+        "intrinsic bridge metadata should not materialize a legacy resolved call"
 
 let test_decode_imported_bare_call_uses_ufcs_callee () =
   let callee =

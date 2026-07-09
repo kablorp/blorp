@@ -874,7 +874,7 @@ let precompile_runtime ?(sanitize = false) ?sanitizer_mode ?(opt = "O0") () =
                ~is_ready:(runtime_cache_verified ~key ~tls_backend));
           check_cached ())
 
-(** Check if raylib was imported (must be called after Pipeline.compile) *)
+(** Check if raylib was imported after a pipeline compile run. *)
 let has_raylib_import () =
   List.exists
     (fun m -> Filename.basename m.Modules.path = "raylib.brp")
@@ -2214,7 +2214,11 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
           ~allow_debug_only_calls:true ~retain_debug_blocks:true ~embed_runtime
           ~filename ~source ()
     | None, false ->
-        Pipeline.compile ~debug ~allow_debug_only_calls:true
+        (* Legacy direct-source path: the OCaml runner still owns test file
+           discovery plus suite/doctest harness generation. Do not rebuild a
+           frontend graph here; migrate this when test discovery and generated
+           harness planning move to Blorp. *)
+        Pipeline.compile_legacy_direct_source ~debug ~allow_debug_only_calls:true
           ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
   in
   match compile_result with
@@ -2306,7 +2310,8 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
                 make_result ~output ~error_detail:detail false
             end)
       in
-      (* Save result to cache — modules are still loaded from Pipeline.compile *)
+      (* Save result to cache — modules are still loaded from the legacy
+         direct-source compile path. *)
       (match loc_remap with
       | None when cache_result -> save_test_cache filename result
       | None -> ()
@@ -2520,7 +2525,7 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
   let filename = Filename.concat cwd filename_base in
   let embed_runtime = Option.is_none precompiled in
   match
-    Pipeline.compile ~debug ~allow_debug_only_calls:true
+    Pipeline.compile_legacy_direct_source ~debug ~allow_debug_only_calls:true
       ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
   with
   | Error errors ->

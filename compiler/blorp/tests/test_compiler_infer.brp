@@ -1,6 +1,6 @@
 import:
-	../compiler_context: compiler_bind_meta
-	../compiler_env:
+	../src/stage_05_types/compiler_context: compiler_bind_meta
+	../src/stage_05_types/compiler_env:
 		CompilerFieldDecl,
 		CompilerFuncOrigin(CompilerUserDefinedFunc),
 		CompilerFuncSymbol,
@@ -31,14 +31,13 @@ import:
 		compiler_env_set_type_param_bounds,
 		compiler_func_symbol,
 		compiler_impl_instance,
-	../compiler_generic_params: compiler_make_bound_type_param
-	../compiler_infer:
+	../src/stage_05_types/compiler_generic_params: compiler_make_bound_type_param
+	../src/stage_06_typecheck/compiler_infer:
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
 		CompilerTypedExpr(
 			CompilerTypedBlockExpr,
 			CompilerTypedCallExpr,
-			CompilerTypedConcurrentBindExpr,
 			CompilerTypedConcurrentBlockExpr,
 			CompilerTypedIntLiteralExpr,
 		),
@@ -48,6 +47,7 @@ import:
 		compiler_infer_expr,
 		compiler_infer_with_expected,
 		compiler_infer_with_expected_value_slot,
+		compiler_resolved_call_callable_id,
 		compiler_typed_expr_binary_left_widening,
 		compiler_typed_expr_binary_right_widening,
 		compiler_typed_expr_call_arg_widening,
@@ -68,7 +68,7 @@ import:
 		compiler_typed_expr_var_initializer_widening,
 		compiler_typed_expr_vector_item_widening,
 		compiler_typed_expr_widening,
-	../compiler_parsed_ast:
+	../src/stage_03_parse/compiler_parsed_ast:
 		ParsedBinaryOp(ParsedAddOp, ParsedEqualOp, ParsedLessOp, ParsedModuloOp),
 		ParsedCompoundAssignOp(ParsedAssignAddOp),
 		ParsedConcurrentParam,
@@ -146,15 +146,15 @@ import:
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		ParsedWithErrorMap,
 		parsed_identifier,
-	../compiler_refinement: compiler_unrefined_binding
-	../compiler_source:
+	../src/stage_05_types/compiler_refinement: compiler_unrefined_binding
+	../src/stage_01_file_io/compiler_source:
 		CompilerCursor,
 		CompilerSourceFile,
 		CompilerSourceSpan,
 		compiler_source_cursor_at,
 		compiler_source_file,
 		compiler_source_span,
-	../compiler_type:
+	../src/stage_05_types/compiler_type:
 		CompilerType(
 			CompilerArrayType,
 			CompilerConstIntType,
@@ -171,7 +171,7 @@ import:
 		compiler_type_string,
 		compiler_type_void,
 		compiler_types_equal,
-	../compiler_type_widening:
+	../src/stage_05_types/compiler_type_widening:
 		CompilerCollectionKind(CompilerDictLiteral, CompilerListLiteral, CompilerVectorLiteral),
 		CompilerTypeWideningDecision(CompilerTypeKeep, CompilerTypeWiden),
 		CompilerTypeWideningReason(
@@ -182,7 +182,7 @@ import:
 		),
 		CompilerValueSlot,
 		compiler_widening_reasons_equal,
-	../compiler_typecheck_state:
+	../src/stage_06_typecheck/compiler_typecheck_state:
 		CompilerTypecheckState,
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_empty,
@@ -1946,13 +1946,14 @@ func test_concurrent_block_checks_params_and_body_and_returns_void() -> Bool:
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_void())
 		and match result.expr:
-			CompilerTypedConcurrentBlockExpr(_, CompilerTypedBlockExpr(items, _, _), _, _):
-				match items.get(0):
-					Some(CompilerTypedConcurrentBindExpr(name, None, _, _, _)):
+			CompilerTypedConcurrentBlockExpr(_, bindings, _, _):
+				match bindings.get(0):
+					Some(binding):
 						(
-							name.text == "result"
+							binding.name.text == "result"
+							and binding.annotation.is_none()
 							and compiler_types_equal(
-								compiler_typed_expr_semantic_type(items.get_or(0, result.expr)),
+								binding.info.semantic_type,
 								compiler_type_task_result(compiler_type_int()),
 							)
 						)
@@ -1981,21 +1982,25 @@ func test_concurrent_block_task_result_alias_annotation_is_canonical() -> Bool:
 	expected_type = compiler_type_task_result(compiler_type_int())
 
 	result.context.state.errors.length() == 0 and match result.expr:
-		CompilerTypedConcurrentBlockExpr(_, CompilerTypedBlockExpr(items, _, _), _, _):
-			match items.get(0):
-				Some(CompilerTypedConcurrentBindExpr(name, Some(annotation), value, _, _)):
+		CompilerTypedConcurrentBlockExpr(_, bindings, _, _):
+			match bindings.get(0):
+				Some(binding):
 					(
-						name.text == "answer"
+						binding.name.text == "answer"
 						and compiler_types_equal(
-							compiler_typed_expr_value_type(value),
+							compiler_typed_expr_value_type(binding.value),
 							compiler_type_int(),
 						)
+						and match binding.annotation:
+							Some(annotation):
+								compiler_types_equal(
+									annotation,
+									CompilerNamedType("TaskResult", [compiler_type_int()]),
+								)
+							None:
+								False
 						and compiler_types_equal(
-							annotation,
-							CompilerNamedType("TaskResult", [compiler_type_int()]),
-						)
-						and compiler_types_equal(
-							compiler_typed_expr_semantic_type(items.get_or(0, result.expr)),
+							binding.info.semantic_type,
 							expected_type,
 						)
 						and match compiler_env_get_var_type(result.context.state.env, "answer"):
@@ -2957,7 +2962,7 @@ func test_constructor_call_specializes_generic_return() -> Bool:
 		CompilerNamedType("Option", [compiler_type_int()]),
 	) and match compiler_typed_expr_resolved_call(result.expr):
 		Some(info):
-			info.callee_name == "Some" and info.callable_id.is_some()
+			info.callee_name == "Some" and compiler_resolved_call_callable_id(info).is_some()
 		None:
 			False
 
@@ -3562,7 +3567,7 @@ func test_direct_call_records_resolved_metadata() -> Bool:
 		result.context.state.errors.length() == 0
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
-				callable_ok = match (info.callable_id, expected_callable_id):
+				callable_ok = match (compiler_resolved_call_callable_id(info), expected_callable_id):
 					(Some(callable_id), Some(expected)):
 						callable_id == expected
 					_:
@@ -3582,6 +3587,43 @@ func test_direct_call_records_resolved_metadata() -> Bool:
 						None:
 							True
 						Some(_):
+							False
+				)
+			None:
+				False
+	)
+
+
+func test_closure_call_records_resolved_metadata() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(
+			ParsedLambdaExpr(
+				True,
+				[lambda_param("x", Some(named_type("Int")))],
+				Some(named_type("Int")),
+				ParsedNameExpr(ident("x")),
+				source_span(),
+			),
+			[int_expr("1")],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+		and match compiler_typed_expr_resolved_call(result.expr):
+			Some(info):
+				(
+					info.callee_name == "<closure>"
+					and compiler_resolved_call_callable_id(info) == None
+					and match info.purity:
+						CompilerPure:
+							True
+						_:
 							False
 				)
 			None:
@@ -3635,7 +3677,7 @@ func test_qualified_module_call_records_resolved_metadata() -> Bool:
 					Some(info):
 						(
 							info.callee_name == "scale"
-							and info.callable_id == Some(expected_callable_id)
+							and compiler_resolved_call_callable_id(info) == Some(expected_callable_id)
 							and match info.purity:
 								CompilerPure:
 									True
@@ -3732,7 +3774,7 @@ func test_qualified_module_constructor_call_infers_owned_constructor() -> Bool:
 		CompilerNamedType("Option", [compiler_type_int()]),
 	) and match compiler_typed_expr_resolved_call(result.expr):
 		Some(info):
-			info.callee_name == "Some" and info.callable_id.is_some()
+			info.callee_name == "Some" and compiler_resolved_call_callable_id(info).is_some()
 		None:
 			False
 
@@ -3751,7 +3793,7 @@ func test_qualified_module_nullary_constructor_uses_expected_type() -> Bool:
 		CompilerNamedType("Option", [compiler_type_string()]),
 	) and match compiler_typed_expr_resolved_call(result.expr):
 		Some(info):
-			info.callee_name == "None" and info.callable_id.is_some()
+			info.callee_name == "None" and compiler_resolved_call_callable_id(info).is_some()
 		None:
 			False
 
@@ -3775,7 +3817,7 @@ func test_overloaded_bare_call_selects_by_first_argument() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(int_result.expr):
 			Some(info):
-				info.callee_name == "describe" and info.callable_id == Some(101)
+				info.callee_name == "describe" and compiler_resolved_call_callable_id(info) == Some(101)
 			None:
 				False
 		and string_result.context.state.errors.length() == 0
@@ -3785,7 +3827,7 @@ func test_overloaded_bare_call_selects_by_first_argument() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(string_result.expr):
 			Some(info):
-				info.callee_name == "describe" and info.callable_id == Some(102)
+				info.callee_name == "describe" and compiler_resolved_call_callable_id(info) == Some(102)
 			None:
 				False
 	)
@@ -3823,7 +3865,7 @@ func test_generic_bare_overload_binds_first_arg_type() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
-				info.callee_name == "first_of" and info.callable_id == Some(204)
+				info.callee_name == "first_of" and compiler_resolved_call_callable_id(info) == Some(204)
 			None:
 				False
 	)
@@ -3847,7 +3889,7 @@ func test_bare_overload_prefers_concrete_over_generic() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(value_result.expr):
 			Some(info):
-				info.callee_name == "rank_value" and info.callable_id == Some(210)
+				info.callee_name == "rank_value" and compiler_resolved_call_callable_id(info) == Some(210)
 			None:
 				False
 		and list_result.context.state.errors.length() == 0
@@ -3857,7 +3899,7 @@ func test_bare_overload_prefers_concrete_over_generic() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(list_result.expr):
 			Some(info):
-				info.callee_name == "rank_list" and info.callable_id == Some(213)
+				info.callee_name == "rank_list" and compiler_resolved_call_callable_id(info) == Some(213)
 			None:
 				False
 	)
@@ -3888,7 +3930,7 @@ func test_bare_overload_uses_all_argument_types() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(string_result.expr):
 			Some(info):
-				info.callee_name == "combine" and info.callable_id == Some(205)
+				info.callee_name == "combine" and compiler_resolved_call_callable_id(info) == Some(205)
 			None:
 				False
 		and bool_result.context.state.errors.length() == 0
@@ -3898,7 +3940,7 @@ func test_bare_overload_uses_all_argument_types() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(bool_result.expr):
 			Some(info):
-				info.callee_name == "combine" and info.callable_id == Some(206)
+				info.callee_name == "combine" and compiler_resolved_call_callable_id(info) == Some(206)
 			None:
 				False
 	)
@@ -3929,7 +3971,7 @@ func test_bare_overload_prefers_pure_callback_slot() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(pure_result.expr):
 			Some(info):
-				info.callee_name == "apply_one" and info.callable_id == Some(208)
+				info.callee_name == "apply_one" and compiler_resolved_call_callable_id(info) == Some(208)
 			None:
 				False
 		and impure_result.context.state.errors.length() == 0
@@ -3939,7 +3981,7 @@ func test_bare_overload_prefers_pure_callback_slot() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(impure_result.expr):
 			Some(info):
-				info.callee_name == "apply_one" and info.callable_id == Some(207)
+				info.callee_name == "apply_one" and compiler_resolved_call_callable_id(info) == Some(207)
 			None:
 				False
 	)
@@ -3962,7 +4004,7 @@ func test_ufcs_method_call_prepends_receiver() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
-				info.callee_name == "size" and info.callable_id == Some(201)
+				info.callee_name == "size" and compiler_resolved_call_callable_id(info) == Some(201)
 			None:
 				False
 	)
@@ -3985,7 +4027,7 @@ func test_module_qualified_ufcs_call_uses_first_argument_as_receiver() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
-				info.callee_name == "size" and info.callable_id == Some(211)
+				info.callee_name == "size" and compiler_resolved_call_callable_id(info) == Some(211)
 			None:
 				False
 	)
@@ -4008,7 +4050,7 @@ func test_generic_ufcs_method_binds_receiver_type() -> Bool:
 		)
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
-				info.callee_name == "head" and info.callable_id == Some(202)
+				info.callee_name == "head" and compiler_resolved_call_callable_id(info) == Some(202)
 			None:
 				False
 	)
@@ -6923,6 +6965,7 @@ tests: TestSuite = {
 		("direct call infers return type", test_direct_call_infers_return_type),
 		("direct call widens argument", test_direct_call_widens_argument),
 		("direct call records resolved metadata", test_direct_call_records_resolved_metadata),
+		("closure call records resolved metadata", test_closure_call_records_resolved_metadata),
 		(
 			"typed expr type error rejects missing call metadata",
 			test_typed_expr_type_error_rejects_missing_call_metadata,

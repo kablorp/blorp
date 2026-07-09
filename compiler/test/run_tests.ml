@@ -37,29 +37,21 @@ let suite_group prefix suite =
 let default_suites =
   suite_group "TypedAst" Test_typed_ast.suite
   @ suite_group "TypedAstJson" Test_typed_ast_json.suite
-  @ suite_group "CtfeIntrinsic" Test_ctfe_intrinsic.suite
-  @ suite_group "CtfeIr" Test_ctfe_ir.suite
-  @ suite_group "CtfeMaterialize" Test_ctfe_materialize.suite
   @ suite_group "TypedAstDebug" Test_typed_ast_debug.suite
   @ suite_group "CompileProfile" Test_compile_profile.suite
   @ suite_group "Diagnostics" Test_diagnostics.suite
   @ suite_group "LanguageSurface" Test_language_surface.suite
   @ suite_group "TypeMetadataFormat" Test_type_metadata_format.suite
   @ suite_group "Types" Test_types.suite
-  @ suite_group "FloatBitPattern" Test_float_bit_pattern.suite
   @ suite_group "TypeResolution" Test_type_resolution.suite
   @ suite_group "TypeWidening" Test_type_widening.suite
   @ suite_group "Refinement" Test_refinement.suite
   @ suite_group "InferTypeNormalization" Test_infer_type_normalization.suite
-  @ suite_group "TypeBoundaryHygiene" Test_type_boundary_hygiene.suite
   @ suite_group "GenericParams" Test_generic_params.suite
-  @ suite_group "Parser" Test_parser.suite
   @ suite_group "ModuleSurface" Test_module_surface.suite
   @ suite_group "ModuleTypeIdentity" Test_module_type_identity.suite
   @ suite_group "ParsedAstJson" Test_parsed_ast_json.suite
   @ suite_group "Blake3" Test_blake3.suite
-  @ suite_group "TraitObligationArchitecture"
-      Test_trait_obligation_architecture.suite
   @ suite_group "Infer" Test_infer.suite
   @ suite_group "PurityAnalysis" Test_purity_analysis.suite
   @ suite_group "Env" Test_env.suite
