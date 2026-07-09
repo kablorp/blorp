@@ -504,6 +504,60 @@ let test_typecheck_source_request_can_include_import_modules () =
         "origin" "std" (string_field "kind" (field "origin" first))
   | _ -> Alcotest.fail "expected one typecheck import module"
 
+let test_typecheck_sources_request_uses_bridge_envelope () =
+  let source =
+    {
+      Bridge.typecheck_import_path = "src/main.brp";
+      typecheck_import_module_name = "main";
+      typecheck_import_module_path = "main";
+      typecheck_import_text = "func main(): 0";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let import_module =
+    {
+      Bridge.typecheck_import_path = "src/dep.brp";
+      typecheck_import_module_name = "dep";
+      typecheck_import_module_path = "dep";
+      typecheck_import_text = "pure func answer() -> Int: 1";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let request =
+    Bridge.typecheck_sources_request_json_with_imports_policy
+      ~resolved_imports:[] ~allow_debug_only_calls:false
+      ~include_comments:false ~import_modules:[ import_module ]
+      ~sources:[ source ]
+    |> parse_json_exn
+  in
+  Alcotest.(check string)
+    "action" "typecheck_sources" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check bool)
+    "include comments" false (bool_field "include_comments" payload);
+  Alcotest.(check bool)
+    "allow debug-only calls" false
+    (bool_field "allow_debug_only_calls" payload);
+  let () =
+    match array_field "sources" payload with
+    | [ first ] ->
+        Alcotest.(check string)
+          "path" "src/main.brp" (string_field "path" first);
+        Alcotest.(check string) "module" "main" (string_field "module" first);
+        Alcotest.(check string)
+          "module_path" "main" (string_field "module_path" first);
+        Alcotest.(check string)
+          "origin" "user" (string_field "kind" (field "origin" first))
+    | _ -> Alcotest.fail "expected one typecheck source"
+  in
+  match array_field "import_modules" payload with
+  | [ first ] ->
+      Alcotest.(check string)
+        "import module" "dep" (string_field "module" first);
+      Alcotest.(check string)
+        "import module path" "dep" (string_field "module_path" first)
+  | _ -> Alcotest.fail "expected one typecheck import module"
+
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
     Blorp.Compiler_blorp_bridge.cli_run_request_json
@@ -684,6 +738,17 @@ let typecheck_artifact ?(ast_phase = "typecheck_source") ?(type_errors = [])
      ]
     @ optional_fields)
 
+let typecheck_batch_item_json ~path ~module_name artifact =
+  match artifact with
+  | Lsp_json.Object fields ->
+      Lsp_json.Object
+        ([
+           ("path", Lsp_json.String path);
+           ("module", Lsp_json.String module_name);
+         ]
+        @ fields)
+  | _ -> artifact
+
 let test_typecheck_source_response_decodes_typed_program_artifact () =
   let response =
     bridge_success_json
@@ -721,6 +786,47 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
         "comment text" "-- typed" comment.Bridge.cc_text;
       Alcotest.(check string) "surface module" "main" surface.Module_surface.module_name
   | Ok _ -> Alcotest.fail "expected decoded typecheck artifact"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_typecheck_sources_response_decodes_items () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ( "sources",
+             Lsp_json.Array
+               [
+                 typecheck_batch_item_json ~path:"main.brp"
+                   ~module_name:"main"
+                   (typecheck_artifact ~ctfe_status:"evaluated"
+                      (typed_program_json []));
+                 typecheck_batch_item_json ~path:"dep.brp" ~module_name:"dep"
+                   (typecheck_artifact ~ctfe_status:"evaluated"
+                      ~import_bindings:[ import_binding_json "Dep" "dep" ]
+                      (typed_program_json []));
+               ] );
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.typecheck_sources_response_json response with
+  | Ok
+      [
+        {
+          Bridge.batch_typechecked_path = "main.brp";
+          batch_typechecked_module_name = "main";
+          batch_typechecked_response = first;
+        };
+        {
+          batch_typechecked_path = "dep.brp";
+          batch_typechecked_module_name = "dep";
+          batch_typechecked_response = second;
+        };
+      ] ->
+      Alcotest.(check bool)
+        "first CTFE" true first.typechecked_ctfe_evaluated_by_blorp;
+      Alcotest.(check int)
+        "second import bindings" 1
+        (List.length second.typechecked_import_bindings)
+  | Ok _ -> Alcotest.fail "expected two decoded typecheck batch items"
   | Error (_, message) -> Alcotest.fail message
 
 let test_typecheck_source_response_rejects_invalid_ctfe_status () =
@@ -1863,6 +1969,8 @@ let suite =
           test_typecheck_source_request_uses_bridge_envelope;
         Alcotest.test_case "typecheck_source request can include imports" `Quick
           test_typecheck_source_request_can_include_import_modules;
+        Alcotest.test_case "typecheck_sources request uses bridge envelope"
+          `Quick test_typecheck_sources_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
@@ -1890,6 +1998,8 @@ let suite =
           test_typecheck_source_response_preserves_errors_for_invalid_typed_tree;
         Alcotest.test_case "typecheck_source response rejects raw phase" `Quick
           test_typecheck_source_response_rejects_raw_phase;
+        Alcotest.test_case "typecheck_sources response decodes items" `Quick
+          test_typecheck_sources_response_decodes_items;
         Alcotest.test_case
           "typecheck_source command decodes typed artifact" `Quick
           test_typecheck_source_command_decodes_typed_artifact;

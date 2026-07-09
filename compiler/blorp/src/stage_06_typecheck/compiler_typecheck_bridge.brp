@@ -4,15 +4,19 @@
 -- separate from the always-built parse bridge helper while the Blorp
 -- typechecker continues to grow toward the production compile path.
 import:
-	../stage_12_cli/compiler_bridge_protocol:
-		BRIDGE_SCHEMA_VERSION,
-		BridgeAction(TypecheckSourceAction),
-		BridgeEnvelope,
-		BridgeProtocolError(InvalidJson),
-		bridge_action_name,
-		bridge_error_json,
-		bridge_success_json,
-		decode_bridge_envelope_value,
+	../stage_01_file_io/compiler_source: CompilerSourceFile, compiler_source_file
+	../stage_02_lex/compiler_lexer: compiler_lex
+	../stage_02_lex/compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
+	../stage_03_parse/compiler_parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl),
+		ParsedImportDecl,
+		ParsedProgram,
+		ParsedProgramPhase(TypecheckSourceProgram),
+		parsed_program_phase_name,
+	../stage_03_parse/compiler_parser: parse_compiler_source
+	../stage_03_parse/compiler_source_ast_finalize: finalize_typecheck_source_program
+	../stage_04_modules/compiler_module_surface: module_surface_for_program
+	../stage_04_modules/compiler_module_surface_json: module_surface_to_json
 	../stage_05_types/compiler_context:
 		CompilerModuleOrigin(
 			CompilerNativePackageModule,
@@ -23,20 +27,16 @@ import:
 	../stage_07_ctfe/compiler_ctfe_context: CompilerCtfeImportedProgram
 	../stage_07_ctfe/compiler_ctfe_eval: compiler_ctfe_eval_error_message
 	../stage_07_ctfe/compiler_ctfe_globals: compiler_ctfe_evaluate_program_globals
+	../stage_12_cli/compiler_bridge_protocol:
+		BRIDGE_SCHEMA_VERSION,
+		BridgeAction(TypecheckSourceAction, TypecheckSourcesAction),
+		BridgeEnvelope,
+		BridgeProtocolError(InvalidJson),
+		bridge_action_name,
+		bridge_error_json,
+		bridge_success_json,
+		decode_bridge_envelope_value,
 	compiler_imports: CompilerImportableModule, compiler_importable_module
-	../stage_02_lex/compiler_lexer: compiler_lex
-	../stage_04_modules/compiler_module_surface: module_surface_for_program
-	../stage_04_modules/compiler_module_surface_json: module_surface_to_json
-	../stage_03_parse/compiler_parsed_ast:
-		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl),
-		ParsedImportDecl,
-		ParsedProgram,
-		ParsedProgramPhase(TypecheckSourceProgram),
-		parsed_program_phase_name,
-	../stage_03_parse/compiler_parser: parse_compiler_source
-	../stage_01_file_io/compiler_source: CompilerSourceFile, compiler_source_file
-	../stage_03_parse/compiler_source_ast_finalize: finalize_typecheck_source_program
-	../stage_02_lex/compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
 	compiler_typecheck_decl:
 		CompilerTypecheckProgramResult,
 		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
@@ -236,6 +236,35 @@ private pure func import_modules_field(
 			Ok([])
 		Some(field):
 			items ?= as_array(field).to_result(ExpectedRequestField("import_modules", "an array"))
+			var modules: List[TypecheckImportModule] = []
+			var error: Option[TypecheckBridgeDispatchError] = None
+
+			for item in items:
+				match error:
+					Some(_):
+						break
+					None:
+						match import_module_from_json(item):
+							Ok(module):
+								modules = modules.append(module)
+							Err(err):
+								error = Some(err)
+
+			match error:
+				Some(err):
+					Err(err)
+				None:
+					Ok(modules)
+
+
+private pure func sources_field(
+	value: JsonValue,
+) -> Result[List[TypecheckImportModule], TypecheckBridgeDispatchError]:
+	match get_field(value, "sources"):
+		None:
+			Err(ExpectedRequestField("sources", "an array"))
+		Some(field):
+			items ?= as_array(field).to_result(ExpectedRequestField("sources", "an array"))
 			var modules: List[TypecheckImportModule] = []
 			var error: Option[TypecheckBridgeDispatchError] = None
 
@@ -494,6 +523,27 @@ private pure func importable_modules_from_request(
 	resolved_imports: List[TypecheckResolvedImport],
 ) -> List[CompilerImportableModule]:
 	modules.map(func(module): importable_module_from_request(module, resolved_imports))
+
+
+private pure func typecheck_import_modules_except_path(
+	modules: List[TypecheckImportModule],
+	module_path: String,
+) -> List[TypecheckImportModule]:
+	modules.filter(func(module): module.module_path != module_path)
+
+
+private pure func typecheck_import_modules_or_sources(
+	request_import_modules: List[TypecheckImportModule],
+	sources: List[TypecheckImportModule],
+) -> List[TypecheckImportModule]:
+	if request_import_modules.length() == 0:
+		-- Do not alias the parsed sources list as the import list. The current
+		-- generated ARC path can double-release that shared list when a batch
+		-- request returns. Copying keeps the bridge conservative while the
+		-- deeper list/value ownership hole is still open.
+		sources.concat([])
+	else:
+		request_import_modules
 
 
 private pure func typed_decl_has_ctfe_global(decl: CompilerTypedDecl) -> Bool:
@@ -797,6 +847,36 @@ private pure func handle_typecheck_source(
 	)
 
 
+private pure func handle_typecheck_sources(
+	body: JsonValue,
+) -> Result[JsonValue, TypecheckBridgeDispatchError]:
+	sources ?= sources_field(body)
+	request_import_modules ?= import_modules_field(body)
+	resolved_imports ?= resolved_imports_field(body)
+	include_comments = optional_bool_field(body, "include_comments", False)
+	allow_debug_only_calls = optional_bool_field(body, "allow_debug_only_calls", False)
+
+	import_modules = typecheck_import_modules_or_sources(request_import_modules, sources)
+
+	-- Keep the batch boundary at the bridge process/JSON layer, but rebuild
+	-- importable modules per source. Sharing CompilerImportableModule values
+	-- across several typecheck calls in one helper process currently crashes
+	-- on the real compiler graph, which points to an ownership/representation
+	-- hole below this bridge rather than a safe value to reuse here.
+	artifacts = sources.map(func(module): typed_source_artifact(
+			module.path,
+			module.module_name,
+			module.text,
+			include_comments,
+			allow_debug_only_calls,
+			module.origin,
+			typecheck_import_modules_except_path(import_modules, module.module_path),
+			resolved_imports,
+		))
+
+	Ok(bridge_success_json(JsonObject([("sources", JsonVector(artifacts))])))
+
+
 private pure func handle_envelope(
 	envelope: BridgeEnvelope,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
@@ -805,6 +885,8 @@ private pure func handle_envelope(
 	match envelope.action:
 		TypecheckSourceAction:
 			handle_typecheck_source(body)
+		TypecheckSourcesAction:
+			handle_typecheck_sources(body)
 		_:
 			Err(UnsupportedBridgeAction(envelope.action))
 
