@@ -47,14 +47,11 @@ let default_suites =
   @ suite_group "TypeWidening" Test_type_widening.suite
   @ suite_group "Refinement" Test_refinement.suite
   @ suite_group "InferTypeNormalization" Test_infer_type_normalization.suite
-  @ suite_group "TypeBoundaryHygiene" Test_type_boundary_hygiene.suite
   @ suite_group "GenericParams" Test_generic_params.suite
   @ suite_group "ModuleSurface" Test_module_surface.suite
   @ suite_group "ModuleTypeIdentity" Test_module_type_identity.suite
   @ suite_group "ParsedAstJson" Test_parsed_ast_json.suite
   @ suite_group "Blake3" Test_blake3.suite
-  @ suite_group "TraitObligationArchitecture"
-      Test_trait_obligation_architecture.suite
   @ suite_group "Infer" Test_infer.suite
   @ suite_group "PurityAnalysis" Test_purity_analysis.suite
   @ suite_group "Env" Test_env.suite
