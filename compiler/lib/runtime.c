@@ -2498,12 +2498,6 @@ static int blorp_io_wait_owner_cancel_waiter(
     blorp_IoWaitOwner owner,
     blorp_IoWaiter* waiter
 );
-static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
-    blorp_IoWaitOwner owner,
-    blorp_IoWaitKind kind,
-    uint64_t generation,
-    blorp_IoWakeReason reason
-);
 static blorp_IoWaiterList blorp_io_wait_owner_extract_exact_waiter(
     blorp_IoWaitOwner owner,
     blorp_IoWaiter* waiter,
@@ -2532,7 +2526,6 @@ static void blorp_io_deadline_queue_insert(
     blorp_IoWaitOwner owner
 );
 static void blorp_io_deadline_queue_remove(blorp_IoWaiter* waiter);
-static long blorp_io_deadline_queue_count(void);
 static uint64_t blorp_io_deadline_queue_drain(void);
 static void blorp_io_deadline_queue_clear(void);
 static int blorp_io_reactor_unregister_fd_generation(int fd, uint64_t generation);
@@ -3101,27 +3094,6 @@ static bool blorp_io_wait_owner_is_open(
             pthread_mutex_unlock(&socket->mutex);
             return open;
         }
-        default:
-            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
-            abort();
-    }
-}
-
-static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
-    blorp_IoWaitOwner owner,
-    blorp_IoWaitKind kind,
-    uint64_t generation,
-    blorp_IoWakeReason reason
-) {
-    switch (owner.kind) {
-        case BLORP_IO_WAIT_OWNER_NONE:
-            return blorp_io_waiter_list_empty();
-        case BLORP_IO_WAIT_OWNER_TCP:
-            return blorp_tcp_inner_extract_waiter(
-                owner.value.tcp_inner, kind, generation, reason);
-        case BLORP_IO_WAIT_OWNER_UDP:
-            return blorp_udp_socket_extract_waiter(
-                owner.value.udp_socket, kind, generation, reason);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -3773,62 +3745,6 @@ static int blorp_io_reactor_register_owner(
     return 0;
 }
 
-static int blorp_io_reactor_register_fd_for_smoke(
-    int fd,
-    uint64_t generation,
-    int interests
-) {
-    if (fd < 0 || interests == 0) return -1;
-    if (blorp_io_reactor_start() != 0) return -1;
-    pthread_mutex_lock(&__blorp_io_reactor.mutex);
-    blorp_IoRegistration* existing =
-        blorp_io_reactor_find_locked(fd, generation);
-    if (existing) {
-        if (blorp_io_wait_owner_is_some(existing->owner)) {
-            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
-            return -1;
-        }
-        existing->interests |= interests;
-        existing->ready_events &= existing->interests;
-        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
-        blorp_io_reactor_wake_control();
-        return 0;
-    }
-    blorp_IoRegistration* reg =
-        (blorp_IoRegistration*)blorp_malloc_checked(sizeof(blorp_IoRegistration));
-    reg->fd = fd;
-    reg->generation = generation;
-    reg->interests = interests;
-    reg->ready_events = 0;
-    reg->owner = blorp_io_wait_owner_none();
-    reg->next = __blorp_io_reactor.registrations;
-    __blorp_io_reactor.registrations = reg;
-    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
-    blorp_io_reactor_wake_control();
-    return 0;
-}
-
-static int blorp_io_reactor_update_interest(
-    int fd,
-    uint64_t generation,
-    int interests
-) {
-    if (fd < 0) return -1;
-    if (blorp_io_reactor_start() != 0) return -1;
-    pthread_mutex_lock(&__blorp_io_reactor.mutex);
-    blorp_IoRegistration* reg =
-        blorp_io_reactor_find_locked(fd, generation);
-    if (!reg) {
-        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
-        return -1;
-    }
-    reg->interests = interests;
-    reg->ready_events &= interests;
-    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
-    blorp_io_reactor_wake_control();
-    return 0;
-}
-
 static int blorp_io_reactor_unregister_fd_generation(int fd, uint64_t generation) {
     if (fd < 0) return -1;
     if (blorp_io_reactor_start() != 0) return -1;
@@ -4102,36 +4018,6 @@ static int blorp_io_reactor_take_ready(
     return ready;
 }
 
-int blorp_io_reactor_smoke_test(void) {
-    int fds[2];
-    if (blorp_runtime_pipe_cloexec_nonblock(fds) != 0) return 10;
-    uint64_t generation = 1;
-    int result = 0;
-    if (blorp_io_reactor_register_fd_for_smoke(
-            fds[0], generation, BLORP_IO_INTEREST_READ) != 0) {
-        result = 11;
-        goto cleanup;
-    }
-    const unsigned char byte = 42;
-    if (write(fds[1], &byte, 1) != 1) {
-        result = 12;
-        goto cleanup_registered;
-    }
-    int ready = blorp_io_reactor_wait_ready(
-        fds[0], generation, BLORP_IO_INTEREST_READ, 5000);
-    if ((ready & BLORP_IO_INTEREST_READ) == 0) {
-        result = 13;
-    }
-
-cleanup_registered:
-    blorp_io_reactor_update_interest(fds[0], generation, 0);
-    blorp_io_reactor_unregister_fd_generation(fds[0], generation);
-cleanup:
-    close(fds[0]);
-    close(fds[1]);
-    return result;
-}
-
 // Sentinel refcount for immortal singleton objects (nullary constructors like None)
 #define BLORP_IMMORTAL_REFCOUNT LONG_MAX
 
@@ -4356,31 +4242,6 @@ void blorp_vector_init_elem_release(blorp_Vector* v, void (*release_fn)(void*)) 
 // - Addition/subtraction/multiplication use wrapping on overflow via -fwrapv
 //   (two's complement, well-defined, zero overhead)
 // ============================================================================
-
-// 0-returning integer division (used by Tensor/Vector element-wise ops and unsafe_div)
-// Guards against LONG_MIN / -1 which is UB in C (SIGFPE on x86-64)
-long blorp_checked_div_int(long a, long b) {
-    return (b == 0 || (a == LONG_MIN && b == -1)) ? 0 : a / b;
-}
-
-// 0-returning integer modulo (used by Tensor/Vector element-wise ops)
-// Guards against LONG_MIN % -1 which is UB in C
-long blorp_checked_mod_int(long a, long b) {
-    return (b == 0 || (a == LONG_MIN && b == -1)) ? 0 : a % b;
-}
-
-// ============================================================================
-// Unsafe Arithmetic (returns 0 on divide-by-zero instead of Option)
-// ============================================================================
-
-long blorp_unsafe_div_int(long a, long b) {
-    return (b == 0 || (a == LONG_MIN && b == -1)) ? 0 : a / b;
-}
-
-long blorp_unsafe_mod_int(long a, long b) {
-    return (b == 0 || (a == LONG_MIN && b == -1)) ? 0 : a % b;
-}
-
 
 // ============================================================================
 // Boxing/Unboxing for Generics
@@ -8392,109 +8253,6 @@ blorp_ConcurrencyError* blorp_TaskFailed(void* msg) {
     return v;
 }
 
-// Result equality - shallow void* comparison (works for Int, Bool, Char)
-long blorp_result_eq(void* a, void* b) {
-    if (a == b) return 1;
-    if (!a || !b) return 0;
-    blorp_Result* ra = (blorp_Result*)a;
-    blorp_Result* rb = (blorp_Result*)b;
-    if (ra->tag != rb->tag) return 0;
-    if (ra->tag == BLORP_TAG_OK) return (long)(ra->data.Ok.field0 == rb->data.Ok.field0);
-    // Err is always String in practice — use string comparison
-    return blorp_string_eq(ra->data.Err.field0, rb->data.Err.field0);
-}
-
-// Result equality for String Ok and/or Err element types
-long blorp_result_eq_string(void* a, void* b) {
-    if (a == b) return 1;
-    if (!a || !b) return 0;
-    blorp_Result* ra = (blorp_Result*)a;
-    blorp_Result* rb = (blorp_Result*)b;
-    if (ra->tag != rb->tag) return 0;
-    if (ra->tag == BLORP_TAG_OK) return blorp_string_eq(ra->data.Ok.field0, rb->data.Ok.field0);
-    return blorp_string_eq(ra->data.Err.field0, rb->data.Err.field0);
-}
-
-// Result equality for Float Ok element type (Err is still string comparison)
-long blorp_result_eq_float(void* a, void* b) {
-    if (a == b) return 1;
-    if (!a || !b) return 0;
-    blorp_Result* ra = (blorp_Result*)a;
-    blorp_Result* rb = (blorp_Result*)b;
-    if (ra->tag != rb->tag) return 0;
-    if (ra->tag == BLORP_TAG_OK) {
-        double da, db;
-        memcpy(&da, &ra->data.Ok.field0, sizeof(double));
-        memcpy(&db, &rb->data.Ok.field0, sizeof(double));
-        return (long)(da == db);
-    }
-    // Err is always String in practice — use string comparison
-    return blorp_string_eq(ra->data.Err.field0, rb->data.Err.field0);
-}
-
-// Result to_string helpers
-// Helper: format "PREFIX(VALUE)" where value is a blorp_String
-static blorp_String* blorp_result_fmt_string(const char* prefix, blorp_String* inner) {
-    size_t plen = strlen(prefix);
-    size_t ilen = inner ? inner->len : 0;
-    size_t total = plen + ilen + 1; // +1 for closing paren
-    char* buf = blorp_malloc_checked(total + 1);
-    memcpy(buf, prefix, plen);
-    if (inner) memcpy(buf + plen, inner->data, ilen);
-    buf[plen + ilen] = ')';
-    buf[total] = '\0';
-    blorp_String* result = blorp_string_from_buf(buf, total);
-    free(buf);
-    return result;
-}
-
-// Result[Int, Int] and similar all-primitive
-blorp_String* blorp_result_to_string_int(void* r) {
-    blorp_Result* res = (blorp_Result*)r;
-    char buf[64];
-    int len;
-    if (res->tag == BLORP_TAG_OK) {
-        len = snprintf(buf, sizeof(buf), "Ok(%ld)", (long)res->data.Ok.field0);
-    } else {
-        len = snprintf(buf, sizeof(buf), "Err(%ld)", (long)res->data.Err.field0);
-    }
-    return blorp_string_from_buf(buf, len);
-}
-
-// Result[T, String] where Ok is Int, Err is String
-blorp_String* blorp_result_to_string_int_string(void* r) {
-    blorp_Result* res = (blorp_Result*)r;
-    if (res->tag == BLORP_TAG_OK) {
-        char buf[64];
-        int len = snprintf(buf, sizeof(buf), "Ok(%ld)", (long)res->data.Ok.field0);
-        return blorp_string_from_buf(buf, len);
-    } else {
-        return blorp_result_fmt_string("Err(", (blorp_String*)res->data.Err.field0);
-    }
-}
-
-// Result[String, T] where Ok is String, Err is Int
-blorp_String* blorp_result_to_string_string_int(void* r) {
-    blorp_Result* res = (blorp_Result*)r;
-    if (res->tag == BLORP_TAG_OK) {
-        return blorp_result_fmt_string("Ok(", (blorp_String*)res->data.Ok.field0);
-    } else {
-        char buf[64];
-        int len = snprintf(buf, sizeof(buf), "Err(%ld)", (long)res->data.Err.field0);
-        return blorp_string_from_buf(buf, len);
-    }
-}
-
-// Result[String, String]
-blorp_String* blorp_result_to_string_string_string(void* r) {
-    blorp_Result* res = (blorp_Result*)r;
-    if (res->tag == BLORP_TAG_OK) {
-        return blorp_result_fmt_string("Ok(", (blorp_String*)res->data.Ok.field0);
-    } else {
-        return blorp_result_fmt_string("Err(", (blorp_String*)res->data.Err.field0);
-    }
-}
-
 // (removed blorp_list_get_opt — now IR intrinsic)
 
 // Bounds-checked string character access returning stack Option[Char]
@@ -10106,83 +9864,6 @@ blorp_Vector* blorp_vector_cow_unique(blorp_Vector* arr) {
     blorp_Vector* copy = blorp_vector_copy(arr);
     blorp_release((blorp_Object*)arr);
     return copy;
-}
-
-// Parse a JSON float array directly from a raw JSON string.
-// Searches for "field_name": [...] and extracts floats into a Vector.
-// Bypasses the recursive parser combinator for large arrays (>1000 elements).
-blorp_Vector* blorp_parse_json_float_array(const char* json, const char* field_name) {
-    if (!json || !field_name) return blorp_vector_new(0);
-    char needle[256];
-    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", field_name);
-    if (nlen < 0 || nlen >= (int)sizeof(needle)) return blorp_vector_new(0);
-    char* pos = strstr(json, needle);
-    if (!pos) return blorp_vector_new(0);
-    pos += nlen;
-    while (*pos && (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r' || *pos == ':')) pos++;
-    if (*pos != '[') return blorp_vector_new(0);
-    pos++;
-    // Count elements
-    long count = 0;
-    { char* scan = pos; int depth = 0;
-      while (*scan && !(*scan == ']' && depth == 0)) {
-          if (*scan == '[') depth++;
-          else if (*scan == ']') depth--;
-          else if (*scan == ',' && depth == 0) count++;
-          scan++;
-      }
-      if (*scan == ']' && scan > pos) count++;
-    }
-    if (count == 0) return blorp_vector_new_f64(0);
-    blorp_Vector* result = blorp_vector_new_f64(count);
-    long idx = 0;
-    char* end = pos;
-    while (idx < count && *end) {
-        while (*end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end++;
-        if (*end == ']') break;
-        double val = strtod(end, &end);
-        blorp_vector_write_f64(result, idx, val);
-        idx++;
-        while (*end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r' || *end == ',')) end++;
-    }
-    return result;
-}
-
-// Strip a large JSON array field, replacing its contents with [].
-// Used to pre-process NAM files so the blorp JSON parser doesn't overflow.
-// Returns a malloc'd C string (caller frees via blorp_string_create wrapping).
-char* blorp_json_strip_array(const char* json, const char* field_name) {
-    if (!json || !field_name) return strdup("");
-    char needle[256];
-    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", field_name);
-    if (nlen < 0 || nlen >= (int)sizeof(needle)) return strdup(json);
-    char* pos = strstr(json, needle);
-    if (!pos) return strdup(json);
-    pos += nlen;
-    while (*pos && (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r' || *pos == ':')) pos++;
-    if (*pos != '[') return strdup(json);
-    const char* array_start = pos;
-    // Find matching ]
-    int depth = 1;
-    pos++;
-    while (*pos && depth > 0) {
-        if (*pos == '[') depth++;
-        else if (*pos == ']') depth--;
-        pos++;
-    }
-    const char* array_end = pos;
-    long json_len = (long)strlen(json);
-    long before_len = array_start - json;
-    long after_len = json_len - (array_end - json);
-    // Build: before + "[]" + after
-    long new_len = before_len + 2 + after_len;
-    char* result = (char*)malloc(new_len + 1);
-    memcpy(result, json, before_len);
-    result[before_len] = '[';
-    result[before_len + 1] = ']';
-    memcpy(result + before_len + 2, array_end, after_len);
-    result[new_len] = '\0';
-    return result;
 }
 
 // Forward declaration of blorp_Option (defined in List section)
@@ -13503,23 +13184,6 @@ blorp_TcpStreamResult blorp_tcp_connect_name_raw(
     long port
 ) {
     return blorp_tcp_connect_raw(name, port);
-}
-
-static bool blorp_tcp_host_string_is_numeric(
-    const blorp_String* host,
-    int family
-) {
-    if (!blorp_tcp_host_value_is_valid(host) || host->len <= 0) return false;
-    if (blorp_string_contains_nul(host)) return false;
-    char host_buf[256];
-    memcpy(host_buf, host->data, (size_t)host->len);
-    host_buf[host->len] = '\0';
-    return blorp_tcp_host_is_numeric(host_buf, family);
-}
-
-static bool blorp_tcp_listener_host_avoids_dns(const blorp_String* host) {
-    return blorp_tcp_host_value_is_valid(host) &&
-           (host->len == 0 || blorp_tcp_host_string_is_numeric(host, AF_INET));
 }
 
 static blorp_String* blorp_tcp_steal_boxed_result_payload(blorp_Result* result) {
@@ -23569,14 +23233,6 @@ static void blorp_io_deadline_queue_remove(blorp_IoWaiter* waiter) {
     blorp_io_deadline_entry_release(&removed);
 }
 
-static long blorp_io_deadline_queue_count(void) {
-    blorp_io_deadline_queue_ensure_init();
-    pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
-    long count = (long)__blorp_io_deadline_queue.len;
-    pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
-    return count;
-}
-
 static uint64_t blorp_io_deadline_queue_drain(void) {
     blorp_io_deadline_queue_ensure_init();
     uint64_t now_ns = blorp_monotonic_now_ns();
@@ -24500,40 +24156,6 @@ static void __blorp_task_join_waiter_wake(
         return;
     }
     blorp_fiber_wake(waiter->wait.fiber, cause, "task complete");
-}
-
-static void __blorp_task_wait_completed(blorp_Task* task) {
-    blorp_Fiber* self = __blorp_current_fiber;
-    pthread_mutex_lock(&task->mutex);
-    while (!task->completed) {
-        if (self) {
-            blorp_TaskJoinWaiter waiter;
-            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
-                self, BLORP_WAIT_OWNER_TASK_JOIN, "task wait begin");
-            __blorp_task_join_waiter_init(&waiter, wait);
-            blorp_fiber_prepare_wait_to_park(
-                wait, "task wait ready to park");
-            __blorp_task_join_waiter_install_locked(
-                task, &waiter, "task wait begin");
-            pthread_mutex_unlock(&task->mutex);
-            blorp_fiber_park(wait);
-            pthread_mutex_lock(&task->mutex);
-            __blorp_task_join_waiter_remove_locked(task, &waiter);
-            if (!task->completed && __blorp_is_cancelled()) {
-                pthread_mutex_unlock(&task->mutex);
-                (void)__blorp_cancel_current_task_if_requested();
-                return;
-            }
-        } else {
-            pthread_cond_wait(&task->done_cond, &task->mutex);
-            if (!task->completed && __blorp_is_cancelled()) {
-                pthread_mutex_unlock(&task->mutex);
-                (void)__blorp_cancel_current_task_if_requested();
-                return;
-            }
-        }
-    }
-    pthread_mutex_unlock(&task->mutex);
 }
 
 static void __blorp_task_wait_completed_uncancellable(blorp_Task* task) {

@@ -1145,12 +1145,6 @@ static inline void* blorp_box_struct(void* data, size_t size) {
 // Safe Arithmetic
 blorp_StackOption_Int blorp_option_div_int(long a, long b);
 blorp_StackOption_Int blorp_option_mod_int(long a, long b);
-long blorp_checked_div_int(long a, long b);
-long blorp_checked_mod_int(long a, long b);
-
-// Unsafe Arithmetic
-long blorp_unsafe_div_int(long a, long b);
-long blorp_unsafe_mod_int(long a, long b);
 
 // String Operations
 blorp_String* blorp_string_literal(const char* cstr);
@@ -1171,8 +1165,6 @@ blorp_String* blorp_string_with_capacity(long cap);
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other);
 blorp_String* blorp_string_append_int(blorp_String* s, long value);
 blorp_String* blorp_string_copy_ffi(blorp_String* src);
-blorp_Vector* blorp_parse_json_float_array(const char* json, const char* field_name);
-char* blorp_json_strip_array(const char* json, const char* field_name);
 
 // I/O
 void blorp_print(blorp_String* s);
@@ -1710,7 +1702,6 @@ void blorp_udp_close_socket(blorp_UdpSocket* socket);
 
 int blorp_io_reactor_start(void);
 void blorp_io_reactor_shutdown(void);
-int blorp_io_reactor_smoke_test(void);
 
 // Dict
 blorp_Dict* blorp_dict_new(void);
@@ -2397,11 +2388,6 @@ long blorp_option_eq(void* a, void* b);
 long blorp_option_eq_string(void* a, void* b);
 long blorp_option_eq_float(void* a, void* b);
 
-// Result equality (called by codegen for == on Result types)
-long blorp_result_eq(void* a, void* b);
-long blorp_result_eq_string(void* a, void* b);
-long blorp_result_eq_float(void* a, void* b);
-
 // Collection equality — consuming (releases both args after comparison)
 long blorp_list_eq(void* a, void* b);
 long blorp_list_eq_string(void* a, void* b);
@@ -2410,12 +2396,6 @@ long blorp_dict_eq(void* a, void* b);
 long blorp_dict_eq_string_value(void* a, void* b);
 long blorp_dict_eq_float_value(void* a, void* b);
 long blorp_set_eq(void* a, void* b);
-
-// Result to_string helpers (called by codegen for string interpolation/to_string)
-blorp_String* blorp_result_to_string_int(void* r);
-blorp_String* blorp_result_to_string_int_string(void* r);
-blorp_String* blorp_result_to_string_string_int(void* r);
-blorp_String* blorp_result_to_string_string_string(void* r);
 
 // Tuple destructor (needed by blorp_tuple_set_rc inline)
 void blorp_tuple_destructor(void* obj);

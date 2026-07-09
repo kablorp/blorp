@@ -21,49 +21,50 @@ func main(args: List[String]) -> Int:
 	0
 BRP
 
-cat > "$TMP_HARNESS/blorp" <<'SH'
+write_fake_blorp() {
+	local fake_check_log="$1"
+	cat > "$TMP_HARNESS/blorp" <<SH
 #!/usr/bin/env bash
 set -u
 
-if [ "${1:-}" = "check" ]; then
-	if [ -n "${BLORP_FAKE_CHECK_LOG:-}" ]; then
-		echo "$*" >> "$BLORP_FAKE_CHECK_LOG"
-	fi
+if [ "\${1:-}" = "check" ]; then
+	echo "\$*" >> "$fake_check_log"
 	exit 0
 fi
 
-if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
-	prepare_dir="${2:-}"
-	if [ -z "$prepare_dir" ]; then
+if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
+	prepare_dir="\${2:-}"
+	if [ -z "\$prepare_dir" ]; then
 		echo "missing prepare directory" >&2
 		exit 2
 	fi
-	mkdir -p "$prepare_dir"
-	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=$prepare_dir/compiler_renderer_bridge.bin"
-	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=$prepare_dir/compiler_parser_bridge.bin"
-	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=$prepare_dir/compiler_typecheck_bridge.bin"
+	mkdir -p "\$prepare_dir"
+	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=\$prepare_dir/compiler_renderer_bridge.bin"
+	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
+	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=\$prepare_dir/compiler_typecheck_bridge.bin"
 	exit 0
 fi
 
-if [ "${1:-}" = "test" ]; then
+if [ "\${1:-}" = "test" ]; then
 	echo "Results: 1 passed, 0 failed (1 tests)"
-	if [ -n "${BLORP_GATE_RESULT:-}" ]; then
-		echo "BLORP_GATE_RESULT gate=$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
+	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
+		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
 	fi
 	exit 1
 fi
 
-echo "unexpected fake blorp command: $*" >&2
+echo "unexpected fake blorp command: \$*" >&2
 exit 2
 SH
-chmod +x "$TMP_HARNESS/blorp"
+	chmod +x "$TMP_HARNESS/blorp"
+}
 
 output_file="$TMP_HARNESS/output.txt"
 check_log="$TMP_HARNESS/check-log.txt"
+write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_FAKE_CHECK_LOG="$check_log" \
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
@@ -107,10 +108,10 @@ fi
 
 std_check_output_file="$TMP_HARNESS/std-check-output.txt"
 std_check_log="$TMP_HARNESS/std-check-log.txt"
+write_fake_blorp "$std_check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_FAKE_CHECK_LOG="$std_check_log" \
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
@@ -179,15 +180,36 @@ mkdir -p "$TMP_HARNESS/compiler" "$TMP_HARNESS/bin"
 
 cat > "$TMP_HARNESS/bin/dune" <<'SH'
 #!/usr/bin/env bash
-if [ "${BLORP_COMPILER_UNIT_TIMINGS:-}" != "1" ]; then
-	echo "missing compiler unit timing env" >&2
+scope=""
+timings=false
+timing_run_id=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--scope=*)
+			scope="${1#--scope=}"
+			;;
+		--timings)
+			timings=true
+			;;
+		--timing-run-id=*)
+			timing_run_id="${1#--timing-run-id=}"
+			;;
+	esac
+	shift
+done
+if [ "$scope" != "default" ]; then
+	echo "missing compiler unit scope arg" >&2
 	exit 3
 fi
-if [ -z "${BLORP_COMPILER_UNIT_TIMING_RUN_ID:-}" ]; then
-	echo "missing compiler unit timing run id" >&2
+if [ "$timings" != "true" ]; then
+	echo "missing compiler unit timing arg" >&2
 	exit 3
 fi
-printf 'BLORP_COMPILER_UNIT_TIMING\t%s\tdefault\tSlowSuite.group\tcase one\t1.234000\n' "$BLORP_COMPILER_UNIT_TIMING_RUN_ID"
+if [ -z "$timing_run_id" ]; then
+	echo "missing compiler unit timing run id arg" >&2
+	exit 3
+fi
+printf 'BLORP_COMPILER_UNIT_TIMING\t%s\tdefault\tSlowSuite.group\tcase one\t1.234000\n' "$timing_run_id"
 echo "Test Successful in 0.001s. 1 tests run."
 exit 0
 SH
@@ -203,7 +225,7 @@ timing_output_file="$TMP_HARNESS/unit-timing-output.txt"
 timing_status=$?
 
 if [ "$timing_status" -ne 0 ]; then
-	echo "FAIL: scripts/test compiler-unit --timings should pass through timing env"
+	echo "FAIL: scripts/test compiler-unit --timings should pass through timing args"
 	cat "$timing_output_file"
 	exit 1
 fi

@@ -5,19 +5,25 @@ type scope = Default | Deep | All
 let timing_line_prefix = "BLORP_COMPILER_UNIT_TIMING"
 let default_timing_run_id = "-"
 
+type runner_config = {
+  scope : scope;
+  timings_enabled : bool;
+  timing_run_id : string;
+}
+
 let scope_name = function
   | Default -> "default"
   | Deep -> "deep"
   | All -> "all"
 
-let env_truthy = function
-  | "1" | "true" | "TRUE" | "yes" | "YES" -> true
-  | _ -> false
-
-let timings_enabled () =
-  match Sys.getenv_opt "BLORP_COMPILER_UNIT_TIMINGS" with
-  | Some value -> env_truthy value
-  | None -> false
+let parse_scope = function
+  | "default" -> Ok Default
+  | "deep" -> Ok Deep
+  | "all" -> Ok All
+  | value ->
+      Error
+        ("unknown compiler-unit scope `" ^ value
+       ^ "` (expected default, deep, or all)")
 
 let timing_field text =
   String.map
@@ -26,10 +32,33 @@ let timing_field text =
       | ch -> ch)
     text
 
-let timing_run_id () =
-  match Sys.getenv_opt "BLORP_COMPILER_UNIT_TIMING_RUN_ID" with
-  | Some value when value <> "" -> timing_field value
-  | _ -> default_timing_run_id
+let default_runner_config =
+  { scope = Default; timings_enabled = false; timing_run_id = default_timing_run_id }
+
+let parse_runner_args argv =
+  let rec loop index config alcotest_args =
+    if index >= Array.length argv then
+      Ok (config, Array.of_list (List.rev alcotest_args))
+    else
+      let arg = argv.(index) in
+      if arg = "--timings" then
+        loop (index + 1) { config with timings_enabled = true } alcotest_args
+      else if String.starts_with ~prefix:"--scope=" arg then
+        let value = String.sub arg 8 (String.length arg - 8) in
+        match parse_scope value with
+        | Ok scope -> loop (index + 1) { config with scope } alcotest_args
+        | Error message -> Error message
+      else if String.starts_with ~prefix:"--timing-run-id=" arg then
+        let value = String.sub arg 16 (String.length arg - 16) in
+        loop (index + 1)
+          { config with timing_run_id = timing_field value }
+          alcotest_args
+      else loop (index + 1) config (arg :: alcotest_args)
+  in
+  let executable =
+    if Array.length argv = 0 then "run_tests.exe" else argv.(0)
+  in
+  loop 1 default_runner_config [ executable ]
 
 let suite_group prefix suite =
   List.map (fun (name, cases) -> (prefix ^ "." ^ name, cases)) suite
@@ -126,43 +155,38 @@ let deep_suites =
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite
   @ suite_group "CompilerBlorpBridge" Test_compiler_blorp_bridge.suite
 
-let scope_from_env () =
-  match Sys.getenv_opt "BLORP_COMPILER_UNIT_SCOPE" with
-  | None | Some "" | Some "default" -> Default
-  | Some "deep" -> Deep
-  | Some "all" -> All
-  | Some value ->
-      prerr_endline
-        ("Unknown BLORP_COMPILER_UNIT_SCOPE=" ^ value
-       ^ " (expected default, deep, or all)");
-      exit 2
-
 let suites_for_scope = function
   | Default -> default_suites
   | Deep -> deep_suites
   | All -> default_suites @ deep_suites
 
-let timed_case ~scope ~suite_name (case_name, speed, run) =
+let timed_case config ~scope ~suite_name (case_name, speed, run) =
   let timed_run input =
     let started = Unix.gettimeofday () in
     Fun.protect
       ~finally:(fun () ->
         let elapsed = Unix.gettimeofday () -. started in
         Printf.printf "%s\t%s\t%s\t%s\t%s\t%.6f\n%!" timing_line_prefix
-          (timing_run_id ()) (scope_name scope) (timing_field suite_name)
+          config.timing_run_id (scope_name scope) (timing_field suite_name)
           (timing_field case_name) elapsed)
       (fun () -> run input)
   in
   (case_name, speed, timed_run)
 
-let maybe_time_suites scope suites =
-  if not (timings_enabled ()) then suites
+let maybe_time_suites config scope suites =
+  if not config.timings_enabled then suites
   else
     List.map
       (fun (suite_name, cases) ->
-        (suite_name, List.map (timed_case ~scope ~suite_name) cases))
+        (suite_name, List.map (timed_case config ~scope ~suite_name) cases))
       suites
 
 let () =
-  let scope = scope_from_env () in
-  Alcotest.run "blorp" (suites_for_scope scope |> maybe_time_suites scope)
+  match parse_runner_args Sys.argv with
+  | Error message ->
+      prerr_endline ("Error: " ^ message);
+      exit 2
+  | Ok (config, alcotest_argv) ->
+      Alcotest.run ~argv:alcotest_argv "blorp"
+        (suites_for_scope config.scope
+        |> maybe_time_suites config config.scope)

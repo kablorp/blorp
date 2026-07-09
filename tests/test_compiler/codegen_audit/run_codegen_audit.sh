@@ -6,13 +6,60 @@
 #   3. Any EXPECT: comments must be satisfied
 
 set -eu
-BLORP="${1:-./blorp}"
+BLORP="./blorp"
+blorp_bin_set=false
+NJOBS=""
 PASS=0
 FAIL=0
 DIR="$(dirname "$0")"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd -P)"
 RUNTIME_DECL="$REPO_ROOT/compiler/lib/runtime_decl.c"
 TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
+
+usage() {
+    cat <<'EOF'
+Usage: tests/test_compiler/codegen_audit/run_codegen_audit.sh [BLORP_BIN] [--jobs N]
+
+Options:
+  --jobs N, -j N   Number of audit workers. Defaults to detected CPU count.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --jobs|-j)
+            if [ $# -lt 2 ]; then
+                echo "FAIL: --jobs requires a worker count"
+                echo ""
+                echo "Results: 0 passed, 1 failed"
+                exit 1
+            fi
+            NJOBS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "FAIL: unknown codegen audit option: $1"
+            echo ""
+            echo "Results: 0 passed, 1 failed"
+            exit 1
+            ;;
+        *)
+            if $blorp_bin_set; then
+                echo "FAIL: multiple blorp binaries supplied"
+                echo ""
+                echo "Results: 0 passed, 1 failed"
+                exit 1
+            fi
+            BLORP="$1"
+            blorp_bin_set=true
+            shift
+            ;;
+    esac
+done
 
 case "$TEST_TIMEOUT" in
     ''|*[!0-9]*)
@@ -23,10 +70,8 @@ case "$TEST_TIMEOUT" in
         ;;
 esac
 
-if [ -n "${BLORP_CODEGEN_AUDIT_JOBS:-}" ]; then
-    NJOBS="$BLORP_CODEGEN_AUDIT_JOBS"
-elif [ -n "${BLORP_TEST_JOBS:-}" ]; then
-    NJOBS="$BLORP_TEST_JOBS"
+if [ -n "$NJOBS" ]; then
+    :
 elif command -v sysctl >/dev/null 2>&1; then
     NJOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 elif command -v nproc >/dev/null 2>&1; then
@@ -37,13 +82,13 @@ fi
 
 case "$NJOBS" in
     ''|*[!0-9]*)
-        echo "FAIL: invalid BLORP_CODEGEN_AUDIT_JOBS/BLORP_TEST_JOBS (must be a positive integer)"
+        echo "FAIL: invalid --jobs value (must be a positive integer)"
         echo ""
         echo "Results: 0 passed, 1 failed"
         exit 1
         ;;
     0)
-        echo "FAIL: invalid BLORP_CODEGEN_AUDIT_JOBS/BLORP_TEST_JOBS (must be a positive integer)"
+        echo "FAIL: invalid --jobs value (must be a positive integer)"
         echo ""
         echo "Results: 0 passed, 1 failed"
         exit 1

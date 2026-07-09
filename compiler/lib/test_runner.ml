@@ -223,9 +223,7 @@ let with_run_artifacts f =
       Fun.protect
         ~finally:(fun () ->
           current_run_artifacts := None;
-          if Sys.getenv_opt "BLORP_KEEP_ARTIFACTS" <> Some "1" then
-            remove_tree artifacts.root
-          else Printf.eprintf "Keeping blorp artifacts in %s\n%!" artifacts.root)
+          remove_tree artifacts.root)
         f
 
 let run_artifact_path ~kind ~prefix ~suffix =
@@ -2194,12 +2192,6 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
     if generated_suite_wrapper then generate_test_wrapper ~leak_check raw_source
     else raw_source
   in
-  (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
-  | Some path ->
-      let oc = open_out path in
-      output_string oc source;
-      close_out oc
-  | None -> ());
 
   let source_dir =
     Option.value module_base_dir ~default:(extract_directory filename)
@@ -2248,12 +2240,6 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
       (* Unreachable: test_runner never supplies ~on_stage. *)
       assert false
   | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-      (match Sys.getenv_opt "BLORP_DUMP_C" with
-      | Some path ->
-          let oc = open_out path in
-          output_string oc c_code;
-          close_out oc
-      | None -> ());
       let compilation_dir = run_compilation_dir () in
       let bin_file = Filename.concat compilation_dir "program.bin" in
 
@@ -2513,12 +2499,6 @@ let print_test_start ?worker file =
 
 let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?precompiled ~harness_label ~filename_base source =
-  (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
-  | Some path ->
-      let oc = open_out path in
-      output_string oc source;
-      close_out oc
-  | None -> ());
   Modules.full_reset ();
   let cwd = Sys.getcwd () in
   init_module_paths cwd;
@@ -2532,12 +2512,6 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
       Error (format_pipeline_errors ~file:("<" ^ harness_label ^ ">") errors)
   | Ok (Pipeline.Stopped_at _) -> assert false
   | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-      (match Sys.getenv_opt "BLORP_DUMP_C" with
-      | Some path ->
-          let oc = open_out path in
-          output_string oc c_code;
-          close_out oc
-      | None -> ());
       let compilation_dir = run_compilation_dir () in
       let bin_file = Filename.concat compilation_dir "program.bin" in
       let cc_args =

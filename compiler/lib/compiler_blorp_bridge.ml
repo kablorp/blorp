@@ -72,12 +72,6 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
-type typecheck_source_batch_response = {
-  batch_typechecked_path : string;
-  batch_typechecked_module_name : string;
-  batch_typechecked_response : typechecked_source;
-}
-
 type cli_frontend_command =
   | CliFrontendCheck
   | CliFrontendCompile
@@ -666,27 +660,6 @@ let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
          ("payload", Lsp_json.Object payload_fields);
        ])
 
-let typecheck_sources_request_json_with_imports_policy ~resolved_imports
-    ~allow_debug_only_calls ~include_comments ~import_modules ~sources =
-  let payload_fields =
-    [
-      ("include_comments", Lsp_json.Bool include_comments);
-      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
-      ( "sources",
-        Lsp_json.Array (List.map typecheck_import_module_json sources) );
-    ]
-    @ typecheck_import_modules_field import_modules
-    @ typecheck_resolved_imports_field resolved_imports
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "typecheck_sources");
-         ("payload", Lsp_json.Object payload_fields);
-       ])
-
 let cli_run_request_json ?version args =
   let version_fields =
     match version with
@@ -1166,35 +1139,6 @@ let typecheck_source_response_field response =
 
 let typecheck_source_response_json response_json =
   response_result response_json typecheck_source_response_field
-
-let typecheck_source_batch_item_response = function
-  | Lsp_json.Object _ as item ->
-      let* path = string_response_field "path" item in
-      let* module_name = string_response_field "module" item in
-      let* typechecked_response =
-        match typechecked_source_artifact_field item with
-        | Ok _ as ok -> ok
-        | Error (code, message) ->
-            Error
-              ( code,
-                Printf.sprintf "typecheck_sources item %s (%s): %s" module_name
-                  path message )
-      in
-      Ok
-        {
-          batch_typechecked_path = path;
-          batch_typechecked_module_name = module_name;
-          batch_typechecked_response = typechecked_response;
-        }
-  | _ -> Error ("invalid_response", "typecheck_sources items must be JSON objects")
-
-let typecheck_sources_response_field response =
-  let* artifact = json_response_field "artifact" response in
-  array_response_field_map "sources" typecheck_source_batch_item_response
-    artifact
-
-let typecheck_sources_response_json response_json =
-  response_result response_json typecheck_sources_response_field
 
 let cli_frontend_command_of_string = function
   | "check" -> Ok CliFrontendCheck
@@ -2942,20 +2886,11 @@ let run_request_via_blorp_binary bridge_binary request_json =
               ~exit_code;
           if exit_code = 0 then output
           else
-            let kept_request =
-              match Sys.getenv_opt "BLORP_KEEP_FAILED_BRIDGE_REQUEST" with
-              | Some "1" ->
-                  let kept_path = request_path ^ ".failed" in
-                  write_file kept_path request_json;
-                  "\nkept request: " ^ kept_path
-              | _ -> ""
-            in
             error_response "bridge_command_failed"
               (Printf.sprintf
-                 "Blorp renderer bridge command exited %d: %s%s\nrequest: %s"
+                 "Blorp renderer bridge command exited %d: %s\nrequest: %s"
                  exit_code
                  (String.trim (output ^ stderr_output))
-                 kept_request
                  (bridge_error_excerpt request_json)))
 
 let run_renderer_request_via_blorp request_json =
@@ -3056,15 +2991,6 @@ let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
          ~path ~module_name ~text)
   in
   typecheck_source_response_json response_json
-
-let typecheck_sources_via_command_with_imports_policy ~resolved_imports
-    ~allow_debug_only_calls ~include_comments ~import_modules ~sources =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_sources_request_json_with_imports_policy ~resolved_imports
-         ~allow_debug_only_calls ~include_comments ~import_modules ~sources)
-  in
-  typecheck_sources_response_json response_json
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json

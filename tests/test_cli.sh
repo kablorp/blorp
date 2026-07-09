@@ -7,15 +7,19 @@ cd "$(dirname "$0")/.."
 
 usage() {
     cat <<'EOF'
-Usage: tests/test_cli.sh [--all|--smoke]
+Usage: tests/test_cli.sh [--all|--smoke] [--timeout SECONDS] [--gate-name NAME]
 
 Options:
-  --all     Run the full CLI integration set, including package lifecycle and formatter tool checks.
-  --smoke   Run public command-surface smoke checks only.
+  --all                Run the full CLI integration set, including package lifecycle and formatter tool checks.
+  --smoke              Run public command-surface smoke checks only.
+  --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or 60.
+  --gate-name NAME     Gate name emitted in the BLORP_GATE_RESULT summary.
 EOF
 }
 
 CLI_MODE="all"
+CLI_GATE_NAME="cli"
+CLI_TIMEOUT="${BLORP_TEST_TIMEOUT:-60}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --all)
@@ -25,6 +29,24 @@ while [ $# -gt 0 ]; do
         --smoke)
             CLI_MODE="smoke"
             shift
+            ;;
+        --timeout)
+            if [ $# -lt 2 ]; then
+                echo "Missing value for --timeout" >&2
+                usage >&2
+                exit 1
+            fi
+            CLI_TIMEOUT="$2"
+            shift 2
+            ;;
+        --gate-name)
+            if [ $# -lt 2 ]; then
+                echo "Missing value for --gate-name" >&2
+                usage >&2
+                exit 1
+            fi
+            CLI_GATE_NAME="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -44,7 +66,6 @@ if [[ "$BLORP_BIN" = /* ]]; then
 else
     BLORP_BIN_ABS="$PWD/${BLORP_BIN#./}"
 fi
-CLI_GATE_NAME="${BLORP_CLI_GATE_NAME:-cli}"
 # Smoke mode is the default local-loop shape used by scripts/test. The full
 # mode keeps package cache/vendor workflows and self-hosted formatter checks
 # available for premerge, where broader process/compiler integration is useful
@@ -53,9 +74,6 @@ run_deep_checks=true
 if [ "$CLI_MODE" = "smoke" ]; then
     run_deep_checks=false
 fi
-# Cold self-hosted formatter startup may need to compile the embedded Blorp
-# formatter before the format checks can run.
-CLI_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"
 TMPDIR_CLI=$(mktemp -d "${TMPDIR:-/tmp}/blorp_cli.XXXXXX") || exit 1
 PASS=0
 FAIL=0
@@ -66,7 +84,7 @@ CHILD_PIDS=()
 
 case "$CLI_TIMEOUT" in
     ''|*[!0-9]*)
-        echo "Error: BLORP_CLI_TEST_TIMEOUT must be a non-negative integer." >&2
+        echo "Error: --timeout must be a non-negative integer." >&2
         exit 1
         ;;
 esac

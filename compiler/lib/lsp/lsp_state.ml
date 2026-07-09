@@ -132,14 +132,9 @@ let timed f =
 
 let slow_analysis_log_threshold_ms = 100.0
 
-let lsp_profile_enabled () =
-  match Sys.getenv_opt "BLORP_LSP_PROFILE" with
-  | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
-  | _ -> false
-
 let log_analysis_timing ~path ~reset_ms ~parse_ms ~load_ms ~module_check_ms
     ~typecheck_ms ~prune_ms ~total_ms =
-  if total_ms >= slow_analysis_log_threshold_ms || lsp_profile_enabled () then
+  if total_ms >= slow_analysis_log_threshold_ms then
     Printf.eprintf
       "[blorp-lsp] analyze path=%s reset=%.1fms parse=%.1fms load=%.1fms \
        module_check=%.1fms typecheck=%.1fms prune=%.1fms total=%.1fms\n\

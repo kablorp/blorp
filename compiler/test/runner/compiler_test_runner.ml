@@ -910,30 +910,24 @@ let timeout_from_env () =
       | Ok (Some timeout) -> Ok (Some timeout)
       | Ok None -> Ok (Some 30))
 
-let jobs_from_env () =
-  match Sys.getenv_opt "BLORP_TEST_JOBS" with
-  | Some value -> (
-      match int_of_string_opt value with
-      | Some n when n > 0 -> Ok n
-      | _ -> Error "Error: BLORP_TEST_JOBS must be a positive integer.")
-  | None ->
-      let sysctl_code, sysctl_output =
-        Test_runner.run_process_capture_timeout ~timeout:(Some 2) "sysctl"
-          [ "-n"; "hw.ncpu" ]
-      in
-      if sysctl_code = 0 then
-        match int_of_string_opt (String.trim sysctl_output) with
-        | Some n when n > 0 -> Ok n
-        | _ -> Ok 4
-      else
-        let nproc_code, nproc_output =
-          Test_runner.run_process_capture_timeout ~timeout:(Some 2) "nproc" []
-        in
-        if nproc_code = 0 then
-          match int_of_string_opt (String.trim nproc_output) with
-          | Some n when n > 0 -> Ok n
-          | _ -> Ok 4
-        else Ok 4
+let default_jobs () =
+  let sysctl_code, sysctl_output =
+    Test_runner.run_process_capture_timeout ~timeout:(Some 2) "sysctl"
+      [ "-n"; "hw.ncpu" ]
+  in
+  if sysctl_code = 0 then
+    match int_of_string_opt (String.trim sysctl_output) with
+    | Some n when n > 0 -> n
+    | _ -> 4
+  else
+    let nproc_code, nproc_output =
+      Test_runner.run_process_capture_timeout ~timeout:(Some 2) "nproc" []
+    in
+    if nproc_code = 0 then
+      match int_of_string_opt (String.trim nproc_output) with
+      | Some n when n > 0 -> n
+      | _ -> 4
+    else 4
 
 let usage () =
   print_endline
@@ -974,11 +968,11 @@ let run_cli args =
         usage ();
         1
   in
-  match (timeout_from_env (), jobs_from_env ()) with
-  | Error msg, _ | _, Error msg ->
+  match timeout_from_env () with
+  | Error msg ->
       prerr_endline msg;
       1
-  | Ok timeout, Ok jobs ->
+  | Ok timeout ->
       let opts =
         {
           verbose = false;
@@ -987,7 +981,7 @@ let run_cli args =
           run_codegen_audit = true;
           case_selection = AllCases;
           gate_name = "compiler";
-          jobs;
+          jobs = default_jobs ();
         }
       in
       loop opts args
