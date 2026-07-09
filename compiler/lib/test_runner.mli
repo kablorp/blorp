@@ -83,8 +83,7 @@ val run_process_capture_timeout :
 
 val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
-    Nested calls reuse the current root. The root is deleted on normal exit
-    unless BLORP_KEEP_ARTIFACTS=1 is set. *)
+    Nested calls reuse the current root. The root is deleted on normal exit. *)
 
 val current_run_artifact_root : unit -> string
 (** Current run artifact root, creating one if needed. Exposed for tests and

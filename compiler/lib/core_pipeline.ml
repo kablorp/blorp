@@ -362,7 +362,7 @@ let compile_typed_with_modules ?(main_import_bindings = [])
                     m.name msg)
             (Typed_ast.program_decls typed_program)
         in
-        Core_flatten.prefix_module_names ~debug m.name core_decls)
+        Core_flatten.prefix_module_names m.name core_decls)
       modules
   in
   let main_core =

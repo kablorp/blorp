@@ -2942,20 +2942,11 @@ let run_request_via_blorp_binary bridge_binary request_json =
               ~exit_code;
           if exit_code = 0 then output
           else
-            let kept_request =
-              match Sys.getenv_opt "BLORP_KEEP_FAILED_BRIDGE_REQUEST" with
-              | Some "1" ->
-                  let kept_path = request_path ^ ".failed" in
-                  write_file kept_path request_json;
-                  "\nkept request: " ^ kept_path
-              | _ -> ""
-            in
             error_response "bridge_command_failed"
               (Printf.sprintf
-                 "Blorp renderer bridge command exited %d: %s%s\nrequest: %s"
+                 "Blorp renderer bridge command exited %d: %s\nrequest: %s"
                  exit_code
                  (String.trim (output ^ stderr_output))
-                 kept_request
                  (bridge_error_excerpt request_json)))
 
 let run_renderer_request_via_blorp request_json =

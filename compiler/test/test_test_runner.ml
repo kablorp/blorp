@@ -610,43 +610,42 @@ let test_precompile_runtime_reuses_verified_cache () =
       write_file fake_cc
         (Printf.sprintf
            {|#!/bin/sh
-for arg in "$@"; do
-    if [ "$arg" = "-c" ]; then
-        echo compile >> "$BLORP_FAKE_CC_LOG"
-        break
-    fi
-done
-exec %s "$@"
-|}
-           (shell_quote real_cc));
-      Unix.chmod fake_cc 0o755;
-      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
-      with_env "HOME" home (fun () ->
-          with_env "BLORP_FAKE_CC_LOG" log_path (fun () ->
-              with_env "PATH"
-                (fake_bin ^ ":" ^ old_path)
-                (fun () ->
-                  Blorp.Test_runner.with_run_artifacts (fun () ->
-                      let first =
-                        Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-                      in
-                      let second =
-                        Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-                      in
-                      let compile_count =
-                        if Sys.file_exists log_path then
-                          read_whole_file log_path |> String.split_on_char '\n'
-                          |> List.filter (fun line -> String.trim line <> "")
-                          |> List.length
-                        else 0
-                      in
-                      match (first, second) with
-                      | Some a, Some b ->
-                          Alcotest.(check string)
-                            "same runtime object" a.runtime_obj b.runtime_obj;
-                          Alcotest.(check int)
-                            "runtime compiled once" 1 compile_count
-                      | _ -> Alcotest.fail "runtime precompile failed")))))
+	for arg in "$@"; do
+	    if [ "$arg" = "-c" ]; then
+	        echo compile >> %s
+	        break
+	    fi
+	done
+	exec %s "$@"
+	|}
+	           (shell_quote log_path) (shell_quote real_cc));
+	      Unix.chmod fake_cc 0o755;
+	      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
+	      with_env "HOME" home (fun () ->
+	          with_env "PATH"
+	            (fake_bin ^ ":" ^ old_path)
+	            (fun () ->
+	              Blorp.Test_runner.with_run_artifacts (fun () ->
+	                  let first =
+	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
+	                  in
+	                  let second =
+	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
+	                  in
+	                  let compile_count =
+	                    if Sys.file_exists log_path then
+	                      read_whole_file log_path |> String.split_on_char '\n'
+	                      |> List.filter (fun line -> String.trim line <> "")
+	                      |> List.length
+	                    else 0
+	                  in
+	                  match (first, second) with
+	                  | Some a, Some b ->
+	                      Alcotest.(check string)
+	                        "same runtime object" a.runtime_obj b.runtime_obj;
+	                      Alcotest.(check int)
+	                        "runtime compiled once" 1 compile_count
+	                  | _ -> Alcotest.fail "runtime precompile failed"))))
 
 let test_precompile_runtime_repairs_incomplete_cache () =
   let real_cc =
@@ -667,54 +666,53 @@ let test_precompile_runtime_repairs_incomplete_cache () =
       write_file fake_cc
         (Printf.sprintf
            {|#!/bin/sh
-for arg in "$@"; do
-    if [ "$arg" = "-c" ]; then
-        echo compile >> "$BLORP_FAKE_CC_LOG"
-        break
-    fi
-done
-exec %s "$@"
-|}
-           (shell_quote real_cc));
-      Unix.chmod fake_cc 0o755;
-      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
-      with_env "HOME" home (fun () ->
-          with_env "BLORP_FAKE_CC_LOG" log_path (fun () ->
-              with_env "PATH"
-                (fake_bin ^ ":" ^ old_path)
-                (fun () ->
-                  Blorp.Test_runner.with_run_artifacts (fun () ->
-                      let first =
-                        Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-                      in
-                      let first_dir =
-                        match first with
-                        | Some p -> Filename.dirname p.runtime_obj
-                        | None -> Alcotest.fail "initial precompile failed"
-                      in
-                      Sys.remove (Filename.concat first_dir "READY");
-                      let repaired =
-                        Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-                      in
-                      let compile_count =
-                        if Sys.file_exists log_path then
-                          read_whole_file log_path |> String.split_on_char '\n'
-                          |> List.filter (fun line -> String.trim line <> "")
-                          |> List.length
-                        else 0
-                      in
-                      match repaired with
-                      | Some p ->
-                          Alcotest.(check bool)
-                            "repaired ready marker" true
-                            (Sys.file_exists
-                               (Filename.concat
-                                  (Filename.dirname p.runtime_obj)
-                                  "READY"));
-                          Alcotest.(check int)
-                            "runtime recompiled after stale cache" 2
-                            compile_count
-                      | None -> Alcotest.fail "repair precompile failed")))))
+	for arg in "$@"; do
+	    if [ "$arg" = "-c" ]; then
+	        echo compile >> %s
+	        break
+	    fi
+	done
+	exec %s "$@"
+	|}
+	           (shell_quote log_path) (shell_quote real_cc));
+	      Unix.chmod fake_cc 0o755;
+	      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
+	      with_env "HOME" home (fun () ->
+	          with_env "PATH"
+	            (fake_bin ^ ":" ^ old_path)
+	            (fun () ->
+	              Blorp.Test_runner.with_run_artifacts (fun () ->
+	                  let first =
+	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
+	                  in
+	                  let first_dir =
+	                    match first with
+	                    | Some p -> Filename.dirname p.runtime_obj
+	                    | None -> Alcotest.fail "initial precompile failed"
+	                  in
+	                  Sys.remove (Filename.concat first_dir "READY");
+	                  let repaired =
+	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
+	                  in
+	                  let compile_count =
+	                    if Sys.file_exists log_path then
+	                      read_whole_file log_path |> String.split_on_char '\n'
+	                      |> List.filter (fun line -> String.trim line <> "")
+	                      |> List.length
+	                    else 0
+	                  in
+	                  match repaired with
+	                  | Some p ->
+	                      Alcotest.(check bool)
+	                        "repaired ready marker" true
+	                        (Sys.file_exists
+	                           (Filename.concat
+	                              (Filename.dirname p.runtime_obj)
+	                              "READY"));
+	                      Alcotest.(check int)
+	                        "runtime recompiled after stale cache" 2
+	                        compile_count
+	                  | None -> Alcotest.fail "repair precompile failed"))))
 
 let test_suite_selector_harness_dispatches_by_index () =
   let source =

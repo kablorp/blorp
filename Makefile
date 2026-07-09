@@ -103,11 +103,11 @@ smoke: all
 
 # Run compiler-internal OCaml/Alcotest tests
 compiler-unit-test: compiler/lib/embedded_std.ml
-	cd compiler && BLORP_COMPILER_UNIT_SCOPE=default dune exec test/run_tests.exe
+	cd compiler && dune exec test/run_tests.exe -- --scope=default
 
 # Run integration-shaped compiler-internal OCaml/Alcotest tests
 compiler-unit-deep-test: compiler/lib/embedded_std.ml
-	cd compiler && BLORP_COMPILER_UNIT_SCOPE=deep dune exec test/run_tests.exe
+	cd compiler && dune exec test/run_tests.exe -- --scope=deep
 
 # Legacy alias for compiler-unit-test
 unit-test: compiler-unit-test
@@ -151,7 +151,7 @@ coverage:
 	rm -rf compiler/_coverage
 	mkdir -p compiler/_coverage
 	cd compiler && dune build --instrument-with bisect_ppx --force test/run_tests.exe
-	cd compiler && BISECT_FILE=$(CURDIR)/compiler/_coverage/bisect ./_build/default/test/run_tests.exe
+	cd compiler && BISECT_FILE=$(CURDIR)/compiler/_coverage/bisect ./_build/default/test/run_tests.exe --scope=default $(RUN_TESTS_ARGS)
 	cd compiler && bisect-ppx-report summary --coverage-path $(CURDIR)/compiler/_coverage
 	cd compiler && bisect-ppx-report html --coverage-path $(CURDIR)/compiler/_coverage
 	@echo "Coverage report: compiler/_coverage/index.html"
