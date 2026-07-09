@@ -568,11 +568,11 @@ let test_parse_source_response_decodes_comments () =
           parsed_module_surface = None;
         }) ->
       Alcotest.(check string)
-        "comment text" "-- note" comment.Parse_comments.cc_text;
-      Alcotest.(check int) "comment line" 2 comment.Parse_comments.cc_line;
-      Alcotest.(check int) "comment column" 3 comment.Parse_comments.cc_col;
+        "comment text" "-- note" comment.Bridge.cc_text;
+      Alcotest.(check int) "comment line" 2 comment.Bridge.cc_line;
+      Alcotest.(check int) "comment column" 3 comment.Bridge.cc_col;
       Alcotest.(check bool)
-        "comment trailing" false comment.Parse_comments.cc_trailing
+        "comment trailing" false comment.Bridge.cc_trailing
   | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
       Alcotest.fail "expected one decoded comment"
   | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->
@@ -718,7 +718,7 @@ let test_typecheck_source_response_decodes_typed_program_artifact () =
         "decls" 0
         (List.length (Blorp.Typed_ast.program_decls typechecked_program));
       Alcotest.(check string)
-        "comment text" "-- typed" comment.Parse_comments.cc_text;
+        "comment text" "-- typed" comment.Bridge.cc_text;
       Alcotest.(check string) "surface module" "main" surface.Module_surface.module_name
   | Ok _ -> Alcotest.fail "expected decoded typecheck artifact"
   | Error (_, message) -> Alcotest.fail message
@@ -970,7 +970,7 @@ let test_parse_sources_response_decodes_items () =
         };
       ] ->
       Alcotest.(check string)
-        "comment text" "-- batch" comment.Parse_comments.cc_text;
+        "comment text" "-- batch" comment.Bridge.cc_text;
       Alcotest.(check string) "diagnostic" "Expected expression" err.Ast.message
   | Ok _ -> Alcotest.fail "expected one parsed item and one diagnostic item"
   | Error (_, message) -> Alcotest.fail message

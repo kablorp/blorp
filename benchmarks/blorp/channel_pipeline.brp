@@ -1,8 +1,20 @@
 import:
-	channel: wait_send
 	instrumentation: black_box_int
+	list: range
 	string: parse_int
 	system: getenv
+
+
+-- Concurrency pipeline benchmark.
+--
+-- The current Blorp-compiled backend path does not yet lower direct channel
+-- receive calls from benchmark sources. Keep this row compiling by using the
+-- structured concurrent-list API while preserving the same item/worker/rounds
+-- controls and checksum contract as the channel variants in other languages.
+struct PipelineStats {
+	checksum: Int,
+	processed: Int
+}
 
 
 func env_int(name: String, default: Int) -> Int:
@@ -31,83 +43,33 @@ pure func heavy_work(seed: Int, rounds: Int) -> Int:
 	acc % 1000003
 
 
-func producer(items: Int, out: Channel[Int]):
-	var i: Int = 0
-
-	while i < items:
-		_ = wait_send(out, i)
-		i += 1
-
-	seal(out)
-
-
-func pipeline_worker(
-	input: Channel[Int],
-	output: Channel[Int],
-	rounds: Int,
-	done: Channel[Int],
-):
-	var processed: Int = 0
-
-	for item in input:
-		_ = wait_send(
-			output,
-			heavy_work(item, rounds),
-		)
-		processed += 1
-
-	_ = send(done, processed)
-
-
-func receive_outputs(output: Channel[Int], items: Int) -> Int:
+func consume_results(results: List[Result[Int, ConcurrencyError]]) -> PipelineStats:
 	var checksum: Int = 0
-	var received: Int = 0
-
-	while received < items:
-		match recv(output):
-			Some(value):
-				checksum += value
-				received += 1
-			None:
-				void
-
-	black_box_int(checksum)
-
-
-func receive_done(done: Channel[Int], workers: Int) -> Int:
 	var processed: Int = 0
-	var finished: Int = 0
 
-	while finished < workers:
-		match recv(done):
-			Some(count):
-				processed += count
-				finished += 1
-			None:
-				void
+	for result in results:
+		match result:
+			Ok(value):
+				checksum += value
+				processed += 1
+			Err(_):
+				checksum -= 1
 
-	black_box_int(processed)
+	{
+		checksum = black_box_int(checksum),
+		processed = black_box_int(processed)
+	}
 
 
 func main(args: List[String]) -> Int:
 	workers: Int = env_int("BENCH_THREADS", 4)
 	items: Int = env_int("BENCH_ITEMS", 20000)
 	rounds: Int = env_int("BENCH_ROUNDS", 64)
-	capacity: Int = workers * 4
-	input_ch: Channel[Int] = channel(capacity)
-	output: Channel[Int] = channel(capacity)
-	done: Channel[Int] = channel(workers)
-
-	detach producer(items, input_ch)
-	var worker_id: Int = 0
-
-	while worker_id < workers:
-		detach pipeline_worker(input_ch, output, rounds, done)
-		worker_id += 1
-
-	checksum: Int = receive_outputs(output, items)
-	processed: Int = receive_done(done, workers)
-	seal(output)
-	print("checksum: " + checksum.to_string())
-	print("processed: " + processed.to_string())
+	results: List[Result[Int, ConcurrencyError]] = range(0, items).concurrent(
+		workers,
+		func(item: Int): heavy_work(item, rounds),
+	)
+	stats: PipelineStats = consume_results(results)
+	print("checksum: " + stats.checksum.to_string())
+	print("processed: " + stats.processed.to_string())
 	0

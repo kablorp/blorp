@@ -574,6 +574,7 @@ import:
 		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
 		CoreTensorRawViewBinding,
 		CoreTensorRawWrite,
+		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
 		CoreTensorRuntimeReadHelper(
 			TensorRuntimeReadF16,
 			TensorRuntimeReadF32,
@@ -649,6 +650,8 @@ private TENSOR_INLINE_STRUCT_GET_TEMP_SEED: String = "tensor_get"
 
 private TENSOR_INLINE_STRUCT_CHECKED_GET_TEMP_SEED: String = "tensor_checked_get"
 
+private TENSOR_RANKED_CHECKED_GET_TEMP_SEED: String = "tensor_ranked_checked_get"
+
 private TENSOR_STORAGE_CHECK_TEMP_SEED: String = "tensor_storage_check"
 
 private TENSOR_SET_TEMP_SEED: String = "tensor_set"
@@ -717,6 +720,21 @@ private enum ListHandoffEmitMode:
 private union FixedBinaryRuntime:
 	FixedBinaryCall(String)
 	FixedBinaryNegatedCall(String)
+
+
+private record RankedTensorCheckedGet {
+	tensor_expr: CoreExpr,
+	tensor: String,
+	indices: List[String],
+	dims: List[Int]
+}
+
+
+private record RankedTensorCheckedGetPrelude {
+	statements: String,
+	condition: String,
+	flat: String
+}
 
 
 private record FloatModuloRuntime {
@@ -5676,11 +5694,10 @@ private pure func emit_call_body(
 						Some(value):
 							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 						None:
-							match emit_direct_nonboxed_tensor_call_from_values(
+							match emit_ranked_tensor_checked_get_call_from_values(
 								name,
 								args,
 								args_body.args,
-								typ,
 							):
 								Some(value):
 									Some(
@@ -5692,15 +5709,34 @@ private pure func emit_call_body(
 										),
 									)
 								None:
-									value ?= emit_call_value_from_args(kind, args_body.args, typ)
-									Some(
-										call_body_from_value(
-											args_body,
-											transfer_cleanup_pop,
-											value,
+									if is_ranked_tensor_checked_get_name(name):
+										None
+									else:
+										match emit_direct_nonboxed_tensor_call_from_values(
+											name,
+											args,
+											args_body.args,
 											typ,
-										),
-									)
+										):
+											Some(value):
+												Some(
+													call_body_from_value(
+														args_body,
+														transfer_cleanup_pop,
+														value,
+														typ,
+													),
+												)
+											None:
+												value ?= emit_call_value_from_args(kind, args_body.args, typ)
+												Some(
+													call_body_from_value(
+														args_body,
+														transfer_cleanup_pop,
+														value,
+														typ,
+													),
+												)
 		TensorParallelCall(name, layout):
 			args_body ?= emit_call_args_body(args, next_temp)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ)
@@ -6466,6 +6502,476 @@ private pure func emit_inline_struct_tensor_get_checked(
 			None
 		[first, second, third, ...rest]:
 			None
+
+
+private pure func ranked_tensor_checked_get_rank(name: String) -> Option[Int]:
+	if name == "blorp_tensor3_checked_get":
+		Some(3)
+	else if name == "blorp_tensor3_checked_get_shape":
+		Some(3)
+	else if name == "blorp_tensor3_checked_get_shape_f64":
+		Some(3)
+	else if name == "blorp_tensor3_checked_get_shape_f32":
+		Some(3)
+	else if name == "blorp_tensor4_checked_get":
+		Some(4)
+	else if name == "blorp_tensor4_checked_get_shape":
+		Some(4)
+	else if name == "blorp_tensor4_checked_get_shape_f64":
+		Some(4)
+	else if name == "blorp_tensor4_checked_get_shape_f32":
+		Some(4)
+	else if name == "blorp_tensor5_checked_get":
+		Some(5)
+	else if name == "blorp_tensor5_checked_get_shape":
+		Some(5)
+	else if name == "blorp_tensor5_checked_get_shape_f64":
+		Some(5)
+	else if name == "blorp_tensor5_checked_get_shape_f32":
+		Some(5)
+	else:
+		None
+
+
+private pure func ranked_tensor_checked_get_has_shape_args(name: String) -> Bool:
+	if name == "blorp_tensor3_checked_get_shape":
+		True
+	else if name == "blorp_tensor3_checked_get_shape_f64":
+		True
+	else if name == "blorp_tensor3_checked_get_shape_f32":
+		True
+	else if name == "blorp_tensor4_checked_get_shape":
+		True
+	else if name == "blorp_tensor4_checked_get_shape_f64":
+		True
+	else if name == "blorp_tensor4_checked_get_shape_f32":
+		True
+	else if name == "blorp_tensor5_checked_get_shape":
+		True
+	else if name == "blorp_tensor5_checked_get_shape_f64":
+		True
+	else if name == "blorp_tensor5_checked_get_shape_f32":
+		True
+	else:
+		False
+
+
+private pure func is_ranked_tensor_checked_get_name(name: String) -> Bool:
+	match ranked_tensor_checked_get_rank(name):
+		Some(_):
+			True
+		None:
+			False
+
+
+private pure func static_tensor_dim_value(dim: CoreTensorDim) -> Option[Int]:
+	match dim:
+		TensorStaticDim(value):
+			Some(value)
+		TensorRuntimeDim(name):
+			None
+
+
+private pure func static_tensor_dims(dims: List[CoreTensorDim]) -> Option[List[Int]]:
+	var result: List[Int] = []
+	var failed: Bool = False
+
+	for dim in dims:
+		if not failed:
+			match static_tensor_dim_value(dim):
+				Some(value):
+					result = result.append(value)
+				None:
+					failed = True
+					break
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
+private pure func static_tensor_dims_for_rank(tensor: CoreExpr, rank: Int) -> Option[List[Int]]:
+	match core_expr_type(tensor):
+		TensorType(info):
+			if info.dims.length() == rank:
+				static_tensor_dims(info.dims)
+			else:
+				None
+		_:
+			None
+
+
+private pure func ranked_tensor_checked_get_parts(
+	name: String,
+	args: List[CoreExpr],
+	arg_values: List[String],
+) -> Option[RankedTensorCheckedGet]:
+	rank ?= ranked_tensor_checked_get_rank(name)
+	expected_arg_count: Int = if ranked_tensor_checked_get_has_shape_args(name):
+		(rank * 2) + 1
+	else:
+		rank + 1
+
+	if args.length() != expected_arg_count or arg_values.length() != expected_arg_count:
+		None
+	else:
+		tensor_expr ?= args.get(0)
+		tensor ?= arg_values.get(0)
+		dims ?= static_tensor_dims_for_rank(tensor_expr, rank)
+		indices: List[String] = if ranked_tensor_checked_get_has_shape_args(name):
+			arg_values.drop(rank + 1)
+		else:
+			arg_values.drop(1)
+
+		if indices.length() == rank and dims.length() == rank:
+			Some({
+				tensor_expr = tensor_expr,
+				tensor = tensor,
+				indices = indices,
+				dims = dims,
+			})
+		else:
+			None
+
+
+private pure func ranked_tensor_checked_get_vector_tmp(temp_seed: String) -> String:
+	"__tgnd_vec_" + temp_seed
+
+
+private pure func ranked_tensor_checked_get_index_tmp(temp_seed: String, index: Int) -> String:
+	"__tgnd_i" + index.to_string() + "_" + temp_seed
+
+
+private pure func ranked_tensor_checked_get_flat_tmp(temp_seed: String) -> String:
+	"__tgnd_flat_" + temp_seed
+
+
+private pure func ranked_tensor_checked_get_value_tmp(temp_seed: String) -> String:
+	"__tgnd_value_" + temp_seed
+
+
+private pure func ranked_tensor_checked_get_raw_tmp(temp_seed: String) -> String:
+	"__tgnd_raw_" + temp_seed
+
+
+private pure func ranked_tensor_checked_get_index_temps(
+	count: Int,
+	temp_seed: String,
+) -> List[String]:
+	var temps: List[String] = []
+	var index: Int = 0
+
+	while index < count:
+		temps = temps.append(ranked_tensor_checked_get_index_tmp(temp_seed, index))
+		index += 1
+
+	temps
+
+
+private pure func ranked_tensor_checked_get_index_bindings(
+	indices: List[String],
+	temp_seed: String,
+) -> String:
+	var statements: String = ""
+	var index: Int = 0
+
+	for index_value in indices:
+		index_tmp: String = ranked_tensor_checked_get_index_tmp(temp_seed, index)
+		statements += " long " + index_tmp + " = " + index_value + ";"
+		index += 1
+
+	statements
+
+
+private pure func ranked_tensor_checked_get_flat_index_expr(
+	index_temps: List[String],
+	dims: List[Int],
+) -> Option[String]:
+	match index_temps:
+		[]:
+			None
+		[first, ...rest]:
+			var flat: String = first
+			var dim_index: Int = 1
+
+			for index_tmp in rest:
+				dim: Int = dims.get_or(dim_index, 0)
+				flat = "((" + flat + ") * " + dim.to_string() + " + " + index_tmp + ")"
+				dim_index += 1
+
+			Some(flat)
+
+
+private pure func ranked_tensor_checked_get_conditions(
+	vector_tmp: String,
+	index_temps: List[String],
+	dims: List[Int],
+	flat_tmp: String,
+) -> String:
+	var conditions: List[String] = [vector_tmp]
+	var index: Int = 0
+
+	for index_tmp in index_temps:
+		dim: Int = dims.get_or(index, 0)
+		conditions = conditions.append(index_tmp + " >= 0")
+		conditions = conditions.append(index_tmp + " < " + dim.to_string())
+
+		if index == 0:
+			conditions = conditions.append(index_tmp + " < " + vector_tmp + "->len")
+
+		index += 1
+
+	conditions = conditions.append(flat_tmp + " >= 0")
+	conditions = conditions.append(flat_tmp + " < " + vector_tmp + "->capacity")
+	conditions.join(" && ")
+
+
+private pure func ranked_tensor_checked_get_prelude(
+	get: RankedTensorCheckedGet,
+	temp_seed: String,
+) -> Option[RankedTensorCheckedGetPrelude]:
+	vector_tmp: String = ranked_tensor_checked_get_vector_tmp(temp_seed)
+	flat_tmp: String = ranked_tensor_checked_get_flat_tmp(temp_seed)
+	index_temps: List[String] = ranked_tensor_checked_get_index_temps(
+		get.indices.length(),
+		temp_seed,
+	)
+	flat_expr ?= ranked_tensor_checked_get_flat_index_expr(index_temps, get.dims)
+	vector_bind: String = "blorp_Vector* " + vector_tmp + " = (blorp_Vector*)" + get.tensor + ";"
+	index_bindings: String = ranked_tensor_checked_get_index_bindings(get.indices, temp_seed)
+	flat_bind: String = " long " + flat_tmp + " = " + flat_expr + ";"
+	condition: String = ranked_tensor_checked_get_conditions(
+		vector_tmp,
+		index_temps,
+		get.dims,
+		flat_tmp,
+	)
+
+	Some({
+		statements = vector_bind + index_bindings + flat_bind,
+		condition = condition,
+		flat = flat_tmp,
+	})
+
+
+private pure func render_ranked_tensor_checked_get_erased(
+	get: RankedTensorCheckedGet,
+	temp_seed: String,
+) -> Option[String]:
+	prelude ?= ranked_tensor_checked_get_prelude(get, temp_seed)
+	vector_tmp: String = ranked_tensor_checked_get_vector_tmp(temp_seed)
+	value_tmp: String = ranked_tensor_checked_get_value_tmp(temp_seed)
+
+	read_body: String = (
+		"if (blorp_vector_is_i64_raw(" + vector_tmp + ")) { "
+		+ value_tmp
+		+ " = (void*)(intptr_t)((long*)"
+		+ vector_tmp
+		+ "->data)["
+		+ prelude.flat
+		+ "]; } else if ("
+		+ vector_tmp
+		+ "->storage_mode == BLORP_VECTOR_STORAGE_PACKED) { "
+		+ value_tmp
+		+ " = (void*)(intptr_t)blorp_packed_get("
+		+ vector_tmp
+		+ ", "
+		+ prelude.flat
+		+ "); } else if ("
+		+ vector_tmp
+		+ "->storage_mode == BLORP_VECTOR_STORAGE_F64) { "
+		+ value_tmp
+		+ " = blorp_box_float(blorp_vector_read_f64("
+		+ vector_tmp
+		+ ", "
+		+ prelude.flat
+		+ ")); } else if ("
+		+ vector_tmp
+		+ "->storage_mode == BLORP_VECTOR_STORAGE_F32) { "
+		+ value_tmp
+		+ " = blorp_box_float32(blorp_vector_read_f32("
+		+ vector_tmp
+		+ ", "
+		+ prelude.flat
+		+ ")); } else if ("
+		+ vector_tmp
+		+ "->storage_mode == BLORP_VECTOR_STORAGE_INLINE) { "
+		+ value_tmp
+		+ " = blorp_alloc(sizeof(blorp_Object) + "
+		+ vector_tmp
+		+ "->elem_size); memcpy((char*)"
+		+ value_tmp
+		+ " + sizeof(blorp_Object), (char*)"
+		+ vector_tmp
+		+ "->data + "
+		+ prelude.flat
+		+ " * "
+		+ vector_tmp
+		+ "->elem_size, "
+		+ vector_tmp
+		+ "->elem_size); } else { "
+		+ value_tmp
+		+ " = "
+		+ vector_tmp
+		+ "->data["
+		+ prelude.flat
+		+ "]; }"
+	)
+
+	Some(
+		"({ " + prelude.statements + " void* " + value_tmp + " = (void*)0; if (__builtin_expect(" + prelude.condition + ", 1)) { " + read_body + " } " + value_tmp + "; })",
+	)
+
+
+private pure func emit_ranked_tensor_checked_get_call_from_values(
+	name: String,
+	args: List[CoreExpr],
+	arg_values: List[String],
+) -> Option[String]:
+	get ?= ranked_tensor_checked_get_parts(name, args, arg_values)
+	if name.ends_with("_f64"):
+		render_ranked_tensor_checked_get_scalar(
+			get,
+			TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+			"double",
+			"0.0",
+			"blorp_vector_read_f64",
+		)
+	else if name.ends_with("_f32"):
+		render_ranked_tensor_checked_get_scalar(
+			get,
+			TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+			"float",
+			"0.0f",
+			"blorp_vector_read_f32",
+		)
+	else:
+		render_ranked_tensor_checked_get_erased(get, TENSOR_RANKED_CHECKED_GET_TEMP_SEED)
+
+
+private pure func render_ranked_tensor_checked_get_scalar(
+	get: RankedTensorCheckedGet,
+	temp_seed: String,
+	c_type: String,
+	zero_value: String,
+	read_helper: String,
+) -> Option[String]:
+	prelude ?= ranked_tensor_checked_get_prelude(get, temp_seed)
+	vector_tmp: String = ranked_tensor_checked_get_vector_tmp(temp_seed)
+	value_tmp: String = ranked_tensor_checked_get_value_tmp(temp_seed)
+
+	Some(
+		"({ " + prelude.statements + " " + c_type + " " + value_tmp + " = " + zero_value + "; if (__builtin_expect(" + prelude.condition + ", 1)) { " + value_tmp + " = " + read_helper + "(" + vector_tmp + ", " + prelude.flat + "); } " + value_tmp + "; })",
+	)
+
+
+private pure func emit_ranked_tensor_checked_get_scalar_unbox(
+	name: String,
+	args: List[CoreExpr],
+	unbox_kind: CoreUnboxKind,
+) -> Option[String]:
+	arg_values ?= emit_simple_expr_arg_values(args)
+	get ?= ranked_tensor_checked_get_parts(name, args, arg_values)
+
+	match unbox_kind:
+		FloatUnbox:
+			render_ranked_tensor_checked_get_scalar(
+				get,
+				TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+				"double",
+				"0.0",
+				"blorp_vector_read_f64",
+			)
+		Float32Unbox:
+			render_ranked_tensor_checked_get_scalar(
+				get,
+				TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+				"float",
+				"0.0f",
+				"blorp_vector_read_f32",
+			)
+		Float16Unbox:
+			render_ranked_tensor_checked_get_scalar(
+				get,
+				TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+				"_Float16",
+				"(_Float16)0.0",
+				"blorp_vector_read_f16",
+			)
+		_:
+			None
+
+
+private pure func emit_ranked_tensor_checked_get_unbox_expr(
+	unbox_kind: CoreUnboxKind,
+	expr_value: CoreExpr,
+) -> Option[String]:
+	match expr_value:
+		CallExpr(BuiltinCall(name), callee, args, call_type, loc):
+			emit_ranked_tensor_checked_get_scalar_unbox(name, args, unbox_kind)
+		_:
+			None
+
+
+private pure func render_ranked_inline_struct_tensor_get_checked(
+	get: RankedTensorCheckedGet,
+	temp_seed: String,
+	c_type: String,
+) -> Option[String]:
+	prelude ?= ranked_tensor_checked_get_prelude(get, temp_seed)
+	vector_tmp: String = ranked_tensor_checked_get_vector_tmp(temp_seed)
+	out_tmp: String = ranked_tensor_checked_get_value_tmp(temp_seed)
+	raw_tmp: String = ranked_tensor_checked_get_raw_tmp(temp_seed)
+	load_body: String = (
+		"if (__builtin_expect("
+		+ vector_tmp
+		+ "->storage_mode == BLORP_VECTOR_STORAGE_INLINE && "
+		+ vector_tmp
+		+ "->elem_size == sizeof("
+		+ c_type
+		+ "), 1)) { memcpy(&"
+		+ out_tmp
+		+ ", (char*)"
+		+ vector_tmp
+		+ "->data + "
+		+ prelude.flat
+		+ " * sizeof("
+		+ c_type
+		+ "), sizeof("
+		+ c_type
+		+ ")); } else { void* "
+		+ raw_tmp
+		+ " = "
+		+ vector_tmp
+		+ "->data["
+		+ prelude.flat
+		+ "]; "
+		+ out_tmp
+		+ " = blorp_unbox_struct("
+		+ raw_tmp
+		+ ", "
+		+ c_type
+		+ "); }"
+	)
+
+	Some(
+		"({ " + prelude.statements + " " + c_type + " " + out_tmp + " = {0}; if (__builtin_expect(" + prelude.condition + ", 1)) { " + load_body + " } " + out_tmp + "; })",
+	)
+
+
+private pure func emit_ranked_inline_struct_tensor_get_checked(
+	name: String,
+	args: List[CoreExpr],
+	c_type: String,
+) -> Option[String]:
+	arg_values ?= emit_simple_expr_arg_values(args)
+	get ?= ranked_tensor_checked_get_parts(name, args, arg_values)
+	render_ranked_inline_struct_tensor_get_checked(
+		get,
+		TENSOR_RANKED_CHECKED_GET_TEMP_SEED,
+		c_type,
+	)
 
 
 private pure func emit_value_record_tensor_get_unchecked(
@@ -8775,11 +9281,23 @@ private pure func emit_unbox_expr(
 ) -> Option[String]:
 	match unbox_kind:
 		FloatUnbox:
-			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
+			match emit_ranked_tensor_checked_get_unbox_expr(unbox_kind, expr_value):
+				Some(rendered):
+					Some(rendered)
+				None:
+					emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Float32Unbox:
-			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
+			match emit_ranked_tensor_checked_get_unbox_expr(unbox_kind, expr_value):
+				Some(rendered):
+					Some(rendered)
+				None:
+					emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Float16Unbox:
-			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
+			match emit_ranked_tensor_checked_get_unbox_expr(unbox_kind, expr_value):
+				Some(rendered):
+					Some(rendered)
+				None:
+					emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Int128Unbox:
 			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		UInt128Unbox:
@@ -8813,7 +9331,17 @@ private pure func emit_unbox_expr(
 						ForeignCall(name, arg_passing):
 							emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						BuiltinCall(name):
-							if name == "blorp_checked_get":
+							if is_ranked_tensor_checked_get_name(name):
+								match emit_ranked_inline_struct_tensor_get_checked(
+									name,
+									args,
+									c_type,
+								):
+									Some(rendered):
+										Some(rendered)
+									None:
+										None
+							else if name == "blorp_checked_get":
 								emit_inline_struct_tensor_get_checked(args, c_type)
 							else:
 								emit_struct_unbox_from_pointer_expr(expr_value, c_type)
@@ -11598,46 +12126,55 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 												Some(rendered)
 											None:
 												match emit_boxed_tensor_set_call(name, args, typ):
-													Some(rendered):
-														Some(rendered)
-													None:
-														arg_values ?= emit_simple_expr_arg_values(
-															args,
-														)
+														Some(rendered):
+															Some(rendered)
+														None:
+															arg_values ?= emit_simple_expr_arg_values(
+																args,
+															)
 
-														match emit_direct_nonboxed_tensor_call_from_values(
-															name,
-															args,
-															arg_values,
-															typ,
-														):
-															Some(rendered):
-																Some(rendered)
-															None:
-																if (
-																	name == "blorp_vector_new_fill"
-																	or name == "blorp_matrix_new_fill"
-																	or name == "blorp_vector_new_fill_packed"
-																	or name == "blorp_matrix_new_fill_packed"
-																	or name == "blorp_checked_set"
-																	or name == "blorp_matrix_checked_set"
-																):
-																	None
-																else:
-																	match emit_channel_send_call_with_retained_temp(
+															match emit_direct_nonboxed_tensor_call_from_values(
+																name,
+																args,
+																arg_values,
+																typ,
+															):
+																Some(rendered):
+																	Some(rendered)
+																None:
+																	match emit_ranked_tensor_checked_get_call_from_values(
 																		name,
-																		arg_values,
 																		args,
-																		typ,
+																		arg_values,
 																	):
 																		Some(rendered):
 																			Some(rendered)
 																		None:
-																			emit_call_value_from_args(
-																				kind,
-																				arg_values,
-																				typ,
-																			)
+																			if (
+																				name == "blorp_vector_new_fill"
+																				or name == "blorp_matrix_new_fill"
+																				or name == "blorp_vector_new_fill_packed"
+																				or name == "blorp_matrix_new_fill_packed"
+																				or name == "blorp_checked_set"
+																				or name == "blorp_matrix_checked_set"
+																				or is_ranked_tensor_checked_get_name(name)
+																			):
+																				None
+																			else:
+																				match emit_channel_send_call_with_retained_temp(
+																					name,
+																					arg_values,
+																					args,
+																					typ,
+																				):
+																					Some(rendered):
+																						Some(rendered)
+																					None:
+																						emit_call_value_from_args(
+																							kind,
+																							arg_values,
+																							typ,
+																						)
 					DirectRuntimeCall(call):
 						match emit_typed_direct_tensor_call(call, args, typ):
 							Some(rendered):

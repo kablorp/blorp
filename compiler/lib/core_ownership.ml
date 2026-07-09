@@ -1158,12 +1158,100 @@ let builtin_contract_table =
       builtins
         [ "blorp_matrix_checked_get" ]
         (bfixed [ Borrow; Borrow; Borrow ] (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor3_checked_get" ]
+        (bfixed [ Borrow; Borrow; Borrow; Borrow ] (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor4_checked_get" ]
+        (bfixed [ Borrow; Borrow; Borrow; Borrow; Borrow ] (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor5_checked_get" ]
+        (bfixed
+           [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ]
+           (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor3_checked_get_shape" ]
+        (bfixed
+           [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ]
+           (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor4_checked_get_shape" ]
+        (bfixed
+           [
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+           ]
+           (ReturnAliasOfArg 0));
+      builtins [ "blorp_tensor5_checked_get_shape" ]
+        (bfixed
+           [
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+           ]
+           (ReturnAliasOfArg 0));
       builtins
         [ "blorp_checked_get_f64"; "blorp_checked_get_f32" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       builtins
         [ "blorp_matrix_checked_get_f64"; "blorp_matrix_checked_get_f32" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [
+          "blorp_tensor3_checked_get_shape_f64";
+          "blorp_tensor3_checked_get_shape_f32";
+        ]
+        (bfixed
+           [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ]
+           ReturnPrimitive);
+      builtins
+        [
+          "blorp_tensor4_checked_get_shape_f64";
+          "blorp_tensor4_checked_get_shape_f32";
+        ]
+        (bfixed
+           [
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+           ]
+           ReturnPrimitive);
+      builtins
+        [
+          "blorp_tensor5_checked_get_shape_f64";
+          "blorp_tensor5_checked_get_shape_f32";
+        ]
+        (bfixed
+           [
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+             Borrow;
+           ]
+           ReturnPrimitive);
       builtins ~void_boxed_args:[ 2 ] [ "blorp_vector_get_or" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnBorrowed);
       builtins ~void_boxed_args:[ 2 ] [ "blorp_vector_set" ]

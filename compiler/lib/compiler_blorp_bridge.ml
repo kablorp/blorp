@@ -32,9 +32,16 @@ let parsed_source_phase_of_string = function
   | other ->
       Error ("invalid_response", "unsupported parser AST phase `" ^ other ^ "`")
 
+type collected_comment = {
+  cc_text : string;
+  cc_line : int;
+  cc_col : int;
+  cc_trailing : bool;
+}
+
 type parsed_source = {
   parsed_program : Ast.program;
-  parsed_comments : Parse_comments.collected_comment list;
+  parsed_comments : collected_comment list;
   parsed_phase : parsed_source_phase;
   parsed_module_surface : Module_surface.t option;
 }
@@ -48,7 +55,7 @@ type typechecked_source = {
   typechecked_errors : string list;
   typechecked_import_bindings : Session.import_binding list;
   typechecked_ctfe_evaluated_by_blorp : bool;
-  typechecked_comments : Parse_comments.collected_comment list;
+  typechecked_comments : collected_comment list;
   typechecked_phase : parsed_source_phase;
   typechecked_module_surface : Module_surface.t option;
 }
@@ -885,7 +892,7 @@ let decode_parse_comment = function
       let* cc_line = int_json_field "line" fields in
       let* cc_col = int_json_field "column" fields in
       let* cc_trailing = bool_json_field "trailing" fields in
-      Ok { Parse_comments.cc_text = cc_text; cc_line; cc_col; cc_trailing }
+      Ok { cc_text; cc_line; cc_col; cc_trailing }
   | _ -> Error ("invalid_response", "parse comments must be JSON objects")
 
 let parse_comments_response_field artifact =

@@ -73,10 +73,12 @@ esac
 
 cleanup() {
     local pid
+    set +u
     for pid in "${CHILD_PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    set -u
     rm -rf "$TMPDIR_CLI"
 }
 trap cleanup EXIT

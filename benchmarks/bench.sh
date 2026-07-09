@@ -61,9 +61,9 @@ GO_CONCURRENCY_THREADS="${GOMAXPROCS:-$BENCH_THREADS}"
 
 # Ordered benchmark list (determines display order)
 ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops threaded_cpu_map channel_pipeline sleep_fanout options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement compiler_ast compiler_symbols compiler_emit"
-EXTRA_BENCHMARKS="numeric_vector paradigms particle_gravity virtual_threads"
+EXTRA_BENCHMARKS="paradigms virtual_threads"
 CONCURRENCY_BENCHMARKS="threaded_cpu_map channel_pipeline sleep_fanout"
-SPEEDUP_SUPPRESSED_BENCHMARKS=""
+SPEEDUP_SUPPRESSED_BENCHMARKS="channel_pipeline"
 
 die() { echo "error: $1" >&2; exit 1; }
 
@@ -109,6 +109,14 @@ contains_concurrency_benchmark() {
         is_concurrency_benchmark "$name" && return 0
     done
     return 1
+}
+
+is_known_benchmark() {
+    local needle="$1"
+    case " $ALL_BENCHMARKS $EXTRA_BENCHMARKS " in
+        *" $needle "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 bench_args_for() {
@@ -746,7 +754,7 @@ has_cmd "$PYTHON" && echo "Python:$($PYTHON --version 2>&1 | sed 's/^/ /')"
 if [ "$FILTER" = "all" ]; then
     RUN_BENCHMARKS="$ALL_BENCHMARKS"
 else
-    has_bench blorp "$FILTER" || die "unknown benchmark: $FILTER"
+    is_known_benchmark "$FILTER" && has_bench blorp "$FILTER" || die "unknown benchmark: $FILTER"
     RUN_BENCHMARKS="$FILTER"
 fi
 

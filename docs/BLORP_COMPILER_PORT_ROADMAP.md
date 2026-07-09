@@ -298,7 +298,6 @@ OCaml references:
   - `decode_import_decl`
   - `decode_foreign_block_decl`
   - `decode_parse_diagnostics`
-- `compiler/lib/parse_comments.ml`
 - `compiler/lib/module_surface.ml`
   - `validate_against_program`
   - `exports_as_ast_pairs`
@@ -372,8 +371,8 @@ Tests:
 
 Deletion point:
 
-- Delete `parsed_ast_json.ml`, `parse_comments.ml`, and OCaml module-surface
-  validation once no OCaml stage consumes parsed AST JSON.
+- Delete `parsed_ast_json.ml` and OCaml module-surface validation once no OCaml
+  stage consumes parsed AST JSON.
 
 ## Checkpoint 3: Module Graph, Import Resolution, And Package Context
 

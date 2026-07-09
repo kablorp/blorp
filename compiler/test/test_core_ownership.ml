@@ -709,6 +709,56 @@ let test_checked_get_borrows_and_aliases () =
     { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_checked_slice" 3)
 
+let test_ranked_checked_get_shape_contracts () =
+  check_contract "blorp_tensor3_checked_get_shape"
+    {
+      args = [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ];
+      result = ReturnAliasOfArg 0;
+    }
+    (builtin_contract "blorp_tensor3_checked_get_shape" 7);
+  check_contract "blorp_tensor4_checked_get_shape"
+    {
+      args =
+        [
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+        ];
+      result = ReturnAliasOfArg 0;
+    }
+    (builtin_contract "blorp_tensor4_checked_get_shape" 9);
+  check_contract "blorp_tensor5_checked_get_shape"
+    {
+      args =
+        [
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+          Borrow;
+        ];
+      result = ReturnAliasOfArg 0;
+    }
+    (builtin_contract "blorp_tensor5_checked_get_shape" 11);
+  check_contract "blorp_tensor3_checked_get_shape_f64"
+    {
+      args = [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ];
+      result = ReturnPrimitive;
+    }
+    (builtin_contract "blorp_tensor3_checked_get_shape_f64" 7)
+
 let test_checked_set_cow_consumes_collection () =
   check_contract "blorp_checked_set"
     { args = [ CowConsume; Borrow; Borrow ]; result = ReturnOwned }
@@ -1479,6 +1529,8 @@ let suite =
           test_string_copy_bytes_borrows;
         Alcotest.test_case "checked_get_borrows_and_aliases" `Quick
           test_checked_get_borrows_and_aliases;
+        Alcotest.test_case "ranked_checked_get_shape_contracts" `Quick
+          test_ranked_checked_get_shape_contracts;
         Alcotest.test_case "checked_set_cow_consumes_collection" `Quick
           test_checked_set_cow_consumes_collection;
         Alcotest.test_case "matrix_option_set_cow_consumes_collection" `Quick

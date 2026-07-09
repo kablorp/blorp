@@ -226,6 +226,18 @@ let supported_raw_tensor_access_builtins =
       "blorp_matrix_checked_get";
       "blorp_matrix_checked_get_f32";
       "blorp_matrix_checked_get_f64";
+      "blorp_tensor3_checked_get";
+      "blorp_tensor4_checked_get";
+      "blorp_tensor5_checked_get";
+      "blorp_tensor3_checked_get_shape";
+      "blorp_tensor4_checked_get_shape";
+      "blorp_tensor5_checked_get_shape";
+      "blorp_tensor3_checked_get_shape_f64";
+      "blorp_tensor4_checked_get_shape_f64";
+      "blorp_tensor5_checked_get_shape_f64";
+      "blorp_tensor3_checked_get_shape_f32";
+      "blorp_tensor4_checked_get_shape_f32";
+      "blorp_tensor5_checked_get_shape_f32";
       "blorp_matrix_set_opt_i64";
       "blorp_matrix_set_opt_nullable_i64";
       "blorp_matrix_get_opt_bool";
