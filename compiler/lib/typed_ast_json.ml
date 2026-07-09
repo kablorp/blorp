@@ -205,6 +205,13 @@ let decode_parsed_type_alias_decl path value =
   | Ok _ -> error path "decoded parsed declaration was not a type alias"
   | Error err -> Error err
 
+let decode_parsed_union_decl path value =
+  let wrapped = Lsp_json.Object [ ("union", value) ] in
+  match parsed_decode_result (Parsed_ast_json.decode_union_decl path wrapped) with
+  | Ok ({ Ast.decl_desc = Ast.DType _; _ } as decl) -> Ok decl
+  | Ok _ -> error path "decoded parsed declaration was not a union"
+  | Error err -> Error err
+
 let decode_parsed_impl_decl path value =
   let wrapped = Lsp_json.Object [ ("impl", value) ] in
   match parsed_decode_result (Parsed_ast_json.decode_impl_decl path wrapped) with
@@ -1950,6 +1957,126 @@ let decode_typed_type_alias_info path value =
         | Error _ -> error path "decoded type alias failed typed-AST validation")
   | _ -> error path "decoded parsed declaration was not a type alias"
 
+type decoded_union_variant_info = {
+  union_variant_name : string;
+  union_variant_fields : Ast.type_expr list;
+  union_variant_tag : int;
+  union_variant_def_id : int option;
+}
+
+let decode_union_variant_info path value =
+  let* name = string_field path "name" value in
+  let* fields_json = array_field path "fields" value in
+  let* fields = decode_list (path ^ ".fields") decode_type fields_json in
+  let* tag = int_field path "tag" value in
+  let* def_id_json = field path "def_id" value in
+  let* def_id = option_int_value (path ^ ".def_id") def_id_json in
+  Ok
+    {
+      union_variant_name = name;
+      union_variant_fields = fields;
+      union_variant_tag = tag;
+      union_variant_def_id = def_id;
+    }
+
+let union_variants_with_metadata path source_variants variant_infos =
+  let rec loop acc index source_variants variant_infos =
+    match (source_variants, variant_infos) with
+    | [], [] -> Ok (List.rev acc)
+    | source :: source_rest, info :: info_rest ->
+        let item_path = Printf.sprintf "%s[%d]" path index in
+        if not (String.equal source.Ast.variant_name info.union_variant_name)
+        then
+          error (item_path ^ ".name")
+            "union variant metadata order must match source variants"
+        else if
+          List.length source.variant_fields
+          <> List.length info.union_variant_fields
+        then
+          error (item_path ^ ".fields")
+            "union variant metadata field count must match source variant"
+        else if info.union_variant_tag <> index then
+          error (item_path ^ ".tag")
+            "union variant tag must match declaration order"
+        else
+          let typed_variant =
+            {
+              source with
+              Ast.variant_fields = info.union_variant_fields;
+              variant_tag = info.union_variant_tag;
+              variant_def_id = info.union_variant_def_id;
+            }
+          in
+          loop (typed_variant :: acc) (index + 1) source_rest info_rest
+    | [], _ :: _ | _ :: _, [] ->
+        error path "union variant metadata count must match source variants"
+  in
+  loop [] 0 source_variants variant_infos
+
+let validate_union_bridge_metadata path variant_infos typed_type_decl =
+  let actual = typed_type_decl.Ast.type_variants in
+  let rec loop index expected actual =
+    match (expected, actual) with
+    | [], [] -> Ok ()
+    | expected :: expected_rest, actual :: actual_rest ->
+        let item_path = Printf.sprintf "%s.variants[%d]" path index in
+        if not (String.equal expected.union_variant_name actual.Ast.variant_name)
+        then
+          error (item_path ^ ".name") "union variant name was not preserved"
+        else if
+          not
+            (types_equal_list expected.union_variant_fields
+               actual.variant_fields)
+        then
+          error (item_path ^ ".fields")
+            "union variant fields were not preserved"
+        else if expected.union_variant_tag <> actual.variant_tag then
+          error (item_path ^ ".tag") "union variant tag was not preserved"
+        else if expected.union_variant_def_id <> actual.variant_def_id then
+          error (item_path ^ ".def_id") "union variant def id was not preserved"
+        else loop (index + 1) expected_rest actual_rest
+    | _ -> error path "union variant metadata count was not preserved"
+  in
+  loop 0 variant_infos actual
+
+let decode_typed_union_info path value =
+  let* decl_json = field path "decl" value in
+  let* source_decl = decode_parsed_union_decl (path ^ ".decl") decl_json in
+  let* variants_json = array_field path "variants" value in
+  let* variant_infos =
+    decode_list (path ^ ".variants") decode_union_variant_info variants_json
+  in
+  match source_decl.Ast.decl_desc with
+  | Ast.DType source_type_decl -> (
+      let* variants =
+        union_variants_with_metadata (path ^ ".variants")
+          source_type_decl.type_variants variant_infos
+      in
+      let typed_type_decl =
+        { source_type_decl with Ast.type_variants = variants }
+      in
+      let typed_decl =
+        { source_decl with Ast.decl_desc = Ast.DType typed_type_decl }
+      in
+      match
+        Typed_ast.of_ast_program_with_sources ~source_program:[ source_decl ]
+          [ typed_decl ]
+      with
+      | Ok program -> (
+          match Typed_ast.program_decls program with
+          | [ decl ] -> (
+              match (Typed_ast.decl_ast decl).Ast.decl_desc with
+              | Ast.DType decoded_type_decl ->
+                  let* () =
+                    validate_union_bridge_metadata path variant_infos
+                      decoded_type_decl
+                  in
+                  Ok decl
+              | _ -> error path "decoded declaration was not a union")
+          | _ -> error path "decoded union produced unexpected declaration count")
+      | Error _ -> error path "decoded union failed typed-AST validation")
+  | _ -> error path "decoded parsed declaration was not a union"
+
 let function_name_matches name func =
   match (Typed_ast.func_ast func).Ast.func_name with
   | Some func_name -> String.equal func_name name
@@ -2093,6 +2220,10 @@ let rec decode_typed_decl_group path value =
   | "type_alias" ->
       let* info_json = field path "info" value in
       let* decl = decode_typed_type_alias_info (path ^ ".info") info_json in
+      Ok [ decl ]
+  | "union" ->
+      let* info_json = field path "info" value in
+      let* decl = decode_typed_union_info (path ^ ".info") info_json in
       Ok [ decl ]
   | "impl" ->
       let* info_json = field path "info" value in

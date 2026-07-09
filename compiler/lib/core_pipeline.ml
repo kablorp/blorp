@@ -330,8 +330,8 @@ let compile_typed_with_modules ?(main_import_bindings = [])
           ~hint:
             "Pipeline.ensure_modules_typed must type-check every loaded module \
              before Core lowering. If this came from a direct Core_pipeline \
-             call, use Pipeline.compile/typecheck_only or populate typed_decls \
-             explicitly."
+             call, use a high-level Pipeline entrypoint or populate \
+             typed_decls explicitly."
           "module %s reached Core lowering without typed declarations" m.name
   in
   let module_core =

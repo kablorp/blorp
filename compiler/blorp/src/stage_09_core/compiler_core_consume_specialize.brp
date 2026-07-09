@@ -1,10 +1,11 @@
 -- Consuming-call specialization before Perceus.
 --
--- Direct port of the OCaml pass shape for the boundary-adjacent slice:
+-- Direct port of the OCaml pass shape:
 -- detect safe `owned = f(owned, ...)` rewrites, clone the callee with a
 -- terminal drop for the consumed parameter, and retarget the assignment call
--- to that clone. This is intentionally conservative; unsupported shapes are
--- left unchanged.
+-- to that clone. Clone identity includes name and definition id, compiled
+-- match bodies are rewritten recursively, and recursive match fields become
+-- owned only when every branch transfers them exactly once.
 import:
 	compiler_core_json:
 		CoreAccessor(RootAccessor, VariantFieldAccessor),
@@ -12,6 +13,11 @@ import:
 		CoreCallKind(UserCall),
 		CoreClosureAbi,
 		CoreClosureCapture,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
 		CoreConstructorMatchBody(
 			ConstructorMatchBodyExpr,
 			ConstructorMatchBodyLength,
@@ -48,6 +54,12 @@ import:
 		CoreGlobal,
 		CoreHeapRecordDecl,
 		CoreHeapRecordField,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
@@ -76,6 +88,7 @@ import:
 
 
 private record CloneKey {
+	original_name: String,
 	original_def_id: Int,
 	arg_index: Int
 }
@@ -108,6 +121,18 @@ private record OwnedUseAnalysis {
 	safe: Bool,
 	min_count: Int,
 	max_count: Int
+}
+
+
+private record RewriteLengthGeqResult {
+	state: ConsumeSpecializeState,
+	geq: Option[CoreConstructorLengthMatchGeq]
+}
+
+
+private record RewriteLengthFallbackResult {
+	state: ConsumeSpecializeState,
+	fallback: Option[CoreConstructorLengthMatchBranch]
 }
 
 
@@ -623,15 +648,24 @@ private pure func clone_name(original: CoreFunction, arg_index: Int) -> String:
 	"${original.name}__consume_arg${arg_index.to_string()}"
 
 
-private pure func clone_key(original_def_id: Int, arg_index: Int) -> CloneKey:
+private pure func clone_key(
+	original_name: String,
+	original_def_id: Int,
+	arg_index: Int,
+) -> CloneKey:
 	{
+		original_name = original_name,
 		original_def_id = original_def_id,
 		arg_index = arg_index
 	}
 
 
 private pure func clone_key_equal(left: CloneKey, right: CloneKey) -> Bool:
-	left.original_def_id == right.original_def_id and left.arg_index == right.arg_index
+	(
+		left.original_name == right.original_name
+		and left.original_def_id == right.original_def_id
+		and left.arg_index == right.arg_index
+	)
 
 
 private pure func clone_callee_var(name: String, def_id: Int) -> CoreVar:
@@ -657,7 +691,7 @@ private pure func rewrite_callee_expr(name: String, def_id: Int, callee: CoreExp
 private pure func is_call_to_function(original: CoreFunction, kind: CoreCallKind) -> Bool:
 	match kind:
 		UserCall(name, Some(def_id), consumed_args):
-			def_id == original.def_id
+			name == original.name and def_id == original.def_id
 		_:
 			False
 
@@ -1745,7 +1779,7 @@ private pure func collect_function_clone_candidates(
 			current = { current |
 				next_def_id = current.next_def_id + 1,
 				candidates = current.candidates.append({
-					key = clone_key(func_info.def_id, arg_index),
+					key = clone_key(func_info.name, func_info.def_id, arg_index),
 					param_type = copy_core_type(param.typ),
 					clone_name = clone_name(func_info, arg_index),
 					clone_def_id = current.next_def_id,
@@ -1761,6 +1795,7 @@ private pure func collect_function_clone_candidates(
 
 private pure func find_clone_target(
 	state: ConsumeSpecializeState,
+	original_name: String,
 	original_def_id: Int,
 	arg_index: Int,
 	target_type: CoreType,
@@ -1769,7 +1804,8 @@ private pure func find_clone_target(
 
 	for candidate in state.candidates:
 		if (
-			candidate.key.original_def_id == original_def_id
+			candidate.key.original_name == original_name
+			and candidate.key.original_def_id == original_def_id
 			and candidate.key.arg_index == arg_index
 			and core_type_equal(candidate.param_type, target_type)
 		):
@@ -1832,7 +1868,7 @@ private pure func call_arg_consumes_target(
 			Some(arg_index):
 				match kind:
 					UserCall(name, Some(def_id), consumed_args):
-						find_clone_target(state, def_id, arg_index, target_type)
+						find_clone_target(state, name, def_id, arg_index, target_type)
 					_:
 						None
 			None:
@@ -1866,6 +1902,221 @@ private pure func rewrite_assignment_call(
 					(state, copy_expr(rhs))
 		_:
 			(state, copy_expr(rhs))
+
+
+private pure func rewrite_constructor_literal_match_cases(
+	state: ConsumeSpecializeState,
+	cases: List[CoreLiteralMatchCase],
+) -> (ConsumeSpecializeState, List[CoreLiteralMatchCase]):
+	var current: ConsumeSpecializeState = state
+	var rewritten: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		body_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(current, match_case.body)
+		current = body_result[0]
+		rewritten = rewritten.append({ match_case | body = body_result[1] })
+
+	(current, rewritten)
+
+
+private pure func rewrite_constructor_literal_match_fallback(
+	state: ConsumeSpecializeState,
+	fallback: CoreLiteralMatchFallback,
+) -> (ConsumeSpecializeState, CoreLiteralMatchFallback):
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			body_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, body)
+			(body_result[0], LiteralMatchFallbackBody(body_result[1]))
+		LiteralMatchFallbackBindings(bindings, body):
+			body_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, body)
+			(
+				body_result[0],
+				LiteralMatchFallbackBindings(copy_match_bindings(bindings), body_result[1]),
+			)
+		LiteralMatchFallbackFail:
+			(state, LiteralMatchFallbackFail)
+
+
+private pure func rewrite_constructor_literal_match(
+	state: ConsumeSpecializeState,
+	match_expr: CoreConstructorLiteralMatch,
+) -> (ConsumeSpecializeState, CoreConstructorLiteralMatch):
+	cases_result: (ConsumeSpecializeState, List[CoreLiteralMatchCase]) = rewrite_constructor_literal_match_cases(
+		state,
+		match_expr.cases,
+	)
+
+	fallback_result: (ConsumeSpecializeState, CoreLiteralMatchFallback) = rewrite_constructor_literal_match_fallback(
+		cases_result[0],
+		match_expr.fallback,
+	)
+
+	(fallback_result[0], { match_expr |
+			cases = cases_result[1],
+			fallback = fallback_result[1]
+		})
+
+
+private pure func rewrite_constructor_length_branch(
+	state: ConsumeSpecializeState,
+	branch: CoreConstructorLengthMatchBranch,
+) -> (ConsumeSpecializeState, CoreConstructorLengthMatchBranch):
+	body_result: (ConsumeSpecializeState, CoreConstructorMatchBody) = rewrite_constructor_match_body(
+		state,
+		branch.body,
+	)
+
+	(body_result[0], { branch | body = body_result[1] })
+
+
+private pure func rewrite_constructor_length_cases(
+	state: ConsumeSpecializeState,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> (ConsumeSpecializeState, List[CoreConstructorLengthMatchCase]):
+	var current: ConsumeSpecializeState = state
+	var rewritten: List[CoreConstructorLengthMatchCase] = []
+
+	for match_case in cases:
+		branch_result: (ConsumeSpecializeState, CoreConstructorLengthMatchBranch) = rewrite_constructor_length_branch(
+			current,
+			match_case.branch,
+		)
+
+		current = branch_result[0]
+		rewritten = rewritten.append({ match_case | branch = branch_result[1] })
+
+	(current, rewritten)
+
+
+private pure func rewrite_constructor_length_geq(
+	state: ConsumeSpecializeState,
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> RewriteLengthGeqResult:
+	match geq:
+		Some(match_case):
+			branch_result: (ConsumeSpecializeState, CoreConstructorLengthMatchBranch) = rewrite_constructor_length_branch(
+				state,
+				match_case.branch,
+			)
+
+			{
+				state = branch_result[0],
+				geq = Some({ match_case | branch = branch_result[1] })
+			}
+		None:
+			{
+				state = state,
+				geq = None
+			}
+
+
+private pure func rewrite_constructor_length_fallback(
+	state: ConsumeSpecializeState,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> RewriteLengthFallbackResult:
+	match fallback:
+		Some(branch):
+			branch_result: (ConsumeSpecializeState, CoreConstructorLengthMatchBranch) = rewrite_constructor_length_branch(
+				state,
+				branch,
+			)
+
+			{
+				state = branch_result[0],
+				fallback = Some(branch_result[1])
+			}
+		None:
+			{
+				state = state,
+				fallback = None
+			}
+
+
+private pure func rewrite_constructor_length_match(
+	state: ConsumeSpecializeState,
+	match_expr: CoreConstructorLengthMatch,
+) -> (ConsumeSpecializeState, CoreConstructorLengthMatch):
+	cases_result: (ConsumeSpecializeState, List[CoreConstructorLengthMatchCase]) = rewrite_constructor_length_cases(
+		state,
+		match_expr.cases,
+	)
+
+	geq_result: RewriteLengthGeqResult = rewrite_constructor_length_geq(
+		cases_result[0],
+		match_expr.geq,
+	)
+
+	fallback_result: RewriteLengthFallbackResult = rewrite_constructor_length_fallback(
+		geq_result.state,
+		match_expr.fallback,
+	)
+
+	(fallback_result.state, { match_expr |
+			cases = cases_result[1],
+			geq = geq_result.geq,
+			fallback = fallback_result.fallback
+		})
+
+
+private pure func rewrite_constructor_match_body(
+	state: ConsumeSpecializeState,
+	body: CoreConstructorMatchBody,
+) -> (ConsumeSpecializeState, CoreConstructorMatchBody):
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			expr_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, expr)
+			(expr_result[0], ConstructorMatchBodyExpr(expr_result[1]))
+		ConstructorMatchBodyLiteral(match_expr):
+			match_result: (ConsumeSpecializeState, CoreConstructorLiteralMatch) = rewrite_constructor_literal_match(
+				state,
+				match_expr,
+			)
+
+			(match_result[0], ConstructorMatchBodyLiteral(match_result[1]))
+		ConstructorMatchBodyLength(match_expr):
+			match_result: (ConsumeSpecializeState, CoreConstructorLengthMatch) = rewrite_constructor_length_match(
+				state,
+				match_expr,
+			)
+
+			(match_result[0], ConstructorMatchBodyLength(match_result[1]))
+
+
+private pure func rewrite_constructor_match_cases(
+	state: ConsumeSpecializeState,
+	cases: List[CoreConstructorMatchCase],
+) -> (ConsumeSpecializeState, List[CoreConstructorMatchCase]):
+	var current: ConsumeSpecializeState = state
+	var rewritten: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		body_result: (ConsumeSpecializeState, CoreConstructorMatchBody) = rewrite_constructor_match_body(
+			current,
+			match_case.body,
+		)
+
+		current = body_result[0]
+		rewritten = rewritten.append({ match_case | body = body_result[1] })
+
+	(current, rewritten)
+
+
+private pure func rewrite_constructor_match_fallback(
+	state: ConsumeSpecializeState,
+	fallback: CoreConstructorMatchFallback,
+) -> (ConsumeSpecializeState, CoreConstructorMatchFallback):
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			body_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, body)
+			(body_result[0], ConstructorMatchFallbackBody(body_result[1]))
+		ConstructorMatchFallbackBindings(bindings, body):
+			body_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, body)
+			(
+				body_result[0],
+				ConstructorMatchFallbackBindings(copy_match_bindings(bindings), body_result[1]),
+			)
+		ConstructorMatchFallbackFail:
+			(state, ConstructorMatchFallbackFail)
 
 
 private pure func rewrite_expr(
@@ -1960,13 +2211,23 @@ private pure func rewrite_expr(
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			scrutinee_result: (ConsumeSpecializeState, CoreExpr) = rewrite_expr(state, scrutinee)
-			(
+			cases_result: (ConsumeSpecializeState, List[CoreConstructorMatchCase]) = rewrite_constructor_match_cases(
 				scrutinee_result[0],
+				cases,
+			)
+
+			fallback_result: (ConsumeSpecializeState, CoreConstructorMatchFallback) = rewrite_constructor_match_fallback(
+				cases_result[0],
+				fallback,
+			)
+
+			(
+				fallback_result[0],
 				ConstructorMatchExpr(
 					scrutinee_result[1],
 					release_policy,
-					copy_constructor_match_cases(cases),
-					copy_constructor_match_fallback(fallback),
+					cases_result[1],
+					fallback_result[1],
 					copy_core_type(typ),
 					loc,
 				),
@@ -2037,7 +2298,8 @@ private pure func clones_after(
 
 	for candidate in state.candidates:
 		if (
-			candidate.key.original_def_id == original_func.def_id
+			candidate.key.original_name == original_func.name
+			and candidate.key.original_def_id == original_func.def_id
 			and clone_key_used(state.used_clone_keys, candidate.key)
 		):
 			match make_consuming_clone(
