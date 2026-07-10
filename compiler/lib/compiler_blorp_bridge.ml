@@ -60,6 +60,17 @@ type typechecked_source = {
   typechecked_module_surface : Module_surface.t option;
 }
 
+type typechecked_graph_source = {
+  typechecked_graph_path : string;
+  typechecked_graph_module_name : string;
+  typechecked_graph_artifact : typechecked_source;
+}
+
+type typechecked_graph = {
+  typechecked_graph_modules : typechecked_graph_source list;
+  typechecked_graph_target : typechecked_graph_source;
+}
+
 type parse_source_batch_request = {
   batch_parse_path : string;
   batch_parse_module_name : string;
@@ -660,6 +671,30 @@ let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
          ("payload", Lsp_json.Object payload_fields);
        ])
 
+let typecheck_graph_request_json_with_policy ~resolved_imports
+    ~allow_debug_only_calls ~target ~modules ~module_targets =
+  let payload_fields =
+    [
+      ("target", typecheck_import_module_json target);
+      ( "modules",
+        Lsp_json.Array (List.map typecheck_import_module_json modules) );
+      ( "module_targets",
+        Lsp_json.Array (List.map (fun path -> Lsp_json.String path) module_targets)
+      );
+      ("include_comments", Lsp_json.Bool false);
+      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
+    ]
+    @ typecheck_resolved_imports_field resolved_imports
+  in
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "typecheck_graph");
+         ("payload", Lsp_json.Object payload_fields);
+       ])
+
 let cli_run_request_json ?version args =
   let version_fields =
     match version with
@@ -1139,6 +1174,64 @@ let typecheck_source_response_field response =
 
 let typecheck_source_response_json response_json =
   response_result response_json typecheck_source_response_field
+
+let typechecked_graph_source_artifact_field artifact =
+  let* typechecked_graph_path = string_response_field "path" artifact in
+  let* typechecked_graph_module_name = string_response_field "module" artifact in
+  let* typechecked_graph_artifact = typechecked_source_artifact_field artifact in
+  Ok
+    {
+      typechecked_graph_path;
+      typechecked_graph_module_name;
+      typechecked_graph_artifact;
+    }
+
+let typecheck_graph_source_response_json response_json =
+  response_result response_json (fun response ->
+      let* artifact = json_response_field "artifact" response in
+      typechecked_graph_source_artifact_field artifact)
+
+(** The Blorp helper emits one artifact per line to bound its own live graph.
+    [run_process_capture] still buffers stdout in this transitional OCaml host;
+    do not build more caching or graph semantics around that temporary limit. *)
+let typecheck_graph_stream_response_json ~module_count response_text =
+  let lines =
+    response_text |> String.split_on_char '\n'
+    |> List.filter (fun line -> String.trim line <> "")
+  in
+  let rec decode acc = function
+    | [] -> Ok (List.rev acc)
+    | line :: rest ->
+        let* source = typecheck_graph_source_response_json line in
+        decode (source :: acc) rest
+  in
+  let* sources = decode [] lines in
+  let rec split_modules remaining acc sources =
+    if remaining = 0 then
+      match sources with
+      | [ target ] ->
+          Ok
+            {
+              typechecked_graph_modules = List.rev acc;
+              typechecked_graph_target = target;
+            }
+      | _ ->
+          Error
+            ( "invalid_response",
+              Printf.sprintf
+                "typecheck_graph returned %d trailing artifacts, expected one target"
+                (List.length sources) )
+    else
+      match sources with
+      | source :: rest -> split_modules (remaining - 1) (source :: acc) rest
+      | [] ->
+          Error
+            ( "invalid_response",
+              Printf.sprintf
+                "typecheck_graph returned %d artifacts, expected %d modules and one target"
+                (List.length lines) module_count )
+  in
+  split_modules module_count [] sources
 
 let cli_frontend_command_of_string = function
   | "check" -> Ok CliFrontendCheck
@@ -2991,6 +3084,17 @@ let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
          ~path ~module_name ~text)
   in
   typecheck_source_response_json response_json
+
+let typecheck_graph_via_command_with_policy ~resolved_imports
+    ~allow_debug_only_calls ~target ~modules ~module_targets =
+  let response_json =
+    run_typecheck_request_via_blorp
+      (typecheck_graph_request_json_with_policy ~resolved_imports
+         ~allow_debug_only_calls ~target ~modules ~module_targets)
+  in
+  typecheck_graph_stream_response_json
+    ~module_count:(List.length module_targets)
+    response_json
 
 let cli_run_via_command ?version args =
   run_cli_request_via_blorp ?version args |> cli_run_response_json

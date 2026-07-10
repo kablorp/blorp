@@ -192,6 +192,10 @@ val requires_process_isolation : string -> bool
 (** True when a test path is configured to stay out of aggregate run-all
     harnesses because it exercises process-global runtime state. *)
 
+val requires_compilation_isolation : string -> bool
+(** True only when a test path cannot safely share a compiled selector harness.
+    Execution isolation alone does not imply recompiling the test program. *)
+
 val source_text_matches_current_file : string -> string option -> bool
 (** True when cached source text, if supplied, still matches the current file
     contents. Used to avoid saving cache entries for stale classified source. *)
