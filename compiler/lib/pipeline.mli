@@ -188,7 +188,7 @@ val compile_legacy_direct_source :
 
     [on_stage_json] fires for Blorp-owned late stages requested through
     [tail_observation_stages]. These observations are bridge JSON because OCaml
-    no longer owns authoritative Core values after the post-Perceus handoff.
+    no longer owns authoritative Core values after the post-DCE handoff.
 
     [require_main] rejects user sources that do not declare a top-level
     [main] function before Core/codegen. It is intended for runnable entry

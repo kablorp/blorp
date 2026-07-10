@@ -24,9 +24,10 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> OCaml host command execution / module-cache and coherence orchestration /
      typed-artifact decode
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
-  -> OCaml Core pipeline through Perceus
-  -> JSON post-Perceus Core
-  -> Blorp reuse / closure / resource / fairness / prepare / prepared reuse
+  -> OCaml Core pipeline through DCE
+  -> JSON post-DCE Core
+  -> Blorp consume specialization / Perceus / reuse / closure / resource /
+     fairness / prepare / prepared reuse
   -> Blorp C artifact emission
   -> OCaml artifact writing / C compiler invocation
 ```
@@ -69,19 +70,15 @@ Current production backend-tail Blorp files:
 
 - `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
 - `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
-
-Checkpoint 10 also has direct Blorp implementations that are tested but are
-not yet on the production path:
-
-- `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
-- `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
-- `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
 
 Current OCaml bridge, orchestration, and production-middle files:
 
@@ -94,15 +91,14 @@ Current OCaml bridge, orchestration, and production-middle files:
 - `compiler/lib/typed_ast.ml`
 - `compiler/lib/core_lower.ml`
 - `compiler/lib/core_pipeline.ml`
-- `compiler/lib/core_perceus.ml`
+- `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` still invokes the OCaml implementations of
-Core lowering, every early/middle Core pass, consume specialization, and
-Perceus. The production JSON handoff to Blorp is exactly after OCaml Perceus.
-Having a same-purpose Blorp module and focused tests does not move this boundary;
-the production caller must be switched before the corresponding OCaml code is
-deletable.
+Core lowering and every early/middle Core pass through DCE. The production JSON
+handoff to Blorp is exactly after OCaml DCE. Blorp is authoritative for consume
+specialization, Perceus, and the complete backend tail; the replaced OCaml
+implementations and their implementation-only tests have been deleted.
 
 The public executable is Blorp-owned through
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
@@ -167,7 +163,7 @@ Implementation steps:
 - Keep bridge request/response handling in `compiler_blorp_bridge.ml`.
   Compiler semantics should live on one side of the boundary, not in the
   bridge client.
-- Keep `emit_post_closure_c` and `run_core_pipeline` as the backend-tail
+- Keep `emit_core_c` and `run_core_pipeline` as the backend-tail
   boundary while OCaml still owns earlier Core stages.
 - Keep the bridge `parse_source` / `parse_sources` actions as the frontend
   parser boundary while OCaml still consumes parsed AST values. OCaml raw
@@ -2075,14 +2071,12 @@ Deletion point:
 Goal: finish the already-started backend ownership migration and remove the
 post-Perceus OCaml boundary.
 
-Status: consume specialization now has direct OCaml test parity for its nine
-Blorp regressions, the ownership registry covers the complete known
-intrinsic/runtime name inventory, and Perceus has substantial direct coverage.
-They remain deliberately outside the normal production Core pipeline. OCaml
-consume specialization and Perceus are still authoritative, and the production
-handoff is exactly post-Perceus. This checkpoint cannot move that handoff until
-the remaining ownership hardening below is complete and Checkpoints 8/9 deliver
-normal production Core to this stage.
+Status: the production boundary has moved from post-Perceus to post-DCE. Blorp
+consume specialization and Perceus are authoritative on every normal compile,
+the single `emit_core_c` bridge action runs the complete Blorp-owned tail, and
+the replaced OCaml implementations and implementation-only tests are deleted.
+The moved path has focused sanitizer coverage and has compiled the full Blorp
+CLI; the formatter path is also ASan-clean through this boundary.
 
 Current progress:
 
@@ -2098,7 +2092,7 @@ Current progress:
 - Perceus now infers user-function ownership contracts from function bodies to
   a bounded fixed point instead of depending on call-site metadata. Blorp Core
   lowering emits empty user-call ownership metadata, so this is required for
-  the future production boundary. The fixed-point implementation is
+  the production boundary. The fixed-point implementation is
   tail-recursive and sanitizer-tested after exposing an environment reuse bug.
 - Branch summaries and balancing cover `if` and compiled constructor decision
   trees, including nested literal and exact/minimum/fallback length matches,
@@ -2111,36 +2105,18 @@ Current progress:
   parameters, and recursively inserts drops through the exhaustive shared Core
   child mapper in `compiler_core_traverse.brp`.
 
-Remaining before the checkpoint can own production:
+Remaining cleanup after the ownership boundary move:
 
-- Port the remaining OCaml alias-temporary normalization as coherent Blorp
-  passes: `protect_consuming_field_args`,
-  `bind_borrowed_owned_temporary_args`, `retain_assignment_alias_rhs`,
-  `normalize_owned_result_aliases`, and `retain_alias_sources_expr`.
-- Carry borrowed match bindings through aggregate-member retention and
-  consuming-call argument protection, not only returned-result retention.
-- Finish task/concurrent capture ownership and resource/cancellation exit
-  parity, then run the runtime concurrency/resource leak suites.
-- Add Blorp stage invariant diagnostics equivalent to
-  `check_call_ownership_contracts_at` and the resource checks. Unknown
-  ownership contracts and pre-Perceus sentinels must fail closed before the
-  Perceus stage is exposed by `compiler_core_pipeline.brp`.
-- Validate normal pre-Perceus Core from Checkpoints 8/9 through consume
-  specialization, Perceus, reuse, closure, resource, fairness, prepare, and C
-  emission before moving or deleting the OCaml boundary.
+- Keep extending runtime leak and sanitizer coverage as new ownership-bearing
+  Core forms are introduced. New forms must be represented in the shared Core
+  traversal and fail closed when their call contract is unknown.
+- Delete the remaining OCaml ownership/layout facts and the Core JSON projector
+  only when the left boundary reaches the corresponding earlier Core stages;
+  they are still inputs to OCaml lowering and post-DCE projection today.
 
-OCaml references:
+Remaining OCaml references:
 
-- `compiler/lib/core_consume_specialize.ml`
-  - `rewrite_program`
 - `compiler/lib/core_ownership.ml`
-- `compiler/lib/core_perceus.ml`
-  - `insert_drops_program`
-  - branch/match ownership joins
-  - loop/repeated-context consume protection
-  - borrowed-result retention
-  - final drop insertion
-  - checker diagnostics
 - remaining metadata/layout helpers:
   - `core_layout_type.ml`
   - `core_hash_container_layout.ml`
@@ -2171,20 +2147,8 @@ Blorp references:
 
 Implementation steps:
 
-- Finish Perceus in Blorp before moving the production boundary left of
-  Perceus:
-  - branch balancing,
-  - match decision tree balancing,
-  - loop consume protection,
-  - concurrent ownership handling,
-  - borrowed-result retention,
-  - aggregate member retention,
-  - assignment alias retention,
-  - consumed parameter balancing,
-  - final drop insertion,
-  - checker diagnostics.
-- Keep consume-specialize before Perceus and preserve the current direct clone
-  eligibility rules.
+- Keep consume specialization immediately before Perceus and preserve the
+  current direct clone eligibility rules.
 - Move `core_layout_type`, option/result/hash-container layout, codegen names,
   and builtin mapping facts into Blorp as typed data rather than OCaml
   projection-time helpers.
@@ -2193,9 +2157,6 @@ Implementation steps:
   backend tail.
 - Keep Blorp emission the only C artifact generator. Do not add new OCaml
   emission helpers.
-- If backend deletion is prioritized before the frontend reaches Core lowering,
-  move the Perceus/ownership boundary leftward. Otherwise keep the next major
-  contiguous step on Checkpoint 7/8 so source-to-Core stays a single Blorp path.
 
 Edge cases:
 
@@ -2210,9 +2171,7 @@ Edge cases:
 
 Tests:
 
-- `compiler/test/test_core_consume_specialize.ml`
 - `compiler/test/test_core_ownership.ml`
-- `compiler/test/test_core_perceus.ml`
 - `compiler/blorp/tests/test_compiler_core_consume_specialize.brp`
 - `compiler/blorp/tests/test_compiler_core_ownership.brp`
 - `compiler/blorp/tests/test_compiler_core_perceus.brp`
@@ -2223,9 +2182,9 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml consume-specialize, ownership, Perceus, layout projection, and
-  Core-to-JSON projection modules after the full Core pipeline runs in Blorp
-  before ownership insertion.
+- Completed for OCaml consume specialization and Perceus. Delete OCaml
+  ownership/layout projection and Core-to-JSON modules after the contiguous
+  left boundary moves before their last production consumers.
 
 ## Checkpoint 11: Artifact Writing, Host C Invocation, Runtime Packaging
 

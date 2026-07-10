@@ -22,18 +22,17 @@
     13. [Core_dce] — prune unreachable concrete functions, impl methods,
        non-runtime generic function/impl templates, and source-only type
        declarations
-    14. [Core_consume_specialize] — clone safe self-replacement callees with
-       explicit consumed parameters
-    15. [Core_perceus] — insert CDup/CDrop for reference counting
-    16. backend handoff — default compilation gives post-Perceus Core to Blorp
+    14. backend handoff — default compilation gives post-DCE Core to Blorp
+    15. Blorp-owned consume-specialize pass
+    16. Blorp-owned Perceus — insert explicit dup/drop operations
     17. Blorp-owned final tail — normal reuse, closure conversion, resource
        cleanup lowering, fairness checkpoints, codegen preparation, prepared
        reuse, and C artifact emission
 
-    OCaml program-bearing callbacks stop at the post-Perceus handoff. CLI
+    OCaml program-bearing callbacks stop at the post-DCE handoff. CLI
     late-stage dumps/stops use Blorp Core JSON observation instead. Timing-only
     observation uses lightweight stage events. Normal C output always comes
-    from the Blorp post-Perceus handoff.
+    from the Blorp post-DCE handoff.
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -111,12 +110,13 @@ let observed_stage_order =
   (Core_stage.Lower :: transform_stage_order) @ [ Core_stage.Final ]
 
 let stage_observed_via_blorp_tail_json = function
-  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final -> true
+  | Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
+  | Core_stage.Closure | Core_stage.Final ->
+      true
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce ->
       false
 
 let pre_backend_program_stage_order =
@@ -131,13 +131,13 @@ let program_free_stage_event_order =
   pre_backend_program_stage_order @ [ Core_stage.Final ]
 
 let blorp_tail_stage_name = function
-  | (Core_stage.Reuse | Core_stage.Closure | Core_stage.Final) as stage ->
+  | ( Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
+    | Core_stage.Closure | Core_stage.Final ) as stage ->
       Some (Core_stage.to_string stage)
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce ->
       None
 
 let core_stage_list_contains target =
@@ -176,18 +176,18 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-let post_perceus_program_json ~reg program =
+let post_dce_program_json ~reg program =
   match Core_emit_blorp_c.program_json ~reg program with
   | Ok json -> json
   | Error error -> failwith (Core_emit_blorp_c.unsupported_to_string error)
 
 let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback) ~(stages : Core_stage.t list)
-    (post_perceus : Core.core_program) =
+    (post_dce : Core.core_program) =
   match stages with
   | [] -> ()
   | _ :: _ ->
-      let core_json = post_perceus_program_json ~reg post_perceus in
+      let core_json = post_dce_program_json ~reg post_dce in
       List.iter
         (fun stage ->
           match blorp_tail_stage_name stage with
@@ -204,14 +204,14 @@ let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
 
 type backend_core_input = {
   blorp_tail_input : Core.core_program;
-      (** Post-Perceus Core handed to Blorp for reuse/closure/resource/fairness/
-          prepare/prepared-reuse/emission on the default path. *)
+      (** Post-DCE Core handed to Blorp for consume specialization, Perceus,
+          reuse, closure, resource/fairness, prepare, and emission. *)
 }
 
 (** Run C emission through the single Blorp backend path. Normal compilation
-    hands off before the final tail so Blorp owns reuse/closure/resource/
-    fairness/prepare. Late-stage CLI observation uses [on_stage_json] over the
-    Blorp tail. *)
+    hands off after DCE so Blorp owns consume specialization, Perceus, and the
+    complete backend tail. Late-stage CLI observation uses [on_stage_json] over
+    the Blorp-owned stages. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     ~(reg : Codegen_types.registry) ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback)
@@ -223,7 +223,7 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
   in
   let result =
-    Core_emit_blorp_c.try_emit_post_closure_program_string cfg
+    Core_emit_blorp_c.try_emit_core_program_string cfg
       backend_input.blorp_tail_input
   in
   if
@@ -246,7 +246,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  let post_perceus =
+  let post_dce =
     prog |> observe Core_stage.Lower
     |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
     |> run_stage Core_stage.Desugar (fun p ->
@@ -275,11 +275,8 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
         |> Core_specialize.specialize_program ~reg
         |> Core_closure.adapt_function_refs_program)
     |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
-    |> run_stage Core_stage.ConsumeSpecialize
-         (Core_consume_specialize.rewrite_program ~reg)
-    |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
   in
-  { blorp_tail_input = post_perceus }
+  { blorp_tail_input = post_dce }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(on_stage_event = no_op_on_stage_event)

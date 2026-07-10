@@ -1,8 +1,8 @@
 (** Core IR desugaring passes.
 
-    Runs after [Core_lower] and before [Core_match] / [Core_perceus].
+    Runs after [Core_lower] and before [Core_match] / the Blorp Perceus pass.
     Rewrites sugar nodes into simpler Core primitives so that downstream
-    passes (and [Core_emit]) see a smaller, more regular IR surface.
+    passes (and the Blorp C emitter) see a smaller, more regular IR surface.
 
     {1 Passes}
 

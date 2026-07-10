@@ -584,7 +584,7 @@ let prefix_module_names (mod_name : string) (decls : Core.core_program) :
     every type alias, enum type, and value-record name the program
     declares. [Core_mono] reads these from [reg] to expand aliases
     eagerly (otherwise structural unification misses the expansion);
-    [Core_perceus] and [Core_emit]'s emission context use the same
+    the Blorp Perceus pass and C emitter use the same
     registrations so ownership classification and C layout agree about
     value records, enums, aliases, and managed destructor policies.
 

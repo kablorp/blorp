@@ -2,9 +2,11 @@
 
 This document defines the compiler-facing ownership model for managed values,
 Perceus reference-count insertion, and copy-on-write (COW). It is the semantic
-contract that `core_ownership.ml`, `core_perceus.ml`,
+contract that `core_ownership.ml`, `compiler_core_perceus.brp`,
 `compiler_core_reuse.brp`, `core_emit_layout.ml`, Core intrinsics, and the C
-runtime must implement.
+runtime must implement. Perceus and reuse are production Blorp stages; the
+remaining OCaml modules provide contracts and layout facts before the post-DCE
+handoff.
 
 The user-facing memory model is documented in `docs/MEMORY_MODEL.md`. This file
 is lower level: it defines the ownership ABI used by compiler phases.

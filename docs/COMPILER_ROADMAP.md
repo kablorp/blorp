@@ -62,7 +62,7 @@ Current state:
   available.
 - `Core_resolve` promotes selected and name-based calls to `CKUser (name,
   Some def_id)` when it can prove the concrete target.
-- `Core_emit` already prefers DefId-based C names, but still has a
+- The Blorp C emitter already prefers DefId-based C names, but still has a
   compatibility fallback for `CKUser (_, None)`.
 - Purity analysis and `purify` already know how to read resolved call metadata,
   but still keep parse/env-based fallbacks for unresolved cases.

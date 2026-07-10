@@ -42,7 +42,7 @@
       populated by a later "captures" pass, not here.
     - Decision-tree match compilation: [CMatchArms] carries raw
       [Ast.pattern]; [Core_match] compiles it to [CMatch] downstream.
-    - RC insertion: no [CDup]/[CDrop]. Those are inserted by [Core_perceus]. *)
+    - RC insertion: no [CDup]/[CDrop]. The Blorp Perceus pass inserts them. *)
 
 open Ast
 module TA = Typed_ast
@@ -1177,7 +1177,7 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
           (* Concurrent block at block head: extract task bindings into the
              [CConcurrent] node's [conc_bindings] field, with subsequent
              block statements becoming [conc_body] (the tail). This shape
-             lets downstream passes ([Core_perceus] especially) see the
+             lets downstream passes (the Blorp Perceus pass especially) see the
              concurrent bindings as scoping over their real uses in the
              tail, rather than being trapped inside an opaque [CConcurrent]
              body where their uses look like zero. *)

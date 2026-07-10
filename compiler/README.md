@@ -40,7 +40,6 @@ compiler/
 │   ├── core.ml               # Core IR definitions
 │   ├── core_pipeline.ml      # Core pipeline orchestration
 │   ├── core_ownership.ml     # Ownership contracts for calls/intrinsics
-│   ├── core_perceus.ml       # ARC insertion via CDup/CDrop
 │   ├── core_closure.ml       # Function-reference eta adapters
 │   ├── core_emit_blorp_c.ml  # Bridge projection for Blorp-owned C emission
 │   ├── core_*.ml             # Other Core lowering, transforms, and layout passes

@@ -54,17 +54,19 @@ late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the supported default backend route crosses the
-single JSON bridge after `Core_perceus`. On that route,
+single JSON bridge after OCaml `Core_dce`. On that route,
+`compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_resource.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`, and
 `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` own the contiguous tail through C
-artifact generation. CLI `reuse`/`closure`/`final` dumps and stops observe the
-Blorp-owned tail as Core JSON through the bridge; OCaml program callbacks stop
-at the post-Perceus handoff. C artifact emission is owned by the Blorp backend
-bridge.
+artifact generation. CLI `consume-specialize`/`perceus`/`reuse`/`closure`/`final`
+dumps and stops observe the Blorp-owned tail as Core JSON through the bridge;
+OCaml program callbacks stop at the post-DCE handoff. C artifact emission is
+owned by the Blorp backend bridge.
 
 ```
 Typed AST
@@ -153,20 +155,22 @@ Typed AST
              (core_dce.ml)
     |
     v
++--------------------------+
+| JSON handoff (supported) |  Supported post-DCE Core enters the
++--------------------------+  contiguous Blorp-owned backend
+    |
+    v
 +-------------------------+
-| Core_consume_specialize |  Clone safe source-owned self-replacement callees
+| Blorp consume-specialize|  Clone safe source-owned self-replacement callees
 +-------------------------+  with explicit consumed parameters before Perceus
-                            (core_consume_specialize.ml)
+                            (compiler_core_consume_specialize.brp)
     |
     v
 +--------------+
-| Core_perceus |  Insert CDup/CDrop for reference counting (core_perceus.ml)
+| Blorp Perceus|  Insert CDup/CDrop for reference counting
 +--------------+  Koka-style precise RC: branch-aware, last-use semantics
+                  (compiler_core_perceus.brp)
     |
-    v
-+--------------------------+
-| JSON handoff (supported) |  Supported post-Perceus Core enters the
-+--------------------------+  Blorp-owned compiler tail for normal emission
     v
 +------------------+
 | Blorp Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
@@ -268,11 +272,9 @@ boxing, or ownership behavior from source spelling.
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
-| `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
-| `core_perceus.ml` | Perceus RC insertion (CDup/CDrop) |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `core_closure.ml` | First-class function reference eta-adapter synthesis before the Blorp closure tail |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
@@ -355,8 +357,6 @@ compiler/
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
 │   ├── core_dce.ml       # Dead concrete declaration pruning before ownership
-│   ├── core_consume_specialize.ml # Source-owned consuming-call clones
-│   ├── core_perceus.ml    # Core IR Perceus RC insertion
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_closure.ml    # Function-reference eta adapters
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
@@ -716,7 +716,8 @@ Zero-capture closures are emitted as immortal file-scope
 `blorp_closure_new_inline`, store captures in the inline environment, and set
 `env_release_mask` so closure destruction releases retained managed captures.
 
-**Perceus RC** (`core_perceus.ml`): Precise reference counting via
+**Perceus RC** (`compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`):
+Precise reference counting via
 `CDup`/`CDrop` nodes. Perceus consumes the ownership ABI defined in
 `docs/OWNERSHIP_MODEL.md`: read-only parameters borrow, owned managed returns
 must cross source-level function boundaries as owned values, and COW-consuming

@@ -150,17 +150,20 @@ let test_blorp_tail_json_observation_captures_late_stages () =
 let test_blorp_tail_json_observation_records_stage_events () =
   let prog = lower_source small_source in
   let stages = ref [] in
+  let requested_tail_stages =
+    [ Core_stage.Reuse; Core_stage.Closure; Core_stage.Final ]
+  in
   let _c_code =
     Core_pipeline.compile_typed
-      ~tail_observation_stages:
-        [ Core_stage.Reuse; Core_stage.Closure; Core_stage.Final ]
+      ~tail_observation_stages:requested_tail_stages
       ~on_stage_event:(fun stage -> stages := stage :: !stages)
       ~on_stage_json:(fun _stage _json -> ())
       prog
   in
   Alcotest.(check (list string))
     "tail JSON stage events in order"
-    (List.map Core_stage.to_string Core_stage.all)
+    (List.map Core_stage.to_string
+       (Core_pipeline.pre_backend_program_stage_order @ requested_tail_stages))
     (List.rev !stages |> List.map Core_stage.to_string)
 
 let test_stop_after_short_circuits () =

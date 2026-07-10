@@ -31,7 +31,8 @@
       or unwraps them for debug builds. Emitters do not decide this policy.
 
     - {b RC is explicit in late Core.} [CDup] / [CDrop] nodes are inserted
-      by [Core_perceus] after specialization and before closure conversion.
+      by the Blorp Perceus pass after specialization and before closure
+      conversion.
 
     {1 What's NOT in Core}
 
@@ -482,8 +483,9 @@ and match_binding = {
 
     Each internal node represents a runtime test; each leaf carries the
     bindings to establish before evaluating the user body. The tree is
-    produced by [Core_match.compile_match] and consumed by [Core_perceus]
-    for liveness/drop placement and by [Core_emit] for backend output.
+    produced by [Core_match.compile_match] and consumed by the Blorp Perceus
+    pass for liveness/drop placement and by the Blorp C emitter for backend
+    output.
 
     Design choice: the tree is self-contained with accessors instead
     of raw [core] expressions. Sub-scrutinees are reached via
@@ -526,7 +528,7 @@ and ctree =
     these to one of the concrete kinds below, based on a name-lookup
     env built from the program.
 
-    The point of the tag is to keep [Core_emit] small: emitters switch
+    The point of the tag is to keep the Blorp C emitter small: emitters switch
     on [call_kind] instead of re-doing name lookups at every call site.
 
     - [CKUser name]: call to a user-defined blorp function by source name.
@@ -995,7 +997,7 @@ and closure_create = {
   cc_def_id : int;
       (** [cf_def_id] of the hoisted function [cc_func] refers to.
       [Core_closure] mints a fresh [core_func] for the lambda and
-      copies its [cf_def_id] here so [Core_emit] can mangle the
+      copies its [cf_def_id] here so the Blorp C emitter can mangle the
       static closure ([__sc_<mangled>]) and the inline closure new
       call using the same DefId the function's decl site uses. *)
   cc_captures : (string * Ast.type_expr) list;
@@ -2548,7 +2550,7 @@ type core_func = {
       is this?" identity doesn't shift when the name does.
 
       Used by [Core_resolve] to key [user_funcs] entries and by
-      [Core_emit] to emit the mangled C symbol for user functions. Typed as
+      the Blorp C emitter to emit the mangled C symbol for user functions. Typed as
       [int] rather than
       [Env_types.def_id] because [core.ml] must stay independent of
       [env_types] (both re-export through higher-level modules).

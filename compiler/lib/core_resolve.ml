@@ -54,7 +54,7 @@ type env = {
     - [user_funcs]: user-defined function names → [def_id] of the
       target (A4.2). Keyed by the post-flatten [cf_name] (i.e. what
       call sites will look up). The [def_id] populates
-      [CKUser (name, Some def_id)] so [Core_emit] can mangle the C
+      [CKUser (name, Some def_id)] so the Blorp C emitter can mangle the C
       symbol via [Codegen_names.mangle_by_def_id] without reaching
       back through [env].
     - [user_func_names_by_id]: reverse index for call sites that carry a
@@ -85,7 +85,7 @@ type env = {
     - [foreign_funcs]: foreign function names → their user-specified
       [c_name] and argument-passing mode (bypass — no mangling).
     - [constructor_names]: set of in-scope constructor names. Used for
-      the [is_union_constructor] classification in [Core_emit]. *)
+      the [is_union_constructor] classification in the Blorp C emitter. *)
 
 let remember_user_func_id (env : env) (name : string) (def_id : int) : unit =
   match Hashtbl.find_opt env.user_func_names_by_id def_id with

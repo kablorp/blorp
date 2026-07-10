@@ -3096,7 +3096,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
   | _ -> e
 
 (** Specialize a function body. Generic bodies (those with remaining type
-    parameters after mono) only get phase-invariant layout rewrites. [Core_emit]
+    parameters after mono) only get phase-invariant layout rewrites. The Blorp C emitter
     skips them (only monomorphized copies are emitted), and several specialize
     rewrites (notably [tensor_peel] → [blorp_tensor_slice_row]) require
     concrete dim values that a generic body doesn't have. Layout-bearing list

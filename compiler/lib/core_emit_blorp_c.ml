@@ -2455,7 +2455,9 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       let* fields = typed [ ("retain", retain) ] in
       Ok (kind "list_retain" fields)
   | Core.CCall
-      ( (Core.CKIntrinsic "list_set" | Core.CKIntrinsic "list_set_owned"),
+      (Core.CKIntrinsic ("list_set" as intrinsic_name), _callee, [ lst; index; value ])
+  | Core.CCall
+      ( Core.CKIntrinsic ("list_set_owned" as intrinsic_name),
         _callee,
         [ lst; index; value ] ) ->
       let layout =
@@ -2463,7 +2465,9 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       let* set =
         list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".set") layout lst index value
+          enum_constructors (path ^ ".set")
+          ~transfers_ownership:(String.equal intrinsic_name "list_set_owned")
+          layout lst index value
       in
       let* fields = typed [ ("set", set) ] in
       Ok (kind "list_set" fields)
@@ -2475,7 +2479,8 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       let* set =
         list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".set") layout lst index value
+          enum_constructors (path ^ ".set") ~transfers_ownership:true layout
+          lst index value
       in
       let* fields = typed [ ("set", set) ] in
       Ok (kind "list_handoff_set_owned" fields)
@@ -5822,9 +5827,14 @@ and unbox_json ~function_names ~consumed_params ~reg enum_names value_record_nam
   Ok (kind_value, expr_value)
 
 and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-    enum_constructors path (layout : Core.list_storage_layout) list index value
-    =
-  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
+    enum_constructors path ~transfers_ownership
+    (layout : Core.list_storage_layout) list index value =
+  let boxed_value =
+    {
+      (Core_emit_layout.boxed_storage_value ~reg value) with
+      bsv_transfers_ownership = transfers_ownership;
+    }
+  in
   let* () = require_list_set_layout path layout boxed_value in
   let* layout_json = list_storage_layout_json layout in
   let* list_json =
@@ -8560,17 +8570,17 @@ let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
       Runtime.runtime_code ^ "\n" ^ artifact.Compiler_blorp_bridge.c_code;
   }
 
-let emit_post_closure_program_to_artifact (config : config)
+let emit_core_program_to_artifact (config : config)
     (program : Core.core_program) =
   let* core_json = program_json ~reg:config.reg program in
   let artifact =
-    Compiler_blorp_bridge.emit_post_closure_c_artifact_exn
+    Compiler_blorp_bridge.emit_core_c_artifact_exn
       ~profile:config.profile core_json
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
 let emit_program_string config program =
-  match emit_post_closure_program_to_artifact config program with
+  match emit_core_program_to_artifact config program with
   | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
   | Error _ as error -> error
 
@@ -8579,4 +8589,4 @@ let try_emit_program_string config program =
   | Ok _ as ok -> ok
   | Error error -> Error (unsupported_to_string error)
 
-let try_emit_post_closure_program_string = try_emit_program_string
+let try_emit_core_program_string = try_emit_program_string
