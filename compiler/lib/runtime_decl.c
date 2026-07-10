@@ -1083,7 +1083,6 @@ static inline bool blorp_is_unique(void* obj) {
 #endif
 }
 
-// (removed blorp_list_len — now IR intrinsic)
 
 static inline void* blorp_list_get_inline(blorp_List* list, long index) {
     if (__builtin_expect(!list || index < 0 || index >= list->len, 0)) return NULL;
@@ -1154,14 +1153,9 @@ blorp_String* blorp_string_concat(const blorp_String* a, const blorp_String* b);
 blorp_String* blorp_string_concat_consume(blorp_String* a, blorp_String* b);
 blorp_String* blorp_string_concat_many(long count, ...);
 bool blorp_string_eq(const blorp_String* a, const blorp_String* b);
-bool blorp_string_eq_cstr(const blorp_String* s, const char* cstr);
-bool blorp_string_eq_consume(blorp_String* a, blorp_String* b);
 long blorp_string_compare(const blorp_String* a, const blorp_String* b);
-long blorp_string_compare_consume(blorp_String* a, blorp_String* b);
-// (removed blorp_char_at — now IR intrinsic)
 blorp_String* blorp_from_char(int32_t c);
 blorp_String* blorp_from_chars(blorp_List* chars);
-blorp_String* blorp_string_with_capacity(long cap);
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other);
 blorp_String* blorp_string_append_int(blorp_String* s, long value);
 blorp_String* blorp_string_copy_ffi(blorp_String* src);
@@ -1175,7 +1169,6 @@ blorp_String* blorp_read_line(void);
 blorp_String* blorp_read_line_or_empty(void);
 blorp_String* blorp_input(blorp_String* prompt);
 blorp_String* blorp_input_or_empty(blorp_String* prompt);
-// (removed blorp_exit — now IR intrinsic)
 
 // Conversion
 blorp_String* blorp_to_string(long i);
@@ -1221,7 +1214,6 @@ blorp_Result* blorp_result_err(void* value);
 blorp_ConcurrencyError* blorp_TaskFailed(void* msg);
 
 // Safe Access / Parsing
-// (removed blorp_list_get_opt — now IR intrinsic)
 blorp_StackOption_Char blorp_string_get_opt(const blorp_String* s, long index);
 blorp_StackOption_Int blorp_parse_int(blorp_String* s);
 blorp_StackOption_Float blorp_parse_float(blorp_String* s);
@@ -1229,13 +1221,6 @@ blorp_StackOption_Float blorp_parse_float(blorp_String* s);
 // List Mutation
 blorp_List* blorp_list_append(blorp_List* list, void* element);
 blorp_List* blorp_list_append_owned(blorp_List* list, void* element);
-// (removed blorp_list_set_releasing — now IR intrinsic)
-// (removed blorp_list_set_inplace — now IR intrinsic)
-// (removed blorp_list_set_releasing_inplace — now IR intrinsic)
-// (removed blorp_list_insert_inplace — now IR intrinsic)
-// (removed blorp_list_remove_inplace — now IR intrinsic)
-blorp_List* blorp_list_build(long count, ...);
-blorp_List* blorp_list_copy_ffi(blorp_List* src);
 blorp_List* blorp_list_cow(blorp_List* list);
 blorp_List* blorp_list_ensure_capacity(blorp_List* list, long min_cap);
 blorp_List* blorp_list_reuse_alloc(blorp_List* list, long min_cap);
@@ -1361,13 +1346,9 @@ blorp_Vector* blorp_vector_new_fill_i64(long value, long size);
 blorp_Vector* blorp_matrix_new_fill_i64(long value, long rows, long cols);
 blorp_Vector* blorp_vector_new_fill_sized(void* value, long size, long elem_byte_size);
 blorp_Vector* blorp_matrix_new_fill_sized(void* value, long rows, long cols, long elem_byte_size);
-blorp_Vector* blorp_tensor3_new_sized(void* value, long d1, long d2, long d3, long elem_byte_size);
-blorp_Vector* blorp_tensor4_new_sized(void* value, long d1, long d2, long d3, long d4, long elem_byte_size);
-blorp_Vector* blorp_tensor5_new_sized(void* value, long d1, long d2, long d3, long d4, long d5, long elem_byte_size);
 blorp_Vector* blorp_vector_new(long size);
 blorp_Vector* blorp_vector_new_noinit(long size);
 blorp_Vector* blorp_tensor_new(long first_dim, long total_capacity);
-blorp_Vector* blorp_tensor_peel_row(blorp_Vector* tensor, long row_idx, long sub_len);
 blorp_Vector* blorp_vector_abs(blorp_Vector* v);
 blorp_Vector* blorp_vector_new_f64(long size);
 blorp_Vector* blorp_vector_new_f32(long size);
@@ -1385,8 +1366,6 @@ blorp_Vector* blorp_matrix_new_fill_packed(long value, long rows, long cols, int
 blorp_Vector* blorp_vector_set_inplace_packed(blorp_Vector* arr, long index, long value);
 blorp_String* blorp_vector_to_string_packed_enum(blorp_Vector* v, blorp_String* (*to_str)(long));
 blorp_String* blorp_vector_to_string_bool(blorp_Vector* v);
-// (removed blorp_vector_len — now IR intrinsic)
-void* blorp_vector_get(blorp_Vector* arr, long index);
 void blorp_vector_set(blorp_Vector* arr, long index, void* value);
 void* blorp_checked_get(blorp_Vector* arr, long index);
 double blorp_checked_get_f64(blorp_Vector* arr, long index);
@@ -1460,12 +1439,10 @@ blorp_Option* blorp_matrix_set_opt(blorp_Vector* arr, long row, long col, void* 
 blorp_Vector* blorp_matrix_set_opt_nullable(blorp_Vector* arr, long row, long col, void* val);
 blorp_Option* blorp_matrix_set_opt_i64(blorp_Vector* arr, long row, long col, long val);
 blorp_Vector* blorp_matrix_set_opt_nullable_i64(blorp_Vector* arr, long row, long col, long val);
-blorp_Vector* blorp_vector_copy_ffi(blorp_Vector* src);
 blorp_Vector* blorp_vector_cow_unique(blorp_Vector* arr);
 
 // Vector Element-wise Ops
 blorp_Vector* blorp_vector_op(int op, int elem_type, const blorp_Vector* a, const blorp_Vector* b);
-blorp_Vector* blorp_vector_op_cow(int op, int elem_type, blorp_Vector* a, const blorp_Vector* b);
 blorp_Vector* blorp_vector_add_i64(const blorp_Vector* a, const blorp_Vector* b);
 blorp_Vector* blorp_vector_sub_i64(const blorp_Vector* a, const blorp_Vector* b);
 blorp_Vector* blorp_vector_mul_i64(const blorp_Vector* a, const blorp_Vector* b);
@@ -1498,8 +1475,6 @@ _Float16 blorp_vector_min_float16(blorp_Vector* v);
 double blorp_vector_norm(blorp_Vector* v);
 
 // Vector Scalar Ops
-blorp_Vector* blorp_vector_add_int(blorp_Vector* a, blorp_Vector* b);
-blorp_Vector* blorp_vector_add_float(blorp_Vector* a, blorp_Vector* b);
 blorp_Vector* blorp_vector_scalar_add_i64(const blorp_Vector* v, long scalar);
 blorp_Vector* blorp_vector_scalar_sub_i64(const blorp_Vector* v, long scalar);
 blorp_Vector* blorp_vector_scalar_mul_i64(const blorp_Vector* v, long scalar);
@@ -1522,8 +1497,6 @@ blorp_Vector* blorp_vector_scalar_rev_sub_f32(const blorp_Vector* v, float scala
 blorp_Vector* blorp_vector_scalar_rev_div_f32(const blorp_Vector* v, float scalar);
 blorp_Vector* blorp_vector_scalar_op_int(int op, blorp_Vector* v, long scalar);
 blorp_Vector* blorp_vector_scalar_op_float(int op, blorp_Vector* v, double scalar);
-blorp_Vector* blorp_vector_scalar_op_int_cow(int op, blorp_Vector* v, long scalar);
-blorp_Vector* blorp_vector_scalar_op_float_cow(int op, blorp_Vector* v, double scalar);
 blorp_Vector* blorp_vector_scalar_op_rev_int(int op, blorp_Vector* v, long scalar);
 blorp_Vector* blorp_vector_scalar_op_rev_float(int op, blorp_Vector* v, double scalar);
 blorp_Vector* blorp_vector_scalar_op_float32(int op, blorp_Vector* v, float scalar);
@@ -1532,7 +1505,6 @@ blorp_Vector* blorp_vector_scalar_op_rev_float32(int op, blorp_Vector* v, float 
 blorp_Vector* blorp_vector_scalar_op_float16(int op, blorp_Vector* v, _Float16 scalar);
 blorp_Vector* blorp_vector_scalar_op_rev_float16(int op, blorp_Vector* v, _Float16 scalar);
 #endif
-blorp_Vector* blorp_vector_slice(blorp_Vector* v, long start, long end);
 long blorp_vector_eq(int elem_type, blorp_Vector* a, blorp_Vector* b);
 
 // Vector Transcendental
@@ -1570,8 +1542,6 @@ blorp_String* blorp_list_to_string_bool(blorp_List* list);
 blorp_String* blorp_list_to_string_cb(blorp_List* list, blorp_String* (*elem_to_str)(void*));
 
 // Vector Construction / Argmax / Cumsum / Cross / Tensor
-// (removed blorp_arange — now IR intrinsic)
-// (removed blorp_linspace — now IR intrinsic)
 blorp_Vector* blorp_vector_cross_float(blorp_Vector* a, blorp_Vector* b);
 blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long row_size, long result_first_dim);
 blorp_Vector* blorp_tensor_matrix_multiply_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
@@ -1603,17 +1573,6 @@ long blorp_length(void* collection);
 blorp_Bytes* blorp_bytes_new(long capacity);
 blorp_Bytes* blorp_bytes_from_string(blorp_String* s);
 blorp_String* blorp_bytes_to_string(blorp_Bytes* b);
-// (removed blorp_bytes_get — now IR intrinsic)
-// (removed blorp_bytes_set_cow — now IR intrinsic)
-// (removed blorp_bytes_slice — now IR intrinsic)
-// (removed blorp_bytes_append — now IR intrinsic)
-// (removed blorp_bytes_fill — now IR intrinsic)
-// (removed blorp_bytes_blit — now IR intrinsic)
-// (removed blorp_bytes_index_of — now IR intrinsic)
-// (removed blorp_bytes_index_of_opt — now IR intrinsic)
-// (removed blorp_bytes_concat — now std source)
-// (removed blorp_bytes_read/write integer helpers — now std source)
-// (removed blorp_bytes_to_hex — now std source)
 blorp_Bytes* blorp_bytes_from_hex(const blorp_String* s);
 blorp_Bytes* blorp_bytes_from_hex_nullable(const blorp_String* s);
 
@@ -1661,10 +1620,6 @@ blorp_TcpStreamResult blorp_tcp_connect_loopback_raw(long family, long port);
 blorp_TcpStreamResult blorp_tcp_connect_ip_raw(blorp_String* address, long port);
 blorp_TcpStreamResult blorp_tcp_connect_scoped_ip_raw(blorp_String* address, blorp_String* scope, long port);
 blorp_TcpStreamResult blorp_tcp_connect_name_raw(blorp_String* name, long port);
-blorp_TcpListener* blorp_tcp_listener_from_fd(long fd);
-blorp_TcpStream* blorp_tcp_stream_from_fd(long fd);
-long blorp_tcp_listener_fd(blorp_TcpListener* listener);
-long blorp_tcp_stream_fd(blorp_TcpStream* stream);
 
 // DNS Networking
 blorp_DnsAddressesResult blorp_dns_resolve_raw(blorp_String* hostname);
@@ -1778,9 +1733,6 @@ void blorp_thread_pool_init(long max_threads);
 void blorp_thread_pool_ensure_initialized(void);
 void blorp_thread_pool_shutdown(void);
 void* blorp_task_spawn(blorp_Closure* func);
-void* blorp_task_spawn_owned(blorp_Closure* func);
-void* blorp_task_spawn_rc(blorp_Closure* func);
-void* blorp_task_spawn_owned_rc(blorp_Closure* func);
 void blorp_concurrent_task_window_begin(
     blorp_ConcurrentTaskWindow* window,
     blorp_CancelCleanupFrame* cleanup,
@@ -1799,11 +1751,7 @@ void blorp_concurrent_task_window_spawn_owned_rc(
     blorp_Closure* func,
     blorp_ConcurrentTaskFlushMode flush_mode
 );
-void blorp_task_init_result_rc(void* t);
 void blorp_detach(void* fn);
-void blorp_detach_rc(void* fn);
-void* blorp_task_join(void* t);
-void* blorp_task_try_join(void* t);
 void* blorp_concurrent_join(void* t, long timeout_ms);
 void* blorp_concurrent_join_cleanup_release(void** task_slot, long timeout_ms);
 void* blorp_concurrent_task_window_join_release(
@@ -2085,14 +2033,8 @@ void* blorp_fold_parallel_ordered_with(blorp_List* list, void* init, blorp_Closu
 blorp_List* blorp_zip_parallel_with(blorp_List* list_a, blorp_List* list_b, blorp_Closure* f, long threads, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 
 // Sequential list HOFs are synthesized as Core IR.
-// (removed blorp_list_concat — now IR intrinsic)
-// (removed blorp_list_reverse — now IR intrinsic)
-// (removed blorp_list_tail — now IR intrinsic)
-// (removed blorp_list_flatten — now IR intrinsic)
-// (removed blorp_list_take — now IR intrinsic)
 blorp_List* blorp_list_drop(blorp_List* list, long n);
 blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b);
-// (removed blorp_list_zip — now IR intrinsic)
 
 // Vector HOFs / Parallel Vector Ops
 blorp_Vector* blorp_vector_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc);
@@ -2174,34 +2116,11 @@ blorp_String* blorp_fixed_to_string(blorp_Fixed* f);
 double blorp_fixed_to_float(blorp_Fixed* f);
 
 // String Operations (Extended)
-blorp_String* blorp_substring(const blorp_String* s, long start, long len);
-// (removed blorp_starts_with — now IR intrinsic)
-// (removed blorp_ends_with — now IR intrinsic)
-// (removed blorp_contains [string version] — now IR intrinsic)
-// (removed blorp_index_of [string version] — now IR intrinsic)
-// (removed blorp_split — now std source)
-// (removed blorp_join — now std source)
-// (removed blorp_trim — now IR intrinsic)
-// (removed blorp_replace — now std source)
 blorp_String* blorp_upper(const blorp_String* s);
 blorp_String* blorp_lower(const blorp_String* s);
-// (removed blorp_capitalize — now IR intrinsic)
-// (removed blorp_equal_ignore_case — now std source)
-// (removed blorp_title_case — now IR intrinsic)
-// (removed blorp_string_repeat — now IR intrinsic)
 blorp_String* blorp_url_encode(const blorp_String* s);
 blorp_String* blorp_url_decode(const blorp_String* s);
 blorp_String* blorp_html_escape(const blorp_String* s);
-// (removed blorp_drop_left — now IR intrinsic)
-// (removed blorp_take_left — now IR intrinsic)
-// (removed blorp_trim_left — now IR intrinsic)
-// (removed blorp_trim_right — now IR intrinsic)
-// (removed blorp_string_count — now IR intrinsic)
-// (removed blorp_lines — now std source)
-// (removed blorp_string_reverse — now IR intrinsic)
-// (removed blorp_pad_left — now IR intrinsic)
-// (removed blorp_pad_right — now IR intrinsic)
-// (removed blorp_words — now std source)
 long blorp_codepoint_length(const blorp_String* s);
 static inline int32_t blorp_string_next_codepoint(const blorp_String* s, long* pos) {
     unsigned char c = (unsigned char)s->data[*pos];
@@ -2218,23 +2137,9 @@ static inline int32_t blorp_string_next_codepoint(const blorp_String* s, long* p
 }
 blorp_List* blorp_string_codepoints(const blorp_String* s);
 blorp_String* blorp_codepoint_reverse(const blorp_String* s);
-// (removed blorp_split_n — now std source)
-// (removed blorp_replace_first — now std source)
-// (removed blorp_last_index_of — now IR intrinsic)
-// (removed blorp_trim_chars — now IR intrinsic)
-// (removed blorp_take_right — now IR intrinsic)
-// (removed blorp_drop_right — now IR intrinsic)
-// (removed blorp_center — now IR intrinsic)
 
 // String analysis builtins
 blorp_List* blorp_string_chars(const blorp_String* s);
-// (removed blorp_string_is_numeric — now IR intrinsic)
-// (removed blorp_string_is_ascii — now IR intrinsic)
-// (removed blorp_string_is_blank — now IR intrinsic)
-// (removed blorp_string_is_lower — now IR intrinsic)
-// (removed blorp_string_is_upper — now IR intrinsic)
-// (removed blorp_string_hamming — now IR intrinsic)
-// (removed blorp_string_common_prefix — now IR intrinsic)
 long blorp_string_levenshtein(const blorp_String* a, const blorp_String* b);
 blorp_String* blorp_string_lcs(const blorp_String* a, const blorp_String* b);
 
@@ -2253,7 +2158,6 @@ blorp_Result* blorp_write_file(const blorp_String* path, const blorp_String* con
 blorp_Result* blorp_read_bytes(const blorp_String* path);
 blorp_Result* blorp_write_bytes(const blorp_String* path, const blorp_Bytes* content);
 blorp_List* blorp_read_all_lines(const blorp_String* path);
-// (removed blorp_write_lines — now IR intrinsic)
 bool blorp_append_file(const blorp_String* path, const blorp_String* content);
 blorp_Result* blorp_for_each_line(const blorp_String* path, blorp_Closure* callback);
 blorp_Result* blorp_for_each_chunk(const blorp_String* path, long chunk_size, blorp_Closure* callback);
@@ -2337,7 +2241,6 @@ void* blorp_file_size(const blorp_String* path);
 void* blorp_file_modified(const blorp_String* path);
 blorp_String* blorp_temp_dir(void);
 void* blorp_mkstemp_path(const blorp_String* prefix);
-// (removed blorp_walk_dir — now IR intrinsic)
 void* blorp_exec_output(const blorp_String* cmd);
 void* blorp_process_run(const blorp_String* program, const blorp_List* args);
 void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args);
@@ -2362,18 +2265,8 @@ blorp_String* blorp_sha512_bytes(blorp_Bytes* b);
 long blorp_crc32_bytes(blorp_Bytes* b);
 blorp_String* blorp_hmac_sha256(blorp_String* key, blorp_String* msg);
 
-// SIMD Vector Operations (non-static in runtime.o)
-blorp_Vector* blorp_simd_vector_op(int op, int elem_type, blorp_Vector* a, blorp_Vector* b);
-blorp_Vector* blorp_simd_vector_scalar_op_f64(int op, const blorp_Vector* v, double scalar);
-blorp_Vector* blorp_simd_vector_scalar_op_rev_f64(int op, const blorp_Vector* v, double scalar);
-blorp_Vector* blorp_simd_vector_op_f64_cow(int op, blorp_Vector* a, const blorp_Vector* b);
-blorp_Vector* blorp_simd_vector_scalar_op_f64_cow(int op, blorp_Vector* v, double scalar);
-blorp_Vector* blorp_simd_vector_op_f32_cow(int op, blorp_Vector* a, const blorp_Vector* b);
-blorp_Vector* blorp_simd_vector_scalar_op_f32_cow(int op, blorp_Vector* v, float scalar);
-
 // Container release helpers (non-static in runtime.o)
 void blorp_elem_release_fn(void* p);
-void blorp_list_set_elem_release(blorp_List* list, void (*release_fn)(void*));
 void blorp_list_init_elem_release(blorp_List* list, void (*release_fn)(void*));
 void blorp_vector_set_elem_release(blorp_Vector* v, void (*release_fn)(void*));
 void blorp_vector_init_elem_release(blorp_Vector* v, void (*release_fn)(void*));

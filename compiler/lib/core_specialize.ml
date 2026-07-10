@@ -198,12 +198,6 @@ let scalar_dispatch_builtin ~reversed elem =
   | TensorArithmeticInt, true | TensorArithmeticGenericIntLike, true ->
       "blorp_vector_scalar_op_rev_int"
 
-let simd_dispatch_elem_code elem =
-  match elem with
-  | TensorArithmeticFloat32 -> Some 0
-  | TensorArithmeticFloat -> Some 1
-  | _ -> None
-
 let require_tensor_parts ?reg ~loc ~context ty =
   match tensor_parts ?reg ty with
   | Some parts -> parts
@@ -2185,19 +2179,12 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
           let elem_code = tensor_arithmetic_elem_code elem in
           match (l_is_t, r_is_t) with
           | true, true ->
-              (* tensor OP tensor: use the SIMD dispatcher for packed floating
-             elements, otherwise fall back to the generic scalar helper. *)
               let fn, args =
                 match direct_vector_binary_builtin elem arith_op with
                 | Some fn -> (fn, [ l; r ])
-                | None -> (
-                    match simd_dispatch_elem_code elem with
-                    | Some code ->
-                        ( "blorp_simd_vector_op",
-                          [ mk_int op_code; mk_int code; l; r ] )
-                    | None ->
-                        ( "blorp_vector_op",
-                          [ mk_int op_code; mk_int elem_code; l; r ] ))
+                | None ->
+                    ( "blorp_vector_op",
+                      [ mk_int op_code; mk_int elem_code; l; r ] )
               in
               { e with desc = CCall (CKBuiltin fn, dummy, args) }
           | true, false ->

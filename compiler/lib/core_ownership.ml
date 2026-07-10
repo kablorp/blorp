@@ -1337,8 +1337,7 @@ let builtin_contract_table =
       builtins ~void_boxed_args:[ 0 ] [ "blorp_tensor5_new" ]
         (bfixed [ Retain; Borrow; Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
       (* Vector arithmetic allocates fresh results and borrows all inputs. *)
-      builtins
-        [ "blorp_vector_op"; "blorp_simd_vector_op" ]
+      builtins [ "blorp_vector_op" ]
         (bfixed [ Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
       builtins
         [
@@ -1432,18 +1431,6 @@ let builtin_contract_table =
           "blorp_vector_scalar_rev_div_f32";
         ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_vector_op_cow" ]
-        (bfixed [ Borrow; Borrow; CowConsume; Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_vector_scalar_op_int_cow";
-          "blorp_vector_scalar_op_float_cow";
-          "blorp_simd_vector_scalar_op_f32_cow";
-          "blorp_simd_vector_scalar_op_f64_cow";
-          "blorp_simd_vector_op_f32_cow";
-          "blorp_simd_vector_op_f64_cow";
-        ]
-        (bfixed [ Borrow; CowConsume; Borrow ] ReturnOwned);
       builtins
         [ "blorp_tensor_add_scaled_f32_cow"; "blorp_tensor_add_scaled_f64_cow" ]
         (bfixed [ CowConsume; Borrow; Borrow ] ReturnOwned);
