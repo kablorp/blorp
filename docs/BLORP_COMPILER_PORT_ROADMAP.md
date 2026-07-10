@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-09.
+Status checked against code on 2026-07-10.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -2107,6 +2107,32 @@ Current progress:
 
 Remaining cleanup after the ownership boundary move:
 
+- **Blocking ownership follow-up (confirmed 2026-07-10):** the committed
+  post-DCE boundary is not yet sanitizer-clean. `test_compiler_core_prepare`
+  has a heap-use-after-free in the nullable-Option tuple preparation case, and
+  `test_compiler_core_lower` exits 118 in the normal gate at the Result `?=`
+  lowering case. The failures come from managed Core values reused across
+  transformed results without one ownership model shared by Perceus and the
+  late backend.
+- Before moving the boundary left of DCE, replace the overloaded
+  `UserCall(..., consumed_args = [])` state with a phase-explicit call contract
+  model. It must distinguish unresolved input, proven borrow-all, proven
+  consuming arguments, and a result that may alias a preserved argument.
+  Perceus must resolve the contract before closure/reuse/emission; the late
+  backend must not reinterpret an unresolved call independently.
+- The call contract is necessary but not sufficient. A prototype carrying the
+  complete contract fixed the nullable-Option prepare failure, but the Result
+  lowering and Perceus suites then exposed unretained aliases when one
+  recursive Core value was installed into several fields of a returned
+  aggregate. Complete the temporary compiler-internal no-sharing discipline in
+  `COMPILER_OWNERSHIP_HARDENING_ROADMAP.md` before retrying the call-state
+  migration. This is a self-contained conservative implementation strategy;
+  it does not change the language's value-semantics contract.
+- Regression gates for that model must include the nullable-Option prepare
+  case, Result `?=` Core lowering, owned-union reuse, channel receive, task
+  result aliases, file-resource cleanup, and mutable aggregate assignment.
+  A conservative consume-all fallback avoids the use-after-free but regresses
+  reuse and leak coverage, so it is not an acceptable production fix.
 - Keep extending runtime leak and sanitizer coverage as new ownership-bearing
   Core forms are introduced. New forms must be represented in the shared Core
   traversal and fail closed when their call contract is unknown.

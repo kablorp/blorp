@@ -30,6 +30,9 @@ for history.
   aggressive OCaml-to-Blorp compiler migration, including explicit JSON
   boundaries, current Blorp-owned CLI/parser and Core-tail edges, and
   deletion-first merge points.
+- [COMPILER_OWNERSHIP_HARDENING_ROADMAP.md](COMPILER_OWNERSHIP_HARDENING_ROADMAP.md)
+  is the active checkpoint-10 plan for making compiler-owned Core
+  transformations sanitizer-clean before moving the production boundary.
 - [FRONTEND_SOURCE_AST_ROADMAP.md](FRONTEND_SOURCE_AST_ROADMAP.md) details the
   next contiguous frontend slice: raw parse vs typecheck-ready source AST,
   interpolation finalization, nested function hoisting, and subscript-read
