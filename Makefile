@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -10,6 +10,7 @@ BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
+BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -36,9 +37,8 @@ SECURITY_LEAK_TESTS := \
 	tests/test_blorp/sys/test_runtime_safety.brp \
 	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp
 
-# Default target: build and install blorp to project root, then warm the
-# formatter command path so the first interactive format is fast.
-all: install warm-formatter
+# Default target: build and install blorp to the project root.
+all: install
 
 # Only copy when build outputs are newer. Installed root binaries may be
 # ad-hoc signed on macOS, so byte-for-byte comparison against unsigned outputs
@@ -55,6 +55,8 @@ install: build-blorp-cli
 		codesign -s - ./blorp 2>/dev/null || true; \
 	fi
 
+warm: warm-formatter
+
 warm-formatter: install
 	@tmp_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/blorp-format-warm.XXXXXX"); \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
@@ -68,21 +70,25 @@ compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
-	cd compiler && dune build
+	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for compiler stages that have not yet moved across the boundary.
 build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	@new_hash=$$( { \
+	@bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
+	if [ -z "$$bridge_compiler" ]; then \
+		bridge_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
+	fi; \
+	new_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
-		printf '%s\n' "$(OCAML_HOST)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \
 		echo "Building Blorp CLI"; \
-		"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$(BLORP_CLI_INPUT_HASH)"; \
 	else \
@@ -128,6 +134,7 @@ hygiene-check:
 	@scripts/check-std-builtins
 	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
+	@tests/test_build_configuration.sh
 	@tests/test_scripts_test_harness.sh
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \

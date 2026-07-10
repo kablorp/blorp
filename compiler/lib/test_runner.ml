@@ -938,7 +938,7 @@ let normalized_relative_test_path filename =
 let path_under root path =
   path = root || starts_with path (root ^ Filename.dir_sep)
 
-let process_isolated_suite_roots =
+let compiler_module_init_isolated_suite_paths =
   [
     (* This Blorp compiler suite imports compiler_infer as part of second-pass
        body checking. When the generated run-all harness imports it before the
@@ -955,20 +955,55 @@ let process_isolated_suite_roots =
 	       typecheck-state tests. Run it through the ordinary one-file wrapper so
        module initialization is scoped to the test that needs it. *)
     "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp";
-    "tests/test_blorp/concurrency";
-    "tests/test_blorp/memory";
-    "tests/test_blorp/sys";
   ]
+
+let process_isolated_suite_roots =
+  compiler_module_init_isolated_suite_paths
+  @ [ "tests/test_blorp/concurrency"; "tests/test_blorp/sys" ]
 
 let filesystem_isolated_suite_roots = [ "tests/test_blorp/memory" ]
 
-let requires_process_isolation filename =
+type test_execution_isolation =
+  | SharedTestProcess
+  | FreshTestProcess of string
+  | FreshTestFilesystem of string
+
+type test_compilation_isolation =
+  | SharedTestCompilation
+  | SeparateTestCompilation
+
+let path_matches_any roots path =
+  List.exists (fun root -> path_under root path) roots
+
+let matching_root roots path = List.find_opt (fun root -> path_under root path) roots
+
+let execution_isolation filename =
   let path = normalized_relative_test_path filename in
-  List.exists (fun root -> path_under root path) process_isolated_suite_roots
+  match matching_root filesystem_isolated_suite_roots path with
+  | Some root -> FreshTestFilesystem root
+  | None -> (
+      match matching_root process_isolated_suite_roots path with
+      | Some root -> FreshTestProcess root
+      | None -> SharedTestProcess)
+
+let compilation_isolation filename =
+  let path = normalized_relative_test_path filename in
+  if path_matches_any compiler_module_init_isolated_suite_paths path then
+    SeparateTestCompilation
+  else SharedTestCompilation
+
+let requires_process_isolation filename =
+  match execution_isolation filename with
+  | SharedTestProcess -> false
+  | FreshTestProcess _ | FreshTestFilesystem _ -> true
 
 let requires_filesystem_isolation filename =
-  let path = normalized_relative_test_path filename in
-  List.exists (fun root -> path_under root path) filesystem_isolated_suite_roots
+  match execution_isolation filename with
+  | FreshTestFilesystem _ -> true
+  | SharedTestProcess | FreshTestProcess _ -> false
+
+let requires_compilation_isolation filename =
+  compilation_isolation filename = SeparateTestCompilation
 
 type test_file_info = {
   test_file_path : string;
@@ -977,8 +1012,8 @@ type test_file_info = {
   test_file_is_suite : bool;
   test_file_is_leak_baseline_program : bool;
   test_file_has_doctests : bool;
-  test_file_requires_process_isolation : bool;
-  test_file_requires_filesystem_isolation : bool;
+  test_file_execution_isolation : test_execution_isolation;
+  test_file_compilation_isolation : test_compilation_isolation;
 }
 
 let leak_baseline_root = "tests/test_blorp/memory/leak_check_baselines"
@@ -996,9 +1031,8 @@ let classify_test_file filename =
     test_file_is_suite = source_declares_testsuite source;
     test_file_is_leak_baseline_program = is_leak_baseline_program filename;
     test_file_has_doctests = source_mentions_doctests source;
-    test_file_requires_process_isolation = requires_process_isolation filename;
-    test_file_requires_filesystem_isolation =
-      requires_filesystem_isolation filename;
+    test_file_execution_isolation = execution_isolation filename;
+    test_file_compilation_isolation = compilation_isolation filename;
   }
 
 let isolated_test_environment cwd = [ ("TMPDIR", cwd) ]
@@ -2434,7 +2468,11 @@ let run_test_with_info ?(debug = false) ?(sanitize = false) ?sanitizer_mode
     ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout info =
   let filename = info.test_file_path in
   let isolate_filesystem =
-    leak_check || info.test_file_requires_filesystem_isolation
+    leak_check
+    ||
+    match info.test_file_execution_isolation with
+    | FreshTestFilesystem _ -> true
+    | SharedTestProcess | FreshTestProcess _ -> false
   in
   let invalid_suite_main_result () =
     {
@@ -2706,7 +2744,8 @@ let suite_selector_eligible_info mode info =
 let suite_run_all_eligible_info ~leak_check mode info =
   (not leak_check)
   && suite_selector_eligible_info mode info
-  && not info.test_file_requires_process_isolation
+  && info.test_file_execution_isolation = SharedTestProcess
+  && info.test_file_compilation_isolation = SharedTestCompilation
 
 (* Keep combined TestSuite harnesses below the size where module initialization
    and process-exit cleanup can fail before or after all suites pass. Four is
@@ -2730,6 +2769,26 @@ let chunk_by_count size items =
         loop rest (chunk :: chunks)
   in
   loop items []
+
+let selector_compilation_groups infos =
+  let groups = Hashtbl.create 4 in
+  let group_order = ref [] in
+  let group_key info =
+    match info.test_file_execution_isolation with
+    | SharedTestProcess -> None
+    | FreshTestProcess root | FreshTestFilesystem root -> Some root
+  in
+  List.iter
+    (fun info ->
+      let key = group_key info in
+      match Hashtbl.find_opt groups key with
+      | Some items -> Hashtbl.replace groups key (info :: items)
+      | None ->
+          group_order := key :: !group_order;
+          Hashtbl.add groups key [ info ])
+    infos;
+  !group_order |> List.rev
+  |> List.map (fun key -> Hashtbl.find groups key |> List.rev)
 
 (* ============================================================================
    Parallel Execution
@@ -2903,7 +2962,7 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
       (fun info ->
         suite_selector_eligible_info mode info
         && not (List.mem info.test_file_path run_all_files)
-        && not info.test_file_requires_process_isolation)
+        && info.test_file_compilation_isolation = SharedTestCompilation)
       infos
   in
   let selector_files =
@@ -2961,36 +3020,50 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           end)
     in
     let run_selector_combined () =
-      if List.length selector_files < 2 then ()
-      else begin
-        mark_handled selector_files;
-        match
-          compile_suite_selector_harness ~debug ~sanitize ?sanitizer_mode
-            ?precompiled ~leak_check selector_files
-        with
-        | Error detail ->
-            Printf.eprintf "Combined isolated test compile failed:\n%s\n%!"
-              detail;
-            record_harness_failure "combined isolated TestSuite compile"
-              ("(compile failed)\n  " ^ detail)
-        | Ok bin_file ->
-            Fun.protect
-              ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
-              (fun () ->
-                List.iteri
-                  (fun index info ->
-                    let file = info.test_file_path in
-                    let cwd =
-                      if leak_check || info.test_file_requires_filesystem_isolation
-                      then
-                        Some (isolated_test_cwd file)
-                      else None
-                    in
-                    record_result
-                      (run_suite_selector_case ~cwd ~timeout ~bin_file ~file
-                         ~index))
-                  selector_infos)
-      end
+      let batches =
+        if leak_check then [ selector_infos ]
+        else selector_compilation_groups selector_infos
+      in
+      List.iter
+        (fun batch_infos ->
+          if List.length batch_infos >= 2 then begin
+            let batch_files =
+              List.map (fun info -> info.test_file_path) batch_infos
+            in
+            mark_handled batch_files;
+            match
+              compile_suite_selector_harness ~debug ~sanitize ?sanitizer_mode
+                ?precompiled ~leak_check batch_files
+            with
+            | Error detail ->
+                Printf.eprintf
+                  "Combined isolated test compile failed:\n%s\n%!" detail;
+                record_harness_failure "combined isolated TestSuite compile"
+                  ("(compile failed)\n  " ^ detail)
+            | Ok bin_file ->
+                Fun.protect
+                  ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
+                  (fun () ->
+                    List.iteri
+                      (fun index info ->
+                        let file = info.test_file_path in
+                        let cwd =
+                          if
+                            leak_check
+                            ||
+                            match info.test_file_execution_isolation with
+                            | FreshTestFilesystem _ -> true
+                            | SharedTestProcess | FreshTestProcess _ -> false
+                          then
+                            Some (isolated_test_cwd file)
+                          else None
+                        in
+                        record_result
+                          (run_suite_selector_case ~cwd ~timeout ~bin_file ~file
+                             ~index))
+                      batch_infos)
+          end)
+        batches
     in
     run_all_combined ();
     run_selector_combined ();

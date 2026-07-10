@@ -1485,29 +1485,6 @@ blorp_Vector* blorp_simd_vector_div_f64(const blorp_Vector* a, const blorp_Vecto
     return result;
 }
 
-// Dispatcher function for SIMD vector operations
-// op: 0=add, 1=sub, 2=mul, 3=div
-// elem_type: 0=f32, 1=f64, 2=i32, 3=i64
-blorp_Vector* blorp_simd_vector_op(int op, int elem_type, blorp_Vector* a, blorp_Vector* b) {
-    if (elem_type == 0) {  // float32
-        switch (op) {
-            case 0: return blorp_simd_vector_add_f32(a, b);
-            case 1: return blorp_simd_vector_sub_f32(a, b);
-            case 2: return blorp_simd_vector_mul_f32(a, b);
-            case 3: return blorp_simd_vector_div_f32(a, b);
-        }
-    } else if (elem_type == 1) {  // float64 (double)
-        switch (op) {
-            case 0: return blorp_simd_vector_add_f64(a, b);
-            case 1: return blorp_simd_vector_sub_f64(a, b);
-            case 2: return blorp_simd_vector_mul_f64(a, b);
-            case 3: return blorp_simd_vector_div_f64(a, b);
-        }
-    }
-    // Fallback to generic blorp_vector_op for unsupported types
-    return NULL;
-}
-
 // ============================================================================
 // SIMD Scalar Broadcast Operations (vector OP scalar, scalar OP vector)
 // ============================================================================
@@ -1560,203 +1537,6 @@ blorp_Vector* blorp_tensor_add_scaled_f32_cow(blorp_Vector* target, const blorp_
     return result;
 }
 
-// Forward: result[i] = v[i] OP scalar
-blorp_Vector* blorp_simd_vector_scalar_op_f64(int op, const blorp_Vector* v, double scalar) {
-    if (!v) return NULL;
-    long len = v->capacity;
-    blorp_Vector* result = blorp_vector_new_like(v);
-
-    double* dv = (double*)v->data;
-    double* dr = (double*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~1;
-        __m128d vs = _mm_set1_pd(scalar);
-        switch (op) {
-            case 0: // add
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_add_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1: // sub
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_sub_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2: // mul
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_mul_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: { // div — safe: scalar==0 → all zeros
-                if (scalar == 0.0) {
-                    memset(dr, 0, len * sizeof(double));
-                } else {
-                    for (long i = 0; i < simd_len; i += 2) {
-                        _mm_storeu_pd(&dr[i], _mm_div_pd(_mm_loadu_pd(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default:
-                for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~1;
-        float64x2_t vs = vdupq_n_f64(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vaddq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vsubq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vmulq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: {
-                if (scalar == 0.0) {
-                    memset(dr, 0, len * sizeof(double));
-                } else {
-                    for (long i = 0; i < simd_len; i += 2) {
-                        vst1q_f64(&dr[i], vdivq_f64(vld1q_f64(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default:
-                for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = dv[i] + scalar; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = dv[i] - scalar; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = dv[i] * scalar; break;
-            case 3:
-                if (scalar == 0.0) { memset(dr, 0, len * sizeof(double)); }
-                else { for (long i = 0; i < len; i++) dr[i] = dv[i] / scalar; }
-                break;
-            default: for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #endif
-    return result;
-}
-
-// Reversed: result[i] = scalar OP v[i]
-blorp_Vector* blorp_simd_vector_scalar_op_rev_f64(int op, const blorp_Vector* v, double scalar) {
-    if (!v) return NULL;
-    long len = v->capacity;
-    blorp_Vector* result = blorp_vector_new_like(v);
-
-    double* dv = (double*)v->data;
-    double* dr = (double*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~1;
-        __m128d vs = _mm_set1_pd(scalar);
-        switch (op) {
-            case 0: // add (commutative, same as forward)
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_add_pd(vs, _mm_loadu_pd(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar + dv[i];
-                break;
-            case 1: // scalar - v[i]
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_sub_pd(vs, _mm_loadu_pd(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar - dv[i];
-                break;
-            case 2: // mul (commutative)
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_mul_pd(vs, _mm_loadu_pd(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar * dv[i];
-                break;
-            case 3: { // scalar / v[i] — per-element safe division
-                __m128d zero = _mm_setzero_pd();
-                for (long i = 0; i < simd_len; i += 2) {
-                    __m128d vv = _mm_loadu_pd(&dv[i]);
-                    __m128d mask = _mm_cmpeq_pd(vv, zero);
-                    __m128d div_result = _mm_div_pd(vs, vv);
-                    _mm_storeu_pd(&dr[i], BLORP_SIMD_BLEND_F64X2(div_result, zero, mask));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (dv[i] == 0.0) ? 0.0 : scalar / dv[i];
-                }
-                break;
-            }
-            default:
-                for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~1;
-        float64x2_t vs = vdupq_n_f64(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vaddq_f64(vs, vld1q_f64(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar + dv[i];
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vsubq_f64(vs, vld1q_f64(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar - dv[i];
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vmulq_f64(vs, vld1q_f64(&dv[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = scalar * dv[i];
-                break;
-            case 3: {
-                float64x2_t zero = vdupq_n_f64(0.0);
-                for (long i = 0; i < simd_len; i += 2) {
-                    float64x2_t vv = vld1q_f64(&dv[i]);
-                    uint64x2_t mask = vceqq_f64(vv, zero);
-                    float64x2_t div_result = vdivq_f64(vs, vv);
-                    vst1q_f64(&dr[i], vbslq_f64(mask, zero, div_result));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (dv[i] == 0.0) ? 0.0 : scalar / dv[i];
-                }
-                break;
-            }
-            default:
-                for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = scalar + dv[i]; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = scalar - dv[i]; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = scalar * dv[i]; break;
-            case 3:
-                for (long i = 0; i < len; i++) {
-                    dr[i] = (dv[i] == 0.0) ? 0.0 : scalar / dv[i];
-                }
-                break;
-            default: for (long i = 0; i < len; i++) dr[i] = dv[i];
-        }
-    #endif
-    return result;
-}
-
 // ============================================================================
 // COW (Copy-on-Write) Invariants
 // ============================================================================
@@ -1777,427 +1557,6 @@ blorp_Vector* blorp_simd_vector_scalar_op_rev_f64(int op, const blorp_Vector* v,
 // COW (Copy-on-Write) SIMD Vector Operations
 // When input is uniquely owned, write in-place; otherwise allocate new.
 // ============================================================================
-
-// COW element-wise: result[i] = a[i] OP b[i] (in-place when a is unique)
-// op: 0=add, 1=sub, 2=mul, 3=div
-blorp_Vector* blorp_simd_vector_op_f64_cow(int op, blorp_Vector* a, const blorp_Vector* b) {
-    if (!a || !b) return NULL;
-    long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    int is_unique_a = blorp_is_unique(a);
-    blorp_Vector* result;
-    if (is_unique_a) {
-        result = a;
-    } else {
-        result = blorp_vector_new_like(a);
-    }
-
-    double* da = (double*)a->data;
-    double* db = (double*)b->data;
-    double* dr = (double*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~1;
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_add_pd(_mm_loadu_pd(&da[i]), _mm_loadu_pd(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] + db[i];
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_sub_pd(_mm_loadu_pd(&da[i]), _mm_loadu_pd(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] - db[i];
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_mul_pd(_mm_loadu_pd(&da[i]), _mm_loadu_pd(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] * db[i];
-                break;
-            case 3: {
-                __m128d zero = _mm_setzero_pd();
-                for (long i = 0; i < simd_len; i += 2) {
-                    __m128d va = _mm_loadu_pd(&da[i]);
-                    __m128d vb = _mm_loadu_pd(&db[i]);
-                    __m128d mask = _mm_cmpeq_pd(vb, zero);
-                    __m128d div_result = _mm_div_pd(va, vb);
-                    _mm_storeu_pd(&dr[i], BLORP_SIMD_BLEND_F64X2(div_result, zero, mask));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (db[i] == 0.0) ? 0.0 : da[i] / db[i];
-                }
-                break;
-            }
-            default:
-                break;
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~1;
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vaddq_f64(vld1q_f64(&da[i]), vld1q_f64(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] + db[i];
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vsubq_f64(vld1q_f64(&da[i]), vld1q_f64(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] - db[i];
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vmulq_f64(vld1q_f64(&da[i]), vld1q_f64(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] * db[i];
-                break;
-            case 3: {
-                float64x2_t zero = vdupq_n_f64(0.0);
-                for (long i = 0; i < simd_len; i += 2) {
-                    float64x2_t va = vld1q_f64(&da[i]);
-                    float64x2_t vb = vld1q_f64(&db[i]);
-                    uint64x2_t mask = vceqq_f64(vb, zero);
-                    float64x2_t div_result = vdivq_f64(va, vb);
-                    vst1q_f64(&dr[i], vbslq_f64(mask, zero, div_result));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (db[i] == 0.0) ? 0.0 : da[i] / db[i];
-                }
-                break;
-            }
-            default:
-                break;
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = da[i] + db[i]; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = da[i] - db[i]; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = da[i] * db[i]; break;
-            case 3:
-                for (long i = 0; i < len; i++) {
-                    dr[i] = (db[i] == 0.0) ? 0.0 : da[i] / db[i];
-                }
-                break;
-            default: break;
-        }
-    #endif
-    blorp_release_cow_input_if_copied(a, result);
-    return result;
-}
-
-// COW element-wise F32: result[i] = a[i] OP b[i] (in-place when a is unique)
-blorp_Vector* blorp_simd_vector_op_f32_cow(int op, blorp_Vector* a, const blorp_Vector* b) {
-    if (!a || !b) return NULL;
-    long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    int is_unique_a = blorp_is_unique(a);
-    blorp_Vector* result;
-    if (is_unique_a) {
-        result = a;
-    } else {
-        result = blorp_vector_new_f32_like(a);
-    }
-
-    float* da = (float*)a->data;
-    float* db = (float*)b->data;
-    float* dr = (float*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~3;
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_add_ps(_mm_loadu_ps(&da[i]), _mm_loadu_ps(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] + db[i];
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_sub_ps(_mm_loadu_ps(&da[i]), _mm_loadu_ps(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] - db[i];
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_mul_ps(_mm_loadu_ps(&da[i]), _mm_loadu_ps(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] * db[i];
-                break;
-            case 3: {
-                __m128 zero = _mm_setzero_ps();
-                for (long i = 0; i < simd_len; i += 4) {
-                    __m128 va = _mm_loadu_ps(&da[i]);
-                    __m128 vb = _mm_loadu_ps(&db[i]);
-                    __m128 mask = _mm_cmpeq_ps(vb, zero);
-                    __m128 div_result = _mm_div_ps(va, vb);
-                    _mm_storeu_ps(&dr[i], BLORP_SIMD_BLEND_F32X4(div_result, zero, mask));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (db[i] == 0.0f) ? 0.0f : da[i] / db[i];
-                }
-                break;
-            }
-            default:
-                break;
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~3;
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vaddq_f32(vld1q_f32(&da[i]), vld1q_f32(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] + db[i];
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vsubq_f32(vld1q_f32(&da[i]), vld1q_f32(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] - db[i];
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vmulq_f32(vld1q_f32(&da[i]), vld1q_f32(&db[i])));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = da[i] * db[i];
-                break;
-            case 3: {
-                float32x4_t zero = vdupq_n_f32(0.0f);
-                for (long i = 0; i < simd_len; i += 4) {
-                    float32x4_t va = vld1q_f32(&da[i]);
-                    float32x4_t vb = vld1q_f32(&db[i]);
-                    uint32x4_t mask = vceqq_f32(vb, zero);
-                    float32x4_t div_result = vdivq_f32(va, vb);
-                    vst1q_f32(&dr[i], vbslq_f32(mask, zero, div_result));
-                }
-                for (long i = simd_len; i < len; i++) {
-                    dr[i] = (db[i] == 0.0f) ? 0.0f : da[i] / db[i];
-                }
-                break;
-            }
-            default:
-                break;
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = da[i] + db[i]; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = da[i] - db[i]; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = da[i] * db[i]; break;
-            case 3:
-                for (long i = 0; i < len; i++) {
-                    dr[i] = (db[i] == 0.0f) ? 0.0f : da[i] / db[i];
-                }
-                break;
-            default: break;
-        }
-    #endif
-    blorp_release_cow_input_if_copied(a, result);
-    return result;
-}
-
-// COW scalar broadcast F32: result[i] = v[i] OP scalar (in-place when v is unique)
-blorp_Vector* blorp_simd_vector_scalar_op_f32_cow(int op, blorp_Vector* v, float scalar) {
-    if (!v) return NULL;
-    long len = v->capacity;
-    int is_unique_v = blorp_is_unique(v);
-    blorp_Vector* result;
-    if (is_unique_v) {
-        result = v;
-    } else {
-        result = blorp_vector_new_f32_like(v);
-    }
-
-    float* dv = (float*)v->data;
-    float* dr = (float*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~3;
-        __m128 vs = _mm_set1_ps(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_add_ps(_mm_loadu_ps(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_sub_ps(_mm_loadu_ps(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 4) {
-                    _mm_storeu_ps(&dr[i], _mm_mul_ps(_mm_loadu_ps(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: {
-                if (scalar == 0.0f) {
-                    memset(dr, 0, len * sizeof(float));
-                } else {
-                    for (long i = 0; i < simd_len; i += 4) {
-                        _mm_storeu_ps(&dr[i], _mm_div_ps(_mm_loadu_ps(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default: break;
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~3;
-        float32x4_t vs = vdupq_n_f32(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vaddq_f32(vld1q_f32(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vsubq_f32(vld1q_f32(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 4) {
-                    vst1q_f32(&dr[i], vmulq_f32(vld1q_f32(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: {
-                if (scalar == 0.0f) {
-                    memset(dr, 0, len * sizeof(float));
-                } else {
-                    for (long i = 0; i < simd_len; i += 4) {
-                        vst1q_f32(&dr[i], vdivq_f32(vld1q_f32(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default: break;
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = dv[i] + scalar; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = dv[i] - scalar; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = dv[i] * scalar; break;
-            case 3:
-                if (scalar == 0.0f) { memset(dr, 0, len * sizeof(float)); }
-                else { for (long i = 0; i < len; i++) dr[i] = dv[i] / scalar; }
-                break;
-            default: break;
-        }
-    #endif
-    blorp_release_cow_input_if_copied(v, result);
-    return result;
-}
-
-// COW scalar broadcast: result[i] = v[i] OP scalar (in-place when v is unique)
-blorp_Vector* blorp_simd_vector_scalar_op_f64_cow(int op, blorp_Vector* v, double scalar) {
-    if (!v) return NULL;
-    long len = v->capacity;
-    int is_unique_v = blorp_is_unique(v);
-    blorp_Vector* result;
-    if (is_unique_v) {
-        result = v;
-    } else {
-        result = blorp_vector_new_like(v);
-    }
-
-    double* dv = (double*)v->data;
-    double* dr = (double*)result->data;
-
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        long simd_len = len & ~1;
-        __m128d vs = _mm_set1_pd(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_add_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_sub_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    _mm_storeu_pd(&dr[i], _mm_mul_pd(_mm_loadu_pd(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: {
-                if (scalar == 0.0) {
-                    memset(dr, 0, len * sizeof(double));
-                } else {
-                    for (long i = 0; i < simd_len; i += 2) {
-                        _mm_storeu_pd(&dr[i], _mm_div_pd(_mm_loadu_pd(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default: break;
-        }
-    #elif defined(BLORP_SIMD_NEON)
-        long simd_len = len & ~1;
-        float64x2_t vs = vdupq_n_f64(scalar);
-        switch (op) {
-            case 0:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vaddq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] + scalar;
-                break;
-            case 1:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vsubq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] - scalar;
-                break;
-            case 2:
-                for (long i = 0; i < simd_len; i += 2) {
-                    vst1q_f64(&dr[i], vmulq_f64(vld1q_f64(&dv[i]), vs));
-                }
-                for (long i = simd_len; i < len; i++) dr[i] = dv[i] * scalar;
-                break;
-            case 3: {
-                if (scalar == 0.0) {
-                    memset(dr, 0, len * sizeof(double));
-                } else {
-                    for (long i = 0; i < simd_len; i += 2) {
-                        vst1q_f64(&dr[i], vdivq_f64(vld1q_f64(&dv[i]), vs));
-                    }
-                    for (long i = simd_len; i < len; i++) dr[i] = dv[i] / scalar;
-                }
-                break;
-            }
-            default: break;
-        }
-    #else
-        switch (op) {
-            case 0: for (long i = 0; i < len; i++) dr[i] = dv[i] + scalar; break;
-            case 1: for (long i = 0; i < len; i++) dr[i] = dv[i] - scalar; break;
-            case 2: for (long i = 0; i < len; i++) dr[i] = dv[i] * scalar; break;
-            case 3:
-                if (scalar == 0.0) { memset(dr, 0, len * sizeof(double)); }
-                else { for (long i = 0; i < len; i++) dr[i] = dv[i] / scalar; }
-                break;
-            default: break;
-        }
-    #endif
-    blorp_release_cow_input_if_copied(v, result);
-    return result;
-}
 
 // ============================================================================
 // ARC (Automatic Reference Counting) Runtime
@@ -3201,14 +2560,6 @@ static void blorp_tcp_inner_operation_cleanup_pop(blorp_TcpInner** slot) {
 #endif
 }
 
-static long blorp_tcp_inner_fd(blorp_TcpInner* inner) {
-    if (!inner) return -1;
-    pthread_mutex_lock(&inner->mutex);
-    long fd = inner->fd;
-    pthread_mutex_unlock(&inner->mutex);
-    return fd;
-}
-
 static int blorp_tcp_inner_begin_op(blorp_TcpInner* inner, long* fd_out) {
     if (!inner || !fd_out) return -1;
     pthread_mutex_lock(&inner->mutex);
@@ -3277,52 +2628,6 @@ static void blorp_tcp_stream_destructor(void* obj) {
     stream->inner = NULL;
 }
 
-static bool blorp_tcp_fd_arg_is_valid(long fd) {
-    return fd >= 0 && fd <= INT_MAX;
-}
-
-static bool blorp_tcp_fd_is_stream_socket(int raw_fd) {
-    int socket_type = 0;
-    socklen_t socket_type_len = sizeof(socket_type);
-    return getsockopt(
-               raw_fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0 &&
-           socket_type == SOCK_STREAM;
-}
-
-static bool blorp_tcp_fd_is_listening_stream_socket(int raw_fd) {
-    if (!blorp_tcp_fd_is_stream_socket(raw_fd)) return false;
-#if defined(SO_ACCEPTCONN)
-    int accept_conn = 0;
-    socklen_t accept_conn_len = sizeof(accept_conn);
-    if (getsockopt(
-            raw_fd, SOL_SOCKET, SO_ACCEPTCONN, &accept_conn,
-            &accept_conn_len) != 0) {
-        return errno == ENOPROTOOPT || errno == EINVAL;
-    }
-    return accept_conn != 0;
-#else
-    return true;
-#endif
-}
-
-static bool blorp_tcp_fd_arg_to_open_socket_fd(
-    long fd,
-    int* raw_fd_out,
-    bool require_listener
-) {
-    if (!raw_fd_out || !blorp_tcp_fd_arg_is_valid(fd)) return false;
-    int raw_fd = (int)fd;
-    if (blorp_runtime_set_cloexec(raw_fd) != 0) return false;
-    if (require_listener) {
-        if (!blorp_tcp_fd_is_listening_stream_socket(raw_fd)) return false;
-    } else if (!blorp_tcp_fd_is_stream_socket(raw_fd)) {
-        return false;
-    }
-    if (blorp_io_reactor_set_nonblocking(raw_fd) != 0) return false;
-    *raw_fd_out = raw_fd;
-    return true;
-}
-
 static blorp_TcpListener* blorp_tcp_listener_from_open_fd(int raw_fd) {
     blorp_TcpInner* inner =
         blorp_tcp_inner_new(BLORP_TCP_HANDLE_LISTENER, raw_fd);
@@ -3343,26 +2648,6 @@ static blorp_TcpStream* blorp_tcp_stream_from_open_fd(int raw_fd) {
     BLORP_SET_DESTRUCTOR(stream, blorp_tcp_stream_destructor);
     stream->inner = inner;
     return stream;
-}
-
-blorp_TcpListener* blorp_tcp_listener_from_fd(long fd) {
-    int raw_fd;
-    if (!blorp_tcp_fd_arg_to_open_socket_fd(fd, &raw_fd, true)) return NULL;
-    return blorp_tcp_listener_from_open_fd(raw_fd);
-}
-
-blorp_TcpStream* blorp_tcp_stream_from_fd(long fd) {
-    int raw_fd;
-    if (!blorp_tcp_fd_arg_to_open_socket_fd(fd, &raw_fd, false)) return NULL;
-    return blorp_tcp_stream_from_open_fd(raw_fd);
-}
-
-long blorp_tcp_listener_fd(blorp_TcpListener* listener) {
-    return listener ? blorp_tcp_inner_fd(listener->inner) : -1;
-}
-
-long blorp_tcp_stream_fd(blorp_TcpStream* stream) {
-    return stream ? blorp_tcp_inner_fd(stream->inner) : -1;
 }
 
 static int blorp_io_reactor_set_nonblocking(int fd) {
@@ -4176,17 +3461,6 @@ static void blorp_list_destroy(void* obj) {
     }
 }
 
-// Set elem_release on a list and retain all existing elements.
-// Used by codegen after blorp_list_build — elements were added before elem_release was set,
-// so they need to be retained now to balance the release in blorp_list_destroy.
-void blorp_list_set_elem_release(blorp_List* list, void (*release_fn)(void*)) {
-    if (!list || list->storage_mode != BLORP_LIST_STORAGE_POINTER || list->elem_release) return;  // already set or null list
-    list->elem_release = release_fn;
-    for (long i = 0; i < list->len; i++) {
-        if (list->data[i]) blorp_retain(list->data[i]);
-    }
-}
-
 // Set elem_release on a list WITHOUT retaining existing elements.
 // Used for lists returned by C runtime functions (map, filter_map, etc.)
 // where elements are either fresh (no other owner) or already retained by
@@ -4519,22 +3793,6 @@ bool blorp_string_eq(const blorp_String* a, const blorp_String* b) {
     return memcmp(a->data, b->data, a->len) == 0;
 }
 
-bool blorp_string_eq_cstr(const blorp_String* s, const char* cstr) {
-    if (!s && (!cstr || cstr[0] == '\0')) return true;
-    if (!s || !cstr) return false;
-    long len = strlen(cstr);
-    if (s->len != len) return false;
-    return memcmp(s->data, cstr, len) == 0;
-}
-
-// Consuming string eq: compares, then releases both inputs.
-bool blorp_string_eq_consume(blorp_String* a, blorp_String* b) {
-    bool result = blorp_string_eq(a, b);
-    if (a) blorp_release(a);
-    if (b) blorp_release(b);
-    return result;
-}
-
 long blorp_string_compare(const blorp_String* a, const blorp_String* b) {
     if (!a && !b) return 0;
     if (!a) return -1;
@@ -4547,15 +3805,6 @@ long blorp_string_compare(const blorp_String* a, const blorp_String* b) {
     return 0;
 }
 
-// Consuming string compare: compares, then releases both inputs.
-long blorp_string_compare_consume(blorp_String* a, blorp_String* b) {
-    long result = blorp_string_compare(a, b);
-    if (a) blorp_release(a);
-    if (b) blorp_release(b);
-    return result;
-}
-
-// (removed blorp_char_at — now IR intrinsic)
 
 // Encode a Unicode codepoint as UTF-8 into buf (up to 4 bytes). Returns byte count.
 static int blorp_utf8_encode(int32_t cp, unsigned char* buf) {
@@ -7051,7 +6300,7 @@ blorp_String* blorp_from_chars(blorp_List* chars) {
 }
 
 // StringBuilder-like operations (COW-aware string building)
-blorp_String* blorp_string_with_capacity(long cap) {
+static blorp_String* blorp_string_with_capacity(long cap) {
     if (cap < 16) cap = 16;
     blorp_String* str = blorp_string_alloc_empty(cap);
     str->data[0] = '\0';
@@ -7289,7 +6538,6 @@ blorp_String* blorp_input_or_empty(blorp_String* prompt) {
     return blorp_read_line_or_empty();
 }
 
-// (removed blorp_exit — now IR intrinsic)
 
 blorp_String* blorp_to_string(long i) {
     char buf[32];
@@ -7450,7 +6698,6 @@ static blorp_List* blorp_list_new_result_layout(long initial_capacity, int resul
     return list;
 }
 
-// (removed blorp_list_len — now IR intrinsic)
 
 static void blorp_list_store_raw(blorp_List* list, long index, void* value) {
     if (!list || index < 0 || index >= list->capacity) return;
@@ -8253,7 +7500,6 @@ blorp_ConcurrencyError* blorp_TaskFailed(void* msg) {
     return v;
 }
 
-// (removed blorp_list_get_opt — now IR intrinsic)
 
 // Bounds-checked string character access returning stack Option[Char]
 blorp_StackOption_Char blorp_string_get_opt(const blorp_String* s, long index) {
@@ -8460,11 +7706,6 @@ blorp_List* blorp_list_reverse_owned(blorp_List* list) {
     result->len = n;
     blorp_release(list);
     return result;
-}
-
-// FFI copy: create independent shallow copy of a list (refcount = 1, elements retained)
-blorp_List* blorp_list_copy_ffi(blorp_List* src) {
-    return blorp_list_copy(src);
 }
 
 // IR intrinsic: COW check — if shared, return a copy; if unique, return as-is.
@@ -8697,28 +7938,6 @@ blorp_List* blorp_list_append_owned(blorp_List* list, void* element) {
 }
 
 
-// (removed blorp_list_set_releasing — now IR intrinsic)
-// (removed blorp_list_set_inplace — now IR intrinsic)
-// (removed blorp_list_set_releasing_inplace — now IR intrinsic)
-// (removed blorp_list_insert_inplace — now IR intrinsic)
-// (removed blorp_list_remove_inplace — now IR intrinsic)
-
-// Build a list from variadic arguments (used by list literals)
-blorp_List* blorp_list_build(long count, ...) {
-    blorp_List* list = blorp_list_new(count > 0 ? count : 4);
-    va_list args;
-    va_start(args, count);
-    for (long i = 0; i < count; i++) {
-        void* elem = va_arg(args, void*);
-        // Note: elem_release is NULL at this point (just created by blorp_list_new).
-        // Codegen sets elem_release AFTER blorp_list_build returns.
-        // Elements passed to build are freshly constructed — no retain needed here.
-        blorp_list_store_raw(list, i, elem);
-    }
-    va_end(args);
-    list->len = count;
-    return list;
-}
 
 // ============================================================================
 // Vector Operations
@@ -8829,48 +8048,6 @@ blorp_Vector* blorp_tensor_new(long first_dim, long total_capacity) {
     arr->storage_mode = BLORP_VECTOR_STORAGE_POINTER;
     memset(arr->data, 0, total_capacity * sizeof(void*));
     return arr;
-}
-
-// Dimension peeling: extract slice i from a 2D+ tensor as a sub-tensor (copy).
-// sub_len is the first dimension of the result: for 2D→1D it equals capacity/len (cols),
-// for 3D→2D it's the second dimension. Codegen passes the known dimension from the type.
-// The returned tensor has len=sub_len, capacity=elems_per_slice.
-// If the parent has elem_release, each copied element is retained.
-blorp_Vector* blorp_tensor_peel_row(blorp_Vector* tensor, long row_idx, long sub_len) {
-    if (!tensor || row_idx < 0 || row_idx >= tensor->len) return blorp_vector_new(0);
-    long elems_per_slice = tensor->len > 0 ? tensor->capacity / tensor->len : 0;
-    if (elems_per_slice <= 0) return blorp_vector_new(0);
-    long byte_size = elems_per_slice * sizeof(void*);
-    // For Float32, use 4-byte elements
-    if (tensor->storage_mode == BLORP_VECTOR_STORAGE_F32
-        && tensor->elem_size == (int16_t)sizeof(float)) {
-        blorp_Vector* row = (blorp_Vector*)blorp_alloc(
-            blorp_checked_add(sizeof(blorp_Vector), elems_per_slice * sizeof(float)));
-        row->len = sub_len;
-        row->capacity = elems_per_slice;
-        row->elem_release = NULL;
-        row->elem_size = 4;
-        row->storage_mode = BLORP_VECTOR_STORAGE_F32;
-        memcpy(row->data, (float*)tensor->data + row_idx * elems_per_slice, elems_per_slice * sizeof(float));
-        return row;
-    }
-    blorp_Vector* row = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), byte_size));
-    row->len = sub_len;
-    row->capacity = elems_per_slice;
-    row->elem_release = tensor->elem_release;
-    row->elem_size = tensor->elem_size;
-    row->storage_mode = tensor->storage_mode;
-    if (row->elem_release) {
-        BLORP_SET_DESTRUCTOR(row, blorp_vector_destroy);
-    }
-    memcpy(row->data, tensor->data + row_idx * elems_per_slice, byte_size);
-    // Retain each element for the new copy
-    if (row->elem_release) {
-        for (long i = 0; i < elems_per_slice; i++) {
-            if (row->data[i]) blorp_retain(row->data[i]);
-        }
-    }
-    return row;
 }
 
 // Float64 raw constructors — 8 bytes per element, but tagged so reads never
@@ -9039,39 +8216,6 @@ blorp_Vector* blorp_matrix_new_fill_sized(void* value, long rows, long cols, lon
     if (cols < 0) cols = 0;
     long total = (long)blorp_checked_mul(rows, cols);
     blorp_Vector* arr = blorp_tensor_new_sized(rows, total, elem_byte_size);
-    blorp_vector_fill_inline_bytes(arr, value);
-    return arr;
-}
-
-blorp_Vector* blorp_tensor3_new_sized(void* value, long d1, long d2, long d3, long elem_byte_size) {
-    if (d1 < 0) d1 = 0;
-    if (d2 < 0) d2 = 0;
-    if (d3 < 0) d3 = 0;
-    long total = (long)blorp_checked_mul(d1, blorp_checked_mul(d2, d3));
-    blorp_Vector* arr = blorp_tensor_new_sized(d1, total, elem_byte_size);
-    blorp_vector_fill_inline_bytes(arr, value);
-    return arr;
-}
-
-blorp_Vector* blorp_tensor4_new_sized(void* value, long d1, long d2, long d3, long d4, long elem_byte_size) {
-    if (d1 < 0) d1 = 0;
-    if (d2 < 0) d2 = 0;
-    if (d3 < 0) d3 = 0;
-    if (d4 < 0) d4 = 0;
-    long total = (long)blorp_checked_mul(blorp_checked_mul(d1, d2), blorp_checked_mul(d3, d4));
-    blorp_Vector* arr = blorp_tensor_new_sized(d1, total, elem_byte_size);
-    blorp_vector_fill_inline_bytes(arr, value);
-    return arr;
-}
-
-blorp_Vector* blorp_tensor5_new_sized(void* value, long d1, long d2, long d3, long d4, long d5, long elem_byte_size) {
-    if (d1 < 0) d1 = 0;
-    if (d2 < 0) d2 = 0;
-    if (d3 < 0) d3 = 0;
-    if (d4 < 0) d4 = 0;
-    if (d5 < 0) d5 = 0;
-    long total = (long)blorp_checked_mul(blorp_checked_mul(d1, d2), blorp_checked_mul(d3, blorp_checked_mul(d4, d5)));
-    blorp_Vector* arr = blorp_tensor_new_sized(d1, total, elem_byte_size);
     blorp_vector_fill_inline_bytes(arr, value);
     return arr;
 }
@@ -9340,18 +8484,6 @@ blorp_String* blorp_vector_to_string_bool(blorp_Vector* v) {
     return blorp_vector_to_string_packed_enum(v, blorp_bool_to_string_long);
 }
 
-// (removed blorp_vector_len — now IR intrinsic)
-
-// Safe: returns NULL on bounds error (consistent with uninitialized element)
-void* blorp_vector_get(blorp_Vector* arr, long index) {
-    if (!arr || index < 0 || index >= arr->len) {
-        return NULL;
-    }
-    if (blorp_vector_is_i64_raw(arr)) {
-        return (void*)(intptr_t)((long*)arr->data)[index];
-    }
-    return arr->data[index];
-}
 
 // Safe: silently ignores out-of-bounds writes (no-op)
 // WARNING: This mutates in-place without COW check - only use when you know the vector is unique
@@ -9799,11 +8931,6 @@ static blorp_Vector* blorp_vector_copy(blorp_Vector* src) {
         }
     }
     return arr;
-}
-
-// FFI copy: create independent deep copy of a vector/tensor (refcount = 1, elements retained)
-blorp_Vector* blorp_vector_copy_ffi(blorp_Vector* src) {
-    return blorp_vector_copy(src);
 }
 
 // Allocate a new vector with the same shape (len/capacity) as src.
@@ -10492,51 +9619,6 @@ BLORP_DEFINE_VECTOR_I64_BINARY(blorp_vector_mod_i64, vb == 0 ? 0 : va % vb)
 
 #undef BLORP_DEFINE_VECTOR_I64_BINARY
 
-// COW element-wise: result[i] = a[i] OP b[i] (in-place when a is unique)
-blorp_Vector* blorp_vector_op_cow(int op, int elem_type, blorp_Vector* a, const blorp_Vector* b) {
-    if (!a || !b) return NULL;
-    long total = a->capacity < b->capacity ? a->capacity : b->capacity;
-    int is_unique_a = blorp_is_unique(a);
-    blorp_Vector* result;
-    if (is_unique_a) {
-        result = a;
-    } else {
-        result = blorp_vector_new_like(a);
-    }
-
-    if (elem_type == 0) {
-        for (long i = 0; i < total; i++) {
-            long va = blorp_vector_read_i64(a, i);
-            long vb = blorp_vector_read_i64(b, i);
-            long vr;
-            switch (op) {
-                case 0: vr = va + vb; break;
-                case 1: vr = va - vb; break;
-                case 2: vr = va * vb; break;
-                case 3: vr = (vb == 0) ? 0 : va / vb; break;
-                default: vr = 0;
-            }
-            blorp_vector_write_i64(result, i, vr);
-        }
-    } else if (elem_type == 1) {
-        for (long i = 0; i < total; i++) {
-            double va = blorp_vector_read_f64(a, i);
-            double vb = blorp_vector_read_f64(b, i);
-            double vr;
-            switch (op) {
-                case 0: vr = va + vb; break;
-                case 1: vr = va - vb; break;
-                case 2: vr = va * vb; break;
-                case 3: vr = (vb == 0.0) ? 0.0 : va / vb; break;
-                default: vr = 0.0;
-            }
-            blorp_vector_write_f64(result, i, vr);
-        }
-    }
-    blorp_release_cow_input_if_copied(a, result);
-    return result;
-}
-
 // ============================================================================
 // Numeric Vector Builtins (tight loops, autovectorizable with -O2)
 // ============================================================================
@@ -10633,16 +9715,6 @@ double blorp_vector_norm(blorp_Vector* v) {
         sum += value * value;
     }
     return sqrt(sum);
-}
-
-// Element-wise Int vector addition
-blorp_Vector* blorp_vector_add_int(blorp_Vector* a, blorp_Vector* b) {
-    return blorp_vector_add_i64(a, b);
-}
-
-// Element-wise Float vector addition
-blorp_Vector* blorp_vector_add_float(blorp_Vector* a, blorp_Vector* b) {
-    return blorp_vector_op(0, 1, a, b);
 }
 
 // Scalar broadcast: result[i] = v[i] OP scalar (forward)
@@ -10810,56 +9882,6 @@ blorp_Vector* blorp_vector_scalar_op_float16(int op, blorp_Vector* v, _Float16 s
     return result;
 }
 
-// COW scalar int: result[i] = v[i] OP scalar (in-place when v is unique)
-blorp_Vector* blorp_vector_scalar_op_int_cow(int op, blorp_Vector* v, long scalar) {
-    if (!v) return blorp_vector_new(0);
-    blorp_Vector* result;
-    if (blorp_is_unique(v)) {
-        result = v;
-    } else {
-        result = blorp_vector_new_like(v);
-    }
-    for (long i = 0; i < v->capacity; i++) {
-        long val = blorp_vector_read_i64(v, i);
-        long vr;
-        switch (op) {
-            case 0: vr = val + scalar; break;
-            case 1: vr = val - scalar; break;
-            case 2: vr = val * scalar; break;
-            case 3: vr = (scalar == 0) ? 0 : val / scalar; break;
-            default: vr = 0;
-        }
-        blorp_vector_write_i64(result, i, vr);
-    }
-    blorp_release_cow_input_if_copied(v, result);
-    return result;
-}
-
-// COW scalar float: result[i] = v[i] OP scalar (in-place when v is unique)
-blorp_Vector* blorp_vector_scalar_op_float_cow(int op, blorp_Vector* v, double scalar) {
-    if (!v) return blorp_vector_new(0);
-    blorp_Vector* result;
-    if (blorp_is_unique(v)) {
-        result = v;
-    } else {
-        result = blorp_vector_new_like(v);
-    }
-    for (long i = 0; i < v->capacity; i++) {
-        double val = blorp_vector_read_f64(v, i);
-        double vr;
-        switch (op) {
-            case 0: vr = val + scalar; break;
-            case 1: vr = val - scalar; break;
-            case 2: vr = val * scalar; break;
-            case 3: vr = (scalar == 0.0) ? 0.0 : val / scalar; break;
-            default: vr = 0.0;
-        }
-        blorp_vector_write_f64(result, i, vr);
-    }
-    blorp_release_cow_input_if_copied(v, result);
-    return result;
-}
-
 // Scalar broadcast reversed: result[i] = scalar OP v[i]
 // Needed for non-commutative ops: 2 - v, 10 / v
 blorp_Vector* blorp_vector_scalar_op_rev_int(int op, blorp_Vector* v, long scalar) {
@@ -10939,38 +9961,6 @@ blorp_Vector* blorp_vector_scalar_op_rev_float16(int op, blorp_Vector* v, _Float
             default: fr = 0.0f;
         }
         result->data[i] = blorp_box_float16((_Float16)fr);
-    }
-    return result;
-}
-
-// Slice a vector from start (inclusive) to end (exclusive)
-blorp_Vector* blorp_vector_slice(blorp_Vector* v, long start, long end) {
-    if (!v || start >= end || start < 0 || end > v->len) return blorp_vector_new(0);
-    long new_len = end - start;
-    int8_t es = v->elem_size;
-    if (es < 0) {
-        // Sub-byte packed: element-by-element copy (start may not be byte-aligned)
-        blorp_Vector* result = blorp_vector_new_packed(new_len, es);
-        for (long i = 0; i < new_len; i++) {
-            blorp_packed_set(result, i, blorp_packed_get(v, start + i));
-        }
-        return result;
-    }
-    long byte_es = (long)es;
-    blorp_Vector* result = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(new_len, byte_es)));
-    result->len = new_len;
-    result->capacity = new_len;
-    result->elem_release = v->elem_release;
-    result->elem_size = es;
-    result->storage_mode = v->storage_mode;
-    if (result->elem_release) {
-        BLORP_SET_DESTRUCTOR(result, blorp_vector_destroy);
-    }
-    memcpy(result->data, (char*)v->data + start * byte_es, new_len * byte_es);
-    if (result->elem_release) {
-        for (long i = 0; i < new_len; i++) {
-            if (result->data[i]) blorp_retain(result->data[i]);
-        }
     }
     return result;
 }
@@ -11398,8 +10388,6 @@ blorp_String* blorp_list_to_string_cb(blorp_List* list, blorp_String* (*elem_to_
     return result;
 }
 
-// (removed blorp_arange — now IR intrinsic)
-// (removed blorp_linspace — now IR intrinsic)
 
 // cross product (3D vectors only)
 blorp_Vector* blorp_vector_cross_float(blorp_Vector* a, blorp_Vector* b) {
@@ -11830,17 +10818,6 @@ blorp_String* blorp_bytes_to_string(blorp_Bytes* b) {
     return s;
 }
 
-// (removed blorp_bytes_get — now IR intrinsic)
-// (removed blorp_bytes_set_cow — now IR intrinsic)
-// (removed blorp_bytes_slice — now IR intrinsic)
-// (removed blorp_bytes_append — now IR intrinsic)
-// (removed blorp_bytes_fill — now IR intrinsic)
-// (removed blorp_bytes_blit — now IR intrinsic)
-// (removed blorp_bytes_index_of — now IR intrinsic)
-// (removed blorp_bytes_index_of_opt — now IR intrinsic)
-// (removed blorp_bytes_concat — now std source)
-// (removed blorp_bytes_read/write integer helpers — now std source)
-// (removed blorp_bytes_to_hex — now std source)
 
 // ============================================================================
 // Hex Decoding
@@ -19940,7 +18917,6 @@ blorp_StackOption_Float16 blorp_dict_get_f16(blorp_Dict* dict, void* key) {
 }
 #endif
 
-// (blorp_dict_lookup removed — unused)
 
 static blorp_Dict* blorp_dict_copy(blorp_Dict* src) {
     if (!src) return blorp_dict_new();
@@ -20338,7 +19314,6 @@ static bool set_is_subset_internal(blorp_Set* a, blorp_Set* b) {
     return true;
 }
 
-// (blorp_set_combine, blorp_set_intersect, blorp_set_difference removed — now blorp source)
 
 // (sort functions moved to blorp source — std/list.brp merge sort)
 
@@ -24302,36 +23277,12 @@ void* blorp_task_spawn(blorp_Closure* func) {
         func, BLORP_TASK_BORROWS_CLOSURE, false, blorp_task_schedule_immediate());
 }
 
-// spawn_owned(func) -> Task[T]. Takes ownership of the caller's closure ref.
-void* blorp_task_spawn_owned(blorp_Closure* func) {
-    return __blorp_task_spawn_impl(
-        func, BLORP_TASK_OWNS_CLOSURE, false, blorp_task_schedule_immediate());
-}
-
 static void* blorp_task_spawn_owned_in_batch(
     blorp_TaskBatch* batch,
     blorp_Closure* func
 ) {
     return __blorp_task_spawn_impl(
         func, BLORP_TASK_OWNS_CLOSURE, false, blorp_task_schedule_batch(batch));
-}
-
-// Mark task result as refcounted (called by codegen after spawn)
-void blorp_task_init_result_rc(void* t) {
-    blorp_Task* task = (blorp_Task*)t;
-    task->result_is_rc = true;
-}
-
-// Spawn a task and mark result as refcounted atomically (no race with worker)
-void* blorp_task_spawn_rc(blorp_Closure* func) {
-    return __blorp_task_spawn_impl(
-        func, BLORP_TASK_BORROWS_CLOSURE, true, blorp_task_schedule_immediate());
-}
-
-// Spawn a task, mark result as refcounted, and take ownership of the closure.
-void* blorp_task_spawn_owned_rc(blorp_Closure* func) {
-    return __blorp_task_spawn_impl(
-        func, BLORP_TASK_OWNS_CLOSURE, true, blorp_task_schedule_immediate());
 }
 
 static void* blorp_task_spawn_owned_rc_in_batch(
@@ -24464,96 +23415,6 @@ void blorp_detach(void* fn) {
     blorp_Task* task = (blorp_Task*)blorp_task_spawn(closure);
     blorp_release(task);
     if (closure) blorp_release(closure);
-}
-
-// detach with result_is_rc set (for closures returning RC values)
-void blorp_detach_rc(void* fn) {
-    blorp_Closure* closure = (blorp_Closure*)fn;
-    blorp_Task* task = (blorp_Task*)blorp_task_spawn_rc(closure);
-    blorp_release(task);
-    if (closure) blorp_release(closure);
-}
-
-// join(task) -> Result[T, String]
-// Ownership transfer: takes the result from the task (sets task->result = NULL).
-// Does NOT retain the result — it may be a boxed primitive, not a heap object.
-// Double-join returns Err("task already joined").
-void* blorp_task_join(void* t) {
-    if (__blorp_cancel_current_task_if_requested()) {
-        return blorp_result_err(blorp_string_literal("task cancelled"));
-    }
-    blorp_Task* task = (blorp_Task*)t;
-    blorp_Fiber* self = __blorp_current_fiber;
-    pthread_mutex_lock(&task->mutex);
-    if (task->joined) {
-        pthread_mutex_unlock(&task->mutex);
-        return blorp_result_err(blorp_string_literal("task already joined"));
-    }
-    if (!task->completed && self) {
-        // Fiber path: prepare to park before inserting into wakeup structure.
-        blorp_TaskJoinWaiter waiter;
-        blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
-            self, BLORP_WAIT_OWNER_TASK_JOIN, "task join begin");
-        __blorp_task_join_waiter_init(&waiter, wait);
-        blorp_fiber_prepare_wait_to_park(wait, "task join ready to park");
-        __blorp_task_join_waiter_install_locked(
-            task, &waiter, "task join begin");
-        pthread_mutex_unlock(&task->mutex);
-        blorp_fiber_park(wait);
-        pthread_mutex_lock(&task->mutex);
-        __blorp_task_join_waiter_remove_locked(task, &waiter);
-        if (__blorp_is_cancelled()) {
-            pthread_mutex_unlock(&task->mutex);
-            if (__blorp_cancel_current_task_if_requested()) {
-                return blorp_result_err(blorp_string_literal("task cancelled"));
-            }
-            pthread_mutex_lock(&task->mutex);
-        }
-    } else {
-        while (!task->completed) {
-            pthread_cond_wait(&task->done_cond, &task->mutex);
-            if (!task->completed && __blorp_is_cancelled()) {
-                pthread_mutex_unlock(&task->mutex);
-                if (__blorp_cancel_current_task_if_requested()) {
-                    return blorp_result_err(blorp_string_literal("task cancelled"));
-                }
-                pthread_mutex_lock(&task->mutex);
-            }
-        }
-    }
-    void* result = task->result;
-    bool result_is_rc = task->result_is_rc;
-    task->result = NULL;
-    task->joined = true;
-    pthread_mutex_unlock(&task->mutex);
-    return blorp_result_ok_with_release_mask(result, result_is_rc);
-}
-
-// try_join(task) -> Option[Result[T, String]]
-// Same ownership transfer model as task_join.
-// Double-join returns Some(Err("task already joined")).
-void* blorp_task_try_join(void* t) {
-    blorp_Task* task = (blorp_Task*)t;
-    pthread_mutex_lock(&task->mutex);
-    if (task->joined) {
-        pthread_mutex_unlock(&task->mutex);
-        blorp_Option* opt = blorp_option_some(blorp_result_err(blorp_string_literal("task already joined")));
-        opt->release_mask = 1UL;
-        return opt;
-    }
-    if (!task->completed) {
-        pthread_mutex_unlock(&task->mutex);
-        return blorp_option_none();
-    }
-    void* result = task->result;
-    bool result_is_rc = task->result_is_rc;
-    task->result = NULL;
-    task->joined = true;
-    pthread_mutex_unlock(&task->mutex);
-    blorp_Option* opt =
-        blorp_option_some(blorp_result_ok_with_release_mask(result, result_is_rc));
-    opt->release_mask = 1UL;
-    return opt;
 }
 
 long blorp_concurrent_deadline_us(long timeout_ms) {
@@ -27526,11 +26387,6 @@ blorp_List* blorp_zip_parallel_with(
 
 // Sequential list HOFs are synthesized as Core IR so Perceus and COW analysis
 // can see allocation, aliasing, transfer, and callback calls directly.
-// (removed blorp_list_concat — now IR intrinsic)
-// (removed blorp_list_reverse — now IR intrinsic)
-// (removed blorp_list_tail — now IR intrinsic)
-// (removed blorp_list_flatten — now IR intrinsic)
-// (removed blorp_list_take — now IR intrinsic)
 
 // List-spread pattern lowering still emits blorp_list_drop.
 blorp_List* blorp_list_drop(blorp_List* list, long n) {
@@ -27567,7 +26423,6 @@ blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b) {
     blorp_vector_init_elem_release(result, blorp_elem_release_fn);
     return result;
 }
-// (removed blorp_list_zip — now IR intrinsic)
 
 // vector map: apply closure to each element, return new vector (no Option/COW overhead)
 blorp_Vector* blorp_vector_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc) {
@@ -33861,7 +32716,6 @@ blorp_Fixed* blorp_fixed_div(blorp_Fixed* a, blorp_Fixed* b) {
     return blorp_fixed_raw(scaled_a / b->value, result_scale, max_prec);
 }
 
-// (blorp_fixed_neg removed — now IR intrinsic)
 
 // Comparisons (auto-normalize for comparison)
 bool blorp_fixed_eq(blorp_Fixed* a, blorp_Fixed* b) {
@@ -33889,7 +32743,6 @@ bool blorp_fixed_ge(blorp_Fixed* a, blorp_Fixed* b) {
     return blorp_fixed_scale_to(a, max_scale) >= blorp_fixed_scale_to(b, max_scale);
 }
 
-// (blorp_fixed_round_to removed — now IR intrinsic)
 
 // Convert to string
 blorp_String* blorp_fixed_to_string(blorp_Fixed* f) {
@@ -33913,7 +32766,6 @@ blorp_String* blorp_fixed_to_string(blorp_Fixed* f) {
     return blorp_string_from_buf(buf, len);
 }
 
-// (blorp_fixed_to_int, get_scale, get_precision removed — now IR intrinsics)
 
 // Convert to float
 double blorp_fixed_to_float(blorp_Fixed* f) {
@@ -33928,7 +32780,7 @@ double blorp_fixed_to_float(blorp_Fixed* f) {
 // String Utility Functions
 // ============================================================================
 
-blorp_String* blorp_substring(const blorp_String* s, long start, long len) {
+static blorp_String* blorp_substring(const blorp_String* s, long start, long len) {
     if (!s || start < 0 || start >= s->len) {
         return __blorp_empty_str;
     }
@@ -33941,20 +32793,8 @@ blorp_String* blorp_substring(const blorp_String* s, long start, long len) {
     return result;
 }
 
-// (removed blorp_starts_with — now IR intrinsic)
-// (removed blorp_ends_with — now IR intrinsic)
-// (removed blorp_contains [string version] — now IR intrinsic)
-// (removed blorp_index_of [string version] — now IR intrinsic)
-// (removed blorp_split — now std source)
-// (removed blorp_join — now std source)
 
-// (removed blorp_trim — now IR intrinsic)
-// (removed blorp_replace — now std source)
 
-// (removed blorp_capitalize — now IR intrinsic)
-// (removed blorp_equal_ignore_case — now std source)
-// (removed blorp_title_case — now IR intrinsic)
-// (removed blorp_string_repeat — now IR intrinsic)
 
 // ============================================================================
 // URL Encoding/Decoding (RFC 3986)
@@ -34060,17 +32900,7 @@ blorp_String* blorp_html_escape(const blorp_String* s) {
 // Additional String Operations
 // ============================================================================
 
-// (removed blorp_drop_left — now IR intrinsic)
-// (removed blorp_take_left — now IR intrinsic)
-// (removed blorp_trim_left — now IR intrinsic)
-// (removed blorp_trim_right — now IR intrinsic)
-// (removed blorp_string_count — now IR intrinsic)
-// (removed blorp_lines — now std source)
 
-// (removed blorp_string_reverse — now IR intrinsic)
-// (removed blorp_pad_left — now IR intrinsic)
-// (removed blorp_pad_right — now IR intrinsic)
-// (removed blorp_words — now std source)
 
 // codepoint_length: count UTF-8 codepoints (not bytes)
 long blorp_codepoint_length(const blorp_String* s) {
@@ -34147,14 +32977,7 @@ blorp_String* blorp_codepoint_reverse(const blorp_String* s) {
     return result;
 }
 
-// (removed blorp_split_n — now std source)
-// (removed blorp_replace_first — now std source)
 
-// (removed blorp_last_index_of — now IR intrinsic)
-// (removed blorp_trim_chars — now IR intrinsic)
-// (removed blorp_take_right — now IR intrinsic)
-// (removed blorp_drop_right — now IR intrinsic)
-// (removed blorp_center — now IR intrinsic)
 
 // ============================================================================
 // String Analysis Builtins
@@ -34170,13 +32993,6 @@ blorp_List* blorp_string_chars(const blorp_String* s) {
     return result;
 }
 
-// (removed blorp_string_is_numeric — now IR intrinsic)
-// (removed blorp_string_is_ascii — now IR intrinsic)
-// (removed blorp_string_is_blank — now IR intrinsic)
-// (removed blorp_string_is_lower — now IR intrinsic)
-// (removed blorp_string_is_upper — now IR intrinsic)
-// (removed blorp_string_hamming — now IR intrinsic)
-// (removed blorp_string_common_prefix — now IR intrinsic)
 
 // levenshtein(a, b) -> Int — edit distance, O(n*m) time, O(min(n,m)) space
 long blorp_string_levenshtein(const blorp_String* a, const blorp_String* b) {
@@ -34757,7 +33573,6 @@ blorp_List* blorp_read_all_lines(const blorp_String* path) {
     return result;
 }
 
-// (removed blorp_write_lines — now IR intrinsic)
 
 bool blorp_append_file(const blorp_String* path, const blorp_String* content) {
     if (!path) return false;
@@ -36893,7 +35708,6 @@ void* blorp_mkstemp_path(const blorp_String* prefix) {
     return (void*)res;
 }
 
-// (removed blorp_walk_dir — now IR intrinsic)
 
 void* blorp_exec_output(const blorp_String* cmd) {
     if (!cmd || cmd->len == 0) {

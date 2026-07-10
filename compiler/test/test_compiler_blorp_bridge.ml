@@ -504,6 +504,46 @@ let test_typecheck_source_request_can_include_import_modules () =
         "origin" "std" (string_field "kind" (field "origin" first))
   | _ -> Alcotest.fail "expected one typecheck import module"
 
+let test_typecheck_graph_request_uses_single_graph_envelope () =
+  let target =
+    {
+      Bridge.typecheck_import_path = "src/main.brp";
+      typecheck_import_module_name = "main";
+      typecheck_import_module_path = "main";
+      typecheck_import_text = "import:\n\tdep: answer\n";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let dependency =
+    {
+      Bridge.typecheck_import_path = "src/dep.brp";
+      typecheck_import_module_name = "dep";
+      typecheck_import_module_path = "dep";
+      typecheck_import_text = "pure func answer() -> Int: 1\n";
+      typecheck_import_origin = Bridge.CliFrontendUserModule;
+    }
+  in
+  let request =
+    Bridge.typecheck_graph_request_json_with_policy ~resolved_imports:[]
+      ~allow_debug_only_calls:false ~target ~modules:[ dependency ]
+      ~module_targets:[ "dep" ]
+    |> parse_json_exn
+  in
+  Alcotest.(check string)
+    "action" "typecheck_graph" (string_field "action" request);
+  let payload = field "payload" request in
+  Alcotest.(check string)
+    "target path" "src/main.brp" (string_field "path" (field "target" payload));
+  match array_field "modules" payload with
+  | [ first ] ->
+      Alcotest.(check string)
+        "dependency path" "src/dep.brp" (string_field "path" first);
+      (match array_field "module_targets" payload with
+      | [ Lsp_json.String target ] ->
+          Alcotest.(check string) "module target" "dep" target
+      | _ -> Alcotest.fail "expected one graph module target")
+  | _ -> Alcotest.fail "expected one graph module"
+
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
     Blorp.Compiler_blorp_bridge.cli_run_request_json
@@ -684,6 +724,15 @@ let typecheck_artifact ?(ast_phase = "typecheck_source") ?(type_errors = [])
      ]
     @ optional_fields)
 
+let typecheck_graph_source_artifact path module_name typed_program =
+  match typecheck_artifact ~ctfe_status:"evaluated" typed_program with
+  | Lsp_json.Object fields ->
+      Lsp_json.Object
+        (("path", Lsp_json.String path)
+        :: ("module", Lsp_json.String module_name)
+        :: fields)
+  | _ -> assert false
+
 let test_typecheck_source_response_decodes_typed_program_artifact () =
   let response =
     bridge_success_json
@@ -765,6 +814,47 @@ let test_typecheck_source_response_rejects_raw_phase () =
   |> Blorp.Compiler_blorp_bridge.typecheck_source_response_json
   |> expect_invalid_response_contains
        "typecheck_source artifact must have ast_phase typecheck_source"
+
+let test_typecheck_graph_stream_response_decodes_all_artifacts () =
+  let response =
+    String.concat "\n"
+      [
+        bridge_success_json
+          (typecheck_graph_source_artifact "src/dep.brp" "dep"
+             (typed_program_json []));
+        bridge_success_json
+          (typecheck_graph_source_artifact "src/main.brp" "main"
+             (typed_program_json []));
+      ]
+  in
+  match Bridge.typecheck_graph_stream_response_json ~module_count:1 response with
+  | Ok
+      {
+        Bridge.typechecked_graph_modules =
+          [
+            {
+              typechecked_graph_path = "src/dep.brp";
+              typechecked_graph_module_name = "dep";
+              _;
+            };
+          ];
+        typechecked_graph_target =
+          {
+            typechecked_graph_path = "src/main.brp";
+            typechecked_graph_module_name = "main";
+            _;
+          };
+      } ->
+      ()
+  | Ok _ -> Alcotest.fail "expected one module and one target artifact"
+  | Error (_, message) -> Alcotest.fail message
+
+let test_typecheck_graph_stream_response_requires_target () =
+  bridge_success_json
+    (typecheck_graph_source_artifact "src/dep.brp" "dep"
+       (typed_program_json []))
+  |> Bridge.typecheck_graph_stream_response_json ~module_count:1
+  |> expect_invalid_response_contains "expected one target"
 
 let check_typechecked_success result =
   match result with
@@ -1863,6 +1953,8 @@ let suite =
           test_typecheck_source_request_uses_bridge_envelope;
         Alcotest.test_case "typecheck_source request can include imports" `Quick
           test_typecheck_source_request_can_include_import_modules;
+        Alcotest.test_case "typecheck_graph request uses one envelope" `Quick
+          test_typecheck_graph_request_uses_single_graph_envelope;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
@@ -1890,6 +1982,10 @@ let suite =
           test_typecheck_source_response_preserves_errors_for_invalid_typed_tree;
         Alcotest.test_case "typecheck_source response rejects raw phase" `Quick
           test_typecheck_source_response_rejects_raw_phase;
+        Alcotest.test_case "typecheck_graph stream decodes all artifacts" `Quick
+          test_typecheck_graph_stream_response_decodes_all_artifacts;
+        Alcotest.test_case "typecheck_graph stream requires target" `Quick
+          test_typecheck_graph_stream_response_requires_target;
         Alcotest.test_case
           "typecheck_source command decodes typed artifact" `Quick
           test_typecheck_source_command_decodes_typed_artifact;

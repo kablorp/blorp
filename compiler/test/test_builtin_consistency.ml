@@ -1282,6 +1282,71 @@ let test_set_source_helpers_have_no_runtime_c_abi () =
       "Set source helpers should not be public C runtime ABI symbols:\n  %s"
       (String.concat "\n  " stale)
 
+let test_retired_runtime_helpers_have_no_c_abi () =
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let symbols =
+    [
+      "blorp_detach_rc";
+      "blorp_list_build";
+      "blorp_list_copy_ffi";
+      "blorp_list_set_elem_release";
+      "blorp_simd_vector_op";
+      "blorp_simd_vector_op_f32_cow";
+      "blorp_simd_vector_op_f64_cow";
+      "blorp_simd_vector_scalar_op_f32_cow";
+      "blorp_simd_vector_scalar_op_f64";
+      "blorp_simd_vector_scalar_op_f64_cow";
+      "blorp_simd_vector_scalar_op_rev_f64";
+      "blorp_string_compare_consume";
+      "blorp_string_eq_consume";
+      "blorp_string_eq_cstr";
+      "blorp_task_init_result_rc";
+      "blorp_task_join";
+      "blorp_task_spawn_owned";
+      "blorp_task_spawn_owned_rc";
+      "blorp_task_spawn_rc";
+      "blorp_task_try_join";
+      "blorp_tcp_listener_fd";
+      "blorp_tcp_listener_from_fd";
+      "blorp_tcp_stream_fd";
+      "blorp_tcp_stream_from_fd";
+      "blorp_tensor3_new_sized";
+      "blorp_tensor4_new_sized";
+      "blorp_tensor5_new_sized";
+      "blorp_tensor_peel_row";
+      "blorp_vector_add_float";
+      "blorp_vector_add_int";
+      "blorp_vector_copy_ffi";
+      "blorp_vector_get";
+      "blorp_vector_op_cow";
+      "blorp_vector_scalar_op_float_cow";
+      "blorp_vector_scalar_op_int_cow";
+      "blorp_vector_slice";
+    ]
+  in
+  let stale =
+    List.filter
+      (fun symbol ->
+        contains_substring runtime_decl (symbol ^ "(")
+        || contains_substring runtime (symbol ^ "("))
+      symbols
+  in
+  if stale <> [] then
+    Alcotest.failf
+      "Retired helpers should not remain in the C runtime ABI:\n  %s"
+      (String.concat "\n  " stale)
+
 let test_wide_integer_boxes_are_arc_managed () =
   let runtime_decl =
     read_first_existing
@@ -1926,6 +1991,8 @@ let suite =
           test_string_appends_have_no_legacy_runtime_c_abi;
         Alcotest.test_case "set source helpers have no runtime C ABI" `Quick
           test_set_source_helpers_have_no_runtime_c_abi;
+        Alcotest.test_case "retired helpers have no runtime C ABI" `Quick
+          test_retired_runtime_helpers_have_no_c_abi;
         Alcotest.test_case "wide integer boxes are ARC-managed" `Quick
           test_wide_integer_boxes_are_arc_managed;
         Alcotest.test_case "sized integer conversions have runtime C ABI" `Quick

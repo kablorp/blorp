@@ -29,7 +29,7 @@ import:
 	../stage_07_ctfe/compiler_ctfe_globals: compiler_ctfe_evaluate_program_globals
 	../stage_12_cli/compiler_bridge_protocol:
 		BRIDGE_SCHEMA_VERSION,
-		BridgeAction(TypecheckSourceAction),
+		BridgeAction(TypecheckGraphAction, TypecheckSourceAction),
 		BridgeEnvelope,
 		BridgeProtocolError(InvalidJson),
 		bridge_action_name,
@@ -79,6 +79,16 @@ record TypecheckResolvedImport {
 	from_module: String,
 	import_path: String,
 	resolved_module: String
+}
+
+
+record TypecheckGraphRequest {
+	target: TypecheckImportModule,
+	modules: List[TypecheckImportModule],
+	module_targets: List[String],
+	resolved_imports: List[TypecheckResolvedImport],
+	include_comments: Bool,
+	allow_debug_only_calls: Bool
 }
 
 
@@ -228,14 +238,15 @@ private pure func import_module_from_json(
 			Err(ExpectedRequestField("import_modules item", "an object"))
 
 
-private pure func import_modules_field(
+private pure func import_modules_named_field(
 	value: JsonValue,
+	field_name: String,
 ) -> Result[List[TypecheckImportModule], TypecheckBridgeDispatchError]:
-	match get_field(value, "import_modules"):
+	match get_field(value, field_name):
 		None:
 			Ok([])
 		Some(field):
-			items ?= as_array(field).to_result(ExpectedRequestField("import_modules", "an array"))
+			items ?= as_array(field).to_result(ExpectedRequestField(field_name, "an array"))
 			var modules: List[TypecheckImportModule] = []
 			var error: Option[TypecheckBridgeDispatchError] = None
 
@@ -255,6 +266,47 @@ private pure func import_modules_field(
 					Err(err)
 				None:
 					Ok(modules)
+
+
+private pure func import_modules_field(
+	value: JsonValue,
+) -> Result[List[TypecheckImportModule], TypecheckBridgeDispatchError]:
+	import_modules_named_field(value, "import_modules")
+
+
+private pure func import_module_named_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[TypecheckImportModule, TypecheckBridgeDispatchError]:
+	field ?= get_field(value, field_name).to_result(ExpectedRequestField(field_name, "an object"))
+	import_module_from_json(field)
+
+
+private pure func string_list_named_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[List[String], TypecheckBridgeDispatchError]:
+	field ?= get_field(value, field_name).to_result(ExpectedRequestField(field_name, "an array"))
+	items ?= as_array(field).to_result(ExpectedRequestField(field_name, "an array"))
+	var strings: List[String] = []
+	var error: Option[TypecheckBridgeDispatchError] = None
+
+	for item in items:
+		match error:
+			Some(_):
+				break
+			None:
+				match as_string(item):
+					Some(text):
+						strings = strings.append(text)
+					None:
+						error = Some(ExpectedRequestField(field_name, "an array of strings"))
+
+	match error:
+		Some(err):
+			Err(err)
+		None:
+			Ok(strings)
 
 
 private pure func resolved_import_from_json(
@@ -494,6 +546,29 @@ private pure func importable_modules_from_request(
 	resolved_imports: List[TypecheckResolvedImport],
 ) -> List[CompilerImportableModule]:
 	modules.map(func(module): importable_module_from_request(module, resolved_imports))
+
+
+private pure func import_module_requests_except_path(
+	modules: List[TypecheckImportModule],
+	module_path: String,
+) -> List[TypecheckImportModule]:
+	modules.filter(func(module): module.module_path != module_path)
+
+
+private pure func graph_target_modules(
+	modules: List[TypecheckImportModule],
+	module_targets: List[String],
+) -> List[TypecheckImportModule]:
+	var targets: List[TypecheckImportModule] = []
+
+	for module_path in module_targets:
+		match modules.find(func(module): module.module_path == module_path):
+			Some(module):
+				targets = targets.append(module)
+			None:
+				void
+
+	targets
 
 
 private pure func typed_decl_has_ctfe_global(decl: CompilerTypedDecl) -> Bool:
@@ -769,6 +844,55 @@ private pure func typed_source_artifact(
 	JsonObject(fields)
 
 
+private pure func typed_graph_module_artifact(
+	request: TypecheckGraphRequest,
+	module: TypecheckImportModule,
+) -> JsonValue:
+	-- Keep import preparation scoped to one artifact. Reusing parsed importables
+	-- across typecheck calls currently exposes a generated-code ownership bug on
+	-- production graphs; independent preparation preserves typecheck_source's
+	-- proven ownership boundary until that lowering bug has its own regression.
+	typed_source_artifact(
+		module.path,
+		module.module_name,
+		module.text,
+		request.include_comments,
+		request.allow_debug_only_calls,
+		module.origin,
+		import_module_requests_except_path(request.modules, module.module_path),
+		request.resolved_imports,
+	)
+
+
+private pure func typed_graph_target_artifact(request: TypecheckGraphRequest) -> JsonValue:
+	target = request.target
+
+	typed_source_artifact(
+		target.path,
+		target.module_name,
+		target.text,
+		request.include_comments,
+		request.allow_debug_only_calls,
+		target.origin,
+		import_module_requests_except_path(request.modules, target.module_path),
+		request.resolved_imports,
+	)
+
+
+private pure func typed_graph_artifact(request: TypecheckGraphRequest) -> JsonValue:
+	module_artifacts = graph_target_modules(
+		request.modules,
+		request.module_targets,
+	).map(
+		func(module): typed_graph_module_artifact(request, module),
+	)
+
+	JsonObject([
+		("modules", JsonVector(module_artifacts)),
+		("target", typed_graph_target_artifact(request)),
+	])
+
+
 private pure func handle_typecheck_source(
 	body: JsonValue,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
@@ -797,12 +921,74 @@ private pure func handle_typecheck_source(
 	)
 
 
+private pure func typecheck_graph_request_from_body(
+	body: JsonValue,
+) -> Result[TypecheckGraphRequest, TypecheckBridgeDispatchError]:
+	target ?= import_module_named_field(body, "target")
+	modules ?= import_modules_named_field(body, "modules")
+	module_targets ?= string_list_named_field(body, "module_targets")
+	resolved_imports ?= resolved_imports_field(body)
+	include_comments = optional_bool_field(body, "include_comments", False)
+	allow_debug_only_calls = optional_bool_field(body, "allow_debug_only_calls", False)
+
+	Ok({
+		target = target,
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = resolved_imports,
+		include_comments = include_comments,
+		allow_debug_only_calls = allow_debug_only_calls,
+	})
+
+
+private pure func handle_typecheck_graph(
+	body: JsonValue,
+) -> Result[JsonValue, TypecheckBridgeDispatchError]:
+	-- This aggregate form keeps the pure bridge API testable for bounded graphs.
+	-- The executable must use stream_typecheck_graph_request_value for production
+	-- graphs so it does not retain every serialized artifact at once.
+	request ?= typecheck_graph_request_from_body(body)
+
+	Ok(bridge_success_json(typed_graph_artifact(request)))
+
+
+func stream_typecheck_graph_request_value(
+	root: JsonValue,
+	emit: (String) -> Void,
+) -> Bool:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			match envelope.action:
+				TypecheckGraphAction:
+					match typecheck_graph_request_from_body(request_body(envelope)):
+						Ok(request):
+							for module in graph_target_modules(
+								request.modules,
+								request.module_targets,
+							):
+								artifact = typed_graph_module_artifact(request, module)
+								emit(bridge_success_json(artifact).to_string())
+
+							target_artifact = typed_graph_target_artifact(request)
+							emit(bridge_success_json(target_artifact).to_string())
+						Err(error):
+							emit(dispatch_error_json(error).to_string())
+
+					True
+				_:
+					False
+		Err(_):
+			False
+
+
 private pure func handle_envelope(
 	envelope: BridgeEnvelope,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
 	body: JsonValue = request_body(envelope)
 
 	match envelope.action:
+		TypecheckGraphAction:
+			handle_typecheck_graph(body)
 		TypecheckSourceAction:
 			handle_typecheck_source(body)
 		_:

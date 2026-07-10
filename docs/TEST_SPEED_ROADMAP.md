@@ -1,6 +1,6 @@
 # Test Speed Roadmap
 
-Status checked against code on 2026-07-06.
+Status checked against code on 2026-07-09.
 
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
@@ -156,16 +156,37 @@ merge and release.
 exercise the Blorp-owned compiler surface through parser, CLI frontier,
 bridge/rendering, and Core-tail paths.
 
-Improve by:
+The typecheck bridge now accepts one explicit graph request and streams one
+artifact per requested module plus the target. The request separates all import
+modules from the ordered `module_targets` that actually need artifacts. This
+preserves the old pipeline rule that embedded std modules can supply signatures
+without being redundantly typechecked and decoded.
 
-- Batching related bridge requests inside a single helper process.
-- Reusing long-lived helper processes within a test run where safe.
-- Avoiding repeated startup and renderer initialization inside tight assertion
-  loops.
-- Keeping the bridge protocol explicit and deterministic.
+Implemented shape:
 
-Expected impact: reduces CPU and process overhead without deleting Blorp-owned
-compiler coverage.
+- Batch all module typecheck requests into one helper process.
+- Stream artifacts so the Blorp helper does not retain one giant response tree.
+- Keep module selection and typechecking semantics in Blorp; OCaml only builds
+  the request, decodes responses, and populates its transitional module cache.
+- Keep the bridge protocol explicit and deterministic.
+
+Measured impact for generating `compiler_cli_main.brp`: 43 typecheck helper
+calls became one. Typecheck bridge time fell from 145.0s to 112.9s and total C
+generation fell from 175.7s to 141.1s.
+
+Known hole: parsed `CompilerImportableModule` values cannot yet be reused across
+multiple typecheck calls in one generated helper. The first call invalidates
+shared nested data and the second crashes in
+`compiler_resolve_qualified_type_name`. The graph helper therefore prepares
+imports independently for each artifact, matching the proven `typecheck_source`
+ownership boundary. Reusing parsed imports requires a dedicated ownership
+lowering fix and a production-sized regression; it must not be restored as a
+local bridge optimization.
+
+The transitional OCaml process runner still captures the streamed stdout as one
+string before decoding lines. Removing that final response buffer belongs with
+deleting the OCaml host or replacing its process transport; it is not a reason
+to add a second cache or protocol implementation there.
 
 ### 6. Reuse Prepared Bridge Helpers
 
@@ -286,6 +307,24 @@ The first high-leverage split is implemented:
     `scripts/premerge-gate` names that gate directly. The reason is clarity:
     setup should prepare shared infrastructure, while broad source validation
     should be visible as coverage with its own result row.
+17. Ordinary `make` no longer hides a full formatter warmup. `make warm` owns
+    that explicit operation, while `make build` asks Dune for only
+    `bin/blorp_ocaml_host.exe`. A warm `make build` now takes about 0.08s instead
+    of roughly 2s.
+18. Dune artifact caching is owned explicitly by CI workflows rather than being
+    mixed into the opam action cache. Cache keys include OS, architecture, OCaml
+    compiler, and commit, with platform/compiler restore prefixes. Generated
+    CLI fingerprints include the pinned bootstrap script and resolved compiler
+    binary.
+19. Runtime tests now model execution isolation separately from compilation
+    isolation. Concurrency, memory, and system suites compile one selector per
+    explicit isolation domain, then each suite still runs in a fresh process.
+    The full uncached runtime/std corpus fell from 353.3s to 179.9s; five
+    uncached concurrency repeats passed 1,060 tests.
+20. Compiler graph typechecking now crosses the JSON bridge once per graph and
+    streams results. It retains independent per-artifact import preparation
+    because shared prepared imports currently expose the ownership bug recorded
+    above.
 
 This removes the largest redundant default-local sweep without deleting the
 coverage.
@@ -436,10 +475,10 @@ Continue with the next low-risk cleanup:
 2. Use `scripts/test compiler-unit-deep --timings --log-dir scratch/...` before
    changing any remaining deep cases. Prefer narrowing duplicated fixture setup
    over replacing end-to-end assertions with constants or mocks.
-3. If batching remains the next focus, target another real duplicate-work
-   boundary with an explicit reset contract. The successful compiler fixture
-   slice worked because the preserved state was named narrowly: parse cache
-   only. Avoid broad caches that cannot state what they preserve and clear.
+3. The next compiler-build optimization should remove repeated parsing inside
+   the Blorp graph helper, but only after fixing and testing ownership of shared
+   importable-module values. Do not add an OCaml cache or a size-based fallback
+   around the defect.
 4. Consider a small explicit fast subset for codegen audit if local default
    runs still need more reduction after the compiler-unit split.
 

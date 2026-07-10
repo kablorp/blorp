@@ -819,6 +819,28 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
 	    (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
 
+let test_execution_isolation_does_not_force_separate_compilation () =
+  Alcotest.(check bool)
+    "concurrency suites share a compiled selector" false
+    (Blorp.Test_runner.requires_compilation_isolation
+       "tests/test_blorp/concurrency/test_list_concurrent.brp");
+  Alcotest.(check bool)
+    "memory suites share a compiled selector" false
+    (Blorp.Test_runner.requires_compilation_isolation
+       "tests/test_blorp/memory/test_memstats_observability.brp");
+  Alcotest.(check bool)
+    "system suites share a compiled selector" false
+    (Blorp.Test_runner.requires_compilation_isolation
+       "tests/test_blorp/sys/test_file_resource.brp");
+  Alcotest.(check bool)
+    "known compiler module-init conflict compiles separately" true
+    (Blorp.Test_runner.requires_compilation_isolation
+       "compiler/blorp/tests/test_compiler_typecheck_decl.brp");
+  Alcotest.(check bool)
+    "ordinary suites share a compiled harness" false
+    (Blorp.Test_runner.requires_compilation_isolation
+       "tests/test_blorp/types/test_bool.brp")
+
 let test_source_text_cache_guard_uses_current_file_contents () =
   with_temp_dir "blorp-source-cache-guard-" (fun dir ->
       let path = Filename.concat dir "sample.brp" in
@@ -1066,6 +1088,8 @@ let suite =
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
           test_runtime_sensitive_suite_paths_require_process_isolation;
+        Alcotest.test_case "execution_and_compilation_isolation" `Quick
+          test_execution_isolation_does_not_force_separate_compilation;
         Alcotest.test_case "source_text_cache_guard" `Quick
           test_source_text_cache_guard_uses_current_file_contents;
         Alcotest.test_case "combined_harness_skips_result_cache" `Quick
