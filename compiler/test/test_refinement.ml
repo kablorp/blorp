@@ -18,6 +18,10 @@ let bound_const n = expect_some "constant bound" (constant_dim_bound n)
 let bound_coll name = collection_length_bound (coll_id name)
 let bound_dim name = dimension_bound (dim_id name)
 
+let make_range_proof ~range_start ~range_upper =
+  make_range_proof_with_source ~source:ProofSourceUnknown ~range_start
+    ~range_upper
+
 let check_source name expected actual =
   Alcotest.(check bool) name true (expected = actual)
 
@@ -305,7 +309,7 @@ let test_range_proofs_carry_sources () =
          ~range_upper:(upper_lit 4))
   in
   check_source "range proof source" ProofSourceLoopRange
-    (range_proof_source explicit);
+    explicit.range_source;
   let env =
     empty_proof_env
     |> proof_env_add_range_bounds ~source:ProofSourceLoopRange ~var:i
@@ -315,7 +319,7 @@ let test_range_proofs_carry_sources () =
     expect_some "stored sourced range" (proof_env_find_range env ~var:i)
   in
   check_source "stored range source" ProofSourceLoopRange
-    (range_proof_source found);
+    found.range_source;
   let env =
     proof_env_add_range_bounds ~source:ProofSourceLoopIndices env ~var:j
       ~range_start:0 ~range_upper:(upper_lit 8)
@@ -324,7 +328,7 @@ let test_range_proofs_carry_sources () =
     expect_some "range bounds source" (proof_env_find_range env ~var:j)
   in
   check_source "range bounds source" ProofSourceLoopIndices
-    (range_proof_source found)
+    found.range_source
 
 let test_subscript_proofs_carry_sources () =
   let i = coll_id "i" in
@@ -445,33 +449,9 @@ let test_branch_narrowing_rejects_mutable_subjects () =
     | Error _ -> Alcotest.fail "immutable subject should produce a proof"
   in
   Alcotest.(check bool)
-    "immutable proof keeps direct subject" true
-    (match branch_range_subject proof with
-    | NarrowedBinding identity ->
-        String.equal (collection_identity_name identity) "i"
-    | _ -> false);
-  Alcotest.(check bool)
     "branch proof reuses range proof decisions" true
     (proves_direct_subscript (branch_range_proof proof)
        ~bounds:[ bound_const 10 ]);
-  let alias =
-    expect_some "immutable alias"
-      (immutable_alias_subject ~alias:"j" ~target:"i")
-  in
-  let alias_proof =
-    match
-      make_branch_range_proof alias ~range_start:0 ~range_upper:(upper_lit 10)
-    with
-    | Ok proof -> proof
-    | Error _ -> Alcotest.fail "immutable alias should produce a proof"
-  in
-  Alcotest.(check bool)
-    "immutable alias proof records alias target" true
-    (match branch_range_subject alias_proof with
-    | NarrowedAlias { alias; target } ->
-        String.equal (collection_identity_name alias) "j"
-        && String.equal (collection_identity_name target) "i"
-    | _ -> false);
   let mutable_subject = expect_some "mutable subject" (mutable_subject "i") in
   Alcotest.(check bool)
     "mutable subject cannot produce branch proof" true

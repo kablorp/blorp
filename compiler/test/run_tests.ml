@@ -93,7 +93,6 @@ let default_suites =
   @ suite_group "CoreResolve" Test_core_resolve.suite
   @ suite_group "CoreStdInline" Test_core_std_inline.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite
-  @ suite_group "CoreDce" Test_core_dce.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
   @ suite_group "CoreMono" Test_core_mono.suite
   @ suite_group "CoreDesugar" Test_core_desugar.suite

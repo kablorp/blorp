@@ -393,7 +393,7 @@ let test_expr_function_purity_uses_structured_metadata () =
   in
   let structured_expr =
     Blorp.Ast.with_expr_type_info legacy_expr
-      (Blorp.Ast.expr_type_info_from_type impure_func_ty)
+      (Test_helpers.expr_type_info_from_type impure_func_ty)
   in
   let env = (Blorp.Typecheck.init_state ()).env in
   Alcotest.(check bool)
@@ -411,15 +411,11 @@ let assert_expr_widening ~label expr ~semantic_ty ~value_ty ~reason =
       let info = Blorp.Typed_ast.type_info typed_expr in
       Alcotest.(check bool)
         (label ^ " semantic type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_semantic_type info)
-           semantic_ty);
+        (Blorp.Types.types_equal info.semantic_ty semantic_ty);
       Alcotest.(check bool)
         (label ^ " value type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_value_type info)
-           value_ty);
-      match Blorp.Typed_ast.type_info_widening info with
+        (Blorp.Types.types_equal info.value_ty value_ty);
+      match info.widening with
       | Blorp.Type_widening.Widen { from_ty; to_ty; reason = actual_reason } ->
           Alcotest.(check bool)
             (label ^ " widening source")
@@ -617,14 +613,10 @@ let assert_ascription_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
       | _ -> Alcotest.failf "%s origin should be explicit annotation" label);
       Alcotest.(check bool)
         (label ^ " semantic type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_semantic_type info)
-           semantic_ty);
+        (Blorp.Types.types_equal info.semantic_ty semantic_ty);
       Alcotest.(check bool)
         (label ^ " value type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_value_type info)
-           value_ty)
+        (Blorp.Types.types_equal info.value_ty value_ty)
 
 let assert_expr_source_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
   match Blorp.Typed_ast.of_ast_expr expr with
@@ -639,14 +631,10 @@ let assert_expr_source_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
       | None -> Alcotest.failf "%s source type missing" label);
       Alcotest.(check bool)
         (label ^ " semantic type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_semantic_type info)
-           semantic_ty);
+        (Blorp.Types.types_equal info.semantic_ty semantic_ty);
       Alcotest.(check bool)
         (label ^ " value type") true
-        (Blorp.Types.types_equal
-           (Blorp.Typed_ast.type_info_value_type info)
-           value_ty)
+        (Blorp.Types.types_equal info.value_ty value_ty)
 
 let test_typecheck_typed_preserves_ascription_metadata () =
   let source_ty = Blorp.Ast.TyNamed ("Int32", []) in
@@ -927,9 +915,21 @@ func main(args: List[String]) -> Int:
         lambda
     | _ -> Alcotest.fail "lambda declaration not found"
   in
-  match Blorp.Typed_ast.of_ast_func_decl lambda with
+  let lambda_decl =
+    {
+      Blorp.Ast.decl_desc = Blorp.Ast.DFunc lambda;
+      decl_loc = Blorp.Ast.dummy_loc;
+      decl_doc = None;
+    }
+  in
+  match Blorp.Typed_ast.of_ast_decl lambda_decl with
   | Error _ -> Alcotest.fail "lambda did not validate"
-  | Ok typed_lambda ->
+  | Ok typed_decl ->
+      let typed_lambda =
+        match Blorp.Typed_ast.decl_func typed_decl with
+        | Some func -> func
+        | None -> Alcotest.fail "lambda declaration did not remain a function"
+      in
       let info = Blorp.Typed_ast.func_info typed_lambda in
       (match info.source_return_ty with
       | Some actual ->
@@ -1470,7 +1470,7 @@ let typecheck_test_expr desc =
 
 let typed_typecheck_test_expr desc ty =
   Blorp.Ast.with_expr_type_info (typecheck_test_expr desc)
-    (Blorp.Ast.expr_type_info_from_type ty)
+    (Test_helpers.expr_type_info_from_type ty)
 
 let test_exhaustiveness_rejects_untyped_scrutinee_boundary () =
   let scrutinee = typecheck_test_expr (Blorp.Ast.EIdent "x") in

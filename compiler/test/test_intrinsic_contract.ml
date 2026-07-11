@@ -404,7 +404,8 @@ let test_void_boxed_runtime_builtins_have_ownership_coverage () =
                  "%s has runtime void* ABI slots but no ownership contract" name)
         | Some entry ->
             let supported_arity =
-              Core_ownership.builtin_contract_sample_arities entry
+              Core_ownership.builtin_contract_spec_sample_arities
+                entry.builtin_spec
               |> List.exists (fun arity ->
                   arity >= required_arity
                   &&

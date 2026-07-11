@@ -17,7 +17,7 @@ import:
 		),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-		CoreConstructorMatchTest(EnumConstructorTest),
+		CoreConstructorMatchTest(EnumConstructorTest, UnionTagConstructorTest),
 		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
 			AssignExpr,
@@ -33,7 +33,6 @@ import:
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
-			ListGetExpr,
 			ListRetainExpr,
 			ListSetExpr,
 			LiteralExpr,
@@ -48,7 +47,6 @@ import:
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(UserFunction),
-		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreLiteralMatchCase,
@@ -62,6 +60,7 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CoreProgram,
+		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -542,6 +541,18 @@ pure func arg_modes_equal(left: List[OwnershipArgMode], right: List[OwnershipArg
 					arg_mode_equal(left_head, right_head) and arg_modes_equal(left_tail, right_tail)
 
 
+pure func int_lists_equal(left: List[Int], right: List[Int]) -> Bool:
+	match left:
+		[]:
+			right.length() == 0
+		[left_head, ...left_tail]:
+			match right:
+				[]:
+					False
+				[right_head, ...right_tail]:
+					left_head == right_head and int_lists_equal(left_tail, right_tail)
+
+
 pure func result_mode_equal(left: OwnershipResultMode, right: OwnershipResultMode) -> Bool:
 	match left:
 		ReturnVoid:
@@ -619,6 +630,14 @@ pure func contract_is(
 			)
 		None:
 			False
+
+
+pure func contract_is_none(contract: Option[OwnershipCallContract]) -> Bool:
+	match contract:
+		Some(_):
+			False
+		None:
+			True
 
 
 pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
@@ -1793,35 +1812,34 @@ pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 		),
 		[TransferArg, TransferArg],
 		ReturnOwned,
-	) and lookup_constructor_call_contract(env, "Node", None, 3) == None
+	) and contract_is_none(lookup_constructor_call_contract(env, "Node", None, 3))
 
 
 pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
 	env: PerceusEnv = build_env(decl_env_program())
 
-	contract_for_call(
-		env,
-		UserCall("Node", None, []),
-		1,
-		UnionType("Tree"),
-	) == None and contract_is(
-		contract_for_call(
-			env,
-			UserCall("Node", None, []),
-			1,
-			boxed_string_type(),
-		),
-		[TransferArg],
-		ReturnOwned,
-	) and contract_is(
-		contract_for_call(
-			env,
-			UserCall("WrongNameButSameDefId", Some(99), []),
-			1,
-			NamedType("BoxedString", []),
-		),
-		[TransferArg],
-		ReturnOwned,
+	(
+		contract_is_none(contract_for_call(env, UserCall("Node", None, []), 1, UnionType("Tree")))
+		and contract_is(
+			contract_for_call(
+				env,
+				UserCall("Node", None, []),
+				1,
+				boxed_string_type(),
+			),
+			[TransferArg],
+			ReturnOwned,
+		)
+		and contract_is(
+			contract_for_call(
+				env,
+				UserCall("WrongNameButSameDefId", Some(99), []),
+				1,
+				NamedType("BoxedString", []),
+			),
+			[TransferArg],
+			ReturnOwned,
+		)
 	)
 
 
@@ -2272,7 +2290,7 @@ pure func test_user_contract_worklist_propagates_consumption_beyond_eight_edges(
 
 	match function_body(rewritten, "consume_0"):
 		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
-			consumed_args == [0]
+			int_lists_equal(consumed_args, [0])
 		Some(body):
 			False
 		None:
@@ -2497,7 +2515,7 @@ pure func test_specialized_functions_with_shared_def_id_keep_distinct_contracts(
 
 	consume_transfers: Bool = match function_body(rewritten, "consume_caller"):
 		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
-			consumed_args == [0]
+			int_lists_equal(consumed_args, [0])
 		Some(body):
 			False
 		None:
@@ -2545,22 +2563,16 @@ pure func test_consumed_managed_parameter_branch_return_transfers_without_retain
 		"read_length",
 		809,
 		[core_param("items", list_int_type())],
-		NamedType(
-			"RawPointer",
-			[],
-		),
-		ListGetExpr(
-			{
-				layout = PointerListStorage,
-				list = var_expr("items", list_int_type()),
-				index = int_expr(0),
-				bounds = ProvenListAccess
-			},
-			NamedType(
-				"RawPointer",
+		NamedType("Option", [int_type()]),
+		SeqExpr(
+			intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+			user_call_expr(
+				"Some",
+				None,
 				[],
+				[int_expr(0)],
+				NamedType("Option", [int_type()]),
 			),
-			SyntheticSourceLoc,
 		),
 	)
 	callee: CoreDecl = function_decl(
@@ -2574,7 +2586,7 @@ pure func test_consumed_managed_parameter_branch_return_transfers_without_retain
 				Some(809),
 				[0],
 				[var_expr("value", list_int_type())],
-				NamedType("RawPointer", []),
+				NamedType("Option", [int_type()]),
 			),
 			SeqExpr(
 				user_call_expr(
@@ -2582,7 +2594,7 @@ pure func test_consumed_managed_parameter_branch_return_transfers_without_retain
 					Some(809),
 					[0],
 					[var_expr("value", list_int_type())],
-					NamedType("RawPointer", []),
+					NamedType("Option", [int_type()]),
 				),
 				IfExpr(
 					var_expr(
@@ -2625,6 +2637,102 @@ pure func test_consumed_managed_parameter_branch_return_transfers_without_retain
 	match function_body(rewritten, "take_or_return"):
 		Some(body):
 			dup_count_for("value", body) == 0 and drop_count_for("value", body) == 0
+		None:
+			False
+
+
+pure func test_nested_consumed_parameter_returns_transfer_each_owner() -> Bool:
+	doc_type: CoreType = UnionType("Doc")
+	concat_expr: CoreExpr = UnionConstructExpr(
+		{
+			type_name = "Doc",
+			constructor_name = "Concat",
+			constructor_c_name = "Concat",
+			representation = GenericUnionRepresentation,
+			payload_storage = ErasedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [
+				transferring_boxed_value(var_expr("a", doc_type)),
+				transferring_boxed_value(var_expr("b", doc_type)),
+			]
+		},
+		doc_type,
+		SyntheticSourceLoc,
+	)
+	inner_match: CoreExpr = ConstructorMatchExpr(
+		var_expr(
+			"b",
+			doc_type,
+		),
+		NoReleasePolicy,
+		[
+			{
+				constructor = "Nil",
+				accessor = RootAccessor,
+				test = UnionTagConstructorTest("TAG_Doc_Nil", "Doc"),
+				bindings = [],
+				body = ConstructorMatchBodyExpr(var_expr("a", doc_type))
+			},
+		],
+		ConstructorMatchFallbackBody(concat_expr),
+		doc_type,
+		SyntheticSourceLoc,
+	)
+	cat: CoreDecl = function_decl(
+		"cat",
+		812,
+		[core_param("a", doc_type), core_param("b", doc_type)],
+		doc_type,
+		ConstructorMatchExpr(
+			var_expr(
+				"a",
+				doc_type,
+			),
+			NoReleasePolicy,
+			[
+				{
+					constructor = "Nil",
+					accessor = RootAccessor,
+					test = UnionTagConstructorTest("TAG_Doc_Nil", "Doc"),
+					bindings = [],
+					body = ConstructorMatchBodyExpr(var_expr("b", doc_type))
+				},
+			],
+			ConstructorMatchFallbackBody(inner_match),
+			doc_type,
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			UnionDecl({
+				name = "Doc",
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("Nil", 0, None, []),
+					union_variant(
+						"Concat",
+						1,
+						None,
+						[union_field(doc_type), union_field(doc_type)],
+					),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			cat,
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "cat"):
+		Some(body):
+			(
+				dup_count_for("a", body) == 0
+				and dup_count_for("b", body) == 0
+				and drop_count_for("a", body) == 1
+				and drop_count_for("b", body) == 1
+			)
 		None:
 			False
 
@@ -4993,7 +5101,7 @@ pure func test_inferred_user_call_contract_is_written_to_calls() -> Bool:
 		Some(body):
 			match body:
 				CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
-					name == "consume" and consumed_args == [0]
+					name == "consume" and int_lists_equal(consumed_args, [0])
 				_:
 					False
 		None:
@@ -5035,7 +5143,7 @@ pure func test_inferred_user_call_contract_is_used_for_union_return() -> Bool:
 
 	match function_body(program, "call_consume_with_union_result"):
 		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
-			name == "consume_with_union_result" and consumed_args == [0]
+			name == "consume_with_union_result" and int_lists_equal(consumed_args, [0])
 		Some(body):
 			False
 		None:
@@ -5197,7 +5305,10 @@ pure func test_inferred_user_call_contract_propagates_through_managed_binding() 
 
 	match function_body(program, "call_parse_owned_inputs_wrapper"):
 		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
-			name == "parse_owned_inputs_wrapper" and consumed_args == [0, 1, 2]
+			name == "parse_owned_inputs_wrapper" and int_lists_equal(
+				consumed_args,
+				[0, 1, 2],
+			)
 		Some(body):
 			False
 		None:
@@ -5767,6 +5878,10 @@ tests: TestSuite = {
 		(
 			"consumed managed parameter branch return transfers without retain",
 			test_consumed_managed_parameter_branch_return_transfers_without_retain,
+		),
+		(
+			"nested consumed parameter returns transfer each owner",
+			test_nested_consumed_parameter_returns_transfer_each_owner,
 		),
 		(
 			"consumed parameter fallible transfer balances reserved owner",

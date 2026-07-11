@@ -3,6 +3,15 @@
 -- This evaluator covers the expression forms already normalized by
 -- compiler_ctfe_ir.brp. Production materialization remains a separate slice.
 import:
+	../stage_01_file_io/compiler_source: CompilerSourceSpan
+	../stage_03_parse/compiler_parsed_ast:
+		ParsedBinaryOp,
+		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
+		ParsedUnaryOp,
+	../stage_05_types/compiler_type: CompilerType
+	../stage_06_typecheck/compiler_infer: CompilerTypedExpr
 	compiler_ctfe_context:
 		CompilerCtfeContext,
 		CompilerCtfeFunction,
@@ -207,15 +216,7 @@ import:
 		compiler_ctfe_result_ok_value,
 		compiler_ctfe_result_state,
 		compiler_ctfe_string_text_of_value,
-	../stage_06_typecheck/compiler_infer: CompilerTypedExpr
-	../stage_03_parse/compiler_parsed_ast:
-		ParsedBinaryOp,
-		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
-		ParsedParam,
-		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
-		ParsedUnaryOp,
-	../stage_01_file_io/compiler_source: CompilerSourceSpan
-	../stage_05_types/compiler_type: CompilerType
+	string as StringOps
 
 
 union CompilerCtfeEvalError:
@@ -248,12 +249,14 @@ pure func compiler_ctfe_eval_error_message(error: CompilerCtfeEvalError) -> Stri
 		CompilerCtfeEvalInvalid(message):
 			message
 		CompilerCtfeEvalUnsupported(form):
-			"compile-time constant evaluation does not support " + form + " yet"
+			"compile-time constant evaluation does not support ${form} yet"
 
 
 private pure func compiler_ctfe_eval_value_result(
 	result: Result[CompilerCtfeValue, CompilerCtfeError],
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	-- Keep error adaptation concrete here. The current self-hosted compiler
+	-- cannot reliably specialize Result.map_err throughout this large module.
 	match result:
 		Ok(value):
 			Ok(value)
@@ -339,6 +342,16 @@ private pure func compiler_ctfe_eval_result_state_result(
 			Err(CompilerCtfeEvalValueError(error))
 
 
+private pure func compiler_ctfe_eval_translate_result(
+	result: Result[CompilerCtfeIrExpr, CompilerCtfeIrTranslateError],
+) -> Result[CompilerCtfeIrExpr, CompilerCtfeEvalError]:
+	match result:
+		Ok(expr):
+			Ok(expr)
+		Err(error):
+			Err(CompilerCtfeEvalTranslateError(error))
+
+
 private pure func compiler_ctfe_ir_eval_span(expr: CompilerCtfeIrExpr) -> CompilerSourceSpan:
 	expr.span
 
@@ -414,6 +427,7 @@ private pure func compiler_ctfe_eval_identifier(
 					compiler_ctfe_ir_eval_span(expr),
 					call.callable_id,
 					call.source_name,
+					call.is_pure,
 				),
 			)
 		CompilerCtfeIrUnsupportedFunctionReference(source_name):
@@ -1103,11 +1117,12 @@ private pure func compiler_ctfe_eval_ctfe_function_call(
 	else:
 		match ctfe_function.info.body:
 			Some(body):
-				body_ir ?= match compiler_ctfe_ir_from_typed_expr(context, body):
-					Ok(ir):
-						Ok(ir)
-					Err(error):
-						Err(CompilerCtfeEvalTranslateError(error))
+				body_ir ?= compiler_ctfe_eval_translate_result(
+					compiler_ctfe_ir_from_typed_expr(
+						context,
+						body,
+					),
+				)
 
 				function_env ?= compiler_ctfe_function_call_env(
 					context,
@@ -1318,7 +1333,10 @@ private pure func compiler_ctfe_eval_expect_function_reference(
 ) -> Result[(Int, String), CompilerCtfeEvalError]:
 	match value.desc:
 		CompilerCtfeFunctionReferenceValue(reference):
-			Ok((reference.callable_id, reference.source_name))
+			if reference.is_pure:
+				Ok((reference.callable_id, reference.source_name))
+			else:
+				Err(CompilerCtfeEvalUnsupported("impure callback calls"))
 		_:
 			Err(CompilerCtfeEvalUnsupported("callback calls on non-function values"))
 
@@ -1744,7 +1762,7 @@ private pure func compiler_ctfe_eval_imported_list_intrinsic(
 			separator ?= compiler_ctfe_eval_string_result(
 				compiler_ctfe_expect_string(separator_value),
 			)
-			text ?= compiler_ctfe_eval_list_join_values(values, separator)
+			text: String ?= compiler_ctfe_eval_list_join_values(values, separator)
 			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
 		(CompilerCtfeListLength, [receiver]):
 			values ?= compiler_ctfe_eval_expect_list(receiver)
@@ -2051,7 +2069,12 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 		(CompilerCtfeStringRepeat, [receiver, count_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
-			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.repeat(count)))
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					StringOps.repeat(receiver_text, count),
+				),
+			)
 		(CompilerCtfeStringReplace, [receiver, old_value, new_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			old ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(old_value))
@@ -2067,9 +2090,12 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 			delimiter ?= compiler_ctfe_eval_string_result(
 				compiler_ctfe_expect_string(delimiter_value),
 			)
-			values = receiver_text
-				.split(delimiter)
-				.map(func(part): compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), part))
+			parts: List[String] = receiver_text.split(delimiter)
+			var values: List[CompilerCtfeValue] = []
+
+			for part in parts:
+				values = values.append(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), part))
+
 			Ok(
 				compiler_ctfe_value(
 					compiler_ctfe_ir_eval_type(expr),

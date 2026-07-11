@@ -1218,6 +1218,35 @@ let typed_global_var_decl =
           ] );
     ]
 
+let typed_qualified_global_var_decl =
+  let canonical_type = named "std/test::TestSuite" in
+  Object
+    [
+      ("kind", String "global_var");
+      ( "info",
+        Object
+          [
+            ( "decl",
+              Object
+                [
+                  ("name", ident_at "tests");
+                  ("type", parsed_named "TestSuite");
+                  ( "value",
+                    Object
+                      [
+                        ("kind", String "name");
+                        ("name", ident_at "suite_value");
+                        ("span", span_json);
+                      ] );
+                  ("is_mutable", Bool false);
+                  ("span", span_json);
+                ] );
+            ("binding_type", canonical_type);
+            ("source_type", named "TestSuite");
+            ("value", typed_name_with_type "suite_value" canonical_type);
+          ] );
+    ]
+
 let typed_function_info =
   Object
     [
@@ -1493,6 +1522,27 @@ let test_decode_typed_program_global_var () =
           Alcotest.(check (option string))
             "var name" (Some "answer") (Typed.var_ast var).var_name;
           check_type "var binding" (TyNamed ("Int", []))
+            (Typed.var_binding_type var)
+      | _ -> Alcotest.fail "expected typed var declaration")
+  | _ -> Alcotest.fail "expected one typed declaration"
+
+let test_decode_typed_program_qualified_global_var () =
+  let program =
+    expect_typed_program
+      (Object
+         [
+           ("kind", String "typed_program");
+           ("source", Object []);
+           ("decls", Array [ typed_qualified_global_var_decl ]);
+           ("diagnostics", Array []);
+         ])
+  in
+  match Typed.program_decls program with
+  | [ decl ] -> (
+      match Typed.decl_view decl with
+      | Typed.DeclVar var ->
+          check_type "canonical var binding"
+            (TyNamed ("std/test::TestSuite", []))
             (Typed.var_binding_type var)
       | _ -> Alcotest.fail "expected typed var declaration")
   | _ -> Alcotest.fail "expected one typed declaration"
@@ -1958,6 +2008,8 @@ let suite =
           test_decode_concurrent_block_requires_explicit_bindings;
         Alcotest.test_case "typed program global var" `Quick
           test_decode_typed_program_global_var;
+        Alcotest.test_case "typed program qualified global var" `Quick
+          test_decode_typed_program_qualified_global_var;
         Alcotest.test_case "typed program function" `Quick
           test_decode_typed_program_function_decl;
         Alcotest.test_case "typed program record and alias" `Quick

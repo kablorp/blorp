@@ -21,11 +21,11 @@ let mk_call_with_resolved_target ~env_purity ~callee_type_pure ~target =
   in
   let callee =
     mk_expr (EIdent "f") |> fun e ->
-    with_expr_type_info e (expr_type_info_from_type fn_ty)
+    with_expr_type_info e (Test_helpers.expr_type_info_from_type fn_ty)
   in
   let call =
     mk_expr (ECall (callee, [])) |> fun e ->
-    with_expr_type_info e (expr_type_info_from_type ty_int)
+    with_expr_type_info e (Test_helpers.expr_type_info_from_type ty_int)
   in
   let resolved =
     {

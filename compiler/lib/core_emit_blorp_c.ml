@@ -8358,6 +8358,11 @@ let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
       Ok []
+  | Core.CDType type_decl
+    when type_decl.type_params <> []
+         && not (supported_generic_erased_union_decl type_decl) ->
+      Ok []
+  | Core.CDRecord record_decl when record_decl.record_type_params <> [] -> Ok []
   | Core.CDFunc func ->
       let* json =
         function_json ~function_names ~consumed_params ~reg ~enum_names

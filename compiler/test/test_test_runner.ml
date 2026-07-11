@@ -202,11 +202,11 @@ let test_inherited_timeout_sends_sigterm_before_sigkill () =
 
 let test_run_artifact_paths_are_scoped_to_one_run_root () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
-      let root = Blorp.Test_runner.current_run_artifact_root () in
       let first =
         Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
           ~suffix:".bin"
       in
+      let root = Filename.dirname (Filename.dirname first) in
       let second =
         Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
           ~suffix:".bin"
@@ -231,7 +231,11 @@ let is_uuid_like s =
 
 let test_run_artifact_root_uses_uuid () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
-      let root = Blorp.Test_runner.current_run_artifact_root () in
+      let artifact =
+        Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
+          ~suffix:".bin"
+      in
+      let root = Filename.dirname (Filename.dirname artifact) in
       let name = Filename.basename root in
       let prefix = "run-" in
       Alcotest.(check bool)
@@ -246,20 +250,23 @@ let test_run_artifact_root_uses_uuid () =
 let test_run_artifact_roots_do_not_overlap () =
   let first =
     Blorp.Test_runner.with_run_artifacts (fun () ->
-        Blorp.Test_runner.current_run_artifact_root ())
+        Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
+          ~suffix:".bin"
+        |> Filename.dirname |> Filename.dirname)
   in
   let second =
     Blorp.Test_runner.with_run_artifacts (fun () ->
-        Blorp.Test_runner.current_run_artifact_root ())
+        Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
+          ~suffix:".bin"
+        |> Filename.dirname |> Filename.dirname)
   in
   Alcotest.(check bool) "separate runs use separate roots" true (first <> second)
 
 let test_compilation_dirs_are_run_scoped () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
-      let root = Blorp.Test_runner.current_run_artifact_root () in
       let first = Blorp.Test_runner.run_compilation_dir () in
       let second = Blorp.Test_runner.run_compilation_dir () in
-      let parent = Filename.concat root "compilations" in
+      let parent = Filename.dirname first in
       let first_name = Filename.basename first in
       let second_name = Filename.basename second in
       Alcotest.(check bool)
@@ -274,7 +281,11 @@ let test_compilation_dirs_are_run_scoped () =
 
 let test_compilation_dirs_are_fork_safe () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
-      let root = Blorp.Test_runner.current_run_artifact_root () in
+      let artifact =
+        Blorp.Test_runner.run_artifact_path ~kind:"bins" ~prefix:"sample"
+          ~suffix:".bin"
+      in
+      let root = Filename.dirname (Filename.dirname artifact) in
       let spawn_child () =
         let read_fd, write_fd = Unix.pipe () in
         match Unix.fork () with
@@ -373,48 +384,6 @@ let test_capture_process_uses_supplied_cwd_and_env () =
         "marker written under cwd" true (Sys.file_exists marker);
       Alcotest.(check string)
         "env propagated" "isolated-tmp" (read_whole_file marker))
-
-let test_collect_test_files_preserves_multi_root_order () =
-  with_temp_dir "blorp-test-roots-" (fun dir ->
-      let std_dir = Filename.concat dir "test_std" in
-      let pkg_dir = Filename.concat dir "test_pkg" in
-      Unix.mkdir std_dir 0o700;
-      Unix.mkdir pkg_dir 0o700;
-      let std_a_file = Filename.concat std_dir "test_a.brp" in
-      let std_z_file = Filename.concat std_dir "test_z.brp" in
-      let pkg_file = Filename.concat pkg_dir "test_crypto.brp" in
-      let ignored_file = Filename.concat std_dir "helper.brp" in
-      let write_suite file description test_name =
-        write_file file
-          (Printf.sprintf
-             {|
-import:
-    test: TestSuite
-
-func %s() -> Bool:
-    True
-
-tests: TestSuite = {
-    description = "%s",
-    tests = [("%s", %s)]
-}
-|}
-             test_name description description test_name)
-      in
-      write_suite std_z_file "std z" "test_std_z";
-      write_suite std_a_file "std a" "test_std_a";
-      write_file pkg_file {|
-func main(args: List[String]) -> Int:
-    0
-|};
-      write_file ignored_file {|
-pure func helper() -> Int:
-    1
-|};
-      Alcotest.(check (list string))
-        "valid test files from each root"
-        [ std_a_file; std_z_file ]
-        (Blorp.Test_runner.collect_test_files [ std_dir; pkg_dir ]))
 
 let test_main_only_file_is_not_runnable_test () =
   with_temp_dir "blorp-main-only-test-" (fun dir ->
@@ -1072,8 +1041,6 @@ let suite =
       ] );
     ( "suite_selector_harness",
       [
-        Alcotest.test_case "collects_multi_root_files" `Quick
-          test_collect_test_files_preserves_multi_root_order;
         Alcotest.test_case "main_only_not_runnable" `Quick
           test_main_only_file_is_not_runnable_test;
         Alcotest.test_case "testsuite_file_runnable" `Quick

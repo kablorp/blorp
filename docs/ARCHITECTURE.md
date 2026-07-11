@@ -54,7 +54,9 @@ late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the supported default backend route crosses the
-single JSON bridge after OCaml `Core_dce`. On that route,
+single JSON bridge after OCaml specialization and function-reference
+adaptation. On that route,
+`compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`,
@@ -63,9 +65,9 @@ single JSON bridge after OCaml `Core_dce`. On that route,
 `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`, and
 `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` own the contiguous tail through C
-artifact generation. CLI `consume-specialize`/`perceus`/`reuse`/`closure`/`final`
+artifact generation. CLI `dce`/`consume-specialize`/`perceus`/`reuse`/`closure`/`final`
 dumps and stops observe the Blorp-owned tail as Core JSON through the bridge;
-OCaml program callbacks stop at the post-DCE handoff. C artifact emission is
+OCaml program callbacks stop at the pre-DCE handoff. C artifact emission is
 owned by the Blorp backend bridge.
 
 ```
@@ -149,15 +151,15 @@ Typed AST
                    (core_specialize.ml, core_closure.ml)
     |
     v
-+----------+
-| Core_dce |  Prune unreachable concrete functions, impl methods, and
-+----------+  non-runtime templates/source-only type declarations before ownership insertion
-             (core_dce.ml)
++--------------------------+
+| JSON handoff (supported) |  Supported pre-DCE Core enters the
++--------------------------+  contiguous Blorp-owned backend
     |
     v
-+--------------------------+
-| JSON handoff (supported) |  Supported post-DCE Core enters the
-+--------------------------+  contiguous Blorp-owned backend
++----------------+
+| Blorp DCE      |  Prune unreachable emitted functions and projected type
++----------------+  declarations using explicit function/type reachability
+                    (compiler_core_dce.brp)
     |
     v
 +-------------------------+
@@ -271,7 +273,6 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
-| `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
@@ -356,7 +357,6 @@ compiler/
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
-│   ├── core_dce.ml       # Dead concrete declaration pruning before ownership
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_closure.ml    # Function-reference eta adapters
 │   ├── core_hash_container_layout.ml # Dict/set layout selection

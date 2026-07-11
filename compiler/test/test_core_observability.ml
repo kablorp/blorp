@@ -21,6 +21,25 @@ func main(args: List[String]) -> Int:
     inc(41)
 |}
 
+let expected_program_stage_order =
+  [
+    Core_stage.Lower;
+    Core_stage.Debug;
+    Core_stage.Desugar;
+    Core_stage.Mono;
+    Core_stage.Synth;
+    Core_stage.Match;
+    Core_stage.TraitResolve;
+    Core_stage.Resolve;
+    Core_stage.StdInline;
+    Core_stage.Tailrec;
+    Core_stage.Fusion;
+    Core_stage.Specialize;
+  ]
+
+let expected_program_free_stage_event_order =
+  expected_program_stage_order @ [ Core_stage.Dce; Core_stage.Final ]
+
 let list_filter_map_collect_source =
   {|
 import:
@@ -97,11 +116,11 @@ let test_dump_after_captures_stage_output () =
   let names = List.map fst captured in
   Alcotest.(check int)
     "every OCaml-owned program stage fired"
-    (List.length Core_pipeline.pre_backend_program_stage_order)
+    (List.length expected_program_stage_order)
     (List.length names);
   Alcotest.(check (list string))
     "stages in order"
-    (List.map Core_stage.to_string Core_pipeline.pre_backend_program_stage_order)
+    (List.map Core_stage.to_string expected_program_stage_order)
     names;
   (* Each capture should mention `inc` (a user-defined function) *)
   List.iter
@@ -122,7 +141,7 @@ let test_stage_events_capture_stage_order_without_programs () =
   in
   Alcotest.(check (list string))
     "stages in order"
-    (List.map Core_stage.to_string Core_pipeline.program_free_stage_event_order)
+    (List.map Core_stage.to_string expected_program_free_stage_event_order)
     (List.rev !stages |> List.map Core_stage.to_string)
 
 let test_blorp_tail_json_observation_captures_late_stages () =
@@ -163,7 +182,7 @@ let test_blorp_tail_json_observation_records_stage_events () =
   Alcotest.(check (list string))
     "tail JSON stage events in order"
     (List.map Core_stage.to_string
-       (Core_pipeline.pre_backend_program_stage_order @ requested_tail_stages))
+       (expected_program_stage_order @ (Core_stage.Dce :: requested_tail_stages)))
     (List.rev !stages |> List.map Core_stage.to_string)
 
 let test_stop_after_short_circuits () =
@@ -300,7 +319,7 @@ let test_pipeline_stage_events_fire_without_program_callback () =
   | Ok (Pipeline.Compiled _) ->
       Alcotest.(check (list string))
         "stage event order"
-        (List.map Core_stage.to_string Core_pipeline.program_free_stage_event_order)
+        (List.map Core_stage.to_string expected_program_free_stage_event_order)
         (List.rev !core_stages |> List.map Core_stage.to_string)
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)

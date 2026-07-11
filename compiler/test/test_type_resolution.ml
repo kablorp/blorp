@@ -140,8 +140,7 @@ let test_imported_signature_uses_named_resolution_path () =
       }
   in
   let resolved =
-    Blorp.Type_resolution.imported_signature ctx source
-    |> Blorp.Type_resolution.canonical
+    Blorp.Type_resolution.imported_signature_canonical ctx source
   in
   check_true "imported signatures resolve through the central resolver"
     (types_equal resolved
@@ -165,7 +164,7 @@ let test_record_field_type_can_preserve_alias_source () =
   check_true "record field type alias source can be preserved"
     (types_equal resolved (TyNamed ("UserId", [])))
 
-let test_declaration_entrypoints_share_resolution_pipeline () =
+let test_declaration_canonicalizers_share_resolution_pipeline () =
   let env =
     Blorp.Env.add_alias (Blorp.Env.empty ()) "LocalHit" []
       (* Typecheck stores aliases in Env after source declarations have already
@@ -189,15 +188,15 @@ let test_declaration_entrypoints_share_resolution_pipeline () =
   let check_entrypoint label resolve =
     let resolved = resolve ctx source in
     check_true
-      (label ^ " retains source spelling")
-      (types_equal (Blorp.Type_resolution.source resolved) source);
-    check_true
       (label ^ " canonicalizes through central resolver")
-      (types_equal (Blorp.Type_resolution.canonical resolved) expected)
+      (types_equal resolved expected)
   in
-  check_entrypoint "record field" Blorp.Type_resolution.record_field_type;
-  check_entrypoint "variant field" Blorp.Type_resolution.variant_field_type;
-  check_entrypoint "type alias target" Blorp.Type_resolution.type_alias_target
+  check_entrypoint "record field"
+    Blorp.Type_resolution.record_field_type_canonical;
+  check_entrypoint "variant field"
+    Blorp.Type_resolution.variant_field_type_canonical;
+  check_entrypoint "type alias target"
+    Blorp.Type_resolution.type_alias_target_canonical
 
 let test_inference_annotation_entrypoints_share_resolution_pipeline () =
   let env =
@@ -258,8 +257,8 @@ let suite =
           test_imported_signature_uses_named_resolution_path;
         Alcotest.test_case "record field type alias preservation" `Quick
           test_record_field_type_can_preserve_alias_source;
-        Alcotest.test_case "declaration named entrypoints" `Quick
-          test_declaration_entrypoints_share_resolution_pipeline;
+        Alcotest.test_case "declaration canonicalizers" `Quick
+          test_declaration_canonicalizers_share_resolution_pipeline;
         Alcotest.test_case "inference annotation named entrypoints" `Quick
           test_inference_annotation_entrypoints_share_resolution_pipeline;
       ] );

@@ -246,18 +246,6 @@ let duplicate_names =
   in
   StringSet.elements duplicates
 
-let descriptor_is_inert
-    { runtime_effect; parallel_boundary; special_inference; _ } =
-  match (runtime_effect, parallel_boundary, special_inference) with
-  | Pure_metadata, false, None -> true
-  | _ -> false
-
-let inert_descriptor_names =
-  descriptors
-  |> List.filter_map (fun ({ name; _ } as d) ->
-      if descriptor_is_inert d then Some name else None)
-  |> List.sort_uniq String.compare
-
 let registry =
   match duplicate_names with
   | [] ->
@@ -269,7 +257,6 @@ let registry =
         ("Builtin_metadata duplicate descriptors: " ^ String.concat ", " names)
 
 let find name = StringMap.find_opt name registry
-let is_registered name = Option.is_some (find name)
 
 let has_effect name builtin_effect =
   match find name with
@@ -288,9 +275,6 @@ let has_effect name builtin_effect =
 
 let is_impure name = has_effect name Impure
 let is_parallel_boundary name = has_effect name Parallel_boundary
-let is_cancellation_point name = has_effect name Cancellation_point
-let may_park_fiber name = has_effect name Fiber_parking
-let is_os_worker_blocking name = has_effect name Os_worker_blocking
 
 let special_inference name =
   match find name with Some d -> d.special_inference | None -> None

@@ -6,7 +6,7 @@ open Blorp.Types
 let check_true msg b = Alcotest.(check bool) msg true b
 
 let with_type expr ty =
-  Blorp.Ast.with_expr_type_info expr (Blorp.Ast.expr_type_info_from_type ty)
+  Blorp.Ast.with_expr_type_info expr (Test_helpers.expr_type_info_from_type ty)
 
 let expr_with_type ty =
   with_type
@@ -75,6 +75,22 @@ let type_decl ?(is_builtin = true) ?(is_resource = true) ?resource_cleanup name
 
 let decl desc = { decl_desc = desc; decl_loc = dummy_loc; decl_doc = None }
 
+let of_func_decl func =
+  match Blorp.Typed_ast.of_ast_decl (decl (DFunc func)) with
+  | Error error -> Error error
+  | Ok typed_decl -> (
+      match Blorp.Typed_ast.decl_func typed_decl with
+      | Some typed_func -> Ok typed_func
+      | None -> assert false)
+
+let of_var_decl var =
+  match Blorp.Typed_ast.of_ast_decl (decl (DVar var)) with
+  | Error error -> Error error
+  | Ok typed_decl -> (
+      match Blorp.Typed_ast.decl_view typed_decl with
+      | Blorp.Typed_ast.DeclVar typed_var -> Ok typed_var
+      | _ -> assert false)
+
 let test_accepts_finalized_expr () =
   match Blorp.Typed_ast.of_ast_expr (expr_with_type ty_int) with
   | Ok typed ->
@@ -117,7 +133,7 @@ let test_value_slot_type_info_preserves_widening () =
           check_true "compatibility expr_type is semantic"
             (types_equal ty (TyConstInt 1))
       | None -> Alcotest.fail "expected compatibility expr_type");
-      match Blorp.Typed_ast.type_info_widening info with
+      match info.widening with
       | Blorp.Type_widening.Widen { from_ty; to_ty; reason } ->
           check_true "widening source retained"
             (types_equal from_ty (TyConstInt 1));
@@ -155,12 +171,10 @@ let test_expr_prefers_ast_type_info () =
   | Ok typed -> (
       let info = Blorp.Typed_ast.type_info typed in
       check_true "semantic type retained"
-        (types_equal
-           (Blorp.Typed_ast.type_info_semantic_type info)
-           (TyConstInt 1));
+        (types_equal info.semantic_ty (TyConstInt 1));
       check_true "value type retained"
-        (types_equal (Blorp.Typed_ast.type_info_value_type info) ty_int);
-      match Blorp.Typed_ast.type_info_widening info with
+        (types_equal info.value_ty ty_int);
+      match info.widening with
       | Blorp.Type_widening.Widen { from_ty; to_ty; reason } ->
           check_true "widening source retained"
             (types_equal from_ty (TyConstInt 1));
@@ -229,10 +243,8 @@ let test_expr_call_metadata_accessors () =
         (Blorp.Typed_ast.expr_resolved_call typed = Some resolved);
       Alcotest.(check (option bool))
         "call purity" (Some true)
-        (Blorp.Typed_ast.expr_call_purity typed);
-      Alcotest.(check (option int))
-        "direct call id" (Some 42)
-        (Blorp.Typed_ast.expr_direct_call_id typed);
+        (Option.map Blorp.Ast.resolved_call_purity
+           (Blorp.Typed_ast.expr_resolved_call typed));
       Alcotest.(check (option int))
         "concrete callable id" (Some 42)
         (Blorp.Typed_ast.expr_concrete_callable_id typed)
@@ -272,9 +284,6 @@ let test_expr_trait_method_concrete_callable_accessor () =
     (Blorp.Ast.expr_concrete_callable_id call);
   match Blorp.Typed_ast.of_ast_expr call with
   | Ok typed ->
-      Alcotest.(check (option int))
-        "direct-only accessor excludes trait metadata" None
-        (Blorp.Typed_ast.expr_direct_call_id typed);
       Alcotest.(check (option int))
         "concrete callable id includes impl method" (Some 99)
         (Blorp.Typed_ast.expr_concrete_callable_id typed)
@@ -374,20 +383,6 @@ let test_expr_rejects_root_loop_view_meta_element_type () =
   | Ok _ -> Alcotest.fail "expected unfinalized root loop view type"
   | Error _ -> Alcotest.fail "expected unfinalized type"
 
-let test_ast_with_expr_type_info_from_type_sets_legacy_payload () =
-  let typed = with_type untyped_expr ty_bool in
-  (match typed.expr_type with
-  | Some ty -> check_true "type set" (types_equal ty ty_bool)
-  | None -> Alcotest.fail "expected expr_type");
-  match typed.expr_type_info with
-  | Some info -> (
-      check_true "semantic type set" (types_equal info.semantic_ty ty_bool);
-      check_true "value type set" (types_equal info.value_ty ty_bool);
-      match info.widening with
-      | Keep ty -> check_true "no-widening payload set" (types_equal ty ty_bool)
-      | Widen _ -> Alcotest.fail "did not expect widening")
-  | None -> Alcotest.fail "expected expr_type_info"
-
 let test_ast_with_expr_type_info_sets_consistent_payload () =
   let info =
     {
@@ -465,7 +460,7 @@ let test_ast_map_expr_type_payload_maps_all_payload_types () =
   | Keep _ | Widen _ -> Alcotest.fail "expected mapped widening"
 
 let test_func_decl_accepts_finalized_boundary () =
-  match Blorp.Typed_ast.of_ast_func_decl (func_decl ()) with
+  match of_func_decl (func_decl ()) with
   | Ok typed ->
       check_true "function retained"
         (match (Blorp.Typed_ast.func_ast typed).func_name with
@@ -477,7 +472,7 @@ let test_func_decl_preserves_inferred_return_separately () =
   let func =
     func_decl ~return_ty:None ~body:(FuncBodyExpr (expr_with_type ty_int)) ()
   in
-  match Blorp.Typed_ast.of_ast_func_decl func with
+  match of_func_decl func with
   | Ok typed ->
       check_true "source return annotation remains absent"
         (Option.is_none (Blorp.Typed_ast.func_ast typed).func_return_type);
@@ -487,7 +482,7 @@ let test_func_decl_preserves_inferred_return_separately () =
 
 let test_func_decl_rejects_missing_param_type () =
   let func = func_decl ~params:[ param ~ty:None "x" ] () in
-  match Blorp.Typed_ast.of_ast_func_decl func with
+  match of_func_decl func with
   | Error (Blorp.Typed_ast.MissingRequiredType { context; _ }) ->
       Alcotest.(check string) "context retained" "param" context
   | Ok _ -> Alcotest.fail "expected missing param type"
@@ -496,7 +491,7 @@ let test_func_decl_rejects_missing_param_type () =
 let test_func_decl_rejects_meta_return_type () =
   let ty = TyNamed ("Option", [ TyMeta 1 ]) in
   let func = func_decl ~return_ty:(Some ty) () in
-  match Blorp.Typed_ast.of_ast_func_decl func with
+  match of_func_decl func with
   | Error (Blorp.Typed_ast.UnfinalizedType { context; ty = reported; _ }) ->
       Alcotest.(check string) "context retained" "function return type" context;
       check_true "reported return type retained" (types_equal reported ty)
@@ -516,7 +511,7 @@ let test_func_decl_rejects_untyped_body_child () =
       ty_int
   in
   match
-    Blorp.Typed_ast.of_ast_func_decl (func_decl ~body:(FuncBodyExpr body) ())
+    of_func_decl (func_decl ~body:(FuncBodyExpr body) ())
   with
   | Error (Blorp.Typed_ast.MissingExprType _) -> ()
   | Ok _ -> Alcotest.fail "expected missing child expr_type"
@@ -547,7 +542,7 @@ let test_var_decl_preserves_inferred_binding_type () =
       var_is_const = false;
     }
   in
-  match Blorp.Typed_ast.of_ast_var_decl var with
+  match of_var_decl var with
   | Ok typed ->
       check_true "source binding annotation remains absent"
         (Option.is_none (Blorp.Typed_ast.var_info typed).source_binding_ty);
@@ -661,7 +656,7 @@ let test_expr_rejects_meta_loop_view_element_type () =
       (TyNamed ("Loop", [ ty_int ]))
   in
   match
-    Blorp.Typed_ast.of_ast_func_decl (func_decl ~body:(FuncBodyExpr body) ())
+    of_func_decl (func_decl ~body:(FuncBodyExpr body) ())
   with
   | Error (Blorp.Typed_ast.UnfinalizedType { context; _ }) ->
       Alcotest.(check string)
@@ -736,8 +731,6 @@ let suite =
           test_expr_rejects_root_lambda_missing_param_type;
         Alcotest.test_case "rejects root loop view meta element type" `Quick
           test_expr_rejects_root_loop_view_meta_element_type;
-        Alcotest.test_case "Ast.expr_type_info_from_type sets legacy payload"
-          `Quick test_ast_with_expr_type_info_from_type_sets_legacy_payload;
         Alcotest.test_case "Ast.with_expr_type_info sets consistent payload"
           `Quick test_ast_with_expr_type_info_sets_consistent_payload;
         Alcotest.test_case "Ast.map_expr_type_payload maps payload types" `Quick

@@ -36,12 +36,7 @@ type special_inference =
   | Bitwise
 
 val duplicate_names : string list
-val inert_descriptor_names : string list
-val is_registered : string -> bool
 val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool
-val is_cancellation_point : string -> bool
-val may_park_fiber : string -> bool
-val is_os_worker_blocking : string -> bool
 val special_inference : string -> special_inference option

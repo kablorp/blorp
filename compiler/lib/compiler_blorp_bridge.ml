@@ -620,16 +620,6 @@ let typecheck_import_module_json item =
         cli_frontend_module_origin_json item.typecheck_import_origin );
     ]
 
-let typecheck_import_modules_field import_modules =
-  match import_modules with
-  | [] -> []
-  | _ ->
-      [
-        ( "import_modules",
-          Lsp_json.Array (List.map typecheck_import_module_json import_modules)
-        );
-      ]
-
 let typecheck_resolved_import_json item =
   Lsp_json.Object
     [
@@ -648,28 +638,6 @@ let typecheck_resolved_imports_field resolved_imports =
           Lsp_json.Array
             (List.map typecheck_resolved_import_json resolved_imports) );
       ]
-
-let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
-  let payload_fields =
-    [
-      ("path", Lsp_json.String path);
-      ("module", Lsp_json.String module_name);
-      ("text", Lsp_json.String text);
-      ("origin", cli_frontend_module_origin_json origin);
-      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
-    ]
-    @ typecheck_import_modules_field import_modules
-    @ typecheck_resolved_imports_field resolved_imports
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "typecheck_source");
-         ("payload", Lsp_json.Object payload_fields);
-       ])
 
 let typecheck_graph_request_json_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =
@@ -1167,13 +1135,6 @@ let typechecked_source_artifact_field artifact =
         Error
           ( "invalid_response",
             Typed_ast_json.decode_error_to_string err )
-
-let typecheck_source_response_field response =
-  let* artifact = json_response_field "artifact" response in
-  typechecked_source_artifact_field artifact
-
-let typecheck_source_response_json response_json =
-  response_result response_json typecheck_source_response_field
 
 let typechecked_graph_source_artifact_field artifact =
   let* typechecked_graph_path = string_response_field "path" artifact in
@@ -2125,16 +2086,6 @@ type bridge_helper_compiler = {
   helper_compiler_source : bridge_helper_compiler_source;
 }
 
-let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
-    starts =
-  match bridge_bin with
-  | Some path when path <> "" -> Some path
-  | _ -> find_upwards_from starts compiler_bootstrap_script_name
-
-let command_program_for_parser_bridge ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
-    starts =
-  locate_default_command_program ~bridge_bin starts
-
 let existing_executable_candidates prog =
   executable_candidates prog |> List.filter Sys.file_exists
 
@@ -3074,16 +3025,6 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
       (parse_source_file_request_json_at_phase ~phase ~path ~module_name)
   in
   parse_source_response_json response_json
-
-let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_source_request_json_with_imports_policy
-         ~resolved_imports ~origin ~allow_debug_only_calls ~import_modules
-         ~path ~module_name ~text)
-  in
-  typecheck_source_response_json response_json
 
 let typecheck_graph_via_command_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =

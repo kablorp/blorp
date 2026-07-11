@@ -16,6 +16,11 @@ let cint n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let cvoid = mk ty_void CVoid
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
 
+let borrowed_match_binding_pairs bindings =
+  List.map
+    (fun (binding, accessor) -> borrowed_match_binding binding accessor)
+    bindings
+
 let resource_scope name ty acquire body cleanup =
   mk body.ty
     (CResourceScope

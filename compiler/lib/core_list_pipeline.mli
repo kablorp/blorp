@@ -50,7 +50,6 @@ val call_base_and_args : Core.core -> (string * Core.core list) option
 val plan_of_expr : Core.core -> t option
 val source : t -> source
 val stages : t -> stage list
-val stage_count : t -> int
 val sink : t -> sink
 val cardinality : t -> cardinality
 val result_ty : t -> Ast.type_expr

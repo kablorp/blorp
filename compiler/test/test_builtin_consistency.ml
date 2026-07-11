@@ -216,7 +216,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " is a cancellation point")
         true
-        (is_cancellation_point name))
+        (has_effect name Cancellation_point))
     [
       "sleep";
       "yield_now";
@@ -261,7 +261,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " is not a cancellation point")
         false
-        (is_cancellation_point name))
+        (has_effect name Cancellation_point))
     [
       "channel";
       "try_send";
@@ -294,7 +294,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
     (fun name ->
       Alcotest.(check bool)
         (name ^ " may park a fiber")
-        true (may_park_fiber name))
+        true (has_effect name Fiber_parking))
     [
       "sleep";
       "send";
@@ -334,7 +334,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
     (fun name ->
       Alcotest.(check bool)
         (name ^ " does not park a fiber")
-        false (may_park_fiber name))
+        false (has_effect name Fiber_parking))
     [
       "yield_now";
       "cancel_after_parked_for_test";
@@ -362,14 +362,14 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " blocks an OS worker")
         true
-        (is_os_worker_blocking name))
+        (has_effect name Os_worker_blocking))
     [ "blorp_dns_resolve_raw" ];
   List.iter
     (fun name ->
       Alcotest.(check bool)
         (name ^ " does not block an OS worker")
         false
-        (is_os_worker_blocking name))
+        (has_effect name Os_worker_blocking))
     [ "sleep"; "send"; "blorp_tcp_connect_loopback_raw"; "blorp_tls_read_raw" ]
 
 let test_type_metadata_classifies_typechecker_policy () =
@@ -463,15 +463,7 @@ let test_builtin_metadata_classifies_special_inference () =
 let test_builtin_metadata_registry_integrity () =
   let open Blorp.Builtin_metadata in
   Alcotest.(check (list string))
-    "descriptor names are unique" [] duplicate_names;
-  Alcotest.(check (list string))
-    "descriptors all carry behavior" [] inert_descriptor_names;
-  Alcotest.(check bool)
-    "unknown names are not registered" false
-    (is_registered "__not_a_builtin__");
-  Alcotest.(check bool)
-    "registered special inference name is known" true
-    (is_registered "checked_get")
+    "descriptor names are unique" [] duplicate_names
 
 let read_file path =
   let ic = open_in path in

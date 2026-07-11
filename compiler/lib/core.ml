@@ -142,25 +142,10 @@ type list_storage_slot_layout =
   | ListInlineStorage of inline_storage_width
   | ListInlineStructStorage of string
 
-type storage_ownership =
-  | StorageManaged
-  | StorageUnmanaged
-  | StorageUnknownOwnership of string
-
-type storage_retain_policy =
-  | StorageNoRetain
-  | StorageArcRetain
-  | StorageUnknownRetain of string
-
 type storage_release_policy =
   | StorageNoRelease
   | StorageArcRelease
   | StorageUnknownRelease of string
-
-type storage_equality_policy =
-  | StorageEqualityBits
-  | StorageEqualityPointer
-  | StorageUnknownEquality of string
 
 type container_storage_policy =
   | StoragePolicyUnmanagedBits
@@ -168,29 +153,11 @@ type container_storage_policy =
   | StoragePolicyOwnedErasedBox
   | StoragePolicyUnknown of string
 
-let storage_policy_ownership = function
-  | StoragePolicyUnmanagedBits -> StorageUnmanaged
-  | StoragePolicyManagedPointer -> StorageManaged
-  | StoragePolicyOwnedErasedBox -> StorageManaged
-  | StoragePolicyUnknown reason -> StorageUnknownOwnership reason
-
-let storage_policy_retain = function
-  | StoragePolicyUnmanagedBits -> StorageNoRetain
-  | StoragePolicyManagedPointer -> StorageArcRetain
-  | StoragePolicyOwnedErasedBox -> StorageNoRetain
-  | StoragePolicyUnknown reason -> StorageUnknownRetain reason
-
 let storage_policy_release = function
   | StoragePolicyUnmanagedBits -> StorageNoRelease
   | StoragePolicyManagedPointer -> StorageArcRelease
   | StoragePolicyOwnedErasedBox -> StorageArcRelease
   | StoragePolicyUnknown reason -> StorageUnknownRelease reason
-
-let storage_policy_equality = function
-  | StoragePolicyUnmanagedBits -> StorageEqualityBits
-  | StoragePolicyManagedPointer -> StorageEqualityPointer
-  | StoragePolicyOwnedErasedBox -> StorageEqualityPointer
-  | StoragePolicyUnknown reason -> StorageUnknownEquality reason
 
 let storage_policy_requires_release_or_error ~phase ~loc ~subject ~hint policy =
   match storage_policy_release policy with
@@ -198,14 +165,6 @@ let storage_policy_requires_release_or_error ~phase ~loc ~subject ~hint policy =
   | StorageArcRelease -> true
   | StorageUnknownRelease reason ->
       Core_error.errorf phase loc ~hint "unknown %s release policy: %s" subject
-        reason
-
-let storage_policy_requires_retain_or_error ~phase ~loc ~subject ~hint policy =
-  match storage_policy_retain policy with
-  | StorageNoRetain -> false
-  | StorageArcRetain -> true
-  | StorageUnknownRetain reason ->
-      Core_error.errorf phase loc ~hint "unknown %s retain policy: %s" subject
         reason
 
 type list_element_value_layout =
@@ -241,15 +200,6 @@ let list_storage_layout_release_hint =
 let list_storage_layout_requires_release_or_error ~phase ~loc layout =
   storage_policy_requires_release_or_error ~phase ~loc ~subject:"list element"
     ~hint:list_storage_layout_release_hint layout.lsl_policy
-
-let list_inline_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) width =
-  list_storage_layout ?elem_ty ~value_layout:(ListElementInlineBits width)
-    ~policy (ListInlineStorage width)
-
-let list_inline_struct_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits)
-    c_type =
-  list_storage_layout ?elem_ty ~value_layout:(ListElementStackStruct c_type)
-    ~policy (ListInlineStructStorage c_type)
 
 type tensor_storage_slot_layout =
   | TensorRawScalarStorage of tensor_unboxed_scalar
@@ -307,12 +257,6 @@ let tensor_inline_struct_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits)
   tensor_storage_layout ?elem_ty ~value_layout:(TensorValueInlineStruct c_type)
     ~policy (TensorInlineStructStorage c_type)
 
-let tensor_boxed_storage ?elem_ty ?value_layout ?policy () =
-  let value_layout =
-    Option.value value_layout ~default:TensorValueBoxedPointer
-  in
-  tensor_storage_layout ?elem_ty ~value_layout ?policy TensorBoxedStorage
-
 type tensor_storage_provenance_kind =
   | TensorStorageKnownProducer
       (** Storage was allocated by a compiler-owned producer whose layout is
@@ -330,10 +274,6 @@ type tensor_storage_provenance =
       tsp_kind : tensor_storage_provenance_kind;
       tsp_layout : tensor_storage_layout;
     }
-
-let tensor_storage_known_producer layout =
-  TensorStorageProven
-    { tsp_kind = TensorStorageKnownProducer; tsp_layout = layout }
 
 type loop_range_direction = RangeMayRunBackward | RangeForwardOnly
 
@@ -1144,20 +1084,8 @@ let match_binding ?(mode = MatchBorrow) mb_var mb_accessor =
 let borrowed_match_binding mb_var mb_accessor =
   match_binding ~mode:MatchBorrow mb_var mb_accessor
 
-let borrowed_match_binding_pairs bindings =
-  List.map
-    (fun (mb_var, mb_accessor) -> borrowed_match_binding mb_var mb_accessor)
-    bindings
-
 let match_binding_is_borrowed binding = binding.mb_mode = MatchBorrow
-let match_binding_name binding = binding.mb_var.vname
 let match_binding_pair binding = (binding.mb_var, binding.mb_accessor)
-let match_binding_shadows name binding = binding.mb_var.vname = name
-
-let match_bindings_shadow name bindings =
-  List.exists (match_binding_shadows name) bindings
-
-let match_binding_names bindings = List.map match_binding_name bindings
 
 (* ============================================================================
    Smart constructors
@@ -1165,15 +1093,6 @@ let match_binding_names bindings = List.map match_binding_name bindings
 
 (** Build a core node. *)
 let mk ~loc ~ty desc = { desc; ty; loc }
-
-let task_copy_capture (name, ty) =
-  {
-    task_capture_name = name;
-    task_capture_ty = ty;
-    task_capture_kind = TaskCopyCapture;
-  }
-
-let task_copy_captures captures = List.map task_copy_capture captures
 
 let task_capture_binding capture =
   (capture.task_capture_name, capture.task_capture_ty)

@@ -472,14 +472,6 @@ let test_inline_struct_storage_is_layout_owned () =
   Alcotest.(check bool)
     "value record inline struct is layout-owned" true
     (is_value_record "Point" (inline_struct_storage ~reg (ty "Point" [])));
-  Alcotest.(check (option string))
-    "value record C type is layout-owned through aliases" (Some "Point")
-    (value_record_c_type ~reg (ty "PointAlias" []));
-  Alcotest.(check (option string))
-    "value record source name is layout-owned through aliases" (Some "Point")
-    (Option.map
-       (fun layout -> layout.vrl_name)
-       (value_record_layout_of_type ~reg (ty "PointAlias" [])));
   Alcotest.(check bool)
     "stack option inline struct is layout-owned" true
     (is_stack_option "blorp_StackOption_Int"
@@ -638,29 +630,6 @@ let test_option_constructor_abi_is_layout_owned () =
      in
      String.sub actual 0 (String.length unavailable_prefix))
 
-let test_option_erasure_layout_is_layout_owned () =
-  let open Blorp.Core_layout_type in
-  let reg = Blorp.Codegen_types.create_registry () in
-  let describe = function
-    | OptionErasureStackValue -> "stack"
-    | OptionErasureNullableManagedPointer -> "nullable"
-    | OptionErasureBoxedUnion reason -> "boxed:" ^ reason
-    | OptionErasureUnknownPayload name -> "unknown:" ^ name
-    | OptionErasureInvalid _ -> "invalid"
-  in
-  Alcotest.(check string)
-    "stack Option erasure fact" "stack"
-    (describe (option_erasure_layout_of_type ~reg (option ty_int)));
-  Alcotest.(check string)
-    "nullable Option erasure fact" "nullable"
-    (describe (option_erasure_layout_of_type ~reg (option ty_string)));
-  Alcotest.(check string)
-    "boxed Option erasure reason" "boxed:nested Option payload"
-    (describe (option_erasure_layout_of_type ~reg (option (option ty_int))));
-  Alcotest.(check string)
-    "non-option erasure is explicit invalid" "invalid"
-    (describe (option_erasure_layout_of_type ~reg ty_int))
-
 let test_stack_result_constructor_abi_is_layout_owned () =
   let open Blorp.Core_layout_type in
   Alcotest.(check string)
@@ -683,10 +652,7 @@ let test_tensor_layout_descriptor_records_raw_scalar_policy () =
     (layout.tsl_slots = TensorRawScalarStorage TensorInt64Elements);
   Alcotest.(check bool)
     "raw scalar tensor storage is unmanaged" true
-    (storage_policy_ownership layout.tsl_policy = StorageUnmanaged);
-  Alcotest.(check bool)
-    "raw scalar tensor storage does not retain" true
-    (storage_policy_retain layout.tsl_policy = StorageNoRetain);
+    (layout.tsl_policy = StoragePolicyUnmanagedBits);
   Alcotest.(check bool)
     "raw scalar tensor storage does not release" true
     (storage_policy_release layout.tsl_policy = StorageNoRelease)
@@ -701,10 +667,7 @@ let test_tensor_layout_descriptor_records_boxed_policy () =
     (layout.tsl_slots = TensorBoxedStorage);
   Alcotest.(check bool)
     "boxed managed tensor storage is managed" true
-    (storage_policy_ownership layout.tsl_policy = StorageManaged);
-  Alcotest.(check bool)
-    "boxed managed tensor storage retains" true
-    (storage_policy_retain layout.tsl_policy = StorageArcRetain);
+    (layout.tsl_policy = StoragePolicyManagedPointer);
   Alcotest.(check bool)
     "boxed managed tensor storage releases" true
     (storage_policy_release layout.tsl_policy = StorageArcRelease)
@@ -722,7 +685,7 @@ let test_tensor_layout_descriptor_records_value_struct_policy () =
     (layout.tsl_slots = TensorInlineStructStorage "Point");
   Alcotest.(check bool)
     "inline struct tensor storage is unmanaged" true
-    (storage_policy_ownership layout.tsl_policy = StorageUnmanaged);
+    (layout.tsl_policy = StoragePolicyUnmanagedBits);
   Alcotest.(check bool)
     "inline struct tensor storage does not release" true
     (storage_policy_release layout.tsl_policy = StorageNoRelease)
@@ -755,29 +718,6 @@ let test_tensor_raw_scalar_abi_is_layout_owned () =
   Alcotest.(check string) "i64 C type" "long" i64.tras_c_type;
   Alcotest.(check string)
     "i64 runtime storage mode" "BLORP_VECTOR_STORAGE_I64" i64.tras_storage_mode
-
-let test_tensor_raw_scalar_abi_from_layout () =
-  let open Blorp.Core in
-  let raw_layout =
-    tensor_raw_scalar_storage ~elem_ty:ty_float TensorFloat64Elements
-  in
-  let boxed_layout =
-    tensor_storage_layout ~elem_ty:ty_string TensorBoxedStorage
-  in
-  let packed_layout = tensor_packed_storage ~elem_ty:ty_bool InlineBytes1 in
-  Alcotest.(check bool)
-    "raw layout exposes scalar ABI" true
-    (match
-       Blorp.Core_layout_type.tensor_raw_scalar_abi_of_layout raw_layout
-     with
-    | Some abi -> abi.tras_c_type = "double"
-    | None -> false);
-  Alcotest.(check bool)
-    "boxed layout has no raw scalar ABI" true
-    (Blorp.Core_layout_type.tensor_raw_scalar_abi_of_layout boxed_layout = None);
-  Alcotest.(check bool)
-    "packed layout has no raw scalar ABI" true
-    (Blorp.Core_layout_type.tensor_raw_scalar_abi_of_layout packed_layout = None)
 
 let test_tensor_raw_scalar_kind_for_type_is_layout_owned () =
   let open Blorp.Core in
@@ -949,8 +889,6 @@ let suite =
           test_option_equality_abi_is_layout_owned;
         Alcotest.test_case "Option constructor ABI is layout-owned" `Quick
           test_option_constructor_abi_is_layout_owned;
-        Alcotest.test_case "Option erasure layout is layout-owned" `Quick
-          test_option_erasure_layout_is_layout_owned;
         Alcotest.test_case "stack Result constructor ABI is layout-owned" `Quick
           test_stack_result_constructor_abi_is_layout_owned;
         Alcotest.test_case "tensor layout records raw scalar policy" `Quick
@@ -961,8 +899,6 @@ let suite =
           test_tensor_layout_descriptor_records_value_struct_policy;
         Alcotest.test_case "tensor raw scalar ABI is layout-owned" `Quick
           test_tensor_raw_scalar_abi_is_layout_owned;
-        Alcotest.test_case "tensor raw scalar ABI from layout" `Quick
-          test_tensor_raw_scalar_abi_from_layout;
         Alcotest.test_case "tensor raw scalar kind for type is layout-owned"
           `Quick test_tensor_raw_scalar_kind_for_type_is_layout_owned;
         Alcotest.test_case "tensor numeric access is layout-owned" `Quick

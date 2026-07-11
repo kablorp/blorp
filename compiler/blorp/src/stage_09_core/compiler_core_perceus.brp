@@ -369,9 +369,7 @@ private pure func args_forward_params_in_order(
 		forwards
 
 
-private pure func consumed_arg_indices(
-	contract: OwnershipCallContract,
-) -> List[Int]:
+private pure func consumed_arg_indices(contract: OwnershipCallContract) -> List[Int]:
 	var consumed: List[Int] = []
 	var index: Int = 0
 
@@ -838,7 +836,10 @@ pure func contract_for_call(
 						Some(contract):
 							Some(contract)
 						None:
-							if env.infer_unresolved_user_calls_as_borrow:
+							if (
+								env.infer_unresolved_user_calls_as_borrow
+								or not is_managed_type(env, return_type)
+							):
 								match lookup_user_call_contract(env, name, arg_count, return_type):
 									Some(contract):
 										Some(contract)
@@ -1013,7 +1014,7 @@ private pure func seq_ownership_uses(
 	second: OwnershipUseSummary,
 ) -> OwnershipUseSummary:
 	{
-		required_refs = max(first.required_refs, first.consumed_refs + second.required_refs),
+		required_refs = max_int(first.required_refs, first.consumed_refs + second.required_refs),
 		consumed_refs = first.consumed_refs + second.consumed_refs,
 		touched = first.touched or second.touched,
 		returns_alias = second.returns_alias,
@@ -1086,8 +1087,8 @@ private pure func branch_ownership_uses(items: List[OwnershipUseSummary]) -> Own
 	var user_call_dependencies: List[String] = []
 
 	for item in items:
-		required_refs = max(required_refs, item.required_refs)
-		consumed_refs = max(consumed_refs, item.consumed_refs)
+		required_refs = max_int(required_refs, item.required_refs)
+		consumed_refs = max_int(consumed_refs, item.consumed_refs)
 		touched = touched or item.touched
 		returns_alias = returns_alias or item.returns_alias
 		user_call_dependencies = merge_user_call_dependencies(
@@ -1431,7 +1432,10 @@ private pure func match_bindings_shadow(name: String, bindings: List[CoreMatchBi
 
 
 private pure func max_int(left: Int, right: Int) -> Int:
-	max(left, right)
+	if left > right:
+		left
+	else:
+		right
 
 
 private pure func count_uses_in_constructor_match_body(
@@ -2299,8 +2303,8 @@ private pure func summarize_linear_ownership_uses(
 				uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
 
 				{
-					required_refs = max(1, uses.required_refs - 1),
-					consumed_refs = max(0, uses.consumed_refs - 1),
+					required_refs = max_int(1, uses.required_refs - 1),
+					consumed_refs = max_int(0, uses.consumed_refs - 1),
 					touched = True,
 					returns_alias = uses.returns_alias,
 					user_call_dependencies = uses.user_call_dependencies
@@ -2780,7 +2784,7 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			count_uses(name, body)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			count_uses(name, cond) + max(
+			count_uses(name, cond) + max_int(
 				count_uses(name, then_expr),
 				count_uses(name, else_expr),
 			)
@@ -2928,7 +2932,7 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 						False
 
 				if not arm_shadows:
-					branch_uses = max(
+					branch_uses = max_int(
 						branch_uses,
 						count_uses(name, arm.body),
 					)
@@ -3253,12 +3257,12 @@ private pure func balance_terminal_branch_body(
 	uses: OwnershipUseSummary,
 	body: CoreExpr,
 ) -> CoreExpr:
-	pre_drops: Int = max(0, available_refs - uses.required_refs)
+	pre_drops: Int = max_int(0, available_refs - uses.required_refs)
 
 	if uses.returns_alias:
 		prepend_drops(pre_drops, variable, value_type, body)
 	else:
-		post_drops: Int = max(0, uses.required_refs - uses.consumed_refs)
+		post_drops: Int = max_int(0, uses.required_refs - uses.consumed_refs)
 		balanced_body: CoreExpr = drop_after_body(post_drops, variable, value_type, body)
 
 		prepend_drops(pre_drops, variable, value_type, balanced_body)
@@ -3303,25 +3307,41 @@ private pure func balance_terminal_constructor_match(
 	if not can_balance:
 		None
 	else:
-		scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-			env,
-			variable.name,
-			scrutinee,
-		)
-		available_after_scrutinee: Int = max(0, available_refs - scrutinee_uses.consumed_refs)
-		scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, variable.name, scrutinee)
+		scrutinee_is_direct_alias: Bool = direct_aliases_name(variable.name, scrutinee)
+
+		scrutinee_consumed_refs: Int = if scrutinee_is_direct_alias:
+			0
+		else:
+			summarize_linear_ownership_uses(env, variable.name, scrutinee).consumed_refs
+
+		available_after_scrutinee: Int = max_int(0, available_refs - scrutinee_consumed_refs)
 		var balanced_cases: List[CoreConstructorMatchCase] = []
 
 		for match_case in cases:
 			match match_case.body:
 				ConstructorMatchBodyExpr(leaf):
+					var uses_borrowed_binding: Bool = False
+
+					if scrutinee_is_direct_alias:
+						for binding in match_case.bindings:
+							if (
+								binding.mode == MatchBorrowBindingMode
+								and count_uses(binding.variable.name, leaf) > 0
+							):
+								uses_borrowed_binding = True
+								break
+							else:
+								void
+					else:
+						void
+
 					leaf_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 						env,
 						variable.name,
 						leaf,
 					)
 
-					balanced_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+					branch_uses: OwnershipUseSummary = if uses_borrowed_binding:
 						seq_ownership_uses(BORROW_OWNERSHIP_USE, leaf_uses)
 					else:
 						leaf_uses
@@ -3329,11 +3349,12 @@ private pure func balance_terminal_constructor_match(
 					balanced_cases = balanced_cases.append(
 						{ match_case |
 							body = ConstructorMatchBodyExpr(
-								balance_terminal_branch_body(
+								balance_branch_body(
+									env,
 									copy_core_var(variable),
 									copy_core_type(value_type),
 									available_after_scrutinee,
-									balanced_uses,
+									branch_uses,
 									leaf,
 								),
 							)
@@ -3350,39 +3371,51 @@ private pure func balance_terminal_constructor_match(
 					leaf,
 				)
 
-				balanced_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
-					seq_ownership_uses(BORROW_OWNERSHIP_USE, leaf_uses)
-				else:
-					leaf_uses
-
 				ConstructorMatchFallbackBody(
-					balance_terminal_branch_body(
+					balance_branch_body(
+						env,
 						copy_core_var(variable),
 						copy_core_type(value_type),
 						available_after_scrutinee,
-						balanced_uses,
+						leaf_uses,
 						leaf,
 					),
 				)
 			ConstructorMatchFallbackBindings(bindings, leaf):
+				var uses_borrowed_binding: Bool = False
+
+				if scrutinee_is_direct_alias:
+					for binding in bindings:
+						if (
+							binding.mode == MatchBorrowBindingMode
+							and count_uses(binding.variable.name, leaf) > 0
+						):
+							uses_borrowed_binding = True
+							break
+						else:
+							void
+				else:
+					void
+
 				leaf_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 					env,
 					variable.name,
 					leaf,
 				)
 
-				balanced_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+				branch_uses: OwnershipUseSummary = if uses_borrowed_binding:
 					seq_ownership_uses(BORROW_OWNERSHIP_USE, leaf_uses)
 				else:
 					leaf_uses
 
 				ConstructorMatchFallbackBindings(
 					bindings,
-					balance_terminal_branch_body(
+					balance_branch_body(
+						env,
 						copy_core_var(variable),
 						copy_core_type(value_type),
 						available_after_scrutinee,
-						balanced_uses,
+						branch_uses,
 						leaf,
 					),
 				)
@@ -3409,8 +3442,8 @@ private pure func balance_branch_body(
 	uses: OwnershipUseSummary,
 	body: CoreExpr,
 ) -> CoreExpr:
-	pre_drops: Int = max(0, available_refs - uses.required_refs)
-	live_refs: Int = max(0, available_refs - pre_drops)
+	pre_drops: Int = max_int(0, available_refs - uses.required_refs)
+	live_refs: Int = max_int(0, available_refs - pre_drops)
 
 	match balance_nested_branch_body(
 		env,
@@ -3439,7 +3472,7 @@ private pure func balance_nested_branch_body(
 				variable.name,
 				first,
 			)
-			available_after_first: Int = max(0, available_refs - first_uses.consumed_refs)
+			available_after_first: Int = max_int(0, available_refs - first_uses.consumed_refs)
 
 			match balance_nested_branch_body(
 				env,
@@ -3461,7 +3494,7 @@ private pure func balance_nested_branch_body(
 					variable.name,
 					rhs,
 				)
-				available_after_rhs: Int = max(0, available_refs - rhs_uses.consumed_refs)
+				available_after_rhs: Int = max_int(0, available_refs - rhs_uses.consumed_refs)
 
 				match balance_nested_branch_body(
 					env,
@@ -3483,7 +3516,7 @@ private pure func balance_nested_branch_body(
 					variable.name,
 					rhs,
 				)
-				available_after_rhs: Int = max(0, available_refs - rhs_uses.consumed_refs)
+				available_after_rhs: Int = max_int(0, available_refs - rhs_uses.consumed_refs)
 
 				match balance_nested_branch_body(
 					env,
@@ -3518,7 +3551,7 @@ private pure func balance_nested_branch_body(
 					None
 		DropExpr(inner_var, inner_type, release_policy, inner_body, typ, loc):
 			next_available: Int = if inner_var.name == variable.name:
-				max(0, available_refs - 1)
+				max_int(0, available_refs - 1)
 			else:
 				available_refs
 
@@ -3552,7 +3585,7 @@ private pure func balance_nested_branch_body(
 				variable.name,
 				else_expr,
 			)
-			available_after_cond: Int = max(0, available_refs - cond_uses.consumed_refs)
+			available_after_cond: Int = max_int(0, available_refs - cond_uses.consumed_refs)
 
 			Some(
 				IfExpr(
@@ -3588,7 +3621,7 @@ private pure func balance_nested_branch_body(
 					variable.name,
 					scrutinee,
 				)
-				available_after_scrutinee: Int = max(
+				available_after_scrutinee: Int = max_int(
 					0,
 					available_refs - scrutinee_uses.consumed_refs,
 				)
@@ -3609,6 +3642,70 @@ private pure func balance_nested_branch_body(
 							copy_core_type(value_type),
 							available_after_scrutinee,
 							fallback,
+						),
+						copy_core_type(typ),
+						loc,
+					),
+				)
+			else:
+				None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			if (
+				env.balance_nested_matches
+				and constructor_literal_match_can_balance(variable.name, match_expr)
+			):
+				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					variable.name,
+					scrutinee,
+				)
+				available_after_scrutinee: Int = max_int(
+					0,
+					available_refs - scrutinee_uses.consumed_refs,
+				)
+
+				Some(
+					AccessorLiteralMatchExpr(
+						scrutinee,
+						release_policy,
+						balance_constructor_literal_match(
+							env,
+							copy_core_var(variable),
+							copy_core_type(value_type),
+							available_after_scrutinee,
+							match_expr,
+						),
+						copy_core_type(typ),
+						loc,
+					),
+				)
+			else:
+				None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			if (
+				env.balance_nested_matches
+				and constructor_length_match_can_balance(variable.name, match_expr)
+			):
+				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					variable.name,
+					scrutinee,
+				)
+				available_after_scrutinee: Int = max_int(
+					0,
+					available_refs - scrutinee_uses.consumed_refs,
+				)
+
+				Some(
+					LengthMatchExpr(
+						scrutinee,
+						release_policy,
+						balance_constructor_length_match(
+							env,
+							copy_core_var(variable),
+							copy_core_type(value_type),
+							available_after_scrutinee,
+							match_expr,
 						),
 						copy_core_type(typ),
 						loc,
@@ -3649,14 +3746,17 @@ private pure func transform_let_if_body(
 	cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, cond)
 	then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, then_expr)
 	else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, else_expr)
-	max_branch_required: Int = max(then_uses.required_refs, else_uses.required_refs)
-	total_needed: Int = max(cond_uses.required_refs, cond_uses.consumed_refs + max_branch_required)
+	max_branch_required: Int = max_int(then_uses.required_refs, else_uses.required_refs)
+	total_needed: Int = max_int(
+		cond_uses.required_refs,
+		cond_uses.consumed_refs + max_branch_required,
+	)
 	if_node: CoreExpr = IfExpr(cond, then_expr, else_expr, copy_core_type(typ), loc)
 
 	if total_needed == 0:
 		prepend_drops(1, variable, value_type, if_node)
 	else:
-		dups_count: Int = max(0, total_needed - 1)
+		dups_count: Int = max_int(0, total_needed - 1)
 		available_after_cond: Int = 1 + dups_count - cond_uses.consumed_refs
 		balanced_if: CoreExpr = IfExpr(
 			cond,
@@ -4038,7 +4138,7 @@ private pure func rename_shadow_var_refs(
 				loc,
 			)
 		_:
-			CoreTraverse.map_core_expr_children(expr, func(child): rename_shadow_var_refs(
+			CoreTraverse.map_core_expr_children(expr, pure func(child): rename_shadow_var_refs(
 					old_name.substring(0, old_name.length()),
 					copy_core_var(new_var),
 					child,
@@ -4213,7 +4313,7 @@ private pure func freshen_shadowed_match_bindings(target: CoreVar, expr: CoreExp
 		_:
 			CoreTraverse.map_core_expr_children(
 				expr,
-				func(child): freshen_shadowed_match_bindings(copy_core_var(target), child),
+				pure func(child): freshen_shadowed_match_bindings(copy_core_var(target), child),
 			)
 
 
@@ -4273,7 +4373,7 @@ private pure func literal_match_cases_max_required(
 	var required: Int = 0
 
 	for match_case in cases:
-		required = max(
+		required = max_int(
 			required,
 			literal_match_case_required(env, name, match_case),
 		)
@@ -4303,7 +4403,7 @@ private pure func constructor_literal_match_required(
 	name: String,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> Int:
-	max(
+	max_int(
 		literal_match_cases_max_required(env, name, match_expr.cases),
 		literal_match_fallback_required(env, name, match_expr.fallback),
 	)
@@ -4538,7 +4638,7 @@ private pure func constructor_length_cases_max_required(
 	var required: Int = 0
 
 	for match_case in cases:
-		required = max(
+		required = max_int(
 			required,
 			constructor_length_branch_required(env, name, match_case.branch),
 		)
@@ -4575,9 +4675,9 @@ private pure func constructor_length_match_required(
 	name: String,
 	match_expr: CoreConstructorLengthMatch,
 ) -> Int:
-	max(
+	max_int(
 		constructor_length_cases_max_required(env, name, match_expr.cases),
-		max(
+		max_int(
 			constructor_length_geq_required(env, name, match_expr.geq),
 			constructor_length_fallback_required(env, name, match_expr.fallback),
 		),
@@ -4609,7 +4709,7 @@ private pure func constructor_match_cases_max_required(
 	var required: Int = 0
 
 	for match_case in cases:
-		required = max(
+		required = max_int(
 			required,
 			constructor_match_case_required(env, name, match_case),
 		)
@@ -5085,11 +5185,11 @@ private pure func transform_let_constructor_match_body(
 			variable.name,
 			scrutinee,
 		)
-		max_branch_required: Int = max(
+		max_branch_required: Int = max_int(
 			constructor_match_cases_max_required(env, variable.name, freshened_cases),
 			constructor_match_fallback_required(env, variable.name, freshened_fallback),
 		)
-		total_needed: Int = max(
+		total_needed: Int = max_int(
 			scrutinee_uses.required_refs,
 			scrutinee_uses.consumed_refs + max_branch_required,
 		)
@@ -5097,7 +5197,7 @@ private pure func transform_let_constructor_match_body(
 		if total_needed == 0:
 			Some(prepend_drops(1, variable, value_type, match_node))
 		else:
-			dups_count: Int = max(0, total_needed - 1)
+			dups_count: Int = max_int(0, total_needed - 1)
 			available_after_scrutinee: Int = 1 + dups_count - scrutinee_uses.consumed_refs
 			balanced_match: CoreExpr = ConstructorMatchExpr(
 				scrutinee,
@@ -5133,7 +5233,7 @@ private pure func balance_let_body_legacy(
 	if not uses.touched:
 		prepend_drops(1, variable, bind_type, body)
 	else:
-		dups_count: Int = max(0, uses.required_refs - 1)
+		dups_count: Int = max_int(0, uses.required_refs - 1)
 		owned_refs: Int = 1 + dups_count
 
 		if env.balance_nested_matches:
@@ -5154,7 +5254,7 @@ private pure func balance_let_body_legacy(
 			post_drops: Int = if uses.returns_alias:
 				0
 			else:
-				max(0, owned_refs - uses.consumed_refs)
+				max_int(0, owned_refs - uses.consumed_refs)
 
 			body_with_dups: CoreExpr = prepend_dups(dups_count, variable, bind_type, body)
 
@@ -5262,7 +5362,7 @@ private pure func rewrite_direct_mutable_assignment(
 ) -> MutableAssignmentRewrite:
 	uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, target.name, rhs)
 	protected_rhs: CoreExpr = prepend_dups(
-		max(0, uses.consumed_refs - 1),
+		max_int(0, uses.consumed_refs - 1),
 		target,
 		target_type,
 		rhs,
@@ -5693,14 +5793,7 @@ private pure func rewrite_mutable_bound_loop_body(
 			next_temp = temp_index
 		}
 	else:
-		rewrite_mutable_assignments(
-			env,
-			target,
-			target_type,
-			body,
-			temp_index,
-			skip_old_release,
-		)
+		rewrite_mutable_assignments(env, target, target_type, body, temp_index, skip_old_release)
 
 
 private pure func rewrite_mutable_assignments(
@@ -5936,7 +6029,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForStringExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -5949,7 +6047,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForStringExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -5957,7 +6058,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForDictExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -5970,7 +6076,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForDictExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -5978,7 +6087,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForSetExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -5991,7 +6105,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForSetExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -5999,7 +6116,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForStreamExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -6012,7 +6134,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForStreamExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -6020,7 +6145,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForResourceSourceExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -6033,7 +6163,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForResourceSourceExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -6041,7 +6174,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForChannelExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -6054,7 +6192,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForChannelExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -6062,7 +6203,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForTensorExpr(loop, typ, loc):
 			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
 			)
 			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
 				env,
@@ -6075,7 +6221,10 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = ForTensorExpr(
-					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
 					copy_core_type(typ),
 					loc,
 				),
@@ -6083,7 +6232,12 @@ private pure func rewrite_mutable_assignments(
 			}
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			start_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env, target, target_type, start, temp_index, skip_old_release,
+				env,
+				target,
+				target_type,
+				start,
+				temp_index,
+				skip_old_release,
 			)
 			end_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
 				env,
@@ -7383,12 +7537,7 @@ private pure func wrap_borrowed_owned_temporary_bindings(
 					uniq = binding.variable.uniq,
 					def_id = None
 				}
-				dropped_result: CoreExpr = drop_after_body(
-					1,
-					binding.variable,
-					binding.typ,
-					result,
-				)
+				dropped_result: CoreExpr = drop_after_body(1, binding.variable, binding.typ, result)
 				borrowed_scope: CoreExpr = BorrowLetExpr(
 					borrowed_view,
 					copy_core_type(binding.typ),
@@ -7905,7 +8054,10 @@ private pure func bind_borrowed_owned_temporary_args_through_unbox(
 		UnboxExpr(unbox_kind, CallExpr(kind, callee, args, call_type, call_loc), typ, loc):
 			match contract_for_call(env, kind, args.length(), call_type):
 				Some(contract):
-					if unbox_copies_alias(unbox_kind) and result_mode_may_alias_argument(contract.result):
+					if (
+						unbox_copies_alias(unbox_kind)
+						and result_mode_may_alias_argument(contract.result)
+					):
 						prepared: PreparedTemporaryCall = prepare_borrowed_owned_temporary_call(
 							env,
 							kind,
@@ -8013,11 +8165,7 @@ private pure func owned_result_is_alias(env: PerceusEnv, expr: CoreExpr) -> Bool
 
 
 private pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
-	(
-		left.name == right.name
-		and left.uniq == right.uniq
-		and left.def_id == right.def_id
-	)
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
 
 
 private pure func result_transfers_existing_owner(env: PerceusEnv, expr: CoreExpr) -> Bool:
@@ -9936,11 +10084,11 @@ private pure func inferred_user_call_consumed_args(
 		Some(contract):
 			fallback
 		None:
-			inferred: List[Int] = env.user_call_contracts_by_name
-				.get(name)
-				.get_or([])
-
-			merge_consumed_args(fallback, inferred)
+			match env.user_call_contracts_by_name.get(name):
+				Some(inferred):
+					merge_consumed_args(fallback, inferred)
+				None:
+					fallback
 
 
 private pure func annotate_user_call_contracts(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
@@ -10063,12 +10211,7 @@ private pure func retain_borrowed_binding_results_in_constructor_body(
 		if is_managed_type(env, binding.typ):
 			if binding.mode == MatchBorrowBindingMode:
 				param: CoreParam = match_binding_as_param(binding)
-				result = retain_borrowed_param_result_in_constructor_body(
-					env,
-					param,
-					True,
-					result,
-				)
+				result = retain_borrowed_param_result_in_constructor_body(env, param, True, result)
 			else if match_binding_materializes_owned_value(binding):
 				result = balance_constructor_match_body(
 					env,
@@ -10352,14 +10495,7 @@ private pure func retain_borrowed_binding_results(
 					binding.variable.name,
 					result,
 				)
-				result = balance_branch_body(
-					env,
-					binding.variable,
-					binding.typ,
-					1,
-					uses,
-					result,
-				)
+				result = balance_branch_body(env, binding.variable, binding.typ, 1, uses, result)
 			else:
 				void
 		else:
@@ -10448,17 +10584,32 @@ private pure func retain_borrowed_param_result(
 ) -> CoreExpr:
 	match expr:
 		VarExpr(variable, typ, loc):
-			if variable.name == param.name.name and is_managed_type(env, typ):
+			stable_variable: CoreVar = copy_core_var(variable)
+			stable_type: CoreType = copy_core_type(typ)
+			is_borrowed_managed_result: Bool = (
+				stable_variable.name == param.name.name
+				and is_managed_type(env, stable_type)
+			)
+
+			if is_borrowed_managed_result:
+				retain_policy: CoreRetainPolicy = retain_policy_for_type(stable_type)
+				retained_body: CoreExpr = VarExpr(
+					copy_core_var(stable_variable),
+					copy_core_type(stable_type),
+					loc,
+				)
+				result_type: CoreType = copy_core_type(stable_type)
+
 				DupExpr(
-					copy_core_var(variable),
-					copy_core_type(typ),
-					retain_policy_for_type(typ),
-					expr,
-					copy_core_type(typ),
+					stable_variable,
+					stable_type,
+					retain_policy,
+					retained_body,
+					result_type,
 					loc,
 				)
 			else:
-				expr
+				VarExpr(stable_variable, stable_type, loc)
 		FieldExpr(owner, field, typ, loc):
 			if is_managed_type(env, typ) and borrow_expr_aliases_target(env, param.name.name, expr):
 				retain_borrowed_alias_result(param, expr)
@@ -10485,15 +10636,20 @@ private pure func retain_borrowed_param_result(
 			else:
 				expr
 		LetExpr(variable, is_mutable, typ, rhs, body):
-			if variable.name == param.name.name:
-				expr
+			stable_body: CoreExpr = copy_expr(body)
+			stable_rhs: CoreExpr = copy_expr(rhs)
+			stable_variable: CoreVar = copy_core_var(variable)
+			stable_type: CoreType = copy_core_type(typ)
+
+			if stable_variable.name == param.name.name:
+				LetExpr(stable_variable, is_mutable, stable_type, stable_rhs, stable_body)
 			else:
 				LetExpr(
-					copy_core_var(variable),
+					stable_variable,
 					is_mutable,
-					copy_core_type(typ),
-					rhs,
-					retain_borrowed_param_result(env, param, body),
+					stable_type,
+					stable_rhs,
+					retain_borrowed_param_result(env, param, stable_body),
 				)
 		BorrowLetExpr(variable, typ, rhs, body):
 			if variable.name == param.name.name:
@@ -10507,8 +10663,8 @@ private pure func retain_borrowed_param_result(
 				)
 		SeqExpr(first, second):
 			SeqExpr(
-				first,
-				retain_borrowed_param_result(env, param, second),
+				copy_expr(first),
+				retain_borrowed_param_result(env, param, copy_expr(second)),
 			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
@@ -10960,6 +11116,7 @@ private pure func protect_borrowed_param_list_set(
 	set: CoreListSet,
 ) -> CoreListSet:
 	protected_value: CoreExpr = protect_borrowed_param_calls(env, param, set.value.value)
+
 	stored_value: CoreExpr = if set.value.transfers_ownership:
 		retain_borrowed_aggregate_value(env, param, protected_value)
 	else:
@@ -10985,10 +11142,13 @@ private pure func protect_borrowed_param_call_dict_entries(
 	param: CoreParam,
 	entries: List[CoreDictEntry],
 ) -> List[CoreDictEntry]:
-	entries.map(func(entry): {
+	entries.map(func(entry):
+		protected: CoreDictEntry = {
 			key = protect_borrowed_param_call_boxed_value(env, param, entry.key),
 			value = protect_borrowed_param_call_boxed_value(env, param, entry.value)
-		})
+		}
+		protected
+	)
 
 
 private pure func protect_borrowed_param_call_literal_case(
@@ -11747,17 +11907,18 @@ private pure func normalize_lambda_result_body(
 	if not is_managed_type(env, return_type):
 		body
 	else:
+		lambda_env: PerceusEnv = { env | transferable_result_vars = [] }
 		var result: CoreExpr = body
 
 		for param in borrowed_values:
-			if is_managed_type(env, param.typ):
-				result = protect_borrowed_param_calls(env, param, result)
-				result = retain_borrowed_param_aggregate_members(env, param, result)
-				result = retain_borrowed_param_result(env, param, result)
+			if is_managed_type(lambda_env, param.typ):
+				result = protect_borrowed_param_calls(lambda_env, param, result)
+				result = retain_borrowed_param_aggregate_members(lambda_env, param, result)
+				result = retain_borrowed_param_result(lambda_env, param, result)
 			else:
 				void
 
-		normalize_owned_result_aliases(env, result)
+		normalize_owned_result_aliases(lambda_env, result)
 
 
 private pure func lambda_capture_param(capture: CoreClosureCapture) -> CoreParam:
@@ -11840,7 +12001,7 @@ private pure func balance_consumed_param_body(
 		variable.name,
 		protected,
 	)
-	owned_refs: Int = max(1, uses.required_refs)
+	owned_refs: Int = max_int(1, uses.required_refs)
 	balanced: CoreExpr = balance_branch_body(
 		balance_env,
 		copy_core_var(variable),
@@ -11906,10 +12067,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			contract_body: CoreExpr = annotate_user_call_contracts(env, body)
 			consumed_params: List[Int] = function_consumed_param_indices(env, analysis_function)
 			result_env: PerceusEnv = { env |
-				transferable_result_vars = consumed_param_vars(
-					analysis_function,
-					consumed_params,
-				)
+				transferable_result_vars = consumed_param_vars(analysis_function, consumed_params)
 			}
 			call_body: CoreExpr = protect_borrowed_param_calls_for_function(
 				env,

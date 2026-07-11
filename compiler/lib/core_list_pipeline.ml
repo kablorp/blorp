@@ -52,7 +52,6 @@ let sink plan = plan.sink
 let cardinality plan = plan.cardinality
 let result_ty plan = plan.result_ty
 let loc plan = plan.loc
-let stage_count plan = List.length (stages plan)
 
 let list_elem_ty = function
   | Ast.TyNamed ("List", [ elem_ty ]) -> Some elem_ty

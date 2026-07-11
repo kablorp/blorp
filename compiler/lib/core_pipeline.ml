@@ -19,20 +19,18 @@
        and narrow tuple-return call sites
     12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
        to CCast / concrete names; make eta adapters visible to Perceus
-    13. [Core_dce] — prune unreachable concrete functions, impl methods,
-       non-runtime generic function/impl templates, and source-only type
-       declarations
-    14. backend handoff — default compilation gives post-DCE Core to Blorp
+    13. backend handoff — default compilation gives pre-DCE Core to Blorp
+    14. Blorp-owned DCE — prune unreachable emitted functions
     15. Blorp-owned consume-specialize pass
     16. Blorp-owned Perceus — insert explicit dup/drop operations
     17. Blorp-owned final tail — normal reuse, closure conversion, resource
        cleanup lowering, fairness checkpoints, codegen preparation, prepared
        reuse, and C artifact emission
 
-    OCaml program-bearing callbacks stop at the post-DCE handoff. CLI
+    OCaml program-bearing callbacks stop at the pre-DCE handoff. CLI
     late-stage dumps/stops use Blorp Core JSON observation instead. Timing-only
     observation uses lightweight stage events. Normal C output always comes
-    from the Blorp post-DCE handoff.
+    from the Blorp pre-DCE handoff.
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -80,64 +78,24 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 
 let no_op_on_stage_json : on_stage_json_callback = fun _ _ -> ()
 
-(** Stages that transform Core after the initial lowering snapshot. [Lower]
-    and [Final] are observations, not transformations, so they are kept out
-    of this list and added explicitly in [observed_stage_order]. *)
-let transform_stage_order =
-  [
-    Core_stage.Debug;
-    Core_stage.Desugar;
-    Core_stage.Mono;
-    Core_stage.Synth;
-    Core_stage.Match;
-    Core_stage.TraitResolve;
-    Core_stage.Resolve;
-    Core_stage.StdInline;
-    Core_stage.Tailrec;
-    Core_stage.Fusion;
-    Core_stage.Specialize;
-    Core_stage.Dce;
-    Core_stage.ConsumeSpecialize;
-    Core_stage.Perceus;
-    Core_stage.Reuse;
-    Core_stage.Closure;
-  ]
-
-(** The exact order in which [on_stage_callback] fires. This is the
-    executable pipeline contract used by tests, docs, dumps, profiling, and
-    [--stop-after]. *)
-let observed_stage_order =
-  (Core_stage.Lower :: transform_stage_order) @ [ Core_stage.Final ]
-
 let stage_observed_via_blorp_tail_json = function
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
-  | Core_stage.Closure | Core_stage.Final ->
+  | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
+  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
       true
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce ->
+  | Core_stage.Fusion | Core_stage.Specialize ->
       false
 
-let pre_backend_program_stage_order =
-  List.filter
-    (fun stage -> not (stage_observed_via_blorp_tail_json stage))
-    observed_stage_order
-
-(** Program-free stage events do not materialize Blorp-owned backend-tail
-    snapshots. Reuse and closure are represented by the single [Final] event
-    unless a caller explicitly requests their Core JSON snapshots. *)
-let program_free_stage_event_order =
-  pre_backend_program_stage_order @ [ Core_stage.Final ]
-
 let blorp_tail_stage_name = function
-  | ( Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
-    | Core_stage.Closure | Core_stage.Final ) as stage ->
+  | ( Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
+    | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ) as stage ->
       Some (Core_stage.to_string stage)
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce ->
+  | Core_stage.Fusion | Core_stage.Specialize ->
       None
 
 let core_stage_list_contains target =
@@ -176,18 +134,18 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-let post_dce_program_json ~reg program =
+let pre_dce_program_json ~reg program =
   match Core_emit_blorp_c.program_json ~reg program with
   | Ok json -> json
   | Error error -> failwith (Core_emit_blorp_c.unsupported_to_string error)
 
 let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback) ~(stages : Core_stage.t list)
-    (post_dce : Core.core_program) =
+    (pre_dce : Core.core_program) =
   match stages with
   | [] -> ()
   | _ :: _ ->
-      let core_json = post_dce_program_json ~reg post_dce in
+      let core_json = pre_dce_program_json ~reg pre_dce in
       List.iter
         (fun stage ->
           match blorp_tail_stage_name stage with
@@ -204,19 +162,21 @@ let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
 
 type backend_core_input = {
   blorp_tail_input : Core.core_program;
-      (** Post-DCE Core handed to Blorp for consume specialization, Perceus,
-          reuse, closure, resource/fairness, prepare, and emission. *)
+      (** Pre-DCE Core handed to Blorp for DCE, consume specialization,
+          Perceus, reuse, closure, resource/fairness, prepare, and emission. *)
 }
 
 (** Run C emission through the single Blorp backend path. Normal compilation
-    hands off after DCE so Blorp owns consume specialization, Perceus, and the
-    complete backend tail. Late-stage CLI observation uses [on_stage_json] over
-    the Blorp-owned stages. *)
+    hands off after specialization so Blorp owns DCE, consume specialization,
+    Perceus, and the complete backend tail. Late-stage CLI observation uses
+    [on_stage_json] over the Blorp-owned stages. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     ~(reg : Codegen_types.registry) ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback)
     ~(tail_observation_stages : Core_stage.t list)
     (backend_input : backend_core_input) : string =
+  if not (core_stage_list_contains Core_stage.Dce tail_observation_stages) then
+    on_stage_event Core_stage.Dce;
   observe_blorp_tail_json ~reg ~on_stage_event ~on_stage_json
     ~stages:tail_observation_stages backend_input.blorp_tail_input;
   let cfg =
@@ -246,7 +206,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  let post_dce =
+  let pre_dce =
     prog |> observe Core_stage.Lower
     |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
     |> run_stage Core_stage.Desugar (fun p ->
@@ -274,9 +234,8 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
         p
         |> Core_specialize.specialize_program ~reg
         |> Core_closure.adapt_function_refs_program)
-    |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
   in
-  { blorp_tail_input = post_dce }
+  { blorp_tail_input = pre_dce }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(on_stage_event = no_op_on_stage_event)

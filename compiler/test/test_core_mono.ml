@@ -18,7 +18,7 @@ let tparams names =
 let mk d t = { desc = d; ty = t; loc }
 
 let ast_with_type expr ty =
-  Blorp.Ast.with_expr_type_info expr (Blorp.Ast.expr_type_info_from_type ty)
+  Blorp.Ast.with_expr_type_info expr (Test_helpers.expr_type_info_from_type ty)
 
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 

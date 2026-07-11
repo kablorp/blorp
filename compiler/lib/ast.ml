@@ -601,23 +601,6 @@ let runtime_helper_name_of_builtin_body = function
   | BuiltinRuntimeHelper name -> Some name
   | BuiltinIntrinsic | BuiltinStdIntrinsic _ -> None
 
-(** Compatibility constructor for transitional typed AST payloads.
-
-    Long term, parsed AST nodes should not carry typed payloads. While the
-    compiler migrates phase-by-phase, keep legacy [expr_type] and structured
-    [expr_type_info] construction in one place so call sites do not rebuild
-    subtly different payloads. *)
-let expr_type_info_from_type ty : expr_type_info =
-  {
-    source_ty = None;
-    semantic_ty = ty;
-    value_ty = ty;
-    origin = Inferred;
-    widening = Keep ty;
-    proofs = Type_proof_metadata.unproven_expr;
-    resolved_call = None;
-  }
-
 let untyped_expr ~loc desc =
   {
     expr_desc = desc;
@@ -645,11 +628,6 @@ let resolved_call_purity call =
   | CallTraitMethod { call_pure; _ }
   | CallClosure { call_pure } ->
       call_pure
-
-let resolved_call_direct_callable_id call =
-  match call.call_target with
-  | CallDirect { callable_id; _ } -> Some callable_id
-  | CallTraitMethod _ | CallClosure _ -> None
 
 let resolved_call_concrete_callable_id call =
   match call.call_target with

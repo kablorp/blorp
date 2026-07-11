@@ -82,7 +82,6 @@ let dimension_identity name =
   if is_dim_var_name name then Some (DimensionIdentity name) else None
 
 let collection_identity_name (CollectionIdentity name) = name
-let dimension_identity_name (DimensionIdentity name) = name
 let collection_var identity = CollVar identity
 let collection_subscript coll ~index = CollSubscript (coll, index)
 let collection_dim dim = if dim < 0 then None else Some (CollDim dim)
@@ -114,12 +113,6 @@ let valid_upper ~range_start = function
 let make_range_proof_with_source ~source ~range_start ~range_upper =
   if range_start < 0 || not (valid_upper ~range_start range_upper) then None
   else Some { range_start; range_upper; range_source = source }
-
-let make_range_proof ~range_start ~range_upper =
-  make_range_proof_with_source ~source:ProofSourceUnknown ~range_start
-    ~range_upper
-
-let range_proof_source proof = proof.range_source
 
 let make_subscript_proof ~source ~collection =
   { subscript_collection = collection; subscript_source = source }

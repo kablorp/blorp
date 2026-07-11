@@ -186,8 +186,8 @@ val of_ast_expr_with_type_info :
   Ast.expr ->
   (expr, error) result
 
-val of_ast_func_decl : Ast.func_decl -> (func_decl, error) result
-val of_ast_var_decl : Ast.var_decl -> (var_decl, error) result
+val of_ast_var_decl_with_source :
+  source_var:Ast.var_decl -> Ast.var_decl -> (var_decl, error) result
 val of_ast_decl : Ast.decl -> (decl, error) result
 
 val of_ast_program :
@@ -213,7 +213,6 @@ val var_ast : var_decl -> Ast.var_decl
 val var_info : var_decl -> var_info
 val var_value_expr : var_decl -> (expr, error) result
 val var_binding_type : var_decl -> Ast.type_expr
-val with_var_ast : var_decl -> Ast.var_decl -> var_decl
 val record_ast : record_decl -> Ast.record_decl
 val record_info : record_decl -> record_info
 val record_field_infos : record_decl -> record_field_info list
@@ -234,15 +233,9 @@ val loc : expr -> Ast.loc
 val type_info : expr -> type_info
 val type_info_to_ast : type_info -> Ast.expr_type_info
 val type_info_source_type : type_info -> Ast.type_expr option
-val type_info_semantic_type : type_info -> Ast.type_expr
-val type_info_value_type : type_info -> Ast.type_expr
 val type_info_origin : type_info -> type_origin
-val type_info_widening : type_info -> Type_widening_metadata.decision
 val type_info_proofs : type_info -> Type_proof_metadata.expr_proofs
-val type_info_resolved_call : type_info -> Ast.resolved_call option
 val expr_resolved_call : expr -> Ast.resolved_call option
-val expr_call_purity : expr -> bool option
-val expr_direct_call_id : expr -> int option
 val expr_concrete_callable_id : expr -> int option
 val semantic_type : expr -> Ast.type_expr
 val value_type : expr -> Ast.type_expr

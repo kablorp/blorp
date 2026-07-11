@@ -116,8 +116,6 @@ let validate_contract (contract : call_contract) =
       else [ Borrowed_result_without_preserved_arg ]
   | ReturnVoid | ReturnPrimitive | ReturnOwned -> []
 
-let contract_is_well_formed contract = validate_contract contract = []
-
 let contract args result =
   let contract = { args; result } in
   match validate_contract contract with
@@ -1512,9 +1510,6 @@ let builtin_contract_table =
              ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
     ]
-
-let builtin_contract_sample_arities entry =
-  builtin_contract_spec_sample_arities entry.builtin_spec
 
 let builtin_void_boxed_arg_positions =
   builtin_contract_table

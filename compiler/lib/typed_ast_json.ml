@@ -2184,7 +2184,7 @@ let decode_typed_global_var_info path value =
     let ast_var =
       {
         source_var with
-        var_type = typed_source_type;
+        var_type = Some binding_type;
         var_value = Typed_ast.ast typed_value;
       }
     in
@@ -2195,7 +2195,7 @@ let decode_typed_global_var_info path value =
         decl_doc = source_decl.decl_doc;
       }
     in
-    match Typed_ast.of_ast_var_decl ast_var with
+    match Typed_ast.of_ast_var_decl_with_source ~source_var ast_var with
     | Ok typed_var ->
         if Types.types_equal (Typed_ast.var_binding_type typed_var) binding_type
         then Ok (Typed_ast.make_var_decl ast_decl typed_var)

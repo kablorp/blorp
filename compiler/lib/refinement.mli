@@ -9,13 +9,6 @@ include module type of Type_proof_metadata
 
 type proof_env
 
-type narrowed_subject = private
-  | NarrowedBinding of collection_identity
-  | NarrowedAlias of {
-      alias : collection_identity;
-      target : collection_identity;
-    }
-
 type branch_subject
 type branch_range_proof
 type branch_proof_rejection = MutableSubjectCannotNarrow | InvalidRangeBounds
@@ -53,9 +46,6 @@ val proof_env_find_range :
 
 val immutable_subject : string -> branch_subject option
 
-val immutable_alias_subject :
-  alias:string -> target:string -> branch_subject option
-
 val mutable_subject : string -> branch_subject option
 
 val make_branch_range_proof :
@@ -64,5 +54,4 @@ val make_branch_range_proof :
   range_upper:range_upper ->
   (branch_range_proof, branch_proof_rejection) result
 
-val branch_range_subject : branch_range_proof -> narrowed_subject
 val branch_range_proof : branch_range_proof -> range_proof

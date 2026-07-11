@@ -4,9 +4,10 @@ open Test_helpers
 
 let typed_program_of_source source =
   with_isolated_env (fun () ->
+      let sess = Blorp.Session.create () in
       match
-        Blorp.Pipeline.typecheck_only_typed ~filename:"typed_ast_debug_test.brp"
-          ~source ()
+        Blorp.Pipeline.typecheck_only_typed_reusing_session ~sess
+          ~filename:"typed_ast_debug_test.brp" ~source ()
       with
       | Ok typed -> typed
       | Error errors ->

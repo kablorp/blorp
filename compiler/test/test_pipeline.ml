@@ -81,29 +81,25 @@ let typed_program_global_int_literal typed_program name =
       | _ -> None)
     (Typed_ast.program_decls typed_program)
 
-let test_typecheck_only_returns_typed_program () =
-  Test_helpers.with_isolated_env (fun () ->
-      let source =
-        "func main(args: List[String]) -> Int:\n    x: Int = 1\n    x + 1\n"
-      in
-      match
-        Pipeline.typecheck_only ~filename:"pipeline_typed_result.brp" ~source ()
-      with
-      | Ok program ->
-          Alcotest.(check bool)
-            "returned program contains typed expressions" true
-            (program_has_typed_expr program)
-      | Error errors ->
-          Alcotest.fail
-            ("expected successful typecheck, got:\n" ^ format_errors errors))
+let typecheck_typed ~filename ~source ?debug () =
+  let sess = Session.create () in
+  Pipeline.typecheck_only_typed_reusing_session ~sess ~filename ~source ?debug ()
 
-let test_typecheck_only_typed_returns_typed_program () =
+let typecheck_ast ~filename ~source ?debug () =
+  typecheck_typed ~filename ~source ?debug ()
+  |> Result.map Typed_ast.program_ast
+
+let typecheck_with_blorp_bridge ~filename ~preloaded_module_graph =
+  Pipeline.typecheck_only_typed_with_blorp_bridge_policy ~debug:false
+    ~allow_debug_only_calls:false ~filename ~preloaded_module_graph
+
+let test_reusable_typecheck_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
       let source =
         "func main(args: List[String]) -> Int:\n    x: Int = 1\n    x + 1\n"
       in
       match
-        Pipeline.typecheck_only_typed ~filename:"pipeline_typed_result_api.brp"
+        typecheck_typed ~filename:"pipeline_typed_result_api.brp"
           ~source ()
       with
       | Ok typed_program ->
@@ -114,44 +110,6 @@ let test_typecheck_only_typed_returns_typed_program () =
           Alcotest.fail
             ("expected successful typed typecheck, got:\n"
            ^ format_errors errors))
-
-let test_compile_parsed_accepts_finalized_bridge_artifact () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_compile_parsed" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let source =
-            "func main(args: List[String]) -> Int:\n\
-            \    print(\"value ${1 + 1}\")\n\
-            \    0\n"
-          in
-          write_file main_path source;
-          let module_name = "main" in
-          match
-            Compiler_blorp_bridge.parse_source_file_via_command_at_phase
-              ~phase:Compiler_blorp_bridge.TypecheckSourceProgram
-              ~path:main_path ~module_name
-          with
-          | Error (_, message) ->
-              Alcotest.fail ("expected Blorp parse bridge artifact: " ^ message)
-          | Ok (Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics) ->
-              Alcotest.fail
-                ("expected parsed bridge artifact, got diagnostics:\n"
-               ^ format_errors diagnostics)
-          | Ok (Compiler_blorp_bridge.ParsedSource parsed_source) ->
-              let program = parsed_source.parsed_program in
-              match
-                Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
-                  ~program ()
-              with
-              | Ok (Pipeline.Compiled { c_code; _ }) ->
-                  Alcotest.(check bool)
-                    "generated C contains interpolated string literal" true
-                    (contains c_code "value")
-              | Ok (Pipeline.Stopped_at _) ->
-                  Alcotest.fail "compile_parsed unexpectedly stopped early"
-              | Error errors ->
-                  Alcotest.fail
-                    ("expected compile_parsed success:\n" ^ format_errors errors)))
 
 let parse_typecheck_source_for_test ~path ~module_name =
   match
@@ -224,48 +182,6 @@ let preloaded_graph_for_single_source ~path ~source ~parsed :
   preloaded_graph_for_single_source_named ~module_name:"main" ~path ~source
     ~parsed
 
-let test_compile_parsed_uses_preloaded_module_graph_without_rereading_import ()
-    =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_compile_graph_preload" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
-          let main_source =
-            "import:\n\
-            \    ./dep: dep_value\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    dep_value()\n"
-          in
-          let dep_source = "pure func dep_value() -> Int: 7\n" in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          Sys.remove dep_path;
-          let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
-          in
-          match
-            Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
-              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
-          with
-          | Ok (Pipeline.Compiled { c_code; _ }) ->
-              Alcotest.(check bool)
-                "generated C uses graph-loaded dependency" true
-                (contains c_code "dep_value")
-          | Ok (Pipeline.Stopped_at _) ->
-              Alcotest.fail "compile_parsed unexpectedly stopped early"
-          | Error errors ->
-              Alcotest.fail
-                ("expected compile_parsed to use preloaded module graph:\n"
-               ^ format_errors errors)))
-
 let test_blorp_bridge_typecheck_uses_preloaded_graph_imports () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_pipeline_typecheck_bridge_graph" (fun dir ->
@@ -293,7 +209,7 @@ let test_blorp_bridge_typecheck_uses_preloaded_graph_imports () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok typed_program ->
@@ -335,7 +251,7 @@ let test_blorp_bridge_typecheck_uses_fresh_session_per_call () =
           in
           let expect_ok label path graph =
             match
-              Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:path
+              typecheck_with_blorp_bridge ~filename:path
                 ~preloaded_module_graph:graph
             with
             | Ok _ -> ()
@@ -365,7 +281,7 @@ let test_blorp_bridge_typecheck_reports_type_errors () =
               ~source:main_source ~parsed:main_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok _ -> Alcotest.fail "expected Blorp bridge type error"
@@ -398,7 +314,7 @@ let test_blorp_bridge_typecheck_runs_ctfe () =
               ~source:main_source ~parsed:main_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok typed_program -> (
@@ -439,7 +355,7 @@ let test_blorp_bridge_typecheck_runs_imported_constant_ctfe () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok typed_program -> (
@@ -484,7 +400,7 @@ let test_blorp_bridge_typecheck_runs_imported_function_ctfe () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok typed_program -> (
@@ -644,7 +560,7 @@ let test_surface_backed_exports_support_selective_imports () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok _ -> ()
@@ -685,7 +601,7 @@ let test_surface_backed_private_names_report_private_import () =
               ~dep_path ~dep_source ~dep_parsed
           in
           match
-            Pipeline.typecheck_only_typed_with_blorp_bridge ~filename:main_path
+            typecheck_with_blorp_bridge ~filename:main_path
               ~preloaded_module_graph
           with
           | Ok _ -> Alcotest.fail "expected private import diagnostic"
@@ -696,72 +612,6 @@ let test_surface_backed_private_names_report_private_import () =
                 (contains messages
                    "'hidden' is private in module './dep' and cannot be \
                     imported")))
-
-let test_compile_parsed_uses_graph_import_spelling_alias () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_compile_graph_import_alias" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "canonical_dep.brp" in
-          let main_source =
-            "import:\n\
-            \    alias_dep: dep_value\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    dep_value()\n"
-          in
-          let dep_source = "pure func dep_value() -> Int: 9\n" in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"canonical_dep"
-          in
-          Sys.remove dep_path;
-          let preloaded_module_graph : Modules.preloaded_module_graph =
-            {
-              preload_graph_context =
-                {
-                  preload_graph_std_dir = None;
-                  preload_graph_source_packages = [];
-                  preload_graph_package_roots = [];
-                };
-              preload_graph_sources =
-                [
-                  preloaded_source_for_test ~path:main_path ~module_name:"main"
-                    ~source:main_source main_parsed;
-                  preloaded_source_for_test ~path:dep_path
-                    ~module_name:"canonical_dep" ~source:dep_source dep_parsed;
-                ];
-              preload_graph_imports =
-                [
-                  {
-                    preload_import_from_path = main_path;
-                    preload_import_from_module = "main";
-                    preload_import_path = "alias_dep";
-                    preload_import_resolved_path = Some dep_path;
-                    preload_import_resolved_module = Some "canonical_dep";
-                    preload_import_resolved_origin = Some Session.User_module;
-                  };
-                ];
-            }
-          in
-          match
-            Pipeline.compile_parsed ~embed_runtime:false ~filename:main_path
-              ~program:main_parsed.parsed_program ~preloaded_module_graph ()
-          with
-          | Ok (Pipeline.Compiled { c_code; _ }) ->
-              Alcotest.(check bool)
-                "generated C uses graph dependency imported by source spelling"
-                true
-                (contains c_code "dep_value")
-          | Ok (Pipeline.Stopped_at _) ->
-              Alcotest.fail "compile_parsed unexpectedly stopped early"
-          | Error errors ->
-              Alcotest.fail
-                ("expected compile_parsed to cache graph import spelling:\n"
-               ^ format_errors errors)))
 
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -814,7 +664,7 @@ let test_typecheck_only_zonks_global_function_reference_initializer () =
          }\n"
       in
       match
-        Pipeline.typecheck_only ~filename:"pipeline_global_lambda_zonk.brp"
+        typecheck_ast ~filename:"pipeline_global_lambda_zonk.brp"
           ~source ()
       with
       | Ok program ->
@@ -908,7 +758,7 @@ let test_direct_std_source_check_does_not_conflict_with_embedded_std () =
       | Some std_dir -> (
           let result_path = Filename.concat std_dir "result.brp" in
           let source = Modules.read_file result_path in
-          match Pipeline.typecheck_only ~filename:result_path ~source () with
+          match typecheck_ast ~filename:result_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               let text = format_errors errors in
@@ -933,7 +783,7 @@ let test_explicit_std_source_check_reports_unused_import_error () =
           let source =
             "import:\n    vector: sum\n\nfunc lint_target() -> Int:\n    0\n"
           in
-          match Pipeline.typecheck_only ~filename:std_path ~source () with
+          match typecheck_ast ~filename:std_path ~source () with
           | Ok _ -> Alcotest.fail "expected explicit std source to fail"
           | Error errors ->
               let text = format_errors errors in
@@ -950,7 +800,7 @@ let test_std_prelude_reexport_source_skips_unused_import_error () =
       | Some std_dir -> (
           let std_path = Filename.concat std_dir "prelude.brp" in
           let source = Modules.read_file std_path in
-          match Pipeline.typecheck_only ~filename:std_path ~source () with
+          match typecheck_ast ~filename:std_path ~source () with
           | Error errors ->
               Alcotest.fail
                 ("std/prelude source should typecheck:\n" ^ format_errors errors)
@@ -968,7 +818,7 @@ let test_user_file_in_std_named_dir_rejects_builtin () =
              func main(args: List[String]) -> Int:\n\
             \    sneaky()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1010,7 +860,7 @@ let test_configured_std_source_rejects_foreign () =
             "foreign(include: \"math.h\"):\n\
             \    func c_abs(x: Int) -> Int = \"abs\"\n"
           in
-          match Pipeline.typecheck_only ~filename:std_path ~source () with
+          match typecheck_ast ~filename:std_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1036,7 +886,7 @@ let test_configured_std_source_rejects_package_import () =
              func harmless() -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:std_path ~source () with
+          match typecheck_ast ~filename:std_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1059,7 +909,7 @@ let test_bare_local_import_does_not_keep_failed_std_probe () =
              func main(args: List[String]) -> Int:\n\
             \    ok()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1082,7 +932,7 @@ let test_imported_module_uses_typecheck_source_finalization () =
              func main(args: List[String]) -> Int:\n\
             \    outer(1)\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1105,7 +955,7 @@ let test_qualified_only_import_does_not_suppress_bare_missing_name () =
              func main(args: List[String]) -> Int:\n\
             \    B.bad()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1152,7 +1002,7 @@ let test_cross_module_coherence_distinguishes_same_named_local_types () =
              func main(args: List[String]) -> Int:\n\
             \    A.module_id() + B.module_id()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1172,7 +1022,7 @@ let test_duplicate_selective_type_import_requires_alias () =
              func main(args: List[String]) -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1195,7 +1045,7 @@ let test_module_alias_rejects_builtin_type_name () =
              func main(args: List[String]) -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1221,7 +1071,7 @@ let test_module_alias_rejects_local_type_name () =
              func main(args: List[String]) -> Int:\n\
             \    Widget.make()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1300,7 +1150,7 @@ let test_selective_imported_record_type_aliases_module_owned_type () =
             \    box: Box = B.new(1)\n\
             \    box.value\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1328,7 +1178,7 @@ let test_selective_imported_union_constructor_uses_module_owned_type () =
             \    else:\n\
             \        1\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1360,7 +1210,7 @@ let test_selective_imported_type_alias_uses_module_owned_target () =
             \        Ok(n): n\n\
             \        Err(_): 0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1391,7 +1241,7 @@ let test_exported_signature_keeps_imported_type_owner () =
              func main(args: List[String]) -> Int:\n\
             \    bridge(J.parse())\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1422,7 +1272,7 @@ let test_selective_import_uses_typed_semantic_export_signature () =
             \        Err(_): 0\n"
           in
           match
-            Pipeline.typecheck_only_typed ~filename:main_path ~source ()
+            typecheck_typed ~filename:main_path ~source ()
           with
           | Error errors ->
               Alcotest.fail
@@ -1485,7 +1335,7 @@ let test_local_record_field_uses_imported_type_owner () =
             \    h: Holder = make()\n\
             \    h.dep.value\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1516,7 +1366,7 @@ let test_qualified_module_value_uses_typed_export_annotation () =
             \    else:\n\
             \        1\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1546,7 +1396,7 @@ let test_alias_only_imports_do_not_expose_trait_methods () =
              func main(args: List[String]) -> Int:\n\
             \    A.marker() + B.marker()\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1570,7 +1420,7 @@ let test_selective_trait_imports_expose_method_collisions () =
              func main(args: List[String]) -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Error errors ->
               let text = format_errors errors in
               Alcotest.(check bool)
@@ -1644,7 +1494,7 @@ let test_selective_function_import_allows_unimported_return_type_name () =
              func main(args: List[String]) -> Int:\n\
             \    make_foo().value\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1667,7 +1517,7 @@ let test_selective_function_import_allows_explicit_exposed_return_type () =
             \    foo: Foo = make_foo()\n\
             \    foo.value\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1689,7 +1539,7 @@ let test_selective_record_import_allows_unimported_field_type_name () =
              func main(args: List[String]) -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1711,7 +1561,7 @@ let test_selective_record_import_allows_prelude_field_types () =
              func main(args: List[String]) -> Int:\n\
             \    0\n"
           in
-          match Pipeline.typecheck_only ~filename:main_path ~source () with
+          match typecheck_ast ~filename:main_path ~source () with
           | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
@@ -1725,16 +1575,8 @@ let suite =
         Alcotest.test_case
           "direct std source check does not conflict with embedded std" `Quick
           test_direct_std_source_check_does_not_conflict_with_embedded_std;
-        Alcotest.test_case "typecheck_only returns typed program" `Quick
-          test_typecheck_only_returns_typed_program;
-        Alcotest.test_case "typecheck_only_typed returns typed program" `Quick
-          test_typecheck_only_typed_returns_typed_program;
-        Alcotest.test_case "compile_parsed accepts finalized bridge artifact"
-          `Quick test_compile_parsed_accepts_finalized_bridge_artifact;
-        Alcotest.test_case
-          "compile_parsed uses preloaded module graph without rereading import"
-          `Quick
-          test_compile_parsed_uses_preloaded_module_graph_without_rereading_import;
+        Alcotest.test_case "reusable typecheck returns typed program" `Quick
+          test_reusable_typecheck_returns_typed_program;
         Alcotest.test_case
           "Blorp bridge typecheck uses preloaded graph imports" `Quick
           test_blorp_bridge_typecheck_uses_preloaded_graph_imports;
@@ -1762,8 +1604,6 @@ let suite =
         Alcotest.test_case
           "surface backed private names report private import" `Quick
           test_surface_backed_private_names_report_private_import;
-        Alcotest.test_case "compile_parsed caches graph import spelling" `Quick
-          test_compile_parsed_uses_graph_import_spelling_alias;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"

@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-10.
+Status checked against code on 2026-07-11.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -24,9 +24,9 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> OCaml host command execution / module-cache and coherence orchestration /
      typed-artifact decode
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
-  -> OCaml Core pipeline through DCE
-  -> JSON post-DCE Core
-  -> Blorp consume specialization / Perceus / reuse / closure / resource /
+  -> OCaml Core pipeline through specialization and function-reference adaptation
+  -> JSON pre-DCE Core
+  -> Blorp DCE / consume specialization / Perceus / reuse / closure / resource /
      fairness / prepare / prepared reuse
   -> Blorp C artifact emission
   -> OCaml artifact writing / C compiler invocation
@@ -70,6 +70,7 @@ Current production backend-tail Blorp files:
 
 - `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
@@ -95,10 +96,11 @@ Current OCaml bridge, orchestration, and production-middle files:
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` still invokes the OCaml implementations of
-Core lowering and every early/middle Core pass through DCE. The production JSON
-handoff to Blorp is exactly after OCaml DCE. Blorp is authoritative for consume
-specialization, Perceus, and the complete backend tail; the replaced OCaml
-implementations and their implementation-only tests have been deleted.
+Core lowering and the early/middle Core passes through specialization and
+function-reference adaptation. The production JSON handoff to Blorp is exactly
+before DCE. Blorp is authoritative for DCE, consume specialization, Perceus,
+and the complete backend tail; the replaced OCaml implementations and their
+implementation-only tests have been deleted.
 
 The public executable is Blorp-owned through
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
@@ -234,8 +236,8 @@ OCaml references:
   - `compile_file_with_opts`
   - `run_file`
 - `compiler/lib/pipeline.ml`
-  - `typecheck_only_typed_with_blorp_bridge`
-  - `compile_parsed`
+  - `typecheck_only_typed_with_blorp_bridge_policy`
+  - `compile_preloaded_graph_with_blorp_bridge`
   - `compile_loaded_program`
 
 Blorp references:
@@ -301,8 +303,10 @@ Closed deletion point:
 - OCaml root expansion, source reads, and parser fallback code for normal
   `check`, `compile`, and `run` have been deleted from the shell path. The
   remaining source-command shell code assumes a Blorp-produced graph before it
-  enters `Pipeline.typecheck_only_typed_with_blorp_bridge` or
-  `Pipeline.compile_parsed`.
+  enters `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` or
+  `Pipeline.compile_preloaded_graph_with_blorp_bridge`. The test-only
+  `Pipeline.compile_parsed` compatibility API and its path-specific tests have
+  been deleted, along with the redundant default-policy typecheck wrapper.
 
 ## Checkpoint 2: Source Model, Parser, And Source-AST Finalization
 
@@ -535,8 +539,8 @@ Tests:
 Deletion point:
 
 - Delete OCaml module path resolution/loading/cache code after
-  `Pipeline.compile_parsed` and
-  `Pipeline.typecheck_only_typed_with_blorp_bridge` consume a Blorp-validated
+  `Pipeline.compile_preloaded_graph_with_blorp_bridge` and
+  `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` consume a Blorp-validated
   module graph for every production/tooling caller and no longer need
   `Modules.load_imports` for non-graph entry points.
 
@@ -957,10 +961,9 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-Core lowering. Legacy direct `Pipeline.compile` /
-`Pipeline.typecheck_only` APIs and some tooling/test paths can still use the
-OCaml parser/typechecker until their callers move to an explicit Blorp frontend
-graph.
+Core lowering. Legacy direct `Pipeline.compile`, reusable compiler-fixture
+typechecking, and some tooling/test paths can still use the OCaml
+parser/typechecker until their callers move to an explicit Blorp frontend graph.
 `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
 primitive/logical operators, direct non-generic calls, tuples, lists, dicts,
@@ -1524,7 +1527,7 @@ Current status:
   typecheck through the Blorp bridge. Bare lookup is scoped: declarations made
   available only through a module alias do not leak as unqualified values, and
   private imported declarations are skipped.
-- `Pipeline.typecheck_only_typed_with_blorp_bridge` is the graph-backed Blorp
+- `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` is the graph-backed Blorp
   typecheck handoff used by source-command checks. It builds explicit
   import-module payloads from graph edges, materializes graph-loaded dependency
   module typed declarations/import bindings into `Modules`, and requires the
@@ -1535,8 +1538,8 @@ Current status:
   Blorp typed-program artifact, populates dependency typed-module caches, and
   then enters the shared OCaml Core/codegen handoff without
   returning to the OCaml typechecker.
-- Direct-source `Pipeline.compile`, `Pipeline.typecheck_only`,
-  `Pipeline.typecheck_only_typed`, and module-only typecheck APIs are now
+- Direct-source `Pipeline.compile`, reusable compiler-fixture typechecking, and
+  module-only typecheck APIs are now
   documented in code as legacy/tooling routes. The raw-source compile route is
   also exposed as `Pipeline.compile_legacy_direct_source`, and the REPL/test
   runner use that explicit name where they intentionally still depend on OCaml
@@ -1556,6 +1559,45 @@ Current status:
   parsed declarations remain valid. The full CLI clean build dropped from a
   typecheck helper exceeding 4.2 GB without completing to a successful roughly
   143 second build with a 1.76 GB process-tree peak on macOS arm64.
+- **Compiler-graph closure closed (measured 2026-07-11):** the default CLI now
+  typechecks `compiler/blorp/tests/test_compiler_core_perceus.brp` through the
+  full Blorp graph in 9m54s with a 3.82 GB maximum resident set. The standalone
+  `compiler_infer.brp` source graph also typechecks in 6m44s with a 2.57 GB
+  maximum resident set. Closing the graph required canonical imported global
+  annotations, contextual function-purity compatibility in list literals,
+  CTFE function-reference values that preserve purity without invoking impure
+  callbacks, explicit Core declaration imports, and concrete integer min/max
+  helpers where the self-hosted graph cannot yet discharge the generic trait
+  call. The remaining limitation is throughput rather than graph closure.
+- **Graph CTFE dependency preparation is deduplicated (2026-07-11):** graph
+  preparation now identifies direct user leaf modules needed by immutable
+  globals across the requested module artifacts and target, typechecks each
+  dependency once, and shares that bounded result with every artifact that
+  explicitly imports it. Failed dependency preparation is cached as an
+  explicit failure and remains isolated to artifacts that require that module.
+  The production protocol still streams one artifact at a time, and the graph
+  does not retain every completed typed artifact. A bridge regression verifies
+  that a leaf shared by two module artifacts and the target appears once in the
+  dependency plan while all three artifacts complete CTFE.
+- Imported module bodies were already materialized once per requested module;
+  retaining a second complete typed graph would increase the measured 3.82 GB
+  peak rather than remove demonstrated duplication. The remaining repeated
+  semantic work is construction of the imported declaration, signature, impl,
+  and binding environment for each selected artifact. The next graph slice
+  should factor that immutable import context into a reusable prepared value,
+  with artifact-local bindings and diagnostics kept separate. It should not add
+  a process-level cache or retain all serialized artifacts.
+- **Full typecheck bridge graph closure is verified (2026-07-11):** a direct
+  production `check` of `compiler_typecheck_bridge.brp` now succeeds across the
+  complete imported graph. The closure pass replaced graph-order-sensitive
+  record literals with typed constructors, reused one canonical optional-type
+  copy helper from the owning type module, modeled inferred versus declared
+  global types explicitly, qualified the colliding string `repeat` operation,
+  and removed generic tuple-result matches the current backend cannot emit.
+  Match-branch and call-argument mismatch diagnostics now preserve the source
+  path, line, and column when crossing the streamed typecheck boundary. These
+  changes also exposed and removed duplicate parameter-annotation conversion
+  and enum membership that incorrectly relied on `Equatable`.
 - Blorp now has the first CTFE value/operator foundation in
   `compiler_ctfe_value.brp`: typed compile-time values, constructor payload
   metadata, structural equality, expectation helpers, and primitive unary/binary
@@ -1690,7 +1732,7 @@ Current status:
 Typed frontier closure before CTFE:
 
 - Close or explicitly classify residual OCaml typecheck/parser consumers:
-  `Pipeline.compile`, `Pipeline.typecheck_only`,
+  `Pipeline.compile`, `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
   test runner, and LSP/tooling helpers.
 - Normal source execution must enter through the Blorp frontend graph and
@@ -1935,11 +1977,12 @@ Deletion point:
 
 Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
-Status: the first Blorp desugar slice exists and is directly tested, but no
-early or middle Core stage has moved on the normal production path. OCaml
-`Core_pipeline.run_core_passes` remains authoritative from debug/desugar
-through DCE. Stage parity modules must not be counted as migrated until the
-production pass ordering invokes them and the replaced OCaml pass is deleted.
+Status: Blorp DCE is authoritative on the normal production path and the
+superseded OCaml DCE implementation and tests are deleted. The remaining early
+and middle Core stages from debug/desugar through specialization are still
+OCaml-authoritative. Stage parity modules must not be counted as migrated until
+the production pass ordering invokes them and the replaced OCaml pass is
+deleted.
 
 OCaml references, in `Core_pipeline.run_core_passes` order:
 
@@ -1975,8 +2018,6 @@ OCaml references, in `Core_pipeline.run_core_passes` order:
   - `specialize_program`
 - `compiler/lib/core_closure.ml`
   - `adapt_function_refs_program`
-- `compiler/lib/core_dce.ml`
-  - `prune_unreachable_declarations`
 
 Blorp references:
 
@@ -1995,7 +2036,7 @@ Blorp references:
 - future `compiler_core_tailrec.brp`
 - future fusion modules
 - future `compiler_core_specialize.brp`
-- future `compiler_core_dce.brp`
+- existing `compiler_core_dce.brp`
 
 Implementation steps:
 
@@ -2034,9 +2075,10 @@ Edge cases:
   intrinsic, and unknown call kinds.
 - Fusion passes must fail closed. They should not rewrite when ownership,
   shape, callback purity, or layout facts are incomplete.
-- DCE must retain backend-required artifacts, destructors, constructors, enum
-  helpers, stack option/result layouts, hash callbacks, tasks, and global
-  initializers.
+- DCE must retain hash callbacks, task closures, global initializers, every
+  reachable emitted function, and the transitive type graph used by retained
+  code. The projected boundary no longer contains generic templates or impl
+  containers; backend artifacts are derived from retained data declarations.
 
 Tests:
 
@@ -2056,12 +2098,13 @@ Tests:
   - `compiler/test/test_core_tensor_type.ml`
   - `compiler/test/test_core_tuple_sroa.ml`
   - `compiler/test/test_core_specialize.ml`
-  - `compiler/test/test_core_dce.ml`
 - Add missing focused coverage for `Core_debug.lower_program` when that slice
   ports.
 - `tests/test_compiler/codegen_audit/should_pass/core_dce_*.brp`
 - Blorp stage parity tests under `compiler/blorp/tests`.
 - `compiler/blorp/tests/test_compiler_core_desugar.brp`
+- `compiler/blorp/tests/test_compiler_core_dce.brp`
+- `tests/test_compiler/codegen_audit/should_pass/blorp_backend_dce.brp`
 
 Deletion point:
 
@@ -2073,8 +2116,8 @@ Deletion point:
 Goal: finish the already-started backend ownership migration and remove the
 post-Perceus OCaml boundary.
 
-Status: the production boundary has moved from post-Perceus to post-DCE. Blorp
-consume specialization and Perceus are authoritative on every normal compile,
+Status: the production boundary has moved from post-Perceus to pre-DCE. Blorp
+DCE, consume specialization, and Perceus are authoritative on every normal compile,
 the single `emit_core_c` bridge action runs the complete Blorp-owned tail, and
 the replaced OCaml implementations and implementation-only tests are deleted.
 The moved path has focused sanitizer coverage and has compiled the full Blorp
@@ -2091,21 +2134,27 @@ Current progress:
   literal, and length constructor-match bodies; handles branch-swapped
   recursive fields; and has a Perceus integration regression proving the clone
   suppresses the obsolete mutable-slot release.
-- Perceus now infers user-function ownership contracts from function bodies to
-  a bounded fixed point instead of depending on call-site metadata. Blorp Core
-  lowering emits empty user-call ownership metadata, so this is required for
-  the production boundary. The fixed-point implementation is
-  tail-recursive and sanitizer-tested after exposing an environment reuse bug.
+- Perceus infers user-function ownership contracts from function bodies with a
+  dependency worklist instead of relying solely on call-site metadata. The
+  monotonic analysis may add consumed parameters but does not remove projected
+  call-site consumes.
 - Branch summaries and balancing cover `if` and compiled constructor decision
   trees, including nested literal and exact/minimum/fallback length matches,
   shadowing, and scrutinee aliases. Repeated consume protection covers while
   and every Core `for` family and traverses nested decision trees.
+- Consumed-parameter balancing now keeps direct match scrutinee aliases live
+  through tag selection and balances ownership only inside the selected branch.
+  A recursive `Doc.cat(a, b)` regression covers returning either consumed
+  parameter from nested matches or transferring both into `Concat`; the
+  production formatter exercises the same shape and passes under ASan.
 - Mutable assignments release replaced owners, retain alias installs, avoid a
   second release after COW consumption, and thread assignment state through
-  compiled matches. Function finalization retains borrowed parameter and match
-  binding returns, retains aggregate members, balances inferred consumed
-  parameters, and recursively inserts drops through the exhaustive shared Core
-  child mapper in `compiler_core_traverse.brp`.
+  compiled matches. Mutable result retention reconstructs matched `LetExpr`
+  children before result-position recursion, avoiding parent-lifetime and C
+  argument-order dependencies. Function finalization retains borrowed parameter
+  and match binding returns, retains aggregate members, balances inferred
+  consumed parameters, and recursively inserts drops through the exhaustive
+  shared Core child mapper in `compiler_core_traverse.brp`.
 
 Remaining cleanup after the ownership boundary move:
 
@@ -2125,6 +2174,12 @@ Remaining cleanup after the ownership boundary move:
   production boundary move requires it or a focused correctness regression
   proves the current state ambiguous. Do not mix that representation change
   into the narrow ownership checkpoint.
+- Keep the conservative managed-return guard in `contract_for_call`. A broad
+  switch to inferred borrowing is not sound yet: match binding modes in the
+  projected callee body can still assume ownership even when both OCaml and
+  Blorp infer a borrowing function parameter. Removing the guard requires
+  Blorp to derive match-binding ownership from the finalized function contract
+  in the same phase, then prove the compiler-owned Core suites under ASan.
 - The narrow ownership merge gate must include the nullable-Option prepare
   case, Result `?=` Core lowering, owned-union reuse, channel receive, task
   result aliases, file-resource cleanup, and mutable aggregate assignment.
@@ -2136,7 +2191,7 @@ Remaining cleanup after the ownership boundary move:
   traversal and fail closed when their call contract is unknown.
 - Delete the remaining OCaml ownership/layout facts and the Core JSON projector
   only when the left boundary reaches the corresponding earlier Core stages;
-  they are still inputs to OCaml lowering and post-DCE projection today.
+  they are still inputs to OCaml lowering and pre-DCE projection today.
 
 Remaining OCaml references:
 
@@ -2156,6 +2211,7 @@ Remaining OCaml references:
 
 Blorp references:
 
+- `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`

@@ -1361,7 +1361,6 @@ let test_list_pipeline_rejects_empty_source_plan () =
 let test_list_pipeline_exposes_nonempty_stages () =
   match LP.plan_of_expr (filter_map_fold_expr ()) with
   | Some plan -> (
-      Alcotest.(check int) "stage count" 2 (LP.stage_count plan);
       match (LP.source plan, LP.stages plan, LP.sink plan) with
       | LP.SourceList _, [ LP.StageFilter _; LP.StageMap _ ], LP.SinkFold _ ->
           ()

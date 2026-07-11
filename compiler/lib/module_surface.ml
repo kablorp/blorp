@@ -53,23 +53,6 @@ let symbol_kind_of_string = function
   | "impl_method" -> Ok ImplMethod
   | other -> Error ("unsupported module surface symbol kind `" ^ other ^ "`")
 
-let symbol_source_kind_name = function
-  | Decl _ -> "decl"
-  | TraitMethod _ -> "trait_method"
-  | ImplMethod _ -> "impl_method"
-  | PrivateDecl _ -> "private_decl"
-  | PrivateTraitMethod _ -> "private_trait_method"
-  | PrivateImplMethod _ -> "private_impl_method"
-
-let source_decl_index = function
-  | Decl index
-  | TraitMethod (index, _)
-  | ImplMethod (index, _)
-  | PrivateDecl index
-  | PrivateTraitMethod (index, _)
-  | PrivateImplMethod (index, _) ->
-      Some index
-
 let export_names surface = List.map (fun symbol -> symbol.name) surface.exports
 
 let private_names surface =

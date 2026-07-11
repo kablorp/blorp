@@ -27,11 +27,8 @@ let test_non_singleton_value_type_is_kept () =
   check_true "value type is Int"
     (types_equal (Blorp.Type_widening.value_type slot) ty_int);
   match Blorp.Type_widening.decision slot with
-  | Blorp.Type_widening.Keep ty -> (
-      check_true "kept decision carries value type" (types_equal ty ty_int);
-      match Blorp.Type_widening.widening_reason slot with
-      | None -> ()
-      | Some _ -> Alcotest.fail "kept slot should not have widening reason")
+  | Blorp.Type_widening.Keep ty ->
+      check_true "kept decision carries value type" (types_equal ty ty_int)
   | Blorp.Type_widening.Widen _ -> Alcotest.fail "did not expect widening"
 
 let test_numeric_operand_slot_preserves_semantic_type () =

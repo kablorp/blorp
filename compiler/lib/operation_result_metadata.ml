@@ -67,14 +67,6 @@ type operation_wait_class =
 
 type source_module = StdDns | StdTcp | StdTls | StdUdp | StdWebSocket | StdFs
 
-let source_module_path = function
-  | StdDns -> Codegen_names.mod_dns
-  | StdTcp -> Codegen_names.mod_tcp
-  | StdTls -> Codegen_names.mod_tls
-  | StdUdp -> Codegen_names.mod_udp
-  | StdWebSocket -> Codegen_names.mod_websocket
-  | StdFs -> Codegen_names.mod_fs
-
 type result_bridge = {
   builtin_name : string;
   source_module : source_module;
@@ -124,9 +116,6 @@ let rec accepted_type_shape_to_string = function
   | NamedType (names, args) ->
       Printf.sprintf "%s[%s]" (String.concat "|" names)
         (String.concat ", " (List.map accepted_type_shape_to_string args))
-
-let success_payload_type_names payload =
-  match payload.accepted_type with NamedType (names, _) -> names
 
 let rec accepted_type_shape_matches shape ty =
   match (shape, ty) with
@@ -519,18 +508,6 @@ let dns_addresses_payload =
     resource_result_policy = Env_types.ResourceResultOrdinary;
   }
 
-let wait_behavior_is_cancellation_point = function
-  | ParksFiber -> true
-  | DoesNotWait | BlocksOsWorker _ -> false
-
-let wait_behavior_parks_fiber = function
-  | ParksFiber -> true
-  | DoesNotWait | BlocksOsWorker _ -> false
-
-let wait_behavior_blocks_os_worker = function
-  | BlocksOsWorker _ -> true
-  | DoesNotWait | ParksFiber -> false
-
 let result_ownership_kind_of_policy = function
   | Env_types.ResourceResultOrdinary -> OrdinaryResult
   | Env_types.ResourceResultIndependent as policy -> ResourceResult policy
@@ -545,21 +522,6 @@ let bridge_operation_wait_class (bridge : result_bridge) =
   | ParksFiber -> ParksFiberReturning (bridge_result_ownership_kind bridge)
   | BlocksOsWorker reason ->
       BlocksOsWorkerReturning (reason, bridge_result_ownership_kind bridge)
-
-let bridge_is_cancellation_point (bridge : result_bridge) =
-  wait_behavior_is_cancellation_point bridge.wait_behavior
-
-let bridge_parks_fiber (bridge : result_bridge) =
-  wait_behavior_parks_fiber bridge.wait_behavior
-
-let bridge_blocks_os_worker (bridge : result_bridge) =
-  wait_behavior_blocks_os_worker bridge.wait_behavior
-
-let terminal_is_cancellation_point (terminal : fallible_stream_terminal) =
-  wait_behavior_is_cancellation_point terminal.wait_behavior
-
-let terminal_parks_fiber (terminal : fallible_stream_terminal) =
-  wait_behavior_parks_fiber terminal.wait_behavior
 
 let tcp_bridge ?(wait_behavior = DoesNotWait) builtin_name runtime_result_c_type
     success arguments =

@@ -1,6 +1,7 @@
 # Late-Core Ownership Stabilization Roadmap
 
-Status: revised on 2026-07-10 after implementation and sanitizer probing.
+Status: completed. Boundary facts refreshed on 2026-07-11 after DCE moved to
+Blorp; this remains the historical ownership-hardening plan.
 
 This roadmap replaces the earlier compiler-wide cloning plan. That plan mixed
 three different jobs:
@@ -41,28 +42,29 @@ production-path failure.
 
 ### Current production handoff
 
-OCaml currently owns Core through DCE. The default backend path then performs
-one post-DCE JSON handoff to Blorp:
+OCaml currently owns Core through specialization and function-reference
+adaptation. The default backend path then performs one pre-DCE JSON handoff to
+Blorp:
 
 ```text
 OCaml lower -> debug -> desugar/SSA -> mono -> synth -> match
   -> trait resolve -> resolve -> std inline -> tailrec -> fusion
-  -> specialize -> DCE
+  -> specialize
   -> Core JSON handoff
-  -> Blorp consume specialize -> Perceus -> reuse -> closure
+  -> Blorp DCE -> consume specialize -> Perceus -> reuse -> closure
   -> resource -> fairness -> prepare -> prepared reuse -> C emission
 ```
 
 Relevant entry points:
 
 - `compiler/lib/core_pipeline.ml`
-  - `post_dce_program_json`
+  - `pre_dce_program_json`
   - `observe_blorp_tail_json`
   - `emit_via_c_backend`
 - `compiler/lib/core_emit_blorp_c.ml`
   - temporary OCaml Core-to-JSON projection
 - `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
-  - `run_post_dce_tail`
+  - `run_pre_dce_tail`
   - `run_core_pipeline_stage`
 - `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 
@@ -71,14 +73,14 @@ duplicate pass ordering while fixing ownership.
 
 ### What this checkpoint does not unlock by itself
 
-Ownership stabilization does not make the post-DCE handoff deletable. Blorp
-does not yet have production equivalents for every Core stage between lowering
-and DCE. In particular, the complete debug, SSA, monomorphization, synthesis,
-match compilation, resolution, inlining, tail-recursion, fusion,
-specialization, and DCE sequence is not yet available as one authoritative
-Blorp path.
+Ownership stabilization did not by itself make the Core handoff deletable.
+Blorp now owns DCE, but it does not yet have production equivalents for every
+Core stage between lowering and specialization. In particular, the complete
+debug, SSA, monomorphization, synthesis, match compilation, resolution,
+inlining, tail-recursion, fusion, and specialization sequence is not yet
+available as one authoritative Blorp path.
 
-Deleting `post_dce_program_json` or `core_emit_blorp_c.ml` before those stages
+Deleting `pre_dce_program_json` or `core_emit_blorp_c.ml` before those stages
 move would skip production transformations. That is not an acceptable bridge
 cleanup.
 
@@ -132,7 +134,7 @@ This is compiler-internal discipline, not a user-visible language change.
 - the unresolved/resolved `UserCall` contract redesign;
 - pre-Core ASan failures in dimensions, CTFE, inference, or typecheck state;
 - adding the broad compiler-owned ASan suite to premerge;
-- deleting the post-DCE JSON handoff;
+- deleting the pre-DCE JSON handoff;
 - changing source-language ownership or ARC semantics;
 - serializing and decoding Core to manufacture copies;
 - suppressing releases or accepting leaks.
@@ -704,14 +706,14 @@ For each stage, record:
 
 ### H2. Apply the bridge deletion rule
 
-Delete `post_dce_program_json`, the relevant projection code in
+Delete `pre_dce_program_json`, the relevant projection code in
 `core_emit_blorp_c.ml`, or its bridge action only when no production stage on
 the left still needs to send an OCaml `Core.core_program` to a Blorp stage on
 the right.
 
-If any stage from debug through DCE remains OCaml-authoritative, the post-DCE
-handoff remains structurally necessary. Continue porting the next contiguous
-left-side stage instead of disguising the handoff.
+If any stage from debug through specialization remains OCaml-authoritative, the
+pre-DCE handoff remains structurally necessary. Continue porting the next
+contiguous left-side stage instead of disguising the handoff.
 
 ### H3. Keep one handoff during migration
 
@@ -735,6 +737,11 @@ older ownership plan. Resume it only when the next production stage requires
 the distinction or a focused ownership/correctness test proves the current
 state ambiguous.
 
+ASan proved that projected match-binding modes can still assume ownership while
+the inferred function contract says borrow. Move function-contract and
+match-binding ownership derivation into Blorp together before removing the
+conservative managed-return guard.
+
 ### Exit criteria
 
 - the ownership branch is merged before boundary work starts;
@@ -745,21 +752,29 @@ state ambiguous.
 ## Separate Pre-Core ASan Backlog
 
 The broad compiler-owned ASan run exposed failures outside this checkpoint.
-Track them separately, in production order:
+Track them separately, in production order.
 
-1. `compiler_dim_solver`
-   - monomial/canonical-list lifetime during solve and solve-diff;
-   - observed from `test_compiler_dim_solver`, `test_compiler_context`, and
-     dimension-constrained inference tests.
-2. `compiler_ctfe_pattern`
+Resolved on 2026-07-11:
+
+- `compiler_dim_solver` no longer returns its mutable monomial result directly
+  from the final `match` branch, which caused the branch-local owner to release
+  the list before solve and solve-diff consumed it. Fresh ASan runs pass
+  `test_compiler_dim_solver` (7/7), `test_compiler_context` (14/14), and
+  `test_compiler_infer` (196/196).
+- Perceus result retention now reconstructs a matched mutable `LetExpr` before
+  recursing into its result-position body. The body is copied first, so neither
+  parent destruction nor C constructor-argument evaluation order can invalidate
+  it. Fresh normal and ASan runs pass `test_compiler_core_perceus` (132/132),
+  including the mutable loop-then-forward regression.
+
+Remaining:
+
+1. `compiler_ctfe_pattern`
    - binding a selected match-case payload into CTFE context;
    - observed from `test_compiler_ctfe_eval`.
-3. `compiler_typecheck_state`
+2. `compiler_typecheck_state`
    - selective import bindings and constructor metadata;
    - observed from `test_compiler_typecheck_decl`.
-4. `compiler_infer`
-   - dimension-constraint checking paths that retain solver results;
-   - observed from `test_compiler_infer`.
 
 Backlog rules:
 

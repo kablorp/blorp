@@ -1,5 +1,8 @@
 import:
-	../src/stage_06_typecheck/compiler_typecheck_bridge: handle_request
+	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		handle_request,
+		stream_typecheck_graph_request_value,
+	channel: Channel, channel, recv, seal, send
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -232,6 +235,14 @@ pure func error_code(value: JsonValue) -> String:
 			""
 
 
+pure func error_message(value: JsonValue) -> String:
+	match get_field(value, "error"):
+		Some(error):
+			string_field(error, "message")
+		None:
+			""
+
+
 pure func typecheck_source_request(source: String) -> String:
 	request_json("typecheck_source", JsonObject([
 			("path", JsonString("main.brp")),
@@ -302,6 +313,41 @@ pure func typecheck_graph_request(
 		]))
 
 
+func streamed_graph_responses(request: String, expected_count: Int) -> Option[List[JsonValue]]:
+	match parse_json(request):
+		Ok(root):
+			responses: Channel[String] = channel(expected_count + 1)
+			streamed = stream_typecheck_graph_request_value(root, func(response):
+				_ = send(responses, response)
+			)
+			seal(responses)
+
+			if not streamed:
+				None
+			else:
+				var values: List[JsonValue] = []
+				var failed: Bool = False
+
+				while True:
+					match recv(responses):
+						Some(response):
+							match parse_json(response):
+								Ok(value):
+									values = values.append(value)
+								Err(_):
+									failed = True
+									break
+						None:
+							break
+
+				if failed or values.length() != expected_count:
+					None
+				else:
+					Some(values)
+		Err(_):
+			None
+
+
 pure func json_string_array_contains(items: List[JsonValue], needle: String) -> Bool:
 	var found: Bool = False
 
@@ -341,7 +387,7 @@ pure func test_typecheck_source_returns_typed_program_artifact() -> Bool:
 			False
 
 
-pure func test_typecheck_graph_returns_module_and_target_artifacts() -> Bool:
+func test_typecheck_graph_returns_module_and_target_artifacts() -> Bool:
 	dep: JsonValue = user_import_module_json("dep", "dep", "pure func answer() -> Int:\n\t41")
 	unused: JsonValue = user_import_module_json(
 		"unused",
@@ -360,44 +406,34 @@ pure func test_typecheck_graph_returns_module_and_target_artifacts() -> Bool:
 	)
 
 	match (
-		response_value(
+		streamed_graph_responses(
 			typecheck_graph_request(
 				target,
 				[dep, unused, context],
 				["unused", "dep"],
 			),
+			3,
 		)
 	):
-		Some(response):
-			match get_field(response, "artifact"):
-				Some(graph):
-					modules: List[JsonValue] = match get_field(graph, "modules"):
-						Some(module_values):
-							as_array(module_values).get_or([])
-						None:
-							[]
+		Some(responses):
+			unused_response = responses.get_or(0, JsonNull)
+			dep_response = responses.get_or(1, JsonNull)
+			target_response = responses.get_or(2, JsonNull)
 
-					match get_field(graph, "target"):
-						Some(target_artifact):
-							bool_field(response, "ok") and modules.length() == 2 and string_field(
-								modules.get_or(0, JsonNull),
-								"path",
-							) == "unused.brp" and string_field(
-								modules.get_or(1, JsonNull),
-								"path",
-							) == "dep.brp" and json_array_length(
-								modules.get_or(0, JsonNull),
-								"type_errors",
-							) == 0 and json_array_length(target_artifact, "type_errors") == 0
-						None:
-							False
-				None:
-					False
+			(
+				bool_field(unused_response, "ok")
+				and bool_field(dep_response, "ok")
+				and bool_field(target_response, "ok")
+				and artifact_string_field(unused_response, "path") == "unused.brp"
+				and artifact_string_field(dep_response, "path") == "dep.brp"
+				and artifact_array_length(unused_response, "type_errors") == 0
+				and artifact_array_length(target_response, "type_errors") == 0
+			)
 		None:
 			False
 
 
-pure func test_typecheck_graph_handles_shared_import_context() -> Bool:
+func test_typecheck_graph_handles_shared_import_context() -> Bool:
 	base: JsonValue = user_import_module_json("base", "base", "pure func answer() -> Int:\n\t41")
 	left: JsonValue = user_import_module_json(
 		"left",
@@ -419,38 +455,71 @@ pure func test_typecheck_graph_handles_shared_import_context() -> Bool:
 	target: JsonValue = user_import_module_json("main", "main", target_text)
 
 	match (
-		response_value(
+		streamed_graph_responses(
 			typecheck_graph_request(
 				target,
 				[base, left, right],
 				["left", "right"],
 			),
+			3,
 		)
 	):
-		Some(response):
-			match artifact_field(response, "modules"):
-				Some(module_values):
-					modules: List[JsonValue] = as_array(module_values).get_or([])
+		Some(responses):
+			left_response = responses.get_or(0, JsonNull)
+			right_response = responses.get_or(1, JsonNull)
+			target_response = responses.get_or(2, JsonNull)
 
-					match artifact_field(response, "target"):
-						Some(target_artifact):
-							(
-								bool_field(response, "ok")
-								and modules.length() == 2
-								and json_array_length(
-									modules.get_or(0, JsonNull),
-									"type_errors",
-								) == 0
-								and json_array_length(
-									modules.get_or(1, JsonNull),
-									"type_errors",
-								) == 0
-								and json_array_length(target_artifact, "type_errors") == 0
-							)
-						None:
-							False
-				None:
-					False
+			(
+				artifact_array_length(left_response, "type_errors") == 0
+				and artifact_array_length(right_response, "type_errors") == 0
+				and artifact_array_length(target_response, "type_errors") == 0
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
+	base: JsonValue = user_import_module_json("base", "base", "answer: Int = 41")
+	left_source: String =
+		|import:
+		|	base: answer
+		|
+		|left_answer: Int = answer
+	left: JsonValue = user_import_module_json("left", "left", left_source)
+	right_source: String =
+		|import:
+		|	base: answer
+		|
+		|right_answer: Int = answer
+	right: JsonValue = user_import_module_json("right", "right", right_source)
+	target_source: String =
+		|import:
+		|	base: answer
+		|
+		|main_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[base, left, right],
+				["left", "right"],
+			),
+			3,
+		)
+	):
+		Some(responses):
+			artifact_string_field(
+				responses.get_or(0, JsonNull),
+				"ctfe_status",
+			) == "evaluated" and artifact_string_field(
+				responses.get_or(1, JsonNull),
+				"ctfe_status",
+			) == "evaluated" and artifact_string_field(
+				responses.get_or(2, JsonNull),
+				"ctfe_status",
+			) == "evaluated"
 		None:
 			False
 
@@ -469,6 +538,83 @@ pure func test_typecheck_source_accepts_main_args_signature() -> Bool:
 					)
 				None:
 					False
+		None:
+			False
+
+
+func test_typecheck_graph_resolves_imported_global_annotation() -> Bool:
+	dep_source: String =
+		|record Box {value: Int}
+		|
+		|pure func make_box() -> Box:
+		|	{value = 1}
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: Box, make_box
+		|
+		|box: Box = make_box()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dep], []),
+		1,
+	):
+		Some(responses):
+			artifact_array_length(
+				responses.get_or(0, JsonNull),
+				"type_errors",
+			) == 0
+		None:
+			False
+
+
+func test_typecheck_graph_materializes_impure_function_reference() -> Bool:
+	target_source: String =
+		|record Suite {tests: List[() -> Bool]}
+		|
+		|func check() -> Bool:
+		|	True
+		|
+		|suite: Suite = {tests = [check]}
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [], []),
+		1,
+	):
+		Some(responses):
+			artifact_array_length(
+				responses.get_or(0, JsonNull),
+				"type_errors",
+			) == 0
+		None:
+			False
+
+
+func test_typecheck_graph_rejects_native_package_origin_alias() -> Bool:
+	target: JsonValue = JsonObject([
+		("path", JsonString("main.brp")),
+		("module", JsonString("main")),
+		("module_path", JsonString("main")),
+		("text", JsonString("value: Int = 1")),
+		("origin", JsonObject([
+			("kind", JsonString("native_package")),
+			("package", JsonString("legacy")),
+		])),
+	])
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				error_code(response) == "invalid_request"
+				and error_message(response).contains("one of user, std, source_package, pkg")
+			)
 		None:
 			False
 
@@ -1007,6 +1153,22 @@ tests: TestSuite = {
 		(
 			"typecheck_graph handles shared import context",
 			test_typecheck_graph_handles_shared_import_context,
+		),
+		(
+			"typecheck_graph evaluates shared CTFE dependency",
+			test_typecheck_graph_evaluates_shared_ctfe_dependency,
+		),
+		(
+			"typecheck_graph resolves imported global annotation",
+			test_typecheck_graph_resolves_imported_global_annotation,
+		),
+		(
+			"typecheck_graph materializes impure function reference",
+			test_typecheck_graph_materializes_impure_function_reference,
+		),
+		(
+			"typecheck_graph rejects native_package origin alias",
+			test_typecheck_graph_rejects_native_package_origin_alias,
 		),
 		(
 			"typecheck_source returns typed union decl",

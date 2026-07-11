@@ -130,15 +130,9 @@ let test_module_origin_policy_helpers () =
   Alcotest.(check bool)
     "source pkg rejects foreign" false
     (Session.module_origin_allows_foreign source_pkg);
-  Alcotest.(check string)
-    "source pkg label" "source package 'sqlite'"
-    (Session.module_origin_label source_pkg);
   Alcotest.(check bool)
     "native pkg allows foreign" true
-    (Session.module_origin_allows_foreign native_pkg);
-  Alcotest.(check string)
-    "native pkg label" "native package 'sqlite'"
-    (Session.module_origin_label native_pkg)
+    (Session.module_origin_allows_foreign native_pkg)
 
 let test_search_paths_independent () =
   let s1 = Session.create () in

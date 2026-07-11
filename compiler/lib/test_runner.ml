@@ -212,8 +212,6 @@ let ensure_run_artifacts () =
       current_run_artifacts := Some artifacts;
       artifacts
 
-let current_run_artifact_root () = (ensure_run_artifacts ()).root
-
 let with_run_artifacts f =
   match !current_run_artifacts with
   | Some _ -> f ()
@@ -527,8 +525,6 @@ let sanitizer_cc_args = function
       [ "-fsanitize=address,undefined"; "-fno-omit-frame-pointer"; "-g" ]
   | SanitizerUndefinedOnly ->
       [ "-fsanitize=undefined"; "-fno-omit-frame-pointer"; "-g" ]
-
-let sanitize_cc_args = sanitizer_cc_args SanitizerAddressUndefined
 
 (** Compile C code piped via stdin, avoiding temp file I/O.
     Uses `cc -x c - -x none` to read C from stdin, then resets the
@@ -1873,11 +1869,6 @@ let find_brp_file_infos ~leak_check dir =
   in
   List.rev (walk [] dir)
 
-let find_brp_files ?(leak_check = false) dir =
-  List.map
-    (fun info -> info.test_file_path)
-    (find_brp_file_infos ~leak_check dir)
-
 let collect_test_file_infos ~leak_check paths =
   let infos_for_path path =
     if is_directory path then find_brp_file_infos ~leak_check path
@@ -1887,16 +1878,6 @@ let collect_test_file_infos ~leak_check paths =
       | None -> []
   in
   List.fold_right (fun path acc -> infos_for_path path @ acc) paths []
-
-let collect_test_files paths =
-  let files_for_path path =
-    if is_directory path then find_brp_files path
-    else
-      match classify_valid_test_file ~leak_check:false path with
-      | Some info -> [ info.test_file_path ]
-      | None -> []
-  in
-  List.fold_right (fun path acc -> files_for_path path @ acc) paths []
 
 (* ============================================================================
    Test Wrapper Generation

@@ -254,12 +254,6 @@ let release_or_error ?(phase = Core_error.Other "type_layout")
     ?(loc = Ast.dummy_loc) meta ty =
   (layout_or_error ~phase ~loc meta ty).release
 
-let requires_release (layout : ownership_layout) =
-  match layout.release with ArcRelease -> true | NoReleaseNeeded -> false
-
-let requires_retain (layout : ownership_layout) =
-  match layout.retain with ArcRetain -> true | NoRetainNeeded -> false
-
 let classify_debug_heap_value (meta : metadata) (ty : Ast.type_expr) :
     debug_heap_classification =
   match classify meta ty with
@@ -308,14 +302,6 @@ let boxed_storage_release_or_error ?(phase = Core_error.Other "type_layout")
     | ty -> release_or_error ~phase ~loc meta ty
   in
   go [] ty
-
-let requires_release_or_error ?(phase = Core_error.Other "type_layout")
-    ?(loc = Ast.dummy_loc) (meta : metadata) (ty : Ast.type_expr) : bool =
-  layout_or_error ~phase ~loc meta ty |> requires_release
-
-let requires_retain_or_error ?(phase = Core_error.Other "type_layout")
-    ?(loc = Ast.dummy_loc) (meta : metadata) (ty : Ast.type_expr) : bool =
-  layout_or_error ~phase ~loc meta ty |> requires_retain
 
 let boxed_storage_requires_release_or_error
     ?(phase = Core_error.Other "type_layout") ?(loc = Ast.dummy_loc)

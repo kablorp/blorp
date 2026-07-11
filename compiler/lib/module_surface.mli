@@ -34,8 +34,6 @@ type t = {
 
 val symbol_kind_of_string : string -> (symbol_kind, string) result
 val symbol_kind_name : symbol_kind -> string
-val symbol_source_kind_name : symbol_source -> string
-val source_decl_index : symbol_source -> int option
 val export_names : t -> string list
 val private_names : t -> string list
 val import_module_names : t -> string list

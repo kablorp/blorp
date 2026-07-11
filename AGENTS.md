@@ -468,7 +468,6 @@ compiler/            # OCaml compiler implementation
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
-    core_dce.ml     # Core IR dead concrete function pruning
     core_consume_specialize.ml  # Core IR consuming-call specialization before Perceus
     core_perceus.ml   # Core IR Perceus RC insertion
     core_reuse.ml     # Core IR post-Perceus reuse analysis and prepared union reuse
