@@ -1548,12 +1548,14 @@ Current status:
   (`pipeline`, the private OCaml host tooling commands, package checking, REPL,
   and test runner). This keeps normal source-command work on the Blorp frontend
   graph while the remaining tooling paths are migrated deliberately.
-- The experimental multi-source typecheck bridge was removed. Real compiler
-  graphs produced very large aggregate typed-AST artifacts and exposed unsafe
-  generated ownership when several module artifacts shared one helper process.
-  Normal source commands use the prepared single-source typecheck helper with
-  explicit graph imports. Do not restore batching until the boundary can stream
-  results or its shared-value ownership is represented and proven explicitly.
+- The production `typecheck_graph` bridge streams one typed artifact at a time.
+  Its graph context parses and finalizes each source module once, constructs
+  the importable-module set once, and reuses those immutable values across
+  target typechecks. Semantic type projection now owns names copied from parsed
+  syntax, and unchanged type-resolution branches return deep copies, so reused
+  parsed declarations remain valid. The full CLI clean build dropped from a
+  typecheck helper exceeding 4.2 GB without completing to a successful roughly
+  143 second build with a 1.76 GB process-tree peak on macOS arm64.
 - Blorp now has the first CTFE value/operator foundation in
   `compiler_ctfe_value.brp`: typed compile-time values, constructor payload
   metadata, structural equality, expectation helpers, and primitive unary/binary
@@ -2107,32 +2109,28 @@ Current progress:
 
 Remaining cleanup after the ownership boundary move:
 
-- **Blocking ownership follow-up (confirmed 2026-07-10):** the committed
-  post-DCE boundary is not yet sanitizer-clean. `test_compiler_core_prepare`
-  has a heap-use-after-free in the nullable-Option tuple preparation case, and
-  `test_compiler_core_lower` exits 118 in the normal gate at the Result `?=`
-  lowering case. The failures come from managed Core values reused across
-  transformed results without one ownership model shared by Perceus and the
-  late backend.
-- Before moving the boundary left of DCE, replace the overloaded
-  `UserCall(..., consumed_args = [])` state with a phase-explicit call contract
-  model. It must distinguish unresolved input, proven borrow-all, proven
-  consuming arguments, and a result that may alias a preserved argument.
-  Perceus must resolve the contract before closure/reuse/emission; the late
-  backend must not reinterpret an unresolved call independently.
-- The call contract is necessary but not sufficient. A prototype carrying the
-  complete contract fixed the nullable-Option prepare failure, but the Result
-  lowering and Perceus suites then exposed unretained aliases when one
-  recursive Core value was installed into several fields of a returned
-  aggregate. Complete the temporary compiler-internal no-sharing discipline in
-  `COMPILER_OWNERSHIP_HARDENING_ROADMAP.md` before retrying the call-state
-  migration. This is a self-contained conservative implementation strategy;
-  it does not change the language's value-semantics contract.
-- Regression gates for that model must include the nullable-Option prepare
+- **Blocking ownership stabilization (re-scoped 2026-07-10):** follow
+  `COMPILER_OWNERSHIP_HARDENING_ROADMAP.md` to land the two confirmed Core
+  lower/prepare fixes and the focused Core ASan gate as one narrow checkpoint.
+  The Result `?=` and nullable-Option tuple regressions now pass individually
+  under ASan on the working branch, and the combined focused Core surface has
+  passed 588/588. The checkpoint is not complete until unrelated diff churn is
+  removed and the documented merge gate passes.
+- Do not require an exhaustive Core clone framework, a compiler-wide pass
+  audit, or pre-Core ASan cleanup before resuming contiguous migration. The
+  broad compiler-owned ASan run has separate dimension-solver, CTFE, inference,
+  and typecheck-state debt; those failures do not invalidate a clean late-Core
+  boundary.
+- Defer the phase-explicit `UserCall` contract redesign until the next
+  production boundary move requires it or a focused correctness regression
+  proves the current state ambiguous. Do not mix that representation change
+  into the narrow ownership checkpoint.
+- The narrow ownership merge gate must include the nullable-Option prepare
   case, Result `?=` Core lowering, owned-union reuse, channel receive, task
   result aliases, file-resource cleanup, and mutable aggregate assignment.
-  A conservative consume-all fallback avoids the use-after-free but regresses
-  reuse and leak coverage, so it is not an acceptable production fix.
+  A conservative consume-all fallback may hide a use-after-free while
+  regressing reuse and leak coverage, so it is not an acceptable production
+  fix.
 - Keep extending runtime leak and sanitizer coverage as new ownership-bearing
   Core forms are introduced. New forms must be represented in the shared Core
   traversal and fail closed when their call contract is unknown.

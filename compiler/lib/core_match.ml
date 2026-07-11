@@ -509,12 +509,17 @@ let drop_unused_spread_bindings body bindings =
       | _ -> true)
     bindings
 
+let pattern_match_binding (var, accessor) =
+  match accessor with
+  | AccListSpread _ -> match_binding ~mode:MatchOwn var accessor
+  | _ -> borrowed_match_binding var accessor
+
 let ct_leaf bindings body =
   CTLeaf
     {
       ct_bindings =
         drop_unused_spread_bindings body bindings
-        |> List.map (fun (v, acc) -> borrowed_match_binding v acc);
+        |> List.map pattern_match_binding;
       ct_body = body;
     }
 

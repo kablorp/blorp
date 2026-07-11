@@ -140,6 +140,101 @@ fi
 
 echo "PASS: scripts/test std-check is explicit"
 
+mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
+compiler_blorp_sanitize_log="$TMP_HARNESS/compiler-blorp-sanitize-log.txt"
+cat > "$TMP_HARNESS/blorp" <<SH
+#!/usr/bin/env bash
+set -u
+
+if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
+	prepare_dir="\${2:-}"
+	mkdir -p "\$prepare_dir"
+	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=\$prepare_dir/compiler_renderer_bridge.bin"
+	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
+	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=\$prepare_dir/compiler_typecheck_bridge.bin"
+	exit 0
+fi
+
+if [ "\${1:-}" = "test" ]; then
+	echo "\$*" >> "$compiler_blorp_sanitize_log"
+	echo "Results: 1 passed, 0 failed (1 tests)"
+	echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT:-missing} status=PASS passed=1 failed=0 tests=1"
+	exit 0
+fi
+
+echo "unexpected fake blorp command: \$*" >&2
+exit 2
+SH
+chmod +x "$TMP_HARNESS/blorp"
+
+compiler_blorp_sanitize_output="$TMP_HARNESS/compiler-blorp-sanitize-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test compiler-blorp-sanitize --serial
+) > "$compiler_blorp_sanitize_output" 2>&1
+compiler_blorp_sanitize_status=$?
+
+if [ "$compiler_blorp_sanitize_status" -ne 0 ]; then
+	echo "FAIL: scripts/test compiler-blorp-sanitize should run as an explicit gate"
+	cat "$compiler_blorp_sanitize_output"
+	exit 1
+fi
+
+if ! grep -Fxq 'test --no-format --no-cache --sanitize -j 1 --timeout 30 compiler/blorp/tests/' "$compiler_blorp_sanitize_log"; then
+	echo "FAIL: compiler-blorp-sanitize should be uncached, sanitized, and sequential"
+	cat "$compiler_blorp_sanitize_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+if ! grep -Eq 'Compiler-Blorp-ASan[[:space:]]+PASS' "$compiler_blorp_sanitize_output"; then
+	echo "FAIL: scripts/test should render the compiler Blorp sanitizer gate"
+	cat "$compiler_blorp_sanitize_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test exposes an uncached compiler Blorp sanitizer gate"
+
+: > "$compiler_blorp_sanitize_log"
+compiler_core_sanitize_output="$TMP_HARNESS/compiler-core-sanitize-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test compiler-core-sanitize --serial
+) > "$compiler_core_sanitize_output" 2>&1
+compiler_core_sanitize_status=$?
+
+if [ "$compiler_core_sanitize_status" -ne 0 ]; then
+	echo "FAIL: scripts/test compiler-core-sanitize should run as an explicit gate"
+	cat "$compiler_core_sanitize_output"
+	exit 1
+fi
+
+expected_core_sanitize_command='test --no-format --no-cache --sanitize -j 1 --timeout 30 compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp'
+if ! grep -Fxq "$expected_core_sanitize_command" "$compiler_blorp_sanitize_log"; then
+	echo "FAIL: compiler-core-sanitize should use the explicit uncached serial Core file set"
+	cat "$compiler_core_sanitize_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+if ! grep -Eq 'Compiler-Core-ASan[[:space:]]+PASS' "$compiler_core_sanitize_output"; then
+	echo "FAIL: scripts/test should render the focused compiler Core sanitizer gate"
+	cat "$compiler_core_sanitize_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test exposes the explicit focused compiler Core sanitizer gate"
+
 mkdir -p "$TMP_HARNESS/tests/test_compiler"
 cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh" <<'SH'
 #!/usr/bin/env bash

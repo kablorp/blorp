@@ -1,604 +1,805 @@
-# Compiler Ownership Hardening Roadmap
+# Late-Core Ownership Stabilization Roadmap
 
-Status: planned on 2026-07-10. This roadmap blocks further movement of the
-production compiler boundary to the left of Core DCE.
+Status: revised on 2026-07-10 after implementation and sanitizer probing.
 
-## Decision
+This roadmap replaces the earlier compiler-wide cloning plan. That plan mixed
+three different jobs:
 
-Until Blorp's general aggregate ownership analysis is stronger, compiler-owned
-Blorp code will follow a stricter implementation discipline:
+1. fixing two concrete late-Core ownership failures;
+2. hardening every Blorp compiler stage under ASan;
+3. removing the OCaml-to-Blorp Core handoff.
 
-> A managed Core value must not be installed into more than one owning output
-> position. Clone it for every additional owner, and clone transformed metadata
-> rather than sharing it with the input tree.
+Those jobs have different boundaries and completion criteria. Treating them as
+one project caused broad copy refactors, expensive rebuilds, and unrelated
+pre-Core failures without moving the production boundary. This roadmap keeps
+them separate.
 
-This is a compiler-internal restriction, not a change to Blorp's language
-semantics. Source-level assignment and aggregate construction still promise
-value semantics. The restriction gives the self-hosted compiler a conservative,
-reviewable implementation path while preserving those semantics.
+## Immediate Objective
 
-The resulting work must be production-ready on its own. It must not disable
-ARC, leak values, rely on a future call-contract change, or require a later
-Perceus fix to be correct.
+Produce one self-contained, mergeable checkpoint that makes the currently
+implemented Core surface sanitizer-clean without changing Core semantics or
+redesigning Blorp ownership generally.
 
-## Due Diligence Findings
+The checkpoint must:
 
-### Production boundary
+- fix the known Result `?=` Core-lowering use-after-free;
+- fix the known nullable-Option tuple-preparation use-after-free;
+- provide only the small, phase-neutral reconstruction helpers those fixes
+  require;
+- add a focused, uncached Core ASan gate;
+- preserve normal Core JSON and generated-C behavior;
+- pass the existing late-Core test surface under ASan;
+- avoid unrelated pre-Core ownership work;
+- avoid a call-contract representation change;
+- avoid a pass-wide or JSON-round-trip clone.
 
-Normal compilation currently hands post-DCE Core from OCaml to Blorp. The
-Blorp-owned tail runs, in order:
+When this checkpoint is complete, return immediately to the compiler migration
+roadmap. Do not continue expanding ownership infrastructure without a concrete
+production-path failure.
 
-1. consume specialization;
-2. Perceus;
-3. post-Perceus reuse;
-4. closure conversion;
-5. resource lowering;
-6. fairness insertion;
-7. Core preparation;
-8. prepared reuse;
-9. C emission.
+## Architectural Facts
 
-The ordering is centralized in
-`compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`. The workaround
-can therefore be audited by phase without adding another bridge or changing
-pipeline order.
+### Current production handoff
 
-### Confirmed failures
-
-The committed post-DCE boundary is not sanitizer-clean:
-
-- `test_compiler_core_prepare.brp` has a heap-use-after-free in the nullable
-  `Option[String]` tuple preparation case.
-- `test_compiler_core_lower.brp` exits 118 in the Result `?=` lowering case;
-  ASan identifies shared recursive `CoreType` storage.
-
-A discarded prototype established that the workaround is viable:
-
-- a complete call-contract prototype plus explicit copies made Core prepare
-  pass 28/28 under ASan;
-- explicit `CoreType`/`CoreVar` copies made Core lower pass 60/60 under ASan;
-- the next ASan failure was another instance of the same pattern in Perceus
-  function metadata, not a new representation or pipeline problem.
-
-These results are diagnostic evidence only. None of the prototype source
-changes remain in the worktree.
-
-### Existing copy code
-
-Copy logic already exists, but it is duplicated and incomplete:
-
-- `compiler_core_perceus.brp` has private `copy_core_var`, `copy_core_type`,
-  `copy_core_param`, and `copy_expr` helpers. It has roughly 300
-  `copy_core_type` call sites.
-- `compiler_core_consume_specialize.brp` independently implements the same
-  families and has roughly 50 `copy_core_type` call sites.
-- Perceus's `copy_expr` falls back to
-  `CoreTraverse.map_core_expr_children`. That traversal maps child expressions
-  but deliberately preserves types, variables, names, bindings, locations,
-  call metadata, and other non-child fields.
-- Consume specialization's `copy_expr` handles only a small subset of
-  `CoreExpr` and returns the original expression for all other variants.
-- Several helpers called `copy_strings` or `copy_ints` currently return the
-  original list. They do not satisfy the no-sharing discipline.
-
-Promoting either implementation would preserve the bug. The canonical clone
-implementation must be built from the typed Core schema instead.
-
-### Test coverage gap
-
-All 72 files under `compiler/blorp/tests` are `TestSuite` files, but the normal
-`compiler-deep` gate runs them without a sanitizer. `make test-asan` covers
-runtime roots, not `compiler/blorp/tests`; on Darwin it also selects UBSan
-instead of ASan for the fiber-heavy runtime suite.
-
-The compiler-owned suites do not require the runtime fiber workaround. They
-need a dedicated ASan invocation so a pass cannot appear correct merely because
-the dangling value remains readable in an unsanitized run.
-
-### Scope assessment
-
-The path is substantial but straightforward:
-
-- it adds no Core variants, runtime ABI, JSON bridge fields, or OCaml logic;
-- the canonical clone module is mechanically derived from the closed Core
-  schema and checked by exhaustive matching;
-- only two production modules currently own competing copy implementations;
-- eight ordered production pass boundaries require review;
-- the principal uncertainty is clone-site coverage, which the dedicated ASan
-  gate makes observable one failure at a time.
-
-The largest change will be the exhaustive clone module. Its size is expected
-because `CoreExpr` and its supporting records are large; its logic should remain
-regular and phase-neutral.
-
-## Scope
-
-Included:
-
-- canonical deep-clone operations for the Core JSON model;
-- removal of duplicate and identity-returning compiler copy helpers;
-- targeted clones at compiler transformation construction boundaries;
-- ASan and leak gates for compiler-owned Blorp modules;
-- a left-to-right audit from Core lowering through C emission;
-- documentation of the temporary compiler discipline.
-
-Excluded from this roadmap:
-
-- changing user-visible value semantics;
-- exposing clone APIs in `std`;
-- resolving the `UserCall(..., consumed_args = [])` ambiguity;
-- moving the production bridge farther left;
-- serializing and decoding Core merely to break sharing;
-- disabling releases, leaking input trees, or treating every call as consuming;
-- redesigning Perceus's general alias provenance model.
-
-The call-contract migration resumes only after this roadmap's exit gate passes.
-
-## Required Invariants
-
-### Output ownership
-
-For every compiler transformation:
-
-- the input and output may be destroyed in either order;
-- two owning fields in the output must not depend on one unretained managed
-  child;
-- a borrowed child extracted from `CoreType`, `CoreExpr`, `Option`, `Result`, a
-  record, tuple, union, or list must be cloned before storage;
-- unchanged declarations and metadata copied into a new `CoreProgram` must be
-  cloned, not returned directly;
-- primitive fields and enums may be copied directly.
-
-### Clone implementation
-
-The canonical clone module must:
-
-- allocate a distinct value for every managed occurrence;
-- clone strings with an allocating string operation, except immortal empty
-  strings;
-- rebuild lists instead of returning the original list;
-- recursively clone `Option` and every managed field in records and unions;
-- use exhaustive matches without wildcard identity fallbacks;
-- construct records explicitly rather than use record update when the record
-  has managed fields;
-- import the Core model but not Perceus, reuse, closure, prepare, or emission.
-
-These constraints keep the dependency direction:
+OCaml currently owns Core through DCE. The default backend path then performs
+one post-DCE JSON handoff to Blorp:
 
 ```text
-compiler_core_json
-        |
-        v
-compiler_core_clone
-        |
-        +--> core lower
-        +--> consume specialization
-        +--> Perceus
-        +--> reuse / closure / resource / fairness / prepare
+OCaml lower -> debug -> desugar/SSA -> mono -> synth -> match
+  -> trait resolve -> resolve -> std inline -> tailrec -> fusion
+  -> specialize -> DCE
+  -> Core JSON handoff
+  -> Blorp consume specialize -> Perceus -> reuse -> closure
+  -> resource -> fairness -> prepare -> prepared reuse -> C emission
 ```
 
-## Checkpoint 0: Freeze The Baseline
+Relevant entry points:
 
-Goal: turn the two known crashes and the general sharing shape into stable,
-focused regressions before refactoring copy code.
+- `compiler/lib/core_pipeline.ml`
+  - `post_dce_program_json`
+  - `observe_blorp_tail_json`
+  - `emit_via_c_backend`
+- `compiler/lib/core_emit_blorp_c.ml`
+  - temporary OCaml Core-to-JSON projection
+- `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
+  - `run_post_dce_tail`
+  - `run_core_pipeline_stage`
+- `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
 
-Files:
+The Blorp tail order is already centralized. Do not add another handoff or
+duplicate pass ordering while fixing ownership.
 
-- `compiler/blorp/tests/test_compiler_core_prepare.brp`
-- `compiler/blorp/tests/test_compiler_core_lower.brp`
-- new `compiler/blorp/tests/test_compiler_core_clone.brp`
-- `tests/test_blorp/memory/test_mutable_assignment_memory.brp`
+### What this checkpoint does not unlock by itself
 
-Work:
+Ownership stabilization does not make the post-DCE handoff deletable. Blorp
+does not yet have production equivalents for every Core stage between lowering
+and DCE. In particular, the complete debug, SSA, monomorphization, synthesis,
+match compilation, resolution, inlining, tail-recursion, fusion,
+specialization, and DCE sequence is not yet available as one authoritative
+Blorp path.
 
-1. Preserve the nullable-Option tuple and Result `?=` failures as named tests.
-2. Add minimal compiler-shaped records that store one recursive managed value
-   in two fields, including:
-   - `CoreType` in two expression/binding positions;
-   - one `CoreVar` in a binding and a reference;
-   - one `String` in two function metadata fields;
-   - one `List[CoreParam]` in two function-like records;
-   - payloads extracted from `Option` and `Result` and then stored.
-3. Keep both original and transformed values live, inspect both through JSON,
-   and let both destruct at function exit. This catches input/output sharing as
-   well as duplicate output ownership.
-4. Add a small ordinary-language aggregate-sharing regression under
-   `tests/test_blorp/memory`; this records that the workaround is compiler-only
-   and must not weaken source value semantics.
+Deleting `post_dce_program_json` or `core_emit_blorp_c.ml` before those stages
+move would skip production transformations. That is not an acceptable bridge
+cleanup.
 
-Commands:
+The ownership checkpoint instead establishes a stable late-Core destination
+for the next leftward boundary move.
+
+## Ownership Rule For This Checkpoint
+
+Use ownership-preserving reconstruction at concrete construction sites:
+
+> When a transformation installs a managed input or extracted child into a new
+> owning aggregate and the original owner remains live, reconstruct the value
+> for the new position.
+
+This is narrower than “deep-copy every Core value.” Blorp value semantics may
+share immutable backing storage when ARC correctly retains it. The goal is not
+pointer inequality. The goal is that every owner can be destroyed safely.
+
+Required properties:
+
+- input and output may remain live and be inspected together;
+- input and output may be destroyed in either order;
+- a binder and a reference do not depend on one unretained `CoreVar` record;
+- multiple expression positions do not depend on one unretained recursive
+  `CoreType` aggregate;
+- a transformed node never returns an input union node unchanged when the
+  caller will retain both trees;
+- primitive values and enums are copied directly;
+- strings may be assigned into a freshly reconstructed record and retained by
+  normal value semantics; do not force string concatenation merely to obtain a
+  different address.
+
+This is compiler-internal discipline, not a user-visible language change.
+
+## Scope Lock
+
+### Included
+
+- the two confirmed lower/prepare failures;
+- `CoreVar`, `CoreType`, `CoreLiteral`, and `CoreSourceLoc` reconstruction;
+- focused tests that keep original and reconstructed values live;
+- focused Core ASan test orchestration;
+- minimal cleanup necessary to keep one implementation of those four helpers;
+- normal, leak, codegen, quality, and clean-build verification.
+
+### Explicitly deferred
+
+- an exhaustive `clone_core_expr` or `clone_core_program` framework;
+- mechanical replacement of every `copy_*` helper in every Core pass;
+- a left-to-right audit of every pass without an ASan failure;
+- the unresolved/resolved `UserCall` contract redesign;
+- pre-Core ASan failures in dimensions, CTFE, inference, or typecheck state;
+- adding the broad compiler-owned ASan suite to premerge;
+- deleting the post-DCE JSON handoff;
+- changing source-language ownership or ARC semantics;
+- serializing and decoding Core to manufacture copies;
+- suppressing releases or accepting leaks.
+
+### Stop condition
+
+Stop ownership work when all focused Core suites pass together under ASan and
+the merge gate below is clean. A broad compiler-owned ASan failure outside the
+focused Core set is recorded separately and does not extend this checkpoint.
+
+## Known Evidence
+
+Before the current fixes:
+
+- `test_compiler_core_lower.brp` failed under ASan in
+  `test_lowers_question_bind_result_to_constructor_match` while destroying a
+  recursively nested `CoreType`;
+- `test_compiler_core_prepare.brp` failed under ASan in
+  `test_prepare_converts_nullable_option_tuple_literal` while destroying a
+  transformed `CoreExpr` child.
+
+After the focused reconstruction changes:
+
+- Core lower passed 60/60 under ASan;
+- Core prepare passed 28/28 under ASan;
+- consume specialization and Perceus passed 127/127 together under ASan;
+- all 14 `test_compiler_core_*.brp` files passed 588/588 together under ASan.
+
+A separate full `compiler/blorp/tests/` ASan run reached 1,240 passing tests
+before reporting pre-Core failures. Those failures are listed in the backlog
+at the end of this document and are not evidence that the late-Core checkpoint
+failed.
+
+### Bootstrap compatibility experiment
+
+An older released compiler can reduce bootstrap cost only if it also accepts
+the current language surface and ownership registry. Probing immutable dev
+releases produced this matrix on macOS arm64:
+
+| Bootstrap | Current source | Result |
+|---|---|---|
+| `dev-9f56c40d2b91` | `compiler_bridge_cli.brp` | Compiles in 5.98s with a 519 MB peak |
+| `dev-9f56c40d2b91` | `compiler_cli_main.brp` | Fails: missing `blorp_process_run_inherit` ownership contract |
+| `dev-9f56c40d2b91` | `test_compiler_core_lower.brp` | Fails: predates current typed match-expression behavior |
+| pinned `dev-33e00c2b94df` | `compiler_cli_main.brp` | Fails on the same missing process ownership contract |
+| `dev-fb008fe4ffb2` | `compiler_cli_main.brp` | Has the contract but grows to 6.85 GB; stopped before OOM |
+
+Setting `BLORP_COMPILER_BRIDGE_BIN` to the old binary does not bypass current
+compiler behavior during `make install`: it uses the old binary to build fresh
+current-source bridge helpers. The typecheck helper then processes the full CLI
+source graph and still exhibits the multi-gigabyte path.
+
+Conclusion: do not repin to `dev-9f56c40d2b91`. It is useful only for narrow
+source files that avoid newer syntax and contracts. Use the supported pinned
+bootstrap path for correctness rather than hiding build problems behind an
+incompatible binary.
+
+### Current verification status
+
+The narrow ownership implementation currently has the following evidence:
+
+- clone, lower, and prepare pass 92/92 normally;
+- all 14 focused Core files pass 588/588 under ASan and UBSan;
+- the test-runner harness passes, including exact focused-gate arguments;
+- `make quality` passes;
+- formatter checks for the two new files and `git diff --check` pass.
+- a clean `make install` completes in about 143 seconds with a 1.76 GB peak RSS.
+
+The clean-build blocker was repeated graph preparation, not the bootstrap
+binary. The typecheck bridge reparsed and finalized every imported module for
+every streamed artifact. It now prepares each module once and reuses explicit
+prepared-program and importable-module values. That exposed two real semantic
+type ownership bugs, now fixed at parsed-type projection and unchanged
+semantic-type transformation branches. The build recipe also stops on a failed
+CLI compilation and publishes the binary and input hash atomically instead of
+linking stale generated C.
+
+The broader compiler-deep, runtime, and standard leak gates still must pass
+before the combined branch is described as merge-ready. Current results are:
+
+- fast compiler: 1,485/1,485 pass;
+- compiler-deep: 94 pass and 98 fail on existing frontend-parity gaps;
+- runtime: 4,107 pass with one direct failure plus combined-harness failures;
+- leak: 28 pass and four fail.
+
+Representative failures reproduce with the previous cached typecheck helper:
+`dim_constant_fold.brp` reports the same tensor trait/bounds errors, and
+`test_url.brp` returns the same status 106. These failures are not regressions
+from prepared graph reuse, but they remain real migration debt and keep the
+full merge gate red.
+
+## Checkpoint A: Reduce The Current Diff To The Scope Lock
+
+Goal: make the branch reviewable before adding more behavior.
+
+### Keep
+
+- `compiler/blorp/src/stage_09_core/compiler_core_clone.brp`, limited to:
+  - `clone_core_var`;
+  - `clone_core_type`;
+  - `clone_core_literal`;
+  - `clone_core_source_loc`;
+- `compiler/blorp/tests/test_compiler_core_clone.brp`;
+- the Result `?=` changes in
+  `compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`;
+- the leaf and tuple changes in
+  `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`;
+- the focused sanitizer gate and its shell-harness regression;
+- imports of the four canonical helpers where a retained ASan regression
+  proves they are needed.
+
+### Remove or defer from this checkpoint
+
+- broad `copy_core_type`/`copy_core_var` call-site renames that produce review
+  churn without fixing a failing test;
+- whole-file formatter churn unrelated to the ownership hunks;
+- unused clone-list wrappers;
+- comments or APIs promising an exhaustive Core clone implementation;
+- premerge wiring for the broad compiler-owned ASan run.
+
+### Procedure
+
+1. Inspect `git diff --stat` and `git diff --word-diff=plain` for each touched
+   compiler file.
+2. Classify every hunk as one of:
+   - required by a reproduced ASan failure;
+   - required test/gate support;
+   - formatting-only;
+   - mechanical cleanup without a failure.
+3. Keep only the first two classes.
+4. Re-run `rg` for newly unused helpers and imports.
+5. Run `git diff --check`.
+
+### Pitfalls
+
+- Do not use a destructive worktree reset. The branch may contain user changes;
+  reduce only known Codex-authored hunks.
+- The current formatter can reorder and reflow an entire older file. A
+  formatter-clean result is not worth hundreds of unrelated lines in this
+  checkpoint. Format new files; keep edits in old files locally styled.
+- A helper rename across hundreds of call sites is not “free cleanup.” It
+  increases review cost and invalidates the self-hosted CLI build cache.
+
+### Exit criteria
+
+- every remaining compiler hunk has a named regression or gate purpose;
+- no touched production file has broad formatting-only movement;
+- no unused helper or import remains;
+- the diff can be reviewed pass by pass without reconstructing mechanical
+  rename history.
+
+## Checkpoint B: Establish Two Sanitizer Scopes
+
+Goal: distinguish the merge-blocking Core gate from broader diagnostic debt.
+
+### B1. Focused Core gate
+
+Add or retain a `compiler-core-sanitize` gate with an explicit file list. Do
+not rely on a shell glob inside the long-term script because future files would
+silently change the gate’s scope.
+
+Required files:
+
+```text
+compiler/blorp/tests/test_compiler_core_clone.brp
+compiler/blorp/tests/test_compiler_core_closure.brp
+compiler/blorp/tests/test_compiler_core_consume_specialize.brp
+compiler/blorp/tests/test_compiler_core_desugar.brp
+compiler/blorp/tests/test_compiler_core_emit.brp
+compiler/blorp/tests/test_compiler_core_emit_type_layout.brp
+compiler/blorp/tests/test_compiler_core_fairness.brp
+compiler/blorp/tests/test_compiler_core_json.brp
+compiler/blorp/tests/test_compiler_core_lower.brp
+compiler/blorp/tests/test_compiler_core_ownership.brp
+compiler/blorp/tests/test_compiler_core_perceus.brp
+compiler/blorp/tests/test_compiler_core_prepare.brp
+compiler/blorp/tests/test_compiler_core_resource.brp
+compiler/blorp/tests/test_compiler_core_reuse.brp
+```
+
+Invocation contract:
 
 ```bash
-./blorp test --no-format --no-cache --sanitize -j 1 \
-  compiler/blorp/tests/test_compiler_core_prepare.brp \
-  compiler/blorp/tests/test_compiler_core_lower.brp
-./blorp test --no-format --no-cache --leak-check --suite -j 1 \
-  tests/test_blorp/memory/test_mutable_assignment_memory.brp
+./blorp test --no-format --no-cache --sanitize -j 1 --timeout 60 \
+  <explicit Core files>
 ```
 
-Exit criteria:
+Required behavior:
 
-- failures reproduce deterministically before the implementation change;
-- failure names identify the owning fields, not only the pass;
-- no test depends on allocator reuse or timing.
+- `--no-cache` is mandatory;
+- `--sanitize` is mandatory on Darwin and Linux for this non-fiber suite;
+- `-j 1` is mandatory to keep diagnostics ordered and memory bounded;
+- the gate reports the structured TestSuite count;
+- a nonzero child status overrides a printed passing summary.
 
-## Checkpoint 1: Add A Compiler ASan Gate
+Add shell-harness assertions for the exact flags and gate label. Expose the
+same command as `make compiler-core-sanitize-test`.
 
-Goal: make ownership safety observable during every following checkpoint.
+### B2. Broad diagnostic gate
 
-Files:
+`compiler-blorp-sanitize` may continue to run all of
+`compiler/blorp/tests/`, but it is diagnostic until its pre-Core backlog is
+separately closed.
 
-- `scripts/test`
-- `Makefile`
-- `scripts/premerge-gate`
-- `tests/test_scripts_test_harness.sh`
-- `AGENTS.md`
+Rules:
 
-Work:
+- do not include it in the default local gate;
+- do not include it in premerge yet;
+- do not weaken it to hide known failures;
+- preserve logs when it is run;
+- do not treat its failures as permission to expand this checkpoint.
 
-1. Add a `compiler-blorp-sanitize` test gate that runs:
+### Pitfalls
 
-   ```bash
-   ./blorp test --no-format --no-cache --sanitize -j 1 compiler/blorp/tests/
-   ```
+- ASan disables normal result caching internally, but the command must still
+  say `--no-cache` so the gate contract is explicit and regression-testable.
+- Apple’s runtime-wide sanitizer gate uses UBSan because fibers switch stacks.
+  That exception does not apply to compiler-owned Core suites.
+- An ASan crash may print a partial “N passed, 0 failed” suite summary before
+  returning 127. Trust the process status and sanitizer output, not only the
+  test count.
+- TestSuite files use a top-level `tests: TestSuite`. They must not define
+  `func main`; the test runner intentionally rejects that shape.
 
-2. Keep the existing runtime sanitizer policy unchanged. The new gate uses
-   ASan on Darwin because these compiler tests do not exercise the fiber paths
-   that require UBSan-only runtime coverage there.
-3. Add a `make compiler-blorp-sanitize-test` wrapper.
-4. Add a focused sanitizer set for normal development:
-   - Core clone;
-   - Core lower;
-   - consume specialization;
-   - Perceus;
-   - reuse;
-   - closure;
-   - prepare;
-   - emit.
-5. Run all 72 compiler-owned suites under ASan in the Linux premerge gate.
-6. Keep the gate uncached. A cached normal result is not evidence for an ASan
-   build.
+### Exit criteria
 
-Exit criteria:
+- the focused gate passes 588 tests from one invocation;
+- the shell harness proves flags and process-status handling;
+- the broad gate remains clearly labeled diagnostic;
+- no premerge configuration depends on a known-failing gate.
 
-- harness tests prove the new gate selects ASan and disables result caching;
-- a known UAF produces a failed gate with the ASan excerpt;
-- a passing run reports the actual TestSuite count rather than only process
-  success.
+## Checkpoint C: Keep The Reconstruction API Minimal
 
-## Checkpoint 2: Build The Canonical Core Clone Module
+Goal: centralize only the phase-neutral operations proven necessary.
 
-Goal: provide one exhaustive implementation that creates independently owned
-Core values.
+File:
 
-Files:
+- `compiler/blorp/src/stage_09_core/compiler_core_clone.brp`
 
-- new `compiler/blorp/src/stage_09_core/compiler_core_clone.brp`
-- new `compiler/blorp/tests/test_compiler_core_clone.brp`
-- `compiler/blorp/src/stage_09_core/compiler_core_json.brp` only if a narrowly
-  useful type must be exposed; do not move clone policy into JSON encoding.
-
-Public API:
+Public API for this checkpoint:
 
 ```text
 clone_core_var(CoreVar) -> CoreVar
 clone_core_type(CoreType) -> CoreType
-clone_core_param(CoreParam) -> CoreParam
-clone_core_expr(CoreExpr) -> CoreExpr
-clone_core_function(CoreFunction) -> CoreFunction
-clone_core_global(CoreGlobal) -> CoreGlobal
-clone_core_decl(CoreDecl) -> CoreDecl
-clone_core_program(CoreProgram) -> CoreProgram
+clone_core_literal(CoreLiteral) -> CoreLiteral
+clone_core_source_loc(CoreSourceLoc) -> CoreSourceLoc
 ```
 
-Private clone families must cover:
+Implementation requirements:
 
-- strings, optional strings, integer and string lists;
-- source spans and source locations;
-- tensor dimensions and tensor type metadata;
-- literals and call kinds;
-- closure ABI and captures;
-- tuple elements, boxed storage, list/tensor/hash-container metadata;
-- record fields, union declarations, variants, and payload metadata;
-- all loop, concurrency, select, resource, and tail-recursion records;
-- literal and constructor decision-tree cases, fallbacks, bindings, tests, and
-  accessors;
-- every `CoreExpr` variant;
-- every declaration and `CoreProgram.foreign_includes`.
+1. Reconstruct every variant of each imported union explicitly.
+2. Recursively reconstruct nested `CoreType` arguments, tuple items, tensor
+   element types, and tensor dimensions.
+3. Reconstruct `KnownSourceLoc` and its span record field by field.
+4. Reconstruct `CoreVar.def_id` as an `Option[Int]` value.
+5. Do not import Perceus, traversal, preparation, lowering, or emission.
+6. Do not add wildcard identity fallbacks.
+7. Do not add `clone_core_expr`, `clone_core_decl`, or `clone_core_program`
+   speculatively.
 
-Implementation rules:
+Tests:
 
-1. Work directly from the unions and records in `compiler_core_json.brp`.
-2. Use exhaustive matches. Do not add `_ : expr`, `_ : value`, or a
-   `CoreTraverse.map_core_expr_children` fallback.
-3. Reconstruct managed records field by field. Record update is allowed only
-   for records proven to contain no managed fields.
-4. Keep helpers private unless another pass needs that exact phase-neutral
-   value.
-5. Add JSON-equivalence tests: cloning may change addresses, never semantic
-   Core content.
-6. Add destruction tests where original and clone remain live and are read in
-   both orders before scope exit.
+- recursive `StackResultType` containing tuple, named, and tensor types;
+- `CoreVar` with `Some(def_id)`;
+- managed `StringLiteral`;
+- known source location with a managed file name;
+- synthetic source location;
+- keep original and reconstructed values live, serialize/read both, and let
+  both leave scope.
 
-Compile-time maintenance property:
+### Pitfalls
 
-- adding a new Core union variant must make `compiler_core_clone.brp` fail
-  exhaustiveness checking until clone behavior is supplied;
-- explicit record construction must make newly added managed fields visible at
-  the clone site.
+- “Clone” means independently ownable, not necessarily different backing
+  addresses. Do not test pointer identity.
+- Returning `args`, `dims`, or another managed list unchanged defeats the
+  purpose. Rebuild the list with `map` where nested reconstruction is needed.
+- Reconstructing a record with the same string field is valid if normal value
+  semantics retain it. Do not allocate strings with `+ ""` or substring
+  tricks.
+- Record update syntax can preserve managed fields implicitly. Use explicit
+  construction in this module.
+- Keep this module below `compiler_core_json` in the dependency graph; a cycle
+  would make the bootstrap path substantially harder to diagnose.
 
-Exit criteria:
+### Exit criteria
 
-- clone tests pass normally, under ASan, and with leak checking;
-- there are no wildcard identity fallbacks;
-- a source audit finds no function in the clone module that returns its managed
-  input unchanged.
+- clone tests pass normally and under ASan;
+- matches are exhaustive;
+- `rg` finds no wildcard return of the input in the module;
+- only the four listed functions are public.
 
-## Checkpoint 3: Consolidate Existing Copy Implementations
+## Checkpoint D: Close Result `?=` Core Lowering
 
-Goal: remove conflicting definitions before applying the discipline elsewhere.
+Goal: ensure every owning position in the generated match tree has valid
+ownership while preserving exact Core semantics.
 
-Files:
+File:
 
-- `compiler_core_perceus.brp`
-- `compiler_core_consume_specialize.brp`
-- `test_compiler_core_perceus.brp`
-- `test_compiler_core_consume_specialize.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`
 
-Work:
+Functions to inspect and, where required, change:
 
-1. Replace Perceus's private `copy_core_*` and `copy_expr` families with
-   `compiler_core_clone` calls.
-2. Replace consume-specialization's duplicate families the same way.
-3. Remove identity implementations of `copy_strings`, `copy_ints`, and the
-   consume-specialization `_ : expr` fallback.
-4. Do not alter consume-specialization eligibility or Perceus balancing logic
-   in this checkpoint.
-5. Compare representative Core JSON before and after consolidation to prove
-   this is an ownership refactor, not an IR rewrite.
+- `core_carrier_success_type`;
+- `core_carrier_failure_type`;
+- `lower_question_bind_success_type`;
+- `lower_question_bind_success_case`;
+- `lower_question_bind_failure_case`;
+- `builtin_core_call`;
+- `carrier_failure_expr`;
+- `lower_typed_question_bind`.
 
-Exit criteria:
+Required ownership positions:
 
-- `rg` finds one implementation of each Core clone operation;
-- consume-specialization and Perceus suites retain their normal assertions;
-- both suites pass under ASan and leak checking.
+1. The payload type extracted from `Option` or `Result` must be reconstructed
+   before storage in a match binding.
+2. The temporary `CoreVar` used by the `LetExpr` binder and `VarExpr`
+   scrutinee must be reconstructed for the additional owner.
+3. `rhs_type` must not be one unretained aggregate shared by the temporary
+   reference, match cases, and enclosing `LetExpr`.
+4. `block_type` must be valid in the failure constructor and match result.
+5. A source location used by both a callee `VarExpr` and its `CallExpr` must be
+   reconstructed for the additional owner.
 
-## Checkpoint 4: Fix The Confirmed Construction Sites
+Semantic constraints:
 
-Goal: close the known prepare, lower, and function-metadata failures using the
-canonical API.
+- preserve constructor names, accessors, tests, binding modes, release policy,
+  and expression shape;
+- do not change Option/Result layout selection;
+- do not alter the encoded `UserCall` contract;
+- do not add a pass-wide clone around `lower_typed_program`.
 
-### Core lowering
-
-File: `compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`
-
-Functions:
-
-- `core_carrier_success_type`
-- `core_carrier_failure_type`
-- `lower_question_bind_success_type`
-- `lower_question_bind_success_case`
-- `lower_question_bind_failure_case`
-- `lower_typed_question_bind`
-- `lower_tuple_destruct_bindings`
-
-Required behavior:
-
-- extracted `Option`/`Result` payload types become independent owned values;
-- match binding types, temporary reference types, match result types, and
-  enclosing `LetExpr` types each receive a valid owner;
-- variables used in both a binder and a reference are cloned for the second
-  position.
-
-### Perceus function rewriting
-
-File: `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
-
-Functions:
-
-- `rewrite_function`
-- `rewrite_global`
-- `rewrite_decl`
-- `insert_drops_program`
-
-Required behavior:
-
-- output function names, source modules, type parameters, parameters, return
-  types, function kinds, locations, and foreign includes do not borrow storage
-  from the input program;
-- the rewritten body and copied function metadata are independently
-  destructible;
-- closure ABI metadata is cloned recursively.
-
-### Core preparation
-
-File: `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
-
-Functions:
-
-- `prepare_expr`
-- `prepare_exprs`
-- `prepare_tuple_expr`
-- `prepare_union_construct`
-- `prepare_function`
-- `prepare_decl`
-- `prepare_program`
-
-Required behavior:
-
-- constructor-call children discarded during preparation are not still owned
-  by the input tree;
-- prepared tuple elements and nested nullable options have independent child
-  ownership;
-- unchanged declarations and foreign includes are cloned.
-
-Exit criteria:
-
-- Core prepare passes 28/28 under ASan;
-- Core lower passes 60/60 under ASan;
-- Perceus progresses past all previously observed metadata failures;
-- the same suites pass under leak checking.
-
-## Checkpoint 5: Audit Every Production Pass Left To Right
-
-Goal: apply one mechanical review checklist to each remaining pass, without
-changing pass semantics.
-
-For each pass:
-
-1. list every public transformation entry point;
-2. identify fields copied from input into output;
-3. identify locals installed in more than one output position;
-4. clone every additional owning occurrence;
-5. keep input and output live together in a focused test;
-6. run normal, ASan, and leak modes before proceeding.
-
-| Order | Module | Entry points and high-risk areas |
-|---|---|---|
-| 1 | `compiler_core_consume_specialize.brp` | `rewrite_program`; cloned functions, recursive call rewrites, constructor decision trees, clone candidate metadata |
-| 2 | `compiler_core_perceus.brp` | `insert_drops_expr`, `insert_drops_program`; rewritten bodies, inserted `DupExpr`/`DropExpr`, mutable aliases, inferred contract maps |
-| 3 | `compiler_core_reuse.brp` | `rewrite_post_perceus_program`, `rewrite_prepared_program`; source/reuse nodes, prepared union metadata, decision-tree branches |
-| 4 | `compiler_core_closure.brp` | `convert_program`; hoisted functions, captures, closure ABI, task and concurrent bodies, captured name/type lists |
-| 5 | `compiler_core_resource.brp` | `rewrite_resource_expr`, `rewrite_resource_program`; cleanup lists, scope bodies, resource variables and types |
-| 6 | `compiler_core_fairness.brp` | `insert_cooperative_checkpoints_expr`, `insert_cooperative_checkpoints`; unchanged metadata around rewritten loop bodies |
-| 7 | `compiler_core_prepare.brp` | `prepare_program`; boxed storage, tuple/union metadata, unchanged declarations |
-| 8 | `compiler_core_emit.brp` | `emit_core_program_c_artifact_with_options`; verify emission only borrows final Core and does not construct persistent aliases |
-
-Review checklist:
-
-- no `return expr` or `_ : expr` in a function advertised as copying;
-- no record update that silently preserves managed fields in clone code;
-- no shared `CoreType`, `CoreVar`, `CoreParam`, bindings list, captures list,
-  string, or source metadata across owning output fields;
-- no unchanged declaration returned into a newly allocated program without a
-  clone;
-- no clone added to primitives or enums merely for symmetry;
-- no ownership policy change hidden inside the copy cleanup.
-
-Exit criteria per pass:
-
-- focused TestSuite passes normally and under ASan;
-- input/output destruction regression passes;
-- generated Core JSON is semantically unchanged;
-- leak count does not increase.
-
-## Checkpoint 6: Full Compiler And Bootstrap Validation
-
-Goal: prove the workaround holds when the compiler compiles compiler code, not
-only isolated pass fixtures.
-
-Commands:
+Tests:
 
 ```bash
-make
-./blorp test --no-format --no-cache --sanitize -j 1 compiler/blorp/tests/
+./blorp test --no-format --no-cache -j 1 --timeout 60 \
+  compiler/blorp/tests/test_compiler_core_lower.brp
+./blorp test --no-format --no-cache --sanitize -j 1 --timeout 60 \
+  compiler/blorp/tests/test_compiler_core_lower.brp
+```
+
+The existing Result `?=` test must still assert the expected
+`constructor_match` JSON shape, not merely survive destruction.
+
+### Pitfalls
+
+- A child returned from `core_carrier_success_type` or
+  `core_carrier_failure_type` is borrowed from the carrier aggregate. Storing
+  it directly recreates the bug.
+- `?=` cannot be introduced arbitrarily inside a nested `match` arm. If the
+  enclosing expression is not recognized as returning `Result`, use an
+  explicit `Ok`/`Err` match.
+- Do not reconstruct a type once and then install that reconstructed value in
+  several owning fields. Each additional owner needs its own reconstruction at
+  the storage boundary.
+
+### Exit criteria
+
+- 60/60 lower tests pass normally and under ASan;
+- Result `?=` retains the same Core JSON;
+- no unrelated lowering function changes;
+- generated source locations and variable identities remain semantically
+  equal.
+
+## Checkpoint E: Close Core Preparation Leaf Sharing
+
+Goal: prevent preparation from returning input leaf nodes into a new tree while
+the original tree remains live.
+
+File:
+
+- `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+
+Functions to inspect and, where required, change:
+
+- `prepare_expr`;
+- `prepare_exprs`;
+- `prepare_tuple_expr`;
+- `prepare_union_construct`.
+
+Required behavior:
+
+1. Reconstruct unchanged leaf variants that can be retained by both trees:
+   - `LiteralExpr`;
+   - `VarExpr`;
+   - `VoidExpr`;
+   - `CooperativeCheckpointExpr`;
+   - `BreakExpr`;
+   - `ContinueExpr`.
+2. When an Option constructor call becomes `UnionConstructExpr`, its result
+   type and source location must be independently ownable.
+3. When a tuple literal becomes `TupleConstructExpr`, the output type and
+   location must be independently ownable.
+4. The prepared callee discarded by constructor conversion must be safe to
+   destroy while the input call still exists.
+
+Do not mechanically reconstruct every `CoreExpr` variant. Existing transformed
+variants already build new nodes, and the combined Core ASan gate is the
+evidence for whether another site is needed.
+
+Tests:
+
+```bash
+./blorp test --no-format --no-cache -j 1 --timeout 60 \
+  compiler/blorp/tests/test_compiler_core_prepare.brp
+./blorp test --no-format --no-cache --sanitize -j 1 --timeout 60 \
+  compiler/blorp/tests/test_compiler_core_prepare.brp
+```
+
+### Pitfalls
+
+- `return expr` in a transformation can be safe only when ownership is moved
+  and the input owner does not remain live. That is not the contract of these
+  tests.
+- The tuple failure appears during destruction, after its semantic assertions
+  pass. A normal TestSuite pass is therefore insufficient evidence.
+- A temporary prepared list can own children that are later installed in a
+  second aggregate. Keep the original and transformed programs live in tests.
+- Do not “fix” the failure by skipping release bits or clearing ownership
+  metadata. That changes generated-program semantics and leaks values.
+
+### Exit criteria
+
+- 28/28 prepare tests pass normally and under ASan;
+- nullable Option tuple conversion retains its expected prepared form;
+- release and retain masks are unchanged;
+- no constructor conversion or tuple layout rule changes.
+
+## Checkpoint F: Run A First-Failure-Only Core Loop
+
+Goal: prove the complete focused Core surface is clean without starting a
+speculative pass audit.
+
+Procedure:
+
+1. Run `make install` once.
+2. Run `make compiler-core-sanitize-test` serially.
+3. If it passes, stop modifying ownership code.
+4. If it fails:
+   - identify the first sanitizer stack;
+   - run only the named TestSuite file;
+   - reduce to the named test where the harness supports it;
+   - add or strengthen one regression that keeps both owners live;
+   - fix the narrow construction site;
+   - rerun that file normally and under ASan;
+   - rerun the focused gate once.
+5. Do not fix the second failure until the first is independently understood.
+
+Allowed expansion rule:
+
+- add a clone helper only when the first failing construction site requires a
+  phase-neutral value not covered by the four existing helpers;
+- add only that helper and its exhaustive unit tests;
+- do not preemptively add sibling clone families.
+
+### Pitfalls
+
+- Running multiple self-hosted compiler tests concurrently can compile the
+  bridge helpers more than once and consume several gigabytes. Run one build
+  or gate at a time.
+- A direct standalone check of a large compiler module was observed above
+  5 GB across the host and renderer processes. Prefer `make install` followed
+  by focused TestSuite invocations.
+- A stale root `./blorp` can disagree with current bridge JSON and report
+  missing fields such as `consumed_args`. Rebuild before diagnosing source.
+- Repeated stage-observation requests may run the Blorp tail once per requested
+  snapshot. Do not use dump-heavy CLI commands as a performance baseline.
+
+### Exit criteria
+
+- one combined invocation passes all 588 focused Core tests under ASan;
+- no implementation was added without a concrete failing trace;
+- no pass-wide cloning or serialization was introduced;
+- peak memory remains bounded enough to complete on the normal development
+  machine.
+
+## Checkpoint G: Merge Gate
+
+Goal: prove the narrow checkpoint is production-ready and does not merely pass
+its two regressions.
+
+Run these commands serially, in this order:
+
+```bash
+make install
+tests/test_scripts_test_harness.sh
+make compiler-core-sanitize-test
 scripts/test --serial compiler-deep
 scripts/test --serial runtime leak
 make quality
 git diff --check
 ```
 
-Add one scripted ASan CLI smoke:
+Then inspect:
 
-1. compile `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp` to C using the
-   pinned bootstrap path used by `make`;
-2. compile that generated C with ASan and UBSan;
-3. run `--help`, `check`, `compile`, and one compiler-owned TestSuite through
-   the sanitized CLI;
-4. fail on sanitizer output, timeout, or a leaked helper process.
+```bash
+git status --short
+git diff --stat
+git diff --word-diff=plain -- \
+  compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp \
+  compiler/blorp/src/stage_09_core/compiler_core_prepare.brp
+```
 
-Platform coverage:
+Required review questions:
 
-- macOS arm64: focused compiler-owned ASan suites and sanitized CLI smoke;
-- Linux x86_64: all 72 compiler-owned ASan suites;
-- Linux arm64: focused compiler-owned ASan suites plus normal full compiler
-  gate.
+1. Does every production hunk correspond to a named ASan regression?
+2. Is the Core JSON shape unchanged?
+3. Did any release policy, retain mask, layout, constructor test, or call kind
+   change?
+4. Did formatting or renaming obscure the behavioral change?
+5. Is the broad pre-Core ASan debt clearly excluded rather than hidden?
+6. Are all test processes and bridge helpers gone after the gate?
 
-Performance evidence:
+### Failure policy
 
-- record a clean compiler CLI rebuild time before and after;
-- record normal `compiler-deep` time before and after;
-- investigate regressions above 10% before merging;
-- do not replace targeted clones with pass-wide clone/serialize round trips to
-  recover correctness at unacceptable compile-time cost.
+- Focused Core ASan failure: blocks merge and returns to checkpoint F.
+- Normal Core/compiler failure: blocks merge; diagnose as semantic regression,
+  not automatically as ownership.
+- Leak regression: blocks merge; cloning may have accidentally over-retained.
+- Quality failure: blocks merge.
+- Broad `compiler-blorp-sanitize` pre-Core failure: record in the separate
+  backlog; it does not reopen this checkpoint.
+- Build-time regression above 10%: inspect for accidental broad cloning or
+  formatter-triggered bootstrap invalidation before accepting.
 
-Exit criteria:
+### Commit shape
 
-- every command above passes from a cleanly rebuilt workspace;
-- no compiler-owned ASan failure remains;
-- no leak regression appears in resource, channel, task, mutable aggregate, or
-  file-resource suites;
-- no generated helper process survives its test;
-- the public CLI remains the Blorp executable compiled by the pinned bootstrap.
+Prefer one self-contained implementation commit after the roadmap commit. The
+implementation commit should contain:
 
-## Checkpoint 7: Resume The Migration Boundary Work
+- focused reconstruction helpers and tests;
+- lower and prepare fixes;
+- focused sanitizer gate and harness coverage;
+- no known-failing premerge configuration;
+- no promise of a later fix for correctness.
 
-Goal: restart ownership ABI work only after the conservative baseline is solid.
+Do not split the helper from the only production fixes that justify it; an
+intermediate commit with unused ownership infrastructure is harder to review
+and revert.
 
-Work:
+### Exit criteria
 
-1. Reintroduce the phase-explicit unresolved/resolved user-call state described
-   in `BLORP_COMPILER_PORT_ROADMAP.md`.
-2. Make Perceus resolve the complete call contract once.
-3. Make reuse, closure, and emission consume the resolved contract without
-   independent fallback policies.
-4. Re-run the complete validation matrix from checkpoint 6.
+- every required command passes;
+- the focused Core gate reports 588 passing tests;
+- no unrelated churn remains;
+- the implementation is independently correct and mergeable.
 
-This checkpoint is not required for the no-sharing workaround to be correct or
-mergeable. It is the next migration task after the workaround's exit gate.
+## Checkpoint H: Resume Boundary Migration
 
-## Review And Merge Strategy
+Goal: leave ownership work and return to moving the Blorp production boundary.
 
-Keep commits independently reviewable:
+### H1. Reconfirm the exact target boundary
 
-1. baseline regressions and sanitizer gate;
-2. canonical clone module and clone tests;
-3. Perceus/consume copy consolidation;
-4. confirmed lower/prepare/Perceus fixes;
-5. one commit per audited production pass when changes are nontrivial;
-6. full bootstrap validation and documentation.
+Before deleting bridge code, inventory the authoritative implementation for
+every stage in `compiler/lib/core_pipeline.ml`:
 
-Do not combine call-contract representation changes with these commits. A
-failure should be attributable either to clone coverage or to one pass audit.
+```text
+lower, debug, desugar/SSA, mono, synth, match, trait resolve, resolve,
+std inline, tailrec, fusion, specialize, DCE, consume specialize, Perceus,
+reuse, closure, resource, fairness, prepare, emission
+```
 
-## Risks And Mitigations
+For each stage, record:
 
-### Clone coverage drifts with Core
+- authoritative production language: OCaml or Blorp;
+- production entry point;
+- Blorp parity TestSuite;
+- OCaml test that can be deleted after the boundary moves;
+- whether stage dumps/stops observe OCaml values or Blorp JSON.
 
-Mitigation: exhaustive matches, explicit record construction, and no wildcard
-identity fallback in `compiler_core_clone.brp`.
+### H2. Apply the bridge deletion rule
 
-### Correctness is bought with excessive compile time
+Delete `post_dce_program_json`, the relevant projection code in
+`core_emit_blorp_c.ml`, or its bridge action only when no production stage on
+the left still needs to send an OCaml `Core.core_program` to a Blorp stage on
+the right.
 
-Mitigation: clone at additional ownership sites, not at every pass boundary;
-measure clean CLI build and `compiler-deep`; reject JSON round-trip cloning.
+If any stage from debug through DCE remains OCaml-authoritative, the post-DCE
+handoff remains structurally necessary. Continue porting the next contiguous
+left-side stage instead of disguising the handoff.
 
-### A helper named copy still returns an alias
+### H3. Keep one handoff during migration
 
-Mitigation: remove duplicate helpers and audit for identity-returning
-`copy_*`/`clone_*` functions. Reserve `clone` for fresh managed ownership.
+While OCaml remains in the middle of the compilation pipeline:
 
-### ASan only checks runtime tests
+- keep exactly one program-bearing handoff from OCaml back to Blorp;
+- do not add per-pass bridge calls;
+- stage observation may request JSON snapshots, but it must not become a
+  second authoritative transformation path;
+- pass ordering remains in one module for each side of the boundary.
 
-Mitigation: dedicated uncached compiler-owned ASan gate and sanitized full CLI
-smoke.
+### H4. Resume with the next missing production stage
 
-### The workaround is mistaken for the language fix
+Use `BLORP_COMPILER_PORT_ROADMAP.md` to select the next stage immediately left
+of the current handoff. Port it with parity tests, move the boundary, switch
+production, and delete its OCaml implementation/tests in the same checkpoint
+when no other consumer remains.
 
-Mitigation: keep it under `compiler/blorp`, document the restriction here and
-in `OWNERSHIP_MODEL.md`, and retain ordinary-language value-semantics tests.
+Do not resume the `UserCall` contract redesign merely because it was next in an
+older ownership plan. Resume it only when the next production stage requires
+the distinction or a focused ownership/correctness test proves the current
+state ambiguous.
+
+### Exit criteria
+
+- the ownership branch is merged before boundary work starts;
+- the next boundary change has one named stage and one authoritative path;
+- no bridge is deleted while it still carries an OCaml-owned stage result;
+- no new bridge is introduced.
+
+## Separate Pre-Core ASan Backlog
+
+The broad compiler-owned ASan run exposed failures outside this checkpoint.
+Track them separately, in production order:
+
+1. `compiler_dim_solver`
+   - monomial/canonical-list lifetime during solve and solve-diff;
+   - observed from `test_compiler_dim_solver`, `test_compiler_context`, and
+     dimension-constrained inference tests.
+2. `compiler_ctfe_pattern`
+   - binding a selected match-case payload into CTFE context;
+   - observed from `test_compiler_ctfe_eval`.
+3. `compiler_typecheck_state`
+   - selective import bindings and constructor metadata;
+   - observed from `test_compiler_typecheck_decl`.
+4. `compiler_infer`
+   - dimension-constraint checking paths that retain solver results;
+   - observed from `test_compiler_infer`.
+
+Backlog rules:
+
+- reproduce each file individually before editing;
+- do not assume all stacks share one root cause;
+- do not fold these fixes into the late-Core merge checkpoint;
+- add a broad compiler ASan premerge gate only after the full directory passes
+  on Linux x86_64 and focused coverage passes on macOS arm64/Linux arm64.
+
+## Gotcha Checklist
+
+Before each implementation or test run, check:
+
+- [ ] Root `./blorp` was rebuilt after bridge-schema changes.
+- [ ] Only one self-hosted build/test process is running.
+- [ ] ASan tests use `--no-cache` and `-j 1`.
+- [ ] TestSuite files define top-level `tests`, not `main`.
+- [ ] A transformed managed union is reconstructed rather than returned by
+      identity while the input remains live.
+- [ ] Extracted Option/Result/list children are reconstructed before storage.
+- [ ] Each additional owning field receives its own reconstructed aggregate.
+- [ ] Record updates do not silently preserve managed fields at clone sites.
+- [ ] JSON equality is checked; pointer inequality is not.
+- [ ] Release policies, masks, and call metadata are unchanged.
+- [ ] The formatter did not rewrite unrelated portions of old compiler files.
+- [ ] Child exit status is checked even if a partial TestSuite summary passed.
+- [ ] No bridge/helper process remains after interruption or timeout.
+- [ ] A broad pre-Core failure has not expanded the current scope.
 
 ## Completion Definition
 
 This roadmap is complete when:
 
-- the compiler has one canonical exhaustive Core clone implementation;
-- compiler passes follow the no-sharing discipline at every production
-  transformation boundary;
-- all compiler-owned TestSuites pass normally, under ASan, and where applicable
-  under leak checking;
-- the full Blorp CLI rebuild and sanitized self-compile smoke pass;
-- runtime ownership/resource/concurrency leak suites remain clean;
-- compile-time regression is measured and accepted;
-- checkpoint 10 in `BLORP_COMPILER_PORT_ROADMAP.md` points to a clean ownership
-  baseline from which call-contract work can resume.
+- the current diff is reduced to the scope lock;
+- the four minimal reconstruction helpers are exhaustive and tested;
+- Core lower passes 60/60 normally and under ASan;
+- Core prepare passes 28/28 normally and under ASan;
+- all 14 focused Core files pass 588/588 together under ASan;
+- compiler-deep, runtime, leak, quality, and diff hygiene gates pass;
+- no unrelated formatting or mechanical rename churn remains;
+- the broad pre-Core ASan debt is documented separately;
+- work returns to the next contiguous compiler migration checkpoint rather
+  than continuing speculative ownership infrastructure.

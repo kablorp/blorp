@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -76,7 +76,8 @@ build: compiler/lib/embedded_std.ml
 # for compiler stages that have not yet moved across the boundary.
 build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	@bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
+	@set -e; \
+	bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
 	if [ -z "$$bridge_compiler" ]; then \
 		bridge_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
@@ -88,9 +89,17 @@ build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \
 		echo "Building Blorp CLI"; \
+		tmp_bin="$(BLORP_CLI_BIN).tmp"; \
+		tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
+		trap 'rm -f "$$tmp_bin" "$$tmp_hash"' EXIT; \
+		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
 		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
-		cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$(BLORP_CLI_BIN)"; \
-		printf '%s\n' "$$new_hash" > "$(BLORP_CLI_INPUT_HASH)"; \
+		test -s "$(BLORP_CLI_C)"; \
+		cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$$tmp_bin"; \
+		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
+		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
+		mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
+		trap - EXIT; \
 	else \
 		echo "Blorp CLI up to date"; \
 	fi
@@ -192,6 +201,15 @@ test-asan: all
 	else \
 		./blorp test --no-format --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
+
+# Run the self-hosted compiler TestSuites without result caching under ASan.
+# Keep this separate from test-asan: compiler-owned sources do not exercise
+# fiber stack switching and therefore support AddressSanitizer on Darwin too.
+compiler-core-sanitize-test: all
+	scripts/test compiler-core-sanitize --serial
+
+compiler-blorp-sanitize-test: all
+	scripts/test compiler-blorp-sanitize --serial
 
 # Docker targets
 docker-build:

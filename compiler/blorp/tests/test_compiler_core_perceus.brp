@@ -1,6 +1,6 @@
 import:
 	../src/stage_09_core/compiler_core_json:
-		CoreAccessor(RootAccessor),
+		CoreAccessor(ListSpreadAccessor, RootAccessor, VariantFieldAccessor),
 		CoreBinaryOp(AddOp, EqualOp),
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
@@ -33,6 +33,7 @@ import:
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
+			ListGetExpr,
 			ListRetainExpr,
 			ListSetExpr,
 			LiteralExpr,
@@ -47,6 +48,7 @@ import:
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(UserFunction),
+		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreLiteralMatchCase,
@@ -57,7 +59,7 @@ import:
 		),
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
-		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy, StackResultReleasePolicy),
@@ -177,6 +179,14 @@ pure func list_int_type() -> CoreType:
 
 pure func list_string_type() -> CoreType:
 	NamedType("List", [string_type()])
+
+
+pure func channel_string_type() -> CoreType:
+	NamedType("Channel", [string_type()])
+
+
+pure func recv_attempt_string_type() -> CoreType:
+	UnionType("RecvAttempt")
 
 
 pure func closure_type() -> CoreType:
@@ -624,6 +634,8 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 			drop_count_for(name, body)
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			drop_count_for(name, rhs) + drop_count_for(name, body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			drop_count_for(name, rhs) + drop_count_for(name, body)
 		SeqExpr(first, second):
 			drop_count_for(name, first) + drop_count_for(name, second)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
@@ -664,6 +676,19 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cases,
 			) + drop_count_in_constructor_fallback(name, fallback)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			drop_count_for(
+				name,
+				scrutinee,
+			) + drop_count_in_literal_cases(
+				name,
+				cases,
+			) + drop_count_in_literal_fallback(name, fallback)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			drop_count_for(
+				name,
+				scrutinee,
+			) + drop_count_in_constructor_length_match(name, match_expr)
 		_:
 			0
 
@@ -847,6 +872,16 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			dup_count_for(name, body)
 		UnionConstructExpr(construct, typ, loc):
 			dup_count_in_boxed_values(name, construct.args)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			dup_count_for(
+				name,
+				set.list,
+			) + dup_count_for(name, set.index) + dup_count_for(name, set.value.value)
+		ListSetExpr(set, typ, loc):
+			dup_count_for(
+				name,
+				set.list,
+			) + dup_count_for(name, set.index) + dup_count_for(name, set.value.value)
 		TupleExpr(items, typ, loc):
 			dup_count_in_args(name, items)
 		RecordExpr(fields, typ, loc):
@@ -866,6 +901,16 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cases,
 			) + dup_count_in_constructor_fallback(name, fallback)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			dup_count_for(
+				name,
+				scrutinee,
+			) + dup_count_in_literal_cases(
+				name,
+				cases,
+			) + dup_count_in_literal_fallback(name, fallback)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			dup_count_for(name, scrutinee) + dup_count_in_constructor_length_match(name, match_expr)
 		_:
 			0
 
@@ -1084,6 +1129,11 @@ pure func has_drop_before_assign_for(name: String, expr: CoreExpr) -> Bool:
 			)
 		WhileExpr(cond, body, typ, loc):
 			has_drop_before_assign_for(name, cond) or has_drop_before_assign_for(name, body)
+		ForListExpr(loop, typ, loc):
+			(
+				has_drop_before_assign_for(name, loop.iterable)
+				or has_drop_before_assign_for(name, loop.body)
+			)
 		_:
 			False
 
@@ -1606,6 +1656,13 @@ pure func test_default_managed_types() -> Bool:
 		)
 		and is_managed_type(env, TupleType([string_type()]))
 		and is_managed_type(env, closure_type())
+		and is_managed_type(
+			env,
+			NamedType(
+				"FallibleStream",
+				[int_type(), string_type()],
+			),
+		)
 		and not is_managed_type(
 			env,
 			NamedType("Option", [int_type()]),
@@ -1702,26 +1759,14 @@ pure func test_stack_result_uses_stack_ownership_policies() -> Bool:
 	)
 
 	unused_uses_stack_release: Bool = match unused:
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			match body:
-				DupExpr(source_var, source_type, StackResultRetainPolicy, inner, body_type, loc):
-					match inner:
-						DropExpr(drop_var, value_type, StackResultReleasePolicy, drop_body, drop_body_type, drop_loc):
-							drop_var.name == "result"
-						_:
-							False
-				_:
-					False
+		LetExpr(variable, is_mutable, typ, DupExpr(source_var, source_type, StackResultRetainPolicy, retained, retained_type, retain_loc), DropExpr(drop_var, value_type, StackResultReleasePolicy, drop_body, drop_body_type, drop_loc)):
+			source_var.name == "source" and drop_var.name == "result"
 		_:
 			False
 
 	reused_uses_stack_retain: Bool = match reused:
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			match body:
-				DupExpr(dup_var, value_type, StackResultRetainPolicy, inner, body_type, loc):
-					True
-				_:
-					False
+		LetExpr(variable, is_mutable, typ, DupExpr(source_var, source_type, StackResultRetainPolicy, retained, retained_type, retain_loc), DupExpr(dup_var, value_type, StackResultRetainPolicy, inner, body_type, loc)):
+			source_var.name == "source" and dup_var.name == "result"
 		_:
 			False
 
@@ -1962,6 +2007,68 @@ pure func test_borrowed_match_binding_result_in_let_rhs_is_retained() -> Bool:
 	)
 
 	dup_count_for("payload", rewritten) == 1
+
+
+pure func test_owned_list_spread_match_binding_is_released() -> Bool:
+	rest_binding: CoreMatchBinding = {
+		variable = named_var("rest"),
+		typ = list_int_type(),
+		accessor = ListSpreadAccessor(RootAccessor, 1),
+		mode = MatchOwnBindingMode
+	}
+	match_expr: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"values",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = Some({
+				minimum_length = 1,
+				branch = constructor_length_branch(
+					[rest_binding],
+					ConstructorMatchBodyExpr(
+						intrinsic_expr(
+							"list_len",
+							[var_expr("rest", list_int_type())],
+							int_type(),
+						),
+					),
+				),
+			}),
+			fallback = None,
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), match_expr)
+
+	drop_count_for("rest", rewritten) == 1
+
+
+pure func test_owned_union_field_match_binding_remains_backend_managed() -> Bool:
+	payload_binding: CoreMatchBinding = {
+		variable = named_var("payload"),
+		typ = string_type(),
+		accessor = VariantFieldAccessor(RootAccessor, "Tag", "Some", 0),
+		mode = MatchOwnBindingMode
+	}
+	match_expr: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[payload_binding],
+				var_expr("payload", string_type()),
+			)],
+		var_expr("fallback", string_type()),
+		string_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), match_expr)
+
+	dup_count_for("payload", rewritten) == 0 and drop_count_for("payload", rewritten) == 0
 
 
 pure func test_union_construction_retains_borrowed_parameter_payload() -> Bool:
@@ -2433,6 +2540,129 @@ pure func test_consumed_managed_parameter_return_transfers_without_retain() -> B
 			False
 
 
+pure func test_consumed_managed_parameter_branch_return_transfers_without_retain() -> Bool:
+	read: CoreDecl = function_decl(
+		"read_length",
+		809,
+		[core_param("items", list_int_type())],
+		NamedType(
+			"RawPointer",
+			[],
+		),
+		ListGetExpr(
+			{
+				layout = PointerListStorage,
+				list = var_expr("items", list_int_type()),
+				index = int_expr(0),
+				bounds = ProvenListAccess
+			},
+			NamedType(
+				"RawPointer",
+				[],
+			),
+			SyntheticSourceLoc,
+		),
+	)
+	callee: CoreDecl = function_decl(
+		"take_or_return",
+		810,
+		[core_param("value", list_int_type()), core_param("consume", bool_type())],
+		list_int_type(),
+		SeqExpr(
+			user_call_expr(
+				"read_length",
+				Some(809),
+				[0],
+				[var_expr("value", list_int_type())],
+				NamedType("RawPointer", []),
+			),
+			SeqExpr(
+				user_call_expr(
+					"read_length",
+					Some(809),
+					[0],
+					[var_expr("value", list_int_type())],
+					NamedType("RawPointer", []),
+				),
+				IfExpr(
+					var_expr(
+						"consume",
+						bool_type(),
+					),
+					LetExpr(
+						named_var("updated"),
+						False,
+						list_int_type(),
+						intrinsic_expr(
+							"list_ensure_unique",
+							[var_expr("value", list_int_type())],
+							list_int_type(),
+						),
+						user_call_expr(
+							"take_or_return",
+							Some(810),
+							[0],
+							[var_expr("updated", list_int_type()), bool_expr(False)],
+							list_int_type(),
+						),
+					),
+					var_expr(
+						"value",
+						list_int_type(),
+					),
+					list_int_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		),
+	)
+	program: CoreProgram = {
+		decls = [read, callee],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "take_or_return"):
+		Some(body):
+			dup_count_for("value", body) == 0 and drop_count_for("value", body) == 0
+		None:
+			False
+
+
+pure func test_consumed_parameter_fallible_transfer_balances_reserved_owner() -> Bool:
+	callee: CoreDecl = function_decl(
+		"consume_or_return",
+		811,
+		[core_param("value", list_int_type())],
+		list_int_type(),
+		LiteralMatchExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("value", list_int_type())],
+				list_int_type(),
+			),
+			[literal_case(
+					IntLiteral(1),
+					[],
+					call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+				)],
+			LiteralMatchFallbackBody(var_expr("value", list_int_type())),
+			list_int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [callee],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "consume_or_return"):
+		Some(body):
+			dup_count_for("value", body) == 1 and drop_count_for("value", body) == 1
+		None:
+			False
+
+
 pure func test_unused_consumed_managed_parameter_is_dropped() -> Bool:
 	callee: CoreDecl = function_decl(
 		"discard",
@@ -2657,6 +2887,43 @@ pure func test_count_uses_includes_prepared_list_retain_value() -> Bool:
 	count_uses("value", expr) == 1 and count_uses("items", expr) == 1
 
 
+pure func test_prepared_list_retain_owns_alias_binding_result() -> Bool:
+	retained: CoreExpr = ListRetainExpr(
+		{
+			list = var_expr("items", list_string_type()),
+			value = {
+				kind = PointerBox,
+				value = var_expr("elem", string_type()),
+				needs_release = True,
+				transfers_ownership = False
+			}
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	rhs: CoreExpr = BorrowLetExpr(
+		named_var("elem"),
+		string_type(),
+		var_expr("borrowed", string_type()),
+		SeqExpr(
+			retained,
+			var_expr("elem", string_type()),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("result"),
+			False,
+			string_type(),
+			rhs,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+
+	dup_count_for("__owned_result", rewritten) == 0
+
+
 pure func test_list_set_owned_transfers_managed_element() -> Bool:
 	body: CoreExpr = ListSetExpr(
 		{
@@ -2685,6 +2952,30 @@ pure func test_list_set_owned_transfers_managed_element() -> Bool:
 			variable.name == "mapped" and drop_count_for("mapped", rewritten_body) == 0
 		_:
 			False
+
+
+pure func test_list_set_owned_retains_borrowed_match_payload() -> Bool:
+	payload_type: CoreType = TupleType([string_type(), string_type()])
+	result_type: CoreType = NamedType("List", [payload_type])
+	set_payload: CoreExpr = ListSetExpr(
+		{
+			layout = PointerListStorage,
+			list = var_expr("result", result_type),
+			index = int_expr(0),
+			value = transferring_boxed_value(var_expr("payload", payload_type)),
+			value_is_stack_result = False
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	match_expr: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [match_binding("payload", payload_type)], set_payload)],
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), match_expr)
+
+	dup_count_for("payload", rewritten) == 1
 
 
 pure func test_linearity_accepts_linear_expressions() -> Bool:
@@ -2855,6 +3146,20 @@ pure func test_lambda_managed_parameter_field_return_is_retained() -> Bool:
 			False
 
 
+pure func test_lambda_managed_capture_union_payload_is_retained() -> Bool:
+	lambda: CoreExpr = LambdaExpr(
+		[],
+		boxed_string_type(),
+		boxed_string_construct(var_expr("captured", string_type())),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), lambda)
+
+	dup_count_for("captured", rewritten) == 1
+
+
 pure func test_unmanaged_let_gets_no_drop() -> Bool:
 	expr: CoreExpr = LetExpr(named_var("n"), False, int_type(), int_expr(1), int_expr(2))
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
@@ -2972,7 +3277,7 @@ pure func test_mutable_managed_let_return_after_loop_transfers_final_owner() -> 
 		),
 	)
 
-	dup_count_for("xs", rewritten) == 0
+	dup_count_for("xs", rewritten) == 0 and has_drop_before_assign_for("xs", rewritten)
 
 
 pure func test_mutable_managed_let_forwarded_copy_retains_source_owner() -> Bool:
@@ -3041,6 +3346,28 @@ pure func test_mutable_consuming_call_preserves_slot_owner() -> Bool:
 		[0],
 		[var_expr("slot", list_int_type())],
 		list_int_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("slot"),
+			True,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			result,
+		),
+	)
+
+	dup_count_for("slot", rewritten) == 1 and drop_count_for("slot", rewritten) == 1
+
+
+pure func test_mutable_collection_equality_preserves_slot_owner() -> Bool:
+	result: CoreExpr = BinaryExpr(
+		EqualOp,
+		var_expr("slot", list_int_type()),
+		var_expr("other", list_int_type()),
+		bool_type(),
+		SyntheticSourceLoc,
 	)
 	rewritten: CoreExpr = insert_drops_expr(
 		empty_env(),
@@ -4189,14 +4516,10 @@ pure func test_consuming_field_argument_gets_owned_alias() -> Bool:
 		LetExpr(variable, False, typ, rhs, body):
 			(
 				variable.name == "__cow_arg_0"
-				and dup_count_for("__cow_arg_0", body) == 1
+				and dup_count_for("__owned_result", rhs) == 1
 				and match body:
-					DupExpr(dup_var, value_type, retain_policy, call, call_type, loc):
-						match call:
-							CallExpr(kind, callee, [VarExpr(arg, arg_type, arg_loc)], result_type, call_loc):
-								arg.name == "__cow_arg_0"
-							_:
-								False
+					CallExpr(kind, callee, [VarExpr(arg, arg_type, arg_loc)], result_type, call_loc):
+						arg.name == "__cow_arg_0"
 					_:
 						False
 			)
@@ -4226,14 +4549,10 @@ pure func test_consuming_collection_equality_field_gets_owned_alias() -> Bool:
 		LetExpr(variable, False, typ, rhs, body):
 			(
 				variable.name == "__equality_arg_0"
-				and dup_count_for("__equality_arg_0", body) == 1
+				and dup_count_for("__owned_result", rhs) == 1
 				and match body:
-					DupExpr(dup_var, value_type, retain_policy, binary, result_type, loc):
-						match binary:
-							BinaryExpr(EqualOp, VarExpr(arg, arg_type, arg_loc), right, typ, binary_loc):
-								arg.name == "__equality_arg_0"
-							_:
-								False
+					BinaryExpr(EqualOp, VarExpr(arg, arg_type, arg_loc), right, typ, binary_loc):
+						arg.name == "__equality_arg_0"
 					_:
 						False
 			)
@@ -4327,10 +4646,54 @@ pure func test_alias_binding_retains_source_owner() -> Bool:
 	)
 
 	match rewritten:
-		LetExpr(variable, False, typ, rhs, DupExpr(source, value_type, policy, body, body_type, loc)):
-			variable.name == "alias" and source.name == "source"
+		LetExpr(variable, False, typ, DupExpr(source, value_type, policy, VarExpr(returned, return_type, return_loc), dup_type, dup_loc), body):
+			variable.name == "alias" and source.name == "source" and returned.name == "source"
 		_:
 			False
+
+
+pure func test_alias_retain_does_not_cover_later_source_consume() -> Bool:
+	alias_use: CoreExpr = intrinsic_expr(
+		"list_len",
+		[var_expr("alias", list_int_type())],
+		int_type(),
+	)
+	consume_source: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("source", list_int_type())],
+		list_int_type(),
+	)
+	borrow_source: CoreExpr = intrinsic_expr(
+		"list_len",
+		[var_expr("source", list_int_type())],
+		int_type(),
+	)
+	body: CoreExpr = LetExpr(
+		named_var("alias"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			alias_use,
+			SeqExpr(consume_source, borrow_source),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("source"),
+			False,
+			list_int_type(),
+			var_expr("input", list_int_type()),
+			body,
+		),
+	)
+
+	(
+		dup_count_for("source", rewritten) == 2
+		and drop_count_for("source", rewritten) == 1
+		and drop_count_for("alias", rewritten) == 1
+	)
 
 
 pure func test_branch_alias_binding_normalizes_rhs_ownership() -> Bool:
@@ -4393,7 +4756,15 @@ pure func test_borrowed_owned_temporary_argument_is_dropped() -> Bool:
 		int_type(),
 		intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
 	)
-	fresh: CoreExpr = intrinsic_expr("list_alloc", [int_expr(0)], list_int_type())
+	fresh: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = False
+		},
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
 	main_decl: CoreDecl = function_decl(
 		"main",
 		211,
@@ -4420,6 +4791,69 @@ pure func test_borrowed_owned_temporary_argument_is_dropped() -> Bool:
 			drop_count_for("__borrow_arg_0", body) == 1
 		None:
 			False
+
+
+pure func test_inferred_union_call_borrowed_temporary_is_dropped() -> Bool:
+	inspect: CoreDecl = function_decl(
+		"inspect_then_union",
+		223,
+		[core_param("items", list_int_type())],
+		boxed_string_type(),
+		SeqExpr(
+			intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+			boxed_string_construct(var_expr("payload", string_type())),
+		),
+	)
+	fresh: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = False
+		},
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	caller: CoreDecl = function_decl(
+		"call_inspect_then_union",
+		224,
+		[],
+		boxed_string_type(),
+		user_call_expr("inspect_then_union", Some(223), [], [fresh], boxed_string_type()),
+	)
+	base: CoreProgram = decl_env_program()
+	program: CoreProgram = insert_drops_program(
+		{ base | decls = base.decls + [inspect, caller] },
+	)
+
+	match function_body(program, "call_inspect_then_union"):
+		Some(body):
+			drop_count_for("__borrow_arg_0", body) == 1
+		None:
+			False
+
+
+pure func test_unboxed_aliasing_call_drops_borrowed_owned_temporary() -> Bool:
+	fresh: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = False
+		},
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	erased_type: CoreType = NamedType("Ptr", [])
+	read: CoreExpr = call_expr(
+		"blorp_checked_get",
+		[fresh, int_expr(0)],
+		erased_type,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		UnboxExpr(PrimUnbox, read, int_type(), SyntheticSourceLoc),
+	)
+
+	drop_count_for("__borrow_arg_0", rewritten) == 1
 
 
 pure func test_borrowed_owned_temporary_under_unmanaged_borrow_is_dropped() -> Bool:
@@ -4484,6 +4918,46 @@ pure func test_concurrent_binding_releases_result_owner() -> Bool:
 			drop_count_for("result", block.body) == 1
 		_:
 			False
+
+
+pure func test_nested_concurrent_borrowed_match_does_not_retain() -> Bool:
+	inner_result_type: CoreType = StackResultType(int_type(), string_type())
+	outer_result_type: CoreType = StackResultType(inner_result_type, string_type())
+	inner_match: CoreExpr = ConstructorMatchExpr(
+		var_expr("answer", outer_result_type),
+		NoReleasePolicy,
+		[constructor_case("Ok", [], int_expr(1))],
+		ConstructorMatchFallbackBody(int_expr(0)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	outer_match: CoreExpr = ConstructorMatchExpr(
+		var_expr("answer", outer_result_type),
+		NoReleasePolicy,
+		[constructor_case("Ok", [], inner_match)],
+		ConstructorMatchFallbackBody(int_expr(0)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	concurrent_expr: CoreExpr = PreClosureConcurrentExpr(
+		{
+			bindings = [
+				{
+					variable = named_var("answer"),
+					typ = outer_result_type,
+					rhs = var_expr("source", inner_result_type)
+				},
+			],
+			body = outer_match,
+			timeout = None,
+			max_threads = None
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), concurrent_expr)
+
+	dup_count_for("answer", rewritten) == 0
 
 
 pure func test_inferred_user_call_contract_is_written_to_calls() -> Bool:
@@ -4566,6 +5040,85 @@ pure func test_inferred_user_call_contract_is_used_for_union_return() -> Bool:
 			False
 		None:
 			False
+
+
+pure func test_managed_union_builtin_wrapper_borrows_argument() -> Bool:
+	attempt_type: CoreType = recv_attempt_string_type()
+	attempt_union: CoreDecl = UnionDecl({
+		name = "RecvAttempt",
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [union_variant("RecvValue", 0, Some(219), [union_field(string_type())])],
+		loc = SyntheticSourceLoc,
+	})
+	wrapper: CoreDecl = function_decl(
+		"recv_attempt",
+		220,
+		[core_param("channel", channel_string_type())],
+		attempt_type,
+		call_expr(
+			"blorp_channel_try_recv_attempt",
+			[var_expr("channel", channel_string_type())],
+			attempt_type,
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"call_recv_attempt",
+		221,
+		[core_param("channel", channel_string_type())],
+		attempt_type,
+		user_call_expr(
+			"recv_attempt",
+			Some(220),
+			[],
+			[var_expr("channel", channel_string_type())],
+			attempt_type,
+		),
+	)
+	owner: CoreDecl = function_decl(
+		"own_channel_around_recv_attempt",
+		222,
+		[],
+		bool_type(),
+		LetExpr(
+			named_var("channel"),
+			False,
+			channel_string_type(),
+			call_expr("blorp_channel_new", [int_expr(1)], channel_string_type()),
+			LetExpr(
+				named_var("attempt"),
+				False,
+				attempt_type,
+				user_call_expr(
+					"recv_attempt",
+					Some(220),
+					[],
+					[var_expr("channel", channel_string_type())],
+					attempt_type,
+				),
+				bool_expr(True),
+			),
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [attempt_union, wrapper, caller, owner],
+		foreign_includes = [],
+	})
+
+	call_borrows: Bool = match function_body(program, "call_recv_attempt"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			name == "recv_attempt" and consumed_args.length() == 0
+		Some(body):
+			False
+		None:
+			False
+
+	owner_drops: Bool = match function_body(program, "own_channel_around_recv_attempt"):
+		Some(body):
+			drop_count_for("channel", body) == 1
+		None:
+			False
+
+	call_borrows and owner_drops
 
 
 pure func test_inferred_user_call_contract_propagates_through_managed_binding() -> Bool:
@@ -5156,6 +5709,14 @@ tests: TestSuite = {
 			test_borrowed_match_binding_result_in_let_rhs_is_retained,
 		),
 		(
+			"owned list spread match binding is released",
+			test_owned_list_spread_match_binding_is_released,
+		),
+		(
+			"owned union field match binding remains backend managed",
+			test_owned_union_field_match_binding_remains_backend_managed,
+		),
+		(
 			"union construction retains borrowed parameter payload",
 			test_union_construction_retains_borrowed_parameter_payload,
 		),
@@ -5204,6 +5765,14 @@ tests: TestSuite = {
 			test_consumed_managed_parameter_return_transfers_without_retain,
 		),
 		(
+			"consumed managed parameter branch return transfers without retain",
+			test_consumed_managed_parameter_branch_return_transfers_without_retain,
+		),
+		(
+			"consumed parameter fallible transfer balances reserved owner",
+			test_consumed_parameter_fallible_transfer_balances_reserved_owner,
+		),
+		(
 			"unused consumed managed parameter is dropped",
 			test_unused_consumed_managed_parameter_is_dropped,
 		),
@@ -5236,7 +5805,15 @@ tests: TestSuite = {
 			"count uses includes prepared list retain value",
 			test_count_uses_includes_prepared_list_retain_value,
 		),
+		(
+			"prepared list retain owns alias binding result",
+			test_prepared_list_retain_owns_alias_binding_result,
+		),
 		("list set owned transfers managed element", test_list_set_owned_transfers_managed_element),
+		(
+			"list set owned retains borrowed match payload",
+			test_list_set_owned_retains_borrowed_match_payload,
+		),
 		("linearity accepts linear expressions", test_linearity_accepts_linear_expressions),
 		("linearity rejects control flow", test_linearity_rejects_control_flow),
 		("unused managed let gets drop", test_unused_managed_let_gets_drop),
@@ -5255,6 +5832,10 @@ tests: TestSuite = {
 		(
 			"lambda managed parameter field return is retained",
 			test_lambda_managed_parameter_field_return_is_retained,
+		),
+		(
+			"lambda managed capture union payload is retained",
+			test_lambda_managed_capture_union_payload_is_retained,
 		),
 		("unmanaged let gets no drop", test_unmanaged_let_gets_no_drop),
 		(
@@ -5289,6 +5870,10 @@ tests: TestSuite = {
 		(
 			"mutable consuming call preserves slot owner",
 			test_mutable_consuming_call_preserves_slot_owner,
+		),
+		(
+			"mutable collection equality preserves slot owner",
+			test_mutable_collection_equality_preserves_slot_owner,
 		),
 		(
 			"mutable aggregate result preserves slot owner",
@@ -5462,6 +6047,10 @@ tests: TestSuite = {
 		),
 		("alias binding retains source owner", test_alias_binding_retains_source_owner),
 		(
+			"alias retain does not cover later source consume",
+			test_alias_retain_does_not_cover_later_source_consume,
+		),
+		(
 			"branch alias binding normalizes RHS ownership",
 			test_branch_alias_binding_normalizes_rhs_ownership,
 		),
@@ -5474,10 +6063,22 @@ tests: TestSuite = {
 			test_borrowed_owned_temporary_argument_is_dropped,
 		),
 		(
+			"inferred union call borrowed temporary is dropped",
+			test_inferred_union_call_borrowed_temporary_is_dropped,
+		),
+		(
+			"unboxed aliasing call drops borrowed owned temporary",
+			test_unboxed_aliasing_call_drops_borrowed_owned_temporary,
+		),
+		(
 			"borrowed owned temporary under unmanaged borrow is dropped",
 			test_borrowed_owned_temporary_under_unmanaged_borrow_is_dropped,
 		),
 		("concurrent binding releases result owner", test_concurrent_binding_releases_result_owner),
+		(
+			"nested concurrent borrowed match does not retain",
+			test_nested_concurrent_borrowed_match_does_not_retain,
+		),
 		(
 			"inferred user-call contract is written to calls",
 			test_inferred_user_call_contract_is_written_to_calls,
@@ -5485,6 +6086,10 @@ tests: TestSuite = {
 		(
 			"inferred user-call contract is used for union return",
 			test_inferred_user_call_contract_is_used_for_union_return,
+		),
+		(
+			"managed union builtin wrapper borrows argument",
+			test_managed_union_builtin_wrapper_borrows_argument,
 		),
 		(
 			"inferred user-call contract propagates through managed binding",

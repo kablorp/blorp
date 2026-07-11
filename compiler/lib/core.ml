@@ -469,9 +469,10 @@ and match_binding_mode =
       (** The binding aliases storage reachable through the match scrutinee.
           This is the normal pattern-match behavior. *)
   | MatchOwn
-      (** The binding owns one reference to the value it names. Late
-          optimization passes may introduce this only when emission can move
-          or retain the payload before the scrutinee is released. *)
+      (** The binding owns one reference to the value it names. A list-spread
+          accessor materializes a fresh list whose lifetime is balanced by
+          Perceus. Late optimization passes may also transfer a direct union
+          field out of its scrutinee; reuse/emission finalize that transfer. *)
 
 and match_binding = {
   mb_var : var;

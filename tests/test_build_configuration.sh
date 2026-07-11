@@ -18,6 +18,20 @@ if grep -Fq './blorp format --check' <<<"$all_plan"; then
 	exit 1
 fi
 
+cli_build_plan=$(make -n build-blorp-cli)
+if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
+	exit 1
+fi
+if ! grep -Fq 'rm -f "compiler/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must remove stale generated C before compilation" >&2
+	exit 1
+fi
+if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
+	exit 1
+fi
+
 setup_action=.github/actions/setup-cached-ocaml/action.yml
 if grep -Eq '~/.cache/dune|~/Library/Caches/dune' "$setup_action"; then
 	echo "FAIL: the opam dependency cache must not own Dune build artifacts" >&2

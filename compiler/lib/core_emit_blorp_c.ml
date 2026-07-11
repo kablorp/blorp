@@ -7954,7 +7954,10 @@ and require_match_binding ~reg scrut_ty path (binding : Core.match_binding) =
       | Core.AccVariantField (Core.AccRoot, _, _) ->
           require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
             binding.mb_accessor
-      | _ -> unsupported path "owned match binding with non-root accessor")
+      | Core.AccListSpread _ ->
+          require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
+            binding.mb_accessor
+      | _ -> unsupported path "unsupported owned match binding accessor")
 
 and require_match_bindings ~reg scrut_ty path bindings =
   let rec check index = function

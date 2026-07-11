@@ -8,7 +8,7 @@
 import:
 	compiler_core_closure as CoreClosure
 	compiler_core_json:
-		CoreAccessor(RootAccessor),
+		CoreAccessor(ListSpreadAccessor, RootAccessor),
 		CoreBinaryOp(EqualOp, NotEqualOp),
 		CoreBoxedStorageValue,
 		CoreCallKind(
@@ -24,6 +24,7 @@ import:
 			TensorParallelCall,
 			UserCall,
 		),
+		CoreClosureCapture,
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
 		CoreConstructorLengthMatchCase,
@@ -116,6 +117,7 @@ import:
 		CoreFunctionKind(ClosureBodyFunction),
 		CoreGlobal,
 		CoreListHandoffMode(BorrowFreshHandoff),
+		CoreListSet,
 		CoreLiteral,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
@@ -125,7 +127,7 @@ import:
 		),
 		CoreLoopBinder,
 		CoreMatchBinding,
-		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
@@ -185,6 +187,7 @@ private DEFAULT_MANAGED_TYPE_NAMES: List[String] = [
 	"Deque",
 	"Heap",
 	"Stream",
+	"FallibleStream",
 	"ResourceSource",
 ]
 
@@ -202,10 +205,12 @@ record PerceusEnv {
 	constructor_contracts: List[ConstructorCallContract],
 	function_names: List[String],
 	constructor_names: List[String],
+	direct_user_call_contracts_by_name: Dict[String, List[Int]],
 	user_call_contracts_by_name: Dict[String, List[Int]],
 	user_call_contract_layers_by_name: List[Dict[String, List[Int]]],
 	infer_unresolved_user_calls_as_borrow: Bool,
-	balance_nested_constructor_matches: Bool
+	balance_nested_matches: Bool,
+	transferable_result_vars: List[CoreVar]
 }
 
 
@@ -229,16 +234,23 @@ record UserContractWave {
 }
 
 
+private union TemporaryBindingContractPlan:
+	BalancedTemporaryBindingContract(OwnershipCallContract)
+	ExplicitDropTemporaryBindingContract(OwnershipCallContract)
+
+
 pure func empty_env() -> PerceusEnv:
 	{
 		managed_type_names = DEFAULT_MANAGED_TYPE_NAMES,
 		constructor_contracts = [],
 		function_names = [],
 		constructor_names = [],
+		direct_user_call_contracts_by_name = {},
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
 		infer_unresolved_user_calls_as_borrow = False,
-		balance_nested_constructor_matches = False
+		balance_nested_matches = False,
+		transferable_result_vars = []
 	}
 
 
@@ -326,6 +338,79 @@ private pure func user_call_contract_from_consumed_args(
 	}
 
 
+private pure func args_forward_params_in_order(
+	args: List[CoreExpr],
+	params: List[CoreParam],
+) -> Bool:
+	if args.length() != params.length():
+		False
+	else:
+		var forwards: Bool = True
+		var index: Int = 0
+
+		while forwards and index < args.length():
+			match args.get(index):
+				Some(VarExpr(variable, typ, loc)):
+					match params.get(index):
+						Some(param):
+							forwards = (
+								variable.name == param.name.name
+								and variable.uniq == param.name.uniq
+							)
+						None:
+							forwards = False
+				Some(arg):
+					forwards = False
+				None:
+					forwards = False
+
+			index += 1
+
+		forwards
+
+
+private pure func consumed_arg_indices(
+	contract: OwnershipCallContract,
+) -> List[Int]:
+	var consumed: List[Int] = []
+	var index: Int = 0
+
+	for mode in contract.args:
+		if arg_consumes_caller(mode):
+			consumed = consumed.append(index)
+		else:
+			void
+
+		index += 1
+
+	consumed
+
+
+private pure func direct_builtin_wrapper_consumed_args(
+	func_info: CoreFunction,
+) -> Option[List[Int]]:
+	match func_info.body:
+		Some(body):
+			match body:
+				CallExpr(kind, callee, args, typ, loc):
+					match kind:
+						BuiltinCall(name):
+							if args_forward_params_in_order(args, func_info.params):
+								match builtin_contract(name, args.length()):
+									Some(contract):
+										Some(consumed_arg_indices(contract))
+									None:
+										None
+							else:
+								None
+						_:
+							None
+				_:
+					None
+		None:
+			None
+
+
 private pure func lookup_layered_user_call_consumed_args(
 	env: PerceusEnv,
 	name: String,
@@ -369,9 +454,23 @@ private pure func lookup_user_call_contract(
 			None
 
 
+private pure func lookup_direct_user_call_contract(
+	env: PerceusEnv,
+	name: String,
+	arg_count: Int,
+	return_type: CoreType,
+) -> Option[OwnershipCallContract]:
+	match env.direct_user_call_contracts_by_name.get(name):
+		Some(consumed_args):
+			Some(user_call_contract_from_consumed_args(env, consumed_args, arg_count, return_type))
+		None:
+			None
+
+
 pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var managed_type_names: List[String] = DEFAULT_MANAGED_TYPE_NAMES
 	var constructor_contracts: List[ConstructorCallContract] = []
+	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 
 	for decl in program.decls:
 		match decl:
@@ -402,7 +501,14 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 				else:
 					void
 			FunctionDecl(func_info):
-				void
+				match direct_builtin_wrapper_consumed_args(func_info):
+					Some(consumed_args):
+						direct_user_call_contracts_by_name = direct_user_call_contracts_by_name.set(
+							func_info.name,
+							consumed_args,
+						)
+					None:
+						void
 			GlobalDecl(global):
 				void
 			_:
@@ -413,10 +519,12 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts = constructor_contracts,
 		function_names = CoreClosure.capture_function_names(program),
 		constructor_names = CoreClosure.capture_constructor_names(program),
+		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
 		infer_unresolved_user_calls_as_borrow = False,
-		balance_nested_constructor_matches = False
+		balance_nested_matches = False,
+		transferable_result_vars = []
 	}
 
 
@@ -726,11 +834,24 @@ pure func contract_for_call(
 				Some(contract):
 					Some(contract)
 				None:
-					if env.infer_unresolved_user_calls_as_borrow:
-						match lookup_user_call_contract(env, name, arg_count, return_type):
-							Some(contract):
-								Some(contract)
-							None:
+					match lookup_direct_user_call_contract(env, name, arg_count, return_type):
+						Some(contract):
+							Some(contract)
+						None:
+							if env.infer_unresolved_user_calls_as_borrow:
+								match lookup_user_call_contract(env, name, arg_count, return_type):
+									Some(contract):
+										Some(contract)
+									None:
+										unresolved_user_call_contract(
+											env,
+											name,
+											def_id,
+											consumed_args,
+											arg_count,
+											return_type,
+										)
+							else:
 								unresolved_user_call_contract(
 									env,
 									name,
@@ -739,15 +860,6 @@ pure func contract_for_call(
 									arg_count,
 									return_type,
 								)
-					else:
-						unresolved_user_call_contract(
-							env,
-							name,
-							def_id,
-							consumed_args,
-							arg_count,
-							return_type,
-						)
 		ForeignCall(name, arg_passing):
 			Some(borrow_contract_for_signature(env, arg_count, return_type))
 		ClosureCall:
@@ -834,6 +946,12 @@ private record SyntheticOwnershipBinding {
 	variable: CoreVar,
 	typ: CoreType,
 	rhs: CoreExpr
+}
+
+
+private record PreparedTemporaryCall {
+	bindings: List[SyntheticOwnershipBinding],
+	call: CoreExpr
 }
 
 
@@ -3459,8 +3577,47 @@ private pure func balance_nested_branch_body(
 					loc,
 				),
 			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			if (
+				env.balance_nested_matches
+				and literal_match_cases_can_balance(variable.name, cases)
+				and literal_match_fallback_can_balance(variable.name, fallback)
+			):
+				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					variable.name,
+					scrutinee,
+				)
+				available_after_scrutinee: Int = max(
+					0,
+					available_refs - scrutinee_uses.consumed_refs,
+				)
+
+				Some(
+					LiteralMatchExpr(
+						scrutinee,
+						balance_literal_match_cases(
+							env,
+							copy_core_var(variable),
+							copy_core_type(value_type),
+							available_after_scrutinee,
+							cases,
+						),
+						balance_literal_match_fallback(
+							env,
+							copy_core_var(variable),
+							copy_core_type(value_type),
+							available_after_scrutinee,
+							fallback,
+						),
+						copy_core_type(typ),
+						loc,
+					),
+				)
+			else:
+				None
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			if env.balance_nested_constructor_matches:
+			if env.balance_nested_matches:
 				balance_terminal_constructor_match(
 					env,
 					variable,
@@ -4979,7 +5136,7 @@ private pure func balance_let_body_legacy(
 		dups_count: Int = max(0, uses.required_refs - 1)
 		owned_refs: Int = 1 + dups_count
 
-		if env.balance_nested_constructor_matches:
+		if env.balance_nested_matches:
 			prepend_dups(
 				dups_count,
 				variable,
@@ -5521,6 +5678,31 @@ private pure func rewrite_mutable_constructor_match(
 	}
 
 
+private pure func rewrite_mutable_bound_loop_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	binder: CoreLoopBinder,
+	body: CoreExpr,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	if binder.variable.name == target.name:
+		{
+			expr = body,
+			next_temp = temp_index
+		}
+	else:
+		rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			body,
+			temp_index,
+			skip_old_release,
+		)
+
+
 private pure func rewrite_mutable_assignments(
 	env: PerceusEnv,
 	target: CoreVar,
@@ -5721,6 +5903,214 @@ private pure func rewrite_mutable_assignments(
 			)
 			{
 				expr = WhileExpr(cond_result.expr, body_result.expr, copy_core_type(typ), loc),
+				next_temp = body_result.next_temp
+			}
+		ForListExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				loop.iterable,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForListExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForStringExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForStringExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForDictExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForDictExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForSetExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForSetExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForStreamExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForStreamExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForResourceSourceExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForResourceSourceExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForChannelExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForChannelExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForTensorExpr(loop, typ, loc):
+			iterable_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, loop.iterable, temp_index, skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				loop.binder,
+				loop.body,
+				iterable_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForTensorExpr(
+					{ loop | iterable = iterable_result.expr, body = body_result.expr },
+					copy_core_type(typ),
+					loc,
+				),
+				next_temp = body_result.next_temp
+			}
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			start_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env, target, target_type, start, temp_index, skip_old_release,
+			)
+			end_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				end_value,
+				start_result.next_temp,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_bound_loop_body(
+				env,
+				target,
+				target_type,
+				binder,
+				body,
+				end_result.next_temp,
+				skip_old_release,
+			)
+			{
+				expr = ForRangeExpr(
+					binder,
+					start_result.expr,
+					end_result.expr,
+					body_result.expr,
+					copy_core_type(typ),
+					loc,
+				),
 				next_temp = body_result.next_temp
 			}
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
@@ -6475,6 +6865,38 @@ private pure func protect_repeated_consumes(
 				prepend_dups(uses.consumed_refs, target, target_type, call)
 			else:
 				call
+		BinaryExpr(op, left, right, typ, loc):
+			protected_left: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				left,
+				in_repeated_context,
+			)
+			protected_right: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				right,
+				in_repeated_context,
+			)
+			binary: CoreExpr = BinaryExpr(
+				op,
+				protected_left,
+				protected_right,
+				copy_core_type(typ),
+				loc,
+			)
+
+			if in_repeated_context and is_consuming_collection_equality(op, left, right):
+				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					target.name,
+					binary,
+				)
+				prepend_dups(uses.consumed_refs, target, target_type, binary)
+			else:
+				binary
 		TupleExpr(items, typ, loc):
 			TupleExpr(
 				protect_repeated_aggregate_exprs(
@@ -6946,6 +7368,52 @@ private pure func wrap_synthetic_bindings(
 	result
 
 
+private pure func wrap_borrowed_owned_temporary_bindings(
+	bindings: List[SyntheticOwnershipBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = body
+	var index: Int = bindings.length() - 1
+
+	while index >= 0:
+		match bindings.get(index):
+			Some(binding):
+				borrowed_view: CoreVar = {
+					name = "${binding.variable.name}_view",
+					uniq = binding.variable.uniq,
+					def_id = None
+				}
+				dropped_result: CoreExpr = drop_after_body(
+					1,
+					binding.variable,
+					binding.typ,
+					result,
+				)
+				borrowed_scope: CoreExpr = BorrowLetExpr(
+					borrowed_view,
+					copy_core_type(binding.typ),
+					VarExpr(
+						copy_core_var(binding.variable),
+						copy_core_type(binding.typ),
+						SyntheticSourceLoc,
+					),
+					dropped_result,
+				)
+				result = LetExpr(
+					copy_core_var(binding.variable),
+					False,
+					copy_core_type(binding.typ),
+					binding.rhs,
+					borrowed_scope,
+				)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
 private pure func is_collection_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
@@ -7107,6 +7575,15 @@ private pure func owned_names_remove(owned: List[String], name: String) -> List[
 
 private pure func retained_var_from_effect(expr: CoreExpr) -> Option[String]:
 	match expr:
+		ListRetainExpr(retain, typ, loc):
+			if retain.value.needs_release:
+				match retain.value.value:
+					VarExpr(value, value_type, value_loc):
+						Some(value.name)
+					_:
+						None
+			else:
+				None
 		CallExpr(IntrinsicCall(name), callee, args, return_type, call_loc):
 			match args.get(1):
 				Some(VarExpr(value, typ, loc)):
@@ -7255,61 +7732,199 @@ private pure func is_immortal_closure_expr(env: PerceusEnv, expr: CoreExpr) -> B
 			False
 
 
+private pure func contract_for_temporary_binding(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	arg_count: Int,
+	return_type: CoreType,
+) -> Option[TemporaryBindingContractPlan]:
+	match contract_for_call(env, kind, arg_count, return_type):
+		Some(contract):
+			Some(BalancedTemporaryBindingContract(contract))
+		None:
+			match kind:
+				UserCall(name, def_id, consumed_args):
+					match lookup_user_call_contract(env, name, arg_count, return_type):
+						Some(contract):
+							Some(ExplicitDropTemporaryBindingContract(contract))
+						None:
+							None
+				_:
+					None
+
+
+private pure func temporary_binding_plan_contract(
+	plan: TemporaryBindingContractPlan,
+) -> OwnershipCallContract:
+	match plan:
+		BalancedTemporaryBindingContract(contract):
+			contract
+		ExplicitDropTemporaryBindingContract(contract):
+			contract
+
+
+private pure func temporary_binding_plan_uses_explicit_drop(
+	plan: TemporaryBindingContractPlan,
+) -> Bool:
+	match plan:
+		BalancedTemporaryBindingContract(contract):
+			False
+		ExplicitDropTemporaryBindingContract(contract):
+			True
+
+
+private pure func borrowed_temporary_view_var(variable: CoreVar) -> CoreVar:
+	{
+		name = "${variable.name}_view",
+		uniq = variable.uniq,
+		def_id = None
+	}
+
+
+private pure func temporary_call_var(variable: CoreVar, use_borrowed_views: Bool) -> CoreVar:
+	if use_borrowed_views:
+		borrowed_temporary_view_var(variable)
+	else:
+		copy_core_var(variable)
+
+
+private pure func prepare_borrowed_owned_temporary_call(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	contract: OwnershipCallContract,
+	use_borrowed_views: Bool,
+) -> PreparedTemporaryCall:
+	var bindings: List[SyntheticOwnershipBinding] = []
+	var rewritten_args: List[CoreExpr] = []
+	var index: Int = 0
+
+	rewritten_callee: CoreExpr = if is_closure_call(kind) and is_owned_temporary_expr(env, callee):
+		temp: CoreVar = synthetic_binding_var("borrow_callee", 0, loc)
+		callee_type: CoreType = expr_result_type(callee)
+		bindings = bindings.append({
+			variable = temp,
+			typ = callee_type,
+			rhs = callee,
+		})
+		VarExpr(
+			temporary_call_var(temp, use_borrowed_views),
+			copy_core_type(callee_type),
+			loc,
+		)
+	else:
+		callee
+
+	for arg in args:
+		match contract.args.get(index):
+			Some(mode):
+				if arg_preserves_caller(mode) and is_owned_temporary_expr(env, arg):
+					temp: CoreVar = synthetic_binding_var("borrow_arg", index, loc)
+					arg_type: CoreType = expr_result_type(arg)
+					bindings = bindings.append({
+						variable = temp,
+						typ = arg_type,
+						rhs = arg,
+					})
+					rewritten_args = rewritten_args.append(
+						VarExpr(
+							temporary_call_var(temp, use_borrowed_views),
+							copy_core_type(arg_type),
+							loc,
+						),
+					)
+				else:
+					rewritten_args = rewritten_args.append(arg)
+			None:
+				rewritten_args = rewritten_args.append(arg)
+
+		index += 1
+
+	{
+		bindings = bindings,
+		call = CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
+	}
+
+
 private pure func bind_borrowed_owned_temporary_args_at_call(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
-			match contract_for_call(env, kind, args.length(), typ):
-				Some(contract):
-					var bindings: List[SyntheticOwnershipBinding] = []
-					var rewritten_args: List[CoreExpr] = []
-					var index: Int = 0
-
-					rewritten_callee: CoreExpr = if (
-						is_closure_call(kind)
-						and is_owned_temporary_expr(env, callee)
-					):
-						temp: CoreVar = synthetic_binding_var("borrow_callee", 0, loc)
-						bindings = bindings.append({
-							variable = temp,
-							typ = expr_result_type(callee),
-							rhs = callee,
-						})
-						VarExpr(temp, expr_result_type(callee), loc)
-					else:
-						callee
-
-					for arg in args:
-						match contract.args.get(index):
-							Some(mode):
-								if arg_preserves_caller(mode) and is_owned_temporary_expr(env, arg):
-									temp: CoreVar = synthetic_binding_var("borrow_arg", index, loc)
-									arg_type: CoreType = expr_result_type(arg)
-									bindings = bindings.append({
-										variable = temp,
-										typ = arg_type,
-										rhs = arg,
-									})
-									rewritten_args = rewritten_args.append(
-										VarExpr(
-											temp,
-											copy_core_type(arg_type),
-											loc,
-										),
-									)
-								else:
-									rewritten_args = rewritten_args.append(arg)
-							None:
-								rewritten_args = rewritten_args.append(arg)
-
-						index += 1
-
-					wrap_synthetic_bindings(
-						bindings,
-						CallExpr(kind, rewritten_callee, rewritten_args, typ, loc),
+			match contract_for_temporary_binding(env, kind, args.length(), typ):
+				Some(plan):
+					explicit_drop: Bool = temporary_binding_plan_uses_explicit_drop(plan)
+					prepared: PreparedTemporaryCall = prepare_borrowed_owned_temporary_call(
+						env,
+						kind,
+						callee,
+						args,
+						typ,
+						loc,
+						temporary_binding_plan_contract(plan),
+						explicit_drop,
 					)
+
+					if explicit_drop:
+						wrap_borrowed_owned_temporary_bindings(prepared.bindings, prepared.call)
+					else:
+						wrap_synthetic_bindings(prepared.bindings, prepared.call)
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func unbox_copies_alias(kind: CoreUnboxKind) -> Bool:
+	match kind:
+		PointerUnbox:
+			False
+		_:
+			True
+
+
+private pure func result_mode_may_alias_argument(mode: OwnershipResultMode) -> Bool:
+	match mode:
+		ReturnAliasOfArg(index):
+			True
+		ReturnBorrowed:
+			True
+		_:
+			False
+
+
+private pure func bind_borrowed_owned_temporary_args_through_unbox(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		UnboxExpr(unbox_kind, CallExpr(kind, callee, args, call_type, call_loc), typ, loc):
+			match contract_for_call(env, kind, args.length(), call_type):
+				Some(contract):
+					if unbox_copies_alias(unbox_kind) and result_mode_may_alias_argument(contract.result):
+						prepared: PreparedTemporaryCall = prepare_borrowed_owned_temporary_call(
+							env,
+							kind,
+							callee,
+							args,
+							call_type,
+							call_loc,
+							contract,
+							True,
+						)
+						unboxed: CoreExpr = UnboxExpr(
+							unbox_kind,
+							prepared.call,
+							copy_core_type(typ),
+							loc,
+						)
+						wrap_borrowed_owned_temporary_bindings(prepared.bindings, unboxed)
+					else:
+						expr
 				None:
 					expr
 		_:
@@ -7393,6 +8008,24 @@ private pure func owned_result_is_alias(env: PerceusEnv, expr: CoreExpr) -> Bool
 							False
 				None:
 					False
+		_:
+			False
+
+
+private pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
+	(
+		left.name == right.name
+		and left.uniq == right.uniq
+		and left.def_id == right.def_id
+	)
+
+
+private pure func result_transfers_existing_owner(env: PerceusEnv, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			env.transferable_result_vars.any(
+				func(transferable): same_core_var(transferable, variable),
+			)
 		_:
 			False
 
@@ -7544,7 +8177,9 @@ private pure func normalize_owned_result_constructor_fallback(
 
 
 private pure func normalize_owned_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	if is_owned_temporary_expr(env, expr):
+	if result_transfers_existing_owner(env, expr):
+		expr
+	else if is_owned_temporary_expr(env, expr):
 		expr
 	else if is_managed_type(env, expr_result_type(expr)) and owned_result_is_alias(env, expr):
 		retain_alias_as_owned(expr)
@@ -7668,43 +8303,46 @@ private pure func retain_assignment_alias_rhs(env: PerceusEnv, expr: CoreExpr) -
 
 
 private pure func normalize_binding_alias_result(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	match expr:
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				cond,
-				normalize_binding_alias_result(env, then_expr),
-				normalize_binding_alias_result(env, else_expr),
-				copy_core_type(typ),
-				loc,
-			)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			LetExpr(
-				copy_core_var(variable),
-				is_mutable,
-				copy_core_type(typ),
-				rhs,
-				normalize_binding_alias_result(env, body),
-			)
-		BorrowLetExpr(variable, typ, rhs, body):
-			BorrowLetExpr(
-				copy_core_var(variable),
-				copy_core_type(typ),
-				rhs,
-				normalize_binding_alias_result(env, body),
-			)
-		SeqExpr(first, second):
-			SeqExpr(
-				first,
-				normalize_binding_alias_result(env, second),
-			)
-		_:
-			if (
-				is_managed_type(env, expr_result_type(expr))
-				and assignment_rhs_returns_alias(env, expr)
-			):
-				retain_alias_as_owned(expr)
-			else:
-				expr
+	if is_owned_temporary_expr(env, expr):
+		expr
+	else:
+		match expr:
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				IfExpr(
+					cond,
+					normalize_binding_alias_result(env, then_expr),
+					normalize_binding_alias_result(env, else_expr),
+					copy_core_type(typ),
+					loc,
+				)
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				LetExpr(
+					copy_core_var(variable),
+					is_mutable,
+					copy_core_type(typ),
+					rhs,
+					normalize_binding_alias_result(env, body),
+				)
+			BorrowLetExpr(variable, typ, rhs, body):
+				BorrowLetExpr(
+					copy_core_var(variable),
+					copy_core_type(typ),
+					rhs,
+					normalize_binding_alias_result(env, body),
+				)
+			SeqExpr(first, second):
+				SeqExpr(
+					first,
+					normalize_binding_alias_result(env, second),
+				)
+			_:
+				if (
+					is_managed_type(env, expr_result_type(expr))
+					and assignment_rhs_returns_alias(env, expr)
+				):
+					retain_alias_as_owned(expr)
+				else:
+					expr
 
 
 private pure func normalize_binding_alias_rhs(
@@ -7717,11 +8355,18 @@ private pure func normalize_binding_alias_rhs(
 	else:
 		match rhs:
 			VarExpr(variable, typ, loc):
-				rhs
+				DupExpr(
+					copy_core_var(variable),
+					copy_core_type(bind_type),
+					retain_policy_for_type(bind_type),
+					rhs,
+					copy_core_type(bind_type),
+					loc,
+				)
 			FieldExpr(owner, field, typ, loc):
-				rhs
+				retain_alias_as_owned(rhs)
 			TupleFieldExpr(owner, field_index, typ, loc):
-				rhs
+				retain_alias_as_owned(rhs)
 			_:
 				normalize_binding_alias_result(env, rhs)
 
@@ -7748,35 +8393,11 @@ private pure func retain_alias_source_in_body(
 
 		match rhs:
 			VarExpr(source, source_type, source_loc):
-				if source.name == variable.name:
-					body
-				else:
-					DupExpr(
-						copy_core_var(source),
-						copy_core_type(bind_type),
-						retain_policy_for_type(bind_type),
-						body,
-						copy_core_type(body_type),
-						source_loc,
-					)
+				body
 			FieldExpr(owner, field, field_type, field_loc):
-				DupExpr(
-					copy_core_var(variable),
-					copy_core_type(bind_type),
-					retain_policy_for_type(bind_type),
-					body,
-					copy_core_type(body_type),
-					field_loc,
-				)
+				body
 			TupleFieldExpr(owner, field_index, field_type, field_loc):
-				DupExpr(
-					copy_core_var(variable),
-					copy_core_type(bind_type),
-					retain_policy_for_type(bind_type),
-					body,
-					copy_core_type(body_type),
-					field_loc,
-				)
+				body
 			_:
 				body
 
@@ -7790,18 +8411,7 @@ private pure func balance_concurrent_binding_body(
 	if not is_managed_type(env, typ):
 		body
 	else:
-		uses: Int = count_uses(variable.name, body)
-		body_with_dups: CoreExpr = prepend_dups(
-			max(0, uses - 1),
-			variable,
-			typ,
-			body,
-		)
-
-		if uses == 0:
-			prepend_drops(1, variable, typ, body)
-		else:
-			drop_after_body(1, variable, typ, body_with_dups)
+		balance_let_body_legacy(env, variable, typ, body)
 
 
 private pure func retain_direct_field_alias_value(env: PerceusEnv, value: CoreExpr) -> CoreExpr:
@@ -8014,6 +8624,8 @@ private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> C
 		CallExpr(kind, callee, args, typ, loc):
 			field_safe: CoreExpr = protect_consuming_field_aliases(env, expr)
 			bind_borrowed_owned_temporary_args_at_call(env, field_safe)
+		UnboxExpr(kind, inner, typ, loc):
+			bind_borrowed_owned_temporary_args_through_unbox(env, expr)
 		BinaryExpr(op, left, right, typ, loc):
 			protect_consuming_field_aliases(env, expr)
 		_:
@@ -8038,7 +8650,7 @@ private pure func rewrite_managed_let(
 		and balanced_path_has_divergent_constructor_match(variable.name, rewritten_body)
 	)
 
-	balance_env: PerceusEnv = { env | balance_nested_constructor_matches = balances_nested_matches }
+	balance_env: PerceusEnv = { env | balance_nested_matches = balances_nested_matches }
 
 	ownership_body: CoreExpr = if managed_binding:
 		freshen_shadowed_match_bindings(variable, rewritten_body)
@@ -8388,6 +9000,8 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 		UnionConstructExpr(construct, typ, loc):
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		CallExpr(kind, callee, args, typ, loc):
+			insert_drops_ownership_node(env, expr)
+		UnboxExpr(kind, inner, typ, loc):
 			insert_drops_ownership_node(env, expr)
 		BinaryExpr(op, left, right, typ, loc):
 			insert_drops_ownership_node(env, expr)
@@ -9292,6 +9906,24 @@ private pure func function_consumed_param_indices(
 		.get_or([])
 
 
+private pure func consumed_param_vars(
+	func_info: CoreFunction,
+	consumed_params: List[Int],
+) -> List[CoreVar]:
+	var variables: List[CoreVar] = []
+	var index: Int = 0
+
+	for param in func_info.params:
+		if consumed_params.contains(index):
+			variables = variables.append(copy_core_var(param.name))
+		else:
+			void
+
+		index += 1
+
+	variables
+
+
 private pure func inferred_user_call_consumed_args(
 	env: PerceusEnv,
 	name: String,
@@ -9395,6 +10027,21 @@ private pure func match_binding_as_param(binding: CoreMatchBinding) -> CoreParam
 	}
 
 
+-- Direct owned union fields transfer storage from their scrutinee and are
+-- finalized by reuse/emission. A list spread instead materializes a fresh list
+-- value at the match boundary, so Perceus must balance its lifetime normally.
+private pure func match_binding_materializes_owned_value(binding: CoreMatchBinding) -> Bool:
+	match binding.mode:
+		MatchBorrowBindingMode:
+			False
+		MatchOwnBindingMode:
+			match binding.accessor:
+				ListSpreadAccessor(parent, offset):
+					True
+				_:
+					False
+
+
 private pure func retain_borrowed_owned_uses(
 	env: PerceusEnv,
 	param: CoreParam,
@@ -9413,9 +10060,25 @@ private pure func retain_borrowed_binding_results_in_constructor_body(
 	var result: CoreConstructorMatchBody = body
 
 	for binding in bindings:
-		if binding.mode == MatchBorrowBindingMode and is_managed_type(env, binding.typ):
-			param: CoreParam = match_binding_as_param(binding)
-			result = retain_borrowed_param_result_in_constructor_body(env, param, True, result)
+		if is_managed_type(env, binding.typ):
+			if binding.mode == MatchBorrowBindingMode:
+				param: CoreParam = match_binding_as_param(binding)
+				result = retain_borrowed_param_result_in_constructor_body(
+					env,
+					param,
+					True,
+					result,
+				)
+			else if match_binding_materializes_owned_value(binding):
+				result = balance_constructor_match_body(
+					env,
+					binding.variable,
+					binding.typ,
+					1,
+					result,
+				)
+			else:
+				void
 		else:
 			void
 
@@ -9675,13 +10338,30 @@ private pure func retain_borrowed_binding_results(
 	var result: CoreExpr = body
 
 	for binding in bindings:
-		if binding.mode == MatchBorrowBindingMode and is_managed_type(env, binding.typ):
-			param: CoreParam = match_binding_as_param(binding)
-			result = retain_borrowed_param_result(
-				env,
-				param,
-				retain_borrowed_owned_uses(env, param, result),
-			)
+		if is_managed_type(env, binding.typ):
+			if binding.mode == MatchBorrowBindingMode:
+				param: CoreParam = match_binding_as_param(binding)
+				result = retain_borrowed_param_result(
+					env,
+					param,
+					retain_borrowed_owned_uses(env, param, result),
+				)
+			else if match_binding_materializes_owned_value(binding):
+				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					binding.variable.name,
+					result,
+				)
+				result = balance_branch_body(
+					env,
+					binding.variable,
+					binding.typ,
+					1,
+					uses,
+					result,
+				)
+			else:
+				void
 		else:
 			void
 
@@ -9888,18 +10568,22 @@ private pure func retain_borrowed_param_result(
 private pure func retain_borrowed_param_results(
 	env: PerceusEnv,
 	func_info: CoreFunction,
+	consumed_params: List[Int],
 	body: CoreExpr,
 ) -> CoreExpr:
 	if not is_managed_type(env, func_info.return_type):
 		body
 	else:
 		var result: CoreExpr = body
+		var index: Int = 0
 
 		for param in func_info.params:
-			if is_managed_type(env, param.typ):
+			if is_managed_type(env, param.typ) and not consumed_params.contains(index):
 				result = retain_borrowed_param_result(env, param, result)
 			else:
 				void
+
+			index += 1
 
 		result
 
@@ -10270,6 +10954,24 @@ private pure func protect_borrowed_param_call_boxed_value(
 	{ value | value = protect_borrowed_param_calls(env, param, value.value) }
 
 
+private pure func protect_borrowed_param_list_set(
+	env: PerceusEnv,
+	param: CoreParam,
+	set: CoreListSet,
+) -> CoreListSet:
+	protected_value: CoreExpr = protect_borrowed_param_calls(env, param, set.value.value)
+	stored_value: CoreExpr = if set.value.transfers_ownership:
+		retain_borrowed_aggregate_value(env, param, protected_value)
+	else:
+		protected_value
+
+	{ set |
+		list = protect_borrowed_param_calls(env, param, set.list),
+		index = protect_borrowed_param_calls(env, param, set.index),
+		value = { set.value | value = stored_value }
+	}
+
+
 private pure func protect_borrowed_param_call_boxed_values(
 	env: PerceusEnv,
 	param: CoreParam,
@@ -10556,6 +11258,18 @@ private pure func protect_borrowed_param_calls(
 						construct.elements,
 					)
 				},
+				copy_core_type(typ),
+				loc,
+			)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			ListHandoffSetOwnedExpr(
+				protect_borrowed_param_list_set(env, param, set),
+				copy_core_type(typ),
+				loc,
+			)
+		ListSetExpr(set, typ, loc):
+			ListSetExpr(
+				protect_borrowed_param_list_set(env, param, set),
 				copy_core_type(typ),
 				loc,
 			)
@@ -11026,7 +11740,7 @@ private pure func retain_borrowed_param_aggregates(
 
 private pure func normalize_lambda_result_body(
 	env: PerceusEnv,
-	params: List[CoreParam],
+	borrowed_values: List[CoreParam],
 	return_type: CoreType,
 	body: CoreExpr,
 ) -> CoreExpr:
@@ -11035,7 +11749,7 @@ private pure func normalize_lambda_result_body(
 	else:
 		var result: CoreExpr = body
 
-		for param in params:
+		for param in borrowed_values:
 			if is_managed_type(env, param.typ):
 				result = protect_borrowed_param_calls(env, param, result)
 				result = retain_borrowed_param_aggregate_members(env, param, result)
@@ -11044,6 +11758,18 @@ private pure func normalize_lambda_result_body(
 				void
 
 		normalize_owned_result_aliases(env, result)
+
+
+private pure func lambda_capture_param(capture: CoreClosureCapture) -> CoreParam:
+	{
+		name = {
+			name = capture.name,
+			uniq = 0,
+			def_id = None
+		},
+		typ = copy_core_type(capture.typ),
+		loc = SyntheticSourceLoc
+	}
 
 
 private pure func normalize_lambda_expr(
@@ -11056,7 +11782,19 @@ private pure func normalize_lambda_expr(
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	nested_body: CoreExpr = normalize_lambda_result_aliases(env, body)
-	normalized_body: CoreExpr = normalize_lambda_result_body(env, params, return_type, nested_body)
+	captures: List[CoreClosureCapture] = CoreClosure.lambda_runtime_captures(
+		env.function_names,
+		env.constructor_names,
+		params,
+		nested_body,
+	)
+	borrowed_values: List[CoreParam] = params + captures.map(lambda_capture_param)
+	normalized_body: CoreExpr = normalize_lambda_result_body(
+		env,
+		borrowed_values,
+		return_type,
+		nested_body,
+	)
 
 	LambdaExpr(
 		params,
@@ -11096,10 +11834,15 @@ private pure func balance_consumed_param_body(
 		body,
 		False,
 	)
-	uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, protected)
+	balance_env: PerceusEnv = { env | balance_nested_matches = True }
+	uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+		balance_env,
+		variable.name,
+		protected,
+	)
 	owned_refs: Int = max(1, uses.required_refs)
 	balanced: CoreExpr = balance_branch_body(
-		env,
+		balance_env,
 		copy_core_var(variable),
 		copy_core_type(value_type),
 		owned_refs,
@@ -11162,6 +11905,12 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			}
 			contract_body: CoreExpr = annotate_user_call_contracts(env, body)
 			consumed_params: List[Int] = function_consumed_param_indices(env, analysis_function)
+			result_env: PerceusEnv = { env |
+				transferable_result_vars = consumed_param_vars(
+					analysis_function,
+					consumed_params,
+				)
+			}
 			call_body: CoreExpr = protect_borrowed_param_calls_for_function(
 				env,
 				analysis_function,
@@ -11176,11 +11925,12 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			retained_body: CoreExpr = retain_borrowed_param_results(
 				env,
 				analysis_function,
+				consumed_params,
 				aggregate_body,
 			)
 
 			owned_result_body: CoreExpr = if is_managed_type(env, return_type):
-				normalize_owned_result_aliases(env, retained_body)
+				normalize_owned_result_aliases(result_env, retained_body)
 			else:
 				retained_body
 

@@ -512,6 +512,14 @@ let has_spread_binding bindings =
       match binding.mb_accessor with AccListSpread _ -> true | _ -> false)
     bindings
 
+let has_owned_spread_binding bindings =
+  List.exists
+    (fun binding ->
+      match (binding.mb_accessor, binding.mb_mode) with
+      | AccListSpread _, MatchOwn -> true
+      | _ -> false)
+    bindings
+
 let has_elem_binding bindings =
   List.exists
     (fun binding ->
@@ -565,6 +573,9 @@ let test_compile_list_used_spread () =
           Alcotest.(check bool)
             "has spread binding" true
             (has_spread_binding ct_bindings);
+          Alcotest.(check bool)
+            "spread binding owns materialized tail" true
+            (has_owned_spread_binding ct_bindings);
           Alcotest.(check bool)
             "has elem binding" true
             (has_elem_binding ct_bindings)
