@@ -1861,7 +1861,7 @@ Blorp references:
   - `lower_typed_expr`
   - `lower_typed_decl`
   - `lower_typed_program`
-- future `compiler_core_flatten.brp`
+- `compiler_core_flatten.brp`
 - future `compiler_core_ffi_boundary.brp`
 - future `compiler_core_list_layout.brp`
 - existing `compiler_core_json.brp`
@@ -1903,10 +1903,55 @@ Current progress:
   declarations with explicit lowering context state for Core def ids.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the next
-  production boundary strict while expression coverage expands. Imported,
-  constructor, impl-method, and foreign direct-call origins remain explicitly
-  closed until flattening, constructor lowering, resolve, and FFI
-  argument-passing policy are available at this lowering boundary.
+  production boundary strict while expression coverage expands. Calls now
+  preserve the same phase distinction as OCaml lowering: local callable ids
+  become `SelectedDirectCall`, while imported, constructor, impl-method,
+  foreign, builtin, intrinsic, closure, and unresolved targets remain
+  `UnknownCall` until their owning middle-pipeline pass classifies them.
+- `compiler_core_resolve.brp` owns the first post-lowering resolution slice.
+  `resolve_callable_id_calls` resolves `SelectedDirectCall` and `UnknownCall`
+  values carrying callable ids when the qualified callee name and carried def
+  id agree with a function or constructor declaration in the assembled Core
+  program. Numeric def ids are module-local, so
+  unrelated declarations may reuse them, and repeated occurrences of the same
+  qualified identity from module-graph assembly are equivalent. Only stale
+  identities remain unresolved. Name-only `UnknownCall` resolution remains
+  closed until module, builtin, foreign, trait, and bound-local registries have
+  all been ported.
+- The temporary OCaml `core_resolve.ml` handoff follows the same identity rule:
+  a canonical post-flatten qualified name is resolved before consulting the
+  reverse selected-id index. This prevents a module-local selected id from
+  resolving to an unrelated same-signature function after flattening. The
+  regression belongs to the boundary and can be deleted with OCaml resolve.
+- `compiler_core_flatten.brp` now owns callable-name flattening for one lowered
+  module. It sanitizes the module path, assigns distinct names to bodied
+  pure/impure overloads, records module provenance on top-level functions and
+  impl methods, and rewrites direct and closure references by the exact
+  `(source name, module-local def_id)` identity. Builtins, foreign declarations,
+  UFCS-mangled names, and impl method declaration names remain stable. Local
+  variables without a callable id cannot be rewritten accidentally. Matching
+  forward declarations converge on the bodied callable's qualified name and
+  body-preference deduplication removes the declaration-only duplicate, which
+  preserves the std pure/impure forward-declaration pattern.
+- This is deliberately not presented as the complete flattening port. Global
+  declarations, module-owned and imported types, canonical type names, import
+  tables, non-callable duplicate declaration handling, and registry population
+  still belong to later checkpoint 8 slices. Keeping those responsibilities
+  explicit avoids reproducing the OCaml pass's name-based fallback before the
+  necessary module and type ownership data is available in the Blorp Core
+  boundary.
+- The shared `CoreDecl` model now preserves declaration type parameters and
+  represents type aliases and impl containers directly. This follows the OCaml
+  pipeline's single progressively refined Core IR instead of introducing a
+  second lowered-declaration hierarchy. Core JSON round trips those early
+  declarations, and the OCaml projection now sends explicit declaration
+  `type_params` at the existing backend bridge.
+- Typed record/enum/union lowering preserves generic parameter names in that
+  shared model. Dispatch for typed alias and impl declarations remains closed:
+  constructing those typed payload paths currently exposes an erased-storage
+  ownership/layout defect around `ParsedIdentifier`. The lowering helpers and
+  Core representation are ready, but production dispatch must not be enabled
+  until that compiler ownership defect has a focused reproducer and fix.
 - `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
   Tensor-shaped type lowering exists in the helper, but the runtime test avoids
   constructing that metadata until backend test emission handles it cheaply.

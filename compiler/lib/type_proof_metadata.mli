@@ -67,7 +67,6 @@ val binding_refinement_of_expr_proofs : expr_proofs -> binding_refinement
 val collection_identity_equal :
   collection_identity -> collection_identity -> bool
 
-val dimension_identity_equal : dimension_identity -> dimension_identity -> bool
 val proven_collection_equal : proven_collection -> proven_collection -> bool
 val collection_identity : string -> collection_identity option
 val collection_identity_name : collection_identity -> string
@@ -146,9 +145,6 @@ val proves_direct_subscript_with_bounds :
   range_proof -> bounds:subscript_bounds -> bool
 
 val proves_direct_subscript : range_proof -> bounds:subscript_bound list -> bool
-
-val proves_offset_subscript_with_bounds :
-  range_proof -> bounds:subscript_bounds -> offset:int -> offset_subscript_proof
 
 val proves_offset_subscript :
   range_proof ->

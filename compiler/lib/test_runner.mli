@@ -24,9 +24,6 @@ type sanitizer_mode =
 val sanitizer_mode_of_string : string -> sanitizer_mode option
 (** Parse CLI/env sanitizer mode values. *)
 
-val sanitizer_mode_to_string : sanitizer_mode -> string
-(** Stable display/cache string for a sanitizer mode. *)
-
 val sanitizer_enabled : sanitizer_mode -> bool
 (** Whether the mode emits any sanitizer instrumentation. *)
 

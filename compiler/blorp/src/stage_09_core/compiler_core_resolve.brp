@@ -1,0 +1,194 @@
+-- Resolve typed callable identities after lowering has assembled a Core program.
+--
+-- This slice resolves only calls carrying callable ids. Name-based UnknownCall
+-- resolution needs module, builtin, foreign, and bound-local registries;
+-- guessing before those registries exist would misclassify calls.
+import:
+	compiler_core_json:
+		CoreCallKind(SelectedDirectCall, UnknownCall, UserCall),
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(CallExpr, VarExpr),
+		CoreFunction,
+		CoreGlobal,
+		CoreProgram,
+	compiler_core_traverse: map_core_expr_children
+
+
+private record CoreCallableIdentity {
+	name: String,
+	def_id: Int
+}
+
+
+-- Def ids are module-local. Qualified name plus id is the callable identity;
+-- repeated occurrences are normal when module graph assembly shares imports.
+private pure func callable_identity_exists(
+	callables: List[CoreCallableIdentity],
+	callee_name: String,
+	selected_id: Int,
+) -> Bool:
+	var found: Bool = False
+
+	for callable in callables:
+		if callable.def_id == selected_id and callable.name == callee_name:
+			found = True
+			break
+		else:
+			void
+
+	found
+
+
+private pure func call_selected_id(kind: CoreCallKind, callee_id: Option[Int]) -> Option[Int]:
+	match kind:
+		SelectedDirectCall(def_id):
+			Some(def_id)
+		UnknownCall:
+			callee_id
+		_:
+			None
+
+
+private pure func call_id_agrees_with_callee(
+	kind: CoreCallKind,
+	callee_id: Option[Int],
+	selected_id: Int,
+) -> Bool:
+	match kind:
+		SelectedDirectCall(_):
+			callee_id.is_none() or callee_id == Some(selected_id)
+		UnknownCall:
+			callee_id == Some(selected_id)
+		_:
+			False
+
+
+private pure func resolve_callable_id_expr(
+	callables: List[CoreCallableIdentity],
+	expr: CoreExpr,
+) -> CoreExpr:
+	resolved_children: CoreExpr = map_core_expr_children(
+		expr,
+		func(child): resolve_callable_id_expr(callables, child),
+	)
+
+	match resolved_children:
+		CallExpr(kind, callee, args, typ, loc):
+			match callee:
+				VarExpr(variable, _, _):
+					match call_selected_id(kind, variable.def_id):
+						Some(def_id):
+							if call_id_agrees_with_callee(kind, variable.def_id, def_id):
+								if callable_identity_exists(callables, variable.name, def_id):
+									CallExpr(
+										UserCall(variable.name, Some(def_id), []),
+										callee,
+										args,
+										typ,
+										loc,
+									)
+								else:
+									resolved_children
+							else:
+								resolved_children
+						None:
+							resolved_children
+				_:
+					resolved_children
+		_:
+			resolved_children
+
+
+private pure func program_callables(program: CoreProgram) -> List[CoreCallableIdentity]:
+	var callables: List[CoreCallableIdentity] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				callables = callables.append({
+					name = function_info.name,
+					def_id = function_info.def_id,
+				})
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							callables = callables.append({
+								name = variant.name,
+								def_id = def_id,
+							})
+						None:
+							void
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							callables = callables.append({
+								name = variant.name,
+								def_id = def_id,
+							})
+						None:
+							void
+			_:
+				void
+
+	callables
+
+
+private pure func resolve_function(
+	callables: List[CoreCallableIdentity],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(func(body): resolve_callable_id_expr(callables, body))
+	}
+
+
+private pure func resolve_global(
+	callables: List[CoreCallableIdentity],
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = resolve_callable_id_expr(callables, global.init) }
+
+
+private pure func resolve_decl(callables: List[CoreCallableIdentity], decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(resolve_function(callables, function_info))
+		GlobalDecl(global):
+			GlobalDecl(resolve_global(callables, global))
+		EnumDecl(_):
+			decl
+		UnionDecl(_):
+			decl
+		ValueRecordDecl(_):
+			decl
+		HeapRecordDecl(_):
+			decl
+		TypeAliasDecl(_):
+			decl
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): resolve_function(callables, method),
+					)
+				},
+			)
+
+
+pure func resolve_callable_id_calls(program: CoreProgram) -> CoreProgram:
+	callables: List[CoreCallableIdentity] = program_callables(program)
+	{
+		decls = program.decls.map(func(decl): resolve_decl(callables, decl)),
+		foreign_includes = program.foreign_includes.map(func(include): include)
+	}

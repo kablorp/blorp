@@ -433,11 +433,13 @@ pure func decl_env_program() -> CoreProgram:
 		decls = [
 			HeapRecordDecl({
 				name = "Node",
+				type_params = [],
 				fields = [],
 				loc = SyntheticSourceLoc,
 			}),
 			UnionDecl({
 				name = "Tree",
+				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [
 					union_variant("Leaf", 0, None, []),
@@ -452,6 +454,7 @@ pure func decl_env_program() -> CoreProgram:
 			}),
 			UnionDecl({
 				name = "BoxedString",
+				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [union_variant("Node", 0, Some(99), [union_field(string_type())])],
 				loc = SyntheticSourceLoc,
@@ -1892,6 +1895,7 @@ pure func test_borrowed_managed_parameter_field_return_is_retained() -> Bool:
 	program: CoreProgram = {
 		decls = [HeapRecordDecl({
 				name = "Node",
+				type_params = [],
 				fields = [],
 				loc = SyntheticSourceLoc,
 			}), function_decl(
@@ -1922,6 +1926,7 @@ pure func test_managed_field_of_owned_temporary_return_is_retained() -> Bool:
 	program: CoreProgram = {
 		decls = [HeapRecordDecl({
 				name = "Node",
+				type_params = [],
 				fields = [],
 				loc = SyntheticSourceLoc,
 			}), function_decl("node_items", 87, [], list_int_type(), field_result)],
@@ -1964,6 +1969,36 @@ pure func test_borrowed_parameter_returned_from_branch_is_retained() -> Bool:
 	match function_body(rewritten, "choose"):
 		Some(rewritten_body):
 			dup_count_for("value", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_owned_local_returned_from_branch_transfers_owner() -> Bool:
+	local: CoreVar = named_var("result")
+	body: CoreExpr = LetExpr(
+		local,
+		False,
+		list_int_type(),
+		intrinsic_expr("list_alloc", [int_expr(0)], list_int_type()),
+		IfExpr(
+			bool_expr(True),
+			var_expr("result", list_int_type()),
+			var_expr("result", list_int_type()),
+			list_int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("return_local", 92, [], list_int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "return_local"):
+		Some(rewritten):
+			(
+				drop_count_for("result", rewritten) == 0
+				and dup_count_for("result", rewritten) == 0
+			)
 		None:
 			False
 
@@ -2093,6 +2128,7 @@ pure func test_union_construction_retains_borrowed_parameter_payload() -> Bool:
 	program: CoreProgram = {
 		decls = [UnionDecl({
 				name = "BoxedString",
+				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [union_variant("Node", 0, Some(99), [union_field(string_type())])],
 				loc = SyntheticSourceLoc,
@@ -2708,6 +2744,7 @@ pure func test_nested_consumed_parameter_returns_transfer_each_owner() -> Bool:
 		decls = [
 			UnionDecl({
 				name = "Doc",
+				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [
 					union_variant("Nil", 0, None, []),
@@ -3858,6 +3895,36 @@ pure func test_mutable_assignment_in_constructor_match_releases_replaced_owner()
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
 
 	drop_count_for("xs", rewritten) == 2 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_mutable_constructor_match_result_retains_direct_return_branch() -> Bool:
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[],
+				user_call_expr(
+					"borrowed_result",
+					Some(81),
+					[],
+					[var_expr("xs", list_int_type())],
+					list_int_type(),
+				),
+			)],
+		var_expr("xs", list_int_type()),
+		list_int_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("xs"),
+			True,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			match_body,
+		),
+	)
+
+	dup_count_for("xs", rewritten) == 2 and drop_count_for("xs", rewritten) == 1
 
 
 pure func test_shadowed_match_binding_freshens_before_outer_owner_balance() -> Bool:
@@ -5154,6 +5221,7 @@ pure func test_managed_union_builtin_wrapper_borrows_argument() -> Bool:
 	attempt_type: CoreType = recv_attempt_string_type()
 	attempt_union: CoreDecl = UnionDecl({
 		name = "RecvAttempt",
+		type_params = [],
 		payload_storage = ErasedUnionPayloadStorage,
 		variants = [union_variant("RecvValue", 0, Some(219), [union_field(string_type())])],
 		loc = SyntheticSourceLoc,
@@ -5460,6 +5528,7 @@ pure func test_borrowed_match_binding_is_retained_in_aggregate_call_arg() -> Boo
 	program: CoreProgram = insert_drops_program({
 		decls = [HeapRecordDecl({
 				name = "Box",
+				type_params = [],
 				fields = [],
 				loc = SyntheticSourceLoc,
 			}), function_decl(
@@ -5473,6 +5542,54 @@ pure func test_borrowed_match_binding_is_retained_in_aggregate_call_arg() -> Boo
 	})
 
 	match function_body(program, "pack_call_arg"):
+		Some(rewritten):
+			dup_count_for("payload", rewritten) == 1
+		None:
+			False
+
+
+pure func test_borrowed_match_binding_is_retained_in_stack_result_constructor() -> Bool:
+	payload_type: CoreType = UnionType("WorkError")
+	result_type: CoreType = StackResultType(int_type(), payload_type)
+	err_result: CoreExpr = CallExpr(
+		UserCall("Err", Some(62610), []),
+		var_expr("Err", NamedType("Function", [])),
+		[var_expr("payload", payload_type)],
+		result_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [match_binding("payload", payload_type)], err_result)],
+		CallExpr(
+			UserCall("Ok", Some(62609), []),
+			var_expr("Ok", NamedType("Function", [])),
+			[int_expr(0)],
+			result_type,
+			SyntheticSourceLoc,
+		),
+		result_type,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			UnionDecl({
+				name = "WorkError",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"return_error",
+				220,
+				[core_param("tag", UnionType("Tag"))],
+				result_type,
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "return_error"):
 		Some(rewritten):
 			dup_count_for("payload", rewritten) == 1
 		None:
@@ -5812,12 +5929,20 @@ tests: TestSuite = {
 			test_borrowed_parameter_returned_from_branch_is_retained,
 		),
 		(
+			"owned local returned from branch transfers owner",
+			test_owned_local_returned_from_branch_transfers_owner,
+		),
+		(
 			"borrowed match binding return is retained",
 			test_borrowed_match_binding_return_is_retained,
 		),
 		(
 			"borrowed match binding result in let RHS is retained",
 			test_borrowed_match_binding_result_in_let_rhs_is_retained,
+		),
+		(
+			"borrowed match binding in stack result constructor is retained",
+			test_borrowed_match_binding_is_retained_in_stack_result_constructor,
 		),
 		(
 			"owned list spread match binding is released",
@@ -6041,6 +6166,10 @@ tests: TestSuite = {
 		(
 			"mutable assignment in constructor match releases replaced owner",
 			test_mutable_assignment_in_constructor_match_releases_replaced_owner,
+		),
+		(
+			"mutable constructor match result retains direct return branch",
+			test_mutable_constructor_match_result_retains_direct_return_branch,
 		),
 		(
 			"shadowed match binding freshens before outer owner balance",

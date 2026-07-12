@@ -8165,6 +8165,7 @@ let enum_decl_json path loc (type_decl : Ast.type_decl) =
       (kind "enum"
          [
            ("name", str type_decl.type_name);
+           ("type_params", string_list_json (Ast.type_param_names type_decl.type_params));
            ("variants", variants);
            ("loc", source_loc_json loc);
          ])
@@ -8243,6 +8244,7 @@ let union_decl_json ~reg enum_names value_record_names heap_record_names union_n
       (kind "union"
          [
            ("name", str type_decl.type_name);
+           ("type_params", string_list_json (Ast.type_param_names type_decl.type_params));
            ( "payload_storage",
              union_payload_storage_json_for_type ~reg type_decl.type_name );
            ("variants", variants);
@@ -8278,6 +8280,8 @@ let value_record_decl_json ~reg enum_names value_record_names heap_record_names 
       (kind "value_record"
          [
            ("name", str record_decl.record_name);
+           ( "type_params",
+             string_list_json (Ast.type_param_names record_decl.record_type_params) );
            ("fields", fields);
            ("loc", source_loc_json loc);
          ])
@@ -8315,6 +8319,8 @@ let heap_record_decl_json ~reg enum_names value_record_names heap_record_names u
       (kind "heap_record"
          [
            ("name", str record_decl.record_name);
+           ( "type_params",
+             string_list_json (Ast.type_param_names record_decl.record_type_params) );
            ("fields", fields);
            ("loc", source_loc_json loc);
          ])

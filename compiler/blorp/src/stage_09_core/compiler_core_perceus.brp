@@ -21,7 +21,9 @@ import:
 			IntrinsicCall,
 			ListToStringCall,
 			OperationResultCall,
+			SelectedDirectCall,
 			TensorParallelCall,
+			UnknownCall,
 			UserCall,
 		),
 		CoreClosureCapture,
@@ -729,11 +731,38 @@ private pure func lookup_return_type_constructor_call_contract(
 	arg_count: Int,
 	return_type: CoreType,
 ) -> Option[OwnershipCallContract]:
-	match optional_constructor_parent_name(return_type):
-		Some(parent_type_name):
-			constructor_contract_by_return_type(env, parent_type_name, name, def_id, arg_count)
-		None:
-			None
+	match return_type:
+		StackResultType(_, _):
+			result_constructor_contract(env, name, arg_count, return_type)
+		BoxedResultType(_, _):
+			result_constructor_contract(env, name, arg_count, return_type)
+		_:
+			match optional_constructor_parent_name(return_type):
+				Some(parent_type_name):
+					constructor_contract_by_return_type(
+						env,
+						parent_type_name,
+						name,
+						def_id,
+						arg_count,
+					)
+				None:
+					None
+
+
+private pure func result_constructor_contract(
+	env: PerceusEnv,
+	name: String,
+	arg_count: Int,
+	return_type: CoreType,
+) -> Option[OwnershipCallContract]:
+	if arg_count == 1 and env.constructor_names.contains(name):
+		Some({
+			args = transfer_args(arg_count),
+			result = result_mode_for_type(env, return_type),
+		})
+	else:
+		None
 
 
 private pure func return_type_has_known_constructor_parent(
@@ -814,6 +843,10 @@ pure func contract_for_call(
 	return_type: CoreType,
 ) -> Option[OwnershipCallContract]:
 	match kind:
+		UnknownCall:
+			None
+		SelectedDirectCall(def_id):
+			None
 		IntrinsicCall(name):
 			intrinsic_contract(name, arg_count)
 		BuiltinCall(name):
@@ -1795,6 +1828,10 @@ private pure func summarize_linear_call(
 			)
 
 			summaries: List[OwnershipUseSummary] = match kind:
+				UnknownCall:
+					arg_uses
+				SelectedDirectCall(def_id):
+					arg_uses
 				ClosureCall:
 					[summarize_linear_borrow(env, name, callee)] + arg_uses
 				BuiltinCall(call_name):
@@ -8168,6 +8205,23 @@ private pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
 
 
+private pure func add_transferable_result_var(
+	variables: List[CoreVar],
+	variable: CoreVar,
+) -> List[CoreVar]:
+	if variables.any(func(candidate): same_core_var(candidate, variable)):
+		variables
+	else:
+		variables.append(copy_core_var(variable))
+
+
+private pure func remove_transferable_result_var(
+	variables: List[CoreVar],
+	variable: CoreVar,
+) -> List[CoreVar]:
+	variables.filter(func(candidate): not same_core_var(candidate, variable))
+
+
 private pure func result_transfers_existing_owner(env: PerceusEnv, expr: CoreExpr) -> Bool:
 	match expr:
 		VarExpr(variable, typ, loc):
@@ -8375,19 +8429,35 @@ private pure func normalize_owned_result_aliases(env: PerceusEnv, expr: CoreExpr
 					loc,
 				)
 			LetExpr(variable, is_mutable, typ, rhs, body):
+				body_env: PerceusEnv = if is_managed_type(env, typ):
+					{ env |
+						transferable_result_vars = add_transferable_result_var(
+							env.transferable_result_vars,
+							variable,
+						)
+					}
+				else:
+					env
+
 				LetExpr(
 					copy_core_var(variable),
 					is_mutable,
 					copy_core_type(typ),
 					rhs,
-					normalize_owned_result_aliases(env, body),
+					normalize_owned_result_aliases(body_env, body),
 				)
 			BorrowLetExpr(variable, typ, rhs, body):
+				body_env: PerceusEnv = { env |
+					transferable_result_vars = remove_transferable_result_var(
+						env.transferable_result_vars,
+						variable,
+					)
+				}
 				BorrowLetExpr(
 					copy_core_var(variable),
 					copy_core_type(typ),
 					rhs,
-					normalize_owned_result_aliases(env, body),
+					normalize_owned_result_aliases(body_env, body),
 				)
 			SeqExpr(first, second):
 				SeqExpr(
@@ -8780,6 +8850,76 @@ private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> C
 			expr
 
 
+-- Match cleanup can forward a branch result through a temporary, hiding the
+-- fact that one branch returns a mutable slot directly. Retain those branch
+-- results while the source result-position structure is still explicit.
+private pure func retain_mutable_match_branch_results(
+	env: PerceusEnv,
+	param: CoreParam,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(first, second):
+			SeqExpr(first, retain_mutable_match_branch_results(env, param, second))
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			if variable.name == param.name.name:
+				LetExpr(variable, is_mutable, typ, rhs, body)
+			else:
+				LetExpr(
+					variable,
+					is_mutable,
+					typ,
+					rhs,
+					retain_mutable_match_branch_results(env, param, body),
+				)
+		BorrowLetExpr(variable, typ, rhs, body):
+			if variable.name == param.name.name:
+				BorrowLetExpr(variable, typ, rhs, body)
+			else:
+				BorrowLetExpr(
+					variable,
+					typ,
+					rhs,
+					retain_mutable_match_branch_results(env, param, body),
+				)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				cond,
+				retain_mutable_match_branch_results(env, param, then_expr),
+				retain_mutable_match_branch_results(env, param, else_expr),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(_, _, _, _, _):
+			retain_borrowed_param_result(env, param, expr)
+		AccessorLiteralMatchExpr(_, _, _, _, _):
+			retain_borrowed_param_result(env, param, expr)
+		LengthMatchExpr(_, _, _, _, _):
+			retain_borrowed_param_result(env, param, expr)
+		ConstructorMatchExpr(_, _, _, _, _, _):
+			retain_borrowed_param_result(env, param, expr)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				retain_mutable_match_branch_results(env, param, body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				retain_mutable_match_branch_results(env, param, body),
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+
 private pure func rewrite_managed_let(
 	env: PerceusEnv,
 	variable: CoreVar,
@@ -8790,7 +8930,19 @@ private pure func rewrite_managed_let(
 ) -> CoreExpr:
 	owned_rhs: CoreExpr = normalize_binding_alias_rhs(env, bind_type, rhs)
 	rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, owned_rhs)
-	rewritten_body: CoreExpr = insert_drops_expr_inner(env, body)
+	branch_safe_body: CoreExpr = if is_mutable:
+		retain_mutable_match_branch_results(
+			env,
+			{
+				name = copy_core_var(variable),
+				typ = copy_core_type(bind_type),
+				loc = SyntheticSourceLoc
+			},
+			body,
+		)
+	else:
+		body
+	rewritten_body: CoreExpr = insert_drops_expr_inner(env, branch_safe_body)
 	managed_binding: Bool = not is_immortal_closure_expr(env, owned_rhs)
 
 	balances_nested_matches: Bool = (

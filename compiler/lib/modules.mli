@@ -30,11 +30,6 @@ type loaded_module = Session.loaded_module = {
 val is_package_loaded_module : loaded_module -> bool
 (** True iff this loaded module came from an explicit package import. *)
 
-val is_std_source_file : ?sess:Session.t -> string -> bool
-(** True iff [path] is inside the configured filesystem std root, or is an
-    embedded std pseudo-path. This is deliberately stricter than substring
-    checks: arbitrary user directories named [std] do not become stdlib. *)
-
 val is_path_under_dir : dir:string -> string -> bool
 (** True iff [path] is [dir] or a descendant of [dir], using canonical
     filesystem paths and directory boundaries rather than string prefixes. *)

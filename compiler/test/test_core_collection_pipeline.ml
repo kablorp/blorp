@@ -419,7 +419,7 @@ let test_recognizes_filter_map_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter->map->fold plan shape")
   | None -> Alcotest.fail "expected filter->map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_fold () =
@@ -438,7 +438,7 @@ let test_recognizes_filter_map_hof_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter_map->fold plan shape")
   | None -> Alcotest.fail "expected filter_map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_collect () =
@@ -458,7 +458,7 @@ let test_recognizes_filter_map_hof_collect () =
           LP.UpperBound,
           TyNamed ("List", [ TyNamed ("Int", []) ]) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter_map collect plan shape")
   | None -> Alcotest.fail "expected filter_map collect pipeline plan"
 
 let test_recognizes_range_map_filter () =
@@ -473,7 +473,7 @@ let test_recognizes_range_map_filter () =
             { result_ty = TyNamed ("List", [ TyNamed ("Int", []) ]) },
           LP.UpperBound ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected range->map->filter plan shape")
   | None -> Alcotest.fail "expected range->map->filter pipeline plan"
 
 let test_rejects_materialized_let () =
@@ -1364,9 +1364,7 @@ let test_list_pipeline_exposes_nonempty_stages () =
       match (LP.source plan, LP.stages plan, LP.sink plan) with
       | LP.SourceList _, [ LP.StageFilter _; LP.StageMap _ ], LP.SinkFold _ ->
           ()
-      | _ ->
-          Alcotest.failf "unexpected ListPipeline shape: %s"
-            (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected ListPipeline shape")
   | None -> Alcotest.fail "expected explicit ListPipeline plan"
 
 let suite =

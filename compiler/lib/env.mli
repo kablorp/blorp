@@ -461,9 +461,6 @@ val set_type_param_bounds : env -> bound_type_param list -> env
 val has_trait_bound : env -> string -> string -> bool
 (** Check if a type parameter has a specific trait bound *)
 
-val has_trait_bound_transitive : env -> string -> string -> bool
-(** Check if a type parameter satisfies a trait bound transitively (through supertraits) *)
-
 val trait_method_names_transitive : env -> string -> string list
 (** All method names reachable from [trait_name] through its own
     declaration + the transitive supertrait graph. Cycle-safe. Used
@@ -476,9 +473,6 @@ val trait_methods_with_declaring_trait : env -> string -> (string * string) list
     trait-function bindings for an imported trait that has
     supertraits — each inherited method must bind to its declaring
     trait for correct dispatch. *)
-
-val trait_has_supertrait : env -> string -> string -> bool
-(** Check if a trait has another trait as a supertrait (transitively) *)
 
 val find_trait_method_for_param :
   env -> string -> string -> (trait_method_sig * string) option

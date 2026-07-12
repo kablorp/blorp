@@ -935,7 +935,7 @@ let test_resolve_ufcs_name_ignores_stale_carried_def_id () =
       Alcotest.(check (option int)) "explicit UFCS def id" (Some 1652) def_id
   | _ -> Alcotest.fail "expected explicit UFCS name to beat stale vdef_id"
 
-let test_resolve_selected_direct_rejects_stale_signature () =
+let test_resolve_selected_direct_prefers_canonical_name_over_colliding_id () =
   let ty_string = TyNamed ("String", []) in
   let ty_list_string = TyNamed ("List", [ ty_string ]) in
   let split_func : core_func =
@@ -962,8 +962,8 @@ let test_resolve_selected_direct_rejects_stale_signature () =
       cf_module = Some "std/list";
       cf_params =
         [
-          { cp_name = Var.named "self"; cp_ty = ty_list_string; cp_loc = loc };
-          { cp_name = Var.named "index"; cp_ty = ty_int; cp_loc = loc };
+          { cp_name = Var.named "self"; cp_ty = ty_string; cp_loc = loc };
+          { cp_name = Var.named "delim"; cp_ty = ty_string; cp_loc = loc };
         ];
       cf_return_ty = ty_list_string;
       cf_body = Some (mk CVoid ty_void);
@@ -2456,8 +2456,9 @@ let suite =
           test_resolve_qualified_call_prefers_carried_def_id_name;
         Alcotest.test_case "ufcs_name_ignores_stale_carried_def_id" `Quick
           test_resolve_ufcs_name_ignores_stale_carried_def_id;
-        Alcotest.test_case "selected_direct_rejects_stale_signature" `Quick
-          test_resolve_selected_direct_rejects_stale_signature;
+        Alcotest.test_case
+          "selected_direct_prefers_canonical_name_over_colliding_id" `Quick
+          test_resolve_selected_direct_prefers_canonical_name_over_colliding_id;
         Alcotest.test_case "local_value_shadows_module_alias_call" `Quick
           test_resolve_local_value_shadows_module_alias_call;
         Alcotest.test_case "resource_scope_shadows_module_alias_call" `Quick

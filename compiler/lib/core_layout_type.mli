@@ -199,8 +199,6 @@ val storage_release : t -> storage_release
 val storage_release_or_error :
   ?phase:Core_error.phase_tag -> t -> storage_release_capability
 
-val storage_requires_release_or_error : ?phase:Core_error.phase_tag -> t -> bool
-
 val boxed_storage_requires_release_or_error :
   ?phase:Core_error.phase_tag ->
   reg:Codegen_types.registry ->
@@ -342,12 +340,6 @@ val dict_type : ?reg:Codegen_types.registry -> Ast.type_expr -> dict_type option
 val tensor_element_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> tensor_element_storage
 
-val list_storage_layout_of_elem :
-  ?reg:Codegen_types.registry ->
-  Ast.type_expr ->
-  Ast.loc ->
-  Core.list_storage_layout
-
 val list_storage_layout_of_type :
   ?reg:Codegen_types.registry ->
   Ast.type_expr ->
@@ -365,9 +357,6 @@ val tensor_storage_layout_of_type :
   Ast.type_expr ->
   Ast.loc ->
   Core.tensor_storage_layout
-
-val nullable_managed_option_payload_type :
-  reg:Codegen_types.registry -> Ast.type_expr -> Ast.type_expr option
 
 val is_nullable_managed_option :
   reg:Codegen_types.registry -> Ast.type_expr -> bool

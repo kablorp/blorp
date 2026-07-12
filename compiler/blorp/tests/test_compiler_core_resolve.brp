@@ -1,0 +1,239 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(SelectedDirectCall, UnknownCall, UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LiteralExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_resolve: resolve_callable_id_calls
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func selected_call(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, Some(def_id)),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func selected_call_without_callee_id(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func unknown_call(name: String, def_id: Option[Int]) -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var(name, def_id),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func main_body(program_value: CoreProgram) -> Option[CoreExpr]:
+	match program_value.decls.get(0):
+		Some(FunctionDecl(function_info)):
+			function_info.body
+		_:
+			None
+
+
+pure func test_resolves_unique_selected_direct_call() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			selected_call("helper", 2),
+		),
+		function_decl("helper", 2, int_literal(42)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), _, _, _, _)):
+			name == "helper" and def_id == Some(2) and consumed_args.length() == 0
+		_:
+			False
+
+
+pure func test_resolves_selected_direct_metadata_without_callee_id() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			selected_call_without_callee_id("helper", 2),
+		),
+		function_decl("helper", 2, int_literal(42)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), _, _, _, _)):
+			name == "helper" and def_id == Some(2) and consumed_args.length() == 0
+		_:
+			False
+
+
+pure func test_resolves_module_local_id_collision_by_qualified_name() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			selected_call("helper", 2),
+		),
+		function_decl("helper", 2, int_literal(42)),
+		function_decl("other", 2, int_literal(7)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), _, _, _, _)):
+			name == "helper" and def_id == Some(2) and consumed_args.length() == 0
+		_:
+			False
+
+
+pure func test_resolves_repeated_callable_identity() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			selected_call("helper", 2),
+		),
+		function_decl("helper", 2, int_literal(42)),
+		function_decl("helper", 2, int_literal(7)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), _, _, _, _)):
+			name == "helper" and def_id == Some(2) and consumed_args.length() == 0
+		_:
+			False
+
+
+pure func test_leaves_stale_selected_name_unresolved() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			selected_call("stale_name", 2),
+		),
+		function_decl("helper", 2, int_literal(42)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(SelectedDirectCall(def_id), _, _, _, _)):
+			def_id == 2
+		_:
+			False
+
+
+pure func test_resolves_unknown_call_with_unique_callable_id() -> Bool:
+	resolved = resolve_callable_id_calls(program([
+		function_decl(
+			"main",
+			1,
+			unknown_call("helper", Some(2)),
+		),
+		function_decl("helper", 2, int_literal(42)),
+	]))
+
+	match main_body(resolved):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), _, _, _, _)):
+			name == "helper" and def_id == Some(2) and consumed_args.length() == 0
+		_:
+			False
+
+
+pure func test_preserves_unknown_call() -> Bool:
+	unknown = unknown_call("external", None)
+	resolved = resolve_callable_id_calls(program([function_decl("main", 1, unknown)]))
+
+	match main_body(resolved):
+		Some(CallExpr(UnknownCall, _, _, _, _)):
+			True
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler selected direct call resolution",
+	tests = [
+		("resolves unique selected direct call", test_resolves_unique_selected_direct_call),
+		(
+			"resolves selected metadata without callee id",
+			test_resolves_selected_direct_metadata_without_callee_id,
+		),
+		(
+			"resolves module-local id collision by qualified name",
+			test_resolves_module_local_id_collision_by_qualified_name,
+		),
+		("resolves repeated callable identity", test_resolves_repeated_callable_identity),
+		("leaves stale selected name unresolved", test_leaves_stale_selected_name_unresolved),
+		(
+			"resolves unknown call with unique callable id",
+			test_resolves_unknown_call_with_unique_callable_id,
+		),
+		("preserves unknown call", test_preserves_unknown_call),
+	]
+}
