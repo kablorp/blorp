@@ -19,6 +19,8 @@ type reason = Type_widening_metadata.reason =
   | CollectionElement of collection_kind
   | BitwiseOperator
   | MethodReceiver
+  | RangeProofErasure
+  | TupleLiteral
   | NumericOperator of binop
 
 type decision = Type_widening_metadata.decision =

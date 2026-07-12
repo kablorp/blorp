@@ -7,7 +7,7 @@
 
     The tests avoid module loading — a single-file program exercised through
     [Core_pipeline.compile_typed] is enough to prove hook plumbing works.
-    [Pipeline.compile]-level tests that exercise module loading belong in
+    [Pipeline.compile_legacy_direct_source]-level tests that exercise module loading belong in
     [test_pipeline.ml] when it exists. *)
 
 open Blorp
@@ -229,7 +229,7 @@ let test_compile_with_modules_uses_same_stage_order () =
   Blorp.Modules.init_module_paths ".";
   let module_stages = ref [] in
   match
-    Pipeline.compile ~embed_runtime:false
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false
       ~on_stage:(fun stage _ -> module_stages := stage :: !module_stages)
       ~filename:"<test>" ~source:small_source ()
   with
@@ -245,19 +245,19 @@ let test_compile_with_modules_uses_same_stage_order () =
       Alcotest.failf "compile_with_modules failed: %d errors" (List.length errs)
 
 let test_pipeline_stopped_returns_tagged_outcome () =
-  (* Phase 0.5.2: Pipeline.compile returns Ok (Stopped_at s) instead of
+  (* Phase 0.5.2: Pipeline.compile_legacy_direct_source returns Ok (Stopped_at s) instead of
      re-raising Stopped_after. The exception stays inside Core_pipeline
      as an internal short-circuit but is converted at the Pipeline
      boundary so callers pattern-match a normal sum type. *)
   let source = small_source in
-  (* Prime module loading so Pipeline.compile doesn't fail to find std. *)
+  (* Prime module loading so Pipeline.compile_legacy_direct_source doesn't fail to find std. *)
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   let on_stage stage _prog =
     if stage = Core_stage.Mono then
       raise (Core_pipeline.Stopped_after Core_stage.Mono)
   in
-  match Pipeline.compile ~on_stage ~filename:"<test>" ~source () with
+  match Pipeline.compile_legacy_direct_source ~on_stage ~filename:"<test>" ~source () with
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.(check string) "stopped at mono" "mono" (Core_stage.to_string s)
   | Ok (Pipeline.Compiled _) ->
@@ -270,7 +270,7 @@ let test_pipeline_no_stop_returns_compiled () =
   let source = small_source in
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
-  match Pipeline.compile ~filename:"<test>" ~source () with
+  match Pipeline.compile_legacy_direct_source ~filename:"<test>" ~source () with
   | Ok (Pipeline.Compiled r) ->
       Alcotest.(check bool) "c_code non-empty" true (String.length r.c_code > 0)
   | Ok (Pipeline.Stopped_at _) ->
@@ -291,7 +291,7 @@ let test_pipeline_frontend_phases_fire_before_core () =
     core_stages := Core_stage.to_string stage :: !core_stages
   in
   match
-    Pipeline.compile ~embed_runtime:false ~on_frontend_phase ~on_stage
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_frontend_phase ~on_stage
       ~filename:"<test>" ~source ()
   with
   | Ok (Pipeline.Compiled _) ->
@@ -312,7 +312,7 @@ let test_pipeline_stage_events_fire_without_program_callback () =
   Blorp.Modules.init_module_paths ".";
   let core_stages = ref [] in
   match
-    Pipeline.compile ~embed_runtime:false
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false
       ~on_stage_event:(fun stage -> core_stages := stage :: !core_stages)
       ~filename:"<test>" ~source ()
   with
@@ -329,7 +329,7 @@ let test_normal_build_removes_debug_block () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   match
-    Pipeline.compile ~embed_runtime:false ~filename:"<test>"
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false ~filename:"<test>"
       ~source:debug_block_source ()
   with
   | Ok (Pipeline.Compiled r) ->
@@ -344,7 +344,7 @@ let test_debug_build_keeps_debug_block () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   match
-    Pipeline.compile ~debug:true ~embed_runtime:false ~filename:"<test>"
+    Pipeline.compile_legacy_direct_source ~debug:true ~embed_runtime:false ~filename:"<test>"
       ~source:debug_block_source ()
   with
   | Ok (Pipeline.Compiled r) ->
@@ -359,7 +359,7 @@ let test_retain_debug_blocks_keeps_debug_block () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   match
-    Pipeline.compile ~retain_debug_blocks:true ~embed_runtime:false
+    Pipeline.compile_legacy_direct_source ~retain_debug_blocks:true ~embed_runtime:false
       ~filename:"<test>" ~source:debug_block_source ()
   with
   | Ok (Pipeline.Compiled r) ->
@@ -383,7 +383,7 @@ let test_pipeline_filter_map_collect_handoff_reuse () =
   in
   let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage
       ~on_stage_json:(fun stage json ->
         if stage = Core_stage.Reuse then reuse_json := Some json)
       ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"
@@ -421,7 +421,7 @@ let test_pipeline_float_filter_map_collect_handoff_reuse () =
   in
   let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage
       ~on_stage_json:(fun stage json ->
         if stage = Core_stage.Reuse then reuse_json := Some json)
       ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"
@@ -467,7 +467,7 @@ let test_pipeline_string_filter_map_collect_handoff_reuse () =
   in
   let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage
+    Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage
       ~on_stage_json:(fun stage json ->
         if stage = Core_stage.Reuse then reuse_json := Some json)
       ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"

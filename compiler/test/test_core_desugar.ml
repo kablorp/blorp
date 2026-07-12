@@ -398,6 +398,39 @@ let emit_program_to_string (prog : core_program) : string =
       Alcotest.failf "Blorp C emission failed: %s"
         (Blorp.Core_emit_blorp_c.unsupported_to_string err)
 
+let test_emit_boxed_vector_get_option () =
+  let vector_ty = TyArray (ty_string, [ TyConstInt 2 ]) in
+  let option_ty = TyNamed ("Option", [ ty_string ]) in
+  let body =
+    mk
+      (CCall
+         ( CKBuiltin "blorp_vector_get_opt",
+           mk CVoid (TyNamed ("Void", [])),
+           [ cvar "values" vector_ty; cint 0 ] ))
+      option_ty
+  in
+  let func : core_func =
+    {
+      cf_name = "get_first";
+      cf_type_params = [];
+      cf_params =
+        [ { cp_name = Var.named "values"; cp_ty = vector_ty; cp_loc = loc } ];
+      cf_module = None;
+      cf_return_ty = option_ty;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let c_code =
+    emit_program_to_string
+      [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ]
+  in
+  Alcotest.(check bool)
+    "boxed vector getter emitted" true
+    (Blorp.Modules.contains c_code "blorp_vector_get_opt")
+
 let test_e2e_record_update () =
   (* struct Pair { a: Int, b: Int }
      func compute() -> Int:
@@ -523,6 +556,11 @@ let suite =
         Alcotest.test_case "unknown_desugars" `Quick
           test_desugar_interp_unknown_desugars;
         Alcotest.test_case "empty" `Quick test_desugar_interp_empty;
+      ] );
+    ( "emit",
+      [
+        Alcotest.test_case "boxed_vector_get_option" `Quick
+          test_emit_boxed_vector_get_option;
       ] );
     ("e2e", [ Alcotest.test_case "record_update" `Quick test_e2e_record_update ]);
   ]

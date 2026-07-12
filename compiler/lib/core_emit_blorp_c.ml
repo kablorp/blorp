@@ -240,6 +240,7 @@ let supported_raw_tensor_access_builtins =
       "blorp_tensor5_checked_get_shape_f32";
       "blorp_matrix_set_opt_i64";
       "blorp_matrix_set_opt_nullable_i64";
+      "blorp_matrix_get_opt";
       "blorp_matrix_get_opt_bool";
       "blorp_matrix_get_opt_char";
       "blorp_matrix_get_opt_f16";
@@ -268,6 +269,7 @@ let supported_raw_tensor_access_builtins =
       "blorp_vector_get_opt_uint32";
       "blorp_vector_get_opt_uint64";
       "blorp_vector_get_opt_uint8";
+      "blorp_vector_get_opt";
       "blorp_vector_eq";
       "blorp_vector_abs";
       "blorp_vector_exp";

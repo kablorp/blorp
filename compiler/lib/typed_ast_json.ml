@@ -389,6 +389,8 @@ let decode_widening_reason path value =
       Ok (Ast.CollectionElement kind)
   | "bitwise_operator" -> Ok Ast.BitwiseOperator
   | "method_receiver" -> Ok Ast.MethodReceiver
+  | "range_proof_erasure" -> Ok Ast.RangeProofErasure
+  | "tuple_literal" -> Ok Ast.TupleLiteral
   | "numeric_operator" ->
       let* op = string_field path "op" value in
       let* op = decode_binary_op (path ^ ".op") op in

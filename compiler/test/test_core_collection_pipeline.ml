@@ -355,7 +355,7 @@ let count_user_call basename body =
     (fun acc node ->
       match node.desc with
       | CCall (CKUser (name, _), _, _)
-        when P.base_list_func_name name = Some basename ->
+        when LP.base_list_func_name name = Some basename ->
           acc + 1
       | _ -> acc)
     0 body
@@ -419,7 +419,7 @@ let test_recognizes_filter_map_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
   | None -> Alcotest.fail "expected filter->map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_fold () =
@@ -438,7 +438,7 @@ let test_recognizes_filter_map_hof_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
   | None -> Alcotest.fail "expected filter_map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_collect () =
@@ -458,7 +458,7 @@ let test_recognizes_filter_map_hof_collect () =
           LP.UpperBound,
           TyNamed ("List", [ TyNamed ("Int", []) ]) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
   | None -> Alcotest.fail "expected filter_map collect pipeline plan"
 
 let test_recognizes_range_map_filter () =
@@ -473,7 +473,7 @@ let test_recognizes_range_map_filter () =
             { result_ty = TyNamed ("List", [ TyNamed ("Int", []) ]) },
           LP.UpperBound ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.failf "unexpected plan: %s" (LP.describe_plan plan))
   | None -> Alcotest.fail "expected range->map->filter pipeline plan"
 
 let test_rejects_materialized_let () =

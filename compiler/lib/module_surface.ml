@@ -53,11 +53,6 @@ let symbol_kind_of_string = function
   | "impl_method" -> Ok ImplMethod
   | other -> Error ("unsupported module surface symbol kind `" ^ other ^ "`")
 
-let export_names surface = List.map (fun symbol -> symbol.name) surface.exports
-
-let private_names surface =
-  List.map (fun symbol -> symbol.name) surface.private_names
-
 let import_module_names surface =
   List.map (fun import -> import.module_path) surface.imports
 

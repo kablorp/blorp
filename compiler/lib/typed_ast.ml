@@ -264,9 +264,6 @@ let type_info_origin (info : type_info) = info.origin
 let type_info_proofs (info : type_info) = info.proofs
 let expr_resolved_call (expr : expr) = expr.info.resolved_call
 
-let expr_concrete_callable_id (expr : expr) =
-  Option.bind expr.info.resolved_call Ast.resolved_call_concrete_callable_id
-
 let semantic_type (expr : expr) = expr.info.semantic_ty
 let value_type (expr : expr) = expr.info.value_ty
 

@@ -517,6 +517,48 @@ let test_decode_widening_metadata () =
                   ("kind", String "collection_element");
                   ("collection", String "vector");
                 ] );
+          ]));
+
+  check_widening "range proof erasure"
+    (Widen
+       {
+         from_ty = TyRange (TyConstInt 10);
+         to_ty = TyNamed ("Int", []);
+         reason = RangeProofErasure;
+       })
+    (expect_widening
+       (Object
+          [
+            ("kind", String "widen");
+            ("from_type", Object [ ("kind", String "range"); ("inner", const_int 10) ]);
+            ("to_type", named "Int");
+            ("reason", Object [ ("kind", String "range_proof_erasure") ]);
+          ]));
+
+  check_widening "tuple literal"
+    (Widen
+       {
+         from_ty = TyTuple [ TyConstInt 1; TyConstInt 2 ];
+         to_ty = TyTuple [ TyNamed ("Int", []); TyNamed ("Int", []) ];
+         reason = TupleLiteral;
+       })
+    (expect_widening
+       (Object
+          [
+            ("kind", String "widen");
+            ( "from_type",
+              Object
+                [
+                  ("kind", String "tuple");
+                  ("items", Array [ const_int 1; const_int 2 ]);
+                ] );
+            ( "to_type",
+              Object
+                [
+                  ("kind", String "tuple");
+                  ("items", Array [ named "Int"; named "Int" ]);
+                ] );
+            ("reason", Object [ ("kind", String "tuple_literal") ]);
           ]))
 
 let test_decode_type_origin () =

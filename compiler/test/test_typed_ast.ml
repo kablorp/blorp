@@ -236,7 +236,8 @@ let test_expr_call_metadata_accessors () =
        (Blorp.Ast.expr_resolved_call call));
   Alcotest.(check (option int))
     "ast concrete callable id" (Some 42)
-    (Blorp.Ast.expr_concrete_callable_id call);
+    (Option.bind (Blorp.Ast.expr_resolved_call call)
+       Blorp.Ast.resolved_call_concrete_callable_id);
   match Blorp.Typed_ast.of_ast_expr call with
   | Ok typed ->
       check_true "resolved call retained"
@@ -247,7 +248,8 @@ let test_expr_call_metadata_accessors () =
            (Blorp.Typed_ast.expr_resolved_call typed));
       Alcotest.(check (option int))
         "concrete callable id" (Some 42)
-        (Blorp.Typed_ast.expr_concrete_callable_id typed)
+        (Option.bind (Blorp.Typed_ast.expr_resolved_call typed)
+           Blorp.Ast.resolved_call_concrete_callable_id)
   | Error _ -> Alcotest.fail "expected typed call expression"
 
 let test_expr_trait_method_concrete_callable_accessor () =
@@ -281,12 +283,14 @@ let test_expr_trait_method_concrete_callable_accessor () =
   let call = Blorp.Ast.with_expr_resolved_call call resolved in
   Alcotest.(check (option int))
     "ast concrete callable id includes impl method" (Some 99)
-    (Blorp.Ast.expr_concrete_callable_id call);
+    (Option.bind (Blorp.Ast.expr_resolved_call call)
+       Blorp.Ast.resolved_call_concrete_callable_id);
   match Blorp.Typed_ast.of_ast_expr call with
   | Ok typed ->
       Alcotest.(check (option int))
         "concrete callable id includes impl method" (Some 99)
-        (Blorp.Typed_ast.expr_concrete_callable_id typed)
+        (Option.bind (Blorp.Typed_ast.expr_resolved_call typed)
+           Blorp.Ast.resolved_call_concrete_callable_id)
   | Error _ -> Alcotest.fail "expected typed call expression"
 
 let test_expr_desc_returns_typed_children () =

@@ -585,7 +585,10 @@ let test_parse_source_response_decodes_module_surface () =
       Alcotest.(check (list string))
         "imports" [ "option" ] (Module_surface.import_module_names surface);
       Alcotest.(check (list string))
-        "exports" [ "main"; "render" ] (Module_surface.export_names surface)
+        "exports" [ "main"; "render" ]
+        (List.map
+           (fun (symbol : Module_surface.symbol) -> symbol.name)
+           surface.exports)
   | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
       Alcotest.fail "expected decoded module surface"
   | Ok (Blorp.Compiler_blorp_bridge.ParseSourceDiagnostics _) ->

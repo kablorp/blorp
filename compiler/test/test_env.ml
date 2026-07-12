@@ -1741,7 +1741,7 @@ let test_is_local_func_distinguishes_imported_and_builtin () =
 
    These guard against the class of bug that motivated moving session-wide
    env tables out of a module-level [Env.empty] binding and into the session:
-   process-global state leaking across independent [Pipeline.compile] calls,
+   process-global state leaking across independent [Pipeline.compile_legacy_direct_source] calls,
    producing order-dependent test failures. Ordinary overload sets are
    separately tested as env-local lexical state.
    ============================================================================ *)

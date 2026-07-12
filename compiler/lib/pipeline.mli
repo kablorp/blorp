@@ -23,25 +23,13 @@ type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 val frontend_phase_to_string : frontend_phase -> string
 (** Stable display label for frontend timing output. *)
 
-(** Outcome of [compile]. [Compiled] is the normal path; [Stopped_at]
+(** Source compilation outcome. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
-    pipeline via [Core_pipeline.Stopped_after]. Previously [compile]
-    re-raised the exception; Phase 0.5.2 converts it to a tagged
+    pipeline via [Core_pipeline.Stopped_after]. The pipeline boundary converts
+    the exception to a tagged
     variant at the library boundary so callers pattern-match the
     full outcome space instead of handling an out-of-band exception. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
-
-val typecheck_only_reusing_session :
-  sess:Session.t ->
-  filename:string ->
-  source:string ->
-  ?debug:bool ->
-  unit ->
-  (Ast.program, Ast.compiler_error list) result
-(** Reuses [sess]'s validated parse cache across
-    calls while resetting all semantic compilation state before each run.
-    Intended for batch test/tool workers that typecheck many independent files
-    in one process. *)
 
 val typecheck_only_typed_reusing_session :
   sess:Session.t ->
@@ -50,7 +38,9 @@ val typecheck_only_typed_reusing_session :
   ?debug:bool ->
   unit ->
   (Typed_ast.program, Ast.compiler_error list) result
-(** Typed-AST variant of [typecheck_only_reusing_session]. *)
+(** Reuses [sess]'s validated parse cache across calls while resetting all
+    semantic compilation state before each run. Intended for batch test/tool
+    workers that typecheck many independent files in one process. *)
 
 val typecheck_only_typed_with_blorp_bridge_policy :
   debug:bool ->
@@ -132,7 +122,7 @@ val compile_legacy_direct_source :
     and the current [core_program]. Used by [--dump-core-after] to print
     intermediate IR and by [--stop-after] to terminate early. Callbacks
     that raise [Core_pipeline.Stopped_after] do not propagate the exception
-    outward — [compile] catches it and returns [Ok (Stopped_at s)].
+    outward — this API catches it and returns [Ok (Stopped_at s)].
 
     [on_stage_event] fires after every Core pipeline stage with only the stage
     marker. Use it for timing or order observation that must not force Core
@@ -158,29 +148,6 @@ val compile_legacy_direct_source :
     consumes the single Blorp frontend graph and does not return to OCaml
     parsing/typechecking. Keep new source-command work off this entrypoint. *)
 
-val compile :
-  ?debug:bool ->
-  ?allow_debug_only_calls:bool ->
-  ?retain_debug_blocks:bool ->
-  ?embed_runtime:bool ->
-  ?require_main:bool ->
-  ?profile:bool ->
-  ?on_frontend_phase:(frontend_phase -> unit) ->
-  ?on_stage:Core_pipeline.on_stage_callback ->
-  ?on_stage_event:Core_pipeline.on_stage_event ->
-  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
-  ?tail_observation_stages:Core_stage.t list ->
-  ?check_invariants:bool ->
-  filename:string ->
-  source:string ->
-  unit ->
-  (compile_outcome, Ast.compiler_error list) result
-(** Compatibility alias for [compile_legacy_direct_source]. Existing tests and
-    tooling still use this public name, but new compiler code should choose
-    either [compile_preloaded_graph_with_blorp_bridge] for source commands or
-    [compile_legacy_direct_source] when the legacy direct-source route is
-    intentional. *)
-
 val compile_preloaded_graph_with_blorp_bridge :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->
@@ -203,8 +170,8 @@ val compile_preloaded_graph_with_blorp_bridge :
     This consumes a Blorp frontend module graph, obtains a decoded Blorp
     typed-program artifact with CTFE already evaluated, populates dependency
     typed-module caches, and then enters the Core/codegen handoff. Production
-    source-command compilation uses this path. Direct source APIs without a
-    preloaded frontend graph still use [compile] until their callers are
+    source-command compilation uses this path. The explicitly legacy direct
+    source API remains for the REPL and test runner until those callers are
     migrated to the single frontend graph handoff. *)
 
 val compile_generated_test_harness :

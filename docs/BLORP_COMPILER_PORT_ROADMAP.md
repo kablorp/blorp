@@ -961,8 +961,8 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-Core lowering. Legacy direct `Pipeline.compile`, reusable compiler-fixture
-typechecking, and some tooling/test paths can still use the OCaml
+Core lowering. Legacy direct `Pipeline.compile_legacy_direct_source`, reusable
+compiler-fixture typechecking, and some tooling/test paths can still use the OCaml
 parser/typechecker until their callers move to an explicit Blorp frontend graph.
 `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
@@ -1538,11 +1538,10 @@ Current status:
   Blorp typed-program artifact, populates dependency typed-module caches, and
   then enters the shared OCaml Core/codegen handoff without
   returning to the OCaml typechecker.
-- Direct-source `Pipeline.compile`, reusable compiler-fixture typechecking, and
-  module-only typecheck APIs are now
-  documented in code as legacy/tooling routes. The raw-source compile route is
-  also exposed as `Pipeline.compile_legacy_direct_source`, and the REPL/test
-  runner use that explicit name where they intentionally still depend on OCaml
+- Direct-source `Pipeline.compile_legacy_direct_source`, reusable
+  compiler-fixture typechecking, and module-only typecheck APIs are now
+  documented in code as legacy/tooling routes. The REPL/test runner use the
+  explicit legacy compile name where they intentionally still depend on OCaml
   parsing and typechecking. A compiler-unit regression pins that the
   graph-backed compile bridge consumes the preloaded target source rather than
   rereading a changed file from disk.
@@ -1551,6 +1550,45 @@ Current status:
   (`pipeline`, the private OCaml host tooling commands, package checking, REPL,
   and test runner). This keeps normal source-command work on the Blorp frontend
   graph while the remaining tooling paths are migrated deliberately.
+- Blorp builtin registration now includes the scalar-width conversions,
+  bitwise operations, tensor constructors, and channel sealing used by the
+  production backend surface. Bare-name lookup scans past declarations owned
+  by unrelated, unimported modules before falling back to a builtin, while a
+  visible local or explicitly imported declaration still wins. This repaired
+  12 generated-C audit cases in the installed CLI. Tensor constructor
+  signatures also bind their dimension arguments directly to `#N` parameters
+  instead of returning unbound symbolic dimensions. Together these changes
+  moved the 2026-07-11 generated-C audit baseline from `92/101` to `105/88`.
+  CTFE now represents admitted compiler builtins as typed enum operations and
+  evaluates deterministic `to_float16`/`to_float32` conversions with target
+  precision before materialization; unsupported builtins remain explicit
+  unsupported calls. Sized-float static constants brought the current audit
+  baseline to `109/84`.
+  Tensor arithmetic, structural `HasLength`/`Stringable` evidence, refined
+  tensor `length`, checked N-D reads, and range-proven subscripts are now owned
+  by Blorp inference. Range proofs remain semantic metadata while ordinary
+  runtime and generic value flow uses `Int`; storing a proof in a tuple erases
+  it instead of polluting the tuple's generic element type. Valid direct
+  variable subscript writes now normalize during inference to
+  `x = checked_set(x, ...)`, with rank selecting the matrix/tensor intrinsic,
+  matching the old OCaml phase contract. The backend bridge also admits the
+  runtime's existing boxed `blorp_vector_get_opt` and
+  `blorp_matrix_get_opt` ABIs while retaining specialized handling for stack
+  `Option` results. Tuple literals now keep singleton/range facts in their
+  semantic type while recursively widening their stored value type; collection
+  and generic element normalization uses that same recursive tuple rule.
+  Scalar dimension refinements also widen to runtime `Int` whenever an `Int`
+  slot is explicitly expected. These changes moved the 2026-07-11 generated-C
+  audit to `128/65`; the previously regressed statement-level conditional,
+  vector raw-storage, dimension-folding, and tuple-match fixtures generate C
+  again. The compile-time collection fixture now advances beyond tuple/list
+  inference to the separate CTFE `std/dict.from_list` coverage gap.
+  The largest remaining audit clusters are aggregate/refined value widening,
+  CTFE builtin coverage, generic collection inference, resource annotation
+  validation, concurrency purity/effect modeling, and stale generated-C
+  ownership expectations. Field-target subscript assignment intentionally
+  remains explicit: rewriting `record.tensor[i] = value` as assignment to the
+  record root would be incorrect without a record-update representation.
 - The production `typecheck_graph` bridge streams one typed artifact at a time.
   Its graph context parses and finalizes each source module once, constructs
   the importable-module set once, and reuses those immutable values across
@@ -1732,7 +1770,8 @@ Current status:
 Typed frontier closure before CTFE:
 
 - Close or explicitly classify residual OCaml typecheck/parser consumers:
-  `Pipeline.compile`, `Pipeline.typecheck_only_typed_reusing_session`,
+  `Pipeline.compile_legacy_direct_source`,
+  `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
   test runner, and LSP/tooling helpers.
 - Normal source execution must enter through the Blorp frontend graph and
@@ -2496,6 +2535,10 @@ make docker-premerge-gate
   OCaml-owned.
 - Delete `language_surface.ml` when typecheck/LSP/tooling no longer need an
   OCaml facade over Blorp-owned language-surface data.
+- Keep builtin effect/special-inference metadata and environment registration
+  under a consistency test. A descriptor alone does not make a builtin name
+  available to inference, and a module-scoped std declaration must not hide the
+  corresponding builtin from source that has not imported that module.
 
 ## Definition Of Done
 

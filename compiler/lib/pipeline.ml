@@ -34,7 +34,7 @@ let bridge_can_read_matching_source ~filename source =
     && String.equal (Modules.read_file filename) source
   with Sys_error _ -> false
 
-(** Outcome of [compile]. See [pipeline.mli] for rationale. *)
+(** Outcome of source compilation. See [pipeline.mli] for rationale. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
 
 type source_kind = User_source | Generated_test_harness
@@ -801,14 +801,6 @@ let typecheck_only_typed_reusing_session ~sess ~filename ~source
           typecheck_loaded_program ~source_kind:User_source ~filename ~program
             ~debug ())
 
-let typecheck_only_reusing_session ~sess ~filename ~source ?(debug = false) ()
-    =
-  match
-    typecheck_only_typed_reusing_session ~sess ~filename ~source ~debug ()
-  with
-  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
-  | Error _ as e -> e
-
 (** Parse and type-check a module, returning the final state and typed program. *)
 let typecheck_module_only_typed_impl ?configure_session ~filename ~source () =
   with_fresh_session ?configure_session filename (fun () ->
@@ -999,15 +991,6 @@ let compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source () =
   compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename ~source ()
-
-let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ?check_invariants ~filename ~source
-    () =
-  compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source ()

@@ -1124,7 +1124,7 @@ let test_aliased_selective_type_imports_keep_original_traits () =
             \        1\n"
           in
           match
-            Pipeline.compile ~embed_runtime:false ~filename:main_path ~source ()
+            Pipeline.compile_legacy_direct_source ~embed_runtime:false ~filename:main_path ~source ()
           with
           | Ok (Pipeline.Compiled _) -> ()
           | Ok (Pipeline.Stopped_at _) ->
@@ -1469,7 +1469,7 @@ let test_direct_function_import_shadows_unrelated_trait_method () =
             \        1\n"
           in
           match
-            Pipeline.compile ~embed_runtime:false ~filename:main_path ~source ()
+            Pipeline.compile_legacy_direct_source ~embed_runtime:false ~filename:main_path ~source ()
           with
           | Ok (Pipeline.Compiled _) -> ()
           | Ok (Pipeline.Stopped_at _) ->

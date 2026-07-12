@@ -44,6 +44,8 @@ let widening_reason_to_string = function
       collection_kind_to_string kind
   | Type_widening_metadata.BitwiseOperator -> "bitwise operator"
   | Type_widening_metadata.MethodReceiver -> "method receiver"
+  | Type_widening_metadata.RangeProofErasure -> "range proof erasure"
+  | Type_widening_metadata.TupleLiteral -> "tuple literal"
   | Type_widening_metadata.NumericOperator op ->
       Printf.sprintf "numeric operator %s" (binop_to_string op)
 

@@ -109,6 +109,13 @@ import:
 		ParsedWithErrorMap,
 		parsed_expr_span,
 		parsed_identifier,
+	../stage_05_types/compiler_builtins:
+		CompilerSpecialInference(
+			CompilerCheckedGetInference,
+			CompilerMatrixCheckedGetInference,
+			CompilerTensorCheckedGetInference,
+		),
+		compiler_builtin_special_inference,
 	../stage_05_types/compiler_context: CompilerContext, compiler_zonk_type
 	../stage_05_types/compiler_dim_solver:
 		CompilerDimSolveResult(
@@ -196,6 +203,7 @@ import:
 		compiler_env_resolve_trait_obligation,
 		compiler_env_scoped_resource_unavailable_owner,
 		compiler_env_select_overload_for_args,
+		compiler_env_symbols_named,
 		compiler_purities_equal,
 		compiler_resolve_self,
 		compiler_resource_arg_policies_equal,
@@ -226,6 +234,7 @@ import:
 		compiler_array_type_parts,
 		compiler_is_any_float_type,
 		compiler_is_any_integer_type,
+		compiler_is_dim_type,
 		compiler_is_dim_var_name,
 		compiler_is_legacy_single_letter_type_param,
 		compiler_is_signed_integer_type,
@@ -258,6 +267,9 @@ import:
 		compiler_mutable_binding_slot,
 		compiler_numeric_operand_slot,
 		compiler_numeric_operand_type,
+		compiler_range_proof_slot,
+		compiler_scalar_int_value_type,
+		compiler_tuple_literal_slot,
 		compiler_widening_decision,
 		compiler_widening_semantic_type,
 		compiler_widening_value_type,
@@ -693,6 +705,7 @@ private record CompilerInferSubscriptIndicesResult {
 	context: CompilerInferContext,
 	indices: List[CompilerTypedExpr],
 	values: List[Int],
+	static_flags: List[Bool],
 	all_static: Bool
 }
 
@@ -1002,6 +1015,17 @@ private pure func compiler_infer_expected_slot(
 					compiler_bitwise_operand_target_slot(expected_type, semantic_type)
 		_:
 			compiler_keep_value_slot(semantic_type)
+
+
+private pure func compiler_infer_range_binding_slot(
+	context: CompilerInferContext,
+	semantic_type: CompilerType,
+) -> CompilerValueSlot:
+	match context.expected_type:
+		Some(CompilerRangeType(_)):
+			compiler_infer_expected_slot(context, semantic_type)
+		_:
+			compiler_range_proof_slot(semantic_type)
 
 
 private pure func compiler_typed_expr_info_from_slot(
@@ -6374,6 +6398,58 @@ private pure func compiler_type_param_name(
 			None
 
 
+private pure func compiler_tensor_element_supports_arithmetic(typ: CompilerType) -> Bool:
+	compiler_is_any_integer_type(typ) or compiler_is_any_float_type(typ)
+
+
+private pure func compiler_dim_is_variadic(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerVarDimsType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_tensor_arithmetic_result_type(
+	op: ParsedBinaryOp,
+	left_type: CompilerType,
+	right_type: CompilerType,
+) -> Option[CompilerType]:
+	if not compiler_is_arithmetic_binary_op(op) or compiler_is_modulo_binary_op(op):
+		None
+	else:
+		match (compiler_array_type_parts(left_type), compiler_array_type_parts(right_type)):
+			(Some((element, dims)), None):
+				if (
+					compiler_tensor_element_supports_arithmetic(element)
+					and compiler_types_equal(element, right_type)
+				):
+					Some(compiler_type_copy(left_type))
+				else:
+					None
+			(None, Some((element, dims))):
+				if (
+					compiler_tensor_element_supports_arithmetic(element)
+					and compiler_types_equal(left_type, element)
+				):
+					Some(compiler_type_copy(right_type))
+				else:
+					None
+			(Some((left_element, left_dims)), Some((right_element, right_dims))):
+				if (
+					compiler_tensor_element_supports_arithmetic(left_element)
+					and compiler_types_equal(left_element, right_element)
+					and not left_dims.any(compiler_dim_is_variadic)
+					and not right_dims.any(compiler_dim_is_variadic)
+					and compiler_types_equal(left_type, right_type)
+				):
+					Some(compiler_type_copy(left_type))
+				else:
+					None
+			_:
+				None
+
+
 private pure func compiler_type_satisfies_trait(
 	context: CompilerInferContext,
 	typ: CompilerType,
@@ -6403,34 +6479,44 @@ private pure func compiler_arithmetic_result_type(
 	left_type: CompilerType,
 	right_type: CompilerType,
 ) -> Option[CompilerType]:
-	if (
-		compiler_named_value_type_is(left_type, "Int")
-		and compiler_named_value_type_is(right_type, "Int")
-	):
-		Some(compiler_type_int())
-	else if (
-		compiler_named_value_type_is(left_type, "Float")
-		and compiler_named_value_type_is(right_type, "Float")
-	):
-		Some(compiler_type_float())
-	else if (
-		compiler_is_fixed_type(left_type)
-		and compiler_is_fixed_type(right_type)
-		and not compiler_is_modulo_binary_op(op)
-	):
-		Some(CompilerNamedType("Fixed", []))
-	else if (
-		compiler_is_add_binary_op(op)
-		and compiler_named_value_type_is(left_type, "String")
-		and compiler_named_value_type_is(right_type, "String")
-	):
-		Some(compiler_type_string())
-	else if compiler_is_any_float_type(left_type) and compiler_types_equal(left_type, right_type):
-		Some(compiler_type_copy(left_type))
-	else if compiler_is_any_integer_type(left_type) and compiler_types_equal(left_type, right_type):
-		Some(compiler_type_copy(left_type))
-	else:
-		None
+	match compiler_tensor_arithmetic_result_type(op, left_type, right_type):
+		Some(result_type):
+			Some(result_type)
+		None:
+			if (
+				compiler_named_value_type_is(left_type, "Int")
+				and compiler_named_value_type_is(right_type, "Int")
+			):
+				Some(compiler_type_int())
+			else if (
+				compiler_named_value_type_is(left_type, "Float")
+				and compiler_named_value_type_is(right_type, "Float")
+			):
+				Some(compiler_type_float())
+			else if (
+				compiler_is_fixed_type(left_type)
+				and compiler_is_fixed_type(right_type)
+				and not compiler_is_modulo_binary_op(op)
+			):
+				Some(CompilerNamedType("Fixed", []))
+			else if (
+				compiler_is_add_binary_op(op)
+				and compiler_named_value_type_is(left_type, "String")
+				and compiler_named_value_type_is(right_type, "String")
+			):
+				Some(compiler_type_string())
+			else if (
+				compiler_is_any_float_type(left_type)
+				and compiler_types_equal(left_type, right_type)
+			):
+				Some(compiler_type_copy(left_type))
+			else if (
+				compiler_is_any_integer_type(left_type)
+				and compiler_types_equal(left_type, right_type)
+			):
+				Some(compiler_type_copy(left_type))
+			else:
+				None
 
 
 private pure func compiler_check_arithmetic_binary_op(
@@ -6493,19 +6579,45 @@ private pure func compiler_check_comparison_binary_op(
 	left_type: CompilerType,
 	right_type: CompilerType,
 ) -> CompilerCheckedType:
+	left_param_name = compiler_type_param_name(context, left_type)
+	right_param_name = compiler_type_param_name(context, right_type)
+
 	if (
 		compiler_types_equal(left_type, right_type)
 		and compiler_is_orderable_primitive_type(left_type)
 	):
 		compiler_checked_type(context, compiler_type_bool())
 	else:
-		next = compiler_infer_error(
-			context,
-			"Comparison requires matching types that implement Orderable, got " + compiler_type_to_string(
-				left_type,
-			) + " and " + compiler_type_to_string(right_type),
-		)
-		compiler_checked_type(next, compiler_type_void())
+		match (left_param_name, right_param_name):
+			(Some(left_name), Some(right_name)):
+				if left_name != right_name:
+					next = compiler_infer_error(
+						context,
+						"Comparison requires the same type parameter, got " + left_name + " and " + right_name,
+					)
+					compiler_checked_type(next, compiler_type_void())
+				else if compiler_type_satisfies_trait(context, left_type, "Orderable"):
+					compiler_checked_type(context, compiler_type_bool())
+				else:
+					next = compiler_infer_error(
+						context,
+						"Type parameter '" + left_name + "' requires Orderable bound for comparison operators",
+					)
+					compiler_checked_type(next, compiler_type_void())
+			_:
+				if (
+					compiler_types_equal(left_type, right_type)
+					and compiler_type_satisfies_trait(context, left_type, "Orderable")
+				):
+					compiler_checked_type(context, compiler_type_bool())
+				else:
+					next = compiler_infer_error(
+						context,
+						"Comparison requires matching types that implement Orderable, got " + compiler_type_to_string(
+							left_type,
+						) + " and " + compiler_type_to_string(right_type),
+					)
+					compiler_checked_type(next, compiler_type_void())
 
 
 private pure func compiler_check_equality_binary_op(
@@ -7135,52 +7247,41 @@ private pure func compiler_lookup_bare_symbol(
 	context: CompilerInferContext,
 	name: ParsedIdentifier,
 ) -> Option[CompilerSymbol]:
-	match compiler_env_lookup(context.state.env, name.text):
+	var visible: Option[CompilerSymbol] = None
+	var builtin_fallback: Option[CompilerSymbol] = None
+
+	for symbol in compiler_env_symbols_named(context.state.env, name.text):
+		match symbol.kind:
+			CompilerFuncSymbolKind(func_symbol):
+				if func_symbol.origin == CompilerBuiltinFunc:
+					if builtin_fallback.is_none():
+						builtin_fallback = Some(symbol)
+				else if compiler_symbol_visible_as_bare(
+					context.state,
+					name.span,
+					name.text,
+					symbol,
+				):
+					visible = Some(symbol)
+					break
+			_:
+				if compiler_symbol_visible_as_bare(context.state, name.span, name.text, symbol):
+					visible = Some(symbol)
+					break
+
+	match visible:
 		Some(symbol):
-			match symbol.kind:
-				CompilerFuncSymbolKind(func_symbol):
-					if func_symbol.origin == CompilerBuiltinFunc:
-						match compiler_typecheck_state_find_imported_name(context.state, name.text):
-							Some(binding):
-								match compiler_symbol_from_imported_binding(
-									context,
-									name.text,
-									binding,
-								):
-									Some(imported_symbol):
-										Some(imported_symbol)
-									None:
-										Some(symbol)
-							None:
-								Some(symbol)
-					else if compiler_symbol_visible_as_bare(
-						context.state,
-						name.span,
-						name.text,
-						symbol,
-					):
-						Some(symbol)
-					else:
-						match compiler_typecheck_state_find_imported_name(context.state, name.text):
-							Some(binding):
-								compiler_symbol_from_imported_binding(context, name.text, binding)
-							None:
-								None
-				_:
-					if compiler_symbol_visible_as_bare(context.state, name.span, name.text, symbol):
-						Some(symbol)
-					else:
-						match compiler_typecheck_state_find_imported_name(context.state, name.text):
-							Some(binding):
-								compiler_symbol_from_imported_binding(context, name.text, binding)
-							None:
-								None
+			Some(symbol)
 		None:
 			match compiler_typecheck_state_find_imported_name(context.state, name.text):
 				Some(binding):
-					compiler_symbol_from_imported_binding(context, name.text, binding)
+					match compiler_symbol_from_imported_binding(context, name.text, binding):
+						Some(imported_symbol):
+							Some(imported_symbol)
+						None:
+							builtin_fallback
 				None:
-					None
+					builtin_fallback
 
 
 private pure func compiler_source_name_for_imported_module_path(
@@ -7249,6 +7350,11 @@ private pure func compiler_infer_name_expr(
 						name.text,
 						var_symbol.origin,
 					)
+					value_slot = match var_symbol.var_type:
+						CompilerRangeType(_):
+							compiler_infer_range_binding_slot(context, var_symbol.var_type)
+						_:
+							compiler_infer_expected_slot(context, var_symbol.var_type)
 					expr = CompilerTypedNameExpr(
 						name,
 						compiler_expr_info_with_resource_dependencies(
@@ -7257,7 +7363,7 @@ private pure func compiler_infer_name_expr(
 								CompilerInferredOrigin,
 								compiler_unrefined_binding(),
 								None,
-								compiler_infer_expected_slot(context, var_symbol.var_type),
+								value_slot,
 							),
 							dependencies,
 						),
@@ -9461,6 +9567,46 @@ private pure func compiler_callable_value_type(
 	compiler_env_resolve_alias(context.state.env, value_type)
 
 
+private pure func compiler_refined_length_return_type(
+	arg_type: CompilerType,
+	fallback: CompilerType,
+) -> CompilerType:
+	match compiler_array_type_parts(arg_type):
+		Some((_, dims)):
+			match dims.get(0):
+				Some(CompilerConstIntType(size)):
+					CompilerConstIntType(size)
+				Some(CompilerTypeVar(name)):
+					if compiler_is_dim_var_name(name):
+						CompilerTypeVar(name)
+					else:
+						compiler_type_copy(fallback)
+				_:
+					compiler_type_copy(fallback)
+		None:
+			compiler_type_copy(fallback)
+
+
+private pure func compiler_refined_builtin_return_type(
+	resolved_call: Option[CompilerResolvedCallInfo],
+	args: List[CompilerTypedExpr],
+	fallback: CompilerType,
+) -> CompilerType:
+	name = compiler_resolved_call_display_name(resolved_call)
+
+	if (name == "length" or name == "vector_length") and args.length() == 1:
+		match args.get(0):
+			Some(arg):
+				compiler_refined_length_return_type(
+					compiler_typed_expr_semantic_type(arg),
+					fallback,
+				)
+			None:
+				compiler_type_copy(fallback)
+	else:
+		compiler_type_copy(fallback)
+
+
 private pure func compiler_infer_call_with_callee_result(
 	context: CompilerInferContext,
 	callee_result: CompilerInferResult,
@@ -9566,7 +9712,11 @@ private pure func compiler_infer_call_with_callee_result(
 				resolved_param_types = call_params.map(
 					func(param): compiler_apply_subst(return_bind.subst, param),
 				)
-				resolved_return_type = compiler_apply_subst(return_bind.subst, call_return_type)
+				resolved_return_type = compiler_refined_builtin_return_type(
+					self_resolved_call,
+					arg_result.args,
+					compiler_apply_subst(return_bind.subst, call_return_type),
+				)
 				instantiated_resolved_call = compiler_optional_resolved_call_with_instantiated_signature(
 					self_resolved_call,
 					resolved_param_types,
@@ -9744,9 +9894,11 @@ private pure func compiler_infer_ufcs_call_with_receiver_result(
 						resolved_param_types = call_params.map(
 							func(param): compiler_apply_subst(return_bind.subst, param),
 						)
-						resolved_return_type = compiler_apply_subst(
-							return_bind.subst,
-							call_return_type,
+						call_args = [receiver_result.expr].concat(arg_result.args)
+						resolved_return_type = compiler_refined_builtin_return_type(
+							Some(resolved_call),
+							call_args,
+							compiler_apply_subst(return_bind.subst, call_return_type),
 						)
 						instantiated_resolved_call = compiler_resolved_call_with_instantiated_signature(
 							resolved_call,
@@ -9755,7 +9907,7 @@ private pure func compiler_infer_ufcs_call_with_receiver_result(
 						)
 						typed = CompilerTypedCallExpr(
 							callee_expr,
-							[receiver_result.expr].concat(arg_result.args),
+							call_args,
 							span,
 							compiler_inferred_call_info(
 								resource_checked_context,
@@ -11515,12 +11667,15 @@ private pure func compiler_infer_unconstrained_exprs(
 
 
 private pure func compiler_tuple_type_from_items(items: List[CompilerTypedExpr]) -> CompilerType:
-	var types: List[CompilerType] = []
+	CompilerTupleType(items.map(compiler_typed_expr_semantic_type))
 
-	for item in items:
-		types = types.append(compiler_type_copy(compiler_typed_expr_semantic_type(item)))
 
-	CompilerTupleType(types)
+private pure func compiler_tuple_value_type_from_items(
+	items: List[CompilerTypedExpr],
+) -> CompilerType:
+	CompilerTupleType(items.map(
+		func(item): compiler_scalar_int_value_type(compiler_typed_expr_value_type(item)),
+	))
 
 
 private pure func compiler_expected_tuple_item_types(
@@ -11584,6 +11739,7 @@ private pure func compiler_infer_tuple_expr(
 ) -> CompilerInferResult:
 	items_result = compiler_infer_tuple_items(context, items)
 	tuple_type = compiler_tuple_type_from_items(items_result.exprs)
+	tuple_value_type = compiler_tuple_value_type_from_items(items_result.exprs)
 	var checked_context: CompilerInferContext = compiler_infer_context_with_state(
 		context,
 		items_result.context.state,
@@ -11599,7 +11755,13 @@ private pure func compiler_infer_tuple_expr(
 	typed = CompilerTypedTupleExpr(
 		items_result.exprs,
 		span,
-		compiler_inferred_info(checked_context, tuple_type),
+		compiler_typed_expr_info_from_slot(
+			None,
+			CompilerInferredOrigin,
+			compiler_unrefined_binding(),
+			None,
+			compiler_tuple_literal_slot(tuple_type, tuple_value_type),
+		),
 	)
 
 	compiler_infer_result(checked_context, typed)
@@ -11779,7 +11941,11 @@ private pure func compiler_vector_item_type(
 
 
 private pure func compiler_default_collection_element_type(typ: CompilerType) -> CompilerType:
-	compiler_numeric_operand_type(ParsedAddOp, typ)
+	match typ:
+		CompilerTupleType(elements):
+			CompilerTupleType(elements.map(compiler_default_collection_element_type))
+		_:
+			compiler_numeric_operand_type(ParsedAddOp, typ)
 
 
 private pure func compiler_types_compatible_for_inference(
@@ -13396,12 +13562,14 @@ private pure func compiler_infer_subscript_indices_result(
 	context: CompilerInferContext,
 	indices: List[CompilerTypedExpr],
 	values: List[Int],
+	static_flags: List[Bool],
 	all_static: Bool,
 ) -> CompilerInferSubscriptIndicesResult:
 	{
 		context = compiler_infer_context_copy(context),
 		indices = indices,
 		values = values,
+		static_flags = static_flags,
 		all_static = all_static
 	}
 
@@ -13425,6 +13593,7 @@ private pure func compiler_infer_subscript_indices(
 	var next_context: CompilerInferContext = compiler_infer_context_copy(context)
 	var typed_indices: List[CompilerTypedExpr] = []
 	var values: List[Int] = []
+	var static_flags: List[Bool] = []
 	var all_static: Bool = True
 	var index: Int = 0
 
@@ -13440,8 +13609,9 @@ private pure func compiler_infer_subscript_indices(
 					index_expr,
 				)
 				index_type = compiler_typed_expr_value_type(index_result.expr)
+				index_semantic_type = compiler_typed_expr_semantic_type(index_result.expr)
 
-				type_context = if compiler_types_equal(index_type, compiler_type_int()):
+				type_context = if compiler_range_endpoint_type_is_int_like(index_type):
 					compiler_infer_context_copy(index_result.context)
 				else:
 					compiler_infer_error(
@@ -13452,15 +13622,21 @@ private pure func compiler_infer_subscript_indices(
 				match compiler_subscript_static_index(index_expr):
 					Some(value):
 						values = values.append(value)
+						static_flags = static_flags.append(True)
 						next_context = compiler_infer_context_copy(type_context)
 					None:
 						values = values.append(0)
+						static_flags = static_flags.append(False)
 						all_static = False
 
-						next_context = if compiler_types_equal(index_type, compiler_type_int()):
-							compiler_static_subscript_index_error(type_context)
-						else:
-							compiler_infer_context_copy(type_context)
+						next_context = match index_semantic_type:
+							CompilerRangeType(_):
+								compiler_infer_context_copy(type_context)
+							_:
+								if compiler_types_equal(index_type, compiler_type_int()):
+									compiler_static_subscript_index_error(type_context)
+								else:
+									compiler_infer_context_copy(type_context)
 
 				typed_indices = typed_indices.append(index_result.expr)
 			None:
@@ -13472,6 +13648,7 @@ private pure func compiler_infer_subscript_indices(
 		compiler_infer_without_expected(next_context),
 		typed_indices,
 		values,
+		static_flags,
 		all_static,
 	)
 
@@ -13571,6 +13748,16 @@ private pure func compiler_validate_array_index(
 				)
 			else:
 				compiler_infer_context_copy(context)
+		CompilerTypeVar(name):
+			if compiler_is_dim_var_name(name) and (index_value == 0 or index_value == -1):
+				-- Dimensions are constrained positive, so the first and last
+				-- positions exist even when the concrete size is still symbolic.
+				compiler_infer_context_copy(context)
+			else:
+				compiler_infer_error(
+					context,
+					"Cannot verify bounds: dimension is not known at compile time",
+				)
 		_:
 			compiler_infer_error(
 				context,
@@ -13578,28 +13765,68 @@ private pure func compiler_validate_array_index(
 			)
 
 
+private pure func compiler_range_bound_fits_dim(
+	bound: CompilerType,
+	dim: CompilerType,
+) -> Bool:
+	match (bound, dim):
+		(CompilerConstIntType(bound_size), CompilerConstIntType(dim_size)):
+			bound_size <= dim_size
+		(CompilerTypeVar(bound_name), CompilerTypeVar(dim_name)):
+			(
+				compiler_is_dim_var_name(bound_name)
+				and compiler_is_dim_var_name(dim_name)
+				and bound_name == dim_name
+			)
+		_:
+			compiler_types_equal(bound, dim)
+
+
+private pure func compiler_validate_array_range_index(
+	context: CompilerInferContext,
+	index_expr: CompilerTypedExpr,
+	dim: CompilerType,
+) -> CompilerInferContext:
+	index_type = compiler_typed_expr_semantic_type(index_expr)
+
+	match index_type:
+		CompilerRangeType(bound):
+			if compiler_range_bound_fits_dim(bound, dim):
+				compiler_infer_context_copy(context)
+			else:
+				compiler_infer_error(
+					context,
+					"Range-refined index " + compiler_type_to_string(
+						index_type,
+					) + " is not proven in bounds for dimension " + compiler_type_to_string(dim),
+				)
+		_:
+			compiler_infer_context_copy(context)
+
+
 private pure func compiler_validate_array_subscript_indices(
 	context: CompilerInferContext,
 	dims: List[CompilerType],
+	indices: List[CompilerTypedExpr],
 	values: List[Int],
-	all_static: Bool,
+	static_flags: List[Bool],
 ) -> CompilerInferContext:
-	if not all_static:
-		compiler_infer_context_copy(context)
-	else:
-		var next_context: CompilerInferContext = compiler_infer_context_copy(context)
-		var index: Int = 0
+	var next_context: CompilerInferContext = compiler_infer_context_copy(context)
+	var index: Int = 0
 
-		while index < values.length() and index < dims.length():
-			match (values.get(index), dims.get(index)):
-				(Some(index_value), Some(dim)):
-					next_context = compiler_validate_array_index(next_context, index_value, dim)
-				_:
-					void
+	while index < indices.length() and index < dims.length():
+		match (indices.get(index), values.get(index), static_flags.get(index), dims.get(index)):
+			(Some(index_expr), Some(index_value), Some(is_static), Some(dim)):
+				next_context = if is_static:
+					compiler_validate_array_index(next_context, index_value, dim)
+				else:
+					compiler_validate_array_range_index(next_context, index_expr, dim)
+			_:
+				void
 
-			index += 1
+		index += 1
 
-		next_context
+	next_context
 
 
 private pure func compiler_array_subscript_arity_error(
@@ -13619,14 +13846,15 @@ private pure func compiler_array_subscript_arity_error(
 private pure func compiler_validate_array_subscript(
 	context: CompilerInferContext,
 	dims: List[CompilerType],
+	indices: List[CompilerTypedExpr],
 	values: List[Int],
+	static_flags: List[Bool],
 	index_count: Int,
-	all_static: Bool,
 ) -> CompilerInferContext:
 	if dims.length() == 0:
 		compiler_infer_error(context, "checked_get requires an array type, got empty dimensions")
 	else if index_count == 1 or index_count == dims.length():
-		compiler_validate_array_subscript_indices(context, dims, values, all_static)
+		compiler_validate_array_subscript_indices(context, dims, indices, values, static_flags)
 	else:
 		compiler_array_subscript_arity_error(context, index_count, dims.length())
 
@@ -13756,9 +13984,10 @@ private pure func compiler_infer_array_subscript_result(
 	next_context = compiler_validate_array_subscript(
 		index_result.context,
 		dims,
+		index_result.indices,
 		index_result.values,
+		index_result.static_flags,
 		index_count,
-		index_result.all_static,
 	)
 	result_type = compiler_subscript_type_if_no_errors(
 		next_context,
@@ -13995,9 +14224,10 @@ private pure func compiler_checked_get_array_result(
 	next_context = compiler_validate_array_subscript(
 		index_result.context,
 		dims,
+		index_result.indices,
 		index_result.values,
+		index_result.static_flags,
 		1,
-		index_result.all_static,
 	)
 	result_type = compiler_subscript_type_if_no_errors(
 		next_context,
@@ -14137,8 +14367,70 @@ private pure func compiler_infer_checked_get_call(
 							receiver_result.expr,
 							index_result,
 							receiver_type,
-							span,
-						)
+								span,
+							)
+
+
+private pure func compiler_nd_checked_get_result(
+	name: String,
+	result: CompilerInferResult,
+	span: CompilerSourceSpan,
+) -> CompilerInferResult:
+	match result.expr:
+		CompilerTypedSubscriptExpr(receiver, indices, _, _):
+			receiver_type = compiler_typed_expr_semantic_type(receiver)
+			result_type = compiler_typed_expr_semantic_type(result.expr)
+			params = [receiver_type].concat(
+				indices.map(func(_): compiler_type_int()),
+			)
+			resolved_call = compiler_builtin_resolved_call(name, params, result_type)
+			callee = compiler_typed_builtin_callee(
+				name,
+				params,
+				result_type,
+				span,
+				resolved_call,
+			)
+			typed = CompilerTypedCallExpr(
+				callee,
+				[receiver].concat(indices),
+				span,
+				compiler_inferred_call_info(
+					result.context,
+					result_type,
+					Some(resolved_call),
+				),
+			)
+			compiler_infer_result(result.context, typed)
+		_:
+			result
+
+
+private pure func compiler_infer_nd_checked_get_call(
+	context: CompilerInferContext,
+	name: String,
+	index_count: Int,
+	args: List[ParsedExpr],
+	span: CompilerSourceSpan,
+) -> CompilerInferResult:
+	if args.length() != index_count + 1:
+		next = compiler_infer_error(
+			context,
+			"${name} takes ${index_count + 1} arguments",
+		)
+		missing = CompilerTypedMissingExpr(
+			span,
+			compiler_inferred_info(next, compiler_type_void()),
+		)
+		compiler_infer_result(next, missing)
+	else:
+		receiver = args.get_or(0, ParsedMissingExpr(span))
+		indices = compiler_parsed_args_after_first(args)
+		compiler_nd_checked_get_result(
+			name,
+			compiler_infer_subscript_expr(context, receiver, indices, span),
+			span,
+		)
 
 
 private pure func compiler_infer_special_builtin_call_expr(
@@ -14149,10 +14441,15 @@ private pure func compiler_infer_special_builtin_call_expr(
 ) -> Option[CompilerInferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			if name.text == "checked_get":
-				Some(compiler_infer_checked_get_call(context, args, span))
-			else:
-				None
+			match compiler_builtin_special_inference(name.text):
+				Some(CompilerCheckedGetInference):
+					Some(compiler_infer_checked_get_call(context, args, span))
+				Some(CompilerMatrixCheckedGetInference):
+					Some(compiler_infer_nd_checked_get_call(context, name.text, 2, args, span))
+				Some(CompilerTensorCheckedGetInference(rank)):
+					Some(compiler_infer_nd_checked_get_call(context, name.text, rank, args, span))
+				_:
+					None
 		_:
 			None
 
@@ -14252,14 +14549,15 @@ private pure func compiler_subscript_assignment_arity_error(
 private pure func compiler_validate_array_subscript_assignment(
 	context: CompilerInferContext,
 	dims: List[CompilerType],
+	indices: List[CompilerTypedExpr],
 	values: List[Int],
+	static_flags: List[Bool],
 	index_count: Int,
-	all_static: Bool,
 ) -> CompilerInferContext:
 	if index_count != dims.length():
 		compiler_subscript_assignment_arity_error(context, index_count, dims.length())
 	else:
-		compiler_validate_array_subscript_indices(context, dims, values, all_static)
+		compiler_validate_array_subscript_indices(context, dims, indices, values, static_flags)
 
 
 private pure func compiler_subscript_assignment_value_mismatch_error(
@@ -14309,6 +14607,105 @@ private pure func compiler_infer_subscript_assign_result(
 	compiler_infer_result(result_context, typed)
 
 
+private pure func compiler_checked_set_callee_name(index_count: Int) -> String:
+	match index_count:
+		2:
+			"matrix_checked_set"
+		3:
+			"tensor3_checked_set"
+		4:
+			"tensor4_checked_set"
+		5:
+			"tensor5_checked_set"
+		_:
+			"checked_set"
+
+
+private pure func compiler_checked_set_call(
+	context: CompilerInferContext,
+	target: CompilerTypedExpr,
+	indices: List[CompilerTypedExpr],
+	value: CompilerTypedExpr,
+	target_type: CompilerType,
+	element_type: CompilerType,
+	span: CompilerSourceSpan,
+) -> CompilerTypedExpr:
+	callee_name = compiler_checked_set_callee_name(indices.length())
+	params = [compiler_type_copy(target_type)]
+		.concat(indices.map(func(_): compiler_type_int()))
+		.append(compiler_type_copy(element_type))
+	resolved_call = compiler_builtin_resolved_call(callee_name, params, target_type)
+	callee = compiler_typed_builtin_callee(
+		callee_name,
+		params,
+		target_type,
+		span,
+		resolved_call,
+	)
+
+	CompilerTypedCallExpr(
+		callee,
+		[target].concat(indices).append(value),
+		span,
+		compiler_inferred_call_info(context, target_type, Some(resolved_call)),
+	)
+
+
+private pure func compiler_infer_array_subscript_assign_result(
+	context: CompilerInferContext,
+	next_context: CompilerInferContext,
+	assign_target: Option[CompilerTypedAssignTarget],
+	target: CompilerTypedExpr,
+	indices: List[CompilerTypedExpr],
+	value: CompilerTypedExpr,
+	target_type: CompilerType,
+	element_type: CompilerType,
+	span: CompilerSourceSpan,
+) -> CompilerInferResult:
+	result_context = compiler_infer_context_with_state(context, next_context.state)
+	set_call = compiler_checked_set_call(
+		result_context,
+		target,
+		indices,
+		value,
+		target_type,
+		element_type,
+		span,
+	)
+
+	match (assign_target, target):
+		(Some(destination), CompilerTypedNameExpr(name, _)):
+			if destination.name == name.text:
+				typed = CompilerTypedAssignExpr(
+					name,
+					destination.scope,
+					set_call,
+					span,
+					compiler_inferred_info(result_context, compiler_type_void()),
+				)
+				compiler_infer_result(result_context, typed)
+			else:
+				compiler_infer_subscript_assign_result(
+					context,
+					next_context,
+					assign_target,
+					target,
+					indices,
+					value,
+					span,
+				)
+		_:
+			compiler_infer_subscript_assign_result(
+				context,
+				next_context,
+				assign_target,
+				target,
+				indices,
+				value,
+				span,
+			)
+
+
 private pure func compiler_infer_subscript_assignment_value(
 	context: CompilerInferContext,
 	expected_type: Option[CompilerType],
@@ -14338,9 +14735,10 @@ private pure func compiler_infer_array_subscript_assign_expr(
 	indices_context = compiler_validate_array_subscript_assignment(
 		index_result.context,
 		dims,
+		index_result.indices,
 		index_result.values,
+		index_result.static_flags,
 		index_count,
-		index_result.all_static,
 	)
 	value_result = compiler_infer_subscript_assignment_value(
 		indices_context,
@@ -14358,13 +14756,15 @@ private pure func compiler_infer_array_subscript_assign_expr(
 			value_type,
 		)
 
-	compiler_infer_subscript_assign_result(
+	compiler_infer_array_subscript_assign_result(
 		context,
 		next_context,
 		assign_target,
 		target_result.expr,
 		index_result.indices,
 		value_result.expr,
+		compiler_typed_expr_semantic_type(target_result.expr),
+		element_type,
 		span,
 	)
 
@@ -14440,6 +14840,10 @@ private pure func compiler_range_endpoint_error(
 	)
 
 
+private pure func compiler_range_endpoint_type_is_int_like(typ: CompilerType) -> Bool:
+	compiler_named_value_type_is(typ, "Int") or compiler_is_dim_type(typ)
+
+
 private pure func compiler_infer_range_expr(
 	context: CompilerInferContext,
 	start_expr: ParsedExpr,
@@ -14456,7 +14860,7 @@ private pure func compiler_infer_range_expr(
 	)
 	start_type = compiler_typed_expr_value_type(start_result.expr)
 
-	start_context = if compiler_named_value_type_is(start_type, "Int"):
+	start_context = if compiler_range_endpoint_type_is_int_like(start_type):
 		compiler_infer_context_copy(start_result.context)
 	else:
 		compiler_range_endpoint_error(start_result.context, "start", start_type)
@@ -14471,7 +14875,7 @@ private pure func compiler_infer_range_expr(
 	)
 	end_type = compiler_typed_expr_value_type(end_result.expr)
 
-	result_context = if compiler_named_value_type_is(end_type, "Int"):
+	result_context = if compiler_range_endpoint_type_is_int_like(end_type):
 		compiler_infer_context_with_state(context, end_result.context.state)
 	else:
 		compiler_infer_context_with_state(
@@ -16055,6 +16459,33 @@ private pure func compiler_add_tuple_for_bindings(
 	next_env
 
 
+private pure func compiler_for_name_binding_type(
+	iterable: CompilerTypedExpr,
+	fallback: CompilerType,
+) -> CompilerType:
+	match iterable:
+		CompilerTypedRangeExpr(start_expr, end_expr, _, _):
+			match compiler_typed_expr_semantic_type(start_expr):
+				CompilerConstIntType(0):
+					match compiler_typed_expr_semantic_type(end_expr):
+						CompilerConstIntType(bound):
+							if bound > 0:
+								CompilerRangeType(CompilerConstIntType(bound))
+							else:
+								compiler_type_copy(fallback)
+						CompilerTypeVar(name):
+							if compiler_is_dim_var_name(name):
+								CompilerRangeType(CompilerTypeVar(name))
+							else:
+								compiler_type_copy(fallback)
+						_:
+							compiler_type_copy(fallback)
+				_:
+					compiler_type_copy(fallback)
+		_:
+			compiler_type_copy(fallback)
+
+
 private pure func compiler_infer_for_expr(
 	context: CompilerInferContext,
 	binder: ParsedForBinder,
@@ -16088,11 +16519,12 @@ private pure func compiler_infer_for_expr(
 			else:
 				compiler_infer_context_copy(after_iter_context)
 
-			elem_type = match element_result:
+			base_elem_type = match element_result:
 				Some(typ):
 					compiler_type_copy(typ)
 				None:
 					compiler_type_void()
+			elem_type = compiler_for_name_binding_type(iter_result.expr, base_elem_type)
 
 			loop_env = compiler_env_push_scope(checked_context.state.env)
 

@@ -236,6 +236,5 @@ val type_info_source_type : type_info -> Ast.type_expr option
 val type_info_origin : type_info -> type_origin
 val type_info_proofs : type_info -> Type_proof_metadata.expr_proofs
 val expr_resolved_call : expr -> Ast.resolved_call option
-val expr_concrete_callable_id : expr -> int option
 val semantic_type : expr -> Ast.type_expr
 val value_type : expr -> Ast.type_expr

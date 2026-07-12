@@ -215,7 +215,7 @@ let test_assert_in_scope_nested_frames () =
    Pipeline-level isolation
    ============================================================================
 
-   These tests pin the contract that [Pipeline.compile] runs in its own
+   These tests pin the contract that [Pipeline.compile_legacy_direct_source] runs in its own
    session — the caller's ambient state must be unchanged after the call,
    and a second compile must not inherit state from the first. This
    contract is the user-visible payoff of Phase 2.1: today the implicit
@@ -237,10 +237,10 @@ let test_compile_isolates_caller_module_cache () =
       let starting_cache_size = Hashtbl.length outer.module_cache in
       let starting_prelude = outer.prelude_modules_loaded in
       let _ =
-        Pipeline.compile ~filename:"isolation_a.brp" ~source:trivial_source ()
+        Pipeline.compile_legacy_direct_source ~filename:"isolation_a.brp" ~source:trivial_source ()
       in
       Alcotest.(check int)
-        "caller module_cache unchanged after Pipeline.compile"
+        "caller module_cache unchanged after Pipeline.compile_legacy_direct_source"
         starting_cache_size
         (Hashtbl.length outer.module_cache);
       Alcotest.(check bool)
@@ -261,13 +261,13 @@ let test_compile_does_not_inherit_prior_load_errors () =
   Test_helpers.with_isolated_env (fun () ->
       (* First compile has a bad import so it populates load_errors. *)
       let _ =
-        Pipeline.compile ~filename:"isolation_bad.brp" ~source:bad_import_source
+        Pipeline.compile_legacy_direct_source ~filename:"isolation_bad.brp" ~source:bad_import_source
           ()
       in
       (* Second compile is clean. Its errors (if any) must not mention the
        prior compile's nonexistent_module_xyz. *)
       match
-        Pipeline.compile ~filename:"isolation_good.brp" ~source:trivial_source
+        Pipeline.compile_legacy_direct_source ~filename:"isolation_good.brp" ~source:trivial_source
           ()
       with
       | Ok _ -> Alcotest.(check pass) "clean second compile" () ()

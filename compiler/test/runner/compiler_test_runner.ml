@@ -411,7 +411,7 @@ let run_typecheck opts context file =
       else
         let source = read_file file in
         match
-          Pipeline.typecheck_only_reusing_session
+          Pipeline.typecheck_only_typed_reusing_session
             ~sess:context.typecheck_session ~filename:file ~source
             ~debug:false ()
         with

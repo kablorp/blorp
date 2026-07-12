@@ -19,12 +19,6 @@ val make_context :
   unit ->
   context
 
-val annotation :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
-
 val annotation_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
@@ -60,12 +54,6 @@ val imported_signature_canonical :
   context ->
   Ast.type_expr ->
   Ast.type_expr
-
-val record_field_type :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
 
 val record_field_type_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
