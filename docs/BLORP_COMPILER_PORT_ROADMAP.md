@@ -2059,10 +2059,15 @@ Current progress:
   explicit prepared Core loop variants with iterable release policy attached
   where the Core shape requires it. Channel and Stream loops are marked
   impure during typed-expression purity scanning because they pull from their
-  input source. Dict tuple-pair binders, resource-source, tuple-binder, tensor,
-  vector/array loop-view producers, and any remaining iterable families still
-  need deliberate prepared-loop slices instead of a generic OCaml-style `CFor`
-  node. A first tuple-binder lowering attempt exposed an unsafe generated
+  input source. Typed `indices(array)` loop views now lower directly to a
+  prepared `ForRangeExpr` over `0..length(array)` and preserve the inferred
+  range-refined binder type. Loop-view metadata is authoritative: malformed
+  metadata and unported view kinds fail lowering instead of falling through to
+  the producer function's nominal return type. Dict tuple-pair binders,
+  resource-source, tuple-binder, tensor, `enumerate`, `enumerate2`, `windows`,
+  and any remaining iterable families still need deliberate prepared-loop
+  slices instead of a generic OCaml-style `CFor` node. A first tuple-binder
+  lowering attempt exposed an unsafe generated
   cleanup shape around synthetic tuple references inside a `?=` path; fix the
   resource/codegen issue before enabling that path in production lowering.
 - Literal-only matches lower directly to prepared `LiteralMatchExpr` nodes for
@@ -2103,7 +2108,9 @@ Edge cases:
   compiler defect is fixed; do not duplicate the enum through import aliases.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
-  internal and must only lower under `for`/tuple-for.
+  internal and must only lower under `for`/tuple-for. `indices` is implemented;
+  keep the remaining producers closed until their synthesized bindings and
+  tensor access operations have explicit collision-free Core identities.
 - Module alias calls use `TyNamed "Module"` sentinel today; replace with an
   explicit typed AST/Core representation when feasible.
 - Callable ids from inference must remain authoritative over stale mangled

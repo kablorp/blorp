@@ -118,6 +118,7 @@ import:
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedLambdaParam,
+		CompilerTypedLoopView(CompilerTypedIndicesLoopView),
 		CompilerTypedMatchCase,
 		CompilerTypedPattern(
 			CompilerTypedBoolPattern,
@@ -144,8 +145,8 @@ import:
 		CompilerTypedVarDeclPayload,
 		CompilerTypedWithBinding,
 		CompilerTypedWithErrorMap,
-		compiler_typed_with_binding_is_try,
 		compiler_typed_expr_value_type,
+		compiler_typed_with_binding_is_try,
 	../stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
@@ -2084,28 +2085,116 @@ private pure func lower_typed_named_iterable_for(
 		Err(CompilerCoreLowerUnsupported("for over " + normalized_name))
 
 
-private pure func lower_typed_for(
+private pure func typed_loop_view_source(
+	iterable: CompilerTypedExpr,
+	view_name: String,
+) -> Result[CompilerTypedExpr, CompilerCoreLowerError]:
+	match iterable:
+		CompilerTypedCallExpr(_, args, _, _):
+			match args.get(0):
+				Some(source):
+					Ok(source)
+				None:
+					Err(
+						CompilerCoreLowerInvalidType(
+							view_name + " loop view is missing its source argument",
+						),
+					)
+		_:
+			Err(
+				CompilerCoreLowerInvalidType(
+					view_name + " loop view is not attached to a call expression",
+				),
+			)
+
+
+private pure func unknown_named_core_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var(name, None),
+			NamedType("Closure", []),
+			clone_core_source_loc(loc),
+		),
+		args,
+		return_type,
+		clone_core_source_loc(loc),
+	)
+
+
+private pure func lower_typed_indices_for(
 	binder: ParsedForBinder,
 	iterable: CompilerTypedExpr,
+	element_type: CompilerType,
 	body: CompilerTypedExpr,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CompilerCoreLowerError]:
-	match iterable:
-		CompilerTypedRangeExpr(start_expr, end_expr, _, _):
-			lower_typed_range_for(binder, iterable, start_expr, end_expr, body, typ, loc)
-		_:
-			iterable_type = compiler_typed_expr_value_type(iterable)
+	source ?= typed_loop_view_source(iterable, "indices")
+	lowered_binder ?= lower_for_name_binder(binder, element_type)
+	lowered_source ?= lower_typed_expr(source)
+	lowered_body ?= lower_typed_expr(body)
+	length_call = unknown_named_core_call(
+		"length",
+		[lowered_source],
+		core_int_type(),
+		clone_core_source_loc(loc),
+	)
 
-			match iterable_type:
-				CompilerNamedType(name, args):
-					lower_typed_named_iterable_for(binder, iterable, body, typ, loc, name, args)
+	Ok(
+		ForRangeExpr(
+			lowered_binder,
+			core_int_literal(0, clone_core_source_loc(loc)),
+			length_call,
+			lowered_body,
+			typ,
+			loc,
+		),
+	)
+
+
+private pure func lower_typed_for(
+	binder: ParsedForBinder,
+	iterable: CompilerTypedExpr,
+	loop_view: Option[CompilerTypedLoopView],
+	body: CompilerTypedExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	match loop_view:
+		Some(CompilerTypedIndicesLoopView(element_type)):
+			lower_typed_indices_for(binder, iterable, element_type, body, typ, loc)
+		Some(_):
+			Err(CompilerCoreLowerUnsupported("for loop view"))
+		None:
+			match iterable:
+				CompilerTypedRangeExpr(start_expr, end_expr, _, _):
+					lower_typed_range_for(binder, iterable, start_expr, end_expr, body, typ, loc)
 				_:
-					Err(
-						CompilerCoreLowerUnsupported(
-							"for over " + compiler_type_to_string(iterable_type),
-						),
-					)
+					iterable_type = compiler_typed_expr_value_type(iterable)
+
+					match iterable_type:
+						CompilerNamedType(name, args):
+							lower_typed_named_iterable_for(
+								binder,
+								iterable,
+								body,
+								typ,
+								loc,
+								name,
+								args,
+							)
+						_:
+							Err(
+								CompilerCoreLowerUnsupported(
+									"for over " + compiler_type_to_string(iterable_type),
+								),
+							)
 
 
 private pure func concurrent_for_item_type(
@@ -2593,8 +2682,12 @@ private pure func lower_with_mapped_failure_case(
 	failure_type ?= core_carrier_failure_type(acquisition_type)
 	accessor ?= carrier_failure_accessor(kind, acquisition_type)
 	mapped_error ?= lower_typed_expr(mapper.value)
+
 	failure_var = if mapper.name.text == "_":
-		core_var(question_bind_name("with_failure", mapper.span), None)
+		core_var(
+			question_bind_name("with_failure", mapper.span),
+			None,
+		)
 	else:
 		core_var(mapper.name.text, None)
 
@@ -2630,13 +2723,7 @@ private pure func lower_with_failure_case(
 ) -> Result[CoreConstructorMatchCase, CompilerCoreLowerError]:
 	match binding.error_map:
 		None:
-			lower_question_bind_failure_case(
-				kind,
-				acquisition_type,
-				result_type,
-				binding.span,
-				loc,
-			)
+			lower_question_bind_failure_case(kind, acquisition_type, result_type, binding.span, loc)
 		Some(mapper):
 			match kind:
 				CompilerCoreLowerOptionCarrier:
@@ -2646,13 +2733,7 @@ private pure func lower_with_failure_case(
 						),
 					)
 				CompilerCoreLowerResultCarrier:
-					lower_with_mapped_failure_case(
-						mapper,
-						kind,
-						acquisition_type,
-						result_type,
-						loc,
-					)
+					lower_with_mapped_failure_case(mapper, kind, acquisition_type, result_type, loc)
 
 
 private pure func lower_typed_with(
@@ -2711,7 +2792,10 @@ private pure func lower_typed_with(
 				clone_core_type(result_type),
 				clone_core_source_loc(loc),
 			)
-			temp_var = core_var(question_bind_name("with_value", binding.span), None)
+			temp_var = core_var(
+				question_bind_name("with_value", binding.span),
+				None,
+			)
 			temp_ref = VarExpr(
 				clone_core_var(temp_var),
 				clone_core_type(acquisition_type),
@@ -2726,26 +2810,9 @@ private pure func lower_typed_with(
 				clone_core_source_loc(loc),
 			)
 
-			Ok(
-				LetExpr(
-					temp_var,
-					False,
-					acquisition_type,
-					acquisition,
-					match_expr,
-				),
-			)
+			Ok(LetExpr(temp_var, False, acquisition_type, acquisition, match_expr))
 	else:
-		Ok(
-			resource_scope_expr(
-				binding,
-				resource_type,
-				acquisition,
-				lowered_body,
-				result_type,
-				loc,
-			),
-		)
+		Ok(resource_scope_expr(binding, resource_type, acquisition, lowered_body, result_type, loc))
 
 
 private pure func lower_tuple_destruct_bindings(
@@ -3002,8 +3069,8 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 		CompilerTypedDetachExpr(body, _, _):
 			lowered_body ?= lower_typed_expr(body)
 			Ok(PreClosureDetachExpr({body = lowered_body}, typ, loc))
-		CompilerTypedForExpr(binder, iterable, _, body, _, _):
-			lower_typed_for(binder, iterable, body, typ, loc)
+		CompilerTypedForExpr(binder, iterable, loop_view, body, _, _):
+			lower_typed_for(binder, iterable, loop_view, body, typ, loc)
 		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			lower_typed_concurrent_block(
 				params,
