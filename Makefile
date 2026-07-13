@@ -84,7 +84,7 @@ build-blorp-cli: build $(BLORP_CLI_SOURCE)
 	new_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
-		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$(OCAML_HOST)" "$$bridge_compiler" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \

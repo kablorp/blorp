@@ -173,8 +173,12 @@ The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
 explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
 which downloads and verifies the pinned dev release `dev-9f56c40d2b91` into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
-when set. Update the tag, version, and target checksums in that script together
-when intentionally moving the fallback bootstrap forward.
+when set. To move the fallback bootstrap forward, update the release revision
+and target checksums in `scripts/blorp-compiler-bootstrap-pin.sh`; the wrapper
+derives the tag and artifact version from that one revision.
+`BLORP_COMPILER_BOOTSTRAP_TAG` overrides are rejected because a tag alone
+cannot safely override the version and checksums. Use
+`BLORP_COMPILER_BRIDGE_BIN` to test a different compiler executable.
 
 Both helper builds call the normal `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read

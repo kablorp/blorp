@@ -95,8 +95,10 @@ needed by the temporary OCaml middle crosses a process boundary.
 8. **The pinned bootstrap is immutable.** Keep the user-selected
    `dev-9f56c40d2b91` bootstrap until an all-green committed revision has
    published replacement artifacts. Rotate the pin in a later, isolated
-   commit. The workflow/script pin discrepancy must be resolved through one
-   authoritative manifest before that rotation.
+   commit. The checked-in pin manifest is the single source of truth; the
+   wrapper derives its tag and artifact version from that revision, while
+   compilation caches hash the manifest and the bootstrap download cache also
+   hashes the resolver so its cold path is exercised after resolver changes.
 
 ## Checkpoint A: Freeze A Green Baseline
 
@@ -109,11 +111,10 @@ Implementation:
 2. Record the revision, bootstrap tag, platform, and gate result in this file.
 3. Add a compact host-boundary inventory test or script that asserts normal
    `check`, `compile`, and `run` enter only the current expected handoff.
-4. Reconcile the bootstrap source of truth. Today the workflow files name
-   `dev-33e00c2b94df`, while `scripts/blorp-compiler-bootstrap` defaults to and
-   verifies `dev-9f56c40d2b91`. Introduce one checked-in manifest consumed by
-   both; do not silently choose whichever environment variable happens to be
-   present.
+4. Reconcile the bootstrap source of truth. Complete: the checked-in pin
+   manifest owns the release revision and checksums; workflow cache namespaces
+   derive from its content hash, and a regression test rejects workflow tag
+   overrides.
 5. Once the revision is committed and CI is green, let the existing release
    workflow publish immutable `dev-<sha>` binaries. Do not pin them yet.
 
