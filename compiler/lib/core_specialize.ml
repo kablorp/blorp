@@ -505,6 +505,7 @@ let specialize_hash (e : core) callee arg : core =
 
 let int_ty = Ast.TyNamed ("Int", [])
 let void_ty = Ast.TyNamed ("Void", [])
+let raw_ptr_ty = Ast.TyNamed ("Ptr", [])
 
 let void_slot_arg_already_explicit arg =
   match arg.desc with CBox _ | CBoxTyped _ -> true | _ -> false
@@ -704,10 +705,16 @@ let raw_tensor_storage_pred_intrinsic kind =
   let pred, _, _ = tensor_fast_read_intrinsics_of_kind kind in
   pred
 
+let tensor_raw_view_source_name tensor =
+  match tensor.desc with CVar var -> Some (Var.to_c_name var) | _ -> None
+
 let bounds_proven_tensor_read ?reg env e tensor idx =
-  if not (loop_proves_tensor_index_in_bounds ?reg env tensor idx) then None
-  else
-    match tensor_fast_read_intrinsics ?reg e.ty with
+  match tensor_raw_view_source_name tensor with
+  | None -> None
+  | Some _ when not (loop_proves_tensor_index_in_bounds ?reg env tensor idx) ->
+      None
+  | Some source_name -> (
+      match tensor_fast_read_intrinsics ?reg e.ty with
     | None -> None
     | Some (storage_pred_intr, raw_kind, safe_get_intr) ->
         let void_ty = Ast.TyNamed ("Void", []) in
@@ -719,12 +726,7 @@ let bounds_proven_tensor_read ?reg env e tensor idx =
             ty = Ast.TyNamed ("Bool", []);
           }
         in
-        let raw_view =
-          let prefix =
-            match tensor.desc with CVar v -> Var.to_c_name v | _ -> "expr"
-          in
-          Var.named (fresh_raw_view_name prefix)
-        in
+        let raw_view = Var.named (fresh_raw_view_name source_name) in
         let raw_read =
           {
             e with
@@ -752,7 +754,7 @@ let bounds_proven_tensor_read ?reg env e tensor idx =
             desc = CCall (CKIntrinsic safe_get_intr, dummy, [ tensor; idx ]);
           }
         in
-        Some { e with desc = CIf (storage_ok, fast_read, safe_read) }
+        Some { e with desc = CIf (storage_ok, fast_read, safe_read) })
 
 let ty_bool = Ast.TyNamed ("Bool", [])
 let ty_void = Ast.TyNamed ("Void", [])
@@ -2282,7 +2284,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                   {
                     e with
                     desc = CCall (CKBuiltin builtin, callee, call_args);
-                    ty = (if returns_primitive then result_ty else void_ty);
+                    ty = (if returns_primitive then result_ty else raw_ptr_ty);
                   }
                 in
                 if returns_primitive then Some call
@@ -2335,7 +2337,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                               ( CKIntrinsic "tensor_get_unchecked",
                                 dummy,
                                 [ arr; idx ] );
-                          ty = void_ty;
+                          ty = raw_ptr_ty;
                         }
                       in
                       if is_pointer then
@@ -2398,7 +2400,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                         {
                           e with
                           desc = CCall (CKBuiltin c, callee, args);
-                          ty = void_ty;
+                          ty = raw_ptr_ty;
                         }
                       in
                       if is_pointer then
@@ -2742,12 +2744,11 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         }
       in
       let new_args = [ coll; idx; mk_int row_size; mk_int result_first_dim ] in
-      let void_ty = TyNamed ("Void", []) in
       let raw_call =
         {
           e with
           desc = CCall (CKBuiltin "blorp_tensor_slice_row", callee, new_args);
-          ty = void_ty;
+          ty = raw_ptr_ty;
         }
       in
       { e with desc = CCast (raw_call, e.ty) }
@@ -3083,7 +3084,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
   | _ -> e
 
 (** Specialize a function body. Generic bodies (those with remaining type
-    parameters after mono) only get phase-invariant layout rewrites. [Core_emit]
+    parameters after mono) only get phase-invariant layout rewrites. The Blorp C emitter
     skips them (only monomorphized copies are emitted), and several specialize
     rewrites (notably [tensor_peel] → [blorp_tensor_slice_row]) require
     concrete dim values that a generic body doesn't have. Layout-bearing list

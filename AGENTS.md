@@ -234,6 +234,8 @@ scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped t
 scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # Fast compiler surface tests
 scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
+scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
+scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime .brp tests
 scripts/test leak               # Focused leak-check baselines
@@ -252,6 +254,7 @@ scripts/test --log-dir logs     # Save complete gate logs with compact console o
 # Makefile shortcuts
 make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
+make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
 make compiler-unit-test           # Compiler-internal OCaml/Alcotest unit-shaped tests
 make compiler-unit-deep-test      # Compiler-internal integration-shaped Alcotest tests
 make coverage                     # Compiler-unit coverage
@@ -465,7 +468,6 @@ compiler/            # OCaml compiler implementation
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
-    core_dce.ml     # Core IR dead concrete function pruning
     core_consume_specialize.ml  # Core IR consuming-call specialization before Perceus
     core_perceus.ml   # Core IR Perceus RC insertion
     core_reuse.ml     # Core IR post-Perceus reuse analysis and prepared union reuse

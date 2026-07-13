@@ -24,9 +24,6 @@ type sanitizer_mode =
 val sanitizer_mode_of_string : string -> sanitizer_mode option
 (** Parse CLI/env sanitizer mode values. *)
 
-val sanitizer_mode_to_string : sanitizer_mode -> string
-(** Stable display/cache string for a sanitizer mode. *)
-
 val sanitizer_enabled : sanitizer_mode -> bool
 (** Whether the mode emits any sanitizer instrumentation. *)
 
@@ -44,11 +41,6 @@ val run_tests :
   string ->
   int
 (** Run tests: dispatches to sequential or parallel based on job count *)
-
-val collect_test_files : string list -> string list
-(** Collect runnable .brp test files from one or more file/directory roots,
-    preserving root order. Runnable files declare [tests: TestSuite] or
-    doctests; ordinary programs with [func main] are not tests. *)
 
 val run_tests_paths :
   ?profile:bool ->
@@ -85,18 +77,11 @@ val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
     Nested calls reuse the current root. The root is deleted on normal exit. *)
 
-val current_run_artifact_root : unit -> string
-(** Current run artifact root, creating one if needed. Exposed for tests and
-    callers that need to place generated binaries under the active run. *)
-
 val run_artifact_path : kind:string -> prefix:string -> suffix:string -> string
 (** Allocate a unique mutable artifact path under the active run root. *)
 
 val run_compilation_dir : unit -> string
 (** Allocate a per-run directory for one compile/link/run lifecycle. *)
-
-val sanitize_cc_args : string list
-(** AddressSanitizer + UBSan compiler flags (list form). *)
 
 val sanitizer_cc_args : sanitizer_mode -> string list
 (** Compiler flags for the selected sanitizer mode. *)

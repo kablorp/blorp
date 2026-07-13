@@ -18,7 +18,9 @@ import:
 			IntrinsicCall,
 			ListToStringCall,
 			OperationResultCall,
+			SelectedDirectCall,
 			TensorParallelCall,
+			UnknownCall,
 			UserCall,
 		),
 		CoreClosureAbi,
@@ -42,9 +44,20 @@ import:
 			ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
 		CoreDictEntry,
 		CoreDictLiteralEntry,
+		CoreEnumDecl,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			AssignExpr,
@@ -162,6 +175,7 @@ import:
 			TupleVoidElement,
 		),
 		CoreType,
+		CoreUnionDecl,
 		CoreVar,
 
 
@@ -186,6 +200,10 @@ record FreeVar {
 
 private pure func call_kind_uses_runtime_callee(kind: CoreCallKind) -> Bool:
 	match kind:
+		UnknownCall:
+			True
+		SelectedDirectCall(def_id):
+			False
 		ClosureCall:
 			True
 		UserCall(name, def_id, consumed_args):
@@ -1069,10 +1087,11 @@ private pure func add_free_var(vars: List[FreeVar], name: String, typ: CoreType)
 	if exists:
 		vars
 	else:
-		vars.append({
+		free_var: FreeVar = {
 			name = name,
-			typ = typ,
-		})
+			typ = typ
+		}
+		vars.append(free_var)
 
 
 private pure func merge_free_vars(left: List[FreeVar], right: List[FreeVar]) -> List[FreeVar]:
@@ -1469,12 +1488,11 @@ private pure func free_vars_expr(
 			else if contains_name(state.function_names, variable.name):
 				[]
 			else:
-				[
-					{
-						name = variable.name,
-						typ = typ
-					},
-				]
+				free_var: FreeVar = {
+					name = variable.name,
+					typ = typ
+				}
+				[free_var]
 		LiteralExpr(literal, typ, loc):
 			[]
 		VoidExpr(typ, loc):
@@ -2062,6 +2080,41 @@ private pure func captures_from_body(
 	result
 
 
+pure func lambda_runtime_captures(
+	function_names: List[String],
+	constructor_names: List[String],
+	params: List[CoreParam],
+	body: CoreExpr,
+) -> List[CoreClosureCapture]:
+	state: ClosureState = {
+		next_lambda_index = 0,
+		next_task_index = 0,
+		next_def_id = 0,
+		current_module = None,
+		function_names = function_names,
+		constructor_names = constructor_names,
+		hoisted = []
+	}
+
+	closure_captures_from_free_vars(
+		captures_from_body(
+			state,
+			[],
+			add_bound_params([], params),
+			body,
+		),
+	)
+
+
+pure func lambda_has_runtime_captures(
+	function_names: List[String],
+	constructor_names: List[String],
+	params: List[CoreParam],
+	body: CoreExpr,
+) -> Bool:
+	lambda_runtime_captures(function_names, constructor_names, params, body).length() > 0
+
+
 private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -2481,6 +2534,10 @@ private pure func call_consumes_var(
 	variable: CoreVar,
 ) -> Bool:
 	match kind:
+		UnknownCall:
+			False
+		SelectedDirectCall(def_id):
+			False
 		UserCall(name, def_id, consumed_args):
 			consumed_arg_refs_var(consumed_args, args, variable)
 		ClosureCall:
@@ -5161,6 +5218,12 @@ private pure func max_decl_def_id(current: Int, decl: CoreDecl) -> Int:
 			current
 		HeapRecordDecl(record_decl):
 			current
+		TypeAliasDecl(alias_decl):
+			current
+		TraitDecl(trait_decl):
+			current
+		ImplDecl(impl_decl):
+			impl_decl.methods.fold_left(current, max_function_def_id)
 
 
 private pure func max_program_def_id(program: CoreProgram) -> Int:
@@ -5183,7 +5246,7 @@ private pure func builtin_constructor_names() -> List[String]:
 	["Some", "None", "Ok", "Err", "True", "False", "Timeout", "TaskFailed", "Cancelled", "NULL"]
 
 
-private pure func scan_constructor_names(program: CoreProgram) -> List[String]:
+pure func capture_constructor_names(program: CoreProgram) -> List[String]:
 	var names: List[String] = builtin_constructor_names()
 
 	for decl in program.decls:
@@ -5205,11 +5268,17 @@ private pure func scan_constructor_names(program: CoreProgram) -> List[String]:
 				void
 			HeapRecordDecl(record_decl):
 				void
+			TypeAliasDecl(alias_decl):
+				void
+			TraitDecl(trait_decl):
+				void
+			ImplDecl(impl_decl):
+				void
 
 	names
 
 
-private pure func scan_function_names(program: CoreProgram) -> List[String]:
+pure func capture_function_names(program: CoreProgram) -> List[String]:
 	var names: List[String] = []
 
 	for decl in program.decls:
@@ -5226,6 +5295,13 @@ private pure func scan_function_names(program: CoreProgram) -> List[String]:
 				void
 			HeapRecordDecl(record_decl):
 				void
+			TypeAliasDecl(alias_decl):
+				void
+			TraitDecl(trait_decl):
+				void
+			ImplDecl(impl_decl):
+				for method in impl_decl.methods:
+					names = add_name_once(names, method.name)
 
 	names
 
@@ -5236,8 +5312,8 @@ private pure func initial_state(program: CoreProgram) -> ClosureState:
 		next_task_index = 0,
 		next_def_id = max_program_def_id(program) + 1,
 		current_module = None,
-		function_names = scan_function_names(program),
-		constructor_names = scan_constructor_names(program),
+		function_names = capture_function_names(program),
+		constructor_names = capture_constructor_names(program),
 		hoisted = []
 	}
 
@@ -5304,6 +5380,21 @@ private pure func convert_decl(state: ClosureState, decl: CoreDecl) -> Converted
 				decls = [decl]
 			}
 		HeapRecordDecl(record_decl):
+			{
+				state = state,
+				decls = [decl]
+			}
+		TypeAliasDecl(alias_decl):
+			{
+				state = state,
+				decls = [decl]
+			}
+		TraitDecl(trait_decl):
+			{
+				state = state,
+				decls = [decl]
+			}
+		ImplDecl(impl_decl):
 			{
 				state = state,
 				decls = [decl]

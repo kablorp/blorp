@@ -1,0 +1,311 @@
+import:
+	../src/stage_08_core_lower/compiler_core_list_layout:
+		annotate_list_layouts,
+		list_element_needs_release,
+		list_layout_for_type,
+	../src/stage_09_core/compiler_core_json:
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TypeAliasDecl, ValueRecordDecl),
+		CoreExpr(ListAllocExpr, ListConstructExpr, LiteralExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(EnumType, NamedType, ValueRecordType, VoidType),
+		CoreVar,
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func list_type(element_type: CoreType) -> CoreType:
+	NamedType("List", [element_type])
+
+
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func empty_program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), named_type("Int"), SyntheticSourceLoc)
+
+
+pure func is_inline_layout(layout: CoreListStorageLayout, width: Int) -> Bool:
+	match layout:
+		InlineListStorage(actual_width):
+			actual_width == width
+		_:
+			False
+
+
+pure func is_inline_struct_layout(layout: CoreListStorageLayout, name: String) -> Bool:
+	match layout:
+		InlineStructListStorage(actual_name):
+			actual_name == name
+		_:
+			False
+
+
+pure func is_pointer_layout(layout: CoreListStorageLayout) -> Bool:
+	match layout:
+		PointerListStorage:
+			True
+		_:
+			False
+
+
+pure func stale_list_construct(typ: CoreType) -> CoreExpr:
+	ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = True
+		},
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func stale_list_alloc(typ: CoreType) -> CoreExpr:
+	ListAllocExpr(
+		{
+			layout = InlineListStorage(1),
+			capacity = int_literal(4),
+			elem_needs_release = False
+		},
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func global_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+	init: CoreExpr,
+) -> CoreDecl:
+	GlobalDecl({
+		name = core_var(name),
+		typ = typ,
+		init = init,
+		is_mutable = False,
+		is_const = False,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func test_classifies_primitive_widths() -> Bool:
+	program: CoreProgram = empty_program([])
+	cases: List[(String, Int)] = [
+		("Bool", 1),
+		("Char", 4),
+		("Int16", 2),
+		("Float32", 4),
+		("Int", 8),
+		("Float", 8),
+	]
+
+	cases.all(func(pair):
+		match list_layout_for_type(program, list_type(named_type(pair[0]))):
+			InlineListStorage(width):
+				width == pair[1]
+			_:
+				False
+	)
+
+
+pure func test_classifies_declared_enum_and_value_record() -> Bool:
+	program: CoreProgram = empty_program([
+		EnumDecl({
+			name = "Tiny",
+			type_params = [],
+			variants = [
+				{
+					name = "Zero",
+					c_name = "Tiny_Zero",
+					tag = 0,
+					def_id = None
+				},
+				{
+					name = "Max",
+					c_name = "Tiny_Max",
+					tag = 255,
+					def_id = None
+				},
+			],
+			loc = SyntheticSourceLoc,
+		}),
+		ValueRecordDecl({
+			name = "Point",
+			type_params = [],
+			fields = [],
+			loc = SyntheticSourceLoc,
+		}),
+	])
+
+	is_inline_layout(
+		list_layout_for_type(program, list_type(EnumType("Tiny"))),
+		1,
+	) and is_inline_struct_layout(
+		list_layout_for_type(program, list_type(ValueRecordType("Point"))),
+		"Point",
+	)
+
+
+pure func test_expands_aliases() -> Bool:
+	program: CoreProgram = empty_program([TypeAliasDecl({
+			name = "Count",
+			type_params = [],
+			target = named_type("Int"),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		}), TypeAliasDecl({
+			name = "Bag",
+			type_params = ["T"],
+			target = NamedType("List", [named_type("T")]),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		}), TypeAliasDecl({
+			name = "CycleA",
+			type_params = [],
+			target = named_type("CycleB"),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		}), TypeAliasDecl({
+			name = "CycleB",
+			type_params = [],
+			target = named_type("CycleA"),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		})])
+
+	is_inline_layout(
+		list_layout_for_type(program, list_type(named_type("Count"))),
+		8,
+	) and is_inline_layout(
+		list_layout_for_type(
+			program,
+			NamedType("Bag", [named_type("Int")]),
+		),
+		8,
+	) and is_pointer_layout(list_layout_for_type(program, list_type(named_type("CycleA"))))
+
+
+pure func test_classifies_stack_option_inline_struct() -> Bool:
+	program: CoreProgram = empty_program([])
+	option_int: CoreType = NamedType("Option", [named_type("Int")])
+
+	is_inline_struct_layout(
+		list_layout_for_type(program, list_type(option_int)),
+		"blorp_StackOption_Int",
+	)
+
+
+pure func test_classifies_pointer_release_policy() -> Bool:
+	program: CoreProgram = empty_program([])
+	string_type: CoreType = named_type("String")
+	int128_type: CoreType = named_type("Int128")
+
+	(
+		is_pointer_layout(list_layout_for_type(program, list_type(string_type)))
+		and list_element_needs_release(program, string_type)
+		and is_pointer_layout(list_layout_for_type(program, list_type(int128_type)))
+		and list_element_needs_release(program, int128_type)
+	)
+
+
+pure func test_annotates_function_global_and_impl_bodies() -> Bool:
+	int_list: CoreType = list_type(named_type("Int"))
+	string_list: CoreType = list_type(named_type("String"))
+	method: CoreFunction = {
+		name = "method",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_list,
+		body = Some(stale_list_construct(int_list)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 3,
+		loc = SyntheticSourceLoc
+	}
+	annotated = annotate_list_layouts(empty_program([
+		function_decl("make", 1, stale_list_construct(int_list)),
+		global_decl("names", 2, string_list, stale_list_alloc(string_list)),
+		ImplDecl({
+			trait_name = "Maker",
+			for_type = named_type("Int"),
+			methods = [method],
+			loc = SyntheticSourceLoc,
+		}),
+	]))
+
+	match annotated.decls:
+		[FunctionDecl(function_info), GlobalDecl(global_info), ImplDecl(impl_info)]:
+			match (function_info.body, global_info.init, impl_info.methods.get(0)):
+				(Some(ListConstructExpr(function_list, _, _)), ListAllocExpr(global_list, _, _), Some(method_info)):
+					match method_info.body:
+						Some(ListConstructExpr(method_list, _, _)):
+							(
+								is_inline_layout(function_list.layout, 8)
+								and not function_list.elem_needs_release
+								and is_pointer_layout(global_list.layout)
+								and global_list.elem_needs_release
+								and is_inline_layout(method_list.layout, 8)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core list layout",
+	tests = [
+		("classifies primitive widths", test_classifies_primitive_widths),
+		(
+			"classifies declared enum and value record",
+			test_classifies_declared_enum_and_value_record,
+		),
+		("expands aliases", test_expands_aliases),
+		("classifies stack option inline struct", test_classifies_stack_option_inline_struct),
+		("classifies pointer release policy", test_classifies_pointer_release_policy),
+		(
+			"annotates function global and impl bodies",
+			test_annotates_function_global_and_impl_bodies,
+		),
+	]
+}

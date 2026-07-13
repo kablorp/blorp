@@ -19,21 +19,18 @@
        and narrow tuple-return call sites
     12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
        to CCast / concrete names; make eta adapters visible to Perceus
-    13. [Core_dce] — prune unreachable concrete functions, impl methods,
-       non-runtime generic function/impl templates, and source-only type
-       declarations
-    14. [Core_consume_specialize] — clone safe self-replacement callees with
-       explicit consumed parameters
-    15. [Core_perceus] — insert CDup/CDrop for reference counting
-    16. backend handoff — default compilation gives post-Perceus Core to Blorp
+    13. backend handoff — default compilation gives pre-DCE Core to Blorp
+    14. Blorp-owned DCE — prune unreachable emitted functions
+    15. Blorp-owned consume-specialize pass
+    16. Blorp-owned Perceus — insert explicit dup/drop operations
     17. Blorp-owned final tail — normal reuse, closure conversion, resource
        cleanup lowering, fairness checkpoints, codegen preparation, prepared
        reuse, and C artifact emission
 
-    OCaml program-bearing callbacks stop at the post-Perceus handoff. CLI
+    OCaml program-bearing callbacks stop at the pre-DCE handoff. CLI
     late-stage dumps/stops use Blorp Core JSON observation instead. Timing-only
     observation uses lightweight stage events. Normal C output always comes
-    from the Blorp post-Perceus handoff.
+    from the Blorp pre-DCE handoff.
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -81,63 +78,24 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 
 let no_op_on_stage_json : on_stage_json_callback = fun _ _ -> ()
 
-(** Stages that transform Core after the initial lowering snapshot. [Lower]
-    and [Final] are observations, not transformations, so they are kept out
-    of this list and added explicitly in [observed_stage_order]. *)
-let transform_stage_order =
-  [
-    Core_stage.Debug;
-    Core_stage.Desugar;
-    Core_stage.Mono;
-    Core_stage.Synth;
-    Core_stage.Match;
-    Core_stage.TraitResolve;
-    Core_stage.Resolve;
-    Core_stage.StdInline;
-    Core_stage.Tailrec;
-    Core_stage.Fusion;
-    Core_stage.Specialize;
-    Core_stage.Dce;
-    Core_stage.ConsumeSpecialize;
-    Core_stage.Perceus;
-    Core_stage.Reuse;
-    Core_stage.Closure;
-  ]
-
-(** The exact order in which [on_stage_callback] fires. This is the
-    executable pipeline contract used by tests, docs, dumps, profiling, and
-    [--stop-after]. *)
-let observed_stage_order =
-  (Core_stage.Lower :: transform_stage_order) @ [ Core_stage.Final ]
-
 let stage_observed_via_blorp_tail_json = function
-  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final -> true
+  | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
+  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
+      true
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+  | Core_stage.Fusion | Core_stage.Specialize ->
       false
 
-let pre_backend_program_stage_order =
-  List.filter
-    (fun stage -> not (stage_observed_via_blorp_tail_json stage))
-    observed_stage_order
-
-(** Program-free stage events do not materialize Blorp-owned backend-tail
-    snapshots. Reuse and closure are represented by the single [Final] event
-    unless a caller explicitly requests their Core JSON snapshots. *)
-let program_free_stage_event_order =
-  pre_backend_program_stage_order @ [ Core_stage.Final ]
-
 let blorp_tail_stage_name = function
-  | (Core_stage.Reuse | Core_stage.Closure | Core_stage.Final) as stage ->
+  | ( Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
+    | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ) as stage ->
       Some (Core_stage.to_string stage)
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
   | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+  | Core_stage.Fusion | Core_stage.Specialize ->
       None
 
 let core_stage_list_contains target =
@@ -176,18 +134,18 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-let post_perceus_program_json ~reg program =
+let pre_dce_program_json ~reg program =
   match Core_emit_blorp_c.program_json ~reg program with
   | Ok json -> json
   | Error error -> failwith (Core_emit_blorp_c.unsupported_to_string error)
 
 let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback) ~(stages : Core_stage.t list)
-    (post_perceus : Core.core_program) =
+    (pre_dce : Core.core_program) =
   match stages with
   | [] -> ()
   | _ :: _ ->
-      let core_json = post_perceus_program_json ~reg post_perceus in
+      let core_json = pre_dce_program_json ~reg pre_dce in
       List.iter
         (fun stage ->
           match blorp_tail_stage_name stage with
@@ -204,26 +162,28 @@ let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
 
 type backend_core_input = {
   blorp_tail_input : Core.core_program;
-      (** Post-Perceus Core handed to Blorp for reuse/closure/resource/fairness/
-          prepare/prepared-reuse/emission on the default path. *)
+      (** Pre-DCE Core handed to Blorp for DCE, consume specialization,
+          Perceus, reuse, closure, resource/fairness, prepare, and emission. *)
 }
 
 (** Run C emission through the single Blorp backend path. Normal compilation
-    hands off before the final tail so Blorp owns reuse/closure/resource/
-    fairness/prepare. Late-stage CLI observation uses [on_stage_json] over the
-    Blorp tail. *)
+    hands off after specialization so Blorp owns DCE, consume specialization,
+    Perceus, and the complete backend tail. Late-stage CLI observation uses
+    [on_stage_json] over the Blorp-owned stages. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     ~(reg : Codegen_types.registry) ~(on_stage_event : on_stage_event)
     ~(on_stage_json : on_stage_json_callback)
     ~(tail_observation_stages : Core_stage.t list)
     (backend_input : backend_core_input) : string =
+  if not (core_stage_list_contains Core_stage.Dce tail_observation_stages) then
+    on_stage_event Core_stage.Dce;
   observe_blorp_tail_json ~reg ~on_stage_event ~on_stage_json
     ~stages:tail_observation_stages backend_input.blorp_tail_input;
   let cfg =
     Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
   in
   let result =
-    Core_emit_blorp_c.try_emit_post_closure_program_string cfg
+    Core_emit_blorp_c.try_emit_core_program_string cfg
       backend_input.blorp_tail_input
   in
   if
@@ -246,7 +206,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  let post_perceus =
+  let pre_dce =
     prog |> observe Core_stage.Lower
     |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
     |> run_stage Core_stage.Desugar (fun p ->
@@ -274,12 +234,8 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
         p
         |> Core_specialize.specialize_program ~reg
         |> Core_closure.adapt_function_refs_program)
-    |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
-    |> run_stage Core_stage.ConsumeSpecialize
-         (Core_consume_specialize.rewrite_program ~reg)
-    |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
   in
-  { blorp_tail_input = post_perceus }
+  { blorp_tail_input = pre_dce }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(on_stage_event = no_op_on_stage_event)
@@ -303,124 +259,166 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   emit_via_c_backend ~embed_runtime ~profile ~reg
     ~on_stage_event ~on_stage_json ~tail_observation_stages backend_input
 
-(** Compile a typed AST program with module support.
+type typed_module_input = {
+  typed_module_name : string;
+  typed_module_program : Typed_ast.program;
+  typed_module_import_bindings : Session.import_binding list;
+}
 
-    Collects all loaded modules (via [Modules.get_all_modules]),
-    lowers them alongside the main program, and runs the full
-    Core pipeline. Each module's declarations are prefixed with the
-    sanitized module name before flattening.
+type prepared_typed_program = {
+  prepared_core : Core.core_program;
+  prepared_registry : Codegen_types.registry;
+  prepared_import_aliases : (string, string * string) Hashtbl.t;
+  prepared_module_imports :
+    (string, (string, string * string) Hashtbl.t) Hashtbl.t;
+}
 
-    Returns [(c_code, link_flags, include_dirs)]. *)
-let compile_typed_with_modules ?(main_import_bindings = [])
-    ?(embed_runtime = true) ?(profile = false) ?(debug = false) ?on_stage
-    ?(on_stage_event = no_op_on_stage_event)
-    ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
-    ?(check_invariants = false) (typed_main : Typed_ast.program) :
-    string * string list * string list =
-  let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
-  let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
-  let program = Typed_ast.program_ast typed_main in
-  Session.reset_core_counters (Session.current ());
-  let modules = Modules.get_all_modules () in
-  let typed_module_decls (m : Modules.loaded_module) =
-    match m.typed_decls with
-    | Some td -> td
+let typed_module_input_of_loaded_module (loaded : Modules.loaded_module) =
+  let typed_module_program =
+    match loaded.typed_decls with
+    | Some typed_program -> typed_program
     | None ->
         Core_error.errorf (Core_error.Stage Core_stage.Lower) Ast.dummy_loc
           ~hint:
             "Pipeline.ensure_modules_typed must type-check every loaded module \
              before Core lowering. If this came from a direct Core_pipeline \
-             call, use a high-level Pipeline entrypoint or populate \
-             typed_decls explicitly."
-          "module %s reached Core lowering without typed declarations" m.name
+             call, use a high-level Pipeline entrypoint or provide an explicit \
+             typed module input."
+          "module %s reached Core lowering without typed declarations"
+          loaded.name
   in
-  let module_core =
-    List.concat_map
-      (fun (m : Modules.loaded_module) ->
-        let typed_program = typed_module_decls m in
-        let decl_label d =
-          match d.Ast.decl_desc with
-          | Ast.DFunc f -> "func " ^ Option.value f.func_name ~default:"?"
-          | Ast.DVar v -> "var " ^ Option.value v.var_name ~default:"?"
-          | Ast.DType t -> "type " ^ t.type_name
-          | _ -> "decl"
-        in
-        let core_decls =
-          List.map
-            (fun typed_decl ->
-              let d = Typed_ast.decl_ast typed_decl in
-              try Core_lower.lower_typed_decl typed_decl with
-              | Core_error.Core_error _ as exn -> raise exn
-              | Failure msg ->
-                  Core_error.errorf (Core_error.Stage Core_stage.Lower)
-                    d.decl_loc
-                    ~hint:
-                      "Core lowering must either translate every module \
-                       declaration or report the unsupported shape; silently \
-                       dropping one would produce a partial module."
-                    "lowering failed for %s in module %s: %s" (decl_label d)
-                    m.name msg)
-            (Typed_ast.program_decls typed_program)
-        in
-        Core_flatten.prefix_module_names m.name core_decls)
-      modules
+  {
+    typed_module_name = loaded.name;
+    typed_module_program;
+    typed_module_import_bindings =
+      Option.value ~default:[] loaded.typed_import_bindings;
+  }
+
+let typed_decl_label typed_decl =
+  match (Typed_ast.decl_ast typed_decl).Ast.decl_desc with
+  | Ast.DFunc f -> "func " ^ Option.value f.func_name ~default:"?"
+  | Ast.DVar v -> "var " ^ Option.value v.var_name ~default:"?"
+  | Ast.DType t -> "type " ^ t.type_name
+  | _ -> "decl"
+
+let lower_typed_module (module_input : typed_module_input) =
+  let core_decls =
+    List.map
+      (fun typed_decl ->
+        let decl = Typed_ast.decl_ast typed_decl in
+        try Core_lower.lower_typed_decl typed_decl with
+        | Core_error.Core_error _ as exn -> raise exn
+        | Failure msg ->
+            Core_error.errorf (Core_error.Stage Core_stage.Lower) decl.decl_loc
+              ~hint:
+                "Core lowering must either translate every module declaration \
+                 or report the unsupported shape; silently dropping one would \
+                 produce a partial module."
+              "lowering failed for %s in module %s: %s"
+              (typed_decl_label typed_decl)
+              module_input.typed_module_name msg)
+      (Typed_ast.program_decls module_input.typed_module_program)
   in
+  Core_flatten.prefix_module_names module_input.typed_module_name core_decls
+
+(** Restore the resource-cleanup metadata carried by a post-typecheck program.
+    OCaml typechecking registers this metadata directly, while decoded Blorp
+    typed programs arrive without those process-local side effects. Keeping
+    restoration at the typed-to-Core boundary makes both inputs equivalent. *)
+let register_typechecked_resource_cleanups ~module_name typed_program =
+  let session = Session.current () in
+  let register type_name cleanup =
+    Session.register_resource_cleanup session ~type_name cleanup
+  in
+  let rec visit_decl (decl : Ast.decl) =
+    match decl.decl_desc with
+    | Ast.DPrivate inner -> visit_decl inner
+    | Ast.DType type_decl when type_decl.type_is_resource ->
+        Option.iter
+          (fun cleanup ->
+            register type_decl.type_name cleanup;
+            let canonical_name =
+              Types.canonical_module_type_name ~module_path:module_name
+                type_decl.type_name
+            in
+            if
+              module_name <> ""
+              && not (String.equal canonical_name type_decl.type_name)
+            then
+              register canonical_name cleanup)
+          type_decl.type_resource_cleanup
+    | _ -> ()
+  in
+  Typed_ast.program_ast typed_program |> List.iter visit_decl
+
+(** Build the explicit lowered input for the semantic middle. This is the
+    shared boundary used by the current in-process pipeline and the temporary
+    OCaml worker. It deliberately takes typed modules rather than consulting
+    the process-global module cache. *)
+let prepare_typed_with_module_inputs ?(main_import_bindings = [])
+    ?(main_module_name = "") ~(modules : typed_module_input list)
+    (typed_main : Typed_ast.program) =
+  let program = Typed_ast.program_ast typed_main in
+  Session.reset_core_counters (Session.current ());
+  List.iter
+    (fun module_input ->
+      register_typechecked_resource_cleanups
+        ~module_name:module_input.typed_module_name
+        module_input.typed_module_program)
+    modules;
+  register_typechecked_resource_cleanups ~module_name:main_module_name typed_main;
+  let module_core = List.concat_map lower_typed_module modules in
   let main_core =
     Core_lower.lower_typed_program typed_main
     |> Core_flatten.rewrite_main_imported_type_names program
   in
-  (* Import alias tables: main program's [import_aliases] + per-module
-     [module_imports]. Built once via [Core_flatten] so downstream
-     passes ([Core_mono], [Core_resolve]) share the same lookup. *)
-  let import_aliases, module_imports =
-    Core_flatten.build_import_tables_from_typecheck ~main_import_bindings
+  let module_bindings =
+    List.map
+      (fun module_input ->
+        ( module_input.typed_module_name,
+          module_input.typed_module_import_bindings ))
       modules
+  in
+  let prepared_import_aliases, prepared_module_imports =
+    Core_flatten.build_import_tables_from_bindings ~main_import_bindings
+      module_bindings
   in
   let full =
     Core_flatten.rewrite_canonical_module_type_names (module_core @ main_core)
   in
-  (* Create a per-compilation registry and register type aliases into it
-     before any subsequent pass runs. Mono matches param types against arg
-     types structurally, so aliases like [Decoder[T] = pure (Value) -> Result[T, _]]
-     must be expanded eagerly — otherwise a call site with a concrete
-     [TyFunc] argument never matches a [TyNamed "Decoder"] parameter and
-     no specialization is enqueued. The same registry is passed through
-     emission so the backend sees the exact type facts used by the Core
-     passes. *)
-  let reg = Codegen_types.create_registry () in
-  Core_flatten.register_types reg full;
-  let full = Core_ffi_boundary.annotate_program ~reg full in
-  let full = Core_list_layout.annotate_program ~reg full in
-  let backend_input =
-    run_core_passes ~on_stage ~on_stage_event ~reg ~import_aliases
-      ~module_imports ~debug full
+  let prepared_registry = Codegen_types.create_registry () in
+  Core_flatten.register_types prepared_registry full;
+  let full = Core_ffi_boundary.annotate_program ~reg:prepared_registry full in
+  let prepared_core =
+    Core_list_layout.annotate_program ~reg:prepared_registry full
   in
-  let output =
-    emit_via_c_backend ~embed_runtime ~profile ~reg ~on_stage_event
-      ~on_stage_json ~tail_observation_stages backend_input
-  in
-  (* Foreign metadata is pulled from the lowered program rather than the
-     loaded-module AST so main-program FFI declarations are included too. *)
+  {
+    prepared_core;
+    prepared_registry;
+    prepared_import_aliases;
+    prepared_module_imports;
+  }
+
+let foreign_metadata_for_program (program : Core.core_program) =
   let host = Platform.current () in
   let keep_flag = function None, _ -> true | Some tag, _ -> tag = host in
-  let source_dir d =
-    match d.Core.cd_loc.Ast.loc_file with
+  let source_dir decl =
+    match decl.Core.cd_loc.Ast.loc_file with
     | Some file -> Some (Modules.extract_directory file)
     | None -> None
   in
-  let rec foreign_metadata d =
-    match d.Core.cd_desc with
+  let rec foreign_metadata decl =
+    match decl.Core.cd_desc with
     | Core.CDFunc f -> (
         match f.cf_kind with
         | Core.CFForeign { link_flags; includes; _ } ->
             let link_flags =
               List.filter_map
-                (fun entry ->
-                  if keep_flag entry then Some (snd entry) else None)
+                (fun entry -> if keep_flag entry then Some (snd entry) else None)
                 link_flags
             in
             let include_dirs =
-              match (includes, source_dir d) with
+              match (includes, source_dir decl) with
               | [], _ | _, None -> []
               | _ :: _, Some dir -> [ dir ]
             in
@@ -431,10 +429,54 @@ let compile_typed_with_modules ?(main_import_bindings = [])
   in
   let link_flags, include_dirs =
     List.fold_left
-      (fun (all_flags, all_dirs) d ->
-        let flags, dirs = foreign_metadata d in
+      (fun (all_flags, all_dirs) decl ->
+        let flags, dirs = foreign_metadata decl in
         (all_flags @ flags, all_dirs @ dirs))
-      ([], []) full
+      ([], []) program
   in
-  let include_dirs = List.sort_uniq String.compare include_dirs in
+  (link_flags, List.sort_uniq String.compare include_dirs)
+
+let compile_typed_with_module_inputs ?(main_import_bindings = [])
+    ~(modules : typed_module_input list)
+    ?(embed_runtime = true) ?(profile = false) ?(debug = false) ?on_stage
+    ?(on_stage_event = no_op_on_stage_event)
+    ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
+    ?(check_invariants = false) (typed_main : Typed_ast.program) :
+    string * string list * string list =
+  let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
+  let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
+  let prepared =
+    prepare_typed_with_module_inputs ~main_import_bindings ~modules typed_main
+  in
+  let backend_input =
+    run_core_passes ~on_stage ~on_stage_event
+      ~reg:prepared.prepared_registry
+      ~import_aliases:prepared.prepared_import_aliases
+      ~module_imports:prepared.prepared_module_imports ~debug
+      prepared.prepared_core
+  in
+  let output =
+    emit_via_c_backend ~embed_runtime ~profile
+      ~reg:prepared.prepared_registry ~on_stage_event
+      ~on_stage_json ~tail_observation_stages backend_input
+  in
+  let link_flags, include_dirs =
+    foreign_metadata_for_program prepared.prepared_core
+  in
   (output, link_flags, include_dirs)
+
+(** Compile a typed AST program with module support from the current session.
+    This compatibility entrypoint converts loaded modules to explicit inputs;
+    all lowering and pass behavior is shared with the semantic worker. *)
+let compile_typed_with_modules ?(main_import_bindings = [])
+    ?(embed_runtime = true) ?(profile = false) ?(debug = false) ?on_stage
+    ?(on_stage_event = no_op_on_stage_event)
+    ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
+    ?(check_invariants = false) (typed_main : Typed_ast.program) :
+    string * string list * string list =
+  let modules =
+    Modules.get_all_modules () |> List.map typed_module_input_of_loaded_module
+  in
+  compile_typed_with_module_inputs ~main_import_bindings ~modules
+    ~embed_runtime ~profile ~debug ?on_stage ~on_stage_event ~on_stage_json
+    ~tail_observation_stages ~check_invariants typed_main

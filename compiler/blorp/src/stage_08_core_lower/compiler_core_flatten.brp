@@ -1,0 +1,331 @@
+-- Establish globally unique names for module-owned callables before modules
+-- are assembled into one Core program.
+--
+-- This pass intentionally handles callable identity only. Type and global
+-- flattening need import-aware type information and remain separate work.
+-- Callable references are rewritten by declaration identity, never by an
+-- unscoped source-name guess, so local variables with the same name remain
+-- untouched.
+import:
+	../stage_09_core/compiler_core_json:
+		CoreClosureCreate,
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(ClosureCreateExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
+		CoreGlobal,
+		CoreImplDecl,
+		CoreProgram,
+		CoreSourceLoc,
+		CoreType,
+		CoreVar,
+	../stage_09_core/compiler_core_traverse: map_core_expr_children
+	string: string
+
+
+UFCS_PREFIX: String = "__ufcs_"
+
+MODULE_NAME_SEPARATOR: String = "__"
+
+PURE_OVERLOAD_SUFFIX: String = "__pure"
+
+
+private record CallableRewrite {
+	source_name: String,
+	def_id: Int,
+	target_name: String
+}
+
+
+private pure func sanitize_module_name(module_name: String) -> String:
+	var result: String = string(module_name.length())
+
+	for ch in module_name:
+		result = if ch == '/' or ch == '.':
+			result.append_char('_')
+		else:
+			result.append_char(ch)
+
+	result
+
+
+private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
+	match function_info.function_kind:
+		UserFunction:
+			not function_info.name.starts_with(UFCS_PREFIX)
+		BuiltinFunction:
+			False
+		ForeignFunction(_):
+			False
+		ClosureBodyFunction(_):
+			False
+
+
+private pure func has_body(function_info: CoreFunction) -> Bool:
+	function_info.body.is_some()
+
+
+private pure func has_bodied_callable(functions: List[CoreFunction], name: String) -> Bool:
+	functions.any(
+		func(
+			candidate,
+		): candidate.name == name and is_module_user_callable(candidate) and has_body(candidate),
+	)
+
+
+private pure func is_paired_purity_overload(functions: List[CoreFunction], name: String) -> Bool:
+	has_pure: Bool = functions.any(
+		func(
+			candidate,
+		): (
+			candidate.name == name
+			and candidate.is_pure
+			and is_module_user_callable(candidate)
+			and has_body(candidate)
+		),
+	)
+	has_impure: Bool = functions.any(
+		func(
+			candidate,
+		): (
+			candidate.name == name
+			and not candidate.is_pure
+			and is_module_user_callable(candidate)
+			and has_body(candidate)
+		),
+	)
+
+	has_pure and has_impure
+
+
+private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction]:
+	program.decls.filter_map(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				Some(function_info)
+			_:
+				None
+	)
+
+
+private pure func callable_target_name(
+	module_prefix: String,
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> String:
+	suffix: String = if (
+		function_info.is_pure
+		and is_paired_purity_overload(functions, function_info.name)
+	):
+		PURE_OVERLOAD_SUFFIX
+	else:
+		""
+
+	module_prefix + MODULE_NAME_SEPARATOR + function_info.name + suffix
+
+
+private pure func collect_callable_rewrites(
+	module_name: String,
+	program: CoreProgram,
+) -> List[CallableRewrite]:
+	module_prefix: String = sanitize_module_name(module_name)
+	functions: List[CoreFunction] = top_level_functions(program)
+
+	functions.filter_map(func(function_info):
+		if (
+			is_module_user_callable(function_info)
+			and has_bodied_callable(functions, function_info.name)
+		):
+			Some({
+				source_name = function_info.name,
+				def_id = function_info.def_id,
+				target_name = callable_target_name(module_prefix, functions, function_info),
+			})
+		else:
+			None
+	)
+
+
+private pure func rewritten_callable_name(
+	rewrites: List[CallableRewrite],
+	source_name: String,
+	def_id: Int,
+) -> Option[String]:
+	var target: Option[String] = None
+
+	for rewrite in rewrites:
+		if rewrite.source_name == source_name and rewrite.def_id == def_id:
+			target = Some(rewrite.target_name)
+			break
+
+	target
+
+
+private pure func rewrite_var(rewrites: List[CallableRewrite], variable: CoreVar) -> CoreVar:
+	match variable.def_id:
+		Some(def_id):
+			rewrite_var_with_id(rewrites, variable, def_id)
+		None:
+			variable
+
+
+private pure func rewrite_var_with_id(
+	rewrites: List[CallableRewrite],
+	variable: CoreVar,
+	def_id: Int,
+) -> CoreVar:
+	match rewritten_callable_name(rewrites, variable.name, def_id):
+		Some(target_name):
+			{ variable | name = target_name }
+		None:
+			variable
+
+
+private pure func rewrite_closure_reference(
+	rewrites: List[CallableRewrite],
+	closure: CoreClosureCreate,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match rewritten_callable_name(rewrites, closure.function_name, closure.def_id):
+		Some(target_name):
+			ClosureCreateExpr({ closure | function_name = target_name }, typ, loc)
+		None:
+			ClosureCreateExpr(closure, typ, loc)
+
+
+private pure func rewrite_expr(rewrites: List[CallableRewrite], expr: CoreExpr) -> CoreExpr:
+	rewritten_children: CoreExpr = map_core_expr_children(
+		expr,
+		pure func(child): rewrite_expr(rewrites, child),
+	)
+
+	match rewritten_children:
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				rewrite_var(rewrites, variable),
+				typ,
+				loc,
+			)
+		ClosureCreateExpr(closure, typ, loc):
+			rewrite_closure_reference(rewrites, closure, typ, loc)
+		_:
+			rewritten_children
+
+
+private pure func rewrite_function_body(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		source_module = Some(module_name),
+		body = function_info.body.map(func(body): rewrite_expr(rewrites, body))
+	}
+
+
+private pure func rewrite_top_level_function(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	rewritten: CoreFunction = rewrite_function_body(module_name, rewrites, function_info)
+
+	match rewritten_callable_name(rewrites, function_info.name, function_info.def_id):
+		Some(target_name):
+			{ rewritten | name = target_name }
+		None:
+			rewritten
+
+
+private pure func rewrite_global(rewrites: List[CallableRewrite], global: CoreGlobal) -> CoreGlobal:
+	{ global | init = rewrite_expr(rewrites, global.init) }
+
+
+private pure func rewrite_impl(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+	impl_decl: CoreImplDecl,
+) -> CoreImplDecl:
+	{ impl_decl |
+		methods = impl_decl.methods.map(
+			func(method): rewrite_function_body(module_name, rewrites, method),
+		)
+	}
+
+
+private pure func rewrite_decl(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_top_level_function(module_name, rewrites, function_info))
+		GlobalDecl(global):
+			GlobalDecl(rewrite_global(rewrites, global))
+		ImplDecl(impl_decl):
+			ImplDecl(rewrite_impl(module_name, rewrites, impl_decl))
+		EnumDecl(_):
+			decl
+		UnionDecl(_):
+			decl
+		ValueRecordDecl(_):
+			decl
+		HeapRecordDecl(_):
+			decl
+		TypeAliasDecl(_):
+			decl
+		TraitDecl(_):
+			decl
+
+
+private pure func function_decl_has_body_named(decls: List[CoreDecl], name: String) -> Bool:
+	decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				function_info.name == name and has_body(function_info)
+			_:
+				False
+	)
+
+
+private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]:
+	var seen_names: List[String] = []
+	var result: List[CoreDecl] = []
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(function_info):
+				if not seen_names.contains(function_info.name):
+					if (
+						has_body(function_info)
+						or not function_decl_has_body_named(decls, function_info.name)
+					):
+						seen_names = seen_names.append(function_info.name)
+						result = result.append(decl)
+			_:
+				result = result.append(decl)
+
+	result
+
+
+pure func prefix_module_callable_names(module_name: String, program: CoreProgram) -> CoreProgram:
+	rewrites: List[CallableRewrite] = collect_callable_rewrites(module_name, program)
+	rewritten_decls: List[CoreDecl] = program.decls.map(
+		func(decl): rewrite_decl(module_name, rewrites, decl),
+	)
+	{
+		decls = deduplicate_functions(rewritten_decls),
+		foreign_includes = program.foreign_includes.map(func(include): include)
+	}

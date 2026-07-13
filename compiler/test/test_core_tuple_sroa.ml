@@ -19,6 +19,11 @@ let cvoid = mk ty_void CVoid
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
 let fn_ty params return = TyFunc { params; return; is_pure = true }
 
+let borrowed_match_binding_pairs bindings =
+  List.map
+    (fun (binding, accessor) -> borrowed_match_binding binding accessor)
+    bindings
+
 let cstring s =
   mk ty_string (CLit (LitString (s, { sf_multiline = false; sf_raw = false })))
 

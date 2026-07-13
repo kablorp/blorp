@@ -161,7 +161,7 @@ let test_descriptor_records_inline_scalar_policies () =
     (storage_policy_release layout.lsl_policy = StorageNoRelease);
   Alcotest.(check bool)
     "inline ints use bitwise equality policy" true
-    (storage_policy_equality layout.lsl_policy = StorageEqualityBits)
+    (layout.lsl_policy = StoragePolicyUnmanagedBits)
 
 let test_descriptor_records_managed_pointer_policies () =
   let layout = Blorp.Core_list_layout.layout_of_type (list_ty ty_string) loc in
@@ -173,7 +173,7 @@ let test_descriptor_records_managed_pointer_policies () =
     (layout.lsl_value_layout = ListElementPointer);
   Alcotest.(check bool)
     "managed pointer elements are ARC retained" true
-    (storage_policy_retain layout.lsl_policy = StorageArcRetain);
+    (layout.lsl_policy = StoragePolicyManagedPointer);
   Alcotest.(check bool)
     "managed pointer elements are ARC released" true
     (storage_policy_release layout.lsl_policy = StorageArcRelease)
@@ -189,7 +189,7 @@ let test_descriptor_records_boxed_value_storage_policies () =
     (layout.lsl_value_layout = ListElementBoxedValue);
   Alcotest.(check bool)
     "boxed wide integer source values are not ARC retained" true
-    (storage_policy_retain layout.lsl_policy = StorageNoRetain);
+    (layout.lsl_policy = StoragePolicyOwnedErasedBox);
   Alcotest.(check bool)
     "boxed wide integer slots are ARC released" true
     (storage_policy_release layout.lsl_policy = StorageArcRelease)

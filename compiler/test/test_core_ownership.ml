@@ -39,10 +39,7 @@ let test_alias_contract_must_reference_existing_arg () =
   let contract = { args = [ Borrow ]; result = ReturnAliasOfArg 1 } in
   check_single_violation "alias index in range"
     (Alias_index_out_of_range { index = 1; arg_count = 1 })
-    (validate_contract contract);
-  Alcotest.(check bool)
-    "contract not well-formed" false
-    (contract_is_well_formed contract)
+    (validate_contract contract)
 
 let test_alias_contract_must_reference_preserved_arg () =
   let check mode =
@@ -54,21 +51,15 @@ let test_alias_contract_must_reference_preserved_arg () =
   in
   List.iter check [ Consume; CowConsume; Transfer ]
 
-let test_valid_alias_contract_is_well_formed () =
-  let borrowed = { args = [ Borrow; Consume ]; result = ReturnAliasOfArg 0 } in
-  let retained = { args = [ Retain ]; result = ReturnAliasOfArg 0 } in
-  Alcotest.(check bool) "borrowed alias" true (contract_is_well_formed borrowed);
-  Alcotest.(check bool) "retained alias" true (contract_is_well_formed retained)
-
 let test_borrowed_result_must_have_preserved_anchor () =
   let invalid = { args = [ Consume; Transfer ]; result = ReturnBorrowed } in
   let valid = { args = [ Consume; Borrow ]; result = ReturnBorrowed } in
   check_single_violation "borrowed result anchor"
     Borrowed_result_without_preserved_arg
     (validate_contract invalid);
-  Alcotest.(check bool)
-    "borrowed result with anchor" true
-    (contract_is_well_formed valid)
+  Alcotest.(check int)
+    "borrowed result with anchor" 0
+    (List.length (validate_contract valid))
 
 let test_list_len_borrows () =
   check_contract "list_len"
@@ -1284,7 +1275,7 @@ let test_builtin_contract_table_entries_are_well_formed () =
         | None ->
             Alcotest.failf "%s/%d is listed but has no contract"
               entry.builtin_name arity)
-      (builtin_contract_sample_arities entry)
+      (builtin_contract_spec_sample_arities entry.builtin_spec)
   in
   List.iter check builtin_contract_table
 
@@ -1398,8 +1389,6 @@ let suite =
           test_alias_contract_must_reference_existing_arg;
         Alcotest.test_case "alias_contract_must_reference_preserved_arg" `Quick
           test_alias_contract_must_reference_preserved_arg;
-        Alcotest.test_case "valid_alias_contract_is_well_formed" `Quick
-          test_valid_alias_contract_is_well_formed;
         Alcotest.test_case "borrowed_result_must_have_preserved_anchor" `Quick
           test_borrowed_result_must_have_preserved_anchor;
       ] );

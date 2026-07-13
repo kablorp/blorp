@@ -291,7 +291,7 @@ func main(args: List[String]) -> Int:
     | _ -> ()
   in
   match
-    Blorp.Pipeline.compile ~embed_runtime:false ~on_stage ~filename:"<test>"
+    Blorp.Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage ~filename:"<test>"
       ~source ()
   with
   | Ok (Blorp.Pipeline.Compiled _) ->
@@ -342,7 +342,7 @@ func main(args: List[String]) -> Int:
     | _ -> ()
   in
   match
-    Blorp.Pipeline.compile ~embed_runtime:false ~on_stage ~filename:"<test>"
+    Blorp.Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage ~filename:"<test>"
       ~source ()
   with
   | Ok (Blorp.Pipeline.Compiled _) ->

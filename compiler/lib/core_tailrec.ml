@@ -352,10 +352,13 @@ let rec rewrite_list_ctree (f : core_func) (list_index : int) (tree : ctree) :
   match tree with
   | CTLeaf { ct_bindings; ct_body } -> (
       match list_self_call_spread_binding f list_index ct_bindings ct_body with
-      | Some (_, offset, args) ->
+      | Some (spread_var, offset, args) ->
           CTLeaf
             {
-              ct_bindings;
+              ct_bindings =
+                List.filter
+                  (fun binding -> not (Var.equal binding.mb_var spread_var))
+                  ct_bindings;
               ct_body =
                 {
                   ct_body with

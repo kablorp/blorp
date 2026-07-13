@@ -69,25 +69,6 @@ let test_borrow_boundary_remains_borrow () =
         (arg_passing = ForeignBorrowArgs)
   | _ -> Alcotest.fail "expected CFForeign"
 
-let test_core_copy_specs_preserve_c_metadata () =
-  let string_spec =
-    Blorp.Core_ffi_boundary.copy_spec_for_core_kind ForeignStringCopy
-  in
-  let bytes_spec =
-    Blorp.Core_ffi_boundary.copy_spec_for_core_kind ForeignBytesCopy
-  in
-  Alcotest.(check string)
-    "string copy c type" "blorp_String*" string_spec.c_type;
-  Alcotest.(check string)
-    "string copy fn" "blorp_string_copy_ffi" string_spec.copy_fn;
-  Alcotest.(check string)
-    "string copy temp prefix" "__ffi_string_copy_" string_spec.temp_prefix;
-  Alcotest.(check string) "bytes copy c type" "blorp_Bytes*" bytes_spec.c_type;
-  Alcotest.(check string)
-    "bytes copy fn" "blorp_bytes_copy_ffi" bytes_spec.copy_fn;
-  Alcotest.(check string)
-    "bytes copy temp prefix" "__ffi_bytes_copy_" bytes_spec.temp_prefix
-
 let test_default_managed_arg_rejected_before_codegen () =
   let variant =
     {
@@ -126,8 +107,6 @@ let suite =
           test_default_args_are_attached_to_core;
         Alcotest.test_case "leaves borrow boundary unchanged" `Quick
           test_borrow_boundary_remains_borrow;
-        Alcotest.test_case "preserves C metadata for defensive copies" `Quick
-          test_core_copy_specs_preserve_c_metadata;
         Alcotest.test_case "rejects managed default args before codegen" `Quick
           test_default_managed_arg_rejected_before_codegen;
       ] );

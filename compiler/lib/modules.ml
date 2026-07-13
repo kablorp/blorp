@@ -320,13 +320,6 @@ let set_typed_decls ?sess name typed_decls =
   | Some m -> m.typed_decls <- Some typed_decls
   | None -> ()
 
-(** Look up resolved import bindings for a typed module from the module cache. *)
-let get_typed_import_bindings ?sess name =
-  let s = sess_of ?sess () in
-  match Hashtbl.find_opt s.module_cache name with
-  | Some m -> m.typed_import_bindings
-  | None -> None
-
 (** Store resolved import bindings for a typed module in the module cache. *)
 let set_typed_import_bindings ?sess name bindings =
   let s = sess_of ?sess () in

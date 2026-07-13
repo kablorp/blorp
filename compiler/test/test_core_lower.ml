@@ -37,7 +37,7 @@ let ty_result_int_error = TyNamed ("Result", [ ty_int; ty_io_error ])
 let str_flags = { sf_multiline = false; sf_raw = false }
 
 let with_type expr ty =
-  Blorp.Ast.with_expr_type_info expr (Blorp.Ast.expr_type_info_from_type ty)
+  Blorp.Ast.with_expr_type_info expr (Test_helpers.expr_type_info_from_type ty)
 
 (** Build a typed AST expression. *)
 let mk_ast desc ty =

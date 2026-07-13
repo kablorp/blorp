@@ -171,6 +171,14 @@ let test_builtin_lookup_uses_exact_module_paths () =
     (Blorp.Codegen_builtins.lookup "/tmp/not-a-blorp-module/raylib"
        "init_window")
 
+let test_vector_minmax_lookup_preserves_type_dispatch () =
+  List.iter
+    (fun (name, expected) ->
+      Alcotest.(check (option string))
+        ("std/vector " ^ name) (Some expected)
+        (Blorp.Codegen_builtins.lookup "std/vector" name))
+    [ ("max", "blorp_max"); ("min", "blorp_min") ]
+
 let test_builtin_effect_metadata_classifies_typechecker_sets () =
   let open Blorp.Builtin_metadata in
   List.iter
@@ -216,7 +224,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " is a cancellation point")
         true
-        (is_cancellation_point name))
+        (has_effect name Cancellation_point))
     [
       "sleep";
       "yield_now";
@@ -261,7 +269,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " is not a cancellation point")
         false
-        (is_cancellation_point name))
+        (has_effect name Cancellation_point))
     [
       "channel";
       "try_send";
@@ -294,7 +302,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
     (fun name ->
       Alcotest.(check bool)
         (name ^ " may park a fiber")
-        true (may_park_fiber name))
+        true (has_effect name Fiber_parking))
     [
       "sleep";
       "send";
@@ -334,7 +342,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
     (fun name ->
       Alcotest.(check bool)
         (name ^ " does not park a fiber")
-        false (may_park_fiber name))
+        false (has_effect name Fiber_parking))
     [
       "yield_now";
       "cancel_after_parked_for_test";
@@ -362,14 +370,14 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       Alcotest.(check bool)
         (name ^ " blocks an OS worker")
         true
-        (is_os_worker_blocking name))
+        (has_effect name Os_worker_blocking))
     [ "blorp_dns_resolve_raw" ];
   List.iter
     (fun name ->
       Alcotest.(check bool)
         (name ^ " does not block an OS worker")
         false
-        (is_os_worker_blocking name))
+        (has_effect name Os_worker_blocking))
     [ "sleep"; "send"; "blorp_tcp_connect_loopback_raw"; "blorp_tls_read_raw" ]
 
 let test_type_metadata_classifies_typechecker_policy () =
@@ -463,15 +471,7 @@ let test_builtin_metadata_classifies_special_inference () =
 let test_builtin_metadata_registry_integrity () =
   let open Blorp.Builtin_metadata in
   Alcotest.(check (list string))
-    "descriptor names are unique" [] duplicate_names;
-  Alcotest.(check (list string))
-    "descriptors all carry behavior" [] inert_descriptor_names;
-  Alcotest.(check bool)
-    "unknown names are not registered" false
-    (is_registered "__not_a_builtin__");
-  Alcotest.(check bool)
-    "registered special inference name is known" true
-    (is_registered "checked_get")
+    "descriptor names are unique" [] duplicate_names
 
 let read_file path =
   let ic = open_in path in
@@ -1949,6 +1949,8 @@ let suite =
           test_list_ir_functions_not_shadowed_by_codegen_builtins;
         Alcotest.test_case "builtin lookup uses exact module paths" `Quick
           test_builtin_lookup_uses_exact_module_paths;
+        Alcotest.test_case "vector minmax lookup preserves type dispatch"
+          `Quick test_vector_minmax_lookup_preserves_type_dispatch;
         Alcotest.test_case "list IR HOFs have no runtime C ABI" `Quick
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick

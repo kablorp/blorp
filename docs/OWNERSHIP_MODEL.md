@@ -2,9 +2,11 @@
 
 This document defines the compiler-facing ownership model for managed values,
 Perceus reference-count insertion, and copy-on-write (COW). It is the semantic
-contract that `core_ownership.ml`, `core_perceus.ml`,
+contract that `core_ownership.ml`, `compiler_core_perceus.brp`,
 `compiler_core_reuse.brp`, `core_emit_layout.ml`, Core intrinsics, and the C
-runtime must implement.
+runtime must implement. Perceus and reuse are production Blorp stages; the
+remaining OCaml modules provide contracts and layout facts before the pre-DCE
+handoff.
 
 The user-facing memory model is documented in `docs/MEMORY_MODEL.md`. This file
 is lower level: it defines the ownership ABI used by compiler phases.
@@ -109,6 +111,18 @@ user call has a call contract:
 args: arg_mode list
 result: result_mode
 ```
+
+At the current pre-DCE boundary, call-site `consumed_args` remain conservative
+compatibility evidence while Blorp derives function consumption with a
+monotonic analysis. Inferred consumption may add arguments but must not remove
+a projected consume.
+
+Inferred borrowing is not yet authoritative for every managed-return call.
+Match-binding ownership modes are still present in the projected body and may
+encode an owning destructure even when a function parameter is classified as
+borrowed. Perceus therefore retains the conservative fallback until Blorp
+derives both function contracts and match-binding modes from one ownership
+analysis.
 
 ### Argument Modes
 

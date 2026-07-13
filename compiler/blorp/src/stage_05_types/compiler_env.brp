@@ -36,6 +36,21 @@ enum CompilerVarMutability:
 	CompilerMutableBinding
 
 
+pure func compiler_var_mutability_is_mutable(mutability: CompilerVarMutability) -> Bool:
+	match mutability:
+		CompilerImmutableBinding:
+			False
+		CompilerMutableBinding:
+			True
+
+
+pure func compiler_var_mutability(is_mutable: Bool) -> CompilerVarMutability:
+	if is_mutable:
+		CompilerMutableBinding
+	else:
+		CompilerImmutableBinding
+
+
 union CompilerVarOrigin:
 	CompilerLetBinding
 	CompilerFuncParam
@@ -104,6 +119,22 @@ enum CompilerLoopProducer:
 	CompilerLoopProducerEnumerate
 	CompilerLoopProducerEnumerate2
 	CompilerLoopProducerWindows
+
+
+pure func compiler_loop_producer_is_windows(producer: CompilerLoopProducer) -> Bool:
+	producer == CompilerLoopProducerWindows
+
+
+pure func compiler_loop_producer_is_indices(producer: CompilerLoopProducer) -> Bool:
+	producer == CompilerLoopProducerIndices
+
+
+pure func compiler_loop_producer_is_enumerate(producer: CompilerLoopProducer) -> Bool:
+	producer == CompilerLoopProducerEnumerate
+
+
+pure func compiler_loop_producer_is_enumerate2(producer: CompilerLoopProducer) -> Bool:
+	producer == CompilerLoopProducerEnumerate2
 
 
 enum CompilerTypeKind:
@@ -325,7 +356,7 @@ private pure func compiler_env_copy_strings(values: List[String]) -> List[String
 	values.map(compiler_env_copy_string)
 
 
-private pure func compiler_string_lists_equal(left: List[String], right: List[String]) -> Bool:
+pure func compiler_string_lists_equal(left: List[String], right: List[String]) -> Bool:
 	if left.length() != right.length():
 		False
 	else:
@@ -463,6 +494,17 @@ pure func compiler_env_lookup(env: CompilerEnv, name: String) -> Option[Compiler
 
 		if result.is_some():
 			break
+
+	result
+
+
+pure func compiler_env_symbols_named(env: CompilerEnv, name: String) -> List[CompilerSymbol]:
+	var result: List[CompilerSymbol] = []
+
+	for scope in env.scopes:
+		for symbol in scope.symbols:
+			if symbol.name == name:
+				result = result.append(symbol)
 
 	result
 
@@ -653,6 +695,18 @@ pure func compiler_env_get_var_refinement(
 			None
 
 
+pure func compiler_env_var_is_immutable(env: CompilerEnv, name: String) -> Bool:
+	match compiler_env_lookup(env, name):
+		Some(symbol):
+			match symbol.kind:
+				CompilerVarSymbolKind(var_symbol):
+					not compiler_var_mutability_is_mutable(var_symbol.mutability)
+				_:
+					False
+		None:
+			False
+
+
 pure func compiler_env_is_func_param(env: CompilerEnv, name: String) -> Bool:
 	match compiler_env_lookup(env, name):
 		Some(symbol):
@@ -761,9 +815,7 @@ private pure func compiler_env_optional_string_copy(value: Option[String]) -> Op
 			None
 
 
-private pure func compiler_env_optional_param_name_copy(
-	value: Option[String],
-) -> Option[String]:
+private pure func compiler_env_optional_param_name_copy(value: Option[String]) -> Option[String]:
 	compiler_env_optional_string_copy(value)
 
 
@@ -829,7 +881,9 @@ pure func compiler_overload_entry_from_func_symbol(
 	}
 
 
-private pure func compiler_overload_entry_copy(entry: CompilerOverloadEntry) -> CompilerOverloadEntry:
+private pure func compiler_overload_entry_copy(
+	entry: CompilerOverloadEntry,
+) -> CompilerOverloadEntry:
 	{
 		def_id = entry.def_id,
 		func_type = compiler_type_copy(entry.func_type),
@@ -1186,10 +1240,12 @@ pure func compiler_env_get_alias(
 		Some(symbol):
 			match symbol.kind:
 				CompilerAliasSymbolKind(alias_symbol):
-					Some((
-						compiler_env_copy_strings(alias_symbol.type_params),
-						compiler_env_copy_type(alias_symbol.target),
-					))
+					Some(
+						(
+							compiler_env_copy_strings(alias_symbol.type_params),
+							compiler_env_copy_type(alias_symbol.target),
+						),
+					)
 				_:
 					empty: Option[(List[String], CompilerType)] = None
 					empty
@@ -1206,11 +1262,13 @@ pure func compiler_env_get_opaque_alias(
 		Some(symbol):
 			match symbol.kind:
 				CompilerOpaqueAliasSymbolKind(alias_symbol):
-					Some((
-						compiler_env_copy_strings(alias_symbol.type_params),
-						compiler_env_copy_type(alias_symbol.target),
-						compiler_env_copy_optional_string(alias_symbol.home_module),
-					))
+					Some(
+						(
+							compiler_env_copy_strings(alias_symbol.type_params),
+							compiler_env_copy_type(alias_symbol.target),
+							compiler_env_copy_optional_string(alias_symbol.home_module),
+						),
+					)
 				_:
 					empty: Option[(List[String], CompilerType, Option[String])] = None
 					empty
@@ -2306,8 +2364,8 @@ private pure func compiler_impl_bound_satisfied(
 
 			for trait_ref in bound.bounds:
 				if compiler_env_resolve_trait_obligation(
-						env,
-						compiler_trait_obligation(concrete_type, trait_ref.name),
+					env,
+					compiler_trait_obligation(concrete_type, trait_ref.name),
 				) != CompilerTraitObligationSatisfied:
 					satisfied = False
 					break
@@ -2413,6 +2471,16 @@ pure func compiler_env_has_direct_trait_evidence(
 					obligation.obligation_type,
 					obligation.obligation_trait.name,
 				)
+		CompilerArrayType(_, _):
+			(
+				obligation.obligation_trait.name == "HasLength"
+				or obligation.obligation_trait.name == "Stringable"
+				or compiler_env_has_exact_impl_for_trait(
+					env,
+					obligation.obligation_type,
+					obligation.obligation_trait.name,
+				)
+			)
 		_:
 			compiler_env_has_exact_impl_for_trait(
 				env,
@@ -2441,6 +2509,24 @@ pure func compiler_env_resolve_trait_obligation(
 					name,
 					obligation.obligation_trait.name,
 				)
+			):
+				CompilerTraitObligationSatisfied
+			else:
+				var result: CompilerTraitObligationResolution = CompilerTraitObligationUnsatisfied
+
+				for impl in env.impls:
+					if (
+						compiler_impl_satisfies_trait(env, impl, obligation.obligation_trait.name)
+						and compiler_impl_matches_type(env, impl, obligation.obligation_type)
+					):
+						result = CompilerTraitObligationSatisfied
+						break
+
+				result
+		CompilerArrayType(_, _):
+			if (
+				obligation.obligation_trait.name == "HasLength"
+				or obligation.obligation_trait.name == "Stringable"
 			):
 				CompilerTraitObligationSatisfied
 			else:
@@ -2732,6 +2818,39 @@ private pure func compiler_find_overload_debug_only_by_def_id(
 	result
 
 
+private pure func compiler_find_overload_loop_producer_by_def_id(
+	sets: List[CompilerOverloadSet],
+	def_id: Int,
+) -> Option[CompilerLoopProducer]:
+	var result: Option[CompilerLoopProducer] = None
+
+	for set in sets:
+		for entry in set.entries:
+			if entry.def_id == def_id:
+				result = entry.loop_producer
+				break
+
+		if result.is_some():
+			break
+
+	result
+
+
+pure func compiler_env_find_callable_loop_producer_by_def_id(
+	env: CompilerEnv,
+	def_id: Int,
+) -> Option[CompilerLoopProducer]:
+	match compiler_env_find_func_by_def_id(env, def_id):
+		Some(func_symbol):
+			func_symbol.loop_producer
+		None:
+			match compiler_find_overload_loop_producer_by_def_id(env.overloads, def_id):
+				Some(producer):
+					Some(producer)
+				None:
+					compiler_find_overload_loop_producer_by_def_id(env.ufcs_methods, def_id)
+
+
 pure func compiler_env_find_callable_debug_only_by_def_id(
 	env: CompilerEnv,
 	def_id: Int,
@@ -2860,11 +2979,11 @@ private pure func compiler_type_mentions_any_param(
 				)
 			)
 		CompilerFunctionType(_, params, return_type):
-			(
-				params.any(func(param):
-					compiler_type_mentions_any_param(compiler_string_list_copy(type_params), param)
-				)
-				or compiler_type_mentions_any_param(compiler_string_list_copy(type_params), return_type)
+			params.any(func(param):
+				compiler_type_mentions_any_param(compiler_string_list_copy(type_params), param)
+			) or compiler_type_mentions_any_param(
+				compiler_string_list_copy(type_params),
+				return_type,
 			)
 		CompilerTupleType(elements):
 			elements.any(func(element):
@@ -3021,6 +3140,7 @@ private pure func compiler_env_lookup_function_ufcs_methods(
 					CompilerFuncSymbolKind(func_symbol):
 						if compiler_func_symbol_supports_ufcs(func_symbol):
 							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+
 							if compiler_overload_first_param_matches(entry, first_arg_type):
 								result = result.append(entry)
 					_:
@@ -3047,6 +3167,7 @@ private pure func compiler_env_lookup_module_function_ufcs_methods(
 							and compiler_func_symbol_supports_ufcs(func_symbol)
 						):
 							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+
 							if compiler_overload_first_param_matches(entry, first_arg_type):
 								result = result.append(entry)
 					_:

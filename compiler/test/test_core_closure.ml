@@ -50,26 +50,6 @@ let require_func name prog =
   | Some f -> f
   | None -> Alcotest.failf "missing function %s" name
 
-let rec count_dups_for name e =
-  let here =
-    match e.desc with CDup (v, _, _) when v.vname = name -> 1 | _ -> 0
-  in
-  fold_immediate_children
-    (fun acc child -> acc + count_dups_for name child)
-    here e
-
-let adapt_then_perceus prog =
-  prog |> Blorp.Core_closure.adapt_function_refs_program
-  |> Blorp.Core_perceus.insert_drops_program
-
-let consume_string_arg name =
-  mk
-    (CCall
-       ( CKBuiltin "blorp_string_concat_consume",
-         mk CVoid ty_void,
-         [ cvar name ty_string; cstr "" ] ))
-    ty_string
-
 let test_returned_function_ref_becomes_closure_create () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -204,6 +184,31 @@ let test_local_function_value_shadows_global_name () =
               (pp_to_string_indented body)
         | None -> Alcotest.fail "missing run body"))
 
+let test_function_param_shadows_global_name () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let callback_ty = fn_ty [ ty_int ] ty_void false in
+        let global_f = mk_func "f" [] ty_int (Some (cint 0)) 100 in
+        let invoke =
+          mk_func "invoke" [ ("f", callback_ty) ] callback_ty
+            (Some (cvar "f" callback_ty)) 101
+        in
+        let adapted =
+          Blorp.Core_closure.adapt_function_refs_program
+            [ decl global_f; decl invoke ]
+        in
+        let invoke' = require_func "invoke" adapted in
+        match invoke'.cf_body with
+        | Some { desc = CVar v; _ } ->
+            Alcotest.(check string) "function parameter stays local" "f" v.vname;
+            Alcotest.(check bool)
+              "function parameter creates no eta adapter" false
+              (Option.is_some (find_func "_blorp_eta_0" adapted))
+        | Some { desc = CClosureCreate _; _ } ->
+            Alcotest.fail "function parameter was wrapped as a global function ref"
+        | Some _ -> Alcotest.fail "expected function parameter reference"
+        | None -> Alcotest.fail "missing invoke body"))
+
 let test_passthrough_builtin_function_ref_becomes_closure_create () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -243,73 +248,6 @@ let test_passthrough_builtin_function_ref_becomes_closure_create () =
               "eta arg passed through" "__eta_arg_0" arg.vname
         | Some body ->
             Alcotest.failf "eta adapter did not call builtin sqrt:\n%s"
-              (pp_to_string_indented body)
-        | None -> Alcotest.fail "missing eta body"))
-
-let test_eta_adapter_retains_consumed_managed_arg () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let consume_ty = fn_ty [ ty_string ] ty_string true in
-        let consume =
-          mk_func ~is_pure:true "consume"
-            [ ("s", ty_string) ]
-            ty_string
-            (Some (consume_string_arg "s"))
-            3
-        in
-        let get_consume =
-          mk_func "get_consume" [] consume_ty
-            (Some (cvar "consume" consume_ty))
-            4
-        in
-        let converted = adapt_then_perceus [ decl consume; decl get_consume ] in
-        let eta = require_func "_blorp_eta_0" converted in
-        match eta.cf_body with
-        | Some body when count_dups_for "__eta_arg_0" body = 1 -> ()
-        | Some body ->
-            Alcotest.failf
-              "eta adapter did not retain consumed managed arg:\n%s"
-              (pp_to_string_indented body)
-        | None -> Alcotest.fail "missing eta body"))
-
-let test_module_fn_ref_retains_consumed_managed_arg () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let consume_ty = fn_ty [ ty_string ] ty_string true in
-        let consume =
-          {
-            (mk_func ~is_pure:true "m__consume"
-               [ ("s", ty_string) ]
-               ty_string
-               (Some (consume_string_arg "s"))
-               30)
-            with
-            cf_module = Some "m";
-          }
-        in
-        let get_consume =
-          {
-            (mk_func "m__get_consume" [] consume_ty
-               (Some (cvar "m__consume" consume_ty))
-               31)
-            with
-            cf_module = Some "m";
-          }
-        in
-        let converted = adapt_then_perceus [ decl consume; decl get_consume ] in
-        let get_consume' = require_func "m__get_consume" converted in
-        (match get_consume'.cf_body with
-        | Some { desc = CClosureCreate _; _ } -> ()
-        | Some body ->
-            Alcotest.failf "module function ref was not closure-adapted:\n%s"
-              (pp_to_string_indented body)
-        | None -> Alcotest.fail "missing get_consume body");
-        let eta = require_func "_blorp_eta_0" converted in
-        match eta.cf_body with
-        | Some body when count_dups_for "__eta_arg_0" body = 1 -> ()
-        | Some body ->
-            Alcotest.failf
-              "module eta adapter did not retain consumed managed arg:\n%s"
               (pp_to_string_indented body)
         | None -> Alcotest.fail "missing eta body"))
 
@@ -366,63 +304,6 @@ let test_function_ref_def_id_collision_uses_name_identity () =
         | Some body ->
             Alcotest.failf "eta adapter selected wrong target:\n%s"
               (pp_to_string_indented body)
-        | None -> Alcotest.fail "missing eta body"))
-
-let test_eta_adapter_does_not_retain_borrowed_managed_arg () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let inspect_ty = fn_ty [ ty_string ] ty_int true in
-        let inspect =
-          mk_func ~is_pure:true "inspect"
-            [ ("s", ty_string) ]
-            ty_int
-            (Some (cint 0))
-            5
-        in
-        let get_inspect =
-          mk_func "get_inspect" [] inspect_ty
-            (Some (cvar "inspect" inspect_ty))
-            6
-        in
-        let converted = adapt_then_perceus [ decl inspect; decl get_inspect ] in
-        let eta = require_func "_blorp_eta_0" converted in
-        match eta.cf_body with
-        | Some body ->
-            Alcotest.(check int)
-              "borrowed managed arg should not be retained" 0
-              (count_dups_for "__eta_arg_0" body)
-        | None -> Alcotest.fail "missing eta body"))
-
-let test_eta_adapter_retains_builtin_consumed_managed_args () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let concat_ty = fn_ty [ ty_string; ty_string ] ty_string true in
-        let concat =
-          mk_func ~is_pure:true "concat"
-            [ ("a", ty_string); ("b", ty_string) ]
-            ty_string
-            (Some
-               (mk
-                  (CCall
-                     ( CKBuiltin "blorp_string_concat_consume",
-                       mk CVoid ty_void,
-                       [ cvar "a" ty_string; cvar "b" ty_string ] ))
-                  ty_string))
-            7
-        in
-        let get_concat =
-          mk_func "get_concat" [] concat_ty (Some (cvar "concat" concat_ty)) 8
-        in
-        let converted = adapt_then_perceus [ decl concat; decl get_concat ] in
-        let eta = require_func "_blorp_eta_0" converted in
-        match eta.cf_body with
-        | Some body ->
-            Alcotest.(check int)
-              "first builtin-consumed arg retained" 1
-              (count_dups_for "__eta_arg_0" body);
-            Alcotest.(check int)
-              "second builtin-consumed arg retained" 1
-              (count_dups_for "__eta_arg_1" body)
         | None -> Alcotest.fail "missing eta body"))
 
 let test_resource_scope_binding_shadows_global_function_ref () =
@@ -552,19 +433,13 @@ let suite =
           test_let_body_function_ref_becomes_closure_create;
         Alcotest.test_case "local_function_value_shadows_global_name" `Quick
           test_local_function_value_shadows_global_name;
+        Alcotest.test_case "function_param_shadows_global_name" `Quick
+          test_function_param_shadows_global_name;
         Alcotest.test_case
           "passthrough_builtin_function_ref_becomes_closure_create" `Quick
           test_passthrough_builtin_function_ref_becomes_closure_create;
-        Alcotest.test_case "eta_adapter_retains_consumed_managed_arg" `Quick
-          test_eta_adapter_retains_consumed_managed_arg;
-        Alcotest.test_case "module_fn_ref_retains_consumed_managed_arg" `Quick
-          test_module_fn_ref_retains_consumed_managed_arg;
         Alcotest.test_case "function_ref_def_id_collision_uses_name_identity"
           `Quick test_function_ref_def_id_collision_uses_name_identity;
-        Alcotest.test_case "eta_adapter_does_not_retain_borrowed_managed_arg"
-          `Quick test_eta_adapter_does_not_retain_borrowed_managed_arg;
-        Alcotest.test_case "eta_adapter_retains_builtin_consumed_managed_args"
-          `Quick test_eta_adapter_retains_builtin_consumed_managed_args;
         Alcotest.test_case "resource_scope_shadows_global_function_ref" `Quick
           test_resource_scope_binding_shadows_global_function_ref;
         Alcotest.test_case "lambda_capture_shadows_global_function_ref" `Quick

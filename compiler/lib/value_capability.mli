@@ -10,9 +10,7 @@ type placement = Direct | OrdinaryCarrier | FunctionCarrier
 type item = { target : target; placement : placement }
 type t = Ordinary | Carries of item list
 
-val ordinary : t
 val of_items : item list -> t
-val has : target -> t -> bool
 val has_function_carrier : target -> t -> bool
 val is_direct : target -> t -> bool
 val has_ordinary_carrier : target -> t -> bool

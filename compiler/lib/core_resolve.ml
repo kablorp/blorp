@@ -17,7 +17,7 @@
     - Foreign functions become [CKForeign { fc_c_name; fc_arg_passing }].
     - Direct calls carrying typed selected-call ids become
       [CKUser (name, def_id)] once the canonical post-flatten Core name is
-      known.
+      known. A canonical qualified name wins over a stale module-local id.
     - User functions, constructors, impl methods, and imported source
       functions become [CKUser (name, def_id)] when a def-id is known.
     - Runtime-backed builtins become [CKBuiltin c_name] through the
@@ -54,15 +54,16 @@ type env = {
     - [user_funcs]: user-defined function names → [def_id] of the
       target (A4.2). Keyed by the post-flatten [cf_name] (i.e. what
       call sites will look up). The [def_id] populates
-      [CKUser (name, Some def_id)] so [Core_emit] can mangle the C
+      [CKUser (name, Some def_id)] so the Blorp C emitter can mangle the C
       symbol via [Codegen_names.mangle_by_def_id] without reaching
       back through [env].
     - [user_func_names_by_id]: reverse index for call sites that carry a
       selected [vdef_id] from typed call metadata. This lets resolution recover
       the canonical post-flatten function name instead of mangling an old source
       spelling such as [map] with the selected id for [map__pure]. Only callable
-      definitions are indexed here; global values are tracked separately so a
-      value def-id can never become a call target.
+      definitions are indexed here, and this reverse index is consulted only
+      after exact canonical-name lookup. Global values are tracked separately
+      so a value def-id can never become a call target.
     - [user_func_sigs_by_id]: signature table for the same selected-id path.
       Blorp bridge/typecheck runs can allocate ids locally per module; after
       modules are flattened into one Core program, a carried id may point at an
@@ -85,7 +86,7 @@ type env = {
     - [foreign_funcs]: foreign function names → their user-specified
       [c_name] and argument-passing mode (bypass — no mangling).
     - [constructor_names]: set of in-scope constructor names. Used for
-      the [is_union_constructor] classification in [Core_emit]. *)
+      the [is_union_constructor] classification in the Blorp C emitter. *)
 
 let remember_user_func_id (env : env) (name : string) (def_id : int) : unit =
   match Hashtbl.find_opt env.user_func_names_by_id def_id with
@@ -144,6 +145,20 @@ let user_call_kind_by_def_id ?callee ?(args = []) (env : env)
               when not (selected_signature_matches_call f callee args) ->
                 None
             | _ -> Some (CKUser (name, Some id)))
+
+let user_call_kind_by_canonical_name (env : env) (callee : core) :
+    call_kind option =
+  match callee.desc with
+  | CVar v ->
+      Hashtbl.find_opt env.user_funcs v.vname
+      |> Option.map (fun def_id -> CKUser (v.vname, Some def_id))
+  | _ -> None
+
+let user_call_kind_by_identity (env : env) (callee : core) (args : core list)
+    (selected_id : int option) : call_kind option =
+  match user_call_kind_by_canonical_name env callee with
+  | Some kind -> Some kind
+  | None -> user_call_kind_by_def_id ~callee ~args env selected_id
 
 let prefixed_runtime_builtin_call_kind (callee : core) : call_kind option =
   match callee.desc with
@@ -636,16 +651,14 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
                 match try_resolve_explicit_ufcs_call env callee args with
                 | Some kind -> kind
                 | None -> (
-                    (* 3. User-defined. Prefer a carried [vdef_id] from typed
-                       call metadata for non-UFCS names; it recovers the
-                       canonical post-flatten name for pure overloads and
-                       direct imported selections. Otherwise use the
-                       name-indexed [collect_env] table. *)
-                    match user_call_kind_by_def_id ~callee ~args env v.vdef_id with
-                | Some kind -> kind
-                | None -> (
-                    match Hashtbl.find_opt env.user_funcs name with
-                    | Some id -> CKUser (name, Some id)
+                    (* 3. User-defined. A canonical post-flatten name is
+                       stronger evidence than a module-local selected id.
+                       Bare overload names still use the selected id to
+                       recover their canonical target. *)
+                    match
+                      user_call_kind_by_identity env callee args v.vdef_id
+                    with
+                    | Some kind -> kind
                     | None -> (
                         (* 3. UFCS *)
                         match Codegen_names.parse_ufcs_name name with
@@ -782,7 +795,7 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
                                                   else
                                                     match callee.ty with
                                                     | Ast.TyFunc _ -> CKClosure
-                                                    | _ -> CKUnknown))))))))))))
+                                                    | _ -> CKUnknown)))))))))))
   | _ -> ( match callee.ty with Ast.TyFunc _ -> CKClosure | _ -> CKUnknown)
 
 (** Rewrite a bare [CVar] that refers to a globally-imported value (e.g.
@@ -907,7 +920,7 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
             | Some kind -> kind
             | None -> (
                 match
-                  user_call_kind_by_def_id ~callee:callee' ~args:args' env
+                  user_call_kind_by_identity env callee' args'
                     (Some selected_id)
                 with
                 | Some kind -> kind

@@ -94,8 +94,6 @@ type inline_struct_storage = private
     }
   | NotInlineStruct
 
-type value_record_layout = private { vrl_name : string; vrl_c_type : string }
-
 type stack_option_emit_abi = private {
   soe_c_type : string;
   soe_none_value : string;
@@ -106,13 +104,6 @@ type option_constructor_abi = private
   | OptionConstructorNullableManaged
   | OptionConstructorBoxedUnion
   | OptionConstructorUnavailable of string
-
-type option_erasure_layout = private
-  | OptionErasureStackValue
-  | OptionErasureNullableManagedPointer
-  | OptionErasureBoxedUnion of string
-  | OptionErasureUnknownPayload of string
-  | OptionErasureInvalid of string
 
 type generated_stack_option_payload_storage = private
   | GeneratedStackOptionInt128
@@ -208,8 +199,6 @@ val storage_release : t -> storage_release
 val storage_release_or_error :
   ?phase:Core_error.phase_tag -> t -> storage_release_capability
 
-val storage_requires_release_or_error : ?phase:Core_error.phase_tag -> t -> bool
-
 val boxed_storage_requires_release_or_error :
   ?phase:Core_error.phase_tag ->
   reg:Codegen_types.registry ->
@@ -274,9 +263,6 @@ val tensor_checked_get_access_of_type :
 val tensor_to_string_runtime_of_elem_type :
   reg:Codegen_types.registry -> Ast.type_expr -> tensor_to_string_runtime
 
-val tensor_raw_scalar_abi_of_layout :
-  Core.tensor_storage_layout -> tensor_raw_scalar_abi option
-
 val inline_width_for_enum_info :
   Codegen_types.enum_info -> Core.inline_storage_width
 
@@ -296,24 +282,11 @@ val is_pointer_type : reg:Codegen_types.registry -> Ast.type_expr -> bool
 val record_field_uses_erased_storage :
   reg:Codegen_types.registry -> Ast.type_expr -> bool
 
-val classify_source_value_layout_of_metadata :
-  ?loc:Ast.loc ->
-  Core_type_layout.metadata ->
-  Ast.type_expr ->
-  source_value_layout_classification
-
 val classify_source_value_layout_of_type :
   reg:Codegen_types.registry ->
   Ast.type_expr ->
   Ast.loc ->
   source_value_layout_classification
-
-val source_value_layout_of_metadata :
-  ?phase:Core_error.phase_tag ->
-  ?loc:Ast.loc ->
-  Core_type_layout.metadata ->
-  Ast.type_expr ->
-  source_value_layout
 
 val source_value_layout_of_type :
   ?phase:Core_error.phase_tag ->
@@ -357,12 +330,6 @@ val primitive_inline_width : Ast.type_expr -> primitive_inline_width
 val inline_struct_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> inline_struct_storage
 
-val value_record_layout_of_type :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> value_record_layout option
-
-val value_record_c_type :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> string option
-
 val list_element_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> list_element_storage
 
@@ -372,12 +339,6 @@ val dict_type : ?reg:Codegen_types.registry -> Ast.type_expr -> dict_type option
 
 val tensor_element_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> tensor_element_storage
-
-val list_storage_layout_of_elem :
-  ?reg:Codegen_types.registry ->
-  Ast.type_expr ->
-  Ast.loc ->
-  Core.list_storage_layout
 
 val list_storage_layout_of_type :
   ?reg:Codegen_types.registry ->
@@ -397,19 +358,6 @@ val tensor_storage_layout_of_type :
   Ast.loc ->
   Core.tensor_storage_layout
 
-val option_layout_or_error :
-  ?phase:Core_error.phase_tag ->
-  reg:Codegen_types.registry ->
-  Ast.type_expr ->
-  Ast.loc ->
-  Core_option_layout.layout
-
-val option_erasure_layout_of_type :
-  reg:Codegen_types.registry -> Ast.type_expr -> option_erasure_layout
-
-val nullable_managed_option_payload_type :
-  reg:Codegen_types.registry -> Ast.type_expr -> Ast.type_expr option
-
 val is_nullable_managed_option :
   reg:Codegen_types.registry -> Ast.type_expr -> bool
 
@@ -421,9 +369,6 @@ val generated_stack_option_get_abi :
   Ast.type_expr ->
   generated_stack_option_get_abi option
 
-val generated_stack_option_payload_from_erased :
-  generated_stack_option_get_abi -> string -> string
-
 val option_payload_runtime_abi :
   reg:Codegen_types.registry -> Ast.type_expr -> option_payload_runtime_abi
 
@@ -434,9 +379,6 @@ val option_type_runtime_abi :
 
 val option_equality_abi :
   reg:Codegen_types.registry -> Ast.type_expr -> option_equality_abi
-
-val stack_option_none_value_for_type :
-  reg:Codegen_types.registry -> Ast.type_expr -> string
 
 val stack_option_c_type :
   reg:Codegen_types.registry -> Ast.type_expr -> string option

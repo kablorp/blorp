@@ -1,0 +1,1396 @@
+-- Dead emitted-function elimination for the projected Core boundary.
+--
+-- The OCaml-to-Blorp Core projection has already removed generic templates,
+-- aliases, traits, imports, and impl containers. Impl methods are projected as
+-- ordinary functions. This pass therefore reasons about emitted function
+-- identities and the projected type graph. Backend artifacts are derived from
+-- retained data declarations rather than modeled as separate DCE nodes.
+-- Missing entrypoints, duplicate function identities, and unresolved user
+-- calls all fail closed by returning the input program unchanged.
+import:
+	compiler_core_json:
+		CoreBoxedStorageValue,
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			DictWithCapacityCall,
+			DirectRuntimeCall,
+			FallibleStreamTerminalCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			OperationResultCall,
+			SelectedDirectCall,
+			TensorParallelCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreDictEntry,
+		CoreDictLiteralEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DictExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LengthMatchExpr,
+			LetExpr,
+			ListAllocExpr,
+			ListConstructExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RangeExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			SetAllocExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreGlobal,
+		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			FloatHashContainerConstructor,
+			GenericHashContainerConstructor,
+			StringHashContainerConstructor,
+		),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreTupleElement(
+			TupleFloat16Element,
+			TupleFloat32Element,
+			TupleFloatElement,
+			TuplePointerElement,
+			TuplePrimElement,
+			TupleStructElement,
+			TupleVoidElement,
+		),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		core_expr_type,
+
+
+record DceFacts {
+	function_ids: List[Int],
+	function_names: List[String],
+	global_names: List[String],
+	type_names: List[String],
+	fail_closed: Bool
+}
+
+
+private pure func add_function_id(facts: DceFacts, def_id: Int) -> DceFacts:
+	if facts.function_ids.contains(def_id):
+		facts
+	else:
+		{ facts | function_ids = facts.function_ids.append(def_id) }
+
+
+private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
+	if facts.function_names.contains(name):
+		facts
+	else:
+		{ facts | function_names = facts.function_names.append(name) }
+
+
+private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
+	if facts.global_names.contains(name):
+		facts
+	else:
+		{ facts | global_names = facts.global_names.append(name) }
+
+
+private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
+	if facts.type_names.contains(name):
+		facts
+	else:
+		{ facts | type_names = facts.type_names.append(name) }
+
+
+private pure func collect_types(facts: DceFacts, types: List[CoreType]) -> DceFacts:
+	var result: DceFacts = facts
+
+	for typ in types:
+		result = collect_type(result, typ)
+
+	result
+
+
+private pure func collect_type(facts: DceFacts, typ: CoreType) -> DceFacts:
+	match typ:
+		VoidType:
+			facts
+		NamedType(name, args):
+			collect_types(
+				add_type_name(facts, name),
+				args,
+			)
+		StackResultType(ok_type, error_type):
+			collect_type(
+				collect_type(facts, ok_type),
+				error_type,
+			)
+		BoxedResultType(ok_type, error_type):
+			collect_type(
+				collect_type(facts, ok_type),
+				error_type,
+			)
+		EnumType(name):
+			add_type_name(facts, name)
+		ValueRecordType(name):
+			add_type_name(facts, name)
+		HeapRecordType(name):
+			add_type_name(facts, name)
+		UnionType(name):
+			add_type_name(facts, name)
+		RangeType:
+			facts
+		TensorType(info):
+			collect_type(facts, info.element_type)
+		TupleType(items):
+			collect_types(facts, items)
+
+
+private pure func collect_hash_constructor(
+	facts: DceFacts,
+	constructor: CoreHashContainerConstructor,
+) -> DceFacts:
+	match constructor:
+		CustomHashContainerConstructor(hash_name, equals_name, needs_release):
+			add_function_name(
+				add_function_name(facts, hash_name),
+				equals_name,
+			)
+		GenericHashContainerConstructor:
+			facts
+		StringHashContainerConstructor:
+			facts
+		FloatHashContainerConstructor:
+			facts
+
+
+private pure func collect_call_kind(facts: DceFacts, kind: CoreCallKind) -> DceFacts:
+	match kind:
+		UnknownCall:
+			-- Dynamic closure calls do not name a top-level target. Reachability for
+			-- their code comes from ClosureCreateExpr and task-closure metadata.
+			facts
+		SelectedDirectCall(def_id):
+			add_function_id(facts, def_id)
+		UserCall(name, Some(def_id), consumed_args):
+			add_function_id(facts, def_id)
+		UserCall(name, None, consumed_args):
+			{ facts | fail_closed = True }
+		DictWithCapacityCall(constructor):
+			collect_hash_constructor(facts, constructor)
+		ListToStringCall(callback_name):
+			add_function_name(facts, callback_name)
+		BuiltinCall(name):
+			facts
+		ClosureCall:
+			facts
+		DirectRuntimeCall(call):
+			facts
+		FallibleStreamTerminalCall(bridge):
+			facts
+		ForeignCall(name, arg_passing):
+			facts
+		IntrinsicCall(name):
+			facts
+		OperationResultCall(bridge):
+			facts
+		TensorParallelCall(name, layout):
+			facts
+
+
+private pure func collect_exprs(facts: DceFacts, exprs: List[CoreExpr]) -> DceFacts:
+	var result: DceFacts = facts
+
+	for expr in exprs:
+		result = collect_expr(result, expr)
+
+	result
+
+
+private pure func collect_boxed_value(facts: DceFacts, value: CoreBoxedStorageValue) -> DceFacts:
+	collect_expr(facts, value.value)
+
+
+private pure func collect_boxed_values(
+	facts: DceFacts,
+	values: List[CoreBoxedStorageValue],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for value in values:
+		result = collect_boxed_value(result, value)
+
+	result
+
+
+private pure func collect_tuple_element(facts: DceFacts, element: CoreTupleElement) -> DceFacts:
+	match element:
+		TuplePrimElement(expr):
+			collect_expr(facts, expr)
+		TuplePointerElement(expr):
+			collect_expr(facts, expr)
+		TupleStructElement(expr, c_type):
+			collect_expr(facts, expr)
+		TupleVoidElement:
+			facts
+		TupleFloatElement(expr):
+			collect_expr(facts, expr)
+		TupleFloat32Element(expr):
+			collect_expr(facts, expr)
+		TupleFloat16Element(expr):
+			collect_expr(facts, expr)
+
+
+private pure func collect_tuple_elements(
+	facts: DceFacts,
+	elements: List[CoreTupleElement],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for element in elements:
+		result = collect_tuple_element(result, element)
+
+	result
+
+
+private pure func collect_record_fields(
+	facts: DceFacts,
+	fields: List[CoreRecordFieldValue],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for field in fields:
+		result = collect_expr(result, field.value)
+
+	result
+
+
+private pure func collect_dict_entries(facts: DceFacts, entries: List[CoreDictEntry]) -> DceFacts:
+	var result: DceFacts = facts
+
+	for entry in entries:
+		result = collect_boxed_value(result, entry.key)
+		result = collect_boxed_value(result, entry.value)
+
+	result
+
+
+private pure func collect_dict_literal_entries(
+	facts: DceFacts,
+	entries: List[CoreDictLiteralEntry],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for entry in entries:
+		result = collect_expr(result, entry.key)
+		result = collect_expr(result, entry.value)
+
+	result
+
+
+private pure func collect_tensor_payload(
+	facts: DceFacts,
+	payload: CoreTensorLiteralPayload,
+) -> DceFacts:
+	match payload:
+		TensorRawLiteralPayload(raw):
+			collect_exprs(facts, raw.elements)
+		TensorInlineStructLiteralPayload(inline_struct):
+			collect_exprs(facts, inline_struct.elements)
+
+
+private pure func collect_literal_match_cases(
+	facts: DceFacts,
+	cases: List[CoreLiteralMatchCase],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for match_case in cases:
+		result = collect_expr(result, match_case.body)
+
+	result
+
+
+private pure func collect_literal_match_fallback(
+	facts: DceFacts,
+	fallback: CoreLiteralMatchFallback,
+) -> DceFacts:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			collect_expr(facts, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			collect_expr(facts, body)
+		LiteralMatchFallbackFail:
+			facts
+
+
+private pure func collect_constructor_match_body(
+	facts: DceFacts,
+	body: CoreConstructorMatchBody,
+) -> DceFacts:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			collect_expr(facts, expr)
+		ConstructorMatchBodyLiteral(literal_match):
+			collect_constructor_literal_match(facts, literal_match)
+		ConstructorMatchBodyLength(length_match):
+			collect_constructor_length_match(facts, length_match)
+
+
+private pure func collect_constructor_match_cases(
+	facts: DceFacts,
+	cases: List[CoreConstructorMatchCase],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for match_case in cases:
+		result = collect_constructor_match_body(result, match_case.body)
+
+	result
+
+
+private pure func collect_constructor_match_fallback(
+	facts: DceFacts,
+	fallback: CoreConstructorMatchFallback,
+) -> DceFacts:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			collect_expr(facts, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			collect_expr(facts, body)
+		ConstructorMatchFallbackFail:
+			facts
+
+
+private pure func collect_constructor_literal_match(
+	facts: DceFacts,
+	match_expr: CoreConstructorLiteralMatch,
+) -> DceFacts:
+	collect_literal_match_fallback(
+		collect_literal_match_cases(facts, match_expr.cases),
+		match_expr.fallback,
+	)
+
+
+private pure func collect_constructor_length_branch(
+	facts: DceFacts,
+	branch: CoreConstructorLengthMatchBranch,
+) -> DceFacts:
+	collect_constructor_match_body(facts, branch.body)
+
+
+private pure func collect_constructor_length_cases(
+	facts: DceFacts,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> DceFacts:
+	var result: DceFacts = facts
+
+	for match_case in cases:
+		result = collect_constructor_length_branch(result, match_case.branch)
+
+	result
+
+
+private pure func collect_constructor_length_geq(
+	facts: DceFacts,
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> DceFacts:
+	match geq:
+		Some(found):
+			collect_constructor_length_branch(facts, found.branch)
+		None:
+			facts
+
+
+private pure func collect_constructor_length_fallback(
+	facts: DceFacts,
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> DceFacts:
+	match fallback:
+		Some(branch):
+			collect_constructor_length_branch(facts, branch)
+		None:
+			facts
+
+
+private pure func collect_constructor_length_match(
+	facts: DceFacts,
+	match_expr: CoreConstructorLengthMatch,
+) -> DceFacts:
+	var result: DceFacts = collect_constructor_length_cases(facts, match_expr.cases)
+	result = collect_constructor_length_geq(result, match_expr.geq)
+	collect_constructor_length_fallback(result, match_expr.fallback)
+
+
+private pure func collect_select_arm_kind(facts: DceFacts, kind: CoreSelectArmKind) -> DceFacts:
+	match kind:
+		SelectRecvArm(recv):
+			collect_expr(facts, recv.channel)
+		SelectSealedArm(channel):
+			collect_expr(facts, channel)
+		SelectAfterArm(timeout):
+			collect_expr(facts, timeout)
+
+
+private pure func collect_select_arms(facts: DceFacts, arms: List[CoreSelectArm]) -> DceFacts:
+	var result: DceFacts = facts
+
+	for arm in arms:
+		result = collect_select_arm_kind(result, arm.kind)
+		result = collect_expr(result, arm.body)
+
+	result
+
+
+private pure func collect_optional_expr(facts: DceFacts, expr: Option[CoreExpr]) -> DceFacts:
+	match expr:
+		Some(found):
+			collect_expr(facts, found)
+		None:
+			facts
+
+
+private pure func collect_expr(facts: DceFacts, expr: CoreExpr) -> DceFacts:
+	collect_expr_children(
+		collect_type(facts, core_expr_type(expr)),
+		expr,
+	)
+
+
+private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceFacts:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			facts
+		VarExpr(variable, typ, loc):
+			add_global_name(facts, variable.name)
+		VoidExpr(typ, loc):
+			facts
+		CooperativeCheckpointExpr(typ, loc):
+			facts
+		CallExpr(kind, callee, args, typ, loc):
+			collect_exprs(
+				collect_expr(
+					collect_call_kind(facts, kind),
+					callee,
+				),
+				args,
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			collect_expr(
+				collect_expr(facts, left),
+				right,
+			)
+		UnaryExpr(op, value, typ, loc):
+			collect_expr(facts, value)
+		LogicalExpr(op, left, right, typ, loc):
+			collect_expr(
+				collect_expr(facts, left),
+				right,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			collect_expr(facts, rhs)
+		CastExpr(value, typ, loc):
+			collect_expr(facts, value)
+		BoxExpr(box, typ, loc):
+			collect_expr(facts, box.value)
+		UnboxExpr(kind, value, typ, loc):
+			collect_expr(facts, value)
+		FieldExpr(value, field_name, typ, loc):
+			collect_expr(facts, value)
+		TupleFieldExpr(value, field_index, typ, loc):
+			collect_expr(facts, value)
+		TupleExpr(items, typ, loc):
+			collect_exprs(facts, items)
+		TupleConstructExpr(construct, typ, loc):
+			collect_tuple_elements(facts, construct.elements)
+		VectorExpr(items, typ, loc):
+			collect_exprs(facts, items)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			collect_expr(facts, body)
+		ClosureCreateExpr(closure, typ, loc):
+			add_function_id(facts, closure.def_id)
+		ListConstructExpr(construct, typ, loc):
+			collect_boxed_values(facts, construct.elements)
+		ListAllocExpr(alloc, typ, loc):
+			collect_expr(facts, alloc.capacity)
+		ListGetExpr(get, typ, loc):
+			collect_expr(
+				collect_expr(facts, get.list),
+				get.index,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			var result: DceFacts = collect_expr(facts, handoff.source)
+			result = collect_expr(result, handoff.capacity)
+			collect_expr(result, handoff.body)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			collect_boxed_value(
+				collect_expr(
+					collect_expr(facts, set.list),
+					set.index,
+				),
+				set.value,
+			)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			var result: DceFacts = collect_expr(facts, slot.result)
+			result = collect_expr(result, slot.out_index)
+			result = collect_expr(result, slot.source)
+			collect_expr(result, slot.source_index)
+		StringByteReadExpr(read, typ, loc):
+			collect_expr(
+				collect_expr(facts, read.source),
+				read.index,
+			)
+		StringByteWriteExpr(write, typ, loc):
+			collect_expr(
+				collect_expr(
+					collect_expr(facts, write.target),
+					write.index,
+				),
+				write.byte,
+			)
+		StringByteCopyExpr(copy, typ, loc):
+			var result: DceFacts = collect_expr(facts, copy.dst)
+			result = collect_expr(result, copy.dst_pos)
+			result = collect_expr(result, copy.src)
+			result = collect_expr(result, copy.src_pos)
+			collect_expr(result, copy.len)
+		StringSetLenExpr(set_len, typ, loc):
+			collect_expr(
+				collect_expr(facts, set_len.target),
+				set_len.len,
+			)
+		TensorLiteralExpr(literal, typ, loc):
+			collect_tensor_payload(facts, literal.payload)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			collect_boxed_values(facts, literal.elements)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			facts
+		TensorRawFillExpr(fill, typ, loc):
+			collect_exprs(
+				collect_expr(facts, fill.value),
+				fill.dims,
+			)
+		TensorRawReadExpr(read, typ, loc):
+			collect_expr(facts, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			collect_expr(
+				collect_expr(facts, write.index),
+				write.value,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			collect_expr(
+				collect_expr(facts, binding.source),
+				body,
+			)
+		DictExpr(entries, typ, loc):
+			collect_dict_literal_entries(facts, entries)
+		DictConstructExpr(construct, typ, loc):
+			collect_dict_entries(
+				collect_hash_constructor(facts, construct.constructor),
+				construct.entries,
+			)
+		SetAllocExpr(alloc, typ, loc):
+			collect_hash_constructor(facts, alloc.constructor)
+		ListRetainExpr(retain, typ, loc):
+			collect_boxed_value(
+				collect_expr(facts, retain.list),
+				retain.value,
+			)
+		ListSetExpr(set, typ, loc):
+			collect_boxed_value(
+				collect_expr(
+					collect_expr(facts, set.list),
+					set.index,
+				),
+				set.value,
+			)
+		ListSwapExpr(swap, typ, loc):
+			collect_expr(
+				collect_expr(
+					collect_expr(facts, swap.list),
+					swap.left_index,
+				),
+				swap.right_index,
+			)
+		RecordExpr(fields, typ, loc):
+			collect_record_fields(facts, fields)
+		RecordConstructExpr(name, fields, typ, loc):
+			collect_record_fields(facts, fields)
+		UnionConstructExpr(construct, typ, loc):
+			collect_boxed_values(facts, construct.args)
+		UnionReuseConstructExpr(construct, typ, loc):
+			collect_boxed_values(
+				collect_expr(facts, construct.source),
+				construct.args,
+			)
+		PreClosureDetachExpr(detached, typ, loc):
+			collect_expr(facts, detached.body)
+		DetachExpr(detached, typ, loc):
+			add_function_id(facts, detached.task.def_id)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			collect_expr(facts, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			collect_expr(facts, body)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			collect_expr(
+				collect_expr(facts, rhs),
+				body,
+			)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			collect_expr(
+				collect_expr(facts, rhs),
+				body,
+			)
+		SeqExpr(first, second):
+			collect_expr(
+				collect_expr(facts, first),
+				second,
+			)
+		WhileExpr(cond, body, typ, loc):
+			collect_expr(
+				collect_expr(facts, cond),
+				body,
+			)
+		BreakExpr(typ, loc):
+			facts
+		ContinueExpr(typ, loc):
+			facts
+		ResourceScopeExpr(scope, typ, loc):
+			var result: DceFacts = collect_expr(facts, scope.acquire)
+			result = collect_expr(result, scope.body)
+			collect_expr(result, scope.cleanup)
+		ResourceCleanupExitExpr(exit, typ, loc):
+			collect_exprs(facts, exit.cleanups)
+		TailrecLoopExpr(params, return_type, body, loc):
+			collect_expr(facts, body)
+		TailrecRecurExpr(args, typ, loc):
+			collect_exprs(facts, args)
+		TailrecListSpreadLoopExpr(loop, loc):
+			collect_expr(facts, loop.body)
+		TailrecListSpreadRecurExpr(rebinds, list_index, typ, loc):
+			var result: DceFacts = facts
+
+			for rebind in rebinds:
+				result = collect_expr(result, rebind.value)
+
+			result
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			collect_expr(
+				collect_expr(
+					collect_expr(facts, start),
+					end_value,
+				),
+				body,
+			)
+		ForChannelExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForListExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForStringExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForDictExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForSetExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForStreamExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		ForTensorExpr(loop, typ, loc):
+			collect_expr(
+				collect_expr(facts, loop.iterable),
+				loop.body,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			var result: DceFacts = collect_expr(facts, loop.iterable)
+			result = collect_expr(result, loop.body)
+			result = collect_optional_expr(result, loop.timeout)
+			collect_expr(result, loop.limit)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			var result: DceFacts = add_function_id(facts, loop.task.def_id)
+			result = collect_expr(result, loop.iterable)
+			result = collect_expr(result, loop.body)
+			result = collect_optional_expr(result, loop.timeout)
+			collect_expr(result, loop.limit)
+		PreClosureConcurrentExpr(block, typ, loc):
+			var result: DceFacts = facts
+
+			for binding in block.bindings:
+				result = collect_expr(result, binding.rhs)
+
+			result = collect_expr(result, block.body)
+			collect_optional_expr(result, block.timeout)
+		ConcurrentExpr(block, typ, loc):
+			var result: DceFacts = facts
+
+			for binding in block.bindings:
+				result = add_function_id(result, binding.task.def_id)
+				result = collect_expr(result, binding.rhs)
+
+			result = collect_expr(result, block.body)
+			collect_optional_expr(result, block.timeout)
+		SelectExpr(select_expr, typ, loc):
+			collect_select_arms(facts, select_expr.arms)
+		RangeExpr(start, end_value, typ, loc):
+			collect_expr(
+				collect_expr(facts, start),
+				end_value,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			collect_literal_match_fallback(
+				collect_literal_match_cases(
+					collect_expr(facts, scrutinee),
+					cases,
+				),
+				fallback,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			collect_constructor_literal_match(
+				collect_expr(facts, scrutinee),
+				match_expr,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			collect_constructor_length_match(
+				collect_expr(facts, scrutinee),
+				match_expr,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			collect_constructor_match_fallback(
+				collect_constructor_match_cases(
+					collect_expr(facts, scrutinee),
+					cases,
+				),
+				fallback,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			collect_expr(
+				collect_expr(
+					collect_expr(facts, cond),
+					then_expr,
+				),
+				else_expr,
+			)
+
+
+private pure func function_is_entrypoint(function_info: CoreFunction) -> Bool:
+	function_info.name == "main" and function_info.source_module.is_none()
+
+
+private pure func function_is_prunable(function_info: CoreFunction) -> Bool:
+	match function_info.function_kind:
+		UserFunction:
+			True
+		ClosureBodyFunction(abi):
+			True
+		BuiltinFunction:
+			False
+		ForeignFunction(_):
+			False
+
+
+private pure func function_facts_for_id(
+	functions: List[CoreFunction],
+	def_id: Int,
+) -> Option[DceFacts]:
+	var found = False
+	var facts: DceFacts = {
+		function_ids = [],
+		function_names = [],
+		global_names = [],
+		type_names = [],
+		fail_closed = False,
+	}
+
+	for function_info in functions:
+		if function_info.def_id == def_id:
+			found = True
+
+			match function_info.body:
+				Some(body):
+					facts = collect_expr(facts, body)
+				None:
+					void
+
+	if found:
+		Some(facts)
+	else:
+		None
+
+
+private pure func add_functions_named(
+	reachable: List[Int],
+	functions: List[CoreFunction],
+	name: String,
+) -> List[Int]:
+	var result: List[Int] = reachable
+
+	for function_info in functions:
+		if function_info.name == name and not result.contains(function_info.def_id):
+			result = result.append(function_info.def_id)
+
+	result
+
+
+private pure func apply_facts(
+	reachable: List[Int],
+	functions: List[CoreFunction],
+	facts: DceFacts,
+) -> List[Int]:
+	var result: List[Int] = reachable
+
+	for def_id in facts.function_ids:
+		if not result.contains(def_id):
+			result = result.append(def_id)
+
+	for name in facts.function_names:
+		result = add_functions_named(result, functions, name)
+
+	result
+
+
+private pure func collect_functions(program_value: CoreProgram) -> List[CoreFunction]:
+	var functions: List[CoreFunction] = []
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(function_info):
+				functions = functions.append(function_info)
+			_:
+				void
+
+	functions
+
+
+record DceRoots {
+	reachable: List[Int],
+	reachable_globals: List[String],
+	fail_closed: Bool,
+	saw_main: Bool
+}
+
+
+private pure func collect_globals(program_value: CoreProgram) -> List[CoreGlobal]:
+	var globals: List[CoreGlobal] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				globals = globals.append(global)
+			_:
+				void
+
+	globals
+
+
+private pure func global_for_name(
+	globals: List[CoreGlobal],
+	name: String,
+) -> Option[CoreGlobal]:
+	var found: Option[CoreGlobal] = None
+
+	for global in globals:
+		if global.name.name == name:
+			found = Some(global)
+			break
+
+	found
+
+
+private pure func append_global_names(
+	reachable: List[String],
+	globals: List[CoreGlobal],
+	names: List[String],
+) -> List[String]:
+	var result = reachable
+
+	for name in names:
+		if not result.contains(name) and global_for_name(globals, name).is_some():
+			result = result.append(name)
+
+	result
+
+
+private pure func collect_roots(
+	program_value: CoreProgram,
+	functions: List[CoreFunction],
+) -> DceRoots:
+	var reachable: List[Int] = []
+	var reachable_globals: List[String] = []
+	var fail_closed: Bool = False
+	var saw_main: Bool = False
+	globals = collect_globals(program_value)
+
+	for function_info in functions:
+		if function_is_entrypoint(function_info):
+			saw_main = True
+
+			if not reachable.contains(function_info.def_id):
+				reachable = reachable.append(function_info.def_id)
+		else if not function_is_prunable(function_info):
+			if not reachable.contains(function_info.def_id):
+				reachable = reachable.append(function_info.def_id)
+
+	for global in globals:
+		if not global.is_private:
+			reachable_globals = reachable_globals.append(global.name.name)
+
+	{
+		reachable = reachable,
+		reachable_globals = reachable_globals,
+		fail_closed = fail_closed,
+		saw_main = saw_main
+	}
+
+
+record DceClosure {
+	reachable: List[Int],
+	reachable_globals: List[String],
+	fail_closed: Bool
+}
+
+
+private @tail_recursive pure func close_reachability(
+	functions: List[CoreFunction],
+	globals: List[CoreGlobal],
+	reachable: List[Int],
+	scanned: List[Int],
+	reachable_globals: List[String],
+	scanned_globals: List[String],
+) -> DceClosure:
+	var next_id: Option[Int] = None
+
+	for def_id in reachable:
+		if not scanned.contains(def_id):
+			next_id = Some(def_id)
+			break
+
+	match next_id:
+		None:
+			var next_global: Option[String] = None
+
+			for name in reachable_globals:
+				if not scanned_globals.contains(name):
+					next_global = Some(name)
+					break
+
+			match next_global:
+				None:
+					{
+						reachable = reachable,
+						reachable_globals = reachable_globals,
+						fail_closed = False,
+					}
+				Some(name):
+					updated_scanned_globals = scanned_globals.append(name)
+
+					match global_for_name(globals, name):
+						None:
+							close_reachability(
+								functions,
+								globals,
+								reachable,
+								scanned,
+								reachable_globals,
+								updated_scanned_globals,
+							)
+						Some(global):
+							facts: DceFacts = collect_expr(
+								{
+									function_ids = [],
+									function_names = [],
+									global_names = [],
+									type_names = [],
+									fail_closed = False,
+								},
+								global.init,
+							)
+
+							if facts.fail_closed:
+								{
+									reachable = reachable,
+									reachable_globals = reachable_globals,
+									fail_closed = True,
+								}
+							else:
+								close_reachability(
+									functions,
+									globals,
+									apply_facts(reachable, functions, facts),
+									scanned,
+									append_global_names(
+										reachable_globals,
+										globals,
+										facts.global_names,
+									),
+									updated_scanned_globals,
+								)
+		Some(def_id):
+			updated_scanned: List[Int] = scanned.append(def_id)
+
+			match function_facts_for_id(functions, def_id):
+				None:
+					close_reachability(
+						functions,
+						globals,
+						reachable,
+						updated_scanned,
+						reachable_globals,
+						scanned_globals,
+					)
+				Some(facts):
+					if facts.fail_closed:
+						{
+							reachable = reachable,
+							reachable_globals = reachable_globals,
+							fail_closed = True,
+						}
+					else:
+						close_reachability(
+							functions,
+							globals,
+							apply_facts(reachable, functions, facts),
+							updated_scanned,
+							append_global_names(
+								reachable_globals,
+								globals,
+								facts.global_names,
+							),
+							scanned_globals,
+						)
+
+
+private pure func function_is_kept(reachable: List[Int], function_info: CoreFunction) -> Bool:
+	not function_is_prunable(function_info) or reachable.contains(function_info.def_id)
+
+
+private pure func collect_function_types(facts: DceFacts, function_info: CoreFunction) -> DceFacts:
+	var result: DceFacts = collect_type(facts, function_info.return_type)
+
+	for param in function_info.params:
+		result = collect_type(result, param.typ)
+
+	match function_info.body:
+		Some(body):
+			collect_expr(result, body)
+		None:
+			result
+
+
+private pure func collect_type_root_facts(
+	program_value: CoreProgram,
+	reachable: List[Int],
+	reachable_globals: List[String],
+) -> DceFacts:
+	var facts: DceFacts = {
+		function_ids = [],
+		function_names = [],
+		global_names = [],
+		type_names = [],
+		fail_closed = False
+	}
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(function_info):
+				if function_is_kept(reachable, function_info):
+					facts = collect_function_types(facts, function_info)
+			GlobalDecl(global):
+				if not global.is_private or reachable_globals.contains(global.name.name):
+					facts = collect_expr(
+						collect_type(facts, global.typ),
+						global.init,
+					)
+			_:
+				void
+
+	facts
+
+
+private pure func collect_decl_type_dependencies(facts: DceFacts, decl: CoreDecl) -> DceFacts:
+	match decl:
+		UnionDecl(union_info):
+			var result: DceFacts = facts
+
+			for variant in union_info.variants:
+				for field in variant.fields:
+					result = collect_type(result, field.typ)
+
+			result
+		ValueRecordDecl(record_info):
+			var result: DceFacts = facts
+
+			for field in record_info.fields:
+				result = collect_type(result, field.typ)
+
+			result
+		HeapRecordDecl(record_info):
+			var result: DceFacts = facts
+
+			for field in record_info.fields:
+				result = collect_type(result, field.typ)
+
+			result
+		_:
+			facts
+
+
+private pure func decl_has_type_name(decl: CoreDecl, name: String) -> Bool:
+	match decl:
+		EnumDecl(enum_info):
+			enum_info.name == name
+		UnionDecl(union_info):
+			union_info.name == name
+		ValueRecordDecl(record_info):
+			record_info.name == name
+		HeapRecordDecl(record_info):
+			record_info.name == name
+		_:
+			False
+
+
+private @tail_recursive pure func close_type_reachability(
+	program_value: CoreProgram,
+	reachable: List[String],
+	scanned: List[String],
+) -> List[String]:
+	var next_name: Option[String] = None
+
+	for name in reachable:
+		if not scanned.contains(name):
+			next_name = Some(name)
+			break
+
+	match next_name:
+		None:
+			reachable
+		Some(name):
+			var facts: DceFacts = {
+				function_ids = [],
+				function_names = [],
+				global_names = [],
+				type_names = [],
+				fail_closed = False
+			}
+
+			for decl in program_value.decls:
+				if decl_has_type_name(decl, name):
+					facts = collect_decl_type_dependencies(facts, decl)
+
+			var updated_reachable: List[String] = reachable
+
+			for dependency in facts.type_names:
+				if not updated_reachable.contains(dependency):
+					updated_reachable = updated_reachable.append(dependency)
+
+			close_type_reachability(
+				program_value,
+				updated_reachable,
+				scanned.append(name),
+			)
+
+
+private pure func keep_decl(
+	reachable_functions: List[Int],
+	reachable_globals: List[String],
+	reachable_types: List[String],
+	decl: CoreDecl,
+) -> Bool:
+	match decl:
+		FunctionDecl(function_info):
+			function_is_kept(reachable_functions, function_info)
+		GlobalDecl(global):
+			not global.is_private or reachable_globals.contains(global.name.name)
+		EnumDecl(enum_info):
+			reachable_types.contains(enum_info.name)
+		UnionDecl(union_info):
+			reachable_types.contains(union_info.name)
+		ValueRecordDecl(record_info):
+			reachable_types.contains(record_info.name)
+		HeapRecordDecl(record_info):
+			reachable_types.contains(record_info.name)
+		TypeAliasDecl(alias_decl):
+			True
+		TraitDecl(trait_decl):
+			True
+		ImplDecl(impl_decl):
+			True
+
+
+pure func prune_program(program_value: CoreProgram) -> CoreProgram:
+	functions: List[CoreFunction] = collect_functions(program_value)
+	roots: DceRoots = collect_roots(program_value, functions)
+
+	if roots.fail_closed or not roots.saw_main:
+		program_value
+	else:
+		closure: DceClosure = close_reachability(
+			functions,
+			collect_globals(program_value),
+			roots.reachable,
+			[],
+			roots.reachable_globals,
+			[],
+		)
+
+		if closure.fail_closed:
+			program_value
+		else:
+			type_facts: DceFacts = collect_type_root_facts(
+				program_value,
+				closure.reachable,
+				closure.reachable_globals,
+			)
+			reachable_types: List[String] = close_type_reachability(
+				program_value,
+				type_facts.type_names,
+				[],
+			)
+			{ program_value |
+				decls = program_value.decls.filter(
+					func(decl): keep_decl(
+					closure.reachable,
+					closure.reachable_globals,
+						reachable_types,
+						decl,
+					),
+				)
+			}

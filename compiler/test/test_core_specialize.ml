@@ -172,6 +172,25 @@ let expect_intrinsic_with_reg label reg expected_name e =
       Alcotest.(check string) (label ^ " name") expected_name got_name
   | _ -> Alcotest.failf "%s did not specialize to expected intrinsic" label
 
+let test_vector_minmax_uses_tensor_element_abi () =
+  let cases =
+    [
+      ("Float max", "blorp_max", ty_float, "blorp_vector_max_float");
+      ("Float min", "blorp_min", ty_float, "blorp_vector_min_float");
+      ("Float32 max", "blorp_max", ty_float32, "blorp_vector_max_float32");
+      ("Float32 min", "blorp_min", ty_float32, "blorp_vector_min_float32");
+      ("Float16 max", "blorp_max", ty_float16, "blorp_vector_max_float16");
+      ("Float16 min", "blorp_min", ty_float16, "blorp_vector_min_float16");
+      ("Int max", "blorp_max", ty_int, "blorp_vector_max_int");
+      ("Int min", "blorp_min", ty_int, "blorp_vector_min_int");
+    ]
+  in
+  List.iter
+    (fun (label, sentinel, elem_ty, expected) ->
+      let vector = cvar "values" (tensor elem_ty [ 3 ]) in
+      expect_builtin label expected (call_builtin sentinel [ vector ] elem_ty))
+    cases
+
 let expect_ranked_checked_get_shape_dims label expected_dims args =
   let got_dims = List.map int_lit (List.filteri (fun i _ -> i >= 1 && i <= 3) args) in
   Alcotest.(check (list int)) (label ^ " dims") expected_dims got_dims
@@ -601,7 +620,7 @@ let test_rank3_int_checked_get_injects_shape_and_unboxes () =
   let e = call_builtin "blorp_tensor3_checked_get" [ t; i; j; k ] ty_int in
   match (specialize e).desc with
   | CUnbox
-      ( { desc = CCall (CKBuiltin got_name, _, args); ty = TyNamed ("Void", []); _ },
+      ( { desc = CCall (CKBuiltin got_name, _, args); ty = TyNamed ("Ptr", []); _ },
         TyNamed ("Int", []) ) ->
       Alcotest.(check string)
         "rank3 int checked_get builtin" "blorp_tensor3_checked_get_shape"
@@ -657,6 +676,31 @@ let test_bounds_proven_tensor_read_uses_typed_raw_view () =
       Alcotest.(check int)
         "reads through typed raw tensor view" 1
         (count_tensor_raw_read TensorFloat64Elements body)
+
+let test_bounds_proven_tensor_read_rejects_temporary_source () =
+  let parent = cvar "parent" (tensor ty_float [ 2; 4 ]) in
+  let row = mk (CLit (LitInt 0L)) ty_int in
+  let values =
+    call_builtin "blorp_tensor_slice_row" [ parent; row ]
+      (tensor ty_float [ 4 ])
+  in
+  let idx = cvar "i" ty_int in
+  let checked_get = call_builtin "blorp_checked_get" [ values; idx ] ty_float in
+  let bound : Blorp.Core_specialize.loop_index_bound =
+    {
+      lib_var = Var.named "i";
+      lib_lower_nonnegative = true;
+      lib_upper_exclusive = Some 4;
+    }
+  in
+  let env : Blorp.Core_specialize.specialize_env =
+    { loop_index_bounds = [ bound ] }
+  in
+  Alcotest.(check bool)
+    "temporary tensor source is not borrowed by a raw view" true
+    (Option.is_none
+       (Blorp.Core_specialize.bounds_proven_tensor_read env checked_get values
+          idx))
 
 let guarded_float64_raw_read source idx =
   let cond = call_intrinsic "tensor_is_f64_storage" [ source ] ty_bool in
@@ -1127,6 +1171,22 @@ let test_tensor_peel_nonconstant_dims_raise_core_error () =
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"tensor_peel" (fun () -> ignore (specialize e))
 
+let test_tensor_peel_raw_call_keeps_pointer_type () =
+  let coll = cvar "m" (tensor ty_int [ 2; 3 ]) in
+  let idx = mk (CLit (LitInt 0L)) ty_int in
+  let result_ty = tensor ty_int [ 3 ] in
+  let e = call_builtin "blorp_tensor_peel" [ coll; idx ] result_ty in
+  match (specialize e).desc with
+  | CCast
+      ( { desc = CCall (CKBuiltin "blorp_tensor_slice_row", _, _); ty; _ },
+        cast_ty ) ->
+      Alcotest.(check string)
+        "raw tensor peel call type" "Ptr" (Blorp.Types.type_to_string ty);
+      Alcotest.(check string)
+        "tensor peel result type" "Tensor[Int, #3]"
+        (Blorp.Types.type_to_string cast_ty)
+  | _ -> Alcotest.fail "tensor_peel should cast a pointer-returning runtime call"
+
 let test_vector_norm_non_tensor_raises_core_error () =
   let x = cvar "x" ty_int in
   let e = call_builtin "blorp_vector_norm" [ x ] ty_float in
@@ -1308,6 +1368,8 @@ let suite =
           test_float32_vector_fill_uses_packed_runtime;
         Alcotest.test_case "float64_vector_fill_unboxed" `Quick
           test_float64_vector_fill_uses_unboxed_runtime;
+        Alcotest.test_case "vector_minmax_uses_tensor_element_abi" `Quick
+          test_vector_minmax_uses_tensor_element_abi;
         Alcotest.test_case "alias_vector_length_constant_folds" `Quick
           test_alias_vector_length_constant_folds;
         Alcotest.test_case
@@ -1337,6 +1399,8 @@ let suite =
           test_rank3_float_checked_get_uses_shape_f64_runtime;
         Alcotest.test_case "bounds_proven_tensor_read_typed_raw_view" `Quick
           test_bounds_proven_tensor_read_uses_typed_raw_view;
+        Alcotest.test_case "bounds_proven_tensor_read_rejects_temporary_source"
+          `Quick test_bounds_proven_tensor_read_rejects_temporary_source;
         Alcotest.test_case "raw_tensor_view_resource_scope_collection" `Quick
           test_raw_tensor_view_collection_respects_resource_scope_binding;
         Alcotest.test_case "raw_tensor_view_resource_scope_rewrite" `Quick
@@ -1418,6 +1482,8 @@ let suite =
           test_named_generic_cbox_rewrites_pointer_inner;
         Alcotest.test_case "tensor_peel_nonconstant_dims_raise_core_error"
           `Quick test_tensor_peel_nonconstant_dims_raise_core_error;
+        Alcotest.test_case "tensor_peel_raw_call_keeps_pointer_type" `Quick
+          test_tensor_peel_raw_call_keeps_pointer_type;
         Alcotest.test_case "vector_norm_non_tensor_raises_core_error" `Quick
           test_vector_norm_non_tensor_raises_core_error;
         Alcotest.test_case

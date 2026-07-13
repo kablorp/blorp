@@ -93,8 +93,6 @@ let default_suites =
   @ suite_group "CoreResolve" Test_core_resolve.suite
   @ suite_group "CoreStdInline" Test_core_std_inline.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite
-  @ suite_group "CoreDce" Test_core_dce.suite
-  @ suite_group "CoreConsumeSpecialize" Test_core_consume_specialize.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
   @ suite_group "CoreMono" Test_core_mono.suite
   @ suite_group "CoreDesugar" Test_core_desugar.suite
@@ -114,7 +112,6 @@ let default_suites =
   @ suite_group "CoreOptionLayout" Test_core_option_layout.suite
   @ suite_group "CoreResultLayout" Test_core_result_layout.suite
   @ suite_group "CoreOwnership" Test_core_ownership.suite
-  @ suite_group "CorePerceus" Test_core_perceus.suite
   @ suite_group "OperationResultMetadata" Test_operation_result_metadata.suite
   @ suite_group "CoreClosure" Test_core_closure.suite
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
@@ -154,6 +151,7 @@ let deep_suites =
   @ suite_group "TestRunner" Test_test_runner.suite
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite
   @ suite_group "CompilerBlorpBridge" Test_compiler_blorp_bridge.suite
+  @ suite_group "SemanticMiddleWorker" Test_semantic_middle_worker.suite
 
 let suites_for_scope = function
   | Default -> default_suites

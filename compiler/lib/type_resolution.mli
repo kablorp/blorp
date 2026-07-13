@@ -19,12 +19,6 @@ val make_context :
   unit ->
   context
 
-val annotation :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
-
 val annotation_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
@@ -37,23 +31,11 @@ val value_ascription :
   Ast.type_expr ->
   resolved_type
 
-val value_ascription_canonical :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  Ast.type_expr
-
 val local_binding_annotation :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
   Ast.type_expr ->
   resolved_type
-
-val local_binding_annotation_canonical :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  Ast.type_expr
 
 val function_parameter_annotation :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
@@ -61,25 +43,7 @@ val function_parameter_annotation :
   Ast.type_expr ->
   resolved_type
 
-val function_parameter_annotation_canonical :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  Ast.type_expr
-
 val function_return_annotation :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
-
-val function_return_annotation_canonical :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  Ast.type_expr
-
-val imported_signature :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
   Ast.type_expr ->
@@ -91,35 +55,17 @@ val imported_signature_canonical :
   Ast.type_expr ->
   Ast.type_expr
 
-val record_field_type :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
-
 val record_field_type_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
   Ast.type_expr ->
   Ast.type_expr
 
-val variant_field_type :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
-
 val variant_field_type_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
   context ->
   Ast.type_expr ->
   Ast.type_expr
-
-val type_alias_target :
-  ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->
-  context ->
-  Ast.type_expr ->
-  resolved_type
 
 val type_alias_target_canonical :
   ?qualify_owner:(Ast.type_expr -> Ast.type_expr) ->

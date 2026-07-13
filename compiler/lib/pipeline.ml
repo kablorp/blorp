@@ -34,7 +34,7 @@ let bridge_can_read_matching_source ~filename source =
     && String.equal (Modules.read_file filename) source
   with Sys_error _ -> false
 
-(** Outcome of [compile]. See [pipeline.mli] for rationale. *)
+(** Outcome of source compilation. See [pipeline.mli] for rationale. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
 
 type source_kind = User_source | Generated_test_harness
@@ -755,11 +755,6 @@ let typecheck_only_typed_with_blorp_bridge_policy ~debug
         ~on_frontend_phase:None ~filename ~preloaded_module_graph
       |> Result.map (fun result -> result.blorp_bridge_typed_program))
 
-let typecheck_only_typed_with_blorp_bridge ~filename ~preloaded_module_graph =
-  typecheck_only_typed_with_blorp_bridge_policy ~debug:false
-    ~allow_debug_only_calls:false ~filename
-    ~preloaded_module_graph
-
 let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a)
     : 'a =
   let parent = Session.current () in
@@ -797,25 +792,6 @@ let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
         in
         if import_errors <> [] then Error import_errors else Ok typed_program
 
-(* Legacy direct-source/typechecking route for tooling and tests that still
-   pass raw source instead of a Blorp frontend graph. Normal source-command
-   checks enter through [typecheck_only_typed_with_blorp_bridge_policy]. *)
-let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
-    =
-  with_fresh_session filename (fun () ->
-      match parse_and_load_modules ~source_kind ~filename source with
-      | Error _ as e -> e
-      | Ok (program, _base_dir) ->
-          typecheck_loaded_program ~source_kind ~filename ~program ~debug ())
-
-let typecheck_only_typed ~filename ~source ?(debug = false) () =
-  typecheck_only_typed_impl ~source_kind:User_source ~filename ~source ~debug ()
-
-let typecheck_only ~filename ~source ?(debug = false) () =
-  match typecheck_only_typed ~filename ~source ~debug () with
-  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
-  | Error _ as e -> e
-
 let typecheck_only_typed_reusing_session ~sess ~filename ~source
     ?(debug = false) () =
   with_reusable_typecheck_session ~sess filename (fun () ->
@@ -824,14 +800,6 @@ let typecheck_only_typed_reusing_session ~sess ~filename ~source
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~source_kind:User_source ~filename ~program
             ~debug ())
-
-let typecheck_only_reusing_session ~sess ~filename ~source ?(debug = false) ()
-    =
-  match
-    typecheck_only_typed_reusing_session ~sess ~filename ~source ~debug ()
-  with
-  | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
-  | Error _ as e -> e
 
 (** Parse and type-check a module, returning the final state and typed program. *)
 let typecheck_module_only_typed_impl ?configure_session ~filename ~source () =
@@ -993,29 +961,6 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
             ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
             ?tail_observation_stages ~check_invariants ~filename ~program ())
 
-let compile_parsed ?debug ?allow_debug_only_calls ?retain_debug_blocks
-    ?embed_runtime ?require_main ?profile ?on_frontend_phase ?on_stage
-    ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?check_invariants ~filename ~program ?preloaded_module_graph () =
-  with_fresh_session filename (fun () ->
-      let loaded =
-        match preloaded_module_graph with
-        | Some graph ->
-            load_modules_after_preloaded_graph ?on_frontend_phase ~filename
-              ~program graph
-        | None ->
-            load_modules_after_parse_with_legacy_imports ?on_frontend_phase
-              ~filename program
-      in
-      match loaded with
-      | Error _ as e -> e
-      | Ok (program, _base_dir) ->
-          compile_loaded_program ~source_kind:User_source ?debug
-            ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-            ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
-            ?on_stage_json ?tail_observation_stages ?check_invariants ~filename
-            ~program ())
-
 let compile_preloaded_graph_with_blorp_bridge ?(debug = false)
     ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
@@ -1046,15 +991,6 @@ let compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source () =
   compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename ~source ()
-
-let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ?check_invariants ~filename ~source
-    () =
-  compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source ()

@@ -5,18 +5,8 @@ type proof_env = {
   range_proofs : (collection_identity * range_proof) list;
 }
 
-type narrowed_subject =
-  | NarrowedBinding of collection_identity
-  | NarrowedAlias of {
-      alias : collection_identity;
-      target : collection_identity;
-    }
-
-type branch_subject =
-  | ImmutableSubject of narrowed_subject
-  | MutableSubject of collection_identity
-
-type branch_range_proof = { subject : narrowed_subject; proof : range_proof }
+type branch_subject = ImmutableSubject | MutableSubject
+type branch_range_proof = range_proof
 type branch_proof_rejection = MutableSubjectCannotNarrow | InvalidRangeBounds
 
 let empty_proof_env = { subscript_proofs = []; range_proofs = [] }
@@ -76,30 +66,23 @@ let proof_env_find_range env ~var = find_proof_for_var var env.range_proofs
 
 let immutable_subject name =
   match collection_identity name with
-  | Some identity -> Some (ImmutableSubject (NarrowedBinding identity))
+  | Some _ -> Some ImmutableSubject
   | None -> None
-
-let immutable_alias_subject ~alias ~target =
-  match (collection_identity alias, collection_identity target) with
-  | Some alias, Some target when not (collection_identity_equal alias target) ->
-      Some (ImmutableSubject (NarrowedAlias { alias; target }))
-  | _ -> None
 
 let mutable_subject name =
   match collection_identity name with
-  | Some identity -> Some (MutableSubject identity)
+  | Some _ -> Some MutableSubject
   | None -> None
 
 let make_branch_range_proof subject ~range_start ~range_upper =
   match subject with
-  | MutableSubject _ -> Error MutableSubjectCannotNarrow
-  | ImmutableSubject subject -> (
+  | MutableSubject -> Error MutableSubjectCannotNarrow
+  | ImmutableSubject -> (
       match
         make_range_proof_with_source ~source:ProofSourceCondition ~range_start
           ~range_upper
       with
-      | Some proof -> Ok { subject; proof }
+      | Some proof -> Ok proof
       | None -> Error InvalidRangeBounds)
 
-let branch_range_subject proof = proof.subject
-let branch_range_proof proof = proof.proof
+let branch_range_proof proof = proof

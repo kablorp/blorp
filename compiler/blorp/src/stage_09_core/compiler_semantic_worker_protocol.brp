@@ -1,0 +1,496 @@
+-- Typed protocol for the one temporary OCaml semantic-middle worker.
+--
+-- Blorp owns the frontend and backend around this boundary. The worker accepts
+-- post-CTFE typed programs and returns pre-DCE Core. CLI arguments, source
+-- discovery, artifact I/O, and process execution do not belong in this shape.
+import:
+	../stage_06_typecheck/compiler_typecheck_decl: CompilerTypedProgram
+	../stage_06_typecheck/compiler_typed_ast_json: compiler_typed_program_to_json
+	compiler_core_json: CoreJsonError, CoreProgram, decode_core_program_json
+	json:
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_array,
+		as_number,
+		as_string,
+		get_field,
+
+
+SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 1
+
+SEMANTIC_MIDDLE_DOMAIN: String = "compiler_semantic_middle"
+
+private SEMANTIC_MIDDLE_REQUEST_KIND: String = "compile_pre_dce"
+
+private SEMANTIC_MIDDLE_TYPED_PHASE: String = "post_ctfe"
+
+
+enum SemanticMiddleStage:
+	LowerMiddleStage
+	DebugMiddleStage
+	DesugarMiddleStage
+	MonoMiddleStage
+	SynthMiddleStage
+	MatchMiddleStage
+	TraitResolveMiddleStage
+	ResolveMiddleStage
+	StdInlineMiddleStage
+	TailrecMiddleStage
+	FusionMiddleStage
+	SpecializeMiddleStage
+
+
+enum SemanticMiddleCapability:
+	PostCtfeTypedCapability
+	PreDceCoreCapability
+	RenderedStageObservationsCapability
+
+
+record SemanticMiddleImportBinding {
+	local_name: String,
+	module_path: String,
+	original_name: Option[String]
+}
+
+
+record SemanticMiddleTypedUnit {
+	path: String,
+	module_name: String,
+	typed_program: CompilerTypedProgram,
+	import_bindings: List[SemanticMiddleImportBinding]
+}
+
+
+record SemanticMiddleRequest {
+	target: SemanticMiddleTypedUnit,
+	modules: List[SemanticMiddleTypedUnit],
+	debug: Bool,
+	require_main: Bool,
+	check_invariants: Bool,
+	required_capabilities: List[SemanticMiddleCapability],
+	observations: List[SemanticMiddleStage],
+	stop_after: Option[SemanticMiddleStage]
+}
+
+
+record SemanticMiddleObservation {
+	stage: SemanticMiddleStage,
+	rendered: String
+}
+
+
+record SemanticMiddleDiagnostic {
+	code: String,
+	message: String,
+	path: Option[String],
+	line: Int,
+	column: Int,
+	help: Option[String]
+}
+
+
+union SemanticMiddleResponse:
+	SemanticMiddleCompiled(CoreProgram, List[SemanticMiddleObservation])
+	SemanticMiddleStopped(SemanticMiddleStage, String, List[SemanticMiddleObservation])
+	SemanticMiddleFailed(List[SemanticMiddleDiagnostic])
+
+
+union SemanticMiddleProtocolError:
+	SemanticMiddleMissingField(String)
+	SemanticMiddleExpectedField(String, String)
+	SemanticMiddleUnsupportedSchema(Int)
+	SemanticMiddleUnsupportedDomain(String)
+	SemanticMiddleUnsupportedKind(String)
+	SemanticMiddleUnsupportedStage(String)
+	SemanticMiddleUnsupportedCapability(String)
+	SemanticMiddleMissingCapability(String)
+	SemanticMiddleInvalidCore(CoreJsonError)
+
+
+pure func semantic_middle_stage_name(stage: SemanticMiddleStage) -> String:
+	match stage:
+		LowerMiddleStage:
+			"lower"
+		DebugMiddleStage:
+			"debug"
+		DesugarMiddleStage:
+			"desugar"
+		MonoMiddleStage:
+			"mono"
+		SynthMiddleStage:
+			"synth"
+		MatchMiddleStage:
+			"match"
+		TraitResolveMiddleStage:
+			"trait_resolve"
+		ResolveMiddleStage:
+			"resolve"
+		StdInlineMiddleStage:
+			"std_inline"
+		TailrecMiddleStage:
+			"tailrec"
+		FusionMiddleStage:
+			"fusion"
+		SpecializeMiddleStage:
+			"specialize"
+
+
+pure func parse_semantic_middle_stage(name: String) -> Option[SemanticMiddleStage]:
+	match name:
+		"lower":
+			Some(LowerMiddleStage)
+		"debug":
+			Some(DebugMiddleStage)
+		"desugar":
+			Some(DesugarMiddleStage)
+		"mono":
+			Some(MonoMiddleStage)
+		"synth":
+			Some(SynthMiddleStage)
+		"match":
+			Some(MatchMiddleStage)
+		"trait_resolve":
+			Some(TraitResolveMiddleStage)
+		"resolve":
+			Some(ResolveMiddleStage)
+		"std_inline":
+			Some(StdInlineMiddleStage)
+		"tailrec":
+			Some(TailrecMiddleStage)
+		"fusion":
+			Some(FusionMiddleStage)
+		"specialize":
+			Some(SpecializeMiddleStage)
+		_:
+			None
+
+
+pure func semantic_middle_capability_name(
+	capability: SemanticMiddleCapability,
+) -> String:
+	match capability:
+		PostCtfeTypedCapability:
+			"typed_ast_post_ctfe"
+		PreDceCoreCapability:
+			"core_pre_dce"
+		RenderedStageObservationsCapability:
+			"rendered_stage_observations"
+
+
+pure func parse_semantic_middle_capability(
+	name: String,
+) -> Option[SemanticMiddleCapability]:
+	match name:
+		"typed_ast_post_ctfe":
+			Some(PostCtfeTypedCapability)
+		"core_pre_dce":
+			Some(PreDceCoreCapability)
+		"rendered_stage_observations":
+			Some(RenderedStageObservationsCapability)
+		_:
+			None
+
+
+private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
+	match value:
+		Some(text):
+			JsonString(text)
+		None:
+			JsonNull
+
+
+private pure func optional_stage_to_json(value: Option[SemanticMiddleStage]) -> JsonValue:
+	match value:
+		Some(stage):
+			JsonString(semantic_middle_stage_name(stage))
+		None:
+			JsonNull
+
+
+private pure func semantic_middle_import_binding_to_json(
+	binding: SemanticMiddleImportBinding,
+) -> JsonValue:
+	JsonObject([
+		("local_name", JsonString(binding.local_name)),
+		("module_path", JsonString(binding.module_path)),
+		("original_name", optional_string_to_json(binding.original_name)),
+	])
+
+
+private pure func semantic_middle_typed_unit_to_json(
+	unit: SemanticMiddleTypedUnit,
+) -> JsonValue:
+	JsonObject([
+		("path", JsonString(unit.path)),
+		("module", JsonString(unit.module_name)),
+		("typed_program", compiler_typed_program_to_json(unit.typed_program)),
+		(
+			"import_bindings",
+			JsonVector(unit.import_bindings.map(semantic_middle_import_binding_to_json)),
+		),
+	])
+
+
+pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString(SEMANTIC_MIDDLE_REQUEST_KIND)),
+		("typed_phase", JsonString(SEMANTIC_MIDDLE_TYPED_PHASE)),
+		("target", semantic_middle_typed_unit_to_json(request.target)),
+		("modules", JsonVector(request.modules.map(semantic_middle_typed_unit_to_json))),
+		("debug", JsonBool(request.debug)),
+		("require_main", JsonBool(request.require_main)),
+		("check_invariants", JsonBool(request.check_invariants)),
+		(
+			"required_capabilities",
+			JsonVector(
+				request.required_capabilities.map(
+					func(capability): JsonString(
+						semantic_middle_capability_name(capability),
+					),
+				),
+			),
+		),
+		(
+			"observations",
+			JsonVector(
+				request.observations.map(
+					func(stage): JsonString(semantic_middle_stage_name(stage)),
+				),
+			),
+		),
+		("stop_after", optional_stage_to_json(request.stop_after)),
+	])
+
+
+private pure func required_field(
+	value: JsonValue,
+	name: String,
+) -> Result[JsonValue, SemanticMiddleProtocolError]:
+	match get_field(value, name):
+		Some(field):
+			Ok(field)
+		None:
+			Err(SemanticMiddleMissingField(name))
+
+
+private pure func string_field(
+	value: JsonValue,
+	name: String,
+) -> Result[String, SemanticMiddleProtocolError]:
+	field ?= required_field(value, name)
+
+	match as_string(field):
+		Some(text):
+			Ok(text)
+		None:
+			Err(SemanticMiddleExpectedField(name, "a string"))
+
+
+private pure func int_field(
+	value: JsonValue,
+	name: String,
+) -> Result[Int, SemanticMiddleProtocolError]:
+	field ?= required_field(value, name)
+
+	match as_number(field):
+		Some(number):
+			Ok(to_int(number))
+		None:
+			Err(SemanticMiddleExpectedField(name, "a number"))
+
+
+private pure func array_field(
+	value: JsonValue,
+	name: String,
+) -> Result[List[JsonValue], SemanticMiddleProtocolError]:
+	field ?= required_field(value, name)
+
+	match as_array(field):
+		Some(items):
+			Ok(items)
+		None:
+			Err(SemanticMiddleExpectedField(name, "an array"))
+
+
+private pure func optional_string_field(
+	value: JsonValue,
+	name: String,
+) -> Result[Option[String], SemanticMiddleProtocolError]:
+	field ?= required_field(value, name)
+
+	match field:
+		JsonNull:
+			Ok(None)
+		JsonString(text):
+			Ok(Some(text))
+		_:
+			Err(SemanticMiddleExpectedField(name, "a string or null"))
+
+
+private pure func decode_semantic_middle_stage(
+	name: String,
+) -> Result[SemanticMiddleStage, SemanticMiddleProtocolError]:
+	parse_semantic_middle_stage(name).to_result(SemanticMiddleUnsupportedStage(name))
+
+
+private pure func decode_semantic_middle_capability(
+	value: JsonValue,
+) -> Result[SemanticMiddleCapability, SemanticMiddleProtocolError]:
+	match as_string(value):
+		Some(name):
+			parse_semantic_middle_capability(name).to_result(
+				SemanticMiddleUnsupportedCapability(name),
+			)
+		None:
+			Err(SemanticMiddleExpectedField("capabilities", "an array of strings"))
+
+
+private pure func decode_semantic_middle_capabilities_at(
+	items: List[JsonValue],
+	index: Int,
+) -> Result[List[SemanticMiddleCapability], SemanticMiddleProtocolError]:
+	if index >= items.length():
+		Ok([])
+	else:
+		item ?= items.get(index).to_result(
+			SemanticMiddleExpectedField("capabilities", "an array item"),
+		)
+		capability ?= decode_semantic_middle_capability(item)
+		rest ?= decode_semantic_middle_capabilities_at(items, index + 1)
+		Ok([capability].concat(rest))
+
+
+private pure func decode_semantic_middle_capabilities(
+	value: JsonValue,
+) -> Result[List[SemanticMiddleCapability], SemanticMiddleProtocolError]:
+	items ?= array_field(value, "capabilities")
+	capabilities ?= decode_semantic_middle_capabilities_at(items, 0)
+
+	if not capabilities.contains(PostCtfeTypedCapability):
+		Err(SemanticMiddleMissingCapability("typed_ast_post_ctfe"))
+	else if not capabilities.contains(PreDceCoreCapability):
+		Err(SemanticMiddleMissingCapability("core_pre_dce"))
+	else if not capabilities.contains(RenderedStageObservationsCapability):
+		Err(SemanticMiddleMissingCapability("rendered_stage_observations"))
+	else:
+		Ok(capabilities)
+
+
+private pure func decode_semantic_middle_observation(
+	value: JsonValue,
+) -> Result[SemanticMiddleObservation, SemanticMiddleProtocolError]:
+	stage_name ?= string_field(value, "stage")
+	stage ?= decode_semantic_middle_stage(stage_name)
+	rendered ?= string_field(value, "rendered")
+	Ok({stage = stage, rendered = rendered})
+
+
+private pure func decode_semantic_middle_observations_at(
+	items: List[JsonValue],
+	index: Int,
+) -> Result[List[SemanticMiddleObservation], SemanticMiddleProtocolError]:
+	if index >= items.length():
+		Ok([])
+	else:
+		item ?= items.get(index).to_result(
+			SemanticMiddleExpectedField("observations", "an array item"),
+		)
+		observation ?= decode_semantic_middle_observation(item)
+		rest ?= decode_semantic_middle_observations_at(items, index + 1)
+		Ok([observation].concat(rest))
+
+
+private pure func decode_semantic_middle_observations(
+	value: JsonValue,
+) -> Result[List[SemanticMiddleObservation], SemanticMiddleProtocolError]:
+	items ?= array_field(value, "observations")
+	decode_semantic_middle_observations_at(items, 0)
+
+
+private pure func decode_semantic_middle_diagnostic(
+	value: JsonValue,
+) -> Result[SemanticMiddleDiagnostic, SemanticMiddleProtocolError]:
+	code ?= string_field(value, "code")
+	message ?= string_field(value, "message")
+	path ?= optional_string_field(value, "path")
+	line ?= int_field(value, "line")
+	column ?= int_field(value, "column")
+	help ?= optional_string_field(value, "help")
+
+	Ok({
+		code = code,
+		message = message,
+		path = path,
+		line = line,
+		column = column,
+		help = help,
+	})
+
+
+private pure func decode_semantic_middle_diagnostics_at(
+	items: List[JsonValue],
+	index: Int,
+) -> Result[List[SemanticMiddleDiagnostic], SemanticMiddleProtocolError]:
+	if index >= items.length():
+		Ok([])
+	else:
+		item ?= items.get(index).to_result(
+			SemanticMiddleExpectedField("diagnostics", "an array item"),
+		)
+		diagnostic ?= decode_semantic_middle_diagnostic(item)
+		rest ?= decode_semantic_middle_diagnostics_at(items, index + 1)
+		Ok([diagnostic].concat(rest))
+
+
+private pure func decode_semantic_middle_diagnostics(
+	value: JsonValue,
+) -> Result[List[SemanticMiddleDiagnostic], SemanticMiddleProtocolError]:
+	items ?= array_field(value, "diagnostics")
+	decode_semantic_middle_diagnostics_at(items, 0)
+
+
+private pure func validate_semantic_middle_response_envelope(
+	value: JsonValue,
+) -> Result[Void, SemanticMiddleProtocolError]:
+	schema ?= int_field(value, "schema")
+
+	if schema != SEMANTIC_MIDDLE_SCHEMA_VERSION:
+		Err(SemanticMiddleUnsupportedSchema(schema))
+	else:
+		domain ?= string_field(value, "domain")
+
+		if domain != SEMANTIC_MIDDLE_DOMAIN:
+			Err(SemanticMiddleUnsupportedDomain(domain))
+		else:
+			Ok(void)
+
+
+pure func decode_semantic_middle_response_value(
+	value: JsonValue,
+) -> Result[SemanticMiddleResponse, SemanticMiddleProtocolError]:
+	envelope_valid ?= validate_semantic_middle_response_envelope(value)
+	capabilities ?= decode_semantic_middle_capabilities(value)
+	kind ?= string_field(value, "kind")
+
+	match kind:
+		"compiled":
+			core_value ?= required_field(value, "core")
+
+			match decode_core_program_json(core_value):
+				Ok(core):
+					observations ?= decode_semantic_middle_observations(value)
+					Ok(SemanticMiddleCompiled(core, observations))
+				Err(error):
+					Err(SemanticMiddleInvalidCore(error))
+		"stopped":
+			stage_name ?= string_field(value, "stage")
+			stage ?= decode_semantic_middle_stage(stage_name)
+			rendered ?= string_field(value, "rendered")
+			observations ?= decode_semantic_middle_observations(value)
+			Ok(SemanticMiddleStopped(stage, rendered, observations))
+		"failed":
+			diagnostics ?= decode_semantic_middle_diagnostics(value)
+			Ok(SemanticMiddleFailed(diagnostics))
+		_:
+			Err(SemanticMiddleUnsupportedKind(kind))

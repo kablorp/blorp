@@ -1,5 +1,10 @@
 -- Source reading, package source resolution, and import graph discovery for the Blorp CLI.
 import:
+	../stage_03_parse/compiler_parsed_ast:
+		ParsedProgramPhase(TypecheckSourceProgram),
+		parsed_program_phase_name,
+	../stage_03_parse/compiler_parser_bridge as ParserBridge
+	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
 	compiler_bridge_protocol: BRIDGE_DOMAIN, BRIDGE_SCHEMA_VERSION
 	compiler_cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
 	compiler_cli_artifact_json: cli_compile_options_json, cli_run_options_json
@@ -20,9 +25,6 @@ import:
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
-	../stage_03_parse/compiler_parsed_ast: ParsedProgramPhase(TypecheckSourceProgram), parsed_program_phase_name
-	../stage_03_parse/compiler_parser_bridge as ParserBridge
 	fs: message, open_read, read_text
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -54,7 +56,9 @@ private pure func owned_json(value: JsonValue) -> JsonValue:
 		JsonVector(items):
 			JsonVector(items.map(owned_json))
 		JsonObject(fields):
-			JsonObject(fields.map(func(field): (owned_string(field[0]), owned_json(field[1]))))
+			JsonObject(fields.map(
+				func(field): (owned_string(field[0]), owned_json(field[1])),
+			))
 
 
 private pure func cli_frontend_ast_phase_name() -> String:
@@ -312,11 +316,11 @@ private pure func parse_source_request_value(
 		("domain", JsonString(BRIDGE_DOMAIN)),
 		("action", JsonString("parse_source")),
 		("payload", JsonObject([
-				("path", JsonString(path)),
-				("module", JsonString(module_name)),
-				("text", JsonString(source)),
-				("ast_phase", JsonString(cli_frontend_ast_phase_name())),
-			])),
+			("path", JsonString(path)),
+			("module", JsonString(module_name)),
+			("text", JsonString(source)),
+			("ast_phase", JsonString(cli_frontend_ast_phase_name())),
+		])),
 	])
 
 
@@ -328,17 +332,16 @@ private pure func parse_source_item_request_value(source: CliSourceFile) -> Json
 	])
 
 
-
 private pure func parse_sources_request_value(sources: List[CliSourceFile]) -> JsonValue:
 	JsonObject([
 		("schema", JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))),
 		("domain", JsonString(BRIDGE_DOMAIN)),
 		("action", JsonString("parse_sources")),
 		("payload", JsonObject([
-				("include_comments", JsonBool(False)),
-				("ast_phase", JsonString(cli_frontend_ast_phase_name())),
-				("sources", JsonVector(sources.map(parse_source_item_request_value))),
-			])),
+			("include_comments", JsonBool(False)),
+			("ast_phase", JsonString(cli_frontend_ast_phase_name())),
+			("sources", JsonVector(sources.map(parse_source_item_request_value))),
+		])),
 	])
 
 
@@ -599,6 +602,7 @@ private func absolute_path(path: String) -> String:
 private func module_name_for_resolved_source_path(path: String) -> String:
 	cwd: String = normalize(getcwd())
 	absolute: String = absolute_path(path)
+
 	relative: String = if is_path_under_dir(cwd, absolute):
 		strip_prefix(cwd + "/", absolute)
 	else:
@@ -1247,12 +1251,62 @@ private func source_package_for_path(
 		result
 
 
+private func path_is_in_configured_std(context: CliFrontendGraphContext, path: String) -> Bool:
+	match context.std_dir:
+		Some(std_dir):
+			is_path_under_dir(absolute_path(std_dir), absolute_path(path))
+		None:
+			False
+
+
+private func configured_std_module_name(
+	context: CliFrontendGraphContext,
+	path: String,
+) -> Option[String]:
+	match context.std_dir:
+		Some(std_dir):
+			std_root: String = absolute_path(std_dir)
+			absolute: String = absolute_path(path)
+
+			if is_path_under_dir(std_root, absolute):
+				relative: String = strip_prefix(std_root + "/", absolute)
+
+				without_extension: String = if relative.ends_with(".brp"):
+					relative.substring(0, relative.length() - 4)
+				else:
+					relative
+
+				Some("std/" + without_extension)
+			else:
+				None
+		None:
+			None
+
+
+private func normalize_root_module_name(
+	context: CliFrontendGraphContext,
+	source: CliParsedSourceFile,
+) -> CliParsedSourceFile:
+	match configured_std_module_name(context, source.path):
+		Some(module_name):
+			{ source | module_name = module_name }
+		None:
+			source
+
+
+private func normalize_root_module_names(
+	context: CliFrontendGraphContext,
+	roots: List[CliParsedSourceFile],
+) -> List[CliParsedSourceFile]:
+	roots.map(func(source): normalize_root_module_name(context, source))
+
+
 private func frontend_module_origin_for_path(
 	context: CliFrontendGraphContext,
 	path: String,
 	module_name: String,
 ) -> CliFrontendModuleOrigin:
-	if module_name.starts_with("std/"):
+	if module_name.starts_with("std/") or path_is_in_configured_std(context, path):
 		CliFrontendStdModule
 	else if module_name.starts_with("pkg/"):
 		match split_module_ref(strip_prefix("pkg/", module_name)):
@@ -1682,12 +1736,11 @@ record CliSourceGraphWalk {
 
 
 private func source_graph_walk_for_roots(
-	action: CliAction,
+	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliSourceGraphWalk, String]:
 	var modules: List[CliParsedSourceFile] = []
 	var import_edges: List[CliFrontendImportEdge] = []
-	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
 	var seen_sources: List[CliSourceIdentity] = parsed_source_identities(roots)
 	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_sources)
 	seen_sources = initial.seen_sources
@@ -1732,7 +1785,9 @@ func source_graph_modules_for_roots(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
 ) -> Result[List[CliParsedSourceFile], String]:
-	walk ?= source_graph_walk_for_roots(action, roots)
+	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
+	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
+	walk ?= source_graph_walk_for_roots(context, normalized_roots)
 	Ok(walk.modules)
 
 
@@ -1744,14 +1799,15 @@ func frontend_module_graph_for_roots(
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
 	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
-	walk ?= source_graph_walk_for_roots(action, roots)
+	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
+	walk ?= source_graph_walk_for_roots(context, normalized_roots)
 
 	Ok({
 		command = command,
 		args = user_args,
 		options = options,
 		context = context,
-		roots = frontend_graph_sources(context, roots),
+		roots = frontend_graph_sources(context, normalized_roots),
 		modules = frontend_graph_sources(context, walk.modules),
 		import_edges = walk.import_edges,
 		diagnostics = [],

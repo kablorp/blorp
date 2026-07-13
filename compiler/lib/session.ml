@@ -92,14 +92,6 @@ let module_origin_allows_foreign = function
   | Native_package_module _ | User_module -> true
   | Stdlib_module | Package_module _ -> false
 
-let module_origin_label = function
-  | Stdlib_module -> "standard library"
-  | User_module -> "user module"
-  | Native_package_module id ->
-      Printf.sprintf "native package '%s'" (package_id_name id)
-  | Package_module id ->
-      Printf.sprintf "source package '%s'" (package_id_name id)
-
 type loaded_module = {
   name : string;  (** Canonical name: "std/list", "./utils". *)
   path : string;  (** "/abs/path/to/file.brp" or "<embedded:std/list>". *)

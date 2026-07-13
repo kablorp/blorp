@@ -43,23 +43,14 @@ let resolve ?(qualify_owner = Fun.id) ctx source =
 let resolve_canonical ?qualify_owner ctx source =
   (resolve ?qualify_owner ctx source).canonical
 
-let annotation = resolve
 let annotation_canonical = resolve_canonical
 let value_ascription = resolve
-let value_ascription_canonical = resolve_canonical
 let local_binding_annotation = resolve
-let local_binding_annotation_canonical = resolve_canonical
 let function_parameter_annotation = resolve
-let function_parameter_annotation_canonical = resolve_canonical
 let function_return_annotation = resolve
-let function_return_annotation_canonical = resolve_canonical
-let imported_signature = resolve
 let imported_signature_canonical = resolve_canonical
-let record_field_type = resolve
 let record_field_type_canonical = resolve_canonical
-let variant_field_type = resolve
 let variant_field_type_canonical = resolve_canonical
-let type_alias_target = resolve
 let type_alias_target_canonical = resolve_canonical
 let source resolved = resolved.source
 let canonical resolved = resolved.canonical

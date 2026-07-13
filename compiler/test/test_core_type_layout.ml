@@ -21,14 +21,16 @@ let expect_known_layout name expected actual =
       Alcotest.failf "%s: expected known layout, got invalid type: %s" name msg
 
 let expect_release name expected meta ty =
+  let layout = Blorp.Core_type_layout.layout_or_error meta ty in
   Alcotest.(check bool)
     name expected
-    (Blorp.Core_type_layout.requires_release_or_error meta ty)
+    (layout.release = Blorp.Core_type_layout.ArcRelease)
 
 let expect_retain name expected meta ty =
+  let layout = Blorp.Core_type_layout.layout_or_error meta ty in
   Alcotest.(check bool)
     name expected
-    (Blorp.Core_type_layout.requires_retain_or_error meta ty)
+    (layout.retain = Blorp.Core_type_layout.ArcRetain)
 
 let expect_boxed_release name expected meta ty =
   Alcotest.(check bool)

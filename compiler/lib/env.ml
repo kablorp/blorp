@@ -596,11 +596,6 @@ let get_func_info (env : env) (name : string) :
       Some (func_type, type_params, purity)
   | _ -> None
 
-let get_func_callable_id (env : env) (name : string) : def_id option =
-  match lookup env name with
-  | Some { kind = FuncSymbol { callable_id; _ }; _ } -> Some callable_id
-  | _ -> None
-
 let get_func_loop_producer (env : env) (name : string) : loop_producer option =
   match lookup env name with
   | Some { kind = FuncSymbol { loop_producer; _ }; _ } -> loop_producer
@@ -667,12 +662,6 @@ let get_constructor (env : env) (name : string) :
         _;
       } ->
       Some (parent_type, type_params, field_types, tag)
-  | _ -> None
-
-let get_constructor_callable_id (env : env) (name : string) : int option =
-  match lookup env name with
-  | Some { kind = ConstructorSymbol { constructor_id; _ }; _ } ->
-      Some constructor_id
   | _ -> None
 
 (** Get a record declaration *)
@@ -1135,22 +1124,6 @@ let format_overload_ref (name : string) (entry : overload_entry) : string =
   match entry.ol_module_path with
   | Some path -> Printf.sprintf "%s (from %s)" name path
   | None -> name
-
-(** Render a list of overload candidates for a diagnostic — one per
-    line, each qualified via [format_overload_ref]. Used when an
-    overload set is ambiguous and the error message should enumerate
-    all candidate sources so the user can pick one. Empty list
-    returns the empty string; callers should treat that as "no
-    candidates to list" and fall back to a bare-name message. *)
-let format_overload_candidates (name : string) (entries : overload_entry list) :
-    string =
-  match entries with
-  | [] -> ""
-  | _ ->
-      String.concat "\n"
-        (List.map
-           (fun e -> Printf.sprintf "  - %s" (format_overload_ref name e))
-           entries)
 
 (** Check if a trait has another trait as a supertrait (transitively).
     Walks the supertrait graph with a visited-set to stop at back-edges.

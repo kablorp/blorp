@@ -312,8 +312,11 @@ let builtin_c_mapping =
       ((N.mod_tensor, "set_index"), "blorp_vector_set_cow");
       ((N.mod_vector, "clear"), "blorp_vector_clear");
       ((N.mod_vector, "zip"), "blorp_vector_zip");
-      ((N.mod_vector, "max"), "blorp_vector_max_int");
-      ((N.mod_vector, "min"), "blorp_vector_min_int");
+      (* Element-specific vector reductions are selected in Core_specialize.
+         Resolving these directly to the Int runtime would erase the tensor
+         element type before that phase can choose the correct ABI. *)
+      ((N.mod_vector, "max"), "blorp_max");
+      ((N.mod_vector, "min"), "blorp_min");
       ((N.mod_vector, "norm"), "blorp_vector_norm");
       ((N.mod_vector, "cross"), "blorp_vector_cross_float");
       ((N.mod_vector, "exp"), "blorp_vector_exp");

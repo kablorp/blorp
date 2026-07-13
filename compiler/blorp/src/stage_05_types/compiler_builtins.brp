@@ -24,7 +24,13 @@ import:
 		compiler_trait_method_sig,
 	compiler_generic_params: compiler_make_bound_type_param
 	compiler_type:
-		CompilerType(CompilerFunctionType, CompilerNamedType, CompilerSelfType, CompilerTypeVar),
+		CompilerType(
+			CompilerArrayType,
+			CompilerFunctionType,
+			CompilerNamedType,
+			CompilerSelfType,
+			CompilerTypeVar,
+		),
 		compiler_type_bool,
 		compiler_type_char,
 		compiler_type_float,
@@ -165,6 +171,7 @@ private pure func compiler_impure_names() -> List[String]:
 		"now",
 		"now_us",
 		"channel",
+		"seal",
 		"try_send",
 		"try_recv",
 		"try_send_attempt",
@@ -460,6 +467,56 @@ private pure func compiler_add_builtin_generic_func(
 			)
 
 
+private pure func compiler_add_scalar_conversion_builtin(
+	env: CompilerEnv,
+	name: String,
+	result_type: CompilerType,
+) -> CompilerEnv:
+	compiler_add_builtin_generic_func(
+		env,
+		name,
+		["T"],
+		fn_type([CompilerTypeVar("T")], result_type),
+	)
+
+
+private pure func compiler_add_tensor_constructor_builtin(
+	env: CompilerEnv,
+	name: String,
+	dim_names: List[String],
+) -> CompilerEnv:
+	dims = dim_names.map(func(dim_name): CompilerTypeVar(dim_name))
+	compiler_add_builtin_generic_func(
+		env,
+		name,
+		["T"].concat(dim_names),
+		fn_type(
+			[CompilerTypeVar("T")].concat(
+				dim_names.map(func(_): compiler_type_int()),
+			),
+			CompilerArrayType(CompilerTypeVar("T"), dims),
+		),
+	)
+
+
+private pure func compiler_add_checked_read_builtin(
+	env: CompilerEnv,
+	name: String,
+	index_count: Int,
+) -> CompilerEnv:
+	var params: List[CompilerType] = [CompilerTypeVar("T")]
+
+	for _ in 0..index_count:
+		params = params.append(compiler_type_int())
+
+	compiler_add_builtin_generic_func(
+		env,
+		name,
+		["T"],
+		fn_type(params, CompilerTypeVar("T")),
+	)
+
+
 private pure func compiler_add_resource_builtin_generic_func(
 	env: CompilerEnv,
 	name: String,
@@ -688,6 +745,7 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 	var result: CompilerEnv = env
 	list_of_t: CompilerType = CompilerNamedType("List", [CompilerTypeVar("T")])
 	channel_of_t: CompilerType = CompilerNamedType("Channel", [CompilerTypeVar("T")])
+	option_of_t: CompilerType = CompilerNamedType("Option", [CompilerTypeVar("T")])
 
 	result = compiler_add_builtin_generic_func(
 		result,
@@ -719,6 +777,22 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		["T"],
 		fn_type([CompilerTypeVar("T")], compiler_type_char()),
 	)
+
+	for (name, result_type) in [
+		("to_int8", CompilerNamedType("Int8", [])),
+		("to_int16", CompilerNamedType("Int16", [])),
+		("to_int32", CompilerNamedType("Int32", [])),
+		("to_int128", CompilerNamedType("Int128", [])),
+		("to_uint8", CompilerNamedType("UInt8", [])),
+		("to_uint16", CompilerNamedType("UInt16", [])),
+		("to_uint32", CompilerNamedType("UInt32", [])),
+		("to_uint64", CompilerNamedType("UInt64", [])),
+		("to_uint128", CompilerNamedType("UInt128", [])),
+		("to_float16", CompilerNamedType("Float16", [])),
+		("to_float32", CompilerNamedType("Float32", [])),
+	]:
+		result = compiler_add_scalar_conversion_builtin(result, name, result_type)
+
 	result = compiler_add_builtin_generic_func(
 		result,
 		"equals",
@@ -755,6 +829,69 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		["T"],
 		fn_type([list_of_t], list_of_t),
 	)
+
+	for name in ["bit_and", "bit_or", "bit_xor"]:
+		result = compiler_add_builtin_generic_func(
+			result,
+			name,
+			["T"],
+			fn_type(
+				[CompilerTypeVar("T"), CompilerTypeVar("T")],
+				CompilerTypeVar("T"),
+			),
+		)
+
+	result = compiler_add_builtin_generic_func(
+		result,
+		"bit_not",
+		["T"],
+		fn_type([CompilerTypeVar("T")], CompilerTypeVar("T")),
+	)
+
+	for name in ["shift_left", "shift_right"]:
+		result = compiler_add_builtin_generic_func(
+			result,
+			name,
+			["T"],
+			fn_type(
+				[CompilerTypeVar("T"), compiler_type_int()],
+				CompilerTypeVar("T"),
+			),
+		)
+
+	for name in ["checked_div", "checked_mod"]:
+		result = compiler_add_builtin_func(
+			result,
+			name,
+			fn_type(
+				[compiler_type_int(), compiler_type_int()],
+				CompilerNamedType("Option", [compiler_type_int()]),
+			),
+		)
+
+	result = compiler_add_tensor_constructor_builtin(result, "vector", ["#N"])
+	result = compiler_add_tensor_constructor_builtin(
+		result,
+		"matrix",
+		["#N", "#M"],
+	)
+
+	result = compiler_add_tensor_constructor_builtin(
+		result,
+		"tensor3",
+		["#X", "#Y", "#Z"],
+	)
+	result = compiler_add_tensor_constructor_builtin(
+		result,
+		"tensor4",
+		["#A", "#B", "#C", "#D"],
+	)
+	result = compiler_add_tensor_constructor_builtin(
+		result,
+		"tensor5",
+		["#A", "#B", "#C", "#D", "#E"],
+	)
+
 	result = compiler_add_builtin_generic_func(
 		result,
 		"checked_get",
@@ -767,6 +904,12 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 			),
 		),
 	)
+
+	result = compiler_add_checked_read_builtin(result, "matrix_checked_get", 2)
+	result = compiler_add_checked_read_builtin(result, "tensor3_checked_get", 3)
+	result = compiler_add_checked_read_builtin(result, "tensor4_checked_get", 4)
+	result = compiler_add_checked_read_builtin(result, "tensor5_checked_get", 5)
+
 	result = compiler_add_builtin_generic_func(
 		result,
 		"assert_shape",
@@ -785,7 +928,7 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		["T"],
 		impure_fn_type(
 			[channel_of_t, CompilerTypeVar("T")],
-			compiler_type_void(),
+			compiler_type_bool(),
 		),
 		CompilerResourceResultOrdinary,
 	)
@@ -793,8 +936,15 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		result,
 		"recv",
 		["T"],
-		impure_fn_type([channel_of_t], CompilerTypeVar("T")),
+		impure_fn_type([channel_of_t], option_of_t),
 		CompilerResourceResultDependent,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"seal",
+		["T"],
+		impure_fn_type([channel_of_t], compiler_type_void()),
+		CompilerResourceResultOrdinary,
 	)
 
 	match compiler_env_mint_def_id(result):

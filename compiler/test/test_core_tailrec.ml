@@ -16,6 +16,11 @@ let cint n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let cvoid = mk ty_void CVoid
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
 
+let borrowed_match_binding_pairs bindings =
+  List.map
+    (fun (binding, accessor) -> borrowed_match_binding binding accessor)
+    bindings
+
 let resource_scope name ty acquire body cleanup =
   mk body.ty
     (CResourceScope
@@ -153,7 +158,16 @@ let test_list_spread_recur_omits_list_rebind () =
         "cursor name is explicit" true
         (String.length tls_cursor_var.vname > 0);
       match rewritten_tree with
-      | CTSwitchLen { ctl_len_geq = Some (_, CTLeaf { ct_body; _ }); _ } -> (
+      | CTSwitchLen
+          {
+            ctl_len_geq = Some (_, CTLeaf { ct_bindings; ct_body });
+            _;
+          } -> (
+          Alcotest.(check bool)
+            "spread binding removed" false
+            (List.exists
+               (fun binding -> Var.equal binding.mb_var rest)
+               ct_bindings);
           match ct_body.desc with
           | CTailrecRecur
               (TailrecListSpreadRecur { tr_rebinds; tr_cursor_advance }) ->

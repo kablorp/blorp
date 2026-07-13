@@ -30,6 +30,13 @@ for history.
   aggressive OCaml-to-Blorp compiler migration, including explicit JSON
   boundaries, current Blorp-owned CLI/parser and Core-tail edges, and
   deletion-first merge points.
+- [BLORP_OCAML_HOST_EXIT_ROADMAP.md](BLORP_OCAML_HOST_EXIT_ROADMAP.md) is the
+  execution plan for replacing serialized CLI-plan delegation with one narrow
+  semantic-middle worker and moving artifact, C compiler, and program effects
+  into Blorp.
+- [COMPILER_OWNERSHIP_HARDENING_ROADMAP.md](COMPILER_OWNERSHIP_HARDENING_ROADMAP.md)
+  is the active checkpoint-10 plan for stabilizing the focused late-Core
+  surface before resuming production-boundary migration.
 - [FRONTEND_SOURCE_AST_ROADMAP.md](FRONTEND_SOURCE_AST_ROADMAP.md) details the
   next contiguous frontend slice: raw parse vs typecheck-ready source AST,
   interpolation finalization, nested function hoisting, and subscript-read

@@ -1,0 +1,523 @@
+-- Attach concrete runtime storage to list-producing Core nodes.
+--
+-- Layout is derived from the program's declarations and the list element type.
+-- Later passes consume the explicit layout instead of repeating type-name
+-- guesses at each allocation or handoff site.
+import:
+	../stage_09_core/compiler_core_json:
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(ListAllocExpr, ListConstructExpr, ListHandoffExpr),
+		CoreFunction,
+		CoreGlobal,
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreProgram,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	../stage_09_core/compiler_core_traverse: map_core_expr_children
+	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
+
+
+INLINE_WIDTH_1: Int = 1
+
+INLINE_WIDTH_2: Int = 2
+
+INLINE_WIDTH_4: Int = 4
+
+INLINE_WIDTH_8: Int = 8
+
+
+private pure func alias_type_argument(
+	params: List[String],
+	args: List[CoreType],
+	name: String,
+) -> Option[CoreType]:
+	var result: Option[CoreType] = None
+	var index: Int = 0
+
+	while index < params.length() and result.is_none():
+		match (params.get(index), args.get(index)):
+			(Some(param), Some(arg)):
+				if param == name:
+					result = Some(arg)
+			(Some(_), None) | (None, Some(_)) | (None, None):
+				void
+
+		index += 1
+
+	result
+
+
+private pure func substitute_alias_type(
+	typ: CoreType,
+	params: List[String],
+	args: List[CoreType],
+) -> CoreType:
+	match typ:
+		NamedType(name, nested_args):
+			if nested_args.length() == 0:
+				alias_type_argument(params, args, name).get_or(typ)
+			else:
+				NamedType(
+					name,
+					nested_args.map(func(arg): substitute_alias_type(arg, params, args)),
+				)
+		StackResultType(ok_type, err_type):
+			StackResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		BoxedResultType(ok_type, err_type):
+			BoxedResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		TensorType(info):
+			TensorType(
+				{ info | element_type = substitute_alias_type(info.element_type, params, args) },
+			)
+		TupleType(items):
+			TupleType(items.map(
+				func(item): substitute_alias_type(item, params, args),
+			))
+		_:
+			typ
+
+
+private pure func find_alias_expansion(
+	program: CoreProgram,
+	name: String,
+	args: List[CoreType],
+) -> Option[CoreType]:
+	var result: Option[CoreType] = None
+
+	for decl in program.decls:
+		match decl:
+			TypeAliasDecl(alias_decl):
+				if alias_decl.name == name and alias_decl.type_params.length() == args.length():
+					result = Some(
+						substitute_alias_type(
+							alias_decl.target,
+							alias_decl.type_params,
+							args,
+						),
+					)
+					break
+			_:
+				void
+
+	result
+
+
+private pure func canonical_declared_type(
+	program: CoreProgram,
+	name: String,
+	args: List[CoreType],
+) -> CoreType:
+	if args.length() != 0:
+		NamedType(name, args)
+	else:
+		var result: CoreType = NamedType(name, args)
+
+		for decl in program.decls:
+			match decl:
+				EnumDecl(enum_decl):
+					if enum_decl.name == name:
+						result = EnumType(name)
+						break
+				ValueRecordDecl(record_decl):
+					if record_decl.name == name:
+						result = ValueRecordType(name)
+						break
+				HeapRecordDecl(record_decl):
+					if record_decl.name == name:
+						result = HeapRecordType(name)
+						break
+				UnionDecl(union_decl):
+					if union_decl.name == name:
+						result = UnionType(name)
+						break
+				_:
+					void
+
+		result
+
+
+private pure func resolve_type(
+	program: CoreProgram,
+	typ: CoreType,
+	seen_aliases: List[String],
+) -> CoreType:
+	match typ:
+		NamedType(name, args):
+			resolved_args: List[CoreType] = args.map(
+				func(arg): resolve_type(program, arg, seen_aliases),
+			)
+
+			if seen_aliases.contains(name):
+				canonical_declared_type(program, name, resolved_args)
+			else:
+				match find_alias_expansion(program, name, resolved_args):
+					Some(target):
+						resolve_type(
+							program,
+							target,
+							seen_aliases.append(name),
+						)
+					None:
+						canonical_declared_type(program, name, resolved_args)
+		StackResultType(ok_type, err_type):
+			StackResultType(
+				resolve_type(program, ok_type, seen_aliases),
+				resolve_type(program, err_type, seen_aliases),
+			)
+		BoxedResultType(ok_type, err_type):
+			BoxedResultType(
+				resolve_type(program, ok_type, seen_aliases),
+				resolve_type(program, err_type, seen_aliases),
+			)
+		TensorType(info):
+			TensorType(
+				{ info | element_type = resolve_type(program, info.element_type, seen_aliases) },
+			)
+		TupleType(items):
+			TupleType(items.map(
+				func(item): resolve_type(program, item, seen_aliases),
+			))
+		_:
+			typ
+
+
+pure func resolve_layout_type(program: CoreProgram, typ: CoreType) -> CoreType:
+	resolve_type(program, typ, [])
+
+
+private pure func list_element_type(program: CoreProgram, typ: CoreType) -> Option[CoreType]:
+	match resolve_layout_type(program, typ):
+		NamedType(name, args):
+			if name == "List":
+				match args:
+					[element_type]:
+						Some(resolve_layout_type(program, element_type))
+					_:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func primitive_inline_width(name: String) -> Option[Int]:
+	if (
+		name == "Bool"
+		or name == "Int8"
+		or name == "UInt8"
+	):
+		Some(INLINE_WIDTH_1)
+	else if (
+		name == "Int16"
+		or name == "UInt16"
+		or name == "Float16"
+	):
+		Some(INLINE_WIDTH_2)
+	else if (
+		name == "Char"
+		or name == "Int32"
+		or name == "UInt32"
+		or name == "Float32"
+	):
+		Some(INLINE_WIDTH_4)
+	else if (
+		name == "Int"
+		or name == "Int64"
+		or name == "UInt64"
+		or name == "Float"
+	):
+		Some(INLINE_WIDTH_8)
+	else:
+		None
+
+
+private pure func enum_inline_width(program: CoreProgram, name: String) -> Option[Int]:
+	var max_tag: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			EnumDecl(enum_decl):
+				if enum_decl.name == name:
+					for variant in enum_decl.variants:
+						max_tag = match max_tag:
+							Some(current):
+								if variant.tag > current:
+									Some(variant.tag)
+								else:
+									Some(current)
+							None:
+								Some(variant.tag)
+
+					break
+			_:
+				void
+
+	match max_tag:
+		Some(tag):
+			if tag <= 255:
+				Some(INLINE_WIDTH_1)
+			else if tag <= 65535:
+				Some(INLINE_WIDTH_2)
+			else if tag <= 4294967295:
+				Some(INLINE_WIDTH_4)
+			else:
+				Some(INLINE_WIDTH_8)
+		None:
+			None
+
+
+private pure func named_decl_layout(
+	program: CoreProgram,
+	name: String,
+) -> Option[CoreListStorageLayout]:
+	var result: Option[CoreListStorageLayout] = None
+
+	for decl in program.decls:
+		match decl:
+			EnumDecl(enum_decl):
+				if enum_decl.name == name:
+					result = match enum_inline_width(program, name):
+						Some(width):
+							Some(InlineListStorage(width))
+						None:
+							None
+
+					break
+			ValueRecordDecl(record_decl):
+				if record_decl.name == name:
+					result = Some(InlineStructListStorage(name))
+					break
+			_:
+				void
+
+	result
+
+
+private pure func list_layout_for_element_type(
+	program: CoreProgram,
+	element_type: CoreType,
+) -> CoreListStorageLayout:
+	element: CoreType = resolve_layout_type(program, element_type)
+
+	match element:
+		NamedType(name, args):
+			match primitive_inline_width(name):
+				Some(width):
+					if args.length() == 0:
+						InlineListStorage(width)
+					else:
+						PointerListStorage
+				None:
+					if name == "Option":
+						match args:
+							[payload_type]:
+								match TypeLayout.stack_option_c_type(
+									resolve_layout_type(
+										program,
+										payload_type,
+									),
+								):
+									Some(c_type):
+										InlineStructListStorage(c_type)
+									None:
+										PointerListStorage
+							_:
+								PointerListStorage
+					else:
+						match named_decl_layout(program, name):
+							Some(layout):
+								layout
+							None:
+								PointerListStorage
+		EnumType(name):
+			match enum_inline_width(program, name):
+				Some(width):
+					InlineListStorage(width)
+				None:
+					PointerListStorage
+		ValueRecordType(name):
+			InlineStructListStorage(name)
+		RangeType:
+			InlineListStorage(INLINE_WIDTH_8)
+		_:
+			PointerListStorage
+
+
+pure func list_layout_for_type(program: CoreProgram, list_type: CoreType) -> CoreListStorageLayout:
+	match list_element_type(program, list_type):
+		Some(element_type):
+			list_layout_for_element_type(program, element_type)
+		None:
+			PointerListStorage
+
+
+private pure func named_pointer_element_needs_release(name: String, args: List[CoreType]) -> Bool:
+	(
+		name == "String" and args.length() == 0
+		or name == "LiteralString" and args.length() == 0
+		or name == "Bytes" and args.length() == 0
+		or name == "Fixed" and args.length() == 0
+		or name == "Int128" and args.length() == 0
+		or name == "UInt128" and args.length() == 0
+		or name == "List" and args.length() == 1
+		or name == "Dict" and args.length() == 2
+		or name == "Set" and args.length() == 1
+		or name == "Channel" and args.length() == 1
+		or name == "Closure" and args.length() == 0
+		or name == "Stream" and args.length() == 1
+		or name == "FallibleStream" and args.length() == 2
+		or name == "Option" and args.length() == 1
+		or name == "Result" and args.length() == 2
+	)
+
+
+private pure func named_decl_needs_release(program: CoreProgram, name: String) -> Bool:
+	program.decls.any(func(decl):
+		match decl:
+			HeapRecordDecl(record_decl):
+				record_decl.name == name
+			UnionDecl(union_decl):
+				union_decl.name == name
+			_:
+				False
+	)
+
+
+pure func list_element_needs_release(program: CoreProgram, typ: CoreType) -> Bool:
+	element: CoreType = resolve_layout_type(program, typ)
+
+	match list_layout_for_element_type(program, element):
+		InlineListStorage(_):
+			False
+		InlineStructListStorage(_):
+			False
+		PointerListStorage:
+			match element:
+				NamedType(name, args):
+					(
+						named_pointer_element_needs_release(name, args)
+						or named_decl_needs_release(program, name)
+					)
+				HeapRecordType(_):
+					True
+				UnionType(_):
+					True
+				StackResultType(_, _):
+					True
+				BoxedResultType(_, _):
+					True
+				TensorType(_):
+					True
+				TupleType(_):
+					True
+				_:
+					False
+
+
+private pure func relayout_expr(program: CoreProgram, expr: CoreExpr) -> CoreExpr:
+	rewritten_children: CoreExpr = map_core_expr_children(
+		expr,
+		pure func(child): relayout_expr(program, child),
+	)
+
+	match rewritten_children:
+		ListConstructExpr(construct, typ, loc):
+			element_type: Option[CoreType] = list_element_type(program, typ)
+			ListConstructExpr(
+				{ construct |
+					layout = list_layout_for_type(program, typ),
+					elem_needs_release = element_type
+						.map(func(element): list_element_needs_release(program, element))
+						.get_or(False)
+				},
+				typ,
+				loc,
+			)
+		ListAllocExpr(alloc, typ, loc):
+			element_type: Option[CoreType] = list_element_type(program, typ)
+			ListAllocExpr(
+				{ alloc |
+					layout = list_layout_for_type(program, typ),
+					elem_needs_release = element_type
+						.map(func(element): list_element_needs_release(program, element))
+						.get_or(False)
+				},
+				typ,
+				loc,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			element_type: Option[CoreType] = list_element_type(program, handoff.result_type)
+			ListHandoffExpr(
+				{ handoff |
+					layout = list_layout_for_type(program, handoff.result_type),
+					elem_needs_release = element_type
+						.map(func(element): list_element_needs_release(program, element))
+						.get_or(False)
+				},
+				typ,
+				loc,
+			)
+		_:
+			rewritten_children
+
+
+private pure func relayout_function(
+	program: CoreProgram,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info | body = function_info.body.map(func(body): relayout_expr(program, body)) }
+
+
+private pure func relayout_global(program: CoreProgram, global: CoreGlobal) -> CoreGlobal:
+	{ global | init = relayout_expr(program, global.init) }
+
+
+private pure func relayout_decl(program: CoreProgram, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(relayout_function(program, function_info))
+		GlobalDecl(global):
+			GlobalDecl(relayout_global(program, global))
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): relayout_function(program, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func annotate_list_layouts(program: CoreProgram) -> CoreProgram:
+	{
+		decls = program.decls.map(func(decl): relayout_decl(program, decl)),
+		foreign_includes = program.foreign_includes
+	}

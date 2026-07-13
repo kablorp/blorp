@@ -17,6 +17,8 @@ type reason = Type_widening_metadata.reason =
   | CollectionElement of collection_kind
   | BitwiseOperator
   | MethodReceiver
+  | RangeProofErasure
+  | TupleLiteral
   | NumericOperator of Ast.binop
 
 type decision = Type_widening_metadata.decision =
@@ -28,7 +30,6 @@ type value_slot
 val semantic_type : value_slot -> Ast.type_expr
 val value_type : value_slot -> Ast.type_expr
 val decision : value_slot -> decision
-val widening_reason : value_slot -> reason option
 val keep_slot : Ast.type_expr -> value_slot
 
 val scalar_int_value_type : Ast.type_expr -> Ast.type_expr
@@ -38,10 +39,6 @@ val scalar_int_value_type : Ast.type_expr -> Ast.type_expr
 
 val is_scalar_int_value_type : Ast.type_expr -> bool
 (** True when [scalar_int_value_type] is the ordinary runtime [Int] type. *)
-
-val collection_kind_to_string : collection_kind -> string
-val reason_to_string : reason -> string
-val decision_to_string : decision -> string
 
 val mutable_binding_slot : Ast.type_expr -> value_slot
 (** Mutable slots hold ordinary runtime values, so singleton integer

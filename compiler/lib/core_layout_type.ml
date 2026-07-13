@@ -88,7 +88,6 @@ type inline_struct_storage =
     }
   | NotInlineStruct
 
-type value_record_layout = { vrl_name : string; vrl_c_type : string }
 type stack_option_emit_abi = { soe_c_type : string; soe_none_value : string }
 
 type option_constructor_abi =
@@ -96,13 +95,6 @@ type option_constructor_abi =
   | OptionConstructorNullableManaged
   | OptionConstructorBoxedUnion
   | OptionConstructorUnavailable of string
-
-type option_erasure_layout =
-  | OptionErasureStackValue
-  | OptionErasureNullableManagedPointer
-  | OptionErasureBoxedUnion of string
-  | OptionErasureUnknownPayload of string
-  | OptionErasureInvalid of string
 
 type generated_stack_option_payload_storage =
   | GeneratedStackOptionInt128
@@ -215,15 +207,6 @@ let source_value_layout_of_ownership_layout ?release_path loc ty
     sv_release_path = release_path;
   }
 
-let classify_source_value_layout_of_metadata ?(loc = Ast.dummy_loc)
-    (meta : Core_type_layout.metadata) (ty : Ast.type_expr) :
-    source_value_layout_classification =
-  match Core_type_layout.classify meta ty with
-  | Core_type_layout.Known layout ->
-      SourceValueKnown (source_value_layout_of_ownership_layout loc ty layout)
-  | Core_type_layout.Unknown_named name -> SourceValueUnknownNamed name
-  | Core_type_layout.Invalid_value_type msg -> SourceValueInvalid msg
-
 let runtime_builtin_arc_release_only = function
   | "String" | "Bytes" | "Fixed" | "MemStats" | "SchedulerStats"
   | "ConcurrencyError" | "IpAddress" | "DnsName" | "InterfaceScope" ->
@@ -265,13 +248,6 @@ let classify_source_value_layout_of_type ~(reg : Codegen_types.registry) ty loc
            ~release_path:(source_release_path_of_type ~reg ty layout))
   | Core_type_layout.Unknown_named name -> SourceValueUnknownNamed name
   | Core_type_layout.Invalid_value_type msg -> SourceValueInvalid msg
-
-let source_value_layout_of_metadata
-    ?(phase = Core_error.Other "layout_type_source_value")
-    ?(loc = Ast.dummy_loc) (meta : Core_type_layout.metadata)
-    (ty : Ast.type_expr) : source_value_layout =
-  let layout = Core_type_layout.layout_or_error ~phase ~loc meta ty in
-  source_value_layout_of_ownership_layout loc ty layout
 
 let source_value_layout_of_type
     ?(phase = Core_error.Other "layout_type_source_value")
@@ -333,22 +309,6 @@ let inline_struct_storage ?reg ty =
               inline_struct_c_type = c_ty;
             }
       | None -> NotInlineStruct)
-
-let value_record_layout_of_type ?reg ty =
-  let reg = registry_or_empty reg in
-  match canonical_type ~reg ty with
-  | Ast.TyNamed (name, []) when Hashtbl.mem reg.value_records name ->
-      Some
-        {
-          vrl_name = name;
-          vrl_c_type = Codegen_types.type_to_c ~reg (Ast.TyNamed (name, []));
-        }
-  | _ -> None
-
-let value_record_c_type ?reg ty =
-  Option.map
-    (fun (layout : value_record_layout) -> layout.vrl_c_type)
-    (value_record_layout_of_type ?reg ty)
 
 let enum_inline_width ?reg ty =
   match reg with
@@ -605,11 +565,6 @@ let tensor_to_string_runtime_of_elem_type ~reg elem_ty =
   | Ast.TyNamed (name, _) when Hashtbl.mem reg.Codegen_types.enum_types name ->
       TensorToStringEnum name
   | _ -> TensorToStringInt
-
-let tensor_raw_scalar_abi_of_layout (layout : Core.tensor_storage_layout) =
-  match layout.tsl_slots with
-  | Core.TensorRawScalarStorage kind -> Some (tensor_raw_scalar_abi kind)
-  | _ -> None
 
 let source_rc_of_layout = function
   | Core_type_layout.Managed -> SourceManaged
@@ -871,47 +826,8 @@ let tensor_storage_layout_of_type ?reg tensor_ty loc =
       tensor_storage_layout_of_elem ~reg:effective_reg tensor_ty.elem_ty loc
   | None -> boxed_tensor_descriptor_for_elem ~reg:effective_reg tensor_ty loc
 
-let option_layout_or_error ?(phase = Core_error.Other "layout_type_option") ~reg
-    ty loc =
-  match
-    Core_option_layout.classify (Core_type_layout.metadata_for_registry reg) ty
-  with
-  | Core_option_layout.Known layout -> layout
-  | Core_option_layout.Unknown_named name ->
-      Core_error.errorf phase loc
-        ~hint:
-          "register the payload type before final Core preparation so Option \
-           layout is explicit"
-        "cannot choose Option representation for unknown payload type `%s`" name
-  | Core_option_layout.Invalid_option_type msg ->
-      Core_error.errorf phase loc
-        ~hint:"Option constructors must have a fully resolved Option[T] result"
-        "%s" msg
-
 let classify_option_layout ~reg ty =
   Core_option_layout.classify (Core_type_layout.metadata_for_registry reg) ty
-
-let describe_option_boxed_reason = function
-  | Core_option_layout.GenericPayload -> "generic Option payload"
-  | Core_option_layout.NullableUnsafePayload ->
-      "nullable unsafe pointer payload"
-  | Core_option_layout.NestedOptionPayload -> "nested Option payload"
-  | Core_option_layout.NestedResultPayload -> "nested Result payload"
-  | Core_option_layout.UnsupportedPayload ty ->
-      "unsupported Option payload " ^ ty
-
-let option_erasure_layout_of_type ~reg ty =
-  match classify_option_layout ~reg ty with
-  | Core_option_layout.Known
-      (Core_option_layout.StackScalar _ | Core_option_layout.StackValueRecord _)
-    ->
-      OptionErasureStackValue
-  | Core_option_layout.Known Core_option_layout.NullableManagedPointer ->
-      OptionErasureNullableManagedPointer
-  | Core_option_layout.Known (Core_option_layout.BoxedUnion reason) ->
-      OptionErasureBoxedUnion (describe_option_boxed_reason reason)
-  | Core_option_layout.Unknown_named name -> OptionErasureUnknownPayload name
-  | Core_option_layout.Invalid_option_type msg -> OptionErasureInvalid msg
 
 let nullable_managed_option_payload_type ~reg ty =
   Core_option_layout.nullable_managed_payload_type
@@ -1057,14 +973,6 @@ let generated_stack_option_get_abi ~reg ty =
   | Core_option_layout.Invalid_option_type _ ->
       None
 
-let generated_stack_option_payload_from_erased abi raw =
-  match abi.gsog_payload_storage with
-  | GeneratedStackOptionInt128 -> Printf.sprintf "blorp_unbox_int128(%s)" raw
-  | GeneratedStackOptionUInt128 -> Printf.sprintf "blorp_unbox_uint128(%s)" raw
-  | GeneratedStackOptionLong -> Printf.sprintf "(long)%s" raw
-  | GeneratedStackOptionValueRecord c_type ->
-      Printf.sprintf "blorp_unbox_struct(%s, %s)" raw c_type
-
 let option_payload_runtime_abi ~reg payload_ty =
   match
     Core_option_layout.classify
@@ -1139,13 +1047,6 @@ let option_equality_abi ~reg ty =
   | _ ->
       OptionEqualityUnavailable
         (Printf.sprintf "expected Option[T], got %s" (Types.type_to_string ty))
-
-let stack_option_none_value_for_type ~reg ty =
-  match Codegen_types.expand_alias ~reg ty with
-  | Ast.TyNamed ("Option", [ Ast.TyNamed (name, []) ])
-    when Hashtbl.mem reg.value_records name ->
-      "{0}"
-  | _ -> "0"
 
 let stack_option_c_type ~reg ty = Codegen_types.stack_option_c_type ~reg ty
 let stack_result_c_type ~reg ty = Codegen_types.stack_result_c_type ~reg ty

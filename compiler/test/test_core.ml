@@ -78,25 +78,7 @@ let test_construct_logical () =
   | CLog (And, _, _) -> ()
   | _ -> Alcotest.fail "expected CLog(And,_,_)"
 
-let test_storage_policy_variants_are_coherent () =
-  Alcotest.(check bool)
-    "unmanaged bits do not retain" true
-    (storage_policy_retain StoragePolicyUnmanagedBits = StorageNoRetain);
-  Alcotest.(check bool)
-    "unmanaged bits do not release" true
-    (storage_policy_release StoragePolicyUnmanagedBits = StorageNoRelease);
-  Alcotest.(check bool)
-    "managed pointers retain" true
-    (storage_policy_retain StoragePolicyManagedPointer = StorageArcRetain);
-  Alcotest.(check bool)
-    "managed pointers release" true
-    (storage_policy_release StoragePolicyManagedPointer = StorageArcRelease);
-  Alcotest.(check bool)
-    "owned erased boxes release slots without retaining source values" true
-    (storage_policy_retain StoragePolicyOwnedErasedBox = StorageNoRetain
-    && storage_policy_release StoragePolicyOwnedErasedBox = StorageArcRelease)
-
-let test_storage_policy_requires_release_and_retain () =
+let test_storage_policy_requires_release () =
   let phase = Blorp.Core_error.Other "storage-policy-test" in
   Alcotest.(check bool)
     "unmanaged bits require no release" false
@@ -109,18 +91,6 @@ let test_storage_policy_requires_release_and_retain () =
   Alcotest.(check bool)
     "owned erased boxes require release" true
     (storage_policy_requires_release_or_error ~phase ~loc ~subject:"value"
-       ~hint:"test hint" StoragePolicyOwnedErasedBox);
-  Alcotest.(check bool)
-    "unmanaged bits require no retain" false
-    (storage_policy_requires_retain_or_error ~phase ~loc ~subject:"value"
-       ~hint:"test hint" StoragePolicyUnmanagedBits);
-  Alcotest.(check bool)
-    "managed pointers require retain" true
-    (storage_policy_requires_retain_or_error ~phase ~loc ~subject:"value"
-       ~hint:"test hint" StoragePolicyManagedPointer);
-  Alcotest.(check bool)
-    "owned erased boxes do not retain source values" false
-    (storage_policy_requires_retain_or_error ~phase ~loc ~subject:"value"
        ~hint:"test hint" StoragePolicyOwnedErasedBox)
 
 let test_storage_policy_unknown_errors_are_centralized () =
@@ -138,9 +108,6 @@ let test_storage_policy_unknown_errors_are_centralized () =
   in
   expect "release" "unknown value release policy: missing descriptor" (fun () ->
       storage_policy_requires_release_or_error ~phase ~loc ~subject:"value"
-        ~hint:"test hint" unknown);
-  expect "retain" "unknown value retain policy: missing descriptor" (fun () ->
-      storage_policy_requires_retain_or_error ~phase ~loc ~subject:"value"
         ~hint:"test hint" unknown)
 
 let test_construct_call () =
@@ -1156,10 +1123,8 @@ let suite =
         Alcotest.test_case "void" `Quick test_construct_void;
         Alcotest.test_case "binary" `Quick test_construct_binary;
         Alcotest.test_case "logical" `Quick test_construct_logical;
-        Alcotest.test_case "storage_policy" `Quick
-          test_storage_policy_variants_are_coherent;
-        Alcotest.test_case "storage_policy requires" `Quick
-          test_storage_policy_requires_release_and_retain;
+        Alcotest.test_case "storage_policy requires release" `Quick
+          test_storage_policy_requires_release;
         Alcotest.test_case "storage_policy unknown errors" `Quick
           test_storage_policy_unknown_errors_are_centralized;
         Alcotest.test_case "call" `Quick test_construct_call;

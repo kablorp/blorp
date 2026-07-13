@@ -1295,39 +1295,6 @@ let test_format_overload_ref_bare () =
     "bare when no module" "length"
     (format_overload_ref "length" entry)
 
-(** Candidate list renders one per line with bullets. *)
-let test_format_overload_candidates_multi () =
-  let mk_entry mod_path =
-    {
-      ol_def_id = 0;
-      ol_func_type =
-        TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true };
-      ol_type_params = [];
-      ol_param_names = [ None ];
-      ol_purity = Pure;
-      ol_origin = Builtin;
-      ol_resource_args = RejectResourceArgs;
-      ol_module_path = mod_path;
-      ol_dim_constraints = [];
-      ol_loop_producer = None;
-      ol_debug_only = false;
-    }
-  in
-  let candidates =
-    [ mk_entry (Some "std/list"); mk_entry (Some "std/set"); mk_entry None ]
-  in
-  let expected = "  - map (from std/list)\n  - map (from std/set)\n  - map" in
-  Alcotest.(check string)
-    "bullet list of candidates" expected
-    (format_overload_candidates "map" candidates)
-
-(** Empty candidate list returns empty string — caller's signal to
-    omit the candidates section. *)
-let test_format_overload_candidates_empty () =
-  Alcotest.(check string)
-    "empty input → empty output" ""
-    (format_overload_candidates "map" [])
-
 (* ============================================================================
    DefId minting (Track A)
    ============================================================================ *)
@@ -1372,78 +1339,6 @@ let test_overload_entry_carries_def_id () =
     }
   in
   Alcotest.(check int) "def_id roundtrip" id entry.ol_def_id
-
-let test_add_func_mints_callable_id () =
-  Blorp.Session.with_current (Blorp.Session.create ()) (fun () ->
-      let env = add_func (empty ()) "identity" (ty_func [ ty_int ] ty_int) () in
-      match get_func_callable_id env "identity" with
-      | Some id -> Alcotest.(check int) "first callable id" 0 id
-      | None -> Alcotest.fail "expected callable id")
-
-let test_add_func_callable_ids_are_distinct () =
-  Blorp.Session.with_current (Blorp.Session.create ()) (fun () ->
-      let env = empty () in
-      let env = add_func env "first" (ty_func [] ty_int) () in
-      let env = add_func env "second" (ty_func [] ty_bool) () in
-      match
-        (get_func_callable_id env "first", get_func_callable_id env "second")
-      with
-      | Some first_id, Some second_id ->
-          check_true "callable ids differ" (first_id <> second_id);
-          Alcotest.(check int) "first id" 0 first_id;
-          Alcotest.(check int) "second id" 1 second_id
-      | _ -> Alcotest.fail "expected both callable ids")
-
-let test_add_func_preserves_explicit_callable_id () =
-  let sess = Blorp.Session.create () in
-  let id = Blorp.Session.mint_def_id sess in
-  Blorp.Session.with_current sess (fun () ->
-      let env =
-        add_func (empty ()) "selected"
-          (ty_func [ ty_int ] ty_int)
-          ~callable_id:id ()
-      in
-      match get_func_callable_id env "selected" with
-      | Some actual -> Alcotest.(check int) "explicit callable id" id actual
-      | None -> Alcotest.fail "expected callable id")
-
-let test_get_func_callable_id_unknown_returns_none () =
-  check_none "unknown callable id" (get_func_callable_id (empty ()) "missing")
-
-let test_add_type_mints_constructor_callable_ids () =
-  Blorp.Session.with_current (Blorp.Session.create ()) (fun () ->
-      let variants =
-        [
-          {
-            variant_name = "Left";
-            variant_fields = [ ty_int ];
-            variant_tag = 0;
-            variant_loc = dummy_loc;
-            variant_def_id = None;
-          };
-          {
-            variant_name = "Right";
-            variant_fields = [ ty_string ];
-            variant_tag = 1;
-            variant_loc = dummy_loc;
-            variant_def_id = None;
-          };
-        ]
-      in
-      let env = add_type (empty ()) "Either" [] variants in
-      match
-        ( get_constructor_callable_id env "Left",
-          get_constructor_callable_id env "Right" )
-      with
-      | Some left_id, Some right_id ->
-          check_true "constructor callable ids differ" (left_id <> right_id);
-          Alcotest.(check int) "left id" 0 left_id;
-          Alcotest.(check int) "right id" 1 right_id
-      | _ -> Alcotest.fail "expected constructor callable ids")
-
-let test_get_constructor_callable_id_unknown_returns_none () =
-  check_none "unknown constructor callable id"
-    (get_constructor_callable_id (empty ()) "Missing")
 
 (* ============================================================================
    Trait method name collision detection (Track D)
@@ -1846,7 +1741,7 @@ let test_is_local_func_distinguishes_imported_and_builtin () =
 
    These guard against the class of bug that motivated moving session-wide
    env tables out of a module-level [Env.empty] binding and into the session:
-   process-global state leaking across independent [Pipeline.compile] calls,
+   process-global state leaking across independent [Pipeline.compile_legacy_direct_source] calls,
    producing order-dependent test failures. Ordinary overload sets are
    separately tested as env-local lexical state.
    ============================================================================ *)
@@ -2105,10 +2000,6 @@ let suite =
           test_format_overload_ref_with_module;
         Alcotest.test_case "overload without module renders bare" `Quick
           test_format_overload_ref_bare;
-        Alcotest.test_case "candidate list multi" `Quick
-          test_format_overload_candidates_multi;
-        Alcotest.test_case "candidate list empty" `Quick
-          test_format_overload_candidates_empty;
       ] );
     ( "def_id",
       [
@@ -2118,18 +2009,6 @@ let suite =
           test_def_id_per_session_isolation;
         Alcotest.test_case "overload entry carries def_id" `Quick
           test_overload_entry_carries_def_id;
-        Alcotest.test_case "add_func mints callable id" `Quick
-          test_add_func_mints_callable_id;
-        Alcotest.test_case "add_func ids are distinct" `Quick
-          test_add_func_callable_ids_are_distinct;
-        Alcotest.test_case "add_func preserves explicit id" `Quick
-          test_add_func_preserves_explicit_callable_id;
-        Alcotest.test_case "unknown func callable id" `Quick
-          test_get_func_callable_id_unknown_returns_none;
-        Alcotest.test_case "add_type mints constructor callable ids" `Quick
-          test_add_type_mints_constructor_callable_ids;
-        Alcotest.test_case "unknown constructor callable id" `Quick
-          test_get_constructor_callable_id_unknown_returns_none;
       ] );
     ( "trait_function_collision",
       [

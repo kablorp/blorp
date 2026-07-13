@@ -355,7 +355,7 @@ let count_user_call basename body =
     (fun acc node ->
       match node.desc with
       | CCall (CKUser (name, _), _, _)
-        when P.base_list_func_name name = Some basename ->
+        when LP.base_list_func_name name = Some basename ->
           acc + 1
       | _ -> acc)
     0 body
@@ -419,7 +419,7 @@ let test_recognizes_filter_map_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter->map->fold plan shape")
   | None -> Alcotest.fail "expected filter->map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_fold () =
@@ -438,7 +438,7 @@ let test_recognizes_filter_map_hof_fold () =
           LP.Terminal,
           TyNamed ("Int", []) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter_map->fold plan shape")
   | None -> Alcotest.fail "expected filter_map->fold pipeline plan"
 
 let test_recognizes_filter_map_hof_collect () =
@@ -458,7 +458,7 @@ let test_recognizes_filter_map_hof_collect () =
           LP.UpperBound,
           TyNamed ("List", [ TyNamed ("Int", []) ]) ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected filter_map collect plan shape")
   | None -> Alcotest.fail "expected filter_map collect pipeline plan"
 
 let test_recognizes_range_map_filter () =
@@ -473,7 +473,7 @@ let test_recognizes_range_map_filter () =
             { result_ty = TyNamed ("List", [ TyNamed ("Int", []) ]) },
           LP.UpperBound ) ->
           ()
-      | _ -> Alcotest.failf "unexpected plan: %s" (P.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected range->map->filter plan shape")
   | None -> Alcotest.fail "expected range->map->filter pipeline plan"
 
 let test_rejects_materialized_let () =
@@ -1361,13 +1361,10 @@ let test_list_pipeline_rejects_empty_source_plan () =
 let test_list_pipeline_exposes_nonempty_stages () =
   match LP.plan_of_expr (filter_map_fold_expr ()) with
   | Some plan -> (
-      Alcotest.(check int) "stage count" 2 (LP.stage_count plan);
       match (LP.source plan, LP.stages plan, LP.sink plan) with
       | LP.SourceList _, [ LP.StageFilter _; LP.StageMap _ ], LP.SinkFold _ ->
           ()
-      | _ ->
-          Alcotest.failf "unexpected ListPipeline shape: %s"
-            (LP.describe_plan plan))
+      | _ -> Alcotest.fail "unexpected ListPipeline shape")
   | None -> Alcotest.fail "expected explicit ListPipeline plan"
 
 let suite =

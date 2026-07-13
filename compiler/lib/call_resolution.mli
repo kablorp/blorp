@@ -15,9 +15,6 @@ type callee_resolution = {
 }
 
 val strip_callable_id_suffix : string -> string
-val parse_callable_id_suffix : string -> int option
-val is_ufcs_mangled_name : string -> bool
-val call_purity_bool : Env.purity -> bool
 
 val callable_origin_of_env :
   module_path:string option -> Env.func_origin -> Ast.callable_origin
@@ -38,20 +35,8 @@ val select_by_context_purity :
   first_arg_ty:Ast.type_expr option ->
   Env.overload_entry option
 
-val call_syntax_of_source_callee :
-  module_aliases:(string * string) list ->
-  source_callee:Ast.expr ->
-  Ast.resolved_call_target ->
-  Ast.call_syntax
-
 val resolved_target_from_overload :
   string -> Env.overload_entry -> Ast.resolved_call_target
-
-val resolved_target_from_callee :
-  env:Env.env ->
-  callee_name:string option ->
-  callee_ty:Ast.type_expr ->
-  Ast.resolved_call_target option
 
 val resolved_call_metadata :
   ?call_syntax_hint:Ast.call_syntax ->

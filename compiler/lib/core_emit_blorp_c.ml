@@ -240,6 +240,7 @@ let supported_raw_tensor_access_builtins =
       "blorp_tensor5_checked_get_shape_f32";
       "blorp_matrix_set_opt_i64";
       "blorp_matrix_set_opt_nullable_i64";
+      "blorp_matrix_get_opt";
       "blorp_matrix_get_opt_bool";
       "blorp_matrix_get_opt_char";
       "blorp_matrix_get_opt_f16";
@@ -268,6 +269,7 @@ let supported_raw_tensor_access_builtins =
       "blorp_vector_get_opt_uint32";
       "blorp_vector_get_opt_uint64";
       "blorp_vector_get_opt_uint8";
+      "blorp_vector_get_opt";
       "blorp_vector_eq";
       "blorp_vector_abs";
       "blorp_vector_exp";
@@ -2455,7 +2457,9 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       let* fields = typed [ ("retain", retain) ] in
       Ok (kind "list_retain" fields)
   | Core.CCall
-      ( (Core.CKIntrinsic "list_set" | Core.CKIntrinsic "list_set_owned"),
+      (Core.CKIntrinsic ("list_set" as intrinsic_name), _callee, [ lst; index; value ])
+  | Core.CCall
+      ( Core.CKIntrinsic ("list_set_owned" as intrinsic_name),
         _callee,
         [ lst; index; value ] ) ->
       let layout =
@@ -2463,7 +2467,9 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       let* set =
         list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".set") layout lst index value
+          enum_constructors (path ^ ".set")
+          ~transfers_ownership:(String.equal intrinsic_name "list_set_owned")
+          layout lst index value
       in
       let* fields = typed [ ("set", set) ] in
       Ok (kind "list_set" fields)
@@ -2475,7 +2481,8 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       in
       let* set =
         list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".set") layout lst index value
+          enum_constructors (path ^ ".set") ~transfers_ownership:true layout
+          lst index value
       in
       let* fields = typed [ ("set", set) ] in
       Ok (kind "list_handoff_set_owned" fields)
@@ -5822,9 +5829,14 @@ and unbox_json ~function_names ~consumed_params ~reg enum_names value_record_nam
   Ok (kind_value, expr_value)
 
 and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
-    enum_constructors path (layout : Core.list_storage_layout) list index value
-    =
-  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
+    enum_constructors path ~transfers_ownership
+    (layout : Core.list_storage_layout) list index value =
+  let boxed_value =
+    {
+      (Core_emit_layout.boxed_storage_value ~reg value) with
+      bsv_transfers_ownership = transfers_ownership;
+    }
+  in
   let* () = require_list_set_layout path layout boxed_value in
   let* layout_json = list_storage_layout_json layout in
   let* list_json =
@@ -6046,7 +6058,22 @@ let function_kind_json ~reg enum_names value_record_names heap_record_names unio
   match func.cf_kind with
   | Core.CFUser -> Ok (kind "user" [])
   | Core.CFBuiltin -> Ok (kind "builtin" [])
-  | Core.CFForeign _ -> Ok (kind "foreign" [])
+  | Core.CFForeign foreign ->
+      let link_flag_json (platform, flag) =
+        obj
+          [
+            ("platform", option_string_json platform);
+            ("flag", str flag);
+          ]
+      in
+      Ok
+        (kind "foreign"
+           [
+             ("c_name", str foreign.c_name);
+             ("includes", arr (List.map str foreign.includes));
+             ("link_flags", arr (List.map link_flag_json foreign.link_flags));
+             ("arg_passing", foreign_arg_passing_json foreign.arg_passing);
+           ])
   | Core.CFClosureBody abi ->
       let* () = require_closure_body_abi ~reg path abi in
       let c_name = Codegen_names.mangle_by_def_id func.cf_def_id func.cf_name in
@@ -7944,7 +7971,10 @@ and require_match_binding ~reg scrut_ty path (binding : Core.match_binding) =
       | Core.AccVariantField (Core.AccRoot, _, _) ->
           require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
             binding.mb_accessor
-      | _ -> unsupported path "owned match binding with non-root accessor")
+      | Core.AccListSpread _ ->
+          require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
+            binding.mb_accessor
+      | _ -> unsupported path "unsupported owned match binding accessor")
 
 and require_match_bindings ~reg scrut_ty path bindings =
   let rec check index = function
@@ -8090,8 +8120,8 @@ let function_json ~function_names ~consumed_params ~reg ~enum_names
 
 let project_global_decl (_global : Core.core_var) = true
 
-let global_json ~function_names ~consumed_params ~reg enum_names value_record_names
-    heap_record_names union_names enum_constructors path loc
+let global_json ~function_names ~consumed_params ~reg ~is_private enum_names
+    value_record_names heap_record_names union_names enum_constructors path loc
     (global : Core.core_var) =
   let* () = require_function_body ~reg union_names (path ^ ".init") global.cv_init in
   let* typ =
@@ -8111,6 +8141,7 @@ let global_json ~function_names ~consumed_params ~reg enum_names value_record_na
          ("init", init);
          ("mutable", bool global.cv_is_mutable);
          ("const", bool global.cv_is_const);
+         ("private", bool is_private);
          ("def_id", int global.cv_def_id);
          ("loc", source_loc_json loc);
        ])
@@ -8150,6 +8181,7 @@ let enum_decl_json path loc (type_decl : Ast.type_decl) =
       (kind "enum"
          [
            ("name", str type_decl.type_name);
+           ("type_params", string_list_json (Ast.type_param_names type_decl.type_params));
            ("variants", variants);
            ("loc", source_loc_json loc);
          ])
@@ -8228,6 +8260,7 @@ let union_decl_json ~reg enum_names value_record_names heap_record_names union_n
       (kind "union"
          [
            ("name", str type_decl.type_name);
+           ("type_params", string_list_json (Ast.type_param_names type_decl.type_params));
            ( "payload_storage",
              union_payload_storage_json_for_type ~reg type_decl.type_name );
            ("variants", variants);
@@ -8263,6 +8296,8 @@ let value_record_decl_json ~reg enum_names value_record_names heap_record_names 
       (kind "value_record"
          [
            ("name", str record_decl.record_name);
+           ( "type_params",
+             string_list_json (Ast.type_param_names record_decl.record_type_params) );
            ("fields", fields);
            ("loc", source_loc_json loc);
          ])
@@ -8300,6 +8335,8 @@ let heap_record_decl_json ~reg enum_names value_record_names heap_record_names u
       (kind "heap_record"
          [
            ("name", str record_decl.record_name);
+           ( "type_params",
+             string_list_json (Ast.type_param_names record_decl.record_type_params) );
            ("fields", fields);
            ("loc", source_loc_json loc);
          ])
@@ -8338,13 +8375,18 @@ let impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
     in
     collect [] 0 impl.ci_methods
 
-let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
-    heap_record_names union_names enum_constructors global_def_ids
-    global_names index (decl : Core.core_decl) =
+let rec decl_jsons ~function_names ~consumed_params ~reg ~is_private enum_names
+    value_record_names heap_record_names union_names enum_constructors
+    global_def_ids global_names index (decl : Core.core_decl) =
   let path = Printf.sprintf "program.decls[%d]" index in
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
       Ok []
+  | Core.CDType type_decl
+    when type_decl.type_params <> []
+         && not (supported_generic_erased_union_decl type_decl) ->
+      Ok []
+  | Core.CDRecord record_decl when record_decl.record_type_params <> [] -> Ok []
   | Core.CDFunc func ->
       let* json =
         function_json ~function_names ~consumed_params ~reg ~enum_names
@@ -8380,12 +8422,12 @@ let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record
   | Core.CDRecord _ ->
       Ok []
   | Core.CDPrivate inner ->
-      decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
-        heap_record_names union_names enum_constructors global_def_ids
-        global_names index inner
+      decl_jsons ~function_names ~consumed_params ~reg ~is_private:true
+        enum_names value_record_names heap_record_names union_names
+        enum_constructors global_def_ids global_names index inner
   | Core.CDVar global when project_global_decl global ->
       let* json =
-        global_json ~function_names ~consumed_params ~reg enum_names
+        global_json ~function_names ~consumed_params ~reg ~is_private enum_names
           value_record_names heap_record_names union_names enum_constructors path
           decl.cd_loc global
       in
@@ -8529,7 +8571,7 @@ let program_json ~reg (program : Core.core_program) =
     | [] -> Ok (arr (List.rev acc))
     | decl :: rest -> (
         match
-          decl_jsons ~function_names ~consumed_params ~reg enum_names
+          decl_jsons ~function_names ~consumed_params ~reg ~is_private:false enum_names
             value_record_names heap_record_names union_names enum_constructors
             unsupported_global_def_ids unsupported_global_names index decl
         with
@@ -8560,17 +8602,17 @@ let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
       Runtime.runtime_code ^ "\n" ^ artifact.Compiler_blorp_bridge.c_code;
   }
 
-let emit_post_closure_program_to_artifact (config : config)
+let emit_core_program_to_artifact (config : config)
     (program : Core.core_program) =
   let* core_json = program_json ~reg:config.reg program in
   let artifact =
-    Compiler_blorp_bridge.emit_post_closure_c_artifact_exn
+    Compiler_blorp_bridge.emit_core_c_artifact_exn
       ~profile:config.profile core_json
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
 let emit_program_string config program =
-  match emit_post_closure_program_to_artifact config program with
+  match emit_core_program_to_artifact config program with
   | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
   | Error _ as error -> error
 
@@ -8579,4 +8621,4 @@ let try_emit_program_string config program =
   | Ok _ as ok -> ok
   | Error error -> Error (unsupported_to_string error)
 
-let try_emit_post_closure_program_string = try_emit_program_string
+let try_emit_core_program_string = try_emit_program_string

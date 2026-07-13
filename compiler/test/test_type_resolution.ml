@@ -5,14 +5,14 @@ open Blorp.Types
 
 let check_true msg b = Alcotest.(check bool) msg true b
 
-let test_annotation_resolves_qualified_array_element () =
+let test_value_ascription_resolves_qualified_array_element () =
   let ctx =
     Blorp.Type_resolution.make_context ~env:(Blorp.Env.empty ())
       ~module_aliases:[ ("G", "std/geometry") ]
       ()
   in
   let source = TyArray (TyNamed ("G.AABB3", []), [ TyConstInt 4 ]) in
-  let resolved = Blorp.Type_resolution.annotation ctx source in
+  let resolved = Blorp.Type_resolution.value_ascription ctx source in
   check_true "source spelling is retained"
     (types_equal (Blorp.Type_resolution.source resolved) source);
   check_true "canonical type resolves array element"
@@ -20,7 +20,7 @@ let test_annotation_resolves_qualified_array_element () =
        (Blorp.Type_resolution.canonical resolved)
        (TyArray (TyNamed ("std/geometry::AABB3", []), [ TyConstInt 4 ])))
 
-let test_annotation_resolves_qualified_names_recursively () =
+let test_value_ascription_resolves_qualified_names_recursively () =
   let ctx =
     Blorp.Type_resolution.make_context ~env:(Blorp.Env.empty ())
       ~module_aliases:[ ("G", "std/geometry"); ("D", "std/dimensions") ]
@@ -45,7 +45,7 @@ let test_annotation_resolves_qualified_names_recursively () =
       ]
   in
   let resolved =
-    Blorp.Type_resolution.annotation ctx source
+    Blorp.Type_resolution.value_ascription ctx source
     |> Blorp.Type_resolution.canonical
   in
   let expected =
@@ -75,20 +75,20 @@ let test_annotation_resolves_qualified_names_recursively () =
     Alcotest.failf "expected %s, got %s" (type_to_string expected)
       (type_to_string resolved)
 
-let test_annotation_applies_nominal_dim_aliases () =
+let test_value_ascription_applies_nominal_dim_aliases () =
   let env =
     Blorp.Env.add_alias (Blorp.Env.empty ()) "FloatRow" [ "#N" ]
       (TyArray (ty_float, [ TyVar "#N" ]))
   in
   let ctx = Blorp.Type_resolution.make_context ~env ~module_aliases:[] () in
   let source = TyArray (TyNamed ("FloatRow", []), [ TyConstInt 8 ]) in
-  let resolved = Blorp.Type_resolution.annotation ctx source in
+  let resolved = Blorp.Type_resolution.value_ascription ctx source in
   check_true "alias application resolves through central resolver"
     (types_equal
        (Blorp.Type_resolution.canonical resolved)
        (TyArray (ty_float, [ TyConstInt 8 ])))
 
-let test_annotation_can_apply_owner_qualification () =
+let test_value_ascription_can_apply_owner_qualification () =
   let ctx =
     Blorp.Type_resolution.make_context ~env:(Blorp.Env.empty ())
       ~module_aliases:[ ("G", "std/geometry") ]
@@ -106,7 +106,7 @@ let test_annotation_can_apply_owner_qualification () =
     Blorp.Types.qualify_module_local_types ~module_path:"mod/a" [ "Local" ]
   in
   let resolved =
-    Blorp.Type_resolution.annotation ~qualify_owner ctx source
+    Blorp.Type_resolution.value_ascription ~qualify_owner ctx source
     |> Blorp.Type_resolution.canonical
   in
   check_true "owner qualification composes with qualified-name resolution"
@@ -140,8 +140,7 @@ let test_imported_signature_uses_named_resolution_path () =
       }
   in
   let resolved =
-    Blorp.Type_resolution.imported_signature ctx source
-    |> Blorp.Type_resolution.canonical
+    Blorp.Type_resolution.imported_signature_canonical ctx source
   in
   check_true "imported signatures resolve through the central resolver"
     (types_equal resolved
@@ -152,20 +151,20 @@ let test_imported_signature_uses_named_resolution_path () =
             is_pure = true;
           }))
 
-let test_record_field_type_can_preserve_alias_source () =
+let test_alias_policy_can_preserve_source () =
   let env = Blorp.Env.add_alias (Blorp.Env.empty ()) "UserId" [] ty_int in
   let ctx =
     Blorp.Type_resolution.make_context ~env ~module_aliases:[]
       ~alias_policy:Blorp.Type_resolution.PreserveAliasSource ()
   in
   let resolved =
-    Blorp.Type_resolution.record_field_type ctx (TyNamed ("UserId", []))
+    Blorp.Type_resolution.value_ascription ctx (TyNamed ("UserId", []))
     |> Blorp.Type_resolution.canonical
   in
-  check_true "record field type alias source can be preserved"
+  check_true "configured alias source can be preserved"
     (types_equal resolved (TyNamed ("UserId", [])))
 
-let test_declaration_entrypoints_share_resolution_pipeline () =
+let test_declaration_canonicalizers_share_resolution_pipeline () =
   let env =
     Blorp.Env.add_alias (Blorp.Env.empty ()) "LocalHit" []
       (* Typecheck stores aliases in Env after source declarations have already
@@ -189,15 +188,15 @@ let test_declaration_entrypoints_share_resolution_pipeline () =
   let check_entrypoint label resolve =
     let resolved = resolve ctx source in
     check_true
-      (label ^ " retains source spelling")
-      (types_equal (Blorp.Type_resolution.source resolved) source);
-    check_true
       (label ^ " canonicalizes through central resolver")
-      (types_equal (Blorp.Type_resolution.canonical resolved) expected)
+      (types_equal resolved expected)
   in
-  check_entrypoint "record field" Blorp.Type_resolution.record_field_type;
-  check_entrypoint "variant field" Blorp.Type_resolution.variant_field_type;
-  check_entrypoint "type alias target" Blorp.Type_resolution.type_alias_target
+  check_entrypoint "record field"
+    Blorp.Type_resolution.record_field_type_canonical;
+  check_entrypoint "variant field"
+    Blorp.Type_resolution.variant_field_type_canonical;
+  check_entrypoint "type alias target"
+    Blorp.Type_resolution.type_alias_target_canonical
 
 let test_inference_annotation_entrypoints_share_resolution_pipeline () =
   let env =
@@ -244,22 +243,22 @@ let test_inference_annotation_entrypoints_share_resolution_pipeline () =
 
 let suite =
   [
-    ( "annotation",
+    ( "resolution",
       [
         Alcotest.test_case "qualified array element" `Quick
-          test_annotation_resolves_qualified_array_element;
+          test_value_ascription_resolves_qualified_array_element;
         Alcotest.test_case "recursive qualified names" `Quick
-          test_annotation_resolves_qualified_names_recursively;
+          test_value_ascription_resolves_qualified_names_recursively;
         Alcotest.test_case "nominal dimension alias" `Quick
-          test_annotation_applies_nominal_dim_aliases;
+          test_value_ascription_applies_nominal_dim_aliases;
         Alcotest.test_case "owner qualification hook" `Quick
-          test_annotation_can_apply_owner_qualification;
+          test_value_ascription_can_apply_owner_qualification;
         Alcotest.test_case "imported signature named path" `Quick
           test_imported_signature_uses_named_resolution_path;
-        Alcotest.test_case "record field type alias preservation" `Quick
-          test_record_field_type_can_preserve_alias_source;
-        Alcotest.test_case "declaration named entrypoints" `Quick
-          test_declaration_entrypoints_share_resolution_pipeline;
+        Alcotest.test_case "alias source preservation" `Quick
+          test_alias_policy_can_preserve_source;
+        Alcotest.test_case "declaration canonicalizers" `Quick
+          test_declaration_canonicalizers_share_resolution_pipeline;
         Alcotest.test_case "inference annotation named entrypoints" `Quick
           test_inference_annotation_entrypoints_share_resolution_pipeline;
       ] );

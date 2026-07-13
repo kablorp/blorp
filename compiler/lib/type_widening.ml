@@ -19,6 +19,8 @@ type reason = Type_widening_metadata.reason =
   | CollectionElement of collection_kind
   | BitwiseOperator
   | MethodReceiver
+  | RangeProofErasure
+  | TupleLiteral
   | NumericOperator of binop
 
 type decision = Type_widening_metadata.decision =
@@ -31,48 +33,7 @@ let semantic_type slot = slot.semantic_ty
 let decision slot = slot.decision
 let decision_value_type = function Keep ty -> ty | Widen { to_ty; _ } -> to_ty
 
-let decision_reason = function
-  | Keep _ -> None
-  | Widen { reason; _ } -> Some reason
-
 let value_type slot = decision_value_type slot.decision
-let widening_reason slot = decision_reason slot.decision
-
-let collection_kind_to_string = function
-  | ListLiteral -> "ListLiteral"
-  | VectorLiteral -> "VectorLiteral"
-  | DictLiteral -> "DictLiteral"
-  | SetLiteral -> "SetLiteral"
-
-let binop_to_string = function
-  | Add -> "Add"
-  | Sub -> "Sub"
-  | Mul -> "Mul"
-  | Div -> "Div"
-  | Mod -> "Mod"
-  | Eq -> "Eq"
-  | Ne -> "Ne"
-  | Lt -> "Lt"
-  | Gt -> "Gt"
-  | Le -> "Le"
-  | Ge -> "Ge"
-
-let reason_to_string = function
-  | MutableBinding -> "MutableBinding"
-  | ArgumentSlot -> "ArgumentSlot"
-  | CollectionElement kind ->
-      Printf.sprintf "CollectionElement(%s)" (collection_kind_to_string kind)
-  | BitwiseOperator -> "BitwiseOperator"
-  | MethodReceiver -> "MethodReceiver"
-  | NumericOperator op ->
-      Printf.sprintf "NumericOperator(%s)" (binop_to_string op)
-
-let decision_to_string = function
-  | Keep ty -> Printf.sprintf "Keep(%s)" (Types.type_to_string ty)
-  | Widen { from_ty; to_ty; reason } ->
-      Printf.sprintf "%s(%s -> %s)" (reason_to_string reason)
-        (Types.type_to_string from_ty)
-        (Types.type_to_string to_ty)
 
 let keep_slot semantic_ty = { semantic_ty; decision = Keep semantic_ty }
 let scalar_int_value_type ty = Types.Dim.lift_to_int ty

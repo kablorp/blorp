@@ -30,11 +30,6 @@ type loaded_module = Session.loaded_module = {
 val is_package_loaded_module : loaded_module -> bool
 (** True iff this loaded module came from an explicit package import. *)
 
-val is_std_source_file : ?sess:Session.t -> string -> bool
-(** True iff [path] is inside the configured filesystem std root, or is an
-    embedded std pseudo-path. This is deliberately stricter than substring
-    checks: arbitrary user directories named [std] do not become stdlib. *)
-
 val is_path_under_dir : dir:string -> string -> bool
 (** True iff [path] is [dir] or a descendant of [dir], using canonical
     filesystem paths and directory boundaries rather than string prefixes. *)
@@ -174,10 +169,6 @@ val get_typed_decls : ?sess:Session.t -> string -> Typed_ast.program option
 
 val set_typed_decls : ?sess:Session.t -> string -> Typed_ast.program -> unit
 (** Store typed AST for a module (sets the module's [typed_decls] field). *)
-
-val get_typed_import_bindings :
-  ?sess:Session.t -> string -> Session.import_binding list option
-(** Look up resolved import bindings for a typed module. *)
 
 val set_typed_import_bindings :
   ?sess:Session.t -> string -> Session.import_binding list -> unit

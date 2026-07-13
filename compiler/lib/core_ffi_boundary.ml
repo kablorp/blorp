@@ -15,10 +15,6 @@ let copy_kind_to_core = function
   | Ffi_boundary.StringCopy -> ForeignStringCopy
   | Ffi_boundary.BytesCopy -> ForeignBytesCopy
 
-let copy_spec_for_core_kind = function
-  | ForeignStringCopy -> Ffi_boundary.string_copy_spec
-  | ForeignBytesCopy -> Ffi_boundary.bytes_copy_spec
-
 let internal_borrow_policy_error param =
   Core_error.errorf phase param.cp_loc
     ~hint:"default foreign boundary classification should not produce borrow"

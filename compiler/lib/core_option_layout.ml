@@ -113,9 +113,6 @@ let c_type_of_primitive_stack_abi abi = (primitive_stack_abi_info abi).c_type
 let runtime_suffix_of_primitive_stack_abi abi =
   (primitive_stack_abi_info abi).runtime_suffix
 
-let payload_c_type_of_primitive_stack_abi abi =
-  (primitive_stack_abi_info abi).payload_c_type
-
 let apply_alias_subst = Core_type_layout.apply_alias_subst
 
 let rec expand_aliases (meta : Core_type_layout.metadata) seen ty =

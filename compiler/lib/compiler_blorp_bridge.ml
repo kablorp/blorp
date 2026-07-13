@@ -509,13 +509,13 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
-let emit_post_closure_c_request_json ?(profile = false) core_json =
+let emit_core_c_request_json ?(profile = false) core_json =
   Lsp_json.to_string
     (Lsp_json.Object
        [
          ("schema", Lsp_json.Int schema_version);
          ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "emit_post_closure_c");
+         ("action", Lsp_json.String "emit_core_c");
          ( "payload",
            Lsp_json.Object
              [ ("core", core_json); ("profile", Lsp_json.Bool profile) ] );
@@ -620,16 +620,6 @@ let typecheck_import_module_json item =
         cli_frontend_module_origin_json item.typecheck_import_origin );
     ]
 
-let typecheck_import_modules_field import_modules =
-  match import_modules with
-  | [] -> []
-  | _ ->
-      [
-        ( "import_modules",
-          Lsp_json.Array (List.map typecheck_import_module_json import_modules)
-        );
-      ]
-
 let typecheck_resolved_import_json item =
   Lsp_json.Object
     [
@@ -648,28 +638,6 @@ let typecheck_resolved_imports_field resolved_imports =
           Lsp_json.Array
             (List.map typecheck_resolved_import_json resolved_imports) );
       ]
-
-let typecheck_source_request_json_with_imports_policy ~resolved_imports ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
-  let payload_fields =
-    [
-      ("path", Lsp_json.String path);
-      ("module", Lsp_json.String module_name);
-      ("text", Lsp_json.String text);
-      ("origin", cli_frontend_module_origin_json origin);
-      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
-    ]
-    @ typecheck_import_modules_field import_modules
-    @ typecheck_resolved_imports_field resolved_imports
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "typecheck_source");
-         ("payload", Lsp_json.Object payload_fields);
-       ])
 
 let typecheck_graph_request_json_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =
@@ -1167,13 +1135,6 @@ let typechecked_source_artifact_field artifact =
         Error
           ( "invalid_response",
             Typed_ast_json.decode_error_to_string err )
-
-let typecheck_source_response_field response =
-  let* artifact = json_response_field "artifact" response in
-  typechecked_source_artifact_field artifact
-
-let typecheck_source_response_json response_json =
-  response_result response_json typecheck_source_response_field
 
 let typechecked_graph_source_artifact_field artifact =
   let* typechecked_graph_path = string_response_field "path" artifact in
@@ -2125,16 +2086,6 @@ type bridge_helper_compiler = {
   helper_compiler_source : bridge_helper_compiler_source;
 }
 
-let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
-    starts =
-  match bridge_bin with
-  | Some path when path <> "" -> Some path
-  | _ -> find_upwards_from starts compiler_bootstrap_script_name
-
-let command_program_for_parser_bridge ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
-    starts =
-  locate_default_command_program ~bridge_bin starts
-
 let existing_executable_candidates prog =
   executable_candidates prog |> List.filter Sys.file_exists
 
@@ -2647,17 +2598,63 @@ let rewrite_casted_enum_tag_checks c_code ~type_name ~tag_prefix variant_defs =
   loop 0 0;
   Buffer.contents buffer
 
+let generated_c_tag_identifiers c_code =
+  let marker = "TAG_" in
+  let marker_len = String.length marker in
+  let len = String.length c_code in
+  let rec identifier_end index =
+    if index < len && is_ident_char c_code.[index] then identifier_end (index + 1)
+    else index
+  in
+  let rec scan index found =
+    if index + marker_len > len then List.sort_uniq String.compare found
+    else if string_starts_with_at c_code index marker then
+      let stop = identifier_end (index + marker_len) in
+      scan stop (String.sub c_code index (stop - index) :: found)
+    else scan (index + 1) found
+  in
+  scan 0 []
+
+let string_ends_with value suffix =
+  let value_len = String.length value in
+  let suffix_len = String.length suffix in
+  suffix_len <= value_len
+  && String.equal (String.sub value (value_len - suffix_len) suffix_len) suffix
+
+let generated_c_missing_enum_patterns c_code variant_defs =
+  let variants =
+    variant_defs
+    |> List.filter_map (fun (variant, definition) ->
+           Option.map (fun _ -> variant) definition)
+    |> List.sort (fun left right ->
+           Int.compare (String.length right) (String.length left))
+  in
+  generated_c_tag_identifiers c_code
+  |> List.filter_map (fun tag_name ->
+         match
+           List.find_opt
+             (fun variant -> string_ends_with tag_name ("_" ^ variant))
+             variants
+         with
+         | None -> None
+         | Some variant ->
+             let tag_prefix_len = String.length tag_name - String.length variant in
+             let tag_prefix = String.sub tag_name 0 tag_prefix_len in
+             let type_name =
+               String.sub tag_prefix 4 (String.length tag_prefix - 5)
+             in
+             let struct_decl = "typedef struct " ^ type_name in
+             if string_contains_substring c_code struct_decl then None
+             else Some (type_name, tag_prefix))
+  |> List.sort_uniq compare
+
 let generated_c_with_stack_enum_payload_patterns c_code =
   let variant_defs = generated_c_variant_defs c_code in
-  c_code
-  |> fun code ->
-  rewrite_casted_enum_tag_checks code
-    ~type_name:"compiler_token__CompilerSymbol"
-    ~tag_prefix:"TAG_compiler_token__CompilerSymbol_" variant_defs
-  |> fun code ->
-  rewrite_casted_enum_tag_checks code
-    ~type_name:"compiler_token__CompilerKeyword"
-    ~tag_prefix:"TAG_compiler_token__CompilerKeyword_" variant_defs
+  let patterns = generated_c_missing_enum_patterns c_code variant_defs in
+  List.fold_left
+    (fun code (type_name, tag_prefix) ->
+      rewrite_casted_enum_tag_checks code ~type_name ~tag_prefix variant_defs)
+    c_code patterns
 
 let generated_c_with_bootstrap_compatibility c_code =
   c_code
@@ -3037,10 +3034,10 @@ let render_via_command_exn ~renderer ~op args =
              ^ op)
         | Error (_, message) -> invalid_arg message)
 
-let emit_post_closure_c_artifact_exn ?(profile = false) core_json =
+let emit_core_c_artifact_exn ?(profile = false) core_json =
   let response_json =
     run_renderer_request_via_blorp
-      (emit_post_closure_c_request_json ~profile core_json)
+      (emit_core_c_request_json ~profile core_json)
   in
   match response_result response_json c_artifact_response_field with
   | Ok artifact -> artifact
@@ -3074,16 +3071,6 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
       (parse_source_file_request_json_at_phase ~phase ~path ~module_name)
   in
   parse_source_response_json response_json
-
-let typecheck_source_via_command_with_imports_policy ~resolved_imports ~origin
-    ~allow_debug_only_calls ~import_modules ~path ~module_name ~text =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_source_request_json_with_imports_policy
-         ~resolved_imports ~origin ~allow_debug_only_calls ~import_modules
-         ~path ~module_name ~text)
-  in
-  typecheck_source_response_json response_json
 
 let typecheck_graph_via_command_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =

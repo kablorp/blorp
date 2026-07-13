@@ -15,6 +15,8 @@ type reason = Ast.type_widening_reason =
   | CollectionElement of collection_kind
   | BitwiseOperator
   | MethodReceiver
+  | RangeProofErasure
+  | TupleLiteral
   | NumericOperator of Ast.binop
 
 type decision = Ast.type_widening_decision =

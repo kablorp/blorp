@@ -42,7 +42,7 @@
       populated by a later "captures" pass, not here.
     - Decision-tree match compilation: [CMatchArms] carries raw
       [Ast.pattern]; [Core_match] compiles it to [CMatch] downstream.
-    - RC insertion: no [CDup]/[CDrop]. Those are inserted by [Core_perceus]. *)
+    - RC insertion: no [CDup]/[CDrop]. The Blorp Perceus pass inserts them. *)
 
 open Ast
 module TA = Typed_ast
@@ -943,6 +943,9 @@ and lower_child_expr (e : TA.expr) : Core.core = lower_typed_expr_core e
 and lower_timeout_expr (e : TA.expr) : Core.core =
   let lowered = lower_child_expr e in
   if Types.types_equal lowered.ty ty_int then lowered
+  else if
+    match lowered.ty with Ast.TyConstInt _ -> true | _ -> false
+  then { lowered with ty = ty_int }
   else if Types.is_std_duration_type lowered.ty then
     lower_duration_timeout_milliseconds lowered
   else
@@ -1177,7 +1180,7 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
           (* Concurrent block at block head: extract task bindings into the
              [CConcurrent] node's [conc_bindings] field, with subsequent
              block statements becoming [conc_body] (the tail). This shape
-             lets downstream passes ([Core_perceus] especially) see the
+             lets downstream passes (the Blorp Perceus pass especially) see the
              concurrent bindings as scoping over their real uses in the
              tail, rather than being trapped inside an opaque [CConcurrent]
              body where their uses look like zero. *)

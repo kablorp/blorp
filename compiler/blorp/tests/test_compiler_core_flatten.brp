@@ -1,0 +1,391 @@
+import:
+	../src/stage_08_core_lower/compiler_core_flatten: prefix_module_callable_names
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
+		CoreExpr(CallExpr, ClosureCreateExpr, LiteralExpr, VarExpr),
+		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunction,
+		CoreFunctionKind(BuiltinFunction, ForeignFunction, UserFunction),
+		CoreImplDecl,
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func selected_call(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, Some(def_id)),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func closure_reference(name: String, def_id: Int) -> CoreExpr:
+	ClosureCreateExpr(
+		{
+			function_name = name,
+			def_id = def_id,
+			c_name = "",
+			static_name = "",
+			captures = []
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func core_function(
+	name: String,
+	def_id: Int,
+	is_pure: Bool,
+	kind: CoreFunctionKind,
+	body: Option[CoreExpr],
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = body,
+		is_pure = is_pure,
+		function_kind = kind,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	is_pure: Bool,
+	kind: CoreFunctionKind,
+	body: Option[CoreExpr],
+) -> CoreDecl:
+	FunctionDecl(core_function(name, def_id, is_pure, kind, body))
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func function_from_decl(decl: CoreDecl) -> Option[CoreFunction]:
+	match decl:
+		FunctionDecl(function_info):
+			Some(function_info)
+		_:
+			None
+
+
+pure func impl_from_decl(decl: CoreDecl) -> Option[CoreImplDecl]:
+	match decl:
+		ImplDecl(impl_decl):
+			Some(impl_decl)
+		_:
+			None
+
+
+pure func function_at(program_value: CoreProgram, index: Int) -> Option[CoreFunction]:
+	program_value.decls
+		.get(index)
+		.and_then(function_from_decl)
+
+
+pure func selected_call_kind(kind: CoreCallKind) -> Bool:
+	match kind:
+		SelectedDirectCall(_):
+			True
+		_:
+			False
+
+
+pure func var_expr_name(expr: CoreExpr) -> Option[String]:
+	match expr:
+		VarExpr(variable, _, _):
+			Some(variable.name)
+		_:
+			None
+
+
+pure func selected_callee_expr_name(expr: CoreExpr) -> Option[String]:
+	match expr:
+		CallExpr(kind, callee, _, _, _):
+			if selected_call_kind(kind):
+				var_expr_name(callee)
+			else:
+				None
+		_:
+			None
+
+
+pure func selected_callee_name(body: Option[CoreExpr]) -> Option[String]:
+	body.and_then(selected_callee_expr_name)
+
+
+pure func is_unqualified_local_target_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			variable.name == "target" and variable.def_id.is_none()
+		_:
+			False
+
+
+pure func is_unqualified_local_target(body: Option[CoreExpr]) -> Bool:
+	body
+		.map(is_unqualified_local_target_expr)
+		.get_or(False)
+
+
+pure func has_flattened_closure_target_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		ClosureCreateExpr(closure, _, _):
+			closure.function_name == "std_example__target"
+		_:
+			False
+
+
+pure func has_flattened_closure_target(body: Option[CoreExpr]) -> Bool:
+	body
+		.map(has_flattened_closure_target_expr)
+		.get_or(False)
+
+
+pure func impl_method_is_preserved(impl_decl: CoreImplDecl) -> Bool:
+	impl_decl.methods
+		.get(0)
+		.map(func(method_info):
+			(
+				method_info.name == "method"
+				and method_info.source_module == Some("std/example")
+				and selected_callee_name(method_info.body) == Some("std_example__target")
+			)
+		)
+		.get_or(False)
+
+
+func test_prefixes_declarations_and_selected_references() -> Bool:
+	flattened = prefix_module_callable_names("std/example", program([
+			function_decl("run", 1, True, UserFunction, Some(selected_call("work", 2))),
+			function_decl("work", 2, True, UserFunction, Some(int_literal(42))),
+		]))
+
+	run_ok: Bool = function_at(flattened, 0)
+		.map(func(run):
+			(
+				run.name == "std_example__run"
+				and run.source_module == Some("std/example")
+				and selected_callee_name(run.body) == Some("std_example__work")
+			)
+		)
+		.get_or(False)
+	work_ok: Bool = function_at(flattened, 1)
+		.map(
+			func(
+				work,
+			): work.name == "std_example__work" and work.source_module == Some("std/example"),
+		)
+		.get_or(False)
+
+	run_ok and work_ok
+
+
+func test_disambiguates_pure_overload_and_reference() -> Bool:
+	flattened = prefix_module_callable_names("std/list", program([
+			function_decl("map", 10, False, UserFunction, Some(int_literal(1))),
+			function_decl("map", 11, True, UserFunction, Some(int_literal(2))),
+			function_decl("use_map", 12, True, UserFunction, Some(selected_call("map", 11))),
+		]))
+
+	impure_ok: Bool = function_at(flattened, 0)
+		.map(func(function_info): function_info.name == "std_list__map")
+		.get_or(False)
+	pure_ok: Bool = function_at(flattened, 1)
+		.map(func(function_info): function_info.name == "std_list__map__pure")
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 2)
+		.map(func(caller): selected_callee_name(caller.body) == Some("std_list__map__pure"))
+		.get_or(False)
+
+	impure_ok and pure_ok and caller_ok
+
+
+func test_preserves_non_user_and_ufcs_names() -> Bool:
+	flattened = prefix_module_callable_names(
+		"std/example",
+		program([
+			function_decl("runtime_builtin", 20, True, BuiltinFunction, None),
+			function_decl("native_call", 21, False, ForeignFunction({
+					c_name = "native_call",
+					includes = [],
+					link_flags = [],
+					arg_passing = ForeignBorrowArgs,
+				}), None),
+			function_decl("__ufcs_std$list__map", 22, True, UserFunction, Some(int_literal(0))),
+		]),
+	)
+
+	builtin_ok: Bool = function_at(flattened, 0)
+		.map(func(function_info): function_info.name == "runtime_builtin")
+		.get_or(False)
+	foreign_ok: Bool = function_at(flattened, 1)
+		.map(func(function_info): function_info.name == "native_call")
+		.get_or(False)
+	ufcs_ok: Bool = function_at(flattened, 2)
+		.map(func(function_info): function_info.name == "__ufcs_std$list__map")
+		.get_or(False)
+
+	builtin_ok and foreign_ok and ufcs_ok
+
+
+func test_preserves_local_shadow_without_callable_id() -> Bool:
+	local_value = VarExpr(
+		core_var("target", None),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	flattened = prefix_module_callable_names("tests/example", program([
+			function_decl("target", 30, True, UserFunction, Some(int_literal(1))),
+			function_decl("read_local", 31, True, UserFunction, Some(local_value)),
+		]))
+
+	function_at(flattened, 1)
+		.map(func(caller): is_unqualified_local_target(caller.body))
+		.get_or(False)
+
+
+func test_rewrites_closure_references_and_preserves_impl_method_names() -> Bool:
+	method: CoreFunction = core_function(
+		"method",
+		42,
+		True,
+		UserFunction,
+		Some(selected_call("target", 40)),
+	)
+
+	flattened = prefix_module_callable_names(
+		"std/example",
+		program([
+			function_decl("target", 40, True, UserFunction, Some(int_literal(1))),
+			function_decl(
+				"capture_target",
+				41,
+				True,
+				UserFunction,
+				Some(closure_reference("target", 40)),
+			),
+			ImplDecl({
+				trait_name = "Example",
+				for_type = int_type(),
+				methods = [method],
+				loc = SyntheticSourceLoc,
+			}),
+		]),
+	)
+
+	closure_ok: Bool = function_at(flattened, 1)
+		.map(func(capture_target): has_flattened_closure_target(capture_target.body))
+		.get_or(False)
+	impl_ok: Bool = flattened.decls
+		.get(2)
+		.and_then(impl_from_decl)
+		.map(impl_method_is_preserved)
+		.get_or(False)
+
+	closure_ok and impl_ok
+
+
+func test_prefers_bodied_overload_to_forward_declaration() -> Bool:
+	flattened = prefix_module_callable_names("std/option", program([
+			function_decl("map", 50, False, UserFunction, None),
+			function_decl("map", 51, True, UserFunction, Some(int_literal(1))),
+			function_decl("use_map", 52, True, UserFunction, Some(selected_call("map", 50))),
+		]))
+
+	map_ok: Bool = function_at(flattened, 0)
+		.map(func(map_function):
+			map_function.name == "std_option__map" and map_function.body.is_some()
+		)
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 1)
+		.map(func(caller): selected_callee_name(caller.body) == Some("std_option__map"))
+		.get_or(False)
+
+	flattened.decls.length() == 2 and map_ok and caller_ok
+
+
+func test_preserves_trait_signatures() -> Bool:
+	flattened = prefix_module_callable_names("std/example", program([TraitDecl({
+				name = "Example",
+				type_params = ["T"],
+				supertraits = ["Equatable"],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			})]))
+
+	match flattened.decls:
+		[TraitDecl(trait_info)]:
+			(
+				trait_info.name == "Example"
+				and trait_info.type_params == ["T"]
+				and trait_info.supertraits == ["Equatable"]
+			)
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler callable flattening",
+	tests = [
+		(
+			"prefixes declarations and selected references",
+			test_prefixes_declarations_and_selected_references,
+		),
+		(
+			"disambiguates pure overload and reference",
+			test_disambiguates_pure_overload_and_reference,
+		),
+		("preserves non-user and UFCS names", test_preserves_non_user_and_ufcs_names),
+		(
+			"preserves local shadow without callable id",
+			test_preserves_local_shadow_without_callable_id,
+		),
+		(
+			"rewrites closure references and preserves impl method names",
+			test_rewrites_closure_references_and_preserves_impl_method_names,
+		),
+		(
+			"prefers bodied overload to forward declaration",
+			test_prefers_bodied_overload_to_forward_declaration,
+		),
+		("preserves trait signatures", test_preserves_trait_signatures),
+	]
+}

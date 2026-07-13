@@ -6,8 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 build_plan=$(make -n build)
-if ! grep -Fxq 'cd compiler && dune build bin/blorp_ocaml_host.exe' <<<"$build_plan"; then
-	echo "FAIL: make build must target only the private OCaml host" >&2
+expected_ocaml_build='cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe'
+if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
+	echo "FAIL: make build must target only the private OCaml host executables" >&2
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi
@@ -15,6 +16,20 @@ fi
 all_plan=$(make -n all)
 if grep -Fq './blorp format --check' <<<"$all_plan"; then
 	echo "FAIL: ordinary make must not execute formatter warm-up" >&2
+	exit 1
+fi
+
+cli_build_plan=$(make -n build-blorp-cli)
+if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
+	exit 1
+fi
+if ! grep -Fq 'rm -f "compiler/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must remove stale generated C before compilation" >&2
+	exit 1
+fi
+if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
 	exit 1
 fi
 

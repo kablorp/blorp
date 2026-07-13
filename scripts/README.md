@@ -171,7 +171,7 @@ the same helper more than once.
 
 The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
 explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
-which downloads and verifies the pinned dev release `dev-33e00c2b94df` into
+which downloads and verifies the pinned dev release `dev-9f56c40d2b91` into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Update the tag, version, and target checksums in that script together
 when intentionally moving the fallback bootstrap forward.

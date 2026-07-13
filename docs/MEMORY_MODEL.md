@@ -402,7 +402,7 @@ only a compact destructor id.
 | `blorp_is_unique(obj)` | `true` if refcount == 1 |
 
 **Retain/release status:** The Core IR pipeline inserts Perceus-style
-`CDup`/`CDrop` nodes during the `core_perceus` pass, which lower to
+`CDup`/`CDrop` nodes during the Blorp-owned Perceus pass, which lower to
 `blorp_retain` / `blorp_release` calls in emitted C. Objects are freed when
 their refcount drops to zero — there is no garbage collector and no arena.
 

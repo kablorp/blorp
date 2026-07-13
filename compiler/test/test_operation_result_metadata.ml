@@ -56,6 +56,14 @@ let require_contains label content needle =
 
 let std_source_path_for_module module_path = module_path ^ ".brp"
 
+let source_module_path = function
+  | StdDns -> Blorp.Codegen_names.mod_dns
+  | StdTcp -> Blorp.Codegen_names.mod_tcp
+  | StdTls -> Blorp.Codegen_names.mod_tls
+  | StdUdp -> Blorp.Codegen_names.mod_udp
+  | StdWebSocket -> Blorp.Codegen_names.mod_websocket
+  | StdFs -> "std/fs"
+
 let std_source_decls_cache : (string, Blorp.Ast.program) Hashtbl.t =
   Hashtbl.create 16
 
@@ -806,10 +814,14 @@ let test_bridges_are_manifested () =
             bridge.runtime_result_c_type;
           List.iter
             (fun type_name ->
+              let accepted_type_names =
+                match bridge.success.accepted_type with
+                | NamedType (names, _) -> names
+              in
               Alcotest.(check bool)
                 (name ^ " accepts " ^ type_name)
                 true
-                (List.mem type_name (success_payload_type_names bridge.success)))
+                (List.mem type_name accepted_type_names))
             type_name_hints;
           Alcotest.(check int)
             (name ^ " success release mask")
@@ -1053,7 +1065,8 @@ let test_parking_metadata_is_explicit () =
     "parking operation-result bridges" expected_parking_operations
     (result_bridges
     |> List.filter_map (fun (bridge : result_bridge) ->
-        if bridge_parks_fiber bridge then Some bridge.builtin_name else None));
+        if bridge.wait_behavior = ParksFiber then Some bridge.builtin_name
+        else None));
   Alcotest.(check (list (pair string string)))
     "OS-worker-blocking operation-result bridges"
     expected_os_worker_blocking_operations
@@ -1070,16 +1083,19 @@ let test_parking_metadata_is_explicit () =
         (Blorp.Builtin_metadata.is_impure bridge.builtin_name);
       Alcotest.(check bool)
         (bridge.builtin_name ^ " cancellation-point metadata")
-        (bridge_is_cancellation_point bridge)
-        (Blorp.Builtin_metadata.is_cancellation_point bridge.builtin_name);
+        (bridge.wait_behavior = ParksFiber)
+        (Blorp.Builtin_metadata.has_effect bridge.builtin_name
+           Blorp.Builtin_metadata.Cancellation_point);
       Alcotest.(check bool)
         (bridge.builtin_name ^ " fiber-parking metadata")
-        (bridge_parks_fiber bridge)
-        (Blorp.Builtin_metadata.may_park_fiber bridge.builtin_name);
+        (bridge.wait_behavior = ParksFiber)
+        (Blorp.Builtin_metadata.has_effect bridge.builtin_name
+           Blorp.Builtin_metadata.Fiber_parking);
       Alcotest.(check bool)
         (bridge.builtin_name ^ " OS-worker-blocking metadata")
-        (bridge_blocks_os_worker bridge)
-        (Blorp.Builtin_metadata.is_os_worker_blocking bridge.builtin_name))
+        (match bridge.wait_behavior with BlocksOsWorker _ -> true | _ -> false)
+        (Blorp.Builtin_metadata.has_effect bridge.builtin_name
+           Blorp.Builtin_metadata.Os_worker_blocking))
     result_bridges
 
 let resource_result_policy_name = function
@@ -1152,15 +1168,18 @@ let test_fallible_stream_sources_are_manifested () =
           Alcotest.(check bool)
             (name ^ " constructor is not a cancellation point")
             false
-            (Blorp.Builtin_metadata.is_cancellation_point name);
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Cancellation_point);
           Alcotest.(check bool)
             (name ^ " constructor does not park a fiber")
             false
-            (Blorp.Builtin_metadata.may_park_fiber name);
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Fiber_parking);
           Alcotest.(check bool)
             (name ^ " constructor does not block an OS worker")
             false
-            (Blorp.Builtin_metadata.is_os_worker_blocking name))
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Os_worker_blocking))
     expected_fallible_stream_sources
 
 let test_fallible_stream_terminals_are_manifested () =
@@ -1191,24 +1210,25 @@ let test_fallible_stream_terminals_are_manifested () =
             void_boxed_args terminal.void_boxed_args;
           Alcotest.(check bool)
             (name ^ " terminal cancellation-point metadata")
-            true
-            (terminal_is_cancellation_point terminal);
+            true (terminal.wait_behavior = ParksFiber);
           Alcotest.(check bool)
             (name ^ " terminal fiber-parking metadata")
-            true
-            (terminal_parks_fiber terminal);
+            true (terminal.wait_behavior = ParksFiber);
           Alcotest.(check bool)
             (name ^ " builtin cancellation-point metadata")
             true
-            (Blorp.Builtin_metadata.is_cancellation_point name);
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Cancellation_point);
           Alcotest.(check bool)
             (name ^ " builtin fiber-parking metadata")
             true
-            (Blorp.Builtin_metadata.may_park_fiber name);
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Fiber_parking);
           Alcotest.(check bool)
             (name ^ " terminal does not block an OS worker")
             false
-            (Blorp.Builtin_metadata.is_os_worker_blocking name))
+            (Blorp.Builtin_metadata.has_effect name
+               Blorp.Builtin_metadata.Os_worker_blocking))
     expected_fallible_stream_terminals
 
 let duplicate_strings values =

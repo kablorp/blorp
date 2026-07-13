@@ -25,16 +25,17 @@ import:
 			CompilerConstIntType,
 			CompilerMetaType,
 			CompilerNamedType,
+			CompilerRangeType,
 			CompilerSelfType,
+			CompilerTypeVar,
 			CompilerVarDimsType,
 		),
-		TYPE_NAME_INT,
 		compiler_collect_type_vars,
+		compiler_is_any_integer_type,
 		compiler_is_dim_var_name,
 		compiler_is_scalar_int_value_type as type_is_scalar_int_value_type,
 		compiler_scalar_int_value_type as type_scalar_int_value_type,
 		compiler_type_copy,
-		compiler_type_int,
 		compiler_types_equal,
 
 
@@ -51,6 +52,8 @@ union CompilerTypeWideningReason:
 	CompilerCollectionElement(CompilerCollectionKind)
 	CompilerBitwiseOperator
 	CompilerMethodReceiver
+	CompilerRangeProofErasure
+	CompilerTupleLiteral
 	CompilerNumericOperator(ParsedBinaryOp)
 
 
@@ -201,6 +204,18 @@ pure func compiler_widening_reasons_equal(
 					True
 				_:
 					False
+		CompilerRangeProofErasure:
+			match right:
+				CompilerRangeProofErasure:
+					True
+				_:
+					False
+		CompilerTupleLiteral:
+			match right:
+				CompilerTupleLiteral:
+					True
+				_:
+					False
 		CompilerNumericOperator(left_op):
 			match right:
 				CompilerNumericOperator(right_op):
@@ -282,11 +297,11 @@ private pure func compiler_singleton_int_slot(
 	reason: CompilerTypeWideningReason,
 	semantic_type: CompilerType,
 ) -> CompilerValueSlot:
-	match semantic_type:
-		CompilerConstIntType(_):
-			compiler_target_slot(reason, semantic_type, compiler_type_int())
-		_:
-			compiler_keep_slot(semantic_type)
+	compiler_target_slot(
+		reason,
+		semantic_type,
+		compiler_scalar_int_value_type(semantic_type),
+	)
 
 
 private pure func compiler_dim_operand_slot(
@@ -315,9 +330,36 @@ private pure func compiler_can_use_concrete_argument_target(
 ) -> Bool:
 	match target_type:
 		CompilerNamedType(name, args):
+			(
+				args.length() == 0
+				and (
+					(
+						compiler_is_any_integer_type(target_type)
+						and compiler_is_scalar_int_value_type(semantic_type)
+					)
+					or (
+						name == "String"
+						and match semantic_type:
+							CompilerNamedType(semantic_name, semantic_args):
+								semantic_name == "LiteralString" and semantic_args.length() == 0
+							_:
+								False
+					)
+				)
+			)
+		CompilerRangeType(bound):
 			match semantic_type:
-				CompilerConstIntType(_):
-					name == TYPE_NAME_INT and args.length() == 0
+				CompilerConstIntType(value):
+					if value < 0:
+						False
+					else:
+						match bound:
+							CompilerConstIntType(size):
+								value < size
+							CompilerTypeVar(name):
+								compiler_is_dim_var_name(name) and value == 0
+							_:
+								False
 				_:
 					False
 		_:
@@ -359,10 +401,10 @@ pure func compiler_argument_target_slot(
 ) -> CompilerValueSlot:
 	if compiler_param_accepts_singleton_argument_widening(context, param_type):
 		compiler_singleton_int_slot(CompilerArgumentSlot, semantic_type)
-	else if compiler_target_keeps_semantic_slot(param_type):
-		compiler_keep_slot(semantic_type)
 	else if compiler_can_use_concrete_argument_target(param_type, semantic_type):
 		compiler_target_slot(CompilerArgumentSlot, semantic_type, param_type)
+	else if compiler_target_keeps_semantic_slot(param_type):
+		compiler_keep_slot(semantic_type)
 	else:
 		compiler_keep_slot(semantic_type)
 
@@ -395,6 +437,21 @@ pure func compiler_bitwise_operand_target_slot(
 
 pure func compiler_method_receiver_slot(semantic_type: CompilerType) -> CompilerValueSlot:
 	compiler_singleton_int_slot(CompilerMethodReceiver, semantic_type)
+
+
+pure func compiler_range_proof_slot(semantic_type: CompilerType) -> CompilerValueSlot:
+	compiler_target_slot(
+		CompilerRangeProofErasure,
+		semantic_type,
+		compiler_scalar_int_value_type(semantic_type),
+	)
+
+
+pure func compiler_tuple_literal_slot(
+	semantic_type: CompilerType,
+	value_type: CompilerType,
+) -> CompilerValueSlot:
+	compiler_target_slot(CompilerTupleLiteral, semantic_type, value_type)
 
 
 pure func compiler_numeric_operand_slot(

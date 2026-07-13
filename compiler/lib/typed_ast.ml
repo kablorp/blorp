@@ -192,7 +192,6 @@ let func_callable_id (func : func_decl) = func.info.callable_id
 let var_ast (var : var_decl) = var.ast_var
 let var_info (var : var_decl) = var.info
 let var_binding_type (var : var_decl) = var.info.binding_ty
-let with_var_ast (var : var_decl) ast_var = { var with ast_var }
 let record_ast (record : record_decl) = record.ast_record
 let record_info (record : record_decl) = record.info
 let record_field_infos (record : record_decl) = record.info.field_infos
@@ -261,22 +260,9 @@ let type_info_of_ast (info : Ast.expr_type_info) : type_info =
   }
 
 let type_info_source_type (info : type_info) = info.source_ty
-let type_info_semantic_type (info : type_info) = info.semantic_ty
-let type_info_value_type (info : type_info) = info.value_ty
 let type_info_origin (info : type_info) = info.origin
-let type_info_widening (info : type_info) = info.widening
 let type_info_proofs (info : type_info) = info.proofs
-let type_info_resolved_call (info : type_info) = info.resolved_call
 let expr_resolved_call (expr : expr) = expr.info.resolved_call
-
-let expr_call_purity (expr : expr) =
-  Option.map Ast.resolved_call_purity expr.info.resolved_call
-
-let expr_direct_call_id (expr : expr) =
-  Option.bind expr.info.resolved_call Ast.resolved_call_direct_callable_id
-
-let expr_concrete_callable_id (expr : expr) =
-  Option.bind expr.info.resolved_call Ast.resolved_call_concrete_callable_id
 
 let semantic_type (expr : expr) = expr.info.semantic_ty
 let value_type (expr : expr) = expr.info.value_ty
@@ -563,7 +549,7 @@ and of_ast_func_decl_with_source ?source_func ?callable_id ast_func =
   let* info = make_func_info ?source_func ?callable_id ast_func in
   Ok { ast_func; info }
 
-and of_ast_var_decl_with_source ?source_var (ast_var : Ast.var_decl) =
+and of_ast_var_decl_with_source_internal ?source_var (ast_var : Ast.var_decl) =
   let source_var = Option.value source_var ~default:ast_var in
   let* () =
     ensure_optional_type ~loc:ast_var.var_value.expr_loc
@@ -1083,7 +1069,7 @@ let rec of_ast_decl_with_source ?source_decl ?callable_id_of_func ast_decl =
         Ok (FunctionDecl typed_func)
     | Ast.DVar var ->
         let* source_var = source_var_decl ~loc:ast_decl.decl_loc source_decl in
-        let* typed_var = of_ast_var_decl_with_source ?source_var var in
+        let* typed_var = of_ast_var_decl_with_source_internal ?source_var var in
         Ok (VarDecl typed_var)
     | Ast.DImpl impl ->
         let* source_impl =
@@ -1180,8 +1166,8 @@ and validate_record_fields = function
       let* () = validate_record_field field in
       validate_record_fields rest
 
-let of_ast_var_decl ast_var = of_ast_var_decl_with_source ast_var
-let of_ast_func_decl ast_func = of_ast_func_decl_with_source ast_func
+let of_ast_var_decl_with_source ~source_var ast_var =
+  of_ast_var_decl_with_source_internal ~source_var ast_var
 let of_ast_decl ast_decl = of_ast_decl_with_source ast_decl
 
 let of_ast_program ?callable_id_of_func ast_program =

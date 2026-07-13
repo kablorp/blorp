@@ -84,10 +84,8 @@ let closure_call ?(loc = Ast.dummy_loc) fn args ty =
 
 let loop name ty = loop_binder_named name ty
 let list_elem_ty = ListPipeline.list_elem_ty
-let base_list_func_name = ListPipeline.base_list_func_name
 let call_base_and_args = ListPipeline.call_base_and_args
 let plan_of_expr = ListPipeline.plan_of_expr
-let describe_plan = ListPipeline.describe_plan
 let plan_stages = ListPipeline.stages
 let counter = ref 0
 let reset_fresh () = counter := 0

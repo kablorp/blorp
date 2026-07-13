@@ -1,11 +1,12 @@
 import:
-	../src/stage_05_types/compiler_context: compiler_context_empty, compiler_fresh_meta_with_origin
 	../src/stage_03_parse/compiler_parsed_ast: ParsedBinaryOp(ParsedAddOp)
+	../src/stage_05_types/compiler_context: compiler_context_empty, compiler_fresh_meta_with_origin
 	../src/stage_05_types/compiler_type:
 		CompilerType(
 			CompilerConstIntType,
 			CompilerNamedType,
 			CompilerRangeType,
+			CompilerTupleType,
 			CompilerTypeVar,
 			CompilerVarDimsType,
 		),
@@ -23,6 +24,8 @@ import:
 			CompilerMethodReceiver,
 			CompilerMutableBinding,
 			CompilerNumericOperator,
+			CompilerRangeProofErasure,
+			CompilerTupleLiteral,
 		),
 		compiler_argument_slot,
 		compiler_argument_target_slot,
@@ -33,7 +36,9 @@ import:
 		compiler_method_receiver_slot,
 		compiler_mutable_binding_slot,
 		compiler_numeric_operand_slot,
+		compiler_range_proof_slot,
 		compiler_scalar_int_value_type,
+		compiler_tuple_literal_slot,
 		compiler_widening_decision,
 		compiler_widening_reason,
 		compiler_widening_reasons_equal,
@@ -111,6 +116,40 @@ func test_method_receiver_slot_preserves_semantic_type() -> Bool:
 	)
 
 
+func test_range_proof_slot_erases_only_runtime_type() -> Bool:
+	semantic_type: CompilerType = CompilerRangeType(CompilerTypeVar("#N"))
+	slot = compiler_range_proof_slot(semantic_type)
+
+	(
+		compiler_types_equal(compiler_widening_semantic_type(slot), semantic_type)
+		and compiler_types_equal(compiler_widening_value_type(slot), compiler_type_int())
+		and match compiler_widening_decision(slot):
+			CompilerTypeWiden(_, _, reason):
+				compiler_widening_reasons_equal(reason, CompilerRangeProofErasure)
+			CompilerTypeKeep(_):
+				False
+	)
+
+
+func test_tuple_literal_slot_preserves_semantic_items() -> Bool:
+	semantic_type: CompilerType = CompilerTupleType([
+		CompilerConstIntType(1),
+		CompilerRangeType(CompilerConstIntType(10)),
+	])
+	value_type: CompilerType = CompilerTupleType([compiler_type_int(), compiler_type_int()])
+	slot = compiler_tuple_literal_slot(semantic_type, value_type)
+
+	(
+		compiler_types_equal(compiler_widening_semantic_type(slot), semantic_type)
+		and compiler_types_equal(compiler_widening_value_type(slot), value_type)
+		and match compiler_widening_decision(slot):
+			CompilerTypeWiden(_, _, reason):
+				compiler_widening_reasons_equal(reason, CompilerTupleLiteral)
+			CompilerTypeKeep(_):
+				False
+	)
+
+
 func test_variadic_dimension_pack_is_kept() -> Bool:
 	pack_type: CompilerType = CompilerVarDimsType("#Ds")
 	slot = compiler_numeric_operand_slot(ParsedAddOp, pack_type)
@@ -154,10 +193,14 @@ func test_argument_slot_only_widens_open_value_metas() -> Bool:
 		CompilerConstIntType(1),
 	)
 	dim_slot = compiler_argument_slot(dim_meta.context, dim_meta.meta_type, CompilerConstIntType(1))
+	range_type: CompilerType = CompilerRangeType(CompilerConstIntType(10))
+	range_slot = compiler_argument_slot(dim_meta.context, value_meta.meta_type, range_type)
 
 	(
 		compiler_types_equal(compiler_widening_value_type(value_slot), compiler_type_int())
 		and compiler_types_equal(compiler_widening_value_type(dim_slot), CompilerConstIntType(1))
+		and compiler_types_equal(compiler_widening_semantic_type(range_slot), range_type)
+		and compiler_types_equal(compiler_widening_value_type(range_slot), compiler_type_int())
 	)
 
 
@@ -176,6 +219,53 @@ func test_argument_target_slot_preserves_semantic_type() -> Bool:
 				compiler_widening_reasons_equal(reason, CompilerArgumentSlot)
 			CompilerTypeKeep(_):
 				False
+	)
+
+
+func test_argument_target_slot_widens_dimension_to_int() -> Bool:
+	semantic_type: CompilerType = CompilerTypeVar("#N")
+	slot = compiler_argument_target_slot(
+		compiler_context_empty(),
+		compiler_type_int(),
+		semantic_type,
+	)
+
+	(
+		compiler_types_equal(compiler_widening_semantic_type(slot), semantic_type)
+		and compiler_types_equal(compiler_widening_value_type(slot), compiler_type_int())
+		and match compiler_widening_decision(slot):
+			CompilerTypeWiden(_, _, reason):
+				compiler_widening_reasons_equal(reason, CompilerArgumentSlot)
+			CompilerTypeKeep(_):
+				False
+	)
+
+
+func test_argument_target_slot_widens_literal_to_sized_integer() -> Bool:
+	target_type = CompilerNamedType("Int128", [])
+	slot = compiler_argument_target_slot(
+		compiler_context_empty(),
+		target_type,
+		CompilerConstIntType(123),
+	)
+
+	(
+		compiler_types_equal(compiler_widening_semantic_type(slot), CompilerConstIntType(123))
+		and compiler_types_equal(compiler_widening_value_type(slot), target_type)
+	)
+
+
+func test_argument_target_slot_accepts_proven_range_literal() -> Bool:
+	target_type: CompilerType = CompilerRangeType(CompilerTypeVar("#N"))
+	slot = compiler_argument_target_slot(
+		compiler_context_empty(),
+		target_type,
+		CompilerConstIntType(0),
+	)
+
+	(
+		compiler_types_equal(compiler_widening_semantic_type(slot), CompilerConstIntType(0))
+		and compiler_types_equal(compiler_widening_value_type(slot), target_type)
 	)
 
 
@@ -278,6 +368,14 @@ tests: TestSuite = {
 			"method receiver slot preserves semantic type",
 			test_method_receiver_slot_preserves_semantic_type,
 		),
+		(
+			"range proof slot erases only runtime type",
+			test_range_proof_slot_erases_only_runtime_type,
+		),
+		(
+			"tuple literal slot preserves semantic items",
+			test_tuple_literal_slot_preserves_semantic_items,
+		),
 		("variadic dimension pack is kept", test_variadic_dimension_pack_is_kept),
 		(
 			"scalar int value type lifts only scalar dims",
@@ -290,6 +388,18 @@ tests: TestSuite = {
 		(
 			"argument target slot preserves semantic type",
 			test_argument_target_slot_preserves_semantic_type,
+		),
+		(
+			"argument target slot widens dimension to int",
+			test_argument_target_slot_widens_dimension_to_int,
+		),
+		(
+			"argument target slot widens literal to sized integer",
+			test_argument_target_slot_widens_literal_to_sized_integer,
+		),
+		(
+			"argument target slot accepts proven range literal",
+			test_argument_target_slot_accepts_proven_range_literal,
 		),
 		(
 			"argument target slot keeps type variable targets",

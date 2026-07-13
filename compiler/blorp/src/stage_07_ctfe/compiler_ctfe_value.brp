@@ -4,6 +4,7 @@
 -- environments and execution; materialization owns rewriting values back into
 -- typed declarations.
 import:
+	../stage_01_file_io/compiler_source: CompilerSourceSpan
 	../stage_03_parse/compiler_parsed_ast:
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -19,7 +20,6 @@ import:
 			ParsedSubtractOp,
 		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
-	../stage_01_file_io/compiler_source: CompilerSourceSpan
 	../stage_05_types/compiler_type:
 		CompilerType,
 		compiler_type_bool,
@@ -47,7 +47,8 @@ record CompilerCtfeConstructorPayload {
 
 record CompilerCtfeFunctionReferencePayload {
 	callable_id: Int,
-	source_name: String
+	source_name: String,
+	is_pure: Bool
 }
 
 
@@ -130,10 +131,12 @@ pure func compiler_ctfe_function_reference(
 	span: CompilerSourceSpan,
 	callable_id: Int,
 	source_name: String,
+	is_pure: Bool,
 ) -> CompilerCtfeValue:
 	compiler_ctfe_value(typ, CompilerCtfeFunctionReferenceValue({
 			callable_id = callable_id,
 			source_name = source_name,
+			is_pure = is_pure,
 		}), span)
 
 
@@ -446,14 +449,19 @@ private pure func compiler_ctfe_compare_float(
 			False
 
 
-private pure func compiler_ctfe_eval_int_binary_desc(
-	op: ParsedBinaryOp,
-	left: CompilerCtfeValue,
-	right: CompilerCtfeValue,
+private pure func compiler_ctfe_value_desc_error(
+	error: CompilerCtfeError,
 ) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
-	left_value ?= compiler_ctfe_expect_int(left)
-	right_value ?= compiler_ctfe_expect_int(right)
+	-- A concrete adapter keeps the current backend away from generic Result
+	-- tuple matches and nested `?= match` forms it cannot emit reliably.
+	Err(error)
 
+
+private pure func compiler_ctfe_eval_int_binary_values(
+	op: ParsedBinaryOp,
+	left_value: Int,
+	right_value: Int,
+) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
 	match op:
 		ParsedAddOp:
 			Ok(CompilerCtfeIntValue(left_value + right_value))
@@ -480,19 +488,32 @@ private pure func compiler_ctfe_eval_int_binary_desc(
 		ParsedGreaterEqualOp:
 			Ok(CompilerCtfeBoolValue(compiler_ctfe_compare_int(op, left_value, right_value)))
 		ParsedEqualOp:
-			Ok(CompilerCtfeBoolValue(compiler_ctfe_values_equal(left, right)))
+			Ok(CompilerCtfeBoolValue(left_value == right_value))
 		ParsedNotEqualOp:
-			Ok(CompilerCtfeBoolValue(not compiler_ctfe_values_equal(left, right)))
+			Ok(CompilerCtfeBoolValue(left_value != right_value))
 
 
-private pure func compiler_ctfe_eval_float_binary_desc(
+private pure func compiler_ctfe_eval_int_binary_desc(
 	op: ParsedBinaryOp,
 	left: CompilerCtfeValue,
 	right: CompilerCtfeValue,
 ) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
-	left_value ?= compiler_ctfe_expect_float(left)
-	right_value ?= compiler_ctfe_expect_float(right)
+	match compiler_ctfe_expect_int(left):
+		Err(error):
+			compiler_ctfe_value_desc_error(error)
+		Ok(left_value):
+			match compiler_ctfe_expect_int(right):
+				Ok(right_value):
+					compiler_ctfe_eval_int_binary_values(op, left_value, right_value)
+				Err(error):
+					compiler_ctfe_value_desc_error(error)
 
+
+private pure func compiler_ctfe_eval_float_binary_values(
+	op: ParsedBinaryOp,
+	left_value: Float,
+	right_value: Float,
+) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
 	match op:
 		ParsedAddOp:
 			Ok(CompilerCtfeFloatValue(left_value + right_value))
@@ -513,9 +534,25 @@ private pure func compiler_ctfe_eval_float_binary_desc(
 		ParsedGreaterEqualOp:
 			Ok(CompilerCtfeBoolValue(compiler_ctfe_compare_float(op, left_value, right_value)))
 		ParsedEqualOp:
-			Ok(CompilerCtfeBoolValue(compiler_ctfe_values_equal(left, right)))
+			Ok(CompilerCtfeBoolValue(left_value == right_value))
 		ParsedNotEqualOp:
-			Ok(CompilerCtfeBoolValue(not compiler_ctfe_values_equal(left, right)))
+			Ok(CompilerCtfeBoolValue(left_value != right_value))
+
+
+private pure func compiler_ctfe_eval_float_binary_desc(
+	op: ParsedBinaryOp,
+	left: CompilerCtfeValue,
+	right: CompilerCtfeValue,
+) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
+	match compiler_ctfe_expect_float(left):
+		Err(error):
+			compiler_ctfe_value_desc_error(error)
+		Ok(left_value):
+			match compiler_ctfe_expect_float(right):
+				Ok(right_value):
+					compiler_ctfe_eval_float_binary_values(op, left_value, right_value)
+				Err(error):
+					compiler_ctfe_value_desc_error(error)
 
 
 private pure func compiler_ctfe_eval_string_binary_desc(
@@ -525,9 +562,15 @@ private pure func compiler_ctfe_eval_string_binary_desc(
 ) -> Result[CompilerCtfeValueDesc, CompilerCtfeError]:
 	match op:
 		ParsedAddOp:
-			left_value ?= compiler_ctfe_expect_string(left)
-			right_value ?= compiler_ctfe_expect_string(right)
-			Ok(CompilerCtfeStringValue(left_value + right_value))
+			match compiler_ctfe_expect_string(left):
+				Err(error):
+					compiler_ctfe_value_desc_error(error)
+				Ok(left_value):
+					match compiler_ctfe_expect_string(right):
+						Ok(right_value):
+							Ok(CompilerCtfeStringValue(left_value + right_value))
+						Err(error):
+							compiler_ctfe_value_desc_error(error)
 		ParsedEqualOp:
 			Ok(CompilerCtfeBoolValue(compiler_ctfe_values_equal(left, right)))
 		ParsedNotEqualOp:
@@ -562,7 +605,7 @@ pure func compiler_ctfe_eval_binary(
 	left: CompilerCtfeValue,
 	right: CompilerCtfeValue,
 ) -> Result[CompilerCtfeValue, CompilerCtfeError]:
-	desc ?= match left.desc:
+	desc_result: Result[CompilerCtfeValueDesc, CompilerCtfeError] = match left.desc:
 		CompilerCtfeStringValue(_):
 			compiler_ctfe_eval_string_binary_desc(op, left, right)
 		CompilerCtfeFloatValue(_):
@@ -576,7 +619,11 @@ pure func compiler_ctfe_eval_binary(
 				_:
 					compiler_ctfe_eval_int_binary_desc(op, left, right)
 
-	Ok(compiler_ctfe_value(compiler_ctfe_binary_result_type(op, left), desc, left.span))
+	match desc_result:
+		Ok(desc):
+			Ok(compiler_ctfe_value(compiler_ctfe_binary_result_type(op, left), desc, left.span))
+		Err(error):
+			Err(error)
 
 
 pure func compiler_ctfe_eval_unary(

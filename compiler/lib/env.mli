@@ -355,10 +355,6 @@ val get_func_info :
   env -> string -> (type_expr * bound_type_param list * purity) option
 (** Get a function's info: (type, type_params, purity) *)
 
-val get_func_callable_id : env -> string -> def_id option
-(** Get the canonical declaration identity for the function currently resolved
-    by [name]. *)
-
 val get_func_loop_producer : env -> string -> loop_producer option
 (** Get the compiler loop-producer identity for the function currently
     resolved by [name], if it is one. *)
@@ -389,9 +385,6 @@ val get_type_contains_resource : env -> string -> bool
 val get_constructor :
   env -> string -> (string * string list * type_expr list * int) option
 (** Get a constructor: (parent_type, type_params, field_types, tag) *)
-
-val get_constructor_callable_id : env -> string -> int option
-(** Get the callable identity for a constructor call. *)
 
 val get_record : env -> string -> (string list * field_decl list) option
 (** Get a record: (type_params, fields) *)
@@ -468,9 +461,6 @@ val set_type_param_bounds : env -> bound_type_param list -> env
 val has_trait_bound : env -> string -> string -> bool
 (** Check if a type parameter has a specific trait bound *)
 
-val has_trait_bound_transitive : env -> string -> string -> bool
-(** Check if a type parameter satisfies a trait bound transitively (through supertraits) *)
-
 val trait_method_names_transitive : env -> string -> string list
 (** All method names reachable from [trait_name] through its own
     declaration + the transitive supertrait graph. Cycle-safe. Used
@@ -483,9 +473,6 @@ val trait_methods_with_declaring_trait : env -> string -> (string * string) list
     trait-function bindings for an imported trait that has
     supertraits — each inherited method must bind to its declaring
     trait for correct dispatch. *)
-
-val trait_has_supertrait : env -> string -> string -> bool
-(** Check if a trait has another trait as a supertrait (transitively) *)
 
 val find_trait_method_for_param :
   env -> string -> string -> (trait_method_sig * string) option
@@ -542,7 +529,6 @@ val format_overload_ref : string -> overload_entry -> string
     with the overload's home module when known. Track B's "which
     `map`?" disambiguator. *)
 
-val format_overload_candidates : string -> overload_entry list -> string
 (** Format a list of overload candidates as a bulleted, qualified
     list. Empty input returns the empty string. *)
 

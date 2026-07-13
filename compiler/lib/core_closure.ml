@@ -363,9 +363,14 @@ let adapt_function_refs_func (state : state) (f : core_func) : core_func =
   | Some body ->
       let prev_module = state.current_module in
       state.current_module <- f.cf_module;
+      let bound =
+        List.fold_left
+          (fun bound (param : core_param) -> add_bound_var bound param.cp_name)
+          StringSet.empty f.cf_params
+      in
       let body' =
-        wrap_fn_ref_as_closure state ~bound:StringSet.empty
-          (adapt_function_refs_expr state StringSet.empty body)
+        wrap_fn_ref_as_closure state ~bound
+          (adapt_function_refs_expr state bound body)
       in
       let result = { f with cf_body = Some body' } in
       state.current_module <- prev_module;

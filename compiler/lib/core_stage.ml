@@ -1,7 +1,6 @@
 (** Core pipeline stage enum, shared by [--dump-core-after] and
     [--stop-after] CLI flags.
 
-    The variants match [Core_pipeline.observed_stage_order].
     Adding a stage means: add a variant, update [all] and [to_string],
     insert the matching hook in [Core_pipeline]. The unit tests in
     [test_core_stage.ml] round-trip every variant, so forgetting a
@@ -107,21 +106,3 @@ let of_string s =
   match List.assoc_opt normalized stage_names with
   | Some stage -> Ok stage
   | None -> unknown_stage_error s normalized
-
-(** Parse a comma-separated list of stage names. Used by the CLI so
-    [--dump-core-after=desugar,mono] produces multiple dumps from a
-    single invocation. Whitespace around commas is tolerated.
-
-    Returns all stages in input order on success, or the first error
-    encountered (the error message names the offending element so the
-    user can tell which item was bad in a longer list). *)
-let of_string_list s =
-  let parts = String.split_on_char ',' s in
-  let rec go acc = function
-    | [] -> Ok (List.rev acc)
-    | part :: rest -> (
-        match of_string part with
-        | Ok stage -> go (stage :: acc) rest
-        | Error err -> Error err)
-  in
-  go [] parts

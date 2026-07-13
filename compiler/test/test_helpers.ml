@@ -14,6 +14,17 @@ open Blorp.Types
 
 let contains_substring haystack needle = Blorp.Modules.contains haystack needle
 
+let expr_type_info_from_type ty : expr_type_info =
+  {
+    source_ty = None;
+    semantic_ty = ty;
+    value_ty = ty;
+    origin = Inferred;
+    widening = Keep ty;
+    proofs = Blorp.Type_proof_metadata.unproven_expr;
+    resolved_call = None;
+  }
+
 let check_core_error_raises ~(phase : Blorp.Core_error.phase_tag) ~msg_contains
     f =
   match f () with

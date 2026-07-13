@@ -99,6 +99,14 @@ let named ?(args = []) name =
       ("args", Array args);
     ]
 
+let array_type element dims =
+  Object
+    [
+      ("kind", String "array");
+      ("element", element);
+      ("dims", Array dims);
+    ]
+
 let function_type ?(pure = false) params return_type =
   Object
     [
@@ -517,6 +525,48 @@ let test_decode_widening_metadata () =
                   ("kind", String "collection_element");
                   ("collection", String "vector");
                 ] );
+          ]));
+
+  check_widening "range proof erasure"
+    (Widen
+       {
+         from_ty = TyRange (TyConstInt 10);
+         to_ty = TyNamed ("Int", []);
+         reason = RangeProofErasure;
+       })
+    (expect_widening
+       (Object
+          [
+            ("kind", String "widen");
+            ("from_type", Object [ ("kind", String "range"); ("inner", const_int 10) ]);
+            ("to_type", named "Int");
+            ("reason", Object [ ("kind", String "range_proof_erasure") ]);
+          ]));
+
+  check_widening "tuple literal"
+    (Widen
+       {
+         from_ty = TyTuple [ TyConstInt 1; TyConstInt 2 ];
+         to_ty = TyTuple [ TyNamed ("Int", []); TyNamed ("Int", []) ];
+         reason = TupleLiteral;
+       })
+    (expect_widening
+       (Object
+          [
+            ("kind", String "widen");
+            ( "from_type",
+              Object
+                [
+                  ("kind", String "tuple");
+                  ("items", Array [ const_int 1; const_int 2 ]);
+                ] );
+            ( "to_type",
+              Object
+                [
+                  ("kind", String "tuple");
+                  ("items", Array [ named "Int"; named "Int" ]);
+                ] );
+            ("reason", Object [ ("kind", String "tuple_literal") ]);
           ]))
 
 let test_decode_type_origin () =
@@ -1171,6 +1221,69 @@ let test_decode_typed_expr_control_and_resource_forms () =
       ] -> ()
   | _ -> Alcotest.fail "control/resource typed expression forms did not decode"
 
+let test_decode_for_loop_view () =
+  let source_type = array_type (named "Int") [ const_int 4 ] in
+  let window_type = array_type (named "Int") [ const_int 2 ] in
+  let source = typed_name_with_type "values" source_type in
+  let size_arg = typed_int_literal "2" in
+  let iterable =
+    typed_node
+      ~info:(expr_info (named ~args:[ named "Int" ] "List"))
+      "call"
+      [
+        ( "callee",
+          typed_name_with_type "windows"
+            (function_type ~pure:true
+               [ source_type; named "Int" ]
+               (named ~args:[ named "Int" ] "List")) );
+        ("args", Array [ source; size_arg ]);
+      ]
+  in
+  let typed =
+    expect_typed_expr
+      (typed_node
+         ~info:(expr_info (named "Void"))
+         "for"
+         [
+           ( "binder",
+             Object
+               [
+                 ("kind", String "name");
+                 ("name", ident_at "window");
+               ] );
+           ("iterable", iterable);
+           ( "loop_view",
+             Object
+               [
+                 ("kind", String "windows");
+                 ("source", source);
+                 ("size_arg", size_arg);
+                 ("size", Int 2);
+                 ("element_type", window_type);
+               ] );
+           ("body", typed_void);
+         ])
+  in
+  match (Typed.ast typed).expr_desc with
+  | EFor
+      ( "window",
+        {
+          expr_desc =
+            ELoopView
+              {
+                loop_view_kind = LoopWindows 2;
+                loop_view_source = { expr_desc = EIdent "values"; _ };
+                loop_view_size_arg = Some _;
+                loop_view_elem_type;
+              };
+          _;
+        },
+        _ ) ->
+      check_type "loop view element type"
+        (TyArray (TyNamed ("Int", []), [ TyConstInt 2 ]))
+        loop_view_elem_type
+  | _ -> Alcotest.fail "for loop view did not decode to ELoopView"
+
 let test_decode_concurrent_block_requires_explicit_bindings () =
   let concurrent_block =
     typed_node
@@ -1218,6 +1331,35 @@ let typed_global_var_decl =
           ] );
     ]
 
+let typed_qualified_global_var_decl =
+  let canonical_type = named "std/test::TestSuite" in
+  Object
+    [
+      ("kind", String "global_var");
+      ( "info",
+        Object
+          [
+            ( "decl",
+              Object
+                [
+                  ("name", ident_at "tests");
+                  ("type", parsed_named "TestSuite");
+                  ( "value",
+                    Object
+                      [
+                        ("kind", String "name");
+                        ("name", ident_at "suite_value");
+                        ("span", span_json);
+                      ] );
+                  ("is_mutable", Bool false);
+                  ("span", span_json);
+                ] );
+            ("binding_type", canonical_type);
+            ("source_type", named "TestSuite");
+            ("value", typed_name_with_type "suite_value" canonical_type);
+          ] );
+    ]
+
 let typed_function_info =
   Object
     [
@@ -1236,6 +1378,15 @@ let typed_function_info =
             ("span", span_json);
           ] );
       ("callable_id", Int 77);
+      ( "effective_type_params",
+        Array
+          [
+            Object
+              [
+                ("name", String "T");
+                ("bounds", Array [ String "Stringable" ]);
+              ];
+          ] );
       ("param_types", Array [ named "Int" ]);
       ("source_return_type", named "Int");
       ("semantic_return_type", named "Int");
@@ -1265,6 +1416,7 @@ let typed_impl_method_info =
     [
       ("decl", parsed_impl_method_decl);
       ("callable_id", Int 88);
+      ("effective_type_params", Array []);
       ("param_types", Array [ named "Int" ]);
       ("source_return_type", named "Int");
       ("semantic_return_type", named "Int");
@@ -1497,6 +1649,27 @@ let test_decode_typed_program_global_var () =
       | _ -> Alcotest.fail "expected typed var declaration")
   | _ -> Alcotest.fail "expected one typed declaration"
 
+let test_decode_typed_program_qualified_global_var () =
+  let program =
+    expect_typed_program
+      (Object
+         [
+           ("kind", String "typed_program");
+           ("source", Object []);
+           ("decls", Array [ typed_qualified_global_var_decl ]);
+           ("diagnostics", Array []);
+         ])
+  in
+  match Typed.program_decls program with
+  | [ decl ] -> (
+      match Typed.decl_view decl with
+      | Typed.DeclVar var ->
+          check_type "canonical var binding"
+            (TyNamed ("std/test::TestSuite", []))
+            (Typed.var_binding_type var)
+      | _ -> Alcotest.fail "expected typed var declaration")
+  | _ -> Alcotest.fail "expected one typed declaration"
+
 let test_decode_typed_program_function_decl () =
   let program =
     expect_typed_program
@@ -1517,6 +1690,14 @@ let test_decode_typed_program_function_decl () =
           | None -> Alcotest.fail "expected named function");
           Alcotest.(check (option int))
             "callable id" (Some 77) (Typed.func_callable_id func);
+          (match (Typed.func_ast func).func_type_params with
+          | [ param ] ->
+              Alcotest.(check string) "effective type param" "T"
+                param.param_name;
+              Alcotest.(check (list string)) "effective type param bounds"
+                [ "Stringable" ]
+                (List.map Blorp.Generic_params.trait_ref_name param.param_bounds)
+          | _ -> Alcotest.fail "expected one effective type parameter");
           (match Typed.func_param_infos func with
           | [ param ] ->
               check_type "param type" (TyNamed ("Int", []))
@@ -1904,6 +2085,22 @@ let test_decode_imported_bare_call_uses_ufcs_callee () =
   | ECall ({ expr_desc = EIdent "__ufcs_std$string__string"; _ }, _) -> ()
   | _ -> Alcotest.fail "imported bare call did not decode to UFCS callee"
 
+let test_decode_imported_function_ref_preserves_identity () =
+  let typed =
+    expect_typed_expr
+      (Object
+         [
+           ("kind", String "name");
+           ("name", ident_at "make_string");
+           ( "info",
+             expr_info ~resolved_call:imported_string_split_resolved_call_info
+               (function_type ~pure:true [ named "Int" ] (named "String")) );
+         ])
+  in
+  match (Typed.ast typed).expr_desc with
+  | EIdent "std_string__string" -> ()
+  | _ -> Alcotest.fail "imported function reference lost selected identity"
+
 let test_decode_rejects_unsupported_pattern () =
   match
     Blorp.Typed_ast_json.decode_pattern "$"
@@ -1954,10 +2151,13 @@ let suite =
           test_decode_typed_expr_structural_forms;
         Alcotest.test_case "typed expr control/resource forms" `Quick
           test_decode_typed_expr_control_and_resource_forms;
+        Alcotest.test_case "for loop view" `Quick test_decode_for_loop_view;
         Alcotest.test_case "concurrent block requires explicit bindings" `Quick
           test_decode_concurrent_block_requires_explicit_bindings;
         Alcotest.test_case "typed program global var" `Quick
           test_decode_typed_program_global_var;
+        Alcotest.test_case "typed program qualified global var" `Quick
+          test_decode_typed_program_qualified_global_var;
         Alcotest.test_case "typed program function" `Quick
           test_decode_typed_program_function_decl;
         Alcotest.test_case "typed program record and alias" `Quick
@@ -1976,6 +2176,8 @@ let suite =
           test_decode_typed_expr_resolved_call_metadata;
         Alcotest.test_case "imported bare call uses UFCS callee" `Quick
           test_decode_imported_bare_call_uses_ufcs_callee;
+        Alcotest.test_case "imported function ref preserves identity" `Quick
+          test_decode_imported_function_ref_preserves_identity;
         Alcotest.test_case "unsupported pattern" `Quick
           test_decode_rejects_unsupported_pattern;
         Alcotest.test_case "unknown kind" `Quick test_decode_rejects_unknown_kind;

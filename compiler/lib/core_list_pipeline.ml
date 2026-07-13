@@ -52,7 +52,6 @@ let sink plan = plan.sink
 let cardinality plan = plan.cardinality
 let result_ty plan = plan.result_ty
 let loc plan = plan.loc
-let stage_count plan = List.length (stages plan)
 
 let list_elem_ty = function
   | Ast.TyNamed ("List", [ elem_ty ]) -> Some elem_ty
@@ -235,29 +234,3 @@ let plan_of_expr e =
             ~cardinality:collected.collected_cardinality ~result_ty:e.Core.ty
             ~loc:e.Core.loc
       | None -> None)
-
-let describe_cardinality = function
-  | Exact -> "exact"
-  | UpperBound -> "upper-bound"
-  | Terminal -> "terminal"
-
-let describe_source = function
-  | SourceList _ -> "list"
-  | SourceRange _ -> "range"
-
-let describe_stage = function
-  | StageFilter _ -> "filter"
-  | StageMap _ -> "map"
-  | StageFilterMap _ -> "filter_map"
-
-let describe_sink = function
-  | SinkCollect _ -> "collect"
-  | SinkFold _ -> "fold_left"
-  | SinkLength -> "length"
-
-let describe_plan plan =
-  Printf.sprintf "%s -> [%s] -> %s (%s)"
-    (describe_source plan.source)
-    (String.concat ", " (List.map describe_stage (stages plan)))
-    (describe_sink plan.sink)
-    (describe_cardinality plan.cardinality)

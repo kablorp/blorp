@@ -1354,6 +1354,19 @@ let lookup_generic_by_def_id (state : mono_state) (def_id : int option) :
         Option.map generic_hit_of_func
           (Hashtbl.find_opt state.generic_bodies_by_id id)
 
+(** Callable IDs are local to a frontend typecheck artifact. Once module
+    artifacts are merged, unrelated declarations may carry the same ID. An
+    explicit UFCS callee already provides the authoritative module/name
+    identity, so never let a colliding ID override it. *)
+let selected_generic_hit_matches_callee (callee_name : string)
+    (hit : generic_hit) : bool =
+  match Codegen_names.parse_ufcs_name callee_name with
+  | None -> true
+  | Some (module_path, source_name) ->
+      let qualified_name = module_qualified_name module_path source_name in
+      (hit.gh_module_path = Some module_path || hit.gh_name = qualified_name)
+      && hit.gh_source_name = source_name
+
 let lookup_generic_module_func (state : mono_state) (mod_path : string)
     (orig_name : string) : generic_hit option =
   let prefixed = module_qualified_name mod_path orig_name in
@@ -1605,7 +1618,13 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
             | Some _ as id -> id
             | None -> v.vdef_id
           in
-          match lookup_generic_by_def_id state selected_id with
+          let selected_hit =
+            match lookup_generic_by_def_id state selected_id with
+            | Some hit when selected_generic_hit_matches_callee name hit ->
+                Some hit
+            | Some _ | None -> None
+          in
+          match selected_hit with
           | Some hit -> Some hit
           | None -> (
               (* UFCS-mangled names are already explicit method targets:

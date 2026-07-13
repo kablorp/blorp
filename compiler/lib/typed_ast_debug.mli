@@ -4,5 +4,4 @@
     It exposes type metadata that is otherwise difficult to inspect while
     hardening the typed pipeline. *)
 
-val format_type_info : Typed_ast.type_info -> string
 val format_program : Typed_ast.program -> string

@@ -62,7 +62,7 @@ Current state:
   available.
 - `Core_resolve` promotes selected and name-based calls to `CKUser (name,
   Some def_id)` when it can prove the concrete target.
-- `Core_emit` already prefers DefId-based C names, but still has a
+- The Blorp C emitter already prefers DefId-based C names, but still has a
   compatibility fallback for `CKUser (_, None)`.
 - Purity analysis and `purify` already know how to read resolved call metadata,
   but still keep parse/env-based fallbacks for unresolved cases.
@@ -122,10 +122,11 @@ new long-form docs.
 
 Current priorities:
 
-- Keep `Core_dce` conservative and identity-based. It already prunes concrete
-  unreachable functions, impl methods, empty impl blocks, non-runtime generic
-  templates after monomorphization, and source-only declarations whose runtime
-  artifacts are represented explicitly enough.
+- Keep `compiler_core_dce.brp` conservative and identity-based. It prunes
+  unreachable emitted functions after generic templates and impl containers
+  have already been removed by the projected Core boundary, and closes the
+  projected type graph before pruning unused data declarations. Backend
+  artifacts are derived from the retained declarations.
 - Add new DCE only when the dependency edge is explicit. If in doubt, retain.
 - Split or instrument large aggregate stages before guessing where compile time
   is going. The `Fusion` stage currently represents several full-program

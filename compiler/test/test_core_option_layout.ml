@@ -229,7 +229,7 @@ let test_primitive_stack_abi_is_explicit () =
         (L.c_type_of_primitive_stack_abi expected_abi);
       Alcotest.(check string)
         (name ^ " payload C type") expected_payload_type
-        (L.payload_c_type_of_primitive_stack_abi expected_abi))
+        (L.primitive_stack_abi_info expected_abi).payload_c_type)
     cases
 
 let test_unimplemented_stack_layouts_do_not_claim_primitive_abi () =

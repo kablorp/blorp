@@ -1,0 +1,120 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, ListConstructExpr, LiteralExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreListStorageLayout(InlineListStorage, PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+		core_program_to_json,
+	../src/stage_09_core/compiler_core_pipeline:
+		parse_core_pipeline_stage,
+		run_core_pipeline_stage,
+		run_pre_dce_tail,
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func selected_call_without_callee_id(name: String, def_id: Int) -> CoreExpr:
+	callee: CoreVar = {
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(callee, int_type(), SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_pre_dce_tail_resolves_selected_direct_call() -> Bool:
+	program: CoreProgram = {
+		decls = [function_decl(
+				"main",
+				1,
+				selected_call_without_callee_id("helper", 2),
+			), function_decl(
+				"helper",
+				2,
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = []
+	}
+	json: String = core_program_to_json(run_pre_dce_tail(program)).to_string()
+
+	json.contains("\"call_kind\":{\"kind\":\"user\"") and not json.contains("selected_direct")
+
+
+pure func test_named_list_layout_stage_relayouts_list_nodes() -> Bool:
+	list_type: CoreType = NamedType("List", [int_type()])
+	body: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = True
+		},
+		list_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, body)],
+		foreign_includes = []
+	}
+
+	match parse_core_pipeline_stage("list_layout"):
+		Some(ListLayoutStage):
+			match run_core_pipeline_stage(ListLayoutStage, program).decls.get(0):
+				Some(FunctionDecl(function_info)):
+					match function_info.body:
+						Some(ListConstructExpr(construct, _, _)):
+							match construct.layout:
+								InlineListStorage(width):
+									width == 8 and not construct.elem_needs_release
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler contiguous Core pipeline",
+	tests = [
+		(
+			"pre-DCE tail resolves selected direct call",
+			test_pre_dce_tail_resolves_selected_direct_call,
+		),
+		(
+			"named list-layout stage relayouts list nodes",
+			test_named_list_layout_stage_relayouts_list_nodes,
+		),
+	]
+}

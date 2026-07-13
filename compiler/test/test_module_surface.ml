@@ -142,10 +142,10 @@ let test_parse_artifact_preserves_module_surface () =
   | Some surface ->
       check_names "artifact export names"
         [ "Box"; "Renderable"; "render"; "render" ]
-        (MS.export_names surface);
+        (List.map (fun (symbol : MS.symbol) -> symbol.name) surface.exports);
       check_names "artifact private names"
         [ "HiddenTrait"; "hidden_func"; "hidden_impl"; "hidden_method" ]
-        (MS.private_names surface)
+        (List.map (fun (symbol : MS.symbol) -> symbol.name) surface.private_names)
 
 let suite =
   [

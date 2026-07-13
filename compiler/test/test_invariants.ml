@@ -56,12 +56,18 @@ let mk_prog decls : core_program =
 let ty_result ok_ty = TyNamed ("Result", [ ok_ty; ty_concurrency_error ])
 let ty_list elem_ty = TyNamed ("List", [ elem_ty ])
 
+let tensor_storage_known_producer tsp_layout =
+  TensorStorageProven { tsp_kind = TensorStorageKnownProducer; tsp_layout }
+
 let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) ?(captures = [])
     return_ty =
+  let copy_capture (task_capture_name, task_capture_ty) =
+    { task_capture_name; task_capture_ty; task_capture_kind = TaskCopyCapture }
+  in
   {
     tc_func = name;
     tc_def_id = def_id;
-    tc_captures = task_copy_captures captures;
+    tc_captures = List.map copy_capture captures;
     tc_return_ty = return_ty;
   }
 
@@ -943,7 +949,8 @@ let test_tensor_literal_layout_invariant_accepts_matching_raw_payload () =
 let test_tensor_literal_layout_invariant_flags_storage_mismatch () =
   let body =
     tensor_literal_with_layout
-      (tensor_boxed_storage ~elem_ty:ty_float ())
+      (tensor_storage_layout ~elem_ty:ty_float
+         ~value_layout:TensorValueBoxedPointer TensorBoxedStorage)
       (TensorRawElements (TensorFloat64Elements, [ tensor_payload_elem ]))
   in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in

@@ -1,0 +1,390 @@
+import:
+	../src/stage_09_core/compiler_core_dce: prune_program
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(UnknownCall, UserCall),
+		CoreClosureCreate,
+		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, ValueRecordDecl),
+		CoreExpr(CallExpr, ClosureCreateExpr, DetachExpr, LiteralExpr, SetAllocExpr, VarExpr, VoidExpr),
+		CoreFunctionKind(UserFunction),
+		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTaskClosure,
+		CoreType(NamedType, ValueRecordType, VoidType),
+		CoreValueRecordField,
+		CoreVar,
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func named_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func user_call(name: String, def_id: Option[Int]) -> CoreExpr:
+	CallExpr(
+		UserCall(name, def_id, []),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func dynamic_call() -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func trait_decl(name: String) -> CoreDecl:
+	TraitDecl({
+		name = name,
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name, Some(def_id)),
+		typ = int_type(),
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func private_global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name, Some(def_id)),
+		typ = int_type(),
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = True,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func value_record_decl(name: String, field_type: CoreType) -> CoreDecl:
+	fields: List[CoreValueRecordField] = [
+		{
+			name = "value",
+			typ = field_type
+		},
+	]
+	ValueRecordDecl({
+		name = name,
+		type_params = [],
+		fields = fields,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func function_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(function_info):
+				names = names.append(function_info.name)
+			_:
+				void
+
+	names
+
+
+pure func value_record_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			ValueRecordDecl(record_info):
+				names = names.append(record_info.name)
+			_:
+				void
+
+	names
+
+
+pure func global_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				names = names.append(global.name.name)
+			_:
+				void
+
+	names
+
+
+func test_prunes_unreachable_functions() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			user_call("helper", Some(2)),
+		),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_global_initializers_root_functions() -> Bool:
+	input_program = program([
+		global_decl(
+			"answer",
+			10,
+			user_call("helper", Some(2)),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_prunes_unreferenced_private_global_and_initializer_helpers() -> Bool:
+	input_program = program([
+		private_global_decl(
+			"scratch",
+			10,
+			user_call("build_scratch", Some(2)),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("build_scratch", 2, int_literal(2)),
+	])
+	pruned = prune_program(input_program)
+
+	global_names(pruned).length() == 0 and function_names(pruned) == ["main"]
+
+
+func test_retains_private_global_referenced_by_runtime_function() -> Bool:
+	input_program = program([
+		private_global_decl("scratch", 10, int_literal(42)),
+		function_decl(
+			"main",
+			1,
+			VarExpr(named_var("scratch", Some(10)), int_type(), SyntheticSourceLoc),
+		),
+	])
+
+	global_names(prune_program(input_program)) == ["scratch"]
+
+
+func test_closure_creation_roots_adapter() -> Bool:
+	closure: CoreClosureCreate = {
+		function_name = "adapter",
+		def_id = 2,
+		c_name = "adapter__def_2",
+		static_name = "adapter__closure_2",
+		captures = []
+	}
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			ClosureCreateExpr(
+				closure,
+				NamedType("Closure", []),
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl("adapter", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "adapter"]
+
+
+func test_custom_hash_callbacks_are_roots() -> Bool:
+	set_alloc = SetAllocExpr(
+		{constructor = CustomHashContainerConstructor("widget_hash", "widget_equals", True)},
+		NamedType("Set", [NamedType("Widget", [])]),
+		SyntheticSourceLoc,
+	)
+	input_program = program([
+		function_decl("main", 1, set_alloc),
+		function_decl("widget_hash", 2, int_literal(2)),
+		function_decl("widget_equals", 3, int_literal(3)),
+		function_decl("dead", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "widget_hash", "widget_equals"]
+
+
+func test_detached_task_closures_are_roots() -> Bool:
+	task: CoreTaskClosure = {
+		function_name = "task_body",
+		def_id = 2,
+		c_name = "task_body__def_2",
+		static_name = "task_body__task_2",
+		captures = [],
+		return_type = int_type()
+	}
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			DetachExpr({task = task}, VoidType, SyntheticSourceLoc),
+		),
+		function_decl("task_body", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "task_body"]
+
+
+func test_unresolved_user_calls_fail_closed() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			user_call("helper", None),
+		),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper", "dead"]
+
+
+func test_dynamic_closure_calls_do_not_root_unrelated_functions() -> Bool:
+	input_program = program([
+		function_decl("main", 1, dynamic_call()),
+		function_decl("dead", 2, int_literal(2)),
+	])
+
+	function_names(prune_program(input_program)) == ["main"]
+
+
+func test_missing_main_fails_closed() -> Bool:
+	input_program = program([
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["helper", "dead"]
+
+
+func test_duplicate_function_ids_are_kept_conservatively() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		function_decl("duplicate", 1, int_literal(1)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "duplicate"]
+
+
+func test_prunes_types_and_retains_field_dependencies() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			VoidExpr(ValueRecordType("Outer"), SyntheticSourceLoc),
+		),
+		value_record_decl("Outer", ValueRecordType("Inner")),
+		value_record_decl("Inner", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["Outer", "Inner"]
+
+
+func test_retains_trait_signatures() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		trait_decl("Display"),
+	])
+
+	match prune_program(input_program).decls:
+		[FunctionDecl(_), TraitDecl(trait_info)]:
+			trait_info.name == "Display"
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler Core DCE",
+	tests = [
+		("prunes unreachable functions", test_prunes_unreachable_functions),
+		("global initializers root functions", test_global_initializers_root_functions),
+		(
+			"prunes unreferenced private global and initializer helpers",
+			test_prunes_unreferenced_private_global_and_initializer_helpers,
+		),
+		(
+			"retains private global referenced by runtime function",
+			test_retains_private_global_referenced_by_runtime_function,
+		),
+		("closure creation roots adapter", test_closure_creation_roots_adapter),
+		("custom hash callbacks are roots", test_custom_hash_callbacks_are_roots),
+		("detached task closures are roots", test_detached_task_closures_are_roots),
+		("unresolved user calls fail closed", test_unresolved_user_calls_fail_closed),
+		(
+			"dynamic closure calls do not root unrelated functions",
+			test_dynamic_closure_calls_do_not_root_unrelated_functions,
+		),
+		("missing main fails closed", test_missing_main_fails_closed),
+		(
+			"duplicate function ids are kept conservatively",
+			test_duplicate_function_ids_are_kept_conservatively,
+		),
+		(
+			"prunes types and retains field dependencies",
+			test_prunes_types_and_retains_field_dependencies,
+		),
+		("retains trait signatures", test_retains_trait_signatures),
+	]
+}
