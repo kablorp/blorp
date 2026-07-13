@@ -134,9 +134,12 @@ Exit condition:
 
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
+Status: implemented on this branch. The private worker is built but is not yet
+called by the production Blorp CLI; that cutover remains in later checkpoints.
+
 New Blorp file:
 
-- `compiler/blorp/src/stage_08_core_lower/compiler_semantic_worker_protocol.brp`
+- `compiler/blorp/src/stage_09_core/compiler_semantic_worker_protocol.brp`
 
 Temporary OCaml file:
 
@@ -148,7 +151,7 @@ The request should be a typed record equivalent to:
 
 ```text
 SemanticMiddleRequest
-  schema_version
+  schema_version and required capabilities
   target_module
   typed_modules
   debug_mode
@@ -162,9 +165,15 @@ The response is a union, not optional fields with coupled meanings:
 ```text
 SemanticMiddleResponse
   SemanticMiddleCompiled(pre_dce_core, observations)
-  SemanticMiddleStopped(stage, core_snapshot, observations)
+  SemanticMiddleStopped(stage, rendered_snapshot, observations)
   SemanticMiddleFailed(diagnostics)
 ```
+
+Successful compilation returns the machine-readable pre-DCE Core JSON consumed
+by the Blorp late pipeline. Earlier OCaml Core forms are intentionally outside
+that projection schema, so requested early/middle observations and stop
+snapshots are stable rendered Core text rather than pretending to be backend
+Core JSON.
 
 Implementation:
 
@@ -188,18 +197,35 @@ Implementation:
    Checkpoint F after the required process semantics exist.
 7. Add a protocol capability/version handshake. A schema mismatch is a hard
    infrastructure error with expected and actual versions.
-8. Add a test-only invocation counter so end-to-end tests can prove one worker
-   call per source command without parsing logs or process names.
+8. The executable consumes exactly one stdin request and then exits. Add the
+   test-only invocation counter at the Blorp process-client seam in Checkpoint
+   F, where it can actually prove one process invocation per source command. A
+   process-local worker counter would always start from zero and could not
+   detect duplicate spawns.
 
 Tests:
 
 - new `compiler/blorp/tests/test_compiler_semantic_worker_protocol.brp`
 - new `compiler/test/test_semantic_middle_worker.ml`
-- malformed schema, missing field, unknown variant, and truncated response
+- malformed schema, missing field, and unknown variant
 - multi-module graph with a shared dependency
 - imported aliases, traits, foreign declarations, CTFE globals, and `main`
 - `--stop-after`, `--dump-core-after`, and invariant-check requests
 - infrastructure failure distinct from source diagnostics
+
+Raw malformed/truncated stdout tests land with the real process client in
+Checkpoint F. Before that client exists, the worker executable is smoke-tested
+directly: malformed request JSON exits nonzero on stderr, while valid semantic
+failures remain versioned `SemanticMiddleFailed` responses.
+
+Implemented evidence on 2026-07-13:
+
+- 7 Blorp protocol tests;
+- 9 OCaml protocol/worker tests, including a real typed target and two explicit
+  typed modules with no module-cache dependency;
+- explicit import-binding table and resource-cleanup restoration regressions;
+- private `blorp_ocaml_middle.exe` stdin/stdout smoke tests; and
+- `scripts/test compiler-unit compiler-unit-deep compiler`: 3,443 passed.
 
 Exit condition:
 

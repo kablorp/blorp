@@ -6,8 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 build_plan=$(make -n build)
-if ! grep -Fxq 'cd compiler && dune build bin/blorp_ocaml_host.exe' <<<"$build_plan"; then
-	echo "FAIL: make build must target only the private OCaml host" >&2
+expected_ocaml_build='cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe'
+if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
+	echo "FAIL: make build must target only the private OCaml host executables" >&2
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi

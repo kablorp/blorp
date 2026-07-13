@@ -70,7 +70,7 @@ compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
-	cd compiler && dune build bin/blorp_ocaml_host.exe
+	cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for compiler stages that have not yet moved across the boundary.

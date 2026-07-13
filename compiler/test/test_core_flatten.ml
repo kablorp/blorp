@@ -346,6 +346,48 @@ let test_resource_scope_binding_stays_local () =
       | _ -> Alcotest.fail "expected resource scope body")
   | _ -> Alcotest.fail "unexpected rewritten declaration shape"
 
+let import_binding ?original_name local_name module_path :
+    Session.import_binding =
+  { local_name; module_path; original_name }
+
+let test_import_tables_build_from_explicit_bindings () =
+  let main_imports =
+    [
+      import_binding ~original_name:"SourceValue" "Value" "pkg/value";
+      import_binding "qualified" "pkg/qualified";
+    ]
+  in
+  let module_bindings =
+    [
+      ( "pkg/consumer",
+        [ import_binding ~original_name:"make" "create" "pkg/provider" ] );
+      ("pkg/empty", []);
+    ]
+  in
+  let main_table, module_tables =
+    Core_flatten.build_import_tables_from_bindings
+      ~main_import_bindings:main_imports module_bindings
+  in
+  Alcotest.(check (option (pair string string)))
+    "main alias preserves original name"
+    (Some ("pkg/value", "SourceValue"))
+    (Hashtbl.find_opt main_table "Value");
+  Alcotest.(check (option (pair string string)))
+    "qualified import preserves empty original name"
+    (Some ("pkg/qualified", ""))
+    (Hashtbl.find_opt main_table "qualified");
+  let consumer = Hashtbl.find_opt module_tables "pkg/consumer" in
+  Alcotest.(check bool) "consumer table exists" true (Option.is_some consumer);
+  Alcotest.(check bool) "empty table is omitted" false
+    (Hashtbl.mem module_tables "pkg/empty");
+  match consumer with
+  | Some table ->
+      Alcotest.(check (option (pair string string)))
+        "module alias preserves owner"
+        (Some ("pkg/provider", "make"))
+        (Hashtbl.find_opt table "create")
+  | None -> Alcotest.fail "expected consumer import table"
+
 let suite =
   [
     ( "type_names",
@@ -368,5 +410,10 @@ let suite =
           test_local_assignment_target_stays_local;
         Alcotest.test_case "resource scope binding stays local" `Quick
           test_resource_scope_binding_stays_local;
+      ] );
+    ( "imports",
+      [
+        Alcotest.test_case "build tables from explicit bindings" `Quick
+          test_import_tables_build_from_explicit_bindings;
       ] );
   ]
