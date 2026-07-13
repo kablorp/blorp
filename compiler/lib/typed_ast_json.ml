@@ -75,6 +75,10 @@ let field path name = function
       | None -> error path ("missing field `" ^ name ^ "`"))
   | _ -> error path "expected object"
 
+let optional_field path name = function
+  | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
+  | _ -> error path "expected object"
+
 let kind_field path value =
   let* value = field path "kind" value in
   match value with
@@ -887,6 +891,22 @@ let bridge_ufcs_name module_path source_name =
   Codegen_names.ufcs_prefix ^ encode_ufcs_module_part module_path ^ "__"
   ^ source_name
 
+let normalize_imported_function_ref_desc
+    (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
+  match (desc, info.resolved_call) with
+  | ( Ast.EIdent _,
+      Some
+        {
+          target =
+            DecodedDirectCall
+              { origin = Ast.CallableImported module_path; _ };
+          source_name;
+          _;
+        } ) ->
+      Ast.EIdent
+        (Codegen_names.sanitize_module_name module_path ^ "__" ^ source_name)
+  | _ -> desc
+
 let normalize_imported_bare_call_desc
     (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
   match (desc, info.resolved_call) with
@@ -981,6 +1001,7 @@ let materialize_resolved_call _path desc
                }))
 
 let make_typed_expr path loc info desc =
+  let desc = normalize_imported_function_ref_desc info desc in
   let desc = normalize_imported_bare_call_desc info desc in
   let* resolved_call =
     materialize_resolved_call (path ^ ".info.resolved_call") desc
@@ -1050,6 +1071,52 @@ and decode_typed_string_interpolation_part path value =
       error
         (path ^ ".kind")
         ("unsupported typed string interpolation part kind `" ^ kind ^ "`")
+
+and decode_loop_view path loc = function
+  | Lsp_json.Null -> Ok None
+  | value ->
+      let* kind = kind_field path value in
+      let* source_json = field path "source" value in
+      let* source = decode_typed_expr (path ^ ".source") source_json in
+      let* element_type_json = field path "element_type" value in
+      let* element_type =
+        decode_type (path ^ ".element_type") element_type_json
+      in
+      let* loop_view_kind, size_arg =
+        match kind with
+        | "indices" -> Ok (Ast.LoopIndices, None)
+        | "enumerate" -> Ok (Ast.LoopEnumerate, None)
+        | "enumerate2" -> Ok (Ast.LoopEnumerate2, None)
+        | "windows" ->
+            let* size = int_field path "size" value in
+            if size <= 0 then error (path ^ ".size") "expected positive window size"
+            else
+              let* size_arg_json = field path "size_arg" value in
+              let* size_arg =
+                decode_typed_expr (path ^ ".size_arg") size_arg_json
+              in
+              Ok (Ast.LoopWindows size, Some (Typed_ast.ast size_arg))
+        | _ -> error (path ^ ".kind") ("unsupported loop view `" ^ kind ^ "`")
+      in
+      let loop_type = Ast.TyNamed ("Loop", [ element_type ]) in
+      let ast =
+        Ast.untyped_expr ~loc
+          (Ast.ELoopView
+             {
+               loop_view_kind;
+               loop_view_source = Typed_ast.ast source;
+               loop_view_size_arg = size_arg;
+               loop_view_elem_type = element_type;
+             })
+      in
+      (match
+         Typed_ast.of_ast_expr_with_type_info
+           ~context:"decoded loop view" ~origin:(Ast.Synthesized "loop view")
+           ~semantic_ty:loop_type ~value_ty:loop_type
+           ~widening:(Type_widening_metadata.Keep loop_type) ast
+       with
+      | Ok typed -> Ok (Some typed)
+      | Error _ -> error path "decoded loop view failed typed-AST validation")
 
 and decode_typed_lambda_param path value =
   let* name_json = field path "name" value in
@@ -1523,8 +1590,17 @@ and decode_typed_expr path value =
       let* binder = decode_for_binder (path ^ ".binder") binder_json in
       let* iterable_json = field path "iterable" value in
       let* iterable = decode_typed_expr (path ^ ".iterable") iterable_json in
+      let* loop_view_json = optional_field path "loop_view" value in
+      let* loop_view =
+        match loop_view_json with
+        | Some loop_view_json ->
+            decode_loop_view (path ^ ".loop_view") (Typed_ast.loc iterable)
+              loop_view_json
+        | None -> Ok None
+      in
       let* body_json = field path "body" value in
       let* body = decode_typed_expr (path ^ ".body") body_json in
+      let iterable = Option.value ~default:iterable loop_view in
       let desc =
         match binder with
         | DecodedForNameBinder name ->
@@ -1662,8 +1738,8 @@ let function_body_from_typed_body source_func = function
   | Some body -> Ast.FuncBodyExpr (Typed_ast.ast body)
   | None -> source_func.Ast.func_body
 
-let canonical_function_from_typed_info path source_func param_types
-    semantic_return_type typed_body =
+let canonical_function_from_typed_info path source_func effective_type_params
+    param_types semantic_return_type typed_body =
   let* params =
     params_with_semantic_types (path ^ ".param_types")
       source_func.Ast.func_params param_types
@@ -1671,6 +1747,7 @@ let canonical_function_from_typed_info path source_func param_types
   Ok
     {
       source_func with
+      Ast.func_type_params = effective_type_params;
       Ast.func_params = params;
       func_return_type = Some semantic_return_type;
       func_body = function_body_from_typed_body source_func typed_body;
@@ -1706,6 +1783,21 @@ let decode_typed_function_info path value =
   let* doc = option_string_field (path ^ ".decl") "doc" decl_json in
   let* callable_id_json = field path "callable_id" value in
   let* callable_id = option_int_value (path ^ ".callable_id") callable_id_json in
+  let decode_effective_type_param param_path param_json =
+    let* name = string_field param_path "name" param_json in
+    let* bounds_json = array_field param_path "bounds" param_json in
+    let* bounds =
+      decode_list (param_path ^ ".bounds") string_value bounds_json
+    in
+    Ok (Ast.make_type_param name bounds)
+  in
+  let* effective_type_params_json =
+    array_field path "effective_type_params" value
+  in
+  let* effective_type_params =
+    decode_list (path ^ ".effective_type_params") decode_effective_type_param
+      effective_type_params_json
+  in
   let* param_types_json = array_field path "param_types" value in
   let* param_types =
     decode_list (path ^ ".param_types") decode_type param_types_json
@@ -1721,8 +1813,8 @@ let decode_typed_function_info path value =
   let* body_json = field path "body" value in
   let* typed_body = decode_optional_typed_expr (path ^ ".body") body_json in
   let* canonical_func =
-    canonical_function_from_typed_info path source_func param_types
-      semantic_return_type typed_body
+    canonical_function_from_typed_info path source_func effective_type_params
+      param_types semantic_return_type typed_body
   in
   let source_decl =
     { Ast.decl_desc = Ast.DFunc source_func; decl_loc = loc; decl_doc = doc }

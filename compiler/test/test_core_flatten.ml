@@ -110,6 +110,71 @@ let test_std_global_abi_type_stays_stable () =
       Alcotest.(check string) "List stays ABI-stable" "List" r.record_name
   | _ -> Alcotest.fail "unexpected rewritten declaration shape"
 
+let test_std_module_local_builtin_type_is_module_owned () =
+  let session_ty = TyNamed ("TlsSession", []) in
+  let session_decl =
+    {
+      type_name = "TlsSession";
+      type_params = [];
+      type_variants = [];
+      type_is_enum = false;
+      type_is_builtin = true;
+      type_is_resource = true;
+      type_resource_cleanup = None;
+    }
+  in
+  let impl =
+    { ci_trait = "Resource"; ci_for_type = session_ty; ci_methods = [] }
+  in
+  let rewritten =
+    Core_flatten.prefix_module_names "std/net/tls"
+      [ decl (CDType session_decl); decl (CDImpl impl) ]
+  in
+  match rewritten with
+  | [ { cd_desc = CDType type_decl; _ }; { cd_desc = CDImpl impl'; _ } ] ->
+      Alcotest.(check string)
+        "builtin declaration is module-owned" "std_net_tls__TlsSession"
+        type_decl.type_name;
+      Alcotest.(check bool)
+        "impl receiver matches module-owned type" true
+        (Types.types_equal impl'.ci_for_type
+           (TyNamed ("std_net_tls__TlsSession", [])))
+  | _ -> Alcotest.fail "unexpected rewritten declaration shape"
+
+let test_imported_function_signature_exposes_module_type_rewrite () =
+  let rewrites = Core_flatten.create_imported_type_rewrites () in
+  let duration = TyNamed ("Duration", []) in
+  let function_decl =
+    {
+      func_name = Some "milliseconds";
+      func_type_params = [];
+      func_params =
+        [
+          {
+            param_name = Some "value";
+            param_pattern = None;
+            param_type = Some ty_int;
+            param_loc = loc;
+          };
+        ];
+      func_return_type = Some duration;
+      func_body = FuncNoBody;
+      func_is_pure = true;
+      func_is_tailrec = false;
+      func_no_copy = false;
+      func_debug_only = false;
+      func_resource_result_ordinary = false;
+      func_dim_constraints = [];
+    }
+  in
+  Core_flatten.add_imported_signature_type_rewrites rewrites
+    [ ("Duration", "std_units__Duration") ]
+    { decl_desc = DFunc function_decl; decl_loc = loc; decl_doc = None };
+  Alcotest.(check (option string))
+    "signature return type uses owner identity"
+    (Some "std_units__Duration")
+    (Core_flatten.find_imported_type_rewrite rewrites "Duration")
+
 let test_global_assignment_targets_are_module_owned () =
   let global =
     {
@@ -289,6 +354,11 @@ let suite =
           test_std_non_abi_types_are_module_owned;
         Alcotest.test_case "std global ABI type stays stable" `Quick
           test_std_global_abi_type_stays_stable;
+        Alcotest.test_case "std module-local builtin type is module-owned"
+          `Quick test_std_module_local_builtin_type_is_module_owned;
+        Alcotest.test_case
+          "imported function signature exposes module type rewrite" `Quick
+          test_imported_function_signature_exposes_module_type_rewrite;
       ] );
     ( "values",
       [

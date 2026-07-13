@@ -47,6 +47,7 @@ import:
 			GlobalDecl,
 			HeapRecordDecl,
 			ImplDecl,
+			TraitDecl,
 			TypeAliasDecl,
 			UnionDecl,
 			ValueRecordDecl,
@@ -138,6 +139,7 @@ import:
 			WhileExpr,
 		),
 		CoreFunction,
+		CoreGlobal,
 		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
 		CoreHashContainerConstructor(
 			CustomHashContainerConstructor,
@@ -184,6 +186,7 @@ import:
 record DceFacts {
 	function_ids: List[Int],
 	function_names: List[String],
+	global_names: List[String],
 	type_names: List[String],
 	fail_closed: Bool
 }
@@ -201,6 +204,13 @@ private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
 		facts
 	else:
 		{ facts | function_names = facts.function_names.append(name) }
+
+
+private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
+	if facts.global_names.contains(name):
+		facts
+	else:
+		{ facts | global_names = facts.global_names.append(name) }
 
 
 private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
@@ -275,7 +285,9 @@ private pure func collect_hash_constructor(
 private pure func collect_call_kind(facts: DceFacts, kind: CoreCallKind) -> DceFacts:
 	match kind:
 		UnknownCall:
-			{ facts | fail_closed = True }
+			-- Dynamic closure calls do not name a top-level target. Reachability for
+			-- their code comes from ClosureCreateExpr and task-closure metadata.
+			facts
 		SelectedDirectCall(def_id):
 			add_function_id(facts, def_id)
 		UserCall(name, Some(def_id), consumed_args):
@@ -568,7 +580,7 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		LiteralExpr(literal, typ, loc):
 			facts
 		VarExpr(variable, typ, loc):
-			facts
+			add_global_name(facts, variable.name)
 		VoidExpr(typ, loc):
 			facts
 		CooperativeCheckpointExpr(typ, loc):
@@ -911,22 +923,37 @@ private pure func function_is_prunable(function_info: CoreFunction) -> Bool:
 			True
 		BuiltinFunction:
 			False
-		ForeignFunction:
+		ForeignFunction(_):
 			False
 
 
-private pure func function_for_id(
+private pure func function_facts_for_id(
 	functions: List[CoreFunction],
 	def_id: Int,
-) -> Option[CoreFunction]:
-	var found: Option[CoreFunction] = None
+) -> Option[DceFacts]:
+	var found = False
+	var facts: DceFacts = {
+		function_ids = [],
+		function_names = [],
+		global_names = [],
+		type_names = [],
+		fail_closed = False,
+	}
 
 	for function_info in functions:
 		if function_info.def_id == def_id:
-			found = Some(function_info)
-			break
+			found = True
 
-	found
+			match function_info.body:
+				Some(body):
+					facts = collect_expr(facts, body)
+				None:
+					void
+
+	if found:
+		Some(facts)
+	else:
+		None
 
 
 private pure func add_functions_named(
@@ -973,25 +1000,53 @@ private pure func collect_functions(program_value: CoreProgram) -> List[CoreFunc
 	functions
 
 
-private pure func has_duplicate_function_ids(functions: List[CoreFunction]) -> Bool:
-	var seen: List[Int] = []
-	var duplicate: Bool = False
-
-	for function_info in functions:
-		if seen.contains(function_info.def_id):
-			duplicate = True
-			break
-		else:
-			seen = seen.append(function_info.def_id)
-
-	duplicate
-
-
 record DceRoots {
 	reachable: List[Int],
+	reachable_globals: List[String],
 	fail_closed: Bool,
 	saw_main: Bool
 }
+
+
+private pure func collect_globals(program_value: CoreProgram) -> List[CoreGlobal]:
+	var globals: List[CoreGlobal] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				globals = globals.append(global)
+			_:
+				void
+
+	globals
+
+
+private pure func global_for_name(
+	globals: List[CoreGlobal],
+	name: String,
+) -> Option[CoreGlobal]:
+	var found: Option[CoreGlobal] = None
+
+	for global in globals:
+		if global.name.name == name:
+			found = Some(global)
+			break
+
+	found
+
+
+private pure func append_global_names(
+	reachable: List[String],
+	globals: List[CoreGlobal],
+	names: List[String],
+) -> List[String]:
+	var result = reachable
+
+	for name in names:
+		if not result.contains(name) and global_for_name(globals, name).is_some():
+			result = result.append(name)
+
+	result
 
 
 private pure func collect_roots(
@@ -999,8 +1054,10 @@ private pure func collect_roots(
 	functions: List[CoreFunction],
 ) -> DceRoots:
 	var reachable: List[Int] = []
+	var reachable_globals: List[String] = []
 	var fail_closed: Bool = False
 	var saw_main: Bool = False
+	globals = collect_globals(program_value)
 
 	for function_info in functions:
 		if function_is_entrypoint(function_info):
@@ -1012,25 +1069,13 @@ private pure func collect_roots(
 			if not reachable.contains(function_info.def_id):
 				reachable = reachable.append(function_info.def_id)
 
-	for decl in program_value.decls:
-		match decl:
-			GlobalDecl(global):
-				facts: DceFacts = collect_expr(
-					{
-						function_ids = [],
-						function_names = [],
-						type_names = [],
-						fail_closed = False
-					},
-					global.init,
-				)
-				reachable = apply_facts(reachable, functions, facts)
-				fail_closed = fail_closed or facts.fail_closed
-			_:
-				void
+	for global in globals:
+		if not global.is_private:
+			reachable_globals = reachable_globals.append(global.name.name)
 
 	{
 		reachable = reachable,
+		reachable_globals = reachable_globals,
 		fail_closed = fail_closed,
 		saw_main = saw_main
 	}
@@ -1038,14 +1083,18 @@ private pure func collect_roots(
 
 record DceClosure {
 	reachable: List[Int],
+	reachable_globals: List[String],
 	fail_closed: Bool
 }
 
 
 private @tail_recursive pure func close_reachability(
 	functions: List[CoreFunction],
+	globals: List[CoreGlobal],
 	reachable: List[Int],
 	scanned: List[Int],
+	reachable_globals: List[String],
+	scanned_globals: List[String],
 ) -> DceClosure:
 	var next_id: Option[Int] = None
 
@@ -1056,42 +1105,97 @@ private @tail_recursive pure func close_reachability(
 
 	match next_id:
 		None:
-			{
-				reachable = reachable,
-				fail_closed = False
-			}
-		Some(def_id):
-			updated_scanned: List[Int] = scanned.append(def_id)
+			var next_global: Option[String] = None
 
-			match function_for_id(functions, def_id):
+			for name in reachable_globals:
+				if not scanned_globals.contains(name):
+					next_global = Some(name)
+					break
+
+			match next_global:
 				None:
-					close_reachability(functions, reachable, updated_scanned)
-				Some(function_info):
-					match function_info.body:
+					{
+						reachable = reachable,
+						reachable_globals = reachable_globals,
+						fail_closed = False,
+					}
+				Some(name):
+					updated_scanned_globals = scanned_globals.append(name)
+
+					match global_for_name(globals, name):
 						None:
-							close_reachability(functions, reachable, updated_scanned)
-						Some(body):
+							close_reachability(
+								functions,
+								globals,
+								reachable,
+								scanned,
+								reachable_globals,
+								updated_scanned_globals,
+							)
+						Some(global):
 							facts: DceFacts = collect_expr(
 								{
 									function_ids = [],
 									function_names = [],
+									global_names = [],
 									type_names = [],
-									fail_closed = False
+									fail_closed = False,
 								},
-								body,
+								global.init,
 							)
 
 							if facts.fail_closed:
 								{
 									reachable = reachable,
-									fail_closed = True
+									reachable_globals = reachable_globals,
+									fail_closed = True,
 								}
 							else:
 								close_reachability(
 									functions,
+									globals,
 									apply_facts(reachable, functions, facts),
-									updated_scanned,
+									scanned,
+									append_global_names(
+										reachable_globals,
+										globals,
+										facts.global_names,
+									),
+									updated_scanned_globals,
 								)
+		Some(def_id):
+			updated_scanned: List[Int] = scanned.append(def_id)
+
+			match function_facts_for_id(functions, def_id):
+				None:
+					close_reachability(
+						functions,
+						globals,
+						reachable,
+						updated_scanned,
+						reachable_globals,
+						scanned_globals,
+					)
+				Some(facts):
+					if facts.fail_closed:
+						{
+							reachable = reachable,
+							reachable_globals = reachable_globals,
+							fail_closed = True,
+						}
+					else:
+						close_reachability(
+							functions,
+							globals,
+							apply_facts(reachable, functions, facts),
+							updated_scanned,
+							append_global_names(
+								reachable_globals,
+								globals,
+								facts.global_names,
+							),
+							scanned_globals,
+						)
 
 
 private pure func function_is_kept(reachable: List[Int], function_info: CoreFunction) -> Bool:
@@ -1114,10 +1218,12 @@ private pure func collect_function_types(facts: DceFacts, function_info: CoreFun
 private pure func collect_type_root_facts(
 	program_value: CoreProgram,
 	reachable: List[Int],
+	reachable_globals: List[String],
 ) -> DceFacts:
 	var facts: DceFacts = {
 		function_ids = [],
 		function_names = [],
+		global_names = [],
 		type_names = [],
 		fail_closed = False
 	}
@@ -1128,10 +1234,11 @@ private pure func collect_type_root_facts(
 				if function_is_kept(reachable, function_info):
 					facts = collect_function_types(facts, function_info)
 			GlobalDecl(global):
-				facts = collect_expr(
-					collect_type(facts, global.typ),
-					global.init,
-				)
+				if not global.is_private or reachable_globals.contains(global.name.name):
+					facts = collect_expr(
+						collect_type(facts, global.typ),
+						global.init,
+					)
 			_:
 				void
 
@@ -1199,6 +1306,7 @@ private @tail_recursive pure func close_type_reachability(
 			var facts: DceFacts = {
 				function_ids = [],
 				function_names = [],
+				global_names = [],
 				type_names = [],
 				fail_closed = False
 			}
@@ -1222,6 +1330,7 @@ private @tail_recursive pure func close_type_reachability(
 
 private pure func keep_decl(
 	reachable_functions: List[Int],
+	reachable_globals: List[String],
 	reachable_types: List[String],
 	decl: CoreDecl,
 ) -> Bool:
@@ -1229,7 +1338,7 @@ private pure func keep_decl(
 		FunctionDecl(function_info):
 			function_is_kept(reachable_functions, function_info)
 		GlobalDecl(global):
-			True
+			not global.is_private or reachable_globals.contains(global.name.name)
 		EnumDecl(enum_info):
 			reachable_types.contains(enum_info.name)
 		UnionDecl(union_info):
@@ -1240,37 +1349,48 @@ private pure func keep_decl(
 			reachable_types.contains(record_info.name)
 		TypeAliasDecl(alias_decl):
 			True
+		TraitDecl(trait_decl):
+			True
 		ImplDecl(impl_decl):
 			True
 
 
 pure func prune_program(program_value: CoreProgram) -> CoreProgram:
 	functions: List[CoreFunction] = collect_functions(program_value)
+	roots: DceRoots = collect_roots(program_value, functions)
 
-	if has_duplicate_function_ids(functions):
+	if roots.fail_closed or not roots.saw_main:
 		program_value
 	else:
-		roots: DceRoots = collect_roots(program_value, functions)
+		closure: DceClosure = close_reachability(
+			functions,
+			collect_globals(program_value),
+			roots.reachable,
+			[],
+			roots.reachable_globals,
+			[],
+		)
 
-		if roots.fail_closed or not roots.saw_main:
+		if closure.fail_closed:
 			program_value
 		else:
-			closure: DceClosure = close_reachability(functions, roots.reachable, [])
-
-			if closure.fail_closed:
-				program_value
-			else:
-				type_facts: DceFacts = collect_type_root_facts(
-					program_value,
+			type_facts: DceFacts = collect_type_root_facts(
+				program_value,
+				closure.reachable,
+				closure.reachable_globals,
+			)
+			reachable_types: List[String] = close_type_reachability(
+				program_value,
+				type_facts.type_names,
+				[],
+			)
+			{ program_value |
+				decls = program_value.decls.filter(
+					func(decl): keep_decl(
 					closure.reachable,
+					closure.reachable_globals,
+						reachable_types,
+						decl,
+					),
 				)
-				reachable_types: List[String] = close_type_reachability(
-					program_value,
-					type_facts.type_names,
-					[],
-				)
-				{ program_value |
-					decls = program_value.decls.filter(
-						func(decl): keep_decl(closure.reachable, reachable_types, decl),
-					)
-				}
+			}

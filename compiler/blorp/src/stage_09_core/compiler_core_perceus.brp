@@ -10364,16 +10364,25 @@ private pure func retain_borrowed_binding_results_in_constructor_body(
 			if binding.mode == MatchBorrowBindingMode:
 				param: CoreParam = match_binding_as_param(binding)
 				result = retain_borrowed_param_result_in_constructor_body(env, param, True, result)
-			else if match_binding_materializes_owned_value(binding):
-				result = balance_constructor_match_body(
-					env,
-					binding.variable,
-					binding.typ,
-					1,
-					result,
-				)
 			else:
-				void
+				result = protect_repeated_constructor_match_body(
+					env,
+					copy_core_var(binding.variable),
+					copy_core_type(binding.typ),
+					result,
+					False,
+				)
+
+				if match_binding_materializes_owned_value(binding):
+					result = balance_constructor_match_body(
+						env,
+						copy_core_var(binding.variable),
+						copy_core_type(binding.typ),
+						1,
+						result,
+					)
+				else:
+					void
 		else:
 			void
 
@@ -10641,15 +10650,31 @@ private pure func retain_borrowed_binding_results(
 					param,
 					retain_borrowed_owned_uses(env, param, result),
 				)
-			else if match_binding_materializes_owned_value(binding):
-				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-					env,
-					binding.variable.name,
-					result,
-				)
-				result = balance_branch_body(env, binding.variable, binding.typ, 1, uses, result)
 			else:
-				void
+				result = protect_repeated_consumes(
+					env,
+					copy_core_var(binding.variable),
+					copy_core_type(binding.typ),
+					result,
+					False,
+				)
+
+				if match_binding_materializes_owned_value(binding):
+					uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+						env,
+						binding.variable.name,
+						result,
+					)
+					result = balance_branch_body(
+						env,
+						binding.variable,
+						binding.typ,
+						1,
+						uses,
+						result,
+					)
+				else:
+					void
 		else:
 			void
 
@@ -11744,6 +11769,87 @@ private pure func protect_borrowed_param_calls(
 				copy_core_type(typ),
 				loc,
 			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				protect_borrowed_param_calls(env, param, start),
+				protect_borrowed_param_calls(env, param, end_value),
+				protect_borrowed_param_loop_body(env, param, binder, body),
+				copy_core_type(typ),
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = protect_borrowed_param_calls(env, param, loop.iterable),
+					body = protect_borrowed_param_loop_body(env, param, loop.binder, loop.body)
+				},
+				copy_core_type(typ),
+				loc,
+			)
 		ResourceScopeExpr(scope, typ, loc):
 			ResourceScopeExpr(
 				{ scope |
@@ -11774,6 +11880,18 @@ private pure func protect_borrowed_param_calls(
 			)
 		_:
 			expr
+
+
+private pure func protect_borrowed_param_loop_body(
+	env: PerceusEnv,
+	param: CoreParam,
+	binder: CoreLoopBinder,
+	body: CoreExpr,
+) -> CoreExpr:
+	if binder.variable.name == param.name.name:
+		body
+	else:
+		protect_borrowed_param_calls(env, param, body)
 
 
 private pure func protect_borrowed_param_calls_for_function(
@@ -12285,6 +12403,7 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 	init: CoreExpr = global.init
 	is_mutable: Bool = global.is_mutable
 	is_const: Bool = global.is_const
+	is_private: Bool = global.is_private
 	def_id: Int = global.def_id
 	loc: CoreSourceLoc = global.loc
 	contract_init: CoreExpr = annotate_user_call_contracts(env, init)
@@ -12296,6 +12415,7 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 		init = rewritten_init,
 		is_mutable = is_mutable,
 		is_const = is_const,
+		is_private = is_private,
 		def_id = def_id,
 		loc = loc
 	}

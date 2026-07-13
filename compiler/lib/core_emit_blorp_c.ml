@@ -6058,7 +6058,22 @@ let function_kind_json ~reg enum_names value_record_names heap_record_names unio
   match func.cf_kind with
   | Core.CFUser -> Ok (kind "user" [])
   | Core.CFBuiltin -> Ok (kind "builtin" [])
-  | Core.CFForeign _ -> Ok (kind "foreign" [])
+  | Core.CFForeign foreign ->
+      let link_flag_json (platform, flag) =
+        obj
+          [
+            ("platform", option_string_json platform);
+            ("flag", str flag);
+          ]
+      in
+      Ok
+        (kind "foreign"
+           [
+             ("c_name", str foreign.c_name);
+             ("includes", arr (List.map str foreign.includes));
+             ("link_flags", arr (List.map link_flag_json foreign.link_flags));
+             ("arg_passing", foreign_arg_passing_json foreign.arg_passing);
+           ])
   | Core.CFClosureBody abi ->
       let* () = require_closure_body_abi ~reg path abi in
       let c_name = Codegen_names.mangle_by_def_id func.cf_def_id func.cf_name in
@@ -8105,8 +8120,8 @@ let function_json ~function_names ~consumed_params ~reg ~enum_names
 
 let project_global_decl (_global : Core.core_var) = true
 
-let global_json ~function_names ~consumed_params ~reg enum_names value_record_names
-    heap_record_names union_names enum_constructors path loc
+let global_json ~function_names ~consumed_params ~reg ~is_private enum_names
+    value_record_names heap_record_names union_names enum_constructors path loc
     (global : Core.core_var) =
   let* () = require_function_body ~reg union_names (path ^ ".init") global.cv_init in
   let* typ =
@@ -8126,6 +8141,7 @@ let global_json ~function_names ~consumed_params ~reg enum_names value_record_na
          ("init", init);
          ("mutable", bool global.cv_is_mutable);
          ("const", bool global.cv_is_const);
+         ("private", bool is_private);
          ("def_id", int global.cv_def_id);
          ("loc", source_loc_json loc);
        ])
@@ -8359,9 +8375,9 @@ let impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
     in
     collect [] 0 impl.ci_methods
 
-let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
-    heap_record_names union_names enum_constructors global_def_ids
-    global_names index (decl : Core.core_decl) =
+let rec decl_jsons ~function_names ~consumed_params ~reg ~is_private enum_names
+    value_record_names heap_record_names union_names enum_constructors
+    global_def_ids global_names index (decl : Core.core_decl) =
   let path = Printf.sprintf "program.decls[%d]" index in
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
@@ -8406,12 +8422,12 @@ let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record
   | Core.CDRecord _ ->
       Ok []
   | Core.CDPrivate inner ->
-      decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
-        heap_record_names union_names enum_constructors global_def_ids
-        global_names index inner
+      decl_jsons ~function_names ~consumed_params ~reg ~is_private:true
+        enum_names value_record_names heap_record_names union_names
+        enum_constructors global_def_ids global_names index inner
   | Core.CDVar global when project_global_decl global ->
       let* json =
-        global_json ~function_names ~consumed_params ~reg enum_names
+        global_json ~function_names ~consumed_params ~reg ~is_private enum_names
           value_record_names heap_record_names union_names enum_constructors path
           decl.cd_loc global
       in
@@ -8555,7 +8571,7 @@ let program_json ~reg (program : Core.core_program) =
     | [] -> Ok (arr (List.rev acc))
     | decl :: rest -> (
         match
-          decl_jsons ~function_names ~consumed_params ~reg enum_names
+          decl_jsons ~function_names ~consumed_params ~reg ~is_private:false enum_names
             value_record_names heap_record_names union_names enum_constructors
             unsupported_global_def_ids unsupported_global_names index decl
         with

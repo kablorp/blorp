@@ -96,6 +96,55 @@ let add_imported_type_rewrite rewrites local target =
 let find_imported_type_rewrite rewrites name =
   Hashtbl.find_opt rewrites.imported_type_names name
 
+let type_names_in_type ty =
+  let rec collect acc = function
+    | Ast.TyNamed (name, args) ->
+        List.fold_left collect (name :: acc) args
+    | Ast.TyArray (element, dims) ->
+        List.fold_left collect (collect acc element) dims
+    | Ast.TyTuple elements -> List.fold_left collect acc elements
+    | Ast.TyFunc fn ->
+        collect (List.fold_left collect acc fn.params) fn.return
+    | Ast.TyRange inner -> collect acc inner
+    | Ast.TyDimOp (_, left, right) -> collect (collect acc left) right
+    | Ast.TyVar _ | Ast.TyVarDims _ | Ast.TyBoundVar _ | Ast.TyConstInt _
+    | Ast.TySelf | Ast.TyMeta _ ->
+        acc
+  in
+  collect [] ty
+
+(** A selectively imported value can introduce module-owned types through its
+    signature even when those types were not imported by name. Record those
+    dependencies so Core expression types use the same flattened identity as
+    the imported declaration. *)
+let add_imported_signature_type_rewrites rewrites targets decl =
+  let rec signature_type_names (d : Ast.decl) =
+    match d.decl_desc with
+    | Ast.DFunc f ->
+        let param_names =
+          List.concat_map
+            (fun (param : Ast.param) ->
+              match param.param_type with
+              | Some ty -> type_names_in_type ty
+              | None -> [])
+            f.func_params
+        in
+        let return_names =
+          match f.func_return_type with
+          | Some ty -> type_names_in_type ty
+          | None -> []
+        in
+        param_names @ return_names
+    | Ast.DPrivate inner -> signature_type_names inner
+    | _ -> []
+  in
+  List.iter
+    (fun name ->
+      match List.assoc_opt name targets with
+      | Some target -> add_imported_type_rewrite rewrites name target
+      | None -> ())
+    (signature_type_names decl)
+
 (** Rewrite selectively imported type names in the main program to the same
     flattened owner names used by module declarations. Qualified-only imports
     are intentionally not included here: [Types.resolve_qualified_types] has
@@ -118,7 +167,12 @@ let rewrite_main_imported_type_names (program : Ast.program)
                         Option.value sym.sym_alias ~default:sym.sym_name
                       in
                       add_imported_type_rewrite imported_types local target
-                  | None -> ())
+                  | None -> (
+                      match List.assoc_opt sym.sym_name loaded.exports with
+                      | Some exported_decl ->
+                          add_imported_signature_type_rewrites imported_types
+                            targets exported_decl
+                      | None -> ()))
                 symbols
           | _ -> ())
       | _ -> ())
@@ -184,9 +238,7 @@ let prefix_module_names (mod_name : string) (decls : Core.core_program) :
       when (not r.Ast.record_is_builtin)
            && should_flatten_type_name mod_name r.Ast.record_name ->
         Hashtbl.replace local_type_names r.Ast.record_name ()
-    | Core.CDType t
-      when (not t.Ast.type_is_builtin)
-           && should_flatten_type_name mod_name t.Ast.type_name ->
+    | Core.CDType t when should_flatten_type_name mod_name t.Ast.type_name ->
         Hashtbl.replace local_type_names t.Ast.type_name ()
     | Core.CDTypeAlias a when should_flatten_type_name mod_name a.Ast.alias_name
       ->

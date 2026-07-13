@@ -21,8 +21,8 @@ import:
 			ParsedSubtractOp,
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
-		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedIdentifier,
+		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder),
 		ParsedTypeParamDecl,
@@ -146,21 +146,30 @@ import:
 	../stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
+			CompilerTypedForeignFunctionDecl,
 			CompilerTypedGlobalVarDecl,
 			CompilerTypedImplDecl,
 			CompilerTypedParsedDecl,
 			CompilerTypedPrivateDecl,
 			CompilerTypedRecordDecl,
+			CompilerTypedTraitDecl,
 			CompilerTypedTypeAliasDecl,
 			CompilerTypedUnionDecl,
 		),
+		CompilerTypedForeignFunctionInfo,
 		CompilerTypedFunctionInfo,
 		CompilerTypedGlobalVarInfo,
+		CompilerTypedImplInfo,
 		CompilerTypedProgram,
 		CompilerTypedRecordFieldInfo,
 		CompilerTypedRecordInfo,
+		CompilerTypedTraitInfo,
+		CompilerTypedTraitMethodInfo,
+		CompilerTypedTypeAliasInfo,
 		CompilerTypedUnionInfo,
 		CompilerTypedUnionVariantInfo,
+		compiler_typed_foreign_arg_passing_borrows,
+		compiler_typed_foreign_link_platform_to_string,
 	../stage_09_core/compiler_core_clone: clone_core_source_loc, clone_core_type, clone_core_var
 	../stage_09_core/compiler_core_json:
 		CoreAccessor(
@@ -219,6 +228,9 @@ import:
 			FunctionDecl,
 			GlobalDecl,
 			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
 			UnionDecl,
 			ValueRecordDecl,
 		),
@@ -268,8 +280,10 @@ import:
 		CoreForSet,
 		CoreForStream,
 		CoreForString,
+		CoreForeignArgPassing(ForeignBorrowArgs, ForeignDefaultArgs),
+		CoreForeignLinkFlag,
 		CoreFunction,
-		CoreFunctionKind(UserFunction),
+		CoreFunctionKind(ForeignFunction, UserFunction),
 		CoreHeapRecordField,
 		CoreListConstruct,
 		CoreListStorageLayout(PointerListStorage),
@@ -300,6 +314,7 @@ import:
 		CoreSelectRecvArm,
 		CoreSourceLoc(KnownSourceLoc),
 		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
+		CoreTraitMethod,
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -948,7 +963,7 @@ private pure func typed_expr_span(expr: CompilerTypedExpr) -> CompilerSourceSpan
 			span
 		CompilerTypedWhileExpr(_, _, span, _):
 			span
-		CompilerTypedForExpr(_, _, _, span, _):
+		CompilerTypedForExpr(_, _, _, _, span, _):
 			span
 		CompilerTypedConcurrentBlockExpr(_, _, span, _):
 			span
@@ -1046,7 +1061,7 @@ private pure func typed_expr_label(expr: CompilerTypedExpr) -> String:
 			"select"
 		CompilerTypedWhileExpr(_, _, _, _):
 			"while"
-		CompilerTypedForExpr(_, _, _, _, _):
+		CompilerTypedForExpr(_, _, _, _, _, _):
 			"for"
 		CompilerTypedConcurrentBlockExpr(_, _, _, _):
 			"concurrent block"
@@ -2731,7 +2746,7 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 		CompilerTypedDetachExpr(body, _, _):
 			lowered_body ?= lower_typed_expr(body)
 			Ok(PreClosureDetachExpr({body = lowered_body}, typ, loc))
-		CompilerTypedForExpr(binder, iterable, body, _, _):
+		CompilerTypedForExpr(binder, iterable, _, body, _, _):
 			lower_typed_for(binder, iterable, body, typ, loc)
 		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
 			lower_typed_concurrent_block(
@@ -2833,7 +2848,7 @@ private pure func lower_typed_function_info(
 				function_info = {
 					name = info.decl.name.text,
 					source_module = context.source_module,
-					type_params = compiler_core_type_param_names(info.decl.type_params),
+					type_params = info.effective_type_params.map(func(param): param.name),
 					params = params,
 					return_type = return_type,
 					body = Some(lowered_body),
@@ -2858,6 +2873,53 @@ private pure func lower_typed_function(
 	})
 
 
+private pure func lower_typed_foreign_function(
+	context: CompilerCoreLowerContext,
+	info: CompilerTypedForeignFunctionInfo,
+) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
+	params ?= compiler_core_lower_params(info.decl.params, info.param_types)
+	return_type ?= compiler_core_lower_type(info.semantic_return_type)
+
+	(next_context, def_id) = match info.callable_id:
+		Some(callable_id):
+			(context, callable_id)
+		None:
+			mint_def_id(context)
+
+	arg_passing: CoreForeignArgPassing = if compiler_typed_foreign_arg_passing_borrows(
+		info.arg_passing,
+	):
+		ForeignBorrowArgs
+	else:
+		ForeignDefaultArgs([])
+
+	link_flags: List[CoreForeignLinkFlag] = info.link_flags.map(pure func(link_flag): {
+			platform = link_flag.platform.map(compiler_typed_foreign_link_platform_to_string),
+			flag = link_flag.flag
+		})
+
+	Ok({
+		context = next_context,
+		decl = FunctionDecl({
+			name = info.decl.name.text,
+			source_module = context.source_module,
+			type_params = [],
+			params = params,
+			return_type = return_type,
+			body = None,
+			is_pure = info.decl.is_pure,
+			function_kind = ForeignFunction({
+				c_name = info.c_name,
+				includes = info.includes,
+				link_flags = link_flags,
+				arg_passing = arg_passing,
+			}),
+			def_id = def_id,
+			loc = compiler_core_source_loc(info.decl.span),
+		}),
+	})
+
+
 private pure func lower_typed_global(
 	context: CompilerCoreLowerContext,
 	info: CompilerTypedGlobalVarInfo,
@@ -2874,6 +2936,7 @@ private pure func lower_typed_global(
 			init = init,
 			is_mutable = info.decl.is_mutable,
 			is_const = False,
+			is_private = False,
 			def_id = def_id,
 			loc = compiler_core_source_loc(info.decl.span),
 		}),
@@ -3191,6 +3254,107 @@ private pure func lower_typed_union(
 		})
 
 
+private pure func lower_typed_type_alias(
+	context: CompilerCoreLowerContext,
+	info: CompilerTypedTypeAliasInfo,
+) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
+	target ?= compiler_core_lower_type(info.semantic_target_type)
+
+	Ok({
+		context = context,
+		decl = TypeAliasDecl({
+			name = info.decl.name.text,
+			type_params = compiler_core_type_param_names(info.decl.type_params),
+			target = target,
+			is_opaque = info.decl.is_opaque,
+			loc = compiler_core_source_loc(info.decl.span),
+		}),
+	})
+
+
+private pure func lower_typed_trait_method(
+	method: CompilerTypedTraitMethodInfo,
+) -> Result[CoreTraitMethod, CompilerCoreLowerError]:
+	params ?= compiler_core_lower_params(method.decl.params, method.param_types)
+	return_type ?= compiler_core_lower_type(method.semantic_return_type)
+
+	Ok({
+		name = method.decl.name.text,
+		params = params,
+		return_type = return_type,
+		is_pure = method.decl.is_pure,
+		loc = compiler_core_source_loc(method.decl.span),
+	})
+
+
+private pure func lower_typed_trait_methods(
+	methods: List[CompilerTypedTraitMethodInfo],
+) -> Result[List[CoreTraitMethod], CompilerCoreLowerError]:
+	match methods:
+		[]:
+			Ok([])
+		[method, ...rest]:
+			lowered ?= lower_typed_trait_method(method)
+			lowered_rest ?= lower_typed_trait_methods(rest)
+			Ok([lowered] + lowered_rest)
+
+
+private pure func lower_typed_trait(
+	context: CompilerCoreLowerContext,
+	info: CompilerTypedTraitInfo,
+) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
+	methods ?= lower_typed_trait_methods(info.methods)
+
+	Ok({
+		context = context,
+		decl = TraitDecl({
+			name = info.decl.name.text,
+			type_params = compiler_core_type_param_names(info.decl.type_params),
+			supertraits = info.decl.supertraits.map(func(name): name.text),
+			methods = methods,
+			loc = compiler_core_source_loc(info.decl.span),
+		}),
+	})
+
+
+private pure func lower_typed_impl_methods_at(
+	context: CompilerCoreLowerContext,
+	methods: List[CompilerTypedFunctionInfo],
+	index: Int,
+	lowered: List[CoreFunction],
+) -> Result[(CompilerCoreLowerContext, List[CoreFunction]), CompilerCoreLowerError]:
+	match methods.get(index):
+		Some(method):
+			result ?= lower_typed_function_info(context, method)
+			lower_typed_impl_methods_at(
+				result.context,
+				methods,
+				index + 1,
+				lowered.append(result.function_info),
+			)
+		None:
+			Ok((context, lowered))
+
+
+private pure func lower_typed_impl(
+	context: CompilerCoreLowerContext,
+	info: CompilerTypedImplInfo,
+) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
+	for_type ?= compiler_core_lower_type(info.for_type)
+	lowered_methods ?= lower_typed_impl_methods_at(context, info.methods, 0, [])
+	(next_context, methods) = lowered_methods
+
+	Ok({
+		context = next_context,
+		decl = ImplDecl({
+			trait_name = info.decl.trait_name.text,
+			for_type = for_type,
+			methods = methods,
+			loc = compiler_core_source_loc(info.decl.span),
+		}),
+	})
+
+
 pure func lower_typed_decl(
 	context: CompilerCoreLowerContext,
 	decl: CompilerTypedDecl,
@@ -3198,6 +3362,8 @@ pure func lower_typed_decl(
 	match decl:
 		CompilerTypedFunctionDecl(info):
 			lower_typed_function(context, info)
+		CompilerTypedForeignFunctionDecl(info):
+			lower_typed_foreign_function(context, info)
 		CompilerTypedGlobalVarDecl(info):
 			lower_typed_global(context, info)
 		CompilerTypedPrivateDecl(inner):
@@ -3206,10 +3372,12 @@ pure func lower_typed_decl(
 			lower_typed_record(context, info)
 		CompilerTypedUnionDecl(info):
 			lower_typed_union(context, info)
-		CompilerTypedTypeAliasDecl(_):
-			Err(CompilerCoreLowerUnsupported("type alias typed payload ownership"))
-		CompilerTypedImplDecl(_):
-			Err(CompilerCoreLowerUnsupported("impl typed payload ownership"))
+		CompilerTypedTypeAliasDecl(info):
+			lower_typed_type_alias(context, info)
+		CompilerTypedTraitDecl(info):
+			lower_typed_trait(context, info)
+		CompilerTypedImplDecl(info):
+			lower_typed_impl(context, info)
 		CompilerTypedParsedDecl(_):
 			Err(CompilerCoreLowerUnsupported("untyped parsed declaration"))
 
@@ -3220,10 +3388,19 @@ pure func lower_typed_program(
 ) -> Result[CompilerCoreLowerProgramResult, CompilerCoreLowerError]:
 	var current: CompilerCoreLowerContext = context
 	var decls: List[CoreDecl] = []
+	var foreign_includes: List[String] = []
 	var failure: Option[CompilerCoreLowerError] = None
 
 	for decl in program.decls:
 		if failure.is_none():
+			match decl:
+				CompilerTypedForeignFunctionDecl(info):
+					foreign_includes = foreign_includes
+						.concat(info.includes)
+						.unique()
+				_:
+					void
+
 			match lower_typed_decl(current, decl):
 				Ok(result):
 					current = result.context
@@ -3239,6 +3416,6 @@ pure func lower_typed_program(
 				context = current,
 				program = {
 					decls = decls,
-					foreign_includes = []
+					foreign_includes = foreign_includes
 				},
 			})

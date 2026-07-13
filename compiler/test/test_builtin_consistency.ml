@@ -171,6 +171,14 @@ let test_builtin_lookup_uses_exact_module_paths () =
     (Blorp.Codegen_builtins.lookup "/tmp/not-a-blorp-module/raylib"
        "init_window")
 
+let test_vector_minmax_lookup_preserves_type_dispatch () =
+  List.iter
+    (fun (name, expected) ->
+      Alcotest.(check (option string))
+        ("std/vector " ^ name) (Some expected)
+        (Blorp.Codegen_builtins.lookup "std/vector" name))
+    [ ("max", "blorp_max"); ("min", "blorp_min") ]
+
 let test_builtin_effect_metadata_classifies_typechecker_sets () =
   let open Blorp.Builtin_metadata in
   List.iter
@@ -1941,6 +1949,8 @@ let suite =
           test_list_ir_functions_not_shadowed_by_codegen_builtins;
         Alcotest.test_case "builtin lookup uses exact module paths" `Quick
           test_builtin_lookup_uses_exact_module_paths;
+        Alcotest.test_case "vector minmax lookup preserves type dispatch"
+          `Quick test_vector_minmax_lookup_preserves_type_dispatch;
         Alcotest.test_case "list IR HOFs have no runtime C ABI" `Quick
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick

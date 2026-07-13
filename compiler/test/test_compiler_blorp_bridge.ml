@@ -1638,9 +1638,9 @@ let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
   let source =
     String.concat "\n"
       [
-        "#define __def_527932_ColonSymbol 7L";
-        "bool check(void* token) {";
-        "  return (((compiler_token__CompilerSymbol*)((compiler_token__CompilerTokenKind*)token)->data.SymbolToken.field0)->tag == TAG_compiler_token__CompilerSymbol_ColonSymbol);";
+        "#define __def_527932_CompilerResolvedLoopProducerIndices 7L";
+        "bool check(void* call) {";
+        "  return (((compiler_infer__CompilerResolvedLoopProducer*)call)->tag == TAG_compiler_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices);";
         "}";
         "";
       ]
@@ -1648,12 +1648,30 @@ let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
   let rewritten = Bridge.generated_c_with_bootstrap_compatibility source in
   Alcotest.(check bool)
     "removes old pointer tag check" false
-    (contains rewritten "TAG_compiler_token__CompilerSymbol_ColonSymbol");
+    (contains rewritten
+       "TAG_compiler_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices");
   Alcotest.(check bool)
     "compares stack enum payload value" true
     (contains rewritten
-       "((long)(long)((compiler_token__CompilerTokenKind*)token)->data.SymbolToken.field0 \
-        == __def_527932_ColonSymbol)")
+       "((long)(long)call == \
+        __def_527932_CompilerResolvedLoopProducerIndices)")
+
+let test_generated_c_bootstrap_compatibility_preserves_union_tag_checks () =
+  let source =
+    String.concat "\n"
+      [
+        "#define __def_527932_SomeCase 7L";
+        "typedef struct compiler_model__Payload compiler_model__Payload;";
+        "bool check(compiler_model__Payload* value) {";
+        "  return (((compiler_model__Payload*)value)->tag == TAG_compiler_model__Payload_SomeCase);";
+        "}";
+        "";
+      ]
+  in
+  let rewritten = Bridge.generated_c_with_bootstrap_compatibility source in
+  Alcotest.(check bool)
+    "preserves boxed union tag check" true
+    (contains rewritten "TAG_compiler_model__Payload_SomeCase")
 
 let suite =
   [
@@ -1781,5 +1799,8 @@ let suite =
         Alcotest.test_case "bootstrap compatibility rewrites enum payload checks"
           `Quick
           test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks;
+        Alcotest.test_case "bootstrap compatibility preserves union tag checks"
+          `Quick
+          test_generated_c_bootstrap_compatibility_preserves_union_tag_checks;
       ] );
   ]

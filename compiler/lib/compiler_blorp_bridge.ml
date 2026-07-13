@@ -2598,17 +2598,63 @@ let rewrite_casted_enum_tag_checks c_code ~type_name ~tag_prefix variant_defs =
   loop 0 0;
   Buffer.contents buffer
 
+let generated_c_tag_identifiers c_code =
+  let marker = "TAG_" in
+  let marker_len = String.length marker in
+  let len = String.length c_code in
+  let rec identifier_end index =
+    if index < len && is_ident_char c_code.[index] then identifier_end (index + 1)
+    else index
+  in
+  let rec scan index found =
+    if index + marker_len > len then List.sort_uniq String.compare found
+    else if string_starts_with_at c_code index marker then
+      let stop = identifier_end (index + marker_len) in
+      scan stop (String.sub c_code index (stop - index) :: found)
+    else scan (index + 1) found
+  in
+  scan 0 []
+
+let string_ends_with value suffix =
+  let value_len = String.length value in
+  let suffix_len = String.length suffix in
+  suffix_len <= value_len
+  && String.equal (String.sub value (value_len - suffix_len) suffix_len) suffix
+
+let generated_c_missing_enum_patterns c_code variant_defs =
+  let variants =
+    variant_defs
+    |> List.filter_map (fun (variant, definition) ->
+           Option.map (fun _ -> variant) definition)
+    |> List.sort (fun left right ->
+           Int.compare (String.length right) (String.length left))
+  in
+  generated_c_tag_identifiers c_code
+  |> List.filter_map (fun tag_name ->
+         match
+           List.find_opt
+             (fun variant -> string_ends_with tag_name ("_" ^ variant))
+             variants
+         with
+         | None -> None
+         | Some variant ->
+             let tag_prefix_len = String.length tag_name - String.length variant in
+             let tag_prefix = String.sub tag_name 0 tag_prefix_len in
+             let type_name =
+               String.sub tag_prefix 4 (String.length tag_prefix - 5)
+             in
+             let struct_decl = "typedef struct " ^ type_name in
+             if string_contains_substring c_code struct_decl then None
+             else Some (type_name, tag_prefix))
+  |> List.sort_uniq compare
+
 let generated_c_with_stack_enum_payload_patterns c_code =
   let variant_defs = generated_c_variant_defs c_code in
-  c_code
-  |> fun code ->
-  rewrite_casted_enum_tag_checks code
-    ~type_name:"compiler_token__CompilerSymbol"
-    ~tag_prefix:"TAG_compiler_token__CompilerSymbol_" variant_defs
-  |> fun code ->
-  rewrite_casted_enum_tag_checks code
-    ~type_name:"compiler_token__CompilerKeyword"
-    ~tag_prefix:"TAG_compiler_token__CompilerKeyword_" variant_defs
+  let patterns = generated_c_missing_enum_patterns c_code variant_defs in
+  List.fold_left
+    (fun code (type_name, tag_prefix) ->
+      rewrite_casted_enum_tag_checks code ~type_name ~tag_prefix variant_defs)
+    c_code patterns
 
 let generated_c_with_bootstrap_compatibility c_code =
   c_code

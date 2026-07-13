@@ -7,7 +7,14 @@ import:
 		compiler_source_file,
 		compiler_source_span,
 	../src/stage_03_parse/compiler_parsed_ast:
-		ParsedBinaryOp(ParsedAddOp, ParsedEqualOp, ParsedLessOp, ParsedModuloOp, ParsedMultiplyOp),
+		ParsedBinaryOp(
+			ParsedAddOp,
+			ParsedEqualOp,
+			ParsedGreaterEqualOp,
+			ParsedLessOp,
+			ParsedModuloOp,
+			ParsedMultiplyOp,
+		),
 		ParsedCompoundAssignOp(ParsedAssignAddOp),
 		ParsedConcurrentParam,
 		ParsedDictEntry,
@@ -90,6 +97,11 @@ import:
 		CompilerFieldDecl,
 		CompilerFuncOrigin(CompilerUserDefinedFunc),
 		CompilerFuncSymbol,
+		CompilerLoopProducer(
+			CompilerLoopProducerEnumerate,
+			CompilerLoopProducerIndices,
+			CompilerLoopProducerWindows,
+		),
 		CompilerOverloadEntry,
 		CompilerPurity(CompilerImpure, CompilerPure),
 		CompilerResourceArgPolicy(CompilerAllowResourceArgs, CompilerRejectResourceArgs),
@@ -120,9 +132,11 @@ import:
 	../src/stage_05_types/compiler_generic_params: compiler_make_bound_type_param
 	../src/stage_05_types/compiler_refinement: compiler_unrefined_binding
 	../src/stage_05_types/compiler_type:
+		CompilerDimOp(CompilerDimMultiply),
 		CompilerType(
 			CompilerArrayType,
 			CompilerConstIntType,
+			CompilerDimOpType,
 			CompilerFunctionType,
 			CompilerMetaType,
 			CompilerNamedType,
@@ -157,8 +171,14 @@ import:
 			CompilerTypedCallExpr,
 			CompilerTypedConcurrentBlockExpr,
 			CompilerTypedIntLiteralExpr,
+			CompilerTypedForExpr,
 		),
 		CompilerTypedExprInfo,
+		CompilerTypedLoopView(
+			CompilerTypedEnumerateLoopView,
+			CompilerTypedIndicesLoopView,
+			CompilerTypedWindowsLoopView,
+		),
 		compiler_finalize_infer_result,
 		compiler_infer_context,
 		compiler_infer_expr,
@@ -811,6 +831,14 @@ pure func state_with_resource_operations() -> CompilerTypecheckState:
 			CompilerPure,
 			CompilerUserDefinedFunc,
 		) }
+
+
+pure func state_with_resource_source_operations() -> CompilerTypecheckState:
+	add_infer_value(
+		state_with_resource_operations(),
+		"source",
+		compiler_type_resource_source(compiler_type_reader(), compiler_type_string()),
+	)
 
 
 pure func state_with_module_scale_func() -> (CompilerTypecheckState, Int):
@@ -1797,6 +1825,26 @@ func test_matrix_builtin_binds_literal_dimensions() -> Bool:
 	)
 
 
+func test_vector_builtin_derives_dimension_arithmetic() -> Bool:
+	expected = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(6)])
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedCallExpr(
+			ParsedNameExpr(ident("vector")),
+			[
+				int_expr("0"),
+				ParsedBinaryExpr(ParsedMultiplyOp, int_expr("2"), int_expr("3"), source_span()),
+			],
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
+	)
+
+
 func test_raw_nested_function_decl_reports_finalization_gap() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -2259,7 +2307,9 @@ func test_concurrent_and_detach_traversals_include_nested_impure_calls() -> Bool
 	(
 		detach_result.context.state.errors.length() == 0
 		and concurrent_result.context.state.errors.length() == 0
+		and compiler_typed_expr_impure_call_names(detach_result.expr).contains("detach")
 		and compiler_typed_expr_impure_call_names(detach_result.expr).contains("tick")
+		and compiler_typed_expr_impure_call_names(concurrent_result.expr).contains("concurrent")
 		and compiler_typed_expr_impure_call_names(concurrent_result.expr).contains("tick")
 	)
 
@@ -2408,6 +2458,21 @@ func test_concurrent_for_checks_list_body_and_returns_void() -> Bool:
 		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_void())
 		and compiler_env_get_var_type(result.context.state.env, "n") == None
 	)
+
+
+func test_concurrent_for_resource_source_binding_is_scoped_resource() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_resource_source_operations()),
+		ParsedConcurrentForExpr(
+			ident("reader"),
+			ParsedNameExpr(ident("source")),
+			[concurrent_param("limit", int_expr("1"))],
+			call_expr(ParsedNameExpr(ident("read_line")), [ParsedNameExpr(ident("reader"))]),
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0
 
 
 func test_concurrent_for_rejects_value_context_non_list_and_bad_params() -> Bool:
@@ -3105,7 +3170,6 @@ func test_question_bind_option_binds_unwrapped_value_for_following_statements() 
 			source_span(),
 		),
 	)
-
 	result.context.state.errors.length() == 0 and compiler_types_equal(
 		compiler_typed_expr_semantic_type(result.expr),
 		CompilerNamedType("Option", [compiler_type_int()]),
@@ -3995,7 +4059,6 @@ func test_qualified_module_constructor_call_infers_owned_constructor() -> Bool:
 			[int_expr("1")],
 		),
 	)
-
 	result.context.state.errors.length() == 0 and compiler_types_equal(
 		compiler_typed_expr_semantic_type(result.expr),
 		CompilerNamedType("Option", [compiler_type_int()]),
@@ -4473,6 +4536,40 @@ func test_generic_call_guides_unannotated_callback_parameter() -> Bool:
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(result.expr),
 			compiler_type_int(),
+		)
+	)
+
+
+func test_expected_pure_callback_upgrades_only_pure_lambda_body() -> Bool:
+	expected_type = compiler_int_callback_type(True)
+	pure_result = compiler_infer_expr(
+		compiler_infer_with_expected(
+			compiler_infer_context(compiler_typecheck_state_empty()),
+			expected_type,
+		),
+		callback_lambda(False),
+	)
+	impure_result = compiler_infer_expr(
+		compiler_infer_with_expected(
+			compiler_infer_context(state_with_impure_tick_func()),
+			expected_type,
+		),
+		ParsedLambdaExpr(
+			False,
+			[lambda_param("x", Some(named_type("Int")))],
+			Some(named_type("Int")),
+			call_expr(ParsedNameExpr(ident("tick")), [ParsedNameExpr(ident("x"))]),
+			source_span(),
+		),
+	)
+
+	(
+		pure_result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(pure_result.expr), expected_type)
+		and impure_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(impure_result.expr),
+			compiler_int_callback_type(False),
 		)
 	)
 
@@ -5390,13 +5487,10 @@ func test_tuple_literal_erases_stored_range_proof() -> Bool:
 
 	(
 		result.context.state.errors.length() == 0
-		and compiler_types_equal(
-			compiler_typed_expr_semantic_type(result.expr),
-			CompilerTupleType([
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), CompilerTupleType([
 				CompilerRangeType(CompilerConstIntType(10)),
 				CompilerConstIntType(1),
-			]),
-		)
+			]))
 		and compiler_types_equal(
 			compiler_typed_expr_value_type(result.expr),
 			CompilerTupleType([compiler_type_int(), compiler_type_int()]),
@@ -6228,6 +6322,194 @@ pure func state_with_symbolic_range_subscript_values() -> CompilerTypecheckState
 	add_infer_value(with_n, "m", CompilerTypeVar("#M"))
 
 
+pure func state_with_flattened_symbolic_subscript_values() -> CompilerTypecheckState:
+	rows = CompilerTypeVar("#M")
+	columns = CompilerTypeVar("#N")
+	flat_size = CompilerDimOpType(CompilerDimMultiply, rows, columns)
+	state = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"values",
+		CompilerArrayType(compiler_type_int(), [flat_size]),
+	)
+	with_row = add_infer_value(state, "row", CompilerRangeType(rows))
+	with_columns = add_infer_value(with_row, "columns", columns)
+	add_infer_value(with_columns, "col", CompilerRangeType(columns))
+
+
+pure func symbolic_set_cell_func_symbol() -> CompilerFuncSymbol:
+	element = CompilerTypeVar("T")
+	rows = CompilerTypeVar("#M")
+	columns = CompilerTypeVar("#N")
+	matrix_type = CompilerArrayType(
+		element,
+		[rows, columns],
+	)
+
+	compiler_func_symbol(
+		401,
+		CompilerFunctionType(
+			True,
+			[matrix_type, compiler_type_int(), compiler_type_int(), element],
+			matrix_type,
+		),
+		[
+			compiler_make_bound_type_param("T", []),
+			compiler_make_bound_type_param("#M", []),
+			compiler_make_bound_type_param("#N", []),
+		],
+		[Some("matrix"), Some("row"), Some("column"), Some("value")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		None,
+		[],
+		None,
+		False,
+	)
+
+
+pure func state_with_symbolic_set_cell_values() -> CompilerTypecheckState:
+	dim = CompilerTypeVar("#N")
+	matrix_type = CompilerArrayType(
+		compiler_type_int(),
+		[dim, dim],
+	)
+	state = compiler_typecheck_state_empty()
+	with_outer_params = { state | env = compiler_env_set_type_param_bounds(
+			state.env,
+			[compiler_make_bound_type_param("T", []), compiler_make_bound_type_param("#N", [])],
+		) }
+	with_func = { with_outer_params |
+		env = compiler_env_add_func_with_info(
+			with_outer_params.env,
+			"set_cell",
+			symbolic_set_cell_func_symbol(),
+		)
+	}
+	with_matrix = add_infer_value(with_func, "matrix", matrix_type)
+	add_infer_value(with_matrix, "i", CompilerRangeType(dim))
+
+
+func test_generic_matrix_call_preserves_repeated_symbolic_dimension() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_symbolic_set_cell_values()),
+		call_expr(
+			ParsedNameExpr(ident("set_cell")),
+			[
+				ParsedNameExpr(ident("matrix")),
+				ParsedNameExpr(ident("i")),
+				ParsedNameExpr(ident("i")),
+				int_expr("1"),
+			],
+		),
+	)
+	expected = CompilerArrayType(
+		compiler_type_int(),
+		[CompilerTypeVar("#N"), CompilerTypeVar("#N")],
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
+	)
+
+
+pure func symbolic_vector_constructor_func_symbol() -> CompilerFuncSymbol:
+	dim = CompilerTypeVar("#K")
+
+	compiler_func_symbol(
+		402,
+		CompilerFunctionType(
+			True,
+			[dim],
+			CompilerArrayType(compiler_type_int(), [dim]),
+		),
+		[compiler_make_bound_type_param("#K", [])],
+		[Some("size")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		None,
+		[],
+		None,
+		False,
+	)
+
+
+pure func state_with_symbolic_vector_constructor() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_outer_params = { state | env = compiler_env_set_type_param_bounds(
+			state.env,
+			[compiler_make_bound_type_param("#M", []), compiler_make_bound_type_param("#N", [])],
+		) }
+	with_func = { with_outer_params |
+		env = compiler_env_add_func_with_info(
+			with_outer_params.env,
+			"make_vector",
+			symbolic_vector_constructor_func_symbol(),
+		)
+	}
+	with_rows = add_infer_value(with_func, "rows", CompilerTypeVar("#M"))
+	add_infer_value(with_rows, "columns", CompilerTypeVar("#N"))
+
+
+func test_generic_dimension_argument_preserves_static_expression() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_symbolic_vector_constructor()),
+		call_expr(
+			ParsedNameExpr(ident("make_vector")),
+			[
+				binary_expr(
+					ParsedMultiplyOp,
+					ParsedNameExpr(ident("rows")),
+					ParsedNameExpr(ident("columns")),
+				),
+			],
+		),
+	)
+	expected_dim = CompilerDimOpType(
+		CompilerDimMultiply,
+		CompilerTypeVar("#M"),
+		CompilerTypeVar("#N"),
+	)
+	expected = CompilerArrayType(compiler_type_int(), [expected_dim])
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
+	)
+
+
+func test_symbolic_product_subscript_proofs() -> Bool:
+	state = state_with_flattened_symbolic_subscript_values()
+	first_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(ParsedNameExpr(ident("values")), [int_expr("0")]),
+	)
+	flat_index = binary_expr(
+		ParsedAddOp,
+		binary_expr(
+			ParsedMultiplyOp,
+			ParsedNameExpr(ident("row")),
+			ParsedNameExpr(ident("columns")),
+		),
+		ParsedNameExpr(ident("col")),
+	)
+	flat_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(ParsedNameExpr(ident("values")), [flat_index]),
+	)
+
+	(
+		first_result.context.state.errors.length() == 0
+		and flat_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(flat_result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
 func test_symbolic_range_subscript_requires_matching_dimension() -> Bool:
 	zero_result = compiler_infer_expr(
 		compiler_infer_context(state_with_symbolic_range_subscript_values()),
@@ -6257,6 +6539,43 @@ func test_symbolic_range_subscript_requires_matching_dimension() -> Bool:
 		and mismatch_result.context.state.errors
 			.get_or(0, "")
 			.contains("Range-refined index ..#M is not proven in bounds for dimension #N")
+	)
+
+
+func test_if_bounds_condition_refines_runtime_index() -> Bool:
+	base_state = compiler_typecheck_state_empty()
+	with_builtins = { base_state | env = compiler_env_with_builtins(base_state.env) }
+	with_grid = add_infer_value(
+		with_builtins,
+		"grid",
+		CompilerArrayType(
+			compiler_type_int(),
+			[CompilerConstIntType(2), CompilerConstIntType(3)],
+		),
+	)
+	state = add_infer_value(with_grid, "row", compiler_type_int())
+	row_expr = ParsedNameExpr(ident("row"))
+	matrix_expr = ParsedNameExpr(ident("grid"))
+	non_negative = binary_expr(ParsedGreaterEqualOp, row_expr, int_expr("0"))
+	below_length = binary_expr(
+		ParsedLessOp,
+		row_expr,
+		call_expr(ParsedNameExpr(ident("length")), [matrix_expr]),
+	)
+	condition = ParsedLogicalExpr(ParsedAndOp, non_negative, below_length, source_span())
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		ParsedIfExpr(
+			condition,
+			subscript_expr(matrix_expr, [row_expr]),
+			Some(subscript_expr(matrix_expr, [int_expr("0")])),
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(3)]),
 	)
 
 
@@ -6306,14 +6625,11 @@ func test_subscript_assign_allows_mutable_tensor() -> Bool:
 			CompilerTypedBlockExpr(items, _, _):
 				match items.get(1):
 					Some(CompilerTypedAssignExpr(name, _, set_call, _, _)):
-						(
-							name.text == "values"
-							and match compiler_typed_expr_resolved_call(set_call):
-								Some(info):
-									info.callee_name == "checked_set"
-								None:
-									False
-						)
+						name.text == "values" and match compiler_typed_expr_resolved_call(set_call):
+							Some(info):
+								info.callee_name == "checked_set"
+							None:
+								False
 					_:
 						False
 			_:
@@ -6339,22 +6655,19 @@ func test_matrix_subscript_assign_uses_ranked_checked_set() -> Bool:
 	)
 	result = compiler_infer_expr(compiler_infer_context(compiler_typecheck_state_empty()), block)
 
-	(
-		result.context.state.errors.length() == 0
-		and match result.expr:
-			CompilerTypedBlockExpr(items, _, _):
-				match items.get(1):
-					Some(CompilerTypedAssignExpr(_, _, set_call, _, _)):
-						match compiler_typed_expr_resolved_call(set_call):
-							Some(info):
-								info.callee_name == "matrix_checked_set"
-							None:
-								False
-					_:
-						False
-			_:
-				False
-	)
+	result.context.state.errors.length() == 0 and match result.expr:
+		CompilerTypedBlockExpr(items, _, _):
+			match items.get(1):
+				Some(CompilerTypedAssignExpr(_, _, set_call, _, _)):
+					match compiler_typed_expr_resolved_call(set_call):
+						Some(info):
+							info.callee_name == "matrix_checked_set"
+						None:
+							False
+				_:
+					False
+		_:
+			False
 
 
 func test_subscript_assign_errors_are_specific() -> Bool:
@@ -6966,6 +7279,28 @@ func test_match_open_scalar_requires_catch_all() -> Bool:
 	)
 
 
+func test_match_int_pattern_accepts_const_int_tuple_field() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedMatchExpr(
+			tuple_expr([int_expr("0"), int_expr("5")]),
+			[
+				match_case(
+					ParsedTuplePattern(
+						[ParsedIntPattern("0", source_span()), ParsedNamePattern(ident("value"))],
+						source_span(),
+					),
+					ParsedNameExpr(ident("value")),
+				),
+				match_case(ParsedWildcardPattern(source_span()), int_expr("99")),
+			],
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0
+
+
 func test_match_nested_pattern_errors_are_specific() -> Bool:
 	tuple_arity_result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -7202,7 +7537,7 @@ func test_for_stream_name_binder_iterates_values() -> Bool:
 	)
 
 	body_has_element_type = match result.expr:
-		CompilerTypedForExpr(_, _, typed_body, _, _):
+		CompilerTypedForExpr(_, _, _, typed_body, _, _):
 			compiler_types_equal(compiler_typed_expr_semantic_type(typed_body), compiler_type_int())
 		_:
 			False
@@ -7216,6 +7551,161 @@ func test_for_stream_name_binder_iterates_values() -> Bool:
 		)
 		and compiler_env_get_var_type(result.context.state.env, "item") == None
 	)
+
+
+pure func no_tensor_loop_param_name(_typ: CompilerType) -> Option[String]:
+	None
+
+
+pure func state_with_tensor_loop_producer(
+	name: String,
+	params: List[CompilerType],
+	return_type: CompilerType,
+	producer: CompilerLoopProducer,
+) -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	vector_type = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)])
+	with_vector = compiler_env_add_var_with_details(
+		state.env,
+		"values",
+		vector_type,
+		Some(vector_type),
+		CompilerImmutableBinding,
+		CompilerLetBinding,
+		compiler_unrefined_binding(),
+	)
+
+	match compiler_env_mint_def_id(with_vector):
+		(next_env, def_id):
+			{ state | env = compiler_env_add_func_with_info(
+					next_env,
+					name,
+					compiler_func_symbol(
+						def_id,
+						CompilerFunctionType(True, params, return_type),
+						[],
+						params.map(no_tensor_loop_param_name),
+						CompilerPure,
+						CompilerUserDefinedFunc,
+						CompilerRejectResourceArgs,
+						None,
+						[],
+						Some(producer),
+						False,
+					),
+				) }
+
+
+func test_for_indices_records_range_loop_view() -> Bool:
+	vector_type = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)])
+	state = state_with_tensor_loop_producer(
+		"indices",
+		[vector_type],
+		compiler_type_list(compiler_type_int()),
+		CompilerLoopProducerIndices,
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		for_name_expr(
+			"index",
+			call_expr(ParsedNameExpr(ident("indices")), [ParsedNameExpr(ident("values"))]),
+			ParsedNameExpr(ident("index")),
+		),
+	)
+
+	match result.expr:
+		CompilerTypedForExpr(_, _, Some(CompilerTypedIndicesLoopView(element_type)), body, _, _):
+			(
+				result.context.state.errors.length() == 0
+				and compiler_types_equal(element_type, CompilerRangeType(CompilerConstIntType(4)))
+				and compiler_types_equal(compiler_typed_expr_semantic_type(body), element_type)
+			)
+		_:
+			False
+
+
+func test_for_enumerate_records_tuple_loop_view() -> Bool:
+	vector_type = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)])
+	state = state_with_tensor_loop_producer(
+		"enumerate",
+		[vector_type],
+		compiler_type_list(CompilerTupleType([compiler_type_int(), compiler_type_int()])),
+		CompilerLoopProducerEnumerate,
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		ParsedForExpr(
+			ParsedForTupleBinder(
+				[ident("index"), ident("value")],
+				source_span(),
+			),
+			call_expr(
+				ParsedNameExpr(ident("enumerate")),
+				[ParsedNameExpr(ident("values"))],
+			),
+			ParsedNameExpr(ident("index")),
+			source_span(),
+		),
+	)
+
+	match result.expr:
+		CompilerTypedForExpr(_, _, Some(CompilerTypedEnumerateLoopView(CompilerTupleType(elements))), body, _, _):
+			(
+				result.context.state.errors.length() == 0
+				and elements.length() == 2
+				and compiler_types_equal(
+					compiler_typed_expr_semantic_type(body),
+					CompilerRangeType(CompilerConstIntType(4)),
+				)
+			)
+		_:
+			False
+
+
+func test_for_windows_records_fixed_array_loop_view() -> Bool:
+	vector_type = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)])
+	state = state_with_tensor_loop_producer(
+		"windows",
+		[vector_type, compiler_type_int()],
+		compiler_type_list(compiler_type_int()),
+		CompilerLoopProducerWindows,
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		for_name_expr(
+			"window",
+			call_expr(
+				ParsedNameExpr(ident("windows")),
+				[ParsedNameExpr(ident("values")), int_expr("2")],
+			),
+			ParsedNameExpr(ident("window")),
+		),
+	)
+
+	match result.expr:
+		CompilerTypedForExpr(_, _, Some(CompilerTypedWindowsLoopView(2, element_type)), body, _, _):
+			expected = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(2)])
+
+			(
+				result.context.state.errors.length() == 0
+				and compiler_types_equal(element_type, expected)
+				and compiler_types_equal(compiler_typed_expr_semantic_type(body), expected)
+			)
+		_:
+			False
+
+
+func test_for_resource_source_binding_is_scoped_resource() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_resource_source_operations()),
+		for_name_expr(
+			"reader",
+			ParsedNameExpr(ident("source")),
+			call_expr(ParsedNameExpr(ident("read_line")), [ParsedNameExpr(ident("reader"))]),
+		),
+	)
+
+	result.context.state.errors.length() == 0
 
 
 func test_for_tuple_binder_binds_iterable_tuple_elements() -> Bool:
@@ -7351,6 +7841,10 @@ tests: TestSuite = {
 		),
 		("matrix builtin binds literal dimensions", test_matrix_builtin_binds_literal_dimensions),
 		(
+			"vector builtin derives dimension arithmetic",
+			test_vector_builtin_derives_dimension_arithmetic,
+		),
+		(
 			"raw nested function decl reports finalization gap",
 			test_raw_nested_function_decl_reports_finalization_gap,
 		),
@@ -7419,6 +7913,10 @@ tests: TestSuite = {
 		(
 			"concurrent for checks list body and returns void",
 			test_concurrent_for_checks_list_body_and_returns_void,
+		),
+		(
+			"concurrent for resource source binding is scoped resource",
+			test_concurrent_for_resource_source_binding_is_scoped_resource,
 		),
 		(
 			"concurrent for rejects value context non list and bad params",
@@ -7628,6 +8126,10 @@ tests: TestSuite = {
 			test_generic_call_guides_unannotated_callback_parameter,
 		),
 		(
+			"expected pure callback upgrades only pure lambda body",
+			test_expected_pure_callback_upgrades_only_pure_lambda_body,
+		),
+		(
 			"expected generic call return guides callback return",
 			test_expected_generic_call_return_guides_callback_return,
 		),
@@ -7835,6 +8337,19 @@ tests: TestSuite = {
 			"symbolic range subscript requires matching dimension",
 			test_symbolic_range_subscript_requires_matching_dimension,
 		),
+		(
+			"if bounds condition refines runtime index",
+			test_if_bounds_condition_refines_runtime_index,
+		),
+		("symbolic product subscript proofs", test_symbolic_product_subscript_proofs),
+		(
+			"generic matrix call preserves repeated symbolic dimension",
+			test_generic_matrix_call_preserves_repeated_symbolic_dimension,
+		),
+		(
+			"generic dimension argument preserves static expression",
+			test_generic_dimension_argument_preserves_static_expression,
+		),
 		("subscript errors are specific", test_subscript_errors_are_specific),
 		("subscript assign allows mutable tensor", test_subscript_assign_allows_mutable_tensor),
 		(
@@ -7891,6 +8406,10 @@ tests: TestSuite = {
 		),
 		("match list exhaustiveness", test_match_list_exhaustiveness),
 		("match open scalar requires catch all", test_match_open_scalar_requires_catch_all),
+		(
+			"match int pattern accepts const int tuple field",
+			test_match_int_pattern_accepts_const_int_tuple_field,
+		),
 		("match nested pattern errors are specific", test_match_nested_pattern_errors_are_specific),
 		("match errors are specific", test_match_errors_are_specific),
 		("while break and continue loop context", test_while_break_and_continue_loop_context),
@@ -7900,6 +8419,16 @@ tests: TestSuite = {
 		("for dict name binder iterates keys", test_for_dict_name_binder_iterates_keys),
 		("for channel name binder iterates values", test_for_channel_name_binder_iterates_values),
 		("for stream name binder iterates values", test_for_stream_name_binder_iterates_values),
+		("for indices records range loop view", test_for_indices_records_range_loop_view),
+		("for enumerate records tuple loop view", test_for_enumerate_records_tuple_loop_view),
+		(
+			"for windows records fixed array loop view",
+			test_for_windows_records_fixed_array_loop_view,
+		),
+		(
+			"for resource source binding is scoped resource",
+			test_for_resource_source_binding_is_scoped_resource,
+		),
 		(
 			"for tuple binder binds iterable tuple elements",
 			test_for_tuple_binder_binds_iterable_tuple_elements,

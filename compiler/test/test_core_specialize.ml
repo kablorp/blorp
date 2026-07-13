@@ -172,6 +172,25 @@ let expect_intrinsic_with_reg label reg expected_name e =
       Alcotest.(check string) (label ^ " name") expected_name got_name
   | _ -> Alcotest.failf "%s did not specialize to expected intrinsic" label
 
+let test_vector_minmax_uses_tensor_element_abi () =
+  let cases =
+    [
+      ("Float max", "blorp_max", ty_float, "blorp_vector_max_float");
+      ("Float min", "blorp_min", ty_float, "blorp_vector_min_float");
+      ("Float32 max", "blorp_max", ty_float32, "blorp_vector_max_float32");
+      ("Float32 min", "blorp_min", ty_float32, "blorp_vector_min_float32");
+      ("Float16 max", "blorp_max", ty_float16, "blorp_vector_max_float16");
+      ("Float16 min", "blorp_min", ty_float16, "blorp_vector_min_float16");
+      ("Int max", "blorp_max", ty_int, "blorp_vector_max_int");
+      ("Int min", "blorp_min", ty_int, "blorp_vector_min_int");
+    ]
+  in
+  List.iter
+    (fun (label, sentinel, elem_ty, expected) ->
+      let vector = cvar "values" (tensor elem_ty [ 3 ]) in
+      expect_builtin label expected (call_builtin sentinel [ vector ] elem_ty))
+    cases
+
 let expect_ranked_checked_get_shape_dims label expected_dims args =
   let got_dims = List.map int_lit (List.filteri (fun i _ -> i >= 1 && i <= 3) args) in
   Alcotest.(check (list int)) (label ^ " dims") expected_dims got_dims
@@ -1349,6 +1368,8 @@ let suite =
           test_float32_vector_fill_uses_packed_runtime;
         Alcotest.test_case "float64_vector_fill_unboxed" `Quick
           test_float64_vector_fill_uses_unboxed_runtime;
+        Alcotest.test_case "vector_minmax_uses_tensor_element_abi" `Quick
+          test_vector_minmax_uses_tensor_element_abi;
         Alcotest.test_case "alias_vector_length_constant_folds" `Quick
           test_alias_vector_length_constant_folds;
         Alcotest.test_case

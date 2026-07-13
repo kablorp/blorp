@@ -243,6 +243,35 @@ let typecheck_graph_target_request source =
       bridge_module_origin_of_session_origin source.preload_origin;
   }
 
+(** Blorp owns typechecking for preloaded graphs, so accepting its typed AST
+    must also restore the compilation metadata that OCaml typechecking used to
+    register as a side effect. Core lowering consults this index to turn a
+    resource scope into its compiler-owned finalizer call. Register both the
+    declaration-local name used while lowering the owning module and the
+    canonical name carried by imported signatures. *)
+let register_typechecked_resource_cleanups ~module_name typed_program =
+  let session = Session.current () in
+  let register type_name cleanup =
+    Session.register_resource_cleanup session ~type_name cleanup
+  in
+  let rec visit_decl (decl : Ast.decl) =
+    match decl.decl_desc with
+    | Ast.DPrivate inner -> visit_decl inner
+    | Ast.DType type_decl when type_decl.type_is_resource ->
+        Option.iter
+          (fun cleanup ->
+            register type_decl.type_name cleanup;
+            let canonical_name =
+              Types.canonical_module_type_name ~module_path:module_name
+                type_decl.type_name
+            in
+            if not (String.equal canonical_name type_decl.type_name) then
+              register canonical_name cleanup)
+          type_decl.type_resource_cleanup
+    | _ -> ()
+  in
+  Typed_ast.program_ast typed_program |> List.iter visit_decl
+
 let decoded_typecheck_graph_source ~expected_path ~expected_module source =
   if
     not
@@ -264,6 +293,11 @@ let decoded_typecheck_graph_source ~expected_path ~expected_module source =
     | _ :: _ as errors -> Error (bridge_errors ~filename:expected_path errors)
     | [] ->
         if artifact.typechecked_ctfe_evaluated_by_blorp then
+          let () =
+            register_typechecked_resource_cleanups
+              ~module_name:source.typechecked_graph_module_name
+              artifact.typechecked_program
+          in
           Ok
             ( artifact.typechecked_program,
               artifact.typechecked_import_bindings )

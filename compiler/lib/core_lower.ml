@@ -943,6 +943,9 @@ and lower_child_expr (e : TA.expr) : Core.core = lower_typed_expr_core e
 and lower_timeout_expr (e : TA.expr) : Core.core =
   let lowered = lower_child_expr e in
   if Types.types_equal lowered.ty ty_int then lowered
+  else if
+    match lowered.ty with Ast.TyConstInt _ -> true | _ -> false
+  then { lowered with ty = ty_int }
   else if Types.is_std_duration_type lowered.ty then
     lower_duration_timeout_milliseconds lowered
   else

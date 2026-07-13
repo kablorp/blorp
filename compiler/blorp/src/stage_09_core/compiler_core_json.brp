@@ -31,6 +31,8 @@ private UNION_DECL_TAG: String = "union"
 
 private TYPE_ALIAS_DECL_TAG: String = "type_alias"
 
+private TRAIT_DECL_TAG: String = "trait"
+
 private IMPL_DECL_TAG: String = "impl"
 
 private TYPED_UNION_PAYLOAD_STORAGE_TAG: String = "typed"
@@ -1879,10 +1881,24 @@ record CoreTailrecListSpreadLoop {
 }
 
 
+record CoreForeignLinkFlag {
+	platform: Option[String],
+	flag: String
+}
+
+
+record CoreForeignFunction {
+	c_name: String,
+	includes: List[String],
+	link_flags: List[CoreForeignLinkFlag],
+	arg_passing: CoreForeignArgPassing
+}
+
+
 union CoreFunctionKind:
 	UserFunction
 	BuiltinFunction
-	ForeignFunction
+	ForeignFunction(CoreForeignFunction)
 	ClosureBodyFunction(CoreClosureAbi)
 
 
@@ -1906,6 +1922,7 @@ record CoreGlobal {
 	init: CoreExpr,
 	is_mutable: Bool,
 	is_const: Bool,
+	is_private: Bool,
 	def_id: Int,
 	loc: CoreSourceLoc
 }
@@ -1990,6 +2007,24 @@ record CoreTypeAliasDecl {
 }
 
 
+record CoreTraitMethod {
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+	is_pure: Bool,
+	loc: CoreSourceLoc
+}
+
+
+record CoreTraitDecl {
+	name: String,
+	type_params: List[String],
+	supertraits: List[String],
+	methods: List[CoreTraitMethod],
+	loc: CoreSourceLoc
+}
+
+
 record CoreImplDecl {
 	trait_name: String,
 	for_type: CoreType,
@@ -2006,6 +2041,7 @@ union CoreDecl:
 	ValueRecordDecl(CoreValueRecordDecl)
 	HeapRecordDecl(CoreHeapRecordDecl)
 	TypeAliasDecl(CoreTypeAliasDecl)
+	TraitDecl(CoreTraitDecl)
 	ImplDecl(CoreImplDecl)
 
 
@@ -11618,14 +11654,71 @@ pure func decode_core_closure_create_json(
 	})
 
 
+private pure func foreign_link_flag_to_json(link_flag: CoreForeignLinkFlag) -> JsonValue:
+	JsonObject([
+		("platform", option_string_to_json(link_flag.platform)),
+		("flag", JsonString(link_flag.flag)),
+	])
+
+
+private pure func decode_foreign_link_flag_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreForeignLinkFlag, CoreJsonError]:
+	platform ?= decode_optional_string(value, path, "platform")
+	flag ?= string_field(value, path, "flag")
+	Ok({
+		platform = platform,
+		flag = flag,
+	})
+
+
+private pure func decode_foreign_link_flags(
+	value: JsonValue,
+	path: String,
+) -> Result[List[CoreForeignLinkFlag], CoreJsonError]:
+	items ?= array_field(value, path, "link_flags")
+	var result: List[CoreForeignLinkFlag] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			match decode_foreign_link_flag_json(
+				item,
+				path_index(
+					path_field(path, "link_flags"),
+					index,
+				),
+			):
+				Ok(link_flag):
+					result = result.append(link_flag)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
 pure func core_function_kind_to_json(kind: CoreFunctionKind) -> JsonValue:
 	match kind:
 		UserFunction:
 			JsonObject([(KIND_FIELD, JsonString(USER_FUNCTION_KIND_TAG))])
 		BuiltinFunction:
 			JsonObject([(KIND_FIELD, JsonString(BUILTIN_FUNCTION_KIND_TAG))])
-		ForeignFunction:
-			JsonObject([(KIND_FIELD, JsonString(FOREIGN_FUNCTION_KIND_TAG))])
+		ForeignFunction(foreign_info):
+			JsonObject([
+				(KIND_FIELD, JsonString(FOREIGN_FUNCTION_KIND_TAG)),
+				("c_name", JsonString(foreign_info.c_name)),
+				("includes", strings_to_json(foreign_info.includes)),
+				("link_flags", JsonVector(foreign_info.link_flags.map(foreign_link_flag_to_json))),
+				("arg_passing", foreign_arg_passing_to_json(foreign_info.arg_passing)),
+			])
 		ClosureBodyFunction(abi):
 			JsonObject([
 				(KIND_FIELD, JsonString(CLOSURE_BODY_FUNCTION_KIND_TAG)),
@@ -11644,7 +11737,20 @@ pure func decode_core_function_kind_json(
 	else if tag == BUILTIN_FUNCTION_KIND_TAG:
 		Ok(BuiltinFunction)
 	else if tag == FOREIGN_FUNCTION_KIND_TAG:
-		Ok(ForeignFunction)
+		c_name ?= string_field(value, path, "c_name")
+		includes ?= decode_string_list(value, path, "includes")
+		link_flags ?= decode_foreign_link_flags(value, path)
+		arg_passing_json ?= object_field(value, path, "arg_passing")
+		arg_passing ?= decode_foreign_arg_passing_json(
+			arg_passing_json,
+			path_field(path, "arg_passing"),
+		)
+		Ok(ForeignFunction({
+			c_name = c_name,
+			includes = includes,
+			link_flags = link_flags,
+			arg_passing = arg_passing,
+		}))
 	else if tag == CLOSURE_BODY_FUNCTION_KIND_TAG:
 		abi_json ?= object_field(value, path, "abi")
 		abi ?= decode_core_closure_abi_json(
@@ -11793,6 +11899,7 @@ pure func core_global_to_json(global: CoreGlobal) -> JsonValue:
 		("init", core_expr_to_json(global.init)),
 		("mutable", JsonBool(global.is_mutable)),
 		("const", JsonBool(global.is_const)),
+		("private", JsonBool(global.is_private)),
 		("def_id", json_int(global.def_id)),
 		("loc", source_loc_to_json(global.loc)),
 	])
@@ -11819,6 +11926,7 @@ pure func decode_core_global_json(
 	)
 	is_mutable ?= bool_field(value, path, "mutable")
 	is_const ?= bool_field(value, path, "const")
+	is_private ?= bool_field(value, path, "private")
 	def_id ?= int_field(value, path, "def_id")
 	loc_json ?= object_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
@@ -11832,6 +11940,7 @@ pure func decode_core_global_json(
 		init = init,
 		is_mutable = is_mutable,
 		is_const = is_const,
+		is_private = is_private,
 		def_id = def_id,
 		loc = loc,
 	})
@@ -12327,6 +12436,106 @@ pure func decode_core_type_alias_decl_json(
 	})
 
 
+private pure func core_trait_method_to_json(method: CoreTraitMethod) -> JsonValue:
+	JsonObject([
+		("name", JsonString(method.name)),
+		("params", core_params_to_json(method.params)),
+		("return_type", core_type_to_json(method.return_type)),
+		("pure", JsonBool(method.is_pure)),
+		("loc", source_loc_to_json(method.loc)),
+	])
+
+
+private pure func decode_core_trait_method_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreTraitMethod, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	params ?= decode_core_params(value, path, "params")
+	return_type_json ?= object_field(value, path, "return_type")
+	return_type ?= decode_core_type_json(
+		return_type_json,
+		path_field(path, "return_type"),
+	)
+	is_pure ?= bool_field(value, path, "pure")
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok({
+		name = name,
+		params = params,
+		return_type = return_type,
+		is_pure = is_pure,
+		loc = loc,
+	})
+
+
+private pure func decode_core_trait_methods(
+	value: JsonValue,
+	path: String,
+) -> Result[List[CoreTraitMethod], CoreJsonError]:
+	items ?= array_field(value, path, "methods")
+	var methods: List[CoreTraitMethod] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			match decode_core_trait_method_json(
+				item,
+				path_index(path_field(path, "methods"), index),
+			):
+				Ok(method):
+					methods = methods.append(method)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(methods)
+
+
+pure func core_trait_decl_to_json(trait_decl: CoreTraitDecl) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(TRAIT_DECL_TAG)),
+		("name", JsonString(trait_decl.name)),
+		("type_params", strings_to_json(trait_decl.type_params)),
+		("supertraits", strings_to_json(trait_decl.supertraits)),
+		("methods", JsonVector(trait_decl.methods.map(core_trait_method_to_json))),
+		("loc", source_loc_to_json(trait_decl.loc)),
+	])
+
+
+pure func decode_core_trait_decl_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreTraitDecl, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	type_params ?= decode_string_list(value, path, "type_params")
+	supertraits ?= decode_string_list(value, path, "supertraits")
+	methods ?= decode_core_trait_methods(value, path)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok({
+		name = name,
+		type_params = type_params,
+		supertraits = supertraits,
+		methods = methods,
+		loc = loc,
+	})
+
+
 pure func core_impl_decl_to_json(impl_decl: CoreImplDecl) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(IMPL_DECL_TAG)),
@@ -12378,6 +12587,8 @@ pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 			core_heap_record_decl_to_json(record_decl)
 		TypeAliasDecl(alias_decl):
 			core_type_alias_decl_to_json(alias_decl)
+		TraitDecl(trait_decl):
+			core_trait_decl_to_json(trait_decl)
 		ImplDecl(impl_decl):
 			core_impl_decl_to_json(impl_decl)
 
@@ -12406,6 +12617,9 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	else if tag == TYPE_ALIAS_DECL_TAG:
 		alias_decl ?= decode_core_type_alias_decl_json(value, path)
 		Ok(TypeAliasDecl(alias_decl))
+	else if tag == TRAIT_DECL_TAG:
+		trait_decl ?= decode_core_trait_decl_json(value, path)
+		Ok(TraitDecl(trait_decl))
 	else if tag == IMPL_DECL_TAG:
 		impl_decl ?= decode_core_impl_decl_json(value, path)
 		Ok(ImplDecl(impl_decl))

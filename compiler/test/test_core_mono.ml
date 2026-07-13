@@ -2200,6 +2200,102 @@ let test_mono_ufcs_hof_builtin_generic_rewrites () =
         "std_list__sort_by__mono_String_ImportSymbol" v.vname
   | _ -> Alcotest.fail "expected rewritten main call"
 
+let test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites () =
+  let list_t = TyNamed ("List", [ TyVar "T" ]) in
+  let result_u =
+    TyNamed
+      ( "Result",
+        [ TyVar "U"; TyNamed ("ConcurrencyError", []) ] )
+  in
+  let result_list_u = TyNamed ("List", [ result_u ]) in
+  let callback_t_u =
+    TyFunc
+      { params = [ TyVar "T" ]; return = TyVar "U"; is_pure = false }
+  in
+  let wrapper =
+    mk_func ~def_id:866 ~type_params:[ "T"; "U" ]
+      ~module_path:(Some "std/list")
+      "std_list__concurrent_with_timeout"
+      [
+        ("self", list_t);
+        ("limit", ty_int);
+        ("timeout", TyNamed ("std_units__Duration", []));
+        ("f", callback_t_u);
+      ]
+      result_list_u (cvar "result" result_list_u)
+  in
+  let colliding_selected_id =
+    mk_func ~def_id:503 ~type_params:[ "T"; "U" ]
+      ~module_path:(Some "std/unrelated") "std_unrelated__map_with_timeout"
+      [
+        ("self", list_t);
+        ("limit", ty_int);
+        ("timeout", TyNamed ("std_units__Duration", []));
+        ("f", callback_t_u);
+      ]
+      result_list_u (cvar "wrong_result" result_list_u)
+  in
+  let result_int =
+    TyNamed
+      ( "Result",
+        [ ty_int; TyNamed ("ConcurrencyError", []) ] )
+  in
+  let concrete_result = TyNamed ("List", [ result_int ]) in
+  let concrete_callback =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = false }
+  in
+  let call_ty =
+    TyFunc
+      {
+        params =
+          [
+            TyNamed ("List", [ ty_int ]);
+            ty_int;
+            TyNamed ("std_units__Duration", []);
+            concrete_callback;
+          ];
+        return = concrete_result;
+        is_pure = false;
+      }
+  in
+  let caller_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 503,
+           cvar "__ufcs_std$list__concurrent_with_timeout" call_ty,
+           [
+             cvar "items" (TyNamed ("List", [ ty_int ]));
+             cvar "limit" ty_int;
+             cvar "timeout" (TyNamed ("std_units__Duration", []));
+             cvar "f" concrete_callback;
+           ] ))
+      concrete_result
+  in
+  let caller =
+    mk_func "caller"
+      [
+        ("items", TyNamed ("List", [ ty_int ]));
+        ("limit", ty_int);
+        ("timeout", TyNamed ("std_units__Duration", []));
+        ("f", concrete_callback);
+      ]
+      concrete_result caller_body
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl wrapper; mk_decl colliding_selected_id; mk_decl caller ]
+  in
+  let names =
+    List.filter_map
+      (function { cd_desc = CDFunc f; _ } -> Some f.cf_name | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "emits concrete timeout wrapper specialization" true
+    (List.mem
+       "std_list__concurrent_with_timeout__mono_Int_Int"
+       names)
+
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -2318,5 +2414,7 @@ let suite =
           test_mono_ufcs_can_target_bare_module_builtin_generic;
         Alcotest.test_case "UFCS HOF builtin generic rewrites" `Quick
           test_mono_ufcs_hof_builtin_generic_rewrites;
+        Alcotest.test_case "UFCS user wrapper with nested generic result rewrites"
+          `Quick test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites;
       ] );
   ]

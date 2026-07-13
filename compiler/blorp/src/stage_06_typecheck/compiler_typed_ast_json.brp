@@ -88,6 +88,12 @@ import:
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedExprInfo,
+		CompilerTypedLoopView(
+			CompilerTypedEnumerate2LoopView,
+			CompilerTypedEnumerateLoopView,
+			CompilerTypedIndicesLoopView,
+			CompilerTypedWindowsLoopView,
+		),
 		CompilerTypedLambdaParam,
 		CompilerTypedMatchCase,
 		CompilerTypedPattern(
@@ -133,8 +139,9 @@ import:
 			ParsedNotEqualOp,
 			ParsedSubtractOp,
 		),
-		ParsedDecl,
+		ParsedDecl(ForeignBlockParsedDecl, TraitParsedDecl),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
+		ParsedForeignBlockArg,
 		ParsedFunctionDecl,
 		ParsedIdentifier,
 		ParsedImplDecl,
@@ -180,6 +187,7 @@ import:
 		CompilerSubscriptProof,
 		CompilerValueProofs,
 	../stage_01_file_io/compiler_source: CompilerSourceFile, CompilerSourceSpan
+	../stage_05_types/compiler_generic_params: CompilerBoundTypeParam
 	../stage_05_types/compiler_type: CompilerType
 	../stage_05_types/compiler_type_json:
 		compiler_optional_type_to_json,
@@ -207,14 +215,18 @@ import:
 	compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
+			CompilerTypedForeignFunctionDecl,
 			CompilerTypedGlobalVarDecl,
 			CompilerTypedImplDecl,
 			CompilerTypedParsedDecl,
 			CompilerTypedPrivateDecl,
 			CompilerTypedRecordDecl,
+			CompilerTypedTraitDecl,
 			CompilerTypedTypeAliasDecl,
 			CompilerTypedUnionDecl,
 		),
+		CompilerTypedForeignFunctionInfo,
+		CompilerTypedForeignLinkFlag,
 		CompilerTypedFunctionInfo,
 		CompilerTypedGlobalVarInfo,
 		CompilerTypedImplInfo,
@@ -224,6 +236,7 @@ import:
 		CompilerTypedTypeAliasInfo,
 		CompilerTypedUnionInfo,
 		CompilerTypedUnionVariantInfo,
+		compiler_typed_foreign_link_platform_to_string,
 	json: JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector)
 
 
@@ -641,6 +654,49 @@ private pure func optional_typed_expr_to_json(expr: Option[CompilerTypedExpr]) -
 		Some(value):
 			compiler_typed_expr_to_json(value)
 		None:
+			JsonNull
+
+
+private pure func compiler_typed_loop_view_to_json(
+	loop_view: Option[CompilerTypedLoopView],
+	iterable: CompilerTypedExpr,
+) -> JsonValue:
+	match (loop_view, iterable):
+		(Some(view), CompilerTypedCallExpr(_, args, _, _)):
+			match (view, args.get(0)):
+				(CompilerTypedIndicesLoopView(element_type), Some(source)):
+					JsonObject([
+						(KIND_FIELD, JsonString("indices")),
+						("source", compiler_typed_expr_to_json(source)),
+						("element_type", compiler_type_to_json(element_type)),
+					])
+				(CompilerTypedEnumerateLoopView(element_type), Some(source)):
+					JsonObject([
+						(KIND_FIELD, JsonString("enumerate")),
+						("source", compiler_typed_expr_to_json(source)),
+						("element_type", compiler_type_to_json(element_type)),
+					])
+				(CompilerTypedEnumerate2LoopView(element_type), Some(source)):
+					JsonObject([
+						(KIND_FIELD, JsonString("enumerate2")),
+						("source", compiler_typed_expr_to_json(source)),
+						("element_type", compiler_type_to_json(element_type)),
+					])
+				(CompilerTypedWindowsLoopView(size, element_type), Some(source)):
+					match args.get(1):
+						Some(size_arg):
+							JsonObject([
+								(KIND_FIELD, JsonString("windows")),
+								("source", compiler_typed_expr_to_json(source)),
+								("size_arg", compiler_typed_expr_to_json(size_arg)),
+								("size", json_int(size)),
+								("element_type", compiler_type_to_json(element_type)),
+							])
+						None:
+							JsonNull
+				_:
+					JsonNull
+		_:
 			JsonNull
 
 
@@ -1230,7 +1286,7 @@ pure func compiler_typed_expr_to_json(expr: CompilerTypedExpr) -> JsonValue:
 					("body", compiler_typed_expr_to_json(body)),
 				],
 			)
-		CompilerTypedForExpr(binder, iterable, body, span, info):
+		CompilerTypedForExpr(binder, iterable, loop_view, body, span, info):
 			typed_expr_json(
 				"for",
 				span,
@@ -1238,6 +1294,7 @@ pure func compiler_typed_expr_to_json(expr: CompilerTypedExpr) -> JsonValue:
 				[
 					("binder", parsed_for_binder_to_json(binder)),
 					("iterable", compiler_typed_expr_to_json(iterable)),
+					("loop_view", compiler_typed_loop_view_to_json(loop_view, iterable)),
 					("body", compiler_typed_expr_to_json(body)),
 				],
 			)
@@ -1335,14 +1392,74 @@ private pure func optional_typed_body_to_json(body: Option[CompilerTypedExpr]) -
 	optional_typed_expr_to_json(body)
 
 
+private pure func compiler_bound_type_param_to_json(
+	param: CompilerBoundTypeParam,
+) -> JsonValue:
+	JsonObject([
+		("name", JsonString(param.name)),
+		("bounds", JsonVector(param.bounds.map(func(bound): JsonString(bound.name)))),
+	])
+
+
 pure func compiler_typed_function_info_to_json(info: CompilerTypedFunctionInfo) -> JsonValue:
 	JsonObject([
 		("decl", typed_function_decl_to_json(info.decl)),
 		("callable_id", option_int_to_json(info.callable_id)),
+		(
+			"effective_type_params",
+			JsonVector(info.effective_type_params.map(compiler_bound_type_param_to_json)),
+		),
 		("param_types", compiler_type_list_to_json(info.param_types)),
 		("source_return_type", compiler_optional_type_to_json(info.source_return_type)),
 		("semantic_return_type", compiler_type_to_json(info.semantic_return_type)),
 		("body", optional_typed_body_to_json(info.body)),
+	])
+
+
+private pure func compiler_typed_foreign_link_arg_name(
+	link_flag: CompilerTypedForeignLinkFlag,
+) -> String:
+	match link_flag.platform:
+		None:
+			"link"
+		Some(platform):
+			"link_" + compiler_typed_foreign_link_platform_to_string(platform)
+
+
+private pure func compiler_typed_foreign_function_to_bridge_json(
+	info: CompilerTypedForeignFunctionInfo,
+) -> JsonValue:
+	include_args: List[ParsedForeignBlockArg] = info.includes.map(func(include_path): {
+			name = {
+				text = "include",
+				span = info.block_span
+			},
+			value = include_path,
+			span = info.block_span
+		})
+	link_args: List[ParsedForeignBlockArg] = info.link_flags.map(
+		func(link_flag: CompilerTypedForeignLinkFlag): {
+			name = {
+				text = compiler_typed_foreign_link_arg_name(link_flag),
+				span = info.block_span
+			},
+			value = link_flag.flag,
+			span = info.block_span
+		},
+	)
+
+	JsonObject([
+		(KIND_FIELD, JsonString("parsed")),
+		(
+			"decl",
+			typed_parsed_decl_to_json(
+				ForeignBlockParsedDecl(
+					include_args + link_args,
+					[info.decl],
+					info.block_span,
+				),
+			),
+		),
 	])
 
 
@@ -1411,6 +1528,8 @@ pure func compiler_typed_decl_to_json(decl: CompilerTypedDecl) -> JsonValue:
 				(KIND_FIELD, JsonString("function")),
 				("info", compiler_typed_function_info_to_json(info)),
 			])
+		CompilerTypedForeignFunctionDecl(info):
+			compiler_typed_foreign_function_to_bridge_json(info)
 		CompilerTypedGlobalVarDecl(info):
 			JsonObject([
 				(KIND_FIELD, JsonString("global_var")),
@@ -1425,6 +1544,13 @@ pure func compiler_typed_decl_to_json(decl: CompilerTypedDecl) -> JsonValue:
 			JsonObject([
 				(KIND_FIELD, JsonString("type_alias")),
 				("info", compiler_typed_type_alias_info_to_json(info)),
+			])
+		CompilerTypedTraitDecl(info):
+			-- OCaml still models trait signatures as DeclOther. Preserve the
+			-- temporary bridge shape while Blorp consumes the typed payload directly.
+			JsonObject([
+				(KIND_FIELD, JsonString("parsed")),
+				("decl", typed_parsed_decl_to_json(TraitParsedDecl(info.decl))),
 			])
 		CompilerTypedUnionDecl(info):
 			JsonObject([

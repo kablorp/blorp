@@ -184,6 +184,31 @@ let test_local_function_value_shadows_global_name () =
               (pp_to_string_indented body)
         | None -> Alcotest.fail "missing run body"))
 
+let test_function_param_shadows_global_name () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let callback_ty = fn_ty [ ty_int ] ty_void false in
+        let global_f = mk_func "f" [] ty_int (Some (cint 0)) 100 in
+        let invoke =
+          mk_func "invoke" [ ("f", callback_ty) ] callback_ty
+            (Some (cvar "f" callback_ty)) 101
+        in
+        let adapted =
+          Blorp.Core_closure.adapt_function_refs_program
+            [ decl global_f; decl invoke ]
+        in
+        let invoke' = require_func "invoke" adapted in
+        match invoke'.cf_body with
+        | Some { desc = CVar v; _ } ->
+            Alcotest.(check string) "function parameter stays local" "f" v.vname;
+            Alcotest.(check bool)
+              "function parameter creates no eta adapter" false
+              (Option.is_some (find_func "_blorp_eta_0" adapted))
+        | Some { desc = CClosureCreate _; _ } ->
+            Alcotest.fail "function parameter was wrapped as a global function ref"
+        | Some _ -> Alcotest.fail "expected function parameter reference"
+        | None -> Alcotest.fail "missing invoke body"))
+
 let test_passthrough_builtin_function_ref_becomes_closure_create () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -408,6 +433,8 @@ let suite =
           test_let_body_function_ref_becomes_closure_create;
         Alcotest.test_case "local_function_value_shadows_global_name" `Quick
           test_local_function_value_shadows_global_name;
+        Alcotest.test_case "function_param_shadows_global_name" `Quick
+          test_function_param_shadows_global_name;
         Alcotest.test_case
           "passthrough_builtin_function_ref_becomes_closure_create" `Quick
           test_passthrough_builtin_function_ref_becomes_closure_create;

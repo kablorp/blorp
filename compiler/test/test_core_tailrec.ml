@@ -158,7 +158,16 @@ let test_list_spread_recur_omits_list_rebind () =
         "cursor name is explicit" true
         (String.length tls_cursor_var.vname > 0);
       match rewritten_tree with
-      | CTSwitchLen { ctl_len_geq = Some (_, CTLeaf { ct_body; _ }); _ } -> (
+      | CTSwitchLen
+          {
+            ctl_len_geq = Some (_, CTLeaf { ct_bindings; ct_body });
+            _;
+          } -> (
+          Alcotest.(check bool)
+            "spread binding removed" false
+            (List.exists
+               (fun binding -> Var.equal binding.mb_var rest)
+               ct_bindings);
           match ct_body.desc with
           | CTailrecRecur
               (TailrecListSpreadRecur { tr_rebinds; tr_cursor_advance }) ->

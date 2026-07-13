@@ -71,9 +71,11 @@ import:
 			ParsedWithExpr,
 		),
 		ParsedFieldDecl,
+		ParsedForeignBlockArg,
 		ParsedForeignFunctionDecl,
 		ParsedFunctionAnnotation(
 			ParsedDebugOnlyAnnotation,
+			ParsedNoCopyAnnotation,
 			ParsedResourceResultOrdinaryAnnotation,
 			ParsedTailRecursiveAnnotation,
 		),
@@ -113,6 +115,12 @@ import:
 		CompilerFuncOrigin(CompilerForeignFunc, CompilerUserDefinedFunc),
 		CompilerImplInstance,
 		CompilerImplMethodInfo,
+		CompilerLoopProducer(
+			CompilerLoopProducerEnumerate,
+			CompilerLoopProducerEnumerate2,
+			CompilerLoopProducerIndices,
+			CompilerLoopProducerWindows,
+		),
 		CompilerPurity(CompilerImpure, CompilerPure),
 		CompilerResourceArgPolicy(CompilerAllowResourceArgs, CompilerRejectResourceArgs),
 		CompilerResourceResultPolicy(
@@ -141,10 +149,14 @@ import:
 		compiler_env_add_var_with_module_details,
 		compiler_env_extend_type_param_bounds,
 		compiler_env_find_conflicting_impl,
+		compiler_env_get_alias,
 		compiler_env_get_constructor_for_parent,
 		compiler_env_get_function_trait,
+		compiler_env_get_opaque_alias,
+		compiler_env_get_record,
 		compiler_env_get_trait,
 		compiler_env_get_type_decl,
+		compiler_env_get_type_kind,
 		compiler_env_get_type_params,
 		compiler_env_has_direct_trait_evidence,
 		compiler_env_mint_def_id,
@@ -176,6 +188,7 @@ import:
 		),
 		compiler_canonical_module_type_name,
 		compiler_collect_type_vars,
+		compiler_is_global_abi_type_name,
 		compiler_optional_type_copy,
 		compiler_qualify_module_local_types,
 		compiler_type_contains_meta,
@@ -195,6 +208,7 @@ import:
 	../stage_05_types/compiler_type_widening:
 		CompilerTypeWideningDecision(CompilerTypeKeep),
 		CompilerValueSlot,
+	compiler_foreign_validation: compiler_validate_foreign_function
 	compiler_imports:
 		CompilerImportableModule,
 		CompilerImportableModuleSurface,
@@ -495,6 +509,7 @@ private pure func compiler_typecheck_with_body_env(
 record CompilerTypedFunctionInfo {
 	decl: ParsedFunctionDecl,
 	callable_id: Option[Int],
+	effective_type_params: List[CompilerBoundTypeParam],
 	param_types: List[CompilerType],
 	source_return_type: Option[CompilerType],
 	semantic_return_type: CompilerType,
@@ -530,6 +545,19 @@ record CompilerTypedTypeAliasInfo {
 }
 
 
+record CompilerTypedTraitMethodInfo {
+	decl: ParsedTraitMethodDecl,
+	param_types: List[CompilerType],
+	semantic_return_type: CompilerType
+}
+
+
+record CompilerTypedTraitInfo {
+	decl: ParsedTraitDecl,
+	methods: List[CompilerTypedTraitMethodInfo]
+}
+
+
 record CompilerTypedUnionVariantInfo {
 	name: String,
 	fields: List[CompilerType],
@@ -551,11 +579,62 @@ record CompilerTypedImplInfo {
 }
 
 
+enum CompilerTypedForeignLinkPlatform:
+	CompilerTypedForeignLinux
+	CompilerTypedForeignMacos
+
+
+pure func compiler_typed_foreign_link_platform_to_string(
+	platform: CompilerTypedForeignLinkPlatform,
+) -> String:
+	match platform:
+		CompilerTypedForeignLinux:
+			"linux"
+		CompilerTypedForeignMacos:
+			"macos"
+
+
+record CompilerTypedForeignLinkFlag {
+	platform: Option[CompilerTypedForeignLinkPlatform],
+	flag: String
+}
+
+
+enum CompilerTypedForeignArgPassing:
+	CompilerTypedForeignDefaultArgs
+	CompilerTypedForeignBorrowArgs
+
+
+pure func compiler_typed_foreign_arg_passing_borrows(
+	arg_passing: CompilerTypedForeignArgPassing,
+) -> Bool:
+	match arg_passing:
+		CompilerTypedForeignDefaultArgs:
+			False
+		CompilerTypedForeignBorrowArgs:
+			True
+
+
+record CompilerTypedForeignFunctionInfo {
+	decl: ParsedForeignFunctionDecl,
+	callable_id: Option[Int],
+	param_types: List[CompilerType],
+	semantic_return_type: CompilerType,
+	c_name: String,
+	includes: List[String],
+	link_flags: List[CompilerTypedForeignLinkFlag],
+	arg_passing: CompilerTypedForeignArgPassing,
+	block_span: CompilerSourceSpan
+}
+
+
 union CompilerTypedDecl:
 	CompilerTypedFunctionDecl(CompilerTypedFunctionInfo)
+	CompilerTypedForeignFunctionDecl(CompilerTypedForeignFunctionInfo)
 	CompilerTypedGlobalVarDecl(CompilerTypedGlobalVarInfo)
 	CompilerTypedRecordDecl(CompilerTypedRecordInfo)
 	CompilerTypedTypeAliasDecl(CompilerTypedTypeAliasInfo)
+	CompilerTypedTraitDecl(CompilerTypedTraitInfo)
 	CompilerTypedUnionDecl(CompilerTypedUnionInfo)
 	CompilerTypedImplDecl(CompilerTypedImplInfo)
 	CompilerTypedPrivateDecl(CompilerTypedDecl)
@@ -601,6 +680,12 @@ record CompilerTypecheckDeclBodyResult {
 record CompilerTypecheckProgramResult {
 	state: CompilerTypecheckState,
 	program: CompilerTypedProgram
+}
+
+
+private record CompilerTypedForeignBlockResult {
+	state: CompilerTypecheckState,
+	decls: List[CompilerTypedDecl]
 }
 
 
@@ -760,6 +845,33 @@ private pure func compiler_typecheck_validate_typed_alias_info(
 	)
 
 
+private pure func compiler_typecheck_validate_typed_trait_info(
+	state: CompilerTypecheckState,
+	label: String,
+	info: CompilerTypedTraitInfo,
+) -> CompilerTypecheckState:
+	var next = state
+
+	for method in info.methods:
+		var index: Int = 0
+
+		for param_type in method.param_types:
+			next = compiler_typecheck_unfinalized_type_error(
+				next,
+				label + " method '" + method.decl.name.text + "' parameter " + index.to_string(),
+				param_type,
+			)
+			index += 1
+
+		next = compiler_typecheck_unfinalized_type_error(
+			next,
+			label + " method '" + method.decl.name.text + "' return type",
+			method.semantic_return_type,
+		)
+
+	next
+
+
 private pure func compiler_typecheck_validate_typed_union_info(
 	state: CompilerTypecheckState,
 	label: String,
@@ -815,6 +927,23 @@ private pure func compiler_typecheck_validate_typed_decl(
 				"function '" + info.decl.name.text + "'",
 				info,
 			)
+		CompilerTypedForeignFunctionDecl(info):
+			var next = state
+			var index: Int = 0
+
+			for param_type in info.param_types:
+				next = compiler_typecheck_unfinalized_type_error(
+					next,
+					"foreign function '" + info.decl.name.text + "' parameter " + index.to_string(),
+					param_type,
+				)
+				index += 1
+
+			compiler_typecheck_unfinalized_type_error(
+				next,
+				"foreign function '" + info.decl.name.text + "' return type",
+				info.semantic_return_type,
+			)
 		CompilerTypedGlobalVarDecl(info):
 			compiler_typecheck_validate_typed_global_info(
 				state,
@@ -831,6 +960,12 @@ private pure func compiler_typecheck_validate_typed_decl(
 			compiler_typecheck_validate_typed_alias_info(
 				state,
 				"type alias '" + info.decl.name.text + "'",
+				info,
+			)
+		CompilerTypedTraitDecl(info):
+			compiler_typecheck_validate_typed_trait_info(
+				state,
+				"trait '" + info.decl.name.text + "'",
 				info,
 			)
 		CompilerTypedUnionDecl(info):
@@ -870,65 +1005,82 @@ private pure func compiler_typecheck_type_contains_resource(
 	state: CompilerTypecheckState,
 	typ: CompilerType,
 ) -> Bool:
-	match typ:
-		CompilerNamedType(name, args):
-			(
-				compiler_typecheck_state_has_known_resource_type_name(
-					compiler_typecheck_state_copy(state),
-					name,
-				)
-				or args.any(func(arg):
-					compiler_typecheck_type_contains_resource(
+	resolved_type = compiler_env_resolve_alias(state.env, typ)
+
+	if not compiler_types_equal(resolved_type, typ):
+		compiler_typecheck_type_contains_resource(state, resolved_type)
+	else:
+		match typ:
+			CompilerNamedType(name, args):
+				(
+					compiler_typecheck_state_has_known_resource_type_name(
 						compiler_typecheck_state_copy(state),
-						arg,
+						name,
+					)
+					or compiler_env_get_type_kind(state.env, name) == Some(CompilerTypeResource)
+					or args.any(
+						func(
+							arg,
+						): compiler_typecheck_type_contains_resource(
+							compiler_typecheck_state_copy(state),
+							arg,
+						),
 					)
 				)
-			)
-		CompilerArrayType(element, dims):
-			(
-				compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
-					element,
-				)
-				or dims.any(func(dim):
+			CompilerArrayType(element, dims):
+				(
 					compiler_typecheck_type_contains_resource(
 						compiler_typecheck_state_copy(state),
-						dim,
+						element,
+					)
+					or dims.any(
+						func(
+							dim,
+						): compiler_typecheck_type_contains_resource(
+							compiler_typecheck_state_copy(state),
+							dim,
+						),
 					)
 				)
-			)
-		CompilerFunctionType(_, params, return_type):
-			params.any(func(param):
-				compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
-					param,
+			CompilerFunctionType(_, params, return_type):
+				(
+					params.any(
+						func(
+							param,
+						): compiler_typecheck_type_contains_resource(
+							compiler_typecheck_state_copy(state),
+							param,
+						),
+					)
+					or compiler_typecheck_type_contains_resource(
+						compiler_typecheck_state_copy(state),
+						return_type,
+					)
 				)
-			) or compiler_typecheck_type_contains_resource(
-				compiler_typecheck_state_copy(state),
-				return_type,
-			)
-		CompilerTupleType(elements):
-			elements.any(func(element):
-				compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
-					element,
+			CompilerTupleType(elements):
+				elements.any(
+					func(
+						element,
+					): compiler_typecheck_type_contains_resource(
+						compiler_typecheck_state_copy(state),
+						element,
+					),
 				)
-			)
-		CompilerRangeType(inner):
-			compiler_typecheck_type_contains_resource(compiler_typecheck_state_copy(state), inner)
-		CompilerDimOpType(_, left, right):
-			(
-				compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
-					left,
+			CompilerRangeType(inner):
+				compiler_typecheck_type_contains_resource(compiler_typecheck_state_copy(state), inner)
+			CompilerDimOpType(_, left, right):
+				(
+					compiler_typecheck_type_contains_resource(
+						compiler_typecheck_state_copy(state),
+						left,
+					)
+					or compiler_typecheck_type_contains_resource(
+						compiler_typecheck_state_copy(state),
+						right,
+					)
 				)
-				or compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
-					right,
-				)
-			)
-		_:
-			False
+			_:
+				False
 
 
 private pure func compiler_field_from_parsed_with_type(
@@ -992,6 +1144,32 @@ private pure func compiler_typed_type_alias_from_parsed(
 		decl = alias_decl,
 		source_target_type = compiler_type_copy(target),
 		semantic_target_type = semantic_target
+	}
+
+
+private pure func compiler_typed_trait_method_from_parsed(
+	state: CompilerTypecheckState,
+	method: ParsedTraitMethodDecl,
+) -> CompilerTypedTraitMethodInfo:
+	registered: CompilerTraitMethodSig = compiler_trait_method_from_parsed(method)
+	{
+		decl = method,
+		param_types = registered.params.map(
+			func(param_type): compiler_canonical_annotation_type(state, param_type),
+		),
+		semantic_return_type = compiler_canonical_annotation_type(state, registered.return_type)
+	}
+
+
+private pure func compiler_typed_trait_from_parsed(
+	state: CompilerTypecheckState,
+	trait_decl: ParsedTraitDecl,
+) -> CompilerTypedTraitInfo:
+	{
+		decl = trait_decl,
+		methods = trait_decl.methods.map(
+			func(method): compiler_typed_trait_method_from_parsed(state, method),
+		)
 	}
 
 
@@ -1345,6 +1523,18 @@ private pure func compiler_function_tail_recursive(
 	annotations: List[ParsedFunctionAnnotation],
 ) -> Bool:
 	annotations.any(compiler_annotation_is_tail_recursive)
+
+
+private pure func compiler_annotation_is_no_copy(annotation: ParsedFunctionAnnotation) -> Bool:
+	match annotation:
+		ParsedNoCopyAnnotation:
+			True
+		_:
+			False
+
+
+private pure func compiler_function_no_copy(annotations: List[ParsedFunctionAnnotation]) -> Bool:
+	annotations.any(compiler_annotation_is_no_copy)
 
 
 private pure func compiler_annotation_has_ordinary_resource_result(
@@ -2003,6 +2193,138 @@ private pure func compiler_register_function_signature(
 	)
 
 
+private pure func compiler_type_param_candidate_name_is_valid(name: String) -> Bool:
+	if name == "#_":
+		True
+	else:
+		base = if name.length() > 1 and name.get_or(0, ' ') == '#':
+			name.substring(1, name.length())
+		else:
+			name
+
+		if base.length() == 0:
+			False
+		else:
+			first = base.get_or(0, ' ')
+			var valid = first >= 'A' and first <= 'Z'
+			var index: Int = 1
+
+			while valid and index < base.length():
+				ch = base.get_or(index, ' ')
+				valid = (
+					(ch >= 'A' and ch <= 'Z')
+					or (ch >= 'a' and ch <= 'z')
+					or (ch >= '0' and ch <= '9')
+				)
+				index += 1
+
+			valid
+
+
+private pure func compiler_type_param_candidates_from_types(
+	types: List[CompilerType],
+) -> List[String]:
+	types.flat_map(compiler_type_param_candidates)
+
+
+private pure func compiler_type_param_candidates(typ: CompilerType) -> List[String]:
+	match typ:
+		CompilerTypeVar(name):
+			[name]
+		CompilerNamedType(name, args):
+			if args.length() == 0 and compiler_type_param_candidate_name_is_valid(name):
+				[name]
+			else:
+				compiler_type_param_candidates_from_types(args)
+		CompilerArrayType(element, dims):
+			compiler_type_param_candidates(element).concat(
+				compiler_type_param_candidates_from_types(dims),
+			)
+		CompilerFunctionType(_, params, return_type):
+			compiler_type_param_candidates_from_types(params).concat(
+				compiler_type_param_candidates(return_type),
+			)
+		CompilerTupleType(elements):
+			compiler_type_param_candidates_from_types(elements)
+		CompilerRangeType(inner):
+			compiler_type_param_candidates(inner)
+		CompilerDimOpType(_, left, right):
+			compiler_type_param_candidates(left).concat(
+				compiler_type_param_candidates(right),
+			)
+		_:
+			[]
+
+
+private pure func compiler_state_has_type_name(
+	state: CompilerTypecheckState,
+	name: String,
+) -> Bool:
+	(
+		compiler_is_global_abi_type_name(name)
+		or state.known_type_names.contains(name)
+		or compiler_env_get_type_decl(state.env, name).is_some()
+		or compiler_env_get_record(state.env, name).is_some()
+		or compiler_env_get_alias(state.env, name).is_some()
+		or compiler_env_get_opaque_alias(state.env, name).is_some()
+	)
+
+
+private pure func compiler_effective_bound_type_params(
+	state: CompilerTypecheckState,
+	declared: List[ParsedTypeParamDecl],
+	func_type: CompilerType,
+) -> List[CompilerBoundTypeParam]:
+	var result = compiler_bound_type_params_from_parsed(declared)
+	var seen = result.map(func(param): param.name)
+
+	for name in compiler_type_param_candidates(func_type):
+		if (
+			name != "#_"
+			and not seen.contains(name)
+			and not compiler_state_has_type_name(state, name)
+		):
+			seen = seen.append(name)
+			result = result.append(compiler_make_bound_type_param(name, []))
+
+	result
+
+
+private pure func compiler_loop_producer_from_expr(
+	expr: ParsedExpr,
+) -> Option[CompilerLoopProducer]:
+	match expr:
+		ParsedBuiltinExpr(Some("std/tensor.indices"), _):
+			Some(CompilerLoopProducerIndices)
+		ParsedBuiltinExpr(Some("std/tensor.enumerate"), _):
+			Some(CompilerLoopProducerEnumerate)
+		ParsedBuiltinExpr(Some("std/tensor.enumerate2"), _):
+			Some(CompilerLoopProducerEnumerate2)
+		ParsedBuiltinExpr(Some("std/tensor.windows"), _):
+			Some(CompilerLoopProducerWindows)
+		ParsedBlockExpr(items, _):
+			if items.length() == 1:
+				match items.get(0):
+					Some(item):
+						compiler_loop_producer_from_expr(item)
+					None:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func compiler_loop_producer_from_body(
+	body: Option[ParsedExpr],
+) -> Option[CompilerLoopProducer]:
+	match body:
+		Some(expr):
+			compiler_loop_producer_from_expr(expr)
+		None:
+			None
+
+
 private pure func compiler_register_function_signature_with_semantic_types(
 	state: CompilerTypecheckState,
 	name: String,
@@ -2044,6 +2366,12 @@ private pure func compiler_register_function_signature_with_semantic_types(
 		annotations,
 		body,
 	)
+	effective_type_params = compiler_effective_bound_type_params(
+		state,
+		type_params,
+		func_type,
+	)
+	loop_producer = compiler_loop_producer_from_body(body)
 
 	match compiler_env_mint_def_id(with_resource_boundary.env):
 		(next_env, def_id):
@@ -2053,14 +2381,14 @@ private pure func compiler_register_function_signature_with_semantic_types(
 				compiler_func_symbol(
 					def_id,
 					func_type,
-					compiler_bound_type_params_from_parsed(type_params),
+					effective_type_params,
 					compiler_param_names_from_parsed(params),
 					compiler_purity_from_parsed(is_pure),
 					origin,
 					resource_arg_policy,
 					module_path,
 					dim_constraints,
-					None,
+					loop_producer,
 					compiler_function_debug_only(annotations),
 				),
 			)
@@ -2526,7 +2854,7 @@ private pure func compiler_impl_method_info_from_semantic_types(
 	compiler_impl_method_info(
 		method.name.text,
 		func_type,
-		compiler_bound_type_params_from_parsed(method.type_params),
+		compiler_effective_bound_type_params(state, method.type_params, func_type),
 		compiler_param_names_from_parsed(method.params),
 		compiler_purity_from_parsed(method.is_pure),
 		compiler_function_resource_arg_policy(state, param_types, method.annotations, method.body),
@@ -3879,10 +4207,18 @@ private pure func compiler_check_function_like_body_result(
 	result: CompilerInferResult,
 ) -> CompilerTypecheckState:
 	found_type = compiler_typed_expr_value_type(result.expr)
+	found_semantic_type = compiler_typed_expr_semantic_type(result.expr)
 
 	match return_type:
 		Some(expected_type):
-			if compiler_return_types_compatible(result.context.state, expected_type, found_type):
+			if (
+				compiler_return_types_compatible(result.context.state, expected_type, found_type)
+				or compiler_return_types_compatible(
+					result.context.state,
+					expected_type,
+					found_semantic_type,
+				)
+			):
 				compiler_typecheck_state_copy(result.context.state)
 			else:
 				compiler_function_return_type_mismatch_error(
@@ -4157,6 +4493,16 @@ private pure func compiler_typed_function_info(
 			compiler_canonical_annotation_type(state, return_type)
 		None:
 			compiler_type_void()
+	param_types = compiler_param_types_from_parsed(
+		function_decl.params,
+	).map(
+		func(param_type): compiler_canonical_annotation_type(state, param_type),
+	)
+	func_type = CompilerFunctionType(
+		function_decl.is_pure,
+		param_types.map(compiler_type_copy),
+		compiler_type_copy(semantic_return_type),
+	)
 
 	{
 		decl = function_decl,
@@ -4164,11 +4510,12 @@ private pure func compiler_typed_function_info(
 			state,
 			compiler_callable_key_from_span(function_decl.name.text, function_decl.span),
 		),
-		param_types = compiler_param_types_from_parsed(
-			function_decl.params,
-		).map(
-			func(param_type): compiler_canonical_annotation_type(state, param_type),
+		effective_type_params = compiler_effective_bound_type_params(
+			state,
+			function_decl.type_params,
+			func_type,
 		),
+		param_types = param_types,
 		source_return_type = compiler_optional_type_copy(source_return_type),
 		semantic_return_type = semantic_return_type,
 		body = body
@@ -5065,6 +5412,125 @@ pure func compiler_typecheck_check_decl_body(
 	compiler_typecheck_materialize_decl_body(state, module_path, decls, decl).state
 
 
+private pure func compiler_typed_foreign_includes(
+	args: List[ParsedForeignBlockArg],
+) -> List[String]:
+	args
+		.filter(func(arg): arg.name.text == "include")
+		.map(func(arg): arg.value)
+
+
+private pure func compiler_typed_foreign_link_flag(
+	arg: ParsedForeignBlockArg,
+) -> List[CompilerTypedForeignLinkFlag]:
+	match arg.name.text:
+		"link":
+			[
+				{
+					platform = None,
+					flag = arg.value
+				},
+			]
+		"link_linux":
+			[
+				{
+					platform = Some(CompilerTypedForeignLinux),
+					flag = arg.value
+				},
+			]
+		"link_macos":
+			[
+				{
+					platform = Some(CompilerTypedForeignMacos),
+					flag = arg.value
+				},
+			]
+		_:
+			[]
+
+
+private pure func compiler_typed_foreign_link_flags(
+	args: List[ParsedForeignBlockArg],
+) -> List[CompilerTypedForeignLinkFlag]:
+	args.flat_map(compiler_typed_foreign_link_flag)
+
+
+private pure func compiler_typed_foreign_function_info(
+	state: CompilerTypecheckState,
+	block_args: List[ParsedForeignBlockArg],
+	block_span: CompilerSourceSpan,
+	decl: ParsedForeignFunctionDecl,
+) -> CompilerTypedForeignFunctionInfo:
+	name: String = decl.name.text
+	param_types: List[CompilerType] = compiler_param_types_from_parsed(
+		decl.params,
+	).map(
+		func(param_type): compiler_canonical_annotation_type(state, param_type),
+	)
+	return_type: CompilerType = compiler_canonical_annotation_type(
+		state,
+		compiler_type_from_parsed_type_expr(decl.return_type),
+	)
+
+	arg_passing: CompilerTypedForeignArgPassing = if (
+		decl.is_pure
+		or compiler_function_no_copy(decl.annotations)
+	):
+		CompilerTypedForeignBorrowArgs
+	else:
+		CompilerTypedForeignDefaultArgs
+
+	{
+		decl = decl,
+		callable_id = compiler_typecheck_state_find_func_callable_id(
+			state,
+			compiler_callable_key_from_span(name, decl.span),
+		),
+		param_types = param_types,
+		semantic_return_type = return_type,
+		c_name = decl.c_name.get_or(name),
+		includes = compiler_typed_foreign_includes(block_args),
+		link_flags = compiler_typed_foreign_link_flags(block_args),
+		arg_passing = arg_passing,
+		block_span = block_span
+	}
+
+
+private pure func compiler_typed_foreign_block(
+	state: CompilerTypecheckState,
+	block_args: List[ParsedForeignBlockArg],
+	functions: List[ParsedForeignFunctionDecl],
+	block_span: CompilerSourceSpan,
+) -> CompilerTypedForeignBlockResult:
+	var next_state: CompilerTypecheckState = state
+	var typed_decls: List[CompilerTypedDecl] = []
+
+	for function_decl in functions:
+		info: CompilerTypedForeignFunctionInfo = compiler_typed_foreign_function_info(
+			state,
+			block_args,
+			block_span,
+			function_decl,
+		)
+
+		for error in compiler_validate_foreign_function(
+			state.env,
+			block_args,
+			function_decl,
+			info.param_types,
+			info.semantic_return_type,
+			compiler_typed_foreign_arg_passing_borrows(info.arg_passing),
+		):
+			next_state = compiler_typecheck_state_add_error(next_state, error)
+
+		typed_decls = typed_decls.append(CompilerTypedForeignFunctionDecl(info))
+
+	{
+		state = next_state,
+		decls = typed_decls
+	}
+
+
 private pure func compiler_typecheck_materialize_decl_body(
 	state: CompilerTypecheckState,
 	module_path: String,
@@ -5111,6 +5577,13 @@ private pure func compiler_typecheck_materialize_decl_body(
 						state,
 						alias_decl,
 					),
+				)
+			}
+		TraitParsedDecl(trait_decl):
+			{
+				state = state,
+				decl = CompilerTypedTraitDecl(
+					compiler_typed_trait_from_parsed(state, trait_decl),
 				)
 			}
 		ImplParsedDecl(impl_decl):
@@ -5160,14 +5633,25 @@ pure func compiler_typecheck_materialize_program_bodies(
 	var typed_decls: List[CompilerTypedDecl] = []
 
 	for decl in program.decls:
-		result = compiler_typecheck_materialize_decl_body(
-			next_state,
-			program.source.module_name,
-			program.decls,
-			decl,
-		)
-		next_state = result.state
-		typed_decls = typed_decls.append(result.decl)
+		match decl:
+			ForeignBlockParsedDecl(block_args, functions, block_span):
+				foreign_result: CompilerTypedForeignBlockResult = compiler_typed_foreign_block(
+					next_state,
+					block_args,
+					functions,
+					block_span,
+				)
+				next_state = foreign_result.state
+				typed_decls = typed_decls.concat(foreign_result.decls)
+			_:
+				result = compiler_typecheck_materialize_decl_body(
+					next_state,
+					program.source.module_name,
+					program.decls,
+					decl,
+				)
+				next_state = result.state
+				typed_decls = typed_decls.append(result.decl)
 
 	compiler_typecheck_validate_typed_program({
 		state = next_state,

@@ -1,10 +1,10 @@
 import:
 	../src/stage_09_core/compiler_core_dce: prune_program
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(UserCall),
+		CoreCallKind(UnknownCall, UserCall),
 		CoreClosureCreate,
-		CoreDecl(FunctionDecl, GlobalDecl, ValueRecordDecl),
-		CoreExpr(CallExpr, ClosureCreateExpr, DetachExpr, LiteralExpr, SetAllocExpr, VoidExpr),
+		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, ValueRecordDecl),
+		CoreExpr(CallExpr, ClosureCreateExpr, DetachExpr, LiteralExpr, SetAllocExpr, VarExpr, VoidExpr),
 		CoreFunctionKind(UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreLiteral(IntLiteral),
@@ -43,6 +43,16 @@ pure func user_call(name: String, def_id: Option[Int]) -> CoreExpr:
 	)
 
 
+pure func dynamic_call() -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
 pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
 	FunctionDecl({
 		name = name,
@@ -58,6 +68,16 @@ pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
 	})
 
 
+pure func trait_decl(name: String) -> CoreDecl:
+	TraitDecl({
+		name = name,
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
 pure func global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
 	GlobalDecl({
 		name = named_var(name, Some(def_id)),
@@ -65,6 +85,20 @@ pure func global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
 		init = init,
 		is_mutable = False,
 		is_const = True,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func private_global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name, Some(def_id)),
+		typ = int_type(),
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = True,
 		def_id = def_id,
 		loc = SyntheticSourceLoc,
 	})
@@ -118,6 +152,19 @@ pure func value_record_names(program_value: CoreProgram) -> List[String]:
 	names
 
 
+pure func global_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				names = names.append(global.name.name)
+			_:
+				void
+
+	names
+
+
 func test_prunes_unreachable_functions() -> Bool:
 	input_program = program([
 		function_decl(
@@ -145,6 +192,34 @@ func test_global_initializers_root_functions() -> Bool:
 	])
 
 	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_prunes_unreferenced_private_global_and_initializer_helpers() -> Bool:
+	input_program = program([
+		private_global_decl(
+			"scratch",
+			10,
+			user_call("build_scratch", Some(2)),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("build_scratch", 2, int_literal(2)),
+	])
+	pruned = prune_program(input_program)
+
+	global_names(pruned).length() == 0 and function_names(pruned) == ["main"]
+
+
+func test_retains_private_global_referenced_by_runtime_function() -> Bool:
+	input_program = program([
+		private_global_decl("scratch", 10, int_literal(42)),
+		function_decl(
+			"main",
+			1,
+			VarExpr(named_var("scratch", Some(10)), int_type(), SyntheticSourceLoc),
+		),
+	])
+
+	global_names(prune_program(input_program)) == ["scratch"]
 
 
 func test_closure_creation_roots_adapter() -> Bool:
@@ -224,6 +299,15 @@ func test_unresolved_user_calls_fail_closed() -> Bool:
 	function_names(prune_program(input_program)) == ["main", "helper", "dead"]
 
 
+func test_dynamic_closure_calls_do_not_root_unrelated_functions() -> Bool:
+	input_program = program([
+		function_decl("main", 1, dynamic_call()),
+		function_decl("dead", 2, int_literal(2)),
+	])
+
+	function_names(prune_program(input_program)) == ["main"]
+
+
 func test_missing_main_fails_closed() -> Bool:
 	input_program = program([
 		function_decl("helper", 2, int_literal(2)),
@@ -233,14 +317,14 @@ func test_missing_main_fails_closed() -> Bool:
 	function_names(prune_program(input_program)) == ["helper", "dead"]
 
 
-func test_duplicate_function_ids_fail_closed() -> Bool:
+func test_duplicate_function_ids_are_kept_conservatively() -> Bool:
 	input_program = program([
 		function_decl("main", 1, int_literal(0)),
 		function_decl("duplicate", 1, int_literal(1)),
 		function_decl("dead", 3, int_literal(3)),
 	])
 
-	function_names(prune_program(input_program)) == ["main", "duplicate", "dead"]
+	function_names(prune_program(input_program)) == ["main", "duplicate"]
 
 
 func test_prunes_types_and_retains_field_dependencies() -> Bool:
@@ -258,20 +342,49 @@ func test_prunes_types_and_retains_field_dependencies() -> Bool:
 	value_record_names(prune_program(input_program)) == ["Outer", "Inner"]
 
 
+func test_retains_trait_signatures() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		trait_decl("Display"),
+	])
+
+	match prune_program(input_program).decls:
+		[FunctionDecl(_), TraitDecl(trait_info)]:
+			trait_info.name == "Display"
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler Core DCE",
 	tests = [
 		("prunes unreachable functions", test_prunes_unreachable_functions),
 		("global initializers root functions", test_global_initializers_root_functions),
+		(
+			"prunes unreferenced private global and initializer helpers",
+			test_prunes_unreferenced_private_global_and_initializer_helpers,
+		),
+		(
+			"retains private global referenced by runtime function",
+			test_retains_private_global_referenced_by_runtime_function,
+		),
 		("closure creation roots adapter", test_closure_creation_roots_adapter),
 		("custom hash callbacks are roots", test_custom_hash_callbacks_are_roots),
 		("detached task closures are roots", test_detached_task_closures_are_roots),
 		("unresolved user calls fail closed", test_unresolved_user_calls_fail_closed),
+		(
+			"dynamic closure calls do not root unrelated functions",
+			test_dynamic_closure_calls_do_not_root_unrelated_functions,
+		),
 		("missing main fails closed", test_missing_main_fails_closed),
-		("duplicate function ids fail closed", test_duplicate_function_ids_fail_closed),
+		(
+			"duplicate function ids are kept conservatively",
+			test_duplicate_function_ids_are_kept_conservatively,
+		),
 		(
 			"prunes types and retains field dependencies",
 			test_prunes_types_and_retains_field_dependencies,
 		),
+		("retains trait signatures", test_retains_trait_signatures),
 	]
 }

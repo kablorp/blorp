@@ -1,6 +1,6 @@
 # Late-Core Ownership Stabilization Roadmap
 
-Status: completed. Boundary facts refreshed on 2026-07-11 after DCE moved to
+Status: completed. Boundary facts refreshed on 2026-07-12 after DCE moved to
 Blorp; this remains the historical ownership-hardening plan.
 
 This roadmap replaces the earlier compiler-wide cloning plan. That plan mixed
@@ -179,7 +179,7 @@ releases produced this matrix on macOS arm64:
 | `dev-9f56c40d2b91` | `compiler_bridge_cli.brp` | Compiles in 5.98s with a 519 MB peak |
 | `dev-9f56c40d2b91` | `compiler_cli_main.brp` | Fails: missing `blorp_process_run_inherit` ownership contract |
 | `dev-9f56c40d2b91` | `test_compiler_core_lower.brp` | Fails: predates current typed match-expression behavior |
-| pinned `dev-33e00c2b94df` | `compiler_cli_main.brp` | Fails on the same missing process ownership contract |
+| later bootstrap candidate | `compiler_cli_main.brp` | Fails on the same missing process ownership contract |
 | `dev-fb008fe4ffb2` | `compiler_cli_main.brp` | Has the contract but grows to 6.85 GB; stopped before OOM |
 
 Setting `BLORP_COMPILER_BRIDGE_BIN` to the old binary does not bypass current
@@ -187,10 +187,9 @@ compiler behavior during `make install`: it uses the old binary to build fresh
 current-source bridge helpers. The typecheck helper then processes the full CLI
 source graph and still exhibits the multi-gigabyte path.
 
-Conclusion: do not repin to `dev-9f56c40d2b91`. It is useful only for narrow
-source files that avoid newer syntax and contracts. Use the supported pinned
-bootstrap path for correctness rather than hiding build problems behind an
-incompatible binary.
+Conclusion: keep `dev-9f56c40d2b91` as the explicit narrow bridge bootstrap.
+It is not a general-purpose compiler for current sources: use it only for the
+bridge entrypoints maintained within its syntax and contract envelope.
 
 ### Current verification status
 
@@ -216,7 +215,7 @@ The broader compiler-deep, runtime, and standard leak gates still must pass
 before the combined branch is described as merge-ready. Current results are:
 
 - fast compiler: 1,485/1,485 pass;
-- compiler-deep: 94 pass and 98 fail on existing frontend-parity gaps;
+- compiler-deep: 1,879/1,879 pass on 2026-07-12;
 - runtime: 4,107 pass with one direct failure plus combined-harness failures;
 - leak: 28 pass and four fail.
 
@@ -767,12 +766,20 @@ Resolved on 2026-07-11:
   it. Fresh normal and ASan runs pass `test_compiler_core_perceus` (132/132),
   including the mutable loop-then-forward regression.
 
+Resolved on 2026-07-12:
+
+- `compiler_ctfe_pattern` exposed a Perceus traversal gap rather than a
+  CTFE-specific ownership rule. A value introduced by `Result ?=` is a
+  borrowed stack-result match binding; consuming it from a Core `for` body did
+  not retain it because borrowed-parameter call protection handled `while` but
+  skipped every `for` variant. Binder-aware traversal now covers all Core
+  `for` families, with regressions for borrowed and backend-managed owned match
+  bindings. The original four-suite CTFE batch passes 59/59 under ASan, and the
+  complete compiler-deep gate passes 1,879/1,879.
+
 Remaining:
 
-1. `compiler_ctfe_pattern`
-   - binding a selected match-case payload into CTFE context;
-   - observed from `test_compiler_ctfe_eval`.
-2. `compiler_typecheck_state`
+1. `compiler_typecheck_state`
    - selective import bindings and constructor metadata;
    - observed from `test_compiler_typecheck_decl`.
 
