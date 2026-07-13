@@ -151,6 +151,7 @@ let deep_suites =
   @ suite_group "TestRunner" Test_test_runner.suite
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite
   @ suite_group "CompilerBlorpBridge" Test_compiler_blorp_bridge.suite
+  @ suite_group "SemanticMiddleWorker" Test_semantic_middle_worker.suite
 
 let suites_for_scope = function
   | Default -> default_suites

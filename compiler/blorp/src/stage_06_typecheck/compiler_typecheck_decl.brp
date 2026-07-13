@@ -296,12 +296,25 @@ private pure func compiler_canonical_annotation_type(
 	state: CompilerTypecheckState,
 	typ: CompilerType,
 ) -> CompilerType:
+	qualified = compiler_resolve_qualified_type_names(state.module_aliases, typ)
 	imported = compiler_resolve_imported_type_aliases_from_bindings(
 		state.imported_names,
 		state.type_homes,
-		typ,
+		qualified,
 	)
 	compiler_env_resolve_alias(state.env, imported)
+
+
+private pure func compiler_canonical_return_type(
+	state: CompilerTypecheckState,
+	return_type: Option[ParsedTypeExpr],
+) -> Option[CompilerType]:
+	return_type.map(
+		func(type_expr): compiler_canonical_annotation_type(
+			state,
+			compiler_type_from_parsed_type_expr(type_expr),
+		),
+	)
 
 
 private pure func compiler_canonical_imported_type_name(
@@ -1068,7 +1081,10 @@ private pure func compiler_typecheck_type_contains_resource(
 					),
 				)
 			CompilerRangeType(inner):
-				compiler_typecheck_type_contains_resource(compiler_typecheck_state_copy(state), inner)
+				compiler_typecheck_type_contains_resource(
+					compiler_typecheck_state_copy(state),
+					inner,
+				)
 			CompilerDimOpType(_, left, right):
 				(
 					compiler_typecheck_type_contains_resource(
@@ -1136,14 +1152,11 @@ private pure func compiler_typed_type_alias_from_parsed(
 	state: CompilerTypecheckState,
 	alias_decl: ParsedTypeAliasDecl,
 ) -> CompilerTypedTypeAliasInfo:
-	target = compiler_canonical_annotation_type(
-		state,
-		compiler_type_from_parsed_type_expr(alias_decl.target),
-	)
-	semantic_target = compiler_canonical_annotation_type(state, target)
+	source_target = compiler_type_from_parsed_type_expr(alias_decl.target)
+	semantic_target = compiler_canonical_annotation_type(state, source_target)
 	{
 		decl = alias_decl,
-		source_target_type = compiler_type_copy(target),
+		source_target_type = compiler_type_copy(source_target),
 		semantic_target_type = semantic_target
 	}
 
@@ -1964,6 +1977,7 @@ private pure func compiler_register_builtin_type_decl(
 		False,
 	)
 	with_env = compiler_typecheck_state_with_env(next, env)
+
 	with_cleanup = match type_decl.cleanup:
 		Some(cleanup):
 			{ with_env |
@@ -1976,12 +1990,7 @@ private pure func compiler_register_builtin_type_decl(
 		None:
 			with_env
 
-	compiler_typecheck_state_record_type_home(
-		with_cleanup,
-		type_decl.name.text,
-		module_path,
-		False,
-	)
+	compiler_typecheck_state_record_type_home(with_cleanup, type_decl.name.text, module_path, False)
 
 
 private pure func compiler_register_record_decl(
@@ -2230,10 +2239,11 @@ private pure func compiler_type_param_candidate_name_is_valid(name: String) -> B
 			while valid and index < base.length():
 				ch = base.get_or(index, ' ')
 				valid = (
-					(ch >= 'A' and ch <= 'Z')
-					or (ch >= 'a' and ch <= 'z')
-					or (ch >= '0' and ch <= '9')
+					ch >= 'A' and ch <= 'Z'
+					or ch >= 'a' and ch <= 'z'
+					or ch >= '0' and ch <= '9'
 				)
+
 				index += 1
 
 			valid
@@ -2255,29 +2265,24 @@ private pure func compiler_type_param_candidates(typ: CompilerType) -> List[Stri
 			else:
 				compiler_type_param_candidates_from_types(args)
 		CompilerArrayType(element, dims):
-			compiler_type_param_candidates(element).concat(
-				compiler_type_param_candidates_from_types(dims),
-			)
+			compiler_type_param_candidates(
+				element,
+			).concat(compiler_type_param_candidates_from_types(dims))
 		CompilerFunctionType(_, params, return_type):
-			compiler_type_param_candidates_from_types(params).concat(
-				compiler_type_param_candidates(return_type),
-			)
+			compiler_type_param_candidates_from_types(
+				params,
+			).concat(compiler_type_param_candidates(return_type))
 		CompilerTupleType(elements):
 			compiler_type_param_candidates_from_types(elements)
 		CompilerRangeType(inner):
 			compiler_type_param_candidates(inner)
 		CompilerDimOpType(_, left, right):
-			compiler_type_param_candidates(left).concat(
-				compiler_type_param_candidates(right),
-			)
+			compiler_type_param_candidates(left).concat(compiler_type_param_candidates(right))
 		_:
 			[]
 
 
-private pure func compiler_state_has_type_name(
-	state: CompilerTypecheckState,
-	name: String,
-) -> Bool:
+private pure func compiler_state_has_type_name(state: CompilerTypecheckState, name: String) -> Bool:
 	(
 		compiler_is_global_abi_type_name(name)
 		or state.known_type_names.contains(name)
@@ -2384,11 +2389,7 @@ private pure func compiler_register_function_signature_with_semantic_types(
 		annotations,
 		body,
 	)
-	effective_type_params = compiler_effective_bound_type_params(
-		state,
-		type_params,
-		func_type,
-	)
+	effective_type_params = compiler_effective_bound_type_params(state, type_params, func_type)
 	loop_producer = compiler_loop_producer_from_body(body)
 
 	match compiler_env_mint_def_id(with_resource_boundary.env):
@@ -3236,6 +3237,7 @@ private pure func compiler_typecheck_register_imported_builtin_type_decl(
 		state
 
 	with_env = compiler_typecheck_state_with_env(with_resource, env)
+
 	with_cleanup = match type_decl.cleanup:
 		Some(cleanup):
 			{ with_env |
@@ -3247,6 +3249,7 @@ private pure func compiler_typecheck_register_imported_builtin_type_decl(
 			}
 		None:
 			with_env
+
 	with_home = compiler_typecheck_state_record_type_home(
 		with_cleanup,
 		canonical_name,
@@ -4173,7 +4176,7 @@ private pure func compiler_body_check_context(
 ) -> CompilerInferContext:
 	compiler_body_check_context_with_expected_type(
 		state,
-		return_type.map(compiler_type_from_parsed_type_expr),
+		compiler_canonical_return_type(state, return_type),
 	)
 
 
@@ -4225,7 +4228,7 @@ private pure func compiler_check_function_body_result(
 ) -> CompilerTypecheckState:
 	compiler_check_function_like_body_result(
 		function_decl.name.text,
-		function_decl.return_type.map(compiler_type_from_parsed_type_expr),
+		compiler_canonical_return_type(result.context.state, function_decl.return_type),
 		result,
 	)
 
@@ -4517,11 +4520,15 @@ private pure func compiler_typed_function_info(
 		compiler_type_from_parsed_type_expr,
 	)
 
-	semantic_return_type: CompilerType = match source_return_type:
+	semantic_return_type: CompilerType = match compiler_canonical_return_type(
+		state,
+		function_decl.return_type,
+	):
 		Some(return_type):
-			compiler_canonical_annotation_type(state, return_type)
+			return_type
 		None:
 			compiler_type_void()
+
 	param_types = compiler_param_types_from_parsed(
 		function_decl.params,
 	).map(
@@ -4706,7 +4713,7 @@ private pure func compiler_typecheck_materialize_function_body_with_options(
 					result,
 				)
 				typed_body = compiler_materialize_declared_return_body(
-					function_decl.return_type.map(compiler_type_from_parsed_type_expr),
+					compiler_canonical_return_type(signature_state, function_decl.return_type),
 					result.expr,
 				)
 				final_state = compiler_typecheck_with_body_env(signature_state, tail_checked_state)
@@ -5289,14 +5296,15 @@ private pure func compiler_trait_visible_for_impl(
 				Some(_):
 					True
 				None:
-					if compiler_typecheck_state_is_stdlib(state):
-						match compiler_env_get_trait(state.env, trait_name):
-							Some(trait_def):
-								trait_def.module_path == Some("std/traits")
-							None:
-								False
-					else:
-						False
+					match compiler_env_get_trait(state.env, trait_name):
+						Some(trait_def):
+							match trait_def.module_path:
+								Some(module_path):
+									module_path == "std/traits"
+								None:
+									True
+						None:
+							False
 
 
 private pure func compiler_trait_declared_in_current_program(
@@ -5611,9 +5619,7 @@ private pure func compiler_typecheck_materialize_decl_body(
 		TraitParsedDecl(trait_decl):
 			{
 				state = state,
-				decl = CompilerTypedTraitDecl(
-					compiler_typed_trait_from_parsed(state, trait_decl),
-				)
+				decl = CompilerTypedTraitDecl(compiler_typed_trait_from_parsed(state, trait_decl))
 			}
 		ImplParsedDecl(impl_decl):
 			result = compiler_typecheck_materialize_impl_body(state, decls, impl_decl)

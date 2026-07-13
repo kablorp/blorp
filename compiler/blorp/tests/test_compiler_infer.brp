@@ -1745,6 +1745,60 @@ func test_int_literal_expected_argument_slot_preserves_semantic_type() -> Bool:
 	)
 
 
+func test_literal_string_argument_widens_to_string_value_slot() -> Bool:
+	literal_string_type = CompilerNamedType("LiteralString", [])
+	with_sql = add_infer_value(compiler_typecheck_state_empty(), "sql", literal_string_type)
+	state = { with_sql | env = compiler_env_add_func(
+			with_sql.env,
+			"execute",
+			CompilerFunctionType(True, [compiler_type_string()], compiler_type_void()),
+			CompilerPure,
+			CompilerUserDefinedFunc,
+		) }
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("execute")), [ParsedNameExpr(ident("sql"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and match compiler_typed_expr_call_arg_widening(result.expr, 0):
+			CompilerTypeWiden(from_type, to_type, reason):
+				(
+					compiler_types_equal(from_type, literal_string_type)
+					and compiler_types_equal(to_type, compiler_type_string())
+					and compiler_widening_reasons_equal(reason, CompilerArgumentSlot)
+				)
+			CompilerTypeKeep(_):
+				False
+	)
+
+
+func test_literal_string_parameter_accepts_direct_literal() -> Bool:
+	literal_string_type = CompilerNamedType("LiteralString", [])
+	state = compiler_typecheck_state_empty()
+	with_execute = { state | env = compiler_env_add_func(
+			state.env,
+			"execute",
+			CompilerFunctionType(True, [literal_string_type], compiler_type_void()),
+			CompilerPure,
+			CompilerUserDefinedFunc,
+		) }
+	result = compiler_infer_expr(
+		compiler_infer_context(with_execute),
+		call_expr(ParsedNameExpr(ident("execute")), [string_expr("SELECT 1")]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and match compiler_typed_expr_call_arg_widening(result.expr, 0):
+			CompilerTypeKeep(arg_type):
+				compiler_types_equal(arg_type, literal_string_type)
+			CompilerTypeWiden(_, _, _):
+				False
+	)
+
+
 func test_identifier_lookup_preserves_source_type() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_int_binding("value")),
@@ -6326,6 +6380,58 @@ func test_tensor_length_ufcs_refines_first_dimension() -> Bool:
 	)
 
 
+func test_tensor_length_ufcs_preserves_expected_argument_slot() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_with_expected_value_slot(
+			compiler_infer_context(state_with_builtin_matrix_binding()),
+			compiler_type_int(),
+			CompilerExpectedArgumentSlot,
+		),
+		ParsedCallExpr(
+			field_access_expr(ParsedNameExpr(ident("matrix")), "length"),
+			[],
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerConstIntType(2),
+		)
+		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_int())
+		and match compiler_typed_expr_widening(result.expr):
+			CompilerTypeWiden(from_type, to_type, reason):
+				(
+					compiler_types_equal(from_type, CompilerConstIntType(2))
+					and compiler_types_equal(to_type, compiler_type_int())
+					and compiler_widening_reasons_equal(reason, CompilerArgumentSlot)
+				)
+			CompilerTypeKeep(_):
+				False
+	)
+
+
+func test_tensor_length_ufcs_preserves_dimension_expression() -> Bool:
+	state = state_with_flattened_symbolic_subscript_values()
+	with_builtins = { state | env = compiler_env_with_builtins(state.env) }
+	result = compiler_infer_expr(
+		compiler_infer_context(with_builtins),
+		ParsedCallExpr(
+			field_access_expr(ParsedNameExpr(ident("values")), "length"),
+			[],
+			source_span(),
+		),
+	)
+	expected = CompilerDimOpType(CompilerDimMultiply, CompilerTypeVar("#M"), CompilerTypeVar("#N"))
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
+	)
+
+
 pure func state_with_symbolic_range_subscript_values() -> CompilerTypecheckState:
 	state = add_infer_value(
 		compiler_typecheck_state_empty(),
@@ -7078,6 +7184,27 @@ func test_match_or_pattern_combines_bool_coverage() -> Bool:
 	)
 
 
+func test_match_or_pattern_nullary_constructors_bind_nothing() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_enum_values()),
+		ParsedMatchExpr(
+			ParsedNameExpr(ident("left_color")),
+			[
+				match_case(
+					ParsedOrPattern(
+						[ParsedNamePattern(ident("Red")), ParsedNamePattern(ident("Blue"))],
+						source_span(),
+					),
+					int_expr("1"),
+				),
+			],
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0
+
+
 func test_match_constructor_patterns_bind_fields() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_option_int_value()),
@@ -7485,6 +7612,33 @@ func test_for_range_binder_is_scoped_to_body() -> Bool:
 	)
 
 
+func test_for_range_dimension_expression_binder_is_refined() -> Bool:
+	state = state_with_flattened_symbolic_subscript_values()
+	with_builtins = { state | env = compiler_env_with_builtins(state.env) }
+	result = compiler_infer_expr(
+		compiler_infer_context(with_builtins),
+		for_name_expr(
+			"i",
+			range_expr(
+				int_expr("0"),
+				call_expr(
+					field_access_expr(ParsedNameExpr(ident("values")), "length"),
+					[],
+				),
+			),
+			subscript_expr(ParsedNameExpr(ident("values")), [ParsedNameExpr(ident("i"))]),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_void(),
+		)
+	)
+
+
 func test_for_list_binder_allows_loop_control() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -7846,6 +8000,14 @@ tests: TestSuite = {
 		(
 			"int literal expected argument slot preserves semantic type",
 			test_int_literal_expected_argument_slot_preserves_semantic_type,
+		),
+		(
+			"LiteralString argument widens to String value slot",
+			test_literal_string_argument_widens_to_string_value_slot,
+		),
+		(
+			"LiteralString parameter accepts direct literal",
+			test_literal_string_parameter_accepts_direct_literal,
 		),
 		("identifier lookup preserves source type", test_identifier_lookup_preserves_source_type),
 		("unknown identifier records error", test_unknown_identifier_records_error),
@@ -8348,6 +8510,14 @@ tests: TestSuite = {
 			test_tensor_length_ufcs_refines_first_dimension,
 		),
 		(
+			"tensor length UFCS preserves expected argument slot",
+			test_tensor_length_ufcs_preserves_expected_argument_slot,
+		),
+		(
+			"tensor length UFCS preserves dimension expression",
+			test_tensor_length_ufcs_preserves_dimension_expression,
+		),
+		(
 			"symbolic range subscript requires matching dimension",
 			test_symbolic_range_subscript_requires_matching_dimension,
 		),
@@ -8405,6 +8575,10 @@ tests: TestSuite = {
 			test_match_list_pattern_binds_elements_and_spread,
 		),
 		("match or pattern combines bool coverage", test_match_or_pattern_combines_bool_coverage),
+		(
+			"match or pattern nullary constructors bind nothing",
+			test_match_or_pattern_nullary_constructors_bind_nothing,
+		),
 		("match constructor patterns bind fields", test_match_constructor_patterns_bind_fields),
 		(
 			"match qualified constructor pattern uses type home",
@@ -8429,6 +8603,10 @@ tests: TestSuite = {
 		("while break and continue loop context", test_while_break_and_continue_loop_context),
 		("while condition must be bool", test_while_condition_must_be_bool),
 		("for range binder is scoped to body", test_for_range_binder_is_scoped_to_body),
+		(
+			"for range dimension expression binder is refined",
+			test_for_range_dimension_expression_binder_is_refined,
+		),
 		("for list binder allows loop control", test_for_list_binder_allows_loop_control),
 		("for dict name binder iterates keys", test_for_dict_name_binder_iterates_keys),
 		("for channel name binder iterates values", test_for_channel_name_binder_iterates_values),

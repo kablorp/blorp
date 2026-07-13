@@ -2438,6 +2438,11 @@ Deletion point:
 Goal: keep the compiler semantics in Blorp while isolating the remaining
 impure shell responsibilities.
 
+The comprehensive implementation and deletion sequence for this checkpoint is
+in `BLORP_OCAML_HOST_EXIT_ROADMAP.md`. It is also authoritative for replacing
+the serialized CLI/module-graph plan with one phase-specific semantic-middle
+worker. The summary below remains as an index of the affected compiler areas.
+
 OCaml references:
 
 - `compiler/bin/blorp_ocaml_host.ml`

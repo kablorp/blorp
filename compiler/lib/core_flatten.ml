@@ -683,29 +683,41 @@ let register_types (reg : Codegen_types.registry) (prog : Core.core_program) :
   List.iter seed prog;
   List.iter refine prog
 
+let import_table_of_bindings (bindings : Session.import_binding list) =
+  let table = Hashtbl.create 16 in
+  List.iter
+    (fun (binding : Session.import_binding) ->
+      let original_name = Option.value binding.original_name ~default:"" in
+      Hashtbl.replace table binding.local_name
+        (binding.module_path, original_name))
+    bindings;
+  table
+
+let build_import_tables_from_bindings
+    ~(main_import_bindings : Session.import_binding list)
+    (module_bindings : (string * Session.import_binding list) list) :
+    (string, string * string) Hashtbl.t
+    * (string, (string, string * string) Hashtbl.t) Hashtbl.t =
+  let module_imports = Hashtbl.create 32 in
+  List.iter
+    (fun (module_name, bindings) ->
+      let table = import_table_of_bindings bindings in
+      if Hashtbl.length table > 0 then
+        Hashtbl.replace module_imports module_name table)
+    module_bindings;
+  (import_table_of_bindings main_import_bindings, module_imports)
+
 let build_import_tables_from_typecheck
     ~(main_import_bindings : Session.import_binding list)
     (modules : Modules.loaded_module list) :
     (string, string * string) Hashtbl.t
     * (string, (string, string * string) Hashtbl.t) Hashtbl.t =
-  let table_of_bindings (bindings : Session.import_binding list) =
-    let tbl = Hashtbl.create 16 in
-    List.iter
-      (fun (binding : Session.import_binding) ->
-        let original_name = Option.value binding.original_name ~default:"" in
-        Hashtbl.replace tbl binding.local_name
-          (binding.module_path, original_name))
-      bindings;
-    tbl
+  let module_bindings =
+    List.filter_map
+      (fun (loaded : Modules.loaded_module) ->
+        Option.map
+          (fun bindings -> (loaded.name, bindings))
+          loaded.typed_import_bindings)
+      modules
   in
-  let module_imports = Hashtbl.create 32 in
-  List.iter
-    (fun (m : Modules.loaded_module) ->
-      match m.Modules.typed_import_bindings with
-      | Some bindings ->
-          let tbl = table_of_bindings bindings in
-          if Hashtbl.length tbl > 0 then
-            Hashtbl.replace module_imports m.name tbl
-      | None -> ())
-    modules;
-  (table_of_bindings main_import_bindings, module_imports)
+  build_import_tables_from_bindings ~main_import_bindings module_bindings

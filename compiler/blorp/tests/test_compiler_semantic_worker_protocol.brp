@@ -1,0 +1,303 @@
+import:
+	../src/stage_08_core_lower/compiler_semantic_worker_protocol:
+		SEMANTIC_MIDDLE_DOMAIN,
+		SEMANTIC_MIDDLE_SCHEMA_VERSION,
+		SemanticMiddleDiagnostic,
+		SemanticMiddleImportBinding,
+		SemanticMiddleObservation,
+		SemanticMiddleRequest,
+		SemanticMiddleResponse(
+			SemanticMiddleCompiled,
+			SemanticMiddleFailed,
+			SemanticMiddleStopped,
+		),
+		SemanticMiddleStage(
+			DebugMiddleStage,
+			DesugarMiddleStage,
+			FusionMiddleStage,
+			LowerMiddleStage,
+			MatchMiddleStage,
+			MonoMiddleStage,
+			ResolveMiddleStage,
+			SpecializeMiddleStage,
+			StdInlineMiddleStage,
+			SynthMiddleStage,
+			TailrecMiddleStage,
+			TraitResolveMiddleStage,
+		),
+		SemanticMiddleTypedUnit,
+		decode_semantic_middle_response_value,
+		parse_semantic_middle_stage,
+		semantic_middle_request_to_json,
+		semantic_middle_stage_name,
+	json:
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_array,
+		as_bool,
+		as_number,
+		as_string,
+		get_field,
+	test: TestSuite
+
+
+pure func sample_typed_program(name: String) -> JsonValue:
+	JsonObject([
+		("kind", JsonString("typed_program")),
+		("source", JsonObject([("name", JsonString(name))])),
+		("decls", JsonVector([])),
+		("diagnostics", JsonVector([])),
+	])
+
+
+pure func sample_import_binding() -> SemanticMiddleImportBinding:
+	{
+		local_name = "Value",
+		module_path = "pkg/value",
+		original_name = Some("SourceValue"),
+	}
+
+
+pure func sample_unit(path: String, module_name: String) -> SemanticMiddleTypedUnit:
+	{
+		path = path,
+		module_name = module_name,
+		typed_program = sample_typed_program(module_name),
+		import_bindings = [sample_import_binding()],
+	}
+
+
+pure func sample_request() -> SemanticMiddleRequest:
+	{
+		target = sample_unit("src/main.brp", "main"),
+		modules = [sample_unit("src/value.brp", "pkg/value")],
+		debug = True,
+		require_main = True,
+		check_invariants = True,
+		observations = [LowerMiddleStage, SpecializeMiddleStage],
+		stop_after = Some(MonoMiddleStage),
+	}
+
+
+pure func field_string_is(value: JsonValue, name: String, expected: String) -> Bool:
+	match get_field(value, name):
+		Some(field):
+			match as_string(field):
+				Some(text):
+					text == expected
+				None:
+					False
+		None:
+			False
+
+
+pure func field_bool_is(value: JsonValue, name: String, expected: Bool) -> Bool:
+	match get_field(value, name):
+		Some(field):
+			match as_bool(field):
+				Some(flag):
+					flag == expected
+				None:
+					False
+		None:
+			False
+
+
+pure func field_number_is(value: JsonValue, name: String, expected: Int) -> Bool:
+	match get_field(value, name):
+		Some(field):
+			match as_number(field):
+				Some(number):
+					to_int(number) == expected
+				None:
+					False
+		None:
+			False
+
+
+pure func field_array_length_is(value: JsonValue, name: String, expected: Int) -> Bool:
+	match get_field(value, name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					items.length() == expected
+				None:
+					False
+		None:
+			False
+
+
+pure func test_stage_names_round_trip() -> Bool:
+	stages = [
+		LowerMiddleStage,
+		DebugMiddleStage,
+		DesugarMiddleStage,
+		MonoMiddleStage,
+		SynthMiddleStage,
+		MatchMiddleStage,
+		TraitResolveMiddleStage,
+		ResolveMiddleStage,
+		StdInlineMiddleStage,
+		TailrecMiddleStage,
+		FusionMiddleStage,
+		SpecializeMiddleStage,
+	]
+
+	stages.all(
+		func(stage): parse_semantic_middle_stage(semantic_middle_stage_name(stage)) == Some(stage),
+	)
+
+
+pure func test_request_json_is_phase_specific() -> Bool:
+	value = semantic_middle_request_to_json(sample_request())
+
+	(
+		field_number_is(value, "schema", SEMANTIC_MIDDLE_SCHEMA_VERSION)
+		and field_string_is(value, "domain", SEMANTIC_MIDDLE_DOMAIN)
+		and field_string_is(value, "kind", "compile_pre_dce")
+		and field_string_is(value, "typed_phase", "post_ctfe")
+		and field_bool_is(value, "debug", True)
+		and field_bool_is(value, "require_main", True)
+		and field_bool_is(value, "check_invariants", True)
+		and field_array_length_is(value, "modules", 1)
+		and field_array_length_is(value, "observations", 2)
+		and field_string_is(value, "stop_after", "mono")
+		and get_field(value, "args").is_none()
+		and get_field(value, "source_text").is_none()
+	)
+
+
+pure func compiled_response_value() -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("compiled")),
+		("core", JsonObject([("decls", JsonVector([]))])),
+		("observations", JsonVector([
+			JsonObject([
+				("stage", JsonString("lower")),
+				("rendered", JsonString("func main")),
+			]),
+		])),
+	])
+
+
+pure func test_decode_compiled_response() -> Bool:
+	match decode_semantic_middle_response_value(compiled_response_value()):
+		Ok(SemanticMiddleCompiled(core, observations)):
+			match observations.get(0):
+				Some(observation):
+					(
+						get_field(core, "decls").is_some()
+						and observation.stage == LowerMiddleStage
+						and observation.rendered == "func main"
+					)
+				None:
+					False
+		Ok(_):
+			False
+		Err(_):
+			False
+
+
+pure func test_decode_stopped_response() -> Bool:
+	value = JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("stopped")),
+		("stage", JsonString("match")),
+		("rendered", JsonString("match snapshot")),
+		("observations", JsonVector([])),
+	])
+
+	match decode_semantic_middle_response_value(value):
+		Ok(SemanticMiddleStopped(stage, rendered, observations)):
+			(
+				stage == MatchMiddleStage
+				and rendered == "match snapshot"
+				and observations.length() == 0
+			)
+		Ok(_):
+			False
+		Err(_):
+			False
+
+
+pure func test_decode_failed_response() -> Bool:
+	value = JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("failed")),
+		("diagnostics", JsonVector([
+			JsonObject([
+				("code", JsonString("core_lower")),
+				("message", JsonString("unsupported typed expression")),
+				("path", JsonString("src/main.brp")),
+				("line", JsonNumber(3.0)),
+				("column", JsonNumber(5.0)),
+				("help", JsonNull),
+			]),
+		])),
+	])
+
+	match decode_semantic_middle_response_value(value):
+		Ok(SemanticMiddleFailed(diagnostics)):
+			match diagnostics.get(0):
+				Some(diagnostic):
+					(
+						diagnostic.code == "core_lower"
+						and diagnostic.message == "unsupported typed expression"
+						and diagnostic.path == Some("src/main.brp")
+						and diagnostic.line == 3
+						and diagnostic.column == 5
+						and diagnostic.help.is_none()
+					)
+				None:
+					False
+		Ok(_):
+			False
+		Err(_):
+			False
+
+
+pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
+	wrong_schema = JsonObject([
+		("schema", JsonNumber(99.0)),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("compiled")),
+		("core", JsonObject([])),
+		("observations", JsonVector([])),
+	])
+	wrong_domain = JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString("compiler_cli")),
+		("kind", JsonString("compiled")),
+		("core", JsonObject([])),
+		("observations", JsonVector([])),
+	])
+	wrong_stage = JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("stopped")),
+		("stage", JsonString("dce")),
+		("rendered", JsonString("unsupported")),
+		("observations", JsonVector([])),
+	])
+
+	(
+		decode_semantic_middle_response_value(wrong_schema).is_err()
+		and decode_semantic_middle_response_value(wrong_domain).is_err()
+		and decode_semantic_middle_response_value(wrong_stage).is_err()
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp semantic-middle worker protocol",
+	tests = [
+		("stage names round trip", test_stage_names_round_trip),
+		("request JSON is phase specific", test_request_json_is_phase_specific),
+		("decode compiled response", test_decode_compiled_response),
+		("decode stopped response", test_decode_stopped_response),
+		("decode failed response", test_decode_failed_response),
+		("reject wrong schema domain and stage", test_rejects_wrong_schema_domain_and_stage),
+	],
+}

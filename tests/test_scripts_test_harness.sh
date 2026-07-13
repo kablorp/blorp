@@ -131,8 +131,8 @@ if ! grep -Eq 'Std-check[[:space:]]+PASS' "$std_check_output_file"; then
 	exit 1
 fi
 
-if ! grep -Fxq 'check --no-format std' "$std_check_log"; then
-	echo "FAIL: scripts/test std-check should call blorp check --no-format std"
+if ! grep -Fxq 'check --no-format --std-dir std std' "$std_check_log"; then
+	echo "FAIL: scripts/test std-check should check std with explicit stdlib context"
 	cat "$std_check_output_file"
 	cat "$std_check_log"
 	exit 1

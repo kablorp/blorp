@@ -11,6 +11,7 @@ import:
 		CliFrontendModuleOrigin(
 			CliFrontendPkgModule,
 			CliFrontendSourcePackageModule,
+			CliFrontendStdModule,
 			CliFrontendUserModule,
 		),
 		CliPackageRunCommand(
@@ -32,7 +33,10 @@ import:
 		),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-	../src/stage_12_cli/compiler_cli_source_graph: expand_check_targets, source_graph_modules_for_roots
+	../src/stage_12_cli/compiler_cli_source_graph:
+		expand_check_targets,
+		frontend_module_graph_for_roots,
+		source_graph_modules_for_roots,
 	json:
 		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -166,10 +170,10 @@ pure func module_surface_json_with_imports(imports: List[String]) -> JsonValue:
 
 pure func parsed_source_json_with_surface(imports: List[String]) -> JsonValue:
 	JsonObject([("parsed_ast", JsonObject([
-				("kind", JsonString("parsed_program")),
-				("decls", JsonVector([])),
-				("diagnostics", JsonVector([])),
-			])), (
+			("kind", JsonString("parsed_program")),
+			("decls", JsonVector([])),
+			("diagnostics", JsonVector([])),
+		])), (
 			"module_surface",
 			module_surface_json_with_imports(
 				imports,
@@ -182,22 +186,17 @@ pure func parsed_source_json_with_surface_and_ast_import(
 	ast_import_path: String,
 ) -> JsonValue:
 	JsonObject([
-		(
-			"parsed_ast",
-			JsonObject([("kind", JsonString("parsed_program")), ("decls", JsonVector([JsonObject([
-							("kind", JsonString("import_block")),
-							(
-								"imports",
-								JsonVector(
-									[
-										JsonObject(
-											[("module_path", JsonString(ast_import_path))],
-										),
-									],
-								),
-							),
-						])])), ("diagnostics", JsonVector([]))]),
-		),
+		("parsed_ast", JsonObject([
+			("kind", JsonString("parsed_program")),
+			("decls", JsonVector([JsonObject([
+					("kind", JsonString("import_block")),
+					(
+						"imports",
+						JsonVector([JsonObject([("module_path", JsonString(ast_import_path))])]),
+					),
+				])])),
+			("diagnostics", JsonVector([])),
+		])),
 		("module_surface", module_surface_json_with_imports(surface_imports)),
 		("ast_phase", JsonString("typecheck_source")),
 	])
@@ -210,6 +209,17 @@ pure func source_graph_test_check_action(root_path: String) -> CliAction:
 		debug = False,
 		no_format = True,
 		std_dir = None,
+		paths = [root_path],
+	})
+
+
+pure func source_graph_test_check_action_with_std(root_path: String, std_dir: String) -> CliAction:
+	CliCheck({
+		dump_ast = False,
+		dump_typed_ast = False,
+		debug = False,
+		no_format = True,
+		std_dir = Some(std_dir),
 		paths = [root_path],
 	})
 
@@ -252,6 +262,14 @@ pure func is_pkg_origin(source: CliFrontendGraphSource, package_id: String) -> B
 	match source.origin:
 		CliFrontendPkgModule(actual_package_id):
 			actual_package_id == package_id
+		_:
+			False
+
+
+pure func is_std_origin(source: CliFrontendGraphSource) -> Bool:
+	match source.origin:
+		CliFrontendStdModule:
+			True
 		_:
 			False
 
@@ -404,10 +422,10 @@ func test_source_graph_rejects_parsed_source_missing_module_surface() -> Bool:
 		module_name = "surface_missing_root",
 		source_text = "",
 		parsed_source = JsonObject([("parsed_ast", JsonObject([
-					("kind", JsonString("parsed_program")),
-					("decls", JsonVector([])),
-					("diagnostics", JsonVector([])),
-				])), ("ast_phase", JsonString("typecheck_source"))])
+				("kind", JsonString("parsed_program")),
+				("decls", JsonVector([])),
+				("diagnostics", JsonVector([])),
+			])), ("ast_phase", JsonString("typecheck_source"))])
 	}
 
 	match source_graph_modules_for_roots(source_graph_test_check_action(root_path), [root]):
@@ -455,6 +473,64 @@ func test_source_graph_no_longer_depends_on_parsed_ast_import_shape() -> Bool:
 						False
 			Err(_):
 				False
+
+
+func test_frontend_graph_uses_configured_std_origin() -> Bool:
+	std_dir: String = temp_dir() + "/blorp_cli_configured_std"
+	std_path: String = std_dir + "/bool.brp"
+	user_path: String = temp_dir() + "/blorp_cli_user/std/bool.brp"
+	std_source: CliParsedSourceFile = {
+		path = std_path,
+		module_name = "bool",
+		source_text = "",
+		parsed_source = parsed_source_json_with_surface([])
+	}
+	user_source: CliParsedSourceFile = {
+		path = user_path,
+		module_name = "bool",
+		source_text = "",
+		parsed_source = parsed_source_json_with_surface([])
+	}
+	std_action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
+	user_action: CliAction = source_graph_test_check_action_with_std(user_path, std_dir)
+
+	configured_std_ok: Bool = match frontend_module_graph_for_roots(
+		std_action,
+		CliFrontendCheck,
+		[],
+		JsonObject([]),
+		[std_source],
+	):
+		Ok(graph):
+			match graph_root_at(graph, 0):
+				Some(root):
+					is_std_origin(root) and root.module_name == "std/bool"
+				None:
+					False
+		Err(_):
+			False
+
+	user_std_name_ok: Bool = match frontend_module_graph_for_roots(
+		user_action,
+		CliFrontendCheck,
+		[],
+		JsonObject([]),
+		[user_source],
+	):
+		Ok(graph):
+			match graph_root_at(graph, 0):
+				Some(root):
+					match root.origin:
+						CliFrontendUserModule:
+							True
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+	configured_std_ok and user_std_name_ok
 
 
 func test_expand_check_targets_discovers_sorted_directory_sources() -> Bool:
@@ -1218,10 +1294,10 @@ func test_cli_run_envelope_frontend_graph_includes_context() -> Bool:
 				action = RunCliAction,
 				action_name = "run_cli",
 				payload = JsonObject([("args", JsonVector([
-							JsonString("compile"),
-							JsonString("--no-format"),
-							JsonString(path),
-						]))])
+						JsonString("compile"),
+						JsonString("--no-format"),
+						JsonString(path),
+					]))])
 			}
 			response: JsonValue = handle_cli_run_envelope(envelope)
 			_ = remove_file(path)
@@ -2301,6 +2377,10 @@ tests: TestSuite = {
 		(
 			"frontend graph no longer depends on parsed_ast imports shape",
 			test_source_graph_no_longer_depends_on_parsed_ast_import_shape,
+		),
+		(
+			"frontend graph uses configured std origin",
+			test_frontend_graph_uses_configured_std_origin,
 		),
 		(
 			"expand check targets discovers sorted directory sources",
