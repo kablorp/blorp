@@ -25,6 +25,7 @@ import:
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
+		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		parsed_identifier,
 	../src/stage_05_types/compiler_env:
 		CompilerPurity(CompilerPure),
@@ -93,12 +94,14 @@ import:
 			CompilerTypedRangeExpr,
 			CompilerTypedRecordExpr,
 			CompilerTypedSelectExpr,
+			CompilerTypedStringLiteralExpr,
 			CompilerTypedTupleExpr,
 			CompilerTypedTupleDestructExpr,
 			CompilerTypedVarDeclExpr,
 			CompilerTypedVectorExpr,
 			CompilerTypedWhileExpr,
 			CompilerTypedVoidExpr,
+			CompilerTypedWithExpr,
 		),
 		CompilerTypedExprInfo,
 		CompilerTypedLambdaParam,
@@ -116,6 +119,8 @@ import:
 			CompilerTypedSelectSealedArm,
 		),
 		CompilerTypedVarDeclPayload,
+		CompilerTypedWithBinding,
+		CompilerTypedWithErrorMap,
 	../src/stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
@@ -188,6 +193,7 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			RangeExpr,
 			RecordExpr,
+			ResourceScopeExpr,
 			SeqExpr,
 			SelectExpr,
 			TupleExpr,
@@ -325,6 +331,28 @@ pure func core_result_int_string_type() -> CoreType:
 	)
 
 
+pure func file_resource_type() -> CompilerType:
+	CompilerNamedType("File", [])
+
+
+pure func core_file_resource_type() -> CoreType:
+	NamedType("File", [])
+
+
+pure func result_file_string_type() -> CompilerType:
+	CompilerNamedType(
+		"Result",
+		[file_resource_type(), compiler_type_string()],
+	)
+
+
+pure func result_file_int_type() -> CompilerType:
+	CompilerNamedType(
+		"Result",
+		[file_resource_type(), int_type()],
+	)
+
+
 pure func core_types_equal(left: CoreType, right: CoreType) -> Bool:
 	core_type_to_json(left).to_string() == core_type_to_json(right).to_string()
 
@@ -394,6 +422,10 @@ pure func int_expr(text: String) -> CompilerTypedExpr:
 
 pure func bool_expr(value: Bool) -> CompilerTypedExpr:
 	CompilerTypedBoolLiteralExpr(value, source_span(), expr_info(compiler_type_bool()))
+
+
+pure func string_expr(value: String) -> CompilerTypedExpr:
+	CompilerTypedStringLiteralExpr(value, source_span(), expr_info(compiler_type_string()))
 
 
 pure func tuple_int_bool_expr() -> CompilerTypedExpr:
@@ -1743,6 +1775,130 @@ func test_lowers_question_bind_result_to_constructor_match() -> Bool:
 				_:
 					False
 		_:
+			False
+
+
+func test_lowers_plain_with_to_resource_scope() -> Bool:
+	binding: CompilerTypedWithBinding = {
+		name = ident("file"),
+		annotation = None,
+		value = CompilerTypedNameExpr(ident("opened"), expr_info(file_resource_type())),
+		kind = ParsedWithPlainBinding,
+		error_map = None,
+		cleanup_function = Some("blorp_file_close"),
+		span = source_span()
+	}
+	expr = CompilerTypedWithExpr(binding, int_expr("7"), source_span(), expr_info(int_type()))
+
+	match lower_typed_expr(expr):
+		Ok(ResourceScopeExpr(scope, typ, _)):
+			cleanup_json = core_expr_to_json(scope.cleanup).to_string()
+
+			(
+				scope.variable.name == "file"
+				and core_types_equal(scope.typ, core_file_resource_type())
+				and core_types_equal(typ, core_int_type())
+				and cleanup_json.contains("blorp_file_close")
+				and cleanup_json.contains("\"name\":\"file\"")
+			)
+		_:
+			False
+
+
+func test_lowers_plain_with_fallback_close() -> Bool:
+	binding: CompilerTypedWithBinding = {
+		name = ident("resource"),
+		annotation = None,
+		value = CompilerTypedNameExpr(ident("opened"), expr_info(file_resource_type())),
+		kind = ParsedWithPlainBinding,
+		error_map = None,
+		cleanup_function = None,
+		span = source_span()
+	}
+	expr = CompilerTypedWithExpr(binding, int_expr("7"), source_span(), expr_info(int_type()))
+
+	match lower_typed_expr(expr):
+		Ok(ResourceScopeExpr(scope, _, _)):
+			match scope.cleanup:
+				CallExpr(UnknownCall, VarExpr(callee, _, _), [arg], _, _):
+					match arg:
+						VarExpr(resource_var, _, _):
+							callee.name == "close" and resource_var.name == "resource"
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_lowers_result_with_try_to_resource_match() -> Bool:
+	binding: CompilerTypedWithBinding = {
+		name = ident("file"),
+		annotation = None,
+		value = CompilerTypedNameExpr(ident("opened"), expr_info(result_file_string_type())),
+		kind = ParsedWithTryBinding,
+		error_map = None,
+		cleanup_function = Some("blorp_file_close"),
+		span = source_span()
+	}
+	expr = CompilerTypedWithExpr(
+		binding,
+		CompilerTypedNameExpr(ident("done"), expr_info(result_int_string_type())),
+		source_span(),
+		expr_info(result_int_string_type()),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(lowered):
+			json = core_expr_to_json(lowered).to_string()
+
+			(
+				json.contains("\"kind\":\"let\"")
+				and json.contains("\"kind\":\"constructor_match\"")
+				and json.contains("\"constructor\":\"Ok\"")
+				and json.contains("\"constructor\":\"Err\"")
+				and json.contains("\"kind\":\"resource_scope\"")
+				and json.contains("blorp_file_close")
+				and json.contains("blorp_result_err")
+			)
+		Err(_):
+			False
+
+
+func test_lowers_result_with_try_error_map() -> Bool:
+	error_map: CompilerTypedWithErrorMap = {
+		name = ident("code"),
+		value = string_expr("mapped"),
+		span = source_span()
+	}
+	binding: CompilerTypedWithBinding = {
+		name = ident("file"),
+		annotation = None,
+		value = CompilerTypedNameExpr(ident("opened"), expr_info(result_file_int_type())),
+		kind = ParsedWithTryBinding,
+		error_map = Some(error_map),
+		cleanup_function = Some("blorp_file_close"),
+		span = source_span()
+	}
+	expr = CompilerTypedWithExpr(
+		binding,
+		CompilerTypedNameExpr(ident("done"), expr_info(result_int_string_type())),
+		source_span(),
+		expr_info(result_int_string_type()),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(lowered):
+			json = core_expr_to_json(lowered).to_string()
+
+			(
+				json.contains("\"name\":\"code\"")
+				and json.contains("mapped")
+				and json.contains("blorp_result_err")
+				and json.contains("blorp_file_close")
+			)
+		Err(_):
 			False
 
 
@@ -3101,6 +3257,10 @@ tests: TestSuite = {
 			"lowers question bind Result to constructor match",
 			test_lowers_question_bind_result_to_constructor_match,
 		),
+		("lowers plain with to resource scope", test_lowers_plain_with_to_resource_scope),
+		("lowers plain with fallback close", test_lowers_plain_with_fallback_close),
+		("lowers Result with try to resource match", test_lowers_result_with_try_to_resource_match),
+		("lowers Result with try error map", test_lowers_result_with_try_error_map),
 		("lowers while expression", test_lowers_while_expression),
 		("lowers range for expression", test_lowers_range_for_expression),
 		("lowers list for expression", test_lowers_list_for_expression),

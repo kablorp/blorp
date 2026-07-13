@@ -2080,12 +2080,27 @@ Current progress:
   `UnionDecl`, including constructor C names, tag names, payload storage, and
   field release policies. CTFE context construction also reads typed union
   constructor metadata so compile-time constructor calls retain callable ids.
+- Resource cleanup identity now crosses the typed-AST boundary explicitly.
+  Builtin resource declarations register their cleanup function in the Blorp
+  typecheck context, including canonical imported type names, and
+  `CompilerTypedWithBinding` preserves the selected cleanup function. Core
+  lowering no longer needs session-global resource metadata: plain `with`
+  lowers directly to `ResourceScopeExpr`, while `with ?=` lowers to a prepared
+  Option/Result constructor match whose success arm owns the resource scope and
+  whose failure arm preserves ordinary or mapped error propagation. Resources
+  without registered builtin cleanup retain the language-level `close`
+  fallback. Focused tests cover registration, inference/JSON transport,
+  builtin and fallback cleanup, mapped errors, and the downstream
+  resource/Perceus passes.
 
 Edge cases:
 
-- `with ?=` resource acquisition still needs resource cleanup metadata from
-  typecheck before it can reuse the direct `?=` carrier lowering safely.
-- `with` resource blocks need cleanup metadata from typecheck.
+- `CompilerTypedWithBinding` still stores the parser's two-case binding-kind
+  enum. A direct phase-specific enum split currently triggers the bootstrap
+  compiler's duplicate nominal-module-identity failure in combined Blorp
+  compiler tests (`expected X, got X` for the same qualified type). Keep the
+  dependency isolated behind `compiler_typed_with_binding_is_try` until that
+  compiler defect is fixed; do not duplicate the enum through import aliases.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
   internal and must only lower under `for`/tuple-for.

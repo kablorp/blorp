@@ -142,6 +142,9 @@ import:
 			CompilerTypedSelectSealedArm,
 		),
 		CompilerTypedVarDeclPayload,
+		CompilerTypedWithBinding,
+		CompilerTypedWithErrorMap,
+		compiler_typed_with_binding_is_try,
 		compiler_typed_expr_value_type,
 	../stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
@@ -206,7 +209,7 @@ import:
 			VoidBox,
 		),
 		CoreBoxedStorageValue,
-		CoreCallKind(SelectedDirectCall, UnknownCall),
+		CoreCallKind(BuiltinCall, SelectedDirectCall, UnknownCall),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
@@ -261,6 +264,7 @@ import:
 			LogicalExpr,
 			RangeExpr,
 			RecordExpr,
+			ResourceScopeExpr,
 			PreClosureDetachExpr,
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
@@ -309,6 +313,7 @@ import:
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
+		CoreResourceScope,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSelectRecvArm,
@@ -2494,6 +2499,255 @@ private pure func lower_typed_question_bind(
 			)
 
 
+private pure func with_resource_name(binding: CompilerTypedWithBinding) -> String:
+	if binding.name.text == "_":
+		question_bind_name("resource", binding.span)
+	else:
+		binding.name.text
+
+
+private pure func with_resource_type(
+	binding: CompilerTypedWithBinding,
+	acquisition_type: CoreType,
+) -> Result[CoreType, CompilerCoreLowerError]:
+	match binding.annotation:
+		Some(annotation):
+			compiler_core_lower_value_type(annotation)
+		None:
+			if compiler_typed_with_binding_is_try(binding):
+				match core_carrier_success_type(acquisition_type):
+					Ok(resource_type):
+						Ok(clone_core_type(resource_type))
+					Err(error):
+						Err(error)
+			else:
+				Ok(clone_core_type(acquisition_type))
+
+
+private pure func resource_cleanup_call(
+	binding: CompilerTypedWithBinding,
+	resource_var: CoreVar,
+	resource_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	resource_ref = VarExpr(
+		clone_core_var(resource_var),
+		clone_core_type(resource_type),
+		clone_core_source_loc(loc),
+	)
+
+	match binding.cleanup_function:
+		Some(cleanup_function):
+			builtin_core_call(
+				cleanup_function,
+				[resource_ref],
+				VoidType,
+				clone_core_source_loc(loc),
+			)
+		None:
+			CallExpr(
+				UnknownCall,
+				VarExpr(
+					core_var("close", None),
+					NamedType("Closure", []),
+					clone_core_source_loc(loc),
+				),
+				[resource_ref],
+				VoidType,
+				clone_core_source_loc(loc),
+			)
+
+
+private pure func resource_scope_expr(
+	binding: CompilerTypedWithBinding,
+	resource_type: CoreType,
+	acquire: CoreExpr,
+	body: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	resource_var = core_var(with_resource_name(binding), None)
+	scope: CoreResourceScope = {
+		variable = clone_core_var(resource_var),
+		typ = clone_core_type(resource_type),
+		acquire = acquire,
+		body = body,
+		cleanup = resource_cleanup_call(
+			binding,
+			resource_var,
+			clone_core_type(resource_type),
+			clone_core_source_loc(loc),
+		)
+	}
+	ResourceScopeExpr(scope, result_type, loc)
+
+
+private pure func lower_with_mapped_failure_case(
+	mapper: CompilerTypedWithErrorMap,
+	kind: CompilerCoreLowerCarrierKind,
+	acquisition_type: CoreType,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreConstructorMatchCase, CompilerCoreLowerError]:
+	test ?= carrier_failure_test(kind, acquisition_type)
+	failure_type ?= core_carrier_failure_type(acquisition_type)
+	accessor ?= carrier_failure_accessor(kind, acquisition_type)
+	mapped_error ?= lower_typed_expr(mapper.value)
+	failure_var = if mapper.name.text == "_":
+		core_var(question_bind_name("with_failure", mapper.span), None)
+	else:
+		core_var(mapper.name.text, None)
+
+	Ok({
+		constructor = "Err",
+		accessor = RootAccessor,
+		test = test,
+		bindings = [
+			{
+				variable = failure_var,
+				typ = failure_type,
+				accessor = accessor,
+				mode = MatchBorrowBindingMode
+			},
+		],
+		body = ConstructorMatchBodyExpr(
+			builtin_core_call(
+				"blorp_result_err",
+				[mapped_error],
+				result_type,
+				loc,
+			),
+		),
+	})
+
+
+private pure func lower_with_failure_case(
+	binding: CompilerTypedWithBinding,
+	kind: CompilerCoreLowerCarrierKind,
+	acquisition_type: CoreType,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreConstructorMatchCase, CompilerCoreLowerError]:
+	match binding.error_map:
+		None:
+			lower_question_bind_failure_case(
+				kind,
+				acquisition_type,
+				result_type,
+				binding.span,
+				loc,
+			)
+		Some(mapper):
+			match kind:
+				CompilerCoreLowerOptionCarrier:
+					Err(
+						CompilerCoreLowerInvalidType(
+							"with ?= error mapping reached lowering for Option",
+						),
+					)
+				CompilerCoreLowerResultCarrier:
+					lower_with_mapped_failure_case(
+						mapper,
+						kind,
+						acquisition_type,
+						result_type,
+						loc,
+					)
+
+
+private pure func lower_typed_with(
+	binding: CompilerTypedWithBinding,
+	body: CompilerTypedExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	acquisition ?= lower_typed_expr(binding.value)
+	acquisition_type ?= compiler_core_lower_value_type(
+		compiler_typed_expr_value_type(binding.value),
+	)
+	resource_type ?= with_resource_type(binding, clone_core_type(acquisition_type))
+	lowered_body ?= lower_typed_expr(body)
+
+	if compiler_typed_with_binding_is_try(binding):
+		acquisition_kind ?= core_carrier_kind(acquisition_type)
+		result_kind ?= core_carrier_kind(result_type)
+
+		if acquisition_kind != result_kind:
+			Err(
+				CompilerCoreLowerInvalidType(
+					"with ?= carrier kind changed between inference and lowering",
+				),
+			)
+		else:
+			payload_name: ParsedIdentifier = {
+				text = question_bind_name("with_payload", binding.span),
+				span = binding.span
+			}
+			payload_var = core_var(payload_name.text, None)
+			payload_ref = VarExpr(
+				clone_core_var(payload_var),
+				clone_core_type(resource_type),
+				clone_core_source_loc(loc),
+			)
+			success_scope = resource_scope_expr(
+				binding,
+				clone_core_type(resource_type),
+				payload_ref,
+				lowered_body,
+				clone_core_type(result_type),
+				clone_core_source_loc(loc),
+			)
+			success_case ?= lower_question_bind_success_case(
+				payload_name,
+				clone_core_type(resource_type),
+				acquisition_kind,
+				clone_core_type(acquisition_type),
+				success_scope,
+			)
+			failure_case ?= lower_with_failure_case(
+				binding,
+				acquisition_kind,
+				clone_core_type(acquisition_type),
+				clone_core_type(result_type),
+				clone_core_source_loc(loc),
+			)
+			temp_var = core_var(question_bind_name("with_value", binding.span), None)
+			temp_ref = VarExpr(
+				clone_core_var(temp_var),
+				clone_core_type(acquisition_type),
+				clone_core_source_loc(loc),
+			)
+			match_expr = ConstructorMatchExpr(
+				temp_ref,
+				NoReleasePolicy,
+				[success_case, failure_case],
+				ConstructorMatchFallbackFail,
+				clone_core_type(result_type),
+				clone_core_source_loc(loc),
+			)
+
+			Ok(
+				LetExpr(
+					temp_var,
+					False,
+					acquisition_type,
+					acquisition,
+					match_expr,
+				),
+			)
+	else:
+		Ok(
+			resource_scope_expr(
+				binding,
+				resource_type,
+				acquisition,
+				lowered_body,
+				result_type,
+				loc,
+			),
+		)
+
+
 private pure func lower_tuple_destruct_bindings(
 	names: List[ParsedIdentifier],
 	index: Int,
@@ -2739,6 +2993,8 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			Ok(LambdaExpr(lowered_params, lowered_return_type, lowered_body, is_pure, typ, loc))
 		CompilerTypedBlockExpr(items, _, _):
 			lower_typed_block_expr(items, typ, loc)
+		CompilerTypedWithExpr(binding, body, _, _):
+			lower_typed_with(binding, body, typ, loc)
 		CompilerTypedWhileExpr(condition, body, _, _):
 			lowered_condition ?= lower_typed_expr(condition)
 			lowered_body ?= lower_typed_expr(body)

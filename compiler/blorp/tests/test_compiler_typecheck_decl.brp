@@ -64,6 +64,7 @@ import:
 	../src/stage_04_modules/compiler_module_surface: module_surface_for_program
 	../src/stage_05_types/compiler_context:
 		CompilerModuleOrigin(CompilerSourcePackageModule, CompilerStdlibModule),
+		compiler_find_resource_cleanup,
 	../src/stage_05_types/compiler_env:
 		CompilerFuncOrigin(CompilerForeignFunc, CompilerUserDefinedFunc),
 		CompilerPurity(CompilerImpure, CompilerPure),
@@ -677,6 +678,23 @@ pure func builtin_type_decl(name: String, is_resource: Bool) -> ParsedDecl:
 		type_params = [],
 		is_resource = is_resource,
 		cleanup = None,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func builtin_resource_type_decl_with_cleanup(
+	name: String,
+	cleanup_function: String,
+) -> ParsedDecl:
+	BuiltinTypeParsedDecl({
+		name = ident(name),
+		type_params = [],
+		is_resource = True,
+		cleanup = Some({
+			builtin_name = cleanup_function,
+			span = source_span(),
+		}),
 		doc = None,
 		span = source_span(),
 	})
@@ -1486,6 +1504,42 @@ func test_imported_global_abi_record_supports_field_access() -> Bool:
 	result.state.errors.length() == 0
 
 
+func test_imported_builtin_resource_preserves_cleanup() -> Bool:
+	module_path = "std/fs"
+	resource_name = "FileReader"
+	source_program = program(
+		[
+			import_block_decl(
+				[import_decl("fs", None, Some([import_symbol(resource_name, None, [])]))],
+			),
+		],
+	)
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[
+			importable_module(
+				module_path,
+				[
+					builtin_resource_type_decl_with_cleanup(
+						resource_name,
+						"blorp_file_close_reader",
+					),
+				],
+			),
+		],
+	)
+	canonical_name = compiler_canonical_module_type_name(module_path, resource_name)
+
+	(
+		result.state.errors.length() == 0
+		and compiler_find_resource_cleanup(
+			result.state.context,
+			canonical_name,
+		) == Some("blorp_file_close_reader")
+	)
+
+
 func test_registers_type_record_alias_and_constructors() -> Bool:
 	source_program = program([
 		union_decl(
@@ -1523,7 +1577,7 @@ func test_registers_type_record_alias_and_constructors() -> Bool:
 
 func test_registers_builtin_resource_and_resource_containing_record() -> Bool:
 	source_program = program([
-		builtin_type_decl("Reader", True),
+		builtin_resource_type_decl_with_cleanup("Reader", "blorp_reader_close"),
 		record_with_fields_decl("ReaderBox", [ParsedNamedType(ident("Reader"), [], source_span())]),
 	])
 	state = compiler_typecheck_register_program_type_decls(
@@ -1541,6 +1595,7 @@ func test_registers_builtin_resource_and_resource_containing_record() -> Bool:
 		and compiler_env_get_type_kind(state.env, "Reader") == Some(CompilerTypeResource)
 		and compiler_env_get_type_contains_resource(state.env, "ReaderBox")
 		and compiler_typecheck_state_has_known_resource_type_name(state, "Reader")
+		and compiler_find_resource_cleanup(state.context, "Reader") == Some("blorp_reader_close")
 		and user_state.errors.length() == 1
 		and user_state.errors
 			.get_or(0, "")
@@ -3384,6 +3439,10 @@ tests: TestSuite = {
 		(
 			"imported global abi record supports field access",
 			test_imported_global_abi_record_supports_field_access,
+		),
+		(
+			"imported builtin resource preserves cleanup",
+			test_imported_builtin_resource_preserves_cleanup,
 		),
 		(
 			"registers type record alias and constructors",
