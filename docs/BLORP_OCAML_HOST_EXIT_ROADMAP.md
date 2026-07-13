@@ -220,7 +220,7 @@ failures remain versioned `SemanticMiddleFailed` responses.
 
 Implemented evidence on 2026-07-13:
 
-- 7 Blorp protocol tests;
+- 8 Blorp protocol tests;
 - 9 OCaml protocol/worker tests, including a real typed target and two explicit
   typed modules with no module-cache dependency;
 - explicit import-binding table and resource-cleanup restoration regressions;
