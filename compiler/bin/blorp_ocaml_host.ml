@@ -826,18 +826,10 @@ let compile_file_with_opts ~frontend_program ~preloaded_module_graph opts
   end
 
 (** Compile and run a blorp file *)
-let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?(leak_check = false) ?(run_mode = Compile_profile.Fast)
-    ~timeout ?(user_args = []) ~preloaded_module_graph ~frontend_program:_
-    filename =
+let run_file ?(profile = false) ?(debug = false) ~sanitizer_mode
+    ?(leak_check = false) ?(run_mode = Compile_profile.Fast) ~timeout
+    ?(user_args = []) ~preloaded_module_graph filename =
   Test_runner.with_run_artifacts (fun () ->
-      let sanitizer_mode =
-        match sanitizer_mode with
-        | Some mode -> mode
-        | None ->
-            if sanitize then Test_runner.SanitizerAddressUndefined
-            else Test_runner.SanitizerOff
-      in
       let sanitize = Test_runner.sanitizer_enabled sanitizer_mode in
       init_module_paths (extract_directory filename);
       let opt = Compile_profile.opt_level_for_run ~sanitize run_mode in
@@ -1298,9 +1290,7 @@ type blorp_cli_frontier =
       * Modules.preloaded_module_graph
       * Compiler_blorp_bridge.cli_compile_options
   | BlorpCliRun of
-      Ast.program
-      * Modules.preloaded_module_graph
-      * Compiler_blorp_bridge.cli_run_options
+      Modules.preloaded_module_graph * Compiler_blorp_bridge.cli_run_options
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
   | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
   | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
@@ -1502,11 +1492,7 @@ let cli_frontier_frontend_module_graph
           exit 1)
   | Compiler_blorp_bridge.CliFrontendRunOptions options -> (
       match roots with
-      | [ root ] ->
-          BlorpCliRun
-            ( root.finalized_parsed_file.parsed_cli_program,
-              preloaded_module_graph,
-              options )
+      | [ _ ] -> BlorpCliRun (preloaded_module_graph, options)
       | _ ->
           prerr_endline
             "Error: run frontend module graph must contain exactly one root";
@@ -1614,8 +1600,7 @@ let run_compiler_host_compile_wrapper_command args =
         "Usage: blorp __compiler-host-compile-wrapper -o <out.c> <file.brp>";
       1
 
-let run_file_from_frontier_options ~frontend_program
-    ~preloaded_module_graph
+let run_file_from_frontier_options ~preloaded_module_graph
     (options : Compiler_blorp_bridge.cli_run_options) =
   let timeout = resolve_timeout options.cli_run_timeout in
   let sanitizer_mode =
@@ -1636,8 +1621,7 @@ let run_file_from_frontier_options ~frontend_program
   | [ file ] ->
       run_file ~profile:options.cli_run_profile ~debug:options.cli_run_debug
         ~sanitizer_mode ~leak_check ~timeout ~run_mode
-        ~user_args:options.cli_run_user_args ~preloaded_module_graph
-        ~frontend_program file
+        ~user_args:options.cli_run_user_args ~preloaded_module_graph file
   | [] ->
       prerr_endline "Error: No input file specified";
       1
@@ -1891,9 +1875,8 @@ and run_frontier = function
   | BlorpCliCompile (frontend_program, preloaded_module_graph, options) ->
       run_compile_from_frontier_options ~frontend_program
         ~preloaded_module_graph options
-  | BlorpCliRun (frontend_program, preloaded_module_graph, options) ->
-      run_file_from_frontier_options ~frontend_program ~preloaded_module_graph
-        options
+  | BlorpCliRun (preloaded_module_graph, options) ->
+      run_file_from_frontier_options ~preloaded_module_graph options
   | BlorpCliTest options -> run_test_from_frontier_options options
   | BlorpCliPurify options -> run_purify_from_frontier_options options
   | BlorpCliRepl options ->

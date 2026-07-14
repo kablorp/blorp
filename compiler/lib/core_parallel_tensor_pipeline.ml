@@ -785,7 +785,7 @@ let rec rewrite_decl calls d =
   in
   { d with cd_desc = desc }
 
-let fuse_program ~reg:_ prog =
+let fuse_program prog =
   counter := 0;
   let calls = collect_std_calls prog in
   if Hashtbl.length calls = 0 then prog else List.map (rewrite_decl calls) prog
