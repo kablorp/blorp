@@ -32,11 +32,13 @@ semantic stages are OCaml- or Blorp-owned.
 
 Execute the checkpoints in document order. Checkpoint C cuts over `check`,
 which needs no backend effects, and builds the compile/run path through an
-in-memory `CArtifact` under focused tests using typed worker requests and
-decoded response fixtures. The real worker process client lands with the
-structured process API in Checkpoint F. Compile/run become authoritative only
-in Checkpoint J, after the artifact, filesystem, process, host-C, runtime, and
-observability checkpoints are complete.
+in-memory `BuildArtifact` under focused tests using typed worker requests and
+decoded response fixtures. Raw Core-to-C emission still uses the smaller
+`CArtifact` compatibility shape until the legacy bridge is removed. The real
+worker process client lands with the structured process API in Checkpoint F.
+Compile/run become authoritative only in Checkpoint J, after the artifact,
+filesystem, process, host-C, runtime, and observability checkpoints are
+complete.
 
 ## Current Boundary
 
@@ -61,12 +63,14 @@ still owns production compile/run effects through these functions in
 the still-OCaml compile implementation; it is no longer reachable from the
 public `check` command.
 
-Compilation already returns a Blorp-owned `CArtifact` from
-`compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`, but the
-artifact is decoded by OCaml and its effects are performed there. `run_file`
-also assembles the host C arguments, uses `Test_runner.precompile_runtime`,
-calls `Test_runner.compile_c_from_stdin`, and uses
-`Test_runner.run_process_timeout` to execute the binary.
+The production compatibility path still returns a raw Blorp-owned `CArtifact`
+that OCaml decodes before performing its effects. The in-process Blorp path
+now immediately combines that raw emission with pre-DCE Core and typed CLI
+facts to produce a complete `BuildArtifact`; downstream policy does not read
+OCaml module caches or compiler-global module state. `run_file` still assembles
+the production host C arguments, uses `Test_runner.precompile_runtime`, calls
+`Test_runner.compile_c_from_stdin`, and uses
+`Test_runner.run_process_timeout` to execute the binary until Checkpoint J.
 
 The desired change is not to move the existing CLI-plan protocol into another
 file. The CLI plan must become an internal Blorp value. Only the semantic input
@@ -239,7 +243,7 @@ Exit condition:
 ## Checkpoint C: Keep The CLI Plan Inside Blorp
 
 Goal: cut ordinary `check` over to Blorp and build a typed, testable compile/run
-path from an internal CLI plan through an in-memory `CArtifact`.
+path from an internal CLI plan through an in-memory `BuildArtifact`.
 
 Status: complete on this branch. Ordinary `check` is production-authoritative
 in Blorp. Compile/run remain production-authoritative in OCaml until
@@ -323,6 +327,10 @@ Implemented evidence on 2026-07-13:
   actionable `blorp package fetch <alias>` guidance for an unavailable
   content-addressed package, and direct check does not cascade into type errors
   after graph setup fails;
+- source-graph discovery uses a generated embedded-std source lookup when no
+  explicit override exists, while preserving the documented `--std-dir`,
+  `BLORP_STD`, `blorp.toml`, embedded precedence and synthetic
+  `<embedded:std/...>` source identities;
 - focused Blorp execution tests: 3 passed;
 - CLI planning and typed graph tests: 87 passed;
 - CLI gate: 51 passed, including the permanent zero-host regression;
@@ -335,10 +343,15 @@ Implemented evidence on 2026-07-13:
   is a performance issue to address separately, not a reason to reintroduce
   the host boundary.
 
-## Checkpoint D: Make `CArtifact` A Complete Blorp Boundary
+## Checkpoint D: Make `BuildArtifact` A Complete Blorp Boundary
 
 Goal: ensure all information needed after semantic compilation is represented
 by a typed Blorp artifact, with no hidden OCaml module state.
+
+Status: complete on this branch. The raw `CArtifact` remains only at the
+temporary legacy bridge, while the Blorp-owned compile/run path upgrades it
+immediately to a complete `BuildArtifact` and derives host-C policy solely
+from that typed value.
 
 Primary files:
 
@@ -349,7 +362,8 @@ Primary files:
 
 Implementation:
 
-1. Replace the minimal `CArtifact` with a phase-specific build artifact that
+1. Keep `CArtifact` as the explicitly temporary raw-emission/legacy-bridge
+   shape. Immediately upgrade it to a phase-specific `BuildArtifact` that
    includes:
    - generated C text;
    - structured native link arguments;
@@ -368,6 +382,19 @@ Implementation:
    - `write_compile_artifact` writes requested output;
    - `execute_c_invocation` runs the command.
 
+Implementation notes:
+
+- `compiler_build_artifact.brp` owns `BuildArtifact`, structured platform link
+  arguments, runtime/native requirements, source identity, compatibility
+  facts, and the pure `build_c_invocation` projection.
+- foreign link groups are validated before Core lowering and split exactly
+  once while entering the structured artifact; downstream code never joins or
+  resplits command text;
+- raylib and TLS requirements derive from typed graph origins and canonical
+  module identities, so user modules cannot spoof native requirements; and
+- `compiler_artifact_json.brp` has a strict versioned codec for every artifact
+  field while retaining the raw codec solely for the temporary OCaml bridge.
+
 Tests:
 
 - extend `test_compiler_artifact_json.brp`
@@ -380,6 +407,27 @@ Exit condition:
 
 - deleting OCaml module caches after C emission cannot change the command that
   Blorp will execute.
+
+Focused evidence on 2026-07-13:
+
+- build-artifact policy tests: 4 passed;
+- strict artifact-codec tests: 6 passed;
+- CLI execution tests cover embedded/external runtime selection, profile and
+  optimization facts, source identity, and exact raylib/TLS graph derivation;
+- the combined artifact, CLI, environment, inference, Core-emission, and
+  Perceus suites passed 750 tests with no failures;
+- the Perceus suite passed all 139 tests under ASan and UBSan, including a
+  regression proving a matched owner outlives retention of its borrowed
+  payload;
+- production and ASan CLI builds both check a normal source successfully and
+  report the expected global-self-reference diagnostic without invoking freed
+  memory. An unchanged follow-up `make` completes in about 2 seconds;
+- production compiler and CLI gates passed all 1,537 tests after the cold
+  self-hosted build exposed and closed CTFE string-case and closure-value
+  parity gaps. CTFE now evaluates lexical closures while recursively rejecting
+  captured closures that cannot be materialized as global data; and
+- the complete default gate passed all 9,572 tests: compiler-unit, compiler,
+  runtime, leak, doctest, and CLI.
 
 ## Checkpoint E: Add The Minimum Robust Filesystem Surface
 
@@ -517,7 +565,7 @@ OCaml references to study exactly:
 
 Implementation:
 
-1. Build `HostCCompileRequest` from `CArtifact`, compile profile, sanitizer
+1. Build `HostCCompileRequest` from `BuildArtifact`, compile profile, sanitizer
    mode, platform, and runtime artifact. Keep option policy pure.
 2. Feed generated C to `cc` through `BytesStdin`; preserve `-x c - -x none`
    so following object files are not parsed as C.
@@ -587,7 +635,7 @@ Tests:
 
 Exit condition:
 
-- given a `CArtifact`, the Blorp executor compiles and runs it with no OCaml
+- given a `BuildArtifact`, the Blorp executor compiles and runs it with no OCaml
   effect helper; the public command switches to this executor in Checkpoint J.
 
 ## Checkpoint I: Preserve Observability And Diagnostics

@@ -6,6 +6,7 @@ import:
 		CliCheckTargetExpansion,
 		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
 		CliFrontendGraphSource,
+		CliFrontendImportEdge,
 		CliFrontendModuleGraph,
 		CliFrontendModuleOrigin(
 			CliFrontendPkgModule,
@@ -239,6 +240,20 @@ pure func graph_module_at(
 	graph.modules.get(index)
 
 
+pure func non_std_graph_modules(graph: CliFrontendModuleGraph) -> List[CliFrontendGraphSource]:
+	graph.modules.filter(func(source):
+		match source.origin:
+			CliFrontendStdModule:
+				False
+			_:
+				True
+	)
+
+
+pure func non_std_source_import_edges(graph: CliFrontendModuleGraph) -> List[CliFrontendImportEdge]:
+	graph.import_edges.filter(func(edge): not edge.from_module.starts_with("std/"))
+
+
 pure func graph_has_single_root(graph: CliFrontendModuleGraph, path: String) -> Bool:
 	match graph.roots:
 		[root]:
@@ -269,6 +284,12 @@ pure func is_std_origin(source: CliFrontendGraphSource) -> Bool:
 			True
 		_:
 			False
+
+
+pure func graph_has_implicit_prelude(graph: CliFrontendModuleGraph) -> Bool:
+	graph.modules.any(func(source):
+		source.module_name == "std/prelude" and is_std_origin(source)
+	)
 
 
 pure func graph_has_source_package_context(
@@ -518,6 +539,45 @@ func test_frontend_graph_uses_configured_std_origin() -> Bool:
 	configured_std_ok and user_std_name_ok
 
 
+func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
+	root_path: String = temp_dir() + "/blorp_cli_embedded_std_main.brp"
+	previous_std: Option[String] = getenv("BLORP_STD")
+	root: CliParsedSourceFile = {
+		path = root_path,
+		module_name = "blorp_cli_embedded_std_main",
+		source_text = "",
+		parsed_source = parsed_source_json_with_surface([])
+	}
+	_ = setenv("BLORP_STD", "")
+	result: Result[CliFrontendModuleGraph, String] = frontend_module_graph_for_roots(
+		source_graph_test_check_action(root_path),
+		[root],
+	)
+
+	match previous_std:
+		Some(path):
+			_ = setenv("BLORP_STD", path)
+		None:
+			_ = setenv("BLORP_STD", "")
+
+	match result:
+		Ok(graph):
+			(
+				graph.context.std_dir.is_none()
+				and graph.modules.any(
+					func(
+						source,
+					): (
+						source.module_name == "std/prelude"
+						and source.path == "<embedded:std/prelude>"
+						and source.source_text.length() > 0
+					),
+				)
+			)
+		Err(_):
+			False
+
+
 func test_expand_check_targets_discovers_sorted_directory_sources() -> Bool:
 	root: String = temp_dir() + "/blorp_cli_check_targets_dir"
 	nested: String = root + "/nested"
@@ -711,8 +771,8 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 					and check_plan.options.no_format
 					and check_plan.options.paths.length() == 2
 					and graph.roots.length() == 2
-					and graph.modules.length() == 0
-					and graph.import_edges.length() == 0
+					and non_std_graph_modules(graph).length() == 0
+					and non_std_source_import_edges(graph).length() == 0
 					and first_ok
 					and second_ok
 				)
@@ -767,7 +827,7 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 					check_plan.args == ["check", "--no-format", root]
 					and check_plan.options.paths.length() == 1
 					and graph.roots.length() == 1
-					and graph.modules.length() == 0
+					and non_std_graph_modules(graph).length() == 0
 					and source_ok
 				)
 			CliRunDelegate(_):
@@ -1637,7 +1697,8 @@ func test_run_cli_parses_compile_source_before_delegation() -> Bool:
 								and graph_source_ast_phase(source) == "typecheck_source"
 								and graph_source_decl_count(source) == 1
 								and graph_source_diagnostic_count(source) == 0
-								and graph.modules.length() == 0
+								and non_std_graph_modules(graph).length() == 0
+								and graph_has_implicit_prelude(graph)
 							)
 						None:
 							False
@@ -1686,12 +1747,15 @@ func test_run_cli_discovers_compile_import_source_graph() -> Bool:
 			CliRunCompile(compile_plan):
 				graph = compile_plan.graph
 
-				match (graph.roots.get(0), graph.modules.get(0)):
+				non_std_modules = non_std_graph_modules(graph)
+				non_std_edges = non_std_source_import_edges(graph)
+
+				match (graph.roots.get(0), non_std_modules.get(0)):
 					(Some(root), Some(module)):
 						(
 							graph.roots.length() == 1
-							and graph.modules.length() == 1
-							and graph.import_edges.length() == 1
+							and non_std_modules.length() == 1
+							and non_std_edges.length() == 1
 							and graph_source_has_module_surface(root)
 							and graph_source_has_module_surface(module)
 							and module.path.ends_with("/blorp_cli_compile_graph_dep.brp")
@@ -1771,6 +1835,8 @@ func test_run_cli_preserves_import_spellings_for_same_path() -> Bool:
 		match plan:
 			CliRunCheck(check_plan):
 				graph = check_plan.graph
+				non_std_modules = non_std_graph_modules(graph)
+				non_std_edges = non_std_source_import_edges(graph)
 				var saw_dot_import: Bool = False
 				var saw_dotdot_import: Bool = False
 				var dot_resolved: Option[String] = None
@@ -1785,7 +1851,7 @@ func test_run_cli_preserves_import_spellings_for_same_path() -> Bool:
 						saw_dotdot_import = True
 						dotdot_resolved = edge.resolved_module
 
-				for module in graph.modules:
+				for module in non_std_modules:
 					if (
 						module.path.ends_with("/shared.brp")
 						and module.module_name.ends_with("/blorp_cli_import_spelling_graph/shared")
@@ -1800,8 +1866,8 @@ func test_run_cli_preserves_import_spellings_for_same_path() -> Bool:
 
 				(
 					graph.roots.length() == 2
-					and graph.modules.length() == 1
-					and graph.import_edges.length() == 2
+					and non_std_modules.length() == 1
+					and non_std_edges.length() == 2
 					and saw_dot_import
 					and saw_dotdot_import
 					and saw_shared_module
@@ -1961,10 +2027,12 @@ func test_run_cli_discovers_package_alias_source_graph() -> Bool:
 		match plan:
 			CliRunCompile(compile_plan):
 				graph = compile_plan.graph
+				non_std_modules = non_std_graph_modules(graph)
+				non_std_edges = non_std_source_import_edges(graph)
 				var saw_alias: Bool = False
 				var saw_internal: Bool = False
 
-				for module in graph.modules:
+				for module in non_std_modules:
 					if module.module_name == "sample_v1":
 						saw_alias = (
 							module.path.ends_with("/vendor/sample/src/sample.brp")
@@ -1979,8 +2047,8 @@ func test_run_cli_discovers_package_alias_source_graph() -> Bool:
 
 				(
 					graph.roots.length() == 1
-					and graph.modules.length() == 2
-					and graph.import_edges.length() == 2
+					and non_std_modules.length() == 2
+					and non_std_edges.length() == 2
 					and graph_has_source_package_context(graph, "sample_v1", "/vendor/sample/src")
 					and saw_alias
 					and saw_internal
@@ -2044,13 +2112,15 @@ func test_run_cli_discovers_pkg_root_source_graph() -> Bool:
 		match plan:
 			CliRunCompile(compile_plan):
 				graph = compile_plan.graph
+				non_std_modules = non_std_graph_modules(graph)
+				non_std_edges = non_std_source_import_edges(graph)
 
-				match graph.modules.get(0):
+				match non_std_modules.get(0):
 					Some(module):
 						(
 							graph.roots.length() == 1
-							and graph.modules.length() == 1
-							and graph.import_edges.length() == 1
+							and non_std_modules.length() == 1
+							and non_std_edges.length() == 1
 							and module.module_name == "pkg/local_math"
 							and module.path.ends_with("/pkg/local_math.brp")
 							and module.source_text == pkg_source
@@ -2596,6 +2666,10 @@ tests: TestSuite = {
 		(
 			"frontend graph uses configured std origin",
 			test_frontend_graph_uses_configured_std_origin,
+		),
+		(
+			"frontend graph uses embedded std without override",
+			test_frontend_graph_uses_embedded_std_without_override,
 		),
 		(
 			"expand check targets discovers sorted directory sources",

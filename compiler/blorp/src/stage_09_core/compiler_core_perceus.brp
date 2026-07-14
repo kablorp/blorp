@@ -2125,17 +2125,35 @@ private pure func summarize_constructor_length_match_uses(
 private pure func summarize_constructor_match_case_uses(
 	env: PerceusEnv,
 	name: String,
+	scrutinee_aliases_owner: Bool,
 	match_case: CoreConstructorMatchCase,
 ) -> OwnershipUseSummary:
 	if match_bindings_shadow(name, match_case.bindings):
 		NO_OWNERSHIP_USES
 	else:
-		summarize_constructor_match_body_uses(env, name, match_case.body)
+		body_uses: OwnershipUseSummary = summarize_constructor_match_body_uses(
+			env,
+			name,
+			match_case.body,
+		)
+		uses_borrowed_binding: Bool = (
+			scrutinee_aliases_owner
+			and constructor_match_body_uses_borrowed_binding(match_case.bindings, match_case.body)
+		)
+
+		if uses_borrowed_binding:
+			ownership_uses_with_returns_alias(
+				seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
+				body_uses.returns_alias,
+			)
+		else:
+			body_uses
 
 
 private pure func summarize_constructor_match_branch_uses(
 	env: PerceusEnv,
 	name: String,
+	scrutinee_aliases_owner: Bool,
 	cases: List[CoreConstructorMatchCase],
 	fallback: CoreConstructorMatchFallback,
 ) -> OwnershipUseSummary:
@@ -2146,6 +2164,7 @@ private pure func summarize_constructor_match_branch_uses(
 			summarize_constructor_match_case_uses(
 				env,
 				name,
+				scrutinee_aliases_owner,
 				match_case,
 			),
 		)
@@ -2157,7 +2176,21 @@ private pure func summarize_constructor_match_branch_uses(
 			if match_bindings_shadow(name, bindings):
 				branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
 			else:
-				branch_uses = branch_uses.append(summarize_linear_ownership_uses(env, name, body))
+				body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
+				uses_borrowed_binding: Bool = (
+					scrutinee_aliases_owner
+					and match_branch_uses_borrowed_binding(bindings, body)
+				)
+
+				branch_uses = branch_uses.append(
+					if uses_borrowed_binding:
+						ownership_uses_with_returns_alias(
+							seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
+							body_uses.returns_alias,
+						)
+					else:
+						body_uses
+				)
 		ConstructorMatchFallbackFail:
 			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
 
@@ -2376,11 +2409,18 @@ private pure func summarize_linear_ownership_uses(
 					ownership_uses_with_returns_alias(body_uses, False),
 				)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, name, scrutinee)
 			summarize_match_ownership_uses(
 				env,
 				name,
 				scrutinee,
-				summarize_constructor_match_branch_uses(env, name, cases, fallback),
+				summarize_constructor_match_branch_uses(
+					env,
+					name,
+					scrutinee_aliases_owner,
+					cases,
+					fallback,
+				),
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			summarize_match_ownership_uses(
@@ -3305,6 +3345,66 @@ private pure func balance_terminal_branch_body(
 		prepend_drops(pre_drops, variable, value_type, balanced_body)
 
 
+private pure func match_branch_uses_borrowed_binding(
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> Bool:
+	var uses_borrowed_binding: Bool = False
+
+	for binding in bindings:
+		if binding.mode == MatchBorrowBindingMode and count_uses(binding.variable.name, body) > 0:
+			uses_borrowed_binding = True
+			break
+		else:
+			void
+
+	uses_borrowed_binding
+
+
+private pure func constructor_match_body_uses_borrowed_binding(
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	var uses_borrowed_binding: Bool = False
+
+	for binding in bindings:
+		if (
+			binding.mode == MatchBorrowBindingMode
+			and count_uses_in_constructor_match_body(binding.variable.name, body) > 0
+		):
+			uses_borrowed_binding = True
+			break
+		else:
+			void
+
+	uses_borrowed_binding
+
+
+-- A borrowed payload aliases the matched owner until the payload is retained.
+-- Model that dependency at the end of the branch so an earlier owner consume
+-- reserves a second reference, and keep balancing from moving the final owner
+-- drop inside control flow ahead of the payload use.
+private pure func balance_borrowed_match_branch_body(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	available_refs: Int,
+	uses_borrowed_binding: Bool,
+	body: CoreExpr,
+) -> CoreExpr:
+	body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, body)
+
+	if uses_borrowed_binding:
+		branch_uses: OwnershipUseSummary = ownership_uses_with_returns_alias(
+			seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
+			body_uses.returns_alias,
+		)
+
+		balance_terminal_branch_body(variable, value_type, available_refs, branch_uses, body)
+	else:
+		balance_branch_body(env, variable, value_type, available_refs, body_uses, body)
+
+
 private pure func balance_terminal_constructor_match(
 	env: PerceusEnv,
 	variable: CoreVar,
@@ -3357,41 +3457,20 @@ private pure func balance_terminal_constructor_match(
 		for match_case in cases:
 			match match_case.body:
 				ConstructorMatchBodyExpr(leaf):
-					var uses_borrowed_binding: Bool = False
-
-					if scrutinee_is_direct_alias:
-						for binding in match_case.bindings:
-							if (
-								binding.mode == MatchBorrowBindingMode
-								and count_uses(binding.variable.name, leaf) > 0
-							):
-								uses_borrowed_binding = True
-								break
-							else:
-								void
-					else:
-						void
-
-					leaf_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-						env,
-						variable.name,
-						leaf,
+					uses_borrowed_binding: Bool = (
+						scrutinee_is_direct_alias
+						and match_branch_uses_borrowed_binding(match_case.bindings, leaf)
 					)
-
-					branch_uses: OwnershipUseSummary = if uses_borrowed_binding:
-						seq_ownership_uses(BORROW_OWNERSHIP_USE, leaf_uses)
-					else:
-						leaf_uses
 
 					balanced_cases = balanced_cases.append(
 						{ match_case |
 							body = ConstructorMatchBodyExpr(
-								balance_branch_body(
+								balance_borrowed_match_branch_body(
 									env,
 									copy_core_var(variable),
 									copy_core_type(value_type),
 									available_after_scrutinee,
-									branch_uses,
+									uses_borrowed_binding,
 									leaf,
 								),
 							)
@@ -3419,40 +3498,19 @@ private pure func balance_terminal_constructor_match(
 					),
 				)
 			ConstructorMatchFallbackBindings(bindings, leaf):
-				var uses_borrowed_binding: Bool = False
-
-				if scrutinee_is_direct_alias:
-					for binding in bindings:
-						if (
-							binding.mode == MatchBorrowBindingMode
-							and count_uses(binding.variable.name, leaf) > 0
-						):
-							uses_borrowed_binding = True
-							break
-						else:
-							void
-				else:
-					void
-
-				leaf_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-					env,
-					variable.name,
-					leaf,
+				uses_borrowed_binding: Bool = (
+					scrutinee_is_direct_alias
+					and match_branch_uses_borrowed_binding(bindings, leaf)
 				)
-
-				branch_uses: OwnershipUseSummary = if uses_borrowed_binding:
-					seq_ownership_uses(BORROW_OWNERSHIP_USE, leaf_uses)
-				else:
-					leaf_uses
 
 				ConstructorMatchFallbackBindings(
 					bindings,
-					balance_branch_body(
+					balance_borrowed_match_branch_body(
 						env,
 						copy_core_var(variable),
 						copy_core_type(value_type),
 						available_after_scrutinee,
-						branch_uses,
+						uses_borrowed_binding,
 						leaf,
 					),
 				)
@@ -7088,6 +7146,63 @@ private pure func protect_repeated_consumes(
 				prepend_dups(uses.consumed_refs, target, target_type, binary)
 			else:
 				binary
+		UnaryExpr(op, inner, typ, loc):
+			UnaryExpr(
+				op,
+				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
+				copy_core_type(typ),
+				loc,
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			LogicalExpr(
+				op,
+				protect_repeated_consumes(env, target, target_type, left, in_repeated_context),
+				protect_repeated_consumes(env, target, target_type, right, in_repeated_context),
+				copy_core_type(typ),
+				loc,
+			)
+		CastExpr(inner, typ, loc):
+			CastExpr(
+				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
+				copy_core_type(typ),
+				loc,
+			)
+		BoxExpr(box, typ, loc):
+			BoxExpr(
+				{ box |
+					value = protect_repeated_consumes(
+						env,
+						target,
+						target_type,
+						box.value,
+						in_repeated_context,
+					),
+					source_type = copy_core_type(box.source_type)
+				},
+				copy_core_type(typ),
+				loc,
+			)
+		UnboxExpr(kind, inner, typ, loc):
+			UnboxExpr(
+				kind,
+				protect_repeated_consumes(env, target, target_type, inner, in_repeated_context),
+				copy_core_type(typ),
+				loc,
+			)
+		FieldExpr(owner, field, typ, loc):
+			FieldExpr(
+				protect_repeated_consumes(env, target, target_type, owner, in_repeated_context),
+				field,
+				copy_core_type(typ),
+				loc,
+			)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			TupleFieldExpr(
+				protect_repeated_consumes(env, target, target_type, owner, in_repeated_context),
+				field_index,
+				copy_core_type(typ),
+				loc,
+			)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
 				protect_repeated_aggregate_exprs(
@@ -8860,7 +8975,10 @@ private pure func retain_mutable_match_branch_results(
 ) -> CoreExpr:
 	match expr:
 		SeqExpr(first, second):
-			SeqExpr(first, retain_mutable_match_branch_results(env, param, second))
+			SeqExpr(
+				first,
+				retain_mutable_match_branch_results(env, param, second),
+			)
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			if variable.name == param.name.name:
 				LetExpr(variable, is_mutable, typ, rhs, body)
@@ -8930,6 +9048,7 @@ private pure func rewrite_managed_let(
 ) -> CoreExpr:
 	owned_rhs: CoreExpr = normalize_binding_alias_rhs(env, bind_type, rhs)
 	rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, owned_rhs)
+
 	branch_safe_body: CoreExpr = if is_mutable:
 		retain_mutable_match_branch_results(
 			env,
@@ -8942,6 +9061,7 @@ private pure func rewrite_managed_let(
 		)
 	else:
 		body
+
 	rewritten_body: CoreExpr = insert_drops_expr_inner(env, branch_safe_body)
 	managed_binding: Bool = not is_immortal_closure_expr(env, owned_rhs)
 

@@ -22,22 +22,145 @@ import:
 		SemanticMiddleStage,
 		decode_semantic_middle_response_value,
 		parse_semantic_middle_stage,
-	../stage_10_backend/compiler_artifact_json: CArtifact
+	../stage_10_backend/compiler_build_artifact:
+		BuildArtifact,
+		BuildArtifactConfiguration,
+		BuildArtifactError(InvalidForeignLinkArguments, UnsupportedForeignLinkPlatform),
+		BuildCompatibility,
+		BuildNativeFeature(BuildRaylib, BuildTls),
+		BuildOptimization(BuildFast, BuildRelease),
+		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
+		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer, BuildUndefinedSanitizer),
+		build_artifact,
 	../stage_10_backend/compiler_core_emit:
 		try_emit_core_program_c_artifact_with_options,
 		unsupported_global_initializer_error_to_string,
+	compiler_cli_args: CliCompileArgs, CliRunArgs
 	compiler_cli_compile_frontend: compile_frontend_graph
-	compiler_cli_plan: CliCompilePlan, CliRunSourcePlan
+	compiler_cli_plan:
+		CliCompilePlan,
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule),
+		CliRunSourcePlan,
 	json: JsonValue
 
 
 union CliCompileExecution:
 	CliCompileFrontendFailed(List[String])
-	CliCompileArtifact(SemanticMiddleRequest, CArtifact)
+	CliCompileArtifact(SemanticMiddleRequest, BuildArtifact)
 	CliCompileStopped(SemanticMiddleRequest, SemanticMiddleStage, String, List[SemanticMiddleObservation])
 	CliCompileSemanticFailed(SemanticMiddleRequest, List[SemanticMiddleDiagnostic])
 	CliCompileProtocolFailed(SemanticMiddleRequest, String)
 	CliCompileEmitFailed(SemanticMiddleRequest, String)
+	CliCompileBuildArtifactFailed(SemanticMiddleRequest, String)
+
+
+private RAYLIB_PACKAGE_ID: String = "raylib"
+
+private TLS_STD_MODULE: String = "std/net/tls"
+
+
+private pure func source_native_features(
+	source: CliFrontendGraphSource,
+) -> List[BuildNativeFeature]:
+	raylib_features: List[BuildNativeFeature] = match source.origin:
+		CliFrontendPkgModule(package_id):
+			if package_id == RAYLIB_PACKAGE_ID:
+				[BuildRaylib]
+			else:
+				[]
+		_:
+			[]
+
+	tls_features: List[BuildNativeFeature] = match source.origin:
+		CliFrontendStdModule:
+			if source.module_name == TLS_STD_MODULE:
+				[BuildTls]
+			else:
+				[]
+		_:
+			[]
+
+	raylib_features.concat(tls_features)
+
+
+pure func graph_native_features(graph: CliFrontendModuleGraph) -> List[BuildNativeFeature]:
+	graph.roots
+		.concat(graph.modules)
+		.flat_map(source_native_features)
+		.unique()
+
+
+private pure func compile_runtime_requirement(options: CliCompileArgs) -> BuildRuntimeRequirement:
+	if options.embed_runtime:
+		BuildEmbeddedRuntime
+	else:
+		BuildExternalRuntime
+
+
+private pure func run_sanitizer(options: CliRunArgs) -> BuildSanitizer:
+	match options.sanitizer:
+		Some(CliSanitizeAddressUndefined):
+			BuildAddressUndefinedSanitizer
+		Some(CliSanitizeUndefined):
+			BuildUndefinedSanitizer
+		Some(CliSanitizeOff):
+			BuildNoSanitizer
+		None:
+			BuildNoSanitizer
+
+
+private pure func compile_compatibility(options: CliCompileArgs) -> BuildCompatibility:
+	{
+		debug = options.debug,
+		profile = False,
+		optimization = BuildFast,
+		sanitizer = BuildNoSanitizer,
+		leak_check = False
+	}
+
+
+private pure func run_optimization(options: CliRunArgs) -> BuildOptimization:
+	if options.release:
+		BuildRelease
+	else:
+		BuildFast
+
+
+private pure func run_compatibility(options: CliRunArgs) -> BuildCompatibility:
+	{
+		debug = options.debug,
+		profile = options.profile,
+		optimization = run_optimization(options),
+		sanitizer = run_sanitizer(options),
+		leak_check = options.leak_check
+	}
+
+
+private pure func artifact_configuration(
+	request: SemanticMiddleRequest,
+	graph: CliFrontendModuleGraph,
+	runtime_requirement: BuildRuntimeRequirement,
+	compatibility: BuildCompatibility,
+) -> BuildArtifactConfiguration:
+	{
+		runtime_requirement = runtime_requirement,
+		native_features = graph_native_features(graph),
+		source = {
+			path = request.target.path,
+			module_name = request.target.module_name
+		},
+		compatibility = compatibility
+	}
+
+
+private pure func build_artifact_error_message(error: BuildArtifactError) -> String:
+	match error:
+		InvalidForeignLinkArguments(arguments):
+			"invalid foreign link arguments in semantic Core: `${arguments}`"
+		UnsupportedForeignLinkPlatform(platform):
+			"unsupported foreign link platform in semantic Core: `${platform}`"
 
 
 private pure func semantic_observation_stages(
@@ -85,15 +208,25 @@ private pure func semantic_protocol_error_message(error: SemanticMiddleProtocolE
 private pure func finish_compile_execution(
 	request: SemanticMiddleRequest,
 	response_value: JsonValue,
-	profile: Bool,
+	configuration: BuildArtifactConfiguration,
 ) -> CliCompileExecution:
 	match decode_semantic_middle_response_value(response_value):
 		Ok(response):
 			match response:
 				SemanticMiddleCompiled(core, _):
-					match try_emit_core_program_c_artifact_with_options(core, {profile = profile}):
-						Ok(artifact):
-							CliCompileArtifact(request, artifact)
+					match try_emit_core_program_c_artifact_with_options(
+						core,
+						{profile = configuration.compatibility.profile},
+					):
+						Ok(emission):
+							match build_artifact(core, emission, configuration):
+								Ok(artifact):
+									CliCompileArtifact(request, artifact)
+								Err(error):
+									CliCompileBuildArtifactFailed(
+										request,
+										build_artifact_error_message(error),
+									)
 						Err(error):
 							CliCompileEmitFailed(
 								request,
@@ -120,7 +253,16 @@ pure func execute_compile_plan(
 		semantic_stop_stage(plan.options.stop_after),
 	):
 		Ok(request):
-			finish_compile_execution(request, response_value, False)
+			finish_compile_execution(
+				request,
+				response_value,
+				artifact_configuration(
+					request,
+					plan.graph,
+					compile_runtime_requirement(plan.options),
+					compile_compatibility(plan.options),
+				),
+			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)
 
@@ -131,6 +273,15 @@ pure func execute_run_plan(
 ) -> CliCompileExecution:
 	match compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None):
 		Ok(request):
-			finish_compile_execution(request, response_value, plan.options.profile)
+			finish_compile_execution(
+				request,
+				response_value,
+				artifact_configuration(
+					request,
+					plan.graph,
+					BuildExternalRuntime,
+					run_compatibility(plan.options),
+				),
+			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)

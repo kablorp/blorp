@@ -16,7 +16,11 @@ import:
 			ConstructorMatchBodyLiteral,
 		),
 		CoreConstructorMatchCase,
-		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
 		CoreConstructorMatchTest(EnumConstructorTest, UnionTagConstructorTest),
 		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
@@ -40,6 +44,7 @@ import:
 			ResourceScopeExpr,
 			SeqExpr,
 			TupleExpr,
+			UnaryExpr,
 			UnboxExpr,
 			VarExpr,
 			VoidExpr,
@@ -74,6 +79,7 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
+		CoreUnaryOp(NotOp),
 		CoreUnboxKind(PointerUnbox),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
@@ -886,6 +892,20 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
 		BinaryExpr(op, left, right, typ, loc):
 			dup_count_for(name, left) + dup_count_for(name, right)
+		UnaryExpr(op, inner, typ, loc):
+			dup_count_for(name, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			dup_count_for(name, left) + dup_count_for(name, right)
+		CastExpr(inner, typ, loc):
+			dup_count_for(name, inner)
+		BoxExpr(box, typ, loc):
+			dup_count_for(name, box.value)
+		UnboxExpr(kind, inner, typ, loc):
+			dup_count_for(name, inner)
+		FieldExpr(owner, field, typ, loc):
+			dup_count_for(name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			dup_count_for(name, owner)
 		CallExpr(kind, callee, args, typ, loc):
 			dup_count_for(name, callee) + dup_count_in_args(name, args)
 		AssignExpr(variable, rhs, typ, loc):
@@ -1001,6 +1021,95 @@ pure func dup_count_in_constructor_literal_match(
 		name,
 		match_expr.cases,
 	) + dup_count_in_literal_fallback(name, match_expr.fallback)
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_body(
+	owner: String,
+	payload: String,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			owner_drop_wraps_payload_dup(owner, payload, expr)
+		_:
+			False
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_cases(
+	owner: String,
+	payload: String,
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	cases.any(func(match_case):
+		owner_drop_wraps_payload_dup_in_constructor_body(owner, payload, match_case.body)
+	)
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_fallback(
+	owner: String,
+	payload: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		ConstructorMatchFallbackBindings(_, body):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		ConstructorMatchFallbackFail:
+			False
+
+
+pure func owner_drop_wraps_payload_dup_in_exprs(
+	owner: String,
+	payload: String,
+	exprs: List[CoreExpr],
+) -> Bool:
+	exprs.any(func(expr): owner_drop_wraps_payload_dup(owner, payload, expr))
+
+
+pure func owner_drop_wraps_payload_dup(owner: String, payload: String, expr: CoreExpr) -> Bool:
+	match expr:
+		DropExpr(variable, _, _, body, _, _):
+			(
+				variable.name == owner and dup_count_for(payload, body) > 0
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		DupExpr(_, _, _, body, _, _):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		LetExpr(_, _, _, rhs, body):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, rhs)
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		BorrowLetExpr(_, _, rhs, body):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, rhs)
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		SeqExpr(first, second):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, first)
+				or owner_drop_wraps_payload_dup(owner, payload, second)
+			)
+		IfExpr(cond, then_expr, else_expr, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, cond)
+				or owner_drop_wraps_payload_dup(owner, payload, then_expr)
+				or owner_drop_wraps_payload_dup(owner, payload, else_expr)
+			)
+		CallExpr(_, callee, args, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, callee)
+				or owner_drop_wraps_payload_dup_in_exprs(owner, payload, args)
+			)
+		ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, scrutinee)
+				or owner_drop_wraps_payload_dup_in_constructor_cases(owner, payload, cases)
+				or owner_drop_wraps_payload_dup_in_constructor_fallback(owner, payload, fallback)
+			)
+		_:
+			False
 
 
 pure func dup_count_in_constructor_length_branch(
@@ -4178,6 +4287,60 @@ pure func test_consuming_while_body_retains_owner_for_each_iteration() -> Bool:
 	)
 
 
+pure func test_consuming_user_call_in_while_retains_function_parameter() -> Bool:
+	consume_decl: CoreDecl = function_decl(
+		"consume_for_check",
+		220,
+		[core_param("value", list_int_type())],
+		bool_type(),
+		SeqExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("value", list_int_type())],
+				list_int_type(),
+			),
+			bool_expr(True),
+		),
+	)
+	loop: CoreExpr = WhileExpr(
+		bool_expr(True),
+		UnaryExpr(
+			NotOp,
+			user_call_expr(
+				"consume_for_check",
+				Some(220),
+				[0],
+				[var_expr("items", list_int_type())],
+				bool_type(),
+			),
+			bool_type(),
+			SyntheticSourceLoc,
+		),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	caller_decl: CoreDecl = function_decl(
+		"check_repeatedly",
+		221,
+		[core_param("items", list_int_type())],
+		void_type(),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume_decl, caller_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "check_repeatedly"):
+		Some(body):
+			expr_has_while_body_dup("items", body)
+		None:
+			False
+
+
 pure func test_consuming_match_branch_in_loop_retains_owner_for_each_iteration() -> Bool:
 	consume: CoreExpr = intrinsic_expr(
 		"list_ensure_unique",
@@ -5814,6 +5977,138 @@ pure func test_borrowed_match_binding_is_retained_for_inferred_consuming_call() 
 			False
 
 
+pure func test_consumed_parameter_owner_outlives_borrowed_match_payload_retain() -> Bool:
+	pattern_type: CoreType = UnionType("Pattern")
+	tag_type: CoreType = UnionType("Tag")
+	payload_type: CoreType = list_int_type()
+	payload_binding: CoreMatchBinding = {
+		variable = named_var("payload"),
+		typ = payload_type,
+		accessor = VariantFieldAccessor(RootAccessor, "Tag", "Some", 0),
+		mode = MatchBorrowBindingMode
+	}
+	take_tag: CoreDecl = function_decl(
+		"take_tag",
+		225,
+		[core_param("value", tag_type)],
+		tag_type,
+		var_expr("value", tag_type),
+	)
+	take_payload: CoreDecl = function_decl(
+		"take_payload",
+		226,
+		[core_param("value", payload_type)],
+		payload_type,
+		intrinsic_expr("list_ensure_unique", [var_expr("value", payload_type)], payload_type),
+	)
+	consume_owner: CoreExpr = LetExpr(
+		named_var("taken_tag"),
+		False,
+		tag_type,
+		user_call_expr("take_tag", Some(225), [], [var_expr("actual", tag_type)], tag_type),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	consume_payload: CoreExpr = LetExpr(
+		named_var("taken_payload"),
+		False,
+		payload_type,
+		user_call_expr(
+			"take_payload",
+			Some(226),
+			[],
+			[var_expr("payload", payload_type)],
+			payload_type,
+		),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	inspect_payload: CoreExpr = ConstructorMatchExpr(
+		var_expr("actual", tag_type),
+		NoReleasePolicy,
+		[constructor_case(
+				"Some",
+				[payload_binding],
+				IfExpr(
+					bool_expr(True),
+					consume_payload,
+					VoidExpr(void_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		ConstructorMatchFallbackBody(VoidExpr(void_type(), SyntheticSourceLoc)),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	match_body: CoreExpr = ConstructorMatchExpr(
+		var_expr("pattern", pattern_type),
+		NoReleasePolicy,
+		[constructor_case(
+				"PatternNamed",
+				[],
+				IfExpr(
+					bool_expr(True),
+					consume_owner,
+					inspect_payload,
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		ConstructorMatchFallbackBody(VoidExpr(void_type(), SyntheticSourceLoc)),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("actual"),
+		False,
+		tag_type,
+		var_expr("source", tag_type),
+		match_body,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			UnionDecl({
+				name = "Pattern",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("PatternVar", 0, None, []),
+					union_variant("PatternNamed", 1, None, []),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			UnionDecl({
+				name = "Tag",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("Some", 0, None, [union_field(payload_type)]),
+					union_variant("None", 1, None, []),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			take_tag,
+			take_payload,
+			function_decl(
+				"bind_payload",
+				227,
+				[core_param("pattern", pattern_type)],
+				void_type(),
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "bind_payload"):
+		Some(rewritten):
+			(
+				dup_count_for("payload", rewritten) == 1
+				and not owner_drop_wraps_payload_dup("actual", "payload", rewritten)
+			)
+		None:
+			False
+
+
 pure func test_nested_aggregate_call_retains_borrowed_match_binding() -> Bool:
 	payload_type: CoreType = list_int_type()
 	span_type: CoreType = HeapRecordType("Span")
@@ -6276,6 +6571,10 @@ tests: TestSuite = {
 			test_consuming_while_body_retains_owner_for_each_iteration,
 		),
 		(
+			"consuming user call in while retains function parameter",
+			test_consuming_user_call_in_while_retains_function_parameter,
+		),
+		(
 			"consuming match branch in loop retains owner for each iteration",
 			test_consuming_match_branch_in_loop_retains_owner_for_each_iteration,
 		),
@@ -6450,6 +6749,10 @@ tests: TestSuite = {
 		(
 			"borrowed match binding is retained for inferred consuming call",
 			test_borrowed_match_binding_is_retained_for_inferred_consuming_call,
+		),
+		(
+			"consumed parameter owner outlives borrowed match payload retain",
+			test_consumed_parameter_owner_outlives_borrowed_match_payload_retain,
 		),
 		(
 			"nested aggregate call retains borrowed match binding",

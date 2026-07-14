@@ -1,0 +1,183 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreDecl(FunctionDecl),
+		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunctionKind(ForeignFunction),
+		CoreProgram,
+		CoreSourceLoc(KnownSourceLoc),
+		CoreType(NamedType),
+	../src/stage_10_backend/compiler_build_artifact:
+		BuildArtifactConfiguration,
+		BuildArtifactError(UnsupportedForeignLinkPlatform),
+		BuildNativeFeature(BuildRaylib, BuildTls),
+		BuildOptimization(BuildRelease),
+		BuildPlatform(BuildLinux, BuildMacos),
+		BuildRuntimeRequirement(BuildExternalRuntime),
+		BuildSanitizer(BuildAddressUndefinedSanitizer),
+		CArtifact,
+		build_artifact,
+		build_c_invocation,
+	test: TestSuite
+
+
+private pure func artifact_configuration() -> BuildArtifactConfiguration:
+	{
+		runtime_requirement = BuildExternalRuntime,
+		native_features = [BuildRaylib, BuildTls, BuildRaylib],
+		source = {
+			path = "/project/src/main.brp",
+			module_name = "main"
+		},
+		compatibility = {
+			debug = True,
+			profile = True,
+			optimization = BuildRelease,
+			sanitizer = BuildAddressUndefinedSanitizer,
+			leak_check = False
+		}
+	}
+
+
+private pure func foreign_program(platform: String) -> CoreProgram:
+	{
+		decls = [
+			FunctionDecl({
+				name = "native_call",
+				source_module = Some("native"),
+				type_params = [],
+				params = [],
+				return_type = NamedType("Void", []),
+				body = None,
+				is_pure = False,
+				function_kind = ForeignFunction({
+					c_name = "native_call",
+					includes = ["native.h"],
+					link_flags = [
+						{
+							platform = None,
+							flag = "-lbase -pthread"
+						},
+						{
+							platform = Some("macos"),
+							flag = "-framework Cocoa"
+						},
+						{
+							platform = Some(platform),
+							flag = "-L/opt/lib -lplatform"
+						},
+					],
+					arg_passing = ForeignBorrowArgs,
+				}),
+				def_id = 1,
+				loc = KnownSourceLoc({
+					file = "/project/src/native.brp",
+					line = 1,
+					column = 1,
+					end_line = 3,
+					end_column = 1,
+				}),
+			}),
+		],
+		foreign_includes = ["native.h"]
+	}
+
+
+private pure func raw_artifact() -> CArtifact:
+	{
+		c_code = "int main(void) { return 0; }\n",
+		link_flags = ["-lm"],
+		include_dirs = ["generated/include"]
+	}
+
+
+pure func test_collects_ordered_foreign_build_requirements() -> Bool:
+	match build_artifact(foreign_program("linux"), raw_artifact(), artifact_configuration()):
+		Ok(artifact):
+			(
+				artifact.link_arguments.map(
+					func(
+						argument,
+					): argument.value,
+				) == [
+					"-lm",
+					"-lbase",
+					"-pthread",
+					"-framework",
+					"Cocoa",
+					"-L/opt/lib",
+					"-lplatform",
+				]
+				and artifact.include_dirs == ["generated/include", "/project/src"]
+				and artifact.native_features == [BuildRaylib, BuildTls]
+			)
+		Err(_):
+			False
+
+
+pure func test_build_c_invocation_filters_without_losing_argument_boundaries() -> Bool:
+	match build_artifact(foreign_program("linux"), raw_artifact(), artifact_configuration()):
+		Ok(artifact):
+			invocation = build_c_invocation(artifact, BuildMacos)
+
+			(
+				invocation.include_arguments == ["-Igenerated/include", "-I/project/src"]
+				and invocation.link_arguments == [
+					"-lm",
+					"-lbase",
+					"-pthread",
+					"-framework",
+					"Cocoa",
+				]
+				and invocation.source.path == artifact.source.path
+				and invocation.source.module_name == artifact.source.module_name
+				and invocation.compatibility.debug == artifact.compatibility.debug
+				and invocation.compatibility.profile == artifact.compatibility.profile
+				and invocation.compatibility.optimization == artifact.compatibility.optimization
+				and invocation.compatibility.sanitizer == artifact.compatibility.sanitizer
+				and invocation.compatibility.leak_check == artifact.compatibility.leak_check
+			)
+		Err(_):
+			False
+
+
+pure func test_rejects_unknown_foreign_platform() -> Bool:
+	match build_artifact(foreign_program("windows"), raw_artifact(), artifact_configuration()):
+		Err(UnsupportedForeignLinkPlatform(platform)):
+			platform == "windows"
+		_:
+			False
+
+
+pure func test_trims_validated_foreign_link_groups() -> Bool:
+	artifact: CArtifact = {
+		c_code = "int main(void) { return 0; }\n",
+		link_flags = ["  -lm -pthread  "],
+		include_dirs = []
+	}
+
+	match build_artifact(
+		{ decls = [], foreign_includes = [] },
+		artifact,
+		artifact_configuration(),
+	):
+		Ok(result):
+			result.link_arguments.map(func(argument): argument.value) == ["-lm", "-pthread"]
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler build artifact",
+	tests = [
+		(
+			"collects ordered foreign build requirements",
+			test_collects_ordered_foreign_build_requirements,
+		),
+		(
+			"build invocation preserves argument boundaries",
+			test_build_c_invocation_filters_without_losing_argument_boundaries,
+		),
+		("rejects unknown foreign platform", test_rejects_unknown_foreign_platform),
+		("trims validated foreign link groups", test_trims_validated_foreign_link_groups),
+	]
+}

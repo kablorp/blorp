@@ -1,0 +1,313 @@
+-- Complete, effect-free build boundary produced after Core-to-C emission.
+--
+-- CArtifact remains the temporary raw-emission shape used by the OCaml
+-- bridge. BuildArtifact is the durable boundary: all later command policy is
+-- derived from its values without consulting compiler-global module state.
+import:
+	../stage_09_core/compiler_core_json:
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreForeignLinkFlag,
+		CoreFunction,
+		CoreFunctionKind(ForeignFunction),
+		CoreProgram,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+	path: dirname
+
+
+record CArtifact {
+	c_code: String,
+	link_flags: List[String],
+	include_dirs: List[String]
+}
+
+
+enum BuildPlatform:
+	BuildLinux
+	BuildMacos
+
+
+record BuildLinkArgument {
+	platform: Option[BuildPlatform],
+	value: String
+}
+
+
+enum BuildRuntimeRequirement:
+	BuildEmbeddedRuntime
+	BuildExternalRuntime
+
+
+enum BuildNativeFeature:
+	BuildRaylib
+	BuildTls
+
+
+record BuildSourceIdentity {
+	path: String,
+	module_name: String
+}
+
+
+enum BuildOptimization:
+	BuildFast
+	BuildRelease
+
+
+enum BuildSanitizer:
+	BuildNoSanitizer
+	BuildAddressUndefinedSanitizer
+	BuildUndefinedSanitizer
+
+
+record BuildCompatibility {
+	debug: Bool,
+	profile: Bool,
+	optimization: BuildOptimization,
+	sanitizer: BuildSanitizer,
+	leak_check: Bool
+}
+
+
+record BuildArtifact {
+	c_code: String,
+	link_arguments: List[BuildLinkArgument],
+	include_dirs: List[String],
+	runtime_requirement: BuildRuntimeRequirement,
+	native_features: List[BuildNativeFeature],
+	source: BuildSourceIdentity,
+	compatibility: BuildCompatibility
+}
+
+
+record BuildArtifactConfiguration {
+	runtime_requirement: BuildRuntimeRequirement,
+	native_features: List[BuildNativeFeature],
+	source: BuildSourceIdentity,
+	compatibility: BuildCompatibility
+}
+
+
+union BuildArtifactError:
+	InvalidForeignLinkArguments(String)
+	UnsupportedForeignLinkPlatform(String)
+
+
+-- The platform-filtered argv contribution for Checkpoint G's C compiler
+-- process request. It deliberately contains no executable or output path:
+-- those are effect-site choices, not properties of the emitted program.
+record BuildCInvocation {
+	c_code: String,
+	include_arguments: List[String],
+	link_arguments: List[String],
+	runtime_requirement: BuildRuntimeRequirement,
+	native_features: List[BuildNativeFeature],
+	source: BuildSourceIdentity,
+	compatibility: BuildCompatibility
+}
+
+
+private record ForeignBuildMetadata {
+	link_arguments: List[BuildLinkArgument],
+	include_dirs: List[String]
+}
+
+
+private pure func append_unique_string(values: List[String], value: String) -> List[String]:
+	if values.contains(value):
+		values
+	else:
+		values.append(value)
+
+
+private pure func build_platform(platform: String) -> Result[BuildPlatform, BuildArtifactError]:
+	match platform:
+		"linux":
+			Ok(BuildLinux)
+		"macos":
+			Ok(BuildMacos)
+		_:
+			Err(UnsupportedForeignLinkPlatform(platform))
+
+
+private pure func optional_build_platform(
+	platform: Option[String],
+) -> Result[Option[BuildPlatform], BuildArtifactError]:
+	match platform:
+		Some(name):
+			build_platform(name).map(func(value: BuildPlatform): Some(value))
+		None:
+			Ok(None)
+
+
+-- Foreign metadata is validated by typechecking before Core lowering. Split
+-- the temporary legacy group exactly once as it enters BuildArtifact; all
+-- downstream policy retains each compiler argv item independently.
+private pure func link_group_arguments(
+	platform: Option[BuildPlatform],
+	group: String,
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	normalized: String = group.trim()
+	values: List[String] = normalized.split(" ")
+
+	if normalized == "" or values.any(func(value): value == ""):
+		Err(InvalidForeignLinkArguments(group))
+	else:
+		Ok(values.map(
+			func(value): {
+				platform = platform,
+				value = value
+			},
+		))
+
+
+private pure func append_link_group(
+	arguments: List[BuildLinkArgument],
+	platform: Option[BuildPlatform],
+	group: String,
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	group_arguments ?= link_group_arguments(platform, group)
+	Ok(arguments.concat(group_arguments))
+
+
+private pure func source_include_dirs(function_info: CoreFunction) -> List[String]:
+	match function_info.function_kind:
+		ForeignFunction(foreign_info):
+			if foreign_info.includes.length() == 0:
+				[]
+			else:
+				match function_info.loc:
+					KnownSourceLoc(span):
+						[dirname(span.file)]
+					SyntheticSourceLoc:
+						[]
+		_:
+			[]
+
+
+private pure func append_foreign_function_metadata(
+	metadata: ForeignBuildMetadata,
+	function_info: CoreFunction,
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	match function_info.function_kind:
+		ForeignFunction(foreign_info):
+			link_arguments ?= append_foreign_link_flags(
+				metadata.link_arguments,
+				foreign_info.link_flags,
+			)
+
+			var include_dirs: List[String] = metadata.include_dirs
+
+			for include_dir in source_include_dirs(function_info):
+				include_dirs = append_unique_string(include_dirs, include_dir)
+
+			Ok({
+				link_arguments = link_arguments,
+				include_dirs = include_dirs,
+			})
+		_:
+			Ok(metadata)
+
+
+private pure func append_foreign_link_flags(
+	arguments: List[BuildLinkArgument],
+	link_flags: List[CoreForeignLinkFlag],
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	match link_flags:
+		[]:
+			Ok(arguments)
+		[link_flag, ...remaining]:
+			platform ?= optional_build_platform(link_flag.platform)
+			next ?= append_link_group(arguments, platform, link_flag.flag)
+			append_foreign_link_flags(next, remaining)
+
+
+private pure func append_impl_metadata(
+	metadata: ForeignBuildMetadata,
+	methods: List[CoreFunction],
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	match methods:
+		[]:
+			Ok(metadata)
+		[method, ...remaining]:
+			next ?= append_foreign_function_metadata(metadata, method)
+			append_impl_metadata(next, remaining)
+
+
+private pure func foreign_build_metadata(
+	decls: List[CoreDecl],
+	initial: ForeignBuildMetadata,
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	match decls:
+		[]:
+			Ok(initial)
+		[decl, ...remaining]:
+			match decl:
+				FunctionDecl(function_info):
+					next ?= append_foreign_function_metadata(initial, function_info)
+					foreign_build_metadata(remaining, next)
+				ImplDecl(impl_info):
+					next ?= append_impl_metadata(initial, impl_info.methods)
+					foreign_build_metadata(remaining, next)
+				_:
+					foreign_build_metadata(remaining, initial)
+
+
+private pure func raw_link_arguments(
+	link_flags: List[String],
+	arguments: List[BuildLinkArgument],
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	match link_flags:
+		[]:
+			Ok(arguments)
+		[link_flag, ...remaining]:
+			next ?= append_link_group(arguments, None, link_flag)
+			raw_link_arguments(remaining, next)
+
+
+pure func build_artifact(
+	program: CoreProgram,
+	emission: CArtifact,
+	configuration: BuildArtifactConfiguration,
+) -> Result[BuildArtifact, BuildArtifactError]:
+	initial_arguments ?= raw_link_arguments(emission.link_flags, [])
+
+	initial: ForeignBuildMetadata = {
+		link_arguments = initial_arguments,
+		include_dirs = emission.include_dirs.unique()
+	}
+	metadata ?= foreign_build_metadata(program.decls, initial)
+
+	Ok({
+		c_code = emission.c_code,
+		link_arguments = metadata.link_arguments,
+		include_dirs = metadata.include_dirs,
+		runtime_requirement = configuration.runtime_requirement,
+		native_features = configuration.native_features.unique(),
+		source = configuration.source,
+		compatibility = configuration.compatibility,
+	})
+
+
+private pure func link_argument_applies(
+	argument: BuildLinkArgument,
+	platform: BuildPlatform,
+) -> Bool:
+	match argument.platform:
+		Some(required_platform):
+			required_platform == platform
+		None:
+			True
+
+
+pure func build_c_invocation(artifact: BuildArtifact, platform: BuildPlatform) -> BuildCInvocation:
+	{
+		c_code = artifact.c_code,
+		include_arguments = artifact.include_dirs.map(func(include_dir): "-I${include_dir}"),
+		link_arguments = artifact.link_arguments
+			.filter(func(argument): link_argument_applies(argument, platform))
+			.map(func(argument): argument.value),
+		runtime_requirement = artifact.runtime_requirement,
+		native_features = artifact.native_features,
+		source = artifact.source,
+		compatibility = artifact.compatibility
+	}

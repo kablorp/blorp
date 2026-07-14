@@ -39,7 +39,7 @@ import:
 		),
 		CompilerExprTypeOrigin(CompilerSynthesizedOrigin),
 		CompilerResolvedCallInfo,
-		CompilerResolvedCallTarget(CompilerResolvedDirectCall),
+		CompilerResolvedCallTarget(CompilerResolvedClosureCall, CompilerResolvedDirectCall),
 		CompilerTypedAssignScope(CompilerLocalAssignScope),
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
@@ -56,6 +56,7 @@ import:
 			CompilerTypedIfExpr,
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedListExpr,
+			CompilerTypedLambdaExpr,
 			CompilerTypedLogicalExpr,
 			CompilerTypedMatchExpr,
 			CompilerTypedNameExpr,
@@ -71,6 +72,7 @@ import:
 			CompilerTypedWhileExpr,
 		),
 		CompilerTypedExprInfo,
+		CompilerTypedLambdaParam,
 		CompilerTypedMatchCase,
 		CompilerTypedPattern(CompilerTypedIntPattern, CompilerTypedNamePattern),
 		CompilerTypedRecordField,
@@ -86,7 +88,11 @@ import:
 		compiler_ctfe_context_empty,
 		compiler_ctfe_context_with_module_alias,
 		compiler_ctfe_context_with_module_global_env,
-	../src/stage_07_ctfe/compiler_ctfe_env: compiler_ctfe_bind_global_value, compiler_ctfe_env_empty
+	../src/stage_07_ctfe/compiler_ctfe_env:
+		compiler_ctfe_bind_global_value,
+		compiler_ctfe_bind_local_value,
+		compiler_ctfe_env_empty,
+		compiler_ctfe_has_local_bindings,
 	../src/stage_07_ctfe/compiler_ctfe_eval:
 		CompilerCtfeEvalError,
 		compiler_ctfe_eval_error_message,
@@ -97,6 +103,7 @@ import:
 			CompilerCtfeBoolValue,
 			CompilerCtfeConstructorValue,
 			CompilerCtfeFloatValue,
+			CompilerCtfeLambdaValue,
 			CompilerCtfeListValue,
 			CompilerCtfeRangeValue,
 			CompilerCtfeRecordValue,
@@ -148,6 +155,17 @@ pure func expr_info_for(typ: CompilerType) -> CompilerTypedExprInfo:
 
 pure func expr_info() -> CompilerTypedExprInfo:
 	expr_info_for(compiler_type_int())
+
+
+pure func lambda_expr() -> CompilerTypedExpr:
+	CompilerTypedLambdaExpr(
+		True,
+		[],
+		Some(compiler_type_int()),
+		int_expr("42"),
+		source_span(),
+		expr_info_for(CompilerFunctionType(True, [], compiler_type_int())),
+	)
 
 
 pure func void_expr_info() -> CompilerTypedExprInfo:
@@ -264,6 +282,48 @@ pure func imported_call_expr(
 		args,
 		source_span(),
 		expr_info_for_with_call(return_type, call),
+	)
+
+
+pure func lambda_call_expr() -> CompilerTypedExpr:
+	lambda_param: CompilerTypedLambdaParam = {
+		name = ident("value"),
+		source_type = Some(compiler_type_int()),
+		param_type = compiler_type_int()
+	}
+	body = CompilerTypedBinaryExpr(
+		ParsedAddOp,
+		name_expr("value"),
+		name_expr("offset"),
+		source_span(),
+		expr_info(),
+	)
+	lambda_type = CompilerFunctionType(True, [compiler_type_int()], compiler_type_int())
+	lambda = CompilerTypedLambdaExpr(
+		True,
+		[lambda_param],
+		Some(compiler_type_int()),
+		body,
+		source_span(),
+		expr_info_for(lambda_type),
+	)
+	call: CompilerResolvedCallInfo = {
+		callee_name = "<lambda>",
+		source_name = "<lambda>",
+		purity = CompilerPure,
+		target = CompilerResolvedClosureCall,
+		instantiated_params = [compiler_type_int()],
+		instantiated_return = compiler_type_int(),
+		resource_args = CompilerRejectResourceArgs,
+		dim_constraints = [],
+		loop_producer = None
+	}
+
+	CompilerTypedCallExpr(
+		lambda,
+		[int_expr("20")],
+		source_span(),
+		expr_info_for_with_call(compiler_type_int(), call),
 	)
 
 
@@ -1668,7 +1728,103 @@ func test_eval_imported_std_string_intrinsics() -> Bool:
 		),
 	)
 
-	length_ok and substring_ok and contains_ok and index_ok
+	upper_ok = value_equals(
+		compiler_ctfe_eval_typed_expr(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			imported_call_expr(
+				"std/string",
+				44,
+				"upper#44",
+				[string_expr("Blorp")],
+				compiler_type_string(),
+			),
+		),
+		compiler_ctfe_string(source_span(), "BLORP"),
+	)
+	lower_ok = value_equals(
+		compiler_ctfe_eval_typed_expr(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			imported_call_expr(
+				"std/string",
+				45,
+				"lower#45",
+				[string_expr("Blorp")],
+				compiler_type_string(),
+			),
+		),
+		compiler_ctfe_string(source_span(), "blorp"),
+	)
+
+	length_ok and substring_ok and contains_ok and index_ok and upper_ok and lower_ok
+
+
+func test_eval_imported_std_string_case_conversion_rejects_non_ascii() -> Bool:
+	error_message(
+		compiler_ctfe_eval_typed_expr(
+			compiler_ctfe_context_empty(),
+			compiler_ctfe_env_empty(),
+			imported_call_expr(
+				"std/string",
+				46,
+				"upper#46",
+				[string_expr("é")],
+				compiler_type_string(),
+			),
+		),
+	) == "compile-time string case conversion currently supports ASCII input only"
+
+
+func test_eval_lambda_preserves_lexical_environment() -> Bool:
+	without_locals = match compiler_ctfe_eval_typed_expr(
+		compiler_ctfe_context_empty(),
+		compiler_ctfe_env_empty(),
+		lambda_expr(),
+	):
+		Ok(value):
+			match value.desc:
+				CompilerCtfeLambdaValue(closure):
+					not compiler_ctfe_has_local_bindings(closure.env)
+				_:
+					False
+		Err(_):
+			False
+
+	local_env = compiler_ctfe_bind_local_value(
+		compiler_ctfe_env_empty(),
+		"offset",
+		compiler_ctfe_int(source_span(), 3),
+	)
+
+	with_locals = match compiler_ctfe_eval_typed_expr(
+		compiler_ctfe_context_empty(),
+		local_env,
+		lambda_expr(),
+	):
+		Ok(value):
+			match value.desc:
+				CompilerCtfeLambdaValue(closure):
+					compiler_ctfe_has_local_bindings(closure.env)
+				_:
+					False
+		Err(_):
+			False
+
+	without_locals and with_locals
+
+
+func test_eval_lambda_call_uses_captured_local() -> Bool:
+	env = compiler_ctfe_bind_local_value(
+		compiler_ctfe_env_empty(),
+		"offset",
+		compiler_ctfe_int(source_span(), 22),
+	)
+
+	value_equals(
+		compiler_ctfe_eval_typed_expr(compiler_ctfe_context_empty(), env, lambda_call_expr()),
+		compiler_ctfe_int(source_span(), 42),
+	)
 
 
 func test_eval_imported_std_list_intrinsics() -> Bool:
@@ -2118,6 +2274,15 @@ tests: TestSuite = {
 			test_eval_imported_function_call_reports_ambiguous_source_group,
 		),
 		("eval imported std string intrinsics", test_eval_imported_std_string_intrinsics),
+		(
+			"eval imported std string case conversion rejects non-ASCII",
+			test_eval_imported_std_string_case_conversion_rejects_non_ascii,
+		),
+		(
+			"eval lambda preserves lexical environment",
+			test_eval_lambda_preserves_lexical_environment,
+		),
+		("eval lambda call uses captured local", test_eval_lambda_call_uses_captured_local),
 		("eval imported std list intrinsics", test_eval_imported_std_list_intrinsics),
 		("eval imported std dict intrinsics", test_eval_imported_std_dict_intrinsics),
 		(

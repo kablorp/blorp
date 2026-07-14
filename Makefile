@@ -10,6 +10,7 @@ BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
+BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_embedded_std.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
@@ -68,13 +69,16 @@ warm-formatter: install
 compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp && mv $@.tmp $@
 
+$(BLORP_EMBEDDED_STD_SOURCE): compiler/tools/gen_embed_std.ml $(STD_SOURCES)
+	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp && mv $@.tmp $@
+
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
 	cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for compiler stages that have not yet moved across the boundary.
-build-blorp-cli: build $(BLORP_CLI_SOURCE)
+build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
@@ -234,4 +238,4 @@ docker-premerge-gate-all:
 clean:
 	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" compiler/lib/embedded_std.ml
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"
