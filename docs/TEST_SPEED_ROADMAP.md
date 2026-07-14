@@ -1,6 +1,6 @@
 # Test Speed Roadmap
 
-Status checked against code on 2026-07-09.
+Status checked against code on 2026-07-14.
 
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
@@ -325,6 +325,39 @@ The first high-leverage split is implemented:
     streams results. It retains independent per-artifact import preparation
     because shared prepared imports currently expose the ownership bug recorded
     above.
+21. The default runtime gate no longer runs `tests/test_blorp/memory` before the
+    leak gate runs the same suites with leak instrumentation. The leak gate is
+    now the sole owner of those assertions, removing one isolated selector
+    compilation from the default runtime sweep without dropping coverage.
+22. Exact-duplicate and overlapping test cleanup removed the duplicated DSP
+    runtime suite, duplicate directory and assignment suites, a superseded
+    geographic suite, duplicate formatter and parser fixtures, an orphaned
+    package helper, and redundant standalone string-repeat and character-trait
+    suites. Obsolete SIMD compatibility/demo suites were removed while the
+    distinct tier, operation, and function-boundary suites remain. Unique edge
+    cases moved into the canonical string and character suites. The codegen
+    audit now checks static list and derived-string constants in one fixture
+    instead of compiling the same source twice.
+23. CLI smoke now keeps one representative success/failure contract per public
+    command. Detailed multi-file dumps, repeat/timeout behavior, parse-error
+    variants, and uncommon option combinations remain in `cli-deep`, where the
+    process boundary is intentional. Tests for two long-removed formatter flags
+    and a removed formatter command were deleted instead of preserving
+    migration-specific behavior. Generic unknown-command behavior remains
+    covered at the parser boundary.
+
+Verification for this cleanup slice:
+
+- Runtime/std without the memory suites: 4,802 passed in 4m18s before the
+  final obsolete SIMD fixture removals.
+- The memory suites owned by the leak gate: 77 passed in 3.64s without leak
+  instrumentation; omitting their duplicate runtime execution is a modest but
+  direct saving.
+- CLI smoke: 28 passed in 30.82s, down from the previously recorded 2m10s
+  broad CLI gate.
+- CLI deep: 77 passed in 1m54s, confirming that detailed command integration
+  coverage remains available.
+- Retained SIMD suites: 53 passed in 4.4s.
 
 This removes the largest redundant default-local sweep without deleting the
 coverage.

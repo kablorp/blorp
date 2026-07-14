@@ -565,7 +565,7 @@ Sanitizer runs should cover:
 3. Emit static strings for CTFE-evaluated global constants. Done for immutable
    global string literal initializers.
 4. Add codegen audit coverage for the `PREPEND_STR` example. Done in
-   `global_constant_static_string.brp`.
+   `global_constant_static_string_list.brp`.
 5. Emit static lists of statically-emittable values. Done for pointer-storage
    lists whose elements are supported static values.
 6. Add COW regression coverage for static strings and lists.

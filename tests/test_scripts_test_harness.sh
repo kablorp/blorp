@@ -8,7 +8,11 @@ cd "$(dirname "$0")/.."
 TMP_HARNESS=$(mktemp -d "${TMPDIR:-/tmp}/blorp_script_harness.XXXXXX") || exit 1
 trap 'rm -rf "$TMP_HARNESS"' EXIT
 
-mkdir -p "$TMP_HARNESS/scripts" "$TMP_HARNESS/std" "$TMP_HARNESS/tests/test_blorp"
+mkdir -p \
+	"$TMP_HARNESS/scripts" \
+	"$TMP_HARNESS/std" \
+	"$TMP_HARNESS/tests/test_blorp/memory" \
+	"$TMP_HARNESS/tests/test_blorp/types"
 cp scripts/test "$TMP_HARNESS/scripts/test"
 
 cat > "$TMP_HARNESS/Makefile" <<'MAKE'
@@ -46,6 +50,7 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 fi
 
 if [ "\${1:-}" = "test" ]; then
+	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
 		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
@@ -98,6 +103,21 @@ if grep -Eq 'Runtime[[:space:]]+PASS' "$output_file"; then
 fi
 
 echo "PASS: scripts/test reports nonzero gate commands as failed"
+
+if ! grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test runtime should enumerate non-memory runtime categories"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+
+if grep -Fq 'tests/test_blorp/memory' "$TMP_HARNESS/test-command-log.txt" \
+	|| grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test runtime should leave memory suites to the leak gate"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test runtime leaves memory suites to the leak gate"
 
 if [ -f "$check_log" ]; then
 	echo "FAIL: scripts/test runtime should not run a hidden std check"

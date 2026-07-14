@@ -437,17 +437,10 @@ expect_exit "top-level version" 0 "$BLORP_BIN" --version
 expect_exit "top-level missing command" 1 "$BLORP_BIN"
 expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
 
-expect_exit "check success" 0 "$BLORP_BIN" check --no-format "$valid_prog"
 expect_exit "check bypasses OCaml host" 0 \
     env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
     "$BLORP_BIN" check --no-format "$valid_prog"
 expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
-expect_output_contains "check multi-file success" 0 "Checking " \
-    "$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
-expect_output_contains "check directory dump ast" 0 "Func main" \
-    "$BLORP_BIN" check --no-format --dump-ast "$check_dir_ok"
-expect_output_contains "check directory dump typed ast" 0 "Type checking succeeded." \
-    "$BLORP_BIN" check --no-format --dump-typed-ast "$check_dir_ok"
 expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
 expect_output_contains "check empty directory" 1 "no .brp files found" \
     "$BLORP_BIN" check --no-format "$check_dir_empty"
@@ -461,6 +454,13 @@ expect_output_contains "package check rejects external import" 1 "may import onl
     "$BLORP_BIN" package check "$package_bad"
 
 if $run_deep_checks; then
+	expect_output_contains "check multi-file success" 0 "Checking " \
+		"$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
+	expect_output_contains "check directory dump ast" 0 "Func main" \
+		"$BLORP_BIN" check --no-format --dump-ast "$check_dir_ok"
+	expect_output_contains "check directory dump typed ast" 0 "Type checking succeeded." \
+		"$BLORP_BIN" check --no-format --dump-typed-ast "$check_dir_ok"
+
     TOTAL=$((TOTAL + 1))
     if run_capture "" "$BLORP_BIN" package hash "$package_ok" \
         && [[ "$RUN_OUTPUT" =~ ^[0-9a-f]{64}$ ]]; then
@@ -602,61 +602,68 @@ else
     record_fail "compile writes requested output" "missing $compiled_c"
 fi
 external_runtime_c="$TMPDIR_CLI/external_runtime.c"
-expect_exit "compile no embedded runtime" 0 "$BLORP_BIN" compile --no-format --no-embed-runtime -o "$external_runtime_c" "$valid_prog"
-if [ ! -f "$external_runtime_c" ]; then
-    TOTAL=$((TOTAL + 1))
-    record_fail "compile no embedded runtime omits runtime body" "missing $external_runtime_c"
-elif grep -qF "blorp Runtime" "$external_runtime_c"; then
-    TOTAL=$((TOTAL + 1))
-    record_fail "compile no embedded runtime omits runtime body" "runtime body was embedded"
-else
-    TOTAL=$((TOTAL + 1))
-    record_pass "compile no embedded runtime omits runtime body"
+if $run_deep_checks; then
+	expect_exit "compile no embedded runtime" 0 "$BLORP_BIN" compile --no-format --no-embed-runtime -o "$external_runtime_c" "$valid_prog"
+	if [ ! -f "$external_runtime_c" ]; then
+		TOTAL=$((TOTAL + 1))
+		record_fail "compile no embedded runtime omits runtime body" "missing $external_runtime_c"
+	elif grep -qF "blorp Runtime" "$external_runtime_c"; then
+		TOTAL=$((TOTAL + 1))
+		record_fail "compile no embedded runtime omits runtime body" "runtime body was embedded"
+	else
+		TOTAL=$((TOTAL + 1))
+		record_pass "compile no embedded runtime omits runtime body"
+	fi
 fi
 expect_exit "compile type failure" 1 "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/invalid.c" "$invalid_prog"
-expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
-    "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
-expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"
-expect_output_contains "run parse failure" 1 'expected `)` after function parameters' \
-    "$BLORP_BIN" run --no-format --timeout 5 "$parse_invalid_prog"
-expect_exit "run bad timeout" 1 "$BLORP_BIN" run --timeout not-an-int "$valid_prog"
+
+if $run_deep_checks; then
+	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
+		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
+	expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"
+	expect_output_contains "run parse failure" 1 'expected `)` after function parameters' \
+		"$BLORP_BIN" run --no-format --timeout 5 "$parse_invalid_prog"
+	expect_exit "run bad timeout" 1 "$BLORP_BIN" run --timeout not-an-int "$valid_prog"
+fi
 
 expect_exit "test success" 0 "$BLORP_BIN" test --no-cache --no-format --timeout 5 tests/test_blorp/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --no-cache --no-format --timeout 5 "$failing_test"
-expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
-expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
-expect_exit "test warmup only accepts prior options" 0 "$BLORP_BIN" test --no-format --warmup-only
-expect_exit "test warmup only validates later options" 1 "$BLORP_BIN" test --warmup-only --bogus
-rm -f "$repeat_marker"
-expect_exit "test repeat success" 0 "$BLORP_BIN" test --no-format --timeout 5 --repeat 3 "$repeat_test"
-TOTAL=$((TOTAL + 1))
-if [ -f "$repeat_marker" ]; then
-    repeat_count=$(wc -l < "$repeat_marker" | tr -d ' ')
-else
-    repeat_count=0
+
+if $run_deep_checks; then
+	expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
+	expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
+	expect_exit "test warmup only accepts prior options" 0 "$BLORP_BIN" test --no-format --warmup-only
+	expect_exit "test warmup only validates later options" 1 "$BLORP_BIN" test --warmup-only --bogus
+	rm -f "$repeat_marker"
+	expect_exit "test repeat success" 0 "$BLORP_BIN" test --no-format --timeout 5 --repeat 3 "$repeat_test"
+	TOTAL=$((TOTAL + 1))
+	if [ -f "$repeat_marker" ]; then
+		repeat_count=$(wc -l < "$repeat_marker" | tr -d ' ')
+	else
+		repeat_count=0
+	fi
+	if [ "$repeat_count" = "3" ]; then
+		record_pass "test repeat disables result cache"
+	else
+		record_fail "test repeat disables result cache" "expected 3 runs, got $repeat_count"
+	fi
+	expect_output_contains "test honors BLORP_TEST_TIMEOUT" 1 "timed out after 1s" \
+		env BLORP_TEST_TIMEOUT=1 "$BLORP_BIN" test --no-cache --no-format "$timeout_test"
 fi
-if [ "$repeat_count" = "3" ]; then
-    record_pass "test repeat disables result cache"
-else
-    record_fail "test repeat disables result cache" "expected 3 runs, got $repeat_count"
-fi
-expect_output_contains "test honors BLORP_TEST_TIMEOUT" 1 "timed out after 1s" \
-    env BLORP_TEST_TIMEOUT=1 "$BLORP_BIN" test --no-cache --no-format "$timeout_test"
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"
-expect_exit "format check empty file" 0 "$BLORP_BIN" format --check "$empty_prog"
 expect_exit "format check failure" 1 "$BLORP_BIN" format --check tests/test_compiler/format/should_fail/bad_spacing.brp
-expect_exit "format missing file arg" 1 "$BLORP_BIN" format --check
-expect_output_contains "format rejects removed expression JSON flag" 1 "unknown format option: --emit-expr-json" \
-    "$BLORP_BIN" format --emit-expr-json "$valid_prog"
-expect_output_contains "format rejects removed Doc JSON flag" 1 "unknown format option: --emit-doc-json" \
-    "$BLORP_BIN" format --emit-doc-json "$valid_prog"
-expect_output_contains "format rejects emit JSON with check" 1 "cannot be combined" \
-    "$BLORP_BIN" format --check --emit-program-json "$valid_prog"
-expect_output_contains "format diff implies check" 1 "needs formatting" \
-    "$BLORP_BIN" format --diff tests/test_compiler/format/should_fail/bad_spacing.brp
+
+if $run_deep_checks; then
+	expect_exit "format check empty file" 0 "$BLORP_BIN" format --check "$empty_prog"
+	expect_exit "format missing file arg" 1 "$BLORP_BIN" format --check
+	expect_output_contains "format rejects emit JSON with check" 1 "cannot be combined" \
+		"$BLORP_BIN" format --check --emit-program-json "$valid_prog"
+	expect_output_contains "format diff implies check" 1 "needs formatting" \
+		"$BLORP_BIN" format --diff tests/test_compiler/format/should_fail/bad_spacing.brp
+fi
 
 expect_exit "purify dry-run success" 0 "$BLORP_BIN" purify --dry-run "$valid_prog"
 
@@ -768,8 +775,6 @@ BRP
     expect_formatter_output_contains "Blorp formatter rejects odd program batch args" 1 \
         "program-batch command requires <program-json-file> <output-file> pairs" \
         program-batch "$formatter_src"
-    expect_formatter_output_contains "Blorp formatter rejects removed document command" 1 \
-        "unknown formatter command: document" document --help
 fi
 
 expect_output_contains "repl help" 0 "Usage: blorp repl" "$BLORP_BIN" repl --help
