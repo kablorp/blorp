@@ -33,7 +33,6 @@ type request = {
   debug : bool;
   require_main : bool;
   check_invariants : bool;
-  required_capabilities : capability list;
   observations : stage list;
   stop_after : stage option;
 }
@@ -217,7 +216,7 @@ let decode_request value =
     let* require_main = bool_field "require_main" value in
     let* check_invariants = bool_field "check_invariants" value in
     let* capability_values = array_field "required_capabilities" value in
-    let* required_capabilities =
+    let* _validated_capabilities =
       decode_list decode_capability capability_values
     in
     let* observation_values = array_field "observations" value in
@@ -237,7 +236,6 @@ let decode_request value =
         debug;
         require_main;
         check_invariants;
-        required_capabilities;
         observations;
         stop_after;
       }

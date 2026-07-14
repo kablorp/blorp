@@ -1255,44 +1255,11 @@ let rec collect_brp_files path =
   else if Filename.check_suffix path ".brp" then [ path ]
   else []
 
-type parsed_cli_file = {
-  parsed_cli_path : string;
-  parsed_cli_program : Ast.program;
-}
-
-let parsed_cli_success path program =
-  { parsed_cli_path = path; parsed_cli_program = program }
-
 let print_parse_diagnostics ~file diagnostics =
   prerr_endline (format_pipeline_errors ~file diagnostics)
 
-let check_parsed_files_with_opts ~preloaded_module_graph opts parsed_files =
-  if parsed_files = [] then begin
-    prerr_endline "Error: no .brp files found";
-    1
-  end
-  else
-    let multiple = match parsed_files with [ _ ] -> false | _ -> true in
-    let failed = ref false in
-    List.iter
-      (fun parsed ->
-        let file = parsed.parsed_cli_path in
-        if multiple then Printf.printf "Checking %s\n" file;
-        if
-          check_file_with_opts ~frontend_program:parsed.parsed_cli_program
-            ~preloaded_module_graph opts file
-          <> 0
-        then
-          failed := true)
-      parsed_files;
-    if !failed then 1 else 0
-
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
-  | BlorpCliCheck of
-      parsed_cli_file list
-      * Modules.preloaded_module_graph
-      * Compiler_blorp_bridge.cli_check_options
   | BlorpCliCompile of
       Ast.program
       * Modules.preloaded_module_graph
@@ -1308,7 +1275,7 @@ type blorp_cli_frontier =
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
 type finalized_cli_frontend_graph_source = {
-  finalized_parsed_file : parsed_cli_file;
+  finalized_program : Ast.program;
   finalized_preloaded_source : Modules.preloaded_parsed_source;
 }
 
@@ -1371,8 +1338,7 @@ let finalize_cli_frontend_graph_source ~imports
       in
       Ok
         {
-          finalized_parsed_file =
-            parsed_cli_success source.cli_frontend_graph_path resolved_program;
+          finalized_program = resolved_program;
           finalized_preloaded_source =
             {
               Modules.preload_module_name =
@@ -1483,19 +1449,12 @@ let cli_frontier_frontend_module_graph
   let preloaded_module_graph =
     preloaded_module_graph_of_cli_frontend_graph graph module_graph_sources
   in
-  let parsed_roots =
-    List.map (fun source -> source.finalized_parsed_file) roots
-  in
   match graph.Compiler_blorp_bridge.cli_frontend_graph_options with
-  | Compiler_blorp_bridge.CliFrontendCheckOptions options ->
-      BlorpCliCheck (parsed_roots, preloaded_module_graph, options)
   | Compiler_blorp_bridge.CliFrontendCompileOptions options -> (
       match roots with
       | [ root ] ->
           BlorpCliCompile
-            ( root.finalized_parsed_file.parsed_cli_program,
-              preloaded_module_graph,
-              options )
+            (root.finalized_program, preloaded_module_graph, options)
       | _ ->
           prerr_endline
             "Error: compile frontend module graph must contain exactly one root";
@@ -1504,9 +1463,7 @@ let cli_frontier_frontend_module_graph
       match roots with
       | [ root ] ->
           BlorpCliRun
-            ( root.finalized_parsed_file.parsed_cli_program,
-              preloaded_module_graph,
-              options )
+            (root.finalized_program, preloaded_module_graph, options)
       | _ ->
           prerr_endline
             "Error: run frontend module graph must contain exactly one root";
@@ -1532,16 +1489,6 @@ let set_std_override_option = function
   | Some dir -> Modules.set_std_override dir
   | None -> ()
 
-let compile_opts_of_cli_check
-    (options : Compiler_blorp_bridge.cli_check_options) =
-  {
-    default_compile_opts with
-    no_emit = true;
-    dump_ast = options.cli_check_dump_ast;
-    dump_typed_ast = options.cli_check_dump_typed_ast;
-    debug = options.cli_check_debug;
-  }
-
 let compile_opts_of_cli_compile
     (options : Compiler_blorp_bridge.cli_compile_options) =
   {
@@ -1566,12 +1513,6 @@ let sanitizer_mode_of_cli_frontend =
   | CliFrontendSanitizeAddressUndefined ->
       Test_runner.SanitizerAddressUndefined
   | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
-
-let run_check_from_frontier_options ~preloaded_module_graph parsed_files
-    (options : Compiler_blorp_bridge.cli_check_options) =
-  let opts = compile_opts_of_cli_check options in
-  set_std_override_option options.cli_check_std_dir;
-  check_parsed_files_with_opts ~preloaded_module_graph opts parsed_files
 
 let run_compile_from_frontier_options ~frontend_program
     ~preloaded_module_graph
@@ -1885,9 +1826,6 @@ and run_compiler_cli_plan_command args =
       1
 and run_frontier = function
   | BlorpCliDelegate args -> run_delegate_command args
-  | BlorpCliCheck (parsed_files, preloaded_module_graph, options) ->
-      run_check_from_frontier_options ~preloaded_module_graph parsed_files
-        options
   | BlorpCliCompile (frontend_program, preloaded_module_graph, options) ->
       run_compile_from_frontier_options ~frontend_program
         ~preloaded_module_graph options

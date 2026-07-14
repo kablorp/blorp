@@ -1,0 +1,141 @@
+import:
+	../src/stage_09_core/compiler_semantic_worker_protocol:
+		SEMANTIC_MIDDLE_DOMAIN,
+		SEMANTIC_MIDDLE_SCHEMA_VERSION,
+	../src/stage_12_cli/compiler_cli: run_cli
+	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_compile_execute:
+		CliCompileExecution(CliCompileArtifact),
+		execute_compile_plan,
+		execute_run_plan,
+	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
+	../src/stage_12_cli/compiler_cli_plan: CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource)
+	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
+	system: remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+pure func compiled_response_fixture() -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("compiled")),
+		("capabilities", JsonVector([
+			JsonString("typed_ast_post_ctfe"),
+			JsonString("core_pre_dce"),
+			JsonString("rendered_stage_observations"),
+		])),
+		("core", JsonObject([
+			("kind", JsonString("program")),
+			("decls", JsonVector([])),
+			("foreign_includes", JsonVector([])),
+		])),
+		("observations", JsonVector([])),
+	])
+
+
+func write_source(path: String) -> Bool:
+	match write_file(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func test_check_executes_without_host_plan() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_check.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["check", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCheck(check_plan):
+				result = execute_check_plan(check_plan)
+				encoded = cli_run_plan_to_json(plan)
+
+				(
+					result.status == 0
+					and result.stdout.contains("Type checking succeeded.")
+					and result.stderr == ""
+					and get_field(encoded, "error").is_some()
+				)
+			_:
+				False
+
+
+func test_compile_builds_one_typed_request_and_artifact() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_compile.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, compiled_response_fixture()):
+					CliCompileArtifact(request, artifact):
+						(
+							request.target.path == path
+							and request.modules.length() == 0
+							and request.required_capabilities.length() == 3
+							and request.require_main
+							and artifact.c_code.length() > 0
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_run_builds_one_typed_request_and_artifact() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_run.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli([
+			"run",
+			"--no-format",
+			"--profile",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunSource(run_plan):
+				match execute_run_plan(run_plan, compiled_response_fixture()):
+					CliCompileArtifact(request, artifact):
+						(
+							request.target.path == path
+							and request.modules.length() == 0
+							and request.require_main
+							and artifact.c_code.length() > 0
+						)
+					_:
+						False
+			_:
+				False
+
+
+tests: TestSuite = {
+	description = "Blorp CLI in-process execution",
+	tests = [
+		("check executes without host plan", test_check_executes_without_host_plan),
+		(
+			"compile builds one typed request and artifact",
+			test_compile_builds_one_typed_request_and_artifact,
+		),
+		(
+			"run builds one typed request and artifact",
+			test_run_builds_one_typed_request_and_artifact,
+		),
+	]
+}

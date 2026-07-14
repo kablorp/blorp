@@ -187,18 +187,6 @@ let parsed_ast_artifact ?(ast_phase = "raw_parse") ?comments ?module_surface
   in
   Lsp_json.Object fields
 
-let check_options_json paths =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "check");
-      ("dump_ast", Lsp_json.Bool false);
-      ("dump_typed_ast", Lsp_json.Bool false);
-      ("debug", Lsp_json.Bool false);
-      ("no_format", Lsp_json.Bool true);
-      ("std_dir", Lsp_json.Null);
-      ("paths", string_array paths);
-    ]
-
 let compile_options_json files =
   Lsp_json.Object
     [
@@ -1211,10 +1199,10 @@ let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "frontend_options");
-           ("command", Lsp_json.String "check");
+           ("command", Lsp_json.String "compile");
            ( "args",
-             string_array [ "check"; "--no-format"; "a.brp"; "b.brp" ] );
-           ("options", check_options_json [ "a.brp"; "b.brp" ]);
+             string_array [ "compile"; "--no-format"; "a.brp" ] );
+           ("options", compile_options_json [ "a.brp" ]);
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
@@ -1341,9 +1329,9 @@ let test_cli_run_response_rejects_mismatched_frontend_args () =
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "check");
-           ("args", string_array [ "compile"; "a.brp" ]);
-           ("options", check_options_json [ "a.brp" ]);
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "run"; "a.brp" ]);
+           ("options", compile_options_json [ "a.brp" ]);
            ("context", frontend_graph_context_json ());
            ( "roots",
              Lsp_json.Array
@@ -1357,7 +1345,7 @@ let test_cli_run_response_rejects_mismatched_frontend_args () =
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "expected `check`"
+  |> expect_invalid_response_contains "expected `compile`"
 
 let test_cli_run_response_rejects_mismatched_repl_args () =
   let response =

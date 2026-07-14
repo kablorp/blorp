@@ -95,18 +95,3 @@ val compile_typed_with_modules :
   string * string list * string list
 (** Compile a typed main program plus loaded typed modules. Returns generated
     output, link flags, and include directories. *)
-
-val compile_typed_with_module_inputs :
-  ?main_import_bindings:Session.import_binding list ->
-  modules:typed_module_input list ->
-  ?embed_runtime:bool ->
-  ?profile:bool ->
-  ?debug:bool ->
-  ?on_stage:on_stage_callback ->
-  ?on_stage_event:on_stage_event ->
-  ?on_stage_json:on_stage_json_callback ->
-  ?tail_observation_stages:Core_stage.t list ->
-  ?check_invariants:bool ->
-  Typed_ast.program ->
-  string * string list * string list
-(** Compile explicit typed module inputs through the full backend. *)

@@ -84,7 +84,6 @@ type parse_source_batch_response = {
 }
 
 type cli_frontend_command =
-  | CliFrontendCheck
   | CliFrontendCompile
   | CliFrontendRun
 
@@ -96,15 +95,6 @@ type cli_frontend_sanitizer_mode =
   | CliFrontendSanitizeOff
   | CliFrontendSanitizeAddressUndefined
   | CliFrontendSanitizeUndefined
-
-type cli_check_options = {
-  cli_check_dump_ast : bool;
-  cli_check_dump_typed_ast : bool;
-  cli_check_debug : bool;
-  cli_check_no_format : bool;
-  cli_check_std_dir : string option;
-  cli_check_paths : string list;
-}
 
 type cli_compile_options = {
   cli_compile_ast_only : bool;
@@ -191,7 +181,6 @@ type cli_package_options = {
 }
 
 type cli_frontend_options =
-  | CliFrontendCheckOptions of cli_check_options
   | CliFrontendCompileOptions of cli_compile_options
   | CliFrontendRunOptions of cli_run_options
 
@@ -1195,7 +1184,6 @@ let typecheck_graph_stream_response_json ~module_count response_text =
   split_modules module_count [] sources
 
 let cli_frontend_command_of_string = function
-  | "check" -> Ok CliFrontendCheck
   | "compile" -> Ok CliFrontendCompile
   | "run" -> Ok CliFrontendRun
   | command ->
@@ -1329,27 +1317,6 @@ let require_options_kind expected options =
       ( "invalid_response",
         "CLI options kind `" ^ kind ^ "` did not match expected `" ^ expected
         ^ "`" )
-
-let decode_cli_check_options options =
-  let* () = require_options_kind "check" options in
-  let* cli_check_dump_ast = bool_response_field "dump_ast" options in
-  let* cli_check_dump_typed_ast =
-    bool_response_field "dump_typed_ast" options
-  in
-  let* cli_check_debug = bool_response_field "debug" options in
-  let* cli_check_no_format = bool_response_field "no_format" options in
-  let* cli_check_std_dir = optional_string_response_field "std_dir" options in
-  let* cli_check_paths = string_array_field "paths" options in
-  Ok
-    (CliFrontendCheckOptions
-       {
-         cli_check_dump_ast;
-         cli_check_dump_typed_ast;
-         cli_check_debug;
-         cli_check_no_format;
-         cli_check_std_dir;
-         cli_check_paths;
-       })
 
 let decode_cli_compile_options options =
   let* () = require_options_kind "compile" options in
@@ -1488,7 +1455,6 @@ let decode_cli_purify_options cli_purify_raw_args options =
 
 let decode_cli_frontend_options command options =
   match command with
-  | CliFrontendCheck -> decode_cli_check_options options
   | CliFrontendCompile -> decode_cli_compile_options options
   | CliFrontendRun -> decode_cli_run_options options
 

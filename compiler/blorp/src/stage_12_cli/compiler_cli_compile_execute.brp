@@ -1,0 +1,136 @@
+-- Pure compile/run execution from the typed frontend worker request through
+-- Blorp-owned late Core and C emission. Process and artifact effects are added
+-- only after their typed standard-library surfaces land.
+import:
+	../stage_09_core/compiler_core_json: core_json_error_to_string
+	../stage_09_core/compiler_semantic_worker_protocol:
+		SemanticMiddleDiagnostic,
+		SemanticMiddleObservation,
+		SemanticMiddleProtocolError(
+			SemanticMiddleExpectedField,
+			SemanticMiddleInvalidCore,
+			SemanticMiddleMissingCapability,
+			SemanticMiddleMissingField,
+			SemanticMiddleUnsupportedCapability,
+			SemanticMiddleUnsupportedDomain,
+			SemanticMiddleUnsupportedKind,
+			SemanticMiddleUnsupportedSchema,
+			SemanticMiddleUnsupportedStage,
+		),
+		SemanticMiddleRequest,
+		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed, SemanticMiddleStopped),
+		SemanticMiddleStage,
+		decode_semantic_middle_response_value,
+		parse_semantic_middle_stage,
+	../stage_10_backend/compiler_artifact_json: CArtifact
+	../stage_10_backend/compiler_core_emit:
+		try_emit_core_program_c_artifact_with_options,
+		unsupported_global_initializer_error_to_string,
+	compiler_cli_compile_frontend: compile_frontend_graph
+	compiler_cli_plan: CliCompilePlan, CliRunSourcePlan
+	json: JsonValue
+
+
+union CliCompileExecution:
+	CliCompileFrontendFailed(List[String])
+	CliCompileArtifact(SemanticMiddleRequest, CArtifact)
+	CliCompileStopped(SemanticMiddleRequest, SemanticMiddleStage, String, List[SemanticMiddleObservation])
+	CliCompileSemanticFailed(SemanticMiddleRequest, List[SemanticMiddleDiagnostic])
+	CliCompileProtocolFailed(SemanticMiddleRequest, String)
+	CliCompileEmitFailed(SemanticMiddleRequest, String)
+
+
+private pure func semantic_observation_stages(
+	stage_names: List[String],
+) -> List[SemanticMiddleStage]:
+	stage_names.flat_map(func(stage_name):
+		match parse_semantic_middle_stage(stage_name):
+			Some(stage):
+				[stage]
+			None:
+				[]
+	)
+
+
+private pure func semantic_stop_stage(stage_name: Option[String]) -> Option[SemanticMiddleStage]:
+	match stage_name:
+		Some(name):
+			parse_semantic_middle_stage(name)
+		None:
+			None
+
+
+private pure func semantic_protocol_error_message(error: SemanticMiddleProtocolError) -> String:
+	match error:
+		SemanticMiddleMissingField(name):
+			"semantic worker response is missing field `${name}`"
+		SemanticMiddleExpectedField(name, expected):
+			"semantic worker response field `${name}` must be ${expected}"
+		SemanticMiddleUnsupportedSchema(schema):
+			"semantic worker returned unsupported schema ${schema.to_string()}"
+		SemanticMiddleUnsupportedDomain(domain):
+			"semantic worker returned unsupported domain `${domain}`"
+		SemanticMiddleUnsupportedKind(kind):
+			"semantic worker returned unsupported response kind `${kind}`"
+		SemanticMiddleUnsupportedStage(stage):
+			"semantic worker returned unsupported stage `${stage}`"
+		SemanticMiddleUnsupportedCapability(capability):
+			"semantic worker returned unsupported capability `${capability}`"
+		SemanticMiddleMissingCapability(capability):
+			"semantic worker response is missing capability `${capability}`"
+		SemanticMiddleInvalidCore(error):
+			"semantic worker returned invalid Core: ${core_json_error_to_string(error)}"
+
+
+private pure func finish_compile_execution(
+	request: SemanticMiddleRequest,
+	response_value: JsonValue,
+	profile: Bool,
+) -> CliCompileExecution:
+	match decode_semantic_middle_response_value(response_value):
+		Ok(response):
+			match response:
+				SemanticMiddleCompiled(core, _):
+					match try_emit_core_program_c_artifact_with_options(core, {profile = profile}):
+						Ok(artifact):
+							CliCompileArtifact(request, artifact)
+						Err(error):
+							CliCompileEmitFailed(
+								request,
+								unsupported_global_initializer_error_to_string(error),
+							)
+				SemanticMiddleStopped(stage, rendered, observations):
+					CliCompileStopped(request, stage, rendered, observations)
+				SemanticMiddleFailed(diagnostics):
+					CliCompileSemanticFailed(request, diagnostics)
+		Err(error):
+			CliCompileProtocolFailed(request, semantic_protocol_error_message(error))
+
+
+pure func execute_compile_plan(
+	plan: CliCompilePlan,
+	response_value: JsonValue,
+) -> CliCompileExecution:
+	match compile_frontend_graph(
+		plan.graph,
+		plan.options.debug,
+		True,
+		plan.options.check_invariants,
+		semantic_observation_stages(plan.options.dump_core_after),
+		semantic_stop_stage(plan.options.stop_after),
+	):
+		Ok(request):
+			finish_compile_execution(request, response_value, False)
+		Err(errors):
+			CliCompileFrontendFailed(errors)
+
+
+pure func execute_run_plan(
+	plan: CliRunSourcePlan,
+	response_value: JsonValue,
+) -> CliCompileExecution:
+	match compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None):
+		Ok(request):
+			finish_compile_execution(request, response_value, plan.options.profile)
+		Err(errors):
+			CliCompileFrontendFailed(errors)

@@ -65,7 +65,7 @@ private union TypecheckBridgeDispatchError:
 	UnsupportedBridgeAction(BridgeAction)
 
 
-private record TypecheckImportModule {
+record TypecheckImportModule {
 	path: String,
 	module_name: String,
 	module_path: String,
@@ -74,7 +74,7 @@ private record TypecheckImportModule {
 }
 
 
-private record TypecheckResolvedImport {
+record TypecheckResolvedImport {
 	from_path: String,
 	from_module: String,
 	import_path: String,
@@ -82,7 +82,7 @@ private record TypecheckResolvedImport {
 }
 
 
-private record TypecheckGraphRequest {
+record TypecheckGraphRequest {
 	target: TypecheckImportModule,
 	modules: List[TypecheckImportModule],
 	module_targets: List[String],
@@ -111,6 +111,24 @@ private record PreparedTypecheckGraph {
 	selected_modules: List[PreparedTypecheckModule],
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency]
+}
+
+
+record CompilerTypecheckedModule {
+	path: String,
+	module_name: String,
+	module_path: String,
+	parsed_program: ParsedProgram,
+	typed_program: CompilerTypedProgram,
+	errors: List[String],
+	import_bindings: List[CompilerImportBinding],
+	ctfe_evaluated: Bool
+}
+
+
+record CompilerTypecheckedGraph {
+	target: CompilerTypecheckedModule,
+	modules: List[CompilerTypecheckedModule]
 }
 
 
@@ -772,12 +790,19 @@ private pure func ctfe_imported_programs_for_artifact(
 		Some([])
 
 
-private pure func typecheck_ctfe_status_name(status: TypecheckCtfeStatus) -> String:
+private pure func typecheck_ctfe_was_evaluated(status: TypecheckCtfeStatus) -> Bool:
 	match status:
 		TypecheckCtfeEvaluated:
-			"evaluated"
+			True
 		TypecheckCtfeNotRun:
-			"not_run"
+			False
+
+
+private pure func typecheck_ctfe_status_name(evaluated: Bool) -> String:
+	if evaluated:
+		"evaluated"
+	else:
+		"not_run"
 
 
 private pure func typecheck_ctfe_artifact(
@@ -824,13 +849,12 @@ private pure func typecheck_ctfe_artifact(
 				}
 
 
-private pure func typed_prepared_module_artifact(
+private pure func typechecked_prepared_module(
 	module: PreparedTypecheckModule,
-	include_comments: Bool,
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-) -> JsonValue:
+) -> CompilerTypecheckedModule:
 	final_program = module.program
 	explicit_import_paths = explicit_import_paths_from_program(final_program)
 	initial_state = compiler_typecheck_state_with_debug_calls(
@@ -854,24 +878,40 @@ private pure func typed_prepared_module_artifact(
 	)
 	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 
+	{
+		path = module.request.path,
+		module_name = module.request.module_name,
+		module_path = module.request.module_path,
+		parsed_program = final_program,
+		typed_program = ctfe_artifact.program,
+		errors = ctfe_artifact.state.errors,
+		import_bindings = ctfe_artifact.state.import_bindings,
+		ctfe_evaluated = typecheck_ctfe_was_evaluated(ctfe_artifact.status)
+	}
+
+
+private pure func typechecked_module_artifact(
+	module: CompilerTypecheckedModule,
+	include_comments: Bool,
+) -> JsonValue:
 	var fields: List[(String, JsonValue)] = [
-		("path", JsonString(module.request.path)),
-		("module", JsonString(module.request.module_name)),
+		("path", JsonString(module.path)),
+		("module", JsonString(module.module_name)),
 		("ast_phase", JsonString(parsed_program_phase_name(TypecheckSourceProgram))),
-		("typed_program", compiler_typed_program_to_json(ctfe_artifact.program)),
-		("ctfe_status", JsonString(typecheck_ctfe_status_name(ctfe_artifact.status))),
-		("type_errors", JsonVector(ctfe_artifact.state.errors.map(
+		("typed_program", compiler_typed_program_to_json(module.typed_program)),
+		("ctfe_status", JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated))),
+		("type_errors", JsonVector(module.errors.map(
 				pure func(item: String): JsonString(item),
 			))),
+		("import_bindings", JsonVector(module.import_bindings.map(import_binding_to_json))),
 		(
-			"import_bindings",
-			JsonVector(ctfe_artifact.state.import_bindings.map(import_binding_to_json)),
+			"module_surface",
+			module_surface_to_json(module_surface_for_program(module.parsed_program)),
 		),
-		("module_surface", module_surface_to_json(module_surface_for_program(final_program))),
 	]
 
 	if include_comments:
-		fields = fields.append(("comments", source_comment_jsons(final_program.source)))
+		fields = fields.append(("comments", source_comment_jsons(module.parsed_program.source)))
 
 	JsonObject(fields)
 
@@ -904,23 +944,24 @@ private pure func typed_source_artifact(
 		allow_debug_only_calls,
 	)
 
-	typed_prepared_module_artifact(
-		module,
+	typechecked_module_artifact(
+		typechecked_prepared_module(
+			module,
+			allow_debug_only_calls,
+			importable_modules,
+			ctfe_dependencies,
+		),
 		include_comments,
-		allow_debug_only_calls,
-		importable_modules,
-		ctfe_dependencies,
 	)
 
 
-private pure func typed_graph_artifact_for_module(
+private pure func typechecked_graph_module(
 	request: TypecheckGraphRequest,
 	graph: PreparedTypecheckGraph,
 	module: PreparedTypecheckModule,
-) -> JsonValue:
-	typed_prepared_module_artifact(
+) -> CompilerTypecheckedModule:
+	typechecked_prepared_module(
 		module,
-		request.include_comments,
 		request.allow_debug_only_calls,
 		importable_modules_except_path(graph.importable_modules, module.request.module_path),
 		graph.ctfe_dependencies,
@@ -943,6 +984,17 @@ private pure func prepare_typecheck_graph(request: TypecheckGraphRequest) -> Pre
 		selected_modules = selected_modules,
 		importable_modules = importable_modules,
 		ctfe_dependencies = ctfe_dependencies
+	}
+
+
+pure func compiler_typecheck_graph(request: TypecheckGraphRequest) -> CompilerTypecheckedGraph:
+	graph = prepare_typecheck_graph(request)
+
+	{
+		target = typechecked_graph_module(request, graph, graph.target),
+		modules = graph.selected_modules.map(
+			func(module): typechecked_graph_module(request, graph, module),
+		)
 	}
 
 
@@ -1004,16 +1056,18 @@ func stream_typecheck_graph_request_value(
 				TypecheckGraphAction:
 					match typecheck_graph_request_from_body(envelope.payload):
 						Ok(request):
-							graph = prepare_typecheck_graph(request)
+							graph = compiler_typecheck_graph(request)
 
-							for module in graph.selected_modules:
-								artifact = typed_graph_artifact_for_module(request, graph, module)
+							for module in graph.modules:
+								artifact = typechecked_module_artifact(
+									module,
+									request.include_comments,
+								)
 								emit(bridge_success_json(artifact).to_string())
 
-							target_artifact = typed_graph_artifact_for_module(
-								request,
-								graph,
+							target_artifact = typechecked_module_artifact(
 								graph.target,
+								request.include_comments,
 							)
 							emit(bridge_success_json(target_artifact).to_string())
 						Err(error):

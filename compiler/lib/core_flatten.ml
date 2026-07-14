@@ -11,7 +11,7 @@
        with [__pure] (pre-Phase-2.7 dedup lived here as reactive
        cleanup; Phase 2.7 replaced it with proactive disambiguation).
 
-    2. [build_import_tables_from_typecheck] — turns typed import
+    2. [build_import_tables_from_bindings] — turns typed import
        bindings into two lookup tables used by [Core_mono] /
        [Core_resolve] for cross-module dispatch: an [import_aliases]
        table for the main program and a per-module [module_imports]
@@ -706,18 +706,3 @@ let build_import_tables_from_bindings
         Hashtbl.replace module_imports module_name table)
     module_bindings;
   (import_table_of_bindings main_import_bindings, module_imports)
-
-let build_import_tables_from_typecheck
-    ~(main_import_bindings : Session.import_binding list)
-    (modules : Modules.loaded_module list) :
-    (string, string * string) Hashtbl.t
-    * (string, (string, string * string) Hashtbl.t) Hashtbl.t =
-  let module_bindings =
-    List.filter_map
-      (fun (loaded : Modules.loaded_module) ->
-        Option.map
-          (fun bindings -> (loaded.name, bindings))
-          loaded.typed_import_bindings)
-      modules
-  in
-  build_import_tables_from_bindings ~main_import_bindings module_bindings

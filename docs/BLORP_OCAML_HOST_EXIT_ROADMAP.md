@@ -32,7 +32,7 @@ semantic stages are OCaml- or Blorp-owned.
 
 Execute the checkpoints in document order. Checkpoint C cuts over `check`,
 which needs no backend effects, and builds the compile/run path through an
-in-memory `CArtifact` under focused tests using encoded worker requests and
+in-memory `CArtifact` under focused tests using typed worker requests and
 decoded response fixtures. The real worker process client lands with the
 structured process API in Checkpoint F. Compile/run become authoritative only
 in Checkpoint J, after the artifact, filesystem, process, host-C, runtime, and
@@ -40,25 +40,26 @@ observability checkpoints are complete.
 
 ## Current Boundary
 
-The public `blorp` executable is Blorp, but
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp` currently:
+The public `blorp` executable is Blorp. Ordinary `check` now stays inside
+`compiler_cli_main.brp`: it discovers and parses the source graph, typechecks
+and runs CTFE from the in-memory graph, and returns diagnostics without
+creating a plan file or invoking OCaml. `CliOcamlHostPlan` has no check
+variant, so this boundary cannot regress through an accidental match arm.
 
-- locates `blorp-ocaml-host` through `BLORP_OCAML_HOST_BIN`;
-- serializes every `CliRunPlan` with `cli_run_plan_to_json`;
-- writes the plan through `system.mkstemp_path` and `system.write_file`; and
-- executes `blorp-ocaml-host __compiler-run-cli-plan <path>`.
+Compile and run still serialize their typed phase-specific plans and execute
+`blorp-ocaml-host __compiler-run-cli-plan <path>`. The OCaml host therefore
+still owns production compile/run effects through these functions in
+`compiler/bin/blorp_ocaml_host.ml`:
 
-For source commands, the plan contains the complete `CliFrontendModuleGraph`.
-The OCaml host decodes that CLI-shaped artifact and owns production command
-execution through these functions in `compiler/bin/blorp_ocaml_host.ml`:
-
-- `run_check_from_frontier_options`
 - `run_compile_from_frontier_options`
 - `run_file_from_frontier_options`
 - `compile_file_with_opts`
-- `check_file_with_opts`
 - `write_compile_output`
 - `run_file`
+
+`check_file_with_opts` remains only as an internal no-emission path used by
+the still-OCaml compile implementation; it is no longer reachable from the
+public `check` command.
 
 Compilation already returns a Blorp-owned `CArtifact` from
 `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`, but the
@@ -225,7 +226,8 @@ Implemented evidence on 2026-07-13:
   typed modules with no module-cache dependency;
 - explicit import-binding table and resource-cleanup restoration regressions;
 - private `blorp_ocaml_middle.exe` stdin/stdout smoke tests; and
-- `scripts/test compiler-unit compiler-unit-deep compiler`: 3,443 passed.
+- `scripts/test compiler-unit compiler-unit-deep compiler`: 3,443 passed; and
+- `scripts/test compiler-deep`: 1,904 passed.
 
 Exit condition:
 
@@ -238,6 +240,10 @@ Exit condition:
 
 Goal: cut ordinary `check` over to Blorp and build a typed, testable compile/run
 path from an internal CLI plan through an in-memory `CArtifact`.
+
+Status: complete on this branch. Ordinary `check` is production-authoritative
+in Blorp. Compile/run remain production-authoritative in OCaml until
+Checkpoint J, but their typed Blorp path is covered through C emission.
 
 Primary files:
 
@@ -261,7 +267,7 @@ Implementation:
 3. Cut ordinary `check` over immediately: it ends after Blorp typecheck unless
    an explicitly requested Core observation requires the semantic worker.
    Ordinary `check` must make zero OCaml calls.
-4. Under focused tests, compile/run encode exactly one semantic-worker request,
+4. Under focused tests, compile/run build exactly one semantic-worker request,
    accept one decoded response fixture, run `compiler_core_pipeline`, and call
    `try_emit_core_program_c_artifact_with_options`. Do not add a temporary
    subprocess mechanism. Do not make this path production-authoritative until
@@ -298,6 +304,36 @@ Deletion deferred to Checkpoint J:
 - `run_compile_from_frontier_options`
 - `run_file_from_frontier_options`
 - compile/run plan decoders and their OCaml-only tests
+
+Implemented evidence on 2026-07-13:
+
+- `CliRunCheck`, `CliRunCompile`, and `CliRunSource` carry phase-specific typed
+  options over a command-neutral `CliFrontendModuleGraph`;
+- `CliOcamlHostPlan` deliberately has no check variant;
+- `compiler_cli_typecheck.brp` owns neutral in-memory graph typechecking,
+  `compiler_cli_execute.brp` owns direct check execution, and the semantic and
+  backend-heavy compile/run executors remain outside the production CLI import
+  graph;
+- the OCaml check option decoder, frontier variant, runner, and implementation-
+  only tests are deleted;
+- a valid check succeeds with `BLORP_OCAML_HOST_BIN` pointing to a missing
+  executable, while compile still fails through that path, proving the check
+  does not invoke the host;
+- source-graph setup preserves package-configuration diagnostics, including
+  actionable `blorp package fetch <alias>` guidance for an unavailable
+  content-addressed package, and direct check does not cascade into type errors
+  after graph setup fails;
+- focused Blorp execution tests: 3 passed;
+- CLI planning and typed graph tests: 87 passed;
+- CLI gate: 51 passed, including the permanent zero-host regression;
+- CLI deep integration gate: 81 passed, including directory and package-import
+  checks through the production Blorp check path;
+- compiler-unit gate: 1,622 passed; and
+- a clean pinned-bootstrap public CLI build completed successfully. The cold
+  whole-program build took about 14 to 18 minutes on macOS ARM64, while an
+  unchanged follow-up `make` completed in about 2 seconds. The cold-build cost
+  is a performance issue to address separately, not a reason to reintroduce
+  the host boundary.
 
 ## Checkpoint D: Make `CArtifact` A Complete Blorp Boundary
 

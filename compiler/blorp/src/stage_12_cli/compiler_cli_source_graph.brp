@@ -7,10 +7,8 @@ import:
 	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
 	compiler_bridge_protocol: BRIDGE_DOMAIN, BRIDGE_SCHEMA_VERSION
 	compiler_cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
-	compiler_cli_artifact_json: cli_compile_options_json, cli_run_options_json
 	compiler_cli_plan:
 		CliCheckTargetExpansion,
-		CliFrontendCommand(CliFrontendCheck, CliFrontendCompile, CliFrontendRun),
 		CliFrontendGraphContext,
 		CliFrontendGraphSource,
 		CliFrontendImportEdge,
@@ -149,22 +147,12 @@ private pure func single_path(paths: List[String]) -> Option[String]:
 			None
 
 
-func frontend_source_for_action(
-	action: CliAction,
-) -> Option[(CliFrontendCommand, String, JsonValue)]:
+func frontend_source_for_action(action: CliAction) -> Option[String]:
 	match action:
 		CliCompile(args):
-			match single_path(args.files):
-				Some(path):
-					Some((CliFrontendCompile, path, cli_compile_options_json(args)))
-				None:
-					None
+			single_path(args.files)
 		CliRun(args):
-			match single_path(args.files):
-				Some(path):
-					Some((CliFrontendRun, path, cli_run_options_json(args)))
-				None:
-					None
+			single_path(args.files)
 		_:
 			None
 
@@ -718,6 +706,21 @@ private pure func toml_table_string_field(value: TomlValue, field_name: String) 
 			None
 
 
+private pure func toml_table_string_list_field(
+	value: TomlValue,
+	field_name: String,
+) -> Option[List[String]]:
+	match value:
+		TomlTable(fields):
+			match fields.get(field_name):
+				Some(field):
+					toml_string_list_value(field)
+				None:
+					None
+		_:
+			None
+
+
 private pure func toml_string_at(toml: TomlValue, key: String) -> Option[String]:
 	match toml_lookup(toml, key):
 		Some(value):
@@ -791,6 +794,22 @@ private pure func package_alias_string_config(
 			match package_alias_inline_value(toml, package_alias):
 				Some(inline_value):
 					toml_table_string_field(inline_value, field_name)
+				None:
+					None
+
+
+private pure func package_alias_string_list_config(
+	toml: TomlValue,
+	package_alias: String,
+	field_name: String,
+) -> Option[List[String]]:
+	match toml_string_list_at(toml, "packages." + package_alias + "." + field_name):
+		Some(value):
+			Some(value)
+		None:
+			match package_alias_inline_value(toml, package_alias):
+				Some(inline_value):
+					toml_table_string_list_field(inline_value, field_name)
 				None:
 					None
 
@@ -917,11 +936,21 @@ private func cached_package_root_for_pin(pin: String) -> Option[String]:
 			None
 
 
+private pure func package_cache_fetch_help(
+	package_alias: String,
+	locations: List[String],
+) -> String:
+	if locations.length() == 0:
+		"Add from = [...] for package `${package_alias}` and run `blorp package fetch ${package_alias}`, or configure a local path."
+	else:
+		"Run `blorp package fetch ${package_alias}` from the project directory before compiling."
+
+
 private func package_root_for_alias(
 	config_dir: String,
 	toml: TomlValue,
 	package_alias: String,
-) -> Option[String]:
+) -> Result[String, String]:
 	match package_alias_string_config(toml, package_alias, "path"):
 		Some(path):
 			if (
@@ -929,15 +958,40 @@ private func package_root_for_alias(
 					.trim()
 					.length() == 0
 			):
-				None
+				Err("package alias `${package_alias}` has an empty path")
 			else:
-				Some(config_relative_path(config_dir, path))
+				Ok(config_relative_path(config_dir, path))
 		None:
 			match package_alias_string_config(toml, package_alias, "hash"):
 				Some(pin):
-					cached_package_root_for_pin(pin)
+					match normalize_hash_pin(pin):
+						Some(_):
+							match cached_package_root_for_pin(pin):
+								Some(package_root):
+									Ok(package_root)
+								None:
+									locations: List[String] = match package_alias_string_list_config(
+										toml,
+										package_alias,
+										"from",
+									):
+										Some(locations):
+											locations
+										None:
+											[]
+
+									help: String = package_cache_fetch_help(
+										package_alias,
+										locations,
+									)
+
+									Err(
+										"package alias `${package_alias}` cannot use hash ${pin} from the local package cache\nhelp: ${help}",
+									)
+						None:
+							Err("package alias `${package_alias}` has an invalid hash pin: ${pin}")
 				None:
-					None
+					Err("package alias `${package_alias}` must define path or hash")
 
 
 record CliPackageManifest {
@@ -949,7 +1003,14 @@ record CliPackageManifest {
 
 record CliSourceGraphConfig {
 	std_dir: Option[String],
-	source_packages: List[CliFrontendSourcePackage]
+	source_packages: List[CliFrontendSourcePackage],
+	diagnostics: List[String]
+}
+
+
+record CliConfiguredSourcePackages {
+	packages: List[CliFrontendSourcePackage],
+	diagnostics: List[String]
 }
 
 
@@ -1072,12 +1133,13 @@ private pure func config_std_dir_from_toml(config_dir: String, toml: TomlValue) 
 private func source_packages_from_config_toml(
 	config_dir: String,
 	toml: TomlValue,
-) -> List[CliFrontendSourcePackage]:
+) -> CliConfiguredSourcePackages:
 	var packages: List[CliFrontendSourcePackage] = []
+	var diagnostics: List[String] = []
 
 	for package_alias in package_aliases_from_toml(toml):
 		match package_root_for_alias(config_dir, toml, package_alias):
-			Some(package_root):
+			Ok(package_root):
 				match read_source_package(package_alias, package_root):
 					Some(package):
 						if not source_package_seen(
@@ -1087,11 +1149,17 @@ private func source_packages_from_config_toml(
 						):
 							packages = packages.append(package)
 					None:
-						void
-			None:
-				void
+						diagnostics = append_unique_string(
+							diagnostics,
+							"package alias `${package_alias}` does not resolve to a valid source package at `${package_root}`",
+						)
+			Err(message):
+				diagnostics = append_unique_string(diagnostics, message)
 
-	packages
+	{
+		packages = packages,
+		diagnostics = diagnostics
+	}
 
 
 private func source_graph_config(config_path: String) -> CliSourceGraphConfig:
@@ -1101,19 +1169,24 @@ private func source_graph_config(config_path: String) -> CliSourceGraphConfig:
 		Ok(source):
 			match parse_toml(source):
 				Ok(toml):
+					configured_packages = source_packages_from_config_toml(config_dir, toml)
+
 					{
 						std_dir = config_std_dir_from_toml(config_dir, toml),
-						source_packages = source_packages_from_config_toml(config_dir, toml)
+						source_packages = configured_packages.packages,
+						diagnostics = configured_packages.diagnostics
 					}
-				Err(_):
+				Err(message):
 					{
 						std_dir = None,
-						source_packages = []
+						source_packages = [],
+						diagnostics = ["failed to parse `${config_path}`: ${message}"]
 					}
-		Err(_):
+		Err(message):
 			{
 				std_dir = None,
-				source_packages = []
+				source_packages = [],
+				diagnostics = ["failed to read `${config_path}`: ${message}"]
 			}
 
 
@@ -1161,13 +1234,20 @@ private pure func append_unique_packages(
 	result
 
 
-private func source_graph_context_for_sources(
+record CliSourceGraphSetup {
+	context: CliFrontendGraphContext,
+	diagnostics: List[String]
+}
+
+
+private func source_graph_setup_for_sources(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
-) -> CliFrontendGraphContext:
+) -> CliSourceGraphSetup:
 	var std_dir: Option[String] = action_or_env_std_dir(action)
 	var source_packages: List[CliFrontendSourcePackage] = []
 	var package_roots: List[String] = []
+	var diagnostics: List[String] = []
 	cwd_pkg: String = join(getcwd(), "pkg")
 
 	if is_directory(cwd_pkg):
@@ -1184,6 +1264,9 @@ private func source_graph_context_for_sources(
 					std_dir = config.std_dir
 
 				source_packages = append_unique_packages(source_packages, config.source_packages)
+
+				for diagnostic in config.diagnostics:
+					diagnostics = append_unique_string(diagnostics, diagnostic)
 			None:
 				void
 
@@ -1194,9 +1277,12 @@ private func source_graph_context_for_sources(
 				void
 
 	{
-		std_dir = std_dir,
-		source_packages = source_packages,
-		package_roots = package_roots
+		context = {
+			std_dir = std_dir,
+			source_packages = source_packages,
+			package_roots = package_roots
+		},
+		diagnostics = diagnostics
 	}
 
 
@@ -1785,7 +1871,8 @@ func source_graph_modules_for_roots(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
 ) -> Result[List[CliParsedSourceFile], String]:
-	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
+	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
+	context: CliFrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
 	walk ?= source_graph_walk_for_roots(context, normalized_roots)
 	Ok(walk.modules)
@@ -1793,24 +1880,19 @@ func source_graph_modules_for_roots(
 
 func frontend_module_graph_for_roots(
 	action: CliAction,
-	command: CliFrontendCommand,
-	user_args: List[String],
-	options: JsonValue,
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
-	context: CliFrontendGraphContext = source_graph_context_for_sources(action, roots)
+	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
+	context: CliFrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
 	walk ?= source_graph_walk_for_roots(context, normalized_roots)
 
 	Ok({
-		command = command,
-		args = user_args,
-		options = options,
 		context = context,
 		roots = frontend_graph_sources(context, normalized_roots),
 		modules = frontend_graph_sources(context, walk.modules),
 		import_edges = walk.import_edges,
-		diagnostics = [],
+		diagnostics = setup.diagnostics,
 	})
 
 

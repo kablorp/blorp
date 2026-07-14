@@ -1,0 +1,157 @@
+-- Typed in-process execution for source-oriented CLI plans.
+--
+-- Check ends at the Blorp-owned typed frontend and does not import semantic
+-- protocol or backend types.
+import:
+	../stage_03_parse/compiler_parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			ParsedErrorDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedProgram,
+	../stage_06_typecheck/compiler_typed_ast_json: compiler_typed_program_to_json
+	compiler_cli_plan: CliCheckPlan, CliHandledResult
+	compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
+
+
+private pure func parsed_count_summary(
+	kind: String,
+	name: String,
+	count: Int,
+	item_name: String,
+) -> String:
+	"${kind} ${name} with ${count.to_string()} ${item_name}"
+
+
+private pure func parsed_decl_summary(decl: ParsedDecl) -> List[String]:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			["Func ${function_decl.name.text}"]
+		VarParsedDecl(var_decl):
+			if var_decl.is_mutable:
+				["var ${var_decl.name.text}"]
+			else:
+				[var_decl.name.text]
+		ImportBlockParsedDecl(imports, _):
+			imports.map(func(import_decl): "Import ${import_decl.module_path}")
+		ForeignBlockParsedDecl(_, functions, _):
+			functions.map(func(function_decl): "Func ${function_decl.name.text}")
+		RecordParsedDecl(record_decl):
+			if record_decl.is_struct:
+				[
+					parsed_count_summary(
+						"Struct",
+						record_decl.name.text,
+						record_decl.fields.length(),
+						"fields",
+					),
+				]
+			else:
+				[
+					parsed_count_summary(
+						"Record",
+						record_decl.name.text,
+						record_decl.fields.length(),
+						"fields",
+					),
+				]
+		UnionParsedDecl(union_decl):
+			[
+				parsed_count_summary(
+					"Union",
+					union_decl.name.text,
+					union_decl.variants.length(),
+					"variants",
+				),
+			]
+		BuiltinTypeParsedDecl(type_decl):
+			["BuiltinType ${type_decl.name.text}"]
+		TypeAliasParsedDecl(alias_decl):
+			["TypeAlias ${alias_decl.name.text}"]
+		TraitParsedDecl(trait_decl):
+			["Trait ${trait_decl.name.text}"]
+		ImplParsedDecl(impl_decl):
+			["Impl ${impl_decl.trait_name.text}"]
+		PrivateParsedDecl(_, _):
+			["Private"]
+		ParsedErrorDecl(_):
+			["<parse error>"]
+
+
+private pure func parsed_program_summary(program: ParsedProgram) -> String:
+	parsed_lines = program.decls.flat_map(parsed_decl_summary)
+	parsed_lines.join("\n")
+
+
+private pure func append_output(output: String, text: String) -> String:
+	if text.length() == 0:
+		output
+	else if output.length() == 0:
+		text
+	else:
+		output + "\n" + text
+
+
+private pure func append_messages(output: String, messages: List[String]) -> String:
+	var result = output
+
+	for message in messages:
+		result = append_output(result, message)
+
+	result
+
+
+pure func execute_check_plan(plan: CliCheckPlan) -> CliHandledResult:
+	var stdout: String = ""
+	var stderr: String = append_messages("", plan.graph.diagnostics)
+	var failed: Bool = plan.graph.diagnostics.length() != 0
+	multiple_roots: Bool = plan.graph.roots.length() > 1
+
+	if plan.graph.diagnostics.length() == 0:
+		for root in plan.graph.roots:
+			if multiple_roots:
+				stdout = append_output(stdout, "Checking ${root.path}")
+
+			typechecked = typecheck_frontend_root(plan.graph, root, plan.options.debug)
+			errors = typechecked_graph_errors(typechecked)
+
+			if plan.options.dump_ast:
+				stdout = append_output(
+					stdout,
+					parsed_program_summary(typechecked.target.parsed_program),
+				)
+
+			if errors.length() == 0:
+				if plan.options.dump_typed_ast:
+					stdout = append_output(
+						stdout,
+						compiler_typed_program_to_json(
+							typechecked.target.typed_program,
+						).to_string(),
+					)
+
+				stdout = append_output(stdout, "Type checking succeeded.")
+			else:
+				failed = True
+				stderr = append_messages(stderr, errors)
+
+	status: Int = if failed:
+		1
+	else:
+		0
+
+	{
+		status = status,
+		stdout = stdout,
+		stderr = stderr
+	}

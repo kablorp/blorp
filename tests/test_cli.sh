@@ -438,6 +438,9 @@ expect_exit "top-level missing command" 1 "$BLORP_BIN"
 expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
 
 expect_exit "check success" 0 "$BLORP_BIN" check --no-format "$valid_prog"
+expect_exit "check bypasses OCaml host" 0 \
+    env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+    "$BLORP_BIN" check --no-format "$valid_prog"
 expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
 expect_output_contains "check multi-file success" 0 "Checking " \
     "$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
