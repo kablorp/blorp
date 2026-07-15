@@ -8389,7 +8389,21 @@ let impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
 let rec decl_jsons ~function_names ~consumed_params ~reg ~is_private enum_names
     value_record_names heap_record_names union_names enum_constructors
     global_def_ids global_names index (decl : Core.core_decl) =
-  let path = Printf.sprintf "program.decls[%d]" index in
+  let declaration_label =
+    match decl.cd_desc with
+    | Core.CDFunc func -> "function " ^ func.cf_name
+    | Core.CDVar var -> "variable " ^ Core.Var.to_string var.cv_name
+    | Core.CDTrait trait -> "trait " ^ trait.ct_name
+    | Core.CDType type_decl -> "type " ^ type_decl.type_name
+    | Core.CDRecord record_decl -> "record " ^ record_decl.record_name
+    | Core.CDImpl impl -> "impl " ^ impl.ci_trait
+    | Core.CDImport import_decl -> "import " ^ import_decl.import_module
+    | Core.CDTypeAlias alias_decl -> "type alias " ^ alias_decl.alias_name
+    | Core.CDPrivate _ -> "private declaration"
+  in
+  let path =
+    Printf.sprintf "program.decls[%d](%s)" index declaration_label
+  in
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
       Ok []

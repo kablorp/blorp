@@ -179,6 +179,29 @@ let test_vector_minmax_lookup_preserves_type_dispatch () =
         (Blorp.Codegen_builtins.lookup "std/vector" name))
     [ ("max", "blorp_max"); ("min", "blorp_min") ]
 
+let test_channel_builtins_have_matching_prelude_and_module_entries () =
+  List.iter
+    (fun (name, expected) ->
+      Alcotest.(check (option string))
+        ("prelude " ^ name) (Some expected)
+        (Blorp.Codegen_builtins.lookup "" name);
+      Alcotest.(check (option string))
+        ("std/channel " ^ name) (Some expected)
+        (Blorp.Codegen_builtins.lookup "std/channel" name))
+    [
+      ("sleep", "blorp_sleep");
+      ("yield_now", "blorp_yield_now");
+      ("max_threads", "blorp_max_threads");
+      ("channel", "blorp_channel_new");
+      ("send", "blorp_channel_send");
+      ("recv", "blorp_channel_recv");
+      ("try_send", "blorp_channel_try_send");
+      ("try_recv", "blorp_channel_try_recv");
+      ("recv_timeout", "blorp_channel_recv_timeout");
+      ("send_timeout", "blorp_channel_send_timeout");
+      ("seal", "blorp_channel_seal");
+    ]
+
 let test_builtin_effect_metadata_classifies_typechecker_sets () =
   let open Blorp.Builtin_metadata in
   List.iter
@@ -1951,6 +1974,9 @@ let suite =
           test_builtin_lookup_uses_exact_module_paths;
         Alcotest.test_case "vector minmax lookup preserves type dispatch"
           `Quick test_vector_minmax_lookup_preserves_type_dispatch;
+        Alcotest.test_case
+          "channel builtins have matching prelude and module entries" `Quick
+          test_channel_builtins_have_matching_prelude_and_module_entries;
         Alcotest.test_case "list IR HOFs have no runtime C ABI" `Quick
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick

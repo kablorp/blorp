@@ -122,6 +122,8 @@ import:
 	../stage_05_types/compiler_context:
 		CompilerContext,
 		compiler_find_resource_cleanup,
+		compiler_fresh_meta_with_origin,
+		compiler_unify_symmetric,
 		compiler_zonk_type,
 	../stage_05_types/compiler_dim_solver:
 		CompilerDimSolveResult(
@@ -201,15 +203,15 @@ import:
 		compiler_env_lookup,
 		compiler_env_lookup_in_current_scope,
 		compiler_env_lookup_is_outermost_scope,
-		compiler_env_lookup_module_ufcs_methods,
-		compiler_env_lookup_ufcs_methods,
 		compiler_env_lookup_with_scope_depth,
 		compiler_env_pop_scope,
 		compiler_env_push_scope,
 		compiler_env_resolve_alias,
 		compiler_env_resolve_alias_head,
+		compiler_env_resolve_module_ufcs_method,
 		compiler_env_resolve_overload,
 		compiler_env_resolve_trait_obligation,
+		compiler_env_resolve_ufcs_method,
 		compiler_env_scoped_resource_unavailable_owner,
 		compiler_env_select_overload_for_args,
 		compiler_env_symbols_named,
@@ -255,7 +257,9 @@ import:
 		compiler_is_signed_integer_type,
 		compiler_is_unsigned_integer_type,
 		compiler_normalize_dim,
+		compiler_normalize_type_name,
 		compiler_optional_type_copy,
+		compiler_occurs_in,
 		compiler_type_bool,
 		compiler_type_char,
 		compiler_type_contains_meta,
@@ -263,6 +267,7 @@ import:
 		compiler_type_float,
 		compiler_type_int,
 		compiler_type_list,
+		compiler_type_name_copy,
 		compiler_type_string,
 		compiler_type_subst_entry,
 		compiler_type_to_string,
@@ -740,6 +745,25 @@ private record CompilerListPatternCoverage {
 private record CompilerMatchResultTypeResult {
 	context: CompilerInferContext,
 	result_type: Option[CompilerType]
+}
+
+
+private record CompilerEqualityCompatibility {
+	context: CompilerInferContext,
+	left_type: CompilerType,
+	right_type: CompilerType
+}
+
+
+private record CompilerConstructorTypeArgsStep {
+	context: CompilerInferContext,
+	args: List[CompilerType]
+}
+
+
+private record CompilerConstructorTypeStep {
+	context: CompilerInferContext,
+	typ: CompilerType
 }
 
 
@@ -6567,6 +6591,37 @@ private pure func compiler_type_satisfies_trait(
 	) == CompilerTraitObligationSatisfied
 
 
+private pure func compiler_is_structural_equality_collection(typ: CompilerType) -> Bool:
+	match typ:
+		CompilerNamedType(name, _):
+			normalized_name: String = compiler_normalize_type_name(name)
+
+			normalized_name == "List" or normalized_name == "Dict" or normalized_name == "Set"
+		_:
+			False
+
+
+private pure func compiler_equality_compatibility(
+	context: CompilerInferContext,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerEqualityCompatibility]:
+	resolved_left = compiler_env_resolve_alias(context.state.env, left)
+	resolved_right = compiler_env_resolve_alias(context.state.env, right)
+
+	match compiler_unify_symmetric(context.state.context, resolved_left, resolved_right):
+		Some(step):
+			next_state = { context.state | context = step.context }
+			next_context = compiler_infer_context_with_state(context, next_state)
+			Some({
+				context = next_context,
+				left_type = compiler_zonk_type(step.context, resolved_left),
+				right_type = compiler_zonk_type(step.context, resolved_right),
+			})
+		None:
+			None
+
+
 private pure func compiler_open_exhaustiveness_scalar_name(typ: CompilerType) -> Option[String]:
 	if (
 		compiler_is_any_integer_type(typ)
@@ -6731,52 +6786,58 @@ private pure func compiler_check_equality_binary_op(
 	left_type: CompilerType,
 	right_type: CompilerType,
 ) -> CompilerCheckedType:
-	left_param_name = compiler_type_param_name(context, left_type)
-	right_param_name = compiler_type_param_name(context, right_type)
+	match compiler_equality_compatibility(context, left_type, right_type):
+		Some(compatibility):
+			left_param_name = compiler_type_param_name(
+				compatibility.context,
+				compatibility.left_type,
+			)
+			right_param_name = compiler_type_param_name(
+				compatibility.context,
+				compatibility.right_type,
+			)
 
-	if (
-		compiler_types_equal(left_type, right_type)
-		and ((
-			compiler_is_equality_primitive_type(left_type)
-			or compiler_is_enum_value_type(context, left_type)
-		))
-	):
-		compiler_checked_type(context, compiler_type_bool())
-	else:
-		match (left_param_name, right_param_name):
-			(Some(left_name), Some(right_name)):
-				if left_name != right_name:
-					next = compiler_infer_error(
-						context,
-						"Cannot compare type parameters " + compiler_type_to_string(
-							left_type,
-						) + " and " + compiler_type_to_string(
-							right_type,
-						) + " because equality requires the same type",
-					)
-					compiler_checked_type(next, compiler_type_void())
-				else if compiler_type_satisfies_trait(context, left_type, "Equatable"):
-					compiler_checked_type(context, compiler_type_bool())
-				else:
-					next = compiler_infer_error(
-						context,
-						"Type parameter '" + left_name + "' requires Equatable bound for == and " + "!= operators. Add '" + left_name + ": Equatable' to the function signature",
-					)
-					compiler_checked_type(next, compiler_type_void())
-			_:
-				if (
-					compiler_types_equal(left_type, right_type)
-					and compiler_type_satisfies_trait(context, left_type, "Equatable")
-				):
-					compiler_checked_type(context, compiler_type_bool())
-				else:
-					next = compiler_infer_error(
-						context,
-						"Equality comparison requires compatible types, got " + compiler_type_to_string(
-							left_type,
-						) + " and " + compiler_type_to_string(right_type),
-					)
-					compiler_checked_type(next, compiler_type_void())
+			if (
+				compiler_is_equality_primitive_type(compatibility.left_type)
+				or compiler_is_enum_value_type(compatibility.context, compatibility.left_type)
+				or compiler_is_structural_equality_collection(compatibility.left_type)
+			):
+				compiler_checked_type(compatibility.context, compiler_type_bool())
+			else:
+				match (left_param_name, right_param_name):
+					(Some(left_name), Some(right_name)):
+						if left_name != right_name:
+							next = compiler_infer_error(
+								compatibility.context,
+								"Cannot compare type parameters " + compiler_type_to_string(
+									compatibility.left_type,
+								) + " and " + compiler_type_to_string(
+									compatibility.right_type,
+								) + " because equality requires the same type",
+							)
+							compiler_checked_type(next, compiler_type_void())
+						else if compiler_type_satisfies_trait(
+							compatibility.context,
+							compatibility.left_type,
+							"Equatable",
+						):
+							compiler_checked_type(compatibility.context, compiler_type_bool())
+						else:
+							next = compiler_infer_error(
+								compatibility.context,
+								"Type parameter '" + left_name + "' requires Equatable bound for == and " + "!= operators. Add '" + left_name + ": Equatable' to the function signature",
+							)
+							compiler_checked_type(next, compiler_type_void())
+					_:
+						compiler_checked_type(compatibility.context, compiler_type_bool())
+		None:
+			next = compiler_infer_error(
+				context,
+				"Equality comparison requires compatible types, got " + compiler_type_to_string(
+					left_type,
+				) + " and " + compiler_type_to_string(right_type),
+			)
+			compiler_checked_type(next, compiler_type_void())
 
 
 private pure func compiler_check_binary_op(
@@ -7039,31 +7100,57 @@ private pure func compiler_var_origin_resource_dependencies(
 			[]
 
 
-private pure func compiler_constructor_type_args(type_params: List[String]) -> List[CompilerType]:
-	var result: List[CompilerType] = []
+private pure func compiler_inferred_constructor_type_args(
+	context: CompilerInferContext,
+	type_params: List[String],
+	field_types: List[CompilerType],
+) -> CompilerConstructorTypeArgsStep:
+	var compiler_context: CompilerContext = context.state.context
+	var args: List[CompilerType] = []
 
 	for param in type_params:
-		result = result.append(CompilerTypeVar(param))
+		if field_types.any(func(field_type): compiler_occurs_in(param, field_type)):
+			args = args.append(CompilerTypeVar(param))
+		else:
+			step = compiler_fresh_meta_with_origin(compiler_context, param)
+			compiler_context = step.context
+			args = args.append(step.meta_type)
 
-	result
+	next_state = { context.state | context = compiler_context }
+	{
+		context = compiler_infer_context_with_state(context, next_state),
+		args = args
+	}
 
 
 private pure func compiler_constructor_return_type(
 	context: CompilerInferContext,
 	parent_type: String,
 	type_params: List[String],
-) -> CompilerType:
+	field_types: List[CompilerType],
+) -> CompilerConstructorTypeStep:
 	match context.expected_type:
 		Some(CompilerNamedType(expected_name, args)):
 			if expected_name == parent_type and args.length() == type_params.length():
-				CompilerNamedType(
-					parent_type,
-					args.map(compiler_type_copy),
-				)
+				{
+					context = context,
+					typ = CompilerNamedType(
+						parent_type,
+						args.map(compiler_type_copy),
+					)
+				}
 			else:
-				CompilerNamedType(parent_type, compiler_constructor_type_args(type_params))
+				step = compiler_inferred_constructor_type_args(context, type_params, field_types)
+				{
+					context = step.context,
+					typ = CompilerNamedType(parent_type, step.args)
+				}
 		_:
-			CompilerNamedType(parent_type, compiler_constructor_type_args(type_params))
+			step = compiler_inferred_constructor_type_args(context, type_params, field_types)
+			{
+				context = step.context,
+				typ = CompilerNamedType(parent_type, step.args)
+			}
 
 
 private pure func compiler_constructor_return_subst(
@@ -7103,17 +7190,25 @@ private pure func compiler_constructor_expr_type(
 	parent_type: String,
 	type_params: List[String],
 	field_types: List[CompilerType],
-) -> CompilerType:
-	return_type = compiler_constructor_return_type(context, parent_type, type_params)
+) -> CompilerConstructorTypeStep:
+	return_step = compiler_constructor_return_type(
+		context,
+		parent_type,
+		type_params,
+		field_types,
+	)
 
 	if field_types.length() == 0:
-		return_type
+		return_step
 	else:
-		CompilerFunctionType(
-			True,
-			compiler_constructor_field_types(type_params, return_type, field_types),
-			return_type,
-		)
+		{
+			context = return_step.context,
+			typ = CompilerFunctionType(
+				True,
+				compiler_constructor_field_types(type_params, return_step.typ, field_types),
+				return_step.typ,
+			)
+		}
 
 
 private pure func compiler_infer_constructor_name_expr(
@@ -7121,12 +7216,13 @@ private pure func compiler_infer_constructor_name_expr(
 	name: ParsedIdentifier,
 	ctor: CompilerConstructorSymbol,
 ) -> CompilerInferResult:
-	constructor_type = compiler_constructor_expr_type(
+	constructor_step = compiler_constructor_expr_type(
 		context,
 		ctor.parent_type,
 		ctor.type_params,
 		ctor.field_types,
 	)
+	constructor_type = constructor_step.typ
 	resolved_call = Some(
 		compiler_resolved_call_from_constructor(
 			name.text,
@@ -7146,7 +7242,7 @@ private pure func compiler_infer_constructor_name_expr(
 		),
 	)
 
-	compiler_infer_result(context, expr)
+	compiler_infer_result(constructor_step.context, expr)
 
 
 private pure func compiler_module_path_matches_span(
@@ -7184,22 +7280,22 @@ private pure func compiler_module_symbol_visible_as_bare(
 
 private pure func compiler_constructor_visible_as_bare(
 	state: CompilerTypecheckState,
+	span: CompilerSourceSpan,
 	local_name: String,
+	original_name: String,
 	ctor: CompilerConstructorSymbol,
 ) -> Bool:
-	if compiler_typecheck_state_type_home_is_imported(state, ctor.parent_type):
-		match compiler_typecheck_state_find_type_home(state, ctor.parent_type):
-			Some(module_path):
-				compiler_typecheck_state_has_import_binding(
-					state,
-					local_name,
-					module_path,
-					Some(local_name),
-				)
-			None:
-				False
-	else:
-		True
+	match compiler_typecheck_state_find_type_home(state, ctor.parent_type):
+		Some(module_path):
+			compiler_module_symbol_visible_as_bare(
+				state,
+				span,
+				local_name,
+				Some(module_path),
+				original_name,
+			)
+		None:
+			True
 
 
 private pure func compiler_symbol_visible_as_bare(
@@ -7226,9 +7322,43 @@ private pure func compiler_symbol_visible_as_bare(
 				symbol.name,
 			)
 		CompilerConstructorSymbolKind(ctor):
-			compiler_constructor_visible_as_bare(state, local_name, ctor)
+			compiler_constructor_visible_as_bare(state, span, local_name, symbol.name, ctor)
 		_:
 			True
+
+
+private pure func compiler_symbol_is_lexical_or_current_module(
+	state: CompilerTypecheckState,
+	span: CompilerSourceSpan,
+	symbol: CompilerSymbol,
+) -> Bool:
+	match symbol.kind:
+		CompilerVarSymbolKind(var_symbol):
+			match var_symbol.module_path:
+				Some(module_path):
+					compiler_module_path_matches_span(module_path, span)
+				None:
+					True
+		CompilerFuncSymbolKind(func_symbol):
+			match func_symbol.module_path:
+				Some(module_path):
+					compiler_module_path_matches_span(module_path, span)
+				None:
+					func_symbol.origin != CompilerBuiltinFunc
+		CompilerConstructorSymbolKind(ctor):
+			match compiler_typecheck_state_find_type_home(state, ctor.parent_type):
+				Some(module_path):
+					(
+						not compiler_typecheck_state_type_home_is_imported(
+							state,
+							ctor.parent_type,
+						)
+						and compiler_module_path_matches_span(module_path, span)
+					)
+				None:
+					False
+		_:
+			False
 
 
 private pure func compiler_symbol_from_imported_binding(
@@ -7236,39 +7366,33 @@ private pure func compiler_symbol_from_imported_binding(
 	local_name: String,
 	binding: CompilerImportedNameBinding,
 ) -> Option[CompilerSymbol]:
-	match compiler_env_get_module_var_symbol(
+	module_path = binding.module_path
+	original_name = binding.original_name
+
+	match compiler_find_module_constructor(
+		context,
 		context.state.env,
-		binding.module_path,
-		binding.original_name,
+		compiler_type_name_copy(module_path),
+		compiler_type_name_copy(original_name),
 	):
-		Some(var_symbol):
-			Some({
-				name = local_name,
-				kind = CompilerVarSymbolKind(var_symbol),
-			})
+		Some(ctor):
+			Some({ name = local_name, kind = CompilerConstructorSymbolKind(ctor) })
 		None:
 			match compiler_env_get_module_func_symbol(
 				context.state.env,
-				binding.module_path,
-				binding.original_name,
+				compiler_type_name_copy(module_path),
+				compiler_type_name_copy(original_name),
 			):
 				Some(func_symbol):
-					Some({
-						name = local_name,
-						kind = CompilerFuncSymbolKind(func_symbol),
-					})
+					Some({ name = local_name, kind = CompilerFuncSymbolKind(func_symbol) })
 				None:
-					match compiler_find_module_constructor(
-						context,
+					match compiler_env_get_module_var_symbol(
 						context.state.env,
-						binding.module_path,
-						binding.original_name,
+						compiler_type_name_copy(module_path),
+						compiler_type_name_copy(original_name),
 					):
-						Some(ctor):
-							Some({
-								name = local_name,
-								kind = CompilerConstructorSymbolKind(ctor),
-							})
+						Some(var_symbol):
+							Some({ name = local_name, kind = CompilerVarSymbolKind(var_symbol) })
 						None:
 							None
 
@@ -7401,8 +7525,10 @@ private pure func compiler_lookup_bare_symbol(
 	context: CompilerInferContext,
 	name: ParsedIdentifier,
 ) -> Option[CompilerSymbol]:
-	var visible: Option[CompilerSymbol] = None
+	var local_or_current: Option[CompilerSymbol] = None
+	var visible_fallback: Option[CompilerSymbol] = None
 	var builtin_fallback: Option[CompilerSymbol] = None
+	imported_binding = compiler_typecheck_state_find_imported_name(context.state, name.text)
 
 	for symbol in compiler_env_symbols_named(context.state.env, name.text):
 		match symbol.kind:
@@ -7410,32 +7536,57 @@ private pure func compiler_lookup_bare_symbol(
 				if func_symbol.origin == CompilerBuiltinFunc:
 					if builtin_fallback.is_none():
 						builtin_fallback = Some(symbol)
-				else if compiler_symbol_visible_as_bare(
-					context.state,
-					name.span,
-					name.text,
-					symbol,
-				):
-					visible = Some(symbol)
-					break
+				else:
+					if compiler_symbol_is_lexical_or_current_module(
+						context.state, name.span, symbol,
+					):
+						local_or_current = Some(symbol)
+						break
+					else if (
+							visible_fallback.is_none()
+							and compiler_symbol_visible_as_bare(
+								context.state,
+								name.span,
+								name.text,
+								symbol,
+							)
+						):
+							visible_fallback = Some(symbol)
 			_:
-				if compiler_symbol_visible_as_bare(context.state, name.span, name.text, symbol):
-					visible = Some(symbol)
+				if compiler_symbol_is_lexical_or_current_module(context.state, name.span, symbol):
+					local_or_current = Some(symbol)
 					break
+				else if (
+						visible_fallback.is_none()
+						and compiler_symbol_visible_as_bare(context.state, name.span, name.text, symbol)
+					):
+						visible_fallback = Some(symbol)
 
-	match visible:
+	match local_or_current:
 		Some(symbol):
 			Some(symbol)
 		None:
-			match compiler_typecheck_state_find_imported_name(context.state, name.text):
+			match imported_binding:
 				Some(binding):
-					match compiler_symbol_from_imported_binding(context, name.text, binding):
+					match compiler_symbol_from_imported_binding(
+						context,
+						compiler_type_name_copy(name.text),
+						binding,
+					):
 						Some(imported_symbol):
 							Some(imported_symbol)
 						None:
-							builtin_fallback
+							match visible_fallback:
+								Some(symbol):
+									Some(symbol)
+								None:
+									builtin_fallback
 				None:
-					builtin_fallback
+					match visible_fallback:
+						Some(symbol):
+							Some(symbol)
+						None:
+							builtin_fallback
 
 
 private pure func compiler_source_name_for_imported_module_path(
@@ -7553,22 +7704,20 @@ private pure func compiler_infer_name_expr(
 						),
 					)
 					compiler_infer_result(next_context, expr)
+				CompilerConstructorSymbolKind(ctor):
+					compiler_infer_constructor_name_expr(context, name, ctor)
 				_:
-					match compiler_env_get_constructor(context.state.env, name.text):
-						Some(ctor):
-							compiler_infer_constructor_name_expr(context, name, ctor)
-						None:
-							next = compiler_infer_error(
-								context,
-								"`" + name.text + "` is not a value",
-							)
-							compiler_infer_result(
-								next,
-								CompilerTypedNameExpr(
-									name,
-									compiler_inferred_info(next, compiler_type_void()),
-								),
-							)
+					next = compiler_infer_error(
+						context,
+						"`" + name.text + "` is not a value",
+					)
+					compiler_infer_result(
+						next,
+						CompilerTypedNameExpr(
+							name,
+							compiler_inferred_info(next, compiler_type_void()),
+						),
+					)
 		None:
 			match compiler_lookup_trait_method_callee(context, name):
 				Some(callee):
@@ -8789,25 +8938,29 @@ private pure func compiler_typed_qualified_module_constructor_expr(
 	field: ParsedIdentifier,
 	span: CompilerSourceSpan,
 	ctor: CompilerConstructorSymbol,
-) -> CompilerTypedExpr:
-	constructor_type = compiler_constructor_expr_type(
+) -> CompilerInferResult:
+	constructor_step = compiler_constructor_expr_type(
 		context,
 		ctor.parent_type,
 		ctor.type_params,
 		ctor.field_types,
 	)
+	constructor_type = constructor_step.typ
 
-	compiler_typed_qualified_module_field_expr(
-		module_ident,
-		field,
-		span,
-		constructor_type,
-		Some(
-			compiler_resolved_call_from_constructor(
-				field.text,
-				ctor.constructor_id,
-				ctor.parent_type,
-				constructor_type,
+	compiler_infer_result(
+		constructor_step.context,
+		compiler_typed_qualified_module_field_expr(
+			module_ident,
+			field,
+			span,
+			constructor_type,
+			Some(
+				compiler_resolved_call_from_constructor(
+					field.text,
+					ctor.constructor_id,
+					ctor.parent_type,
+					constructor_type,
+				),
 			),
 		),
 	)
@@ -8853,14 +9006,15 @@ private pure func compiler_infer_qualified_module_callee(
 										field.text,
 									):
 										Some(ctor):
-											typed = compiler_typed_qualified_module_constructor_expr(
-												context,
-												module_ident,
-												field,
-												span,
-												ctor,
+											Some(
+												compiler_typed_qualified_module_constructor_expr(
+													context,
+													module_ident,
+													field,
+													span,
+													ctor,
+												),
 											)
-											Some(compiler_infer_result(context, typed))
 										None:
 											None
 						None:
@@ -8927,14 +9081,15 @@ private pure func compiler_infer_qualified_module_field_expr(
 										field.text,
 									):
 										Some(ctor):
-											typed = compiler_typed_qualified_module_constructor_expr(
-												context,
-												module_ident,
-												field,
-												span,
-												ctor,
+											Some(
+												compiler_typed_qualified_module_constructor_expr(
+													context,
+													module_ident,
+													field,
+													span,
+													ctor,
+												),
 											)
-											Some(compiler_infer_result(context, typed))
 										None:
 											next = compiler_infer_error(
 												context,
@@ -10388,12 +10543,12 @@ private pure func compiler_infer_qualified_module_ufcs_call_expr(
 											receiver_result.expr,
 										)
 
-										match compiler_env_lookup_module_ufcs_methods(
+										match compiler_env_resolve_module_ufcs_method(
 											context.state.env,
 											module_path,
 											method.text,
 											receiver_type,
-										).get(0):
+										):
 											Some(entry):
 												compiler_infer_ufcs_call_with_receiver_result(
 													context,
@@ -10558,11 +10713,11 @@ private pure func compiler_infer_ufcs_call_expr(
 				else:
 					receiver_type = compiler_typed_expr_value_type(receiver_result.expr)
 
-					match compiler_env_lookup_ufcs_methods(
+					match compiler_env_resolve_ufcs_method(
 						context.state.env,
 						method.text,
 						receiver_type,
-					).get(0):
+					):
 						Some(entry):
 							compiler_infer_ufcs_call_with_receiver_result(
 								context,
@@ -12624,33 +12779,58 @@ private pure func compiler_types_compatible_for_inference(
 	compiler_types_compatible_with_params(type_params, resolved_expected, resolved_actual)
 
 
-private pure func compiler_common_inferred_type(
+private pure func compiler_common_inferred_type_without_meta(
 	context: CompilerInferContext,
 	left: CompilerType,
 	right: CompilerType,
-) -> Option[CompilerType]:
+) -> Option[CompilerCheckedType]:
 	if compiler_types_equal(left, right):
-		Some(compiler_type_copy(left))
+		Some(compiler_checked_type(context, left))
 	else if compiler_types_compatible_for_inference(context, left, right):
-		Some(compiler_type_copy(left))
+		Some(compiler_checked_type(context, left))
 	else if compiler_types_compatible_for_inference(context, right, left):
-		Some(compiler_type_copy(right))
+		Some(compiler_checked_type(context, right))
 	else:
 		match (left, right):
 			(CompilerConstIntType(_), CompilerConstIntType(_)):
-				Some(compiler_type_int())
+				Some(compiler_checked_type(context, compiler_type_int()))
 			(CompilerConstIntType(_), CompilerNamedType(name, args)):
 				if name == "Int" and args.length() == 0:
-					Some(compiler_type_int())
+					Some(compiler_checked_type(context, compiler_type_int()))
 				else:
 					None
 			(CompilerNamedType(name, args), CompilerConstIntType(_)):
 				if name == "Int" and args.length() == 0:
-					Some(compiler_type_int())
+					Some(compiler_checked_type(context, compiler_type_int()))
 				else:
 					None
 			_:
 				None
+
+
+private pure func compiler_common_inferred_type(
+	context: CompilerInferContext,
+	left: CompilerType,
+	right: CompilerType,
+) -> Option[CompilerCheckedType]:
+	if compiler_type_contains_meta(left) or compiler_type_contains_meta(right):
+		resolved_left = compiler_env_resolve_alias(context.state.env, left)
+		resolved_right = compiler_env_resolve_alias(context.state.env, right)
+
+		match compiler_unify_symmetric(context.state.context, resolved_left, resolved_right):
+			Some(step):
+				next_state = { context.state | context = step.context }
+				next_context = compiler_infer_context_with_state(context, next_state)
+				Some(
+					compiler_checked_type(
+						next_context,
+						compiler_zonk_type(step.context, left),
+					),
+				)
+			None:
+				None
+	else:
+		compiler_common_inferred_type_without_meta(context, left, right)
 
 
 private pure func compiler_type_range() -> CompilerType:
@@ -16344,10 +16524,10 @@ private pure func compiler_match_result_type(
 			}
 		Some(expected):
 			match compiler_common_inferred_type(context, expected, branch_type):
-				Some(common_type):
+				Some(common):
 					{
-						context = compiler_infer_context_copy(context),
-						result_type = Some(common_type)
+						context = common.context,
+						result_type = Some(common.typ)
 					}
 				None:
 					{
@@ -17033,18 +17213,18 @@ private pure func compiler_infer_if_expr(
 			)
 			else_type = compiler_typed_expr_semantic_type(else_result.expr)
 
-			match compiler_common_inferred_type(context, then_type, else_type):
-				Some(result_type):
+			match compiler_common_inferred_type(else_result.context, then_type, else_type):
+				Some(common):
 					result_context = compiler_infer_context_with_state(
 						context,
-						else_result.context.state,
+						common.context.state,
 					)
 					typed = CompilerTypedIfExpr(
 						condition_result.expr,
 						then_result.expr,
 						Some(else_result.expr),
 						span,
-						compiler_inferred_info(result_context, result_type),
+						compiler_inferred_info(result_context, common.typ),
 					)
 					compiler_infer_result(result_context, typed)
 				None:
@@ -17898,12 +18078,18 @@ private pure func compiler_infer_assign_expr(
 						)
 						compiler_infer_invalid_assign_target_result(next_context, name, value, span)
 				_:
-					next_context = compiler_assign_to_non_var_error(
-						context,
+					if compiler_env_lookup_in_current_scope(
+						context.state.env,
 						name.text,
-						lookup.symbol.kind,
-					)
-					compiler_infer_invalid_assign_target_result(next_context, name, value, span)
+					).is_none():
+						compiler_infer_implicit_assign_binding(context, name, value, span)
+					else:
+						next_context = compiler_assign_to_non_var_error(
+							context,
+							name.text,
+							lookup.symbol.kind,
+						)
+						compiler_infer_invalid_assign_target_result(next_context, name, value, span)
 
 
 private pure func compiler_compound_assign_binary_op(op: ParsedCompoundAssignOp) -> ParsedBinaryOp:

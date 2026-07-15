@@ -204,7 +204,9 @@ record ConstructorCallContract {
 
 record PerceusEnv {
 	managed_type_names: List[String],
-	constructor_contracts: List[ConstructorCallContract],
+	constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]],
+	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
+	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	function_names: List[String],
 	constructor_names: List[String],
 	direct_user_call_contracts_by_name: Dict[String, List[Int]],
@@ -244,7 +246,9 @@ private union TemporaryBindingContractPlan:
 pure func empty_env() -> PerceusEnv:
 	{
 		managed_type_names = DEFAULT_MANAGED_TYPE_NAMES,
-		constructor_contracts = [],
+		constructor_contracts_by_name = {},
+		constructor_contracts_by_def_id = {},
+		constructor_contracts_by_parent_name = {},
 		function_names = [],
 		constructor_names = [],
 		direct_user_call_contracts_by_name = {},
@@ -469,7 +473,9 @@ private pure func lookup_direct_user_call_contract(
 
 pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var managed_type_names: List[String] = DEFAULT_MANAGED_TYPE_NAMES
-	var constructor_contracts: List[ConstructorCallContract] = []
+	var constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]] = {}
+	var constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]] = {}
+	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 
 	for decl in program.decls:
@@ -484,15 +490,58 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					arity: Int = variant.fields.length()
 
 					if arity > 0:
-						constructor_contracts = constructor_contracts.append({
+						entry: ConstructorCallContract = {
 							parent_type_name = union_decl.name,
 							name = variant.name,
 							def_id = variant.def_id,
 							contract = {
 								args = transfer_args(arity),
 								result = ReturnOwned
-							},
-						})
+							}
+						}
+
+						contracts_with_name: List[ConstructorCallContract] = match constructor_contracts_by_name.get(
+							entry.name,
+						):
+							Some(contracts):
+								contracts
+							None:
+								[]
+
+						constructor_contracts_by_name = constructor_contracts_by_name.set(
+							entry.name,
+							contracts_with_name.append(entry),
+						)
+
+						contracts_with_parent: List[ConstructorCallContract] = match constructor_contracts_by_parent_name.get(
+							entry.parent_type_name,
+						):
+							Some(contracts):
+								contracts
+							None:
+								[]
+
+						constructor_contracts_by_parent_name = constructor_contracts_by_parent_name.set(
+							entry.parent_type_name,
+							contracts_with_parent.append(entry),
+						)
+
+						match entry.def_id:
+							Some(def_id):
+								contracts_with_def_id: List[ConstructorCallContract] = match constructor_contracts_by_def_id.get(
+									def_id,
+								):
+									Some(contracts):
+										contracts
+									None:
+										[]
+
+								constructor_contracts_by_def_id = constructor_contracts_by_def_id.set(
+									def_id,
+									contracts_with_def_id.append(entry),
+								)
+							None:
+								void
 					else:
 						void
 			HeapRecordDecl(record_decl):
@@ -516,7 +565,9 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 
 	{
 		managed_type_names = managed_type_names,
-		constructor_contracts = constructor_contracts,
+		constructor_contracts_by_name = constructor_contracts_by_name,
+		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
+		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		function_names = CoreClosure.capture_function_names(program),
 		constructor_names = CoreClosure.capture_constructor_names(program),
 		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
@@ -602,22 +653,6 @@ pure func borrow_contract_for_signature(
 	}
 
 
-private pure func optional_int_equal(left: Option[Int], right: Option[Int]) -> Bool:
-	match left:
-		Some(left_value):
-			match right:
-				Some(right_value):
-					left_value == right_value
-				None:
-					False
-		None:
-			match right:
-				Some(right_value):
-					False
-				None:
-					True
-
-
 private pure func contract_matches_arity(contract: OwnershipCallContract, arg_count: Int) -> Bool:
 	contract.args.length() == arg_count
 
@@ -633,30 +668,25 @@ private pure func optional_constructor_parent_name(typ: CoreType) -> Option[Stri
 
 
 private pure func constructor_parent_is_known(env: PerceusEnv, parent_type_name: String) -> Bool:
-	var found: Bool = False
-
-	for entry in env.constructor_contracts:
-		if entry.parent_type_name == parent_type_name:
-			found = True
-			break
-		else:
-			void
-
-	found
+	env.constructor_contracts_by_parent_name.contains(parent_type_name)
 
 
 private pure func constructor_contract_by_def_id(
 	env: PerceusEnv,
-	def_id: Option[Int],
+	def_id: Int,
 	arg_count: Int,
 ) -> Option[OwnershipCallContract]:
 	var found: Option[OwnershipCallContract] = None
 
-	for entry in env.constructor_contracts:
-		if (
-			optional_int_equal(entry.def_id, def_id)
-			and contract_matches_arity(entry.contract, arg_count)
-		):
+	entries: List[ConstructorCallContract] = match env.constructor_contracts_by_def_id.get(def_id):
+		Some(contracts):
+			contracts
+		None:
+			[]
+
+	-- Unscoped lookup preserves the historical last matching declaration.
+	for entry in entries:
+		if contract_matches_arity(entry.contract, arg_count):
 			found = Some(entry.contract)
 		else:
 			void
@@ -671,8 +701,15 @@ private pure func constructor_contract_by_name(
 ) -> Option[OwnershipCallContract]:
 	var found: Option[OwnershipCallContract] = None
 
-	for entry in env.constructor_contracts:
-		if entry.name == name and contract_matches_arity(entry.contract, arg_count):
+	entries: List[ConstructorCallContract] = match env.constructor_contracts_by_name.get(name):
+		Some(contracts):
+			contracts
+		None:
+			[]
+
+	-- Unscoped lookup preserves the historical last matching declaration.
+	for entry in entries:
+		if contract_matches_arity(entry.contract, arg_count):
 			found = Some(entry.contract)
 		else:
 			void
@@ -689,12 +726,20 @@ private pure func constructor_contract_by_return_type(
 ) -> Option[OwnershipCallContract]:
 	var by_def_id: Option[OwnershipCallContract] = None
 
+	entries: List[ConstructorCallContract] = match env.constructor_contracts_by_parent_name.get(
+		parent_type_name,
+	):
+		Some(contracts):
+			contracts
+		None:
+			[]
+
+	-- Parent buckets retain program order for the scoped first-match behavior.
 	match def_id:
 		Some(value):
-			for entry in env.constructor_contracts:
+			for entry in entries:
 				if (
-					entry.parent_type_name == parent_type_name
-					and optional_int_equal(entry.def_id, Some(value))
+					entry.def_id == Some(value)
 					and contract_matches_arity(entry.contract, arg_count)
 				):
 					by_def_id = Some(entry.contract)
@@ -710,12 +755,8 @@ private pure func constructor_contract_by_return_type(
 		None:
 			var by_name: Option[OwnershipCallContract] = None
 
-			for entry in env.constructor_contracts:
-				if (
-					entry.parent_type_name == parent_type_name
-					and entry.name == name
-					and contract_matches_arity(entry.contract, arg_count)
-				):
+			for entry in entries:
+				if entry.name == name and contract_matches_arity(entry.contract, arg_count):
 					by_name = Some(entry.contract)
 					break
 				else:
@@ -784,7 +825,7 @@ pure func lookup_constructor_call_contract(
 ) -> Option[OwnershipCallContract]:
 	match def_id:
 		Some(value):
-			match constructor_contract_by_def_id(env, Some(value), arg_count):
+			match constructor_contract_by_def_id(env, value, arg_count):
 				Some(contract):
 					Some(contract)
 				None:

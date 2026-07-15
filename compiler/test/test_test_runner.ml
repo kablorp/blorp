@@ -882,6 +882,60 @@ tests: TestSuite = {
                 "run-all skips per-file result cache" false
                 (Sys.file_exists test_results_dir))))
 
+let test_suite_harness_uses_blorp_frontend () =
+  with_temp_dir "blorp-suite-frontend-" (fun dir ->
+      let home = Filename.concat dir "home" in
+      Unix.mkdir home 0o700;
+      write_file
+        (Filename.concat dir "qualified_process.brp")
+        {|
+import:
+    process as Process
+    test: TestSuite
+
+private pure func exit_code(exit: Process.ProcessExit) -> Int:
+    match exit:
+        Process.Exited(code):
+            code
+        Process.Signaled(_):
+            -1
+        Process.TimedOut:
+            -1
+
+func test_qualified_process_constructor() -> Bool:
+    exit_code(Process.Exited(7)) == 7
+
+tests: TestSuite = {
+    description = "Qualified process",
+    tests = [("qualified process constructor", test_qualified_process_constructor)]
+}
+|};
+      write_file
+        (Filename.concat dir "ordinary.brp")
+        {|
+import:
+    test: TestSuite
+
+func test_ordinary() -> Bool:
+    True
+
+tests: TestSuite = {
+    description = "Ordinary",
+    tests = [("ordinary", test_ordinary)]
+}
+|};
+      let old_cwd = Sys.getcwd () in
+      Fun.protect
+        ~finally:(fun () -> Sys.chdir old_cwd)
+        (fun () ->
+          Sys.chdir dir;
+          with_isolated_home_preserving_bridge_cache home (fun () ->
+              let code =
+                Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+                  ~cache:false "."
+              in
+              Alcotest.(check int) "Blorp frontend suite run" 0 code)))
+
 let test_suite_selector_compile_failure_is_hard_failure () =
   with_temp_dir "blorp-suite-selector-fail-" (fun dir ->
       let home = Filename.concat dir "home" in
@@ -1061,6 +1115,8 @@ let suite =
           test_source_text_cache_guard_uses_current_file_contents;
         Alcotest.test_case "combined_harness_skips_result_cache" `Quick
           test_suite_harness_runs_combined_without_result_cache;
+        Alcotest.test_case "uses_blorp_frontend" `Quick
+          test_suite_harness_uses_blorp_frontend;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick
           test_suite_selector_compile_failure_is_hard_failure;
         Alcotest.test_case "uses_leak_check_runner" `Quick

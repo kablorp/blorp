@@ -2057,7 +2057,7 @@ let test_decode_typed_expr_resolved_call_metadata () =
       Alcotest.fail
         "intrinsic bridge metadata should not materialize a legacy resolved call"
 
-let test_decode_imported_bare_call_uses_ufcs_callee () =
+let test_decode_imported_bare_call_materializes_module_identity () =
   let callee =
     Object
       [
@@ -2082,10 +2082,26 @@ let test_decode_imported_bare_call_uses_ufcs_callee () =
          ])
   in
   match (Typed.ast typed).expr_desc with
-  | ECall ({ expr_desc = EIdent "__ufcs_std$string__string"; _ }, _) -> ()
-  | _ -> Alcotest.fail "imported bare call did not decode to UFCS callee"
+  | ECall ({ expr_desc = EIdent "__ufcs_std$string__string"; _ }, _) -> (
+      match Typed.expr_resolved_call typed with
+      | Some
+          {
+            call_target =
+              CallDirect
+                {
+                  source_name = "string";
+                  origin = CallableImported "std/string";
+                  _;
+                };
+            _;
+          } ->
+          ()
+      | _ ->
+          Alcotest.fail
+            "imported bare call lost its explicit resolved-call identity")
+  | _ -> Alcotest.fail "imported bare call did not materialize module identity"
 
-let test_decode_imported_function_ref_preserves_identity () =
+let test_decode_imported_function_ref_materializes_module_identity () =
   let typed =
     expect_typed_expr
       (Object
@@ -2098,8 +2114,26 @@ let test_decode_imported_function_ref_preserves_identity () =
          ])
   in
   match (Typed.ast typed).expr_desc with
-  | EIdent "std_string__string" -> ()
-  | _ -> Alcotest.fail "imported function reference lost selected identity"
+  | EIdent "std_string__string" -> (
+      match Typed.expr_resolved_call typed with
+      | Some
+          {
+            call_target =
+              CallDirect
+                {
+                  source_name = "string";
+                  origin = CallableImported "std/string";
+                  _;
+                };
+            _;
+          } ->
+          ()
+      | _ ->
+          Alcotest.fail
+            "imported function reference lost its resolved-call identity")
+  | _ ->
+      Alcotest.fail
+        "imported function reference did not materialize module identity"
 
 let test_decode_rejects_unsupported_pattern () =
   match
@@ -2174,10 +2208,10 @@ let suite =
           test_decode_typed_program_flattens_parsed_import_block;
         Alcotest.test_case "typed expr resolved call metadata" `Quick
           test_decode_typed_expr_resolved_call_metadata;
-        Alcotest.test_case "imported bare call uses UFCS callee" `Quick
-          test_decode_imported_bare_call_uses_ufcs_callee;
-        Alcotest.test_case "imported function ref preserves identity" `Quick
-          test_decode_imported_function_ref_preserves_identity;
+        Alcotest.test_case "imported bare call materializes module identity"
+          `Quick test_decode_imported_bare_call_materializes_module_identity;
+        Alcotest.test_case "imported function ref materializes module identity"
+          `Quick test_decode_imported_function_ref_materializes_module_identity;
         Alcotest.test_case "unsupported pattern" `Quick
           test_decode_rejects_unsupported_pattern;
         Alcotest.test_case "unknown kind" `Quick test_decode_rejects_unknown_kind;

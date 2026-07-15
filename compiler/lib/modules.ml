@@ -297,6 +297,159 @@ type preloaded_module_graph = {
   preload_graph_imports : preloaded_import_edge list;
 }
 
+type finalized_cli_frontend_graph = {
+  finalized_preloaded_graph : preloaded_module_graph;
+  finalized_root : preloaded_parsed_source;
+  finalized_compile_options : Compiler_blorp_bridge.cli_compile_options;
+}
+
+let resolved_cli_frontend_import_module imports source import_module =
+  match
+    List.find_opt
+      (fun (edge : Compiler_blorp_bridge.cli_frontend_import_edge) ->
+        String.equal edge.cli_frontend_import_from_path
+          source.Compiler_blorp_bridge.cli_frontend_graph_path
+        && String.equal edge.cli_frontend_import_from_module
+             source.cli_frontend_graph_module_name
+        && String.equal edge.cli_frontend_import_path import_module)
+      imports
+  with
+  | Some edge ->
+      Option.value edge.cli_frontend_import_resolved_module
+        ~default:import_module
+  | None -> import_module
+
+let rewrite_cli_frontend_import_modules imports source program =
+  let rec rewrite_decl decl =
+    let decl_desc =
+      match decl.Ast.decl_desc with
+      | Ast.DImport import_decl ->
+          let import_module =
+            resolved_cli_frontend_import_module imports source
+              import_decl.Ast.import_module
+          in
+          Ast.DImport { import_decl with Ast.import_module = import_module }
+      | Ast.DPrivate inner -> Ast.DPrivate (rewrite_decl inner)
+      | other -> other
+    in
+    { decl with Ast.decl_desc = decl_desc }
+  in
+  List.map rewrite_decl program
+
+let module_origin_of_cli_frontend_origin =
+  let open Compiler_blorp_bridge in
+  function
+  | CliFrontendUserModule -> Session.User_module
+  | CliFrontendStdModule -> Session.Stdlib_module
+  | CliFrontendPkgModule package_id -> Session.native_package_origin package_id
+  | CliFrontendSourcePackageModule package_alias ->
+      Session.package_origin package_alias
+
+let finalize_cli_frontend_source ~imports
+    (source : Compiler_blorp_bridge.cli_frontend_graph_source) =
+  match source.cli_frontend_graph_parsed_response with
+  | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics ->
+      Error diagnostics
+  | Compiler_blorp_bridge.ParsedSource parsed_source ->
+      Ok
+        {
+          preload_module_name = source.cli_frontend_graph_module_name;
+          preload_path = source.cli_frontend_graph_path;
+          preload_origin =
+            module_origin_of_cli_frontend_origin
+              source.cli_frontend_graph_origin;
+          preload_source = source.cli_frontend_graph_source_text;
+          preload_decls =
+            rewrite_cli_frontend_import_modules imports source
+              parsed_source.parsed_program;
+          preload_surface = parsed_source.parsed_module_surface;
+        }
+
+let finalize_cli_frontend_sources ~imports sources =
+  let rec loop finalized = function
+    | [] -> Ok (List.rev finalized)
+    | source :: rest -> (
+        match finalize_cli_frontend_source ~imports source with
+        | Ok source -> loop (source :: finalized) rest
+        | Error diagnostics -> Error diagnostics)
+  in
+  loop [] sources
+
+let source_package_of_cli_frontend_source_package
+    (pkg : Compiler_blorp_bridge.cli_frontend_source_package) : source_package =
+  {
+    source_package_alias = pkg.cli_frontend_source_package_alias;
+    source_package_name = pkg.cli_frontend_source_package_name;
+    source_package_root = pkg.cli_frontend_source_package_root;
+    source_package_source_dir = pkg.cli_frontend_source_package_source_dir;
+    source_package_exports = pkg.cli_frontend_source_package_exports;
+  }
+
+let preloaded_graph_context_of_cli_frontend_context
+    (context : Compiler_blorp_bridge.cli_frontend_graph_context) =
+  {
+    preload_graph_std_dir = context.cli_frontend_context_std_dir;
+    preload_graph_source_packages =
+      List.map source_package_of_cli_frontend_source_package
+        context.cli_frontend_context_source_packages;
+    preload_graph_package_roots = context.cli_frontend_context_package_roots;
+  }
+
+let preloaded_import_edge_of_cli_frontend_import
+    (edge : Compiler_blorp_bridge.cli_frontend_import_edge) =
+  {
+    preload_import_from_path = edge.cli_frontend_import_from_path;
+    preload_import_from_module = edge.cli_frontend_import_from_module;
+    preload_import_path = edge.cli_frontend_import_path;
+    preload_import_resolved_path = edge.cli_frontend_import_resolved_path;
+    preload_import_resolved_module = edge.cli_frontend_import_resolved_module;
+    preload_import_resolved_origin =
+      Option.map module_origin_of_cli_frontend_origin
+        edge.cli_frontend_import_resolved_origin;
+  }
+
+let finalize_cli_frontend_module_graph
+    (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
+  let imports = graph.cli_frontend_graph_imports in
+  match
+    finalize_cli_frontend_sources ~imports graph.cli_frontend_graph_roots
+  with
+  | Error diagnostics -> Error diagnostics
+  | Ok roots -> (
+      match roots with
+      | [ root ] -> (
+          match
+            finalize_cli_frontend_sources ~imports
+              graph.cli_frontend_graph_modules
+          with
+          | Error diagnostics -> Error diagnostics
+          | Ok modules ->
+              Ok
+                {
+                  finalized_preloaded_graph =
+                    {
+                      preload_graph_context =
+                        preloaded_graph_context_of_cli_frontend_context
+                          graph.cli_frontend_graph_context;
+                      preload_graph_sources = roots @ modules;
+                      preload_graph_imports =
+                        List.map preloaded_import_edge_of_cli_frontend_import
+                          imports;
+                    };
+                  finalized_root = root;
+                  finalized_compile_options =
+                    graph.cli_frontend_graph_compile_options;
+                })
+      | _ ->
+          let filename =
+            match roots with root :: _ -> Some root.preload_path | [] -> None
+          in
+          Error
+            [
+              parse_error_for_message ?filename
+                "compile frontend module graph must contain exactly one root";
+            ])
+
 let add_source_package ?sess (pkg : source_package) =
   let s = sess_of ?sess () in
   s.source_packages <-

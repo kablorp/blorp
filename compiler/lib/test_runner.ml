@@ -2217,16 +2217,18 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
   let compile_result =
     match (loc_remap, generated_suite_wrapper) with
     | Some _, _ | None, true ->
+        let frontend_filename =
+          match module_base_dir with
+          | Some dir -> Filename.concat dir (Filename.basename filename)
+          | None -> filename
+        in
         Pipeline.compile_generated_test_harness ~debug
           ~allow_debug_only_calls:true ~retain_debug_blocks:true ~embed_runtime
-          ~filename ~source ()
+          ~filename:frontend_filename ~source ()
     | None, false ->
-        (* Legacy direct-source path: the OCaml runner still owns test file
-           discovery plus suite/doctest harness generation. Do not rebuild a
-           frontend graph here; migrate this when test discovery and generated
-           harness planning move to Blorp. *)
-        Pipeline.compile_legacy_direct_source ~debug ~allow_debug_only_calls:true
-          ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
+        Pipeline.compile_in_memory_source_with_blorp_bridge ~debug
+          ~allow_debug_only_calls:true ~retain_debug_blocks:true ~embed_runtime
+          ~filename ~source ()
   in
   match compile_result with
   | Error errors ->
@@ -2524,7 +2526,7 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
   let filename = Filename.concat cwd filename_base in
   let embed_runtime = Option.is_none precompiled in
   match
-    Pipeline.compile_legacy_direct_source ~debug ~allow_debug_only_calls:true
+    Pipeline.compile_generated_test_harness ~debug ~allow_debug_only_calls:true
       ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
   with
   | Error errors ->

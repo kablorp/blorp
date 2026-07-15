@@ -503,6 +503,27 @@ let test_cli_run_request_can_include_version_context () =
         (string_field "version" payload)
   | _ -> Alcotest.fail "expected CLI args in payload"
 
+let test_cli_run_request_can_include_source_override () =
+  let open Blorp.Compiler_blorp_bridge in
+  let request =
+    cli_run_request_json
+      ~source:
+        {
+          cli_source_path = "generated/suite.brp";
+          cli_source_module_name = "suite";
+          cli_source_text = "func main(args: List[String]) -> Int: 0\n";
+        }
+      [ "compile"; "--no-format"; "generated/suite.brp" ]
+    |> parse_json_exn
+  in
+  let source = field "source" (field "payload" request) in
+  Alcotest.(check string)
+    "source path" "generated/suite.brp" (string_field "path" source);
+  Alcotest.(check string) "source module" "suite" (string_field "module" source);
+  Alcotest.(check string)
+    "source text" "func main(args: List[String]) -> Int: 0\n"
+    (string_field "text" source)
+
 let test_parse_source_response_decodes_parsed_ast_artifact () =
   let response = bridge_success_json (parsed_ast_artifact (parsed_program_json [])) in
   match Blorp.Compiler_blorp_bridge.parse_source_response_json response with
@@ -1717,6 +1738,8 @@ let suite =
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
           test_cli_run_request_can_include_version_context;
+        Alcotest.test_case "CLI run request can include source override" `Quick
+          test_cli_run_request_can_include_source_override;
         Alcotest.test_case "parse_source response decodes parsed AST artifact"
           `Quick test_parse_source_response_decodes_parsed_ast_artifact;
         Alcotest.test_case "parse_source response decodes comments" `Quick

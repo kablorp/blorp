@@ -973,7 +973,7 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
             ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
             ?tail_observation_stages ~check_invariants ~filename ~program ())
 
-let compile_preloaded_graph_with_blorp_bridge ?(debug = false)
+let compile_preloaded_graph_impl ~source_kind ?(debug = false)
     ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
@@ -990,13 +990,23 @@ let compile_preloaded_graph_with_blorp_bridge ?(debug = false)
       with
       | Error _ as error -> error
       | Ok result ->
-          compile_typechecked_program ~source_kind:User_source
-            ~retain_debug_blocks ~embed_runtime ~require_main ~profile
-            ?on_stage ?on_stage_event ?on_stage_json ?tail_observation_stages
-            ~check_invariants ~filename
+          compile_typechecked_program ~source_kind ~retain_debug_blocks
+            ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
+            ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
             ~program:result.blorp_bridge_source_program
             ~typed_program:result.blorp_bridge_typed_program
             ~main_import_bindings:result.blorp_bridge_import_bindings ())
+
+let compile_preloaded_graph_with_blorp_bridge ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
+    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+    ?tail_observation_stages ?check_invariants ~filename
+    ~preloaded_module_graph () =
+  compile_preloaded_graph_impl ~source_kind:User_source ?debug
+    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ?require_main
+    ?profile ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+    ?tail_observation_stages ?check_invariants ~filename
+    ~preloaded_module_graph ()
 
 let compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
@@ -1007,8 +1017,59 @@ let compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ~filename ~source ()
 
+let in_memory_source_module_name filename =
+  let basename = Filename.basename filename in
+  if Filename.check_suffix basename ".brp" then
+    String.sub basename 0 (String.length basename - 4)
+  else basename
+
+let in_memory_source_frontend_graph ~filename ~source =
+  let module_name = in_memory_source_module_name filename in
+  match
+    Compiler_blorp_bridge.cli_run_source_via_command ~path:filename ~module_name
+      ~text:source [ "compile"; "--no-format"; filename ]
+  with
+  | Error (_code, message) ->
+      Error [ bridge_error ~filename ~phase:Ast.Parse message ]
+  | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
+      Modules.finalize_cli_frontend_module_graph graph
+  | Ok (Compiler_blorp_bridge.CliRunHandled result) ->
+      let message =
+        String.trim
+          (result.cli_run_stderr ^ result.cli_run_stdout)
+      in
+      Error
+        [
+          bridge_error ~filename ~phase:Ast.Parse
+            (if String.equal message "" then
+               "Blorp frontend rejected in-memory source"
+             else message);
+        ]
+  | Ok _ ->
+      Error
+        [
+          bridge_error ~filename ~phase:Ast.Parse
+            "Blorp frontend returned a non-compilation plan for in-memory source";
+        ]
+
+let compile_in_memory_source_impl ~source_kind ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ~filename ~source () =
+  match in_memory_source_frontend_graph ~filename ~source with
+  | Error _ as error -> error
+  | Ok finalized ->
+      compile_preloaded_graph_impl ~source_kind ?debug
+        ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
+        ~filename:finalized.Modules.finalized_root.preload_path
+        ~preloaded_module_graph:finalized.finalized_preloaded_graph ()
+
+let compile_in_memory_source_with_blorp_bridge ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ~filename ~source () =
+  compile_in_memory_source_impl ~source_kind:User_source ?debug
+    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ~filename ~source
+    ()
+
 let compile_generated_test_harness ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ~filename ~source () =
-  compile_impl ~source_kind:Generated_test_harness ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ~filename
-    ~source ()
+  compile_in_memory_source_impl ~source_kind:Generated_test_harness ?debug
+    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ~filename ~source
+    ()

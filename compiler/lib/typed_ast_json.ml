@@ -884,13 +884,6 @@ let call_pure_of_purity = function
   | Env_types.Pure -> true
   | Env_types.Impure -> false
 
-let encode_ufcs_module_part module_path =
-  String.map (fun c -> if c = '/' then '$' else c) module_path
-
-let bridge_ufcs_name module_path source_name =
-  Codegen_names.ufcs_prefix ^ encode_ufcs_module_part module_path ^ "__"
-  ^ source_name
-
 let normalize_imported_function_ref_desc
     (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
   match (desc, info.resolved_call) with
@@ -921,7 +914,9 @@ let normalize_imported_bare_call_desc
         } ) ->
       Ast.ECall
         ( { callee with
-            expr_desc = Ast.EIdent (bridge_ufcs_name module_path source_name);
+            expr_desc =
+              Ast.EIdent
+                (Codegen_names.make_ufcs_name module_path source_name);
           },
           args )
   | _ -> desc

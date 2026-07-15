@@ -65,6 +65,14 @@ let test_parse_ufcs_name_rejects_non_ufcs_name () =
     "non ufcs name" None
     (parse_ufcs_name "__def_1_std_list_get")
 
+let test_ufcs_name_round_trips_module_identity () =
+  let encoded = make_ufcs_name "std/net/url" "parse" in
+  Alcotest.(check string)
+    "stable encoding" "__ufcs_std$net$url__parse" encoded;
+  Alcotest.(check (option (pair string string)))
+    "round trip" (Some ("std/net/url", "parse"))
+    (parse_ufcs_name encoded)
+
 let suite =
   [
     ( "mangle_by_def_id",
@@ -92,5 +100,7 @@ let suite =
           test_parse_ufcs_name_decodes_module_path;
         Alcotest.test_case "rejects non-ufcs name" `Quick
           test_parse_ufcs_name_rejects_non_ufcs_name;
+        Alcotest.test_case "round trips module identity" `Quick
+          test_ufcs_name_round_trips_module_identity;
       ] );
   ]

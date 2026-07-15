@@ -120,12 +120,14 @@ import:
 		compiler_env_add_overload,
 		compiler_env_add_record,
 		compiler_env_add_type,
+		compiler_env_add_type_with_constructor_ids,
 		compiler_env_add_ufcs_method,
 		compiler_env_add_var_with_details,
 		compiler_env_add_var_with_module_details,
 		compiler_env_get_func_callable_id,
 		compiler_env_get_var_type,
 		compiler_env_mint_def_id,
+		compiler_env_push_scope,
 		compiler_env_set_type_param_bounds,
 		compiler_func_symbol,
 		compiler_impl_instance,
@@ -167,6 +169,7 @@ import:
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
+			CompilerTypedBinaryExpr,
 			CompilerTypedBlockExpr,
 			CompilerTypedCallExpr,
 			CompilerTypedConcurrentBlockExpr,
@@ -211,6 +214,7 @@ import:
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_empty,
 		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_register_imported_name,
 		compiler_typecheck_state_register_module_alias,
 	test: TestSuite
 
@@ -1378,6 +1382,44 @@ pure func state_with_shadowed_module_option_constructors() -> CompilerTypecheckS
 		True,
 	)
 	{ state | env = shadow_env }
+
+
+pure func state_with_explicitly_imported_constructor_collision(
+	local_name: String,
+) -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_selected = compiler_env_add_type_with_constructor_ids(
+		state.env,
+		"SelectedValue",
+		[],
+		[{ name = "SharedCtor", fields = [compiler_type_int()], tag = 0 }],
+		CompilerTypeUnion,
+		False,
+		True,
+		[],
+	)
+	with_unrelated = compiler_env_add_type_with_constructor_ids(
+		with_selected,
+		"UnrelatedValue",
+		[],
+		[{ name = "SharedCtor", fields = [compiler_type_string()], tag = 0 }],
+		CompilerTypeUnion,
+		False,
+		True,
+		[],
+	)
+	with_home = compiler_typecheck_state_record_type_home(
+		{ state | env = with_unrelated },
+		"SelectedValue",
+		"selected",
+		True,
+	)
+	compiler_typecheck_state_register_imported_name(
+		with_home,
+		local_name,
+		"selected",
+		"SharedCtor",
+	).state
 
 
 pure func state_with_option_and_result_values() -> CompilerTypecheckState:
@@ -3200,6 +3242,31 @@ func test_constructor_identifier_uses_generic_expected_parent_type() -> Bool:
 	)
 
 
+func test_equality_binds_unconstrained_generic_constructor() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_option_int_value()),
+			binary_expr(
+				ParsedEqualOp,
+				ParsedNameExpr(ident("maybe")),
+				ParsedNameExpr(ident("None")),
+			),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		CompilerTypedBinaryExpr(_, left, right, _, _):
+			compiler_types_equal(
+				compiler_typed_expr_semantic_type(left),
+				CompilerNamedType("Option", [compiler_type_int()]),
+			) and compiler_types_equal(
+				compiler_typed_expr_semantic_type(right),
+				CompilerNamedType("Option", [compiler_type_int()]),
+			)
+		_:
+			False
+
+
 func test_constructor_call_specializes_generic_return() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_option_int_value()),
@@ -3257,6 +3324,25 @@ func test_if_branch_constructor_call_uses_expected_return_for_unmentioned_generi
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
 		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), expected)
+	)
+
+
+func test_if_branches_infer_complementary_result_parameters() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_result_string_error()),
+			ParsedIfExpr(
+				bool_expr(True),
+				call_expr(ParsedNameExpr(ident("Ok")), [int_expr("1")]),
+				Some(call_expr(ParsedNameExpr(ident("Err")), [ParsedNameExpr(ident("error"))])),
+				source_span(),
+			),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		compiler_type_result(compiler_type_int(), compiler_type_string()),
 	)
 
 
@@ -3794,6 +3880,36 @@ func test_comparison_and_equality_return_bool() -> Bool:
 	)
 
 
+func test_collection_equality_returns_bool() -> Bool:
+	var state: CompilerTypecheckState = compiler_typecheck_state_empty()
+	state = add_infer_value(
+		state,
+		"left_list",
+		CompilerNamedType("List", [compiler_type_string()]),
+	)
+	state = add_infer_value(
+		state,
+		"right_list",
+		CompilerNamedType("List", [compiler_type_string()]),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		binary_expr(
+			ParsedEqualOp,
+			ParsedNameExpr(ident("left_list")),
+			ParsedNameExpr(ident("right_list")),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_bool(),
+		)
+	)
+
+
 pure func state_with_generic_comparison_values(has_bound: Bool) -> CompilerTypecheckState:
 	state = compiler_typecheck_state_empty()
 
@@ -4179,6 +4295,41 @@ func test_qualified_module_constructor_call_infers_owned_constructor() -> Bool:
 			info.callee_name == "Some" and compiler_resolved_call_callable_id(info).is_some()
 		None:
 			False
+
+
+func test_explicit_import_wins_constructor_name_collision() -> Bool:
+	state = state_with_explicitly_imported_constructor_collision("SharedCtor")
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("SharedCtor")), [int_expr("1")]),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerNamedType("SelectedValue", []),
+	)
+
+
+func test_lexical_binding_wins_explicit_import() -> Bool:
+	state = state_with_explicitly_imported_constructor_collision("SharedCtor")
+	local_env = compiler_env_add_var_with_details(
+		compiler_env_push_scope(state.env),
+		"SharedCtor",
+		compiler_type_int(),
+		Some(compiler_type_int()),
+		CompilerImmutableBinding,
+		CompilerLetBinding,
+		compiler_unrefined_binding(),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context({ state | env = local_env }),
+		ParsedNameExpr(ident("SharedCtor")),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		compiler_type_int(),
+	)
 
 
 func test_qualified_module_nullary_constructor_uses_expected_type() -> Bool:
@@ -5782,6 +5933,27 @@ func test_assignment_creates_implicit_immutable_binding() -> Bool:
 	)
 
 
+func test_assignment_shadows_outer_function_with_local_binding() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_add_one_func()),
+		ParsedBlockExpr(
+			[
+				assign_expr("add_one", int_expr("1")),
+				ParsedNameExpr(ident("add_one")),
+			],
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerConstIntType(1),
+		)
+	)
+
+
 func test_assignment_updates_mutable_binding() -> Bool:
 	block = ParsedBlockExpr(
 		[
@@ -7067,6 +7239,25 @@ func test_if_with_else_infers_common_int_type() -> Bool:
 	)
 
 
+func test_if_unifies_generic_nullary_constructor_branch() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_option_int_value()),
+			ParsedIfExpr(
+				bool_expr(True),
+				ParsedNameExpr(ident("maybe")),
+				Some(ParsedNameExpr(ident("None"))),
+				source_span(),
+			),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerNamedType("Option", [compiler_type_int()]),
+	)
+
+
 func test_if_without_else_requires_void_then_branch() -> Bool:
 	ok_result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -8148,6 +8339,11 @@ tests: TestSuite = {
 			"hidden module function does not shadow builtin",
 			test_hidden_module_function_does_not_shadow_builtin,
 		),
+		(
+			"explicit import wins constructor name collision",
+			test_explicit_import_wins_constructor_name_collision,
+		),
+		("lexical binding wins explicit import", test_lexical_binding_wins_explicit_import),
 		("matrix builtin binds literal dimensions", test_matrix_builtin_binds_literal_dimensions),
 		(
 			"vector builtin derives dimension arithmetic",
@@ -8289,6 +8485,10 @@ tests: TestSuite = {
 			test_constructor_identifier_uses_generic_expected_parent_type,
 		),
 		(
+			"equality binds unconstrained generic constructor",
+			test_equality_binds_unconstrained_generic_constructor,
+		),
+		(
 			"constructor call specializes generic return",
 			test_constructor_call_specializes_generic_return,
 		),
@@ -8299,6 +8499,10 @@ tests: TestSuite = {
 		(
 			"if branch constructor call uses expected return for unmentioned generic",
 			test_if_branch_constructor_call_uses_expected_return_for_unmentioned_generic,
+		),
+		(
+			"if branches infer complementary Result parameters",
+			test_if_branches_infer_complementary_result_parameters,
 		),
 		(
 			"question bind option binds unwrapped value for following statements",
@@ -8348,6 +8552,7 @@ tests: TestSuite = {
 			test_string_interpolation_rejects_non_stringable_expr,
 		),
 		("comparison and equality return bool", test_comparison_and_equality_return_bool),
+		("collection equality returns bool", test_collection_equality_returns_bool),
 		(
 			"generic comparison requires Orderable bound",
 			test_generic_comparison_requires_orderable_bound,
@@ -8582,6 +8787,10 @@ tests: TestSuite = {
 			"assignment creates implicit immutable binding",
 			test_assignment_creates_implicit_immutable_binding,
 		),
+		(
+			"assignment shadows outer function with local binding",
+			test_assignment_shadows_outer_function_with_local_binding,
+		),
 		("assignment updates mutable binding", test_assignment_updates_mutable_binding),
 		(
 			"assignment accepts semantically proven range",
@@ -8693,6 +8902,10 @@ tests: TestSuite = {
 		("record update errors are specific", test_record_update_errors_are_specific),
 		("range expr requires int endpoints", test_range_expr_requires_int_endpoints),
 		("if with else infers common int type", test_if_with_else_infers_common_int_type),
+		(
+			"if unifies generic nullary constructor branch",
+			test_if_unifies_generic_nullary_constructor_branch,
+		),
 		(
 			"if without else requires void then branch",
 			test_if_without_else_requires_void_then_branch,

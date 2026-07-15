@@ -1769,12 +1769,14 @@ Current status:
   removed; legacy direct pipeline APIs now produce finalized typed ASTs without
   a compile-time global rewrite and should continue moving to explicit Blorp
   frontend graphs.
-- The OCaml test runner remains one of those classified legacy paths. It
-  discovers test files, rewrites `TestSuite` and doctest harnesses, and compiles
-  generated sources after CLI planning has already delegated to test mode. Do
-  not duplicate frontend graph construction inside the OCaml runner; move this
-  only with a Blorp-owned test runner or an explicit Blorp test source-graph
-  handoff.
+- The OCaml test runner still owns discovery, `TestSuite`/doctest harness
+  generation, C compilation, and execution, but it no longer re-enters the
+  OCaml source frontend. Generated suite, aggregate, and doctest harnesses use
+  an explicit in-memory Blorp source-graph handoff with generated-source policy;
+  standalone leak-baseline programs use the same handoff with ordinary user
+  source policy. The remaining TestRunner migration is orchestration ownership,
+  not parser/typechecker parity, and must preserve doctest location remapping,
+  process cleanup, and filesystem-isolation behavior.
 
 Typed frontier closure before CTFE:
 
@@ -1782,7 +1784,8 @@ Typed frontier closure before CTFE:
   `Pipeline.compile_legacy_direct_source`,
   `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
-  test runner, and LSP/tooling helpers.
+  LSP/tooling helpers, and the remaining package/REPL routes. TestRunner source
+  compilation is closed; its OCaml work is post-frontend orchestration.
 - Normal source execution must enter through the Blorp frontend graph and
   `typecheck_source` bridge. If a direct pipeline API remains, document it as a
   temporary legacy/tooling route with a deletion condition rather than allowing

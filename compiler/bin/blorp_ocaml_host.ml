@@ -90,11 +90,6 @@ let run_compiler_bridge_prepare_command args =
 (** Format a list of pipeline errors for display *)
 let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
-let finalize_cli_frontend_parsed_response = function
-  | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics -> Error diagnostics
-  | Compiler_blorp_bridge.ParsedSource parsed_source ->
-      Ok parsed_source.Compiler_blorp_bridge.parsed_program
-
 (** Resolve timeout: CLI flag overrides env vars, checked in order. *)
 let resolve_timeout_from_env env_names cli_timeout =
   match cli_timeout with
@@ -799,9 +794,6 @@ let rec collect_brp_files path =
   else if Filename.check_suffix path ".brp" then [ path ]
   else []
 
-let print_parse_diagnostics ~file diagnostics =
-  prerr_endline (format_pipeline_errors ~file diagnostics)
-
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
@@ -810,174 +802,19 @@ type blorp_cli_frontier =
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
-type finalized_cli_frontend_graph_source = {
-  finalized_preloaded_source : Modules.preloaded_parsed_source;
-}
-
-let resolved_import_module_for_source
-    (imports : Compiler_blorp_bridge.cli_frontend_import_edge list)
-    (source : Compiler_blorp_bridge.cli_frontend_graph_source) import_module =
-  match
-    List.find_opt
-      (fun (edge : Compiler_blorp_bridge.cli_frontend_import_edge) ->
-        String.equal edge.cli_frontend_import_from_path
-          source.cli_frontend_graph_path
-        && String.equal edge.cli_frontend_import_from_module
-             source.cli_frontend_graph_module_name
-        && String.equal edge.cli_frontend_import_path import_module)
-      imports
-  with
-  | Some edge -> Option.value edge.cli_frontend_import_resolved_module ~default:import_module
-  | None -> import_module
-
-let rewrite_frontend_import_modules
-    (imports : Compiler_blorp_bridge.cli_frontend_import_edge list)
-    (source : Compiler_blorp_bridge.cli_frontend_graph_source) program =
-  let rec rewrite_decl decl =
-    let decl_desc =
-      match decl.Ast.decl_desc with
-      | Ast.DImport import_decl ->
-          let import_module =
-            resolved_import_module_for_source imports source
-              import_decl.Ast.import_module
-          in
-          Ast.DImport { import_decl with Ast.import_module = import_module }
-      | Ast.DPrivate inner -> Ast.DPrivate (rewrite_decl inner)
-      | other -> other
-    in
-    { decl with Ast.decl_desc = decl_desc }
-  in
-  List.map rewrite_decl program
-
-let module_origin_of_cli_frontend_module_origin =
-  let open Compiler_blorp_bridge in
-  function
-  | CliFrontendUserModule -> Session.User_module
-  | CliFrontendStdModule -> Session.Stdlib_module
-  | CliFrontendPkgModule package_id -> Session.native_package_origin package_id
-  | CliFrontendSourcePackageModule package_alias ->
-      Session.package_origin package_alias
-
-let finalize_cli_frontend_graph_source ~imports
-    (source : Compiler_blorp_bridge.cli_frontend_graph_source) =
-  match
-    finalize_cli_frontend_parsed_response
-      source.cli_frontend_graph_parsed_response
-  with
-  | Error diagnostics ->
-      print_parse_diagnostics ~file:source.cli_frontend_graph_path diagnostics;
-      Error ()
-  | Ok program ->
-      let resolved_program =
-        rewrite_frontend_import_modules imports source program
-      in
-      Ok
-        {
-          finalized_preloaded_source =
-            {
-              Modules.preload_module_name =
-                source.cli_frontend_graph_module_name;
-              preload_path = source.cli_frontend_graph_path;
-              preload_origin =
-                module_origin_of_cli_frontend_module_origin
-                  source.cli_frontend_graph_origin;
-              preload_source = source.cli_frontend_graph_source_text;
-              preload_decls = resolved_program;
-              preload_surface =
-                (match source.cli_frontend_graph_parsed_response with
-                | Compiler_blorp_bridge.ParsedSource parsed_source ->
-                    parsed_source.parsed_module_surface
-                | Compiler_blorp_bridge.ParseSourceDiagnostics _ -> None);
-            };
-        }
-
-let finalized_cli_frontend_graph_sources_or_exit ~imports sources =
-  let rec loop acc = function
-    | [] -> List.rev acc
-    | source :: rest -> (
-        match finalize_cli_frontend_graph_source ~imports source with
-        | Ok finalized -> loop (finalized :: acc) rest
-        | Error () -> exit 1)
-  in
-  loop [] sources
-
-let source_package_of_cli_frontend_source_package
-    (pkg : Compiler_blorp_bridge.cli_frontend_source_package) :
-    Modules.source_package =
-  {
-    Modules.source_package_alias = pkg.cli_frontend_source_package_alias;
-    source_package_name = pkg.cli_frontend_source_package_name;
-    source_package_root = pkg.cli_frontend_source_package_root;
-    source_package_source_dir = pkg.cli_frontend_source_package_source_dir;
-    source_package_exports = pkg.cli_frontend_source_package_exports;
-  }
-
-let preloaded_graph_context_of_cli_frontend_context
-    (context : Compiler_blorp_bridge.cli_frontend_graph_context) :
-    Modules.preloaded_module_graph_context =
-  {
-    Modules.preload_graph_std_dir =
-      context.cli_frontend_context_std_dir;
-    preload_graph_source_packages =
-      List.map source_package_of_cli_frontend_source_package
-        context.cli_frontend_context_source_packages;
-    preload_graph_package_roots = context.cli_frontend_context_package_roots;
-  }
-
-let preloaded_import_edge_of_cli_frontend_import
-    (edge : Compiler_blorp_bridge.cli_frontend_import_edge) :
-    Modules.preloaded_import_edge =
-  {
-    Modules.preload_import_from_path =
-      edge.cli_frontend_import_from_path;
-    preload_import_from_module = edge.cli_frontend_import_from_module;
-    preload_import_path = edge.cli_frontend_import_path;
-    preload_import_resolved_path = edge.cli_frontend_import_resolved_path;
-    preload_import_resolved_module = edge.cli_frontend_import_resolved_module;
-    preload_import_resolved_origin =
-      Option.map module_origin_of_cli_frontend_module_origin
-        edge.cli_frontend_import_resolved_origin;
-  }
-
-let preloaded_module_graph_of_cli_frontend_graph graph sources :
-    Modules.preloaded_module_graph =
-  {
-    Modules.preload_graph_context =
-      preloaded_graph_context_of_cli_frontend_context
-        graph.Compiler_blorp_bridge.cli_frontend_graph_context;
-    preload_graph_sources = sources;
-    preload_graph_imports =
-      List.map preloaded_import_edge_of_cli_frontend_import
-        graph.cli_frontend_graph_imports;
-  }
-
 let bootstrap_compile_graph_of_cli_frontend_module_graph
     (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
-  let imports = graph.Compiler_blorp_bridge.cli_frontend_graph_imports in
-  let roots =
-    finalized_cli_frontend_graph_sources_or_exit ~imports
-      graph.Compiler_blorp_bridge.cli_frontend_graph_roots
-  in
-  let modules =
-    finalized_cli_frontend_graph_sources_or_exit ~imports
-      graph.Compiler_blorp_bridge.cli_frontend_graph_modules
-  in
-  let module_graph_sources =
-    List.map
-      (fun source -> source.finalized_preloaded_source)
-      (roots @ modules)
-  in
-  let preloaded_module_graph =
-    preloaded_module_graph_of_cli_frontend_graph graph module_graph_sources
-  in
-  let options =
-    graph.Compiler_blorp_bridge.cli_frontend_graph_compile_options
-  in
-  match roots with
-  | [ _ ] -> (preloaded_module_graph, options)
-  | _ ->
-      prerr_endline
-        "Error: compile frontend module graph must contain exactly one root";
+  match Modules.finalize_cli_frontend_module_graph graph with
+  | Ok finalized ->
+      ( finalized.Modules.finalized_preloaded_graph,
+        finalized.finalized_compile_options )
+  | Error diagnostics ->
+      let file =
+        match graph.cli_frontend_graph_roots with
+        | root :: _ -> root.cli_frontend_graph_path
+        | [] -> "<cli-frontend-graph>"
+      in
+      prerr_endline (format_pipeline_errors ~file diagnostics);
       exit 1
 
 let cli_frontier_of_cli_run_result = function

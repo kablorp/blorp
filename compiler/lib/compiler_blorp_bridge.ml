@@ -82,6 +82,12 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
+type cli_source_override = {
+  cli_source_path : string;
+  cli_source_module_name : string;
+  cli_source_text : string;
+}
+
 type cli_frontend_delegation_io =
   | CliFrontendBatchDelegation
   | CliFrontendTerminalDelegation
@@ -628,7 +634,7 @@ let typecheck_graph_request_json_with_policy ~resolved_imports
          ("payload", Lsp_json.Object payload_fields);
        ])
 
-let cli_run_request_json ?version args =
+let cli_run_request_json ?version ?source args =
   let version_fields =
     match version with
     | Some value -> [ ("version", Lsp_json.String value) ]
@@ -639,6 +645,18 @@ let cli_run_request_json ?version args =
       ("args", Lsp_json.Array (List.map (fun arg -> Lsp_json.String arg) args));
     ]
     @ version_fields
+    @ (match source with
+      | Some source ->
+          [
+            ( "source",
+              Lsp_json.Object
+                [
+                  ("path", Lsp_json.String source.cli_source_path);
+                  ("module", Lsp_json.String source.cli_source_module_name);
+                  ("text", Lsp_json.String source.cli_source_text);
+                ] );
+          ]
+      | None -> [])
   in
   Lsp_json.to_string
     (Lsp_json.Object
@@ -2895,8 +2913,8 @@ let run_parser_request_via_blorp request_json =
 let run_typecheck_request_via_blorp request_json =
   run_request_via_blorp_binary typecheck_bridge_binary request_json
 
-let run_cli_request_via_blorp ?version args =
-  run_parser_request_via_blorp (cli_run_request_json ?version args)
+let run_cli_request_via_blorp ?version ?source args =
+  run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
 
 let render_cache_key ~renderer ~op args =
   let buf = Buffer.create 128 in
@@ -2986,8 +3004,18 @@ let typecheck_graph_via_command_with_policy ~resolved_imports
     ~module_count:(List.length module_targets)
     response_json
 
-let cli_run_via_command ?version args =
-  run_cli_request_via_blorp ?version args |> cli_run_response_json
+let cli_run_via_command ?version ?source args =
+  run_cli_request_via_blorp ?version ?source args |> cli_run_response_json
+
+let cli_run_source_via_command ~path ~module_name ~text args =
+  cli_run_via_command
+    ~source:
+      {
+        cli_source_path = path;
+        cli_source_module_name = module_name;
+        cli_source_text = text;
+      }
+    args
 
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer

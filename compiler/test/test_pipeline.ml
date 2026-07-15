@@ -612,6 +612,32 @@ let test_blorp_bridge_compile_types_std_support_modules () =
                 ("expected Blorp bridge compile preview to type std support:\n"
                ^ format_errors errors)))
 
+let test_blorp_bridge_compile_uses_in_memory_source () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_bridge_in_memory_source" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let supplied_source =
+            "func main(args: List[String]) -> Int:\n\
+            \    0\n"
+          in
+          write_file main_path
+            "func main(args: List[String]) -> Int:\n    missing_name\n";
+          match
+            Pipeline.compile_in_memory_source_with_blorp_bridge
+              ~embed_runtime:false ~filename:main_path ~source:supplied_source ()
+          with
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "generated C comes from supplied source" true
+                (contains c_code "blorp_main")
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail
+                "in-memory Blorp bridge compile unexpectedly stopped early"
+          | Error errors ->
+              Alcotest.fail
+                ("expected Blorp bridge compile to use supplied source:\n"
+               ^ format_errors errors)))
+
 let find_core_function_def_id program name =
   List.find_map
     (fun (decl : Core.core_decl) ->
@@ -1823,6 +1849,8 @@ let suite =
         Alcotest.test_case
           "Blorp bridge compile uses preloaded target source" `Quick
           test_blorp_bridge_compile_uses_preloaded_target_source;
+        Alcotest.test_case "Blorp bridge compile uses in-memory source" `Quick
+          test_blorp_bridge_compile_uses_in_memory_source;
         Alcotest.test_case
           "surface backed exports support selective imports" `Quick
           test_surface_backed_exports_support_selective_imports;

@@ -98,6 +98,22 @@ type preloaded_module_graph = {
     graph directly instead of asking OCaml to resolve and parse the same import
     tree again. *)
 
+type finalized_cli_frontend_graph = {
+  finalized_preloaded_graph : preloaded_module_graph;
+  finalized_root : preloaded_parsed_source;
+  finalized_compile_options : Compiler_blorp_bridge.cli_compile_options;
+}
+(** A validated CLI frontend graph ready for the typecheck/Core pipeline. The
+    single root is represented directly so downstream callers cannot observe
+    an empty or ambiguous root set. *)
+
+val finalize_cli_frontend_module_graph :
+  Compiler_blorp_bridge.cli_frontend_module_graph ->
+  (finalized_cli_frontend_graph, Ast.compiler_error list) result
+(** Finalize Blorp parser artifacts and resolved import edges without rereading
+    source files. Diagnostics remain structured so executable callers decide
+    how to render them. *)
+
 val add_source_package : ?sess:Session.t -> source_package -> unit
 (** Add or replace a source package alias in the active session. *)
 

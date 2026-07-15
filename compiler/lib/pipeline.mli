@@ -168,8 +168,21 @@ val compile_preloaded_graph_with_blorp_bridge :
     typed-program artifact with CTFE already evaluated, populates dependency
     typed-module caches, and then enters the Core/codegen handoff. Production
     source-command compilation uses this path. The explicitly legacy direct
-    source API remains for the REPL and test runner until those callers are
-    migrated to the single frontend graph handoff. *)
+    source API remains for the REPL and other classified tooling until those
+    callers are migrated to the single frontend graph handoff. *)
+
+val compile_in_memory_source_with_blorp_bridge :
+  ?debug:bool ->
+  ?allow_debug_only_calls:bool ->
+  ?retain_debug_blocks:bool ->
+  ?embed_runtime:bool ->
+  filename:string ->
+  source:string ->
+  unit ->
+  (compile_outcome, Ast.compiler_error list) result
+(** Compile supplied user source through the Blorp-owned source and typecheck
+    frontier. [filename] provides module/import identity, but the frontend uses
+    [source] even when the file does not exist or has different contents. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->
@@ -180,7 +193,6 @@ val compile_generated_test_harness :
   source:string ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
-(** Compile compiler-generated test scaffolding. The harness is not a user
-    source file, so its synthetic imports are not subject to unused-import
-    diagnostics; any user modules loaded by the harness are still checked
-    normally. *)
+(** Compile compiler-generated test scaffolding through the Blorp-owned source
+    and typecheck frontier. The harness is not a user source file, so its
+    synthetic imports are not subject to unused-import diagnostics. *)
