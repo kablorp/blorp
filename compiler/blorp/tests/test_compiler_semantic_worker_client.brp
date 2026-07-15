@@ -1,0 +1,206 @@
+import:
+	../src/stage_01_file_io/compiler_source: compiler_source_file
+	../src/stage_06_typecheck/compiler_typecheck_decl: CompilerTypedProgram
+	../src/stage_09_core/compiler_semantic_worker_protocol:
+		SemanticMiddleCapability(
+			PostCtfeTypedCapability,
+			PreDceCoreCapability,
+			RenderedStageObservationsCapability,
+		),
+		SemanticMiddleRequest,
+		SemanticMiddleResponse(SemanticMiddleCompiled),
+		SemanticMiddleTypedUnit,
+	../src/stage_12_cli/compiler_semantic_worker_client:
+		SemanticMiddleClientError(
+			SemanticMiddleInvalidJson,
+			SemanticMiddleProcessFailed,
+			SemanticMiddleUnexpectedStderr,
+			SemanticMiddleWorkerExited,
+			SemanticMiddleWorkerTimedOut,
+		),
+		SemanticMiddleWorkerCommand,
+		run_semantic_middle_worker,
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessError(ProcessOutputLimitExceeded, ProgramNotFound)
+	system: read_file, temp_dir
+	test: TestSuite
+	units: from_bytes, mebibytes, milliseconds
+
+
+private COMPILED_RESPONSE: String =
+	|{"schema":1,"domain":"compiler_semantic_middle","kind":"compiled","capabilities":["typed_ast_post_ctfe","core_pre_dce","rendered_stage_observations"],"core":{"kind":"program","decls":[],"foreign_includes":[]},"observations":[]}
+
+
+private pure func empty_typed_program() -> CompilerTypedProgram:
+	{
+		source = compiler_source_file("src/main.brp", "main", ""),
+		decls = [],
+		diagnostics = []
+	}
+
+
+private pure func request_fixture() -> SemanticMiddleRequest:
+	unit: SemanticMiddleTypedUnit = {
+		path = "src/main.brp",
+		module_name = "main",
+		typed_program = empty_typed_program(),
+		import_bindings = []
+	}
+	{
+		target = unit,
+		modules = [],
+		debug = False,
+		require_main = False,
+		check_invariants = False,
+		required_capabilities = [
+			PostCtfeTypedCapability,
+			PreDceCoreCapability,
+			RenderedStageObservationsCapability,
+		],
+		observations = [],
+		stop_after = None
+	}
+
+
+private pure func worker(script: String, args: List[String]) -> SemanticMiddleWorkerCommand:
+	{
+		program = "sh",
+		args = ["-c", script, "sh"].concat(args),
+		timeout = None,
+		max_response_size = mebibytes(1)
+	}
+
+
+private func exercise_single_worker_invocation() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_semantic_client_"):
+		marker: String = directory.resource_path() + "/invocations"
+		configured = worker(
+			"cat >/dev/null; printf x >> \"$1\"; printf '%s' \"$2\"",
+			[marker, COMPILED_RESPONSE],
+		)
+
+		match run_semantic_middle_worker(configured, request_fixture()):
+			Ok(SemanticMiddleCompiled(core, observations)):
+				match read_file(marker):
+					Ok(invocations):
+						Ok(
+							(
+								invocations == "x"
+								and core.decls.length() == 0
+								and observations.length() == 0
+							),
+						)
+					Err(_):
+						Ok(False)
+			Ok(_):
+				Ok(False)
+			Err(_):
+				Ok(False)
+
+
+private func test_worker_is_invoked_once() -> Bool:
+	match exercise_single_worker_invocation():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func test_worker_rejects_malformed_stdout() -> Bool:
+	match run_semantic_middle_worker(
+		worker("cat >/dev/null; printf '{'", []),
+		request_fixture(),
+	):
+		Err(SemanticMiddleInvalidJson(detail)):
+			detail.contains("line 1")
+		_:
+			False
+
+
+private func test_worker_rejects_unexpected_stderr() -> Bool:
+	match run_semantic_middle_worker(
+		worker("cat >/dev/null; printf warning >&2; printf '%s' \"$1\"", [COMPILED_RESPONSE]),
+		request_fixture(),
+	):
+		Err(SemanticMiddleUnexpectedStderr(detail)):
+			detail == "warning"
+		_:
+			False
+
+
+private func test_worker_reports_nonzero_exit() -> Bool:
+	match run_semantic_middle_worker(
+		worker("cat >/dev/null; printf failed >&2; exit 7", []),
+		request_fixture(),
+	):
+		Err(SemanticMiddleWorkerExited(code, stderr)):
+			code == 7 and stderr == "failed"
+		_:
+			False
+
+
+private func test_worker_reports_spawn_failure() -> Bool:
+	configured: SemanticMiddleWorkerCommand = {
+		program = "__blorp_missing_semantic_worker__",
+		args = [],
+		timeout = None,
+		max_response_size = mebibytes(1)
+	}
+
+	match run_semantic_middle_worker(configured, request_fixture()):
+		Err(SemanticMiddleProcessFailed(ProgramNotFound(_))):
+			True
+		_:
+			False
+
+
+private func test_worker_reports_timeout() -> Bool:
+	configured = { worker("cat >/dev/null; sleep 2", []) | timeout = Some(milliseconds(10)) }
+
+	match run_semantic_middle_worker(configured, request_fixture()):
+		Err(SemanticMiddleWorkerTimedOut(_)):
+			True
+		_:
+			False
+
+
+private func test_worker_enforces_response_limit() -> Bool:
+	configured = { worker("cat >/dev/null; printf '%s' \"$1\"", [COMPILED_RESPONSE]) |
+		max_response_size = from_bytes(1)
+	}
+
+	match run_semantic_middle_worker(configured, request_fixture()):
+		Err(SemanticMiddleProcessFailed(ProcessOutputLimitExceeded(_))):
+			True
+		_:
+			False
+
+
+private func test_real_worker_round_trip() -> Bool:
+	configured: SemanticMiddleWorkerCommand = {
+		program = "compiler/_build/default/bin/blorp_ocaml_middle.exe",
+		args = [],
+		timeout = Some(milliseconds(5000)),
+		max_response_size = mebibytes(16)
+	}
+
+	match run_semantic_middle_worker(configured, request_fixture()):
+		Ok(SemanticMiddleCompiled(core, observations)):
+			core.decls.length() == 0 and observations.length() == 0
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Semantic middle worker process client",
+	tests = [
+		("invokes the worker exactly once", test_worker_is_invoked_once),
+		("rejects malformed stdout", test_worker_rejects_malformed_stdout),
+		("rejects unexpected stderr", test_worker_rejects_unexpected_stderr),
+		("reports nonzero exit", test_worker_reports_nonzero_exit),
+		("reports spawn failure", test_worker_reports_spawn_failure),
+		("reports timeout", test_worker_reports_timeout),
+		("enforces its response limit", test_worker_enforces_response_limit),
+		("round trips through the real worker", test_real_worker_round_trip),
+	]
+}

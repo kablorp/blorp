@@ -150,9 +150,6 @@ let resolve_timeout_from_env env_names cli_timeout =
         (fun name -> Option.bind (Sys.getenv_opt name) int_of_string_opt)
         env_names
 
-let resolve_timeout cli_timeout =
-  resolve_timeout_from_env [ "BLORP_TIMEOUT" ] cli_timeout
-
 let resolve_test_timeout cli_timeout =
   resolve_timeout_from_env [ "BLORP_TEST_TIMEOUT"; "BLORP_TIMEOUT" ] cli_timeout
 
@@ -825,117 +822,6 @@ let compile_file_with_opts ~frontend_program ~preloaded_module_graph opts
     end
   end
 
-(** Compile and run a blorp file *)
-let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?(leak_check = false) ?(run_mode = Compile_profile.Fast)
-    ~timeout ?(user_args = []) ~preloaded_module_graph ~frontend_program:_
-    filename =
-  Test_runner.with_run_artifacts (fun () ->
-      let sanitizer_mode =
-        match sanitizer_mode with
-        | Some mode -> mode
-        | None ->
-            if sanitize then Test_runner.SanitizerAddressUndefined
-            else Test_runner.SanitizerOff
-      in
-      let sanitize = Test_runner.sanitizer_enabled sanitizer_mode in
-      init_module_paths (extract_directory filename);
-      let opt = Compile_profile.opt_level_for_run ~sanitize run_mode in
-      let precompiled =
-        Test_runner.precompile_runtime ~sanitizer_mode ~opt ()
-      in
-      let embed_runtime = precompiled = None in
-      match
-        Pipeline.compile_preloaded_graph_with_blorp_bridge ~profile ~debug
-          ~embed_runtime ~require_main:true ~filename ~preloaded_module_graph
-          ()
-      with
-      | Error errors ->
-          prerr_endline (format_pipeline_errors ~file:filename errors);
-          1
-      | Ok (Pipeline.Stopped_at _) ->
-          (* Unreachable: `blorp run` doesn't wire observability flags. *)
-          assert false
-      | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-          let compilation_dir = Test_runner.run_compilation_dir () in
-          let bin_file = Filename.concat compilation_dir "program.bin" in
-
-          let raylib_flags =
-            if Test_runner.has_raylib_import () then
-              Test_runner.raylib_linker_flags ()
-            else ""
-          in
-          let header_file =
-            Option.map (fun p -> p.Test_runner.header_file) precompiled
-          in
-          let pch_file =
-            Option.bind precompiled (fun p -> p.Test_runner.pch_file)
-          in
-          let tls_backend =
-            match precompiled with
-            | Some p -> p.Test_runner.tls_backend
-            | None -> Test_runner.current_tls_backend_profile ()
-          in
-          let runtime_feature_args =
-            if Option.is_none precompiled then
-              Test_runner.tls_backend_runtime_cc_args tls_backend
-            else []
-          in
-          let cc_args =
-            [ "-" ^ opt; "-fwrapv"; "-pipe" ]
-            @ (if Lazy.force Test_runner.cc_is_clang && Sys.os_type = "Unix"
-               then [ "-Wl,-stack_size,0x1000000" ]
-               else [])
-            @ (if sanitize then [] else [ "-w" ])
-            @ runtime_feature_args
-            @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
-            @ (match pch_file with
-              | Some pch_f ->
-                  if Lazy.force Test_runner.cc_is_clang then
-                    [ "-include-pch"; pch_f ]
-                  else [ "-include"; pch_f ]
-              | None -> (
-                  match header_file with
-                  | Some h -> [ "-include"; h ]
-                  | None -> []))
-            @ (match precompiled with
-              | Some p -> [ p.Test_runner.runtime_obj ]
-              | None -> [])
-            @ [ "-lm"; "-lpthread" ]
-            @ Test_runner.sanitizer_cc_args sanitizer_mode
-            @ Test_runner.tls_backend_link_cc_args tls_backend
-            @ (if raylib_flags = "" then []
-               else String.split_on_char ' ' (String.trim raylib_flags))
-            @ Ffi_boundary.link_flags_cc_args link_flags
-          in
-          let cc_result, cc_output =
-            Test_runner.compile_c_from_stdin c_code bin_file cc_args
-          in
-          if cc_result <> 0 then begin
-            let msg =
-              "Internal error: generated C code failed to compile.\n"
-              ^ "This is a compiler bug. The C compiler said:\n  "
-              ^ String.concat "\n  "
-                  (String.split_on_char '\n' (String.trim cc_output))
-            in
-            prerr_endline
-              (Diagnostics.format_diagnostic ~file:filename ~loc:Ast.dummy_loc
-                 ~severity:Error ~message:msg);
-            1
-          end
-          else begin
-            if leak_check then Unix.putenv "BLORP_LEAK_CHECK" "strict";
-            let result =
-              Test_runner.run_process_timeout ~timeout bin_file user_args
-            in
-            if result = 124 then begin
-              let secs = match timeout with Some s -> s | None -> 0 in
-              Printf.eprintf "Timed out after %ds\n" secs;
-              result
-            end
-            else result
-          end)
-
 let package_pin_overlap left right =
   match
     (Package_hash.validate_hash_pin left, Package_hash.validate_hash_pin right)
@@ -1264,10 +1150,6 @@ type blorp_cli_frontier =
       Ast.program
       * Modules.preloaded_module_graph
       * Compiler_blorp_bridge.cli_compile_options
-  | BlorpCliRun of
-      Ast.program
-      * Modules.preloaded_module_graph
-      * Compiler_blorp_bridge.cli_run_options
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
   | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
   | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
@@ -1449,25 +1331,16 @@ let cli_frontier_frontend_module_graph
   let preloaded_module_graph =
     preloaded_module_graph_of_cli_frontend_graph graph module_graph_sources
   in
-  match graph.Compiler_blorp_bridge.cli_frontend_graph_options with
-  | Compiler_blorp_bridge.CliFrontendCompileOptions options -> (
-      match roots with
-      | [ root ] ->
-          BlorpCliCompile
-            (root.finalized_program, preloaded_module_graph, options)
-      | _ ->
-          prerr_endline
-            "Error: compile frontend module graph must contain exactly one root";
-          exit 1)
-  | Compiler_blorp_bridge.CliFrontendRunOptions options -> (
-      match roots with
-      | [ root ] ->
-          BlorpCliRun
-            (root.finalized_program, preloaded_module_graph, options)
-      | _ ->
-          prerr_endline
-            "Error: run frontend module graph must contain exactly one root";
-          exit 1)
+  let options =
+    graph.Compiler_blorp_bridge.cli_frontend_graph_compile_options
+  in
+  match roots with
+  | [ root ] ->
+      BlorpCliCompile (root.finalized_program, preloaded_module_graph, options)
+  | _ ->
+      prerr_endline
+        "Error: compile frontend module graph must contain exactly one root";
+      exit 1
 
 let cli_frontier_of_cli_run_result = function
   | Compiler_blorp_bridge.CliRunHandled result ->
@@ -1553,37 +1426,6 @@ let run_compiler_host_compile_wrapper_command args =
   | _ ->
       prerr_endline
         "Usage: blorp __compiler-host-compile-wrapper -o <out.c> <file.brp>";
-      1
-
-let run_file_from_frontier_options ~frontend_program
-    ~preloaded_module_graph
-    (options : Compiler_blorp_bridge.cli_run_options) =
-  let timeout = resolve_timeout options.cli_run_timeout in
-  let sanitizer_mode =
-    options.cli_run_sanitizer
-    |> Option.map sanitizer_mode_of_cli_frontend
-    |> resolve_sanitizer_mode
-  in
-  let leak_check = resolve_leak_check options.cli_run_leak_check in
-  let run_mode =
-    if options.cli_run_release then Compile_profile.Release
-    else Compile_profile.Fast
-  in
-  set_std_override_option options.cli_run_std_dir;
-  (match options.cli_run_threads with
-  | Some n -> Unix.putenv "BLORP_THREADS" (string_of_int n)
-  | None -> ());
-  match options.cli_run_files with
-  | [ file ] ->
-      run_file ~profile:options.cli_run_profile ~debug:options.cli_run_debug
-        ~sanitizer_mode ~leak_check ~timeout ~run_mode
-        ~user_args:options.cli_run_user_args ~preloaded_module_graph
-        ~frontend_program file
-  | [] ->
-      prerr_endline "Error: No input file specified";
-      1
-  | _ ->
-      prerr_endline "Error: Multiple input files not supported";
       1
 
 let test_mode_of_cli_frontend =
@@ -1829,9 +1671,6 @@ and run_frontier = function
   | BlorpCliCompile (frontend_program, preloaded_module_graph, options) ->
       run_compile_from_frontier_options ~frontend_program
         ~preloaded_module_graph options
-  | BlorpCliRun (frontend_program, preloaded_module_graph, options) ->
-      run_file_from_frontier_options ~frontend_program ~preloaded_module_graph
-        options
   | BlorpCliTest options -> run_test_from_frontier_options options
   | BlorpCliPurify options -> run_purify_from_frontier_options options
   | BlorpCliRepl options ->

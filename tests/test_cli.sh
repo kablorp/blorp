@@ -256,6 +256,8 @@ timeout_test="$TMPDIR_CLI/timeout_test.brp"
 repeat_test="$TMPDIR_CLI/repeat_test.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
+late_core_dump="$TMPDIR_CLI/late-core.dump"
+late_stopped_c="$TMPDIR_CLI/late-stopped.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
 check_dir_empty="$TMPDIR_CLI/check_dir_empty"
@@ -594,6 +596,32 @@ PY
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
+expect_exit "compile bypasses legacy OCaml host" 0 \
+	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"
+expect_output_contains "compile AST bypasses semantic worker" 0 "Func main" \
+	env BLORP_OCAML_MIDDLE_BIN="$TMPDIR_CLI/missing-ocaml-middle" \
+	"$BLORP_BIN" compile --no-format --ast "$valid_prog"
+expect_output_contains "compile stops in Blorp-owned Core tail" 0 "stopped after dce" \
+	"$BLORP_BIN" compile --no-format \
+		--dump-core-after=dce --dump-core-file="$late_core_dump" \
+		--stop-after=dce -o "$late_stopped_c" "$valid_prog"
+TOTAL=$((TOTAL + 1))
+if [ -f "$late_core_dump" ] \
+	&& grep -qF "===== after dce =====" "$late_core_dump" \
+	&& grep -qF '"kind":"program"' "$late_core_dump"; then
+	record_pass "compile writes Blorp-owned late Core dump"
+else
+	record_fail "compile writes Blorp-owned late Core dump" \
+		"missing or invalid $late_core_dump"
+fi
+TOTAL=$((TOTAL + 1))
+if [ ! -e "$late_stopped_c" ]; then
+	record_pass "compile late stop skips artifact publication"
+else
+	record_fail "compile late stop skips artifact publication" \
+		"unexpected artifact $late_stopped_c"
+fi
 if [ -f "$compiled_c" ]; then
     TOTAL=$((TOTAL + 1))
     record_pass "compile writes requested output"
@@ -618,8 +646,14 @@ fi
 expect_exit "compile type failure" 1 "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/invalid.c" "$invalid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
+expect_exit "run bypasses legacy OCaml host" 0 \
+	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 
 if $run_deep_checks; then
+	expect_output_contains "compile reports missing semantic worker" 1 "semantic worker failure" \
+		env BLORP_OCAML_MIDDLE_BIN="$TMPDIR_CLI/missing-ocaml-middle" \
+		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/missing-middle.c" "$valid_prog"
 	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
 	expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"

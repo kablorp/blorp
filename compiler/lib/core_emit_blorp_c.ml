@@ -401,6 +401,7 @@ let supported_primitive_runtime_builtins =
       "blorp_dict_with_capacity_string";
       "blorp_dict_remove";
       "blorp_dir_close";
+      "blorp_directory_path";
       "blorp_decode_utf8";
       "blorp_decode_utf8_nullable";
       "blorp_debug_error";
@@ -416,6 +417,11 @@ let supported_primitive_runtime_builtins =
       "blorp_file_close_read_writer";
       "blorp_file_close_reader";
       "blorp_file_close_writer";
+      "blorp_file_create_directories_raw";
+      "blorp_file_remove_directory_tree_raw";
+      "blorp_file_rename_path_raw";
+      "blorp_file_writer_path";
+      "blorp_file_write_text_atomic_raw";
       "blorp_file_exists";
       "blorp_file_modified";
       "blorp_file_size";
@@ -446,6 +452,8 @@ let supported_primitive_runtime_builtins =
       "blorp_get_mem_stats";
       "blorp_get_scheduler_stats";
       "blorp_getcwd";
+      "blorp_compiler_runtime_source";
+      "blorp_compiler_runtime_decl";
       "blorp_getenv";
       "blorp_getenv_nullable";
       "blorp_crc32";
@@ -482,6 +490,7 @@ let supported_primitive_runtime_builtins =
       "blorp_print_error";
       "blorp_print_live_object_summary";
       "blorp_process_run";
+      "blorp_process_run_command_raw";
       "blorp_process_run_inherit";
       "blorp_process_shell";
       "blorp_puts";
@@ -597,6 +606,8 @@ let supported_primitive_runtime_builtins =
       "blorp_test_tls_state_probe";
       "blorp_test_wait_ready_to_park_probe";
       "blorp_test_websocket_state_probe";
+      "blorp_temporary_directory_open_raw";
+      "blorp_temporary_file_open_raw";
       "blorp_string_concat";
       "blorp_string_eq";
       "blorp_vector_get_nullable";

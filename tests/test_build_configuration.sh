@@ -32,6 +32,20 @@ if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_pla
 	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
 	exit 1
 fi
+if ! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must link the generated runtime source provider" >&2
+	exit 1
+fi
+if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
+	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
+	exit 1
+fi
+
+install_plan=$(make -n install)
+if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_middle.exe" "./blorp-ocaml-middle"' <<<"$install_plan"; then
+	echo "FAIL: install must place the semantic worker beside the Blorp CLI" >&2
+	exit 1
+fi
 
 setup_action=.github/actions/setup-cached-ocaml/action.yml
 if grep -Eq '~/.cache/dune|~/Library/Caches/dune' "$setup_action"; then

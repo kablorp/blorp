@@ -3,6 +3,326 @@
 -- Provides safe process spawning with stdout/stderr capture.
 -- Uses posix_spawnp internally (no shell injection risk for run()).
 -- shell() is provided for convenience but runs via /bin/sh.
+import:
+	bytes: bytes
+	units: DataSize, Duration, data_size_bytes, to_timeout_milliseconds
+
+
+union ProcessStdin:
+	InheritStdin
+	NullStdin
+	BytesStdin(Bytes)
+
+
+enum ProcessStream:
+	InheritStream
+	CaptureStream
+	NullStream
+
+
+union ProcessExit:
+	Exited(Int)
+	Signaled(Int)
+	TimedOut
+
+
+implements Equatable for ProcessExit:
+	pure func equals(a: ProcessExit, b: ProcessExit) -> Bool:
+		match a:
+			Exited(a_code):
+				match b:
+					Exited(b_code):
+						a_code == b_code
+					_:
+						False
+			Signaled(a_signal):
+				match b:
+					Signaled(b_signal):
+						a_signal == b_signal
+					_:
+						False
+			TimedOut:
+				match b:
+					TimedOut:
+						True
+					_:
+						False
+
+
+enum ProcessGroup:
+	InheritProcessGroup
+	NewProcessGroup
+
+
+record ProcessEnvironmentChange {
+	name: String,
+	value: Option[String]
+}
+
+
+record ProcessCommand {
+	program: String,
+	args: List[String],
+	cwd: Option[String],
+	environment: List[ProcessEnvironmentChange],
+	stdin: ProcessStdin,
+	stdout: ProcessStream,
+	stderr: ProcessStream,
+	timeout: Option[Duration],
+	process_group: ProcessGroup,
+	capture_limit: Option[DataSize]
+}
+
+
+record ProcessResult {
+	exit: ProcessExit,
+	stdout: Bytes,
+	stderr: Bytes
+}
+
+
+union ProcessError:
+	InvalidCommand(String)
+	ProgramNotFound(String)
+	SpawnFailed(String)
+	ProcessIoFailed(String)
+	ProcessOutputLimitExceeded(String)
+
+
+implements Stringable for ProcessError:
+	pure func to_string(error: ProcessError) -> String:
+		match error:
+			InvalidCommand(detail):
+				"invalid process command: " + detail
+			ProgramNotFound(program):
+				"program not found: " + program
+			SpawnFailed(detail):
+				"process spawn failed: " + detail
+			ProcessIoFailed(detail):
+				"process I/O failed: " + detail
+			ProcessOutputLimitExceeded(detail):
+				"process output limit exceeded: " + detail
+
+
+---
+Create a process command with captured output and no inherited stdin.
+
+The child starts in a new process group so a configured timeout can terminate
+the child and its descendants. Record update syntax customizes other fields.
+---
+pure func command(program: String, args: List[String]) -> ProcessCommand:
+	{
+		program = program,
+		args = args,
+		cwd = None,
+		environment = [],
+		stdin = NullStdin,
+		stdout = CaptureStream,
+		stderr = CaptureStream,
+		timeout = None,
+		process_group = NewProcessGroup,
+		capture_limit = None
+	}
+
+
+private RAW_STDIN_INHERIT: Int = 0
+private RAW_STDIN_NULL: Int = 1
+private RAW_STDIN_BYTES: Int = 2
+
+private RAW_STREAM_INHERIT: Int = 0
+private RAW_STREAM_CAPTURE: Int = 1
+private RAW_STREAM_NULL: Int = 2
+
+private RAW_GROUP_INHERIT: Int = 0
+private RAW_GROUP_NEW: Int = 1
+
+private RAW_EXIT_EXITED: Int = 0
+private RAW_EXIT_SIGNALED: Int = 1
+private RAW_EXIT_TIMED_OUT: Int = 2
+
+private RAW_ERROR_INVALID_COMMAND: Int = 0
+private RAW_ERROR_PROGRAM_NOT_FOUND: Int = 1
+private RAW_ERROR_SPAWN_FAILED: Int = 2
+private RAW_ERROR_IO_FAILED: Int = 3
+private RAW_ERROR_OUTPUT_LIMIT: Int = 4
+
+private RAW_DEFAULT_CAPTURE_LIMIT: Int = -1
+
+
+private record RawProcessEnvironment {
+	set_names: List[String],
+	set_values: List[String],
+	unset_names: List[String]
+}
+
+
+private pure func raw_process_environment(
+	changes: List[ProcessEnvironmentChange],
+) -> Result[RawProcessEnvironment, ProcessError]:
+	var seen: List[String] = []
+	var set_names: List[String] = []
+	var set_values: List[String] = []
+	var unset_names: List[String] = []
+	var failure: Option[ProcessError] = None
+
+	for change in changes:
+		if change.name.length() == 0:
+			failure = Some(InvalidCommand("environment variable name is empty"))
+			break
+		else if change.name.contains("="):
+			failure = Some(InvalidCommand("environment variable name contains '='"))
+			break
+		else if seen.contains(change.name):
+			failure = Some(
+				InvalidCommand("duplicate environment change for '" + change.name + "'"),
+			)
+			break
+		else:
+			seen = seen.append(change.name)
+
+			match change.value:
+				Some(value):
+					set_names = set_names.append(change.name)
+					set_values = set_values.append(value)
+				None:
+					unset_names = unset_names.append(change.name)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				set_names = set_names,
+				set_values = set_values,
+				unset_names = unset_names
+			})
+
+
+private pure func raw_process_stdin(stdin: ProcessStdin) -> (Int, Bytes):
+	match stdin:
+		InheritStdin:
+			(RAW_STDIN_INHERIT, bytes(0))
+		NullStdin:
+			(RAW_STDIN_NULL, bytes(0))
+		BytesStdin(data):
+			(RAW_STDIN_BYTES, data)
+
+
+private pure func raw_process_stream(stream: ProcessStream) -> Int:
+	match stream:
+		InheritStream:
+			RAW_STREAM_INHERIT
+		CaptureStream:
+			RAW_STREAM_CAPTURE
+		NullStream:
+			RAW_STREAM_NULL
+
+
+private pure func raw_process_group(group: ProcessGroup) -> Int:
+	match group:
+		InheritProcessGroup:
+			RAW_GROUP_INHERIT
+		NewProcessGroup:
+			RAW_GROUP_NEW
+
+
+private pure func process_exit_from_raw(kind: Int, code: Int) -> ProcessExit:
+	if kind == RAW_EXIT_EXITED:
+		Exited(code)
+	else if kind == RAW_EXIT_SIGNALED:
+		Signaled(code)
+	else:
+		TimedOut
+
+
+private pure func process_error_from_raw(kind: Int, detail: String) -> ProcessError:
+	if kind == RAW_ERROR_INVALID_COMMAND:
+		InvalidCommand(detail)
+	else if kind == RAW_ERROR_PROGRAM_NOT_FOUND:
+		ProgramNotFound(detail)
+	else if kind == RAW_ERROR_SPAWN_FAILED:
+		SpawnFailed(detail)
+	else if kind == RAW_ERROR_OUTPUT_LIMIT:
+		ProcessOutputLimitExceeded(detail)
+	else:
+		ProcessIoFailed(detail)
+
+
+private pure func raw_capture_limit(
+	limit: Option[DataSize],
+) -> Result[Int, ProcessError]:
+	match limit:
+		Some(size):
+			byte_count: Int = data_size_bytes(size)
+			if byte_count < 0:
+				Err(InvalidCommand("capture limit must be non-negative"))
+			else:
+				Ok(byte_count)
+		None:
+			Ok(RAW_DEFAULT_CAPTURE_LIMIT)
+
+
+private func process_run_command_builtin(
+	program: String,
+	args: List[String],
+	options: (
+		(String, Bool),
+		(List[String], List[String], List[String]),
+		(Int, Bytes, Int, Int),
+		(Bool, Int, Int, Int),
+	),
+) -> Result[(Int, Int, Bytes, Bytes), (Int, String)]:
+	builtin("blorp_process_run_command_raw")
+
+
+---
+Run a structured process command without shell parsing or process-global
+environment mutation.
+
+Captured output remains bytes. Stdin is written while captured stdout and
+stderr are drained, so payloads larger than OS pipe buffers cannot deadlock.
+---
+func run_command(request: ProcessCommand) -> Result[ProcessResult, ProcessError]:
+	environment ?= raw_process_environment(request.environment)
+	capture_limit ?= raw_capture_limit(request.capture_limit)
+	stdin: (Int, Bytes) = raw_process_stdin(request.stdin)
+	has_timeout: Bool = request.timeout.is_some()
+	timeout_ms: Int = request.timeout.map(to_timeout_milliseconds).get_or(0)
+
+	match process_run_command_builtin(
+		request.program,
+		request.args,
+		(
+			(request.cwd.get_or(""), request.cwd.is_some()),
+			(
+				environment.set_names,
+				environment.set_values,
+				environment.unset_names,
+			),
+			(
+				stdin[0],
+				stdin[1],
+				raw_process_stream(request.stdout),
+				raw_process_stream(request.stderr),
+			),
+			(
+				has_timeout,
+				timeout_ms,
+				raw_process_group(request.process_group),
+				capture_limit,
+			),
+		),
+	):
+		Ok(raw):
+			Ok({
+				exit = process_exit_from_raw(raw[0], raw[1]),
+				stdout = raw[2],
+				stderr = raw[3]
+			})
+		Err(raw):
+			Err(process_error_from_raw(raw[0], raw[1]))
+
+
 -- ============================================================================
 -- Process Output Type
 -- ============================================================================

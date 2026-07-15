@@ -4,11 +4,25 @@
 -- separate from the always-built parse bridge helper while the Blorp
 -- typechecker continues to grow toward the production compile path.
 import:
-	../stage_01_file_io/compiler_source: CompilerSourceFile, compiler_source_file
+	../stage_01_file_io/compiler_source:
+		CompilerSourceFile,
+		CompilerSourceSpan,
+		compiler_source_file,
 	../stage_02_lex/compiler_lexer: compiler_lex
 	../stage_02_lex/compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
 	../stage_03_parse/compiler_parsed_ast:
-		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, VarParsedDecl),
+		ParsedDecl(
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			PrivateParsedDecl,
+			TraitParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedForeignFunctionDecl,
+		ParsedFunctionDecl,
 		ParsedImportDecl,
 		ParsedProgram,
 		ParsedProgramPhase(TypecheckSourceProgram),
@@ -44,11 +58,25 @@ import:
 		compiler_typecheck_program,
 		compiler_typecheck_program_with_import_modules,
 	compiler_typecheck_state:
+		CompilerFuncCallableIdEntry,
 		CompilerImportBinding,
+		CompilerSourceDefinitionIdEntry,
+		CompilerSourceDefinitionKey,
+		CompilerSourceDefinitionKind(
+			CompilerConstructorDefinition,
+			CompilerImplDefinition,
+			CompilerTraitDefinition,
+		),
 		CompilerTypecheckState,
+		compiler_callable_source_loc_from_span,
+		compiler_func_callable_key,
+		compiler_func_callable_keys_equal,
+		compiler_source_definition_key,
+		compiler_source_definition_keys_equal,
 		compiler_typecheck_state_add_error,
 		compiler_typecheck_state_for_origin,
 		compiler_typecheck_state_with_debug_calls,
+		compiler_typecheck_state_with_reserved_definition_ids,
 	compiler_typed_ast_json: compiler_typed_program_to_json
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -106,11 +134,19 @@ private record PreparedCtfeDependency {
 }
 
 
+private record CompilerGraphDefinitionPlan {
+	func_callable_ids: List[CompilerFuncCallableIdEntry],
+	source_definition_ids: List[CompilerSourceDefinitionIdEntry],
+	next_def_id: Int
+}
+
+
 private record PreparedTypecheckGraph {
 	target: PreparedTypecheckModule,
 	selected_modules: List[PreparedTypecheckModule],
 	importable_modules: List[CompilerImportableModule],
-	ctfe_dependencies: List[PreparedCtfeDependency]
+	ctfe_dependencies: List[PreparedCtfeDependency],
+	definition_plan: CompilerGraphDefinitionPlan
 }
 
 
@@ -567,6 +603,158 @@ private pure func prepare_typecheck_modules(
 	modules.map(func(module): prepare_typecheck_module(module, resolved_imports))
 
 
+private pure func graph_definition_plan_empty() -> CompilerGraphDefinitionPlan:
+	builtin_state = compiler_typecheck_state_for_origin(CompilerUserModule)
+	{
+		func_callable_ids = [],
+		source_definition_ids = [],
+		next_def_id = builtin_state.env.next_def_id
+	}
+
+
+private pure func graph_definition_plan_reserve_function(
+	plan: CompilerGraphDefinitionPlan,
+	name: String,
+	span: CompilerSourceSpan,
+) -> CompilerGraphDefinitionPlan:
+	key = compiler_func_callable_key(name, compiler_callable_source_loc_from_span(span))
+
+	if plan.func_callable_ids.any(
+		pure func(entry): compiler_func_callable_keys_equal(entry.key, key),
+	):
+		plan
+	else:
+		{ plan |
+			func_callable_ids = plan.func_callable_ids.append({
+				key = key,
+				def_id = plan.next_def_id,
+			}),
+			next_def_id = plan.next_def_id + 1
+		}
+
+
+private pure func graph_definition_plan_reserve_parsed_function(
+	plan: CompilerGraphDefinitionPlan,
+	function_decl: ParsedFunctionDecl,
+) -> CompilerGraphDefinitionPlan:
+	graph_definition_plan_reserve_function(plan, function_decl.name.text, function_decl.span)
+
+
+private pure func graph_definition_plan_reserve_foreign_function(
+	plan: CompilerGraphDefinitionPlan,
+	function_decl: ParsedForeignFunctionDecl,
+) -> CompilerGraphDefinitionPlan:
+	graph_definition_plan_reserve_function(plan, function_decl.name.text, function_decl.span)
+
+
+private pure func graph_definition_plan_reserve_source(
+	plan: CompilerGraphDefinitionPlan,
+	key: CompilerSourceDefinitionKey,
+) -> CompilerGraphDefinitionPlan:
+	if plan.source_definition_ids.any(
+		pure func(entry): compiler_source_definition_keys_equal(entry.key, key),
+	):
+		plan
+	else:
+		{ plan |
+			source_definition_ids = plan.source_definition_ids.append({
+				key = key,
+				def_id = plan.next_def_id,
+			}),
+			next_def_id = plan.next_def_id + 1
+		}
+
+
+private pure func graph_definition_plan_reserve_decl(
+	plan: CompilerGraphDefinitionPlan,
+	decl: ParsedDecl,
+) -> CompilerGraphDefinitionPlan:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			graph_definition_plan_reserve_parsed_function(plan, function_decl)
+		ForeignBlockParsedDecl(_, functions, _):
+			functions.fold_left(plan, graph_definition_plan_reserve_foreign_function)
+		UnionParsedDecl(union_decl):
+			var with_variants = plan
+
+			for variant in union_decl.variants:
+				with_variants = graph_definition_plan_reserve_source(
+					with_variants,
+					compiler_source_definition_key(
+						CompilerConstructorDefinition,
+						variant.name.text,
+						Some(union_decl.name.text),
+						variant.span,
+					),
+				)
+
+			with_variants
+		TraitParsedDecl(trait_decl):
+			graph_definition_plan_reserve_source(
+				plan,
+				compiler_source_definition_key(
+					CompilerTraitDefinition,
+					trait_decl.name.text,
+					None,
+					trait_decl.span,
+				),
+			)
+		ImplParsedDecl(impl_decl):
+			with_impl = graph_definition_plan_reserve_source(
+				plan,
+				compiler_source_definition_key(
+					CompilerImplDefinition,
+					impl_decl.trait_name.text,
+					None,
+					impl_decl.span,
+				),
+			)
+			impl_decl.methods.fold_left(with_impl, graph_definition_plan_reserve_parsed_function)
+		PrivateParsedDecl(inner, _):
+			graph_definition_plan_reserve_decl(plan, inner)
+		_:
+			plan
+
+
+private pure func graph_definition_plan_reserve_program(
+	plan: CompilerGraphDefinitionPlan,
+	program: ParsedProgram,
+) -> CompilerGraphDefinitionPlan:
+	program.decls.fold_left(plan, graph_definition_plan_reserve_decl)
+
+
+private pure func graph_definition_plan_for_modules(
+	target: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
+) -> CompilerGraphDefinitionPlan:
+	with_target = graph_definition_plan_reserve_program(
+		graph_definition_plan_empty(),
+		target.program,
+	)
+	var plan = with_target
+
+	for module in modules:
+		plan = graph_definition_plan_reserve_program(plan, module.program)
+
+	plan
+
+
+private pure func graph_typecheck_state(
+	origin: CompilerModuleOrigin,
+	allow_debug_only_calls: Bool,
+	plan: CompilerGraphDefinitionPlan,
+) -> CompilerTypecheckState:
+	compiler_typecheck_state_with_reserved_definition_ids(
+		compiler_typecheck_state_with_debug_calls(
+			compiler_typecheck_state_for_origin(origin),
+			allow_debug_only_calls,
+		),
+		plan.func_callable_ids,
+		plan.source_definition_ids,
+		plan.next_def_id,
+	)
+
+
 private pure func importable_module_from_prepared(
 	module: PreparedTypecheckModule,
 ) -> CompilerImportableModule:
@@ -659,11 +847,9 @@ private pure func ctfe_imported_program_from_prepared(
 	module: PreparedTypecheckModule,
 	importable_modules: List[CompilerImportableModule],
 	allow_debug_only_calls: Bool,
+	definition_plan: CompilerGraphDefinitionPlan,
 ) -> Option[CompilerCtfeImportedProgram]:
-	state = compiler_typecheck_state_with_debug_calls(
-		compiler_typecheck_state_for_origin(module.request.origin),
-		allow_debug_only_calls,
-	)
+	state = graph_typecheck_state(module.request.origin, allow_debug_only_calls, definition_plan)
 	typed_result = compiler_typecheck_program_with_import_modules(
 		state,
 		module.program,
@@ -728,6 +914,7 @@ private pure func prepare_ctfe_dependencies(
 	dependencies: List[PreparedTypecheckModule],
 	importable_modules: List[CompilerImportableModule],
 	allow_debug_only_calls: Bool,
+	definition_plan: CompilerGraphDefinitionPlan,
 ) -> List[PreparedCtfeDependency]:
 	dependencies.map(func(dependency): {
 			module_path = dependency.request.module_path,
@@ -735,6 +922,7 @@ private pure func prepare_ctfe_dependencies(
 				dependency,
 				importable_modules,
 				allow_debug_only_calls,
+				definition_plan,
 			)
 		})
 
@@ -854,12 +1042,14 @@ private pure func typechecked_prepared_module(
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	definition_plan: CompilerGraphDefinitionPlan,
 ) -> CompilerTypecheckedModule:
 	final_program = module.program
 	explicit_import_paths = explicit_import_paths_from_program(final_program)
-	initial_state = compiler_typecheck_state_with_debug_calls(
-		compiler_typecheck_state_for_origin(module.request.origin),
+	initial_state = graph_typecheck_state(
+		module.request.origin,
 		allow_debug_only_calls,
+		definition_plan,
 	)
 
 	typed_result = if importable_modules.length() == 0:
@@ -938,10 +1128,12 @@ private pure func typed_source_artifact(
 		},
 		resolved_imports,
 	)
+	definition_plan = graph_definition_plan_for_modules(module, prepared_imports)
 	ctfe_dependencies = prepare_ctfe_dependencies(
 		ctfe_dependencies_for_artifact(module, prepared_imports),
 		importable_modules,
 		allow_debug_only_calls,
+		definition_plan,
 	)
 
 	typechecked_module_artifact(
@@ -950,6 +1142,7 @@ private pure func typed_source_artifact(
 			allow_debug_only_calls,
 			importable_modules,
 			ctfe_dependencies,
+			definition_plan,
 		),
 		include_comments,
 	)
@@ -965,6 +1158,7 @@ private pure func typechecked_graph_module(
 		request.allow_debug_only_calls,
 		importable_modules_except_path(graph.importable_modules, module.request.module_path),
 		graph.ctfe_dependencies,
+		graph.definition_plan,
 	)
 
 
@@ -973,17 +1167,20 @@ private pure func prepare_typecheck_graph(request: TypecheckGraphRequest) -> Pre
 	target = prepare_typecheck_module(request.target, request.resolved_imports)
 	selected_modules = graph_target_modules(modules, request.module_targets)
 	importable_modules = importable_modules_from_prepared(modules)
+	definition_plan = graph_definition_plan_for_modules(target, modules)
 	ctfe_dependencies = prepare_ctfe_dependencies(
 		ctfe_dependencies_for_graph(target, modules, selected_modules),
 		importable_modules,
 		request.allow_debug_only_calls,
+		definition_plan,
 	)
 
 	{
 		target = target,
 		selected_modules = selected_modules,
 		importable_modules = importable_modules,
-		ctfe_dependencies = ctfe_dependencies
+		ctfe_dependencies = ctfe_dependencies,
+		definition_plan = definition_plan
 	}
 
 
@@ -996,6 +1193,18 @@ pure func compiler_typecheck_graph(request: TypecheckGraphRequest) -> CompilerTy
 			func(module): typechecked_graph_module(request, graph, module),
 		)
 	}
+
+
+private pure func typechecked_graph_module_response(
+	request: TypecheckGraphRequest,
+	graph: PreparedTypecheckGraph,
+	module: PreparedTypecheckModule,
+) -> String:
+	artifact = typechecked_module_artifact(
+		typechecked_graph_module(request, graph, module),
+		request.include_comments,
+	)
+	bridge_success_json(artifact).to_string()
 
 
 private pure func handle_typecheck_source(
@@ -1056,20 +1265,12 @@ func stream_typecheck_graph_request_value(
 				TypecheckGraphAction:
 					match typecheck_graph_request_from_body(envelope.payload):
 						Ok(request):
-							graph = compiler_typecheck_graph(request)
+							graph = prepare_typecheck_graph(request)
 
-							for module in graph.modules:
-								artifact = typechecked_module_artifact(
-									module,
-									request.include_comments,
-								)
-								emit(bridge_success_json(artifact).to_string())
+							for module in graph.selected_modules:
+								emit(typechecked_graph_module_response(request, graph, module))
 
-							target_artifact = typechecked_module_artifact(
-								graph.target,
-								request.include_comments,
-							)
-							emit(bridge_success_json(target_artifact).to_string())
+							emit(typechecked_graph_module_response(request, graph, graph.target))
 						Err(error):
 							emit(dispatch_error_json(error).to_string())
 

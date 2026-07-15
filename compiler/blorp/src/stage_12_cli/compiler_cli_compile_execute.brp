@@ -2,26 +2,15 @@
 -- Blorp-owned late Core and C emission. Process and artifact effects are added
 -- only after their typed standard-library surfaces land.
 import:
-	../stage_09_core/compiler_core_json: core_json_error_to_string
+	../stage_09_core/compiler_core_json: CoreProgram
 	../stage_09_core/compiler_semantic_worker_protocol:
 		SemanticMiddleDiagnostic,
 		SemanticMiddleObservation,
-		SemanticMiddleProtocolError(
-			SemanticMiddleExpectedField,
-			SemanticMiddleInvalidCore,
-			SemanticMiddleMissingCapability,
-			SemanticMiddleMissingField,
-			SemanticMiddleUnsupportedCapability,
-			SemanticMiddleUnsupportedDomain,
-			SemanticMiddleUnsupportedKind,
-			SemanticMiddleUnsupportedSchema,
-			SemanticMiddleUnsupportedStage,
-		),
 		SemanticMiddleRequest,
 		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed, SemanticMiddleStopped),
-		SemanticMiddleStage,
 		decode_semantic_middle_response_value,
-		parse_semantic_middle_stage,
+		semantic_middle_stage_name,
+		semantic_middle_protocol_error_message,
 	../stage_10_backend/compiler_build_artifact:
 		BuildArtifact,
 		BuildArtifactConfiguration,
@@ -37,23 +26,39 @@ import:
 		unsupported_global_initializer_error_to_string,
 	compiler_cli_args: CliCompileArgs, CliRunArgs
 	compiler_cli_compile_frontend: compile_frontend_graph
+	compiler_cli_core_observation: CliCoreObservation
+	compiler_cli_late_core:
+		CliLateCoreExecution(CliLateCoreCompleted, CliLateCoreStopped),
+		execute_late_core_stages,
 	compiler_cli_plan:
 		CliCompilePlan,
 		CliFrontendGraphSource,
 		CliFrontendModuleGraph,
 		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule),
 		CliRunSourcePlan,
+	compiler_cli_stage_requests:
+		CliCompileStageRequests,
+		CliLateCoreStageRequest,
+		compile_stage_requests,
 	json: JsonValue
 
 
 union CliCompileExecution:
 	CliCompileFrontendFailed(List[String])
-	CliCompileArtifact(SemanticMiddleRequest, BuildArtifact)
-	CliCompileStopped(SemanticMiddleRequest, SemanticMiddleStage, String, List[SemanticMiddleObservation])
+	CliCompileArtifact(SemanticMiddleRequest, BuildArtifact, List[CliCoreObservation])
+	CliCompileStopped(SemanticMiddleRequest, String, String, List[CliCoreObservation])
 	CliCompileSemanticFailed(SemanticMiddleRequest, List[SemanticMiddleDiagnostic])
 	CliCompileProtocolFailed(SemanticMiddleRequest, String)
+	CliCompileWorkerFailed(SemanticMiddleRequest, String)
 	CliCompileEmitFailed(SemanticMiddleRequest, String)
 	CliCompileBuildArtifactFailed(SemanticMiddleRequest, String)
+
+
+record CliPreparedCompileExecution {
+	request: SemanticMiddleRequest,
+	configuration: BuildArtifactConfiguration,
+	late_stages: List[CliLateCoreStageRequest]
+}
 
 
 private RAYLIB_PACKAGE_ID: String = "raylib"
@@ -163,105 +168,160 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"unsupported foreign link platform in semantic Core: `${platform}`"
 
 
-private pure func semantic_observation_stages(
-	stage_names: List[String],
-) -> List[SemanticMiddleStage]:
-	stage_names.flat_map(func(stage_name):
-		match parse_semantic_middle_stage(stage_name):
-			Some(stage):
-				[stage]
-			None:
-				[]
-	)
+private pure func core_observation(
+	observation: SemanticMiddleObservation,
+) -> CliCoreObservation:
+	{
+		stage_name = semantic_middle_stage_name(observation.stage),
+		rendered = observation.rendered
+	}
 
 
-private pure func semantic_stop_stage(stage_name: Option[String]) -> Option[SemanticMiddleStage]:
-	match stage_name:
-		Some(name):
-			parse_semantic_middle_stage(name)
-		None:
-			None
+private pure func emit_compile_artifact(
+	request: SemanticMiddleRequest,
+	core: CoreProgram,
+	observations: List[CliCoreObservation],
+	configuration: BuildArtifactConfiguration,
+) -> CliCompileExecution:
+	match try_emit_core_program_c_artifact_with_options(
+		core,
+		{profile = configuration.compatibility.profile},
+	):
+		Ok(emission):
+			match build_artifact(core, emission, configuration):
+				Ok(artifact):
+					CliCompileArtifact(request, artifact, observations)
+				Err(error):
+					CliCompileBuildArtifactFailed(
+						request,
+						build_artifact_error_message(error),
+					)
+		Err(error):
+			CliCompileEmitFailed(
+				request,
+				unsupported_global_initializer_error_to_string(error),
+			)
 
 
-private pure func semantic_protocol_error_message(error: SemanticMiddleProtocolError) -> String:
-	match error:
-		SemanticMiddleMissingField(name):
-			"semantic worker response is missing field `${name}`"
-		SemanticMiddleExpectedField(name, expected):
-			"semantic worker response field `${name}` must be ${expected}"
-		SemanticMiddleUnsupportedSchema(schema):
-			"semantic worker returned unsupported schema ${schema.to_string()}"
-		SemanticMiddleUnsupportedDomain(domain):
-			"semantic worker returned unsupported domain `${domain}`"
-		SemanticMiddleUnsupportedKind(kind):
-			"semantic worker returned unsupported response kind `${kind}`"
-		SemanticMiddleUnsupportedStage(stage):
-			"semantic worker returned unsupported stage `${stage}`"
-		SemanticMiddleUnsupportedCapability(capability):
-			"semantic worker returned unsupported capability `${capability}`"
-		SemanticMiddleMissingCapability(capability):
-			"semantic worker response is missing capability `${capability}`"
-		SemanticMiddleInvalidCore(error):
-			"semantic worker returned invalid Core: ${core_json_error_to_string(error)}"
+private pure func finish_decoded_compile_execution(
+	request: SemanticMiddleRequest,
+	response: SemanticMiddleResponse,
+	configuration: BuildArtifactConfiguration,
+	late_stages: List[CliLateCoreStageRequest],
+) -> CliCompileExecution:
+	match response:
+		SemanticMiddleCompiled(core, observations):
+			match execute_late_core_stages(
+				core,
+				observations.map(core_observation),
+				late_stages,
+			):
+				CliLateCoreCompleted(completed_core, completed_observations):
+					emit_compile_artifact(
+						request,
+						completed_core,
+						completed_observations,
+						configuration,
+					)
+				CliLateCoreStopped(stage_name, rendered, stopped_observations):
+					CliCompileStopped(
+						request,
+						stage_name,
+						rendered,
+						stopped_observations,
+					)
+		SemanticMiddleStopped(stage, rendered, observations):
+			CliCompileStopped(
+				request,
+				semantic_middle_stage_name(stage),
+				rendered,
+				observations.map(core_observation),
+			)
+		SemanticMiddleFailed(diagnostics):
+			CliCompileSemanticFailed(request, diagnostics)
 
 
 private pure func finish_compile_execution(
 	request: SemanticMiddleRequest,
 	response_value: JsonValue,
 	configuration: BuildArtifactConfiguration,
+	late_stages: List[CliLateCoreStageRequest],
 ) -> CliCompileExecution:
 	match decode_semantic_middle_response_value(response_value):
 		Ok(response):
-			match response:
-				SemanticMiddleCompiled(core, _):
-					match try_emit_core_program_c_artifact_with_options(
-						core,
-						{profile = configuration.compatibility.profile},
-					):
-						Ok(emission):
-							match build_artifact(core, emission, configuration):
-								Ok(artifact):
-									CliCompileArtifact(request, artifact)
-								Err(error):
-									CliCompileBuildArtifactFailed(
-										request,
-										build_artifact_error_message(error),
-									)
-						Err(error):
-							CliCompileEmitFailed(
-								request,
-								unsupported_global_initializer_error_to_string(error),
-							)
-				SemanticMiddleStopped(stage, rendered, observations):
-					CliCompileStopped(request, stage, rendered, observations)
-				SemanticMiddleFailed(diagnostics):
-					CliCompileSemanticFailed(request, diagnostics)
+			finish_decoded_compile_execution(request, response, configuration, late_stages)
 		Err(error):
-			CliCompileProtocolFailed(request, semantic_protocol_error_message(error))
+			CliCompileProtocolFailed(request, semantic_middle_protocol_error_message(error))
+
+
+pure func finish_prepared_compile_execution(
+	prepared: CliPreparedCompileExecution,
+	response: SemanticMiddleResponse,
+) -> CliCompileExecution:
+	finish_decoded_compile_execution(
+		prepared.request,
+		response,
+		prepared.configuration,
+		prepared.late_stages,
+	)
+
+
+pure func prepare_compile_plan(
+	plan: CliCompilePlan,
+) -> Result[CliPreparedCompileExecution, List[String]]:
+	stage_requests: CliCompileStageRequests = compile_stage_requests(
+		plan.options.dump_core_after,
+		plan.options.stop_after,
+	)
+	request ?= compile_frontend_graph(
+		plan.graph,
+		plan.options.debug,
+		True,
+		plan.options.check_invariants,
+		stage_requests.semantic_observations,
+		stage_requests.semantic_stop,
+	)
+
+	Ok({
+		request = request,
+		configuration = artifact_configuration(
+			request,
+			plan.graph,
+			compile_runtime_requirement(plan.options),
+			compile_compatibility(plan.options),
+		),
+		late_stages = stage_requests.late_stages
+	})
+
+
+pure func prepare_run_plan(
+	plan: CliRunSourcePlan,
+) -> Result[CliPreparedCompileExecution, List[String]]:
+	request ?= compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None)
+
+	Ok({
+		request = request,
+		configuration = artifact_configuration(
+			request,
+			plan.graph,
+			BuildExternalRuntime,
+			run_compatibility(plan.options),
+		),
+		late_stages = []
+	})
 
 
 pure func execute_compile_plan(
 	plan: CliCompilePlan,
 	response_value: JsonValue,
 ) -> CliCompileExecution:
-	match compile_frontend_graph(
-		plan.graph,
-		plan.options.debug,
-		True,
-		plan.options.check_invariants,
-		semantic_observation_stages(plan.options.dump_core_after),
-		semantic_stop_stage(plan.options.stop_after),
-	):
-		Ok(request):
+	match prepare_compile_plan(plan):
+		Ok(prepared):
 			finish_compile_execution(
-				request,
+				prepared.request,
 				response_value,
-				artifact_configuration(
-					request,
-					plan.graph,
-					compile_runtime_requirement(plan.options),
-					compile_compatibility(plan.options),
-				),
+				prepared.configuration,
+				prepared.late_stages,
 			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)
@@ -271,17 +331,13 @@ pure func execute_run_plan(
 	plan: CliRunSourcePlan,
 	response_value: JsonValue,
 ) -> CliCompileExecution:
-	match compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None):
-		Ok(request):
+	match prepare_run_plan(plan):
+		Ok(prepared):
 			finish_compile_execution(
-				request,
+				prepared.request,
 				response_value,
-				artifact_configuration(
-					request,
-					plan.graph,
-					BuildExternalRuntime,
-					run_compatibility(plan.options),
-				),
+				prepared.configuration,
+				prepared.late_stages,
 			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)

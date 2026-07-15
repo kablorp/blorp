@@ -291,6 +291,11 @@ import:
 		compiler_widening_value_type,
 	compiler_typecheck_state:
 		CompilerImportedNameBinding,
+		CompilerResourceShapeTarget(
+			CompilerOneShotStreamShape,
+			CompilerResourceSourceShape,
+		),
+		CompilerTypeShapeMemo,
 		CompilerTypecheckState,
 		compiler_top_level_name_kind_is_trait,
 		compiler_typecheck_state_add_error,
@@ -605,6 +610,12 @@ private record CompilerCallSignature {
 record CompilerInferResult {
 	context: CompilerInferContext,
 	expr: CompilerTypedExpr
+}
+
+
+private record CompilerMemoizedTypeShapeCheck {
+	contains: Bool,
+	memo: CompilerTypeShapeMemo
 }
 
 
@@ -11294,19 +11305,14 @@ private pure func compiler_scoped_resource_derived_capture_names(
 	result
 
 
-private enum CompilerResourceCapabilityTarget:
-	CompilerOneShotStreamCapabilityTarget
-	CompilerResourceSourceCapabilityTarget
-
-
 private pure func compiler_resource_capability_target_matches(
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	name: String,
 ) -> Bool:
 	match target:
-		CompilerOneShotStreamCapabilityTarget:
+		CompilerOneShotStreamShape:
 			compiler_is_one_shot_stream_type_name(name)
-		CompilerResourceSourceCapabilityTarget:
+		CompilerResourceSourceShape:
 			compiler_is_resource_source_type_name(name)
 
 
@@ -11342,7 +11348,7 @@ private pure func compiler_named_type_component_types(
 
 private pure func compiler_type_is_resource_capability_target(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
 ) -> Bool:
 	resolved = compiler_env_resolve_alias(context.state.env, typ)
@@ -11356,7 +11362,7 @@ private pure func compiler_type_is_resource_capability_target(
 
 private pure func compiler_type_contains_resource_capability_seen(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	visited: List[String],
 	typ: CompilerType,
 ) -> Bool:
@@ -11434,9 +11440,9 @@ private pure func compiler_type_contains_resource_capability_seen(
 			False
 
 
-private pure func compiler_type_contains_resource_capability(
+private pure func compiler_type_contains_resource_capability_uncached(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
 ) -> Bool:
 	compiler_type_contains_resource_capability_seen(context, target, [], typ)
@@ -11444,18 +11450,18 @@ private pure func compiler_type_contains_resource_capability(
 
 private pure func compiler_type_endpoint_hides_resource_capability(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
 ) -> Bool:
 	(
-		compiler_type_contains_resource_capability(context, target, typ)
+		compiler_type_contains_resource_capability_uncached(context, target, typ)
 		and not compiler_type_is_resource_capability_target(context, target, typ)
 	)
 
 
 private pure func compiler_function_endpoint_has_resource_capability_carrier(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	visited: List[String],
 	typ: CompilerType,
 ) -> Bool:
@@ -11483,7 +11489,7 @@ private pure func compiler_function_endpoint_has_resource_capability_carrier(
 
 private pure func compiler_type_contains_resource_capability_function_carrier_seen(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	visited: List[String],
 	typ: CompilerType,
 ) -> Bool:
@@ -11598,23 +11604,117 @@ private pure func compiler_type_contains_resource_capability_function_carrier_se
 			False
 
 
-private pure func compiler_type_contains_resource_capability_function_carrier(
+private pure func compiler_type_contains_resource_capability_function_carrier_uncached(
 	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
 ) -> Bool:
 	compiler_type_contains_resource_capability_function_carrier_seen(context, target, [], typ)
 
 
-private pure func compiler_type_has_ordinary_resource_capability_carrier(
-	context: CompilerInferContext,
-	target: CompilerResourceCapabilityTarget,
+private pure func compiler_contains_target_memo_lookup(
+	memo: CompilerTypeShapeMemo,
+	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
-) -> Bool:
-	(
-		compiler_type_contains_resource_capability(context, target, typ)
-		and not compiler_type_is_resource_capability_target(context, target, typ)
-	)
+) -> Option[Bool]:
+	var result: Option[Bool] = None
+
+	for entry in memo.contains_target:
+		if (
+			entry.target == target
+			and entry.rigid_type_params.length() == 0
+			and compiler_types_equal(entry.typ, typ)
+		):
+			result = Some(entry.contains)
+			break
+
+	result
+
+
+private pure func compiler_function_carrier_memo_lookup(
+	memo: CompilerTypeShapeMemo,
+	target: CompilerResourceShapeTarget,
+	typ: CompilerType,
+) -> Option[Bool]:
+	var result: Option[Bool] = None
+
+	for entry in memo.function_carrier:
+		if (
+			entry.target == target
+			and entry.rigid_type_params.length() == 0
+			and compiler_types_equal(entry.typ, typ)
+		):
+			result = Some(entry.contains)
+			break
+
+	result
+
+
+private pure func compiler_type_contains_resource_capability(
+	context: CompilerInferContext,
+	target: CompilerResourceShapeTarget,
+	typ: CompilerType,
+) -> CompilerMemoizedTypeShapeCheck:
+	memo = context.state.type_shape_memo
+
+	match compiler_contains_target_memo_lookup(memo, target, typ):
+		Some(cached_result):
+			{
+				contains = cached_result,
+				memo = memo
+			}
+		None:
+			contains_capability = compiler_type_contains_resource_capability_uncached(
+				context,
+				target,
+				typ,
+			)
+			{
+				contains = contains_capability,
+				memo = { memo | contains_target = memo.contains_target.append({
+						target = target,
+						rigid_type_params = [],
+						typ = typ,
+						contains = contains_capability
+					}) }
+			}
+
+
+private pure func compiler_type_contains_resource_capability_function_carrier(
+	context: CompilerInferContext,
+	target: CompilerResourceShapeTarget,
+	typ: CompilerType,
+) -> CompilerMemoizedTypeShapeCheck:
+	memo = context.state.type_shape_memo
+
+	match compiler_function_carrier_memo_lookup(memo, target, typ):
+		Some(cached_result):
+			{
+				contains = cached_result,
+				memo = memo
+			}
+		None:
+			contains_carrier = compiler_type_contains_resource_capability_function_carrier_uncached(
+				context,
+				target,
+				typ,
+			)
+			{
+				contains = contains_carrier,
+				memo = { memo | function_carrier = memo.function_carrier.append({
+						target = target,
+						rigid_type_params = [],
+						typ = typ,
+						contains = contains_carrier
+					}) }
+			}
+
+
+private pure func compiler_infer_context_with_type_shape_memo(
+	context: CompilerInferContext,
+	memo: CompilerTypeShapeMemo,
+) -> CompilerInferContext:
+	{ context | state = { context.state | type_shape_memo = memo } }
 
 
 private pure func compiler_optional_binding_name_suffix(name: String) -> String:
@@ -11629,30 +11729,50 @@ private pure func compiler_check_one_shot_stream_ordinary_binding(
 	binding_name: String,
 	typ: CompilerType,
 ) -> CompilerInferContext:
-	if compiler_type_contains_resource_capability_function_carrier(
+	carrier_check = compiler_type_contains_resource_capability_function_carrier(
 		context,
-		CompilerOneShotStreamCapabilityTarget,
+		CompilerOneShotStreamShape,
 		typ,
-	):
+	)
+	with_function_carrier_memo = compiler_infer_context_with_type_shape_memo(
+		context,
+		carrier_check.memo,
+	)
+
+	if carrier_check.contains:
 		compiler_infer_error(
-			context,
+			with_function_carrier_memo,
 			"function value" + compiler_optional_binding_name_suffix(
 				binding_name,
 			) + " cannot accept or return a one-shot stream carrier",
 		)
-	else if compiler_type_has_ordinary_resource_capability_carrier(
-		context,
-		CompilerOneShotStreamCapabilityTarget,
-		typ,
-	):
-		compiler_infer_error(
-			context,
-			"one-shot stream value" + compiler_optional_binding_name_suffix(
-				binding_name,
-			) + " cannot be bound to an ordinary variable",
-		)
 	else:
-		compiler_infer_context_copy(context)
+		capability_check = compiler_type_contains_resource_capability(
+			with_function_carrier_memo,
+			CompilerOneShotStreamShape,
+			typ,
+		)
+		with_contains_memo = compiler_infer_context_with_type_shape_memo(
+			with_function_carrier_memo,
+			capability_check.memo,
+		)
+
+		if (
+			capability_check.contains
+			and not compiler_type_is_resource_capability_target(
+				with_contains_memo,
+				CompilerOneShotStreamShape,
+				typ,
+			)
+		):
+			compiler_infer_error(
+				with_contains_memo,
+				"one-shot stream value" + compiler_optional_binding_name_suffix(
+					binding_name,
+				) + " cannot be bound to an ordinary variable",
+			)
+		else:
+			compiler_infer_context_copy(with_contains_memo)
 
 
 private pure func compiler_check_resource_source_ordinary_binding(
@@ -11660,30 +11780,50 @@ private pure func compiler_check_resource_source_ordinary_binding(
 	binding_name: String,
 	typ: CompilerType,
 ) -> CompilerInferContext:
-	if compiler_type_contains_resource_capability_function_carrier(
+	carrier_check = compiler_type_contains_resource_capability_function_carrier(
 		context,
-		CompilerResourceSourceCapabilityTarget,
+		CompilerResourceSourceShape,
 		typ,
-	):
+	)
+	with_function_carrier_memo = compiler_infer_context_with_type_shape_memo(
+		context,
+		carrier_check.memo,
+	)
+
+	if carrier_check.contains:
 		compiler_infer_error(
-			context,
+			with_function_carrier_memo,
 			"function value" + compiler_optional_binding_name_suffix(
 				binding_name,
 			) + " cannot accept or return a resource source carrier",
 		)
-	else if compiler_type_has_ordinary_resource_capability_carrier(
-		context,
-		CompilerResourceSourceCapabilityTarget,
-		typ,
-	):
-		compiler_infer_error(
-			context,
-			"resource source value" + compiler_optional_binding_name_suffix(
-				binding_name,
-			) + " cannot be bound to an ordinary variable",
-		)
 	else:
-		compiler_infer_context_copy(context)
+		capability_check = compiler_type_contains_resource_capability(
+			with_function_carrier_memo,
+			CompilerResourceSourceShape,
+			typ,
+		)
+		with_contains_memo = compiler_infer_context_with_type_shape_memo(
+			with_function_carrier_memo,
+			capability_check.memo,
+		)
+
+		if (
+			capability_check.contains
+			and not compiler_type_is_resource_capability_target(
+				with_contains_memo,
+				CompilerResourceSourceShape,
+				typ,
+			)
+		):
+			compiler_infer_error(
+				with_contains_memo,
+				"resource source value" + compiler_optional_binding_name_suffix(
+					binding_name,
+				) + " cannot be bound to an ordinary variable",
+			)
+		else:
+			compiler_infer_context_copy(with_contains_memo)
 
 
 private pure func compiler_check_resource_source_mutable_binding(
@@ -11696,7 +11836,7 @@ private pure func compiler_check_resource_source_mutable_binding(
 		is_mutable
 		and compiler_type_is_resource_capability_target(
 			context,
-			CompilerResourceSourceCapabilityTarget,
+			CompilerResourceSourceShape,
 			typ,
 		)
 	):
@@ -11715,7 +11855,7 @@ private pure func compiler_resource_source_refs_in_expr(
 	expr: ParsedExpr,
 ) -> List[String]:
 	refs = compiler_free_var_refs_in_expr(context.state.env, [], expr)
-	compiler_capture_names_with_capability(context, refs, CompilerResourceSourceCapabilityTarget)
+	compiler_capture_names_with_capability(context, refs, CompilerResourceSourceShape)
 
 
 private pure func compiler_check_resource_source_copy_from_existing(
@@ -11726,7 +11866,7 @@ private pure func compiler_check_resource_source_copy_from_existing(
 ) -> CompilerInferContext:
 	if compiler_type_is_resource_capability_target(
 		context,
-		CompilerResourceSourceCapabilityTarget,
+		CompilerResourceSourceShape,
 		typ,
 	):
 		refs = compiler_resource_source_refs_in_expr(context, value)
@@ -11778,19 +11918,22 @@ private pure func compiler_check_one_shot_stream_storage(
 	container: String,
 	typ: CompilerType,
 ) -> CompilerInferContext:
-	if compiler_type_contains_resource_capability(
+	capability_check = compiler_type_contains_resource_capability(
 		context,
-		CompilerOneShotStreamCapabilityTarget,
+		CompilerOneShotStreamShape,
 		typ,
-	):
+	)
+	with_memo = compiler_infer_context_with_type_shape_memo(context, capability_check.memo)
+
+	if capability_check.contains:
 		compiler_infer_error(
-			context,
+			with_memo,
 			"one-shot stream values cannot be stored in " + container + " (found " + compiler_type_to_string(
 				typ,
 			) + ")",
 		)
 	else:
-		compiler_infer_context_copy(context)
+		compiler_infer_context_copy(with_memo)
 
 
 private pure func compiler_check_resource_source_storage(
@@ -11798,19 +11941,22 @@ private pure func compiler_check_resource_source_storage(
 	container: String,
 	typ: CompilerType,
 ) -> CompilerInferContext:
-	if compiler_type_contains_resource_capability(
+	capability_check = compiler_type_contains_resource_capability(
 		context,
-		CompilerResourceSourceCapabilityTarget,
+		CompilerResourceSourceShape,
 		typ,
-	):
+	)
+	with_memo = compiler_infer_context_with_type_shape_memo(context, capability_check.memo)
+
+	if capability_check.contains:
 		compiler_infer_error(
-			context,
+			with_memo,
 			"resource source values cannot be stored in " + container + " (found " + compiler_type_to_string(
 				typ,
 			) + ")",
 		)
 	else:
-		compiler_infer_context_copy(context)
+		compiler_infer_context_copy(with_memo)
 
 
 private pure func compiler_check_resource_capability_storage(
@@ -11825,14 +11971,14 @@ private pure func compiler_check_resource_capability_storage(
 private pure func compiler_capture_names_with_capability(
 	context: CompilerInferContext,
 	refs: List[String],
-	target: CompilerResourceCapabilityTarget,
+	target: CompilerResourceShapeTarget,
 ) -> List[String]:
 	var result: List[String] = []
 
 	for name in refs:
 		match compiler_env_get_var_type(context.state.env, name):
 			Some(typ):
-				if compiler_type_contains_resource_capability(context, target, typ):
+				if compiler_type_contains_resource_capability_uncached(context, target, typ):
 					result = compiler_name_list_add_unique(result, name)
 			None:
 				void
@@ -11869,13 +12015,13 @@ private pure func compiler_check_lambda_captures(
 	source_captures = compiler_capture_names_with_capability(
 		context,
 		free_refs,
-		CompilerResourceSourceCapabilityTarget,
+		CompilerResourceSourceShape,
 	)
 	derived_captures = compiler_scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = compiler_capture_names_with_capability(
 		context,
 		free_refs,
-		CompilerOneShotStreamCapabilityTarget,
+		CompilerOneShotStreamShape,
 	)
 	mutable_captures = compiler_mutable_capture_names(context.state.env, free_refs)
 
@@ -18624,13 +18770,13 @@ private pure func compiler_check_task_captures(
 	source_captures = compiler_capture_names_with_capability(
 		context,
 		free_refs,
-		CompilerResourceSourceCapabilityTarget,
+		CompilerResourceSourceShape,
 	)
 	derived_captures = compiler_scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = compiler_capture_names_with_capability(
 		context,
 		free_refs,
-		CompilerOneShotStreamCapabilityTarget,
+		CompilerOneShotStreamShape,
 	)
 	mutable_captures = compiler_mutable_capture_names(context.state.env, free_refs)
 

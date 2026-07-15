@@ -221,6 +221,98 @@ let test_blorp_bridge_typecheck_uses_preloaded_graph_imports () =
                 ("expected Blorp bridge typecheck to use graph imports:\n"
                ^ format_errors errors)))
 
+let test_blorp_bridge_typecheck_canonicalizes_resolved_module_aliases () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_typecheck_bridge_alias" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let first_path = Filename.concat dir "first.brp" in
+          let dep_path = Filename.concat dir "dep.brp" in
+          let main_source =
+            "import:\n\
+            \    first: first\n\
+            \    nested/dep as Dep\n\n\
+             func identity() -> Int:\n\
+            \    first() + Dep.answer()\n"
+          in
+          let first_source =
+            "import:\n\
+            \    dep: answer\n\n\
+             pure func first() -> Int:\n\
+            \    answer()\n"
+          in
+          let dep_source = "pure func answer() -> Int:\n    1\n" in
+          write_file main_path main_source;
+          write_file first_path first_source;
+          write_file dep_path dep_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let first_parsed =
+            parse_typecheck_source_for_test ~path:first_path
+              ~module_name:"first"
+          in
+          let dep_parsed =
+            parse_typecheck_source_for_test ~path:dep_path ~module_name:"dep"
+          in
+          let dep_alias_parsed =
+            parse_typecheck_source_for_test ~path:dep_path
+              ~module_name:"nested/dep"
+          in
+          let preloaded_module_graph : Modules.preloaded_module_graph =
+            {
+              preload_graph_context = empty_preloaded_graph_context;
+              preload_graph_sources =
+                [
+                  preloaded_source_for_test ~path:main_path ~module_name:"main"
+                    ~source:main_source main_parsed;
+                  preloaded_source_for_test ~path:first_path
+                    ~module_name:"first" ~source:first_source first_parsed;
+                  preloaded_source_for_test ~path:dep_path ~module_name:"dep"
+                    ~source:dep_source dep_parsed;
+                  preloaded_source_for_test ~path:dep_path
+                    ~module_name:"nested/dep" ~source:dep_source
+                    dep_alias_parsed;
+                ];
+              preload_graph_imports =
+                [
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "first";
+                    preload_import_resolved_path = Some first_path;
+                    preload_import_resolved_module = Some "first";
+                    preload_import_resolved_origin = Some Session.User_module;
+                  };
+                  {
+                    preload_import_from_path = first_path;
+                    preload_import_from_module = "first";
+                    preload_import_path = "dep";
+                    preload_import_resolved_path = Some dep_path;
+                    preload_import_resolved_module = Some "dep";
+                    preload_import_resolved_origin = Some Session.User_module;
+                  };
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "nested/dep";
+                    preload_import_resolved_path = Some dep_path;
+                    preload_import_resolved_module = Some "nested/dep";
+                    preload_import_resolved_origin = Some Session.User_module;
+                  };
+                ];
+            }
+          in
+          match
+            typecheck_with_blorp_bridge ~filename:main_path
+              ~preloaded_module_graph
+          with
+          | Ok _ -> ()
+          | Error errors ->
+              Alcotest.fail
+                ("expected resolved source aliases to share the loaded module \
+                  identity:\n"
+               ^ format_errors errors)))
+
 let test_blorp_bridge_typecheck_uses_fresh_session_per_call () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_pipeline_typecheck_bridge_fresh_session" (fun dir ->
@@ -519,6 +611,136 @@ let test_blorp_bridge_compile_types_std_support_modules () =
               Alcotest.fail
                 ("expected Blorp bridge compile preview to type std support:\n"
                ^ format_errors errors)))
+
+let find_core_function_def_id program name =
+  List.find_map
+    (fun (decl : Core.core_decl) ->
+      match decl.cd_desc with
+      | Core.CDFunc func when String.equal func.cf_name name ->
+          Some func.cf_def_id
+      | _ -> None)
+    program
+
+let has_prefix ~prefix value =
+  let prefix_length = String.length prefix in
+  String.length value >= prefix_length
+  && String.sub value 0 prefix_length = prefix
+
+let find_resolved_call_identity program source_function_name =
+  let mono_prefix = source_function_name ^ "__mono_" in
+  let call_identity_in_body body =
+    Core.fold_tree
+      (fun found node ->
+        match found with
+        | Some _ -> found
+        | None -> (
+            match node.Core.desc with
+            | Core.CCall (kind, _, _) -> (
+                match kind with
+                | Core.CKUser (name, Some def_id)
+                  when String.equal name source_function_name
+                       || has_prefix ~prefix:mono_prefix name ->
+                    Some (name, def_id)
+                | _ -> None)
+            | _ -> None))
+      None body
+  in
+  List.find_map
+    (fun (decl : Core.core_decl) ->
+      match decl.cd_desc with
+      | Core.CDFunc { cf_body = Some body; _ } -> call_identity_in_body body
+      | _ -> None)
+    program
+
+let test_blorp_bridge_std_call_and_declaration_share_identity () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_compile_bridge_std_identity" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let main_source =
+            "import:\n\
+            \    channel: SendAttempt(SendAccepted), try_send_attempt\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    ch: Channel[Int] = channel(1)\n\
+            \    attempt: SendAttempt = try_send_attempt(ch, 7)\n\
+            \    match attempt:\n\
+            \        SendAccepted:\n\
+            \            0\n\
+            \        _:\n\
+            \            1\n"
+          in
+          write_file main_path main_source;
+          let main_parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let preloaded_module_graph =
+            preloaded_graph_for_single_source ~path:main_path
+              ~source:main_source ~parsed:main_parsed
+            |> fun graph ->
+            {
+              graph with
+              preload_graph_imports =
+                [
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "channel";
+                    preload_import_resolved_path = None;
+                    preload_import_resolved_module = None;
+                    preload_import_resolved_origin = None;
+                  };
+                ];
+            }
+          in
+          let resolved = ref None in
+          let on_stage stage program =
+            if stage = Core_stage.Resolve then begin
+              resolved := Some program;
+              raise (Core_pipeline.Stopped_after stage)
+            end
+          in
+          (match
+             Pipeline.compile_preloaded_graph_with_blorp_bridge
+               ~embed_runtime:false ~on_stage ~filename:main_path
+               ~preloaded_module_graph ()
+           with
+          | Ok (Pipeline.Stopped_at Core_stage.Resolve) -> ()
+          | Ok (Pipeline.Stopped_at stage) ->
+              Alcotest.failf "unexpected stop after %s"
+                (Core_stage.to_string stage)
+          | Ok (Pipeline.Compiled _) ->
+              Alcotest.fail "expected compile to stop after resolve"
+          | Error errors ->
+              Alcotest.fail
+                ("expected Blorp graph to resolve channel call:\n"
+               ^ format_errors errors));
+          let resolved =
+            match !resolved with
+            | Some program -> program
+            | None -> Alcotest.fail "resolve-stage callback did not run"
+          in
+          let source_function_name = "std_channel__try_send_attempt" in
+          let source_id =
+            match find_core_function_def_id resolved source_function_name with
+            | Some id -> id
+            | None -> Alcotest.fail "source channel declaration was not lowered"
+          in
+          let resolved_name, call_id =
+            match
+              find_resolved_call_identity resolved source_function_name
+            with
+            | Some identity -> identity
+            | None -> Alcotest.fail "channel call was not resolved"
+          in
+          let declaration_id =
+            match find_core_function_def_id resolved resolved_name with
+            | Some id -> id
+            | None -> Alcotest.fail "resolved channel declaration was not retained"
+          in
+          Alcotest.(check int)
+            "resolved call and declaration identity" declaration_id call_id;
+          Alcotest.(check bool)
+            "generated identity is above source identities" true
+            (call_id > source_id)))
 
 let test_surface_backed_exports_support_selective_imports () =
   Test_helpers.with_isolated_env (fun () ->
@@ -1581,6 +1803,9 @@ let suite =
           "Blorp bridge typecheck uses preloaded graph imports" `Quick
           test_blorp_bridge_typecheck_uses_preloaded_graph_imports;
         Alcotest.test_case
+          "Blorp bridge typecheck canonicalizes resolved module aliases" `Quick
+          test_blorp_bridge_typecheck_canonicalizes_resolved_module_aliases;
+        Alcotest.test_case
           "Blorp bridge typecheck uses fresh session per call" `Quick
           test_blorp_bridge_typecheck_uses_fresh_session_per_call;
         Alcotest.test_case "Blorp bridge typecheck reports type errors"
@@ -1639,6 +1864,9 @@ let suite =
         Alcotest.test_case
           "Blorp bridge compile types std support modules" `Quick
           test_blorp_bridge_compile_types_std_support_modules;
+        Alcotest.test_case
+          "Blorp bridge std call and declaration share identity" `Quick
+          test_blorp_bridge_std_call_and_declaration_share_identity;
         Alcotest.test_case
           "cross-module coherence distinguishes same-named local types" `Quick
           test_cross_module_coherence_distinguishes_same_named_local_types;

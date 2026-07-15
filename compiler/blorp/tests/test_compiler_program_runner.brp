@@ -1,0 +1,215 @@
+import:
+	../src/stage_10_backend/compiler_build_artifact:
+		BuildArtifact,
+		BuildCompatibility,
+		BuildOptimization(BuildFast),
+		BuildPlatform(BuildLinux),
+		BuildRuntimeRequirement(BuildEmbeddedRuntime),
+		BuildSanitizer(BuildNoSanitizer),
+	../src/stage_12_cli/compiler_host_c:
+		HostCCompilerFamily(HostClang),
+		HostCConfiguration,
+		HostRuntimeInput(HostEmbeddedRuntime),
+		HostTlsBackend(HostTlsUnsupported),
+	../src/stage_12_cli/compiler_program_runner:
+		ProgramRunRequest,
+		prepare_program_command,
+		program_exit_status,
+		run_build_artifact,
+	compiler_runtime: CompilerRuntimeSources
+	process:
+		ProcessExit(Exited, Signaled, TimedOut),
+		ProcessStdin(InheritStdin),
+		ProcessStream(InheritStream),
+	system: file_exists, getenv, temp_dir
+	test: TestSuite
+	units: Duration, mebibytes, milliseconds, seconds
+
+
+private pure func build_artifact(code: String, leak_check: Bool) -> BuildArtifact:
+	compatibility: BuildCompatibility = {
+		debug = False,
+		profile = False,
+		optimization = BuildFast,
+		sanitizer = BuildNoSanitizer,
+		leak_check = leak_check
+	}
+	{
+		c_code = code,
+		link_arguments = [],
+		include_dirs = [],
+		runtime_requirement = BuildEmbeddedRuntime,
+		native_features = [],
+		source = {
+			path = "runner-test.brp",
+			module_name = "RunnerTest"
+		},
+		compatibility = compatibility
+	}
+
+
+private pure func host_configuration() -> HostCConfiguration:
+	{
+		platform = BuildLinux,
+		compiler = {
+			program = "cc",
+			prefix_arguments = [],
+			family = HostClang
+		},
+		tls = {
+			backend = HostTlsUnsupported,
+			runtime_arguments = [],
+			link_arguments = []
+		},
+		raylib_prefix = None,
+		timeout = Some(seconds(10)),
+		capture_limit = mebibytes(4)
+	}
+
+
+private func run_request(
+	code: String,
+	arguments: List[String],
+	timeout: Option[Duration],
+	threads: Option[Int],
+	leak_check: Bool,
+) -> ProgramRunRequest:
+	sources: CompilerRuntimeSources = {
+		runtime = "\n",
+		declarations = ""
+	}
+	{
+		artifact = build_artifact(code, leak_check),
+		host = host_configuration(),
+		runtime = HostEmbeddedRuntime(sources),
+		temporary_root = temp_dir(),
+		user_arguments = arguments,
+		timeout = timeout,
+		threads = threads
+	}
+
+
+pure func test_program_command_preserves_argv_and_child_environment() -> Bool:
+	request = prepare_program_command(
+		"/tmp/program with spaces",
+		["", "two words", "quote'\""],
+		Some(seconds(3)),
+		Some(7),
+		True,
+	)
+
+	stdin_inherited: Bool = match request.stdin:
+		InheritStdin:
+			True
+		_:
+			False
+
+	stdout_inherited: Bool = match request.stdout:
+		InheritStream:
+			True
+		_:
+			False
+
+	stderr_inherited: Bool = match request.stderr:
+		InheritStream:
+			True
+		_:
+			False
+
+	environment_is_exact: Bool = match request.environment:
+		[threads, leak_check]:
+			(
+				threads.name == "BLORP_THREADS"
+				and threads.value == Some("7")
+				and leak_check.name == "BLORP_LEAK_CHECK"
+				and leak_check.value == Some("strict")
+			)
+		_:
+			False
+
+	(
+		request.program == "/tmp/program with spaces"
+		and request.args == ["", "two words", "quote'\""]
+		and environment_is_exact
+		and stdin_inherited
+		and stdout_inherited
+		and stderr_inherited
+	)
+
+
+pure func test_program_exit_status_is_conventional() -> Bool:
+	(
+		program_exit_status(Exited(17)) == 17
+		and program_exit_status(Signaled(15)) == 143
+		and program_exit_status(TimedOut) == 124
+	)
+
+
+private func test_program_execution_preserves_args_env_and_cleans_up() -> Bool:
+	before_threads: Option[String] = getenv("BLORP_THREADS")
+	before_leak_check: Option[String] = getenv("BLORP_LEAK_CHECK")
+	code: String =
+		|#include <stdlib.h>
+		|#include <string.h>
+		|int main(int argc, char** argv) {
+		|  const char* threads = getenv("BLORP_THREADS");
+		|  const char* leak = getenv("BLORP_LEAK_CHECK");
+		|  if (argc != 4) return 10;
+		|  if (strcmp(argv[1], "") != 0) return 11;
+		|  if (strcmp(argv[2], "two words") != 0) return 12;
+		|  if (strcmp(argv[3], "quote'\"") != 0) return 13;
+		|  if (!threads || strcmp(threads, "3") != 0) return 14;
+		|  if (!leak || strcmp(leak, "strict") != 0) return 15;
+		|  return 0;
+		|}
+	request = run_request(
+		code,
+		["", "two words", "quote'\""],
+		Some(seconds(5)),
+		Some(3),
+		True,
+	)
+
+	match run_build_artifact(request):
+		Err(_):
+			False
+		Ok(result):
+			(
+				result.exit == Exited(0)
+				and not file_exists(result.executable_path)
+				and getenv("BLORP_THREADS") == before_threads
+				and getenv("BLORP_LEAK_CHECK") == before_leak_check
+			)
+
+
+private func test_program_timeout_is_distinct() -> Bool:
+	code: String =
+		|#include <unistd.h>
+		|int main(void) {
+		|  sleep(2);
+		|  return 0;
+		|}
+	request = run_request(code, [], Some(milliseconds(20)), None, False)
+
+	match run_build_artifact(request):
+		Ok(result):
+			result.exit == TimedOut and not file_exists(result.executable_path)
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler program runner",
+	tests = [
+		(
+			"program command preserves argv and child environment",
+			test_program_command_preserves_argv_and_child_environment,
+		),
+		("program exit status is conventional", test_program_exit_status_is_conventional),
+		(
+			"program execution preserves args, env, and cleanup",
+			test_program_execution_preserves_args_env_and_cleans_up,
+		),
+		("program timeout is distinct", test_program_timeout_is_distinct),
+	]
+}

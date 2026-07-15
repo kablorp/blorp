@@ -1,9 +1,21 @@
 import:
-	../src/stage_05_types/compiler_context: CompilerModuleOrigin(CompilerUserModule)
+	../src/stage_05_types/compiler_context:
+		CompilerModuleOrigin(CompilerStdlibModule, CompilerUserModule),
+	../src/stage_06_typecheck/compiler_infer:
+		compiler_resolved_call_callable_id,
+		compiler_typed_expr_resolved_call,
 	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedModule,
 		compiler_typecheck_graph,
 		handle_request,
 		stream_typecheck_graph_request_value,
+	../src/stage_06_typecheck/compiler_typecheck_decl:
+		CompilerTypedDecl(
+			CompilerTypedFunctionDecl,
+			CompilerTypedPrivateDecl,
+			CompilerTypedUnionDecl,
+		),
+		CompilerTypedProgram,
 	channel: Channel, channel, recv, seal, send
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -571,6 +583,62 @@ func test_typecheck_graph_resolves_imported_global_annotation() -> Bool:
 			False
 
 
+func test_typecheck_graph_preserves_imported_opaque_record_field_owner() -> Bool:
+	units: JsonValue = user_import_module_json("units", "units", "opaque type Duration = Int")
+	process_source: String =
+		|import:
+		|	units: Duration
+		|
+		|record Command {timeout: Option[Duration]}
+		|
+		|pure func command() -> Command:
+		|	{timeout = None}
+	process: JsonValue = user_import_module_json("process", "process", process_source)
+	target_source: String =
+		|import:
+		|	process: command
+		|
+		|func main(args: List[String]) -> Int:
+		|	configured = { command() | timeout = None }
+		|
+		|	match configured.timeout:
+		|		Some(_):
+		|			1
+		|		None:
+		|			0
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[units, process],
+				["process"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			process_response: String = responses
+				.get_or(0, JsonNull)
+				.to_string()
+			target_response: String = responses
+				.get_or(1, JsonNull)
+				.to_string()
+
+			artifact_array_length(
+				responses.get_or(0, JsonNull),
+				"type_errors",
+			) == 0 and artifact_array_length(
+				responses.get_or(1, JsonNull),
+				"type_errors",
+			) == 0 and process_response.contains(
+				"units::Duration",
+			) and target_response.contains("units::Duration")
+		None:
+			False
+
+
 func test_typecheck_graph_materializes_impure_function_reference() -> Bool:
 	target_source: String =
 		|record Suite {tests: List[() -> Bool]}
@@ -690,7 +758,7 @@ pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
 
 pure func test_typecheck_source_evaluates_imported_function_ctfe() -> Bool:
 	source: String = "import:\n\tdep: answer\n\nVALUE: Int = answer() + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
-	dep_text: String = "pure func answer() -> Int:\n\t41"
+	dep_text: String = "private pure func add_one(value: Int) -> Int:\n\tvalue + 1\n\npure func answer() -> Int:\n\tadd_one(40)"
 
 	match response_value(
 		typecheck_source_request_with_imports(
@@ -909,6 +977,50 @@ pure func test_typecheck_source_accepts_imported_generic_return_signature() -> B
 			source,
 			[import_module_json("dep", "dep", dep_text)],
 		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_ignores_unimported_module_declarations() -> Bool:
+	source: String = "import:\n\tdep: answer\n\ntrait Collision:\n\tpure func local(value: Self) -> Int\n\nfunc main(args: List[String]) -> Int:\n\tanswer()"
+	dep_text: String = "pure func answer() -> Int:\n\t0"
+	unrelated_text: String = "trait Collision:\n\tpure func unrelated(value: Self) -> Int"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					import_module_json("dep", "dep", dep_text),
+					import_module_json("unrelated", "unrelated", unrelated_text),
+				],
+			),
+		)
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_resolves_direct_import_transitive_signature() -> Bool:
+	source: String = "import:\n\tdep: make\n\nfunc main(args: List[String]) -> Int:\n\tvalue = make()\n\tvalue.value"
+	dep_text: String = "import:\n\ttypes: Item\n\npure func make() -> Item:\n\tbuiltin(\"make_item\")"
+	types_text: String = "record Item {value: Int}"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					import_module_json("dep", "dep", dep_text),
+					import_module_json("types", "types", types_text),
+				],
+			),
+		)
 	):
 		Some(response):
 			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
@@ -1202,6 +1314,192 @@ pure func test_typed_graph_api_returns_in_memory_results() -> Bool:
 	)
 
 
+pure func test_typed_graph_avoids_std_prelude_self_import() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "prelude.brp",
+				module_name = "std/prelude",
+				module_path = "std/prelude",
+				text = "import:\n\tparallel_list as ParallelListOps",
+				origin = CompilerStdlibModule
+			},
+			{
+				path = "parallel_list.brp",
+				module_name = "std/parallel_list",
+				module_path = "std/parallel_list",
+				text = "pure func identity(value: Int) -> Int:\n\tvalue",
+				origin = CompilerStdlibModule
+			},
+		],
+		module_targets = ["std/parallel_list"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.length() == 0
+		and graph.modules
+			.get(0)
+			.map(func(module): module.errors.length()) == Some(0)
+	)
+
+
+private pure func typed_function_callable_id(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					result = info.callable_id
+					break
+			CompilerTypedPrivateDecl(CompilerTypedFunctionDecl(info)):
+				if info.decl.name.text == name:
+					result = info.callable_id
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_function_body_call_id(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							match compiler_typed_expr_resolved_call(body):
+								Some(call):
+									result = compiler_resolved_call_callable_id(call)
+								None:
+									void
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_module_program(
+	modules: List[CompilerTypecheckedModule],
+	module_path: String,
+) -> Option[CompilerTypedProgram]:
+	modules
+		.find(pure func(module): module.module_path == module_path)
+		.map(pure func(module): module.typed_program)
+
+
+private pure func typed_union_constructor_id(
+	program: CompilerTypedProgram,
+	type_name: String,
+	constructor_name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedUnionDecl(info):
+				if info.decl.name.text == type_name:
+					match info.variants.find(func(variant): variant.name == constructor_name):
+						Some(variant):
+							result = variant.def_id
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+pure func test_typed_graph_uses_graph_wide_definition_ids() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tutil\n\nfunc main(args: List[String]) -> Int:\n\tutil.answer()",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "util.brp",
+				module_name = "util",
+				module_path = "util",
+				text = "pure func answer() -> Int:\n\t42",
+				origin = CompilerUserModule
+			},
+			{
+				path = "color.brp",
+				module_name = "color",
+				module_path = "color",
+				text = "enum Color:\n\tRed",
+				origin = CompilerUserModule
+			},
+			{
+				path = "signal.brp",
+				module_name = "signal",
+				module_path = "signal",
+				text = "union Signal:\n\tRed(Int)",
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["util", "color", "signal"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "util",
+				resolved_module = "util"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	match (
+		typed_module_program(graph.modules, "util"),
+		typed_module_program(graph.modules, "color"),
+		typed_module_program(graph.modules, "signal"),
+	):
+		(Some(util_program), Some(color_program), Some(signal_program)):
+			match (
+				typed_function_callable_id(util_program, "answer"),
+				typed_function_body_call_id(graph.target.typed_program, "main"),
+				typed_union_constructor_id(color_program, "Color", "Red"),
+				typed_union_constructor_id(signal_program, "Signal", "Red"),
+			):
+				(Some(answer_id), Some(call_id), Some(color_red_id), Some(signal_red_id)):
+					answer_id == call_id and color_red_id != signal_red_id
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler typecheck bridge",
 	tests = [
@@ -1222,6 +1520,14 @@ tests: TestSuite = {
 			test_typed_graph_api_returns_in_memory_results,
 		),
 		(
+			"typed graph avoids std prelude self import",
+			test_typed_graph_avoids_std_prelude_self_import,
+		),
+		(
+			"typed graph uses graph-wide definition ids",
+			test_typed_graph_uses_graph_wide_definition_ids,
+		),
+		(
 			"typecheck_graph handles shared import context",
 			test_typecheck_graph_handles_shared_import_context,
 		),
@@ -1232,6 +1538,10 @@ tests: TestSuite = {
 		(
 			"typecheck_graph resolves imported global annotation",
 			test_typecheck_graph_resolves_imported_global_annotation,
+		),
+		(
+			"typecheck_graph preserves imported opaque record field owner",
+			test_typecheck_graph_preserves_imported_opaque_record_field_owner,
 		),
 		(
 			"typecheck_graph materializes impure function reference",
@@ -1306,6 +1616,14 @@ tests: TestSuite = {
 		(
 			"typecheck_source accepts imported generic return signature",
 			test_typecheck_source_accepts_imported_generic_return_signature,
+		),
+		(
+			"typecheck_source ignores unimported module declarations",
+			test_typecheck_source_ignores_unimported_module_declarations,
+		),
+		(
+			"typecheck_source resolves direct import transitive signature",
+			test_typecheck_source_resolves_direct_import_transitive_signature,
 		),
 		(
 			"typecheck_source uses aliased imported function",

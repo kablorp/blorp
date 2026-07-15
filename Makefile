@@ -5,11 +5,14 @@
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
+OCAML_MIDDLE := compiler/_build/default/bin/blorp_ocaml_middle.exe
+ROOT_OCAML_MIDDLE := ./blorp-ocaml-middle
 BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
+BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_embedded_std.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
@@ -50,6 +53,11 @@ install: build-blorp-cli
 		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
 		codesign -s - "$(ROOT_OCAML_HOST)" 2>/dev/null || true; \
 	fi
+	@if [ ! -f "$(ROOT_OCAML_MIDDLE)" ] || [ "$(OCAML_MIDDLE)" -nt "$(ROOT_OCAML_MIDDLE)" ]; then \
+		rm -f "$(ROOT_OCAML_MIDDLE)"; \
+		cp "$(OCAML_MIDDLE)" "$(ROOT_OCAML_MIDDLE)"; \
+		codesign -s - "$(ROOT_OCAML_MIDDLE)" 2>/dev/null || true; \
+	fi
 	@if [ ! -f ./blorp ] || [ "$(BLORP_CLI_BIN)" -nt ./blorp ]; then \
 		rm -f ./blorp; \
 		cp "$(BLORP_CLI_BIN)" ./blorp; \
@@ -78,7 +86,11 @@ build: compiler/lib/embedded_std.ml
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for compiler stages that have not yet moved across the boundary.
-build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE)
+$(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
+	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp && mv $@.tmp $@
+
+build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
@@ -88,7 +100,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE)
 	new_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
-		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \
@@ -99,7 +111,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE)
 		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
 		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
-		cc -O0 -fwrapv -pipe -w "$(BLORP_CLI_C)" -lm -lpthread -o "$$tmp_bin"; \
+		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
 		mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
@@ -148,6 +160,7 @@ hygiene-check:
 	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
 	@tests/test_build_configuration.sh
+	@tests/test_embed_runtime_generator.sh
 	@tests/test_scripts_test_harness.sh
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \

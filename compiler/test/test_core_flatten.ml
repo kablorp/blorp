@@ -175,6 +175,131 @@ let test_imported_function_signature_exposes_module_type_rewrite () =
     (Some "std_units__Duration")
     (Core_flatten.find_imported_type_rewrite rewrites "Duration")
 
+let test_main_imported_result_type_rewrites_without_module_cache () =
+  let send_attempt = TyNamed ("SendAttempt", []) in
+  let send_attempt_decl =
+    {
+      type_name = "SendAttempt";
+      type_params = [];
+      type_variants = [];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+    }
+  in
+  let try_send_attempt =
+    {
+      func_name = Some "try_send_attempt";
+      func_type_params = [];
+      func_params = [];
+      func_return_type = Some send_attempt;
+      func_body = FuncNoBody;
+      func_is_pure = false;
+      func_is_tailrec = false;
+      func_no_copy = false;
+      func_debug_only = false;
+      func_resource_result_ordinary = false;
+      func_dim_constraints = [];
+    }
+  in
+  let main =
+    {
+      cf_name = "main";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = send_attempt;
+      cf_body = None;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let module_program =
+    [
+      { decl_desc = DType send_attempt_decl; decl_loc = loc; decl_doc = None };
+      { decl_desc = DFunc try_send_attempt; decl_loc = loc; decl_doc = None };
+    ]
+  in
+  let rewritten =
+    Core_flatten.rewrite_main_imported_type_names_from_bindings
+      ~main_import_bindings:
+        [
+          {
+            Session.local_name = "try_send_attempt";
+            module_path = "std/channel";
+            original_name = Some "try_send_attempt";
+          };
+        ]
+      ~module_programs:[ ("std/channel", module_program) ]
+      [ decl (CDFunc main) ]
+  in
+  match rewritten with
+  | [ { cd_desc = CDFunc rewritten_main; _ } ] ->
+      Alcotest.(check bool)
+        "inferred result type uses explicit module identity" true
+        (Types.types_equal rewritten_main.cf_return_ty
+           (TyNamed ("std_channel__SendAttempt", [])))
+  | _ -> Alcotest.fail "unexpected rewritten declaration shape"
+
+let test_module_imported_type_rewrites_without_module_cache () =
+  let duration = TyNamed ("Duration", []) in
+  let duration_decl =
+    {
+      type_name = "Duration";
+      type_params = [];
+      type_variants = [];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+    }
+  in
+  let benchmark =
+    {
+      cf_name = "benchmark";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = duration;
+      cf_body = None;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 2;
+    }
+  in
+  let rewritten =
+    Core_flatten.prefix_module_names
+      ~import_bindings:
+        [
+          {
+            Session.local_name = "Duration";
+            module_path = "std/units";
+            original_name = Some "Duration";
+          };
+        ]
+      ~module_programs:
+        [
+          ( "std/units",
+            [
+              {
+                decl_desc = DType duration_decl;
+                decl_loc = loc;
+                decl_doc = None;
+              };
+            ] );
+        ]
+      "benchmarks/support" [ decl (CDFunc benchmark) ]
+  in
+  match rewritten with
+  | [ { cd_desc = CDFunc rewritten_benchmark; _ } ] ->
+      Alcotest.(check bool)
+        "module annotation uses explicit imported type identity" true
+        (Types.types_equal rewritten_benchmark.cf_return_ty
+           (TyNamed ("std_units__Duration", [])))
+  | _ -> Alcotest.fail "unexpected rewritten declaration shape"
+
 let test_global_assignment_targets_are_module_owned () =
   let global =
     {
@@ -401,6 +526,12 @@ let suite =
         Alcotest.test_case
           "imported function signature exposes module type rewrite" `Quick
           test_imported_function_signature_exposes_module_type_rewrite;
+        Alcotest.test_case
+          "main imported result type rewrites without module cache" `Quick
+          test_main_imported_result_type_rewrites_without_module_cache;
+        Alcotest.test_case
+          "module imported type rewrites without module cache" `Quick
+          test_module_imported_type_rewrites_without_module_cache;
       ] );
     ( "values",
       [

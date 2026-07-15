@@ -194,11 +194,27 @@ let typecheck_import_module_for_loaded_module graph (m : Modules.loaded_module)
       })
     (loaded_module_source_text_for_bridge graph m)
 
-let typecheck_resolved_imports_for_graph graph =
+let typecheck_module_path_for_resolved_source import_requests resolved_path =
+  List.find_map
+    (fun ((loaded : Modules.loaded_module), request) ->
+      if String.equal loaded.path resolved_path then
+        Some request.Compiler_blorp_bridge.typecheck_import_module_path
+      else None)
+    import_requests
+
+let typecheck_resolved_imports_for_graph graph import_requests =
   graph.Modules.preload_graph_imports
   |> List.filter_map (fun edge ->
-         match edge.Modules.preload_import_resolved_module with
-         | Some resolved_module ->
+         match
+           ( edge.Modules.preload_import_resolved_path,
+             edge.preload_import_resolved_module )
+         with
+         | Some resolved_path, Some resolved_module ->
+             let resolved_module =
+               typecheck_module_path_for_resolved_source import_requests
+                 resolved_path
+               |> Option.value ~default:resolved_module
+             in
              Some
                {
                  Compiler_blorp_bridge.typecheck_resolved_import_from_path =
@@ -208,7 +224,8 @@ let typecheck_resolved_imports_for_graph graph =
                  typecheck_resolved_import_path = edge.preload_import_path;
                  typecheck_resolved_import_module = resolved_module;
                }
-         | None -> None)
+         | None, None -> None
+         | _ -> None)
 
 let typecheck_graph_import_requests graph =
   let seen = Hashtbl.create 64 in
@@ -225,13 +242,12 @@ let typecheck_graph_import_requests graph =
        []
   |> List.rev
 
-let typecheck_graph_module_requests graph import_requests =
-  List.filter
-    (fun (loaded, _) ->
-      Modules.get_typed_decls loaded.Modules.name = None
-      && Option.is_some
-           (find_graph_source graph ~path:loaded.path ~module_name:loaded.name))
-    import_requests
+let typecheck_graph_module_requests import_requests =
+  (* Every module supplied to the graph typechecker must also take its typed
+     declaration from that graph response. Mixing Blorp-resolved call IDs with
+     an OCaml-typed declaration for embedded std produced two identities for
+     one function and let DCE remove live code. *)
+  import_requests
 
 let typecheck_graph_target_request source =
   {
@@ -313,7 +329,7 @@ type preloaded_graph_typecheck_result = {
 let typecheck_preloaded_graph_with_blorp_bridge ~allow_debug_only_calls graph
     target =
   let import_requests = typecheck_graph_import_requests graph in
-  let module_requests = typecheck_graph_module_requests graph import_requests in
+  let module_requests = typecheck_graph_module_requests import_requests in
   let modules = List.map snd import_requests in
   let module_targets =
     List.map
@@ -322,7 +338,9 @@ let typecheck_preloaded_graph_with_blorp_bridge ~allow_debug_only_calls graph
       module_requests
   in
   let target_request = typecheck_graph_target_request target in
-  let resolved_imports = typecheck_resolved_imports_for_graph graph in
+  let resolved_imports =
+    typecheck_resolved_imports_for_graph graph import_requests
+  in
   match
     Compiler_blorp_bridge.typecheck_graph_via_command_with_policy
       ~allow_debug_only_calls ~resolved_imports ~target:target_request ~modules

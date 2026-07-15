@@ -1045,11 +1045,9 @@ let test_cli_run_response_decodes_frontend_module_graph () =
   | Ok
       (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
         {
-          cli_frontend_graph_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
           cli_frontend_graph_args = [ "compile"; "--no-format"; "src/main.brp" ];
-          cli_frontend_graph_options =
-            Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
-              { cli_compile_files = [ "src/main.brp" ]; _ };
+          cli_frontend_graph_compile_options =
+            { cli_compile_files = [ "src/main.brp" ]; _ };
           cli_frontend_graph_context =
             {
               cli_frontend_context_std_dir = Some "custom-std";
@@ -1101,6 +1099,29 @@ let test_cli_run_response_decodes_frontend_module_graph () =
       ()
   | Ok _ -> Alcotest.fail "expected decoded frontend module graph"
   | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_rejects_source_run_frontend_graph () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "run");
+           ("args", string_array [ "run"; "src/main.brp" ]);
+           ("options", compile_options_json [ "src/main.brp" ]);
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [ frontend_graph_source "src/main.brp" "main" "func main(): 0" ]
+           );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains
+       "unsupported CLI frontend command `run`"
 
 let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
   let response =
@@ -1730,6 +1751,8 @@ let suite =
           test_cli_run_response_decodes_test_options;
         Alcotest.test_case "CLI run response decodes frontend module graph"
           `Quick test_cli_run_response_decodes_frontend_module_graph;
+        Alcotest.test_case "CLI run response rejects source run frontend graph"
+          `Quick test_cli_run_response_rejects_source_run_frontend_graph;
         Alcotest.test_case
           "CLI run response rejects frontend graph missing resolved target" `Quick
           test_cli_run_response_rejects_frontend_graph_missing_resolved_target;

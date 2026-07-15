@@ -2168,6 +2168,8 @@ blorp_FileOpenAppenderResult blorp_file_open_append_raw(const blorp_String* path
 blorp_FileOpenReadWriterResult blorp_file_open_read_write_raw(const blorp_String* path);
 blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(const blorp_String* path);
 blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path);
+blorp_FileOpenWriterResult blorp_temporary_file_open_raw(const blorp_String* parent, const blorp_String* prefix);
+blorp_DirectoryOpenResult blorp_temporary_directory_open_raw(const blorp_String* parent, const blorp_String* prefix);
 blorp_DirectoryEntryResult blorp_dir_read_entry_raw(blorp_Directory* dir);
 blorp_DirectoryEntryListResult blorp_dir_read_next_entries_raw(blorp_Directory* dir, long max_entries);
 blorp_FileStringResult blorp_file_read_text_reader_raw(const blorp_FileReader* reader);
@@ -2202,6 +2204,12 @@ blorp_FileVoidResult blorp_file_append_text_read_appender_raw(blorp_FileReadAppe
 blorp_FileVoidResult blorp_file_append_bytes_read_appender_raw(blorp_FileReadAppender* file, const blorp_Bytes* bytes);
 blorp_FileIntResult blorp_file_append_chunk_read_appender_raw(blorp_FileReadAppender* file, const blorp_Bytes* bytes);
 blorp_FileIntResult blorp_file_size_read_appender_raw(const blorp_FileReadAppender* file);
+blorp_String* blorp_file_writer_path(const blorp_FileWriter* file);
+blorp_String* blorp_directory_path(const blorp_Directory* directory);
+blorp_FileVoidResult blorp_file_write_text_atomic_raw(const blorp_String* path, const blorp_String* text);
+blorp_FileVoidResult blorp_file_create_directories_raw(const blorp_String* path);
+blorp_FileVoidResult blorp_file_rename_path_raw(const blorp_String* source, const blorp_String* destination);
+blorp_FileVoidResult blorp_file_remove_directory_tree_raw(const blorp_String* path);
 void blorp_file_close_reader(blorp_FileReader* reader);
 void blorp_file_close_writer(blorp_FileWriter* writer);
 void blorp_file_close_appender(blorp_FileAppender* appender);
@@ -2244,6 +2252,9 @@ void* blorp_mkstemp_path(const blorp_String* prefix);
 void* blorp_exec_output(const blorp_String* cmd);
 void* blorp_process_run(const blorp_String* program, const blorp_List* args);
 void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args);
+void* blorp_process_run_command_raw(const blorp_String* program, const blorp_List* args, const blorp_Tuple* options);
+blorp_String* blorp_compiler_runtime_source(void);
+blorp_String* blorp_compiler_runtime_decl(void);
 void* blorp_process_shell(const blorp_String* command);
 
 // Hashing / Crypto

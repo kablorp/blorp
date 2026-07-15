@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-13.
+Status checked against code on 2026-07-14.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -30,51 +30,49 @@ This document expands Checkpoint 11 of
 `BLORP_COMPILER_PORT_ROADMAP.md`. That roadmap remains authoritative for which
 semantic stages are OCaml- or Blorp-owned.
 
-Execute the checkpoints in document order. Checkpoint C cuts over `check`,
-which needs no backend effects, and builds the compile/run path through an
+The checkpoints were executed in document order. Checkpoint C cut over
+`check`, which needs no backend effects, and built the compile/run path through an
 in-memory `BuildArtifact` under focused tests using typed worker requests and
 decoded response fixtures. Raw Core-to-C emission still uses the smaller
 `CArtifact` compatibility shape until the legacy bridge is removed. The real
 worker process client lands with the structured process API in Checkpoint F.
-Compile/run become authoritative only in Checkpoint J, after the artifact,
+Compile/run became authoritative in Checkpoint J, after the artifact,
 filesystem, process, host-C, runtime, and observability checkpoints are
 complete.
 
 ## Current Boundary
 
-The public `blorp` executable is Blorp. Ordinary `check` now stays inside
-`compiler_cli_main.brp`: it discovers and parses the source graph, typechecks
-and runs CTFE from the in-memory graph, and returns diagnostics without
-creating a plan file or invoking OCaml. `CliOcamlHostPlan` has no check
-variant, so this boundary cannot regress through an accidental match arm.
+The public `blorp` executable is Blorp. Ordinary `check`, `compile`, and `run`
+now stay inside `compiler_cli_main.brp` for command execution and host effects.
+All three discover, parse, typecheck, and run CTFE from the in-memory Blorp
+graph. Compile and run invoke exactly one sibling `blorp-ocaml-middle` process
+with the typed semantic request, then Blorp runs the complete late Core
+pipeline, emits C, writes artifacts, invokes the host C compiler, manages the
+runtime cache, and runs the resulting program.
 
-Compile and run still serialize their typed phase-specific plans and execute
-`blorp-ocaml-host __compiler-run-cli-plan <path>`. The OCaml host therefore
-still owns production compile/run effects through these functions in
-`compiler/bin/blorp_ocaml_host.ml`:
+`CliOcamlHostPlan` has no source-command variant. Run-plan JSON is rejected at
+the serializer, the OCaml bridge decoder represents compile graphs only, and
+the obsolete OCaml run/C-compiler effect path has been deleted. The remaining
+general host delegation is for commands not yet migrated (`test`, `purify`,
+`package`, `repl`, and `lsp`).
 
-- `run_compile_from_frontier_options`
-- `run_file_from_frontier_options`
-- `compile_file_with_opts`
-- `write_compile_output`
-- `run_file`
-
-`check_file_with_opts` remains only as an internal no-emission path used by
-the still-OCaml compile implementation; it is no longer reachable from the
-public `check` command.
-
-The production compatibility path still returns a raw Blorp-owned `CArtifact`
-that OCaml decodes before performing its effects. The in-process Blorp path
-now immediately combines that raw emission with pre-DCE Core and typed CLI
-facts to produce a complete `BuildArtifact`; downstream policy does not read
-OCaml module caches or compiler-global module state. `run_file` still assembles
-the production host C arguments, uses `Test_runner.precompile_runtime`, calls
-`Test_runner.compile_c_from_stdin`, and uses
-`Test_runner.run_process_timeout` to execute the binary until Checkpoint J.
+One explicitly named compatibility path remains for bootstrapping:
+`blorp-ocaml-host __compiler-host-compile-wrapper` consumes a serialized
+compile graph in order to build the public Blorp executable with the pinned
+`dev-9f56c40d2b91` compiler. It is not reachable from an installed public
+source command. Consequently `compile_file_with_opts`,
+`run_compile_from_frontier_options`, and `write_compile_output` remain only for
+that bootstrap wrapper until Checkpoint K ratchets the bootstrap.
 
 The desired change is not to move the existing CLI-plan protocol into another
 file. The CLI plan must become an internal Blorp value. Only the semantic input
 needed by the temporary OCaml middle crosses a process boundary.
+
+The frontend graph also owns source-definition identity. Target, imported
+modules, and CTFE dependencies are typechecked from one graph-wide DefId plan;
+the OCaml middle preserves those IDs and reserves all generated Core IDs above
+the highest source function or constructor ID. Mixing Blorp-resolved calls with
+OCaml-reminted declarations, or restarting generated IDs at zero, is invalid.
 
 ## Non-Negotiable Invariants
 
@@ -102,6 +100,10 @@ needed by the temporary OCaml middle crosses a process boundary.
    published replacement artifacts. Rotate the pin in a later, isolated
    commit. The workflow/script pin discrepancy must be resolved through one
    authoritative manifest before that rotation.
+9. **One identity domain per compile graph.** Source functions, impl methods,
+   and constructors receive deterministic graph-wide DefIds in Blorp. Every
+   typed module installed in the OCaml middle comes from that graph response,
+   and generated Core declarations allocate strictly above its high-water mark.
 
 ## Checkpoint A: Freeze A Green Baseline
 
@@ -245,9 +247,8 @@ Exit condition:
 Goal: cut ordinary `check` over to Blorp and build a typed, testable compile/run
 path from an internal CLI plan through an in-memory `BuildArtifact`.
 
-Status: complete on this branch. Ordinary `check` is production-authoritative
-in Blorp. Compile/run remain production-authoritative in OCaml until
-Checkpoint J, but their typed Blorp path is covered through C emission.
+Status: complete on this branch. Check, compile, and run all keep their CLI
+plans inside Blorp. Compile/run cross only the typed semantic-middle boundary.
 
 Primary files:
 
@@ -303,11 +304,14 @@ Deletion after the check cutover:
 - `run_check_from_frontier_options`
 - the check-specific OCaml decoder and implementation-only tests
 
-Deletion deferred to Checkpoint J:
+Deletion completed during Checkpoint J:
 
-- `run_compile_from_frontier_options`
-- `run_file_from_frontier_options`
-- compile/run plan decoders and their OCaml-only tests
+- source run-plan host serialization and decoding;
+- `run_file_from_frontier_options` and `run_file`; and
+- the OCaml run frontend/options/frontier types and their implementation-only
+  tests.
+
+Compile graph decoding remains only for the pinned bootstrap wrapper.
 
 Implemented evidence on 2026-07-13:
 
@@ -434,6 +438,16 @@ Focused evidence on 2026-07-13:
 Goal: perform compiler artifact I/O with `std/fs.brp`, not ad hoc `system`
 helpers.
 
+Status: complete on this branch. The implementation uses the existing `FileWriter` and
+`Directory` resource types for temporary resources. Their opaque runtime
+handles carry whether cleanup removes the path, and `resource_path()` exposes
+the associated path. This is deliberate bootstrap compatibility: the pinned
+`dev-9f56c40d2b91` compiler has a closed resource-layout registry and cannot
+compile a standard library that introduces another `resource type`. Ordinary
+writers/directories never remove their paths; only handles created by the
+temporary factories do. This keeps cleanup scoped without weakening the pinned
+bootstrap contract or adding a compatibility compiler path.
+
 Required standard-library work:
 
 - add atomic replacement built on same-directory temporary creation, flush,
@@ -446,7 +460,7 @@ Proposed APIs:
 
 ```text
 write_text_atomic(path, text) -> Result[Void, IOError]
-with temporary_directory(prefix) ?= ...
+with temporary_directory(parent, prefix) ?= ...
 with temporary_file(parent, prefix) ?= ...
 ```
 
@@ -473,12 +487,27 @@ Tests:
 Exit condition:
 
 - the Blorp artifact writer passes focused parity and failure tests;
-  `write_compile_output` is deleted at the production cutover in Checkpoint J.
+  the production path no longer reaches `write_compile_output`. That helper
+  remains only for the pinned bootstrap wrapper until Checkpoint K.
+
+Implemented evidence on 2026-07-14:
+
+- `write_text_atomic`, scoped temporary files/directories, recursive directory
+  creation, atomic rename, and symlink-safe recursive removal are exposed by
+  `std/fs.brp` with path-rich `IOError` results;
+- operation-result metadata and both OCaml and Blorp ownership-contract suites
+  cover every new runtime primitive without duplicate registrations;
+- filesystem runtime tests pass 7 tests normally and under strict leak check;
+- compiler artifact-writer tests pass 4 focused cases, including replacement
+  and failure behavior.
 
 ## Checkpoint F: Add A Structured Process API
 
 Goal: let Blorp invoke `cc` and programs without shell parsing or global
 environment mutation.
+
+Status: complete on this branch. The old convenience wrappers remain for
+unmigrated callers, but all new compiler effects use `ProcessCommand`.
 
 The current `std/process.brp` `run` and `run_inherit` APIs are insufficient:
 they do not model stdin bytes, cwd, child-only environment changes, timeout,
@@ -540,9 +569,25 @@ Exit condition:
 - compiler execution uses no shell command strings and mutates no global
   environment for a child process.
 
+Implemented evidence on 2026-07-14:
+
+- `ProcessCommand` models exact argv, stdin bytes, each output stream, cwd,
+  child-only environment changes, process groups, timeout, and a per-command
+  capture limit;
+- the runtime writes stdin while draining stdout/stderr, terminates timed-out
+  process groups, waits for children, and distinguishes exits, signals, and
+  timeouts;
+- process tests pass 11 cases normally and under strict leak check; and
+- the semantic worker client passes 8 focused protocol/process cases,
+  including malformed output and response-size enforcement.
+
 ## Checkpoint G: Port Host C Invocation And Runtime Packaging
 
 Goal: reproduce `Test_runner` compilation behavior in maintainable Blorp code.
+
+Status: implementation complete on this branch. Exact host-C policy, typed
+host/toolchain discovery, the verified runtime CAS, and production compile/run
+assembly are Blorp-owned. Full platform-gate validation remains.
 
 New Blorp files:
 
@@ -601,13 +646,28 @@ Tests:
 Exit condition:
 
 - the Blorp host-C and runtime-cache implementations pass focused parity tests.
-  The OCaml implementations are deleted when production switches in
-  Checkpoint J.
+  The OCaml source-run implementation is deleted; shared test/bootstrap
+  machinery remains only where another current command still reaches it.
+
+Implemented evidence on 2026-07-14:
+
+- host-C tests pass 6 cases, including exact embedded/external argv, sanitizer
+  policy, TLS/runtime mismatches, real stdin compilation, and diagnostics;
+- runtime-cache tests pass 3 cases covering semantic key inputs, verified
+  reuse, object/READY corruption repair, and concurrent publisher convergence;
+- host platform tests pass 6 cases for OS normalization, compiler/target
+  probing, compiler-family detection, cache roots, TLS validation, and quoted
+  argument boundaries;
+- host environment tests pass 2 cases proving overrides remain structured and
+  unsupported TLS does not invoke `pkg-config`.
 
 ## Checkpoint H: Port Program Execution Semantics
 
-Goal: implement and test the complete Blorp-owned `run` effect path, ready for
-the production switch in Checkpoint J.
+Goal: implement and test the complete Blorp-owned `run` effect path for the
+production switch in Checkpoint J.
+
+Status: implementation complete on this branch. The artifact-to-program effect
+path, CLI option/environment assembly, and production routing are Blorp-owned.
 
 Implementation:
 
@@ -636,11 +696,30 @@ Tests:
 Exit condition:
 
 - given a `BuildArtifact`, the Blorp executor compiles and runs it with no OCaml
-  effect helper; the public command switches to this executor in Checkpoint J.
+  effect helper; the public command uses this executor.
+
+Implemented evidence on 2026-07-14:
+
+- program-runner tests pass 4 cases normally and under strict leak check;
+- exact empty/spaced/quoted argv and child-only thread/leak environment values
+  reach a real compiled C program;
+- inherited stdio, timeout classification, conventional status translation,
+  and temporary executable cleanup are covered.
+
+Remaining validation gaps:
+
+- complete the signal/descendant and macOS/Linux architecture matrix; and
+- keep the CLI parity tests for timeout, sanitizer, leak, thread, observation,
+  dump-file, and timing policy green during deletion.
 
 ## Checkpoint I: Preserve Observability And Diagnostics
 
 Goal: avoid making the cutover correct but operationally opaque.
+
+Status: implemented on this branch; full gate validation remains. Parse/typed
+output stays on Blorp frontend data, semantic and late observations cross their
+typed boundaries once, and requested late snapshots do not replace mandatory
+final pipeline completion.
 
 Implementation:
 
@@ -664,6 +743,13 @@ Tests:
 
 Goal: remove the general OCaml host from source compilation.
 
+Status: source-command cutover is implemented on this branch. Check makes zero
+OCaml calls; compile/run make one semantic-middle call; all post-worker effects
+are Blorp-owned; source run is unrepresentable in `CliOcamlHostPlan`; and the
+OCaml run effect implementation is deleted. The general host remains for
+unmigrated non-source commands, while the old compile implementation remains
+only behind the explicitly named pinned-bootstrap wrapper.
+
 Implementation order:
 
 1. Verify the Checkpoint C `check` path remains direct and makes zero worker
@@ -684,18 +770,21 @@ Implementation order:
    delete newly orphaned decoders, option conversion, module orchestration,
    artifact, process, and cache helpers.
 
-Expected immediate deletions:
+Completed deletions:
+
+- `run_file`
+- `run_file_from_frontier_options`
+- source run-plan variants and run frontend/options records in the Blorp/OCaml
+  bridge; and
+- OCaml host C invocation, runtime-cache selection, and child execution used
+  only by source run.
+
+Deferred solely for the pinned bootstrap wrapper:
 
 - `write_compile_output`
 - `compile_file_with_opts`
-- `run_file`
-- `run_check_from_frontier_options`
 - `run_compile_from_frontier_options`
-- `run_file_from_frontier_options`
-- source-plan decode branches and their CLI-shaped record types in
-  `compiler_blorp_bridge.ml`
-- production-only `Test_runner` C invocation/runtime cache helpers once Blorp
-  tests cover them
+- compile graph decoding and its behavior-focused bootstrap tests
 
 Do not delete yet:
 

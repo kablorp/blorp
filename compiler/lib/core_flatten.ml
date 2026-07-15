@@ -145,38 +145,72 @@ let add_imported_signature_type_rewrites rewrites targets decl =
       | None -> ())
     (signature_type_names decl)
 
-(** Rewrite selectively imported type names in the main program to the same
-    flattened owner names used by module declarations. Qualified-only imports
-    are intentionally not included here: [Types.resolve_qualified_types] has
-    already preserved those as canonical module-owned names. *)
-let rewrite_main_imported_type_names (program : Ast.program)
-    (prog : Core.core_program) : Core.core_program =
-  let imported_types = create_imported_type_rewrites () in
+(** Build the type identities exposed by one explicitly supplied typed module.
+    The semantic worker deliberately has no [Modules] cache, so production
+    lowering must derive this information from its request rather than ambient
+    process state. *)
+let exported_type_targets_for_program module_name (program : Ast.program) =
+  List.filter_map
+    (fun decl ->
+      Option.map
+        (fun type_name ->
+          (type_name, flattened_type_name_for_module module_name type_name))
+        (exported_type_name decl))
+    program
+
+let rec decl_source_name (decl : Ast.decl) =
+  match decl.decl_desc with
+  | Ast.DFunc f -> f.func_name
+  | Ast.DVar v -> v.var_name
+  | Ast.DRecord r -> Some r.record_name
+  | Ast.DType t -> Some t.type_name
+  | Ast.DTypeAlias a -> Some a.alias_name
+  | Ast.DTrait t -> Some t.trait_name
+  | Ast.DPrivate inner -> decl_source_name inner
+  | Ast.DImport _ | Ast.DImpl _ -> None
+
+let find_decl_named name program =
+  List.find_opt
+    (fun decl -> Option.equal String.equal (decl_source_name decl) (Some name))
+    program
+
+let add_imported_type_rewrites_from_bindings rewrites
+    ~(module_programs : (string * Ast.program) list)
+    (bindings : Session.import_binding list) =
   List.iter
-    (fun (d : Ast.decl) ->
-      match d.decl_desc with
-      | Ast.DImport imp -> (
-          match (Modules.find_cached imp.import_module, imp.import_symbols) with
-          | Some loaded, Some symbols ->
-              let targets = exported_type_targets loaded in
-              List.iter
-                (fun (sym : Ast.import_symbol) ->
-                  match List.assoc_opt sym.sym_name targets with
-                  | Some target ->
-                      let local =
-                        Option.value sym.sym_alias ~default:sym.sym_name
-                      in
-                      add_imported_type_rewrite imported_types local target
-                  | None -> (
-                      match List.assoc_opt sym.sym_name loaded.exports with
-                      | Some exported_decl ->
-                          add_imported_signature_type_rewrites imported_types
-                            targets exported_decl
-                      | None -> ()))
-                symbols
-          | _ -> ())
-      | _ -> ())
-    program;
+    (fun (binding : Session.import_binding) ->
+      match
+        ( binding.original_name,
+          List.assoc_opt binding.module_path module_programs )
+      with
+      | Some original_name, Some module_program ->
+          let targets =
+            exported_type_targets_for_program binding.module_path module_program
+          in
+          (match List.assoc_opt original_name targets with
+          | Some target ->
+              add_imported_type_rewrite rewrites binding.local_name target
+          | None ->
+              Option.iter
+                (add_imported_signature_type_rewrites rewrites targets)
+                (find_decl_named original_name module_program))
+      | None, _ | _, None -> ())
+    bindings
+
+(** Rewrite selectively imported type names in the main program to the same
+    flattened owner names used by module declarations. Bindings for imported
+    values also expose the module-owned types in their signatures; inferred
+    call-result types otherwise retain a bare name after typed-AST decoding.
+
+    Qualified-only bindings are intentionally ignored here: frontend type
+    resolution has already preserved those as canonical module-owned names. *)
+let rewrite_main_imported_type_names_from_bindings
+    ~(main_import_bindings : Session.import_binding list)
+    ~(module_programs : (string * Ast.program) list) (prog : Core.core_program) :
+    Core.core_program =
+  let imported_types = create_imported_type_rewrites () in
+  add_imported_type_rewrites_from_bindings imported_types ~module_programs
+    main_import_bindings;
   let rewrite_type ty =
     Types.map_type_expr
       (function
@@ -199,12 +233,14 @@ let rewrite_main_imported_type_names (program : Ast.program)
     Std primitive/prelude ABI type names stay stable; all other std-local type
     declarations are flattened like user module types to avoid same-name layout
     collisions. *)
-let prefix_module_names (mod_name : string) (decls : Core.core_program) :
-    Core.core_program =
+let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
+    (mod_name : string) (decls : Core.core_program) : Core.core_program =
   let prefix = sanitize_module_name mod_name in
   let defined = Hashtbl.create 32 in
   let local_type_names = Hashtbl.create 16 in
   let imported_types = create_imported_type_rewrites () in
+  add_imported_type_rewrites_from_bindings imported_types ~module_programs
+    import_bindings;
   let should_skip name =
     match Codegen_names.parse_ufcs_name name with
     | Some _ -> true

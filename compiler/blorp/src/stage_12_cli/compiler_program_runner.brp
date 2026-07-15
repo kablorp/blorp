@@ -1,0 +1,137 @@
+-- Scoped host compilation and execution of a complete BuildArtifact.
+--
+-- The caller supplies all host policy explicitly. This module owns only the
+-- temporary executable, exact child argv/environment, and exit translation.
+import:
+	../stage_10_backend/compiler_build_artifact: BuildArtifact
+	compiler_host_c:
+		HostCCompileError,
+		HostCConfiguration,
+		HostCPreparationError,
+		HostRuntimeInput,
+		host_c_compile_error_message,
+		host_c_preparation_error_message,
+		prepare_host_c_compilation,
+		run_host_c_compilation,
+	fs: IOError, resource_path, temporary_directory
+	process as Process
+	units: Duration
+
+
+record ProgramRunRequest {
+	artifact: BuildArtifact,
+	host: HostCConfiguration,
+	runtime: HostRuntimeInput,
+	temporary_root: String,
+	user_arguments: List[String],
+	timeout: Option[Duration],
+	threads: Option[Int]
+}
+
+
+record ProgramRunResult {
+	exit: Process.ProcessExit,
+	executable_path: String
+}
+
+
+union ProgramRunError:
+	ProgramTemporaryDirectoryFailed(IOError)
+	ProgramHostPreparationFailed(HostCPreparationError)
+	ProgramHostCompilationFailed(HostCCompileError)
+	ProgramProcessFailed(Process.ProcessError)
+
+
+pure func program_run_error_message(error: ProgramRunError) -> String:
+	match error:
+		ProgramTemporaryDirectoryFailed(io_error):
+			"cannot create run directory: ${io_error.to_string()}"
+		ProgramHostPreparationFailed(preparation_error):
+			host_c_preparation_error_message(preparation_error)
+		ProgramHostCompilationFailed(compile_error):
+			host_c_compile_error_message(compile_error)
+		ProgramProcessFailed(process_error):
+			"cannot run compiled program: ${process_error.to_string()}"
+
+
+private pure func program_environment(
+	threads: Option[Int],
+	leak_check: Bool,
+) -> List[Process.ProcessEnvironmentChange]:
+	thread_environment: List[Process.ProcessEnvironmentChange] = match threads:
+		Some(count):
+			[{
+				name = "BLORP_THREADS",
+				value = Some(count.to_string())
+			}]
+		None:
+			[]
+	leak_environment: List[Process.ProcessEnvironmentChange] = if leak_check:
+		[{
+			name = "BLORP_LEAK_CHECK",
+			value = Some("strict")
+		}]
+	else:
+		[]
+
+	thread_environment.concat(leak_environment)
+
+
+pure func prepare_program_command(
+	executable_path: String,
+	arguments: List[String],
+	timeout: Option[Duration],
+	threads: Option[Int],
+	leak_check: Bool,
+) -> Process.ProcessCommand:
+	{ Process.command(executable_path, arguments) |
+		environment = program_environment(threads, leak_check),
+		stdin = Process.InheritStdin,
+		stdout = Process.InheritStream,
+		stderr = Process.InheritStream,
+		timeout = timeout
+	}
+
+
+pure func program_exit_status(exit: Process.ProcessExit) -> Int:
+	match exit:
+		Process.Exited(code):
+			code
+		Process.Signaled(signal):
+			128 + signal
+		Process.TimedOut:
+			124
+
+
+func run_build_artifact(
+	request: ProgramRunRequest,
+) -> Result[ProgramRunResult, ProgramRunError]:
+	with compilation_directory ?= temporary_directory(
+		request.temporary_root,
+		"blorp_run_",
+	) on error => ProgramTemporaryDirectoryFailed(error):
+		executable_path: String = compilation_directory.resource_path() + "/program.bin"
+		prepared ?= prepare_host_c_compilation(
+			request.artifact,
+			executable_path,
+			request.host,
+			request.runtime,
+		).map_err(func(error: HostCPreparationError): ProgramHostPreparationFailed(error))
+		compiled ?= run_host_c_compilation(prepared)
+			.map_err(func(error: HostCCompileError): ProgramHostCompilationFailed(error))
+		program = prepare_program_command(
+			executable_path,
+			request.user_arguments,
+			request.timeout,
+			request.threads,
+			request.artifact.compatibility.leak_check,
+		)
+
+		match Process.run_command(program):
+			Ok(result):
+				Ok({
+					exit = result.exit,
+					executable_path = executable_path
+				})
+			Err(error):
+				Err(ProgramProcessFailed(error))

@@ -2296,6 +2296,56 @@ let test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites () =
        "std_list__concurrent_with_timeout__mono_Int_Int"
        names)
 
+let test_mono_bare_concrete_call_ignores_colliding_generic_id () =
+  let list_t = TyNamed ("List", [ TyVar "T" ]) in
+  let list_string = TyNamed ("List", [ ty_string ]) in
+  let raw_environment = TyNamed ("RawProcessEnvironment", []) in
+  let generic_sum =
+    mk_func ~def_id:503 ~type_params:[ "T" ]
+      ~module_path:(Some "std/list") "std_list__sum"
+      [ ("self", list_t) ] (TyVar "T") (cvar "total" (TyVar "T"))
+  in
+  let concrete_environment =
+    mk_func ~def_id:503 ~module_path:(Some "std/process")
+      "raw_process_environment" [ ("changes", list_string) ] raw_environment
+      (cvar "environment" raw_environment)
+  in
+  let call_ty =
+    TyFunc
+      {
+        params = [ list_string ];
+        return = raw_environment;
+        is_pure = true;
+      }
+  in
+  let caller_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 503,
+           cvar "raw_process_environment" call_ty,
+           [ cvar "changes" list_string ] ))
+      raw_environment
+  in
+  let caller =
+    mk_func "caller" [ ("changes", list_string) ] raw_environment caller_body
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl generic_sum; mk_decl concrete_environment; mk_decl caller ]
+  in
+  let caller_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "caller" | _ -> false)
+      result
+  in
+  match caller_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar callee; _ }, _); _ }; _ }
+    ->
+      Alcotest.(check string)
+        "keeps the concrete callee" "raw_process_environment" callee.vname
+  | _ -> Alcotest.fail "expected unchanged concrete call"
+
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -2416,5 +2466,8 @@ let suite =
           test_mono_ufcs_hof_builtin_generic_rewrites;
         Alcotest.test_case "UFCS user wrapper with nested generic result rewrites"
           `Quick test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites;
+        Alcotest.test_case
+          "bare concrete call ignores colliding generic id" `Quick
+          test_mono_bare_concrete_call_ignores_colliding_generic_id;
       ] );
   ]

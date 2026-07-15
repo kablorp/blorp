@@ -16,8 +16,8 @@ mkdir -p \
 cp scripts/test "$TMP_HARNESS/scripts/test"
 
 cat > "$TMP_HARNESS/Makefile" <<'MAKE'
-all install:
-	@:
+all install build:
+	@printf '%s\n' "$@" >> make-target-log.txt
 MAKE
 
 cat > "$TMP_HARNESS/std/prelude.brp" <<'BRP'
@@ -103,6 +103,14 @@ if grep -Eq 'Runtime[[:space:]]+PASS' "$output_file"; then
 fi
 
 echo "PASS: scripts/test reports nonzero gate commands as failed"
+
+if [ "$(cat "$TMP_HARNESS/make-target-log.txt")" != "install" ]; then
+	echo "FAIL: a runtime gate should install the public CLI"
+	cat "$TMP_HARNESS/make-target-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test installs the public CLI for Blorp gates"
 
 if ! grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-memory runtime categories"
@@ -367,6 +375,7 @@ SH
 chmod +x "$TMP_HARNESS/bin/dune"
 
 unit_output_file="$TMP_HARNESS/unit-output.txt"
+: > "$TMP_HARNESS/make-target-log.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
@@ -388,3 +397,11 @@ if ! grep -Eq 'Compiler-unit[[:space:]]+FAIL' "$unit_output_file"; then
 fi
 
 echo "PASS: scripts/test exits nonzero when gate summary parsing fails"
+
+if [ "$(cat "$TMP_HARNESS/make-target-log.txt")" != "build" ]; then
+	echo "FAIL: compiler-unit should build only the OCaml compiler"
+	cat "$TMP_HARNESS/make-target-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test builds only the OCaml compiler for compiler-unit"

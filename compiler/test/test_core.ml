@@ -994,10 +994,13 @@ let test_pp_program_empty () =
 
 let test_pp_program_one_func () =
   let body = cadd (cint 1) (cint 2) in
-  let f = mk_func ~name:"main" ~body in
+  let f = { (mk_func ~name:"main" ~body) with cf_def_id = 37 } in
   let prog = [ mk_decl (CDFunc f) ] in
   let out = pp_program_indented prog in
   Alcotest.(check bool) "mentions main" true (Blorp.Modules.contains out "main");
+  Alcotest.(check bool)
+    "shows callable identity" true
+    (Blorp.Modules.contains out "[def=37]");
   Alcotest.(check bool)
     "mentions body" true
     (Blorp.Modules.contains out "(1 + 2)");

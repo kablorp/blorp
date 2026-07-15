@@ -1355,13 +1355,21 @@ let lookup_generic_by_def_id (state : mono_state) (def_id : int option) :
           (Hashtbl.find_opt state.generic_bodies_by_id id)
 
 (** Callable IDs are local to a frontend typecheck artifact. Once module
-    artifacts are merged, unrelated declarations may carry the same ID. An
-    explicit UFCS callee already provides the authoritative module/name
-    identity, so never let a colliding ID override it. *)
+    artifacts are merged, unrelated declarations may carry the same ID. The
+    callee name remains authoritative: a selected generic must match either
+    its source name, canonical flattened name, or explicit UFCS identity. *)
 let selected_generic_hit_matches_callee (callee_name : string)
     (hit : generic_hit) : bool =
   match Codegen_names.parse_ufcs_name callee_name with
-  | None -> true
+  | None ->
+      String.equal hit.gh_source_name callee_name
+      || String.equal hit.gh_name callee_name
+      || (match hit.gh_module_path with
+         | Some module_path ->
+             String.equal
+               (module_qualified_name module_path hit.gh_source_name)
+               callee_name
+         | None -> false)
   | Some (module_path, source_name) ->
       let qualified_name = module_qualified_name module_path source_name in
       (hit.gh_module_path = Some module_path || hit.gh_name = qualified_name)

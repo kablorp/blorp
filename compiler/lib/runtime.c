@@ -7114,6 +7114,8 @@ typedef struct blorp_Bytes blorp_Bytes;
 
 typedef struct blorp_FileWriter {
     int fd;
+    char* path;
+    bool remove_on_close;
 } blorp_FileWriter;
 
 typedef struct blorp_FileAppender {
@@ -7131,6 +7133,7 @@ typedef struct blorp_FileReadAppender {
 typedef struct blorp_Directory {
     DIR* dir;
     char* path;
+    bool remove_on_close;
 } blorp_Directory;
 
 typedef struct blorp_DirectoryEntry {
@@ -34446,6 +34449,145 @@ static blorp_FileIntResult blorp_file_write_chunk_fd(
     }
 }
 
+static char* blorp_temporary_template_from_c(
+    const char* parent,
+    const char* prefix
+) {
+    size_t parent_len = strlen(parent);
+    size_t prefix_len = strlen(prefix);
+    bool needs_separator = parent_len == 0 || parent[parent_len - 1] != '/';
+    size_t len = blorp_checked_add(parent_len, needs_separator ? 1 : 0);
+    len = blorp_checked_add(len, prefix_len);
+    len = blorp_checked_add(len, 6);
+
+    char* result = (char*)blorp_malloc_checked(blorp_checked_add(len, 1));
+    size_t offset = 0;
+    memcpy(result + offset, parent, parent_len);
+    offset += parent_len;
+    if (needs_separator) result[offset++] = '/';
+    memcpy(result + offset, prefix, prefix_len);
+    offset += prefix_len;
+    memcpy(result + offset, "XXXXXX", 6);
+    result[len] = '\0';
+    return result;
+}
+
+static char* blorp_temporary_template(
+    const blorp_String* parent,
+    const blorp_String* prefix,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    char* parent_path =
+        blorp_file_copy_path_for_open(parent, error_kind, error_detail);
+    if (!parent_path) return NULL;
+
+    if (!prefix || prefix->len <= 0) {
+        free(parent_path);
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal(
+            "temporary path prefix must be non-empty");
+        return NULL;
+    }
+    if (
+        memchr(prefix->data, '\0', (size_t)prefix->len) != NULL ||
+        memchr(prefix->data, '/', (size_t)prefix->len) != NULL
+    ) {
+        free(parent_path);
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal(
+            "temporary path prefix must be a filename prefix");
+        return NULL;
+    }
+
+    char* prefix_text = blorp_cstring_copy_if_valid(prefix);
+    if (!prefix_text) {
+        free(parent_path);
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("invalid temporary path prefix");
+        return NULL;
+    }
+
+    char* result = blorp_temporary_template_from_c(parent_path, prefix_text);
+    free(prefix_text);
+    free(parent_path);
+    return result;
+}
+
+blorp_FileOpenWriterResult blorp_temporary_file_open_raw(
+    const blorp_String* parent,
+    const blorp_String* prefix
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* path =
+        blorp_temporary_template(parent, prefix, &error_kind, &error_detail);
+    if (!path) return blorp_file_open_writer_error(error_kind, error_detail);
+
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        int errnum = errno;
+        free(path);
+        error_kind = blorp_file_error_kind_from_errno(errnum);
+        error_detail = blorp_file_open_errno_detail(parent, error_kind, errnum);
+        return blorp_file_open_writer_error(error_kind, error_detail);
+    }
+    blorp_runtime_set_cloexec(fd);
+
+    blorp_FileWriter* file =
+        (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
+    file->fd = fd;
+    file->path = path;
+    file->remove_on_close = true;
+    return (blorp_FileOpenWriterResult){
+        .handle = file,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_DirectoryOpenResult blorp_temporary_directory_open_raw(
+    const blorp_String* parent,
+    const blorp_String* prefix
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* path =
+        blorp_temporary_template(parent, prefix, &error_kind, &error_detail);
+    if (!path) {
+        return blorp_dir_open_error(error_kind, error_detail);
+    }
+
+    if (!mkdtemp(path)) {
+        int errnum = errno;
+        free(path);
+        error_kind = blorp_file_error_kind_from_errno(errnum);
+        error_detail = blorp_file_open_errno_detail(parent, error_kind, errnum);
+        return blorp_dir_open_error(error_kind, error_detail);
+    }
+
+    DIR* raw_dir = opendir(path);
+    if (!raw_dir) {
+        int errnum = errno;
+        rmdir(path);
+        free(path);
+        error_kind = blorp_file_error_kind_from_errno(errnum);
+        error_detail = blorp_file_open_errno_detail(parent, error_kind, errnum);
+        return blorp_dir_open_error(error_kind, error_detail);
+    }
+
+    blorp_Directory* directory =
+        (blorp_Directory*)blorp_malloc_checked(sizeof(blorp_Directory));
+    directory->dir = raw_dir;
+    directory->path = path;
+    directory->remove_on_close = true;
+    return (blorp_DirectoryOpenResult){
+        .handle = directory,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
 blorp_FileOpenReaderResult blorp_file_open_read_raw(const blorp_String* path) {
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
@@ -34474,6 +34616,8 @@ blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path) {
     blorp_FileWriter* writer =
         (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
     writer->fd = fd;
+    writer->path = blorp_cstring_copy_if_valid(path);
+    writer->remove_on_close = false;
     return (blorp_FileOpenWriterResult){
         .handle = writer,
         .error_kind = BLORP_FILE_ERROR_NONE,
@@ -34561,6 +34705,7 @@ blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path) {
         (blorp_Directory*)blorp_malloc_checked(sizeof(blorp_Directory));
     dir->dir = raw_dir;
     dir->path = cpath;
+    dir->remove_on_close = false;
     return (blorp_DirectoryOpenResult){
         .handle = dir,
         .error_kind = BLORP_FILE_ERROR_NONE,
@@ -35017,10 +35162,250 @@ blorp_FileIntResult blorp_file_size_read_appender_raw(
     return blorp_file_size_fd(file ? file->fd : -1);
 }
 
+blorp_String* blorp_file_writer_path(const blorp_FileWriter* file) {
+    if (!file || !file->path) return blorp_string_create("");
+    return blorp_string_from_buf_size(file->path, strlen(file->path));
+}
+
+blorp_String* blorp_directory_path(const blorp_Directory* directory) {
+    if (!directory || !directory->path) return blorp_string_create("");
+    return blorp_string_from_buf_size(directory->path, strlen(directory->path));
+}
+
+static blorp_FileVoidResult blorp_file_errno_void_result(
+    const blorp_String* path,
+    const char* operation,
+    int errnum
+) {
+    blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+    blorp_String* detail = NULL;
+    switch (kind) {
+        case BLORP_FILE_ERROR_NOT_FOUND:
+        case BLORP_FILE_ERROR_PERMISSION_DENIED:
+        case BLORP_FILE_ERROR_ALREADY_EXISTS:
+            detail = (blorp_String*)blorp_retain((void*)path);
+            break;
+        default:
+            detail = blorp_file_operation_errno_detail(operation, errnum);
+            break;
+    }
+    return blorp_file_void_error(kind, detail);
+}
+
+blorp_FileVoidResult blorp_file_write_text_atomic_raw(
+    const blorp_String* path,
+    const blorp_String* text
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* destination =
+        blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
+    if (!destination) return blorp_file_void_error(error_kind, error_detail);
+    if (!text) {
+        free(destination);
+        return blorp_file_void_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_text_atomic: null text"));
+    }
+
+    char* slash = strrchr(destination, '/');
+    const char* basename = slash ? slash + 1 : destination;
+    if (basename[0] == '\0') {
+        free(destination);
+        return blorp_file_void_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_text_atomic: destination must name a file"));
+    }
+
+    char* parent = NULL;
+    if (!slash) {
+        parent = strdup(".");
+    } else if (slash == destination) {
+        parent = strdup("/");
+    } else {
+        size_t parent_len = (size_t)(slash - destination);
+        parent = (char*)blorp_malloc_checked(blorp_checked_add(parent_len, 1));
+        memcpy(parent, destination, parent_len);
+        parent[parent_len] = '\0';
+    }
+    if (!parent) {
+        free(destination);
+        return blorp_file_void_error(
+            BLORP_FILE_ERROR_OTHER,
+            blorp_string_literal("write_text_atomic: out of memory"));
+    }
+
+    char* temporary =
+        blorp_temporary_template_from_c(parent, ".blorp-atomic-");
+    free(parent);
+    int fd = mkstemp(temporary);
+    if (fd < 0) {
+        int errnum = errno;
+        free(temporary);
+        free(destination);
+        return blorp_file_errno_void_result(path, "write_text_atomic", errnum);
+    }
+    blorp_runtime_set_cloexec(fd);
+
+    struct stat destination_stat;
+    if (stat(destination, &destination_stat) == 0) {
+        if (fchmod(fd, destination_stat.st_mode & 07777) != 0) {
+            int errnum = errno;
+            close(fd);
+            unlink(temporary);
+            free(temporary);
+            free(destination);
+            return blorp_file_errno_void_result(
+                path, "write_text_atomic chmod", errnum);
+        }
+    }
+
+    blorp_FileVoidResult write_result = blorp_file_write_text_fd(fd, text);
+    if (write_result.error_kind != BLORP_FILE_ERROR_NONE) {
+        close(fd);
+        unlink(temporary);
+        free(temporary);
+        free(destination);
+        return write_result;
+    }
+    if (fsync(fd) != 0) {
+        int errnum = errno;
+        close(fd);
+        unlink(temporary);
+        free(temporary);
+        free(destination);
+        return blorp_file_errno_void_result(path, "write_text_atomic sync", errnum);
+    }
+    if (close(fd) != 0) {
+        int errnum = errno;
+        unlink(temporary);
+        free(temporary);
+        free(destination);
+        return blorp_file_errno_void_result(path, "write_text_atomic close", errnum);
+    }
+    if (rename(temporary, destination) != 0) {
+        int errnum = errno;
+        unlink(temporary);
+        free(temporary);
+        free(destination);
+        return blorp_file_errno_void_result(path, "write_text_atomic rename", errnum);
+    }
+
+    free(temporary);
+    free(destination);
+    return blorp_file_void_ok();
+}
+
+blorp_FileVoidResult blorp_file_create_directories_raw(
+    const blorp_String* path
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* directory =
+        blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
+    if (!directory) return blorp_file_void_error(error_kind, error_detail);
+
+    size_t length = strlen(directory);
+    if (length == 0) {
+        free(directory);
+        return blorp_file_void_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("create_directories: path must be non-empty"));
+    }
+
+    for (size_t i = 1; i <= length; i++) {
+        if (i < length && directory[i] != '/') continue;
+        if (directory[i - 1] == '/') continue;
+
+        char saved = directory[i];
+        directory[i] = '\0';
+        int mkdir_status = mkdir(directory, 0755);
+        if (mkdir_status != 0) {
+            int errnum = errno;
+            if (errnum != EEXIST) {
+                directory[i] = saved;
+                free(directory);
+                return blorp_file_errno_void_result(
+                    path, "create_directories", errnum);
+            }
+            struct stat info;
+            int stat_status = stat(directory, &info);
+            if (stat_status != 0 || !S_ISDIR(info.st_mode)) {
+                int stat_errnum = stat_status == 0 ? ENOTDIR : errno;
+                directory[i] = saved;
+                free(directory);
+                return blorp_file_errno_void_result(
+                    path, "create_directories", stat_errnum);
+            }
+        }
+        directory[i] = saved;
+    }
+
+    free(directory);
+    return blorp_file_void_ok();
+}
+
+blorp_FileVoidResult blorp_file_rename_path_raw(
+    const blorp_String* source,
+    const blorp_String* destination
+) {
+    blorp_FileErrorKind source_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* source_detail = NULL;
+    char* source_path =
+        blorp_file_copy_path_for_open(source, &source_kind, &source_detail);
+    if (!source_path) return blorp_file_void_error(source_kind, source_detail);
+
+    blorp_FileErrorKind destination_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* destination_detail = NULL;
+    char* destination_path = blorp_file_copy_path_for_open(
+        destination, &destination_kind, &destination_detail);
+    if (!destination_path) {
+        free(source_path);
+        return blorp_file_void_error(destination_kind, destination_detail);
+    }
+
+    if (rename(source_path, destination_path) != 0) {
+        int errnum = errno;
+        free(source_path);
+        free(destination_path);
+        return blorp_file_errno_void_result(
+            errnum == ENOENT ? source : destination,
+            "rename_path",
+            errnum);
+    }
+
+    free(source_path);
+    free(destination_path);
+    return blorp_file_void_ok();
+}
+
 static void blorp_file_close_fd(int* fd) {
     if (!fd || *fd < 0) return;
     close(*fd);
     *fd = -1;
+}
+
+static int blorp_remove_tree_checked(const char* path);
+static void blorp_remove_temporary_tree(const char* path);
+
+blorp_FileVoidResult blorp_file_remove_directory_tree_raw(
+    const blorp_String* path
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* tree =
+        blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
+    if (!tree) return blorp_file_void_error(error_kind, error_detail);
+
+    if (blorp_remove_tree_checked(tree) != 0) {
+        int errnum = errno;
+        free(tree);
+        return blorp_file_errno_void_result(
+            path, "remove_directory_tree", errnum);
+    }
+
+    free(tree);
+    return blorp_file_void_ok();
 }
 
 void blorp_file_close_reader(blorp_FileReader* reader) {
@@ -35032,6 +35417,9 @@ void blorp_file_close_reader(blorp_FileReader* reader) {
 void blorp_file_close_writer(blorp_FileWriter* writer) {
     if (!writer) return;
     blorp_file_close_fd(&writer->fd);
+    if (writer->remove_on_close && writer->path) unlink(writer->path);
+    free(writer->path);
+    writer->path = NULL;
     free(writer);
 }
 
@@ -35059,9 +35447,69 @@ void blorp_dir_close(blorp_Directory* dir) {
         closedir(dir->dir);
         dir->dir = NULL;
     }
+    if (dir->remove_on_close && dir->path) {
+        blorp_remove_temporary_tree(dir->path);
+    }
     free(dir->path);
     dir->path = NULL;
     free(dir);
+}
+
+static int blorp_remove_tree_checked(const char* path) {
+    struct stat info;
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (lstat(path, &info) != 0) return -1;
+
+    if (!S_ISDIR(info.st_mode) || S_ISLNK(info.st_mode)) {
+        return unlink(path);
+    }
+
+    DIR* directory = opendir(path);
+    if (!directory) return -1;
+
+    int failure = 0;
+    struct dirent* entry = NULL;
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (
+            strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0
+        ) {
+            continue;
+        }
+
+        size_t path_len = strlen(path);
+        size_t name_len = strlen(entry->d_name);
+        size_t child_len = blorp_checked_add(path_len, 1);
+        child_len = blorp_checked_add(child_len, name_len);
+        char* child =
+            (char*)blorp_malloc_checked(blorp_checked_add(child_len, 1));
+        memcpy(child, path, path_len);
+        child[path_len] = '/';
+        memcpy(child + path_len + 1, entry->d_name, name_len);
+        child[child_len] = '\0';
+        if (blorp_remove_tree_checked(child) != 0) {
+            failure = errno;
+            free(child);
+            break;
+        }
+        free(child);
+        errno = 0;
+    }
+    if (failure == 0 && errno != 0) failure = errno;
+    if (closedir(directory) != 0 && failure == 0) failure = errno;
+    if (failure != 0) {
+        errno = failure;
+        return -1;
+    }
+    return rmdir(path);
+}
+
+static void blorp_remove_temporary_tree(const char* path) {
+    (void)blorp_remove_tree_checked(path);
 }
 
 // ============================================================================
@@ -35753,6 +36201,35 @@ void* blorp_exec_output(const blorp_String* cmd) {
 #include <spawn.h>
 extern char **environ;
 
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
+extern const char blorp_compiler_runtime_source_data[];
+extern const size_t blorp_compiler_runtime_source_data_len;
+extern const char blorp_compiler_runtime_decl_data[];
+extern const size_t blorp_compiler_runtime_decl_data_len;
+
+blorp_String* blorp_compiler_runtime_source(void) {
+    return blorp_string_from_buf_size(
+        blorp_compiler_runtime_source_data,
+        blorp_compiler_runtime_source_data_len
+    );
+}
+
+blorp_String* blorp_compiler_runtime_decl(void) {
+    return blorp_string_from_buf_size(
+        blorp_compiler_runtime_decl_data,
+        blorp_compiler_runtime_decl_data_len
+    );
+}
+#else
+blorp_String* blorp_compiler_runtime_source(void) {
+    return blorp_string_from_buf_size("", 0);
+}
+
+blorp_String* blorp_compiler_runtime_decl(void) {
+    return blorp_string_from_buf_size("", 0);
+}
+#endif
+
 typedef struct {
     char* data;
     size_t len;
@@ -35763,10 +36240,81 @@ typedef struct {
     bool timed_out;
     bool output_limit_exceeded;
     bool poll_failed;
+    bool io_failed;
     bool wait_failed;
     bool child_exited;
     int status;
 } blorp_ProcessRunState;
+
+typedef enum {
+    BLORP_PROCESS_STDIN_INHERIT = 0,
+    BLORP_PROCESS_STDIN_NULL = 1,
+    BLORP_PROCESS_STDIN_BYTES = 2
+} blorp_ProcessStdinMode;
+
+typedef enum {
+    BLORP_PROCESS_STREAM_INHERIT = 0,
+    BLORP_PROCESS_STREAM_CAPTURE = 1,
+    BLORP_PROCESS_STREAM_NULL = 2
+} blorp_ProcessStreamMode;
+
+typedef enum {
+    BLORP_PROCESS_GROUP_INHERIT = 0,
+    BLORP_PROCESS_GROUP_NEW = 1
+} blorp_ProcessGroupMode;
+
+typedef enum {
+    BLORP_PROCESS_EXIT_EXITED = 0,
+    BLORP_PROCESS_EXIT_SIGNALED = 1,
+    BLORP_PROCESS_EXIT_TIMED_OUT = 2
+} blorp_ProcessExitKind;
+
+typedef enum {
+    BLORP_PROCESS_ERROR_INVALID_COMMAND = 0,
+    BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND = 1,
+    BLORP_PROCESS_ERROR_SPAWN_FAILED = 2,
+    BLORP_PROCESS_ERROR_IO_FAILED = 3,
+    BLORP_PROCESS_ERROR_OUTPUT_LIMIT = 4
+} blorp_ProcessErrorKind;
+
+typedef enum {
+    BLORP_PROCESS_OPTION_CWD = 0,
+    BLORP_PROCESS_OPTION_ENVIRONMENT = 1,
+    BLORP_PROCESS_OPTION_STREAMS = 2,
+    BLORP_PROCESS_OPTION_LIFECYCLE = 3,
+    BLORP_PROCESS_OPTION_COUNT = 4
+} blorp_ProcessOptionIndex;
+
+enum {
+    BLORP_PROCESS_CWD_PATH = 0,
+    BLORP_PROCESS_CWD_PRESENT = 1,
+    BLORP_PROCESS_CWD_COUNT = 2
+};
+
+enum {
+    BLORP_PROCESS_ENVIRONMENT_SET_NAMES = 0,
+    BLORP_PROCESS_ENVIRONMENT_SET_VALUES = 1,
+    BLORP_PROCESS_ENVIRONMENT_UNSET_NAMES = 2,
+    BLORP_PROCESS_ENVIRONMENT_COUNT = 3
+};
+
+enum {
+    BLORP_PROCESS_STREAMS_STDIN_MODE = 0,
+    BLORP_PROCESS_STREAMS_STDIN_BYTES = 1,
+    BLORP_PROCESS_STREAMS_STDOUT_MODE = 2,
+    BLORP_PROCESS_STREAMS_STDERR_MODE = 3,
+    BLORP_PROCESS_STREAMS_COUNT = 4
+};
+
+enum {
+    BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT = 0,
+    BLORP_PROCESS_LIFECYCLE_TIMEOUT_MS = 1,
+    BLORP_PROCESS_LIFECYCLE_GROUP_MODE = 2,
+    BLORP_PROCESS_LIFECYCLE_CAPTURE_LIMIT = 3,
+    BLORP_PROCESS_LIFECYCLE_COUNT = 4
+};
+
+static const long BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT = -1;
 
 static void __process_buffer_init(blorp_ProcessBuffer* b) {
     b->cap = 4096;
@@ -35796,6 +36344,15 @@ static void __process_buffer_reserve(blorp_ProcessBuffer* b, size_t extra) {
 
 static blorp_String* __process_buffer_to_string(blorp_ProcessBuffer* b) {
     return blorp_string_from_buf_size(b->data, b->len);
+}
+
+static blorp_Bytes* __process_buffer_to_bytes(blorp_ProcessBuffer* b) {
+    if (b->len > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("Bytes", LONG_MAX, LONG_MAX);
+    }
+    blorp_Bytes* result = blorp_bytes_new((long)b->len);
+    if (b->len > 0) memcpy(result->data, b->data, b->len);
+    return result;
 }
 
 static long __process_env_long_or_default(
@@ -35854,8 +36411,10 @@ static bool __process_check_child(
         state->child_exited = true;
         return true;
     }
-    if (result < 0 && errno != ECHILD) state->wait_failed = true;
-    if (result < 0 && errno == ECHILD) state->child_exited = true;
+    if (result < 0) {
+        state->wait_failed = true;
+        state->child_exited = true;
+    }
     return state->child_exited;
 }
 
@@ -35904,6 +36463,7 @@ static void __drain_process_fd(
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return;
         } else {
+            state->io_failed = true;
             close(fd);
             *open_flag = false;
             return;
@@ -35942,7 +36502,10 @@ static void __drain_process_pipes(
     size_t output_limit =
         max_output_bytes < 0 ? SIZE_MAX : (size_t)max_output_bytes;
 
-    while (out_open || err_open || !state->child_exited) {
+    while (
+        out_open || err_open || !state->child_exited ||
+        (termination_sent && use_process_group && !kill_sent)
+    ) {
         uint64_t now_ns = blorp_monotonic_now_ns();
         if (!state->child_exited) {
             __process_check_child(pid, state, WNOHANG);
@@ -35974,7 +36537,7 @@ static void __drain_process_pipes(
         if (
             termination_sent &&
             !kill_sent &&
-            !state->child_exited &&
+            (use_process_group || !state->child_exited) &&
             has_kill_deadline &&
             now_ns >= kill_deadline_ns
         ) {
@@ -36050,14 +36613,386 @@ static void __drain_process_pipes(
     __process_buffer_free(&err_buf);
 }
 
+static void __run_process_command_io(
+    pid_t pid,
+    bool use_process_group,
+    int stdin_fd,
+    const blorp_Bytes* stdin_bytes,
+    int stdout_fd,
+    int stderr_fd,
+    bool has_timeout,
+    long timeout_ms,
+    long max_output_bytes,
+    blorp_ProcessRunState* state,
+    blorp_Bytes** stdout_result,
+    blorp_Bytes** stderr_result
+) {
+    blorp_ProcessBuffer stdout_buffer;
+    blorp_ProcessBuffer stderr_buffer;
+    __process_buffer_init(&stdout_buffer);
+    __process_buffer_init(&stderr_buffer);
+
+    if (stdin_fd >= 0) blorp_io_reactor_set_nonblocking(stdin_fd);
+    if (stdout_fd >= 0) blorp_io_reactor_set_nonblocking(stdout_fd);
+    if (stderr_fd >= 0) blorp_io_reactor_set_nonblocking(stderr_fd);
+
+    bool stdin_open = stdin_fd >= 0;
+    bool stdout_open = stdout_fd >= 0;
+    bool stderr_open = stderr_fd >= 0;
+    size_t stdin_offset = 0;
+    size_t stdin_length =
+        stdin_bytes && stdin_bytes->len > 0 ? (size_t)stdin_bytes->len : 0;
+    if (stdin_open && stdin_length == 0) {
+        __process_close_if_open(&stdin_fd, &stdin_open);
+    }
+
+    uint64_t deadline_ns =
+        has_timeout ? blorp_deadline_ns_from_now_ms(timeout_ms) : 0;
+    bool termination_sent = false;
+    bool kill_sent = false;
+    bool has_kill_deadline = false;
+    uint64_t kill_deadline_ns = 0;
+    size_t total_output_bytes = 0;
+    size_t output_limit =
+        max_output_bytes < 0 ? SIZE_MAX : (size_t)max_output_bytes;
+
+    while (
+        stdin_open || stdout_open || stderr_open || !state->child_exited ||
+        (termination_sent && use_process_group && !kill_sent)
+    ) {
+        uint64_t now_ns = blorp_monotonic_now_ns();
+        if (!state->child_exited) __process_check_child(pid, state, WNOHANG);
+        if (state->child_exited) {
+            __process_close_if_open(&stdin_fd, &stdin_open);
+        }
+
+        if (
+            has_timeout &&
+            !termination_sent &&
+            (stdin_open || stdout_open || stderr_open || !state->child_exited) &&
+            now_ns >= deadline_ns
+        ) {
+            state->timed_out = true;
+            termination_sent = true;
+            has_kill_deadline = true;
+            kill_deadline_ns =
+                blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
+            __process_signal(pid, use_process_group, SIGTERM);
+        }
+        if (state->timed_out) {
+            __process_close_if_open(&stdin_fd, &stdin_open);
+            __process_close_if_open(&stdout_fd, &stdout_open);
+            __process_close_if_open(&stderr_fd, &stderr_open);
+        }
+        if (state->output_limit_exceeded && !termination_sent) {
+            termination_sent = true;
+            has_kill_deadline = true;
+            kill_deadline_ns =
+                blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
+            __process_signal(pid, use_process_group, SIGTERM);
+        }
+        if (
+            termination_sent &&
+            !kill_sent &&
+            (use_process_group || !state->child_exited) &&
+            has_kill_deadline &&
+            now_ns >= kill_deadline_ns
+        ) {
+            kill_sent = true;
+            __process_signal(pid, use_process_group, SIGKILL);
+        }
+
+        struct pollfd fds[3];
+        nfds_t nfds = 0;
+        int stdin_index = -1;
+        int stdout_index = -1;
+        int stderr_index = -1;
+        if (stdin_open) {
+            stdin_index = (int)nfds;
+            fds[nfds] = (struct pollfd){
+                .fd = stdin_fd,
+                .events = POLLOUT,
+                .revents = 0
+            };
+            nfds++;
+        }
+        if (stdout_open) {
+            stdout_index = (int)nfds;
+            fds[nfds] = (struct pollfd){
+                .fd = stdout_fd,
+                .events = POLLIN,
+                .revents = 0
+            };
+            nfds++;
+        }
+        if (stderr_open) {
+            stderr_index = (int)nfds;
+            fds[nfds] = (struct pollfd){
+                .fd = stderr_fd,
+                .events = POLLIN,
+                .revents = 0
+            };
+            nfds++;
+        }
+
+        now_ns = blorp_monotonic_now_ns();
+        int poll_timeout = __process_poll_timeout_ms(
+            now_ns,
+            has_timeout && !termination_sent,
+            deadline_ns,
+            has_kill_deadline && !kill_sent,
+            kill_deadline_ns
+        );
+        int poll_result = poll(fds, nfds, poll_timeout);
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            state->poll_failed = true;
+            __process_close_if_open(&stdin_fd, &stdin_open);
+            __process_close_if_open(&stdout_fd, &stdout_open);
+            __process_close_if_open(&stderr_fd, &stderr_open);
+            break;
+        }
+
+        if (
+            stdout_index >= 0 &&
+            (fds[stdout_index].revents &
+             (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+        ) {
+            __drain_process_fd(
+                stdout_fd,
+                &stdout_buffer,
+                &stdout_open,
+                output_limit,
+                &total_output_bytes,
+                state
+            );
+            if (!stdout_open) stdout_fd = -1;
+        }
+        if (
+            stderr_index >= 0 &&
+            (fds[stderr_index].revents &
+             (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+        ) {
+            __drain_process_fd(
+                stderr_fd,
+                &stderr_buffer,
+                &stderr_open,
+                output_limit,
+                &total_output_bytes,
+                state
+            );
+            if (!stderr_open) stderr_fd = -1;
+        }
+        if (
+            stdin_index >= 0 &&
+            (fds[stdin_index].revents & POLLOUT)
+        ) {
+            size_t remaining = stdin_length - stdin_offset;
+            size_t chunk = remaining > 1048576 ? 1048576 : remaining;
+            ssize_t written = write(
+                stdin_fd,
+                stdin_bytes->data + stdin_offset,
+                chunk
+            );
+            if (written > 0) {
+                stdin_offset += (size_t)written;
+                if (stdin_offset == stdin_length) {
+                    __process_close_if_open(&stdin_fd, &stdin_open);
+                }
+            } else if (written < 0 && errno != EINTR &&
+                       errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (errno != EPIPE) state->io_failed = true;
+                __process_close_if_open(&stdin_fd, &stdin_open);
+            }
+        }
+        if (
+            stdin_index >= 0 &&
+            (fds[stdin_index].revents & (POLLHUP | POLLERR | POLLNVAL))
+        ) {
+            __process_close_if_open(&stdin_fd, &stdin_open);
+        }
+        if (state->output_limit_exceeded) {
+            __process_close_if_open(&stdin_fd, &stdin_open);
+            __process_close_if_open(&stdout_fd, &stdout_open);
+            __process_close_if_open(&stderr_fd, &stderr_open);
+        }
+    }
+
+    *stdout_result = __process_buffer_to_bytes(&stdout_buffer);
+    *stderr_result = __process_buffer_to_bytes(&stderr_buffer);
+    __process_buffer_free(&stdout_buffer);
+    __process_buffer_free(&stderr_buffer);
+}
+
 static void __free_argv(char** argv, long count) {
     if (!argv) return;
     for (long i = 0; i < count; i++) free(argv[i]);
     free(argv);
 }
 
-static bool __process_path_is_executable(const char* path) {
-    return path && path[0] != '\0' && access(path, X_OK) == 0;
+static char* __process_cstring_copy(const char* value) {
+    size_t len = strlen(value);
+    char* copy = (char*)blorp_malloc_checked(blorp_checked_add(len, 1));
+    memcpy(copy, value, len + 1);
+    return copy;
+}
+
+static void __process_free_strings(char** values, long count) {
+    if (!values) return;
+    for (long i = 0; i < count; i++) free(values[i]);
+    free(values);
+}
+
+static bool __process_string_list_to_c(
+    const blorp_List* values,
+    char*** result,
+    long* count
+) {
+    long len = values ? values->len : 0;
+    if (len < 0 || len > (long)(SIZE_MAX / sizeof(char*))) return false;
+    char** converted = len == 0
+        ? NULL
+        : (char**)blorp_malloc_checked(sizeof(char*) * (size_t)len);
+    for (long i = 0; i < len; i++) {
+        blorp_String* value =
+            (blorp_String*)blorp_list_get((blorp_List*)values, i);
+        converted[i] = blorp_cstring_copy_if_valid(value);
+        if (!converted[i]) {
+            __process_free_strings(converted, i);
+            return false;
+        }
+    }
+    *result = converted;
+    *count = len;
+    return true;
+}
+
+static bool __process_environment_name_is_valid(const char* name) {
+    return name && name[0] != '\0' && strchr(name, '=') == NULL;
+}
+
+static bool __process_name_in_list(
+    const char* name,
+    char* const* names,
+    long count
+) {
+    for (long i = 0; i < count; i++) {
+        if (strcmp(name, names[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool __process_environment_entry_is_overridden(
+    const char* entry,
+    char* const* set_names,
+    long set_count,
+    char* const* unset_names,
+    long unset_count
+) {
+    const char* separator = strchr(entry, '=');
+    size_t name_len = separator ? (size_t)(separator - entry) : strlen(entry);
+    for (long i = 0; i < set_count; i++) {
+        if (strlen(set_names[i]) == name_len &&
+            memcmp(entry, set_names[i], name_len) == 0) {
+            return true;
+        }
+    }
+    for (long i = 0; i < unset_count; i++) {
+        if (strlen(unset_names[i]) == name_len &&
+            memcmp(entry, unset_names[i], name_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char** __process_build_environment(
+    char* const* set_names,
+    char* const* set_values,
+    long set_count,
+    char* const* unset_names,
+    long unset_count
+) {
+    size_t inherited_count = 0;
+    while (environ && environ[inherited_count]) inherited_count++;
+    size_t capacity = blorp_checked_add(inherited_count, (size_t)set_count);
+    capacity = blorp_checked_add(capacity, 1);
+    char** result =
+        (char**)blorp_malloc_checked(sizeof(char*) * capacity);
+    size_t len = 0;
+
+    for (size_t i = 0; i < inherited_count; i++) {
+        if (!__process_environment_entry_is_overridden(
+                environ[i], set_names, set_count, unset_names, unset_count)) {
+            result[len++] = __process_cstring_copy(environ[i]);
+        }
+    }
+
+    for (long i = 0; i < set_count; i++) {
+        size_t name_len = strlen(set_names[i]);
+        size_t value_len = strlen(set_values[i]);
+        size_t entry_len = blorp_checked_add(name_len, 1);
+        entry_len = blorp_checked_add(entry_len, value_len);
+        char* entry =
+            (char*)blorp_malloc_checked(blorp_checked_add(entry_len, 1));
+        memcpy(entry, set_names[i], name_len);
+        entry[name_len] = '=';
+        memcpy(entry + name_len + 1, set_values[i], value_len);
+        entry[entry_len] = '\0';
+        result[len++] = entry;
+    }
+    result[len] = NULL;
+    return result;
+}
+
+static void __process_free_environment(char** environment) {
+    if (!environment) return;
+    for (size_t i = 0; environment[i]; i++) free(environment[i]);
+    free(environment);
+}
+
+static void __process_close_fd(int* fd) {
+    if (*fd >= 0) close(*fd);
+    *fd = -1;
+}
+
+static bool __process_make_pipe(int pipe_fds[2]) {
+    if (pipe(pipe_fds) != 0) return false;
+    blorp_runtime_set_cloexec(pipe_fds[0]);
+    blorp_runtime_set_cloexec(pipe_fds[1]);
+    for (int i = 0; i < 2; i++) {
+        if (pipe_fds[i] > STDERR_FILENO) continue;
+#ifdef F_DUPFD_CLOEXEC
+        int replacement = fcntl(pipe_fds[i], F_DUPFD_CLOEXEC, 3);
+#else
+        int replacement = fcntl(pipe_fds[i], F_DUPFD, 3);
+        if (replacement >= 0) blorp_runtime_set_cloexec(replacement);
+#endif
+        if (replacement < 0) {
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            pipe_fds[0] = -1;
+            pipe_fds[1] = -1;
+            return false;
+        }
+        close(pipe_fds[i]);
+        pipe_fds[i] = replacement;
+    }
+    return true;
+}
+
+typedef enum {
+    BLORP_PROCESS_PROGRAM_NOT_FOUND,
+    BLORP_PROCESS_PROGRAM_EXECUTABLE,
+    BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE
+} blorp_ProcessProgramLookup;
+
+static blorp_ProcessProgramLookup __process_path_lookup(const char* path) {
+    if (!path || path[0] == '\0') return BLORP_PROCESS_PROGRAM_NOT_FOUND;
+    struct stat info;
+    if (stat(path, &info) != 0) return BLORP_PROCESS_PROGRAM_NOT_FOUND;
+    if (access(path, X_OK) == 0) return BLORP_PROCESS_PROGRAM_EXECUTABLE;
+    return BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE;
 }
 
 static const char* __process_default_path(char* buf, size_t buf_len) {
@@ -36073,9 +37008,11 @@ static const char* __process_default_path(char* buf, size_t buf_len) {
     return "/bin:/usr/bin";
 }
 
-static bool __process_program_is_resolvable(const char* program) {
-    if (!program || program[0] == '\0') return false;
-    if (strchr(program, '/')) return __process_path_is_executable(program);
+static blorp_ProcessProgramLookup __process_program_lookup(
+    const char* program
+) {
+    if (!program || program[0] == '\0') return BLORP_PROCESS_PROGRAM_NOT_FOUND;
+    if (strchr(program, '/')) return __process_path_lookup(program);
 
     char default_path_buf[1024];
     const char* path = getenv("PATH");
@@ -36085,6 +37022,7 @@ static bool __process_program_is_resolvable(const char* program) {
 
     size_t program_len = strlen(program);
     const char* part = path;
+    bool found_non_executable = false;
     while (true) {
         const char* end = strchr(part, ':');
         size_t dir_len = end ? (size_t)(end - part) : strlen(part);
@@ -36101,13 +37039,23 @@ static bool __process_program_is_resolvable(const char* program) {
             candidate[dir_len] = '/';
             memcpy(candidate + dir_len + 1, program, program_len + 1);
         }
-        bool found = __process_path_is_executable(candidate);
+        blorp_ProcessProgramLookup lookup = __process_path_lookup(candidate);
         free(candidate);
-        if (found) return true;
+        if (lookup == BLORP_PROCESS_PROGRAM_EXECUTABLE) return lookup;
+        if (lookup == BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE) {
+            found_non_executable = true;
+        }
         if (!end) break;
         part = end + 1;
     }
-    return false;
+    return found_non_executable
+        ? BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE
+        : BLORP_PROCESS_PROGRAM_NOT_FOUND;
+}
+
+static bool __process_program_is_resolvable(const char* program) {
+    return __process_program_lookup(program) ==
+        BLORP_PROCESS_PROGRAM_EXECUTABLE;
 }
 
 static void* __process_error_result(
@@ -36118,6 +37066,656 @@ static void* __process_error_result(
     if (out_str) blorp_release((void*)out_str);
     if (err_str) blorp_release((void*)err_str);
     return (void*)blorp_result_err((void*)blorp_string_literal(message));
+}
+
+static void* __process_command_error_string(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    blorp_Tuple* payload =
+        blorp_tuple_new(2, (void*)(long)kind, (void*)detail);
+    blorp_tuple_set_rc(payload, 0x2);
+    blorp_Result* result = blorp_result_err((void*)payload);
+    result->release_mask = 1UL;
+    return (void*)result;
+}
+
+static void* __process_command_error(
+    blorp_ProcessErrorKind kind,
+    const char* detail
+) {
+    return __process_command_error_string(
+        kind,
+        blorp_string_from_buf_size(detail, strlen(detail))
+    );
+}
+
+static void* __process_command_errno(
+    blorp_ProcessErrorKind kind,
+    const char* operation,
+    int errnum
+) {
+    char detail[256];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "%s: %s",
+        operation,
+        strerror(errnum)
+    );
+    return __process_command_error(kind, detail);
+}
+
+static void* __process_command_success(
+    blorp_ProcessExitKind exit_kind,
+    long exit_code,
+    blorp_Bytes* stdout_bytes,
+    blorp_Bytes* stderr_bytes
+) {
+    blorp_Tuple* payload = blorp_tuple_new(
+        4,
+        (void*)(long)exit_kind,
+        (void*)exit_code,
+        (void*)stdout_bytes,
+        (void*)stderr_bytes
+    );
+    blorp_tuple_set_rc(payload, 0xC);
+    blorp_Result* result = blorp_result_ok((void*)payload);
+    result->release_mask = 1UL;
+    return (void*)result;
+}
+
+static int __process_add_input_actions(
+    posix_spawn_file_actions_t* actions,
+    blorp_ProcessStdinMode mode,
+    const int pipe_fds[2]
+) {
+    if (mode == BLORP_PROCESS_STDIN_INHERIT) return 0;
+    if (mode == BLORP_PROCESS_STDIN_NULL) {
+        return posix_spawn_file_actions_addopen(
+            actions,
+            STDIN_FILENO,
+            "/dev/null",
+            O_RDONLY,
+            0
+        );
+    }
+    int status = posix_spawn_file_actions_addclose(actions, pipe_fds[1]);
+    if (status == 0) {
+        status = posix_spawn_file_actions_adddup2(
+            actions,
+            pipe_fds[0],
+            STDIN_FILENO
+        );
+    }
+    if (status == 0) {
+        status = posix_spawn_file_actions_addclose(actions, pipe_fds[0]);
+    }
+    return status;
+}
+
+static int __process_add_output_actions(
+    posix_spawn_file_actions_t* actions,
+    blorp_ProcessStreamMode mode,
+    const int pipe_fds[2],
+    int target_fd
+) {
+    if (mode == BLORP_PROCESS_STREAM_INHERIT) return 0;
+    if (mode == BLORP_PROCESS_STREAM_NULL) {
+        return posix_spawn_file_actions_addopen(
+            actions,
+            target_fd,
+            "/dev/null",
+            O_WRONLY,
+            0
+        );
+    }
+    int status = posix_spawn_file_actions_addclose(actions, pipe_fds[0]);
+    if (status == 0) {
+        status = posix_spawn_file_actions_adddup2(
+            actions,
+            pipe_fds[1],
+            target_fd
+        );
+    }
+    if (status == 0) {
+        status = posix_spawn_file_actions_addclose(actions, pipe_fds[1]);
+    }
+    return status;
+}
+
+void* blorp_process_run_command_raw(
+    const blorp_String* program,
+    const blorp_List* args,
+    const blorp_Tuple* options
+) {
+    void* result = NULL;
+    const blorp_String* cwd = NULL;
+    bool has_cwd = false;
+    const blorp_List* set_environment_names = NULL;
+    const blorp_List* set_environment_values = NULL;
+    const blorp_List* unset_environment_names = NULL;
+    long stdin_mode_value = -1;
+    const blorp_Bytes* stdin_bytes = NULL;
+    long stdout_mode_value = -1;
+    long stderr_mode_value = -1;
+    bool has_timeout = false;
+    long timeout_ms = 0;
+    long process_group_mode_value = -1;
+    long capture_limit = BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT;
+    char* executable = NULL;
+    char** argv = NULL;
+    long argc = args ? args->len : 0;
+    char* cwd_path = NULL;
+    char** set_names = NULL;
+    char** set_values = NULL;
+    char** unset_names = NULL;
+    long set_name_count = 0;
+    long set_value_count = 0;
+    long unset_count = 0;
+    char** child_environment = NULL;
+    int stdin_pipe[2] = { -1, -1 };
+    int stdout_pipe[2] = { -1, -1 };
+    int stderr_pipe[2] = { -1, -1 };
+    posix_spawn_file_actions_t actions;
+    bool actions_initialized = false;
+    posix_spawnattr_t attributes;
+    bool attributes_initialized = false;
+
+    if (!options || options->arity != BLORP_PROCESS_OPTION_COUNT) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "invalid process option payload"
+        );
+        goto cleanup;
+    }
+    const blorp_Tuple* cwd_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_CWD];
+    const blorp_Tuple* environment_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_ENVIRONMENT];
+    const blorp_Tuple* stream_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_STREAMS];
+    const blorp_Tuple* lifecycle_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_LIFECYCLE];
+    if (
+        !cwd_options || cwd_options->arity != BLORP_PROCESS_CWD_COUNT ||
+        !environment_options ||
+        environment_options->arity != BLORP_PROCESS_ENVIRONMENT_COUNT ||
+        !stream_options ||
+        stream_options->arity != BLORP_PROCESS_STREAMS_COUNT ||
+        !lifecycle_options ||
+        lifecycle_options->arity != BLORP_PROCESS_LIFECYCLE_COUNT
+    ) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "invalid nested process option payload"
+        );
+        goto cleanup;
+    }
+    cwd = (const blorp_String*)cwd_options->elem[BLORP_PROCESS_CWD_PATH];
+    has_cwd = (bool)(long)cwd_options->elem[BLORP_PROCESS_CWD_PRESENT];
+    set_environment_names = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_NAMES];
+    set_environment_values = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_VALUES];
+    unset_environment_names = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_UNSET_NAMES];
+    stdin_mode_value =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_MODE];
+    stdin_bytes = (const blorp_Bytes*)
+        stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_BYTES];
+    stdout_mode_value =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDOUT_MODE];
+    stderr_mode_value =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDERR_MODE];
+    has_timeout =
+        (bool)(long)lifecycle_options->elem[
+            BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT
+        ];
+    timeout_ms = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_TIMEOUT_MS
+    ];
+    process_group_mode_value =
+        (long)lifecycle_options->elem[
+            BLORP_PROCESS_LIFECYCLE_GROUP_MODE
+        ];
+    capture_limit = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_CAPTURE_LIMIT
+    ];
+
+    if (!program || program->len <= 0) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "program is empty"
+        );
+        goto cleanup;
+    }
+    if (
+        stdin_mode_value < BLORP_PROCESS_STDIN_INHERIT ||
+        stdin_mode_value > BLORP_PROCESS_STDIN_BYTES ||
+        stdout_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
+        stdout_mode_value > BLORP_PROCESS_STREAM_NULL ||
+        stderr_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
+        stderr_mode_value > BLORP_PROCESS_STREAM_NULL ||
+        process_group_mode_value < BLORP_PROCESS_GROUP_INHERIT ||
+        process_group_mode_value > BLORP_PROCESS_GROUP_NEW
+    ) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "invalid process mode"
+        );
+        goto cleanup;
+    }
+    if (has_timeout && timeout_ms < 0) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "timeout must be non-negative"
+        );
+        goto cleanup;
+    }
+    if (capture_limit < BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "capture limit must be non-negative"
+        );
+        goto cleanup;
+    }
+    if (argc < 0 || argc > (long)(SIZE_MAX / sizeof(char*) - 2)) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "too many process arguments"
+        );
+        goto cleanup;
+    }
+
+    executable = blorp_cstring_copy_if_valid(program);
+    if (!executable) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "program contains a NUL byte"
+        );
+        goto cleanup;
+    }
+    blorp_ProcessProgramLookup lookup =
+        __process_program_lookup(executable);
+    if (lookup == BLORP_PROCESS_PROGRAM_NOT_FOUND) {
+        result = __process_command_error_string(
+            BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND,
+            blorp_string_from_buf_size(executable, strlen(executable))
+        );
+        goto cleanup;
+    }
+    if (lookup == BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "program is not executable"
+        );
+        goto cleanup;
+    }
+
+    argv = (char**)blorp_malloc_checked(
+        sizeof(char*) * ((size_t)argc + 2)
+    );
+    argv[0] = executable;
+    executable = NULL;
+    for (long i = 0; i < argc; i++) {
+        blorp_String* argument =
+            (blorp_String*)blorp_list_get((blorp_List*)args, i);
+        argv[i + 1] = blorp_cstring_copy_if_valid(argument);
+        if (!argv[i + 1]) {
+            __free_argv(argv, i + 1);
+            argv = NULL;
+            result = __process_command_error(
+                BLORP_PROCESS_ERROR_INVALID_COMMAND,
+                "process argument contains a NUL byte"
+            );
+            goto cleanup;
+        }
+    }
+    argv[argc + 1] = NULL;
+
+    if (has_cwd) {
+        cwd_path = blorp_cstring_copy_if_valid(cwd);
+        if (!cwd_path || cwd_path[0] == '\0') {
+            result = __process_command_error(
+                BLORP_PROCESS_ERROR_INVALID_COMMAND,
+                "working directory is empty or contains a NUL byte"
+            );
+            goto cleanup;
+        }
+        struct stat cwd_info;
+        if (stat(cwd_path, &cwd_info) != 0) {
+            result = __process_command_errno(
+                BLORP_PROCESS_ERROR_SPAWN_FAILED,
+                "working directory",
+                errno
+            );
+            goto cleanup;
+        }
+        if (!S_ISDIR(cwd_info.st_mode)) {
+            result = __process_command_errno(
+                BLORP_PROCESS_ERROR_SPAWN_FAILED,
+                "working directory",
+                ENOTDIR
+            );
+            goto cleanup;
+        }
+    }
+
+    if (!__process_string_list_to_c(
+            set_environment_names, &set_names, &set_name_count) ||
+        !__process_string_list_to_c(
+            set_environment_values, &set_values, &set_value_count) ||
+        !__process_string_list_to_c(
+            unset_environment_names, &unset_names, &unset_count)) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "environment change contains a NUL byte or is too large"
+        );
+        goto cleanup;
+    }
+    if (set_name_count != set_value_count) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "environment name/value count does not match"
+        );
+        goto cleanup;
+    }
+    for (long i = 0; i < set_name_count; i++) {
+        if (!__process_environment_name_is_valid(set_names[i]) ||
+            __process_name_in_list(set_names[i], set_names, i) ||
+            __process_name_in_list(set_names[i], unset_names, unset_count)) {
+            result = __process_command_error(
+                BLORP_PROCESS_ERROR_INVALID_COMMAND,
+                "invalid or duplicate environment variable name"
+            );
+            goto cleanup;
+        }
+    }
+    for (long i = 0; i < unset_count; i++) {
+        if (!__process_environment_name_is_valid(unset_names[i]) ||
+            __process_name_in_list(unset_names[i], unset_names, i)) {
+            result = __process_command_error(
+                BLORP_PROCESS_ERROR_INVALID_COMMAND,
+                "invalid or duplicate environment variable name"
+            );
+            goto cleanup;
+        }
+    }
+    if (set_name_count > 0 || unset_count > 0) {
+        child_environment = __process_build_environment(
+            set_names,
+            set_values,
+            set_name_count,
+            unset_names,
+            unset_count
+        );
+    }
+
+    blorp_ProcessStdinMode stdin_mode =
+        (blorp_ProcessStdinMode)stdin_mode_value;
+    blorp_ProcessStreamMode stdout_mode =
+        (blorp_ProcessStreamMode)stdout_mode_value;
+    blorp_ProcessStreamMode stderr_mode =
+        (blorp_ProcessStreamMode)stderr_mode_value;
+    blorp_ProcessGroupMode group_mode =
+        (blorp_ProcessGroupMode)process_group_mode_value;
+
+    if (
+        stdin_mode == BLORP_PROCESS_STDIN_BYTES &&
+        !__process_make_pipe(stdin_pipe)
+    ) {
+        result = __process_command_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stdin pipe",
+            errno
+        );
+        goto cleanup;
+    }
+    if (
+        stdout_mode == BLORP_PROCESS_STREAM_CAPTURE &&
+        !__process_make_pipe(stdout_pipe)
+    ) {
+        result = __process_command_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stdout pipe",
+            errno
+        );
+        goto cleanup;
+    }
+    if (
+        stderr_mode == BLORP_PROCESS_STREAM_CAPTURE &&
+        !__process_make_pipe(stderr_pipe)
+    ) {
+        result = __process_command_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stderr pipe",
+            errno
+        );
+        goto cleanup;
+    }
+
+    int action_status = posix_spawn_file_actions_init(&actions);
+    if (action_status != 0) {
+        result = __process_command_errno(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "initialize spawn actions",
+            action_status
+        );
+        goto cleanup;
+    }
+    actions_initialized = true;
+
+    if (has_cwd) {
+#if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+    __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
+        action_status =
+            posix_spawn_file_actions_addchdir(&actions, cwd_path);
+#elif defined(__APPLE__) || defined(__GLIBC__)
+        action_status =
+            posix_spawn_file_actions_addchdir_np(&actions, cwd_path);
+#else
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "working directory changes are unsupported on this platform"
+        );
+        goto cleanup;
+#endif
+    }
+    if (action_status == 0) {
+        action_status = __process_add_input_actions(
+            &actions,
+            stdin_mode,
+            stdin_pipe
+        );
+    }
+    if (action_status == 0) {
+        action_status = __process_add_output_actions(
+            &actions,
+            stdout_mode,
+            stdout_pipe,
+            STDOUT_FILENO
+        );
+    }
+    if (action_status == 0) {
+        action_status = __process_add_output_actions(
+            &actions,
+            stderr_mode,
+            stderr_pipe,
+            STDERR_FILENO
+        );
+    }
+    if (action_status != 0) {
+        result = __process_command_errno(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "configure spawn actions",
+            action_status
+        );
+        goto cleanup;
+    }
+
+    if (group_mode == BLORP_PROCESS_GROUP_NEW) {
+#if defined(POSIX_SPAWN_SETPGROUP)
+        int attribute_status = posix_spawnattr_init(&attributes);
+        if (attribute_status == 0) {
+            attributes_initialized = true;
+            attribute_status = posix_spawnattr_setpgroup(&attributes, 0);
+        }
+        if (attribute_status == 0) {
+            attribute_status = posix_spawnattr_setflags(
+                &attributes,
+                POSIX_SPAWN_SETPGROUP
+            );
+        }
+        if (attribute_status != 0) {
+            result = __process_command_errno(
+                BLORP_PROCESS_ERROR_SPAWN_FAILED,
+                "configure process group",
+                attribute_status
+            );
+            goto cleanup;
+        }
+#else
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "new process groups are unsupported on this platform"
+        );
+        goto cleanup;
+#endif
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = -1;
+    int spawn_status = posix_spawnp(
+        &pid,
+        argv[0],
+        &actions,
+        attributes_initialized ? &attributes : NULL,
+        argv,
+        child_environment ? child_environment : environ
+    );
+    if (spawn_status != 0) {
+        result = __process_command_errno(
+            spawn_status == ENOENT
+                ? BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND
+                : BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "posix_spawnp",
+            spawn_status
+        );
+        goto cleanup;
+    }
+
+    __process_close_fd(&stdin_pipe[0]);
+    __process_close_fd(&stdout_pipe[1]);
+    __process_close_fd(&stderr_pipe[1]);
+
+    blorp_ProcessRunState run_state = {0};
+    blorp_Bytes* stdout_bytes = NULL;
+    blorp_Bytes* stderr_bytes = NULL;
+    long max_output_bytes = capture_limit;
+    if (max_output_bytes == BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT) {
+        max_output_bytes = __process_env_long_or_default(
+            "BLORP_PROCESS_MAX_OUTPUT_BYTES",
+            BLORP_PROCESS_DEFAULT_MAX_OUTPUT_BYTES,
+            0,
+            LONG_MAX
+        );
+    }
+    __run_process_command_io(
+        pid,
+        group_mode == BLORP_PROCESS_GROUP_NEW,
+        stdin_pipe[1],
+        stdin_bytes,
+        stdout_pipe[0],
+        stderr_pipe[0],
+        has_timeout,
+        timeout_ms,
+        max_output_bytes,
+        &run_state,
+        &stdout_bytes,
+        &stderr_bytes
+    );
+    stdin_pipe[1] = -1;
+    stdout_pipe[0] = -1;
+    stderr_pipe[0] = -1;
+    if (!run_state.child_exited) {
+        __process_signal(
+            pid,
+            group_mode == BLORP_PROCESS_GROUP_NEW,
+            SIGKILL
+        );
+        __process_check_child(pid, &run_state, 0);
+    }
+
+    if (run_state.output_limit_exceeded) {
+        blorp_release(stdout_bytes);
+        blorp_release(stderr_bytes);
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_OUTPUT_LIMIT,
+            "captured stdout and stderr exceeded the configured limit"
+        );
+        goto cleanup;
+    }
+    if (run_state.poll_failed || run_state.io_failed || run_state.wait_failed) {
+        blorp_release(stdout_bytes);
+        blorp_release(stderr_bytes);
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            run_state.wait_failed
+                ? "failed to wait for child process"
+                : "failed while transferring process streams"
+        );
+        goto cleanup;
+    }
+
+    if (run_state.timed_out) {
+        result = __process_command_success(
+            BLORP_PROCESS_EXIT_TIMED_OUT,
+            0,
+            stdout_bytes,
+            stderr_bytes
+        );
+    } else if (WIFEXITED(run_state.status)) {
+        result = __process_command_success(
+            BLORP_PROCESS_EXIT_EXITED,
+            (long)WEXITSTATUS(run_state.status),
+            stdout_bytes,
+            stderr_bytes
+        );
+    } else if (WIFSIGNALED(run_state.status)) {
+        result = __process_command_success(
+            BLORP_PROCESS_EXIT_SIGNALED,
+            (long)WTERMSIG(run_state.status),
+            stdout_bytes,
+            stderr_bytes
+        );
+    } else {
+        blorp_release(stdout_bytes);
+        blorp_release(stderr_bytes);
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "child process ended with an unknown wait status"
+        );
+    }
+
+cleanup:
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    __process_close_fd(&stdin_pipe[0]);
+    __process_close_fd(&stdin_pipe[1]);
+    __process_close_fd(&stdout_pipe[0]);
+    __process_close_fd(&stdout_pipe[1]);
+    __process_close_fd(&stderr_pipe[0]);
+    __process_close_fd(&stderr_pipe[1]);
+    free(executable);
+    __free_argv(argv, argc + 1);
+    free(cwd_path);
+    __process_free_strings(set_names, set_name_count);
+    __process_free_strings(set_values, set_value_count);
+    __process_free_strings(unset_names, unset_count);
+    __process_free_environment(child_environment);
+    return result;
 }
 
 // Returns Result[Tuple3[String, String, Int], String]
@@ -36267,6 +37865,9 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     }
     if (run_state.poll_failed) {
         return __process_error_result(out_str, err_str, "process poll failed");
+    }
+    if (run_state.io_failed) {
+        return __process_error_result(out_str, err_str, "process I/O failed");
     }
     if (run_state.wait_failed) {
         return __process_error_result(out_str, err_str, "process wait failed");

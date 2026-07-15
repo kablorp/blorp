@@ -1,0 +1,369 @@
+-- Immutable, verified runtime-object cache for Blorp-owned host compilation.
+--
+-- A cache entry is assembled in a scoped sibling directory. MANIFEST records
+-- content hashes, READY is written last, and rename publishes the complete
+-- directory atomically. Readers never consume an unverified entry.
+import:
+	../stage_10_backend/compiler_build_artifact:
+		BuildOptimization,
+		BuildPlatform(BuildLinux, BuildMacos),
+		BuildSanitizer,
+	compiler_host_c:
+		HostCCompiler,
+		HostPrecompiledRuntime,
+		HostTlsConfiguration,
+		host_c_compiler_family_name,
+		host_c_optimization_argument,
+		host_c_sanitizer_arguments,
+		host_c_warning_arguments,
+		host_tls_backend_name,
+	compiler_runtime: CompilerRuntimeSources
+	fs:
+		IOError(NotFound),
+		create_directories,
+		open_read,
+		remove_directory_tree,
+		rename_path,
+		resource_path,
+		temporary_directory,
+		write_text_atomic,
+	hash: sha256, sha256_bytes
+	process as Process
+	units: DataSize, Duration
+
+
+private RUNTIME_CACHE_SCHEMA: String = "blorp-runtime-cache-v1"
+private RUNTIME_MANIFEST_SCHEMA: String = "blorp-runtime-manifest-v1"
+private RUNTIME_OBJECT_NAME: String = "runtime.o"
+private RUNTIME_DECLARATIONS_NAME: String = "runtime.h"
+private RUNTIME_MANIFEST_NAME: String = "MANIFEST"
+private RUNTIME_READY_NAME: String = "READY"
+private RUNTIME_READY_CONTENT: String = "ready\n"
+
+
+record RuntimeCacheConfiguration {
+	cache_root: String,
+	compiler: HostCCompiler,
+	compiler_identity: String,
+	target_identity: String,
+	platform: BuildPlatform,
+	optimization: BuildOptimization,
+	sanitizer: BuildSanitizer,
+	tls: HostTlsConfiguration,
+	runtime_sources: CompilerRuntimeSources,
+	timeout: Option[Duration],
+	capture_limit: DataSize
+}
+
+
+union RuntimeCacheError:
+	RuntimeCacheIoFailed(IOError)
+	RuntimeCacheProcessFailed(Process.ProcessError)
+	RuntimeCacheCompilerRejected(Int, String)
+	RuntimeCacheCompilerSignaled(Int, String)
+	RuntimeCacheCompilerTimedOut(String)
+	RuntimeCacheInvalidRuntimeSources
+	RuntimeCacheVerificationFailed(String)
+
+
+pure func runtime_cache_error_message(error: RuntimeCacheError) -> String:
+	match error:
+		RuntimeCacheIoFailed(io_error):
+			"runtime cache I/O failed: ${io_error.to_string()}"
+		RuntimeCacheProcessFailed(process_error):
+			"cannot start the runtime C compiler: ${process_error.to_string()}"
+		RuntimeCacheCompilerRejected(code, diagnostics):
+			"runtime C compiler exited with status ${code.to_string()}: ${diagnostics}"
+		RuntimeCacheCompilerSignaled(signal, diagnostics):
+			"runtime C compiler was terminated by signal ${signal.to_string()}: ${diagnostics}"
+		RuntimeCacheCompilerTimedOut(diagnostics):
+			"runtime C compiler timed out: ${diagnostics}"
+		RuntimeCacheInvalidRuntimeSources:
+			"embedded compiler runtime sources are unavailable"
+		RuntimeCacheVerificationFailed(path):
+			"runtime cache entry failed verification: ${path}"
+
+
+private pure func cache_component(value: String) -> String:
+	"${value.length().to_string()}:${value}"
+
+
+private pure func cache_components(values: List[String]) -> String:
+	values.map(cache_component).join("")
+
+
+private pure func platform_name(platform: BuildPlatform) -> String:
+	match platform:
+		BuildLinux:
+			"linux"
+		BuildMacos:
+			"macos"
+
+
+pure func runtime_cache_key(configuration: RuntimeCacheConfiguration) -> String:
+	sha256(cache_components([
+		RUNTIME_CACHE_SCHEMA,
+		sha256(configuration.runtime_sources.runtime),
+		sha256(configuration.runtime_sources.declarations),
+		configuration.compiler.program,
+		host_c_compiler_family_name(configuration.compiler.family),
+		cache_components(configuration.compiler.prefix_arguments),
+		configuration.compiler_identity,
+		configuration.target_identity,
+		platform_name(configuration.platform),
+		host_c_optimization_argument(configuration.optimization, configuration.sanitizer),
+		cache_components(host_c_warning_arguments(configuration.sanitizer)),
+		cache_components(host_c_sanitizer_arguments(configuration.sanitizer)),
+		host_tls_backend_name(configuration.tls.backend),
+		cache_components(configuration.tls.runtime_arguments),
+		cache_components(configuration.tls.link_arguments),
+		"-fwrapv",
+		"-pipe",
+	]))
+
+
+private pure func entry_path(root: String, key: String) -> String:
+	root + "/runtime-" + key
+
+
+private pure func runtime_object_path(directory: String) -> String:
+	directory + "/" + RUNTIME_OBJECT_NAME
+
+
+private pure func runtime_declarations_path(directory: String) -> String:
+	directory + "/" + RUNTIME_DECLARATIONS_NAME
+
+
+private pure func runtime_manifest_path(directory: String) -> String:
+	directory + "/" + RUNTIME_MANIFEST_NAME
+
+
+private pure func runtime_ready_path(directory: String) -> String:
+	directory + "/" + RUNTIME_READY_NAME
+
+
+private pure func runtime_manifest(
+	key: String,
+	tls_backend: String,
+	object_hash: String,
+	declarations_hash: String,
+) -> String:
+	|${RUNTIME_MANIFEST_SCHEMA}
+	|key=${key}
+	|tls_backend=${tls_backend}
+	|runtime.o=${object_hash}
+	|runtime.h=${declarations_hash}
+	|
+
+
+private func read_text_path(path: String) -> Result[String, IOError]:
+	with reader ?= open_read(path):
+		reader.read_text()
+
+
+private func read_bytes_path(path: String) -> Result[Bytes, IOError]:
+	with reader ?= open_read(path):
+		reader.read_bytes()
+
+
+private func verified_runtime_entry(
+	directory: String,
+	key: String,
+	tls: HostTlsConfiguration,
+) -> Option[HostPrecompiledRuntime]:
+	match read_text_path(runtime_ready_path(directory)):
+		Ok(ready):
+			if ready != RUNTIME_READY_CONTENT:
+				None
+			else:
+				match read_bytes_path(runtime_object_path(directory)):
+					Err(_):
+						None
+					Ok(object_bytes):
+						match read_bytes_path(runtime_declarations_path(directory)):
+							Err(_):
+								None
+							Ok(declaration_bytes):
+								expected: String = runtime_manifest(
+									key,
+									host_tls_backend_name(tls.backend),
+									sha256_bytes(object_bytes),
+									sha256_bytes(declaration_bytes),
+								)
+
+								match read_text_path(runtime_manifest_path(directory)):
+									Ok(manifest):
+										if manifest == expected:
+											Some({
+												object_path = runtime_object_path(directory),
+												declarations_path = runtime_declarations_path(directory),
+												tls_backend = tls.backend
+											})
+										else:
+											None
+									Err(_):
+										None
+		Err(_):
+			None
+
+
+private pure func process_diagnostics(stdout: String, stderr: String) -> String:
+	if stdout.length() == 0:
+		stderr
+	else if stderr.length() == 0:
+		stdout
+	else:
+		stdout + "\n" + stderr
+
+
+private func compile_runtime_object(
+	configuration: RuntimeCacheConfiguration,
+	object_path: String,
+) -> Result[Void, RuntimeCacheError]:
+	arguments: List[String] = configuration.compiler.prefix_arguments
+		.concat(["-x", "c", "-", "-x", "none", "-c"])
+		.append(host_c_optimization_argument(
+			configuration.optimization,
+			configuration.sanitizer,
+		))
+		.concat(["-fwrapv", "-pipe"])
+		.concat(host_c_warning_arguments(configuration.sanitizer))
+		.concat(["-o", object_path, "-lpthread"])
+		.concat(configuration.tls.runtime_arguments)
+		.concat(host_c_sanitizer_arguments(configuration.sanitizer))
+	request = { Process.command(configuration.compiler.program, arguments) |
+		stdin = Process.BytesStdin(configuration.runtime_sources.runtime.to_bytes()),
+		timeout = configuration.timeout,
+		capture_limit = Some(configuration.capture_limit)
+	}
+
+	match Process.run_command(request):
+		Err(error):
+			Err(RuntimeCacheProcessFailed(error))
+		Ok(result):
+			diagnostics: String = process_diagnostics(
+				result.stdout.to_string(),
+				result.stderr.to_string(),
+			)
+
+			match result.exit:
+				Process.Exited(code):
+					if code == 0:
+						Ok(void)
+					else:
+						Err(RuntimeCacheCompilerRejected(code, diagnostics))
+				Process.Signaled(signal):
+					Err(RuntimeCacheCompilerSignaled(signal, diagnostics))
+				Process.TimedOut:
+					Err(RuntimeCacheCompilerTimedOut(diagnostics))
+
+
+private func write_cache_text(
+	path: String,
+	text: String,
+) -> Result[Void, RuntimeCacheError]:
+	match write_text_atomic(path, text):
+		Ok(_):
+			Ok(void)
+		Err(error):
+			Err(RuntimeCacheIoFailed(error))
+
+
+private func remove_stale_entry(path: String) -> Result[Void, RuntimeCacheError]:
+	match remove_directory_tree(path):
+		Ok(_):
+			Ok(void)
+		Err(NotFound(_)):
+			Ok(void)
+		Err(error):
+			Err(RuntimeCacheIoFailed(error))
+
+
+private func publish_runtime_entry(
+	stage: String,
+	destination: String,
+	key: String,
+	configuration: RuntimeCacheConfiguration,
+) -> Result[HostPrecompiledRuntime, RuntimeCacheError]:
+	match rename_path(stage, destination):
+		Ok(_):
+			match verified_runtime_entry(destination, key, configuration.tls):
+				Some(runtime):
+					Ok(runtime)
+				None:
+					Err(RuntimeCacheVerificationFailed(destination))
+		Err(rename_error):
+			match verified_runtime_entry(destination, key, configuration.tls):
+				Some(runtime):
+					Ok(runtime)
+				None:
+					Err(RuntimeCacheIoFailed(rename_error))
+
+
+func prepare_runtime_cache(
+	configuration: RuntimeCacheConfiguration,
+) -> Result[HostPrecompiledRuntime, RuntimeCacheError]:
+	if (
+		configuration.runtime_sources.runtime.length() == 0
+		or configuration.runtime_sources.declarations.length() == 0
+	):
+		Err(RuntimeCacheInvalidRuntimeSources)
+	else:
+		key: String = runtime_cache_key(configuration)
+		destination: String = entry_path(configuration.cache_root, key)
+
+		match verified_runtime_entry(destination, key, configuration.tls):
+			Some(runtime):
+				Ok(runtime)
+			None:
+				match create_directories(configuration.cache_root):
+					Err(error):
+						Err(RuntimeCacheIoFailed(error))
+					Ok(_):
+						removed ?= remove_stale_entry(destination)
+
+						with stage_directory ?= temporary_directory(
+							configuration.cache_root,
+							"runtime-${key}_",
+						) on error => RuntimeCacheIoFailed(error):
+							stage: String = stage_directory.resource_path()
+							object_path: String = runtime_object_path(stage)
+							compiled ?= compile_runtime_object(configuration, object_path)
+							declarations_written ?= write_cache_text(
+								runtime_declarations_path(stage),
+								configuration.runtime_sources.declarations,
+							)
+
+							match read_bytes_path(object_path):
+								Err(error):
+									Err(RuntimeCacheIoFailed(error))
+								Ok(object_bytes):
+									match read_bytes_path(runtime_declarations_path(stage)):
+										Err(error):
+											Err(RuntimeCacheIoFailed(error))
+										Ok(declaration_bytes):
+											manifest: String = runtime_manifest(
+												key,
+												host_tls_backend_name(configuration.tls.backend),
+												sha256_bytes(object_bytes),
+												sha256_bytes(declaration_bytes),
+											)
+											manifest_written ?= write_cache_text(
+												runtime_manifest_path(stage),
+												manifest,
+											)
+											ready_written ?= write_cache_text(
+												runtime_ready_path(stage),
+												RUNTIME_READY_CONTENT,
+											)
+
+											match verified_runtime_entry(stage, key, configuration.tls):
+												None:
+													Err(RuntimeCacheVerificationFailed(stage))
+												Some(_):
+													publish_runtime_entry(
+														stage,
+														destination,
+														key,
+														configuration,
+													)
