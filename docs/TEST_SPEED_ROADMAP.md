@@ -1,6 +1,6 @@
 # Test Speed Roadmap
 
-Status checked against code on 2026-07-14.
+Status checked against code on 2026-07-15 at commit `41d48dfd`.
 
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
@@ -35,6 +35,47 @@ Recent measurements on this branch showed:
   and LSP.
 - Bridge helper preparation still costs roughly 16-21 seconds per `scripts/test`
   run when helper binaries are prepared into a fresh startup directory.
+
+### 2026-07-15 Whole-Compiler Baseline
+
+The most recent compiler migration work changed the dominant cost. Fresh
+measurements at `41d48dfd` showed:
+
+- `scripts/test compiler-unit compiler --serial`: 3,104 tests passed in 5m36s.
+  Compiler-unit took 2m40s and compiler took 2m53s.
+- `scripts/test compiler-deep --serial`: 1,999 tests passed in 37m39s wall
+  time, with 37m33s attributed to the gate.
+- The deep run reached roughly 3.7 GB resident memory in the OCaml host.
+- Generating the self-hosted CLI C during `make` took roughly 6-8 minutes.
+  Once generated C existed, the host C compiler completed in roughly 7
+  seconds.
+
+Another checkout ran a full test command during approximately the final four
+minutes of the deep measurement. Re-baseline in isolation before using these
+numbers for a before/after claim. That contention does not explain the full
+regression, and the observed phase split rules out Dune and the host C compiler
+as the primary causes.
+
+Before P1, the broad compiler-owned Blorp sweep discovered 94 top-level test
+files and `try_run_suite_selector_tests` compiled at most four suites per
+generated harness. This rebuilt and typechecked the compiler module graph
+roughly two dozen times in one sweep. The limit was documented as a correctness
+workaround for three typecheck declaration suites, but the focused
+reproductions below showed that those exceptions had become stale.
+
+The immediate performance problem is therefore repeated whole-program work:
+
+1. `Test_runner` discovers tests and generates several run-all harnesses.
+2. Each harness re-enters `Pipeline.compile_generated_test_harness`.
+3. The OCaml host sends an in-memory source through the Blorp CLI/frontend
+   bridge, decodes and finalizes the graph, then invokes the Blorp typecheck
+   bridge and remaining compilation stages.
+4. The host C compiler and harness process are invoked for every compiled
+   group.
+
+The roadmap below removes that accidental repetition, then removes algorithmic
+work inside the remaining compile. It does not add a result cache or hide the
+deep coverage.
 
 ## Principles
 
@@ -235,6 +276,411 @@ Keep them narrow:
 
 Expected impact: keeps runtime tests from regrowing the previous nested compiler
 property-test problem.
+
+## Whole-Compiler Performance Recovery Roadmap
+
+This is the active performance track. Complete the checkpoints in order unless
+a checkpoint explicitly says it can proceed independently. Each measured
+change should be a coherent commit so regressions can be bisected without
+untangling unrelated migration work.
+
+### P0. Add Phase Accounting and Re-Baseline
+
+**Status:** implemented on 2026-07-15; the isolated post-P1 compiler-owned
+sweep is the retained comparison log.
+
+**Goal:** make every expensive compiler-deep minute attributable to a named
+operation before changing behavior.
+
+**Implementation:**
+
+- Extend `scripts/test --timings` to request and retain generated-suite compile
+  timings, not only Alcotest case timings.
+- In `compiler/lib/test_runner.ml`, record test discovery, run-all eligibility,
+  isolation-group planning, generated-harness compilation, host C compilation,
+  and harness execution separately.
+- In `compiler/lib/pipeline.ml`, expose timing for in-memory frontend graph
+  construction, graph finalization, graph typechecking, the OCaml-owned
+  semantic middle, and Blorp-owned backend emission. Reuse the existing
+  `BLORP_COMPILER_BRIDGE_STATS` records in
+  `compiler/lib/compiler_blorp_bridge.ml` instead of creating a competing
+  bridge timer.
+- Emit stable machine-readable records containing the group identity, suite
+  count, source count, elapsed time, and peak memory when available. Keep the
+  normal console summary compact; full records belong in `--log-dir` output.
+- Count frontend graph builds, typecheck requests, generated C compilations,
+  and executed harnesses. Counts are as important as elapsed time because they
+  distinguish repeated work from a slow individual phase.
+
+**Tests:**
+
+- Add focused parser/format tests for the timing records in
+  `compiler/test/test_test_runner.ml` and `compiler/test/test_pipeline.ml`.
+- Add a shell-harness assertion that `scripts/test --timings --log-dir ...`
+  preserves the records without changing test selection or exit status.
+- Run compiler-deep alone at least twice and retain both logs. Use the second
+  isolated run as the comparison baseline if the first includes bootstrap
+  preparation.
+
+**Implemented shape:** `Pipeline.phase_timing` reports the source-to-C phase
+boundaries without retaining IR or introducing another pipeline. The semantic
+middle/backend split uses the existing `Core_stage.Dce` handoff: work before
+that event is the transitional OCaml-owned middle, while work after it is the
+Blorp-owned backend. `Test_runner.timing_event` adds discovery, harness
+planning, total pipeline, host-C, and execution records. `scripts/test
+--timings` retains the machine-readable records in gate logs and prints compact
+phase totals.
+
+The final 94-suite validation produced 10 records for every generated-harness
+phase and passed all 1,700 contained tests. Its phase totals were 108.396s for
+frontend graph construction, 0.006s for graph finalization, 432.459s for graph
+typechecking, 15.456s for the OCaml-owned semantic middle, 254.831s for
+Blorp-owned backend emission, 18.584s for host C, and 16.798s for test
+execution. A separate `compiler-deep` run in another checkout overlapped this
+measurement, so retain the operation counts and phase proportions but do not
+use these elapsed totals as an uncontended before/after speed claim.
+
+**Exit condition:** one compiler-deep log accounts for all generated harnesses
+and separates Blorp frontend/typecheck time, semantic-middle time, backend
+time, host C time, and execution time. The sum may differ slightly from wall
+time because total and child phases intentionally overlap, but no multi-minute
+interval is unclassified.
+
+**Pitfalls:** timing must not serialize work that is normally parallel, retain
+large graphs solely for reporting, or introduce a second source of truth for
+phase names.
+
+### P1. Remove the Four-Suite Correctness Workaround
+
+**Status:** implemented on 2026-07-15 with a resource-bound correction to the
+original one-unbounded-group proposal.
+
+**Goal:** remove the arbitrary suite-count limit and stale path-specific
+correctness exceptions. Compile as much compatible source work together as is
+currently memory-safe, with additional groups only for an explicit execution
+isolation rule or an explicit source-work budget.
+
+**Investigation:**
+
+- Reproduce groups of 5, 16, and all eligible compiler TestSuites outside the
+  runner's four-suite chunking.
+- Distinguish compilation failure, failure before `main`, test failure, failure
+  during global teardown, leak-check failure, and sanitizer failure. Do not
+  classify all nonzero exits as a batch-size problem.
+- Inspect Core and generated C for `tests: TestSuite`,
+  `__blorp_init_globals`, and global cleanup. Relevant implementation and tests
+  begin in:
+  - `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
+  - `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`
+  - `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`
+  - `compiler/blorp/src/stage_09_core/compiler_core_closure.brp`
+  - `compiler/blorp/tests/test_compiler_core_emit.brp`
+- Determine whether immutable TestSuite globals should be materialized by CTFE
+  or require runtime initialization. Fix the earliest stage that owns the
+  violated invariant; do not special-case test names or generated harnesses in
+  codegen.
+
+**Investigation result:**
+
+- A five-suite harness passed all 11 contained tests.
+- A 16-suite, approximately 232 KiB source group passed all 131 contained
+  tests.
+- The formerly conflicting `typecheck_decl + infer` group passed 304 tests.
+  The formerly conflicting `impl_decl + resource_decl + state + types` group
+  passed 26 tests. No initialization, early-exit, or teardown defect remained
+  to fix, so the three path exceptions were removed.
+- One unbounded 94-suite harness was not viable: the OCaml host reached roughly
+  7.3 GB RSS and the Blorp bridge roughly 8.7 GB RSS before the probe was
+  stopped to avoid exhausting the machine. This is retained-graph pressure,
+  not a semantic isolation requirement. Treating "one group" as an invariant
+  would make P1 less reliable and would work against the planned move of test
+  planning into Blorp.
+
+**Implementation:**
+
+- Correct global ownership, initialization, or teardown only if a focused
+  reproduction demonstrates a defect. Do not create speculative Core or
+  codegen changes when current behavior is correct.
+- Replace `run_all_suite_batch_size` and `test_compilation_isolation` with a
+  stable accumulated source-byte partition. Suite count is not a useful proxy:
+  compiler-owned test files differ by more than an order of magnitude in size.
+- Use a named 256 KiB source budget, based on the successful 16-suite probe.
+  A source larger than the budget forms a one-item group, and no item is
+  dropped or reordered. This is a resource policy, not a correctness
+  distinction.
+- Detect doctests only inside actual `---` docstring blocks. This keeps parser
+  fixtures containing escaped `doctests:` source text in the normal TestSuite
+  groups instead of silently compiling them through a separate path.
+- Re-evaluate the three currently isolated compiler typecheck declaration
+  suites. Keep isolation only when a focused regression demonstrates an
+  inherent process-level requirement and documents it next to the declaration.
+- Compile one run-all harness per source-work group and run each group's tests
+  in one process. Keep the grouping function pure and independent of OCaml
+  compiler state so it can move with test planning into Blorp.
+
+**Tests:**
+
+- Add a runtime regression with more than four modules whose globals contain
+  TestSuites and closure-valued test cases.
+- Cover successful initialization, an unused imported global, deterministic
+  cleanup, and a failing test that still exits cleanly.
+- Run the focused generated-harness tests under ASan, UBSan, and leak-check.
+- Assert in `test_test_runner.ml` that five small compatible suites remain one
+  group, ordering is stable, accumulated work respects the budget, and one
+  oversized source forms a one-item group.
+- Run the full `compiler/blorp/tests/` sweep before and after and compare phase
+  counts from P0.
+
+**Exit condition:** normal run-all coverage performs one graph build, one
+typecheck request, and one generated-C compile per explicit source-work or
+execution-isolation group. There is no arbitrary suite-count threshold and no
+path-specific workaround for the compiler test directory.
+
+**Expected impact:** the 94-suite compiler-owned sweep produces 10 source-work
+groups instead of roughly 24 four-suite groups. P3 and P4 must reduce graph
+duplication and representation lifetime before one whole-corpus group is a
+safe target. The actual speed claim uses the P0 records rather than the group
+count alone.
+
+**Verification and hardening:**
+
+- The normal 10-group sweep passed all 1,700 tests. The full ASan/UBSan sweep
+  also passed all 1,700 tests with the same group plan.
+- Sanitized phase totals were 117.464s for frontend graph construction, 0.010s
+  for graph finalization, 542.001s for graph typechecking, 19.614s for the
+  semantic middle, 343.033s for backend emission, 90.109s for host C, and
+  57.534s for execution. These totals are validation evidence, not a speed
+  baseline, because sanitizer instrumentation changes both compile and runtime
+  cost.
+- A healthy 23-suite sanitizer group takes about 43 seconds to execute on the
+  measured macOS ARM host. Compiler sanitizer gates therefore use a separate
+  named 60-second default rather than inheriting the ordinary 30-second test
+  timeout. `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` remains the explicit override.
+- The sanitizer sweep exposed a runtime teardown defect independent of grouping:
+  Apple ASan attempted to unmap each worker's malloc-backed alternate signal
+  stack at thread exit. ASan builds now rely on ASan's stack-overflow reporting
+  and do not register those worker signal stacks; ordinary and UBSan builds
+  retain Blorp's alternate-stack handler.
+- The expanded leak-check integration exposed ambient host mutation:
+  `run_test_infos` set `BLORP_LEAK_CHECK=strict` globally, contaminating later
+  compiler tests. Leak mode is now passed only to generated child processes,
+  and the regression asserts that the long-lived OCaml host environment is
+  unchanged.
+- `scripts/test compiler-unit-deep --serial --timings` passed all 343 tests after
+  the hardening fixes. This covers repeated test-runner use in one process and
+  the source-to-C pipeline callback surface.
+
+### P2. Index Name Candidates in the Compiler Environment
+
+**Goal:** remove expression-count times environment-size scans from inference
+without changing lookup precedence or overload behavior.
+
+**Current issue:** `CompilerScope` in
+`compiler/blorp/src/stage_05_types/compiler_env.brp` has an ordered symbol list
+and a latest-symbol dictionary. Exact lookup uses the dictionary, but
+`compiler_env_symbols_named`, `compiler_env_get_constructors`, and UFCS method
+lookup repeatedly scan every symbol in every scope. Whole-compiler graphs make
+those scans a material cost.
+
+**Implementation:**
+
+- Add a per-scope candidate index such as
+  `symbol_candidates_by_name: Dict[String, List[CompilerSymbol]]` while keeping
+  the ordered symbol list for deterministic enumeration.
+- Update `compiler_scope_add_symbol` once so the ordered list, latest-symbol
+  index, and candidate index cannot diverge.
+- Preserve current ordering exactly: innermost scope before outer scopes and
+  newest declaration before older declarations within one scope.
+- Rewrite these functions to start from indexed candidates:
+  - `compiler_env_symbols_named`
+  - `compiler_env_get_constructors`
+  - `compiler_env_lookup_function_ufcs_methods`
+  - `compiler_env_lookup_module_function_ufcs_methods`
+- Keep module, import, lexical, concrete-vs-generic, and declaration-order
+  ranking in their existing named policies. The index narrows candidates; it
+  must not decide semantic precedence.
+
+**Tests:**
+
+- Protect same-scope shadow history and latest-symbol lookup.
+- Cover lexical symbols shadowing explicit imports, explicit imports resolving
+  constructor collisions, constructors with the same name in several modules,
+  and concrete UFCS methods outranking generic methods.
+- Add deterministic counters or a compiler benchmark showing that a lookup
+  visits candidates for the requested name rather than all symbols. Do not put
+  wall-clock assertions in unit tests.
+- Re-run the compiler-oriented AST, symbols, inference, and full CLI-generation
+  benchmarks.
+
+**Exit condition:** no name-based candidate query performs an unconditional
+full scan of each scope. All precedence tests pass and P0 reports a measurable
+reduction in graph typecheck time or demonstrates that another phase dominates.
+
+Implement this after the P0/P1 checkpoint as a separate measured commit.
+
+### P3. Keep Generated-Test Frontend Work in Blorp
+
+**Goal:** stop the OCaml TestRunner from generating source and then re-entering
+the Blorp CLI/frontend through a second process and serialized module graph.
+
+**Target architecture:**
+
+1. Blorp discovers or receives the selected TestSuite modules.
+2. Blorp constructs the generated run-all module in memory and adds it to the
+   already loaded frontend graph.
+3. Lexing, parsing, module loading, graph finalization, and graph typechecking
+   remain one contiguous Blorp operation.
+4. One typed semantic-middle request crosses the transitional OCaml boundary.
+5. The Blorp backend emits C; the command compiles and executes the harness.
+
+**Implementation:**
+
+- Move the behavior of `generate_suite_selector_harness` and
+  `generate_suite_run_all_harness` from `compiler/lib/test_runner.ml` to the
+  Blorp test-command/compiler modules. Preserve deterministic module aliases,
+  test ordering, filtering, and source diagnostics.
+- Add an explicit in-memory module constructor to the Blorp module graph. A
+  generated module must have a real source identity and import edges; do not
+  infer generated status from a filename or source prefix.
+- Reuse the CLI graph built for the test command. Do not call
+  `Pipeline.compile_generated_test_harness` or
+  `compile_in_memory_source_with_blorp_bridge` for the normal path.
+- Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
+  then delete the superseded generation and bridge entry points once no
+  production caller remains.
+- Preserve one bridge: the typed semantic-middle request. Do not introduce a
+  test-only parser bridge or a second graph protocol.
+
+**Tests:**
+
+- Port selector, run-all, duplicate-name, filtering, diagnostics, and exit-code
+  regressions to Blorp-owned tests before deleting their OCaml equivalents.
+- Add an integration assertion from bridge statistics that one test command
+  performs one frontend graph construction and one semantic-middle request for
+  each explicit isolation group.
+- Compare generated Core and C for a representative harness before and after.
+- Verify source spans in failures still point to the user test module rather
+  than the generated harness wherever possible.
+
+**Exit condition:** the production `blorp test` path does not serialize a
+generated source string to an OCaml TestRunner and then invoke the Blorp
+frontend again. Deleted OCaml APIs have no test-only callers left behind.
+
+### P4. Reduce Graph Copies, Serialization, and Peak Retention
+
+**Goal:** after compile count is fixed, reduce the cost and memory footprint of
+the one remaining whole-compiler compile.
+
+**Implementation:**
+
+- Use P0 allocation and phase data to identify which graph representation is
+  simultaneously live at peak RSS: source, parsed modules, JSON projection,
+  decoded OCaml graph, typed graph, Core JSON, or generated C.
+- Release each phase-owned representation immediately after the next owner has
+  accepted it. Express ownership in phase-specific types or function
+  boundaries rather than setting unrelated fields to sentinels.
+- Stream module artifacts at existing protocol boundaries where the consumer
+  can process them incrementally. Do not retain a giant response tree merely
+  to split it into modules afterward.
+- Remove decode/re-encode cycles that cross no architectural ownership
+  boundary. Prefer deleting the transitional OCaml representation as the
+  Blorp footprint advances over optimizing its JSON parser in isolation.
+- Audit large `List.append` construction, repeated string concatenation, and
+  full-list `map` chains in graph projection and Core serialization. Use the
+  existing string builder and single-pass folds only where profiles show a
+  material producer cost.
+
+**Tests:**
+
+- Keep protocol roundtrip and malformed-input tests at every surviving bridge.
+- Add production-sized ownership/leak regressions under sanitizer gates.
+- Compare output hashes or normalized Core/C for representative compiler
+  inputs to prove that streaming and early release do not reorder artifacts.
+- Record peak RSS and per-phase request/response byte counts in the same
+  isolated benchmark used for P0.
+
+**Exit condition:** peak live representations are documented, avoidable graph
+copies are removed, and peak RSS falls materially from the isolated P0
+baseline without weakening diagnostics or deterministic output.
+
+### P5. Delete Superseded Work and Duplicate Coverage
+
+**Goal:** turn every boundary movement into less production and test code, not
+another permanent implementation layer.
+
+**Implementation:**
+
+- After P1-P4, run reference searches from the production CLI inward and list
+  OCaml functions with no production callers, then test-only callers, then
+  compatibility wrappers around removed paths.
+- Delete old generated-harness builders, old in-memory frontend bridge entry
+  points, redundant graph decoders, and tests that only assert substrings in
+  Blorp source.
+- Retain OCaml tests only for production OCaml responsibilities. Move behavior
+  tests to Blorp before deleting an implementation, then remove duplicated
+  OCaml assertions in the same change.
+- Review compiler Blorp tests for duplicate fixture coverage made unnecessary
+  by the unified run-all path. Prefer one semantic regression over several
+  transport-shape tests.
+- Update `docs/ARCHITECTURE.md`, the migration roadmap, and gate ownership in
+  `AGENTS.md` whenever a production boundary is deleted.
+
+**Tests:**
+
+- Run unused-code tooling and `rg` call-site audits for both OCaml and Blorp.
+- Run the focused owner gate after each deletion, then all normal gates before
+  combining the cleanup with later migration work.
+- Compare gate test counts and document every removed case as duplicate,
+  obsolete, or transferred. A lower count without that accounting is not a
+  performance result.
+
+**Exit condition:** no superseded API survives solely for its old tests, and
+the architecture documentation names only production paths that still exist.
+
+### P6. Consider Separate Compilation Only After Duplication Is Gone
+
+**Goal:** decide from evidence whether a stable compiler-library artifact is
+needed after P1-P5.
+
+Do not start here. Separate compilation adds artifact identity, ABI/versioning,
+linking, invalidation, diagnostics, and ownership questions. It is justified
+only if P0 still shows one unavoidable whole-compiler compile dominating the
+feedback loop after repeated harness compilation and environment scans are
+removed.
+
+If needed, scope it as an explicit compiler feature:
+
+- Define the typed/Core artifact boundary and content identity.
+- Compile stable compiler modules once per command invocation, not through a
+  hidden cross-run cache.
+- Compile only generated harness code against that artifact.
+- Validate deterministic linking, global initialization order, diagnostics,
+  sanitizer behavior, and bootstrap compatibility.
+
+**Exit condition:** either measurements reject separate compilation as needless
+complexity, or a separate design document establishes its semantics before
+implementation.
+
+### P7. Validate the New Feedback Loop
+
+Run these checkpoints in an otherwise idle checkout:
+
+1. `make`
+2. `scripts/test compiler-unit compiler --serial --timings --log-dir ...`
+3. `scripts/test compiler-deep --serial --timings --log-dir ...`
+4. `scripts/test compiler-blorp-sanitize --serial --log-dir ...`
+5. `scripts/test leak --serial --log-dir ...`
+6. The full normal and premerge gate sets.
+
+Report before/after values for graph builds, typecheck requests, generated C
+compiles, host C compiles, wall time, user CPU, and peak RSS. The first milestone
+is at least a 50% reduction in the compiler-owned Blorp portion of
+compiler-deep from the isolated P0 baseline. The prior approximately four-minute
+deep measurement is useful context, but not a hard target because the compiler
+surface and test count have grown.
+
+Do not claim a speedup from a warm cache, a contended baseline, fewer selected
+tests, or a run that skipped sanitizer/leak behavior required by its gate.
 
 ## Completed Slice
 
@@ -501,19 +947,21 @@ Compiler-unit deep verification after reusable typecheck-session coverage:
 
 ## Recommended Next Slice
 
-Continue with the next low-risk cleanup:
+Execute the recovery track in this order:
 
-1. Keep formatter/purify fixtures in `compiler-deep` until there is an
-   in-process or batched interface that reduces work instead of hiding it.
-2. Use `scripts/test compiler-unit-deep --timings --log-dir scratch/...` before
-   changing any remaining deep cases. Prefer narrowing duplicated fixture setup
-   over replacing end-to-end assertions with constants or mocks.
-3. The next compiler-build optimization should remove repeated parsing inside
-   the Blorp graph helper, but only after fixing and testing ownership of shared
-   importable-module values. Do not add an OCaml cache or a size-based fallback
-   around the defect.
-4. Consider a small explicit fast subset for codegen audit if local default
-   runs still need more reduction after the compiler-unit split.
+1. Retain the P0 timing log and P1 reproduction results as the comparison
+   baseline. Re-run the same isolated sweep after each whole-compiler change.
+2. Implement P2 as a separate measured commit. The candidate index is a
+   generally useful compiler improvement independent of test-harness policy.
+3. Move generated harness construction into the existing Blorp graph in P3.
+   Do not optimize or retain the transitional OCaml round trip.
+4. Use the new phase and memory data for P4, then delete superseded paths and
+   duplicate tests in P5.
+
+Keep formatter/purify fixtures in `compiler-deep` until an in-process or batched
+interface reduces actual work. Keep the codegen audit split explicit. Those
+remain valid gate-shaping improvements but are not the current 37-minute
+bottleneck.
 
 ## Success Metrics
 
@@ -526,3 +974,15 @@ Continue with the next low-risk cleanup:
 - Test summaries make it obvious which expensive coverage did or did not run.
 - Runtime/std tests do not contain broad nested compiler tests.
 - CLI smoke remains focused on public command behavior instead of corpus sweeps.
+- Compatible compiler-owned TestSuites compile in source-work groups; no group
+  exists because of suite count or a path-specific compiler workaround.
+- Timings expose graph-build, typecheck, semantic-middle, backend, host-C, and
+  execution counts and durations.
+- The normal test command builds each generated frontend graph once and crosses
+  the semantic-middle bridge once per explicit isolation group.
+- Name candidate lookup scales with matching candidates rather than all symbols
+  in every scope.
+- Peak compiler memory is measured and materially lower than the isolated P0
+  baseline after representation-lifetime work.
+- No speedup depends on skipping coverage, weakening assertions, or preserving
+  a superseded OCaml path solely for its tests.

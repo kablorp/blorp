@@ -20,6 +20,25 @@ type compile_result = {
 (** Frontend phases that run before Core lowering. *)
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
+type phase_timing_phase =
+  | InMemoryFrontendGraph
+  | FrontendGraphFinalize
+  | GraphTypecheck
+  | SemanticMiddle
+  | BackendEmission
+  | CorePipeline
+
+type phase_timing = {
+  timing_phase : phase_timing_phase;
+  duration_seconds : float;
+}
+(** One observed phase from a source-to-C compilation. These phases describe
+    the current architectural boundaries without introducing another compiler
+    pipeline or changing ownership. *)
+
+val phase_timing_name : phase_timing_phase -> string
+(** Stable machine-readable name for timing output. *)
+
 (** Source compilation outcome. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
     pipeline via [Core_pipeline.Stopped_after]. The pipeline boundary converts
@@ -158,6 +177,7 @@ val compile_preloaded_graph_with_blorp_bridge :
   ?on_stage_json:Core_pipeline.on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
   ?check_invariants:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
   filename:string ->
   preloaded_module_graph:Modules.preloaded_module_graph ->
   unit ->
@@ -176,6 +196,7 @@ val compile_in_memory_source_with_blorp_bridge :
   ?allow_debug_only_calls:bool ->
   ?retain_debug_blocks:bool ->
   ?embed_runtime:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
   filename:string ->
   source:string ->
   unit ->
@@ -189,6 +210,7 @@ val compile_generated_test_harness :
   ?allow_debug_only_calls:bool ->
   ?retain_debug_blocks:bool ->
   ?embed_runtime:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
   filename:string ->
   source:string ->
   unit ->

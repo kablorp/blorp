@@ -19,7 +19,7 @@ scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
 scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --coverage         # Compiler-unit coverage report
-scripts/test --timings          # Print slow compiler-unit/deep Alcotest cases
+scripts/test --timings          # Print unit cases and generated-suite phases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -38,6 +38,8 @@ pass-by-pass stream.
 Use `--timings` when investigating slow `compiler-unit` or
 `compiler-unit-deep` runs; the harness prints the slowest cases and stores
 stable `BLORP_COMPILER_UNIT_TIMING` records in logs saved with `--log-dir`.
+Generated TestSuite gates also report frontend, typecheck, Core, host-C, and
+execution phase totals.
 
 `scripts/test` also holds a per-worktree build lock for the duration of the
 gate. This keeps concurrent local invocations from racing on Dune build state,

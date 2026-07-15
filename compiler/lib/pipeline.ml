@@ -21,6 +21,83 @@ type compile_result = {
 
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
+type phase_timing_phase =
+  | InMemoryFrontendGraph
+  | FrontendGraphFinalize
+  | GraphTypecheck
+  | SemanticMiddle
+  | BackendEmission
+  | CorePipeline
+
+type phase_timing = {
+  timing_phase : phase_timing_phase;
+  duration_seconds : float;
+}
+
+let phase_timing_name = function
+  | InMemoryFrontendGraph -> "frontend_graph"
+  | FrontendGraphFinalize -> "frontend_finalize"
+  | GraphTypecheck -> "graph_typecheck"
+  | SemanticMiddle -> "semantic_middle"
+  | BackendEmission -> "backend_emission"
+  | CorePipeline -> "core_pipeline"
+
+let observe_phase_timing on_phase_timing timing_phase f =
+  match on_phase_timing with
+  | None -> f ()
+  | Some observe ->
+      let started_at = Unix.gettimeofday () in
+      Fun.protect f ~finally:(fun () ->
+          observe
+            {
+              timing_phase;
+              duration_seconds = Unix.gettimeofday () -. started_at;
+            })
+
+(* [Dce] is the production handoff from the OCaml-owned Core middle to the
+   Blorp-owned backend tail. Observe that existing boundary so timing continues
+   to describe compiler ownership as the migration advances. *)
+let observe_core_pipeline_timing on_phase_timing on_stage_event f =
+  match on_phase_timing with
+  | None -> f on_stage_event
+  | Some observe ->
+      let semantic_started_at = Unix.gettimeofday () in
+      let backend_started_at = ref None in
+      let finish_semantic_phase () =
+        match !backend_started_at with
+        | Some _ -> ()
+        | None ->
+            let boundary = Unix.gettimeofday () in
+            backend_started_at := Some boundary;
+            observe
+              {
+                timing_phase = SemanticMiddle;
+                duration_seconds = boundary -. semantic_started_at;
+              }
+      in
+      let observe_stage stage =
+        if stage = Core_stage.Dce then finish_semantic_phase ();
+        Option.iter (fun observe_stage_event -> observe_stage_event stage)
+          on_stage_event
+      in
+      Fun.protect
+        (fun () -> f (Some observe_stage))
+        ~finally:(fun () ->
+          let finished_at = Unix.gettimeofday () in
+          match !backend_started_at with
+          | None ->
+              observe
+                {
+                  timing_phase = SemanticMiddle;
+                  duration_seconds = finished_at -. semantic_started_at;
+                }
+          | Some started_at ->
+              observe
+                {
+                  timing_phase = BackendEmission;
+                  duration_seconds = finished_at -. started_at;
+                })
+
 let bridge_can_read_matching_source ~filename source =
   try
     Sys.file_exists filename
@@ -861,8 +938,8 @@ let typecheck_module_only ~filename ~source =
 
 let compile_typechecked_program ~source_kind ~retain_debug_blocks
     ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
-    ~program ~typed_program ~main_import_bindings () =
+    ?on_stage_json ?tail_observation_stages ~check_invariants ?on_phase_timing
+    ~filename ~program ~typed_program ~main_import_bindings () =
   let module_name = target_module_name filename in
   let import_errors =
     unused_import_errors ~scope:(Explicit_target { module_name; source_kind })
@@ -874,10 +951,13 @@ let compile_typechecked_program ~source_kind ~retain_debug_blocks
   else
     try
       let c_code, link_flags, include_dirs =
-        Core_pipeline.compile_typed_with_modules ~main_import_bindings
-          ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
-          ?on_stage_event ?on_stage_json ?tail_observation_stages
-          ~check_invariants typed_program
+        observe_phase_timing on_phase_timing CorePipeline (fun () ->
+            observe_core_pipeline_timing on_phase_timing on_stage_event
+              (fun observed_stage_event ->
+                Core_pipeline.compile_typed_with_modules ~main_import_bindings
+                  ~embed_runtime ~profile ~debug:retain_debug_blocks ?on_stage
+                  ?on_stage_event:observed_stage_event ?on_stage_json
+                  ?tail_observation_stages ~check_invariants typed_program))
       in
       Ok (Compiled { program; typed_program; c_code; link_flags; include_dirs })
     with
@@ -977,22 +1057,26 @@ let compile_preloaded_graph_impl ~source_kind ?(debug = false)
     ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?(check_invariants = false) ~filename ~preloaded_module_graph () =
+    ?(check_invariants = false) ?on_phase_timing ~filename
+    ~preloaded_module_graph () =
   let retain_debug_blocks = Option.value retain_debug_blocks ~default:debug in
   with_fresh_session filename (fun () ->
       let allow_debug_only_calls =
         Option.value allow_debug_only_calls ~default:debug
       in
-      match
-        typecheck_graph_with_blorp_bridge_policy ~debug
-          ~allow_debug_only_calls ~filename ~on_frontend_phase
-          ~preloaded_module_graph
-      with
+      let typecheck_result =
+        observe_phase_timing on_phase_timing GraphTypecheck (fun () ->
+            typecheck_graph_with_blorp_bridge_policy ~debug
+              ~allow_debug_only_calls ~filename ~on_frontend_phase
+              ~preloaded_module_graph)
+      in
+      match typecheck_result with
       | Error _ as error -> error
       | Ok result ->
           compile_typechecked_program ~source_kind ~retain_debug_blocks
             ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
-            ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
+            ?on_stage_json ?tail_observation_stages ~check_invariants
+            ?on_phase_timing ~filename
             ~program:result.blorp_bridge_source_program
             ~typed_program:result.blorp_bridge_typed_program
             ~main_import_bindings:result.blorp_bridge_import_bindings ())
@@ -1000,12 +1084,12 @@ let compile_preloaded_graph_impl ~source_kind ?(debug = false)
 let compile_preloaded_graph_with_blorp_bridge ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename
+    ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
     ~preloaded_module_graph () =
   compile_preloaded_graph_impl ~source_kind:User_source ?debug
     ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ?require_main
     ?profile ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename
+    ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
     ~preloaded_module_graph ()
 
 let compile_legacy_direct_source ?debug ?allow_debug_only_calls
@@ -1023,16 +1107,19 @@ let in_memory_source_module_name filename =
     String.sub basename 0 (String.length basename - 4)
   else basename
 
-let in_memory_source_frontend_graph ~filename ~source =
+let in_memory_source_frontend_graph ?on_phase_timing ~filename ~source () =
   let module_name = in_memory_source_module_name filename in
-  match
-    Compiler_blorp_bridge.cli_run_source_via_command ~path:filename ~module_name
-      ~text:source [ "compile"; "--no-format"; filename ]
-  with
+  let graph_result =
+    observe_phase_timing on_phase_timing InMemoryFrontendGraph (fun () ->
+        Compiler_blorp_bridge.cli_run_source_via_command ~path:filename
+          ~module_name ~text:source [ "compile"; "--no-format"; filename ])
+  in
+  match graph_result with
   | Error (_code, message) ->
       Error [ bridge_error ~filename ~phase:Ast.Parse message ]
   | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
-      Modules.finalize_cli_frontend_module_graph graph
+      observe_phase_timing on_phase_timing FrontendGraphFinalize (fun () ->
+          Modules.finalize_cli_frontend_module_graph graph)
   | Ok (Compiler_blorp_bridge.CliRunHandled result) ->
       let message =
         String.trim
@@ -1053,23 +1140,27 @@ let in_memory_source_frontend_graph ~filename ~source =
         ]
 
 let compile_in_memory_source_impl ~source_kind ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ~filename ~source () =
-  match in_memory_source_frontend_graph ~filename ~source with
+    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
+  let frontend_result =
+    in_memory_source_frontend_graph ?on_phase_timing ~filename ~source ()
+  in
+  match frontend_result with
   | Error _ as error -> error
   | Ok finalized ->
       compile_preloaded_graph_impl ~source_kind ?debug
         ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
+        ?on_phase_timing
         ~filename:finalized.Modules.finalized_root.preload_path
         ~preloaded_module_graph:finalized.finalized_preloaded_graph ()
 
 let compile_in_memory_source_with_blorp_bridge ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ~filename ~source () =
+    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
   compile_in_memory_source_impl ~source_kind:User_source ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ~filename ~source
-    ()
+    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
+    ?on_phase_timing ~filename ~source ()
 
 let compile_generated_test_harness ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ~filename ~source () =
+    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
   compile_in_memory_source_impl ~source_kind:Generated_test_harness ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ~filename ~source
-    ()
+    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
+    ?on_phase_timing ~filename ~source ()

@@ -18,7 +18,7 @@
 #   scripts/test compiler-unit compiler  # Multiple gates
 #   scripts/test --serial           # Run selected gates one at a time
 #   scripts/test --coverage         # Compiler-unit coverage report
-#   scripts/test --timings          # Print slow compiler-unit/inner-integration cases
+#   scripts/test --timings          # Print compiler-unit and generated-suite timings
 #   scripts/test --verbose          # Print every child-runner line
 #   scripts/test --log-dir logs     # Save premerge gate logs
 
@@ -61,7 +61,7 @@ usage() {
 Options:
   --serial       Run selected gates one at a time.
   --coverage     Run compiler-unit tests with coverage instrumentation.
-  --timings      Print slow compiler-unit and compiler-unit-deep cases.
+  --timings      Print compiler-unit cases and generated-suite phase timings.
   --verbose      Stream full child-runner output, including passing tests.
   --quiet        Suppress passing-test output (default).
   --log-dir DIR  Copy each gate's full captured output into DIR.
@@ -117,6 +117,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if $timings; then
+    export BLORP_TEST_TIMINGS=1
+    export BLORP_COMPILER_BRIDGE_STATS="${BLORP_COMPILER_BRIDGE_STATS:-1}"
+fi
+
 # Default: run the normal local confidence gates. The full generated-C audit is
 # available as compiler-deep and is included by scripts/premerge-gate.
 if [ ${#gates[@]} -eq 0 ]; then
@@ -129,6 +134,8 @@ fi
 
 default_test_timeout=30
 test_timeout="${BLORP_TEST_TIMEOUT:-$default_test_timeout}"
+default_compiler_sanitize_test_timeout=60
+compiler_sanitize_test_timeout="${BLORP_COMPILER_SANITIZE_TEST_TIMEOUT:-$default_compiler_sanitize_test_timeout}"
 runtime_roots=()
 for root in tests/test_blorp/*/; do
 	[ -d "$root" ] || continue
@@ -909,6 +916,41 @@ print_compiler_unit_timing_summary() {
     rm -f "$slow_file" "$timing_input"
 }
 
+print_blorp_test_timing_summary() {
+    local output_file="$1"
+
+    $timings || return 0
+    grep -q '^BLORP_TEST_TIMING ' "$output_file" || return 0
+
+    echo "Generated TestSuite phase totals:"
+    awk '
+        $1 == "BLORP_TEST_TIMING" {
+            phase = ""
+            duration = 0
+            for (i = 2; i <= NF; i++) {
+                split($i, field, "=")
+                if (field[1] == "phase") phase = field[2]
+                if (field[1] == "duration_ms") duration = field[2] + 0
+            }
+            if (phase != "") {
+                count[phase]++
+                total[phase] += duration
+            }
+        }
+        END {
+            phase_order = "discovery planning frontend_graph frontend_finalize graph_typecheck semantic_middle backend_emission core_pipeline pipeline host_c execution"
+            phase_count = split(phase_order, phases, " ")
+            for (i = 1; i <= phase_count; i++) {
+                phase = phases[i]
+                if (count[phase] > 0) {
+                    printf "  %-16s %4d calls  %9.3fs\n", phase, count[phase], total[phase] / 1000.0
+                }
+            }
+        }
+    ' "$output_file"
+    echo ""
+}
+
 print_failure_excerpt() {
     local gate="$1"
     local output_file="$2"
@@ -1014,7 +1056,7 @@ run_compiler_core_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_core_sanitize \
-        ./blorp test --no-format --no-cache --sanitize -j 1 --timeout "$test_timeout" \
+        ./blorp test --no-format --no-cache --sanitize -j 1 --timeout "$compiler_sanitize_test_timeout" \
         "${compiler_core_sanitize_roots[@]}"
 }
 
@@ -1023,7 +1065,7 @@ run_compiler_blorp_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_blorp_sanitize \
-        ./blorp test --no-format --no-cache --sanitize -j 1 --timeout "$test_timeout" compiler/blorp/tests/
+        ./blorp test --no-format --no-cache --sanitize -j 1 --timeout "$compiler_sanitize_test_timeout" compiler/blorp/tests/
 }
 
 run_compiler_deep_gate_commands() {
@@ -1185,6 +1227,7 @@ run_compiler_deep() {
     output=$(cat "$output_file")
     record_gate_log "compiler-deep" "$output_file"
     maybe_print_failure_excerpt "compiler-deep" "$output_file" "$exit_code"
+    print_blorp_test_timing_summary "$output_file"
     rm -f "$output_file"
     compiler_deep_seconds=$(elapsed_since "$start_seconds")
     echo ""
@@ -1225,6 +1268,7 @@ run_compiler_blorp_sanitize() {
     output=$(cat "$output_file")
     record_gate_log "compiler-blorp-sanitize" "$output_file"
     maybe_print_failure_excerpt "compiler-blorp-sanitize" "$output_file" "$exit_code"
+    print_blorp_test_timing_summary "$output_file"
     rm -f "$output_file"
     compiler_blorp_sanitize_seconds=$(elapsed_since "$start_seconds")
     echo ""
@@ -1574,6 +1618,11 @@ collect_gate_worker() {
     fi
     if [ -f "$outfile" ]; then
         print_compiler_unit_timing_summary "$gate" "$outfile"
+        case "$gate" in
+            compiler_deep|compiler_blorp_sanitize)
+                print_blorp_test_timing_summary "$outfile"
+                ;;
+        esac
     fi
 
     [ -f "$outfile" ] && local_output=$(cat "$outfile")

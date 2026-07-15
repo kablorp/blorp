@@ -13,6 +13,31 @@ type test_result = {
 }
 (** Result of running a single test *)
 
+type timing_phase =
+  | TestDiscovery
+  | HarnessPlanning
+  | HarnessPipeline
+  | HarnessFrontendGraph
+  | HarnessFrontendFinalize
+  | HarnessGraphTypecheck
+  | HarnessSemanticMiddle
+  | HarnessBackendEmission
+  | HarnessCorePipeline
+  | HarnessHostCCompile
+  | HarnessExecution
+
+type timing_event = {
+  timing_phase : timing_phase;
+  timing_group : string;
+  timing_suite_count : int;
+  timing_source_count : int;
+  timing_duration_ms : int;
+}
+(** Stable accounting event emitted by generated TestSuite compilation. *)
+
+val format_timing_event : timing_event -> string
+(** Format an event for logs consumed by [scripts/test --timings]. *)
+
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
@@ -96,6 +121,10 @@ val has_top_level_main_source : string -> bool
 (** True when source contains an actual top-level [func main(...)] declaration.
     This intentionally ignores generated-program snippets inside strings. *)
 
+val source_mentions_doctests : string -> bool
+(** True when a docstring block contains a [doctests:] section. Escaped source
+    snippets in parser tests do not make the containing file a doctest. *)
+
 (* ============================================================================
    Doctest extraction + loc remapping
 
@@ -177,9 +206,13 @@ val requires_process_isolation : string -> bool
 (** True when a test path is configured to stay out of aggregate run-all
     harnesses because it exercises process-global runtime state. *)
 
-val requires_compilation_isolation : string -> bool
-(** True only when a test path cannot safely share a compiled selector harness.
-    Execution isolation alone does not imply recompiling the test program. *)
+val group_by_source_size_budget :
+  max_source_bytes:int ->
+  source_size:('a -> int) ->
+  'a list ->
+  'a list list
+(** Partition items stably by accumulated source work. An item larger than the
+    budget forms a one-item group; no item is dropped or reordered. *)
 
 val source_text_matches_current_file : string -> string option -> bool
 (** True when cached source text, if supplied, still matches the current file

@@ -244,7 +244,7 @@ scripts/test cli                # CLI smoke and exit-code checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
 scripts/test --coverage         # Compiler-unit coverage report
-scripts/test --timings          # Print slow compiler-unit/deep Alcotest cases
+scripts/test --timings          # Print unit cases and generated-suite phases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -289,6 +289,8 @@ The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
 invocation and codegen-audit case to 30 seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler/runtime gates.
+Compiler sanitizer gates default to 60 seconds per generated test binary;
+`BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` overrides that measured ASan allowance.
 
 When preview examples are restored, list their exact check/run/format commands
 here. Do not gate preview on ignored `scratch/` files.

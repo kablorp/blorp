@@ -213,7 +213,7 @@ if [ "$compiler_blorp_sanitize_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fxq 'test --no-format --no-cache --sanitize -j 1 --timeout 30 compiler/blorp/tests/' "$compiler_blorp_sanitize_log"; then
+if ! grep -Fxq 'test --no-format --no-cache --sanitize -j 1 --timeout 60 compiler/blorp/tests/' "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp-sanitize should be uncached, sanitized, and sequential"
 	cat "$compiler_blorp_sanitize_output"
 	cat "$compiler_blorp_sanitize_log"
@@ -247,7 +247,7 @@ if [ "$compiler_core_sanitize_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_core_sanitize_command='test --no-format --no-cache --sanitize -j 1 --timeout 30 compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_dce.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_ffi_boundary.brp compiler/blorp/tests/test_compiler_core_flatten.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_list_layout.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_pipeline.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resolve.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp'
+expected_core_sanitize_command='test --no-format --no-cache --sanitize -j 1 --timeout 60 compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_dce.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_ffi_boundary.brp compiler/blorp/tests/test_compiler_core_flatten.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_list_layout.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_pipeline.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resolve.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp'
 if ! grep -Fxq "$expected_core_sanitize_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-core-sanitize should use the explicit uncached serial Core file set"
 	cat "$compiler_core_sanitize_output"
@@ -366,6 +366,89 @@ if ! grep -Fq '1.234s  SlowSuite.group :: case one' "$timing_output_file"; then
 fi
 
 echo "PASS: scripts/test prints compiler-unit timing summaries"
+
+mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
+cat > "$TMP_HARNESS/blorp" <<'SH'
+#!/usr/bin/env bash
+set -u
+
+if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
+	prepare_dir="${2:-}"
+	mkdir -p "$prepare_dir"
+	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=$prepare_dir/compiler_renderer_bridge.bin"
+	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=$prepare_dir/compiler_parser_bridge.bin"
+	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=$prepare_dir/compiler_typecheck_bridge.bin"
+	exit 0
+fi
+
+if [ "${1:-}" = "test" ]; then
+	if [ "${BLORP_TEST_TIMINGS:-}" != "1" ]; then
+		echo "missing BLORP_TEST_TIMINGS" >&2
+		exit 3
+	fi
+	if [ "${BLORP_COMPILER_BRIDGE_STATS:-}" != "1" ]; then
+		echo "missing BLORP_COMPILER_BRIDGE_STATS" >&2
+		exit 3
+	fi
+	echo "BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 duration_ms=1250"
+	echo "BLORP_TEST_TIMING phase=host_c group=run_all_0 suites=4 sources=4 duration_ms=250"
+	echo "Results: 1 passed, 0 failed (1 tests)"
+	echo "BLORP_GATE_RESULT gate=${BLORP_GATE_RESULT:-compiler_blorp_sanitize} status=PASS passed=1 failed=0 tests=1"
+	exit 0
+fi
+
+echo "unexpected fake blorp command: $*" >&2
+exit 2
+SH
+chmod +x "$TMP_HARNESS/blorp"
+
+generated_timing_output_file="$TMP_HARNESS/generated-timing-output.txt"
+generated_timing_log_dir="$TMP_HARNESS/generated-timing-logs"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test compiler-blorp-sanitize --serial --timings \
+			--log-dir "$generated_timing_log_dir"
+) > "$generated_timing_output_file" 2>&1
+generated_timing_status=$?
+
+if [ "$generated_timing_status" -ne 0 ]; then
+	echo "FAIL: scripts/test generated-suite timing run should pass"
+	cat "$generated_timing_output_file"
+	exit 1
+fi
+
+if ! grep -Fq 'Generated TestSuite phase totals:' "$generated_timing_output_file"; then
+	echo "FAIL: scripts/test should print generated-suite phase totals"
+	cat "$generated_timing_output_file"
+	exit 1
+fi
+
+if ! grep -Eq 'frontend_graph[[:space:]]+1 calls[[:space:]]+1\.250s' "$generated_timing_output_file"; then
+	echo "FAIL: scripts/test should aggregate generated frontend timing"
+	cat "$generated_timing_output_file"
+	exit 1
+fi
+
+if ! grep -Eq 'host_c[[:space:]]+1 calls[[:space:]]+0\.250s' "$generated_timing_output_file"; then
+	echo "FAIL: scripts/test should aggregate generated host-C timing"
+	cat "$generated_timing_output_file"
+	exit 1
+fi
+
+if ! grep -Fq \
+	'BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 duration_ms=1250' \
+	"$generated_timing_log_dir/compiler-blorp-sanitize.log"; then
+	echo "FAIL: scripts/test should preserve raw generated-suite timings in gate logs"
+	cat "$generated_timing_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test prints generated-suite phase timing summaries"
 
 cat > "$TMP_HARNESS/bin/dune" <<'SH'
 #!/usr/bin/env bash

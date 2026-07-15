@@ -20766,10 +20766,18 @@ static void* __blorp_worker(void* arg) {
     long worker_id = worker_arg->worker_id;
     __blorp_current_worker_id = worker_id;
     // Set up per-thread alternate signal stack for fiber overflow detection
+    // outside ASan. Apple ASan treats a registered malloc-backed signal stack
+    // as a mapping it owns and aborts while trying to unmap it at thread exit;
+    // ASan already supplies its own stack-overflow diagnostics.
+#if defined(BLORP_ASAN)
+    char* alt_stack = NULL;
+#else
     char* alt_stack = (char*)malloc(SIGSTKSZ);
+#endif
+    bool alt_stack_installed = false;
     if (alt_stack) {
         stack_t ss = { .ss_sp = alt_stack, .ss_size = SIGSTKSZ, .ss_flags = 0 };
-        sigaltstack(&ss, NULL);
+        alt_stack_installed = sigaltstack(&ss, NULL) == 0;
     }
     while (1) {
         // Phase 1: Drain expired timers into run queue
@@ -20901,7 +20909,7 @@ static void* __blorp_worker(void* arg) {
                     &__fiber_runnable_count, memory_order_acquire) > 0) {
                 continue;
             }
-            return NULL;
+            break;
         }
 
         if (__fibers_initialized &&
@@ -20933,6 +20941,18 @@ static void* __blorp_worker(void* arg) {
         }
         pthread_mutex_unlock(&pool->queue_lock);
     }
+    if (alt_stack_installed) {
+        // Alternate signal stacks are thread-owned. Disable this one on its
+        // worker before releasing the backing allocation; leaving it installed
+        // makes sanitizer thread teardown treat freed memory as a live stack.
+        stack_t disabled = { .ss_flags = SS_DISABLE };
+        if (sigaltstack(&disabled, NULL) != 0) {
+            // Keep the backing allocation alive if unregistering fails; freeing
+            // memory still registered as this thread's signal stack is unsafe.
+            return NULL;
+        }
+    }
+    free(alt_stack);
     return NULL;
 }
 

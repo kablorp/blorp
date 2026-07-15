@@ -622,14 +622,39 @@ let test_blorp_bridge_compile_uses_in_memory_source () =
           in
           write_file main_path
             "func main(args: List[String]) -> Int:\n    missing_name\n";
+          let observed_timings = ref [] in
+          let on_phase_timing timing =
+            observed_timings := timing :: !observed_timings
+          in
           match
             Pipeline.compile_in_memory_source_with_blorp_bridge
-              ~embed_runtime:false ~filename:main_path ~source:supplied_source ()
+              ~embed_runtime:false ~on_phase_timing ~filename:main_path
+              ~source:supplied_source ()
           with
           | Ok (Pipeline.Compiled { c_code; _ }) ->
               Alcotest.(check bool)
                 "generated C comes from supplied source" true
-                (contains c_code "blorp_main")
+                (contains c_code "blorp_main");
+              let timings = List.rev !observed_timings in
+              Alcotest.(check (list string))
+                "reports each in-memory compile phase"
+                [
+                  "frontend_graph";
+                  "frontend_finalize";
+                  "graph_typecheck";
+                  "semantic_middle";
+                  "backend_emission";
+                  "core_pipeline";
+                ]
+                (List.map
+                   (fun timing ->
+                     Pipeline.phase_timing_name timing.Pipeline.timing_phase)
+                   timings);
+              Alcotest.(check bool)
+                "phase durations are nonnegative" true
+                (List.for_all
+                   (fun timing -> timing.Pipeline.duration_seconds >= 0.0)
+                   timings)
           | Ok (Pipeline.Stopped_at _) ->
               Alcotest.fail
                 "in-memory Blorp bridge compile unexpectedly stopped early"

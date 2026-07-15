@@ -62,7 +62,15 @@ let source_declares_testsuite source =
   || contains_substring source "tests:TestSuite"
 
 let source_mentions_doctests source =
-  contains_substring source "---" && contains_substring source "doctests:"
+  let rec scan in_docstring = function
+    | [] -> false
+    | line :: rest -> (
+        match String.trim line with
+        | "---" -> scan (not in_docstring) rest
+        | "doctests:" when in_docstring -> true
+        | _ -> scan in_docstring rest)
+  in
+  scan false (String.split_on_char '\n' source)
 
 (** Get current time in seconds *)
 let get_time () = Unix.gettimeofday ()
@@ -916,6 +924,74 @@ type test_result = {
 }
 (** Result of running a single test *)
 
+type timing_phase =
+  | TestDiscovery
+  | HarnessPlanning
+  | HarnessPipeline
+  | HarnessFrontendGraph
+  | HarnessFrontendFinalize
+  | HarnessGraphTypecheck
+  | HarnessSemanticMiddle
+  | HarnessBackendEmission
+  | HarnessCorePipeline
+  | HarnessHostCCompile
+  | HarnessExecution
+
+type timing_event = {
+  timing_phase : timing_phase;
+  timing_group : string;
+  timing_suite_count : int;
+  timing_source_count : int;
+  timing_duration_ms : int;
+}
+
+let timing_phase_name = function
+  | TestDiscovery -> "discovery"
+  | HarnessPlanning -> "planning"
+  | HarnessPipeline -> "pipeline"
+  | HarnessFrontendGraph -> "frontend_graph"
+  | HarnessFrontendFinalize -> "frontend_finalize"
+  | HarnessGraphTypecheck -> "graph_typecheck"
+  | HarnessSemanticMiddle -> "semantic_middle"
+  | HarnessBackendEmission -> "backend_emission"
+  | HarnessCorePipeline -> "core_pipeline"
+  | HarnessHostCCompile -> "host_c"
+  | HarnessExecution -> "execution"
+
+let format_timing_event event =
+  Printf.sprintf
+    "BLORP_TEST_TIMING phase=%s group=%s suites=%d sources=%d duration_ms=%d"
+    (timing_phase_name event.timing_phase)
+    event.timing_group event.timing_suite_count event.timing_source_count
+    event.timing_duration_ms
+
+let timings_enabled () =
+  match Sys.getenv_opt "BLORP_TEST_TIMINGS" with
+  | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+  | _ -> false
+
+let milliseconds elapsed_seconds =
+  max 0 (int_of_float ((elapsed_seconds *. 1000.0) +. 0.5))
+
+let emit_timing_event event =
+  if timings_enabled () then
+    Printf.eprintf "%s\n%!" (format_timing_event event)
+
+let record_timed_operation ~timing_phase ~timing_group ~timing_suite_count
+    ~timing_source_count operation =
+  if not (timings_enabled ()) then operation ()
+  else
+    let started_at = get_time () in
+    Fun.protect operation ~finally:(fun () ->
+        emit_timing_event
+          {
+            timing_phase;
+            timing_group;
+            timing_suite_count;
+            timing_source_count;
+            timing_duration_ms = milliseconds (get_time () -. started_at);
+          })
+
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
@@ -934,28 +1010,8 @@ let normalized_relative_test_path filename =
 let path_under root path =
   path = root || starts_with path (root ^ Filename.dir_sep)
 
-let compiler_module_init_isolated_suite_paths =
-  [
-    (* This Blorp compiler suite imports compiler_infer as part of second-pass
-       body checking. When the generated run-all harness imports it before the
-       compiler_infer suite, the current module-init path can exit before
-	       main. Keep this file out of run-all batching until that harness/module
-	       initialization issue is fixed. *)
-	    "compiler/blorp/tests/test_compiler_typecheck_decl.brp";
-	    (* Impl-declaration tests exercise the same declaration-checker import
-	       graph and can fail in a combined run-all harness with neighboring
-	       typecheck-state/typecheck-types suites. *)
-	    "compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp";
-	    (* This suite shares the typecheck declaration path above and can exit
-	       before main when imported in the same run-all harness as neighboring
-	       typecheck-state tests. Run it through the ordinary one-file wrapper so
-       module initialization is scoped to the test that needs it. *)
-    "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp";
-  ]
-
 let process_isolated_suite_roots =
-  compiler_module_init_isolated_suite_paths
-  @ [ "tests/test_blorp/concurrency"; "tests/test_blorp/sys" ]
+  [ "tests/test_blorp/concurrency"; "tests/test_blorp/sys" ]
 
 let filesystem_isolated_suite_roots = [ "tests/test_blorp/memory" ]
 
@@ -963,13 +1019,6 @@ type test_execution_isolation =
   | SharedTestProcess
   | FreshTestProcess of string
   | FreshTestFilesystem of string
-
-type test_compilation_isolation =
-  | SharedTestCompilation
-  | SeparateTestCompilation
-
-let path_matches_any roots path =
-  List.exists (fun root -> path_under root path) roots
 
 let matching_root roots path = List.find_opt (fun root -> path_under root path) roots
 
@@ -982,12 +1031,6 @@ let execution_isolation filename =
       | Some root -> FreshTestProcess root
       | None -> SharedTestProcess)
 
-let compilation_isolation filename =
-  let path = normalized_relative_test_path filename in
-  if path_matches_any compiler_module_init_isolated_suite_paths path then
-    SeparateTestCompilation
-  else SharedTestCompilation
-
 let requires_process_isolation filename =
   match execution_isolation filename with
   | SharedTestProcess -> false
@@ -998,9 +1041,6 @@ let requires_filesystem_isolation filename =
   | FreshTestFilesystem _ -> true
   | SharedTestProcess | FreshTestProcess _ -> false
 
-let requires_compilation_isolation filename =
-  compilation_isolation filename = SeparateTestCompilation
-
 type test_file_info = {
   test_file_path : string;
   test_file_source : string;
@@ -1009,7 +1049,6 @@ type test_file_info = {
   test_file_is_leak_baseline_program : bool;
   test_file_has_doctests : bool;
   test_file_execution_isolation : test_execution_isolation;
-  test_file_compilation_isolation : test_compilation_isolation;
 }
 
 let leak_baseline_root = "tests/test_blorp/memory/leak_check_baselines"
@@ -1028,10 +1067,16 @@ let classify_test_file filename =
     test_file_is_leak_baseline_program = is_leak_baseline_program filename;
     test_file_has_doctests = source_mentions_doctests source;
     test_file_execution_isolation = execution_isolation filename;
-    test_file_compilation_isolation = compilation_isolation filename;
   }
 
 let isolated_test_environment cwd = [ ("TMPDIR", cwd) ]
+
+let test_process_environment ?cwd ~leak_check () =
+  let filesystem_environment =
+    match cwd with Some dir -> isolated_test_environment dir | None -> []
+  in
+  if leak_check then ("BLORP_LEAK_CHECK", "strict") :: filesystem_environment
+  else filesystem_environment
 
 let isolated_test_cwd filename =
   run_artifact_dir ~kind:"isolated-filesystems"
@@ -1879,6 +1924,22 @@ let collect_test_file_infos ~leak_check paths =
   in
   List.fold_right (fun path acc -> infos_for_path path @ acc) paths []
 
+let collect_test_file_infos_timed ~leak_check paths =
+  if not (timings_enabled ()) then collect_test_file_infos ~leak_check paths
+  else
+    let started_at = get_time () in
+    let infos = collect_test_file_infos ~leak_check paths in
+    emit_timing_event
+      {
+        timing_phase = TestDiscovery;
+        timing_group = "all";
+        timing_suite_count =
+          List.length (List.filter (fun info -> info.test_file_is_suite) infos);
+        timing_source_count = List.length infos;
+        timing_duration_ms = milliseconds (get_time () -. started_at);
+      };
+    infos
+
 (* ============================================================================
    Test Wrapper Generation
    ============================================================================ *)
@@ -2285,11 +2346,7 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
                 if isolate_filesystem then Some (isolated_test_cwd filename)
                 else None
               in
-              let env =
-                match cwd with
-                | Some dir -> isolated_test_environment dir
-                | None -> []
-              in
+              let env = test_process_environment ?cwd ~leak_check () in
               let result, output =
                 run_process_capture_timeout ?cwd ~env ~timeout bin_file []
               in
@@ -2518,17 +2575,45 @@ let print_test_start ?worker file =
   | Some id -> Printf.eprintf "RUN[%d]: %s\n%!" id file
   | None -> Printf.eprintf "RUN: %s\n%!" file
 
+let harness_timing_phase = function
+  | Pipeline.InMemoryFrontendGraph -> HarnessFrontendGraph
+  | Pipeline.FrontendGraphFinalize -> HarnessFrontendFinalize
+  | Pipeline.GraphTypecheck -> HarnessGraphTypecheck
+  | Pipeline.SemanticMiddle -> HarnessSemanticMiddle
+  | Pipeline.BackendEmission -> HarnessBackendEmission
+  | Pipeline.CorePipeline -> HarnessCorePipeline
+
 let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?precompiled ~harness_label ~filename_base source =
+    ?sanitizer_mode ?precompiled ~timing_group ~suite_count ~harness_label
+    ~filename_base source =
   Modules.full_reset ();
   let cwd = Sys.getcwd () in
   init_module_paths cwd;
   let filename = Filename.concat cwd filename_base in
   let embed_runtime = Option.is_none precompiled in
-  match
-    Pipeline.compile_generated_test_harness ~debug ~allow_debug_only_calls:true
-      ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
-  with
+  let on_phase_timing =
+    if timings_enabled () then
+      Some
+        (fun timing ->
+          emit_timing_event
+            {
+              timing_phase = harness_timing_phase timing.Pipeline.timing_phase;
+              timing_group;
+              timing_suite_count = suite_count;
+              timing_source_count = suite_count;
+              timing_duration_ms = milliseconds timing.duration_seconds;
+            })
+    else None
+  in
+  let pipeline_result =
+    record_timed_operation ~timing_phase:HarnessPipeline ~timing_group
+      ~timing_suite_count:suite_count ~timing_source_count:suite_count
+      (fun () ->
+        Pipeline.compile_generated_test_harness ~debug
+          ~allow_debug_only_calls:true ~retain_debug_blocks:true ~embed_runtime
+          ?on_phase_timing ~filename ~source ())
+  in
+  match pipeline_result with
   | Error errors ->
       Error (format_pipeline_errors ~file:("<" ^ harness_label ^ ">") errors)
   | Ok (Pipeline.Stopped_at _) -> assert false
@@ -2539,7 +2624,11 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
         cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize
           ?sanitizer_mode ~link_flags ()
       in
-      let cc_result, cc_output = compile_c_from_stdin c_code bin_file cc_args in
+      let cc_result, cc_output =
+        record_timed_operation ~timing_phase:HarnessHostCCompile ~timing_group
+          ~timing_suite_count:suite_count ~timing_source_count:suite_count
+          (fun () -> compile_c_from_stdin c_code bin_file cc_args)
+      in
       if cc_result = 0 then Ok bin_file
       else
         let detail =
@@ -2552,30 +2641,34 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
         Error detail
 
 let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?precompiled ?(leak_check = false) files =
+    ?sanitizer_mode ?precompiled ?(leak_check = false) ~timing_group files =
   compile_suite_harness_source ~debug ~sanitize ?sanitizer_mode ?precompiled
+    ~timing_group ~suite_count:(List.length files)
     ~harness_label:"suite-selector-harness"
     ~filename_base:"__suite_selector_harness__.brp"
     (generate_suite_selector_harness ~leak_check files)
 
 let compile_suite_run_all_harness ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?precompiled files =
+    ?sanitizer_mode ?precompiled ~timing_group files =
   compile_suite_harness_source ~debug ~sanitize ?sanitizer_mode ?precompiled
+    ~timing_group ~suite_count:(List.length files)
     ~harness_label:"suite-run-all-harness"
     ~filename_base:"__suite_run_all_harness__.brp"
     (generate_suite_run_all_harness files)
 
-let run_suite_selector_case ~cwd ~timeout ~bin_file ~file ~index =
+let run_suite_selector_case ~cwd ~leak_check ~timeout ~bin_file ~file ~index
+    ~timing_group ~suite_count =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     { file; passed; duration = get_time () -. start_time; output; error_detail }
   in
-  let env =
-    match cwd with Some dir -> isolated_test_environment dir | None -> []
-  in
+  let env = test_process_environment ?cwd ~leak_check () in
   let result, output =
-    run_process_capture_timeout ?cwd ~env ~timeout bin_file
-      [ string_of_int index ]
+    record_timed_operation ~timing_phase:HarnessExecution ~timing_group
+      ~timing_suite_count:suite_count ~timing_source_count:suite_count
+      (fun () ->
+        run_process_capture_timeout ?cwd ~env ~timeout bin_file
+          [ string_of_int index ])
   in
   if result = 0 then make_result ~output true
   else if result = 99 then
@@ -2667,7 +2760,7 @@ let suite_run_all_results_from_output ~elapsed files output =
       (List.init expected_count (fun index ->
            Hashtbl.find results_by_index index))
 
-let run_suite_run_all_case ~timeout ~bin_file ~files =
+let run_suite_run_all_case ~timeout ~bin_file ~files ~timing_group =
   let start_time = get_time () in
   let make_harness_result ?(output = "") ?(error_detail = "") passed =
     [
@@ -2681,7 +2774,10 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
     ]
   in
   let result, output =
-    run_process_capture_timeout ~timeout bin_file []
+    record_timed_operation ~timing_phase:HarnessExecution ~timing_group
+      ~timing_suite_count:(List.length files)
+      ~timing_source_count:(List.length files) (fun () ->
+        run_process_capture_timeout ~timeout bin_file [])
   in
   let elapsed = get_time () -. start_time in
   match result with
@@ -2728,30 +2824,36 @@ let suite_run_all_eligible_info ~leak_check mode info =
   (not leak_check)
   && suite_selector_eligible_info mode info
   && info.test_file_execution_isolation = SharedTestProcess
-  && info.test_file_compilation_isolation = SharedTestCompilation
 
-(* Keep combined TestSuite harnesses below the size where module initialization
-   and process-exit cleanup can fail before or after all suites pass. Four is
-   the largest currently-safe batch for the compiler-owned Blorp suites while
-   still avoiding one compile per small suite. *)
-let run_all_suite_batch_size = 4
+(* Generated compiler TestSuites vary by more than an order of magnitude in
+   source size, so suite count is not a meaningful compile-work boundary. This
+   budget keeps the measured frontend graph for an ordinary group near the
+   successful 16-suite/232 KiB probe while allowing any single larger suite to
+   compile on its own. Harness planning will move with the test command into
+   Blorp; keeping this policy as a pure source-work partition makes that move
+   mechanical. *)
+let combined_harness_source_budget_bytes = 256 * 1024
 
-let chunk_by_count size items =
-  let rec take remaining count taken =
-    if count = 0 then (List.rev taken, remaining)
-    else
-      match remaining with
-      | [] -> (List.rev taken, [])
-      | item :: rest -> take rest (count - 1) (item :: taken)
+let group_by_source_size_budget ~max_source_bytes ~source_size items =
+  if max_source_bytes <= 0 then
+    invalid_arg "group_by_source_size_budget requires a positive budget";
+  let finish_group groups current =
+    match current with [] -> groups | _ -> List.rev current :: groups
   in
-  let rec loop remaining chunks =
-    match remaining with
-    | [] -> List.rev chunks
-    | _ ->
-        let chunk, rest = take remaining size [] in
-        loop rest (chunk :: chunks)
+  let rec loop groups current current_size = function
+    | [] -> List.rev (finish_group groups current)
+    | item :: rest ->
+        let item_size = max 0 (source_size item) in
+        if
+          current = []
+          || (current_size <= max_source_bytes
+             && item_size <= max_source_bytes - current_size)
+        then
+          loop groups (item :: current) (current_size + item_size) rest
+        else
+          loop (List.rev current :: groups) [ item ] item_size rest
   in
-  loop items []
+  loop [] [] 0 items
 
 let selector_compilation_groups infos =
   let groups = Hashtbl.create 4 in
@@ -2936,20 +3038,34 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
     ?(sanitize = false) ?sanitizer_mode ?precompiled ?(leak_check = false)
     ?(mode = TestAll) ~timeout infos =
   let files = List.map (fun info -> info.test_file_path) infos in
-  let run_all_infos =
-    List.filter (suite_run_all_eligible_info ~leak_check mode) infos
-  in
-  let run_all_files = List.map (fun info -> info.test_file_path) run_all_infos in
-  let selector_infos =
-    List.filter
-      (fun info ->
-        suite_selector_eligible_info mode info
-        && not (List.mem info.test_file_path run_all_files)
-        && info.test_file_compilation_isolation = SharedTestCompilation)
-      infos
-  in
-  let selector_files =
-    List.map (fun info -> info.test_file_path) selector_infos
+  let run_all_groups, run_all_files, selector_infos, selector_files =
+    record_timed_operation ~timing_phase:HarnessPlanning ~timing_group:"all"
+      ~timing_suite_count:
+        (List.length (List.filter (fun info -> info.test_file_is_suite) infos))
+      ~timing_source_count:(List.length infos) (fun () ->
+        let run_all_infos =
+          List.filter (suite_run_all_eligible_info ~leak_check mode) infos
+        in
+        let run_all_files =
+          List.map (fun info -> info.test_file_path) run_all_infos
+        in
+        let run_all_groups =
+          group_by_source_size_budget
+            ~max_source_bytes:combined_harness_source_budget_bytes
+            ~source_size:(fun info -> String.length info.test_file_source)
+            run_all_infos
+        in
+        let selector_infos =
+          List.filter
+            (fun info ->
+              suite_selector_eligible_info mode info
+              && not (List.mem info.test_file_path run_all_files))
+            infos
+        in
+        let selector_files =
+          List.map (fun info -> info.test_file_path) selector_infos
+        in
+        (run_all_groups, run_all_files, selector_infos, selector_files))
   in
   if List.length run_all_files < 2 && List.length selector_files < 2 then None
   else begin
@@ -2980,14 +3096,17 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
         }
     in
     let run_all_combined () =
-      run_all_files
-      |> chunk_by_count run_all_suite_batch_size
-      |> List.iter (fun batch ->
-          if List.length batch >= 2 then begin
+      run_all_groups
+      |> List.iteri (fun batch_index batch_infos ->
+          let batch =
+            List.map (fun info -> info.test_file_path) batch_infos
+          in
+          if batch <> [] then begin
+            let timing_group = Printf.sprintf "run_all_%d" batch_index in
             mark_handled batch;
             match
               compile_suite_run_all_harness ~debug ~sanitize ?sanitizer_mode
-                ?precompiled batch
+                ?precompiled ~timing_group batch
             with
             | Error detail ->
                 Printf.eprintf "Combined run-all test compile failed:\n%s\n%!"
@@ -2999,7 +3118,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
                   ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
                   (fun () ->
                     record_results
-                      (run_suite_run_all_case ~timeout ~bin_file ~files:batch))
+                      (run_suite_run_all_case ~timeout ~bin_file ~files:batch
+                         ~timing_group))
           end)
     in
     let run_selector_combined () =
@@ -3007,16 +3127,17 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
         if leak_check then [ selector_infos ]
         else selector_compilation_groups selector_infos
       in
-      List.iter
-        (fun batch_infos ->
+      List.iteri
+        (fun batch_index batch_infos ->
           if List.length batch_infos >= 2 then begin
+            let timing_group = Printf.sprintf "selector_%d" batch_index in
             let batch_files =
               List.map (fun info -> info.test_file_path) batch_infos
             in
             mark_handled batch_files;
             match
               compile_suite_selector_harness ~debug ~sanitize ?sanitizer_mode
-                ?precompiled ~leak_check batch_files
+                ?precompiled ~leak_check ~timing_group batch_files
             with
             | Error detail ->
                 Printf.eprintf
@@ -3042,8 +3163,9 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
                           else None
                         in
                         record_result
-                          (run_suite_selector_case ~cwd ~timeout ~bin_file ~file
-                             ~index))
+                          (run_suite_selector_case ~cwd ~leak_check ~timeout
+                             ~bin_file ~file ~index ~timing_group
+                             ~suite_count:(List.length batch_infos)))
                       batch_infos)
           end)
         batches
@@ -3246,8 +3368,6 @@ let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
       let files = List.map (fun info -> info.test_file_path) test_infos in
       (* Warn if std/ sources are newer than the compiler binary *)
       check_stale_std ();
-      (* Set leak check env var at top level — inherited by forked workers *)
-      if leak_check then Unix.putenv "BLORP_LEAK_CHECK" "strict";
       (* Disable test result caching if --no-cache or if leak_check/sanitize
        (these change behavior without changing source files) *)
       let repeat = max 1 repeat in
@@ -3295,10 +3415,11 @@ let run_tests ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(cache = true) ?(repeat = 1) path =
   run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
     ~timeout ~jobs ~cache ~repeat
-    (collect_test_file_infos ~leak_check [ path ])
+    (collect_test_file_infos_timed ~leak_check [ path ])
 
 let run_tests_paths ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
     ?(cache = true) ?(repeat = 1) paths =
   run_test_infos ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
-    ~timeout ~jobs ~cache ~repeat (collect_test_file_infos ~leak_check paths)
+    ~timeout ~jobs ~cache ~repeat
+    (collect_test_file_infos_timed ~leak_check paths)

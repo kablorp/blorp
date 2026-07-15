@@ -30,7 +30,7 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --coverage         # compiler-unit coverage
-scripts/test --timings          # print slow compiler-unit/deep Alcotest cases
+scripts/test --timings          # print unit cases and generated-suite phases
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
@@ -39,6 +39,9 @@ excerpts and can save full logs with `--log-dir`.
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.
+With `compiler-deep` and `compiler-blorp-sanitize`, it also records generated
+TestSuite frontend, typecheck, Core, host-C, and execution phases and prints
+their totals.
 After setup, multiple selected gates run in fixed waves by default:
 
 ```text
@@ -61,6 +64,8 @@ Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
+- `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
+  timeout (default 60 seconds, reflecting measured ASan overhead).
 - In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.

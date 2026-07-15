@@ -45,6 +45,29 @@ tests: TestSuite = {
     "comment main ignored" false
     (Blorp.Test_runner.has_top_level_main_source source)
 
+let test_doctest_detection_requires_a_docstring_block () =
+  let actual_doctest =
+    {|
+---
+Examples.
+
+doctests:
+    :: returns true
+    True
+---
+pure func documented() -> Bool: True
+|}
+  in
+  let parser_fixture =
+    {|program_source: String = "---\nExamples.\n\ndoctests:\n    :: true\n    True\n---"|}
+  in
+  Alcotest.(check bool)
+    "docstring doctests detected" true
+    (Blorp.Test_runner.source_mentions_doctests actual_doctest);
+  Alcotest.(check bool)
+    "escaped parser fixture is not a doctest" false
+    (Blorp.Test_runner.source_mentions_doctests parser_fixture)
+
 let test_sanitizer_mode_parsing () =
   let open Blorp.Test_runner in
   let check label input expected =
@@ -746,6 +769,22 @@ let test_suite_run_all_harness_calls_generated_functions () =
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
 
+let test_timing_event_has_stable_machine_readable_format () =
+  let event : Blorp.Test_runner.timing_event =
+    {
+      timing_phase = HarnessFrontendGraph;
+      timing_group = "run_all_0";
+      timing_suite_count = 4;
+      timing_source_count = 4;
+      timing_duration_ms = 1234;
+    }
+  in
+  Alcotest.(check string)
+    "timing record"
+    "BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 \
+     duration_ms=1234"
+    (Blorp.Test_runner.format_timing_event event)
+
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
   Alcotest.(check bool)
@@ -775,40 +814,32 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
     "system resource suites are process isolated" true
     (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/sys/test_file_resource.brp");
-	  Alcotest.(check bool)
-	    "compiler resource declaration suite is process isolated" true
-	    (Blorp.Test_runner.requires_process_isolation
-	       "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp");
-	  Alcotest.(check bool)
-	    "compiler impl declaration suite is process isolated" true
-	    (Blorp.Test_runner.requires_process_isolation
-	       "compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp");
-	  Alcotest.(check bool)
-	    "ordinary type suite is not process isolated" false
-	    (Blorp.Test_runner.requires_process_isolation
-       "tests/test_blorp/types/test_bool.brp")
-
-let test_execution_isolation_does_not_force_separate_compilation () =
   Alcotest.(check bool)
-    "concurrency suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/concurrency/test_list_concurrent.brp");
-  Alcotest.(check bool)
-    "memory suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/memory/test_memstats_observability.brp");
-  Alcotest.(check bool)
-    "system suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/sys/test_file_resource.brp");
-  Alcotest.(check bool)
-    "known compiler module-init conflict compiles separately" true
-    (Blorp.Test_runner.requires_compilation_isolation
+    "compiler declaration suites are not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
        "compiler/blorp/tests/test_compiler_typecheck_decl.brp");
   Alcotest.(check bool)
-    "ordinary suites share a compiled harness" false
-    (Blorp.Test_runner.requires_compilation_isolation
+    "ordinary type suite is not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
+
+let test_compilation_groups_follow_source_budget_not_suite_count () =
+  let five_small_suites = [ "a"; "b"; "c"; "d"; "e" ] in
+  Alcotest.(check (list (list string)))
+    "five small suites remain one group" [ five_small_suites ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:5
+       ~source_size:(fun _ -> 1) five_small_suites);
+  Alcotest.(check (list (list string)))
+    "groups preserve order and respect accumulated source size"
+    [ [ "a" ]; [ "b"; "c" ] ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:100
+       ~source_size:(function "a" -> 40 | "b" -> 70 | _ -> 20)
+       [ "a"; "b"; "c" ]);
+  Alcotest.(check (list (list string)))
+    "one oversized suite forms its own group" [ [ "large" ]; [ "small" ] ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:100
+       ~source_size:(function "large" -> 150 | _ -> 10)
+       [ "large"; "small" ])
 
 let test_source_text_cache_guard_uses_current_file_contents () =
   with_temp_dir "blorp-source-cache-guard-" (fun dir ->
@@ -832,38 +863,37 @@ let test_source_text_cache_guard_uses_current_file_contents () =
         (Blorp.Test_runner.source_text_matches_current_file path
            (Some "func main(args: List[String]) -> Int: 1\n")))
 
-let test_suite_harness_runs_combined_without_result_cache () =
+let test_suite_harness_combines_globals_without_result_cache () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
       let home = Filename.concat dir "home" in
       Unix.mkdir home 0o700;
-      write_file
-        (Filename.concat dir "a.brp")
-        {|
+      let suite_source name test_result =
+        Printf.sprintf
+          {|
 import:
     test: TestSuite
 
-func test_a() -> Bool:
-    True
+func test_%s() -> Bool:
+    %s
 
 tests: TestSuite = {
-    description = "A",
-    tests = [("a", test_a)]
+    description = "%s",
+    tests = [("%s", test_%s)]
 }
-|};
-      write_file
-        (Filename.concat dir "b.brp")
-        {|
-import:
-    test: TestSuite
 
-func test_b() -> Bool:
-    True
-
-tests: TestSuite = {
-    description = "B",
-    tests = [("b", test_b)]
+unused_tests: TestSuite = {
+    description = "Unused %s",
+    tests = []
 }
-|};
+|}
+          name test_result (String.uppercase_ascii name) name name name
+      in
+      List.iter
+        (fun name ->
+          write_file
+            (Filename.concat dir (name ^ ".brp"))
+            (suite_source name "True"))
+        [ "a"; "b"; "c"; "d"; "e" ];
       let old_cwd = Sys.getcwd () in
       Fun.protect
         ~finally:(fun () -> Sys.chdir old_cwd)
@@ -880,7 +910,32 @@ tests: TestSuite = {
               Alcotest.(check int) "combined suite run" 0 code;
               Alcotest.(check bool)
                 "run-all skips per-file result cache" false
-                (Sys.file_exists test_results_dir))))
+                (Sys.file_exists test_results_dir);
+              write_file
+                (Filename.concat dir "e.brp")
+                (suite_source "e" "False");
+              let failing_code =
+                Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+                  ~cache:false "."
+              in
+              Alcotest.(check int)
+                "combined suite reports a normal test failure" 1 failing_code;
+              write_file
+                (Filename.concat dir "e.brp")
+                (suite_source "e" "True");
+              let leak_check_environment_before =
+                Sys.getenv_opt "BLORP_LEAK_CHECK"
+              in
+              let leak_check_code =
+                Blorp.Test_runner.run_tests ~leak_check:true
+                  ~timeout:(Some 10) ~jobs:1 ~cache:false "."
+              in
+              Alcotest.(check int)
+                "combined globals pass leak checking" 0 leak_check_code;
+              Alcotest.(check (option string))
+                "leak checking does not mutate the host environment"
+                leak_check_environment_before
+                (Sys.getenv_opt "BLORP_LEAK_CHECK"))))
 
 let test_suite_harness_uses_blorp_frontend () =
   with_temp_dir "blorp-suite-frontend-" (fun dir ->
@@ -1044,6 +1099,8 @@ let suite =
         Alcotest.test_case "string_literal" `Quick
           test_top_level_main_ignores_string_literal;
         Alcotest.test_case "comment" `Quick test_top_level_main_ignores_comment;
+        Alcotest.test_case "doctest_block" `Quick
+          test_doctest_detection_requires_a_docstring_block;
       ] );
     ( "timeouts",
       [
@@ -1105,16 +1162,18 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "timing_record_format" `Quick
+          test_timing_event_has_stable_machine_readable_format;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
           test_runtime_sensitive_suite_paths_require_process_isolation;
-        Alcotest.test_case "execution_and_compilation_isolation" `Quick
-          test_execution_isolation_does_not_force_separate_compilation;
+        Alcotest.test_case "source_budget_compilation_groups" `Quick
+          test_compilation_groups_follow_source_budget_not_suite_count;
         Alcotest.test_case "source_text_cache_guard" `Quick
           test_source_text_cache_guard_uses_current_file_contents;
-        Alcotest.test_case "combined_harness_skips_result_cache" `Quick
-          test_suite_harness_runs_combined_without_result_cache;
+        Alcotest.test_case "combined_harness_globals_and_result_cache" `Quick
+          test_suite_harness_combines_globals_without_result_cache;
         Alcotest.test_case "uses_blorp_frontend" `Quick
           test_suite_harness_uses_blorp_frontend;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick
