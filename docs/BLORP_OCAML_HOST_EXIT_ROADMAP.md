@@ -60,9 +60,11 @@ One explicitly named compatibility path remains for bootstrapping:
 `blorp-ocaml-host __compiler-host-compile-wrapper` consumes a serialized
 compile graph in order to build the public Blorp executable with the pinned
 `dev-9f56c40d2b91` compiler. It is not reachable from an installed public
-source command. Consequently `compile_file_with_opts`,
-`run_compile_from_frontier_options`, and `write_compile_output` remain only for
-that bootstrap wrapper until Checkpoint K ratchets the bootstrap.
+source command. The wrapper now validates its fixed
+`compile --no-format -o <out.c> <file.brp>` contract and calls the semantic
+pipeline directly. The former generic OCaml compile options, AST/typed-AST
+dumping, Core observation, stage stopping, profiling, and output-selection
+stack has been deleted. Generic host-plan execution rejects compile graphs.
 
 The desired change is not to move the existing CLI-plan protocol into another
 file. The CLI plan must become an internal Blorp value. Only the semantic input
@@ -487,8 +489,8 @@ Tests:
 Exit condition:
 
 - the Blorp artifact writer passes focused parity and failure tests;
-  the production path no longer reaches `write_compile_output`. That helper
-  remains only for the pinned bootstrap wrapper until Checkpoint K.
+  neither the production path nor the pinned bootstrap wrapper retains the
+  former generic OCaml artifact writer.
 
 Implemented evidence on 2026-07-14:
 
@@ -777,14 +779,20 @@ Completed deletions:
 - source run-plan variants and run frontend/options records in the Blorp/OCaml
   bridge; and
 - OCaml host C invocation, runtime-cache selection, and child execution used
-  only by source run.
+  only by source run;
+- `write_compile_output`, `compile_file_with_opts`,
+  `run_compile_from_frontier_options`, and their generic compile-option
+  adapter;
+- OCaml AST/typed-AST debug rendering and the test-only `Typed_ast_debug`
+  module; and
+- OCaml Core profiling and compile-profile helpers superseded by Blorp-owned
+  compile timing.
 
 Deferred solely for the pinned bootstrap wrapper:
 
-- `write_compile_output`
-- `compile_file_with_opts`
-- `run_compile_from_frontier_options`
-- compile graph decoding and its behavior-focused bootstrap tests
+- compile graph decoding;
+- graph finalization into `Modules.preloaded_module_graph`; and
+- the narrow `run_bootstrap_compile` semantic-pipeline call.
 
 Do not delete yet:
 

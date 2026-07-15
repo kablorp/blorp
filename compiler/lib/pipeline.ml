@@ -21,12 +21,6 @@ type compile_result = {
 
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
-let frontend_phase_to_string = function
-  | Parse -> "parse"
-  | ModuleLoad -> "module_load"
-  | ModuleTypecheck -> "module_typecheck"
-  | MainTypecheck -> "main_typecheck"
-
 let bridge_can_read_matching_source ~filename source =
   try
     Sys.file_exists filename

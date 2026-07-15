@@ -147,7 +147,6 @@ OCaml references still needed at this checkpoint:
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/language_surface.ml`
 - `compiler/lib/core_trait_resolve.ml`
-- `compiler/lib/core_profile.ml`
 
 Blorp references:
 
@@ -1808,7 +1807,6 @@ Edge cases:
 Tests:
 
 - `compiler/test/test_typed_ast.ml`
-- `compiler/test/test_typed_ast_debug.ml`
 - `compiler/blorp/tests/test_compiler_ctfe_*.brp`
 - `tests/test_compiler/typecheck/should_pass/compile_time_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/global_constant_*.brp`

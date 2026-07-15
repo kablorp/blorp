@@ -243,7 +243,8 @@ record CompilerSymbolLookup {
 
 
 record CompilerScope {
-	symbols: List[CompilerSymbol]
+	symbols: List[CompilerSymbol],
+	symbols_by_name: Dict[String, CompilerSymbol]
 }
 
 
@@ -345,7 +346,10 @@ record CompilerEnv {
 
 
 private pure func compiler_empty_scope() -> CompilerScope:
-	{symbols = []}
+	{
+		symbols = [],
+		symbols_by_name = {}
+	}
 
 
 private pure func compiler_env_copy_string(value: String) -> String:
@@ -442,7 +446,10 @@ private pure func compiler_scope_add_symbol(
 	scope: CompilerScope,
 	symbol: CompilerSymbol,
 ) -> CompilerScope:
-	{ scope | symbols = [symbol].concat(scope.symbols) }
+	{ scope |
+		symbols = [symbol].concat(scope.symbols),
+		symbols_by_name = scope.symbols_by_name.set(symbol.name, symbol)
+	}
 
 
 pure func compiler_env_add_symbol(env: CompilerEnv, symbol: CompilerSymbol) -> CompilerEnv:
@@ -471,14 +478,7 @@ pure func compiler_env_lookup_in_current_scope(
 ) -> Option[CompilerSymbol]:
 	match env.scopes.get(0):
 		Some(scope):
-			var result: Option[CompilerSymbol] = None
-
-			for symbol in scope.symbols:
-				if symbol.name == name:
-					result = Some(symbol)
-					break
-
-			result
+			scope.symbols_by_name.get(name)
 		None:
 			None
 
@@ -487,13 +487,12 @@ pure func compiler_env_lookup(env: CompilerEnv, name: String) -> Option[Compiler
 	var result: Option[CompilerSymbol] = None
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
+		match scope.symbols_by_name.get(name):
+			Some(symbol):
 				result = Some(symbol)
 				break
-
-		if result.is_some():
-			break
+			None:
+				void
 
 	result
 
@@ -517,18 +516,15 @@ pure func compiler_env_lookup_with_scope_depth(
 	var depth: Int = 0
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
+		match scope.symbols_by_name.get(name):
+			Some(symbol):
 				result = Some({
 					symbol = symbol,
 					scope_depth = depth,
 				})
 				break
-
-		if result.is_some():
-			break
-
-		depth += 1
+			None:
+				depth += 1
 
 	result
 
@@ -1574,6 +1570,39 @@ private pure func compiler_env_resolve_alias_seen(
 
 pure func compiler_env_resolve_alias(env: CompilerEnv, typ: CompilerType) -> CompilerType:
 	compiler_env_resolve_alias_seen(env, "", typ)
+
+
+-- Shape traversals already visit every child. Expanding only the alias at the
+-- current node avoids rebuilding the same nested type at every recursive step.
+private pure func compiler_env_resolve_alias_head_seen(
+	env: CompilerEnv,
+	seen: List[String],
+	typ: CompilerType,
+) -> CompilerType:
+	match typ:
+		CompilerNamedType(name, args):
+			if seen.contains(name):
+				typ
+			else:
+				match compiler_env_get_alias(env, name):
+					Some((type_params, target)):
+						if type_params.length() == args.length():
+							subst = compiler_subst_for_params(type_params, args)
+							compiler_env_resolve_alias_head_seen(
+								env,
+								seen.append(name),
+								compiler_apply_subst(subst, target),
+							)
+						else:
+							typ
+					None:
+						typ
+		_:
+			typ
+
+
+pure func compiler_env_resolve_alias_head(env: CompilerEnv, typ: CompilerType) -> CompilerType:
+	compiler_env_resolve_alias_head_seen(env, [], typ)
 
 
 pure func compiler_env_set_type_param_bounds(

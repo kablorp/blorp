@@ -31,8 +31,6 @@ type purify_candidate = {
 }
 
 let read_file = Modules.read_file
-let extract_directory = Modules.extract_directory
-let init_module_paths = Modules.init_module_paths
 
 let write_file path contents =
   let channel = open_out path in
@@ -96,50 +94,6 @@ let finalize_cli_frontend_parsed_response = function
   | Compiler_blorp_bridge.ParseSourceDiagnostics diagnostics -> Error diagnostics
   | Compiler_blorp_bridge.ParsedSource parsed_source ->
       Ok parsed_source.Compiler_blorp_bridge.parsed_program
-
-let type_expr_to_string = Types.type_to_string
-
-let func_to_string depth func =
-  let indent = String.make (depth * 2) ' ' in
-  let name_str =
-    match func.Ast.func_name with Some n -> n | None -> "<lambda>"
-  in
-  let pure_str = if func.Ast.func_is_pure then " [pure]" else "" in
-  let tailrec_str =
-    if func.Ast.func_is_tailrec then " [@tail_recursive]" else ""
-  in
-  let ret_str =
-    match func.Ast.func_return_type with
-    | Some t -> " -> " ^ type_expr_to_string t
-    | None -> ""
-  in
-  Printf.sprintf "%sFunc %s%s%s%s" indent name_str pure_str tailrec_str ret_str
-
-let decl_to_string d =
-  match d.Ast.decl_desc with
-  | Ast.DFunc f -> func_to_string 0 f
-  | Ast.DType t ->
-      Printf.sprintf "Union %s[%s] with %d variants" t.Ast.type_name
-        (String.concat ", " (Ast.type_param_names t.Ast.type_params))
-        (List.length t.Ast.type_variants)
-  | Ast.DRecord r ->
-      let keyword = if r.Ast.record_is_value then "Struct" else "Record" in
-      Printf.sprintf "%s %s[%s] with %d fields" keyword r.Ast.record_name
-        (String.concat ", " (Ast.type_param_names r.Ast.record_type_params))
-        (List.length r.Ast.record_fields)
-  | Ast.DVar v ->
-      let name = match v.Ast.var_name with Some n -> n | None -> "_" in
-      let prefix = if v.Ast.var_is_mutable then "var " else "" in
-      Printf.sprintf "%s%s" prefix name
-  | Ast.DImport i -> Printf.sprintf "Import %s" i.Ast.import_module
-  | Ast.DPrivate _ -> "Private"
-  | Ast.DTrait t -> Printf.sprintf "Trait %s" t.Ast.trait_name
-  | Ast.DImpl i ->
-      Printf.sprintf "Impl %s for %s" i.Ast.impl_trait
-        (type_expr_to_string i.Ast.impl_for_type)
-  | Ast.DTypeAlias a -> Printf.sprintf "TypeAlias %s" a.Ast.alias_name
-
-let program_to_string prog = String.concat "\n" (List.map decl_to_string prog)
 
 (** Resolve timeout: CLI flag overrides env vars, checked in order. *)
 let resolve_timeout_from_env env_names cli_timeout =
@@ -526,302 +480,6 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
                       (List.length names) filename;
                     List.length names)))
 
-type compile_opts = {
-  no_emit : bool;
-  ast_only : bool;
-      (** Legacy --ast: prints AST and exits (no typecheck, no emit) *)
-  dump_ast : bool;  (** --dump-ast: prints AST and continues compiling *)
-  dump_typed_ast : bool;
-      (** --dump-typed-ast: prints typed AST and continues compiling *)
-  debug : bool;
-  output : string option;
-  embed_runtime : bool;
-  dump_core_after : Blorp.Core_stage.t list;
-      (** --dump-core / --dump-core-after=STAGE[,STAGE…]; repeatable *)
-  stop_after : Blorp.Core_stage.t option;  (** --stop-after=STAGE *)
-  dump_file : string option;  (** --dump-core-file=PATH; stderr if None *)
-  time_phases : bool;  (** --time-phases (per-phase timing) *)
-  check_invariants : bool;  (** --check-invariants (Phase 2.2) *)
-}
-(** Options for the [compile] subcommand. *)
-
-let default_compile_opts =
-  {
-    no_emit = false;
-    ast_only = false;
-    dump_ast = false;
-    dump_typed_ast = false;
-    debug = false;
-    output = None;
-    embed_runtime = true;
-    dump_core_after = [];
-    stop_after = None;
-    dump_file = None;
-    time_phases = false;
-    check_invariants = false;
-  }
-
-(** Open the dump channel based on [opts.dump_file]. Caller must close. *)
-let open_dump_channel opts =
-  match opts.dump_file with
-  | Some path -> (open_out path, true)
-  | None -> (stderr, false)
-
-type obs = {
-  callback : Blorp.Core_pipeline.on_stage_callback option;
-  core_stage_event : Blorp.Core_pipeline.on_stage_event option;
-  tail_json_callback : Blorp.Core_pipeline.on_stage_json_callback option;
-  tail_observation_stages : Blorp.Core_stage.t list;
-  frontend_callback : (Blorp.Pipeline.frontend_phase -> unit) option;
-  profiler : Blorp.Core_profile.t option;
-  cleanup : unit -> unit;  (** closes the dump channel if one was opened *)
-}
-(** Composite observability handle: the optional program-bearing stage callback,
-    optional lightweight stage event, optional profiler for summary reporting,
-    and a cleanup thunk that must run on every exit path (success, stop, or
-    error). *)
-
-let obs_none =
-  {
-    callback = None;
-    core_stage_event = None;
-    tail_json_callback = None;
-    tail_observation_stages = [];
-    frontend_callback = None;
-    profiler = None;
-    cleanup = (fun () -> ());
-  }
-
-(** Best-effort short git SHA for dump provenance (Phase 0.5.6). Returns
-    the output of [git rev-parse --short HEAD] if the repo is accessible,
-    else ["unknown"]. Never raises — provenance is nice-to-have. *)
-let dump_git_sha () =
-  try
-    let ic = Unix.open_process_in "git rev-parse --short HEAD 2>/dev/null" in
-    let line = try input_line ic with End_of_file -> "" in
-    match Unix.close_process_in ic with
-    | Unix.WEXITED 0 when String.length line > 0 -> line
-    | _ -> "unknown"
-  with _ -> "unknown"
-
-let stop_after_requests_stage opts stage =
-  match opts.stop_after with Some s -> s = stage | None -> false
-
-let compile_opts_requests_stage opts stage =
-  List.exists (fun s -> s = stage) opts.dump_core_after
-  || stop_after_requests_stage opts stage
-
-let tail_json_observation_stages opts =
-  List.filter
-    (fun stage ->
-      Blorp.Core_pipeline.stage_observed_via_blorp_tail_json stage
-      && compile_opts_requests_stage opts stage)
-    Blorp.Core_stage.all
-
-let program_callback_observation_stages opts =
-  List.filter
-    (fun stage ->
-      compile_opts_requests_stage opts stage
-      && not (Blorp.Core_pipeline.stage_observed_via_blorp_tail_json stage))
-    Blorp.Core_stage.all
-
-(** Build a composite stage callback that may dump, stop, and/or profile.
-    Returns [obs_none] if no observability options are active (so the
-    pipeline skips the hook overhead entirely). [source_file] is the
-    path compiled, used only for the dump header (Phase 0.5.6). The
-    returned [cleanup] must be called on every exit path; callers
-    typically wrap their compile invocation in
-    [Fun.protect ~finally:obs.cleanup]. *)
-let build_on_stage ?source_file opts : obs =
-  let profiler =
-    if opts.time_phases then Some (Blorp.Core_profile.create ()) else None
-  in
-  let tail_observation_stages = tail_json_observation_stages opts in
-  let program_observation_stages = program_callback_observation_stages opts in
-  let frontend_callback =
-    Option.map
-      (fun p phase ->
-        Blorp.Core_profile.on_label p
-          (Blorp.Pipeline.frontend_phase_to_string phase))
-      profiler
-  in
-  let core_stage_event = Option.map Blorp.Core_profile.on_stage_event profiler in
-  let needs_program_callback = program_observation_stages <> [] in
-  let needs_tail_json_callback = tail_observation_stages <> [] in
-  let needs_dump_or_stop_callback =
-    needs_program_callback || needs_tail_json_callback
-  in
-  match (needs_dump_or_stop_callback, profiler) with
-  | false, None -> obs_none
-  | false, Some _ ->
-      {
-        callback = None;
-        core_stage_event;
-        tail_json_callback = None;
-        tail_observation_stages = [];
-        frontend_callback;
-        profiler;
-        cleanup = (fun () -> ());
-      }
-  | true, _ ->
-      let ch, should_close = open_dump_channel opts in
-      let closed = ref false in
-      let close_once () =
-        if should_close && not !closed then begin
-          closed := true;
-          close_out_noerr ch
-        end
-      in
-      let header_emitted = ref false in
-      let emit_header_once () =
-        if (not !header_emitted) && opts.dump_core_after <> [] then begin
-          header_emitted := true;
-          let file = Option.value source_file ~default:"<stdin>" in
-          Printf.fprintf ch "-- blorp %s-%s %s\n" Blorp.Version.version
-            (dump_git_sha ()) file;
-          flush ch
-        end
-      in
-      let cb stage prog =
-        if List.exists (fun s -> s = stage) opts.dump_core_after then begin
-          emit_header_once ();
-          Printf.fprintf ch "===== after %s =====\n%s"
-            (Blorp.Core_stage.to_string stage)
-            (Blorp.Core.pp_program_indented prog);
-          flush ch
-        end;
-        match opts.stop_after with
-        | Some s when s = stage ->
-            raise (Blorp.Core_pipeline.Stopped_after stage)
-        | _ -> ()
-      in
-      let tail_cb stage json =
-        if List.exists (fun s -> s = stage) opts.dump_core_after then begin
-          emit_header_once ();
-          Printf.fprintf ch "===== after %s =====\n%s\n"
-            (Blorp.Core_stage.to_string stage)
-            json;
-          flush ch
-        end;
-        match opts.stop_after with
-        | Some s when s = stage ->
-            raise (Blorp.Core_pipeline.Stopped_after stage)
-        | _ -> ()
-      in
-      {
-        callback =
-          (match program_observation_stages with
-          | [] -> None
-          | _ :: _ -> Some cb);
-        core_stage_event;
-        tail_json_callback =
-          (match tail_observation_stages with
-          | [] -> None
-          | _ :: _ -> Some tail_cb);
-        tail_observation_stages;
-        frontend_callback;
-        profiler;
-        cleanup = close_once;
-      }
-
-let check_file_with_opts ~frontend_program ~preloaded_module_graph opts filename =
-  if opts.ast_only then
-    begin
-      print_endline (program_to_string frontend_program);
-      0
-    end
-  else begin
-    init_module_paths (extract_directory filename);
-    if opts.dump_ast then print_endline (program_to_string frontend_program);
-    if opts.dump_typed_ast then (
-      match
-        Pipeline.typecheck_only_typed_with_blorp_bridge_policy
-          ~debug:opts.debug ~allow_debug_only_calls:opts.debug ~filename
-          ~preloaded_module_graph
-      with
-      | Error errors ->
-          prerr_endline (format_pipeline_errors ~file:filename errors);
-          1
-      | Ok typed_program ->
-          print_endline (Typed_ast_debug.format_program typed_program);
-          print_endline "Type checking succeeded.";
-          0)
-    else
-      match
-        Pipeline.typecheck_only_typed_with_blorp_bridge_policy
-          ~debug:opts.debug ~allow_debug_only_calls:opts.debug ~filename
-          ~preloaded_module_graph
-      with
-      | Error errors ->
-          prerr_endline (format_pipeline_errors ~file:filename errors);
-          1
-      | Ok _program ->
-          print_endline "Type checking succeeded.";
-          0
-  end
-
-let write_compile_output opts filename c_code =
-  let base = Filename.remove_extension filename in
-  let c_file = match opts.output with Some o -> o | None -> base ^ ".c" in
-  let oc = open_out c_file in
-  Fun.protect
-    ~finally:(fun () -> close_out oc)
-    (fun () -> output_string oc c_code);
-  Printf.printf "Generated %s\n" c_file;
-  0
-
-let compile_file_with_opts ~frontend_program ~preloaded_module_graph opts
-    filename =
-  if opts.no_emit then
-    check_file_with_opts ~frontend_program ~preloaded_module_graph opts filename
-  else begin
-    if opts.ast_only then
-      begin
-        print_endline (program_to_string frontend_program);
-        0
-      end
-    else begin
-      init_module_paths (extract_directory filename);
-      (* --dump-ast prints the parsed AST before any further work, then
-         continues with the rest of the pipeline. Unlike --ast (which stops
-         after parse), it's non-destructive and composes with --dump-core,
-         --time-phases, etc. *)
-      if opts.dump_ast then print_endline (program_to_string frontend_program);
-      let obs = build_on_stage ~source_file:filename opts in
-      let print_profile () =
-        match obs.profiler with
-        | Some p -> prerr_string (Blorp.Core_profile.format p)
-        | None -> ()
-      in
-      Fun.protect ~finally:obs.cleanup (fun () ->
-          let result =
-            match
-              Pipeline.compile_preloaded_graph_with_blorp_bridge
-                ~debug:opts.debug
-                ?on_stage:obs.callback ?on_stage_event:obs.core_stage_event
-                ?on_stage_json:obs.tail_json_callback
-                ~tail_observation_stages:obs.tail_observation_stages
-                ~check_invariants:opts.check_invariants
-                ~embed_runtime:opts.embed_runtime
-                ?on_frontend_phase:obs.frontend_callback ~filename
-                ~preloaded_module_graph ()
-            with
-            | Error errors ->
-                prerr_endline (format_pipeline_errors ~file:filename errors);
-                1
-            | Ok (Pipeline.Stopped_at s) ->
-                Printf.eprintf "stopped after %s\n" (Blorp.Core_stage.to_string s);
-                0
-            | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
-                if opts.dump_typed_ast then
-                  print_endline (Typed_ast_debug.format_program typed_program);
-                write_compile_output opts filename c_code
-          in
-          print_profile ();
-          result)
-    end
-  end
-
 let package_pin_overlap left right =
   match
     (Package_hash.validate_hash_pin left, Package_hash.validate_hash_pin right)
@@ -1146,10 +804,6 @@ let print_parse_diagnostics ~file diagnostics =
 
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
-  | BlorpCliCompile of
-      Ast.program
-      * Modules.preloaded_module_graph
-      * Compiler_blorp_bridge.cli_compile_options
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
   | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
   | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
@@ -1157,7 +811,6 @@ type blorp_cli_frontier =
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
 type finalized_cli_frontend_graph_source = {
-  finalized_program : Ast.program;
   finalized_preloaded_source : Modules.preloaded_parsed_source;
 }
 
@@ -1220,7 +873,6 @@ let finalize_cli_frontend_graph_source ~imports
       in
       Ok
         {
-          finalized_program = resolved_program;
           finalized_preloaded_source =
             {
               Modules.preload_module_name =
@@ -1272,17 +924,6 @@ let preloaded_graph_context_of_cli_frontend_context
     preload_graph_package_roots = context.cli_frontend_context_package_roots;
   }
 
-let apply_cli_frontend_graph_context
-    (context : Compiler_blorp_bridge.cli_frontend_graph_context) =
-  Option.iter Modules.set_std_override context.cli_frontend_context_std_dir;
-  List.iter Modules.add_package_root context.cli_frontend_context_package_roots;
-  List.iter
-    (fun pkg ->
-      Modules.add_source_package
-        (source_package_of_cli_frontend_source_package pkg))
-    context.cli_frontend_context_source_packages;
-  Modules.add_search_path (Sys.getcwd ())
-
 let preloaded_import_edge_of_cli_frontend_import
     (edge : Compiler_blorp_bridge.cli_frontend_import_edge) :
     Modules.preloaded_import_edge =
@@ -1310,10 +951,8 @@ let preloaded_module_graph_of_cli_frontend_graph graph sources :
         graph.cli_frontend_graph_imports;
   }
 
-let cli_frontier_frontend_module_graph
+let bootstrap_compile_graph_of_cli_frontend_module_graph
     (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
-  apply_cli_frontend_graph_context
-    graph.Compiler_blorp_bridge.cli_frontend_graph_context;
   let imports = graph.Compiler_blorp_bridge.cli_frontend_graph_imports in
   let roots =
     finalized_cli_frontend_graph_sources_or_exit ~imports
@@ -1335,8 +974,7 @@ let cli_frontier_frontend_module_graph
     graph.Compiler_blorp_bridge.cli_frontend_graph_compile_options
   in
   match roots with
-  | [ root ] ->
-      BlorpCliCompile (root.finalized_program, preloaded_module_graph, options)
+  | [ _ ] -> (preloaded_module_graph, options)
   | _ ->
       prerr_endline
         "Error: compile frontend module graph must contain exactly one root";
@@ -1347,8 +985,11 @@ let cli_frontier_of_cli_run_result = function
       print_string result.Compiler_blorp_bridge.cli_run_stdout;
       prerr_string result.Compiler_blorp_bridge.cli_run_stderr;
       exit result.Compiler_blorp_bridge.cli_run_status
-  | Compiler_blorp_bridge.CliRunFrontendModuleGraph graph ->
-      cli_frontier_frontend_module_graph graph
+  | Compiler_blorp_bridge.CliRunFrontendModuleGraph _ ->
+      prerr_endline
+        "Internal error: compile plans are accepted only by the bootstrap \
+         compile wrapper";
+      exit 1
   | Compiler_blorp_bridge.CliRunTestOptions options -> BlorpCliTest options
   | Compiler_blorp_bridge.CliRunPurifyOptions options -> BlorpCliPurify options
   | Compiler_blorp_bridge.CliRunReplOptions options -> BlorpCliRepl options
@@ -1362,23 +1003,6 @@ let set_std_override_option = function
   | Some dir -> Modules.set_std_override dir
   | None -> ()
 
-let compile_opts_of_cli_compile
-    (options : Compiler_blorp_bridge.cli_compile_options) =
-  {
-    default_compile_opts with
-    ast_only = options.cli_compile_ast_only;
-    dump_ast = options.cli_compile_dump_ast;
-    dump_typed_ast = options.cli_compile_dump_typed_ast;
-    dump_core_after = options.cli_compile_dump_core_after;
-    dump_file = options.cli_compile_dump_file;
-    stop_after = options.cli_compile_stop_after;
-    time_phases = options.cli_compile_time_phases;
-    check_invariants = options.cli_compile_check_invariants;
-    debug = options.cli_compile_debug;
-    embed_runtime = options.cli_compile_embed_runtime;
-    output = options.cli_compile_output;
-  }
-
 let sanitizer_mode_of_cli_frontend =
   let open Compiler_blorp_bridge in
   function
@@ -1387,20 +1011,46 @@ let sanitizer_mode_of_cli_frontend =
       Test_runner.SanitizerAddressUndefined
   | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
 
-let run_compile_from_frontier_options ~frontend_program
-    ~preloaded_module_graph
+let is_bootstrap_compile_plan ~output ~filename
     (options : Compiler_blorp_bridge.cli_compile_options) =
-  let opts = compile_opts_of_cli_compile options in
-  set_std_override_option options.cli_compile_std_dir;
-  match options.cli_compile_files with
-  | [ file ] ->
-      compile_file_with_opts ~frontend_program ~preloaded_module_graph opts file
-  | [] ->
-      prerr_endline "Error: No input file specified";
-      1
-  | _ ->
-      prerr_endline "Error: Multiple input files not supported";
-      1
+  (not options.cli_compile_ast_only)
+  && not options.cli_compile_dump_ast
+  && not options.cli_compile_dump_typed_ast
+  && options.cli_compile_dump_core_after = []
+  && options.cli_compile_dump_file = None
+  && options.cli_compile_stop_after = None
+  && not options.cli_compile_time_phases
+  && not options.cli_compile_check_invariants
+  && not options.cli_compile_debug
+  && options.cli_compile_no_format
+  && options.cli_compile_embed_runtime
+  && options.cli_compile_std_dir = None
+  && options.cli_compile_output = Some output
+  && options.cli_compile_files = [ filename ]
+
+let run_bootstrap_compile ~output ~filename ~preloaded_module_graph options =
+  if not (is_bootstrap_compile_plan ~output ~filename options) then begin
+    prerr_endline
+      "Internal error: bootstrap compiler returned an unexpected compile plan";
+    1
+  end
+  else
+    match
+      Pipeline.compile_preloaded_graph_with_blorp_bridge ~filename
+        ~preloaded_module_graph ()
+    with
+    | Error errors ->
+        prerr_endline (format_pipeline_errors ~file:filename errors);
+        1
+    | Ok (Pipeline.Stopped_at stage) ->
+        Printf.eprintf
+          "Internal error: bootstrap compilation stopped unexpectedly after %s\n"
+          (Blorp.Core_stage.to_string stage);
+        1
+    | Ok (Pipeline.Compiled { c_code; _ }) ->
+        write_file output c_code;
+        Printf.printf "Generated %s\n" output;
+        0
 
 let run_compiler_host_compile_wrapper_command args =
   match args with
@@ -1412,17 +1062,16 @@ let run_compiler_host_compile_wrapper_command args =
       | Error (_, message) ->
           prerr_endline message;
           1
-      | Ok result -> (
-          match cli_frontier_of_cli_run_result result with
-          | BlorpCliCompile (frontend_program, preloaded_module_graph, options)
-            ->
-              run_compile_from_frontier_options ~frontend_program
-                ~preloaded_module_graph options
-          | _ ->
-              prerr_endline
-                "Internal error: compiler host compile wrapper expected a \
-                 Blorp frontend compile graph";
-              1))
+      | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
+          let preloaded_module_graph, options =
+            bootstrap_compile_graph_of_cli_frontend_module_graph graph
+          in
+          run_bootstrap_compile ~output ~filename ~preloaded_module_graph options
+      | Ok _ ->
+          prerr_endline
+            "Internal error: compiler host compile wrapper expected a Blorp \
+             frontend compile graph";
+          1)
   | _ ->
       prerr_endline
         "Usage: blorp __compiler-host-compile-wrapper -o <out.c> <file.brp>";
@@ -1668,9 +1317,6 @@ and run_compiler_cli_plan_command args =
       1
 and run_frontier = function
   | BlorpCliDelegate args -> run_delegate_command args
-  | BlorpCliCompile (frontend_program, preloaded_module_graph, options) ->
-      run_compile_from_frontier_options ~frontend_program
-        ~preloaded_module_graph options
   | BlorpCliTest options -> run_test_from_frontier_options options
   | BlorpCliPurify options -> run_purify_from_frontier_options options
   | BlorpCliRepl options ->

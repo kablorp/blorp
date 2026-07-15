@@ -10,7 +10,6 @@ let schema_version = 1
 let domain = "compiler"
 let core_error_renderer = "core_error"
 let core_fairness_renderer = "core_fairness"
-let core_profile_renderer = "core_profile"
 let core_stage_renderer = "core_stage"
 let core_trait_resolve_renderer = "core_trait_resolve"
 let language_surface_renderer = "language_surface"
@@ -2998,10 +2997,6 @@ let render_core_trait_resolve_no_impl_hint ~method_name ~type_name ~candidates =
   render_via_command_exn ~renderer:core_trait_resolve_renderer
     ~op:"core_trait_resolve_no_impl_hint"
     [ method_name; type_name; String.concat ";" candidates ]
-
-let render_core_profile_format serialized_entries =
-  render_via_command_exn ~renderer:core_profile_renderer
-    ~op:"core_profile_format" [ serialized_entries ]
 
 let render_core_error_format ~phase ~message ~line ~column ~hint =
   let hint_kind, hint_text =

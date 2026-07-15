@@ -779,6 +779,50 @@ pure func state_with_stream_source_binding_values() -> CompilerTypecheckState:
 		) }
 
 
+pure func state_with_aliased_stream_binding() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_stream_alias = compiler_env_add_alias(
+		state.env,
+		"StreamAlias",
+		["T"],
+		compiler_type_stream(CompilerTypeVar("T")),
+	)
+	with_container_alias = compiler_env_add_alias(
+		with_stream_alias,
+		"MaybeAlias",
+		["T"],
+		compiler_type_option(CompilerTypeVar("T")),
+	)
+
+	add_infer_value(
+		{ state | env = with_container_alias },
+		"aliased_stream",
+		CompilerNamedType("MaybeAlias", [CompilerNamedType("StreamAlias", [compiler_type_int()])]),
+	)
+
+
+pure func state_with_cyclic_alias_binding() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_first_alias = compiler_env_add_alias(
+		state.env,
+		"FirstAlias",
+		[],
+		CompilerNamedType("SecondAlias", []),
+	)
+	with_cycle = compiler_env_add_alias(
+		with_first_alias,
+		"SecondAlias",
+		[],
+		CompilerNamedType("FirstAlias", []),
+	)
+
+	add_infer_value(
+		{ state | env = with_cycle },
+		"cycle_value",
+		CompilerNamedType("FirstAlias", []),
+	)
+
+
 pure func state_with_resource_and_impure_tick() -> CompilerTypecheckState:
 	state = state_with_resource_values()
 	{ state | env = compiler_env_add_func(
@@ -5371,6 +5415,41 @@ func test_resource_shape_checks_memoize_complete_types() -> Bool:
 	)
 
 
+func test_resource_shape_checks_expand_generic_alias_chains() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_aliased_stream_binding()),
+		ParsedVarDeclExpr(
+			ident("boxed"),
+			None,
+			ParsedNameExpr(ident("aliased_stream")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("one-shot stream value `boxed` cannot be bound to an ordinary variable")
+	)
+
+
+func test_resource_shape_checks_terminate_on_cyclic_aliases() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_cyclic_alias_binding()),
+		ParsedVarDeclExpr(
+			ident("copy"),
+			None,
+			ParsedNameExpr(ident("cycle_value")),
+			False,
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0
+
+
 func test_var_decl_rejects_resource_source_carrier_binding() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_stream_source_binding_values()),
@@ -8438,6 +8517,14 @@ tests: TestSuite = {
 		(
 			"resource shape checks memoize complete types",
 			test_resource_shape_checks_memoize_complete_types,
+		),
+		(
+			"resource shape checks expand generic alias chains",
+			test_resource_shape_checks_expand_generic_alias_chains,
+		),
+		(
+			"resource shape checks terminate on cyclic aliases",
+			test_resource_shape_checks_terminate_on_cyclic_aliases,
 		),
 		(
 			"var decl rejects resource source carrier binding",

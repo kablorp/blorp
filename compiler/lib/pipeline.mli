@@ -20,9 +20,6 @@ type compile_result = {
 (** Frontend phases that run before Core lowering. *)
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
-val frontend_phase_to_string : frontend_phase -> string
-(** Stable display label for frontend timing output. *)
-
 (** Source compilation outcome. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
     pipeline via [Core_pipeline.Stopped_after]. The pipeline boundary converts
