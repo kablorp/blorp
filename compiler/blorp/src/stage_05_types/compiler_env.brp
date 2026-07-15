@@ -244,7 +244,7 @@ record CompilerSymbolLookup {
 
 record CompilerScope {
 	symbols: List[CompilerSymbol],
-	symbols_by_name: Dict[String, CompilerSymbol]
+	symbols_by_name: Dict[String, List[CompilerSymbol]]
 }
 
 
@@ -446,10 +446,33 @@ private pure func compiler_scope_add_symbol(
 	scope: CompilerScope,
 	symbol: CompilerSymbol,
 ) -> CompilerScope:
+	name_candidates = scope.symbols_by_name
+		.get(symbol.name)
+		.get_or([])
+
 	{ scope |
 		symbols = [symbol].concat(scope.symbols),
-		symbols_by_name = scope.symbols_by_name.set(symbol.name, symbol)
+		symbols_by_name = scope.symbols_by_name.set(
+			symbol.name,
+			[symbol].concat(name_candidates),
+		)
 	}
+
+
+private pure func compiler_scope_symbols_named(
+	scope: CompilerScope,
+	name: String,
+) -> List[CompilerSymbol]:
+	scope.symbols_by_name
+		.get(name)
+		.get_or([])
+
+
+private pure func compiler_scope_lookup(
+	scope: CompilerScope,
+	name: String,
+) -> Option[CompilerSymbol]:
+	compiler_scope_symbols_named(scope, name).get(0)
 
 
 pure func compiler_env_add_symbol(env: CompilerEnv, symbol: CompilerSymbol) -> CompilerEnv:
@@ -478,7 +501,7 @@ pure func compiler_env_lookup_in_current_scope(
 ) -> Option[CompilerSymbol]:
 	match env.scopes.get(0):
 		Some(scope):
-			scope.symbols_by_name.get(name)
+			compiler_scope_lookup(scope, name)
 		None:
 			None
 
@@ -487,7 +510,7 @@ pure func compiler_env_lookup(env: CompilerEnv, name: String) -> Option[Compiler
 	var result: Option[CompilerSymbol] = None
 
 	for scope in env.scopes:
-		match scope.symbols_by_name.get(name):
+		match compiler_scope_lookup(scope, name):
 			Some(symbol):
 				result = Some(symbol)
 				break
@@ -501,9 +524,7 @@ pure func compiler_env_symbols_named(env: CompilerEnv, name: String) -> List[Com
 	var result: List[CompilerSymbol] = []
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				result = result.append(symbol)
+		result = result.concat(compiler_scope_symbols_named(scope, name))
 
 	result
 
@@ -516,7 +537,7 @@ pure func compiler_env_lookup_with_scope_depth(
 	var depth: Int = 0
 
 	for scope in env.scopes:
-		match scope.symbols_by_name.get(name):
+		match compiler_scope_lookup(scope, name):
 			Some(symbol):
 				result = Some({
 					symbol = symbol,
@@ -660,15 +681,14 @@ pure func compiler_env_get_module_var_symbol(
 	var result: Option[CompilerVarSymbol] = None
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				match symbol.kind:
-					CompilerVarSymbolKind(var_symbol):
-						if var_symbol.module_path == Some(module_path):
-							result = Some(var_symbol)
-							break
-					_:
-						void
+		for symbol in compiler_scope_symbols_named(scope, name):
+			match symbol.kind:
+				CompilerVarSymbolKind(var_symbol):
+					if var_symbol.module_path == Some(module_path):
+						result = Some(var_symbol)
+						break
+				_:
+					void
 
 		if result.is_some():
 			break
@@ -974,15 +994,14 @@ pure func compiler_env_get_module_func_symbol(
 	var result: Option[CompilerFuncSymbol] = None
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				match symbol.kind:
-					CompilerFuncSymbolKind(func_symbol):
-						if func_symbol.module_path == Some(module_path):
-							result = Some(func_symbol)
-							break
-					_:
-						void
+		for symbol in compiler_scope_symbols_named(scope, name):
+			match symbol.kind:
+				CompilerFuncSymbolKind(func_symbol):
+					if func_symbol.module_path == Some(module_path):
+						result = Some(func_symbol)
+						break
+				_:
+					void
 
 		if result.is_some():
 			break
@@ -1236,13 +1255,12 @@ pure func compiler_env_get_constructors(
 	var constructors: List[CompilerConstructorSymbol] = []
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				match symbol.kind:
-					CompilerConstructorSymbolKind(ctor):
-						constructors = constructors.append(ctor)
-					_:
-						void
+		for symbol in compiler_scope_symbols_named(scope, name):
+			match symbol.kind:
+				CompilerConstructorSymbolKind(ctor):
+					constructors = constructors.append(ctor)
+				_:
+					void
 
 	constructors
 
@@ -3218,17 +3236,16 @@ private pure func compiler_env_lookup_function_ufcs_methods(
 	var result: List[CompilerOverloadEntry] = []
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				match symbol.kind:
-					CompilerFuncSymbolKind(func_symbol):
-						if compiler_func_symbol_supports_ufcs(func_symbol):
-							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+		for symbol in compiler_scope_symbols_named(scope, name):
+			match symbol.kind:
+				CompilerFuncSymbolKind(func_symbol):
+					if compiler_func_symbol_supports_ufcs(func_symbol):
+						entry = compiler_overload_entry_from_func_symbol(func_symbol)
 
-							if compiler_overload_first_param_matches(entry, first_arg_type):
-								result = result.append(entry)
-					_:
-						void
+						if compiler_overload_first_param_matches(entry, first_arg_type):
+							result = result.append(entry)
+				_:
+					void
 
 	result
 
@@ -3242,20 +3259,19 @@ private pure func compiler_env_lookup_module_function_ufcs_methods(
 	var result: List[CompilerOverloadEntry] = []
 
 	for scope in env.scopes:
-		for symbol in scope.symbols:
-			if symbol.name == name:
-				match symbol.kind:
-					CompilerFuncSymbolKind(func_symbol):
-						if (
-							func_symbol.module_path == Some(module_path)
-							and compiler_func_symbol_supports_ufcs(func_symbol)
-						):
-							entry = compiler_overload_entry_from_func_symbol(func_symbol)
+		for symbol in compiler_scope_symbols_named(scope, name):
+			match symbol.kind:
+				CompilerFuncSymbolKind(func_symbol):
+					if (
+						func_symbol.module_path == Some(module_path)
+						and compiler_func_symbol_supports_ufcs(func_symbol)
+					):
+						entry = compiler_overload_entry_from_func_symbol(func_symbol)
 
-							if compiler_overload_first_param_matches(entry, first_arg_type):
-								result = result.append(entry)
-					_:
-						void
+						if compiler_overload_first_param_matches(entry, first_arg_type):
+							result = result.append(entry)
+				_:
+					void
 
 	result
 
@@ -3350,15 +3366,14 @@ pure func compiler_env_has_ufcs_method(env: CompilerEnv, name: String) -> Bool:
 			var found: Bool = False
 
 			for scope in env.scopes:
-				for symbol in scope.symbols:
-					if symbol.name == name:
-						match symbol.kind:
-							CompilerFuncSymbolKind(func_symbol):
-								if compiler_func_symbol_supports_ufcs(func_symbol):
-									found = True
-									break
-							_:
-								void
+				for symbol in compiler_scope_symbols_named(scope, name):
+					match symbol.kind:
+						CompilerFuncSymbolKind(func_symbol):
+							if compiler_func_symbol_supports_ufcs(func_symbol):
+								found = True
+								break
+						_:
+							void
 
 				if found:
 					break

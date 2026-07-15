@@ -472,39 +472,50 @@ count alone.
 
 ### P2. Index Name Candidates in the Compiler Environment
 
+**Status:** implemented and verified on 2026-07-15.
+
 **Goal:** remove expression-count times environment-size scans from inference
 without changing lookup precedence or overload behavior.
 
 **Current issue:** `CompilerScope` in
-`compiler/blorp/src/stage_05_types/compiler_env.brp` has an ordered symbol list
-and a latest-symbol dictionary. Exact lookup uses the dictionary, but
-`compiler_env_symbols_named`, `compiler_env_get_constructors`, and UFCS method
-lookup repeatedly scan every symbol in every scope. Whole-compiler graphs make
-those scans a material cost.
+`compiler/blorp/src/stage_05_types/compiler_env.brp` had an ordered symbol list
+and a latest-symbol dictionary. Exact lookup used the dictionary, but history,
+module-qualified, constructor, and UFCS queries repeatedly scanned every symbol
+in every scope. Whole-compiler graphs make those expression-count times
+environment-size scans a material cost.
 
 **Implementation:**
 
-- Add a per-scope candidate index such as
-  `symbol_candidates_by_name: Dict[String, List[CompilerSymbol]]` while keeping
-  the ordered symbol list for deterministic enumeration.
-- Update `compiler_scope_add_symbol` once so the ordered list, latest-symbol
-  index, and candidate index cannot diverge.
+- Change the existing per-scope `symbols_by_name` dictionary to map each name to
+  one newest-first `List[CompilerSymbol]`. The first item is the latest symbol,
+  so a second latest-only dictionary would duplicate state and create an
+  unnecessary consistency invariant.
+- Keep the ordered symbol list for deterministic full enumeration, record-field
+  shape matching, callable-id lookup, and fuzzy diagnostics.
+- Update `compiler_scope_add_symbol` once so the ordered list and candidate
+  index cannot diverge. Centralize candidate and latest lookup in private scope
+  helpers.
 - Preserve current ordering exactly: innermost scope before outer scopes and
   newest declaration before older declarations within one scope.
 - Rewrite these functions to start from indexed candidates:
   - `compiler_env_symbols_named`
+  - `compiler_env_get_module_var_symbol`
+  - `compiler_env_get_module_func_symbol`
   - `compiler_env_get_constructors`
   - `compiler_env_lookup_function_ufcs_methods`
   - `compiler_env_lookup_module_function_ufcs_methods`
+  - `compiler_env_has_ufcs_method`
 - Keep module, import, lexical, concrete-vs-generic, and declaration-order
   ranking in their existing named policies. The index narrows candidates; it
   must not decide semantic precedence.
 
 **Tests:**
 
-- Protect same-scope shadow history and latest-symbol lookup.
-- Cover lexical symbols shadowing explicit imports, explicit imports resolving
-  constructor collisions, constructors with the same name in several modules,
+- Protect same-scope shadow history, cross-scope candidate ordering, and
+  latest-symbol lookup.
+- Cover lexical symbols shadowing explicit imports, module-qualified variable
+  and function lookup, constructors with the same name in several types,
+  regular function symbols participating in UFCS, module/receiver filtering,
   and concrete UFCS methods outranking generic methods.
 - Add deterministic counters or a compiler benchmark showing that a lookup
   visits candidates for the requested name rather than all symbols. Do not put
@@ -512,11 +523,26 @@ those scans a material cost.
 - Re-run the compiler-oriented AST, symbols, inference, and full CLI-generation
   benchmarks.
 
-**Exit condition:** no name-based candidate query performs an unconditional
+**Exit condition:** no exact-name candidate query performs an unconditional
 full scan of each scope. All precedence tests pass and P0 reports a measurable
 reduction in graph typecheck time or demonstrates that another phase dominates.
 
-Implement this after the P0/P1 checkpoint as a separate measured commit.
+**Focused measurement:** two uncontended helper-only A/B pairs held the
+renderer, parser, semantic middle, backend, host C compiler, and test workload
+constant while swapping only `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN`. The old
+environment took 18.091s and 19.342s to typecheck the combined inference/types
+workload; the indexed environment took 16.788s and 18.151s. The averages are
+18.717s and 17.470s respectively, a 6.7% typecheck improvement. This is a
+measurable but modest win, below the original 20-40% working estimate, so later
+work should follow P0 evidence rather than extending environment indexes
+speculatively.
+
+**Verification:** all ten compiler-owned source-work groups passed, totaling
+1,703 tests. The indexed environment, inference, and type suites also passed
+259 tests under ASan/UBSan. An aggregate invocation was terminated when an
+independent automatic `make install` rebuilt the whole compiler concurrently;
+rerunning every existing source-work group explicitly produced the complete
+passing result without changing selection or assertions.
 
 ### P3. Keep Generated-Test Frontend Work in Blorp
 
