@@ -1,4 +1,16 @@
 import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral, StringLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+		core_program_to_json,
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
@@ -24,6 +36,14 @@ import:
 
 
 pure func compiled_response_fixture() -> JsonValue:
+	compiled_response_fixture_with_core(JsonObject([
+		("kind", JsonString("program")),
+		("decls", JsonVector([])),
+		("foreign_includes", JsonVector([])),
+	]))
+
+
+pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
 	JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
@@ -33,13 +53,82 @@ pure func compiled_response_fixture() -> JsonValue:
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
-		("core", JsonObject([
-			("kind", JsonString("program")),
-			("decls", JsonVector([])),
-			("foreign_includes", JsonVector([])),
-		])),
+		("core", core),
 		("observations", JsonVector([])),
 	])
+
+
+pure func named_var(name: String) -> CoreVar:
+	{name = name, uniq = 0, def_id = None}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
+	desc: CoreVar = named_var("desc")
+	read: CoreVar = named_var("read")
+	string_type: CoreType = NamedType("String", [])
+	int_type: CoreType = NamedType("Int", [])
+	read_param: CoreParam = {
+		name = named_var("value"),
+		typ = string_type,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [
+			function_decl(
+				"read",
+				2,
+				[read_param],
+				int_type,
+				LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
+			),
+			function_decl(
+				"main",
+				1,
+				[],
+				int_type,
+				LetExpr(
+					desc,
+					True,
+					string_type,
+					LiteralExpr(
+						StringLiteral("description"),
+						string_type,
+						SyntheticSourceLoc,
+					),
+					CallExpr(
+						UserCall("read", Some(2), []),
+						VarExpr(read, NamedType("Function", []), SyntheticSourceLoc),
+						[VarExpr(desc, string_type, SyntheticSourceLoc)],
+						int_type,
+						SyntheticSourceLoc,
+					),
+				),
+			),
+		],
+		foreign_includes = []
+	}
 
 
 func write_source(path: String) -> Bool:
@@ -145,6 +234,30 @@ func test_run_builds_one_typed_request_and_artifact() -> Bool:
 				False
 
 
+func test_compile_emits_completed_core_without_repeating_late_pipeline() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_prepared_core.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+		response: JsonValue = compiled_response_fixture_with_core(
+			core_program_to_json(mutable_string_owner_pre_dce_program()),
+		)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, response):
+					CliCompileArtifact(_, artifact, _):
+						artifact.c_code.count("blorp_release(desc);") == 1
+					_:
+						False
+			_:
+				False
+
+
 pure func test_native_features_come_from_typed_graph() -> Bool:
 	graph: CliFrontendModuleGraph = {
 		context = {
@@ -209,6 +322,10 @@ tests: TestSuite = {
 		(
 			"run builds one typed request and artifact",
 			test_run_builds_one_typed_request_and_artifact,
+		),
+		(
+			"compile emits prepared Core without repeating the late pipeline",
+			test_compile_emits_completed_core_without_repeating_late_pipeline,
 		),
 		("native features come from typed graph", test_native_features_come_from_typed_graph),
 	]

@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-14.
+Status checked against code on 2026-07-16.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -49,6 +49,12 @@ graph. Compile and run invoke exactly one sibling `blorp-ocaml-middle` process
 with the typed semantic request, then Blorp runs the complete late Core
 pipeline, emits C, writes artifacts, invokes the host C compiler, manages the
 runtime cache, and runs the resulting program.
+
+The late-pipeline boundary is represented explicitly. The semantic worker and
+`emit_core_c` bridge exchange pre-DCE `CoreProgram`; `run_pre_dce_tail` returns
+`PreparedCoreProgram`, and only the prepared emitter accepts that value. The
+CLI therefore cannot accidentally repeat Perceus, resource, fairness, prepare,
+or prepared-reuse passes after `execute_late_core_stages` has completed them.
 
 `CliOcamlHostPlan` has no source-command variant. Run-plan JSON is rejected at
 the serializer, the OCaml bridge decoder represents compile graphs only, and
@@ -100,12 +106,15 @@ OCaml-reminted declarations, or restarting generated IDs at zero, is invalid.
 8. **The pinned bootstrap is immutable.** Keep the user-selected
    `dev-9f56c40d2b91` bootstrap until an all-green committed revision has
    published replacement artifacts. Rotate the pin in a later, isolated
-   commit. The workflow/script pin discrepancy must be resolved through one
-   authoritative manifest before that rotation.
+   commit. `compiler/bootstrap.env` is the authoritative release identity for
+   both the wrapper and CI cache keys.
 9. **One identity domain per compile graph.** Source functions, impl methods,
    and constructors receive deterministic graph-wide DefIds in Blorp. Every
    typed module installed in the OCaml middle comes from that graph response,
    and generated Core declarations allocate strictly above its high-water mark.
+10. **Late ownership runs exactly once.** Pre-DCE and prepared Core use distinct
+    types at the backend boundary. Bridge emission owns the late pipeline for
+    pre-DCE input; CLI emission consumes the already prepared result.
 
 ## Checkpoint A: Freeze A Green Baseline
 
@@ -118,11 +127,11 @@ Implementation:
 2. Record the revision, bootstrap tag, platform, and gate result in this file.
 3. Add a compact host-boundary inventory test or script that asserts normal
    `check`, `compile`, and `run` enter only the current expected handoff.
-4. Reconcile the bootstrap source of truth. Today the workflow files name
-   `dev-33e00c2b94df`, while `scripts/blorp-compiler-bootstrap` defaults to and
-   verifies `dev-9f56c40d2b91`. Introduce one checked-in manifest consumed by
-   both; do not silently choose whichever environment variable happens to be
-   present.
+4. Reconcile the bootstrap source of truth through one checked-in manifest
+   consumed by both the wrapper and CI; do not silently choose whichever
+   environment variable happens to be present. Complete:
+   `compiler/bootstrap.env` owns the tag, artifact version, and target
+   checksums, and workflow cache keys read the tag through the wrapper.
 5. Once the revision is committed and CI is green, let the existing release
    workflow publish immutable `dev-<sha>` binaries. Do not pin them yet.
 
@@ -807,6 +816,12 @@ Do not delete yet:
 
 Goal: publish and consume a compiler that exercises the new architecture
 without making the migration change depend on its own release.
+
+Status: prerequisite complete on this branch. `compiler/bootstrap.env` is now
+the single checked-in release identity consumed by the bootstrap wrapper and
+all CI cache keys. The pin intentionally remains on the previous immutable
+release until this branch is merged and release CI publishes all three target
+artifacts; the actual rotation must be a separate commit.
 
 Implementation:
 

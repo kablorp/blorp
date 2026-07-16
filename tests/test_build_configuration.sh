@@ -53,6 +53,65 @@ if grep -Eq '~/.cache/dune|~/Library/Caches/dune' "$setup_action"; then
 	exit 1
 fi
 
+bootstrap_manifest=compiler/bootstrap.env
+if [ ! -f "$bootstrap_manifest" ]; then
+	echo "FAIL: the compiler bootstrap must have one checked-in manifest" >&2
+	exit 1
+fi
+
+# The manifest is checked-in shell data so the bootstrap wrapper and CI can
+# share one release identity without maintaining a second parser.
+# shellcheck source=../compiler/bootstrap.env
+source "$bootstrap_manifest"
+
+for required_bootstrap_value in \
+	BLORP_BOOTSTRAP_REPO \
+	BLORP_BOOTSTRAP_TAG \
+	BLORP_BOOTSTRAP_VERSION \
+	BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN \
+	BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU \
+	BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU
+do
+	if [ -z "${!required_bootstrap_value:-}" ]; then
+		echo "FAIL: $bootstrap_manifest must define $required_bootstrap_value" >&2
+		exit 1
+	fi
+done
+
+if [[ ! "$BLORP_BOOTSTRAP_TAG" =~ ^dev-[0-9a-f]{12}$ ]]; then
+	echo "FAIL: $bootstrap_manifest must pin an immutable dev revision" >&2
+	exit 1
+fi
+
+bootstrap_revision=${BLORP_BOOTSTRAP_TAG#dev-}
+if [[ "$BLORP_BOOTSTRAP_VERSION" != *"-dev.$bootstrap_revision" ]]; then
+	echo "FAIL: the bootstrap artifact version must match $BLORP_BOOTSTRAP_TAG" >&2
+	exit 1
+fi
+
+for bootstrap_sha in \
+	"$BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" \
+	"$BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" \
+	"$BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
+do
+	if [[ ! "$bootstrap_sha" =~ ^[0-9a-f]{64}$ ]]; then
+		echo "FAIL: $bootstrap_manifest contains an invalid target checksum" >&2
+		exit 1
+	fi
+done
+
+if [ "$(scripts/blorp-compiler-bootstrap --print-tag)" != "$BLORP_BOOTSTRAP_TAG" ]; then
+	echo "FAIL: the bootstrap wrapper must read its default tag from $bootstrap_manifest" >&2
+	exit 1
+fi
+
+overridden_tag=$(BLORP_COMPILER_BOOTSTRAP_TAG=dev-000000000000 \
+	scripts/blorp-compiler-bootstrap --print-tag)
+if [ "$overridden_tag" != "$BLORP_BOOTSTRAP_TAG" ]; then
+	echo "FAIL: an ambient environment variable must not override the bootstrap manifest" >&2
+	exit 1
+fi
+
 for workflow in \
 	.github/workflows/ci.yml \
 	.github/workflows/premerge.yml \
@@ -61,6 +120,18 @@ for workflow in \
 do
 	if ! grep -Fq 'name: Cache Dune build artifacts' "$workflow"; then
 		echo "FAIL: $workflow must cache Dune build artifacts explicitly" >&2
+		exit 1
+	fi
+	if grep -Eq 'BLORP_COMPILER_BOOTSTRAP_TAG: dev-[0-9a-f]+' "$workflow"; then
+		echo "FAIL: $workflow must not carry an independent compiler bootstrap pin" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'id: compiler-bootstrap' "$workflow"; then
+		echo "FAIL: $workflow must load the compiler bootstrap manifest" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'steps.compiler-bootstrap.outputs.tag' "$workflow"; then
+		echo "FAIL: $workflow cache keys must use the compiler bootstrap manifest tag" >&2
 		exit 1
 	fi
 done

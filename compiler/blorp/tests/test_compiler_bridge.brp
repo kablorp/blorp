@@ -2,14 +2,27 @@ import:
 	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
 	../src/stage_09_core/compiler_core_json:
 		CoreBinaryOp(AddOp),
+		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl),
-		CoreExpr(BinaryExpr, CooperativeCheckpointExpr, LiteralExpr, SeqExpr, VoidExpr, WhileExpr),
+		CoreExpr(
+			BinaryExpr,
+			CallExpr,
+			CooperativeCheckpointExpr,
+			LetExpr,
+			LiteralExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
-		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
+		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType, VoidType),
+		CoreVar,
 		core_program_to_json,
 		decode_core_program_json,
 	../src/stage_12_cli/compiler_bridge: handle_request
@@ -386,6 +399,75 @@ pure func test_emit_core_c_core_payload_request() -> Bool:
 				and artifact_string_field(response, "c_code").contains("int main(void)")
 				and artifact_string_field(response, "c_code").contains("return (39 + 3);")
 			)
+		None:
+			False
+
+
+pure func bridge_mutable_string_pre_dce_program() -> CoreProgram:
+	desc: CoreVar = {name = "desc", uniq = 0, def_id = None}
+	read: CoreVar = {name = "read", uniq = 0, def_id = None}
+	string_type: CoreType = NamedType("String", [])
+	int_type: CoreType = NamedType("Int", [])
+	read_param: CoreParam = {
+		name = {name = "value", uniq = 0, def_id = None},
+		typ = string_type,
+		loc = SyntheticSourceLoc
+	}
+	read_func: CoreFunction = {
+		name = "read",
+		source_module = None,
+		type_params = [],
+		params = [read_param],
+		return_type = int_type,
+		body = Some(LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 5,
+		loc = SyntheticSourceLoc
+	}
+	render_func: CoreFunction = {
+		name = "render",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type,
+		body = Some(
+			LetExpr(
+				desc,
+				True,
+				string_type,
+				LiteralExpr(StringLiteral("description"), string_type, SyntheticSourceLoc),
+				CallExpr(
+					UserCall("read", Some(5), []),
+					VarExpr(read, NamedType("Function", []), SyntheticSourceLoc),
+					[VarExpr(desc, string_type, SyntheticSourceLoc)],
+					int_type,
+					SyntheticSourceLoc,
+				),
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 4,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(read_func), FunctionDecl(render_func)],
+		foreign_includes = []
+	}
+
+
+pure func test_emit_core_c_preserves_mutable_owner_cleanup() -> Bool:
+	request: String = request_json(
+		"emit_core_c",
+		JsonObject([("core", core_program_to_json(bridge_mutable_string_pre_dce_program()))]),
+	)
+
+	match response_value(request):
+		Some(response):
+			code: String = artifact_string_field(response, "c_code")
+			bool_field(response, "ok") and code.count("blorp_release(desc);") == 1
 		None:
 			False
 
@@ -1067,6 +1149,10 @@ tests: TestSuite = {
 		("render core stage request", test_render_core_stage_request),
 		("render core trait resolve request", test_render_core_trait_resolve_request),
 		("emit_core_c Core payload request", test_emit_core_c_core_payload_request),
+		(
+			"emit_core_c preserves mutable owner cleanup",
+			test_emit_core_c_preserves_mutable_owner_cleanup,
+		),
 		(
 			"run_core_pipeline tail stage returns Core payload",
 			test_run_core_pipeline_tail_stage_returns_core_payload,

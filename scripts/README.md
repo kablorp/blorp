@@ -176,10 +176,11 @@ the same helper more than once.
 
 The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
 explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
-which downloads and verifies the pinned dev release `dev-9f56c40d2b91` into
+which reads the immutable release identity and per-target checksums from
+`compiler/bootstrap.env`, then downloads and verifies that release into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
-when set. Update the tag, version, and target checksums in that script together
-when intentionally moving the fallback bootstrap forward.
+when set. Rotate the tag, version, and all target checksums together in that
+single manifest only after release CI has published the merged revision.
 
 Both helper builds call the normal `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
@@ -199,6 +200,7 @@ Useful compiler bootstrap commands:
 
 ```bash
 scripts/blorp-compiler-bootstrap --print-id
+scripts/blorp-compiler-bootstrap --print-tag
 scripts/blorp-compiler-bootstrap --print-path
 scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp
 ```

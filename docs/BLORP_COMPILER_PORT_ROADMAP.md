@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-12.
+Status checked against code on 2026-07-16.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -20,16 +20,16 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
 Blorp executable / CLI planning / source graph discovery / source reads / parse
-  -> JSON frontend module graph and Blorp typed-program/CTFE bridge
-  -> OCaml host command execution / module-cache and coherence orchestration /
-     typed-artifact decode
+  -> Blorp typecheck / CTFE / typed semantic-middle request
+  -> one blorp-ocaml-middle process
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
   -> OCaml Core pipeline through specialization and function-reference adaptation
   -> JSON pre-DCE Core
   -> Blorp DCE / consume specialization / Perceus / reuse / closure / resource /
      fairness / prepare / prepared reuse
   -> Blorp C artifact emission
-  -> OCaml artifact writing / C compiler invocation
+  -> Blorp artifact writing / runtime cache / C compiler invocation /
+     optional program execution
 ```
 
 Current source-frontier Blorp files:
@@ -83,12 +83,9 @@ Current production backend-tail Blorp files:
 
 Current OCaml bridge, orchestration, and production-middle files:
 
-- `compiler/bin/blorp_ocaml_host.ml`
+- `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/modules.ml`
 - `compiler/lib/pipeline.ml`
-- `compiler/lib/typecheck.ml`
-- `compiler/lib/infer.ml`
 - `compiler/lib/typed_ast.ml`
 - `compiler/lib/core_lower.ml`
 - `compiler/lib/core_pipeline.ml`
@@ -103,9 +100,11 @@ and the complete backend tail; the replaced OCaml implementations and their
 implementation-only tests have been deleted.
 
 The public executable is Blorp-owned through
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
-private execution shell for decoded Blorp plans, temporary typed-program
-handoffs, artifact writing, host C invocation, and still-OCaml compiler stages.
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. Ordinary `check` makes
+no OCaml call. Ordinary `compile` and `run` call only the private
+`blorp-ocaml-middle` semantic worker; source-command effects stay in Blorp.
+`compiler/bin/blorp_ocaml_host.ml` remains only for non-source commands and the
+explicit pinned-bootstrap compile wrapper.
 
 ## Migration Rules
 
@@ -2470,17 +2469,20 @@ in `BLORP_OCAML_HOST_EXIT_ROADMAP.md`. It is also authoritative for replacing
 the serialized CLI/module-graph plan with one phase-specific semantic-middle
 worker. The summary below remains as an index of the affected compiler areas.
 
+Status: production cutover is complete. Blorp owns source-command artifact
+writing, runtime packaging and caching, host-C invocation, and program
+execution. Pre-DCE and prepared Core are distinct backend-boundary types, so
+the CLI cannot repeat the late ownership pipeline before emission. The
+remaining work is Checkpoint K of the host-exit roadmap: merge and publish this
+architecture from the old immutable bootstrap, then rotate the single
+bootstrap manifest in a separate commit.
+
 OCaml references:
 
 - `compiler/bin/blorp_ocaml_host.ml`
-  - `write_file`
-  - `write_compile_output`
-  - `run_file`
+  - `run_bootstrap_compile`, used only by the pinned bootstrap wrapper
 - `compiler/lib/test_runner.ml`
-  - `compile_c_from_stdin`
-  - `precompile_runtime`
-  - `runtime_cache_key`
-  - `cc_args_for_test_binary`
+  - shared test-command compilation, scheduled for Checkpoint 12
 - `compiler/lib/runtime.c`
 - `compiler/lib/runtime_decl.c`
 - `compiler/lib/runtime_raylib.c`
@@ -2488,10 +2490,11 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`
 - `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
-- future `compiler_artifact_writer.brp`
-- future `compiler_host_c.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_artifact_writer.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_host_c.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_runtime_cache.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_program_runner.brp`
 
 Implementation steps:
 
@@ -2522,9 +2525,10 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml artifact writing and host-C wrapper only after the Blorp CLI can
-  perform impure file/process actions directly and the preview smoke commands
-  pass through the Blorp shell.
+- Complete for ordinary source commands. Delete the narrow OCaml bootstrap
+  compile wrapper only after the post-merge compiler release is pinned and no
+  longer requires it. Test-runner process/C compilation remains a separate
+  Checkpoint 12 responsibility.
 
 ## Checkpoint 12: Tools, Test Runner, REPL, LSP, Packages, And Final OCaml Shell
 
