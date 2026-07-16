@@ -487,11 +487,12 @@ environment-size scans a material cost.
 **Implementation:**
 
 - Change the existing per-scope `symbols_by_name` dictionary to map each name to
-  one newest-first `List[CompilerSymbol]`. The first item is the latest symbol,
-  so a second latest-only dictionary would duplicate state and create an
-  unnecessary consistency invariant.
-- Keep the ordered symbol list for deterministic full enumeration, record-field
-  shape matching, callable-id lookup, and fuzzy diagnostics.
+  one newest-first list of positions in the scope's canonical symbol list. The
+  first position names the latest symbol. This avoids retaining a second copy of
+  every symbol and its nominal type graph merely to accelerate lookup.
+- Keep the canonical symbol list in declaration order for deterministic full
+  enumeration, record-field shape matching, callable-id lookup, and fuzzy
+  diagnostics. Resolve indexed positions only at the lookup boundary.
 - Update `compiler_scope_add_symbol` once so the ordered list and candidate
   index cannot diverge. Centralize candidate and latest lookup in private scope
   helpers.

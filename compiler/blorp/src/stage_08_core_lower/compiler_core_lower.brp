@@ -21,12 +21,18 @@ import:
 			ParsedSubtractOp,
 		),
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
+		ParsedFunctionBodyKind(
+			ParsedFunctionBuiltinBody,
+			ParsedFunctionForwardDecl,
+			ParsedFunctionSourceBody,
+		),
 		ParsedIdentifier,
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder),
 		ParsedTypeParamDecl,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+		parsed_function_body_kind,
 	../stage_05_types/compiler_type:
 		CompilerType(
 			CompilerArrayType,
@@ -118,7 +124,11 @@ import:
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedLambdaParam,
-		CompilerTypedLoopView(CompilerTypedIndicesLoopView),
+		CompilerTypedLoopView(
+			CompilerTypedEnumerate2LoopView,
+			CompilerTypedEnumerateLoopView,
+			CompilerTypedIndicesLoopView,
+		),
 		CompilerTypedMatchCase,
 		CompilerTypedPattern(
 			CompilerTypedBoolPattern,
@@ -211,7 +221,7 @@ import:
 			VoidBox,
 		),
 		CoreBoxedStorageValue,
-		CoreCallKind(BuiltinCall, SelectedDirectCall, UnknownCall),
+		CoreCallKind(BuiltinCall, IntrinsicCall, SelectedDirectCall, UnknownCall),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
@@ -289,7 +299,7 @@ import:
 		CoreForeignArgPassing(ForeignBorrowArgs, ForeignDefaultArgs),
 		CoreForeignLinkFlag,
 		CoreFunction,
-		CoreFunctionKind(ForeignFunction, UserFunction),
+		CoreFunctionKind(BuiltinFunction, ForeignFunction, UserFunction),
 		CoreHeapRecordField,
 		CoreListConstruct,
 		CoreListStorageLayout(PointerListStorage),
@@ -362,6 +372,12 @@ union CompilerCoreLowerError:
 	CompilerCoreLowerInvalidCall(String)
 
 
+private union CompilerCoreLowerFunctionBody:
+	CompilerCoreLowerUserFunctionBody(CoreExpr)
+	CompilerCoreLowerForwardDeclaration
+	CompilerCoreLowerBuiltinDeclaration
+
+
 enum CompilerCoreLowerCarrierKind:
 	CompilerCoreLowerOptionCarrier
 	CompilerCoreLowerResultCarrier
@@ -401,6 +417,12 @@ record CompilerCoreLowerForParts {
 	binder: CoreLoopBinder,
 	iterable: CoreExpr,
 	iterable_release_policy: CoreReleasePolicy,
+	body: CoreExpr
+}
+
+
+private record CompilerCoreLowerLoopBinding {
+	binder: CoreLoopBinder,
 	body: CoreExpr
 }
 
@@ -478,6 +500,10 @@ private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
 					(name, None)
 	else:
 		(name, None)
+
+
+private pure func trait_method_target_name(module_path: String, source_name: String) -> String:
+	UFCS_PREFIX + module_path.replace("/", "$") + "__" + source_name
 
 
 private pure func compiler_core_tensor_dim(
@@ -663,6 +689,38 @@ private pure func question_bind_name(label: String, span: CompilerSourceSpan) ->
 
 private pure func tuple_destruct_name(span: CompilerSourceSpan) -> String:
 	"__td_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+
+
+private pure func loop_view_internal_name(label: String, span: CompilerSourceSpan) -> String:
+	"__loop_" + label + "_" + span.start_line.to_string() + "_" + span.start_column.to_string()
+
+
+private pure func for_binder_span(binder: ParsedForBinder) -> CompilerSourceSpan:
+	match binder:
+		ParsedForNameBinder(name):
+			name.span
+		ParsedForTupleBinder(_, span):
+			span
+
+
+private pure func loop_view_binder_name(
+	binder: ParsedForBinder,
+	position: Int,
+	label: String,
+	span: CompilerSourceSpan,
+) -> String:
+	match binder:
+		ParsedForTupleBinder(names, _):
+			match names.get(position):
+				Some(name):
+					if name.text == "_":
+						loop_view_internal_name(label, span)
+					else:
+						name.text
+				None:
+					loop_view_internal_name(label, span)
+		ParsedForNameBinder(_):
+			loop_view_internal_name(label, span)
 
 
 private pure func core_carrier_kind(
@@ -878,6 +936,30 @@ private pure func builtin_core_call(
 		args,
 		return_type,
 		clone_core_source_loc(loc),
+	)
+
+
+private pure func core_param_value(param: CoreParam) -> CoreExpr:
+	VarExpr(
+		clone_core_var(param.name),
+		clone_core_type(param.typ),
+		clone_core_source_loc(param.loc),
+	)
+
+
+private pure func lower_runtime_helper_body(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CompilerCoreLowerFunctionBody:
+	CompilerCoreLowerUserFunctionBody(
+		builtin_core_call(
+			name,
+			params.map(core_param_value),
+			return_type,
+			loc,
+		),
 	)
 
 
@@ -1949,6 +2031,62 @@ private pure func lower_for_name_binder(
 			Err(CompilerCoreLowerUnsupported("tuple for binder"))
 
 
+private pure func lower_typed_for_binding(
+	binder: ParsedForBinder,
+	element_type: CompilerType,
+	body: CompilerTypedExpr,
+) -> Result[CompilerCoreLowerLoopBinding, CompilerCoreLowerError]:
+	lowered_body ?= lower_typed_expr(body)
+
+	match binder:
+		ParsedForNameBinder(_):
+			lowered_binder ?= lower_for_name_binder(binder, element_type)
+			Ok({
+				binder = lowered_binder,
+				body = lowered_body,
+			})
+		ParsedForTupleBinder(names, span):
+			match element_type:
+				CompilerTupleType(element_types):
+					if names.length() != element_types.length():
+						Err(
+							CompilerCoreLowerInvalidType(
+								"tuple for binder has ${names.length()} names but element type has ${element_types.length()} fields",
+							),
+						)
+					else:
+						field_types ?= compiler_core_lower_type_list(element_types)
+						tuple_type: CoreType = TupleType(field_types)
+						tuple_var = core_var(tuple_destruct_name(span), None)
+						tuple_ref = VarExpr(
+							clone_core_var(tuple_var),
+							clone_core_type(tuple_type),
+							compiler_core_source_loc(span),
+						)
+						body_with_bindings ?= lower_tuple_destruct_bindings(
+							names,
+							0,
+							tuple_ref,
+							field_types,
+							lowered_body,
+							compiler_core_source_loc(span),
+						)
+						Ok({
+							binder = {
+								variable = tuple_var,
+								typ = tuple_type,
+								range_direction = RangeMayRunBackward
+							},
+							body = body_with_bindings,
+						})
+				_:
+					Err(
+						CompilerCoreLowerInvalidType(
+							"tuple for binder requires a tuple element type",
+						),
+					)
+
+
 private pure func lower_typed_range_for(
 	binder: ParsedForBinder,
 	iterable: CompilerTypedExpr,
@@ -1983,15 +2121,14 @@ private pure func lower_typed_for_parts(
 ) -> Result[CompilerCoreLowerForParts, CompilerCoreLowerError]:
 	iterable_type: CompilerType = compiler_typed_expr_value_type(iterable)
 	iterable_core_type ?= compiler_core_lower_type(iterable_type)
-	lowered_binder ?= lower_for_name_binder(binder, element_type)
+	lowered_binding ?= lower_typed_for_binding(binder, element_type, body)
 	lowered_iterable ?= lower_typed_expr(iterable)
-	lowered_body ?= lower_typed_expr(body)
 
 	Ok({
-		binder = lowered_binder,
+		binder = lowered_binding.binder,
 		iterable = lowered_iterable,
 		iterable_release_policy = TypeLayout.cleanup_release_policy_for_type(iterable_core_type),
-		body = lowered_body,
+		body = lowered_binding.body,
 	})
 
 
@@ -2031,8 +2168,14 @@ private pure func lower_typed_named_iterable_for(
 		Ok(ForStringExpr(for_string, typ, loc))
 	else if normalized_name == "Dict":
 		match args:
-			[key_type, _]:
-				parts ?= lower_typed_for_parts(binder, key_type, iterable, body)
+			[key_type, value_type]:
+				element_type: CompilerType = match binder:
+					ParsedForTupleBinder(_, _):
+						CompilerTupleType([key_type, value_type])
+					ParsedForNameBinder(_):
+						key_type
+
+				parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
 				for_dict: CoreForDict = {
 					binder = parts.binder,
 					iterable = parts.iterable,
@@ -2159,6 +2302,517 @@ private pure func lower_typed_indices_for(
 	)
 
 
+private pure func lower_enumerate_loop_body(
+	binder: ParsedForBinder,
+	span: CompilerSourceSpan,
+	index_var: CoreVar,
+	index_type: CoreType,
+	element_expr: CoreExpr,
+	element_type: CoreType,
+	body: CompilerTypedExpr,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	lowered_body ?= lower_typed_expr(body)
+
+	match binder:
+		ParsedForTupleBinder(names, _):
+			if names.length() != 2:
+				Err(
+					CompilerCoreLowerInvalidType(
+						"enumerate tuple loop requires exactly two binders",
+					),
+				)
+			else:
+				match (names.get(0), names.get(1)):
+					(Some(index_name), Some(element_name)):
+						if index_name.text != "_" and index_name.text != index_var.name:
+							Err(
+								CompilerCoreLowerInvalidType(
+									"enumerate index binder does not match its Core loop variable",
+								),
+							)
+						else if element_name.text == "_":
+							Ok(lowered_body)
+						else:
+							Ok(
+								LetExpr(
+									core_var(element_name.text, None),
+									False,
+									element_type,
+									element_expr,
+									lowered_body,
+								),
+							)
+					_:
+						Err(
+							CompilerCoreLowerInvalidType(
+								"enumerate tuple loop has incomplete binder metadata",
+							),
+						)
+		ParsedForNameBinder(name):
+			if name.text == "_":
+				Ok(lowered_body)
+			else:
+				tuple_type: CoreType = TupleType(
+					[clone_core_type(index_type), clone_core_type(element_type)],
+				)
+				index_ref = VarExpr(
+					clone_core_var(index_var),
+					clone_core_type(index_type),
+					compiler_core_source_loc(span),
+				)
+
+				Ok(
+					LetExpr(
+						core_var(
+							name.text,
+							None,
+						),
+						False,
+						tuple_type,
+						TupleExpr(
+							[index_ref, element_expr],
+							clone_core_type(tuple_type),
+							compiler_core_source_loc(span),
+						),
+						lowered_body,
+					),
+				)
+
+
+private pure func lower_typed_1d_enumerate_for(
+	binder: ParsedForBinder,
+	source: CompilerTypedExpr,
+	source_type: CompilerType,
+	index_source_type: CompilerType,
+	element_source_type: CompilerType,
+	body: CompilerTypedExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	span: CompilerSourceSpan = for_binder_span(binder)
+
+	index_name: String = loop_view_binder_name(binder, 0, "enumerate_index", span)
+
+	index_type ?= compiler_core_lower_type(index_source_type)
+	element_type ?= compiler_core_lower_type(element_source_type)
+	lowered_source ?= lower_typed_expr(source)
+	lowered_source_type ?= compiler_core_lower_type(source_type)
+	source_var = core_var(
+		loop_view_internal_name("enumerate_source", span),
+		None,
+	)
+	index_var = core_var(index_name, None)
+	element_expr = unknown_named_core_call(
+		"checked_get",
+		[
+			VarExpr(
+				clone_core_var(source_var),
+				clone_core_type(lowered_source_type),
+				clone_core_source_loc(loc),
+			),
+			VarExpr(
+				clone_core_var(index_var),
+				clone_core_type(index_type),
+				clone_core_source_loc(loc),
+			),
+		],
+		clone_core_type(element_type),
+		clone_core_source_loc(loc),
+	)
+	loop_body ?= lower_enumerate_loop_body(
+		binder,
+		span,
+		index_var,
+		index_type,
+		element_expr,
+		element_type,
+		body,
+	)
+	length_call = unknown_named_core_call(
+		"length",
+		[
+			VarExpr(
+				clone_core_var(source_var),
+				clone_core_type(lowered_source_type),
+				clone_core_source_loc(loc),
+			),
+		],
+		core_int_type(),
+		clone_core_source_loc(loc),
+	)
+	loop_expr = ForRangeExpr(
+		{
+			variable = index_var,
+			typ = index_type,
+			range_direction = RangeMayRunBackward
+		},
+		core_int_literal(
+			0,
+			clone_core_source_loc(loc),
+		),
+		length_call,
+		loop_body,
+		typ,
+		clone_core_source_loc(loc),
+	)
+
+	Ok(LetExpr(source_var, False, lowered_source_type, lowered_source, loop_expr))
+
+
+private pure func lower_typed_enumerate_for(
+	binder: ParsedForBinder,
+	iterable: CompilerTypedExpr,
+	loop_element_type: CompilerType,
+	body: CompilerTypedExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	source ?= typed_loop_view_source(iterable, "enumerate")
+	source_type: CompilerType = compiler_typed_expr_value_type(source)
+
+	match loop_element_type:
+		CompilerTupleType(elements):
+			if elements.length() != 2:
+				Err(
+					CompilerCoreLowerInvalidType(
+						"enumerate loop view must yield an (index, element) tuple",
+					),
+				)
+			else:
+				match compiler_array_type_parts(source_type):
+					Some((_, dims)):
+						if dims.length() != 1:
+							Err(
+								CompilerCoreLowerUnsupported(
+									"enumerate over multidimensional tensor",
+								),
+							)
+						else:
+							match (elements.get(0), elements.get(1)):
+								(Some(index_type), Some(element_type)):
+									lower_typed_1d_enumerate_for(
+										binder,
+										source,
+										source_type,
+										index_type,
+										element_type,
+										body,
+										typ,
+										loc,
+									)
+								_:
+									Err(
+										CompilerCoreLowerInvalidType(
+											"enumerate loop view has incomplete element metadata",
+										),
+									)
+					None:
+						Err(CompilerCoreLowerInvalidType("enumerate requires a tensor source"))
+		_:
+			Err(
+				CompilerCoreLowerInvalidType(
+					"enumerate loop view must yield an (index, element) tuple",
+				),
+			)
+
+
+private pure func lower_enumerate2_loop_body(
+	binder: ParsedForBinder,
+	span: CompilerSourceSpan,
+	row_var: CoreVar,
+	row_type: CoreType,
+	column_var: CoreVar,
+	column_type: CoreType,
+	element_expr: CoreExpr,
+	element_type: CoreType,
+	body: CompilerTypedExpr,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	lowered_body ?= lower_typed_expr(body)
+
+	match binder:
+		ParsedForTupleBinder(names, _):
+			if names.length() != 3:
+				Err(
+					CompilerCoreLowerInvalidType(
+						"enumerate2 tuple loop requires exactly three binders",
+					),
+				)
+			else:
+				match (names.get(0), names.get(1), names.get(2)):
+					(Some(row_name), Some(column_name), Some(element_name)):
+						if row_name.text != "_" and row_name.text != row_var.name:
+							Err(
+								CompilerCoreLowerInvalidType(
+									"enumerate2 row binder does not match its Core loop variable",
+								),
+							)
+						else if column_name.text != "_" and column_name.text != column_var.name:
+							Err(
+								CompilerCoreLowerInvalidType(
+									"enumerate2 column binder does not match its Core loop variable",
+								),
+							)
+						else if element_name.text == "_":
+							Ok(lowered_body)
+						else:
+							Ok(
+								LetExpr(
+									core_var(element_name.text, None),
+									False,
+									element_type,
+									element_expr,
+									lowered_body,
+								),
+							)
+					_:
+						Err(
+							CompilerCoreLowerInvalidType(
+								"enumerate2 tuple loop has incomplete binder metadata",
+							),
+						)
+		ParsedForNameBinder(name):
+			if name.text == "_":
+				Ok(lowered_body)
+			else:
+				tuple_type: CoreType = TupleType([
+					clone_core_type(row_type),
+					clone_core_type(column_type),
+					clone_core_type(element_type),
+				])
+				row_ref = VarExpr(
+					clone_core_var(row_var),
+					clone_core_type(row_type),
+					compiler_core_source_loc(span),
+				)
+				column_ref = VarExpr(
+					clone_core_var(column_var),
+					clone_core_type(column_type),
+					compiler_core_source_loc(span),
+				)
+
+				Ok(
+					LetExpr(
+						core_var(
+							name.text,
+							None,
+						),
+						False,
+						tuple_type,
+						TupleExpr(
+							[row_ref, column_ref, element_expr],
+							clone_core_type(tuple_type),
+							compiler_core_source_loc(span),
+						),
+						lowered_body,
+					),
+				)
+
+
+private pure func lower_typed_2d_enumerate2_for(
+	binder: ParsedForBinder,
+	source: CompilerTypedExpr,
+	source_type: CompilerType,
+	row_source_type: CompilerType,
+	column_source_type: CompilerType,
+	element_source_type: CompilerType,
+	column_dim: CompilerType,
+	body: CompilerTypedExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	span: CompilerSourceSpan = for_binder_span(binder)
+	row_name: String = loop_view_binder_name(binder, 0, "enumerate2_row", span)
+	column_name: String = loop_view_binder_name(binder, 1, "enumerate2_column", span)
+	row_type ?= compiler_core_lower_type(row_source_type)
+	column_type ?= compiler_core_lower_type(column_source_type)
+	element_type ?= compiler_core_lower_type(element_source_type)
+	lowered_source ?= lower_typed_expr(source)
+	lowered_source_type ?= compiler_core_lower_type(source_type)
+	source_var = core_var(
+		loop_view_internal_name("enumerate2_source", span),
+		None,
+	)
+	row_var = core_var(row_name, None)
+	column_var = core_var(column_name, None)
+	row_ref = VarExpr(
+		clone_core_var(row_var),
+		clone_core_type(row_type),
+		clone_core_source_loc(loc),
+	)
+	column_ref = VarExpr(
+		clone_core_var(column_var),
+		clone_core_type(column_type),
+		clone_core_source_loc(loc),
+	)
+	element_expr = unknown_named_core_call(
+		"matrix_checked_get",
+		[
+			VarExpr(
+				clone_core_var(source_var),
+				clone_core_type(lowered_source_type),
+				clone_core_source_loc(loc),
+			),
+			row_ref,
+			column_ref,
+		],
+		clone_core_type(element_type),
+		clone_core_source_loc(loc),
+	)
+	loop_body ?= lower_enumerate2_loop_body(
+		binder,
+		span,
+		row_var,
+		row_type,
+		column_var,
+		column_type,
+		element_expr,
+		element_type,
+		body,
+	)
+	rows_call = unknown_named_core_call(
+		"length",
+		[
+			VarExpr(
+				clone_core_var(source_var),
+				clone_core_type(lowered_source_type),
+				clone_core_source_loc(loc),
+			),
+		],
+		core_int_type(),
+		clone_core_source_loc(loc),
+	)
+
+	column_count: CoreExpr = match column_dim:
+		CompilerConstIntType(value):
+			core_int_literal(value, clone_core_source_loc(loc))
+		_:
+			capacity_call = CallExpr(
+				IntrinsicCall("tensor_capacity"),
+				VoidExpr(VoidType, clone_core_source_loc(loc)),
+				[
+					VarExpr(
+						clone_core_var(source_var),
+						clone_core_type(lowered_source_type),
+						clone_core_source_loc(loc),
+					),
+				],
+				core_int_type(),
+				clone_core_source_loc(loc),
+			)
+			column_rows_call = unknown_named_core_call(
+				"length",
+				[
+					VarExpr(
+						clone_core_var(source_var),
+						clone_core_type(lowered_source_type),
+						clone_core_source_loc(loc),
+					),
+				],
+				core_int_type(),
+				clone_core_source_loc(loc),
+			)
+
+			BinaryExpr(
+				DivideOp,
+				capacity_call,
+				column_rows_call,
+				core_int_type(),
+				clone_core_source_loc(loc),
+			)
+
+	inner_loop = ForRangeExpr(
+		{
+			variable = column_var,
+			typ = column_type,
+			range_direction = RangeMayRunBackward
+		},
+		core_int_literal(
+			0,
+			clone_core_source_loc(loc),
+		),
+		column_count,
+		loop_body,
+		typ,
+		clone_core_source_loc(loc),
+	)
+	outer_loop = ForRangeExpr(
+		{
+			variable = row_var,
+			typ = row_type,
+			range_direction = RangeMayRunBackward
+		},
+		core_int_literal(
+			0,
+			clone_core_source_loc(loc),
+		),
+		rows_call,
+		inner_loop,
+		typ,
+		clone_core_source_loc(loc),
+	)
+
+	Ok(LetExpr(source_var, False, lowered_source_type, lowered_source, outer_loop))
+
+
+private pure func lower_typed_enumerate2_for(
+	binder: ParsedForBinder,
+	iterable: CompilerTypedExpr,
+	loop_element_type: CompilerType,
+	body: CompilerTypedExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	source ?= typed_loop_view_source(iterable, "enumerate2")
+	source_type: CompilerType = compiler_typed_expr_value_type(source)
+
+	match loop_element_type:
+		CompilerTupleType(elements):
+			if elements.length() != 3:
+				Err(
+					CompilerCoreLowerInvalidType(
+						"enumerate2 loop view must yield a (row, column, element) tuple",
+					),
+				)
+			else:
+				match compiler_array_type_parts(source_type):
+					Some((_, dims)):
+						if dims.length() != 2:
+							Err(
+								CompilerCoreLowerUnsupported(
+									"enumerate2 requires a two-dimensional tensor",
+								),
+							)
+						else:
+							match (elements.get(0), elements.get(1), elements.get(2), dims.get(1)):
+								(Some(row_source_type), Some(column_source_type), Some(element_source_type), Some(column_dim)):
+									lower_typed_2d_enumerate2_for(
+										binder,
+										source,
+										source_type,
+										row_source_type,
+										column_source_type,
+										element_source_type,
+										column_dim,
+										body,
+										typ,
+										loc,
+									)
+								_:
+									Err(
+										CompilerCoreLowerInvalidType(
+											"enumerate2 loop view has incomplete element or dimension metadata",
+										),
+									)
+					None:
+						Err(CompilerCoreLowerInvalidType("enumerate2 requires a tensor source"))
+		_:
+			Err(
+				CompilerCoreLowerInvalidType(
+					"enumerate2 loop view must yield a (row, column, element) tuple",
+				),
+			)
+
+
 private pure func lower_typed_for(
 	binder: ParsedForBinder,
 	iterable: CompilerTypedExpr,
@@ -2170,6 +2824,10 @@ private pure func lower_typed_for(
 	match loop_view:
 		Some(CompilerTypedIndicesLoopView(element_type)):
 			lower_typed_indices_for(binder, iterable, element_type, body, typ, loc)
+		Some(CompilerTypedEnumerateLoopView(element_type)):
+			lower_typed_enumerate_for(binder, iterable, element_type, body, typ, loc)
+		Some(CompilerTypedEnumerate2LoopView(element_type)):
+			lower_typed_enumerate2_for(binder, iterable, element_type, body, typ, loc)
 		Some(_):
 			Err(CompilerCoreLowerUnsupported("for loop view"))
 		None:
@@ -2383,10 +3041,10 @@ private pure func lower_resolved_call_kind(
 							Ok(UnknownCall)
 						CompilerCallableForeign:
 							Ok(UnknownCall)
-				CompilerResolvedTraitMethodCall(_, callable_id):
-					match callable_id:
-						Some(id):
-							lower_user_call_kind(info, id, callee)
+				CompilerResolvedTraitMethodCall(_, impl_target):
+					match impl_target:
+						Some(target):
+							lower_user_call_kind(info, target.callable_id, callee)
 						None:
 							Err(
 								CompilerCoreLowerUnsupported(
@@ -2950,8 +3608,18 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 	loc: CoreSourceLoc = compiler_core_source_loc(typed_expr_span(expr))
 
 	match expr:
-		CompilerTypedNameExpr(name, _):
-			(clean_name, def_id) = split_var_callable_id(name.text)
+		CompilerTypedNameExpr(name, info):
+			resolved_name = match info.resolved_call:
+				Some(resolved):
+					match resolved.target:
+						CompilerResolvedTraitMethodCall(_, Some(target)):
+							trait_method_target_name(target.module_path, resolved.source_name)
+						_:
+							name.text
+				None:
+					name.text
+
+			(clean_name, def_id) = split_var_callable_id(resolved_name)
 			Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
 		CompilerTypedIntLiteralExpr(text, _, _):
 			Ok(LiteralExpr(compiler_core_literal_int(text), typ, loc))
@@ -3151,39 +3819,103 @@ private pure func compiler_core_lower_params(
 				Ok(lowered)
 
 
+private pure func lower_typed_function_body(
+	info: CompilerTypedFunctionInfo,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Result[CompilerCoreLowerFunctionBody, CompilerCoreLowerError]:
+	match parsed_function_body_kind(info.decl.body):
+		ParsedFunctionSourceBody:
+			match info.body:
+				Some(body):
+					match lower_typed_expr(body):
+						Ok(lowered_body):
+							Ok(CompilerCoreLowerUserFunctionBody(lowered_body))
+						Err(error):
+							Err(error)
+				None:
+					Err(
+						CompilerCoreLowerUnsupported(
+							"typed source function has no body: " + info.decl.name.text,
+						),
+					)
+		ParsedFunctionForwardDecl:
+			if info.body.is_some():
+				Err(
+					CompilerCoreLowerUnsupported(
+						"forward function has a typed body: " + info.decl.name.text,
+					),
+				)
+			else:
+				Ok(CompilerCoreLowerForwardDeclaration)
+		ParsedFunctionBuiltinBody(name):
+			if info.body.is_some():
+				Err(
+					CompilerCoreLowerUnsupported(
+						"builtin function has a typed body: " + info.decl.name.text,
+					),
+				)
+			else:
+				match name:
+					None:
+						Ok(CompilerCoreLowerBuiltinDeclaration)
+					Some(builtin_name):
+						if builtin_name.starts_with("std/"):
+							Ok(CompilerCoreLowerBuiltinDeclaration)
+						else:
+							Ok(
+								lower_runtime_helper_body(
+									builtin_name,
+									params,
+									return_type,
+									compiler_core_source_loc(info.decl.span),
+								),
+							)
+
+
 private pure func lower_typed_function_info(
 	context: CompilerCoreLowerContext,
 	info: CompilerTypedFunctionInfo,
 ) -> Result[CompilerCoreLowerFunctionResult, CompilerCoreLowerError]:
-	match info.body:
-		Some(body):
-			params ?= compiler_core_lower_params(info.decl.params, info.param_types)
-			return_type ?= compiler_core_lower_type(info.semantic_return_type)
-			lowered_body ?= lower_typed_expr(body)
+	params ?= compiler_core_lower_params(info.decl.params, info.param_types)
+	return_type ?= compiler_core_lower_type(info.semantic_return_type)
+	lowered_function_body ?= lower_typed_function_body(info, params, clone_core_type(return_type))
 
-			(next_context, def_id) = match info.callable_id:
-				Some(callable_id):
-					(context, callable_id)
-				None:
-					mint_def_id(context)
+	body: Option[CoreExpr] = match lowered_function_body:
+		CompilerCoreLowerUserFunctionBody(lowered_body):
+			Some(lowered_body)
+		CompilerCoreLowerForwardDeclaration:
+			None
+		CompilerCoreLowerBuiltinDeclaration:
+			None
 
-			Ok({
-				context = next_context,
-				function_info = {
-					name = info.decl.name.text,
-					source_module = context.source_module,
-					type_params = info.effective_type_params.map(func(param): param.name),
-					params = params,
-					return_type = return_type,
-					body = Some(lowered_body),
-					is_pure = info.decl.is_pure,
-					function_kind = UserFunction,
-					def_id = def_id,
-					loc = compiler_core_source_loc(info.decl.span)
-				},
-			})
+	function_kind: CoreFunctionKind = match lowered_function_body:
+		CompilerCoreLowerBuiltinDeclaration:
+			BuiltinFunction
+		_:
+			UserFunction
+
+	(next_context, def_id) = match info.callable_id:
+		Some(callable_id):
+			(context, callable_id)
 		None:
-			Err(CompilerCoreLowerUnsupported("function without body: " + info.decl.name.text))
+			mint_def_id(context)
+
+	Ok({
+		context = next_context,
+		function_info = {
+			name = info.decl.name.text,
+			source_module = context.source_module,
+			type_params = info.effective_type_params.map(func(param): param.name),
+			params = params,
+			return_type = return_type,
+			body = body,
+			is_pure = info.decl.is_pure,
+			function_kind = function_kind,
+			def_id = def_id,
+			loc = compiler_core_source_loc(info.decl.span)
+		},
+	})
 
 
 private pure func lower_typed_function(

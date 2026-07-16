@@ -691,8 +691,47 @@ private pure func graph_definition_plan_reserve_source(
 		}
 
 
+private pure func graph_default_method_names_in_decl(
+	names: List[String],
+	decl: ParsedDecl,
+) -> List[String]:
+	match decl:
+		TraitParsedDecl(trait_decl):
+			var result = names
+
+			for method in trait_decl.methods:
+				if method.body.is_some() and not result.contains(method.name.text):
+					result = result.append(method.name.text)
+
+			result
+		PrivateParsedDecl(inner, _):
+			graph_default_method_names_in_decl(names, inner)
+		_:
+			names
+
+
+private pure func graph_default_method_names_in_program(
+	names: List[String],
+	program: ParsedProgram,
+) -> List[String]:
+	program.decls.fold_left(names, graph_default_method_names_in_decl)
+
+
+private pure func graph_default_method_names_for_modules(
+	target: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
+) -> List[String]:
+	var names = graph_default_method_names_in_program([], target.program)
+
+	for module in modules:
+		names = graph_default_method_names_in_program(names, module.program)
+
+	names
+
+
 private pure func graph_definition_plan_reserve_decl(
 	plan: CompilerGraphDefinitionPlan,
+	default_method_names: List[String],
 	decl: ParsedDecl,
 ) -> CompilerGraphDefinitionPlan:
 	match decl:
@@ -735,32 +774,51 @@ private pure func graph_definition_plan_reserve_decl(
 					impl_decl.span,
 				),
 			)
-			impl_decl.methods.fold_left(with_impl, graph_definition_plan_reserve_parsed_function)
+			with_defaults = default_method_names.fold_left(
+				with_impl,
+				func(
+					current,
+					method_name,
+				): graph_definition_plan_reserve_function(current, method_name, impl_decl.span),
+			)
+			impl_decl.methods.fold_left(
+				with_defaults,
+				graph_definition_plan_reserve_parsed_function,
+			)
 		PrivateParsedDecl(inner, _):
-			graph_definition_plan_reserve_decl(plan, inner)
+			graph_definition_plan_reserve_decl(plan, default_method_names, inner)
 		_:
 			plan
 
 
 private pure func graph_definition_plan_reserve_program(
 	plan: CompilerGraphDefinitionPlan,
+	default_method_names: List[String],
 	program: ParsedProgram,
 ) -> CompilerGraphDefinitionPlan:
-	program.decls.fold_left(plan, graph_definition_plan_reserve_decl)
+	program.decls.fold_left(
+		plan,
+		func(
+			current,
+			decl,
+		): graph_definition_plan_reserve_decl(current, default_method_names, decl),
+	)
 
 
 private pure func graph_definition_plan_for_modules(
 	target: PreparedTypecheckModule,
 	modules: List[PreparedTypecheckModule],
 ) -> CompilerGraphDefinitionPlan:
+	default_method_names = graph_default_method_names_for_modules(target, modules)
 	with_target = graph_definition_plan_reserve_program(
 		graph_definition_plan_empty(),
+		default_method_names,
 		target.program,
 	)
 	var plan = with_target
 
 	for module in modules:
-		plan = graph_definition_plan_reserve_program(plan, module.program)
+		plan = graph_definition_plan_reserve_program(plan, default_method_names, module.program)
 
 	plan
 

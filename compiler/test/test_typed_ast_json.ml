@@ -225,10 +225,34 @@ let trait_resolved_call_info =
           [
             ("kind", String "trait_method");
             ("trait_name", String "HasZero");
-            ("callable_id", Null);
+            ("impl_target", Null);
           ] );
       ("instantiated_params", Array []);
       ("instantiated_return", type_var "T");
+      ("resource_args", Object [ ("kind", String "reject") ]);
+      ("dim_constraints", Array []);
+    ]
+
+let concrete_trait_resolved_call_info =
+  Object
+    [
+      ("callee_name", String "length");
+      ("source_name", String "length");
+      ("purity", String "pure");
+      ( "target",
+        Object
+          [
+            ("kind", String "trait_method");
+            ("trait_name", String "HasLength");
+            ( "impl_target",
+              Object
+                [
+                  ("callable_id", Int 254);
+                  ("module_path", String "std/dict");
+                ] );
+          ] );
+      ("instantiated_params", Array [ named "Data" ]);
+      ("instantiated_return", named "Int");
       ("resource_args", Object [ ("kind", String "reject") ]);
       ("dim_constraints", Array []);
     ]
@@ -2135,6 +2159,49 @@ let test_decode_imported_function_ref_materializes_module_identity () =
       Alcotest.fail
         "imported function reference did not materialize module identity"
 
+let test_decode_trait_impl_materializes_module_identity () =
+  let callee =
+    Object
+      [
+        ("kind", String "name");
+        ("name", ident_at "length");
+        ( "info",
+          expr_info ~resolved_call:concrete_trait_resolved_call_info
+            (function_type ~pure:true [ named "Data" ] (named "Int")) );
+      ]
+  in
+  let typed =
+    expect_typed_expr
+      (Object
+         [
+           ("kind", String "call");
+           ("span", span_json);
+           ( "info",
+             expr_info ~resolved_call:concrete_trait_resolved_call_info
+               (named "Int") );
+           ("callee", callee);
+           ("args", Array []);
+         ])
+  in
+  match (Typed.ast typed).expr_desc with
+  | ECall ({ expr_desc = EIdent "__ufcs_std$dict__length"; _ }, _) -> (
+      match Typed.expr_resolved_call typed with
+      | Some
+          {
+            call_target =
+              CallTraitMethod
+                {
+                  trait_name = "HasLength";
+                  method_name = "length";
+                  callable_id = Some 254;
+                  _;
+                };
+            _;
+          } ->
+          ()
+      | _ -> Alcotest.fail "trait impl target identity was not materialized")
+  | _ -> Alcotest.fail "trait impl target did not materialize module identity"
+
 let test_decode_rejects_unsupported_pattern () =
   match
     Blorp.Typed_ast_json.decode_pattern "$"
@@ -2212,6 +2279,8 @@ let suite =
           `Quick test_decode_imported_bare_call_materializes_module_identity;
         Alcotest.test_case "imported function ref materializes module identity"
           `Quick test_decode_imported_function_ref_materializes_module_identity;
+        Alcotest.test_case "trait impl materializes module identity" `Quick
+          test_decode_trait_impl_materializes_module_identity;
         Alcotest.test_case "unsupported pattern" `Quick
           test_decode_rejects_unsupported_pattern;
         Alcotest.test_case "unknown kind" `Quick test_decode_rejects_unknown_kind;

@@ -1913,6 +1913,16 @@ Current progress:
   simple named-binder
   range/List/String/Set `for` loops, and function/global/record/enum/union
   declarations with explicit lowering context state for Core def ids.
+- Function-body classification is now shared at the parsed-AST boundary rather
+  than being inferred independently by typecheck and Core lowering. Blorp Core
+  lowering preserves legal forward declarations as bodyless user functions,
+  preserves naked and `std/...` builtin declarations as bodyless builtin
+  functions for later synthesis/resolution, and synthesizes named runtime
+  helper bodies as parameter-forwarding `BuiltinCall` expressions. It rejects
+  inconsistent typed payloads, such as a forward or builtin declaration that
+  unexpectedly carries a typed source body. Concrete intrinsic-body synthesis
+  and the post-monomorphization `Core_synth` retry are still required before the
+  production lowering boundary can move across std modules.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the next
   production boundary strict while expression coverage expands. Calls now
@@ -2011,7 +2021,9 @@ Current progress:
   lowering. Do not make `CompilerTypedParsedDecl` disappear by dropping these
   declarations: the late pre-DCE bridge can omit them only because OCaml has
   already consumed their semantics.
-- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
+- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice,
+  including ordinary function bodies, forward declarations, deferred std
+  builtins, and named runtime-helper forwarding bodies.
   Tensor-shaped type lowering exists in the helper, but the runtime test avoids
   constructing that metadata until backend test emission handles it cheaply.
 - The lowering tests now include a fixture-shaped `CompilerTypedProgram` to
@@ -2065,12 +2077,24 @@ Current progress:
   range-refined binder type. Loop-view metadata is authoritative: malformed
   metadata and unported view kinds fail lowering instead of falling through to
   the producer function's nominal return type. Dict tuple-pair binders,
-  resource-source, tuple-binder, tensor, `enumerate`, `enumerate2`, `windows`,
-  and any remaining iterable families still need deliberate prepared-loop
-  slices instead of a generic OCaml-style `CFor` node. A first tuple-binder
-  lowering attempt exposed an unsafe generated
-  cleanup shape around synthetic tuple references inside a `?=` path; fix the
-  resource/codegen issue before enabling that path in production lowering.
+  resource-source, tensor, `windows`, and any remaining iterable families still
+  need deliberate prepared-loop slices instead of a generic OCaml-style `CFor`
+  node. Ordinary tuple binders over
+  tuple-valued iterables now lower through one collision-free synthetic loop
+  binder plus explicit tuple-field `LetExpr` bindings; Dict pairs select the
+  existing prepared pair-iteration backend path. This work resumes after the
+  ownership-hardening fixes that closed the earlier synthetic-tuple cleanup
+  failure. The focused late-Core ASan/UBSan gate passes 672/672 with the tuple
+  and loop-view lowering regressions included. One-dimensional tensor
+  `enumerate` and matrix `enumerate2` now capture their source exactly once and
+  lower directly to one or two prepared range loops. Tuple binders use the
+  range variables directly
+  and bind only the fetched element, avoiding a per-iteration tuple allocation;
+  a single-name binder still materializes the language-level pair or triple.
+  `enumerate2` uses the concrete column dimension when available and otherwise
+  mirrors the production OCaml fallback of `tensor_capacity(source) /
+  length(source)` for generic matrix dimensions. Multidimensional `enumerate`
+  and `windows` remain closed.
 - Literal-only matches lower directly to prepared `LiteralMatchExpr` nodes for
   literal arms plus a wildcard fallback. Binding, constructor, tuple/list, and
   or-pattern lowering remains deliberately closed until the full match
@@ -2109,9 +2133,11 @@ Edge cases:
   compiler defect is fixed; do not duplicate the enum through import aliases.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
-  internal and must only lower under `for`/tuple-for. `indices` is implemented;
-  keep the remaining producers closed until their synthesized bindings and
-  tensor access operations have explicit collision-free Core identities.
+  internal and must only lower under `for`/tuple-for. `indices`, one-dimensional
+  `enumerate`, and two-dimensional `enumerate2` are implemented with explicit
+  collision-free Core identities. Keep multidimensional `enumerate` and
+  `windows` closed until their row/slice operations have the same explicit
+  ownership and identity treatment.
 - Module alias calls use `TyNamed "Module"` sentinel today; replace with an
   explicit typed AST/Core representation when feasible.
 - Callable ids from inference must remain authoritative over stale mangled

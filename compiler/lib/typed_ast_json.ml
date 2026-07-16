@@ -16,6 +16,11 @@ type decoded_value_slot = {
   value_slot_decision : Ast.type_widening_decision;
 }
 
+type decoded_trait_method_target = {
+  callable_id : int;
+  module_path : string;
+}
+
 type decoded_resolved_call_target =
   | DecodedDirectCall of {
       callable_id : int;
@@ -23,7 +28,7 @@ type decoded_resolved_call_target =
     }
   | DecodedTraitMethodCall of {
       trait_name : string;
-      callable_id : int option;
+      impl_target : decoded_trait_method_target option;
     }
   | DecodedIntrinsicCall
   | DecodedClosureCall
@@ -117,6 +122,28 @@ let bool_field path name value =
 let int_field path name value =
   let* value = field path name value in
   int_value (path ^ "." ^ name) value
+
+let const_int_field path name value =
+  let* value = field path name value in
+  let value_path = path ^ "." ^ name in
+  match value with
+  | Lsp_json.String text -> (
+      match int_of_string_opt text with
+      | Some value -> Ok (Some value)
+      | None -> (
+          match Int64.of_string_opt text with
+          | Some _ -> Ok None
+          | None -> error value_path "expected integer text"))
+  | Lsp_json.Int value -> Ok (Some value)
+  | Lsp_json.Float value ->
+      if not (Float.is_finite value) then error value_path "expected finite integer"
+      else if value < float_of_int min_int || value > float_of_int max_int then
+        Ok None
+      else
+        let truncated = int_of_float value in
+        if Float.equal value (float_of_int truncated) then Ok (Some truncated)
+        else error value_path "expected exact integer"
+  | _ -> error value_path "expected integer"
 
 let option_string_value path = function
   | Lsp_json.Null -> Ok None
@@ -318,8 +345,11 @@ let rec decode_type path value =
       let* name = string_field path "name" value in
       Ok (Ast.TyVar name)
   | "const_int" ->
-      let* value = int_field path "value" value in
-      Ok (Ast.TyConstInt value)
+      let* value = const_int_field path "value" value in
+      Ok
+        (match value with
+        | Some value -> Ast.TyConstInt value
+        | None -> Ast.TyNamed ("Int", []))
   | "tuple" ->
       let* items_json = array_field path "items" value in
       let* items = decode_list (path ^ ".items") decode_type items_json in
@@ -721,6 +751,17 @@ let decode_dim_constraint path value =
   let* right = decode_type (path ^ ".right") right_json in
   Ok (left, right)
 
+let decode_trait_method_target path value =
+  let* callable_id = int_field path "callable_id" value in
+  let* module_path = string_field path "module_path" value in
+  Ok { callable_id; module_path }
+
+let decode_optional_trait_method_target path = function
+  | Lsp_json.Null -> Ok None
+  | value ->
+      let* target = decode_trait_method_target path value in
+      Ok (Some target)
+
 let decode_resolved_call_target path value =
   let* kind = kind_field path value in
   match kind with
@@ -731,11 +772,12 @@ let decode_resolved_call_target path value =
       Ok (DecodedDirectCall { callable_id; origin })
   | "trait_method" ->
       let* trait_name = string_field path "trait_name" value in
-      let* callable_id_json = field path "callable_id" value in
-      let* callable_id =
-        option_int_value (path ^ ".callable_id") callable_id_json
+      let* impl_target_json = field path "impl_target" value in
+      let* impl_target =
+        decode_optional_trait_method_target
+          (path ^ ".impl_target") impl_target_json
       in
-      Ok (DecodedTraitMethodCall { trait_name; callable_id })
+      Ok (DecodedTraitMethodCall { trait_name; impl_target })
   | "intrinsic" -> Ok DecodedIntrinsicCall
   | "closure" -> Ok DecodedClosureCall
   | _ ->
@@ -900,6 +942,21 @@ let normalize_imported_function_ref_desc
         (Codegen_names.sanitize_module_name module_path ^ "__" ^ source_name)
   | _ -> desc
 
+let normalize_trait_method_function_ref_desc
+    (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
+  match (desc, info.resolved_call) with
+  | ( Ast.EIdent _,
+      Some
+        {
+          target =
+            DecodedTraitMethodCall
+              { impl_target = Some { module_path; _ }; _ };
+          source_name;
+          _;
+        } ) ->
+      Ast.EIdent (Codegen_names.make_ufcs_name module_path source_name)
+  | _ -> desc
+
 let normalize_imported_bare_call_desc
     (info : decoded_typed_expr_info) (desc : Ast.expr_desc) : Ast.expr_desc =
   match (desc, info.resolved_call) with
@@ -962,7 +1019,7 @@ let materialize_resolved_call _path desc
                  instantiated_params = info.instantiated_params;
                  instantiated_return = info.instantiated_return;
                })
-      | DecodedTraitMethodCall { trait_name; callable_id } ->
+      | DecodedTraitMethodCall { trait_name; impl_target } ->
           Ok
             (Some
                {
@@ -973,7 +1030,7 @@ let materialize_resolved_call _path desc
                        trait_name;
                        method_name = info.source_name;
                        call_pure = call_pure_of_purity info.purity;
-                       callable_id;
+                       callable_id = Option.map (fun target -> target.callable_id) impl_target;
                      };
                  instantiated_params = info.instantiated_params;
                  instantiated_return = info.instantiated_return;
@@ -997,6 +1054,7 @@ let materialize_resolved_call _path desc
 
 let make_typed_expr path loc info desc =
   let desc = normalize_imported_function_ref_desc info desc in
+  let desc = normalize_trait_method_function_ref_desc info desc in
   let desc = normalize_imported_bare_call_desc info desc in
   let* resolved_call =
     materialize_resolved_call (path ^ ".info.resolved_call") desc

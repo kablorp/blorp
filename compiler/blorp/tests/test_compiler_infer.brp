@@ -167,6 +167,7 @@ import:
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
+		CompilerInferResult,
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
 			CompilerTypedBinaryExpr,
@@ -175,6 +176,8 @@ import:
 			CompilerTypedConcurrentBlockExpr,
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedForExpr,
+			CompilerTypedNameExpr,
+			CompilerTypedSubscriptExpr,
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedExprInfo,
@@ -1392,7 +1395,13 @@ pure func state_with_explicitly_imported_constructor_collision(
 		state.env,
 		"SelectedValue",
 		[],
-		[{ name = "SharedCtor", fields = [compiler_type_int()], tag = 0 }],
+		[
+			{
+				name = "SharedCtor",
+				fields = [compiler_type_int()],
+				tag = 0
+			},
+		],
 		CompilerTypeUnion,
 		False,
 		True,
@@ -1402,7 +1411,13 @@ pure func state_with_explicitly_imported_constructor_collision(
 		with_selected,
 		"UnrelatedValue",
 		[],
-		[{ name = "SharedCtor", fields = [compiler_type_string()], tag = 0 }],
+		[
+			{
+				name = "SharedCtor",
+				fields = [compiler_type_string()],
+				tag = 0
+			},
+		],
 		CompilerTypeUnion,
 		False,
 		True,
@@ -1951,6 +1966,33 @@ func test_hidden_module_function_does_not_shadow_builtin() -> Bool:
 	)
 
 
+func test_compiler_prelude_trait_functions_are_visible() -> Bool:
+	abs_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(
+			ParsedNameExpr(ident("abs")),
+			[ParsedUnaryExpr(ParsedNegateOp, int_expr("1"), source_span())],
+		),
+	)
+	sqrt_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(ParsedNameExpr(ident("sqrt")), [float_expr("4.0")]),
+	)
+
+	(
+		abs_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(abs_result.expr),
+			compiler_type_int(),
+		)
+		and sqrt_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(sqrt_result.expr),
+			compiler_type_float(),
+		)
+	)
+
+
 func test_matrix_builtin_binds_literal_dimensions() -> Bool:
 	expected = CompilerArrayType(
 		compiler_type_float(),
@@ -2099,23 +2141,55 @@ func test_block_preserves_last_expression_value_type() -> Bool:
 	)
 
 
-func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
+func test_name_lookup_uses_resolved_bound_meta() -> Bool:
 	state = compiler_typecheck_state_empty()
 	with_context = { state | context = compiler_bind_meta(state.context, 0, compiler_type_int()) }
 	with_meta_value = add_infer_value(with_context, "mystery", CompilerMetaType(0))
 	result = compiler_infer_expr(
 		compiler_infer_context(with_meta_value),
-		ParsedBlockExpr([ParsedNameExpr(ident("mystery"))], source_span()),
+		ParsedNameExpr(ident("mystery")),
 	)
-	finalized = compiler_finalize_infer_result(result)
 
 	(
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(result.expr),
-			CompilerMetaType(0),
+			compiler_type_int(),
 		)
-		and compiler_typed_expr_contains_meta(result.expr)
+		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_int())
+	)
+
+
+func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
+	state = compiler_typecheck_state_empty()
+	with_context = { state | context = compiler_bind_meta(state.context, 0, compiler_type_int()) }
+	meta_type = CompilerMetaType(0)
+	meta_slot: CompilerValueSlot = {
+		semantic_type = meta_type,
+		decision = CompilerTypeKeep(meta_type)
+	}
+	meta_info: CompilerTypedExprInfo = {
+		source_type = None,
+		semantic_type = meta_type,
+		value_type = meta_type,
+		origin = CompilerInferredOrigin,
+		value_slot = meta_slot,
+		proofs = compiler_unrefined_binding(),
+		resolved_call = None,
+		resource_dependencies = []
+	}
+	result: CompilerInferResult = {
+		context = compiler_infer_context(with_context),
+		expr = CompilerTypedBlockExpr(
+			[CompilerTypedNameExpr(ident("mystery"), meta_info)],
+			source_span(),
+			meta_info,
+		)
+	}
+	finalized = compiler_finalize_infer_result(result)
+
+	(
+		compiler_typed_expr_contains_meta(result.expr)
 		and not compiler_typed_expr_contains_meta(finalized.expr)
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(finalized.expr),
@@ -4326,9 +4400,12 @@ func test_lexical_binding_wins_explicit_import() -> Bool:
 		ParsedNameExpr(ident("SharedCtor")),
 	)
 
-	result.context.state.errors.length() == 0 and compiler_types_equal(
-		compiler_typed_expr_semantic_type(result.expr),
-		compiler_type_int(),
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
 	)
 
 
@@ -5937,10 +6014,7 @@ func test_assignment_shadows_outer_function_with_local_binding() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_add_one_func()),
 		ParsedBlockExpr(
-			[
-				assign_expr("add_one", int_expr("1")),
-				ParsedNameExpr(ident("add_one")),
-			],
+			[assign_expr("add_one", int_expr("1")), ParsedNameExpr(ident("add_one"))],
 			source_span(),
 		),
 	)
@@ -6640,6 +6714,33 @@ func test_tensor_subscript_peels_and_multi_index_returns_element() -> Bool:
 		compiler_typed_expr_semantic_type(multi_result.expr),
 		compiler_type_int(),
 	)
+
+
+func test_modulo_subscript_rewrites_negative_dividend_safely() -> Bool:
+	state = add_infer_value(
+		state_with_int_binding("i"),
+		"values",
+		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)]),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(
+			ParsedNameExpr(ident("values")),
+			[binary_expr(ParsedModuloOp, ParsedNameExpr(ident("i")), int_expr("4"))],
+		),
+	)
+
+	safe_index = match result.expr:
+		CompilerTypedSubscriptExpr(_, indices, _, _):
+			match indices.get(0):
+				Some(CompilerTypedBinaryExpr(ParsedModuloOp, CompilerTypedBinaryExpr(ParsedAddOp, CompilerTypedBinaryExpr(ParsedModuloOp, _, _, _, _), _, _, _), _, _, _)):
+					True
+				_:
+					False
+		_:
+			False
+
+	result.context.state.errors.length() == 0 and safe_index
 
 
 func test_normalized_matrix_checked_get_infers_element_call() -> Bool:
@@ -8340,6 +8441,10 @@ tests: TestSuite = {
 			test_hidden_module_function_does_not_shadow_builtin,
 		),
 		(
+			"compiler prelude trait functions are visible",
+			test_compiler_prelude_trait_functions_are_visible,
+		),
+		(
 			"explicit import wins constructor name collision",
 			test_explicit_import_wins_constructor_name_collision,
 		),
@@ -8369,6 +8474,7 @@ tests: TestSuite = {
 			"block preserves last expression value type",
 			test_block_preserves_last_expression_value_type,
 		),
+		("name lookup uses resolved bound meta", test_name_lookup_uses_resolved_bound_meta),
 		(
 			"finalize infer result zonks bound meta tree",
 			test_finalize_infer_result_zonks_bound_meta_tree,
@@ -8854,6 +8960,10 @@ tests: TestSuite = {
 		(
 			"tensor subscript peels and multi index returns element",
 			test_tensor_subscript_peels_and_multi_index_returns_element,
+		),
+		(
+			"modulo subscript rewrites negative dividend safely",
+			test_modulo_subscript_rewrites_negative_dividend_safely,
 		),
 		(
 			"normalized matrix checked get infers element call",

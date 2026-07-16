@@ -108,7 +108,10 @@ import:
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
+		parsed_function_body_is_builtin,
+	../stage_03_parse/compiler_parsed_ast_traverse: map_parsed_expr_children
 	../stage_04_modules/compiler_module_type_identity: compiler_local_type_names_from_decls
+	../stage_05_types/compiler_builtins: compiler_builtin_trait_is_prelude
 	../stage_05_types/compiler_context: compiler_register_resource_cleanup
 	../stage_05_types/compiler_env:
 		CompilerEnv,
@@ -116,6 +119,7 @@ import:
 		CompilerFuncOrigin(CompilerForeignFunc, CompilerUserDefinedFunc),
 		CompilerImplInstance,
 		CompilerImplMethodInfo,
+		CompilerImplMethodTarget,
 		CompilerLoopProducer(
 			CompilerLoopProducerEnumerate,
 			CompilerLoopProducerEnumerate2,
@@ -265,6 +269,7 @@ import:
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_add_known_type_name,
 		compiler_typecheck_state_add_private_impl,
+		compiler_typecheck_state_add_scoped_trait_function,
 		compiler_typecheck_state_allows_builtin,
 		compiler_typecheck_state_allows_foreign,
 		compiler_typecheck_state_find_func_callable_id,
@@ -280,10 +285,16 @@ import:
 		compiler_typecheck_state_record_type_home,
 		compiler_typecheck_state_remember_top_level_name,
 		compiler_typecheck_state_type_home_matches,
+		compiler_typecheck_state_with_scoped_trait_functions,
 	compiler_typecheck_types:
 		compiler_bound_type_params_from_parsed,
 		compiler_type_from_parsed_type_expr,
 		compiler_type_param_names,
+
+
+COMPILER_PRELUDE_TRAITS_MODULE_PATH: String = "std/traits"
+
+COMPILER_PRELUDE_TRAITS_MODULE_NAME: String = "traits"
 
 
 private pure func compiler_typecheck_state_with_env(
@@ -1576,16 +1587,6 @@ private pure func compiler_function_resource_result_ordinary(
 	annotations.any(compiler_annotation_has_ordinary_resource_result)
 
 
-private pure func compiler_function_has_builtin_body(body: Option[ParsedExpr]) -> Bool:
-	match body:
-		Some(ParsedBuiltinExpr(_, _)):
-			True
-		Some(ParsedBlockExpr(exprs, _)):
-			exprs.length() == 1 and compiler_function_has_builtin_body(exprs.get(0))
-		_:
-			False
-
-
 private pure func compiler_type_contains_scoped_dependency_carrier(typ: CompilerType) -> Bool:
 	match typ:
 		CompilerNamedType(name, args):
@@ -1640,7 +1641,7 @@ private pure func compiler_function_resource_arg_policy(
 			break
 
 	if (
-		compiler_function_has_builtin_body(body)
+		parsed_function_body_is_builtin(body)
 		and (has_resource_param or has_scoped_dependency_param)
 	):
 		result_policy: CompilerResourceResultPolicy = if compiler_function_resource_result_ordinary(
@@ -1665,7 +1666,7 @@ private pure func compiler_validate_resource_result_annotation(
 ) -> CompilerTypecheckState:
 	if not compiler_function_resource_result_ordinary(annotations):
 		compiler_typecheck_state_copy(state)
-	else if not compiler_function_has_builtin_body(body):
+	else if not parsed_function_body_is_builtin(body):
 		compiler_typecheck_state_add_error(
 			state,
 			(
@@ -1714,7 +1715,7 @@ private pure func compiler_validate_resource_signature_boundary(
 	return_type: CompilerType,
 	body: Option[ParsedExpr],
 ) -> CompilerTypecheckState:
-	if compiler_function_has_builtin_body(body):
+	if parsed_function_body_is_builtin(body):
 		compiler_typecheck_state_copy(state)
 	else:
 		var next = compiler_typecheck_state_copy(state)
@@ -2938,6 +2939,7 @@ private pure func compiler_impl_bounds_for_decl_type(
 
 private pure func compiler_impl_method_info_from_decl(
 	state: CompilerTypecheckState,
+	module_path: String,
 	method: ParsedFunctionDecl,
 ) -> CompilerImplMethodInfo:
 	param_types: List[CompilerType] = compiler_param_types_from_parsed(
@@ -2949,11 +2951,18 @@ private pure func compiler_impl_method_info_from_decl(
 		state,
 		compiler_type_from_optional_parsed_type_expr(method.return_type),
 	)
-	compiler_impl_method_info_from_semantic_types(state, method, param_types, return_type)
+	compiler_impl_method_info_from_semantic_types(
+		state,
+		module_path,
+		method,
+		param_types,
+		return_type,
+	)
 
 
 private pure func compiler_impl_method_info_from_semantic_types(
 	state: CompilerTypecheckState,
+	module_path: String,
 	method: ParsedFunctionDecl,
 	param_types: List[CompilerType],
 	return_type: CompilerType,
@@ -2963,9 +2972,17 @@ private pure func compiler_impl_method_info_from_semantic_types(
 		param_types.map(compiler_type_copy),
 		compiler_type_copy(return_type),
 	)
+	target: Option[CompilerImplMethodTarget] = compiler_typecheck_state_find_func_callable_id(
+		state,
+		compiler_callable_key_from_span(method.name.text, method.span),
+	).map(func(callable_id): {
+			callable_id = callable_id,
+			module_path = module_path
+		})
 
 	compiler_impl_method_info(
 		method.name.text,
+		target,
 		func_type,
 		compiler_effective_bound_type_params(state, method.type_params, func_type),
 		compiler_param_names_from_parsed(method.params),
@@ -2978,9 +2995,10 @@ private pure func compiler_impl_method_info_from_semantic_types(
 
 private pure func compiler_impl_method_infos_from_decl(
 	state: CompilerTypecheckState,
+	module_path: String,
 	methods: List[ParsedFunctionDecl],
 ) -> List[CompilerImplMethodInfo]:
-	methods.map(func(method): compiler_impl_method_info_from_decl(state, method))
+	methods.map(func(method): compiler_impl_method_info_from_decl(state, module_path, method))
 
 
 private pure func compiler_imported_impl_type(
@@ -3014,7 +3032,13 @@ private pure func compiler_imported_impl_method_info_from_decl(
 		local_type_names,
 		compiler_type_from_optional_parsed_type_expr(method.return_type),
 	)
-	compiler_impl_method_info_from_semantic_types(state, method, param_types, return_type)
+	compiler_impl_method_info_from_semantic_types(
+		state,
+		module_path,
+		method,
+		param_types,
+		return_type,
+	)
 
 
 private pure func compiler_imported_impl_method_infos_from_decl(
@@ -3116,6 +3140,7 @@ private pure func compiler_register_impl_decl(
 	)
 	method_infos: List[CompilerImplMethodInfo] = compiler_impl_method_infos_from_decl(
 		state,
+		module_path,
 		impl_decl.methods,
 	)
 	compiler_register_impl_decl_with_info(
@@ -4789,84 +4814,6 @@ private pure func compiler_materialize_declared_return_body(
 			body
 
 
-private pure func compiler_typecheck_materialize_function_like_body(
-	state: CompilerTypecheckState,
-	function_name: String,
-	params: List[ParsedParam],
-	param_types: List[CompilerType],
-	return_type: Option[CompilerType],
-	body: ParsedExpr,
-	is_pure: Bool,
-) -> (CompilerTypecheckState, CompilerTypedExpr):
-	prepare_param_types: List[CompilerType] = param_types.map(compiler_type_copy)
-	callback_param_types: List[CompilerType] = param_types.map(compiler_type_copy)
-	context_return_type: Option[CompilerType] = compiler_optional_type_copy(return_type)
-	result_return_type: Option[CompilerType] = compiler_optional_type_copy(return_type)
-
-	body_state = compiler_prepare_typed_function_body_state(
-		state,
-		function_name,
-		params,
-		prepare_param_types,
-	)
-	context = compiler_body_check_context_with_expected_type(body_state, context_return_type)
-	raw_result = compiler_infer_expr(context, body)
-	result = compiler_finalize_infer_result(raw_result)
-	checked_state = compiler_check_function_like_body_result(
-		function_name,
-		result_return_type,
-		result,
-	)
-	debug_checked_state = compiler_check_debug_block_body(checked_state, result)
-	callback_checked_state = compiler_check_pure_function_like_callback_params(
-		debug_checked_state,
-		function_name,
-		is_pure,
-		params,
-		callback_param_types,
-	)
-	lambda_checked_state = compiler_check_nested_pure_lambda_body_calls(
-		callback_checked_state,
-		result,
-	)
-	purity_checked_state = compiler_check_pure_function_like_body_calls(
-		lambda_checked_state,
-		function_name,
-		is_pure,
-		result,
-	)
-	module_assign_checked_state = compiler_check_pure_function_like_module_assignments(
-		purity_checked_state,
-		function_name,
-		is_pure,
-		result,
-	)
-
-	(compiler_typecheck_with_body_env(state, module_assign_checked_state), result.expr)
-
-
-private pure func compiler_typecheck_check_function_like_body(
-	state: CompilerTypecheckState,
-	function_name: String,
-	params: List[ParsedParam],
-	param_types: List[CompilerType],
-	return_type: Option[CompilerType],
-	body: ParsedExpr,
-	is_pure: Bool,
-) -> CompilerTypecheckState:
-	match compiler_typecheck_materialize_function_like_body(
-		state,
-		function_name,
-		params,
-		param_types,
-		return_type,
-		body,
-		is_pure,
-	):
-		(next_state, _):
-			next_state
-
-
 private pure func compiler_typecheck_materialize_function_body_with_options(
 	state: CompilerTypecheckState,
 	function_decl: ParsedFunctionDecl,
@@ -4879,7 +4826,7 @@ private pure func compiler_typecheck_materialize_function_body_with_options(
 
 	match function_decl.body:
 		Some(body):
-			if compiler_function_has_builtin_body(function_decl.body):
+			if parsed_function_body_is_builtin(function_decl.body):
 				typed_info = compiler_typed_function_info(
 					compiler_typecheck_state_copy(signature_state),
 					function_decl,
@@ -5396,82 +5343,264 @@ private pure func compiler_find_trait_decl(
 	result
 
 
-private pure func compiler_trait_default_return_type(
-	method: ParsedTraitMethodDecl,
-	resolved: CompilerTraitMethodSig,
-) -> Option[CompilerType]:
-	match method.return_type:
-		Some(_):
-			Some(compiler_type_copy(resolved.return_type))
-		None:
-			None
-
-
-private pure func compiler_typecheck_check_default_impl_method_body(
-	state: CompilerTypecheckState,
-	method: ParsedTraitMethodDecl,
-	resolved: CompilerTraitMethodSig,
-) -> CompilerTypecheckState:
-	match method.body:
-		Some(body):
-			param_types: List[CompilerType] = resolved.params.map(compiler_type_copy)
-			compiler_typecheck_check_function_like_body(
-				state,
-				method.name.text,
-				method.params,
-				param_types,
-				compiler_trait_default_return_type(method, resolved),
-				body,
-				method.is_pure,
+private pure func compiler_resolve_self_parsed_type(
+	replacement: ParsedTypeExpr,
+	type_expr: ParsedTypeExpr,
+) -> ParsedTypeExpr:
+	match type_expr:
+		ParsedNamedType(name, args, span):
+			if name.text == "Self" and args.length() == 0:
+				replacement
+			else:
+				ParsedNamedType(
+					name,
+					args.map(func(arg): compiler_resolve_self_parsed_type(replacement, arg)),
+					span,
+				)
+		ParsedQualifiedNamedType(qualifier, name, args, span):
+			ParsedQualifiedNamedType(
+				qualifier,
+				name,
+				args.map(func(arg): compiler_resolve_self_parsed_type(replacement, arg)),
+				span,
 			)
-		None:
-			state
+		ParsedTupleType(items, span):
+			ParsedTupleType(
+				items.map(func(item): compiler_resolve_self_parsed_type(replacement, item)),
+				span,
+			)
+		ParsedArrayType(element, dims, span):
+			ParsedArrayType(
+				compiler_resolve_self_parsed_type(replacement, element),
+				dims.map(func(dim): compiler_resolve_self_parsed_type(replacement, dim)),
+				span,
+			)
+		ParsedFunctionType(is_pure, params, return_type, span):
+			ParsedFunctionType(
+				is_pure,
+				params.map(func(param): compiler_resolve_self_parsed_type(replacement, param)),
+				compiler_resolve_self_parsed_type(replacement, return_type),
+				span,
+			)
+		ParsedRangeType(inner, span):
+			ParsedRangeType(
+				compiler_resolve_self_parsed_type(replacement, inner),
+				span,
+			)
+		ParsedDimBinaryType(op, left, right, span):
+			ParsedDimBinaryType(
+				op,
+				compiler_resolve_self_parsed_type(replacement, left),
+				compiler_resolve_self_parsed_type(replacement, right),
+				span,
+			)
+		_:
+			type_expr
 
 
-private pure func compiler_typecheck_check_default_impl_method_bodies(
-	state: CompilerTypecheckState,
+private pure func compiler_resolve_self_optional_parsed_type(
+	replacement: ParsedTypeExpr,
+	type_expr: Option[ParsedTypeExpr],
+) -> Option[ParsedTypeExpr]:
+	type_expr.map(func(value): compiler_resolve_self_parsed_type(replacement, value))
+
+
+private pure func compiler_resolve_self_parsed_param(
+	replacement: ParsedTypeExpr,
+	param: ParsedParam,
+) -> ParsedParam:
+	{ param | type_expr = compiler_resolve_self_optional_parsed_type(replacement, param.type_expr) }
+
+
+private pure func compiler_resolve_self_parsed_function(
+	replacement: ParsedTypeExpr,
+	decl: ParsedFunctionDecl,
+) -> ParsedFunctionDecl:
+	{ decl |
+		params = decl.params.map(
+			func(param): compiler_resolve_self_parsed_param(replacement, param),
+		),
+		return_type = compiler_resolve_self_optional_parsed_type(replacement, decl.return_type),
+		body = decl.body.map(func(body): compiler_resolve_self_parsed_expr(replacement, body))
+	}
+
+
+private pure func compiler_resolve_self_parsed_expr(
+	replacement: ParsedTypeExpr,
+	expr: ParsedExpr,
+) -> ParsedExpr:
+	with_children = map_parsed_expr_children(
+		expr,
+		func(child): compiler_resolve_self_parsed_expr(replacement, child),
+	)
+
+	match with_children:
+		ParsedAscriptionExpr(value, type_expr, span):
+			ParsedAscriptionExpr(
+				value,
+				compiler_resolve_self_parsed_type(replacement, type_expr),
+				span,
+			)
+		ParsedOpaqueIntoExpr(type_expr, value, span):
+			ParsedOpaqueIntoExpr(
+				compiler_resolve_self_parsed_type(replacement, type_expr),
+				value,
+				span,
+			)
+		ParsedOpaqueFromExpr(type_expr, value, span):
+			ParsedOpaqueFromExpr(
+				compiler_resolve_self_parsed_type(replacement, type_expr),
+				value,
+				span,
+			)
+		ParsedWithExpr(binding, body, span):
+			ParsedWithExpr(
+				{ binding |
+					type_expr = compiler_resolve_self_optional_parsed_type(
+						replacement,
+						binding.type_expr,
+					)
+				},
+				body,
+				span,
+			)
+		ParsedLambdaExpr(is_pure, params, return_type, body, span):
+			ParsedLambdaExpr(
+				is_pure,
+				params.map(
+					func(
+						param,
+					): { param |
+						type_expr = compiler_resolve_self_optional_parsed_type(
+							replacement,
+							param.type_expr,
+						)
+					},
+				),
+				compiler_resolve_self_optional_parsed_type(replacement, return_type),
+				body,
+				span,
+			)
+		ParsedFunctionDeclExpr(decl):
+			ParsedFunctionDeclExpr(compiler_resolve_self_parsed_function(replacement, decl))
+		ParsedVarDeclExpr(name, type_expr, value, is_mutable, span):
+			ParsedVarDeclExpr(
+				name,
+				compiler_resolve_self_optional_parsed_type(replacement, type_expr),
+				value,
+				is_mutable,
+				span,
+			)
+		ParsedQuestionBindExpr(name, type_expr, value, span):
+			ParsedQuestionBindExpr(
+				name,
+				compiler_resolve_self_optional_parsed_type(replacement, type_expr),
+				value,
+				span,
+			)
+		_:
+			with_children
+
+
+private pure func compiler_default_impl_method_decl(
 	impl_decl: ParsedImplDecl,
-	for_type: CompilerType,
-	trait_decl: ParsedTraitDecl,
-	trait_methods: List[CompilerTraitMethodSig],
-) -> CompilerTypecheckState:
-	if compiler_collect_type_vars(for_type).length() > 0:
-		state
-	else:
-		var next = state
+	method: ParsedTraitMethodDecl,
+) -> ParsedFunctionDecl:
+	replacement: ParsedTypeExpr = impl_decl.for_type
+	{
+		name = method.name,
+		type_params = [],
+		params = method.params.map(
+			func(param): compiler_resolve_self_parsed_param(replacement, param),
+		),
+		return_type = compiler_resolve_self_optional_parsed_type(replacement, method.return_type),
+		dim_constraints = [],
+		body = method.body.map(func(body): compiler_resolve_self_parsed_expr(replacement, body)),
+		is_pure = method.is_pure,
+		annotations = [],
+		doc = None,
+		span = impl_decl.span
+	}
 
-		for method in trait_decl.methods:
-			if (
-				method.body.is_some()
-				and not compiler_impl_has_method(impl_decl.methods, method.name.text)
-			):
-				match compiler_find_trait_method(trait_methods, method.name.text):
-					Some(trait_method):
-						resolved = compiler_resolve_impl_method_sig(
-							compiler_type_copy(for_type),
-							trait_method,
-						)
-						next = compiler_typecheck_check_default_impl_method_body(
-							next,
-							method,
-							resolved,
-						)
-					None:
-						void
 
-		next
+private pure func compiler_find_imported_trait_decl(
+	import_modules: List[CompilerImportableModule],
+	module_path: String,
+	trait_name: String,
+) -> Option[ParsedTraitDecl]:
+	var result: Option[ParsedTraitDecl] = None
+
+	for module in import_modules:
+		if module.module_path == module_path:
+			result = compiler_find_trait_decl(module.decls, trait_name)
+			break
+
+	result
+
+
+private pure func compiler_importable_module_is_prelude_traits(
+	module: CompilerImportableModule,
+) -> Bool:
+	(
+		module.module_path == COMPILER_PRELUDE_TRAITS_MODULE_PATH
+		or module.module_path == COMPILER_PRELUDE_TRAITS_MODULE_NAME
+		or module.surface.module_name == COMPILER_PRELUDE_TRAITS_MODULE_PATH
+		or module.surface.module_name == COMPILER_PRELUDE_TRAITS_MODULE_NAME
+	)
+
+
+private pure func compiler_find_prelude_trait_decl(
+	import_modules: List[CompilerImportableModule],
+	trait_name: String,
+) -> Option[ParsedTraitDecl]:
+	var result: Option[ParsedTraitDecl] = None
+
+	for module in import_modules:
+		if compiler_importable_module_is_prelude_traits(module):
+			result = compiler_find_trait_decl(module.decls, trait_name)
+			break
+
+	result
+
+
+private pure func compiler_find_impl_trait_decl(
+	state: CompilerTypecheckState,
+	decls: List[ParsedDecl],
+	import_modules: List[CompilerImportableModule],
+	trait_name: String,
+) -> Option[ParsedTraitDecl]:
+	match compiler_find_trait_decl(decls, trait_name):
+		Some(trait_decl):
+			Some(trait_decl)
+		None:
+			match compiler_typecheck_state_find_imported_name(state, trait_name):
+				Some(binding):
+					compiler_find_imported_trait_decl(
+						import_modules,
+						binding.module_path,
+						binding.original_name,
+					)
+				None:
+					if compiler_builtin_trait_is_prelude(trait_name):
+						compiler_find_prelude_trait_decl(import_modules, trait_name)
+					else:
+						None
 
 
 private pure func compiler_add_impl_body_trait_functions(
 	state: CompilerTypecheckState,
 	trait_name: String,
 ) -> CompilerTypecheckState:
-	var env = state.env
+	var next = state
 
-	for pair in compiler_env_trait_methods_with_declaring_trait(env, trait_name):
-		env = compiler_env_add_trait_function(env, pair[0], pair[1])
+	for pair in compiler_env_trait_methods_with_declaring_trait(state.env, trait_name):
+		next = compiler_typecheck_state_with_env(
+			next,
+			compiler_env_add_trait_function(next.env, pair[0], pair[1]),
+		)
+		next = compiler_typecheck_state_add_scoped_trait_function(next, pair[0], pair[1])
 
-	compiler_typecheck_state_with_env(state, env)
+	next
 
 
 private pure func compiler_typecheck_validate_impl_decl(
@@ -5515,17 +5644,6 @@ private pure func compiler_trait_visible_for_impl(
 							False
 
 
-private pure func compiler_trait_declared_in_current_program(
-	state: CompilerTypecheckState,
-	trait_name: String,
-) -> Bool:
-	match compiler_typecheck_state_find_top_level_name(state, trait_name):
-		Some(kind):
-			kind == CompilerTopLevelTrait
-		None:
-			False
-
-
 private pure func compiler_typecheck_validate_visible_impl_decl(
 	state: CompilerTypecheckState,
 	impl_decl: ParsedImplDecl,
@@ -5565,6 +5683,7 @@ private pure func compiler_typecheck_validate_visible_impl_decl(
 private pure func compiler_typecheck_materialize_impl_body(
 	state: CompilerTypecheckState,
 	decls: List[ParsedDecl],
+	import_modules: List[CompilerImportableModule],
 	impl_decl: ParsedImplDecl,
 ) -> CompilerTypecheckImplBodyResult:
 	for_type: CompilerType = compiler_type_from_parsed_type_expr(impl_decl.for_type)
@@ -5598,15 +5717,7 @@ private pure func compiler_typecheck_materialize_impl_body(
 			}
 		}
 	else:
-		trait_is_local = compiler_trait_declared_in_current_program(
-			validated,
-			impl_decl.trait_name.text,
-		)
-
-		body_state = if trait_is_local:
-			compiler_add_impl_body_trait_functions(validated, impl_decl.trait_name.text)
-		else:
-			validated
+		body_state = compiler_add_impl_body_trait_functions(validated, impl_decl.trait_name.text)
 
 		var next = body_state
 		var typed_methods: List[CompilerTypedFunctionInfo] = []
@@ -5620,25 +5731,35 @@ private pure func compiler_typecheck_materialize_impl_body(
 			next = method_result.state
 			typed_methods = typed_methods.append(method_result.typed)
 
-		match compiler_find_trait_decl(decls, impl_decl.trait_name.text):
-			Some(trait_decl):
-				match compiler_env_get_trait(next.env, impl_decl.trait_name.text):
-					Some(trait_def):
-						checked_defaults = compiler_typecheck_check_default_impl_method_bodies(
-							next,
-							impl_decl,
-							compiler_type_copy(for_type),
-							trait_decl,
-							trait_def.methods,
-						)
-						next = compiler_typecheck_state_with_env(checked_defaults, next.env)
-					None:
-						void
-			_:
-				void
+		if compiler_collect_type_vars(for_type).length() == 0:
+			match compiler_find_impl_trait_decl(
+				next,
+				decls,
+				import_modules,
+				impl_decl.trait_name.text,
+			):
+				Some(trait_decl):
+					for method in trait_decl.methods:
+						if (
+							method.body.is_some()
+							and not compiler_impl_has_method(impl_decl.methods, method.name.text)
+						):
+							default_decl = compiler_default_impl_method_decl(impl_decl, method)
+							method_result = compiler_typecheck_materialize_function_body_with_options(
+								next,
+								default_decl,
+								False,
+							)
+							next = method_result.state
+							typed_methods = typed_methods.append(method_result.typed)
+				None:
+					void
 
 		{
-			state = compiler_typecheck_state_with_env(next, state.env),
+			state = compiler_typecheck_state_with_scoped_trait_functions(
+				compiler_typecheck_state_with_env(next, state.env),
+				state.scoped_trait_functions,
+			),
 			typed = {
 				decl = impl_decl,
 				for_type = compiler_type_copy(for_type),
@@ -5653,7 +5774,7 @@ pure func compiler_typecheck_check_decl_body(
 	decls: List[ParsedDecl],
 	decl: ParsedDecl,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_materialize_decl_body(state, module_path, decls, decl).state
+	compiler_typecheck_materialize_decl_body(state, module_path, decls, [], decl).state
 
 
 private pure func compiler_typed_foreign_includes(
@@ -5779,6 +5900,7 @@ private pure func compiler_typecheck_materialize_decl_body(
 	state: CompilerTypecheckState,
 	module_path: String,
 	decls: List[ParsedDecl],
+	import_modules: List[CompilerImportableModule],
 	decl: ParsedDecl,
 ) -> CompilerTypecheckDeclBodyResult:
 	match decl:
@@ -5829,13 +5951,24 @@ private pure func compiler_typecheck_materialize_decl_body(
 				decl = CompilerTypedTraitDecl(compiler_typed_trait_from_parsed(state, trait_decl))
 			}
 		ImplParsedDecl(impl_decl):
-			result = compiler_typecheck_materialize_impl_body(state, decls, impl_decl)
+			result = compiler_typecheck_materialize_impl_body(
+				state,
+				decls,
+				import_modules,
+				impl_decl,
+			)
 			{
 				state = result.state,
 				decl = CompilerTypedImplDecl(result.typed)
 			}
 		PrivateParsedDecl(inner, _):
-			result = compiler_typecheck_materialize_decl_body(state, module_path, decls, inner)
+			result = compiler_typecheck_materialize_decl_body(
+				state,
+				module_path,
+				decls,
+				import_modules,
+				inner,
+			)
 			{
 				state = result.state,
 				decl = CompilerTypedPrivateDecl(result.decl)
@@ -5871,6 +6004,14 @@ pure func compiler_typecheck_materialize_program_bodies(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckProgramResult:
+	compiler_typecheck_materialize_program_bodies_with_import_modules(state, program, [])
+
+
+private pure func compiler_typecheck_materialize_program_bodies_with_import_modules(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+) -> CompilerTypecheckProgramResult:
 	var next_state = state
 	var typed_decls: List[CompilerTypedDecl] = []
 
@@ -5890,6 +6031,7 @@ pure func compiler_typecheck_materialize_program_bodies(
 					next_state,
 					program.source.module_name,
 					program.decls,
+					import_modules,
 					decl,
 				)
 				next_state = result.state
@@ -5904,6 +6046,7 @@ pure func compiler_typecheck_materialize_program_bodies(
 private pure func compiler_typecheck_program_after_import_registration(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
 ) -> CompilerTypecheckProgramResult:
 	with_types = compiler_typecheck_register_program_type_decls(
 		compiler_typecheck_state_copy(state),
@@ -5918,9 +6061,10 @@ private pure func compiler_typecheck_program_after_import_registration(
 		program,
 	)
 
-	compiler_typecheck_materialize_program_bodies(
+	compiler_typecheck_materialize_program_bodies_with_import_modules(
 		compiler_typecheck_state_copy(with_impls),
 		program,
+		import_modules,
 	)
 
 
@@ -5936,7 +6080,7 @@ pure func compiler_typecheck_program_with_import_surfaces(
 		program,
 	)
 
-	compiler_typecheck_program_after_import_registration(with_imports, program)
+	compiler_typecheck_program_after_import_registration(with_imports, program, [])
 
 
 pure func compiler_typecheck_program_with_import_modules(
@@ -5967,7 +6111,11 @@ pure func compiler_typecheck_program_with_import_modules(
 		import_surfaces,
 	)
 
-	compiler_typecheck_program_after_import_registration(with_import_decls, program_with_prelude)
+	compiler_typecheck_program_after_import_registration(
+		with_import_decls,
+		program_with_prelude,
+		import_modules,
+	)
 
 
 pure func compiler_typecheck_program(
@@ -5980,4 +6128,4 @@ pure func compiler_typecheck_program(
 		program,
 	)
 
-	compiler_typecheck_program_after_import_registration(with_imports, program)
+	compiler_typecheck_program_after_import_registration(with_imports, program, [])

@@ -2,7 +2,11 @@ import:
 	compiler_env:
 		CompilerEnv,
 		CompilerFuncOrigin(CompilerBuiltinFunc),
-		CompilerLoopProducer(CompilerLoopProducerIndices, CompilerLoopProducerWindows),
+		CompilerLoopProducer(
+			CompilerLoopProducerEnumerate2,
+			CompilerLoopProducerIndices,
+			CompilerLoopProducerWindows,
+		),
 		CompilerPurity(CompilerImpure, CompilerPure),
 		CompilerResourceArgPolicy(CompilerAllowResourceArgs, CompilerRejectResourceArgs),
 		CompilerResourceResultPolicy(
@@ -29,6 +33,7 @@ import:
 			CompilerFunctionType,
 			CompilerNamedType,
 			CompilerSelfType,
+			CompilerTupleType,
 			CompilerTypeVar,
 		),
 		compiler_type_bool,
@@ -474,6 +479,34 @@ private pure func compiler_add_builtin_generic_func(
 			)
 
 
+private pure func compiler_add_loop_producer_builtin(
+	env: CompilerEnv,
+	name: String,
+	type_params: List[String],
+	func_type: CompilerType,
+	loop_producer: CompilerLoopProducer,
+) -> CompilerEnv:
+	match compiler_env_mint_def_id(env):
+		(next_env, def_id):
+			compiler_env_add_func_with_info(
+				next_env,
+				name,
+				compiler_func_symbol(
+					def_id,
+					func_type,
+					type_params.map(func(param): compiler_make_bound_type_param(param, [])),
+					[],
+					builtin_purity(name),
+					CompilerBuiltinFunc,
+					CompilerRejectResourceArgs,
+					None,
+					[],
+					Some(loop_producer),
+					False,
+				),
+			)
+
+
 private pure func compiler_add_scalar_conversion_builtin(
 	env: CompilerEnv,
 	name: String,
@@ -498,9 +531,9 @@ private pure func compiler_add_tensor_constructor_builtin(
 		name,
 		["T"].concat(dim_names),
 		fn_type(
-			[CompilerTypeVar("T")].concat(
-				dim_names.map(func(_): compiler_type_int()),
-			),
+			[CompilerTypeVar("T")].concat(dim_names.map(
+				func(_): compiler_type_int(),
+			)),
 			CompilerArrayType(CompilerTypeVar("T"), dims),
 		),
 	)
@@ -516,6 +549,25 @@ private pure func compiler_add_checked_read_builtin(
 	for _ in 0..index_count:
 		params = params.append(compiler_type_int())
 
+	compiler_add_builtin_generic_func(
+		env,
+		name,
+		["T"],
+		fn_type(params, CompilerTypeVar("T")),
+	)
+
+
+private pure func compiler_add_checked_write_builtin(
+	env: CompilerEnv,
+	name: String,
+	index_count: Int,
+) -> CompilerEnv:
+	var params: List[CompilerType] = [CompilerTypeVar("T")]
+
+	for _ in 0..index_count:
+		params = params.append(compiler_type_int())
+
+	params = params.append(CompilerTypeVar("T"))
 	compiler_add_builtin_generic_func(
 		env,
 		name,
@@ -671,6 +723,38 @@ private pure func add_core_builtin_types(env: CompilerEnv) -> CompilerEnv:
 	result
 
 
+pure func compiler_builtin_trait_is_prelude(trait_name: String) -> Bool:
+	-- These traits own callable names installed directly into the compiler
+	-- prelude below. Source loading may replace their declarations with the
+	-- equivalent std/traits definitions, so module ownership is not a stable
+	-- way to identify prelude visibility.
+	match trait_name:
+		"Absolute":
+			True
+		"Bounded":
+			True
+		"Equatable":
+			True
+		"FixedPoint":
+			True
+		"FloatingPoint":
+			True
+		"HasLength":
+			True
+		"Integer":
+			True
+		"Orderable":
+			True
+		"Stringable":
+			True
+		"ToFloat":
+			True
+		"ToInt":
+			True
+		_:
+			False
+
+
 private pure func builtin_unary_self_method(
 	name: String,
 	return_type: CompilerType,
@@ -682,7 +766,12 @@ private pure func builtin_binary_self_method(
 	name: String,
 	return_type: CompilerType,
 ) -> CompilerTraitMethodSig:
-	compiler_trait_method_sig(name, [CompilerSelfType, CompilerSelfType], return_type, True)
+	compiler_trait_method_sig(
+		name,
+		[CompilerSelfType, CompilerSelfType],
+		return_type,
+		True,
+	)
 
 
 private pure func add_core_builtin_traits(env: CompilerEnv) -> CompilerEnv:
@@ -690,266 +779,374 @@ private pure func add_core_builtin_traits(env: CompilerEnv) -> CompilerEnv:
 	option_self = CompilerNamedType("Option", [CompilerSelfType])
 	fixed_type = CompilerNamedType("Fixed", [])
 
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		100,
-		"Stringable",
-		[],
-		[builtin_unary_self_method("to_string", compiler_type_string())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		101,
-		"Equatable",
-		[],
-		[builtin_binary_self_method("equals", compiler_type_bool())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		102,
-		"Orderable",
-		["Equatable"],
-		[builtin_binary_self_method("less_than", compiler_type_bool())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		103,
-		"HasLength",
-		[],
-		[builtin_unary_self_method("length", compiler_type_int())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		104,
-		"Integer",
-		[
-			"Addable",
-			"Subtractable",
-			"Multipliable",
-			"Divisible",
-			"Modulable",
-			"Orderable",
-			"HasZero",
-			"HasOne",
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			100,
 			"Stringable",
-			"Absolute",
-			"Bounded",
-			"ToInt",
-		],
-		[
-			builtin_binary_self_method("checked_div", option_self),
-			builtin_binary_self_method("checked_mod", option_self),
-			builtin_binary_self_method("bit_and", CompilerSelfType),
-			builtin_binary_self_method("bit_or", CompilerSelfType),
-			builtin_binary_self_method("bit_xor", CompilerSelfType),
-			builtin_unary_self_method("bit_not", CompilerSelfType),
-			compiler_trait_method_sig(
-				"shift_left",
-				[CompilerSelfType, compiler_type_int()],
-				CompilerSelfType,
-				True,
-			),
-			compiler_trait_method_sig(
-				"shift_right",
-				[CompilerSelfType, compiler_type_int()],
-				CompilerSelfType,
-				True,
-			),
-		],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		105,
-		"FloatingPoint",
-		[
-			"Addable",
-			"Subtractable",
-			"Multipliable",
-			"Divisible",
-			"Negatable",
+			[],
+			[builtin_unary_self_method("to_string", compiler_type_string())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			101,
+			"Equatable",
+			[],
+			[builtin_binary_self_method("equals", compiler_type_bool())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			102,
 			"Orderable",
-			"HasZero",
-			"HasOne",
-			"Stringable",
-			"Absolute",
-			"Bounded",
-			"ToFloat",
-		],
-		[
-			builtin_unary_self_method("floor", CompilerSelfType),
-			builtin_unary_self_method("ceil", CompilerSelfType),
-			builtin_unary_self_method("round", CompilerSelfType),
-			builtin_unary_self_method("trunc", CompilerSelfType),
-			builtin_unary_self_method("sqrt", CompilerSelfType),
-			builtin_unary_self_method("sin", CompilerSelfType),
-			builtin_unary_self_method("cos", CompilerSelfType),
-			builtin_unary_self_method("tan", CompilerSelfType),
-			builtin_unary_self_method("exp", CompilerSelfType),
-			builtin_unary_self_method("log", CompilerSelfType),
-			builtin_binary_self_method("pow", CompilerSelfType),
-			builtin_unary_self_method("is_nan", compiler_type_bool()),
-			builtin_unary_self_method("is_inf", compiler_type_bool()),
-			builtin_unary_self_method("is_finite", compiler_type_bool()),
-		],
-	))
+			["Equatable"],
+			[builtin_binary_self_method("less_than", compiler_type_bool())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			103,
+			"HasLength",
+			[],
+			[builtin_unary_self_method("length", compiler_type_int())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			104,
+			"Integer",
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Modulable",
+				"Orderable",
+				"HasZero",
+				"HasOne",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+				"ToInt",
+			],
+			[
+				builtin_binary_self_method("checked_div", option_self),
+				builtin_binary_self_method("checked_mod", option_self),
+				builtin_binary_self_method("bit_and", CompilerSelfType),
+				builtin_binary_self_method("bit_or", CompilerSelfType),
+				builtin_binary_self_method("bit_xor", CompilerSelfType),
+				builtin_unary_self_method("bit_not", CompilerSelfType),
+				compiler_trait_method_sig(
+					"shift_left",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+				compiler_trait_method_sig(
+					"shift_right",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			105,
+			"FloatingPoint",
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Negatable",
+				"Orderable",
+				"HasZero",
+				"HasOne",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+				"ToFloat",
+			],
+			[
+				builtin_unary_self_method("floor", CompilerSelfType),
+				builtin_unary_self_method("ceil", CompilerSelfType),
+				builtin_unary_self_method("round", CompilerSelfType),
+				builtin_unary_self_method("trunc", CompilerSelfType),
+				builtin_unary_self_method("sqrt", CompilerSelfType),
+				builtin_unary_self_method("sin", CompilerSelfType),
+				builtin_unary_self_method("cos", CompilerSelfType),
+				builtin_unary_self_method("tan", CompilerSelfType),
+				builtin_unary_self_method("exp", CompilerSelfType),
+				builtin_unary_self_method("log", CompilerSelfType),
+				builtin_binary_self_method("pow", CompilerSelfType),
+				builtin_unary_self_method("is_nan", compiler_type_bool()),
+				builtin_unary_self_method("is_inf", compiler_type_bool()),
+				builtin_unary_self_method("is_finite", compiler_type_bool()),
+			],
+		),
+	)
 
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		106,
-		"Addable",
-		[],
-		[builtin_binary_self_method("add", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		107,
-		"Subtractable",
-		[],
-		[builtin_binary_self_method("subtract", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		108,
-		"Multipliable",
-		[],
-		[builtin_binary_self_method("multiply", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		109,
-		"Divisible",
-		[],
-		[builtin_binary_self_method("divide", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		110,
-		"Modulable",
-		[],
-		[builtin_binary_self_method("remainder", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		111,
-		"Negatable",
-		[],
-		[builtin_unary_self_method("negate", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		112,
-		"HasZero",
-		[],
-		[compiler_trait_method_sig("zero", [], CompilerSelfType, True)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		113,
-		"HasOne",
-		[],
-		[compiler_trait_method_sig("one", [], CompilerSelfType, True)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		114,
-		"Absolute",
-		[],
-		[builtin_unary_self_method("abs", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		115,
-		"Bounded",
-		[],
-		[
-			builtin_binary_self_method("min", CompilerSelfType),
-			builtin_binary_self_method("max", CompilerSelfType),
-		],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		116,
-		"Hashable",
-		["Equatable"],
-		[builtin_unary_self_method("hash", compiler_type_int())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		117,
-		"ToBool",
-		[],
-		[builtin_unary_self_method("to_bool", compiler_type_bool())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		118,
-		"Logical",
-		[],
-		[
-			builtin_binary_self_method("logical_and", CompilerSelfType),
-			builtin_binary_self_method("logical_or", CompilerSelfType),
-			builtin_unary_self_method("logical_not", CompilerSelfType),
-		],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		119,
-		"ToInt",
-		[],
-		[builtin_unary_self_method("to_int", compiler_type_int())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		120,
-		"ToFloat",
-		[],
-		[builtin_unary_self_method("to_float", compiler_type_float())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		121,
-		"ToFixed",
-		[],
-		[builtin_unary_self_method("to_fixed", fixed_type)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		122,
-		"ToChar",
-		[],
-		[builtin_unary_self_method("to_char", compiler_type_char())],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		123,
-		"SignedInteger",
-		["Integer", "Negatable"],
-		[],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		124,
-		"UnsignedInteger",
-		["Integer"],
-		[],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		125,
-		"Numeric",
-		["Addable", "Multipliable", "HasZero"],
-		[],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		126,
-		"FixedPoint",
-		[
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			106,
 			"Addable",
+			[],
+			[builtin_binary_self_method("add", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			107,
 			"Subtractable",
+			[],
+			[builtin_binary_self_method("subtract", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			108,
 			"Multipliable",
+			[],
+			[builtin_binary_self_method("multiply", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			109,
 			"Divisible",
-			"Orderable",
+			[],
+			[builtin_binary_self_method("divide", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			110,
+			"Modulable",
+			[],
+			[builtin_binary_self_method("remainder", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			111,
+			"Negatable",
+			[],
+			[builtin_unary_self_method("negate", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			112,
 			"HasZero",
-			"Stringable",
+			[],
+			[compiler_trait_method_sig("zero", [], CompilerSelfType, True)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			113,
+			"HasOne",
+			[],
+			[compiler_trait_method_sig("one", [], CompilerSelfType, True)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			114,
 			"Absolute",
+			[],
+			[builtin_unary_self_method("abs", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			115,
 			"Bounded",
-		],
-		[
-			builtin_unary_self_method("get_scale", compiler_type_int()),
-			compiler_trait_method_sig(
-				"round_to",
-				[CompilerSelfType, compiler_type_int()],
-				CompilerSelfType,
-				True,
-			),
-		],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		127,
-		"Copyable",
-		[],
-		[builtin_unary_self_method("copy", CompilerSelfType)],
-	))
-	result = compiler_env_add_trait(result, compiler_trait_def(
-		128,
-		"Cloneable",
-		[],
-		[compiler_trait_method_sig("clone", [CompilerSelfType], CompilerSelfType, False)],
-	))
+			[],
+			[
+				builtin_binary_self_method("min", CompilerSelfType),
+				builtin_binary_self_method("max", CompilerSelfType),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			116,
+			"Hashable",
+			["Equatable"],
+			[builtin_unary_self_method("hash", compiler_type_int())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			117,
+			"ToBool",
+			[],
+			[builtin_unary_self_method("to_bool", compiler_type_bool())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			118,
+			"Logical",
+			[],
+			[
+				builtin_binary_self_method("logical_and", CompilerSelfType),
+				builtin_binary_self_method("logical_or", CompilerSelfType),
+				builtin_unary_self_method("logical_not", CompilerSelfType),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			119,
+			"ToInt",
+			[],
+			[builtin_unary_self_method("to_int", compiler_type_int())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			120,
+			"ToFloat",
+			[],
+			[builtin_unary_self_method("to_float", compiler_type_float())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(121, "ToFixed", [], [builtin_unary_self_method("to_fixed", fixed_type)]),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			122,
+			"ToChar",
+			[],
+			[builtin_unary_self_method("to_char", compiler_type_char())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			123,
+			"SignedInteger",
+			["Integer", "Negatable"],
+			[],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(124, "UnsignedInteger", ["Integer"], []),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			125,
+			"Numeric",
+			["Addable", "Multipliable", "HasZero"],
+			[],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			126,
+			"FixedPoint",
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Orderable",
+				"HasZero",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+			],
+			[
+				builtin_unary_self_method("get_scale", compiler_type_int()),
+				compiler_trait_method_sig(
+					"round_to",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			127,
+			"Copyable",
+			[],
+			[builtin_unary_self_method("copy", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			128,
+			"Cloneable",
+			[],
+			[compiler_trait_method_sig("clone", [CompilerSelfType], CompilerSelfType, False)],
+		),
+	)
+
+	for name in [
+		"checked_div",
+		"checked_mod",
+		"bit_and",
+		"bit_or",
+		"bit_xor",
+		"bit_not",
+		"shift_left",
+		"shift_right",
+	]:
+		result = compiler_env_add_trait_function(result, name, "Integer")
+
+	for name in [
+		"floor",
+		"ceil",
+		"round",
+		"trunc",
+		"sqrt",
+		"sin",
+		"cos",
+		"tan",
+		"exp",
+		"log",
+		"pow",
+		"is_nan",
+		"is_inf",
+		"is_finite",
+	]:
+		result = compiler_env_add_trait_function(result, name, "FloatingPoint")
+
 	result = compiler_env_add_trait_function(result, "to_string", "Stringable")
 	result = compiler_env_add_trait_function(result, "equals", "Equatable")
 	result = compiler_env_add_trait_function(result, "less_than", "Orderable")
@@ -962,7 +1159,26 @@ private pure func add_core_builtin_traits(env: CompilerEnv) -> CompilerEnv:
 	result = compiler_env_add_trait_function(result, "get_scale", "FixedPoint")
 	result = compiler_env_add_trait_function(result, "round_to", "FixedPoint")
 	result = compiler_add_builtin_impl(result, "Integer", compiler_type_int())
-	result = compiler_add_builtin_impl(result, "FloatingPoint", compiler_type_float())
+	result = compiler_add_builtin_impl(result, "SignedInteger", compiler_type_int())
+
+	for name in ["Int8", "Int16", "Int32", "Int128"]:
+		typ = CompilerNamedType(name, [])
+		result = compiler_add_builtin_impl(result, "Integer", typ)
+		result = compiler_add_builtin_impl(result, "SignedInteger", typ)
+
+	for name in ["UInt8", "UInt16", "UInt32", "UInt64", "UInt128"]:
+		typ = CompilerNamedType(name, [])
+		result = compiler_add_builtin_impl(result, "Integer", typ)
+		result = compiler_add_builtin_impl(result, "UnsignedInteger", typ)
+
+	for name in ["Float", "Float32", "Float16"]:
+		result = compiler_add_builtin_impl(
+			result,
+			"FloatingPoint",
+			CompilerNamedType(name, []),
+		)
+
+	result = compiler_add_builtin_impl(result, "FixedPoint", fixed_type)
 	result = compiler_add_builtin_impl(result, "Stringable", compiler_type_string())
 	result = compiler_add_builtin_impl(result, "Equatable", compiler_type_string())
 	result = compiler_add_builtin_impl(result, "Equatable", compiler_type_bool())
@@ -978,6 +1194,8 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 	list_of_t: CompilerType = CompilerNamedType("List", [CompilerTypeVar("T")])
 	channel_of_t: CompilerType = CompilerNamedType("Channel", [CompilerTypeVar("T")])
 	option_of_t: CompilerType = CompilerNamedType("Option", [CompilerTypeVar("T")])
+	char_type: CompilerType = compiler_type_char()
+	fixed_type: CompilerType = CompilerNamedType("Fixed", [])
 
 	result = compiler_add_builtin_generic_func(
 		result,
@@ -1008,6 +1226,24 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		"to_char",
 		["T"],
 		fn_type([CompilerTypeVar("T")], compiler_type_char()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"from_char",
+		fn_type([char_type], compiler_type_string()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"from_chars",
+		fn_type([CompilerNamedType("List", [char_type])], compiler_type_string()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"fixed",
+		fn_type(
+			[compiler_type_float(), compiler_type_int()],
+			fixed_type,
+		),
 	)
 
 	for (name, result_type) in [
@@ -1097,7 +1333,10 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 			name,
 			fn_type(
 				[compiler_type_int(), compiler_type_int()],
-				CompilerNamedType("Option", [compiler_type_int()]),
+				CompilerNamedType(
+					"Option",
+					[compiler_type_int()],
+				),
 			),
 		)
 
@@ -1137,10 +1376,33 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		),
 	)
 
+	result = compiler_add_builtin_generic_func(
+		result,
+		"tensor_peel",
+		["T"],
+		fn_type(
+			[CompilerTypeVar("T"), compiler_type_int()],
+			CompilerTypeVar("T"),
+		),
+	)
+	result = compiler_add_checked_write_builtin(result, "checked_set", 1)
+	result = compiler_add_builtin_generic_func(
+		result,
+		"checked_slice",
+		["T"],
+		fn_type(
+			[CompilerTypeVar("T"), compiler_type_int(), compiler_type_int()],
+			CompilerTypeVar("T"),
+		),
+	)
 	result = compiler_add_checked_read_builtin(result, "matrix_checked_get", 2)
+	result = compiler_add_checked_write_builtin(result, "matrix_checked_set", 2)
 	result = compiler_add_checked_read_builtin(result, "tensor3_checked_get", 3)
+	result = compiler_add_checked_write_builtin(result, "tensor3_checked_set", 3)
 	result = compiler_add_checked_read_builtin(result, "tensor4_checked_get", 4)
+	result = compiler_add_checked_write_builtin(result, "tensor4_checked_set", 4)
 	result = compiler_add_checked_read_builtin(result, "tensor5_checked_get", 5)
+	result = compiler_add_checked_write_builtin(result, "tensor5_checked_set", 5)
 
 	result = compiler_add_builtin_generic_func(
 		result,
@@ -1173,36 +1435,98 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 	)
 	result = compiler_add_resource_builtin_generic_func(
 		result,
+		"try_send",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, CompilerTypeVar("T")],
+			compiler_type_bool(),
+		),
+		CompilerResourceResultOrdinary,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"try_recv",
+		["T"],
+		impure_fn_type([channel_of_t], option_of_t),
+		CompilerResourceResultDependent,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"recv_timeout",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, compiler_type_int()],
+			option_of_t,
+		),
+		CompilerResourceResultDependent,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"send_timeout",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, CompilerTypeVar("T"), compiler_type_int()],
+			compiler_type_bool(),
+		),
+		CompilerResourceResultOrdinary,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
 		"seal",
 		["T"],
 		impure_fn_type([channel_of_t], compiler_type_void()),
 		CompilerResourceResultOrdinary,
 	)
+	result = compiler_add_builtin_func(
+		result,
+		"max_threads",
+		fn_type([], compiler_type_int()),
+	)
 
-	match compiler_env_mint_def_id(result):
-		(next_env, def_id):
-			compiler_env_add_func_with_info(
-				next_env,
-				"windows",
-				compiler_func_symbol(
-					def_id,
-					fn_type(
-						[list_of_t, compiler_type_int()],
-						list_of_t,
-					),
-					["T"].map(
-						func(param): compiler_make_bound_type_param(param, []),
-					),
-					[],
-					CompilerPure,
-					CompilerBuiltinFunc,
-					CompilerRejectResourceArgs,
-					None,
-					[],
-					Some(CompilerLoopProducerWindows),
-					False,
-				),
-			)
+	matrix_of_t: CompilerType = CompilerArrayType(
+		CompilerTypeVar("T"),
+		[CompilerTypeVar("#M"), CompilerTypeVar("#N")],
+	)
+	result = compiler_add_loop_producer_builtin(
+		result,
+		"enumerate2",
+		["T", "#M", "#N"],
+		fn_type(
+			[matrix_of_t],
+			CompilerNamedType("List", [CompilerTupleType([
+						compiler_type_int(),
+						compiler_type_int(),
+						CompilerTypeVar("T"),
+					])]),
+		),
+		CompilerLoopProducerEnumerate2,
+	)
+	result = compiler_add_builtin_generic_func(
+		result,
+		"zip",
+		["T", "U", "#N"],
+		fn_type(
+			[
+				CompilerArrayType(CompilerTypeVar("T"), [CompilerTypeVar("#N")]),
+				CompilerArrayType(CompilerTypeVar("U"), [CompilerTypeVar("#N")]),
+			],
+			CompilerArrayType(
+				CompilerTupleType([CompilerTypeVar("T"), CompilerTypeVar("U")]),
+				[CompilerTypeVar("#N")],
+			),
+		),
+	)
+
+	compiler_add_loop_producer_builtin(
+		result,
+		"windows",
+		["T"],
+		fn_type(
+			[list_of_t, compiler_type_int()],
+			list_of_t,
+		),
+		CompilerLoopProducerWindows,
+	)
 
 
 pure func compiler_env_with_builtins(env: CompilerEnv) -> CompilerEnv:
