@@ -837,13 +837,6 @@ let typecheck_graph_with_blorp_bridge_policy ~debug
                         blorp_bridge_import_bindings = import_bindings;
                       }
 
-let typecheck_only_typed_with_blorp_bridge_policy ~debug
-    ~allow_debug_only_calls ~filename ~preloaded_module_graph =
-  with_fresh_session filename (fun () ->
-      typecheck_graph_with_blorp_bridge_policy ~debug ~allow_debug_only_calls
-        ~on_frontend_phase:None ~filename ~preloaded_module_graph
-      |> Result.map (fun result -> result.blorp_bridge_typed_program))
-
 let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a)
     : 'a =
   let parent = Session.current () in

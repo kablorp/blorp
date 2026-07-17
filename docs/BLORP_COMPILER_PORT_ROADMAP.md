@@ -234,7 +234,6 @@ OCaml references:
   - `compile_file_with_opts`
   - `run_file`
 - `compiler/lib/pipeline.ml`
-  - `typecheck_only_typed_with_blorp_bridge_policy`
   - `compile_preloaded_graph_with_blorp_bridge`
   - `compile_loaded_program`
 
@@ -300,11 +299,11 @@ Closed deletion point:
 
 - OCaml root expansion, source reads, and parser fallback code for normal
   `check`, `compile`, and `run` have been deleted from the shell path. The
-  remaining source-command shell code assumes a Blorp-produced graph before it
-  enters `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` or
+  ordinary `check` path now ends in the Blorp frontend without entering OCaml.
+  The pinned bootstrap compile wrapper consumes a Blorp-produced graph through
   `Pipeline.compile_preloaded_graph_with_blorp_bridge`. The test-only
-  `Pipeline.compile_parsed` compatibility API and its path-specific tests have
-  been deleted, along with the redundant default-policy typecheck wrapper.
+  graph-typecheck wrapper, `Pipeline.compile_parsed` compatibility API, and
+  their path-specific tests have been deleted.
 
 ## Checkpoint 2: Source Model, Parser, And Source-AST Finalization
 
@@ -536,11 +535,11 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml module path resolution/loading/cache code after
-  `Pipeline.compile_preloaded_graph_with_blorp_bridge` and
-  `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` consume a Blorp-validated
-  module graph for every production/tooling caller and no longer need
-  `Modules.load_imports` for non-graph entry points.
+- Delete OCaml module path resolution/loading/cache code after every remaining
+  production and tooling caller consumes a Blorp-validated module graph and no
+  longer needs `Modules.load_imports` for non-graph entry points. The pinned
+  bootstrap wrapper already enters through
+  `Pipeline.compile_preloaded_graph_with_blorp_bridge`.
 
 ## Checkpoint 4: Diagnostics, Session, Types, Env, And Builtins
 
@@ -1535,12 +1534,9 @@ Current status:
   typecheck through the Blorp bridge. Bare lookup is scoped: declarations made
   available only through a module alias do not leak as unqualified values, and
   private imported declarations are skipped.
-- `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` is the graph-backed Blorp
-  typecheck handoff used by source-command checks. It builds explicit
-  import-module payloads from graph edges, materializes graph-loaded dependency
-  module typed declarations/import bindings into `Modules`, and requires the
-  decoded Blorp artifact to have already run CTFE before returning the target
-  typed program or Blorp typecheck/CTFE diagnostics.
+- Source-command checks now typecheck the in-memory graph directly in Blorp and
+  never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
+  wrapper and its duplicate adapter tests have been deleted.
 - `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
   compile boundary: it consumes the same Blorp frontend graph, decodes the
   Blorp typed-program artifact, populates dependency typed-module caches, and

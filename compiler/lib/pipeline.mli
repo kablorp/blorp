@@ -58,15 +58,6 @@ val typecheck_only_typed_reusing_session :
     semantic compilation state before each run. Intended for batch test/tool
     workers that typecheck many independent files in one process. *)
 
-val typecheck_only_typed_with_blorp_bridge_policy :
-  debug:bool ->
-  allow_debug_only_calls:bool ->
-  filename:string ->
-  preloaded_module_graph:Modules.preloaded_module_graph ->
-  (Typed_ast.program, Ast.compiler_error list) result
-(** Typecheck through the Blorp-owned typed-source bridge for a frontend module
-    graph, with explicit [--debug] and [@debug_only] policy. *)
-
 val typecheck_module_only :
   filename:string ->
   source:string ->
