@@ -261,6 +261,28 @@ let test_collect_subst_variadic_dim_packs () =
         (Blorp.Core_mono.mangle_name "swap_order" subst)
   | None -> Alcotest.fail "expected variadic dimension pack substitution"
 
+let test_collect_subst_implicit_trailing_dim_pack () =
+  let type_params = tparams [ "#N" ] in
+  let param =
+    TyArray (ty_int, [ TyVar "#N"; TyVarDims "#Ds" ])
+  in
+  let actual = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
+  let raw =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params param actual []
+  in
+  match Blorp.Core_mono.dedup_subst_consistent raw with
+  | Some subst ->
+      Alcotest.(check bool)
+        "declared prefix dimension binds" true
+        (List.assoc_opt "#N" subst = Some (st (TyConstInt 2)));
+      Alcotest.(check bool)
+        "implicit trailing pack captures suffix" true
+        (List.assoc_opt "#Ds" subst = Some (sd [ TyConstInt 3 ]));
+      Alcotest.(check bool)
+        "return type splices implicit trailing pack" true
+        (Blorp.Core_mono.apply_subst subst param = actual)
+  | None -> Alcotest.fail "expected implicit trailing dimension pack substitution"
+
 let test_collect_subst_ignores_identity_bindings () =
   let dict key value = TyNamed ("Dict", [ key; value ]) in
   let type_params = tparams [ "K"; "V" ] in
@@ -2369,6 +2391,8 @@ let suite =
           `Quick test_collect_subst_ignores_erased_dim_value_params;
         Alcotest.test_case "collect_subst_variadic_dim_packs" `Quick
           test_collect_subst_variadic_dim_packs;
+        Alcotest.test_case "collect_subst_implicit_trailing_dim_pack" `Quick
+          test_collect_subst_implicit_trailing_dim_pack;
         Alcotest.test_case "collect_subst_ignores_identity_bindings" `Quick
           test_collect_subst_ignores_identity_bindings;
         Alcotest.test_case "apply" `Quick test_apply_subst;

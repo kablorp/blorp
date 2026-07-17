@@ -3078,33 +3078,138 @@ private pure func compiler_ufcs_receiver_families_match(
 			True
 
 
+private pure func compiler_overload_type_patterns_match(
+	type_params: List[String],
+	param_type: CompilerType,
+	arg_type: CompilerType,
+) -> Bool:
+	match (param_type, arg_type):
+		(CompilerFunctionType(param_pure, param_params, param_return), CompilerFunctionType(arg_pure, arg_params, arg_return)):
+			(
+				(not param_pure or arg_pure)
+				and compiler_overload_callback_param_patterns_match(
+					type_params,
+					param_params,
+					arg_params,
+				)
+				and compiler_overload_type_patterns_match(type_params, param_return, arg_return)
+			)
+		_:
+			compiler_types_compatible_with_params(type_params, param_type, arg_type)
+
+
+private pure func compiler_overload_pattern_contains_type_param(
+	type_params: List[String],
+	typ: CompilerType,
+) -> Bool:
+	match typ:
+		CompilerTypeVar(name):
+			type_params.contains(name)
+		CompilerNamedType(name, args):
+			(
+				args.length() == 0 and type_params.contains(name)
+				or args.any(
+					func(arg): compiler_overload_pattern_contains_type_param(type_params, arg),
+				)
+			)
+		CompilerArrayType(element, dims):
+			(
+				compiler_overload_pattern_contains_type_param(type_params, element)
+				or dims.any(
+					func(dim): compiler_overload_pattern_contains_type_param(type_params, dim),
+				)
+			)
+		CompilerFunctionType(_, params, return_type):
+			(
+				params.any(
+					func(param): compiler_overload_pattern_contains_type_param(type_params, param),
+				)
+				or compiler_overload_pattern_contains_type_param(type_params, return_type)
+			)
+		CompilerTupleType(elements):
+			elements.any(
+				func(element): compiler_overload_pattern_contains_type_param(type_params, element),
+			)
+		CompilerRangeType(inner):
+			compiler_overload_pattern_contains_type_param(type_params, inner)
+		CompilerDimOpType(_, left, right):
+			(
+				compiler_overload_pattern_contains_type_param(type_params, left)
+				or compiler_overload_pattern_contains_type_param(type_params, right)
+			)
+		CompilerVarDimsType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_overload_callback_param_patterns_match(
+	type_params: List[String],
+	param_types: List[CompilerType],
+	arg_types: List[CompilerType],
+) -> Bool:
+	if param_types.length() != arg_types.length():
+		False
+	else:
+		var index: Int = 0
+		var matches: Bool = True
+
+		while index < param_types.length() and matches:
+			match (param_types.get(index), arg_types.get(index)):
+				(Some(param_type), Some(arg_type)):
+					matches = if compiler_overload_pattern_contains_type_param(
+						type_params,
+						param_type,
+					):
+						compiler_overload_type_patterns_match(type_params, param_type, arg_type)
+					else:
+						compiler_types_compatible_with_params([], arg_type, param_type)
+				_:
+					matches = False
+
+			index += 1
+
+		matches
+
+
+private pure func compiler_overload_type_pattern_lists_match(
+	type_params: List[String],
+	param_types: List[CompilerType],
+	arg_types: List[CompilerType],
+) -> Bool:
+	if param_types.length() != arg_types.length():
+		False
+	else:
+		var index: Int = 0
+		var matches: Bool = True
+
+		while index < param_types.length() and matches:
+			match (param_types.get(index), arg_types.get(index)):
+				(Some(param_type), Some(arg_type)):
+					matches = compiler_overload_type_patterns_match(
+						type_params,
+						param_type,
+						arg_type,
+					)
+				_:
+					matches = False
+
+			index += 1
+
+		matches
+
+
 private pure func compiler_overload_arg_types_match(
 	entry: CompilerOverloadEntry,
 	arg_types: List[CompilerType],
 ) -> Bool:
 	match compiler_function_param_types(entry.func_type):
 		Some(param_types):
-			if param_types.length() != arg_types.length():
-				False
-			else:
-				type_params = compiler_overload_type_param_names(entry)
-				var matches: Bool = True
-				var index: Int = 0
-
-				while index < param_types.length() and matches:
-					match (param_types.get(index), arg_types.get(index)):
-						(Some(param_type), Some(arg_type)):
-							matches = compiler_types_compatible_with_params(
-								type_params,
-								param_type,
-								arg_type,
-							)
-						_:
-							matches = False
-
-					index += 1
-
-				matches
+			compiler_overload_type_pattern_lists_match(
+				compiler_overload_type_param_names(entry),
+				param_types,
+				arg_types,
+			)
 		None:
 			False
 
@@ -3256,20 +3361,13 @@ pure func compiler_env_select_overload_for_args(
 	entries: List[CompilerOverloadEntry],
 	arg_types: List[CompilerType],
 ) -> Option[CompilerOverloadEntry]:
-	if entries.length() == 1:
-		match entries.get(0):
-			Some(entry):
-				Some(compiler_overload_entry_copy(entry))
-			None:
-				None
-	else:
-		var matches: List[CompilerOverloadEntry] = []
+	var matches: List[CompilerOverloadEntry] = []
 
-		for entry in entries:
-			if compiler_overload_arg_types_match(entry, arg_types):
-				matches = matches.append(compiler_overload_entry_copy(entry))
+	for entry in entries:
+		if compiler_overload_arg_types_match(entry, arg_types):
+			matches = matches.append(compiler_overload_entry_copy(entry))
 
-		compiler_select_unique_best_overload(matches, arg_types)
+	compiler_select_unique_best_overload(matches, arg_types)
 
 
 pure func compiler_env_resolve_overload(
