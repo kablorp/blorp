@@ -5900,7 +5900,26 @@ and list_swap_json ~function_names ~consumed_params ~reg enum_names value_record
 
 and list_retain_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path list value =
-  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
+  (* [list_retain_for] is already an explicit ownership operation. Container
+     intrinsics often carry managed pointer slots as [Ptr], so deriving this
+     bit only from the source type would erase the required retain. Inline
+     values must remain false: boxing one solely for a no-op retain leaks the
+     temporary box. *)
+  let prepared_value = Core_emit_layout.boxed_storage_value ~reg value in
+  let needs_release =
+    match prepared_value.bsv_box.box_kind with
+    | Core.BoxPointer -> true
+    | Core.BoxStruct _ ->
+        Core_layout_type.is_stack_result_type ~reg value.ty
+    | Core.BoxPrim | Core.BoxVoid | Core.BoxFloat | Core.BoxFloat32
+    | Core.BoxFloat16 | Core.BoxInt128 | Core.BoxUInt128 -> false
+  in
+  let boxed_value =
+    {
+      prepared_value with
+      bsv_needs_release = needs_release;
+    }
+  in
   let* list_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list

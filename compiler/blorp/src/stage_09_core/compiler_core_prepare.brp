@@ -1894,7 +1894,7 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 		LiteralExpr(literal, typ, loc):
 			match literal:
 				StringLiteral(value):
-					True
+					False
 				IntLiteral(value):
 					False
 				WideIntLiteral(value):
@@ -2665,41 +2665,32 @@ private pure func hash_container_constructor_for_key_type(
 			GenericHashContainerConstructor
 
 
-private pure func prepare_dict_literal_entry(
-	decls: List[CoreDecl],
-	entry: CoreDictLiteralEntry,
-) -> CoreDictEntry:
-	prepared_key: CoreExpr = prepare_expr(decls, entry.key)
-	prepared_value: CoreExpr = prepare_expr(decls, entry.value)
-
+private pure func box_dict_literal_entry(entry: CoreDictLiteralEntry) -> CoreDictEntry:
 	{
-		key = boxed_storage_value_for_expr(prepared_key),
-		value = boxed_storage_value_for_expr(prepared_value)
+		key = boxed_storage_value_for_expr(entry.key),
+		value = boxed_storage_value_for_expr(entry.value)
 	}
 
 
-private pure func prepare_dict_literal_entries(
-	decls: List[CoreDecl],
+private pure func box_dict_literal_entries(
 	entries: List[CoreDictLiteralEntry],
 ) -> List[CoreDictEntry]:
-	entries.map(func(entry): prepare_dict_literal_entry(decls, entry))
+	entries.map(box_dict_literal_entry)
 
 
-private pure func prepare_dict_expr(
+private pure func lower_dict_literal_expr(
 	decls: List[CoreDecl],
 	entries: List[CoreDictLiteralEntry],
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	prepared_entries: List[CoreDictEntry] = prepare_dict_literal_entries(decls, entries)
-
 	match dict_key_value_types(typ):
 		Some(types):
 			value_kind: CoreBoxKind = boxed_kind_for_type(types.value_type)
 			DictConstructExpr(
 				{
 					constructor = hash_container_constructor_for_key_type(decls, types.key_type),
-					entries = prepared_entries,
+					entries = box_dict_literal_entries(entries),
 					value_needs_release = boxed_storage_type_needs_release(
 						types.value_type,
 						value_kind,
@@ -2710,6 +2701,29 @@ private pure func prepare_dict_expr(
 			)
 		None:
 			DictExpr(entries, typ, loc)
+
+
+private pure func prepare_dict_literal_entry(
+	decls: List[CoreDecl],
+	entry: CoreDictLiteralEntry,
+) -> CoreDictLiteralEntry:
+	{
+		key = prepare_expr(decls, entry.key),
+		value = prepare_expr(decls, entry.value)
+	}
+
+
+private pure func prepare_dict_expr(
+	decls: List[CoreDecl],
+	entries: List[CoreDictLiteralEntry],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_entries: List[CoreDictLiteralEntry] = entries.map(
+		func(entry): prepare_dict_literal_entry(decls, entry),
+	)
+
+	lower_dict_literal_expr(decls, prepared_entries, typ, loc)
 
 
 private pure func prepare_record_fields(
@@ -4146,6 +4160,77 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				typ,
 				loc,
 			)
+
+
+private pure func prepare_dict_literal_entry_for_ownership(
+	decls: List[CoreDecl],
+	entry: CoreDictLiteralEntry,
+) -> CoreDictLiteralEntry:
+	{
+		key = prepare_dict_literals_for_ownership_expr(decls, entry.key),
+		value = prepare_dict_literals_for_ownership_expr(decls, entry.value)
+	}
+
+
+private pure func prepare_dict_literals_for_ownership_expr(
+	decls: List[CoreDecl],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		DictExpr(entries, typ, loc):
+			prepared_entries: List[CoreDictLiteralEntry] = entries.map(
+				func(entry): prepare_dict_literal_entry_for_ownership(decls, entry),
+			)
+
+			lower_dict_literal_expr(decls, prepared_entries, typ, loc)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				decls,
+				prepare_dict_literals_for_ownership_expr,
+			)
+
+
+private pure func prepare_dict_literals_for_ownership_function(
+	decls: List[CoreDecl],
+	func_info: CoreFunction,
+) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(prepare_dict_literals_for_ownership_expr(decls, body)) }
+		None:
+			func_info
+
+
+private pure func prepare_dict_literals_for_ownership_decl(
+	decls: List[CoreDecl],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(prepare_dict_literals_for_ownership_function(decls, func_info))
+		GlobalDecl(global):
+			GlobalDecl(
+				{ global | init = prepare_dict_literals_for_ownership_expr(decls, global.init) },
+			)
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): prepare_dict_literals_for_ownership_function(decls, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgram:
+	{ program |
+		decls = program.decls.map(
+			func(decl): prepare_dict_literals_for_ownership_decl(program.decls, decl),
+		)
+	}
 
 
 private pure func prepare_function(decls: List[CoreDecl], func_info: CoreFunction) -> CoreFunction:

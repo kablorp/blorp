@@ -167,7 +167,7 @@ Typed AST
     v
 +----------------+
 | Blorp DCE      |  Prune unreachable emitted functions and projected type
-+----------------+  declarations using explicit function/type reachability
++----------------+  declarations using explicit reachability
                     (compiler_core_dce.brp)
     |
     v
@@ -175,6 +175,13 @@ Typed AST
 | Blorp consume-specialize|  Clone safe source-owned self-replacement callees
 +-------------------------+  with explicit consumed parameters before Perceus
                             (compiler_core_consume_specialize.brp)
+    |
+    v
++--------------------------+
+| Blorp ownership prepare  |  Lower dictionary literals to explicit boxed
++--------------------------+  construction so Perceus can assign entry owners;
+                              all other backend preparation remains late
+                              (compiler_core_prepare.brp)
     |
     v
 +--------------+

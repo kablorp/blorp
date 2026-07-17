@@ -44,7 +44,7 @@ import:
 			ConstructorMatchFallbackFail,
 		),
 		CoreConstructorMatchTest,
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
 		CoreDictEntry,
 		CoreExpr(
 			AssignExpr,
@@ -120,7 +120,7 @@ import:
 		CoreGlobal,
 		CoreListHandoffMode(BorrowFreshHandoff),
 		CoreListSet,
-		CoreLiteral,
+		CoreLiteral(StringLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -202,11 +202,18 @@ record ConstructorCallContract {
 }
 
 
+record PerceusGlobal {
+	value: CoreParam,
+	is_mutable: Bool
+}
+
+
 record PerceusEnv {
 	managed_type_names: List[String],
 	constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]],
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
+	global_values: List[PerceusGlobal],
 	function_names: List[String],
 	constructor_names: List[String],
 	direct_user_call_contracts_by_name: Dict[String, List[Int]],
@@ -249,6 +256,7 @@ pure func empty_env() -> PerceusEnv:
 		constructor_contracts_by_name = {},
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
+		global_values = [],
 		function_names = [],
 		constructor_names = [],
 		direct_user_call_contracts_by_name = {},
@@ -477,6 +485,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]] = {}
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
+	var global_values: List[PerceusGlobal] = []
 
 	for decl in program.decls:
 		match decl:
@@ -559,7 +568,14 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					None:
 						void
 			GlobalDecl(global):
-				void
+				global_values = global_values.append({
+					value = {
+						name = global.name,
+						typ = global.typ,
+						loc = global.loc,
+					},
+					is_mutable = global.is_mutable,
+				})
 			_:
 				void
 
@@ -568,6 +584,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts_by_name = constructor_contracts_by_name,
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
+		global_values = global_values,
 		function_names = CoreClosure.capture_function_names(program),
 		constructor_names = CoreClosure.capture_constructor_names(program),
 		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
@@ -4281,6 +4298,96 @@ private pure func rename_shadow_var_refs(
 				))
 
 
+private pure func global_name_count(env: PerceusEnv, name: String) -> Int:
+	var count: Int = 0
+
+	for global in env.global_values:
+		if global.value.name.name == name:
+			count += 1
+		else:
+			void
+
+	count
+
+
+private pure func global_name_is_unique(env: PerceusEnv, name: String) -> Bool:
+	global_name_count(env, name) == 1
+
+
+private pure func resolve_global_refs_in_expr(
+	env: PerceusEnv,
+	shadowing_values: List[CoreParam],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = expr
+
+	for global in env.global_values:
+		name: String = global.value.name.name
+
+		if global_name_is_unique(env, name) and not core_params_shadow(name, shadowing_values):
+			result = rename_shadow_var_refs(name, global.value.name, result)
+		else:
+			void
+
+	result
+
+
+private pure func resolve_function_global_refs(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info |
+				body = Some(resolve_global_refs_in_expr(env, func_info.params, body))
+			}
+		None:
+			func_info
+
+
+private pure func resolve_global_initializer_refs(
+	env: PerceusEnv,
+	global: CoreGlobal,
+) -> CoreGlobal:
+	global_value: CoreParam = {
+		name = global.name,
+		typ = global.typ,
+		loc = global.loc
+	}
+
+	{ global |
+		init = resolve_global_refs_in_expr(env, [global_value], global.init)
+	}
+
+
+private pure func resolve_decl_global_refs(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(resolve_function_global_refs(env, func_info))
+		GlobalDecl(global):
+			GlobalDecl(resolve_global_initializer_refs(env, global))
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): resolve_function_global_refs(env, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+private pure func resolve_program_global_refs(
+	env: PerceusEnv,
+	program: CoreProgram,
+) -> CoreProgram:
+	{
+		decls = program.decls.map(func(decl): resolve_decl_global_refs(env, decl)),
+		foreign_includes = program.foreign_includes
+	}
+
+
 private pure func freshen_match_bindings_in_constructor_body(
 	target: CoreVar,
 	bindings: List[CoreMatchBinding],
@@ -7965,6 +8072,8 @@ private pure func is_owned_temporary_with_names(
 		match expr:
 			VarExpr(variable, var_type, loc):
 				False
+			LiteralExpr(StringLiteral(value), literal_type, loc):
+				True
 			CallExpr(kind, callee, args, return_type, loc):
 				call_result_is_owned(env, kind, args, return_type)
 			CastExpr(inner, cast_type, loc):
@@ -8676,7 +8785,26 @@ private pure func retain_assignment_alias_rhs(env: PerceusEnv, expr: CoreExpr) -
 			expr
 
 
-private pure func normalize_binding_alias_result(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func normalize_binding_alias_match_results(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	expr: CoreExpr,
+) -> CoreExpr:
+	CoreTraverse.map_core_match_results(
+		expr,
+		func(nested_bindings, result): normalize_scoped_binding_alias_result(
+			env,
+			bindings + nested_bindings,
+			result,
+		),
+	)
+
+
+private pure func normalize_scoped_binding_alias_result(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	expr: CoreExpr,
+) -> CoreExpr:
 	if is_owned_temporary_expr(env, expr):
 		expr
 	else:
@@ -8684,8 +8812,8 @@ private pure func normalize_binding_alias_result(env: PerceusEnv, expr: CoreExpr
 			IfExpr(cond, then_expr, else_expr, typ, loc):
 				IfExpr(
 					cond,
-					normalize_binding_alias_result(env, then_expr),
-					normalize_binding_alias_result(env, else_expr),
+					normalize_scoped_binding_alias_result(env, bindings, then_expr),
+					normalize_scoped_binding_alias_result(env, bindings, else_expr),
 					copy_core_type(typ),
 					loc,
 				)
@@ -8695,28 +8823,47 @@ private pure func normalize_binding_alias_result(env: PerceusEnv, expr: CoreExpr
 					is_mutable,
 					copy_core_type(typ),
 					rhs,
-					normalize_binding_alias_result(env, body),
+					normalize_scoped_binding_alias_result(env, bindings, body),
 				)
 			BorrowLetExpr(variable, typ, rhs, body):
 				BorrowLetExpr(
 					copy_core_var(variable),
 					copy_core_type(typ),
 					rhs,
-					normalize_binding_alias_result(env, body),
+					normalize_scoped_binding_alias_result(env, bindings, body),
 				)
 			SeqExpr(first, second):
 				SeqExpr(
 					first,
-					normalize_binding_alias_result(env, second),
+					normalize_scoped_binding_alias_result(env, bindings, second),
 				)
+			LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+				normalize_binding_alias_match_results(env, bindings, expr)
+			AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				normalize_binding_alias_match_results(env, bindings, expr)
+			LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				normalize_binding_alias_match_results(env, bindings, expr)
+			ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+				normalize_binding_alias_match_results(env, bindings, expr)
 			_:
+				shadowed_match_binding: Bool = match expr:
+					VarExpr(variable, typ, loc):
+						match_bindings_shadow(variable.name, bindings)
+					_:
+						False
+
 				if (
-					is_managed_type(env, expr_result_type(expr))
+					not shadowed_match_binding
+					and is_managed_type(env, expr_result_type(expr))
 					and assignment_rhs_returns_alias(env, expr)
 				):
 					retain_alias_as_owned(expr)
 				else:
 					expr
+
+
+private pure func normalize_binding_alias_result(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	normalize_scoped_binding_alias_result(env, [], expr)
 
 
 private pure func normalize_binding_alias_rhs(
@@ -8868,7 +9015,10 @@ private pure func retain_direct_field_alias_boxed_value(
 ) -> CoreBoxedStorageValue:
 	kind = value.kind
 	needs_release: Bool = value.needs_release
-	transfers_ownership: Bool = value.transfers_ownership
+	transfers_ownership: Bool = (
+		value.transfers_ownership
+		or needs_release and is_owned_temporary_expr(env, value.value)
+	)
 
 	owned_value: CoreExpr = if transfers_ownership:
 		retain_direct_field_alias_value(env, value.value)
@@ -9570,15 +9720,30 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				loc,
 			)
 		AssignExpr(variable, rhs, typ, loc):
-			retain_assignment_alias_rhs(
-				env,
-				AssignExpr(
-					copy_core_var(variable),
-					insert_drops_expr_inner(env, rhs),
-					copy_core_type(typ),
-					loc,
-				),
-			)
+			rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, rhs)
+
+			match mutable_managed_global_for_target(env, variable):
+				Some(global):
+					rewrite_direct_mutable_assignment(
+						env,
+						global.name,
+						global.typ,
+						rewritten_rhs,
+						typ,
+						loc,
+						0,
+						False,
+					).expr
+				None:
+					retain_assignment_alias_rhs(
+						env,
+						AssignExpr(
+							copy_core_var(variable),
+							rewritten_rhs,
+							copy_core_type(typ),
+							loc,
+						),
+					)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			DupExpr(
 				copy_core_var(variable),
@@ -11489,191 +11654,172 @@ private pure func protect_borrowed_param_call_dict_entries(
 	)
 
 
-private pure func protect_borrowed_param_call_literal_case(
+private pure func map_borrowed_param_literal_case(
 	env: PerceusEnv,
 	param: CoreParam,
 	match_case: CoreLiteralMatchCase,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreLiteralMatchCase:
 	if match_bindings_shadow(param.name.name, match_case.bindings):
 		match_case
 	else:
-		{ match_case | body = protect_borrowed_param_calls(env, param, match_case.body) }
+		{ match_case | body = mapper(env, param, match_case.body) }
 
 
-private pure func protect_borrowed_param_call_literal_fallback(
+private pure func map_borrowed_param_literal_fallback(
 	env: PerceusEnv,
 	param: CoreParam,
 	fallback: CoreLiteralMatchFallback,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(protect_borrowed_param_calls(env, param, body))
+			LiteralMatchFallbackBody(mapper(env, param, body))
 		LiteralMatchFallbackBindings(bindings, body):
 			if match_bindings_shadow(param.name.name, bindings):
 				fallback
 			else:
-				LiteralMatchFallbackBindings(
-					bindings,
-					protect_borrowed_param_calls(env, param, body),
-				)
+				LiteralMatchFallbackBindings(bindings, mapper(env, param, body))
 		LiteralMatchFallbackFail:
 			LiteralMatchFallbackFail
 
 
-private pure func protect_borrowed_param_call_literal_cases(
+private pure func map_borrowed_param_literal_cases(
 	env: PerceusEnv,
 	param: CoreParam,
 	cases: List[CoreLiteralMatchCase],
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> List[CoreLiteralMatchCase]:
-	var protected: List[CoreLiteralMatchCase] = []
-
-	for match_case in cases:
-		protected = protected.append(
-			protect_borrowed_param_call_literal_case(
-				env,
-				param,
-				match_case,
-			),
-		)
-
-	protected
+	cases.map(func(match_case): map_borrowed_param_literal_case(env, param, match_case, mapper))
 
 
-private pure func protect_borrowed_param_call_literal_match(
+private pure func map_borrowed_param_literal_match(
 	env: PerceusEnv,
 	param: CoreParam,
 	match_expr: CoreConstructorLiteralMatch,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorLiteralMatch:
 	{ match_expr |
-		cases = protect_borrowed_param_call_literal_cases(env, param, match_expr.cases),
-		fallback = protect_borrowed_param_call_literal_fallback(env, param, match_expr.fallback)
+		cases = map_borrowed_param_literal_cases(env, param, match_expr.cases, mapper),
+		fallback = map_borrowed_param_literal_fallback(env, param, match_expr.fallback, mapper)
 	}
 
 
-private pure func protect_borrowed_param_call_constructor_body(
+private pure func map_borrowed_param_constructor_body(
 	env: PerceusEnv,
 	param: CoreParam,
 	body: CoreConstructorMatchBody,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(protect_borrowed_param_calls(env, param, expr))
+			ConstructorMatchBodyExpr(mapper(env, param, expr))
 		ConstructorMatchBodyLiteral(match_expr):
 			ConstructorMatchBodyLiteral(
-				protect_borrowed_param_call_literal_match(
+				map_borrowed_param_literal_match(
 					env,
 					param,
 					match_expr,
+					mapper,
 				),
 			)
 		ConstructorMatchBodyLength(match_expr):
 			ConstructorMatchBodyLength(
-				protect_borrowed_param_call_length_match(
+				map_borrowed_param_length_match(
 					env,
 					param,
 					match_expr,
+					mapper,
 				),
 			)
 
 
-private pure func protect_borrowed_param_call_length_branch(
+private pure func map_borrowed_param_length_branch(
 	env: PerceusEnv,
 	param: CoreParam,
 	branch: CoreConstructorLengthMatchBranch,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorLengthMatchBranch:
 	if match_bindings_shadow(param.name.name, branch.bindings):
 		branch
 	else:
-		{ branch | body = protect_borrowed_param_call_constructor_body(env, param, branch.body) }
+		{ branch | body = map_borrowed_param_constructor_body(env, param, branch.body, mapper) }
 
 
-private pure func protect_borrowed_param_call_length_match(
+private pure func map_borrowed_param_length_match(
 	env: PerceusEnv,
 	param: CoreParam,
 	match_expr: CoreConstructorLengthMatch,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorLengthMatch:
-	var protected_cases: List[CoreConstructorLengthMatchCase] = []
+	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(func(match_case):
+		{ match_case |
+			branch = map_borrowed_param_length_branch(env, param, match_case.branch, mapper)
+		}
+	)
 
-	for match_case in match_expr.cases:
-		protected_cases = protected_cases.append(
-			{ match_case |
-				branch = protect_borrowed_param_call_length_branch(env, param, match_case.branch)
-			},
-		)
-
-	protected_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
 		Some(geq):
 			Some(
 				{ geq |
-					branch = protect_borrowed_param_call_length_branch(env, param, geq.branch)
+					branch = map_borrowed_param_length_branch(env, param, geq.branch, mapper)
 				},
 			)
 		None:
 			None
 
-	protected_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
 		Some(branch):
-			Some(protect_borrowed_param_call_length_branch(env, param, branch))
+			Some(map_borrowed_param_length_branch(env, param, branch, mapper))
 		None:
 			None
 
 	{ match_expr |
-		cases = protected_cases,
-		geq = protected_geq,
-		fallback = protected_fallback
+		cases = mapped_cases,
+		geq = mapped_geq,
+		fallback = mapped_fallback
 	}
 
 
-private pure func protect_borrowed_param_call_constructor_case(
+private pure func map_borrowed_param_constructor_case(
 	env: PerceusEnv,
 	param: CoreParam,
 	match_case: CoreConstructorMatchCase,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorMatchCase:
 	if match_bindings_shadow(param.name.name, match_case.bindings):
 		match_case
 	else:
 		{ match_case |
-			body = protect_borrowed_param_call_constructor_body(env, param, match_case.body)
+			body = map_borrowed_param_constructor_body(env, param, match_case.body, mapper)
 		}
 
 
-private pure func protect_borrowed_param_call_constructor_fallback(
+private pure func map_borrowed_param_constructor_fallback(
 	env: PerceusEnv,
 	param: CoreParam,
 	fallback: CoreConstructorMatchFallback,
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(protect_borrowed_param_calls(env, param, body))
+			ConstructorMatchFallbackBody(mapper(env, param, body))
 		ConstructorMatchFallbackBindings(bindings, body):
 			if match_bindings_shadow(param.name.name, bindings):
 				fallback
 			else:
-				ConstructorMatchFallbackBindings(
-					bindings,
-					protect_borrowed_param_calls(env, param, body),
-				)
+				ConstructorMatchFallbackBindings(bindings, mapper(env, param, body))
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
 
 
-private pure func protect_borrowed_param_call_constructor_cases(
+private pure func map_borrowed_param_constructor_cases(
 	env: PerceusEnv,
 	param: CoreParam,
 	cases: List[CoreConstructorMatchCase],
+	mapper: pure (PerceusEnv, CoreParam, CoreExpr) -> CoreExpr,
 ) -> List[CoreConstructorMatchCase]:
-	var protected: List[CoreConstructorMatchCase] = []
-
-	for match_case in cases:
-		protected = protected.append(
-			protect_borrowed_param_call_constructor_case(
-				env,
-				param,
-				match_case,
-			),
-		)
-
-	protected
+	cases.map(func(match_case): map_borrowed_param_constructor_case(env, param, match_case, mapper))
 
 
 private pure func protect_borrowed_param_calls(
@@ -11848,8 +11994,13 @@ private pure func protect_borrowed_param_calls(
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				protect_borrowed_param_calls(env, param, scrutinee),
-				protect_borrowed_param_call_literal_cases(env, param, cases),
-				protect_borrowed_param_call_literal_fallback(env, param, fallback),
+				map_borrowed_param_literal_cases(env, param, cases, protect_borrowed_param_calls),
+				map_borrowed_param_literal_fallback(
+					env,
+					param,
+					fallback,
+					protect_borrowed_param_calls,
+				),
 				copy_core_type(typ),
 				loc,
 			)
@@ -11857,7 +12008,12 @@ private pure func protect_borrowed_param_calls(
 			AccessorLiteralMatchExpr(
 				protect_borrowed_param_calls(env, param, scrutinee),
 				release_policy,
-				protect_borrowed_param_call_literal_match(env, param, match_expr),
+				map_borrowed_param_literal_match(
+					env,
+					param,
+					match_expr,
+					protect_borrowed_param_calls,
+				),
 				copy_core_type(typ),
 				loc,
 			)
@@ -11865,7 +12021,12 @@ private pure func protect_borrowed_param_calls(
 			LengthMatchExpr(
 				protect_borrowed_param_calls(env, param, scrutinee),
 				release_policy,
-				protect_borrowed_param_call_length_match(env, param, match_expr),
+				map_borrowed_param_length_match(
+					env,
+					param,
+					match_expr,
+					protect_borrowed_param_calls,
+				),
 				copy_core_type(typ),
 				loc,
 			)
@@ -11873,8 +12034,18 @@ private pure func protect_borrowed_param_calls(
 			ConstructorMatchExpr(
 				protect_borrowed_param_calls(env, param, scrutinee),
 				release_policy,
-				protect_borrowed_param_call_constructor_cases(env, param, cases),
-				protect_borrowed_param_call_constructor_fallback(env, param, fallback),
+				map_borrowed_param_constructor_cases(
+					env,
+					param,
+					cases,
+					protect_borrowed_param_calls,
+				),
+				map_borrowed_param_constructor_fallback(
+					env,
+					param,
+					fallback,
+					protect_borrowed_param_calls,
+				),
 				copy_core_type(typ),
 				loc,
 			)
@@ -12080,7 +12251,7 @@ private pure func retain_borrowed_aggregate_boxed_value(
 	param: CoreParam,
 	value: CoreBoxedStorageValue,
 ) -> CoreBoxedStorageValue:
-	if value.transfers_ownership:
+	if value.needs_release:
 		{
 			kind = value.kind,
 			value = retain_borrowed_aggregate_value(env, param, value.value),
@@ -12229,6 +12400,69 @@ private pure func retain_borrowed_param_aggregate_members(
 				copy_core_type(typ),
 				loc,
 			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				retain_borrowed_param_aggregate_members(env, param, scrutinee),
+				map_borrowed_param_literal_cases(
+					env,
+					param,
+					cases,
+					retain_borrowed_param_aggregate_members,
+				),
+				map_borrowed_param_literal_fallback(
+					env,
+					param,
+					fallback,
+					retain_borrowed_param_aggregate_members,
+				),
+				copy_core_type(typ),
+				loc,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				retain_borrowed_param_aggregate_members(env, param, scrutinee),
+				release_policy,
+				map_borrowed_param_literal_match(
+					env,
+					param,
+					match_expr,
+					retain_borrowed_param_aggregate_members,
+				),
+				copy_core_type(typ),
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				retain_borrowed_param_aggregate_members(env, param, scrutinee),
+				release_policy,
+				map_borrowed_param_length_match(
+					env,
+					param,
+					match_expr,
+					retain_borrowed_param_aggregate_members,
+				),
+				copy_core_type(typ),
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				retain_borrowed_param_aggregate_members(env, param, scrutinee),
+				release_policy,
+				map_borrowed_param_constructor_cases(
+					env,
+					param,
+					cases,
+					retain_borrowed_param_aggregate_members,
+				),
+				map_borrowed_param_constructor_fallback(
+					env,
+					param,
+					fallback,
+					retain_borrowed_param_aggregate_members,
+				),
+				copy_core_type(typ),
+				loc,
+			)
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			retained_body: CoreExpr = if variable.name == param.name.name:
 				body
@@ -12316,13 +12550,92 @@ private pure func retain_borrowed_param_aggregate_members(
 private pure func retain_borrowed_param_aggregates(
 	env: PerceusEnv,
 	func_info: CoreFunction,
+	consumed_params: List[Int],
 	body: CoreExpr,
 ) -> CoreExpr:
 	var result: CoreExpr = body
+	var index: Int = 0
 
 	for param in func_info.params:
-		if is_managed_type(env, param.typ):
+		if is_managed_type(env, param.typ) and not int_list_contains(consumed_params, index):
 			result = retain_borrowed_param_aggregate_members(env, param, result)
+		else:
+			void
+
+		index += 1
+
+	result
+
+
+private pure func retain_borrowed_values(
+	env: PerceusEnv,
+	borrowed_values: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	managed_result: Bool = is_managed_type(env, return_type)
+	var result: CoreExpr = body
+
+	for value in borrowed_values:
+		if is_managed_type(env, value.typ):
+			result = protect_borrowed_param_calls(env, value, result)
+			result = retain_borrowed_param_aggregate_members(env, value, result)
+
+			if managed_result:
+				result = retain_borrowed_param_result(env, value, result)
+			else:
+				void
+		else:
+			void
+
+	result
+
+
+private pure func global_is_unshadowed(
+	env: PerceusEnv,
+	shadowing_values: List[CoreParam],
+	global: PerceusGlobal,
+) -> Bool:
+	global_name_is_unique(env, global.value.name.name) and not core_params_shadow(
+		global.value.name.name,
+		shadowing_values,
+	)
+
+
+private pure func unshadowed_global_values(
+	env: PerceusEnv,
+	shadowing_values: List[CoreParam],
+) -> List[CoreParam]:
+	env.global_values
+		.filter(func(global): global_is_unshadowed(env, shadowing_values, global))
+		.map(func(global): global.value)
+
+
+private pure func core_vars_have_same_definition(left: CoreVar, right: CoreVar) -> Bool:
+	if left.name != right.name or left.uniq != right.uniq:
+		False
+	else:
+		match (left.def_id, right.def_id):
+			(Some(left_id), Some(right_id)):
+				left_id == right_id
+			_:
+				False
+
+
+private pure func mutable_managed_global_for_target(
+	env: PerceusEnv,
+	target: CoreVar,
+) -> Option[CoreParam]:
+	var result: Option[CoreParam] = None
+
+	for global in env.global_values:
+		if (
+			global.is_mutable
+			and is_managed_type(env, global.value.typ)
+			and core_vars_have_same_definition(target, global.value.name)
+		):
+			result = Some(global.value)
+			break
 		else:
 			void
 
@@ -12337,19 +12650,11 @@ private pure func normalize_lambda_body_ownership(
 ) -> CoreExpr:
 	lambda_env: PerceusEnv = { env | transferable_result_vars = [] }
 	managed_result: Bool = is_managed_type(lambda_env, return_type)
-	var result: CoreExpr = body
-
-	for param in borrowed_values:
-		if is_managed_type(lambda_env, param.typ):
-			result = protect_borrowed_param_calls(lambda_env, param, result)
-			result = retain_borrowed_param_aggregate_members(lambda_env, param, result)
-
-			if managed_result:
-				result = retain_borrowed_param_result(lambda_env, param, result)
-			else:
-				void
-		else:
-			void
+	all_borrowed_values: List[CoreParam] = borrowed_values + unshadowed_global_values(
+		lambda_env,
+		borrowed_values,
+	)
+	result: CoreExpr = retain_borrowed_values(lambda_env, all_borrowed_values, return_type, body)
 
 	if managed_result:
 		normalize_owned_result_aliases(lambda_env, result)
@@ -12514,6 +12819,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			aggregate_body: CoreExpr = retain_borrowed_param_aggregates(
 				env,
 				analysis_function,
+				consumed_params,
 				call_body,
 			)
 			retained_body: CoreExpr = retain_borrowed_param_results(
@@ -12522,11 +12828,17 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				consumed_params,
 				aggregate_body,
 			)
+			global_safe_body: CoreExpr = retain_borrowed_values(
+				env,
+				unshadowed_global_values(env, params),
+				return_type,
+				retained_body,
+			)
 
 			owned_result_body: CoreExpr = if is_managed_type(env, return_type):
-				normalize_owned_result_aliases(result_env, retained_body)
+				normalize_owned_result_aliases(result_env, global_safe_body)
 			else:
-				retained_body
+				global_safe_body
 
 			rewritten_body: CoreExpr = insert_drops_expr(env, owned_result_body)
 			balanced_body: CoreExpr = balance_consumed_param_bodies(
@@ -12573,7 +12885,18 @@ private pure func rewrite_global(env: PerceusEnv, global: CoreGlobal) -> CoreGlo
 	def_id: Int = global.def_id
 	loc: CoreSourceLoc = global.loc
 	contract_init: CoreExpr = annotate_user_call_contracts(env, init)
-	rewritten_init: CoreExpr = insert_drops_expr(env, contract_init)
+	global_value: CoreParam = {
+		name = name,
+		typ = typ,
+		loc = loc
+	}
+	owned_init: CoreExpr = retain_borrowed_values(
+		env,
+		unshadowed_global_values(env, [global_value]),
+		typ,
+		contract_init,
+	)
+	rewritten_init: CoreExpr = insert_drops_expr(env, owned_init)
 
 	{
 		name = name,
@@ -12602,11 +12925,16 @@ private pure func rewrite_decl(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
 
 
 pure func insert_drops_program(program: CoreProgram) -> CoreProgram:
-	foreign_includes: List[String] = program.foreign_includes
-	env: PerceusEnv = infer_user_call_contracts(program, build_env(program))
+	declaration_env: PerceusEnv = build_env(program)
+	resolved_program: CoreProgram = resolve_program_global_refs(declaration_env, program)
+	foreign_includes: List[String] = resolved_program.foreign_includes
+	env: PerceusEnv = infer_user_call_contracts(
+		resolved_program,
+		build_env(resolved_program),
+	)
 	var decls: List[CoreDecl] = []
 
-	for decl in program.decls:
+	for decl in resolved_program.decls:
 		decls = decls.append(rewrite_decl(env, decl))
 
 	{

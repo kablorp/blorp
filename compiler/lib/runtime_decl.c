@@ -1146,14 +1146,16 @@ blorp_StackOption_Int blorp_option_div_int(long a, long b);
 blorp_StackOption_Int blorp_option_mod_int(long a, long b);
 
 // String Operations
-blorp_String* blorp_string_literal(const char* cstr);
-blorp_String* blorp_string_literal_len(const char* bytes, long len);
 blorp_String* blorp_string_create(const char* cstr);
+blorp_String* blorp_string_create_len(const char* bytes, long len);
+typedef void (*blorp_GlobalCleanupFn)(void);
+void blorp_register_global_cleanup(blorp_GlobalCleanupFn cleanup);
 blorp_String* blorp_string_concat(const blorp_String* a, const blorp_String* b);
 blorp_String* blorp_string_concat_consume(blorp_String* a, blorp_String* b);
 blorp_String* blorp_string_concat_many(long count, ...);
 bool blorp_string_eq(const blorp_String* a, const blorp_String* b);
 long blorp_string_compare(const blorp_String* a, const blorp_String* b);
+long blorp_string_compare_bytes(const blorp_String* value, const char* bytes, long len);
 blorp_String* blorp_from_char(int32_t c);
 blorp_String* blorp_from_chars(blorp_List* chars);
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other);
