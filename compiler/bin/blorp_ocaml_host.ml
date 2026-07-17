@@ -1,13 +1,12 @@
-(** blorp OCaml host - private command-line implementation host
+(** blorp OCaml host - private implementation host for commands that have not
+    completed the Blorp migration.
 
     Usage:
       blorp compile program.brp          # Compile to C and binary
-      blorp check program.brp            # Type check only
       blorp compile --ast program.brp    # Show AST only
       blorp run program.brp              # Compile and run
       blorp run --release program.brp    # Compile and run optimized
       blorp run --profile program.brp    # Run with profiling
-      blorp check src/                   # Type check all .brp files in directory
       blorp test tests/test.brp          # Run a single test
       blorp test tests/                  # Run all tests in directory
       blorp purify program.brp           # Automatically mark pure functions

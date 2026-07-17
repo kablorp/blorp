@@ -207,32 +207,21 @@ Deletion point:
 
 ## Checkpoint 1: Command Frontier For Source Commands
 
-Goal: make `check`, `compile`, and `run` source command planning entirely
-Blorp-owned up to the frontend module graph handed to the OCaml middle.
+Goal: make `check`, `compile`, and `run` source command planning and frontend
+execution Blorp-owned, with one typed semantic-middle boundary for commands
+that continue past the frontend.
 
-Status: closed for normal source commands. The OCaml shell validates and
-executes a decoded `frontend_module_graph` for `check`, `compile`, and `run`;
-it no longer rediscovers roots, rereads sources, reparses roots, or rebuilds
-source-package context for those commands. The legacy `frontend_options`
-artifact is rejected as an unsupported legacy artifact rather than decoded for
-source execution.
+Status: closed for normal source commands. The Blorp executable discovers and
+reads the source graph, parses and typechecks it, and runs CTFE. `check` ends in
+Blorp without invoking OCaml. `compile` and `run` send one typed request to the
+temporary OCaml semantic-middle worker; the OCaml command host is not part of
+their normal source path. The legacy `frontend_options` artifact is rejected
+rather than decoded for source execution.
 
 OCaml references:
 
-- `compiler/bin/blorp_ocaml_host.ml`
-  - `apply_blorp_cli_frontier`
-  - `cli_frontier_frontend_module_graph`
-  - `finalize_cli_frontend_graph_source`
-  - `finalized_cli_frontend_graph_sources_or_exit`
-  - `apply_cli_frontend_graph_context`
-  - `run_check_from_frontier_options`
-  - `run_compile_from_frontier_options`
-  - `run_file_from_frontier_options`
-  - `compile_opts_of_cli_check`
-  - `compile_opts_of_cli_compile`
-  - `check_file_with_opts`
-  - `compile_file_with_opts`
-  - `run_file`
+- `compiler/bin/blorp_ocaml_middle.ml`
+- `compiler/lib/semantic_middle_worker.ml`
 - `compiler/lib/pipeline.ml`
   - `compile_preloaded_graph_with_blorp_bridge`
   - `compile_loaded_program`
@@ -243,6 +232,10 @@ Blorp references:
 - `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_typecheck.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_execute.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_compile_execute.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
 
 Implementation steps:
@@ -262,12 +255,10 @@ Implementation steps:
   - source package aliases,
   - local `pkg/` roots,
   - parsed response at the requested AST phase.
-- Make OCaml `apply_cli_frontend_graph_context` only apply already-discovered
-  graph context to the current session. It should not perform independent
-  filesystem discovery for normal source commands.
-- Make `run_check_from_frontier_options`, `run_compile_from_frontier_options`,
-  and `run_file_from_frontier_options` call the parsed/graph pipeline entry
-  points only.
+- Keep `check` execution free of semantic-middle and backend imports so its
+  dependency graph cannot accidentally reintroduce the OCaml boundary.
+- Keep compile/run worker requests typed and phase-specific, and invoke the
+  semantic middle exactly once after the Blorp frontend succeeds.
 - Do not reintroduce `frontend_options` execution for source commands. Treat it
   as an unsupported legacy artifact at the bridge decoder boundary.
 
@@ -1781,6 +1772,16 @@ Typed frontier closure before CTFE:
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
   LSP/tooling helpers, and the remaining package/REPL routes. TestRunner source
   compilation is closed; its OCaml work is post-frontend orchestration.
+- The separate compiler fixture runner still uses
+  `Pipeline.typecheck_only_typed_reusing_session` for most `infer` and
+  `typecheck` fixtures. This is test-only and is not part of production
+  `blorp check`. A production-check parity probe on 2026-07-17 found 73
+  should-pass fixtures rejected and 137 should-fail fixtures accepted by the
+  Blorp checker. Keep those fixtures as migration-gap coverage; delete the
+  reusable OCaml checker and its implementation tests only after the Blorp
+  path agrees on status and diagnostics. Do not make one compiler process per
+  fixture the permanent replacement because that would materially regress the
+  test feedback loop.
 - Normal source execution must enter through the Blorp frontend graph and
   `typecheck_source` bridge. If a direct pipeline API remains, document it as a
   temporary legacy/tooling route with a deletion condition rather than allowing
