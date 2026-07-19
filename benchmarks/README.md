@@ -80,6 +80,38 @@ included in `bench.sh all`.
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
 
+## Compiler Memory Diagnostics
+
+`compiler_perceus_memory` is an opt-in compiler benchmark rather than a runtime
+language comparison. It generates a bounded Core program with managed globals
+that are irrelevant to moderately sized function bodies, sends it through the
+production `emit_core_c` bridge action, validates the emitted C, and reports
+request size, elapsed time, and peak memory:
+
+```bash
+benchmarks/compiler_perceus_memory
+benchmarks/compiler_perceus_memory --globals 24
+benchmarks/compiler_perceus_memory --globals 384
+```
+
+The function count and body shape stay fixed when comparing those last two
+commands, isolating the cost of irrelevant globals. The runner uses
+`BLORP_COMPILER_RENDERER_BRIDGE_BIN` when it names a prepared helper; otherwise
+it prepares a cached helper through `./blorp __compiler-bridge-prepare` before
+starting measurement. Bridge preparation is excluded from the reported time.
+
+On macOS, `--vmmap` samples physical footprint, `MALLOC_SMALL`, and allocation
+count when `vmmap` exposes those fields:
+
+```bash
+benchmarks/compiler_perceus_memory --vmmap
+```
+
+Requests, responses, emitted C, and measurement files live in a temporary
+directory and are removed after each run. This diagnostic is deliberately not
+part of `bench.sh all`: it measures compilation, has a materially longer cold
+setup, and is intended for before/after compiler investigations.
+
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected
