@@ -285,11 +285,12 @@ scripts/test cli
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
-30-second per-test timeout. The compiler gate also defaults each compiler
-invocation and codegen-audit case to 30 seconds; set
+30-second per-test timeout. The compiler gate defaults each individual compiler
+invocation and codegen-audit case to 30 seconds, while grouped compiler-owned
+Blorp suites default to 60 seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler/runtime gates.
-Compiler sanitizer gates default to 60 seconds per generated test binary;
+Compiler sanitizer gates default to 180 seconds per generated test binary;
 `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` overrides that measured ASan allowance.
 
 When preview examples are restored, list their exact check/run/format commands

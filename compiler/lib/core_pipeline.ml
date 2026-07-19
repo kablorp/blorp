@@ -78,16 +78,6 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 
 let no_op_on_stage_json : on_stage_json_callback = fun _ _ -> ()
 
-let stage_observed_via_blorp_tail_json = function
-  | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
-  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
-      true
-  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
-  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize ->
-      false
-
 let blorp_tail_stage_name = function
   | ( Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
     | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ) as stage ->

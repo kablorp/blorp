@@ -34,14 +34,6 @@ type phase_timing = {
   duration_seconds : float;
 }
 
-let phase_timing_name = function
-  | InMemoryFrontendGraph -> "frontend_graph"
-  | FrontendGraphFinalize -> "frontend_finalize"
-  | GraphTypecheck -> "graph_typecheck"
-  | SemanticMiddle -> "semantic_middle"
-  | BackendEmission -> "backend_emission"
-  | CorePipeline -> "core_pipeline"
-
 let observe_phase_timing on_phase_timing timing_phase f =
   match on_phase_timing with
   | None -> f ()

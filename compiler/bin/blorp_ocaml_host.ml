@@ -1,19 +1,5 @@
 (** blorp OCaml host - private implementation host for commands that have not
-    completed the Blorp migration.
-
-    Usage:
-      blorp compile program.brp          # Compile to C and binary
-      blorp compile --ast program.brp    # Show AST only
-      blorp run program.brp              # Compile and run
-      blorp run --release program.brp    # Compile and run optimized
-      blorp run --profile program.brp    # Run with profiling
-      blorp test tests/test.brp          # Run a single test
-      blorp test tests/                  # Run all tests in directory
-      blorp purify program.brp           # Automatically mark pure functions
-      blorp package check path/          # Validate a source package
-      blorp package hash path/           # Print a source package content hash
-      blorp package pack path/ -o pkg    # Write a deterministic source package artifact
-*)
+    completed the Blorp migration. *)
 
 open Blorp
 module StringMap = Map.Make (String)
@@ -36,33 +22,6 @@ let write_file path contents =
   Fun.protect
     ~finally:(fun () -> close_out_noerr channel)
     (fun () -> output_string channel contents)
-
-let read_all_channel channel =
-  let buffer = Buffer.create 4096 in
-  let bytes = Bytes.create 4096 in
-  let rec loop () =
-    match input channel bytes 0 4096 with
-    | 0 -> Buffer.contents buffer
-    | n ->
-        Buffer.add_subbytes buffer bytes 0 n;
-        loop ()
-  in
-  loop ()
-
-let run_compiler_bridge_command args =
-  let request_json =
-    match args with
-    | [] -> read_all_channel stdin
-    | [ path ] -> read_file path
-    | _ ->
-        prerr_endline "Usage: blorp __compiler-bridge [request.json]";
-        exit 1
-  in
-  let response_json =
-    Compiler_blorp_bridge.run_renderer_request_via_blorp request_json
-  in
-  print_endline response_json;
-  0
 
 let run_compiler_bridge_prepare_command args =
   match args with
@@ -1104,7 +1063,6 @@ let run_package_from_frontier_options
           1)
 
 let is_internal_compiler_command = function
-  | "__compiler-bridge" :: _
   | "__compiler-bridge-prepare" :: _
   | "__compiler-host-compile-wrapper" :: _
   | "__compiler-run-cli-plan" :: _ ->
@@ -1129,7 +1087,6 @@ let command_line_args () =
 
 let rec run_delegate_command args =
   match args with
-  | "__compiler-bridge" :: rest -> exit (run_compiler_bridge_command rest)
   | "__compiler-bridge-prepare" :: rest ->
       exit (run_compiler_bridge_prepare_command rest)
   | "__compiler-host-compile-wrapper" :: rest ->

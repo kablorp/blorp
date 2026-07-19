@@ -400,6 +400,7 @@ import:
 		CoreVar,
 	../stage_09_core/compiler_core_ownership:
 		OwnershipCallContract,
+		OwnershipResultMode(ReturnOwned),
 		arg_consumes_caller,
 		builtin_contract,
 		intrinsic_contract,
@@ -1393,6 +1394,34 @@ private pure func type_is_value_record(typ: CoreType) -> Bool:
 	TypeLayout.type_is_value_record(typ)
 
 
+private pure func ownership_result_transfers_ownership(result: OwnershipResultMode) -> Bool:
+	match result:
+		ReturnOwned:
+			True
+		_:
+			False
+
+
+private pure func call_result_transfers_ownership(kind: CoreCallKind, arg_count: Int) -> Bool:
+	match call_kind_ownership_contract(kind, arg_count):
+		Some(contract):
+			ownership_result_transfers_ownership(contract.result)
+		None:
+			-- User, closure, foreign, and unresolved calls follow the Core ABI:
+			-- managed results are caller-owned unless a runtime contract says otherwise.
+			True
+
+
+private pure func expr_source_transfers_ownership(expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			call_result_transfers_ownership(kind, args.length())
+		CastExpr(expr_value, typ, loc):
+			expr_source_transfers_ownership(expr_value)
+		_:
+			expr_transfers_ownership(expr)
+
+
 private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 	match expr:
 		BoxExpr(box, typ, loc):
@@ -1430,7 +1459,10 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		CooperativeCheckpointExpr(typ, loc):
 			boxed_value_needs_release_type(typ)
 		CallExpr(kind, callee, args, typ, loc):
-			boxed_value_needs_release_type(typ)
+			(
+				boxed_value_needs_release_type(typ)
+				and call_result_transfers_ownership(kind, args.length())
+			)
 		BinaryExpr(op, left, right, typ, loc):
 			boxed_value_needs_release_type(typ)
 		UnaryExpr(op, expr_value, typ, loc):
@@ -1440,7 +1472,7 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		AssignExpr(variable, rhs, typ, loc):
 			boxed_value_needs_release_type(typ)
 		CastExpr(expr_value, typ, loc):
-			boxed_value_needs_release_type(typ)
+			boxed_value_needs_release_type(typ) and expr_source_transfers_ownership(expr_value)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
 			boxed_value_needs_release_type(typ)
 		TupleExpr(items, typ, loc):
@@ -5876,7 +5908,11 @@ private pure func emit_call_body(
 						Some(value):
 							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 						None:
-							value ?= emit_call_value_from_args(kind, args_body.args, typ)
+							value ?= emit_call_value_from_args(
+								DirectRuntimeCall(call),
+								args_body.args,
+								typ,
+							)
 							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 		BuiltinCall(name):
 			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
@@ -6888,6 +6924,7 @@ private pure func ranked_tensor_checked_get_index_temps(
 
 private pure func ranked_tensor_checked_get_index_bindings(
 	indices: List[String],
+	dims: List[Int],
 	temp_seed: String,
 ) -> String:
 	var statements: String = ""
@@ -6895,7 +6932,9 @@ private pure func ranked_tensor_checked_get_index_bindings(
 
 	for index_value in indices:
 		index_tmp: String = ranked_tensor_checked_get_index_tmp(temp_seed, index)
+		dim: Int = dims.get_or(index, 0)
 		statements += " long " + index_tmp + " = " + index_value + ";"
+		statements += " if (" + index_tmp + " < 0) " + index_tmp + " += " + dim.to_string() + ";"
 		index += 1
 
 	statements
@@ -6956,7 +6995,11 @@ private pure func ranked_tensor_checked_get_prelude(
 	)
 	flat_expr ?= ranked_tensor_checked_get_flat_index_expr(index_temps, get.dims)
 	vector_bind: String = "blorp_Vector* " + vector_tmp + " = (blorp_Vector*)" + get.tensor + ";"
-	index_bindings: String = ranked_tensor_checked_get_index_bindings(get.indices, temp_seed)
+	index_bindings: String = ranked_tensor_checked_get_index_bindings(
+		get.indices,
+		get.dims,
+		temp_seed,
+	)
 	flat_bind: String = " long " + flat_tmp + " = " + flat_expr + ";"
 	condition: String = ranked_tensor_checked_get_conditions(
 		vector_tmp,
@@ -8458,6 +8501,7 @@ private pure func boxed_storage_value_for_retain_intrinsic(
 ) -> CoreBoxedStorageValue:
 	value_type: CoreType = core_expr_type(value)
 	kind: CoreBoxKind = boxed_storage_kind_for_retain_value(value_type)
+
 	needs_release: Bool = match kind:
 		PointerBox:
 			True
@@ -12093,8 +12137,11 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		AssignExpr(variable, rhs, typ, loc):
 			None
 		CastExpr(expr_value, typ, loc):
-			expr_c ?= emit_simple_expr(expr_value)
-			Some("((" + c_type_name(typ) + ")" + expr_c + ")")
+			if expr_transfers_ownership(expr):
+				None
+			else:
+				expr_c ?= emit_simple_expr(expr_value)
+				Some("((" + c_type_name(typ) + ")" + expr_c + ")")
 		BoxExpr(box, typ, loc):
 			emit_box_expr(box)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):

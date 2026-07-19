@@ -102,24 +102,32 @@ let tensor_arithmetic_op_code = function
 
 type tensor_arithmetic_elem =
   | TensorArithmeticInt
+  | TensorArithmeticIntLike
   | TensorArithmeticFloat
   | TensorArithmeticFloat32
   | TensorArithmeticFloat16
-  | TensorArithmeticGenericIntLike
 
-let tensor_arithmetic_elem_of_type ty =
+let tensor_arithmetic_elem_of_type ~loc ty =
   match normalize_type ty with
   | Ast.TyNamed ("Int", []) -> TensorArithmeticInt
   | Ast.TyNamed ("Float", _) -> TensorArithmeticFloat
   | Ast.TyNamed ("Float32", _) -> TensorArithmeticFloat32
   | Ast.TyNamed ("Float16", _) -> TensorArithmeticFloat16
-  | _ -> TensorArithmeticGenericIntLike
+  | ty when Types.is_any_integer_type ty -> TensorArithmeticIntLike
+  | ty ->
+      Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
+        ~hint:
+          "Tensor arithmetic currently supports the built-in integer and float \
+           families. Restrict the source generic bound to Integer or \
+           FloatingPoint."
+        "tensor arithmetic requires a concrete numeric element type, got %s"
+        (Types.type_to_string ty)
 
 let tensor_arithmetic_elem_code = function
   | TensorArithmeticFloat -> 1
   | TensorArithmeticFloat32 -> 2
   | TensorArithmeticFloat16 -> 3
-  | TensorArithmeticInt | TensorArithmeticGenericIntLike -> 0
+  | TensorArithmeticInt | TensorArithmeticIntLike -> 0
 
 let direct_vector_binary_builtin elem op =
   match (elem, op) with
@@ -193,9 +201,9 @@ let scalar_dispatch_builtin ~reversed elem =
   | TensorArithmeticFloat32, true -> "blorp_vector_scalar_op_rev_float32"
   | TensorArithmeticFloat16, false -> "blorp_vector_scalar_op_float16"
   | TensorArithmeticFloat16, true -> "blorp_vector_scalar_op_rev_float16"
-  | TensorArithmeticInt, false | TensorArithmeticGenericIntLike, false ->
+  | TensorArithmeticInt, false | TensorArithmeticIntLike, false ->
       "blorp_vector_scalar_op_int"
-  | TensorArithmeticInt, true | TensorArithmeticGenericIntLike, true ->
+  | TensorArithmeticInt, true | TensorArithmeticIntLike, true ->
       "blorp_vector_scalar_op_rev_int"
 
 let require_tensor_parts ?reg ~loc ~context ty =
@@ -2177,7 +2185,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
               loc = e.loc;
             }
           in
-          let elem = tensor_arithmetic_elem_of_type elem_ty in
+          let elem = tensor_arithmetic_elem_of_type ~loc:e.loc elem_ty in
           let elem_code = tensor_arithmetic_elem_code elem in
           match (l_is_t, r_is_t) with
           | true, true ->

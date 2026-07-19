@@ -18,10 +18,6 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 (** Callback fired for Blorp-owned stages whose authoritative observation is
     bridge JSON rather than an OCaml [Core.core_program]. *)
 
-val stage_observed_via_blorp_tail_json : Core_stage.t -> bool
-(** Whether observing this stage requires the Blorp-owned tail JSON path rather
-    than an OCaml program callback. *)
-
 val make_stage_hook :
   check_invariants:bool -> user:on_stage_callback -> on_stage_callback
 (** Compose a user callback with invariant checking. Exposed for focused tests

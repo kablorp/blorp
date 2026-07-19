@@ -81,10 +81,12 @@ import:
 			CompilerCtfeVectorValue,
 			CompilerCtfeVoidValue,
 		),
+	float: format_float, is_finite
 
 
 enum CompilerCtfeMaterializeError:
 	CompilerCtfeCapturedLambda
+	CompilerCtfeFloatPrecisionUnavailable
 	CompilerCtfeLambdaSourceUnavailable
 
 
@@ -95,11 +97,40 @@ pure func compiler_ctfe_materialize_error_message(error: CompilerCtfeMaterialize
 				"compile-time function values that capture local bindings cannot be materialized "
 				+ "as global data"
 			)
+		CompilerCtfeFloatPrecisionUnavailable:
+			(
+				"compile-time floating-point value cannot be materialized without changing its "
+				+ "value"
+			)
 		CompilerCtfeLambdaSourceUnavailable:
 			(
 				"internal compile-time constant evaluation error: parsed lambda source is "
 				+ "unavailable"
 			)
+
+
+-- Bootstrap compilers before round-tripping Float.to_string support emit only
+-- six significant digits. Verify compact output and use the existing fixed
+-- formatter as a compatibility path; never silently materialize a different
+-- floating-point value.
+private pure func compiler_ctfe_float_literal_text(
+	value: Float,
+) -> Result[String, CompilerCtfeMaterializeError]:
+	compact = value.to_string()
+
+	if not is_finite(value):
+		-- Internal typed literals use the C spellings emitted by Float.to_string
+		-- for IEEE infinity and NaN values.
+		Ok(compact)
+	else if to_float(compact) == value:
+		Ok(compact)
+	else:
+		fixed_text = format_float(value, 20)
+
+		if to_float(fixed_text) == value:
+			Ok(fixed_text)
+		else:
+			Err(CompilerCtfeFloatPrecisionUnavailable)
 
 
 private pure func compiler_ctfe_materialize_info(
@@ -379,7 +410,8 @@ pure func compiler_ctfe_materialize_value(
 		CompilerCtfeIntValue(raw):
 			Ok(CompilerTypedIntLiteralExpr(raw.to_string(), value.span, info))
 		CompilerCtfeFloatValue(raw):
-			Ok(CompilerTypedFloatLiteralExpr(raw.to_string(), value.span, info))
+			text ?= compiler_ctfe_float_literal_text(raw)
+			Ok(CompilerTypedFloatLiteralExpr(text, value.span, info))
 		CompilerCtfeBoolValue(raw):
 			Ok(CompilerTypedBoolLiteralExpr(raw, value.span, info))
 		CompilerCtfeCharValue(raw):
@@ -475,7 +507,8 @@ pure func compiler_ctfe_materialize_parsed_expr(
 		CompilerCtfeIntValue(raw):
 			Ok(ParsedIntLiteralExpr(raw.to_string(), value.span))
 		CompilerCtfeFloatValue(raw):
-			Ok(ParsedFloatLiteralExpr(raw.to_string(), value.span))
+			text ?= compiler_ctfe_float_literal_text(raw)
+			Ok(ParsedFloatLiteralExpr(text, value.span))
 		CompilerCtfeBoolValue(raw):
 			Ok(ParsedBoolLiteralExpr(raw, value.span))
 		CompilerCtfeCharValue(raw):
@@ -548,5 +581,5 @@ pure func compiler_ctfe_materialize_global_var_info(
 							info.decl.value,
 						),
 					)
-				Err(CompilerCtfeCapturedLambda):
-					Err(CompilerCtfeCapturedLambda)
+				Err(error):
+					Err(error)

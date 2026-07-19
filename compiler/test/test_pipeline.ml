@@ -264,20 +264,19 @@ let test_blorp_bridge_compile_uses_in_memory_source () =
                 "generated C comes from supplied source" true
                 (contains c_code "blorp_main");
               let timings = List.rev !observed_timings in
-              Alcotest.(check (list string))
-                "reports each in-memory compile phase"
-                [
-                  "frontend_graph";
-                  "frontend_finalize";
-                  "graph_typecheck";
-                  "semantic_middle";
-                  "backend_emission";
-                  "core_pipeline";
-                ]
+              Alcotest.(check bool)
+                "reports each in-memory compile phase in order" true
                 (List.map
-                   (fun timing ->
-                     Pipeline.phase_timing_name timing.Pipeline.timing_phase)
-                   timings);
+                   (fun timing -> timing.Pipeline.timing_phase)
+                   timings
+                = [
+                    Pipeline.InMemoryFrontendGraph;
+                    Pipeline.FrontendGraphFinalize;
+                    Pipeline.GraphTypecheck;
+                    Pipeline.SemanticMiddle;
+                    Pipeline.BackendEmission;
+                    Pipeline.CorePipeline;
+                  ]);
               Alcotest.(check bool)
                 "phase durations are nonnegative" true
                 (List.for_all

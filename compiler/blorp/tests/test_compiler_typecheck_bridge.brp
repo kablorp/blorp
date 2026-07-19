@@ -144,6 +144,49 @@ pure func json_is_non_null(value: JsonValue) -> Bool:
 			True
 
 
+pure func json_is_resolved_trait_call(
+	value: JsonValue,
+	callee_name: String,
+	module_path: String,
+) -> Bool:
+	if string_field(value, "callee_name") != callee_name:
+		False
+	else:
+		match get_field(value, "target"):
+			Some(target):
+				if string_field(target, "kind") != "trait_method":
+					False
+				else:
+					match get_field(target, "impl_target"):
+						Some(impl_target):
+							string_field(impl_target, "module_path") == module_path
+						None:
+							False
+			None:
+				False
+
+
+pure func json_contains_resolved_trait_call(
+	value: JsonValue,
+	callee_name: String,
+	module_path: String,
+) -> Bool:
+	if json_is_resolved_trait_call(value, callee_name, module_path):
+		True
+	else:
+		match value:
+			JsonObject(fields):
+				fields.any(func(field):
+					json_contains_resolved_trait_call(field[1], callee_name, module_path)
+				)
+			JsonVector(items):
+				items.any(func(item):
+					json_contains_resolved_trait_call(item, callee_name, module_path)
+				)
+			_:
+				False
+
+
 pure func typed_program_has_impl_method_body(value: JsonValue) -> Bool:
 	var found: Bool = False
 
@@ -307,6 +350,38 @@ pure func user_import_module_json(
 	])
 
 
+pure func source_package_import_module_json(
+	module_path: String,
+	module_name: String,
+	package: String,
+	text: String,
+) -> JsonValue:
+	JsonObject([
+		("path", JsonString(module_name + ".brp")),
+		("module", JsonString(module_name)),
+		("module_path", JsonString(module_path)),
+		("text", JsonString(text)),
+		("origin", JsonObject([
+			("kind", JsonString("source_package")),
+			("package", JsonString(package)),
+		])),
+	])
+
+
+pure func resolved_import_json(
+	from_path: String,
+	from_module: String,
+	import_path: String,
+	resolved_module: String,
+) -> JsonValue:
+	JsonObject([
+		("from_path", JsonString(from_path)),
+		("from_module", JsonString(from_module)),
+		("import_path", JsonString(import_path)),
+		("resolved_module", JsonString(resolved_module)),
+	])
+
+
 pure func typecheck_source_request_with_imports(
 	source: String,
 	import_modules: List[JsonValue],
@@ -336,12 +411,22 @@ pure func typecheck_graph_request(
 	modules: List[JsonValue],
 	module_targets: List[String],
 ) -> String:
+	typecheck_graph_request_with_resolved_imports(target, modules, module_targets, [])
+
+
+pure func typecheck_graph_request_with_resolved_imports(
+	target: JsonValue,
+	modules: List[JsonValue],
+	module_targets: List[String],
+	resolved_imports: List[JsonValue],
+) -> String:
 	request_json("typecheck_graph", JsonObject([
 			("target", target),
 			("modules", JsonVector(modules)),
 			("module_targets", JsonVector(module_targets.map(
 					func(path): JsonString(path),
 				))),
+			("resolved_imports", JsonVector(resolved_imports)),
 		]))
 
 
@@ -510,6 +595,60 @@ func test_typecheck_graph_handles_shared_import_context() -> Bool:
 			False
 
 
+func test_typecheck_graph_preserves_qualified_trait_method_resolution() -> Bool:
+	traits: JsonValue = import_module_json(
+		"std/traits",
+		"traits",
+		"trait Stringable:\n\tpure func to_string(value: Self) -> String",
+	)
+	slice_source: String =
+		|import:
+		|	traits: Stringable
+		|
+		|type StringSlice = builtin
+		|
+		|implements Stringable for StringSlice:
+		|	pure func to_string(value: StringSlice) -> String:
+		|		builtin("std/slice.to_string")
+	slice: JsonValue = import_module_json("std/slice", "slice", slice_source)
+	subject_source: String =
+		|import:
+		|	slice as S
+		|
+		|pure func render(value: S.StringSlice) -> String:
+		|	S.to_string(value)
+	subject: JsonValue = user_import_module_json("subject", "subject", subject_source)
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[traits, slice, subject],
+				["subject"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			subject_response = responses.get_or(0, JsonNull)
+
+			match artifact_field(subject_response, "typed_program"):
+				Some(program):
+					(
+						artifact_array_length(subject_response, "type_errors") == 0
+						and json_contains_resolved_trait_call(program, "to_string", "std/slice")
+					)
+				None:
+					False
+		None:
+			False
+
+
 func test_typecheck_graph_refines_unannotated_generic_factory() -> Bool:
 	dep_source: String =
 		|opaque type Cache[K, V] = (K, V)
@@ -585,6 +724,271 @@ func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
 				responses.get_or(2, JsonNull),
 				"ctfe_status",
 			) == "evaluated"
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first() -> Bool:
+	base: JsonValue = user_import_module_json("base", "base", "answer: Int = 40")
+	dep_source: String =
+		|import:
+		|	base: answer
+		|
+		|next_answer: Int = answer + 1
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: next_answer
+		|
+		|final_answer: Int = next_answer + 1
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dep, base],
+				[],
+			),
+			1,
+		)
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_follows_ctfe_dependency_through_function_only_module() -> Bool:
+	base: JsonValue = user_import_module_json(
+		"base",
+		"base",
+		"pure func base_value() -> Int:\n\t40",
+	)
+	dep_source: String =
+		|import:
+		|	base: base_value
+		|
+		|pure func dep_value() -> Int:
+		|	base_value() + 1
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: dep_value
+		|
+		|final_answer: Int = dep_value() + 1
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dep, base],
+				[],
+			),
+			1,
+		)
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_std_ctfe_dependency() -> Bool:
+	constants: JsonValue = import_module_json("std/constants", "constants", "answer: Int = 42")
+	target_source: String =
+		|import:
+		|	constants: answer
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+	resolved = resolved_import_json("main.brp", "main", "constants", "std/constants")
+
+	match streamed_graph_responses(
+		typecheck_graph_request_with_resolved_imports(target, [constants], [], [resolved]),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_source_package_ctfe_dependency() -> Bool:
+	constants: JsonValue = source_package_import_module_json(
+		"deps/demo/constants",
+		"constants",
+		"demo",
+		"answer: Int = 42",
+	)
+	target_source: String =
+		|import:
+		|	constants: answer
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+	resolved = resolved_import_json("main.brp", "main", "constants", "deps/demo/constants")
+
+	match streamed_graph_responses(
+		typecheck_graph_request_with_resolved_imports(target, [constants], [], [resolved]),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_root_local_trait_method() -> Bool:
+	target_source: String =
+		|trait HasValue:
+		|	pure func read_value(value: Self) -> Int
+		|
+		|record Box {value: Int}
+		|
+		|implements HasValue for Box:
+		|	pure func read_value(box: Box) -> Int:
+		|		box.value
+		|
+		|box: Box = {value = 42}
+		|answer: Int = box.read_value()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_imported_trait_method() -> Bool:
+	dep_source: String =
+		|trait HasValue:
+		|	pure func read_value(value: Self) -> Int
+		|
+		|record Box {value: Int}
+		|
+		|implements HasValue for Box:
+		|	pure func read_value(box: Box) -> Int:
+		|		box.value
+		|
+		|pure func box(value: Int) -> Box:
+		|	{value = value}
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: Box, box, read_value
+		|
+		|answer: Int = box(42).read_value()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dep], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_isolates_unrelated_ctfe_dependency_failure() -> Bool:
+	broken: JsonValue = user_import_module_json("broken", "broken", "answer: Int = missing_value")
+	dependent_source: String =
+		|import:
+		|	broken: answer
+		|
+		|dependent_answer: Int = answer
+	dependent: JsonValue = user_import_module_json("dependent", "dependent", dependent_source)
+	target: JsonValue = user_import_module_json("main", "main", "answer: Int = 42")
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dependent, broken],
+				["dependent"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			dependent_response = responses.get_or(0, JsonNull)
+			target_response = responses.get_or(1, JsonNull)
+
+			(
+				artifact_array_length(dependent_response, "type_errors") > 0
+				and artifact_array_length(target_response, "type_errors") == 0
+				and artifact_string_field(target_response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_ctfe_dependency_sees_target_surface() -> Bool:
+	dependency_source: String =
+		|import:
+		|	main: Marker
+		|
+		|answer: Int = 42
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dependency], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
 		None:
 			False
 
@@ -787,7 +1191,7 @@ pure func test_typecheck_source_marks_self_contained_ctfe_evaluated() -> Bool:
 			False
 
 
-pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
+pure func test_typecheck_source_evaluates_qualified_import_ctfe() -> Bool:
 	source: String = "import:\n\tdep as Dep\n\nVALUE: String = Dep.answer()\n\nfunc main(args: List[String]) -> Int:\n\t0"
 	dep_text: String = "pure func answer() -> String:\n\t3.to_string()"
 
@@ -800,8 +1204,8 @@ pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
 		Some(response):
 			(
 				bool_field(response, "ok")
-				and artifact_string_field(response, "ctfe_status") == "not_run"
-				and artifact_array_length(response, "type_errors") > 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
 			)
 		None:
 			False
@@ -836,6 +1240,32 @@ pure func test_typecheck_source_evaluates_imported_constant_ctfe() -> Bool:
 			source,
 			[user_import_module_json("dep", "dep", dep_text)],
 		),
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
+			)
+		None:
+			False
+
+
+pure func test_typecheck_source_evaluates_aliased_constant_from_non_leaf_module() -> Bool:
+	source: String = "import:\n\tdep: OFFSET as OFFSET_ALIAS\n\nVALUE: Int = OFFSET_ALIAS + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
+	base_text: String = "BASE: Int = 1"
+	dep_text: String = "import:\n\tbase: BASE\n\nprivate pure func offset() -> Int:\n\t41\n\nOFFSET: Int = offset()"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					user_import_module_json("base", "base", base_text),
+					user_import_module_json("dep", "dep", dep_text),
+				],
+			),
+		)
 	):
 		Some(response):
 			(
@@ -977,6 +1407,41 @@ pure func test_typecheck_source_preserves_imported_resource_cleanup() -> Bool:
 					.to_string()
 					.contains("\"cleanup_function\":\"blorp_file_close_reader\"")
 			)
+		None:
+			False
+
+
+pure func test_typecheck_source_preserves_independent_accept_result() -> Bool:
+	source: String =
+		|import:
+		|	dep: Error, Listener, Stream, accept, listen
+		|
+		|func serve() -> Result[Int, Error]:
+		|	with listener ?= listen():
+		|		with first ?= accept(listener):
+		|			with second ?= accept(listener):
+		|				Ok(0)
+	dep_text: String =
+		|resource type Listener = builtin("close_listener")
+		|resource type Stream = builtin("close_stream")
+		|
+		|union Error:
+		|	Other(String)
+		|
+		|func listen() -> Result[Listener, Error]:
+		|	builtin("listen")
+		|
+		|func accept(listener: Listener) -> Result[Stream, Error]:
+		|	builtin("blorp_tcp_accept_raw")
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
 		None:
 			False
 
@@ -1962,12 +2427,48 @@ tests: TestSuite = {
 			test_typecheck_graph_handles_shared_import_context,
 		),
 		(
+			"typecheck_graph preserves qualified trait method resolution",
+			test_typecheck_graph_preserves_qualified_trait_method_resolution,
+		),
+		(
 			"typecheck_graph refines unannotated generic factory",
 			test_typecheck_graph_refines_unannotated_generic_factory,
 		),
 		(
 			"typecheck_graph evaluates shared CTFE dependency",
 			test_typecheck_graph_evaluates_shared_ctfe_dependency,
+		),
+		(
+			"typecheck_graph evaluates transitive CTFE dependencies first",
+			test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first,
+		),
+		(
+			"typecheck_graph follows CTFE dependency through function-only module",
+			test_typecheck_graph_follows_ctfe_dependency_through_function_only_module,
+		),
+		(
+			"typecheck_graph evaluates std CTFE dependency",
+			test_typecheck_graph_evaluates_std_ctfe_dependency,
+		),
+		(
+			"typecheck_graph evaluates source-package CTFE dependency",
+			test_typecheck_graph_evaluates_source_package_ctfe_dependency,
+		),
+		(
+			"typecheck_graph evaluates root-local trait method",
+			test_typecheck_graph_evaluates_root_local_trait_method,
+		),
+		(
+			"typecheck_graph evaluates imported trait method",
+			test_typecheck_graph_evaluates_imported_trait_method,
+		),
+		(
+			"typecheck_graph isolates unrelated CTFE dependency failure",
+			test_typecheck_graph_isolates_unrelated_ctfe_dependency_failure,
+		),
+		(
+			"typecheck_graph CTFE dependency sees target surface",
+			test_typecheck_graph_ctfe_dependency_sees_target_surface,
 		),
 		(
 			"typecheck_graph resolves imported global annotation",
@@ -1995,8 +2496,8 @@ tests: TestSuite = {
 			test_typecheck_source_marks_self_contained_ctfe_evaluated,
 		),
 		(
-			"typecheck_source reports unsupported import CTFE",
-			test_typecheck_source_reports_unsupported_import_ctfe,
+			"typecheck_source evaluates qualified import CTFE",
+			test_typecheck_source_evaluates_qualified_import_ctfe,
 		),
 		(
 			"typecheck_source evaluates imported function CTFE",
@@ -2005,6 +2506,10 @@ tests: TestSuite = {
 		(
 			"typecheck_source evaluates imported constant CTFE",
 			test_typecheck_source_evaluates_imported_constant_ctfe,
+		),
+		(
+			"typecheck_source evaluates aliased constant from non-leaf module",
+			test_typecheck_source_evaluates_aliased_constant_from_non_leaf_module,
 		),
 		(
 			"typecheck_source sees global conversion builtins",
@@ -2038,6 +2543,10 @@ tests: TestSuite = {
 		(
 			"typecheck_source preserves imported resource cleanup",
 			test_typecheck_source_preserves_imported_resource_cleanup,
+		),
+		(
+			"typecheck_source preserves independent accept result",
+			test_typecheck_source_preserves_independent_accept_result,
 		),
 		(
 			"typecheck_source matches std shorthand import path",

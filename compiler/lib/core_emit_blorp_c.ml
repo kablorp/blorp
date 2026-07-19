@@ -903,41 +903,41 @@ let var_json (variable : Core.var) =
 let enum_constructor_key type_name constructor_name =
   type_name ^ "\000" ^ constructor_name
 
-let constructor_c_name_for_type constructor_symbols ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+let constructor_c_name_for_type ~reg constructor_symbols ty (variable : Core.var) =
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed (type_name, _) ->
       StringMap.find_opt
         (enum_constructor_key type_name variable.vname)
         constructor_symbols
   | _ -> None
 
-let is_option_none_constructor ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+let is_option_none_constructor ~reg ty (variable : Core.var) =
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed ("Option", [ _ ]) when String.equal variable.vname "None" ->
       true
   | _ -> false
 
 let is_stack_option_none_constructor ~reg ty variable =
-  is_option_none_constructor ty variable
+  is_option_none_constructor ~reg ty variable
   && Core_layout_type.is_stack_option_type ~reg ty
 
-let is_singleton_constructor_value constructor_symbols ty variable =
-  if is_option_none_constructor ty variable then true
+let is_singleton_constructor_value ~reg constructor_symbols ty variable =
+  if is_option_none_constructor ~reg ty variable then true
   else
-    match constructor_c_name_for_type constructor_symbols ty variable with
+    match constructor_c_name_for_type ~reg constructor_symbols ty variable with
     | Some _ -> true
     | None -> false
 
 let retain_policy_json_for_var ~reg constructor_symbols ty variable =
-  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  if is_singleton_constructor_value ~reg constructor_symbols ty variable then str "none"
   else retain_policy_json ~reg ty
 
 let release_policy_json_for_var ~reg constructor_symbols ty variable =
-  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  if is_singleton_constructor_value ~reg constructor_symbols ty variable then str "none"
   else release_policy_json ~reg ty
 
 let nullable_option_constructor_c_name ~reg ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed ("Option", [ _ ])
     when Core_layout_type.is_nullable_managed_option ~reg ty
          && String.equal variable.vname "None" ->
@@ -952,7 +952,7 @@ let var_json_for_expr ~reg constructor_symbols ty (variable : Core.var) =
       match nullable_option_constructor_c_name ~reg ty variable with
       | Some c_name -> c_name
       | None -> (
-          match constructor_c_name_for_type constructor_symbols ty variable with
+          match constructor_c_name_for_type ~reg constructor_symbols ty variable with
           | Some c_name -> c_name
           | None -> Core.Var.to_c_name variable)
   in
@@ -1273,6 +1273,7 @@ let match_accessor_parent_type ~reg scrut_ty = function
 
 let constructor_match_test_json ~reg enum_names union_names enum_constructors path
     scrut_ty ctor =
+  let scrut_ty = Core_emit_layout.canonical_type ~reg scrut_ty in
   match scrut_ty with
   | Ast.TyNamed ("Option", [ _ ])
     when Core_layout_type.is_stack_option_type ~reg scrut_ty -> (
@@ -4355,24 +4356,38 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
           let* fields = typed [ ("literal", literal_json) ] in
           Ok (kind "tensor_literal" fields)
       | Core.TensorWordElements _ -> unsupported path "word tensor literal")
-  | Core.CDict entries ->
-      let* entries_json =
-        result_list entries (fun index (key, value) ->
-            let entry_path = Printf.sprintf "%s.entries[%d]" path index in
-            let* key_json =
-              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
-                heap_record_names union_names enum_constructors
-                (entry_path ^ ".key") key
-            in
-            let* value_json =
-              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
-                heap_record_names union_names enum_constructors
-                (entry_path ^ ".value") value
-            in
-            Ok (obj [ ("key", key_json); ("value", value_json) ]))
-      in
-      let* fields = typed [ ("entries", entries_json) ] in
-      Ok (kind "dict" fields)
+  | Core.CDict entries -> (
+      match (entries, Core_emit_layout.canonical_type ~reg expr.ty) with
+      | [], Ast.TyNamed ("Set", [ elem_ty ]) ->
+          let alloc =
+            {
+              Core.sa_constructor =
+                Core_hash_container_layout.set_constructor_kind ~reg elem_ty;
+            }
+          in
+          let* alloc_json =
+            set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc
+          in
+          let* fields = typed [ ("alloc", alloc_json) ] in
+          Ok (kind "set_alloc" fields)
+      | _ ->
+          let* entries_json =
+            result_list entries (fun index (key, value) ->
+                let entry_path = Printf.sprintf "%s.entries[%d]" path index in
+                let* key_json =
+                  expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                    heap_record_names union_names enum_constructors
+                    (entry_path ^ ".key") key
+                in
+                let* value_json =
+                  expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                    heap_record_names union_names enum_constructors
+                    (entry_path ^ ".value") value
+                in
+                Ok (obj [ ("key", key_json); ("value", value_json) ]))
+          in
+          let* fields = typed [ ("entries", entries_json) ] in
+          Ok (kind "dict" fields))
   | Core.CDictConstruct dc ->
       let* construct =
         dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names

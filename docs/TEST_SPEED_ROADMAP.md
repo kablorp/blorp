@@ -452,10 +452,12 @@ count alone.
   57.534s for execution. These totals are validation evidence, not a speed
   baseline, because sanitizer instrumentation changes both compile and runtime
   cost.
-- A healthy 23-suite sanitizer group takes about 43 seconds to execute on the
-  measured macOS ARM host. Compiler sanitizer gates therefore use a separate
-  named 60-second default rather than inheriting the ordinary 30-second test
-  timeout. `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` remains the explicit override.
+- A normal compiler-owned Blorp group can exceed the ordinary 30-second
+  single-test budget, so grouped compiler suites use a measured 60-second
+  default. The largest healthy sanitizer group takes about 107 seconds to
+  execute on the measured macOS ARM host, so compiler sanitizer gates use a
+  separate 180-second default. `BLORP_COMPILER_TEST_TIMEOUT` and
+  `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` remain the explicit overrides.
 - The sanitizer sweep exposed a runtime teardown defect independent of grouping:
   Apple ASan attempted to unmap each worker's malloc-backed alternate signal
   stack at thread exit. ASan builds now rely on ASan's stack-overflow reporting

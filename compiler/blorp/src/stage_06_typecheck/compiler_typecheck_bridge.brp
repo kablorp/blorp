@@ -126,11 +126,17 @@ private record PreparedTypecheckModule {
 }
 
 
--- Retain only CTFE leaf dependencies shared by requested artifacts. Completed
--- typed artifacts remain streamed and are not retained by this graph value.
+-- Retain only CTFE dependencies shared by requested artifacts. Completed typed
+-- artifacts remain streamed and are not retained by this graph value.
 private record PreparedCtfeDependency {
 	module_path: String,
 	imported_program: Option[CompilerCtfeImportedProgram]
+}
+
+
+private record CtfeDependencyOrder {
+	visited_paths: List[String],
+	dependencies: List[PreparedTypecheckModule]
 }
 
 
@@ -145,6 +151,7 @@ private record CompilerGraphDefinitionPlan {
 
 private record PreparedTypecheckGraph {
 	target: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
 	selected_modules: List[PreparedTypecheckModule],
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
@@ -856,6 +863,16 @@ private pure func importable_modules_from_prepared(
 	modules.map(importable_module_from_prepared)
 
 
+private pure func importable_modules_with_artifact(
+	modules: List[CompilerImportableModule],
+	artifact: PreparedTypecheckModule,
+) -> List[CompilerImportableModule]:
+	importable_modules_except_path(
+		modules,
+		artifact.request.module_path,
+	).append(importable_module_from_prepared(artifact))
+
+
 private pure func graph_target_modules(
 	modules: List[PreparedTypecheckModule],
 	module_targets: List[String],
@@ -944,38 +961,51 @@ private pure func ctfe_imported_program_from_prepared(
 		Some({
 			module_path = module.request.module_path,
 			program = typed_result.program,
+			import_bindings = typed_result.state.import_bindings,
 		})
 	else:
 		None
 
 
-private pure func append_unique_ctfe_dependencies(
-	dependencies: List[PreparedTypecheckModule],
-	additional_dependencies: List[PreparedTypecheckModule],
-) -> List[PreparedTypecheckModule]:
-	var result = dependencies
-
-	for dependency in additional_dependencies:
-		if not result.any(
-			func(existing): existing.request.module_path == dependency.request.module_path,
-		):
-			result = result.append(dependency)
-
-	result
-
-
-private pure func ctfe_dependencies_for_artifact(
+private pure func direct_ctfe_dependencies_for_artifact(
 	artifact: PreparedTypecheckModule,
 	modules: List[PreparedTypecheckModule],
 ) -> List[PreparedTypecheckModule]:
-	if parsed_program_has_ctfe_globals(artifact.program):
-		explicit_import_paths = explicit_import_paths_from_program(artifact.program)
+	explicit_import_paths = explicit_import_paths_from_program(artifact.program)
 
-		modules.filter(
-			func(module): import_module_is_explicit_leaf_for_ctfe(module, explicit_import_paths),
-		)
+	modules.filter(func(module): import_module_is_explicit_for_ctfe(module, explicit_import_paths))
+
+
+private pure func append_ctfe_dependency_tree(
+	order: CtfeDependencyOrder,
+	dependency: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
+) -> CtfeDependencyOrder:
+	module_path = dependency.request.module_path
+
+	if order.visited_paths.contains(module_path):
+		order
 	else:
-		[]
+		var result = { order | visited_paths = order.visited_paths.append(module_path) }
+
+		for transitive in direct_ctfe_dependencies_for_artifact(dependency, modules):
+			result = append_ctfe_dependency_tree(result, transitive, modules)
+
+		{ result | dependencies = result.dependencies.append(dependency) }
+
+
+private pure func append_ctfe_dependencies_for_artifact(
+	order: CtfeDependencyOrder,
+	artifact: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
+) -> CtfeDependencyOrder:
+	var result = order
+
+	if parsed_program_has_ctfe_globals(artifact.program):
+		for dependency in direct_ctfe_dependencies_for_artifact(artifact, modules):
+			result = append_ctfe_dependency_tree(result, dependency, modules)
+
+	result
 
 
 private pure func ctfe_dependencies_for_graph(
@@ -983,15 +1013,36 @@ private pure func ctfe_dependencies_for_graph(
 	modules: List[PreparedTypecheckModule],
 	selected_modules: List[PreparedTypecheckModule],
 ) -> List[PreparedTypecheckModule]:
-	var dependencies = ctfe_dependencies_for_artifact(target, modules)
+	var order: CtfeDependencyOrder = {
+		visited_paths = [],
+		dependencies = []
+	}
+	order = append_ctfe_dependencies_for_artifact(order, target, modules)
 
 	for module in selected_modules:
-		dependencies = append_unique_ctfe_dependencies(
-			dependencies,
-			ctfe_dependencies_for_artifact(module, modules),
-		)
+		order = append_ctfe_dependencies_for_artifact(order, module, modules)
 
-	dependencies
+	order.dependencies
+
+
+private pure func prepared_ctfe_dependencies_for_artifact(
+	artifact: PreparedTypecheckModule,
+	modules: List[PreparedTypecheckModule],
+	prepared_dependencies: List[PreparedCtfeDependency],
+) -> List[PreparedCtfeDependency]:
+	order = append_ctfe_dependencies_for_artifact(
+		{
+			visited_paths = [],
+			dependencies = []
+		},
+		artifact,
+		modules,
+	)
+	dependency_paths = order.dependencies.map(func(dependency): dependency.request.module_path)
+
+	prepared_dependencies.filter(
+		func(dependency): dependency_paths.contains(dependency.module_path),
+	)
 
 
 private pure func prepare_ctfe_dependencies(
@@ -1011,39 +1062,34 @@ private pure func prepare_ctfe_dependencies(
 		})
 
 
-private pure func prepared_module_has_explicit_imports(module: PreparedTypecheckModule) -> Bool:
-	explicit_import_paths_from_program(module.program).length() != 0
-
-
-private pure func import_module_is_explicit_leaf_for_ctfe(
+private pure func import_module_is_explicit_for_ctfe(
 	module: PreparedTypecheckModule,
 	explicit_import_paths: List[String],
 ) -> Bool:
 	match module.request.origin:
-		CompilerUserModule:
-			(
-				explicit_import_paths.contains(module.request.module_path)
-				and not prepared_module_has_explicit_imports(module)
-			)
-		_:
+		CompilerNativePackageModule(_):
 			False
+		CompilerSourcePackageModule(_):
+			explicit_import_paths.contains(module.request.module_path)
+		CompilerStdlibModule:
+			explicit_import_paths.contains(module.request.module_path)
+		CompilerUserModule:
+			explicit_import_paths.contains(module.request.module_path)
 
 
 private pure func ctfe_imported_programs_from_dependencies(
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	explicit_import_paths: List[String],
 ) -> Option[List[CompilerCtfeImportedProgram]]:
 	var result: List[CompilerCtfeImportedProgram] = []
 	var failed: Bool = False
 
 	for dependency in ctfe_dependencies:
-		if explicit_import_paths.contains(dependency.module_path):
-			match dependency.imported_program:
-				Some(imported_program):
-					result = result.append(imported_program)
-				None:
-					failed = True
-					break
+		match dependency.imported_program:
+			Some(imported_program):
+				result = result.append(imported_program)
+			None:
+				failed = True
+				break
 
 	if failed:
 		None
@@ -1054,10 +1100,9 @@ private pure func ctfe_imported_programs_from_dependencies(
 private pure func ctfe_imported_programs_for_artifact(
 	typed_result: CompilerTypecheckProgramResult,
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	explicit_import_paths: List[String],
 ) -> Option[List[CompilerCtfeImportedProgram]]:
 	if typed_program_has_ctfe_globals(typed_result.program):
-		ctfe_imported_programs_from_dependencies(ctfe_dependencies, explicit_import_paths)
+		ctfe_imported_programs_from_dependencies(ctfe_dependencies)
 	else:
 		Some([])
 
@@ -1129,7 +1174,6 @@ private pure func typechecked_prepared_module(
 	definition_plan: CompilerGraphDefinitionPlan,
 ) -> CompilerTypecheckedModule:
 	final_program = module.program
-	explicit_import_paths = explicit_import_paths_from_program(final_program)
 	initial_state = graph_typecheck_state(
 		module.request.origin,
 		allow_debug_only_calls,
@@ -1145,11 +1189,7 @@ private pure func typechecked_prepared_module(
 			importable_modules,
 		)
 
-	imported_programs = ctfe_imported_programs_for_artifact(
-		typed_result,
-		ctfe_dependencies,
-		explicit_import_paths,
-	)
+	imported_programs = ctfe_imported_programs_for_artifact(typed_result, ctfe_dependencies)
 	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 
 	{
@@ -1214,8 +1254,15 @@ private pure func typed_source_artifact(
 	)
 	definition_plan = graph_definition_plan_for_modules(module, prepared_imports)
 	ctfe_dependencies = prepare_ctfe_dependencies(
-		ctfe_dependencies_for_artifact(module, prepared_imports),
-		importable_modules,
+		append_ctfe_dependencies_for_artifact(
+			{
+				visited_paths = [],
+				dependencies = []
+			},
+			module,
+			prepared_imports,
+		).dependencies,
+		importable_modules_with_artifact(importable_modules, module),
 		allow_debug_only_calls,
 		definition_plan,
 	)
@@ -1241,7 +1288,7 @@ private pure func typechecked_graph_module(
 		module,
 		request.allow_debug_only_calls,
 		importable_modules_except_path(graph.importable_modules, module.request.module_path),
-		graph.ctfe_dependencies,
+		prepared_ctfe_dependencies_for_artifact(module, graph.modules, graph.ctfe_dependencies),
 		graph.definition_plan,
 	)
 
@@ -1254,13 +1301,14 @@ private pure func prepare_typecheck_graph(request: TypecheckGraphRequest) -> Pre
 	definition_plan = graph_definition_plan_for_modules(target, modules)
 	ctfe_dependencies = prepare_ctfe_dependencies(
 		ctfe_dependencies_for_graph(target, modules, selected_modules),
-		importable_modules,
+		importable_modules_with_artifact(importable_modules, target),
 		request.allow_debug_only_calls,
 		definition_plan,
 	)
 
 	{
 		target = target,
+		modules = modules,
 		selected_modules = selected_modules,
 		importable_modules = importable_modules,
 		ctfe_dependencies = ctfe_dependencies,

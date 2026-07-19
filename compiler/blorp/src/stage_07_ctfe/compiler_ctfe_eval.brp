@@ -10,7 +10,10 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedUnaryOp,
-	../stage_05_types/compiler_type: CompilerType
+	../stage_05_types/compiler_type:
+		CompilerType,
+		compiler_array_type,
+		compiler_array_type_parts,
 	../stage_06_typecheck/compiler_infer: CompilerTypedExpr, CompilerTypedLambdaParam
 	compiler_ctfe_context:
 		CompilerCtfeContext,
@@ -32,8 +35,12 @@ import:
 		compiler_ctfe_project_existing_bindings,
 	compiler_ctfe_intrinsic:
 		CompilerCtfeBuiltinIntrinsic(
+			CompilerCtfeFromCharIntrinsic,
+			CompilerCtfeFromCharsIntrinsic,
+			CompilerCtfeTensorFillIntrinsic,
 			CompilerCtfeToFloat16Intrinsic,
 			CompilerCtfeToFloat32Intrinsic,
+			CompilerCtfeToStringIntrinsic,
 		),
 		CompilerCtfeDictIntrinsic(
 			CompilerCtfeDictContains,
@@ -45,8 +52,10 @@ import:
 			CompilerCtfeDictSet,
 		),
 		CompilerCtfeImportedIntrinsic(
+			CompilerCtfeImportedBuiltinIntrinsic,
 			CompilerCtfeImportedDictIntrinsic,
 			CompilerCtfeImportedListIntrinsic,
+			CompilerCtfeImportedMatrixIntrinsic,
 			CompilerCtfeImportedOptionIntrinsic,
 			CompilerCtfeImportedResultIntrinsic,
 			CompilerCtfeImportedStringIntrinsic,
@@ -71,6 +80,10 @@ import:
 			CompilerCtfeListMapIndexed,
 			CompilerCtfeListSet,
 		),
+		CompilerCtfeMatrixIntrinsic(
+			CompilerCtfeMatrixColumnCount,
+			CompilerCtfeMatrixRowCount,
+		),
 		CompilerCtfeOptionIntrinsic(
 			CompilerCtfeOptionAndThen,
 			CompilerCtfeOptionFilter,
@@ -91,8 +104,13 @@ import:
 			CompilerCtfeResultMapErr,
 		),
 		CompilerCtfeStringIntrinsic(
+			CompilerCtfeStringChars,
+			CompilerCtfeStringCount,
 			CompilerCtfeStringContains,
+			CompilerCtfeStringDropLeft,
 			CompilerCtfeStringEndsWith,
+			CompilerCtfeStringFromChar,
+			CompilerCtfeStringFromChars,
 			CompilerCtfeStringGet,
 			CompilerCtfeStringGetOr,
 			CompilerCtfeStringIndexOf,
@@ -101,10 +119,14 @@ import:
 			CompilerCtfeStringRawIndexOf,
 			CompilerCtfeStringRepeat,
 			CompilerCtfeStringReplace,
+			CompilerCtfeStringReverse,
 			CompilerCtfeStringSplit,
 			CompilerCtfeStringStartsWith,
 			CompilerCtfeStringSubstring,
+			CompilerCtfeStringTakeLeft,
 			CompilerCtfeStringTrim,
+			CompilerCtfeStringTrimLeft,
+			CompilerCtfeStringTrimRight,
 			CompilerCtfeStringUpper,
 		),
 		compiler_ctfe_imported_intrinsic,
@@ -129,6 +151,7 @@ import:
 			CompilerCtfeIrConstructorCall,
 			CompilerCtfeIrImpureCall,
 			CompilerCtfeIrImportedCall,
+			CompilerCtfeIrIntrinsicCall,
 			CompilerCtfeIrLocalCall,
 			CompilerCtfeIrUnresolvedCall,
 			CompilerCtfeIrUnsupportedCall,
@@ -211,6 +234,7 @@ import:
 			CompilerCtfeListValue,
 			CompilerCtfeRangeValue,
 			CompilerCtfeRecordValue,
+			CompilerCtfeStringValue,
 			CompilerCtfeTupleValue,
 			CompilerCtfeVectorValue,
 			CompilerCtfeVoidValue,
@@ -2193,6 +2217,26 @@ private pure func compiler_ctfe_eval_imported_result_intrinsic(
 							error_value,
 						),
 					)
+		(CompilerCtfeResultFromOption, [receiver, error_value]):
+			state ?= compiler_ctfe_eval_option_state_result(compiler_ctfe_option_state(receiver))
+
+			match state:
+				CompilerCtfeOptionSome(value):
+					Ok(
+						compiler_ctfe_result_ok_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							value,
+						),
+					)
+				CompilerCtfeOptionNone:
+					Ok(
+						compiler_ctfe_result_err_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							error_value,
+						),
+					)
 		(CompilerCtfeResultGetOr, [receiver, default_value]):
 			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
 
@@ -2278,8 +2322,48 @@ private pure func compiler_ctfe_eval_imported_result_intrinsic(
 							mapped,
 						),
 					)
+		(CompilerCtfeResultToOption, [receiver]):
+			state ?= compiler_ctfe_eval_result_state_result(compiler_ctfe_result_state(receiver))
+
+			match state:
+				CompilerCtfeResultOk(value):
+					Ok(
+						compiler_ctfe_option_some_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+							value,
+						),
+					)
+				CompilerCtfeResultErr(_):
+					Ok(
+						compiler_ctfe_option_none_value(
+							compiler_ctfe_ir_eval_type(expr),
+							compiler_ctfe_ir_eval_span(expr),
+						),
+					)
 		_:
 			Err(CompilerCtfeEvalUnsupported("std/result compile-time intrinsic call"))
+
+
+private pure func compiler_ctfe_eval_chars(
+	values: List[CompilerCtfeValue],
+) -> Result[List[Char], CompilerCtfeEvalError]:
+	var chars: List[Char] = []
+	var failure: Option[CompilerCtfeEvalError] = None
+
+	for value in values:
+		match compiler_ctfe_eval_char_result(compiler_ctfe_expect_char(value)):
+			Ok(char_value):
+				chars = chars.append(char_value)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(chars)
 
 
 private pure func compiler_ctfe_eval_imported_string_intrinsic(
@@ -2288,10 +2372,66 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 	arg_values: List[CompilerCtfeValue],
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
 	match (op, arg_values):
+		(CompilerCtfeStringChars, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			values = receiver_text
+				.chars()
+				.map(pure func(value): compiler_ctfe_char(compiler_ctfe_ir_eval_span(expr), value))
+			Ok(
+				compiler_ctfe_value(
+					compiler_ctfe_ir_eval_type(expr),
+					CompilerCtfeListValue(values),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+		(CompilerCtfeStringCount, [receiver, needle_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			needle ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(needle_value))
+			var occurrences: Int = 0
+			var index: Int = 0
+
+			if needle.length() > 0:
+				while index + needle.length() <= receiver_text.length():
+					if receiver_text.substring(index, needle.length()) == needle:
+						occurrences += 1
+						index += needle.length()
+					else:
+						index += 1
+
+			Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), occurrences))
 		(CompilerCtfeStringContains, [receiver, needle_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			needle ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(needle_value))
 			Ok(compiler_ctfe_bool(compiler_ctfe_ir_eval_span(expr), receiver_text.contains(needle)))
+		(CompilerCtfeStringDropLeft, [receiver, count_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
+			start = if count < 0:
+				0
+			else:
+				count
+			remaining = if start >= receiver_text.length():
+				""
+			else:
+				receiver_text.substring(start, receiver_text.length() - start)
+
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), remaining))
+		(CompilerCtfeStringTakeLeft, [receiver, count_value]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
+			prefix_length = if count < 0:
+				0
+			else if count > receiver_text.length():
+				receiver_text.length()
+			else:
+				count
+
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.substring(0, prefix_length),
+				),
+			)
 		(CompilerCtfeStringEndsWith, [receiver, suffix_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			suffix ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(suffix_value))
@@ -2299,6 +2439,24 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 				compiler_ctfe_bool(
 					compiler_ctfe_ir_eval_span(expr),
 					receiver_text.ends_with(suffix),
+				),
+			)
+		(CompilerCtfeStringFromChar, [char_value]):
+			value ?= compiler_ctfe_eval_char_result(compiler_ctfe_expect_char(char_value))
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					StringOps.from_char(value),
+				),
+			)
+		(CompilerCtfeStringFromChars, [chars_value]):
+			values ?= compiler_ctfe_eval_expect_list(chars_value)
+			chars ?= compiler_ctfe_eval_chars(values)
+
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					StringOps.from_chars(chars),
 				),
 			)
 		(CompilerCtfeStringGet, [receiver, index_value]):
@@ -2361,6 +2519,14 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 					receiver_text.replace(old, new_text),
 				),
 			)
+		(CompilerCtfeStringReverse, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			Ok(
+				compiler_ctfe_string(
+					compiler_ctfe_ir_eval_span(expr),
+					receiver_text.reverse(),
+				),
+			)
 		(CompilerCtfeStringSplit, [receiver, delimiter_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			delimiter ?= compiler_ctfe_eval_string_result(
@@ -2401,6 +2567,12 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 		(CompilerCtfeStringTrim, [receiver]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.trim()))
+		(CompilerCtfeStringTrimLeft, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.trim_left()))
+		(CompilerCtfeStringTrimRight, [receiver]):
+			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.trim_right()))
 		(CompilerCtfeStringUpper, [receiver]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 
@@ -2416,6 +2588,54 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 			Err(CompilerCtfeEvalUnsupported("std/string compile-time intrinsic call"))
 
 
+private pure func compiler_ctfe_value_length(value: CompilerCtfeValue) -> Option[Int]:
+	match value.desc:
+		CompilerCtfeVectorValue(values):
+			Some(values.length())
+		CompilerCtfeListValue(values):
+			Some(values.length())
+		CompilerCtfeStringValue(text):
+			Some(text.length())
+		CompilerCtfeDictValue(entries):
+			Some(entries.length())
+		_:
+			None
+
+
+private pure func compiler_ctfe_eval_imported_matrix_intrinsic(
+	expr: CompilerCtfeIrExpr,
+	op: CompilerCtfeMatrixIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match (op, arg_values):
+		(CompilerCtfeMatrixRowCount, [matrix_value]):
+			match compiler_ctfe_value_length(matrix_value):
+				Some(length):
+					Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), length))
+				None:
+					Err(CompilerCtfeEvalUnsupported("matrix row_count on non-tensor value"))
+		(CompilerCtfeMatrixColumnCount, [matrix_value]):
+			match matrix_value.desc:
+				CompilerCtfeVectorValue(rows):
+					match rows.get(0):
+						Some(row):
+							match compiler_ctfe_value_length(row):
+								Some(length):
+									Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), length))
+								None:
+									Err(
+										CompilerCtfeEvalUnsupported(
+											"matrix column_count on malformed tensor value",
+										),
+									)
+						None:
+							Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), 0))
+				_:
+					Err(CompilerCtfeEvalUnsupported("matrix column_count on non-tensor value"))
+		_:
+			Err(CompilerCtfeEvalUnsupported("matrix shape intrinsic with invalid arguments"))
+
+
 private pure func compiler_ctfe_eval_imported_intrinsic(
 	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
@@ -2424,10 +2644,14 @@ private pure func compiler_ctfe_eval_imported_intrinsic(
 	arg_values: List[CompilerCtfeValue],
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
 	match intrinsic:
+		CompilerCtfeImportedBuiltinIntrinsic(op):
+			compiler_ctfe_eval_builtin_intrinsic(expr, op, arg_values)
 		CompilerCtfeImportedDictIntrinsic(op):
 			compiler_ctfe_eval_imported_dict_intrinsic(expr, op, arg_values)
 		CompilerCtfeImportedListIntrinsic(op):
 			compiler_ctfe_eval_imported_list_intrinsic(context, env, expr, op, arg_values)
+		CompilerCtfeImportedMatrixIntrinsic(op):
+			compiler_ctfe_eval_imported_matrix_intrinsic(expr, op, arg_values)
 		CompilerCtfeImportedOptionIntrinsic(op):
 			compiler_ctfe_eval_imported_option_intrinsic(context, env, expr, op, arg_values)
 		CompilerCtfeImportedResultIntrinsic(op):
@@ -2458,6 +2682,8 @@ private pure func compiler_ctfe_eval_sized_float_conversion(
 							to_float(to_float16(raw))
 						CompilerCtfeToFloat32Intrinsic:
 							to_float(to_float32(raw))
+						_:
+							raw
 
 					Ok(
 						compiler_ctfe_value(
@@ -2476,6 +2702,260 @@ private pure func compiler_ctfe_eval_sized_float_conversion(
 			Err(CompilerCtfeEvalUnsupported("sized float conversion with invalid argument count"))
 
 
+private pure func compiler_ctfe_dims_after_first(
+	dims: List[CompilerType],
+) -> List[CompilerType]:
+	var result: List[CompilerType] = []
+	var index: Int = 1
+
+	while index < dims.length():
+		match dims.get(index):
+			Some(dim):
+				result = result.append(dim)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+private pure func compiler_ctfe_tensor_child_type(typ: CompilerType) -> CompilerType:
+	match compiler_array_type_parts(typ):
+		Some((element_type, dims)):
+			compiler_array_type(element_type, compiler_ctfe_dims_after_first(dims))
+		None:
+			typ
+
+
+private pure func compiler_ctfe_eval_tensor_fill_at(
+	expr: CompilerCtfeIrExpr,
+	fill_value: CompilerCtfeValue,
+	dimensions: List[CompilerCtfeValue],
+	dimension_index: Int,
+	result_type: CompilerType,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	if dimension_index >= dimensions.length():
+		Ok({ fill_value | typ = result_type, span = compiler_ctfe_ir_eval_span(expr) })
+	else:
+		dimension_value ?= match dimensions.get(dimension_index):
+			Some(value):
+				Ok(value)
+			None:
+				Err(CompilerCtfeEvalUnsupported("tensor constructor dimension is missing"))
+		size ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(dimension_value))
+
+		if size < 0:
+			Err(CompilerCtfeEvalInvalid("compile-time tensor dimensions cannot be negative"))
+		else:
+			child ?= compiler_ctfe_eval_tensor_fill_at(
+				expr,
+				fill_value,
+				dimensions,
+				dimension_index + 1,
+				compiler_ctfe_tensor_child_type(result_type),
+			)
+			var values: List[CompilerCtfeValue] = []
+			var index: Int = 0
+
+			while index < size:
+				values = values.append(child)
+				index += 1
+
+			Ok(
+				compiler_ctfe_value(
+					result_type,
+					CompilerCtfeVectorValue(values),
+					compiler_ctfe_ir_eval_span(expr),
+				),
+			)
+
+
+private pure func compiler_ctfe_values_after_first(
+	values: List[CompilerCtfeValue],
+) -> List[CompilerCtfeValue]:
+	var result: List[CompilerCtfeValue] = []
+	var index: Int = 1
+
+	while index < values.length():
+		match values.get(index):
+			Some(value):
+				result = result.append(value)
+			None:
+				void
+
+		index += 1
+
+	result
+
+
+private pure func compiler_ctfe_eval_tensor_fill(
+	expr: CompilerCtfeIrExpr,
+	rank: Int,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	if arg_values.length() != rank + 1:
+		Err(CompilerCtfeEvalUnsupported("tensor constructor with invalid argument count"))
+	else:
+		match arg_values.get(0):
+			Some(fill_value):
+				compiler_ctfe_eval_tensor_fill_at(
+					expr,
+					fill_value,
+					compiler_ctfe_values_after_first(arg_values),
+					0,
+					compiler_ctfe_ir_eval_type(expr),
+				)
+			None:
+				Err(CompilerCtfeEvalUnsupported("tensor constructor without a fill value"))
+
+
+private pure func compiler_ctfe_eval_builtin_intrinsic(
+	expr: CompilerCtfeIrExpr,
+	intrinsic: CompilerCtfeBuiltinIntrinsic,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	match intrinsic:
+		CompilerCtfeToFloat16Intrinsic:
+			compiler_ctfe_eval_sized_float_conversion(expr, intrinsic, arg_values)
+		CompilerCtfeToFloat32Intrinsic:
+			compiler_ctfe_eval_sized_float_conversion(expr, intrinsic, arg_values)
+		CompilerCtfeFromCharIntrinsic:
+			match arg_values:
+				[char_value]:
+					value ?= compiler_ctfe_eval_char_result(compiler_ctfe_expect_char(char_value))
+					Ok(
+						compiler_ctfe_string(
+							compiler_ctfe_ir_eval_span(expr),
+							StringOps.from_char(value),
+						),
+					)
+				_:
+					Err(CompilerCtfeEvalUnsupported("from_char with invalid argument count"))
+		CompilerCtfeFromCharsIntrinsic:
+			match arg_values:
+				[chars_value]:
+					values ?= compiler_ctfe_eval_expect_list(chars_value)
+					chars ?= compiler_ctfe_eval_chars(values)
+					Ok(
+						compiler_ctfe_string(
+							compiler_ctfe_ir_eval_span(expr),
+							StringOps.from_chars(chars),
+						),
+					)
+				_:
+					Err(CompilerCtfeEvalUnsupported("from_chars with invalid argument count"))
+		CompilerCtfeLengthIntrinsic:
+			match arg_values:
+				[receiver]:
+					match compiler_ctfe_value_length(receiver):
+						Some(value):
+							Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), value))
+						None:
+							Err(
+								CompilerCtfeEvalUnsupported(
+									"length on unsupported compile-time value",
+								),
+							)
+				_:
+					Err(CompilerCtfeEvalUnsupported("length with invalid argument count"))
+		CompilerCtfeTensorFillIntrinsic(rank):
+			compiler_ctfe_eval_tensor_fill(expr, rank, arg_values)
+		CompilerCtfeToStringIntrinsic:
+			match arg_values:
+				[value]:
+					text ?= compiler_ctfe_eval_string_result(compiler_ctfe_string_text_of_value(value))
+					Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
+				_:
+					Err(CompilerCtfeEvalUnsupported("to_string with invalid argument count"))
+
+
+private pure func compiler_ctfe_is_checked_get_intrinsic(name: String) -> Bool:
+	match name:
+		"checked_get":
+			True
+		"matrix_checked_get":
+			True
+		"tensor3_checked_get":
+			True
+		"tensor4_checked_get":
+			True
+		"tensor5_checked_get":
+			True
+		"tensor_peel":
+			True
+		_:
+			False
+
+
+private pure func compiler_ctfe_eval_vector_indices(
+	expr: CompilerCtfeIrExpr,
+	value: CompilerCtfeValue,
+	arg_values: List[CompilerCtfeValue],
+	arg_index: Int,
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	if arg_index >= arg_values.length():
+		Ok(compiler_ctfe_eval_return_value(expr, value))
+	else:
+		index_value ?= match arg_values.get(arg_index):
+			Some(arg):
+				compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(arg))
+			None:
+				Err(CompilerCtfeEvalUnsupported("checked tensor read with missing index"))
+
+		match value.desc:
+			CompilerCtfeVectorValue(values):
+				normalized_index = if index_value < 0:
+					values.length() + index_value
+				else:
+					index_value
+
+				match values.get(normalized_index):
+					Some(selected):
+						compiler_ctfe_eval_vector_indices(
+							expr,
+							selected,
+							arg_values,
+							arg_index + 1,
+						)
+					None:
+						Err(CompilerCtfeEvalInvalid("compile-time tensor index is out of bounds"))
+			_:
+				Err(CompilerCtfeEvalUnsupported("checked tensor read on a non-tensor value"))
+
+
+private pure func compiler_ctfe_eval_intrinsic_call(
+	expr: CompilerCtfeIrExpr,
+	name: String,
+	arg_values: List[CompilerCtfeValue],
+) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
+	if compiler_ctfe_is_checked_get_intrinsic(name):
+		match arg_values.get(0):
+			Some(receiver):
+				compiler_ctfe_eval_vector_indices(expr, receiver, arg_values, 1)
+			None:
+				Err(CompilerCtfeEvalUnsupported("checked tensor read without a receiver"))
+	else if name == "length" or name == "vector_length":
+		match arg_values:
+			[receiver]:
+				match compiler_ctfe_value_length(receiver):
+					Some(value):
+						Ok(compiler_ctfe_int(compiler_ctfe_ir_eval_span(expr), value))
+					None:
+						Err(CompilerCtfeEvalUnsupported("length on unsupported compile-time value"))
+			_:
+				Err(CompilerCtfeEvalUnsupported("length with invalid argument count"))
+	else if name == "to_string":
+		match arg_values:
+			[value]:
+				text ?= compiler_ctfe_eval_string_result(compiler_ctfe_string_text_of_value(value))
+				Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
+			_:
+				Err(CompilerCtfeEvalUnsupported("to_string with invalid argument count"))
+	else:
+		Err(CompilerCtfeEvalUnsupported("intrinsic function call '" + name + "'"))
+
+
 private pure func compiler_ctfe_eval_call(
 	context: CompilerCtfeContext,
 	env: CompilerCtfeEnv,
@@ -2488,19 +2968,17 @@ private pure func compiler_ctfe_eval_call(
 		CompilerCtfeIrClosureCall:
 			callee_value ?= compiler_ctfe_eval_ir_in_context(context, env, call.callee)
 			arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
-
-			match callee_value.desc:
-				CompilerCtfeLambdaValue(closure):
-					compiler_ctfe_eval_lambda_call(context, closure, arg_values)
-				_:
-					Err(CompilerCtfeEvalUnsupported("closure calls on non-lambda values"))
+			compiler_ctfe_eval_callback_call(context, env, callee_value, arg_values)
 		CompilerCtfeIrImpureCall:
 			Err(CompilerCtfeEvalUnsupported("impure function calls"))
+		CompilerCtfeIrIntrinsicCall(name):
+			arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
+			compiler_ctfe_eval_intrinsic_call(expr, name, arg_values)
 		CompilerCtfeIrUnsupportedCall(form):
 			Err(CompilerCtfeEvalUnsupported(form))
 		CompilerCtfeIrBuiltinCall(_, intrinsic):
 			arg_values ?= compiler_ctfe_eval_exprs(context, env, call.args)
-			compiler_ctfe_eval_sized_float_conversion(expr, intrinsic, arg_values)
+			compiler_ctfe_eval_builtin_intrinsic(expr, intrinsic, arg_values)
 		CompilerCtfeIrLocalCall(direct):
 			if not direct.is_pure:
 				Err(CompilerCtfeEvalUnsupported("impure function calls"))

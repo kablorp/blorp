@@ -14,6 +14,7 @@
 #include <setjmp.h>
 #include <assert.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
@@ -6586,6 +6587,38 @@ blorp_String* blorp_uint128_to_string(unsigned __int128 v) {
 blorp_String* blorp_float_to_string(double f) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", f);
+
+    if (isfinite(f)) {
+        uint64_t original_bits = 0;
+        memcpy(&original_bits, &f, sizeof(original_bits));
+        bool exact = false;
+
+        if (len > 0 && len < (int)sizeof(buf)) {
+            char* end = NULL;
+            double parsed = strtod(buf, &end);
+            uint64_t parsed_bits = 0;
+            memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
+            exact = end == buf + len && original_bits == parsed_bits;
+        }
+
+        /* Preserve the established, human-readable %g form whenever it is
+           already exact. Otherwise increase significant digits until the
+           decimal text round-trips to the same IEEE double. */
+        if (!exact) {
+            for (int precision = 7; precision <= DBL_DECIMAL_DIG; precision++) {
+                len = snprintf(buf, sizeof(buf), "%.*g", precision, f);
+                if (len <= 0 || len >= (int)sizeof(buf)) continue;
+
+                char* end = NULL;
+                double parsed = strtod(buf, &end);
+                uint64_t parsed_bits = 0;
+                memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
+
+                if (end == buf + len && original_bits == parsed_bits) break;
+            }
+        }
+    }
+
     if (len < 0) len = 0;
     return blorp_string_from_buf(buf, len);
 }
@@ -8522,8 +8555,14 @@ void blorp_vector_set(blorp_Vector* arr, long index, void* value) {
 // Returns a borrowed raw void* from data[index]. The compiler's ownership
 // contract for checked_get is ReturnAliasOfArg(0), so any longer-lived local
 // binding must retain explicitly in generated code.
+static inline long blorp_normalize_index(long index, long length) {
+    return index < 0 ? length + index : index;
+}
+
 void* blorp_checked_get(blorp_Vector* arr, long index) {
-    if (!arr || index < 0 || index >= arr->len) return 0;
+    if (!arr) return 0;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return 0;
     if (blorp_vector_is_i64_raw(arr)) {
         return (void*)(intptr_t)((long*)arr->data)[index];
     }
@@ -8541,12 +8580,16 @@ void* blorp_checked_get(blorp_Vector* arr, long index) {
 }
 
 double blorp_checked_get_f64(blorp_Vector* arr, long index) {
-    if (!arr || index < 0 || index >= arr->len) return 0.0;
+    if (!arr) return 0.0;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return 0.0;
     return blorp_vector_read_f64(arr, index);
 }
 
 float blorp_checked_get_f32(blorp_Vector* arr, long index) {
-    if (!arr || index < 0 || index >= arr->len) return 0.0f;
+    if (!arr) return 0.0f;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return 0.0f;
     return blorp_vector_read_f32(arr, index);
 }
 
@@ -8557,7 +8600,7 @@ blorp_Vector* blorp_vector_set_inplace(blorp_Vector* arr, long index, void* valu
 // Returns the (possibly newly-allocated) vector. Handles inline-struct
 // storage, element retain/release for RC payloads, and COW on shared input.
 blorp_Vector* blorp_checked_set(blorp_Vector* arr, long index, void* value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
     return blorp_vector_set_inplace(arr, index, value);
 }
 
@@ -8613,8 +8656,11 @@ blorp_Vector* blorp_checked_slice(blorp_Vector* arr, long start, long end_idx) {
 
 // N-D checked get — flat index into capacity-sized data array
 void* blorp_matrix_checked_get(blorp_Vector* arr, long row, long col) {
-    if (!arr || row < 0 || col < 0) return 0;
+    if (!arr) return 0;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return 0;
     if (row >= arr->len || col >= cols) return 0;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return 0;
@@ -8635,8 +8681,11 @@ void* blorp_matrix_checked_get(blorp_Vector* arr, long row, long col) {
 }
 
 double blorp_matrix_checked_get_f64(blorp_Vector* arr, long row, long col) {
-    if (!arr || row < 0 || col < 0) return 0.0;
+    if (!arr) return 0.0;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return 0.0;
     if (row >= arr->len || col >= cols) return 0.0;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return 0.0;
@@ -8644,8 +8693,11 @@ double blorp_matrix_checked_get_f64(blorp_Vector* arr, long row, long col) {
 }
 
 float blorp_matrix_checked_get_f32(blorp_Vector* arr, long row, long col) {
-    if (!arr || row < 0 || col < 0) return 0.0f;
+    if (!arr) return 0.0f;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return 0.0f;
     if (row >= arr->len || col >= cols) return 0.0f;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return 0.0f;
@@ -8665,8 +8717,9 @@ static bool blorp_tensor_checked_flat_index(
     long total = 1;
     for (long axis = 0; axis < rank; axis++) {
         long dim = dims[axis];
-        long index = indices[axis];
-        if (dim <= 0 || index < 0 || index >= dim) return false;
+        if (dim <= 0) return false;
+        long index = blorp_normalize_index(indices[axis], dim);
+        if (index < 0 || index >= dim) return false;
         if (axis == 0 && index >= arr->len) return false;
         if (idx > (LONG_MAX - index) / dim) return false;
         idx = idx * dim + index;
@@ -8862,8 +8915,11 @@ float blorp_tensor5_checked_get_shape_f32(
 // for RC payloads. Uses row-major flat indexing; cols derived from
 // capacity/rows (len==rows for 2D).
 blorp_Vector* blorp_matrix_checked_set(blorp_Vector* arr, long row, long col, void* value) {
-    if (!arr || row < 0 || col < 0) return arr;
+    if (!arr) return arr;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return arr;
     if (row >= arr->len || col >= cols) return arr;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return arr;
@@ -8885,18 +8941,21 @@ blorp_Vector* blorp_matrix_checked_set(blorp_Vector* arr, long row, long col, vo
         blorp_release_cow_input_if_copied(arr, result);
         return result;
     }
+    if (result->elem_release && value) blorp_retain(value);
     if (result->elem_release && result->data[idx]) {
         result->elem_release(result->data[idx]);
     }
     result->data[idx] = value;
-    if (result->elem_release && value) blorp_retain(value);
     blorp_release_cow_input_if_copied(arr, result);
     return result;
 }
 
 blorp_Vector* blorp_matrix_checked_set_f64(blorp_Vector* arr, long row, long col, double value) {
-    if (!arr || row < 0 || col < 0) return arr;
+    if (!arr) return arr;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return arr;
     if (row >= arr->len || col >= cols) return arr;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return arr;
@@ -8907,8 +8966,11 @@ blorp_Vector* blorp_matrix_checked_set_f64(blorp_Vector* arr, long row, long col
 }
 
 blorp_Vector* blorp_matrix_checked_set_f32(blorp_Vector* arr, long row, long col, float value) {
-    if (!arr || row < 0 || col < 0) return arr;
+    if (!arr) return arr;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return arr;
     if (row >= arr->len || col >= cols) return arr;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return arr;
@@ -8919,8 +8981,11 @@ blorp_Vector* blorp_matrix_checked_set_f32(blorp_Vector* arr, long row, long col
 }
 
 blorp_Vector* blorp_matrix_checked_set_i64(blorp_Vector* arr, long row, long col, long value) {
-    if (!arr || row < 0 || col < 0) return arr;
+    if (!arr) return arr;
     long cols = arr->len > 0 ? arr->capacity / arr->len : 0;
+    row = blorp_normalize_index(row, arr->len);
+    col = blorp_normalize_index(col, cols);
+    if (row < 0 || col < 0) return arr;
     if (row >= arr->len || col >= cols) return arr;
     long idx = row * cols + col;
     if (idx < 0 || idx >= arr->capacity) return arr;
@@ -9021,7 +9086,9 @@ blorp_Vector* blorp_vector_cow_unique(blorp_Vector* arr) {
 // On out-of-bounds: returns arr unchanged. On success: consumes arr by
 // modifying in-place when unique, otherwise COW-copying and releasing arr.
 blorp_Vector* blorp_vector_set_inplace(blorp_Vector* arr, long index, void* value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return arr;
     blorp_Vector* result = blorp_is_unique(arr) ? arr : blorp_vector_copy(arr);
     if (blorp_vector_is_i64_raw(result)) {
         ((long*)result->data)[index] = (long)(intptr_t)value;
@@ -9041,19 +9108,21 @@ blorp_Vector* blorp_vector_set_inplace(blorp_Vector* arr, long index, void* valu
         blorp_release_cow_input_if_copied(arr, result);
         return result;
     }
+    if (result->elem_release && value) {
+        blorp_retain(value);
+    }
     if (result->elem_release && result->data[index]) {
         result->elem_release(result->data[index]);
     }
     result->data[index] = value;
-    if (result->elem_release && value) {
-        blorp_retain(value);
-    }
     blorp_release_cow_input_if_copied(arr, result);
     return result;
 }
 
 blorp_Vector* blorp_vector_set_inplace_i64(blorp_Vector* arr, long index, long value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return arr;
     blorp_Vector* result = blorp_is_unique(arr) ? arr : blorp_vector_copy(arr);
     blorp_vector_write_i64(result, index, value);
     blorp_release_cow_input_if_copied(arr, result);
@@ -9062,7 +9131,9 @@ blorp_Vector* blorp_vector_set_inplace_i64(blorp_Vector* arr, long index, long v
 
 // Float32 packed variant of set_inplace.
 blorp_Vector* blorp_vector_set_inplace_f32(blorp_Vector* arr, long index, float value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return arr;
     blorp_Vector* result = blorp_is_unique(arr) ? arr : blorp_vector_copy(arr);
     blorp_vector_write_f32(result, index, value);
     blorp_release_cow_input_if_copied(arr, result);
@@ -9071,7 +9142,9 @@ blorp_Vector* blorp_vector_set_inplace_f32(blorp_Vector* arr, long index, float 
 
 // Float64 packed variant of set_inplace (stores double via memcpy in void* slots).
 blorp_Vector* blorp_vector_set_inplace_f64(blorp_Vector* arr, long index, double value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return arr;
     blorp_Vector* result = blorp_is_unique(arr) ? arr : blorp_vector_copy(arr);
     blorp_vector_write_f64(result, index, value);
     blorp_release_cow_input_if_copied(arr, result);
@@ -9080,7 +9153,9 @@ blorp_Vector* blorp_vector_set_inplace_f64(blorp_Vector* arr, long index, double
 
 // Float16 packed variant of set_inplace.
 blorp_Vector* blorp_vector_set_inplace_f16(blorp_Vector* arr, long index, _Float16 value) {
-    if (!arr || index < 0 || index >= arr->len) return arr;
+    if (!arr) return arr;
+    index = blorp_normalize_index(index, arr->len);
+    if (index < 0 || index >= arr->len) return arr;
     blorp_Vector* result = blorp_is_unique(arr) ? arr : blorp_vector_copy(arr);
     result->data[index] = blorp_box_float16(value);
     blorp_release_cow_input_if_copied(arr, result);
@@ -9110,13 +9185,13 @@ static blorp_Vector* blorp_vector_set_cow_result(blorp_Vector* arr, long index, 
                (char*)value + sizeof(blorp_Object),
                result->elem_size);
     } else {
+        if (result->elem_release && value) {
+            blorp_retain(value);
+        }
         if (result->elem_release && result->data[index]) {
             result->elem_release(result->data[index]);
         }
         result->data[index] = value;
-        if (result->elem_release && value) {
-            blorp_retain(value);
-        }
     }
     return result;
 }
@@ -9484,11 +9559,11 @@ static blorp_Vector* blorp_matrix_set_result(blorp_Vector* arr, long row, long c
         blorp_release_cow_input_if_copied(arr, result);
         return result;
     }
+    if (result->elem_release && val) blorp_retain(val);
     if (result->elem_release && result->data[offset]) {
         result->elem_release(result->data[offset]);
     }
     result->data[offset] = val;
-    if (result->elem_release && val) blorp_retain(val);
     blorp_release_cow_input_if_copied(arr, result);
     return result;
 }
@@ -10435,6 +10510,7 @@ blorp_Vector* blorp_vector_cross_float(blorp_Vector* a, blorp_Vector* b) {
 // result_first_dim: the len of the result (= row_size for 1D result, = next dim for N-D result)
 blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long row_size, long result_first_dim) {
     if (!tensor || row_size <= 0) return blorp_vector_new(0);
+    row_index = blorp_normalize_index(row_index, tensor->len);
     if (row_index < 0 || row_index >= tensor->len) return blorp_vector_new(0);
     long offset = row_index * row_size;
     if (offset + row_size > tensor->capacity) return blorp_vector_new(0);

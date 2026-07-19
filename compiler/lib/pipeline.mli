@@ -36,9 +36,6 @@ type phase_timing = {
     the current architectural boundaries without introducing another compiler
     pipeline or changing ownership. *)
 
-val phase_timing_name : phase_timing_phase -> string
-(** Stable machine-readable name for timing output. *)
-
 (** Source compilation outcome. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
     pipeline via [Core_pipeline.Stopped_after]. The pipeline boundary converts

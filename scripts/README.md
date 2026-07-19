@@ -63,9 +63,11 @@ resource scheduler would be harder to reason about than the tests it runs. Use
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
-- `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
+- `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
+  grouped compiler-owned Blorp suites default to 60 seconds; individual
+  compiler fixtures and codegen audits default to 30 seconds.
 - `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
-  timeout (default 60 seconds, reflecting measured ASan overhead).
+  timeout (default 180 seconds, reflecting measured ASan overhead).
 - In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.

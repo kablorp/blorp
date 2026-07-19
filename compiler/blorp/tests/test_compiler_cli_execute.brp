@@ -27,9 +27,12 @@ import:
 		graph_native_features,
 	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
 	../src/stage_12_cli/compiler_cli_plan:
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
 		CliFrontendModuleGraph,
 		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule, CliFrontendUserModule),
 		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
+	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
 	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
 	system: remove_file, temp_dir, write_file
 	test: TestSuite
@@ -59,7 +62,11 @@ pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
 
 
 pure func named_var(name: String) -> CoreVar:
-	{name = name, uniq = 0, def_id = None}
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
 
 
 pure func function_decl(
@@ -95,15 +102,13 @@ pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
 	}
 
 	{
-		decls = [
-			function_decl(
+		decls = [function_decl(
 				"read",
 				2,
 				[read_param],
 				int_type,
 				LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
-			),
-			function_decl(
+			), function_decl(
 				"main",
 				1,
 				[],
@@ -112,21 +117,20 @@ pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
 					desc,
 					True,
 					string_type,
-					LiteralExpr(
-						StringLiteral("description"),
-						string_type,
-						SyntheticSourceLoc,
-					),
+					LiteralExpr(StringLiteral("description"), string_type, SyntheticSourceLoc),
 					CallExpr(
 						UserCall("read", Some(2), []),
-						VarExpr(read, NamedType("Function", []), SyntheticSourceLoc),
+						VarExpr(
+							read,
+							NamedType("Function", []),
+							SyntheticSourceLoc,
+						),
 						[VarExpr(desc, string_type, SyntheticSourceLoc)],
 						int_type,
 						SyntheticSourceLoc,
 					),
 				),
-			),
-		],
+			)],
 		foreign_includes = []
 	}
 
@@ -162,6 +166,131 @@ func test_check_executes_without_host_plan() -> Bool:
 				)
 			_:
 				False
+
+
+func test_check_reports_imported_module_errors() -> Bool:
+	plan = run_cli([
+		"check",
+		"--no-format",
+		"tests/test_compiler/typecheck/should_fail/module_undefined_identifier.brp",
+	])
+
+	match plan:
+		CliRunCheck(check_plan):
+			result = execute_check_plan(check_plan)
+
+			result.status == 1 and result.stderr.contains("nonexistent_var")
+		_:
+			False
+
+
+pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bool:
+	first_root: CliFrontendGraphSource = {
+		path = "/project/first.brp",
+		module_name = "first",
+		source_text = "import:\n\tshared: broken\n\npure func first() -> Int: broken()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	second_root: CliFrontendGraphSource = {
+		path = "/project/second.brp",
+		module_name = "second",
+		source_text = "import:\n\tshared: broken\n\npure func second() -> Int: broken()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	dependency: CliFrontendGraphSource = {
+		path = "/project/shared.brp",
+		module_name = "shared",
+		source_text = "pure func broken() -> Int: missing_shared_value",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	first_edge: CliFrontendImportEdge = {
+		from_path = first_root.path,
+		from_module = first_root.module_name,
+		import_path = "shared",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	second_edge: CliFrontendImportEdge = {
+		from_path = second_root.path,
+		from_module = second_root.module_name,
+		import_path = "shared",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [first_root, second_root],
+		modules = [dependency],
+		import_edges = [first_edge, second_edge],
+		diagnostics = []
+	}
+	result = execute_check_plan({
+		args = [],
+		graph = graph,
+		options = {
+			debug = False,
+			dump_ast = False,
+			dump_typed_ast = False,
+			no_format = True,
+			std_dir = None,
+			paths = [first_root.path, second_root.path]
+		},
+	})
+
+	(
+		result.status == 1
+		and result.stdout.contains("Checking /project/first.brp")
+		and result.stdout.contains("Checking /project/second.brp")
+		and result.stderr.count("missing_shared_value") == 1
+	)
+
+
+pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
+	root: CliFrontendGraphSource = {
+		path = "/project/main.brp",
+		module_name = "main",
+		source_text = "import:\n\tdep: helper\n\nfunc main() -> Int: helper()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	dependency: CliFrontendGraphSource = {
+		path = "/project/dep.brp",
+		module_name = "dep",
+		source_text = "pure func helper() -> Int: 1",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	edge: CliFrontendImportEdge = {
+		from_path = root.path,
+		from_module = root.module_name,
+		import_path = "dep",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [root],
+		modules = [dependency],
+		import_edges = [edge],
+		diagnostics = []
+	}
+
+	typechecked = typecheck_frontend_root_only(graph, root, False)
+	typechecked.modules.length() == 0
 
 
 func test_compile_builds_one_typed_request_and_artifact() -> Bool:
@@ -315,6 +444,15 @@ tests: TestSuite = {
 	description = "Blorp CLI in-process execution",
 	tests = [
 		("check executes without host plan", test_check_executes_without_host_plan),
+		("check reports imported module errors", test_check_reports_imported_module_errors),
+		(
+			"check visits all roots and reports a shared dependency once",
+			test_check_visits_all_roots_and_reports_shared_dependency_once,
+		),
+		(
+			"check root only returns no dependency artifacts",
+			test_check_root_only_returns_no_dependency_artifacts,
+		),
 		(
 			"compile builds one typed request and artifact",
 			test_compile_builds_one_typed_request_and_artifact,
