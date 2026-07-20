@@ -1,8 +1,8 @@
 # Compiler Perceus Memory Dossier And Roadmap
 
-Status: active implementation plan; Slices 0-2 completed on 2026-07-19.
+Status: active implementation plan; Slices 0-3 completed as of 2026-07-20.
 
-Last checked against `dogfood-3` based on `a88a9484` on 2026-07-19.
+Last checked against `dogfood-3` based on `6f1c76e2` on 2026-07-20.
 
 This document records the primary cause of the current self-hosted compiler
 memory blow-up and defines the implementation sequence for correcting it. It is
@@ -756,7 +756,7 @@ normalization, exact result-alias hardening, and formatting:
 
 The broader affected gates above have been rerun for this mergeable checkpoint.
 
-### Slice 3: Precompute Global Declaration Facts Once
+### Slice 3: Precompute Global Declaration Facts Once (Complete)
 
 **Independent value:** removes repeated `global_name_count` scans and gives
 duplicate-name behavior one explicit construction boundary.
@@ -764,7 +764,9 @@ duplicate-name behavior one explicit construction boundary.
 At `PerceusEnv` construction, classify global names as unique or ambiguous and
 deduplicate repeated identical global identities according to one documented
 rule. Replace `global_name_is_unique` calls in body rewrites with indexed
-lookups. Do not change which references resolve.
+lookups. Preserve existing resolution behavior except for the explicit exact
+duplicate rule: repeated copies of one `(qualified name, def_id)` are one
+candidate rather than an ambiguity.
 
 Tests:
 
@@ -783,6 +785,70 @@ Required proof:
 
 This index may be moved to `compiler_core_resolve.brp` later, but this slice
 must use it immediately and must not expose a broad premature API.
+
+Implemented in `compiler_core_perceus.brp` with a private
+`GlobalNameResolution` index constructed alongside `global_values`. The index
+stores one canonical definition id for a resolvable qualified name and an
+explicit ambiguous state otherwise. The name is not duplicated in the value;
+it is already the dictionary key. Repeated declarations of the same exact
+qualified `(name, def_id)` identity remain one resolvable candidate; a second
+identity with the same qualified name makes the entry permanently ambiguous.
+Because the key is the qualified textual name and exact equality also requires
+the definition id, equal module-local ids under different qualified names
+remain independent. `global_name_count` and its repeated linear scans are
+deleted. A parallel `CoreVar` candidate list contains only the first
+declaration for each qualified name, so exact duplicate declarations do not
+trigger redundant whole-body rewrites; the index still vetoes that candidate
+if a later distinct identity makes the name ambiguous.
+
+Focused regressions cover unique resolution, distinct same-name ambiguity,
+exact duplicate deduplication, and equal ids under different qualified names.
+The focused Perceus suite passes 187 tests.
+
+Post-Slice 3 medians from five unsampled, interleaved runs on the same Apple M4
+host are shown below. Both baseline and changed renderer helpers were produced
+by the same freshly built compiler; this controls for unrelated generated-code
+size and speed differences that made earlier batches incomparable.
+
+| Globals | Slice 2 elapsed | Slice 3 elapsed | Slice 2 peak RSS | Slice 3 peak RSS |
+|---:|---:|---:|---:|---:|
+| 24 | 0.136s | 0.138s | 42,991,616 bytes | 42,876,928 bytes |
+| 384 | 0.179s | 0.178s | 47,382,528 bytes | 47,300,608 bytes |
+
+The one-time index is therefore effectively neutral on this already bounded
+fixture: about 1% slower at 24 globals and 0.6% faster at 384 globals, with
+peak RSS lower by less than 0.3% at both sizes. Its independent value is a
+clear `O(G)` declaration-classification boundary and removal of repeated
+`global_name_count` scans without a measurable memory penalty. The only
+resolution change is the documented exact-duplicate rule, which makes
+repeated copies of one identity behave as one declaration.
+
+Production `/usr/bin/time -l make` runs also completed successfully. An
+intermediate build took 341 seconds and reported a 17,778,098,176-byte maximum
+resident set size. The first exact-final rebuild reported only 7,912,521,728
+bytes, but a forced cold repeat with that newly produced compiler took 265
+seconds and reported 16,186,966,016 bytes. The repeat sampled its renderer at
+roughly 15 GB of RSS and reported no swaps. The 7.9 GB run is therefore
+treated as a cache/phase-state outlier; 16.19 GB is the conservative current
+cold-build peak.
+
+That compiler-sized peak remains far above the bounded Perceus fixture and is
+not claimed as a Slice 3 solution. Process sampling showed a large renderer
+helper followed by substantial host-side response handling, so the remaining
+whole-build pressure includes frontend and bridge ownership outside this
+slice's declaration-classification scope.
+
+Final Slice 3 verification:
+
+- focused Perceus suite: 187 passed, 0 failed;
+- focused Perceus ASan/UBSan run: 187 passed, 0 failed;
+- focused Core pipeline suite: 2 passed, 0 failed;
+- global record/union lifecycle runtime test: 1 passed, 0 failed;
+- string-literal lifecycle leak baseline: 404 allocations, 404 releases,
+  0 leaked bytes;
+- `make quality`: passed;
+- two production self-host builds from changed source: passed;
+- immediate follow-up `make`: passed and reported `Blorp CLI up to date`.
 
 ### Slice 4: Replace The Per-Global Resolver With One Core Walk
 

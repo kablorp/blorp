@@ -218,12 +218,19 @@ record PerceusGlobal {
 }
 
 
+private union GlobalNameResolution:
+	ResolvableGlobalName(Int)
+	AmbiguousGlobalName
+
+
 record PerceusEnv {
 	managed_type_names: List[String],
 	constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]],
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	global_values: List[PerceusGlobal],
+	global_resolution_candidates: List[CoreVar],
+	global_name_resolutions: Dict[String, GlobalNameResolution],
 	function_names: List[String],
 	constructor_names: List[String],
 	direct_user_call_contracts_by_name: Dict[String, List[Int]],
@@ -267,6 +274,8 @@ pure func empty_env() -> PerceusEnv:
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
 		global_values = [],
+		global_resolution_candidates = [],
+		global_name_resolutions = {},
 		function_names = [],
 		constructor_names = [],
 		direct_user_call_contracts_by_name = {},
@@ -489,6 +498,25 @@ private pure func lookup_direct_user_call_contract(
 			None
 
 
+private pure func record_global_name_resolution(
+	resolutions: Dict[String, GlobalNameResolution],
+	name: String,
+	definition_id: Int,
+) -> Dict[String, GlobalNameResolution]:
+	match resolutions.get(name):
+		None:
+			resolutions.set(name, ResolvableGlobalName(definition_id))
+		Some(ResolvableGlobalName(existing_definition_id)):
+			-- Repeated declarations of one exact identity do not make an
+			-- otherwise resolvable name ambiguous. Distinct identities do.
+			if existing_definition_id == definition_id:
+				resolutions
+			else:
+				resolutions.set(name, AmbiguousGlobalName)
+		Some(AmbiguousGlobalName):
+			resolutions
+
+
 pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var managed_type_names: List[String] = DEFAULT_MANAGED_TYPE_NAMES
 	var constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]] = {}
@@ -496,6 +524,8 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 	var global_values: List[PerceusGlobal] = []
+	var global_resolution_candidates: List[CoreVar] = []
+	var global_name_resolutions: Dict[String, GlobalNameResolution] = {}
 
 	for decl in program.decls:
 		match decl:
@@ -578,14 +608,32 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					None:
 						void
 			GlobalDecl(global):
-				global_values = global_values.append({
+				perceus_global: PerceusGlobal = {
 					value = {
 						name = { global.name | def_id = Some(global.def_id) },
 						typ = global.typ,
 						loc = global.loc
 					},
-					is_mutable = global.is_mutable,
-				})
+					is_mutable = global.is_mutable
+				}
+				global_values = global_values.append(perceus_global)
+
+				if (
+					global_name_resolutions
+						.get(global.name.name)
+						.is_none()
+				):
+					global_resolution_candidates = global_resolution_candidates.append(
+						perceus_global.value.name,
+					)
+				else:
+					void
+
+				global_name_resolutions = record_global_name_resolution(
+					global_name_resolutions,
+					global.name.name,
+					global.def_id,
+				)
 			_:
 				void
 
@@ -595,6 +643,8 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		global_values = global_values,
+		global_resolution_candidates = global_resolution_candidates,
+		global_name_resolutions = global_name_resolutions,
 		function_names = CoreClosure.capture_function_names(program),
 		constructor_names = CoreClosure.capture_constructor_names(program),
 		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
@@ -6012,20 +6062,12 @@ private pure func rename_shadow_var_refs(
 				))
 
 
-private pure func global_name_count(env: PerceusEnv, name: String) -> Int:
-	var count: Int = 0
-
-	for global in env.global_values:
-		if global.value.name.name == name:
-			count += 1
-		else:
-			void
-
-	count
-
-
-private pure func global_name_is_unique(env: PerceusEnv, name: String) -> Bool:
-	global_name_count(env, name) == 1
+private pure func global_name_is_resolvable(env: PerceusEnv, name: String) -> Bool:
+	match env.global_name_resolutions.get(name):
+		Some(ResolvableGlobalName(_)):
+			True
+		_:
+			False
 
 
 private pure func resolve_global_refs_in_expr(
@@ -6036,20 +6078,15 @@ private pure func resolve_global_refs_in_expr(
 	reference_names: List[String] = CoreDce.value_references(expr).names
 	var result: CoreExpr = expr
 
-	for global in env.global_values:
-		name: String = global.value.name.name
+	for candidate in env.global_resolution_candidates:
+		name: String = candidate.name
 
 		if (
 			reference_names.contains(name)
-			and global_name_is_unique(env, name)
+			and global_name_is_resolvable(env, name)
 			and not core_params_shadow(name, shadowing_values)
 		):
-			result = rename_shadow_var_refs(
-				RewriteUnresolvedMatchingVars,
-				name,
-				global.value.name,
-				result,
-			)
+			result = rename_shadow_var_refs(RewriteUnresolvedMatchingVars, name, candidate, result)
 		else:
 			void
 
