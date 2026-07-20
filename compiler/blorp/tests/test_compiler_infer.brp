@@ -85,7 +85,7 @@ import:
 		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm(ParsedPlainStringLiteral),
-		ParsedTypeExpr(ParsedDimLiteralType, ParsedNamedType, ParsedRangeType),
+		ParsedTypeExpr(ParsedDimLiteralType, ParsedFunctionType, ParsedNamedType, ParsedRangeType),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -120,12 +120,14 @@ import:
 		compiler_env_add_overload,
 		compiler_env_add_record,
 		compiler_env_add_type,
+		compiler_env_add_type_with_constructor_ids,
 		compiler_env_add_ufcs_method,
 		compiler_env_add_var_with_details,
 		compiler_env_add_var_with_module_details,
 		compiler_env_get_func_callable_id,
 		compiler_env_get_var_type,
 		compiler_env_mint_def_id,
+		compiler_env_push_scope,
 		compiler_env_set_type_param_bounds,
 		compiler_func_symbol,
 		compiler_impl_instance,
@@ -143,6 +145,7 @@ import:
 			CompilerRangeType,
 			CompilerTupleType,
 			CompilerTypeVar,
+			CompilerVarDimsType,
 		),
 		compiler_type_bool,
 		compiler_type_float,
@@ -165,13 +168,18 @@ import:
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
+		CompilerInferResult,
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
+			CompilerTypedBinaryExpr,
 			CompilerTypedBlockExpr,
 			CompilerTypedCallExpr,
 			CompilerTypedConcurrentBlockExpr,
+			CompilerTypedFieldAccessExpr,
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedForExpr,
+			CompilerTypedNameExpr,
+			CompilerTypedSubscriptExpr,
 			CompilerTypedWithExpr,
 		),
 		CompilerTypedExprInfo,
@@ -211,6 +219,7 @@ import:
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_empty,
 		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_register_imported_name,
 		compiler_typecheck_state_register_module_alias,
 	test: TestSuite
 
@@ -239,6 +248,14 @@ pure func lambda_param(name: String, type_expr: Option[ParsedTypeExpr]) -> Parse
 
 pure func named_type(name: String) -> ParsedTypeExpr:
 	ParsedNamedType(ident(name), [], source_span())
+
+
+pure func function_type(
+	is_pure: Bool,
+	params: List[ParsedTypeExpr],
+	return_type: ParsedTypeExpr,
+) -> ParsedTypeExpr:
+	ParsedFunctionType(is_pure, params, return_type, source_span())
 
 
 pure func range_type(bound: String) -> ParsedTypeExpr:
@@ -552,6 +569,21 @@ pure func state_with_add_one_func() -> CompilerTypecheckState:
 		) }
 
 
+pure func state_with_user_assert_shape_func() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	{ state | env = compiler_env_add_func(
+			state.env,
+			"assert_shape",
+			CompilerFunctionType(
+				True,
+				[compiler_type_int(), compiler_type_int()],
+				compiler_type_int(),
+			),
+			CompilerPure,
+			CompilerUserDefinedFunc,
+		) }
+
+
 pure func state_with_function_alias_value() -> CompilerTypecheckState:
 	state = compiler_typecheck_state_empty()
 	function_type: CompilerType = CompilerFunctionType(
@@ -777,6 +809,50 @@ pure func state_with_stream_source_binding_values() -> CompilerTypecheckState:
 			CompilerPure,
 			CompilerUserDefinedFunc,
 		) }
+
+
+pure func state_with_aliased_stream_binding() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_stream_alias = compiler_env_add_alias(
+		state.env,
+		"StreamAlias",
+		["T"],
+		compiler_type_stream(CompilerTypeVar("T")),
+	)
+	with_container_alias = compiler_env_add_alias(
+		with_stream_alias,
+		"MaybeAlias",
+		["T"],
+		compiler_type_option(CompilerTypeVar("T")),
+	)
+
+	add_infer_value(
+		{ state | env = with_container_alias },
+		"aliased_stream",
+		CompilerNamedType("MaybeAlias", [CompilerNamedType("StreamAlias", [compiler_type_int()])]),
+	)
+
+
+pure func state_with_cyclic_alias_binding() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_first_alias = compiler_env_add_alias(
+		state.env,
+		"FirstAlias",
+		[],
+		CompilerNamedType("SecondAlias", []),
+	)
+	with_cycle = compiler_env_add_alias(
+		with_first_alias,
+		"SecondAlias",
+		[],
+		CompilerNamedType("FirstAlias", []),
+	)
+
+	add_infer_value(
+		{ state | env = with_cycle },
+		"cycle_value",
+		CompilerNamedType("FirstAlias", []),
+	)
 
 
 pure func state_with_resource_and_impure_tick() -> CompilerTypecheckState:
@@ -1059,7 +1135,7 @@ pure func compiler_int_callback_type(is_pure: Bool) -> CompilerType:
 
 
 pure func state_with_callback_purity_overloads() -> CompilerTypecheckState:
-	state = compiler_typecheck_state_empty()
+	state = state_with_impure_tick_func()
 	impure_entry = infer_two_arg_overload_entry(
 		207,
 		compiler_type_int(),
@@ -1079,6 +1155,27 @@ pure func state_with_callback_purity_overloads() -> CompilerTypecheckState:
 		) }
 
 
+pure func state_with_callback_purity_ufcs_overloads() -> CompilerTypecheckState:
+	state = state_with_impure_tick_func()
+	impure_entry = infer_two_arg_overload_entry(
+		209,
+		compiler_type_int(),
+		compiler_int_callback_type(False),
+		compiler_type_bool(),
+	)
+	pure_entry = infer_two_arg_overload_entry(
+		210,
+		compiler_type_int(),
+		compiler_int_callback_type(True),
+		compiler_type_string(),
+	)
+	{ state | env = compiler_env_add_ufcs_method(
+			compiler_env_add_ufcs_method(state.env, "apply_one", impure_entry),
+			"apply_one",
+			pure_entry,
+		) }
+
+
 pure func callback_lambda(is_pure: Bool) -> ParsedExpr:
 	ParsedLambdaExpr(
 		is_pure,
@@ -1087,6 +1184,28 @@ pure func callback_lambda(is_pure: Bool) -> ParsedExpr:
 		ParsedNameExpr(ident("x")),
 		source_span(),
 	)
+
+
+pure func impure_callback_lambda() -> ParsedExpr:
+	ParsedLambdaExpr(
+		False,
+		[lambda_param("x", Some(named_type("Int")))],
+		Some(named_type("Int")),
+		call_expr(ParsedNameExpr(ident("tick")), [ParsedNameExpr(ident("x"))]),
+		source_span(),
+	)
+
+
+pure func state_with_callback_consumer(callback_is_pure: Bool) -> CompilerTypecheckState:
+	state = state_with_impure_tick_func()
+	callback_type = compiler_int_callback_type(callback_is_pure)
+	{ state | env = compiler_env_add_func(
+			state.env,
+			"consume_callback",
+			CompilerFunctionType(False, [callback_type], compiler_type_int()),
+			CompilerImpure,
+			CompilerUserDefinedFunc,
+		) }
 
 
 pure func state_with_string_size_ufcs() -> CompilerTypecheckState:
@@ -1117,6 +1236,21 @@ pure func state_with_generic_list_head_ufcs() -> CompilerTypecheckState:
 		"T",
 	)
 	{ state | env = compiler_env_add_ufcs_method(state.env, "head", head_entry) }
+
+
+pure func state_with_source_parallel_and_builtin() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	list_type = compiler_type_list(compiler_type_int())
+	parallel_entry = { infer_two_arg_overload_entry(
+		212,
+		list_type,
+		CompilerFunctionType(True, [list_type], list_type),
+		list_type,
+	) | module_path = Some("std/list") }
+	with_builtins = compiler_env_with_builtins(state.env)
+	with_parallel = compiler_env_add_ufcs_method(with_builtins, "parallel", parallel_entry)
+
+	add_infer_value({ state | env = with_parallel }, "nums", list_type)
 
 
 pure func compiler_type_outer_key() -> CompilerType:
@@ -1336,6 +1470,56 @@ pure func state_with_shadowed_module_option_constructors() -> CompilerTypecheckS
 	{ state | env = shadow_env }
 
 
+pure func state_with_explicitly_imported_constructor_collision(
+	local_name: String,
+) -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_selected = compiler_env_add_type_with_constructor_ids(
+		state.env,
+		"SelectedValue",
+		[],
+		[
+			{
+				name = "SharedCtor",
+				fields = [compiler_type_int()],
+				tag = 0
+			},
+		],
+		CompilerTypeUnion,
+		False,
+		True,
+		[],
+	)
+	with_unrelated = compiler_env_add_type_with_constructor_ids(
+		with_selected,
+		"UnrelatedValue",
+		[],
+		[
+			{
+				name = "SharedCtor",
+				fields = [compiler_type_string()],
+				tag = 0
+			},
+		],
+		CompilerTypeUnion,
+		False,
+		True,
+		[],
+	)
+	with_home = compiler_typecheck_state_record_type_home(
+		{ state | env = with_unrelated },
+		"SelectedValue",
+		"selected",
+		True,
+	)
+	compiler_typecheck_state_register_imported_name(
+		with_home,
+		local_name,
+		"selected",
+		"SharedCtor",
+	).state
+
+
 pure func state_with_option_and_result_values() -> CompilerTypecheckState:
 	state = state_with_option_int_value()
 	with_result = compiler_env_add_var_with_details(
@@ -1385,6 +1569,155 @@ pure func state_with_generic_identity_func() -> CompilerTypecheckState:
 			CompilerPure,
 			CompilerUserDefinedFunc,
 		) }
+
+
+pure func state_with_float_tensor_value(dims: List[CompilerType]) -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	value_type = CompilerArrayType(compiler_type_float(), dims)
+	{ state |
+		env = compiler_env_add_var_with_details(
+			state.env,
+			"values",
+			value_type,
+			Some(value_type),
+			CompilerImmutableBinding,
+			CompilerLetBinding,
+			compiler_unrefined_binding(),
+		)
+	}
+
+
+pure func state_with_imported_scalar_sqrt_and_tensor() -> CompilerTypecheckState:
+	state = state_with_float_tensor_value([CompilerConstIntType(3)])
+
+	match compiler_env_mint_def_id(state.env):
+		(next_env, def_id):
+			sqrt_symbol = compiler_func_symbol(
+				def_id,
+				CompilerFunctionType(True, [compiler_type_float()], compiler_type_float()),
+				[],
+				[Some("value")],
+				CompilerPure,
+				CompilerUserDefinedFunc,
+				CompilerRejectResourceArgs,
+				Some("std/float"),
+				[],
+				None,
+				False,
+			)
+			with_sqrt = { state |
+				env = compiler_env_add_func_with_info(next_env, "sqrt", sqrt_symbol)
+			}
+			compiler_typecheck_state_register_imported_name(
+				with_sqrt,
+				"sqrt",
+				"std/float",
+				"sqrt",
+			).state
+
+
+pure func state_with_local_scalar_sqrt_and_tensor() -> CompilerTypecheckState:
+	state = state_with_float_tensor_value([CompilerConstIntType(3)])
+	{ state | env = compiler_env_add_func(
+			state.env,
+			"sqrt",
+			CompilerFunctionType(True, [compiler_type_float()], compiler_type_float()),
+			CompilerPure,
+			CompilerUserDefinedFunc,
+		) }
+
+
+pure func state_with_variadic_tensor_functions() -> CompilerTypecheckState:
+	state = state_with_float_tensor_value([CompilerConstIntType(3)])
+	param_type = CompilerArrayType(compiler_type_float(), [CompilerVarDimsType("#Ds")])
+
+	match compiler_env_mint_def_id(state.env):
+		(next_env, consume_def_id):
+			consume_env = compiler_env_add_func_with_info(
+				next_env,
+				"consume_tensor",
+				compiler_func_symbol(
+					consume_def_id,
+					CompilerFunctionType(True, [param_type], compiler_type_int()),
+					[compiler_make_bound_type_param("#Ds", [])],
+					[Some("values")],
+					CompilerPure,
+					CompilerUserDefinedFunc,
+					CompilerRejectResourceArgs,
+					None,
+					[],
+					None,
+					False,
+				),
+			)
+
+			match compiler_env_mint_def_id(consume_env):
+				(identity_env, identity_def_id):
+					with_identity = compiler_env_add_func_with_info(
+						identity_env,
+						"identity_tensor",
+						compiler_func_symbol(
+							identity_def_id,
+							CompilerFunctionType(True, [param_type], param_type),
+							[compiler_make_bound_type_param("#Ds", [])],
+							[Some("values")],
+							CompilerPure,
+							CompilerUserDefinedFunc,
+							CompilerRejectResourceArgs,
+							None,
+							[],
+							None,
+							False,
+						),
+					)
+
+					match compiler_env_mint_def_id(with_identity):
+						(pair_env, pair_def_id):
+							{ state | env = compiler_env_add_func_with_info(
+									pair_env,
+									"pair_tensor",
+									compiler_func_symbol(
+										pair_def_id,
+										CompilerFunctionType(
+											True,
+											[param_type],
+											CompilerTupleType([param_type, compiler_type_int()]),
+										),
+										[compiler_make_bound_type_param("#Ds", [])],
+										[Some("values")],
+										CompilerPure,
+										CompilerUserDefinedFunc,
+										CompilerRejectResourceArgs,
+										None,
+										[],
+										None,
+										False,
+									),
+								) }
+
+
+pure func state_with_generic_dim_consumer() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+
+	match compiler_env_mint_def_id(state.env):
+		(next_env, def_id):
+			{ state | env = compiler_env_add_func_with_info(
+					next_env,
+					"consume_dim",
+					compiler_func_symbol(
+						def_id,
+						CompilerFunctionType(True, [CompilerTypeVar("#N")], compiler_type_int()),
+						[compiler_make_bound_type_param("#N", [])],
+						[Some("size")],
+						CompilerPure,
+						CompilerUserDefinedFunc,
+						CompilerRejectResourceArgs,
+						None,
+						[],
+						None,
+						False,
+					),
+				) }
 
 
 pure func state_with_generic_first_func() -> CompilerTypecheckState:
@@ -1463,6 +1796,41 @@ pure func add_generic_apply_func(state: CompilerTypecheckState) -> CompilerTypec
 
 pure func state_with_generic_apply_func() -> CompilerTypecheckState:
 	add_generic_apply_func(compiler_typecheck_state_empty())
+
+
+pure func state_with_generic_apply_and_impure_tick() -> CompilerTypecheckState:
+	add_generic_apply_func(state_with_impure_tick_func())
+
+
+pure func state_with_generic_callback_first_func() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	symbol = compiler_func_symbol(
+		303,
+		CompilerFunctionType(
+			True,
+			[
+				CompilerFunctionType(
+					True,
+					[CompilerTypeVar("T"), CompilerTypeVar("T")],
+					CompilerTypeVar("T"),
+				),
+				CompilerTypeVar("T"),
+				CompilerTypeVar("T"),
+			],
+			CompilerTypeVar("T"),
+		),
+		[compiler_make_bound_type_param("T", [])],
+		[Some("combine"), Some("left"), Some("right")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		None,
+		[],
+		None,
+		False,
+	)
+
+	{ state | env = compiler_env_add_func_with_info(state.env, "combine", symbol) }
 
 
 pure func state_with_ambiguous_point_records_and_generic_apply() -> CompilerTypecheckState:
@@ -1697,6 +2065,34 @@ pure func state_with_point_binding() -> CompilerTypecheckState:
 		) }
 
 
+pure func state_with_callable_run_field_and_ufcs() -> CompilerTypecheckState:
+	runner_type = CompilerNamedType("Runner", [])
+	callback_type = CompilerFunctionType(False, [compiler_type_int()], compiler_type_int())
+	state = compiler_typecheck_state_empty()
+	with_record = { state |
+		env = compiler_env_add_record(
+			state.env,
+			"Runner",
+			[],
+			[field_decl("run", callback_type)],
+			False,
+			False,
+		)
+	}
+	with_ufcs = { with_record | env = compiler_env_add_ufcs_method(
+			with_record.env,
+			"run",
+			infer_two_arg_overload_entry(
+				213,
+				runner_type,
+				compiler_type_int(),
+				compiler_type_int(),
+			),
+		) }
+
+	add_infer_value(with_ufcs, "box", runner_type)
+
+
 pure func state_with_matrix_binding() -> CompilerTypecheckState:
 	state = compiler_typecheck_state_empty()
 	matrix_type: CompilerType = CompilerArrayType(
@@ -1865,6 +2261,70 @@ func test_hidden_module_function_does_not_shadow_builtin() -> Bool:
 	)
 
 
+func test_compiler_prelude_trait_functions_are_visible() -> Bool:
+	abs_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(
+			ParsedNameExpr(ident("abs")),
+			[ParsedUnaryExpr(ParsedNegateOp, int_expr("1"), source_span())],
+		),
+	)
+	sqrt_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(ParsedNameExpr(ident("sqrt")), [float_expr("4.0")]),
+	)
+
+	(
+		abs_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(abs_result.expr),
+			compiler_type_int(),
+		)
+		and sqrt_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(sqrt_result.expr),
+			compiler_type_float(),
+		)
+	)
+
+
+func test_scalar_math_call_lifts_over_tensor_argument() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_imported_scalar_sqrt_and_tensor()),
+		call_expr(ParsedNameExpr(ident("sqrt")), [ParsedNameExpr(ident("values"))]),
+	)
+	expected = CompilerArrayType(compiler_type_float(), [CompilerConstIntType(3)])
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
+	)
+
+
+func test_local_scalar_math_call_does_not_lift_over_tensor_argument() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_local_scalar_sqrt_and_tensor()),
+		call_expr(ParsedNameExpr(ident("sqrt")), [ParsedNameExpr(ident("values"))]),
+	)
+
+	result.context.state.errors.length() != 0
+
+
+func test_bare_length_dispatches_to_tensor_has_length() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_float_tensor_value([CompilerConstIntType(3)])),
+		call_expr(ParsedNameExpr(ident("length")), [ParsedNameExpr(ident("values"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerConstIntType(3),
+		)
+	)
+
+
 func test_matrix_builtin_binds_literal_dimensions() -> Bool:
 	expected = CompilerArrayType(
 		compiler_type_float(),
@@ -1972,6 +2432,73 @@ func test_annotated_var_decl_widens_literal_initializer() -> Bool:
 			False
 
 
+func test_annotated_binding_accepts_pure_callback_for_impure_slot() -> Bool:
+	expected_type = compiler_int_callback_type(False)
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedVarDeclExpr(
+			ident("callback"),
+			Some(function_type(False, [named_type("Int")], named_type("Int"))),
+			callback_lambda(True),
+			False,
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and optional_types_equal(
+		compiler_env_get_var_type(result.context.state.env, "callback"),
+		Some(expected_type),
+	)
+
+
+func test_annotated_binding_rejects_impure_callback_for_pure_slot() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_impure_tick_func()),
+		ParsedVarDeclExpr(
+			ident("callback"),
+			Some(function_type(True, [named_type("Int")], named_type("Int"))),
+			impure_callback_lambda(),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("initializer has type `(Int) -> Int`")
+	)
+
+
+func test_annotated_binding_rejects_narrower_higher_order_callback() -> Bool:
+	callback_type = function_type(False, [named_type("Int")], named_type("Int"))
+	narrower_callback_type = function_type(True, [named_type("Int")], named_type("Int"))
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedVarDeclExpr(
+			ident("higher_order"),
+			Some(function_type(False, [callback_type], named_type("Int"))),
+			ParsedLambdaExpr(
+				True,
+				[lambda_param("callback", Some(narrower_callback_type))],
+				Some(named_type("Int")),
+				int_expr("0"),
+				source_span(),
+			),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("Binding `higher_order` declared as")
+	)
+
+
 func test_block_scopes_local_bindings_and_uses_last_expression_type() -> Bool:
 	block = ParsedBlockExpr(
 		[
@@ -2013,23 +2540,55 @@ func test_block_preserves_last_expression_value_type() -> Bool:
 	)
 
 
-func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
+func test_name_lookup_uses_resolved_bound_meta() -> Bool:
 	state = compiler_typecheck_state_empty()
 	with_context = { state | context = compiler_bind_meta(state.context, 0, compiler_type_int()) }
 	with_meta_value = add_infer_value(with_context, "mystery", CompilerMetaType(0))
 	result = compiler_infer_expr(
 		compiler_infer_context(with_meta_value),
-		ParsedBlockExpr([ParsedNameExpr(ident("mystery"))], source_span()),
+		ParsedNameExpr(ident("mystery")),
 	)
-	finalized = compiler_finalize_infer_result(result)
 
 	(
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(result.expr),
-			CompilerMetaType(0),
+			compiler_type_int(),
 		)
-		and compiler_typed_expr_contains_meta(result.expr)
+		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_int())
+	)
+
+
+func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
+	state = compiler_typecheck_state_empty()
+	with_context = { state | context = compiler_bind_meta(state.context, 0, compiler_type_int()) }
+	meta_type = CompilerMetaType(0)
+	meta_slot: CompilerValueSlot = {
+		semantic_type = meta_type,
+		decision = CompilerTypeKeep(meta_type)
+	}
+	meta_info: CompilerTypedExprInfo = {
+		source_type = None,
+		semantic_type = meta_type,
+		value_type = meta_type,
+		origin = CompilerInferredOrigin,
+		value_slot = meta_slot,
+		proofs = compiler_unrefined_binding(),
+		resolved_call = None,
+		resource_dependencies = []
+	}
+	result: CompilerInferResult = {
+		context = compiler_infer_context(with_context),
+		expr = CompilerTypedBlockExpr(
+			[CompilerTypedNameExpr(ident("mystery"), meta_info)],
+			source_span(),
+			meta_info,
+		)
+	}
+	finalized = compiler_finalize_infer_result(result)
+
+	(
+		compiler_typed_expr_contains_meta(result.expr)
 		and not compiler_typed_expr_contains_meta(finalized.expr)
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(finalized.expr),
@@ -2414,6 +2973,38 @@ func test_select_checks_arms_and_returns_void() -> Bool:
 	(
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), compiler_type_void())
+	)
+
+
+func test_select_accepts_canonical_duration_and_range_timeout() -> Bool:
+	duration_state = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"duration",
+		CompilerNamedType("std/units::Duration", []),
+	)
+	duration_result = compiler_infer_expr(
+		compiler_infer_context(duration_state),
+		ParsedSelectExpr([select_after_arm(
+					ParsedNameExpr(ident("duration")),
+					ParsedBlockExpr([ParsedVoidExpr(source_span())], source_span()),
+				)], source_span()),
+	)
+	range_state = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"milliseconds",
+		CompilerRangeType(CompilerConstIntType(100)),
+	)
+	range_result = compiler_infer_expr(
+		compiler_infer_context(range_state),
+		ParsedSelectExpr([select_after_arm(
+					ParsedNameExpr(ident("milliseconds")),
+					ParsedBlockExpr([ParsedVoidExpr(source_span())], source_span()),
+				)], source_span()),
+	)
+
+	(
+		duration_result.context.state.errors.length() == 0
+		and range_result.context.state.errors.length() == 0
 	)
 
 
@@ -3156,6 +3747,31 @@ func test_constructor_identifier_uses_generic_expected_parent_type() -> Bool:
 	)
 
 
+func test_equality_binds_unconstrained_generic_constructor() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_option_int_value()),
+			binary_expr(
+				ParsedEqualOp,
+				ParsedNameExpr(ident("maybe")),
+				ParsedNameExpr(ident("None")),
+			),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		CompilerTypedBinaryExpr(_, left, right, _, _):
+			compiler_types_equal(
+				compiler_typed_expr_semantic_type(left),
+				CompilerNamedType("Option", [compiler_type_int()]),
+			) and compiler_types_equal(
+				compiler_typed_expr_semantic_type(right),
+				CompilerNamedType("Option", [compiler_type_int()]),
+			)
+		_:
+			False
+
+
 func test_constructor_call_specializes_generic_return() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_option_int_value()),
@@ -3213,6 +3829,24 @@ func test_if_branch_constructor_call_uses_expected_return_for_unmentioned_generi
 		result.context.state.errors.length() == 0
 		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected)
 		and compiler_types_equal(compiler_typed_expr_value_type(result.expr), expected)
+	)
+
+
+func test_if_branches_infer_complementary_result_parameters() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_result_string_error()),
+			ParsedIfExpr(
+				bool_expr(True),
+				call_expr(ParsedNameExpr(ident("Ok")), [int_expr("1")]),
+				Some(call_expr(ParsedNameExpr(ident("Err")), [ParsedNameExpr(ident("error"))])),
+				source_span(),
+			),
+		),
+	)
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		compiler_type_result(compiler_type_int(), compiler_type_string()),
 	)
 
 
@@ -3569,6 +4203,22 @@ pure func state_with_tensor_arithmetic_values() -> CompilerTypecheckState:
 	add_infer_value(with_strings, "float_scalar", compiler_type_float())
 
 
+pure func state_with_generic_tensor_arithmetic_values(
+	element_bounds: List[String],
+) -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_bounds = { state | env = compiler_env_set_type_param_bounds(
+			state.env,
+			[
+				compiler_make_bound_type_param("T", element_bounds),
+				compiler_make_bound_type_param("#N", []),
+			],
+		) }
+	tensor_type = CompilerArrayType(CompilerTypeVar("T"), [CompilerTypeVar("#N")])
+	with_left = add_infer_value(with_bounds, "generic_left", tensor_type)
+	add_infer_value(with_left, "generic_right", tensor_type)
+
+
 func test_tensor_arithmetic_preserves_fixed_shape() -> Bool:
 	state = state_with_tensor_arithmetic_values()
 	tensor_type = CompilerArrayType(
@@ -3613,6 +4263,36 @@ func test_tensor_arithmetic_preserves_fixed_shape() -> Bool:
 			compiler_typed_expr_semantic_type(left_scalar_result.expr),
 			tensor_type,
 		)
+	)
+
+
+func test_tensor_arithmetic_rejects_bounded_generic_element() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_generic_tensor_arithmetic_values(["Addable"])),
+		binary_expr(
+			ParsedAddOp,
+			ParsedNameExpr(ident("generic_left")),
+			ParsedNameExpr(ident("generic_right")),
+		),
+	)
+
+	result.context.state.errors.length() == 1
+
+
+func test_tensor_arithmetic_accepts_numeric_family_bound() -> Bool:
+	tensor_type = CompilerArrayType(CompilerTypeVar("T"), [CompilerTypeVar("#N")])
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_generic_tensor_arithmetic_values(["Integer"])),
+		binary_expr(
+			ParsedAddOp,
+			ParsedNameExpr(ident("generic_left")),
+			ParsedNameExpr(ident("generic_right")),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), tensor_type)
 	)
 
 
@@ -3750,6 +4430,36 @@ func test_comparison_and_equality_return_bool() -> Bool:
 	)
 
 
+func test_collection_equality_returns_bool() -> Bool:
+	var state: CompilerTypecheckState = compiler_typecheck_state_empty()
+	state = add_infer_value(
+		state,
+		"left_list",
+		CompilerNamedType("List", [compiler_type_string()]),
+	)
+	state = add_infer_value(
+		state,
+		"right_list",
+		CompilerNamedType("List", [compiler_type_string()]),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		binary_expr(
+			ParsedEqualOp,
+			ParsedNameExpr(ident("left_list")),
+			ParsedNameExpr(ident("right_list")),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_bool(),
+		)
+	)
+
+
 pure func state_with_generic_comparison_values(has_bound: Bool) -> CompilerTypecheckState:
 	state = compiler_typecheck_state_empty()
 
@@ -3859,10 +4569,79 @@ func test_unary_and_logical_ops() -> Bool:
 	)
 
 
+func test_negative_float_literal_uses_expected_sized_float_type() -> Bool:
+	float16_type: CompilerType = CompilerNamedType("Float16", [])
+	float32_type: CompilerType = CompilerNamedType("Float32", [])
+	float16_result = compiler_infer_expr(
+		compiler_infer_with_expected_value_slot(
+			compiler_infer_context(compiler_typecheck_state_empty()),
+			float16_type,
+			CompilerExpectedArgumentSlot,
+		),
+		ParsedUnaryExpr(ParsedNegateOp, float_expr("1.5"), source_span()),
+	)
+	float32_result = compiler_infer_expr(
+		compiler_infer_with_expected_value_slot(
+			compiler_infer_context(compiler_typecheck_state_empty()),
+			float32_type,
+			CompilerExpectedArgumentSlot,
+		),
+		ParsedUnaryExpr(ParsedNegateOp, float_expr("1.5"), source_span()),
+	)
+
+	(
+		float16_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(float16_result.expr),
+			float16_type,
+		)
+		and float32_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(float32_result.expr),
+			float32_type,
+		)
+	)
+
+
+func test_negative_int_literal_uses_expected_sized_int_type() -> Bool:
+	int8_type: CompilerType = CompilerNamedType("Int8", [])
+	result = compiler_infer_expr(
+		compiler_infer_with_expected_value_slot(
+			compiler_infer_context(compiler_typecheck_state_empty()),
+			int8_type,
+			CompilerExpectedArgumentSlot,
+		),
+		ParsedUnaryExpr(ParsedNegateOp, int_expr("10"), source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), int8_type)
+	)
+
+
 func test_direct_call_infers_return_type() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_add_one_func()),
 		call_expr(ParsedNameExpr(ident("add_one")), [int_expr("1")]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
+func test_user_function_shadows_assert_shape_builtin() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_user_assert_shape_func()),
+		call_expr(
+			ParsedNameExpr(ident("assert_shape")),
+			[int_expr("1"), int_expr("2")],
+		),
 	)
 
 	(
@@ -3907,6 +4686,28 @@ func test_direct_call_widens_argument() -> Bool:
 			CompilerTypeKeep(_):
 				False
 	)
+
+
+func test_direct_call_preserves_range_proof_for_range_parameter() -> Bool:
+	base_state = compiler_typecheck_state_empty()
+	with_function = { base_state | env = compiler_env_add_func(
+			base_state.env,
+			"take_index",
+			CompilerFunctionType(
+				True,
+				[CompilerRangeType(CompilerConstIntType(10))],
+				compiler_type_int(),
+			),
+			CompilerPure,
+			CompilerUserDefinedFunc,
+		) }
+	state = add_infer_value(with_function, "index", CompilerRangeType(CompilerConstIntType(10)))
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("take_index")), [ParsedNameExpr(ident("index"))]),
+	)
+
+	result.context.state.errors.length() == 0
 
 
 func test_direct_call_records_resolved_metadata() -> Bool:
@@ -4137,6 +4938,44 @@ func test_qualified_module_constructor_call_infers_owned_constructor() -> Bool:
 			False
 
 
+func test_explicit_import_wins_constructor_name_collision() -> Bool:
+	state = state_with_explicitly_imported_constructor_collision("SharedCtor")
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("SharedCtor")), [int_expr("1")]),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerNamedType("SelectedValue", []),
+	)
+
+
+func test_lexical_binding_wins_explicit_import() -> Bool:
+	state = state_with_explicitly_imported_constructor_collision("SharedCtor")
+	local_env = compiler_env_add_var_with_details(
+		compiler_env_push_scope(state.env),
+		"SharedCtor",
+		compiler_type_int(),
+		Some(compiler_type_int()),
+		CompilerImmutableBinding,
+		CompilerLetBinding,
+		compiler_unrefined_binding(),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context({ state | env = local_env }),
+		ParsedNameExpr(ident("SharedCtor")),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
 func test_qualified_module_nullary_constructor_uses_expected_type() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_with_expected(
@@ -4338,7 +5177,7 @@ func test_bare_overload_prefers_pure_callback_slot() -> Bool:
 		compiler_infer_context(state),
 		call_expr(
 			ParsedNameExpr(ident("apply_one")),
-			[int_expr("1"), callback_lambda(False)],
+			[int_expr("1"), impure_callback_lambda()],
 		),
 	)
 
@@ -4369,6 +5208,37 @@ func test_bare_overload_prefers_pure_callback_slot() -> Bool:
 				)
 			None:
 				False
+	)
+
+
+func test_ufcs_overload_uses_non_receiver_argument_types() -> Bool:
+	state = state_with_callback_purity_ufcs_overloads()
+	pure_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(
+			field_access_expr(int_expr("1"), "apply_one"),
+			[callback_lambda(False)],
+		),
+	)
+	impure_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(
+			field_access_expr(int_expr("1"), "apply_one"),
+			[impure_callback_lambda()],
+		),
+	)
+
+	(
+		pure_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(pure_result.expr),
+			compiler_type_string(),
+		)
+		and impure_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(impure_result.expr),
+			compiler_type_bool(),
+		)
 	)
 
 
@@ -4437,6 +5307,60 @@ func test_generic_ufcs_method_binds_receiver_type() -> Bool:
 			Some(info):
 				info.callee_name == "head" and compiler_resolved_call_callable_id(info) == Some(202)
 			None:
+				False
+	)
+
+
+func test_source_ufcs_method_precedes_same_named_builtin() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_source_parallel_and_builtin()),
+		call_expr(
+			field_access_expr(ParsedNameExpr(ident("nums")), "parallel"),
+			[
+				ParsedLambdaExpr(
+					True,
+					[lambda_param("items", None)],
+					None,
+					ParsedNameExpr(ident("items")),
+					source_span(),
+				),
+			],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_list(compiler_type_int()),
+		)
+		and match compiler_typed_expr_resolved_call(result.expr):
+			Some(info):
+				compiler_resolved_call_callable_id(info) == Some(212)
+			None:
+				False
+	)
+
+
+func test_callable_record_field_precedes_same_named_ufcs_method() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_callable_run_field_and_ufcs()),
+		call_expr(
+			field_access_expr(ParsedNameExpr(ident("box")), "run"),
+			[int_expr("5")],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+		and match result.expr:
+			CompilerTypedCallExpr(CompilerTypedFieldAccessExpr(_, field, _, _), _, _, _):
+				field.text == "run"
+			_:
 				False
 	)
 
@@ -4519,6 +5443,38 @@ func test_direct_call_errors_are_specific() -> Bool:
 	)
 
 
+func test_direct_call_accepts_pure_callback_for_impure_slot() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_callback_consumer(False)),
+		call_expr(ParsedNameExpr(ident("consume_callback")), [callback_lambda(True)]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
+func test_direct_call_rejects_impure_callback_for_pure_slot() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_callback_consumer(True)),
+		call_expr(ParsedNameExpr(ident("consume_callback")), [impure_callback_lambda()]),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains((
+					"Argument type mismatch: in call to 'consume_callback', argument 1 expected pure "
+					+ "(Int) -> Int, got (Int) -> Int"
+				))
+	)
+
+
 func test_generic_direct_call_substitutes_type_var() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_generic_identity_func()),
@@ -4531,6 +5487,130 @@ func test_generic_direct_call_substitutes_type_var() -> Bool:
 			compiler_typed_expr_semantic_type(result.expr),
 			compiler_type_int(),
 		)
+	)
+
+
+func test_direct_call_accepts_concrete_tensor_for_variadic_dims() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_variadic_tensor_functions()),
+		call_expr(ParsedNameExpr(ident("consume_tensor")), [ParsedNameExpr(ident("values"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
+func test_direct_call_resolves_variadic_dims_in_return_types() -> Bool:
+	state = state_with_variadic_tensor_functions()
+	identity_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("identity_tensor")), [ParsedNameExpr(ident("values"))]),
+	)
+	pair_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("pair_tensor")), [ParsedNameExpr(ident("values"))]),
+	)
+	concrete_tensor_type = CompilerArrayType(compiler_type_float(), [CompilerConstIntType(3)])
+
+	(
+		identity_result.context.state.errors.length() == 0
+		and pair_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(identity_result.expr),
+			concrete_tensor_type,
+		)
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(pair_result.expr),
+			CompilerTupleType([concrete_tensor_type, compiler_type_int()]),
+		)
+	)
+
+
+func test_generic_dim_argument_uses_static_expression_type() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_generic_dim_consumer()),
+		call_expr(
+			ParsedNameExpr(ident("consume_dim")),
+			[binary_expr(ParsedMultiplyOp, int_expr("2"), int_expr("3"))],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
+func test_assert_shape_refines_and_validates_arguments() -> Bool:
+	variadic_state = state_with_float_tensor_value([CompilerVarDimsType("#Ds")])
+	with_length_state = { variadic_state |
+		env = compiler_env_add_var_with_details(
+			variadic_state.env,
+			"length_value",
+			compiler_type_int(),
+			Some(compiler_type_int()),
+			CompilerImmutableBinding,
+			CompilerLetBinding,
+			compiler_unrefined_binding(),
+		)
+	}
+	concrete_state = state_with_float_tensor_value([CompilerConstIntType(4)])
+	success = compiler_infer_expr(
+		compiler_infer_context(variadic_state),
+		call_expr(
+			ParsedNameExpr(ident("assert_shape")),
+			[ParsedNameExpr(ident("values")), int_expr("5")],
+		),
+	)
+	concrete_error = compiler_infer_expr(
+		compiler_infer_context(concrete_state),
+		call_expr(
+			ParsedNameExpr(ident("assert_shape")),
+			[ParsedNameExpr(ident("values")), int_expr("4")],
+		),
+	)
+	zero_error = compiler_infer_expr(
+		compiler_infer_context(variadic_state),
+		call_expr(
+			ParsedNameExpr(ident("assert_shape")),
+			[ParsedNameExpr(ident("values")), int_expr("0")],
+		),
+	)
+	non_literal_error = compiler_infer_expr(
+		compiler_infer_context(with_length_state),
+		call_expr(
+			ParsedNameExpr(ident("assert_shape")),
+			[ParsedNameExpr(ident("values")), ParsedNameExpr(ident("length_value"))],
+		),
+	)
+	expected_type = CompilerNamedType(
+		"Option",
+		[CompilerArrayType(compiler_type_float(), [CompilerConstIntType(5)])],
+	)
+
+	(
+		success.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(success.expr), expected_type)
+		and concrete_error.context.state.errors.length() == 1
+		and concrete_error.context.state.errors
+			.get_or(0, "")
+			.contains("assert_shape requires a variadic-dimension tensor")
+		and zero_error.context.state.errors.length() == 1
+		and zero_error.context.state.errors
+			.get_or(0, "")
+			.contains("assert_shape requires a positive compile-time integer literal")
+		and non_literal_error.context.state.errors.length() == 1
+		and non_literal_error.context.state.errors
+			.get_or(0, "")
+			.contains("assert_shape requires a positive compile-time integer literal")
 	)
 
 
@@ -4596,6 +5676,55 @@ func test_generic_call_guides_unannotated_callback_parameter() -> Bool:
 					binary_expr(ParsedAddOp, ParsedNameExpr(ident("x")), int_expr("1")),
 					source_span(),
 				)],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			compiler_type_int(),
+		)
+	)
+
+
+func test_generic_call_rejects_impure_callback_for_pure_slot() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_generic_apply_and_impure_tick()),
+		call_expr(
+			ParsedNameExpr(ident("apply_generic")),
+			[int_expr("1"), impure_callback_lambda()],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("argument 2 expected pure (Int) -> Int, got (Int) -> Int")
+	)
+
+
+func test_generic_call_uses_purity_for_annotated_callback_first() -> Bool:
+	callback = ParsedLambdaExpr(
+		False,
+		[
+			lambda_param("left", Some(named_type("Int"))),
+			lambda_param("right", Some(named_type("Int"))),
+		],
+		Some(named_type("Int")),
+		binary_expr(
+			ParsedAddOp,
+			ParsedNameExpr(ident("left")),
+			ParsedNameExpr(ident("right")),
+		),
+		source_span(),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_generic_callback_first_func()),
+		call_expr(
+			ParsedNameExpr(ident("combine")),
+			[callback, int_expr("1"), int_expr("2")],
 		),
 	)
 
@@ -5317,6 +6446,95 @@ func test_var_decl_rejects_one_shot_stream_function_carrier_binding() -> Bool:
 	)
 
 
+func test_resource_shape_checks_memoize_complete_types() -> Bool:
+	state = add_infer_value(
+		state_with_stream_source_binding_values(),
+		"plain_option",
+		compiler_type_option(compiler_type_int()),
+	)
+	first = compiler_infer_expr(
+		compiler_infer_context(state),
+		ParsedVarDeclExpr(
+			ident("boxed_a"),
+			None,
+			ParsedNameExpr(ident("maybe_stream")),
+			False,
+			source_span(),
+		),
+	)
+	first_contains_count = first.context.state.type_shape_memo.contains_target.length()
+	first_carrier_count = first.context.state.type_shape_memo.function_carrier.length()
+	plain = compiler_infer_expr(
+		first.context,
+		ParsedVarDeclExpr(
+			ident("plain"),
+			None,
+			ParsedNameExpr(ident("plain_option")),
+			False,
+			source_span(),
+		),
+	)
+	plain_contains_count = plain.context.state.type_shape_memo.contains_target.length()
+	plain_carrier_count = plain.context.state.type_shape_memo.function_carrier.length()
+	repeated = compiler_infer_expr(
+		plain.context,
+		ParsedVarDeclExpr(
+			ident("boxed_b"),
+			None,
+			ParsedNameExpr(ident("maybe_stream")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		first.context.state.errors.length() == 1
+		and plain.context.state.errors.length() == 1
+		and repeated.context.state.errors.length() == 2
+		and first_contains_count > 0
+		and first_carrier_count > 0
+		and plain_contains_count > first_contains_count
+		and plain_carrier_count > first_carrier_count
+		and repeated.context.state.type_shape_memo.contains_target.length() == plain_contains_count
+		and repeated.context.state.type_shape_memo.function_carrier.length() == plain_carrier_count
+	)
+
+
+func test_resource_shape_checks_expand_generic_alias_chains() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_aliased_stream_binding()),
+		ParsedVarDeclExpr(
+			ident("boxed"),
+			None,
+			ParsedNameExpr(ident("aliased_stream")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("one-shot stream value `boxed` cannot be bound to an ordinary variable")
+	)
+
+
+func test_resource_shape_checks_terminate_on_cyclic_aliases() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_cyclic_alias_binding()),
+		ParsedVarDeclExpr(
+			ident("copy"),
+			None,
+			ParsedNameExpr(ident("cycle_value")),
+			False,
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0
+
+
 func test_var_decl_rejects_resource_source_carrier_binding() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_stream_source_binding_values()),
@@ -5649,6 +6867,24 @@ func test_assignment_creates_implicit_immutable_binding() -> Bool:
 	)
 
 
+func test_assignment_shadows_outer_function_with_local_binding() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_add_one_func()),
+		ParsedBlockExpr(
+			[assign_expr("add_one", int_expr("1")), ParsedNameExpr(ident("add_one"))],
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerConstIntType(1),
+		)
+	)
+
+
 func test_assignment_updates_mutable_binding() -> Bool:
 	block = ParsedBlockExpr(
 		[
@@ -5672,6 +6908,54 @@ func test_assignment_updates_mutable_binding() -> Bool:
 			compiler_typed_expr_semantic_type(result.expr),
 			compiler_type_int(),
 		)
+	)
+
+
+func test_assignment_accepts_pure_callback_for_impure_slot() -> Bool:
+	expected_type = compiler_int_callback_type(False)
+	block = ParsedBlockExpr(
+		[
+			ParsedVarDeclExpr(
+				ident("callback"),
+				Some(function_type(False, [named_type("Int")], named_type("Int"))),
+				callback_lambda(True),
+				True,
+				source_span(),
+			),
+			assign_expr("callback", callback_lambda(True)),
+			ParsedNameExpr(ident("callback")),
+		],
+		source_span(),
+	)
+	result = compiler_infer_expr(compiler_infer_context(compiler_typecheck_state_empty()), block)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(compiler_typed_expr_semantic_type(result.expr), expected_type)
+	)
+
+
+func test_assignment_rejects_impure_callback_for_pure_slot() -> Bool:
+	block = ParsedBlockExpr(
+		[
+			ParsedVarDeclExpr(
+				ident("callback"),
+				Some(function_type(True, [named_type("Int")], named_type("Int"))),
+				callback_lambda(True),
+				True,
+				source_span(),
+			),
+			assign_expr("callback", impure_callback_lambda()),
+		],
+		source_span(),
+	)
+	result = compiler_infer_expr(compiler_infer_context(state_with_impure_tick_func()), block)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("Cannot assign to variable 'callback'")
 	)
 
 
@@ -6337,6 +7621,55 @@ func test_tensor_subscript_peels_and_multi_index_returns_element() -> Bool:
 	)
 
 
+func test_negative_tensor_subscript_normalizes_concrete_index() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_matrix_binding()),
+		subscript_expr(
+			ParsedNameExpr(ident("matrix")),
+			[ParsedUnaryExpr(ParsedNegateOp, int_expr("1"), source_span())],
+		),
+	)
+
+	normalized = match result.expr:
+		CompilerTypedSubscriptExpr(_, indices, _, _):
+			match indices.get(0):
+				Some(CompilerTypedIntLiteralExpr("1", _, _)):
+					True
+				_:
+					False
+		_:
+			False
+
+	result.context.state.errors.length() == 0 and normalized
+
+
+func test_modulo_subscript_rewrites_negative_dividend_safely() -> Bool:
+	state = add_infer_value(
+		state_with_int_binding("i"),
+		"values",
+		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(4)]),
+	)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(
+			ParsedNameExpr(ident("values")),
+			[binary_expr(ParsedModuloOp, ParsedNameExpr(ident("i")), int_expr("4"))],
+		),
+	)
+
+	safe_index = match result.expr:
+		CompilerTypedSubscriptExpr(_, indices, _, _):
+			match indices.get(0):
+				Some(CompilerTypedBinaryExpr(ParsedModuloOp, CompilerTypedBinaryExpr(ParsedAddOp, CompilerTypedBinaryExpr(ParsedModuloOp, _, _, _, _), _, _, _), _, _, _)):
+					True
+				_:
+					False
+		_:
+			False
+
+	result.context.state.errors.length() == 0 and safe_index
+
+
 func test_normalized_matrix_checked_get_infers_element_call() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_matrix_binding()),
@@ -6440,6 +7773,24 @@ pure func state_with_symbolic_range_subscript_values() -> CompilerTypecheckState
 	)
 	with_n = add_infer_value(state, "n", CompilerTypeVar("#N"))
 	add_infer_value(with_n, "m", CompilerTypeVar("#M"))
+
+
+pure func state_with_symbolic_minimum_subscript_values() -> CompilerTypecheckState:
+	n = CompilerTypeVar("#N")
+	m = CompilerTypeVar("#M")
+	with_offset = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"offset_values",
+		CompilerArrayType(
+			compiler_type_int(),
+			[CompilerDimOpType(CompilerDimAdd, n, CompilerConstIntType(3))],
+		),
+	)
+	add_infer_value(
+		with_offset,
+		"sum_values",
+		CompilerArrayType(compiler_type_int(), [CompilerDimOpType(CompilerDimAdd, m, n)]),
+	)
 
 
 pure func state_with_flattened_symbolic_subscript_values() -> CompilerTypecheckState:
@@ -6573,6 +7924,58 @@ pure func state_with_symbolic_vector_constructor() -> CompilerTypecheckState:
 	add_infer_value(with_rows, "columns", CompilerTypeVar("#N"))
 
 
+pure func state_with_generic_dimension_return() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	matrix_type = CompilerArrayType(
+		compiler_type_int(),
+		[CompilerTypeVar("#M"), CompilerTypeVar("#N")],
+	)
+	symbol = compiler_func_symbol(
+		403,
+		CompilerFunctionType(
+			True,
+			[matrix_type],
+			CompilerTypeVar("#M"),
+		),
+		[compiler_make_bound_type_param("#M", []), compiler_make_bound_type_param("#N", [])],
+		[Some("matrix")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		None,
+		[],
+		None,
+		False,
+	)
+	with_func = { state | env = compiler_env_add_func_with_info(state.env, "row_count", symbol) }
+	add_infer_value(
+		with_func,
+		"matrix",
+		CompilerArrayType(
+			compiler_type_int(),
+			[CompilerConstIntType(2), CompilerConstIntType(3)],
+		),
+	)
+
+
+func test_generic_dimension_return_widens_to_expected_int() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_with_expected(
+			compiler_infer_context(state_with_generic_dimension_return()),
+			compiler_type_int(),
+		),
+		call_expr(ParsedNameExpr(ident("row_count")), [ParsedNameExpr(ident("matrix"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerConstIntType(2),
+		)
+	)
+
+
 func test_generic_dimension_argument_preserves_static_expression() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_symbolic_vector_constructor()),
@@ -6630,6 +8033,31 @@ func test_symbolic_product_subscript_proofs() -> Bool:
 	)
 
 
+func test_symbolic_literal_subscript_uses_guaranteed_minimum() -> Bool:
+	state = state_with_symbolic_minimum_subscript_values()
+	third_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(ParsedNameExpr(ident("offset_values")), [int_expr("2")]),
+	)
+	last_guaranteed_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(
+			ParsedNameExpr(ident("offset_values")),
+			[ParsedUnaryExpr(ParsedNegateOp, int_expr("4"), source_span())],
+		),
+	)
+	second_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		subscript_expr(ParsedNameExpr(ident("sum_values")), [int_expr("1")]),
+	)
+
+	(
+		third_result.context.state.errors.length() == 0
+		and last_guaranteed_result.context.state.errors.length() == 0
+		and second_result.context.state.errors.length() == 0
+	)
+
+
 func test_symbolic_range_subscript_requires_matching_dimension() -> Bool:
 	zero_result = compiler_infer_expr(
 		compiler_infer_context(state_with_symbolic_range_subscript_values()),
@@ -6680,7 +8108,10 @@ func test_if_bounds_condition_refines_runtime_index() -> Bool:
 	below_length = binary_expr(
 		ParsedLessOp,
 		row_expr,
-		call_expr(ParsedNameExpr(ident("length")), [matrix_expr]),
+		call_expr(
+			field_access_expr(matrix_expr, "length"),
+			[],
+		),
 	)
 	condition = ParsedLogicalExpr(ParsedAndOp, non_negative, below_length, source_span())
 	result = compiler_infer_expr(
@@ -6696,6 +8127,116 @@ func test_if_bounds_condition_refines_runtime_index() -> Bool:
 	result.context.state.errors.length() == 0 and compiler_types_equal(
 		compiler_typed_expr_semantic_type(result.expr),
 		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(3)]),
+	)
+
+
+func test_if_bounds_condition_refines_multiple_runtime_indices() -> Bool:
+	base_state = compiler_typecheck_state_empty()
+	with_builtins = { base_state | env = compiler_env_with_builtins(base_state.env) }
+	with_grid = add_infer_value(
+		with_builtins,
+		"grid",
+		CompilerArrayType(
+			compiler_type_int(),
+			[CompilerConstIntType(2), CompilerConstIntType(3)],
+		),
+	)
+	with_values = add_infer_value(
+		with_grid,
+		"values",
+		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(3)]),
+	)
+	with_row = add_infer_value(with_values, "row", compiler_type_int())
+	state = add_infer_value(with_row, "column", compiler_type_int())
+	row_expr = ParsedNameExpr(ident("row"))
+	column_expr = ParsedNameExpr(ident("column"))
+	grid_expr = ParsedNameExpr(ident("grid"))
+	values_expr = ParsedNameExpr(ident("values"))
+	row_bounds = ParsedLogicalExpr(
+		ParsedAndOp,
+		binary_expr(ParsedGreaterEqualOp, row_expr, int_expr("0")),
+		binary_expr(
+			ParsedLessOp,
+			row_expr,
+			call_expr(
+				field_access_expr(grid_expr, "length"),
+				[],
+			),
+		),
+		source_span(),
+	)
+	column_bounds = ParsedLogicalExpr(
+		ParsedAndOp,
+		binary_expr(ParsedGreaterEqualOp, column_expr, int_expr("0")),
+		binary_expr(
+			ParsedLessOp,
+			column_expr,
+			call_expr(
+				field_access_expr(values_expr, "length"),
+				[],
+			),
+		),
+		source_span(),
+	)
+	condition = ParsedLogicalExpr(ParsedAndOp, row_bounds, column_bounds, source_span())
+	then_value = tuple_expr([
+		subscript_expr(grid_expr, [row_expr]),
+		subscript_expr(values_expr, [column_expr]),
+	])
+	else_value = tuple_expr([
+		subscript_expr(grid_expr, [int_expr("0")]),
+		subscript_expr(values_expr, [int_expr("0")]),
+	])
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		ParsedIfExpr(condition, then_value, Some(else_value), source_span()),
+	)
+
+	result.context.state.errors.length() == 0
+
+
+func test_builtin_zip_resolves_through_ufcs() -> Bool:
+	base_state = compiler_typecheck_state_empty()
+	vector_type = CompilerArrayType(compiler_type_int(), [CompilerConstIntType(3)])
+	imported_symbol = compiler_func_symbol(
+		404,
+		CompilerFunctionType(
+			True,
+			[vector_type, vector_type],
+			CompilerArrayType(
+				CompilerTupleType([compiler_type_int(), compiler_type_int()]),
+				[CompilerConstIntType(3)],
+			),
+		),
+		[],
+		[Some("left"), Some("right")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		Some("std/vector"),
+		[],
+		None,
+		False,
+	)
+	with_shadow = { base_state |
+		env = compiler_env_add_func_with_info(base_state.env, "zip", imported_symbol)
+	}
+	with_left = add_infer_value(with_shadow, "left", vector_type)
+	state = add_infer_value(with_left, "right", vector_type)
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(
+			field_access_expr(ParsedNameExpr(ident("left")), "zip"),
+			[ParsedNameExpr(ident("right"))],
+		),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerArrayType(
+			CompilerTupleType([compiler_type_int(), compiler_type_int()]),
+			[CompilerConstIntType(3)],
+		),
 	)
 
 
@@ -6788,6 +8329,42 @@ func test_matrix_subscript_assign_uses_ranked_checked_set() -> Bool:
 					False
 		_:
 			False
+
+
+func test_direct_checked_set_calls_preserve_tensor_type() -> Bool:
+	vector_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(
+			ParsedNameExpr(ident("checked_set")),
+			[vector_expr([int_expr("1"), int_expr("2")]), int_expr("0"), int_expr("7")],
+		),
+	)
+	matrix_result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		call_expr(
+			ParsedNameExpr(ident("matrix_checked_set")),
+			[vector_expr([
+					vector_expr([int_expr("1"), int_expr("2")]),
+					vector_expr([int_expr("3"), int_expr("4")]),
+				]), int_expr("0"), int_expr("1"), int_expr("7")],
+		),
+	)
+
+	(
+		vector_result.context.state.errors.length() == 0
+		and matrix_result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(vector_result.expr),
+			CompilerArrayType(compiler_type_int(), [CompilerConstIntType(2)]),
+		)
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(matrix_result.expr),
+			CompilerArrayType(
+				compiler_type_int(),
+				[CompilerConstIntType(2), CompilerConstIntType(2)],
+			),
+		)
+	)
 
 
 func test_subscript_assign_errors_are_specific() -> Bool:
@@ -6931,6 +8508,45 @@ func test_if_with_else_infers_common_int_type() -> Bool:
 			compiler_typed_expr_semantic_type(result.expr),
 			compiler_type_int(),
 		)
+	)
+
+
+func test_if_with_else_widens_literal_tuple_elements() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(compiler_typecheck_state_empty()),
+		ParsedIfExpr(
+			bool_expr(True),
+			tuple_expr([string_expr("then"), int_expr("42")]),
+			Some(tuple_expr([string_expr("else"), int_expr("0")])),
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_types_equal(
+			compiler_typed_expr_semantic_type(result.expr),
+			CompilerTupleType([compiler_type_string(), compiler_type_int()]),
+		)
+	)
+
+
+func test_if_unifies_generic_nullary_constructor_branch() -> Bool:
+	result = compiler_finalize_infer_result(
+		compiler_infer_expr(
+			compiler_infer_context(state_with_option_int_value()),
+			ParsedIfExpr(
+				bool_expr(True),
+				ParsedNameExpr(ident("maybe")),
+				Some(ParsedNameExpr(ident("None"))),
+				source_span(),
+			),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and compiler_types_equal(
+		compiler_typed_expr_semantic_type(result.expr),
+		CompilerNamedType("Option", [compiler_type_int()]),
 	)
 
 
@@ -7639,6 +9255,56 @@ func test_for_range_dimension_expression_binder_is_refined() -> Bool:
 	)
 
 
+func test_for_literal_range_proves_safe_offsets() -> Bool:
+	state = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"values",
+		CompilerArrayType(compiler_type_int(), [CompilerConstIntType(5)]),
+	)
+	forward_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		for_name_expr(
+			"i",
+			range_expr(int_expr("0"), int_expr("4")),
+			subscript_expr(
+				ParsedNameExpr(ident("values")),
+				[binary_expr(ParsedAddOp, ParsedNameExpr(ident("i")), int_expr("1"))],
+			),
+		),
+	)
+	backward_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		for_name_expr(
+			"i",
+			range_expr(int_expr("1"), int_expr("5")),
+			subscript_expr(
+				ParsedNameExpr(ident("values")),
+				[binary_expr(ParsedSubtractOp, ParsedNameExpr(ident("i")), int_expr("1"))],
+			),
+		),
+	)
+	unsafe_result = compiler_infer_expr(
+		compiler_infer_context(state),
+		for_name_expr(
+			"i",
+			range_expr(int_expr("0"), int_expr("5")),
+			subscript_expr(
+				ParsedNameExpr(ident("values")),
+				[binary_expr(ParsedAddOp, ParsedNameExpr(ident("i")), int_expr("1"))],
+			),
+		),
+	)
+
+	(
+		forward_result.context.state.errors.length() == 0
+		and backward_result.context.state.errors.length() == 0
+		and unsafe_result.context.state.errors.length() == 1
+		and unsafe_result.context.state.errors
+			.get_or(0, "")
+			.contains("exceeds dimension of size 5")
+	)
+
+
 func test_for_list_binder_allows_loop_control() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -8015,6 +9681,27 @@ tests: TestSuite = {
 			"hidden module function does not shadow builtin",
 			test_hidden_module_function_does_not_shadow_builtin,
 		),
+		(
+			"compiler prelude trait functions are visible",
+			test_compiler_prelude_trait_functions_are_visible,
+		),
+		(
+			"scalar math call lifts over tensor argument",
+			test_scalar_math_call_lifts_over_tensor_argument,
+		),
+		(
+			"local scalar math call does not lift over tensor argument",
+			test_local_scalar_math_call_does_not_lift_over_tensor_argument,
+		),
+		(
+			"bare length dispatches to tensor HasLength",
+			test_bare_length_dispatches_to_tensor_has_length,
+		),
+		(
+			"explicit import wins constructor name collision",
+			test_explicit_import_wins_constructor_name_collision,
+		),
+		("lexical binding wins explicit import", test_lexical_binding_wins_explicit_import),
 		("matrix builtin binds literal dimensions", test_matrix_builtin_binds_literal_dimensions),
 		(
 			"vector builtin derives dimension arithmetic",
@@ -8033,6 +9720,18 @@ tests: TestSuite = {
 			test_annotated_var_decl_widens_literal_initializer,
 		),
 		(
+			"annotated binding accepts pure callback for impure slot",
+			test_annotated_binding_accepts_pure_callback_for_impure_slot,
+		),
+		(
+			"annotated binding rejects impure callback for pure slot",
+			test_annotated_binding_rejects_impure_callback_for_pure_slot,
+		),
+		(
+			"annotated binding rejects narrower higher order callback",
+			test_annotated_binding_rejects_narrower_higher_order_callback,
+		),
+		(
 			"block scopes local bindings and uses last expression type",
 			test_block_scopes_local_bindings_and_uses_last_expression_type,
 		),
@@ -8040,6 +9739,7 @@ tests: TestSuite = {
 			"block preserves last expression value type",
 			test_block_preserves_last_expression_value_type,
 		),
+		("name lookup uses resolved bound meta", test_name_lookup_uses_resolved_bound_meta),
 		(
 			"finalize infer result zonks bound meta tree",
 			test_finalize_infer_result_zonks_bound_meta_tree,
@@ -8077,6 +9777,10 @@ tests: TestSuite = {
 		),
 		("detach rejects stream capture", test_detach_rejects_stream_capture),
 		("select checks arms and returns void", test_select_checks_arms_and_returns_void),
+		(
+			"select accepts canonical Duration and range timeout",
+			test_select_accepts_canonical_duration_and_range_timeout,
+		),
 		(
 			"select rejects empty non channel and bad timeout",
 			test_select_rejects_empty_non_channel_and_bad_timeout,
@@ -8156,6 +9860,10 @@ tests: TestSuite = {
 			test_constructor_identifier_uses_generic_expected_parent_type,
 		),
 		(
+			"equality binds unconstrained generic constructor",
+			test_equality_binds_unconstrained_generic_constructor,
+		),
+		(
 			"constructor call specializes generic return",
 			test_constructor_call_specializes_generic_return,
 		),
@@ -8166,6 +9874,10 @@ tests: TestSuite = {
 		(
 			"if branch constructor call uses expected return for unmentioned generic",
 			test_if_branch_constructor_call_uses_expected_return_for_unmentioned_generic,
+		),
+		(
+			"if branches infer complementary Result parameters",
+			test_if_branches_infer_complementary_result_parameters,
 		),
 		(
 			"question bind option binds unwrapped value for following statements",
@@ -8201,6 +9913,14 @@ tests: TestSuite = {
 		("arithmetic widens literal operands", test_arithmetic_widens_literal_operands),
 		("tensor arithmetic preserves fixed shape", test_tensor_arithmetic_preserves_fixed_shape),
 		(
+			"tensor arithmetic rejects bounded generic element",
+			test_tensor_arithmetic_rejects_bounded_generic_element,
+		),
+		(
+			"tensor arithmetic accepts numeric family bound",
+			test_tensor_arithmetic_accepts_numeric_family_bound,
+		),
+		(
 			"tensor arithmetic rejects invalid operands",
 			test_tensor_arithmetic_rejects_invalid_operands,
 		),
@@ -8215,14 +9935,31 @@ tests: TestSuite = {
 			test_string_interpolation_rejects_non_stringable_expr,
 		),
 		("comparison and equality return bool", test_comparison_and_equality_return_bool),
+		("collection equality returns bool", test_collection_equality_returns_bool),
 		(
 			"generic comparison requires Orderable bound",
 			test_generic_comparison_requires_orderable_bound,
 		),
 		("enum equality returns bool", test_enum_equality_returns_bool),
 		("unary and logical ops", test_unary_and_logical_ops),
+		(
+			"negative float literal uses expected sized float type",
+			test_negative_float_literal_uses_expected_sized_float_type,
+		),
+		(
+			"negative int literal uses expected sized int type",
+			test_negative_int_literal_uses_expected_sized_int_type,
+		),
 		("direct call infers return type", test_direct_call_infers_return_type),
+		(
+			"user function shadows assert_shape builtin",
+			test_user_function_shadows_assert_shape_builtin,
+		),
 		("direct call widens argument", test_direct_call_widens_argument),
+		(
+			"direct call preserves range proof for range parameter",
+			test_direct_call_preserves_range_proof_for_range_parameter,
+		),
 		("direct call records resolved metadata", test_direct_call_records_resolved_metadata),
 		("closure call records resolved metadata", test_closure_call_records_resolved_metadata),
 		(
@@ -8265,12 +10002,24 @@ tests: TestSuite = {
 		),
 		("bare overload uses all argument types", test_bare_overload_uses_all_argument_types),
 		("bare overload prefers pure callback slot", test_bare_overload_prefers_pure_callback_slot),
+		(
+			"UFCS overload uses non-receiver argument types",
+			test_ufcs_overload_uses_non_receiver_argument_types,
+		),
 		("ufcs method call prepends receiver", test_ufcs_method_call_prepends_receiver),
 		(
 			"module qualified ufcs call uses first argument as receiver",
 			test_module_qualified_ufcs_call_uses_first_argument_as_receiver,
 		),
 		("generic ufcs method binds receiver type", test_generic_ufcs_method_binds_receiver_type),
+		(
+			"source UFCS method precedes same named builtin",
+			test_source_ufcs_method_precedes_same_named_builtin,
+		),
+		(
+			"callable record field precedes same named UFCS method",
+			test_callable_record_field_precedes_same_named_ufcs_method,
+		),
 		(
 			"ufcs call keeps outer type params when callee names collide",
 			test_ufcs_call_keeps_outer_type_params_when_callee_names_collide,
@@ -8283,8 +10032,32 @@ tests: TestSuite = {
 			"direct call accepts function type alias value",
 			test_direct_call_accepts_function_type_alias_value,
 		),
+		(
+			"direct call accepts pure callback for impure slot",
+			test_direct_call_accepts_pure_callback_for_impure_slot,
+		),
+		(
+			"direct call rejects impure callback for pure slot",
+			test_direct_call_rejects_impure_callback_for_pure_slot,
+		),
 		("direct call errors are specific", test_direct_call_errors_are_specific),
 		("generic direct call substitutes type var", test_generic_direct_call_substitutes_type_var),
+		(
+			"direct call accepts concrete tensor for variadic dims",
+			test_direct_call_accepts_concrete_tensor_for_variadic_dims,
+		),
+		(
+			"direct call resolves variadic dims in return types",
+			test_direct_call_resolves_variadic_dims_in_return_types,
+		),
+		(
+			"generic dim argument uses static expression type",
+			test_generic_dim_argument_uses_static_expression_type,
+		),
+		(
+			"assert_shape refines and validates arguments",
+			test_assert_shape_refines_and_validates_arguments,
+		),
 		(
 			"generic direct call substitutes nested type var",
 			test_generic_direct_call_substitutes_nested_type_var,
@@ -8300,6 +10073,14 @@ tests: TestSuite = {
 		(
 			"generic call guides unannotated callback parameter",
 			test_generic_call_guides_unannotated_callback_parameter,
+		),
+		(
+			"generic call rejects impure callback for pure slot",
+			test_generic_call_rejects_impure_callback_for_pure_slot,
+		),
+		(
+			"generic call uses purity for annotated callback first",
+			test_generic_call_uses_purity_for_annotated_callback_first,
 		),
 		(
 			"expected pure callback upgrades only pure lambda body",
@@ -8382,6 +10163,18 @@ tests: TestSuite = {
 			test_var_decl_rejects_one_shot_stream_function_carrier_binding,
 		),
 		(
+			"resource shape checks memoize complete types",
+			test_resource_shape_checks_memoize_complete_types,
+		),
+		(
+			"resource shape checks expand generic alias chains",
+			test_resource_shape_checks_expand_generic_alias_chains,
+		),
+		(
+			"resource shape checks terminate on cyclic aliases",
+			test_resource_shape_checks_terminate_on_cyclic_aliases,
+		),
+		(
 			"var decl rejects resource source carrier binding",
 			test_var_decl_rejects_resource_source_carrier_binding,
 		),
@@ -8437,7 +10230,19 @@ tests: TestSuite = {
 			"assignment creates implicit immutable binding",
 			test_assignment_creates_implicit_immutable_binding,
 		),
+		(
+			"assignment shadows outer function with local binding",
+			test_assignment_shadows_outer_function_with_local_binding,
+		),
 		("assignment updates mutable binding", test_assignment_updates_mutable_binding),
+		(
+			"assignment accepts pure callback for impure slot",
+			test_assignment_accepts_pure_callback_for_impure_slot,
+		),
+		(
+			"assignment rejects impure callback for pure slot",
+			test_assignment_rejects_impure_callback_for_pure_slot,
+		),
 		(
 			"assignment accepts semantically proven range",
 			test_assignment_accepts_semantically_proven_range,
@@ -8502,6 +10307,14 @@ tests: TestSuite = {
 			test_tensor_subscript_peels_and_multi_index_returns_element,
 		),
 		(
+			"negative tensor subscript normalizes concrete index",
+			test_negative_tensor_subscript_normalizes_concrete_index,
+		),
+		(
+			"modulo subscript rewrites negative dividend safely",
+			test_modulo_subscript_rewrites_negative_dividend_safely,
+		),
+		(
 			"normalized matrix checked get infers element call",
 			test_normalized_matrix_checked_get_infers_element_call,
 		),
@@ -8522,6 +10335,10 @@ tests: TestSuite = {
 			test_symbolic_range_subscript_requires_matching_dimension,
 		),
 		(
+			"symbolic literal subscript uses guaranteed minimum",
+			test_symbolic_literal_subscript_uses_guaranteed_minimum,
+		),
+		(
 			"if bounds condition refines runtime index",
 			test_if_bounds_condition_refines_runtime_index,
 		),
@@ -8534,11 +10351,24 @@ tests: TestSuite = {
 			"generic dimension argument preserves static expression",
 			test_generic_dimension_argument_preserves_static_expression,
 		),
+		(
+			"generic dimension return widens to expected int",
+			test_generic_dimension_return_widens_to_expected_int,
+		),
+		(
+			"if bounds condition refines multiple runtime indices",
+			test_if_bounds_condition_refines_multiple_runtime_indices,
+		),
+		("builtin zip resolves through UFCS", test_builtin_zip_resolves_through_ufcs),
 		("subscript errors are specific", test_subscript_errors_are_specific),
 		("subscript assign allows mutable tensor", test_subscript_assign_allows_mutable_tensor),
 		(
 			"matrix subscript assign uses ranked checked set",
 			test_matrix_subscript_assign_uses_ranked_checked_set,
+		),
+		(
+			"direct checked set calls preserve tensor type",
+			test_direct_checked_set_calls_preserve_tensor_type,
 		),
 		("subscript assign errors are specific", test_subscript_assign_errors_are_specific),
 		(
@@ -8548,6 +10378,14 @@ tests: TestSuite = {
 		("record update errors are specific", test_record_update_errors_are_specific),
 		("range expr requires int endpoints", test_range_expr_requires_int_endpoints),
 		("if with else infers common int type", test_if_with_else_infers_common_int_type),
+		(
+			"if with else widens literal tuple elements",
+			test_if_with_else_widens_literal_tuple_elements,
+		),
+		(
+			"if unifies generic nullary constructor branch",
+			test_if_unifies_generic_nullary_constructor_branch,
+		),
 		(
 			"if without else requires void then branch",
 			test_if_without_else_requires_void_then_branch,
@@ -8607,6 +10445,7 @@ tests: TestSuite = {
 			"for range dimension expression binder is refined",
 			test_for_range_dimension_expression_binder_is_refined,
 		),
+		("for literal range proves safe offsets", test_for_literal_range_proves_safe_offsets),
 		("for list binder allows loop control", test_for_list_binder_allows_loop_control),
 		("for dict name binder iterates keys", test_for_dict_name_binder_iterates_keys),
 		("for channel name binder iterates values", test_for_channel_name_binder_iterates_values),

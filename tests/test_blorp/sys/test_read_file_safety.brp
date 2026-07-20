@@ -1,67 +1,144 @@
--- Tests for read_file/read_bytes safety on non-seekable and edge-case files
+-- Tests for read_file/read_bytes safety on non-seekable and edge-case files.
 import:
-	string: length
-	system: exec, read_bytes, read_file
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessCommand, ProcessExit(Exited), ProcessStream(NullStream), command, run_command
+	system: read_bytes, read_file, temp_dir, write_file
 	test: TestSuite
+	units: milliseconds
 
 
--- Test: read_file on a FIFO (non-seekable) returns Err instead of crashing
--- This exercises the ftell() == -1 guard
+FIFO_WRITER_TIMEOUT_MILLISECONDS: Int = 5000
+
+
+private pure func fifo_writer_command(path: String) -> ProcessCommand:
+	{ command(
+		"sh",
+		["-c", "trap 'exit 0' PIPE; printf 'hello\\n' > \"$1\" || true", "sh", path],
+	) |
+		stdout = NullStream,
+		stderr = NullStream,
+		timeout = Some(milliseconds(FIFO_WRITER_TIMEOUT_MILLISECONDS))
+	}
+
+
+private func exercise_read_file_fifo() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_read_file_fifo_"):
+		path: String = directory.resource_path() + "/input"
+
+		match run_command(command("mkfifo", [path])):
+			Err(_):
+				Ok(False)
+			Ok(created):
+				if created.exit != Exited(0):
+					Ok(False)
+				else:
+					concurrent:
+						writer = run_command(fifo_writer_command(path))
+						reader = read_file(path)
+
+					match writer:
+						Err(_):
+							Ok(False)
+						Ok(writer_result):
+							match writer_result:
+								Err(_):
+									Ok(False)
+								Ok(command_result):
+									if command_result.exit != Exited(0):
+										Ok(False)
+									else:
+										match reader:
+											Err(_):
+												Ok(False)
+											Ok(read_result):
+												match read_result:
+													Err(_):
+														Ok(True)
+													Ok(_):
+														Ok(False)
+
+
+private func exercise_read_bytes_fifo() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_read_bytes_fifo_"):
+		path: String = directory.resource_path() + "/input"
+
+		match run_command(command("mkfifo", [path])):
+			Err(_):
+				Ok(False)
+			Ok(created):
+				if created.exit != Exited(0):
+					Ok(False)
+				else:
+					concurrent:
+						writer = run_command(fifo_writer_command(path))
+						reader = read_bytes(path)
+
+					match writer:
+						Err(_):
+							Ok(False)
+						Ok(writer_result):
+							match writer_result:
+								Err(_):
+									Ok(False)
+								Ok(command_result):
+									if command_result.exit != Exited(0):
+										Ok(False)
+									else:
+										match reader:
+											Err(_):
+												Ok(False)
+											Ok(read_result):
+												match read_result:
+													Err(_):
+														Ok(True)
+													Ok(_):
+														Ok(False)
+
+
+private func exercise_normal_file(content: String) -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_read_file_normal_"):
+		path: String = directory.resource_path() + "/input"
+
+		match write_file(path, content):
+			Err(_):
+				Ok(False)
+			Ok(_):
+				match read_file(path):
+					Ok(actual):
+						Ok(actual == content)
+					Err(_):
+						Ok(False)
+
+
 func test_read_fifo_returns_err() -> Bool:
-	fifo_path: String = "/tmp/__blorp_test_fifo_safety"
-
-	-- Create a FIFO
-	_ = exec("rm -f /tmp/__blorp_test_fifo_safety && mkfifo /tmp/__blorp_test_fifo_safety")
-
-	-- Write something to the FIFO in background so it doesn't block
-	_ = exec("echo hello > /tmp/__blorp_test_fifo_safety &")
-	result: Result[String, String] = read_file(fifo_path)
-
-	-- Clean up
-	_ = exec("rm -f /tmp/__blorp_test_fifo_safety")
-
-	-- Should return Err (not crash) because FIFO is non-seekable
-	match result:
-		Ok(_): True -- Some systems may handle FIFOs; passing is OK
-		Err(_): True -- Expected: ftell returns -1 on non-seekable
-
-
--- Test: read_bytes on a FIFO returns Err instead of crashing
-func test_read_bytes_fifo_returns_err() -> Bool:
-	fifo_path: String = "/tmp/__blorp_test_fifo_bytes_safety"
-	_ = exec((
-			"rm -f /tmp/__blorp_test_fifo_bytes_safety && mkfifo /tmp/"
-			+ "__blorp_test_fifo_bytes_safety"
-		))
-	_ = exec("echo hello > /tmp/__blorp_test_fifo_bytes_safety &")
-	result: Result[Bytes, String] = read_bytes(fifo_path)
-	_ = exec("rm -f /tmp/__blorp_test_fifo_bytes_safety")
-	match result:
-		Ok(_): True
-		Err(_): True
-
-
--- Test: read_file on normal file still works
-func test_read_normal_file() -> Bool:
-	_ = exec("printf 'test content' > /tmp/__blorp_test_read_normal")
-	match read_file("/tmp/__blorp_test_read_normal"):
-		Ok(content):
-			_ = exec("rm -f /tmp/__blorp_test_read_normal")
-			content == "test content"
+	match exercise_read_file_fifo():
+		Ok(result):
+			result
 		Err(_):
-			_ = exec("rm -f /tmp/__blorp_test_read_normal")
 			False
 
 
--- Test: read_file on empty file returns empty string
-func test_read_empty_file() -> Bool:
-	_ = exec("touch /tmp/__blorp_test_read_empty")
-	match read_file("/tmp/__blorp_test_read_empty"):
-		Ok(content):
-			_ = exec("rm -f /tmp/__blorp_test_read_empty")
-			content.length() == 0
+func test_read_bytes_fifo_returns_err() -> Bool:
+	match exercise_read_bytes_fifo():
+		Ok(result):
+			result
 		Err(_):
-			_ = exec("rm -f /tmp/__blorp_test_read_empty")
+			False
+
+
+func test_read_normal_file() -> Bool:
+	match exercise_normal_file("test content"):
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+func test_read_empty_file() -> Bool:
+	match exercise_normal_file(""):
+		Ok(result):
+			result
+		Err(_):
 			False
 
 

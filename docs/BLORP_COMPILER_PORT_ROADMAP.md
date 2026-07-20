@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-12.
+Status checked against code on 2026-07-16.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -20,16 +20,16 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
 Blorp executable / CLI planning / source graph discovery / source reads / parse
-  -> JSON frontend module graph and Blorp typed-program/CTFE bridge
-  -> OCaml host command execution / module-cache and coherence orchestration /
-     typed-artifact decode
+  -> Blorp typecheck / CTFE / typed semantic-middle request
+  -> one blorp-ocaml-middle process
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
   -> OCaml Core pipeline through specialization and function-reference adaptation
   -> JSON pre-DCE Core
   -> Blorp DCE / consume specialization / Perceus / reuse / closure / resource /
      fairness / prepare / prepared reuse
   -> Blorp C artifact emission
-  -> OCaml artifact writing / C compiler invocation
+  -> Blorp artifact writing / runtime cache / C compiler invocation /
+     optional program execution
 ```
 
 Current source-frontier Blorp files:
@@ -83,12 +83,9 @@ Current production backend-tail Blorp files:
 
 Current OCaml bridge, orchestration, and production-middle files:
 
-- `compiler/bin/blorp_ocaml_host.ml`
+- `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/modules.ml`
 - `compiler/lib/pipeline.ml`
-- `compiler/lib/typecheck.ml`
-- `compiler/lib/infer.ml`
 - `compiler/lib/typed_ast.ml`
 - `compiler/lib/core_lower.ml`
 - `compiler/lib/core_pipeline.ml`
@@ -103,9 +100,11 @@ and the complete backend tail; the replaced OCaml implementations and their
 implementation-only tests have been deleted.
 
 The public executable is Blorp-owned through
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. `compiler/bin/blorp_ocaml_host.ml` is a
-private execution shell for decoded Blorp plans, temporary typed-program
-handoffs, artifact writing, host C invocation, and still-OCaml compiler stages.
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. Ordinary `check` makes
+no OCaml call. Ordinary `compile` and `run` call only the private
+`blorp-ocaml-middle` semantic worker; source-command effects stay in Blorp.
+`compiler/bin/blorp_ocaml_host.ml` remains only for non-source commands and the
+explicit pinned-bootstrap compile wrapper.
 
 ## Migration Rules
 
@@ -147,7 +146,6 @@ OCaml references still needed at this checkpoint:
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/language_surface.ml`
 - `compiler/lib/core_trait_resolve.ml`
-- `compiler/lib/core_profile.ml`
 
 Blorp references:
 
@@ -209,34 +207,22 @@ Deletion point:
 
 ## Checkpoint 1: Command Frontier For Source Commands
 
-Goal: make `check`, `compile`, and `run` source command planning entirely
-Blorp-owned up to the frontend module graph handed to the OCaml middle.
+Goal: make `check`, `compile`, and `run` source command planning and frontend
+execution Blorp-owned, with one typed semantic-middle boundary for commands
+that continue past the frontend.
 
-Status: closed for normal source commands. The OCaml shell validates and
-executes a decoded `frontend_module_graph` for `check`, `compile`, and `run`;
-it no longer rediscovers roots, rereads sources, reparses roots, or rebuilds
-source-package context for those commands. The legacy `frontend_options`
-artifact is rejected as an unsupported legacy artifact rather than decoded for
-source execution.
+Status: closed for normal source commands. The Blorp executable discovers and
+reads the source graph, parses and typechecks it, and runs CTFE. `check` ends in
+Blorp without invoking OCaml. `compile` and `run` send one typed request to the
+temporary OCaml semantic-middle worker; the OCaml command host is not part of
+their normal source path. The legacy `frontend_options` artifact is rejected
+rather than decoded for source execution.
 
 OCaml references:
 
-- `compiler/bin/blorp_ocaml_host.ml`
-  - `apply_blorp_cli_frontier`
-  - `cli_frontier_frontend_module_graph`
-  - `finalize_cli_frontend_graph_source`
-  - `finalized_cli_frontend_graph_sources_or_exit`
-  - `apply_cli_frontend_graph_context`
-  - `run_check_from_frontier_options`
-  - `run_compile_from_frontier_options`
-  - `run_file_from_frontier_options`
-  - `compile_opts_of_cli_check`
-  - `compile_opts_of_cli_compile`
-  - `check_file_with_opts`
-  - `compile_file_with_opts`
-  - `run_file`
+- `compiler/bin/blorp_ocaml_middle.ml`
+- `compiler/lib/semantic_middle_worker.ml`
 - `compiler/lib/pipeline.ml`
-  - `typecheck_only_typed_with_blorp_bridge_policy`
   - `compile_preloaded_graph_with_blorp_bridge`
   - `compile_loaded_program`
 
@@ -246,6 +232,10 @@ Blorp references:
 - `compiler/blorp/src/stage_12_cli/compiler_cli_args.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_plan.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_typecheck.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_execute.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_compile_execute.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_cli_artifact_json.brp`
 
 Implementation steps:
@@ -265,12 +255,10 @@ Implementation steps:
   - source package aliases,
   - local `pkg/` roots,
   - parsed response at the requested AST phase.
-- Make OCaml `apply_cli_frontend_graph_context` only apply already-discovered
-  graph context to the current session. It should not perform independent
-  filesystem discovery for normal source commands.
-- Make `run_check_from_frontier_options`, `run_compile_from_frontier_options`,
-  and `run_file_from_frontier_options` call the parsed/graph pipeline entry
-  points only.
+- Keep `check` execution free of semantic-middle and backend imports so its
+  dependency graph cannot accidentally reintroduce the OCaml boundary.
+- Keep compile/run worker requests typed and phase-specific, and invoke the
+  semantic middle exactly once after the Blorp frontend succeeds.
 - Do not reintroduce `frontend_options` execution for source commands. Treat it
   as an unsupported legacy artifact at the bridge decoder boundary.
 
@@ -302,11 +290,11 @@ Closed deletion point:
 
 - OCaml root expansion, source reads, and parser fallback code for normal
   `check`, `compile`, and `run` have been deleted from the shell path. The
-  remaining source-command shell code assumes a Blorp-produced graph before it
-  enters `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` or
+  ordinary `check` path now ends in the Blorp frontend without entering OCaml.
+  The pinned bootstrap compile wrapper consumes a Blorp-produced graph through
   `Pipeline.compile_preloaded_graph_with_blorp_bridge`. The test-only
-  `Pipeline.compile_parsed` compatibility API and its path-specific tests have
-  been deleted, along with the redundant default-policy typecheck wrapper.
+  graph-typecheck wrapper, `Pipeline.compile_parsed` compatibility API, and
+  their path-specific tests have been deleted.
 
 ## Checkpoint 2: Source Model, Parser, And Source-AST Finalization
 
@@ -538,11 +526,11 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml module path resolution/loading/cache code after
-  `Pipeline.compile_preloaded_graph_with_blorp_bridge` and
-  `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` consume a Blorp-validated
-  module graph for every production/tooling caller and no longer need
-  `Modules.load_imports` for non-graph entry points.
+- Delete OCaml module path resolution/loading/cache code after every remaining
+  production and tooling caller consumes a Blorp-validated module graph and no
+  longer needs `Modules.load_imports` for non-graph entry points. The pinned
+  bootstrap wrapper already enters through
+  `Pipeline.compile_preloaded_graph_with_blorp_bridge`.
 
 ## Checkpoint 4: Diagnostics, Session, Types, Env, And Builtins
 
@@ -1537,12 +1525,9 @@ Current status:
   typecheck through the Blorp bridge. Bare lookup is scoped: declarations made
   available only through a module alias do not leak as unqualified values, and
   private imported declarations are skipped.
-- `Pipeline.typecheck_only_typed_with_blorp_bridge_policy` is the graph-backed Blorp
-  typecheck handoff used by source-command checks. It builds explicit
-  import-module payloads from graph edges, materializes graph-loaded dependency
-  module typed declarations/import bindings into `Modules`, and requires the
-  decoded Blorp artifact to have already run CTFE before returning the target
-  typed program or Blorp typecheck/CTFE diagnostics.
+- Source-command checks now typecheck the in-memory graph directly in Blorp and
+  never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
+  wrapper and its duplicate adapter tests have been deleted.
 - `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
   compile boundary: it consumes the same Blorp frontend graph, decodes the
   Blorp typed-program artifact, populates dependency typed-module caches, and
@@ -1770,12 +1755,14 @@ Current status:
   removed; legacy direct pipeline APIs now produce finalized typed ASTs without
   a compile-time global rewrite and should continue moving to explicit Blorp
   frontend graphs.
-- The OCaml test runner remains one of those classified legacy paths. It
-  discovers test files, rewrites `TestSuite` and doctest harnesses, and compiles
-  generated sources after CLI planning has already delegated to test mode. Do
-  not duplicate frontend graph construction inside the OCaml runner; move this
-  only with a Blorp-owned test runner or an explicit Blorp test source-graph
-  handoff.
+- The OCaml test runner still owns discovery, `TestSuite`/doctest harness
+  generation, C compilation, and execution, but it no longer re-enters the
+  OCaml source frontend. Generated suite, aggregate, and doctest harnesses use
+  an explicit in-memory Blorp source-graph handoff with generated-source policy;
+  standalone leak-baseline programs use the same handoff with ordinary user
+  source policy. The remaining TestRunner migration is orchestration ownership,
+  not parser/typechecker parity, and must preserve doctest location remapping,
+  process cleanup, and filesystem-isolation behavior.
 
 Typed frontier closure before CTFE:
 
@@ -1783,7 +1770,18 @@ Typed frontier closure before CTFE:
   `Pipeline.compile_legacy_direct_source`,
   `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
-  test runner, and LSP/tooling helpers.
+  LSP/tooling helpers, and the remaining package/REPL routes. TestRunner source
+  compilation is closed; its OCaml work is post-frontend orchestration.
+- The separate compiler fixture runner still uses
+  `Pipeline.typecheck_only_typed_reusing_session` for most `infer` and
+  `typecheck` fixtures. This is test-only and is not part of production
+  `blorp check`. A production-check parity probe on 2026-07-17 found 73
+  should-pass fixtures rejected and 137 should-fail fixtures accepted by the
+  Blorp checker. Keep those fixtures as migration-gap coverage; delete the
+  reusable OCaml checker and its implementation tests only after the Blorp
+  path agrees on status and diagnostics. Do not make one compiler process per
+  fixture the permanent replacement because that would materially regress the
+  test feedback loop.
 - Normal source execution must enter through the Blorp frontend graph and
   `typecheck_source` bridge. If a direct pipeline API remains, document it as a
   temporary legacy/tooling route with a deletion condition rather than allowing
@@ -1808,7 +1806,6 @@ Edge cases:
 Tests:
 
 - `compiler/test/test_typed_ast.ml`
-- `compiler/test/test_typed_ast_debug.ml`
 - `compiler/blorp/tests/test_compiler_ctfe_*.brp`
 - `tests/test_compiler/typecheck/should_pass/compile_time_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/global_constant_*.brp`
@@ -1912,6 +1909,16 @@ Current progress:
   simple named-binder
   range/List/String/Set `for` loops, and function/global/record/enum/union
   declarations with explicit lowering context state for Core def ids.
+- Function-body classification is now shared at the parsed-AST boundary rather
+  than being inferred independently by typecheck and Core lowering. Blorp Core
+  lowering preserves legal forward declarations as bodyless user functions,
+  preserves naked and `std/...` builtin declarations as bodyless builtin
+  functions for later synthesis/resolution, and synthesizes named runtime
+  helper bodies as parameter-forwarding `BuiltinCall` expressions. It rejects
+  inconsistent typed payloads, such as a forward or builtin declaration that
+  unexpectedly carries a typed source body. Concrete intrinsic-body synthesis
+  and the post-monomorphization `Core_synth` retry are still required before the
+  production lowering boundary can move across std modules.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the next
   production boundary strict while expression coverage expands. Calls now
@@ -2010,7 +2017,9 @@ Current progress:
   lowering. Do not make `CompilerTypedParsedDecl` disappear by dropping these
   declarations: the late pre-DCE bridge can omit them only because OCaml has
   already consumed their semantics.
-- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice.
+- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice,
+  including ordinary function bodies, forward declarations, deferred std
+  builtins, and named runtime-helper forwarding bodies.
   Tensor-shaped type lowering exists in the helper, but the runtime test avoids
   constructing that metadata until backend test emission handles it cheaply.
 - The lowering tests now include a fixture-shaped `CompilerTypedProgram` to
@@ -2064,12 +2073,24 @@ Current progress:
   range-refined binder type. Loop-view metadata is authoritative: malformed
   metadata and unported view kinds fail lowering instead of falling through to
   the producer function's nominal return type. Dict tuple-pair binders,
-  resource-source, tuple-binder, tensor, `enumerate`, `enumerate2`, `windows`,
-  and any remaining iterable families still need deliberate prepared-loop
-  slices instead of a generic OCaml-style `CFor` node. A first tuple-binder
-  lowering attempt exposed an unsafe generated
-  cleanup shape around synthetic tuple references inside a `?=` path; fix the
-  resource/codegen issue before enabling that path in production lowering.
+  resource-source, tensor, `windows`, and any remaining iterable families still
+  need deliberate prepared-loop slices instead of a generic OCaml-style `CFor`
+  node. Ordinary tuple binders over
+  tuple-valued iterables now lower through one collision-free synthetic loop
+  binder plus explicit tuple-field `LetExpr` bindings; Dict pairs select the
+  existing prepared pair-iteration backend path. This work resumes after the
+  ownership-hardening fixes that closed the earlier synthetic-tuple cleanup
+  failure. The focused late-Core ASan/UBSan gate passes 672/672 with the tuple
+  and loop-view lowering regressions included. One-dimensional tensor
+  `enumerate` and matrix `enumerate2` now capture their source exactly once and
+  lower directly to one or two prepared range loops. Tuple binders use the
+  range variables directly
+  and bind only the fetched element, avoiding a per-iteration tuple allocation;
+  a single-name binder still materializes the language-level pair or triple.
+  `enumerate2` uses the concrete column dimension when available and otherwise
+  mirrors the production OCaml fallback of `tensor_capacity(source) /
+  length(source)` for generic matrix dimensions. Multidimensional `enumerate`
+  and `windows` remain closed.
 - Literal-only matches lower directly to prepared `LiteralMatchExpr` nodes for
   literal arms plus a wildcard fallback. Binding, constructor, tuple/list, and
   or-pattern lowering remains deliberately closed until the full match
@@ -2108,9 +2129,11 @@ Edge cases:
   compiler defect is fixed; do not duplicate the enum through import aliases.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
-  internal and must only lower under `for`/tuple-for. `indices` is implemented;
-  keep the remaining producers closed until their synthesized bindings and
-  tensor access operations have explicit collision-free Core identities.
+  internal and must only lower under `for`/tuple-for. `indices`, one-dimensional
+  `enumerate`, and two-dimensional `enumerate2` are implemented with explicit
+  collision-free Core identities. Keep multidimensional `enumerate` and
+  `windows` closed until their row/slice operations have the same explicit
+  ownership and identity treatment.
 - Module alias calls use `TyNamed "Module"` sentinel today; replace with an
   explicit typed AST/Core representation when feasible.
 - Callable ids from inference must remain authoritative over stale mangled
@@ -2443,17 +2466,20 @@ in `BLORP_OCAML_HOST_EXIT_ROADMAP.md`. It is also authoritative for replacing
 the serialized CLI/module-graph plan with one phase-specific semantic-middle
 worker. The summary below remains as an index of the affected compiler areas.
 
+Status: production cutover is complete. Blorp owns source-command artifact
+writing, runtime packaging and caching, host-C invocation, and program
+execution. Pre-DCE and prepared Core are distinct backend-boundary types, so
+the CLI cannot repeat the late ownership pipeline before emission. The
+remaining work is Checkpoint K of the host-exit roadmap: merge and publish this
+architecture from the old immutable bootstrap, then rotate the single
+bootstrap manifest in a separate commit.
+
 OCaml references:
 
 - `compiler/bin/blorp_ocaml_host.ml`
-  - `write_file`
-  - `write_compile_output`
-  - `run_file`
+  - `run_bootstrap_compile`, used only by the pinned bootstrap wrapper
 - `compiler/lib/test_runner.ml`
-  - `compile_c_from_stdin`
-  - `precompile_runtime`
-  - `runtime_cache_key`
-  - `cc_args_for_test_binary`
+  - shared test-command compilation, scheduled for Checkpoint 12
 - `compiler/lib/runtime.c`
 - `compiler/lib/runtime_decl.c`
 - `compiler/lib/runtime_raylib.c`
@@ -2461,10 +2487,11 @@ OCaml references:
 
 Blorp references:
 
-- `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp`
 - `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`
-- future `compiler_artifact_writer.brp`
-- future `compiler_host_c.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_artifact_writer.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_host_c.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_runtime_cache.brp`
+- `compiler/blorp/src/stage_12_cli/compiler_program_runner.brp`
 
 Implementation steps:
 
@@ -2495,9 +2522,10 @@ Tests:
 
 Deletion point:
 
-- Delete OCaml artifact writing and host-C wrapper only after the Blorp CLI can
-  perform impure file/process actions directly and the preview smoke commands
-  pass through the Blorp shell.
+- Complete for ordinary source commands. Delete the narrow OCaml bootstrap
+  compile wrapper only after the post-merge compiler release is pinned and no
+  longer requires it. Test-runner process/C compilation remains a separate
+  Checkpoint 12 responsibility.
 
 ## Checkpoint 12: Tools, Test Runner, REPL, LSP, Packages, And Final OCaml Shell
 

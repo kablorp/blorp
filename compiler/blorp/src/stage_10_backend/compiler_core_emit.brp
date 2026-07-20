@@ -2,7 +2,8 @@
 --
 -- This intentionally starts as a valid-C skeleton. The production migration
 -- can replace each inventory comment with real C emission while preserving the
--- same typed CoreProgram -> CArtifact boundary.
+-- same typed CoreProgram -> raw CArtifact boundary. Build metadata is completed
+-- separately by compiler_build_artifact.
 import:
 	../stage_09_core/compiler_core_json:
 		CoreAccessor(
@@ -399,6 +400,7 @@ import:
 		CoreVar,
 	../stage_09_core/compiler_core_ownership:
 		OwnershipCallContract,
+		OwnershipResultMode(ReturnOwned),
 		arg_consumes_caller,
 		builtin_contract,
 		intrinsic_contract,
@@ -648,7 +650,7 @@ import:
 		TupleConstructWithRcArgs,
 		TupleRetainElemArgs,
 		render_prepared_tuple_op,
-	compiler_artifact_json: CArtifact
+	compiler_build_artifact: CArtifact
 	compiler_core_emit_type_layout as TypeLayout
 	string: string as make_string
 
@@ -1073,14 +1075,14 @@ private pure func c_type_name(typ: CoreType) -> String:
 
 
 private pure func c_return_type(func_info: CoreFunction) -> String:
-	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module == None:
+	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module.is_none():
 		"int"
 	else:
 		c_type_name(func_info.return_type)
 
 
 private pure func c_function_name(func_info: CoreFunction) -> String:
-	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module == None:
+	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module.is_none():
 		ENTRYPOINT_FUNCTION_NAME
 	else:
 		c_identifier(func_info.name)
@@ -1109,7 +1111,7 @@ private pure func c_var_name(variable: CoreVar) -> String:
 private pure func entrypoint_has_source_args(func_info: CoreFunction) -> Bool:
 	(
 		func_info.name == ENTRYPOINT_FUNCTION_NAME
-		and func_info.source_module == None
+		and func_info.source_module.is_none()
 		and func_info.params.length() > 0
 	)
 
@@ -1388,12 +1390,36 @@ private pure func dict_value_needs_release_type(typ: CoreType) -> Bool:
 	TypeLayout.dict_value_needs_release_type(typ)
 
 
-private pure func list_element_needs_retain_type(typ: CoreType) -> Bool:
-	TypeLayout.list_element_needs_retain_type(typ)
-
-
 private pure func type_is_value_record(typ: CoreType) -> Bool:
 	TypeLayout.type_is_value_record(typ)
+
+
+private pure func ownership_result_transfers_ownership(result: OwnershipResultMode) -> Bool:
+	match result:
+		ReturnOwned:
+			True
+		_:
+			False
+
+
+private pure func call_result_transfers_ownership(kind: CoreCallKind, arg_count: Int) -> Bool:
+	match call_kind_ownership_contract(kind, arg_count):
+		Some(contract):
+			ownership_result_transfers_ownership(contract.result)
+		None:
+			-- User, closure, foreign, and unresolved calls follow the Core ABI:
+			-- managed results are caller-owned unless a runtime contract says otherwise.
+			True
+
+
+private pure func expr_source_transfers_ownership(expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			call_result_transfers_ownership(kind, args.length())
+		CastExpr(expr_value, typ, loc):
+			expr_source_transfers_ownership(expr_value)
+		_:
+			expr_transfers_ownership(expr)
 
 
 private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
@@ -1409,7 +1435,7 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		LiteralExpr(literal, typ, loc):
 			match literal:
 				StringLiteral(value):
-					False
+					True
 				IntLiteral(value):
 					boxed_value_needs_release_type(typ)
 				WideIntLiteral(value):
@@ -1433,7 +1459,10 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		CooperativeCheckpointExpr(typ, loc):
 			boxed_value_needs_release_type(typ)
 		CallExpr(kind, callee, args, typ, loc):
-			boxed_value_needs_release_type(typ)
+			(
+				boxed_value_needs_release_type(typ)
+				and call_result_transfers_ownership(kind, args.length())
+			)
 		BinaryExpr(op, left, right, typ, loc):
 			boxed_value_needs_release_type(typ)
 		UnaryExpr(op, expr_value, typ, loc):
@@ -1443,7 +1472,7 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		AssignExpr(variable, rhs, typ, loc):
 			boxed_value_needs_release_type(typ)
 		CastExpr(expr_value, typ, loc):
-			boxed_value_needs_release_type(typ)
+			boxed_value_needs_release_type(typ) and expr_source_transfers_ownership(expr_value)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
 			boxed_value_needs_release_type(typ)
 		TupleExpr(items, typ, loc):
@@ -2163,9 +2192,73 @@ private pure func emit_string_literal_expr(value: String) -> String:
 		.to_string()
 
 	if string_contains_nul(value):
-		"blorp_string_literal_len(" + literal_c + ", " + length_c + "L)"
+		"blorp_string_create_len(" + literal_c + ", " + length_c + "L)"
 	else:
-		"blorp_string_literal(" + literal_c + ")"
+		"blorp_string_create(" + literal_c + ")"
+
+
+private pure func emit_string_literal_comparison(value_c: String, literal: String) -> String:
+	"blorp_string_compare_bytes(" + value_c + ", " + c_string_literal(literal) + ", " + literal
+		.length()
+		.to_string() + "L)"
+
+
+private pure func string_literal_value(expr: CoreExpr) -> Option[String]:
+	match expr:
+		LiteralExpr(StringLiteral(value), typ, loc):
+			Some(value)
+		_:
+			None
+
+
+private pure func string_binary_expr_with_right_literal(
+	op: CoreBinaryOp,
+	left_c: String,
+	right: CoreExpr,
+) -> Option[String]:
+	literal ?= string_literal_value(right)
+	comparison: String = emit_string_literal_comparison(left_c, literal)
+
+	match op:
+		EqualOp:
+			Some("(" + comparison + " == 0)")
+		NotEqualOp:
+			Some("(" + comparison + " != 0)")
+		LessOp:
+			Some("(" + comparison + " < 0)")
+		LessEqualOp:
+			Some("(" + comparison + " <= 0)")
+		GreaterOp:
+			Some("(" + comparison + " > 0)")
+		GreaterEqualOp:
+			Some("(" + comparison + " >= 0)")
+		_:
+			None
+
+
+private pure func string_binary_expr_with_left_literal(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right_c: String,
+) -> Option[String]:
+	literal ?= string_literal_value(left)
+	comparison: String = emit_string_literal_comparison(right_c, literal)
+
+	match op:
+		EqualOp:
+			Some("(" + comparison + " == 0)")
+		NotEqualOp:
+			Some("(" + comparison + " != 0)")
+		LessOp:
+			Some("(" + comparison + " > 0)")
+		LessEqualOp:
+			Some("(" + comparison + " >= 0)")
+		GreaterOp:
+			Some("(" + comparison + " < 0)")
+		GreaterEqualOp:
+			Some("(" + comparison + " <= 0)")
+		_:
+			None
 
 
 private pure func c_float_literal(value: Float) -> String:
@@ -2669,29 +2762,29 @@ private pure func c_binary_expr(
 					None:
 						Some(c_primitive_binary_expr(op, core_expr_type(left), left_c, right_c))
 	else if is_string_type(core_expr_type(left)) or is_string_type(core_expr_type(right)):
-		match op:
-			EqualOp:
-				Some("blorp_string_eq(" + left_c + ", " + right_c + ")")
-			NotEqualOp:
-				Some("(!blorp_string_eq(" + left_c + ", " + right_c + "))")
-			LessOp:
-				Some("(blorp_string_compare(" + left_c + ", " + right_c + ") < 0)")
-			LessEqualOp:
-				Some("(blorp_string_compare(" + left_c + ", " + right_c + ") <= 0)")
-			GreaterOp:
-				Some("(blorp_string_compare(" + left_c + ", " + right_c + ") > 0)")
-			GreaterEqualOp:
-				Some("(blorp_string_compare(" + left_c + ", " + right_c + ") >= 0)")
-			AddOp:
-				None
-			SubtractOp:
-				None
-			MultiplyOp:
-				None
-			DivideOp:
-				None
-			ModuloOp:
-				None
+		match string_binary_expr_with_right_literal(op, left_c, right):
+			Some(expr):
+				Some(expr)
+			None:
+				match string_binary_expr_with_left_literal(op, left, right_c):
+					Some(expr):
+						Some(expr)
+					None:
+						match op:
+							EqualOp:
+								Some("blorp_string_eq(" + left_c + ", " + right_c + ")")
+							NotEqualOp:
+								Some("(!blorp_string_eq(" + left_c + ", " + right_c + "))")
+							LessOp:
+								Some("(blorp_string_compare(" + left_c + ", " + right_c + ") < 0)")
+							LessEqualOp:
+								Some("(blorp_string_compare(" + left_c + ", " + right_c + ") <= 0)")
+							GreaterOp:
+								Some("(blorp_string_compare(" + left_c + ", " + right_c + ") > 0)")
+							GreaterEqualOp:
+								Some("(blorp_string_compare(" + left_c + ", " + right_c + ") >= 0)")
+							_:
+								None
 	else:
 		match collection_equality_binary_expr(op, left, right, left_c, right_c):
 			Some(expr):
@@ -3493,7 +3586,7 @@ private pure func fallible_stream_error_value_statement(
 		error_domain,
 		op_tmp + ".error.detail",
 		op_tmp + ".error.detail ? 1UL : 0UL",
-	) + "; break; } } else { blorp_String* " + detail_tmp + " = " + op_tmp + ".error.detail ? " + op_tmp + ".error.detail : blorp_string_literal(\"fallible stream error domain mismatch\"); " + err_tmp + " = " + fallible_stream_other_error_expr(
+	) + "; break; } } else { blorp_String* " + detail_tmp + " = " + op_tmp + ".error.detail ? " + op_tmp + ".error.detail : blorp_string_create(\"fallible stream error domain mismatch\"); " + err_tmp + " = " + fallible_stream_other_error_expr(
 		error_domain,
 		detail_tmp,
 		op_tmp + ".error.detail ? 1UL : 0UL",
@@ -5815,7 +5908,11 @@ private pure func emit_call_body(
 						Some(value):
 							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 						None:
-							value ?= emit_call_value_from_args(kind, args_body.args, typ)
+							value ?= emit_call_value_from_args(
+								DirectRuntimeCall(call),
+								args_body.args,
+								typ,
+							)
 							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 		BuiltinCall(name):
 			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
@@ -6827,6 +6924,7 @@ private pure func ranked_tensor_checked_get_index_temps(
 
 private pure func ranked_tensor_checked_get_index_bindings(
 	indices: List[String],
+	dims: List[Int],
 	temp_seed: String,
 ) -> String:
 	var statements: String = ""
@@ -6834,7 +6932,9 @@ private pure func ranked_tensor_checked_get_index_bindings(
 
 	for index_value in indices:
 		index_tmp: String = ranked_tensor_checked_get_index_tmp(temp_seed, index)
+		dim: Int = dims.get_or(index, 0)
 		statements += " long " + index_tmp + " = " + index_value + ";"
+		statements += " if (" + index_tmp + " < 0) " + index_tmp + " += " + dim.to_string() + ";"
 		index += 1
 
 	statements
@@ -6895,7 +6995,11 @@ private pure func ranked_tensor_checked_get_prelude(
 	)
 	flat_expr ?= ranked_tensor_checked_get_flat_index_expr(index_temps, get.dims)
 	vector_bind: String = "blorp_Vector* " + vector_tmp + " = (blorp_Vector*)" + get.tensor + ";"
-	index_bindings: String = ranked_tensor_checked_get_index_bindings(get.indices, temp_seed)
+	index_bindings: String = ranked_tensor_checked_get_index_bindings(
+		get.indices,
+		get.dims,
+		temp_seed,
+	)
 	flat_bind: String = " long " + flat_tmp + " = " + flat_expr + ";"
 	condition: String = ranked_tensor_checked_get_conditions(
 		vector_tmp,
@@ -8034,6 +8138,8 @@ private pure func emit_dict_insert_statement(entry: CoreDictEntry) -> Option[Str
 		temp_seed = DICT_CONSTRUCT_TEMP_SEED,
 		key = key_c,
 		value = value_c,
+		key_transfers_ownership = entry.key.transfers_ownership,
+		value_transfers_ownership = entry.value.transfers_ownership,
 	})))
 
 
@@ -8349,7 +8455,7 @@ private pure func emit_list_handoff_set_source_slot(
 
 
 private pure func emit_list_retain(retain: CoreListRetain) -> Option[String]:
-	if not list_element_needs_retain_type(core_expr_type(retain.list)):
+	if not retain.value.needs_release:
 		Some("(void)0")
 	else:
 		list_c ?= emit_simple_expr(retain.list)
@@ -8390,12 +8496,36 @@ private pure func boxed_storage_kind_for_retain_value(typ: CoreType) -> CoreBoxK
 				PointerBox
 
 
-private pure func boxed_storage_value_for_retain_expr(value: CoreExpr) -> CoreBoxedStorageValue:
+private pure func boxed_storage_value_for_retain_intrinsic(
+	value: CoreExpr,
+) -> CoreBoxedStorageValue:
 	value_type: CoreType = core_expr_type(value)
+	kind: CoreBoxKind = boxed_storage_kind_for_retain_value(value_type)
+
+	needs_release: Bool = match kind:
+		PointerBox:
+			True
+		StructBox(_):
+			is_stack_result_type(value_type)
+		PrimBox:
+			False
+		VoidBox:
+			False
+		FloatBox:
+			False
+		Float32Box:
+			False
+		Float16Box:
+			False
+		Int128Box:
+			False
+		UInt128Box:
+			False
+
 	{
-		kind = boxed_storage_kind_for_retain_value(value_type),
+		kind = kind,
 		value = value,
-		needs_release = boxed_value_needs_release_type(value_type),
+		needs_release = needs_release,
 		transfers_ownership = False
 	}
 
@@ -8404,7 +8534,7 @@ private pure func emit_list_retain_body(
 	retain: CoreListRetain,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	if not list_element_needs_retain_type(core_expr_type(retain.list)):
+	if not retain.value.needs_release:
 		Some(body_value("(void)0", next_temp))
 	else:
 		list_c ?= emit_simple_expr(retain.list)
@@ -8438,7 +8568,7 @@ private pure func emit_list_retain_intrinsic_body(
 			emit_list_retain_body(
 				{
 					list = list_expr,
-					value = boxed_storage_value_for_retain_expr(value_expr)
+					value = boxed_storage_value_for_retain_intrinsic(value_expr)
 				},
 				next_temp,
 			)
@@ -12007,8 +12137,11 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		AssignExpr(variable, rhs, typ, loc):
 			None
 		CastExpr(expr_value, typ, loc):
-			expr_c ?= emit_simple_expr(expr_value)
-			Some("((" + c_type_name(typ) + ")" + expr_c + ")")
+			if expr_transfers_ownership(expr):
+				None
+			else:
+				expr_c ?= emit_simple_expr(expr_value)
+				Some("((" + c_type_name(typ) + ")" + expr_c + ")")
 		BoxExpr(box, typ, loc):
 			emit_box_expr(box)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
@@ -15467,7 +15600,7 @@ private pure func c_literal_match_test(scrutinee: String, literal: CoreLiteral) 
 		CharLiteral(value):
 			Some(scrutinee + " == " + value.to_string())
 		StringLiteral(value):
-			Some("blorp_string_eq(" + scrutinee + ", " + emit_string_literal_expr(value) + ")")
+			Some(emit_string_literal_comparison(scrutinee, value) + " == 0")
 
 
 private pure func emit_literal_match_branch_body(
@@ -19216,7 +19349,7 @@ private pure func emit_general_supported_user_function(
 					profile_name: String = func_info.name
 					is_entrypoint_function: Bool = (
 						func_info.name == ENTRYPOINT_FUNCTION_NAME
-						and func_info.source_module == None
+						and func_info.source_module.is_none()
 					)
 
 					global_init: String = if is_entrypoint_function:
@@ -19322,7 +19455,7 @@ private pure func emit_function_forward_decl(func_info: CoreFunction) -> String:
 				Some(body):
 					if (
 						func_info.name == ENTRYPOINT_FUNCTION_NAME
-						and func_info.source_module == None
+						and func_info.source_module.is_none()
 					):
 						""
 					else:
@@ -19369,7 +19502,7 @@ private pure func enum_vector_to_string_function_name(enum_decl: CoreEnumDecl) -
 
 
 private pure func emit_enum_to_string_case(variant: CoreEnumVariant) -> String:
-	"    case " + variant.c_name + ": return blorp_string_literal(" + c_string_literal(
+	"    case " + variant.c_name + ": return blorp_string_create(" + c_string_literal(
 		variant.name,
 	) + ");\n"
 
@@ -19407,15 +19540,11 @@ private pure func emit_enum_decl(enum_decl: CoreEnumDecl) -> String:
 	c_code
 
 
-private STATIC_STRING_TRAILING_NUL_BYTES: Int = 1
-
 private STATIC_LIST_MIN_CAPACITY: Int = 1
 
 private STATIC_LIST_RUNTIME_PADDING_BYTES: Int = 5
 
 private STATIC_TUPLE_MIN_STORAGE_SLOTS: Int = 1
-
-private GLOBAL_STRING_ELEM_IMMORTALIZER: String = "__blorp_immortalize_global_elem_string"
 
 private STATIC_FLOAT_NORMALIZE_MAX_STEPS: Int = 4096
 
@@ -19458,10 +19587,6 @@ private struct PositiveBinaryFloat {
 
 private pure func owned_static_fragment(text: String) -> String:
 	"" + text
-
-
-private pure func static_string_storage_name(path_c: String) -> String:
-	"__blorp_static_string_" + path_c
 
 
 private pure func static_list_storage_name(path_c: String) -> String:
@@ -19783,32 +19908,6 @@ private pure func static_float16_tuple_initializer(value: CoreExpr) -> Option[St
 	c_static_float16_box_initializer(literal)
 
 
-private pure func is_static_string_type(typ: CoreType) -> Bool:
-	match typ:
-		NamedType(name, args):
-			(name == "String" or name == "LiteralString") and args.length() == 0
-		VoidType:
-			False
-		StackResultType(ok_type, err_type):
-			False
-		BoxedResultType(ok_type, err_type):
-			False
-		EnumType(name):
-			False
-		ValueRecordType(name):
-			False
-		HeapRecordType(name):
-			False
-		UnionType(name):
-			False
-		RangeType:
-			False
-		TensorType(info):
-			False
-		TupleType(items):
-			False
-
-
 private pure func c_static_literal_initializer(literal: CoreLiteral) -> Option[String]:
 	match literal:
 		IntLiteral(value):
@@ -19834,28 +19933,6 @@ private pure func c_static_literal_initializer(literal: CoreLiteral) -> Option[S
 			Some(value.to_string())
 		StringLiteral(value):
 			None
-
-
-private pure func emit_static_string_object(storage_name: String, text: String) -> String:
-	byte_len: Int = text.length()
-	data_len: Int = byte_len + STATIC_STRING_TRAILING_NUL_BYTES
-	escaped: String = c_string_literal(text)
-	var c_code: String = "static struct { blorp_Object header; long len; long capacity; char data["
-	c_code += data_len.to_string()
-	c_code += "]; } "
-	c_code += storage_name
-	c_code += " = {\n"
-	c_code += "  { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n"
-	c_code += "  "
-	c_code += byte_len.to_string()
-	c_code += "L,\n"
-	c_code += "  "
-	c_code += byte_len.to_string()
-	c_code += "L,\n"
-	c_code += "  "
-	c_code += escaped
-	c_code += "\n};\n"
-	c_code
 
 
 private pure func static_integer_storage_c_type(width_bytes: Int) -> Option[String]:
@@ -19951,7 +20028,7 @@ private pure func static_core_literal(expr: CoreExpr) -> Option[CoreLiteral]:
 private pure func static_literal_supported(typ: CoreType, literal: CoreLiteral) -> Bool:
 	match literal:
 		StringLiteral(value):
-			is_static_string_type(typ)
+			False
 		IntLiteral(value):
 			True
 		WideIntLiteral(value):
@@ -20302,14 +20379,7 @@ private pure func static_literal_value_initializer(
 ) -> Option[StaticValueInitializer]:
 	match literal:
 		StringLiteral(value):
-			if is_static_string_type(typ):
-				storage_name: String = static_string_storage_name(path_c)
-				Some({
-					definitions = emit_static_string_object(storage_name, value) + "\n",
-					value = "(blorp_String*)&" + storage_name,
-				})
-			else:
-				None
+			None
 		IntLiteral(value):
 			init ?= c_static_literal_initializer(literal)
 			Some({
@@ -20969,187 +21039,6 @@ private pure func emit_static_managed_global_decl(global: CoreGlobal) -> Option[
 		)
 
 
-private pure func dict_type_args(typ: CoreType) -> Option[(CoreType, CoreType)]:
-	match typ:
-		NamedType(name, args):
-			if name == "Dict":
-				match args:
-					[key_type, value_type]:
-						Some((key_type, value_type))
-					[]:
-						None
-					[only]:
-						None
-					[first, second, third, ...rest]:
-						None
-			else:
-				None
-		VoidType:
-			None
-		StackResultType(ok_type, err_type):
-			None
-		BoxedResultType(ok_type, err_type):
-			None
-		EnumType(name):
-			None
-		ValueRecordType(name):
-			None
-		HeapRecordType(name):
-			None
-		UnionType(name):
-			None
-		RangeType:
-			None
-		TensorType(info):
-			None
-		TupleType(items):
-			None
-
-
-private pure func global_elem_immortalizer_arg(typ: CoreType) -> String:
-	if is_string_type(typ):
-		GLOBAL_STRING_ELEM_IMMORTALIZER
-	else:
-		"NULL"
-
-
-private pure func const_dict_global_immortalization(global: CoreGlobal) -> String:
-	if not global.is_const:
-		""
-	else:
-		match dict_type_args(global.typ):
-			Some(type_args):
-				(key_type, value_type) = type_args
-				name_c: String = c_var_name(global.name)
-
-				"  blorp_make_immortal_constant(" + name_c + ");\n" + "  blorp_make_immortal_dict_constant(" + name_c + ", " + global_elem_immortalizer_arg(
-					key_type,
-				) + ", " + global_elem_immortalizer_arg(value_type) + ");\n"
-			None:
-				""
-
-
-private pure func global_needs_string_elem_immortalizer(global: CoreGlobal) -> Bool:
-	if not global.is_const:
-		False
-	else:
-		match dict_type_args(global.typ):
-			Some(type_args):
-				(key_type, value_type) = type_args
-				is_string_type(key_type) or is_string_type(value_type)
-			None:
-				False
-
-
-private GLOBAL_STRING_ELEM_IMMORTALIZER_C: String = "static void " + GLOBAL_STRING_ELEM_IMMORTALIZER + "(void* value) {\n" + "  blorp_make_immortal_constant(((blorp_String*)value));\n" + "}\n\n"
-
-
-private pure func emit_global_immortalizer_helpers(decls: List[CoreDecl]) -> String:
-	var needs_string_helper: Bool = False
-
-	for decl in decls:
-		if not needs_string_helper:
-			match decl:
-				GlobalDecl(global):
-					needs_string_helper = global_needs_string_elem_immortalizer(global)
-				FunctionDecl(func_info):
-					void
-				EnumDecl(enum_decl):
-					void
-				UnionDecl(union_decl):
-					void
-				ValueRecordDecl(record_decl):
-					void
-				HeapRecordDecl(record_decl):
-					void
-				TypeAliasDecl(alias_decl):
-					void
-				TraitDecl(trait_decl):
-					void
-				ImplDecl(impl_decl):
-					void
-
-	if needs_string_helper:
-		GLOBAL_STRING_ELEM_IMMORTALIZER_C
-	else:
-		""
-
-
-private pure func global_payload_needs_immortalization(typ: CoreType) -> Bool:
-	boxed_value_needs_release_type(typ) or type_requires_release(typ)
-
-
-private pure func erased_union_arg_immortalization(
-	global_name: String,
-	constructor_name: String,
-	index: Int,
-	arg: CoreBoxedStorageValue,
-) -> String:
-	payload_type: CoreType = core_expr_type(arg.value)
-
-	if global_payload_needs_immortalization(payload_type):
-		"        blorp_make_immortal_constant(((" + c_type_name(
-			payload_type,
-		) + ")" + global_name + "->data." + c_identifier(
-			constructor_name,
-		) + ".field" + index.to_string() + "));\n"
-	else:
-		""
-
-
-private pure func erased_union_args_immortalization(
-	global_name: String,
-	construct: CoreUnionConstruct,
-) -> String:
-	var statements: String = ""
-	var index: Int = 0
-
-	for arg in construct.args:
-		statements += erased_union_arg_immortalization(
-			global_name,
-			construct.constructor_name,
-			index,
-			arg,
-		)
-		index += 1
-
-	statements
-
-
-private pure func const_erased_union_global_immortalization(
-	global: CoreGlobal,
-	construct: CoreUnionConstruct,
-) -> String:
-	if not global.is_const:
-		""
-	else:
-		match construct.payload_storage:
-			ErasedUnionPayloadStorage:
-				name_c: String = c_var_name(global.name)
-				payload_statements: String = erased_union_args_immortalization(name_c, construct)
-
-				if payload_statements == "":
-					""
-				else:
-					"  blorp_make_immortal_constant(" + name_c + ");\n" + "  switch (" + name_c + "->tag) {\n" + "    case " + union_construct_tag_c_name(
-						construct,
-					) + ":\n" + payload_statements + "      break;\n" + "    default:\n" + "      break;\n" + "  }\n"
-			TypedUnionPayloadStorage:
-				""
-
-
-private pure func const_union_global_immortalization(global: CoreGlobal) -> String:
-	match global.init:
-		UnionConstructExpr(construct, typ, loc):
-			const_erased_union_global_immortalization(global, construct)
-		non_union_init:
-			""
-
-
-private pure func emit_global_post_runtime_init(global: CoreGlobal) -> String:
-	const_dict_global_immortalization(global) + const_union_global_immortalization(global)
-
-
 private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]:
 	match init:
 		LiteralExpr(literal, typ, loc):
@@ -21376,7 +21265,7 @@ private pure func emit_global_runtime_init_body(
 		Some({
 			statements = "  {\n" + init_body.statements + "  " + c_var_name(
 				global.name,
-			) + " = " + init_value + ";\n" + emit_global_post_runtime_init(global) + "  }\n",
+			) + " = " + init_value + ";\n  }\n",
 			value = "",
 			next_temp = init_body.next_temp,
 			returns = False,
@@ -22115,6 +22004,32 @@ private pure func emit_global_decls(decls: List[CoreDecl]) -> String:
 	c_code
 
 
+private pure func emit_global_cleanup_statement(global: CoreGlobal) -> String:
+	if not global_needs_runtime_init(global):
+		""
+	else:
+		policy: CoreReleasePolicy = cleanup_release_policy_for_type(global.typ)
+
+		if release_policy_requires_cleanup(policy):
+			emit_release_statement(c_var_name(global.name), policy)
+		else:
+			""
+
+
+private pure func emit_global_cleanup_statements(decls: List[CoreDecl]) -> String:
+	var statements: String = ""
+
+	for decl in decls:
+		match decl:
+			GlobalDecl(global):
+				-- Global initializers may refer to earlier globals, so release roots in reverse order.
+				statements = emit_global_cleanup_statement(global) + statements
+			_:
+				void
+
+	statements
+
+
 private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 ) -> Result[String, UnsupportedGlobalInitializerError]:
@@ -22159,10 +22074,20 @@ private pure func emit_global_init_function(
 		Some(existing_error):
 			Err(existing_error)
 		None:
+			cleanup_statements: String = emit_global_cleanup_statements(decls)
+
+			cleanup_function: String = if cleanup_statements == "":
+				""
+			else:
+				"static void __blorp_drop_globals(void) {\n" + cleanup_statements + "}\n\n"
+
+			cleanup_registration: String = if cleanup_statements == "":
+				""
+			else:
+				"  blorp_register_global_cleanup(__blorp_drop_globals);\n"
+
 			Ok(
-				emit_global_immortalizer_helpers(
-					decls,
-				) + "void __blorp_init_globals(void) {\n" + statements + "}\n\n",
+				cleanup_function + "void __blorp_init_globals(void) {\n" + statements + cleanup_registration + "}\n\n",
 			)
 
 
@@ -22290,9 +22215,10 @@ private pure func error_artifact(error: UnsupportedGlobalInitializerError) -> CA
 
 
 pure func try_emit_prepared_core_program_c_artifact_with_options(
-	program: CoreProgram,
+	prepared: CorePipeline.PreparedCoreProgram,
 	options: CoreEmitOptions,
 ) -> Result[CArtifact, UnsupportedGlobalInitializerError]:
+	program: CoreProgram = prepared.program
 	decls_c ?= emit_decls(program.decls, options)
 	Ok({
 		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
@@ -22316,7 +22242,7 @@ pure func try_emit_core_program_c_artifact_with_options(
 	program: CoreProgram,
 	options: CoreEmitOptions,
 ) -> Result[CArtifact, UnsupportedGlobalInitializerError]:
-	prepared_program: CoreProgram = CorePipeline.run_pre_dce_tail(program)
+	prepared_program: CorePipeline.PreparedCoreProgram = CorePipeline.run_pre_dce_tail(program)
 
 	try_emit_prepared_core_program_c_artifact_with_options(prepared_program, options)
 

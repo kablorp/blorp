@@ -30,7 +30,7 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --coverage         # compiler-unit coverage
-scripts/test --timings          # print slow compiler-unit/deep Alcotest cases
+scripts/test --timings          # print unit cases and generated-suite phases
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
@@ -39,6 +39,9 @@ excerpts and can save full logs with `--log-dir`.
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.
+With `compiler-deep` and `compiler-blorp-sanitize`, it also records generated
+TestSuite frontend, typecheck, Core, host-C, and execution phases and prints
+their totals.
 After setup, multiple selected gates run in fixed waves by default:
 
 ```text
@@ -60,7 +63,11 @@ resource scheduler would be harder to reason about than the tests it runs. Use
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
-- `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
+- `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
+  grouped compiler-owned Blorp suites default to 60 seconds; individual
+  compiler fixtures and codegen audits default to 30 seconds.
+- `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
+  timeout (default 180 seconds, reflecting measured ASan overhead).
 - In multi-gate wave runs, the leak-check gate scales the built-in default
   timeout by the selected gate count to avoid false timeouts under local CPU
   contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.
@@ -171,14 +178,11 @@ the same helper more than once.
 
 The backend helper is compiled with `BLORP_COMPILER_BRIDGE_BIN` when that
 explicit override is set. Otherwise it uses `scripts/blorp-compiler-bootstrap`,
-which downloads and verifies the pinned dev release `dev-9f56c40d2b91` into
+which reads the immutable release identity and per-target checksums from
+`compiler/bootstrap.env`, then downloads and verifies that release into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
-when set. To move the fallback bootstrap forward, update the release revision
-and target checksums in `scripts/blorp-compiler-bootstrap-pin.sh`; the wrapper
-derives the tag and artifact version from that one revision.
-`BLORP_COMPILER_BOOTSTRAP_TAG` overrides are rejected because a tag alone
-cannot safely override the version and checksums. Use
-`BLORP_COMPILER_BRIDGE_BIN` to test a different compiler executable.
+when set. Rotate the tag, version, and all target checksums together in that
+single manifest only after release CI has published the merged revision.
 
 Both helper builds call the normal `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
@@ -198,6 +202,7 @@ Useful compiler bootstrap commands:
 
 ```bash
 scripts/blorp-compiler-bootstrap --print-id
+scripts/blorp-compiler-bootstrap --print-tag
 scripts/blorp-compiler-bootstrap --print-path
 scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp
 ```

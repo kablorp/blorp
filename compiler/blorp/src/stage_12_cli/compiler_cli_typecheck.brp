@@ -1,0 +1,160 @@
+-- Shared typed-frontend execution over an already discovered CLI source graph.
+-- This module deliberately has no semantic-middle or backend dependencies so
+-- ordinary check stays on the smallest contiguous compiler surface.
+import:
+	../stage_02_lex/compiler_parse_diagnostic:
+		compiler_parse_diagnostic_is_error,
+		compiler_parse_diagnostic_to_string,
+	../stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../stage_05_types/compiler_context:
+		CompilerModuleOrigin(
+			CompilerNativePackageModule,
+			CompilerSourcePackageModule,
+			CompilerStdlibModule,
+			CompilerUserModule,
+		),
+	../stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedGraph,
+		CompilerTypecheckedModule,
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckResolvedImport,
+		compiler_typecheck_graph,
+	compiler_cli_diagnostic: cli_error_message
+	compiler_cli_plan:
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(
+			CliFrontendPkgModule,
+			CliFrontendSourcePackageModule,
+			CliFrontendStdModule,
+			CliFrontendUserModule,
+		),
+
+
+private pure func frontend_origin_to_compiler_origin(
+	origin: CliFrontendModuleOrigin,
+) -> CompilerModuleOrigin:
+	match origin:
+		CliFrontendUserModule:
+			CompilerUserModule
+		CliFrontendStdModule:
+			CompilerStdlibModule
+		CliFrontendSourcePackageModule(package_alias):
+			CompilerSourcePackageModule(package_alias)
+		CliFrontendPkgModule(package_id):
+			CompilerNativePackageModule(package_id)
+
+
+private pure func typecheck_source(source: CliFrontendGraphSource) -> TypecheckImportModule:
+	{
+		path = source.path,
+		module_name = source.module_name,
+		module_path = source.module_name,
+		text = source.source_text,
+		origin = frontend_origin_to_compiler_origin(source.origin)
+	}
+
+
+private pure func same_source(left: CliFrontendGraphSource, right: CliFrontendGraphSource) -> Bool:
+	left.path == right.path and left.module_name == right.module_name
+
+
+private pure func append_unique_source(
+	sources: List[CliFrontendGraphSource],
+	source: CliFrontendGraphSource,
+) -> List[CliFrontendGraphSource]:
+	if sources.any(func(existing): same_source(existing, source)):
+		sources
+	else:
+		sources.append(source)
+
+
+private pure func dependency_sources_for_root(
+	graph: CliFrontendModuleGraph,
+	root: CliFrontendGraphSource,
+) -> List[CliFrontendGraphSource]:
+	var sources: List[CliFrontendGraphSource] = []
+
+	for source in graph.modules.concat(graph.roots):
+		if not same_source(source, root):
+			sources = append_unique_source(sources, source)
+
+	sources
+
+
+private pure func resolved_imports(graph: CliFrontendModuleGraph) -> List[TypecheckResolvedImport]:
+	var imports: List[TypecheckResolvedImport] = []
+
+	for edge in graph.import_edges:
+		match edge.resolved_module:
+			Some(resolved_module):
+				imports = imports.append({
+					from_path = edge.from_path,
+					from_module = edge.from_module,
+					import_path = edge.import_path,
+					resolved_module = resolved_module,
+				})
+			None:
+				void
+
+	imports
+
+
+private pure func typecheck_frontend_root_with_targets(
+	graph: CliFrontendModuleGraph,
+	root: CliFrontendGraphSource,
+	allow_debug_only_calls: Bool,
+	module_targets: List[String],
+) -> CompilerTypecheckedGraph:
+	dependency_sources = dependency_sources_for_root(graph, root)
+	request: TypecheckGraphRequest = {
+		target = typecheck_source(root),
+		modules = dependency_sources.map(typecheck_source),
+		module_targets = module_targets,
+		resolved_imports = resolved_imports(graph),
+		include_comments = False,
+		allow_debug_only_calls = allow_debug_only_calls
+	}
+
+	compiler_typecheck_graph(request)
+
+
+pure func typecheck_frontend_root(
+	graph: CliFrontendModuleGraph,
+	root: CliFrontendGraphSource,
+	allow_debug_only_calls: Bool,
+) -> CompilerTypecheckedGraph:
+	typecheck_frontend_root_with_targets(
+		graph,
+		root,
+		allow_debug_only_calls,
+		graph.modules.map(func(source): source.module_name),
+	)
+
+
+-- Directory checks already visit every root. Returning dependency artifacts
+-- for every root repeats O(N^2) body checks and can report a dependency's
+-- synthetic prelude imports without that dependency's own source context.
+pure func typecheck_frontend_root_only(
+	graph: CliFrontendModuleGraph,
+	root: CliFrontendGraphSource,
+	allow_debug_only_calls: Bool,
+) -> CompilerTypecheckedGraph:
+	typecheck_frontend_root_with_targets(graph, root, allow_debug_only_calls, [])
+
+
+private pure func parse_error_messages(program: ParsedProgram) -> List[String]:
+	program.diagnostics
+		.filter(compiler_parse_diagnostic_is_error)
+		.map(compiler_parse_diagnostic_to_string)
+
+
+private pure func typechecked_module_errors(module: CompilerTypecheckedModule) -> List[String]:
+	parse_error_messages(module.parsed_program).concat(module.errors.map(cli_error_message))
+
+
+pure func typechecked_graph_errors(graph: CompilerTypecheckedGraph) -> List[String]:
+	graph.modules
+		.flat_map(typechecked_module_errors)
+		.concat(typechecked_module_errors(graph.target))

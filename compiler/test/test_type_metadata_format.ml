@@ -43,16 +43,6 @@ let detailed_hover_info : Ast.expr_type_info =
     resolved_call = None;
   }
 
-let test_debug_type_info_uses_shared_wording () =
-  let rendered =
-    Type_metadata_format.format_debug_type_info source_alias_info
-  in
-  Alcotest.(check string)
-    "debug type metadata"
-    "source type: UserId; semantic type: Int; value-slot type: Int; origin: \
-     explicit annotation (UserId); widening: none (kept Int)"
-    rendered
-
 let test_hover_type_view_prefers_source_and_reports_canonical () =
   let view = Type_metadata_format.hover_type_view source_alias_info in
   Alcotest.(check string) "primary source type" "UserId" view.primary_type;
@@ -113,8 +103,6 @@ let suite =
   [
     ( "format",
       [
-        Alcotest.test_case "debug type info wording" `Quick
-          test_debug_type_info_uses_shared_wording;
         Alcotest.test_case "hover source and canonical wording" `Quick
           test_hover_type_view_prefers_source_and_reports_canonical;
         Alcotest.test_case "hover widening wording" `Quick

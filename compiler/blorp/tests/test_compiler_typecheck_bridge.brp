@@ -1,7 +1,24 @@
 import:
+	../src/stage_05_types/compiler_context:
+		CompilerModuleOrigin(CompilerStdlibModule, CompilerUserModule),
+	../src/stage_06_typecheck/compiler_infer:
+		CompilerResolvedCallTarget(CompilerResolvedTraitMethodCall),
+		CompilerTypedExpr(CompilerTypedBlockExpr, CompilerTypedCallExpr),
+		compiler_resolved_call_callable_id,
+		compiler_typed_expr_resolved_call,
 	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedModule,
+		compiler_typecheck_graph,
 		handle_request,
 		stream_typecheck_graph_request_value,
+	../src/stage_06_typecheck/compiler_typecheck_decl:
+		CompilerTypedDecl(
+			CompilerTypedFunctionDecl,
+			CompilerTypedImplDecl,
+			CompilerTypedPrivateDecl,
+			CompilerTypedUnionDecl,
+		),
+		CompilerTypedProgram,
 	channel: Channel, channel, recv, seal, send
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -127,6 +144,49 @@ pure func json_is_non_null(value: JsonValue) -> Bool:
 			True
 
 
+pure func json_is_resolved_trait_call(
+	value: JsonValue,
+	callee_name: String,
+	module_path: String,
+) -> Bool:
+	if string_field(value, "callee_name") != callee_name:
+		False
+	else:
+		match get_field(value, "target"):
+			Some(target):
+				if string_field(target, "kind") != "trait_method":
+					False
+				else:
+					match get_field(target, "impl_target"):
+						Some(impl_target):
+							string_field(impl_target, "module_path") == module_path
+						None:
+							False
+			None:
+				False
+
+
+pure func json_contains_resolved_trait_call(
+	value: JsonValue,
+	callee_name: String,
+	module_path: String,
+) -> Bool:
+	if json_is_resolved_trait_call(value, callee_name, module_path):
+		True
+	else:
+		match value:
+			JsonObject(fields):
+				fields.any(func(field):
+					json_contains_resolved_trait_call(field[1], callee_name, module_path)
+				)
+			JsonVector(items):
+				items.any(func(item):
+					json_contains_resolved_trait_call(item, callee_name, module_path)
+				)
+			_:
+				False
+
+
 pure func typed_program_has_impl_method_body(value: JsonValue) -> Bool:
 	var found: Bool = False
 
@@ -155,6 +215,21 @@ pure func typed_program_has_impl_method_body(value: JsonValue) -> Bool:
 			break
 
 	found
+
+
+pure func typed_program_impl_method_count(value: JsonValue) -> Int:
+	var result: Int = -1
+
+	for decl in typed_program_decls(value):
+		if string_field(decl, "kind") == "impl":
+			match get_field(decl, "info"):
+				Some(info):
+					result = json_array_length(info, "methods")
+					break
+				None:
+					void
+
+	result
 
 
 pure func resolved_call_has_alias_source(
@@ -275,6 +350,38 @@ pure func user_import_module_json(
 	])
 
 
+pure func source_package_import_module_json(
+	module_path: String,
+	module_name: String,
+	package: String,
+	text: String,
+) -> JsonValue:
+	JsonObject([
+		("path", JsonString(module_name + ".brp")),
+		("module", JsonString(module_name)),
+		("module_path", JsonString(module_path)),
+		("text", JsonString(text)),
+		("origin", JsonObject([
+			("kind", JsonString("source_package")),
+			("package", JsonString(package)),
+		])),
+	])
+
+
+pure func resolved_import_json(
+	from_path: String,
+	from_module: String,
+	import_path: String,
+	resolved_module: String,
+) -> JsonValue:
+	JsonObject([
+		("from_path", JsonString(from_path)),
+		("from_module", JsonString(from_module)),
+		("import_path", JsonString(import_path)),
+		("resolved_module", JsonString(resolved_module)),
+	])
+
+
 pure func typecheck_source_request_with_imports(
 	source: String,
 	import_modules: List[JsonValue],
@@ -304,12 +411,22 @@ pure func typecheck_graph_request(
 	modules: List[JsonValue],
 	module_targets: List[String],
 ) -> String:
+	typecheck_graph_request_with_resolved_imports(target, modules, module_targets, [])
+
+
+pure func typecheck_graph_request_with_resolved_imports(
+	target: JsonValue,
+	modules: List[JsonValue],
+	module_targets: List[String],
+	resolved_imports: List[JsonValue],
+) -> String:
 	request_json("typecheck_graph", JsonObject([
 			("target", target),
 			("modules", JsonVector(modules)),
 			("module_targets", JsonVector(module_targets.map(
 					func(path): JsonString(path),
 				))),
+			("resolved_imports", JsonVector(resolved_imports)),
 		]))
 
 
@@ -478,6 +595,93 @@ func test_typecheck_graph_handles_shared_import_context() -> Bool:
 			False
 
 
+func test_typecheck_graph_preserves_qualified_trait_method_resolution() -> Bool:
+	traits: JsonValue = import_module_json(
+		"std/traits",
+		"traits",
+		"trait Stringable:\n\tpure func to_string(value: Self) -> String",
+	)
+	slice_source: String =
+		|import:
+		|	traits: Stringable
+		|
+		|type StringSlice = builtin
+		|
+		|implements Stringable for StringSlice:
+		|	pure func to_string(value: StringSlice) -> String:
+		|		builtin("std/slice.to_string")
+	slice: JsonValue = import_module_json("std/slice", "slice", slice_source)
+	subject_source: String =
+		|import:
+		|	slice as S
+		|
+		|pure func render(value: S.StringSlice) -> String:
+		|	S.to_string(value)
+	subject: JsonValue = user_import_module_json("subject", "subject", subject_source)
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[traits, slice, subject],
+				["subject"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			subject_response = responses.get_or(0, JsonNull)
+
+			match artifact_field(subject_response, "typed_program"):
+				Some(program):
+					(
+						artifact_array_length(subject_response, "type_errors") == 0
+						and json_contains_resolved_trait_call(program, "to_string", "std/slice")
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_typecheck_graph_refines_unannotated_generic_factory() -> Bool:
+	dep_source: String =
+		|opaque type Cache[K, V] = (K, V)
+		|
+		|pure func cache[K, V](capacity: Int) -> Cache[K, V]:
+		|	builtin("test_store")
+		|
+		|pure func put[K, V](store: Cache[K, V], key: K, value: V) -> Cache[K, V]:
+		|	builtin("test_put")
+	dep: JsonValue = user_import_module_json("cache", "cache", dep_source)
+	target_source: String =
+		|import:
+		|	cache as C: Cache
+		|
+		|func use_store() -> Bool:
+		|	var store = C.cache(10)
+		|	store = C.put(store, "answer", 42)
+		|	True
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dep], []),
+		1,
+	):
+		Some(responses):
+			artifact_array_length(
+				responses.get_or(0, JsonNull),
+				"type_errors",
+			) == 0
+		None:
+			False
+
+
 func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
 	base: JsonValue = user_import_module_json("base", "base", "answer: Int = 41")
 	left_source: String =
@@ -524,6 +728,271 @@ func test_typecheck_graph_evaluates_shared_ctfe_dependency() -> Bool:
 			False
 
 
+func test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first() -> Bool:
+	base: JsonValue = user_import_module_json("base", "base", "answer: Int = 40")
+	dep_source: String =
+		|import:
+		|	base: answer
+		|
+		|next_answer: Int = answer + 1
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: next_answer
+		|
+		|final_answer: Int = next_answer + 1
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dep, base],
+				[],
+			),
+			1,
+		)
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_follows_ctfe_dependency_through_function_only_module() -> Bool:
+	base: JsonValue = user_import_module_json(
+		"base",
+		"base",
+		"pure func base_value() -> Int:\n\t40",
+	)
+	dep_source: String =
+		|import:
+		|	base: base_value
+		|
+		|pure func dep_value() -> Int:
+		|	base_value() + 1
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: dep_value
+		|
+		|final_answer: Int = dep_value() + 1
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dep, base],
+				[],
+			),
+			1,
+		)
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_std_ctfe_dependency() -> Bool:
+	constants: JsonValue = import_module_json("std/constants", "constants", "answer: Int = 42")
+	target_source: String =
+		|import:
+		|	constants: answer
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+	resolved = resolved_import_json("main.brp", "main", "constants", "std/constants")
+
+	match streamed_graph_responses(
+		typecheck_graph_request_with_resolved_imports(target, [constants], [], [resolved]),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_source_package_ctfe_dependency() -> Bool:
+	constants: JsonValue = source_package_import_module_json(
+		"deps/demo/constants",
+		"constants",
+		"demo",
+		"answer: Int = 42",
+	)
+	target_source: String =
+		|import:
+		|	constants: answer
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+	resolved = resolved_import_json("main.brp", "main", "constants", "deps/demo/constants")
+
+	match streamed_graph_responses(
+		typecheck_graph_request_with_resolved_imports(target, [constants], [], [resolved]),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_root_local_trait_method() -> Bool:
+	target_source: String =
+		|trait HasValue:
+		|	pure func read_value(value: Self) -> Int
+		|
+		|record Box {value: Int}
+		|
+		|implements HasValue for Box:
+		|	pure func read_value(box: Box) -> Int:
+		|		box.value
+		|
+		|box: Box = {value = 42}
+		|answer: Int = box.read_value()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_evaluates_imported_trait_method() -> Bool:
+	dep_source: String =
+		|trait HasValue:
+		|	pure func read_value(value: Self) -> Int
+		|
+		|record Box {value: Int}
+		|
+		|implements HasValue for Box:
+		|	pure func read_value(box: Box) -> Int:
+		|		box.value
+		|
+		|pure func box(value: Int) -> Box:
+		|	{value = value}
+	dep: JsonValue = user_import_module_json("dep", "dep", dep_source)
+	target_source: String =
+		|import:
+		|	dep: Box, box, read_value
+		|
+		|answer: Int = box(42).read_value()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dep], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_isolates_unrelated_ctfe_dependency_failure() -> Bool:
+	broken: JsonValue = user_import_module_json("broken", "broken", "answer: Int = missing_value")
+	dependent_source: String =
+		|import:
+		|	broken: answer
+		|
+		|dependent_answer: Int = answer
+	dependent: JsonValue = user_import_module_json("dependent", "dependent", dependent_source)
+	target: JsonValue = user_import_module_json("main", "main", "answer: Int = 42")
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[dependent, broken],
+				["dependent"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			dependent_response = responses.get_or(0, JsonNull)
+			target_response = responses.get_or(1, JsonNull)
+
+			(
+				artifact_array_length(dependent_response, "type_errors") > 0
+				and artifact_array_length(target_response, "type_errors") == 0
+				and artifact_string_field(target_response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_ctfe_dependency_sees_target_surface() -> Bool:
+	dependency_source: String =
+		|import:
+		|	main: Marker
+		|
+		|answer: Int = 42
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dependency], []),
+		1,
+	):
+		Some(responses):
+			response = responses.get_or(0, JsonNull)
+
+			(
+				artifact_array_length(response, "type_errors") == 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
 pure func test_typecheck_source_accepts_main_args_signature() -> Bool:
 	source: String = "func main(args: List[String]) -> Int:\n\t0"
 
@@ -565,6 +1034,62 @@ func test_typecheck_graph_resolves_imported_global_annotation() -> Bool:
 				responses.get_or(0, JsonNull),
 				"type_errors",
 			) == 0
+		None:
+			False
+
+
+func test_typecheck_graph_preserves_imported_opaque_record_field_owner() -> Bool:
+	units: JsonValue = user_import_module_json("units", "units", "opaque type Duration = Int")
+	process_source: String =
+		|import:
+		|	units: Duration
+		|
+		|record Command {timeout: Option[Duration]}
+		|
+		|pure func command() -> Command:
+		|	{timeout = None}
+	process: JsonValue = user_import_module_json("process", "process", process_source)
+	target_source: String =
+		|import:
+		|	process: command
+		|
+		|func main(args: List[String]) -> Int:
+		|	configured = { command() | timeout = None }
+		|
+		|	match configured.timeout:
+		|		Some(_):
+		|			1
+		|		None:
+		|			0
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match (
+		streamed_graph_responses(
+			typecheck_graph_request(
+				target,
+				[units, process],
+				["process"],
+			),
+			2,
+		)
+	):
+		Some(responses):
+			process_response: String = responses
+				.get_or(0, JsonNull)
+				.to_string()
+			target_response: String = responses
+				.get_or(1, JsonNull)
+				.to_string()
+
+			artifact_array_length(
+				responses.get_or(0, JsonNull),
+				"type_errors",
+			) == 0 and artifact_array_length(
+				responses.get_or(1, JsonNull),
+				"type_errors",
+			) == 0 and process_response.contains(
+				"units::Duration",
+			) and target_response.contains("units::Duration")
 		None:
 			False
 
@@ -666,7 +1191,7 @@ pure func test_typecheck_source_marks_self_contained_ctfe_evaluated() -> Bool:
 			False
 
 
-pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
+pure func test_typecheck_source_evaluates_qualified_import_ctfe() -> Bool:
 	source: String = "import:\n\tdep as Dep\n\nVALUE: String = Dep.answer()\n\nfunc main(args: List[String]) -> Int:\n\t0"
 	dep_text: String = "pure func answer() -> String:\n\t3.to_string()"
 
@@ -679,8 +1204,8 @@ pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
 		Some(response):
 			(
 				bool_field(response, "ok")
-				and artifact_string_field(response, "ctfe_status") == "not_run"
-				and artifact_array_length(response, "type_errors") > 0
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
 			)
 		None:
 			False
@@ -688,7 +1213,7 @@ pure func test_typecheck_source_reports_unsupported_import_ctfe() -> Bool:
 
 pure func test_typecheck_source_evaluates_imported_function_ctfe() -> Bool:
 	source: String = "import:\n\tdep: answer\n\nVALUE: Int = answer() + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
-	dep_text: String = "pure func answer() -> Int:\n\t41"
+	dep_text: String = "private pure func add_one(value: Int) -> Int:\n\tvalue + 1\n\npure func answer() -> Int:\n\tadd_one(40)"
 
 	match response_value(
 		typecheck_source_request_with_imports(
@@ -726,6 +1251,32 @@ pure func test_typecheck_source_evaluates_imported_constant_ctfe() -> Bool:
 			False
 
 
+pure func test_typecheck_source_evaluates_aliased_constant_from_non_leaf_module() -> Bool:
+	source: String = "import:\n\tdep: OFFSET as OFFSET_ALIAS\n\nVALUE: Int = OFFSET_ALIAS + 1\n\nfunc main(args: List[String]) -> Int:\n\tVALUE"
+	base_text: String = "BASE: Int = 1"
+	dep_text: String = "import:\n\tbase: BASE\n\nprivate pure func offset() -> Int:\n\t41\n\nOFFSET: Int = offset()"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					user_import_module_json("base", "base", base_text),
+					user_import_module_json("dep", "dep", dep_text),
+				],
+			),
+		)
+	):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "ctfe_status") == "evaluated"
+				and artifact_array_length(response, "type_errors") == 0
+			)
+		None:
+			False
+
+
 pure func test_typecheck_source_sees_global_conversion_builtins() -> Bool:
 	source: String = "pure func convert(value: Int) -> Float:\n\tto_float(value)\n\npure func narrow(value: Float) -> Int:\n\tto_int(value)"
 
@@ -748,6 +1299,16 @@ pure func test_typecheck_source_handles_tuple_subscript_rewrite() -> Bool:
 
 pure func test_typecheck_source_allows_bounded_type_param_equality() -> Bool:
 	source: String = "pure func same[T: Equatable](left: T, right: T) -> Bool:\n\tleft == right"
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_allows_generic_constructor_equality() -> Bool:
+	source: String = "import:\n\toption: Option(None)\n\npure func is_missing(value: Option[Int]) -> Bool:\n\tvalue == None"
 
 	match response_value(typecheck_source_request(source)):
 		Some(response):
@@ -850,6 +1411,41 @@ pure func test_typecheck_source_preserves_imported_resource_cleanup() -> Bool:
 			False
 
 
+pure func test_typecheck_source_preserves_independent_accept_result() -> Bool:
+	source: String =
+		|import:
+		|	dep: Error, Listener, Stream, accept, listen
+		|
+		|func serve() -> Result[Int, Error]:
+		|	with listener ?= listen():
+		|		with first ?= accept(listener):
+		|			with second ?= accept(listener):
+		|				Ok(0)
+	dep_text: String =
+		|resource type Listener = builtin("close_listener")
+		|resource type Stream = builtin("close_stream")
+		|
+		|union Error:
+		|	Other(String)
+		|
+		|func listen() -> Result[Listener, Error]:
+		|	builtin("listen")
+		|
+		|func accept(listener: Listener) -> Result[Stream, Error]:
+		|	builtin("blorp_tcp_accept_raw")
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
 pure func test_typecheck_source_matches_std_shorthand_import_path() -> Bool:
 	source: String = "import:\n\tio: answer\n\nfunc identity() -> Int:\n\tanswer()"
 	dep_text: String = "pure func answer() -> Int:\n\t1"
@@ -898,6 +1494,117 @@ pure func test_typecheck_source_uses_qualified_return_only_generic() -> Bool:
 			False
 
 
+pure func test_typecheck_source_uses_selective_return_only_generic() -> Bool:
+	source: String =
+		|import:
+		|	dep: values
+		|
+		|func use_values() -> Int:
+		|	values: List[Int] = values(2)
+		|	values.length()
+	dep_text: String =
+		|pure func values[T](capacity: Int) -> List[T]:
+		|	builtin("test_values")
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_aliased_return_only_generic() -> Bool:
+	source: String =
+		|import:
+		|	dep: values as make_values
+		|
+		|func use_values() -> Int:
+		|	values: List[Int] = make_values()
+		|	values.length()
+	dep_text: String =
+		|pure func values[T]() -> List[T]:
+		|	builtin("test_values")
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_refines_unannotated_generic_factory() -> Bool:
+	source: String =
+		|import:
+		|	dep as Dep
+		|
+		|func use_store() -> Bool:
+		|	var store = Dep.store(10)
+		|	store = Dep.put(store, "answer", 42)
+		|	True
+	dep_text: String =
+		|opaque type Store[K, V] = (K, V)
+		|
+		|pure func store[K, V](capacity: Int) -> Store[K, V]:
+		|	builtin("test_store")
+		|
+		|pure func put[K, V](store: Store[K, V], key: K, value: V) -> Store[K, V]:
+		|	builtin("test_put")
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_unifies_constructor_meta_in_generic_call() -> Bool:
+	source: String =
+		|union Maybe[T]:
+		|	Just(T)
+		|	Nothing
+		|
+		|pure func keep[T](value: Maybe[T], fallback: T) -> Maybe[T]:
+		|	builtin("test_keep")
+		|
+		|func use_maybe() -> Bool:
+		|	value: Maybe[Int] = keep(Nothing, 42)
+		|	True
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_contextually_types_float_tensor_constructor() -> Bool:
+	source: String =
+		|func use_values() -> Bool:
+		|	values: Float32[#4] = vector(0.0, 4)
+		|	True
+
+	match response_value(typecheck_source_request(source)):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
 pure func test_typecheck_source_accepts_imported_generic_return_signature() -> Bool:
 	source: String = "func main(args: List[String]) -> Int:\n\t0"
 	dep_text: String = "pure func values[T]() -> List[T]:\n\tbuiltin(\"test_values\")"
@@ -907,6 +1614,50 @@ pure func test_typecheck_source_accepts_imported_generic_return_signature() -> B
 			source,
 			[import_module_json("dep", "dep", dep_text)],
 		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_ignores_unimported_module_declarations() -> Bool:
+	source: String = "import:\n\tdep: answer\n\ntrait Collision:\n\tpure func local(value: Self) -> Int\n\nfunc main(args: List[String]) -> Int:\n\tanswer()"
+	dep_text: String = "pure func answer() -> Int:\n\t0"
+	unrelated_text: String = "trait Collision:\n\tpure func unrelated(value: Self) -> Int"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					import_module_json("dep", "dep", dep_text),
+					import_module_json("unrelated", "unrelated", unrelated_text),
+				],
+			),
+		)
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_resolves_direct_import_transitive_signature() -> Bool:
+	source: String = "import:\n\tdep: make\n\nfunc main(args: List[String]) -> Int:\n\tvalue = make()\n\tvalue.value"
+	dep_text: String = "import:\n\ttypes: Item\n\npure func make() -> Item:\n\tbuiltin(\"make_item\")"
+	types_text: String = "record Item {value: Int}"
+
+	match (
+		response_value(
+			typecheck_source_request_with_imports(
+				source,
+				[
+					import_module_json("dep", "dep", dep_text),
+					import_module_json("types", "types", types_text),
+				],
+			),
+		)
 	):
 		Some(response):
 			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
@@ -936,7 +1687,7 @@ pure func test_typecheck_source_uses_aliased_imported_function() -> Bool:
 
 pure func test_typecheck_source_materializes_imported_trait_impl_method() -> Bool:
 	source: String = "import:\n\tdep: Same\n\nrecord Box {value: Int}\n\nimplements Same for Box:\n\tpure func same(a: Box, b: Box) -> Bool:\n\t\tTrue"
-	dep_text: String = "trait Same:\n\tpure func same(a: Self, b: Self) -> Bool"
+	dep_text: String = "trait Same:\n\tpure func same(a: Self, b: Self) -> Bool\n\tpure func not_same(a: Self, b: Self) -> Bool: not same(a, b)"
 
 	match response_value(
 		typecheck_source_request_with_imports(
@@ -948,6 +1699,7 @@ pure func test_typecheck_source_materializes_imported_trait_impl_method() -> Boo
 			(
 				bool_field(response, "ok")
 				and artifact_array_length(response, "type_errors") == 0
+				and typed_program_impl_method_count(response) == 2
 				and typed_program_has_impl_method_body(response)
 			)
 		None:
@@ -973,6 +1725,54 @@ pure func test_typecheck_source_uses_imported_nullary_trait_method() -> Bool:
 pure func test_typecheck_source_uses_imported_trait_method_as_ufcs() -> Bool:
 	source: String = "import:\n\tdep: Reader, read_text\n\nfunc read(reader: Reader) -> String:\n\treader.read_text()"
 	dep_text: String = "trait TextReader:\n\tfunc read_text(value: Self) -> String\n\nrecord Reader {value: String}\n\nimplements TextReader for Reader:\n\tfunc read_text(reader: Reader) -> String:\n\t\treader.value"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_uses_later_same_module_function_as_ufcs() -> Bool:
+	source: String = "import:\n\tdep: helper\n\npure func format(value: String) -> String:\n\tvalue.pad_right(4)\n\nprivate pure func pad_right(value: String, width: Int) -> String:\n\tvalue"
+	dep_text: String = "pure func helper() -> Int:\n\t1\n\npure func pad_right(value: String, width: Int, fill: Char) -> String:\n\tvalue"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_keeps_compiler_prelude_trait_method_visible() -> Bool:
+	source: String = "import:\n\tdep: helper\n\npure func rows(value: Int[#2, #3]) -> Int:\n\tvalue.length()"
+	dep_text: String = "trait HasLength:\n\tpure func length(value: Self) -> Int\n\npure func helper() -> Int:\n\t1"
+
+	match response_value(
+		typecheck_source_request_with_imports(
+			source,
+			[import_module_json("dep", "dep", dep_text)],
+		),
+	):
+		Some(response):
+			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+		None:
+			False
+
+
+pure func test_typecheck_source_selects_pure_imported_ufcs_overload() -> Bool:
+	source: String = "import:\n\tdep: transform\n\npure func apply(value: String) -> String:\n\tvalue.transform(func(x: Int): x + 1)"
+	dep_text: String = "func transform(value: String, callback: (Int) -> Int) -> String:\n\tvalue\n\npure func transform(value: String, callback: pure (Int) -> Int) -> String:\n\tvalue"
 
 	match response_value(
 		typecheck_source_request_with_imports(
@@ -1157,6 +1957,436 @@ pure func test_typecheck_source_requires_text() -> Bool:
 			False
 
 
+pure func test_typed_graph_api_returns_in_memory_results() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tutil\n\nfunc main(args: List[String]) -> Int:\n\tutil.answer()",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "util.brp",
+				module_name = "util",
+				module_path = "util",
+				text = "pure func answer() -> Int:\n\t42",
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["util"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "util",
+				resolved_module = "util"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.path == "main.brp"
+		and graph.target.errors.length() == 0
+		and graph.target.ctfe_evaluated
+		and graph.target.import_bindings.length() == 1
+		and graph.modules.length() == 1
+		and graph.modules
+			.get(0)
+			.map(func(module): module.module_path) == Some("util")
+	)
+
+
+pure func test_typed_graph_avoids_std_prelude_self_import() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "prelude.brp",
+				module_name = "std/prelude",
+				module_path = "std/prelude",
+				text = "import:\n\tparallel_list as ParallelListOps",
+				origin = CompilerStdlibModule
+			},
+			{
+				path = "parallel_list.brp",
+				module_name = "std/parallel_list",
+				module_path = "std/parallel_list",
+				text = "pure func identity(value: Int) -> Int:\n\tvalue",
+				origin = CompilerStdlibModule
+			},
+		],
+		module_targets = ["std/parallel_list"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.target.errors.length() == 0
+		and graph.modules
+			.get(0)
+			.map(func(module): module.errors.length()) == Some(0)
+	)
+
+
+private pure func typed_function_callable_id(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					result = info.callable_id
+					break
+			CompilerTypedPrivateDecl(CompilerTypedFunctionDecl(info)):
+				if info.decl.name.text == name:
+					result = info.callable_id
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_function_body_call_id(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							match compiler_typed_expr_resolved_call(body):
+								Some(call):
+									result = compiler_resolved_call_callable_id(call)
+								None:
+									void
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_function_body_call_module_path(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							match compiler_typed_expr_resolved_call(body):
+								Some(call):
+									match call.target:
+										CompilerResolvedTraitMethodCall(_, Some(target)):
+											result = Some(target.module_path)
+										_:
+											void
+								None:
+									void
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_expr_callee_call_module_path(expr: CompilerTypedExpr) -> Option[String]:
+	match expr:
+		CompilerTypedCallExpr(callee, _, _, _):
+			match compiler_typed_expr_resolved_call(callee):
+				Some(call):
+					match call.target:
+						CompilerResolvedTraitMethodCall(_, Some(target)):
+							Some(target.module_path)
+						_:
+							None
+				None:
+					None
+		CompilerTypedBlockExpr(items, _, _):
+			match items.get(items.length() - 1):
+				Some(last):
+					typed_expr_callee_call_module_path(last)
+				None:
+					None
+		_:
+			None
+
+
+private pure func typed_function_body_callee_call_module_path(
+	program: CompilerTypedProgram,
+	name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedFunctionDecl(info):
+				if info.decl.name.text == name:
+					match info.body:
+						Some(body):
+							result = typed_expr_callee_call_module_path(body)
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_module_program(
+	modules: List[CompilerTypecheckedModule],
+	module_path: String,
+) -> Option[CompilerTypedProgram]:
+	modules
+		.find(pure func(module): module.module_path == module_path)
+		.map(pure func(module): module.typed_program)
+
+
+private pure func typed_impl_method_callable_id(
+	program: CompilerTypedProgram,
+	trait_name: String,
+	method_name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedImplDecl(info):
+				if info.decl.trait_name.text == trait_name:
+					match info.methods.find(func(method): method.decl.name.text == method_name):
+						Some(method):
+							result = method.callable_id
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+private pure func typed_union_constructor_id(
+	program: CompilerTypedProgram,
+	type_name: String,
+	constructor_name: String,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			CompilerTypedUnionDecl(info):
+				if info.decl.name.text == type_name:
+					match info.variants.find(func(variant): variant.name == constructor_name):
+						Some(variant):
+							result = variant.def_id
+						None:
+							void
+
+					break
+			_:
+				void
+
+	result
+
+
+pure func test_typed_graph_uses_graph_wide_definition_ids() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tutil\n\nfunc main(args: List[String]) -> Int:\n\tutil.answer()",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "util.brp",
+				module_name = "util",
+				module_path = "util",
+				text = "pure func answer() -> Int:\n\t42",
+				origin = CompilerUserModule
+			},
+			{
+				path = "color.brp",
+				module_name = "color",
+				module_path = "color",
+				text = "enum Color:\n\tRed",
+				origin = CompilerUserModule
+			},
+			{
+				path = "signal.brp",
+				module_name = "signal",
+				module_path = "signal",
+				text = "union Signal:\n\tRed(Int)",
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["util", "color", "signal"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "util",
+				resolved_module = "util"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	match (
+		typed_module_program(graph.modules, "util"),
+		typed_module_program(graph.modules, "color"),
+		typed_module_program(graph.modules, "signal"),
+	):
+		(Some(util_program), Some(color_program), Some(signal_program)):
+			match (
+				typed_function_callable_id(util_program, "answer"),
+				typed_function_body_call_id(graph.target.typed_program, "main"),
+				typed_union_constructor_id(color_program, "Color", "Red"),
+				typed_union_constructor_id(signal_program, "Signal", "Red"),
+			):
+				(Some(answer_id), Some(call_id), Some(color_red_id), Some(signal_red_id)):
+					answer_id == call_id and color_red_id != signal_red_id
+				_:
+					False
+		_:
+			False
+
+
+pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tdep: Data, HasLength\n\nrecord Cache[K, V] {key: K, value: V}\n\npure func length[K, V](cache: Cache[K, V]) -> Int:\n\t0\n\npure func measure[T](data: Data[T]) -> Int:\n\tdata.length()",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "dep.brp",
+				module_name = "dep",
+				module_path = "dep",
+				text = "trait HasLength:\n\tpure func length(self: Self) -> Int\n\nrecord Data[T] {value: T}\n\nimplements HasLength for Data[T]:\n\tpure func length[T](self: Data[T]) -> Int:\n\t\t1",
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["dep"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "dep",
+				resolved_module = "dep"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	body_call_module_path = typed_function_body_call_module_path(
+		graph.target.typed_program,
+		"measure",
+	)
+
+	match (
+		typed_function_callable_id(graph.target.typed_program, "length"),
+		typed_function_body_call_id(graph.target.typed_program, "measure"),
+		typed_function_body_callee_call_module_path(graph.target.typed_program, "measure"),
+		typed_module_program(graph.modules, "dep"),
+	):
+		(Some(local_length_id), Some(measure_call_id), Some("dep"), Some(dep_program)):
+			(
+				graph.target.errors.length() == 0
+				and body_call_module_path == Some("dep")
+				and measure_call_id != local_length_id
+				and typed_impl_method_callable_id(
+					dep_program,
+					"HasLength",
+					"length",
+				) == Some(measure_call_id)
+			)
+		_:
+			False
+
+
+pure func test_typed_graph_imported_ufcs_precedes_builtin_fallback() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tdep: parallel\n\npure func measure(data: List[Int]) -> Int:\n\tdata.parallel(1)",
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "dep.brp",
+				module_name = "dep",
+				module_path = "dep",
+				text = "pure func parallel[T](data: List[T], extra: Int) -> Int:\n\textra",
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["dep"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "dep",
+				resolved_module = "dep"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	match typed_module_program(graph.modules, "dep"):
+		Some(dep_program):
+			match (
+				typed_function_callable_id(dep_program, "parallel"),
+				typed_function_body_call_id(graph.target.typed_program, "measure"),
+			):
+				(Some(parallel_id), Some(measure_call_id)):
+					graph.target.errors.length() == 0 and parallel_id == measure_call_id
+				_:
+					False
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler typecheck bridge",
 	tests = [
@@ -1173,16 +2403,80 @@ tests: TestSuite = {
 			test_typecheck_graph_returns_module_and_target_artifacts,
 		),
 		(
+			"typed graph API returns in-memory results",
+			test_typed_graph_api_returns_in_memory_results,
+		),
+		(
+			"typed graph avoids std prelude self import",
+			test_typed_graph_avoids_std_prelude_self_import,
+		),
+		(
+			"typed graph uses graph-wide definition ids",
+			test_typed_graph_uses_graph_wide_definition_ids,
+		),
+		(
+			"typed graph UFCS rejects mismatched local generic receiver",
+			test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver,
+		),
+		(
+			"typed graph imported UFCS precedes builtin fallback",
+			test_typed_graph_imported_ufcs_precedes_builtin_fallback,
+		),
+		(
 			"typecheck_graph handles shared import context",
 			test_typecheck_graph_handles_shared_import_context,
+		),
+		(
+			"typecheck_graph preserves qualified trait method resolution",
+			test_typecheck_graph_preserves_qualified_trait_method_resolution,
+		),
+		(
+			"typecheck_graph refines unannotated generic factory",
+			test_typecheck_graph_refines_unannotated_generic_factory,
 		),
 		(
 			"typecheck_graph evaluates shared CTFE dependency",
 			test_typecheck_graph_evaluates_shared_ctfe_dependency,
 		),
 		(
+			"typecheck_graph evaluates transitive CTFE dependencies first",
+			test_typecheck_graph_evaluates_transitive_ctfe_dependencies_first,
+		),
+		(
+			"typecheck_graph follows CTFE dependency through function-only module",
+			test_typecheck_graph_follows_ctfe_dependency_through_function_only_module,
+		),
+		(
+			"typecheck_graph evaluates std CTFE dependency",
+			test_typecheck_graph_evaluates_std_ctfe_dependency,
+		),
+		(
+			"typecheck_graph evaluates source-package CTFE dependency",
+			test_typecheck_graph_evaluates_source_package_ctfe_dependency,
+		),
+		(
+			"typecheck_graph evaluates root-local trait method",
+			test_typecheck_graph_evaluates_root_local_trait_method,
+		),
+		(
+			"typecheck_graph evaluates imported trait method",
+			test_typecheck_graph_evaluates_imported_trait_method,
+		),
+		(
+			"typecheck_graph isolates unrelated CTFE dependency failure",
+			test_typecheck_graph_isolates_unrelated_ctfe_dependency_failure,
+		),
+		(
+			"typecheck_graph CTFE dependency sees target surface",
+			test_typecheck_graph_ctfe_dependency_sees_target_surface,
+		),
+		(
 			"typecheck_graph resolves imported global annotation",
 			test_typecheck_graph_resolves_imported_global_annotation,
+		),
+		(
+			"typecheck_graph preserves imported opaque record field owner",
+			test_typecheck_graph_preserves_imported_opaque_record_field_owner,
 		),
 		(
 			"typecheck_graph materializes impure function reference",
@@ -1202,8 +2496,8 @@ tests: TestSuite = {
 			test_typecheck_source_marks_self_contained_ctfe_evaluated,
 		),
 		(
-			"typecheck_source reports unsupported import CTFE",
-			test_typecheck_source_reports_unsupported_import_ctfe,
+			"typecheck_source evaluates qualified import CTFE",
+			test_typecheck_source_evaluates_qualified_import_ctfe,
 		),
 		(
 			"typecheck_source evaluates imported function CTFE",
@@ -1212,6 +2506,10 @@ tests: TestSuite = {
 		(
 			"typecheck_source evaluates imported constant CTFE",
 			test_typecheck_source_evaluates_imported_constant_ctfe,
+		),
+		(
+			"typecheck_source evaluates aliased constant from non-leaf module",
+			test_typecheck_source_evaluates_aliased_constant_from_non_leaf_module,
 		),
 		(
 			"typecheck_source sees global conversion builtins",
@@ -1224,6 +2522,10 @@ tests: TestSuite = {
 		(
 			"typecheck_source allows bounded type param equality",
 			test_typecheck_source_allows_bounded_type_param_equality,
+		),
+		(
+			"typecheck_source allows generic constructor equality",
+			test_typecheck_source_allows_generic_constructor_equality,
 		),
 		("typecheck_source returns import bindings", test_typecheck_source_returns_import_bindings),
 		(
@@ -1243,6 +2545,10 @@ tests: TestSuite = {
 			test_typecheck_source_preserves_imported_resource_cleanup,
 		),
 		(
+			"typecheck_source preserves independent accept result",
+			test_typecheck_source_preserves_independent_accept_result,
+		),
+		(
 			"typecheck_source matches std shorthand import path",
 			test_typecheck_source_matches_std_shorthand_import_path,
 		),
@@ -1255,8 +2561,36 @@ tests: TestSuite = {
 			test_typecheck_source_uses_qualified_return_only_generic,
 		),
 		(
+			"typecheck_source uses selective return-only generic",
+			test_typecheck_source_uses_selective_return_only_generic,
+		),
+		(
+			"typecheck_source uses aliased return-only generic",
+			test_typecheck_source_uses_aliased_return_only_generic,
+		),
+		(
+			"typecheck_source refines unannotated generic factory",
+			test_typecheck_source_refines_unannotated_generic_factory,
+		),
+		(
+			"typecheck_source unifies constructor meta in generic call",
+			test_typecheck_source_unifies_constructor_meta_in_generic_call,
+		),
+		(
+			"typecheck_source contextually types Float32 tensor constructor",
+			test_typecheck_source_contextually_types_float_tensor_constructor,
+		),
+		(
 			"typecheck_source accepts imported generic return signature",
 			test_typecheck_source_accepts_imported_generic_return_signature,
+		),
+		(
+			"typecheck_source ignores unimported module declarations",
+			test_typecheck_source_ignores_unimported_module_declarations,
+		),
+		(
+			"typecheck_source resolves direct import transitive signature",
+			test_typecheck_source_resolves_direct_import_transitive_signature,
 		),
 		(
 			"typecheck_source uses aliased imported function",
@@ -1273,6 +2607,18 @@ tests: TestSuite = {
 		(
 			"typecheck_source uses imported trait method as UFCS",
 			test_typecheck_source_uses_imported_trait_method_as_ufcs,
+		),
+		(
+			"typecheck_source uses later same-module function as UFCS",
+			test_typecheck_source_uses_later_same_module_function_as_ufcs,
+		),
+		(
+			"typecheck_source keeps compiler prelude trait method visible",
+			test_typecheck_source_keeps_compiler_prelude_trait_method_visible,
+		),
+		(
+			"typecheck_source selects pure imported UFCS overload",
+			test_typecheck_source_selects_pure_imported_ufcs_overload,
 		),
 		(
 			"typecheck_source preserves resource policy for trait method UFCS",

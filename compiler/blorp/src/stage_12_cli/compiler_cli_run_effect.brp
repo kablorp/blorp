@@ -1,0 +1,198 @@
+-- Public run-command effect boundary.
+--
+-- The semantic worker returns a complete external-runtime BuildArtifact.
+-- This module discovers host policy once, prepares or repairs the immutable
+-- runtime cache, compiles in a scoped directory, and executes exact user argv.
+import:
+	../stage_10_backend/compiler_build_artifact:
+		BuildArtifact,
+		BuildRuntimeRequirement(BuildEmbeddedRuntime),
+	compiler_cli_compile_execute:
+		CliCompileExecution(CliCompileArtifact, CliCompileStopped),
+	compiler_cli_compile_worker_execute: execute_run_plan_with_worker
+	compiler_cli_execution_error: compile_execution_failure_message
+	compiler_cli_plan: CliHandledResult, CliRunSourcePlan
+	compiler_cli_run_policy: run_timeout_duration
+	compiler_host_c:
+		HostCConfiguration,
+		HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput),
+	compiler_host_environment:
+		CompilerHostEnvironment,
+		current_compiler_host_environment,
+	compiler_platform: host_platform_error_message
+	compiler_program_runner:
+		ProgramRunRequest,
+		program_exit_status,
+		program_run_error_message,
+		run_build_artifact,
+	compiler_runtime_cache: RuntimeCacheConfiguration, prepare_runtime_cache
+	compiler_semantic_worker_client: SemanticMiddleWorkerCommand
+	compiler_runtime: CompilerRuntimeSources
+	process as Process
+	units: DataSize, Duration
+
+
+record CliRunEffectConfiguration {
+	worker: SemanticMiddleWorkerCommand,
+	runtime_sources: CompilerRuntimeSources,
+	host_timeout: Option[Duration],
+	capture_limit: DataSize,
+	temporary_root: String
+}
+
+
+private record CliRunRuntimeSelection {
+	artifact: BuildArtifact,
+	runtime: HostRuntimeInput
+}
+
+
+private pure func handled_error(message: String) -> CliHandledResult:
+	{
+		status = 1,
+		stdout = "",
+		stderr = message
+	}
+
+
+private pure func artifact_uses_raylib(artifact: BuildArtifact) -> Bool:
+	artifact.native_features.any(func(feature):
+		match feature:
+			BuildRaylib:
+				True
+			BuildTls:
+				False
+	)
+
+
+private pure func host_c_configuration(
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> HostCConfiguration:
+	{
+		platform = host.toolchain.platform,
+		compiler = host.toolchain.compiler,
+		tls = host.tls,
+		raylib_prefix = host.raylib_prefix,
+		timeout = configuration.host_timeout,
+		capture_limit = configuration.capture_limit
+	}
+
+
+private pure func runtime_cache_configuration(
+	artifact: BuildArtifact,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> RuntimeCacheConfiguration:
+	{
+		cache_root = host.cache_root,
+		compiler = host.toolchain.compiler,
+		compiler_identity = host.toolchain.compiler_identity,
+		target_identity = host.toolchain.target_identity,
+		platform = host.toolchain.platform,
+		optimization = artifact.compatibility.optimization,
+		sanitizer = artifact.compatibility.sanitizer,
+		tls = host.tls,
+		runtime_sources = configuration.runtime_sources,
+		timeout = configuration.host_timeout,
+		capture_limit = configuration.capture_limit
+	}
+
+
+private func select_run_runtime(
+	artifact: BuildArtifact,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> CliRunRuntimeSelection:
+	match prepare_runtime_cache(runtime_cache_configuration(
+		artifact,
+		host,
+		configuration,
+	)):
+		Ok(precompiled):
+			{
+				artifact = artifact,
+				runtime = HostPrecompiledRuntimeInput(precompiled)
+			}
+		Err(_):
+			-- Preserve the established best-effort cache policy. A cache failure
+			-- changes packaging only; the same runtime source is compiled inline.
+			{
+				artifact = { artifact | runtime_requirement = BuildEmbeddedRuntime },
+				runtime = HostEmbeddedRuntime(configuration.runtime_sources)
+			}
+
+
+private func execute_compiled_run(
+	plan: CliRunSourcePlan,
+	artifact: BuildArtifact,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	match current_compiler_host_environment(
+		artifact_uses_raylib(artifact),
+		configuration.host_timeout,
+		configuration.capture_limit,
+	):
+		Err(error):
+			handled_error("host toolchain discovery failed: ${host_platform_error_message(error)}")
+		Ok(host):
+			selection: CliRunRuntimeSelection = select_run_runtime(
+				artifact,
+				host,
+				configuration,
+			)
+			request: ProgramRunRequest = {
+				artifact = selection.artifact,
+				host = host_c_configuration(host, configuration),
+				runtime = selection.runtime,
+				temporary_root = configuration.temporary_root,
+				user_arguments = plan.options.user_args,
+				timeout = run_timeout_duration(plan.options.timeout),
+				threads = plan.options.threads
+			}
+
+			match run_build_artifact(request):
+				Err(error):
+					handled_error(
+						"${artifact.source.path}: ${program_run_error_message(error)}",
+					)
+				Ok(result):
+					status: Int = program_exit_status(result.exit)
+					stderr: String = match result.exit:
+						Process.TimedOut:
+							match plan.options.timeout:
+								Some(timeout):
+									"Timed out after ${timeout.to_string()}s"
+								None:
+									"Timed out"
+						Process.Exited(_):
+							""
+						Process.Signaled(_):
+							""
+
+					{
+						status = status,
+						stdout = "",
+						stderr = stderr
+					}
+
+
+func execute_run_command(
+	plan: CliRunSourcePlan,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	execution: CliCompileExecution = execute_run_plan_with_worker(
+		plan,
+		configuration.worker,
+	)
+
+	match execution:
+		CliCompileArtifact(_, artifact, _):
+			execute_compiled_run(plan, artifact, configuration)
+		CliCompileStopped(_, _, _, _):
+			handled_error("internal error: run compilation stopped unexpectedly")
+		_:
+			handled_error(
+				compile_execution_failure_message(execution)
+					.get_or("internal error: run compilation produced no artifact"),
+			)

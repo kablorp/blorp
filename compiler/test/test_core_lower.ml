@@ -18,6 +18,7 @@ let loc =
   { line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }
 
 let ty_int = TyNamed ("Int", [])
+let ty_float = TyNamed ("Float", [])
 let ty_bool = TyNamed ("Bool", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
@@ -159,6 +160,84 @@ let test_lower_call () =
   | CCall (_, { desc = CVar { vname = "inc"; _ }; _ }, [ arg ]) ->
       Alcotest.(check bool) "arg" true (arg.desc = CLit (LitInt 5L))
   | _ -> Alcotest.fail "expected CCall"
+
+let test_lower_imported_scalar_call_lifted_over_tensor () =
+  let tensor_ty = TyArray (ty_float, [ TyConstInt 3 ]) in
+  let callee_ty =
+    TyFunc { params = [ ty_float ]; return = ty_float; is_pure = true }
+  in
+  let resolved_call =
+    {
+      call_syntax = CallBare;
+      call_target =
+        CallDirect
+          {
+            callable_id = 42;
+            source_name = "sqrt";
+            call_pure = true;
+            origin = CallableImported "std/float";
+          };
+      instantiated_params = [ ty_float ];
+      instantiated_return = tensor_ty;
+    }
+  in
+  let callee =
+    Blorp.Ast.with_expr_resolved_call
+      (ast_var "std_float__sqrt" callee_ty)
+      resolved_call
+  in
+  let tensor = ast_var "values" tensor_ty in
+  let call =
+    Blorp.Ast.with_expr_resolved_call
+      (mk_ast (ECall (callee, [ tensor ])) tensor_ty)
+      resolved_call
+  in
+  let core = lower_expr call in
+  match core.desc with
+  | CCall
+      ( CKBuiltin "blorp_vector_sqrt",
+        _,
+        [ { desc = CVar { vname = "values"; _ }; _ } ] ) ->
+      ()
+  | _ -> Alcotest.fail "expected imported sqrt call to lower as tensor sqrt"
+
+let test_lower_local_scalar_call_is_not_lifted_over_tensor () =
+  let tensor_ty = TyArray (ty_float, [ TyConstInt 3 ]) in
+  let callee_ty =
+    TyFunc { params = [ ty_float ]; return = ty_float; is_pure = true }
+  in
+  let resolved_call =
+    {
+      call_syntax = CallBare;
+      call_target =
+        CallDirect
+          {
+            callable_id = 43;
+            source_name = "sqrt";
+            call_pure = true;
+            origin = CallableLocal;
+          };
+      instantiated_params = [ ty_float ];
+      instantiated_return = tensor_ty;
+    }
+  in
+  let callee =
+    Blorp.Ast.with_expr_resolved_call (ast_var "sqrt" callee_ty) resolved_call
+  in
+  let tensor = ast_var "values" tensor_ty in
+  let call =
+    Blorp.Ast.with_expr_resolved_call
+      (mk_ast (ECall (callee, [ tensor ])) tensor_ty)
+      resolved_call
+  in
+  let core = lower_expr call in
+  match core.desc with
+  | CCall
+      ( CKSelectedDirect 43,
+        { desc = CVar { vname = "sqrt"; _ }; _ },
+        [ { desc = CVar { vname = "values"; _ }; _ } ] ) ->
+      ()
+  | _ -> Alcotest.fail "expected local sqrt call to remain a selected direct call"
 
 let test_lower_field () =
   let pt_ty = TyNamed ("Point", []) in
@@ -1978,6 +2057,59 @@ let test_core_lower_qualified_imported_call_ignores_selected_call_id () =
               "expected imported qualified call to preserve CField without \
                trusting bridge-local callable id"))
 
+(** Module-qualified implementation methods do not have a standalone function
+    symbol for name-based Core resolution. The graph-wide implementation ID is
+    therefore the authoritative target and must survive the module-field
+    syntax used by the typed bridge. *)
+let test_core_lower_qualified_impl_method_uses_selected_call_id () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let module_ty = TyNamed ("Module", []) in
+        let slice_ty = TyNamed ("StringSlice", []) in
+        let callee_ty =
+          TyFunc { params = [ slice_ty ]; return = ty_string; is_pure = true }
+        in
+        let alias = ast_var "S" module_ty in
+        let callee =
+          mk_ast (Blorp.Ast.EFieldAccess (alias, "to_string")) callee_ty
+        in
+        let slice = ast_var "slice" slice_ty in
+        let resolved_call =
+          {
+            call_syntax = CallMethod;
+            call_target =
+              CallDirect
+                {
+                  callable_id = 128;
+                  source_name = "to_string";
+                  call_pure = true;
+                  origin = CallableImplMethod;
+                };
+            instantiated_params = [ slice_ty ];
+            instantiated_return = ty_string;
+          }
+        in
+        let call =
+          Blorp.Ast.with_expr_resolved_call
+            (mk_ast (Blorp.Ast.ECall (callee, [ slice ])) ty_string)
+            resolved_call
+        in
+        let core = lower_expr call in
+        match core.desc with
+        | CCall
+            ( CKSelectedDirect 128,
+              {
+                desc =
+                  CField
+                    ( { desc = CVar { vname = "S"; _ }; _ }, "to_string" );
+                _;
+              },
+              _ ) ->
+            ()
+        | _ ->
+            Alcotest.fail
+              "expected qualified implementation method to retain selected id"))
+
 (** Annotated local bindings rewrap the initializer with the declared slot type.
     That must keep the imported module-field callee shape so the later
     module-aware resolver does not mistake it for closure field dispatch. *)
@@ -2045,6 +2177,23 @@ let test_core_lower_annotated_binding_preserves_imported_call_shape () =
             Alcotest.fail
               "expected annotated binding initializer to retain qualified \
                selected call kind"))
+
+(** Source annotations are retained for diagnostics, so a qualified type name
+    can differ from the canonical value-slot type produced by inference. Core
+    must use the latter for both the let binding and its initializer. *)
+let test_core_lower_local_binding_uses_canonical_value_slot_type () =
+  let source_ty = TyNamed ("SMTP.Config", []) in
+  let canonical_ty = TyNamed ("pkg_net_smtp__Config", []) in
+  let init = mk_ast (ERecord []) canonical_ty in
+  let binding = mk_ast (EVarDecl ("config", Some source_ty, init, false)) ty_void in
+  let block = ast_block [ binding; ast_var "config" canonical_ty ] canonical_ty in
+  match (lower_expr block).desc with
+  | CLet ({ bind_ty; bind_rhs; _ }, _) ->
+      Alcotest.(check bool)
+        "binding type is canonical" true (bind_ty = canonical_ty);
+      Alcotest.(check bool)
+        "initializer type is canonical" true (bind_rhs.ty = canonical_ty)
+  | _ -> Alcotest.fail "expected canonical local binding to lower as CLet"
 
 (** A3.3: non-UFCS idents lower to CVar with vdef_id = None. *)
 let test_core_lower_non_ufcs_ident_has_no_def_id () =
@@ -2217,6 +2366,10 @@ let suite =
     ( "call_field",
       [
         Alcotest.test_case "call" `Quick test_lower_call;
+        Alcotest.test_case "imported_scalar_call_lifted_over_tensor" `Quick
+          test_lower_imported_scalar_call_lifted_over_tensor;
+        Alcotest.test_case "local_scalar_call_is_not_lifted_over_tensor" `Quick
+          test_lower_local_scalar_call_is_not_lifted_over_tensor;
         Alcotest.test_case "field" `Quick test_lower_field;
         Alcotest.test_case "module_alias_field_typed_sentinel" `Quick
           test_lower_module_alias_field_uses_typed_sentinel;
@@ -2382,8 +2535,12 @@ let suite =
           test_core_lower_call_uses_resolved_call_def_id;
         Alcotest.test_case "core_lower qualified import ignores selected id"
           `Quick test_core_lower_qualified_imported_call_ignores_selected_call_id;
+        Alcotest.test_case "core_lower qualified impl uses selected id" `Quick
+          test_core_lower_qualified_impl_method_uses_selected_call_id;
         Alcotest.test_case "annotated binding preserves imported call shape" `Quick
           test_core_lower_annotated_binding_preserves_imported_call_shape;
+        Alcotest.test_case "local binding uses canonical value slot type" `Quick
+          test_core_lower_local_binding_uses_canonical_value_slot_type;
         Alcotest.test_case "non-ufcs ident has no vdef_id" `Quick
           test_core_lower_non_ufcs_ident_has_no_def_id;
       ] );

@@ -261,6 +261,28 @@ let test_collect_subst_variadic_dim_packs () =
         (Blorp.Core_mono.mangle_name "swap_order" subst)
   | None -> Alcotest.fail "expected variadic dimension pack substitution"
 
+let test_collect_subst_implicit_trailing_dim_pack () =
+  let type_params = tparams [ "#N" ] in
+  let param =
+    TyArray (ty_int, [ TyVar "#N"; TyVarDims "#Ds" ])
+  in
+  let actual = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
+  let raw =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params param actual []
+  in
+  match Blorp.Core_mono.dedup_subst_consistent raw with
+  | Some subst ->
+      Alcotest.(check bool)
+        "declared prefix dimension binds" true
+        (List.assoc_opt "#N" subst = Some (st (TyConstInt 2)));
+      Alcotest.(check bool)
+        "implicit trailing pack captures suffix" true
+        (List.assoc_opt "#Ds" subst = Some (sd [ TyConstInt 3 ]));
+      Alcotest.(check bool)
+        "return type splices implicit trailing pack" true
+        (Blorp.Core_mono.apply_subst subst param = actual)
+  | None -> Alcotest.fail "expected implicit trailing dimension pack substitution"
+
 let test_collect_subst_ignores_identity_bindings () =
   let dict key value = TyNamed ("Dict", [ key; value ]) in
   let type_params = tparams [ "K"; "V" ] in
@@ -2296,6 +2318,56 @@ let test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites () =
        "std_list__concurrent_with_timeout__mono_Int_Int"
        names)
 
+let test_mono_bare_concrete_call_ignores_colliding_generic_id () =
+  let list_t = TyNamed ("List", [ TyVar "T" ]) in
+  let list_string = TyNamed ("List", [ ty_string ]) in
+  let raw_environment = TyNamed ("RawProcessEnvironment", []) in
+  let generic_sum =
+    mk_func ~def_id:503 ~type_params:[ "T" ]
+      ~module_path:(Some "std/list") "std_list__sum"
+      [ ("self", list_t) ] (TyVar "T") (cvar "total" (TyVar "T"))
+  in
+  let concrete_environment =
+    mk_func ~def_id:503 ~module_path:(Some "std/process")
+      "raw_process_environment" [ ("changes", list_string) ] raw_environment
+      (cvar "environment" raw_environment)
+  in
+  let call_ty =
+    TyFunc
+      {
+        params = [ list_string ];
+        return = raw_environment;
+        is_pure = true;
+      }
+  in
+  let caller_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 503,
+           cvar "raw_process_environment" call_ty,
+           [ cvar "changes" list_string ] ))
+      raw_environment
+  in
+  let caller =
+    mk_func "caller" [ ("changes", list_string) ] raw_environment caller_body
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl generic_sum; mk_decl concrete_environment; mk_decl caller ]
+  in
+  let caller_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "caller" | _ -> false)
+      result
+  in
+  match caller_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar callee; _ }, _); _ }; _ }
+    ->
+      Alcotest.(check string)
+        "keeps the concrete callee" "raw_process_environment" callee.vname
+  | _ -> Alcotest.fail "expected unchanged concrete call"
+
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -2319,6 +2391,8 @@ let suite =
           `Quick test_collect_subst_ignores_erased_dim_value_params;
         Alcotest.test_case "collect_subst_variadic_dim_packs" `Quick
           test_collect_subst_variadic_dim_packs;
+        Alcotest.test_case "collect_subst_implicit_trailing_dim_pack" `Quick
+          test_collect_subst_implicit_trailing_dim_pack;
         Alcotest.test_case "collect_subst_ignores_identity_bindings" `Quick
           test_collect_subst_ignores_identity_bindings;
         Alcotest.test_case "apply" `Quick test_apply_subst;
@@ -2416,5 +2490,8 @@ let suite =
           test_mono_ufcs_hof_builtin_generic_rewrites;
         Alcotest.test_case "UFCS user wrapper with nested generic result rewrites"
           `Quick test_mono_ufcs_user_wrapper_with_nested_generic_result_rewrites;
+        Alcotest.test_case
+          "bare concrete call ignores colliding generic id" `Quick
+          test_mono_bare_concrete_call_ignores_colliding_generic_id;
       ] );
   ]

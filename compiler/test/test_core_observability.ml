@@ -283,10 +283,7 @@ let test_pipeline_frontend_phases_fire_before_core () =
   Blorp.Modules.init_module_paths ".";
   let frontend_phases = ref [] in
   let core_stages = ref [] in
-  let on_frontend_phase phase =
-    frontend_phases :=
-      Pipeline.frontend_phase_to_string phase :: !frontend_phases
-  in
+  let on_frontend_phase phase = frontend_phases := phase :: !frontend_phases in
   let on_stage stage _program =
     core_stages := Core_stage.to_string stage :: !core_stages
   in
@@ -295,10 +292,16 @@ let test_pipeline_frontend_phases_fire_before_core () =
       ~filename:"<test>" ~source ()
   with
   | Ok (Pipeline.Compiled _) ->
-      Alcotest.(check (list string))
+      Alcotest.(check (list int))
         "frontend phase order"
-        [ "parse"; "module_load"; "module_typecheck"; "main_typecheck" ]
-        (List.rev !frontend_phases);
+        [ 0; 1; 2; 3 ]
+        (List.rev_map
+           (function
+             | Pipeline.Parse -> 0
+             | ModuleLoad -> 1
+             | ModuleTypecheck -> 2
+             | MainTypecheck -> 3)
+           !frontend_phases);
       Alcotest.(check bool)
         "core stages still fire" true
         (List.rev !core_stages <> [])

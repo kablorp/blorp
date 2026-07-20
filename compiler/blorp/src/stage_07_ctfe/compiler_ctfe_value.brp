@@ -1,8 +1,8 @@
 -- Compile-time value representation and primitive operations.
 --
--- This module intentionally stays data-and-operators only. The evaluator owns
--- environments and execution; materialization owns rewriting values back into
--- typed declarations.
+-- This module owns CTFE value data, including the recursive closure/environment
+-- shape. Environment operations and evaluation remain in their dedicated
+-- modules; materialization owns rewriting values back into typed declarations.
 import:
 	../stage_01_file_io/compiler_source: CompilerSourceSpan
 	../stage_03_parse/compiler_parsed_ast:
@@ -21,7 +21,7 @@ import:
 		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 	../stage_05_types/compiler_type:
-		CompilerType,
+		CompilerType(CompilerNamedType),
 		compiler_type_bool,
 		compiler_type_char,
 		compiler_type_float,
@@ -29,6 +29,10 @@ import:
 		compiler_type_string,
 		compiler_type_to_string,
 		compiler_type_void,
+	../stage_06_typecheck/compiler_infer:
+		CompilerTypedExpr,
+		CompilerTypedExprInfo,
+		CompilerTypedLambdaParam,
 
 
 record CompilerCtfeConstructorInfo {
@@ -52,6 +56,54 @@ record CompilerCtfeFunctionReferencePayload {
 }
 
 
+-- Binding data lives with CTFE values because lambda values close over an
+-- environment. Keeping both sides of that recursive relationship in one
+-- module avoids making the value and environment modules import each other.
+enum CompilerCtfeBindingScope:
+	CompilerCtfeGlobalBinding
+	CompilerCtfeLocalBinding
+
+
+union CompilerCtfeUnavailableGlobalReason:
+	CompilerCtfeCurrentGlobal
+	CompilerCtfeLaterGlobal
+	CompilerCtfeRuntimeInitializedGlobal
+	CompilerCtfeImportedRuntimeInitializedGlobal(String, String)
+
+
+union CompilerCtfeBindingValue:
+	CompilerCtfeAvailableValue(CompilerCtfeValue)
+	CompilerCtfeUnavailableGlobal(CompilerCtfeUnavailableGlobalReason)
+
+
+record CompilerCtfeBinding {
+	scope: CompilerCtfeBindingScope,
+	is_mutable: Bool,
+	value: CompilerCtfeBindingValue
+}
+
+
+record CompilerCtfeEnv {
+	bindings: List[(String, CompilerCtfeBinding)]
+}
+
+
+record CompilerCtfeLambdaSource {
+	is_pure: Bool,
+	params: List[CompilerTypedLambdaParam],
+	return_annotation: Option[CompilerType],
+	body: CompilerTypedExpr,
+	span: CompilerSourceSpan,
+	info: CompilerTypedExprInfo
+}
+
+
+record CompilerCtfeLambdaPayload {
+	source: CompilerCtfeLambdaSource,
+	env: CompilerCtfeEnv
+}
+
+
 union CompilerCtfeValueDesc:
 	CompilerCtfeIntValue(Int)
 	CompilerCtfeFloatValue(Float)
@@ -67,6 +119,7 @@ union CompilerCtfeValueDesc:
 	CompilerCtfeVoidValue
 	CompilerCtfeConstructorValue(CompilerCtfeConstructorPayload)
 	CompilerCtfeFunctionReferenceValue(CompilerCtfeFunctionReferencePayload)
+	CompilerCtfeLambdaValue(CompilerCtfeLambdaPayload)
 
 
 record CompilerCtfeValue {
@@ -174,6 +227,8 @@ pure func compiler_ctfe_value_kind(value: CompilerCtfeValue) -> String:
 			"Constructor"
 		CompilerCtfeFunctionReferenceValue(_):
 			"Function reference"
+		CompilerCtfeLambdaValue(_):
+			"Lambda"
 
 
 pure func compiler_ctfe_error_message(error: CompilerCtfeError) -> String:
@@ -327,6 +382,8 @@ pure func compiler_ctfe_values_equal(left: CompilerCtfeValue, right: CompilerCtf
 					)
 				_:
 					False
+		CompilerCtfeLambdaValue(_):
+			False
 
 
 private pure func compiler_ctfe_constructor_values_equal(
@@ -600,6 +657,28 @@ private pure func compiler_ctfe_binary_result_type(
 			left.typ
 
 
+private pure func compiler_ctfe_round_float_desc(
+	typ: CompilerType,
+	desc: CompilerCtfeValueDesc,
+) -> CompilerCtfeValueDesc:
+	match desc:
+		CompilerCtfeFloatValue(raw):
+			match typ:
+				CompilerNamedType(name, args):
+					if args.length() != 0:
+						desc
+					else if name == "Float16":
+						CompilerCtfeFloatValue(to_float(to_float16(raw)))
+					else if name == "Float32":
+						CompilerCtfeFloatValue(to_float(to_float32(raw)))
+					else:
+						desc
+				_:
+					desc
+		_:
+			desc
+
+
 pure func compiler_ctfe_eval_binary(
 	op: ParsedBinaryOp,
 	left: CompilerCtfeValue,
@@ -621,7 +700,14 @@ pure func compiler_ctfe_eval_binary(
 
 	match desc_result:
 		Ok(desc):
-			Ok(compiler_ctfe_value(compiler_ctfe_binary_result_type(op, left), desc, left.span))
+			result_type = compiler_ctfe_binary_result_type(op, left)
+			Ok(
+				compiler_ctfe_value(
+					result_type,
+					compiler_ctfe_round_float_desc(result_type, desc),
+					left.span,
+				),
+			)
 		Err(error):
 			Err(error)
 
@@ -634,7 +720,16 @@ pure func compiler_ctfe_eval_unary(
 		ParsedNegateOp:
 			match value.desc:
 				CompilerCtfeFloatValue(raw):
-					Ok(compiler_ctfe_float(value.span, 0.0 - raw))
+					Ok(
+						compiler_ctfe_value(
+							value.typ,
+							compiler_ctfe_round_float_desc(
+								value.typ,
+								CompilerCtfeFloatValue(0.0 - raw),
+							),
+							value.span,
+						),
+					)
 				_:
 					raw ?= compiler_ctfe_expect_int(value)
 					Ok(compiler_ctfe_int(value.span, 0 - raw))

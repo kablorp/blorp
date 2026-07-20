@@ -115,6 +115,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreMatchBinding,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
 		CoreTupleElement(
@@ -337,6 +338,184 @@ pure func map_core_constructor_match_fallback(
 			ConstructorMatchFallbackBindings(bindings, mapper(body))
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
+
+
+private pure func map_scoped_literal_match_case(
+	match_case: CoreLiteralMatchCase,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreLiteralMatchCase:
+	scoped_bindings: List[CoreMatchBinding] = bindings + match_case.bindings
+	{ match_case | body = mapper(scoped_bindings, match_case.body) }
+
+
+private pure func map_scoped_literal_match_cases(
+	cases: List[CoreLiteralMatchCase],
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> List[CoreLiteralMatchCase]:
+	cases.map(func(match_case): map_scoped_literal_match_case(match_case, bindings, mapper))
+
+
+private pure func map_scoped_literal_match_fallback(
+	fallback: CoreLiteralMatchFallback,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(mapper(bindings, body))
+		LiteralMatchFallbackBindings(fallback_bindings, body):
+			LiteralMatchFallbackBindings(
+				fallback_bindings,
+				mapper(bindings + fallback_bindings, body),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func map_scoped_constructor_literal_match(
+	match_expr: CoreConstructorLiteralMatch,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = map_scoped_literal_match_cases(match_expr.cases, bindings, mapper),
+		fallback = map_scoped_literal_match_fallback(match_expr.fallback, bindings, mapper)
+	}
+
+
+private pure func map_scoped_constructor_match_body(
+	body: CoreConstructorMatchBody,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(mapper(bindings, expr))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				map_scoped_constructor_literal_match(match_expr, bindings, mapper),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				map_scoped_constructor_length_match(match_expr, bindings, mapper),
+			)
+
+
+private pure func map_scoped_constructor_length_branch(
+	branch: CoreConstructorLengthMatchBranch,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorLengthMatchBranch:
+	scoped_bindings: List[CoreMatchBinding] = bindings + branch.bindings
+	{ branch |
+		body = map_scoped_constructor_match_body(branch.body, scoped_bindings, mapper)
+	}
+
+
+private pure func map_scoped_constructor_length_match(
+	match_expr: CoreConstructorLengthMatch,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorLengthMatch:
+	mapped_cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(
+		func(match_case): { match_case |
+			branch = map_scoped_constructor_length_branch(match_case.branch, bindings, mapper)
+		},
+	)
+	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(geq):
+			Some({ geq |
+				branch = map_scoped_constructor_length_branch(geq.branch, bindings, mapper)
+			})
+		None:
+			None
+	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(map_scoped_constructor_length_branch(branch, bindings, mapper))
+		None:
+			None
+
+	{ match_expr |
+		cases = mapped_cases,
+		geq = mapped_geq,
+		fallback = mapped_fallback
+	}
+
+
+private pure func map_scoped_constructor_match_case(
+	match_case: CoreConstructorMatchCase,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorMatchCase:
+	scoped_bindings: List[CoreMatchBinding] = bindings + match_case.bindings
+	{ match_case |
+		body = map_scoped_constructor_match_body(match_case.body, scoped_bindings, mapper)
+	}
+
+
+private pure func map_scoped_constructor_match_fallback(
+	fallback: CoreConstructorMatchFallback,
+	bindings: List[CoreMatchBinding],
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(mapper(bindings, body))
+		ConstructorMatchFallbackBindings(fallback_bindings, body):
+			ConstructorMatchFallbackBindings(
+				fallback_bindings,
+				mapper(bindings + fallback_bindings, body),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+pure func map_core_match_results(
+	expr: CoreExpr,
+	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				scrutinee,
+				map_scoped_literal_match_cases(cases, [], mapper),
+				map_scoped_literal_match_fallback(fallback, [], mapper),
+				typ,
+				loc,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				scrutinee,
+				release_policy,
+				map_scoped_constructor_literal_match(match_expr, [], mapper),
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				scrutinee,
+				release_policy,
+				map_scoped_constructor_length_match(match_expr, [], mapper),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				scrutinee,
+				release_policy,
+				cases.map(func(match_case): map_scoped_constructor_match_case(
+						match_case,
+						[],
+						mapper,
+					)),
+				map_scoped_constructor_match_fallback(fallback, [], mapper),
+				typ,
+				loc,
+			)
+		_:
+			expr
 
 
 private pure func map_select_arm_kind(

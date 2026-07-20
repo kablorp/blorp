@@ -100,8 +100,6 @@ let test_decode_phase_specific_request () =
   Alcotest.(check int) "observation count" 2
     (List.length request.observations);
   Alcotest.(check bool) "invariants" true request.check_invariants;
-  Alcotest.(check int) "capability count" 3
-    (List.length request.required_capabilities);
   Alcotest.(check (option string)) "no stop" None
     (Option.map Semantic_middle_worker.stage_name request.stop_after)
 

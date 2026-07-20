@@ -32,14 +32,18 @@ if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_pla
 	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
 	exit 1
 fi
-
-cli_hash_block=$(sed -n '/new_hash=\$\$( {/,/old_hash=\$\$(cat/p' Makefile)
-if [ -z "$cli_hash_block" ] || ! grep -Fq '"$$bridge_compiler"' <<<"$cli_hash_block"; then
-	echo "FAIL: generated CLI artifacts must hash the concrete compiler executable" >&2
+if ! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must link the generated runtime source provider" >&2
 	exit 1
 fi
-if grep -Fq '"$(BLORP_COMPILER_BOOTSTRAP)"' <<<"$cli_hash_block"; then
-	echo "FAIL: resolver-only edits must not invalidate generated CLI artifacts" >&2
+if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
+	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
+	exit 1
+fi
+
+install_plan=$(make -n install)
+if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_middle.exe" "./blorp-ocaml-middle"' <<<"$install_plan"; then
+	echo "FAIL: install must place the semantic worker beside the Blorp CLI" >&2
 	exit 1
 fi
 
@@ -49,81 +53,85 @@ if grep -Eq '~/.cache/dune|~/Library/Caches/dune' "$setup_action"; then
 	exit 1
 fi
 
-bootstrap=scripts/blorp-compiler-bootstrap
-bootstrap_pin=scripts/blorp-compiler-bootstrap-pin.sh
-if [ ! -f "$bootstrap_pin" ]; then
-	echo "FAIL: the compiler bootstrap must have one checked-in pin manifest" >&2
+bootstrap_manifest=compiler/bootstrap.env
+if [ ! -f "$bootstrap_manifest" ]; then
+	echo "FAIL: the compiler bootstrap must have one checked-in manifest" >&2
 	exit 1
 fi
 
-# shellcheck source=../scripts/blorp-compiler-bootstrap-pin.sh
-source "$bootstrap_pin"
-if [[ ! "$BLORP_BOOTSTRAP_RELEASE_REVISION" =~ ^[0-9a-f]{12}$ ]]; then
-	echo "FAIL: the bootstrap release revision must be a 12-character lowercase commit prefix" >&2
-	exit 1
-fi
-if [[ ! "$BLORP_BOOTSTRAP_RELEASE_BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-	echo "FAIL: the bootstrap base version must use major.minor.patch syntax" >&2
-	exit 1
-fi
-expected_bootstrap_id="dev-${BLORP_BOOTSTRAP_RELEASE_REVISION} ${BLORP_BOOTSTRAP_RELEASE_BASE_VERSION}-dev.${BLORP_BOOTSTRAP_RELEASE_REVISION}"
-if [ "$("$bootstrap" --print-id)" != "$expected_bootstrap_id" ]; then
-	echo "FAIL: the bootstrap tag and version must derive from the pin manifest revision" >&2
-	exit 1
-fi
+# The manifest is checked-in shell data so the bootstrap wrapper and CI can
+# share one release identity without maintaining a second parser.
+# shellcheck source=../compiler/bootstrap.env
+source "$bootstrap_manifest"
 
-for checksum in \
-	"$BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" \
-	"$BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" \
-	"$BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
+for required_bootstrap_value in \
+	BLORP_BOOTSTRAP_REPO \
+	BLORP_BOOTSTRAP_TAG \
+	BLORP_BOOTSTRAP_VERSION \
+	BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN \
+	BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU \
+	BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU
 do
-	if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
-		echo "FAIL: compiler bootstrap checksums must be lowercase SHA-256 values" >&2
+	if [ -z "${!required_bootstrap_value:-}" ]; then
+		echo "FAIL: $bootstrap_manifest must define $required_bootstrap_value" >&2
 		exit 1
 	fi
 done
 
-if override_output=$(BLORP_COMPILER_BOOTSTRAP_TAG=dev-invalid "$bootstrap" --print-id 2>&1); then
-	echo "FAIL: the bootstrap must reject tag-only environment overrides" >&2
-	exit 1
-fi
-if ! grep -Fq 'BLORP_COMPILER_BOOTSTRAP_TAG is no longer supported' <<<"$override_output"; then
-	echo "FAIL: the retired bootstrap tag override needs an actionable diagnostic" >&2
-	printf '%s\n' "$override_output" >&2
+if [[ ! "$BLORP_BOOTSTRAP_TAG" =~ ^dev-[0-9a-f]{12}$ ]]; then
+	echo "FAIL: $bootstrap_manifest must pin an immutable dev revision" >&2
 	exit 1
 fi
 
-for workflow in .github/workflows/*.yml .github/workflows/*.yaml
+bootstrap_revision=${BLORP_BOOTSTRAP_TAG#dev-}
+if [[ "$BLORP_BOOTSTRAP_VERSION" != *"-dev.$bootstrap_revision" ]]; then
+	echo "FAIL: the bootstrap artifact version must match $BLORP_BOOTSTRAP_TAG" >&2
+	exit 1
+fi
+
+for bootstrap_sha in \
+	"$BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" \
+	"$BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" \
+	"$BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
 do
-	if [ ! -e "$workflow" ]; then
-		continue
-	fi
-	if ! grep -Eq '(^|[[:space:]])make([[:space:]]|$)|scripts/(premerge-gate|test)|benchmarks/bench\.sh' "$workflow"; then
-		continue
-	fi
-	if grep -Fq 'BLORP_COMPILER_BOOTSTRAP_TAG' "$workflow"; then
-		echo "FAIL: $workflow must not override the bootstrap script's pinned release" >&2
+	if [[ ! "$bootstrap_sha" =~ ^[0-9a-f]{64}$ ]]; then
+		echo "FAIL: $bootstrap_manifest contains an invalid target checksum" >&2
 		exit 1
 	fi
-	if ! grep -Fq "key: blorp-compiler-bootstrap-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('scripts/blorp-compiler-bootstrap-pin.sh') }}-\${{ hashFiles('scripts/blorp-compiler-bootstrap') }}" "$workflow"; then
-		echo "FAIL: $workflow must derive the bootstrap cache key from the pin and resolver" >&2
-		exit 1
-	fi
-	if ! grep -Fq "blorp-compiler-bridge-v1-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('scripts/blorp-compiler-bootstrap-pin.sh') }}-" "$workflow"; then
-		echo "FAIL: $workflow must isolate bridge caches by bootstrap pin" >&2
-		exit 1
-	fi
-	if ! grep -Fq "blorp-cli-v1-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('scripts/blorp-compiler-bootstrap-pin.sh') }}-" "$workflow"; then
-		echo "FAIL: $workflow must isolate generated CLI caches by bootstrap pin" >&2
-		exit 1
-	fi
-	expensive_cache_lines=$(grep -E 'blorp-(compiler-bridge|cli)-v1-' "$workflow")
-	if grep -Fq "hashFiles('scripts/blorp-compiler-bootstrap')" <<<"$expensive_cache_lines"; then
-		echo "FAIL: $workflow must not invalidate compiled artifacts for resolver-only edits" >&2
-		exit 1
-	fi
+done
+
+if [ "$(scripts/blorp-compiler-bootstrap --print-tag)" != "$BLORP_BOOTSTRAP_TAG" ]; then
+	echo "FAIL: the bootstrap wrapper must read its default tag from $bootstrap_manifest" >&2
+	exit 1
+fi
+
+overridden_tag=$(BLORP_COMPILER_BOOTSTRAP_TAG=dev-000000000000 \
+	scripts/blorp-compiler-bootstrap --print-tag)
+if [ "$overridden_tag" != "$BLORP_BOOTSTRAP_TAG" ]; then
+	echo "FAIL: an ambient environment variable must not override the bootstrap manifest" >&2
+	exit 1
+fi
+
+for workflow in \
+	.github/workflows/ci.yml \
+	.github/workflows/premerge.yml \
+	.github/workflows/benchmarks.yml \
+	.github/workflows/release.yml
+do
 	if ! grep -Fq 'name: Cache Dune build artifacts' "$workflow"; then
 		echo "FAIL: $workflow must cache Dune build artifacts explicitly" >&2
+		exit 1
+	fi
+	if grep -Eq 'BLORP_COMPILER_BOOTSTRAP_TAG: dev-[0-9a-f]+' "$workflow"; then
+		echo "FAIL: $workflow must not carry an independent compiler bootstrap pin" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'id: compiler-bootstrap' "$workflow"; then
+		echo "FAIL: $workflow must load the compiler bootstrap manifest" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'steps.compiler-bootstrap.outputs.tag' "$workflow"; then
+		echo "FAIL: $workflow cache keys must use the compiler bootstrap manifest tag" >&2
 		exit 1
 	fi
 done

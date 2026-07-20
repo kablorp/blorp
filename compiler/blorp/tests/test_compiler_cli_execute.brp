@@ -1,0 +1,470 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral, StringLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+		core_program_to_json,
+	../src/stage_09_core/compiler_semantic_worker_protocol:
+		SEMANTIC_MIDDLE_DOMAIN,
+		SEMANTIC_MIDDLE_SCHEMA_VERSION,
+	../src/stage_10_backend/compiler_build_artifact:
+		BuildNativeFeature(BuildRaylib, BuildTls),
+		BuildOptimization(BuildFast),
+		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
+	../src/stage_12_cli/compiler_cli: run_cli
+	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_compile_execute:
+		CliCompileExecution(CliCompileArtifact),
+		execute_compile_plan,
+		execute_run_plan,
+		graph_native_features,
+	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
+	../src/stage_12_cli/compiler_cli_plan:
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule, CliFrontendUserModule),
+		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
+	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
+	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
+	system: remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+pure func compiled_response_fixture() -> JsonValue:
+	compiled_response_fixture_with_core(JsonObject([
+		("kind", JsonString("program")),
+		("decls", JsonVector([])),
+		("foreign_includes", JsonVector([])),
+	]))
+
+
+pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
+		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
+		("kind", JsonString("compiled")),
+		("capabilities", JsonVector([
+			JsonString("typed_ast_post_ctfe"),
+			JsonString("core_pre_dce"),
+			JsonString("rendered_stage_observations"),
+		])),
+		("core", core),
+		("observations", JsonVector([])),
+	])
+
+
+pure func named_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
+	desc: CoreVar = named_var("desc")
+	read: CoreVar = named_var("read")
+	string_type: CoreType = NamedType("String", [])
+	int_type: CoreType = NamedType("Int", [])
+	read_param: CoreParam = {
+		name = named_var("value"),
+		typ = string_type,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [function_decl(
+				"read",
+				2,
+				[read_param],
+				int_type,
+				LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
+			), function_decl(
+				"main",
+				1,
+				[],
+				int_type,
+				LetExpr(
+					desc,
+					True,
+					string_type,
+					LiteralExpr(StringLiteral("description"), string_type, SyntheticSourceLoc),
+					CallExpr(
+						UserCall("read", Some(2), []),
+						VarExpr(
+							read,
+							NamedType("Function", []),
+							SyntheticSourceLoc,
+						),
+						[VarExpr(desc, string_type, SyntheticSourceLoc)],
+						int_type,
+						SyntheticSourceLoc,
+					),
+				),
+			)],
+		foreign_includes = []
+	}
+
+
+func write_source(path: String) -> Bool:
+	match write_file(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func test_check_executes_without_host_plan() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_check.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["check", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCheck(check_plan):
+				result = execute_check_plan(check_plan)
+				encoded = cli_run_plan_to_json(plan)
+
+				(
+					result.status == 0
+					and result.stdout.contains("Type checking succeeded.")
+					and result.stderr == ""
+					and get_field(encoded, "error").is_some()
+				)
+			_:
+				False
+
+
+func test_check_reports_imported_module_errors() -> Bool:
+	plan = run_cli([
+		"check",
+		"--no-format",
+		"tests/test_compiler/typecheck/should_fail/module_undefined_identifier.brp",
+	])
+
+	match plan:
+		CliRunCheck(check_plan):
+			result = execute_check_plan(check_plan)
+
+			result.status == 1 and result.stderr.contains("nonexistent_var")
+		_:
+			False
+
+
+pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bool:
+	first_root: CliFrontendGraphSource = {
+		path = "/project/first.brp",
+		module_name = "first",
+		source_text = "import:\n\tshared: broken\n\npure func first() -> Int: broken()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	second_root: CliFrontendGraphSource = {
+		path = "/project/second.brp",
+		module_name = "second",
+		source_text = "import:\n\tshared: broken\n\npure func second() -> Int: broken()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	dependency: CliFrontendGraphSource = {
+		path = "/project/shared.brp",
+		module_name = "shared",
+		source_text = "pure func broken() -> Int: missing_shared_value",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	first_edge: CliFrontendImportEdge = {
+		from_path = first_root.path,
+		from_module = first_root.module_name,
+		import_path = "shared",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	second_edge: CliFrontendImportEdge = {
+		from_path = second_root.path,
+		from_module = second_root.module_name,
+		import_path = "shared",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [first_root, second_root],
+		modules = [dependency],
+		import_edges = [first_edge, second_edge],
+		diagnostics = []
+	}
+	result = execute_check_plan({
+		args = [],
+		graph = graph,
+		options = {
+			debug = False,
+			dump_ast = False,
+			dump_typed_ast = False,
+			no_format = True,
+			std_dir = None,
+			paths = [first_root.path, second_root.path]
+		},
+	})
+
+	(
+		result.status == 1
+		and result.stdout.contains("Checking /project/first.brp")
+		and result.stdout.contains("Checking /project/second.brp")
+		and result.stderr.count("missing_shared_value") == 1
+	)
+
+
+pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
+	root: CliFrontendGraphSource = {
+		path = "/project/main.brp",
+		module_name = "main",
+		source_text = "import:\n\tdep: helper\n\nfunc main() -> Int: helper()",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	dependency: CliFrontendGraphSource = {
+		path = "/project/dep.brp",
+		module_name = "dep",
+		source_text = "pure func helper() -> Int: 1",
+		parsed_source = JsonObject([]),
+		origin = CliFrontendUserModule
+	}
+	edge: CliFrontendImportEdge = {
+		from_path = root.path,
+		from_module = root.module_name,
+		import_path = "dep",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(CliFrontendUserModule)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [root],
+		modules = [dependency],
+		import_edges = [edge],
+		diagnostics = []
+	}
+
+	typechecked = typecheck_frontend_root_only(graph, root, False)
+	typechecked.modules.length() == 0
+
+
+func test_compile_builds_one_typed_request_and_artifact() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_compile.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, compiled_response_fixture()):
+					CliCompileArtifact(request, artifact, _):
+						(
+							request.target.path == path
+							and request.modules.any(
+								func(module): module.module_name == "std/prelude",
+							)
+							and request.required_capabilities.length() == 3
+							and request.require_main
+							and artifact.c_code.length() > 0
+							and artifact.runtime_requirement == BuildEmbeddedRuntime
+							and artifact.source.path == path
+							and artifact.compatibility.optimization == BuildFast
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_run_builds_one_typed_request_and_artifact() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_run.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli([
+			"run",
+			"--no-format",
+			"--profile",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunSource(run_plan):
+				encoded = cli_run_plan_to_json(plan)
+
+				match execute_run_plan(run_plan, compiled_response_fixture()):
+					CliCompileArtifact(request, artifact, _):
+						(
+							get_field(encoded, "error").is_some()
+							and request.target.path == path
+							and request.modules.any(
+								func(module): module.module_name == "std/prelude",
+							)
+							and request.require_main
+							and artifact.c_code.length() > 0
+							and artifact.runtime_requirement == BuildExternalRuntime
+							and artifact.compatibility.profile
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_compile_emits_completed_core_without_repeating_late_pipeline() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_prepared_core.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+		response: JsonValue = compiled_response_fixture_with_core(
+			core_program_to_json(mutable_string_owner_pre_dce_program()),
+		)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, response):
+					CliCompileArtifact(_, artifact, _):
+						artifact.c_code.count("blorp_release(desc);") == 1
+					_:
+						False
+			_:
+				False
+
+
+pure func test_native_features_come_from_typed_graph() -> Bool:
+	graph: CliFrontendModuleGraph = {
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [
+			{
+				path = "/project/main.brp",
+				module_name = "main",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				origin = CliFrontendUserModule
+			},
+		],
+		modules = [
+			{
+				path = "/builtin/raylib.brp",
+				module_name = "pkg/raylib/core",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				origin = CliFrontendPkgModule("raylib")
+			},
+			{
+				path = "/project/std/net/tls.brp",
+				module_name = "std/net/tls",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				origin = CliFrontendStdModule
+			},
+			{
+				path = "/other/raylib.brp",
+				module_name = "not_raylib",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				origin = CliFrontendUserModule
+			},
+			{
+				path = "/other/tls.brp",
+				module_name = "std/net/tls",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				origin = CliFrontendUserModule
+			},
+		],
+		import_edges = [],
+		diagnostics = []
+	}
+
+	graph_native_features(graph) == [BuildRaylib, BuildTls]
+
+
+tests: TestSuite = {
+	description = "Blorp CLI in-process execution",
+	tests = [
+		("check executes without host plan", test_check_executes_without_host_plan),
+		("check reports imported module errors", test_check_reports_imported_module_errors),
+		(
+			"check visits all roots and reports a shared dependency once",
+			test_check_visits_all_roots_and_reports_shared_dependency_once,
+		),
+		(
+			"check root only returns no dependency artifacts",
+			test_check_root_only_returns_no_dependency_artifacts,
+		),
+		(
+			"compile builds one typed request and artifact",
+			test_compile_builds_one_typed_request_and_artifact,
+		),
+		(
+			"run builds one typed request and artifact",
+			test_run_builds_one_typed_request_and_artifact,
+		),
+		(
+			"compile emits prepared Core without repeating the late pipeline",
+			test_compile_emits_completed_core_without_repeating_late_pipeline,
+		),
+		("native features come from typed graph", test_native_features_come_from_typed_graph),
+	]
+}

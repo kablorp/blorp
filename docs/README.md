@@ -26,6 +26,10 @@ for history.
   structure, Core pass order, and backend boundaries.
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) tracks active compiler cleanup,
   call-resolution, performance, and native-boundary work.
+- [COMPILER_PERCEUS_MEMORY_ROADMAP.md](COMPILER_PERCEUS_MEMORY_ROADMAP.md)
+  records the measured self-hosted compiler memory regression in global
+  reference/ownership handling and the staged plan to replace per-global Core
+  rewrites with resolved identities and per-body reference facts.
 - [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) tracks the
   aggressive OCaml-to-Blorp compiler migration, including explicit JSON
   boundaries, current Blorp-owned CLI/parser and Core-tail edges, and

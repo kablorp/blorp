@@ -13,26 +13,33 @@ import:
 			CompilerLengthRefinedInference,
 			CompilerTensorCheckedSetInference,
 		),
-		compiler_builtin_duplicate_names,
 		compiler_builtin_has_effect,
-		compiler_builtin_inert_descriptor_names,
 		compiler_builtin_is_cancellation_point,
+		compiler_builtin_is_elementwise_tensor_function,
 		compiler_builtin_is_impure,
 		compiler_builtin_is_os_worker_blocking,
 		compiler_builtin_is_parallel_boundary,
 		compiler_builtin_is_registered,
 		compiler_builtin_may_park_fiber,
+		compiler_builtin_resource_result_policy,
 		compiler_builtin_special_inference,
+		compiler_builtin_trait_is_prelude,
 		compiler_env_with_builtins,
 	../src/stage_05_types/compiler_env:
 		CompilerEnv,
 		CompilerPurity(CompilerImpure, CompilerPure),
+		CompilerResourceResultPolicy(
+			CompilerResourceResultDependent,
+			CompilerResourceResultIndependent,
+		),
+		CompilerTraitMethodSig,
 		CompilerTraitObligationResolution(CompilerTraitObligationSatisfied),
 		CompilerTypeKind(CompilerTypeBuiltin),
 		compiler_env_empty,
 		compiler_env_get_constructor,
 		compiler_env_get_func_info,
 		compiler_env_get_function_trait,
+		compiler_env_get_trait,
 		compiler_env_get_type_decl,
 		compiler_env_get_type_kind,
 		compiler_env_is_builtin_func,
@@ -48,12 +55,15 @@ import:
 			CompilerConstIntType,
 			CompilerFunctionType,
 			CompilerNamedType,
+			CompilerSelfType,
 			CompilerTypeVar,
+			CompilerVarDimsType,
 		),
 		compiler_type_bool,
 		compiler_type_int,
 		compiler_type_string,
 		compiler_types_equal,
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -85,20 +95,52 @@ func test_builtin_metadata_classifies_effects_and_specials() -> Bool:
 				and not compiler_builtin_is_registered("__missing_builtin__")
 				and compiler_builtin_is_impure("print")
 				and compiler_builtin_is_impure("seal")
+				and compiler_builtin_is_impure("blorp_udp_bind_numeric_raw")
 				and compiler_builtin_has_effect("send_timeout", CompilerBuiltinImpure)
 				and compiler_builtin_is_cancellation_point("yield_now")
+				and compiler_builtin_is_cancellation_point("tls_state_probe_for_test")
 				and compiler_builtin_is_cancellation_point("sleep")
 				and compiler_builtin_may_park_fiber("recv")
+				and compiler_builtin_may_park_fiber("blorp_udp_recv_from_raw")
 				and not compiler_builtin_may_park_fiber("yield_now")
 				and compiler_builtin_is_os_worker_blocking("blorp_dns_resolve_raw")
 				and compiler_builtin_is_parallel_boundary("parallel")
 				and is_assert_shape_special(compiler_builtin_special_inference("assert_shape"))
 				and is_bitwise_special(compiler_builtin_special_inference("shift_right"))
-				and compiler_builtin_duplicate_names().length() == 0
-				and compiler_builtin_inert_descriptor_names().length() == 0
+				and compiler_builtin_trait_is_prelude("HasLength")
+				and compiler_builtin_trait_is_prelude("Absolute")
+				and compiler_builtin_trait_is_prelude("FloatingPoint")
+				and compiler_builtin_is_elementwise_tensor_function("sqrt")
+				and compiler_builtin_is_elementwise_tensor_function("abs")
+				and not compiler_builtin_is_elementwise_tensor_function("sin")
+				and not compiler_builtin_trait_is_prelude("UserTrait")
 			)
 		_:
 			False
+
+
+func test_builtin_effect_lookup_does_not_materialize_registry() -> Bool:
+	name: String = "send_timeout"
+	reset_mem_stats()
+	var classified: Bool = True
+
+	for _ in 0..1000:
+		if not compiler_builtin_may_park_fiber(name):
+			classified = False
+
+	stats = get_mem_stats()
+	classified and stats.total_allocations == 0 and stats.total_releases == 0
+
+
+pure func test_builtin_resource_result_policy_is_explicit() -> Bool:
+	(
+		compiler_builtin_resource_result_policy(
+			"blorp_tcp_accept_raw",
+		) == CompilerResourceResultIndependent
+		and compiler_builtin_resource_result_policy(
+			"read_handle",
+		) == CompilerResourceResultDependent
+	)
 
 
 func test_with_builtins_populates_core_env() -> Bool:
@@ -226,17 +268,31 @@ func test_with_builtins_populates_specialized_and_scalar_functions() -> Bool:
 		"bit_xor",
 		"checked_div",
 		"checked_mod",
+		"checked_set",
+		"checked_slice",
+		"enumerate2",
+		"fixed",
+		"from_char",
+		"from_chars",
 		"matrix_checked_get",
+		"matrix_checked_set",
 		"matrix",
+		"max_threads",
+		"recv_timeout",
 		"seal",
+		"send_timeout",
 		"shift_left",
 		"shift_right",
 		"tensor3",
 		"tensor3_checked_get",
+		"tensor3_checked_set",
 		"tensor4",
 		"tensor4_checked_get",
+		"tensor4_checked_set",
 		"tensor5",
 		"tensor5_checked_get",
+		"tensor5_checked_set",
+		"tensor_peel",
 		"to_float16",
 		"to_float32",
 		"to_int8",
@@ -248,7 +304,10 @@ func test_with_builtins_populates_specialized_and_scalar_functions() -> Bool:
 		"to_uint32",
 		"to_uint64",
 		"to_uint128",
+		"try_recv",
+		"try_send",
 		"vector",
+		"zip",
 	]
 
 	required_names.all(func(name): compiler_env_is_builtin_func(env, name))
@@ -280,6 +339,203 @@ func test_channel_builtins_use_public_result_types() -> Bool:
 			False
 
 
+func test_builtin_numeric_families_satisfy_declared_traits() -> Bool:
+	env: CompilerEnv = compiler_env_with_builtins(compiler_env_empty())
+
+	compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Int32", []),
+			"Integer",
+		),
+	) == CompilerTraitObligationSatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Int16", []),
+			"SignedInteger",
+		),
+	) == CompilerTraitObligationSatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("UInt8", []),
+			"UnsignedInteger",
+		),
+	) == CompilerTraitObligationSatisfied and compiler_env_resolve_trait_obligation(
+		env,
+		compiler_trait_obligation(
+			CompilerNamedType("Float32", []),
+			"FloatingPoint",
+		),
+	) == CompilerTraitObligationSatisfied
+
+
+func test_floating_point_methods_are_registered() -> Bool:
+	env: CompilerEnv = compiler_env_with_builtins(compiler_env_empty())
+	method_names: List[String] = [
+		"floor",
+		"ceil",
+		"round",
+		"trunc",
+		"sqrt",
+		"sin",
+		"cos",
+		"tan",
+		"asin",
+		"acos",
+		"atan",
+		"atan2",
+		"sinh",
+		"cosh",
+		"tanh",
+		"asinh",
+		"acosh",
+		"atanh",
+		"exp",
+		"exp2",
+		"expm1",
+		"log",
+		"log2",
+		"log10",
+		"log1p",
+		"pow",
+		"cbrt",
+		"hypot",
+		"fmod",
+		"copysign",
+		"fma",
+		"is_nan",
+		"is_inf",
+		"is_finite",
+	]
+
+	registered = method_names.all(func(name):
+		compiler_env_get_function_trait(env, name) == Some("FloatingPoint")
+	)
+
+	registered and match compiler_env_get_trait(env, "FloatingPoint"):
+		Some(trait_def):
+			trait_def.methods.any(func(method):
+				floating_point_method_matches(
+					method,
+					"atan2",
+					[CompilerSelfType, CompilerSelfType],
+					CompilerSelfType,
+				)
+			) and trait_def.methods.any(func(method):
+				floating_point_method_matches(
+					method,
+					"fma",
+					[CompilerSelfType, CompilerSelfType, CompilerSelfType],
+					CompilerSelfType,
+				)
+			) and trait_def.methods.any(func(method):
+				floating_point_method_matches(
+					method,
+					"is_finite",
+					[CompilerSelfType],
+					compiler_type_bool(),
+				)
+			)
+		None:
+			False
+
+
+pure func floating_point_method_matches(
+	method: CompilerTraitMethodSig,
+	name: String,
+	params: List[CompilerType],
+	return_type: CompilerType,
+) -> Bool:
+	(
+		method.name == name
+		and method.is_pure
+		and floating_point_param_types_match(method.params, params)
+		and compiler_types_equal(method.return_type, return_type)
+	)
+
+
+pure func floating_point_param_types_match(
+	left: List[CompilerType],
+	right: List[CompilerType],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var equal: Bool = True
+
+		while index < left.length() and equal:
+			equal = compiler_types_equal(
+				left.get_or(index, CompilerSelfType),
+				right.get_or(index, CompilerSelfType),
+			)
+			index += 1
+
+		equal
+
+
+func test_assert_shape_builtin_uses_variadic_tensor_signature() -> Bool:
+	env: CompilerEnv = compiler_env_with_builtins(compiler_env_empty())
+	type_t: CompilerType = CompilerTypeVar("T")
+	tensor_t: CompilerType = CompilerArrayType(type_t, [CompilerVarDimsType("#Ds")])
+
+	match compiler_env_get_func_info(env, "assert_shape"):
+		Some((typ, params, purity)):
+			(
+				params.map(compiler_bound_type_param_name) == ["T"]
+				and purity == CompilerPure
+				and compiler_types_equal(
+					typ,
+					CompilerFunctionType(
+						True,
+						[tensor_t, compiler_type_int()],
+						CompilerNamedType(
+							"Option",
+							[tensor_t],
+						),
+					),
+				)
+			)
+		None:
+			False
+
+
+func test_hashable_primitives_and_dispatch_are_registered() -> Bool:
+	env: CompilerEnv = compiler_env_with_builtins(compiler_env_empty())
+	hashable_types: List[CompilerType] = [
+		compiler_type_int(),
+		CompilerNamedType("Int8", []),
+		CompilerNamedType("Int16", []),
+		CompilerNamedType("Int32", []),
+		CompilerNamedType("Int64", []),
+		CompilerNamedType("Int128", []),
+		CompilerNamedType("UInt8", []),
+		CompilerNamedType("UInt16", []),
+		CompilerNamedType("UInt32", []),
+		CompilerNamedType("UInt64", []),
+		CompilerNamedType("UInt128", []),
+		CompilerNamedType("Float", []),
+		CompilerNamedType("Float32", []),
+		CompilerNamedType("Float16", []),
+		CompilerNamedType("Bool", []),
+		CompilerNamedType("Char", []),
+		compiler_type_string(),
+	]
+
+	(
+		compiler_builtin_trait_is_prelude("Hashable")
+		and compiler_env_get_function_trait(env, "hash") == Some("Hashable")
+		and compiler_env_is_builtin_func(env, "hash")
+		and compiler_env_is_builtin_func(env, "hash_combine")
+		and hashable_types.all(func(typ):
+			compiler_env_resolve_trait_obligation(
+				env,
+				compiler_trait_obligation(typ, "Hashable"),
+			) == CompilerTraitObligationSatisfied
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler builtins substrate",
 	tests = [
@@ -287,14 +543,32 @@ tests: TestSuite = {
 			"builtin metadata classifies effects and specials",
 			test_builtin_metadata_classifies_effects_and_specials,
 		),
+		(
+			"builtin effect lookup does not materialize registry",
+			test_builtin_effect_lookup_does_not_materialize_registry,
+		),
+		(
+			"builtin resource result policy is explicit",
+			test_builtin_resource_result_policy_is_explicit,
+		),
 		("with builtins populates core env", test_with_builtins_populates_core_env),
 		(
 			"with builtins populates specialized and scalar functions",
 			test_with_builtins_populates_specialized_and_scalar_functions,
 		),
+		("channel builtins use public result types", test_channel_builtins_use_public_result_types),
 		(
-			"channel builtins use public result types",
-			test_channel_builtins_use_public_result_types,
+			"builtin numeric families satisfy declared traits",
+			test_builtin_numeric_families_satisfy_declared_traits,
+		),
+		("FloatingPoint methods are registered", test_floating_point_methods_are_registered),
+		(
+			"assert_shape uses variadic tensor signature",
+			test_assert_shape_builtin_uses_variadic_tensor_signature,
+		),
+		(
+			"Hashable primitives and dispatch are registered",
+			test_hashable_primitives_and_dispatch_are_registered,
 		),
 	]
 }

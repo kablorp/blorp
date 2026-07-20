@@ -2,22 +2,6 @@
 
 let type_to_string = Types.type_to_string
 
-type source_spelling = SourceType of Ast.type_expr | NoSourceType
-
-let source_spelling_of_optional_type = function
-  | Some ty -> SourceType ty
-  | None -> NoSourceType
-
-let source_spelling_to_string = function
-  | SourceType ty -> type_to_string ty
-  | NoSourceType -> "<none>"
-
-let type_origin_to_string = function
-  | Ast.ExplicitAnnotation ty ->
-      Printf.sprintf "explicit annotation (%s)" (type_to_string ty)
-  | Ast.Inferred -> "inferred"
-  | Ast.Synthesized label -> Printf.sprintf "synthesized (%s)" label
-
 let collection_kind_to_string = function
   | Type_widening_metadata.ListLiteral -> "list literal element"
   | Type_widening_metadata.VectorLiteral -> "vector literal element"
@@ -76,18 +60,6 @@ let value_slot_detail ~value_ty ~semantic_ty =
 
 let optional_details details =
   List.filter_map (function Some detail -> Some detail | None -> None) details
-
-let format_debug_type_info (info : Ast.expr_type_info) =
-  let source =
-    "source type: "
-    ^ source_spelling_to_string
-        (source_spelling_of_optional_type info.source_ty)
-  in
-  let semantic = "semantic type: " ^ type_to_string info.semantic_ty in
-  let value = "value-slot type: " ^ type_to_string info.value_ty in
-  let origin = "origin: " ^ type_origin_to_string info.origin in
-  let widening = "widening: " ^ widening_to_string info.widening in
-  String.concat "; " [ source; semantic; value; origin; widening ]
 
 type hover_type_view = { primary_type : string; details : string list }
 

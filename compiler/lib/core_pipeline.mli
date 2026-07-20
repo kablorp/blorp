@@ -18,10 +18,6 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 (** Callback fired for Blorp-owned stages whose authoritative observation is
     bridge JSON rather than an OCaml [Core.core_program]. *)
 
-val stage_observed_via_blorp_tail_json : Core_stage.t -> bool
-(** Whether observing this stage requires the Blorp-owned tail JSON path rather
-    than an OCaml program callback. *)
-
 val make_stage_hook :
   check_invariants:bool -> user:on_stage_callback -> on_stage_callback
 (** Compose a user callback with invariant checking. Exposed for focused tests
@@ -95,18 +91,3 @@ val compile_typed_with_modules :
   string * string list * string list
 (** Compile a typed main program plus loaded typed modules. Returns generated
     output, link flags, and include directories. *)
-
-val compile_typed_with_module_inputs :
-  ?main_import_bindings:Session.import_binding list ->
-  modules:typed_module_input list ->
-  ?embed_runtime:bool ->
-  ?profile:bool ->
-  ?debug:bool ->
-  ?on_stage:on_stage_callback ->
-  ?on_stage_event:on_stage_event ->
-  ?on_stage_json:on_stage_json_callback ->
-  ?tail_observation_stages:Core_stage.t list ->
-  ?check_invariants:bool ->
-  Typed_ast.program ->
-  string * string list * string list
-(** Compile explicit typed module inputs through the full backend. *)

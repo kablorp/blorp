@@ -67,20 +67,6 @@ let program_has_typed_expr (program : Ast.program) : bool =
   in
   List.exists decl_has_typed_expr program
 
-let typed_program_global_int_literal typed_program name =
-  List.find_map
-    (fun typed_decl ->
-      match Typed_ast.decl_view typed_decl with
-      | Typed_ast.DeclVar var ->
-          let ast_var = Typed_ast.var_ast var in
-          if ast_var.Ast.var_name = Some name then
-            match ast_var.var_value.expr_desc with
-            | Ast.ELiteral (Ast.LitInt value) -> Some value
-            | _ -> None
-          else None
-      | _ -> None)
-    (Typed_ast.program_decls typed_program)
-
 let typecheck_typed ~filename ~source ?debug () =
   let sess = Session.create () in
   Pipeline.typecheck_only_typed_reusing_session ~sess ~filename ~source ?debug ()
@@ -88,10 +74,6 @@ let typecheck_typed ~filename ~source ?debug () =
 let typecheck_ast ~filename ~source ?debug () =
   typecheck_typed ~filename ~source ?debug ()
   |> Result.map Typed_ast.program_ast
-
-let typecheck_with_blorp_bridge ~filename ~preloaded_module_graph =
-  Pipeline.typecheck_only_typed_with_blorp_bridge_policy ~debug:false
-    ~allow_debug_only_calls:false ~filename ~preloaded_module_graph
 
 let test_reusable_typecheck_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -142,278 +124,16 @@ let empty_preloaded_graph_context : Modules.preloaded_module_graph_context =
     preload_graph_package_roots = [];
   }
 
-let preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-    ~dep_path ~dep_source ~dep_parsed : Modules.preloaded_module_graph =
-  {
-    preload_graph_context = empty_preloaded_graph_context;
-    preload_graph_sources =
-      [
-        preloaded_source_for_test ~path:main_path ~module_name:"main"
-          ~source:main_source main_parsed;
-        preloaded_source_for_test ~path:dep_path ~module_name:"./dep"
-          ~source:dep_source dep_parsed;
-      ];
-    preload_graph_imports =
-      [
-        {
-          preload_import_from_path = main_path;
-          preload_import_from_module = "main";
-          preload_import_path = "./dep";
-          preload_import_resolved_path = Some dep_path;
-          preload_import_resolved_module = Some "./dep";
-          preload_import_resolved_origin = Some Session.User_module;
-        };
-      ];
-  }
-
-let preloaded_graph_for_single_source_named ~module_name ~path ~source ~parsed :
+let preloaded_graph_for_single_source ~path ~source ~parsed :
     Modules.preloaded_module_graph =
   {
     preload_graph_context = empty_preloaded_graph_context;
     preload_graph_sources =
       [
-        preloaded_source_for_test ~path ~module_name ~source parsed;
+        preloaded_source_for_test ~path ~module_name:"main" ~source parsed;
       ];
     preload_graph_imports = [];
   }
-
-let preloaded_graph_for_single_source ~path ~source ~parsed :
-    Modules.preloaded_module_graph =
-  preloaded_graph_for_single_source_named ~module_name:"main" ~path ~source
-    ~parsed
-
-let test_blorp_bridge_typecheck_uses_preloaded_graph_imports () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_graph" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
-          let main_source =
-            "import:\n\
-            \    ./dep as Dep\n\n\
-             func identity() -> Int:\n\
-            \    Dep.answer()\n"
-          in
-          let dep_source = "pure func answer() -> Int:\n    1\n" in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          Sys.remove dep_path;
-          let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
-          in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok typed_program ->
-              Alcotest.(check bool)
-                "returned program contains typed expressions" true
-                (program_has_typed_expr (Typed_ast.program_ast typed_program))
-          | Error errors ->
-              Alcotest.fail
-                ("expected Blorp bridge typecheck to use graph imports:\n"
-               ^ format_errors errors)))
-
-let test_blorp_bridge_typecheck_uses_fresh_session_per_call () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_fresh_session" (fun dir ->
-          let first_path = Filename.concat dir "first.brp" in
-          let second_path = Filename.concat dir "second.brp" in
-          let source =
-            "func main(args: List[String]) -> Int:\n\
-            \    print(\"ok\")\n\
-            \    0\n"
-          in
-          write_file first_path source;
-          write_file second_path source;
-          let first_parsed =
-            parse_typecheck_source_for_test ~path:first_path
-              ~module_name:"first"
-          in
-          let second_parsed =
-            parse_typecheck_source_for_test ~path:second_path
-              ~module_name:"second"
-          in
-          let first_graph =
-            preloaded_graph_for_single_source_named ~module_name:"first"
-              ~path:first_path ~source ~parsed:first_parsed
-          in
-          let second_graph =
-            preloaded_graph_for_single_source_named ~module_name:"second"
-              ~path:second_path ~source ~parsed:second_parsed
-          in
-          let expect_ok label path graph =
-            match
-              typecheck_with_blorp_bridge ~filename:path
-                ~preloaded_module_graph:graph
-            with
-            | Ok _ -> ()
-            | Error errors ->
-                Alcotest.fail
-                  (Printf.sprintf
-                     "expected %s bridge typecheck to be isolated:\n%s" label
-                     (format_errors errors))
-          in
-          expect_ok "first" first_path first_graph;
-          expect_ok "second" second_path second_graph))
-
-let test_blorp_bridge_typecheck_reports_type_errors () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_errors" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let main_source =
-            "func identity() -> Int:\n\
-            \    \"not an int\"\n"
-          in
-          write_file main_path main_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let preloaded_module_graph =
-            preloaded_graph_for_single_source ~path:main_path
-              ~source:main_source ~parsed:main_parsed
-          in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok _ -> Alcotest.fail "expected Blorp bridge type error"
-          | Error errors ->
-              let messages = format_errors errors in
-              if
-                not
-                  (contains messages "returns wrong type"
-                  && contains messages "expected: Int"
-                  && contains messages "found: String")
-              then
-                Alcotest.fail
-                  ("type error did not match expected shape:\n" ^ messages)))
-
-let test_blorp_bridge_typecheck_runs_ctfe () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_ctfe" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let main_source =
-            "private pure func add_two(value: Int) -> Int:\n\
-            \    value + 2\n\n\
-             VALUE: Int = add_two(40)\n"
-          in
-          write_file main_path main_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let preloaded_module_graph =
-            preloaded_graph_for_single_source ~path:main_path
-              ~source:main_source ~parsed:main_parsed
-          in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok typed_program -> (
-              match typed_program_global_int_literal typed_program "VALUE" with
-              | Some value ->
-                  Alcotest.(check int64) "ctfe value" 42L value
-              | None ->
-                  Alcotest.fail
-                    "expected Blorp bridge typecheck to return a CTFE \
-                     materialized VALUE")
-          | Error errors ->
-              Alcotest.fail
-                ("expected Blorp bridge typecheck to run CTFE:\n"
-               ^ format_errors errors)))
-
-let test_blorp_bridge_typecheck_runs_imported_constant_ctfe () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_import_ctfe" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
-          let main_source =
-            "import:\n\
-            \    ./dep: OFFSET\n\n\
-             VALUE: Int = OFFSET + 1\n"
-          in
-          let dep_source = "OFFSET: Int = 41\n" in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
-          in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok typed_program -> (
-              match typed_program_global_int_literal typed_program "VALUE" with
-              | Some value ->
-                  Alcotest.(check int64) "imported ctfe value" 42L value
-              | None ->
-                  Alcotest.fail
-                    "expected imported constant CTFE to materialize VALUE")
-          | Error errors ->
-              Alcotest.fail
-                ("expected imported constant CTFE to typecheck:\n"
-               ^ format_errors errors)))
-
-let test_blorp_bridge_typecheck_runs_imported_function_ctfe () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_typecheck_bridge_import_fn_ctfe" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
-          let main_source =
-            "import:\n\
-            \    ./dep as Dep\n\n\
-             VALUE: Int = Dep.answer() + 1\n"
-          in
-          let dep_source =
-            "private pure func add_one(value: Int) -> Int:\n\
-            \    value + 1\n\n\
-             pure func answer() -> Int:\n\
-            \    add_one(40)\n"
-          in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
-          in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok typed_program -> (
-              match typed_program_global_int_literal typed_program "VALUE" with
-              | Some value ->
-                  Alcotest.(check int64) "imported function ctfe value" 42L value
-              | None ->
-                  Alcotest.fail
-                    "expected Blorp CTFE to materialize imported function VALUE")
-          | Error errors ->
-              Alcotest.fail
-                ("expected imported function CTFE to typecheck:\n"
-               ^ format_errors errors)))
 
 let test_blorp_bridge_compile_reaches_core () =
   Test_helpers.with_isolated_env (fun () ->
@@ -520,98 +240,185 @@ let test_blorp_bridge_compile_types_std_support_modules () =
                 ("expected Blorp bridge compile preview to type std support:\n"
                ^ format_errors errors)))
 
-let test_surface_backed_exports_support_selective_imports () =
+let test_blorp_bridge_compile_uses_in_memory_source () =
   Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_surface_exports" (fun dir ->
+      with_temp_dir "blorp_pipeline_compile_bridge_in_memory_source" (fun dir ->
           let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
-          let main_source =
-            "import:\n\
-            \    ./dep: Box, dep_value, label\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    box: Box = {label = \"box\"}\n\
-            \    if dep_value() == 7 and label(box) == \"box\":\n\
-            \        0\n\
-            \    else:\n\
-            \        1\n"
+          let supplied_source =
+            "func main(args: List[String]) -> Int:\n\
+            \    0\n"
           in
-          let dep_source =
-            "trait Labeled:\n\
-            \    pure func label(value: Self) -> String\n\n\
-             record Box {label: String}\n\n\
-             implements Labeled for Box:\n\
-            \    pure func label(value: Box) -> String:\n\
-            \        value.label\n\n\
-             pure func dep_value() -> Int:\n\
-            \    7\n"
-          in
-          write_file main_path main_source;
-          write_file dep_path dep_source;
-          let main_parsed =
-            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
-          in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          Sys.remove dep_path;
-          let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
+          write_file main_path
+            "func main(args: List[String]) -> Int:\n    missing_name\n";
+          let observed_timings = ref [] in
+          let on_phase_timing timing =
+            observed_timings := timing :: !observed_timings
           in
           match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
+            Pipeline.compile_in_memory_source_with_blorp_bridge
+              ~embed_runtime:false ~on_phase_timing ~filename:main_path
+              ~source:supplied_source ()
           with
-          | Ok _ -> ()
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "generated C comes from supplied source" true
+                (contains c_code "blorp_main");
+              let timings = List.rev !observed_timings in
+              Alcotest.(check bool)
+                "reports each in-memory compile phase in order" true
+                (List.map
+                   (fun timing -> timing.Pipeline.timing_phase)
+                   timings
+                = [
+                    Pipeline.InMemoryFrontendGraph;
+                    Pipeline.FrontendGraphFinalize;
+                    Pipeline.GraphTypecheck;
+                    Pipeline.SemanticMiddle;
+                    Pipeline.BackendEmission;
+                    Pipeline.CorePipeline;
+                  ]);
+              Alcotest.(check bool)
+                "phase durations are nonnegative" true
+                (List.for_all
+                   (fun timing -> timing.Pipeline.duration_seconds >= 0.0)
+                   timings)
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail
+                "in-memory Blorp bridge compile unexpectedly stopped early"
           | Error errors ->
               Alcotest.fail
-                ("surface-backed selective imports failed:\n"
+                ("expected Blorp bridge compile to use supplied source:\n"
                ^ format_errors errors)))
 
-let test_surface_backed_private_names_report_private_import () =
+let find_core_function_def_id program name =
+  List.find_map
+    (fun (decl : Core.core_decl) ->
+      match decl.cd_desc with
+      | Core.CDFunc func when String.equal func.cf_name name ->
+          Some func.cf_def_id
+      | _ -> None)
+    program
+
+let has_prefix ~prefix value =
+  let prefix_length = String.length prefix in
+  String.length value >= prefix_length
+  && String.sub value 0 prefix_length = prefix
+
+let find_resolved_call_identity program source_function_name =
+  let mono_prefix = source_function_name ^ "__mono_" in
+  let call_identity_in_body body =
+    Core.fold_tree
+      (fun found node ->
+        match found with
+        | Some _ -> found
+        | None -> (
+            match node.Core.desc with
+            | Core.CCall (kind, _, _) -> (
+                match kind with
+                | Core.CKUser (name, Some def_id)
+                  when String.equal name source_function_name
+                       || has_prefix ~prefix:mono_prefix name ->
+                    Some (name, def_id)
+                | _ -> None)
+            | _ -> None))
+      None body
+  in
+  List.find_map
+    (fun (decl : Core.core_decl) ->
+      match decl.cd_desc with
+      | Core.CDFunc { cf_body = Some body; _ } -> call_identity_in_body body
+      | _ -> None)
+    program
+
+let test_blorp_bridge_std_call_and_declaration_share_identity () =
   Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_surface_private" (fun dir ->
+      with_temp_dir "blorp_pipeline_compile_bridge_std_identity" (fun dir ->
           let main_path = Filename.concat dir "main.brp" in
-          let dep_path = Filename.concat dir "dep.brp" in
           let main_source =
             "import:\n\
-            \    ./dep: hidden\n\n\
+            \    channel: SendAttempt(SendAccepted), try_send_attempt\n\n\
              func main(args: List[String]) -> Int:\n\
-            \    hidden()\n"
-          in
-          let dep_source =
-            "private func hidden() -> Int:\n\
-            \    1\n\n\
-             func visible() -> Int:\n\
-            \    2\n"
+            \    ch: Channel[Int] = channel(1)\n\
+            \    attempt: SendAttempt = try_send_attempt(ch, 7)\n\
+            \    match attempt:\n\
+            \        SendAccepted:\n\
+            \            0\n\
+            \        _:\n\
+            \            1\n"
           in
           write_file main_path main_source;
-          write_file dep_path dep_source;
           let main_parsed =
             parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
           in
-          let dep_parsed =
-            parse_typecheck_source_for_test ~path:dep_path
-              ~module_name:"./dep"
-          in
-          Sys.remove dep_path;
           let preloaded_module_graph =
-            preloaded_graph_for_dep_import ~main_path ~main_source ~main_parsed
-              ~dep_path ~dep_source ~dep_parsed
+            preloaded_graph_for_single_source ~path:main_path
+              ~source:main_source ~parsed:main_parsed
+            |> fun graph ->
+            {
+              graph with
+              preload_graph_imports =
+                [
+                  {
+                    preload_import_from_path = main_path;
+                    preload_import_from_module = "main";
+                    preload_import_path = "channel";
+                    preload_import_resolved_path = None;
+                    preload_import_resolved_module = None;
+                    preload_import_resolved_origin = None;
+                  };
+                ];
+            }
           in
-          match
-            typecheck_with_blorp_bridge ~filename:main_path
-              ~preloaded_module_graph
-          with
-          | Ok _ -> Alcotest.fail "expected private import diagnostic"
+          let resolved = ref None in
+          let on_stage stage program =
+            if stage = Core_stage.Resolve then begin
+              resolved := Some program;
+              raise (Core_pipeline.Stopped_after stage)
+            end
+          in
+          (match
+             Pipeline.compile_preloaded_graph_with_blorp_bridge
+               ~embed_runtime:false ~on_stage ~filename:main_path
+               ~preloaded_module_graph ()
+           with
+          | Ok (Pipeline.Stopped_at Core_stage.Resolve) -> ()
+          | Ok (Pipeline.Stopped_at stage) ->
+              Alcotest.failf "unexpected stop after %s"
+                (Core_stage.to_string stage)
+          | Ok (Pipeline.Compiled _) ->
+              Alcotest.fail "expected compile to stop after resolve"
           | Error errors ->
-              let messages = format_errors errors in
-              Alcotest.(check bool)
-                "private import diagnostic" true
-                (contains messages
-                   "'hidden' is private in module './dep' and cannot be \
-                    imported")))
+              Alcotest.fail
+                ("expected Blorp graph to resolve channel call:\n"
+               ^ format_errors errors));
+          let resolved =
+            match !resolved with
+            | Some program -> program
+            | None -> Alcotest.fail "resolve-stage callback did not run"
+          in
+          let source_function_name = "std_channel__try_send_attempt" in
+          let source_id =
+            match find_core_function_def_id resolved source_function_name with
+            | Some id -> id
+            | None -> Alcotest.fail "source channel declaration was not lowered"
+          in
+          let resolved_name, call_id =
+            match
+              find_resolved_call_identity resolved source_function_name
+            with
+            | Some identity -> identity
+            | None -> Alcotest.fail "channel call was not resolved"
+          in
+          let declaration_id =
+            match find_core_function_def_id resolved resolved_name with
+            | Some id -> id
+            | None -> Alcotest.fail "resolved channel declaration was not retained"
+          in
+          Alcotest.(check int)
+            "resolved call and declaration identity" declaration_id call_id;
+          Alcotest.(check bool)
+            "generated identity is above source identities" true
+            (call_id > source_id)))
 
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -1577,33 +1384,13 @@ let suite =
           test_direct_std_source_check_does_not_conflict_with_embedded_std;
         Alcotest.test_case "reusable typecheck returns typed program" `Quick
           test_reusable_typecheck_returns_typed_program;
-        Alcotest.test_case
-          "Blorp bridge typecheck uses preloaded graph imports" `Quick
-          test_blorp_bridge_typecheck_uses_preloaded_graph_imports;
-        Alcotest.test_case
-          "Blorp bridge typecheck uses fresh session per call" `Quick
-          test_blorp_bridge_typecheck_uses_fresh_session_per_call;
-        Alcotest.test_case "Blorp bridge typecheck reports type errors"
-          `Quick test_blorp_bridge_typecheck_reports_type_errors;
-        Alcotest.test_case "Blorp bridge typecheck runs CTFE" `Quick
-          test_blorp_bridge_typecheck_runs_ctfe;
-        Alcotest.test_case
-          "Blorp bridge typecheck runs imported constant CTFE" `Quick
-          test_blorp_bridge_typecheck_runs_imported_constant_ctfe;
-        Alcotest.test_case
-          "Blorp bridge typecheck runs imported function CTFE" `Quick
-          test_blorp_bridge_typecheck_runs_imported_function_ctfe;
         Alcotest.test_case "Blorp bridge compile reaches Core" `Quick
           test_blorp_bridge_compile_reaches_core;
         Alcotest.test_case
           "Blorp bridge compile uses preloaded target source" `Quick
           test_blorp_bridge_compile_uses_preloaded_target_source;
-        Alcotest.test_case
-          "surface backed exports support selective imports" `Quick
-          test_surface_backed_exports_support_selective_imports;
-        Alcotest.test_case
-          "surface backed private names report private import" `Quick
-          test_surface_backed_private_names_report_private_import;
+        Alcotest.test_case "Blorp bridge compile uses in-memory source" `Quick
+          test_blorp_bridge_compile_uses_in_memory_source;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"
@@ -1639,6 +1426,9 @@ let suite =
         Alcotest.test_case
           "Blorp bridge compile types std support modules" `Quick
           test_blorp_bridge_compile_types_std_support_modules;
+        Alcotest.test_case
+          "Blorp bridge std call and declaration share identity" `Quick
+          test_blorp_bridge_std_call_and_declaration_share_identity;
         Alcotest.test_case
           "cross-module coherence distinguishes same-named local types" `Quick
           test_cross_module_coherence_distinguishes_same_named_local_types;

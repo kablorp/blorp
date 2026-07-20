@@ -66,8 +66,6 @@ let suite_group prefix suite =
 let default_suites =
   suite_group "TypedAst" Test_typed_ast.suite
   @ suite_group "TypedAstJson" Test_typed_ast_json.suite
-  @ suite_group "TypedAstDebug" Test_typed_ast_debug.suite
-  @ suite_group "CompileProfile" Test_compile_profile.suite
   @ suite_group "Diagnostics" Test_diagnostics.suite
   @ suite_group "LanguageSurface" Test_language_surface.suite
   @ suite_group "TypeMetadataFormat" Test_type_metadata_format.suite

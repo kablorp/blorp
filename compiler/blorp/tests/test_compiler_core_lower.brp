@@ -8,9 +8,9 @@ import:
 		compiler_source_span,
 	../src/stage_03_parse/compiler_parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
-		ParsedExpr(ParsedIntLiteralExpr),
+		ParsedExpr(ParsedBlockExpr, ParsedBuiltinExpr, ParsedIntLiteralExpr),
 		ParsedFieldDecl,
-		ParsedForBinder(ParsedForNameBinder),
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedForeignFunctionDecl,
 		ParsedFunctionDecl,
 		ParsedIdentifier,
@@ -105,7 +105,11 @@ import:
 		),
 		CompilerTypedExprInfo,
 		CompilerTypedLambdaParam,
-		CompilerTypedLoopView(CompilerTypedIndicesLoopView),
+		CompilerTypedLoopView(
+			CompilerTypedEnumerate2LoopView,
+			CompilerTypedEnumerateLoopView,
+			CompilerTypedIndicesLoopView,
+		),
 		CompilerTypedMatchCase,
 		CompilerTypedPattern(
 			CompilerTypedIntPattern,
@@ -128,6 +132,7 @@ import:
 			CompilerTypedForeignFunctionDecl,
 			CompilerTypedGlobalVarDecl,
 			CompilerTypedImplDecl,
+			CompilerTypedPrivateDecl,
 			CompilerTypedRecordDecl,
 			CompilerTypedTraitDecl,
 			CompilerTypedTypeAliasDecl,
@@ -156,7 +161,7 @@ import:
 		lower_typed_expr,
 		lower_typed_program,
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(SelectedDirectCall, UnknownCall),
+		CoreCallKind(BuiltinCall, SelectedDirectCall, UnknownCall),
 		CoreDecl(
 			EnumDecl,
 			FunctionDecl,
@@ -205,7 +210,7 @@ import:
 			VoidExpr,
 		),
 		CoreForeignArgPassing(ForeignDefaultArgs),
-		CoreFunctionKind(ForeignFunction),
+		CoreFunctionKind(BuiltinFunction, ForeignFunction, UserFunction),
 		CoreLiteral(BoolLiteral, IntLiteral, WideIntLiteral),
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -271,6 +276,13 @@ pure func set_int_type() -> CompilerType:
 
 pure func vector_int_type() -> CompilerType:
 	CompilerArrayType(int_type(), [CompilerConstIntType(2)])
+
+
+pure func matrix_int_type() -> CompilerType:
+	CompilerArrayType(
+		int_type(),
+		[CompilerConstIntType(2), CompilerConstIntType(3)],
+	)
 
 
 pure func dict_int_int_type() -> CompilerType:
@@ -842,8 +854,8 @@ func test_lowers_resolved_constructor_direct_call_as_unknown() -> Bool:
 	direct_call_lowers_to_unknown_call("Some", 93, CompilerCallableConstructor("Option"))
 
 
-func test_lowers_resolved_impl_method_direct_call_as_unknown() -> Bool:
-	direct_call_lowers_to_unknown_call("show_int", 94, CompilerCallableImplMethod)
+func test_lowers_resolved_impl_method_direct_call() -> Bool:
+	direct_call_lowers_to_selected_direct_call("show_int", 94, CompilerCallableImplMethod)
 
 
 func test_lowers_resolved_foreign_direct_call_as_unknown() -> Bool:
@@ -2042,6 +2054,155 @@ func test_lowers_indices_loop_view_to_range() -> Bool:
 			False
 
 
+func test_lowers_enumerate_tuple_loop_view() -> Bool:
+	source = CompilerTypedNameExpr(ident("values"), expr_info(vector_int_type()))
+	iterable = CompilerTypedCallExpr(
+		CompilerTypedNameExpr(ident("enumerate"), expr_info(function_type())),
+		[source],
+		source_span(),
+		expr_info(CompilerTupleType([CompilerRangeType(CompilerConstIntType(2)), int_type()])),
+	)
+	body = CompilerTypedNameExpr(ident("value"), expr_info(int_type()))
+	expr = CompilerTypedForExpr(
+		ParsedForTupleBinder(
+			[ident("index"), ident("value")],
+			source_span(),
+		),
+		iterable,
+		Some(
+			CompilerTypedEnumerateLoopView(
+				CompilerTupleType([CompilerRangeType(CompilerConstIntType(2)), int_type()]),
+			),
+		),
+		body,
+		source_span(),
+		expr_info(compiler_type_void()),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(source_var, False, source_type, VarExpr(values_var, _, _), loop)):
+			match loop:
+				ForRangeExpr(binder, _, length_call, loop_body, typ, _):
+					length_source: Option[String] = match length_call:
+						CallExpr(UnknownCall, VarExpr(length_var, _, _), [VarExpr(value, _, _)], _, _):
+							if length_var.name == "length":
+								Some(value.name)
+							else:
+								None
+						_:
+							None
+
+					element_source: Option[String] = match loop_body:
+						LetExpr(value_var, False, value_type, element_call, VarExpr(body_var, _, _)):
+							match element_call:
+								CallExpr(UnknownCall, VarExpr(get_var, _, _), [VarExpr(value, _, _), VarExpr(index_var, _, _)], result_type, _):
+									if (
+										value_var.name == "value"
+										and body_var.name == "value"
+										and get_var.name == "checked_get"
+										and index_var.name == "index"
+										and core_types_equal(value_type, core_int_type())
+										and core_types_equal(result_type, core_int_type())
+									):
+										Some(value.name)
+									else:
+										None
+								_:
+									None
+						_:
+							None
+
+					(
+						values_var.name == "values"
+						and binder.variable.name == "index"
+						and core_types_equal(binder.typ, RangeType)
+						and core_types_equal(
+							source_type,
+							compiler_core_lower_type(vector_int_type()).get_or(VoidType),
+						)
+						and length_source == Some(source_var.name)
+						and element_source == Some(source_var.name)
+						and core_types_equal(typ, VoidType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_lowers_enumerate2_tuple_loop_view() -> Bool:
+	source = CompilerTypedNameExpr(ident("values"), expr_info(matrix_int_type()))
+	loop_element_type: CompilerType = CompilerTupleType([
+		CompilerRangeType(CompilerConstIntType(2)),
+		CompilerRangeType(CompilerConstIntType(3)),
+		int_type(),
+	])
+	iterable = CompilerTypedCallExpr(
+		CompilerTypedNameExpr(ident("enumerate2"), expr_info(function_type())),
+		[source],
+		source_span(),
+		expr_info(loop_element_type),
+	)
+	body = CompilerTypedNameExpr(ident("value"), expr_info(int_type()))
+	expr = CompilerTypedForExpr(
+		ParsedForTupleBinder(
+			[ident("row"), ident("column"), ident("value")],
+			source_span(),
+		),
+		iterable,
+		Some(CompilerTypedEnumerate2LoopView(loop_element_type)),
+		body,
+		source_span(),
+		expr_info(compiler_type_void()),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(source_var, False, source_type, VarExpr(values_var, _, _), outer_loop)):
+			match outer_loop:
+				ForRangeExpr(row_binder, _, rows_call, inner_loop, outer_type, _):
+					match (rows_call, inner_loop):
+						(CallExpr(UnknownCall, VarExpr(length_var, _, _), [VarExpr(rows_source, _, _)], _, _), ForRangeExpr(column_binder, _, column_count, loop_body, inner_type, _)):
+							match (column_count, loop_body):
+								(LiteralExpr(IntLiteral(3), _, _), LetExpr(value_var, False, value_type, value_call, VarExpr(body_var, _, _))):
+									match value_call:
+										CallExpr(UnknownCall, VarExpr(get_var, _, _), [VarExpr(value_source, _, _), VarExpr(row_var, _, _), VarExpr(column_var, _, _)], result_type, _):
+											(
+												values_var.name == "values"
+												and length_var.name == "length"
+												and rows_source.name == source_var.name
+												and value_source.name == source_var.name
+												and row_binder.variable.name == "row"
+												and row_var.name == "row"
+												and column_binder.variable.name == "column"
+												and column_var.name == "column"
+												and value_var.name == "value"
+												and body_var.name == "value"
+												and get_var.name == "matrix_checked_get"
+												and core_types_equal(row_binder.typ, RangeType)
+												and core_types_equal(column_binder.typ, RangeType)
+												and core_types_equal(value_type, core_int_type())
+												and core_types_equal(result_type, core_int_type())
+												and core_types_equal(
+													source_type,
+													compiler_core_lower_type(
+														matrix_int_type(),
+													).get_or(VoidType),
+												)
+												and core_types_equal(outer_type, VoidType)
+												and core_types_equal(inner_type, VoidType)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 func test_lowers_list_for_expression() -> Bool:
 	iterable = CompilerTypedNameExpr(ident("items"), expr_info(list_int_type()))
 	body = CompilerTypedBreakExpr(source_span(), expr_info(compiler_type_void()))
@@ -2172,6 +2333,51 @@ func test_lowers_dict_for_expression() -> Bool:
 				)
 				and core_type_to_json(typ).to_string() == core_type_to_json(VoidType).to_string()
 			)
+		_:
+			False
+
+
+func test_lowers_dict_tuple_for_expression() -> Bool:
+	iterable = CompilerTypedNameExpr(ident("items"), expr_info(dict_int_int_type()))
+	body = CompilerTypedBreakExpr(source_span(), expr_info(compiler_type_void()))
+	expr = CompilerTypedForExpr(
+		ParsedForTupleBinder(
+			[ident("key"), ident("value")],
+			source_span(),
+		),
+		iterable,
+		None,
+		body,
+		source_span(),
+		expr_info(compiler_type_void()),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(ForDictExpr(for_dict, _, _)):
+			match for_dict.body:
+				LetExpr(key_var, False, key_type, TupleFieldExpr(key_tuple, 0, _, _), value_let):
+					match value_let:
+						LetExpr(value_var, False, value_type, TupleFieldExpr(value_tuple, 1, _, _), BreakExpr(_, _)):
+							match (key_tuple, value_tuple):
+								(VarExpr(key_source, _, _), VarExpr(value_source, _, _)):
+									(
+										key_var.name == "key"
+										and value_var.name == "value"
+										and key_source.name == for_dict.binder.variable.name
+										and value_source.name == for_dict.binder.variable.name
+										and core_types_equal(key_type, core_int_type())
+										and core_types_equal(value_type, core_int_type())
+										and core_types_equal(
+											for_dict.binder.typ,
+											TupleType([core_int_type(), core_int_type()]),
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
 		_:
 			False
 
@@ -2844,6 +3050,109 @@ func test_lowers_function_decl_preserving_callable_id() -> Bool:
 			False
 
 
+func test_lowers_forward_function_decl() -> Bool:
+	info: CompilerTypedFunctionInfo = {
+		decl = { parsed_function_decl() | body = None },
+		callable_id = Some(43),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = None
+	}
+
+	match lower_typed_decl(
+		compiler_core_lower_context(100, None),
+		CompilerTypedFunctionDecl(info),
+	):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(func_info):
+					(
+						result.context.next_def_id == 100
+						and func_info.def_id == 43
+						and func_info.function_kind == UserFunction
+						and func_info.body.is_none()
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_deferred_std_builtin_function_decl() -> Bool:
+	builtin_body = ParsedBlockExpr(
+		[ParsedBuiltinExpr(Some("std/list.length"), source_span())],
+		source_span(),
+	)
+	info: CompilerTypedFunctionInfo = {
+		decl = { parsed_function_decl() | body = Some(builtin_body) },
+		callable_id = Some(44),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = None
+	}
+
+	match lower_typed_decl(
+		compiler_core_lower_context(100, None),
+		CompilerTypedFunctionDecl(info),
+	):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(func_info):
+					(
+						result.context.next_def_id == 100
+						and func_info.def_id == 44
+						and func_info.function_kind == BuiltinFunction
+						and func_info.body.is_none()
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_runtime_helper_builtin_function_decl() -> Bool:
+	builtin_body = ParsedBlockExpr(
+		[ParsedBuiltinExpr(Some("blorp_answer"), source_span())],
+		source_span(),
+	)
+	info: CompilerTypedFunctionInfo = {
+		decl = { parsed_function_decl() | body = Some(builtin_body) },
+		callable_id = Some(45),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = None
+	}
+
+	match lower_typed_decl(
+		compiler_core_lower_context(100, None),
+		CompilerTypedFunctionDecl(info),
+	):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(func_info):
+					match func_info.body:
+						Some(CallExpr(BuiltinCall(name), _, args, _, _)):
+							(
+								result.context.next_def_id == 100
+								and func_info.def_id == 45
+								and func_info.function_kind == UserFunction
+								and name == "blorp_answer"
+								and args.length() == 1
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_lowers_foreign_function_metadata() -> Bool:
 	info: CompilerTypedForeignFunctionInfo = {
 		decl = parsed_foreign_function_decl(),
@@ -2917,6 +3226,9 @@ func test_lowers_global_decl_minting_def_id() -> Bool:
 						result.context.next_def_id == 11
 						and global_info.def_id == 10
 						and global_info.name.name == "answer"
+						and global_info.name.def_id == Some(10)
+						and global_info.is_const
+						and not global_info.is_private
 						and core_exprs_equal(
 							global_info.init,
 							LiteralExpr(
@@ -2926,6 +3238,26 @@ func test_lowers_global_decl_minting_def_id() -> Bool:
 							),
 						)
 					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_private_global_visibility() -> Bool:
+	info: CompilerTypedGlobalVarInfo = {
+		decl = parsed_var_decl(),
+		binding_type = int_type(),
+		source_type = Some(int_type()),
+		value = int_expr("42")
+	}
+	context = compiler_core_lower_context(10, None)
+
+	match lower_typed_decl(context, CompilerTypedPrivateDecl(CompilerTypedGlobalVarDecl(info))):
+		Ok(result):
+			match result.decl:
+				GlobalDecl(global_info):
+					global_info.is_const and global_info.is_private
 				_:
 					False
 		Err(_):
@@ -3272,8 +3604,8 @@ tests: TestSuite = {
 			test_lowers_resolved_constructor_direct_call_as_unknown,
 		),
 		(
-			"lowers resolved impl method direct call as unknown",
-			test_lowers_resolved_impl_method_direct_call_as_unknown,
+			"lowers resolved impl method direct call",
+			test_lowers_resolved_impl_method_direct_call,
 		),
 		(
 			"lowers resolved foreign direct call as unknown",
@@ -3317,9 +3649,12 @@ tests: TestSuite = {
 		("lowers while expression", test_lowers_while_expression),
 		("lowers range for expression", test_lowers_range_for_expression),
 		("lowers indices loop view to range", test_lowers_indices_loop_view_to_range),
+		("lowers enumerate tuple loop view", test_lowers_enumerate_tuple_loop_view),
+		("lowers enumerate2 tuple loop view", test_lowers_enumerate2_tuple_loop_view),
 		("lowers list for expression", test_lowers_list_for_expression),
 		("lowers string for expression", test_lowers_string_for_expression),
 		("lowers dict for expression", test_lowers_dict_for_expression),
+		("lowers dict tuple for expression", test_lowers_dict_tuple_for_expression),
 		("lowers channel for expression", test_lowers_channel_for_expression),
 		("lowers set for expression", test_lowers_set_for_expression),
 		("lowers stream for expression", test_lowers_stream_for_expression),
@@ -3353,8 +3688,18 @@ tests: TestSuite = {
 			"lowers function decl preserving callable id",
 			test_lowers_function_decl_preserving_callable_id,
 		),
+		("lowers forward function decl", test_lowers_forward_function_decl),
+		(
+			"lowers deferred std builtin function decl",
+			test_lowers_deferred_std_builtin_function_decl,
+		),
+		(
+			"lowers runtime helper builtin function decl",
+			test_lowers_runtime_helper_builtin_function_decl,
+		),
 		("lowers foreign function metadata", test_lowers_foreign_function_metadata),
 		("lowers global decl minting def id", test_lowers_global_decl_minting_def_id),
+		("lowers private global visibility", test_lowers_private_global_visibility),
 		("lowers struct record decl", test_lowers_struct_record_decl),
 		(
 			"lowers heap record decl with field release policy",

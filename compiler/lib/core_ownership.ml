@@ -582,12 +582,24 @@ let builtin_contract_table =
         (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_rename" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       builtins
+        [ "blorp_file_writer_path"; "blorp_directory_path" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
         [ "blorp_file_size"; "blorp_file_modified"; "blorp_mkstemp_path" ]
         (bfixed [ Borrow ] ReturnOwned);
-      builtins [ "blorp_getcwd"; "blorp_temp_dir" ] (bfixed [] ReturnOwned);
+      builtins
+        [
+          "blorp_getcwd";
+          "blorp_temp_dir";
+          "blorp_compiler_runtime_source";
+          "blorp_compiler_runtime_decl";
+        ]
+        (bfixed [] ReturnOwned);
       builtins
         [ "blorp_process_run"; "blorp_process_run_inherit" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_process_run_command_raw" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_process_shell" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_exec" ] (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_exec_output" ] (bfixed [ Borrow ] ReturnOwned);

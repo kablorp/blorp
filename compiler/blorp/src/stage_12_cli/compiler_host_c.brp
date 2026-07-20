@@ -1,0 +1,356 @@
+-- Typed host-C compilation policy and effect boundary.
+--
+-- Argument construction is pure and preserves argv boundaries. The effect
+-- runner delegates streaming and process-group cleanup to process.run_command.
+import:
+	../stage_10_backend/compiler_build_artifact:
+		BuildArtifact,
+		BuildNativeFeature(BuildRaylib),
+		BuildOptimization(BuildFast, BuildRelease),
+		BuildPlatform(BuildLinux, BuildMacos),
+		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
+		BuildSanitizer(
+			BuildAddressUndefinedSanitizer,
+			BuildNoSanitizer,
+			BuildUndefinedSanitizer,
+		),
+		BuildSourceIdentity,
+		build_c_invocation,
+	compiler_runtime: CompilerRuntimeSources
+	process as Process
+	units: DataSize, Duration
+
+
+enum HostCCompilerFamily:
+	HostClang
+	HostGcc
+	HostOtherCompiler
+
+
+record HostCCompiler {
+	program: String,
+	prefix_arguments: List[String],
+	family: HostCCompilerFamily
+}
+
+
+enum HostTlsBackend:
+	HostTlsUnsupported
+	HostTlsOpenSsl
+
+
+record HostTlsConfiguration {
+	backend: HostTlsBackend,
+	runtime_arguments: List[String],
+	link_arguments: List[String]
+}
+
+
+record HostPrecompiledRuntime {
+	object_path: String,
+	declarations_path: String,
+	tls_backend: HostTlsBackend
+}
+
+
+union HostRuntimeInput:
+	HostEmbeddedRuntime(CompilerRuntimeSources)
+	HostPrecompiledRuntimeInput(HostPrecompiledRuntime)
+
+
+record HostCConfiguration {
+	platform: BuildPlatform,
+	compiler: HostCCompiler,
+	tls: HostTlsConfiguration,
+	raylib_prefix: Option[String],
+	timeout: Option[Duration],
+	capture_limit: DataSize
+}
+
+
+record HostCPreparedCompilation {
+	command: Process.ProcessCommand,
+	output_path: String,
+	source: BuildSourceIdentity
+}
+
+
+record HostCCompileSuccess {
+	output_path: String
+}
+
+
+union HostCPreparationError:
+	HostEmbeddedRuntimeUnavailable
+	HostRuntimeRequirementMismatch
+	HostRuntimeTlsMismatch
+
+
+union HostCCompileError:
+	HostCProcessFailed(Process.ProcessError)
+	HostCCompilerRejected(Int, String)
+	HostCCompilerSignaled(Int, String)
+	HostCCompilerTimedOut(String)
+
+
+pure func host_c_preparation_error_message(error: HostCPreparationError) -> String:
+	match error:
+		HostEmbeddedRuntimeUnavailable:
+			"embedded compiler runtime source is unavailable"
+		HostRuntimeRequirementMismatch:
+			"build artifact and host runtime inputs are incompatible"
+		HostRuntimeTlsMismatch:
+			"cached runtime TLS configuration does not match the host configuration"
+
+
+pure func host_c_compile_error_message(error: HostCCompileError) -> String:
+	match error:
+		HostCProcessFailed(process_error):
+			"cannot start the C compiler: ${process_error.to_string()}"
+		HostCCompilerRejected(code, diagnostics):
+			"C compiler exited with status ${code.to_string()}: ${diagnostics}"
+		HostCCompilerSignaled(signal, diagnostics):
+			"C compiler was terminated by signal ${signal.to_string()}: ${diagnostics}"
+		HostCCompilerTimedOut(diagnostics):
+			"C compiler timed out: ${diagnostics}"
+
+
+private record HostRuntimePolicy {
+	c_source: String,
+	runtime_feature_arguments: List[String],
+	link_input_arguments: List[String]
+}
+
+
+pure func host_c_compiler_family_name(family: HostCCompilerFamily) -> String:
+	match family:
+		HostClang:
+			"clang"
+		HostGcc:
+			"gcc"
+		HostOtherCompiler:
+			"other"
+
+
+pure func host_tls_backend_name(backend: HostTlsBackend) -> String:
+	match backend:
+		HostTlsUnsupported:
+			"unsupported"
+		HostTlsOpenSsl:
+			"openssl"
+
+
+private pure func tls_backends_match(a: HostTlsBackend, b: HostTlsBackend) -> Bool:
+	match a:
+		HostTlsUnsupported:
+			match b:
+				HostTlsUnsupported:
+					True
+				HostTlsOpenSsl:
+					False
+		HostTlsOpenSsl:
+			match b:
+				HostTlsUnsupported:
+					False
+				HostTlsOpenSsl:
+					True
+
+
+private pure func host_runtime_policy(
+	artifact: BuildArtifact,
+	configuration: HostCConfiguration,
+	runtime: HostRuntimeInput,
+) -> Result[HostRuntimePolicy, HostCPreparationError]:
+	runtime_requirement: BuildRuntimeRequirement = artifact.runtime_requirement
+	match runtime_requirement:
+		BuildEmbeddedRuntime:
+			match runtime:
+				HostEmbeddedRuntime(sources):
+					if sources.runtime.length() == 0:
+						Err(HostEmbeddedRuntimeUnavailable)
+					else:
+						Ok({
+							c_source = sources.runtime + artifact.c_code,
+							runtime_feature_arguments = configuration.tls.runtime_arguments,
+							link_input_arguments = []
+						})
+				HostPrecompiledRuntimeInput(_):
+					Err(HostRuntimeRequirementMismatch)
+		BuildExternalRuntime:
+			match runtime:
+				HostEmbeddedRuntime(_):
+					Err(HostRuntimeRequirementMismatch)
+				HostPrecompiledRuntimeInput(precompiled):
+					if not tls_backends_match(precompiled.tls_backend, configuration.tls.backend):
+						Err(HostRuntimeTlsMismatch)
+					else:
+						Ok({
+							c_source = artifact.c_code,
+							runtime_feature_arguments = [],
+							link_input_arguments = [
+								"-include",
+								precompiled.declarations_path,
+								precompiled.object_path,
+							]
+						})
+
+
+pure func host_c_optimization_argument(
+	optimization: BuildOptimization,
+	sanitizer: BuildSanitizer,
+) -> String:
+	match sanitizer:
+		BuildNoSanitizer:
+			match optimization:
+				BuildFast:
+					"-O0"
+				BuildRelease:
+					"-O2"
+		_:
+			"-O0"
+
+
+pure func host_c_sanitizer_arguments(sanitizer: BuildSanitizer) -> List[String]:
+	match sanitizer:
+		BuildNoSanitizer:
+			[]
+		BuildAddressUndefinedSanitizer:
+			["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
+		BuildUndefinedSanitizer:
+			["-fsanitize=undefined", "-fno-omit-frame-pointer", "-g"]
+
+
+pure func host_c_warning_arguments(sanitizer: BuildSanitizer) -> List[String]:
+	match sanitizer:
+		BuildNoSanitizer:
+			["-w"]
+		_:
+			[]
+
+
+private pure func platform_arguments(
+	platform: BuildPlatform,
+	compiler: HostCCompilerFamily,
+) -> List[String]:
+	match platform:
+		BuildMacos:
+			match compiler:
+				HostClang:
+					["-Wl,-stack_size,0x1000000"]
+				_:
+					[]
+		BuildLinux:
+			[]
+
+
+private pure func raylib_arguments(
+	platform: BuildPlatform,
+	prefix: Option[String],
+) -> List[String]:
+	match platform:
+		BuildMacos:
+			prefix_arguments: List[String] = match prefix:
+				Some(path):
+					["-L${path}/lib", "-I${path}/include"]
+				None:
+					[]
+
+			prefix_arguments.concat([
+				"-lraylib",
+				"-framework", "IOKit",
+				"-framework", "Cocoa",
+				"-framework", "OpenGL",
+				"-framework", "CoreVideo",
+			])
+		BuildLinux:
+			["-lraylib", "-lGL", "-lm", "-lpthread", "-ldl", "-lrt", "-lX11"]
+
+
+private pure func native_feature_arguments(
+	artifact: BuildArtifact,
+	configuration: HostCConfiguration,
+) -> List[String]:
+	if artifact.native_features.any(func(feature: BuildNativeFeature):
+		match feature:
+			BuildRaylib:
+				True
+			_:
+				False
+	):
+		raylib_arguments(configuration.platform, configuration.raylib_prefix)
+	else:
+		[]
+
+
+pure func prepare_host_c_compilation(
+	artifact: BuildArtifact,
+	output_path: String,
+	configuration: HostCConfiguration,
+	runtime: HostRuntimeInput,
+) -> Result[HostCPreparedCompilation, HostCPreparationError]:
+	runtime_policy ?= host_runtime_policy(artifact, configuration, runtime)
+	invocation = build_c_invocation(artifact, configuration.platform)
+	arguments: List[String] = ["-x", "c", "-", "-x", "none"]
+		.append(host_c_optimization_argument(
+			artifact.compatibility.optimization,
+			artifact.compatibility.sanitizer,
+		))
+		.concat(["-fwrapv", "-pipe"])
+		.concat(platform_arguments(configuration.platform, configuration.compiler.family))
+		.concat(host_c_warning_arguments(artifact.compatibility.sanitizer))
+		.concat(runtime_policy.runtime_feature_arguments)
+		.concat(invocation.include_arguments)
+		.concat(runtime_policy.link_input_arguments)
+		.concat(["-lm", "-lpthread"])
+		.concat(host_c_sanitizer_arguments(artifact.compatibility.sanitizer))
+		.concat(configuration.tls.link_arguments)
+		.concat(native_feature_arguments(artifact, configuration))
+		.concat(invocation.link_arguments)
+		.concat(["-o", output_path])
+	process_command = { Process.command(
+		configuration.compiler.program,
+		configuration.compiler.prefix_arguments.concat(arguments),
+	) |
+		stdin = Process.BytesStdin(runtime_policy.c_source.to_bytes()),
+		timeout = configuration.timeout,
+		capture_limit = Some(configuration.capture_limit)
+	}
+
+	Ok({
+		command = process_command,
+		output_path = output_path,
+		source = artifact.source
+	})
+
+
+private pure func compiler_diagnostics(stdout: String, stderr: String) -> String:
+	if stdout.length() == 0:
+		stderr
+	else if stderr.length() == 0:
+		stdout
+	else:
+		stdout + "\n" + stderr
+
+
+func run_host_c_compilation(
+	prepared: HostCPreparedCompilation,
+) -> Result[HostCCompileSuccess, HostCCompileError]:
+	match Process.run_command(prepared.command):
+		Err(error):
+			Err(HostCProcessFailed(error))
+		Ok(result):
+			diagnostics: String = compiler_diagnostics(
+				result.stdout.to_string(),
+				result.stderr.to_string(),
+			)
+
+			match result.exit:
+				Process.Exited(code):
+					if code == 0:
+						Ok({output_path = prepared.output_path})
+					else:
+						Err(HostCCompilerRejected(code, diagnostics))
+				Process.Signaled(signal):
+					Err(HostCCompilerSignaled(signal, diagnostics))
+				Process.TimedOut:
+					Err(HostCCompilerTimedOut(diagnostics))

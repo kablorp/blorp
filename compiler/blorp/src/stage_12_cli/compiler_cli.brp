@@ -1,4 +1,5 @@
 import:
+	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
 	compiler_bridge_protocol: BridgeEnvelope
 	compiler_cli_args:
 		CliAction(
@@ -40,15 +41,14 @@ import:
 		CliReplAction(CliReplHelp, CliReplRun),
 		parse_cli_args,
 	compiler_cli_artifact_json:
-		cli_check_options_json,
 		cli_command_error_json,
 		cli_purify_options_json,
 		cli_run_plan_to_json,
 		cli_test_options_json,
 		cli_test_warmup_options_json,
+	compiler_cli_run_environment: resolve_current_run_args_environment
 	compiler_cli_plan:
 		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
-		CliFrontendCommand(CliFrontendCheck),
 		CliHandledResult,
 		CliPackageRunCommand(
 			CliPackageRunCheck,
@@ -59,18 +59,22 @@ import:
 			CliPackageRunVendorAll,
 			CliPackageRunVendorTarget,
 		),
+		CliParsedSourceFile,
 		CliRunContext,
 		CliRunPlan(
+			CliRunCheck,
+			CliRunCompile,
 			CliRunDelegate,
-			CliRunFrontendModuleGraph,
 			CliRunHandled,
 			CliRunLsp,
 			CliRunPackage,
 			CliRunPurify,
 			CliRunRepl,
+			CliRunSource,
 			CliRunTest,
 		),
 		CliRunRequest,
+		CliSourceFile,
 	compiler_cli_source_graph:
 		expand_check_targets,
 		frontend_module_graph_for_roots,
@@ -80,7 +84,6 @@ import:
 		parse_cli_sources,
 		read_cli_sources_for_action,
 		single_explicit_check_source,
-	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
 	json: JsonValue, as_array, as_string, get_field
 
 
@@ -362,20 +365,48 @@ private pure func args_after_command(
 private func parsed_source_plan_for_action(
 	user_args: List[String],
 	action: CliAction,
+	supplied_source: Option[CliSourceFile],
 ) -> Option[CliRunPlan]:
 	match frontend_source_for_action(action):
-		Some((command, path, options)):
-			match parse_cli_source_file_for_action(action, path):
+		Some(path):
+			parsed_source: Result[CliParsedSourceFile, String] = match supplied_source:
+				Some(source):
+					if source.path == path:
+						parse_cli_source(source)
+					else:
+						Err(
+							"payload source path `${source.path}` does not match CLI source `${path}`",
+						)
+				None:
+					parse_cli_source_file_for_action(action, path)
+
+			match parsed_source:
 				Ok(source):
-					match frontend_module_graph_for_roots(
-						action,
-						command,
-						user_args,
-						options,
-						[source],
-					):
+					match frontend_module_graph_for_roots(action, [source]):
 						Ok(graph):
-							Some(CliRunFrontendModuleGraph(graph))
+							match action:
+								CliCompile(options):
+									Some(CliRunCompile({
+										args = user_args,
+										options = options,
+										graph = graph,
+									}))
+								CliRun(options):
+									match resolve_current_run_args_environment(options):
+										Ok(resolved_options):
+											Some(CliRunSource({
+												args = user_args,
+												options = resolved_options,
+												graph = graph,
+											}))
+										Err(message):
+											Some(handled_error(message))
+								_:
+									Some(
+										handled_error(
+											"internal error: frontend source action is not compile or run",
+										),
+									)
 						Err(message):
 							Some(handled_error(message))
 				Err(message):
@@ -393,15 +424,13 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 						Some(source):
 							match parse_cli_source(source):
 								Ok(parsed):
-									match frontend_module_graph_for_roots(
-										CliCheck(args),
-										CliFrontendCheck,
-										user_args,
-										cli_check_options_json(args),
-										[parsed],
-									):
+									match frontend_module_graph_for_roots(CliCheck(args), [parsed]):
 										Ok(graph):
-											CliRunFrontendModuleGraph(graph)
+											CliRunCheck({
+												args = user_args,
+												options = args,
+												graph = graph,
+											})
 										Err(message):
 											handled_error(message)
 								Err(message):
@@ -414,13 +443,14 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 									Ok(parsed_sources):
 										match frontend_module_graph_for_roots(
 											CliCheck(args),
-											CliFrontendCheck,
-											user_args,
-											cli_check_options_json(args),
 											parsed_sources,
 										):
 											Ok(graph):
-												CliRunFrontendModuleGraph(graph)
+												CliRunCheck({
+													args = user_args,
+													options = args,
+													graph = graph,
+												})
 											Err(message):
 												handled_error(message)
 									Err(message):
@@ -431,7 +461,11 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 			handled_error(message)
 
 
-private func run_cli_with_context(user_args: List[String], context: CliRunContext) -> CliRunPlan:
+private func run_cli_with_context(
+	user_args: List[String],
+	context: CliRunContext,
+	supplied_source: Option[CliSourceFile],
+) -> CliRunPlan:
 	action: CliAction = parse_cli_args(user_args)
 
 	match action:
@@ -547,7 +581,7 @@ private func run_cli_with_context(user_args: List[String], context: CliRunContex
 						CliCheck(args):
 							check_plan_for_args(user_args, args)
 						_:
-							match parsed_source_plan_for_action(user_args, action):
+							match parsed_source_plan_for_action(user_args, action, supplied_source):
 								Some(plan):
 									plan
 								None:
@@ -558,11 +592,11 @@ private func run_cli_with_context(user_args: List[String], context: CliRunContex
 
 
 func run_cli(user_args: List[String]) -> CliRunPlan:
-	run_cli_with_context(user_args, {version = None})
+	run_cli_with_context(user_args, {version = None}, None)
 
 
 func run_cli_with_version(user_args: List[String], version: String) -> CliRunPlan:
-	run_cli_with_context(user_args, {version = Some(version)})
+	run_cli_with_context(user_args, {version = Some(version)}, None)
 
 
 private pure func decode_args_at(
@@ -615,23 +649,52 @@ private pure func payload_optional_string(
 			Ok(None)
 
 
+private pure func payload_required_string(
+	payload: JsonValue,
+	name: String,
+) -> Result[String, String]:
+	match get_field(payload, name):
+		Some(value):
+			match as_string(value):
+				Some(text):
+					Ok(text)
+				None:
+					Err("payload source field `${name}` must be a string")
+		None:
+			Err("missing payload source field `${name}`")
+
+
+private pure func payload_optional_source(payload: JsonValue) -> Result[Option[CliSourceFile], String]:
+	match get_field(payload, "source"):
+		Some(source):
+			path ?= payload_required_string(source, "path")
+			module_name ?= payload_required_string(source, "module")
+			source_text ?= payload_required_string(source, "text")
+			Ok(Some({
+				path = path,
+				module_name = module_name,
+				source_text = source_text,
+			}))
+		None:
+			Ok(None)
+
+
 private pure func payload_run_request(payload: JsonValue) -> Result[CliRunRequest, String]:
 	args ?= payload_args(payload)
 	version ?= payload_optional_string(payload, "version")
+	source ?= payload_optional_source(payload)
 
 	Ok({
 		args = args,
 		version = version,
+		source = source,
 	})
 
 
 func handle_cli_run_envelope(envelope: BridgeEnvelope) -> JsonValue:
 	match payload_run_request(envelope.payload):
 		Ok(request):
-			match request.version:
-				Some(version):
-					cli_run_plan_to_json(run_cli_with_version(request.args, version))
-				None:
-					cli_run_plan_to_json(run_cli(request.args))
+			context: CliRunContext = {version = request.version}
+			cli_run_plan_to_json(run_cli_with_context(request.args, context, request.source))
 		Err(message):
 			cli_command_error_json(message, CLI_WRAPPER_ERROR_EXIT)

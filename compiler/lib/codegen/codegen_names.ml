@@ -18,6 +18,7 @@ let mod_matrix = "std/matrix"
 let mod_bytes = "std/bytes"
 let mod_stream = "std/stream"
 let mod_regex = "std/regex"
+let mod_channel = "std/channel"
 let mod_dns = "std/net/dns"
 let mod_tcp = "std/net/tcp"
 let mod_tls = "std/net/tls"
@@ -61,6 +62,15 @@ let mangle_by_def_id (id : int) (name : string) : string =
   Printf.sprintf "__def_%d_%s" id (sanitize_c_ident name)
 
 let ufcs_prefix = "__ufcs_"
+
+let encode_ufcs_module_part module_path =
+  String.map (fun c -> if c = '/' then '$' else c) module_path
+
+(** Encode an explicit module-function target for the UFCS resolver. Keep this
+    paired with [parse_ufcs_name]; bridge and Core code must not reproduce the
+    delimiter or module-path encoding independently. *)
+let make_ufcs_name module_path source_name =
+  ufcs_prefix ^ encode_ufcs_module_part module_path ^ "__" ^ source_name
 
 let has_prefix prefix name =
   let prefix_len = String.length prefix in

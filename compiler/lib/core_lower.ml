@@ -322,12 +322,18 @@ let typed_ident_expr ~(loc : Ast.loc) (name : string) (ty : type_expr) : TA.expr
 
 let direct_call_core_def_id (call : resolved_call) : int option =
   match call.call_target with
-  | CallDirect { callable_id; origin = CallableLocal; _ } -> Some callable_id
+  | CallDirect
+      {
+        callable_id;
+        origin = (CallableLocal | CallableImplMethod);
+        _;
+      } ->
+      Some callable_id
   | CallDirect
       {
         origin =
           ( CallableImported _ | CallableBuiltin | CallableForeign
-          | CallableConstructor _ | CallableImplMethod );
+          | CallableConstructor _ );
         _;
       } ->
       None
@@ -353,7 +359,7 @@ let selected_direct_call_kind ~(call : TA.expr) (callee_core : Core.core) :
                  carried %d but resolved_call carried %d"
                 v.vname existing callable_id
           | Some _ | None -> CKSelectedDirect callable_id))
-  | ( Some ({ call_syntax = CallQualified _; _ } as resolved),
+  | ( Some resolved,
       CField ({ desc = CVar v; ty; _ }, field) )
     when Types.types_equal ty (TyNamed ("Module", [])) -> (
       match direct_call_core_def_id resolved with
@@ -1077,15 +1083,38 @@ and lower_ast_binding_init (ty_ann : Ast.type_expr option) (init : Ast.expr) :
     - The last element is the block's result (type [ty]).
 *)
 
-(** Extract a source function name from a call's callee AST.
-    - [EIdent name] → [Some name]
-    - [EFieldAccess (_, name)] → [Some name]  (module-qualified or UFCS)
-    - Anything else (lambda, indirect call, etc.) → [None]. *)
-and callee_source_name (e : TA.expr) : string option =
-  match typed_expr_desc e with
-  | TA.EIdent n -> Some n
-  | TA.EFieldAccess (_, n) -> Some n
-  | _ -> None
+(** Return the source operation only when inference resolved it to an
+    element-wise math callable owned by the compiler or standard library.
+    Callable identity is authoritative: a local scalar function named [sqrt]
+    must remain a normal user call. *)
+and elementwise_call_name (e : TA.expr) : string option =
+  match TA.expr_resolved_call e with
+  | Some
+      {
+        call_target =
+          Ast.CallDirect
+            { source_name; origin = (CallableBuiltin | CallableImported "std/float"); _ };
+        _;
+      }
+    when List.mem source_name Codegen_builtins.elementwise_tensor_functions ->
+      Some source_name
+  | Some
+      {
+        call_target =
+          Ast.CallTraitMethod
+            { trait_name = "FloatingPoint"; method_name; _ };
+        _;
+      }
+    when List.mem method_name [ "sqrt"; "exp"; "log" ] ->
+      Some method_name
+  | Some
+      {
+        call_target =
+          Ast.CallTraitMethod { trait_name = "Absolute"; method_name = "abs"; _ };
+        _;
+      } ->
+      Some "abs"
+  | Some _ | None -> None
 
 (** Phase 4.2 entry point: if [callee(arg)] is an element-wise lift over
     an array arg, emit the specialized per-type runtime call
@@ -1095,7 +1124,7 @@ and try_elementwise_lift (result_ty : Ast.type_expr) (callee : TA.expr)
     (args : TA.expr list) : Core.core option =
   match args with
   | [ arg ] -> (
-      let name_opt = callee_source_name callee in
+      let name_opt = elementwise_call_name callee in
       let arg_ty = type_of_child_expr arg in
       let is_tensor_ty t = Types.is_array_type t in
       let is_tensor = is_tensor_ty arg_ty in
@@ -1152,18 +1181,20 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
   | [] -> mk CVoid
   | first :: rest -> (
       match typed_expr_desc first with
-      | TA.EVarDecl (name, ty_ann, init, is_mut) ->
+      | TA.EVarDecl (name, _ty_ann, init, is_mut) ->
           (* [EVarDecl] scopes over the rest of the block, even if [rest] is
              empty — in which case the body is [CVoid]. Previously this case
-             short-circuited for singleton blocks and infinite-looped. *)
-          let init' = lower_binding_init ty_ann init in
+             short-circuited for singleton blocks and infinite-looped.
+
+             The initializer's value slot is the authoritative binding type.
+             Its source annotation may retain aliases or module-qualified
+             spellings for diagnostics, while the value slot has already been
+             canonicalized and widened by inference. *)
           let bind_ty =
-            match ty_ann with
-            | Some t ->
-                require_final_type ~loc:(TA.loc first)
-                  ~context:"local binding annotation" t
-            | None -> init'.ty
+            require_final_type ~loc:(TA.loc first)
+              ~context:"local binding value slot" (TA.value_type init)
           in
+          let init' = lower_binding_init (Some bind_ty) init in
           let body = lower_block ~loc:(TA.loc first) ~ty rest in
           let bind =
             {

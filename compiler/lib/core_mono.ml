@@ -135,11 +135,9 @@ let rec collect_subst ~(reg : Codegen_types.registry)
         match (p_args, a_args) with
         | [], _ -> a
         | [ Ast.TyVarDims name ], rest ->
-            if List.mem (type_param_name name) type_param_names then
-              match mono_dim_pack_binding_opt name rest with
-              | Some binding -> binding :: a
-              | None -> a
-            else a
+            (match mono_dim_pack_binding_opt name rest with
+            | Some binding -> binding :: a
+            | None -> a)
         | p :: prest, ar :: arest ->
             walk_args (collect_subst ~reg type_params p ar a) prest arest
         | _ :: _, [] -> a
@@ -150,11 +148,9 @@ let rec collect_subst ~(reg : Codegen_types.registry)
         match (p_args, a_args) with
         | [], _ -> a
         | [ Ast.TyVarDims name ], rest ->
-            if List.mem (type_param_name name) type_param_names then
-              match mono_dim_pack_binding_opt name rest with
-              | Some binding -> binding :: a
-              | None -> a
-            else a
+            (match mono_dim_pack_binding_opt name rest with
+            | Some binding -> binding :: a
+            | None -> a)
         | p :: prest, ar :: arest ->
             walk_args (collect_subst ~reg type_params p ar a) prest arest
         | _ :: _, [] -> a
@@ -703,7 +699,6 @@ let concrete_subst_for_call (state : mono_state) ~(func_name : string)
     |> Codegen_types.normalize_type |> erase_function_purity
   in
   let is_declared_param name = List.mem (type_param_name name) type_param_names in
-  let is_anonymous_dim_wildcard name = type_param_name name = "#_" in
   let rec guard_has_declared_param ty =
     match normalize_for_signature_guard ty with
     | Ast.TyVar name | Ast.TyNamed (name, []) -> is_declared_param name
@@ -724,8 +719,7 @@ let concrete_subst_for_call (state : mono_state) ~(func_name : string)
   let rec compatible_args expected actual =
     match (expected, actual) with
     | [], [] -> true
-    | [ Ast.TyVarDims name ], _ when is_declared_param name -> true
-    | [ Ast.TyVarDims name ], _ when is_anonymous_dim_wildcard name -> true
+    | [ Ast.TyVarDims _ ], _ -> true
     | e :: expected, a :: actual ->
         compatible e a && compatible_args expected actual
     | _ -> false
@@ -743,8 +737,7 @@ let concrete_subst_for_call (state : mono_state) ~(func_name : string)
     | Ast.TyVar name, _ when is_declared_param name -> true
     | Ast.TyBoundVar param, _ when is_declared_param param.param_name -> true
     | Ast.TyNamed (name, []), _ when is_declared_param name -> true
-    | Ast.TyVarDims name, _ when is_declared_param name -> true
-    | Ast.TyVarDims name, _ when is_anonymous_dim_wildcard name -> true
+    | Ast.TyVarDims _, _ -> true
     | Ast.TyDimOp _, _ when guard_has_declared_param expected -> true
     | Ast.TyRange inner, _ when guard_has_declared_param inner -> true
     | Ast.TyNamed (expected_name, expected_args), Ast.TyNamed (actual_name, actual_args)
@@ -1355,13 +1348,21 @@ let lookup_generic_by_def_id (state : mono_state) (def_id : int option) :
           (Hashtbl.find_opt state.generic_bodies_by_id id)
 
 (** Callable IDs are local to a frontend typecheck artifact. Once module
-    artifacts are merged, unrelated declarations may carry the same ID. An
-    explicit UFCS callee already provides the authoritative module/name
-    identity, so never let a colliding ID override it. *)
+    artifacts are merged, unrelated declarations may carry the same ID. The
+    callee name remains authoritative: a selected generic must match either
+    its source name, canonical flattened name, or explicit UFCS identity. *)
 let selected_generic_hit_matches_callee (callee_name : string)
     (hit : generic_hit) : bool =
   match Codegen_names.parse_ufcs_name callee_name with
-  | None -> true
+  | None ->
+      String.equal hit.gh_source_name callee_name
+      || String.equal hit.gh_name callee_name
+      || (match hit.gh_module_path with
+         | Some module_path ->
+             String.equal
+               (module_qualified_name module_path hit.gh_source_name)
+               callee_name
+         | None -> false)
   | Some (module_path, source_name) ->
       let qualified_name = module_qualified_name module_path source_name in
       (hit.gh_module_path = Some module_path || hit.gh_name = qualified_name)

@@ -1,0 +1,252 @@
+import:
+	fs: IOError, resource_path, temporary_directory
+	process:
+		ProcessEnvironmentChange,
+		ProcessError(InvalidCommand, ProcessOutputLimitExceeded),
+		ProcessExit(Exited, Signaled, TimedOut),
+		ProcessGroup(NewProcessGroup),
+		ProcessStdin(BytesStdin),
+		ProcessStream(NullStream),
+		command,
+		run_command,
+	string: remove_suffix, repeat
+	system: file_exists, getenv, temp_dir
+	test: TestSuite
+	units: from_bytes, milliseconds
+
+
+func test_command_preserves_argument_boundaries() -> Bool:
+	request = command(
+		"sh",
+		["-c", "printf '%s|%s|%s' \"$1\" \"$2\" \"$3\"", "sh", "two words", "", "quote\"value"],
+	)
+
+	match run_command(request):
+		Ok(result):
+			(
+				result.exit == Exited(0)
+				and result.stdout.to_string() == "two words||quote\"value"
+				and result.stderr.length() == 0
+			)
+		Err(_):
+			False
+
+
+func test_command_streams_stdin_and_drains_both_outputs() -> Bool:
+	input_text: String = "i".repeat(100000)
+	request = { command(
+		"sh",
+		["-c", "cat; i=0; while [ $i -lt 100000 ]; do printf o; printf e >&2; i=$((i+1)); done"],
+	) | stdin = BytesStdin(input_text.to_bytes()) }
+
+	match run_command(request):
+		Ok(result):
+			(
+				result.exit == Exited(0)
+				and result.stdout.length() == 200000
+				and result.stderr.length() == 100000
+			)
+		Err(_):
+			False
+
+
+func test_command_applies_child_only_environment_and_cwd() -> Bool:
+	name: String = "BLORP_PROCESS_COMMAND_CHILD_ONLY"
+	before = getenv(name)
+	change: ProcessEnvironmentChange = {
+		name = name,
+		value = Some("child value")
+	}
+	request = { command(
+		"sh",
+		["-c", "printf '%s|%s' \"$BLORP_PROCESS_COMMAND_CHILD_ONLY\" \"$PWD\""],
+	) |
+		cwd = Some(temp_dir()),
+		environment = [change]
+	}
+
+	match run_command(request):
+		Ok(result):
+			(
+				getenv(name) == before
+				and result.exit == Exited(0)
+				and result.stdout
+					.to_string()
+					.starts_with("child value|")
+				and result.stdout
+					.to_string()
+					.ends_with(temp_dir().remove_suffix("/"))
+			)
+		Err(_):
+			False
+
+
+func test_command_reports_signal_exit() -> Bool:
+	match (
+		run_command(
+			command(
+				"sh",
+				["-c", "kill -TERM $$"],
+			),
+		)
+	):
+		Ok(result):
+			match result.exit:
+				Signaled(signal):
+					signal > 0
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_command_reports_timeout() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "trap '' TERM; while true; do sleep 1; done"],
+	) |
+		timeout = Some(milliseconds(100)),
+		process_group = NewProcessGroup
+	}
+
+	match run_command(request):
+		Ok(result):
+			result.exit == TimedOut
+		Err(_):
+			False
+
+
+func test_command_missing_program_is_structured_error() -> Bool:
+	match run_command(command("__blorp_missing_process_command__", [])):
+		Ok(_):
+			False
+		Err(error):
+			error
+				.to_string()
+				.contains("program not found")
+
+
+func test_command_rejects_duplicate_environment_changes() -> Bool:
+	first: ProcessEnvironmentChange = {
+		name = "BLORP_DUPLICATE_ENVIRONMENT",
+		value = Some("first")
+	}
+	second: ProcessEnvironmentChange = {
+		name = "BLORP_DUPLICATE_ENVIRONMENT",
+		value = None
+	}
+	request = { command(
+		"sh",
+		["-c", "exit 99"],
+	) | environment = [first, second] }
+
+	match run_command(request):
+		Ok(_):
+			False
+		Err(InvalidCommand(detail)):
+			detail.contains("duplicate environment change")
+		Err(_):
+			False
+
+
+func test_command_null_streams_are_not_captured() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "printf ignored; printf ignored >&2"],
+	) |
+		stdout = NullStream,
+		stderr = NullStream
+	}
+
+	match run_command(request):
+		Ok(result):
+			result.exit == Exited(0) and result.stdout.length() == 0 and result.stderr.length() == 0
+		Err(_):
+			False
+
+
+func test_command_enforces_its_capture_limit() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "printf 12345"],
+	) | capture_limit = Some(from_bytes(4)) }
+
+	match run_command(request):
+		Err(ProcessOutputLimitExceeded(_)):
+			True
+		_:
+			False
+
+
+func test_command_rejects_a_negative_capture_limit() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "exit 99"],
+	) | capture_limit = Some(from_bytes(-1)) }
+
+	match run_command(request):
+		Err(InvalidCommand(detail)):
+			detail.contains("capture limit")
+		_:
+			False
+
+
+func exercise_timeout_kills_descendants() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_process_group_"):
+		marker: String = directory.resource_path() + "/descendant-survived"
+		request = { command(
+			"sh",
+			["-c", "(sleep 0.5; printf survived > \"$1\"; printf done) & exit 0", "sh", marker],
+		) | timeout = Some(milliseconds(100)) }
+
+		match run_command(request):
+			Err(_):
+				Ok(False)
+			Ok(result):
+				_ = run_command(
+					command(
+						"sh",
+						["-c", "sleep 0.8"],
+					),
+				)
+				timed_out: Bool = result.exit == TimedOut
+				marker_exists: Bool = file_exists(marker)
+				Ok(timed_out and not marker_exists)
+
+
+func test_command_timeout_kills_descendants() -> Bool:
+	match exercise_timeout_kills_descendants():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Structured process commands",
+	tests = [
+		("preserves argument boundaries", test_command_preserves_argument_boundaries),
+		(
+			"streams stdin and drains both outputs",
+			test_command_streams_stdin_and_drains_both_outputs,
+		),
+		(
+			"applies child-only environment and cwd",
+			test_command_applies_child_only_environment_and_cwd,
+		),
+		("reports signal exit", test_command_reports_signal_exit),
+		("reports timeout", test_command_reports_timeout),
+		("missing program is a structured error", test_command_missing_program_is_structured_error),
+		(
+			"rejects duplicate environment changes",
+			test_command_rejects_duplicate_environment_changes,
+		),
+		("null streams are not captured", test_command_null_streams_are_not_captured),
+		("enforces its capture limit", test_command_enforces_its_capture_limit),
+		("rejects a negative capture limit", test_command_rejects_a_negative_capture_limit),
+		(
+			"timeout kills descendants after the leader exits",
+			test_command_timeout_kills_descendants,
+		),
+	]
+}

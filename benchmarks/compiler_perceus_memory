@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Measure Perceus scaling through the production compiler bridge."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import resource
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+FIXTURE_VERSION = 1
+DEFAULT_GLOBALS = 384
+DEFAULT_FUNCTIONS = 64
+DEFAULT_BODY_LEAVES = 64
+RENDERER_BRIDGE_ENV = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
+WORKER_FLAG = "--measurement-worker"
+VMAP_SAMPLE_SECONDS = 0.1
+
+JsonObject = dict[str, Any]
+
+
+def synthetic_loc() -> JsonObject:
+    return {"kind": "synthetic"}
+
+
+def named_type(name: str) -> JsonObject:
+    return {"kind": "named", "name": name, "args": []}
+
+
+def core_var(name: str, def_id: int | None) -> JsonObject:
+    return {"name": name, "uniq": 0, "def_id": def_id}
+
+
+def literal_expr(kind: str, value: Any, type_name: str) -> JsonObject:
+    return {
+        "kind": "literal",
+        "literal": {"kind": kind, "value": value},
+        "type": named_type(type_name),
+        "loc": synthetic_loc(),
+    }
+
+
+def seq_expr(expressions: list[JsonObject]) -> JsonObject:
+    if not expressions:
+        raise ValueError("a sequence requires at least one expression")
+
+    result = expressions[-1]
+    for expression in reversed(expressions[:-1]):
+        result = {"kind": "seq", "first": expression, "second": result}
+    return result
+
+
+def global_decl(index: int) -> JsonObject:
+    def_id = index + 1
+    name = f"BENCH_UNUSED_GLOBAL_{index:04d}"
+    return {
+        "kind": "global",
+        "name": core_var(name, def_id),
+        "type": named_type("String"),
+        "init": literal_expr("string", f"global-{index:04d}", "String"),
+        "mutable": False,
+        "const": True,
+        "private": False,
+        "def_id": def_id,
+        "loc": synthetic_loc(),
+    }
+
+
+def user_function(name: str, def_id: int, body: JsonObject) -> JsonObject:
+    return {
+        "kind": "function",
+        "name": name,
+        "module": None,
+        "type_params": [],
+        "params": [],
+        "return_type": named_type("Int"),
+        "body": body,
+        "pure": True,
+        "function_kind": {"kind": "user"},
+        "def_id": def_id,
+        "loc": synthetic_loc(),
+    }
+
+
+def worker_decl(index: int, def_id: int, body_leaves: int) -> JsonObject:
+    body = seq_expr(
+        [literal_expr("int", leaf, "Int") for leaf in range(body_leaves)]
+    )
+    return user_function(f"bench_worker_{index:04d}", def_id, body)
+
+
+def call_worker_expr(index: int, def_id: int) -> JsonObject:
+    name = f"bench_worker_{index:04d}"
+    function_type = named_type("Function")
+    return {
+        "kind": "call",
+        "call_kind": {"kind": "selected_direct", "def_id": def_id},
+        "callee": {
+            "kind": "var",
+            "var": core_var(name, def_id),
+            "type": function_type,
+            "loc": synthetic_loc(),
+        },
+        "args": [],
+        "type": named_type("Int"),
+        "loc": synthetic_loc(),
+    }
+
+
+def fixture_request(
+    global_count: int,
+    function_count: int,
+    body_leaves: int,
+) -> tuple[JsonObject, JsonObject]:
+    globals_json = [global_decl(index) for index in range(global_count)]
+    first_function_id = global_count + 1
+    functions_json = [
+        worker_decl(index, first_function_id + index, body_leaves)
+        for index in range(function_count)
+    ]
+    main_expressions = [
+        call_worker_expr(index, first_function_id + index)
+        for index in range(function_count)
+    ]
+    main_expressions.append(literal_expr("int", 0, "Int"))
+    main_json = user_function(
+        "main",
+        first_function_id + function_count,
+        seq_expr(main_expressions),
+    )
+    core_program = {
+        "kind": "program",
+        "decls": [*globals_json, *functions_json, main_json],
+        "foreign_includes": [],
+    }
+    request = {
+        "schema": 1,
+        "domain": "compiler",
+        "action": "emit_core_c",
+        "payload": {"core": core_program, "profile": False},
+    }
+    return request, core_program
+
+
+def input_expression_count(
+    global_count: int,
+    function_count: int,
+    body_leaves: int,
+) -> int:
+    worker_nodes = function_count * ((2 * body_leaves) - 1)
+    main_nodes = (3 * function_count) + 1
+    return global_count + worker_nodes + main_nodes
+
+
+def parse_memory_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:[.][0-9]+)?)([KMGTP]?)", value.strip())
+    if match is None:
+        raise ValueError(f"invalid memory value: {value}")
+    number = float(match.group(1))
+    suffix = match.group(2)
+    multiplier = {
+        "": 1,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+    }[suffix]
+    return int(number * multiplier)
+
+
+def vmmap_metrics(pid: int) -> JsonObject:
+    result = subprocess.run(
+        ["vmmap", "-summary", str(pid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+
+    metrics: JsonObject = {}
+    physical = re.search(r"^Physical footprint:\s+([0-9.]+[KMGTP]?)", result.stdout, re.M)
+    if physical is not None:
+        metrics["physical_footprint_bytes"] = parse_memory_bytes(physical.group(1))
+
+    malloc_small = re.search(
+        r"^\s*MALLOC_SMALL\b[^\n]*?([0-9.]+[KMGTP])\b",
+        result.stdout,
+        re.M,
+    )
+    if malloc_small is not None:
+        metrics["malloc_small_bytes"] = parse_memory_bytes(malloc_small.group(1))
+
+    allocation_counts = re.findall(r"([0-9][0-9,]*) allocations", result.stdout)
+    zone_rows = re.findall(
+        r"^DefaultMallocZone_\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([0-9,]+)\s+",
+        result.stdout,
+        re.M,
+    )
+    allocation_counts.extend(zone_rows)
+    if allocation_counts:
+        metrics["allocation_count"] = max(
+            int(value.replace(",", "")) for value in allocation_counts
+        )
+    return metrics
+
+
+def merge_max_metrics(current: JsonObject, sample: JsonObject) -> JsonObject:
+    result = dict(current)
+    for name, value in sample.items():
+        result[name] = max(int(result.get(name, 0)), int(value))
+    return result
+
+
+def normalized_max_rss_bytes() -> int:
+    max_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if platform.system() == "Darwin":
+        return int(max_rss)
+    return int(max_rss) * 1024
+
+
+def measurement_worker(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("bridge")
+    parser.add_argument("request")
+    parser.add_argument("response")
+    parser.add_argument("stderr")
+    parser.add_argument("metrics")
+    parser.add_argument("sample_vmmap", choices=("0", "1"))
+    args = parser.parse_args(argv)
+
+    vmmap_enabled = args.sample_vmmap == "1"
+    vmmap_result: JsonObject = {}
+    started = time.perf_counter()
+    with open(args.response, "wb") as stdout_file, open(args.stderr, "wb") as stderr_file:
+        process = subprocess.Popen(
+            [args.bridge, args.request],
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        if vmmap_enabled:
+            while process.poll() is None:
+                vmmap_result = merge_max_metrics(vmmap_result, vmmap_metrics(process.pid))
+                time.sleep(VMAP_SAMPLE_SECONDS)
+        return_code = process.wait()
+
+    metrics = {
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_rss_bytes": normalized_max_rss_bytes(),
+        "exit_code": return_code,
+        **vmmap_result,
+    }
+    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
+    return 0
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def prepared_renderer_bridge(root: Path, out_dir: Path, explicit: str | None) -> Path:
+    candidate = explicit or os.environ.get(RENDERER_BRIDGE_ENV)
+    if candidate:
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"renderer bridge does not exist: {path}")
+        return path
+
+    blorp = root / "blorp"
+    if not blorp.is_file():
+        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
+
+    result = subprocess.run(
+        [str(blorp), "__compiler-bridge-prepare", str(out_dir)],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
+
+    values = {}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator:
+            values[name] = value
+    candidate = values.get(RENDERER_BRIDGE_ENV)
+    if not candidate:
+        raise RuntimeError("bridge preparation did not report the renderer helper")
+    path = Path(candidate).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"prepared renderer bridge does not exist: {path}")
+    return path
+
+
+def validate_response(response_path: Path, global_count: int, function_count: int) -> int:
+    try:
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"renderer bridge returned invalid JSON: {error}") from error
+
+    if response.get("ok") is not True:
+        raise RuntimeError(f"renderer bridge failed: {response.get('error', response)}")
+    artifact = response.get("artifact")
+    if not isinstance(artifact, dict):
+        raise RuntimeError("renderer bridge response is missing an artifact")
+    c_code = artifact.get("c_code")
+    if not isinstance(c_code, str) or not c_code:
+        raise RuntimeError("renderer bridge artifact is missing generated C")
+
+    expected_names = ["BENCH_UNUSED_GLOBAL_0000", "bench_worker_0000", "main"]
+    if global_count > 1:
+        expected_names.append(f"BENCH_UNUSED_GLOBAL_{global_count - 1:04d}")
+    if function_count > 1:
+        expected_names.append(f"bench_worker_{function_count - 1:04d}")
+    missing_names = [name for name in expected_names if name not in c_code]
+    if missing_names:
+        raise RuntimeError(
+            "generated C is missing fixture declarations: " + ", ".join(missing_names)
+        )
+    return len(c_code.encode("utf-8"))
+
+
+def print_metrics(metrics: JsonObject, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(metrics, sort_keys=True))
+        return
+
+    ordered_names = (
+        "fixture_version",
+        "globals",
+        "functions",
+        "body_leaves",
+        "declarations",
+        "input_expression_nodes",
+        "request_bytes",
+        "response_bytes",
+        "generated_c_bytes",
+        "elapsed_seconds",
+        "peak_rss_bytes",
+        "physical_footprint_bytes",
+        "malloc_small_bytes",
+        "allocation_count",
+        "verified",
+    )
+    fields = [f"{name}={metrics[name]}" for name in ordered_names if name in metrics]
+    print("PERCEUS_MEMORY_BENCH " + " ".join(fields))
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-memory-") as temp_name:
+        temp_dir = Path(temp_name)
+        bridge_dir = temp_dir / "bridge"
+        bridge_dir.mkdir()
+        bridge = prepared_renderer_bridge(root, bridge_dir, args.bridge)
+
+        request, core_program = fixture_request(
+            args.globals,
+            args.functions,
+            args.body_leaves,
+        )
+        request_path = temp_dir / "request.json"
+        response_path = temp_dir / "response.json"
+        stderr_path = temp_dir / "bridge.stderr"
+        metrics_path = temp_dir / "metrics.json"
+        request_path.write_text(
+            json.dumps(request, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+        worker_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            WORKER_FLAG,
+            str(bridge),
+            str(request_path),
+            str(response_path),
+            str(stderr_path),
+            str(metrics_path),
+            "1" if args.vmmap else "0",
+        ]
+        worker = subprocess.run(worker_command, cwd=root, check=False)
+        if worker.returncode != 0 or not metrics_path.is_file():
+            raise RuntimeError("benchmark measurement worker failed")
+
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if metrics["exit_code"] != 0:
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"renderer bridge exited with {metrics['exit_code']}: {stderr}"
+            )
+
+        generated_c_bytes = validate_response(
+            response_path,
+            args.globals,
+            args.functions,
+        )
+        metrics.update(
+            {
+                "fixture_version": FIXTURE_VERSION,
+                "globals": args.globals,
+                "functions": args.functions,
+                "body_leaves": args.body_leaves,
+                "declarations": len(core_program["decls"]),
+                "input_expression_nodes": input_expression_count(
+                    args.globals,
+                    args.functions,
+                    args.body_leaves,
+                ),
+                "request_bytes": request_path.stat().st_size,
+                "response_bytes": response_path.stat().st_size,
+                "generated_c_bytes": generated_c_bytes,
+                "verified": True,
+            }
+        )
+        del metrics["exit_code"]
+        print_metrics(metrics, args.json)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == WORKER_FLAG:
+        return measurement_worker(argv[1:])
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure the production emit_core_c path with many managed globals "
+            "that are irrelevant to moderately sized function bodies."
+        )
+    )
+    parser.add_argument("--globals", type=positive_int, default=DEFAULT_GLOBALS)
+    parser.add_argument("--functions", type=positive_int, default=DEFAULT_FUNCTIONS)
+    parser.add_argument("--body-leaves", type=positive_int, default=DEFAULT_BODY_LEAVES)
+    parser.add_argument(
+        "--bridge",
+        help=f"prepared renderer bridge; defaults to ${RENDERER_BRIDGE_ENV} or prepares one",
+    )
+    parser.add_argument(
+        "--vmmap",
+        action="store_true",
+        help="sample macOS vmmap allocator and physical-footprint metrics",
+    )
+    parser.add_argument("--json", action="store_true", help="print metrics as JSON")
+    args = parser.parse_args(argv)
+
+    if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
+        parser.error("--vmmap requires macOS vmmap")
+
+    try:
+        return run_benchmark(args)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

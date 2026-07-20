@@ -20,8 +20,21 @@ type compile_result = {
 (** Frontend phases that run before Core lowering. *)
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
-val frontend_phase_to_string : frontend_phase -> string
-(** Stable display label for frontend timing output. *)
+type phase_timing_phase =
+  | InMemoryFrontendGraph
+  | FrontendGraphFinalize
+  | GraphTypecheck
+  | SemanticMiddle
+  | BackendEmission
+  | CorePipeline
+
+type phase_timing = {
+  timing_phase : phase_timing_phase;
+  duration_seconds : float;
+}
+(** One observed phase from a source-to-C compilation. These phases describe
+    the current architectural boundaries without introducing another compiler
+    pipeline or changing ownership. *)
 
 (** Source compilation outcome. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
@@ -41,15 +54,6 @@ val typecheck_only_typed_reusing_session :
 (** Reuses [sess]'s validated parse cache across calls while resetting all
     semantic compilation state before each run. Intended for batch test/tool
     workers that typecheck many independent files in one process. *)
-
-val typecheck_only_typed_with_blorp_bridge_policy :
-  debug:bool ->
-  allow_debug_only_calls:bool ->
-  filename:string ->
-  preloaded_module_graph:Modules.preloaded_module_graph ->
-  (Typed_ast.program, Ast.compiler_error list) result
-(** Typecheck through the Blorp-owned typed-source bridge for a frontend module
-    graph, with explicit [--debug] and [@debug_only] policy. *)
 
 val typecheck_module_only :
   filename:string ->
@@ -161,6 +165,7 @@ val compile_preloaded_graph_with_blorp_bridge :
   ?on_stage_json:Core_pipeline.on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
   ?check_invariants:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
   filename:string ->
   preloaded_module_graph:Modules.preloaded_module_graph ->
   unit ->
@@ -171,19 +176,33 @@ val compile_preloaded_graph_with_blorp_bridge :
     typed-program artifact with CTFE already evaluated, populates dependency
     typed-module caches, and then enters the Core/codegen handoff. Production
     source-command compilation uses this path. The explicitly legacy direct
-    source API remains for the REPL and test runner until those callers are
-    migrated to the single frontend graph handoff. *)
+    source API remains for the REPL and other classified tooling until those
+    callers are migrated to the single frontend graph handoff. *)
+
+val compile_in_memory_source_with_blorp_bridge :
+  ?debug:bool ->
+  ?allow_debug_only_calls:bool ->
+  ?retain_debug_blocks:bool ->
+  ?embed_runtime:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
+  filename:string ->
+  source:string ->
+  unit ->
+  (compile_outcome, Ast.compiler_error list) result
+(** Compile supplied user source through the Blorp-owned source and typecheck
+    frontier. [filename] provides module/import identity, but the frontend uses
+    [source] even when the file does not exist or has different contents. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->
   ?retain_debug_blocks:bool ->
   ?embed_runtime:bool ->
+  ?on_phase_timing:(phase_timing -> unit) ->
   filename:string ->
   source:string ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
-(** Compile compiler-generated test scaffolding. The harness is not a user
-    source file, so its synthetic imports are not subject to unused-import
-    diagnostics; any user modules loaded by the harness are still checked
-    normally. *)
+(** Compile compiler-generated test scaffolding through the Blorp-owned source
+    and typecheck frontier. The harness is not a user source file, so its
+    synthetic imports are not subject to unused-import diagnostics. *)

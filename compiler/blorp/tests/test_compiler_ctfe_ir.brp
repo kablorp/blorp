@@ -16,7 +16,7 @@ import:
 		CompilerResourceArgPolicy(CompilerRejectResourceArgs),
 	../src/stage_05_types/compiler_refinement: compiler_unrefined_binding
 	../src/stage_05_types/compiler_type:
-		CompilerType(CompilerNamedType, CompilerRangeType, CompilerTupleType),
+		CompilerType(CompilerFunctionType, CompilerNamedType, CompilerTupleType),
 		compiler_type_bool,
 		compiler_type_int,
 		compiler_type_string,
@@ -32,7 +32,7 @@ import:
 		),
 		CompilerExprTypeOrigin(CompilerSynthesizedOrigin),
 		CompilerResolvedCallInfo,
-		CompilerResolvedCallTarget(CompilerResolvedDirectCall),
+		CompilerResolvedCallTarget(CompilerResolvedDirectCall, CompilerResolvedTraitMethodCall),
 		CompilerTypedAssignScope(CompilerLocalAssignScope),
 		CompilerTypedDictEntry,
 		CompilerTypedExpr(
@@ -49,6 +49,7 @@ import:
 			CompilerTypedForExpr,
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedListExpr,
+			CompilerTypedLambdaExpr,
 			CompilerTypedMatchExpr,
 			CompilerTypedNameExpr,
 			CompilerTypedQuestionBindExpr,
@@ -70,6 +71,7 @@ import:
 			CompilerTypedInterpolationLiteral,
 		),
 		CompilerTypedVarDeclPayload,
+		compiler_typed_expr_value_type,
 	../src/stage_07_ctfe/compiler_ctfe_context:
 		CompilerCtfeContext,
 		compiler_ctfe_context_empty,
@@ -103,6 +105,7 @@ import:
 			CompilerCtfeIrImportedGlobalExpr,
 			CompilerCtfeIrIdentExpr,
 			CompilerCtfeIrListExpr,
+			CompilerCtfeIrLambdaExpr,
 			CompilerCtfeIrLiteralExpr,
 			CompilerCtfeIrRecordExpr,
 			CompilerCtfeIrMatchExpr,
@@ -232,7 +235,8 @@ pure func constructor_context() -> CompilerCtfeContext:
 		imported_functions = [],
 		constructors = [("None", compiler_ctfe_constructor_info("Option", 0, None))],
 		module_aliases = [],
-		module_global_envs = []
+		module_global_envs = [],
+		active_module_path = None
 	}
 
 
@@ -380,7 +384,7 @@ func test_translates_field_access_kinds() -> Bool:
 		int_expr("0"),
 		int_expr("3"),
 		source_span(),
-		expr_info_for(CompilerRangeType(compiler_type_int())),
+		expr_info_for(CompilerNamedType("Range", [])),
 	)
 
 	record_result = compiler_ctfe_ir_from_typed_expr_without_context(
@@ -931,6 +935,38 @@ func test_translates_name_references() -> Bool:
 	value_ok and constructor_ok
 
 
+func test_translates_resolved_nullary_constructor_reference_without_context() -> Bool:
+	constructor_call = resolved_call_with_origin(
+		41,
+		"None#41",
+		CompilerPure,
+		CompilerCallableConstructor("Option"),
+	)
+
+	match compiler_ctfe_ir_from_typed_expr_without_context(
+		name_expr_with_call(
+			"None",
+			constructor_call,
+		),
+	):
+		Ok(expr):
+			match expr.desc:
+				CompilerCtfeIrIdentExpr(identifier):
+					match identifier.reference_kind:
+						CompilerCtfeIrNullaryConstructorReference(constructor):
+							(
+								constructor.name == "None"
+								and constructor.parent_type == "Option"
+								and constructor.callable_id == Some(41)
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_translates_local_function_references() -> Bool:
 	pure_typed = name_expr_with_call(
 		"helper",
@@ -1150,6 +1186,47 @@ func test_keeps_unadmitted_builtin_call_unsupported() -> Bool:
 			False
 
 
+func test_translates_resolved_trait_method_as_imported_call() -> Bool:
+	call: CompilerResolvedCallInfo = {
+		callee_name = "length",
+		source_name = "length#17",
+		purity = CompilerPure,
+		target = CompilerResolvedTraitMethodCall("Length", Some({
+				callable_id = 17,
+				module_path = "std/list",
+			})),
+		instantiated_params = [compiler_type_int()],
+		instantiated_return = compiler_type_int(),
+		resource_args = CompilerRejectResourceArgs,
+		dim_constraints = [],
+		loop_producer = None
+	}
+	typed = CompilerTypedCallExpr(
+		name_expr_with_call("length", call),
+		[int_expr("1")],
+		source_span(),
+		expr_info_with_call(call),
+	)
+
+	match compiler_ctfe_ir_from_typed_expr_without_context(typed):
+		Ok(expr):
+			match expr.desc:
+				CompilerCtfeIrCallExpr(ctfe_call):
+					match ctfe_call.kind:
+						CompilerCtfeIrImportedCall(direct, module_path):
+							(
+								direct.callable_id == 17
+								and direct.source_name == "length"
+								and module_path == "std/list"
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_rejects_unsupported_forms_at_translation_boundary() -> Bool:
 	typed = CompilerTypedSubscriptExpr(
 		name_expr("items"),
@@ -1167,6 +1244,35 @@ func test_rejects_unsupported_forms_at_translation_boundary() -> Bool:
 			False
 
 
+func test_translates_lambda_as_explicit_ctfe_ir() -> Bool:
+	typed = CompilerTypedLambdaExpr(
+		True,
+		[],
+		Some(compiler_type_int()),
+		int_expr("42"),
+		source_span(),
+		expr_info_for(CompilerFunctionType(True, [], compiler_type_int())),
+	)
+
+	match compiler_ctfe_ir_from_typed_expr_without_context(typed):
+		Ok(expr):
+			match expr.desc:
+				CompilerCtfeIrLambdaExpr(lambda):
+					(
+						lambda.is_pure
+						and lambda.params.length() == 0
+						and lambda.return_annotation.is_some()
+						and compiler_types_equal(
+							compiler_typed_expr_value_type(lambda.body),
+							compiler_type_int(),
+						)
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler CTFE IR",
 	tests = [
@@ -1176,6 +1282,7 @@ tests: TestSuite = {
 			test_translates_transparent_and_collection_exprs,
 		),
 		("translates record and dict exprs", test_translates_record_and_dict_exprs),
+		("translates lambdas as explicit CTFE IR", test_translates_lambda_as_explicit_ctfe_ir),
 		("translates field access kinds", test_translates_field_access_kinds),
 		("translates imported global field access", test_translates_imported_global_field_access),
 		("translates block local bindings", test_translates_block_local_bindings),
@@ -1190,12 +1297,20 @@ tests: TestSuite = {
 		("translates while and loop control", test_translates_while_and_loop_control),
 		("translates for loops", test_translates_for_loops),
 		("translates name references", test_translates_name_references),
+		(
+			"translates resolved nullary constructor reference without context",
+			test_translates_resolved_nullary_constructor_reference_without_context,
+		),
 		("translates local function references", test_translates_local_function_references),
 		("translates call kinds", test_translates_call_kinds),
 		("translates supported builtin call", test_translates_supported_builtin_call),
 		(
 			"keeps unadmitted builtin call unsupported",
 			test_keeps_unadmitted_builtin_call_unsupported,
+		),
+		(
+			"translates resolved trait method as imported call",
+			test_translates_resolved_trait_method_as_imported_call,
 		),
 		(
 			"rejects unsupported forms at translation boundary",

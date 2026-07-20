@@ -338,6 +338,14 @@ let reset_core_counters (s : t) : unit =
      [Core_pipeline.compile_typed] runs. *)
   s.def_id_counter <- 0
 
+(** Ensure the next generated definition id is at least [floor]. Source
+    definition ids can arrive from a serialized frontend graph rather than
+    this process's counter. The typed-to-Core boundary reserves their range
+    before lowering mints globals, lambdas, and specializations. *)
+let reserve_def_id_floor (s : t) (floor : int) : unit =
+  if floor < 0 then invalid_arg "Session.reserve_def_id_floor: negative floor";
+  if s.def_id_counter < floor then s.def_id_counter <- floor
+
 (** Mint a fresh [def_id] from the session counter. Monotonic within
     a session; a new session starts from 0. See [Env_types.def_id]. *)
 let mint_def_id (s : t) : Env_types.def_id =

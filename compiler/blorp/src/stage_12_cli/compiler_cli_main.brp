@@ -1,28 +1,54 @@
 import:
 	compiler_cli: run_cli
-	compiler_cli_artifact_json: cli_run_plan_to_json
+	compiler_cli_artifact_json: cli_ocaml_host_plan_to_json
+	compiler_cli_compile_effect: execute_compile_command
+	compiler_cli_execute: execute_check_plan
 	compiler_cli_plan:
+		CliHandledResult,
+		CliOcamlHostPlan(
+			CliOcamlHostLsp,
+			CliOcamlHostPackage,
+			CliOcamlHostPurify,
+			CliOcamlHostRepl,
+			CliOcamlHostTest,
+		),
 		CliRunPlan(
+			CliRunCheck,
+			CliRunCompile,
 			CliRunDelegate,
-			CliRunFrontendModuleGraph,
 			CliRunHandled,
 			CliRunLsp,
 			CliRunPackage,
 			CliRunPurify,
 			CliRunRepl,
+			CliRunSource,
 			CliRunTest,
 		),
-	io: print_error
+	compiler_cli_run_effect: CliRunEffectConfiguration, execute_run_command
+	compiler_runtime: compiler_runtime_sources
+	compiler_semantic_worker_client: SemanticMiddleWorkerCommand
+	io: print, print_error
 	path: dirname, join
 	process: run_inherit
-	system: getenv, mkstemp_path, remove_file, write_file
+	system: getenv, mkstemp_path, remove_file, temp_dir, write_file
+	units: mebibytes
 
 
 private OCAML_HOST_ENV: String = "BLORP_OCAML_HOST_BIN"
 
+private OCAML_MIDDLE_ENV: String = "BLORP_OCAML_MIDDLE_BIN"
+
 private DEFAULT_OCAML_HOST_NAME: String = "blorp-ocaml-host"
 
+private DEFAULT_OCAML_MIDDLE_NAME: String = "blorp-ocaml-middle"
+
+private DEFAULT_BLORP_NAME: String = "blorp"
+
 private HOST_EXECUTE_CLI_PLAN_COMMAND: String = "__compiler-run-cli-plan"
+
+private SEMANTIC_WORKER_RESPONSE_MEBIBYTES: Int = 512
+
+private HOST_CAPTURE_MEBIBYTES: Int = 64
 
 
 private pure func sibling_ocaml_host_path(program_path: String) -> String:
@@ -30,6 +56,13 @@ private pure func sibling_ocaml_host_path(program_path: String) -> String:
 		join(dirname(program_path), DEFAULT_OCAML_HOST_NAME)
 	else:
 		DEFAULT_OCAML_HOST_NAME
+
+
+private pure func sibling_ocaml_middle_path(program_path: String) -> String:
+	if program_path.contains("/"):
+		join(dirname(program_path), DEFAULT_OCAML_MIDDLE_NAME)
+	else:
+		DEFAULT_OCAML_MIDDLE_NAME
 
 
 private func ocaml_host_path(program_path: String) -> String:
@@ -43,12 +76,30 @@ private func ocaml_host_path(program_path: String) -> String:
 			sibling_ocaml_host_path(program_path)
 
 
+private func ocaml_middle_path(program_path: String) -> String:
+	match getenv(OCAML_MIDDLE_ENV):
+		Some(path):
+			if path.length() > 0:
+				path
+			else:
+				sibling_ocaml_middle_path(program_path)
+		None:
+			sibling_ocaml_middle_path(program_path)
+
+
+private pure func semantic_middle_worker(path: String) -> SemanticMiddleWorkerCommand:
+	{
+		program = path,
+		args = [],
+		timeout = None,
+		max_response_size = mebibytes(SEMANTIC_WORKER_RESPONSE_MEBIBYTES)
+	}
+
+
 private pure func is_internal_compiler_command(args: List[String]) -> Bool:
 	match args.get(0):
 		Some(command):
 			match command:
-				"__compiler-bridge":
-					True
 				"__compiler-bridge-prepare":
 					True
 				"__compiler-host-compile-wrapper":
@@ -70,17 +121,17 @@ private func run_ocaml_host(host_path: String, host_args: List[String]) -> Int:
 			1
 
 
-private func write_cli_plan_file(plan: CliRunPlan) -> Result[String, String]:
+private func write_cli_plan_file(plan: CliOcamlHostPlan) -> Result[String, String]:
 	path ?= mkstemp_path("blorp_cli_plan_")
 
-	match write_file(path, cli_run_plan_to_json(plan).to_string()):
+	match write_file(path, cli_ocaml_host_plan_to_json(plan).to_string()):
 		Ok(_):
 			Ok(path)
 		Err(message):
 			Err(message)
 
 
-private func run_ocaml_host_with_plan(host_path: String, plan: CliRunPlan) -> Int:
+private func run_ocaml_host_with_plan(host_path: String, plan: CliOcamlHostPlan) -> Int:
 	match write_cli_plan_file(plan):
 		Ok(path):
 			status: Int = run_ocaml_host(
@@ -94,34 +145,62 @@ private func run_ocaml_host_with_plan(host_path: String, plan: CliRunPlan) -> In
 			1
 
 
-private func execute_cli_plan(host_path: String, plan: CliRunPlan) -> Int:
+private func run_handled_result(result: CliHandledResult) -> Int:
+	if result.stdout.length() != 0:
+		print(result.stdout)
+
+	if result.stderr.length() != 0:
+		print_error(result.stderr)
+
+	result.status
+
+
+private func execute_cli_plan(host_path: String, middle_path: String, plan: CliRunPlan) -> Int:
 	match plan:
 		CliRunDelegate(delegation):
 			run_ocaml_host(host_path, delegation.args)
+		CliRunCheck(check_plan):
+			run_handled_result(execute_check_plan(check_plan))
 		CliRunHandled(result):
-			run_ocaml_host_with_plan(host_path, CliRunHandled(result))
-		CliRunFrontendModuleGraph(graph):
-			run_ocaml_host_with_plan(host_path, CliRunFrontendModuleGraph(graph))
+			run_handled_result(result)
+		CliRunCompile(compile_plan):
+			run_handled_result(
+				execute_compile_command(
+					compile_plan,
+					semantic_middle_worker(middle_path),
+					compiler_runtime_sources(),
+				),
+			)
+		CliRunSource(run_plan):
+			configuration: CliRunEffectConfiguration = {
+				worker = semantic_middle_worker(middle_path),
+				runtime_sources = compiler_runtime_sources(),
+				host_timeout = None,
+				capture_limit = mebibytes(HOST_CAPTURE_MEBIBYTES),
+				temporary_root = temp_dir()
+			}
+			run_handled_result(execute_run_command(run_plan, configuration))
 		CliRunTest(test_plan):
-			run_ocaml_host_with_plan(host_path, CliRunTest(test_plan))
+			run_ocaml_host_with_plan(host_path, CliOcamlHostTest(test_plan))
 		CliRunPurify(purify_plan):
-			run_ocaml_host_with_plan(host_path, CliRunPurify(purify_plan))
+			run_ocaml_host_with_plan(host_path, CliOcamlHostPurify(purify_plan))
 		CliRunRepl(repl_plan):
-			run_ocaml_host_with_plan(host_path, CliRunRepl(repl_plan))
+			run_ocaml_host_with_plan(host_path, CliOcamlHostRepl(repl_plan))
 		CliRunLsp(lsp_plan):
-			run_ocaml_host_with_plan(host_path, CliRunLsp(lsp_plan))
+			run_ocaml_host_with_plan(host_path, CliOcamlHostLsp(lsp_plan))
 		CliRunPackage(package_plan):
-			run_ocaml_host_with_plan(host_path, CliRunPackage(package_plan))
+			run_ocaml_host_with_plan(host_path, CliOcamlHostPackage(package_plan))
 
 
 func main(args: List[String]) -> Int:
 	host_args: List[String] = args.drop(1)
 	program_path: String = args
 		.get(0)
-		.get_or(DEFAULT_OCAML_HOST_NAME)
+		.get_or(DEFAULT_BLORP_NAME)
 	host_path: String = ocaml_host_path(program_path)
+	middle_path: String = ocaml_middle_path(program_path)
 
 	if is_internal_compiler_command(host_args):
 		run_ocaml_host(host_path, host_args)
 	else:
-		execute_cli_plan(host_path, run_cli(host_args))
+		execute_cli_plan(host_path, middle_path, run_cli(host_args))

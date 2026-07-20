@@ -14,8 +14,7 @@ import:
 	../stage_05_types/compiler_env:
 		CompilerPurity(CompilerImpure, CompilerPure),
 		compiler_purities_equal,
-	../stage_05_types/compiler_type:
-		CompilerType(CompilerNamedType, CompilerRangeType, CompilerTupleType),
+	../stage_05_types/compiler_type: CompilerType(CompilerNamedType, CompilerTupleType)
 	../stage_06_typecheck/compiler_infer:
 		CompilerCallableOrigin(
 			CompilerCallableBuiltin,
@@ -96,10 +95,12 @@ import:
 		CompilerCtfeContext,
 		CompilerCtfeNullaryConstructorReference,
 		compiler_ctfe_context_empty,
+		compiler_ctfe_context_function_by_callable_id,
 		compiler_ctfe_context_module_alias,
 		compiler_ctfe_context_module_has_global_binding,
 		compiler_ctfe_context_nullary_constructor_reference,
 	compiler_ctfe_intrinsic: CompilerCtfeBuiltinIntrinsic, compiler_ctfe_builtin_intrinsic
+	compiler_ctfe_value: CompilerCtfeLambdaSource
 
 
 union CompilerCtfeIrLiteral:
@@ -133,6 +134,8 @@ record CompilerCtfeIrIdentifier {
 
 union CompilerCtfeIrCallKind:
 	CompilerCtfeIrUnresolvedCall
+	CompilerCtfeIrClosureCall
+	CompilerCtfeIrIntrinsicCall(String)
 	CompilerCtfeIrLocalCall(CompilerCtfeIrDirectCall)
 	CompilerCtfeIrImportedCall(CompilerCtfeIrDirectCall, String)
 	CompilerCtfeIrConstructorCall(CompilerCtfeIrDirectCall, String)
@@ -227,6 +230,7 @@ union CompilerCtfeIrExprDesc:
 	CompilerCtfeIrRecordExpr(List[CompilerCtfeIrField])
 	CompilerCtfeIrRecordUpdateExpr(CompilerCtfeIrExpr, List[CompilerCtfeIrField])
 	CompilerCtfeIrDictExpr(List[CompilerCtfeIrDictEntry])
+	CompilerCtfeIrLambdaExpr(CompilerCtfeLambdaSource)
 	CompilerCtfeIrFieldAccessExpr(CompilerCtfeIrFieldAccess)
 	CompilerCtfeIrImportedGlobalExpr(CompilerCtfeIrImportedGlobal)
 	CompilerCtfeIrRangeExpr(CompilerCtfeIrExpr, CompilerCtfeIrExpr)
@@ -425,17 +429,17 @@ private pure func compiler_ctfe_ir_reference_kind(
 						)
 					else:
 						match origin:
-							CompilerCallableConstructor(_):
-								match compiler_ctfe_context_nullary_constructor_reference(
-									context,
-									compiler_ctfe_ir_clean_source_name(call.source_name),
-								):
-									Some(constructor):
-										CompilerCtfeIrNullaryConstructorReference(constructor)
-									None:
-										CompilerCtfeIrUnsupportedFunctionReference(
-											compiler_ctfe_ir_clean_source_name(call.source_name),
-										)
+							CompilerCallableConstructor(parent_type):
+								if call.instantiated_params.length() == 0:
+									CompilerCtfeIrNullaryConstructorReference({
+										name = compiler_ctfe_ir_clean_source_name(call.source_name),
+										parent_type = parent_type,
+										callable_id = Some(callable_id),
+									})
+								else:
+									CompilerCtfeIrUnsupportedFunctionReference(
+										compiler_ctfe_ir_clean_source_name(call.source_name),
+									)
 							_:
 								if compiler_ctfe_ir_is_pure(call.purity):
 									CompilerCtfeIrUnsupportedFunctionReference(
@@ -456,6 +460,7 @@ private pure func compiler_ctfe_ir_reference_kind(
 
 
 private pure func compiler_ctfe_ir_call_kind(
+	context: CompilerCtfeContext,
 	resolved_call: Option[CompilerResolvedCallInfo],
 ) -> CompilerCtfeIrCallKind:
 	match resolved_call:
@@ -511,12 +516,39 @@ private pure func compiler_ctfe_ir_call_kind(
 								CompilerCtfeIrUnsupportedCall("foreign function calls")
 							CompilerCallableImplMethod:
 								CompilerCtfeIrUnsupportedCall("impl method calls")
-				CompilerResolvedTraitMethodCall(_, _):
-					CompilerCtfeIrUnsupportedCall("trait method calls")
+				CompilerResolvedTraitMethodCall(_, target):
+					if not compiler_ctfe_ir_is_pure(call.purity):
+						CompilerCtfeIrImpureCall
+					else:
+						match target:
+							Some(method_target):
+								direct = compiler_ctfe_ir_direct_call(
+									method_target.callable_id,
+									call.source_name,
+									call.purity,
+								)
+
+								match compiler_ctfe_context_function_by_callable_id(
+									context,
+									method_target.callable_id,
+								):
+									Some(_):
+										CompilerCtfeIrLocalCall(direct)
+									None:
+										CompilerCtfeIrImportedCall(
+											direct,
+											method_target.module_path,
+										)
+							None:
+								CompilerCtfeIrIntrinsicCall(
+									compiler_ctfe_ir_clean_source_name(call.source_name),
+								)
 				CompilerResolvedIntrinsicCall:
-					CompilerCtfeIrUnsupportedCall("intrinsic function calls")
+					CompilerCtfeIrIntrinsicCall(
+						compiler_ctfe_ir_clean_source_name(call.source_name),
+					)
 				CompilerResolvedClosureCall:
-					CompilerCtfeIrUnsupportedCall("closure calls")
+					CompilerCtfeIrClosureCall
 		None:
 			CompilerCtfeIrUnresolvedCall
 
@@ -585,10 +617,13 @@ private pure func compiler_ctfe_ir_field_access_kind(
 	match receiver_type:
 		CompilerTupleType(elements):
 			compiler_ctfe_ir_tuple_field_kind(field, elements.length())
-		CompilerNamedType("Tuple", elements):
-			compiler_ctfe_ir_tuple_field_kind(field, elements.length())
-		CompilerRangeType(_):
-			compiler_ctfe_ir_range_field_kind(field)
+		CompilerNamedType(name, args):
+			if name == "Tuple":
+				compiler_ctfe_ir_tuple_field_kind(field, args.length())
+			else if name == "Range" and args.length() == 0:
+				compiler_ctfe_ir_range_field_kind(field)
+			else:
+				CompilerCtfeIrRecordField(field)
 		_:
 			CompilerCtfeIrRecordField(field)
 
@@ -1036,7 +1071,10 @@ pure func compiler_ctfe_ir_from_typed_expr(
 			Ok(compiler_ctfe_ir_expr(
 				expr,
 				CompilerCtfeIrCallExpr({
-					kind = compiler_ctfe_ir_call_kind(compiler_typed_expr_resolved_call(expr)),
+					kind = compiler_ctfe_ir_call_kind(
+						context,
+						compiler_typed_expr_resolved_call(expr),
+					),
 					callee = callee_ir,
 					args = args_ir,
 				}),
@@ -1049,8 +1087,18 @@ pure func compiler_ctfe_ir_from_typed_expr(
 			compiler_ctfe_ir_unsupported(expr, "subscript expressions")
 		CompilerTypedSubscriptAssignExpr(_, _, _, _, _, _):
 			compiler_ctfe_ir_unsupported(expr, "subscript assignments")
-		CompilerTypedLambdaExpr(_, _, _, _, _, _):
-			compiler_ctfe_ir_unsupported(expr, "lambdas")
+		CompilerTypedLambdaExpr(is_pure, params, return_annotation, body, span, info):
+			Ok(compiler_ctfe_ir_expr(
+				expr,
+				CompilerCtfeIrLambdaExpr({
+					is_pure = is_pure,
+					params = params,
+					return_annotation = return_annotation,
+					body = body,
+					span = span,
+					info = info,
+				}),
+			))
 		CompilerTypedSelectExpr(_, _, _):
 			compiler_ctfe_ir_unsupported(expr, "select expressions")
 		CompilerTypedWhileExpr(condition, body, _, _):

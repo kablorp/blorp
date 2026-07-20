@@ -2,11 +2,16 @@ import:
 	compiler_env:
 		CompilerEnv,
 		CompilerFuncOrigin(CompilerBuiltinFunc),
-		CompilerLoopProducer(CompilerLoopProducerIndices, CompilerLoopProducerWindows),
+		CompilerLoopProducer(
+			CompilerLoopProducerEnumerate2,
+			CompilerLoopProducerIndices,
+			CompilerLoopProducerWindows,
+		),
 		CompilerPurity(CompilerImpure, CompilerPure),
 		CompilerResourceArgPolicy(CompilerAllowResourceArgs, CompilerRejectResourceArgs),
 		CompilerResourceResultPolicy(
 			CompilerResourceResultDependent,
+			CompilerResourceResultIndependent,
 			CompilerResourceResultOrdinary,
 		),
 		CompilerTraitMethodSig,
@@ -29,7 +34,9 @@ import:
 			CompilerFunctionType,
 			CompilerNamedType,
 			CompilerSelfType,
+			CompilerTupleType,
 			CompilerTypeVar,
+			CompilerVarDimsType,
 		),
 		compiler_type_bool,
 		compiler_type_char,
@@ -47,8 +54,8 @@ enum CompilerBuiltinEffect:
 	CompilerBuiltinOsWorkerBlocking
 
 
-enum CompilerRuntimeEffect:
-	CompilerPureMetadata
+private enum CompilerRuntimeEffect:
+	CompilerNoRuntimeEffect
 	CompilerImpureNonWaiting
 	CompilerCancellationCheckpoint
 	CompilerFiberParkingWait
@@ -73,325 +80,313 @@ union CompilerSpecialInference:
 	CompilerBitwiseInference
 
 
-record CompilerBuiltinDescriptor {
-	name: String,
-	runtime_effect: CompilerRuntimeEffect,
-	parallel_boundary: Bool,
-	special_inference: Option[CompilerSpecialInference]
-}
+pure func compiler_builtin_is_elementwise_tensor_function(name: String) -> Bool:
+	["sqrt", "abs", "exp", "log"].contains(name)
 
 
-private pure func compiler_impure_descriptor(name: String) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerImpureNonWaiting,
-		parallel_boundary = False,
-		special_inference = None
-	}
+-- Resource-producing builtins borrow their resource argument by default. Keep
+-- the exceptional ownership contracts beside the other builtin metadata.
+pure func compiler_builtin_resource_result_policy(name: String) -> CompilerResourceResultPolicy:
+	match name:
+		"blorp_tcp_accept_raw":
+			CompilerResourceResultIndependent
+		_:
+			CompilerResourceResultDependent
 
 
-private pure func compiler_cancellation_descriptor(name: String) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerCancellationCheckpoint,
-		parallel_boundary = False,
-		special_inference = None
-	}
-
-
-private pure func compiler_fiber_parking_descriptor(name: String) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerFiberParkingWait,
-		parallel_boundary = False,
-		special_inference = None
-	}
-
-
-private pure func compiler_os_worker_blocking_descriptor(name: String) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerOsWorkerBlockingWait,
-		parallel_boundary = False,
-		special_inference = None
-	}
-
-
-private pure func compiler_parallel_boundary_descriptor(name: String) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerPureMetadata,
-		parallel_boundary = True,
-		special_inference = None
-	}
-
-
-private pure func compiler_special_descriptor(
-	name: String,
-	special_inference: CompilerSpecialInference,
-) -> CompilerBuiltinDescriptor:
-	{
-		name = name,
-		runtime_effect = CompilerPureMetadata,
-		parallel_boundary = False,
-		special_inference = Some(special_inference)
-	}
-
-
-private pure func compiler_impure_names() -> List[String]:
-	[
-		"print",
-		"puts",
-		"print_error",
-		"read_file",
-		"write_file",
-		"read_bytes",
-		"write_bytes",
-		"file_exists",
-		"is_directory",
-		"exec",
-		"read_line",
-		"read_line_or_empty",
-		"read_all",
-		"input",
-		"input_or_empty",
-		"seed_random",
-		"random_int",
-		"random_float",
-		"read_all_lines",
-		"write_lines",
-		"append_file",
-		"for_each_line",
-		"getcwd",
-		"mkdir",
-		"remove_file",
-		"remove_dir",
-		"rename",
-		"exec_output",
-		"now",
-		"now_us",
-		"channel",
-		"seal",
-		"try_send",
-		"try_recv",
-		"try_send_attempt",
-		"try_recv_attempt",
-		"task_join_slot_probe_for_test",
-		"fiber_created_schedule_probe_for_test",
-		"timer_waiter_identity_probe_for_test",
-		"wait_ready_to_park_probe_for_test",
-		"fiber_lifecycle_ready_to_park_probe_for_test",
-		"fiber_cancel_before_park_probe_for_test",
-		"current_timer_wait_install_probe_for_test",
-		"timeout_arithmetic_probe_for_test",
-		"websocket_state_probe_for_test",
-		"getenv",
-		"setenv",
-		"init_window",
-		"close_window",
-		"window_should_close",
-		"set_target_fps",
-		"get_fps",
-		"begin_drawing",
-		"end_drawing",
-		"clear_background",
-		"draw_rectangle",
-		"draw_rectangle_rec",
-		"draw_circle",
-		"draw_line",
-		"draw_text",
-		"is_key_pressed",
-		"is_key_down",
-		"get_mouse_x",
-		"get_mouse_y",
-		"is_mouse_button_pressed",
-		"is_mouse_button_down",
-		"get_frame_time",
-		"get_time",
-		"blorp_dir_entries_raw",
-		"blorp_dir_open_raw",
-		"blorp_dir_read_entry_raw",
-		"blorp_dir_read_next_entries_raw",
-		"blorp_tcp_listen",
-		"blorp_tcp_listen_loopback_raw",
-		"blorp_tcp_listen_any_interface_raw",
-		"blorp_tcp_listen_ip_raw",
-		"blorp_tcp_local_port_listener_raw",
-		"blorp_tcp_set_timeout_listener_raw",
-		"blorp_udp_bind_raw",
-		"blorp_udp_bind_numeric_raw",
-		"blorp_udp_send_to_raw",
-		"blorp_udp_send_to_numeric_raw",
-	]
-
-
-private pure func compiler_fiber_parking_names() -> List[String]:
-	[
-		"sleep",
-		"send",
-		"recv",
-		"send_timeout",
-		"recv_timeout",
-		"send_timeout_attempt",
-		"recv_timeout_attempt",
-		"blorp_tcp_accept",
-		"blorp_tcp_connect",
-		"blorp_tcp_read",
-		"blorp_tcp_write",
-		"blorp_tcp_accept_raw",
-		"blorp_tcp_connect_loopback_raw",
-		"blorp_tcp_connect_ip_raw",
-		"blorp_tcp_connect_scoped_ip_raw",
-		"blorp_tcp_connect_name_raw",
-		"blorp_tcp_read_raw",
-		"blorp_tcp_write_raw",
-		"blorp_tcp_write_all_raw",
-		"blorp_tls_connect_raw",
-		"blorp_tls_read_raw",
-		"blorp_tls_write_raw",
-		"blorp_tls_write_all_raw",
-		"blorp_websocket_connect_raw",
-		"blorp_websocket_receive_raw",
-		"blorp_websocket_send_text_raw",
-		"blorp_websocket_send_binary_raw",
-		"blorp_websocket_send_ping_raw",
-		"blorp_websocket_send_pong_raw",
-		"blorp_websocket_send_close_raw",
-		"blorp_udp_send_to_wait_raw",
-		"blorp_udp_send_to_wait_numeric_raw",
-		"blorp_udp_recv_from_raw",
-	]
-
-
-private pure func compiler_cancellation_names() -> List[String]:
-	[
-		"yield_now",
-		"cancel_after_parked_for_test",
-		"cooperative_checkpoint_probe_for_test",
-		"tls_state_probe_for_test",
-	]
-
-
-private pure func compiler_os_worker_blocking_names() -> List[String]:
-	["blorp_dns_resolve_raw"]
-
-
-private pure func compiler_special_descriptors() -> List[CompilerBuiltinDescriptor]:
-	[
-		compiler_parallel_boundary_descriptor("parallel"),
-		compiler_special_descriptor("checked_get", CompilerCheckedGetInference),
-		compiler_special_descriptor("checked_set", CompilerCheckedSetInference),
-		compiler_special_descriptor("checked_slice", CompilerCheckedSliceInference),
-		compiler_special_descriptor("matrix_checked_get", CompilerMatrixCheckedGetInference),
-		compiler_special_descriptor("matrix_checked_set", CompilerMatrixCheckedSetInference),
-		compiler_special_descriptor("tensor3_checked_get", CompilerTensorCheckedGetInference(3)),
-		compiler_special_descriptor("tensor4_checked_get", CompilerTensorCheckedGetInference(4)),
-		compiler_special_descriptor("tensor5_checked_get", CompilerTensorCheckedGetInference(5)),
-		compiler_special_descriptor("tensor3_checked_set", CompilerTensorCheckedSetInference(3)),
-		compiler_special_descriptor("tensor4_checked_set", CompilerTensorCheckedSetInference(4)),
-		compiler_special_descriptor("tensor5_checked_set", CompilerTensorCheckedSetInference(5)),
-		compiler_special_descriptor("assert_shape", CompilerAssertShapeInference),
-		compiler_special_descriptor("length", CompilerLengthRefinedInference),
-		compiler_special_descriptor("vector_length", CompilerLengthRefinedInference),
-		compiler_special_descriptor("type_name", CompilerTypeNameInference),
-		compiler_special_descriptor("is_heap", CompilerIsHeapInference),
-		compiler_special_descriptor("vector", CompilerVectorCtorInference),
-		compiler_special_descriptor("matrix", CompilerMatrixCtorInference),
-		compiler_special_descriptor("tensor3", CompilerTensorCtorInference(3)),
-		compiler_special_descriptor("tensor4", CompilerTensorCtorInference(4)),
-		compiler_special_descriptor("tensor5", CompilerTensorCtorInference(5)),
-		compiler_special_descriptor("bit_and", CompilerBitwiseInference),
-		compiler_special_descriptor("bit_or", CompilerBitwiseInference),
-		compiler_special_descriptor("bit_xor", CompilerBitwiseInference),
-		compiler_special_descriptor("bit_not", CompilerBitwiseInference),
-		compiler_special_descriptor("shift_left", CompilerBitwiseInference),
-		compiler_special_descriptor("shift_right", CompilerBitwiseInference),
-	]
-
-
-pure func compiler_builtin_descriptors() -> List[CompilerBuiltinDescriptor]:
-	compiler_impure_names()
-		.map(compiler_impure_descriptor)
-		.concat(compiler_fiber_parking_names().map(compiler_fiber_parking_descriptor))
-		.concat(compiler_cancellation_names().map(compiler_cancellation_descriptor))
-		.concat(compiler_os_worker_blocking_names().map(compiler_os_worker_blocking_descriptor))
-		.concat(compiler_special_descriptors())
-
-
-pure func compiler_builtin_duplicate_names() -> List[String]:
-	var seen: List[String] = []
-	var duplicates: List[String] = []
-
-	for descriptor in compiler_builtin_descriptors():
-		if seen.contains(descriptor.name):
-			if not duplicates.contains(descriptor.name):
-				duplicates = duplicates.append(descriptor.name)
-		else:
-			seen = seen.append(descriptor.name)
-
-	duplicates.sort()
-
-
-private pure func compiler_descriptor_is_inert(descriptor: CompilerBuiltinDescriptor) -> Bool:
-	(
-		descriptor.runtime_effect == CompilerPureMetadata
-		and not descriptor.parallel_boundary
-		and descriptor.special_inference.is_none()
-	)
-
-
-pure func compiler_builtin_inert_descriptor_names() -> List[String]:
-	var result: List[String] = []
-
-	for descriptor in compiler_builtin_descriptors():
-		if compiler_descriptor_is_inert(descriptor):
-			result = result.append(descriptor.name)
-
-	result.sort()
-
-
-pure func compiler_builtin_find(name: String) -> Option[CompilerBuiltinDescriptor]:
-	var result: Option[CompilerBuiltinDescriptor] = None
-
-	for descriptor in compiler_builtin_descriptors():
-		if descriptor.name == name:
-			result = Some(descriptor)
-			break
-
-	result
+private pure func compiler_builtin_runtime_effect(name: String) -> CompilerRuntimeEffect:
+	match name:
+		"print":
+			CompilerImpureNonWaiting
+		"puts":
+			CompilerImpureNonWaiting
+		"print_error":
+			CompilerImpureNonWaiting
+		"read_file":
+			CompilerImpureNonWaiting
+		"write_file":
+			CompilerImpureNonWaiting
+		"read_bytes":
+			CompilerImpureNonWaiting
+		"write_bytes":
+			CompilerImpureNonWaiting
+		"file_exists":
+			CompilerImpureNonWaiting
+		"is_directory":
+			CompilerImpureNonWaiting
+		"exec":
+			CompilerImpureNonWaiting
+		"read_line":
+			CompilerImpureNonWaiting
+		"read_line_or_empty":
+			CompilerImpureNonWaiting
+		"read_all":
+			CompilerImpureNonWaiting
+		"input":
+			CompilerImpureNonWaiting
+		"input_or_empty":
+			CompilerImpureNonWaiting
+		"seed_random":
+			CompilerImpureNonWaiting
+		"random_int":
+			CompilerImpureNonWaiting
+		"random_float":
+			CompilerImpureNonWaiting
+		"read_all_lines":
+			CompilerImpureNonWaiting
+		"write_lines":
+			CompilerImpureNonWaiting
+		"append_file":
+			CompilerImpureNonWaiting
+		"for_each_line":
+			CompilerImpureNonWaiting
+		"getcwd":
+			CompilerImpureNonWaiting
+		"mkdir":
+			CompilerImpureNonWaiting
+		"remove_file":
+			CompilerImpureNonWaiting
+		"remove_dir":
+			CompilerImpureNonWaiting
+		"rename":
+			CompilerImpureNonWaiting
+		"exec_output":
+			CompilerImpureNonWaiting
+		"now":
+			CompilerImpureNonWaiting
+		"now_us":
+			CompilerImpureNonWaiting
+		"channel":
+			CompilerImpureNonWaiting
+		"seal":
+			CompilerImpureNonWaiting
+		"try_send":
+			CompilerImpureNonWaiting
+		"try_recv":
+			CompilerImpureNonWaiting
+		"try_send_attempt":
+			CompilerImpureNonWaiting
+		"try_recv_attempt":
+			CompilerImpureNonWaiting
+		"task_join_slot_probe_for_test":
+			CompilerImpureNonWaiting
+		"fiber_created_schedule_probe_for_test":
+			CompilerImpureNonWaiting
+		"timer_waiter_identity_probe_for_test":
+			CompilerImpureNonWaiting
+		"wait_ready_to_park_probe_for_test":
+			CompilerImpureNonWaiting
+		"fiber_lifecycle_ready_to_park_probe_for_test":
+			CompilerImpureNonWaiting
+		"fiber_cancel_before_park_probe_for_test":
+			CompilerImpureNonWaiting
+		"current_timer_wait_install_probe_for_test":
+			CompilerImpureNonWaiting
+		"timeout_arithmetic_probe_for_test":
+			CompilerImpureNonWaiting
+		"websocket_state_probe_for_test":
+			CompilerImpureNonWaiting
+		"getenv":
+			CompilerImpureNonWaiting
+		"setenv":
+			CompilerImpureNonWaiting
+		"init_window":
+			CompilerImpureNonWaiting
+		"close_window":
+			CompilerImpureNonWaiting
+		"window_should_close":
+			CompilerImpureNonWaiting
+		"set_target_fps":
+			CompilerImpureNonWaiting
+		"get_fps":
+			CompilerImpureNonWaiting
+		"begin_drawing":
+			CompilerImpureNonWaiting
+		"end_drawing":
+			CompilerImpureNonWaiting
+		"clear_background":
+			CompilerImpureNonWaiting
+		"draw_rectangle":
+			CompilerImpureNonWaiting
+		"draw_rectangle_rec":
+			CompilerImpureNonWaiting
+		"draw_circle":
+			CompilerImpureNonWaiting
+		"draw_line":
+			CompilerImpureNonWaiting
+		"draw_text":
+			CompilerImpureNonWaiting
+		"is_key_pressed":
+			CompilerImpureNonWaiting
+		"is_key_down":
+			CompilerImpureNonWaiting
+		"get_mouse_x":
+			CompilerImpureNonWaiting
+		"get_mouse_y":
+			CompilerImpureNonWaiting
+		"is_mouse_button_pressed":
+			CompilerImpureNonWaiting
+		"is_mouse_button_down":
+			CompilerImpureNonWaiting
+		"get_frame_time":
+			CompilerImpureNonWaiting
+		"get_time":
+			CompilerImpureNonWaiting
+		"blorp_dir_entries_raw":
+			CompilerImpureNonWaiting
+		"blorp_dir_open_raw":
+			CompilerImpureNonWaiting
+		"blorp_dir_read_entry_raw":
+			CompilerImpureNonWaiting
+		"blorp_dir_read_next_entries_raw":
+			CompilerImpureNonWaiting
+		"blorp_temporary_file_open_raw":
+			CompilerImpureNonWaiting
+		"blorp_temporary_directory_open_raw":
+			CompilerImpureNonWaiting
+		"blorp_file_write_text_atomic_raw":
+			CompilerImpureNonWaiting
+		"blorp_file_create_directories_raw":
+			CompilerImpureNonWaiting
+		"blorp_file_rename_path_raw":
+			CompilerImpureNonWaiting
+		"blorp_file_remove_directory_tree_raw":
+			CompilerImpureNonWaiting
+		"blorp_process_run_command_raw":
+			CompilerImpureNonWaiting
+		"blorp_tcp_listen":
+			CompilerImpureNonWaiting
+		"blorp_tcp_listen_loopback_raw":
+			CompilerImpureNonWaiting
+		"blorp_tcp_listen_any_interface_raw":
+			CompilerImpureNonWaiting
+		"blorp_tcp_listen_ip_raw":
+			CompilerImpureNonWaiting
+		"blorp_tcp_local_port_listener_raw":
+			CompilerImpureNonWaiting
+		"blorp_tcp_set_timeout_listener_raw":
+			CompilerImpureNonWaiting
+		"blorp_udp_bind_raw":
+			CompilerImpureNonWaiting
+		"blorp_udp_bind_numeric_raw":
+			CompilerImpureNonWaiting
+		"blorp_udp_send_to_raw":
+			CompilerImpureNonWaiting
+		"blorp_udp_send_to_numeric_raw":
+			CompilerImpureNonWaiting
+		"sleep":
+			CompilerFiberParkingWait
+		"send":
+			CompilerFiberParkingWait
+		"recv":
+			CompilerFiberParkingWait
+		"send_timeout":
+			CompilerFiberParkingWait
+		"recv_timeout":
+			CompilerFiberParkingWait
+		"send_timeout_attempt":
+			CompilerFiberParkingWait
+		"recv_timeout_attempt":
+			CompilerFiberParkingWait
+		"blorp_tcp_accept":
+			CompilerFiberParkingWait
+		"blorp_tcp_connect":
+			CompilerFiberParkingWait
+		"blorp_tcp_read":
+			CompilerFiberParkingWait
+		"blorp_tcp_write":
+			CompilerFiberParkingWait
+		"blorp_tcp_accept_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_connect_loopback_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_connect_ip_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_connect_scoped_ip_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_connect_name_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_read_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_write_raw":
+			CompilerFiberParkingWait
+		"blorp_tcp_write_all_raw":
+			CompilerFiberParkingWait
+		"blorp_tls_connect_raw":
+			CompilerFiberParkingWait
+		"blorp_tls_read_raw":
+			CompilerFiberParkingWait
+		"blorp_tls_write_raw":
+			CompilerFiberParkingWait
+		"blorp_tls_write_all_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_connect_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_receive_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_send_text_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_send_binary_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_send_ping_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_send_pong_raw":
+			CompilerFiberParkingWait
+		"blorp_websocket_send_close_raw":
+			CompilerFiberParkingWait
+		"blorp_udp_send_to_wait_raw":
+			CompilerFiberParkingWait
+		"blorp_udp_send_to_wait_numeric_raw":
+			CompilerFiberParkingWait
+		"blorp_udp_recv_from_raw":
+			CompilerFiberParkingWait
+		"yield_now":
+			CompilerCancellationCheckpoint
+		"cancel_after_parked_for_test":
+			CompilerCancellationCheckpoint
+		"cooperative_checkpoint_probe_for_test":
+			CompilerCancellationCheckpoint
+		"tls_state_probe_for_test":
+			CompilerCancellationCheckpoint
+		"blorp_dns_resolve_raw":
+			CompilerOsWorkerBlockingWait
+		_:
+			CompilerNoRuntimeEffect
 
 
 pure func compiler_builtin_is_registered(name: String) -> Bool:
-	compiler_builtin_find(name).is_some()
+	(
+		compiler_builtin_runtime_effect(name) != CompilerNoRuntimeEffect
+		or compiler_builtin_is_parallel_boundary(name)
+		or compiler_builtin_special_inference(name).is_some()
+	)
 
 
 pure func compiler_builtin_has_effect(name: String, effect: CompilerBuiltinEffect) -> Bool:
-	match compiler_builtin_find(name):
-		Some(descriptor):
-			match effect:
-				CompilerBuiltinImpure:
-					descriptor.runtime_effect != CompilerPureMetadata
-				CompilerBuiltinParallelBoundary:
-					descriptor.parallel_boundary
-				CompilerBuiltinCancellationPoint:
-					(
-						descriptor.runtime_effect == CompilerCancellationCheckpoint
-						or descriptor.runtime_effect == CompilerFiberParkingWait
-					)
-				CompilerBuiltinFiberParking:
-					descriptor.runtime_effect == CompilerFiberParkingWait
-				CompilerBuiltinOsWorkerBlocking:
-					descriptor.runtime_effect == CompilerOsWorkerBlockingWait
-		None:
-			False
+	runtime_effect = compiler_builtin_runtime_effect(name)
+
+	match effect:
+		CompilerBuiltinImpure:
+			runtime_effect != CompilerNoRuntimeEffect
+		CompilerBuiltinParallelBoundary:
+			compiler_builtin_is_parallel_boundary(name)
+		CompilerBuiltinCancellationPoint:
+			(
+				runtime_effect == CompilerCancellationCheckpoint
+				or runtime_effect == CompilerFiberParkingWait
+			)
+		CompilerBuiltinFiberParking:
+			runtime_effect == CompilerFiberParkingWait
+		CompilerBuiltinOsWorkerBlocking:
+			runtime_effect == CompilerOsWorkerBlockingWait
 
 
 pure func compiler_builtin_is_impure(name: String) -> Bool:
-	compiler_builtin_has_effect(name, CompilerBuiltinImpure)
+	compiler_builtin_runtime_effect(name) != CompilerNoRuntimeEffect
 
 
 pure func compiler_builtin_is_parallel_boundary(name: String) -> Bool:
-	compiler_builtin_has_effect(name, CompilerBuiltinParallelBoundary)
+	name == "parallel"
 
 
 pure func compiler_builtin_is_cancellation_point(name: String) -> Bool:
@@ -407,10 +402,62 @@ pure func compiler_builtin_is_os_worker_blocking(name: String) -> Bool:
 
 
 pure func compiler_builtin_special_inference(name: String) -> Option[CompilerSpecialInference]:
-	match compiler_builtin_find(name):
-		Some(descriptor):
-			descriptor.special_inference
-		None:
+	match name:
+		"checked_get":
+			Some(CompilerCheckedGetInference)
+		"checked_set":
+			Some(CompilerCheckedSetInference)
+		"checked_slice":
+			Some(CompilerCheckedSliceInference)
+		"matrix_checked_get":
+			Some(CompilerMatrixCheckedGetInference)
+		"matrix_checked_set":
+			Some(CompilerMatrixCheckedSetInference)
+		"tensor3_checked_get":
+			Some(CompilerTensorCheckedGetInference(3))
+		"tensor4_checked_get":
+			Some(CompilerTensorCheckedGetInference(4))
+		"tensor5_checked_get":
+			Some(CompilerTensorCheckedGetInference(5))
+		"tensor3_checked_set":
+			Some(CompilerTensorCheckedSetInference(3))
+		"tensor4_checked_set":
+			Some(CompilerTensorCheckedSetInference(4))
+		"tensor5_checked_set":
+			Some(CompilerTensorCheckedSetInference(5))
+		"assert_shape":
+			Some(CompilerAssertShapeInference)
+		"length":
+			Some(CompilerLengthRefinedInference)
+		"vector_length":
+			Some(CompilerLengthRefinedInference)
+		"type_name":
+			Some(CompilerTypeNameInference)
+		"is_heap":
+			Some(CompilerIsHeapInference)
+		"vector":
+			Some(CompilerVectorCtorInference)
+		"matrix":
+			Some(CompilerMatrixCtorInference)
+		"tensor3":
+			Some(CompilerTensorCtorInference(3))
+		"tensor4":
+			Some(CompilerTensorCtorInference(4))
+		"tensor5":
+			Some(CompilerTensorCtorInference(5))
+		"bit_and":
+			Some(CompilerBitwiseInference)
+		"bit_or":
+			Some(CompilerBitwiseInference)
+		"bit_xor":
+			Some(CompilerBitwiseInference)
+		"bit_not":
+			Some(CompilerBitwiseInference)
+		"shift_left":
+			Some(CompilerBitwiseInference)
+		"shift_right":
+			Some(CompilerBitwiseInference)
+		_:
 			None
 
 
@@ -467,6 +514,34 @@ private pure func compiler_add_builtin_generic_func(
 			)
 
 
+private pure func compiler_add_loop_producer_builtin(
+	env: CompilerEnv,
+	name: String,
+	type_params: List[String],
+	func_type: CompilerType,
+	loop_producer: CompilerLoopProducer,
+) -> CompilerEnv:
+	match compiler_env_mint_def_id(env):
+		(next_env, def_id):
+			compiler_env_add_func_with_info(
+				next_env,
+				name,
+				compiler_func_symbol(
+					def_id,
+					func_type,
+					type_params.map(func(param): compiler_make_bound_type_param(param, [])),
+					[],
+					builtin_purity(name),
+					CompilerBuiltinFunc,
+					CompilerRejectResourceArgs,
+					None,
+					[],
+					Some(loop_producer),
+					False,
+				),
+			)
+
+
 private pure func compiler_add_scalar_conversion_builtin(
 	env: CompilerEnv,
 	name: String,
@@ -491,9 +566,9 @@ private pure func compiler_add_tensor_constructor_builtin(
 		name,
 		["T"].concat(dim_names),
 		fn_type(
-			[CompilerTypeVar("T")].concat(
-				dim_names.map(func(_): compiler_type_int()),
-			),
+			[CompilerTypeVar("T")].concat(dim_names.map(
+				func(_): compiler_type_int(),
+			)),
 			CompilerArrayType(CompilerTypeVar("T"), dims),
 		),
 	)
@@ -509,6 +584,25 @@ private pure func compiler_add_checked_read_builtin(
 	for _ in 0..index_count:
 		params = params.append(compiler_type_int())
 
+	compiler_add_builtin_generic_func(
+		env,
+		name,
+		["T"],
+		fn_type(params, CompilerTypeVar("T")),
+	)
+
+
+private pure func compiler_add_checked_write_builtin(
+	env: CompilerEnv,
+	name: String,
+	index_count: Int,
+) -> CompilerEnv:
+	var params: List[CompilerType] = [CompilerTypeVar("T")]
+
+	for _ in 0..index_count:
+		params = params.append(compiler_type_int())
+
+	params = params.append(CompilerTypeVar("T"))
 	compiler_add_builtin_generic_func(
 		env,
 		name,
@@ -664,54 +758,139 @@ private pure func add_core_builtin_types(env: CompilerEnv) -> CompilerEnv:
 	result
 
 
+pure func compiler_builtin_trait_is_prelude(trait_name: String) -> Bool:
+	-- These traits own callable names installed directly into the compiler
+	-- prelude below. Source loading may replace their declarations with the
+	-- equivalent std/traits definitions, so module ownership is not a stable
+	-- way to identify prelude visibility.
+	match trait_name:
+		"Absolute":
+			True
+		"Bounded":
+			True
+		"Equatable":
+			True
+		"FixedPoint":
+			True
+		"FloatingPoint":
+			True
+		"Hashable":
+			True
+		"HasLength":
+			True
+		"Integer":
+			True
+		"Orderable":
+			True
+		"Stringable":
+			True
+		"ToFloat":
+			True
+		"ToInt":
+			True
+		_:
+			False
+
+
+private pure func builtin_unary_self_method(
+	name: String,
+	return_type: CompilerType,
+) -> CompilerTraitMethodSig:
+	compiler_trait_method_sig(name, [CompilerSelfType], return_type, True)
+
+
+private pure func builtin_binary_self_method(
+	name: String,
+	return_type: CompilerType,
+) -> CompilerTraitMethodSig:
+	compiler_trait_method_sig(
+		name,
+		[CompilerSelfType, CompilerSelfType],
+		return_type,
+		True,
+	)
+
+
 private pure func add_core_builtin_traits(env: CompilerEnv) -> CompilerEnv:
 	var result: CompilerEnv = env
-	stringable_methods: List[CompilerTraitMethodSig] = [
-		compiler_trait_method_sig("to_string", [CompilerSelfType], compiler_type_string(), True),
-	]
-	equatable_methods: List[CompilerTraitMethodSig] = [
-		compiler_trait_method_sig(
-			"equals",
-			[CompilerSelfType, CompilerSelfType],
-			compiler_type_bool(),
-			True,
-		),
-	]
-	orderable_methods: List[CompilerTraitMethodSig] = [
-		compiler_trait_method_sig(
-			"less_than",
-			[CompilerSelfType, CompilerSelfType],
-			compiler_type_bool(),
-			True,
-		),
-	]
-	has_length_methods: List[CompilerTraitMethodSig] = [
-		compiler_trait_method_sig("length", [CompilerSelfType], compiler_type_int(), True),
-	]
+	option_self = CompilerNamedType("Option", [CompilerSelfType])
+	fixed_type = CompilerNamedType("Fixed", [])
 
 	result = compiler_env_add_trait(
 		result,
-		compiler_trait_def(100, "Stringable", [], stringable_methods),
+		compiler_trait_def(
+			100,
+			"Stringable",
+			[],
+			[builtin_unary_self_method("to_string", compiler_type_string())],
+		),
 	)
 	result = compiler_env_add_trait(
 		result,
-		compiler_trait_def(101, "Equatable", [], equatable_methods),
+		compiler_trait_def(
+			101,
+			"Equatable",
+			[],
+			[builtin_binary_self_method("equals", compiler_type_bool())],
+		),
 	)
 	result = compiler_env_add_trait(
 		result,
-		compiler_trait_def(102, "Orderable", ["Equatable"], orderable_methods),
+		compiler_trait_def(
+			102,
+			"Orderable",
+			["Equatable"],
+			[builtin_binary_self_method("less_than", compiler_type_bool())],
+		),
 	)
 	result = compiler_env_add_trait(
 		result,
-		compiler_trait_def(103, "HasLength", [], has_length_methods),
+		compiler_trait_def(
+			103,
+			"HasLength",
+			[],
+			[builtin_unary_self_method("length", compiler_type_int())],
+		),
 	)
 	result = compiler_env_add_trait(
 		result,
 		compiler_trait_def(
 			104,
 			"Integer",
-			["Stringable", "Equatable"],
-			[],
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Modulable",
+				"Orderable",
+				"HasZero",
+				"HasOne",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+				"ToInt",
+			],
+			[
+				builtin_binary_self_method("checked_div", option_self),
+				builtin_binary_self_method("checked_mod", option_self),
+				builtin_binary_self_method("bit_and", CompilerSelfType),
+				builtin_binary_self_method("bit_or", CompilerSelfType),
+				builtin_binary_self_method("bit_xor", CompilerSelfType),
+				builtin_unary_self_method("bit_not", CompilerSelfType),
+				compiler_trait_method_sig(
+					"shift_left",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+				compiler_trait_method_sig(
+					"shift_right",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+			],
 		),
 	)
 	result = compiler_env_add_trait(
@@ -719,21 +898,399 @@ private pure func add_core_builtin_traits(env: CompilerEnv) -> CompilerEnv:
 		compiler_trait_def(
 			105,
 			"FloatingPoint",
-			["Stringable", "Equatable"],
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Negatable",
+				"Orderable",
+				"HasZero",
+				"HasOne",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+				"ToFloat",
+			],
+			[
+				builtin_unary_self_method("floor", CompilerSelfType),
+				builtin_unary_self_method("ceil", CompilerSelfType),
+				builtin_unary_self_method("round", CompilerSelfType),
+				builtin_unary_self_method("trunc", CompilerSelfType),
+				builtin_unary_self_method("sqrt", CompilerSelfType),
+				builtin_unary_self_method("sin", CompilerSelfType),
+				builtin_unary_self_method("cos", CompilerSelfType),
+				builtin_unary_self_method("tan", CompilerSelfType),
+				builtin_unary_self_method("asin", CompilerSelfType),
+				builtin_unary_self_method("acos", CompilerSelfType),
+				builtin_unary_self_method("atan", CompilerSelfType),
+				builtin_binary_self_method("atan2", CompilerSelfType),
+				builtin_unary_self_method("sinh", CompilerSelfType),
+				builtin_unary_self_method("cosh", CompilerSelfType),
+				builtin_unary_self_method("tanh", CompilerSelfType),
+				builtin_unary_self_method("asinh", CompilerSelfType),
+				builtin_unary_self_method("acosh", CompilerSelfType),
+				builtin_unary_self_method("atanh", CompilerSelfType),
+				builtin_unary_self_method("exp", CompilerSelfType),
+				builtin_unary_self_method("exp2", CompilerSelfType),
+				builtin_unary_self_method("expm1", CompilerSelfType),
+				builtin_unary_self_method("log", CompilerSelfType),
+				builtin_unary_self_method("log2", CompilerSelfType),
+				builtin_unary_self_method("log10", CompilerSelfType),
+				builtin_unary_self_method("log1p", CompilerSelfType),
+				builtin_binary_self_method("pow", CompilerSelfType),
+				builtin_unary_self_method("cbrt", CompilerSelfType),
+				builtin_binary_self_method("hypot", CompilerSelfType),
+				builtin_binary_self_method("fmod", CompilerSelfType),
+				builtin_binary_self_method("copysign", CompilerSelfType),
+				compiler_trait_method_sig(
+					"fma",
+					[CompilerSelfType, CompilerSelfType, CompilerSelfType],
+					CompilerSelfType,
+					True,
+				),
+				builtin_unary_self_method("is_nan", compiler_type_bool()),
+				builtin_unary_self_method("is_inf", compiler_type_bool()),
+				builtin_unary_self_method("is_finite", compiler_type_bool()),
+			],
+		),
+	)
+
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			106,
+			"Addable",
+			[],
+			[builtin_binary_self_method("add", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			107,
+			"Subtractable",
+			[],
+			[builtin_binary_self_method("subtract", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			108,
+			"Multipliable",
+			[],
+			[builtin_binary_self_method("multiply", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			109,
+			"Divisible",
+			[],
+			[builtin_binary_self_method("divide", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			110,
+			"Modulable",
+			[],
+			[builtin_binary_self_method("remainder", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			111,
+			"Negatable",
+			[],
+			[builtin_unary_self_method("negate", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			112,
+			"HasZero",
+			[],
+			[compiler_trait_method_sig("zero", [], CompilerSelfType, True)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			113,
+			"HasOne",
+			[],
+			[compiler_trait_method_sig("one", [], CompilerSelfType, True)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			114,
+			"Absolute",
+			[],
+			[builtin_unary_self_method("abs", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			115,
+			"Bounded",
+			[],
+			[
+				builtin_binary_self_method("min", CompilerSelfType),
+				builtin_binary_self_method("max", CompilerSelfType),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			116,
+			"Hashable",
+			["Equatable"],
+			[builtin_unary_self_method("hash", compiler_type_int())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			117,
+			"ToBool",
+			[],
+			[builtin_unary_self_method("to_bool", compiler_type_bool())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			118,
+			"Logical",
+			[],
+			[
+				builtin_binary_self_method("logical_and", CompilerSelfType),
+				builtin_binary_self_method("logical_or", CompilerSelfType),
+				builtin_unary_self_method("logical_not", CompilerSelfType),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			119,
+			"ToInt",
+			[],
+			[builtin_unary_self_method("to_int", compiler_type_int())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			120,
+			"ToFloat",
+			[],
+			[builtin_unary_self_method("to_float", compiler_type_float())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(121, "ToFixed", [], [builtin_unary_self_method("to_fixed", fixed_type)]),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			122,
+			"ToChar",
+			[],
+			[builtin_unary_self_method("to_char", compiler_type_char())],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			123,
+			"SignedInteger",
+			["Integer", "Negatable"],
 			[],
 		),
 	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(124, "UnsignedInteger", ["Integer"], []),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			125,
+			"Numeric",
+			["Addable", "Multipliable", "HasZero"],
+			[],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			126,
+			"FixedPoint",
+			[
+				"Addable",
+				"Subtractable",
+				"Multipliable",
+				"Divisible",
+				"Orderable",
+				"HasZero",
+				"Stringable",
+				"Absolute",
+				"Bounded",
+			],
+			[
+				builtin_unary_self_method("get_scale", compiler_type_int()),
+				compiler_trait_method_sig(
+					"round_to",
+					[CompilerSelfType, compiler_type_int()],
+					CompilerSelfType,
+					True,
+				),
+			],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			127,
+			"Copyable",
+			[],
+			[builtin_unary_self_method("copy", CompilerSelfType)],
+		),
+	)
+	result = compiler_env_add_trait(
+		result,
+		compiler_trait_def(
+			128,
+			"Cloneable",
+			[],
+			[compiler_trait_method_sig("clone", [CompilerSelfType], CompilerSelfType, False)],
+		),
+	)
+
+	for name in [
+		"checked_div",
+		"checked_mod",
+		"bit_and",
+		"bit_or",
+		"bit_xor",
+		"bit_not",
+		"shift_left",
+		"shift_right",
+	]:
+		result = compiler_env_add_trait_function(result, name, "Integer")
+
+	for name in [
+		"floor",
+		"ceil",
+		"round",
+		"trunc",
+		"sqrt",
+		"sin",
+		"cos",
+		"tan",
+		"asin",
+		"acos",
+		"atan",
+		"atan2",
+		"sinh",
+		"cosh",
+		"tanh",
+		"asinh",
+		"acosh",
+		"atanh",
+		"exp",
+		"exp2",
+		"expm1",
+		"log",
+		"log2",
+		"log10",
+		"log1p",
+		"pow",
+		"cbrt",
+		"hypot",
+		"fmod",
+		"copysign",
+		"fma",
+		"is_nan",
+		"is_inf",
+		"is_finite",
+	]:
+		result = compiler_env_add_trait_function(result, name, "FloatingPoint")
+
 	result = compiler_env_add_trait_function(result, "to_string", "Stringable")
 	result = compiler_env_add_trait_function(result, "equals", "Equatable")
 	result = compiler_env_add_trait_function(result, "less_than", "Orderable")
 	result = compiler_env_add_trait_function(result, "length", "HasLength")
 	result = compiler_env_add_trait_function(result, "to_int", "ToInt")
 	result = compiler_env_add_trait_function(result, "to_float", "ToFloat")
+	result = compiler_env_add_trait_function(result, "abs", "Absolute")
+	result = compiler_env_add_trait_function(result, "min", "Bounded")
+	result = compiler_env_add_trait_function(result, "max", "Bounded")
+	result = compiler_env_add_trait_function(result, "get_scale", "FixedPoint")
+	result = compiler_env_add_trait_function(result, "round_to", "FixedPoint")
+	result = compiler_env_add_trait_function(result, "hash", "Hashable")
 	result = compiler_add_builtin_impl(result, "Integer", compiler_type_int())
-	result = compiler_add_builtin_impl(result, "FloatingPoint", compiler_type_float())
+	result = compiler_add_builtin_impl(result, "SignedInteger", compiler_type_int())
+
+	for name in ["Int8", "Int16", "Int32", "Int128"]:
+		typ = CompilerNamedType(name, [])
+		result = compiler_add_builtin_impl(result, "Integer", typ)
+		result = compiler_add_builtin_impl(result, "SignedInteger", typ)
+
+	for name in ["UInt8", "UInt16", "UInt32", "UInt64", "UInt128"]:
+		typ = CompilerNamedType(name, [])
+		result = compiler_add_builtin_impl(result, "Integer", typ)
+		result = compiler_add_builtin_impl(result, "UnsignedInteger", typ)
+
+	for name in ["Float", "Float32", "Float16"]:
+		result = compiler_add_builtin_impl(
+			result,
+			"FloatingPoint",
+			CompilerNamedType(name, []),
+		)
+
+	result = compiler_add_builtin_impl(result, "FixedPoint", fixed_type)
 	result = compiler_add_builtin_impl(result, "Stringable", compiler_type_string())
 	result = compiler_add_builtin_impl(result, "Equatable", compiler_type_string())
 	result = compiler_add_builtin_impl(result, "Equatable", compiler_type_bool())
+
+	for name in [
+		"Int",
+		"Int8",
+		"Int16",
+		"Int32",
+		"Int64",
+		"Int128",
+		"UInt8",
+		"UInt16",
+		"UInt32",
+		"UInt64",
+		"UInt128",
+		"Float",
+		"Float32",
+		"Float16",
+		"Bool",
+		"Char",
+		"String",
+	]:
+		result = compiler_add_builtin_impl(
+			result,
+			"Hashable",
+			CompilerNamedType(name, []),
+		)
+
 	result = compiler_add_builtin_impl(result, "Orderable", compiler_type_string())
 	result = compiler_add_builtin_impl(result, "Orderable", compiler_type_int())
 	result = compiler_add_builtin_impl(result, "Orderable", compiler_type_float())
@@ -746,6 +1303,27 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 	list_of_t: CompilerType = CompilerNamedType("List", [CompilerTypeVar("T")])
 	channel_of_t: CompilerType = CompilerNamedType("Channel", [CompilerTypeVar("T")])
 	option_of_t: CompilerType = CompilerNamedType("Option", [CompilerTypeVar("T")])
+	variadic_tensor_of_t: CompilerType = CompilerArrayType(
+		CompilerTypeVar("T"),
+		[CompilerVarDimsType("#Ds")],
+	)
+	char_type: CompilerType = compiler_type_char()
+	fixed_type: CompilerType = CompilerNamedType("Fixed", [])
+	any_type: CompilerType = CompilerNamedType("Any", [])
+
+	result = compiler_add_builtin_func(
+		result,
+		"hash",
+		fn_type([any_type], compiler_type_int()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"hash_combine",
+		fn_type(
+			[compiler_type_int(), compiler_type_int()],
+			compiler_type_int(),
+		),
+	)
 
 	result = compiler_add_builtin_generic_func(
 		result,
@@ -776,6 +1354,24 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		"to_char",
 		["T"],
 		fn_type([CompilerTypeVar("T")], compiler_type_char()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"from_char",
+		fn_type([char_type], compiler_type_string()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"from_chars",
+		fn_type([CompilerNamedType("List", [char_type])], compiler_type_string()),
+	)
+	result = compiler_add_builtin_func(
+		result,
+		"fixed",
+		fn_type(
+			[compiler_type_float(), compiler_type_int()],
+			fixed_type,
+		),
 	)
 
 	for (name, result_type) in [
@@ -865,7 +1461,10 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 			name,
 			fn_type(
 				[compiler_type_int(), compiler_type_int()],
-				CompilerNamedType("Option", [compiler_type_int()]),
+				CompilerNamedType(
+					"Option",
+					[compiler_type_int()],
+				),
 			),
 		)
 
@@ -905,16 +1504,45 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 		),
 	)
 
+	result = compiler_add_builtin_generic_func(
+		result,
+		"tensor_peel",
+		["T"],
+		fn_type(
+			[CompilerTypeVar("T"), compiler_type_int()],
+			CompilerTypeVar("T"),
+		),
+	)
+	result = compiler_add_checked_write_builtin(result, "checked_set", 1)
+	result = compiler_add_builtin_generic_func(
+		result,
+		"checked_slice",
+		["T"],
+		fn_type(
+			[CompilerTypeVar("T"), compiler_type_int(), compiler_type_int()],
+			CompilerTypeVar("T"),
+		),
+	)
 	result = compiler_add_checked_read_builtin(result, "matrix_checked_get", 2)
+	result = compiler_add_checked_write_builtin(result, "matrix_checked_set", 2)
 	result = compiler_add_checked_read_builtin(result, "tensor3_checked_get", 3)
+	result = compiler_add_checked_write_builtin(result, "tensor3_checked_set", 3)
 	result = compiler_add_checked_read_builtin(result, "tensor4_checked_get", 4)
+	result = compiler_add_checked_write_builtin(result, "tensor4_checked_set", 4)
 	result = compiler_add_checked_read_builtin(result, "tensor5_checked_get", 5)
+	result = compiler_add_checked_write_builtin(result, "tensor5_checked_set", 5)
 
 	result = compiler_add_builtin_generic_func(
 		result,
 		"assert_shape",
 		["T"],
-		fn_type([list_of_t], compiler_type_bool()),
+		fn_type(
+			[variadic_tensor_of_t, compiler_type_int()],
+			CompilerNamedType(
+				"Option",
+				[variadic_tensor_of_t],
+			),
+		),
 	)
 	result = compiler_add_builtin_generic_func(
 		result,
@@ -941,36 +1569,98 @@ private pure func add_core_builtin_functions(env: CompilerEnv) -> CompilerEnv:
 	)
 	result = compiler_add_resource_builtin_generic_func(
 		result,
+		"try_send",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, CompilerTypeVar("T")],
+			compiler_type_bool(),
+		),
+		CompilerResourceResultOrdinary,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"try_recv",
+		["T"],
+		impure_fn_type([channel_of_t], option_of_t),
+		CompilerResourceResultDependent,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"recv_timeout",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, compiler_type_int()],
+			option_of_t,
+		),
+		CompilerResourceResultDependent,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
+		"send_timeout",
+		["T"],
+		impure_fn_type(
+			[channel_of_t, CompilerTypeVar("T"), compiler_type_int()],
+			compiler_type_bool(),
+		),
+		CompilerResourceResultOrdinary,
+	)
+	result = compiler_add_resource_builtin_generic_func(
+		result,
 		"seal",
 		["T"],
 		impure_fn_type([channel_of_t], compiler_type_void()),
 		CompilerResourceResultOrdinary,
 	)
+	result = compiler_add_builtin_func(
+		result,
+		"max_threads",
+		fn_type([], compiler_type_int()),
+	)
 
-	match compiler_env_mint_def_id(result):
-		(next_env, def_id):
-			compiler_env_add_func_with_info(
-				next_env,
-				"windows",
-				compiler_func_symbol(
-					def_id,
-					fn_type(
-						[list_of_t, compiler_type_int()],
-						list_of_t,
-					),
-					["T"].map(
-						func(param): compiler_make_bound_type_param(param, []),
-					),
-					[],
-					CompilerPure,
-					CompilerBuiltinFunc,
-					CompilerRejectResourceArgs,
-					None,
-					[],
-					Some(CompilerLoopProducerWindows),
-					False,
-				),
-			)
+	matrix_of_t: CompilerType = CompilerArrayType(
+		CompilerTypeVar("T"),
+		[CompilerTypeVar("#M"), CompilerTypeVar("#N")],
+	)
+	result = compiler_add_loop_producer_builtin(
+		result,
+		"enumerate2",
+		["T", "#M", "#N"],
+		fn_type(
+			[matrix_of_t],
+			CompilerNamedType("List", [CompilerTupleType([
+						compiler_type_int(),
+						compiler_type_int(),
+						CompilerTypeVar("T"),
+					])]),
+		),
+		CompilerLoopProducerEnumerate2,
+	)
+	result = compiler_add_builtin_generic_func(
+		result,
+		"zip",
+		["T", "U", "#N"],
+		fn_type(
+			[
+				CompilerArrayType(CompilerTypeVar("T"), [CompilerTypeVar("#N")]),
+				CompilerArrayType(CompilerTypeVar("U"), [CompilerTypeVar("#N")]),
+			],
+			CompilerArrayType(
+				CompilerTupleType([CompilerTypeVar("T"), CompilerTypeVar("U")]),
+				[CompilerTypeVar("#N")],
+			),
+		),
+	)
+
+	compiler_add_loop_producer_builtin(
+		result,
+		"windows",
+		["T"],
+		fn_type(
+			[list_of_t, compiler_type_int()],
+			list_of_t,
+		),
+		CompilerLoopProducerWindows,
+	)
 
 
 pure func compiler_env_with_builtins(env: CompilerEnv) -> CompilerEnv:

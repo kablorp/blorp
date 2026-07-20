@@ -187,18 +187,6 @@ let parsed_ast_artifact ?(ast_phase = "raw_parse") ?comments ?module_surface
   in
   Lsp_json.Object fields
 
-let check_options_json paths =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "check");
-      ("dump_ast", Lsp_json.Bool false);
-      ("dump_typed_ast", Lsp_json.Bool false);
-      ("debug", Lsp_json.Bool false);
-      ("no_format", Lsp_json.Bool true);
-      ("std_dir", Lsp_json.Null);
-      ("paths", string_array paths);
-    ]
-
 let compile_options_json files =
   Lsp_json.Object
     [
@@ -514,6 +502,27 @@ let test_cli_run_request_can_include_version_context () =
       Alcotest.(check string) "version" "blorp test"
         (string_field "version" payload)
   | _ -> Alcotest.fail "expected CLI args in payload"
+
+let test_cli_run_request_can_include_source_override () =
+  let open Blorp.Compiler_blorp_bridge in
+  let request =
+    cli_run_request_json
+      ~source:
+        {
+          cli_source_path = "generated/suite.brp";
+          cli_source_module_name = "suite";
+          cli_source_text = "func main(args: List[String]) -> Int: 0\n";
+        }
+      [ "compile"; "--no-format"; "generated/suite.brp" ]
+    |> parse_json_exn
+  in
+  let source = field "source" (field "payload" request) in
+  Alcotest.(check string)
+    "source path" "generated/suite.brp" (string_field "path" source);
+  Alcotest.(check string) "source module" "suite" (string_field "module" source);
+  Alcotest.(check string)
+    "source text" "func main(args: List[String]) -> Int: 0\n"
+    (string_field "text" source)
 
 let test_parse_source_response_decodes_parsed_ast_artifact () =
   let response = bridge_success_json (parsed_ast_artifact (parsed_program_json [])) in
@@ -1057,11 +1066,9 @@ let test_cli_run_response_decodes_frontend_module_graph () =
   | Ok
       (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
         {
-          cli_frontend_graph_command = Blorp.Compiler_blorp_bridge.CliFrontendCompile;
           cli_frontend_graph_args = [ "compile"; "--no-format"; "src/main.brp" ];
-          cli_frontend_graph_options =
-            Blorp.Compiler_blorp_bridge.CliFrontendCompileOptions
-              { cli_compile_files = [ "src/main.brp" ]; _ };
+          cli_frontend_graph_compile_options =
+            { cli_compile_files = [ "src/main.brp" ]; _ };
           cli_frontend_graph_context =
             {
               cli_frontend_context_std_dir = Some "custom-std";
@@ -1113,6 +1120,29 @@ let test_cli_run_response_decodes_frontend_module_graph () =
       ()
   | Ok _ -> Alcotest.fail "expected decoded frontend module graph"
   | Error (_, message) -> Alcotest.fail message
+
+let test_cli_run_response_rejects_source_run_frontend_graph () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "run");
+           ("args", string_array [ "run"; "src/main.brp" ]);
+           ("options", compile_options_json [ "src/main.brp" ]);
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [ frontend_graph_source "src/main.brp" "main" "func main(): 0" ]
+           );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  Blorp.Compiler_blorp_bridge.cli_run_response_json response
+  |> expect_invalid_response_contains
+       "unsupported CLI frontend command `run`"
 
 let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
   let response =
@@ -1211,10 +1241,10 @@ let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "frontend_options");
-           ("command", Lsp_json.String "check");
+           ("command", Lsp_json.String "compile");
            ( "args",
-             string_array [ "check"; "--no-format"; "a.brp"; "b.brp" ] );
-           ("options", check_options_json [ "a.brp"; "b.brp" ]);
+             string_array [ "compile"; "--no-format"; "a.brp" ] );
+           ("options", compile_options_json [ "a.brp" ]);
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
@@ -1341,9 +1371,9 @@ let test_cli_run_response_rejects_mismatched_frontend_args () =
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "check");
-           ("args", string_array [ "compile"; "a.brp" ]);
-           ("options", check_options_json [ "a.brp" ]);
+           ("command", Lsp_json.String "compile");
+           ("args", string_array [ "run"; "a.brp" ]);
+           ("options", compile_options_json [ "a.brp" ]);
            ("context", frontend_graph_context_json ());
            ( "roots",
              Lsp_json.Array
@@ -1357,7 +1387,7 @@ let test_cli_run_response_rejects_mismatched_frontend_args () =
          ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "expected `check`"
+  |> expect_invalid_response_contains "expected `compile`"
 
 let test_cli_run_response_rejects_mismatched_repl_args () =
   let response =
@@ -1708,6 +1738,8 @@ let suite =
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
           test_cli_run_request_can_include_version_context;
+        Alcotest.test_case "CLI run request can include source override" `Quick
+          test_cli_run_request_can_include_source_override;
         Alcotest.test_case "parse_source response decodes parsed AST artifact"
           `Quick test_parse_source_response_decodes_parsed_ast_artifact;
         Alcotest.test_case "parse_source response decodes comments" `Quick
@@ -1742,6 +1774,8 @@ let suite =
           test_cli_run_response_decodes_test_options;
         Alcotest.test_case "CLI run response decodes frontend module graph"
           `Quick test_cli_run_response_decodes_frontend_module_graph;
+        Alcotest.test_case "CLI run response rejects source run frontend graph"
+          `Quick test_cli_run_response_rejects_source_run_frontend_graph;
         Alcotest.test_case
           "CLI run response rejects frontend graph missing resolved target" `Quick
           test_cli_run_response_rejects_frontend_graph_missing_resolved_target;

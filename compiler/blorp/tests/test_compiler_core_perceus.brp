@@ -1,4 +1,5 @@
 import:
+	../src/stage_09_core/compiler_core_consume_specialize as CoreConsumeSpecialize
 	../src/stage_09_core/compiler_core_json:
 		CoreAccessor(ListSpreadAccessor, RootAccessor, VariantFieldAccessor),
 		CoreBinaryOp(AddOp, EqualOp),
@@ -16,30 +17,42 @@ import:
 			ConstructorMatchBodyLiteral,
 		),
 		CoreConstructorMatchCase,
-		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
 		CoreConstructorMatchTest(EnumConstructorTest, UnionTagConstructorTest),
-		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
 			BorrowLetExpr,
 			CallExpr,
+			ClosureCreateExpr,
+			DetachExpr,
 			PreClosureConcurrentExpr,
 			ConstructorMatchExpr,
 			DropExpr,
 			DupExpr,
 			FieldExpr,
+			ForRangeExpr,
 			ForListExpr,
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
 			ListRetainExpr,
 			ListSetExpr,
+			LengthMatchExpr,
 			LiteralExpr,
 			RecordConstructExpr,
 			ResourceScopeExpr,
+			SelectExpr,
 			SeqExpr,
+			TensorPackedLiteralExpr,
+			TensorRawReadExpr,
 			TupleExpr,
+			UnaryExpr,
 			UnboxExpr,
 			VarExpr,
 			VoidExpr,
@@ -48,7 +61,7 @@ import:
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(PointerListStorage),
-		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -63,7 +76,11 @@ import:
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy),
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
 		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTaskCaptureKind(TaskCopyCapture),
+		CoreTensorLiteralShape(TensorVectorLength),
+		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreType(
 			BoxedResultType,
 			HeapRecordType,
@@ -74,6 +91,7 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
+		CoreUnaryOp(NotOp),
 		CoreUnboxKind(PointerUnbox),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
@@ -93,6 +111,7 @@ import:
 	../src/stage_09_core/compiler_core_perceus:
 		PerceusEnv,
 		borrow_contract_for_signature,
+		borrowed_result_aliases_param,
 		build_env,
 		contract_for_call,
 		count_uses,
@@ -122,6 +141,18 @@ pure func core_param(name: String, typ: CoreType) -> CoreParam:
 	}
 
 
+pure func core_param_with_id(name: String, def_id: Int, typ: CoreType) -> CoreParam:
+	{
+		name = {
+			name = name,
+			uniq = 0,
+			def_id = Some(def_id)
+		},
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func function_decl(
 	name: String,
 	def_id: Int,
@@ -138,6 +169,86 @@ pure func function_decl(
 		body = Some(body),
 		is_pure = True,
 		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func global_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+	init: CoreExpr,
+) -> CoreDecl:
+	GlobalDecl({
+		name = {
+			name = name,
+			uniq = 0,
+			def_id = Some(def_id)
+		},
+		typ = typ,
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = True,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func mutable_global_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+	init: CoreExpr,
+) -> CoreDecl:
+	GlobalDecl({
+		name = {
+			name = name,
+			uniq = 0,
+			def_id = Some(def_id)
+		},
+		typ = typ,
+		init = init,
+		is_mutable = True,
+		is_const = False,
+		is_private = True,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func unresolved_name_global_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+	init: CoreExpr,
+) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name),
+		typ = typ,
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = True,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func unresolved_name_mutable_global_decl(
+	name: String,
+	def_id: Int,
+	typ: CoreType,
+	init: CoreExpr,
+) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name),
+		typ = typ,
+		init = init,
+		is_mutable = True,
+		is_const = False,
+		is_private = True,
 		def_id = def_id,
 		loc = SyntheticSourceLoc,
 	})
@@ -706,6 +817,11 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cases,
 			) + drop_count_in_literal_fallback(name, fallback)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			drop_count_for(
+				name,
+				scrutinee,
+			) + drop_count_in_constructor_literal_match(name, match_expr)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			drop_count_for(
 				name,
@@ -886,6 +1002,20 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
 		BinaryExpr(op, left, right, typ, loc):
 			dup_count_for(name, left) + dup_count_for(name, right)
+		UnaryExpr(op, inner, typ, loc):
+			dup_count_for(name, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			dup_count_for(name, left) + dup_count_for(name, right)
+		CastExpr(inner, typ, loc):
+			dup_count_for(name, inner)
+		BoxExpr(box, typ, loc):
+			dup_count_for(name, box.value)
+		UnboxExpr(kind, inner, typ, loc):
+			dup_count_for(name, inner)
+		FieldExpr(owner, field, typ, loc):
+			dup_count_for(name, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			dup_count_for(name, owner)
 		CallExpr(kind, callee, args, typ, loc):
 			dup_count_for(name, callee) + dup_count_in_args(name, args)
 		AssignExpr(variable, rhs, typ, loc):
@@ -931,6 +1061,11 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				cases,
 			) + dup_count_in_literal_fallback(name, fallback)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			dup_count_for(
+				name,
+				scrutinee,
+			) + dup_count_in_constructor_literal_match(name, match_expr)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			dup_count_for(name, scrutinee) + dup_count_in_constructor_length_match(name, match_expr)
 		_:
@@ -1001,6 +1136,95 @@ pure func dup_count_in_constructor_literal_match(
 		name,
 		match_expr.cases,
 	) + dup_count_in_literal_fallback(name, match_expr.fallback)
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_body(
+	owner: String,
+	payload: String,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			owner_drop_wraps_payload_dup(owner, payload, expr)
+		_:
+			False
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_cases(
+	owner: String,
+	payload: String,
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	cases.any(func(match_case):
+		owner_drop_wraps_payload_dup_in_constructor_body(owner, payload, match_case.body)
+	)
+
+
+pure func owner_drop_wraps_payload_dup_in_constructor_fallback(
+	owner: String,
+	payload: String,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		ConstructorMatchFallbackBindings(_, body):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		ConstructorMatchFallbackFail:
+			False
+
+
+pure func owner_drop_wraps_payload_dup_in_exprs(
+	owner: String,
+	payload: String,
+	exprs: List[CoreExpr],
+) -> Bool:
+	exprs.any(func(expr): owner_drop_wraps_payload_dup(owner, payload, expr))
+
+
+pure func owner_drop_wraps_payload_dup(owner: String, payload: String, expr: CoreExpr) -> Bool:
+	match expr:
+		DropExpr(variable, _, _, body, _, _):
+			(
+				variable.name == owner and dup_count_for(payload, body) > 0
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		DupExpr(_, _, _, body, _, _):
+			owner_drop_wraps_payload_dup(owner, payload, body)
+		LetExpr(_, _, _, rhs, body):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, rhs)
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		BorrowLetExpr(_, _, rhs, body):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, rhs)
+				or owner_drop_wraps_payload_dup(owner, payload, body)
+			)
+		SeqExpr(first, second):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, first)
+				or owner_drop_wraps_payload_dup(owner, payload, second)
+			)
+		IfExpr(cond, then_expr, else_expr, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, cond)
+				or owner_drop_wraps_payload_dup(owner, payload, then_expr)
+				or owner_drop_wraps_payload_dup(owner, payload, else_expr)
+			)
+		CallExpr(_, callee, args, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, callee)
+				or owner_drop_wraps_payload_dup_in_exprs(owner, payload, args)
+			)
+		ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
+			(
+				owner_drop_wraps_payload_dup(owner, payload, scrutinee)
+				or owner_drop_wraps_payload_dup_in_constructor_cases(owner, payload, cases)
+				or owner_drop_wraps_payload_dup_in_constructor_fallback(owner, payload, fallback)
+			)
+		_:
+			False
 
 
 pure func dup_count_in_constructor_length_branch(
@@ -1354,6 +1578,33 @@ pure func top_let_first_constructor_case_shadows(name: String, expr: CoreExpr) -
 			False
 
 
+pure func top_let_first_constructor_case_binding_has_identity(
+	name: String,
+	def_id: Int,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+					match cases.get(0):
+						Some(match_case):
+							match match_case.bindings.get(0):
+								Some(binding):
+									(
+										binding.variable.name == name
+										and binding.variable.def_id == Some(def_id)
+									)
+								None:
+									False
+						None:
+							False
+				_:
+					False
+		_:
+			False
+
+
 pure func constructor_fallback_has_pre_drop_int(
 	name: String,
 	expected: Int,
@@ -1685,6 +1936,31 @@ pure func test_default_managed_types() -> Bool:
 				[int_type(), string_type()],
 			),
 		)
+		and is_managed_type(
+			env,
+			NamedType("std_stream__Stream", [int_type()]),
+		)
+		and is_managed_type(
+			env,
+			NamedType(
+				"std/stream::FallibleStream",
+				[int_type(), string_type()],
+			),
+		)
+		and is_managed_type(
+			env,
+			NamedType(
+				"std_stream__ResourceSource",
+				[int_type(), string_type()],
+			),
+		)
+		and is_managed_type(
+			env,
+			NamedType(
+				"std/stream::ResourceSource",
+				[int_type(), string_type()],
+			),
+		)
 		and not is_managed_type(
 			env,
 			NamedType("Option", [int_type()]),
@@ -1797,6 +2073,7 @@ pure func test_stack_result_uses_stack_ownership_policies() -> Bool:
 
 pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 	env: PerceusEnv = build_env(decl_env_program())
+	missing_def_id: Int = 404
 
 	contract_is(
 		lookup_constructor_call_contract(env, "Node", None, 2),
@@ -1815,11 +2092,16 @@ pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 		),
 		[TransferArg, TransferArg],
 		ReturnOwned,
+	) and contract_is(
+		lookup_constructor_call_contract(env, "Node", Some(missing_def_id), 2),
+		[TransferArg, TransferArg],
+		ReturnOwned,
 	) and contract_is_none(lookup_constructor_call_contract(env, "Node", None, 3))
 
 
 pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
 	env: PerceusEnv = build_env(decl_env_program())
+	missing_def_id: Int = 404
 
 	(
 		contract_is_none(contract_for_call(env, UserCall("Node", None, []), 1, UnionType("Tree")))
@@ -1841,6 +2123,16 @@ pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
 				NamedType("BoxedString", []),
 			),
 			[TransferArg],
+			ReturnOwned,
+		)
+		and contract_is(
+			contract_for_call(
+				env,
+				UserCall("Node", Some(missing_def_id), []),
+				2,
+				UnionType("Tree"),
+			),
+			[TransferArg, TransferArg],
 			ReturnOwned,
 		)
 	)
@@ -1912,6 +2204,56 @@ pure func test_borrowed_managed_parameter_field_return_is_retained() -> Bool:
 	match function_body(rewritten, "node_text"):
 		Some(body):
 			dup_count_for("__borrowed_result_node_0", body) == 1
+		None:
+			False
+
+
+pure func test_borrowed_match_field_embedded_in_union_result_is_retained() -> Bool:
+	name_type: CoreType = HeapRecordType("Name")
+	result: CoreExpr = boxed_string_construct(
+		FieldExpr(
+			var_expr("name", name_type),
+			"text",
+			string_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = {
+		decls = [HeapRecordDecl({
+				name = "Name",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), UnionDecl({
+				name = "BoxedString",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Node", 0, None, [union_field(string_type())])],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"name_text",
+				87,
+				[core_param("tag", UnionType("Tag"))],
+				boxed_string_type(),
+				constructor_match_expr(
+					[constructor_case("Named", [match_binding("name", name_type)], result)],
+					boxed_string_construct(
+						LiteralExpr(
+							StringLiteral("fallback"),
+							string_type(),
+							SyntheticSourceLoc,
+						),
+					),
+					boxed_string_type(),
+				),
+			)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "name_text"):
+		Some(body):
+			dup_count_for("__borrowed_result_name_0", body) == 1
 		None:
 			False
 
@@ -2193,7 +2535,7 @@ pure func test_borrowed_match_binding_retains_repeated_consume() -> Bool:
 	dup_count_for("payload", rewritten) == 1
 
 
-pure func test_union_construction_retains_borrowed_parameter_payload() -> Bool:
+pure func test_union_construction_transfers_consumed_parameter_payload() -> Bool:
 	program: CoreProgram = {
 		decls = [UnionDecl({
 				name = "BoxedString",
@@ -2214,12 +2556,12 @@ pure func test_union_construction_retains_borrowed_parameter_payload() -> Bool:
 
 	match function_body(rewritten, "wrap"):
 		Some(body):
-			dup_count_for("value", body) == 1
+			dup_count_for("value", body) == 0
 		None:
 			False
 
 
-pure func test_tuple_construction_retains_borrowed_parameter_member() -> Bool:
+pure func test_tuple_construction_transfers_consumed_parameter_member() -> Bool:
 	tuple_type: CoreType = TupleType([list_int_type()])
 	program: CoreProgram = {
 		decls = [function_decl(
@@ -2235,7 +2577,7 @@ pure func test_tuple_construction_retains_borrowed_parameter_member() -> Bool:
 
 	match function_body(rewritten, "wrap_tuple"):
 		Some(body):
-			dup_count_for("value", body) == 1
+			dup_count_for("value", body) == 0
 		None:
 			False
 
@@ -3306,6 +3648,24 @@ pure func test_lambda_temporaries_and_captured_owner_are_dropped() -> Bool:
 	)
 
 
+pure func test_unmanaged_lambda_result_preserves_consumed_capture() -> Bool:
+	value_type: CoreType = list_string_type()
+	lambda: CoreExpr = LambdaExpr(
+		[],
+		bool_type(),
+		SeqExpr(
+			intrinsic_expr("list_ensure_unique", [var_expr("captured", value_type)], value_type),
+			bool_expr(True),
+		),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), lambda)
+
+	dup_count_for("captured", rewritten) == 1
+
+
 pure func test_static_lambda_temporary_needs_no_owned_binding() -> Bool:
 	callback: CoreExpr = LambdaExpr(
 		[],
@@ -3919,6 +4279,57 @@ pure func test_mutable_assignment_in_branch_releases_replaced_owner() -> Bool:
 	)
 
 
+pure func test_mutable_consuming_condition_preserves_else_assignment_owner() -> Bool:
+	value_type: CoreType = list_int_type()
+	predicate: CoreDecl = function_decl(
+		"consuming_predicate",
+		801,
+		[core_param("value", value_type)],
+		bool_type(),
+		SeqExpr(
+			intrinsic_expr("list_ensure_unique", [var_expr("value", value_type)], value_type),
+			bool_expr(True),
+		),
+	)
+	condition: CoreExpr = user_call_expr(
+		"consuming_predicate",
+		Some(801),
+		[],
+		[var_expr("xs", value_type)],
+		bool_type(),
+	)
+	replacement: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", value_type)],
+		value_type,
+	)
+	body: CoreExpr = IfExpr(
+		condition,
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		AssignExpr(named_var("xs"), replacement, void_type(), SyntheticSourceLoc),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	caller_body: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		value_type,
+		var_expr("source", value_type),
+		body,
+	)
+	caller: CoreDecl = function_decl("predicate_caller", 802, [], void_type(), caller_body)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [predicate, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "predicate_caller"):
+		Some(rewritten_body):
+			dup_count_for("xs", rewritten_body) == 1 and drop_count_for("xs", rewritten_body) == 1
+		None:
+			False
+
+
 pure func test_mutable_assignment_in_while_releases_replaced_owner() -> Bool:
 	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
 	body: CoreExpr = WhileExpr(
@@ -3997,17 +4408,33 @@ pure func test_mutable_constructor_match_result_retains_direct_return_branch() -
 
 
 pure func test_shadowed_match_binding_freshens_before_outer_owner_balance() -> Bool:
+	outer_variable: CoreVar = {
+		name = "value",
+		uniq = 0,
+		def_id = Some(1398)
+	}
+	match_variable: CoreVar = {
+		name = "value",
+		uniq = 0,
+		def_id = Some(1399)
+	}
+	match_value: CoreMatchBinding = {
+		variable = match_variable,
+		typ = string_type(),
+		accessor = RootAccessor,
+		mode = MatchBorrowBindingMode
+	}
 	match_body: CoreExpr = constructor_match_expr(
 		[constructor_case(
 				"Shadow",
-				[match_binding("value", string_type())],
-				var_expr("value", string_type()),
+				[match_value],
+				VarExpr(match_variable, string_type(), SyntheticSourceLoc),
 			)],
-		var_expr("value", string_type()),
+		VarExpr(outer_variable, string_type(), SyntheticSourceLoc),
 		string_type(),
 	)
 	expr: CoreExpr = LetExpr(
-		named_var("value"),
+		outer_variable,
 		False,
 		string_type(),
 		var_expr("source", string_type()),
@@ -4018,6 +4445,12 @@ pure func test_shadowed_match_binding_freshens_before_outer_owner_balance() -> B
 	(
 		drop_count_for("value", rewritten) == 1
 		and not top_let_first_constructor_case_shadows("value", rewritten)
+		and top_let_first_constructor_case_binding_has_identity(
+			"__perceus_shadow_value_0_0_0",
+			1399,
+			rewritten,
+		)
+		and dup_count_for("__perceus_shadow_value_0_0_0", rewritten) == 1
 	)
 
 
@@ -4176,6 +4609,60 @@ pure func test_consuming_while_body_retains_owner_for_each_iteration() -> Bool:
 		and dup_count_for("xs", rewritten) == 1
 		and top_let_while_body_has_dup("xs", rewritten)
 	)
+
+
+pure func test_consuming_user_call_in_while_retains_function_parameter() -> Bool:
+	consume_decl: CoreDecl = function_decl(
+		"consume_for_check",
+		220,
+		[core_param("value", list_int_type())],
+		bool_type(),
+		SeqExpr(
+			intrinsic_expr(
+				"list_ensure_unique",
+				[var_expr("value", list_int_type())],
+				list_int_type(),
+			),
+			bool_expr(True),
+		),
+	)
+	loop: CoreExpr = WhileExpr(
+		bool_expr(True),
+		UnaryExpr(
+			NotOp,
+			user_call_expr(
+				"consume_for_check",
+				Some(220),
+				[0],
+				[var_expr("items", list_int_type())],
+				bool_type(),
+			),
+			bool_type(),
+			SyntheticSourceLoc,
+		),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	caller_decl: CoreDecl = function_decl(
+		"check_repeatedly",
+		221,
+		[core_param("items", list_int_type())],
+		void_type(),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume_decl, caller_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "check_repeatedly"):
+		Some(body):
+			expr_has_while_body_dup("items", body)
+		None:
+			False
 
 
 pure func test_consuming_match_branch_in_loop_retains_owner_for_each_iteration() -> Bool:
@@ -4966,6 +5453,36 @@ pure func test_branch_alias_binding_normalizes_rhs_ownership() -> Bool:
 			False
 
 
+pure func test_match_field_alias_binding_normalizes_rhs_ownership() -> Bool:
+	field: CoreExpr = FieldExpr(
+		var_expr("node", HeapRecordType("Node")),
+		"text",
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	rhs: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [], field)],
+		LiteralExpr(StringLiteral("fallback"), string_type(), SyntheticSourceLoc),
+		string_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("selected"),
+			False,
+			string_type(),
+			rhs,
+			intrinsic_expr("string_length", [var_expr("selected", string_type())], int_type()),
+		),
+	)
+
+	match rewritten:
+		LetExpr(variable, False, typ, normalized_rhs, body):
+			variable.name == "selected" and dup_count_for("__owned_result", normalized_rhs) == 1
+		_:
+			False
+
+
 pure func test_tuple_field_alias_binding_retains_field_owner() -> Bool:
 	item_type: CoreType = list_int_type()
 	tuple_type: CoreType = TupleType([item_type])
@@ -5033,6 +5550,1495 @@ pure func test_borrowed_owned_temporary_argument_is_dropped() -> Bool:
 	match function_body(program, "main"):
 		Some(body):
 			drop_count_for("__borrow_arg_0", body) == 1
+		None:
+			False
+
+
+pure func test_borrowed_string_literal_argument_is_dropped() -> Bool:
+	inspect: CoreDecl = function_decl(
+		"inspect_string",
+		212,
+		[core_param("value", string_type())],
+		int_type(),
+		LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+	)
+	literal: CoreExpr = LiteralExpr(StringLiteral("temporary"), string_type(), SyntheticSourceLoc)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		213,
+		[],
+		int_type(),
+		user_call_expr("inspect_string", Some(212), [], [literal], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [inspect, main_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "main"):
+		Some(body):
+			drop_count_for("__borrow_arg_0", body) == 1
+		None:
+			False
+
+
+pure func test_string_literal_list_element_transfers_ownership() -> Bool:
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		ListConstructExpr(
+			{
+				layout = PointerListStorage,
+				elements = [
+					{
+						kind = PointerBox,
+						value = LiteralExpr(
+							StringLiteral("owned"),
+							string_type(),
+							SyntheticSourceLoc,
+						),
+						needs_release = True,
+						transfers_ownership = False
+					},
+				],
+				elem_needs_release = True
+			},
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match rewritten:
+		ListConstructExpr(construct, typ, loc):
+			match construct.elements:
+				[element]:
+					element.transfers_ownership
+				_:
+					False
+		_:
+			False
+
+
+pure func test_resolved_global_read_preserves_existing_definition_id() -> Bool:
+	global_def_id: Int = 1400
+	existing_def_id: Int = 1401
+	reference: CoreVar = {
+		name = "GLOBAL_COUNT",
+		uniq = 0,
+		def_id = Some(existing_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				"GLOBAL_COUNT",
+				global_def_id,
+				int_type(),
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_count",
+				1402,
+				[],
+				int_type(),
+				VarExpr(reference, int_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_count"):
+		Some(VarExpr(variable, typ, loc)):
+			variable.def_id == Some(existing_def_id)
+		_:
+			False
+
+
+pure func test_unresolved_global_read_receives_unique_definition_id() -> Bool:
+	global_def_id: Int = 1403
+	reference: CoreVar = {
+		name = "GLOBAL_COUNT",
+		uniq = 0,
+		def_id = None
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				"GLOBAL_COUNT",
+				global_def_id,
+				int_type(),
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_count",
+				1404,
+				[],
+				int_type(),
+				VarExpr(reference, int_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_count"):
+		Some(VarExpr(variable, typ, loc)):
+			variable.def_id == Some(global_def_id)
+		_:
+			False
+
+
+pure func test_resolved_assignment_preserves_existing_definition_id() -> Bool:
+	global_def_id: Int = 1405
+	existing_def_id: Int = 1406
+	target: CoreVar = {
+		name = "GLOBAL_COUNT",
+		uniq = 0,
+		def_id = Some(existing_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [mutable_global_decl(
+				"GLOBAL_COUNT",
+				global_def_id,
+				int_type(),
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+			), function_decl(
+				"write_count",
+				1407,
+				[],
+				void_type(),
+				AssignExpr(
+					target,
+					LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "write_count"):
+		Some(AssignExpr(variable, rhs, typ, loc)):
+			variable.def_id == Some(existing_def_id)
+		_:
+			False
+
+
+pure func test_unresolved_global_assignment_target_receives_definition_id() -> Bool:
+	global_def_id: Int = 1408
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			mutable_global_decl("GLOBAL_COUNT", global_def_id, int_type(), int_expr(0)),
+			function_decl(
+				"write_count",
+				1409,
+				[],
+				void_type(),
+				AssignExpr(named_var("GLOBAL_COUNT"), int_expr(1), void_type(), SyntheticSourceLoc),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "write_count"):
+		Some(AssignExpr(variable, rhs, typ, loc)):
+			variable.def_id == Some(global_def_id)
+		_:
+			False
+
+
+pure func test_same_named_local_remains_unresolved_during_global_repair() -> Bool:
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl("SHARED_NAME", 1410, int_type(), int_expr(42)), function_decl(
+				"read_local",
+				1411,
+				[],
+				int_type(),
+				LetExpr(
+					named_var("SHARED_NAME"),
+					False,
+					int_type(),
+					int_expr(7),
+					var_expr("SHARED_NAME", int_type()),
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_local"):
+		Some(LetExpr(variable, is_mutable, typ, rhs, body)):
+			match body:
+				VarExpr(reference, reference_type, loc):
+					variable.def_id.is_none() and reference.def_id.is_none()
+				_:
+					False
+		_:
+			False
+
+
+pure func test_nested_binders_remain_unresolved_during_global_repair() -> Bool:
+	shadow_name: String = "SHARED_BINDER"
+	loop_binder = {
+		variable = named_var(shadow_name),
+		typ = int_type(),
+		range_direction = RangeForwardOnly
+	}
+	body: CoreExpr = TupleExpr(
+		[
+			ForRangeExpr(
+				loop_binder,
+				int_expr(0),
+				int_expr(1),
+				var_expr(shadow_name, int_type()),
+				int_type(),
+				SyntheticSourceLoc,
+			),
+			PreClosureConcurrentExpr(
+				{
+					bindings = [
+						{
+							variable = named_var(shadow_name),
+							typ = int_type(),
+							rhs = int_expr(1)
+						},
+					],
+					body = var_expr(shadow_name, int_type()),
+					timeout = None,
+					max_threads = None
+				},
+				int_type(),
+				SyntheticSourceLoc,
+			),
+			SelectExpr(
+				{arms = [
+						{
+							kind = SelectRecvArm({
+								binder = named_var(shadow_name),
+								elem_type = int_type(),
+								channel = int_expr(0),
+							}),
+							body = var_expr(shadow_name, int_type()),
+							loc = SyntheticSourceLoc
+						},
+					]},
+				int_type(),
+				SyntheticSourceLoc,
+			),
+		],
+		TupleType([int_type(), int_type(), int_type()]),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(shadow_name, 1460, int_type(), int_expr(42)),
+			function_decl(
+				"read_nested_locals",
+				1461,
+				[],
+				TupleType([int_type(), int_type(), int_type()]),
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_nested_locals"):
+		Some(TupleExpr(items, typ, loc)):
+			loop_is_unresolved: Bool = match items.get(0):
+				Some(ForRangeExpr(binder, start, end_value, loop_body, loop_type, loop_loc)):
+					match loop_body:
+						VarExpr(reference, reference_type, reference_loc):
+							binder.variable.def_id.is_none() and reference.def_id.is_none()
+						_:
+							False
+				_:
+					False
+
+			concurrent_is_unresolved: Bool = match items.get(1):
+				Some(PreClosureConcurrentExpr(block, block_type, block_loc)):
+					match block.body:
+						VarExpr(reference, reference_type, reference_loc):
+							match block.bindings.get(0):
+								Some(binding):
+									binding.variable.def_id.is_none() and reference.def_id.is_none()
+								None:
+									False
+						_:
+							False
+				_:
+					False
+
+			select_is_unresolved: Bool = match items.get(2):
+				Some(SelectExpr(select_expr, select_type, select_loc)):
+					match select_expr.arms.get(0):
+						Some(arm):
+							match arm.kind:
+								SelectRecvArm(recv):
+									match arm.body:
+										VarExpr(reference, reference_type, reference_loc):
+											(
+												recv.binder.def_id.is_none()
+												and reference.def_id.is_none()
+											)
+										_:
+											False
+								_:
+									False
+						None:
+							False
+				_:
+					False
+
+			loop_is_unresolved and concurrent_is_unresolved and select_is_unresolved
+		_:
+			False
+
+
+pure func test_irrelevant_managed_global_leaves_unrelated_body_unchanged() -> Bool:
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				"UNUSED_GLOBAL",
+				1412,
+				string_type(),
+				LiteralExpr(StringLiteral("unused"), string_type(), SyntheticSourceLoc),
+			), function_decl("unrelated", 1413, [], int_type(), int_expr(7))],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "unrelated"):
+		Some(LiteralExpr(IntLiteral(value), typ, loc)):
+			value == 7
+		_:
+			False
+
+
+pure func test_global_definition_id_is_normalized_from_declaration() -> Bool:
+	global_def_id: Int = 1414
+	program: CoreProgram = insert_drops_program({
+		decls = [unresolved_name_global_decl(
+				"GLOBAL_NAME",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_name",
+				1415,
+				[],
+				string_type(),
+				var_expr("GLOBAL_NAME", string_type()),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_name"):
+		Some(DupExpr(variable, value_type, retain_policy, body, typ, loc)):
+			variable.def_id == Some(global_def_id)
+		_:
+			False
+
+
+pure func test_same_named_definition_is_not_retained_as_global() -> Bool:
+	global_def_id: Int = 1416
+	local_def_id: Int = 1417
+	local_reference: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = Some(local_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				"GLOBAL_NAME",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_other_definition",
+				1418,
+				[],
+				string_type(),
+				VarExpr(local_reference, string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_other_definition"):
+		Some(VarExpr(variable, typ, loc)):
+			variable.def_id == Some(local_def_id)
+		_:
+			False
+
+
+pure func test_global_retention_uses_definition_identity() -> Bool:
+	global_def_id: Int = 1419
+	local_def_id: Int = 1420
+	global_reference: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	local_reference: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = Some(local_def_id)
+	}
+	result_type: CoreType = TupleType([string_type(), string_type()])
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				"GLOBAL_NAME",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			),
+			function_decl(
+				"read_both_definitions",
+				1421,
+				[],
+				result_type,
+				TupleExpr(
+					[
+						VarExpr(global_reference, string_type(), SyntheticSourceLoc),
+						VarExpr(local_reference, string_type(), SyntheticSourceLoc),
+					],
+					result_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_both_definitions"):
+		Some(TupleExpr(items, typ, loc)):
+			match (items.get(0), items.get(1)):
+				(Some(DupExpr(global_var, value_type, retain_policy, body, result_type, dup_loc)), Some(VarExpr(local_var, local_type, local_loc))):
+					(
+						global_var.def_id == Some(global_def_id)
+						and local_var.def_id == Some(local_def_id)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_global_reference_identity_includes_qualified_name() -> Bool:
+	shared_def_id: Int = 1422
+	first_name: String = "first__GLOBAL_NAME"
+	second_name: String = "second__GLOBAL_NAME"
+	first_reference: CoreVar = {
+		name = first_name,
+		uniq = 0,
+		def_id = Some(shared_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				first_name,
+				shared_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("first"), string_type(), SyntheticSourceLoc),
+			), global_decl(
+				second_name,
+				shared_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("second"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_first",
+				1423,
+				[],
+				string_type(),
+				VarExpr(first_reference, string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_first"):
+		Some(DupExpr(variable, value_type, retain_policy, body, typ, loc)):
+			variable.name == first_name and variable.def_id == Some(shared_def_id)
+		_:
+			False
+
+
+pure func test_exact_global_reference_survives_same_name_ambiguity() -> Bool:
+	global_name: String = "module__GLOBAL_NAME"
+	referenced_id: Int = 1434
+	reference: CoreVar = {
+		name = global_name,
+		uniq = 0,
+		def_id = Some(referenced_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				global_name,
+				referenced_id,
+				string_type(),
+				LiteralExpr(StringLiteral("selected"), string_type(), SyntheticSourceLoc),
+			), global_decl(
+				global_name,
+				1435,
+				string_type(),
+				LiteralExpr(StringLiteral("other"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_selected",
+				1436,
+				[],
+				string_type(),
+				VarExpr(reference, string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_selected"):
+		Some(DupExpr(variable, value_type, retain_policy, body, typ, loc)):
+			variable.def_id == Some(referenced_id)
+		_:
+			False
+
+
+pure func test_duplicate_exact_global_identity_is_retained_once() -> Bool:
+	global_name: String = "module__GLOBAL_NAME"
+	global_def_id: Int = 1437
+	init: CoreExpr = LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc)
+	reference: CoreVar = {
+		name = global_name,
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(global_name, global_def_id, string_type(), init),
+			global_decl(global_name, global_def_id, string_type(), init),
+			function_decl(
+				"read_shared",
+				1438,
+				[],
+				string_type(),
+				VarExpr(reference, string_type(), SyntheticSourceLoc),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_shared"):
+		Some(body):
+			dup_count_for(global_name, body) == 1
+		None:
+			False
+
+
+pure func test_resolved_global_is_retained_under_same_named_parameter() -> Bool:
+	global_def_id: Int = 1424
+	global_reference: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = Some(global_def_id)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [global_decl(
+				"GLOBAL_NAME",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"read_global",
+				1426,
+				[core_param_with_id("GLOBAL_NAME", 1425, int_type())],
+				string_type(),
+				VarExpr(global_reference, string_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_global"):
+		Some(DupExpr(variable, value_type, retain_policy, body, typ, loc)):
+			variable.def_id == Some(global_def_id)
+		_:
+			False
+
+
+pure func test_alias_contract_correlates_exact_argument_identity() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1429, list_string_type())
+	same_named_other_owner: CoreVar = {
+		name = "value",
+		uniq = 0,
+		def_id = Some(1430)
+	}
+	exact_reference: CoreExpr = VarExpr(param.name, list_string_type(), SyntheticSourceLoc)
+	call: CoreExpr = intrinsic_expr(
+		"list_get",
+		[
+			VarExpr(same_named_other_owner, list_string_type(), SyntheticSourceLoc),
+			SeqExpr(exact_reference, int_expr(0)),
+		],
+		string_type(),
+	)
+
+	not borrowed_result_aliases_param(empty_env(), param, call)
+
+
+pure func test_exact_alias_contract_accepts_sequence_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1439, list_string_type())
+	other: CoreVar = {
+		name = "value",
+		uniq = 0,
+		def_id = Some(1440)
+	}
+	argument: CoreExpr = SeqExpr(
+		VarExpr(other, list_string_type(), SyntheticSourceLoc),
+		VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+	)
+	call: CoreExpr = intrinsic_expr(
+		"list_get",
+		[argument, int_expr(0)],
+		string_type(),
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, call)
+
+
+pure func test_exact_alias_contract_follows_let_alias() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1441, list_string_type())
+	local: CoreVar = {
+		name = "local_value",
+		uniq = 0,
+		def_id = Some(1442)
+	}
+	argument: CoreExpr = LetExpr(
+		local,
+		False,
+		list_string_type(),
+		VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+		VarExpr(local, list_string_type(), SyntheticSourceLoc),
+	)
+	call: CoreExpr = intrinsic_expr(
+		"list_get",
+		[argument, int_expr(0)],
+		string_type(),
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, call)
+
+
+pure func test_exact_alias_contract_follows_branch_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1443, list_string_type())
+	other: CoreVar = {
+		name = "other",
+		uniq = 0,
+		def_id = Some(1444)
+	}
+	argument: CoreExpr = IfExpr(
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+		VarExpr(other, list_string_type(), SyntheticSourceLoc),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	call: CoreExpr = intrinsic_expr(
+		"list_get",
+		[argument, int_expr(0)],
+		string_type(),
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, call)
+
+
+pure func test_exact_alias_contract_follows_literal_match_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1445, list_string_type())
+	result: CoreExpr = LiteralMatchExpr(int_expr(1), [literal_case(
+				IntLiteral(1),
+				[],
+				VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+			)], LiteralMatchFallbackFail, list_string_type(), SyntheticSourceLoc)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_follows_accessor_literal_match_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1446, list_string_type())
+	result: CoreExpr = AccessorLiteralMatchExpr(
+		int_expr(1),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = int_type(),
+			cases = [literal_case(
+					IntLiteral(1),
+					[],
+					VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+				)],
+			fallback = LiteralMatchFallbackFail,
+			result_type = list_string_type(),
+			loc = SyntheticSourceLoc
+		},
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_follows_length_match_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1447, list_string_type())
+	result: CoreExpr = LengthMatchExpr(
+		VarExpr(
+			param.name,
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = None,
+			fallback = Some(
+				constructor_length_branch(
+					[],
+					ConstructorMatchBodyExpr(
+						VarExpr(
+							param.name,
+							list_string_type(),
+							SyntheticSourceLoc,
+						),
+					),
+				),
+			),
+			result_type = list_string_type(),
+			loc = SyntheticSourceLoc
+		},
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_follows_constructor_match_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1448, list_string_type())
+	result: CoreExpr = ConstructorMatchExpr(
+		var_expr("tag", UnionType("Tag")),
+		NoReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(VarExpr(param.name, list_string_type(), SyntheticSourceLoc)),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_follows_borrowed_match_binding() -> Bool:
+	param: CoreParam = core_param_with_id("tag", 1449, UnionType("Tag"))
+	binding: CoreMatchBinding = {
+		variable = {
+			name = "payload",
+			uniq = 0,
+			def_id = Some(1450)
+		},
+		typ = string_type(),
+		accessor = RootAccessor,
+		mode = MatchBorrowBindingMode
+	}
+	result: CoreExpr = ConstructorMatchExpr(
+		VarExpr(param.name, UnionType("Tag"), SyntheticSourceLoc),
+		NoReleasePolicy,
+		[
+			constructor_case_body(
+				"Some",
+				[binding],
+				ConstructorMatchBodyExpr(
+					VarExpr(
+						binding.variable,
+						string_type(),
+						SyntheticSourceLoc,
+					),
+				),
+			),
+		],
+		ConstructorMatchFallbackFail,
+		string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_follows_resource_scope_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1451, list_string_type())
+	result: CoreExpr = ResourceScopeExpr(
+		{
+			variable = {
+				name = "resource",
+				uniq = 0,
+				def_id = Some(1452)
+			},
+			typ = string_type(),
+			acquire = LiteralExpr(StringLiteral("resource"), string_type(), SyntheticSourceLoc),
+			body = VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+			cleanup = VoidExpr(void_type(), SyntheticSourceLoc)
+		},
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, result)
+
+
+pure func test_exact_alias_contract_recognizes_retained_wrapped_result() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1453, list_string_type())
+	local: CoreVar = {
+		name = "local",
+		uniq = 0,
+		def_id = Some(1454)
+	}
+	retained_sequence: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		SeqExpr(
+			int_expr(0),
+			VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+		),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	retained_let: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		LetExpr(
+			local,
+			False,
+			int_type(),
+			int_expr(0),
+			VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+		),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	retained_branch: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		IfExpr(
+			bool_expr(True),
+			VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+			intrinsic_expr("list_alloc", [int_expr(0)], list_string_type()),
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	retained_match: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		LiteralMatchExpr(int_expr(1), [literal_case(
+					IntLiteral(1),
+					[],
+					VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+				)], LiteralMatchFallbackBody(
+				intrinsic_expr(
+					"list_alloc",
+					[int_expr(0)],
+					list_string_type(),
+				),
+			), list_string_type(), SyntheticSourceLoc),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	retained_resource: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		ResourceScopeExpr(
+			{
+				variable = {
+					name = "resource",
+					uniq = 0,
+					def_id = Some(1455)
+				},
+				typ = int_type(),
+				acquire = int_expr(0),
+				body = VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+				cleanup = VoidExpr(void_type(), SyntheticSourceLoc)
+			},
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	(
+		not borrowed_result_aliases_param(empty_env(), param, retained_sequence)
+		and not borrowed_result_aliases_param(empty_env(), param, retained_let)
+		and not borrowed_result_aliases_param(empty_env(), param, retained_branch)
+		and not borrowed_result_aliases_param(empty_env(), param, retained_match)
+		and not borrowed_result_aliases_param(empty_env(), param, retained_resource)
+	)
+
+
+pure func test_exact_alias_contract_rejects_reassigned_definition() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1456, list_string_type())
+	reassigned_result: CoreExpr = DupExpr(
+		param.name,
+		list_string_type(),
+		ArcRetainPolicy,
+		SeqExpr(
+			AssignExpr(
+				param.name,
+				intrinsic_expr("list_alloc", [int_expr(0)], list_string_type()),
+				void_type(),
+				SyntheticSourceLoc,
+			),
+			VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+		),
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+
+	borrowed_result_aliases_param(empty_env(), param, reassigned_result)
+
+
+pure func test_literal_match_parameter_result_is_retained() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1455, list_string_type())
+	body: CoreExpr = LiteralMatchExpr(int_expr(1), [literal_case(
+				IntLiteral(1),
+				[],
+				VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+			)], LiteralMatchFallbackFail, list_string_type(), SyntheticSourceLoc)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("literal_result", 1456, [param], list_string_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "literal_result"):
+		Some(rewritten):
+			dup_count_for("value", rewritten) == 1
+		None:
+			False
+
+
+pure func test_accessor_literal_match_parameter_result_is_retained() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1457, list_string_type())
+	body: CoreExpr = AccessorLiteralMatchExpr(
+		int_expr(1),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = int_type(),
+			cases = [literal_case(
+					IntLiteral(1),
+					[],
+					VarExpr(param.name, list_string_type(), SyntheticSourceLoc),
+				)],
+			fallback = LiteralMatchFallbackFail,
+			result_type = list_string_type(),
+			loc = SyntheticSourceLoc
+		},
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("accessor_result", 1458, [param], list_string_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "accessor_result"):
+		Some(rewritten):
+			dup_count_for("value", rewritten) == 1
+		None:
+			False
+
+
+pure func test_length_match_parameter_result_is_retained() -> Bool:
+	param: CoreParam = core_param_with_id("value", 1459, list_string_type())
+	items: CoreParam = core_param_with_id("items", 1460, list_string_type())
+	body: CoreExpr = LengthMatchExpr(
+		VarExpr(
+			items.name,
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = None,
+			fallback = Some(
+				constructor_length_branch(
+					[],
+					ConstructorMatchBodyExpr(
+						VarExpr(
+							param.name,
+							list_string_type(),
+							SyntheticSourceLoc,
+						),
+					),
+				),
+			),
+			result_type = list_string_type(),
+			loc = SyntheticSourceLoc
+		},
+		list_string_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			function_decl(
+				"length_result",
+				1461,
+				[param, items],
+				list_string_type(),
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "length_result"):
+		Some(rewritten):
+			dup_count_for("value", rewritten) == 1
+		None:
+			False
+
+
+pure func test_managed_global_is_retained_when_stored_in_record() -> Bool:
+	global_name: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = Some(214)
+	}
+	box_type: CoreType = HeapRecordType("NameBox")
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				"GLOBAL_NAME",
+				214,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			),
+			HeapRecordDecl({
+				name = "NameBox",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"make_name_box",
+				215,
+				[],
+				box_type,
+				RecordConstructExpr(
+					"NameBox",
+					[
+						{
+							name = "name",
+							value = VarExpr(global_name, string_type(), SyntheticSourceLoc)
+						},
+					],
+					box_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "make_name_box"):
+		Some(body):
+			dup_count_for("GLOBAL_NAME", body) == 1
+		None:
+			False
+
+
+pure func test_managed_global_is_retained_in_releasing_union_slot() -> Bool:
+	global_name: CoreVar = {
+		name = "GLOBAL_NAME",
+		uniq = 0,
+		def_id = None
+	}
+	box_type: CoreType = UnionType("NameBox")
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				"GLOBAL_NAME",
+				216,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), SyntheticSourceLoc),
+			),
+			UnionDecl({
+				name = "NameBox",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("NameBox", 0, Some(217), [union_field(string_type())])],
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"make_name_box",
+				218,
+				[],
+				box_type,
+				UnionConstructExpr(
+					{
+						type_name = "NameBox",
+						constructor_name = "NameBox",
+						constructor_c_name = "NameBox",
+						representation = GenericUnionRepresentation,
+						payload_storage = ErasedUnionPayloadStorage,
+						uses_release_mask = False,
+						release_mask = 0,
+						args = [
+							{
+								kind = PointerBox,
+								value = VarExpr(global_name, string_type(), SyntheticSourceLoc),
+								needs_release = True,
+								transfers_ownership = False
+							},
+						]
+					},
+					box_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "make_name_box"):
+		Some(body):
+			dup_count_for("GLOBAL_NAME", body) == 1
+		None:
+			False
+
+
+pure func test_managed_global_is_retained_in_nested_record_union_payload() -> Bool:
+	global_seed: CoreVar = {
+		name = "GLOBAL_SEED",
+		uniq = 0,
+		def_id = Some(219)
+	}
+	args_type: CoreType = HeapRecordType("RenderArgs")
+	op_type: CoreType = UnionType("RenderOp")
+	args: CoreExpr = RecordConstructExpr(
+		"RenderArgs",
+		[
+			{
+				name = "temp_seed",
+				value = VarExpr(global_seed, string_type(), SyntheticSourceLoc)
+			},
+		],
+		args_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				"GLOBAL_SEED",
+				219,
+				string_type(),
+				LiteralExpr(StringLiteral("seed"), string_type(), SyntheticSourceLoc),
+			),
+			HeapRecordDecl({
+				name = "RenderArgs",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			UnionDecl({
+				name = "RenderOp",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Render", 0, Some(220), [union_field(args_type)])],
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"make_render_op",
+				221,
+				[],
+				op_type,
+				UnionConstructExpr(
+					{
+						type_name = "RenderOp",
+						constructor_name = "Render",
+						constructor_c_name = "Render",
+						representation = GenericUnionRepresentation,
+						payload_storage = ErasedUnionPayloadStorage,
+						uses_release_mask = False,
+						release_mask = 0,
+						args = [
+							{
+								kind = PointerBox,
+								value = args,
+								needs_release = True,
+								transfers_ownership = False
+							},
+						]
+					},
+					op_type,
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "make_render_op"):
+		Some(body):
+			dup_count_for("GLOBAL_SEED", body) == 1
+		None:
+			False
+
+
+pure func test_managed_global_is_retained_in_record_passed_to_union_constructor() -> Bool:
+	global_seed: CoreVar = {
+		name = "GLOBAL_SEED",
+		uniq = 0,
+		def_id = None
+	}
+	args_type: CoreType = HeapRecordType("RenderArgs")
+	op_type: CoreType = UnionType("RenderOp")
+	args: CoreExpr = RecordConstructExpr(
+		"RenderArgs",
+		[
+			{
+				name = "temp_seed",
+				value = VarExpr(global_seed, string_type(), SyntheticSourceLoc)
+			},
+		],
+		args_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program(CoreConsumeSpecialize.rewrite_program({
+		decls = [global_decl(
+				"GLOBAL_SEED",
+				222,
+				string_type(),
+				LiteralExpr(StringLiteral("seed"), string_type(), SyntheticSourceLoc),
+			), HeapRecordDecl({
+				name = "RenderArgs",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), UnionDecl({
+				name = "RenderOp",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Render", 0, Some(223), [union_field(args_type)])],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"make_render_op",
+				224,
+				[],
+				op_type,
+				user_call_expr("Render", Some(223), [], [args], op_type),
+			)],
+		foreign_includes = [],
+	}))
+
+	match function_body(program, "make_render_op"):
+		Some(body):
+			dup_count_for("GLOBAL_SEED", body) == 1
+		None:
+			False
+
+
+pure func test_managed_global_in_length_match_branch_is_retained() -> Bool:
+	global_seed: CoreVar = {
+		name = "GLOBAL_SEED",
+		uniq = 0,
+		def_id = None
+	}
+	args_type: CoreType = HeapRecordType("RenderArgs")
+	op_type: CoreType = UnionType("RenderOp")
+	args: CoreExpr = RecordConstructExpr(
+		"RenderArgs",
+		[
+			{
+				name = "temp_seed",
+				value = VarExpr(global_seed, string_type(), SyntheticSourceLoc)
+			},
+		],
+		args_type,
+		SyntheticSourceLoc,
+	)
+	call: CoreExpr = user_call_expr("Render", Some(226), [], [args], op_type)
+	body: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"values",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [
+				{
+					length = 0,
+					branch = constructor_length_branch([], ConstructorMatchBodyExpr(call))
+				},
+			],
+			geq = None,
+			fallback = None,
+			result_type = op_type,
+			loc = SyntheticSourceLoc
+		},
+		op_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program(CoreConsumeSpecialize.rewrite_program({
+		decls = [global_decl(
+				"GLOBAL_SEED",
+				225,
+				string_type(),
+				LiteralExpr(StringLiteral("seed"), string_type(), SyntheticSourceLoc),
+			), HeapRecordDecl({
+				name = "RenderArgs",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), UnionDecl({
+				name = "RenderOp",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [union_variant("Render", 0, Some(226), [union_field(args_type)])],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"make_render_op",
+				227,
+				[core_param("values", list_int_type())],
+				op_type,
+				body,
+			)],
+		foreign_includes = [],
+	}))
+
+	match function_body(program, "make_render_op"):
+		Some(rewritten):
+			dup_count_for("GLOBAL_SEED", rewritten) == 1
+		None:
+			False
+
+
+pure func test_mutable_managed_global_assignment_releases_previous_owner() -> Bool:
+	global_state: CoreVar = {
+		name = "GLOBAL_STATE",
+		uniq = 0,
+		def_id = Some(216)
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [mutable_global_decl(
+				"GLOBAL_STATE",
+				216,
+				string_type(),
+				LiteralExpr(StringLiteral("initial"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"set_state",
+				217,
+				[],
+				void_type(),
+				AssignExpr(
+					global_state,
+					LiteralExpr(StringLiteral("next"), string_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "set_state"):
+		Some(body):
+			drop_count_for("GLOBAL_STATE", body) == 1
+		None:
+			False
+
+
+pure func test_unresolved_assignment_resolves_unique_managed_global() -> Bool:
+	unresolved_state: CoreVar = {
+		name = "GLOBAL_STATE",
+		uniq = 0,
+		def_id = None
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [mutable_global_decl(
+				"GLOBAL_STATE",
+				218,
+				string_type(),
+				LiteralExpr(StringLiteral("initial"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"set_local",
+				219,
+				[],
+				void_type(),
+				AssignExpr(
+					unresolved_state,
+					LiteralExpr(StringLiteral("next"), string_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "set_local"):
+		Some(body):
+			drop_count_for("GLOBAL_STATE", body) == 1
+		None:
+			False
+
+
+pure func test_production_shaped_mutable_global_resolves_and_releases() -> Bool:
+	global_def_id: Int = 1427
+	program: CoreProgram = insert_drops_program({
+		decls = [unresolved_name_mutable_global_decl(
+				"GLOBAL_STATE",
+				global_def_id,
+				string_type(),
+				LiteralExpr(StringLiteral("initial"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"set_state",
+				1428,
+				[],
+				void_type(),
+				AssignExpr(
+					named_var("GLOBAL_STATE"),
+					LiteralExpr(StringLiteral("next"), string_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "set_state"):
+		Some(body):
+			has_drop_before_assign_for("GLOBAL_STATE", body)
+		None:
+			False
+
+
+pure func test_parameter_shadow_prevents_global_assignment_resolution() -> Bool:
+	unresolved_state: CoreVar = {
+		name = "GLOBAL_STATE",
+		uniq = 0,
+		def_id = None
+	}
+	program: CoreProgram = insert_drops_program({
+		decls = [mutable_global_decl(
+				"GLOBAL_STATE",
+				220,
+				string_type(),
+				LiteralExpr(StringLiteral("initial"), string_type(), SyntheticSourceLoc),
+			), function_decl(
+				"set_local",
+				221,
+				[core_param("GLOBAL_STATE", int_type())],
+				void_type(),
+				AssignExpr(
+					unresolved_state,
+					LiteralExpr(StringLiteral("next"), string_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "set_local"):
+		Some(body):
+			drop_count_for("GLOBAL_STATE", body) == 0
 		None:
 			False
 
@@ -5702,6 +7708,43 @@ pure func test_borrowed_match_binding_in_resource_scope_is_retained() -> Bool:
 			False
 
 
+pure func test_resource_scope_binder_shadows_unresolved_borrowed_param() -> Bool:
+	resource_type: CoreType = string_type()
+	body: CoreExpr = ResourceScopeExpr(
+		{
+			variable = named_var("resource"),
+			typ = resource_type,
+			acquire = LiteralExpr(StringLiteral("open"), resource_type, SyntheticSourceLoc),
+			body = var_expr("resource", resource_type),
+			cleanup = VoidExpr(void_type(), SyntheticSourceLoc)
+		},
+		resource_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			function_decl(
+				"read_resource",
+				1439,
+				[core_param("resource", resource_type)],
+				resource_type,
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "read_resource"):
+		Some(ResourceScopeExpr(scope, typ, loc)):
+			match scope.body:
+				VarExpr(variable, body_type, body_loc):
+					variable.name == "resource"
+				_:
+					False
+		_:
+			False
+
+
 pure func test_borrowed_match_binding_is_retained_once_with_multiple_params() -> Bool:
 	payload_type: CoreType = list_int_type()
 	result_type: CoreType = TupleType([payload_type])
@@ -5810,6 +7853,138 @@ pure func test_borrowed_match_binding_is_retained_for_inferred_consuming_call() 
 	match function_body(program, "consume_matched_payload"):
 		Some(rewritten):
 			dup_count_for("payload", rewritten) == 1
+		None:
+			False
+
+
+pure func test_consumed_parameter_owner_outlives_borrowed_match_payload_retain() -> Bool:
+	pattern_type: CoreType = UnionType("Pattern")
+	tag_type: CoreType = UnionType("Tag")
+	payload_type: CoreType = list_int_type()
+	payload_binding: CoreMatchBinding = {
+		variable = named_var("payload"),
+		typ = payload_type,
+		accessor = VariantFieldAccessor(RootAccessor, "Tag", "Some", 0),
+		mode = MatchBorrowBindingMode
+	}
+	take_tag: CoreDecl = function_decl(
+		"take_tag",
+		225,
+		[core_param("value", tag_type)],
+		tag_type,
+		var_expr("value", tag_type),
+	)
+	take_payload: CoreDecl = function_decl(
+		"take_payload",
+		226,
+		[core_param("value", payload_type)],
+		payload_type,
+		intrinsic_expr("list_ensure_unique", [var_expr("value", payload_type)], payload_type),
+	)
+	consume_owner: CoreExpr = LetExpr(
+		named_var("taken_tag"),
+		False,
+		tag_type,
+		user_call_expr("take_tag", Some(225), [], [var_expr("actual", tag_type)], tag_type),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	consume_payload: CoreExpr = LetExpr(
+		named_var("taken_payload"),
+		False,
+		payload_type,
+		user_call_expr(
+			"take_payload",
+			Some(226),
+			[],
+			[var_expr("payload", payload_type)],
+			payload_type,
+		),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	inspect_payload: CoreExpr = ConstructorMatchExpr(
+		var_expr("actual", tag_type),
+		NoReleasePolicy,
+		[constructor_case(
+				"Some",
+				[payload_binding],
+				IfExpr(
+					bool_expr(True),
+					consume_payload,
+					VoidExpr(void_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		ConstructorMatchFallbackBody(VoidExpr(void_type(), SyntheticSourceLoc)),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	match_body: CoreExpr = ConstructorMatchExpr(
+		var_expr("pattern", pattern_type),
+		NoReleasePolicy,
+		[constructor_case(
+				"PatternNamed",
+				[],
+				IfExpr(
+					bool_expr(True),
+					consume_owner,
+					inspect_payload,
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			)],
+		ConstructorMatchFallbackBody(VoidExpr(void_type(), SyntheticSourceLoc)),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("actual"),
+		False,
+		tag_type,
+		var_expr("source", tag_type),
+		match_body,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			UnionDecl({
+				name = "Pattern",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("PatternVar", 0, None, []),
+					union_variant("PatternNamed", 1, None, []),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			UnionDecl({
+				name = "Tag",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("Some", 0, None, [union_field(payload_type)]),
+					union_variant("None", 1, None, []),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			take_tag,
+			take_payload,
+			function_decl(
+				"bind_payload",
+				227,
+				[core_param("pattern", pattern_type)],
+				void_type(),
+				body,
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "bind_payload"):
+		Some(rewritten):
+			(
+				dup_count_for("payload", rewritten) == 1
+				and not owner_drop_wraps_payload_dup("actual", "payload", rewritten)
+			)
 		None:
 			False
 
@@ -5993,6 +8168,10 @@ tests: TestSuite = {
 			test_borrowed_managed_parameter_field_return_is_retained,
 		),
 		(
+			"borrowed match field embedded in union result is retained",
+			test_borrowed_match_field_embedded_in_union_result_is_retained,
+		),
+		(
 			"managed field of owned temporary return is retained",
 			test_managed_field_of_owned_temporary_return_is_retained,
 		),
@@ -6033,12 +8212,12 @@ tests: TestSuite = {
 			test_borrowed_match_binding_retains_repeated_consume,
 		),
 		(
-			"union construction retains borrowed parameter payload",
-			test_union_construction_retains_borrowed_parameter_payload,
+			"union construction transfers consumed parameter payload",
+			test_union_construction_transfers_consumed_parameter_payload,
 		),
 		(
-			"tuple construction retains borrowed parameter member",
-			test_tuple_construction_retains_borrowed_parameter_member,
+			"tuple construction transfers consumed parameter member",
+			test_tuple_construction_transfers_consumed_parameter_member,
 		),
 		(
 			"consuming user call propagates consumed parameter",
@@ -6146,6 +8325,10 @@ tests: TestSuite = {
 			test_lambda_temporaries_and_captured_owner_are_dropped,
 		),
 		(
+			"unmanaged lambda result preserves consumed capture",
+			test_unmanaged_lambda_result_preserves_consumed_capture,
+		),
+		(
 			"static lambda temporary needs no owned binding",
 			test_static_lambda_temporary_needs_no_owned_binding,
 		),
@@ -6240,6 +8423,10 @@ tests: TestSuite = {
 			test_mutable_assignment_in_branch_releases_replaced_owner,
 		),
 		(
+			"mutable consuming condition preserves else assignment owner",
+			test_mutable_consuming_condition_preserves_else_assignment_owner,
+		),
+		(
 			"mutable assignment in while releases replaced owner",
 			test_mutable_assignment_in_while_releases_replaced_owner,
 		),
@@ -6274,6 +8461,10 @@ tests: TestSuite = {
 		(
 			"consuming while body retains owner for each iteration",
 			test_consuming_while_body_retains_owner_for_each_iteration,
+		),
+		(
+			"consuming user call in while retains function parameter",
+			test_consuming_user_call_in_while_retains_function_parameter,
 		),
 		(
 			"consuming match branch in loop retains owner for each iteration",
@@ -6379,12 +8570,173 @@ tests: TestSuite = {
 			test_branch_alias_binding_normalizes_rhs_ownership,
 		),
 		(
+			"match field alias binding normalizes RHS ownership",
+			test_match_field_alias_binding_normalizes_rhs_ownership,
+		),
+		(
 			"tuple field alias binding retains field owner",
 			test_tuple_field_alias_binding_retains_field_owner,
 		),
 		(
 			"borrowed owned temporary argument is dropped",
 			test_borrowed_owned_temporary_argument_is_dropped,
+		),
+		(
+			"borrowed string literal argument is dropped",
+			test_borrowed_string_literal_argument_is_dropped,
+		),
+		(
+			"string literal list element transfers ownership",
+			test_string_literal_list_element_transfers_ownership,
+		),
+		(
+			"resolved global read preserves existing definition id",
+			test_resolved_global_read_preserves_existing_definition_id,
+		),
+		(
+			"unresolved global read receives unique definition id",
+			test_unresolved_global_read_receives_unique_definition_id,
+		),
+		(
+			"resolved assignment preserves existing definition id",
+			test_resolved_assignment_preserves_existing_definition_id,
+		),
+		(
+			"unresolved global assignment target receives definition id",
+			test_unresolved_global_assignment_target_receives_definition_id,
+		),
+		(
+			"same-named local remains unresolved during global repair",
+			test_same_named_local_remains_unresolved_during_global_repair,
+		),
+		(
+			"nested binders remain unresolved during global repair",
+			test_nested_binders_remain_unresolved_during_global_repair,
+		),
+		(
+			"irrelevant managed global leaves unrelated body unchanged",
+			test_irrelevant_managed_global_leaves_unrelated_body_unchanged,
+		),
+		(
+			"global definition id is normalized from declaration",
+			test_global_definition_id_is_normalized_from_declaration,
+		),
+		(
+			"same-named definition is not retained as global",
+			test_same_named_definition_is_not_retained_as_global,
+		),
+		(
+			"global retention uses definition identity",
+			test_global_retention_uses_definition_identity,
+		),
+		(
+			"global reference identity includes qualified name",
+			test_global_reference_identity_includes_qualified_name,
+		),
+		(
+			"exact global reference survives same-name ambiguity",
+			test_exact_global_reference_survives_same_name_ambiguity,
+		),
+		(
+			"duplicate exact global identity is retained once",
+			test_duplicate_exact_global_identity_is_retained_once,
+		),
+		(
+			"resolved global is retained under same-named parameter",
+			test_resolved_global_is_retained_under_same_named_parameter,
+		),
+		(
+			"alias contract correlates exact argument identity",
+			test_alias_contract_correlates_exact_argument_identity,
+		),
+		(
+			"exact alias contract accepts sequence result",
+			test_exact_alias_contract_accepts_sequence_result,
+		),
+		("exact alias contract follows let alias", test_exact_alias_contract_follows_let_alias),
+		(
+			"exact alias contract follows branch result",
+			test_exact_alias_contract_follows_branch_result,
+		),
+		(
+			"exact alias contract follows literal match result",
+			test_exact_alias_contract_follows_literal_match_result,
+		),
+		(
+			"exact alias contract follows accessor literal match result",
+			test_exact_alias_contract_follows_accessor_literal_match_result,
+		),
+		(
+			"exact alias contract follows length match result",
+			test_exact_alias_contract_follows_length_match_result,
+		),
+		(
+			"exact alias contract follows constructor match result",
+			test_exact_alias_contract_follows_constructor_match_result,
+		),
+		(
+			"exact alias contract follows borrowed match binding",
+			test_exact_alias_contract_follows_borrowed_match_binding,
+		),
+		(
+			"exact alias contract follows resource scope result",
+			test_exact_alias_contract_follows_resource_scope_result,
+		),
+		(
+			"exact alias contract recognizes retained wrapped result",
+			test_exact_alias_contract_recognizes_retained_wrapped_result,
+		),
+		(
+			"exact alias contract rejects reassigned definition",
+			test_exact_alias_contract_rejects_reassigned_definition,
+		),
+		(
+			"literal match parameter result is retained",
+			test_literal_match_parameter_result_is_retained,
+		),
+		(
+			"accessor literal match parameter result is retained",
+			test_accessor_literal_match_parameter_result_is_retained,
+		),
+		(
+			"length match parameter result is retained",
+			test_length_match_parameter_result_is_retained,
+		),
+		(
+			"managed global is retained when stored in record",
+			test_managed_global_is_retained_when_stored_in_record,
+		),
+		(
+			"managed global is retained in releasing union slot",
+			test_managed_global_is_retained_in_releasing_union_slot,
+		),
+		(
+			"managed global is retained in nested record union payload",
+			test_managed_global_is_retained_in_nested_record_union_payload,
+		),
+		(
+			"managed global is retained in record passed to union constructor",
+			test_managed_global_is_retained_in_record_passed_to_union_constructor,
+		),
+		(
+			"managed global in length match branch is retained",
+			test_managed_global_in_length_match_branch_is_retained,
+		),
+		(
+			"mutable managed global assignment releases previous owner",
+			test_mutable_managed_global_assignment_releases_previous_owner,
+		),
+		(
+			"unresolved assignment resolves unique managed global",
+			test_unresolved_assignment_resolves_unique_managed_global,
+		),
+		(
+			"production-shaped mutable global resolves and releases",
+			test_production_shaped_mutable_global_resolves_and_releases,
+		),
+		(
+			"parameter shadow prevents global assignment resolution",
+			test_parameter_shadow_prevents_global_assignment_resolution,
 		),
 		(
 			"inferred union call borrowed temporary is dropped",
@@ -6440,6 +8792,10 @@ tests: TestSuite = {
 			test_borrowed_match_binding_in_resource_scope_is_retained,
 		),
 		(
+			"resource scope binder shadows unresolved borrowed param",
+			test_resource_scope_binder_shadows_unresolved_borrowed_param,
+		),
+		(
 			"borrowed match binding is retained once with multiple params",
 			test_borrowed_match_binding_is_retained_once_with_multiple_params,
 		),
@@ -6450,6 +8806,10 @@ tests: TestSuite = {
 		(
 			"borrowed match binding is retained for inferred consuming call",
 			test_borrowed_match_binding_is_retained_for_inferred_consuming_call,
+		),
+		(
+			"consumed parameter owner outlives borrowed match payload retain",
+			test_consumed_parameter_owner_outlives_borrowed_match_payload_retain,
 		),
 		(
 			"nested aggregate call retains borrowed match binding",

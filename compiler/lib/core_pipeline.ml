@@ -78,16 +78,6 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 
 let no_op_on_stage_json : on_stage_json_callback = fun _ _ -> ()
 
-let stage_observed_via_blorp_tail_json = function
-  | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
-  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
-      true
-  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
-  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Specialize ->
-      false
-
 let blorp_tail_stage_name = function
   | ( Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
     | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ) as stage ->
@@ -237,13 +227,63 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
   in
   { blorp_tail_input = pre_dce }
 
+let max_definition_id current candidate =
+  match (current, candidate) with
+  | current, None -> current
+  | None, Some id -> Some id
+  | Some current_id, Some id -> Some (max current_id id)
+
+let max_function_definition_id current func =
+  max_definition_id current (Typed_ast.func_callable_id func)
+
+let rec max_typed_decl_definition_id current decl =
+  let current =
+    match Typed_ast.decl_view decl with
+    | Typed_ast.DeclFunction func ->
+        max_function_definition_id current func
+    | Typed_ast.DeclImpl impl ->
+        List.fold_left max_function_definition_id current
+          (Typed_ast.impl_methods impl)
+    | Typed_ast.DeclPrivate inner ->
+        max_typed_decl_definition_id current inner
+    | Typed_ast.DeclVar _ | Typed_ast.DeclRecord _
+    | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclOther ->
+        current
+  in
+  match (Typed_ast.decl_ast decl).Ast.decl_desc with
+  | Ast.DType type_decl ->
+      List.fold_left
+        (fun max_id variant ->
+          max_definition_id max_id variant.Ast.variant_def_id)
+        current type_decl.type_variants
+  | Ast.DFunc _ | Ast.DRecord _ | Ast.DVar _ | Ast.DImport _
+  | Ast.DPrivate _ | Ast.DTrait _ | Ast.DImpl _ | Ast.DTypeAlias _ ->
+      current
+
+(** Reset per-compilation counters while reserving the source identity range
+    carried by typed frontend artifacts. Generated globals, lambdas, and
+    specializations must never reuse a source function or constructor DefId. *)
+let reset_core_counters_for_typed_programs typed_programs =
+  let session = Session.current () in
+  Session.reset_core_counters session;
+  let max_source_id =
+    List.fold_left
+      (fun max_id program ->
+        List.fold_left max_typed_decl_definition_id max_id
+          (Typed_ast.program_decls program))
+      None typed_programs
+  in
+  Option.iter
+    (fun source_id -> Session.reserve_def_id_floor session (source_id + 1))
+    max_source_id
+
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(on_stage_event = no_op_on_stage_event)
     ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
     ?(check_invariants = false) (typed_program : Typed_ast.program) : string =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
-  Session.reset_core_counters (Session.current ());
+  reset_core_counters_for_typed_programs [ typed_program ];
   let core_prog = Core_lower.lower_typed_program typed_program in
   (* Share one registry across mono and emit so type aliases registered at
      either end are visible to both. See [compile_with_modules] for the
@@ -301,7 +341,7 @@ let typed_decl_label typed_decl =
   | Ast.DType t -> "type " ^ t.type_name
   | _ -> "decl"
 
-let lower_typed_module (module_input : typed_module_input) =
+let lower_typed_module ~module_programs (module_input : typed_module_input) =
   let core_decls =
     List.map
       (fun typed_decl ->
@@ -319,7 +359,9 @@ let lower_typed_module (module_input : typed_module_input) =
               module_input.typed_module_name msg)
       (Typed_ast.program_decls module_input.typed_module_program)
   in
-  Core_flatten.prefix_module_names module_input.typed_module_name core_decls
+  Core_flatten.prefix_module_names
+    ~import_bindings:module_input.typed_module_import_bindings ~module_programs
+    module_input.typed_module_name core_decls
 
 (** Restore the resource-cleanup metadata carried by a post-typecheck program.
     OCaml typechecking registers this metadata directly, while decoded Blorp
@@ -358,8 +400,8 @@ let register_typechecked_resource_cleanups ~module_name typed_program =
 let prepare_typed_with_module_inputs ?(main_import_bindings = [])
     ?(main_module_name = "") ~(modules : typed_module_input list)
     (typed_main : Typed_ast.program) =
-  let program = Typed_ast.program_ast typed_main in
-  Session.reset_core_counters (Session.current ());
+  reset_core_counters_for_typed_programs
+    (typed_main :: List.map (fun input -> input.typed_module_program) modules);
   List.iter
     (fun module_input ->
       register_typechecked_resource_cleanups
@@ -367,10 +409,20 @@ let prepare_typed_with_module_inputs ?(main_import_bindings = [])
         module_input.typed_module_program)
     modules;
   register_typechecked_resource_cleanups ~module_name:main_module_name typed_main;
-  let module_core = List.concat_map lower_typed_module modules in
+  let module_programs =
+    List.map
+      (fun module_input ->
+        ( module_input.typed_module_name,
+          Typed_ast.program_ast module_input.typed_module_program ))
+      modules
+  in
+  let module_core =
+    List.concat_map (lower_typed_module ~module_programs) modules
+  in
   let main_core =
     Core_lower.lower_typed_program typed_main
-    |> Core_flatten.rewrite_main_imported_type_names program
+    |> Core_flatten.rewrite_main_imported_type_names_from_bindings
+         ~main_import_bindings ~module_programs
   in
   let module_bindings =
     List.map

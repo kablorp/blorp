@@ -45,6 +45,29 @@ tests: TestSuite = {
     "comment main ignored" false
     (Blorp.Test_runner.has_top_level_main_source source)
 
+let test_doctest_detection_requires_a_docstring_block () =
+  let actual_doctest =
+    {|
+---
+Examples.
+
+doctests:
+    :: returns true
+    True
+---
+pure func documented() -> Bool: True
+|}
+  in
+  let parser_fixture =
+    {|program_source: String = "---\nExamples.\n\ndoctests:\n    :: true\n    True\n---"|}
+  in
+  Alcotest.(check bool)
+    "docstring doctests detected" true
+    (Blorp.Test_runner.source_mentions_doctests actual_doctest);
+  Alcotest.(check bool)
+    "escaped parser fixture is not a doctest" false
+    (Blorp.Test_runner.source_mentions_doctests parser_fixture)
+
 let test_sanitizer_mode_parsing () =
   let open Blorp.Test_runner in
   let check label input expected =
@@ -98,6 +121,101 @@ let test_capture_timeout_sends_sigterm_before_sigkill () =
     |> List.exists (fun line -> String.trim line = "TERM")
   in
   Alcotest.(check bool) "SIGTERM handler output" true saw_term_line
+
+let test_capture_timeout_progress_marker_resets_deadline () =
+  let code, output =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "printf '__BLORP_TEST_' >&2; sleep 0.4; "
+        ^ "printf 'PROGRESS__ 0 BEGIN first\\n' >&2; sleep 0.4; "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 END first\\n' >&2; sleep 0.4";
+      ]
+  in
+  Alcotest.(check int) "progressing process exits normally" 0 code;
+  let saw_progress_marker =
+    output |> String.split_on_char '\n'
+    |> List.exists (fun line ->
+           String.trim line = "__BLORP_TEST_PROGRESS__ 0 BEGIN first")
+  in
+  Alcotest.(check bool)
+    "captures progress markers" true saw_progress_marker
+
+let test_capture_timeout_ignores_unrecognized_output () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do printf 'ordinary output\\n' >&2; "
+        ^ "sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "ordinary output does not extend timeout" 124 code
+
+let test_capture_timeout_ignores_malformed_progress_records () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for line in '__BLORP_TEST_PROGRESS__' "
+        ^ "'__BLORP_TEST_PROGRESS__ nope BEGIN test' "
+        ^ "'prefix __BLORP_TEST_PROGRESS__ 0 END test'; do "
+        ^ "printf '%s\\n' \"$line\" >&2; sleep 0.4; done";
+      ]
+  in
+  Alcotest.(check int) "malformed records do not extend timeout" 124 code
+
+let test_capture_timeout_ignores_replayed_progress_records () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~progress_count:1
+      ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n' >&2; "
+        ^ "sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "replayed BEGIN records do not extend timeout" 124 code
+
+let test_capture_timeout_ignores_progress_marker_on_stdout () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n'; sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "stdout cannot extend timeout" 124 code
+
+let test_capture_timeout_keeps_progress_separate_from_stdout () =
+  let check_capture label timeout =
+    let code, output =
+      Blorp.Test_runner.run_process_capture_timeout
+        ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout "/bin/sh"
+        [
+          "-c";
+          "printf 'stdout-before'; "
+          ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n' >&2; "
+          ^ "printf '%s\\n' '-after'";
+        ]
+    in
+    Alcotest.(check int) (label ^ " exits normally") 0 code;
+    let lines = String.split_on_char '\n' output in
+    Alcotest.(check bool)
+      (label ^ " keeps stderr out of stdout framing") true
+      (List.mem "stdout-before-after" lines
+      && List.mem "__BLORP_TEST_PROGRESS__ 0 BEGIN test" lines)
+  in
+  check_capture "bounded timeout" (Some 2);
+  check_capture "disabled timeout" None;
+  check_capture "zero timeout" (Some 0)
 
 let process_exists pid =
   try
@@ -734,6 +852,30 @@ let test_suite_run_all_harness_calls_generated_functions () =
     && contains_substring source
          "__BLORP_SUITE_RUN_ALL_END__ 1 FAIL tests/test_blorp/b.brp");
   Alcotest.(check bool)
+    "keeps result framing ordered on stdout" true
+    (contains_substring source
+       "print(\"__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp\")"
+    && contains_substring source
+         "print(\"__BLORP_SUITE_RUN_ALL_END__ 1 FAIL tests/test_blorp/b.brp\")"
+    && not
+         (contains_substring source
+            "print_error(\"__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp\")"));
+  Alcotest.(check bool)
+    "writes separate progress heartbeats to unbuffered stderr" true
+    (contains_substring source
+       "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 BEGIN tests/test_blorp/a.brp\")"
+    && contains_substring source
+         "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 END tests/test_blorp/b.brp\")");
+  let nonce_source =
+    Blorp.Test_runner.generate_suite_run_all_harness
+      ~progress_marker:"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce"
+      [ "tests/test_blorp/a.brp" ]
+  in
+  Alcotest.(check bool)
+    "embeds the run-specific progress marker" true
+    (contains_substring nonce_source
+       "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce 0 BEGIN tests/test_blorp/a.brp\")");
+  Alcotest.(check bool)
     "copies suite before run_suite" true
     (contains_substring source "suite: TestSuite = T0.tests"
     && contains_substring source "passed: Bool = run_suite(suite)"
@@ -745,6 +887,60 @@ let test_suite_run_all_harness_calls_generated_functions () =
   Alcotest.(check bool)
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
+
+let test_suite_run_all_streams_preserve_stderr_diagnostics () =
+  let files = [ "tests/a.brp"; "tests/b.brp" ] in
+  let stdout_output =
+    "__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/a.brp\n"
+    ^ "first stdout\n"
+    ^ "__BLORP_SUITE_RUN_ALL_END__ 0 FAIL tests/a.brp\n"
+    ^ "__BLORP_SUITE_RUN_ALL_BEGIN__ 1 tests/b.brp\n"
+    ^ "second stdout\n"
+    ^ "__BLORP_SUITE_RUN_ALL_END__ 1 PASS tests/b.brp\n"
+  in
+  let stderr_output =
+    "__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 BEGIN tests/a.brp\n"
+    ^ "first diagnostic\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 END tests/a.brp\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 BEGIN tests/b.brp\n"
+    ^ "second diagnostic\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 END tests/b.brp\n"
+  in
+  match
+    Blorp.Test_runner.suite_run_all_results_from_streams ~elapsed:0.25 files
+      ~stdout_output ~stderr_output
+  with
+  | Some [ first; second ] ->
+      Alcotest.(check bool) "first suite failed" false first.passed;
+      Alcotest.(check bool)
+        "first stderr stays with first suite" true
+        (contains_substring first.output "first diagnostic"
+        && not (contains_substring first.output "second diagnostic"));
+      Alcotest.(check bool) "second suite passed" true second.passed;
+      Alcotest.(check bool)
+        "second stderr stays with second suite" true
+        (contains_substring second.output "second diagnostic"
+        && not (contains_substring second.output "first diagnostic"))
+  | Some results ->
+      Alcotest.failf "expected two parsed suite results, got %d"
+        (List.length results)
+  | None -> Alcotest.fail "expected valid split-stream suite output"
+
+let test_timing_event_has_stable_machine_readable_format () =
+  let event : Blorp.Test_runner.timing_event =
+    {
+      timing_phase = HarnessFrontendGraph;
+      timing_group = "run_all_0";
+      timing_suite_count = 4;
+      timing_source_count = 4;
+      timing_duration_ms = 1234;
+    }
+  in
+  Alcotest.(check string)
+    "timing record"
+    "BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 \
+     duration_ms=1234"
+    (Blorp.Test_runner.format_timing_event event)
 
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
@@ -775,40 +971,32 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
     "system resource suites are process isolated" true
     (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/sys/test_file_resource.brp");
-	  Alcotest.(check bool)
-	    "compiler resource declaration suite is process isolated" true
-	    (Blorp.Test_runner.requires_process_isolation
-	       "compiler/blorp/tests/test_compiler_typecheck_resource_decl.brp");
-	  Alcotest.(check bool)
-	    "compiler impl declaration suite is process isolated" true
-	    (Blorp.Test_runner.requires_process_isolation
-	       "compiler/blorp/tests/test_compiler_typecheck_impl_decl.brp");
-	  Alcotest.(check bool)
-	    "ordinary type suite is not process isolated" false
-	    (Blorp.Test_runner.requires_process_isolation
-       "tests/test_blorp/types/test_bool.brp")
-
-let test_execution_isolation_does_not_force_separate_compilation () =
   Alcotest.(check bool)
-    "concurrency suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/concurrency/test_list_concurrent.brp");
-  Alcotest.(check bool)
-    "memory suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/memory/test_memstats_observability.brp");
-  Alcotest.(check bool)
-    "system suites share a compiled selector" false
-    (Blorp.Test_runner.requires_compilation_isolation
-       "tests/test_blorp/sys/test_file_resource.brp");
-  Alcotest.(check bool)
-    "known compiler module-init conflict compiles separately" true
-    (Blorp.Test_runner.requires_compilation_isolation
+    "compiler declaration suites are not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
        "compiler/blorp/tests/test_compiler_typecheck_decl.brp");
   Alcotest.(check bool)
-    "ordinary suites share a compiled harness" false
-    (Blorp.Test_runner.requires_compilation_isolation
+    "ordinary type suite is not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
+
+let test_compilation_groups_follow_source_budget_not_suite_count () =
+  let five_small_suites = [ "a"; "b"; "c"; "d"; "e" ] in
+  Alcotest.(check (list (list string)))
+    "five small suites remain one group" [ five_small_suites ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:5
+       ~source_size:(fun _ -> 1) five_small_suites);
+  Alcotest.(check (list (list string)))
+    "groups preserve order and respect accumulated source size"
+    [ [ "a" ]; [ "b"; "c" ] ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:100
+       ~source_size:(function "a" -> 40 | "b" -> 70 | _ -> 20)
+       [ "a"; "b"; "c" ]);
+  Alcotest.(check (list (list string)))
+    "one oversized suite forms its own group" [ [ "large" ]; [ "small" ] ]
+    (Blorp.Test_runner.group_by_source_size_budget ~max_source_bytes:100
+       ~source_size:(function "large" -> 150 | _ -> 10)
+       [ "large"; "small" ])
 
 let test_source_text_cache_guard_uses_current_file_contents () =
   with_temp_dir "blorp-source-cache-guard-" (fun dir ->
@@ -832,38 +1020,37 @@ let test_source_text_cache_guard_uses_current_file_contents () =
         (Blorp.Test_runner.source_text_matches_current_file path
            (Some "func main(args: List[String]) -> Int: 1\n")))
 
-let test_suite_harness_runs_combined_without_result_cache () =
+let test_suite_harness_combines_globals_without_result_cache () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
       let home = Filename.concat dir "home" in
       Unix.mkdir home 0o700;
-      write_file
-        (Filename.concat dir "a.brp")
-        {|
+      let suite_source name test_result =
+        Printf.sprintf
+          {|
 import:
     test: TestSuite
 
-func test_a() -> Bool:
-    True
+func test_%s() -> Bool:
+    %s
 
 tests: TestSuite = {
-    description = "A",
-    tests = [("a", test_a)]
+    description = "%s",
+    tests = [("%s", test_%s)]
 }
-|};
-      write_file
-        (Filename.concat dir "b.brp")
-        {|
-import:
-    test: TestSuite
 
-func test_b() -> Bool:
-    True
-
-tests: TestSuite = {
-    description = "B",
-    tests = [("b", test_b)]
+unused_tests: TestSuite = {
+    description = "Unused %s",
+    tests = []
 }
-|};
+|}
+          name test_result (String.uppercase_ascii name) name name name
+      in
+      List.iter
+        (fun name ->
+          write_file
+            (Filename.concat dir (name ^ ".brp"))
+            (suite_source name "True"))
+        [ "a"; "b"; "c"; "d"; "e" ];
       let old_cwd = Sys.getcwd () in
       Fun.protect
         ~finally:(fun () -> Sys.chdir old_cwd)
@@ -880,7 +1067,86 @@ tests: TestSuite = {
               Alcotest.(check int) "combined suite run" 0 code;
               Alcotest.(check bool)
                 "run-all skips per-file result cache" false
-                (Sys.file_exists test_results_dir))))
+                (Sys.file_exists test_results_dir);
+              write_file
+                (Filename.concat dir "e.brp")
+                (suite_source "e" "False");
+              let failing_code =
+                Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+                  ~cache:false "."
+              in
+              Alcotest.(check int)
+                "combined suite reports a normal test failure" 1 failing_code;
+              write_file
+                (Filename.concat dir "e.brp")
+                (suite_source "e" "True");
+              let leak_check_environment_before =
+                Sys.getenv_opt "BLORP_LEAK_CHECK"
+              in
+              let leak_check_code =
+                Blorp.Test_runner.run_tests ~leak_check:true
+                  ~timeout:(Some 10) ~jobs:1 ~cache:false "."
+              in
+              Alcotest.(check int)
+                "combined globals pass leak checking" 0 leak_check_code;
+              Alcotest.(check (option string))
+                "leak checking does not mutate the host environment"
+                leak_check_environment_before
+                (Sys.getenv_opt "BLORP_LEAK_CHECK"))))
+
+let test_suite_harness_uses_blorp_frontend () =
+  with_temp_dir "blorp-suite-frontend-" (fun dir ->
+      let home = Filename.concat dir "home" in
+      Unix.mkdir home 0o700;
+      write_file
+        (Filename.concat dir "qualified_process.brp")
+        {|
+import:
+    process as Process
+    test: TestSuite
+
+private pure func exit_code(exit: Process.ProcessExit) -> Int:
+    match exit:
+        Process.Exited(code):
+            code
+        Process.Signaled(_):
+            -1
+        Process.TimedOut:
+            -1
+
+func test_qualified_process_constructor() -> Bool:
+    exit_code(Process.Exited(7)) == 7
+
+tests: TestSuite = {
+    description = "Qualified process",
+    tests = [("qualified process constructor", test_qualified_process_constructor)]
+}
+|};
+      write_file
+        (Filename.concat dir "ordinary.brp")
+        {|
+import:
+    test: TestSuite
+
+func test_ordinary() -> Bool:
+    True
+
+tests: TestSuite = {
+    description = "Ordinary",
+    tests = [("ordinary", test_ordinary)]
+}
+|};
+      let old_cwd = Sys.getcwd () in
+      Fun.protect
+        ~finally:(fun () -> Sys.chdir old_cwd)
+        (fun () ->
+          Sys.chdir dir;
+          with_isolated_home_preserving_bridge_cache home (fun () ->
+              let code =
+                Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
+                  ~cache:false "."
+              in
+              Alcotest.(check int) "Blorp frontend suite run" 0 code)))
 
 let test_suite_selector_compile_failure_is_hard_failure () =
   with_temp_dir "blorp-suite-selector-fail-" (fun dir ->
@@ -990,6 +1256,8 @@ let suite =
         Alcotest.test_case "string_literal" `Quick
           test_top_level_main_ignores_string_literal;
         Alcotest.test_case "comment" `Quick test_top_level_main_ignores_comment;
+        Alcotest.test_case "doctest_block" `Quick
+          test_doctest_detection_requires_a_docstring_block;
       ] );
     ( "timeouts",
       [
@@ -997,6 +1265,18 @@ let suite =
           test_capture_timeout_does_not_wait_for_inherited_pipe;
         Alcotest.test_case "capture_timeout_sigterm_before_sigkill" `Quick
           test_capture_timeout_sends_sigterm_before_sigkill;
+        Alcotest.test_case "capture_timeout_progress_marker" `Quick
+          test_capture_timeout_progress_marker_resets_deadline;
+        Alcotest.test_case "capture_timeout_ignores_other_output" `Quick
+          test_capture_timeout_ignores_unrecognized_output;
+        Alcotest.test_case "capture_timeout_ignores_malformed_progress" `Quick
+          test_capture_timeout_ignores_malformed_progress_records;
+        Alcotest.test_case "capture_timeout_ignores_replayed_progress" `Quick
+          test_capture_timeout_ignores_replayed_progress_records;
+        Alcotest.test_case "capture_timeout_ignores_stdout_marker" `Quick
+          test_capture_timeout_ignores_progress_marker_on_stdout;
+        Alcotest.test_case "capture_timeout_separates_progress_stream" `Quick
+          test_capture_timeout_keeps_progress_separate_from_stdout;
         Alcotest.test_case "capture_timeout_kills_descendants" `Quick
           test_capture_timeout_kills_descendant_processes;
         Alcotest.test_case "capture_process_cwd_env" `Quick
@@ -1051,16 +1331,22 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "run_all_preserves_stderr_diagnostics" `Quick
+          test_suite_run_all_streams_preserve_stderr_diagnostics;
+        Alcotest.test_case "timing_record_format" `Quick
+          test_timing_event_has_stable_machine_readable_format;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
           test_runtime_sensitive_suite_paths_require_process_isolation;
-        Alcotest.test_case "execution_and_compilation_isolation" `Quick
-          test_execution_isolation_does_not_force_separate_compilation;
+        Alcotest.test_case "source_budget_compilation_groups" `Quick
+          test_compilation_groups_follow_source_budget_not_suite_count;
         Alcotest.test_case "source_text_cache_guard" `Quick
           test_source_text_cache_guard_uses_current_file_contents;
-        Alcotest.test_case "combined_harness_skips_result_cache" `Quick
-          test_suite_harness_runs_combined_without_result_cache;
+        Alcotest.test_case "combined_harness_globals_and_result_cache" `Quick
+          test_suite_harness_combines_globals_without_result_cache;
+        Alcotest.test_case "uses_blorp_frontend" `Quick
+          test_suite_harness_uses_blorp_frontend;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick
           test_suite_selector_compile_failure_is_hard_failure;
         Alcotest.test_case "uses_leak_check_runner" `Quick

@@ -11,6 +11,7 @@ import:
 			ParsedBoolLiteralExpr,
 			ParsedCallExpr,
 			ParsedDictExpr,
+			ParsedFloatLiteralExpr,
 			ParsedIntLiteralExpr,
 			ParsedListExpr,
 			ParsedNameExpr,
@@ -18,6 +19,7 @@ import:
 			ParsedStringLiteralExpr,
 			ParsedTupleExpr,
 		),
+	../src/stage_05_types/compiler_refinement: compiler_unrefined_binding
 	../src/stage_05_types/compiler_type:
 		CompilerType(CompilerFunctionType, CompilerNamedType, CompilerRangeType, CompilerTupleType),
 		compiler_type_int,
@@ -25,16 +27,20 @@ import:
 		compiler_type_string,
 		compiler_type_void,
 		compiler_types_equal,
+	../src/stage_05_types/compiler_type_widening: CompilerTypeWideningDecision(CompilerTypeKeep)
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerCallableOrigin(CompilerCallableConstructor, CompilerCallableLocal),
+		CompilerExprTypeOrigin(CompilerSynthesizedOrigin),
 		CompilerResolvedCallTarget(CompilerResolvedDirectCall),
 		CompilerTypedExpr(
 			CompilerTypedBoolLiteralExpr,
 			CompilerTypedCallExpr,
 			CompilerTypedCharLiteralExpr,
 			CompilerTypedDictExpr,
+			CompilerTypedFloatLiteralExpr,
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedListExpr,
+			CompilerTypedLambdaExpr,
 			CompilerTypedNameExpr,
 			CompilerTypedRangeExpr,
 			CompilerTypedRecordExpr,
@@ -44,14 +50,22 @@ import:
 		),
 		compiler_typed_expr_resolved_call,
 		compiler_typed_expr_value_type,
+	../src/stage_07_ctfe/compiler_ctfe_env: compiler_ctfe_bind_local_value, compiler_ctfe_env_empty
 	../src/stage_07_ctfe/compiler_ctfe_materialize:
+		CompilerCtfeMaterializeError(
+			CompilerCtfeCapturedLambda,
+			CompilerCtfeLambdaSourceUnavailable,
+		),
 		compiler_ctfe_materialize_parsed_expr,
 		compiler_ctfe_materialize_value,
 	../src/stage_07_ctfe/compiler_ctfe_value:
+		CompilerCtfeEnv,
+		CompilerCtfeLambdaSource,
 		CompilerCtfeValue,
 		CompilerCtfeValueDesc(
 			CompilerCtfeConstructorValue,
 			CompilerCtfeDictValue,
+			CompilerCtfeLambdaValue,
 			CompilerCtfeListValue,
 			CompilerCtfeRangeValue,
 			CompilerCtfeRecordValue,
@@ -60,6 +74,7 @@ import:
 		compiler_ctfe_bool,
 		compiler_ctfe_char,
 		compiler_ctfe_constructor_info,
+		compiler_ctfe_float,
 		compiler_ctfe_function_reference,
 		compiler_ctfe_int,
 		compiler_ctfe_string,
@@ -80,6 +95,10 @@ pure func source_span() -> CompilerSourceSpan:
 
 pure func int_value(value: Int) -> CompilerCtfeValue:
 	compiler_ctfe_int(source_span(), value)
+
+
+pure func float_value(value: Float) -> CompilerCtfeValue:
+	compiler_ctfe_float(source_span(), value)
 
 
 pure func string_value(value: String) -> CompilerCtfeValue:
@@ -161,46 +180,142 @@ pure func function_reference_value() -> CompilerCtfeValue:
 	)
 
 
-pure func materialized_type_is(value: CompilerCtfeValue, expected: CompilerType) -> Bool:
-	compiler_types_equal(
-		compiler_typed_expr_value_type(compiler_ctfe_materialize_value(value)),
-		expected,
+pure func lambda_source() -> CompilerCtfeLambdaSource:
+	lambda_type = CompilerFunctionType(True, [], compiler_type_int())
+	{
+		is_pure = True,
+		params = [],
+		return_annotation = Some(compiler_type_int()),
+		body = CompilerTypedIntLiteralExpr(
+			"42",
+			source_span(),
+			{
+				source_type = None,
+				semantic_type = compiler_type_int(),
+				value_type = compiler_type_int(),
+				origin = CompilerSynthesizedOrigin("ctfe_materialize_test"),
+				value_slot = {
+					semantic_type = compiler_type_int(),
+					decision = CompilerTypeKeep(compiler_type_int())
+				},
+				proofs = compiler_unrefined_binding(),
+				resolved_call = None,
+				resource_dependencies = []
+			},
+		),
+		span = source_span(),
+		info = {
+			source_type = None,
+			semantic_type = lambda_type,
+			value_type = lambda_type,
+			origin = CompilerSynthesizedOrigin("ctfe_materialize_test"),
+			value_slot = {
+				semantic_type = lambda_type,
+				decision = CompilerTypeKeep(lambda_type)
+			},
+			proofs = compiler_unrefined_binding(),
+			resolved_call = None,
+			resource_dependencies = []
+		}
+	}
+
+
+pure func lambda_expr() -> CompilerTypedExpr:
+	source = lambda_source()
+	CompilerTypedLambdaExpr(
+		source.is_pure,
+		source.params,
+		source.return_annotation,
+		source.body,
+		source.span,
+		source.info,
 	)
+
+
+pure func lambda_value_with_env(env: CompilerCtfeEnv) -> CompilerCtfeValue:
+	source = lambda_source()
+	compiler_ctfe_value(source.info.value_type, CompilerCtfeLambdaValue({
+			source = source,
+			env = env,
+		}), source.span)
+
+
+pure func lambda_value() -> CompilerCtfeValue:
+	lambda_value_with_env(compiler_ctfe_env_empty())
+
+
+pure func captured_lambda_value() -> CompilerCtfeValue:
+	lambda_value_with_env(
+		compiler_ctfe_bind_local_value(
+			compiler_ctfe_env_empty(),
+			"offset",
+			compiler_ctfe_int(source_span(), 3),
+		),
+	)
+
+
+pure func materialized_type_is(value: CompilerCtfeValue, expected: CompilerType) -> Bool:
+	match compiler_ctfe_materialize_value(value):
+		Ok(materialized):
+			compiler_types_equal(compiler_typed_expr_value_type(materialized), expected)
+		Err(_):
+			False
+
+
+pure func materialize_error_is(
+	error: CompilerCtfeMaterializeError,
+	expected: CompilerCtfeMaterializeError,
+) -> Bool:
+	error == expected
 
 
 func test_materializes_scalar_literals() -> Bool:
 	int_ok = match compiler_ctfe_materialize_value(int_value(42)):
-		CompilerTypedIntLiteralExpr(text, _, _):
+		Ok(CompilerTypedIntLiteralExpr(text, _, _)):
 			text == "42"
 		_:
 			False
 
+	float_ok = match compiler_ctfe_materialize_value(float_value(3.141592653589793)):
+		Ok(CompilerTypedFloatLiteralExpr(text, _, _)):
+			text == "3.141592653589793"
+		_:
+			False
+
+	non_finite_float_ok = match compiler_ctfe_materialize_value(float_value(1.0 / 0.0)):
+		Ok(CompilerTypedFloatLiteralExpr(text, _, _)):
+			text == "inf"
+		_:
+			False
+
 	bool_ok = match compiler_ctfe_materialize_value(bool_value(True)):
-		CompilerTypedBoolLiteralExpr(value, _, _):
+		Ok(CompilerTypedBoolLiteralExpr(value, _, _)):
 			value
 		_:
 			False
 
 	char_ok = match compiler_ctfe_materialize_value(char_value(65)):
-		CompilerTypedCharLiteralExpr(value, _, _):
+		Ok(CompilerTypedCharLiteralExpr(value, _, _)):
 			value == 65
 		_:
 			False
 
 	string_ok = match compiler_ctfe_materialize_value(string_value("blorp")):
-		CompilerTypedStringLiteralExpr(value, _, _):
+		Ok(CompilerTypedStringLiteralExpr(value, _, _)):
 			value == "blorp"
 		_:
 			False
 
 	void_ok = match compiler_ctfe_materialize_value(compiler_ctfe_void(source_span())):
-		CompilerTypedVoidExpr(_, _):
+		Ok(CompilerTypedVoidExpr(_, _)):
 			True
 		_:
 			False
 
 	(
 		int_ok
+		and float_ok
+		and non_finite_float_ok
 		and bool_ok
 		and char_ok
 		and string_ok
@@ -214,19 +329,19 @@ func test_materializes_aggregate_literals() -> Bool:
 	tuple_ok = match compiler_ctfe_materialize_value(
 		tuple_value([int_value(1), string_value("x")]),
 	):
-		CompilerTypedTupleExpr(items, _, _):
+		Ok(CompilerTypedTupleExpr(items, _, _)):
 			items.length() == 2
 		_:
 			False
 
 	list_ok = match compiler_ctfe_materialize_value(list_value([int_value(1), int_value(2)])):
-		CompilerTypedListExpr(items, _, _):
+		Ok(CompilerTypedListExpr(items, _, _)):
 			items.length() == 2
 		_:
 			False
 
 	record_ok = match compiler_ctfe_materialize_value(record_value([("value", int_value(3))])):
-		CompilerTypedRecordExpr(fields, _, _):
+		Ok(CompilerTypedRecordExpr(fields, _, _)):
 			match fields.get(0):
 				Some(field):
 					field.name.text == "value"
@@ -238,13 +353,13 @@ func test_materializes_aggregate_literals() -> Bool:
 	dict_ok = match compiler_ctfe_materialize_value(
 		dict_value([(string_value("answer"), int_value(42))]),
 	):
-		CompilerTypedDictExpr(entries, _, _):
+		Ok(CompilerTypedDictExpr(entries, _, _)):
 			entries.length() == 1
 		_:
 			False
 
 	range_ok = match compiler_ctfe_materialize_value(range_value(int_value(0), int_value(3))):
-		CompilerTypedRangeExpr(_, _, _, _):
+		Ok(CompilerTypedRangeExpr(_, _, _, _)):
 			True
 		_:
 			False
@@ -254,7 +369,7 @@ func test_materializes_aggregate_literals() -> Bool:
 
 func test_materializes_constructors() -> Bool:
 	nullary_ok = match compiler_ctfe_materialize_value(constructor_value("None", [], None)):
-		CompilerTypedNameExpr(name, _):
+		Ok(CompilerTypedNameExpr(name, _)):
 			name.text == "None"
 		_:
 			False
@@ -262,28 +377,32 @@ func test_materializes_constructors() -> Bool:
 	expr = compiler_ctfe_materialize_value(constructor_value("Some", [int_value(42)], Some(17)))
 
 	call_ok = match expr:
-		CompilerTypedCallExpr(callee, args, _, _):
-			callee_ok = match callee:
-				CompilerTypedNameExpr(name, _):
-					name.text == "Some"
-				_:
-					False
-
-			resolved_ok = match compiler_typed_expr_resolved_call(expr):
-				Some(call):
-					match call.target:
-						CompilerResolvedDirectCall(callable_id, origin):
-							match origin:
-								CompilerCallableConstructor(parent_type):
-									callable_id == 17 and parent_type == "Option"
-								_:
-									False
+		Ok(call_expr):
+			match call_expr:
+				CompilerTypedCallExpr(callee, args, _, _):
+					callee_ok = match callee:
+						CompilerTypedNameExpr(name, _):
+							name.text == "Some"
 						_:
 							False
-				None:
-					False
 
-			callee_ok and args.length() == 1 and resolved_ok
+					resolved_ok = match compiler_typed_expr_resolved_call(call_expr):
+						Some(call):
+							match call.target:
+								CompilerResolvedDirectCall(callable_id, origin):
+									match origin:
+										CompilerCallableConstructor(parent_type):
+											callable_id == 17 and parent_type == "Option"
+										_:
+											False
+								_:
+									False
+						None:
+							False
+
+					callee_ok and args.length() == 1 and resolved_ok
+				_:
+					False
 		_:
 			False
 
@@ -294,10 +413,8 @@ func test_materializes_function_references() -> Bool:
 	value = function_reference_value()
 
 	typed_ok = match compiler_ctfe_materialize_value(value):
-		CompilerTypedNameExpr(name, _):
-			resolved_ok = match compiler_typed_expr_resolved_call(
-				compiler_ctfe_materialize_value(value),
-			):
+		Ok(materialized):
+			resolved_ok = match compiler_typed_expr_resolved_call(materialized):
 				Some(call):
 					match call.target:
 						CompilerResolvedDirectCall(callable_id, origin):
@@ -318,12 +435,16 @@ func test_materializes_function_references() -> Bool:
 				None:
 					False
 
-			name.text == "increment" and resolved_ok
+			match materialized:
+				CompilerTypedNameExpr(name, _):
+					name.text == "increment" and resolved_ok
+				_:
+					False
 		_:
 			False
 
 	parsed_ok = match compiler_ctfe_materialize_parsed_expr(value):
-		ParsedNameExpr(name):
+		Ok(ParsedNameExpr(name)):
 			name.text == "increment"
 		_:
 			False
@@ -331,39 +452,77 @@ func test_materializes_function_references() -> Bool:
 	typed_ok and parsed_ok
 
 
+func test_materializes_lambda_without_inventing_parsed_source() -> Bool:
+	typed_ok = match compiler_ctfe_materialize_value(lambda_value()):
+		Ok(CompilerTypedLambdaExpr(_, _, _, _, _, _)):
+			True
+		_:
+			False
+
+	parsed_unavailable = match compiler_ctfe_materialize_parsed_expr(lambda_value()):
+		Err(error):
+			materialize_error_is(error, CompilerCtfeLambdaSourceUnavailable)
+		_:
+			False
+
+	typed_ok and parsed_unavailable
+
+
+func test_rejects_captured_lambda_materialization() -> Bool:
+	match compiler_ctfe_materialize_value(captured_lambda_value()):
+		Err(error):
+			materialize_error_is(error, CompilerCtfeCapturedLambda)
+		_:
+			False
+
+
+func test_rejects_captured_lambda_nested_in_aggregate() -> Bool:
+	match compiler_ctfe_materialize_value(record_value([("callback", captured_lambda_value())])):
+		Err(error):
+			materialize_error_is(error, CompilerCtfeCapturedLambda)
+		_:
+			False
+
+
 func test_materializes_parsed_literals() -> Bool:
 	int_ok = match compiler_ctfe_materialize_parsed_expr(int_value(42)):
-		ParsedIntLiteralExpr(text, _):
+		Ok(ParsedIntLiteralExpr(text, _)):
 			text == "42"
 		_:
 			False
 
+	float_ok = match compiler_ctfe_materialize_parsed_expr(float_value(3.141592653589793)):
+		Ok(ParsedFloatLiteralExpr(text, _)):
+			text == "3.141592653589793"
+		_:
+			False
+
 	bool_ok = match compiler_ctfe_materialize_parsed_expr(bool_value(True)):
-		ParsedBoolLiteralExpr(value, _):
+		Ok(ParsedBoolLiteralExpr(value, _)):
 			value
 		_:
 			False
 
 	string_ok = match compiler_ctfe_materialize_parsed_expr(string_value("blorp")):
-		ParsedStringLiteralExpr(value, _, _):
+		Ok(ParsedStringLiteralExpr(value, _, _)):
 			value == "blorp"
 		_:
 			False
 
-	int_ok and bool_ok and string_ok
+	int_ok and float_ok and bool_ok and string_ok
 
 
 func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 	tuple_ok = match compiler_ctfe_materialize_parsed_expr(
 		tuple_value([int_value(1), string_value("x")]),
 	):
-		ParsedTupleExpr(items, _):
+		Ok(ParsedTupleExpr(items, _)):
 			items.length() == 2
 		_:
 			False
 
 	list_ok = match compiler_ctfe_materialize_parsed_expr(list_value([int_value(1), int_value(2)])):
-		ParsedListExpr(items, _):
+		Ok(ParsedListExpr(items, _)):
 			items.length() == 2
 		_:
 			False
@@ -371,7 +530,7 @@ func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 	record_ok = match compiler_ctfe_materialize_parsed_expr(
 		record_value([("value", int_value(3))]),
 	):
-		ParsedRecordExpr(fields, _):
+		Ok(ParsedRecordExpr(fields, _)):
 			match fields.get(0):
 				Some(field):
 					field.name.text == "value"
@@ -383,7 +542,7 @@ func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 	dict_ok = match compiler_ctfe_materialize_parsed_expr(
 		dict_value([(string_value("answer"), int_value(42))]),
 	):
-		ParsedDictExpr(entries, _):
+		Ok(ParsedDictExpr(entries, _)):
 			match entries.get(0):
 				Some(entry):
 					match entry.key:
@@ -397,7 +556,7 @@ func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 			False
 
 	nullary_ok = match compiler_ctfe_materialize_parsed_expr(constructor_value("None", [], None)):
-		ParsedNameExpr(name):
+		Ok(ParsedNameExpr(name)):
 			name.text == "None"
 		_:
 			False
@@ -409,7 +568,7 @@ func test_materializes_parsed_aggregates_and_constructors() -> Bool:
 			Some(9),
 		),
 	):
-		ParsedCallExpr(callee, args, _):
+		Ok(ParsedCallExpr(callee, args, _)):
 			callee_ok = match callee:
 				ParsedNameExpr(name):
 					name.text == "Some"
@@ -430,6 +589,15 @@ tests: TestSuite = {
 		("materializes aggregate literals", test_materializes_aggregate_literals),
 		("materializes constructors", test_materializes_constructors),
 		("materializes function references", test_materializes_function_references),
+		(
+			"materializes typed lambdas without inventing parsed source",
+			test_materializes_lambda_without_inventing_parsed_source,
+		),
+		("rejects captured lambda materialization", test_rejects_captured_lambda_materialization),
+		(
+			"rejects captured lambda nested in aggregate",
+			test_rejects_captured_lambda_nested_in_aggregate,
+		),
 		("materializes parsed literals", test_materializes_parsed_literals),
 		(
 			"materializes parsed aggregates and constructors",

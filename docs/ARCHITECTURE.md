@@ -17,19 +17,25 @@ Source (.brp)
     |
     v
 +---------+
-| Modules |  Import resolution, module loading (modules.ml)
+| Modules |  Import resolution and module loading
+|         |  (compiler/blorp/src/stage_04_modules/)
 +---------+
     |
     v
 +-----------+
-| Frontend  |  Blorp source-AST finalization, then OCaml infer/typecheck
-| Typing    |  (compiler_source_ast_finalize.brp, infer.ml, typecheck.ml)
+| Frontend  |  Blorp source-AST finalization, inference, and typechecking
+| Typing    |  (stage_03_parse, stage_05_types, stage_06_typecheck)
 +-----------+
     |
     v
++----------------+
+| Typed AST JSON |  Temporary production bridge into the OCaml Core pipeline
++----------------+
+    |
+    v
 +------------+
-| Core IR    |  Lowering → observed transform stages → JSON handoff for
-| pipeline   |  the supported Blorp-owned backend tail
+| Core IR    |  OCaml lowering and early/middle transforms, then the Core JSON
+| pipeline   |  handoff into the supported Blorp-owned backend tail
 +------------+
     |
     v
@@ -53,9 +59,12 @@ Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
-During the OCaml-to-Blorp port, the supported default backend route crosses the
-single JSON bridge after OCaml specialization and function-reference
-adaptation. On that route,
+During the OCaml-to-Blorp port, the production route first decodes the
+Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
+then crosses the Core JSON bridge after OCaml specialization and
+function-reference adaptation. Checkpoint 8 in
+`docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
+making Blorp Core lowering authoritative. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
@@ -158,7 +167,7 @@ Typed AST
     v
 +----------------+
 | Blorp DCE      |  Prune unreachable emitted functions and projected type
-+----------------+  declarations using explicit function/type reachability
++----------------+  declarations using explicit reachability
                     (compiler_core_dce.brp)
     |
     v
@@ -166,6 +175,13 @@ Typed AST
 | Blorp consume-specialize|  Clone safe source-owned self-replacement callees
 +-------------------------+  with explicit consumed parameters before Perceus
                             (compiler_core_consume_specialize.brp)
+    |
+    v
++--------------------------+
+| Blorp ownership prepare  |  Lower dictionary literals to explicit boxed
++--------------------------+  construction so Perceus can assign entry owners;
+                              all other backend preparation remains late
+                              (compiler_core_prepare.brp)
     |
     v
 +--------------+

@@ -1046,6 +1046,17 @@ let test_float16_unary_neg_uses_float16_scalar_runtime () =
   let e = mk (CUn (Neg, v)) (tensor ty_float16 [ 4 ]) in
   expect_builtin "float16 unary neg" "blorp_vector_scalar_op_rev_float16" e
 
+let test_custom_tensor_arithmetic_raises_core_error () =
+  let custom_ty = TyNamed ("CustomNumber", []) in
+  let tensor_ty = tensor custom_ty [ 4 ] in
+  let left = cvar "left" tensor_ty in
+  let right = cvar "right" tensor_ty in
+  let e = mk (CBin (Add, left, right)) tensor_ty in
+  Test_helpers.check_core_error_raises
+    ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
+    ~msg_contains:"tensor arithmetic requires a concrete numeric element type"
+    (fun () -> ignore (specialize e))
+
 let test_bool_tensor_to_string_uses_bool_runtime () =
   let v = cvar "v" (tensor (TyNamed ("Bool", [])) [ 3 ]) in
   let e = call_builtin "blorp_to_string" [ v ] (TyNamed ("String", [])) in
@@ -1452,6 +1463,8 @@ let suite =
           test_float32_unary_neg_uses_float32_scalar_runtime;
         Alcotest.test_case "unary_neg_float16" `Quick
           test_float16_unary_neg_uses_float16_scalar_runtime;
+        Alcotest.test_case "custom_tensor_arithmetic_rejected" `Quick
+          test_custom_tensor_arithmetic_raises_core_error;
         Alcotest.test_case "bool_to_string" `Quick
           test_bool_tensor_to_string_uses_bool_runtime;
         Alcotest.test_case "enum_to_string" `Quick

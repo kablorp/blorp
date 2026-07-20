@@ -611,7 +611,7 @@ let dns_bridge builtin_name runtime_result_c_type success arguments =
     error = dns_error_mapping;
   }
 
-let file_open_bridge builtin_name runtime_result_c_type success =
+let file_resource_open_bridge builtin_name runtime_result_c_type success arguments =
   {
     builtin_name;
     source_module = StdFs;
@@ -619,13 +619,17 @@ let file_open_bridge builtin_name runtime_result_c_type success =
     runtime_result_c_type;
     temp_prefix = "file_open";
     wait_behavior = DoesNotWait;
-    arguments = [ ArgBorrow ];
+    arguments;
     result_layout_policy =
       BoxedResultOnly
         "typed file resource opens currently use the boxed Result ABI";
     success;
     error = file_error_mapping;
   }
+
+let file_open_bridge builtin_name runtime_result_c_type success =
+  file_resource_open_bridge builtin_name runtime_result_c_type success
+    [ ArgBorrow ]
 
 let fallible_stream_source source_module
     ?(runtime_return_c_type = "blorp_FallibleStream*") builtin_name
@@ -764,6 +768,20 @@ let result_bridges =
       "blorp_FileOpenReadAppenderResult" file_read_appender_payload;
     file_open_bridge "blorp_dir_open_raw" "blorp_DirectoryOpenResult"
       directory_payload;
+    file_resource_open_bridge "blorp_temporary_file_open_raw"
+      "blorp_FileOpenWriterResult" file_writer_payload
+      [ ArgBorrow; ArgBorrow ];
+    file_resource_open_bridge "blorp_temporary_directory_open_raw"
+      "blorp_DirectoryOpenResult" directory_payload
+      [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_write_text_atomic_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_create_directories_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow ];
+    file_operation_bridge "blorp_file_rename_path_raw" "blorp_FileVoidResult"
+      void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_remove_directory_tree_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow ];
     file_operation_bridge "blorp_dir_read_entry_raw"
       "blorp_DirectoryEntryResult" directory_entry_option_payload [ ArgBorrow ];
     file_operation_bridge "blorp_dir_read_next_entries_raw"

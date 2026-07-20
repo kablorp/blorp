@@ -139,8 +139,8 @@ import:
 			WhileExpr,
 		),
 		CoreFunction,
-		CoreGlobal,
 		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
+		CoreGlobal,
 		CoreHashContainerConstructor(
 			CustomHashContainerConstructor,
 			FloatHashContainerConstructor,
@@ -180,30 +180,55 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
+		CoreVar,
 		core_expr_type,
+	set as Sets
+
+
+private enum DceFactCollectionMode:
+	CollectReachabilityFacts
+	CollectValueReferences
 
 
 record DceFacts {
+	mode: DceFactCollectionMode,
 	function_ids: List[Int],
 	function_names: List[String],
 	global_names: List[String],
+	value_reads: List[CoreVar],
+	value_invalidations: List[CoreVar],
 	type_names: List[String],
 	fail_closed: Bool
 }
 
 
+record CoreValueReferences {
+	names: List[String],
+	resolved_reads: List[CoreVar],
+	resolved_invalidations: List[CoreVar]
+}
+
+
 private pure func add_function_id(facts: DceFacts, def_id: Int) -> DceFacts:
-	if facts.function_ids.contains(def_id):
-		facts
-	else:
-		{ facts | function_ids = facts.function_ids.append(def_id) }
+	match facts.mode:
+		CollectReachabilityFacts:
+			if facts.function_ids.contains(def_id):
+				facts
+			else:
+				{ facts | function_ids = facts.function_ids.append(def_id) }
+		CollectValueReferences:
+			facts
 
 
 private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
-	if facts.function_names.contains(name):
-		facts
-	else:
-		{ facts | function_names = facts.function_names.append(name) }
+	match facts.mode:
+		CollectReachabilityFacts:
+			if facts.function_names.contains(name):
+				facts
+			else:
+				{ facts | function_names = facts.function_names.append(name) }
+		CollectValueReferences:
+			facts
 
 
 private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
@@ -213,11 +238,58 @@ private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
 		{ facts | global_names = facts.global_names.append(name) }
 
 
-private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
-	if facts.type_names.contains(name):
-		facts
+-- Keep this phase-local while the pinned bootstrap cannot safely pass CoreVar
+-- records through an imported helper call during the self-host build.
+private pure func core_vars_have_same_definition(left: CoreVar, right: CoreVar) -> Bool:
+	if left.name != right.name:
+		False
 	else:
-		{ facts | type_names = facts.type_names.append(name) }
+		match (left.def_id, right.def_id):
+			(Some(left_id), Some(right_id)):
+				left_id == right_id
+			_:
+				False
+
+
+private pure func add_value_read(facts: DceFacts, variable: CoreVar) -> DceFacts:
+	match facts.mode:
+		CollectReachabilityFacts:
+			facts
+		CollectValueReferences:
+			if variable.def_id.is_none():
+				facts
+			else if facts.value_reads.any(
+				func(existing): core_vars_have_same_definition(existing, variable),
+			):
+				facts
+			else:
+				{ facts | value_reads = facts.value_reads.append(variable) }
+
+
+private pure func add_value_invalidation(facts: DceFacts, variable: CoreVar) -> DceFacts:
+	match facts.mode:
+		CollectReachabilityFacts:
+			facts
+		CollectValueReferences:
+			if variable.def_id.is_none():
+				facts
+			else if facts.value_invalidations.any(
+				func(existing): core_vars_have_same_definition(existing, variable),
+			):
+				facts
+			else:
+				{ facts | value_invalidations = facts.value_invalidations.append(variable) }
+
+
+private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
+	match facts.mode:
+		CollectReachabilityFacts:
+			if facts.type_names.contains(name):
+				facts
+			else:
+				{ facts | type_names = facts.type_names.append(name) }
+		CollectValueReferences:
+			facts
 
 
 private pure func collect_types(facts: DceFacts, types: List[CoreType]) -> DceFacts:
@@ -569,8 +641,22 @@ private pure func collect_optional_expr(facts: DceFacts, expr: Option[CoreExpr])
 
 
 private pure func collect_expr(facts: DceFacts, expr: CoreExpr) -> DceFacts:
+	typed_facts: DceFacts = collect_type(facts, core_expr_type(expr))
+
+	-- The pinned bootstrap can treat an unchanged aggregate return as borrowed,
+	-- forcing later COW updates to copy every accumulated list. A fresh record
+	-- shell preserves value semantics while keeping those lists uniquely owned.
 	collect_expr_children(
-		collect_type(facts, core_expr_type(expr)),
+		{
+			mode = typed_facts.mode,
+			function_ids = typed_facts.function_ids,
+			function_names = typed_facts.function_names,
+			global_names = typed_facts.global_names,
+			value_reads = typed_facts.value_reads,
+			value_invalidations = typed_facts.value_invalidations,
+			type_names = typed_facts.type_names,
+			fail_closed = typed_facts.fail_closed
+		},
 		expr,
 	)
 
@@ -580,7 +666,10 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		LiteralExpr(literal, typ, loc):
 			facts
 		VarExpr(variable, typ, loc):
-			add_global_name(facts, variable.name)
+			add_value_read(
+				add_global_name(facts, variable.name),
+				variable,
+			)
 		VoidExpr(typ, loc):
 			facts
 		CooperativeCheckpointExpr(typ, loc):
@@ -606,7 +695,13 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				right,
 			)
 		AssignExpr(variable, rhs, typ, loc):
-			collect_expr(facts, rhs)
+			collect_expr(
+				add_value_invalidation(
+					add_global_name(facts, variable.name),
+					variable,
+				),
+				rhs,
+			)
 		CastExpr(value, typ, loc):
 			collect_expr(facts, value)
 		BoxExpr(box, typ, loc):
@@ -682,7 +777,7 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			collect_boxed_values(facts, literal.elements)
 		TensorPackedLiteralExpr(literal, typ, loc):
-			facts
+			collect_exprs(facts, literal.elements)
 		TensorRawFillExpr(fill, typ, loc):
 			collect_exprs(
 				collect_expr(facts, fill.value),
@@ -748,7 +843,10 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			collect_expr(facts, body)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			collect_expr(facts, body)
+			collect_expr(
+				add_value_invalidation(facts, variable),
+				body,
+			)
 		LetExpr(variable, is_mutable, value_type, rhs, body):
 			collect_expr(
 				collect_expr(facts, rhs),
@@ -911,6 +1009,28 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 			)
 
 
+pure func value_references(expr: CoreExpr) -> CoreValueReferences:
+	facts: DceFacts = collect_expr(
+		{
+			mode = CollectValueReferences,
+			function_ids = [],
+			function_names = [],
+			global_names = [],
+			value_reads = [],
+			value_invalidations = [],
+			type_names = [],
+			fail_closed = False
+		},
+		expr,
+	)
+
+	{
+		names = facts.global_names,
+		resolved_reads = facts.value_reads,
+		resolved_invalidations = facts.value_invalidations
+	}
+
+
 private pure func function_is_entrypoint(function_info: CoreFunction) -> Bool:
 	function_info.name == "main" and function_info.source_module.is_none()
 
@@ -927,64 +1047,44 @@ private pure func function_is_prunable(function_info: CoreFunction) -> Bool:
 			False
 
 
+record DceReachabilityIndex {
+	functions_by_id: Dict[Int, List[CoreFunction]],
+	function_ids_by_name: Dict[String, List[Int]],
+	globals_by_name: Dict[String, CoreGlobal],
+	type_decls_by_name: Dict[String, List[CoreDecl]]
+}
+
+
 private pure func function_facts_for_id(
-	functions: List[CoreFunction],
+	index: DceReachabilityIndex,
 	def_id: Int,
 ) -> Option[DceFacts]:
-	var found = False
 	var facts: DceFacts = {
+		mode = CollectReachabilityFacts,
 		function_ids = [],
 		function_names = [],
 		global_names = [],
+		value_reads = [],
+		value_invalidations = [],
 		type_names = [],
-		fail_closed = False,
+		fail_closed = False
 	}
 
-	for function_info in functions:
-		if function_info.def_id == def_id:
-			found = True
+	for function_info in (
+		index.functions_by_id
+			.get(def_id)
+			.get_or([])
+	):
+		match function_info.body:
+			Some(body):
+				facts = collect_expr(facts, body)
+			None:
+				void
 
-			match function_info.body:
-				Some(body):
-					facts = collect_expr(facts, body)
-				None:
-					void
-
-	if found:
+	if index.functions_by_id.contains(def_id):
 		Some(facts)
 	else:
 		None
-
-
-private pure func add_functions_named(
-	reachable: List[Int],
-	functions: List[CoreFunction],
-	name: String,
-) -> List[Int]:
-	var result: List[Int] = reachable
-
-	for function_info in functions:
-		if function_info.name == name and not result.contains(function_info.def_id):
-			result = result.append(function_info.def_id)
-
-	result
-
-
-private pure func apply_facts(
-	reachable: List[Int],
-	functions: List[CoreFunction],
-	facts: DceFacts,
-) -> List[Int]:
-	var result: List[Int] = reachable
-
-	for def_id in facts.function_ids:
-		if not result.contains(def_id):
-			result = result.append(def_id)
-
-	for name in facts.function_names:
-		result = add_functions_named(result, functions, name)
-
-	result
 
 
 private pure func collect_functions(program_value: CoreProgram) -> List[CoreFunction]:
@@ -998,6 +1098,68 @@ private pure func collect_functions(program_value: CoreProgram) -> List[CoreFunc
 				void
 
 	functions
+
+
+private pure func compiler_core_dce_type_decl_name(decl: CoreDecl) -> Option[String]:
+	match decl:
+		EnumDecl(enum_info):
+			Some(enum_info.name)
+		UnionDecl(union_info):
+			Some(union_info.name)
+		ValueRecordDecl(record_info):
+			Some(record_info.name)
+		HeapRecordDecl(record_info):
+			Some(record_info.name)
+		_:
+			None
+
+
+private pure func build_reachability_index(program_value: CoreProgram) -> DceReachabilityIndex:
+	var functions_by_id: Dict[Int, List[CoreFunction]] = {}
+	var function_ids_by_name: Dict[String, List[Int]] = {}
+	var globals_by_name: Dict[String, CoreGlobal] = {}
+	var type_decls_by_name: Dict[String, List[CoreDecl]] = {}
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(function_info):
+				functions_by_id = functions_by_id.set(
+					function_info.def_id,
+					functions_by_id
+						.get(function_info.def_id)
+						.get_or([])
+						.append(function_info),
+				)
+				function_ids_by_name = function_ids_by_name.set(
+					function_info.name,
+					function_ids_by_name
+						.get(function_info.name)
+						.get_or([])
+						.append(function_info.def_id),
+				)
+			GlobalDecl(global):
+				-- Preserve the original first-declaration lookup behavior.
+				if not globals_by_name.contains(global.name.name):
+					globals_by_name = globals_by_name.set(global.name.name, global)
+			_:
+				match compiler_core_dce_type_decl_name(decl):
+					Some(name):
+						type_decls_by_name = type_decls_by_name.set(
+							name,
+							type_decls_by_name
+								.get(name)
+								.get_or([])
+								.append(decl),
+						)
+					None:
+						void
+
+	{
+		functions_by_id = functions_by_id,
+		function_ids_by_name = function_ids_by_name,
+		globals_by_name = globals_by_name,
+		type_decls_by_name = type_decls_by_name
+	}
 
 
 record DceRoots {
@@ -1021,34 +1183,6 @@ private pure func collect_globals(program_value: CoreProgram) -> List[CoreGlobal
 	globals
 
 
-private pure func global_for_name(
-	globals: List[CoreGlobal],
-	name: String,
-) -> Option[CoreGlobal]:
-	var found: Option[CoreGlobal] = None
-
-	for global in globals:
-		if global.name.name == name:
-			found = Some(global)
-			break
-
-	found
-
-
-private pure func append_global_names(
-	reachable: List[String],
-	globals: List[CoreGlobal],
-	names: List[String],
-) -> List[String]:
-	var result = reachable
-
-	for name in names:
-		if not result.contains(name) and global_for_name(globals, name).is_some():
-			result = result.append(name)
-
-	result
-
-
 private pure func collect_roots(
 	program_value: CoreProgram,
 	functions: List[CoreFunction],
@@ -1070,7 +1204,7 @@ private pure func collect_roots(
 				reachable = reachable.append(function_info.def_id)
 
 	for global in globals:
-		if not global.is_private:
+		if not global.is_private and not reachable_globals.contains(global.name.name):
 			reachable_globals = reachable_globals.append(global.name.name)
 
 	{
@@ -1084,147 +1218,172 @@ private pure func collect_roots(
 record DceClosure {
 	reachable: List[Int],
 	reachable_globals: List[String],
+	reachable_types: List[String],
 	fail_closed: Bool
 }
 
 
-private @tail_recursive pure func close_reachability(
-	functions: List[CoreFunction],
-	globals: List[CoreGlobal],
+record DceClosureState {
 	reachable: List[Int],
-	scanned: List[Int],
+	reachable_set: Set[Int],
 	reachable_globals: List[String],
-	scanned_globals: List[String],
-) -> DceClosure:
-	var next_id: Option[Int] = None
+	reachable_global_set: Set[String],
+	reachable_types: List[String],
+	reachable_type_set: Set[String],
+	fail_closed: Bool
+}
 
-	for def_id in reachable:
-		if not scanned.contains(def_id):
-			next_id = Some(def_id)
-			break
 
-	match next_id:
-		None:
-			var next_global: Option[String] = None
+private pure func apply_reachability_facts(
+	index: DceReachabilityIndex,
+	state: DceClosureState,
+	facts: DceFacts,
+) -> DceClosureState:
+	if facts.fail_closed:
+		{ state | fail_closed = True }
+	else:
+		var reachable = state.reachable
+		var reachable_set = state.reachable_set
+		var reachable_globals = state.reachable_globals
+		var reachable_global_set = state.reachable_global_set
+		var reachable_types = state.reachable_types
+		var reachable_type_set = state.reachable_type_set
 
-			for name in reachable_globals:
-				if not scanned_globals.contains(name):
-					next_global = Some(name)
-					break
+		for def_id in facts.function_ids:
+			if not Sets.contains(reachable_set, def_id):
+				reachable = reachable.append(def_id)
+				reachable_set = Sets.add(reachable_set, def_id)
 
-			match next_global:
-				None:
-					{
-						reachable = reachable,
-						reachable_globals = reachable_globals,
-						fail_closed = False,
-					}
-				Some(name):
-					updated_scanned_globals = scanned_globals.append(name)
+		for name in facts.function_names:
+			for def_id in (
+				index.function_ids_by_name
+					.get(name)
+					.get_or([])
+			):
+				if not Sets.contains(reachable_set, def_id):
+					reachable = reachable.append(def_id)
+					reachable_set = Sets.add(reachable_set, def_id)
 
-					match global_for_name(globals, name):
+		for name in facts.global_names:
+			if (
+				index.globals_by_name.contains(name)
+				and not Sets.contains(reachable_global_set, name)
+			):
+				reachable_globals = reachable_globals.append(name)
+				reachable_global_set = Sets.add(reachable_global_set, name)
+
+		for name in facts.type_names:
+			if not Sets.contains(reachable_type_set, name):
+				reachable_types = reachable_types.append(name)
+				reachable_type_set = Sets.add(reachable_type_set, name)
+
+		{
+			reachable = reachable,
+			reachable_set = reachable_set,
+			reachable_globals = reachable_globals,
+			reachable_global_set = reachable_global_set,
+			reachable_types = reachable_types,
+			reachable_type_set = reachable_type_set,
+			fail_closed = False
+		}
+
+
+private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoots) -> DceClosure:
+	var state: DceClosureState = {
+		reachable = roots.reachable,
+		reachable_set = Sets.from_list(roots.reachable),
+		reachable_globals = roots.reachable_globals,
+		reachable_global_set = Sets.from_list(roots.reachable_globals),
+		reachable_types = [],
+		reachable_type_set = Sets.set(),
+		fail_closed = False
+	}
+	var next_function_index: Int = 0
+	var next_global_index: Int = 0
+
+	while (
+		not state.fail_closed
+		and ((
+			next_function_index < state.reachable.length()
+			or next_global_index < state.reachable_globals.length()
+		))
+	):
+		if next_function_index < state.reachable.length():
+			match state.reachable.get(next_function_index):
+				Some(def_id):
+					next_function_index += 1
+
+					match function_facts_for_id(index, def_id):
+						Some(facts):
+							state = apply_reachability_facts(index, state, facts)
 						None:
-							close_reachability(
-								functions,
-								globals,
-								reachable,
-								scanned,
-								reachable_globals,
-								updated_scanned_globals,
-							)
+							void
+				None:
+					next_function_index += 1
+		else:
+			match state.reachable_globals.get(next_global_index):
+				Some(name):
+					next_global_index += 1
+
+					match index.globals_by_name.get(name):
 						Some(global):
 							facts: DceFacts = collect_expr(
 								{
+									mode = CollectReachabilityFacts,
 									function_ids = [],
 									function_names = [],
 									global_names = [],
+									value_reads = [],
+									value_invalidations = [],
 									type_names = [],
-									fail_closed = False,
+									fail_closed = False
 								},
 								global.init,
 							)
-
-							if facts.fail_closed:
-								{
-									reachable = reachable,
-									reachable_globals = reachable_globals,
-									fail_closed = True,
-								}
-							else:
-								close_reachability(
-									functions,
-									globals,
-									apply_facts(reachable, functions, facts),
-									scanned,
-									append_global_names(
-										reachable_globals,
-										globals,
-										facts.global_names,
-									),
-									updated_scanned_globals,
-								)
-		Some(def_id):
-			updated_scanned: List[Int] = scanned.append(def_id)
-
-			match function_facts_for_id(functions, def_id):
+							state = apply_reachability_facts(index, state, facts)
+						None:
+							void
 				None:
-					close_reachability(
-						functions,
-						globals,
-						reachable,
-						updated_scanned,
-						reachable_globals,
-						scanned_globals,
-					)
-				Some(facts):
-					if facts.fail_closed:
-						{
-							reachable = reachable,
-							reachable_globals = reachable_globals,
-							fail_closed = True,
-						}
-					else:
-						close_reachability(
-							functions,
-							globals,
-							apply_facts(reachable, functions, facts),
-							updated_scanned,
-							append_global_names(
-								reachable_globals,
-								globals,
-								facts.global_names,
-							),
-							scanned_globals,
-						)
+					next_global_index += 1
+
+	{
+		reachable = state.reachable,
+		reachable_globals = state.reachable_globals,
+		reachable_types = state.reachable_types,
+		fail_closed = state.fail_closed
+	}
 
 
-private pure func function_is_kept(reachable: List[Int], function_info: CoreFunction) -> Bool:
-	not function_is_prunable(function_info) or reachable.contains(function_info.def_id)
+private pure func function_is_kept(reachable: Set[Int], function_info: CoreFunction) -> Bool:
+	not function_is_prunable(function_info) or Sets.contains(reachable, function_info.def_id)
 
 
-private pure func collect_function_types(facts: DceFacts, function_info: CoreFunction) -> DceFacts:
+private pure func collect_function_signature_types(
+	facts: DceFacts,
+	function_info: CoreFunction,
+) -> DceFacts:
 	var result: DceFacts = collect_type(facts, function_info.return_type)
 
 	for param in function_info.params:
 		result = collect_type(result, param.typ)
 
-	match function_info.body:
-		Some(body):
-			collect_expr(result, body)
-		None:
-			result
+	result
 
 
 private pure func collect_type_root_facts(
 	program_value: CoreProgram,
-	reachable: List[Int],
-	reachable_globals: List[String],
+	reachable: Set[Int],
+	reachable_globals: Set[String],
+	body_type_names: List[String],
 ) -> DceFacts:
 	var facts: DceFacts = {
+		mode = CollectReachabilityFacts,
 		function_ids = [],
 		function_names = [],
 		global_names = [],
-		type_names = [],
+		value_reads = [],
+		value_invalidations = [],
+		type_names = body_type_names,
 		fail_closed = False
 	}
 
@@ -1232,13 +1391,10 @@ private pure func collect_type_root_facts(
 		match decl:
 			FunctionDecl(function_info):
 				if function_is_kept(reachable, function_info):
-					facts = collect_function_types(facts, function_info)
+					facts = collect_function_signature_types(facts, function_info)
 			GlobalDecl(global):
-				if not global.is_private or reachable_globals.contains(global.name.name):
-					facts = collect_expr(
-						collect_type(facts, global.typ),
-						global.init,
-					)
+				if not global.is_private or Sets.contains(reachable_globals, global.name.name):
+					facts = collect_type(facts, global.typ)
 			_:
 				void
 
@@ -1273,80 +1429,65 @@ private pure func collect_decl_type_dependencies(facts: DceFacts, decl: CoreDecl
 			facts
 
 
-private pure func decl_has_type_name(decl: CoreDecl, name: String) -> Bool:
-	match decl:
-		EnumDecl(enum_info):
-			enum_info.name == name
-		UnionDecl(union_info):
-			union_info.name == name
-		ValueRecordDecl(record_info):
-			record_info.name == name
-		HeapRecordDecl(record_info):
-			record_info.name == name
-		_:
-			False
-
-
-private @tail_recursive pure func close_type_reachability(
-	program_value: CoreProgram,
+private pure func close_type_reachability(
+	index: DceReachabilityIndex,
 	reachable: List[String],
-	scanned: List[String],
 ) -> List[String]:
-	var next_name: Option[String] = None
+	var result = reachable
+	var reachable_set: Set[String] = Sets.from_list(reachable)
+	var next_index: Int = 0
 
-	for name in reachable:
-		if not scanned.contains(name):
-			next_name = Some(name)
-			break
+	while next_index < result.length():
+		match result.get(next_index):
+			Some(name):
+				next_index += 1
+				var facts: DceFacts = {
+					mode = CollectReachabilityFacts,
+					function_ids = [],
+					function_names = [],
+					global_names = [],
+					value_reads = [],
+					value_invalidations = [],
+					type_names = [],
+					fail_closed = False
+				}
 
-	match next_name:
-		None:
-			reachable
-		Some(name):
-			var facts: DceFacts = {
-				function_ids = [],
-				function_names = [],
-				global_names = [],
-				type_names = [],
-				fail_closed = False
-			}
-
-			for decl in program_value.decls:
-				if decl_has_type_name(decl, name):
+				for decl in (
+					index.type_decls_by_name
+						.get(name)
+						.get_or([])
+				):
 					facts = collect_decl_type_dependencies(facts, decl)
 
-			var updated_reachable: List[String] = reachable
+				for dependency in facts.type_names:
+					if not Sets.contains(reachable_set, dependency):
+						result = result.append(dependency)
+						reachable_set = Sets.add(reachable_set, dependency)
+			None:
+				next_index += 1
 
-			for dependency in facts.type_names:
-				if not updated_reachable.contains(dependency):
-					updated_reachable = updated_reachable.append(dependency)
-
-			close_type_reachability(
-				program_value,
-				updated_reachable,
-				scanned.append(name),
-			)
+	result
 
 
 private pure func keep_decl(
-	reachable_functions: List[Int],
-	reachable_globals: List[String],
-	reachable_types: List[String],
+	reachable_functions: Set[Int],
+	reachable_globals: Set[String],
+	reachable_types: Set[String],
 	decl: CoreDecl,
 ) -> Bool:
 	match decl:
 		FunctionDecl(function_info):
 			function_is_kept(reachable_functions, function_info)
 		GlobalDecl(global):
-			not global.is_private or reachable_globals.contains(global.name.name)
+			not global.is_private or Sets.contains(reachable_globals, global.name.name)
 		EnumDecl(enum_info):
-			reachable_types.contains(enum_info.name)
+			Sets.contains(reachable_types, enum_info.name)
 		UnionDecl(union_info):
-			reachable_types.contains(union_info.name)
+			Sets.contains(reachable_types, union_info.name)
 		ValueRecordDecl(record_info):
-			reachable_types.contains(record_info.name)
+			Sets.contains(reachable_types, record_info.name)
 		HeapRecordDecl(record_info):
-			reachable_types.contains(record_info.name)
+			Sets.contains(reachable_types, record_info.name)
 		TypeAliasDecl(alias_decl):
 			True
 		TraitDecl(trait_decl):
@@ -1362,35 +1503,26 @@ pure func prune_program(program_value: CoreProgram) -> CoreProgram:
 	if roots.fail_closed or not roots.saw_main:
 		program_value
 	else:
-		closure: DceClosure = close_reachability(
-			functions,
-			collect_globals(program_value),
-			roots.reachable,
-			[],
-			roots.reachable_globals,
-			[],
-		)
+		index = build_reachability_index(program_value)
+		closure: DceClosure = close_reachability(index, roots)
 
 		if closure.fail_closed:
 			program_value
 		else:
+			reachable_functions: Set[Int] = Sets.from_list(closure.reachable)
+			reachable_globals: Set[String] = Sets.from_list(closure.reachable_globals)
 			type_facts: DceFacts = collect_type_root_facts(
 				program_value,
-				closure.reachable,
-				closure.reachable_globals,
+				reachable_functions,
+				reachable_globals,
+				closure.reachable_types,
 			)
-			reachable_types: List[String] = close_type_reachability(
-				program_value,
-				type_facts.type_names,
-				[],
-			)
+			reachable_types: List[String] = close_type_reachability(index, type_facts.type_names)
+			reachable_type_set: Set[String] = Sets.from_list(reachable_types)
 			{ program_value |
 				decls = program_value.decls.filter(
-					func(decl): keep_decl(
-					closure.reachable,
-					closure.reachable_globals,
-						reachable_types,
+					func(
 						decl,
-					),
+					): keep_decl(reachable_functions, reachable_globals, reachable_type_set, decl),
 				)
 			}

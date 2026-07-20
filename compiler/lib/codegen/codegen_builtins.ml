@@ -20,6 +20,15 @@ let c_passthrough names = List.map (fun name -> (("", name), name)) names
 let prefixed_group mod_path prefix names =
   List.map (fun name -> ((mod_path, name), prefix ^ name)) names
 
+(** Register a builtin under both its prelude spelling and the std module that
+    declares it. Calls decoded from the typed frontend retain imported module
+    identity, while the same language surface remains available from the
+    prelude. Both names must therefore resolve to one runtime symbol. *)
+let prelude_and_module_builtins mod_path entries =
+  List.concat_map
+    (fun (name, c_name) -> [ (("", name), c_name); ((mod_path, name), c_name) ])
+    entries
+
 (* ============================================================================
    Module groups
 
@@ -412,20 +421,22 @@ let builtin_c_mapping =
     ]
   @
   (* StringSlice builtins — all moved to IR intrinsics *)
-  (* Concurrency builtins *)
-  [
-    (("", "sleep"), "blorp_sleep");
-    (("", "yield_now"), "blorp_yield_now");
-    (("", "max_threads"), "blorp_max_threads");
-    (("", "channel"), "blorp_channel_new");
-    (("", "send"), "blorp_channel_send");
-    (("", "recv"), "blorp_channel_recv");
-    (("", "try_send"), "blorp_channel_try_send");
-    (("", "try_recv"), "blorp_channel_try_recv");
-    (("", "recv_timeout"), "blorp_channel_recv_timeout");
-    (("", "send_timeout"), "blorp_channel_send_timeout");
-    (("", "seal"), "blorp_channel_seal");
-  ]
+  (* Concurrency builtins are available through both the prelude and the
+     declarations in std/channel.brp. *)
+  prelude_and_module_builtins N.mod_channel
+    [
+      ("sleep", "blorp_sleep");
+      ("yield_now", "blorp_yield_now");
+      ("max_threads", "blorp_max_threads");
+      ("channel", "blorp_channel_new");
+      ("send", "blorp_channel_send");
+      ("recv", "blorp_channel_recv");
+      ("try_send", "blorp_channel_try_send");
+      ("try_recv", "blorp_channel_try_recv");
+      ("recv_timeout", "blorp_channel_recv_timeout");
+      ("send_timeout", "blorp_channel_send_timeout");
+      ("seal", "blorp_channel_seal");
+    ]
 
 (** Look up a builtin's C name given its module and function name.
     Returns None if not a registered builtin. Module paths must match an

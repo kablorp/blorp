@@ -1,0 +1,120 @@
+-- Canonical ownership plan for user-requested Core observations and stops.
+--
+-- Semantic-middle stages execute in the temporary worker. Late stages execute
+-- in Blorp after that worker returns pre-DCE Core. Keeping this split typed
+-- prevents a valid CLI stage from being silently dropped at the boundary.
+import:
+	../stage_09_core/compiler_core_pipeline_stage:
+		CorePipelineStage,
+		parse_core_pipeline_stage,
+	../stage_09_core/compiler_semantic_worker_protocol:
+		SemanticMiddleStage,
+		parse_semantic_middle_stage,
+	../stage_09_core/core_stage_manifest: CORE_STAGE_NAMES
+
+
+enum CliLateCoreStageAction:
+	ObserveLateCoreStage
+	StopLateCoreStage
+	ObserveAndStopLateCoreStage
+
+
+record CliLateCoreStageRequest {
+	name: String,
+	stage: CorePipelineStage,
+	action: CliLateCoreStageAction
+}
+
+
+record CliCompileStageRequests {
+	semantic_observations: List[SemanticMiddleStage],
+	semantic_stop: Option[SemanticMiddleStage],
+	late_stages: List[CliLateCoreStageRequest]
+}
+
+
+private pure func is_stop_stage(name: String, stop_after: Option[String]) -> Bool:
+	match stop_after:
+		Some(stage_name):
+			name == stage_name
+		None:
+			False
+
+
+private pure func late_stage_action(
+	name: String,
+	observation_names: List[String],
+	stop_after: Option[String],
+) -> Option[CliLateCoreStageAction]:
+	observed: Bool = observation_names.contains(name)
+	stopped: Bool = is_stop_stage(name, stop_after)
+
+	if observed and stopped:
+		Some(ObserveAndStopLateCoreStage)
+	else if observed:
+		Some(ObserveLateCoreStage)
+	else if stopped:
+		Some(StopLateCoreStage)
+	else:
+		None
+
+
+private pure func semantic_observation_for_name(
+	name: String,
+	observation_names: List[String],
+) -> List[SemanticMiddleStage]:
+	if observation_names.contains(name):
+		match parse_semantic_middle_stage(name):
+			Some(stage):
+				[stage]
+			None:
+				[]
+	else:
+		[]
+
+
+private pure func late_stage_for_name(
+	name: String,
+	observation_names: List[String],
+	stop_after: Option[String],
+) -> List[CliLateCoreStageRequest]:
+	match (
+		parse_core_pipeline_stage(name),
+		late_stage_action(name, observation_names, stop_after),
+	):
+		(Some(stage), Some(action)):
+			[{
+				name = name,
+				stage = stage,
+				action = action
+			}]
+		_:
+			[]
+
+
+pure func compile_stage_requests(
+	observation_names: List[String],
+	stop_after: Option[String],
+) -> CliCompileStageRequests:
+	var semantic_observations: List[SemanticMiddleStage] = []
+	var late_stages: List[CliLateCoreStageRequest] = []
+
+	for name in CORE_STAGE_NAMES:
+		semantic_observations = semantic_observations.concat(
+			semantic_observation_for_name(name, observation_names),
+		)
+		late_stages = late_stages.concat(
+			late_stage_for_name(name, observation_names, stop_after),
+		)
+
+	semantic_stop: Option[SemanticMiddleStage] = match stop_after:
+		Some(name):
+			parse_semantic_middle_stage(name)
+		None:
+			None
+
+	{
+		semantic_observations = semantic_observations,
+		semantic_stop = semantic_stop,
+		late_stages = late_stages
+	}

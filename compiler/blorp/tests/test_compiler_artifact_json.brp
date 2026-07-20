@@ -1,6 +1,23 @@
 import:
-	../src/stage_10_backend/compiler_artifact_json: CArtifact, c_artifact_to_json
-	json: JsonValue(JsonObject), as_array, as_string, get_field
+	../src/stage_10_backend/compiler_artifact_json:
+		BuildArtifactJsonError(
+			BuildArtifactExpectedField,
+			BuildArtifactUnsupportedNativeFeature,
+			BuildArtifactUnsupportedRuntimeRequirement,
+		),
+		build_artifact_to_json,
+		c_artifact_to_json,
+		decode_build_artifact_json,
+	../src/stage_10_backend/compiler_build_artifact:
+		BuildArtifact,
+		BuildLinkArgument,
+		BuildNativeFeature(BuildRaylib, BuildTls),
+		BuildOptimization(BuildRelease),
+		BuildPlatform(BuildMacos),
+		BuildRuntimeRequirement(BuildExternalRuntime),
+		BuildSanitizer(BuildAddressUndefinedSanitizer),
+		CArtifact,
+	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), as_array, as_string, get_field
 	test: TestSuite
 
 
@@ -10,6 +27,76 @@ func sample_artifact() -> CArtifact:
 		link_flags = ["-lm", "-lpthread"],
 		include_dirs = ["runtime/include", "pkg/include"]
 	}
+
+
+pure func sample_build_artifact() -> BuildArtifact:
+	{
+		c_code = "int main(void) { return 0; }\n",
+		link_arguments = [
+			{
+				platform = None,
+				value = "-lm"
+			},
+			{
+				platform = Some(BuildMacos),
+				value = "-framework"
+			},
+			{
+				platform = Some(BuildMacos),
+				value = "CoreFoundation"
+			},
+		],
+		include_dirs = ["runtime/include", "pkg/include"],
+		runtime_requirement = BuildExternalRuntime,
+		native_features = [BuildRaylib, BuildTls],
+		source = {
+			path = "src/main.brp",
+			module_name = "main"
+		},
+		compatibility = {
+			debug = True,
+			profile = True,
+			optimization = BuildRelease,
+			sanitizer = BuildAddressUndefinedSanitizer,
+			leak_check = False
+		}
+	}
+
+
+private pure func replace_field(
+	value: JsonValue,
+	name: String,
+	replacement: JsonValue,
+) -> JsonValue:
+	match value:
+		JsonObject(fields):
+			JsonObject(
+				fields.map(func(field):
+					if field[0] == name:
+						(name, replacement)
+					else:
+						field
+				),
+			)
+		_:
+			value
+
+
+private pure func same_link_arguments(
+	left: List[BuildLinkArgument],
+	right: List[BuildLinkArgument],
+) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_argument, ...left_rest], [right_argument, ...right_rest]):
+			(
+				left_argument.platform == right_argument.platform
+				and left_argument.value == right_argument.value
+				and same_link_arguments(left_rest, right_rest)
+			)
+		_:
+			False
 
 
 func string_field_is(value: JsonValue, name: String, expected: String) -> Bool:
@@ -89,10 +176,91 @@ func test_artifact_json_preserves_empty_lists() -> Bool:
 	)
 
 
+pure func test_build_artifact_json_round_trips_every_field() -> Bool:
+	expected = sample_build_artifact()
+
+	match decode_build_artifact_json(build_artifact_to_json(expected)):
+		Ok(actual):
+			(
+				actual.c_code == expected.c_code
+				and same_link_arguments(actual.link_arguments, expected.link_arguments)
+				and actual.include_dirs == expected.include_dirs
+				and actual.runtime_requirement == expected.runtime_requirement
+				and actual.native_features == expected.native_features
+				and actual.source.path == expected.source.path
+				and actual.source.module_name == expected.source.module_name
+				and actual.compatibility.debug == expected.compatibility.debug
+				and actual.compatibility.profile == expected.compatibility.profile
+				and actual.compatibility.optimization == expected.compatibility.optimization
+				and actual.compatibility.sanitizer == expected.compatibility.sanitizer
+				and actual.compatibility.leak_check == expected.compatibility.leak_check
+			)
+		Err(_):
+			False
+
+
+pure func test_build_artifact_json_rejects_unknown_runtime_requirement() -> Bool:
+	value = replace_field(
+		build_artifact_to_json(sample_build_artifact()),
+		"runtime_requirement",
+		JsonString("automatic"),
+	)
+
+	match decode_build_artifact_json(value):
+		Err(BuildArtifactUnsupportedRuntimeRequirement(name)):
+			name == "automatic"
+		_:
+			False
+
+
+pure func test_build_artifact_json_rejects_unknown_native_feature() -> Bool:
+	value = replace_field(
+		build_artifact_to_json(sample_build_artifact()),
+		"native_features",
+		JsonVector([JsonString("cuda")]),
+	)
+
+	match decode_build_artifact_json(value):
+		Err(BuildArtifactUnsupportedNativeFeature(name)):
+			name == "cuda"
+		_:
+			False
+
+
+pure func test_build_artifact_json_rejects_fractional_schema() -> Bool:
+	value = replace_field(
+		build_artifact_to_json(sample_build_artifact()),
+		"schema",
+		JsonNumber(1.5),
+	)
+
+	match decode_build_artifact_json(value):
+		Err(BuildArtifactExpectedField(field, expected)):
+			field == "schema" and expected == "an integer"
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler C artifact JSON",
 	tests = [
 		("artifact JSON has fields", test_artifact_json_has_fields),
 		("artifact JSON preserves empty lists", test_artifact_json_preserves_empty_lists),
+		(
+			"build artifact JSON round trips every field",
+			test_build_artifact_json_round_trips_every_field,
+		),
+		(
+			"build artifact JSON rejects unknown runtime requirement",
+			test_build_artifact_json_rejects_unknown_runtime_requirement,
+		),
+		(
+			"build artifact JSON rejects unknown native feature",
+			test_build_artifact_json_rejects_unknown_native_feature,
+		),
+		(
+			"build artifact JSON rejects fractional schema",
+			test_build_artifact_json_rejects_fractional_schema,
+		),
 	]
 }

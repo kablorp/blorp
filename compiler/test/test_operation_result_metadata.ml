@@ -379,6 +379,36 @@ let expected_file_operations =
       [ "Directory" ],
       0,
       Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_temporary_file_open_raw",
+      "blorp_FileOpenWriterResult",
+      [ "FileWriter" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_temporary_directory_open_raw",
+      "blorp_DirectoryOpenResult",
+      [ "Directory" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_file_write_text_atomic_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_create_directories_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_rename_path_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_remove_directory_tree_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
     ( "blorp_dir_read_entry_raw",
       "blorp_DirectoryEntryResult",
       [ "Option" ],
@@ -611,6 +641,12 @@ let expected_operation_arguments =
     ("blorp_file_open_read_write_raw", [ ArgBorrow ]);
     ("blorp_file_open_read_append_raw", [ ArgBorrow ]);
     ("blorp_dir_open_raw", [ ArgBorrow ]);
+    ("blorp_temporary_file_open_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_temporary_directory_open_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_write_text_atomic_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_create_directories_raw", [ ArgBorrow ]);
+    ("blorp_file_rename_path_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_remove_directory_tree_raw", [ ArgBorrow ]);
     ("blorp_dir_read_entry_raw", [ ArgBorrow ]);
     ("blorp_dir_read_next_entries_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_file_read_text_reader_raw", [ ArgBorrow ]);
@@ -657,6 +693,8 @@ let expected_boxed_only_operations =
     "blorp_file_open_read_write_raw";
     "blorp_file_open_read_append_raw";
     "blorp_dir_open_raw";
+    "blorp_temporary_file_open_raw";
+    "blorp_temporary_directory_open_raw";
   ]
 
 let expected_parking_operations =

@@ -1,0 +1,96 @@
+-- Process client for the one temporary OCaml semantic-middle worker.
+--
+-- The worker receives one post-CTFE typed request on stdin and emits one
+-- pre-DCE response on stdout. Process and protocol failures remain distinct so
+-- callers never mistake compiler infrastructure failure for source diagnostics.
+import:
+	../stage_09_core/compiler_semantic_worker_protocol:
+		SemanticMiddleProtocolError,
+		SemanticMiddleRequest,
+		SemanticMiddleResponse,
+		decode_semantic_middle_response_value,
+		semantic_middle_protocol_error_message,
+		semantic_middle_request_to_json,
+	json: parse_json
+	process as Process
+	units: DataSize, Duration
+
+
+record SemanticMiddleWorkerCommand {
+	program: String,
+	args: List[String],
+	timeout: Option[Duration],
+	max_response_size: DataSize
+}
+
+
+union SemanticMiddleClientError:
+	SemanticMiddleProcessFailed(Process.ProcessError)
+	SemanticMiddleWorkerExited(Int, String)
+	SemanticMiddleWorkerSignaled(Int, String)
+	SemanticMiddleWorkerTimedOut(String)
+	SemanticMiddleUnexpectedStderr(String)
+	SemanticMiddleInvalidJson(String)
+	SemanticMiddleProtocolFailed(SemanticMiddleProtocolError)
+
+
+pure func semantic_middle_client_error_message(error: SemanticMiddleClientError) -> String:
+	match error:
+		SemanticMiddleProcessFailed(process_error):
+			"cannot start semantic worker: ${process_error.to_string()}"
+		SemanticMiddleWorkerExited(code, stderr):
+			"semantic worker exited with status ${code.to_string()}: ${stderr}"
+		SemanticMiddleWorkerSignaled(signal, stderr):
+			"semantic worker was terminated by signal ${signal.to_string()}: ${stderr}"
+		SemanticMiddleWorkerTimedOut(stderr):
+			"semantic worker timed out: ${stderr}"
+		SemanticMiddleUnexpectedStderr(stderr):
+			"semantic worker wrote to stderr on success: ${stderr}"
+		SemanticMiddleInvalidJson(detail):
+			"semantic worker returned invalid JSON: ${detail}"
+		SemanticMiddleProtocolFailed(protocol_error):
+			semantic_middle_protocol_error_message(protocol_error)
+
+
+private pure func decode_worker_stdout(
+	stdout: String,
+) -> Result[SemanticMiddleResponse, SemanticMiddleClientError]:
+	match parse_json(stdout):
+		Err(detail):
+			Err(SemanticMiddleInvalidJson(detail))
+		Ok(value):
+			match decode_semantic_middle_response_value(value):
+				Ok(response):
+					Ok(response)
+				Err(error):
+					Err(SemanticMiddleProtocolFailed(error))
+
+
+func run_semantic_middle_worker(
+	worker: SemanticMiddleWorkerCommand,
+	request: SemanticMiddleRequest,
+) -> Result[SemanticMiddleResponse, SemanticMiddleClientError]:
+	process_request = { Process.command(worker.program, worker.args) |
+		stdin = Process.BytesStdin(semantic_middle_request_to_json(request).to_string().to_bytes()),
+		timeout = worker.timeout,
+		capture_limit = Some(worker.max_response_size)
+	}
+
+	match Process.run_command(process_request):
+		Err(error):
+			Err(SemanticMiddleProcessFailed(error))
+		Ok(result):
+			stderr: String = result.stderr.to_string()
+
+			match result.exit:
+				Process.Exited(code):
+					if code != 0:
+						Err(SemanticMiddleWorkerExited(code, stderr))
+					else if stderr.length() != 0:
+						Err(SemanticMiddleUnexpectedStderr(stderr))
+					else:
+						decode_worker_stdout(result.stdout.to_string())
+				Process.Signaled(signal):
+					Err(SemanticMiddleWorkerSignaled(signal, stderr))
+				Process.TimedOut:
+					Err(SemanticMiddleWorkerTimedOut(stderr))

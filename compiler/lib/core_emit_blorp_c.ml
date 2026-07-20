@@ -401,6 +401,7 @@ let supported_primitive_runtime_builtins =
       "blorp_dict_with_capacity_string";
       "blorp_dict_remove";
       "blorp_dir_close";
+      "blorp_directory_path";
       "blorp_decode_utf8";
       "blorp_decode_utf8_nullable";
       "blorp_debug_error";
@@ -416,6 +417,11 @@ let supported_primitive_runtime_builtins =
       "blorp_file_close_read_writer";
       "blorp_file_close_reader";
       "blorp_file_close_writer";
+      "blorp_file_create_directories_raw";
+      "blorp_file_remove_directory_tree_raw";
+      "blorp_file_rename_path_raw";
+      "blorp_file_writer_path";
+      "blorp_file_write_text_atomic_raw";
       "blorp_file_exists";
       "blorp_file_modified";
       "blorp_file_size";
@@ -446,6 +452,8 @@ let supported_primitive_runtime_builtins =
       "blorp_get_mem_stats";
       "blorp_get_scheduler_stats";
       "blorp_getcwd";
+      "blorp_compiler_runtime_source";
+      "blorp_compiler_runtime_decl";
       "blorp_getenv";
       "blorp_getenv_nullable";
       "blorp_crc32";
@@ -482,6 +490,7 @@ let supported_primitive_runtime_builtins =
       "blorp_print_error";
       "blorp_print_live_object_summary";
       "blorp_process_run";
+      "blorp_process_run_command_raw";
       "blorp_process_run_inherit";
       "blorp_process_shell";
       "blorp_puts";
@@ -597,6 +606,8 @@ let supported_primitive_runtime_builtins =
       "blorp_test_tls_state_probe";
       "blorp_test_wait_ready_to_park_probe";
       "blorp_test_websocket_state_probe";
+      "blorp_temporary_directory_open_raw";
+      "blorp_temporary_file_open_raw";
       "blorp_string_concat";
       "blorp_string_eq";
       "blorp_vector_get_nullable";
@@ -892,41 +903,41 @@ let var_json (variable : Core.var) =
 let enum_constructor_key type_name constructor_name =
   type_name ^ "\000" ^ constructor_name
 
-let constructor_c_name_for_type constructor_symbols ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+let constructor_c_name_for_type ~reg constructor_symbols ty (variable : Core.var) =
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed (type_name, _) ->
       StringMap.find_opt
         (enum_constructor_key type_name variable.vname)
         constructor_symbols
   | _ -> None
 
-let is_option_none_constructor ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+let is_option_none_constructor ~reg ty (variable : Core.var) =
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed ("Option", [ _ ]) when String.equal variable.vname "None" ->
       true
   | _ -> false
 
 let is_stack_option_none_constructor ~reg ty variable =
-  is_option_none_constructor ty variable
+  is_option_none_constructor ~reg ty variable
   && Core_layout_type.is_stack_option_type ~reg ty
 
-let is_singleton_constructor_value constructor_symbols ty variable =
-  if is_option_none_constructor ty variable then true
+let is_singleton_constructor_value ~reg constructor_symbols ty variable =
+  if is_option_none_constructor ~reg ty variable then true
   else
-    match constructor_c_name_for_type constructor_symbols ty variable with
+    match constructor_c_name_for_type ~reg constructor_symbols ty variable with
     | Some _ -> true
     | None -> false
 
 let retain_policy_json_for_var ~reg constructor_symbols ty variable =
-  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  if is_singleton_constructor_value ~reg constructor_symbols ty variable then str "none"
   else retain_policy_json ~reg ty
 
 let release_policy_json_for_var ~reg constructor_symbols ty variable =
-  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  if is_singleton_constructor_value ~reg constructor_symbols ty variable then str "none"
   else release_policy_json ~reg ty
 
 let nullable_option_constructor_c_name ~reg ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
+  match Core_emit_layout.canonical_type ~reg ty with
   | Ast.TyNamed ("Option", [ _ ])
     when Core_layout_type.is_nullable_managed_option ~reg ty
          && String.equal variable.vname "None" ->
@@ -941,7 +952,7 @@ let var_json_for_expr ~reg constructor_symbols ty (variable : Core.var) =
       match nullable_option_constructor_c_name ~reg ty variable with
       | Some c_name -> c_name
       | None -> (
-          match constructor_c_name_for_type constructor_symbols ty variable with
+          match constructor_c_name_for_type ~reg constructor_symbols ty variable with
           | Some c_name -> c_name
           | None -> Core.Var.to_c_name variable)
   in
@@ -1262,6 +1273,7 @@ let match_accessor_parent_type ~reg scrut_ty = function
 
 let constructor_match_test_json ~reg enum_names union_names enum_constructors path
     scrut_ty ctor =
+  let scrut_ty = Core_emit_layout.canonical_type ~reg scrut_ty in
   match scrut_ty with
   | Ast.TyNamed ("Option", [ _ ])
     when Core_layout_type.is_stack_option_type ~reg scrut_ty -> (
@@ -4344,24 +4356,38 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
           let* fields = typed [ ("literal", literal_json) ] in
           Ok (kind "tensor_literal" fields)
       | Core.TensorWordElements _ -> unsupported path "word tensor literal")
-  | Core.CDict entries ->
-      let* entries_json =
-        result_list entries (fun index (key, value) ->
-            let entry_path = Printf.sprintf "%s.entries[%d]" path index in
-            let* key_json =
-              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
-                heap_record_names union_names enum_constructors
-                (entry_path ^ ".key") key
-            in
-            let* value_json =
-              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
-                heap_record_names union_names enum_constructors
-                (entry_path ^ ".value") value
-            in
-            Ok (obj [ ("key", key_json); ("value", value_json) ]))
-      in
-      let* fields = typed [ ("entries", entries_json) ] in
-      Ok (kind "dict" fields)
+  | Core.CDict entries -> (
+      match (entries, Core_emit_layout.canonical_type ~reg expr.ty) with
+      | [], Ast.TyNamed ("Set", [ elem_ty ]) ->
+          let alloc =
+            {
+              Core.sa_constructor =
+                Core_hash_container_layout.set_constructor_kind ~reg elem_ty;
+            }
+          in
+          let* alloc_json =
+            set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc
+          in
+          let* fields = typed [ ("alloc", alloc_json) ] in
+          Ok (kind "set_alloc" fields)
+      | _ ->
+          let* entries_json =
+            result_list entries (fun index (key, value) ->
+                let entry_path = Printf.sprintf "%s.entries[%d]" path index in
+                let* key_json =
+                  expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                    heap_record_names union_names enum_constructors
+                    (entry_path ^ ".key") key
+                in
+                let* value_json =
+                  expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+                    heap_record_names union_names enum_constructors
+                    (entry_path ^ ".value") value
+                in
+                Ok (obj [ ("key", key_json); ("value", value_json) ]))
+          in
+          let* fields = typed [ ("entries", entries_json) ] in
+          Ok (kind "dict" fields))
   | Core.CDictConstruct dc ->
       let* construct =
         dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -5889,7 +5915,26 @@ and list_swap_json ~function_names ~consumed_params ~reg enum_names value_record
 
 and list_retain_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path list value =
-  let boxed_value = Core_emit_layout.boxed_storage_value ~reg value in
+  (* [list_retain_for] is already an explicit ownership operation. Container
+     intrinsics often carry managed pointer slots as [Ptr], so deriving this
+     bit only from the source type would erase the required retain. Inline
+     values must remain false: boxing one solely for a no-op retain leaks the
+     temporary box. *)
+  let prepared_value = Core_emit_layout.boxed_storage_value ~reg value in
+  let needs_release =
+    match prepared_value.bsv_box.box_kind with
+    | Core.BoxPointer -> true
+    | Core.BoxStruct _ ->
+        Core_layout_type.is_stack_result_type ~reg value.ty
+    | Core.BoxPrim | Core.BoxVoid | Core.BoxFloat | Core.BoxFloat32
+    | Core.BoxFloat16 | Core.BoxInt128 | Core.BoxUInt128 -> false
+  in
+  let boxed_value =
+    {
+      prepared_value with
+      bsv_needs_release = needs_release;
+    }
+  in
   let* list_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list
@@ -8378,7 +8423,21 @@ let impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
 let rec decl_jsons ~function_names ~consumed_params ~reg ~is_private enum_names
     value_record_names heap_record_names union_names enum_constructors
     global_def_ids global_names index (decl : Core.core_decl) =
-  let path = Printf.sprintf "program.decls[%d]" index in
+  let declaration_label =
+    match decl.cd_desc with
+    | Core.CDFunc func -> "function " ^ func.cf_name
+    | Core.CDVar var -> "variable " ^ Core.Var.to_string var.cv_name
+    | Core.CDTrait trait -> "trait " ^ trait.ct_name
+    | Core.CDType type_decl -> "type " ^ type_decl.type_name
+    | Core.CDRecord record_decl -> "record " ^ record_decl.record_name
+    | Core.CDImpl impl -> "impl " ^ impl.ci_trait
+    | Core.CDImport import_decl -> "import " ^ import_decl.import_module
+    | Core.CDTypeAlias alias_decl -> "type alias " ^ alias_decl.alias_name
+    | Core.CDPrivate _ -> "private declaration"
+  in
+  let path =
+    Printf.sprintf "program.decls[%d](%s)" index declaration_label
+  in
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
       Ok []

@@ -10,7 +10,6 @@ let schema_version = 1
 let domain = "compiler"
 let core_error_renderer = "core_error"
 let core_fairness_renderer = "core_fairness"
-let core_profile_renderer = "core_profile"
 let core_stage_renderer = "core_stage"
 let core_trait_resolve_renderer = "core_trait_resolve"
 let language_surface_renderer = "language_surface"
@@ -83,10 +82,11 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
-type cli_frontend_command =
-  | CliFrontendCheck
-  | CliFrontendCompile
-  | CliFrontendRun
+type cli_source_override = {
+  cli_source_path : string;
+  cli_source_module_name : string;
+  cli_source_text : string;
+}
 
 type cli_frontend_delegation_io =
   | CliFrontendBatchDelegation
@@ -96,15 +96,6 @@ type cli_frontend_sanitizer_mode =
   | CliFrontendSanitizeOff
   | CliFrontendSanitizeAddressUndefined
   | CliFrontendSanitizeUndefined
-
-type cli_check_options = {
-  cli_check_dump_ast : bool;
-  cli_check_dump_typed_ast : bool;
-  cli_check_debug : bool;
-  cli_check_no_format : bool;
-  cli_check_std_dir : string option;
-  cli_check_paths : string list;
-}
 
 type cli_compile_options = {
   cli_compile_ast_only : bool;
@@ -121,20 +112,6 @@ type cli_compile_options = {
   cli_compile_std_dir : string option;
   cli_compile_output : string option;
   cli_compile_files : string list;
-}
-
-type cli_run_options = {
-  cli_run_profile : bool;
-  cli_run_debug : bool;
-  cli_run_sanitizer : cli_frontend_sanitizer_mode option;
-  cli_run_leak_check : bool;
-  cli_run_release : bool;
-  cli_run_no_format : bool;
-  cli_run_timeout : int option;
-  cli_run_threads : int option;
-  cli_run_std_dir : string option;
-  cli_run_files : string list;
-  cli_run_user_args : string list;
 }
 
 type cli_test_mode =
@@ -190,11 +167,6 @@ type cli_package_options = {
   cli_package_command : cli_package_command;
 }
 
-type cli_frontend_options =
-  | CliFrontendCheckOptions of cli_check_options
-  | CliFrontendCompileOptions of cli_compile_options
-  | CliFrontendRunOptions of cli_run_options
-
 type cli_frontend_module_origin =
   | CliFrontendUserModule
   | CliFrontendStdModule
@@ -248,9 +220,8 @@ type cli_frontend_import_edge = {
 }
 
 type cli_frontend_module_graph = {
-  cli_frontend_graph_command : cli_frontend_command;
   cli_frontend_graph_args : string list;
-  cli_frontend_graph_options : cli_frontend_options;
+  cli_frontend_graph_compile_options : cli_compile_options;
   cli_frontend_graph_context : cli_frontend_graph_context;
   cli_frontend_graph_roots : cli_frontend_graph_source list;
   cli_frontend_graph_modules : cli_frontend_graph_source list;
@@ -663,7 +634,7 @@ let typecheck_graph_request_json_with_policy ~resolved_imports
          ("payload", Lsp_json.Object payload_fields);
        ])
 
-let cli_run_request_json ?version args =
+let cli_run_request_json ?version ?source args =
   let version_fields =
     match version with
     | Some value -> [ ("version", Lsp_json.String value) ]
@@ -674,6 +645,18 @@ let cli_run_request_json ?version args =
       ("args", Lsp_json.Array (List.map (fun arg -> Lsp_json.String arg) args));
     ]
     @ version_fields
+    @ (match source with
+      | Some source ->
+          [
+            ( "source",
+              Lsp_json.Object
+                [
+                  ("path", Lsp_json.String source.cli_source_path);
+                  ("module", Lsp_json.String source.cli_source_module_name);
+                  ("text", Lsp_json.String source.cli_source_text);
+                ] );
+          ]
+      | None -> [])
   in
   Lsp_json.to_string
     (Lsp_json.Object
@@ -1194,10 +1177,8 @@ let typecheck_graph_stream_response_json ~module_count response_text =
   in
   split_modules module_count [] sources
 
-let cli_frontend_command_of_string = function
-  | "check" -> Ok CliFrontendCheck
-  | "compile" -> Ok CliFrontendCompile
-  | "run" -> Ok CliFrontendRun
+let require_compile_frontend_command = function
+  | "compile" -> Ok ()
   | command ->
       Error ("invalid_response", "unsupported CLI frontend command `" ^ command ^ "`")
 
@@ -1330,27 +1311,6 @@ let require_options_kind expected options =
         "CLI options kind `" ^ kind ^ "` did not match expected `" ^ expected
         ^ "`" )
 
-let decode_cli_check_options options =
-  let* () = require_options_kind "check" options in
-  let* cli_check_dump_ast = bool_response_field "dump_ast" options in
-  let* cli_check_dump_typed_ast =
-    bool_response_field "dump_typed_ast" options
-  in
-  let* cli_check_debug = bool_response_field "debug" options in
-  let* cli_check_no_format = bool_response_field "no_format" options in
-  let* cli_check_std_dir = optional_string_response_field "std_dir" options in
-  let* cli_check_paths = string_array_field "paths" options in
-  Ok
-    (CliFrontendCheckOptions
-       {
-         cli_check_dump_ast;
-         cli_check_dump_typed_ast;
-         cli_check_debug;
-         cli_check_no_format;
-         cli_check_std_dir;
-         cli_check_paths;
-       })
-
 let decode_cli_compile_options options =
   let* () = require_options_kind "compile" options in
   let* cli_compile_ast_only = bool_response_field "ast_only" options in
@@ -1382,52 +1342,22 @@ let decode_cli_compile_options options =
   let* cli_compile_output = optional_string_response_field "output" options in
   let* cli_compile_files = string_array_field "files" options in
   Ok
-    (CliFrontendCompileOptions
-       {
-         cli_compile_ast_only;
-         cli_compile_dump_ast;
-         cli_compile_dump_typed_ast;
-         cli_compile_dump_core_after;
-         cli_compile_dump_file;
-         cli_compile_stop_after;
-         cli_compile_time_phases;
-         cli_compile_check_invariants;
-         cli_compile_debug;
-         cli_compile_no_format;
-         cli_compile_embed_runtime;
-         cli_compile_std_dir;
-         cli_compile_output;
-         cli_compile_files;
-       })
-
-let decode_cli_run_options options =
-  let* () = require_options_kind "run" options in
-  let* cli_run_profile = bool_response_field "profile" options in
-  let* cli_run_debug = bool_response_field "debug" options in
-  let* cli_run_sanitizer = optional_sanitizer_response_field "sanitizer" options in
-  let* cli_run_leak_check = bool_response_field "leak_check" options in
-  let* cli_run_release = bool_response_field "release" options in
-  let* cli_run_no_format = bool_response_field "no_format" options in
-  let* cli_run_timeout = optional_int_response_field "timeout" options in
-  let* cli_run_threads = optional_int_response_field "threads" options in
-  let* cli_run_std_dir = optional_string_response_field "std_dir" options in
-  let* cli_run_files = string_array_field "files" options in
-  let* cli_run_user_args = string_array_field "user_args" options in
-  Ok
-    (CliFrontendRunOptions
-       {
-         cli_run_profile;
-         cli_run_debug;
-         cli_run_sanitizer;
-         cli_run_leak_check;
-         cli_run_release;
-         cli_run_no_format;
-         cli_run_timeout;
-         cli_run_threads;
-         cli_run_std_dir;
-         cli_run_files;
-         cli_run_user_args;
-       })
+    {
+      cli_compile_ast_only;
+      cli_compile_dump_ast;
+      cli_compile_dump_typed_ast;
+      cli_compile_dump_core_after;
+      cli_compile_dump_file;
+      cli_compile_stop_after;
+      cli_compile_time_phases;
+      cli_compile_check_invariants;
+      cli_compile_debug;
+      cli_compile_no_format;
+      cli_compile_embed_runtime;
+      cli_compile_std_dir;
+      cli_compile_output;
+      cli_compile_files;
+    }
 
 let decode_cli_test_run_options cli_test_raw_args options =
   let* () = require_options_kind "test" options in
@@ -1485,12 +1415,6 @@ let decode_cli_purify_options cli_purify_raw_args options =
       cli_purify_verbose;
       cli_purify_paths;
     }
-
-let decode_cli_frontend_options command options =
-  match command with
-  | CliFrontendCheck -> decode_cli_check_options options
-  | CliFrontendCompile -> decode_cli_compile_options options
-  | CliFrontendRun -> decode_cli_run_options options
 
 let cli_frontend_module_origin_field origin =
   let* kind = string_response_field "kind" origin in
@@ -1679,17 +1603,15 @@ let validate_cli_frontend_import_edges ~sources edges =
 
 let cli_frontend_module_graph_response_field artifact =
   let* command_text = string_response_field "command" artifact in
-  let* cli_frontend_graph_command =
-    cli_frontend_command_of_string command_text
-  in
+  let* () = require_compile_frontend_command command_text in
   let* cli_frontend_graph_args = string_array_field "args" artifact in
   let* () =
     validate_cli_artifact_command "frontend_module_graph" command_text
       cli_frontend_graph_args
   in
   let* options = json_response_field "options" artifact in
-  let* cli_frontend_graph_options =
-    decode_cli_frontend_options cli_frontend_graph_command options
+  let* cli_frontend_graph_compile_options =
+    decode_cli_compile_options options
   in
   let* cli_frontend_graph_context =
     cli_frontend_graph_context_field artifact
@@ -1712,9 +1634,8 @@ let cli_frontend_module_graph_response_field artifact =
   Ok
     (CliRunFrontendModuleGraph
        {
-         cli_frontend_graph_command;
          cli_frontend_graph_args;
-         cli_frontend_graph_options;
+         cli_frontend_graph_compile_options;
          cli_frontend_graph_context;
          cli_frontend_graph_roots;
          cli_frontend_graph_modules;
@@ -2992,8 +2913,8 @@ let run_parser_request_via_blorp request_json =
 let run_typecheck_request_via_blorp request_json =
   run_request_via_blorp_binary typecheck_bridge_binary request_json
 
-let run_cli_request_via_blorp ?version args =
-  run_parser_request_via_blorp (cli_run_request_json ?version args)
+let run_cli_request_via_blorp ?version ?source args =
+  run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
 
 let render_cache_key ~renderer ~op args =
   let buf = Buffer.create 128 in
@@ -3083,8 +3004,18 @@ let typecheck_graph_via_command_with_policy ~resolved_imports
     ~module_count:(List.length module_targets)
     response_json
 
-let cli_run_via_command ?version args =
-  run_cli_request_via_blorp ?version args |> cli_run_response_json
+let cli_run_via_command ?version ?source args =
+  run_cli_request_via_blorp ?version ?source args |> cli_run_response_json
+
+let cli_run_source_via_command ~path ~module_name ~text args =
+  cli_run_via_command
+    ~source:
+      {
+        cli_source_path = path;
+        cli_source_module_name = module_name;
+        cli_source_text = text;
+      }
+    args
 
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer
@@ -3094,10 +3025,6 @@ let render_core_trait_resolve_no_impl_hint ~method_name ~type_name ~candidates =
   render_via_command_exn ~renderer:core_trait_resolve_renderer
     ~op:"core_trait_resolve_no_impl_hint"
     [ method_name; type_name; String.concat ";" candidates ]
-
-let render_core_profile_format serialized_entries =
-  render_via_command_exn ~renderer:core_profile_renderer
-    ~op:"core_profile_format" [ serialized_entries ]
 
 let render_core_error_format ~phase ~message ~line ~column ~hint =
   let hint_kind, hint_text =

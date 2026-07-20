@@ -1,0 +1,192 @@
+import:
+	fs:
+		IOError(Other),
+		create_directories,
+		message,
+		open_read,
+		remove_directory_tree,
+		rename_path,
+		resource_path,
+		temporary_directory,
+		temporary_file,
+		write_text,
+		write_text_atomic,
+	system: file_exists, is_directory, read_file, temp_dir
+	test: TestSuite
+
+
+func exercise_temporary_directory() -> Result[String, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_fs_dir_"):
+		path: String = directory.resource_path()
+
+		if is_directory(path):
+			Ok(path)
+		else:
+			Err(Other("temporary directory was not created"))
+
+
+func test_temporary_directory_is_scoped() -> Bool:
+	match exercise_temporary_directory():
+		Ok(path):
+			not file_exists(path)
+		Err(_):
+			False
+
+
+func exercise_temporary_file() -> Result[String, IOError]:
+	with file ?= temporary_file(temp_dir(), "blorp_fs_file_"):
+		path: String = file.resource_path()
+		written ?= file.write_text("temporary contents")
+
+		match read_file(path):
+			Ok(contents):
+				if contents == "temporary contents":
+					Ok(path)
+				else:
+					Err(Other("temporary file contents did not match"))
+			Err(detail):
+				Err(Other(detail))
+
+
+func test_temporary_file_is_writable_and_scoped() -> Bool:
+	match exercise_temporary_file():
+		Ok(path):
+			not file_exists(path)
+		Err(_):
+			False
+
+
+func exercise_atomic_write_creates_and_replaces() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_fs_atomic_"):
+		path: String = directory.resource_path() + "/output file λ.txt"
+
+		match write_text_atomic(path, "first"):
+			Err(_):
+				Ok(False)
+			Ok(_):
+				match write_text_atomic(path, "second"):
+					Err(_):
+						Ok(False)
+					Ok(_):
+						match read_file(path):
+							Ok(contents):
+								Ok(contents == "second")
+							Err(_):
+								Ok(False)
+
+
+func test_atomic_write_creates_and_replaces() -> Bool:
+	match exercise_atomic_write_creates_and_replaces():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+func exercise_atomic_write_failure_preserves_destination() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_fs_atomic_failure_"):
+		path: String = directory.resource_path()
+
+		match write_text_atomic(path, "must not replace a directory"):
+			Ok(_):
+				Ok(False)
+			Err(_):
+				Ok(is_directory(path))
+
+
+func test_atomic_write_failure_preserves_destination() -> Bool:
+	match exercise_atomic_write_failure_preserves_destination():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+func exercise_temporary_parent_error() -> Result[Bool, Bool]:
+	missing: String = temp_dir() + "/__blorp_missing_temporary_parent__"
+
+	with directory ?= temporary_directory(
+		missing,
+		"child_",
+	) on error => message(error).contains(missing):
+		Ok(False)
+
+
+func test_temporary_parent_error_keeps_path_context() -> Bool:
+	match exercise_temporary_parent_error():
+		Ok(_):
+			False
+		Err(has_path):
+			has_path
+
+
+func exercise_typed_path_operations() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_fs_paths_"):
+		root: String = directory.resource_path()
+		nested: String = root + "/cache/a/b"
+		created ?= create_directories(nested)
+		text_path: String = nested + "/value.txt"
+		written ?= write_text_atomic(text_path, "cache value")
+
+		with text_reader ?= open_read(text_path):
+			text ?= text_reader.read_text()
+
+			with bytes_reader ?= open_read(text_path):
+				bytes_value ?= bytes_reader.read_bytes()
+				removed ?= remove_directory_tree(root + "/cache")
+
+				Ok(
+					(
+						text == "cache value"
+						and bytes_value.to_string() == "cache value"
+						and not file_exists(root + "/cache")
+					),
+				)
+
+
+func test_typed_path_operations() -> Bool:
+	match exercise_typed_path_operations():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+func exercise_directory_publication() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_fs_publish_"):
+		root: String = directory.resource_path()
+		stage: String = root + "/stage"
+		published: String = root + "/published"
+		created ?= create_directories(stage)
+		written ?= write_text_atomic(stage + "/READY", "ready\n")
+		renamed ?= rename_path(stage, published)
+
+		with ready_file ?= open_read(published + "/READY"):
+			ready ?= ready_file.read_text()
+
+			Ok(ready == "ready\n" and not file_exists(stage) and file_exists(published))
+
+
+func test_directory_publication() -> Bool:
+	match exercise_directory_publication():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Scoped temporary filesystem resources",
+	tests = [
+		("temporary directory cleans up on scope exit", test_temporary_directory_is_scoped),
+		("temporary file is writable and cleans up", test_temporary_file_is_writable_and_scoped),
+		("atomic write creates and replaces", test_atomic_write_creates_and_replaces),
+		(
+			"atomic write failure preserves destination",
+			test_atomic_write_failure_preserves_destination,
+		),
+		("temporary parent error includes path", test_temporary_parent_error_keeps_path_context),
+		("typed path operations compose", test_typed_path_operations),
+		("directory publication is atomic", test_directory_publication),
+	]
+}

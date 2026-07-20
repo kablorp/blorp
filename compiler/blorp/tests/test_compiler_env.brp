@@ -6,6 +6,7 @@ import:
 		CompilerOverloadEntry,
 		CompilerPurity(CompilerImpure, CompilerPure),
 		CompilerResourceArgPolicy(CompilerRejectResourceArgs),
+		CompilerSymbolKind(CompilerVarSymbolKind),
 		CompilerTraitObligationResolution(
 			CompilerTraitObligationDeferred,
 			CompilerTraitObligationSatisfied,
@@ -29,17 +30,22 @@ import:
 		compiler_env_add_trait,
 		compiler_env_add_trait_function,
 		compiler_env_add_type,
+		compiler_env_add_type_with_constructor_ids,
 		compiler_env_add_ufcs_method,
 		compiler_env_add_var,
 		compiler_env_add_var_with_details,
 		compiler_env_add_var_with_module_details,
 		compiler_env_disambiguate_nominal_dim_application,
 		compiler_env_empty,
+		compiler_env_extend_type_param_bounds,
+		compiler_env_find_callable_debug_only_by_def_id,
+		compiler_env_find_callable_type_params_by_def_id,
 		compiler_env_find_conflicting_impl,
 		compiler_env_find_overload_by_def_id,
 		compiler_env_find_records_with_fields,
 		compiler_env_get_alias,
 		compiler_env_get_constructor,
+		compiler_env_get_constructors,
 		compiler_env_get_func_info,
 		compiler_env_get_function_trait,
 		compiler_env_get_module_func_symbol,
@@ -56,6 +62,7 @@ import:
 		compiler_env_is_scoped_resource_derived_var,
 		compiler_env_is_scoped_resource_related_var,
 		compiler_env_is_scoped_resource_var,
+		compiler_env_lookup,
 		compiler_env_lookup_in_current_scope,
 		compiler_env_lookup_is_outermost_scope,
 		compiler_env_lookup_module_ufcs_methods,
@@ -65,15 +72,19 @@ import:
 		compiler_env_resolve_alias,
 		compiler_env_resolve_overload,
 		compiler_env_resolve_trait_obligation,
+		compiler_env_resolve_ufcs_method,
 		compiler_env_scoped_resource_unavailable_owner,
 		compiler_env_select_overload_for_args,
 		compiler_env_set_type_param_bounds,
+		compiler_env_symbols_named,
 		compiler_env_trait_function_collision,
 		compiler_env_trait_has_supertrait,
 		compiler_env_trait_method_names_transitive,
 		compiler_env_trait_methods_with_declaring_trait,
 		compiler_func_symbol,
 		compiler_impl_instance,
+		compiler_impl_instance_with_methods,
+		compiler_impl_method_info,
 		compiler_overload_type_param_names,
 		compiler_resolve_self,
 		compiler_trait_def,
@@ -248,6 +259,90 @@ func test_scope_lookup_and_shadowing() -> Bool:
 			False
 
 
+func test_same_scope_lookup_preserves_latest_symbol_and_full_history() -> Bool:
+	base = compiler_env_empty()
+	with_int = compiler_env_add_var(base, "value", compiler_type_int())
+	with_string = compiler_env_add_var(with_int, "value", compiler_type_string())
+
+	match compiler_env_lookup(with_string, "value"):
+		Some(symbol):
+			symbol.name == "value" and compiler_types_equal(
+				compiler_env_get_var_type(with_string, "value").get_or(compiler_type_int()),
+				compiler_type_string(),
+			) and compiler_env_symbols_named(with_string, "value").length() == 2
+		None:
+			False
+
+
+func test_symbol_history_preserves_scope_and_declaration_order() -> Bool:
+	outer = compiler_env_add_var(compiler_env_empty(), "value", compiler_type_int())
+	inner = compiler_env_add_var(
+		compiler_env_add_var(compiler_env_push_scope(outer), "value", compiler_type_string()),
+		"value",
+		compiler_type_bool(),
+	)
+	history = compiler_env_symbols_named(inner, "value")
+
+	match (history.get(0), history.get(1), history.get(2)):
+		(Some(first), Some(second), Some(third)):
+			match (first.kind, second.kind, third.kind):
+				(CompilerVarSymbolKind(first_var), CompilerVarSymbolKind(second_var), CompilerVarSymbolKind(third_var)):
+					(
+						history.length() == 3
+						and compiler_types_equal(first_var.var_type, compiler_type_bool())
+						and compiler_types_equal(second_var.var_type, compiler_type_string())
+						and compiler_types_equal(third_var.var_type, compiler_type_int())
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_constructor_lookup_preserves_same_name_candidates() -> Bool:
+	first = compiler_env_add_type(
+		compiler_env_empty(),
+		"FirstChoice",
+		[],
+		[
+			{
+				name = "Shared",
+				fields = [compiler_type_int()],
+				tag = 0
+			},
+		],
+		CompilerTypeUnion,
+		False,
+		True,
+	)
+	second = compiler_env_add_type(
+		first,
+		"SecondChoice",
+		[],
+		[
+			{
+				name = "Shared",
+				fields = [compiler_type_string()],
+				tag = 0
+			},
+		],
+		CompilerTypeUnion,
+		False,
+		True,
+	)
+	constructors = compiler_env_get_constructors(second, "Shared")
+
+	match (constructors.get(0), constructors.get(1)):
+		(Some(latest), Some(earlier)):
+			(
+				constructors.length() == 2
+				and latest.parent_type == "SecondChoice"
+				and earlier.parent_type == "FirstChoice"
+			)
+		_:
+			False
+
+
 func test_type_record_alias_and_nominal_dim_resolution() -> Bool:
 	var env: CompilerEnv = compiler_env_empty()
 	env = compiler_env_add_type(
@@ -328,6 +423,37 @@ func test_type_record_alias_and_nominal_dim_resolution() -> Bool:
 					CompilerArrayType(compiler_type_float(), [CompilerConstIntType(8)]),
 				)
 			)
+		_:
+			False
+
+
+func test_type_registration_uses_reserved_constructor_ids() -> Bool:
+	base = compiler_env_empty()
+	env = compiler_env_add_type_with_constructor_ids(
+		{ base | next_def_id = 43 },
+		"Choice",
+		[],
+		[
+			{
+				name = "Left",
+				fields = [compiler_type_int()],
+				tag = 0
+			},
+			{
+				name = "Right",
+				fields = [compiler_type_int()],
+				tag = 1
+			},
+		],
+		CompilerTypeUnion,
+		False,
+		True,
+		[Some(41), Some(42)],
+	)
+
+	match (compiler_env_get_constructor(env, "Left"), compiler_env_get_constructor(env, "Right")):
+		(Some(left), Some(right)):
+			left.constructor_id == 41 and right.constructor_id == 42 and env.next_def_id == 43
 		_:
 			False
 
@@ -488,6 +614,18 @@ func test_traits_impls_overloads_and_ufcs() -> Bool:
 			False
 
 
+func test_empty_type_param_extension_preserves_environment() -> Bool:
+	extended = compiler_env_extend_type_param_bounds(
+		compiler_env_set_type_param_bounds(
+			compiler_env_empty(),
+			[compiler_make_bound_type_param("T", ["Display"])],
+		),
+		[],
+	)
+
+	compiler_env_has_trait_bound_transitive(extended, "T", "Display")
+
+
 func test_resolve_self_returns_owned_types() -> Bool:
 	concrete = CompilerNamedType("Widget", [])
 	source = CompilerFunctionType(
@@ -564,6 +702,80 @@ func test_overload_ranking_prefers_concrete_over_generic() -> Bool:
 			selected.def_id == 61 and resolved.def_id == 61
 		_:
 			False
+
+
+func test_overload_matching_handles_generic_callback_parameters() -> Bool:
+	generic_callback_entry: CompilerOverloadEntry = {
+		def_id = 62,
+		func_type = CompilerFunctionType(
+			True,
+			[
+				CompilerNamedType("List", [CompilerTypeVar("T")]),
+				CompilerFunctionType(True, [CompilerTypeVar("T")], CompilerTypeVar("U")),
+			],
+			CompilerNamedType(
+				"List",
+				[CompilerTypeVar("U")],
+			),
+		),
+		type_params = [
+			compiler_make_bound_type_param("T", []),
+			compiler_make_bound_type_param("U", []),
+		],
+		param_names = [Some("values"), Some("mapper")],
+		purity = CompilerPure,
+		origin = CompilerUserDefinedFunc,
+		resource_args = CompilerRejectResourceArgs,
+		module_path = None,
+		dim_constraints = [],
+		loop_producer = None,
+		debug_only = False
+	}
+	decoy = two_arg_overload_entry(
+		63,
+		compiler_type_string(),
+		compiler_type_string(),
+		compiler_type_string(),
+	)
+
+	pure_selection = compiler_env_select_overload_for_args(
+		[generic_callback_entry, decoy],
+		[
+			CompilerNamedType("List", [compiler_type_int()]),
+			CompilerFunctionType(True, [compiler_type_int()], compiler_type_string()),
+		],
+	)
+	impure_selection = compiler_env_select_overload_for_args(
+		[generic_callback_entry],
+		[
+			CompilerNamedType("List", [compiler_type_int()]),
+			CompilerFunctionType(False, [compiler_type_int()], compiler_type_string()),
+		],
+	)
+
+	match pure_selection:
+		Some(selected):
+			selected.def_id == 62 and impure_selection.is_none()
+		None:
+			False
+
+
+func test_overload_matching_rejects_narrower_higher_order_callback() -> Bool:
+	impure_callback = CompilerFunctionType(False, [compiler_type_int()], compiler_type_int())
+	pure_callback = CompilerFunctionType(True, [compiler_type_int()], compiler_type_int())
+	expected_higher_order = CompilerFunctionType(False, [impure_callback], compiler_type_int())
+	narrower_actual = CompilerFunctionType(True, [pure_callback], compiler_type_int())
+	entry = two_arg_overload_entry(
+		64,
+		compiler_type_int(),
+		expected_higher_order,
+		compiler_type_int(),
+	)
+
+	compiler_env_select_overload_for_args(
+		[entry],
+		[compiler_type_int(), narrower_actual],
+	).is_none()
 
 
 func test_generic_impl_requires_concrete_type_to_satisfy_bounds() -> Bool:
@@ -646,6 +858,45 @@ func test_generic_impl_conflicts_with_specific_impl() -> Bool:
 	):
 		(Some(left_conflict), Some(right_conflict)):
 			left_conflict.def_id == 50 and right_conflict.def_id == 51
+		_:
+			False
+
+
+func test_callable_metadata_finds_impl_method_by_id() -> Bool:
+	method = compiler_impl_method_info(
+		"length",
+		Some({
+			callable_id = 73,
+			module_path = "std/list",
+		}),
+		CompilerFunctionType(
+			True,
+			[CompilerNamedType("List", [CompilerTypeVar("T")])],
+			compiler_type_int(),
+		),
+		[compiler_make_bound_type_param("T", [])],
+		[Some("self")],
+		CompilerPure,
+		CompilerRejectResourceArgs,
+		[],
+		True,
+	)
+	impl = compiler_impl_instance_with_methods(
+		72,
+		"HasLength",
+		CompilerNamedType("List", [CompilerTypeVar("T")]),
+		[compiler_make_bound_type_param("T", [])],
+		[method],
+		False,
+	)
+	env = compiler_env_add_impl(compiler_env_empty(), impl)
+
+	match compiler_env_find_callable_type_params_by_def_id(env, 73):
+		Some([type_param]):
+			(
+				type_param.name == "T"
+				and compiler_env_find_callable_debug_only_by_def_id(env, 73) == Some(True)
+			)
 		_:
 			False
 
@@ -744,6 +995,73 @@ func test_module_ufcs_lookup_filters_module_and_receiver() -> Bool:
 			False
 
 
+func test_function_symbol_ufcs_lookup_filters_same_name_candidates() -> Bool:
+	int_func = compiler_func_symbol(
+		30,
+		CompilerFunctionType(True, [compiler_type_int()], compiler_type_int()),
+		[],
+		[Some("value")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		Some("std/convert"),
+		[],
+		None,
+		False,
+	)
+	string_func = compiler_func_symbol(
+		31,
+		CompilerFunctionType(True, [compiler_type_string()], compiler_type_string()),
+		[],
+		[Some("value")],
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		Some("std/convert"),
+		[],
+		None,
+		False,
+	)
+	env = compiler_env_add_func_with_info(
+		compiler_env_add_func_with_info(compiler_env_empty(), "convert", int_func),
+		"convert",
+		string_func,
+	)
+	matches = compiler_env_lookup_module_ufcs_methods(
+		env,
+		"std/convert",
+		"convert",
+		compiler_type_string(),
+	)
+
+	match matches.get(0):
+		Some(entry):
+			(
+				matches.length() == 1
+				and entry.def_id == 31
+				and compiler_env_has_ufcs_method(env, "convert")
+				and not compiler_env_has_ufcs_method(env, "missing")
+			)
+		None:
+			False
+
+
+func test_ufcs_resolution_prefers_concrete_receiver() -> Bool:
+	generic_entry = generic_overload_entry(23, CompilerTypeVar("T"), compiler_type_string(), "T")
+	concrete_entry = overload_entry(24, compiler_type_string(), compiler_type_int())
+	env = compiler_env_add_ufcs_method(
+		compiler_env_add_ufcs_method(compiler_env_empty(), "repeat", generic_entry),
+		"repeat",
+		concrete_entry,
+	)
+
+	match compiler_env_resolve_ufcs_method(env, "repeat", compiler_type_string()):
+		Some(entry):
+			entry.def_id == 24
+		None:
+			False
+
+
 func test_module_variable_lookup_uses_module_path() -> Bool:
 	env = compiler_env_add_var_with_module_details(
 		compiler_env_add_var(compiler_env_empty(), "version", compiler_type_int()),
@@ -772,13 +1090,41 @@ tests: TestSuite = {
 	tests = [
 		("scope lookup and shadowing", test_scope_lookup_and_shadowing),
 		(
+			"same-scope lookup preserves latest symbol and full history",
+			test_same_scope_lookup_preserves_latest_symbol_and_full_history,
+		),
+		(
+			"symbol history preserves scope and declaration order",
+			test_symbol_history_preserves_scope_and_declaration_order,
+		),
+		(
+			"constructor lookup preserves same-name candidates",
+			test_constructor_lookup_preserves_same_name_candidates,
+		),
+		(
 			"type record alias and nominal dim resolution",
 			test_type_record_alias_and_nominal_dim_resolution,
 		),
+		(
+			"type registration uses reserved constructor ids",
+			test_type_registration_uses_reserved_constructor_ids,
+		),
 		("traits impls overloads and ufcs", test_traits_impls_overloads_and_ufcs),
+		(
+			"empty type parameter extension preserves environment",
+			test_empty_type_param_extension_preserves_environment,
+		),
 		(
 			"overload ranking prefers concrete over generic",
 			test_overload_ranking_prefers_concrete_over_generic,
+		),
+		(
+			"overload matching handles generic callback parameters",
+			test_overload_matching_handles_generic_callback_parameters,
+		),
+		(
+			"overload matching rejects narrower higher order callback",
+			test_overload_matching_rejects_narrower_higher_order_callback,
 		),
 		("resolve self returns owned types", test_resolve_self_returns_owned_types),
 		(
@@ -793,10 +1139,22 @@ tests: TestSuite = {
 			"generic impl conflicts with specific impl",
 			test_generic_impl_conflicts_with_specific_impl,
 		),
+		(
+			"callable metadata finds impl method by id",
+			test_callable_metadata_finds_impl_method_by_id,
+		),
 		("module function lookup uses module path", test_module_function_lookup_uses_module_path),
 		(
 			"module ufcs lookup filters module and receiver",
 			test_module_ufcs_lookup_filters_module_and_receiver,
+		),
+		(
+			"function-symbol ufcs lookup filters same-name candidates",
+			test_function_symbol_ufcs_lookup_filters_same_name_candidates,
+		),
+		(
+			"ufcs resolution prefers concrete receiver",
+			test_ufcs_resolution_prefers_concrete_receiver,
 		),
 		("module variable lookup uses module path", test_module_variable_lookup_uses_module_path),
 	]

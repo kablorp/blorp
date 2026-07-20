@@ -248,8 +248,9 @@ Next implementation slices:
 
 Implementation order:
 
-1. Measure pass-group time before splitting a stage. `Core_profile` can already
-   report observed Core stages; use it before optimizing aggregate stages.
+1. Measure pass-group time before splitting a stage. The Blorp CLI compile
+   worker already records phase timings; use those measurements before
+   optimizing aggregate stages.
 2. Split the `Fusion` observed stage only if measurements show that string,
    collection, tensor, or tuple SROA work needs independent visibility.
 3. Keep Blorp-tail-internal safety/finalization passes out of `Core_stage`

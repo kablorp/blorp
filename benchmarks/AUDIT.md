@@ -43,6 +43,7 @@ for rows marked **Not comparable** or **Blocked**.
 |-----------|--------|-------|
 | `paradigms` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; current focus is intra-Blorp paradigm comparison. |
 | `virtual_threads` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; current focus is fiber spawn, join, park, and wake scaling. |
+| `compiler_perceus_memory` | Compiler diagnostic | Invokes the production `emit_core_c` bridge with a generated, bounded Core fixture. It varies irrelevant managed globals while keeping reachable worker functions and body shape fixed, validates emitted C, and is excluded from `bench.sh all`. |
 
 ## Audit Rules
 

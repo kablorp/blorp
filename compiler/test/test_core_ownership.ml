@@ -160,6 +160,16 @@ let test_file_close_finalizers_consume_handles () =
       "blorp_file_close_read_appender";
     ]
 
+let test_file_path_operations_borrow_paths () =
+  let unary_expected = { args = [ Borrow ]; result = ReturnOwned } in
+  check_contract "blorp_file_create_directories_raw" unary_expected
+    (builtin_contract "blorp_file_create_directories_raw" 1);
+  check_contract "blorp_file_remove_directory_tree_raw" unary_expected
+    (builtin_contract "blorp_file_remove_directory_tree_raw" 1);
+  check_contract "blorp_file_rename_path_raw"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_file_rename_path_raw" 2)
+
 let test_tcp_close_finalizers_consume_handles () =
   List.iter check_consuming_finalizer
     [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
@@ -289,6 +299,15 @@ let test_memory_runtime_builtins_have_contracts () =
     (builtin_contract "blorp_print_live_object_summary" 0)
 
 let test_process_signal_runtime_builtins_have_contracts () =
+  check_contract "blorp_process_run_command_raw"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_process_run_command_raw" 3);
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnOwned }
+        (builtin_contract name 0))
+    [ "blorp_compiler_runtime_source"; "blorp_compiler_runtime_decl" ];
   List.iter
     (fun name ->
       check_contract name
@@ -1423,6 +1442,8 @@ let suite =
           test_channel_recv_timeout_attempt_borrows_channel;
         Alcotest.test_case "file_close_finalizers_consume_handles" `Quick
           test_file_close_finalizers_consume_handles;
+        Alcotest.test_case "file_path_operations_borrow_paths" `Quick
+          test_file_path_operations_borrow_paths;
         Alcotest.test_case "tcp_close_finalizers_consume_handles" `Quick
           test_tcp_close_finalizers_consume_handles;
         Alcotest.test_case "directory_close_finalizer_consumes_handle" `Quick

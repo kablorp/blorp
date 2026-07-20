@@ -13,6 +13,31 @@ type test_result = {
 }
 (** Result of running a single test *)
 
+type timing_phase =
+  | TestDiscovery
+  | HarnessPlanning
+  | HarnessPipeline
+  | HarnessFrontendGraph
+  | HarnessFrontendFinalize
+  | HarnessGraphTypecheck
+  | HarnessSemanticMiddle
+  | HarnessBackendEmission
+  | HarnessCorePipeline
+  | HarnessHostCCompile
+  | HarnessExecution
+
+type timing_event = {
+  timing_phase : timing_phase;
+  timing_group : string;
+  timing_suite_count : int;
+  timing_source_count : int;
+  timing_duration_ms : int;
+}
+(** Stable accounting event emitted by generated TestSuite compilation. *)
+
+val format_timing_event : timing_event -> string
+(** Format an event for logs consumed by [scripts/test --timings]. *)
+
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
@@ -66,12 +91,17 @@ val run_process_timeout : timeout:int option -> string -> string list -> int
 val run_process_capture_timeout :
   ?cwd:string ->
   ?env:(string * string) list ->
+  ?progress_marker:string ->
+  ?progress_count:int ->
   timeout:int option ->
   string ->
   string list ->
   int * string
-(** Run a program directly with timeout, capturing stdout+stderr.
-    Returns exit code 124 on timeout. *)
+(** Run a program directly with timeout, capturing stdout+stderr. When a
+    progress marker is supplied, only ordered, paired stderr records of the form
+    [MARKER INDEX BEGIN|END ...] reset the deadline. [progress_count] bounds the
+    accepted indexes when supplied. Other output and malformed, repeated, or
+    out-of-order records do not reset it. Returns exit code 124 on timeout. *)
 
 val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
@@ -95,6 +125,10 @@ val has_raylib_import : unit -> bool
 val has_top_level_main_source : string -> bool
 (** True when source contains an actual top-level [func main(...)] declaration.
     This intentionally ignores generated-program snippets inside strings. *)
+
+val source_mentions_doctests : string -> bool
+(** True when a docstring block contains a [doctests:] section. Escaped source
+    snippets in parser tests do not make the containing file a doctest. *)
 
 (* ============================================================================
    Doctest extraction + loc remapping
@@ -166,9 +200,20 @@ val generate_suite_selector_harness : ?leak_check:bool -> string list -> string
 (** Generate a multi-suite harness that imports each test file once and
     dispatches one selected suite per process via argv[0]. Exposed for tests. *)
 
-val generate_suite_run_all_harness : string list -> string
+val generate_suite_run_all_harness :
+  ?progress_marker:string -> string list -> string
 (** Generate a multi-suite harness that imports each test file once and runs
     ordinary suites through generated suite functions. Exposed for tests. *)
+
+val suite_run_all_results_from_streams :
+  ?progress_marker:string ->
+  elapsed:float ->
+  string list ->
+  stdout_output:string ->
+  stderr_output:string ->
+  test_result list option
+(** Decode ordered stdout result framing and associate stderr diagnostics using
+    the independent suite heartbeat stream. Exposed for protocol tests. *)
 
 val requires_filesystem_isolation : string -> bool
 (** True when a test path is configured for isolated process filesystem state. *)
@@ -177,9 +222,13 @@ val requires_process_isolation : string -> bool
 (** True when a test path is configured to stay out of aggregate run-all
     harnesses because it exercises process-global runtime state. *)
 
-val requires_compilation_isolation : string -> bool
-(** True only when a test path cannot safely share a compiled selector harness.
-    Execution isolation alone does not imply recompiling the test program. *)
+val group_by_source_size_budget :
+  max_source_bytes:int ->
+  source_size:('a -> int) ->
+  'a list ->
+  'a list list
+(** Partition items stably by accumulated source work. An item larger than the
+    budget forms a one-item group; no item is dropped or reordered. *)
 
 val source_text_matches_current_file : string -> string option -> bool
 (** True when cached source text, if supplied, still matches the current file

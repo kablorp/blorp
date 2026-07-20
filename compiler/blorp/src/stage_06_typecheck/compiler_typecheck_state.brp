@@ -3,6 +3,7 @@
 -- Declaration/indexing slices extend this value instead of growing separate
 -- side tables.
 import:
+	../stage_01_file_io/compiler_source: CompilerSourceSpan
 	../stage_05_types/compiler_builtins: compiler_env_with_builtins
 	../stage_05_types/compiler_context:
 		CompilerContext,
@@ -84,6 +85,26 @@ record CompilerFuncCallableIdEntry {
 }
 
 
+enum CompilerSourceDefinitionKind:
+	CompilerConstructorDefinition
+	CompilerTraitDefinition
+	CompilerImplDefinition
+
+
+record CompilerSourceDefinitionKey {
+	kind: CompilerSourceDefinitionKind,
+	name: String,
+	owner: Option[String],
+	loc: CompilerCallableSourceLoc
+}
+
+
+record CompilerSourceDefinitionIdEntry {
+	key: CompilerSourceDefinitionKey,
+	def_id: Int
+}
+
+
 record CompilerNamedComponentsMemoEntry {
 	type_name: String,
 	args: List[CompilerType],
@@ -152,8 +173,12 @@ record CompilerTypecheckState {
 	known_type_names: List[String],
 	known_resource_type_names: List[String],
 	top_level_names: List[CompilerTopLevelName],
+	scoped_trait_functions: List[(String, String)],
 	type_homes: List[CompilerTypecheckTypeHome],
 	func_callable_ids: List[CompilerFuncCallableIdEntry],
+	func_callable_ids_by_name: Dict[String, List[CompilerFuncCallableIdEntry]],
+	source_definition_ids: List[CompilerSourceDefinitionIdEntry],
+	source_definition_ids_by_name: Dict[String, List[CompilerSourceDefinitionIdEntry]],
 	type_shape_memo: CompilerTypeShapeMemo
 }
 
@@ -201,6 +226,32 @@ pure func compiler_func_callable_key(
 	}
 
 
+pure func compiler_callable_source_loc_from_span(
+	span: CompilerSourceSpan,
+) -> CompilerCallableSourceLoc:
+	compiler_callable_source_loc(
+		span.start_line,
+		span.start_column,
+		span.end_line,
+		span.end_column,
+		Some(span.path),
+	)
+
+
+pure func compiler_source_definition_key(
+	kind: CompilerSourceDefinitionKind,
+	name: String,
+	owner: Option[String],
+	span: CompilerSourceSpan,
+) -> CompilerSourceDefinitionKey:
+	{
+		kind = kind,
+		name = name,
+		owner = owner,
+		loc = compiler_callable_source_loc_from_span(span)
+	}
+
+
 pure func compiler_top_level_name_kind_label(kind: CompilerTopLevelNameKind) -> String:
 	match kind:
 		CompilerTopLevelType:
@@ -240,8 +291,12 @@ pure func compiler_typecheck_state_for_origin(
 		known_type_names = [],
 		known_resource_type_names = [],
 		top_level_names = [],
+		scoped_trait_functions = [],
 		type_homes = [],
 		func_callable_ids = [],
+		func_callable_ids_by_name = {},
+		source_definition_ids = [],
+		source_definition_ids_by_name = {},
 		type_shape_memo = compiler_type_shape_memo_empty()
 	}
 
@@ -259,6 +314,43 @@ pure func compiler_typecheck_state_with_debug_calls(
 	allow_debug_only_calls: Bool,
 ) -> CompilerTypecheckState:
 	{ state | allow_debug_only_calls = allow_debug_only_calls }
+
+
+pure func compiler_typecheck_state_with_scoped_trait_functions(
+	state: CompilerTypecheckState,
+	functions: List[(String, String)],
+) -> CompilerTypecheckState:
+	{ state | scoped_trait_functions = functions }
+
+
+pure func compiler_typecheck_state_allows_scoped_trait_function(
+	state: CompilerTypecheckState,
+	function_name: String,
+	trait_name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for pair in state.scoped_trait_functions:
+		if pair[0] == function_name and pair[1] == trait_name:
+			found = True
+			break
+
+	found
+
+
+pure func compiler_typecheck_state_add_scoped_trait_function(
+	state: CompilerTypecheckState,
+	function_name: String,
+	trait_name: String,
+) -> CompilerTypecheckState:
+	if compiler_typecheck_state_allows_scoped_trait_function(state, function_name, trait_name):
+		state
+	else:
+		{ state |
+			scoped_trait_functions = state.scoped_trait_functions.append(
+				(function_name, trait_name),
+			)
+		}
 
 
 pure func compiler_typecheck_state_add_error(
@@ -678,7 +770,7 @@ private pure func callable_locs_equal(
 	)
 
 
-private pure func callable_keys_equal(
+pure func compiler_func_callable_keys_equal(
 	left: CompilerFuncCallableKey,
 	right: CompilerFuncCallableKey,
 ) -> Bool:
@@ -693,7 +785,7 @@ private pure func replace_callable_id(
 	var replaced: Bool = False
 
 	for entry in entries:
-		if callable_keys_equal(entry.key, replacement.key):
+		if compiler_func_callable_keys_equal(entry.key, replacement.key):
 			result = result.append(replacement)
 			replaced = True
 		else:
@@ -705,18 +797,64 @@ private pure func replace_callable_id(
 		result.append(replacement)
 
 
+private pure func index_callable_ids_by_name(
+	entries: List[CompilerFuncCallableIdEntry],
+) -> Dict[String, List[CompilerFuncCallableIdEntry]]:
+	var result: Dict[String, List[CompilerFuncCallableIdEntry]] = {}
+
+	for entry in entries:
+		result = result.set(
+			entry.key.name,
+			result
+				.get(entry.key.name)
+				.get_or([])
+				.append(entry),
+		)
+
+	result
+
+
 pure func compiler_typecheck_state_record_func_callable_id(
 	state: CompilerTypecheckState,
 	key: CompilerFuncCallableKey,
 	def_id: Int,
 ) -> CompilerTypecheckState:
-	{ state | func_callable_ids = replace_callable_id(
-			state.func_callable_ids,
-			{
+	match compiler_typecheck_state_find_func_callable_id(state, key):
+		Some(existing_id):
+			if existing_id == def_id:
+				state
+			else:
+				replacement: CompilerFuncCallableIdEntry = {
+					key = key,
+					def_id = def_id
+				}
+				{ state |
+					func_callable_ids = replace_callable_id(state.func_callable_ids, replacement),
+					func_callable_ids_by_name = state.func_callable_ids_by_name.set(
+						key.name,
+						replace_callable_id(
+							state.func_callable_ids_by_name
+								.get(key.name)
+								.get_or([]),
+							replacement,
+						),
+					)
+				}
+		None:
+			entry: CompilerFuncCallableIdEntry = {
 				key = key,
 				def_id = def_id
-			},
-		) }
+			}
+			{ state |
+				func_callable_ids = state.func_callable_ids.append(entry),
+				func_callable_ids_by_name = state.func_callable_ids_by_name.set(
+					key.name,
+					state.func_callable_ids_by_name
+						.get(key.name)
+						.get_or([])
+						.append(entry),
+				)
+			}
 
 
 pure func compiler_typecheck_state_find_func_callable_id(
@@ -725,12 +863,144 @@ pure func compiler_typecheck_state_find_func_callable_id(
 ) -> Option[Int]:
 	var result: Option[Int] = None
 
-	for entry in state.func_callable_ids:
-		if callable_keys_equal(entry.key, key):
+	for entry in (
+		state.func_callable_ids_by_name
+			.get(key.name)
+			.get_or([])
+	):
+		if compiler_func_callable_keys_equal(entry.key, key):
 			result = Some(entry.def_id)
 			break
 
 	result
+
+
+pure func compiler_source_definition_keys_equal(
+	left: CompilerSourceDefinitionKey,
+	right: CompilerSourceDefinitionKey,
+) -> Bool:
+	(
+		left.kind == right.kind
+		and left.name == right.name
+		and left.owner == right.owner
+		and callable_locs_equal(left.loc, right.loc)
+	)
+
+
+private pure func replace_source_definition_id(
+	entries: List[CompilerSourceDefinitionIdEntry],
+	replacement: CompilerSourceDefinitionIdEntry,
+) -> List[CompilerSourceDefinitionIdEntry]:
+	var result: List[CompilerSourceDefinitionIdEntry] = []
+	var replaced: Bool = False
+
+	for entry in entries:
+		if compiler_source_definition_keys_equal(entry.key, replacement.key):
+			result = result.append(replacement)
+			replaced = True
+		else:
+			result = result.append(entry)
+
+	if replaced:
+		result
+	else:
+		result.append(replacement)
+
+
+private pure func index_source_definition_ids_by_name(
+	entries: List[CompilerSourceDefinitionIdEntry],
+) -> Dict[String, List[CompilerSourceDefinitionIdEntry]]:
+	var result: Dict[String, List[CompilerSourceDefinitionIdEntry]] = {}
+
+	for entry in entries:
+		result = result.set(
+			entry.key.name,
+			result
+				.get(entry.key.name)
+				.get_or([])
+				.append(entry),
+		)
+
+	result
+
+
+pure func compiler_typecheck_state_record_source_definition_id(
+	state: CompilerTypecheckState,
+	key: CompilerSourceDefinitionKey,
+	def_id: Int,
+) -> CompilerTypecheckState:
+	match compiler_typecheck_state_find_source_definition_id(state, key):
+		Some(existing_id):
+			if existing_id == def_id:
+				state
+			else:
+				replacement: CompilerSourceDefinitionIdEntry = {
+					key = key,
+					def_id = def_id
+				}
+				{ state |
+					source_definition_ids = replace_source_definition_id(
+						state.source_definition_ids,
+						replacement,
+					),
+					source_definition_ids_by_name = state.source_definition_ids_by_name.set(
+						key.name,
+						replace_source_definition_id(
+							state.source_definition_ids_by_name
+								.get(key.name)
+								.get_or([]),
+							replacement,
+						),
+					)
+				}
+		None:
+			entry: CompilerSourceDefinitionIdEntry = {
+				key = key,
+				def_id = def_id
+			}
+			{ state |
+				source_definition_ids = state.source_definition_ids.append(entry),
+				source_definition_ids_by_name = state.source_definition_ids_by_name.set(
+					key.name,
+					state.source_definition_ids_by_name
+						.get(key.name)
+						.get_or([])
+						.append(entry),
+				)
+			}
+
+
+pure func compiler_typecheck_state_find_source_definition_id(
+	state: CompilerTypecheckState,
+	key: CompilerSourceDefinitionKey,
+) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for entry in (
+		state.source_definition_ids_by_name
+			.get(key.name)
+			.get_or([])
+	):
+		if compiler_source_definition_keys_equal(entry.key, key):
+			result = Some(entry.def_id)
+			break
+
+	result
+
+
+pure func compiler_typecheck_state_with_reserved_definition_ids(
+	state: CompilerTypecheckState,
+	func_callable_ids: List[CompilerFuncCallableIdEntry],
+	source_definition_ids: List[CompilerSourceDefinitionIdEntry],
+	next_def_id: Int,
+) -> CompilerTypecheckState:
+	{ state |
+		env = { state.env | next_def_id = next_def_id },
+		func_callable_ids = func_callable_ids,
+		func_callable_ids_by_name = index_callable_ids_by_name(func_callable_ids),
+		source_definition_ids = source_definition_ids,
+		source_definition_ids_by_name = index_source_definition_ids_by_name(source_definition_ids)
+	}
 
 
 pure func compiler_typecheck_state_add_private_impl(

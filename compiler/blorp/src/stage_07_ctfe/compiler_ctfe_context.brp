@@ -4,23 +4,15 @@
 -- constructor metadata, and module global environments without performing
 -- evaluation.
 import:
-	compiler_ctfe_env:
-		CompilerCtfeEnv,
-		compiler_ctfe_env_empty,
-		compiler_ctfe_env_has_binding,
-		compiler_ctfe_lookup_value,
-	compiler_ctfe_value:
-		CompilerCtfeConstructorInfo,
-		CompilerCtfeValue,
-		compiler_ctfe_constructor_info,
-	../stage_06_typecheck/compiler_imports: compiler_import_default_alias
 	../stage_03_parse/compiler_parsed_ast:
 		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, UnionParsedDecl),
 		ParsedImportDecl,
 		ParsedUnionDecl,
+	../stage_06_typecheck/compiler_imports: compiler_import_default_alias
 	../stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
 			CompilerTypedFunctionDecl,
+			CompilerTypedImplDecl,
 			CompilerTypedParsedDecl,
 			CompilerTypedPrivateDecl,
 			CompilerTypedUnionDecl,
@@ -28,6 +20,16 @@ import:
 		CompilerTypedFunctionInfo,
 		CompilerTypedProgram,
 		CompilerTypedUnionInfo,
+	../stage_06_typecheck/compiler_typecheck_state: CompilerImportBinding
+	compiler_ctfe_env:
+		compiler_ctfe_env_empty,
+		compiler_ctfe_env_has_binding,
+		compiler_ctfe_lookup_value,
+	compiler_ctfe_value:
+		CompilerCtfeConstructorInfo,
+		CompilerCtfeEnv,
+		CompilerCtfeValue,
+		compiler_ctfe_constructor_info,
 
 
 record CompilerCtfeFunction {
@@ -39,7 +41,8 @@ record CompilerCtfeFunction {
 
 record CompilerCtfeImportedProgram {
 	module_path: String,
-	program: CompilerTypedProgram
+	program: CompilerTypedProgram,
+	import_bindings: List[CompilerImportBinding]
 }
 
 
@@ -57,6 +60,7 @@ record CompilerCtfeModuleGlobalEnv {
 
 
 record CompilerCtfeModuleAlias {
+	owner_module_path: Option[String],
 	local_name: String,
 	module_path: String
 }
@@ -74,7 +78,8 @@ record CompilerCtfeContext {
 	imported_functions: List[CompilerCtfeImportedFunctionGroup],
 	constructors: List[(String, CompilerCtfeConstructorInfo)],
 	module_aliases: List[CompilerCtfeModuleAlias],
-	module_global_envs: List[CompilerCtfeModuleGlobalEnv]
+	module_global_envs: List[CompilerCtfeModuleGlobalEnv],
+	active_module_path: Option[String]
 }
 
 
@@ -84,7 +89,8 @@ pure func compiler_ctfe_context_empty() -> CompilerCtfeContext:
 		imported_functions = [],
 		constructors = [],
 		module_aliases = [],
-		module_global_envs = []
+		module_global_envs = [],
+		active_module_path = None
 	}
 
 
@@ -145,7 +151,11 @@ pure func compiler_ctfe_context_function_by_callable_id(
 	var result: Option[CompilerCtfeFunction] = None
 
 	for (id, ctfe_function) in context.functions:
-		if result.is_none() and id == callable_id:
+		if (
+			result.is_none()
+			and id == callable_id
+			and ctfe_function.module_path == context.active_module_path
+		):
 			result = Some(ctfe_function)
 			break
 
@@ -169,6 +179,32 @@ pure func compiler_ctfe_context_imported_functions_by_source(
 			break
 
 	result.get_or([])
+
+
+pure func compiler_ctfe_context_imported_function_by_callable_id(
+	context: CompilerCtfeContext,
+	module_path: String,
+	source_name: String,
+	callable_id: Int,
+) -> Option[CompilerCtfeFunction]:
+	functions = compiler_ctfe_context_imported_functions_by_source(
+		context,
+		module_path,
+		source_name,
+	)
+	var result: Option[CompilerCtfeFunction] = None
+
+	for ctfe_function in functions:
+		if result.is_none() and ctfe_function.info.callable_id == Some(callable_id):
+			result = Some(ctfe_function)
+			break
+
+	if result.is_some():
+		result
+	else if functions.length() == 1:
+		functions.get(0)
+	else:
+		None
 
 
 pure func compiler_ctfe_context_module_global_env(
@@ -207,7 +243,11 @@ pure func compiler_ctfe_context_module_alias(
 	var result: Option[String] = None
 
 	for module_alias in context.module_aliases:
-		if result.is_none() and module_alias.local_name == local_name:
+		if (
+			result.is_none()
+			and module_alias.owner_module_path == context.active_module_path
+			and module_alias.local_name == local_name
+		):
 			result = Some(module_alias.module_path)
 			break
 
@@ -234,8 +274,13 @@ pure func compiler_ctfe_context_with_module_alias(
 	var aliases: List[CompilerCtfeModuleAlias] = []
 
 	for module_alias in context.module_aliases:
-		if not replaced and module_alias.local_name == local_name:
+		if (
+			not replaced
+			and module_alias.owner_module_path == context.active_module_path
+			and module_alias.local_name == local_name
+		):
 			aliases = aliases.append({
+				owner_module_path = context.active_module_path,
 				local_name = local_name,
 				module_path = module_path,
 			})
@@ -245,6 +290,7 @@ pure func compiler_ctfe_context_with_module_alias(
 
 	if not replaced:
 		aliases = aliases.append({
+			owner_module_path = context.active_module_path,
 			local_name = local_name,
 			module_path = module_path,
 		})
@@ -300,12 +346,14 @@ private pure func compiler_ctfe_import_registers_module_alias(
 private pure func compiler_ctfe_collect_import_aliases_from_imports(
 	aliases: List[CompilerCtfeModuleAlias],
 	imports: List[ParsedImportDecl],
+	owner_module_path: Option[String],
 ) -> List[CompilerCtfeModuleAlias]:
 	var result = aliases
 
 	for import_decl in imports:
 		if compiler_ctfe_import_registers_module_alias(import_decl):
 			result = result.append({
+				owner_module_path = owner_module_path,
 				local_name = compiler_ctfe_import_alias(import_decl),
 				module_path = import_decl.module_path,
 			})
@@ -316,21 +364,27 @@ private pure func compiler_ctfe_collect_import_aliases_from_imports(
 private pure func compiler_ctfe_collect_decl_import_aliases(
 	aliases: List[CompilerCtfeModuleAlias],
 	decl: CompilerTypedDecl,
+	owner_module_path: Option[String],
 ) -> List[CompilerCtfeModuleAlias]:
 	match decl:
 		CompilerTypedParsedDecl(parsed_decl):
 			match parsed_decl:
 				ImportBlockParsedDecl(imports, _):
-					compiler_ctfe_collect_import_aliases_from_imports(aliases, imports)
+					compiler_ctfe_collect_import_aliases_from_imports(
+						aliases,
+						imports,
+						owner_module_path,
+					)
 				PrivateParsedDecl(inner, _):
 					compiler_ctfe_collect_decl_import_aliases(
 						aliases,
 						CompilerTypedParsedDecl(inner),
+						owner_module_path,
 					)
 				_:
 					aliases
 		CompilerTypedPrivateDecl(inner):
-			compiler_ctfe_collect_decl_import_aliases(aliases, inner)
+			compiler_ctfe_collect_decl_import_aliases(aliases, inner, owner_module_path)
 		_:
 			aliases
 
@@ -338,11 +392,12 @@ private pure func compiler_ctfe_collect_decl_import_aliases(
 private pure func compiler_ctfe_collect_program_import_aliases(
 	aliases: List[CompilerCtfeModuleAlias],
 	program: CompilerTypedProgram,
+	owner_module_path: Option[String],
 ) -> List[CompilerCtfeModuleAlias]:
 	var result = aliases
 
 	for decl in program.decls:
-		result = compiler_ctfe_collect_decl_import_aliases(result, decl)
+		result = compiler_ctfe_collect_decl_import_aliases(result, decl, owner_module_path)
 
 	result
 
@@ -382,6 +437,13 @@ private pure func compiler_ctfe_collect_decl_functions(
 	match decl:
 		CompilerTypedFunctionDecl(info):
 			compiler_ctfe_collect_function(functions, info, module_path)
+		CompilerTypedImplDecl(info):
+			var result = functions
+
+			for method in info.methods:
+				result = compiler_ctfe_collect_function(result, method, module_path)
+
+			result
 		CompilerTypedPrivateDecl(inner):
 			compiler_ctfe_collect_decl_functions(functions, inner, module_path)
 		_:
@@ -450,6 +512,18 @@ private pure func compiler_ctfe_collect_imported_function_groups(
 	result
 
 
+private pure func compiler_ctfe_add_imported_function_info(
+	groups: List[CompilerCtfeImportedFunctionGroup],
+	module_path: String,
+	info: CompilerTypedFunctionInfo,
+) -> List[CompilerCtfeImportedFunctionGroup]:
+	match compiler_ctfe_function_from_info(info, Some(module_path)):
+		Some(ctfe_function):
+			compiler_ctfe_add_imported_function_group(groups, module_path, ctfe_function)
+		None:
+			groups
+
+
 private pure func compiler_ctfe_collect_imported_decl_function_groups(
 	groups: List[CompilerCtfeImportedFunctionGroup],
 	module_path: String,
@@ -457,21 +531,16 @@ private pure func compiler_ctfe_collect_imported_decl_function_groups(
 ) -> List[CompilerCtfeImportedFunctionGroup]:
 	match decl:
 		CompilerTypedFunctionDecl(info):
-			match compiler_ctfe_function_from_info(info, Some(module_path)):
-				Some(ctfe_function):
-					compiler_ctfe_add_imported_function_group(
-						groups,
-						module_path,
-						ctfe_function,
-					)
-				None:
-					groups
+			compiler_ctfe_add_imported_function_info(groups, module_path, info)
+		CompilerTypedImplDecl(info):
+			var result = groups
+
+			for method in info.methods:
+				result = compiler_ctfe_add_imported_function_info(result, module_path, method)
+
+			result
 		CompilerTypedPrivateDecl(inner):
-			compiler_ctfe_collect_imported_decl_function_groups(
-				groups,
-				module_path,
-				inner,
-			)
+			compiler_ctfe_collect_imported_decl_function_groups(groups, module_path, inner)
 		_:
 			groups
 
@@ -577,12 +646,20 @@ pure func compiler_ctfe_context_from_program(
 	for imported in imported_programs:
 		imported_groups = compiler_ctfe_collect_imported_function_groups(imported_groups, imported)
 
-	aliases = compiler_ctfe_collect_program_import_aliases([], program)
+	var aliases = compiler_ctfe_collect_program_import_aliases([], program, None)
+
+	for imported in imported_programs:
+		aliases = compiler_ctfe_collect_program_import_aliases(
+			aliases,
+			imported.program,
+			Some(imported.module_path),
+		)
 
 	{
 		functions = functions,
 		imported_functions = imported_groups,
 		constructors = constructors,
 		module_aliases = aliases,
-		module_global_envs = []
+		module_global_envs = [],
+		active_module_path = None
 	}

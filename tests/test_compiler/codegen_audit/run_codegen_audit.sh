@@ -9,19 +9,22 @@ set -eu
 BLORP="./blorp"
 blorp_bin_set=false
 NJOBS=""
+jobs_set=false
 PASS=0
 FAIL=0
 DIR="$(dirname "$0")"
 REPO_ROOT="$(cd "$DIR/../../.." && pwd -P)"
 RUNTIME_DECL="$REPO_ROOT/compiler/lib/runtime_decl.c"
 TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
+DEFAULT_JOB_CAP=2
 
 usage() {
     cat <<'EOF'
 Usage: tests/test_compiler/codegen_audit/run_codegen_audit.sh [BLORP_BIN] [--jobs N]
 
 Options:
-  --jobs N, -j N   Number of audit workers. Defaults to detected CPU count.
+  --jobs N, -j N   Number of audit workers. Defaults to at most two because
+                   each compiler process can require over 1 GiB of memory.
 EOF
 }
 
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             NJOBS="$2"
+            jobs_set=true
             shift 2
             ;;
         -h|--help)
@@ -94,6 +98,10 @@ case "$NJOBS" in
         exit 1
         ;;
 esac
+
+if ! $jobs_set && [ "$NJOBS" -gt "$DEFAULT_JOB_CAP" ]; then
+    NJOBS="$DEFAULT_JOB_CAP"
+fi
 
 # The audit validates generated C syntax and frontend warnings only. Linking is
 # covered by runtime tests and would make this suite pay avoidable linker cost.

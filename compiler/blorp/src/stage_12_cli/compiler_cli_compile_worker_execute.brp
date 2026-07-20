@@ -1,0 +1,126 @@
+-- Effectful semantic-worker adapter for compile plans.
+--
+-- Pure frontend preparation and late compilation remain in
+-- compiler_cli_compile_execute so their tests do not pull process machinery
+-- into every compiler fixture.
+import:
+	compiler_cli_compile_execute:
+		CliCompileExecution(CliCompileFrontendFailed, CliCompileWorkerFailed),
+		finish_prepared_compile_execution,
+		prepare_compile_plan,
+		prepare_run_plan,
+	compiler_cli_plan: CliCompilePlan, CliRunSourcePlan
+	compiler_cli_timing: CliCompileTiming
+	compiler_semantic_worker_client:
+		SemanticMiddleWorkerCommand,
+		run_semantic_middle_worker,
+		semantic_middle_client_error_message,
+	system: now_microseconds
+
+
+record CliTimedCompileExecution {
+	execution: CliCompileExecution,
+	timings: List[CliCompileTiming]
+}
+
+
+private pure func elapsed_timing(
+	label: String,
+	started_at: Int,
+	finished_at: Int,
+) -> CliCompileTiming:
+	{
+		label = label,
+		microseconds = finished_at - started_at
+	}
+
+
+private func current_time_when(enabled: Bool) -> Int:
+	if enabled:
+		now_microseconds()
+	else:
+		0
+
+
+func execute_compile_plan_with_worker_timed(
+	plan: CliCompilePlan,
+	worker: SemanticMiddleWorkerCommand,
+	record_timings: Bool,
+) -> CliTimedCompileExecution:
+	frontend_started: Int = current_time_when(record_timings)
+	match prepare_compile_plan(plan):
+		Err(errors):
+			frontend_finished: Int = current_time_when(record_timings)
+			timings: List[CliCompileTiming] = if record_timings:
+				[elapsed_timing("frontend", frontend_started, frontend_finished)]
+			else:
+				[]
+			{
+				execution = CliCompileFrontendFailed(errors),
+				timings = timings
+			}
+		Ok(prepared):
+			frontend_finished: Int = current_time_when(record_timings)
+			worker_started: Int = frontend_finished
+			match run_semantic_middle_worker(worker, prepared.request):
+				Err(error):
+					worker_finished: Int = current_time_when(record_timings)
+					timings: List[CliCompileTiming] = if record_timings:
+						[
+							elapsed_timing("frontend", frontend_started, frontend_finished),
+							elapsed_timing("semantic_middle", worker_started, worker_finished),
+						]
+					else:
+						[]
+					{
+						execution = CliCompileWorkerFailed(
+							prepared.request,
+							semantic_middle_client_error_message(error),
+						),
+						timings = timings
+					}
+				Ok(response):
+					worker_finished: Int = current_time_when(record_timings)
+					backend_started: Int = worker_finished
+					execution: CliCompileExecution = finish_prepared_compile_execution(
+						prepared,
+						response,
+					)
+					backend_finished: Int = current_time_when(record_timings)
+					timings: List[CliCompileTiming] = if record_timings:
+						[
+							elapsed_timing("frontend", frontend_started, frontend_finished),
+							elapsed_timing("semantic_middle", worker_started, worker_finished),
+							elapsed_timing("backend", backend_started, backend_finished),
+						]
+					else:
+						[]
+					{
+						execution = execution,
+						timings = timings
+					}
+
+
+func execute_compile_plan_with_worker(
+	plan: CliCompilePlan,
+	worker: SemanticMiddleWorkerCommand,
+) -> CliCompileExecution:
+	execute_compile_plan_with_worker_timed(plan, worker, False).execution
+
+
+func execute_run_plan_with_worker(
+	plan: CliRunSourcePlan,
+	worker: SemanticMiddleWorkerCommand,
+) -> CliCompileExecution:
+	match prepare_run_plan(plan):
+		Err(errors):
+			CliCompileFrontendFailed(errors)
+		Ok(prepared):
+			match run_semantic_middle_worker(worker, prepared.request):
+				Ok(response):
+					finish_prepared_compile_execution(prepared, response)
+				Err(error):
+					CliCompileWorkerFailed(
+						prepared.request,
+						semantic_middle_client_error_message(error),
+					)

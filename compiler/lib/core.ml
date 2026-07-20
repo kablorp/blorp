@@ -2891,8 +2891,8 @@ let pp_program_indented (prog : core_program) : string =
       | CFForeign { c_name; _ } -> Printf.sprintf " [foreign=%s]" c_name
       | CFClosureBody _ -> " [closure]"
     in
-    Printf.sprintf "%s %s(%s) -> %s%s" prefix f.cf_name params
-      (ty_str f.cf_return_ty) tags
+    Printf.sprintf "%s %s(%s) -> %s [def=%d]%s" prefix f.cf_name params
+      (ty_str f.cf_return_ty) f.cf_def_id tags
   in
   let rec emit_decl d =
     match d.cd_desc with
