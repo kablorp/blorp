@@ -150,8 +150,7 @@ let matrix_parallel_expr body =
        body (ty_parallel_mat ty_int))
 
 let fuse_expr expr =
-  let reg = Blorp.Codegen_types.create_registry () in
-  match List.rev (P.fuse_program ~reg (std_decls @ [ app_decl expr ])) with
+  match List.rev (P.fuse_program (std_decls @ [ app_decl expr ])) with
   | { cd_desc = CDFunc f; _ } :: _ -> (
       match f.cf_body with
       | Some body -> body
