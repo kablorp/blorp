@@ -91,12 +91,17 @@ val run_process_timeout : timeout:int option -> string -> string list -> int
 val run_process_capture_timeout :
   ?cwd:string ->
   ?env:(string * string) list ->
+  ?progress_marker:string ->
+  ?progress_count:int ->
   timeout:int option ->
   string ->
   string list ->
   int * string
-(** Run a program directly with timeout, capturing stdout+stderr.
-    Returns exit code 124 on timeout. *)
+(** Run a program directly with timeout, capturing stdout+stderr. When a
+    progress marker is supplied, only ordered, paired stderr records of the form
+    [MARKER INDEX BEGIN|END ...] reset the deadline. [progress_count] bounds the
+    accepted indexes when supplied. Other output and malformed, repeated, or
+    out-of-order records do not reset it. Returns exit code 124 on timeout. *)
 
 val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
@@ -195,9 +200,20 @@ val generate_suite_selector_harness : ?leak_check:bool -> string list -> string
 (** Generate a multi-suite harness that imports each test file once and
     dispatches one selected suite per process via argv[0]. Exposed for tests. *)
 
-val generate_suite_run_all_harness : string list -> string
+val generate_suite_run_all_harness :
+  ?progress_marker:string -> string list -> string
 (** Generate a multi-suite harness that imports each test file once and runs
     ordinary suites through generated suite functions. Exposed for tests. *)
+
+val suite_run_all_results_from_streams :
+  ?progress_marker:string ->
+  elapsed:float ->
+  string list ->
+  stdout_output:string ->
+  stderr_output:string ->
+  test_result list option
+(** Decode ordered stdout result framing and associate stderr diagnostics using
+    the independent suite heartbeat stream. Exposed for protocol tests. *)
 
 val requires_filesystem_isolation : string -> bool
 (** True when a test path is configured for isolated process filesystem state. *)

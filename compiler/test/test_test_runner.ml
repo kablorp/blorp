@@ -122,6 +122,101 @@ let test_capture_timeout_sends_sigterm_before_sigkill () =
   in
   Alcotest.(check bool) "SIGTERM handler output" true saw_term_line
 
+let test_capture_timeout_progress_marker_resets_deadline () =
+  let code, output =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "printf '__BLORP_TEST_' >&2; sleep 0.4; "
+        ^ "printf 'PROGRESS__ 0 BEGIN first\\n' >&2; sleep 0.4; "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 END first\\n' >&2; sleep 0.4";
+      ]
+  in
+  Alcotest.(check int) "progressing process exits normally" 0 code;
+  let saw_progress_marker =
+    output |> String.split_on_char '\n'
+    |> List.exists (fun line ->
+           String.trim line = "__BLORP_TEST_PROGRESS__ 0 BEGIN first")
+  in
+  Alcotest.(check bool)
+    "captures progress markers" true saw_progress_marker
+
+let test_capture_timeout_ignores_unrecognized_output () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do printf 'ordinary output\\n' >&2; "
+        ^ "sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "ordinary output does not extend timeout" 124 code
+
+let test_capture_timeout_ignores_malformed_progress_records () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for line in '__BLORP_TEST_PROGRESS__' "
+        ^ "'__BLORP_TEST_PROGRESS__ nope BEGIN test' "
+        ^ "'prefix __BLORP_TEST_PROGRESS__ 0 END test'; do "
+        ^ "printf '%s\\n' \"$line\" >&2; sleep 0.4; done";
+      ]
+  in
+  Alcotest.(check int) "malformed records do not extend timeout" 124 code
+
+let test_capture_timeout_ignores_replayed_progress_records () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~progress_count:1
+      ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n' >&2; "
+        ^ "sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "replayed BEGIN records do not extend timeout" 124 code
+
+let test_capture_timeout_ignores_progress_marker_on_stdout () =
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout
+      ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout:(Some 1) "/bin/sh"
+      [
+        "-c";
+        "for delay in 0.4 0.4 0.4; do "
+        ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n'; sleep $delay; done";
+      ]
+  in
+  Alcotest.(check int) "stdout cannot extend timeout" 124 code
+
+let test_capture_timeout_keeps_progress_separate_from_stdout () =
+  let check_capture label timeout =
+    let code, output =
+      Blorp.Test_runner.run_process_capture_timeout
+        ~progress_marker:"__BLORP_TEST_PROGRESS__" ~timeout "/bin/sh"
+        [
+          "-c";
+          "printf 'stdout-before'; "
+          ^ "printf '__BLORP_TEST_PROGRESS__ 0 BEGIN test\\n' >&2; "
+          ^ "printf '%s\\n' '-after'";
+        ]
+    in
+    Alcotest.(check int) (label ^ " exits normally") 0 code;
+    let lines = String.split_on_char '\n' output in
+    Alcotest.(check bool)
+      (label ^ " keeps stderr out of stdout framing") true
+      (List.mem "stdout-before-after" lines
+      && List.mem "__BLORP_TEST_PROGRESS__ 0 BEGIN test" lines)
+  in
+  check_capture "bounded timeout" (Some 2);
+  check_capture "disabled timeout" None;
+  check_capture "zero timeout" (Some 0)
+
 let process_exists pid =
   try
     Unix.kill pid 0;
@@ -757,6 +852,30 @@ let test_suite_run_all_harness_calls_generated_functions () =
     && contains_substring source
          "__BLORP_SUITE_RUN_ALL_END__ 1 FAIL tests/test_blorp/b.brp");
   Alcotest.(check bool)
+    "keeps result framing ordered on stdout" true
+    (contains_substring source
+       "print(\"__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp\")"
+    && contains_substring source
+         "print(\"__BLORP_SUITE_RUN_ALL_END__ 1 FAIL tests/test_blorp/b.brp\")"
+    && not
+         (contains_substring source
+            "print_error(\"__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp\")"));
+  Alcotest.(check bool)
+    "writes separate progress heartbeats to unbuffered stderr" true
+    (contains_substring source
+       "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 BEGIN tests/test_blorp/a.brp\")"
+    && contains_substring source
+         "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 END tests/test_blorp/b.brp\")");
+  let nonce_source =
+    Blorp.Test_runner.generate_suite_run_all_harness
+      ~progress_marker:"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce"
+      [ "tests/test_blorp/a.brp" ]
+  in
+  Alcotest.(check bool)
+    "embeds the run-specific progress marker" true
+    (contains_substring nonce_source
+       "print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce 0 BEGIN tests/test_blorp/a.brp\")");
+  Alcotest.(check bool)
     "copies suite before run_suite" true
     (contains_substring source "suite: TestSuite = T0.tests"
     && contains_substring source "passed: Bool = run_suite(suite)"
@@ -768,6 +887,44 @@ let test_suite_run_all_harness_calls_generated_functions () =
   Alcotest.(check bool)
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
+
+let test_suite_run_all_streams_preserve_stderr_diagnostics () =
+  let files = [ "tests/a.brp"; "tests/b.brp" ] in
+  let stdout_output =
+    "__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/a.brp\n"
+    ^ "first stdout\n"
+    ^ "__BLORP_SUITE_RUN_ALL_END__ 0 FAIL tests/a.brp\n"
+    ^ "__BLORP_SUITE_RUN_ALL_BEGIN__ 1 tests/b.brp\n"
+    ^ "second stdout\n"
+    ^ "__BLORP_SUITE_RUN_ALL_END__ 1 PASS tests/b.brp\n"
+  in
+  let stderr_output =
+    "__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 BEGIN tests/a.brp\n"
+    ^ "first diagnostic\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 0 END tests/a.brp\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 BEGIN tests/b.brp\n"
+    ^ "second diagnostic\n"
+    ^ "__BLORP_SUITE_RUN_ALL_PROGRESS__ 1 END tests/b.brp\n"
+  in
+  match
+    Blorp.Test_runner.suite_run_all_results_from_streams ~elapsed:0.25 files
+      ~stdout_output ~stderr_output
+  with
+  | Some [ first; second ] ->
+      Alcotest.(check bool) "first suite failed" false first.passed;
+      Alcotest.(check bool)
+        "first stderr stays with first suite" true
+        (contains_substring first.output "first diagnostic"
+        && not (contains_substring first.output "second diagnostic"));
+      Alcotest.(check bool) "second suite passed" true second.passed;
+      Alcotest.(check bool)
+        "second stderr stays with second suite" true
+        (contains_substring second.output "second diagnostic"
+        && not (contains_substring second.output "first diagnostic"))
+  | Some results ->
+      Alcotest.failf "expected two parsed suite results, got %d"
+        (List.length results)
+  | None -> Alcotest.fail "expected valid split-stream suite output"
 
 let test_timing_event_has_stable_machine_readable_format () =
   let event : Blorp.Test_runner.timing_event =
@@ -1108,6 +1265,18 @@ let suite =
           test_capture_timeout_does_not_wait_for_inherited_pipe;
         Alcotest.test_case "capture_timeout_sigterm_before_sigkill" `Quick
           test_capture_timeout_sends_sigterm_before_sigkill;
+        Alcotest.test_case "capture_timeout_progress_marker" `Quick
+          test_capture_timeout_progress_marker_resets_deadline;
+        Alcotest.test_case "capture_timeout_ignores_other_output" `Quick
+          test_capture_timeout_ignores_unrecognized_output;
+        Alcotest.test_case "capture_timeout_ignores_malformed_progress" `Quick
+          test_capture_timeout_ignores_malformed_progress_records;
+        Alcotest.test_case "capture_timeout_ignores_replayed_progress" `Quick
+          test_capture_timeout_ignores_replayed_progress_records;
+        Alcotest.test_case "capture_timeout_ignores_stdout_marker" `Quick
+          test_capture_timeout_ignores_progress_marker_on_stdout;
+        Alcotest.test_case "capture_timeout_separates_progress_stream" `Quick
+          test_capture_timeout_keeps_progress_separate_from_stdout;
         Alcotest.test_case "capture_timeout_kills_descendants" `Quick
           test_capture_timeout_kills_descendant_processes;
         Alcotest.test_case "capture_process_cwd_env" `Quick
@@ -1162,6 +1331,8 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "run_all_preserves_stderr_diagnostics" `Quick
+          test_suite_run_all_streams_preserve_stderr_diagnostics;
         Alcotest.test_case "timing_record_format" `Quick
           test_timing_event_has_stable_machine_readable_format;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick

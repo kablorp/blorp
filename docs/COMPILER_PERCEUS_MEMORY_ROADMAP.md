@@ -1,8 +1,8 @@
 # Compiler Perceus Memory Dossier And Roadmap
 
-Status: active implementation plan; Slice 0 completed on 2026-07-19.
+Status: active implementation plan; Slices 0-2 completed on 2026-07-19.
 
-Last checked against `dogfood-3` at `4d88200f` on 2026-07-19.
+Last checked against `dogfood-3` based on `a88a9484` on 2026-07-19.
 
 This document records the primary cause of the current self-hosted compiler
 memory blow-up and defines the implementation sequence for correcting it. It is
@@ -588,7 +588,7 @@ Implemented by `benchmarks/compiler_perceus_memory` and documented in
 `bench.sh all` because it measures compiler execution rather than runtime
 language performance and has a cold bridge-preparation step.
 
-### Slice 1: Preserve Existing Definition Identities
+### Slice 1: Preserve Existing Definition Identities (Complete)
 
 **Independent value:** fixes a latent correctness bug in the current resolver
 without changing phase ownership or the surrounding algorithm.
@@ -612,15 +612,28 @@ Required proof:
 This is intentionally a correction to the current production path. It does not
 wait for the later phase move.
 
-### Slice 2: Bound Work To Names That Can Occur In A Body
+Implemented in `compiler_core_perceus.brp` with an explicit private rewrite
+policy. Global-reference repair rewrites only unresolved matching variables,
+while Perceus match-binding freshening retains its existing behavior of
+rewriting every matching reference. This keeps an existing `def_id`
+authoritative without conflating two distinct uses of the shared scope-aware
+traversal. Existing match-freshening coverage now uses explicit definition
+identities so the all-matching policy cannot regress to unresolved-only repair.
+
+Verification is recorded with Slice 2 because the final identity tests exercise
+both changes together.
+
+### Slice 2: Bound Work To Names That Can Occur In A Body (Complete)
 
 **Independent value:** contains the 45 GB failure with a conservative
 performance guard while preserving the current resolver's semantics.
 
-Collect a superset of value-reference names once per function body or global
-initializer. Use that set only to skip per-global rewrites whose name cannot
-occur in the body. The existing scope-aware resolver remains authoritative for
-names that may occur.
+Collect a superset of value-reference names in one linear walk at each Perceus
+consumer of a function body or global initializer. Use that set only to skip
+per-global rewrites whose name cannot occur in the body. The existing
+scope-aware resolver remains authoritative for names that may occur. Slice 2
+does not persist this derived set across the separate resolution and ownership
+steps; doing so would add cross-step state for two bounded linear walks.
 
 The collector must cover `VarExpr` reads, assignment targets, nested lambdas,
 match bodies, loops, concurrent forms, selects, and all other Core children. A
@@ -647,6 +660,101 @@ Required proof:
 This slice is a valid stopping point. It removes the catastrophic multiplier
 without changing ownership semantics. The conservative name facts may later
 become exact identity facts, but their immediate use is complete.
+
+Implemented by extending the existing exhaustive reference traversal in
+`compiler_core_dce.brp`, rather than adding a second Core matcher. An explicit
+collection mode keeps the two consumers separate:
+
+- DCE gathers function, global-name, and type reachability facts;
+- Perceus gathers candidate source names, resolved value reads, and resolved
+  invalidations from assignment and drop ownership actions.
+
+Candidate names are a conservative prefilter for legacy unresolved-global
+repair. The shared collector includes assignment targets so a write-only mutable
+global is still repaired. Resolved facts retain the complete `CoreVar`; Perceus
+then compares qualified name and definition id, so module-local id collisions
+and same-named lexical values cannot select the wrong global. Exact result-alias
+proofs use invalidations to reject mutable rebindings and drops before a returned
+value. Packed tensor elements are now traversed by the shared collector as well.
+
+The collector deliberately includes lexical locals as harmless name false
+positives. Names only decide whether the existing scope-aware repair can be
+skipped; exact identity remains authoritative for ownership selection.
+
+The pinned bootstrap can treat an unchanged aggregate return as borrowed,
+forcing later COW updates to copy every accumulated list. The shared traversal
+therefore gives each recursive step a fresh `DceFacts` record shell while
+preserving the lists themselves. This is semantically neutral and benefits both
+DCE and Perceus without duplicating traversal code.
+
+Sanitizer diagnosis also exposed a production-only identity mismatch. A
+`CoreGlobal` stores its canonical identity in `CoreGlobal.def_id`, while its
+embedded `CoreVar` may still have `def_id = None`. Test constructors had
+previously populated both fields and masked the mismatch. `build_env` now
+normalizes the `CoreVar` from the declaration id at the environment construction
+boundary. Global repair consequently assigns the canonical identity, and later
+ownership filtering compares qualified `(name, def_id)` identities instead of
+treating same-named locals or same-id declarations from another module as the
+global. Once a reference is resolved, textual shadowing no longer overrides its
+identity. Production-shaped immutable and mutable regressions cover this
+representation.
+
+Borrowed-result alias analysis also has a separate exact-identity path. It
+follows only result-producing operands and uses call result contracts directly,
+so an aliasing same-named argument and an unrelated exact reference cannot be
+combined into a false ownership fact. This avoids both the prior correctness
+ambiguity and rebuilding a whole reference index for every nested alias query.
+
+Post-Slice 2 medians from three unsampled runs on the same Apple M4 host:
+
+| Globals | Elapsed | Peak RSS | Baseline elapsed | Baseline peak RSS |
+|---:|---:|---:|---:|---:|
+| 24 | 0.363s | 42,975,232 bytes | 0.404s | 56,033,280 bytes |
+| 384 | 0.396s | 48,021,504 bytes | 2.666s | 251,215,872 bytes |
+
+The 384-global fixture is now effectively insensitive to irrelevant globals.
+Against the recorded baseline it is about 86% faster and uses about 81% less
+peak RSS. A final sampled 384-global run reported 33,554,432 bytes of physical
+footprint, 33,554,432 bytes of `MALLOC_SMALL`, and 339,216 allocations. Relative
+to the Slice 0 sampled baseline, those are reductions of about 86%, 86%, and
+90%, respectively. Sampled elapsed time remains excluded from timing comparisons.
+
+Verification before the final shared-reference refinement on 2026-07-19:
+
+- combined closure and Perceus suites: 165 passed, 0 failed;
+- combined closure and Perceus ASan/UBSan run: 165 passed, 0 failed;
+- the pinned-bootstrap renderer replayed the 8,032,480-byte runtime request
+  successfully under ASan/UBSan and in an ordinary build;
+- compiler Core ASan/UBSan gate: 699 passed, 0 failed;
+- runtime gate: 4,822 passed, 0 failed;
+- compiler-deep gate: 2,134 passed, 0 failed;
+- compiler-Blorp ASan/UBSan gate: 1,835 passed, 0 failed;
+- all 12 test gates in the final split run: 14,513 passed, 0 failed;
+- global record/union lifecycle runtime test: 1 passed, 0 failed;
+- string-literal lifecycle leak baseline: 404 allocations, 404 releases,
+  0 leaked bytes;
+- a production `make` completed successfully with the changed compiler.
+
+Verification after shared reference collection, global-identity
+normalization, exact result-alias hardening, and formatting:
+
+- focused DCE and Perceus suites: 199 passed, 0 failed;
+- focused Perceus ASan/UBSan run: 184 passed, 0 failed;
+- compiler-Blorp ASan/UBSan gate: 1,847 passed, 0 failed;
+- production self-host build: passed;
+- compiler-deep gate: 686 passed, 0 failed;
+- runtime gate: 4,822 passed, 0 failed;
+- leak gate: 403 passed, 0 failed;
+- focused test-runner suite: 45 passed, 0 failed;
+- FIFO safety suite: 5 consecutive runs of 4 passed, 0 failed;
+- fresh default compiler-unit, compiler, runtime, leak, doctest, and CLI matrix:
+  9,426 passed, 0 failed;
+- FIFO read safety suite: 4 passed, 0 failed across three consecutive runs;
+- `make quality`: passed;
+- three-run benchmark medians: 0.363s and 42,975,232-byte peak RSS with
+  24 globals; 0.396s and 48,021,504-byte peak RSS with 384 globals.
+
+The broader affected gates above have been rerun for this mergeable checkpoint.
 
 ### Slice 3: Precompute Global Declaration Facts Once
 
@@ -781,6 +889,10 @@ now rely on resolved Core.
 
 ### Slice 6: Select Borrowed Globals By Exact Reference Identity
 
+Status: exact selection and alias matching were pulled forward while hardening
+Slice 2; final gate and compiler-sized measurement evidence remains to close
+this slice formally.
+
 **Independent value:** ownership work becomes proportional to the globals a
 body actually references, and same-name coincidences cannot influence it.
 
@@ -822,7 +934,7 @@ Required proof:
 **Independent value:** nested lambdas stop repeating enclosing-program global
 work and make their ownership boundary explicit.
 
-Use Slice 6's exact reference collector at each lambda body boundary. Include
+Use Slice 6's exact reference facts at each lambda body boundary. Include
 only globals referenced by that lambda and avoid duplicate retention in the
 enclosing body. Do not alter ordinary closure capture analysis in this slice.
 

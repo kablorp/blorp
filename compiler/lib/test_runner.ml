@@ -318,37 +318,129 @@ let run_process_capture ?cwd ?(env = []) prog args =
   let _, status = waitpid_retry [] pid in
   (exit_code_of_status status, output)
 
-(** Run a program directly with timeout, capture output.
+(** Run a program directly with timeout, capture output. When
+    [progress_marker] is set, only a complete stderr protocol record of the
+    form [MARKER INDEX BEGIN|END ...] resets the deadline; unrelated or
+    malformed output cannot keep a stuck process alive.
     Returns (exit_code, output). exit_code 124 = timed out. *)
-let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
-  match timeout with
-  | None | Some 0 -> run_process_capture ?cwd ~env prog args
-  | Some seconds ->
+let run_process_capture_timeout_streams ?cwd ?(env = []) ?progress_marker
+    ?progress_count ~timeout prog args =
+  let timeout_seconds =
+    match timeout with Some seconds when seconds > 0 -> Some seconds | _ -> None
+  in
+  let has_progress_marker =
+    match progress_marker with Some marker -> marker <> "" | None -> false
+  in
+  match (timeout_seconds, has_progress_marker) with
+  | None, false ->
+      let code, output = run_process_capture ?cwd ~env prog args in
+      (code, output, "")
+  | _ ->
       let read_fd, write_fd = Unix.pipe () in
+      (* Result framing and heartbeats may use different stdio streams. Read
+         them independently so writes from one stream cannot split protocol
+         records from the other before capture is complete. *)
+      let progress_pipe =
+        match progress_marker with
+        | Some marker when marker <> "" -> Some (Unix.pipe ())
+        | None | Some _ -> None
+      in
+      let progress_read_fd = Option.map fst progress_pipe in
+      let progress_write_fd = Option.map snd progress_pipe in
+      let stderr_fd = Option.value ~default:write_fd progress_write_fd in
+      let close_fds = read_fd :: Option.to_list progress_read_fd in
       let argv = Array.of_list (prog :: args) in
       let pid =
-        create_process_direct ~new_session:true ~close_fds:[ read_fd ] ?cwd ~env
-          prog argv Unix.stdin write_fd write_fd
+        create_process_direct ~new_session:(Option.is_some timeout_seconds)
+          ~close_fds ?cwd ~env prog argv Unix.stdin write_fd stderr_fd
       in
       Unix.close write_fd;
+      Option.iter Unix.close progress_write_fd;
       let timed_out = ref false in
       let status = ref None in
       let pipe_open = ref true in
+      let progress_pipe_open = ref (Option.is_some progress_read_fd) in
       let output = Buffer.create 4096 in
+      let progress_output = Buffer.create 1024 in
       let bytes = Bytes.create 4096 in
+      let progress_bytes = Bytes.create 4096 in
+      let deadline =
+        ref
+          (match timeout_seconds with
+          | Some seconds -> get_time () +. float_of_int seconds
+          | None -> 0.0)
+      in
+      let stderr_progress_tail = ref "" in
+      let next_progress_index = ref 0 in
+      let active_progress_index = ref None in
+      let progress_index_is_expected index =
+        index = !next_progress_index
+        && Option.fold ~none:true ~some:(fun count -> index < count) progress_count
+      in
+      let progress_record_advances marker line =
+        match
+          String.trim line |> String.split_on_char ' '
+          |> List.filter (fun field -> field <> "")
+        with
+        | record_marker :: raw_index :: phase :: _ ->
+            if not (String.equal record_marker marker) then false
+            else (
+              match (int_of_string_opt raw_index, phase, !active_progress_index) with
+              | Some index, "BEGIN", None when progress_index_is_expected index ->
+                  active_progress_index := Some index;
+                  true
+              | Some index, "END", Some active when index = active ->
+                  active_progress_index := None;
+                  next_progress_index := active + 1;
+                  true
+              | _ -> false)
+        | _ -> false
+      in
+      let observe_progress tail bytes count =
+        match (progress_marker, timeout_seconds) with
+        | Some marker, Some seconds when marker <> "" ->
+            let chunk = Bytes.sub_string bytes 0 count in
+            let candidate = !tail ^ chunk in
+            let rec consume_complete_lines offset =
+              match String.index_from_opt candidate offset '\n' with
+              | Some newline ->
+                  let line = String.sub candidate offset (newline - offset) in
+                  if progress_record_advances marker line then
+                    deadline := get_time () +. float_of_int seconds;
+                  consume_complete_lines (newline + 1)
+              | None ->
+                  tail :=
+                    String.sub candidate offset (String.length candidate - offset)
+            in
+            consume_complete_lines 0
+        | Some _, Some _ | Some _, None | None, Some _ | None, None -> ()
+      in
       Unix.set_nonblock read_fd;
-      let rec drain_available () =
-        if !pipe_open then
-          match Unix.read read_fd bytes 0 4096 with
-          | 0 -> pipe_open := false
+      Option.iter Unix.set_nonblock progress_read_fd;
+      let rec drain_pipe fd is_open buffer progress_tail chunk =
+        if !is_open then
+          match Unix.read fd chunk 0 4096 with
+          | 0 -> is_open := false
           | n ->
-              Buffer.add_subbytes output bytes 0 n;
-              drain_available ()
-          | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain_available ()
+              Buffer.add_subbytes buffer chunk 0 n;
+              Option.iter
+                (fun tail -> observe_progress tail chunk n)
+                progress_tail;
+              drain_pipe fd is_open buffer progress_tail chunk
+          | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+              drain_pipe fd is_open buffer progress_tail chunk
           | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
             ->
               ()
-          | exception _ -> pipe_open := false
+          | exception _ -> is_open := false
+      in
+      let drain_available () =
+        drain_pipe read_fd pipe_open output None bytes;
+        Option.iter
+          (fun fd ->
+            drain_pipe fd progress_pipe_open progress_output
+              (Some stderr_progress_tail) progress_bytes)
+          progress_read_fd
       in
       let poll_status () =
         match !status with
@@ -360,7 +452,6 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
               | _, st -> status := Some st
             with Unix.Unix_error (Unix.ECHILD, _, _) -> ())
       in
-      let deadline = get_time () +. float_of_int seconds in
       let kill_grace = ref None in
       let sent_kill = ref false in
       let rec loop () =
@@ -370,11 +461,13 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
         | Some _ -> ()
         | None ->
             let now = get_time () in
-            if (not !timed_out) && now >= deadline then begin
-              timed_out := true;
-              kill_grace := Some (now +. process_timeout_sigterm_grace_seconds);
-              kill_process_group_or_process pid Sys.sigterm
-            end;
+            (match timeout_seconds with
+            | Some _ when (not !timed_out) && now >= !deadline ->
+                timed_out := true;
+                kill_grace :=
+                  Some (now +. process_timeout_sigterm_grace_seconds);
+                kill_process_group_or_process pid Sys.sigterm
+            | Some _ | None -> ());
             (match !kill_grace with
             | Some grace_deadline
               when !timed_out && (not !sent_kill) && now >= grace_deadline ->
@@ -391,11 +484,19 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
             in
             if not stop_waiting then begin
               let wait =
-                match !kill_grace with
-                | Some grace_deadline -> max 0.0 (grace_deadline -. get_time ())
-                | None -> max 0.0 (deadline -. get_time ())
+                match (!kill_grace, timeout_seconds) with
+                | Some grace_deadline, _ ->
+                    max 0.0 (grace_deadline -. get_time ())
+                | None, Some _ -> max 0.0 (!deadline -. get_time ())
+                | None, None -> process_timeout_poll_interval_seconds
               in
-              let read_fds = if !pipe_open then [ read_fd ] else [] in
+              let read_fds =
+                (if !pipe_open then [ read_fd ] else [])
+                @
+                match progress_read_fd with
+                | Some fd when !progress_pipe_open -> [ fd ]
+                | Some _ | None -> []
+              in
               let wait = min wait process_timeout_poll_interval_seconds in
               (try ignore (Unix.select read_fds [] [] wait) with _ -> ());
               loop ()
@@ -405,12 +506,33 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
       if !timed_out then reap_child_if_needed pid status;
       drain_available ();
       Unix.close read_fd;
+      Option.iter Unix.close progress_read_fd;
       let exit_code =
         if !timed_out then 124
         else
           match !status with Some st -> exit_code_of_status st | None -> 124
       in
-      (exit_code, Buffer.contents output)
+      let stdout_output = Buffer.contents output in
+      let stderr_output = Buffer.contents progress_output in
+      (exit_code, stdout_output, stderr_output)
+
+let combine_captured_streams stdout_output stderr_output =
+  if stdout_output = "" then stderr_output
+  else if stderr_output = "" then stdout_output
+  else
+    let separator =
+      if stdout_output.[String.length stdout_output - 1] = '\n' then ""
+      else "\n"
+    in
+    stdout_output ^ separator ^ stderr_output
+
+let run_process_capture_timeout ?cwd ?(env = []) ?progress_marker ?progress_count
+    ~timeout prog args =
+  let code, stdout_output, stderr_output =
+    run_process_capture_timeout_streams ?cwd ~env ?progress_marker ?progress_count
+      ~timeout prog args
+  in
+  (code, combine_captured_streams stdout_output stderr_output)
 
 (** Run a program directly with timeout, inheriting stdin/stdout/stderr.
     Returns exit code (124 = timed out). For interactive use (blorp run). *)
@@ -995,8 +1117,17 @@ let record_timed_operation ~timing_phase ~timing_group ~timing_suite_count
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
+let suite_run_all_progress_marker = "__BLORP_SUITE_RUN_ALL_PROGRESS__"
 let suite_run_all_begin_marker = "__BLORP_SUITE_RUN_ALL_BEGIN__"
 let suite_run_all_end_marker = "__BLORP_SUITE_RUN_ALL_END__"
+
+let suite_run_all_progress_nonce = ref 0
+
+let fresh_suite_run_all_progress_marker () =
+  incr suite_run_all_progress_nonce;
+  Printf.sprintf "%s%d_%d_%Ld" suite_run_all_progress_marker (Unix.getpid ())
+    !suite_run_all_progress_nonce
+    (Int64.of_float (Unix.gettimeofday () *. 1_000_000.0))
 
 let normalized_relative_test_path filename =
   let cwd_prefix = Sys.getcwd () ^ Filename.dir_sep in
@@ -2094,7 +2225,8 @@ let generate_suite_selector_harness ?(leak_check = false) test_files =
 (** Generate a harness that compiles multiple TestSuite modules once and runs
     ordinary suites inside one process. Process-sensitive suites are kept out
     by [suite_run_all_eligible]; this generator only builds the fast path. *)
-let generate_suite_run_all_harness test_files =
+let generate_suite_run_all_harness
+    ?(progress_marker = suite_run_all_progress_marker) test_files =
   let run_fn = "run_suite" in
   let buf = Buffer.create 4096 in
   let emit line =
@@ -2105,6 +2237,10 @@ let generate_suite_run_all_harness test_files =
   List.iteri
     (fun i file ->
       emit (Printf.sprintf "func __run_suite_%d() -> Bool:" i);
+      emit
+        (Printf.sprintf "    print_error(%s)"
+           (blorp_string_literal
+              (Printf.sprintf "%s %d BEGIN %s" progress_marker i file)));
       emit
         (Printf.sprintf "    print(%s)"
            (blorp_string_literal
@@ -2121,6 +2257,10 @@ let generate_suite_run_all_harness test_files =
         (Printf.sprintf "        print(%s)"
            (blorp_string_literal
               (Printf.sprintf "%s %d FAIL %s" suite_run_all_end_marker i file)));
+      emit
+        (Printf.sprintf "    print_error(%s)"
+           (blorp_string_literal
+              (Printf.sprintf "%s %d END %s" progress_marker i file)));
       emit "    passed";
       emit "";
       emit "")
@@ -2649,12 +2789,12 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
     (generate_suite_selector_harness ~leak_check files)
 
 let compile_suite_run_all_harness ?(debug = false) ?(sanitize = false)
-    ?sanitizer_mode ?precompiled ~timing_group files =
+    ?sanitizer_mode ?precompiled ~progress_marker ~timing_group files =
   compile_suite_harness_source ~debug ~sanitize ?sanitizer_mode ?precompiled
     ~timing_group ~suite_count:(List.length files)
     ~harness_label:"suite-run-all-harness"
     ~filename_base:"__suite_run_all_harness__.brp"
-    (generate_suite_run_all_harness files)
+    (generate_suite_run_all_harness ~progress_marker files)
 
 let run_suite_selector_case ~cwd ~leak_check ~timeout ~bin_file ~file ~index
     ~timing_group ~suite_count =
@@ -2760,7 +2900,79 @@ let suite_run_all_results_from_output ~elapsed files output =
       (List.init expected_count (fun index ->
            Hashtbl.find results_by_index index))
 
-let run_suite_run_all_case ~timeout ~bin_file ~files ~timing_group =
+let parse_suite_run_all_progress ~progress_marker line =
+  match split_marker_fields line with
+  | marker :: raw_index :: phase :: _
+    when marker = progress_marker -> (
+      match (int_of_string_opt raw_index, phase) with
+      | Some index, "BEGIN" -> Some (index, true)
+      | Some index, "END" -> Some (index, false)
+      | _ -> None)
+  | _ -> None
+
+let append_captured_line buffer line =
+  Buffer.add_string buffer line;
+  Buffer.add_char buffer '\n'
+
+let suite_run_all_stderr_by_index ~progress_marker expected_count stderr_output =
+  let buffers = Array.init expected_count (fun _ -> Buffer.create 128) in
+  let unscoped = Buffer.create 128 in
+  let current = ref None in
+  let valid_index index = index >= 0 && index < expected_count in
+  stderr_output |> String.split_on_char '\n'
+  |> List.iter (fun line ->
+      match parse_suite_run_all_progress ~progress_marker line with
+      | Some (index, true) when valid_index index -> current := Some index
+      | Some (index, false) when !current = Some index -> current := None
+      | Some _ -> append_captured_line unscoped line
+      | None -> (
+          match !current with
+          | Some index -> append_captured_line buffers.(index) line
+          | None -> append_captured_line unscoped line));
+  (Array.map Buffer.contents buffers, Buffer.contents unscoped)
+
+let append_captured_output output extra =
+  if String.trim extra = "" then output
+  else if output = "" || output.[String.length output - 1] = '\n' then
+    output ^ extra
+  else output ^ "\n" ^ extra
+
+let rec first_failed_result_index index = function
+  | [] -> None
+  | result :: _ when not result.passed -> Some index
+  | _ :: rest -> first_failed_result_index (index + 1) rest
+
+let suite_run_all_results_from_streams
+    ?(progress_marker = suite_run_all_progress_marker) ~elapsed files
+    ~stdout_output ~stderr_output =
+  match suite_run_all_results_from_output ~elapsed files stdout_output with
+  | None -> None
+  | Some results ->
+      let stderr_by_index, unscoped_stderr =
+        suite_run_all_stderr_by_index ~progress_marker (List.length files)
+          stderr_output
+      in
+      let unscoped_index =
+        match first_failed_result_index 0 results with
+        | Some index -> Some index
+        | None -> if results = [] then None else Some 0
+      in
+      Some
+        (List.mapi
+           (fun index result ->
+             let output =
+               append_captured_output result.output stderr_by_index.(index)
+             in
+             let output =
+               if unscoped_index = Some index then
+                 append_captured_output output unscoped_stderr
+               else output
+             in
+             { result with output })
+           results)
+
+let run_suite_run_all_case ~timeout ~bin_file ~files ~progress_marker
+    ~timing_group =
   let start_time = get_time () in
   let make_harness_result ?(output = "") ?(error_detail = "") passed =
     [
@@ -2773,16 +2985,22 @@ let run_suite_run_all_case ~timeout ~bin_file ~files ~timing_group =
       };
     ]
   in
-  let result, output =
+  let result, stdout_output, stderr_output =
     record_timed_operation ~timing_phase:HarnessExecution ~timing_group
       ~timing_suite_count:(List.length files)
       ~timing_source_count:(List.length files) (fun () ->
-        run_process_capture_timeout ~timeout bin_file [])
+        run_process_capture_timeout_streams
+          ~progress_marker ~progress_count:(List.length files) ~timeout bin_file
+          [])
   in
+  let output = combine_captured_streams stdout_output stderr_output in
   let elapsed = get_time () -. start_time in
   match result with
   | 0 | 1 -> (
-      match suite_run_all_results_from_output ~elapsed files output with
+      match
+        suite_run_all_results_from_streams ~progress_marker ~elapsed files
+          ~stdout_output ~stderr_output
+      with
       | Some results -> results
       | None ->
           make_harness_result ~output
@@ -2792,7 +3010,8 @@ let run_suite_run_all_case ~timeout ~bin_file ~files ~timing_group =
   | 124 ->
       let secs = match timeout with Some s -> s | None -> 0 in
       make_harness_result ~output
-        ~error_detail:(Printf.sprintf "(timed out after %ds)" secs)
+        ~error_detail:
+          (Printf.sprintf "(made no TestSuite progress for %ds)" secs)
         false
   | code ->
       let detail =
@@ -3103,10 +3322,11 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           in
           if batch <> [] then begin
             let timing_group = Printf.sprintf "run_all_%d" batch_index in
+            let progress_marker = fresh_suite_run_all_progress_marker () in
             mark_handled batch;
             match
               compile_suite_run_all_harness ~debug ~sanitize ?sanitizer_mode
-                ?precompiled ~timing_group batch
+                ?precompiled ~progress_marker ~timing_group batch
             with
             | Error detail ->
                 Printf.eprintf "Combined run-all test compile failed:\n%s\n%!"
@@ -3119,7 +3339,7 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
                   (fun () ->
                     record_results
                       (run_suite_run_all_case ~timeout ~bin_file ~files:batch
-                         ~timing_group))
+                         ~progress_marker ~timing_group))
           end)
     in
     let run_selector_combined () =
