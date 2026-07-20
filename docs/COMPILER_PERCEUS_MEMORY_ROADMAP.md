@@ -1,8 +1,8 @@
 # Compiler Perceus Memory Dossier And Roadmap
 
-Status: active implementation plan; Slices 0-3 completed as of 2026-07-20.
+Status: active implementation plan; Slices 0-4 completed as of 2026-07-20.
 
-Last checked against `dogfood-3` based on `6f1c76e2` on 2026-07-20.
+Last checked against `dogfood-3` based on `f9250351` on 2026-07-20.
 
 This document records the primary cause of the current self-hosted compiler
 memory blow-up and defines the implementation sequence for correcting it. It is
@@ -11,11 +11,11 @@ Core path from global binding resolution through Perceus ownership rewriting.
 
 ## Executive Conclusion
 
-The primary backend memory regression is caused by the algorithm used to make
+The primary backend memory regression was caused by the algorithm used to make
 global references ownership-safe in
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`.
 
-The current implementation repeatedly rebuilds each function body once for
+The pre-Slice 4 implementation repeatedly rebuilt each function body once for
 every globally declared value, then can rebuild it up to three more times for
 every managed global. A compiler-sized Core program has thousands of functions
 and hundreds of globals. This turns a bounded ownership correction into work
@@ -187,15 +187,14 @@ resolve callable ids
 `run_perceus_stage` prepares dictionary literals and then calls
 `CorePerceus.insert_drops_program`.
 
-`insert_drops_program` currently performs these operations:
+`insert_drops_program` now performs these operations:
 
-1. `build_env(program)` gathers type, constructor, function, call-contract, and
-   global facts.
-2. `resolve_program_global_refs(declaration_env, program)` repairs unresolved
-   global references by name.
-3. `build_env(resolved_program)` repeats environment construction.
-4. `infer_user_call_contracts` infers consumed arguments.
-5. `rewrite_decl` runs Perceus over every function, global initializer, and
+1. `CoreResolve.resolve_global_value_refs(program)` resolves unresolved global
+   values in one indexed, scope-aware walk.
+2. `build_env(resolved_program)` gathers type, constructor, function,
+   call-contract, and global facts once.
+3. `infer_user_call_contracts` infers consumed arguments.
+4. `rewrite_decl` runs Perceus over every function, global initializer, and
    implementation method.
 
 Inside `rewrite_function`, the body passes through a sequence of whole-tree
@@ -205,14 +204,14 @@ transformations:
 2. `protect_borrowed_param_calls_for_function`;
 3. `retain_borrowed_param_aggregates`;
 4. `retain_borrowed_param_results`;
-5. `retain_borrowed_values` for all unshadowed globals;
+5. `retain_borrowed_values` for referenced, unshadowed globals;
 6. `normalize_owned_result_aliases` for managed results;
 7. `insert_drops_expr`;
 8. `balance_consumed_param_bodies`.
 
-Several of those passes are semantically necessary. The regression comes from
-feeding every global to name-specific passes even when the body never refers to
-that global.
+Several of those passes are semantically necessary. Slices 2-4 removed the
+regression by selecting referenced globals once per body and replacing the
+per-global resolver with one indexed program walk.
 
 ## Primary Cause In Detail
 
@@ -915,6 +914,71 @@ Required proof:
 This is a complete algorithm replacement. If the roadmap stops here, the
 compiler has one correct resolver and bounded behavior; only its orchestration
 location remains later than desired.
+
+Implemented as one indexed, scope-aware walk in `compiler_core_resolve.brp`.
+The index maps each qualified global name to either one canonical definition
+id or an explicit ambiguous state. Exact duplicate declarations retain the
+Slice 3 behavior of one resolvable identity; distinct identities sharing a
+name remain unresolved. Existing ids are authoritative. The traversal handles
+every Core binder explicitly and resolves ordinary expression children through
+the shared context-aware traversal API.
+
+Sanitizer testing of a freshly compiled renderer helper found that the pinned
+bootstrap did not retain managed values captured by repeatedly invoked generic
+callbacks. The first failure freed the resolution dictionary between top-level
+declarations; the second freed an extended match scope between nested match
+results. The durable fix was to make
+`map_core_expr_children_with_context` and
+`map_core_match_results_with_context` pass context as ordinary function
+arguments throughout their complete traversals. Their list/container helpers
+use explicit loops, avoiding both managed captures and a pinned-bootstrap C
+declaration-order bug for private generic functions used as first-class
+callbacks. The older non-context APIs are now thin adapters over the same
+implementations, so there is one traversal definition for each operation.
+The resolver's recursive entry also creates a fresh record shell for each
+edge. This keeps the shared index and current scope owned for the full child
+call without deep-copying either collection; an official Core sanitizer run
+found and now covers the sibling-child lifetime that requires this shell.
+
+`insert_drops_program` invokes the new resolver at the former Perceus resolver
+location. The per-global implementation, its indexes, its unresolved-only
+rewrite policy, and nine resolution-only Perceus tests were deleted. Match
+binding freshening retains a single narrowly scoped name rewrite with no
+global-resolution mode. Ownership tests remain in Perceus; 16 global-value
+identity and scope regressions, including the sibling-scope lifetime case, now
+live in CoreResolve.
+
+Post-Slice 4 medians from five unsampled, interleaved runs on the same Apple M4
+host:
+
+| Globals | Elapsed | Peak RSS |
+|---:|---:|---:|
+| 24 | 0.320s | 44,482,560 bytes |
+| 384 | 0.377s | 48,775,168 bytes |
+
+The larger fixture adds 360 global declarations and their emitted C, but no
+longer multiplies each function body by the global count. Elapsed time grows
+about 18% and peak RSS about 10%, versus the original roughly 6.6x elapsed
+growth. Both runs validated the generated C.
+
+A post-Slice 4 `--vmmap` sample of the 384-global fixture reported 79,549
+default-zone allocations, a 9,076,736-byte physical footprint, and 20,971,520
+bytes of `MALLOC_SMALL`. The comparable pre-Slice 4 sample reported 3,510,453
+allocations and a 238,131,609-byte physical footprint. Sampling perturbs
+elapsed time, but the allocator counts confirm that the resolver's
+sanitizer-required ownership shells do not offset the algorithmic reduction.
+
+Final Slice 4 verification:
+
+- focused CoreResolve suite: 24 passed, 0 failed;
+- focused Perceus suite: 178 passed, 0 failed;
+- fresh renderer helper under ASan/UBSan: both focused suites passed with no
+  sanitizer findings;
+- official focused Core sanitizer gate: 730 passed, 0 failed;
+- focused Core pipeline suite: 2 passed, 0 failed;
+- global record/union lifecycle runtime test: 1 passed, 0 failed;
+- string-literal lifecycle leak baseline: 404 allocations, 404 releases,
+  0 leaked bytes.
 
 ### Slice 5: Move Resolution To The Core Pipeline Boundary
 

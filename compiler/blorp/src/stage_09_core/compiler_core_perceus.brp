@@ -179,6 +179,7 @@ import:
 		arg_preserves_caller,
 		builtin_contract,
 		intrinsic_contract,
+	compiler_core_resolve as CoreResolve
 	compiler_core_traverse as CoreTraverse
 
 
@@ -218,19 +219,12 @@ record PerceusGlobal {
 }
 
 
-private union GlobalNameResolution:
-	ResolvableGlobalName(Int)
-	AmbiguousGlobalName
-
-
 record PerceusEnv {
 	managed_type_names: List[String],
 	constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]],
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	global_values: List[PerceusGlobal],
-	global_resolution_candidates: List[CoreVar],
-	global_name_resolutions: Dict[String, GlobalNameResolution],
 	function_names: List[String],
 	constructor_names: List[String],
 	direct_user_call_contracts_by_name: Dict[String, List[Int]],
@@ -274,8 +268,6 @@ pure func empty_env() -> PerceusEnv:
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
 		global_values = [],
-		global_resolution_candidates = [],
-		global_name_resolutions = {},
 		function_names = [],
 		constructor_names = [],
 		direct_user_call_contracts_by_name = {},
@@ -498,25 +490,6 @@ private pure func lookup_direct_user_call_contract(
 			None
 
 
-private pure func record_global_name_resolution(
-	resolutions: Dict[String, GlobalNameResolution],
-	name: String,
-	definition_id: Int,
-) -> Dict[String, GlobalNameResolution]:
-	match resolutions.get(name):
-		None:
-			resolutions.set(name, ResolvableGlobalName(definition_id))
-		Some(ResolvableGlobalName(existing_definition_id)):
-			-- Repeated declarations of one exact identity do not make an
-			-- otherwise resolvable name ambiguous. Distinct identities do.
-			if existing_definition_id == definition_id:
-				resolutions
-			else:
-				resolutions.set(name, AmbiguousGlobalName)
-		Some(AmbiguousGlobalName):
-			resolutions
-
-
 pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var managed_type_names: List[String] = DEFAULT_MANAGED_TYPE_NAMES
 	var constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]] = {}
@@ -524,8 +497,6 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 	var global_values: List[PerceusGlobal] = []
-	var global_resolution_candidates: List[CoreVar] = []
-	var global_name_resolutions: Dict[String, GlobalNameResolution] = {}
 
 	for decl in program.decls:
 		match decl:
@@ -617,23 +588,6 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					is_mutable = global.is_mutable
 				}
 				global_values = global_values.append(perceus_global)
-
-				if (
-					global_name_resolutions
-						.get(global.name.name)
-						.is_none()
-				):
-					global_resolution_candidates = global_resolution_candidates.append(
-						perceus_global.value.name,
-					)
-				else:
-					void
-
-				global_name_resolutions = record_global_name_resolution(
-					global_name_resolutions,
-					global.name.name,
-					global.def_id,
-				)
 			_:
 				void
 
@@ -643,8 +597,6 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		global_values = global_values,
-		global_resolution_candidates = global_resolution_candidates,
-		global_name_resolutions = global_name_resolutions,
 		function_names = CoreClosure.capture_function_names(program),
 		constructor_names = CoreClosure.capture_constructor_names(program),
 		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
@@ -5182,28 +5134,7 @@ private pure func perceus_shadow_var(
 	}
 
 
-private enum NamedVarRewritePolicy:
-	RewriteAllMatchingVars
-	RewriteUnresolvedMatchingVars
-
-
-private pure func named_var_matches_rewrite(
-	policy: NamedVarRewritePolicy,
-	old_name: String,
-	variable: CoreVar,
-) -> Bool:
-	if variable.name != old_name:
-		False
-	else:
-		match policy:
-			RewriteAllMatchingVars:
-				True
-			RewriteUnresolvedMatchingVars:
-				variable.def_id.is_none()
-
-
 private pure func rename_shadow_var_refs_in_literal_case(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	match_case: CoreLiteralMatchCase,
@@ -5211,11 +5142,10 @@ private pure func rename_shadow_var_refs_in_literal_case(
 	if match_bindings_shadow(old_name, match_case.bindings):
 		match_case
 	else:
-		{ match_case | body = rename_shadow_var_refs(policy, old_name, new_var, match_case.body) }
+		{ match_case | body = rename_shadow_var_refs(old_name, new_var, match_case.body) }
 
 
 private pure func rename_shadow_var_refs_in_literal_cases(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	cases: List[CoreLiteralMatchCase],
@@ -5225,7 +5155,6 @@ private pure func rename_shadow_var_refs_in_literal_cases(
 	for match_case in cases:
 		renamed = renamed.append(
 			rename_shadow_var_refs_in_literal_case(
-				policy,
 				old_name,
 				new_var,
 				match_case,
@@ -5236,41 +5165,33 @@ private pure func rename_shadow_var_refs_in_literal_cases(
 
 
 private pure func rename_shadow_var_refs_in_literal_fallback(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	fallback: CoreLiteralMatchFallback,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(rename_shadow_var_refs(policy, old_name, new_var, body))
+			LiteralMatchFallbackBody(rename_shadow_var_refs(old_name, new_var, body))
 		LiteralMatchFallbackBindings(bindings, body):
 			if match_bindings_shadow(old_name, bindings):
 				fallback
 			else:
 				LiteralMatchFallbackBindings(
 					bindings,
-					rename_shadow_var_refs(policy, old_name, new_var, body),
+					rename_shadow_var_refs(old_name, new_var, body),
 				)
 		LiteralMatchFallbackFail:
 			LiteralMatchFallbackFail
 
 
 private pure func rename_shadow_var_refs_in_literal_match(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> CoreConstructorLiteralMatch:
 	{ match_expr |
-		cases = rename_shadow_var_refs_in_literal_cases(
-			policy,
-			old_name,
-			new_var,
-			match_expr.cases,
-		),
+		cases = rename_shadow_var_refs_in_literal_cases(old_name, new_var, match_expr.cases),
 		fallback = rename_shadow_var_refs_in_literal_fallback(
-			policy,
 			old_name,
 			new_var,
 			match_expr.fallback,
@@ -5279,18 +5200,16 @@ private pure func rename_shadow_var_refs_in_literal_match(
 
 
 private pure func rename_shadow_var_refs_in_constructor_body(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	body: CoreConstructorMatchBody,
 ) -> CoreConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(rename_shadow_var_refs(policy, old_name, new_var, expr))
+			ConstructorMatchBodyExpr(rename_shadow_var_refs(old_name, new_var, expr))
 		ConstructorMatchBodyLiteral(match_expr):
 			ConstructorMatchBodyLiteral(
 				rename_shadow_var_refs_in_literal_match(
-					policy,
 					old_name,
 					new_var,
 					match_expr,
@@ -5299,7 +5218,6 @@ private pure func rename_shadow_var_refs_in_constructor_body(
 		ConstructorMatchBodyLength(match_expr):
 			ConstructorMatchBodyLength(
 				rename_shadow_var_refs_in_length_match(
-					policy,
 					old_name,
 					new_var,
 					match_expr,
@@ -5308,7 +5226,6 @@ private pure func rename_shadow_var_refs_in_constructor_body(
 
 
 private pure func rename_shadow_var_refs_in_length_branch(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	branch: CoreConstructorLengthMatchBranch,
@@ -5317,17 +5234,11 @@ private pure func rename_shadow_var_refs_in_length_branch(
 		branch
 	else:
 		{ branch |
-			body = rename_shadow_var_refs_in_constructor_body(
-				policy,
-				old_name,
-				new_var,
-				branch.body,
-			)
+			body = rename_shadow_var_refs_in_constructor_body(old_name, new_var, branch.body)
 		}
 
 
 private pure func rename_shadow_var_refs_in_length_match(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	match_expr: CoreConstructorLengthMatch,
@@ -5338,7 +5249,6 @@ private pure func rename_shadow_var_refs_in_length_match(
 		renamed_cases = renamed_cases.append(
 			{ match_case |
 				branch = rename_shadow_var_refs_in_length_branch(
-					policy,
 					old_name,
 					new_var,
 					match_case.branch,
@@ -5351,7 +5261,6 @@ private pure func rename_shadow_var_refs_in_length_match(
 			Some(
 				{ match_case |
 					branch = rename_shadow_var_refs_in_length_branch(
-						policy,
 						old_name,
 						new_var,
 						match_case.branch,
@@ -5363,7 +5272,7 @@ private pure func rename_shadow_var_refs_in_length_match(
 
 	renamed_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
 		Some(branch):
-			Some(rename_shadow_var_refs_in_length_branch(policy, old_name, new_var, branch))
+			Some(rename_shadow_var_refs_in_length_branch(old_name, new_var, branch))
 		None:
 			None
 
@@ -5375,7 +5284,6 @@ private pure func rename_shadow_var_refs_in_length_match(
 
 
 private pure func rename_shadow_var_refs_in_constructor_case(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	match_case: CoreConstructorMatchCase,
@@ -5384,17 +5292,11 @@ private pure func rename_shadow_var_refs_in_constructor_case(
 		match_case
 	else:
 		{ match_case |
-			body = rename_shadow_var_refs_in_constructor_body(
-				policy,
-				old_name,
-				new_var,
-				match_case.body,
-			)
+			body = rename_shadow_var_refs_in_constructor_body(old_name, new_var, match_case.body)
 		}
 
 
 private pure func rename_shadow_var_refs_in_constructor_cases(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	cases: List[CoreConstructorMatchCase],
@@ -5404,7 +5306,6 @@ private pure func rename_shadow_var_refs_in_constructor_cases(
 	for match_case in cases:
 		renamed = renamed.append(
 			rename_shadow_var_refs_in_constructor_case(
-				policy,
 				old_name,
 				new_var,
 				match_case,
@@ -5415,41 +5316,38 @@ private pure func rename_shadow_var_refs_in_constructor_cases(
 
 
 private pure func rename_shadow_var_refs_in_constructor_fallback(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	fallback: CoreConstructorMatchFallback,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(rename_shadow_var_refs(policy, old_name, new_var, body))
+			ConstructorMatchFallbackBody(rename_shadow_var_refs(old_name, new_var, body))
 		ConstructorMatchFallbackBindings(bindings, body):
 			if match_bindings_shadow(old_name, bindings):
 				fallback
 			else:
 				ConstructorMatchFallbackBindings(
 					bindings,
-					rename_shadow_var_refs(policy, old_name, new_var, body),
+					rename_shadow_var_refs(old_name, new_var, body),
 				)
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
 
 
 private pure func rename_shadow_var_refs_in_optional_expr(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	expr: Option[CoreExpr],
 ) -> Option[CoreExpr]:
 	match expr:
 		Some(value):
-			Some(rename_shadow_var_refs(policy, old_name, new_var, value))
+			Some(rename_shadow_var_refs(old_name, new_var, value))
 		None:
 			None
 
 
 private pure func rename_shadow_var_refs_in_loop_body(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	binder: CoreLoopBinder,
@@ -5458,11 +5356,10 @@ private pure func rename_shadow_var_refs_in_loop_body(
 	if binder.variable.name == old_name:
 		body
 	else:
-		rename_shadow_var_refs(policy, old_name, new_var, body)
+		rename_shadow_var_refs(old_name, new_var, body)
 
 
 private pure func rename_shadow_var_refs_in_select_arm(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	arm: CoreSelectArm,
@@ -5472,25 +5369,23 @@ private pure func rename_shadow_var_refs_in_select_arm(
 			renamed_body: CoreExpr = if recv.binder.name == old_name:
 				arm.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, arm.body)
+				rename_shadow_var_refs(old_name, new_var, arm.body)
 
 			{ arm |
 				kind = SelectRecvArm(
-					{ recv |
-						channel = rename_shadow_var_refs(policy, old_name, new_var, recv.channel)
-					},
+					{ recv | channel = rename_shadow_var_refs(old_name, new_var, recv.channel) },
 				),
 				body = renamed_body
 			}
 		SelectSealedArm(channel):
 			{ arm |
-				kind = SelectSealedArm(rename_shadow_var_refs(policy, old_name, new_var, channel)),
-				body = rename_shadow_var_refs(policy, old_name, new_var, arm.body)
+				kind = SelectSealedArm(rename_shadow_var_refs(old_name, new_var, channel)),
+				body = rename_shadow_var_refs(old_name, new_var, arm.body)
 			}
 		SelectAfterArm(timeout):
 			{ arm |
-				kind = SelectAfterArm(rename_shadow_var_refs(policy, old_name, new_var, timeout)),
-				body = rename_shadow_var_refs(policy, old_name, new_var, arm.body)
+				kind = SelectAfterArm(rename_shadow_var_refs(old_name, new_var, timeout)),
+				body = rename_shadow_var_refs(old_name, new_var, arm.body)
 			}
 
 
@@ -5529,7 +5424,6 @@ private pure func concurrent_bindings_shadow(
 
 
 private pure func rename_shadow_var_refs_in_pre_closure_concurrent_bindings(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	bindings: List[CorePreClosureConcurrentBinding],
@@ -5538,14 +5432,13 @@ private pure func rename_shadow_var_refs_in_pre_closure_concurrent_bindings(
 
 	for binding in bindings:
 		renamed = renamed.append(
-			{ binding | rhs = rename_shadow_var_refs(policy, old_name, new_var, binding.rhs) },
+			{ binding | rhs = rename_shadow_var_refs(old_name, new_var, binding.rhs) },
 		)
 
 	renamed
 
 
 private pure func rename_shadow_var_refs_in_concurrent_bindings(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	bindings: List[CoreConcurrentBinding],
@@ -5554,14 +5447,13 @@ private pure func rename_shadow_var_refs_in_concurrent_bindings(
 
 	for binding in bindings:
 		renamed = renamed.append(
-			{ binding | rhs = rename_shadow_var_refs(policy, old_name, new_var, binding.rhs) },
+			{ binding | rhs = rename_shadow_var_refs(old_name, new_var, binding.rhs) },
 		)
 
 	renamed
 
 
 private pure func rename_shadow_var_refs_in_select_arms(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	arms: List[CoreSelectArm],
@@ -5569,39 +5461,31 @@ private pure func rename_shadow_var_refs_in_select_arms(
 	var renamed: List[CoreSelectArm] = []
 
 	for arm in arms:
-		renamed = renamed.append(
-			rename_shadow_var_refs_in_select_arm(
-				policy,
-				old_name,
-				new_var,
-				arm,
-			),
-		)
+		renamed = renamed.append(rename_shadow_var_refs_in_select_arm(old_name, new_var, arm))
 
 	renamed
 
 
 private pure func rename_shadow_var_refs(
-	policy: NamedVarRewritePolicy,
 	old_name: String,
 	new_var: CoreVar,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
 		VarExpr(variable, typ, loc):
-			if named_var_matches_rewrite(policy, old_name, variable):
+			if variable.name == old_name:
 				VarExpr(copy_core_var(new_var), copy_core_type(typ), loc)
 			else:
 				expr
 		AssignExpr(variable, rhs, typ, loc):
-			renamed_variable: CoreVar = if named_var_matches_rewrite(policy, old_name, variable):
+			renamed_variable: CoreVar = if variable.name == old_name:
 				copy_core_var(new_var)
 			else:
 				copy_core_var(variable)
 
 			AssignExpr(
 				renamed_variable,
-				rename_shadow_var_refs(policy, old_name, new_var, rhs),
+				rename_shadow_var_refs(old_name, new_var, rhs),
 				copy_core_type(typ),
 				loc,
 			)
@@ -5609,25 +5493,25 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if variable.name == old_name:
 				body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, body)
+				rename_shadow_var_refs(old_name, new_var, body)
 
 			LetExpr(
 				copy_core_var(variable),
 				is_mutable,
 				copy_core_type(typ),
-				rename_shadow_var_refs(policy, old_name, new_var, rhs),
+				rename_shadow_var_refs(old_name, new_var, rhs),
 				renamed_body,
 			)
 		BorrowLetExpr(variable, typ, rhs, body):
 			renamed_body: CoreExpr = if variable.name == old_name:
 				body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, body)
+				rename_shadow_var_refs(old_name, new_var, body)
 
 			BorrowLetExpr(
 				copy_core_var(variable),
 				copy_core_type(typ),
-				rename_shadow_var_refs(policy, old_name, new_var, rhs),
+				rename_shadow_var_refs(old_name, new_var, rhs),
 				renamed_body,
 			)
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
@@ -5637,13 +5521,13 @@ private pure func rename_shadow_var_refs(
 				LambdaExpr(
 					params,
 					copy_core_type(return_type),
-					rename_shadow_var_refs(policy, old_name, new_var, body),
+					rename_shadow_var_refs(old_name, new_var, body),
 					is_pure,
 					copy_core_type(typ),
 					loc,
 				)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			renamed_variable: CoreVar = if named_var_matches_rewrite(policy, old_name, variable):
+			renamed_variable: CoreVar = if variable.name == old_name:
 				copy_core_var(new_var)
 			else:
 				copy_core_var(variable)
@@ -5652,12 +5536,12 @@ private pure func rename_shadow_var_refs(
 				renamed_variable,
 				copy_core_type(value_type),
 				retain_policy,
-				rename_shadow_var_refs(policy, old_name, new_var, body),
+				rename_shadow_var_refs(old_name, new_var, body),
 				copy_core_type(typ),
 				loc,
 			)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			renamed_variable: CoreVar = if named_var_matches_rewrite(policy, old_name, variable):
+			renamed_variable: CoreVar = if variable.name == old_name:
 				copy_core_var(new_var)
 			else:
 				copy_core_var(variable)
@@ -5666,12 +5550,12 @@ private pure func rename_shadow_var_refs(
 				renamed_variable,
 				copy_core_type(value_type),
 				release_policy,
-				rename_shadow_var_refs(policy, old_name, new_var, body),
+				rename_shadow_var_refs(old_name, new_var, body),
 				copy_core_type(typ),
 				loc,
 			)
 		TensorRawReadExpr(read, typ, loc):
-			renamed_view: CoreVar = if named_var_matches_rewrite(policy, old_name, read.view):
+			renamed_view: CoreVar = if read.view.name == old_name:
 				copy_core_var(new_var)
 			else:
 				copy_core_var(read.view)
@@ -5679,13 +5563,13 @@ private pure func rename_shadow_var_refs(
 			TensorRawReadExpr(
 				{ read |
 					view = renamed_view,
-					index = rename_shadow_var_refs(policy, old_name, new_var, read.index)
+					index = rename_shadow_var_refs(old_name, new_var, read.index)
 				},
 				copy_core_type(typ),
 				loc,
 			)
 		TensorRawWriteExpr(write, typ, loc):
-			renamed_view: CoreVar = if named_var_matches_rewrite(policy, old_name, write.view):
+			renamed_view: CoreVar = if write.view.name == old_name:
 				copy_core_var(new_var)
 			else:
 				copy_core_var(write.view)
@@ -5693,8 +5577,8 @@ private pure func rename_shadow_var_refs(
 			TensorRawWriteExpr(
 				{ write |
 					view = renamed_view,
-					index = rename_shadow_var_refs(policy, old_name, new_var, write.index),
-					value = rename_shadow_var_refs(policy, old_name, new_var, write.value)
+					index = rename_shadow_var_refs(old_name, new_var, write.index),
+					value = rename_shadow_var_refs(old_name, new_var, write.value)
 				},
 				copy_core_type(typ),
 				loc,
@@ -5703,12 +5587,10 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if binding.variable.name == old_name:
 				body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, body)
+				rename_shadow_var_refs(old_name, new_var, body)
 
 			TensorRawViewLetExpr(
-				{ binding |
-					source = rename_shadow_var_refs(policy, old_name, new_var, binding.source)
-				},
+				{ binding | source = rename_shadow_var_refs(old_name, new_var, binding.source) },
 				renamed_body,
 				copy_core_type(typ),
 				loc,
@@ -5724,12 +5606,12 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if body_is_shadowed:
 				handoff.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, handoff.body)
+				rename_shadow_var_refs(old_name, new_var, handoff.body)
 
 			ListHandoffExpr(
 				{ handoff |
-					source = rename_shadow_var_refs(policy, old_name, new_var, handoff.source),
-					capacity = rename_shadow_var_refs(policy, old_name, new_var, handoff.capacity),
+					source = rename_shadow_var_refs(old_name, new_var, handoff.source),
+					capacity = rename_shadow_var_refs(old_name, new_var, handoff.capacity),
 					body = renamed_body
 				},
 				copy_core_type(typ),
@@ -5742,7 +5624,7 @@ private pure func rename_shadow_var_refs(
 				TailrecLoopExpr(
 					params,
 					copy_core_type(return_type),
-					rename_shadow_var_refs(policy, old_name, new_var, body),
+					rename_shadow_var_refs(old_name, new_var, body),
 					loc,
 				)
 		TailrecListSpreadLoopExpr(loop, loc):
@@ -5756,24 +5638,23 @@ private pure func rename_shadow_var_refs(
 				expr
 			else:
 				TailrecListSpreadLoopExpr(
-					{ loop | body = rename_shadow_var_refs(policy, old_name, new_var, loop.body) },
+					{ loop | body = rename_shadow_var_refs(old_name, new_var, loop.body) },
 					loc,
 				)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			ForRangeExpr(
 				binder,
-				rename_shadow_var_refs(policy, old_name, new_var, start),
-				rename_shadow_var_refs(policy, old_name, new_var, end_value),
-				rename_shadow_var_refs_in_loop_body(policy, old_name, new_var, binder, body),
+				rename_shadow_var_refs(old_name, new_var, start),
+				rename_shadow_var_refs(old_name, new_var, end_value),
+				rename_shadow_var_refs_in_loop_body(old_name, new_var, binder, body),
 				copy_core_type(typ),
 				loc,
 			)
 		ForChannelExpr(loop, typ, loc):
 			ForChannelExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5786,9 +5667,8 @@ private pure func rename_shadow_var_refs(
 		ForListExpr(loop, typ, loc):
 			ForListExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5801,9 +5681,8 @@ private pure func rename_shadow_var_refs(
 		ForStringExpr(loop, typ, loc):
 			ForStringExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5816,9 +5695,8 @@ private pure func rename_shadow_var_refs(
 		ForDictExpr(loop, typ, loc):
 			ForDictExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5831,9 +5709,8 @@ private pure func rename_shadow_var_refs(
 		ForSetExpr(loop, typ, loc):
 			ForSetExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5846,9 +5723,8 @@ private pure func rename_shadow_var_refs(
 		ForStreamExpr(loop, typ, loc):
 			ForStreamExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5861,9 +5737,8 @@ private pure func rename_shadow_var_refs(
 		ForResourceSourceExpr(loop, typ, loc):
 			ForResourceSourceExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5876,9 +5751,8 @@ private pure func rename_shadow_var_refs(
 		ForTensorExpr(loop, typ, loc):
 			ForTensorExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = rename_shadow_var_refs_in_loop_body(
-						policy,
 						old_name,
 						new_var,
 						loop.binder,
@@ -5892,19 +5766,18 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if loop.variable.name == old_name:
 				loop.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, loop.body)
+				rename_shadow_var_refs(old_name, new_var, loop.body)
 
 			PreClosureConcurrentlyLoopExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = renamed_body,
 					timeout = rename_shadow_var_refs_in_optional_expr(
-						policy,
 						old_name,
 						new_var,
 						loop.timeout,
 					),
-					limit = rename_shadow_var_refs(policy, old_name, new_var, loop.limit)
+					limit = rename_shadow_var_refs(old_name, new_var, loop.limit)
 				},
 				copy_core_type(typ),
 				loc,
@@ -5913,19 +5786,18 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if loop.variable.name == old_name:
 				loop.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, loop.body)
+				rename_shadow_var_refs(old_name, new_var, loop.body)
 
 			ConcurrentlyLoopExpr(
 				{ loop |
-					iterable = rename_shadow_var_refs(policy, old_name, new_var, loop.iterable),
+					iterable = rename_shadow_var_refs(old_name, new_var, loop.iterable),
 					body = renamed_body,
 					timeout = rename_shadow_var_refs_in_optional_expr(
-						policy,
 						old_name,
 						new_var,
 						loop.timeout,
 					),
-					limit = rename_shadow_var_refs(policy, old_name, new_var, loop.limit)
+					limit = rename_shadow_var_refs(old_name, new_var, loop.limit)
 				},
 				copy_core_type(typ),
 				loc,
@@ -5939,19 +5811,17 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if body_is_shadowed:
 				block.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, block.body)
+				rename_shadow_var_refs(old_name, new_var, block.body)
 
 			PreClosureConcurrentExpr(
 				{ block |
 					bindings = rename_shadow_var_refs_in_pre_closure_concurrent_bindings(
-						policy,
 						old_name,
 						new_var,
 						block.bindings,
 					),
 					body = renamed_body,
 					timeout = rename_shadow_var_refs_in_optional_expr(
-						policy,
 						old_name,
 						new_var,
 						block.timeout,
@@ -5966,19 +5836,17 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if body_is_shadowed:
 				block.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, block.body)
+				rename_shadow_var_refs(old_name, new_var, block.body)
 
 			ConcurrentExpr(
 				{ block |
 					bindings = rename_shadow_var_refs_in_concurrent_bindings(
-						policy,
 						old_name,
 						new_var,
 						block.bindings,
 					),
 					body = renamed_body,
 					timeout = rename_shadow_var_refs_in_optional_expr(
-						policy,
 						old_name,
 						new_var,
 						block.timeout,
@@ -5991,7 +5859,6 @@ private pure func rename_shadow_var_refs(
 			SelectExpr(
 				{ select_expr |
 					arms = rename_shadow_var_refs_in_select_arms(
-						policy,
 						old_name,
 						new_var,
 						select_expr.arms,
@@ -6004,16 +5871,16 @@ private pure func rename_shadow_var_refs(
 			renamed_body: CoreExpr = if scope.variable.name == old_name:
 				scope.body
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, scope.body)
+				rename_shadow_var_refs(old_name, new_var, scope.body)
 
 			renamed_cleanup: CoreExpr = if scope.variable.name == old_name:
 				scope.cleanup
 			else:
-				rename_shadow_var_refs(policy, old_name, new_var, scope.cleanup)
+				rename_shadow_var_refs(old_name, new_var, scope.cleanup)
 
 			ResourceScopeExpr(
 				{ scope |
-					acquire = rename_shadow_var_refs(policy, old_name, new_var, scope.acquire),
+					acquire = rename_shadow_var_refs(old_name, new_var, scope.acquire),
 					body = renamed_body,
 					cleanup = renamed_cleanup
 				},
@@ -6022,126 +5889,43 @@ private pure func rename_shadow_var_refs(
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
-				rename_shadow_var_refs(policy, old_name, new_var, scrutinee),
-				rename_shadow_var_refs_in_literal_cases(policy, old_name, new_var, cases),
-				rename_shadow_var_refs_in_literal_fallback(policy, old_name, new_var, fallback),
+				rename_shadow_var_refs(old_name, new_var, scrutinee),
+				rename_shadow_var_refs_in_literal_cases(old_name, new_var, cases),
+				rename_shadow_var_refs_in_literal_fallback(old_name, new_var, fallback),
 				copy_core_type(typ),
 				loc,
 			)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			AccessorLiteralMatchExpr(
-				rename_shadow_var_refs(policy, old_name, new_var, scrutinee),
+				rename_shadow_var_refs(old_name, new_var, scrutinee),
 				release_policy,
-				rename_shadow_var_refs_in_literal_match(policy, old_name, new_var, match_expr),
+				rename_shadow_var_refs_in_literal_match(old_name, new_var, match_expr),
 				copy_core_type(typ),
 				loc,
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			LengthMatchExpr(
-				rename_shadow_var_refs(policy, old_name, new_var, scrutinee),
+				rename_shadow_var_refs(old_name, new_var, scrutinee),
 				release_policy,
-				rename_shadow_var_refs_in_length_match(policy, old_name, new_var, match_expr),
+				rename_shadow_var_refs_in_length_match(old_name, new_var, match_expr),
 				copy_core_type(typ),
 				loc,
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
-				rename_shadow_var_refs(policy, old_name, new_var, scrutinee),
+				rename_shadow_var_refs(old_name, new_var, scrutinee),
 				release_policy,
-				rename_shadow_var_refs_in_constructor_cases(policy, old_name, new_var, cases),
-				rename_shadow_var_refs_in_constructor_fallback(policy, old_name, new_var, fallback),
+				rename_shadow_var_refs_in_constructor_cases(old_name, new_var, cases),
+				rename_shadow_var_refs_in_constructor_fallback(old_name, new_var, fallback),
 				copy_core_type(typ),
 				loc,
 			)
 		_:
 			CoreTraverse.map_core_expr_children(expr, pure func(child): rename_shadow_var_refs(
-					policy,
 					old_name.substring(0, old_name.length()),
 					copy_core_var(new_var),
 					child,
 				))
-
-
-private pure func global_name_is_resolvable(env: PerceusEnv, name: String) -> Bool:
-	match env.global_name_resolutions.get(name):
-		Some(ResolvableGlobalName(_)):
-			True
-		_:
-			False
-
-
-private pure func resolve_global_refs_in_expr(
-	env: PerceusEnv,
-	shadowing_values: List[CoreParam],
-	expr: CoreExpr,
-) -> CoreExpr:
-	reference_names: List[String] = CoreDce.value_references(expr).names
-	var result: CoreExpr = expr
-
-	for candidate in env.global_resolution_candidates:
-		name: String = candidate.name
-
-		if (
-			reference_names.contains(name)
-			and global_name_is_resolvable(env, name)
-			and not core_params_shadow(name, shadowing_values)
-		):
-			result = rename_shadow_var_refs(RewriteUnresolvedMatchingVars, name, candidate, result)
-		else:
-			void
-
-	result
-
-
-private pure func resolve_function_global_refs(
-	env: PerceusEnv,
-	func_info: CoreFunction,
-) -> CoreFunction:
-	match func_info.body:
-		Some(body):
-			resolved_body: CoreExpr = resolve_global_refs_in_expr(env, func_info.params, body)
-			{ func_info | body = Some(resolved_body) }
-		None:
-			func_info
-
-
-private pure func resolve_global_initializer_refs(
-	env: PerceusEnv,
-	global: CoreGlobal,
-) -> CoreGlobal:
-	global_value: CoreParam = {
-		name = global.name,
-		typ = global.typ,
-		loc = global.loc
-	}
-
-	resolved_init: CoreExpr = resolve_global_refs_in_expr(env, [global_value], global.init)
-	{ global | init = resolved_init }
-
-
-private pure func resolve_decl_global_refs(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
-	match decl:
-		FunctionDecl(func_info):
-			FunctionDecl(resolve_function_global_refs(env, func_info))
-		GlobalDecl(global):
-			GlobalDecl(resolve_global_initializer_refs(env, global))
-		ImplDecl(impl_decl):
-			ImplDecl(
-				{ impl_decl |
-					methods = impl_decl.methods.map(
-						func(method): resolve_function_global_refs(env, method),
-					)
-				},
-			)
-		_:
-			decl
-
-
-private pure func resolve_program_global_refs(env: PerceusEnv, program: CoreProgram) -> CoreProgram:
-	{
-		decls = program.decls.map(func(decl): resolve_decl_global_refs(env, decl)),
-		foreign_includes = program.foreign_includes
-	}
 
 
 private pure func freshen_match_bindings_in_constructor_body(
@@ -6159,7 +5943,6 @@ private pure func freshen_match_bindings_in_constructor_body(
 			shadow: CoreVar = perceus_shadow_var(target, binding, branch_index, binding_index)
 			freshened_bindings = freshened_bindings.append({ binding | variable = shadow })
 			freshened_body = rename_shadow_var_refs_in_constructor_body(
-				RewriteAllMatchingVars,
 				target.name,
 				shadow,
 				freshened_body,
@@ -6235,12 +6018,7 @@ private pure func freshen_constructor_match_fallback_shadow(
 						binding_index,
 					)
 					freshened_bindings = freshened_bindings.append({ binding | variable = shadow })
-					freshened_body = rename_shadow_var_refs(
-						RewriteAllMatchingVars,
-						target.name,
-						shadow,
-						freshened_body,
-					)
+					freshened_body = rename_shadow_var_refs(target.name, shadow, freshened_body)
 				else:
 					freshened_bindings = freshened_bindings.append(binding)
 
@@ -14761,8 +14539,7 @@ private pure func rewrite_decl(env: PerceusEnv, decl: CoreDecl) -> CoreDecl:
 
 
 pure func insert_drops_program(program: CoreProgram) -> CoreProgram:
-	declaration_env: PerceusEnv = build_env(program)
-	resolved_program: CoreProgram = resolve_program_global_refs(declaration_env, program)
+	resolved_program: CoreProgram = CoreResolve.resolve_global_value_refs(program)
 	foreign_includes: List[String] = resolved_program.foreign_includes
 	env: PerceusEnv = infer_user_call_contracts(resolved_program, build_env(resolved_program))
 	var decls: List[CoreDecl] = []
