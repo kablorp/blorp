@@ -120,6 +120,8 @@ let default_suites =
   @ suite_group "IntrinsicContract" Test_intrinsic_contract.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite
+  @ suite_group "CompilerBlorpBridgeTransport"
+      Test_compiler_blorp_bridge.transport_suite
 
 let deep_suites =
   (* These suites cross larger compiler boundaries: process/session state, LSP,

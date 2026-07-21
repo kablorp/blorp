@@ -1265,17 +1265,36 @@ demonstrably remove the irrelevant-global multiplier it claims to address.
 
 The investigation found important memory costs outside Perceus:
 
-### Typecheck bridge buffering
+### Typecheck bridge buffering (Complete)
 
-The typecheck helper streams one artifact per line, but the OCaml host uses
-`run_process_capture`, buffers the complete response, splits the resulting
-448 MB string, and then decodes all artifacts. The helper simultaneously
-materializes large typed values. This explains the separate 14.33 GB helper
-and 4.04 GB host peaks.
+The typecheck helper already streamed one artifact per line, but the OCaml host
+used `run_process_capture`, buffered the complete response, split the resulting
+448 MB string, and only then decoded all artifacts. The helper simultaneously
+materialized large typed values. Earlier measurements recorded separate 14.33
+GB helper and 4.04 GB host peaks.
 
-Future work should consume the line protocol incrementally and release each
-serialized artifact after use. It should not change the single semantic bridge
-boundary.
+The host now redirects only `typecheck_graph` stdout to a private temporary
+file, waits for the helper to exit, and decodes the response one nonempty line
+at a time. Parser and renderer responses retain their existing in-memory
+transport. The decoder still retains the complete typed graph required by the
+semantic middle, but it no longer retains the complete serialized response or
+the list produced by `String.split_on_char`. Process failure diagnostics read
+bounded excerpts while bridge statistics use the actual output file sizes.
+
+On the compiler-sized production request, the response file reached
+456,501,933 bytes. Live sampling while the helper was active showed about 5 MB
+in the waiting host and 5.2 GB in the helper; the response file was removed
+before backend emission began. A build with an explicitly empty bridge cache
+completed in 300.28 seconds with 7,500,136,448 bytes maximum single-process RSS
+and no swaps. That headline maximum is effectively unchanged from the prior
+7.50 GB empty-cache build because a later backend process remains the largest
+single process. This slice instead removes the serialized-response overlap at
+the constrained typecheck phase.
+
+The next typecheck-specific memory target is helper-side artifact projection:
+one module can temporarily coexist as a typed program, a recursive `JsonValue`
+tree, and its serialized string. That requires separate profiling and a direct
+JSON-emission design; it is not hidden inside this transport slice.
 
 ### Core JSON duplication
 
