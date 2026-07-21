@@ -32,6 +32,7 @@ import:
 			ForStreamExpr,
 			ForStringExpr,
 			ForTensorExpr,
+			IfExpr,
 			LambdaExpr,
 			LengthMatchExpr,
 			LetExpr,
@@ -42,6 +43,7 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			ResourceScopeExpr,
 			SelectExpr,
+			SeqExpr,
 			TailrecListSpreadLoopExpr,
 			TailrecLoopExpr,
 			TensorRawReadExpr,
@@ -54,7 +56,7 @@ import:
 		CoreListHandoffMode(BorrowFreshHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(PointerListStorage),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
 			LiteralMatchFallbackBody,
@@ -87,6 +89,10 @@ import:
 
 pure func int_type() -> CoreType:
 	NamedType("Int", [])
+
+
+pure func bool_type() -> CoreType:
+	NamedType("Bool", [])
 
 
 pure func void_type() -> CoreType:
@@ -369,6 +375,331 @@ pure func test_context_traversal_matches_plain_traversal() -> Bool:
 			plain_matches,
 		).to_string() == core_expr_to_json(context_matches).to_string()
 	)
+
+
+pure func deep_sequence(final_item: CoreExpr, depth: Int) -> CoreExpr:
+	var result: CoreExpr = final_item
+	var index: Int = 0
+
+	while index < depth:
+		result = SeqExpr(int_literal(index), result)
+		index += 1
+
+	result
+
+
+pure func deep_sequence_call_is_resolved(
+	expr: CoreExpr,
+	callable_id: Int,
+	expected_depth: Int,
+) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_items: Int = 0
+	var valid: Bool = True
+
+	while resolved_items < expected_depth and valid:
+		match current:
+			SeqExpr(first, second):
+				match first:
+					LiteralExpr(IntLiteral(value), typ, loc):
+						if value == expected_depth - resolved_items - 1:
+							current = second
+							resolved_items += 1
+						else:
+							valid = False
+					_:
+						valid = False
+			_:
+				valid = False
+
+	if not valid or resolved_items != expected_depth:
+		False
+	else:
+		match current:
+			CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
+				name == "helper" and def_id == Some(callable_id)
+			_:
+				False
+
+
+pure func nested_selected_calls(
+	final_expr: CoreExpr,
+	name: String,
+	def_id: Int,
+	depth: Int,
+) -> CoreExpr:
+	var result: CoreExpr = final_expr
+	var index: Int = 0
+
+	while index < depth:
+		result = CallExpr(
+			SelectedDirectCall(def_id),
+			VarExpr(
+				core_var(name, Some(def_id)),
+				int_type(),
+				SyntheticSourceLoc,
+			),
+			[result],
+			int_type(),
+			SyntheticSourceLoc,
+		)
+		index += 1
+
+	result
+
+
+pure func deep_selected_call(name: String, def_id: Int, depth: Int) -> CoreExpr:
+	nested_selected_calls(
+		selected_call(name, def_id),
+		name,
+		def_id,
+		depth,
+	)
+
+
+pure func deep_call_is_resolved(expr: CoreExpr, callable_id: Int, expected_depth: Int) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_calls: Int = 0
+	var valid: Bool = True
+
+	while resolved_calls < expected_depth and valid:
+		match current:
+			CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
+				match args.get(0):
+					Some(next):
+						if name == "helper" and def_id == Some(callable_id):
+							current = next
+							resolved_calls += 1
+						else:
+							valid = False
+					None:
+						valid = False
+			_:
+				valid = False
+
+	if not valid or resolved_calls != expected_depth:
+		False
+	else:
+		match current:
+			CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
+				name == "helper" and def_id == Some(callable_id) and args.length() == 0
+			_:
+				False
+
+
+pure func deep_sequence_global_is_resolved(
+	expr: CoreExpr,
+	global_name: String,
+	global_id: Int,
+	expected_depth: Int,
+) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_items: Int = 0
+	var valid: Bool = True
+
+	while resolved_items < expected_depth and valid:
+		match current:
+			SeqExpr(first, second):
+				match first:
+					LiteralExpr(IntLiteral(value), typ, loc):
+						if value == expected_depth - resolved_items - 1:
+							current = second
+							resolved_items += 1
+						else:
+							valid = False
+					_:
+						valid = False
+			_:
+				valid = False
+
+	if not valid or resolved_items != expected_depth:
+		False
+	else:
+		match current:
+			VarExpr(variable, typ, loc):
+				variable.name == global_name and variable.def_id == Some(global_id)
+			_:
+				False
+
+
+pure func deep_call_global_is_resolved(
+	expr: CoreExpr,
+	global_name: String,
+	global_id: Int,
+	callable_id: Int,
+	expected_depth: Int,
+) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_calls: Int = 0
+	var valid: Bool = True
+
+	while resolved_calls < expected_depth and valid:
+		match current:
+			CallExpr(SelectedDirectCall(def_id), callee, args, typ, loc):
+				match args.get(0):
+					Some(next):
+						if def_id == callable_id:
+							current = next
+							resolved_calls += 1
+						else:
+							valid = False
+					None:
+						valid = False
+			_:
+				valid = False
+
+	if not valid or resolved_calls != expected_depth:
+		False
+	else:
+		match current:
+			VarExpr(variable, typ, loc):
+				variable.name == global_name and variable.def_id == Some(global_id)
+			_:
+				False
+
+
+pure func nested_ifs(final_expr: CoreExpr, depth: Int) -> CoreExpr:
+	var result: CoreExpr = final_expr
+	var index: Int = 0
+
+	while index < depth:
+		condition: CoreExpr = LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+		result = IfExpr(condition, result, int_literal(0), int_type(), SyntheticSourceLoc)
+		index += 1
+
+	result
+
+
+pure func deep_if_global_is_resolved(
+	expr: CoreExpr,
+	global_name: String,
+	global_id: Int,
+	expected_depth: Int,
+) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_ifs: Int = 0
+	var valid: Bool = True
+
+	while resolved_ifs < expected_depth and valid:
+		match current:
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				current = then_expr
+				resolved_ifs += 1
+			_:
+				valid = False
+
+	if not valid or resolved_ifs != expected_depth:
+		False
+	else:
+		match current:
+			VarExpr(variable, typ, loc):
+				variable.name == global_name and variable.def_id == Some(global_id)
+			_:
+				False
+
+
+pure func test_deep_sequence_callable_resolution_is_stack_bounded() -> Bool:
+	depth: Int = 1024
+	callable_id: Int = 141
+	input: CoreProgram = program([
+		function_decl("helper", callable_id, int_literal(42)),
+		function_decl(
+			"main",
+			142,
+			deep_sequence(
+				selected_call("helper", callable_id),
+				depth,
+			),
+		),
+	])
+	resolved: CoreProgram = resolve_callable_id_calls(input)
+
+	match function_body(resolved, "main"):
+		Some(body):
+			deep_sequence_call_is_resolved(body, callable_id, depth)
+		None:
+			False
+
+
+pure func test_deep_call_callable_resolution_avoids_generic_mapper_frames() -> Bool:
+	depth: Int = 80
+	callable_id: Int = 143
+	input: CoreProgram = program([
+		function_decl("helper", callable_id, int_literal(42)),
+		function_decl(
+			"main",
+			144,
+			deep_selected_call("helper", callable_id, depth),
+		),
+	])
+	resolved: CoreProgram = resolve_callable_id_calls(input)
+
+	match function_body(resolved, "main"):
+		Some(body):
+			deep_call_is_resolved(body, callable_id, depth)
+		None:
+			False
+
+
+pure func test_deep_global_resolution_spines_are_stack_bounded() -> Bool:
+	sequence_depth: Int = 1024
+	branch_depth: Int = 80
+	global_name: String = "answer"
+	global_id: Int = 145
+	callable_id: Int = 146
+	input: CoreProgram = program([
+		global_decl(global_name, global_id, int_literal(42)),
+		function_decl("helper", callable_id, int_literal(42)),
+		function_decl(
+			"main",
+			147,
+			TupleExpr(
+				[
+					deep_sequence(var_expr(global_name), sequence_depth),
+					nested_selected_calls(
+						var_expr(global_name),
+						"helper",
+						callable_id,
+						branch_depth,
+					),
+					nested_ifs(var_expr(global_name), branch_depth),
+				],
+				TupleType([int_type(), int_type(), int_type()]),
+				SyntheticSourceLoc,
+			),
+		),
+	])
+	resolved: CoreProgram = resolve_global_value_refs(input)
+
+	match function_body(resolved, "main"):
+		Some(TupleExpr(items, typ, loc)):
+			match (items.get(0), items.get(1), items.get(2)):
+				(Some(sequence), Some(calls), Some(branches)):
+					(
+						deep_sequence_global_is_resolved(
+							sequence,
+							global_name,
+							global_id,
+							sequence_depth,
+						)
+						and deep_call_global_is_resolved(
+							calls,
+							global_name,
+							global_id,
+							callable_id,
+							branch_depth,
+						)
+						and deep_if_global_is_resolved(
+							branches,
+							global_name,
+							global_id,
+							branch_depth,
+						)
+					)
+				_:
+					False
+		_:
+			False
 
 
 pure func test_resolves_unique_selected_direct_call() -> Bool:
@@ -1693,6 +2024,18 @@ tests: TestSuite = {
 		(
 			"context traversal matches plain traversal",
 			test_context_traversal_matches_plain_traversal,
+		),
+		(
+			"deep sequence callable resolution is stack bounded",
+			test_deep_sequence_callable_resolution_is_stack_bounded,
+		),
+		(
+			"deep call resolution avoids generic mapper frames",
+			test_deep_call_callable_resolution_avoids_generic_mapper_frames,
+		),
+		(
+			"deep global resolution spines are stack bounded",
+			test_deep_global_resolution_spines_are_stack_bounded,
 		),
 		("resolves unique selected direct call", test_resolves_unique_selected_direct_call),
 		(

@@ -1,11 +1,15 @@
 import:
 	../src/stage_09_core/compiler_core_closure: convert_program
 	../src/stage_09_core/compiler_core_json:
+		CoreAccessor(RootAccessor),
 		CoreBinaryOp(AddOp),
 		CoreCallKind(UserCall),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopMoveResourceItem),
 		CoreConcurrentlyLoopMoveResourceItem,
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
+		CoreConstructorMatchTest(EnumConstructorTest),
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			BinaryExpr,
@@ -13,10 +17,13 @@ import:
 			ClosureCreateExpr,
 			ConcurrentExpr,
 			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
 			DetachExpr,
 			DropExpr,
 			LambdaExpr,
+			LetExpr,
 			LiteralExpr,
+			LogicalExpr,
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
@@ -26,7 +33,8 @@ import:
 		),
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp),
 		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(
@@ -53,8 +61,17 @@ import:
 	test: TestSuite
 
 
+DEEP_SEQUENCE_LENGTH: Int = 1024
+
+DEEP_CONTROL_FLOW_LENGTH: Int = 48
+
+
 pure func int_type() -> CoreType:
 	NamedType("Int", [])
+
+
+pure func bool_type() -> CoreType:
+	NamedType("Bool", [])
 
 
 pure func string_type() -> CoreType:
@@ -439,6 +456,234 @@ pure func resource_concurrent_loop_program() -> CoreProgram:
 	}
 
 
+pure func deep_sequence_program() -> CoreProgram:
+	captured: CoreParam = local_param("captured", int_type())
+	var body: CoreExpr = VoidExpr(VoidType, SyntheticSourceLoc)
+	var index: Int = 0
+
+	while index < DEEP_SEQUENCE_LENGTH:
+		item: CoreExpr = if index == 0:
+			CallExpr(
+				UserCall("consume", Some(49), [0]),
+				VarExpr(local_var("consume"), closure_type(), SyntheticSourceLoc),
+				[VarExpr(captured.name, int_type(), SyntheticSourceLoc)],
+				VoidType,
+				SyntheticSourceLoc,
+			)
+		else:
+			LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc)
+
+		body = SeqExpr(item, body)
+		index += 1
+
+	consume: CoreFunction = {
+		name = "consume",
+		source_module = None,
+		type_params = [],
+		params = [local_param("value", int_type())],
+		return_type = VoidType,
+		body = Some(VoidExpr(VoidType, SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 49,
+		loc = SyntheticSourceLoc
+	}
+
+	function: CoreFunction = {
+		name = "deep_sequence",
+		source_module = None,
+		type_params = [],
+		params = [captured],
+		return_type = VoidType,
+		body = Some(PreClosureDetachExpr({body = body}, VoidType, SyntheticSourceLoc)),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 50,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(consume), FunctionDecl(function)],
+		foreign_includes = []
+	}
+
+
+pure func has_deep_sequence_shape(expr: CoreExpr) -> Bool:
+	var current: CoreExpr = expr
+	var remaining: Int = DEEP_SEQUENCE_LENGTH
+	var valid: Bool = True
+
+	while valid and remaining > 0:
+		match current:
+			SeqExpr(first, second):
+				item_is_expected: Bool = if remaining == 1:
+					match first:
+						CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
+							name == "consume" and def_id == Some(49) and consumed_args == [0]
+						_:
+							False
+				else:
+					match first:
+						LiteralExpr(IntLiteral(value), typ, loc):
+							value == remaining - 1
+						_:
+							False
+
+				if item_is_expected:
+					current = second
+					remaining -= 1
+				else:
+					valid = False
+			_:
+				valid = False
+
+	if valid and remaining == 0:
+		match current:
+			VoidExpr(typ, loc):
+				True
+			_:
+				False
+	else:
+		False
+
+
+pure func test_deep_sequence_conversion_is_stack_bounded() -> Bool:
+	converted: CoreProgram = convert_program(deep_sequence_program())
+
+	match converted.decls:
+		[FunctionDecl(consume), FunctionDecl(function), FunctionDecl(task)]:
+			match (function.body, task.body, task.function_kind):
+				(Some(DetachExpr(detached, typ, loc)), Some(task_body), ClosureBodyFunction(abi)):
+					(
+						detached.task.function_name == task.name
+						and detached.task.def_id == task.def_id
+						and task.name == "_blorp_task_0"
+						and task.def_id == 51
+						and detached.task.captures.length() == 1
+						and detached.task.captures
+							.get(0)
+							.map(func(capture): capture.name)
+							.get_or("") == "captured"
+						and abi.task_abi
+						and has_deep_sequence_shape(task_body)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func deep_control_flow_program() -> CoreProgram:
+	var body: CoreExpr = VoidExpr(VoidType, SyntheticSourceLoc)
+	var index: Int = 0
+	subject: CoreVar = local_var("subject")
+	subject_type: CoreType = EnumType("Flag")
+
+	while index < DEEP_CONTROL_FLOW_LENGTH:
+		value: CoreVar = local_var("value")
+		logical: CoreExpr = LogicalExpr(
+			AndOp,
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(False), bool_type(), SyntheticSourceLoc),
+			bool_type(),
+			SyntheticSourceLoc,
+		)
+		body = ConstructorMatchExpr(
+			VarExpr(
+				subject,
+				subject_type,
+				SyntheticSourceLoc,
+			),
+			NoReleasePolicy,
+			[
+				{
+					constructor = "Value",
+					accessor = RootAccessor,
+					test = EnumConstructorTest("Value"),
+					bindings = [],
+					body = ConstructorMatchBodyExpr(
+						LetExpr(
+							value,
+							False,
+							bool_type(),
+							logical,
+							body,
+						),
+					)
+				},
+			],
+			ConstructorMatchFallbackFail,
+			VoidType,
+			SyntheticSourceLoc,
+		)
+		index += 1
+
+	function: CoreFunction = {
+		name = "deep_control_flow",
+		source_module = None,
+		type_params = [],
+		params = [local_param("subject", subject_type)],
+		return_type = VoidType,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 52,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(function)],
+		foreign_includes = []
+	}
+
+
+pure func has_deep_control_flow_shape(expr: CoreExpr) -> Bool:
+	var current: CoreExpr = expr
+	var remaining: Int = DEEP_CONTROL_FLOW_LENGTH
+	var valid: Bool = True
+
+	while valid and remaining > 0:
+		match current:
+			ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+				match cases:
+					[match_case]:
+						match match_case.body:
+							ConstructorMatchBodyExpr(LetExpr(variable, is_mutable, var_type, rhs, body)):
+								match rhs:
+									LogicalExpr(AndOp, left, right, logical_type, logical_loc):
+										current = body
+										remaining -= 1
+									_:
+										valid = False
+							_:
+								valid = False
+					_:
+						valid = False
+			_:
+				valid = False
+
+	if valid and remaining == 0:
+		match current:
+			VoidExpr(typ, loc):
+				True
+			_:
+				False
+	else:
+		False
+
+
+pure func test_deep_control_flow_conversion_is_stack_bounded() -> Bool:
+	converted: CoreProgram = convert_program(deep_control_flow_program())
+
+	match converted.decls:
+		[FunctionDecl(function)]:
+			function.body
+				.map(has_deep_control_flow_shape)
+				.get_or(False)
+		_:
+			False
+
+
 pure func test_lambda_is_hoisted_to_closure_body() -> Bool:
 	converted: CoreProgram = convert_program(lambda_program())
 
@@ -668,6 +913,14 @@ tests: TestSuite = {
 		(
 			"pre-closure resource loop captures moved item, not resolved callee alias",
 			test_pre_closure_resource_loop_captures_moved_item_not_callee_alias,
+		),
+		(
+			"deep sequence conversion is stack bounded",
+			test_deep_sequence_conversion_is_stack_bounded,
+		),
+		(
+			"deep control flow conversion is stack bounded",
+			test_deep_control_flow_conversion_is_stack_bounded,
 		),
 	]
 }
