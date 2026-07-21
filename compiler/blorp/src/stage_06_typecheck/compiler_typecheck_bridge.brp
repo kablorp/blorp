@@ -21,11 +21,31 @@ import:
 			UnionParsedDecl,
 			VarParsedDecl,
 		),
+		ParsedDictEntry,
+		ParsedExpr(
+			ParsedAscriptionExpr,
+			ParsedBinaryExpr,
+			ParsedBlockExpr,
+			ParsedBoolLiteralExpr,
+			ParsedCharLiteralExpr,
+			ParsedDictExpr,
+			ParsedFloatLiteralExpr,
+			ParsedIfExpr,
+			ParsedIntLiteralExpr,
+			ParsedListExpr,
+			ParsedLogicalExpr,
+			ParsedRecordExpr,
+			ParsedStringLiteralExpr,
+			ParsedTupleExpr,
+			ParsedUnaryExpr,
+			ParsedVectorExpr,
+		),
 		ParsedForeignFunctionDecl,
 		ParsedFunctionDecl,
 		ParsedImportDecl,
 		ParsedProgram,
 		ParsedProgramPhase(TypecheckSourceProgram),
+		ParsedRecordExprField,
 		parsed_program_phase_name,
 	../stage_03_parse/compiler_parser: parse_compiler_source
 	../stage_03_parse/compiler_source_ast_finalize: finalize_typecheck_source_program
@@ -917,6 +937,83 @@ private pure func parsed_program_has_ctfe_globals(program: ParsedProgram) -> Boo
 	program.decls.any(parsed_decl_has_ctfe_global)
 
 
+-- Closed initializer trees can be evaluated without constructing contexts for
+-- imported programs. Unknown or name-bearing forms remain conservative so
+-- this proof cannot mistake a local-looking name for an imported dependency.
+private pure func parsed_expr_is_import_independent_ctfe_initializer(expr: ParsedExpr) -> Bool:
+	match expr:
+		ParsedIntLiteralExpr(_, _):
+			True
+		ParsedFloatLiteralExpr(_, _):
+			True
+		ParsedStringLiteralExpr(_, _, _):
+			True
+		ParsedBoolLiteralExpr(_, _):
+			True
+		ParsedCharLiteralExpr(_, _):
+			True
+		ParsedUnaryExpr(_, value, _):
+			parsed_expr_is_import_independent_ctfe_initializer(value)
+		ParsedBinaryExpr(_, left, right, _):
+			(
+				parsed_expr_is_import_independent_ctfe_initializer(left)
+				and parsed_expr_is_import_independent_ctfe_initializer(right)
+			)
+		ParsedLogicalExpr(_, left, right, _):
+			(
+				parsed_expr_is_import_independent_ctfe_initializer(left)
+				and parsed_expr_is_import_independent_ctfe_initializer(right)
+			)
+		ParsedAscriptionExpr(value, _, _):
+			parsed_expr_is_import_independent_ctfe_initializer(value)
+		ParsedListExpr(items, _):
+			items.all(parsed_expr_is_import_independent_ctfe_initializer)
+		ParsedTupleExpr(items, _):
+			items.all(parsed_expr_is_import_independent_ctfe_initializer)
+		ParsedRecordExpr(fields, _):
+			fields.all(func(field: ParsedRecordExprField):
+				parsed_expr_is_import_independent_ctfe_initializer(field.value)
+			)
+		ParsedDictExpr(entries, _):
+			entries.all(func(entry: ParsedDictEntry):
+				(
+					parsed_expr_is_import_independent_ctfe_initializer(entry.key)
+					and parsed_expr_is_import_independent_ctfe_initializer(entry.value)
+				)
+			)
+		ParsedVectorExpr(items, _):
+			items.all(parsed_expr_is_import_independent_ctfe_initializer)
+		ParsedBlockExpr(items, _):
+			items.all(parsed_expr_is_import_independent_ctfe_initializer)
+		ParsedIfExpr(condition, then_expr, else_expr, _):
+			(
+				parsed_expr_is_import_independent_ctfe_initializer(condition)
+				and parsed_expr_is_import_independent_ctfe_initializer(then_expr)
+				and else_expr
+					.map(parsed_expr_is_import_independent_ctfe_initializer)
+					.get_or(True)
+			)
+		_:
+			False
+
+
+private pure func parsed_decl_has_ctfe_global_requiring_imports(decl: ParsedDecl) -> Bool:
+	match decl:
+		VarParsedDecl(var_decl):
+			(
+				not var_decl.is_mutable
+				and not parsed_expr_is_import_independent_ctfe_initializer(var_decl.value)
+			)
+		PrivateParsedDecl(inner, _):
+			parsed_decl_has_ctfe_global_requiring_imports(inner)
+		_:
+			False
+
+
+private pure func parsed_program_has_ctfe_globals_requiring_imports(program: ParsedProgram) -> Bool:
+	program.decls.any(parsed_decl_has_ctfe_global_requiring_imports)
+
+
 private pure func importable_modules_except_path(
 	modules: List[CompilerImportableModule],
 	module_path: String,
@@ -1001,7 +1098,7 @@ private pure func append_ctfe_dependencies_for_artifact(
 ) -> CtfeDependencyOrder:
 	var result = order
 
-	if parsed_program_has_ctfe_globals(artifact.program):
+	if parsed_program_has_ctfe_globals_requiring_imports(artifact.program):
 		for dependency in direct_ctfe_dependencies_for_artifact(artifact, modules):
 			result = append_ctfe_dependency_tree(result, dependency, modules)
 

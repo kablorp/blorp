@@ -2,7 +2,7 @@
 
 Status: active implementation plan; Slices 0-4 completed as of 2026-07-20.
 
-Last checked against `dogfood-3` based on `f9250351` on 2026-07-20.
+Last checked against `dogfood-3` after `feb3ac29` on 2026-07-20.
 
 This document records the primary cause of the current self-hosted compiler
 memory blow-up and defines the implementation sequence for correcting it. It is
@@ -1291,10 +1291,38 @@ and no swaps. That headline maximum is effectively unchanged from the prior
 single process. This slice instead removes the serialized-response overlap at
 the constrained typecheck phase.
 
-The next typecheck-specific memory target is helper-side artifact projection:
-one module can temporarily coexist as a typed program, a recursive `JsonValue`
-tree, and its serialized string. That requires separate profiling and a direct
-JSON-emission design; it is not hidden inside this transport slice.
+Follow-up profiling rejected helper-side artifact projection as the immediate
+typecheck target. A direct JSON-emission experiment still died with zero output
+bytes, proving the peak preceded artifact projection and serialization.
+Temporary stage probes then localized the failure to graph-wide CTFE dependency
+preparation. Under an 8 GB `linux/arm64` Docker limit, the helper attempted to
+prepare 129 typed dependency programs and was killed while adding dependency 63,
+`compiler_core_reuse`. The killed helper had about 7.02 GB anonymous RSS and the
+container had peaked at 7,687,340,032 bytes. No typechecked artifact had been
+emitted.
+
+The graph builder treated every explicit import as a CTFE dependency whenever a
+module contained any immutable global. That made a literal such as
+`DEFAULT_WIDTH: Int = 100` retain the module's entire typed import closure even
+though evaluating it cannot consult imported functions or values. It also made
+an unused broken import incorrectly prevent an otherwise closed global from
+being evaluated.
+
+The graph now proves a deliberately narrow set of parsed initializer trees to
+be import-independent: primitive literals and recursively closed operators,
+ascriptions, lists, tuples, records, dictionaries, vectors, blocks, and
+conditionals. Unknown, name-bearing, and call-bearing expressions retain the
+existing conservative dependency closure. A regression verifies that closed
+literal, list, and binary initializers evaluate successfully despite an unused
+import whose function body does not typecheck.
+
+With that change, the same constrained build completed typecheck and entered the
+renderer helper. The renderer was then killed at about 7.02 GB anonymous RSS;
+the container peak was 7,681,785,856 bytes. The complete 8 GB build therefore
+remains red, but the failure moved across a process boundary to the late backend.
+The next measured memory slice belongs there. Direct JSON emission remains a
+possible later optimization only after a profile shows projection or
+serialization at the live peak.
 
 ### Core JSON duplication
 
