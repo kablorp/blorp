@@ -1925,11 +1925,6 @@ let rec waitpid_retry pid =
   try snd (Unix.waitpid [] pid)
   with Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_retry pid
 
-let exit_code_of_status = function
-  | Unix.WEXITED code -> code
-  | Unix.WSIGNALED signal -> 128 + signal
-  | Unix.WSTOPPED _ -> 128
-
 let rec remove_path_noerr path =
   try
     match (Unix.lstat path).Unix.st_kind with
@@ -2121,7 +2116,7 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       let status = waitpid_retry pid in
       let stderr_output = read_file_if_exists stderr_path in
       (try Sys.remove stderr_path with _ -> ());
-      (exit_code_of_status status, output, stderr_output)
+      (Process_status.exit_code status, output, stderr_output)
 
 type completed_file_process = {
   process_exit_code : int;
@@ -2181,7 +2176,7 @@ let with_process_stdout_file ?(env = []) ?(unset_env = []) prog args consume =
           let stderr_output = read_file_excerpt_if_exists stderr_path in
           consume
             {
-              process_exit_code = exit_code_of_status status;
+              process_exit_code = Process_status.exit_code status;
               process_stdout_path = stdout_path;
               process_stdout_bytes = stdout_bytes;
               process_stderr_output = stderr_output;

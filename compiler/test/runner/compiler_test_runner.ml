@@ -717,11 +717,6 @@ let parse_worker_result output =
           | Some passed, Some failed, Some total -> Some (passed, failed, total)
           | _ -> None))
 
-let exit_code_of_status = function
-  | Unix.WEXITED code -> code
-  | Unix.WSIGNALED signal -> 128 + signal
-  | Unix.WSTOPPED _ -> 128
-
 let terminate_worker_pids pids =
   List.iter
     (fun pid -> try Unix.kill pid Sys.sigterm with _ -> ())
@@ -731,7 +726,7 @@ let install_worker_signal_cleanup active_worker_pids =
   let terminate_workers () = terminate_worker_pids !active_worker_pids in
   let handle signal =
     terminate_workers ();
-    exit (128 + signal)
+    exit (Process_status.exit_code_of_signal signal)
   in
   let previous_int =
     Sys.signal Sys.sigint (Sys.Signal_handle (fun _ -> handle Sys.sigint))
@@ -815,7 +810,7 @@ let run_cases_parallel opts cases =
                   failed := !failed + worker_failed;
                   total := !total + worker_total
               | None ->
-                  let code = exit_code_of_status status in
+                  let code = Process_status.exit_code status in
                   emit_fail "runner"
                     (Printf.sprintf "worker-%d" pid)
                     [

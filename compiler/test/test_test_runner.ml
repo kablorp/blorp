@@ -122,6 +122,22 @@ let test_capture_timeout_sends_sigterm_before_sigkill () =
   in
   Alcotest.(check bool) "SIGTERM handler output" true saw_term_line
 
+let test_capture_signal_uses_shell_exit_code () =
+  Alcotest.(check int)
+    "normal exit code" 7
+    (Blorp.Process_status.exit_code (Unix.WEXITED 7));
+  Alcotest.(check int)
+    "stopped SIGTERM exit code" 143
+    (Blorp.Process_status.exit_code (Unix.WSTOPPED Sys.sigterm));
+  Alcotest.(check int)
+    "SIGINT exit code" 130
+    (Blorp.Process_status.exit_code_of_signal Sys.sigint);
+  let code, _ =
+    Blorp.Test_runner.run_process_capture_timeout ~timeout:None "/bin/sh"
+      [ "-c"; "kill -SEGV $$" ]
+  in
+  Alcotest.(check int) "SIGSEGV exit code" 139 code
+
 let test_capture_timeout_progress_marker_resets_deadline () =
   let code, output =
     Blorp.Test_runner.run_process_capture_timeout
@@ -433,10 +449,7 @@ let test_compilation_dirs_are_fork_safe () =
       in
       let child_status (pid, read_fd) =
         let dir = read_dir read_fd in
-        match snd (Unix.waitpid [] pid) with
-        | Unix.WEXITED code -> (code, dir)
-        | Unix.WSIGNALED signal -> (128 + signal, dir)
-        | Unix.WSTOPPED signal -> (128 + signal, dir)
+        (Blorp.Process_status.exit_code (snd (Unix.waitpid [] pid)), dir)
       in
       let first_code, first_dir = child_status first in
       let second_code, second_dir = child_status second in
@@ -1265,6 +1278,8 @@ let suite =
           test_capture_timeout_does_not_wait_for_inherited_pipe;
         Alcotest.test_case "capture_timeout_sigterm_before_sigkill" `Quick
           test_capture_timeout_sends_sigterm_before_sigkill;
+        Alcotest.test_case "capture_signal_shell_exit_code" `Quick
+          test_capture_signal_uses_shell_exit_code;
         Alcotest.test_case "capture_timeout_progress_marker" `Quick
           test_capture_timeout_progress_marker_resets_deadline;
         Alcotest.test_case "capture_timeout_ignores_other_output" `Quick
