@@ -1,11 +1,14 @@
--- Resolve typed callable identities after lowering has assembled a Core program.
+-- Resolve typed callable and global value identities after lowering has
+-- assembled a Core program.
 --
--- This slice resolves only calls carrying callable ids. Name-based UnknownCall
--- resolution needs module, builtin, foreign, and bound-local registries;
--- guessing before those registries exist would misclassify calls.
+-- Callable resolution only changes calls carrying ids. Name-based UnknownCall
+-- resolution still needs module, builtin, foreign, and bound-local registries.
+-- Global value resolution repairs unresolved references only when one indexed
+-- declaration identity is valid and no lexical binding shadows its name.
 import:
 	compiler_core_json:
 		CoreCallKind(SelectedDirectCall, UnknownCall, UserCall),
+		CoreConcurrentBinding,
 		CoreDecl(
 			EnumDecl,
 			FunctionDecl,
@@ -17,17 +20,868 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreExpr(CallExpr, VarExpr),
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DropExpr,
+			DupExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LengthMatchExpr,
+			LetExpr,
+			ListHandoffExpr,
+			LiteralMatchExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecLoopExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			VarExpr,
+		),
 		CoreFunction,
 		CoreGlobal,
+		CoreMatchBinding,
+		CoreParam,
+		CorePreClosureConcurrentBinding,
 		CoreProgram,
-	compiler_core_traverse: map_core_expr_children
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc,
+		CoreType,
+		CoreVar,
+	compiler_core_traverse:
+		map_core_expr_children,
+		map_core_expr_children_with_context,
+		map_core_exprs_with_context,
+		map_core_match_results_with_context,
+		map_core_sequence_items,
+		map_core_sequence_items_with_context,
 
 
 private record CoreCallableIdentity {
 	name: String,
 	def_id: Int
 }
+
+
+private union CoreGlobalValueResolution:
+	ResolvableGlobalValue(Int)
+	AmbiguousGlobalValue
+
+
+private record CoreGlobalValueResolveContext {
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String]
+}
+
+
+private pure func record_global_value_resolution(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	global: CoreGlobal,
+) -> Dict[String, CoreGlobalValueResolution]:
+	name: String = global.name.name
+
+	match resolutions.get(name):
+		None:
+			resolutions.set(name, ResolvableGlobalValue(global.def_id))
+		Some(ResolvableGlobalValue(existing_def_id)):
+			if existing_def_id == global.def_id:
+				resolutions
+			else:
+				resolutions.set(name, AmbiguousGlobalValue)
+		Some(AmbiguousGlobalValue):
+			resolutions
+
+
+private pure func program_global_value_resolutions(
+	program: CoreProgram,
+) -> Dict[String, CoreGlobalValueResolution]:
+	var resolutions: Dict[String, CoreGlobalValueResolution] = {}
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(global):
+				resolutions = record_global_value_resolution(resolutions, global)
+			_:
+				void
+
+	resolutions
+
+
+private pure func scope_with_var(scope: List[String], variable: CoreVar) -> List[String]:
+	scope.append(variable.name)
+
+
+private pure func scope_with_params(scope: List[String], params: List[CoreParam]) -> List[String]:
+	var result: List[String] = scope
+
+	for param in params:
+		result = scope_with_var(result, param.name)
+
+	result
+
+
+private pure func scope_with_match_bindings(
+	scope: List[String],
+	bindings: List[CoreMatchBinding],
+) -> List[String]:
+	var result: List[String] = scope
+
+	for binding in bindings:
+		result = scope_with_var(result, binding.variable)
+
+	result
+
+
+private pure func copy_scope(scope: List[String]) -> List[String]:
+	scope.map(pure func(name): name)
+
+
+private pure func resolve_global_value_var(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	variable: CoreVar,
+) -> CoreVar:
+	if variable.def_id.is_some() or scope.contains(variable.name):
+		variable
+	else:
+		match resolutions.get(variable.name):
+			Some(ResolvableGlobalValue(def_id)):
+				{ variable | def_id = Some(def_id) }
+			_:
+				variable
+
+
+private pure func resolve_global_value_select_arm(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			{ arm |
+				kind = SelectRecvArm(
+					{ recv |
+						channel = resolve_global_value_expr(
+							resolutions,
+							copy_scope(scope),
+							recv.channel,
+						)
+					},
+				),
+				body = resolve_global_value_expr(
+					resolutions,
+					scope_with_var(copy_scope(scope), recv.binder),
+					arm.body,
+				)
+			}
+		SelectSealedArm(channel):
+			{ arm |
+				kind = SelectSealedArm(
+					resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						channel,
+					),
+				),
+				body = resolve_global_value_expr(resolutions, copy_scope(scope), arm.body)
+			}
+		SelectAfterArm(timeout):
+			{ arm |
+				kind = SelectAfterArm(
+					resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						timeout,
+					),
+				),
+				body = resolve_global_value_expr(resolutions, copy_scope(scope), arm.body)
+			}
+
+
+private pure func resolve_global_value_optional_expr(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	value: Option[CoreExpr],
+) -> Option[CoreExpr]:
+	match value:
+		Some(expr):
+			Some(resolve_global_value_expr(resolutions, copy_scope(scope), expr))
+		None:
+			None
+
+
+private pure func resolve_global_value_pre_closure_concurrent_bindings(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> List[CorePreClosureConcurrentBinding]:
+	var resolved: List[CorePreClosureConcurrentBinding] = []
+
+	for binding in bindings:
+		resolved = resolved.append(
+			{ binding |
+				rhs = resolve_global_value_expr(resolutions, copy_scope(scope), binding.rhs)
+			},
+		)
+
+	resolved
+
+
+private pure func resolve_global_value_concurrent_bindings(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	bindings: List[CoreConcurrentBinding],
+) -> List[CoreConcurrentBinding]:
+	var resolved: List[CoreConcurrentBinding] = []
+
+	for binding in bindings:
+		resolved = resolved.append(
+			{ binding |
+				rhs = resolve_global_value_expr(resolutions, copy_scope(scope), binding.rhs)
+			},
+		)
+
+	resolved
+
+
+private pure func resolve_global_value_select_arms(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	arms: List[CoreSelectArm],
+) -> List[CoreSelectArm]:
+	var resolved: List[CoreSelectArm] = []
+
+	for arm in arms:
+		resolved = resolved.append(
+			resolve_global_value_select_arm(
+				resolutions,
+				copy_scope(scope),
+				arm,
+			),
+		)
+
+	resolved
+
+
+private pure func resolve_global_value_child(
+	context: CoreGlobalValueResolveContext,
+	child: CoreExpr,
+) -> CoreExpr:
+	resolve_global_value_expr(context.resolutions, copy_scope(context.scope), child)
+
+
+private pure func resolve_global_value_match_result(
+	context: CoreGlobalValueResolveContext,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	resolve_global_value_expr(
+		context.resolutions,
+		scope_with_match_bindings(copy_scope(context.scope), bindings),
+		body,
+	)
+
+
+-- Keep an owning record shell alive across each recursive edge. The pinned
+-- bootstrap can otherwise pass managed fields as borrowed values and release
+-- a newly extended scope while a sibling child still uses it. Pass an
+-- independent list into the recursive dispatcher because that bootstrap also
+-- consumes one reference from the scope argument while compiling the large
+-- non-spine match. Calls and right-associated sequences stay in this small
+-- dispatcher so their depth does not multiply that match's generated-C frame.
+private pure func resolve_global_value_expr(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			map_core_sequence_items_with_context(
+				expr,
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_child,
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			resolved_args: List[CoreExpr] = map_core_exprs_with_context(
+				args,
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_child,
+			)
+			resolved_callee: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				callee,
+			)
+			CallExpr(kind, resolved_callee, resolved_args, typ, loc)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			resolved_cond: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				cond,
+			)
+			resolved_then: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				then_expr,
+			)
+			resolved_else: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				else_expr,
+			)
+			IfExpr(resolved_cond, resolved_then, resolved_else, typ, loc)
+		_:
+			context: CoreGlobalValueResolveContext = {
+				resolutions = resolutions,
+				scope = copy_scope(scope)
+			}
+			resolve_global_value_expr_inner(
+				context.resolutions,
+				copy_scope(context.scope),
+				expr,
+			)
+
+
+private pure func resolve_global_value_expr_inner(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				resolve_global_value_var(resolutions, copy_scope(scope), variable),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				resolve_global_value_var(resolutions, copy_scope(scope), variable),
+				resolve_global_value_expr(resolutions, copy_scope(scope), rhs),
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				resolve_global_value_var(resolutions, copy_scope(scope), variable),
+				value_type,
+				retain_policy,
+				resolve_global_value_expr(resolutions, copy_scope(scope), body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				resolve_global_value_var(resolutions, copy_scope(scope), variable),
+				value_type,
+				release_policy,
+				resolve_global_value_expr(resolutions, copy_scope(scope), body),
+				typ,
+				loc,
+			)
+		TensorRawReadExpr(read, typ, loc):
+			TensorRawReadExpr(
+				{ read |
+					view = resolve_global_value_var(resolutions, copy_scope(scope), read.view),
+					index = resolve_global_value_expr(resolutions, copy_scope(scope), read.index)
+				},
+				typ,
+				loc,
+			)
+		TensorRawWriteExpr(write, typ, loc):
+			TensorRawWriteExpr(
+				{ write |
+					view = resolve_global_value_var(resolutions, copy_scope(scope), write.view),
+					index = resolve_global_value_expr(resolutions, copy_scope(scope), write.index),
+					value = resolve_global_value_expr(resolutions, copy_scope(scope), write.value)
+				},
+				typ,
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				resolve_global_value_expr(resolutions, copy_scope(scope), rhs),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(copy_scope(scope), variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				resolve_global_value_expr(resolutions, copy_scope(scope), rhs),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(copy_scope(scope), variable),
+					body,
+				),
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			LambdaExpr(
+				params,
+				return_type,
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_params(copy_scope(scope), params),
+					body,
+				),
+				is_pure,
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				{ binding |
+					source = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						binding.source,
+					)
+				},
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(copy_scope(scope), binding.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			body_scope: List[String] = scope_with_var(
+				scope_with_var(
+					scope_with_var(
+						scope_with_var(copy_scope(scope), handoff.source_var),
+						handoff.result_var,
+					),
+					handoff.len_var,
+				),
+				handoff.out_var,
+			)
+			ListHandoffExpr(
+				{ handoff |
+					source = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						handoff.source,
+					),
+					capacity = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						handoff.capacity,
+					),
+					body = resolve_global_value_expr(resolutions, body_scope, handoff.body)
+				},
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(resource_scope, typ, loc):
+			body_scope: List[String] = scope_with_var(copy_scope(scope), resource_scope.variable)
+			ResourceScopeExpr(
+				{ resource_scope |
+					acquire = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						resource_scope.acquire,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						copy_scope(body_scope),
+						resource_scope.body,
+					),
+					cleanup = resolve_global_value_expr(
+						resolutions,
+						copy_scope(body_scope),
+						resource_scope.cleanup,
+					)
+				},
+				typ,
+				loc,
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			TailrecLoopExpr(
+				params,
+				return_type,
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_params(copy_scope(scope), params),
+					body,
+				),
+				loc,
+			)
+		TailrecListSpreadLoopExpr(loop, loc):
+			body_scope: List[String] = scope_with_var(
+				scope_with_params(
+					scope_with_params(copy_scope(scope), loop.params),
+					[loop.list_param],
+				),
+				loop.cursor,
+			)
+			TailrecListSpreadLoopExpr(
+				{ loop | body = resolve_global_value_expr(resolutions, body_scope, loop.body) },
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				resolve_global_value_expr(resolutions, copy_scope(scope), start),
+				resolve_global_value_expr(resolutions, copy_scope(scope), end_value),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(copy_scope(scope), binder.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.variable),
+						loop.body,
+					),
+					timeout = resolve_global_value_optional_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.timeout,
+					),
+					limit = resolve_global_value_expr(resolutions, copy_scope(scope), loop.limit)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			ConcurrentlyLoopExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.iterable,
+					),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(copy_scope(scope), loop.variable),
+						loop.body,
+					),
+					timeout = resolve_global_value_optional_expr(
+						resolutions,
+						copy_scope(scope),
+						loop.timeout,
+					),
+					limit = resolve_global_value_expr(resolutions, copy_scope(scope), loop.limit)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			var body_scope: List[String] = copy_scope(scope)
+
+			for binding in block.bindings:
+				body_scope = scope_with_var(body_scope, binding.variable)
+
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = resolve_global_value_pre_closure_concurrent_bindings(
+						resolutions,
+						copy_scope(scope),
+						block.bindings,
+					),
+					body = resolve_global_value_expr(resolutions, body_scope, block.body),
+					timeout = resolve_global_value_optional_expr(
+						resolutions,
+						copy_scope(scope),
+						block.timeout,
+					)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentExpr(block, typ, loc):
+			var body_scope: List[String] = copy_scope(scope)
+
+			for binding in block.bindings:
+				body_scope = scope_with_var(body_scope, binding.variable)
+
+			ConcurrentExpr(
+				{ block |
+					bindings = resolve_global_value_concurrent_bindings(
+						resolutions,
+						copy_scope(scope),
+						block.bindings,
+					),
+					body = resolve_global_value_expr(resolutions, body_scope, block.body),
+					timeout = resolve_global_value_optional_expr(
+						resolutions,
+						copy_scope(scope),
+						block.timeout,
+					)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(select_expr, typ, loc):
+			SelectExpr(
+				{ select_expr |
+					arms = resolve_global_value_select_arms(
+						resolutions,
+						copy_scope(scope),
+						select_expr.arms,
+					)
+				},
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			map_core_match_results_with_context(
+				LiteralMatchExpr(
+					resolve_global_value_expr(resolutions, copy_scope(scope), scrutinee),
+					cases,
+					fallback,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_match_result,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			map_core_match_results_with_context(
+				AccessorLiteralMatchExpr(
+					resolve_global_value_expr(resolutions, copy_scope(scope), scrutinee),
+					release_policy,
+					match_expr,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_match_result,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			map_core_match_results_with_context(
+				LengthMatchExpr(
+					resolve_global_value_expr(resolutions, copy_scope(scope), scrutinee),
+					release_policy,
+					match_expr,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_match_result,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			map_core_match_results_with_context(
+				ConstructorMatchExpr(
+					resolve_global_value_expr(resolutions, copy_scope(scope), scrutinee),
+					release_policy,
+					cases,
+					fallback,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_match_result,
+			)
+		_:
+			map_core_expr_children_with_context(
+				expr,
+				{
+					resolutions = resolutions,
+					scope = copy_scope(scope)
+				},
+				resolve_global_value_child,
+			)
 
 
 -- Def ids are module-local. Qualified name plus id is the callable identity;
@@ -73,40 +927,68 @@ private pure func call_id_agrees_with_callee(
 			False
 
 
+private pure func resolved_callable_kind(
+	callables: List[CoreCallableIdentity],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+) -> CoreCallKind:
+	match callee:
+		VarExpr(variable, _, _):
+			match call_selected_id(kind, variable.def_id):
+				Some(def_id):
+					if call_id_agrees_with_callee(kind, variable.def_id, def_id):
+						if callable_identity_exists(callables, variable.name, def_id):
+							UserCall(variable.name, Some(def_id), [])
+						else:
+							kind
+					else:
+						kind
+				None:
+					kind
+		_:
+			kind
+
+
+private pure func resolve_callable_id_call_expr(
+	callables: List[CoreCallableIdentity],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	resolved_kind: CoreCallKind = resolved_callable_kind(callables, kind, callee)
+	resolve_child: pure (CoreExpr) -> CoreExpr = pure func(child):
+		resolve_callable_id_expr(callables, child)
+	resolved_args: List[CoreExpr] = args.map(resolve_child)
+	resolved_callee: CoreExpr = resolve_child(callee)
+	CallExpr(resolved_kind, resolved_callee, resolved_args, typ, loc)
+
+
 private pure func resolve_callable_id_expr(
 	callables: List[CoreCallableIdentity],
 	expr: CoreExpr,
 ) -> CoreExpr:
-	resolved_children: CoreExpr = map_core_expr_children(
+	match expr:
+		SeqExpr(_, _):
+			map_core_sequence_items(
+				expr,
+				pure func(item): resolve_callable_id_expr(callables, item),
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			resolve_callable_id_call_expr(callables, kind, callee, args, typ, loc)
+		_:
+			resolve_callable_id_non_sequence_expr(callables, expr)
+
+
+private pure func resolve_callable_id_non_sequence_expr(
+	callables: List[CoreCallableIdentity],
+	expr: CoreExpr,
+) -> CoreExpr:
+	map_core_expr_children(
 		expr,
 		pure func(child): resolve_callable_id_expr(callables, child),
 	)
-
-	match resolved_children:
-		CallExpr(kind, callee, args, typ, loc):
-			match callee:
-				VarExpr(variable, _, _):
-					match call_selected_id(kind, variable.def_id):
-						Some(def_id):
-							if call_id_agrees_with_callee(kind, variable.def_id, def_id):
-								if callable_identity_exists(callables, variable.name, def_id):
-									CallExpr(
-										UserCall(variable.name, Some(def_id), []),
-										callee,
-										args,
-										typ,
-										loc,
-									)
-								else:
-									resolved_children
-							else:
-								resolved_children
-						None:
-							resolved_children
-				_:
-					resolved_children
-		_:
-			resolved_children
 
 
 private pure func program_callables(program: CoreProgram) -> List[CoreCallableIdentity]:
@@ -193,5 +1075,79 @@ pure func resolve_callable_id_calls(program: CoreProgram) -> CoreProgram:
 	callables: List[CoreCallableIdentity] = program_callables(program)
 	{
 		decls = program.decls.map(func(decl): resolve_decl(callables, decl)),
+		foreign_includes = program.foreign_includes.map(func(include): include)
+	}
+
+
+private pure func resolve_global_value_function(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	resolved_body: Option[CoreExpr] = match function_info.body:
+		Some(body):
+			Some(
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_params([], function_info.params),
+					body,
+				),
+			)
+		None:
+			None
+
+	{ function_info | body = resolved_body }
+
+
+private pure func resolve_global_value_global(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = resolve_global_value_expr(
+			resolutions,
+			scope_with_var([], global.name),
+			global.init,
+		) }
+
+
+private pure func resolve_global_value_functions(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	functions: List[CoreFunction],
+) -> List[CoreFunction]:
+	var resolved: List[CoreFunction] = []
+
+	for function_info in functions:
+		resolved = resolved.append(resolve_global_value_function(resolutions, function_info))
+
+	resolved
+
+
+private pure func resolve_global_value_decl(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(resolve_global_value_function(resolutions, function_info))
+		GlobalDecl(global):
+			GlobalDecl(resolve_global_value_global(resolutions, global))
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = resolve_global_value_functions(resolutions, impl_decl.methods)
+				},
+			)
+		_:
+			decl
+
+
+pure func resolve_global_value_refs(program: CoreProgram) -> CoreProgram:
+	resolutions: Dict[String, CoreGlobalValueResolution] = program_global_value_resolutions(program)
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(resolve_global_value_decl(resolutions, decl))
+
+	{
+		decls = decls,
 		foreign_includes = program.foreign_includes.map(func(include): include)
 	}

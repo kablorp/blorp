@@ -146,6 +146,7 @@ import:
 		CoreFunctionKind(ClosureBodyFunction, UserFunction, BuiltinFunction, ForeignFunction),
 		CoreGlobal,
 		CoreLiteralMatchCase,
+		CoreLogicalOp,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
 			LiteralMatchFallbackBody,
@@ -768,6 +769,21 @@ private pure func max_dict_literal_entries_def_id(
 	result
 
 
+private pure func max_sequence_def_id(current: Int, expr: CoreExpr) -> Int:
+	var result: Int = current
+	var final_item: CoreExpr = expr
+
+	while True:
+		match final_item:
+			SeqExpr(first, second):
+				result = max_expr_def_id(result, first)
+				final_item = second
+			_:
+				break
+
+	max_expr_def_id(result, final_item)
+
+
 private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -939,10 +955,7 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 			result = max_expr_def_id(result, rhs)
 			max_expr_def_id(result, body)
 		SeqExpr(first, second):
-			max_expr_def_id(
-				max_expr_def_id(current, first),
-				second,
-			)
+			max_sequence_def_id(current, expr)
 		WhileExpr(cond, body, typ, loc):
 			max_expr_def_id(
 				max_expr_def_id(current, cond),
@@ -1470,6 +1483,31 @@ private pure func free_vars_select_arms(
 	result
 
 
+private pure func free_vars_sequence(
+	state: ClosureState,
+	bound: List[String],
+	expr: CoreExpr,
+) -> List[FreeVar]:
+	var result: List[FreeVar] = []
+	var final_item: CoreExpr = expr
+
+	while True:
+		match final_item:
+			SeqExpr(first, second):
+				result = merge_free_vars(
+					result,
+					free_vars_expr(state, bound, first),
+				)
+				final_item = second
+			_:
+				break
+
+	merge_free_vars(
+		result,
+		free_vars_expr(state, bound, final_item),
+	)
+
+
 private pure func free_vars_expr(
 	state: ClosureState,
 	bound: List[String],
@@ -1746,10 +1784,7 @@ private pure func free_vars_expr(
 				),
 			)
 		SeqExpr(first, second):
-			merge_free_vars(
-				free_vars_expr(state, bound, first),
-				free_vars_expr(state, bound, second),
-			)
+			free_vars_sequence(state, bound, expr)
 		WhileExpr(cond, body, typ, loc):
 			merge_free_vars(
 				free_vars_expr(state, bound, cond),
@@ -2111,6 +2146,19 @@ pure func lambda_has_runtime_captures(
 	lambda_runtime_captures(function_names, constructor_names, params, body).length() > 0
 
 
+private pure func core_sequence_type(expr: CoreExpr) -> CoreType:
+	var final_item: CoreExpr = expr
+
+	while True:
+		match final_item:
+			SeqExpr(first, second):
+				final_item = second
+			_:
+				break
+
+	core_expr_type(final_item)
+
+
 private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -2214,7 +2262,7 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		BorrowLetExpr(name, typ, rhs, body):
 			core_expr_type(body)
 		SeqExpr(first, second):
-			core_expr_type(second)
+			core_sequence_type(expr)
 		WhileExpr(cond, body, typ, loc):
 			typ
 		BreakExpr(typ, loc):
@@ -3025,6 +3073,24 @@ private pure func concurrent_consumes_var(
 		expr_consumes_var(body, variable)
 
 
+private pure func sequence_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
+	var final_item: CoreExpr = expr
+	var found: Bool = False
+
+	while not found:
+		match final_item:
+			SeqExpr(first, second):
+				if expr_consumes_var(first, variable):
+					found = True
+				else:
+					final_item = second
+			_:
+				found = expr_consumes_var(final_item, variable)
+				break
+
+	found
+
+
 private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
@@ -3051,7 +3117,7 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			else:
 				expr_consumes_var(body, variable)
 		SeqExpr(first, second):
-			expr_consumes_var(first, variable) or expr_consumes_var(second, variable)
+			sequence_consumes_var(expr, variable)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			(
 				expr_consumes_var(cond, variable)
@@ -4119,7 +4185,332 @@ private pure func convert_select_arms(
 	}
 
 
+-- Core blocks are represented as right-associated SeqExpr chains. Convert the
+-- chain iteratively so large generated programs do not consume one native stack
+-- frame per statement. State remains threaded in source order because closure
+-- conversion can hoist declarations while visiting any sequence item.
+private pure func convert_sequence_expr(
+	state: ClosureState,
+	bound: List[String],
+	expr: CoreExpr,
+) -> ConvertedExpr:
+	var preceding_items: List[CoreExpr] = []
+	var final_item: CoreExpr = expr
+
+	while True:
+		match final_item:
+			SeqExpr(first, second):
+				preceding_items = preceding_items.append(first)
+				final_item = second
+			_:
+				break
+
+	var current: ClosureState = state
+	var converted_items: List[CoreExpr] = []
+
+	for item in preceding_items:
+		converted: ConvertedExpr = convert_expr(current, bound, item)
+		current = converted.state
+		converted_items = converted_items.append(converted.expr)
+
+	final_converted: ConvertedExpr = convert_expr(current, bound, final_item)
+	var converted_expr: CoreExpr = final_converted.expr
+	var index: Int = converted_items.length() - 1
+
+	while index >= 0:
+		match converted_items.get(index):
+			Some(item):
+				converted_expr = SeqExpr(item, converted_expr)
+			None:
+				void
+
+		index -= 1
+
+	{
+		state = final_converted.state,
+		expr = converted_expr
+	}
+
+
+private pure func convert_call_expr(
+	state: ClosureState,
+	bound: List[String],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	callee_converted: ConvertedExpr = convert_expr(state, bound, callee)
+	args_converted: ConvertedExprs = convert_exprs(callee_converted.state, bound, args)
+	{
+		state = args_converted.state,
+		expr = CallExpr(kind, callee_converted.expr, args_converted.exprs, typ, loc)
+	}
+
+
+private pure func convert_logical_expr(
+	state: ClosureState,
+	bound: List[String],
+	op: CoreLogicalOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	left_converted: ConvertedExpr = convert_expr(state, bound, left)
+	right_converted: ConvertedExpr = convert_expr(left_converted.state, bound, right)
+	{
+		state = right_converted.state,
+		expr = LogicalExpr(op, left_converted.expr, right_converted.expr, typ, loc)
+	}
+
+
+private pure func convert_let_expr(
+	state: ClosureState,
+	bound: List[String],
+	variable: CoreVar,
+	is_mutable: Bool,
+	var_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> ConvertedExpr:
+	rhs_converted: ConvertedExpr = convert_expr(state, copy_names(bound), rhs)
+	body_bound: List[String] = add_bound_var(copy_names(bound), variable)
+	body_converted: ConvertedExpr = convert_expr(rhs_converted.state, body_bound, body)
+	{
+		state = body_converted.state,
+		expr = LetExpr(
+			variable,
+			is_mutable,
+			var_type,
+			rhs_converted.expr,
+			body_converted.expr,
+		)
+	}
+
+
+private pure func convert_borrow_let_expr(
+	state: ClosureState,
+	bound: List[String],
+	variable: CoreVar,
+	var_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> ConvertedExpr:
+	rhs_converted: ConvertedExpr = convert_expr(state, copy_names(bound), rhs)
+	body_bound: List[String] = add_bound_var(copy_names(bound), variable)
+	body_converted: ConvertedExpr = convert_expr(rhs_converted.state, body_bound, body)
+	{
+		state = body_converted.state,
+		expr = BorrowLetExpr(variable, var_type, rhs_converted.expr, body_converted.expr)
+	}
+
+
+private pure func convert_literal_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	cases_converted: ConvertedLiteralMatchCases = convert_literal_match_cases(
+		scrutinee_converted.state,
+		bound,
+		cases,
+	)
+	fallback_converted: ConvertedLiteralMatchFallback = convert_literal_match_fallback(
+		cases_converted.state,
+		bound,
+		fallback,
+	)
+	{
+		state = fallback_converted.state,
+		expr = LiteralMatchExpr(
+			scrutinee_converted.expr,
+			cases_converted.cases,
+			fallback_converted.fallback,
+			typ,
+			loc,
+		)
+	}
+
+
+private pure func convert_accessor_literal_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	match_expr: CoreConstructorLiteralMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	match_converted: ConvertedConstructorLiteralMatch = convert_constructor_literal_match(
+		scrutinee_converted.state,
+		bound,
+		match_expr,
+	)
+	{
+		state = match_converted.state,
+		expr = AccessorLiteralMatchExpr(
+			scrutinee_converted.expr,
+			release_policy,
+			match_converted.match_expr,
+			typ,
+			loc,
+		)
+	}
+
+
+private pure func convert_length_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	match_expr: CoreConstructorLengthMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	match_converted: ConvertedConstructorLengthMatch = convert_constructor_length_match(
+		scrutinee_converted.state,
+		bound,
+		match_expr,
+	)
+	{
+		state = match_converted.state,
+		expr = LengthMatchExpr(
+			scrutinee_converted.expr,
+			release_policy,
+			match_converted.match_expr,
+			typ,
+			loc,
+		)
+	}
+
+
+private pure func convert_constructor_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	cases_converted: ConvertedConstructorMatchCases = convert_constructor_match_cases(
+		scrutinee_converted.state,
+		bound,
+		cases,
+	)
+	fallback_converted: ConvertedConstructorMatchFallback = convert_constructor_match_fallback(
+		cases_converted.state,
+		bound,
+		fallback,
+	)
+	{
+		state = fallback_converted.state,
+		expr = ConstructorMatchExpr(
+			scrutinee_converted.expr,
+			release_policy,
+			cases_converted.cases,
+			fallback_converted.fallback,
+			typ,
+			loc,
+		)
+	}
+
+
+private pure func convert_if_expr(
+	state: ClosureState,
+	bound: List[String],
+	cond: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	cond_converted: ConvertedExpr = convert_expr(state, bound, cond)
+	then_converted: ConvertedExpr = convert_expr(cond_converted.state, bound, then_expr)
+	else_converted: ConvertedExpr = convert_expr(then_converted.state, bound, else_expr)
+	{
+		state = else_converted.state,
+		expr = IfExpr(
+			cond_converted.expr,
+			then_converted.expr,
+			else_converted.expr,
+			typ,
+			loc,
+		)
+	}
+
+
+-- Keep common recursive spines out of the exhaustive CoreExpr matcher. The
+-- pinned bootstrap emits the full matcher with a large -O0 C stack frame, so
+-- nesting that frame makes valid generated compiler programs overflow the
+-- native stack before closure conversion reaches a leaf.
 private pure func convert_expr(
+	state: ClosureState,
+	bound: List[String],
+	expr: CoreExpr,
+) -> ConvertedExpr:
+	match expr:
+		SeqExpr(_, _):
+			convert_sequence_expr(state, bound, expr)
+		CallExpr(kind, callee, args, typ, loc):
+			convert_call_expr(state, bound, kind, callee, args, typ, loc)
+		LogicalExpr(op, left, right, typ, loc):
+			convert_logical_expr(state, bound, op, left, right, typ, loc)
+		LetExpr(variable, is_mutable, var_type, rhs, body):
+			convert_let_expr(state, bound, variable, is_mutable, var_type, rhs, body)
+		BorrowLetExpr(variable, var_type, rhs, body):
+			convert_borrow_let_expr(state, bound, variable, var_type, rhs, body)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			convert_literal_match_expr(state, bound, scrutinee, cases, fallback, typ, loc)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			convert_accessor_literal_match_expr(
+				state,
+				bound,
+				scrutinee,
+				release_policy,
+				match_expr,
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			convert_length_match_expr(
+				state,
+				bound,
+				scrutinee,
+				release_policy,
+				match_expr,
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			convert_constructor_match_expr(
+				state,
+				bound,
+				scrutinee,
+				release_policy,
+				cases,
+				fallback,
+				typ,
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			convert_if_expr(state, bound, cond, then_expr, else_expr, typ, loc)
+		_:
+			convert_non_spine_expr(state, bound, expr)
+
+
+private pure func convert_non_spine_expr(
 	state: ClosureState,
 	bound: List[String],
 	expr: CoreExpr,
@@ -4678,12 +5069,7 @@ private pure func convert_expr(
 				expr = BorrowLetExpr(variable, var_type, rhs_converted.expr, body_converted.expr)
 			}
 		SeqExpr(first, second):
-			first_converted: ConvertedExpr = convert_expr(state, bound, first)
-			second_converted: ConvertedExpr = convert_expr(first_converted.state, bound, second)
-			{
-				state = second_converted.state,
-				expr = SeqExpr(first_converted.expr, second_converted.expr)
-			}
+			convert_sequence_expr(state, bound, expr)
 		WhileExpr(cond, body, typ, loc):
 			cond_converted: ConvertedExpr = convert_expr(state, bound, cond)
 			body_converted: ConvertedExpr = convert_expr(cond_converted.state, bound, body)
