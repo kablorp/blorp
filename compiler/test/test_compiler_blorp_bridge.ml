@@ -1492,6 +1492,46 @@ let test_bridge_helper_compiler_rejects_current_executable_override () =
         "mentions current executable" true
         (contains message "current compiler executable")
 
+let test_prepared_bridge_request_owns_stats_and_cleanup () =
+  let request_json = {|{"action":"emit_core_c"}|} in
+  let prepared = Bridge.prepare_bridge_request ~stats_enabled:true request_json in
+  let request_path = prepared.request_path in
+  Alcotest.(check bool) "request file exists" true (Sys.file_exists request_path);
+  (match prepared.request_stats with
+  | Some stats ->
+      Alcotest.(check string) "request action" "emit_core_c" stats.request_action;
+      Alcotest.(check int)
+        "request bytes" (String.length request_json) stats.request_bytes
+  | None -> Alcotest.fail "expected bridge request stats");
+  let response =
+    Bridge.run_prepared_bridge_request
+      (fun () -> Error "missing prepared bridge")
+      prepared
+  in
+  Alcotest.(check bool)
+    "resolution error is preserved" true
+    (contains response "missing prepared bridge");
+  Alcotest.(check bool)
+    "request file removed" false (Sys.file_exists request_path);
+  let without_stats =
+    Bridge.prepare_bridge_request ~stats_enabled:false request_json
+  in
+  Alcotest.(check bool)
+    "disabled stats are absent" true
+    (Option.is_none without_stats.request_stats);
+  let compactions_before = (Gc.quick_stat ()).compactions in
+  let resolver_saw_compaction = ref false in
+  ignore
+    (Bridge.run_prepared_bridge_request ~release_host_heap_before_run:true
+       (fun () ->
+         resolver_saw_compaction :=
+           (Gc.quick_stat ()).compactions > compactions_before;
+         Error "missing prepared bridge")
+       without_stats);
+  Alcotest.(check bool)
+    "host heap compacted before bridge resolution" true
+    !resolver_saw_compaction
+
 let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
       let compiler_dir = Filename.concat root "compiler" in
@@ -1814,6 +1854,8 @@ let suite =
           test_bridge_helper_compiler_respects_explicit_override;
         Alcotest.test_case "helper compiler rejects current executable override"
           `Quick test_bridge_helper_compiler_rejects_current_executable_override;
+        Alcotest.test_case "prepared request owns stats and cleanup" `Quick
+          test_prepared_bridge_request_owns_stats_and_cleanup;
         Alcotest.test_case "cache key includes helper entrypoint" `Quick
           test_bridge_cache_key_includes_helper_entrypoint;
         Alcotest.test_case "cache key includes std sources" `Quick

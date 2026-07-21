@@ -497,23 +497,30 @@ let compile_typed_with_module_inputs ?(main_import_bindings = [])
     string * string list * string list =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
-  let prepared =
+  let {
+    prepared_core;
+    prepared_registry;
+    prepared_import_aliases;
+    prepared_module_imports;
+  } =
     prepare_typed_with_module_inputs ~main_import_bindings ~modules typed_main
+  in
+  (* Extract metadata before emission so [prepared_core] is no longer needed
+     while the external Blorp emitter decodes its own Core representation. On
+     compiler-sized inputs, retaining both graphs at that boundary can exceed
+     a constrained build runner's memory. *)
+  let link_flags, include_dirs =
+    foreign_metadata_for_program prepared_core
   in
   let backend_input =
     run_core_passes ~on_stage ~on_stage_event
-      ~reg:prepared.prepared_registry
-      ~import_aliases:prepared.prepared_import_aliases
-      ~module_imports:prepared.prepared_module_imports ~debug
-      prepared.prepared_core
+      ~reg:prepared_registry ~import_aliases:prepared_import_aliases
+      ~module_imports:prepared_module_imports ~debug prepared_core
   in
   let output =
     emit_via_c_backend ~embed_runtime ~profile
-      ~reg:prepared.prepared_registry ~on_stage_event
-      ~on_stage_json ~tail_observation_stages backend_input
-  in
-  let link_flags, include_dirs =
-    foreign_metadata_for_program prepared.prepared_core
+      ~reg:prepared_registry ~on_stage_event ~on_stage_json
+      ~tail_observation_stages backend_input
   in
   (output, link_flags, include_dirs)
 
