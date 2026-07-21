@@ -2,7 +2,7 @@
 
 Status: active implementation plan; Slices 0-4 completed as of 2026-07-20.
 
-Last checked against `dogfood-3` based on `f9250351` on 2026-07-20.
+Last checked against `dogfood-3` after `feb3ac29` on 2026-07-20.
 
 This document records the primary cause of the current self-hosted compiler
 memory blow-up and defines the implementation sequence for correcting it. It is
@@ -1265,17 +1265,64 @@ demonstrably remove the irrelevant-global multiplier it claims to address.
 
 The investigation found important memory costs outside Perceus:
 
-### Typecheck bridge buffering
+### Typecheck bridge buffering (Complete)
 
-The typecheck helper streams one artifact per line, but the OCaml host uses
-`run_process_capture`, buffers the complete response, splits the resulting
-448 MB string, and then decodes all artifacts. The helper simultaneously
-materializes large typed values. This explains the separate 14.33 GB helper
-and 4.04 GB host peaks.
+The typecheck helper already streamed one artifact per line, but the OCaml host
+used `run_process_capture`, buffered the complete response, split the resulting
+448 MB string, and only then decoded all artifacts. The helper simultaneously
+materialized large typed values. Earlier measurements recorded separate 14.33
+GB helper and 4.04 GB host peaks.
 
-Future work should consume the line protocol incrementally and release each
-serialized artifact after use. It should not change the single semantic bridge
-boundary.
+The host now redirects only `typecheck_graph` stdout to a private temporary
+file, waits for the helper to exit, and decodes the response one nonempty line
+at a time. Parser and renderer responses retain their existing in-memory
+transport. The decoder still retains the complete typed graph required by the
+semantic middle, but it no longer retains the complete serialized response or
+the list produced by `String.split_on_char`. Process failure diagnostics read
+bounded excerpts while bridge statistics use the actual output file sizes.
+
+On the compiler-sized production request, the response file reached
+456,501,933 bytes. Live sampling while the helper was active showed about 5 MB
+in the waiting host and 5.2 GB in the helper; the response file was removed
+before backend emission began. A build with an explicitly empty bridge cache
+completed in 300.28 seconds with 7,500,136,448 bytes maximum single-process RSS
+and no swaps. That headline maximum is effectively unchanged from the prior
+7.50 GB empty-cache build because a later backend process remains the largest
+single process. This slice instead removes the serialized-response overlap at
+the constrained typecheck phase.
+
+Follow-up profiling rejected helper-side artifact projection as the immediate
+typecheck target. A direct JSON-emission experiment still died with zero output
+bytes, proving the peak preceded artifact projection and serialization.
+Temporary stage probes then localized the failure to graph-wide CTFE dependency
+preparation. Under an 8 GB `linux/arm64` Docker limit, the helper attempted to
+prepare 129 typed dependency programs and was killed while adding dependency 63,
+`compiler_core_reuse`. The killed helper had about 7.02 GB anonymous RSS and the
+container had peaked at 7,687,340,032 bytes. No typechecked artifact had been
+emitted.
+
+The graph builder treated every explicit import as a CTFE dependency whenever a
+module contained any immutable global. That made a literal such as
+`DEFAULT_WIDTH: Int = 100` retain the module's entire typed import closure even
+though evaluating it cannot consult imported functions or values. It also made
+an unused broken import incorrectly prevent an otherwise closed global from
+being evaluated.
+
+The graph now proves a deliberately narrow set of parsed initializer trees to
+be import-independent: primitive literals and recursively closed operators,
+ascriptions, lists, tuples, records, dictionaries, vectors, blocks, and
+conditionals. Unknown, name-bearing, and call-bearing expressions retain the
+existing conservative dependency closure. A regression verifies that closed
+literal, list, and binary initializers evaluate successfully despite an unused
+import whose function body does not typecheck.
+
+With that change, the same constrained build completed typecheck and entered the
+renderer helper. The renderer was then killed at about 7.02 GB anonymous RSS;
+the container peak was 7,681,785,856 bytes. The complete 8 GB build therefore
+remains red, but the failure moved across a process boundary to the late backend.
+The next measured memory slice belongs there. Direct JSON emission remains a
+possible later optimization only after a profile shows projection or
+serialization at the live peak.
 
 ### Core JSON duplication
 

@@ -51,6 +51,18 @@ let expect_invalid_response_contains expected = function
       Alcotest.fail
         ("expected invalid_response, got " ^ code ^ ": " ^ message)
 
+let with_input_text text f =
+  let path = Filename.temp_file "blorp-bridge-response-" ".jsonl" in
+  Fun.protect
+    ~finally:(fun () -> try Sys.remove path with _ -> ())
+    (fun () ->
+      let output = open_out_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_out output)
+        (fun () -> output_string output text);
+      let input = open_in_bin path in
+      Fun.protect ~finally:(fun () -> close_in input) (fun () -> f input))
+
 let with_env name value f =
   let old = Sys.getenv_opt name in
   Unix.putenv name value;
@@ -740,7 +752,10 @@ let test_typecheck_graph_stream_response_decodes_all_artifacts () =
              (typed_program_json []));
       ]
   in
-  match Bridge.typecheck_graph_stream_response_json ~module_count:1 response with
+  match
+    with_input_text response
+      (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
+  with
   | Ok
       {
         Bridge.typechecked_graph_modules =
@@ -766,8 +781,47 @@ let test_typecheck_graph_stream_response_requires_target () =
   bridge_success_json
     (typecheck_graph_source_artifact "src/dep.brp" "dep"
        (typed_program_json []))
-  |> Bridge.typecheck_graph_stream_response_json ~module_count:1
+  |> fun response ->
+  with_input_text response
+    (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
   |> expect_invalid_response_contains "expected one target"
+
+let test_typecheck_graph_stream_response_rejects_trailing_artifact () =
+  let artifact path module_name =
+    bridge_success_json
+      (typecheck_graph_source_artifact path module_name (typed_program_json []))
+  in
+  String.concat "\n"
+    [
+      artifact "src/dep.brp" "dep";
+      artifact "src/main.brp" "main";
+      artifact "src/extra.brp" "extra";
+    ]
+  |> fun response ->
+  with_input_text response
+    (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
+  |> expect_invalid_response_contains "trailing artifacts"
+
+let test_typecheck_graph_stream_response_preserves_trailing_error () =
+  let artifact path module_name =
+    bridge_success_json
+      (typecheck_graph_source_artifact path module_name (typed_program_json []))
+  in
+  let response =
+    String.concat "\n"
+      [
+        artifact "src/dep.brp" "dep";
+        artifact "src/main.brp" "main";
+        Bridge.error_response "late_error" "late bridge failure";
+      ]
+  in
+  match
+    with_input_text response
+      (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
+  with
+  | Error ("bridge_error", "late bridge failure") -> ()
+  | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message)
+  | Ok _ -> Alcotest.fail "expected trailing bridge error"
 
 let test_parse_sources_response_decodes_items () =
   let response =
@@ -1446,6 +1500,119 @@ let with_temp_dir f =
       remove root)
     (fun () -> f root)
 
+let test_process_stdout_file_waits_and_cleans_up () =
+  with_temp_dir (fun root ->
+      let helper = Filename.concat root "bridge-helper.sh" in
+      let marker = Filename.concat root "helper-finished" in
+      let stdout_path = ref None in
+      write_file helper
+        "#!/bin/sh\nprintf 'first\\nsecond\\n'\nprintf 'done' > \"$1\"\nprintf 'warning' >&2\n";
+      Unix.chmod helper 0o700;
+      let exit_code =
+        Bridge.with_process_stdout_file helper [ marker ] (fun completed ->
+            stdout_path := Some completed.Bridge.process_stdout_path;
+            Alcotest.(check bool)
+              "helper exited before response consumption" true
+              (Sys.file_exists marker);
+            Alcotest.(check string)
+              "file-backed stdout" "first\nsecond\n"
+              (Bridge.read_file completed.process_stdout_path);
+            Alcotest.(check int)
+              "stdout byte count" 13 completed.process_stdout_bytes;
+            Alcotest.(check string)
+              "stderr capture" "warning" completed.process_stderr_output;
+            completed.process_exit_code)
+      in
+      Alcotest.(check int) "process exit code" 0 exit_code;
+      match !stdout_path with
+      | Some path ->
+          Alcotest.(check bool)
+            "stdout file removed after consumer" false (Sys.file_exists path)
+      | None -> Alcotest.fail "expected a file-backed stdout path")
+
+let typecheck_response_helper root response =
+  let response_path = Filename.concat root "typecheck-response.jsonl" in
+  let helper = Filename.concat root "typecheck-helper.sh" in
+  write_file response_path response;
+  write_file helper "#!/bin/sh\ncat \"$BLORP_TEST_RESPONSE\"\n";
+  Unix.chmod helper 0o700;
+  (helper, response_path)
+
+let test_prepared_typecheck_request_decodes_and_cleans_up () =
+  with_temp_dir (fun root ->
+      let response =
+        bridge_success_json
+          (typecheck_graph_source_artifact "src/main.brp" "main"
+             (typed_program_json []))
+      in
+      let helper, response_path = typecheck_response_helper root response in
+      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
+      let request_path = request.request_path in
+      let result =
+        with_env "BLORP_TEST_RESPONSE" response_path (fun () ->
+            Bridge.run_prepared_typecheck_graph_request ~module_count:0
+              (fun () -> Ok helper)
+              request)
+      in
+      (match result with
+      | Ok graph ->
+          Alcotest.(check string)
+            "target path" "src/main.brp"
+            graph.Bridge.typechecked_graph_target.typechecked_graph_path
+      | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message));
+      Alcotest.(check bool)
+        "request removed after successful decode" false
+        (Sys.file_exists request_path))
+
+let test_prepared_typecheck_request_cleans_up_after_decode_error () =
+  with_temp_dir (fun root ->
+      let helper, response_path = typecheck_response_helper root "not json" in
+      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
+      let request_path = request.request_path in
+      let result =
+        with_env "BLORP_TEST_RESPONSE" response_path (fun () ->
+            Bridge.run_prepared_typecheck_graph_request ~module_count:0
+              (fun () -> Ok helper)
+              request)
+      in
+      expect_invalid_response_contains "expected" result;
+      Alcotest.(check bool)
+        "request removed after decode error" false (Sys.file_exists request_path))
+
+let test_prepared_typecheck_request_bounds_process_failure () =
+  with_temp_dir (fun root ->
+      let helper = Filename.concat root "failing-typecheck-helper.sh" in
+      let stdout_path = Filename.concat root "large-stdout" in
+      let stderr_path = Filename.concat root "large-stderr" in
+      let large_output = String.make (Bridge.bridge_error_excerpt_limit + 128) 'x' in
+      write_file stdout_path large_output;
+      write_file stderr_path large_output;
+      write_file helper
+        "#!/bin/sh\ncat \"$BLORP_TEST_STDOUT\"\ncat \"$BLORP_TEST_STDERR\" >&2\nexit 7\n";
+      Unix.chmod helper 0o700;
+      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
+      let request_path = request.request_path in
+      let result =
+        with_env "BLORP_TEST_STDOUT" stdout_path (fun () ->
+            with_env "BLORP_TEST_STDERR" stderr_path (fun () ->
+                Bridge.run_prepared_typecheck_graph_request ~module_count:0
+                  (fun () -> Ok helper)
+                  request))
+      in
+      (match result with
+      | Error ("bridge_command_failed", message) ->
+          Alcotest.(check bool)
+            "reports helper exit" true (contains message "exited 7");
+          Alcotest.(check bool)
+            "truncates process output" true (contains message "<truncated 128 bytes>");
+          Alcotest.(check bool)
+            "does not return full process output" true
+            (String.length message < String.length large_output * 2)
+      | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message)
+      | Ok _ -> Alcotest.fail "expected typecheck helper failure");
+      Alcotest.(check bool)
+        "request removed after process failure" false (Sys.file_exists request_path))
+
 let test_bridge_helper_compiler_finds_pinned_bootstrap () =
   with_temp_dir (fun root ->
       let scripts_dir = Filename.concat root "scripts" in
@@ -1743,6 +1910,29 @@ let test_generated_c_bootstrap_compatibility_preserves_union_tag_checks () =
     "preserves boxed union tag check" true
     (contains rewritten "TAG_compiler_model__Payload_SomeCase")
 
+let transport_suite =
+  [
+    ( "file_backed_typecheck",
+      [
+        Alcotest.test_case "stream decodes all artifacts" `Quick
+          test_typecheck_graph_stream_response_decodes_all_artifacts;
+        Alcotest.test_case "stream requires target" `Quick
+          test_typecheck_graph_stream_response_requires_target;
+        Alcotest.test_case "stream rejects trailing artifact" `Quick
+          test_typecheck_graph_stream_response_rejects_trailing_artifact;
+        Alcotest.test_case "stream preserves trailing error" `Quick
+          test_typecheck_graph_stream_response_preserves_trailing_error;
+        Alcotest.test_case "process waits and cleans up" `Quick
+          test_process_stdout_file_waits_and_cleans_up;
+        Alcotest.test_case "prepared request decodes and cleans up" `Quick
+          test_prepared_typecheck_request_decodes_and_cleans_up;
+        Alcotest.test_case "prepared request cleans decode failure" `Quick
+          test_prepared_typecheck_request_cleans_up_after_decode_error;
+        Alcotest.test_case "prepared request bounds process failure" `Quick
+          test_prepared_typecheck_request_bounds_process_failure;
+      ] );
+  ]
+
 let suite =
   [
     ( "renderer_bridge_build",
@@ -1800,10 +1990,6 @@ let suite =
           test_typecheck_graph_response_preserves_errors_for_invalid_typed_tree;
         Alcotest.test_case "typecheck_graph response rejects raw phase" `Quick
           test_typecheck_graph_response_rejects_raw_phase;
-        Alcotest.test_case "typecheck_graph stream decodes all artifacts" `Quick
-          test_typecheck_graph_stream_response_decodes_all_artifacts;
-        Alcotest.test_case "typecheck_graph stream requires target" `Quick
-          test_typecheck_graph_stream_response_requires_target;
         Alcotest.test_case "parse_sources response decodes items" `Quick
           test_parse_sources_response_decodes_items;
         Alcotest.test_case "CLI run response decodes handled" `Quick

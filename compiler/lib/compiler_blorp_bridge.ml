@@ -1135,47 +1135,58 @@ let typecheck_graph_source_response_json response_json =
       let* artifact = json_response_field "artifact" response in
       typechecked_graph_source_artifact_field artifact)
 
-(** The Blorp helper emits one artifact per line to bound its own live graph.
-    [run_process_capture] still buffers stdout in this transitional OCaml host;
-    do not build more caching or graph semantics around that temporary limit. *)
-let typecheck_graph_stream_response_json ~module_count response_text =
-  let lines =
-    response_text |> String.split_on_char '\n'
-    |> List.filter (fun line -> String.trim line <> "")
+(** Decode the line protocol after the typecheck helper has exited. Only one
+    serialized artifact is retained at a time; decoded module artifacts remain
+    live because the semantic middle consumes the complete typed graph. *)
+let typecheck_graph_stream_response_channel ~module_count channel =
+  let rec next_nonempty_line () =
+    match input_line channel with
+    | line when String.trim line = "" -> next_nonempty_line ()
+    | line -> Some line
+    | exception End_of_file -> None
   in
-  let rec decode acc = function
-    | [] -> Ok (List.rev acc)
-    | line :: rest ->
-        let* source = typecheck_graph_source_response_json line in
-        decode (source :: acc) rest
+  let rec decode_remaining count =
+    match next_nonempty_line () with
+    | Some line ->
+        let* _ = typecheck_graph_source_response_json line in
+        decode_remaining (count + 1)
+    | None -> Ok count
   in
-  let* sources = decode [] lines in
-  let rec split_modules remaining acc sources =
+  let rec decode_modules remaining decoded_count acc =
     if remaining = 0 then
-      match sources with
-      | [ target ] ->
-          Ok
-            {
-              typechecked_graph_modules = List.rev acc;
-              typechecked_graph_target = target;
-            }
-      | _ ->
+      match next_nonempty_line () with
+      | None ->
           Error
             ( "invalid_response",
-              Printf.sprintf
-                "typecheck_graph returned %d trailing artifacts, expected one target"
-                (List.length sources) )
+              "typecheck_graph returned no target artifact, expected one target" )
+      | Some target_line ->
+          let* target = typecheck_graph_source_response_json target_line in
+          let* trailing_count = decode_remaining 0 in
+          if trailing_count = 0 then
+            Ok
+              {
+                typechecked_graph_modules = List.rev acc;
+                typechecked_graph_target = target;
+              }
+          else
+            Error
+              ( "invalid_response",
+                Printf.sprintf
+                  "typecheck_graph returned %d trailing artifacts after the target"
+                  trailing_count )
     else
-      match sources with
-      | source :: rest -> split_modules (remaining - 1) (source :: acc) rest
-      | [] ->
+      match next_nonempty_line () with
+      | Some line ->
+          let* source = typecheck_graph_source_response_json line in
+          decode_modules (remaining - 1) (decoded_count + 1) (source :: acc)
+      | None ->
           Error
             ( "invalid_response",
               Printf.sprintf
                 "typecheck_graph returned %d artifacts, expected %d modules and one target"
-                (List.length lines) module_count )
+                decoded_count module_count )
   in
-  split_modules module_count [] sources
+  decode_modules module_count 0 []
 
 let require_compile_frontend_command = function
   | "compile" -> Ok ()
@@ -1878,6 +1889,21 @@ let read_file_if_exists path =
         let len = in_channel_length channel in
         really_input_string channel len)
 
+let read_file_excerpt_if_exists path =
+  if not (Sys.file_exists path) then ""
+  else
+    let channel = open_in_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr channel)
+      (fun () ->
+        let len = in_channel_length channel in
+        let excerpt_len = min len bridge_error_excerpt_limit in
+        let excerpt = really_input_string channel excerpt_len in
+        if excerpt_len = len then excerpt
+        else
+          excerpt
+          ^ Printf.sprintf "... <truncated %d bytes>" (len - excerpt_len))
+
 let string_starts_with_at value index prefix =
   let prefix_len = String.length prefix in
   index >= 0
@@ -2096,6 +2122,71 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       let stderr_output = read_file_if_exists stderr_path in
       (try Sys.remove stderr_path with _ -> ());
       (exit_code_of_status status, output, stderr_output)
+
+type completed_file_process = {
+  process_exit_code : int;
+  process_stdout_path : string;
+  process_stdout_bytes : int;
+  process_stderr_output : string;
+  process_stderr_bytes : int;
+}
+
+let close_fd_noerr fd = try Unix.close fd with _ -> ()
+
+let close_owned_fd fd =
+  match !fd with
+  | Some value ->
+      fd := None;
+      close_fd_noerr value
+  | None -> ()
+
+let with_process_stdout_file ?(env = []) ?(unset_env = []) prog args consume =
+  let stdout_path, stdout_fd_value =
+    create_bridge_temp_file "blorp-compiler-bridge-stdout-" ".jsonl"
+      bridge_temp_retry_limit
+  in
+  let stderr_path, stderr_fd_value =
+    try
+      create_bridge_temp_file "blorp-compiler-bridge-stderr-" ".log"
+        bridge_temp_retry_limit
+    with exn ->
+      close_fd_noerr stdout_fd_value;
+      (try Sys.remove stdout_path with _ -> ());
+      raise exn
+  in
+  let stdout_fd = ref (Some stdout_fd_value) in
+  let stderr_fd = ref (Some stderr_fd_value) in
+  Fun.protect
+    ~finally:(fun () ->
+      close_owned_fd stdout_fd;
+      close_owned_fd stderr_fd;
+      (try Sys.remove stdout_path with _ -> ());
+      (try Sys.remove stderr_path with _ -> ()))
+    (fun () ->
+      match Unix.fork () with
+      | 0 -> (
+          try
+            Unix.dup2 stdout_fd_value Unix.stdout;
+            Unix.dup2 stderr_fd_value Unix.stderr;
+            Unix.close stdout_fd_value;
+            Unix.close stderr_fd_value;
+            exec_program prog args (child_environment ~env ~unset_env)
+          with _ -> Unix._exit 127)
+      | pid ->
+          close_owned_fd stdout_fd;
+          close_owned_fd stderr_fd;
+          let status = waitpid_retry pid in
+          let stdout_bytes = (Unix.stat stdout_path).Unix.st_size in
+          let stderr_bytes = (Unix.stat stderr_path).Unix.st_size in
+          let stderr_output = read_file_excerpt_if_exists stderr_path in
+          consume
+            {
+              process_exit_code = exit_code_of_status status;
+              process_stdout_path = stdout_path;
+              process_stdout_bytes = stdout_bytes;
+              process_stderr_output = stderr_output;
+              process_stderr_bytes = stderr_bytes;
+            })
 
 let default_bridge_helper_compiler () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -2903,8 +2994,8 @@ let prepare_bridge_request ~stats_enabled request_json =
     request_error_excerpt;
   }
 
-let run_prepared_bridge_request ?(release_host_heap_before_run = false)
-    bridge_binary request =
+let with_resolved_prepared_bridge_request
+    ?(release_host_heap_before_run = false) bridge_binary request run =
   Fun.protect
     ~finally:(fun () -> try Sys.remove request.request_path with _ -> ())
     (fun () ->
@@ -2914,32 +3005,76 @@ let run_prepared_bridge_request ?(release_host_heap_before_run = false)
          not consume physical memory concurrently on a cold cache. *)
       if release_host_heap_before_run then Gc.compact ();
       match bridge_binary () with
-      | Error message -> error_response "bridge_command_failed" message
-      | Ok bridge_binary ->
-          let started_at = Unix.gettimeofday () in
-          let exit_code, output, stderr_output =
-            run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
-              [ request.request_path ]
-          in
-          Option.iter
-            (fun stats ->
-              log_bridge_stats ~action:stats.request_action ~bridge_binary
-                ~request_bytes:stats.request_bytes
-                ~stdout_bytes:(String.length output)
-                ~stderr_bytes:(String.length stderr_output)
-                ~duration_ms:
-                  (int_of_float
-                     ((Unix.gettimeofday () -. started_at) *. 1000.0))
-                ~exit_code)
-            request.request_stats;
-          if exit_code = 0 then output
+      | Error message -> Error ("bridge_command_failed", message)
+      | Ok bridge_binary -> run bridge_binary)
+
+let log_prepared_bridge_stats request ~bridge_binary ~stdout_bytes ~stderr_bytes
+    ~started_at ~exit_code =
+  Option.iter
+    (fun stats ->
+      log_bridge_stats ~action:stats.request_action ~bridge_binary
+        ~request_bytes:stats.request_bytes ~stdout_bytes ~stderr_bytes
+        ~duration_ms:
+          (int_of_float ((Unix.gettimeofday () -. started_at) *. 1000.0))
+        ~exit_code)
+    request.request_stats
+
+let bridge_process_failure_message request ~exit_code ~stdout ~stderr =
+  Printf.sprintf "Blorp bridge command exited %d: %s\nrequest: %s" exit_code
+    (String.trim (stdout ^ stderr))
+    request.request_error_excerpt
+
+let run_prepared_bridge_request ?(release_host_heap_before_run = false)
+    bridge_binary request =
+  match
+    with_resolved_prepared_bridge_request ~release_host_heap_before_run
+      bridge_binary request (fun bridge_binary ->
+        let started_at = Unix.gettimeofday () in
+        let exit_code, output, stderr_output =
+          run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
+            [ request.request_path ]
+        in
+        log_prepared_bridge_stats request ~bridge_binary
+          ~stdout_bytes:(String.length output)
+          ~stderr_bytes:(String.length stderr_output) ~started_at ~exit_code;
+        if exit_code = 0 then Ok output
+        else
+          Error
+            ( "bridge_command_failed",
+              bridge_process_failure_message request ~exit_code ~stdout:output
+                ~stderr:stderr_output ))
+  with
+  | Ok output -> output
+  | Error (code, message) -> error_response code message
+
+let typecheck_graph_response_file ~module_count path =
+  let channel = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr channel)
+    (fun () -> typecheck_graph_stream_response_channel ~module_count channel)
+
+let run_prepared_typecheck_graph_request ~module_count bridge_binary request =
+  with_resolved_prepared_bridge_request bridge_binary request
+    (fun bridge_binary ->
+      let started_at = Unix.gettimeofday () in
+      with_process_stdout_file bridge_binary
+        ~unset_env:[ "BLORP_LEAK_CHECK" ]
+        [ request.request_path ] (fun completed ->
+          log_prepared_bridge_stats request ~bridge_binary
+            ~stdout_bytes:completed.process_stdout_bytes
+            ~stderr_bytes:completed.process_stderr_bytes ~started_at
+            ~exit_code:completed.process_exit_code;
+          if completed.process_exit_code = 0 then
+            typecheck_graph_response_file ~module_count
+              completed.process_stdout_path
           else
-            error_response "bridge_command_failed"
-              (Printf.sprintf
-                 "Blorp renderer bridge command exited %d: %s\nrequest: %s"
-                 exit_code
-                 (String.trim (output ^ stderr_output))
-                 request.request_error_excerpt))
+            Error
+              ( "bridge_command_failed",
+                bridge_process_failure_message request
+                  ~exit_code:completed.process_exit_code
+                  ~stdout:
+                    (read_file_excerpt_if_exists completed.process_stdout_path)
+                  ~stderr:completed.process_stderr_output )))
 
 let run_request_via_blorp_binary ?release_host_heap_before_run bridge_binary
     request_json =
@@ -2954,8 +3089,10 @@ let run_renderer_request_via_blorp ?release_host_heap_before_run request_json =
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
 
-let run_typecheck_request_via_blorp request_json =
-  run_request_via_blorp_binary typecheck_bridge_binary request_json
+let run_typecheck_graph_request_via_blorp ~module_count request_json =
+  let stats_enabled = bridge_stats_enabled () in
+  run_prepared_typecheck_graph_request ~module_count typecheck_bridge_binary
+    (prepare_bridge_request ~stats_enabled request_json)
 
 let run_cli_request_via_blorp ?version ?source args =
   run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
@@ -3039,14 +3176,10 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
 
 let typecheck_graph_via_command_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =
-  let response_json =
-    run_typecheck_request_via_blorp
-      (typecheck_graph_request_json_with_policy ~resolved_imports
-         ~allow_debug_only_calls ~target ~modules ~module_targets)
-  in
-  typecheck_graph_stream_response_json
+  run_typecheck_graph_request_via_blorp
     ~module_count:(List.length module_targets)
-    response_json
+    (typecheck_graph_request_json_with_policy ~resolved_imports
+       ~allow_debug_only_calls ~target ~modules ~module_targets)
 
 let cli_run_via_command ?version ?source args =
   run_cli_request_via_blorp ?version ?source args |> cli_run_response_json
