@@ -140,11 +140,6 @@ let read_all_fd fd =
   loop ();
   Buffer.contents buf
 
-let exit_code_of_status = function
-  | Unix.WEXITED c -> c
-  | Unix.WSIGNALED s -> 128 + s
-  | Unix.WSTOPPED _ -> 128
-
 (** waitpid with EINTR retry *)
 let rec waitpid_retry flags pid =
   try Unix.waitpid flags pid
@@ -316,7 +311,7 @@ let run_process_capture ?cwd ?(env = []) prog args =
   let output = read_all_fd read_fd in
   Unix.close read_fd;
   let _, status = waitpid_retry [] pid in
-  (exit_code_of_status status, output)
+  (Process_status.exit_code status, output)
 
 (** Run a program directly with timeout, capture output. When
     [progress_marker] is set, only a complete stderr protocol record of the
@@ -510,7 +505,7 @@ let run_process_capture_timeout_streams ?cwd ?(env = []) ?progress_marker
       let exit_code =
         if !timed_out then 124
         else
-          match !status with Some st -> exit_code_of_status st | None -> 124
+          match !status with Some st -> Process_status.exit_code st | None -> 124
       in
       let stdout_output = Buffer.contents output in
       let stderr_output = Buffer.contents progress_output in
@@ -577,7 +572,7 @@ let run_process_timeout ~timeout prog args =
   | None | Some 0 ->
       with_forwarded_signal_handlers (fun () ->
           let _, status = waitpid_retry [] pid in
-          exit_code_of_status status)
+          Process_status.exit_code status)
   | Some seconds ->
       with_forwarded_signal_handlers (fun () ->
           let timed_out = ref false in
@@ -641,7 +636,9 @@ let run_process_timeout ~timeout prog args =
           if !timed_out then reap_child_if_needed pid status;
           if !timed_out then 124
           else
-            match !status with Some st -> exit_code_of_status st | None -> 124)
+            match !status with
+            | Some st -> Process_status.exit_code st
+            | None -> 124)
 
 (** Detect whether `cc` is Clang or GCC. Cached after first call. *)
 let cc_is_clang =
@@ -691,7 +688,7 @@ let compile_c_from_stdin c_code bin_file extra_args =
   let output = read_all_fd stdout_read in
   Unix.close stdout_read;
   let _, status = waitpid_retry [] pid in
-  (exit_code_of_status status, output)
+  (Process_status.exit_code status, output)
 
 type tls_backend_profile = TlsUnsupported | TlsOpenSsl
 

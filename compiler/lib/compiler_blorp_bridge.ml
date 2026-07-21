@@ -1925,11 +1925,6 @@ let rec waitpid_retry pid =
   try snd (Unix.waitpid [] pid)
   with Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_retry pid
 
-let exit_code_of_status = function
-  | Unix.WEXITED code -> code
-  | Unix.WSIGNALED signal -> 128 + signal
-  | Unix.WSTOPPED _ -> 128
-
 let rec remove_path_noerr path =
   try
     match (Unix.lstat path).Unix.st_kind with
@@ -2121,7 +2116,72 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       let status = waitpid_retry pid in
       let stderr_output = read_file_if_exists stderr_path in
       (try Sys.remove stderr_path with _ -> ());
-      (exit_code_of_status status, output, stderr_output)
+      (Process_status.exit_code status, output, stderr_output)
+
+type completed_file_process = {
+  process_exit_code : int;
+  process_stdout_path : string;
+  process_stdout_bytes : int;
+  process_stderr_output : string;
+  process_stderr_bytes : int;
+}
+
+let close_fd_noerr fd = try Unix.close fd with _ -> ()
+
+let close_owned_fd fd =
+  match !fd with
+  | Some value ->
+      fd := None;
+      close_fd_noerr value
+  | None -> ()
+
+let with_process_stdout_file ?(env = []) ?(unset_env = []) prog args consume =
+  let stdout_path, stdout_fd_value =
+    create_bridge_temp_file "blorp-compiler-bridge-stdout-" ".jsonl"
+      bridge_temp_retry_limit
+  in
+  let stderr_path, stderr_fd_value =
+    try
+      create_bridge_temp_file "blorp-compiler-bridge-stderr-" ".log"
+        bridge_temp_retry_limit
+    with exn ->
+      close_fd_noerr stdout_fd_value;
+      (try Sys.remove stdout_path with _ -> ());
+      raise exn
+  in
+  let stdout_fd = ref (Some stdout_fd_value) in
+  let stderr_fd = ref (Some stderr_fd_value) in
+  Fun.protect
+    ~finally:(fun () ->
+      close_owned_fd stdout_fd;
+      close_owned_fd stderr_fd;
+      (try Sys.remove stdout_path with _ -> ());
+      (try Sys.remove stderr_path with _ -> ()))
+    (fun () ->
+      match Unix.fork () with
+      | 0 -> (
+          try
+            Unix.dup2 stdout_fd_value Unix.stdout;
+            Unix.dup2 stderr_fd_value Unix.stderr;
+            Unix.close stdout_fd_value;
+            Unix.close stderr_fd_value;
+            exec_program prog args (child_environment ~env ~unset_env)
+          with _ -> Unix._exit 127)
+      | pid ->
+          close_owned_fd stdout_fd;
+          close_owned_fd stderr_fd;
+          let status = waitpid_retry pid in
+          let stdout_bytes = (Unix.stat stdout_path).Unix.st_size in
+          let stderr_bytes = (Unix.stat stderr_path).Unix.st_size in
+          let stderr_output = read_file_excerpt_if_exists stderr_path in
+          consume
+            {
+              process_exit_code = Process_status.exit_code status;
+              process_stdout_path = stdout_path;
+              process_stdout_bytes = stdout_bytes;
+              process_stderr_output = stderr_output;
+              process_stderr_bytes = stderr_bytes;
+            })
 
 type completed_file_process = {
   process_exit_code : int;
