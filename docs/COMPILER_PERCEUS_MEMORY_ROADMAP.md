@@ -837,6 +837,32 @@ helper followed by substantial host-side response handling, so the remaining
 whole-build pressure includes frontend and bridge ownership outside this
 slice's declaration-classification scope.
 
+Post-Slice 4 compiler-sized lifetime hardening removed the largest concurrent
+peak. A cold GitHub `ubuntu-latest` build was terminated while the OCaml host
+retained its prepared Core graph and the Blorp `emit_core_c` helper decoded an
+independent copy. Replaying the captured 144,561,870-byte request isolated the
+renderer at 6,641,303,552 bytes maximum RSS. The host also kept
+`prepared_core` live because foreign-link metadata was computed only after the
+renderer returned.
+
+Foreign metadata is now collected before emission, and the host compacts its
+heap immediately before the explicitly selected `emit_core_c` subprocess.
+Parser, typechecker, and ordinary renderer requests do not pay that compaction
+cost. A cold public-CLI rebuild on the same Apple M4 host completed in 250.72s
+with 6,171,443,200 bytes maximum RSS and no swaps. Live sampling showed the
+host near 1.15 GB while the renderer was active; the host's later response
+processing peak occurred only after the renderer exited. This is about 62%
+below the conservative 16.19 GB cold-build peak and restores a bounded process
+lifetime boundary without changing Core or emitted-C semantics.
+
+That first measurement reused the content-addressed renderer helper. A second
+run with an explicitly empty bridge cache forced helper compilation as well as
+the public-CLI build. It completed in 295.15s with 7,498,465,280 bytes maximum
+RSS and no swaps. While the newly compiled renderer was active, live sampling
+showed about 0.85 GB in the host and 4.0 GB in the renderer. The empty-cache
+result remains about 54% below the former conservative peak and covers the
+cold-cache path used by a fresh CI source revision.
+
 Final Slice 3 verification:
 
 - focused Perceus suite: 187 passed, 0 failed;

@@ -1938,10 +1938,14 @@ let write_temp_request request_json =
       bridge_temp_retry_limit
   in
   let channel = Unix.out_channel_of_descr fd in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr channel)
-    (fun () -> output_string channel request_json);
-  path
+  try
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr channel)
+      (fun () -> output_string channel request_json);
+    path
+  with exn ->
+    (try Sys.remove path with _ -> ());
+    raise exn
 
 let env_binding_name binding =
   match String.index_opt binding '=' with
@@ -2870,31 +2874,64 @@ let prepare_bridge_binaries ~out_dir =
       prepared_typecheck_bridge_bin = typecheck_path;
     }
 
-let run_request_via_blorp_binary bridge_binary request_json =
-  match bridge_binary () with
-  | Error message -> error_response "bridge_command_failed" message
-  | Ok bridge_binary ->
-      let request_path = write_temp_request request_json in
-      let stats_enabled = bridge_stats_enabled () in
-      let action =
-        if stats_enabled then bridge_request_action request_json else ""
-      in
-      let request_bytes = String.length request_json in
-      Fun.protect
-        ~finally:(fun () -> try Sys.remove request_path with _ -> ())
-        (fun () ->
+type bridge_request_stats = {
+  request_action : string;
+  request_bytes : int;
+}
+
+type prepared_bridge_request = {
+  request_path : string;
+  request_stats : bridge_request_stats option;
+  request_error_excerpt : string;
+}
+
+let prepare_bridge_request ~stats_enabled request_json =
+  let request_stats =
+    if stats_enabled then
+      Some
+        {
+          request_action = bridge_request_action request_json;
+          request_bytes = String.length request_json;
+        }
+    else None
+  in
+  let request_error_excerpt = bridge_error_excerpt request_json in
+  let request_path = write_temp_request request_json in
+  {
+    request_path;
+    request_stats;
+    request_error_excerpt;
+  }
+
+let run_prepared_bridge_request ?(release_host_heap_before_run = false)
+    bridge_binary request =
+  Fun.protect
+    ~finally:(fun () -> try Sys.remove request.request_path with _ -> ())
+    (fun () ->
+      (* The Core emitter builds an independent Blorp representation of a
+         compiler-sized request. Release dead frontend and OCaml Core heap
+         chunks before resolving or starting that helper so both compilers do
+         not consume physical memory concurrently on a cold cache. *)
+      if release_host_heap_before_run then Gc.compact ();
+      match bridge_binary () with
+      | Error message -> error_response "bridge_command_failed" message
+      | Ok bridge_binary ->
           let started_at = Unix.gettimeofday () in
           let exit_code, output, stderr_output =
             run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
-              [ request_path ]
+              [ request.request_path ]
           in
-          if stats_enabled then
-            log_bridge_stats ~action ~bridge_binary ~request_bytes
-              ~stdout_bytes:(String.length output)
-              ~stderr_bytes:(String.length stderr_output)
-              ~duration_ms:
-                (int_of_float ((Unix.gettimeofday () -. started_at) *. 1000.0))
-              ~exit_code;
+          Option.iter
+            (fun stats ->
+              log_bridge_stats ~action:stats.request_action ~bridge_binary
+                ~request_bytes:stats.request_bytes
+                ~stdout_bytes:(String.length output)
+                ~stderr_bytes:(String.length stderr_output)
+                ~duration_ms:
+                  (int_of_float
+                     ((Unix.gettimeofday () -. started_at) *. 1000.0))
+                ~exit_code)
+            request.request_stats;
           if exit_code = 0 then output
           else
             error_response "bridge_command_failed"
@@ -2902,10 +2939,17 @@ let run_request_via_blorp_binary bridge_binary request_json =
                  "Blorp renderer bridge command exited %d: %s\nrequest: %s"
                  exit_code
                  (String.trim (output ^ stderr_output))
-                 (bridge_error_excerpt request_json)))
+                 request.request_error_excerpt))
 
-let run_renderer_request_via_blorp request_json =
-  run_request_via_blorp_binary renderer_bridge_binary request_json
+let run_request_via_blorp_binary ?release_host_heap_before_run bridge_binary
+    request_json =
+  let stats_enabled = bridge_stats_enabled () in
+  run_prepared_bridge_request ?release_host_heap_before_run bridge_binary
+    (prepare_bridge_request ~stats_enabled request_json)
+
+let run_renderer_request_via_blorp ?release_host_heap_before_run request_json =
+  run_request_via_blorp_binary ?release_host_heap_before_run
+    renderer_bridge_binary request_json
 
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
@@ -2957,7 +3001,7 @@ let render_via_command_exn ~renderer ~op args =
 
 let emit_core_c_artifact_exn ?(profile = false) core_json =
   let response_json =
-    run_renderer_request_via_blorp
+    run_renderer_request_via_blorp ~release_host_heap_before_run:true
       (emit_core_c_request_json ~profile core_json)
   in
   match response_result response_json c_artifact_response_field with
