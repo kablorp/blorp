@@ -922,7 +922,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       in
       lower_concurrently_loop ~loc ~ty ~output var iter body timeout width
   | TA.EDetach inner ->
-      mk (CDetach { detach_body = lower_child_expr inner; detach_task = None })
+      mk (CDetach { detach_body = lower_child_expr inner })
   (* Subscript forms should never reach core_lower:
      - ESubscript / ESubscriptMulti are rewritten to calls by
        the Blorp typecheck-source finalizer before typecheck.
@@ -1040,7 +1040,6 @@ and lower_concurrently_loop ~loc ~ty ~output var iter body timeout width =
           cf_output = output;
           cf_item_mode;
           cf_task_scope = task_scope;
-          cf_task = None;
         };
     ty;
     loc;
@@ -1970,7 +1969,6 @@ and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
             cb_ty = type_of_child_expr stmt;
             cb_rhs = init';
             cb_task_scope = task_scope;
-            cb_task = None;
           }
       | _ ->
           Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)

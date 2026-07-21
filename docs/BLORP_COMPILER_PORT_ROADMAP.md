@@ -2165,10 +2165,12 @@ Deletion point:
 Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
 Status: Blorp DCE is authoritative on the normal production path and the
-superseded OCaml DCE implementation and tests are deleted. The remaining early
-and middle Core stages from debug/desugar through specialization are still
-OCaml-authoritative. Stage parity modules must not be counted as migrated until
-the production pass ordering invokes them and the replaced OCaml pass is
+superseded OCaml DCE implementation and tests are deleted. First-class
+function-reference adaptation is also Blorp-authoritative immediately after
+the handoff; its OCaml implementation and tests are deleted. The remaining
+early and middle Core stages from debug/desugar through specialization are
+still OCaml-authoritative. Stage parity modules must not be counted as migrated
+until the production pass ordering invokes them and the replaced OCaml pass is
 deleted.
 
 OCaml references, in `Core_pipeline.run_core_passes` order:
@@ -2203,8 +2205,6 @@ OCaml references, in `Core_pipeline.run_core_passes` order:
   - `core_tuple_sroa.ml` / `rewrite_program`
 - `compiler/lib/core_specialize.ml`
   - `specialize_program`
-- `compiler/lib/core_closure.ml`
-  - `adapt_function_refs_program`
 
 Blorp references:
 
@@ -2223,6 +2223,7 @@ Blorp references:
 - future `compiler_core_tailrec.brp`
 - future fusion modules
 - future `compiler_core_specialize.brp`
+- existing `compiler_core_closure.brp` / `adapt_function_refs_program`
 - existing `compiler_core_dce.brp`
 
 Implementation steps:

@@ -24,8 +24,9 @@ the filesystem order mirrors the compilation frontier:
 
 As the compiler migration progresses, prefer contiguous Blorp-owned pipeline
 slices with one OCaml transfer point at the boundary. The current supported
-backend route owns a real Core tail: `compiler_core_reuse.brp`,
-`compiler_core_closure.brp`, `compiler_core_resource.brp`,
+backend route begins with first-class function-reference adaptation in
+`compiler_core_closure.brp`, then owns DCE, consume specialization, Perceus,
+`compiler_core_reuse.brp`, late closure conversion, `compiler_core_resource.brp`,
 `compiler_core_fairness.brp`, `compiler_core_prepare.brp`, then
 `compiler_core_emit.brp`.
 Shared shallow Core expression traversal helpers live in

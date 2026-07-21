@@ -50,7 +50,7 @@ let request_json ?(schema = 1) ?(domain = "compiler_semantic_middle")
         "core_pre_dce";
         "rendered_stage_observations";
       ])
-    ?(observations = [ "lower"; "specialize" ]) ?stop_after () =
+    ?(observations = [ "lower"; "fusion" ]) ?stop_after () =
   Lsp_json.Object
     [
       ("schema", Lsp_json.Int schema);
@@ -118,7 +118,9 @@ let test_rejects_schema_domain_phase_and_stage () =
   expect_decode_error "unsupported_capability"
     (request_json ~capabilities:[ "source_loading" ] ());
   expect_decode_error "unsupported_stage"
-    (request_json ~observations:[ "dce" ] ())
+    (request_json ~observations:[ "dce" ] ());
+  expect_decode_error "unsupported_stage"
+    (request_json ~observations:[ "specialize" ] ())
 
 let test_rejects_missing_and_malformed_typed_fields () =
   let without_required_capabilities =

@@ -1,9 +1,8 @@
--- Closure conversion for the Blorp-owned Core tail.
+-- Closure formation for the Blorp-owned Core pipeline.
 --
--- This is a direct port of the production OCaml closure pass with
--- first-class function-reference wrapping intentionally left on the OCaml side
--- for now. The input boundary is post-reuse/pre-closure Core; this pass hoists
--- raw lambdas and task bodies into closure-body functions.
+-- First-class function references are normalized before Perceus so ownership
+-- insertion sees the eta-adapter body. Raw lambdas and task bodies are hoisted
+-- separately at the post-reuse/pre-closure boundary.
 import:
 	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
 	compiler_core_json:
@@ -143,7 +142,13 @@ import:
 			WhileExpr,
 		),
 		CoreFunction,
-		CoreFunctionKind(ClosureBodyFunction, UserFunction, BuiltinFunction, ForeignFunction),
+		CoreFunctionKind(
+			BuiltinFunction,
+			ClosureBodyFunction,
+			ForeignFunction,
+			UnresolvedBuiltinFunction,
+			UserFunction,
+		),
 		CoreGlobal,
 		CoreLiteralMatchCase,
 		CoreLogicalOp,
@@ -184,6 +189,8 @@ LAMBDA_NAME_PREFIX: String = "_blorp_clambda_"
 
 TASK_NAME_PREFIX: String = "_blorp_task_"
 
+ETA_NAME_PREFIX: String = "_blorp_eta_"
+
 MANGLED_DEF_ID_PREFIX: String = "__def_"
 
 STATIC_CLOSURE_PREFIX: String = "__sc_"
@@ -192,11 +199,18 @@ CLOSURE_TYPE_NAME: String = "Closure"
 
 VOID_TYPE_NAME: String = "Void"
 
+VOID_TYPE: CoreType = VoidType
+
 
 record FreeVar {
 	name: String,
 	typ: CoreType
 }
+
+
+enum ClosurePassMode:
+	AdaptFunctionRefs
+	ConvertClosures
 
 
 private pure func call_kind_uses_runtime_callee(kind: CoreCallKind) -> Bool:
@@ -230,10 +244,14 @@ private pure func call_kind_uses_runtime_callee(kind: CoreCallKind) -> Bool:
 
 
 record ClosureState {
+	mode: ClosurePassMode,
+	next_eta_index: Int,
 	next_lambda_index: Int,
 	next_task_index: Int,
 	next_def_id: Int,
 	current_module: Option[String],
+	functions_by_id: Dict[Int, List[CoreFunction]],
+	functions_by_name: Dict[String, List[CoreFunction]],
 	function_names: List[String],
 	constructor_names: List[String],
 	hoisted: List[CoreDecl]
@@ -399,6 +417,12 @@ record HoistedTaskClosure {
 }
 
 
+record FunctionIndexes {
+	by_id: Dict[Int, List[CoreFunction]],
+	by_name: Dict[String, List[CoreFunction]]
+}
+
+
 private pure func max_int(left: Int, right: Int) -> Int:
 	if left > right:
 		left
@@ -426,16 +450,20 @@ private pure func static_closure_name(c_name: String) -> String:
 	STATIC_CLOSURE_PREFIX + c_name
 
 
-private pure func void_type() -> CoreType:
-	VoidType
-
-
 private pure func var_from_name(name: String) -> CoreVar:
 	{
 		name = name,
 		uniq = 0,
 		def_id = None
 	}
+
+
+private pure func is_closure_value_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == CLOSURE_TYPE_NAME and args.length() == 0
+		_:
+			False
 
 
 private pure func task_capture_moves_env_slot(capture: CoreTaskCapture) -> Bool:
@@ -2049,6 +2077,23 @@ private pure func free_vars_expr(
 			)
 
 
+private pure func next_eta_name(state: ClosureState) -> FreshHoistedName:
+	name: String = ETA_NAME_PREFIX + state.next_eta_index.to_string()
+	def_id: Int = state.next_def_id
+	c_name: String = mangle_by_def_id(def_id, name)
+	new_state: ClosureState = { state |
+		next_eta_index = state.next_eta_index + 1,
+		next_def_id = state.next_def_id + 1
+	}
+	{
+		state = new_state,
+		name = name,
+		def_id = def_id,
+		c_name = c_name,
+		static_name = static_closure_name(c_name)
+	}
+
+
 private pure func next_lambda_name(state: ClosureState) -> FreshHoistedName:
 	name: String = LAMBDA_NAME_PREFIX + state.next_lambda_index.to_string()
 	def_id: Int = state.next_def_id
@@ -2118,10 +2163,14 @@ pure func lambda_runtime_captures(
 	body: CoreExpr,
 ) -> List[CoreClosureCapture]:
 	state: ClosureState = {
+		mode = ConvertClosures,
+		next_eta_index = 0,
 		next_lambda_index = 0,
 		next_task_index = 0,
 		next_def_id = 0,
 		current_module = None,
+		functions_by_id = {},
+		functions_by_name = {},
 		function_names = function_names,
 		constructor_names = constructor_names,
 		hoisted = []
@@ -3523,6 +3572,161 @@ private pure func add_hoisted_function(
 	{ state | hoisted = state.hoisted.append(FunctionDecl(func_info)) }
 
 
+private pure func function_target_for_var(
+	state: ClosureState,
+	variable: CoreVar,
+) -> Option[CoreFunction]:
+	by_name: Option[CoreFunction] = match state.functions_by_name.get(variable.name).get_or([]):
+		[only]:
+			Some(only)
+		_:
+			None
+
+	match variable.def_id:
+		Some(def_id):
+			candidates: List[CoreFunction] = state.functions_by_id.get(def_id).get_or([])
+			var exact: Option[CoreFunction] = None
+
+			for candidate in candidates:
+				if exact.is_none() and candidate.name == variable.name:
+					exact = Some(candidate)
+				else:
+					void
+
+			match exact:
+				Some(target):
+					Some(target)
+				None:
+					match candidates:
+						[only]:
+							Some(only)
+						_:
+							by_name
+		None:
+			by_name
+
+
+private pure func function_ref_call_kind(target: CoreFunction) -> Option[CoreCallKind]:
+	match target.body:
+		Some(body):
+			Some(UserCall(target.name, Some(target.def_id), []))
+		None:
+			match target.function_kind:
+				BuiltinFunction(c_name):
+					Some(BuiltinCall(c_name))
+				ForeignFunction(foreign_info):
+					Some(ForeignCall(foreign_info.c_name, foreign_info.arg_passing))
+				UserFunction:
+					None
+				UnresolvedBuiltinFunction:
+					None
+				ClosureBodyFunction(abi):
+					None
+
+
+private pure func adapt_var_expr(
+	state: ClosureState,
+	bound: List[String],
+	variable: CoreVar,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	if (
+		state.mode == ConvertClosures
+		or not is_closure_value_type(typ)
+		or contains_name(bound, variable.name)
+		or contains_name(state.constructor_names, variable.name)
+	):
+		{
+			state = state,
+			expr = VarExpr(variable, typ, loc)
+		}
+	else:
+		match function_target_for_var(state, variable):
+			Some(target):
+				match function_ref_call_kind(target):
+					Some(call_kind):
+						var params: List[CoreParam] = []
+						var args: List[CoreExpr] = []
+						var index: Int = 0
+
+						for target_param in target.params:
+							param_variable: CoreVar = var_from_name(
+								"__eta_arg_" + index.to_string(),
+							)
+							params = params.append({
+								name = param_variable,
+								typ = target_param.typ,
+								loc = loc,
+							})
+							args = args.append(VarExpr(param_variable, target_param.typ, loc))
+							index += 1
+
+						fresh: FreshHoistedName = next_eta_name(state)
+						abi: CoreClosureAbi = {
+							c_name = fresh.c_name,
+							params = params,
+							captures = [],
+							moved_captures = [],
+							task_abi = False,
+						}
+						callee: CoreExpr = VarExpr(
+							{
+								name = target.name,
+								uniq = variable.uniq,
+								def_id = Some(target.def_id),
+							},
+							typ,
+							loc,
+						)
+						adapter: CoreFunction = {
+							name = fresh.name,
+							source_module = fresh.state.current_module,
+							type_params = [],
+							params = params,
+							return_type = target.return_type,
+							body = Some(CallExpr(
+								call_kind,
+								callee,
+								args,
+								target.return_type,
+								loc,
+							)),
+							is_pure = target.is_pure,
+							function_kind = ClosureBodyFunction(abi),
+							def_id = fresh.def_id,
+							loc = loc,
+						}
+						final_state: ClosureState = add_hoisted_function(
+							fresh.state,
+							adapter,
+						)
+						{
+							state = final_state,
+							expr = ClosureCreateExpr(
+								{
+									function_name = fresh.name,
+									def_id = fresh.def_id,
+									c_name = fresh.c_name,
+									static_name = fresh.static_name,
+									captures = [],
+								},
+								typ,
+								loc,
+							),
+						}
+					None:
+						{
+							state = state,
+							expr = VarExpr(variable, typ, loc),
+						}
+			None:
+				{
+					state = state,
+					expr = VarExpr(variable, typ, loc),
+				}
+
+
 private pure func hoist_lambda(
 	state: ClosureState,
 	capturable: List[String],
@@ -4241,7 +4445,16 @@ private pure func convert_call_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
-	callee_converted: ConvertedExpr = convert_expr(state, bound, callee)
+	callee_converted: ConvertedExpr = if (
+		state.mode == AdaptFunctionRefs
+		and not call_kind_uses_runtime_callee(kind)
+	):
+		{
+			state = state,
+			expr = callee,
+		}
+	else:
+		convert_expr(state, bound, callee)
 	args_converted: ConvertedExprs = convert_exprs(callee_converted.state, bound, args)
 	{
 		state = args_converted.state,
@@ -4522,10 +4735,7 @@ private pure func convert_non_spine_expr(
 				expr = expr
 			}
 		VarExpr(variable, typ, loc):
-			{
-				state = state,
-				expr = expr
-			}
+			adapt_var_expr(state, bound, variable, typ, loc)
 		VoidExpr(typ, loc):
 			{
 				state = state,
@@ -4628,19 +4838,33 @@ private pure func convert_non_spine_expr(
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			body_bound: List[String] = add_bound_params(bound, params)
 			body_converted: ConvertedExpr = convert_expr(state, body_bound, body)
-			hoisted: HoistedClosureCreate = hoist_lambda(
-				body_converted.state,
-				bound,
-				params,
-				return_type,
-				body_converted.expr,
-				is_pure,
-				loc,
-			)
-			{
-				state = hoisted.state,
-				expr = ClosureCreateExpr(hoisted.create, typ, loc)
-			}
+
+			if state.mode == AdaptFunctionRefs:
+				{
+					state = body_converted.state,
+					expr = LambdaExpr(
+						params,
+						return_type,
+						body_converted.expr,
+						is_pure,
+						typ,
+						loc,
+					),
+				}
+			else:
+				hoisted: HoistedClosureCreate = hoist_lambda(
+					body_converted.state,
+					bound,
+					params,
+					return_type,
+					body_converted.expr,
+					is_pure,
+					loc,
+				)
+				{
+					state = hoisted.state,
+					expr = ClosureCreateExpr(hoisted.create, typ, loc),
+				}
 		ClosureCreateExpr(closure, typ, loc):
 			{
 				state = state,
@@ -5017,18 +5241,25 @@ private pure func convert_non_spine_expr(
 			}
 		PreClosureDetachExpr(detached, typ, loc):
 			body: ConvertedExpr = convert_expr(state, bound, detached.body)
-			task: HoistedTaskClosure = hoist_copy_task(
-				body.state,
-				bound,
-				[],
-				body.expr,
-				void_type(),
-				loc,
-			)
-			{
-				state = task.state,
-				expr = DetachExpr({task = task.task}, typ, loc)
-			}
+
+			if state.mode == AdaptFunctionRefs:
+				{
+					state = body.state,
+					expr = PreClosureDetachExpr({body = body.expr}, typ, loc),
+				}
+			else:
+				task: HoistedTaskClosure = hoist_copy_task(
+					body.state,
+					bound,
+					[],
+					body.expr,
+					VOID_TYPE,
+					loc,
+				)
+				{
+					state = task.state,
+					expr = DetachExpr({task = task.task}, typ, loc),
+				}
 		DetachExpr(detached, typ, loc):
 			{
 				state = state,
@@ -5318,34 +5549,50 @@ private pure func convert_non_spine_expr(
 			body: ConvertedExpr = convert_expr(iterable.state, body_bound, loop.body)
 			timeout: ConvertedOptionalExpr = convert_optional_expr(body.state, bound, loop.timeout)
 			limit: ConvertedExpr = convert_expr(timeout.state, bound, loop.limit)
-			task: HoistedTaskClosure = hoist_loop_task(
-				limit.state,
-				body_bound,
-				[],
-				loop.variable,
-				loop.item_mode,
-				body.expr,
-				core_expr_type(body.expr),
-				loc,
-			)
-			{
-				state = task.state,
-				expr = ConcurrentlyLoopExpr(
-					{
-						variable = loop.variable,
-						item_type = loop.item_type,
-						item_mode = loop.item_mode,
-						iterable = iterable.expr,
-						body = body.expr,
-						timeout = timeout.expr,
-						limit = limit.expr,
-						output = loop.output,
-						task = task.task
-					},
-					typ,
+
+			if state.mode == AdaptFunctionRefs:
+				{
+					state = limit.state,
+					expr = PreClosureConcurrentlyLoopExpr(
+						{ loop |
+							iterable = iterable.expr,
+							body = body.expr,
+							timeout = timeout.expr,
+							limit = limit.expr,
+						},
+						typ,
+						loc,
+					),
+				}
+			else:
+				task: HoistedTaskClosure = hoist_loop_task(
+					limit.state,
+					body_bound,
+					[],
+					loop.variable,
+					loop.item_mode,
+					body.expr,
+					core_expr_type(body.expr),
 					loc,
 				)
-			}
+				{
+					state = task.state,
+					expr = ConcurrentlyLoopExpr(
+						{
+							variable = loop.variable,
+							item_type = loop.item_type,
+							item_mode = loop.item_mode,
+							iterable = iterable.expr,
+							body = body.expr,
+							timeout = timeout.expr,
+							limit = limit.expr,
+							output = loop.output,
+							task = task.task,
+						},
+						typ,
+						loc,
+					),
+				}
 		ConcurrentlyLoopExpr(loop, typ, loc):
 			iterable: ConvertedExpr = convert_expr(state, bound, loop.iterable)
 			body_bound: List[String] = add_bound_var(bound, loop.variable)
@@ -5366,51 +5613,84 @@ private pure func convert_non_spine_expr(
 				)
 			}
 		PreClosureConcurrentExpr(block, typ, loc):
-			var current: ClosureState = state
-			var bindings: List[CoreConcurrentBinding] = []
+			if state.mode == AdaptFunctionRefs:
+				var current: ClosureState = state
+				var bindings: List[CorePreClosureConcurrentBinding] = []
 
-			for binding in block.bindings:
-				rhs: ConvertedExpr = convert_expr(current, copy_names(bound), binding.rhs)
-				task: HoistedTaskClosure = hoist_copy_task(
-					rhs.state,
+				for binding in block.bindings:
+					rhs: ConvertedExpr = convert_expr(current, copy_names(bound), binding.rhs)
+					current = rhs.state
+					bindings = bindings.append({ binding | rhs = rhs.expr })
+
+				var body_bound: List[String] = copy_names(bound)
+
+				for binding in block.bindings:
+					body_bound = add_bound_var(body_bound, binding.variable)
+
+				body: ConvertedExpr = convert_expr(current, body_bound, block.body)
+				timeout: ConvertedOptionalExpr = convert_optional_expr(
+					body.state,
 					copy_names(bound),
-					[],
-					rhs.expr,
-					core_expr_type(rhs.expr),
-					loc,
+					block.timeout,
 				)
-				current = task.state
-				bindings = bindings.append({
-					variable = binding.variable,
-					typ = binding.typ,
-					rhs = rhs.expr,
-					task = task.task,
-				})
+				{
+					state = timeout.state,
+					expr = PreClosureConcurrentExpr(
+						{ block |
+							bindings = bindings,
+							body = body.expr,
+							timeout = timeout.expr,
+						},
+						typ,
+						loc,
+					),
+				}
+			else:
+				var current: ClosureState = state
+				var bindings: List[CoreConcurrentBinding] = []
 
-			var body_bound: List[String] = copy_names(bound)
+				for binding in block.bindings:
+					rhs: ConvertedExpr = convert_expr(current, copy_names(bound), binding.rhs)
+					task: HoistedTaskClosure = hoist_copy_task(
+						rhs.state,
+						copy_names(bound),
+						[],
+						rhs.expr,
+						core_expr_type(rhs.expr),
+						loc,
+					)
+					current = task.state
+					bindings = bindings.append({
+						variable = binding.variable,
+						typ = binding.typ,
+						rhs = rhs.expr,
+						task = task.task,
+					})
 
-			for binding in block.bindings:
-				body_bound = add_bound_var(body_bound, binding.variable)
+				var body_bound: List[String] = copy_names(bound)
 
-			body: ConvertedExpr = convert_expr(current, body_bound, block.body)
-			timeout: ConvertedOptionalExpr = convert_optional_expr(
-				body.state,
-				copy_names(bound),
-				block.timeout,
-			)
-			{
-				state = timeout.state,
-				expr = ConcurrentExpr(
-					{
-						bindings = bindings,
-						body = body.expr,
-						timeout = timeout.expr,
-						max_threads = block.max_threads
-					},
-					typ,
-					loc,
+				for binding in block.bindings:
+					body_bound = add_bound_var(body_bound, binding.variable)
+
+				body: ConvertedExpr = convert_expr(current, body_bound, block.body)
+				timeout: ConvertedOptionalExpr = convert_optional_expr(
+					body.state,
+					copy_names(bound),
+					block.timeout,
 				)
-			}
+				{
+					state = timeout.state,
+					expr = ConcurrentExpr(
+						{
+							bindings = bindings,
+							body = body.expr,
+							timeout = timeout.expr,
+							max_threads = block.max_threads,
+						},
+						typ,
+						loc,
+					),
+				}
 		ConcurrentExpr(block, typ, loc):
 			var current: ClosureState = state
 			var bindings: List[CoreConcurrentBinding] = []
@@ -5688,12 +5968,55 @@ pure func capture_function_names(program: CoreProgram) -> List[String]:
 	names
 
 
-private pure func initial_state(program: CoreProgram) -> ClosureState:
+private pure func index_function(
+	indexes: FunctionIndexes,
+	func_info: CoreFunction,
+) -> FunctionIndexes:
 	{
+		by_id = indexes.by_id.set(
+			func_info.def_id,
+			indexes.by_id.get(func_info.def_id).get_or([]).append(func_info),
+		),
+		by_name = indexes.by_name.set(
+			func_info.name,
+			indexes.by_name.get(func_info.name).get_or([]).append(func_info),
+		),
+	}
+
+
+private pure func index_functions(program: CoreProgram) -> FunctionIndexes:
+	var indexes: FunctionIndexes = {
+		by_id = {},
+		by_name = {},
+	}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				indexes = index_function(indexes, func_info)
+			ImplDecl(impl_info):
+				for method in impl_info.methods:
+					indexes = index_function(indexes, method)
+			_:
+				void
+
+	indexes
+
+
+private pure func initial_state(
+	program: CoreProgram,
+	mode: ClosurePassMode,
+) -> ClosureState:
+	indexes: FunctionIndexes = index_functions(program)
+	{
+		mode = mode,
+		next_eta_index = 0,
 		next_lambda_index = 0,
 		next_task_index = 0,
 		next_def_id = max_program_def_id(program) + 1,
 		current_module = None,
+		functions_by_id = indexes.by_id,
+		functions_by_name = indexes.by_name,
 		function_names = capture_function_names(program),
 		constructor_names = capture_constructor_names(program),
 		hoisted = []
@@ -5734,6 +6057,11 @@ private pure func convert_decl(state: ClosureState, decl: CoreDecl) -> Converted
 				{
 					state = converted.state,
 					decls = [converted.decl]
+				}
+			else if state.mode == AdaptFunctionRefs:
+				{
+					state = state,
+					decls = [decl],
 				}
 			else:
 				{
@@ -5798,9 +6126,24 @@ private pure func convert_decls(state: ClosureState, decls: List[CoreDecl]) -> C
 	}
 
 
-pure func convert_program(program: CoreProgram) -> CoreProgram:
-	converted: ConvertedDecls = convert_decls(initial_state(program), program.decls)
+private pure func run_closure_pass(
+	program: CoreProgram,
+	mode: ClosurePassMode,
+) -> CoreProgram:
+	converted: ConvertedDecls = convert_decls(initial_state(program, mode), program.decls)
 	{
 		decls = converted.decls.concat(converted.state.hoisted),
 		foreign_includes = program.foreign_includes
 	}
+
+
+-- Normalize bare global function values into explicit eta closures before
+-- Perceus. Exact (name, def-id) identity wins; a raw def-id is accepted only
+-- when it identifies one function in the projected program. A reference with
+-- no def-id is accepted only when its name identifies one function.
+pure func adapt_function_refs_program(program: CoreProgram) -> CoreProgram:
+	run_closure_pass(program, AdaptFunctionRefs)
+
+
+pure func convert_program(program: CoreProgram) -> CoreProgram:
+	run_closure_pass(program, ConvertClosures)

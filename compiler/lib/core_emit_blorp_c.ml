@@ -1592,123 +1592,6 @@ let closure_params_json ~reg enum_names value_record_names heap_record_names uni
         (Printf.sprintf "%s[%d]" path index)
         param)
 
-let closure_capture_json ~reg enum_names value_record_names heap_record_names
-    union_names path (name, capture_ty) =
-  let* typ =
-    type_json ~reg enum_names value_record_names heap_record_names union_names
-      (path ^ ".type") capture_ty
-  in
-  Ok (obj [ ("name", str name); ("type", typ) ])
-
-let closure_captures_json ~reg enum_names value_record_names heap_record_names
-    union_names path captures =
-  result_list captures (fun index capture ->
-      closure_capture_json ~reg enum_names value_record_names heap_record_names
-        union_names
-        (Printf.sprintf "%s[%d]" path index)
-        capture)
-
-let closure_abi_json ~reg enum_names value_record_names heap_record_names union_names
-    path c_name (abi : Core.closure_abi) =
-  let* params =
-    closure_params_json ~reg enum_names value_record_names heap_record_names
-      union_names (path ^ ".params") abi.ca_params
-  in
-  let* captures =
-    closure_captures_json ~reg enum_names value_record_names heap_record_names
-      union_names (path ^ ".captures") abi.ca_captures
-  in
-  Ok
-    (obj
-       [
-         ("c_name", str c_name);
-         ("params", params);
-         ("captures", captures);
-         ("moved_captures", string_list_json abi.ca_moved_captures);
-         ("task_abi", bool abi.ca_task_abi);
-       ])
-
-let scalar_closure_capture_type ~reg = function
-  | Ast.TyNamed
-      ( ( "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16"
-        | "UInt32" | "UInt64" | "Bool" | "Char" ),
-        [] ) ->
-      true
-  | ty when Types.is_any_float_type ty -> true
-  | Ast.TyNamed (name, []) when Codegen_types.is_enum_type reg name -> true
-  | _ -> false
-
-let managed_pointer_closure_capture_type ~reg = function
-  | Ast.TyNamed (("String" | "Bytes" | "Fixed" | "Closure"), []) -> true
-  | Ast.TyFunc _ -> true
-  | Ast.TyNamed ("List", [ _ ]) -> true
-  | Ast.TyNamed ("Dict", [ _; _ ]) -> true
-  | Ast.TyNamed ("Set", [ _ ]) -> true
-  | Ast.TyNamed ("Channel", [ _ ]) -> true
-  | Ast.TyArray _ -> true
-  | Ast.TyNamed (name, []) when Codegen_types.is_managed_type reg name -> true
-  | _ -> false
-
-let unmanaged_pointer_closure_capture_type = function
-  | Ast.TyNamed ("Ptr", []) -> true
-  | _ -> false
-
-let value_record_closure_capture_type ~reg = function
-  | Ast.TyNamed (name, []) when Hashtbl.mem reg.Codegen_types.value_records name ->
-      true
-  | _ -> false
-
-let supported_closure_capture_type ~reg ty =
-  let ty = Codegen_types.expand_alias ~reg ty in
-  scalar_closure_capture_type ~reg ty
-  || managed_pointer_closure_capture_type ~reg ty
-  || unmanaged_pointer_closure_capture_type ty
-  || value_record_closure_capture_type ~reg ty
-
-let supported_resource_task_capture_type ~reg ty =
-  let ty = Codegen_types.expand_alias ~reg ty in
-  supported_closure_capture_type ~reg ty
-  || Core_layout_type.is_pointer_type ~reg ty
-
-let rec require_supported_closure_captures ~reg path index captures =
-  match captures with
-  | [] -> Ok ()
-  | (_, capture_ty) :: rest ->
-      if supported_closure_capture_type ~reg capture_ty then
-        require_supported_closure_captures ~reg path (index + 1) rest
-      else
-        unsupported
-          (Printf.sprintf "%s[%d]" path index)
-          (Printf.sprintf "unsupported closure capture type %s"
-             (Types.type_to_string capture_ty))
-
-let rec require_supported_task_abi_captures ~reg moved_captures path index
-    captures =
-  match captures with
-  | [] -> Ok ()
-  | (capture_name, capture_ty) :: rest ->
-      let supported =
-        if List.mem capture_name moved_captures then
-          supported_resource_task_capture_type ~reg capture_ty
-        else supported_closure_capture_type ~reg capture_ty
-      in
-      if supported then
-        require_supported_task_abi_captures ~reg moved_captures path (index + 1)
-          rest
-      else
-        unsupported
-          (Printf.sprintf "%s[%d]" path index)
-          (Printf.sprintf "unsupported closure capture type %s"
-             (Types.type_to_string capture_ty))
-
-let require_closure_body_abi ~reg path (abi : Core.closure_abi) =
-  match (abi.ca_captures, abi.ca_moved_captures, abi.ca_task_abi) with
-  | captures, moved_captures, true ->
-      require_supported_task_abi_captures ~reg moved_captures
-        (path ^ ".captures") 0 captures
-  | captures, _, false ->
-      require_supported_closure_captures ~reg (path ^ ".captures") 0 captures
-
 let loop_range_direction_json = function
   | Core.RangeMayRunBackward -> str "may_run_backward"
   | Core.RangeForwardOnly -> str "forward_only"
@@ -2353,30 +2236,6 @@ let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_t
       unsupported path
         ("unresolved call kind for callee `" ^ compact_callee_label callee ^ "`")
   | _ -> call_kind_json ~consumed_params ~reg path ~result_ty ~loc call_kind
-
-let require_closure_create ~reg path (closure : Core.closure_create) =
-  require_supported_closure_captures ~reg (path ^ ".captures") 0
-    closure.cc_captures
-
-let closure_create_json ~reg enum_names value_record_names heap_record_names
-    union_names path (closure : Core.closure_create) =
-  let* () = require_closure_create ~reg path closure in
-  let c_name =
-    Codegen_names.mangle_by_def_id closure.cc_def_id closure.cc_func
-  in
-  let* captures =
-    closure_captures_json ~reg enum_names value_record_names heap_record_names
-      union_names (path ^ ".captures") closure.cc_captures
-  in
-  Ok
-    (obj
-       [
-         ("function_name", str closure.cc_func);
-         ("def_id", int closure.cc_def_id);
-         ("c_name", str c_name);
-         ("static_name", str ("__sc_" ^ c_name));
-         ("captures", captures);
-       ])
 
 let binop_tag = function
   | Ast.Add -> Ok "add"
@@ -4423,13 +4282,6 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
           ]
       in
       Ok (kind "lambda" fields)
-  | Core.CClosureCreate closure ->
-      let* closure_json =
-        closure_create_json ~reg enum_names value_record_names heap_record_names
-          union_names (path ^ ".closure") closure
-      in
-      let* fields = typed [ ("closure", closure_json) ] in
-      Ok (kind "closure_create" fields)
   | Core.CTensorRawRead read ->
       let* read_json =
         tensor_raw_read_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -4476,67 +4328,30 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
   | Core.CMatchArms _ -> unsupported path "match arms"
   | Core.CMatch _ -> unsupported path "compiled match"
   | Core.CConcurrent block ->
-      if List.for_all (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task) block.conc_bindings then
-        let* block_json =
-          concurrent_block_json ~function_names ~consumed_params ~reg enum_names
-            value_record_names heap_record_names union_names enum_constructors
-            (path ^ ".concurrent") block
-        in
-        let* fields = typed [ ("concurrent", block_json) ] in
-        Ok (kind "concurrent" fields)
-      else
-        let* block_json =
-          pre_closure_concurrent_block_json ~function_names ~consumed_params
-            ~reg enum_names value_record_names heap_record_names union_names
-            enum_constructors
-            (path ^ ".pre_closure_concurrent") block
-        in
-        let* fields = typed [ ("pre_closure_concurrent", block_json) ] in
-        Ok (kind "pre_closure_concurrent" fields)
+      let* block_json =
+        pre_closure_concurrent_block_json ~function_names ~consumed_params
+          ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors
+          (path ^ ".pre_closure_concurrent") block
+      in
+      let* fields = typed [ ("pre_closure_concurrent", block_json) ] in
+      Ok (kind "pre_closure_concurrent" fields)
   | Core.CConcurrentlyLoop loop ->
-      begin
-        match loop.cf_task with
-        | Some _ ->
-            let* loop_json =
-              concurrently_loop_json ~function_names ~consumed_params ~reg
-                enum_names value_record_names heap_record_names union_names
-                enum_constructors
-                (path ^ ".concurrently_loop") loop
-            in
-            let* fields = typed [ ("concurrently_loop", loop_json) ] in
-            Ok (kind "concurrently_loop" fields)
-        | None ->
-            let* loop_json =
-              pre_closure_concurrently_loop_json ~function_names
-                ~consumed_params ~reg enum_names value_record_names
-                heap_record_names union_names enum_constructors
-                (path ^ ".pre_closure_concurrently_loop") loop
-            in
-            let* fields =
-              typed [ ("pre_closure_concurrently_loop", loop_json) ]
-            in
-            Ok (kind "pre_closure_concurrently_loop" fields)
-      end
+      let* loop_json =
+        pre_closure_concurrently_loop_json ~function_names ~consumed_params
+          ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".pre_closure_concurrently_loop") loop
+      in
+      let* fields = typed [ ("pre_closure_concurrently_loop", loop_json) ] in
+      Ok (kind "pre_closure_concurrently_loop" fields)
   | Core.CDetach detach ->
-      begin
-        match detach.detach_task with
-        | Some _ ->
-            let* detach_json =
-              detach_json ~reg enum_names value_record_names heap_record_names
-                union_names (path ^ ".detach") detach
-            in
-            let* fields = typed [ ("detach", detach_json) ] in
-            Ok (kind "detach" fields)
-        | None ->
-            let* detach_json =
-              pre_closure_detach_json ~function_names ~consumed_params ~reg
-                enum_names value_record_names heap_record_names union_names
-                enum_constructors
-                (path ^ ".pre_closure_detach") detach
-            in
-            let* fields = typed [ ("pre_closure_detach", detach_json) ] in
-            Ok (kind "pre_closure_detach" fields)
-      end
+      let* detach_json =
+        pre_closure_detach_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".pre_closure_detach") detach
+      in
+      let* fields = typed [ ("pre_closure_detach", detach_json) ] in
+      Ok (kind "pre_closure_detach" fields)
   | Core.CSelect select ->
       let* select_json =
         select_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -4909,66 +4724,6 @@ and for_resource_source_json ~function_names ~consumed_params ~reg enum_names va
          ("body", body_json);
        ])
 
-and task_capture_kind_json = function
-  | Core.TaskCopyCapture -> str "copy"
-  | Core.TaskMoveResourceItem -> str "move_resource_item"
-  | Core.TaskStructuredTaskBorrow -> str "structured_task_borrow"
-
-and task_capture_json ~reg enum_names value_record_names heap_record_names
-    union_names path (capture : Core.task_capture) =
-  let* typ =
-    type_json ~reg enum_names value_record_names heap_record_names union_names
-      (path ^ ".type") capture.task_capture_ty
-  in
-  Ok
-    (obj
-       [
-         ("name", str capture.task_capture_name);
-         ("type", typ);
-         ("kind", task_capture_kind_json capture.task_capture_kind);
-       ])
-
-and task_captures_json ~reg enum_names value_record_names heap_record_names
-    union_names path captures =
-  result_list captures (fun index capture ->
-      task_capture_json ~reg enum_names value_record_names heap_record_names
-        union_names
-        (Printf.sprintf "%s[%d]" path index)
-        capture)
-
-and task_closure_json ~reg enum_names value_record_names heap_record_names
-    union_names path (task : Core.task_closure) =
-  let c_name = Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func in
-  let* captures =
-    task_captures_json ~reg enum_names value_record_names heap_record_names
-      union_names (path ^ ".captures") task.tc_captures
-  in
-  let* return_type =
-    type_json ~reg enum_names value_record_names heap_record_names union_names
-      (path ^ ".return_type") task.tc_return_ty
-  in
-  Ok
-    (obj
-       [
-         ("function_name", str task.tc_func);
-         ("def_id", int task.tc_def_id);
-         ("c_name", str c_name);
-         ("static_name", str ("__sc_" ^ c_name));
-         ("captures", captures);
-         ("return_type", return_type);
-       ])
-
-and detach_json ~reg enum_names value_record_names heap_record_names union_names
-    path (detach : Core.detach_expr) =
-  match detach.detach_task with
-  | Some task ->
-      let* task_json =
-        task_closure_json ~reg enum_names value_record_names heap_record_names
-          union_names (path ^ ".task") task
-      in
-      Ok (obj [ ("task", task_json) ])
-  | None -> unsupported (path ^ ".task") "missing detach task closure"
-
 and pre_closure_detach_json ~function_names ~consumed_params ~reg enum_names
     value_record_names heap_record_names union_names enum_constructors path
     (detach : Core.detach_expr) =
@@ -4978,35 +4733,6 @@ and pre_closure_detach_json ~function_names ~consumed_params ~reg enum_names
       (path ^ ".body") detach.detach_body
   in
   Ok (obj [ ("body", body) ])
-
-and concurrent_binding_json ~function_names ~consumed_params ~reg enum_names
-    value_record_names heap_record_names union_names enum_constructors path index
-    (binding : Core.conc_binding) =
-  let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
-  let* binding_type =
-    type_json ~reg enum_names value_record_names heap_record_names union_names
-      (binding_path ^ ".type") binding.cb_ty
-  in
-  let* rhs =
-    expr_json ~function_names ~consumed_params ~reg enum_names
-      value_record_names heap_record_names union_names enum_constructors
-      (binding_path ^ ".rhs") binding.cb_rhs
-  in
-  let* task =
-    match binding.cb_task with
-    | Some task ->
-        task_closure_json ~reg enum_names value_record_names heap_record_names
-          union_names (binding_path ^ ".task") task
-    | None -> unsupported (binding_path ^ ".task") "missing concurrent task closure"
-  in
-  Ok
-    (obj
-       [
-         ("var", var_json binding.cb_var);
-         ("type", binding_type);
-         ("rhs", rhs);
-         ("task", task);
-       ])
 
 and pre_closure_concurrent_binding_json ~function_names ~consumed_params ~reg
     enum_names value_record_names heap_record_names union_names enum_constructors
@@ -5039,13 +4765,15 @@ and concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
         timeout
   | None -> Ok null
 
-and concurrent_block_json ~function_names ~consumed_params ~reg enum_names
-    value_record_names heap_record_names union_names enum_constructors path
+and pre_closure_concurrent_block_json ~function_names ~consumed_params ~reg
+    enum_names value_record_names heap_record_names union_names enum_constructors
+    path
     (block : Core.concurrent_block) =
   let* bindings =
     result_list block.conc_bindings
-      (concurrent_binding_json ~function_names ~consumed_params ~reg enum_names
-         value_record_names heap_record_names union_names enum_constructors path)
+      (pre_closure_concurrent_binding_json ~function_names ~consumed_params
+         ~reg enum_names value_record_names heap_record_names union_names
+         enum_constructors path)
   in
   let* body =
     expr_json ~function_names ~consumed_params ~reg enum_names
@@ -5065,38 +4793,6 @@ and concurrent_block_json ~function_names ~consumed_params ~reg enum_names
          ("timeout", timeout);
          ("max_threads", option_int_json block.conc_max_threads);
        ])
-
-and pre_closure_concurrent_block_json ~function_names ~consumed_params ~reg
-    enum_names value_record_names heap_record_names union_names enum_constructors
-    path
-    (block : Core.concurrent_block) =
-  if List.exists (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task) block.conc_bindings then
-    unsupported (path ^ ".bindings") "mixed pre-closure and post-closure concurrent bindings"
-  else
-    let* bindings =
-      result_list block.conc_bindings
-        (pre_closure_concurrent_binding_json ~function_names ~consumed_params
-           ~reg enum_names value_record_names heap_record_names union_names
-           enum_constructors path)
-    in
-    let* body =
-      expr_json ~function_names ~consumed_params ~reg enum_names
-        value_record_names heap_record_names union_names enum_constructors
-        (path ^ ".body") block.conc_body
-    in
-    let* timeout =
-      concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
-        value_record_names heap_record_names union_names enum_constructors
-        (path ^ ".timeout") block.conc_timeout
-    in
-    Ok
-      (obj
-         [
-           ("bindings", bindings);
-           ("body", body);
-           ("timeout", timeout);
-           ("max_threads", option_int_json block.conc_max_threads);
-         ])
 
 and concurrently_loop_output_json = function
   | Core.ConcurrentlyLoopCollect -> str "collect"
@@ -5128,61 +4824,6 @@ and concurrently_loop_item_mode_json ~reg enum_names value_record_names
       Ok
         (kind "move_resource_item"
            [ ("resource_type", resource_type); ("error_type", error_type) ])
-
-and concurrently_loop_json ~function_names ~consumed_params ~reg enum_names
-    value_record_names heap_record_names union_names enum_constructors path
-    (loop : Core.concurrently_loop) =
-  let* item_ty = concurrently_loop_item_type (path ^ ".item_type") loop in
-  let* item_type =
-    type_json ~reg enum_names value_record_names heap_record_names union_names
-      (path ^ ".item_type") item_ty
-  in
-  let* item_mode =
-    concurrently_loop_item_mode_json ~reg enum_names value_record_names
-      heap_record_names union_names (path ^ ".item_mode") loop.cf_item_mode
-  in
-  let* iterable =
-    expr_json ~function_names ~consumed_params ~reg enum_names
-      value_record_names heap_record_names union_names enum_constructors
-      (path ^ ".iterable") loop.cf_iter
-  in
-  let* body =
-    expr_json ~function_names ~consumed_params ~reg enum_names
-      value_record_names heap_record_names union_names enum_constructors
-      (path ^ ".body") loop.cf_body
-  in
-  let* timeout =
-    concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
-      value_record_names heap_record_names union_names enum_constructors
-      (path ^ ".timeout") loop.cf_timeout
-  in
-  let* limit =
-    match loop.cf_width with
-    | Core.ConcurrentlyLoopLimit limit ->
-        expr_json ~function_names ~consumed_params ~reg enum_names
-          value_record_names heap_record_names union_names enum_constructors
-          (path ^ ".limit") limit
-  in
-  let* task =
-    match loop.cf_task with
-    | Some task ->
-        task_closure_json ~reg enum_names value_record_names heap_record_names
-          union_names (path ^ ".task") task
-    | None -> unsupported (path ^ ".task") "missing concurrently loop task closure"
-  in
-  Ok
-    (obj
-       [
-         ("var", var_json loop.cf_var);
-         ("item_type", item_type);
-         ("item_mode", item_mode);
-         ("iterable", iterable);
-         ("body", body);
-         ("timeout", timeout);
-         ("limit", limit);
-         ("output", concurrently_loop_output_json loop.cf_output);
-         ("task", task);
-       ])
 
 and pre_closure_concurrently_loop_json ~function_names ~consumed_params ~reg
     enum_names value_record_names heap_record_names union_names enum_constructors
@@ -6098,11 +5739,13 @@ and union_construct_json ~function_names ~consumed_params ~reg enum_names value_
          ("args", args_json);
        ])
 
-let function_kind_json ~reg enum_names value_record_names heap_record_names union_names
-    path (func : Core.core_func) =
+let function_kind_json (func : Core.core_func) =
   match func.cf_kind with
   | Core.CFUser -> Ok (kind "user" [])
-  | Core.CFBuiltin -> Ok (kind "builtin" [])
+  | Core.CFBuiltin -> (
+      match Core_resolve.builtin_c_name_for_func func with
+      | Some c_name -> Ok (kind "builtin" [ ("c_name", str c_name) ])
+      | None -> Ok (kind "unresolved_builtin" []))
   | Core.CFForeign foreign ->
       let link_flag_json (platform, flag) =
         obj
@@ -6119,14 +5762,6 @@ let function_kind_json ~reg enum_names value_record_names heap_record_names unio
              ("link_flags", arr (List.map link_flag_json foreign.link_flags));
              ("arg_passing", foreign_arg_passing_json foreign.arg_passing);
            ])
-  | Core.CFClosureBody abi ->
-      let* () = require_closure_body_abi ~reg path abi in
-      let c_name = Codegen_names.mangle_by_def_id func.cf_def_id func.cf_name in
-      let* abi_json =
-        closure_abi_json ~reg enum_names value_record_names heap_record_names
-          union_names (path ^ ".abi") c_name abi
-      in
-      Ok (kind "closure_body" [ ("abi", abi_json) ])
 
 let collect_foreign_includes (program : Core.core_program) =
   let seen = Hashtbl.create 8 in
@@ -6142,7 +5777,7 @@ let collect_foreign_includes (program : Core.core_program) =
     | Core.CDFunc func -> (
         match func.cf_kind with
         | Core.CFForeign { includes; _ } -> List.iter remember includes
-        | Core.CFUser | Core.CFBuiltin | Core.CFClosureBody _ -> ())
+        | Core.CFUser | Core.CFBuiltin -> ())
     | Core.CDPrivate inner -> visit_decl inner
     | _ -> ()
   in
@@ -6420,7 +6055,6 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CRecordConstruct rc -> require_record_construct path rc
   | Core.CUnionConstruct uc -> require_union_construct path uc
   | Core.CLambda _ -> Ok ()
-  | Core.CClosureCreate _ -> Ok ()
   | Core.CRange (lo, hi) ->
       let* () = require_simple_expr (path ^ ".start") lo in
       require_simple_expr (path ^ ".end") hi
@@ -6931,123 +6565,33 @@ and require_resource_cleanup_exit ~reg union_names path
   in
   check 0 cleanup_exit.rce_cleanups
 
-and require_task_copy_captures ~reg path index captures =
-  match captures with
-  | [] -> Ok ()
-  | (capture : Core.task_capture) :: rest -> (
-      match capture.task_capture_kind with
-      | Core.TaskCopyCapture ->
-          if supported_closure_capture_type ~reg capture.task_capture_ty then
-            require_task_copy_captures ~reg path (index + 1) rest
-          else
-            unsupported
-              (Printf.sprintf "%s[%d]" path index)
-              "unsupported concurrent task capture type"
-      | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow ->
-          unsupported
-            (Printf.sprintf "%s[%d]" path index)
-            "non-copy concurrent task capture")
-
-and require_resource_task_captures ~reg path index captures =
-  match captures with
-  | [] -> Ok ()
-  | (capture : Core.task_capture) :: rest -> (
-      match capture.task_capture_kind with
-      | Core.TaskCopyCapture ->
-          if supported_closure_capture_type ~reg capture.task_capture_ty then
-            require_resource_task_captures ~reg path (index + 1) rest
-          else
-            unsupported
-              (Printf.sprintf "%s[%d]" path index)
-              "unsupported concurrent task capture type"
-      | Core.TaskMoveResourceItem ->
-          if supported_resource_task_capture_type ~reg capture.task_capture_ty then
-            require_resource_task_captures ~reg path (index + 1) rest
-          else
-            unsupported
-              (Printf.sprintf "%s[%d]" path index)
-              "unsupported concurrent task capture type"
-      | Core.TaskStructuredTaskBorrow ->
-          unsupported
-            (Printf.sprintf "%s[%d]" path index)
-            "structured task borrow capture")
-
 and require_concurrent_binding ~reg union_names path index
     (binding : Core.conc_binding) =
   let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
-  let* () =
-    match binding.cb_task with
-    | Some task ->
-        require_task_copy_captures ~reg (binding_path ^ ".task.captures") 0
-          task.tc_captures
-    | None ->
-        unsupported (binding_path ^ ".task") "missing concurrent task closure"
-  in
   require_function_body ~reg union_names (binding_path ^ ".rhs") binding.cb_rhs
 
 and require_concurrent_block ~reg union_names path
     (block : Core.concurrent_block) =
-  if
-    List.for_all
-      (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task)
-      block.conc_bindings
-  then
-    let rec check index = function
-      | [] -> Ok ()
-      | binding :: rest ->
-          let* () =
-            require_concurrent_binding ~reg union_names path index binding
-          in
-          check (index + 1) rest
-    in
-    let* () = check 0 block.conc_bindings in
-    let* () =
-      match block.conc_timeout with
-      | Some timeout ->
-          require_function_body ~reg union_names (path ^ ".timeout") timeout
-      | None -> Ok ()
-    in
-    require_function_body ~reg union_names (path ^ ".body") block.conc_body
-  else if
-    List.exists
-      (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task)
-      block.conc_bindings
-  then unsupported (path ^ ".bindings") "mixed pre-closure and post-closure concurrent bindings"
-  else
-    let rec check index = function
-      | [] -> Ok ()
-      | (binding : Core.conc_binding) :: rest ->
-          let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
-          let* () =
-            require_function_body ~reg union_names (binding_path ^ ".rhs")
-              binding.cb_rhs
-          in
-          check (index + 1) rest
-    in
-    let* () = check 0 block.conc_bindings in
-    let* () =
-      match block.conc_timeout with
-      | Some timeout ->
-          require_function_body ~reg union_names (path ^ ".timeout") timeout
-      | None -> Ok ()
-    in
-    require_function_body ~reg union_names (path ^ ".body") block.conc_body
+  let rec check index = function
+    | [] -> Ok ()
+    | binding :: rest ->
+        let* () =
+          require_concurrent_binding ~reg union_names path index binding
+        in
+        check (index + 1) rest
+  in
+  let* () = check 0 block.conc_bindings in
+  let* () =
+    match block.conc_timeout with
+    | Some timeout ->
+        require_function_body ~reg union_names (path ^ ".timeout") timeout
+    | None -> Ok ()
+  in
+  require_function_body ~reg union_names (path ^ ".body") block.conc_body
 
 and require_concurrently_loop ~reg union_names path
     (loop : Core.concurrently_loop) =
   let* _ = concurrently_loop_item_type (path ^ ".item_type") loop in
-  let* () =
-    match loop.cf_task with
-    | Some task -> (
-        match loop.cf_item_mode with
-        | Core.ConcurrentlyLoopCopyItem ->
-            require_task_copy_captures ~reg (path ^ ".task.captures") 0
-              task.tc_captures
-        | Core.ConcurrentlyLoopMoveResourceItem _ ->
-            require_resource_task_captures ~reg (path ^ ".task.captures") 0
-              task.tc_captures)
-    | None -> Ok ()
-  in
   let* () =
     require_function_body ~reg union_names (path ^ ".iterable") loop.cf_iter
   in
@@ -7268,14 +6812,9 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_record_construct_body ~reg union_names path rc
   | Core.CUnionConstruct uc ->
       require_union_construct_body ~reg union_names path uc
-  | Core.CDetach detach -> (
-      match detach.detach_task with
-      | Some task ->
-          require_task_copy_captures ~reg (path ^ ".task.captures") 0
-            task.tc_captures
-      | None ->
-          require_function_body ~reg union_names (path ^ ".body")
-            detach.detach_body)
+  | Core.CDetach detach ->
+      require_function_body ~reg union_names (path ^ ".body")
+        detach.detach_body
   | Core.CCall (Core.CKIntrinsic "list_retain_for", _, [ _; _ ])
   | Core.CCall
       ( Core.CKIntrinsic "list_handoff_set_source_slot",
@@ -8141,8 +7680,7 @@ let function_json ~function_names ~consumed_params ~reg ~enum_names
     | None -> Ok null
   in
   let* function_kind =
-    function_kind_json ~reg enum_names value_record_names heap_record_names
-      union_names (path ^ ".function_kind") func
+    function_kind_json func
   in
   Ok
     (kind "function"

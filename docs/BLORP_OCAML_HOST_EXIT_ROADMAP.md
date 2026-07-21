@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-16.
+Status checked against code on 2026-07-21.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -16,8 +16,8 @@ the early/middle Core passes are ported, one narrow OCaml worker may remain:
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> one versioned typed-program request
   -> OCaml Core-lowering/early-middle worker
-  -> one versioned pre-DCE Core response
-  -> Blorp late Core pipeline and C emission
+  -> one versioned post-specialize/pre-DCE Core response
+  -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
 ```
 
@@ -46,9 +46,10 @@ The public `blorp` executable is Blorp. Ordinary `check`, `compile`, and `run`
 now stay inside `compiler_cli_main.brp` for command execution and host effects.
 All three discover, parse, typecheck, and run CTFE from the in-memory Blorp
 graph. Compile and run invoke exactly one sibling `blorp-ocaml-middle` process
-with the typed semantic request, then Blorp runs the complete late Core
-pipeline, emits C, writes artifacts, invokes the host C compiler, manages the
-runtime cache, and runs the resulting program.
+with the typed semantic request. That worker returns after specialization;
+Blorp then normalizes first-class function references before DCE, runs the
+complete late Core pipeline, emits C, writes artifacts, invokes the host C
+compiler, manages the runtime cache, and runs the resulting program.
 
 The late-pipeline boundary is represented explicitly. The semantic worker and
 `emit_core_c` bridge exchange pre-DCE `CoreProgram`; `run_pre_dce_tail` returns

@@ -111,7 +111,6 @@ let default_suites =
   @ suite_group "CoreResultLayout" Test_core_result_layout.suite
   @ suite_group "CoreOwnership" Test_core_ownership.suite
   @ suite_group "OperationResultMetadata" Test_operation_result_metadata.suite
-  @ suite_group "CoreClosure" Test_core_closure.suite
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
   @ suite_group "CoreStage" Test_core_stage.suite

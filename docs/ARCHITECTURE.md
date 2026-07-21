@@ -155,14 +155,19 @@ Typed AST
     v
 +-----------------+
 | Core_specialize |  Type-dispatch polymorphic builtins (to_int, to_float,
-+-----------------+  to_string) → CCast nodes or concrete names; adapt
-                   function references before ownership insertion
-                   (core_specialize.ml, core_closure.ml)
++-----------------+  to_string) → CCast nodes or concrete names
+                   (core_specialize.ml)
     |
     v
 +--------------------------+
 | JSON handoff (supported) |  Supported pre-DCE Core enters the
 +--------------------------+  contiguous Blorp-owned backend
+    |
+    v
++--------------------------+
+| Blorp function refs      |  Adapt bare first-class function values into eta
++--------------------------+  closures before ownership insertion
+                              (compiler_core_closure.brp)
     |
     v
 +----------------+
@@ -196,7 +201,7 @@ Typed AST
     |
     v
 +--------------------+
-| Blorp Core_closure |  Hoist lambdas and build closure values
+| Blorp closure      |  Hoist lambdas and build closure values
 +--------------------+  (compiler_core_closure.brp)
     |
     v
@@ -293,7 +298,6 @@ boxing, or ownership behavior from source spelling.
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_closure.ml` | First-class function reference eta-adapter synthesis before the Blorp closure tail |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
@@ -374,7 +378,6 @@ compiler/
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
-│   ├── core_closure.ml    # Function-reference eta adapters
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_layout_type.ml # Layout metadata and erased-storage policy
 │   ├── core_option_layout.ml # Option representation selection
@@ -714,9 +717,10 @@ Shared utilities live in `compiler/lib/codegen/`:
 // C: double identity_Float(double x)
 ```
 
-**Closure conversion** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Lambdas are
-hoisted into helper functions in the Blorp-owned backend tail and use the runtime
-closure ABI:
+**Closure formation** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Bare
+first-class function values become eta closures before Perceus. Lambdas are
+then hoisted into helper functions in the Blorp-owned backend tail and use the
+runtime closure ABI:
 ```c
 typedef struct {
     blorp_Object header;
