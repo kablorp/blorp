@@ -207,6 +207,14 @@ let source_name_for_builtin_lookup (f : core_func) : string =
       (String.length source_name - String.length pure_suffix)
   else source_name
 
+let builtin_c_name_for_func (f : core_func) : string option =
+  let source_name = source_name_for_builtin_lookup f in
+  let module_path = Option.value f.cf_module ~default:"" in
+  match Codegen_builtins.lookup module_path source_name with
+  | Some _ as hit -> hit
+  | None ->
+      if module_path = "" then None else Codegen_builtins.lookup "" source_name
+
 (** Build a resolution env from a core program. *)
 let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
   let env =
@@ -1116,19 +1124,6 @@ let resolve_func (env : env) (f : core_func) : core_func =
         List.fold_left
           (fun acc (p : core_param) -> bind_var acc p.cp_name)
           Bound_names.empty f.cf_params
-      in
-      let param_bound =
-        match f.cf_kind with
-        | CFClosureBody abi ->
-            let with_abi_params =
-              List.fold_left
-                (fun acc (v, _) -> bind_var acc v)
-                param_bound abi.ca_params
-            in
-            List.fold_left
-              (fun acc (name, _) -> Bound_names.add name acc)
-              with_abi_params abi.ca_captures
-        | _ -> param_bound
       in
       {
         f with

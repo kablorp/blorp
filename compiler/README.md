@@ -40,7 +40,6 @@ compiler/
 │   ├── core.ml               # Core IR definitions
 │   ├── core_pipeline.ml      # Core pipeline orchestration
 │   ├── core_ownership.ml     # Ownership contracts for calls/intrinsics
-│   ├── core_closure.ml       # Function-reference eta adapters
 │   ├── core_emit_blorp_c.ml  # Bridge projection for Blorp-owned C emission
 │   ├── core_*.ml             # Other Core lowering, transforms, and layout passes
 │   ├── codegen/              # Shared backend naming/type/builtin helpers
@@ -62,8 +61,9 @@ Source (.brp)
   → lex/parse
   → interpolation desugar + module loading
   → subscript desugar + infer/typecheck
-  → Core lowering, FFI annotation, transforms, Perceus
-  → Blorp-owned reuse, closure conversion, final preparation, and C emission
+  → OCaml Core lowering and early/middle transforms
+  → Blorp-owned function-reference adaptation, DCE, Perceus, reuse,
+    closure conversion, final preparation, and C emission
   → C compiler
   → native binary
 ```

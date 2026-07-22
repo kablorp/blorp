@@ -436,11 +436,6 @@ and var_occurs_free_in_body (name : string) bound (body : core) : bool =
       var_occurs_free_in_body name
         (add_bound_typed_vars bound lam.lam_params)
         lam.lam_body
-  | CClosureCreate cc ->
-      List.exists
-        (fun (capture, _) ->
-          capture = name && not (MatchStringSet.mem capture bound))
-        cc.cc_captures
   | CFor (binder, iter, loop_body) ->
       var_occurs_free_in_body name bound iter
       || var_occurs_free_in_body name

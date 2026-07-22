@@ -394,22 +394,6 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
   let rewrite_param (p : Core.core_param) =
     { p with cp_ty = rewrite_type p.cp_ty }
   in
-  let rewrite_closure_abi (abi : Core.closure_abi) =
-    {
-      Core.ca_params =
-        List.map (fun (v, ty) -> (v, rewrite_type ty)) abi.Core.ca_params;
-      ca_captures =
-        List.map
-          (fun (name, ty) -> (name, rewrite_type ty))
-          abi.Core.ca_captures;
-      ca_moved_captures = abi.Core.ca_moved_captures;
-      ca_task_abi = abi.Core.ca_task_abi;
-    }
-  in
-  let rewrite_func_kind = function
-    | Core.CFClosureBody abi -> Core.CFClosureBody (rewrite_closure_abi abi)
-    | kind -> kind
-  in
   let rewrite_expr_type_desc desc =
     match desc with
     | Core.CLambda lam ->
@@ -419,15 +403,6 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
             lam_params =
               List.map (fun (v, ty) -> (v, rewrite_type ty)) lam.lam_params;
             lam_return_ty = rewrite_type lam.lam_return_ty;
-          }
-    | Core.CClosureCreate cc ->
-        Core.CClosureCreate
-          {
-            cc with
-            cc_captures =
-              List.map
-                (fun (name, ty) -> (name, rewrite_type ty))
-                cc.cc_captures;
           }
     | Core.CLet (b, body) ->
         Core.CLet ({ b with bind_ty = rewrite_type b.bind_ty }, body)
@@ -539,7 +514,7 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
       cf_module = Some mod_name;
       cf_params = List.map rewrite_param f.cf_params;
       cf_return_ty = rewrite_type f.cf_return_ty;
-      cf_kind = rewrite_func_kind f.cf_kind;
+        cf_kind = f.cf_kind;
       cf_body = Option.map (rewrite_expr_scoped bound) f.cf_body;
     }
   in
@@ -560,7 +535,7 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
       cf_module = Some mod_name;
       cf_params = List.map rewrite_param f.cf_params;
       cf_return_ty = rewrite_type f.cf_return_ty;
-      cf_kind = rewrite_func_kind f.cf_kind;
+      cf_kind = f.cf_kind;
       cf_body = Option.map (rewrite_expr_scoped bound) f.cf_body;
     }
   in

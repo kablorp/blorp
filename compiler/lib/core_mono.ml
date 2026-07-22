@@ -1814,7 +1814,6 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
               scope lam.lam_params
           in
           CLambda { lam with lam_body = rewrite lam_scope lam.lam_body }
-      | CClosureCreate _ -> e.desc
       | CBin (op, lhs, rhs) -> CBin (op, rewrite scope lhs, rewrite scope rhs)
       | CUn (op, operand) -> CUn (op, rewrite scope operand)
       | CLog (op, lhs, rhs) -> CLog (op, rewrite scope lhs, rewrite scope rhs)
@@ -1956,7 +1955,7 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
               cf_timeout = Option.map (rewrite scope) cf.cf_timeout;
             }
       | CDetach d ->
-          CDetach { d with detach_body = rewrite scope d.detach_body }
+          CDetach { detach_body = rewrite scope d.detach_body }
       | CCast (expr, ty) -> CCast (rewrite scope expr, ty)
       | CUnbox (expr, ty) -> CUnbox (rewrite scope expr, ty)
       | CUnboxTyped u ->
@@ -2231,8 +2230,7 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
         scan_expr scope value.bsv_box.box_value
       in
       match e.desc with
-      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint
-      | CClosureCreate _ ->
+      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
           ()
       | CResourceCleanupExit exit ->
           List.iter (scan_expr scope) exit.rce_cleanups

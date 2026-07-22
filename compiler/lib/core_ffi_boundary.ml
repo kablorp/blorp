@@ -51,7 +51,7 @@ let annotate_func_kind ~metadata params = function
       CFForeign { foreign with arg_passing = ForeignDefaultArgs policies }
   | CFForeign ({ arg_passing = ForeignBorrowArgs; _ } as foreign) ->
       CFForeign foreign
-  | (CFUser | CFBuiltin | CFClosureBody _) as kind -> kind
+  | (CFUser | CFBuiltin) as kind -> kind
 
 let annotate_func ~metadata (f : core_func) =
   { f with cf_kind = annotate_func_kind ~metadata f.cf_params f.cf_kind }

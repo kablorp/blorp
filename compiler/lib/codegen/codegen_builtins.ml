@@ -239,11 +239,10 @@ let builtin_c_mapping =
   (* Prelude-only builtins (no module counterpart or irregular naming) *)
   @ [
       (("", "to_string"), "blorp_to_string");
-      (* [hash] dispatches by argument type in [Core_specialize.specialize_hash];
-     this entry maps the source-level [hash(x)] call to the
-     polymorphic [blorp_hash] sentinel that the specialize pass
-     pattern-matches on. See [specialize_hash] for the per-type
-     runtime function each concrete type routes to. *)
+      (* [hash] dispatches by argument type in the Blorp Core specialization
+         stage. This entry maps source-level [hash(x)] to the polymorphic
+         [blorp_hash] sentinel that the stage replaces with the concrete
+         runtime function for the receiver type. *)
       (("", "hash"), "blorp_hash");
       (* [hash_combine(seed, value)] — binary hash mixer used by user
      Hashable impls to combine per-field hashes. Direct mapping to

@@ -59,18 +59,6 @@ let ty_list elem_ty = TyNamed ("List", [ elem_ty ])
 let tensor_storage_known_producer tsp_layout =
   TensorStorageProven { tsp_kind = TensorStorageKnownProducer; tsp_layout }
 
-let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) ?(captures = [])
-    return_ty =
-  let copy_capture (task_capture_name, task_capture_ty) =
-    { task_capture_name; task_capture_ty; task_capture_kind = TaskCopyCapture }
-  in
-  {
-    tc_func = name;
-    tc_def_id = def_id;
-    tc_captures = List.map copy_capture captures;
-    tc_return_ty = return_ty;
-  }
-
 let type_alias_decl name target =
   {
     alias_name = name;
@@ -1045,211 +1033,17 @@ let test_tensor_loop_storage_provenance_flags_element_mismatch () =
         (Modules.contains v.Core_error.msg "loop source storage proof")
   | _ -> Alcotest.fail "unreachable"
 
-let test_closure_check_flags_raw_clambda () =
-  let lam =
-    mk
-      (CLambda
-         {
-           lam_params = [];
-           lam_body = mk (CLit (LitInt 42L)) ty_int;
-           lam_return_ty = ty_int;
-           lam_is_pure = false;
-         })
-      (TyFunc { params = []; return = ty_int; is_pure = false })
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:lam) ] in
-  let violations = Core_invariants.check_no_preclosure_forms prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions CLambda" true
-        (Modules.contains v.Core_error.msg "CLambda");
-      Alcotest.(check bool)
-        "phase tag is Closure" true
-        (v.Core_error.phase = Core_error.Stage Core_stage.Closure)
-  | _ -> Alcotest.fail "unreachable"
-
-let test_closure_check_flags_missing_detach_task () =
-  let detach =
-    mk (CDetach { detach_body = mk CVoid ty_void; detach_task = None }) ty_void
-  in
-  let func =
-    {
-      cf_name = "main";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [];
-      cf_return_ty = ty_void;
-      cf_body = Some detach;
-      cf_is_pure = false;
-      cf_kind = CFUser;
-      cf_def_id = 0;
-    }
-  in
-  let prog = mk_prog [ CDFunc func ] in
-  let violations = Core_invariants.check_no_preclosure_forms prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions detach task metadata" true
-        (Modules.contains v.Core_error.msg "detach");
-      Alcotest.(check bool)
-        "phase tag is Closure" true
-        (v.Core_error.phase = Core_error.Stage Core_stage.Closure)
-  | _ -> Alcotest.fail "unreachable"
-
-let test_dispatcher_closure_fires () =
-  let lam =
-    mk
-      (CLambda
-         {
-           lam_params = [];
-           lam_body = mk (CLit (LitInt 1L)) ty_int;
-           lam_return_ty = ty_int;
-           lam_is_pure = false;
-         })
-      (TyFunc { params = []; return = ty_int; is_pure = false })
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:lam) ] in
-  let violations = Core_invariants.run_for_stage Core_stage.Closure prog in
-  Alcotest.(check bool) "closure fires check" true (List.length violations >= 1)
-
-let test_resource_capture_metadata_flags_closure_create () =
-  let closure =
-    mk
-      (CClosureCreate
-         {
-           cc_func = "_blorp_closure_test";
-           cc_def_id = 42;
-           cc_captures = [ ("resource", ty_test_resource) ];
-         })
-      ty_fn_int_int
-  in
-  let prog =
-    mk_prog
-      [
-        CDType resource_type_decl;
-        CDFunc (mk_simple_func ~name:"main" ~body:closure);
-      ]
-  in
-  let violations =
-    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
-  in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions resource capture" true
-        (Modules.contains v.Core_error.msg "resource capture")
-  | _ -> Alcotest.fail "unreachable"
-
-let test_resource_capture_metadata_flags_task_capture () =
-  let rhs = cint 1 in
-  let task = task_closure ~captures:[ ("resource", ty_test_resource) ] rhs.ty in
-  let binding =
-    {
-      cb_var = Var.named "answer";
-      cb_ty = ty_result rhs.ty;
-      cb_rhs = rhs;
-      cb_task_scope = synthetic_concurrent_task_scope;
-      cb_task = Some task;
-    }
-  in
-  let body = mk CVoid ty_void in
-  let node =
-    mk
-      (CConcurrent
-         {
-           conc_bindings = [ binding ];
-           conc_body = body;
-           conc_timeout = None;
-           conc_max_threads = None;
-         })
-      body.ty
-  in
-  let prog =
-    mk_prog
-      [
-        CDType resource_type_decl;
-        CDFunc (mk_simple_func ~name:"main" ~body:node);
-      ]
-  in
-  let violations =
-    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
-  in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions resource capture" true
-        (Modules.contains v.Core_error.msg "resource capture")
-  | _ -> Alcotest.fail "unreachable"
-
-let test_task_capture_metadata_flags_unsupported_kind () =
-  let rhs = cint 1 in
-  let task =
-    {
-      tc_func = "_blorp_task_test";
-      tc_def_id = 9001;
-      tc_captures =
-        [
-          {
-            task_capture_name = "item";
-            task_capture_ty = ty_int;
-            task_capture_kind = TaskMoveResourceItem;
-          };
-        ];
-      tc_return_ty = rhs.ty;
-    }
-  in
-  let binding =
-    {
-      cb_var = Var.named "answer";
-      cb_ty = ty_result rhs.ty;
-      cb_rhs = rhs;
-      cb_task_scope = synthetic_concurrent_task_scope;
-      cb_task = Some task;
-    }
-  in
-  let body = mk CVoid ty_void in
-  let node =
-    mk
-      (CConcurrent
-         {
-           conc_bindings = [ binding ];
-           conc_body = body;
-           conc_timeout = None;
-           conc_max_threads = None;
-         })
-      body.ty
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
-  let violations =
-    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
-  in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions unsupported capture" true
-        (Modules.contains v.Core_error.msg "unsupported")
-  | _ -> Alcotest.fail "unreachable"
-
 (* ============================================================================
    Final Core: concurrency semantic contracts are explicit
    ============================================================================ *)
 
-let concurrent_binding ?cb_ty ?task_ty name rhs =
+let concurrent_binding ?cb_ty name rhs =
   let cb_ty = Option.value cb_ty ~default:(ty_result rhs.ty) in
-  let task_ty = Option.value task_ty ~default:rhs.ty in
   {
     cb_var = Var.named name;
     cb_ty;
     cb_rhs = rhs;
     cb_task_scope = synthetic_concurrent_task_scope;
-    cb_task = Some (task_closure task_ty);
   }
 
 let concurrent_block_expr ?timeout ?max_threads ?(node_ty = ty_void) bindings
@@ -1264,12 +1058,11 @@ let concurrent_block_expr ?timeout ?max_threads ?(node_ty = ty_void) bindings
        })
     node_ty
 
-let concurrently_loop_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_ty
-    ?task_scope ?output () =
+let concurrently_loop_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_scope
+    ?output () =
   let iter_ty = Option.value iter_ty ~default:(ty_list ty_int) in
   let body_ty = Option.value body_ty ~default:ty_int in
   let node_ty = Option.value node_ty ~default:(ty_list (ty_result body_ty)) in
-  let task_ty = Option.value task_ty ~default:body_ty in
   let width = Core.ConcurrentlyLoopLimit (cint 2) in
   let task_scope =
     Option.value task_scope ~default:Core.synthetic_concurrent_task_scope
@@ -1286,7 +1079,6 @@ let concurrently_loop_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_ty
          cf_output = output;
          cf_item_mode = ConcurrentlyLoopCopyItem;
          cf_task_scope = task_scope;
-         cf_task = Some (task_closure task_ty);
        })
     node_ty
 
@@ -1345,25 +1137,6 @@ let test_concurrent_semantics_flags_duplicate_binding_names () =
       Alcotest.(check bool)
         "mentions duplicate concurrent binding" true
         (Modules.contains v.Core_error.msg "duplicate concurrent binding")
-  | _ -> Alcotest.fail "unreachable"
-
-let test_concurrent_semantics_flags_task_return_mismatch () =
-  let rhs = cint 1 in
-  let node =
-    concurrent_block_expr
-      [ concurrent_binding ~task_ty:ty_string "answer" rhs ]
-      (mk CVoid ty_void)
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
-  let violations =
-    Core_invariants.check_concurrent_semantics_at Core_stage.Final prog
-  in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions task return" true
-        (Modules.contains v.Core_error.msg "task return type")
   | _ -> Alcotest.fail "unreachable"
 
 let test_concurrent_semantics_flags_timeout_type () =
@@ -1577,8 +1350,9 @@ let test_pipeline_check_invariants_passes_on_clean_code () =
   match Core_pipeline.compile_typed ~check_invariants:true prog with
   | _c_code -> () (* no exception = pass *)
   | exception Core_error.Core_error err ->
-      Alcotest.failf "unexpected invariant violation: %s"
-        (Core_error.to_string err)
+      Alcotest.failf "unexpected invariant violation [%s]: %s"
+        (Core_error.phase_tag_to_string err.phase)
+        err.msg
 
 let test_make_stage_hook_raises_on_violation () =
   (* Prove [make_stage_hook] runs the invariant check BEFORE the user
@@ -2148,128 +1922,6 @@ let test_final_accepts_explicit_void_slot_builtin_boxes () =
   let violations = Core_invariants.run_for_stage Core_stage.Final prog in
   Alcotest.(check int) "no violations" 0 (List.length violations)
 
-let test_final_rejects_raw_top_level_function_ref () =
-  let target =
-    {
-      cf_name = "double";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
-      cf_return_ty = ty_int;
-      cf_body = Some (mk (CVar (Var.named "x")) ty_int);
-      cf_is_pure = true;
-      cf_kind = CFUser;
-      cf_def_id = 100;
-    }
-  in
-  let getter =
-    {
-      cf_name = "get_double";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [];
-      cf_return_ty = ty_fn_int_int;
-      cf_body = Some (mk (CVar (var_with_def_id "double" 100)) ty_fn_int_int);
-      cf_is_pure = true;
-      cf_kind = CFUser;
-      cf_def_id = 101;
-    }
-  in
-  let violations =
-    Core_invariants.run_for_stage Core_stage.Final
-      (mk_prog [ CDFunc target; CDFunc getter ])
-  in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions function reference" true
-        (Modules.contains v.Core_error.msg "function reference");
-      Alcotest.(check bool)
-        "mentions CClosureCreate" true
-        (Modules.contains v.Core_error.msg "CClosureCreate")
-  | _ -> Alcotest.fail "unreachable"
-
-let test_final_allows_direct_top_level_function_call () =
-  let target =
-    {
-      cf_name = "double";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
-      cf_return_ty = ty_int;
-      cf_body = Some (mk (CVar (Var.named "x")) ty_int);
-      cf_is_pure = true;
-      cf_kind = CFUser;
-      cf_def_id = 102;
-    }
-  in
-  let callee = mk (CVar (var_with_def_id "double" 102)) ty_fn_int_int in
-  let call =
-    mk_call
-      (CKUser ("double", Some 102))
-      callee
-      [ mk (CLit (LitInt 21L)) ty_int ]
-      ty_int
-  in
-  let main = mk_simple_func ~name:"main" ~body:call in
-  let violations =
-    Core_invariants.run_for_stage Core_stage.Final
-      (mk_prog [ CDFunc target; CDFunc main ])
-  in
-  Alcotest.(check int) "no violations" 0 (List.length violations)
-
-let test_final_allows_local_function_value_named_like_global () =
-  let target =
-    {
-      cf_name = "double";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
-      cf_return_ty = ty_int;
-      cf_body = Some (mk (CVar (Var.named "x")) ty_int);
-      cf_is_pure = true;
-      cf_kind = CFUser;
-      cf_def_id = 103;
-    }
-  in
-  let local_closure =
-    mk
-      (CClosureCreate
-         { cc_func = "_blorp_eta_0"; cc_def_id = 104; cc_captures = [] })
-      ty_fn_int_int
-  in
-  let body =
-    mk
-      (CLet
-         ( {
-             bind_var = Var.named "double";
-             bind_mut = false;
-             bind_ty = ty_fn_int_int;
-             bind_rhs = local_closure;
-           },
-           mk (CVar (Var.named "double")) ty_fn_int_int ))
-      ty_fn_int_int
-  in
-  let getter =
-    {
-      cf_name = "get_double";
-      cf_module = None;
-      cf_type_params = [];
-      cf_params = [];
-      cf_return_ty = ty_fn_int_int;
-      cf_body = Some body;
-      cf_is_pure = true;
-      cf_kind = CFUser;
-      cf_def_id = 105;
-    }
-  in
-  let violations =
-    Core_invariants.run_for_stage Core_stage.Final
-      (mk_prog [ CDFunc target; CDFunc getter ])
-  in
-  Alcotest.(check int) "no violations" 0 (List.length violations)
-
 let suite =
   [
     ( "ckunknown",
@@ -2404,21 +2056,6 @@ let suite =
           test_dispatcher_desugar_fires;
         Alcotest.test_case "match fires cmatch check" `Quick
           test_dispatcher_match_fires_check;
-        Alcotest.test_case "closure fires preclosure check" `Quick
-          test_dispatcher_closure_fires;
-      ] );
-    ( "closure",
-      [
-        Alcotest.test_case "flags raw CLambda" `Quick
-          test_closure_check_flags_raw_clambda;
-        Alcotest.test_case "flags missing detach task metadata" `Quick
-          test_closure_check_flags_missing_detach_task;
-        Alcotest.test_case "flags resource closure capture metadata" `Quick
-          test_resource_capture_metadata_flags_closure_create;
-        Alcotest.test_case "flags resource task capture metadata" `Quick
-          test_resource_capture_metadata_flags_task_capture;
-        Alcotest.test_case "flags unsupported task capture metadata" `Quick
-          test_task_capture_metadata_flags_unsupported_kind;
       ] );
     ( "concurrency_semantics",
       [
@@ -2428,8 +2065,6 @@ let suite =
           test_concurrent_semantics_flags_binding_result_mismatch;
         Alcotest.test_case "flags duplicate binding names" `Quick
           test_concurrent_semantics_flags_duplicate_binding_names;
-        Alcotest.test_case "flags task return mismatch" `Quick
-          test_concurrent_semantics_flags_task_return_mismatch;
         Alcotest.test_case "flags timeout type" `Quick
           test_concurrent_semantics_flags_timeout_type;
         Alcotest.test_case "flags non-positive max_threads" `Quick
@@ -2517,11 +2152,5 @@ let suite =
           test_final_rejects_unboxed_void_slot_builtin_arg;
         Alcotest.test_case "final accepts explicit void-slot builtin boxes"
           `Quick test_final_accepts_explicit_void_slot_builtin_boxes;
-        Alcotest.test_case "final rejects raw top-level function ref" `Quick
-          test_final_rejects_raw_top_level_function_ref;
-        Alcotest.test_case "final allows direct top-level function call" `Quick
-          test_final_allows_direct_top_level_function_call;
-        Alcotest.test_case "final allows local function value named like global"
-          `Quick test_final_allows_local_function_value_named_like_global;
       ] );
   ]

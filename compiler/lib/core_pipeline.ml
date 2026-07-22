@@ -17,10 +17,10 @@
        [Core_tuple_sroa] — fuse compatible string/list/scoped tensor pipelines
        and tensor update expressions; scalar-replace non-escaping local tuples
        and narrow tuple-return call sites
-    12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
-       to CCast / concrete names; make eta adapters visible to Perceus
+    12. [Core_specialize] — type-dispatch builtins to CCast / concrete names
     13. backend handoff — default compilation gives pre-DCE Core to Blorp
-    14. Blorp-owned DCE — prune unreachable emitted functions
+    14. Blorp-owned function-reference adaptation + DCE — make eta adapters
+       visible to Perceus, then prune unreachable emitted functions
     15. Blorp-owned consume-specialize pass
     16. Blorp-owned Perceus — insert explicit dup/drop operations
     17. Blorp-owned final tail — normal reuse, closure conversion, resource
@@ -220,10 +220,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
         |> Core_parallel_tensor_pipeline.fuse_program
         |> Core_tensor_fusion.fuse_program ~reg
         |> Core_tuple_sroa.rewrite_program ~reg)
-    |> run_stage Core_stage.Specialize (fun p ->
-        p
-        |> Core_specialize.specialize_program ~reg
-        |> Core_closure.adapt_function_refs_program)
+    |> run_stage Core_stage.Specialize (Core_specialize.specialize_program ~reg)
   in
   { blorp_tail_input = pre_dce }
 

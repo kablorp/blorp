@@ -254,10 +254,6 @@ and expr_has_runtime_free_var bound e =
       expr_has_runtime_free_var
         (add_typed_vars bound lam.lam_params)
         lam.lam_body
-  | CClosureCreate cc ->
-      List.exists
-        (fun (name, _) -> not (StringSet.mem name bound))
-        cc.cc_captures
   | CLet (b, body) ->
       expr_has_runtime_free_var bound b.bind_rhs
       || expr_has_runtime_free_var (add_var bound b.bind_var) body

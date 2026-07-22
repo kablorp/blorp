@@ -121,9 +121,9 @@ let semantic_middle_stage = function
   | ( Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
     | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
     | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-    | Core_stage.Fusion | Core_stage.Specialize ) as stage ->
+    | Core_stage.Fusion ) as stage ->
       Some stage
-  | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
+  | Core_stage.Specialize | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
   | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
       None
 

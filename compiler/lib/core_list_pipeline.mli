@@ -53,4 +53,3 @@ val stages : t -> stage list
 val sink : t -> sink
 val cardinality : t -> cardinality
 val result_ty : t -> Ast.type_expr
-val loc : t -> Ast.loc

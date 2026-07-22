@@ -288,7 +288,7 @@ let test_construct_concurrent () =
   | _ -> Alcotest.fail "expected CConcurrent"
 
 let test_construct_detach () =
-  let e = mk (CDetach { detach_body = cvoid; detach_task = None }) ty_void in
+  let e = mk (CDetach { detach_body = cvoid }) ty_void in
   match e.desc with CDetach _ -> () | _ -> Alcotest.fail "expected CDetach"
 
 let test_construct_record_update () =
@@ -1098,21 +1098,6 @@ let test_cf_kind_foreign_carries_c_name () =
         (arg_passing = ForeignDefaultArgs [])
   | _ -> Alcotest.fail "expected CFForeign"
 
-let test_cf_kind_closure_body_tag () =
-  let ca =
-    {
-      ca_params = [];
-      ca_captures = [];
-      ca_moved_captures = [];
-      ca_task_abi = false;
-    }
-  in
-  let f = mk_kind_func ~name:"c" ~kind:(CFClosureBody ca) in
-  let out = pp_program_indented [ mk_decl (CDFunc f) ] in
-  Alcotest.(check bool)
-    "closure tag" true
-    (Blorp.Modules.contains out "[closure]")
-
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -1257,7 +1242,5 @@ let suite =
           test_cf_kind_builtin_tag;
         Alcotest.test_case "CFForeign — carries c_name" `Quick
           test_cf_kind_foreign_carries_c_name;
-        Alcotest.test_case "CFClosureBody — [closure]" `Quick
-          test_cf_kind_closure_body_tag;
       ] );
   ]

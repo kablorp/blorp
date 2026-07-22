@@ -474,7 +474,6 @@ compiler/            # OCaml compiler implementation
     core_consume_specialize.ml  # Core IR consuming-call specialization before Perceus
     core_perceus.ml   # Core IR Perceus RC insertion
     core_reuse.ml     # Core IR post-Perceus reuse analysis and prepared union reuse
-    core_closure.ml   # Core IR closure conversion / lambda hoisting
     core_resource.ml  # Resource-scope cleanup-exit lowering
     core_fairness.ml  # Cooperative loop checkpoint insertion
     core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client

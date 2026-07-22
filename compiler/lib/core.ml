@@ -36,7 +36,7 @@
 
     {1 What's NOT in Core}
 
-    - Captures on [CLambda] — computed by [Core_closure], which hoists
+    - Captures on [CLambda] — computed by the Blorp closure pass, which hoists
       lambdas and task bodies into top-level functions with explicit capture
       metadata before emission.
 
@@ -555,8 +555,6 @@ and desc =
       (** [{ base | f = v, ... }] — sugar, desugar pass eliminates later *)
   | CRange of core * core  (** [start..end] (exclusive) *)
   | CLambda of lambda  (** anonymous function *)
-  | CClosureCreate of closure_create
-      (** closure construction (post-conversion) *)
   (* === Computation === *)
   | CBin of Ast.binop * core * core  (** arithmetic / comparison *)
   | CUn of Ast.unop * core  (** [-x], [not x] *)
@@ -933,66 +931,12 @@ and lambda = {
   lam_is_pure : bool;
 }
 
-and closure_create = {
-  cc_func : string;  (** name of hoisted function *)
-  cc_def_id : int;
-      (** [cf_def_id] of the hoisted function [cc_func] refers to.
-      [Core_closure] mints a fresh [core_func] for the lambda and
-      copies its [cf_def_id] here so the Blorp C emitter can mangle the
-      static closure ([__sc_<mangled>]) and the inline closure new
-      call using the same DefId the function's decl site uses. *)
-  cc_captures : (string * Ast.type_expr) list;
-      (** captured variable names + types *)
-}
-(** A closure construction site — references a hoisted top-level function
-    and lists the captured variables. Produced by [Core_closure]. *)
-
-and task_closure = {
-  tc_func : string;  (** name of hoisted task function *)
-  tc_def_id : int;
-  tc_captures : task_capture list;
-      (** captured variables with task-specific ownership semantics *)
-  tc_return_ty : Ast.type_expr;  (** raw task body return type *)
-}
-(** A Core-visible runtime task closure. Produced by [Core_closure] for
-    concurrency constructs whose bodies are executed by the task runtime
-    rather than called as ordinary first-class functions. *)
-
-and task_capture = {
-  task_capture_name : string;
-  task_capture_ty : Ast.type_expr;
-  task_capture_kind : task_capture_kind;
-}
-
-and task_capture_kind =
-  | TaskCopyCapture  (** Ordinary immutable value captured into a child task. *)
-  | TaskMoveResourceItem
-      (** Reserved for resource-source loops where each item is moved into
-          exactly one child task. *)
-  | TaskStructuredTaskBorrow
-      (** Reserved for structured borrows that are proven not to outlive the
-          child task. *)
-
 and task_scope_id = TaskScopeId of int
 
 and concurrent_task_scope = {
   task_parent_scope_id : task_scope_id;
   task_child_scope_id : task_scope_id;
 }
-
-and closure_abi = {
-  ca_params : (var * Ast.type_expr) list;  (** original typed parameters *)
-  ca_captures : (string * Ast.type_expr) list;  (** captured variables *)
-  ca_moved_captures : string list;
-      (** Capture slots moved out of the closure environment by task-entry
-          code. The closure owns these slots until the task body starts; entry
-          unboxes and nulls each slot so the body can transfer ownership into a
-          more precise cleanup scope. *)
-  ca_task_abi : bool;  (** true when task runtime calls this closure *)
-}
-(** Closure ABI metadata on hoisted lambda functions. When present on
-    a [core_func], the emitter generates a void* ABI wrapper function
-    that unboxes captures from env and params from void* args. *)
 
 and conc_binding = {
   cb_var : var;  (** the binding name in the outer scope *)
@@ -1002,10 +946,6 @@ and conc_binding = {
   cb_task_scope : concurrent_task_scope;
       (** Lexical parent/child scope edge for the task that evaluates
       [cb_rhs]. *)
-  cb_task : task_closure option;
-      (** Core-visible task closure metadata after [Core_closure]. [None] is
-      the pre-closure-conversion form and remains accepted so tests and
-      defensive emit paths can construct early-stage Core directly. *)
 }
 
 and concurrent_block = {
@@ -1054,12 +994,9 @@ and concurrently_loop = {
   cf_output : concurrently_loop_output;
   cf_item_mode : concurrently_loop_item_mode;
   cf_task_scope : concurrent_task_scope;
-  cf_task : task_closure option;
-      (** Core-visible per-iteration task closure metadata after
-      [Core_closure]. [None] is the pre-closure-conversion form. *)
 }
 
-and detach_expr = { detach_body : core; detach_task : task_closure option }
+and detach_expr = { detach_body : core }
 
 and select_arm_kind =
   | SelectRecv of {
@@ -1093,9 +1030,6 @@ let match_binding_pair binding = (binding.mb_var, binding.mb_accessor)
 
 (** Build a core node. *)
 let mk ~loc ~ty desc = { desc; ty; loc }
-
-let task_capture_binding capture =
-  (capture.task_capture_name, capture.task_capture_ty)
 
 let root_task_scope_id = TaskScopeId 0
 let task_scope_id_to_int (TaskScopeId id) = id
@@ -1217,7 +1151,6 @@ let rec map_children (f : core -> core) (e : core) : core =
         CRecordUpdate (f b, List.map (fun (n, v) -> (n, f v)) fs)
     | CRange (a, b) -> CRange (f a, f b)
     | CLambda lam -> CLambda { lam with lam_body = f lam.lam_body }
-    | CClosureCreate _ -> e.desc (* leaf node: no child expressions *)
     | CBin (op, l, r) -> CBin (op, f l, f r)
     | CUn (op, x) -> CUn (op, f x)
     | CLog (op, l, r) -> CLog (op, f l, f r)
@@ -1305,9 +1238,8 @@ let rec map_children (f : core -> core) (e : core) : core =
             cf_output = cf.cf_output;
             cf_item_mode = cf.cf_item_mode;
             cf_task_scope = cf.cf_task_scope;
-            cf_task = cf.cf_task;
           }
-    | CDetach d -> CDetach { d with detach_body = f d.detach_body }
+    | CDetach d -> CDetach { detach_body = f d.detach_body }
     | CSelect select ->
         let map_arm arm =
           let select_arm_kind =
@@ -1859,9 +1791,6 @@ let rec pp_to_string (e : core) : string =
       in
       Printf.sprintf "fun(%s) -> %s { %s }" params (ty_str lam.lam_return_ty)
         (pp_to_string lam.lam_body)
-  | CClosureCreate cc ->
-      let caps = String.concat ", " (List.map fst cc.cc_captures) in
-      Printf.sprintf "closure(%s, [%s])" cc.cc_func caps
   | CBin (op, l, r) ->
       Printf.sprintf "(%s %s %s)" (pp_to_string l) (binop_str op)
         (pp_to_string r)
@@ -2317,9 +2246,6 @@ let pp_to_string_indented (e : core) : string =
           (ty_str lam.lam_return_ty)
           (go (i + 1) lam.lam_body)
           p
-    | CClosureCreate cc ->
-        let caps = String.concat ", " (List.map fst cc.cc_captures) in
-        Printf.sprintf "%sclosure(%s, [%s])" p cc.cc_func caps
   and pp_ctree_indented i tree =
     let p = pad i in
     match tree with
@@ -2428,9 +2354,8 @@ let pp_to_string_indented (e : core) : string =
       [arg_passing] is the safety contract used when resolving call sites:
       default impure foreign functions carry checked per-argument copy/scalar
       policies, while [foreign pure] and [@no_copy] borrow.
-    - [CFClosureBody] — hoisted lambda body that uses the closure
-      calling convention: [void* func(void* __env, void* arg0, ...)]
-      with unboxing preamble. Set by [Core_closure]. *)
+    Closure-body functions are created only after the Core handoff and are
+    represented by the Blorp Core model rather than this pre-handoff type. *)
 type cf_kind =
   | CFUser
   | CFBuiltin
@@ -2440,7 +2365,6 @@ type cf_kind =
       link_flags : (string option * string) list;
       arg_passing : foreign_arg_passing;
     }
-  | CFClosureBody of closure_abi
 
 type core_func = {
   cf_name : string;
@@ -2463,7 +2387,7 @@ type core_func = {
   cf_kind : cf_kind;
   cf_def_id : int;
       (** Canonical Core-IR identity for this function, minted fresh at
-      [Core_lower] / [Core_closure] / [Core_mono] time via
+      [Core_lower] / [Core_mono] time via
       [Session.mint_def_id]. Stays stable through downstream passes —
       record-update rewrites (e.g. [Core_flatten.prefix_module_names]
       renaming [cf_name]) preserve [cf_def_id] so the "which function
@@ -2492,11 +2416,9 @@ type core_func = {
 
     {1 Phase 2.6.4 note}
 
-    The 15-field struct was collapsed to 8:
-    - 5 flags ([cf_is_builtin] / [cf_foreign_name] / [cf_includes] /
-      [cf_link_flags] / [cf_closure_abi]) became one [cf_kind] variant.
-      Impossible states — "foreign AND builtin", "closure body without
-      ABI" — are now unrepresentable.
+    The former builtin/foreign flag and option fields became one [cf_kind]
+    variant, making states such as "foreign AND builtin" unrepresentable.
+    Closure bodies are not legal in this pre-handoff Core model.
     - [cf_is_tailrec] was deleted. [@tail_recursive] is
       validated in [Typecheck]; Core lowers supported resolved self-tail-call
       shapes in [Core_tailrec] without retaining the source annotation.
@@ -2591,22 +2513,11 @@ type core_program = core_decl list
 
 (** Rewrite every static type slot in a Core expression. This includes the
     node's own [.ty] plus type annotations carried by binders, lambdas,
-    casts/boxes, closure ABI metadata, try/RC nodes, and concurrent
+    casts/boxes, try/RC nodes, and concurrent
     bindings. Child expressions are rewritten recursively. *)
 let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
     =
   let rewrite_var_ty (v, ty) = (v, f ty) in
-  let rewrite_capture_ty (name, ty) = (name, f ty) in
-  let rewrite_task_capture capture =
-    { capture with task_capture_ty = f capture.task_capture_ty }
-  in
-  let rewrite_task_closure (tc : task_closure) =
-    {
-      tc with
-      tc_captures = List.map rewrite_task_capture tc.tc_captures;
-      tc_return_ty = f tc.tc_return_ty;
-    }
-  in
   let rewrite_box_op_ty b = { b with box_source_ty = f b.box_source_ty } in
   let rewrite_unbox_op_ty u =
     { u with unbox_target_ty = f u.unbox_target_ty }
@@ -2651,9 +2562,6 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
               lam_params = List.map rewrite_var_ty lam.lam_params;
               lam_return_ty = f lam.lam_return_ty;
             }
-      | CClosureCreate cc ->
-          CClosureCreate
-            { cc with cc_captures = List.map rewrite_capture_ty cc.cc_captures }
       | CLet (b, body) -> CLet ({ b with bind_ty = f b.bind_ty }, body)
       | CBorrowLet (b, body) ->
           CBorrowLet ({ b with borrow_ty = f b.borrow_ty }, body)
@@ -2697,12 +2605,7 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
               cb with
               conc_bindings =
                 List.map
-                  (fun b ->
-                    {
-                      b with
-                      cb_ty = f b.cb_ty;
-                      cb_task = Option.map rewrite_task_closure b.cb_task;
-                    })
+                  (fun b -> { b with cb_ty = f b.cb_ty })
                   cb.conc_bindings;
             }
       | CConcurrentlyLoop cf ->
@@ -2711,13 +2614,6 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
               cf with
               cf_item_mode =
                 map_concurrently_loop_item_mode_types f cf.cf_item_mode;
-              cf_task = Option.map rewrite_task_closure cf.cf_task;
-            }
-      | CDetach d ->
-          CDetach
-            {
-              d with
-              detach_task = Option.map rewrite_task_closure d.detach_task;
             }
       | CTupleConstruct tc ->
           CTupleConstruct
@@ -2794,25 +2690,13 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
 let rec map_types_in_decl (f : Ast.type_expr -> Ast.type_expr)
     (decl : core_decl) : core_decl =
   let rewrite_param p = { p with cp_ty = f p.cp_ty } in
-  let rewrite_closure_abi abi =
-    {
-      ca_params = List.map (fun (v, ty) -> (v, f ty)) abi.ca_params;
-      ca_captures = List.map (fun (name, ty) -> (name, f ty)) abi.ca_captures;
-      ca_moved_captures = abi.ca_moved_captures;
-      ca_task_abi = abi.ca_task_abi;
-    }
-  in
-  let rewrite_kind = function
-    | CFClosureBody abi -> CFClosureBody (rewrite_closure_abi abi)
-    | kind -> kind
-  in
   let rewrite_func func =
     {
       func with
       cf_params = List.map rewrite_param func.cf_params;
       cf_return_ty = f func.cf_return_ty;
       cf_body = Option.map (map_types_in_expr f) func.cf_body;
-      cf_kind = rewrite_kind func.cf_kind;
+      cf_kind = func.cf_kind;
     }
   in
   let rewrite_field (field : Ast.field_decl) =
@@ -2889,7 +2773,6 @@ let pp_program_indented (prog : core_program) : string =
       | CFUser -> ""
       | CFBuiltin -> " [builtin]"
       | CFForeign { c_name; _ } -> Printf.sprintf " [foreign=%s]" c_name
-      | CFClosureBody _ -> " [closure]"
     in
     Printf.sprintf "%s %s(%s) -> %s [def=%d]%s" prefix f.cf_name params
       (ty_str f.cf_return_ty) f.cf_def_id tags

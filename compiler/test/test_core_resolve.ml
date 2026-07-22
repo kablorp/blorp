@@ -1832,10 +1832,11 @@ let test_resolve_call_ignores_global_value_def_id () =
     "blorp_string_get_opt" body
 
 let test_resolve_monomorphized_bodyless_builtin () =
-  (* Post-mono builtins that stay bodyless must still resolve to their
-     runtime C builtin. Otherwise [Core_closure] treats the function-typed
-     callee as a first-class closure and emits calls to a nonexistent static
-     closure symbol such as [std_vector__map__mono_3_Int_Int]. *)
+  (* Post-mono builtins that stay bodyless must still resolve to their runtime
+     C builtin. Otherwise the Blorp function-reference pass treats the
+     function-typed callee as a first-class closure and emits calls to a
+     nonexistent static closure symbol such as
+     [std_vector__map__mono_3_Int_Int]. *)
   let vector_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
   let map_fty =
     TyFunc

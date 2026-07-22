@@ -61,10 +61,15 @@ Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the production route first decodes the
 Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
-then crosses the Core JSON bridge after OCaml specialization and
-function-reference adaptation. Checkpoint 8 in
+then crosses the Core JSON bridge after the remaining OCaml specialization
+families. Primitive conversion and hash builtins intentionally cross in
+semantic form so Blorp can specialize them before Blorp-owned
+function-reference adaptation.
+Length specialization remains before the bridge because its concrete tensor
+intrinsics feed raw-view formation in the same OCaml pass. Checkpoint 8 in
 `docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
 making Blorp Core lowering authoritative. On the current backend route,
+`compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
@@ -153,16 +158,27 @@ Typed AST
                  core_tuple_sroa.ml)
     |
     v
-+-----------------+
-| Core_specialize |  Type-dispatch polymorphic builtins (to_int, to_float,
-+-----------------+  to_string) → CCast nodes or concrete names; adapt
-                   function references before ownership insertion
-                   (core_specialize.ml, core_closure.ml)
++-----------------------+
+| OCaml Core_specialize |  Remaining registry/layout-dependent builtin
++-----------------------+  specialization, including to_string and containers
+                          (core_specialize.ml)
     |
     v
 +--------------------------+
 | JSON handoff (supported) |  Supported pre-DCE Core enters the
 +--------------------------+  contiguous Blorp-owned backend
+    |
+    v
++----------------------------+
+| Blorp primitive specialize |  Conversion and hash builtins become casts or
++----------------------------+  direct runtime calls
+                                (compiler_core_specialize.brp)
+    |
+    v
++--------------------------+
+| Blorp function refs      |  Adapt bare first-class function values into eta
++--------------------------+  closures before ownership insertion
+                              (compiler_core_closure.brp)
     |
     v
 +----------------+
@@ -196,7 +212,7 @@ Typed AST
     |
     v
 +--------------------+
-| Blorp Core_closure |  Hoist lambdas and build closure values
+| Blorp closure      |  Hoist lambdas and build closure values
 +--------------------+  (compiler_core_closure.brp)
     |
     v
@@ -288,12 +304,11 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
-| `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
+| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_closure.ml` | First-class function reference eta-adapter synthesis before the Blorp closure tail |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
@@ -309,6 +324,7 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_12_cli/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
 | `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
 | `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
@@ -372,9 +388,8 @@ compiler/
 │   ├── core_tensor_fusion.ml # Tensor update fusion
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
-│   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
+│   ├── core_specialize.ml # Remaining registry/layout-dependent builtin specialization
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
-│   ├── core_closure.ml    # Function-reference eta adapters
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_layout_type.ml # Layout metadata and erased-storage policy
 │   ├── core_option_layout.ml # Option representation selection
@@ -714,9 +729,10 @@ Shared utilities live in `compiler/lib/codegen/`:
 // C: double identity_Float(double x)
 ```
 
-**Closure conversion** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Lambdas are
-hoisted into helper functions in the Blorp-owned backend tail and use the runtime
-closure ABI:
+**Closure formation** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Bare
+first-class function values become eta closures before Perceus. Lambdas are
+then hoisted into helper functions in the Blorp-owned backend tail and use the
+runtime closure ABI:
 ```c
 typedef struct {
     blorp_Object header;

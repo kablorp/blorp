@@ -2457,7 +2457,6 @@ let list_concurrent_collect ?timeout self_ty result_ty self limit f =
          cf_output = ConcurrentlyLoopCollect;
          cf_item_mode = ConcurrentlyLoopCopyItem;
          cf_task_scope = synthetic_concurrent_task_scope;
-         cf_task = None;
        })
 
 (** map_indexed(self, f) -> List[U]

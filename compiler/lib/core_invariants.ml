@@ -27,8 +27,6 @@
     - [check_resource_scope_nonlocal_exits_at] — ENABLED (Final)
     - [check_resource_cleanup_exits_at] — ENABLED (Final)
     - [check_void_boxed_builtin_args_explicit] — ENABLED (Final)
-    - [check_no_raw_top_level_function_refs] — ENABLED (Final)
-    - [check_no_resource_capture_metadata_at] — ENABLED (Closure and Final)
     - [check_concurrent_semantics_at] — ENABLED (Final)
     - [check_cooperative_checkpoints_at] — ENABLED (Final)
 
@@ -37,7 +35,6 @@
 
 module StringSet = Set.Make (String)
 module StringMap = Map.Make (String)
-module IntSet = Set.Make (Int)
 
 (** Walk every expression in a [core_program]. Visits:
     - function bodies (including nested lambdas)
@@ -679,256 +676,6 @@ let check_void_boxed_builtin_args_explicit_at (stage : Core_stage.t)
   |> List.rev
 
 (* ============================================================================
-   Final Core: first-class top-level function references are explicit closures
-   ============================================================================ *)
-
-type top_level_function_index = {
-  top_fn_names : StringSet.t;
-  top_fn_def_ids : IntSet.t;
-}
-
-let empty_top_level_function_index =
-  { top_fn_names = StringSet.empty; top_fn_def_ids = IntSet.empty }
-
-let top_level_function_is_runtime (f : Core.core_func) : bool =
-  match f.cf_kind with
-  | Core.CFForeign _ -> true
-  | Core.CFBuiltin -> false
-  | Core.CFUser | Core.CFClosureBody _ -> f.cf_body <> None
-
-let add_top_level_function index (f : Core.core_func) : top_level_function_index
-    =
-  if not (top_level_function_is_runtime f) then index
-  else
-    {
-      top_fn_names = StringSet.add f.cf_name index.top_fn_names;
-      top_fn_def_ids = IntSet.add f.cf_def_id index.top_fn_def_ids;
-    }
-
-let collect_top_level_function_index (prog : Core.core_program) :
-    top_level_function_index =
-  let rec visit_decl index (d : Core.core_decl) =
-    match d.cd_desc with
-    | Core.CDFunc f -> add_top_level_function index f
-    | Core.CDImpl i -> List.fold_left add_top_level_function index i.ci_methods
-    | Core.CDPrivate inner -> visit_decl index inner
-    | Core.CDType _ | Core.CDRecord _ | Core.CDImport _ | Core.CDTypeAlias _
-    | Core.CDVar _ | Core.CDTrait _ ->
-        index
-  in
-  List.fold_left visit_decl empty_top_level_function_index prog
-
-let add_bound_var (bound : StringSet.t) (v : Core.var) : StringSet.t =
-  StringSet.add v.vname bound
-
-let add_bound_core_param (bound : StringSet.t) (p : Core.core_param) :
-    StringSet.t =
-  add_bound_var bound p.cp_name
-
-let add_bound_closure_capture (bound : StringSet.t) ((name, _) : string * _) :
-    StringSet.t =
-  StringSet.add name bound
-
-let add_bound_pattern_vars (bound : StringSet.t) (pat : Ast.pattern) :
-    StringSet.t =
-  List.fold_left
-    (fun acc name -> StringSet.add name acc)
-    bound
-    (Ast.collect_pattern_vars pat)
-
-let add_bound_function_scope (bound : StringSet.t) (f : Core.core_func) :
-    StringSet.t =
-  let bound = List.fold_left add_bound_core_param bound f.cf_params in
-  match f.cf_kind with
-  | Core.CFClosureBody abi ->
-      let bound =
-        List.fold_left
-          (fun acc (v, _) -> add_bound_var acc v)
-          bound abi.ca_params
-      in
-      List.fold_left add_bound_closure_capture bound abi.ca_captures
-  | Core.CFUser | Core.CFBuiltin | Core.CFForeign _ -> bound
-
-let raw_top_level_function_ref (index : top_level_function_index)
-    (bound : StringSet.t) (v : Core.var) (ty : Ast.type_expr) : bool =
-  match Codegen_types.normalize_type ty with
-  | Ast.TyFunc _ ->
-      (not (StringSet.mem v.vname bound))
-      && begin match v.vdef_id with
-      | Some id ->
-          IntSet.mem id index.top_fn_def_ids
-          || StringSet.mem v.vname index.top_fn_names
-      | None -> StringSet.mem v.vname index.top_fn_names
-      end
-  | _ -> false
-
-let direct_call_kind = function
-  | Core.CKUser _ | Core.CKForeign _ | Core.CKBuiltin _ | Core.CKIntrinsic _
-  | Core.CKUnknown | Core.CKSelectedDirect _ ->
-      true
-  | Core.CKClosure -> false
-
-let check_no_raw_top_level_function_refs_at (stage : Core_stage.t)
-    (prog : Core.core_program) : Core_error.t list =
-  let index = collect_top_level_function_index prog in
-  let violation_for (e : Core.core) (v : Core.var) =
-    violation_at stage e.loc
-      ~hint:
-        "Core_closure.adapt_function_refs_program should rewrite first-class \
-         top-level function references into explicit CClosureCreate eta \
-         adapters before final Core. Emitters should lower the declared \
-         closure ABI, not synthesize function-reference trampolines."
-      (Printf.sprintf
-         "top-level function reference `%s` reached final Core as raw CVar; \
-          expected explicit CClosureCreate"
-         v.vname)
-  in
-  let rec visit_ctree bound acc = function
-    | Core.CTLeaf { ct_bindings; ct_body } ->
-        let bound =
-          List.fold_left
-            (fun acc binding -> add_bound_var acc binding.Core.mb_var)
-            bound ct_bindings
-        in
-        visit bound acc ct_body
-    | Core.CTFail -> acc
-    | Core.CTSwitchTag { cts_cases; cts_default; _ } ->
-        let acc =
-          List.fold_left
-            (fun acc (_, sub) -> visit_ctree bound acc sub)
-            acc cts_cases
-        in
-        Option.fold ~none:acc
-          ~some:(fun sub -> visit_ctree bound acc sub)
-          cts_default
-    | Core.CTSwitchLit { ctl_cases; ctl_default; _ } ->
-        let acc =
-          List.fold_left
-            (fun acc (_, sub) -> visit_ctree bound acc sub)
-            acc ctl_cases
-        in
-        visit_ctree bound acc ctl_default
-    | Core.CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-        let acc =
-          List.fold_left
-            (fun acc (_, sub) -> visit_ctree bound acc sub)
-            acc ctl_len_cases
-        in
-        let acc =
-          match ctl_len_geq with
-          | Some (_, sub) -> visit_ctree bound acc sub
-          | None -> acc
-        in
-        Option.fold ~none:acc
-          ~some:(fun sub -> visit_ctree bound acc sub)
-          ctl_len_default
-  and visit_tailrec_loop bound acc = function
-    | Core.TailrecUnmanagedLoop { tul_params; tul_body; _ } ->
-        let bound = List.fold_left add_bound_core_param bound tul_params in
-        visit bound acc tul_body
-    | Core.TailrecListSpreadLoop
-        { tls_params; tls_list_param; tls_cursor_var; tls_body; _ } ->
-        let bound = List.fold_left add_bound_core_param bound tls_params in
-        let bound = add_bound_core_param bound tls_list_param in
-        let bound = add_bound_var bound tls_cursor_var in
-        visit bound acc tls_body
-  and visit_listhandoff bound acc (h : Core.list_handoff) =
-    let acc = visit bound acc h.lh_source in
-    let acc = visit bound acc h.lh_capacity in
-    let body_bound =
-      List.fold_left add_bound_var bound
-        [ h.lh_source_var; h.lh_result_var; h.lh_len_var; h.lh_out_var ]
-    in
-    visit body_bound acc h.lh_body
-  and visit bound acc (e : Core.core) =
-    let acc =
-      match e.desc with
-      | Core.CVar v when raw_top_level_function_ref index bound v e.ty ->
-          violation_for e v :: acc
-      | _ -> acc
-    in
-    match e.desc with
-    | Core.CLet (b, body) ->
-        let acc = visit bound acc b.bind_rhs in
-        visit (add_bound_var bound b.bind_var) acc body
-    | Core.CBorrowLet (b, body) ->
-        let acc = visit bound acc b.borrow_rhs in
-        visit (add_bound_var bound b.borrow_var) acc body
-    | Core.CLambda lam ->
-        let bound =
-          List.fold_left
-            (fun acc (v, _) -> add_bound_var acc v)
-            bound lam.lam_params
-        in
-        visit bound acc lam.lam_body
-    | Core.CCall (kind, fn, args) ->
-        let acc = if direct_call_kind kind then acc else visit bound acc fn in
-        List.fold_left (visit bound) acc args
-    | Core.CFor (binder, iter, body) ->
-        let acc = visit bound acc iter in
-        visit (add_bound_var bound binder.loop_var) acc body
-    | Core.CMatchArms (scrut, arms) ->
-        let acc = visit bound acc scrut in
-        List.fold_left
-          (fun acc (pat, body) ->
-            visit (add_bound_pattern_vars bound pat) acc body)
-          acc arms
-    | Core.CMatch (scrut, tree) ->
-        let acc = visit bound acc scrut in
-        visit_ctree bound acc tree
-    | Core.CTailrecLoop loop -> visit_tailrec_loop bound acc loop
-    | Core.CConcurrent (block : Core.concurrent_block) ->
-        let acc =
-          List.fold_left
-            (fun acc (b : Core.conc_binding) -> visit bound acc b.cb_rhs)
-            acc block.conc_bindings
-        in
-        let acc =
-          match block.conc_timeout with
-          | Some timeout -> visit bound acc timeout
-          | None -> acc
-        in
-        let body_bound =
-          List.fold_left
-            (fun acc (b : Core.conc_binding) -> add_bound_var acc b.cb_var)
-            bound block.conc_bindings
-        in
-        visit body_bound acc block.conc_body
-    | Core.CConcurrentlyLoop (cf : Core.concurrently_loop) ->
-        let acc = visit bound acc cf.cf_iter in
-        let acc =
-          match cf.cf_timeout with
-          | Some timeout -> visit bound acc timeout
-          | None -> acc
-        in
-        visit (add_bound_var bound cf.cf_var) acc cf.cf_body
-    | Core.CListHandoff h -> visit_listhandoff bound acc h
-    | _ -> Core.fold_immediate_children (visit bound) acc e
-  in
-  let rec visit_decl acc (d : Core.core_decl) =
-    match d.cd_desc with
-    | Core.CDFunc f -> (
-        match f.cf_body with
-        | Some body ->
-            visit (add_bound_function_scope StringSet.empty f) acc body
-        | None -> acc)
-    | Core.CDVar v -> visit StringSet.empty acc v.cv_init
-    | Core.CDImpl i ->
-        List.fold_left
-          (fun acc (m : Core.core_func) ->
-            match m.cf_body with
-            | Some body ->
-                visit (add_bound_function_scope StringSet.empty m) acc body
-            | None -> acc)
-          acc i.ci_methods
-    | Core.CDPrivate inner -> visit_decl acc inner
-    | Core.CDTrait _ | Core.CDType _ | Core.CDRecord _ | Core.CDImport _
-    | Core.CDTypeAlias _ ->
-        acc
-  in
-  List.fold_left visit_decl [] prog |> List.rev
-
-(* ============================================================================
    Post-mono: user-function call arg types are type-variable-free
    ============================================================================ *)
 
@@ -1160,186 +907,6 @@ let check_no_cmatcharms (prog : Core.core_program) : Core_error.t list =
   |> List.rev
 
 (* ============================================================================
-   Post-closure: no raw lambdas or task-less concurrency forms survive
-   ============================================================================ *)
-
-let check_no_preclosure_forms (prog : Core.core_program) : Core_error.t list =
-  fold_program
-    (fun acc e ->
-      match e.Core.desc with
-      | Core.CLambda _ ->
-          let v =
-            violation_at Core_stage.Closure e.loc
-              ~hint:
-                "Core_closure should hoist every CLambda into a top-level \
-                 closure body and replace the site with CClosureCreate."
-              "raw CLambda survived closure conversion"
-          in
-          v :: acc
-      | Core.CConcurrent block ->
-          List.fold_left
-            (fun acc (b : Core.conc_binding) ->
-              match b.cb_task with
-              | Some _ -> acc
-              | None ->
-                  let v =
-                    violation_at Core_stage.Closure b.cb_rhs.loc
-                      ~hint:
-                        "Core_closure should attach task metadata to every \
-                         concurrent binding before emission."
-                      "concurrent binding is missing task closure metadata"
-                  in
-                  v :: acc)
-            acc block.conc_bindings
-      | Core.CConcurrentlyLoop cf -> (
-          match cf.cf_task with
-          | Some _ -> acc
-          | None ->
-              let v =
-                violation_at Core_stage.Closure cf.cf_body.loc
-                  ~hint:
-                    "Core_closure should attach task metadata to every for ... \
-                     concurrently body before emission."
-                  "for ... concurrently is missing task closure metadata"
-              in
-              v :: acc)
-      | Core.CDetach detach -> (
-          match detach.detach_task with
-          | Some _ -> acc
-          | None ->
-              let v =
-                violation_at Core_stage.Closure detach.detach_body.loc
-                  ~hint:
-                    "Core_closure should attach task metadata to every detach \
-                     body before emission."
-                  "detach is missing task closure metadata"
-              in
-              v :: acc)
-      | _ -> acc)
-    [] prog
-  |> List.rev
-
-let check_no_resource_capture_metadata_at (stage : Core_stage.t)
-    (prog : Core.core_program) : Core_error.t list =
-  let reg = alias_registry_for_program prog in
-  let resource_names = resource_type_names_for_program ~reg prog in
-  let aggregate_components = aggregate_components_for_program prog in
-  let resource_capture_violation loc ~context name ty =
-    violation_at stage loc
-      ~hint:
-        "Core_closure must not encode scoped resources in closure or task \
-         capture metadata. Keep resource use inside its with scope, or capture \
-         ordinary data read from the resource instead."
-      (Printf.sprintf "resource capture `%s: %s` reached %s metadata" name
-         (Types.type_to_string ty) context)
-  in
-  let check_captures loc ~context captures acc =
-    List.fold_left
-      (fun acc (name, ty) ->
-        if
-          type_contains_resource_named ~reg ~resource_names
-            ~aggregate_components ty
-        then resource_capture_violation loc ~context name ty :: acc
-        else acc)
-      acc captures
-  in
-  let unsupported_task_capture_violation loc ~context capture =
-    violation_at stage loc
-      ~hint:
-        "Only ordinary copy captures are currently implemented for child \
-         tasks. Resource item moves and structured task borrows need explicit \
-         lowering before they can reach closure metadata."
-      (Printf.sprintf "unsupported %s capture `%s: %s`" context
-         capture.Core.task_capture_name
-         (Types.type_to_string capture.Core.task_capture_ty))
-  in
-  let check_task_captures ?allowed_resource_move loc ~context task acc =
-    let acc =
-      List.fold_left
-        (fun acc capture ->
-          match capture.Core.task_capture_kind with
-          | Core.TaskCopyCapture -> acc
-          | Core.TaskMoveResourceItem -> (
-              match allowed_resource_move with
-              | Some (name, ty)
-                when capture.Core.task_capture_name = name
-                     && invariant_types_equal ~reg capture.Core.task_capture_ty
-                          ty ->
-                  acc
-              | _ ->
-                  unsupported_task_capture_violation loc ~context capture :: acc
-              )
-          | Core.TaskStructuredTaskBorrow ->
-              unsupported_task_capture_violation loc ~context capture :: acc)
-        acc task.Core.tc_captures
-    in
-    let copy_capture_bindings =
-      task.Core.tc_captures
-      |> List.filter_map (fun capture ->
-          match capture.Core.task_capture_kind with
-          | Core.TaskCopyCapture -> Some (Core.task_capture_binding capture)
-          | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow -> None)
-    in
-    check_captures loc ~context copy_capture_bindings acc
-  in
-  let check_task ?allowed_resource_move loc ~context task_opt acc =
-    match task_opt with
-    | Some task ->
-        check_task_captures ?allowed_resource_move loc ~context task acc
-    | None -> acc
-  in
-  let check_func acc (f : Core.core_func) =
-    match f.cf_kind with
-    | Core.CFClosureBody abi ->
-        let loc =
-          match f.cf_body with Some body -> body.loc | None -> Ast.dummy_loc
-        in
-        let copied_captures =
-          List.filter
-            (fun (name, _) -> not (List.mem name abi.ca_moved_captures))
-            abi.ca_captures
-        in
-        check_captures loc ~context:"closure ABI" copied_captures acc
-    | Core.CFUser | Core.CFBuiltin | Core.CFForeign _ -> acc
-  in
-  let rec visit_decl acc (d : Core.core_decl) =
-    match d.cd_desc with
-    | Core.CDFunc f -> check_func acc f
-    | Core.CDImpl i -> List.fold_left check_func acc i.ci_methods
-    | Core.CDPrivate inner -> visit_decl acc inner
-    | Core.CDType _ | Core.CDRecord _ | Core.CDImport _ | Core.CDTypeAlias _
-    | Core.CDVar _ | Core.CDTrait _ ->
-        acc
-  in
-  let acc = List.fold_left visit_decl [] prog in
-  fold_program
-    (fun acc e ->
-      match e.Core.desc with
-      | Core.CClosureCreate cc ->
-          check_captures e.loc ~context:"closure creation" cc.cc_captures acc
-      | Core.CConcurrent block ->
-          List.fold_left
-            (fun acc (b : Core.conc_binding) ->
-              check_task b.cb_rhs.loc ~context:"concurrent binding task"
-                b.cb_task acc)
-            acc block.conc_bindings
-      | Core.CConcurrentlyLoop cf ->
-          let allowed_resource_move =
-            match cf.cf_item_mode with
-            | Core.ConcurrentlyLoopMoveResourceItem { clmi_resource_ty; _ } ->
-                Some (cf.cf_var.Core.vname, clmi_resource_ty)
-            | Core.ConcurrentlyLoopCopyItem -> None
-          in
-          check_task ?allowed_resource_move cf.cf_body.loc
-            ~context:"for ... concurrently task" cf.cf_task acc
-      | Core.CDetach detach ->
-          check_task detach.detach_body.loc ~context:"detach task"
-            detach.detach_task acc
-      | _ -> acc)
-    acc prog
-  |> List.rev
-
-(* ============================================================================
    Final Core: concurrency result and task contracts are explicit
    ============================================================================ *)
 
@@ -1358,7 +925,7 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
   let type_mismatch loc ~subject ~expected ~actual acc =
     violation_at stage loc
       ~hint:
-        "Infer/Core_lower/Core_closure should preserve one explicit \
+        "Inference and Core lowering should preserve one explicit \
          concurrency contract: task bodies have raw type T, joined bindings \
          have Result[T, ConcurrencyError], and collecting concurrently-loop \
          Core forms have List[Result[T, ConcurrencyError]]."
@@ -1429,15 +996,6 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
       :: acc
     else acc
   in
-  let check_task_return loc ~subject task_opt expected acc =
-    match task_opt with
-    | Some task
-      when not (invariant_types_equal ~reg task.Core.tc_return_ty expected) ->
-        type_mismatch loc
-          ~subject:(subject ^ " task return type")
-          ~expected ~actual:task.Core.tc_return_ty acc
-    | _ -> acc
-  in
   let check_unique_concurrent_binding_names bindings acc =
     let rec go seen acc = function
       | [] -> acc
@@ -1482,10 +1040,8 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
                       ~subject:"concurrent binding result type" ~expected
                       ~actual:b.cb_ty acc
                 in
-                check_task_return b.cb_rhs.loc ~subject:"concurrent binding"
-                  b.cb_task b.cb_rhs.ty acc
-                |> check_concurrent_task_scope b.cb_rhs.loc
-                     ~subject:"concurrent binding" b.cb_task_scope)
+                check_concurrent_task_scope b.cb_rhs.loc
+                  ~subject:"concurrent binding" b.cb_task_scope acc)
               acc block.conc_bindings
           in
           let acc =
@@ -1565,10 +1121,6 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
                 type_mismatch cf.cf_body.loc
                   ~subject:"discarding for ... concurrently body type"
                   ~expected:ty_void ~actual:cf.cf_body.ty acc
-          in
-          let acc =
-            check_task_return cf.cf_body.loc ~subject:"for ... concurrently"
-              cf.cf_task cf.cf_body.ty acc
           in
           let acc =
             match cf.cf_timeout with
@@ -2194,9 +1746,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_raw_tensor_views_at stage prog (* bookend *)
       @ check_call_ownership_contracts_at stage prog
       @ check_resource_scope_contracts_at stage prog
-  | Core_stage.Closure ->
-      check_no_preclosure_forms prog
-      @ check_no_resource_capture_metadata_at stage prog
+  | Core_stage.Closure -> []
   | Core_stage.Final ->
       check_no_debug_blocks_at stage prog
       @ check_no_sugar prog @ check_no_cmatcharms prog
@@ -2204,9 +1754,6 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_no_layoutless_list_alloc_at stage prog
       @ check_no_codegen_unprepared_forms_at stage prog
       @ check_void_boxed_builtin_args_explicit_at stage prog
-      @ check_no_raw_top_level_function_refs_at stage prog
-      @ check_no_preclosure_forms prog
-      @ check_no_resource_capture_metadata_at stage prog
       @ check_raw_tensor_views_at stage prog
       @ check_no_unguarded_raw_tensor_gets_at stage prog
       @ check_no_raw_string_byte_intrinsics_at stage prog
