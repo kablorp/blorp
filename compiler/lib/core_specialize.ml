@@ -427,32 +427,6 @@ let specialize_debug_string ~reg (e : core) callee arg : core =
      [to_string] on a non-Stringable type today. *)
   | _ -> e
 
-(** Specialize [hash(arg)] by argument type.
-
-    Primitive types route to the runtime's HashDoS-resistant seeded
-    hash functions ([blorp_dict_hash_int], [blorp_dict_hash_string]
-    etc. — already used internally by Dict/Set key dispatch). For
-    floats, the runtime doesn't have a dedicated hasher; we bit-cast
-    to an integer of matching width and route through
-    [blorp_dict_hash_int]. For booleans, bit-value works directly.
-    For Char, the codepoint Int is the right hash. Unknown types
-    pass through — core_trait_resolve handles user-defined Hashable
-    impls via the normal method-dispatch path. *)
-let specialize_hash (e : core) callee arg : core =
-  let builtin c = { e with desc = CCall (CKBuiltin c, callee, [ arg ]) } in
-  match normalize_type arg.ty with
-  | Ast.TyNamed ("String", _) -> builtin "blorp_hash_string"
-  | ty when Types.Dim.is_value_dim ty -> builtin "blorp_hash_int"
-  | Ast.TyNamed ("Int", _) | Ast.TyNamed ("Bool", _) | Ast.TyNamed ("Char", _)
-    ->
-      builtin "blorp_hash_int"
-  | ty when Types.is_any_integer_type ty -> builtin "blorp_hash_int"
-  | Ast.TyNamed ("Float", _)
-  | Ast.TyNamed ("Float32", _)
-  | Ast.TyNamed ("Float16", _) ->
-      builtin "blorp_hash_float"
-  | _ -> e
-
 let int_ty = Ast.TyNamed ("Int", [])
 let void_ty = Ast.TyNamed ("Void", [])
 let raw_ptr_ty = Ast.TyNamed ("Ptr", [])
@@ -1607,7 +1581,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
           { e with desc = CCall (CKBuiltin norm_name, callee, [ arg ]) }
       | "blorp_to_string" -> specialize_to_string ~reg e callee arg
       | "blorp_debug_string" -> specialize_debug_string ~reg e callee arg
-      | "blorp_hash" -> specialize_hash e callee arg
       | "blorp_stream_repeat" ->
           let elem_layout =
             stream_result_borrowed_layout ~reg ~loc:e.loc

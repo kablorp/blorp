@@ -8,7 +8,6 @@
 
 let schema_version = 1
 let domain = "compiler"
-let core_error_renderer = "core_error"
 let core_fairness_renderer = "core_fairness"
 let core_stage_renderer = "core_stage"
 let core_trait_resolve_renderer = "core_trait_resolve"
@@ -3198,20 +3197,5 @@ let render_core_trait_resolve_no_impl_hint ~method_name ~type_name ~candidates =
     ~op:"core_trait_resolve_no_impl_hint"
     [ method_name; type_name; String.concat ";" candidates ]
 
-let render_core_error_format ~phase ~message ~line ~column ~hint =
-  let hint_kind, hint_text =
-    match hint with Some text -> ("some", text) | None -> ("none", "")
-  in
-  render_via_command_exn ~renderer:core_error_renderer ~op:"core_error_format"
-    [
-      phase;
-      message;
-      string_of_int line;
-      string_of_int column;
-      hint_kind;
-      hint_text;
-    ]
-
 let () =
-  Core_stage.set_unknown_stage_error_renderer render_core_stage_unknown_error;
-  Core_error.set_formatter render_core_error_format
+  Core_stage.set_unknown_stage_error_renderer render_core_stage_unknown_error

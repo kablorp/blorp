@@ -1053,11 +1053,6 @@ let stack_result_c_type ~reg ty = Codegen_types.stack_result_c_type ~reg ty
 let is_stack_option_type ~reg ty = stack_option_c_type ~reg ty <> None
 let is_stack_result_type ~reg ty = stack_result_c_type ~reg ty <> None
 
-let stack_result_layout ~reg ty =
-  Core_type_layout.stack_result_layout
-    (Core_type_layout.metadata_for_registry reg)
-    ty
-
 let stack_result_constructor_abi_of_layout = function
   | Core_result_layout.StackErased | Core_result_layout.StackManaged ->
       { src_result_c_type = "blorp_StackResult" }

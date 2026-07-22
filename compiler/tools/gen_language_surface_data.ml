@@ -178,8 +178,7 @@ let emit_rows completion_keywords prelude_imports prelude_ufcs_modules =
   Printf.printf "  (%S, %S);\n" "language_prelude_method_type_imports"
     imports_text;
   Printf.printf "  (%S, %S);\n" "language_prelude_ufcs_modules" ufcs_text;
-  Printf.printf "]\n\n";
-  Printf.printf "let find name = List.assoc_opt name rows\n"
+  Printf.printf "]\n"
 
 let () =
   let manifest_path =

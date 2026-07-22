@@ -25,7 +25,7 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
   -> OCaml Core pipeline through length and the remaining
      registry/layout-dependent specialization
-  -> JSON pre-DCE Core with semantic conversion builtins preserved
+  -> JSON pre-DCE Core with semantic conversion and hash builtins preserved
   -> Blorp primitive specialization / function-reference adaptation / DCE /
      consume specialization / Perceus / reuse / closure / resource / fairness /
      prepare / prepared reuse
@@ -100,11 +100,11 @@ Core lowering and the early/middle Core passes, including length and the
 remaining registry/layout-dependent specialization families. Length must stay
 before the current bridge because its tensor intrinsic rewrite feeds raw-view
 formation in the same pass. The production JSON handoff preserves the concrete
-conversion builtins that are now specialized in Blorp. Blorp is authoritative
-for those primitive specializations, function-reference adaptation, DCE,
-consume specialization, Perceus, and the complete backend tail; each replaced
-OCaml implementation and its implementation-only tests are deleted in the same
-slice.
+conversion and hash builtins that are now specialized in Blorp. Blorp is
+authoritative for those primitive specializations, function-reference
+adaptation, DCE, consume specialization, Perceus, and the complete backend
+tail; each replaced OCaml implementation and its implementation-only tests are
+deleted in the same slice.
 
 The public executable is Blorp-owned through
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. Ordinary `check` makes
@@ -2175,15 +2175,16 @@ Status: Blorp DCE is authoritative on the normal production path and the
 superseded OCaml DCE implementation and tests are deleted. First-class
 function-reference adaptation is also Blorp-authoritative immediately after
 the handoff; its OCaml implementation and tests are deleted. Primitive
-conversion specialization is now Blorp-authoritative at that same boundary for
-`blorp_to_int`, `blorp_to_float`, `blorp_to_float32`, `blorp_to_float16`,
-`blorp_to_bool`, and `blorp_to_char`; the corresponding OCaml implementations
-and direct tests are deleted. Length specialization remains OCaml-authoritative
-because it feeds tensor raw-view formation before the current bridge. The
-remaining early and middle Core stages, including the registry/layout-dependent
-parts of specialization, are also still OCaml-authoritative. Stage parity
-modules must not be counted as migrated until the production pass ordering
-invokes them and the replaced OCaml pass is deleted.
+conversion and hash specialization is now Blorp-authoritative at that same
+boundary for `blorp_to_int`, `blorp_to_float`, `blorp_to_float32`,
+`blorp_to_float16`, `blorp_to_bool`, `blorp_to_char`, and `blorp_hash`; the
+corresponding OCaml implementations and implementation-only tests are deleted.
+Length specialization remains OCaml-authoritative because it feeds tensor
+raw-view formation before the current bridge. The remaining early and middle
+Core stages, including the registry/layout-dependent parts of specialization,
+are also still OCaml-authoritative. Stage parity modules must not be counted as
+migrated until the production pass ordering invokes them and the replaced
+OCaml pass is deleted.
 
 OCaml references, in `Core_pipeline.run_core_passes` order:
 
@@ -2235,8 +2236,8 @@ Blorp references:
 - future `compiler_core_tailrec.brp`
 - future fusion modules
 - existing `compiler_core_specialize.brp` for the authoritative primitive
-  conversion family; extend it by coherent builtin families whose consumers
-  are already on the Blorp side of the bridge
+  conversion and hash families; extend it by coherent builtin families whose
+  consumers are already on the Blorp side of the bridge
 - existing `compiler_core_closure.brp` / `adapt_function_refs_program`
 - existing `compiler_core_dce.brp`
 

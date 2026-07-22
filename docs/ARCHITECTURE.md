@@ -62,8 +62,9 @@ Core path is the compiler's codegen path.
 During the OCaml-to-Blorp port, the production route first decodes the
 Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
 then crosses the Core JSON bridge after the remaining OCaml specialization
-families. Primitive conversion builtins intentionally cross in semantic form
-so Blorp can specialize them before Blorp-owned function-reference adaptation.
+families. Primitive conversion and hash builtins intentionally cross in
+semantic form so Blorp can specialize them before Blorp-owned
+function-reference adaptation.
 Length specialization remains before the bridge because its concrete tensor
 intrinsics feed raw-view formation in the same OCaml pass. Checkpoint 8 in
 `docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
@@ -169,8 +170,8 @@ Typed AST
     |
     v
 +----------------------------+
-| Blorp primitive specialize |  Conversion builtins become casts or direct
-+----------------------------+  runtime calls
+| Blorp primitive specialize |  Conversion and hash builtins become casts or
++----------------------------+  direct runtime calls
                                 (compiler_core_specialize.brp)
     |
     v
@@ -323,7 +324,7 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_12_cli/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
 | `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion specialization after the handoff |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
 | `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |

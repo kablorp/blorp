@@ -136,9 +136,6 @@ let payload_status_of_expanded meta ty =
         PayloadGeneric
     | Ast.TyRange _ | Ast.TyConstInt _ | Ast.TyDimOp _ -> PayloadErased
 
-let payload_status meta payload_ty =
-  payload_status_of_expanded meta (expand_aliases meta [] payload_ty)
-
 let classification_from_payloads ok_status err_status =
   match (ok_status, err_status) with
   | PayloadErased, PayloadErased -> Known StackErased

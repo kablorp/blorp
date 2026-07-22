@@ -40,7 +40,6 @@ let obj fields = Lsp_json.Object fields
 let arr values = Lsp_json.Array values
 let str value = Lsp_json.String value
 let int value = Lsp_json.Int value
-let float value = Lsp_json.Float value
 let bool value = Lsp_json.Bool value
 let null = Lsp_json.Null
 let kind tag fields = obj (("kind", str tag) :: fields)
@@ -71,6 +70,7 @@ let supported_sized_integer_conversion_builtins =
 let blorp_specialization_builtins =
   StringSet.of_list
     [
+      "blorp_hash";
       "blorp_to_bool";
       "blorp_to_char";
       "blorp_to_float";
@@ -4964,12 +4964,6 @@ and select_json ~function_names ~consumed_params ~reg enum_names value_record_na
          union_names enum_constructors path)
   in
   Ok (obj [ ("arms", arms) ])
-
-	and require_tensor_for_single_dimension path ~reg (iter : Core.core) =
-	  match Core_tensor_type.of_type ~reg iter.ty with
-	  | Some { Core_tensor_type.dims = [ _ ]; _ } -> Ok ()
-	  | Some _ -> unsupported path "multi-dimensional tensor for-loop"
-	  | None -> unsupported path "non-tensor for-loop"
 
 	and tensor_for_row_slice_json ~reg path (iter : Core.core) =
 	  match Core_tensor_type.of_type ~reg iter.ty with

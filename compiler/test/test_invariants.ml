@@ -1350,8 +1350,9 @@ let test_pipeline_check_invariants_passes_on_clean_code () =
   match Core_pipeline.compile_typed ~check_invariants:true prog with
   | _c_code -> () (* no exception = pass *)
   | exception Core_error.Core_error err ->
-      Alcotest.failf "unexpected invariant violation: %s"
-        (Core_error.to_string err)
+      Alcotest.failf "unexpected invariant violation [%s]: %s"
+        (Core_error.phase_tag_to_string err.phase)
+        err.msg
 
 let test_make_stage_hook_raises_on_violation () =
   (* Prove [make_stage_hook] runs the invariant check BEFORE the user

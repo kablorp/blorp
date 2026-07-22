@@ -18,14 +18,13 @@
         "expression missing type"
     ]}
 
-    At the boundary (e.g. [Pipeline]), catch [Core_error] and render
-    it via [to_string] or a fancier [Diagnostics]-based renderer:
+    At a compiler boundary, catch [Core_error] and translate its structured
+    fields into the boundary's diagnostic type:
 
     {[
       try Core_lower.lower_typed_program typed_prog
-      with Core_error err ->
-        prerr_endline (Core_error.to_string err);
-        exit 1
+      with Core_error { phase; msg; loc; hint } ->
+        report_core_error ~phase ~message:msg ~loc ~hint
     ]} *)
 
 (** Where in the compiler an error was produced. Stage-level errors
@@ -66,35 +65,3 @@ exception Core_error of t
     actionable suggestion. *)
 let errorf ?hint phase loc fmt =
   Printf.ksprintf (fun msg -> raise (Core_error { phase; msg; loc; hint })) fmt
-
-let formatter :
-    (phase:string ->
-    message:string ->
-    line:int ->
-    column:int ->
-    hint:string option ->
-    string)
-    option
-    ref =
-  ref None
-
-let set_formatter render = formatter := Some render
-
-(** Render a [Core_error.t] as a multi-line string for display. *)
-let to_string (e : t) : string =
-  let fallback_to_string () =
-    let base =
-      Printf.sprintf "%s: %s at %d:%d"
-        (phase_tag_to_string e.phase)
-        e.msg e.loc.line e.loc.column
-    in
-    match e.hint with Some h -> base ^ "\n  hint: " ^ h | None -> base
-  in
-  match !formatter with
-  | Some render -> (
-      try
-        render
-          ~phase:(phase_tag_to_string e.phase)
-          ~message:e.msg ~line:e.loc.line ~column:e.loc.column ~hint:e.hint
-      with Invalid_argument _ -> fallback_to_string ())
-  | None -> fallback_to_string ()

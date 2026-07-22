@@ -51,7 +51,6 @@ let source plan = plan.source
 let sink plan = plan.sink
 let cardinality plan = plan.cardinality
 let result_ty plan = plan.result_ty
-let loc plan = plan.loc
 
 let list_elem_ty = function
   | Ast.TyNamed ("List", [ elem_ty ]) -> Some elem_ty

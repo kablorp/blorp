@@ -389,11 +389,6 @@ val stack_result_c_type :
 val is_stack_option_type : reg:Codegen_types.registry -> Ast.type_expr -> bool
 val is_stack_result_type : reg:Codegen_types.registry -> Ast.type_expr -> bool
 
-val stack_result_layout :
-  reg:Codegen_types.registry ->
-  Ast.type_expr ->
-  Core_result_layout.layout option
-
 val stack_result_constructor_abi_of_layout :
   Core_result_layout.layout -> stack_result_constructor_abi
 

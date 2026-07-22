@@ -133,11 +133,3 @@ let same_type_collect_policy_for_stages model ~filter_map_payload_policy
               filter_map_payload_policy;
             }
       | _ -> Ineligible NotSameTypeCollect)
-
-let same_type_collect_policy model ~(source_elem_ty : Ast.type_expr)
-    ~(filter_input_ty : Ast.type_expr) ~(map_input_ty : Ast.type_expr)
-    ~(map_output_ty : Ast.type_expr) ~(result_ty : Ast.type_expr) :
-    collect_policy eligibility =
-  same_type_collect_policy_for_stages model ~source_elem_ty
-    ~stage_value_tys:[ filter_input_ty; map_input_ty; map_output_ty ]
-    ~filter_map_payload_policy:NoFilterMapPayload ~result_ty
