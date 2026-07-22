@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-21.
+Status checked against code on 2026-07-22.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -23,12 +23,14 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> Blorp typecheck / CTFE / typed semantic-middle request
   -> one blorp-ocaml-middle process
   -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
-  -> OCaml Core pipeline through length and the remaining
-     registry/layout-dependent specialization
-  -> JSON pre-DCE Core with semantic conversion and hash builtins preserved
-  -> Blorp primitive specialization / function-reference adaptation / DCE /
-     consume specialization / Perceus / reuse / closure / resource / fairness /
-     prepare / prepared reuse
+  -> OCaml early/middle Core pipeline and the remaining registry/layout-dependent
+     specialization
+  -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
+     tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
+     reduction, and bounds-proven tensor-access builtins preserved
+  -> Blorp primitive and tensor specialization / function-reference adaptation /
+     DCE / consume specialization / Perceus / reuse / closure / resource /
+     fairness / prepare / prepared reuse
   -> Blorp C artifact emission
   -> Blorp artifact writing / runtime cache / C compiler invocation /
      optional program execution
@@ -73,6 +75,7 @@ Current production backend-tail Blorp files:
 - `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`
@@ -96,15 +99,18 @@ Current OCaml bridge, orchestration, and production-middle files:
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` still invokes the OCaml implementations of
-Core lowering and the early/middle Core passes, including length and the
-remaining registry/layout-dependent specialization families. Length must stay
-before the current bridge because its tensor intrinsic rewrite feeds raw-view
-formation in the same pass. The production JSON handoff preserves the concrete
-conversion and hash builtins that are now specialized in Blorp. Blorp is
-authoritative for those primitive specializations, function-reference
-adaptation, DCE, consume specialization, Perceus, and the complete backend
-tail; each replaced OCaml implementation and its implementation-only tests are
-deleted in the same slice.
+Core lowering and the early/middle Core passes, including the remaining
+registry/layout-dependent specialization families. The production JSON handoff
+preserves concrete conversion, hash, length, numeric checked tensor-access,
+raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
+bounds-proven tensor-access builtins for Blorp specialization. Blorp is
+authoritative for primitive specialization, length folding, numeric checked
+read/write, raw-scalar fill, unary tensor-math dispatch, numeric
+tensor-reduction dispatch,
+bounds-proven guarded tensor raw-view formation,
+function-reference adaptation, DCE, consume specialization, Perceus, and the
+complete backend tail; each replaced OCaml implementation and its
+implementation-only tests is deleted in the same slice.
 
 The public executable is Blorp-owned through
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. Ordinary `check` makes
@@ -2179,12 +2185,32 @@ conversion and hash specialization is now Blorp-authoritative at that same
 boundary for `blorp_to_int`, `blorp_to_float`, `blorp_to_float32`,
 `blorp_to_float16`, `blorp_to_bool`, `blorp_to_char`, and `blorp_hash`; the
 corresponding OCaml implementations and implementation-only tests are deleted.
-Length specialization remains OCaml-authoritative because it feeds tensor
-raw-view formation before the current bridge. The remaining early and middle
-Core stages, including the registry/layout-dependent parts of specialization,
-are also still OCaml-authoritative. Stage parity modules must not be counted as
-migrated until the production pass ordering invokes them and the replaced
-OCaml pass is deleted.
+Length specialization, numeric checked tensor-access, raw-scalar fill, unary
+tensor-math and numeric reduction dispatch, and bounds-proven tensor raw-view
+formation are also Blorp-authoritative at that boundary. They live together in
+`compiler_core_tensor_specialize.brp`: static tensor length folding supplies
+the loop bound used by the raw-access proof; numeric reads select typed or
+erased runtime ABIs and inject static dimensions for ranked access; typed
+vector/matrix writes and `Int`/`Float`/`Float32` fills select concrete runtime
+names; `norm`, `sqrt`, `exp`, and `log` select `Float`, `Float32`, or `Float16`
+runtime ABIs from their tensor receiver; `max` and `min` select `Int`, `Float`,
+`Float32`, or `Float16` reduction ABIs; and runtime storage plus COW uniqueness
+guards retain the original loop as a fallback. Core JSON canonicalizes aliases
+and all ordinary source tensor spellings before this pass. Packed fills,
+including `Bool` and inline enums, and boxed or inline-record fills remain
+OCaml-owned until their layout metadata is represented precisely on the Blorp
+side. Pointer, wide value, Option-layout, and boxed-value access also remains
+OCaml-owned. Tensor reductions outside the four exact numeric element types
+also remain OCaml-owned until their storage and comparison contracts are
+represented explicitly. The four numeric reduction cases now bypass the OCaml
+fallback and their implementation-only test is deleted. The replaced OCaml
+numeric and unary tensor-math dispatch branches, raw-view environment,
+collector, rewriter, global fresh-name counter, and implementation-only tests
+are deleted. The remaining
+early and middle Core stages, including other registry/layout-dependent
+specialization families, are still OCaml-authoritative. Stage parity modules
+must not be counted as migrated until the production pass ordering invokes
+them and the replaced OCaml pass is deleted.
 
 OCaml references, in `Core_pipeline.run_core_passes` order:
 
@@ -2238,6 +2264,10 @@ Blorp references:
 - existing `compiler_core_specialize.brp` for the authoritative primitive
   conversion and hash families; extend it by coherent builtin families whose
   consumers are already on the Blorp side of the bridge
+- existing `compiler_core_tensor_specialize.brp` for authoritative length
+  folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math
+  and numeric reduction dispatch, and guarded raw-view formation in
+  bounds-proven range loops
 - existing `compiler_core_closure.brp` / `adapt_function_refs_program`
 - existing `compiler_core_dce.brp`
 

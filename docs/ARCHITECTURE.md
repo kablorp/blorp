@@ -62,14 +62,20 @@ Core path is the compiler's codegen path.
 During the OCaml-to-Blorp port, the production route first decodes the
 Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
 then crosses the Core JSON bridge after the remaining OCaml specialization
-families. Primitive conversion and hash builtins intentionally cross in
-semantic form so Blorp can specialize them before Blorp-owned
-function-reference adaptation.
-Length specialization remains before the bridge because its concrete tensor
-intrinsics feed raw-view formation in the same OCaml pass. Checkpoint 8 in
+families. Primitive conversion, hash, length, numeric checked tensor access,
+raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
+bounds-proven tensor access builtins intentionally cross in semantic form so
+Blorp can specialize them before Blorp-owned function-reference adaptation.
+The Core JSON projection expands aliases and canonicalizes `Vector`, `Matrix`,
+`Tensor`, and array spellings to one tensor type, so tensor specialization
+receives canonical shapes, numeric types, and enum types rather than repeating
+registry lookup in Blorp. Length folding and raw-view formation remain one coherent pass because
+the folded static dimension is the fact that proves loop accesses in bounds.
+Checkpoint 8 in
 `docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
 making Blorp Core lowering authoritative. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
@@ -173,6 +179,13 @@ Typed AST
 | Blorp primitive specialize |  Conversion and hash builtins become casts or
 +----------------------------+  direct runtime calls
                                 (compiler_core_specialize.brp)
+    |
+    v
++--------------------------+
+| Blorp tensor specialize  |  Fold length; dispatch numeric checked access,
++--------------------------+  raw-scalar fills, unary math, and reductions; form guarded
+                              raw views for bounds-proven loops
+                              (compiler_core_tensor_specialize.brp)
     |
     v
 +--------------------------+
@@ -304,7 +317,7 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
-| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff |
+| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff, excluding Blorp-owned primitive, length, numeric checked tensor-access, raw-scalar tensor-fill, and bounds-proven raw-view families |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
@@ -325,6 +338,7 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
 | `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
+| `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
 | `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |

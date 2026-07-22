@@ -23,19 +23,6 @@ let ty_list_char = TyNamed ("List", [ TyNamed ("Char", []) ])
 let ty_stream_string = TyNamed ("Stream", [ ty_string ])
 let mk d t = { desc = d; ty = t; loc }
 let cvar n t = mk (CVar (Var.named n)) t
-let cvoid = mk CVoid ty_void
-
-let resource_scope name ty acquire body cleanup =
-  mk
-    (CResourceScope
-       {
-         rs_var = Var.named name;
-         rs_ty = ty;
-         rs_acquire = acquire;
-         rs_body = body;
-         rs_cleanup = cleanup;
-       })
-    body.ty
 
 let enum_variant name tag =
   {
@@ -165,59 +152,6 @@ let expect_intrinsic label expected_name e =
   | CCall (CKIntrinsic got_name, _, _) ->
       Alcotest.(check string) (label ^ " name") expected_name got_name
   | _ -> Alcotest.failf "%s did not specialize to expected intrinsic" label
-
-let expect_intrinsic_with_reg label reg expected_name e =
-  match (specialize_with_reg reg e).desc with
-  | CCall (CKIntrinsic got_name, _, _) ->
-      Alcotest.(check string) (label ^ " name") expected_name got_name
-  | _ -> Alcotest.failf "%s did not specialize to expected intrinsic" label
-
-let test_vector_minmax_uses_tensor_element_abi () =
-  let cases =
-    [
-      ("Float max", "blorp_max", ty_float, "blorp_vector_max_float");
-      ("Float min", "blorp_min", ty_float, "blorp_vector_min_float");
-      ("Float32 max", "blorp_max", ty_float32, "blorp_vector_max_float32");
-      ("Float32 min", "blorp_min", ty_float32, "blorp_vector_min_float32");
-      ("Float16 max", "blorp_max", ty_float16, "blorp_vector_max_float16");
-      ("Float16 min", "blorp_min", ty_float16, "blorp_vector_min_float16");
-      ("Int max", "blorp_max", ty_int, "blorp_vector_max_int");
-      ("Int min", "blorp_min", ty_int, "blorp_vector_min_int");
-    ]
-  in
-  List.iter
-    (fun (label, sentinel, elem_ty, expected) ->
-      let vector = cvar "values" (tensor elem_ty [ 3 ]) in
-      expect_builtin label expected (call_builtin sentinel [ vector ] elem_ty))
-    cases
-
-let expect_ranked_checked_get_shape_dims label expected_dims args =
-  let got_dims = List.map int_lit (List.filteri (fun i _ -> i >= 1 && i <= 3) args) in
-  Alcotest.(check (list int)) (label ^ " dims") expected_dims got_dims
-
-let count_intrinsic name body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CCall (CKIntrinsic got, _, _) when got = name -> acc + 1
-      | _ -> acc)
-    0 body
-
-let count_tensor_raw_view_let kind body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CTensorRawViewLet ({ trv_kind; _ }, _) when trv_kind = kind -> acc + 1
-      | _ -> acc)
-    0 body
-
-let count_tensor_raw_read kind body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CTensorRawRead { trr_kind; _ } when trr_kind = kind -> acc + 1
-      | _ -> acc)
-    0 body
 
 let expect_list_alloc_width label expected_width e =
   match (specialize e).desc with
@@ -449,23 +383,6 @@ let test_unknown_matrix_vector_multiply_requires_resolved_builtin () =
       Alcotest.failf "unresolved multiply_vector specialized to %s by name" name
   | _ -> Alcotest.fail "expected unresolved multiply_vector to remain a call"
 
-let test_float32_vector_fill_uses_packed_runtime () =
-  let value = mk (CLit (LitFloat 0.0)) ty_float32 in
-  let size = mk (CLit (LitInt 4L)) ty_int in
-  let e =
-    call_builtin "blorp_vector_new_fill" [ value; size ]
-      (tensor ty_float32 [ 4 ])
-  in
-  expect_builtin "float32 vector fill" "blorp_vector_new_fill_f32" e
-
-let test_float64_vector_fill_uses_unboxed_runtime () =
-  let value = mk (CLit (LitFloat 0.0)) ty_float in
-  let size = mk (CLit (LitInt 4L)) ty_int in
-  let e =
-    call_builtin "blorp_vector_new_fill" [ value; size ] (tensor ty_float [ 4 ])
-  in
-  expect_builtin "float64 vector fill" "blorp_vector_new_fill_f64" e
-
 let test_alias_matrix_vector_multiply_static_dims_specializes () =
   let reg = Blorp.Codegen_types.create_registry () in
   Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
@@ -510,16 +427,6 @@ let test_alias_matrix_multiply_static_dims_specializes () =
   expect_builtin_with_dims_with_reg "alias multiply" reg
     "blorp_tensor_matrix_multiply_float" [ 2; 3; 4 ] e
 
-let test_float64_matrix_fill_uses_unboxed_runtime () =
-  let value = mk (CLit (LitFloat 0.0)) ty_float in
-  let rows = mk (CLit (LitInt 2L)) ty_int in
-  let cols = mk (CLit (LitInt 3L)) ty_int in
-  let e =
-    call_builtin "blorp_matrix_new_fill" [ value; rows; cols ]
-      (tensor ty_float [ 2; 3 ])
-  in
-  expect_builtin "float64 matrix fill" "blorp_matrix_new_fill_f64" e
-
 let test_bool_vector_fill_uses_packed_runtime () =
   let value = mk (CLit (LitBool true)) ty_bool in
   let size = mk (CLit (LitInt 4L)) ty_int in
@@ -555,211 +462,6 @@ let test_enum_vector_fill_uses_packed_runtime () =
   in
   expect_builtin_last_int_with_reg "enum vector fill" reg
     "blorp_vector_new_fill_packed" 1 e
-
-let test_float32_checked_get_uses_packed_runtime () =
-  let v = cvar "v" (tensor ty_float32 [ 4 ]) in
-  let idx = mk (CLit (LitInt 2L)) ty_int in
-  let e = call_builtin "blorp_checked_get" [ v; idx ] ty_float32 in
-  expect_intrinsic "float32 checked_get" "tensor_get_f32" e
-
-let test_float64_checked_get_uses_unboxed_intrinsic () =
-  let v = cvar "v" (tensor ty_float [ 4 ]) in
-  let idx = mk (CLit (LitInt 2L)) ty_int in
-  let e = call_builtin "blorp_checked_get" [ v; idx ] ty_float in
-  expect_intrinsic "float64 checked_get" "tensor_get_f64" e
-
-let test_alias_int_checked_get_uses_raw_scalar_intrinsic () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Count" ([], ty_int);
-  Hashtbl.replace reg.type_aliases "Counts"
-    ([], TyNamed ("Vector", [ TyNamed ("Count", []); TyConstInt 4 ]));
-  let v = cvar "v" (TyNamed ("Counts", [])) in
-  let idx = mk (CLit (LitInt 2L)) ty_int in
-  let e = call_builtin "blorp_checked_get" [ v; idx ] (TyNamed ("Count", [])) in
-  expect_intrinsic_with_reg "alias int checked_get" reg "tensor_get_i64" e
-
-let test_alias_enum_checked_get_uses_layout_intrinsic () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Blorp.Codegen_types.register_enum_type reg "Color"
-    [ enum_variant "Red" 0; enum_variant "Blue" 1 ];
-  Hashtbl.replace reg.type_aliases "Paint" ([], TyNamed ("Color", []));
-  Hashtbl.replace reg.type_aliases "Paints"
-    ([], TyNamed ("Vector", [ TyNamed ("Paint", []); TyConstInt 4 ]));
-  let v = cvar "v" (TyNamed ("Paints", [])) in
-  let idx = mk (CLit (LitInt 2L)) ty_int in
-  let e = call_builtin "blorp_checked_get" [ v; idx ] (TyNamed ("Paint", [])) in
-  expect_intrinsic_with_reg "alias enum checked_get" reg "tensor_get_i64" e
-
-let test_float64_matrix_checked_get_uses_unboxed_runtime () =
-  let m = cvar "m" (tensor ty_float [ 2; 3 ]) in
-  let row = mk (CLit (LitInt 1L)) ty_int in
-  let col = mk (CLit (LitInt 2L)) ty_int in
-  let e = call_builtin "blorp_matrix_checked_get" [ m; row; col ] ty_float in
-  expect_builtin "float64 matrix checked_get" "blorp_matrix_checked_get_f64" e
-
-let test_rank3_int_checked_get_injects_shape_and_unboxes () =
-  let t = cvar "t" (tensor ty_int [ 2; 3; 4 ]) in
-  let i = mk (CLit (LitInt 1L)) ty_int in
-  let j = mk (CLit (LitInt 2L)) ty_int in
-  let k = mk (CLit (LitInt 3L)) ty_int in
-  let e = call_builtin "blorp_tensor3_checked_get" [ t; i; j; k ] ty_int in
-  match (specialize e).desc with
-  | CUnbox
-      ( { desc = CCall (CKBuiltin got_name, _, args); ty = TyNamed ("Ptr", []); _ },
-        TyNamed ("Int", []) ) ->
-      Alcotest.(check string)
-        "rank3 int checked_get builtin" "blorp_tensor3_checked_get_shape"
-        got_name;
-      Alcotest.(check int) "rank3 int checked_get arg count" 7
-        (List.length args);
-      expect_ranked_checked_get_shape_dims "rank3 int checked_get" [ 2; 3; 4 ]
-        args
-  | _ -> Alcotest.fail "rank3 Int checked_get should specialize through CUnbox"
-
-let test_rank3_float_checked_get_uses_shape_f64_runtime () =
-  let t = cvar "t" (tensor ty_float [ 2; 3; 4 ]) in
-  let i = mk (CLit (LitInt 1L)) ty_int in
-  let j = mk (CLit (LitInt 2L)) ty_int in
-  let k = mk (CLit (LitInt 3L)) ty_int in
-  let e = call_builtin "blorp_tensor3_checked_get" [ t; i; j; k ] ty_float in
-  match (specialize e).desc with
-  | CCall (CKBuiltin got_name, _, args) ->
-      Alcotest.(check string)
-        "rank3 float checked_get builtin" "blorp_tensor3_checked_get_shape_f64"
-        got_name;
-      Alcotest.(check int) "rank3 float checked_get arg count" 7
-        (List.length args);
-      expect_ranked_checked_get_shape_dims "rank3 float checked_get" [ 2; 3; 4 ]
-        args
-  | _ -> Alcotest.fail "rank3 Float checked_get should specialize to shape f64"
-
-let test_bounds_proven_tensor_read_uses_typed_raw_view () =
-  let values = cvar "values" (tensor ty_float [ 4 ]) in
-  let idx = cvar "i" ty_int in
-  let checked_get = call_builtin "blorp_checked_get" [ values; idx ] ty_float in
-  let bound : Blorp.Core_specialize.loop_index_bound =
-    {
-      lib_var = Var.named "i";
-      lib_lower_nonnegative = true;
-      lib_upper_exclusive = Some 4;
-    }
-  in
-  let env : Blorp.Core_specialize.specialize_env =
-    { loop_index_bounds = [ bound ] }
-  in
-  match
-    Blorp.Core_specialize.bounds_proven_tensor_read env checked_get values idx
-  with
-  | None -> Alcotest.fail "bounds-proven Float tensor read should specialize"
-  | Some body ->
-      Alcotest.(check int)
-        "does not emit raw unchecked get intrinsic" 0
-        (count_intrinsic "tensor_get_f64_raw_unchecked" body);
-      Alcotest.(check int)
-        "binds one typed raw tensor view" 1
-        (count_tensor_raw_view_let TensorFloat64Elements body);
-      Alcotest.(check int)
-        "reads through typed raw tensor view" 1
-        (count_tensor_raw_read TensorFloat64Elements body)
-
-let test_bounds_proven_tensor_read_rejects_temporary_source () =
-  let parent = cvar "parent" (tensor ty_float [ 2; 4 ]) in
-  let row = mk (CLit (LitInt 0L)) ty_int in
-  let values =
-    call_builtin "blorp_tensor_slice_row" [ parent; row ]
-      (tensor ty_float [ 4 ])
-  in
-  let idx = cvar "i" ty_int in
-  let checked_get = call_builtin "blorp_checked_get" [ values; idx ] ty_float in
-  let bound : Blorp.Core_specialize.loop_index_bound =
-    {
-      lib_var = Var.named "i";
-      lib_lower_nonnegative = true;
-      lib_upper_exclusive = Some 4;
-    }
-  in
-  let env : Blorp.Core_specialize.specialize_env =
-    { loop_index_bounds = [ bound ] }
-  in
-  Alcotest.(check bool)
-    "temporary tensor source is not borrowed by a raw view" true
-    (Option.is_none
-       (Blorp.Core_specialize.bounds_proven_tensor_read env checked_get values
-          idx))
-
-let guarded_float64_raw_read source idx =
-  let cond = call_intrinsic "tensor_is_f64_storage" [ source ] ty_bool in
-  let fast =
-    call_intrinsic "tensor_get_f64_raw_unchecked" [ source; idx ] ty_float
-  in
-  let safe = call_builtin "blorp_checked_get" [ source; idx ] ty_float in
-  mk (CIf (cond, fast, safe)) ty_float
-
-let test_raw_tensor_view_collection_respects_resource_scope_binding () =
-  let values_ty = tensor ty_float [ 4 ] in
-  let values = cvar "values" values_ty in
-  let idx = cvar "i" ty_int in
-  let scoped =
-    resource_scope "values" values_ty
-      (cvar "open_values" values_ty)
-      (guarded_float64_raw_read values idx)
-      cvoid
-  in
-  match
-    Blorp.Core_specialize.collect_raw_tensor_views
-      Blorp.Core_specialize.empty_specialize_env [] [] scoped
-  with
-  | Some [] -> ()
-  | Some views ->
-      Alcotest.failf "expected no views, collected %d" (List.length views)
-  | None -> Alcotest.fail "resource scope should not make collection fail"
-
-let test_raw_tensor_view_rewrite_does_not_enter_resource_scope () =
-  let values_ty = tensor ty_float [ 4 ] in
-  let values = cvar "values" values_ty in
-  let idx = cvar "i" ty_int in
-  let scoped =
-    resource_scope "values" values_ty
-      (cvar "open_values" values_ty)
-      (guarded_float64_raw_read values idx)
-      cvoid
-  in
-  let view : Blorp.Core_specialize.raw_tensor_view =
-    {
-      rtv_tensor = Var.named "values";
-      rtv_tensor_ty = values_ty;
-      rtv_ptr = Var.named "__values_raw";
-      rtv_kind = TensorFloat64Elements;
-      rtv_needs_unique = false;
-    }
-  in
-  let rewritten =
-    Blorp.Core_specialize.rewrite_raw_tensor_view_body
-      Blorp.Core_specialize.empty_specialize_env [] [ view ] scoped
-  in
-  Alcotest.(check int)
-    "resource body is not rewritten to raw view" 0
-    (count_tensor_raw_read TensorFloat64Elements rewritten)
-
-let test_float64_checked_set_uses_unboxed_runtime () =
-  let v = cvar "v" (tensor ty_float [ 4 ]) in
-  let idx = mk (CLit (LitInt 2L)) ty_int in
-  let value = mk (CLit (LitFloat 1.5)) ty_float in
-  let e =
-    call_builtin "blorp_checked_set" [ v; idx; value ] (tensor ty_float [ 4 ])
-  in
-  expect_builtin "float64 checked_set" "blorp_vector_set_inplace_f64" e
-
-let test_float64_matrix_checked_set_uses_unboxed_runtime () =
-  let m = cvar "m" (tensor ty_float [ 2; 3 ]) in
-  let row = mk (CLit (LitInt 1L)) ty_int in
-  let col = mk (CLit (LitInt 2L)) ty_int in
-  let value = mk (CLit (LitFloat 1.5)) ty_float in
-  let e =
-    call_builtin "blorp_matrix_checked_set" [ m; row; col; value ]
-      (tensor ty_float [ 2; 3 ])
-  in
-  expect_builtin "float64 matrix checked_set" "blorp_matrix_checked_set_f64" e
 
 let test_float32_vector_get_option_uses_packed_runtime () =
   let v = cvar "v" (tensor ty_float32 [ 4 ]) in
@@ -1015,11 +717,6 @@ let test_assert_shape_managed_option_uses_nullable_runtime () =
       (TyNamed ("Option", [ tensor ty_float [ 4 ] ]))
   in
   expect_builtin "assert_shape Option[Tensor]" "blorp_assert_shape_nullable" e
-
-let test_float32_vector_exp_builtin_specializes () =
-  let v = cvar "v" (tensor ty_float32 [ 4 ]) in
-  let e = call_builtin "blorp_vector_exp" [ v ] (tensor ty_float32 [ 4 ]) in
-  expect_builtin "float32 exp" "blorp_vector_exp_float32" e
 
 let test_float32_unary_neg_uses_float32_scalar_runtime () =
   let v = cvar "v" (tensor ty_float32 [ 4 ]) in
@@ -1360,49 +1057,15 @@ let suite =
       ] );
     ( "float32_tensor_specialization",
       [
-        Alcotest.test_case "vector_fill_packed" `Quick
-          test_float32_vector_fill_uses_packed_runtime;
-        Alcotest.test_case "float64_vector_fill_unboxed" `Quick
-          test_float64_vector_fill_uses_unboxed_runtime;
-        Alcotest.test_case "vector_minmax_uses_tensor_element_abi" `Quick
-          test_vector_minmax_uses_tensor_element_abi;
         Alcotest.test_case
           "alias_matrix_vector_multiply_static_dims_specializes" `Quick
           test_alias_matrix_vector_multiply_static_dims_specializes;
         Alcotest.test_case "alias_matrix_multiply_static_dims_specializes"
           `Quick test_alias_matrix_multiply_static_dims_specializes;
-        Alcotest.test_case "float64_matrix_fill_unboxed" `Quick
-          test_float64_matrix_fill_uses_unboxed_runtime;
         Alcotest.test_case "bool_vector_fill_packed" `Quick
           test_bool_vector_fill_uses_packed_runtime;
         Alcotest.test_case "enum_vector_fill_packed" `Quick
           test_enum_vector_fill_uses_packed_runtime;
-        Alcotest.test_case "checked_get_packed" `Quick
-          test_float32_checked_get_uses_packed_runtime;
-        Alcotest.test_case "float64_checked_get_unboxed" `Quick
-          test_float64_checked_get_uses_unboxed_intrinsic;
-        Alcotest.test_case "alias_int_checked_get_raw_scalar" `Quick
-          test_alias_int_checked_get_uses_raw_scalar_intrinsic;
-        Alcotest.test_case "alias_enum_checked_get_layout_intrinsic" `Quick
-          test_alias_enum_checked_get_uses_layout_intrinsic;
-        Alcotest.test_case "float64_matrix_checked_get_unboxed" `Quick
-          test_float64_matrix_checked_get_uses_unboxed_runtime;
-        Alcotest.test_case "rank3_int_checked_get_shape_unbox" `Quick
-          test_rank3_int_checked_get_injects_shape_and_unboxes;
-        Alcotest.test_case "rank3_float_checked_get_shape_f64" `Quick
-          test_rank3_float_checked_get_uses_shape_f64_runtime;
-        Alcotest.test_case "bounds_proven_tensor_read_typed_raw_view" `Quick
-          test_bounds_proven_tensor_read_uses_typed_raw_view;
-        Alcotest.test_case "bounds_proven_tensor_read_rejects_temporary_source"
-          `Quick test_bounds_proven_tensor_read_rejects_temporary_source;
-        Alcotest.test_case "raw_tensor_view_resource_scope_collection" `Quick
-          test_raw_tensor_view_collection_respects_resource_scope_binding;
-        Alcotest.test_case "raw_tensor_view_resource_scope_rewrite" `Quick
-          test_raw_tensor_view_rewrite_does_not_enter_resource_scope;
-        Alcotest.test_case "float64_checked_set_unboxed" `Quick
-          test_float64_checked_set_uses_unboxed_runtime;
-        Alcotest.test_case "float64_matrix_checked_set_unboxed" `Quick
-          test_float64_matrix_checked_set_uses_unboxed_runtime;
         Alcotest.test_case "option_get_packed" `Quick
           test_float32_vector_get_option_uses_packed_runtime;
         Alcotest.test_case "dict_get_nullable_managed" `Quick
@@ -1440,8 +1103,6 @@ let suite =
           test_runtime_managed_option_builtins_use_nullable_runtime;
         Alcotest.test_case "assert_shape_nullable_managed" `Quick
           test_assert_shape_managed_option_uses_nullable_runtime;
-        Alcotest.test_case "vector_exp_packed" `Quick
-          test_float32_vector_exp_builtin_specializes;
         Alcotest.test_case "unary_neg_packed" `Quick
           test_float32_unary_neg_uses_float32_scalar_runtime;
         Alcotest.test_case "unary_neg_float16" `Quick

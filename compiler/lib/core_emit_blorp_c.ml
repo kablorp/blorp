@@ -62,25 +62,116 @@ let supported_sized_integer_conversion_builtins =
       "blorp_to_uint128";
     ]
 
-(* These calls intentionally cross the pre-DCE boundary in semantic form.
-   The Blorp-owned specialize stage dispatches them from their concrete Core
-   argument types before ownership analysis and C emission. Keep this set
-   separate from [direct_builtin_supported]: classifying them as direct
-   runtime calls here would erase the distinction that specialization needs. *)
+(* These calls may cross the pre-DCE boundary in semantic form. The Blorp-owned
+   specialize stage dispatches them from concrete Core types before ownership
+   analysis and C emission. Numeric tensor fill names are candidates only:
+   [blorp_specialization_crosses_boundary] keeps boxed fill layouts on their
+   established direct-runtime ABI. Receiver-typed unary tensor math is handled
+   by [call_kind_json_for_call], where the argument type is available. Keep
+   this set separate from
+   [direct_builtin_supported], which cannot preserve that distinction. *)
 let blorp_specialization_builtins =
   StringSet.of_list
     [
+      "blorp_checked_get";
+      "blorp_checked_get_f32";
+      "blorp_checked_get_f64";
+      "blorp_checked_set";
       "blorp_hash";
+      "blorp_length";
+      "blorp_matrix_checked_get";
+      "blorp_matrix_checked_set";
+      "blorp_matrix_new_fill";
+      "blorp_tensor3_checked_get";
+      "blorp_tensor4_checked_get";
+      "blorp_tensor5_checked_get";
       "blorp_to_bool";
       "blorp_to_char";
       "blorp_to_float";
       "blorp_to_float16";
       "blorp_to_float32";
       "blorp_to_int";
+      "blorp_vector_len";
+      "blorp_vector_new_fill";
+      "blorp_vector_set_inplace_f32";
+      "blorp_vector_set_inplace_f64";
+      "blorp_vector_set_inplace_i64";
     ]
 
 let blorp_specialization_builtin_supported name =
   StringSet.mem name blorp_specialization_builtins
+
+let blorp_numeric_tensor_fill_builtin = function
+  | "blorp_vector_new_fill" | "blorp_matrix_new_fill" -> true
+  | _ -> false
+
+let blorp_tensor_parts ~reg ty =
+  Codegen_types.expand_alias ~reg ty
+  |> Codegen_types.normalize_type |> Types.array_parts
+
+let blorp_tensor_element_name ~reg ty =
+  match blorp_tensor_parts ~reg ty with
+  | Some (elem_ty, _dims) -> (
+      match
+        Codegen_types.expand_alias ~reg elem_ty |> Codegen_types.normalize_type
+      with
+      | Ast.TyNamed (name, []) -> Some name
+      | _ -> None)
+  | None -> None
+
+let blorp_numeric_tensor_fill_result ~reg ty =
+  match blorp_tensor_element_name ~reg ty with
+  | Some ("Int" | "Float" | "Float32") -> true
+  | _ -> false
+
+let blorp_specialization_crosses_boundary ~reg name result_ty =
+  if blorp_numeric_tensor_fill_builtin name then
+    blorp_numeric_tensor_fill_result ~reg result_ty
+  else blorp_specialization_builtin_supported name
+
+let blorp_unary_tensor_math_builtin = function
+  | "blorp_vector_norm" | "blorp_vector_sqrt" | "blorp_vector_exp"
+  | "blorp_vector_log" ->
+      true
+  | _ -> false
+
+let blorp_unary_tensor_math_receiver ~reg ty =
+  match blorp_tensor_element_name ~reg ty with
+  | Some ("Float" | "Float32" | "Float16") -> true
+  | _ -> false
+
+let blorp_tensor_reduction_builtin = function
+  | "blorp_max" | "blorp_min" -> true
+  | _ -> false
+
+let blorp_receiver_specialization_builtin name =
+  blorp_unary_tensor_math_builtin name || blorp_tensor_reduction_builtin name
+
+let blorp_tensor_reduction_receiver ~reg ty =
+  match blorp_tensor_element_name ~reg ty with
+  | Some ("Int" | "Float" | "Float32" | "Float16") -> true
+  | _ -> false
+
+let blorp_receiver_specialization_crosses_boundary ~reg name receiver_ty =
+  (blorp_unary_tensor_math_builtin name
+  && blorp_unary_tensor_math_receiver ~reg receiver_ty)
+  || (blorp_tensor_reduction_builtin name
+     && blorp_tensor_reduction_receiver ~reg receiver_ty)
+
+let blorp_specialization_builtin_arity = function
+  | "blorp_checked_get" | "blorp_checked_get_f32" | "blorp_checked_get_f64" ->
+      2
+  | "blorp_vector_new_fill" -> 2
+  | "blorp_matrix_checked_get" | "blorp_checked_set"
+  | "blorp_matrix_new_fill" ->
+      3
+  | "blorp_tensor3_checked_get" | "blorp_matrix_checked_set" -> 4
+  | "blorp_tensor4_checked_get" -> 5
+  | "blorp_tensor5_checked_get" -> 6
+  | "blorp_vector_set_inplace_f32" | "blorp_vector_set_inplace_f64"
+  | "blorp_vector_set_inplace_i64" ->
+      3
+  | _ -> 1
 
 let supported_math_passthrough_builtins =
   StringSet.of_list
@@ -1029,7 +1120,28 @@ let tensor_dims_json dims =
 
 let rec type_json ~reg enum_names value_record_names heap_record_names union_names path
     (ty : Ast.type_expr) =
-  let ty = Codegen_types.expand_alias ~reg ty in
+  let ty =
+    Codegen_types.expand_alias ~reg ty |> Codegen_types.normalize_type
+  in
+  match Types.array_parts ty with
+  | Some (elem_ty, dims) ->
+      let* elem_json =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".info.element_type") elem_ty
+      in
+      let* dims_json = tensor_dims_json dims in
+      Ok
+        (kind "tensor"
+           [
+             ( "info",
+               obj [ ("element_type", elem_json); ("dims", dims_json) ] );
+           ])
+  | None ->
+      non_tensor_type_json ~reg enum_names value_record_names heap_record_names
+        union_names path ty
+
+and non_tensor_type_json ~reg enum_names value_record_names heap_record_names
+    union_names path ty =
   match ty with
   | Ast.TyNamed ("Void", []) -> Ok (kind "void" [])
   | Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ->
@@ -1096,18 +1208,7 @@ let rec type_json ~reg enum_names value_record_names heap_record_names union_nam
               item)
       in
       Ok (kind "tuple" [ ("items", item_values) ])
-  | Ast.TyArray (elem_ty, dims) ->
-      let* elem_json =
-        type_json ~reg enum_names value_record_names heap_record_names union_names
-          (path ^ ".info.element_type") elem_ty
-      in
-      let* dims_json = tensor_dims_json dims in
-      Ok
-        (kind "tensor"
-           [
-             ( "info",
-               obj [ ("element_type", elem_json); ("dims", dims_json) ] );
-           ])
+  | Ast.TyArray _ -> unsupported path "uncanonicalized tensor type"
   | Ast.TyFunc _ ->
       Ok (kind "named" [ ("name", str "Closure"); ("args", arr []) ])
   | Ast.TyVar name when Types.Dim.is_var_name name ->
@@ -2219,7 +2320,7 @@ let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
                    ])
           | None when channel_semantic_builtin_supported name ->
               Ok (kind "builtin" [ ("name", str name) ])
-          | None when blorp_specialization_builtin_supported name ->
+          | None when blorp_specialization_crosses_boundary ~reg name result_ty ->
               Ok (kind "builtin" [ ("name", str name) ])
           | None -> (
               match direct_runtime_abi ~reg ~loc result_ty name with
@@ -2253,6 +2354,14 @@ let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_t
           unsupported path
             (Printf.sprintf "blorp_dict_with_capacity_custom on non-Dict type %s"
                (Types.type_to_string other)))
+  | Core.CKBuiltin name, [ receiver ]
+    when blorp_receiver_specialization_crosses_boundary ~reg name receiver.ty ->
+      Ok (kind "builtin" [ ("name", str name) ])
+  | Core.CKBuiltin name, [ receiver ]
+    when blorp_receiver_specialization_builtin name ->
+      unsupported path
+        (Printf.sprintf "builtin call %s on unsupported receiver type %s" name
+           (Types.type_to_string receiver.ty))
   | Core.CKUnknown, _ ->
       unsupported path
         ("unresolved call kind for callee `" ^ compact_callee_label callee ^ "`")
@@ -5908,6 +6017,13 @@ let require_simple_call_kind path ~result_ty ~callee call_kind args =
               | Some arity -> require_core_arity path name arity args
               | None -> unsupported path ("builtin call " ^ name))
           | _ when blorp_specialization_builtin_supported name ->
+              require_core_arity path name
+                (blorp_specialization_builtin_arity name)
+                args
+          | _ when blorp_receiver_specialization_builtin name ->
+              (* Structural validation runs without the type registry. The
+                 call projector separately proves the receiver type before it
+                 preserves one of these semantic names for Blorp. *)
               require_core_arity path name 1 args
           | _ when direct_builtin_supported name -> Ok ()
           | _ -> unsupported path ("builtin call " ^ name)))
