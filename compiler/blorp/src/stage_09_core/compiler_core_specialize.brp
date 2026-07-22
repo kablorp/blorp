@@ -1,0 +1,265 @@
+-- Post-resolve specialization owned by the Blorp late-Core pipeline.
+--
+-- This module is intentionally organized by independent semantic builtin
+-- families. Each family can move across the production bridge without
+-- coupling the rest of specialization to registry-backed layout decisions.
+import:
+	compiler_core_json:
+		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
+		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreExpr(
+			BinaryExpr,
+			CallExpr,
+			CastExpr,
+			FieldExpr,
+			LiteralExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, RangeType, VoidType),
+		core_expr_type,
+	compiler_core_traverse as CoreTraverse
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func named_type_is(typ: CoreType, expected: String) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == expected and args.length() == 0
+		_:
+			False
+
+
+private pure func integer_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if args.length() != 0:
+				False
+			else:
+				(
+					name == "Int"
+					or name == "Int8"
+					or name == "Int16"
+					or name == "Int32"
+					or name == "Int64"
+					or name == "Int128"
+					or name == "UInt8"
+					or name == "UInt16"
+					or name == "UInt32"
+					or name == "UInt64"
+					or name == "UInt128"
+				)
+		_:
+			False
+
+
+private pure func cast(value: CoreExpr, target: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+	CastExpr(value, target, loc)
+
+
+private pure func direct_runtime_call(
+	name: String,
+	arg: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		DirectRuntimeCall({
+			name = name,
+			args = DirectRuntimeArgsAsWritten,
+			result = DirectRuntimeResultAsWritten,
+		}),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[arg],
+		result_type,
+		loc,
+	)
+
+
+private pure func specialize_to_int(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if named_type_is(arg_type, "Int"):
+		Some(arg)
+	else if (
+		named_type_is(arg_type, "Float")
+		or named_type_is(arg_type, "Float32")
+		or named_type_is(arg_type, "Float16")
+		or named_type_is(arg_type, "Bool")
+		or named_type_is(arg_type, "Char")
+		or integer_type(arg_type)
+	):
+		Some(cast(arg, named_type("Int"), loc))
+	else:
+		match arg_type:
+			RangeType:
+				Some(cast(arg, named_type("Int"), loc))
+			NamedType("String", args):
+				Some(direct_runtime_call("blorp_to_int", arg, named_type("Int"), loc))
+			_:
+				None
+
+
+private pure func specialize_to_float(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if named_type_is(arg_type, "Float"):
+		Some(arg)
+	else if named_type_is(arg_type, "Bool"):
+		Some(cast(cast(arg, named_type("Int"), SyntheticSourceLoc), named_type("Float"), loc))
+	else if (
+		named_type_is(arg_type, "Float32")
+		or named_type_is(arg_type, "Float16")
+		or integer_type(arg_type)
+	):
+		Some(cast(arg, named_type("Float"), loc))
+	else:
+		match arg_type:
+			RangeType:
+				Some(cast(arg, named_type("Float"), loc))
+			NamedType("String", args):
+				Some(direct_runtime_call("blorp_to_float", arg, named_type("Float"), loc))
+			_:
+				None
+
+
+private pure func specialize_float_width(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	target: CoreType,
+	target_name: String,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if named_type_is(arg_type, target_name):
+		arg
+	else:
+		cast(arg, target, loc)
+
+
+private pure func tag_truthiness(arg: CoreExpr, tag_name: String, loc: CoreSourceLoc) -> CoreExpr:
+	tag_field: CoreExpr = FieldExpr(arg, "tag", named_type("Int"), loc)
+	tag_value: CoreExpr = VarExpr(
+		{
+			name = tag_name,
+			uniq = 0,
+			def_id = None
+		},
+		named_type("Int"),
+		loc,
+	)
+	BinaryExpr(EqualOp, tag_field, tag_value, named_type("Bool"), loc)
+
+
+private pure func specialize_to_bool(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if named_type_is(arg_type, "Bool"):
+		arg
+	else if named_type_is(arg_type, "Int"):
+		BinaryExpr(
+			NotEqualOp,
+			arg,
+			LiteralExpr(IntLiteral(0), named_type("Int"), SyntheticSourceLoc),
+			named_type("Bool"),
+			loc,
+		)
+	else:
+		match arg_type:
+			NamedType("Option", args):
+				tag_truthiness(arg, "TAG_Some", loc)
+			NamedType("Result", args):
+				tag_truthiness(arg, "TAG_Ok", loc)
+			_:
+				cast(arg, named_type("Bool"), loc)
+
+
+private pure func specialize_unary_builtin(
+	name: String,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match args:
+		[arg]:
+			arg_type: CoreType = core_expr_type(arg)
+
+			if name == "blorp_to_int":
+				specialize_to_int(arg, arg_type, loc)
+			else if name == "blorp_to_float":
+				specialize_to_float(arg, arg_type, loc)
+			else if name == "blorp_to_float32":
+				Some(specialize_float_width(arg, arg_type, named_type("Float32"), "Float32", loc))
+			else if name == "blorp_to_float16":
+				Some(specialize_float_width(arg, arg_type, named_type("Float16"), "Float16", loc))
+			else if name == "blorp_to_bool":
+				Some(specialize_to_bool(arg, arg_type, loc))
+			else if name == "blorp_to_char":
+				Some(specialize_float_width(arg, arg_type, named_type("Char"), "Char", loc))
+			else:
+				None
+		_:
+			None
+
+
+private pure func specialize_primitive_call(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(kind, _, args, _, loc):
+			match kind:
+				BuiltinCall(name):
+					match specialize_unary_builtin(name, args, loc):
+						Some(specialized):
+							specialized
+						None:
+							expr
+				_:
+					expr
+		_:
+			expr
+
+
+private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, specialize_expr)
+		_:
+			children_specialized: CoreExpr = CoreTraverse.map_core_expr_children(
+				expr,
+				specialize_expr,
+			)
+			specialize_primitive_call(children_specialized)
+
+
+private pure func specialize_function(function_info: CoreFunction) -> CoreFunction:
+	{ function_info | body = function_info.body.map(specialize_expr) }
+
+
+private pure func specialize_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(specialize_function(function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = specialize_expr(global.init) })
+		ImplDecl(impl_decl):
+			ImplDecl({ impl_decl | methods = impl_decl.methods.map(specialize_function) })
+		_:
+			decl
+
+
+pure func specialize_program(program: CoreProgram) -> CoreProgram:
+	{ program | decls = program.decls.map(specialize_decl) }

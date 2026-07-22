@@ -221,8 +221,6 @@ let tensor_elem_type ?reg ~loc ~context ty =
   let elem, _ = require_tensor_parts ?reg ~loc ~context ty in
   normalize_type elem
 
-let cast e arg target_ty = { e with desc = CCast (arg, target_ty) }
-
 let specialize_list_alloc ~reg e cap =
   {
     e with
@@ -242,62 +240,6 @@ let rec specialize_layout_allocs_expr ~reg (e : core) : core =
   | CCall (CKBuiltin "blorp_list_new", _, [ cap ]) ->
       specialize_list_alloc ~reg e cap
   | _ -> e
-
-(** Specialize [to_int(arg)] by argument type.
-    Float/Bool/Char/sized-int/range -> CCast to Int.
-    Int -> identity (elide call).
-    String -> blorp_to_int (parse). *)
-let specialize_to_int (e : core) arg : core =
-  match normalize_type arg.ty with
-  | Ast.TyNamed ("Int", _) -> arg
-  | Ast.TyNamed ("Float", _)
-  | Ast.TyNamed ("Float32", _)
-  | Ast.TyNamed ("Float16", _)
-  | Ast.TyNamed ("Bool", _)
-  | Ast.TyNamed ("Char", _) ->
-      cast e arg (Ast.TyNamed ("Int", []))
-  (* Range-refined integers erase to [long] at runtime — cast is a no-op
-     at the C level but needed so the Core IR carries the right type. *)
-  | Ast.TyRange _ -> cast e arg (Ast.TyNamed ("Int", []))
-  | ty when Types.is_any_integer_type ty -> cast e arg (Ast.TyNamed ("Int", []))
-  | _ -> e
-
-(** Specialize [to_float(arg)] by argument type.
-    Int/sized-int/range -> CCast to Float.
-    Float -> identity.
-    Bool -> CCast to Int then CCast to Float.
-    String -> blorp_to_float (parse). *)
-let specialize_to_float (e : core) arg : core =
-  match normalize_type arg.ty with
-  | Ast.TyNamed ("Float", _) -> arg
-  | Ast.TyNamed ("Int", _)
-  | Ast.TyNamed ("Float32", _)
-  | Ast.TyNamed ("Float16", _) ->
-      cast e arg (Ast.TyNamed ("Float", []))
-  | Ast.TyNamed ("Bool", _) ->
-      let to_long =
-        cast
-          { arg with ty = Ast.TyNamed ("Int", []) }
-          arg
-          (Ast.TyNamed ("Int", []))
-      in
-      cast e to_long (Ast.TyNamed ("Float", []))
-  | Ast.TyRange _ -> cast e arg (Ast.TyNamed ("Float", []))
-  | ty when Types.is_any_integer_type ty ->
-      cast e arg (Ast.TyNamed ("Float", []))
-  | _ -> e
-
-let specialize_to_float32 (e : core) arg : core =
-  match normalize_type arg.ty with
-  | Ast.TyNamed ("Float32", _) -> arg
-  | Ast.TyRange _ -> cast e arg (Ast.TyNamed ("Float32", []))
-  | _ -> cast e arg (Ast.TyNamed ("Float32", []))
-
-let specialize_to_float16 (e : core) arg : core =
-  match normalize_type arg.ty with
-  | Ast.TyNamed ("Float16", _) -> arg
-  | Ast.TyRange _ -> cast e arg (Ast.TyNamed ("Float16", []))
-  | _ -> cast e arg (Ast.TyNamed ("Float16", []))
 
 (** Specialize [to_string(arg)] by argument type.
     Dispatches to the correct C to_string function. *)
@@ -1663,10 +1605,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             | _ -> c
           in
           { e with desc = CCall (CKBuiltin norm_name, callee, [ arg ]) }
-      | "blorp_to_int" -> specialize_to_int e arg
-      | "blorp_to_float" -> specialize_to_float e arg
-      | "blorp_to_float32" -> specialize_to_float32 e arg
-      | "blorp_to_float16" -> specialize_to_float16 e arg
       | "blorp_to_string" -> specialize_to_string ~reg e callee arg
       | "blorp_debug_string" -> specialize_debug_string ~reg e callee arg
       | "blorp_hash" -> specialize_hash e callee arg
@@ -1720,65 +1658,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             { arg with desc = CVoid; ty = Ast.TyNamed ("Void", []) }
           in
           { e with desc = CCall (CKIntrinsic "tensor_len", dummy, [ arg ]) }
-      | "blorp_to_bool" -> (
-          match normalize_type arg.ty with
-          | Ast.TyNamed ("Bool", _) -> arg
-          | Ast.TyNamed ("Int", _) ->
-              let zero =
-                {
-                  arg with
-                  desc = CLit (Ast.LitInt 0L);
-                  ty = Ast.TyNamed ("Int", []);
-                }
-              in
-              { e with desc = CBin (Ast.Ne, arg, zero) }
-          | Ast.TyNamed ("Option", _) ->
-              (* to_bool(option) → option->tag == TAG_Some *)
-              let tag =
-                {
-                  arg with
-                  desc = CField (arg, "tag");
-                  ty = Ast.TyNamed ("Int", []);
-                }
-              in
-              let some_tag =
-                {
-                  arg with
-                  desc = CVar (Var.named "TAG_Some");
-                  ty = Ast.TyNamed ("Int", []);
-                }
-              in
-              {
-                e with
-                desc = CBin (Ast.Eq, tag, some_tag);
-                ty = Ast.TyNamed ("Bool", []);
-              }
-          | Ast.TyNamed ("Result", _) ->
-              (* to_bool(result) → result->tag == TAG_Ok *)
-              let tag =
-                {
-                  arg with
-                  desc = CField (arg, "tag");
-                  ty = Ast.TyNamed ("Int", []);
-                }
-              in
-              let ok_tag =
-                {
-                  arg with
-                  desc = CVar (Var.named "TAG_Ok");
-                  ty = Ast.TyNamed ("Int", []);
-                }
-              in
-              {
-                e with
-                desc = CBin (Ast.Eq, tag, ok_tag);
-                ty = Ast.TyNamed ("Bool", []);
-              }
-          | _ -> cast e arg (Ast.TyNamed ("Bool", [])))
-      | "blorp_to_char" -> (
-          match normalize_type arg.ty with
-          | Ast.TyNamed ("Char", _) -> arg
-          | _ -> cast e arg (Ast.TyNamed ("Char", [])))
       | "blorp_tensor_transpose" ->
           (* transpose(m) where m: T[#M, #N] — inject dim args.
               blorp_tensor_transpose(mat, rows, cols) at runtime. *)

@@ -466,21 +466,6 @@ let test_float64_vector_fill_uses_unboxed_runtime () =
   in
   expect_builtin "float64 vector fill" "blorp_vector_new_fill_f64" e
 
-let test_alias_vector_length_constant_folds () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
-  Hashtbl.replace reg.type_aliases "Positions"
-    ([], TyNamed ("Vector", [ TyNamed ("Meters", []); TyConstInt 4 ]));
-  let values = cvar "values" (TyNamed ("Positions", [])) in
-  let e = call_builtin "blorp_length" [ values ] ty_int in
-  match (specialize_with_reg reg e).desc with
-  | CLit (LitInt n) -> Alcotest.(check int64) "length" 4L n
-  | CCall (CKBuiltin got, _, _) ->
-      Alcotest.failf "alias vector length stayed as builtin %s" got
-  | CCall (CKIntrinsic got, _, _) ->
-      Alcotest.failf "alias vector length used runtime intrinsic %s" got
-  | _ -> Alcotest.fail "alias vector length did not constant-fold"
-
 let test_alias_matrix_vector_multiply_static_dims_specializes () =
   let reg = Blorp.Codegen_types.create_registry () in
   Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
@@ -1381,8 +1366,6 @@ let suite =
           test_float64_vector_fill_uses_unboxed_runtime;
         Alcotest.test_case "vector_minmax_uses_tensor_element_abi" `Quick
           test_vector_minmax_uses_tensor_element_abi;
-        Alcotest.test_case "alias_vector_length_constant_folds" `Quick
-          test_alias_vector_length_constant_folds;
         Alcotest.test_case
           "alias_matrix_vector_multiply_static_dims_specializes" `Quick
           test_alias_matrix_vector_multiply_static_dims_specializes;

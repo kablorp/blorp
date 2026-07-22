@@ -63,6 +63,25 @@ let supported_sized_integer_conversion_builtins =
       "blorp_to_uint128";
     ]
 
+(* These calls intentionally cross the pre-DCE boundary in semantic form.
+   The Blorp-owned specialize stage dispatches them from their concrete Core
+   argument types before ownership analysis and C emission. Keep this set
+   separate from [direct_builtin_supported]: classifying them as direct
+   runtime calls here would erase the distinction that specialization needs. *)
+let blorp_specialization_builtins =
+  StringSet.of_list
+    [
+      "blorp_to_bool";
+      "blorp_to_char";
+      "blorp_to_float";
+      "blorp_to_float16";
+      "blorp_to_float32";
+      "blorp_to_int";
+    ]
+
+let blorp_specialization_builtin_supported name =
+  StringSet.mem name blorp_specialization_builtins
+
 let supported_math_passthrough_builtins =
   StringSet.of_list
     [
@@ -2199,6 +2218,8 @@ let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
                        tensor_parallel_layout_json ~reg ~loc result_ty );
                    ])
           | None when channel_semantic_builtin_supported name ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None when blorp_specialization_builtin_supported name ->
               Ok (kind "builtin" [ ("name", str name) ])
           | None -> (
               match direct_runtime_abi ~reg ~loc result_ty name with
@@ -5892,6 +5913,8 @@ let require_simple_call_kind path ~result_ty ~callee call_kind args =
               match channel_attempt_builtin_arity name with
               | Some arity -> require_core_arity path name arity args
               | None -> unsupported path ("builtin call " ^ name))
+          | _ when blorp_specialization_builtin_supported name ->
+              require_core_arity path name 1 args
           | _ when direct_builtin_supported name -> Ok ()
           | _ -> unsupported path ("builtin call " ^ name)))
   | Core.CKIntrinsic _ -> Ok ()
