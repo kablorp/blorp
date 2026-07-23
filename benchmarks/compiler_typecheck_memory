@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""Measure type-shape scanning through the production typecheck bridge."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import resource
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+FIXTURE_VERSION = 5
+DEFAULT_MODULES = 1
+DEFAULT_TYPE_DEPTH = 192
+DEFAULT_PROBES_PER_MODULE = 192
+DEFAULT_PRIMITIVE_PROBES_PER_MODULE = 0
+DEFAULT_PRIMITIVE_STORAGE_PROBES_PER_MODULE = 0
+DEFAULT_RESOURCE_SCAN_DEPTH = 0
+DEFAULT_RESOURCE_SCAN_PROBES_PER_MODULE = 0
+TYPECHECK_BRIDGE_ENV = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
+WORKER_FLAG = "--measurement-worker"
+VMAP_SAMPLE_SECONDS = 0.1
+
+JsonObject = dict[str, Any]
+
+
+def nested_resource_scan_type(depth: int) -> str:
+    result = "Int"
+    for _ in range(depth):
+        result = f"({result}, Int)"
+    return result
+
+
+def fixture_module(
+    module_index: int,
+    type_depth: int,
+    probes_per_module: int,
+    primitive_probes_per_module: int,
+    primitive_storage_probes_per_module: int,
+    resource_scan_depth: int,
+    resource_scan_probes_per_module: int,
+) -> JsonObject:
+    module_name = f"bench/typecheck_{module_index:04d}"
+    type_prefix = f"BenchM{module_index:04d}Shape"
+    declarations: list[str] = []
+
+    for type_index in range(type_depth):
+        field_type = "Int" if type_index == 0 else f"{type_prefix}{type_index - 1:04d}"
+        declarations.append(
+            f"record {type_prefix}{type_index:04d} {{value: {field_type}}}"
+        )
+
+    for probe_index in range(probes_per_module):
+        probe_type_index = (
+            ((probe_index + 1) * type_depth - 1) // probes_per_module
+        )
+        probe_type = f"{type_prefix}{probe_type_index:04d}"
+        declarations.append(
+            "\n".join(
+                (
+                    (
+                        f"pure func bench_m{module_index:04d}_probe_{probe_index:04d}"
+                        f"(value: {probe_type}) -> {probe_type}:"
+                    ),
+                    f"\tcopy: {probe_type} = value",
+                    "\tcopy",
+                )
+            )
+        )
+
+    for probe_index in range(primitive_probes_per_module):
+        probe_type = "Int" if probe_index == 0 else f"..#{probe_index + 1}"
+        declarations.append(
+            "\n".join(
+                (
+                    (
+                        f"pure func bench_m{module_index:04d}_primitive_{probe_index:04d}"
+                        f"(value: {probe_type}) -> {probe_type}:"
+                    ),
+                    f"\tcopy: {probe_type} = value",
+                    "\tcopy",
+                )
+            )
+        )
+
+    for probe_index in range(primitive_storage_probes_per_module):
+        probe_type = f"..#{probe_index + 1}"
+        declarations.append(
+            "\n".join(
+                (
+                    (
+                        f"pure func bench_m{module_index:04d}_primitive_storage_"
+                        f"{probe_index:04d}(value: {probe_type}) -> ({probe_type}, Int):"
+                    ),
+                    "\t(value, 0)",
+                )
+            )
+        )
+
+    resource_scan_type = nested_resource_scan_type(resource_scan_depth)
+    for probe_index in range(resource_scan_probes_per_module):
+        declarations.append(
+            "\n".join(
+                (
+                    (
+                        f"pure func bench_m{module_index:04d}_resource_scan_"
+                        f"{probe_index:04d}(value: {resource_scan_type}) -> Int:"
+                    ),
+                    "\t0",
+                )
+            )
+        )
+
+    return {
+        "path": f"/bench/typecheck_{module_index:04d}.brp",
+        "module": module_name,
+        "module_path": module_name,
+        "text": "\n\n".join(declarations) + "\n",
+        "origin": {"kind": "user"},
+    }
+
+
+def fixture_request(
+    module_count: int,
+    type_depth: int,
+    probes_per_module: int,
+    primitive_probes_per_module: int,
+    primitive_storage_probes_per_module: int,
+    resource_scan_depth: int,
+    resource_scan_probes_per_module: int,
+) -> tuple[JsonObject, JsonObject]:
+    modules = [
+        fixture_module(
+            index,
+            type_depth,
+            probes_per_module,
+            primitive_probes_per_module,
+            primitive_storage_probes_per_module,
+            resource_scan_depth,
+            resource_scan_probes_per_module,
+        )
+        for index in range(module_count)
+    ]
+    module_targets = [str(module["module_path"]) for module in modules]
+    target_name = "bench/target"
+    target = {
+        "path": "/bench/target.brp",
+        "module": target_name,
+        "module_path": target_name,
+        "text": "func main(args: List[String]) -> Int:\n\t0\n",
+        "origin": {"kind": "user"},
+    }
+    request = {
+        "schema": 1,
+        "domain": "compiler",
+        "action": "typecheck_graph",
+        "payload": {
+            "target": target,
+            "modules": modules,
+            "module_targets": module_targets,
+            "resolved_imports": [],
+            "include_comments": False,
+            "allow_debug_only_calls": False,
+        },
+    }
+    fixture = {
+        "artifact_order": [*module_targets, target_name],
+        "source_declarations": (
+            module_count
+            * (
+                type_depth
+                + probes_per_module
+                + primitive_probes_per_module
+                + primitive_storage_probes_per_module
+                + resource_scan_probes_per_module
+            )
+        )
+        + 1,
+    }
+    return request, fixture
+
+
+def parse_memory_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:[.][0-9]+)?)([KMGTP]?)", value.strip())
+    if match is None:
+        raise ValueError(f"invalid memory value: {value}")
+    multiplier = {
+        "": 1,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+    }[match.group(2)]
+    return int(float(match.group(1)) * multiplier)
+
+
+def vmmap_metrics(pid: int) -> JsonObject:
+    result = subprocess.run(
+        ["vmmap", "-summary", str(pid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+
+    metrics: JsonObject = {}
+    physical = re.search(
+        r"^Physical footprint:\s+([0-9.]+[KMGTP]?)",
+        result.stdout,
+        re.M,
+    )
+    if physical is not None:
+        metrics["physical_footprint_bytes"] = parse_memory_bytes(physical.group(1))
+
+    malloc_small = re.search(
+        r"^\s*MALLOC_SMALL\b[^\n]*?([0-9.]+[KMGTP])\b",
+        result.stdout,
+        re.M,
+    )
+    if malloc_small is not None:
+        metrics["malloc_small_bytes"] = parse_memory_bytes(malloc_small.group(1))
+
+    allocation_counts = re.findall(r"([0-9][0-9,]*) allocations", result.stdout)
+    zone_rows = re.findall(
+        r"^DefaultMallocZone_\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([0-9,]+)\s+",
+        result.stdout,
+        re.M,
+    )
+    allocation_counts.extend(zone_rows)
+    if allocation_counts:
+        metrics["allocation_count"] = max(
+            int(value.replace(",", "")) for value in allocation_counts
+        )
+    return metrics
+
+
+def merge_max_metrics(current: JsonObject, sample: JsonObject) -> JsonObject:
+    result = dict(current)
+    for name, value in sample.items():
+        result[name] = max(int(result.get(name, 0)), int(value))
+    return result
+
+
+def normalized_max_rss_bytes() -> int:
+    max_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if platform.system() == "Darwin":
+        return int(max_rss)
+    return int(max_rss) * 1024
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def measurement_worker(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("bridge")
+    parser.add_argument("request")
+    parser.add_argument("response")
+    parser.add_argument("stderr")
+    parser.add_argument("metrics")
+    parser.add_argument("sample_vmmap", choices=("0", "1"))
+    args = parser.parse_args(argv)
+
+    vmmap_result: JsonObject = {}
+    started = time.perf_counter()
+    with open(args.response, "wb") as stdout_file, open(
+        args.stderr,
+        "wb",
+    ) as stderr_file:
+        process = subprocess.Popen(
+            [args.bridge, args.request],
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        if args.sample_vmmap == "1":
+            while process.poll() is None:
+                vmmap_result = merge_max_metrics(
+                    vmmap_result,
+                    vmmap_metrics(process.pid),
+                )
+                time.sleep(VMAP_SAMPLE_SECONDS)
+        exit_code = process.wait()
+
+    metrics = {
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_rss_bytes": normalized_max_rss_bytes(),
+        "exit_code": exit_code,
+        **vmmap_result,
+    }
+    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
+    return 0
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return result
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def prepared_typecheck_bridge(
+    root: Path,
+    out_dir: Path,
+    explicit: str | None,
+) -> Path:
+    candidate = explicit or os.environ.get(TYPECHECK_BRIDGE_ENV)
+    if candidate:
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"typecheck bridge does not exist: {path}")
+        return path
+
+    blorp = root / "blorp"
+    if not blorp.is_file():
+        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
+
+    result = subprocess.run(
+        [str(blorp), "__compiler-bridge-prepare", str(out_dir)],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
+
+    values = {}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator:
+            values[name] = value
+    candidate = values.get(TYPECHECK_BRIDGE_ENV)
+    if not candidate:
+        raise RuntimeError("bridge preparation did not report the typecheck helper")
+    path = Path(candidate).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"prepared typecheck bridge does not exist: {path}")
+    return path
+
+
+def validate_response(response_path: Path, expected_modules: list[str]) -> int:
+    try:
+        response_lines = response_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"could not read typecheck bridge response: {error}") from error
+
+    nonempty_lines = [line for line in response_lines if line.strip()]
+    if len(nonempty_lines) != len(expected_modules):
+        raise RuntimeError(
+            "typecheck bridge returned "
+            f"{len(nonempty_lines)} artifacts; expected {len(expected_modules)}"
+        )
+
+    for index, (line, expected_module) in enumerate(
+        zip(nonempty_lines, expected_modules, strict=True)
+    ):
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"typecheck bridge artifact {index} is invalid JSON: {error}"
+            ) from error
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            detail = (
+                response.get("error", response)
+                if isinstance(response, dict)
+                else response
+            )
+            raise RuntimeError(f"typecheck bridge artifact {index} failed: {detail}")
+        artifact = response.get("artifact")
+        if not isinstance(artifact, dict):
+            raise RuntimeError(
+                f"typecheck bridge artifact {index} is missing its payload"
+            )
+        if artifact.get("module") != expected_module:
+            raise RuntimeError(
+                "typecheck bridge artifact order mismatch: "
+                f"expected {expected_module}, got {artifact.get('module')}"
+            )
+        if not isinstance(artifact.get("typed_program"), dict):
+            raise RuntimeError(
+                f"typecheck bridge artifact {expected_module} has no typed program"
+            )
+        type_errors = artifact.get("type_errors")
+        if type_errors != []:
+            raise RuntimeError(
+                f"typecheck bridge artifact {expected_module} has type errors: "
+                f"{type_errors}"
+            )
+    return len(nonempty_lines)
+
+
+def print_metrics(metrics: JsonObject, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(metrics, sort_keys=True))
+        return
+
+    ordered_names = (
+        "fixture_version",
+        "modules",
+        "type_depth",
+        "probes_per_module",
+        "primitive_probes_per_module",
+        "primitive_storage_probes_per_module",
+        "resource_scan_depth",
+        "resource_scan_probes_per_module",
+        "source_declarations",
+        "artifacts",
+        "request_bytes",
+        "response_bytes",
+        "bridge_sha256",
+        "request_sha256",
+        "elapsed_seconds",
+        "peak_rss_bytes",
+        "physical_footprint_bytes",
+        "malloc_small_bytes",
+        "allocation_count",
+        "verified",
+    )
+    fields = [f"{name}={metrics[name]}" for name in ordered_names if name in metrics]
+    print("TYPECHECK_MEMORY_BENCH " + " ".join(fields))
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-typecheck-memory-") as temp_name:
+        temp_dir = Path(temp_name)
+        bridge_dir = temp_dir / "bridge"
+        bridge_dir.mkdir()
+        bridge = prepared_typecheck_bridge(root, bridge_dir, args.bridge)
+
+        request, fixture = fixture_request(
+            args.modules,
+            args.type_depth,
+            args.probes_per_module,
+            args.primitive_probes_per_module,
+            args.primitive_storage_probes_per_module,
+            args.resource_scan_depth,
+            args.resource_scan_probes_per_module,
+        )
+        request_path = temp_dir / "request.json"
+        response_path = temp_dir / "response.jsonl"
+        stderr_path = temp_dir / "bridge.stderr"
+        metrics_path = temp_dir / "metrics.json"
+        request_path.write_text(
+            json.dumps(request, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        bridge_sha256 = sha256_file(bridge)
+        request_sha256 = sha256_file(request_path)
+
+        worker_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            WORKER_FLAG,
+            str(bridge),
+            str(request_path),
+            str(response_path),
+            str(stderr_path),
+            str(metrics_path),
+            "1" if args.vmmap else "0",
+        ]
+        worker = subprocess.run(worker_command, cwd=root, check=False)
+        if worker.returncode != 0 or not metrics_path.is_file():
+            raise RuntimeError("benchmark measurement worker failed")
+        if sha256_file(bridge) != bridge_sha256:
+            raise RuntimeError("typecheck bridge changed during measurement")
+        if sha256_file(request_path) != request_sha256:
+            raise RuntimeError("typecheck request changed during measurement")
+
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if metrics["exit_code"] != 0:
+            stderr = stderr_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+            raise RuntimeError(
+                f"typecheck bridge exited with {metrics['exit_code']}: {stderr}"
+            )
+
+        artifact_count = validate_response(
+            response_path,
+            fixture["artifact_order"],
+        )
+        metrics.update(
+            {
+                "fixture_version": FIXTURE_VERSION,
+                "modules": args.modules,
+                "type_depth": args.type_depth,
+                "probes_per_module": args.probes_per_module,
+                "primitive_probes_per_module": args.primitive_probes_per_module,
+                "primitive_storage_probes_per_module": (
+                    args.primitive_storage_probes_per_module
+                ),
+                "resource_scan_depth": args.resource_scan_depth,
+                "resource_scan_probes_per_module": (
+                    args.resource_scan_probes_per_module
+                ),
+                "source_declarations": fixture["source_declarations"],
+                "artifacts": artifact_count,
+                "request_bytes": request_path.stat().st_size,
+                "response_bytes": response_path.stat().st_size,
+                "bridge_sha256": bridge_sha256,
+                "request_sha256": request_sha256,
+                "verified": True,
+            }
+        )
+        del metrics["exit_code"]
+        print_metrics(metrics, args.json)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == WORKER_FLAG:
+        return measurement_worker(argv[1:])
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure the production typecheck_graph path with nested named types "
+            "and explicitly typed local bindings."
+        )
+    )
+    parser.add_argument("--modules", type=positive_int, default=DEFAULT_MODULES)
+    parser.add_argument("--type-depth", type=positive_int, default=DEFAULT_TYPE_DEPTH)
+    parser.add_argument(
+        "--probes-per-module",
+        type=positive_int,
+        default=DEFAULT_PROBES_PER_MODULE,
+    )
+    parser.add_argument(
+        "--primitive-probes-per-module",
+        type=nonnegative_int,
+        default=DEFAULT_PRIMITIVE_PROBES_PER_MODULE,
+    )
+    parser.add_argument(
+        "--primitive-storage-probes-per-module",
+        type=nonnegative_int,
+        default=DEFAULT_PRIMITIVE_STORAGE_PROBES_PER_MODULE,
+    )
+    parser.add_argument(
+        "--resource-scan-depth",
+        type=nonnegative_int,
+        default=DEFAULT_RESOURCE_SCAN_DEPTH,
+    )
+    parser.add_argument(
+        "--resource-scan-probes-per-module",
+        type=nonnegative_int,
+        default=DEFAULT_RESOURCE_SCAN_PROBES_PER_MODULE,
+    )
+    parser.add_argument(
+        "--bridge",
+        help=f"prepared typecheck bridge; defaults to ${TYPECHECK_BRIDGE_ENV} or prepares one",
+    )
+    parser.add_argument(
+        "--vmmap",
+        action="store_true",
+        help="sample macOS vmmap allocator and physical-footprint metrics",
+    )
+    parser.add_argument("--json", action="store_true", help="print metrics as JSON")
+    args = parser.parse_args(argv)
+
+    if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
+        parser.error("--vmmap requires macOS vmmap")
+
+    try:
+        return run_benchmark(args)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

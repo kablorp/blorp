@@ -283,7 +283,6 @@ import:
 		compiler_typecheck_state_find_source_definition_id,
 		compiler_typecheck_state_find_top_level_name,
 		compiler_typecheck_state_find_type_home,
-		compiler_typecheck_state_has_known_resource_type_name,
 		compiler_typecheck_state_has_known_type_name,
 		compiler_typecheck_state_is_stdlib,
 		compiler_typecheck_state_record_func_callable_id,
@@ -300,6 +299,12 @@ import:
 COMPILER_PRELUDE_TRAITS_MODULE_PATH: String = "std/traits"
 
 COMPILER_PRELUDE_TRAITS_MODULE_NAME: String = "traits"
+
+
+private record CompilerResourceTypeScanContext {
+	env: CompilerEnv,
+	known_resource_type_names: List[String]
+}
 
 
 private pure func compiler_typecheck_state_with_env(
@@ -1036,47 +1041,72 @@ pure func compiler_typecheck_validate_typed_program(
 	{ result | state = next_state }
 
 
--- Resource-shape checks are read-only, but they call helpers recursively and
--- from loops while the surrounding validation state remains live. Pass copied
--- state into those probes so current generated ownership never aliases a
--- no-op/read helper result with the caller-owned state.
-private pure func compiler_typecheck_type_contains_resource(
-	state: CompilerTypecheckState,
+-- Resource-shape checks are read-only, but recursive calls still need owned
+-- inputs under current generated ownership. Keep that recursive copy narrow
+-- instead of carrying the full typecheck state through every type node.
+private pure func compiler_resource_type_scan_context(
+	env: CompilerEnv,
+	known_resource_type_names: List[String],
+) -> CompilerResourceTypeScanContext:
+	{
+		env = env,
+		known_resource_type_names = known_resource_type_names
+	}
+
+
+private pure func compiler_resource_type_scan_context_copy(
+	context: CompilerResourceTypeScanContext,
+) -> CompilerResourceTypeScanContext:
+	{
+		env = context.env,
+		known_resource_type_names = context.known_resource_type_names
+	}
+
+
+private pure func compiler_resource_type_scan_has_known_name(
+	context: CompilerResourceTypeScanContext,
+	name: String,
+) -> Bool:
+	context.known_resource_type_names.contains(name)
+
+
+private pure func compiler_resource_type_scan_contains(
+	context: CompilerResourceTypeScanContext,
 	typ: CompilerType,
 ) -> Bool:
-	resolved_type = compiler_env_resolve_alias(state.env, typ)
+	resolved_type = compiler_env_resolve_alias(context.env, typ)
 
 	if not compiler_types_equal(resolved_type, typ):
-		compiler_typecheck_type_contains_resource(state, resolved_type)
+		compiler_resource_type_scan_contains(context, resolved_type)
 	else:
 		match typ:
 			CompilerNamedType(name, args):
 				(
-					compiler_typecheck_state_has_known_resource_type_name(
-						compiler_typecheck_state_copy(state),
+					compiler_resource_type_scan_has_known_name(
+						compiler_resource_type_scan_context_copy(context),
 						name,
 					)
-					or compiler_env_type_is_resource(state.env, name)
+					or compiler_env_type_is_resource(context.env, name)
 					or args.any(
 						func(
 							arg,
-						): compiler_typecheck_type_contains_resource(
-							compiler_typecheck_state_copy(state),
+						): compiler_resource_type_scan_contains(
+							compiler_resource_type_scan_context_copy(context),
 							arg,
 						),
 					)
 				)
 			CompilerArrayType(element, dims):
 				(
-					compiler_typecheck_type_contains_resource(
-						compiler_typecheck_state_copy(state),
+					compiler_resource_type_scan_contains(
+						compiler_resource_type_scan_context_copy(context),
 						element,
 					)
 					or dims.any(
 						func(
 							dim,
-						): compiler_typecheck_type_contains_resource(
-							compiler_typecheck_state_copy(state),
+						): compiler_resource_type_scan_contains(
+							compiler_resource_type_scan_context_copy(context),
 							dim,
 						),
 					)
@@ -1086,13 +1116,13 @@ private pure func compiler_typecheck_type_contains_resource(
 					params.any(
 						func(
 							param,
-						): compiler_typecheck_type_contains_resource(
-							compiler_typecheck_state_copy(state),
+						): compiler_resource_type_scan_contains(
+							compiler_resource_type_scan_context_copy(context),
 							param,
 						),
 					)
-					or compiler_typecheck_type_contains_resource(
-						compiler_typecheck_state_copy(state),
+					or compiler_resource_type_scan_contains(
+						compiler_resource_type_scan_context_copy(context),
 						return_type,
 					)
 				)
@@ -1100,29 +1130,36 @@ private pure func compiler_typecheck_type_contains_resource(
 				elements.any(
 					func(
 						element,
-					): compiler_typecheck_type_contains_resource(
-						compiler_typecheck_state_copy(state),
+					): compiler_resource_type_scan_contains(
+						compiler_resource_type_scan_context_copy(context),
 						element,
 					),
 				)
 			CompilerRangeType(inner):
-				compiler_typecheck_type_contains_resource(
-					compiler_typecheck_state_copy(state),
+				compiler_resource_type_scan_contains(
+					compiler_resource_type_scan_context_copy(context),
 					inner,
 				)
 			CompilerDimOpType(_, left, right):
 				(
-					compiler_typecheck_type_contains_resource(
-						compiler_typecheck_state_copy(state),
+					compiler_resource_type_scan_contains(
+						compiler_resource_type_scan_context_copy(context),
 						left,
 					)
-					or compiler_typecheck_type_contains_resource(
-						compiler_typecheck_state_copy(state),
+					or compiler_resource_type_scan_contains(
+						compiler_resource_type_scan_context_copy(context),
 						right,
 					)
 				)
 			_:
 				False
+
+
+private pure func compiler_typecheck_type_contains_resource(
+	context: CompilerResourceTypeScanContext,
+	typ: CompilerType,
+) -> Bool:
+	compiler_resource_type_scan_contains(context, typ)
 
 
 private pure func compiler_field_from_parsed_with_type(
@@ -1366,22 +1403,28 @@ private pure func compiler_imported_variants_from_parsed(
 
 
 private pure func compiler_variant_contains_resource(
-	state: CompilerTypecheckState,
+	context: CompilerResourceTypeScanContext,
 	variant: CompilerVariantDef,
 ) -> Bool:
 	variant.fields.any(func(field):
-		compiler_typecheck_type_contains_resource(compiler_typecheck_state_copy(state), field)
+		compiler_typecheck_type_contains_resource(
+			compiler_resource_type_scan_context_copy(context),
+			field,
+		)
 	)
 
 
 private pure func compiler_variants_contain_resource(
-	state: CompilerTypecheckState,
+	context: CompilerResourceTypeScanContext,
 	variants: List[CompilerVariantDef],
 ) -> Bool:
 	var result: Bool = False
 
 	for variant in variants:
-		if compiler_variant_contains_resource(compiler_typecheck_state_copy(state), variant):
+		if compiler_variant_contains_resource(
+			compiler_resource_type_scan_context_copy(context),
+			variant,
+		):
 			result = True
 			break
 
@@ -1389,12 +1432,12 @@ private pure func compiler_variants_contain_resource(
 
 
 private pure func compiler_fields_contain_resource(
-	state: CompilerTypecheckState,
+	context: CompilerResourceTypeScanContext,
 	fields: List[CompilerFieldDecl],
 ) -> Bool:
 	fields.any(func(field):
 		compiler_typecheck_type_contains_resource(
-			compiler_typecheck_state_copy(state),
+			compiler_resource_type_scan_context_copy(context),
 			field.field_type,
 		)
 	)
@@ -1644,7 +1687,7 @@ private pure func compiler_function_resource_arg_policy(
 
 	for param_type in param_types:
 		if compiler_typecheck_type_contains_resource(
-			compiler_typecheck_state_copy(state),
+			compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
 			param_type,
 		):
 			has_resource_param = True
@@ -1690,7 +1733,7 @@ private pure func compiler_validate_resource_result_annotation(
 			),
 		)
 	else if compiler_typecheck_type_contains_resource(
-		compiler_typecheck_state_copy(state),
+		compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
 		return_type,
 	):
 		compiler_typecheck_state_add_error(
@@ -1703,7 +1746,7 @@ private pure func compiler_validate_resource_result_annotation(
 
 		for param_type in param_types:
 			if compiler_typecheck_type_contains_resource(
-				compiler_typecheck_state_copy(state),
+				compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
 				param_type,
 			):
 				has_resource_param = True
@@ -1742,7 +1785,7 @@ private pure func compiler_validate_resource_signature_boundary(
 			)
 
 			if compiler_typecheck_type_contains_resource(
-				compiler_typecheck_state_copy(next),
+				compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
 				param_type,
 			):
 				param_name: String = compiler_param_name_from_parsed(param).get_or("_")
@@ -1752,7 +1795,7 @@ private pure func compiler_validate_resource_signature_boundary(
 				)
 
 		if compiler_typecheck_type_contains_resource(
-			compiler_typecheck_state_copy(next),
+			compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
 			return_type,
 		):
 			compiler_typecheck_state_add_error(
@@ -1960,7 +2003,10 @@ private pure func compiler_register_union_decl(
 	else:
 		CompilerTypeUnion
 
-	contains_resource: Bool = compiler_variants_contain_resource(next, variants)
+	contains_resource: Bool = compiler_variants_contain_resource(
+		compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
+		variants,
+	)
 	constructor_ids = compiler_reserved_constructor_ids(next, union_decl)
 	env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
 		next.env,
@@ -2060,7 +2106,10 @@ private pure func compiler_register_record_decl(
 		compiler_type_param_names(record_decl.type_params),
 		fields,
 		record_decl.is_struct,
-		compiler_fields_contain_resource(next, fields),
+		compiler_fields_contain_resource(
+			compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
+			fields,
+		),
 	)
 	with_env = compiler_typecheck_state_with_env(next, env)
 	compiler_typecheck_state_record_type_home(with_env, record_decl.name.text, module_path, False)
@@ -3306,7 +3355,10 @@ private pure func compiler_typecheck_register_imported_union_decl(
 	else:
 		CompilerTypeUnion
 
-	contains_resource: Bool = compiler_variants_contain_resource(state, variants)
+	contains_resource: Bool = compiler_variants_contain_resource(
+		compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
+		variants,
+	)
 	constructor_ids = compiler_reserved_constructor_ids(state, union_decl)
 	env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
 		state.env,
@@ -3362,7 +3414,10 @@ private pure func compiler_typecheck_register_imported_record_decl(
 		compiler_type_param_names(record_decl.type_params),
 		fields,
 		record_decl.is_struct,
-		compiler_fields_contain_resource(state, fields),
+		compiler_fields_contain_resource(
+			compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
+			fields,
+		),
 	)
 	with_env = compiler_typecheck_state_with_env(state, env)
 	with_home = compiler_typecheck_state_record_type_home(
