@@ -1324,6 +1324,70 @@ The next measured memory slice belongs there. Direct JSON emission remains a
 possible later optimization only after a profile shows projection or
 serialization at the live peak.
 
+#### Exact `compiler_infer` replay (2026-07-23)
+
+The later compiler migration exposed a separate self-hosted typecheck peak, so
+the bridge now supports exact request capture through
+`BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST`.
+`benchmarks/compiler_typecheck_replay` executes that request in an isolated
+process with a timeout, a Linux address-space or macOS sampled-RSS limit,
+file-backed output, response validation, request/helper hashes, and
+phase/module markers.
+
+The captured `compiler_infer.brp` request is 1,396,350 bytes with SHA-256
+`72ed96735b70982cd63bcb4688b3233f73d31ecccb457ff32648587e0067639e`.
+Normal replays established:
+
+| Selection | Before peak RSS | After peak RSS | Before time | After time |
+|-----------|----------------:|---------------:|------------:|-----------:|
+| target typecheck, full graph context | 2,073,985,024 bytes | 2,016,165,888 bytes | 22.48 s | 22.31 s |
+| full selected graph | 3,177,906,176 bytes | 3,084,386,304 bytes | 25.61 s | 25.54 s |
+
+The target-typecheck peak fell by 57,819,136 bytes (2.8%), and the full graph
+peak fell by 93,519,872 bytes (2.9%), with effectively unchanged elapsed time
+and byte-identical responses. A focused recursive resource-scan fixture fell
+from about 222,887,936 bytes to 51,773,440 bytes.
+
+The implemented reductions are deliberately narrow:
+
+- declaration resource-shape traversal expands only an alias head before
+  visiting children, avoiding recursive reconstruction at every node;
+- immutable semantic and value types are shared across value slots and typed
+  expression metadata instead of being recursively copied into equivalent
+  fields;
+- the type-shape memo is reset at declaration boundaries and before the final
+  state escapes;
+- typed artifacts are emitted one declaration at a time, and graph responses
+  are written in chunks without constructing a second program-sized
+  `JsonValue` or serialized string;
+- each typechecked artifact falls out of lexical scope after its response is
+  emitted; graph preparation, typecheck, projection, emission, and artifact
+  scope boundaries are visible in opt-in trace markers. Prepared graph modules
+  remain live for the request.
+
+The markers rule out CTFE and final projection as the dominant peak for this
+request. It has no CTFE dependency preparations. Graph parse and importable
+preparation reach roughly 155 MB; most growth happens while constructing the
+typed target. Prior selected modules leave roughly 1.26 GB of allocator
+high-water before the target starts. Typechecking only the target reaches about
+2.0 GB while still retaining the full prepared graph context.
+
+`--memstats` is intentionally perturbative and is disabled in normal
+measurements. One target-typecheck diagnostic run timed out at 120 seconds near
+3.81 GB sampled RSS. Its `typecheck_complete` marker reported 189,594,195
+allocations, 162,679,722 releases, 26,914,473 current objects, and
+1,849,339,381 requested allocation bytes. Projection raised total allocations
+to about 201.75 million without increasing current objects. This is evidence
+of extreme allocation churn plus a large live typed representation; it is not
+evidence of an unbounded leak.
+
+The remaining 2.0 GB target-typecheck and 3.08 GB full-graph peaks are not
+resolved by this slice. The next measured work should inventory recursive
+`compiler_type_copy` boundaries and reduce only copies whose values are
+provably immutable and non-mutated. Environment-wide ownership changes or a
+typed-AST representation redesign require separate tests and measurements;
+they should not be inferred from RSS high-water alone.
+
 ### Core JSON duplication
 
 The OCaml side builds a large `Lsp_json` Core tree and serialized request; the

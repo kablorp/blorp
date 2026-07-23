@@ -68,6 +68,7 @@ import:
 		bridge_action_name,
 		bridge_error_json,
 		bridge_failure_json,
+		bridge_schema_json,
 		bridge_success_json,
 		decode_bridge_envelope_value,
 	compiler_imports: CompilerImportableModule, compiler_importable_module
@@ -97,12 +98,13 @@ import:
 		compiler_typecheck_state_for_origin,
 		compiler_typecheck_state_with_debug_calls,
 		compiler_typecheck_state_with_reserved_definition_ids,
-	compiler_typed_ast_json: compiler_typed_program_to_json
+	compiler_typed_ast_json: compiler_typed_program_to_json, emit_compiler_typed_program_json_chunks
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
 		as_bool,
 		as_string,
+		emit_json_chunks,
 		get_field,
 		parse_json,
 
@@ -1159,6 +1161,33 @@ private pure func prepare_ctfe_dependencies(
 		})
 
 
+private func prepare_ctfe_dependencies_with_trace(
+	dependencies: List[PreparedTypecheckModule],
+	importable_modules: List[CompilerImportableModule],
+	allow_debug_only_calls: Bool,
+	definition_plan: CompilerGraphDefinitionPlan,
+	trace: (String, String) -> Void,
+) -> List[PreparedCtfeDependency]:
+	var result: List[PreparedCtfeDependency] = []
+
+	for dependency in dependencies:
+		module_path = dependency.request.module_path
+		trace("ctfe_dependency_typecheck_start", module_path)
+		imported_program = ctfe_imported_program_from_prepared(
+			dependency,
+			importable_modules,
+			allow_debug_only_calls,
+			definition_plan,
+		)
+		trace("ctfe_dependency_typecheck_complete", module_path)
+		result = result.append({
+			module_path = module_path,
+			imported_program = imported_program,
+		})
+
+	result
+
+
 private pure func import_module_is_explicit_for_ctfe(
 	module: PreparedTypecheckModule,
 	explicit_import_paths: List[String],
@@ -1327,6 +1356,74 @@ private pure func typechecked_module_artifact(
 	JsonObject(fields)
 
 
+private func emit_json_string_list(
+	items: List[String],
+	emit: (String) -> Void,
+) -> Void:
+	emit("[")
+	var first: Bool = True
+
+	for item in items:
+		if first:
+			first = False
+		else:
+			emit(",")
+
+		emit_json_chunks(JsonString(item), emit)
+
+	emit("]")
+
+
+private func emit_import_bindings(
+	items: List[CompilerImportBinding],
+	emit: (String) -> Void,
+) -> Void:
+	emit("[")
+	var first: Bool = True
+
+	for item in items:
+		if first:
+			first = False
+		else:
+			emit(",")
+
+		emit_json_chunks(import_binding_to_json(item), emit)
+
+	emit("]")
+
+
+private func emit_typechecked_module_artifact_chunks(
+	module: CompilerTypecheckedModule,
+	include_comments: Bool,
+	emit: (String) -> Void,
+) -> Void:
+	emit("{\"path\":")
+	emit_json_chunks(JsonString(module.path), emit)
+	emit(",\"module\":")
+	emit_json_chunks(JsonString(module.module_name), emit)
+	emit(",\"ast_phase\":")
+	emit_json_chunks(JsonString(parsed_program_phase_name(TypecheckSourceProgram)), emit)
+	emit(",\"typed_program\":")
+	emit_compiler_typed_program_json_chunks(module.typed_program, emit)
+	emit(",\"ctfe_status\":")
+	emit_json_chunks(JsonString(typecheck_ctfe_status_name(module.ctfe_evaluated)), emit)
+	emit(",\"type_errors\":")
+	emit_json_string_list(module.errors, emit)
+	emit(",\"import_bindings\":")
+	emit_import_bindings(module.import_bindings, emit)
+	emit(",\"module_surface\":")
+	emit_json_chunks(
+		module_surface_to_json(module_surface_for_program(module.parsed_program)),
+		emit,
+	)
+
+	if include_comments:
+		emit(",\"comments\":")
+		emit_json_chunks(source_comment_jsons(module.parsed_program.source), emit)
+
+	emit("}")
+
+
 private pure func typed_source_artifact(
 	path: String,
 	module_name: String,
@@ -1413,6 +1510,39 @@ private pure func prepare_typecheck_graph(request: TypecheckGraphRequest) -> Pre
 	}
 
 
+private func prepare_typecheck_graph_with_trace(
+	request: TypecheckGraphRequest,
+	trace: (String, String) -> Void,
+) -> PreparedTypecheckGraph:
+	target_module_path = request.target.module_path
+	modules = prepare_typecheck_modules(request.modules, request.resolved_imports)
+	target = prepare_typecheck_module(request.target, request.resolved_imports)
+	selected_modules = graph_target_modules(modules, request.module_targets)
+	trace("graph_parse_complete", target_module_path)
+	importable_modules = importable_modules_from_prepared(modules)
+	trace("graph_importables_complete", target_module_path)
+	definition_plan = graph_definition_plan_for_modules(target, modules)
+	trace("graph_definition_plan_complete", target_module_path)
+	ctfe_dependency_plan = ctfe_dependencies_for_graph(target, modules, selected_modules)
+	trace("graph_ctfe_plan_complete", target_module_path)
+	ctfe_dependencies = prepare_ctfe_dependencies_with_trace(
+		ctfe_dependency_plan,
+		importable_modules_with_artifact(importable_modules, target),
+		request.allow_debug_only_calls,
+		definition_plan,
+		trace,
+	)
+
+	{
+		target = target,
+		modules = modules,
+		selected_modules = selected_modules,
+		importable_modules = importable_modules,
+		ctfe_dependencies = ctfe_dependencies,
+		definition_plan = definition_plan
+	}
+
+
 pure func compiler_typecheck_graph(request: TypecheckGraphRequest) -> CompilerTypecheckedGraph:
 	graph = prepare_typecheck_graph(request)
 
@@ -1434,6 +1564,34 @@ private pure func typechecked_graph_module_response(
 		request.include_comments,
 	)
 	bridge_success_json(artifact).to_string()
+
+
+private func emit_typechecked_graph_module_response(
+	request: TypecheckGraphRequest,
+	graph: PreparedTypecheckGraph,
+	module: PreparedTypecheckModule,
+	emit: (String) -> Void,
+	trace: (String, String) -> Void,
+) -> Void:
+	module_path = module.request.module_path
+	trace("typecheck_start", module_path)
+	typechecked = typechecked_graph_module(request, graph, module)
+	trace("typecheck_complete", module_path)
+	emit("{\"schema\":")
+	emit_json_chunks(bridge_schema_json(), emit)
+	emit(",\"ok\":true,\"artifact\":")
+	emit_typechecked_module_artifact_chunks(typechecked, request.include_comments, emit)
+	trace("projection_complete", module_path)
+	emit("}")
+	emit("\n")
+	trace("emit_complete", module_path)
+
+
+private func typecheck_trace_artifact_scope_complete(
+	module: PreparedTypecheckModule,
+	trace: (String, String) -> Void,
+) -> Void:
+	trace("typed_artifact_scope_complete", module.request.module_path)
 
 
 private pure func handle_typecheck_source(
@@ -1502,6 +1660,51 @@ func stream_typecheck_graph_request_value(
 							emit(typechecked_graph_module_response(request, graph, graph.target))
 						Err(error):
 							emit(dispatch_error_json(error).to_string())
+
+					True
+				_:
+					False
+		Err(_):
+			False
+
+
+func stream_typecheck_graph_request_chunks(
+	root: JsonValue,
+	emit: (String) -> Void,
+	trace: (String, String) -> Void,
+) -> Bool:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			match envelope.action:
+				TypecheckGraphAction:
+					match typecheck_graph_request_from_body(envelope.payload):
+						Ok(request):
+							target_module_path = request.target.module_path
+							trace("graph_prepare_start", target_module_path)
+							graph = prepare_typecheck_graph_with_trace(request, trace)
+							trace("graph_prepare_complete", target_module_path)
+
+							for module in graph.selected_modules:
+								emit_typechecked_graph_module_response(
+									request,
+									graph,
+									module,
+									emit,
+									trace,
+								)
+								typecheck_trace_artifact_scope_complete(module, trace)
+
+							emit_typechecked_graph_module_response(
+								request,
+								graph,
+								graph.target,
+								emit,
+								trace,
+							)
+							typecheck_trace_artifact_scope_complete(graph.target, trace)
+						Err(error):
+							emit_json_chunks(dispatch_error_json(error), emit)
+							emit("\n")
 
 					True
 				_:

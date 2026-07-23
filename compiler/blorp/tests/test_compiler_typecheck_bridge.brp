@@ -10,6 +10,7 @@ import:
 		CompilerTypecheckedModule,
 		compiler_typecheck_graph,
 		handle_request,
+		stream_typecheck_graph_request_chunks,
 		stream_typecheck_graph_request_value,
 	../src/stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
@@ -420,6 +421,16 @@ pure func typecheck_graph_request_with_resolved_imports(
 	module_targets: List[String],
 	resolved_imports: List[JsonValue],
 ) -> String:
+	typecheck_graph_request_with_options(target, modules, module_targets, resolved_imports, False)
+
+
+pure func typecheck_graph_request_with_options(
+	target: JsonValue,
+	modules: List[JsonValue],
+	module_targets: List[String],
+	resolved_imports: List[JsonValue],
+	include_comments: Bool,
+) -> String:
 	request_json("typecheck_graph", JsonObject([
 			("target", target),
 			("modules", JsonVector(modules)),
@@ -427,7 +438,13 @@ pure func typecheck_graph_request_with_resolved_imports(
 					func(path): JsonString(path),
 				))),
 			("resolved_imports", JsonVector(resolved_imports)),
+			("include_comments", JsonBool(include_comments)),
 		]))
+
+
+func ignore_typecheck_trace(phase: String, module_name: String) -> Void:
+	_ = phase.length()
+	_ = module_name.length()
 
 
 func streamed_graph_responses(request: String, expected_count: Int) -> Option[List[JsonValue]]:
@@ -463,6 +480,93 @@ func streamed_graph_responses(request: String, expected_count: Int) -> Option[Li
 					Some(values)
 		Err(_):
 			None
+
+
+func chunked_graph_response_lines(request: String, expected_count: Int) -> Option[List[JsonValue]]:
+	match parse_json(request):
+		Ok(root):
+			chunks: Channel[String] = channel(4096)
+			streamed = stream_typecheck_graph_request_chunks(root
+			, func(chunk):
+				_ = send(chunks, chunk)
+			, ignore_typecheck_trace)
+			seal(chunks)
+
+			if not streamed:
+				None
+			else:
+				var text: String = ""
+
+				while True:
+					match recv(chunks):
+						Some(chunk):
+							text = text.append_str(chunk)
+						None:
+							break
+
+				lines = text
+					.split("\n")
+					.filter(func(line): line.length() != 0)
+				var values: List[JsonValue] = []
+				var failed: Bool = False
+
+				for line in lines:
+					match parse_json(line):
+						Ok(value):
+							values = values.append(value)
+						Err(_):
+							failed = True
+							break
+
+				if failed or values.length() != expected_count:
+					None
+				else:
+					Some(values)
+		Err(_):
+			None
+
+
+func chunked_graph_trace_entries(request: String) -> List[String]:
+	match parse_json(request):
+		Ok(root):
+			entries: Channel[String] = channel(256)
+			emit_chunk = func(chunk: String):
+				_ = chunk.length()
+			trace_entry = func(phase: String, module_name: String):
+				_ = send(entries, phase + ":" + module_name)
+			_ = stream_typecheck_graph_request_chunks(root, emit_chunk, trace_entry)
+			seal(entries)
+			var result: List[String] = []
+
+			while True:
+				match recv(entries):
+					Some(entry):
+						result = result.append(entry)
+					None:
+						break
+
+			result
+		Err(_):
+			[]
+
+
+pure func json_value_lists_equal(left: List[JsonValue], right: List[JsonValue]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var equal: Bool = True
+
+		while index < left.length() and equal:
+			equal = left
+				.get_or(index, JsonNull)
+				.to_string() == right
+				.get_or(index, JsonNull)
+				.to_string()
+
+			index += 1
+
+		equal
 
 
 pure func json_string_array_contains(items: List[JsonValue], needle: String) -> Bool:
@@ -548,6 +652,55 @@ func test_typecheck_graph_returns_module_and_target_artifacts() -> Bool:
 			)
 		None:
 			False
+
+
+func test_typecheck_graph_chunk_stream_returns_complete_lines() -> Bool:
+	dep: JsonValue = user_import_module_json("dep", "dep", "pure func answer() -> Int:\n\t41")
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"import:\n\tdep: answer\n\nfunc main(args: List[String]) -> Int:\n\tanswer()",
+	)
+
+	request = typecheck_graph_request(target, [dep], ["dep"])
+
+	match (streamed_graph_responses(request, 2), chunked_graph_response_lines(request, 2)):
+		(Some(canonical), Some(chunked)):
+			json_value_lists_equal(canonical, chunked)
+		_:
+			False
+
+
+func test_typecheck_graph_chunk_stream_matches_comments_and_errors() -> Bool:
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"-- retained comment\n\nfunc main(args: List[String]) -> Int:\n\tmissing_name",
+	)
+	request = typecheck_graph_request_with_options(target, [], [], [], True)
+
+	match (streamed_graph_responses(request, 1), chunked_graph_response_lines(request, 1)):
+		(Some(canonical), Some(chunked)):
+			json_value_lists_equal(canonical, chunked)
+		_:
+			False
+
+
+func test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation() -> Bool:
+	dep: JsonValue = user_import_module_json("dep", "dep", "pure func answer() -> Int:\n\t41")
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"import:\n\tdep: answer\n\nvalue: Int = answer()",
+	)
+	entries = chunked_graph_trace_entries(typecheck_graph_request(target, [dep], []))
+
+	(
+		entries.contains("graph_parse_complete:main")
+		and entries.contains("graph_definition_plan_complete:main")
+		and entries.contains("ctfe_dependency_typecheck_start:dep")
+		and entries.contains("ctfe_dependency_typecheck_complete:dep")
+	)
 
 
 func test_typecheck_graph_handles_shared_import_context() -> Bool:
@@ -2429,6 +2582,18 @@ tests: TestSuite = {
 		(
 			"typecheck_graph returns module and target artifacts",
 			test_typecheck_graph_returns_module_and_target_artifacts,
+		),
+		(
+			"typecheck_graph chunk stream returns complete lines",
+			test_typecheck_graph_chunk_stream_returns_complete_lines,
+		),
+		(
+			"typecheck_graph chunk stream matches comments and errors",
+			test_typecheck_graph_chunk_stream_matches_comments_and_errors,
+		),
+		(
+			"typecheck_graph chunk stream traces graph and CTFE preparation",
+			test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation,
 		),
 		(
 			"typed graph API returns in-memory results",

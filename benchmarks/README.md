@@ -133,6 +133,101 @@ Bridge preparation is excluded from the reported time. Results include SHA-256
 digests of the bridge and request so saved before/after measurements remain
 auditable.
 
+### Captured Typecheck Replay
+
+`compiler_typecheck_replay` runs one exact production `typecheck_graph` request
+against an isolated helper. Capture mode writes the request immediately before
+the OCaml host would start that helper, then deliberately stops:
+
+```bash
+cd compiler && dune build bin/blorp_ocaml_host.exe
+cd ..
+
+capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.json")
+output=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.c")
+BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$capture" \
+  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  __compiler-host-compile-wrapper \
+  -o "$output" \
+  compiler/blorp/src/stage_06_typecheck/compiler_infer.brp
+```
+
+The capture command is expected to exit nonzero, and it must not create the
+requested output. Keep captures local: they contain source text and local
+paths. First typecheck only the target while retaining its full prepared graph
+context, then typecheck the complete selected module graph:
+
+```bash
+benchmarks/compiler_typecheck_replay "$capture" \
+  --target-only --timeout 60 --memory-limit 4G --json
+benchmarks/compiler_typecheck_replay "$capture" \
+  --timeout 60 --memory-limit 4G --json
+```
+
+`--module PATH` selects one original module target plus the request target;
+`--first N` selects a prefix. The result records request, replay, and helper
+hashes; artifact order and count; response size and hash; elapsed time; peak
+RSS; and sampled peak RSS by phase and module. Phases shorter than the sampling
+interval can be absent rather than receiving an inferred value. Helper
+preparation is excluded from the measurement, while stdout and stderr remain
+file-backed.
+
+The memory limit uses an address-space limit on Linux and a sampled RSS
+watchdog on macOS. Linux allocation-limit failures are not distinguishable from
+unrelated helper failures by exit status alone, so a nonzero exit under that
+limit is reported as indeterminate and should be rerun without the limit.
+`--memstats` adds runtime allocation counters to phase markers, but it
+substantially increases time and memory use. Use it only for diagnosis, never
+for headline before/after RSS or timing comparisons.
+
+On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
+helper leader process. This is appropriate for the current single-process
+typecheck helper, but it perturbs elapsed time and would omit any future child
+processes. Use the global peak as the memory comparison and treat per-phase
+samples and macOS elapsed time as diagnostic.
+
+### Captured Backend Replay
+
+`compiler_backend_memory` replays one production `emit_core_c` request against
+an isolated renderer helper. Capture mode writes the request and deliberately
+stops before resolving or starting the renderer:
+
+```bash
+capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
+BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
+  ./blorp test --no-cache --timeout 30 \
+  compiler/blorp/tests/test_compiler_infer.brp
+```
+
+The capture command exits nonzero after reporting the saved path. Its test
+timeout does not govern compilation; safety comes from capture mode stopping
+before renderer execution. Capture still runs the compiler frontend and middle
+once and materializes the serialized request. Keep captured requests local:
+they contain the lowered program and source paths, can be large, and should not
+be committed.
+
+Replay a bounded request with:
+
+```bash
+benchmarks/compiler_backend_memory "$capture" --timeout 60
+benchmarks/compiler_backend_memory "$capture" --timeout 60 --json
+benchmarks/compiler_backend_memory "$capture" --timeout 60 --vmmap
+```
+
+Requests larger than 16 MiB are refused by default. Use
+`--allow-large-request` only when the replay process is already inside an
+external memory limit, such as a Linux container or cgroup. The acknowledgement
+is not itself a memory limit.
+
+The result records request and helper SHA-256 digests, request/response sizes,
+elapsed time, peak RSS, process status, and generated-C size. `--vmmap` adds
+sampled macOS physical-footprint and allocator metrics. In `--vmmap` mode,
+`peak_rss_bytes` is omitted because the sampler would contaminate the child RSS
+value; use sampled `physical_footprint_bytes` instead. Full request validation
+runs in a short-lived process and releases its JSON heap before bridge
+preparation or replay. Bridge preparation is excluded from measurement, and
+responses stay file-backed until the renderer has exited.
+
 ### Perceus Global Scanning
 
 `compiler_perceus_memory` generates a bounded Core program with managed globals
@@ -152,11 +247,13 @@ commands, isolating the cost of irrelevant globals. The runner uses
 it prepares a cached helper through `./blorp __compiler-bridge-prepare` before
 starting measurement. Bridge preparation is excluded from the reported time.
 
-On macOS, both diagnostics accept `--vmmap` to sample physical footprint,
-`MALLOC_SMALL`, and allocation count when `vmmap` exposes those fields:
+On macOS, all compiler memory diagnostics accept `--vmmap` to sample physical
+footprint, `MALLOC_SMALL`, and allocation count when `vmmap` exposes those
+fields:
 
 ```bash
 benchmarks/compiler_typecheck_memory --vmmap
+benchmarks/compiler_backend_memory captured-request.json --vmmap
 benchmarks/compiler_perceus_memory --vmmap
 ```
 

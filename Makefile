@@ -159,7 +159,9 @@ hygiene-check:
 	@scripts/check-std-builtins
 	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
 	@tests/test_scripts_test_harness.sh

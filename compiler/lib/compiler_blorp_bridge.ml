@@ -1827,6 +1827,9 @@ let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
+let capture_emit_core_request_env = "BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST"
+let capture_typecheck_graph_request_env =
+  "BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST"
 let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
 let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
 let typecheck_bridge_source_name =
@@ -3131,13 +3134,23 @@ let render_via_command_exn ~renderer ~op args =
         | Error (_, message) -> invalid_arg message)
 
 let emit_core_c_artifact_exn ?(profile = false) core_json =
-  let response_json =
-    run_renderer_request_via_blorp ~release_host_heap_before_run:true
-      (emit_core_c_request_json ~profile core_json)
-  in
-  match response_result response_json c_artifact_response_field with
-  | Ok artifact -> artifact
-  | Error (_, message) -> invalid_arg message
+  let request_json = emit_core_c_request_json ~profile core_json in
+  match Sys.getenv_opt capture_emit_core_request_env with
+  | Some capture_path when not (String.equal capture_path "") ->
+      write_file capture_path request_json;
+      invalid_arg
+        (Printf.sprintf
+           "captured emit_core_c request at %s; renderer was not started because \
+            %s is set"
+           capture_path capture_emit_core_request_env)
+  | _ ->
+      let response_json =
+        run_renderer_request_via_blorp ~release_host_heap_before_run:true
+          request_json
+      in
+      (match response_result response_json c_artifact_response_field with
+      | Ok artifact -> artifact
+      | Error (_, message) -> invalid_arg message)
 
 let run_core_pipeline_core_json_exn ~stage core_json =
   let response_json =
@@ -3170,10 +3183,21 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
 
 let typecheck_graph_via_command_with_policy ~resolved_imports
     ~allow_debug_only_calls ~target ~modules ~module_targets =
-  run_typecheck_graph_request_via_blorp
-    ~module_count:(List.length module_targets)
-    (typecheck_graph_request_json_with_policy ~resolved_imports
-       ~allow_debug_only_calls ~target ~modules ~module_targets)
+  let request_json =
+    typecheck_graph_request_json_with_policy ~resolved_imports
+      ~allow_debug_only_calls ~target ~modules ~module_targets
+  in
+  match Sys.getenv_opt capture_typecheck_graph_request_env with
+  | Some capture_path when not (String.equal capture_path "") ->
+      write_file capture_path request_json;
+      invalid_arg
+        (Printf.sprintf
+           "captured typecheck_graph request at %s; typecheck helper was not \
+            started because %s is set"
+           capture_path capture_typecheck_graph_request_env)
+  | _ ->
+      run_typecheck_graph_request_via_blorp
+        ~module_count:(List.length module_targets) request_json
 
 let cli_run_via_command ?version ?source args =
   run_cli_request_via_blorp ?version ?source args |> cli_run_response_json

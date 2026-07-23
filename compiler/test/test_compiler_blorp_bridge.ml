@@ -1699,6 +1699,90 @@ let test_prepared_bridge_request_owns_stats_and_cleanup () =
     "host heap compacted before bridge resolution" true
     !resolver_saw_compaction
 
+let test_emit_core_capture_writes_request_without_starting_renderer () =
+  with_temp_dir (fun root ->
+      let capture_path = Filename.concat root "captured-request.json" in
+      let marker_path = Filename.concat root "renderer-started" in
+      let helper_path = Filename.concat root "renderer-helper.sh" in
+      write_file helper_path
+        ("#!/bin/sh\nprintf started > " ^ Filename.quote marker_path ^ "\n");
+      Unix.chmod helper_path 0o700;
+      let result =
+        with_env Bridge.capture_emit_core_request_env capture_path (fun () ->
+            with_env Bridge.prepared_renderer_bridge_bin_env helper_path (fun () ->
+                try
+                  ignore
+                    (Bridge.emit_core_c_artifact_exn ~profile:true
+                       (Lsp_json.Object [ ("kind", Lsp_json.String "program") ]));
+                  Alcotest.fail "expected capture-only renderer stop"
+                with Invalid_argument message -> message))
+      in
+      Alcotest.(check bool)
+        "capture reports renderer stop" true
+        (contains result "captured emit_core_c request");
+      Alcotest.(check bool)
+        "capture file exists" true (Sys.file_exists capture_path);
+      Alcotest.(check bool)
+        "renderer was not started" false (Sys.file_exists marker_path);
+      let captured = Bridge.read_file capture_path |> parse_json_exn in
+      (match field "schema" captured with
+      | Lsp_json.Int schema ->
+          Alcotest.(check int) "captured schema" 1 schema
+      | _ -> Alcotest.fail "expected integer JSON field schema");
+      Alcotest.(check string)
+        "captured domain" "compiler" (string_field "domain" captured);
+      Alcotest.(check string)
+        "captured action" "emit_core_c" (string_field "action" captured);
+      let payload = field "payload" captured in
+      Alcotest.(check bool)
+        "captured profile" true (bool_field "profile" payload);
+      match field "core" payload with
+      | Lsp_json.Object fields ->
+          Alcotest.(check string)
+            "captured core" "program"
+            (string_field "kind" (Lsp_json.Object fields))
+      | _ -> Alcotest.fail "expected captured Core object")
+
+
+let test_typecheck_capture_writes_request_without_starting_helper () =
+  with_temp_dir (fun root ->
+      let capture_path = Filename.concat root "captured-typecheck-request.json" in
+      let marker_path = Filename.concat root "typecheck-helper-started" in
+      let helper_path = Filename.concat root "typecheck-helper.sh" in
+      let target =
+        {
+          Bridge.typecheck_import_path = "src/main.brp";
+          typecheck_import_module_name = "main";
+          typecheck_import_module_path = "main";
+          typecheck_import_text = "func main(args: List[String]) -> Int: 0\n";
+          typecheck_import_origin = Bridge.CliFrontendUserModule;
+        }
+      in
+      write_file helper_path
+        ("#!/bin/sh\nprintf started > " ^ Filename.quote marker_path ^ "\n");
+      Unix.chmod helper_path 0o700;
+      let result =
+        with_env Bridge.capture_typecheck_graph_request_env capture_path (fun () ->
+            with_env Bridge.prepared_typecheck_bridge_bin_env helper_path (fun () ->
+                try
+                  ignore
+                    (Bridge.typecheck_graph_via_command_with_policy
+                       ~resolved_imports:[] ~allow_debug_only_calls:false ~target
+                       ~modules:[] ~module_targets:[]);
+                  Alcotest.fail "expected capture-only typecheck stop"
+                with Invalid_argument message -> message))
+      in
+      Alcotest.(check bool)
+        "capture reports helper stop" true
+        (contains result "captured typecheck_graph request");
+      Alcotest.(check bool)
+        "capture file exists" true (Sys.file_exists capture_path);
+      Alcotest.(check bool)
+        "helper was not started" false (Sys.file_exists marker_path);
+      let captured = Bridge.read_file capture_path |> parse_json_exn in
+      Alcotest.(check string)
+        "captured action" "typecheck_graph" (string_field "action" captured))
+
 let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
       let compiler_dir = Filename.concat root "compiler" in
@@ -2042,6 +2126,12 @@ let suite =
           `Quick test_bridge_helper_compiler_rejects_current_executable_override;
         Alcotest.test_case "prepared request owns stats and cleanup" `Quick
           test_prepared_bridge_request_owns_stats_and_cleanup;
+        Alcotest.test_case
+          "emit Core capture writes request without starting renderer" `Quick
+          test_emit_core_capture_writes_request_without_starting_renderer;
+        Alcotest.test_case
+          "typecheck capture writes request without starting helper" `Quick
+          test_typecheck_capture_writes_request_without_starting_helper;
         Alcotest.test_case "cache key includes helper entrypoint" `Quick
           test_bridge_cache_key_includes_helper_entrypoint;
         Alcotest.test_case "cache key includes std sources" `Quick

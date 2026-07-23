@@ -1,5 +1,6 @@
 import:
 	bytes: from_hex
+	channel: Channel, channel, recv, seal, send
 	json:
 		JsonError,
 		JsonValue(JsonObject, JsonNumber, JsonVector, JsonString, JsonNull, JsonBool),
@@ -7,6 +8,7 @@ import:
 		as_bool,
 		as_number,
 		as_string,
+		emit_json_chunks,
 		format_error,
 		get_field,
 		is_null,
@@ -15,7 +17,7 @@ import:
 		parse_json_detailed,
 		to_string,
 	parser: ParseResult(ParseFailed, Parsed)
-	string: from_char
+	string: append_char, from_char, string as make_string
 	test: TestSuite
 
 
@@ -315,6 +317,25 @@ func test_string_escape_decoding() -> Bool:
 			False
 
 
+func test_long_plain_string_decoding() -> Bool:
+	var content: String = make_string(4096)
+	var index: Int = 0
+
+	while index < 4096:
+		content = content.append_char('x')
+		index += 1
+
+	match parse_json(make_json_string(content)):
+		Ok(v):
+			match as_string(v):
+				Some(parsed):
+					parsed == content
+				None:
+					False
+		Err(_):
+			False
+
+
 func test_unicode_escape_decoding() -> Bool:
 	match parse_json("\"\\u0041\\u00E9\""):
 		Ok(v):
@@ -449,6 +470,31 @@ func test_serializer_escapes_control_chars() -> Bool:
 func test_serializer_preserves_raw_utf8_bytes() -> Bool:
 	raw: String = utf8_cafe_string()
 	JsonString(raw).to_string() == make_json_string(raw)
+
+
+func test_chunked_serializer_matches_to_string() -> Bool:
+	value = JsonObject([("message", JsonString("line one\n\"line two\"")), ("values", JsonVector([
+			JsonNull,
+			JsonBool(True),
+			JsonNumber(42.5),
+			JsonObject([("nested", JsonString("yes"))]),
+		]))])
+	chunks: Channel[String] = channel(64)
+	emit_json_chunks(value, func(chunk):
+		_ = send(chunks, chunk)
+	)
+	seal(chunks)
+
+	var emitted: List[String] = []
+
+	while True:
+		match recv(chunks):
+			Some(chunk):
+				emitted = emitted.append(chunk)
+			None:
+				break
+
+	emitted.join("") == value.to_string()
 
 
 func test_serializer_maps_non_finite_numbers_to_null() -> Bool:
@@ -693,6 +739,7 @@ tests: TestSuite = {
 		("parse exponent number", test_parse_exponent_number),
 		("rejects malformed numbers", test_rejects_malformed_numbers),
 		("string escape decoding", test_string_escape_decoding),
+		("long plain string decoding", test_long_plain_string_decoding),
 		("unicode escape decoding", test_unicode_escape_decoding),
 		("unicode surrogate pair decoding", test_unicode_surrogate_pair_decoding),
 		("rejects bad string escapes", test_rejects_bad_string_escapes),
@@ -709,6 +756,7 @@ tests: TestSuite = {
 		),
 		("serializer escapes control chars", test_serializer_escapes_control_chars),
 		("serializer preserves raw UTF-8 bytes", test_serializer_preserves_raw_utf8_bytes),
+		("chunked serializer matches to_string", test_chunked_serializer_matches_to_string),
 		(
 			"serializer maps non finite numbers to null",
 			test_serializer_maps_non_finite_numbers_to_null,
