@@ -111,7 +111,6 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreDetach,
 		CoreDictConstruct,
 		CoreDictEntry,
 		CoreDictLiteralEntry,
@@ -307,11 +306,9 @@ import:
 		),
 		CoreRuntimeUnionArg(RuntimeIntField, RuntimeOwnedField),
 		CoreRuntimeUnionCase,
-		CoreSelect,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSelectRecvArm,
-		CoreSetAlloc,
 		CoreStackOptionRepresentation,
 		CoreStackResultRepresentation,
 		CoreStringByteCopy,
@@ -410,7 +407,7 @@ import:
 		arg_consumes_caller,
 		builtin_contract,
 		intrinsic_contract,
-	../stage_09_core/compiler_core_pipeline as CorePipeline
+	../stage_09_core/compiler_core_pipeline: PreparedCoreProgram(PreparedCore), run_pre_dce_tail
 	../stage_09_core/compiler_core_prepare as CorePrepare
 	codegen_intrinsic_renderer as Intrinsic
 	codegen_prepared_backend_renderer:
@@ -855,23 +852,17 @@ private C_RESERVED_IDENTIFIERS: List[String] = [
 ]
 
 
-record CoreEmitOptions {
-	profile: Bool
-}
+union CoreEmitError:
+	UnsupportedGlobalInitializer(String)
 
 
-record UnsupportedGlobalInitializerError {
-	global_name: String
-}
+pure func core_emit_error_message(error: CoreEmitError) -> String:
+	match error:
+		UnsupportedGlobalInitializer(global_name):
+			"unsupported global initializer for `${global_name}`"
 
 
-pure func unsupported_global_initializer_error_to_string(
-	error: UnsupportedGlobalInitializerError,
-) -> String:
-	"unsupported global initializer for `${error.global_name}`"
-
-
-private DEFAULT_CORE_EMIT_OPTIONS: CoreEmitOptions = {profile = False}
+private DEFAULT_PROFILE_ENABLED: Bool = False
 
 private MANGLED_DEF_ID_PREFIX: String = "__def_"
 
@@ -1148,22 +1139,22 @@ private pure func entrypoint_arg_cleanup(func_info: CoreFunction) -> String:
 		""
 
 
-private pure func emit_profile_runtime_setup(options: CoreEmitOptions) -> String:
-	if options.profile:
+private pure func emit_profile_runtime_setup(profile_enabled: Bool) -> String:
+	if profile_enabled:
 		"  blorp_profile_enable();\n  atexit(blorp_profile_report);\n"
 	else:
 		""
 
 
-private pure func emit_profile_start(options: CoreEmitOptions, name: String) -> String:
-	if options.profile:
+private pure func emit_profile_start(profile_enabled: Bool, name: String) -> String:
+	if profile_enabled:
 		"  blorp_profile_start(" + c_string_literal(name) + ");\n"
 	else:
 		""
 
 
-private pure func emit_profile_end(options: CoreEmitOptions, name: String) -> String:
-	if options.profile:
+private pure func emit_profile_end(profile_enabled: Bool, name: String) -> String:
+	if profile_enabled:
 		"  blorp_profile_end(" + c_string_literal(name) + ");\n"
 	else:
 		""
@@ -8195,8 +8186,8 @@ private pure func emit_dict_construct(construct: CoreDictConstruct) -> Option[St
 		Some(render_prepared_backend_op(BackendDictConstructWithBody(args)))
 
 
-private pure func emit_set_alloc(alloc: CoreSetAlloc) -> Option[String]:
-	Some(emit_set_constructor(alloc.constructor))
+private pure func emit_set_alloc(constructor: CoreHashContainerConstructor) -> Option[String]:
+	Some(emit_set_constructor(constructor))
 
 
 private enum ListStoreMode:
@@ -13933,9 +13924,9 @@ private pure func emit_resource_concurrent_task_closure(
 	Some("  blorp_Closure* " + fn_name + " = (blorp_Closure*)" + closure_value + ";\n")
 
 
-private pure func emit_detach(detached: CoreDetach, next_temp: Int) -> Option[FunctionBodyC]:
+private pure func emit_detach(task: CoreTaskClosure, next_temp: Int) -> Option[FunctionBodyC]:
 	fn_name: String = concurrent_task_function_name(next_temp, 0)
-	closure_statement ?= emit_copy_concurrent_task_closure(detached.task, next_temp, 0)
+	closure_statement ?= emit_copy_concurrent_task_closure(task, next_temp, 0)
 
 	Some({
 		statements = closure_statement + "  blorp_detach(" + fn_name + ");\n",
@@ -14717,21 +14708,24 @@ private pure func emit_select_branch(
 	})
 
 
-private pure func emit_select(select_expr: CoreSelect, next_temp: Int) -> Option[FunctionBodyC]:
+private pure func emit_select(
+	select_expr: List[CoreSelectArm],
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
 	select_index: Int = next_temp
 	arms_name: String = temp_name("select_arms", select_index)
 	result_name: String = temp_name("select_result", select_index)
 	var current_temp: Int = next_temp + 1
 	var inner: String = render_select_backend_op(BackendSelectArmsDecl({
 		arms = arms_name,
-		arm_count = select_expr.arms
+		arm_count = select_expr
 			.length()
 			.to_string(),
 	}))
 	var arm_index: Int = 0
 	var failed: Bool = False
 
-	for arm in select_expr.arms:
+	for arm in select_expr:
 		if not failed:
 			match emit_select_arm_setup(arms_name, arm_index, arm.kind, current_temp):
 				Some(setup):
@@ -14748,13 +14742,13 @@ private pure func emit_select(select_expr: CoreSelect, next_temp: Int) -> Option
 		inner += render_select_backend_op(BackendSelectWait({
 			result = result_name,
 			arms = arms_name,
-			arm_count = select_expr.arms
+			arm_count = select_expr
 				.length()
 				.to_string(),
 		}))
 		arm_index = 0
 
-		for arm in select_expr.arms:
+		for arm in select_expr:
 			if not failed:
 				match emit_select_branch(arm, result_name, select_index, arm_index, current_temp):
 					Some(branch):
@@ -19331,20 +19325,20 @@ private pure func emit_channel_attempt_user_function(
 private pure func emit_supported_user_function(
 	decls: List[CoreDecl],
 	func_info: CoreFunction,
-	options: CoreEmitOptions,
+	profile_enabled: Bool,
 ) -> Option[String]:
-	if options.profile:
-		emit_general_supported_user_function(options, func_info)
+	if profile_enabled:
+		emit_general_supported_user_function(profile_enabled, func_info)
 	else:
 		match emit_channel_attempt_user_function(decls, func_info):
 			Some(c_code):
 				Some(c_code)
 			None:
-				emit_general_supported_user_function(options, func_info)
+				emit_general_supported_user_function(profile_enabled, func_info)
 
 
 private pure func emit_general_supported_user_function(
-	options: CoreEmitOptions,
+	profile_enabled: Bool,
 	func_info: CoreFunction,
 ) -> Option[String]:
 	match func_info.body:
@@ -19366,12 +19360,12 @@ private pure func emit_general_supported_user_function(
 						""
 
 					profile_runtime_setup: String = if is_entrypoint_function:
-						emit_profile_runtime_setup(options)
+						emit_profile_runtime_setup(profile_enabled)
 					else:
 						""
 
 					body_prefix: String = prefix + global_init + profile_runtime_setup + body_prelude + emit_profile_start(
-						options,
+						profile_enabled,
 						profile_name,
 					)
 
@@ -19381,7 +19375,7 @@ private pure func emit_general_supported_user_function(
 								body_prefix + discard_body(
 									body_c,
 								) + emit_profile_end(
-									options,
+									profile_enabled,
 									profile_name,
 								) + body_cleanup + "  return 0;\n}\n",
 							)
@@ -19389,27 +19383,27 @@ private pure func emit_general_supported_user_function(
 							Some(
 								body_prefix + discard_body(
 									body_c,
-								) + emit_profile_end(options, profile_name) + "}\n",
+								) + emit_profile_end(profile_enabled, profile_name) + "}\n",
 							)
 					else:
 						match required_body_value(body_c):
 							Some(return_value):
 								if (
 									is_entrypoint_function
-									and (entrypoint_has_source_args(func_info) or options.profile)
+									and (entrypoint_has_source_args(func_info) or profile_enabled)
 								):
 									Some(
 										body_prefix + body_c.statements + "  long __blorp_main_result = (long)" + return_value + ";\n" + emit_profile_end(
-											options,
+											profile_enabled,
 											profile_name,
 										) + body_cleanup + "  return (int)__blorp_main_result;\n}\n",
 									)
-								else if options.profile:
+								else if profile_enabled:
 									Some(
 										body_prefix + body_c.statements + "  " + c_return_type(
 											func_info,
 										) + " __blorp_profile_result = " + return_value + ";\n" + emit_profile_end(
-											options,
+											profile_enabled,
 											profile_name,
 										) + "  return __blorp_profile_result;\n}\n",
 									)
@@ -19431,13 +19425,13 @@ private pure func emit_general_supported_user_function(
 private pure func emit_function(
 	decls: List[CoreDecl],
 	func_info: CoreFunction,
-	options: CoreEmitOptions,
+	profile_enabled: Bool,
 ) -> String:
 	match func_info.function_kind:
 		UserFunction:
 			match func_info.body:
 				Some(body):
-					match emit_supported_user_function(decls, func_info, options):
+					match emit_supported_user_function(decls, func_info, profile_enabled):
 						Some(c_code):
 							c_code
 						None:
@@ -22044,11 +22038,9 @@ private pure func emit_global_cleanup_statements(decls: List[CoreDecl]) -> Strin
 	statements
 
 
-private pure func emit_global_init_function(
-	decls: List[CoreDecl],
-) -> Result[String, UnsupportedGlobalInitializerError]:
+private pure func emit_global_init_function(decls: List[CoreDecl]) -> Result[String, CoreEmitError]:
 	var statements: String = ""
-	var error: Option[UnsupportedGlobalInitializerError] = None
+	var error: Option[CoreEmitError] = None
 	var temp_index: Int = 0
 
 	for decl in decls:
@@ -22064,7 +22056,7 @@ private pure func emit_global_init_function(
 									statements += init_body.statements
 									temp_index = init_body.next_temp
 								None:
-									error = Some({global_name = global.name.name})
+									error = Some(UnsupportedGlobalInitializer(global.name.name))
 						else:
 							void
 					EnumDecl(enum_decl):
@@ -22105,13 +22097,13 @@ private pure func emit_global_init_function(
 			)
 
 
-private pure func emit_function_decls(decls: List[CoreDecl], options: CoreEmitOptions) -> String:
+private pure func emit_function_decls(decls: List[CoreDecl], profile_enabled: Bool) -> String:
 	var c_code: String = ""
 
 	for decl in decls:
 		match decl:
 			FunctionDecl(func_info):
-				c_code += emit_function(decls, func_info, options)
+				c_code += emit_function(decls, func_info, profile_enabled)
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
@@ -22194,8 +22186,8 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 
 private pure func emit_decls(
 	decls: List[CoreDecl],
-	options: CoreEmitOptions,
-) -> Result[String, UnsupportedGlobalInitializerError]:
+	profile_enabled: Bool,
+) -> Result[String, CoreEmitError]:
 	global_init ?= emit_global_init_function(decls)
 	Ok(
 		emit_heap_record_and_union_forward_decls(
@@ -22214,52 +22206,55 @@ private pure func emit_decls(
 			decls,
 		) + emit_function_forward_decls(
 			decls,
-		) + emit_global_decls(decls) + global_init + emit_function_decls(decls, options),
+		) + emit_global_decls(decls) + global_init + emit_function_decls(decls, profile_enabled),
 	)
 
 
-private pure func error_artifact(error: UnsupportedGlobalInitializerError) -> CArtifact:
+private pure func error_artifact(error: CoreEmitError) -> CArtifact:
 	{
 		c_code = C_ARTIFACT_HEADER + "#error " + c_string_literal(
-			unsupported_global_initializer_error_to_string(error),
+			core_emit_error_message(error),
 		) + "\n",
 		link_flags = [],
 		include_dirs = []
 	}
 
 
-pure func try_emit_prepared_core_program_c_artifact_with_options(
-	prepared: CorePipeline.PreparedCoreProgram,
-	options: CoreEmitOptions,
-) -> Result[CArtifact, UnsupportedGlobalInitializerError]:
-	program: CoreProgram = prepared.program
-	decls_c ?= emit_decls(program.decls, options)
-	Ok({
-		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
-		link_flags = [],
-		include_dirs = [],
-	})
+pure func try_emit_prepared_core_program_c_artifact_with_profile(
+	prepared: PreparedCoreProgram,
+	profile_enabled: Bool,
+) -> Result[CArtifact, CoreEmitError]:
+	match prepared:
+		PreparedCore(program):
+			decls_c ?= emit_decls(program.decls, profile_enabled)
+			Ok({
+				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
+					program.foreign_includes,
+				) + decls_c,
+				link_flags = [],
+				include_dirs = [],
+			})
 
 
-pure func emit_core_program_c_artifact_with_options(
+pure func emit_core_program_c_artifact_with_profile(
 	program: CoreProgram,
-	options: CoreEmitOptions,
+	profile_enabled: Bool,
 ) -> CArtifact:
-	match try_emit_core_program_c_artifact_with_options(program, options):
+	match try_emit_core_program_c_artifact_with_profile(program, profile_enabled):
 		Ok(artifact):
 			artifact
 		Err(error):
 			error_artifact(error)
 
 
-pure func try_emit_core_program_c_artifact_with_options(
+pure func try_emit_core_program_c_artifact_with_profile(
 	program: CoreProgram,
-	options: CoreEmitOptions,
-) -> Result[CArtifact, UnsupportedGlobalInitializerError]:
-	prepared_program: CorePipeline.PreparedCoreProgram = CorePipeline.run_pre_dce_tail(program)
+	profile_enabled: Bool,
+) -> Result[CArtifact, CoreEmitError]:
+	prepared_program: PreparedCoreProgram = run_pre_dce_tail(program)
 
-	try_emit_prepared_core_program_c_artifact_with_options(prepared_program, options)
+	try_emit_prepared_core_program_c_artifact_with_profile(prepared_program, profile_enabled)
 
 
 pure func emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:
-	emit_core_program_c_artifact_with_options(program, DEFAULT_CORE_EMIT_OPTIONS)
+	emit_core_program_c_artifact_with_profile(program, DEFAULT_PROFILE_ENABLED)

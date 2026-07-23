@@ -122,13 +122,9 @@ record ModuleSurfaceSymbol {
     source: ModuleSurfaceSymbolSource
 }
 
-record ModuleSurfaceImport {
-    module_path: String
-}
-
 record ModuleSurface {
     module_name: String,
-    imports: List[ModuleSurfaceImport],
+    import_paths: List[String],
     exports: List[ModuleSurfaceSymbol],
     private_names: List[ModuleSurfaceSymbol],
     private_traits: List[String]
@@ -203,7 +199,7 @@ Functions in `compiler_module_surface.brp`:
 
 - `module_surface_symbol_kind_name(kind: ModuleSurfaceSymbolKind) -> String`
 - `module_surface_symbol_source_kind(source: ModuleSurfaceSymbolSource) -> String`
-- `module_surface_imports(program: ParsedProgram) -> List[ModuleSurfaceImport]`
+- `module_surface_import_paths(program: ParsedProgram) -> List[String]`
 - `module_surface_private_trait_names(program: ParsedProgram) -> List[String]`
 - `module_surface_symbols_from_decl(
     decl: ParsedDecl,
@@ -267,7 +263,7 @@ Functions in `compiler_module_surface_json.brp`:
 - `module_surface_symbol_kind_to_json(kind: ModuleSurfaceSymbolKind) -> JsonValue`
 - `module_surface_symbol_source_to_json(source: ModuleSurfaceSymbolSource) -> JsonValue`
 - `module_surface_symbol_to_json(symbol: ModuleSurfaceSymbol) -> JsonValue`
-- `module_surface_import_to_json(import: ModuleSurfaceImport) -> JsonValue`
+- Import paths are projected to `{ "module_path": ... }` objects at the JSON boundary.
 - `module_surface_to_json(surface: ModuleSurface) -> JsonValue`
 
 Parser bridge changes:

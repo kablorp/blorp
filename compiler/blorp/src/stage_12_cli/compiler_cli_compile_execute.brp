@@ -2,15 +2,15 @@
 -- Blorp-owned late Core and C emission. Process and artifact effects are added
 -- only after their typed standard-library surfaces land.
 import:
-	../stage_09_core/compiler_core_pipeline: PreparedCoreProgram
+	../stage_09_core/compiler_core_pipeline: PreparedCoreProgram(PreparedCore)
 	../stage_09_core/compiler_semantic_worker_protocol:
 		SemanticMiddleDiagnostic,
 		SemanticMiddleObservation,
 		SemanticMiddleRequest,
 		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed, SemanticMiddleStopped),
 		decode_semantic_middle_response_value,
-		semantic_middle_stage_name,
 		semantic_middle_protocol_error_message,
+		semantic_middle_stage_name,
 	../stage_10_backend/compiler_build_artifact:
 		BuildArtifact,
 		BuildArtifactConfiguration,
@@ -22,8 +22,8 @@ import:
 		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer, BuildUndefinedSanitizer),
 		build_artifact,
 	../stage_10_backend/compiler_core_emit:
-		try_emit_prepared_core_program_c_artifact_with_options,
-		unsupported_global_initializer_error_to_string,
+		core_emit_error_message,
+		try_emit_prepared_core_program_c_artifact_with_profile,
 	compiler_cli_args: CliCompileArgs, CliRunArgs
 	compiler_cli_compile_frontend: compile_frontend_graph
 	compiler_cli_core_observation: CliCoreObservation
@@ -168,9 +168,7 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"unsupported foreign link platform in semantic Core: `${platform}`"
 
 
-private pure func core_observation(
-	observation: SemanticMiddleObservation,
-) -> CliCoreObservation:
+private pure func core_observation(observation: SemanticMiddleObservation) -> CliCoreObservation:
 	{
 		stage_name = semantic_middle_stage_name(observation.stage),
 		rendered = observation.rendered
@@ -183,24 +181,23 @@ private pure func emit_compile_artifact(
 	observations: List[CliCoreObservation],
 	configuration: BuildArtifactConfiguration,
 ) -> CliCompileExecution:
-	match try_emit_prepared_core_program_c_artifact_with_options(
-		prepared_core,
-		{profile = configuration.compatibility.profile},
-	):
-		Ok(emission):
-			match build_artifact(prepared_core.program, emission, configuration):
-				Ok(artifact):
-					CliCompileArtifact(request, artifact, observations)
+	match prepared_core:
+		PreparedCore(program):
+			match try_emit_prepared_core_program_c_artifact_with_profile(
+				prepared_core,
+				configuration.compatibility.profile,
+			):
+				Ok(emission):
+					match build_artifact(program, emission, configuration):
+						Ok(artifact):
+							CliCompileArtifact(request, artifact, observations)
+						Err(error):
+							CliCompileBuildArtifactFailed(
+								request,
+								build_artifact_error_message(error),
+							)
 				Err(error):
-					CliCompileBuildArtifactFailed(
-						request,
-						build_artifact_error_message(error),
-					)
-		Err(error):
-			CliCompileEmitFailed(
-				request,
-				unsupported_global_initializer_error_to_string(error),
-			)
+					CliCompileEmitFailed(request, core_emit_error_message(error))
 
 
 private pure func finish_decoded_compile_execution(
@@ -224,12 +221,7 @@ private pure func finish_decoded_compile_execution(
 						configuration,
 					)
 				CliLateCoreStopped(stage_name, rendered, stopped_observations):
-					CliCompileStopped(
-						request,
-						stage_name,
-						rendered,
-						stopped_observations,
-					)
+					CliCompileStopped(request, stage_name, rendered, stopped_observations)
 		SemanticMiddleStopped(stage, rendered, observations):
 			CliCompileStopped(
 				request,
@@ -290,7 +282,7 @@ pure func prepare_compile_plan(
 			compile_runtime_requirement(plan.options),
 			compile_compatibility(plan.options),
 		),
-		late_stages = stage_requests.late_stages
+		late_stages = stage_requests.late_stages,
 	})
 
 
@@ -307,7 +299,7 @@ pure func prepare_run_plan(
 			BuildExternalRuntime,
 			run_compatibility(plan.options),
 		),
-		late_stages = []
+		late_stages = [],
 	})
 
 
