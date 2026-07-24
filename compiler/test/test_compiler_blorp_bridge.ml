@@ -73,6 +73,11 @@ let with_env name value f =
       | None -> Unix.putenv name "")
     f
 
+let with_current_directory path f =
+  let old = Sys.getcwd () in
+  Unix.chdir path;
+  Fun.protect ~finally:(fun () -> Unix.chdir old) f
+
 let parsed_program_json ?(diagnostics = []) decls =
   Lsp_json.Object
     [
@@ -323,6 +328,17 @@ let test_typecheck_bridge_compile_env_supports_pinned_bootstrap () =
   Alcotest.(check (option string))
     "retired bootstrap parser selector" (Some "ocaml")
     (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
+
+let test_bridge_helper_compile_env_isolates_pinned_workers () =
+  let unset_env =
+    Blorp.Compiler_blorp_bridge.bridge_helper_compile_unset_env
+  in
+  Alcotest.(check bool)
+    "does not override pinned OCaml host" true
+    (List.mem "BLORP_OCAML_HOST_BIN" unset_env);
+  Alcotest.(check bool)
+    "does not override pinned OCaml middle worker" true
+    (List.mem "BLORP_OCAML_MIDDLE_BIN" unset_env)
 
 let test_parse_source_request_uses_bridge_envelope () =
   let request =
@@ -1909,6 +1925,63 @@ let test_prepared_bridge_binary_env_rejects_missing_file () =
           Alcotest.fail ("unexpected prepared bridge path: " ^ path)
       | None -> Alcotest.fail "expected prepared bridge env to be checked")
 
+let test_prepared_bridge_binary_finds_sibling_helper () =
+  with_temp_dir (fun root ->
+      let path_dir = Filename.concat root "path-bin" in
+      let work_dir = Filename.concat root "work" in
+      mkdir path_dir;
+      mkdir work_dir;
+      let host = Filename.concat path_dir "blorp-ocaml-host" in
+      let helper = Filename.concat path_dir "blorp-compiler-renderer" in
+      let cwd_helper = Filename.concat work_dir "blorp-compiler-renderer" in
+      write_file host "#!/usr/bin/env bash\n";
+      write_file helper "#!/usr/bin/env bash\n";
+      write_file cwd_helper "#!/usr/bin/env bash\n";
+      Unix.chmod host 0o700;
+      Unix.chmod helper 0o700;
+      Unix.chmod cwd_helper 0o700;
+      with_env "PATH" path_dir (fun () ->
+          with_current_directory work_dir (fun () ->
+              match
+                Bridge.prepared_bridge_binary_from_env
+                  ~current_executable:"blorp-ocaml-host"
+                  Bridge.prepared_renderer_bridge_bin_env
+              with
+              | Some (Ok path) ->
+                  Alcotest.(check string) "PATH-resolved sibling" helper path
+              | Some (Error message) -> Alcotest.fail message
+              | None ->
+                  Alcotest.fail "expected sibling prepared bridge to be used")))
+
+let test_prepared_bridge_binary_does_not_mix_path_installations () =
+  with_temp_dir (fun root ->
+      let first_dir = Filename.concat root "first-bin" in
+      let second_dir = Filename.concat root "second-bin" in
+      mkdir first_dir;
+      mkdir second_dir;
+      let first_host = Filename.concat first_dir "blorp-ocaml-host" in
+      let second_host = Filename.concat second_dir "blorp-ocaml-host" in
+      let second_helper =
+        Filename.concat second_dir "blorp-compiler-renderer"
+      in
+      write_file first_host "#!/usr/bin/env bash\n";
+      write_file second_host "#!/usr/bin/env bash\n";
+      write_file second_helper "#!/usr/bin/env bash\n";
+      Unix.chmod first_host 0o700;
+      Unix.chmod second_host 0o700;
+      Unix.chmod second_helper 0o700;
+      with_env "PATH" (first_dir ^ ":" ^ second_dir) (fun () ->
+          match
+            Bridge.prepared_bridge_binary_from_env
+              ~current_executable:"blorp-ocaml-host"
+              Bridge.prepared_renderer_bridge_bin_env
+          with
+          | None -> ()
+          | Some (Ok path) ->
+              Alcotest.fail
+                ("must not use a helper from another installation: " ^ path)
+          | Some (Error message) -> Alcotest.fail message))
+
 let test_renderer_bridge_binary_prefers_prepared_env () =
   with_temp_dir (fun root ->
       let bin = Filename.concat root "prepared-renderer.bin" in
@@ -2033,6 +2106,8 @@ let suite =
           test_parser_bridge_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "typecheck helper env supports pinned bootstrap"
           `Quick test_typecheck_bridge_compile_env_supports_pinned_bootstrap;
+        Alcotest.test_case "helper env isolates pinned workers" `Quick
+          test_bridge_helper_compile_env_isolates_pinned_workers;
         Alcotest.test_case "parse_source request uses bridge envelope" `Quick
           test_parse_source_request_uses_bridge_envelope;
         Alcotest.test_case "parse_source file request omits source text" `Quick
@@ -2142,6 +2217,10 @@ let suite =
           test_prepared_bridge_binary_env_accepts_existing_file;
         Alcotest.test_case "prepared env rejects missing helper" `Quick
           test_prepared_bridge_binary_env_rejects_missing_file;
+        Alcotest.test_case "prepared bridge finds sibling helper" `Quick
+          test_prepared_bridge_binary_finds_sibling_helper;
+        Alcotest.test_case "prepared bridge does not mix PATH installations"
+          `Quick test_prepared_bridge_binary_does_not_mix_path_installations;
         Alcotest.test_case "renderer helper prefers prepared env" `Quick
           test_renderer_bridge_binary_prefers_prepared_env;
         Alcotest.test_case "renderer helper requires prepared env" `Quick

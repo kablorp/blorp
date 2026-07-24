@@ -2024,6 +2024,15 @@ let exec_program prog args envp =
 
 let compiler_bridge_bin_env = "BLORP_COMPILER_BRIDGE_BIN"
 let compiler_bootstrap_script_name = "scripts/blorp-compiler-bootstrap"
+let bridge_helper_compile_unset_env =
+  [
+    compiler_bridge_bin_env;
+    prepared_renderer_bridge_bin_env;
+    prepared_parser_bridge_bin_env;
+    prepared_typecheck_bridge_bin_env;
+    "BLORP_OCAML_HOST_BIN";
+    "BLORP_OCAML_MIDDLE_BIN";
+  ]
 
 type bridge_helper_compiler_source =
   | PinnedBootstrapScript
@@ -2694,13 +2703,7 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
       let compile_code, compile_output, compile_stderr =
         run_process_capture program
           ~env:compile_env
-          ~unset_env:
-            [
-              compiler_bridge_bin_env;
-              prepared_renderer_bridge_bin_env;
-              prepared_parser_bridge_bin_env;
-              prepared_typecheck_bridge_bin_env;
-            ]
+          ~unset_env:bridge_helper_compile_unset_env
           [ "compile"; "--no-format"; "-o"; c_path; source_path ]
       in
       if compile_code <> 0 then
@@ -2840,7 +2843,39 @@ let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
           Ok binary
       | Error _ as error -> error)
 
-let prepared_bridge_binary_from_env env_name =
+let prepared_bridge_sibling_name env_name =
+  if String.equal env_name prepared_renderer_bridge_bin_env then
+    Some "blorp-compiler-renderer"
+  else if String.equal env_name prepared_parser_bridge_bin_env then
+    Some "blorp-compiler-parser"
+  else if String.equal env_name prepared_typecheck_bridge_bin_env then
+    Some "blorp-compiler-typecheck"
+  else None
+
+let executable_candidate_can_run path =
+  try
+    if Sys.is_directory path then false
+    else (
+      Unix.access path [ Unix.X_OK ];
+      true)
+  with Sys_error _ | Unix.Unix_error _ -> false
+
+let prepared_bridge_sibling_candidates ~current_executable env_name =
+  match prepared_bridge_sibling_name env_name with
+  | None -> []
+  | Some name -> (
+      let resolved_current =
+        if String.contains current_executable '/' then Some current_executable
+        else
+          executable_candidates current_executable
+          |> List.find_opt executable_candidate_can_run
+      in
+      match resolved_current with
+      | Some current -> [ Filename.concat (Filename.dirname current) name ]
+      | None -> [])
+
+let prepared_bridge_binary_from_env
+    ?(current_executable = Sys.executable_name) env_name =
   match Sys.getenv_opt env_name with
   | Some path when path <> "" ->
       if Sys.file_exists path && not (Sys.is_directory path) then Some (Ok path)
@@ -2850,7 +2885,11 @@ let prepared_bridge_binary_from_env env_name =
              (Printf.sprintf
                 "%s points to missing Blorp bridge helper binary: %s" env_name
                 path))
-  | _ -> None
+  | _ ->
+      prepared_bridge_sibling_candidates ~current_executable env_name
+      |> List.find_opt (fun path ->
+             Sys.file_exists path && not (Sys.is_directory path))
+      |> Option.map (fun path -> Ok path)
 
 let prepared_bridge_required () =
   match Sys.getenv_opt require_prepared_bridge_env with Some "1" -> true | _ -> false

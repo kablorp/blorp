@@ -164,6 +164,7 @@ hygiene-check:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
+	@tests/test_release_toolchain.sh
 	@tests/test_scripts_test_harness.sh
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \

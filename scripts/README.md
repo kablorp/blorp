@@ -183,6 +183,9 @@ which reads the immutable release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
+`BLORP_BOOTSTRAP_LAYOUT=single` is reserved for the current legacy pin; every
+new pin must use `toolchain` so the cached public command has all private
+workers and prepared bridges beside it.
 
 Both helper builds call the normal `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
@@ -257,18 +260,30 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` packages `./blorp` into a release archive plus
+`scripts/package-release` packages the public `./blorp` command and its private
+OCaml workers and prepared compiler bridges into a release archive plus a
 `.sha256` file:
 
 ```bash
 scripts/package-release dist
 ```
 
+When prepared bridge paths are not supplied, the helper asks `./blorp` to
+prepare them before creating the archive.
+
 Useful environment variables:
 
 - `BLORP_RELEASE_BINARY` selects the binary to package.
+- `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
+- `BLORP_RELEASE_OCAML_MIDDLE` selects the private semantic worker to package.
+- `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.
+- `BLORP_RELEASE_PARSER_BRIDGE` selects the prepared parser bridge.
+- `BLORP_RELEASE_TYPECHECK_BRIDGE` selects the prepared typecheck bridge.
 - `BLORP_RELEASE_VERSION` overrides the version in the asset name.
 - `BLORP_RELEASE_TARGET` overrides the target triple in the asset name.
+
+The three prepared bridge overrides must be supplied together so one archive
+cannot mix helpers from different compiler generations.
 
 `scripts/install-dev` installs the latest moving `dev` release:
 
@@ -277,7 +292,9 @@ curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-
 ```
 
 It downloads the matching `blorp-dev-<target>.tar.gz`, verifies the `.sha256`,
-and installs one binary to `$HOME/.local/bin/blorp` by default.
+and installs the public command plus its private workers and bridges in
+`$HOME/.local/bin` by default. `blorp` remains the only public command.
+Incomplete archives are rejected before installation.
 
 Useful options/environment:
 
@@ -290,5 +307,11 @@ BLORP_INSTALL_DIR="$HOME/bin" scripts/install-dev
 Remove the dev binary with:
 
 ```bash
-rm -f "$HOME/.local/bin/blorp"
+rm -f \
+  "$HOME/.local/bin/blorp" \
+  "$HOME/.local/bin/blorp-ocaml-host" \
+  "$HOME/.local/bin/blorp-ocaml-middle" \
+  "$HOME/.local/bin/blorp-compiler-renderer" \
+  "$HOME/.local/bin/blorp-compiler-parser" \
+  "$HOME/.local/bin/blorp-compiler-typecheck"
 ```
