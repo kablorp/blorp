@@ -149,15 +149,30 @@ do
 	fi
 done
 
+ci_workflow=.github/workflows/ci.yml
+if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
+	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
+then
+	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
+	exit 1
+fi
+
+premerge_workflow=.github/workflows/premerge.yml
+if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
+	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
+	exit 1
+fi
+
 release_workflow=.github/workflows/release.yml
 if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow"
 then
-	echo "FAIL: release CI must exercise both private workers from the archive" >&2
+	echo "FAIL: release CI must exercise self-hosting and both private workers from the archive" >&2
 	exit 1
 fi
 

@@ -208,7 +208,7 @@ c-static-analysis:
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c
 
 security-check: all c-static-analysis
-	BLORP_COMPILER_TEST_TIMEOUT=60 scripts/test compiler compiler-deep
+	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler compiler-deep
 	./blorp test --no-cache --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	./blorp test --no-cache --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 

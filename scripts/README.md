@@ -64,7 +64,7 @@ Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
-  grouped compiler-owned Blorp suites default to 60 seconds; individual
+  grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
 - `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
   timeout (default 180 seconds, reflecting measured ASan overhead).

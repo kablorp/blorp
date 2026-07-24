@@ -265,7 +265,7 @@ if [ "$compiler_blorp_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_compiler_blorp_timeout=60
+expected_compiler_blorp_timeout=180
 expected_blorp_command="test --no-format --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"

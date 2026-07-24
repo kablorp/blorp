@@ -1940,18 +1940,20 @@ let test_prepared_bridge_binary_finds_sibling_helper () =
       Unix.chmod host 0o700;
       Unix.chmod helper 0o700;
       Unix.chmod cwd_helper 0o700;
-      with_env "PATH" path_dir (fun () ->
-          with_current_directory work_dir (fun () ->
-              match
-                Bridge.prepared_bridge_binary_from_env
-                  ~current_executable:"blorp-ocaml-host"
-                  Bridge.prepared_renderer_bridge_bin_env
-              with
-              | Some (Ok path) ->
-                  Alcotest.(check string) "PATH-resolved sibling" helper path
-              | Some (Error message) -> Alcotest.fail message
-              | None ->
-                  Alcotest.fail "expected sibling prepared bridge to be used")))
+      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
+          with_env "PATH" path_dir (fun () ->
+              with_current_directory work_dir (fun () ->
+                  match
+                    Bridge.prepared_bridge_binary_from_env
+                      ~current_executable:"blorp-ocaml-host"
+                      Bridge.prepared_renderer_bridge_bin_env
+                  with
+                  | Some (Ok path) ->
+                      Alcotest.(check string) "PATH-resolved sibling" helper path
+                  | Some (Error message) -> Alcotest.fail message
+                  | None ->
+                      Alcotest.fail
+                        "expected sibling prepared bridge to be used"))))
 
 let test_prepared_bridge_binary_does_not_mix_path_installations () =
   with_temp_dir (fun root ->
@@ -1970,17 +1972,18 @@ let test_prepared_bridge_binary_does_not_mix_path_installations () =
       Unix.chmod first_host 0o700;
       Unix.chmod second_host 0o700;
       Unix.chmod second_helper 0o700;
-      with_env "PATH" (first_dir ^ ":" ^ second_dir) (fun () ->
-          match
-            Bridge.prepared_bridge_binary_from_env
-              ~current_executable:"blorp-ocaml-host"
-              Bridge.prepared_renderer_bridge_bin_env
-          with
-          | None -> ()
-          | Some (Ok path) ->
-              Alcotest.fail
-                ("must not use a helper from another installation: " ^ path)
-          | Some (Error message) -> Alcotest.fail message))
+      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
+          with_env "PATH" (first_dir ^ ":" ^ second_dir) (fun () ->
+              match
+                Bridge.prepared_bridge_binary_from_env
+                  ~current_executable:"blorp-ocaml-host"
+                  Bridge.prepared_renderer_bridge_bin_env
+              with
+              | None -> ()
+              | Some (Ok path) ->
+                  Alcotest.fail
+                    ("must not use a helper from another installation: " ^ path)
+              | Some (Error message) -> Alcotest.fail message)))
 
 let test_renderer_bridge_binary_prefers_prepared_env () =
   with_temp_dir (fun root ->
