@@ -1,14 +1,17 @@
 import:
-	../src/stage_08_core_lower/compiler_core_flatten: prefix_module_callable_names
+	../src/stage_08_core_lower/compiler_core_flatten: prefix_module_names
 	../src/stage_09_core/compiler_core_json:
+		CoreBinaryOp(AddOp),
 		CoreCallKind(SelectedDirectCall),
-		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
-		CoreExpr(CallExpr, ClosureCreateExpr, LiteralExpr, VarExpr),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl, ValueRecordDecl),
+		CoreExpr(BinaryExpr, CallExpr, ClosureCreateExpr, LiteralExpr, VarExpr),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
+		CoreGlobal,
 		CoreImplDecl,
 		CoreLiteral(IntLiteral),
+		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType),
@@ -18,6 +21,18 @@ import:
 
 pure func int_type() -> CoreType:
 	NamedType("Int", [])
+
+
+pure func directory_entry_kind_type() -> CoreType:
+	NamedType("DirectoryEntryKind", [])
+
+
+pure func is_flattened_directory_entry_kind_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "std_fs__DirectoryEntryKind" and args.length() == 0
+		_:
+			False
 
 
 pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
@@ -165,6 +180,14 @@ pure func is_unqualified_local_target(body: Option[CoreExpr]) -> Bool:
 		.get_or(False)
 
 
+pure func is_local_parameter_sum(body: Option[CoreExpr]) -> Bool:
+	match body:
+		Some(BinaryExpr(AddOp, left, right, _, _)):
+			var_expr_name(left) == Some("answer") and var_expr_name(right) == Some("answer")
+		_:
+			False
+
+
 pure func has_flattened_closure_target_expr(expr: CoreExpr) -> Bool:
 	match expr:
 		ClosureCreateExpr(closure, _, _):
@@ -193,7 +216,7 @@ pure func impl_method_is_preserved(impl_decl: CoreImplDecl) -> Bool:
 
 
 func test_prefixes_declarations_and_selected_references() -> Bool:
-	flattened = prefix_module_callable_names("std/example", program([
+	flattened = prefix_module_names("std/example", program([
 			function_decl("run", 1, True, UserFunction, Some(selected_call("work", 2))),
 			function_decl("work", 2, True, UserFunction, Some(int_literal(42))),
 		]))
@@ -219,7 +242,7 @@ func test_prefixes_declarations_and_selected_references() -> Bool:
 
 
 func test_disambiguates_pure_overload_and_reference() -> Bool:
-	flattened = prefix_module_callable_names("std/list", program([
+	flattened = prefix_module_names("std/list", program([
 			function_decl("map", 10, False, UserFunction, Some(int_literal(1))),
 			function_decl("map", 11, True, UserFunction, Some(int_literal(2))),
 			function_decl("use_map", 12, True, UserFunction, Some(selected_call("map", 11))),
@@ -239,7 +262,7 @@ func test_disambiguates_pure_overload_and_reference() -> Bool:
 
 
 func test_preserves_non_user_and_ufcs_names() -> Bool:
-	flattened = prefix_module_callable_names(
+	flattened = prefix_module_names(
 		"std/example",
 		program([
 			function_decl("runtime_builtin", 20, True, UnresolvedBuiltinFunction, None),
@@ -272,7 +295,7 @@ func test_preserves_local_shadow_without_callable_id() -> Bool:
 		int_type(),
 		SyntheticSourceLoc,
 	)
-	flattened = prefix_module_callable_names("tests/example", program([
+	flattened = prefix_module_names("tests/example", program([
 			function_decl("target", 30, True, UserFunction, Some(int_literal(1))),
 			function_decl("read_local", 31, True, UserFunction, Some(local_value)),
 		]))
@@ -291,7 +314,7 @@ func test_rewrites_closure_references_and_preserves_impl_method_names() -> Bool:
 		Some(selected_call("target", 40)),
 	)
 
-	flattened = prefix_module_callable_names(
+	flattened = prefix_module_names(
 		"std/example",
 		program([
 			function_decl("target", 40, True, UserFunction, Some(int_literal(1))),
@@ -324,7 +347,7 @@ func test_rewrites_closure_references_and_preserves_impl_method_names() -> Bool:
 
 
 func test_prefers_bodied_overload_to_forward_declaration() -> Bool:
-	flattened = prefix_module_callable_names("std/option", program([
+	flattened = prefix_module_names("std/option", program([
 			function_decl("map", 50, False, UserFunction, None),
 			function_decl("map", 51, True, UserFunction, Some(int_literal(1))),
 			function_decl("use_map", 52, True, UserFunction, Some(selected_call("map", 50))),
@@ -343,7 +366,7 @@ func test_prefers_bodied_overload_to_forward_declaration() -> Bool:
 
 
 func test_preserves_trait_signatures() -> Bool:
-	flattened = prefix_module_callable_names("std/example", program([TraitDecl({
+	flattened = prefix_module_names("std/example", program([TraitDecl({
 				name = "Example",
 				type_params = ["T"],
 				supertraits = ["Equatable"],
@@ -357,6 +380,197 @@ func test_preserves_trait_signatures() -> Bool:
 				trait_info.name == "Example"
 				and trait_info.type_params == ["T"]
 				and trait_info.supertraits == ["Equatable"]
+			)
+		_:
+			False
+
+
+func test_prefixes_global_declaration_and_unshadowed_references() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(60)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 60,
+		loc = SyntheticSourceLoc
+	}
+	reader = core_function(
+		"read_answer",
+		61,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("answer", None), int_type(), SyntheticSourceLoc)),
+	)
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(lowered_global), FunctionDecl(lowered_reader)]:
+			(
+				lowered_global.name.name == "pkg_value__answer"
+				and lowered_reader.body.and_then(var_expr_name) == Some("pkg_value__answer")
+			)
+		_:
+			False
+
+
+func test_preserves_parameter_shadowing_module_global() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(62)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 62,
+		loc = SyntheticSourceLoc
+	}
+	param: CoreParam = {
+		name = core_var("answer", None),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	reader: CoreFunction = { core_function(
+		"read_answer",
+		63,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("answer", None), int_type(), SyntheticSourceLoc)),
+	) |
+		params = [param]
+	}
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(_), FunctionDecl(lowered_reader)]:
+			lowered_reader.body.and_then(var_expr_name) == Some("answer")
+		_:
+			False
+
+
+func test_reuses_parameter_scope_across_sibling_expressions() -> Bool:
+	param: CoreParam = {
+		name = core_var("answer", None),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	body = BinaryExpr(
+		AddOp,
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	reader: CoreFunction = { core_function("sum_answer", 64, True, UserFunction, Some(body)) |
+		params = [param]
+	}
+	flattened = prefix_module_names("pkg/value", program([FunctionDecl(reader)]))
+
+	function_at(flattened, 0)
+		.map(func(lowered_reader): is_local_parameter_sum(lowered_reader.body))
+		.get_or(False)
+
+
+func test_prefixes_module_type_declarations_but_preserves_std_abi_types() -> Bool:
+	user = prefix_module_names("pkg/value", program([ValueRecordDecl({
+				name = "Value",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})]))
+	stdlib = prefix_module_names("std/file", program([ValueRecordDecl({
+				name = "FileReader",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})]))
+
+	match (user.decls, stdlib.decls):
+		([ValueRecordDecl(user_record)], [ValueRecordDecl(std_record)]):
+			user_record.name == "pkg_value__Value" and std_record.name == "FileReader"
+		_:
+			False
+
+
+func test_rewrites_module_local_type_references_with_declaration() -> Bool:
+	entry_kind_type: CoreType = directory_entry_kind_type()
+	param: CoreParam = {
+		name = core_var("kind", None),
+		typ = entry_kind_type,
+		loc = SyntheticSourceLoc
+	}
+	identity: CoreFunction = { core_function(
+		"identity",
+		70,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("kind", None), entry_kind_type, SyntheticSourceLoc)),
+	) |
+		params = [param],
+		return_type = entry_kind_type
+	}
+	flattened = prefix_module_names(
+		"std/fs",
+		program([
+			EnumDecl({
+				name = "DirectoryEntryKind",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}),
+			ValueRecordDecl({
+				name = "DirectoryEntry",
+				type_params = [],
+				fields = [
+					{
+						name = "kind",
+						typ = entry_kind_type
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl(identity),
+		]),
+	)
+
+	match flattened.decls:
+		[EnumDecl(enum_decl), ValueRecordDecl(record_decl), FunctionDecl(function_info)]:
+			body_type_matches: Bool = match function_info.body:
+				Some(VarExpr(_, typ, _)):
+					is_flattened_directory_entry_kind_type(typ)
+				_:
+					False
+
+			(
+				enum_decl.name == "std_fs__DirectoryEntryKind"
+				and record_decl.name == "DirectoryEntry"
+				and record_decl.fields
+					.get(0)
+					.map(func(field): is_flattened_directory_entry_kind_type(field.typ))
+					.get_or(False)
+				and function_info.params
+					.get(0)
+					.map(func(item): is_flattened_directory_entry_kind_type(item.typ))
+					.get_or(False)
+				and is_flattened_directory_entry_kind_type(function_info.return_type)
+				and body_type_matches
 			)
 		_:
 			False
@@ -387,5 +601,25 @@ tests: TestSuite = {
 			test_prefers_bodied_overload_to_forward_declaration,
 		),
 		("preserves trait signatures", test_preserves_trait_signatures),
+		(
+			"prefixes global declaration and unshadowed references",
+			test_prefixes_global_declaration_and_unshadowed_references,
+		),
+		(
+			"preserves parameter shadowing module global",
+			test_preserves_parameter_shadowing_module_global,
+		),
+		(
+			"reuses parameter scope across sibling expressions",
+			test_reuses_parameter_scope_across_sibling_expressions,
+		),
+		(
+			"prefixes module type declarations but preserves std ABI types",
+			test_prefixes_module_type_declarations_but_preserves_std_abi_types,
+		),
+		(
+			"rewrites module-local type references with declaration",
+			test_rewrites_module_local_type_references_with_declaration,
+		),
 	]
 }

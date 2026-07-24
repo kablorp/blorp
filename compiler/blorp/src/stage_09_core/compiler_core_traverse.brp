@@ -41,6 +41,7 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
 			DictExpr,
@@ -76,6 +77,7 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
 			RangeExpr,
+			RawMatchExpr,
 			RecordConstructExpr,
 			RecordExpr,
 			ResourceCleanupExitExpr,
@@ -117,7 +119,18 @@ import:
 			LiteralMatchFallbackFail,
 		),
 		CoreMatchBinding,
+		CorePattern(
+			ConstructorPattern,
+			ListPattern,
+			LiteralPattern,
+			NamePattern,
+			OrPattern,
+			QualifiedConstructorPattern,
+			TuplePattern,
+			WildcardPattern,
+		),
 		CorePreClosureConcurrentBinding,
+		CoreRawMatchCase,
 		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -132,6 +145,28 @@ import:
 			TupleStructElement,
 			TupleVoidElement,
 		),
+
+
+pure func core_pattern_bound_names(pattern: CorePattern) -> List[String]:
+	match pattern:
+		NamePattern(name):
+			[name]
+		ConstructorPattern(_, args) | QualifiedConstructorPattern(_, _, args):
+			args.flat_map(core_pattern_bound_names)
+		TuplePattern(items) | OrPattern(items):
+			items.flat_map(core_pattern_bound_names)
+		ListPattern(items, spread):
+			spread_names: List[String] = match spread:
+				Some(spread_pattern):
+					core_pattern_bound_names(spread_pattern)
+				None:
+					[]
+
+			items
+				.flat_map(core_pattern_bound_names)
+				.concat(spread_names)
+		WildcardPattern | LiteralPattern(_):
+			[]
 
 
 private record CoreExprMapContext[C] {
@@ -154,6 +189,16 @@ private pure func map_context_exprs[C](
 		mapped = mapped.append(map_context_expr(context, item))
 
 	mapped
+
+
+private pure func map_context_raw_match_cases[C](
+	cases: List[CoreRawMatchCase],
+	context: CoreExprMapContext[C],
+) -> List[CoreRawMatchCase]:
+	cases.map(func(match_case): {
+			pattern = match_case.pattern,
+			body = map_context_expr(context, match_case.body)
+		})
 
 
 private pure func map_context_optional_expr[C](
@@ -1037,6 +1082,12 @@ private pure func map_core_expr_children_with_map_context[C](
 			expr
 		VoidExpr(typ, loc):
 			expr
+		DebugBlockExpr(body, typ, loc):
+			DebugBlockExpr(
+				map_context_expr(context, body),
+				typ,
+				loc,
+			)
 		CooperativeCheckpointExpr(typ, loc):
 			expr
 		CallExpr(kind, callee, args, typ, loc):
@@ -1586,6 +1637,13 @@ private pure func map_core_expr_children_with_map_context[C](
 				typ,
 				loc,
 			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				map_context_expr(context, scrutinee),
+				map_context_raw_match_cases(cases, context),
+				typ,
+				loc,
+			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				map_context_expr(context, scrutinee),
@@ -1849,6 +1907,8 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 			[]
 		VoidExpr(_, _):
 			[]
+		DebugBlockExpr(body, _, _):
+			[body]
 		CooperativeCheckpointExpr(_, _):
 			[]
 		CallExpr(_, callee, args, _, _):
@@ -2005,6 +2065,8 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 			select_expr.arms.flat_map(func(arm): select_arm_kind_items(arm.kind) + [arm.body])
 		RangeExpr(start, end_value, _, _):
 			[start, end_value]
+		RawMatchExpr(scrutinee, cases, _, _):
+			[scrutinee] + cases.map(func(match_case): match_case.body)
 		LiteralMatchExpr(scrutinee, cases, fallback, _, _):
 			[
 				scrutinee,

@@ -93,7 +93,7 @@ let test_default_managed_arg_rejected_before_codegen () =
   let func = foreign_func "take_message" [ param "m" (ty "Message" []) ] in
   let prog = [ decl (CDType union); decl (CDFunc func) ] in
   let reg = Blorp.Codegen_types.create_registry () in
-  Blorp.Core_flatten.register_types reg prog;
+  Blorp.Core_registry.register_types reg prog;
   try
     let _ = Blorp.Core_ffi_boundary.annotate_program ~reg prog in
     Alcotest.fail "expected managed default FFI arg to be rejected"

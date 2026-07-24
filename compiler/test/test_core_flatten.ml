@@ -490,7 +490,7 @@ let test_import_tables_build_from_explicit_bindings () =
     ]
   in
   let main_table, module_tables =
-    Core_flatten.build_import_tables_from_bindings
+    Core_imports.tables_of_bindings
       ~main_import_bindings:main_imports module_bindings
   in
   Alcotest.(check (option (pair string string)))

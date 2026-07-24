@@ -20,11 +20,12 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 
 ```text
 Blorp executable / CLI planning / source graph discovery / source reads / parse
-  -> Blorp typecheck / CTFE / typed semantic-middle request
+  -> Blorp typecheck / CTFE
+  -> Blorp Core lowering / module flattening / FFI boundary / initial list layout
+  -> strict prepared-Core semantic-middle request
   -> one blorp-ocaml-middle process
-  -> decoded Blorp typed AST with CTFE evaluated -> OCaml Core lowering
-  -> OCaml early/middle Core pipeline and the remaining registry/layout-dependent
-     specialization
+  -> OCaml early/middle Core pipeline and the remaining registry-dependent
+     transforms
   -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
      tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
      reduction, and bounds-proven tensor-access builtins preserved
@@ -70,6 +71,16 @@ Primary typed-frontend and CTFE Blorp files used by normal source commands:
 - `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_ir.brp`
 - `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_materialize.brp`
 
+Current production Core-boundary Blorp files:
+
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_identity.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_flatten.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_graph_prepare.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_ffi_boundary.brp`
+- `compiler/blorp/src/stage_08_core_lower/compiler_core_list_layout.brp`
+- `compiler/blorp/src/stage_09_core/compiler_semantic_worker_protocol.brp`
+
 Current production backend-tail Blorp files:
 
 - `compiler/blorp/src/stage_09_core/compiler_core_json.brp`
@@ -91,17 +102,15 @@ Current OCaml bridge, orchestration, and production-middle files:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/pipeline.ml`
-- `compiler/lib/typed_ast.ml`
-- `compiler/lib/core_lower.ml`
+- `compiler/lib/core_pre_middle_json.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
-`compiler/lib/core_pipeline.ml` still invokes the OCaml implementations of
-Core lowering and the early/middle Core passes, including the remaining
-registry/layout-dependent specialization families. The production JSON handoff
-preserves concrete conversion, hash, length, numeric checked tensor-access,
+`compiler/lib/core_pipeline.ml` still invokes the OCaml early/middle Core
+passes after the strict prepared-Core decoder. It does not lower typed AST on
+the normal production source path. The production JSON handoff preserves
+concrete conversion, hash, length, numeric checked tensor-access,
 raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
 bounds-proven tensor-access builtins for Blorp specialization. Blorp is
 authoritative for primitive specialization, length folding, numeric checked
@@ -118,6 +127,12 @@ no OCaml call. Ordinary `compile` and `run` call only the private
 `blorp-ocaml-middle` semantic worker; source-command effects stay in Blorp.
 `compiler/bin/blorp_ocaml_host.ml` remains only for non-source commands and the
 explicit pinned-bootstrap compile wrapper.
+
+The OCaml typed-AST lowering and flattening modules remain compatibility code
+for the pinned-bootstrap wrapper and direct in-memory OCaml compiler tests.
+They are not the normal `compile`/`run` producer. Delete them only after those
+callers are converted to prepared Core; checkpoint 8 does not move the
+bootstrap trust root.
 
 ## Migration Rules
 
@@ -1409,9 +1424,9 @@ Implementation steps:
   - std compile-time helpers,
   - pattern matching,
   - value materialization back into typed AST.
-- Introduce a typed-program JSON artifact only for the temporary handoff from
-  Blorp typecheck to OCaml Core lowering. Delete it when Core lowering moves to
-  Blorp.
+- Keep typed-program JSON only for explicit typed-AST diagnostics, fixtures,
+  and bootstrap compatibility. It is no longer the production compile/run
+  handoff.
 
 Current status:
 
@@ -1835,11 +1850,16 @@ Deletion point:
 
 Goal: move the boundary from typed AST to lowered Core.
 
-Status: implementation parity is in progress, but the production boundary has
-not moved. Normal source commands still decode the Blorp typed artifact into
-OCaml `Typed_ast` and call `Core_lower.lower_typed_program` through
-`Core_pipeline.compile_typed_with_modules`. The Blorp lowerer is currently a
-directly tested implementation, not the production Core producer.
+Status: complete for normal production source commands. Blorp now lowers the
+typed target and every typed dependency module, flattens module-owned Core
+identities, applies the checked FFI boundary and initial list layout, and sends
+one strict prepared-Core request to the OCaml semantic-middle worker. The
+worker rejects late ownership/backend nodes and begins at the early/middle Core
+pipeline; it no longer reconstructs typed AST or invokes OCaml Core lowering.
+
+The pinned-bootstrap compile wrapper and direct in-memory OCaml compiler tests
+still use `Core_lower`/`Core_flatten` as compatibility scaffolding. This is a
+separate trust-root path, not a fallback from normal `compile` or `run`.
 
 OCaml references:
 
@@ -1883,9 +1903,11 @@ Blorp references:
   - `lower_typed_decl`
   - `lower_typed_program`
 - `compiler_core_flatten.brp`
-- future `compiler_core_ffi_boundary.brp`
+- `compiler_core_graph_prepare.brp`
+- `compiler_core_ffi_boundary.brp`
 - `compiler_core_list_layout.brp`
-- existing `compiler_core_json.brp`
+- `compiler_core_json.brp`
+- `compiler_semantic_worker_protocol.brp`
 
 Implementation steps:
 
@@ -1909,19 +1931,29 @@ Implementation steps:
 
 Current progress:
 
-- `compiler_core_lower.brp` owns the first lowering slice for source
-  locations, Core type conversion, expression value-type lowering after
-  widening, function values as `Closure`, stable Core vars, scalar literal/name
-  expressions, resolved local/trait/intrinsic/closure call expressions,
-  resolved builtin direct-call expressions, unary/binary/logical expressions,
-  tuple/list/vector/dict expressions, `if`, `while`, lambdas, blocks with local
-  `LetExpr` bindings, tuple destructuring block items, ascriptions and opaque
-  wrappers, assignment, record field access, tuple field access, ranges, record
-  literals, and `detach`, no-parameter `concurrent:` blocks, simple
-  literal/wildcard matches, simple `select:` expressions,
-  simple named-binder
-  range/List/String/Set `for` loops, and function/global/record/enum/union
-  declarations with explicit lowering context state for Core def ids.
+- `compiler_core_graph_prepare.brp` is the authoritative checkpoint boundary.
+  It lowers modules in graph order with one monotonic definition-id range,
+  flattens each module before assembly, keeps the target unprefixed, preserves
+  ordered foreign includes, and runs FFI and list-layout annotation exactly
+  once before serialization.
+- `compiler_semantic_worker_protocol.brp` schema 2 carries prepared Core,
+  import tables, the next definition id, stage observations, and invariant
+  policy. `core_pre_middle_json.ml` is a strict phase-specific decoder rather
+  than a permissive reuse of the late backend projection.
+- Production lowering covers the finalized typed expression and declaration
+  surface, including raw patterns for the middle match compiler, record
+  updates, resource scopes and resource-source loops, tensor iteration,
+  multidimensional enumerate, windows, concurrency, imports, globals, traits,
+  impls, aliases, records, unions, and foreign declarations. Source-only or
+  malformed typed nodes fail at the boundary instead of falling back to OCaml.
+- The normal CLI path is contiguous Blorp from source reads through prepared
+  Core. The only OCaml call is the single semantic-middle worker, after this
+  checkpoint boundary.
+
+- `compiler_core_lower.brp` owns typed expression/declaration lowering with
+  explicit context state for Core definition ids and source-module ownership.
+  It preserves semantic call identity, produces early Core sugar only where a
+  named middle pass owns its elimination, and rejects source-only typed nodes.
 - Function-body classification is now shared at the parsed-AST boundary rather
   than being inferred independently by typecheck and Core lowering. Blorp Core
   lowering preserves legal forward declarations as bodyless user functions,
@@ -1930,11 +1962,10 @@ Current progress:
   helper bodies as parameter-forwarding `BuiltinCall` expressions. It rejects
   inconsistent typed payloads, such as a forward or builtin declaration that
   unexpectedly carries a typed source body. Concrete intrinsic-body synthesis
-  and the post-monomorphization `Core_synth` retry are still required before the
-  production lowering boundary can move across std modules.
+  remains in the semantic middle, after this lowering boundary.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
-  dropping declarations or falling back implicitly. This keeps the next
-  production boundary strict while expression coverage expands. Calls now
+  dropping declarations or falling back implicitly. This keeps the production
+  boundary strict. Calls
   preserve the same phase distinction as OCaml lowering: local callable ids
   become `SelectedDirectCall`, while imported, constructor, impl-method,
   foreign, builtin, intrinsic, closure, and unresolved targets remain
@@ -1964,23 +1995,23 @@ Current progress:
   forward declarations converge on the bodied callable's qualified name and
   body-preference deduplication removes the declaration-only duplicate, which
   preserves the std pure/impure forward-declaration pattern.
-- This is deliberately not presented as the complete flattening port. Global
-  declarations, module-owned and imported types, canonical type names, import
-  tables, non-callable duplicate declaration handling, and registry population
-  still belong to later checkpoint 8 slices. Keeping those responsibilities
-  explicit avoids reproducing the OCaml pass's name-based fallback before the
-  necessary module and type ownership data is available in the Blorp Core
-  boundary.
+- `compiler_core_flatten.brp` also owns global and type declaration prefixing,
+  canonical module type names, declaration deduplication, and exact-reference
+  rewriting. It rewrites every module-local type use together with its
+  declaration, including record/union fields, function and trait signatures,
+  impl receivers, binders, resource/concurrency metadata, and expression
+  result types. Imported type identities are already canonicalized by
+  typecheck; flattening does not guess their owners from bare names. Import
+  bindings remain explicit protocol data because the middle trait/resolve
+  passes still consume them.
 - `compiler_core_list_layout.brp` now owns list storage annotation over the
   shared Core model. It derives primitive and enum inline widths, value-record
   and stack-option inline structs, pointer storage, and element release facts
   from `CoreProgram` declarations. Alias expansion supports both ordinary and
   parameterized aliases and terminates safely on alias cycles. The pass walks
   function, global, and impl-method bodies and rewrites list construction,
-  allocation, and handoff nodes bottom-up. It is available as the named
-  `list_layout` Blorp Core stage, but is not redundantly rerun in the current
-  production pre-DCE tail because that handoff still receives layouts attached
-  by OCaml lowering.
+  allocation, and handoff nodes bottom-up. Graph preparation runs it exactly
+  once before the production prepared-Core handoff.
 - `CoreFunctionKind.ForeignFunction` now preserves the C name, includes,
   platform link flags, and checked argument-passing mode. The late OCaml Core
   projection populates and round-trips that payload instead of discarding it.
@@ -1991,16 +2022,13 @@ Current progress:
   `CompilerTypedForeignFunctionDecl` per function, with callable identity,
   canonical parameter/return types, C name, includes, typed platform link
   flags, and explicit default-copy/borrow mode. Blorp Core lowering consumes
-  that typed payload directly and collects ordered foreign includes. The
-  temporary typed-AST bridge re-encodes each declaration as a one-function
-  foreign block for the existing OCaml decoder, so this slice adds no new OCaml
-  handoff model. `compiler_foreign_validation.brp` now owns source-level C-name,
+  that typed payload directly and collects ordered foreign includes.
+  `compiler_foreign_validation.brp` now owns source-level C-name,
   include-path, and link-flag validation, rejects unverifiable foreign return
   refinements, and rejects managed default-mode arguments before Core lowering;
   the existing compiler failure corpus exercises those production diagnostics.
-  Before the production boundary moves, the lowered program must run FFI
-  annotation before later Core passes. Do not reconstruct metadata from
-  function names or call shapes.
+  Graph preparation runs FFI annotation before later Core passes. No metadata
+  is reconstructed from function names or call shapes.
 - The shared `CoreDecl` model now preserves declaration type parameters and
   represents type aliases and impl containers directly. This follows the OCaml
   pipeline's single progressively refined Core IR instead of introducing a
@@ -2021,20 +2049,13 @@ Current progress:
   supertraits, purity, parameters, and source locations in `TraitDecl`. Core
   JSON round-trips this phase-specific representation, callable flattening and
   later passes preserve it, and DCE keeps it for the future Blorp trait resolver.
-  The temporary typed-AST bridge deliberately re-encodes the parsed declaration
-  because OCaml still models traits as `DeclOther`; no semantic type facts are
-  reconstructed from that bridge inside Blorp.
-- Builtin type declarations and imports remain parsed passthrough production
-  blockers because they contribute registry and module-resolution facts.
-  Represent those facts at the typed/Core boundary before switching production
-  lowering. Do not make `CompilerTypedParsedDecl` disappear by dropping these
-  declarations: the late pre-DCE bridge can omit them only because OCaml has
-  already consumed their semantics.
-- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the initial slice,
-  including ordinary function bodies, forward declarations, deferred std
-  builtins, and named runtime-helper forwarding bodies.
-  Tensor-shaped type lowering exists in the helper, but the runtime test avoids
-  constructing that metadata until backend test emission handles it cheaply.
+- Builtin type declarations and imports are consumed deliberately during graph
+  preparation. Their semantic contributions already live in canonical typed
+  types, callable identities, explicit import tables, and Core declarations;
+  they do not cross as placeholder Core declarations.
+- `compiler/blorp/tests/test_compiler_core_lower.brp` covers the production
+  lowering surface and the graph-preparation boundary, including module order,
+  definition-id continuity, root naming, and initial list layout.
 - The lowering tests now include a fixture-shaped `CompilerTypedProgram` to
   Core JSON harness. It starts with a small function fixture and gives future
   slices a stable place to compare typed-program bridge artifacts against
@@ -2054,8 +2075,8 @@ Current progress:
 - No-parameter `concurrent:` blocks lower to the pre-closure Core concurrent
   form. When a concurrent block appears at the head of a block expression, the
   following block tail becomes the concurrent body so task-result bindings
-  scope over their actual uses. Parameterized concurrent blocks stay closed
-  until timeout and `max_threads` normalization are ported.
+  scope over their actual uses. Parameterized blocks preserve normalized
+  timeout and `max_threads` values.
 - `select:` receive, sealed, integer-timeout, and `Duration`-timeout arms lower
   to the prepared `SelectExpr` Core shape. Duration timeout lowering now
   mirrors OCaml's microsecond-to-millisecond conversion, including clamping
@@ -2066,8 +2087,8 @@ Current progress:
   `for ... concurrently(limit: ..., timeout: ...)` loops now lower to the
   pre-closure concurrent-loop Core shape, preserving positive-literal `limit`,
   normalized optional timeout, copy-item mode, and discard-output semantics.
-  Resource-source concurrent loops remain closed until the resource ownership
-  lowering slice can port the cleanup-scope behavior from OCaml.
+  Resource-source concurrent loops use explicit move-resource item mode and a
+  typed cleanup scope around each task body.
 - Direct block `?=` bindings now lower to a temporary plus prepared
   `ConstructorMatchExpr` for both `Option[T]` and `Result[T, E]` carriers.
   The success arm binds the unwrapped payload and lowers the remaining block as
@@ -2076,7 +2097,9 @@ Current progress:
   layout code.
 - Simple `for name in start..end` loops lower directly to the prepared
   `ForRangeExpr` Core form with a conservative `RangeMayRunBackward` loop
-  binder. Simple `for name in items` loops over `Channel[T]`, `List[T]`,
+  binder. Iteration over a first-class `Range` value evaluates the range
+  producer once, binds that value, and reads its start/end fields from the
+  stable binding. Simple `for name in items` loops over `Channel[T]`, `List[T]`,
   `Stream[T]`, `String`, `Dict[K, V]` keys, and `Set[T]` lower to the
   explicit prepared Core loop variants with iterable release policy attached
   where the Core shape requires it. Channel and Stream loops are marked
@@ -2085,16 +2108,14 @@ Current progress:
   prepared `ForRangeExpr` over `0..length(array)` and preserve the inferred
   range-refined binder type. Loop-view metadata is authoritative: malformed
   metadata and unported view kinds fail lowering instead of falling through to
-  the producer function's nominal return type. Dict tuple-pair binders,
-  resource-source, tensor, `windows`, and any remaining iterable families still
-  need deliberate prepared-loop slices instead of a generic OCaml-style `CFor`
-  node. Ordinary tuple binders over
+  the producer function's nominal return type. Dict pairs, resource sources,
+  tensors, and `windows` each lower to a deliberate prepared-loop shape instead
+  of a generic source loop. Ordinary tuple binders over
   tuple-valued iterables now lower through one collision-free synthetic loop
   binder plus explicit tuple-field `LetExpr` bindings; Dict pairs select the
-  existing prepared pair-iteration backend path. This work resumes after the
-  ownership-hardening fixes that closed the earlier synthetic-tuple cleanup
-  failure. The focused late-Core ASan/UBSan gate passes 672/672 with the tuple
-  and loop-view lowering regressions included. One-dimensional tensor
+  existing prepared pair-iteration backend path. The focused late-Core
+  ASan/UBSan gate covers the tuple and loop-view ownership regressions.
+  One-dimensional tensor
   `enumerate` and matrix `enumerate2` now capture their source exactly once and
   lower directly to one or two prepared range loops. Tuple binders use the
   range variables directly
@@ -2103,15 +2124,29 @@ Current progress:
   `enumerate2` uses the concrete column dimension when available and otherwise
   mirrors the production OCaml fallback of `tensor_capacity(source) /
   length(source)` for generic matrix dimensions. Multidimensional `enumerate`
-  and `windows` remain closed.
-- Literal-only matches lower directly to prepared `LiteralMatchExpr` nodes for
-  literal arms plus a wildcard fallback. Binding, constructor, tuple/list, and
-  or-pattern lowering remains deliberately closed until the full match
-  decision-tree port is in place.
+  peels row slices, and `windows` captures its source once and binds checked
+  fixed-size slices.
+- Matches lower to `RawMatchExpr` with literal, binding, constructor,
+  qualified-constructor, tuple, list/spread, wildcard, and or-pattern shapes.
+  The existing middle match compiler remains the one owner of decision-tree
+  construction.
 - Expression value-type lowering now treats `CompilerConstIntType` as a Core
   `Int` value while strict type lowering still rejects dimension literals as
   standalone Core types. This keeps literal-valued expression nodes from
   failing lowering before the remaining type-finalization paths are migrated.
+- Prepared-Core integer literals cross JSON as exact decimal text under the
+  existing `int` tag. The strict OCaml decoder accepts that representation and
+  rejects lossy floating-point values, preserving the full signed 64-bit range
+  without confusing ordinary `Int` with source-level wide integers.
+- Prepared-Core FFI defensive-copy kinds cross as the scalar `string`/`bytes`
+  tags emitted by `compiler_core_json.brp`. The phase-specific OCaml decoder
+  consumes that schema directly rather than assuming the object shape used by
+  the separate late-Core projection.
+- Typed `debug:` blocks survive inference and CTFE validation, lower to an
+  explicit prepared-Core `debug_block`, and decode to OCaml `CDebugBlock`.
+  `Core_debug` remains the single owner of normal-build erasure and debug-build
+  retention, and the existing post-debug invariant prevents the node from
+  leaking into later Blorp ownership or emission passes.
 - Enum and union declarations now materialize as `CompilerTypedUnionDecl`
   instead of parsed passthrough declarations. The typed shape carries canonical
   variant field types, tags, and constructor def ids from typecheck/env
@@ -2131,6 +2166,16 @@ Current progress:
   fallback. Focused tests cover registration, inference/JSON transport,
   builtin and fallback cleanup, mapped errors, and the downstream
   resource/Perceus passes.
+- Resource-source loop ownership is represented explicitly as well. Inference
+  tags the synthesized per-item `with` binding with the exact internal loop
+  item identity, and production Core lowering recognizes canonical and bare
+  `ResourceSource` names through the shared type-name metadata predicate. The
+  temporary typed-AST compatibility projection uses that tag to restore the
+  original source binder and body before legacy OCaml lowering; this prevents
+  the compatibility path from wrapping and closing the same resource twice
+  without making production lowering depend on a synthetic-name convention or
+  expression-shape heuristic. Focused lowering and JSON tests cover the tag,
+  and the TCP runtime suite covers the cleanup path under ASan.
 
 Edge cases:
 
@@ -2140,13 +2185,14 @@ Edge cases:
   compiler tests (`expected X, got X` for the same qualified type). Keep the
   dependency isolated behind `compiler_typed_with_binding_is_try` until that
   compiler defect is fixed; do not duplicate the enum through import aliases.
+- Keep `resource_loop_item_name` private to the typed compiler model. It is
+  compiler-synthesized ownership metadata, not source syntax or part of the
+  prepared-Core protocol; ordinary user-written `with` bindings must carry
+  `None`.
 - `Duration` timeouts must round microseconds up to milliseconds.
 - Loop-view producers (`indices`, `enumerate`, `enumerate2`, `windows`) are
-  internal and must only lower under `for`/tuple-for. `indices`, one-dimensional
-  `enumerate`, and two-dimensional `enumerate2` are implemented with explicit
-  collision-free Core identities. Keep multidimensional `enumerate` and
-  `windows` closed until their row/slice operations have the same explicit
-  ownership and identity treatment.
+  internal and must only lower under `for`/tuple-for. Their lowering captures
+  sources once and uses collision-resistant synthesized Core identities.
 - Module alias calls use `TyNamed "Module"` sentinel today; replace with an
   explicit typed AST/Core representation when feasible.
 - Callable ids from inference must remain authoritative over stale mangled
@@ -2154,24 +2200,35 @@ Edge cases:
 - Subscript reads should already be calls; subscript assignment should already
   be typechecked into an explicit call.
 - Foreign string/bytes copy/no-copy metadata must be preserved.
-- Record update lowering needs either an early Core sugar variant in the Blorp
-  Core model or a direct lowering target that preserves update semantics across
-  later ownership passes.
+- Record updates lower directly to a single-evaluation let/field reconstruction
+  form using typed declaration fields, so unchanged fields and release policy
+  remain explicit through ownership passes.
 
 Tests:
 
+- `compiler/blorp/tests/test_compiler_core_lower.brp`
+- `compiler/blorp/tests/test_compiler_core_flatten.brp`
+- `compiler/blorp/tests/test_compiler_core_ffi_boundary.brp`
+- `compiler/blorp/tests/test_compiler_core_list_layout.brp`
+- `compiler/blorp/tests/test_compiler_infer.brp`
+- `compiler/test/test_core_pre_middle_json.ml`
+- `compiler/test/test_semantic_middle_worker.ml`
 - `compiler/test/test_core_lower.ml`
 - `compiler/test/test_core_flatten.ml`
 - `compiler/test/test_core_ffi_boundary.ml`
 - `compiler/test/test_core_list_layout.ml`
 - `tests/test_compiler/codegen_audit/should_pass/foreign_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/concurrent*.brp`
-- New Blorp lowering parity tests using typed AST JSON fixtures.
+- `tests/test_compiler/codegen_audit/should_pass/tensor_loop_views_direct.brp`
 
 Deletion point:
 
-- Delete `core_lower.ml`, `core_flatten.ml`, and OCaml lowering tests after
-  `compile` starts the Core pipeline from Blorp-lowered Core.
+- Normal production ownership has moved, so no new source-command dependency
+  may be added to OCaml typed-AST lowering or flattening. Delete
+  `core_lower.ml`, `core_flatten.ml`, and their implementation-only tests after
+  the pinned-bootstrap wrapper and direct in-memory compatibility tests are
+  converted to prepared Core. This cleanup is independent of checkpoint 8's
+  production boundary.
 
 ## Checkpoint 9: Early And Middle Core Pipeline
 

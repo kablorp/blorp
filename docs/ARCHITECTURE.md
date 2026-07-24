@@ -28,15 +28,22 @@ Source (.brp)
 +-----------+
     |
     v
++------------------+
+| Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
+|                  |  and initial list layout (stage_08_core_lower)
++------------------+
+    |
+    v
 +----------------+
-| Typed AST JSON |  Temporary production bridge into the OCaml Core pipeline
+| Prepared Core  |  One strict JSON bridge into the OCaml semantic middle
+| bridge         |  (core_pre_middle_json.ml)
 +----------------+
     |
     v
-+------------+
-| Core IR    |  OCaml lowering and early/middle transforms, then the Core JSON
-| pipeline   |  handoff into the supported Blorp-owned backend tail
-+------------+
++---------------+
+| Core IR       |  OCaml early/middle transforms, then the Core JSON handoff
+| middle + tail |  into the Blorp-owned specialization/backend tail
++---------------+
     |
     v
 +------------+
@@ -59,10 +66,12 @@ Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
-During the OCaml-to-Blorp port, the production route first decodes the
-Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
-then crosses the Core JSON bridge after the remaining OCaml specialization
-families. Primitive conversion, hash, length, numeric checked tensor access,
+During the OCaml-to-Blorp port, the production route lowers and assembles the
+typed module graph into prepared Core in Blorp. One phase-specific bridge
+decodes that Core into the remaining OCaml early/middle pipeline; source and
+typed AST do not cross this boundary. The pipeline then crosses the late Core
+JSON bridge after the remaining OCaml specialization families. Primitive
+conversion, hash, length, numeric checked tensor access,
 raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
 bounds-proven tensor access builtins intentionally cross in semantic form so
 Blorp can specialize them before Blorp-owned function-reference adaptation.
@@ -71,9 +80,9 @@ The Core JSON projection expands aliases and canonicalizes `Vector`, `Matrix`,
 receives canonical shapes, numeric types, and enum types rather than repeating
 registry lookup in Blorp. Length folding and raw-view formation remain one coherent pass because
 the folded static dimension is the fact that proves loop accesses in bounds.
-Checkpoint 8 in
-`docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
-making Blorp Core lowering authoritative. On the current backend route,
+Checkpoint 8 in `docs/BLORP_COMPILER_PORT_ROADMAP.md` made Blorp Core lowering,
+module flattening, FFI annotation, and initial list layout authoritative for
+normal source commands. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
@@ -90,23 +99,41 @@ dumps and stops observe the Blorp-owned tail as Core JSON through the bridge;
 OCaml program callbacks stop at the pre-DCE handoff. C artifact emission is
 owned by the Blorp backend bridge.
 
+Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
+prepared-Core `debug_block` nodes. The strict prepared-Core decoder maps them
+to `CDebugBlock`; `Core_debug` is the single stage that either erases the node
+or retains its body according to the request's debug mode. The post-debug
+invariant rejects any node that survives that decision.
+
+Resource-source loops acquire and scope each resource in Blorp inference and
+Core lowering. The compiler records the exact synthesized loop-item identity
+on the typed scope rather than recognizing generated names. Only the temporary
+typed-AST compatibility projection removes that tagged wrapper before legacy
+OCaml lowering, which keeps both paths at one cleanup owner per resource.
+
+The late-Core projection preserves scoped `let`/`borrow` expressions inside
+closure-call arguments. OCaml fusion may introduce those forms before the
+handoff; the Blorp-owned closure and preparation stages, rather than the
+projection boundary, own their final normalization for C emission.
+
+The pinned-bootstrap wrapper still compiles the Blorp CLI through the legacy
+OCaml typed-AST/Core-lowering entrypoint. That bootstrap trust-root path is
+kept separate from normal source compilation and is not a runtime fallback.
+Direct in-memory OCaml compiler tests also retain the compatibility entrypoint
+until their fixtures move to prepared Core.
+
 ```
-Typed AST
+Blorp Typed AST graph
     |
     v
-+------------+
-| Core_lower |  Mechanical AST → Core IR translation (core_lower.ml)
-+------------+
++----------------------+
+| Core graph prepare   |  Blorp typed AST -> Core, module flattening,
++----------------------+  checked FFI policies, and initial list layout
     |
     v
-+-------------------+
-| Core_ffi_boundary |  Attach checked FFI argument-boundary policies
-+-------------------+  before downstream Core passes
-    |
-    v
-+------------------+
-| Core_list_layout |  Annotate list literals/allocations/handoffs with
-+------------------+  concrete storage layout facts used by later passes
++----------------------+
+| Prepared-Core bridge |  Strict phase decoder; rejects late Core forms
++----------------------+
     |
     v
 +------------+

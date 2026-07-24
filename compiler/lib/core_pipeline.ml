@@ -1,29 +1,32 @@
 (** Core IR compilation pipeline.
 
-    Chains the Core passes in order:
-    1. [Core_lower] + [Core_ffi_boundary] — typed AST → Core IR, with checked
-       FFI argument-boundary policies attached after type registration
-    2. [Core_debug] — erase or retain explicit debug blocks
-    3. [Core_desugar] + [Core_ssa] — eliminate Core sugar and mutable locals
-    4. [Core_mono] — monomorphize generic functions
-    5. [Core_synth] — synthesize concrete builtin IR bodies post-mono
-    6. [Core_match] — compile CMatchArms → CMatch decision trees
-    7. [Core_trait_resolve] — rewrite trait methods/operators to impl calls
-    8. [Core_resolve] — tag CCall by callee kind
-    9. [Core_std_inline] — expand compiler-owned std wrappers at call sites
-    10. [Core_tailrec] — make tail-recursive self-loops explicit
-    11. [Core_string_pipeline] + [Core_collection_pipeline] +
+    Normal source commands enter through [run_core_passes] with prepared Core
+    produced by Blorp lowering, graph flattening, FFI annotation, and initial
+    list layout. The typed-program entrypoints below remain for the pinned
+    bootstrap wrapper and direct in-memory compatibility tests.
+
+    The shared pass chain is:
+    1. [Core_debug] — erase or retain explicit debug blocks
+    2. [Core_desugar] + [Core_ssa] — eliminate Core sugar and mutable locals
+    3. [Core_mono] — monomorphize generic functions
+    4. [Core_synth] — synthesize concrete builtin IR bodies post-mono
+    5. [Core_match] — compile CMatchArms → CMatch decision trees
+    6. [Core_trait_resolve] — rewrite trait methods/operators to impl calls
+    7. [Core_resolve] — tag CCall by callee kind
+    8. [Core_std_inline] — expand compiler-owned std wrappers at call sites
+    9. [Core_tailrec] — make tail-recursive self-loops explicit
+    10. [Core_string_pipeline] + [Core_collection_pipeline] +
        [Core_parallel_tensor_pipeline] + [Core_tensor_fusion] +
        [Core_tuple_sroa] — fuse compatible string/list/scoped tensor pipelines
        and tensor update expressions; scalar-replace non-escaping local tuples
        and narrow tuple-return call sites
-    12. [Core_specialize] — type-dispatch builtins to CCast / concrete names
-    13. backend handoff — default compilation gives pre-DCE Core to Blorp
-    14. Blorp-owned function-reference adaptation + DCE — make eta adapters
+    11. [Core_specialize] — type-dispatch builtins to CCast / concrete names
+    12. backend handoff — default compilation gives pre-DCE Core to Blorp
+    13. Blorp-owned function-reference adaptation + DCE — make eta adapters
        visible to Perceus, then prune unreachable emitted functions
-    15. Blorp-owned consume-specialize pass
-    16. Blorp-owned Perceus — insert explicit dup/drop operations
-    17. Blorp-owned final tail — normal reuse, closure conversion, resource
+    14. Blorp-owned consume-specialize pass
+    15. Blorp-owned Perceus — insert explicit dup/drop operations
+    16. Blorp-owned final tail — normal reuse, closure conversion, resource
        cleanup lowering, fairness checkpoints, codegen preparation, prepared
        reuse, and C artifact emission
 
@@ -32,8 +35,7 @@
     observation uses lightweight stage events. Normal C output always comes
     from the Blorp pre-DCE handoff.
 
-    This module is the single entry point for routing a typed program
-    through the Core path instead of the legacy [Codegen.generate]. *)
+    This module is the single OCaml owner of the remaining Core middle. *)
 
 (* Module flattening (prefix_module_names, import-table assembly) moved
    to [Core_flatten] in Phase 5.5. Call sites below go through the
@@ -181,11 +183,10 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
   then on_stage_event Core_stage.Final;
   match result with Ok c_code -> c_code | Error reason -> failwith reason
 
-(** Run the shared Core-to-Core pass chain starting from an already-lowered
-    [core_program]. [compile] and [compile_with_modules] differ in how they
-    assemble that initial program (single file vs. loaded modules), but the
-    pass ordering after lowering is identical. Keeping the sequence in one
-    place prevents stage drift between the two entry points. *)
+(** Run the shared Core-to-Core pass chain starting from an already-lowered,
+    flattened, FFI-annotated, list-layout-annotated [core_program]. Production
+    semantic-worker requests and compatibility typed-program entrypoints join
+    here, so pass ordering cannot drift between them. *)
 let run_core_passes ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
@@ -287,7 +288,7 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
      rationale. *)
   let reg = Codegen_types.create_registry () in
   let core_prog = Core_flatten.rewrite_canonical_module_type_names core_prog in
-  Core_flatten.register_types reg core_prog;
+  Core_registry.register_types reg core_prog;
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
   let backend_input =
@@ -429,14 +430,14 @@ let prepare_typed_with_module_inputs ?(main_import_bindings = [])
       modules
   in
   let prepared_import_aliases, prepared_module_imports =
-    Core_flatten.build_import_tables_from_bindings ~main_import_bindings
+    Core_imports.tables_of_bindings ~main_import_bindings
       module_bindings
   in
   let full =
     Core_flatten.rewrite_canonical_module_type_names (module_core @ main_core)
   in
   let prepared_registry = Codegen_types.create_registry () in
-  Core_flatten.register_types prepared_registry full;
+  Core_registry.register_types prepared_registry full;
   let full = Core_ffi_boundary.annotate_program ~reg:prepared_registry full in
   let prepared_core =
     Core_list_layout.annotate_program ~reg:prepared_registry full

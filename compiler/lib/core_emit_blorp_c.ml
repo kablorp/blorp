@@ -5908,6 +5908,18 @@ let collect_foreign_includes (program : Core.core_program) =
   List.iter visit_decl program;
   List.rev !ordered
 
+let merge_foreign_includes explicit program =
+  let seen = Hashtbl.create 8 in
+  let remember_rev acc header =
+    if Hashtbl.mem seen header then acc
+    else begin
+      Hashtbl.add seen header ();
+      header :: acc
+    end
+  in
+  List.fold_left remember_rev [] (explicit @ collect_foreign_includes program)
+  |> List.rev
+
 let var_is_global global_def_ids global_names (variable : Core.var) =
   match variable.vdef_id with
   | Some def_id when IntSet.mem def_id global_def_ids -> true
@@ -7000,8 +7012,6 @@ and require_function_body ~reg union_names path (expr : Core.core) =
           require_function_body ~reg union_names (path ^ ".value") value
       | Core.ListInlineStructStorage _ | Core.ListInlineStorage _ ->
           require_simple_expr (path ^ ".value") value)
-  | Core.CCall (Core.CKClosure, _callee, _args) ->
-      require_simple_expr path expr
   | Core.CCall (Core.CKBuiltin name, _callee, _args)
     when is_ranked_tensor_fill_factory_name name ->
       require_simple_expr path expr
@@ -7853,6 +7863,7 @@ let global_json ~function_names ~consumed_params ~reg ~is_private enum_names
     (kind "global"
        [
          ("name", var_json global.cv_name);
+         ("source_module", option_string_json global.cv_module);
          ("type", typ);
          ("init", init);
          ("mutable", bool global.cv_is_mutable);
@@ -8168,7 +8179,7 @@ let rec decl_jsons ~function_names ~consumed_params ~reg ~is_private enum_names
         ~value_record_names ~heap_record_names ~union_names ~enum_constructors
         ~global_def_ids ~global_names path decl.cd_loc impl
 
-let program_json ~reg (program : Core.core_program) =
+let program_json ?(foreign_includes = []) ~reg (program : Core.core_program) =
   let rec collect_enum_names names (decl : Core.core_decl) =
     match decl.cd_desc with
     | Core.CDType type_decl
@@ -8313,7 +8324,8 @@ let program_json ~reg (program : Core.core_program) =
     (kind "program"
        [
          ("decls", decls);
-         ("foreign_includes", string_list_json (collect_foreign_includes program));
+         ( "foreign_includes",
+           string_list_json (merge_foreign_includes foreign_includes program) );
        ])
 
 type config = {

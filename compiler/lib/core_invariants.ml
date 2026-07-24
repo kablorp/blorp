@@ -259,7 +259,7 @@ let check_call_ownership_contracts_at (stage : Core_stage.t)
 
 let registry_for_program (prog : Core.core_program) : Codegen_types.registry =
   let reg = Codegen_types.create_registry () in
-  Core_flatten.register_types reg prog;
+  Core_registry.register_types reg prog;
   reg
 
 (** Resource-safety invariants only need alias expansion. Avoid the full codegen

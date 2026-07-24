@@ -143,6 +143,7 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
 			DictExpr,
@@ -180,6 +181,7 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
+			RawMatchExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -324,7 +326,12 @@ import:
 		CoreTaskCaptureKind(TaskCopyCapture, TaskMoveResourceItem, TaskStructuredTaskBorrow),
 		CoreTaskClosure,
 		CoreTensorBoxedLiteral,
-		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
+		CoreTensorDim(
+			TensorDimOperation,
+			TensorRuntimeDim,
+			TensorStaticDim,
+			TensorVariadicDim,
+		),
 		CoreTensorForElementStorage(
 			TensorForBoxedElement,
 			TensorForInlineStructElement,
@@ -367,6 +374,7 @@ import:
 		CoreType(
 			BoxedResultType,
 			EnumType,
+			FunctionType,
 			HeapRecordType,
 			NamedType,
 			RangeType,
@@ -1058,6 +1066,8 @@ private pure func closure_abi_value_for_type(typ: CoreType) -> Option[ClosureAbi
 			Some(ClosureAbiStruct("blorp_StackResult"))
 		BoxedResultType(ok_type, err_type):
 			Some(ClosureAbiPointer)
+		FunctionType(_, _, _):
+			Some(ClosureAbiPointer)
 		EnumType(name):
 			Some(ClosureAbiPrim)
 		ValueRecordType(name):
@@ -1206,6 +1216,10 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 			False
 		VoidExpr(typ, loc):
 			True
+		DebugBlockExpr(body, typ, loc):
+			False
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			False
 		CooperativeCheckpointExpr(typ, loc):
 			False
 		CallExpr(kind, callee, args, typ, loc):
@@ -1464,6 +1478,8 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 					boxed_value_needs_release_type(typ)
 		VoidExpr(typ, loc):
 			boxed_value_needs_release_type(typ)
+		DebugBlockExpr(body, typ, loc):
+			boxed_value_needs_release_type(typ)
 		CooperativeCheckpointExpr(typ, loc):
 			boxed_value_needs_release_type(typ)
 		CallExpr(kind, callee, args, typ, loc):
@@ -1614,6 +1630,8 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			boxed_value_needs_release_type(typ)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			boxed_value_needs_release_type(typ)
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			boxed_value_needs_release_type(typ)
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			boxed_value_needs_release_type(typ)
@@ -1874,7 +1892,11 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 			None
 		VoidExpr(typ, loc):
 			None
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
+			None
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			None
 		BinaryExpr(op, left, right, typ, loc):
 			None
@@ -2365,6 +2387,8 @@ private pure func is_string_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			False
+		FunctionType(_, _, _):
+			False
 		VoidType:
 			False
 		EnumType(name):
@@ -2390,6 +2414,8 @@ private pure func is_float_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(_, _, _):
 			False
 		VoidType:
 			False
@@ -2417,6 +2443,8 @@ private pure func is_ieee_float_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			False
+		FunctionType(_, _, _):
+			False
 		VoidType:
 			False
 		EnumType(name):
@@ -2442,6 +2470,8 @@ private pure func is_fixed_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(_, _, _):
 			False
 		VoidType:
 			False
@@ -2529,6 +2559,8 @@ private pure func float_modulo_runtime(typ: CoreType) -> Option[FloatModuloRunti
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(_, _, _):
+			None
 		VoidType:
 			None
 		EnumType(name):
@@ -2580,6 +2612,8 @@ private pure func list_equality_function(typ: CoreType) -> Option[String]:
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(_, _, _):
+			None
 		VoidType:
 			None
 		EnumType(name):
@@ -2622,6 +2656,8 @@ private pure func dict_equality_function(typ: CoreType) -> Option[String]:
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		VoidType:
 			None
 		EnumType(name):
@@ -2656,6 +2692,8 @@ private pure func set_equality_function(typ: CoreType) -> Option[String]:
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		VoidType:
 			None
@@ -3134,6 +3172,8 @@ private pure func result_bridge_layout_for_type(
 			Some(StackResultBridgeLayout(ok_type, err_type))
 		BoxedResultType(ok_type, err_type):
 			Some(BoxedResultBridgeLayout(ok_type, err_type))
+		FunctionType(is_pure, param_types, return_type):
+			None
 		NamedType(name, args):
 			if name == BOXED_RESULT_TYPE_NAME:
 				match args:
@@ -3209,6 +3249,8 @@ private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		VoidType:
 			Some("Void")
@@ -3455,6 +3497,8 @@ private pure func is_named_option_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			False
+		FunctionType(is_pure, param_types, return_type):
+			False
 		HeapRecordType(name):
 			False
 		UnionType(name):
@@ -3498,6 +3542,8 @@ private pure func fallible_stream_option_payload_release_mask(ok_type: CoreType)
 		StackResultType(ok_type, err_type):
 			0
 		BoxedResultType(ok_type, err_type):
+			0
+		FunctionType(is_pure, param_types, return_type):
 			0
 		HeapRecordType(name):
 			0
@@ -4912,6 +4958,8 @@ private pure func is_foreign_string_arg(arg: CoreExpr) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			False
+		FunctionType(is_pure, param_types, return_type):
+			False
 		EnumType(name):
 			False
 		ValueRecordType(name):
@@ -5134,6 +5182,8 @@ private pure func stack_option_none_value_for_type(typ: CoreType) -> String:
 			"0"
 		BoxedResultType(ok_type, err_type):
 			"0"
+		FunctionType(is_pure, param_types, return_type):
+			"0"
 		EnumType(name):
 			"0"
 		ValueRecordType(name):
@@ -5177,6 +5227,8 @@ private pure func stack_option_none_expr_for_type(typ: CoreType) -> Option[Strin
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		EnumType(name):
 			None
@@ -5275,6 +5327,8 @@ private pure func emit_dict_get_stack_option_payload(
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		HeapRecordType(name):
 			None
 		UnionType(name):
@@ -5310,6 +5364,8 @@ private pure func emit_prepared_dict_builtin_call(
 					StackResultType(ok_type, err_type):
 						None
 					BoxedResultType(ok_type, err_type):
+						None
+					FunctionType(is_pure, param_types, return_type):
 						None
 					EnumType(type_name):
 						None
@@ -5419,6 +5475,8 @@ private pure func emit_vector_get_stack_option_payload(
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		HeapRecordType(name):
 			None
 		UnionType(name):
@@ -5489,6 +5547,8 @@ private pure func emit_matrix_get_stack_option_payload(
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		HeapRecordType(name):
 			None
 		UnionType(name):
@@ -5555,6 +5615,8 @@ private pure func emit_tensor_stack_option_get_call(
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		EnumType(type_name):
 			None
@@ -6831,6 +6893,10 @@ private pure func static_tensor_dim_value(dim: CoreTensorDim) -> Option[Int]:
 			Some(value)
 		TensorRuntimeDim(name):
 			None
+		TensorVariadicDim(_):
+			None
+		TensorDimOperation(_, _, _):
+			None
 
 
 private pure func static_tensor_dims(dims: List[CoreTensorDim]) -> Option[List[Int]]:
@@ -7178,6 +7244,8 @@ private pure func emit_value_record_tensor_get_unchecked(
 				None
 			BoxedResultType(ok_type, err_type):
 				None
+			FunctionType(is_pure, param_types, return_type):
+				None
 			RangeType:
 				None
 			TensorType(info):
@@ -7208,6 +7276,8 @@ private pure func tensor_raw_scalar_kind_for_type(typ: CoreType) -> Option[CoreT
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		EnumType(type_name):
 			None
@@ -9252,6 +9322,8 @@ private pure func is_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			True
+		FunctionType(is_pure, param_types, return_type):
+			True
 		HeapRecordType(name):
 			True
 		UnionType(name):
@@ -9286,6 +9358,8 @@ private pure func emit_float_tuple_field_access(element_c: String, typ: CoreType
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		HeapRecordType(name):
 			None
@@ -9339,6 +9413,8 @@ private pure func emit_tuple_field_access(
 						None
 					BoxedResultType(ok_type, err_type):
 						None
+					FunctionType(is_pure, param_types, return_type):
+						None
 					HeapRecordType(name):
 						None
 					UnionType(name):
@@ -9376,6 +9452,8 @@ private pure func c_field_access_value(
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		EnumType(name):
 			None
@@ -9694,6 +9772,8 @@ private pure func is_managed_pointer_capture_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			True
+		FunctionType(is_pure, param_types, return_type):
+			True
 		HeapRecordType(name):
 			True
 		UnionType(name):
@@ -9719,6 +9799,8 @@ private pure func is_unmanaged_pointer_capture_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(is_pure, param_types, return_type):
 			False
 		HeapRecordType(name):
 			False
@@ -10505,7 +10587,11 @@ private pure func handoff_source_cleanup_pop_statement(rhs: CoreExpr) -> String:
 			""
 		VoidExpr(typ, loc):
 			""
+		DebugBlockExpr(body, typ, loc):
+			""
 		CooperativeCheckpointExpr(typ, loc):
+			""
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			""
 		BinaryExpr(op, left, right, typ, loc):
 			""
@@ -10714,7 +10800,11 @@ private pure func transfer_prefix_is_non_suspending(expr: CoreExpr) -> Bool:
 			True
 		VoidExpr(typ, loc):
 			True
+		DebugBlockExpr(body, typ, loc):
+			transfer_prefix_is_non_suspending(body)
 		CooperativeCheckpointExpr(typ, loc):
+			False
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			False
 		CallExpr(kind, callee, args, typ, loc):
 			call_kind_is_non_suspending_transfer(kind) and exprs_are_non_suspending_transfer(args)
@@ -10882,7 +10972,11 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 			False
 		VoidExpr(typ, loc):
 			False
+		DebugBlockExpr(body, typ, loc):
+			False
 		CooperativeCheckpointExpr(typ, loc):
+			False
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			False
 		CallExpr(kind, callee, args, typ, loc):
 			False
@@ -11128,7 +11222,11 @@ private pure func call_arg_transfer_cleanup_pop_statement(arg: CoreExpr) -> Stri
 			""
 		VoidExpr(typ, loc):
 			""
+		DebugBlockExpr(body, typ, loc):
+			""
 		CooperativeCheckpointExpr(typ, loc):
+			""
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			""
 		CallExpr(kind, callee, args, typ, loc):
 			""
@@ -11365,6 +11463,11 @@ private pure func dict_literal_entries_consume_var_before_suspension(
 
 private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			if body_consumes_var_before_suspension(scrutinee, variable):
+				True
+			else:
+				cases.any(func(case): body_consumes_var_before_suspension(case.body, variable))
 		CallExpr(kind, callee, args, typ, loc):
 			call_consumes_var_before_suspension(kind, args, variable)
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
@@ -11412,6 +11515,8 @@ private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: 
 			False
 		VoidExpr(typ, loc):
 			False
+		DebugBlockExpr(body, typ, loc):
+			body_consumes_var_before_suspension(body, variable)
 		CooperativeCheckpointExpr(typ, loc):
 			False
 		BinaryExpr(op, left, right, typ, loc):
@@ -11629,6 +11734,10 @@ private pure func apply_let_cleanup_to_body(
 
 private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			body_consumes_var(scrutinee, variable) or cases.any(
+				func(case): body_consumes_var(case.body, variable),
+			)
 		CallExpr(kind, callee, args, typ, loc):
 			call_consumes_var(kind, args, variable)
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
@@ -11668,6 +11777,8 @@ private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		VoidExpr(typ, loc):
 			False
+		DebugBlockExpr(body, typ, loc):
+			body_consumes_var(body, variable)
 		CooperativeCheckpointExpr(typ, loc):
 			False
 		BinaryExpr(op, left, right, typ, loc):
@@ -11810,11 +11921,15 @@ private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 
 private pure func directly_returns_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			False
 		VarExpr(returned, typ, loc):
 			core_vars_equal(returned, variable)
 		LiteralExpr(literal, typ, loc):
 			False
 		VoidExpr(typ, loc):
+			False
+		DebugBlockExpr(body, typ, loc):
 			False
 		CooperativeCheckpointExpr(typ, loc):
 			False
@@ -11995,6 +12110,8 @@ private pure func statement_expr(statement: String, value: String) -> String:
 
 private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		LiteralExpr(literal, typ, loc):
 			emit_literal_expr(literal)
 		VarExpr(variable, typ, loc):
@@ -12004,6 +12121,8 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 				Some(c_var_name(variable))
 		VoidExpr(typ, loc):
 			Some("(void)0")
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
 			None
 		CallExpr(kind, callee, args, typ, loc):
@@ -12367,6 +12486,8 @@ private pure func emit_tailrec_tail(
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		TailrecRecurExpr(args, typ, loc):
 			emit_tailrec_recur(params, args, next_temp)
 		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
@@ -12458,6 +12579,8 @@ private pure func emit_tailrec_tail(
 			emit_tailrec_return(return_type, expr, next_temp)
 		VoidExpr(typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		CallExpr(kind, callee, args, typ, loc):
@@ -13136,6 +13259,8 @@ private pure func emit_tailrec_list_spread_tail(
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
 			emit_tailrec_list_spread_recur(loop, rebinds, cursor_advance, next_temp)
 		LetExpr(name, is_mutable, typ, rhs, body):
@@ -13211,6 +13336,8 @@ private pure func emit_tailrec_list_spread_tail(
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		VoidExpr(typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		CallExpr(kind, callee, args, typ, loc):
@@ -13368,6 +13495,8 @@ private pure func emit_tailrec_list_spread_loop(
 
 private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		LiteralExpr(literal, typ, loc):
 			match literal:
 				IntLiteral(value):
@@ -13393,6 +13522,8 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
+			None
+		DebugBlockExpr(body, typ, loc):
 			None
 		CooperativeCheckpointExpr(typ, loc):
 			None
@@ -15023,6 +15154,8 @@ private pure func dict_loop_binding(
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		EnumType(name):
 			Some(render_prepared_backend_op(BackendDictIterKeyBinding({
 				key_c_type = c_type_name(for_dict.binder.typ),
@@ -15420,11 +15553,15 @@ private pure func tensor_runtime_read_helper_name(helper: CoreTensorRuntimeReadH
 
 private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			typ
 		LiteralExpr(literal, typ, loc):
 			typ
 		VarExpr(variable, typ, loc):
 			typ
 		VoidExpr(typ, loc):
+			typ
+		DebugBlockExpr(body, typ, loc):
 			typ
 		CooperativeCheckpointExpr(typ, loc):
 			typ
@@ -16984,6 +17121,8 @@ private pure func emit_constructor_expr_match_body(
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
@@ -16994,6 +17133,8 @@ private pure func emit_constructor_expr_match_body(
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		VoidExpr(typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		CallExpr(kind, callee, args, typ, loc):
@@ -17316,6 +17457,8 @@ private pure func list_payload_binding(binding: CoreMatchBinding) -> Option[Core
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(is_pure, param_types, return_type):
 			None
 		EnumType(name):
 			None
@@ -18086,6 +18229,8 @@ private pure func emit_resource_scope(
 
 private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[FunctionBodyC]:
 	match expr:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		LetExpr(name, is_mutable, typ, rhs, body):
 			if is_void_type(typ):
 				rhs_c ?= emit_function_body(rhs, next_temp)
@@ -18241,6 +18386,8 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 		VoidExpr(typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
+		DebugBlockExpr(body, typ, loc):
+			None
 		CooperativeCheckpointExpr(typ, loc):
 			Some({
 				statements = "  blorp_cooperative_checkpoint();\n",
@@ -18707,6 +18854,8 @@ private pure func union_type_name(typ: CoreType) -> Option[String]:
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(is_pure, param_types, return_type):
+			None
 		HeapRecordType(name):
 			None
 		TupleType(items):
@@ -19095,6 +19244,8 @@ private pure func emit_channel_attempt_user_function(
 	temp_seed: String = func_info.def_id.to_string()
 
 	match body:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		CallExpr(BuiltinCall(name), callee, args, typ, loc):
 			arg_values ?= emit_simple_expr_arg_values(args)
 
@@ -19171,6 +19322,8 @@ private pure func emit_channel_attempt_user_function(
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
+			None
+		DebugBlockExpr(body, typ, loc):
 			None
 		CooperativeCheckpointExpr(typ, loc):
 			None
@@ -20339,6 +20492,8 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 					False
 				BoxedResultType(ok_type, err_type):
 					False
+				FunctionType(is_pure, param_types, return_type):
+					False
 				EnumType(name):
 					False
 				NamedType(name, args):
@@ -20556,6 +20711,8 @@ private pure func static_value_initializer(
 				StackResultType(ok_type, err_type):
 					None
 				BoxedResultType(ok_type, err_type):
+					None
+				FunctionType(is_pure, param_types, return_type):
 					None
 				EnumType(name):
 					None
@@ -21057,6 +21214,8 @@ private pure func emit_static_managed_global_decl(global: CoreGlobal) -> Option[
 
 private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]:
 	match init:
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
 		LiteralExpr(literal, typ, loc):
 			match literal:
 				IntLiteral(value):
@@ -21082,6 +21241,8 @@ private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]
 		VarExpr(variable, typ, loc):
 			None
 		VoidExpr(typ, loc):
+			None
+		DebugBlockExpr(body, typ, loc):
 			None
 		CooperativeCheckpointExpr(typ, loc):
 			None
