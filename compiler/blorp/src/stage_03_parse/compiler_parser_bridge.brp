@@ -33,6 +33,7 @@ import:
 		as_string,
 		get_field,
 		parse_json,
+	memory: MemStats, get_mem_stats, print_live_object_summary
 
 
 union ParserBridgeDispatchError:
@@ -186,6 +187,45 @@ private pure func parsed_source_artifact(
 	JsonObject(fields)
 
 
+private pure func parser_retention_stats_json(stats: MemStats) -> JsonValue:
+	JsonObject([
+		("total_allocations", JsonNumber(to_float(stats.total_allocations))),
+		("total_releases", JsonNumber(to_float(stats.total_releases))),
+		("current_objects", JsonNumber(to_float(stats.current_objects))),
+		("bytes_allocated", JsonNumber(to_float(stats.bytes_allocated))),
+	])
+
+
+private func parsed_source_retention_artifact(
+	path: String,
+	module_name: String,
+	text: String,
+	phase: ParsedProgramPhase,
+	print_live_types: Bool,
+) -> JsonValue:
+	source_file = compiler_source_file(path, module_name, text)
+	raw_program = parse_compiler_source(source_file)
+	program = match phase:
+		RawParsedProgram:
+			raw_program
+		TypecheckSourceProgram:
+			finalize_typecheck_source_program(raw_program)
+
+	stats = get_mem_stats()
+
+	if print_live_types:
+		print_live_object_summary()
+
+	JsonObject([
+		("path", JsonString(path)),
+		("module", JsonString(module_name)),
+		("ast_phase", JsonString(parsed_program_phase_name(phase))),
+		("decls", JsonNumber(to_float(program.decls.length()))),
+		("diagnostics", JsonNumber(to_float(program.diagnostics.length()))),
+		("memstats", parser_retention_stats_json(stats)),
+	])
+
+
 private pure func handle_parse_source(
 	body: JsonValue,
 ) -> Result[JsonValue, ParserBridgeDispatchError]:
@@ -203,6 +243,28 @@ private pure func handle_parse_source(
 				text,
 				phase,
 				include_comments,
+			),
+		),
+	)
+
+
+private func handle_parse_source_retention(
+	body: JsonValue,
+	print_live_types: Bool,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	path ?= string_field(body, "path")
+	module_name ?= string_field(body, "module")
+	text ?= string_field(body, "text")
+	phase ?= optional_ast_phase_field(body, "ast_phase", RawParsedProgram)
+
+	Ok(
+		bridge_success_json(
+			parsed_source_retention_artifact(
+				path,
+				module_name,
+				text,
+				phase,
+				print_live_types,
 			),
 		),
 	)
@@ -285,6 +347,19 @@ pure func handle_request_value(root: JsonValue) -> JsonValue:
 	match decode_bridge_envelope_value(root):
 		Ok(envelope):
 			handle_envelope(envelope).get_or_else(dispatch_error_json)
+		Err(error):
+			bridge_error_json(error)
+
+
+func handle_retention_request_value(root: JsonValue, print_live_types: Bool) -> JsonValue:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			match envelope.action:
+				ParseSourceAction:
+					handle_parse_source_retention(envelope.payload, print_live_types)
+						.get_or_else(dispatch_error_json)
+				_:
+					dispatch_error_json(UnsupportedBridgeAction(envelope.action))
 		Err(error):
 			bridge_error_json(error)
 

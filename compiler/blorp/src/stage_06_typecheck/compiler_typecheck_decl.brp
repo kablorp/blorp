@@ -224,6 +224,7 @@ import:
 	compiler_imports:
 		CompilerImportableModule,
 		CompilerImportableModuleSurface,
+		compiler_importable_module_identity_matches_request,
 		compiler_importable_module_to_surface,
 		compiler_register_import_decls,
 		compiler_register_program_import_syntax,
@@ -268,7 +269,6 @@ import:
 		),
 		CompilerTypecheckState,
 		CompilerTypecheckTypeHome,
-		compiler_callable_source_loc_from_span,
 		compiler_func_callable_key,
 		compiler_source_definition_key,
 		compiler_typecheck_state_add_error,
@@ -1192,7 +1192,7 @@ private pure func compiler_typed_record_field_from_parsed(
 	semantic_type = compiler_canonical_annotation_type(state, field_type)
 	{
 		name = field.name.text,
-		source_type = compiler_type_copy(field_type),
+		source_type = field_type,
 		semantic_type = semantic_type
 	}
 
@@ -1217,7 +1217,7 @@ private pure func compiler_typed_type_alias_from_parsed(
 	semantic_target = compiler_canonical_annotation_type(state, source_target)
 	{
 		decl = alias_decl,
-		source_target_type = compiler_type_copy(source_target),
+		source_target_type = source_target,
 		semantic_target_type = semantic_target
 	}
 
@@ -1809,7 +1809,7 @@ private pure func compiler_callable_key_from_span(
 	name: String,
 	span: CompilerSourceSpan,
 ) -> CompilerFuncCallableKey:
-	compiler_func_callable_key(name, compiler_callable_source_loc_from_span(span))
+	compiler_func_callable_key(name, span)
 
 
 private pure func compiler_supertrait_names_from_parsed(
@@ -3835,13 +3835,11 @@ private pure func compiler_import_module_matches_request(
 	module: CompilerImportableModule,
 	requested_path: String,
 ) -> Bool:
-	std_requested: String = "std/" + requested_path
-
-	(
-		module.module_path == requested_path
-		or module.surface.module_name == requested_path
-		or module.module_path == std_requested
-		or module.surface.module_name == std_requested
+	compiler_importable_module_identity_matches_request(
+		module.module_path,
+		module.origin,
+		module.surface.module_name,
+		requested_path,
 	)
 
 
@@ -4029,17 +4027,39 @@ private pure func compiler_program_import_identities(
 	compiler_decl_import_identities(import_modules, program.decls)
 
 
+private pure func compiler_import_module_is_current(
+	module_path: String,
+	current_module_path: Option[String],
+) -> Bool:
+	match current_module_path:
+		Some(current_path):
+			module_path == current_path
+		None:
+			False
+
+
 private pure func compiler_importable_modules_for_program(
 	modules: List[CompilerImportableModule],
 	program: ParsedProgram,
+	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
 	identities: List[String] = compiler_program_import_identities(modules, program)
-	modules.filter(func(module): identities.contains(module.module_path))
+	var result: List[CompilerImportableModule] = []
+
+	for module in modules:
+		if (
+			identities.contains(module.module_path)
+			and not compiler_import_module_is_current(module.module_path, current_module_path)
+		):
+			result = result.append(module)
+
+	result
 
 
 private pure func compiler_importable_module_dependency_closure(
 	modules: List[CompilerImportableModule],
 	roots: List[CompilerImportableModule],
+	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
 	var identities: List[String] = []
 	var index: Int = 0
@@ -4053,7 +4073,10 @@ private pure func compiler_importable_module_dependency_closure(
 		for module in modules:
 			if module.module_path == current_identity:
 				for dependency in compiler_decl_import_identities(modules, module.decls):
-					if not identities.contains(dependency):
+					if (
+						not identities.contains(dependency)
+						and not compiler_import_module_is_current(dependency, current_module_path)
+					):
 						identities = identities.append(dependency)
 
 				break
@@ -4063,7 +4086,10 @@ private pure func compiler_importable_module_dependency_closure(
 	var result: List[CompilerImportableModule] = []
 
 	for module in modules:
-		if identities.contains(module.module_path):
+		if (
+			identities.contains(module.module_path)
+			and not compiler_import_module_is_current(module.module_path, current_module_path)
+		):
 			result = result.append(module)
 
 	result
@@ -6060,6 +6086,51 @@ private pure func compiler_typecheck_materialize_program_bodies_with_import_modu
 	})
 
 
+private func compiler_typecheck_materialize_program_bodies_with_import_modules_with_trace(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+	trace: (String) -> Void,
+) -> CompilerTypecheckProgramResult:
+	var next_state = state
+	var typed_decls: List[CompilerTypedDecl] = []
+	var decl_index: Int = 0
+
+	for decl in program.decls:
+		phase_prefix = "typecheck_body_decl_" + decl_index.to_string()
+		trace(phase_prefix + "_start")
+		next_state = compiler_typecheck_state_reset_type_shape_memo(next_state)
+
+		match decl:
+			ForeignBlockParsedDecl(block_args, functions, block_span):
+				foreign_result: CompilerTypedForeignBlockResult = compiler_typed_foreign_block(
+					next_state,
+					block_args,
+					functions,
+					block_span,
+				)
+				next_state = foreign_result.state
+				typed_decls = typed_decls.concat(foreign_result.decls)
+			_:
+				result = compiler_typecheck_materialize_decl_body(
+					next_state,
+					program.source.module_name,
+					program.decls,
+					import_modules,
+					decl,
+				)
+				next_state = result.state
+				typed_decls = typed_decls.append(result.decl)
+
+		trace(phase_prefix + "_complete")
+		decl_index += 1
+
+	compiler_typecheck_validate_typed_program({
+		state = compiler_typecheck_state_reset_type_shape_memo(next_state),
+		program = compiler_typed_program_from_decls(program, typed_decls),
+	})
+
+
 private pure func compiler_typecheck_program_after_import_registration(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
@@ -6100,20 +6171,54 @@ pure func compiler_typecheck_program_with_import_surfaces(
 	compiler_typecheck_program_after_import_registration(with_imports, program, [])
 
 
-pure func compiler_typecheck_program_with_import_modules(
+private pure func compiler_reachable_importable_modules(
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+	current_module_path: Option[String],
+) -> List[CompilerImportableModule]:
+	direct_import_modules = compiler_importable_modules_for_program(
+		import_modules,
+		program,
+		current_module_path,
+	)
+	compiler_importable_module_dependency_closure(
+		import_modules,
+		direct_import_modules,
+		current_module_path,
+	)
+
+
+pure func compiler_reachable_importable_modules_for_program(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 	import_modules: List[CompilerImportableModule],
+	current_module_path: String,
+) -> List[CompilerImportableModule]:
+	program_with_prelude = compiler_program_with_prelude_imports(state, program, import_modules)
+	compiler_reachable_importable_modules(
+		program_with_prelude,
+		import_modules,
+		Some(current_module_path),
+	)
+
+
+private pure func compiler_typecheck_program_with_import_modules_internal(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+	current_module_path: Option[String],
 ) -> CompilerTypecheckProgramResult:
 	program_with_prelude = compiler_program_with_prelude_imports(state, program, import_modules)
-	import_surfaces = compiler_importable_module_surfaces(import_modules)
-	direct_import_modules = compiler_importable_modules_for_program(
-		import_modules,
+	type_import_modules = compiler_reachable_importable_modules(
 		program_with_prelude,
-	)
-	type_import_modules = compiler_importable_module_dependency_closure(
 		import_modules,
-		direct_import_modules,
+		current_module_path,
+	)
+	import_surfaces = compiler_importable_module_surfaces(type_import_modules)
+	direct_import_modules = compiler_importable_modules_for_program(
+		type_import_modules,
+		program_with_prelude,
+		current_module_path,
 	)
 	with_names = compiler_typecheck_prescan_program(state, program_with_prelude)
 	with_imports = compiler_register_program_imports(
@@ -6133,6 +6238,92 @@ pure func compiler_typecheck_program_with_import_modules(
 		program_with_prelude,
 		import_modules,
 	)
+
+
+pure func compiler_typecheck_program_with_import_modules(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+) -> CompilerTypecheckProgramResult:
+	compiler_typecheck_program_with_import_modules_internal(state, program, import_modules, None)
+
+
+pure func compiler_typecheck_program_with_import_modules_for_module(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+	current_module_path: String,
+) -> CompilerTypecheckProgramResult:
+	compiler_typecheck_program_with_import_modules_internal(
+		state,
+		program,
+		import_modules,
+		Some(current_module_path),
+	)
+
+
+func compiler_typecheck_program_with_import_modules_for_module_with_trace(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+	current_module_path: String,
+	trace: (String) -> Void,
+) -> CompilerTypecheckProgramResult:
+	program_with_prelude = compiler_program_with_prelude_imports(state, program, import_modules)
+	trace("typecheck_prelude_complete")
+	type_import_modules = compiler_reachable_importable_modules(
+		program_with_prelude,
+		import_modules,
+		Some(current_module_path),
+	)
+	trace("typecheck_reachable_imports_complete")
+	import_surfaces = compiler_importable_module_surfaces(type_import_modules)
+	trace("typecheck_import_surfaces_complete")
+	direct_import_modules = compiler_importable_modules_for_program(
+		type_import_modules,
+		program_with_prelude,
+		Some(current_module_path),
+	)
+	trace("typecheck_direct_imports_complete")
+	with_names = compiler_typecheck_prescan_program(state, program_with_prelude)
+	trace("typecheck_prescan_complete")
+	with_imports = compiler_register_program_imports(
+		compiler_typecheck_state_copy(with_names),
+		import_surfaces,
+		program_with_prelude,
+	)
+	trace("typecheck_import_syntax_complete")
+	with_import_decls = compiler_typecheck_register_import_modules(
+		compiler_typecheck_state_copy(with_imports),
+		type_import_modules,
+		direct_import_modules,
+		import_surfaces,
+	)
+	trace("typecheck_import_decls_complete")
+	with_types = compiler_typecheck_register_program_type_decls(
+		compiler_typecheck_state_copy(with_import_decls),
+		program_with_prelude,
+	)
+	trace("typecheck_local_types_complete")
+	with_signatures = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_state_copy(with_types),
+		program_with_prelude,
+	)
+	trace("typecheck_local_signatures_complete")
+	with_impls = compiler_typecheck_register_program_impl_decls(
+		compiler_typecheck_state_copy(with_signatures),
+		program_with_prelude,
+	)
+	trace("typecheck_local_impls_complete")
+	result = compiler_typecheck_materialize_program_bodies_with_import_modules_with_trace(
+		compiler_typecheck_state_copy(with_impls),
+		program_with_prelude,
+		import_modules,
+		trace,
+	)
+	trace("typecheck_bodies_complete")
+
+	result
 
 
 pure func compiler_typecheck_program(

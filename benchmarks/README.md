@@ -164,13 +164,46 @@ benchmarks/compiler_typecheck_replay "$capture" \
   --timeout 60 --memory-limit 4G --json
 ```
 
-`--module PATH` selects one original module target plus the request target;
-`--first N` selects a prefix. The result records request, replay, and helper
-hashes; artifact order and count; response size and hash; elapsed time; peak
-RSS; and sampled peak RSS by phase and module. Phases shorter than the sampling
-interval can be absent rather than receiving an inferred value. Helper
-preparation is excluded from the measurement, while stdout and stderr remain
-file-backed.
+`--module PATH` selects one original module target plus the request target and
+can be repeated to form a narrow module set. `--first N` selects a prefix.
+The `--retention-slice` preset specifically requires a `compiler_cli_main`
+capture:
+
+```bash
+cli_capture=$(mktemp "${TMPDIR:-/tmp}/blorp-cli-typecheck.XXXXXX.json")
+BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$cli_capture" \
+  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  __compiler-host-compile-wrapper \
+  -o "$output" \
+  compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
+
+benchmarks/compiler_typecheck_replay "$cli_capture" \
+  --retention-slice --timeout 60 --memory-limit 4G
+```
+
+As with the generic capture, the host command is expected to stop nonzero
+before creating `"$output"`. The preset selects the known CTFE trigger plus its
+six retained dependencies.
+
+This is the fast feedback loop for graph-retention work. With a prepared helper
+it completes in roughly 20 seconds on the development machine, instead of
+running the unsafe 145-artifact graph. The runner enables a low-overhead
+structural inventory by default. It reports parsed graph size, retained CTFE
+program declarations and typed-expression nodes, artifact nodes, and modules
+that exist simultaneously as retained CTFE and emitted typed programs. These
+are logical structure counts, not allocator-byte estimates.
+Artifact inventory distinguishes a second typed representation
+(`duplicates_retained_ctfe=1`) from direct reuse of the retained CTFE program
+(`reuses_retained_ctfe=1`). Reuse is permitted only when the dependency
+typechecks in the artifact import environment and the graph target is not
+reachable through its explicit import closure.
+Use `--no-inventory` for an otherwise identical RSS/timing control run.
+
+The result also records request, replay, and helper hashes; artifact order and
+count; response size and hash; elapsed time; peak RSS; and sampled peak RSS by
+phase and module. Phases shorter than the sampling interval can be absent
+rather than receiving an inferred value. Helper preparation is excluded from
+the measurement, while stdout and stderr remain file-backed.
 
 The memory limit uses an address-space limit on Linux and a sampled RSS
 watchdog on macOS. Linux allocation-limit failures are not distinguishable from

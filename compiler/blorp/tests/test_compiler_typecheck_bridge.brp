@@ -11,6 +11,7 @@ import:
 		compiler_typecheck_graph,
 		handle_request,
 		stream_typecheck_graph_request_chunks,
+		stream_typecheck_graph_request_chunks_with_inventory,
 		stream_typecheck_graph_request_value,
 	../src/stage_06_typecheck/compiler_typecheck_decl:
 		CompilerTypedDecl(
@@ -550,6 +551,68 @@ func chunked_graph_trace_entries(request: String) -> List[String]:
 			[]
 
 
+func chunked_graph_inventory_trace_entries(request: String) -> List[String]:
+	match parse_json(request):
+		Ok(root):
+			entries: Channel[String] = channel(1024)
+			emit_chunk = func(chunk: String):
+				_ = chunk.length()
+			trace_entry = func(phase: String, module_name: String):
+				_ = send(entries, phase + ":" + module_name)
+			inventory_entry = func(kind: String, fields: String):
+				_ = kind.length() + fields.length()
+			_ = stream_typecheck_graph_request_chunks_with_inventory(
+				root,
+				emit_chunk,
+				trace_entry,
+				inventory_entry,
+			)
+			seal(entries)
+			var result: List[String] = []
+
+			while True:
+				match recv(entries):
+					Some(entry):
+						result = result.append(entry)
+					None:
+						break
+
+			result
+		Err(_):
+			[]
+
+
+func chunked_graph_inventory_entries(request: String) -> List[String]:
+	match parse_json(request):
+		Ok(root):
+			entries: Channel[String] = channel(256)
+			emit_chunk = func(chunk: String):
+				_ = chunk.length()
+			trace_entry = func(phase: String, module_name: String):
+				_ = phase.length() + module_name.length()
+			inventory_entry = func(kind: String, fields: String):
+				_ = send(entries, kind + ":" + fields)
+			_ = stream_typecheck_graph_request_chunks_with_inventory(
+				root,
+				emit_chunk,
+				trace_entry,
+				inventory_entry,
+			)
+			seal(entries)
+			var result: List[String] = []
+
+			while True:
+				match recv(entries):
+					Some(entry):
+						result = result.append(entry)
+					None:
+						break
+
+			result
+		Err(_):
+			[]
+
+
 pure func json_value_lists_equal(left: List[JsonValue], right: List[JsonValue]) -> Bool:
 	if left.length() != right.length():
 		False
@@ -701,6 +764,120 @@ func test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation() -> Bo
 		and entries.contains("ctfe_dependency_typecheck_start:dep")
 		and entries.contains("ctfe_dependency_typecheck_complete:dep")
 	)
+
+
+func test_typecheck_inventory_traces_internal_typecheck_phases() -> Bool:
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"pure func answer() -> Int:\n\t41\n\nvalue: Int = answer()",
+	)
+	request = typecheck_graph_request(target, [], [])
+	inventory_entries = chunked_graph_inventory_trace_entries(request)
+	normal_entries = chunked_graph_trace_entries(request)
+
+	(
+		inventory_entries.contains("typecheck_prelude_complete:main")
+		and inventory_entries.contains("typecheck_reachable_imports_complete:main")
+		and inventory_entries.contains("typecheck_import_decls_complete:main")
+		and inventory_entries.contains("typecheck_local_impls_complete:main")
+		and inventory_entries.contains("typecheck_body_decl_0_start:main")
+		and inventory_entries.contains("typecheck_body_decl_0_complete:main")
+		and inventory_entries.contains("typecheck_bodies_complete:main")
+		and not normal_entries.contains("typecheck_prelude_complete:main")
+		and not normal_entries.contains("typecheck_body_decl_0_start:main")
+	)
+
+
+func test_typecheck_graph_chunk_stream_inventories_retained_typed_programs() -> Bool:
+	dep: JsonValue = user_import_module_json("dep", "dep", "pure func answer() -> Int:\n\t41")
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"import:\n\tdep: answer\n\nvalue: Int = answer()",
+	)
+	entries = chunked_graph_inventory_entries(typecheck_graph_request(target, [dep], ["dep"]))
+	graph_entry = entries.find(func(entry):
+		(
+			entry.starts_with("graph:")
+			and entry.contains("modules=1")
+			and entry.contains("selected_modules=1")
+			and entry.contains("ctfe_dependencies=1")
+			and entry.contains("ctfe_selected_overlap=1")
+		)
+	)
+	dependency_entry = entries.find(func(entry):
+		(
+			entry.starts_with("ctfe_dependency:module=dep ")
+			and entry.contains("typed_decls=1")
+			and entry.contains("typed_expr_nodes=2")
+		)
+	)
+	duplicate_artifact_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact:module=dep ")
+			and entry.contains("duplicates_retained_ctfe=0")
+			and entry.contains("reuses_retained_ctfe=1")
+			and entry.contains("typed_decls=1")
+			and entry.contains("typed_expr_nodes=2")
+		)
+	)
+	target_artifact_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact:module=main ")
+			and entry.contains("duplicates_retained_ctfe=0")
+			and entry.contains("reuses_retained_ctfe=0")
+			and entry.contains("typed_decls=2")
+			and entry.contains("typed_expr_nodes=1")
+		)
+	)
+	target_ownership_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact_ownership:module=main ")
+			and entry.contains("after_typecheck_unique=")
+			and entry.contains("after_ctfe_unique=")
+			and entry.contains("after_module_construction_unique=")
+			and entry.contains("before_artifact_release_unique=")
+		)
+	)
+
+	(
+		graph_entry.is_some()
+		and dependency_entry.is_some()
+		and duplicate_artifact_entry.is_some()
+		and target_artifact_entry.is_some()
+		and target_ownership_entry.is_some()
+	)
+
+
+func test_typecheck_graph_reuses_ctfe_artifact_with_rewritten_global() -> Bool:
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", "answer: Int = 41")
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"import:\n\tdependency: answer\n\nfinal_answer: Int = answer",
+	)
+	request = typecheck_graph_request(target, [dependency], ["dependency"])
+	entries = chunked_graph_inventory_entries(request)
+	dependency_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact:module=dependency ")
+			and entry.contains("duplicates_retained_ctfe=0")
+			and entry.contains("reuses_retained_ctfe=1")
+		)
+	)
+
+	match streamed_graph_responses(request, 2):
+		Some(responses):
+			dependency_response = responses.get_or(0, JsonNull)
+
+			(
+				dependency_entry.is_some()
+				and artifact_array_length(dependency_response, "type_errors") == 0
+				and artifact_string_field(dependency_response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
 
 
 func test_typecheck_graph_handles_shared_import_context() -> Bool:
@@ -1169,6 +1346,173 @@ func test_typecheck_graph_ctfe_dependency_sees_target_surface() -> Bool:
 			(
 				artifact_array_length(response, "type_errors") == 0
 				and artifact_string_field(response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_does_not_reuse_target_dependent_ctfe_artifact() -> Bool:
+	dependency_source: String =
+		|import:
+		|	main: Marker
+		|
+		|answer: Int = 42
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+	request = typecheck_graph_request(target, [dependency], ["dependency"])
+	entries = chunked_graph_inventory_entries(request)
+	dependency_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact:module=dependency ")
+			and entry.contains("duplicates_retained_ctfe=1")
+			and entry.contains("reuses_retained_ctfe=0")
+		)
+	)
+
+	match streamed_graph_responses(request, 2):
+		Some(responses):
+			dependency_response = responses.get_or(0, JsonNull)
+			target_response = responses.get_or(1, JsonNull)
+
+			(
+				dependency_entry.is_some()
+				and artifact_array_length(dependency_response, "type_errors") == 0
+				and artifact_array_length(target_response, "type_errors") == 0
+				and artifact_string_field(target_response, "ctfe_status") == "evaluated"
+			)
+		None:
+			False
+
+
+func test_typecheck_graph_does_not_reuse_std_relative_target_dependency() -> Bool:
+	dependency_source: String =
+		|import:
+		|	std/main: Marker
+		|
+		|answer: Int = 42
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = import_module_json("main", "main", target_source)
+	entries = chunked_graph_inventory_entries(
+		typecheck_graph_request(
+			target,
+			[dependency],
+			["dependency"],
+		),
+	)
+
+	entries.any(func(entry):
+		(
+			entry.starts_with("artifact:module=dependency ")
+			and entry.contains("duplicates_retained_ctfe=1")
+			and entry.contains("reuses_retained_ctfe=0")
+		)
+	)
+
+
+func test_typecheck_graph_does_not_reuse_transitive_std_relative_target_dependency() -> Bool:
+	intermediate_source: String =
+		|import:
+		|	std/main: Marker
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	intermediate: JsonValue = user_import_module_json(
+		"intermediate",
+		"intermediate",
+		intermediate_source,
+	)
+	dependency_source: String =
+		|import:
+		|	intermediate: preserve
+		|
+		|answer: Int = 42
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = import_module_json("main", "main", target_source)
+	entries = chunked_graph_inventory_entries(
+		typecheck_graph_request(
+			target,
+			[intermediate, dependency],
+			["dependency"],
+		),
+	)
+
+	entries.any(func(entry):
+		(
+			entry.starts_with("artifact:module=dependency ")
+			and entry.contains("duplicates_retained_ctfe=1")
+			and entry.contains("reuses_retained_ctfe=0")
+		)
+	)
+
+
+func test_typecheck_graph_does_not_reuse_ctfe_artifact_with_prelude_target_import() -> Bool:
+	prelude_source: String =
+		|import:
+		|	std/main: Marker
+	prelude: JsonValue = import_module_json("std/prelude", "prelude", prelude_source)
+	dependency_source: String =
+		|answer: Int = 42
+		|
+		|pure func preserve(value: Marker) -> Marker:
+		|	value
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: answer
+		|
+		|record Marker {value: Int}
+		|
+		|final_answer: Int = answer
+	target: JsonValue = import_module_json("main", "main", target_source)
+	request = typecheck_graph_request(
+		target,
+		[prelude, dependency],
+		["dependency"],
+	)
+	entries = chunked_graph_inventory_entries(request)
+	dependency_entry = entries.find(func(entry):
+		(
+			entry.starts_with("artifact:module=dependency ")
+			and entry.contains("duplicates_retained_ctfe=1")
+			and entry.contains("reuses_retained_ctfe=0")
+		)
+	)
+
+	match streamed_graph_responses(request, 2):
+		Some(responses):
+			target_response = responses.get_or(1, JsonNull)
+
+			(
+				dependency_entry.is_some()
+				and artifact_array_length(target_response, "type_errors") == 0
+				and artifact_string_field(target_response, "ctfe_status") == "evaluated"
 			)
 		None:
 			False
@@ -2596,6 +2940,18 @@ tests: TestSuite = {
 			test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation,
 		),
 		(
+			"typecheck inventory traces internal typecheck phases",
+			test_typecheck_inventory_traces_internal_typecheck_phases,
+		),
+		(
+			"typecheck_graph chunk stream inventories retained typed programs",
+			test_typecheck_graph_chunk_stream_inventories_retained_typed_programs,
+		),
+		(
+			"typecheck_graph reuses CTFE artifact with rewritten global",
+			test_typecheck_graph_reuses_ctfe_artifact_with_rewritten_global,
+		),
+		(
 			"typed graph API returns in-memory results",
 			test_typed_graph_api_returns_in_memory_results,
 		),
@@ -2666,6 +3022,22 @@ tests: TestSuite = {
 		(
 			"typecheck_graph CTFE dependency sees target surface",
 			test_typecheck_graph_ctfe_dependency_sees_target_surface,
+		),
+		(
+			"typecheck_graph does not reuse target-dependent CTFE artifact",
+			test_typecheck_graph_does_not_reuse_target_dependent_ctfe_artifact,
+		),
+		(
+			"typecheck_graph does not reuse std-relative target dependency",
+			test_typecheck_graph_does_not_reuse_std_relative_target_dependency,
+		),
+		(
+			"typecheck_graph does not reuse transitive std-relative target dependency",
+			test_typecheck_graph_does_not_reuse_transitive_std_relative_target_dependency,
+		),
+		(
+			"typecheck_graph does not reuse CTFE artifact with prelude target import",
+			test_typecheck_graph_does_not_reuse_ctfe_artifact_with_prelude_target_import,
 		),
 		(
 			"typecheck_graph resolves imported global annotation",
