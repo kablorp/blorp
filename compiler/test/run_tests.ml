@@ -87,9 +87,7 @@ let default_suites =
   @ suite_group "Core" Test_core.suite
   @ suite_group "CorePreMiddleJson" Test_core_pre_middle_json.suite
   @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
-  @ suite_group "CoreFlatten" Test_core_flatten.suite
-  @ suite_group "CoreLower" Test_core_lower.suite
-  @ suite_group "CoreFfiBoundary" Test_core_ffi_boundary.suite
+  @ suite_group "CoreCompatibility" Test_core_compatibility.suite
   @ suite_group "CoreResolve" Test_core_resolve.suite
   @ suite_group "CoreStdInline" Test_core_std_inline.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite

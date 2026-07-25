@@ -323,8 +323,8 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_lower.ml` | Typed AST → Core lowering |
-| `core_ffi_boundary.ml` | Checked FFI argument-boundary policies attached before Core transforms |
+| `core_lower.ml` | Compatibility typed AST → Core lowering used only by the bounded bootstrap and legacy in-memory routes |
+| `core_ffi_boundary.ml` | Compatibility checked FFI annotation for those legacy lowering routes |
 | `core_debug.ml` | `debug:` block erasure/retention after lowering |
 | `core_desugar.ml` | Sugar elimination |
 | `core_ssa.ml` | Mutable-local lowering used inside the desugar stage |
@@ -351,7 +351,7 @@ boxing, or ownership behavior from source spelling.
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
-| `core_flatten.ml` | Module prefixing and import-table assembly |
+| `core_flatten.ml` | Compatibility module prefixing for the bounded bootstrap and legacy in-memory routes |
 | `core_invariants.ml` | Stage-boundary invariant checks |
 | `core_pipeline.ml` | Pipeline orchestration, module assembly |
 | `core_error.ml` | Structured errors with phase/location/hint |
@@ -408,8 +408,8 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_lower.ml      # Typed AST → Core IR lowering (require_type invariant)
-│   ├── core_ffi_boundary.ml # Checked FFI argument-boundary policies
+│   ├── core_lower.ml      # Compatibility-only typed AST → Core lowering
+│   ├── core_ffi_boundary.ml # Compatibility-only checked FFI policies
 │   ├── core_debug.ml      # debug: block lowering by build mode
 │   ├── core_desugar.ml    # Core IR sugar elimination
 │   ├── core_ssa.ml        # Mutable-local lowering used by core_desugar
@@ -868,12 +868,13 @@ User-facing subcommands:
 5. **TypeCheck** (`typecheck.ml`, `infer.ml`):
    - Add type checking for new construct
 
-6. **Core lowering** (`core_lower.ml`):
-   - Translate the new AST node into Core IR. If the construct desugars
-     to existing Core, handle it in `core_desugar.ml` instead.
+6. **Core lowering** (`compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`):
+   - Translate the new typed AST node into Core IR. If the construct desugars
+     to existing Core, handle it in the owning Blorp middle-Core pass instead.
    - If the construct has build-mode semantics like `debug:`, represent it
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
+   - Do not add new behavior to compatibility-only `compiler/lib/core_lower.ml`.
 
 7. **Core emission** (`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.

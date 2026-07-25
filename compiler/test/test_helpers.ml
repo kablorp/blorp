@@ -124,44 +124,11 @@ let expect_ok_typed src =
       (format_errors errors);
   typed
 
-(** Assert a hand-built AST expression satisfies the typed boundary. Use this
-    in Core tests that need custom AST shapes but should still exercise typed
-    entrypoints instead of transitional compatibility wrappers. *)
-let expect_valid_typed_expr expr =
-  match Blorp.Typed_ast.of_ast_expr expr with
-  | Ok typed -> typed
-  | Error _ -> Alcotest.fail "expected test expression to satisfy Typed_ast"
-
-(** Assert a hand-built AST declaration satisfies the typed boundary. *)
-let expect_valid_typed_decl decl =
-  match Blorp.Typed_ast.of_ast_decl decl with
-  | Ok typed -> typed
-  | Error _ -> Alcotest.fail "expected test declaration to satisfy Typed_ast"
-
 (** Assert a hand-built AST program satisfies the typed boundary. *)
 let expect_valid_typed_program program =
   match Blorp.Typed_ast.of_ast_program program with
   | Ok typed -> typed
   | Error _ -> Alcotest.fail "expected test program to satisfy Typed_ast"
-
-let expect_typed_expr_error expr check =
-  match Blorp.Typed_ast.of_ast_expr expr with
-  | Ok _ -> Alcotest.fail "expected test expression to fail Typed_ast"
-  | Error err -> check err
-
-let expect_typed_decl_error decl check =
-  match Blorp.Typed_ast.of_ast_decl decl with
-  | Ok _ -> Alcotest.fail "expected test declaration to fail Typed_ast"
-  | Error err -> check err
-
-let lower_valid_expr expr =
-  Blorp.Core_lower.lower_typed_expr (expect_valid_typed_expr expr)
-
-let lower_valid_decl decl =
-  Blorp.Core_lower.lower_typed_decl (expect_valid_typed_decl decl)
-
-let lower_valid_program program =
-  Blorp.Core_lower.lower_typed_program (expect_valid_typed_program program)
 
 let compile_valid_program ?embed_runtime ?profile ?debug ?on_stage
     ?check_invariants program =

@@ -1866,7 +1866,6 @@ OCaml references:
 - `compiler/lib/core_lower.ml`
   - `lower_typed_program`
   - `lower_typed_decl`
-  - `lower_typed_expr`
   - `lower_typed_expr_core`
   - `lower_block`
   - `lower_with`
@@ -2213,9 +2212,7 @@ Tests:
 - `compiler/blorp/tests/test_compiler_infer.brp`
 - `compiler/test/test_core_pre_middle_json.ml`
 - `compiler/test/test_semantic_middle_worker.ml`
-- `compiler/test/test_core_lower.ml`
-- `compiler/test/test_core_flatten.ml`
-- `compiler/test/test_core_ffi_boundary.ml`
+- `compiler/test/test_core_compatibility.ml`
 - `compiler/test/test_core_list_layout.ml`
 - `tests/test_compiler/codegen_audit/should_pass/foreign_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/concurrent*.brp`
@@ -2225,10 +2222,14 @@ Deletion point:
 
 - Normal production ownership has moved, so no new source-command dependency
   may be added to OCaml typed-AST lowering or flattening. Delete
-  `core_lower.ml`, `core_flatten.ml`, and their implementation-only tests after
-  the pinned-bootstrap wrapper and direct in-memory compatibility tests are
-  converted to prepared Core. This cleanup is independent of checkpoint 8's
-  production boundary.
+  `core_lower.ml` and `core_flatten.ml` after the pinned-bootstrap wrapper and
+  direct in-memory compatibility tests are converted to prepared Core. The
+  broad implementation-only OCaml lowering, flattening, and FFI-boundary suites
+  were replaced with one focused compatibility-contract suite after their
+  authoritative Blorp suites and production prepared-Core boundary were
+  established. Keep that compact suite until the remaining compatibility
+  source is deleted. This cleanup is independent of checkpoint 8's production
+  boundary.
 
 ## Checkpoint 9: Early And Middle Core Pipeline
 
