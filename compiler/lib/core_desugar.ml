@@ -17,6 +17,10 @@
       other expressions are converted with concrete to-string helpers or
       the [blorp_to_string] sentinel resolved by [Core_specialize].
 
+    - {b String accumulation}: [target = target + suffix] →
+      [target = blorp_string_append(target, suffix)]. The append builtin
+      consumes the overwritten value and reuses its allocation when unique.
+
     Direct [?=] propagation is lowered before this pass by [Core_lower]. *)
 
 open Core
@@ -203,7 +207,7 @@ let is_string_ty ty =
 let desugar_string_binop (e : core) : core =
   match e.desc with
   | CBin (Ast.Add, l, r) when is_string_ty l.ty ->
-      builtin_call "blorp_string_concat" [ l; r ] ty_string e.loc
+      builtin_call "blorp_string_concat" [ l; r ] e.ty e.loc
   | CBin (Ast.Eq, l, r) when is_string_ty l.ty ->
       let ty_bool = Ast.TyNamed ("Bool", []) in
       builtin_call "blorp_string_eq" [ l; r ] ty_bool e.loc
@@ -211,6 +215,36 @@ let desugar_string_binop (e : core) : core =
       let ty_bool = Ast.TyNamed ("Bool", []) in
       let eq = builtin_call "blorp_string_eq" [ l; r ] ty_bool e.loc in
       { desc = CUn (Ast.Not, eq); ty = ty_bool; loc = e.loc }
+  | _ -> e
+
+(** Rewrite exact string accumulator assignments after their [String + String]
+    child has become [blorp_string_concat]. The target/source identity check is
+    structural Core variable identity, not a source-name heuristic.
+
+    This intentionally does not reassociate left-nested additions such as
+    [target = target + a + b]; that requires a producer-chain lowering that
+    preserves evaluation and ownership explicitly. *)
+let desugar_string_accumulator_assignment (e : core) : core =
+  match e.desc with
+  | CAssign
+      ( target,
+        ({
+           desc =
+             CCall
+               ( CKBuiltin "blorp_string_concat",
+                 _,
+                 [ ({ desc = CVar source; _ } as source_expr); suffix ] );
+           _;
+         } as rhs) )
+    when Var.equal target source && is_string_ty rhs.ty ->
+      {
+        e with
+        desc =
+          CAssign
+            ( target,
+              builtin_call "blorp_string_append" [ source_expr; suffix ] rhs.ty
+                rhs.loc );
+      }
   | _ -> e
 
 (* ============================================================================
@@ -231,7 +265,8 @@ let desugar_expr (field_map : (string, Ast.field_decl list) Hashtbl.t)
     (fun node ->
       let node = desugar_record_update field_map node in
       let node = desugar_string_interp node in
-      desugar_string_binop node)
+      let node = desugar_string_binop node in
+      desugar_string_accumulator_assignment node)
     e
 
 (** Desugar record updates in a function body. *)
