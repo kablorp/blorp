@@ -118,7 +118,10 @@ let test_rejects_schema_domain_phase_capability_and_stage () =
   expect_decode_error "unsupported_core_phase" (request_json ~core_phase:"post_ctfe" ());
   expect_decode_error "unsupported_capability"
     (request_json ~capabilities:[ "typed_ast_post_ctfe" ] ());
-  expect_decode_error "unsupported_stage" (request_json ~observations:[ "dce" ] ())
+  expect_decode_error "unsupported_stage"
+    (request_json ~observations:[ "dce" ] ());
+  expect_decode_error "unsupported_stage"
+    (request_json ~observations:[ "specialize" ] ())
 
 let test_rejects_missing_and_late_core () =
   expect_decode_error "missing_field"

@@ -31,6 +31,11 @@
 #include <poll.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -899,6 +904,8 @@ static void* __mem_watch_thread(void* arg) {
 typedef struct blorp_AllocMeta_s {
     blorp_Object* object;
     size_t alloc_size;
+    long alloc_site_offset;
+    long alloc_caller_offset;
     unsigned long stats_epoch;
     bool stats_tracked;
     bool live_linked;
@@ -916,6 +923,37 @@ static pthread_mutex_t __alloc_meta_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline bool __alloc_meta_enabled(void) {
     return __blorp_stats_enabled || __leak_tracking_enabled;
+}
+
+static inline bool __blorp_allocator_stats_active(void) {
+    return getenv("BLORP_ALLOCATOR_STATS") != NULL;
+}
+
+static long __blorp_allocator_bytes_in_use(void) {
+    size_t bytes = 0;
+#if defined(__APPLE__)
+    malloc_statistics_t stats = {0};
+    malloc_zone_statistics(malloc_default_zone(), &stats);
+    bytes = stats.size_in_use;
+#elif defined(__GLIBC__)
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+    struct mallinfo2 stats = mallinfo2();
+    size_t heap_bytes = stats.uordblks;
+    size_t mmap_bytes = stats.hblkhd;
+    bytes = heap_bytes > SIZE_MAX - mmap_bytes
+        ? SIZE_MAX
+        : heap_bytes + mmap_bytes;
+#else
+    return -1;
+#endif
+#else
+    return -1;
+#endif
+#else
+    return -1;
+#endif
+    return bytes > (size_t)LONG_MAX ? LONG_MAX : (long)bytes;
 }
 
 static inline size_t __alloc_meta_slot(const blorp_Object* obj) {
@@ -939,6 +977,8 @@ static void __alloc_meta_insert(blorp_Object* obj, size_t alloc_size, bool stats
     }
     meta->object = obj;
     meta->alloc_size = alloc_size;
+    meta->alloc_site_offset = 0;
+    meta->alloc_caller_offset = 0;
     meta->stats_epoch = atomic_load(&global_mem_stats.epoch);
     meta->stats_tracked = stats_tracked;
     meta->live_linked = __leak_tracking_enabled;
@@ -985,6 +1025,21 @@ static void __alloc_meta_set_type_tag(blorp_Object* obj, const char* tag) {
     pthread_mutex_lock(&__alloc_meta_mutex);
     blorp_AllocMeta* meta = __alloc_meta_find_locked(obj);
     if (meta) meta->type_tag = tag;
+    pthread_mutex_unlock(&__alloc_meta_mutex);
+}
+
+static void __alloc_meta_set_alloc_site(
+    blorp_Object* obj,
+    long site_offset,
+    long caller_offset
+) {
+    if (!__alloc_meta_enabled()) return;
+    pthread_mutex_lock(&__alloc_meta_mutex);
+    blorp_AllocMeta* meta = __alloc_meta_find_locked(obj);
+    if (meta) {
+        meta->alloc_site_offset = site_offset;
+        meta->alloc_caller_offset = caller_offset;
+    }
     pthread_mutex_unlock(&__alloc_meta_mutex);
 }
 
@@ -1630,10 +1685,13 @@ static long __blorp_collect_live_object_types(FILE* out,
             meta->stats_epoch == current_epoch) {
             __leak_type_record(buckets, meta->type_tag, meta->alloc_size);
             if (verbose) {
-                fprintf(out, "  #%ld  %s  %zu bytes  rc=%ld\n",
+                fprintf(out,
+                        "  #%ld  %s  %zu bytes  rc=%ld  alloc_site=%+ld"
+                        "  alloc_caller=%+ld\n",
                         counted + 1,
                         meta->type_tag ? meta->type_tag : "(unknown)",
-                        meta->alloc_size, rc);
+                        meta->alloc_size, rc, meta->alloc_site_offset,
+                        meta->alloc_caller_offset);
             }
             counted++;
         }
@@ -1806,6 +1864,11 @@ void* blorp_alloc(size_t size) {
         header,
         cls >= 0 ? (uint32_t)cls : BLORP_ALLOC_CLASS_DIRECT,
         actual_size
+    );
+    __alloc_meta_set_alloc_site(
+        header,
+        (long)((char*)__builtin_return_address(1) - (char*)(void*)&blorp_alloc),
+        (long)((char*)__builtin_return_address(2) - (char*)(void*)&blorp_alloc)
     );
     if (__blorp_stats_enabled && __blorp_trace_allocs) __blorp_trace_record(actual_size);
     return obj;
@@ -35722,18 +35785,30 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value) {
 // ============================================================================
 
 blorp_MemStats* blorp_get_mem_stats(void) {
-    __blorp_stats_enabled = true;  // Enable tracking when stats are requested
+    bool allocator_stats = __blorp_allocator_stats_active();
+    if (!allocator_stats) {
+        __blorp_stats_enabled = true;
+    }
     blorp_MemStats* stats = (blorp_MemStats*)blorp_alloc_untracked(sizeof(blorp_MemStats));
     // MemStats is an observation object, not part of the measured program heap.
-    stats->total_allocations = atomic_load(&global_mem_stats.total_allocations);
-    stats->total_releases = atomic_load(&global_mem_stats.total_releases);
-    stats->current_objects = atomic_load(&global_mem_stats.current_objects);
-    stats->bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
+    if (allocator_stats) {
+        stats->total_allocations = 0;
+        stats->total_releases = 0;
+        stats->current_objects = 0;
+        stats->bytes_allocated = __blorp_allocator_bytes_in_use();
+    } else {
+        stats->total_allocations = atomic_load(&global_mem_stats.total_allocations);
+        stats->total_releases = atomic_load(&global_mem_stats.total_releases);
+        stats->current_objects = atomic_load(&global_mem_stats.current_objects);
+        stats->bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
+    }
     return stats;
 }
 
 void blorp_reset_mem_stats(void) {
-    __blorp_stats_enabled = true;  // Enable tracking when stats are reset
+    if (!__blorp_allocator_stats_active()) {
+        __blorp_stats_enabled = true;
+    }
     atomic_fetch_add(&global_mem_stats.epoch, 1);
     atomic_store(&global_mem_stats.total_allocations, 0);
     atomic_store(&global_mem_stats.total_releases, 0);

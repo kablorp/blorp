@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-22.
+Status checked against code on 2026-07-24.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -289,7 +289,7 @@ Implementation:
    Ordinary `check` must make zero OCaml calls.
 4. Under focused tests, compile/run build exactly one semantic-worker request,
    accept one decoded response fixture, run `compiler_core_pipeline`, and call
-   `try_emit_core_program_c_artifact_with_options`. Do not add a temporary
+   `try_emit_core_program_c_artifact_with_profile`. Do not add a temporary
    subprocess mechanism. Do not make this path production-authoritative until
    Checkpoints D through I are complete.
 5. Split `CliRunFrontendModuleGraph` so the removed check handoff cannot be

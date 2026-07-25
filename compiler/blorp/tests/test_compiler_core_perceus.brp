@@ -1,7 +1,14 @@
 import:
 	../src/stage_09_core/compiler_core_consume_specialize as CoreConsumeSpecialize
 	../src/stage_09_core/compiler_core_json:
-		CoreAccessor(ListSpreadAccessor, RootAccessor, VariantFieldAccessor),
+		CoreAccessor(
+			ListElementAccessor,
+			ListSpreadAccessor,
+			RootAccessor,
+			StackResultErrPayloadAccessor,
+			StackResultOkPayloadAccessor,
+			VariantFieldAccessor,
+		),
 		CoreBinaryOp(AddOp, EqualOp),
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
@@ -22,7 +29,12 @@ import:
 			ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreConstructorMatchTest(EnumConstructorTest, UnionTagConstructorTest),
+		CoreConstructorMatchTest(
+			EnumConstructorTest,
+			StackResultErrConstructorTest,
+			StackResultOkConstructorTest,
+			UnionTagConstructorTest,
+		),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
 		CoreExpr(
 			AssignExpr,
@@ -45,12 +57,15 @@ import:
 			ListSetExpr,
 			LengthMatchExpr,
 			LiteralExpr,
+			PreClosureDetachExpr,
 			RecordConstructExpr,
 			ResourceScopeExpr,
 			SelectExpr,
 			SeqExpr,
 			TensorPackedLiteralExpr,
 			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
 			TupleExpr,
 			UnaryExpr,
 			UnboxExpr,
@@ -76,9 +91,11 @@ import:
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy),
+		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTaskCaptureKind(TaskCopyCapture),
+		CoreTensorDim(TensorStaticDim),
 		CoreTensorLiteralShape(TensorVectorLength),
 		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreType(
@@ -86,6 +103,7 @@ import:
 			HeapRecordType,
 			NamedType,
 			StackResultType,
+			TensorType,
 			TupleType,
 			UnionType,
 			ValueRecordType,
@@ -294,6 +312,13 @@ pure func list_int_type() -> CoreType:
 
 pure func list_string_type() -> CoreType:
 	NamedType("List", [string_type()])
+
+
+pure func tensor_int_type() -> CoreType:
+	TensorType({
+		element_type = int_type(),
+		dims = [TensorStaticDim(2)],
+	})
 
 
 pure func channel_string_type() -> CoreType:
@@ -1348,6 +1373,42 @@ pure func body_is_post_drop_after_value(name: String, body: CoreExpr) -> Bool:
 			is_post_drop_after_value(name, body)
 
 
+pure func outer_let_body_is_post_drop_after_raw_view(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				LetExpr(result_var, False, result_type, TensorRawViewLetExpr(binding, raw_body, raw_type, raw_loc), DropExpr(drop_var, _, _, VarExpr(returned, _, _), _, _)):
+					drop_var.name == name and returned.name == result_var.name
+				_:
+					False
+		_:
+			False
+
+
+pure func outer_let_body_is_post_drop_after_accessor_match(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				LetExpr(result_var, False, result_type, AccessorLiteralMatchExpr(scrutinee, policy, match_expr, match_type, match_loc), DropExpr(drop_var, _, _, VarExpr(returned, _, _), _, _)):
+					drop_var.name == name and returned.name == result_var.name
+				_:
+					False
+		_:
+			False
+
+
+pure func outer_let_body_is_post_drop_after_length_match(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			match body:
+				LetExpr(result_var, False, result_type, LengthMatchExpr(scrutinee, policy, match_expr, match_type, match_loc), DropExpr(drop_var, _, _, VarExpr(returned, _, _), _, _)):
+					drop_var.name == name and returned.name == result_var.name
+				_:
+					False
+		_:
+			False
+
+
 pure func has_drop_before_assign_for(name: String, expr: CoreExpr) -> Bool:
 	match expr:
 		SeqExpr(first, second):
@@ -1712,6 +1773,71 @@ pure func body_constructor_match_has_borrowed_case_only_drop(name: String, body:
 							False
 				_:
 					False
+
+
+pure func nested_constructor_match_drops_only_first_case(name: String, body: CoreExpr) -> Bool:
+	match body:
+		LetExpr(variable, is_mutable, typ, rhs, inner):
+			(
+				nested_constructor_match_drops_only_first_case(name, rhs)
+				or nested_constructor_match_drops_only_first_case(name, inner)
+			)
+		BorrowLetExpr(variable, typ, rhs, inner):
+			(
+				nested_constructor_match_drops_only_first_case(name, rhs)
+				or nested_constructor_match_drops_only_first_case(name, inner)
+			)
+		SeqExpr(first, second):
+			(
+				nested_constructor_match_drops_only_first_case(name, first)
+				or nested_constructor_match_drops_only_first_case(name, second)
+			)
+		DupExpr(variable, value_type, policy, inner, typ, loc):
+			nested_constructor_match_drops_only_first_case(name, inner)
+		DropExpr(variable, value_type, policy, inner, typ, loc):
+			nested_constructor_match_drops_only_first_case(name, inner)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+			match cases:
+				[first, second]:
+					match (first.body, second.body):
+						(ConstructorMatchBodyExpr(first_body), ConstructorMatchBodyExpr(second_body)):
+							(
+								drop_count_for(name, first_body) == 1
+								and drop_count_for(name, second_body) == 0
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func nested_if_drops_only_else_branch(name: String, body: CoreExpr) -> Bool:
+	match body:
+		LetExpr(variable, is_mutable, typ, rhs, inner):
+			(
+				nested_if_drops_only_else_branch(name, rhs)
+				or nested_if_drops_only_else_branch(name, inner)
+			)
+		BorrowLetExpr(variable, typ, rhs, inner):
+			(
+				nested_if_drops_only_else_branch(name, rhs)
+				or nested_if_drops_only_else_branch(name, inner)
+			)
+		SeqExpr(first, second):
+			(
+				nested_if_drops_only_else_branch(name, first)
+				or nested_if_drops_only_else_branch(name, second)
+			)
+		DupExpr(variable, value_type, policy, inner, typ, loc):
+			nested_if_drops_only_else_branch(name, inner)
+		DropExpr(variable, value_type, policy, inner, typ, loc):
+			nested_if_drops_only_else_branch(name, inner)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			drop_count_for(name, then_expr) == 0 and drop_count_for(name, else_expr) == 1
+		_:
+			False
 
 
 pure func literal_fallback_has_pre_drop_int(
@@ -2283,12 +2409,68 @@ pure func test_managed_field_of_owned_temporary_return_is_retained() -> Bool:
 
 	match function_body(rewritten, "node_items"):
 		Some(body):
-			(
-				dup_count_for("__owned_result", body) == 1
-				and drop_count_for("__owned_result", body) == 0
-			)
+			dup_count_for("__owned_result", body) == 1
 		None:
 			False
+
+
+pure func test_owned_temporary_field_owner_is_released() -> Bool:
+	field_result: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(88), [], [], HeapRecordType("Node")),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [HeapRecordDecl({
+				name = "Node",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl("node_items", 89, [], list_int_type(), field_result)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "node_items"):
+		Some(body):
+			drop_count_for("__owned_field_owner_0", body) == 1
+		None:
+			False
+
+
+pure func test_owned_temporary_tuple_field_owner_is_released() -> Bool:
+	tuple_type: CoreType = TupleType([list_int_type()])
+	field_result: CoreExpr = TupleFieldExpr(
+		user_call_expr("make_pair", Some(90), [], [], tuple_type),
+		0,
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("pair_items", 91, [], list_int_type(), field_result)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "pair_items"):
+		Some(body):
+			drop_count_for("__owned_field_owner_0", body) == 1
+		None:
+			False
+
+
+pure func test_unmanaged_temporary_tuple_field_owner_is_released_at_node() -> Bool:
+	tuple_type: CoreType = TupleType([string_type(), int_type()])
+	projection: CoreExpr = TupleFieldExpr(
+		user_call_expr("make_pair", Some(92), [], [], tuple_type),
+		1,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), projection)
+
+	drop_count_for("__owned_field_owner_0", rewritten) == 1
 
 
 pure func test_borrowed_parameter_returned_from_branch_is_retained() -> Bool:
@@ -2649,6 +2831,47 @@ pure func test_program_infers_read_only_user_call_borrows_argument() -> Bool:
 	match function_body(rewritten, "caller"):
 		Some(body):
 			drop_count_for("xs", body) == 1 and dup_count_for("xs", body) == 0
+		None:
+			False
+
+
+pure func test_string_equality_user_call_borrows_arguments() -> Bool:
+	string_equals: CoreDecl = function_decl(
+		"string_equals",
+		895,
+		[core_param("left", string_type()), core_param("right", string_type())],
+		bool_type(),
+		BinaryExpr(
+			EqualOp,
+			var_expr("left", string_type()),
+			var_expr("right", string_type()),
+			bool_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	caller: CoreDecl = function_decl(
+		"call_string_equals",
+		896,
+		[core_param("left", string_type()), core_param("right", string_type())],
+		bool_type(),
+		user_call_expr(
+			"string_equals",
+			Some(895),
+			[],
+			[var_expr("left", string_type()), var_expr("right", string_type())],
+			bool_type(),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [string_equals, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "call_string_equals"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc)):
+			name == "string_equals" and consumed_args.length() == 0
+		Some(_):
+			False
 		None:
 			False
 
@@ -3224,6 +3447,110 @@ pure func test_consumed_parameter_fallible_transfer_balances_reserved_owner() ->
 			False
 
 
+pure func test_result_propagation_balances_reserved_consumed_parameter_owner() -> Bool:
+	result_type: CoreType = StackResultType(int_type(), string_type())
+	consume_or_error: CoreDecl = function_decl(
+		"consume_or_error",
+		813,
+		[core_param("key", string_type()), core_param("succeeds", bool_type())],
+		result_type,
+		IfExpr(
+			var_expr("succeeds", bool_type()),
+			user_call_expr("Ok", Some(1207), [], [int_expr(1)], result_type),
+			user_call_expr("Err", Some(1208), [], [var_expr("key", string_type())], result_type),
+			result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	ok_case: CoreConstructorMatchCase = {
+		constructor = "Ok",
+		accessor = RootAccessor,
+		test = StackResultOkConstructorTest("blorp_StackResult"),
+		bindings = [
+			{
+				variable = named_var("value"),
+				typ = int_type(),
+				accessor = StackResultOkPayloadAccessor(RootAccessor),
+				mode = MatchBorrowBindingMode
+			},
+		],
+		body = ConstructorMatchBodyExpr(
+			IfExpr(
+				var_expr("valid", bool_type()),
+				user_call_expr("Ok", Some(1207), [], [var_expr("value", int_type())], result_type),
+				user_call_expr(
+					"Err",
+					Some(1208),
+					[],
+					[var_expr("key", string_type())],
+					result_type,
+				),
+				result_type,
+				SyntheticSourceLoc,
+			),
+		)
+	}
+	err_case: CoreConstructorMatchCase = {
+		constructor = "Err",
+		accessor = RootAccessor,
+		test = StackResultErrConstructorTest("blorp_StackResult"),
+		bindings = [
+			{
+				variable = named_var("propagated_error"),
+				typ = string_type(),
+				accessor = StackResultErrPayloadAccessor(RootAccessor),
+				mode = MatchBorrowBindingMode
+			},
+		],
+		body = ConstructorMatchBodyExpr(
+			call_expr(
+				"blorp_result_err",
+				[var_expr("propagated_error", string_type())],
+				result_type,
+			),
+		)
+	}
+	decode_key: CoreDecl = function_decl(
+		"decode_key",
+		814,
+		[core_param("key", string_type()), core_param("valid", bool_type())],
+		result_type,
+		LetExpr(
+			named_var("fallible"),
+			False,
+			result_type,
+			user_call_expr(
+				"consume_or_error",
+				Some(813),
+				[],
+				[var_expr("key", string_type()), bool_expr(True)],
+				result_type,
+			),
+			ConstructorMatchExpr(
+				var_expr(
+					"fallible",
+					result_type,
+				),
+				NoReleasePolicy,
+				[ok_case, err_case],
+				ConstructorMatchFallbackFail,
+				result_type,
+				SyntheticSourceLoc,
+			),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [consume_or_error, decode_key],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "decode_key"):
+		Some(body):
+			dup_count_for("key", body) == 1 and drop_count_for("key", body) == 2
+		None:
+			False
+
+
 pure func test_unused_consumed_managed_parameter_is_dropped() -> Bool:
 	callee: CoreDecl = function_decl(
 		"discard",
@@ -3446,6 +3773,151 @@ pure func test_count_uses_includes_prepared_list_retain_value() -> Bool:
 	)
 
 	count_uses("value", expr) == 1 and count_uses("items", expr) == 1
+
+
+pure func test_count_uses_includes_raw_tensor_view_operands() -> Bool:
+	view: CoreVar = named_var("__raw")
+	body: CoreExpr = SeqExpr(
+		TensorRawReadExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = var_expr("index", int_type())
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		TensorRawWriteExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = var_expr("index", int_type()),
+				value = var_expr("value", int_type())
+			},
+			void_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	expr: CoreExpr = TensorRawViewLetExpr(
+		{
+			variable = view,
+			kind = TensorInt64Elements,
+			source = var_expr("tensor", tensor_int_type())
+		},
+		body,
+		void_type(),
+		SyntheticSourceLoc,
+	)
+
+	(
+		count_uses("tensor", expr) == 1
+		and count_uses("index", expr) == 2
+		and count_uses("value", expr) == 1
+		and count_uses("__raw", expr) == 0
+	)
+
+
+pure func test_raw_tensor_view_drops_source_after_body() -> Bool:
+	view: CoreVar = named_var("__raw")
+	raw_read: CoreExpr = TensorRawViewLetExpr(
+		{
+			variable = view,
+			kind = TensorInt64Elements,
+			source = var_expr("tensor", tensor_int_type())
+		},
+		TensorRawReadExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = int_expr(0)
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("tensor"),
+			False,
+			tensor_int_type(),
+			var_expr("source", tensor_int_type()),
+			raw_read,
+		),
+	)
+
+	(
+		drop_count_for("tensor", rewritten) == 1
+		and outer_let_body_is_post_drop_after_raw_view("tensor", rewritten)
+	)
+
+
+pure func test_count_uses_flattened_detach_payloads() -> Bool:
+	pre_closure: CoreExpr = PreClosureDetachExpr(
+		binary_expr(
+			var_expr("x", int_type()),
+			var_expr("x", int_type()),
+			int_type(),
+		),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	post_closure: CoreExpr = DetachExpr(
+		{
+			function_name = "worker",
+			def_id = 91,
+			c_name = "worker_c",
+			static_name = "worker_static",
+			captures = [
+				{
+					name = "x",
+					typ = string_type(),
+					kind = TaskCopyCapture
+				},
+			],
+			return_type = void_type()
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+
+	count_uses("x", pre_closure) == 2 and count_uses("x", post_closure) == 1
+
+
+pure func test_count_uses_select_waits_branches_and_shadowing() -> Bool:
+	recv_arm: CoreSelectArm = {
+		kind = SelectRecvArm({
+			binder = named_var("x"),
+			elem_type = int_type(),
+			channel = var_expr("x", int_type()),
+		}),
+		body = binary_expr(
+			var_expr("x", int_type()),
+			var_expr("x", int_type()),
+			int_type(),
+		),
+		loc = SyntheticSourceLoc
+	}
+	after_arm: CoreSelectArm = {
+		kind = SelectAfterArm(var_expr("x", int_type())),
+		body = binary_expr(
+			var_expr("x", int_type()),
+			var_expr("x", int_type()),
+			int_type(),
+		),
+		loc = SyntheticSourceLoc
+	}
+
+	count_uses(
+		"x",
+		SelectExpr(
+			[recv_arm, after_arm],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	) == 4
 
 
 pure func test_prepared_list_retain_owns_alias_binding_result() -> Bool:
@@ -4987,6 +5459,639 @@ pure func test_if_borrowed_branch_and_cow_consuming_branch_balance_independently
 	)
 
 
+pure func test_nested_constructor_match_balances_borrow_and_consume_with_equal_use_counts() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [], borrow)],
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+	)
+	body: CoreExpr = LetExpr(named_var("prefix"), False, int_type(), int_expr(0), match_body)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_nested_accessor_literal_match_balances_borrow_and_consume() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	literal_match: CoreConstructorLiteralMatch = {
+		accessor = RootAccessor,
+		scrutinee_type = int_type(),
+		cases = [literal_case(IntLiteral(1), [], borrow)],
+		fallback = LiteralMatchFallbackBody(SeqExpr(consume, int_expr(1))),
+		result_type = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	match_body: CoreExpr = AccessorLiteralMatchExpr(
+		int_expr(1),
+		NoReleasePolicy,
+		literal_match,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(named_var("prefix"), False, int_type(), int_expr(0), match_body)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_owned_accessor_match_with_nested_length_releases_every_branch() -> Bool:
+	match_var: CoreVar = named_var("match_value")
+	nested_length: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"match_value",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = Some({
+				minimum_length = 2,
+				branch = constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(20))),
+			}),
+			fallback = Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(30)))),
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	literal_match: CoreConstructorLiteralMatch = {
+		accessor = ListElementAccessor(RootAccessor, 0),
+		scrutinee_type = int_type(),
+		cases = [literal_case(IntLiteral(0), [], int_expr(10))],
+		fallback = LiteralMatchFallbackBody(nested_length),
+		result_type = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	match_body: CoreExpr = AccessorLiteralMatchExpr(
+		var_expr("match_value", list_int_type()),
+		NoReleasePolicy,
+		literal_match,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	fresh_list: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [
+				{
+					kind = PointerBox,
+					value = int_expr(1),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			],
+			elem_needs_release = False
+		},
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(match_var, False, list_int_type(), fresh_list, match_body),
+	)
+
+	drop_count_for("match_value", rewritten) == 3
+
+
+pure func test_owned_accessor_match_defers_drop_for_borrowed_binding() -> Bool:
+	element_binding: CoreMatchBinding = {
+		variable = named_var("element"),
+		typ = string_type(),
+		accessor = ListElementAccessor(RootAccessor, 1),
+		mode = MatchBorrowBindingMode
+	}
+	literal_match: CoreConstructorLiteralMatch = {
+		accessor = ListElementAccessor(RootAccessor, 0),
+		scrutinee_type = string_type(),
+		cases = [literal_case(
+				StringLiteral("head"),
+				[element_binding],
+				intrinsic_expr("string_length", [var_expr("element", string_type())], int_type()),
+			)],
+		fallback = LiteralMatchFallbackBody(
+			intrinsic_expr(
+				"list_len",
+				[var_expr("match_value", list_string_type())],
+				int_type(),
+			),
+		),
+		result_type = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	match_body: CoreExpr = AccessorLiteralMatchExpr(
+		var_expr("match_value", list_string_type()),
+		NoReleasePolicy,
+		literal_match,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("match_value"),
+			False,
+			list_string_type(),
+			var_expr("source", list_string_type()),
+			match_body,
+		),
+	)
+
+	(
+		drop_count_for("match_value", rewritten) == 1
+		and outer_let_body_is_post_drop_after_accessor_match("match_value", rewritten)
+	)
+
+
+pure func test_owned_length_match_defers_drop_for_borrowed_binding() -> Bool:
+	head_binding: CoreMatchBinding = {
+		variable = named_var("head"),
+		typ = string_type(),
+		accessor = ListElementAccessor(RootAccessor, 0),
+		mode = MatchBorrowBindingMode
+	}
+	match_body: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"match_value",
+			list_string_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = Some({
+				minimum_length = 1,
+				branch = constructor_length_branch(
+					[head_binding],
+					ConstructorMatchBodyExpr(
+						intrinsic_expr(
+							"string_length",
+							[var_expr("head", string_type())],
+							int_type(),
+						),
+					),
+				),
+			}),
+			fallback = Some(
+				constructor_length_branch(
+					[],
+					ConstructorMatchBodyExpr(
+						intrinsic_expr(
+							"list_len",
+							[var_expr("match_value", list_string_type())],
+							int_type(),
+						),
+					),
+				),
+			),
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("match_value"),
+			False,
+			list_string_type(),
+			var_expr("source", list_string_type()),
+			match_body,
+		),
+	)
+
+	(
+		drop_count_for("match_value", rewritten) == 1
+		and outer_let_body_is_post_drop_after_length_match("match_value", rewritten)
+	)
+
+
+pure func test_consumed_parameter_literal_match_drops_unused_success_branch() -> Bool:
+	param: CoreParam = core_param_with_id("name", 1601, string_type())
+	consume: CoreExpr = boxed_string_construct(var_expr("name", string_type()))
+	body: CoreExpr = LiteralMatchExpr(
+		var_expr("name", string_type()),
+		[literal_case(StringLiteral("known"), [], int_expr(0))],
+		LiteralMatchFallbackBody(SeqExpr(consume, int_expr(1))),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("parse_action", 1602, [param], int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "parse_action"):
+		Some(rewritten):
+			drop_count_for("name", rewritten) == 1 and dup_count_for("name", rewritten) == 0
+		None:
+			False
+
+
+pure func test_owned_local_literal_match_drops_recognized_branch() -> Bool:
+	body: CoreExpr = LiteralMatchExpr(
+		var_expr("text", string_type()),
+		[literal_case(StringLiteral("func"), [], int_expr(0))],
+		LiteralMatchFallbackBody(
+			SeqExpr(
+				boxed_string_construct(var_expr("text", string_type())),
+				int_expr(1),
+			),
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("text"),
+			False,
+			string_type(),
+			var_expr("source", string_type()),
+			body,
+		),
+	)
+
+	drop_count_for("text", rewritten) == 1 and dup_count_for("text", rewritten) == 0
+
+
+pure func test_owned_local_borrowed_call_match_drops_nontransfer_branch() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	token_type: CoreType = UnionType("TokenKind")
+	span_type: CoreType = HeapRecordType("Span")
+	state_type: CoreType = HeapRecordType("State")
+	scanned_type: CoreType = TupleType([string_type(), span_type, state_type])
+	result_type: CoreType = TupleType([state_type, token_type])
+	span_record: CoreDecl = HeapRecordDecl({
+		name = "Span",
+		type_params = [],
+		fields = [],
+		loc = SyntheticSourceLoc,
+	})
+	state_record: CoreDecl = HeapRecordDecl({
+		name = "State",
+		type_params = [],
+		fields = [],
+		loc = SyntheticSourceLoc,
+	})
+	token_union: CoreDecl = UnionDecl({
+		name = "TokenKind",
+		type_params = [],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [
+			union_variant("KeywordToken", 0, Some(1603), []),
+			union_variant("IdentifierToken", 1, Some(1604), [union_field(string_type())]),
+		],
+		loc = SyntheticSourceLoc,
+	})
+	classify: CoreDecl = function_decl(
+		"classify",
+		1605,
+		[core_param("text", string_type())],
+		option_type,
+		LiteralMatchExpr(
+			var_expr("text", string_type()),
+			[literal_case(
+					StringLiteral("func"),
+					[],
+					user_call_expr("Some", Some(1205), [], [int_expr(1)], option_type),
+				)],
+			LiteralMatchFallbackBody(user_call_expr("None", Some(1206), [], [], option_type)),
+			option_type,
+			SyntheticSourceLoc,
+		),
+	)
+	emit: CoreDecl = function_decl(
+		"emit",
+		1606,
+		[
+			core_param("state", state_type),
+			core_param("kind", token_type),
+			core_param("span", span_type),
+		],
+		result_type,
+		DupExpr(
+			named_var("state"),
+			state_type,
+			ArcRetainPolicy,
+			DupExpr(
+				named_var("kind"),
+				token_type,
+				ArcRetainPolicy,
+				TupleExpr(
+					[var_expr("state", state_type), var_expr("kind", token_type)],
+					result_type,
+					SyntheticSourceLoc,
+				),
+				result_type,
+				SyntheticSourceLoc,
+			),
+			result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	scan: CoreDecl = function_decl(
+		"scan",
+		1607,
+		[],
+		result_type,
+		LetExpr(
+			named_var("scanned"),
+			False,
+			scanned_type,
+			var_expr(
+				"scanned_source",
+				scanned_type,
+			),
+			LetExpr(
+				named_var("text"),
+				False,
+				string_type(),
+				TupleFieldExpr(
+					var_expr("scanned", scanned_type),
+					0,
+					string_type(),
+					SyntheticSourceLoc,
+				),
+				LetExpr(
+					named_var("span"),
+					False,
+					span_type,
+					TupleFieldExpr(
+						var_expr("scanned", scanned_type),
+						1,
+						span_type,
+						SyntheticSourceLoc,
+					),
+					LetExpr(
+						named_var("state"),
+						False,
+						state_type,
+						TupleFieldExpr(
+							var_expr("scanned", scanned_type),
+							2,
+							state_type,
+							SyntheticSourceLoc,
+						),
+						LetExpr(
+							named_var("match_scrutinee"),
+							False,
+							option_type,
+							user_call_expr(
+								"classify",
+								Some(1605),
+								[],
+								[var_expr("text", string_type())],
+								option_type,
+							),
+							ConstructorMatchExpr(
+								var_expr(
+									"match_scrutinee",
+									option_type,
+								),
+								NoReleasePolicy,
+								[
+									constructor_case(
+										"Some",
+										[],
+										user_call_expr(
+											"emit",
+											Some(1606),
+											[],
+											[
+												var_expr("state", state_type),
+												user_call_expr(
+													"KeywordToken",
+													Some(1603),
+													[],
+													[],
+													token_type,
+												),
+												var_expr("span", span_type),
+											],
+											result_type,
+										),
+									),
+									constructor_case(
+										"None",
+										[],
+										user_call_expr(
+											"emit",
+											Some(1606),
+											[],
+											[
+												var_expr("state", state_type),
+												user_call_expr(
+													"IdentifierToken",
+													Some(1604),
+													[],
+													[var_expr("text", string_type())],
+													token_type,
+												),
+												var_expr("span", span_type),
+											],
+											result_type,
+										),
+									),
+								],
+								ConstructorMatchFallbackFail,
+								result_type,
+								SyntheticSourceLoc,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [span_record, state_record, token_union, classify, emit, scan],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "scan"):
+		Some(body):
+			(
+				drop_count_for("text", body) == 1
+				and dup_count_for("text", body) == 0
+				and nested_constructor_match_drops_only_first_case("text", body)
+			)
+		None:
+			False
+
+
+pure func test_statement_if_balances_reserved_owner_before_unused_continuation() -> Bool:
+	value_type: CoreType = list_int_type()
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("source", value_type)],
+		value_type,
+	)
+	optional_consume: CoreExpr = IfExpr(
+		bool_expr(False),
+		SeqExpr(
+			intrinsic_expr("list_ensure_unique", [var_expr("source", value_type)], value_type),
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("source"),
+			False,
+			value_type,
+			var_expr("input", value_type),
+			LetExpr(
+				named_var("parsed"),
+				False,
+				value_type,
+				consume,
+				SeqExpr(optional_consume, int_expr(0)),
+			),
+		),
+	)
+
+	(
+		dup_count_for("source", rewritten) == 1
+		and drop_count_for("source", rewritten) == 1
+		and nested_if_drops_only_else_branch("source", rewritten)
+	)
+
+
+pure func test_nested_match_detects_divergent_ownership_inside_case_body() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	case_body: CoreExpr = IfExpr(
+		bool_expr(True),
+		borrow,
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [], case_body)],
+		SeqExpr(consume, int_expr(0)),
+		int_type(),
+	)
+	body: CoreExpr = LetExpr(named_var("prefix"), False, int_type(), int_expr(0), match_body)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_nested_accessor_match_detects_divergent_ownership_inside_case_body() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	case_body: CoreExpr = IfExpr(
+		bool_expr(True),
+		borrow,
+		SeqExpr(consume, int_expr(1)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	literal_match: CoreConstructorLiteralMatch = {
+		accessor = RootAccessor,
+		scrutinee_type = int_type(),
+		cases = [literal_case(IntLiteral(1), [], case_body)],
+		fallback = LiteralMatchFallbackBody(SeqExpr(consume, int_expr(0))),
+		result_type = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	match_body: CoreExpr = AccessorLiteralMatchExpr(
+		int_expr(1),
+		NoReleasePolicy,
+		literal_match,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(named_var("prefix"), False, int_type(), int_expr(0), match_body)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_nested_constructor_literal_body_detects_divergent_ownership() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[literal_case(IntLiteral(1), [], borrow)],
+		LiteralMatchFallbackBody(SeqExpr(consume, int_expr(1))),
+		int_type(),
+	)
+	match_body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], literal_body)],
+		ConstructorMatchFallbackBody(SeqExpr(consume, int_expr(0))),
+		int_type(),
+	)
+	body: CoreExpr = LetExpr(named_var("prefix"), False, int_type(), int_expr(0), match_body)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
 pure func test_constructor_match_branch_use_prevents_pre_match_drop() -> Bool:
 	body: CoreExpr = constructor_match_expr(
 		[constructor_case(
@@ -5139,6 +6244,175 @@ pure func test_constructor_match_nested_literal_body_balances_branches() -> Bool
 	)
 
 
+pure func test_releasing_constructor_match_with_borrowed_literal_fallback_does_not_double_drop(
+
+) -> Bool:
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[
+			literal_case(IntLiteral(0), [], bool_expr(False)),
+			literal_case(IntLiteral(42), [], bool_expr(False)),
+		],
+		LiteralMatchFallbackBindings(
+			[match_binding("payload", int_type())],
+			SeqExpr(
+				var_expr("payload", int_type()),
+				bool_expr(True),
+			),
+		),
+		bool_type(),
+	)
+	result_type: CoreType = UnionType("Result")
+	match_body: CoreExpr = ConstructorMatchExpr(
+		var_expr("match_value", result_type),
+		ArcReleasePolicy,
+		[constructor_case_body("Ok", [], literal_body)],
+		ConstructorMatchFallbackFail,
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("match_value"),
+			False,
+			result_type,
+			var_expr("source", result_type),
+			match_body,
+		),
+	)
+
+	drop_count_for("match_value", rewritten) == 0 and dup_count_for("match_value", rewritten) == 0
+
+
+pure func nested_releasing_match_drops_only_unused_branch(
+	value_type: CoreType,
+	match_body: CoreExpr,
+) -> Bool:
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("match_value"),
+			False,
+			value_type,
+			var_expr("source", value_type),
+			IfExpr(bool_expr(True), match_body, bool_expr(False), bool_type(), SyntheticSourceLoc),
+		),
+	)
+
+	(
+		drop_count_for("match_value", rewritten) == 1
+		and dup_count_for("match_value", rewritten) == 0
+		and nested_if_drops_only_else_branch("match_value", rewritten)
+	)
+
+
+pure func test_nested_releasing_constructor_match_reserves_intrinsic_release() -> Bool:
+	value_type: CoreType = list_int_type()
+	match_body: CoreExpr = ConstructorMatchExpr(
+		var_expr("match_value", value_type),
+		ArcReleasePolicy,
+		[constructor_case(
+				"Cons",
+				[match_binding("payload", list_int_type())],
+				SeqExpr(
+					intrinsic_expr("list_len", [var_expr("match_value", value_type)], int_type()),
+					SeqExpr(
+						intrinsic_expr(
+							"list_len",
+							[var_expr("payload", list_int_type())],
+							int_type(),
+						),
+						bool_expr(True),
+					),
+				),
+			)],
+		ConstructorMatchFallbackBody(bool_expr(False)),
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+
+	nested_releasing_match_drops_only_unused_branch(value_type, match_body)
+
+
+pure func test_nested_releasing_accessor_match_reserves_intrinsic_release() -> Bool:
+	value_type: CoreType = list_int_type()
+	match_body: CoreExpr = AccessorLiteralMatchExpr(
+		var_expr(
+			"match_value",
+			value_type,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = ListElementAccessor(RootAccessor, 0),
+			scrutinee_type = int_type(),
+			cases = [literal_case(
+					IntLiteral(0),
+					[],
+					SeqExpr(
+						intrinsic_expr(
+							"list_len",
+							[var_expr("match_value", value_type)],
+							int_type(),
+						),
+						bool_expr(True),
+					),
+				)],
+			fallback = LiteralMatchFallbackBody(bool_expr(False)),
+			result_type = bool_type(),
+			loc = SyntheticSourceLoc
+		},
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+
+	nested_releasing_match_drops_only_unused_branch(value_type, match_body)
+
+
+pure func test_nested_releasing_length_match_reserves_intrinsic_release() -> Bool:
+	value_type: CoreType = list_int_type()
+	match_body: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"match_value",
+			value_type,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [
+				{
+					length = 1,
+					branch = constructor_length_branch(
+						[],
+						ConstructorMatchBodyExpr(
+							SeqExpr(
+								intrinsic_expr(
+									"list_len",
+									[var_expr("match_value", value_type)],
+									int_type(),
+								),
+								bool_expr(True),
+							),
+						),
+					)
+				},
+			],
+			geq = None,
+			fallback = Some(
+				constructor_length_branch(
+					[],
+					ConstructorMatchBodyExpr(bool_expr(False)),
+				),
+			),
+			result_type = bool_type(),
+			loc = SyntheticSourceLoc
+		},
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+
+	nested_releasing_match_drops_only_unused_branch(value_type, match_body)
+
+
 pure func test_constructor_match_nested_length_body_balances_branches() -> Bool:
 	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
 	length_body: CoreConstructorMatchBody = constructor_length_body(
@@ -5171,6 +6445,104 @@ pure func test_constructor_match_nested_length_body_balances_branches() -> Bool:
 		and dup_count_for("xs", rewritten) == 0
 		and top_let_constructor_match_has_nested_length_branch_drops("xs", rewritten)
 	)
+
+
+pure func test_length_match_detects_divergent_ownership_inside_branch() -> Bool:
+	borrow: CoreExpr = SeqExpr(
+		intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type()),
+		int_expr(0),
+	)
+	consume: CoreExpr = SeqExpr(
+		var_expr("xs", list_int_type()),
+		int_expr(0),
+	)
+	nested_if: CoreExpr = IfExpr(
+		var_expr("choose_borrow", bool_type()),
+		borrow,
+		consume,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"values",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [
+				{
+					length = 1,
+					branch = constructor_length_branch([], ConstructorMatchBodyExpr(nested_if))
+				},
+			],
+			geq = None,
+			fallback = Some(constructor_length_branch([], ConstructorMatchBodyExpr(consume))),
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("xs"),
+			False,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			body,
+		),
+	)
+
+	drop_count_for("xs", rewritten) == 1
+
+
+pure func test_constructor_length_body_detects_divergent_ownership_inside_branch() -> Bool:
+	borrow: CoreExpr = SeqExpr(
+		intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type()),
+		int_expr(0),
+	)
+	consume: CoreExpr = SeqExpr(
+		var_expr("xs", list_int_type()),
+		int_expr(0),
+	)
+	nested_if: CoreExpr = IfExpr(
+		var_expr("choose_borrow", bool_type()),
+		borrow,
+		consume,
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	length_body: CoreConstructorMatchBody = constructor_length_body(
+		[
+			{
+				length = 1,
+				branch = constructor_length_branch([], ConstructorMatchBodyExpr(nested_if))
+			},
+		],
+		None,
+		Some(constructor_length_branch([], ConstructorMatchBodyExpr(consume))),
+		int_type(),
+	)
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], length_body)],
+		ConstructorMatchFallbackFail,
+		int_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("xs"),
+			False,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			body,
+		),
+	)
+
+	drop_count_for("xs", rewritten) == 1
 
 
 pure func test_constructor_match_nested_length_geq_body_balances_branches() -> Bool:
@@ -6781,7 +8153,7 @@ pure func test_parameter_shadow_prevents_global_assignment_resolution() -> Bool:
 			False
 
 
-pure func test_inferred_union_call_borrowed_temporary_is_dropped() -> Bool:
+pure func test_inferred_union_call_overrides_stale_consumed_args() -> Bool:
 	inspect: CoreDecl = function_decl(
 		"inspect_then_union",
 		223,
@@ -6806,7 +8178,7 @@ pure func test_inferred_union_call_borrowed_temporary_is_dropped() -> Bool:
 		224,
 		[],
 		boxed_string_type(),
-		user_call_expr("inspect_then_union", Some(223), [], [fresh], boxed_string_type()),
+		user_call_expr("inspect_then_union", Some(223), [0], [fresh], boxed_string_type()),
 	)
 	base: CoreProgram = decl_env_program()
 	program: CoreProgram = insert_drops_program(
@@ -7913,6 +9285,15 @@ tests: TestSuite = {
 			"managed field of owned temporary return is retained",
 			test_managed_field_of_owned_temporary_return_is_retained,
 		),
+		("owned temporary field owner is released", test_owned_temporary_field_owner_is_released),
+		(
+			"owned temporary tuple field owner is released",
+			test_owned_temporary_tuple_field_owner_is_released,
+		),
+		(
+			"unmanaged temporary tuple field owner is released at node",
+			test_unmanaged_temporary_tuple_field_owner_is_released_at_node,
+		),
 		(
 			"borrowed parameter returned from branch is retained",
 			test_borrowed_parameter_returned_from_branch_is_retained,
@@ -7966,6 +9347,10 @@ tests: TestSuite = {
 			test_program_infers_read_only_user_call_borrows_argument,
 		),
 		(
+			"string equality user call borrows arguments",
+			test_string_equality_user_call_borrows_arguments,
+		),
+		(
 			"user contract inference converges beyond eight edges",
 			test_user_contract_inference_converges_beyond_eight_edges,
 		),
@@ -8010,6 +9395,10 @@ tests: TestSuite = {
 			test_consumed_parameter_fallible_transfer_balances_reserved_owner,
 		),
 		(
+			"result propagation balances reserved consumed parameter owner",
+			test_result_propagation_balances_reserved_consumed_parameter_owner,
+		),
+		(
 			"unused consumed managed parameter is dropped",
 			test_unused_consumed_managed_parameter_is_dropped,
 		),
@@ -8041,6 +9430,16 @@ tests: TestSuite = {
 		(
 			"count uses includes prepared list retain value",
 			test_count_uses_includes_prepared_list_retain_value,
+		),
+		(
+			"count uses includes raw tensor view operands",
+			test_count_uses_includes_raw_tensor_view_operands,
+		),
+		("raw tensor view drops source after body", test_raw_tensor_view_drops_source_after_body),
+		("count uses flattened detach payloads", test_count_uses_flattened_detach_payloads),
+		(
+			"count uses select waits branches and shadowing",
+			test_count_uses_select_waits_branches_and_shadowing,
 		),
 		(
 			"prepared list retain owns alias binding result",
@@ -8246,6 +9645,54 @@ tests: TestSuite = {
 			test_if_borrowed_branch_and_cow_consuming_branch_balance_independently,
 		),
 		(
+			"nested constructor match balances borrow and consume with equal use counts",
+			test_nested_constructor_match_balances_borrow_and_consume_with_equal_use_counts,
+		),
+		(
+			"nested accessor literal match balances borrow and consume",
+			test_nested_accessor_literal_match_balances_borrow_and_consume,
+		),
+		(
+			"owned accessor match with nested length releases every branch",
+			test_owned_accessor_match_with_nested_length_releases_every_branch,
+		),
+		(
+			"owned accessor match defers drop for borrowed binding",
+			test_owned_accessor_match_defers_drop_for_borrowed_binding,
+		),
+		(
+			"owned length match defers drop for borrowed binding",
+			test_owned_length_match_defers_drop_for_borrowed_binding,
+		),
+		(
+			"consumed parameter literal match drops unused success branch",
+			test_consumed_parameter_literal_match_drops_unused_success_branch,
+		),
+		(
+			"owned local literal match drops recognized branch",
+			test_owned_local_literal_match_drops_recognized_branch,
+		),
+		(
+			"owned local borrowed-call match drops nontransfer branch",
+			test_owned_local_borrowed_call_match_drops_nontransfer_branch,
+		),
+		(
+			"statement if balances reserved owner before unused continuation",
+			test_statement_if_balances_reserved_owner_before_unused_continuation,
+		),
+		(
+			"nested match detects divergent ownership inside case body",
+			test_nested_match_detects_divergent_ownership_inside_case_body,
+		),
+		(
+			"nested accessor match detects divergent ownership inside case body",
+			test_nested_accessor_match_detects_divergent_ownership_inside_case_body,
+		),
+		(
+			"nested constructor literal body detects divergent ownership",
+			test_nested_constructor_literal_body_detects_divergent_ownership,
+		),
+		(
 			"constructor match branch use prevents pre-match drop",
 			test_constructor_match_branch_use_prevents_pre_match_drop,
 		),
@@ -8270,8 +9717,32 @@ tests: TestSuite = {
 			test_constructor_match_nested_literal_body_balances_branches,
 		),
 		(
+			"releasing constructor match with borrowed literal fallback does not double drop",
+			test_releasing_constructor_match_with_borrowed_literal_fallback_does_not_double_drop,
+		),
+		(
+			"nested releasing constructor match reserves intrinsic release",
+			test_nested_releasing_constructor_match_reserves_intrinsic_release,
+		),
+		(
+			"nested releasing accessor match reserves intrinsic release",
+			test_nested_releasing_accessor_match_reserves_intrinsic_release,
+		),
+		(
+			"nested releasing length match reserves intrinsic release",
+			test_nested_releasing_length_match_reserves_intrinsic_release,
+		),
+		(
 			"constructor match nested length body balances branches",
 			test_constructor_match_nested_length_body_balances_branches,
+		),
+		(
+			"length match detects divergent ownership inside branch",
+			test_length_match_detects_divergent_ownership_inside_branch,
+		),
+		(
+			"constructor length body detects divergent ownership inside branch",
+			test_constructor_length_body_detects_divergent_ownership_inside_branch,
 		),
 		(
 			"constructor match nested length >= body balances branches",
@@ -8453,8 +9924,8 @@ tests: TestSuite = {
 			test_parameter_shadow_prevents_global_assignment_resolution,
 		),
 		(
-			"inferred union call borrowed temporary is dropped",
-			test_inferred_union_call_borrowed_temporary_is_dropped,
+			"inferred union call overrides stale consumed args",
+			test_inferred_union_call_overrides_stale_consumed_args,
 		),
 		(
 			"unboxed aliasing call drops borrowed owned temporary",

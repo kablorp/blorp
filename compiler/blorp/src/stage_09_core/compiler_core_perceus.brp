@@ -947,31 +947,18 @@ pure func contract_for_call(
 						Some(contract):
 							Some(contract)
 						None:
-							if (
-								env.infer_unresolved_user_calls_as_borrow
-								or not is_managed_type(env, return_type)
-							):
-								match lookup_user_call_contract(env, name, arg_count, return_type):
-									Some(contract):
-										Some(contract)
-									None:
-										unresolved_user_call_contract(
-											env,
-											name,
-											def_id,
-											consumed_args,
-											arg_count,
-											return_type,
-										)
-							else:
-								unresolved_user_call_contract(
-									env,
-									name,
-									def_id,
-									consumed_args,
-									arg_count,
-									return_type,
-								)
+							match lookup_user_call_contract(env, name, arg_count, return_type):
+								Some(contract):
+									Some(contract)
+								None:
+									unresolved_user_call_contract(
+										env,
+										name,
+										def_id,
+										consumed_args,
+										arg_count,
+										return_type,
+									)
 		ForeignCall(name, arg_passing):
 			Some(borrow_contract_for_signature(env, arg_count, return_type))
 		ClosureCall:
@@ -2001,10 +1988,31 @@ private pure func summarize_linear_borrow(
 			summarize_linear_ownership_uses(env, name, expr)
 
 
+private pure func release_expr_is_owner_value(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.name == name
+		CastExpr(inner, typ, loc):
+			release_expr_is_owner_value(name, inner)
+		UnboxExpr(PointerUnbox, inner, typ, loc):
+			release_expr_is_owner_value(name, inner)
+		_:
+			False
+
+
+private pure func releasing_match_consumes_owner(
+	name: String,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> Bool:
+	release_policy != NoReleasePolicy and release_expr_is_owner_value(name, scrutinee)
+
+
 private pure func summarize_match_ownership_uses(
 	env: PerceusEnv,
 	name: String,
 	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
 	branch_uses: OwnershipUseSummary,
 ) -> OwnershipUseSummary:
 	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, name, scrutinee)
@@ -2015,7 +2023,15 @@ private pure func summarize_match_ownership_uses(
 		summarize_linear_ownership_uses(env, name, scrutinee)
 
 	balanced_branch_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
-		seq_ownership_uses(BORROW_OWNERSHIP_USE, branch_uses)
+		if releasing_match_consumes_owner(name, scrutinee, release_policy):
+			-- Releasing matches inspect the alias first, run their selected
+			-- branch, and consume the matched owner when the match exits.
+			ownership_uses_with_returns_alias(
+				seq_ownership_uses(branch_uses, CONSUME_OWNERSHIP_USE),
+				branch_uses.returns_alias,
+			)
+		else:
+			seq_ownership_uses(BORROW_OWNERSHIP_USE, branch_uses)
 	else:
 		branch_uses
 
@@ -3469,10 +3485,16 @@ private pure func summarize_linear_ownership_uses(
 		CallExpr(kind, callee, args, typ, loc):
 			summarize_linear_call(env, name, typ, kind, callee, args)
 		BinaryExpr(op, left, right, typ, loc):
-			seq_ownership_uses(
-				summarize_linear_ownership_uses(env, name, left),
-				summarize_linear_ownership_uses(env, name, right),
-			)
+			if is_borrowing_equality(op, left, right):
+				seq_ownership_uses(
+					summarize_linear_borrow(env, name, left),
+					summarize_linear_borrow(env, name, right),
+				)
+			else:
+				seq_ownership_uses(
+					summarize_linear_ownership_uses(env, name, left),
+					summarize_linear_ownership_uses(env, name, right),
+				)
 		UnaryExpr(op, inner, typ, loc):
 			summarize_linear_ownership_uses(env, name, inner)
 		LogicalExpr(op, left, right, typ, loc):
@@ -3587,6 +3609,22 @@ private pure func summarize_linear_ownership_uses(
 				name,
 				[set_len.target, set_len.len],
 			)
+		TensorRawReadExpr(read, typ, loc):
+			summarize_linear_ownership_uses(env, name, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, write.index),
+				summarize_linear_ownership_uses(env, name, write.value),
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, binding.source)
+
+			body_uses: OwnershipUseSummary = if binding.variable.name == name:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+
+			seq_ownership_uses(source_uses, body_uses)
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			summarize_boxed_storage_values(env, name, literal.elements)
 		DictConstructExpr(construct, typ, loc):
@@ -3668,6 +3706,7 @@ private pure func summarize_linear_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_constructor_match_branch_uses(
 					env,
 					name,
@@ -3681,6 +3720,7 @@ private pure func summarize_linear_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				NoReleasePolicy,
 				summarize_constructor_literal_match_uses(
 					env,
 					name,
@@ -3699,6 +3739,7 @@ private pure func summarize_linear_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_constructor_literal_match_uses(env, name, match_expr),
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
@@ -3706,6 +3747,7 @@ private pure func summarize_linear_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_constructor_length_match_uses(env, name, match_expr),
 			)
 		BreakExpr(typ, loc):
@@ -3729,9 +3771,9 @@ private pure func summarize_linear_ownership_uses(
 		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
 			summarize_exprs(env, name, cleanup_exit.cleanups)
 		PreClosureDetachExpr(detached, typ, loc):
-			task_capture_ownership_use(name, detached.body)
+			task_capture_ownership_use(name, detached)
 		DetachExpr(detached, typ, loc):
-			if detached.task.captures.any(func(capture): capture.name == name):
+			if detached.captures.any(func(capture): capture.name == name):
 				BORROW_OWNERSHIP_USE
 			else:
 				NO_OWNERSHIP_USES
@@ -3946,7 +3988,7 @@ private pure func summarize_linear_ownership_uses(
 			var wait_summaries: List[OwnershipUseSummary] = []
 			var branch_summaries: List[OwnershipUseSummary] = []
 
-			for arm in select_expr.arms:
+			for arm in select_expr:
 				arm_shadows: Bool = match arm.kind:
 					SelectRecvArm(recv):
 						wait_summaries = wait_summaries.append(
@@ -3989,6 +4031,13 @@ private pure func summarize_linear_ownership_uses(
 			)
 		_:
 			ownership_uses_from_legacy_count(count_uses(name, expr))
+
+
+private pure func count_core_var_use(name: String, variable: CoreVar) -> Int:
+	if variable.name == name:
+		1
+	else:
+		0
 
 
 pure func count_uses(name: String, expr: CoreExpr) -> Int:
@@ -4090,6 +4139,20 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			) + count_uses(name, copy.src_pos) + count_uses(name, copy.len)
 		StringSetLenExpr(set_len, typ, loc):
 			count_uses(name, set_len.target) + count_uses(name, set_len.len)
+		TensorRawReadExpr(read, typ, loc):
+			count_core_var_use(name, read.view) + count_uses(name, read.index)
+		TensorRawWriteExpr(write, typ, loc):
+			count_core_var_use(
+				name,
+				write.view,
+			) + count_uses(name, write.index) + count_uses(name, write.value)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			body_uses: Int = if binding.variable.name == name:
+				0
+			else:
+				count_uses(name, body)
+
+			count_uses(name, binding.source) + body_uses
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			count_uses_in_boxed_values(name, literal.elements)
 		DictConstructExpr(construct, typ, loc):
@@ -4186,9 +4249,9 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 		ForTensorExpr(loop, typ, loc):
 			count_loop_uses(name, loop.binder, loop.iterable, loop.body)
 		PreClosureDetachExpr(detached, typ, loc):
-			count_uses(name, detached.body)
+			count_uses(name, detached)
 		DetachExpr(detached, typ, loc):
-			if detached.task.captures.any(func(capture): capture.name == name):
+			if detached.captures.any(func(capture): capture.name == name):
 				1
 			else:
 				0
@@ -4252,7 +4315,7 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			var wait_uses: Int = 0
 			var branch_uses: Int = 0
 
-			for arm in select_expr.arms:
+			for arm in select_expr:
 				arm_shadows: Bool = match arm.kind:
 					SelectRecvArm(recv):
 						wait_uses += count_uses(name, recv.channel)
@@ -4506,26 +4569,212 @@ private pure func drop_after_body(
 			LetExpr(tmp_var, False, copy_core_type(body_type), body, drop_then_return)
 
 
-private pure func constructor_match_has_divergent_use_counts(
+private pure func ownership_uses_need_distinct_branch_balance(
+	left: OwnershipUseSummary,
+	right: OwnershipUseSummary,
+) -> Bool:
+	(
+		left.required_refs != right.required_refs
+		or left.consumed_refs != right.consumed_refs
+		or left.returns_alias != right.returns_alias
+	)
+
+
+private pure func ownership_use_summaries_need_distinct_branch_balance(
+	summaries: List[OwnershipUseSummary],
+) -> Bool:
+	var baseline: Option[OwnershipUseSummary] = None
+	var divergent: Bool = False
+
+	for uses in summaries:
+		match baseline:
+			Some(reference):
+				if ownership_uses_need_distinct_branch_balance(reference, uses):
+					divergent = True
+					break
+				else:
+					void
+			None:
+				baseline = Some(uses)
+
+	divergent
+
+
+private pure func literal_match_has_divergent_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	var branch_uses: List[OwnershipUseSummary] = []
+
+	for match_case in cases:
+		uses: OwnershipUseSummary = if match_bindings_shadow(name, match_case.bindings):
+			NO_OWNERSHIP_USES
+		else:
+			summarize_linear_ownership_uses(env, name, match_case.body)
+
+		branch_uses = branch_uses.append(uses)
+
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			branch_uses = branch_uses.append(summarize_linear_ownership_uses(env, name, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			uses: OwnershipUseSummary = if match_bindings_shadow(name, bindings):
+				NO_OWNERSHIP_USES
+			else:
+				summarize_linear_ownership_uses(env, name, body)
+
+			branch_uses = branch_uses.append(uses)
+		LiteralMatchFallbackFail:
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+
+	ownership_use_summaries_need_distinct_branch_balance(branch_uses)
+
+
+private pure func constructor_literal_match_has_divergent_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Bool:
+	literal_match_has_divergent_ownership_uses(env, name, match_expr.cases, match_expr.fallback)
+
+
+private pure func constructor_length_match_has_divergent_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	var branch_uses: List[OwnershipUseSummary] = []
+
+	for match_case in match_expr.cases:
+		branch_uses = branch_uses.append(
+			summarize_constructor_length_branch_uses(
+				env,
+				name,
+				match_case.branch,
+			),
+		)
+
+	match match_expr.geq:
+		Some(match_case):
+			branch_uses = branch_uses.append(
+				summarize_constructor_length_branch_uses(
+					env,
+					name,
+					match_case.branch,
+				),
+			)
+		None:
+			void
+
+	match match_expr.fallback:
+		Some(branch):
+			branch_uses = branch_uses.append(
+				summarize_constructor_length_branch_uses(
+					env,
+					name,
+					branch,
+				),
+			)
+		None:
+			branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
+
+	ownership_use_summaries_need_distinct_branch_balance(branch_uses)
+
+
+private pure func constructor_length_branch_has_divergent_nested_ownership(
+	env: PerceusEnv,
+	name: String,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	if match_bindings_shadow(name, branch.bindings):
+		False
+	else:
+		match branch.body:
+			ConstructorMatchBodyExpr(body):
+				balanced_path_has_divergent_constructor_match(env, name, body)
+			ConstructorMatchBodyLiteral(match_expr):
+				(
+					constructor_literal_match_has_divergent_ownership_uses(env, name, match_expr)
+					or literal_match_has_divergent_nested_branch_ownership(
+						env,
+						name,
+						match_expr.cases,
+						match_expr.fallback,
+					)
+				)
+			ConstructorMatchBodyLength(match_expr):
+				(
+					constructor_length_match_has_divergent_ownership_uses(env, name, match_expr)
+					or constructor_length_match_has_divergent_nested_ownership(
+						env,
+						name,
+						match_expr,
+					)
+				)
+
+
+private pure func constructor_length_match_has_divergent_nested_ownership(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	var divergent: Bool = False
+
+	for match_case in match_expr.cases:
+		if constructor_length_branch_has_divergent_nested_ownership(env, name, match_case.branch):
+			divergent = True
+			break
+		else:
+			void
+
+	if not divergent:
+		match match_expr.geq:
+			Some(match_case):
+				divergent = constructor_length_branch_has_divergent_nested_ownership(
+					env,
+					name,
+					match_case.branch,
+				)
+			None:
+				void
+
+	if not divergent:
+		match match_expr.fallback:
+			Some(branch):
+				divergent = constructor_length_branch_has_divergent_nested_ownership(
+					env,
+					name,
+					branch,
+				)
+			None:
+				void
+
+	divergent
+
+
+private pure func constructor_match_has_divergent_ownership_uses(
+	env: PerceusEnv,
 	name: String,
 	cases: List[CoreConstructorMatchCase],
 	fallback: CoreConstructorMatchFallback,
 ) -> Bool:
-	var baseline: Option[Int] = None
+	var baseline: Option[OwnershipUseSummary] = None
 	var divergent: Bool = False
 	var analyzable: Bool = True
 
 	for match_case in cases:
 		match match_case.body:
 			ConstructorMatchBodyExpr(body):
-				uses: Int = if match_bindings_shadow(name, match_case.bindings):
-					0
+				uses: OwnershipUseSummary = if match_bindings_shadow(name, match_case.bindings):
+					NO_OWNERSHIP_USES
 				else:
-					count_uses(name, body)
+					summarize_linear_ownership_uses(env, name, body)
 
 				match baseline:
 					Some(reference):
-						if reference != uses:
+						if ownership_uses_need_distinct_branch_balance(reference, uses):
 							divergent = True
 							break
 						else:
@@ -4537,14 +4786,14 @@ private pure func constructor_match_has_divergent_use_counts(
 				break
 
 	if analyzable and not divergent:
-		fallback_uses: Option[Int] = match fallback:
+		fallback_uses: Option[OwnershipUseSummary] = match fallback:
 			ConstructorMatchFallbackBody(body):
-				Some(count_uses(name, body))
+				Some(summarize_linear_ownership_uses(env, name, body))
 			ConstructorMatchFallbackBindings(bindings, body):
 				if match_bindings_shadow(name, bindings):
-					Some(0)
+					Some(NO_OWNERSHIP_USES)
 				else:
-					Some(count_uses(name, body))
+					Some(summarize_linear_ownership_uses(env, name, body))
 			ConstructorMatchFallbackFail:
 				None
 
@@ -4552,7 +4801,7 @@ private pure func constructor_match_has_divergent_use_counts(
 			Some(uses):
 				match baseline:
 					Some(reference):
-						divergent = reference != uses
+						divergent = ownership_uses_need_distinct_branch_balance(reference, uses)
 					None:
 						void
 			None:
@@ -4561,28 +4810,187 @@ private pure func constructor_match_has_divergent_use_counts(
 	analyzable and divergent
 
 
+private pure func constructor_match_has_divergent_nested_branch_ownership(
+	env: PerceusEnv,
+	name: String,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	var divergent: Bool = False
+
+	for match_case in cases:
+		if not match_bindings_shadow(name, match_case.bindings):
+			match match_case.body:
+				ConstructorMatchBodyExpr(body):
+					if balanced_path_has_divergent_constructor_match(env, name, body):
+						divergent = True
+						break
+					else:
+						void
+				ConstructorMatchBodyLiteral(match_expr):
+					if (
+						constructor_literal_match_has_divergent_ownership_uses(
+							env,
+							name,
+							match_expr,
+						)
+						or literal_match_has_divergent_nested_branch_ownership(
+							env,
+							name,
+							match_expr.cases,
+							match_expr.fallback,
+						)
+					):
+						divergent = True
+						break
+					else:
+						void
+				ConstructorMatchBodyLength(match_expr):
+					if (
+						constructor_length_match_has_divergent_ownership_uses(env, name, match_expr)
+						or constructor_length_match_has_divergent_nested_ownership(
+							env,
+							name,
+							match_expr,
+						)
+					):
+						divergent = True
+						break
+					else:
+						void
+		else:
+			void
+
+	if not divergent:
+		fallback_body: Option[CoreExpr] = match fallback:
+			ConstructorMatchFallbackBody(body):
+				Some(body)
+			ConstructorMatchFallbackBindings(bindings, body):
+				if match_bindings_shadow(name, bindings):
+					None
+				else:
+					Some(body)
+			ConstructorMatchFallbackFail:
+				None
+
+		match fallback_body:
+			Some(body):
+				divergent = balanced_path_has_divergent_constructor_match(env, name, body)
+			None:
+				void
+
+	divergent
+
+
+private pure func literal_match_has_divergent_nested_branch_ownership(
+	env: PerceusEnv,
+	name: String,
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	var divergent: Bool = False
+
+	for match_case in cases:
+		if (
+			not match_bindings_shadow(name, match_case.bindings)
+			and balanced_path_has_divergent_constructor_match(env, name, match_case.body)
+		):
+			divergent = True
+			break
+		else:
+			void
+
+	if not divergent:
+		fallback_body: Option[CoreExpr] = match fallback:
+			LiteralMatchFallbackBody(body):
+				Some(body)
+			LiteralMatchFallbackBindings(bindings, body):
+				if match_bindings_shadow(name, bindings):
+					None
+				else:
+					Some(body)
+			LiteralMatchFallbackFail:
+				None
+
+		match fallback_body:
+			Some(body):
+				divergent = balanced_path_has_divergent_constructor_match(env, name, body)
+			None:
+				void
+
+	divergent
+
+
 private pure func balanced_path_has_divergent_constructor_match(
+	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
 ) -> Bool:
 	match expr:
 		SeqExpr(first, second):
-			balanced_path_has_divergent_constructor_match(name, second)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			variable.name != name and balanced_path_has_divergent_constructor_match(name, body)
-		BorrowLetExpr(variable, typ, rhs, body):
-			variable.name != name and balanced_path_has_divergent_constructor_match(name, body)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			balanced_path_has_divergent_constructor_match(name, body)
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			balanced_path_has_divergent_constructor_match(name, body)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
 			(
-				balanced_path_has_divergent_constructor_match(name, then_expr)
-				or balanced_path_has_divergent_constructor_match(name, else_expr)
+				balanced_path_has_divergent_constructor_match(env, name, second)
+				or (
+					not summarize_linear_ownership_uses(env, name, second).touched
+					and balanced_path_has_divergent_constructor_match(env, name, first)
+				)
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			(
+				variable.name != name
+				and ((
+					balanced_path_has_divergent_constructor_match(env, name, body)
+					or (
+						not summarize_linear_ownership_uses(env, name, body).touched
+						and balanced_path_has_divergent_constructor_match(env, name, rhs)
+					)
+				))
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			variable.name != name and balanced_path_has_divergent_constructor_match(env, name, body)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			balanced_path_has_divergent_constructor_match(env, name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			balanced_path_has_divergent_constructor_match(env, name, body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, then_expr)
+			else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, else_expr)
+
+			(
+				ownership_uses_need_distinct_branch_balance(then_uses, else_uses)
+				or balanced_path_has_divergent_constructor_match(env, name, then_expr)
+				or balanced_path_has_divergent_constructor_match(env, name, else_expr)
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			(
+				literal_match_has_divergent_ownership_uses(env, name, cases, fallback)
+				or literal_match_has_divergent_nested_branch_ownership(env, name, cases, fallback)
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				constructor_literal_match_has_divergent_ownership_uses(env, name, match_expr)
+				or literal_match_has_divergent_nested_branch_ownership(
+					env,
+					name,
+					match_expr.cases,
+					match_expr.fallback,
+				)
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				constructor_length_match_has_divergent_ownership_uses(env, name, match_expr)
+				or constructor_length_match_has_divergent_nested_ownership(env, name, match_expr)
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			constructor_match_has_divergent_use_counts(name, cases, fallback)
+			(
+				constructor_match_has_divergent_ownership_uses(env, name, cases, fallback)
+				or constructor_match_has_divergent_nested_branch_ownership(
+					env,
+					name,
+					cases,
+					fallback,
+				)
+			)
 		_:
 			False
 
@@ -4677,19 +5085,28 @@ private pure func balance_terminal_constructor_match(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreExpr]:
-	var can_balance: Bool = True
+	scrutinee_is_direct_alias: Bool = direct_aliases_name(variable.name, scrutinee)
+	var can_balance: Bool = not (scrutinee_is_direct_alias and release_policy != NoReleasePolicy)
 
 	for match_case in cases:
 		if match_bindings_shadow(variable.name, match_case.bindings):
 			can_balance = False
 			break
 		else:
-			match match_case.body:
+			body_is_expr: Bool = match match_case.body:
 				ConstructorMatchBodyExpr(leaf):
-					void
+					True
 				_:
-					can_balance = False
-					break
+					False
+
+			if scrutinee_is_direct_alias and not body_is_expr:
+				can_balance = False
+				break
+			else if not constructor_match_body_can_balance(variable.name, match_case.body):
+				can_balance = False
+				break
+			else:
+				void
 
 	if can_balance:
 		match fallback:
@@ -4704,8 +5121,6 @@ private pure func balance_terminal_constructor_match(
 	if not can_balance:
 		None
 	else:
-		scrutinee_is_direct_alias: Bool = direct_aliases_name(variable.name, scrutinee)
-
 		scrutinee_consumed_refs: Int = if scrutinee_is_direct_alias:
 			0
 		else:
@@ -4737,7 +5152,17 @@ private pure func balance_terminal_constructor_match(
 						},
 					)
 				_:
-					balanced_cases = balanced_cases.append(match_case)
+					balanced_cases = balanced_cases.append(
+						{ match_case |
+							body = balance_constructor_match_body(
+								env,
+								copy_core_var(variable),
+								copy_core_type(value_type),
+								available_after_scrutinee,
+								match_case.body,
+							)
+						},
+					)
 
 		balanced_fallback: CoreConstructorMatchFallback = match fallback:
 			ConstructorMatchFallbackBody(leaf):
@@ -4827,19 +5252,43 @@ private pure func balance_nested_branch_body(
 				variable.name,
 				first,
 			)
-			available_after_first: Int = max_int(0, available_refs - first_uses.consumed_refs)
-
-			match balance_nested_branch_body(
+			second_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 				env,
-				variable,
-				value_type,
-				available_after_first,
+				variable.name,
 				second,
+			)
+
+			if (
+				not second_uses.touched
+				and balanced_path_has_divergent_constructor_match(env, variable.name, first)
 			):
-				Some(balanced_second):
-					Some(SeqExpr(first, balanced_second))
-				None:
-					None
+				Some(
+					SeqExpr(
+						balance_branch_body(
+							env,
+							variable,
+							value_type,
+							available_refs,
+							first_uses,
+							first,
+						),
+						second,
+					),
+				)
+			else:
+				available_after_first: Int = max_int(0, available_refs - first_uses.consumed_refs)
+
+				match balance_nested_branch_body(
+					env,
+					variable,
+					value_type,
+					available_after_first,
+					second,
+				):
+					Some(balanced_second):
+						Some(SeqExpr(first, balanced_second))
+					None:
+						None
 		LetExpr(inner_var, is_mutable, inner_type, rhs, inner_body):
 			if inner_var.name == variable.name:
 				None
@@ -4849,19 +5298,49 @@ private pure func balance_nested_branch_body(
 					variable.name,
 					rhs,
 				)
-				available_after_rhs: Int = max_int(0, available_refs - rhs_uses.consumed_refs)
-
-				match balance_nested_branch_body(
+				body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 					env,
-					variable,
-					value_type,
-					available_after_rhs,
+					variable.name,
 					inner_body,
+				)
+
+				if (
+					not body_uses.touched
+					and balanced_path_has_divergent_constructor_match(env, variable.name, rhs)
 				):
-					Some(balanced_body):
-						Some(LetExpr(inner_var, is_mutable, inner_type, rhs, balanced_body))
-					None:
-						None
+					-- Managed result cleanup introduces a let around branch-shaped
+					-- RHS expressions. When the continuation no longer needs this
+					-- owner, close every RHS path before those branches rejoin.
+					Some(
+						LetExpr(
+							inner_var,
+							is_mutable,
+							inner_type,
+							balance_branch_body(
+								env,
+								variable,
+								value_type,
+								available_refs,
+								rhs_uses,
+								rhs,
+							),
+							inner_body,
+						),
+					)
+				else:
+					available_after_rhs: Int = max_int(0, available_refs - rhs_uses.consumed_refs)
+
+					match balance_nested_branch_body(
+						env,
+						variable,
+						value_type,
+						available_after_rhs,
+						inner_body,
+					):
+						Some(balanced_body):
+							Some(LetExpr(inner_var, is_mutable, inner_type, rhs, balanced_body))
+						None:
+							None
 		BorrowLetExpr(inner_var, inner_type, rhs, inner_body):
 			if inner_var.name == variable.name:
 				None
@@ -4971,11 +5450,15 @@ private pure func balance_nested_branch_body(
 				and literal_match_cases_can_balance(variable.name, cases)
 				and literal_match_fallback_can_balance(variable.name, fallback)
 			):
-				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				scrutinee_uses: OwnershipUseSummary = if borrow_expr_aliases_target(
 					env,
 					variable.name,
 					scrutinee,
-				)
+				):
+					summarize_linear_borrow(env, variable.name, scrutinee)
+				else:
+					summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
 				available_after_scrutinee: Int = max_int(
 					0,
 					available_refs - scrutinee_uses.consumed_refs,
@@ -5005,15 +5488,22 @@ private pure func balance_nested_branch_body(
 			else:
 				None
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
+				env,
+				variable.name,
+				scrutinee,
+			)
+
 			if (
 				env.balance_nested_matches
 				and constructor_literal_match_can_balance(variable.name, match_expr)
+				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
 			):
-				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-					env,
-					variable.name,
-					scrutinee,
-				)
+				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+					summarize_linear_borrow(env, variable.name, scrutinee)
+				else:
+					summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
 				available_after_scrutinee: Int = max_int(
 					0,
 					available_refs - scrutinee_uses.consumed_refs,
@@ -5037,15 +5527,22 @@ private pure func balance_nested_branch_body(
 			else:
 				None
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
+				env,
+				variable.name,
+				scrutinee,
+			)
+
 			if (
 				env.balance_nested_matches
 				and constructor_length_match_can_balance(variable.name, match_expr)
+				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
 			):
-				scrutinee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-					env,
-					variable.name,
-					scrutinee,
-				)
+				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
+					summarize_linear_borrow(env, variable.name, scrutinee)
+				else:
+					summarize_linear_ownership_uses(env, variable.name, scrutinee)
+
 				available_after_scrutinee: Int = max_int(
 					0,
 					available_refs - scrutinee_uses.consumed_refs,
@@ -5873,13 +6370,7 @@ private pure func rename_shadow_var_refs(
 			)
 		SelectExpr(select_expr, typ, loc):
 			SelectExpr(
-				{ select_expr |
-					arms = rename_shadow_var_refs_in_select_arms(
-						old_name,
-						new_var,
-						select_expr.arms,
-					)
-				},
+				rename_shadow_var_refs_in_select_arms(old_name, new_var, select_expr),
 				copy_core_type(typ),
 				loc,
 			)
@@ -6120,7 +6611,10 @@ private pure func literal_match_case_can_balance(
 	name: String,
 	match_case: CoreLiteralMatchCase,
 ) -> Bool:
-	not match_bindings_shadow(name, match_case.bindings)
+	(
+		not match_bindings_shadow(name, match_case.bindings)
+		and not match_branch_uses_borrowed_binding(match_case.bindings, match_case.body)
+	)
 
 
 private pure func literal_match_cases_can_balance(
@@ -6138,7 +6632,10 @@ private pure func literal_match_fallback_can_balance(
 		LiteralMatchFallbackBody(body):
 			True
 		LiteralMatchFallbackBindings(bindings, body):
-			not match_bindings_shadow(name, bindings)
+			(
+				not match_bindings_shadow(name, bindings)
+				and not match_branch_uses_borrowed_binding(bindings, body)
+			)
 		LiteralMatchFallbackFail:
 			True
 
@@ -6319,6 +6816,7 @@ private pure func constructor_length_branch_can_balance(
 ) -> Bool:
 	(
 		not match_bindings_shadow(name, branch.bindings)
+		and not constructor_match_body_uses_borrowed_binding(branch.bindings, branch.body)
 		and constructor_match_body_can_balance(name, branch.body)
 	)
 
@@ -9447,6 +9945,16 @@ private pure func is_consuming_collection_equality(
 			False
 
 
+private pure func is_borrowing_equality(op: CoreBinaryOp, left: CoreExpr, right: CoreExpr) -> Bool:
+	match op:
+		EqualOp:
+			not is_consuming_collection_equality(op, left, right)
+		NotEqualOp:
+			not is_consuming_collection_equality(op, left, right)
+		_:
+			False
+
+
 private pure func protect_consuming_field_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
@@ -10200,7 +10708,17 @@ private pure func normalize_owned_result_constructor_fallback(
 
 
 private pure func normalize_owned_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	if result_transfers_existing_owner(env, expr):
+	owned_temporary_projection: Bool = match expr:
+		FieldExpr(owner, field, typ, loc):
+			is_owned_temporary_expr(env, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			is_owned_temporary_expr(env, owner)
+		_:
+			False
+
+	if owned_temporary_projection:
+		bind_owned_temporary_field_projection(env, expr)
+	else if result_transfers_existing_owner(env, expr):
 		expr
 	else if is_owned_temporary_expr(env, expr):
 		expr
@@ -10440,9 +10958,15 @@ private pure func normalize_binding_alias_rhs(
 					loc,
 				)
 			FieldExpr(owner, field, typ, loc):
-				retain_alias_as_owned(rhs)
+				if is_owned_temporary_expr(env, owner):
+					bind_owned_temporary_field_projection(env, rhs)
+				else:
+					retain_alias_as_owned(rhs)
 			TupleFieldExpr(owner, field_index, typ, loc):
-				retain_alias_as_owned(rhs)
+				if is_owned_temporary_expr(env, owner):
+					bind_owned_temporary_field_projection(env, rhs)
+				else:
+					retain_alias_as_owned(rhs)
 			_:
 				normalize_binding_alias_result(env, rhs)
 
@@ -10690,6 +11214,53 @@ private pure func rewrite_aggregate_with_owned_field_aliases(
 			expr
 
 
+private pure func bind_owned_temporary_field_projection(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		FieldExpr(owner, field, typ, loc):
+			if is_owned_temporary_expr(env, owner):
+				owner_type: CoreType = expr_result_type(owner)
+				owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+				projection: CoreExpr = FieldExpr(
+					VarExpr(copy_core_var(owner_var), copy_core_type(owner_type), loc),
+					field,
+					copy_core_type(typ),
+					loc,
+				)
+
+				owned_projection: CoreExpr = if is_managed_type(env, typ):
+					retain_alias_as_owned(projection)
+				else:
+					projection
+
+				LetExpr(owner_var, False, owner_type, owner, owned_projection)
+			else:
+				expr
+		TupleFieldExpr(owner, field_index, typ, loc):
+			if is_owned_temporary_expr(env, owner):
+				owner_type: CoreType = expr_result_type(owner)
+				owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+				projection: CoreExpr = TupleFieldExpr(
+					VarExpr(copy_core_var(owner_var), copy_core_type(owner_type), loc),
+					field_index,
+					copy_core_type(typ),
+					loc,
+				)
+
+				owned_projection: CoreExpr = if is_managed_type(env, typ):
+					retain_alias_as_owned(projection)
+				else:
+					projection
+
+				LetExpr(owner_var, False, owner_type, owner, owned_projection)
+			else:
+				expr
+		_:
+			expr
+
+
 private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
@@ -10707,6 +11278,10 @@ private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> C
 			bind_borrowed_owned_temporary_args_through_unbox(env, expr)
 		BinaryExpr(op, left, right, typ, loc):
 			protect_consuming_field_aliases(env, expr)
+		FieldExpr(owner, field, typ, loc):
+			bind_owned_temporary_field_projection(env, expr)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			bind_owned_temporary_field_projection(env, expr)
 		_:
 			expr
 
@@ -10813,7 +11388,7 @@ private pure func rewrite_managed_let(
 
 	balances_nested_matches: Bool = (
 		managed_binding
-		and balanced_path_has_divergent_constructor_match(variable.name, rewritten_body)
+		and balanced_path_has_divergent_constructor_match(env, variable.name, rewritten_body)
 	)
 
 	balance_env: PerceusEnv = { env | balance_nested_matches = balances_nested_matches }
@@ -11170,6 +11745,10 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 		UnboxExpr(kind, inner, typ, loc):
 			insert_drops_ownership_node(env, expr)
 		BinaryExpr(op, left, right, typ, loc):
+			insert_drops_ownership_node(env, expr)
+		FieldExpr(owner, field, typ, loc):
+			insert_drops_ownership_node(env, expr)
+		TupleFieldExpr(owner, field_index, typ, loc):
 			insert_drops_ownership_node(env, expr)
 		_:
 			insert_drops_normalized_expr(env, expr)
@@ -11675,6 +12254,7 @@ private pure func summarize_function_return_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_function_return_match_branch_uses(
 					env,
 					name,
@@ -11688,6 +12268,7 @@ private pure func summarize_function_return_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				NoReleasePolicy,
 				summarize_function_return_literal_match_uses(
 					env,
 					name,
@@ -11707,6 +12288,7 @@ private pure func summarize_function_return_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_function_return_literal_match_uses(env, name, return_type, match_expr),
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
@@ -11714,6 +12296,7 @@ private pure func summarize_function_return_ownership_uses(
 				env,
 				name,
 				scrutinee,
+				release_policy,
 				summarize_function_return_length_match_uses(env, name, return_type, match_expr),
 			)
 		LetExpr(variable, is_mutable, bind_type, rhs, body):

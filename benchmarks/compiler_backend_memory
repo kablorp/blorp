@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""Replay a captured production emit_core_c request with bounded diagnostics."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+METRIC_VERSION = 1
+DEFAULT_TIMEOUT_SECONDS = 60.0
+MAX_UNCONFIRMED_REQUEST_BYTES = 16 * 1024 * 1024
+RENDERER_BRIDGE_ENV = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
+WORKER_FLAG = "--measurement-worker"
+VALIDATE_FLAG = "--validate-request"
+POLL_SECONDS = 0.1
+TERMINATE_GRACE_SECONDS = 1.0
+WORKER_TERMINATE_GRACE_SECONDS = 3.0
+VMMAP_COMMAND_TIMEOUT_SECONDS = 1.0
+ERROR_EXCERPT_BYTES = 4096
+
+JsonObject = dict[str, Any]
+
+
+def parse_memory_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:[.][0-9]+)?)([KMGTP]?)", value.strip())
+    if match is None:
+        raise ValueError(f"invalid memory value: {value}")
+    multiplier = {
+        "": 1,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+    }[match.group(2)]
+    return int(float(match.group(1)) * multiplier)
+
+
+def vmmap_metrics(pid: int, timeout_seconds: float) -> JsonObject:
+    try:
+        result = subprocess.run(
+            ["vmmap", "-summary", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    metrics: JsonObject = {}
+    physical = re.search(
+        r"^Physical footprint:\s+([0-9.]+[KMGTP]?)",
+        result.stdout,
+        re.M,
+    )
+    if physical is not None:
+        metrics["physical_footprint_bytes"] = parse_memory_bytes(physical.group(1))
+
+    malloc_small = re.search(
+        r"^\s*MALLOC_SMALL\b[^\n]*?([0-9.]+[KMGTP])\b",
+        result.stdout,
+        re.M,
+    )
+    if malloc_small is not None:
+        metrics["malloc_small_bytes"] = parse_memory_bytes(malloc_small.group(1))
+
+    allocation_counts = re.findall(r"([0-9][0-9,]*) allocations", result.stdout)
+    zone_rows = re.findall(
+        r"^DefaultMallocZone_\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+([0-9,]+)\s+",
+        result.stdout,
+        re.M,
+    )
+    allocation_counts.extend(zone_rows)
+    if allocation_counts:
+        metrics["allocation_count"] = max(
+            int(value.replace(",", "")) for value in allocation_counts
+        )
+    return metrics
+
+
+def merge_max_metrics(current: JsonObject, sample: JsonObject) -> JsonObject:
+    result = dict(current)
+    for name, value in sample.items():
+        result[name] = max(int(result.get(name, 0)), int(value))
+    return result
+
+
+def normalized_max_rss_bytes() -> int:
+    max_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if platform.system() == "Darwin":
+        return int(max_rss)
+    return int(max_rss) * 1024
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group_id = process.pid
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+
+    deadline = time.perf_counter() + TERMINATE_GRACE_SECONDS
+    while time.perf_counter() < deadline:
+        process.poll()
+        if not process_group_exists(process_group_id):
+            break
+        time.sleep(0.01)
+
+    if process_group_exists(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+    process.wait()
+
+
+def run_measurement_worker(args: argparse.Namespace) -> int:
+    vmmap_enabled = args.sample_vmmap == "1"
+    vmmap_result: JsonObject = {}
+    timed_out = False
+    started = time.perf_counter()
+    deadline = started + args.timeout_seconds
+
+    with open(args.response, "wb") as stdout_file, open(
+        args.stderr,
+        "wb",
+    ) as stderr_file:
+        process = subprocess.Popen(
+            [args.bridge, args.request],
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+
+        try:
+            while process.poll() is None:
+                now = time.perf_counter()
+                if now >= deadline:
+                    timed_out = True
+                    terminate_process_group(process)
+                    break
+
+                if vmmap_enabled:
+                    vmmap_result = merge_max_metrics(
+                        vmmap_result,
+                        vmmap_metrics(
+                            process.pid,
+                            min(VMMAP_COMMAND_TIMEOUT_SECONDS, deadline - now),
+                        ),
+                    )
+
+                now = time.perf_counter()
+                if now >= deadline:
+                    continue
+                time.sleep(min(POLL_SECONDS, deadline - now))
+        finally:
+            process.poll()
+            if process_group_exists(process.pid):
+                terminate_process_group(process)
+
+        return_code = process.wait()
+
+    metrics = {
+        "elapsed_seconds": time.perf_counter() - started,
+        "exit_code": return_code,
+        "timed_out": timed_out,
+        **vmmap_result,
+    }
+    if not vmmap_enabled:
+        metrics["peak_rss_bytes"] = normalized_max_rss_bytes()
+    if return_code < 0:
+        metrics["exit_signal"] = -return_code
+    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
+    return 0
+
+
+def measurement_worker(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("bridge")
+    parser.add_argument("request")
+    parser.add_argument("response")
+    parser.add_argument("stderr")
+    parser.add_argument("metrics")
+    parser.add_argument("timeout_seconds", type=float)
+    parser.add_argument("sample_vmmap", choices=("0", "1"))
+    args = parser.parse_args(argv)
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    interrupted = False
+
+    def interrupt_worker(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        raise InterruptedError("measurement worker terminated")
+
+    signal.signal(signal.SIGINT, interrupt_worker)
+    signal.signal(signal.SIGTERM, interrupt_worker)
+    try:
+        return run_measurement_worker(args)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+
+def positive_float(value: str) -> float:
+    result = float(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepared_renderer_bridge(root: Path, out_dir: Path, explicit: str | None) -> Path:
+    candidate = explicit or os.environ.get(RENDERER_BRIDGE_ENV)
+    if candidate:
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"renderer bridge does not exist: {path}")
+        return path
+
+    blorp = root / "blorp"
+    if not blorp.is_file():
+        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
+
+    result = subprocess.run(
+        [str(blorp), "__compiler-bridge-prepare", str(out_dir)],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
+
+    values = {}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator:
+            values[name] = value
+    candidate = values.get(RENDERER_BRIDGE_ENV)
+    if not candidate:
+        raise RuntimeError("bridge preparation did not report the renderer helper")
+    path = Path(candidate).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"prepared renderer bridge does not exist: {path}")
+    return path
+
+
+def validate_request(request_path: Path) -> None:
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"captured request is invalid JSON: {error}") from error
+
+    if not isinstance(request, dict):
+        raise RuntimeError("captured request must be a JSON object")
+    if request.get("schema") != 1 or request.get("domain") != "compiler":
+        raise RuntimeError("captured request is not a compiler bridge schema-1 envelope")
+    if request.get("action") != "emit_core_c":
+        raise RuntimeError("captured request action must be emit_core_c")
+    payload = request.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("core"), dict):
+        raise RuntimeError("captured emit_core_c request is missing its Core program")
+
+
+def validate_request_in_subprocess(request_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            VALIDATE_FLAG,
+            str(request_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "request validation process failed"
+        raise RuntimeError(detail)
+
+
+def validate_response(response_path: Path) -> int:
+    try:
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"renderer bridge returned invalid JSON: {error}") from error
+
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        detail = response.get("error", response) if isinstance(response, dict) else response
+        raise RuntimeError(f"renderer bridge failed: {detail}")
+    artifact = response.get("artifact")
+    if not isinstance(artifact, dict):
+        raise RuntimeError("renderer bridge response is missing an artifact")
+    c_code = artifact.get("c_code")
+    if not isinstance(c_code, str) or not c_code:
+        raise RuntimeError("renderer bridge artifact is missing generated C")
+    return len(c_code.encode("utf-8"))
+
+
+def wait_for_measurement_worker(command: list[str], root: Path) -> int:
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    worker: subprocess.Popen[bytes] | None = None
+    interrupted = False
+
+    def interrupt_controller(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        raise InterruptedError("backend measurement interrupted")
+
+    signal.signal(signal.SIGINT, interrupt_controller)
+    signal.signal(signal.SIGTERM, interrupt_controller)
+    try:
+        worker = subprocess.Popen(command, cwd=root)
+        return worker.wait()
+    finally:
+        if worker is not None and worker.poll() is None:
+            worker.terminate()
+            try:
+                worker.wait(timeout=WORKER_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.wait()
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+
+def error_excerpt(path: Path) -> str:
+    try:
+        contents = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if len(contents) <= ERROR_EXCERPT_BYTES:
+        return contents
+    omitted = len(contents) - ERROR_EXCERPT_BYTES
+    return contents[:ERROR_EXCERPT_BYTES] + f"... <truncated {omitted} bytes>"
+
+
+def print_metrics(metrics: JsonObject, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(metrics, sort_keys=True))
+        return
+
+    ordered_names = (
+        "metric_version",
+        "request_bytes",
+        "response_bytes",
+        "generated_c_bytes",
+        "elapsed_seconds",
+        "timeout_seconds",
+        "peak_rss_bytes",
+        "physical_footprint_bytes",
+        "malloc_small_bytes",
+        "allocation_count",
+        "exit_code",
+        "exit_signal",
+        "timed_out",
+        "verified",
+        "request_sha256",
+        "bridge_sha256",
+        "response_sha256",
+    )
+    fields = [f"{name}={metrics[name]}" for name in ordered_names if name in metrics]
+    print("BACKEND_MEMORY_REPLAY " + " ".join(fields))
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
+    root = project_root()
+    source_request = Path(args.request).expanduser().resolve()
+    if not source_request.is_file():
+        raise RuntimeError(f"captured request does not exist: {source_request}")
+    request_bytes = source_request.stat().st_size
+    if (
+        request_bytes > MAX_UNCONFIRMED_REQUEST_BYTES
+        and not args.allow_large_request
+    ):
+        raise RuntimeError(
+            "captured request exceeds the safe local threshold; rerun with "
+            "--allow-large-request only inside an external memory limit"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="blorp-backend-memory-") as temp_name:
+        temp_dir = Path(temp_name)
+        request_path = temp_dir / "request.json"
+        shutil.copyfile(source_request, request_path)
+        request_bytes = request_path.stat().st_size
+        if (
+            request_bytes > MAX_UNCONFIRMED_REQUEST_BYTES
+            and not args.allow_large_request
+        ):
+            raise RuntimeError(
+                "captured request changed while it was copied and now exceeds "
+                "the safe local threshold"
+            )
+        request_sha256 = sha256_file(request_path)
+        validate_request_in_subprocess(request_path)
+        if sha256_file(request_path) != request_sha256:
+            raise RuntimeError("private replay request changed during validation")
+
+        bridge_dir = temp_dir / "bridge"
+        bridge_dir.mkdir()
+        bridge = prepared_renderer_bridge(root, bridge_dir, args.bridge)
+        bridge_sha256 = sha256_file(bridge)
+
+        response_path = temp_dir / "response.json"
+        stderr_path = temp_dir / "bridge.stderr"
+        metrics_path = temp_dir / "metrics.json"
+
+        worker_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            WORKER_FLAG,
+            str(bridge),
+            str(request_path),
+            str(response_path),
+            str(stderr_path),
+            str(metrics_path),
+            str(args.timeout),
+            "1" if args.vmmap else "0",
+        ]
+        worker_return_code = wait_for_measurement_worker(worker_command, root)
+        if worker_return_code != 0 or not metrics_path.is_file():
+            raise RuntimeError("backend measurement worker failed")
+
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if sha256_file(request_path) != request_sha256:
+            raise RuntimeError("replay request changed during measurement")
+        if sha256_file(bridge) != bridge_sha256:
+            raise RuntimeError("renderer bridge changed during measurement")
+
+        metrics.update(
+            {
+                "metric_version": METRIC_VERSION,
+                "request_bytes": request_bytes,
+                "response_bytes": response_path.stat().st_size,
+                "request_sha256": request_sha256,
+                "bridge_sha256": bridge_sha256,
+                "timeout_seconds": args.timeout,
+            }
+        )
+
+        if metrics["timed_out"]:
+            metrics["verified"] = False
+            detail = error_excerpt(stderr_path)
+            if detail:
+                metrics["error"] = detail
+            print_metrics(metrics, args.json)
+            return 124
+
+        if metrics["exit_code"] != 0:
+            metrics["verified"] = False
+            detail = error_excerpt(stderr_path)
+            if detail:
+                metrics["error"] = detail
+            print_metrics(metrics, args.json)
+            return 1
+
+        generated_c_bytes = validate_response(response_path)
+        metrics.update(
+            {
+                "generated_c_bytes": generated_c_bytes,
+                "response_sha256": sha256_file(response_path),
+                "verified": True,
+            }
+        )
+        print_metrics(metrics, args.json)
+        return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == WORKER_FLAG:
+        return measurement_worker(argv[1:])
+    if argv and argv[0] == VALIDATE_FLAG:
+        if len(argv) != 2:
+            print("error: request validation requires exactly one path", file=sys.stderr)
+            return 2
+        try:
+            validate_request(Path(argv[1]))
+            return 0
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replay one captured production emit_core_c request against an "
+            "isolated renderer bridge."
+        )
+    )
+    parser.add_argument("request", help="captured emit_core_c request JSON")
+    parser.add_argument(
+        "--bridge",
+        help=f"prepared renderer bridge; defaults to ${RENDERER_BRIDGE_ENV} or prepares one",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"terminate the renderer after this many seconds (default: {DEFAULT_TIMEOUT_SECONDS:g})",
+    )
+    parser.add_argument(
+        "--allow-large-request",
+        action="store_true",
+        help=(
+            "allow requests larger than 16 MiB; use only with an external "
+            "process or container memory limit"
+        ),
+    )
+    parser.add_argument(
+        "--vmmap",
+        action="store_true",
+        help="sample macOS vmmap allocator and physical-footprint metrics",
+    )
+    parser.add_argument("--json", action="store_true", help="print metrics as JSON")
+    args = parser.parse_args(argv)
+
+    if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
+        parser.error("--vmmap requires macOS vmmap")
+
+    try:
+        return run_benchmark(args)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

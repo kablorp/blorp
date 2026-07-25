@@ -1324,6 +1324,209 @@ The next measured memory slice belongs there. Direct JSON emission remains a
 possible later optimization only after a profile shows projection or
 serialization at the live peak.
 
+#### Exact `compiler_infer` replay (2026-07-23)
+
+The later compiler migration exposed a separate self-hosted typecheck peak, so
+the bridge now supports exact request capture through
+`BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST`.
+`benchmarks/compiler_typecheck_replay` executes that request in an isolated
+process with a timeout, a Linux address-space or macOS sampled-RSS limit,
+file-backed output, response validation, request/helper hashes, and
+phase/module markers.
+
+The captured `compiler_infer.brp` request is 1,396,350 bytes with SHA-256
+`72ed96735b70982cd63bcb4688b3233f73d31ecccb457ff32648587e0067639e`.
+Normal replays established:
+
+| Selection | Before peak RSS | After peak RSS | Before time | After time |
+|-----------|----------------:|---------------:|------------:|-----------:|
+| target typecheck, full graph context | 2,073,985,024 bytes | 2,016,165,888 bytes | 22.48 s | 22.31 s |
+| full selected graph | 3,177,906,176 bytes | 3,084,386,304 bytes | 25.61 s | 25.54 s |
+
+The target-typecheck peak fell by 57,819,136 bytes (2.8%), and the full graph
+peak fell by 93,519,872 bytes (2.9%), with effectively unchanged elapsed time
+and byte-identical responses. A focused recursive resource-scan fixture fell
+from about 222,887,936 bytes to 51,773,440 bytes.
+
+The implemented reductions are deliberately narrow:
+
+- declaration resource-shape traversal expands only an alias head before
+  visiting children, avoiding recursive reconstruction at every node;
+- immutable semantic and value types are shared across value slots and typed
+  expression metadata instead of being recursively copied into equivalent
+  fields;
+- the type-shape memo is reset at declaration boundaries and before the final
+  state escapes;
+- typed artifacts are emitted one declaration at a time, and graph responses
+  are written in chunks without constructing a second program-sized
+  `JsonValue` or serialized string;
+- each typechecked artifact falls out of lexical scope after its response is
+  emitted; graph preparation, typecheck, projection, emission, and artifact
+  scope boundaries are visible in opt-in trace markers. Prepared graph modules
+  remain live for the request.
+
+The markers rule out CTFE and final projection as the dominant peak for this
+request. It has no CTFE dependency preparations. Graph parse and importable
+preparation reach roughly 155 MB; most growth happens while constructing the
+typed target. Prior selected modules leave roughly 1.26 GB of allocator
+high-water before the target starts. Typechecking only the target reaches about
+2.0 GB while still retaining the full prepared graph context.
+
+`--memstats` is intentionally perturbative and is disabled in normal
+measurements. One target-typecheck diagnostic run timed out at 120 seconds near
+3.81 GB sampled RSS. Its `typecheck_complete` marker reported 189,594,195
+allocations, 162,679,722 releases, 26,914,473 current objects, and
+1,849,339,381 requested allocation bytes. Projection raised total allocations
+to about 201.75 million without increasing current objects. This is evidence
+of extreme allocation churn plus a large live typed representation; it is not
+evidence of an unbounded leak.
+
+The remaining 2.0 GB target-typecheck and 3.08 GB full-graph peaks are not
+resolved by this slice. The next measured work should inventory recursive
+`compiler_type_copy` boundaries and reduce only copies whose values are
+provably immutable and non-mutated. Environment-wide ownership changes or a
+typed-AST representation redesign require separate tests and measurements;
+they should not be inferred from RSS high-water alone.
+
+#### Bounded full CLI rebuild (2026-07-23)
+
+A native `linux/arm64` Docker rebuild was run with swap disabled and an
+effective Docker VM ceiling of 7.751 GiB. The current CLI did not finish
+building, so the compiler inference tests never started. The container was OOM
+killed while executing the `compiler_cli_main` `typecheck_graph` action:
+
+- cgroup peak: 7,664,627,712 bytes;
+- largest observed helper RSS: 7,127,982,080 bytes;
+- request size reported by the host: 6,958,706 bytes;
+- helper exit: 137, with one cgroup `oom_kill` event.
+
+This rules out the earlier `compiler_infer` target replay as a sufficient proxy
+for a full self-hosted build. The failing process is a typecheck bridge launched
+during `make`, before the requested `blorp test --no-cache` workload.
+
+An exact local `compiler_cli_main` request was then captured before helper
+launch. It is 6,963,323 bytes with SHA-256
+`4070fed72199e1d63e31e03571c58e2d331e49f7aed7855c33045d29538e7589`.
+The request contains 145 prepared modules, 145 selected module targets, and 597
+resolved imports. Bounded prefix replays against the preserved Linux helper
+produced:
+
+| Selected module targets | CTFE dependencies completed | Artifacts emitted | Peak bytes | Result |
+|------------------------:|----------------------------:|------------------:|-----------:|--------|
+| 0 | 0 | 1 | 1,044,066,304 | completed |
+| 25 | 0 | 26 | 1,916,477,440 | completed |
+| 50 | 6 | 41 | 7,641,427,968 | 180 s timeout |
+| 75 | 33 | 18 | 7,640,506,368 | 180 s timeout |
+| 145 | 33 | 19 | 7,649,677,312 process RSS | terminated at diagnostic deadline |
+
+The 50-target replay stalled while starting `compiler_core_consume_specialize`.
+The 75-target replay stalled while starting `compiler_parsed_ast_traverse`.
+The full replay completed all 33 CTFE dependency preparations, emitted 19
+selected-module artifacts, and remained near the ceiling while starting
+`compiler_type_name_metadata`.
+
+This establishes two distinct multipliers:
+
+1. selecting the first 25 frontend/type modules remains below 2 GB;
+2. crossing into Core modules induces retained CTFE programs and selected
+   module typechecking/emission pressure, taking the process to the 8 GB
+   ceiling before even half of the selected graph is emitted.
+
+The lexical typed-artifact boundary and chunked response remove projection
+overlap, but process RSS does not fall between modules. The next correction
+must therefore bound retained graph-wide CTFE/typecheck state or move selected
+module typechecking to independently reclaimable processes. Unbounded local
+full builds remain unsafe; use a cgroup or Docker memory ceiling until this
+graph-width multiplier is removed.
+
+#### Structural retention inventory (2026-07-23)
+
+The typecheck helper now has a separate opt-in structural inventory path.
+Normal compiler requests do not traverse or retain inventory metadata.
+`benchmarks/compiler_typecheck_replay` enables it for diagnostic replays and
+aggregates one graph record, one record per retained CTFE typed program, and
+one record per emitted artifact. Recursive typed-expression counts provide a
+stable logical-size comparison without enabling perturbative runtime
+`memstats` or serializing retained CTFE programs.
+
+Three bounded macOS replays of the exact `compiler_cli_main` request produced:
+
+| Selection | Retained CTFE programs | Retained CTFE declarations | Retained CTFE expression nodes | Duplicate artifacts | Peak RSS | Time |
+|-----------|-----------------------:|---------------------------:|--------------------------------:|--------------------:|---------:|-----:|
+| target only | 0 | 0 | 0 | 0 | 926,138,368 bytes | 5.52 s |
+| `compiler_core_closure` plus target | 6 | 1,291 | 31,710 | 0 | 2,220,326,912 bytes | 15.24 s |
+| retention slice plus target | 6 | 1,291 | 31,710 | 6 | 2,753,265,664 bytes | 19.79 s |
+
+The retention slice selects `compiler_core_closure` and the six CTFE
+dependencies that its `VOID_TYPE` global requires. All six dependency modules
+are also emitted artifacts. Their second typed representations contain 31,703
+expression nodes, nearly matching the 31,710 nodes in the retained CTFE
+programs. The largest observed logical overlap is 56,633 expression nodes
+because the largest current artifact is added to all retained CTFE programs.
+This confirms redundant simultaneous typed representations rather than merely
+allocator high-water.
+
+An otherwise identical `--no-inventory` control measured 2,751,496,192 bytes
+and 19.65 seconds, versus 2,751,610,880 bytes and 19.75 seconds with structural
+counting. The 114,688-byte peak difference is 0.004%, so the inventory walk
+does not materially perturb this workload.
+
+The prepared graph also contains 146 parsed programs covering 5,959,542 source
+bytes and 9,752 declarations, plus 145 importable-module surfaces referencing
+9,731 declarations. The importable declaration lists are expected to share the
+parsed declarations through ARC, so those logical references are not yet
+evidence of physical tree copies.
+
+The focused feedback command is:
+
+```bash
+benchmarks/compiler_typecheck_replay "$capture" \
+  --retention-slice --timeout 60 --memory-limit 4G
+```
+
+The confirmed CTFE duplication is a concrete optimization target, but 31,710
+expression nodes alone do not explain multi-gigabyte RSS. Each typed node also
+retains type metadata, resolved-call data, and other recursive structures, and
+CTFE builds derived indexes while the source programs remain live. The next
+implementation should compact or reuse CTFE dependency artifacts, then compare
+this same slice before broadening the investigation.
+
+#### CTFE artifact reuse (2026-07-23)
+
+Selected modules that were already typechecked as CTFE dependencies now reuse
+that retained typed program as their artifact input. Reuse is attempted in the
+ordinary artifact import environment. It is rejected when the graph target is
+an ambient prelude/trait module or is reachable through the dependency's
+resolved explicit-import closure; those dependencies retain the target-aware
+CTFE program and use a separate artifact typecheck. This preserves the existing
+case where a CTFE dependency intentionally imports the target surface.
+
+Four matched retention-slice runs after the change produced:
+
+| Run | Reused artifacts | Duplicate artifacts | Peak RSS | Time |
+|----:|-----------------:|--------------------:|---------:|-----:|
+| 1 | 6 | 0 | 2,222,555,136 bytes | 17.28 s |
+| 2 | 6 | 0 | 2,223,357,952 bytes | 17.36 s |
+| 3 | 6 | 0 | 2,223,767,552 bytes | 17.49 s |
+| 4 | 6 | 0 | 2,223,210,496 bytes | 17.58 s |
+
+An otherwise identical `--no-inventory` run peaked at 2,222,309,376 bytes,
+confirming that reuse is active on the normal bridge path and is not an
+inventory-only effect.
+
+Against the latest pre-change inventory run at 2,751,561,728 bytes and 19.59
+seconds, the first matched run reduces peak RSS by 529,006,592 bytes (19.2%)
+and elapsed time by 2.31 seconds (11.8%). The six reused artifacts cover 31,703
+typed-expression nodes. The conservative largest simultaneous logical count
+remains 56,633 nodes because CTFE evaluation rebuilds the declaration list and
+materializes global initializers even when artifact typechecking is reused.
+
+This removes the confirmed CTFE/artifact duplication but leaves approximately
+2.22 GB in the narrow slice. The remaining baseline closely matches the earlier
+`compiler_core_closure`-plus-target run, so the next investigation should
+measure retained CTFE metadata and graph-wide parsed/importable state rather
+than extending artifact reuse.
+
 ### Core JSON duplication
 
 The OCaml side builds a large `Lsp_json` Core tree and serialized request; the

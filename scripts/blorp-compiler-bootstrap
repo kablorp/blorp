@@ -21,6 +21,7 @@ for required_value in \
 	BLORP_BOOTSTRAP_REPO \
 	BLORP_BOOTSTRAP_TAG \
 	BLORP_BOOTSTRAP_VERSION \
+	BLORP_BOOTSTRAP_LAYOUT \
 	BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN \
 	BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU \
 	BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU
@@ -34,6 +35,16 @@ done
 repo="${BLORP_COMPILER_BOOTSTRAP_REPO:-$BLORP_BOOTSTRAP_REPO}"
 tag="$BLORP_BOOTSTRAP_TAG"
 version="$BLORP_BOOTSTRAP_VERSION"
+layout="$BLORP_BOOTSTRAP_LAYOUT"
+
+case "$layout" in
+	single | toolchain) ;;
+	*)
+		echo "Compiler bootstrap manifest has unsupported layout: $layout" >&2
+		exit 1
+		;;
+esac
+toolchain_executables="blorp blorp-ocaml-host blorp-ocaml-middle blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck"
 
 if [[ ! "$tag" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "Compiler bootstrap tag must be an immutable dev revision: $tag" >&2
@@ -152,24 +163,42 @@ sha256_file() {
 }
 
 cache_marker_matches() {
-	local binary="$1"
+	local install_dir="$1"
 	local marker="$2"
 	local target="$3"
 	local archive_sha="$4"
+	local binary="$install_dir/blorp"
+	local executable actual_sha
 
 	if [ ! -x "$binary" ] || [ ! -f "$marker" ]; then
 		return 1
 	fi
 
-	local actual_binary_sha
-	actual_binary_sha=$(sha256_file "$binary")
+	if ! grep -Fxq "repo=$repo" "$marker" ||
+		! grep -Fxq "tag=$tag" "$marker" ||
+		! grep -Fxq "version=$version" "$marker" ||
+		! grep -Fxq "layout=$layout" "$marker" ||
+		! grep -Fxq "target=$target" "$marker" ||
+		! grep -Fxq "archive_sha256=$archive_sha" "$marker"
+	then
+		return 1
+	fi
 
-	grep -Fxq "repo=$repo" "$marker" &&
-		grep -Fxq "tag=$tag" "$marker" &&
-		grep -Fxq "version=$version" "$marker" &&
-		grep -Fxq "target=$target" "$marker" &&
-		grep -Fxq "archive_sha256=$archive_sha" "$marker" &&
-		grep -Fxq "binary_sha256=$actual_binary_sha" "$marker"
+	if [ "$layout" = "single" ]; then
+		actual_sha=$(sha256_file "$binary")
+		grep -Fxq "binary_sha256=$actual_sha" "$marker"
+		return
+	fi
+
+	for executable in $toolchain_executables; do
+		if [ ! -x "$install_dir/$executable" ]; then
+			return 1
+		fi
+		actual_sha=$(sha256_file "$install_dir/$executable")
+		if ! grep -Fxq "file_sha256_${executable}=$actual_sha" "$marker"; then
+			return 1
+		fi
+	done
 }
 
 install_bootstrap() {
@@ -178,13 +207,14 @@ install_bootstrap() {
 	local install_dir="$3"
 	local binary="$4"
 	local marker="$5"
-	local asset archive checksum url expected_checksum actual_checksum binary_path stage_dir binary_sha
+	local asset archive checksum url expected_checksum actual_checksum
+	local binary_path package_dir stage_dir executable actual_sha
 
 	asset="blorp-${version}-${target}.tar.gz"
 	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
-	trap 'rm -rf "$stage_dir"' EXIT
+	trap 'rm -rf "$stage_dir"; for executable in $toolchain_executables; do rm -f "$install_dir/$executable.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
 
 	archive="$stage_dir/$asset"
 	checksum="$archive.sha256"
@@ -216,18 +246,56 @@ install_bootstrap() {
 		exit 1
 	fi
 
+	package_dir=$(dirname "$binary_path")
+	if [ "$layout" = "toolchain" ]; then
+		for executable in $toolchain_executables; do
+			if [ ! -f "$package_dir/$executable" ]; then
+				echo "Downloaded compiler bootstrap archive is missing $executable." >&2
+				exit 1
+			fi
+		done
+	fi
+
 	mkdir -p "$install_dir"
-	cp "$binary_path" "$binary"
-	chmod 0755 "$binary"
-	binary_sha=$(sha256_file "$binary")
+	if [ "$layout" = "toolchain" ]; then
+		for executable in $toolchain_executables; do
+			cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
+			chmod 0755 "$install_dir/$executable.tmp.$$"
+		done
+	else
+		cp "$binary_path" "$binary.tmp.$$"
+		chmod 0755 "$binary.tmp.$$"
+	fi
+
 	{
 		echo "repo=$repo"
 		echo "tag=$tag"
 		echo "version=$version"
+		echo "layout=$layout"
 		echo "target=$target"
 		echo "archive_sha256=$archive_sha"
-		echo "binary_sha256=$binary_sha"
-	} > "$marker"
+		if [ "$layout" = "toolchain" ]; then
+			for executable in $toolchain_executables; do
+				actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
+				echo "file_sha256_${executable}=$actual_sha"
+			done
+		else
+			actual_sha=$(sha256_file "$binary.tmp.$$")
+			echo "binary_sha256=$actual_sha"
+		fi
+	} > "$marker.tmp.$$"
+
+	if [ "$layout" = "toolchain" ]; then
+		for executable in $toolchain_executables; do
+			if [ "$executable" != "blorp" ]; then
+				mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
+			fi
+		done
+		mv "$install_dir/blorp.tmp.$$" "$binary"
+	else
+		mv "$binary.tmp.$$" "$binary"
+	fi
+	mv "$marker.tmp.$$" "$marker"
 	rm -rf "$stage_dir"
 	trap - EXIT
 }
@@ -237,12 +305,13 @@ resolve_bootstrap_path() {
 
 	target=$(target_triple)
 	archive_sha=$(expected_archive_sha256 "$target")
-	key="${tag}/${target}/${archive_sha}"
+	key="${tag}/${layout}/${target}/${archive_sha}"
 	install_dir="$cache_root/$key"
 	binary="$install_dir/blorp"
 	marker="$install_dir/MANIFEST"
 
-	if ! cache_marker_matches "$binary" "$marker" "$target" "$archive_sha"; then
+	if ! cache_marker_matches "$install_dir" "$marker" "$target" "$archive_sha"
+	then
 		install_bootstrap "$target" "$archive_sha" "$install_dir" "$binary" "$marker"
 	fi
 

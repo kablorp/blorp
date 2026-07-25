@@ -68,6 +68,7 @@ for required_bootstrap_value in \
 	BLORP_BOOTSTRAP_REPO \
 	BLORP_BOOTSTRAP_TAG \
 	BLORP_BOOTSTRAP_VERSION \
+	BLORP_BOOTSTRAP_LAYOUT \
 	BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN \
 	BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU \
 	BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU
@@ -77,6 +78,19 @@ do
 		exit 1
 	fi
 done
+
+case "$BLORP_BOOTSTRAP_LAYOUT" in
+	single | toolchain) ;;
+	*)
+		echo "FAIL: $bootstrap_manifest must declare a supported archive layout" >&2
+		exit 1
+		;;
+esac
+
+if [ "$BLORP_BOOTSTRAP_LAYOUT" != "toolchain" ]; then
+	echo "FAIL: $bootstrap_manifest must pin the complete compiler toolchain" >&2
+	exit 1
+fi
 
 if [[ ! "$BLORP_BOOTSTRAP_TAG" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "FAIL: $bootstrap_manifest must pin an immutable dev revision" >&2
@@ -134,6 +148,37 @@ do
 		echo "FAIL: $workflow cache keys must use the compiler bootstrap manifest tag" >&2
 		exit 1
 	fi
+	if ! grep -Fq 'key: blorp-compiler-bootstrap-v2-' "$workflow"; then
+		echo "FAIL: $workflow must use the complete-toolchain bootstrap cache schema" >&2
+		exit 1
+	fi
 done
+
+ci_workflow=.github/workflows/ci.yml
+if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
+	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
+then
+	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
+	exit 1
+fi
+
+premerge_workflow=.github/workflows/premerge.yml
+if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
+	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
+	exit 1
+fi
+
+release_workflow=.github/workflows/release.yml
+if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
+	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
+	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
+	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
+	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
+	! grep -Fq '"$package_dir/blorp" test' "$release_workflow"
+then
+	echo "FAIL: release CI must exercise self-hosting and both private workers from the archive" >&2
+	exit 1
+fi
 
 echo "PASS: build and CI cache ownership is explicit"

@@ -61,6 +61,7 @@ import:
 			DebugBlockExpr,
 			DictExpr,
 			DictConstructExpr,
+			DetachExpr,
 			DupExpr,
 			DropExpr,
 			FieldExpr,
@@ -87,6 +88,7 @@ import:
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
+			PreClosureDetachExpr,
 			SeqExpr,
 			SetAllocExpr,
 			StringByteCopyExpr,
@@ -171,7 +173,7 @@ import:
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreResourceExit(ResourceBreakExit),
-		CoreSelect,
+		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
 		CoreStringByteCopy,
@@ -225,13 +227,19 @@ import:
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreVar,
+		core_expr_to_json,
 		core_json_error_to_string,
 		core_literal_to_json,
 		core_program_to_json,
+		core_select_to_json,
+		core_set_alloc_to_json,
 		core_type_to_json,
 		core_union_representation_to_json,
+		decode_core_expr_json,
 		decode_core_literal_json,
 		decode_core_program_json,
+		decode_core_select_json,
+		decode_core_set_alloc_json,
 		decode_core_type_json,
 		decode_core_union_representation_json,
 	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector)
@@ -246,6 +254,44 @@ pure func sample_loc() -> CoreSourceLoc:
 		end_line = 1,
 		end_column = 12,
 	})
+
+
+pure func void_type_json_fixture() -> JsonValue:
+	JsonObject([("kind", JsonString("void"))])
+
+
+pure func synthetic_loc_json_fixture() -> JsonValue:
+	JsonObject([("kind", JsonString("synthetic"))])
+
+
+pure func void_expr_json_fixture() -> JsonValue:
+	JsonObject([
+		("kind", JsonString("void")),
+		("type", void_type_json_fixture()),
+		("loc", synthetic_loc_json_fixture()),
+	])
+
+
+pure func task_closure_json_fixture() -> JsonValue:
+	JsonObject([
+		("function_name", JsonString("worker")),
+		("def_id", JsonNumber(7.0)),
+		("c_name", JsonString("worker_c")),
+		("static_name", JsonString("worker_static")),
+		("captures", JsonVector([])),
+		("return_type", void_type_json_fixture()),
+	])
+
+
+pure func task_closure_fixture() -> CoreTaskClosure:
+	{
+		function_name = "worker",
+		def_id = 7,
+		c_name = "worker_c",
+		static_name = "worker_static",
+		captures = [],
+		return_type = VoidType
+	}
 
 
 pure func int_type() -> CoreType:
@@ -1092,33 +1138,27 @@ pure func channel_for_program() -> CoreProgram:
 pure func select_program() -> CoreProgram:
 	channel_param: CoreParam = local_param("events", channel_int_type())
 	timeout_param: CoreParam = local_param("timeout", int_type())
-	select_expr: CoreSelect = {arms = [
-			{
-				kind = SelectRecvArm({
-					binder = local_var("event"),
-					elem_type = int_type(),
-					channel = VarExpr(channel_param.name, channel_int_type(), sample_loc()),
-				}),
-				body = VoidExpr(VoidType, sample_loc()),
-				loc = sample_loc()
-			},
-			{
-				kind = SelectSealedArm(
-					VarExpr(
-						channel_param.name,
-						channel_int_type(),
-						sample_loc(),
-					),
-				),
-				body = VoidExpr(VoidType, sample_loc()),
-				loc = sample_loc()
-			},
-			{
-				kind = SelectAfterArm(VarExpr(timeout_param.name, int_type(), sample_loc())),
-				body = VoidExpr(VoidType, sample_loc()),
-				loc = sample_loc()
-			},
-		]}
+	select_expr: List[CoreSelectArm] = [
+		{
+			kind = SelectRecvArm({
+				binder = local_var("event"),
+				elem_type = int_type(),
+				channel = VarExpr(channel_param.name, channel_int_type(), sample_loc()),
+			}),
+			body = VoidExpr(VoidType, sample_loc()),
+			loc = sample_loc()
+		},
+		{
+			kind = SelectSealedArm(VarExpr(channel_param.name, channel_int_type(), sample_loc())),
+			body = VoidExpr(VoidType, sample_loc()),
+			loc = sample_loc()
+		},
+		{
+			kind = SelectAfterArm(VarExpr(timeout_param.name, int_type(), sample_loc())),
+			body = VoidExpr(VoidType, sample_loc()),
+			loc = sample_loc()
+		},
+	]
 
 	{
 		decls = [
@@ -2658,13 +2698,7 @@ pure func hash_container_program() -> CoreProgram:
 		type_params = [],
 		params = [],
 		return_type = set_string_type(),
-		body = Some(
-			SetAllocExpr(
-				{constructor = StringHashContainerConstructor},
-				set_string_type(),
-				sample_loc(),
-			),
-		),
+		body = Some(SetAllocExpr(StringHashContainerConstructor, set_string_type(), sample_loc())),
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = 61,
@@ -3840,6 +3874,89 @@ pure func test_core_program_json_round_trips_select() -> Bool:
 	)
 
 
+pure func test_set_alloc_json_schema_contract() -> Bool:
+	fixture: JsonValue = JsonObject([("constructor", JsonObject([("kind", JsonString("string"))]))])
+	encoded_ok: Bool = core_set_alloc_to_json(
+		StringHashContainerConstructor,
+	).to_string() == fixture.to_string()
+
+	decoded_ok: Bool = match decode_core_set_alloc_json(fixture, "set_alloc"):
+		Ok(StringHashContainerConstructor):
+			True
+		_:
+			False
+
+	encoded_ok and decoded_ok
+
+
+pure func test_detach_json_schema_contract() -> Bool:
+	fixture: JsonValue = JsonObject([
+		("kind", JsonString("detach")),
+		("detach", JsonObject([("task", task_closure_json_fixture())])),
+		("type", void_type_json_fixture()),
+		("loc", synthetic_loc_json_fixture()),
+	])
+	encoded_ok: Bool = core_expr_to_json(
+		DetachExpr(
+			task_closure_fixture(),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	).to_string() == fixture.to_string()
+
+	decoded_ok: Bool = match decode_core_expr_json(fixture, "expr"):
+		Ok(DetachExpr(task, VoidType, SyntheticSourceLoc)):
+			(
+				task.function_name == "worker"
+				and task.def_id == 7
+				and task.c_name == "worker_c"
+				and task.static_name == "worker_static"
+				and task.captures.length() == 0
+				and task.return_type == VoidType
+			)
+		_:
+			False
+
+	encoded_ok and decoded_ok
+
+
+pure func test_pre_closure_detach_json_schema_contract() -> Bool:
+	fixture: JsonValue = JsonObject([
+		("kind", JsonString("pre_closure_detach")),
+		("pre_closure_detach", JsonObject([("body", void_expr_json_fixture())])),
+		("type", void_type_json_fixture()),
+		("loc", synthetic_loc_json_fixture()),
+	])
+	encoded_ok: Bool = core_expr_to_json(
+		PreClosureDetachExpr(
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	).to_string() == fixture.to_string()
+
+	decoded_ok: Bool = match decode_core_expr_json(fixture, "expr"):
+		Ok(PreClosureDetachExpr(VoidExpr(VoidType, SyntheticSourceLoc), VoidType, SyntheticSourceLoc)):
+			True
+		_:
+			False
+
+	encoded_ok and decoded_ok
+
+
+pure func test_select_json_schema_contract() -> Bool:
+	fixture: JsonValue = JsonObject([("arms", JsonVector([]))])
+	encoded_ok: Bool = core_select_to_json([]).to_string() == fixture.to_string()
+
+	decoded_ok: Bool = match decode_core_select_json(fixture, "select"):
+		Ok([]):
+			True
+		_:
+			False
+
+	encoded_ok and decoded_ok
+
+
 pure func test_core_program_json_round_trips_tensor_parallel_call() -> Bool:
 	encoded: JsonValue = core_program_to_json(tensor_parallel_inline_struct_program())
 	encoded_text: String = encoded.to_string()
@@ -4588,6 +4705,10 @@ tests: TestSuite = {
 			test_core_program_json_round_trips_channel_for_loop,
 		),
 		("Core program JSON round trips select", test_core_program_json_round_trips_select),
+		("set allocation JSON schema is stable", test_set_alloc_json_schema_contract),
+		("detach JSON schema is stable", test_detach_json_schema_contract),
+		("pre-closure detach JSON schema is stable", test_pre_closure_detach_json_schema_contract),
+		("select JSON schema is stable", test_select_json_schema_contract),
 		(
 			"Core program JSON round trips tensor parallel call",
 			test_core_program_json_round_trips_tensor_parallel_call,

@@ -1,0 +1,1030 @@
+#!/usr/bin/env python3
+"""Replay a captured production typecheck_graph request with bounded diagnostics."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+METRIC_VERSION = 2
+DEFAULT_TIMEOUT_SECONDS = 120.0
+MAX_UNCONFIRMED_REQUEST_BYTES = 16 * 1024 * 1024
+TYPECHECK_BRIDGE_ENV = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
+TRACE_ENV = "BLORP_COMPILER_TYPECHECK_TRACE"
+MEMSTATS_ENV = "BLORP_COMPILER_TYPECHECK_MEMSTATS"
+ALLOCATOR_STATS_ENV = "BLORP_ALLOCATOR_STATS"
+INVENTORY_ENV = "BLORP_COMPILER_TYPECHECK_INVENTORY"
+WORKER_FLAG = "--measurement-worker"
+POLL_SECONDS = 0.02
+TERMINATE_GRACE_SECONDS = 1.0
+ERROR_EXCERPT_BYTES = 4096
+PHASE_PREFIX = "[typecheck-phase] "
+INVENTORY_PREFIX = "[typecheck-inventory] "
+MEMSTAT_FIELDS = (
+    "total_allocations",
+    "total_releases",
+    "current_objects",
+    "bytes_allocated",
+)
+COMPILER_CLI_RETENTION_SLICE = (
+    "std/string",
+    "std/parser",
+    "std/float",
+    "std/json",
+    "compiler/blorp/src/stage_09_core/compiler_core_json",
+    "compiler/blorp/src/stage_10_backend/compiler_core_emit_type_layout",
+    "compiler_core_closure",
+)
+
+JsonObject = dict[str, Any]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bridge_supports_allocator_stats(path: Path) -> bool:
+    return ALLOCATOR_STATS_ENV.encode() in path.read_bytes()
+
+
+def normalized_max_rss_bytes() -> int:
+    max_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    if platform.system() == "Darwin":
+        return int(max_rss)
+    return int(max_rss) * 1024
+
+
+def parse_memory_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:[.][0-9]+)?)([KMGTP]?)", value.strip())
+    if match is None:
+        raise ValueError(f"invalid memory value: {value}")
+    multiplier = {
+        "": 1,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+    }[match.group(2)]
+    return int(float(match.group(1)) * multiplier)
+
+
+def process_rss_bytes(pid: int) -> int:
+    status_path = Path(f"/proc/{pid}/status")
+    if status_path.is_file():
+        try:
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+        except (OSError, ValueError):
+            return 0
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+        return int(result.stdout.strip() or "0") * 1024
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return 0
+
+
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+
+    deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline and process_group_exists(process.pid):
+        process.poll()
+        time.sleep(0.01)
+
+    if process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+    process.wait()
+
+
+def memory_limit_kind(limit_bytes: int) -> str:
+    if limit_bytes <= 0:
+        return "none"
+    if platform.system() == "Darwin":
+        return "sampled_rss"
+    return "address_space"
+
+
+def memory_limiter(limit_bytes: int, limit_kind: str):
+    if limit_kind != "address_space":
+        return None
+
+    def apply_limit() -> None:
+        _soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_AS)
+        effective_limit = limit_bytes
+        if hard_limit != resource.RLIM_INFINITY:
+            effective_limit = min(effective_limit, hard_limit)
+        resource.setrlimit(resource.RLIMIT_AS, (effective_limit, hard_limit))
+
+    return apply_limit
+
+
+def read_phase_markers(path: Path) -> list[tuple[str, str, dict[str, int]]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    result: list[tuple[str, str, dict[str, int]]] = []
+    for line in lines:
+        if not line.startswith(PHASE_PREFIX):
+            continue
+        fields = dict(
+            item.split("=", 1)
+            for item in line[len(PHASE_PREFIX) :].split()
+            if "=" in item
+        )
+        phase = fields.get("phase")
+        module = fields.get("module")
+        if phase and module:
+            memstats: dict[str, int] = {}
+            for name in MEMSTAT_FIELDS:
+                try:
+                    memstats[name] = int(fields[name])
+                except (KeyError, ValueError):
+                    pass
+            result.append((phase, module, memstats))
+    return result
+
+
+def decode_inventory_field(value: str) -> str:
+    return (
+        value.replace("%20", " ")
+        .replace("%09", "\t")
+        .replace("%0D", "\r")
+        .replace("%0A", "\n")
+        .replace("%25", "%")
+    )
+
+
+def read_inventory(path: Path) -> JsonObject:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+
+    graph: JsonObject = {}
+    ctfe_dependencies: dict[str, JsonObject] = {}
+    artifacts: dict[str, JsonObject] = {}
+    artifact_ownership: dict[str, JsonObject] = {}
+    for line in lines:
+        if not line.startswith(INVENTORY_PREFIX):
+            continue
+        fields: JsonObject = {}
+        for item in line[len(INVENTORY_PREFIX) :].split():
+            name, separator, value = item.partition("=")
+            if not separator:
+                continue
+            if value == "True":
+                fields[name] = True
+            elif value == "False":
+                fields[name] = False
+            else:
+                try:
+                    fields[name] = int(value)
+                except ValueError:
+                    fields[name] = (
+                        decode_inventory_field(value) if name == "module" else value
+                    )
+
+        kind = fields.pop("kind", None)
+        module = fields.get("module")
+        if kind == "graph":
+            graph = fields
+        elif kind == "ctfe_dependency" and isinstance(module, str):
+            ctfe_dependencies[module] = fields
+        elif kind == "artifact" and isinstance(module, str):
+            artifacts[module] = fields
+        elif kind == "artifact_ownership" and isinstance(module, str):
+            artifact_ownership[module] = fields
+
+    if not graph and not ctfe_dependencies and not artifacts and not artifact_ownership:
+        return {}
+
+    retained_programs = [
+        item
+        for item in ctfe_dependencies.values()
+        if item.get("typecheck_failed") != 1
+    ]
+    failed_dependencies = len(ctfe_dependencies) - len(retained_programs)
+    retained_expr_nodes = sum(
+        int(item.get("typed_expr_nodes", 0))
+        for item in retained_programs
+    )
+    retained_typed_decls = sum(
+        int(item.get("typed_decls", 0))
+        for item in retained_programs
+    )
+    duplicated_artifacts = [
+        item
+        for item in artifacts.values()
+        if item.get("duplicates_retained_ctfe") == 1
+    ]
+    duplicated_expr_nodes = sum(
+        int(item.get("typed_expr_nodes", 0))
+        for item in duplicated_artifacts
+    )
+    reused_artifacts = [
+        item
+        for item in artifacts.values()
+        if item.get("reuses_retained_ctfe") == 1
+    ]
+    reused_expr_nodes = sum(
+        int(item.get("typed_expr_nodes", 0))
+        for item in reused_artifacts
+    )
+    summary = {
+        "planned_ctfe_dependencies": len(ctfe_dependencies),
+        "retained_ctfe_programs": len(retained_programs),
+        "failed_ctfe_dependencies": failed_dependencies,
+        "retained_ctfe_typed_decls": retained_typed_decls,
+        "retained_ctfe_typed_expr_nodes": retained_expr_nodes,
+        "duplicated_artifacts": len(duplicated_artifacts),
+        "duplicated_artifact_typed_expr_nodes": duplicated_expr_nodes,
+        "reused_artifacts": len(reused_artifacts),
+        "reused_artifact_typed_expr_nodes": reused_expr_nodes,
+        "largest_observed_simultaneous_typed_expr_nodes": max(
+            (
+                retained_expr_nodes + int(item.get("typed_expr_nodes", 0))
+                for item in artifacts.values()
+            ),
+            default=retained_expr_nodes,
+        ),
+    }
+    return {
+        "graph": graph,
+        "ctfe_dependencies": ctfe_dependencies,
+        "artifacts": artifacts,
+        "artifact_ownership": artifact_ownership,
+        "summary": summary,
+    }
+
+
+def validate_inventory(inventory: JsonObject, expected_artifacts: int) -> None:
+    graph = inventory.get("graph")
+    dependencies = inventory.get("ctfe_dependencies")
+    artifacts = inventory.get("artifacts")
+    artifact_ownership = inventory.get("artifact_ownership")
+    if not isinstance(graph, dict):
+        raise RuntimeError("typecheck helper did not emit graph inventory")
+    if not isinstance(dependencies, dict):
+        raise RuntimeError("typecheck helper did not emit CTFE dependency inventory")
+    if not isinstance(artifacts, dict) or len(artifacts) != expected_artifacts:
+        actual = len(artifacts) if isinstance(artifacts, dict) else 0
+        raise RuntimeError(
+            "typecheck helper emitted "
+            f"{actual} artifact inventory records; expected {expected_artifacts}"
+        )
+    expected_dependencies = graph.get("ctfe_dependencies")
+    if (
+        not isinstance(expected_dependencies, int)
+        or len(dependencies) != expected_dependencies
+    ):
+        raise RuntimeError(
+            "typecheck helper emitted incomplete CTFE dependency inventory"
+        )
+    fresh_artifacts = {
+        module
+        for module, fields in artifacts.items()
+        if isinstance(fields, dict) and fields.get("reuses_retained_ctfe") == 0
+    }
+    observed_ownership = (
+        set(artifact_ownership) if isinstance(artifact_ownership, dict) else set()
+    )
+    missing_ownership = fresh_artifacts - observed_ownership
+    if missing_ownership:
+        missing = ", ".join(sorted(missing_ownership))
+        raise RuntimeError(
+            f"typecheck helper omitted ownership inventory for fresh artifacts: {missing}"
+        )
+    required_ownership_fields = (
+        "after_typecheck_unique",
+        "after_ctfe_unique",
+        "after_module_construction_unique",
+        "before_artifact_release_unique",
+    )
+    for module in sorted(fresh_artifacts):
+        fields = artifact_ownership[module]
+        if not isinstance(fields, dict):
+            raise RuntimeError(
+                f"typecheck helper emitted invalid ownership inventory for {module}"
+            )
+        invalid_fields = [
+            field
+            for field in required_ownership_fields
+            if type(fields.get(field)) is not bool
+        ]
+        if invalid_fields:
+            invalid = ", ".join(invalid_fields)
+            raise RuntimeError(
+                "typecheck helper emitted incomplete ownership inventory "
+                f"for {module}: {invalid}"
+            )
+
+
+def merge_max_counters(
+    counters: dict[str, dict[str, int]],
+    key: str,
+    sample: dict[str, int],
+) -> None:
+    current = counters.setdefault(key, {})
+    for name, value in sample.items():
+        current[name] = max(current.get(name, 0), value)
+
+
+def measurement_worker(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("bridge")
+    parser.add_argument("request")
+    parser.add_argument("response")
+    parser.add_argument("stderr")
+    parser.add_argument("metrics")
+    parser.add_argument("timeout_seconds", type=float)
+    parser.add_argument("memory_limit_bytes", type=int)
+    parser.add_argument("memstats_enabled", type=int)
+    parser.add_argument("allocator_stats_enabled", type=int)
+    parser.add_argument("inventory_enabled", type=int)
+    args = parser.parse_args(argv)
+
+    response_path = Path(args.response)
+    stderr_path = Path(args.stderr)
+    environment = dict(os.environ)
+    environment[TRACE_ENV] = "1"
+    if args.inventory_enabled:
+        environment[INVENTORY_ENV] = "1"
+    else:
+        environment.pop(INVENTORY_ENV, None)
+    if args.memstats_enabled or args.allocator_stats_enabled:
+        environment[MEMSTATS_ENV] = "1"
+    else:
+        environment.pop(MEMSTATS_ENV, None)
+    if args.allocator_stats_enabled:
+        environment[ALLOCATOR_STATS_ENV] = "1"
+    else:
+        environment.pop(ALLOCATOR_STATS_ENV, None)
+    timed_out = False
+    memory_limited = False
+    limit_kind = memory_limit_kind(args.memory_limit_bytes)
+    peak_sampled_rss = 0
+    phase_sampled_peaks: dict[str, int] = {}
+    module_sampled_peaks: dict[str, int] = {}
+    module_phase_sampled_peaks: dict[str, dict[str, int]] = {}
+    phase_memstats: dict[str, dict[str, int]] = {}
+    module_memstats: dict[str, dict[str, int]] = {}
+    seen_markers = 0
+    current_phase = "startup"
+    current_module = ""
+    started = time.monotonic()
+    deadline = started + args.timeout_seconds
+
+    with response_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        process = subprocess.Popen(
+            [args.bridge, args.request],
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=environment,
+            start_new_session=True,
+            preexec_fn=memory_limiter(args.memory_limit_bytes, limit_kind),
+        )
+
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    timed_out = True
+                    terminate_process_group(process)
+                    break
+
+                markers = read_phase_markers(stderr_path)
+                if len(markers) > seen_markers:
+                    new_markers = markers[seen_markers:]
+                    for phase, module, memstats in new_markers:
+                        merge_max_counters(phase_memstats, phase, memstats)
+                        merge_max_counters(module_memstats, module, memstats)
+                    current_phase, current_module, _memstats = markers[-1]
+                    seen_markers = len(markers)
+
+                rss = process_rss_bytes(process.pid)
+                if rss > 0:
+                    peak_sampled_rss = max(peak_sampled_rss, rss)
+                    phase_sampled_peaks[current_phase] = max(
+                        phase_sampled_peaks.get(current_phase, 0),
+                        rss,
+                    )
+                    if current_module:
+                        module_sampled_peaks[current_module] = max(
+                            module_sampled_peaks.get(current_module, 0),
+                            rss,
+                        )
+                        module_phases = module_phase_sampled_peaks.setdefault(
+                            current_module,
+                            {},
+                        )
+                        module_phases[current_phase] = max(
+                            module_phases.get(current_phase, 0),
+                            rss,
+                        )
+                if (
+                    limit_kind == "sampled_rss"
+                    and rss > args.memory_limit_bytes
+                ):
+                    memory_limited = True
+                    terminate_process_group(process)
+                    break
+                time.sleep(min(POLL_SECONDS, max(0.0, deadline - now)))
+        finally:
+            process.poll()
+            if process_group_exists(process.pid):
+                terminate_process_group(process)
+
+        exit_code = process.wait()
+
+    peak_rss = max(peak_sampled_rss, normalized_max_rss_bytes())
+    final_markers = read_phase_markers(stderr_path)
+    inventory = read_inventory(stderr_path)
+    for phase, module, memstats in final_markers:
+        merge_max_counters(phase_memstats, phase, memstats)
+        merge_max_counters(module_memstats, module, memstats)
+    phase_timeline = [
+        {
+            "phase": phase,
+            "module": module,
+            **memstats,
+        }
+        for phase, module, memstats in final_markers
+    ]
+    allocator_samples = [
+        memstats
+        for _phase, _module, memstats in final_markers
+        if "bytes_allocated" in memstats
+    ]
+    allocator_stats_available = (
+        not args.allocator_stats_enabled
+        or (
+            bool(allocator_samples)
+            and all(
+                sample["bytes_allocated"] >= 0
+                and sample.get("total_allocations", 0) == 0
+                and sample.get("total_releases", 0) == 0
+                and sample.get("current_objects", 0) == 0
+                for sample in allocator_samples
+            )
+        )
+    )
+    memory_limit_failure_possible = (
+        limit_kind == "address_space"
+        and args.memory_limit_bytes > 0
+        and exit_code != 0
+        and not timed_out
+    )
+
+    metrics: JsonObject = {
+        "elapsed_seconds": time.monotonic() - started,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "memory_limited": memory_limited,
+        "memory_limit_kind": limit_kind,
+        "memory_limit_failure_possible": memory_limit_failure_possible,
+        "memstats_enabled": bool(args.memstats_enabled),
+        "allocator_stats_enabled": bool(args.allocator_stats_enabled),
+        "allocator_stats_available": allocator_stats_available,
+        "inventory_enabled": bool(args.inventory_enabled),
+        "peak_rss_bytes": peak_rss,
+        "rss_phase_attribution": "latest marker observed before each RSS sample",
+        "phase_sampled_peak_rss_bytes": phase_sampled_peaks,
+        "module_sampled_peak_rss_bytes": module_sampled_peaks,
+        "module_phase_sampled_peak_rss_bytes": module_phase_sampled_peaks,
+        "phase_memstats_max": phase_memstats,
+        "module_memstats_max": module_memstats,
+        "phase_timeline": phase_timeline,
+        "phase_markers": len(final_markers),
+        "inventory_available": bool(inventory),
+        "inventory": inventory,
+    }
+    if exit_code < 0:
+        metrics["exit_signal"] = -exit_code
+    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
+    return 0
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def prepared_typecheck_bridge(root: Path, out_dir: Path, explicit: str | None) -> Path:
+    candidate = explicit or os.environ.get(TYPECHECK_BRIDGE_ENV)
+    if candidate:
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"typecheck bridge does not exist: {path}")
+        return path
+
+    compiler = root / "blorp"
+    if not compiler.is_file():
+        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
+    result = subprocess.run(
+        [str(compiler), "__compiler-bridge-prepare", str(out_dir)],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
+
+    values = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line
+    )
+    candidate = values.get(TYPECHECK_BRIDGE_ENV)
+    if not candidate:
+        raise RuntimeError("bridge preparation did not report the typecheck helper")
+    path = Path(candidate).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"prepared typecheck bridge does not exist: {path}")
+    return path
+
+
+def request_details(request: JsonObject) -> tuple[JsonObject, list[str], list[str]]:
+    if request.get("schema") != 1:
+        raise ValueError("request schema must be 1")
+    if request.get("domain") != "compiler":
+        raise ValueError("request domain must be compiler")
+    if request.get("action") != "typecheck_graph":
+        raise ValueError("request action must be typecheck_graph")
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("request payload must be an object")
+    target = payload.get("target")
+    modules = payload.get("modules")
+    module_targets = payload.get("module_targets")
+    if not isinstance(target, dict) or not isinstance(modules, list):
+        raise ValueError("typecheck_graph payload requires target and modules")
+    if not isinstance(module_targets, list) or not all(
+        isinstance(item, str) for item in module_targets
+    ):
+        raise ValueError("module_targets must be an array of strings")
+
+    modules_by_path = {
+        item.get("module_path"): item
+        for item in modules
+        if isinstance(item, dict) and isinstance(item.get("module_path"), str)
+    }
+    missing = [name for name in module_targets if name not in modules_by_path]
+    if missing:
+        raise ValueError(f"module_targets contains unknown module: {missing[0]}")
+    expected_modules = [
+        str(modules_by_path[name].get("module", name)) for name in module_targets
+    ]
+    target_name = target.get("module")
+    if not isinstance(target_name, str):
+        raise ValueError("target module must be a string")
+    expected_modules.append(target_name)
+    return payload, list(module_targets), expected_modules
+
+
+def prepare_replay_request(
+    source_path: Path,
+    destination_path: Path,
+    selected_modules: list[str] | None,
+    first_modules: int | None,
+    target_only: bool,
+    retention_slice: bool,
+) -> tuple[Path, list[str], list[str], bool]:
+    request = json.loads(source_path.read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise ValueError("request root must be an object")
+    payload, original_targets, _expected = request_details(request)
+    selected_targets = original_targets
+    sliced = (
+        selected_modules is not None
+        or first_modules is not None
+        or target_only
+        or retention_slice
+    )
+
+    if target_only:
+        selected_targets = []
+    elif retention_slice:
+        selected_targets = list(COMPILER_CLI_RETENTION_SLICE)
+        missing = [
+            module for module in selected_targets if module not in original_targets
+        ]
+        if missing:
+            raise ValueError(
+                "compiler CLI retention slice module is not in module_targets: "
+                f"{missing[0]}"
+            )
+    elif selected_modules is not None:
+        for selected_module in selected_modules:
+            if selected_module not in original_targets:
+                raise ValueError(
+                    f"selected module is not in module_targets: {selected_module}"
+                )
+        selected_targets = list(dict.fromkeys(selected_modules))
+    elif first_modules is not None:
+        selected_targets = original_targets[:first_modules]
+
+    if not sliced:
+        _, _, expected_modules = request_details(request)
+        return source_path, original_targets, expected_modules, False
+
+    payload["module_targets"] = selected_targets
+    destination_path.write_text(
+        json.dumps(request, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    _, module_targets, expected_modules = request_details(request)
+    return destination_path, module_targets, expected_modules, True
+
+
+def validate_response(path: Path, expected_modules: list[str]) -> tuple[int, str]:
+    artifacts = 0
+    last_module = ""
+    with path.open(encoding="utf-8") as response_file:
+        for line_number, line in enumerate(response_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"typecheck artifact line {line_number} is invalid JSON: {error}"
+                ) from error
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                raise RuntimeError(f"typecheck artifact line {line_number} failed")
+            artifact = response.get("artifact")
+            if not isinstance(artifact, dict):
+                raise RuntimeError(
+                    f"typecheck artifact line {line_number} has no artifact"
+                )
+            module_name = artifact.get("module")
+            if artifacts >= len(expected_modules):
+                raise RuntimeError("typecheck helper returned trailing artifacts")
+            if module_name != expected_modules[artifacts]:
+                raise RuntimeError(
+                    "typecheck artifact order mismatch: "
+                    f"expected {expected_modules[artifacts]}, got {module_name}"
+                )
+            if not isinstance(artifact.get("typed_program"), dict):
+                raise RuntimeError(f"typecheck artifact {module_name} has no typed program")
+            artifacts += 1
+            last_module = str(module_name)
+
+    if artifacts != len(expected_modules):
+        raise RuntimeError(
+            f"typecheck helper returned {artifacts} artifacts; "
+            f"expected {len(expected_modules)}"
+        )
+    return artifacts, last_module
+
+
+def error_excerpt(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > ERROR_EXCERPT_BYTES:
+        data = data[-ERROR_EXCERPT_BYTES:]
+    lines = [
+        line
+        for line in data.decode("utf-8", errors="replace").splitlines()
+        if not line.startswith(PHASE_PREFIX)
+        and not line.startswith(INVENTORY_PREFIX)
+    ]
+    return "\n".join(lines).strip()
+
+
+def print_metrics(metrics: JsonObject, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(metrics, sort_keys=True))
+        return
+    ordered = (
+        "metric_version",
+        "request_bytes",
+        "response_bytes",
+        "artifacts",
+        "last_module",
+        "elapsed_seconds",
+        "peak_rss_bytes",
+        "inventory_enabled",
+        "inventory_available",
+        "planned_ctfe_dependencies",
+        "retained_ctfe_programs",
+        "failed_ctfe_dependencies",
+        "retained_ctfe_typed_decls",
+        "retained_ctfe_typed_expr_nodes",
+        "duplicated_artifacts",
+        "duplicated_artifact_typed_expr_nodes",
+        "reused_artifacts",
+        "reused_artifact_typed_expr_nodes",
+        "largest_observed_simultaneous_typed_expr_nodes",
+        "phase_markers",
+        "memory_limit_failure_possible",
+        "timed_out",
+        "verified",
+    )
+    fields = [f"{name}={metrics[name]}" for name in ordered if name in metrics]
+    print("TYPECHECK_MEMORY_REPLAY " + " ".join(fields))
+
+
+def run_benchmark(args: argparse.Namespace) -> int:
+    root = project_root()
+    source_path = Path(args.request).expanduser().resolve()
+    if not source_path.is_file():
+        raise ValueError(f"request does not exist: {source_path}")
+    source_bytes = source_path.stat().st_size
+    if (
+        source_bytes > MAX_UNCONFIRMED_REQUEST_BYTES
+        and not args.allow_large_request
+    ):
+        raise ValueError(
+            "request is larger than 16 MiB; pass --allow-large-request only "
+            "inside an external memory limit"
+        )
+    source_sha256 = sha256_file(source_path)
+
+    with tempfile.TemporaryDirectory(prefix="blorp-typecheck-replay-") as temp_name:
+        temp_dir = Path(temp_name)
+        replay_path, module_targets, expected_modules, sliced = prepare_replay_request(
+            source_path,
+            temp_dir / "request.json",
+            args.module,
+            args.first,
+            args.target_only,
+            args.retention_slice,
+        )
+        replay_sha256 = sha256_file(replay_path)
+        bridge_dir = temp_dir / "bridge"
+        bridge_dir.mkdir()
+        bridge = prepared_typecheck_bridge(root, bridge_dir, args.bridge)
+        if args.allocator_stats and not bridge_supports_allocator_stats(bridge):
+            raise RuntimeError(
+                "typecheck helper runtime does not support --allocator-stats; "
+                "pass --bridge with a helper built from the current runtime"
+            )
+        bridge_sha256 = sha256_file(bridge)
+        response_path = temp_dir / "response.jsonl"
+        stderr_path = temp_dir / "bridge.stderr"
+        metrics_path = temp_dir / "metrics.json"
+
+        worker = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                WORKER_FLAG,
+                str(bridge),
+                str(replay_path),
+                str(response_path),
+                str(stderr_path),
+                str(metrics_path),
+                str(args.timeout),
+                str(args.memory_limit or 0),
+                "1" if args.memstats else "0",
+                "1" if args.allocator_stats else "0",
+                "0" if args.no_inventory else "1",
+            ],
+            cwd=root,
+            check=False,
+        )
+        if worker.returncode != 0 or not metrics_path.is_file():
+            raise RuntimeError("typecheck replay measurement worker failed")
+        if sha256_file(bridge) != bridge_sha256:
+            raise RuntimeError("typecheck helper changed during replay")
+        if sha256_file(source_path) != source_sha256:
+            raise RuntimeError("captured request changed during replay")
+
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        inventory_summary = metrics.get("inventory", {}).get("summary", {})
+        if isinstance(inventory_summary, dict):
+            metrics.update(inventory_summary)
+        metrics.update(
+            {
+                "metric_version": METRIC_VERSION,
+                "request_bytes": source_bytes,
+                "replay_request_bytes": replay_path.stat().st_size,
+                "request_sha256": source_sha256,
+                "replay_request_sha256": replay_sha256,
+                "bridge_sha256": bridge_sha256,
+                "response_bytes": response_path.stat().st_size,
+                "module_targets": module_targets,
+                "request_was_sliced": sliced,
+                "timeout_seconds": args.timeout,
+                "memory_limit_bytes": args.memory_limit or 0,
+            }
+        )
+
+        if metrics["timed_out"]:
+            metrics["verified"] = False
+            detail = error_excerpt(stderr_path)
+            if detail:
+                metrics["error"] = detail
+            print_metrics(metrics, args.json)
+            return 124
+        if metrics["memory_limited"]:
+            metrics["verified"] = False
+            metrics["error"] = "typecheck helper exceeded the sampled RSS limit"
+            print_metrics(metrics, args.json)
+            return 125
+        if metrics["exit_code"] != 0:
+            metrics["verified"] = False
+            detail = error_excerpt(stderr_path)
+            errors: list[str] = []
+            if metrics["memory_limit_failure_possible"]:
+                errors.append(
+                    "helper failed while an address-space limit was active; "
+                    "rerun without the limit to distinguish an allocation-limit "
+                    "failure from an unrelated helper failure"
+                )
+            if detail:
+                errors.append(detail)
+            if errors:
+                metrics["error"] = "\n".join(errors)
+            print_metrics(metrics, args.json)
+            return 1
+
+        if not metrics["allocator_stats_available"]:
+            metrics["verified"] = False
+            metrics["error"] = (
+                "allocator statistics are unavailable on this runtime platform"
+            )
+            print_metrics(metrics, args.json)
+            return 1
+
+        if metrics["inventory_enabled"]:
+            try:
+                validate_inventory(metrics["inventory"], len(expected_modules))
+            except RuntimeError as error:
+                metrics["verified"] = False
+                metrics["error"] = str(error)
+                print_metrics(metrics, args.json)
+                return 1
+
+        artifacts, last_module = validate_response(response_path, expected_modules)
+        metrics.update(
+            {
+                "artifacts": artifacts,
+                "last_module": last_module,
+                "response_sha256": sha256_file(response_path),
+                "verified": True,
+            }
+        )
+        print_metrics(metrics, args.json)
+        return 0
+
+
+def positive_float(value: str) -> float:
+    result = float(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == WORKER_FLAG:
+        return measurement_worker(argv[1:])
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replay one captured production typecheck_graph request against "
+            "an isolated, bounded typecheck helper."
+        )
+    )
+    parser.add_argument("request", help="captured typecheck_graph request JSON")
+    parser.add_argument(
+        "--bridge",
+        help=f"prepared typecheck bridge; defaults to ${TYPECHECK_BRIDGE_ENV}",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--module",
+        action="append",
+        help="emit a named module target; repeat to select a small module set",
+    )
+    selection.add_argument(
+        "--first",
+        type=positive_int,
+        help="emit the first N module targets plus target",
+    )
+    selection.add_argument(
+        "--target-only",
+        action="store_true",
+        help=(
+            "typecheck and emit only the request target while retaining its "
+            "full prepared graph context"
+        ),
+    )
+    selection.add_argument(
+        "--retention-slice",
+        action="store_true",
+        help=(
+            "select the compiler CLI CTFE trigger and its six retained "
+            "dependencies for a fast duplicate-representation measurement"
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"terminate the helper after this many seconds (default: {DEFAULT_TIMEOUT_SECONDS:g})",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        type=parse_memory_bytes,
+        help=(
+            "enforce a child memory ceiling, for example 4G "
+            "(sampled RSS on macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-large-request",
+        action="store_true",
+        help="allow requests larger than 16 MiB inside an external memory limit",
+    )
+    instrumentation = parser.add_mutually_exclusive_group()
+    instrumentation.add_argument(
+        "--memstats",
+        action="store_true",
+        help="enable perturbative runtime allocation counters in phase markers",
+    )
+    instrumentation.add_argument(
+        "--allocator-stats",
+        action="store_true",
+        help=(
+            "report lightweight system allocator live bytes in phase markers "
+            "without per-object metadata"
+        ),
+    )
+    parser.add_argument(
+        "--no-inventory",
+        action="store_true",
+        help="disable structural counting for an otherwise identical control run",
+    )
+    parser.add_argument("--json", action="store_true", help="print metrics as JSON")
+    args = parser.parse_args(argv)
+
+    try:
+        return run_benchmark(args)
+    except (OSError, RuntimeError, ValueError) as error:
+        if args.json:
+            print(json.dumps({"verified": False, "error": str(error)}))
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

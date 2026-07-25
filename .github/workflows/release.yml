@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/blorp/compiler-bootstrap
-          key: blorp-compiler-bootstrap-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
+          key: blorp-compiler-bootstrap-v2-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Prewarm Blorp compiler bootstrap
         run: scripts/blorp-compiler-bootstrap --print-path
@@ -141,11 +141,41 @@ jobs:
           opam exec -- make install
           ./blorp --version
 
+      - name: Prepare packaged compiler bridges
+        run: |
+          mkdir -p compiler/_build/release-bridges
+          ./blorp __compiler-bridge-prepare compiler/_build/release-bridges
+
       - name: Package binary
         env:
           BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
           BLORP_RELEASE_TARGET: ${{ steps.meta.outputs.target }}
+          BLORP_RELEASE_RENDERER_BRIDGE: compiler/_build/release-bridges/compiler_renderer_bridge.bin
+          BLORP_RELEASE_PARSER_BRIDGE: compiler/_build/release-bridges/compiler_parser_bridge.bin
+          BLORP_RELEASE_TYPECHECK_BRIDGE: compiler/_build/release-bridges/compiler_typecheck_bridge.bin
         run: scripts/package-release dist
+
+      - name: Smoke packaged toolchain
+        shell: bash
+        env:
+          BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          BLORP_RELEASE_TARGET: ${{ steps.meta.outputs.target }}
+        run: |
+          set -euo pipefail
+          package_root=$(mktemp -d "${RUNNER_TEMP}/blorp-package-smoke.XXXXXX")
+          trap 'rm -rf "$package_root"' EXIT
+          archive_base="blorp-${BLORP_RELEASE_VERSION}-${BLORP_RELEASE_TARGET}"
+          tar -xzf "dist/${archive_base}.tar.gz" -C "$package_root"
+          package_dir="$package_root/$archive_base"
+          source_root="$PWD"
+          cd "$package_root"
+          "$package_dir/blorp" check --no-format \
+            "$source_root/compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
+          "$package_dir/blorp" compile --no-format \
+            -o "$package_root/empty_main.c" \
+            "$source_root/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
+          "$package_dir/blorp" test --no-format --no-cache --timeout 5 \
+            "$source_root/tests/test_blorp/types/test_bool.brp"
 
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4

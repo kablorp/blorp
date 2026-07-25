@@ -799,8 +799,31 @@ pure func state_with_stream_source_binding_values() -> CompilerTypecheckState:
 			compiler_type_option(compiler_type_stream(compiler_type_int())),
 		),
 	)
-	{ with_stream_carrier_func | env = compiler_env_add_func(
-			with_stream_carrier_func.env,
+	with_stream_parameter_carrier_func = add_infer_value(
+		with_stream_carrier_func,
+		"stream_parameter_carrier_func",
+		CompilerFunctionType(
+			True,
+			[compiler_type_option(compiler_type_stream(compiler_type_int()))],
+			compiler_type_int(),
+		),
+	)
+	with_source_carrier_func = add_infer_value(
+		with_stream_parameter_carrier_func,
+		"source_carrier_func",
+		CompilerFunctionType(
+			True,
+			[],
+			compiler_type_option(
+				compiler_type_resource_source(
+					compiler_type_reader(),
+					compiler_type_string(),
+				),
+			),
+		),
+	)
+	{ with_source_carrier_func | env = compiler_env_add_func(
+			with_source_carrier_func.env,
 			"make_source",
 			CompilerFunctionType(
 				True,
@@ -2953,6 +2976,34 @@ func test_detach_rejects_stream_capture() -> Bool:
 		and result.context.state.errors
 			.get_or(0, "")
 			.contains("detach cannot capture one-shot stream value: s")
+	)
+
+
+func test_detach_rejects_resource_source_capture() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_stream_source_binding_values()),
+		ParsedDetachExpr(ParsedNameExpr(ident("source")), source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("detach cannot capture resource source value: source")
+	)
+
+
+func test_detach_rejects_stream_inside_record_capture() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_stream_box_binding()),
+		ParsedDetachExpr(ParsedNameExpr(ident("box")), source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("detach cannot capture one-shot stream value: box")
 	)
 
 
@@ -6470,6 +6521,46 @@ func test_var_decl_rejects_one_shot_stream_function_carrier_binding() -> Bool:
 	)
 
 
+func test_var_decl_rejects_one_shot_stream_parameter_carrier_binding() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_stream_source_binding_values()),
+		ParsedVarDeclExpr(
+			ident("f"),
+			None,
+			ParsedNameExpr(ident("stream_parameter_carrier_func")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("function value `f` cannot accept or return a one-shot stream carrier")
+	)
+
+
+func test_var_decl_rejects_resource_source_function_carrier_binding() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_stream_source_binding_values()),
+		ParsedVarDeclExpr(
+			ident("f"),
+			None,
+			ParsedNameExpr(ident("source_carrier_func")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("function value `f` cannot accept or return a resource source carrier")
+	)
+
+
 func test_resource_shape_checks_memoize_complete_types() -> Bool:
 	state = add_infer_value(
 		state_with_stream_source_binding_values(),
@@ -6521,6 +6612,48 @@ func test_resource_shape_checks_memoize_complete_types() -> Bool:
 		and plain_carrier_count > first_carrier_count
 		and repeated.context.state.type_shape_memo.contains_target.length() == plain_contains_count
 		and repeated.context.state.type_shape_memo.function_carrier.length() == plain_carrier_count
+	)
+
+
+func test_primitive_binding_skips_resource_shape_memo() -> Bool:
+	state = add_infer_value(compiler_typecheck_state_empty(), "plain_int", compiler_type_int())
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		ParsedVarDeclExpr(
+			ident("copy"),
+			None,
+			ParsedNameExpr(ident("plain_int")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and result.context.state.type_shape_memo.contains_target.length() == 0
+		and result.context.state.type_shape_memo.function_carrier.length() == 0
+	)
+
+
+func test_primitive_storage_skips_resource_shape_memo() -> Bool:
+	state = add_infer_value(
+		compiler_typecheck_state_empty(),
+		"index",
+		CompilerRangeType(CompilerConstIntType(10)),
+	)
+	list_result = compiler_infer_expr(compiler_infer_context(state), list_expr([int_expr("1")]))
+	tuple_result = compiler_infer_expr(
+		list_result.context,
+		tuple_expr([ParsedNameExpr(ident("index")), int_expr("0")]),
+	)
+
+	(
+		list_result.context.state.errors.length() == 0
+		and list_result.context.state.type_shape_memo.contains_target.length() == 0
+		and list_result.context.state.type_shape_memo.function_carrier.length() == 0
+		and tuple_result.context.state.errors.length() == 0
+		and tuple_result.context.state.type_shape_memo.contains_target.length() == 0
+		and tuple_result.context.state.type_shape_memo.function_carrier.length() == 0
 	)
 
 
@@ -9818,6 +9951,11 @@ tests: TestSuite = {
 			test_concurrent_and_detach_traversals_include_nested_impure_calls,
 		),
 		("detach rejects stream capture", test_detach_rejects_stream_capture),
+		("detach rejects resource source capture", test_detach_rejects_resource_source_capture),
+		(
+			"detach rejects stream inside record capture",
+			test_detach_rejects_stream_inside_record_capture,
+		),
 		("select checks arms and returns void", test_select_checks_arms_and_returns_void),
 		(
 			"select accepts canonical Duration and range timeout",
@@ -10205,8 +10343,24 @@ tests: TestSuite = {
 			test_var_decl_rejects_one_shot_stream_function_carrier_binding,
 		),
 		(
+			"var decl rejects one-shot stream parameter carrier binding",
+			test_var_decl_rejects_one_shot_stream_parameter_carrier_binding,
+		),
+		(
+			"var decl rejects resource source function carrier binding",
+			test_var_decl_rejects_resource_source_function_carrier_binding,
+		),
+		(
 			"resource shape checks memoize complete types",
 			test_resource_shape_checks_memoize_complete_types,
+		),
+		(
+			"primitive binding skips resource shape memo",
+			test_primitive_binding_skips_resource_shape_memo,
+		),
+		(
+			"primitive storage skips resource shape memo",
+			test_primitive_storage_skips_resource_shape_memo,
 		),
 		(
 			"resource shape checks expand generic alias chains",

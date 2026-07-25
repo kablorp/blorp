@@ -82,8 +82,188 @@ included in `bench.sh all`.
 
 ## Compiler Memory Diagnostics
 
-`compiler_perceus_memory` is an opt-in compiler benchmark rather than a runtime
-language comparison. It generates a bounded Core program with managed globals
+These opt-in compiler benchmarks exercise production bridge actions with
+bounded synthetic fixtures. They are not runtime language comparisons and are
+deliberately excluded from `bench.sh all`.
+
+### Typecheck Type-Shape Scanning
+
+`compiler_typecheck_memory` generates nested record types and probe functions
+with explicitly typed local bindings. It sends them through the production
+`typecheck_graph` action and validates every streamed typed artifact:
+
+```bash
+benchmarks/compiler_typecheck_memory
+benchmarks/compiler_typecheck_memory --type-depth 96 --probes-per-module 192
+benchmarks/compiler_typecheck_memory --type-depth 384 --probes-per-module 192
+benchmarks/compiler_typecheck_memory --modules 4 --type-depth 48 --probes-per-module 48
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --primitive-probes-per-module 512
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --primitive-storage-probes-per-module 512
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --resource-scan-depth 64 --resource-scan-probes-per-module 128
+```
+
+Aggregate probes sample record types evenly across the full declared chain,
+including its deepest type. Keep `--probes-per-module` fixed when comparing
+depth commands so the same number of bindings covers each requested chain.
+Deeper fixtures necessarily declare more record types, so this comparison also
+includes their parse, environment, and artifact costs; use matching one-probe
+runs as setup controls when attributing the incremental cost. Keep depth and
+probe count fixed when varying `--modules` to measure graph width. The default
+`192/192` fixture is intended for a roughly one-second local feedback loop on a
+development machine.
+
+Primitive probes use distinct scalar range types. Keep `--type-depth` and
+`--probes-per-module` at 1 when comparing the final command so the retained
+shape-memo cost of leaf bindings is isolated from nested aggregate scanning.
+Primitive storage probes place distinct scalar range types in tuple literals.
+Keep the other fixture dimensions at 1 or 0 when using the storage command so
+the retained shape-memo cost of leaf-element storage checks remains visible.
+
+Resource scan probes place a deeply nested tuple type in function signatures.
+Keep the other fixture dimensions at 1 or 0 when using the final command so
+recursive declaration resource-shape scanning is isolated.
+
+The runner uses `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` when it names a prepared
+helper. `--bridge PATH` overrides it. Otherwise, the runner prepares a cached
+helper through `./blorp __compiler-bridge-prepare` before starting measurement.
+Bridge preparation is excluded from the reported time. Results include SHA-256
+digests of the bridge and request so saved before/after measurements remain
+auditable.
+
+### Captured Typecheck Replay
+
+`compiler_typecheck_replay` runs one exact production `typecheck_graph` request
+against an isolated helper. Capture mode writes the request immediately before
+the OCaml host would start that helper, then deliberately stops:
+
+```bash
+cd compiler && dune build bin/blorp_ocaml_host.exe
+cd ..
+
+capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.json")
+output=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.c")
+BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$capture" \
+  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  __compiler-host-compile-wrapper \
+  -o "$output" \
+  compiler/blorp/src/stage_06_typecheck/compiler_infer.brp
+```
+
+The capture command is expected to exit nonzero, and it must not create the
+requested output. Keep captures local: they contain source text and local
+paths. First typecheck only the target while retaining its full prepared graph
+context, then typecheck the complete selected module graph:
+
+```bash
+benchmarks/compiler_typecheck_replay "$capture" \
+  --target-only --timeout 60 --memory-limit 4G --json
+benchmarks/compiler_typecheck_replay "$capture" \
+  --timeout 60 --memory-limit 4G --json
+```
+
+`--module PATH` selects one original module target plus the request target and
+can be repeated to form a narrow module set. `--first N` selects a prefix.
+The `--retention-slice` preset specifically requires a `compiler_cli_main`
+capture:
+
+```bash
+cli_capture=$(mktemp "${TMPDIR:-/tmp}/blorp-cli-typecheck.XXXXXX.json")
+BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$cli_capture" \
+  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  __compiler-host-compile-wrapper \
+  -o "$output" \
+  compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
+
+benchmarks/compiler_typecheck_replay "$cli_capture" \
+  --retention-slice --timeout 60 --memory-limit 4G
+```
+
+As with the generic capture, the host command is expected to stop nonzero
+before creating `"$output"`. The preset selects the known CTFE trigger plus its
+six retained dependencies.
+
+This is the fast feedback loop for graph-retention work. With a prepared helper
+it completes in roughly 20 seconds on the development machine, instead of
+running the unsafe 145-artifact graph. The runner enables a low-overhead
+structural inventory by default. It reports parsed graph size, retained CTFE
+program declarations and typed-expression nodes, artifact nodes, and modules
+that exist simultaneously as retained CTFE and emitted typed programs. These
+are logical structure counts, not allocator-byte estimates.
+Artifact inventory distinguishes a second typed representation
+(`duplicates_retained_ctfe=1`) from direct reuse of the retained CTFE program
+(`reuses_retained_ctfe=1`). Reuse is permitted only when the dependency
+typechecks in the artifact import environment and the graph target is not
+reachable through its explicit import closure.
+Use `--no-inventory` for an otherwise identical RSS/timing control run.
+
+The result also records request, replay, and helper hashes; artifact order and
+count; response size and hash; elapsed time; peak RSS; and sampled peak RSS by
+phase and module. Phases shorter than the sampling interval can be absent
+rather than receiving an inferred value. Helper preparation is excluded from
+the measurement, while stdout and stderr remain file-backed.
+
+The memory limit uses an address-space limit on Linux and a sampled RSS
+watchdog on macOS. Linux allocation-limit failures are not distinguishable from
+unrelated helper failures by exit status alone, so a nonzero exit under that
+limit is reported as indeterminate and should be rerun without the limit.
+`--memstats` adds runtime allocation counters to phase markers, but it
+substantially increases time and memory use. Use it only for diagnosis, never
+for headline before/after RSS or timing comparisons.
+
+On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
+helper leader process. This is appropriate for the current single-process
+typecheck helper, but it perturbs elapsed time and would omit any future child
+processes. Use the global peak as the memory comparison and treat per-phase
+samples and macOS elapsed time as diagnostic.
+
+### Captured Backend Replay
+
+`compiler_backend_memory` replays one production `emit_core_c` request against
+an isolated renderer helper. Capture mode writes the request and deliberately
+stops before resolving or starting the renderer:
+
+```bash
+capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
+BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
+  ./blorp test --no-cache --timeout 30 \
+  compiler/blorp/tests/test_compiler_infer.brp
+```
+
+The capture command exits nonzero after reporting the saved path. Its test
+timeout does not govern compilation; safety comes from capture mode stopping
+before renderer execution. Capture still runs the compiler frontend and middle
+once and materializes the serialized request. Keep captured requests local:
+they contain the lowered program and source paths, can be large, and should not
+be committed.
+
+Replay a bounded request with:
+
+```bash
+benchmarks/compiler_backend_memory "$capture" --timeout 60
+benchmarks/compiler_backend_memory "$capture" --timeout 60 --json
+benchmarks/compiler_backend_memory "$capture" --timeout 60 --vmmap
+```
+
+Requests larger than 16 MiB are refused by default. Use
+`--allow-large-request` only when the replay process is already inside an
+external memory limit, such as a Linux container or cgroup. The acknowledgement
+is not itself a memory limit.
+
+The result records request and helper SHA-256 digests, request/response sizes,
+elapsed time, peak RSS, process status, and generated-C size. `--vmmap` adds
+sampled macOS physical-footprint and allocator metrics. In `--vmmap` mode,
+`peak_rss_bytes` is omitted because the sampler would contaminate the child RSS
+value; use sampled `physical_footprint_bytes` instead. Full request validation
+runs in a short-lived process and releases its JSON heap before bridge
+preparation or replay. Bridge preparation is excluded from measurement, and
+responses stay file-backed until the renderer has exited.
+
+### Perceus Global Scanning
+
+`compiler_perceus_memory` generates a bounded Core program with managed globals
 that are irrelevant to moderately sized function bodies, sends it through the
 production `emit_core_c` bridge action, validates the emitted C, and reports
 request size, elapsed time, and peak memory:
@@ -100,17 +280,20 @@ commands, isolating the cost of irrelevant globals. The runner uses
 it prepares a cached helper through `./blorp __compiler-bridge-prepare` before
 starting measurement. Bridge preparation is excluded from the reported time.
 
-On macOS, `--vmmap` samples physical footprint, `MALLOC_SMALL`, and allocation
-count when `vmmap` exposes those fields:
+On macOS, all compiler memory diagnostics accept `--vmmap` to sample physical
+footprint, `MALLOC_SMALL`, and allocation count when `vmmap` exposes those
+fields:
 
 ```bash
+benchmarks/compiler_typecheck_memory --vmmap
+benchmarks/compiler_backend_memory captured-request.json --vmmap
 benchmarks/compiler_perceus_memory --vmmap
 ```
 
-Requests, responses, emitted C, and measurement files live in a temporary
-directory and are removed after each run. This diagnostic is deliberately not
-part of `bench.sh all`: it measures compilation, has a materially longer cold
-setup, and is intended for before/after compiler investigations.
+`vmmap` sampling perturbs elapsed time, so use regular runs for timing and
+sampled runs for allocator detail. Requests, responses, emitted C, and
+measurement files live in a temporary directory and are removed after each
+run.
 
 ## Timing Model
 

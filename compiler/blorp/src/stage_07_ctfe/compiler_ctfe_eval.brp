@@ -10,10 +10,7 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedUnaryOp,
-	../stage_05_types/compiler_type:
-		CompilerType,
-		compiler_array_type,
-		compiler_array_type_parts,
+	../stage_05_types/compiler_type: CompilerType, compiler_array_type, compiler_array_type_parts
 	../stage_06_typecheck/compiler_infer: CompilerTypedExpr, CompilerTypedLambdaParam
 	compiler_ctfe_context:
 		CompilerCtfeContext,
@@ -29,6 +26,8 @@ import:
 		compiler_ctfe_assign_value,
 		compiler_ctfe_bind_local_value,
 		compiler_ctfe_bind_mutable_local_value,
+		compiler_ctfe_env_concat,
+		compiler_ctfe_env_empty,
 		compiler_ctfe_env_error_message,
 		compiler_ctfe_global_bindings,
 		compiler_ctfe_lookup_value,
@@ -80,10 +79,7 @@ import:
 			CompilerCtfeListMapIndexed,
 			CompilerCtfeListSet,
 		),
-		CompilerCtfeMatrixIntrinsic(
-			CompilerCtfeMatrixColumnCount,
-			CompilerCtfeMatrixRowCount,
-		),
+		CompilerCtfeMatrixIntrinsic(CompilerCtfeMatrixColumnCount, CompilerCtfeMatrixRowCount),
 		CompilerCtfeOptionIntrinsic(
 			CompilerCtfeOptionAndThen,
 			CompilerCtfeOptionFilter,
@@ -1058,7 +1054,7 @@ private pure func compiler_ctfe_function_global_env(
 		Some(module_path):
 			compiler_ctfe_context_module_global_env(context, module_path)
 		None:
-			{bindings = compiler_ctfe_global_bindings(caller_env)}
+			compiler_ctfe_global_bindings(caller_env)
 
 
 private pure func compiler_ctfe_bind_tuple_param_values(
@@ -1121,7 +1117,7 @@ private pure func compiler_ctfe_bind_function_params(
 					.length()
 					.to_string()))
 	else:
-		var env = {bindings = []}
+		var env: CompilerCtfeEnv = compiler_ctfe_env_empty()
 		var failure: Option[CompilerCtfeEvalError] = None
 		var index: Int = 0
 
@@ -1160,7 +1156,7 @@ private pure func compiler_ctfe_bind_lambda_params(
 					.length()
 					.to_string()))
 	else:
-		var env = {bindings = []}
+		var env: CompilerCtfeEnv = compiler_ctfe_env_empty()
 		var failure: Option[CompilerCtfeEvalError] = None
 		var index: Int = 0
 
@@ -1200,7 +1196,7 @@ private pure func compiler_ctfe_eval_lambda_call(
 		)
 		compiler_ctfe_eval_ir_in_context(
 			context,
-			{bindings = param_env.bindings + closure.env.bindings},
+			compiler_ctfe_env_concat(param_env, closure.env),
 			body_ir,
 		)
 
@@ -1213,7 +1209,7 @@ private pure func compiler_ctfe_function_call_env(
 ) -> Result[CompilerCtfeEnv, CompilerCtfeEvalError]:
 	param_env ?= compiler_ctfe_bind_function_params(ctfe_function.info.decl.params, arg_values)
 	global_env = compiler_ctfe_function_global_env(context, caller_env, ctfe_function)
-	Ok({bindings = param_env.bindings + global_env.bindings})
+	Ok(compiler_ctfe_env_concat(param_env, global_env))
 
 
 private pure func compiler_ctfe_eval_ctfe_function_call(
@@ -1227,10 +1223,7 @@ private pure func compiler_ctfe_eval_ctfe_function_call(
 	else:
 		match ctfe_function.info.body:
 			Some(body):
-				function_context = {
-					context |
-					active_module_path = ctfe_function.module_path
-				}
+				function_context = { context | active_module_path = ctfe_function.module_path }
 				body_ir ?= compiler_ctfe_eval_translate_result(
 					compiler_ctfe_ir_from_typed_expr(
 						function_context,
@@ -1282,12 +1275,7 @@ private pure func compiler_ctfe_eval_imported_function_call(
 		callable_id,
 	):
 		Some(ctfe_function):
-			compiler_ctfe_eval_ctfe_function_call(
-				context,
-				caller_env,
-				ctfe_function,
-				arg_values,
-			)
+			compiler_ctfe_eval_ctfe_function_call(context, caller_env, ctfe_function, arg_values)
 		None:
 			functions = compiler_ctfe_context_imported_functions_by_source(
 				context,
@@ -2406,10 +2394,12 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 		(CompilerCtfeStringDropLeft, [receiver, count_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
+
 			start = if count < 0:
 				0
 			else:
 				count
+
 			remaining = if start >= receiver_text.length():
 				""
 			else:
@@ -2419,6 +2409,7 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 		(CompilerCtfeStringTakeLeft, [receiver, count_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			count ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(count_value))
+
 			prefix_length = if count < 0:
 				0
 			else if count > receiver_text.length():
@@ -2443,22 +2434,12 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 			)
 		(CompilerCtfeStringFromChar, [char_value]):
 			value ?= compiler_ctfe_eval_char_result(compiler_ctfe_expect_char(char_value))
-			Ok(
-				compiler_ctfe_string(
-					compiler_ctfe_ir_eval_span(expr),
-					StringOps.from_char(value),
-				),
-			)
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), StringOps.from_char(value)))
 		(CompilerCtfeStringFromChars, [chars_value]):
 			values ?= compiler_ctfe_eval_expect_list(chars_value)
 			chars ?= compiler_ctfe_eval_chars(values)
 
-			Ok(
-				compiler_ctfe_string(
-					compiler_ctfe_ir_eval_span(expr),
-					StringOps.from_chars(chars),
-				),
-			)
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), StringOps.from_chars(chars)))
 		(CompilerCtfeStringGet, [receiver, index_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			index ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(index_value))
@@ -2521,12 +2502,7 @@ private pure func compiler_ctfe_eval_imported_string_intrinsic(
 			)
 		(CompilerCtfeStringReverse, [receiver]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
-			Ok(
-				compiler_ctfe_string(
-					compiler_ctfe_ir_eval_span(expr),
-					receiver_text.reverse(),
-				),
-			)
+			Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), receiver_text.reverse()))
 		(CompilerCtfeStringSplit, [receiver, delimiter_value]):
 			receiver_text ?= compiler_ctfe_eval_string_result(compiler_ctfe_expect_string(receiver))
 			delimiter ?= compiler_ctfe_eval_string_result(
@@ -2702,9 +2678,7 @@ private pure func compiler_ctfe_eval_sized_float_conversion(
 			Err(CompilerCtfeEvalUnsupported("sized float conversion with invalid argument count"))
 
 
-private pure func compiler_ctfe_dims_after_first(
-	dims: List[CompilerType],
-) -> List[CompilerType]:
+private pure func compiler_ctfe_dims_after_first(dims: List[CompilerType]) -> List[CompilerType]:
 	var result: List[CompilerType] = []
 	var index: Int = 1
 
@@ -2736,13 +2710,17 @@ private pure func compiler_ctfe_eval_tensor_fill_at(
 	result_type: CompilerType,
 ) -> Result[CompilerCtfeValue, CompilerCtfeEvalError]:
 	if dimension_index >= dimensions.length():
-		Ok({ fill_value | typ = result_type, span = compiler_ctfe_ir_eval_span(expr) })
+		Ok({ fill_value |
+				typ = result_type,
+				span = compiler_ctfe_ir_eval_span(expr)
+			})
 	else:
 		dimension_value ?= match dimensions.get(dimension_index):
 			Some(value):
 				Ok(value)
 			None:
 				Err(CompilerCtfeEvalUnsupported("tensor constructor dimension is missing"))
+
 		size ?= compiler_ctfe_eval_int_result(compiler_ctfe_expect_int(dimension_value))
 
 		if size < 0:
@@ -2864,7 +2842,9 @@ private pure func compiler_ctfe_eval_builtin_intrinsic(
 		CompilerCtfeToStringIntrinsic:
 			match arg_values:
 				[value]:
-					text ?= compiler_ctfe_eval_string_result(compiler_ctfe_string_text_of_value(value))
+					text ?= compiler_ctfe_eval_string_result(
+						compiler_ctfe_string_text_of_value(value),
+					)
 					Ok(compiler_ctfe_string(compiler_ctfe_ir_eval_span(expr), text))
 				_:
 					Err(CompilerCtfeEvalUnsupported("to_string with invalid argument count"))
@@ -2912,12 +2892,7 @@ private pure func compiler_ctfe_eval_vector_indices(
 
 				match values.get(normalized_index):
 					Some(selected):
-						compiler_ctfe_eval_vector_indices(
-							expr,
-							selected,
-							arg_values,
-							arg_index + 1,
-						)
+						compiler_ctfe_eval_vector_indices(expr, selected, arg_values, arg_index + 1)
 					None:
 						Err(CompilerCtfeEvalInvalid("compile-time tensor index is out of bounds"))
 			_:

@@ -121,6 +121,7 @@ import:
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
+			PreClosureDetachExpr,
 			RangeExpr,
 			RecordExpr,
 			RecordConstructExpr,
@@ -215,9 +216,8 @@ import:
 			StackResultReleasePolicy,
 		),
 		CoreRetainPolicy(ArcRetainPolicy, NoRetainPolicy, StackResultRetainPolicy),
-		CoreSelect,
+		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
-		CoreSetAlloc,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreStringByteCopy,
 		CoreStringByteRead,
@@ -279,11 +279,14 @@ import:
 		),
 		CoreValueRecordDecl,
 		CoreVar,
+	../src/stage_09_core/compiler_core_pipeline: PreparedCoreProgram(PreparedCore)
 	../src/stage_10_backend/compiler_build_artifact: CArtifact
 	../src/stage_10_backend/compiler_core_emit:
-		CoreEmitOptions,
+		CoreEmitError(UnsupportedGlobalInitializer),
+		core_emit_error_message,
 		emit_core_program_c_artifact,
-		emit_core_program_c_artifact_with_options,
+		emit_core_program_c_artifact_with_profile,
+		try_emit_prepared_core_program_c_artifact_with_profile,
 	bytes: from_hex
 	test: TestSuite
 
@@ -291,6 +294,32 @@ import:
 pure func empty_program() -> CoreProgram:
 	{
 		decls = [],
+		foreign_includes = []
+	}
+
+
+pure func unsupported_global_program() -> CoreProgram:
+	{
+		decls = [
+			GlobalDecl({
+				name = {
+					name = "BROKEN_GLOBAL",
+					uniq = 0,
+					def_id = Some(990)
+				},
+				typ = VoidType,
+				init = PreClosureDetachExpr(
+					VoidExpr(VoidType, SyntheticSourceLoc),
+					VoidType,
+					SyntheticSourceLoc,
+				),
+				is_mutable = False,
+				is_const = True,
+				is_private = True,
+				def_id = 990,
+				loc = SyntheticSourceLoc,
+			}),
+		],
 		foreign_includes = []
 	}
 
@@ -380,10 +409,6 @@ pure func int32_type() -> CoreType:
 
 pure func uint8_type() -> CoreType:
 	NamedType("UInt8", [])
-
-
-pure func profile_enabled_options() -> CoreEmitOptions:
-	{profile = True}
 
 
 pure func string_type() -> CoreType:
@@ -7347,10 +7372,7 @@ pure func test_emit_profiled_main_enables_report() -> Bool:
 		decls = [FunctionDecl(main_return_zero_function())],
 		foreign_includes = []
 	}
-	artifact: CArtifact = emit_core_program_c_artifact_with_options(
-		program,
-		profile_enabled_options(),
-	)
+	artifact: CArtifact = emit_core_program_c_artifact_with_profile(program, True)
 
 	(
 		artifact.c_code.contains("blorp_profile_enable();")
@@ -7360,6 +7382,53 @@ pure func test_emit_profiled_main_enables_report() -> Bool:
 		and artifact.c_code.contains("blorp_profile_end(\"main\");")
 		and artifact.c_code.contains("return (int)__blorp_main_result;")
 	)
+
+
+pure func test_emit_profile_disabled_omits_hooks() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(main_return_zero_function())],
+		foreign_includes = []
+	}
+	explicit: CArtifact = emit_core_program_c_artifact_with_profile(program, False)
+	default: CArtifact = emit_core_program_c_artifact(program)
+
+	(
+		not explicit.c_code.contains("blorp_profile_enable")
+		and not explicit.c_code.contains("blorp_profile_start")
+		and not explicit.c_code.contains("blorp_profile_end")
+		and not default.c_code.contains("blorp_profile_enable")
+		and not default.c_code.contains("blorp_profile_start")
+		and not default.c_code.contains("blorp_profile_end")
+	)
+
+
+pure func test_emit_prepared_program_boundary() -> Bool:
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		PreparedCore(empty_program()),
+		False,
+	):
+		Ok(artifact):
+			artifact.c_code.contains("Blorp final Core C artifact")
+		Err(_):
+			False
+
+
+pure func test_emit_unsupported_global_returns_structured_error() -> Bool:
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		PreparedCore(unsupported_global_program()),
+		False,
+	):
+		Ok(_):
+			False
+		Err(error):
+			match error:
+				UnsupportedGlobalInitializer(global_name):
+					(
+						global_name == "BROKEN_GLOBAL"
+						and core_emit_error_message(
+							error,
+						) == "unsupported global initializer for `BROKEN_GLOBAL`"
+					)
 
 
 pure func test_emit_identity_function_with_int_param() -> Bool:
@@ -7381,10 +7450,7 @@ pure func test_emit_profiled_named_function() -> Bool:
 		decls = [FunctionDecl(identity_function())],
 		foreign_includes = []
 	}
-	artifact: CArtifact = emit_core_program_c_artifact_with_options(
-		program,
-		profile_enabled_options(),
-	)
+	artifact: CArtifact = emit_core_program_c_artifact_with_profile(program, True)
 
 	(
 		artifact.c_code.contains("long id(long x)")
@@ -13622,7 +13688,7 @@ pure func start_detach_function() -> CoreFunction:
 		type_params = [],
 		params = [],
 		return_type = VoidType,
-		body = Some(DetachExpr({task = detach_task_closure()}, VoidType, SyntheticSourceLoc)),
+		body = Some(DetachExpr(detach_task_closure(), VoidType, SyntheticSourceLoc)),
 		is_pure = False,
 		function_kind = UserFunction,
 		def_id = 902,
@@ -13694,27 +13760,27 @@ pure func visit_channel_strings_function() -> CoreFunction:
 pure func select_channel_timer_function() -> CoreFunction:
 	channel_param: CoreParam = channel_string_param("ch")
 	timeout_param: CoreParam = int_param("timeout")
-	select_expr: CoreSelect = {arms = [
-			{
-				kind = SelectRecvArm({
-					binder = named_var("message"),
-					elem_type = string_type(),
-					channel = param_var_expr(channel_param),
-				}),
-				body = VoidExpr(VoidType, SyntheticSourceLoc),
-				loc = SyntheticSourceLoc
-			},
-			{
-				kind = SelectSealedArm(param_var_expr(channel_param)),
-				body = VoidExpr(VoidType, SyntheticSourceLoc),
-				loc = SyntheticSourceLoc
-			},
-			{
-				kind = SelectAfterArm(param_var_expr(timeout_param)),
-				body = VoidExpr(VoidType, SyntheticSourceLoc),
-				loc = SyntheticSourceLoc
-			},
-		]}
+	select_expr: List[CoreSelectArm] = [
+		{
+			kind = SelectRecvArm({
+				binder = named_var("message"),
+				elem_type = string_type(),
+				channel = param_var_expr(channel_param),
+			}),
+			body = VoidExpr(VoidType, SyntheticSourceLoc),
+			loc = SyntheticSourceLoc
+		},
+		{
+			kind = SelectSealedArm(param_var_expr(channel_param)),
+			body = VoidExpr(VoidType, SyntheticSourceLoc),
+			loc = SyntheticSourceLoc
+		},
+		{
+			kind = SelectAfterArm(param_var_expr(timeout_param)),
+			body = VoidExpr(VoidType, SyntheticSourceLoc),
+			loc = SyntheticSourceLoc
+		},
+	]
 
 	{
 		name = "wait_for_select",
@@ -13732,17 +13798,17 @@ pure func select_channel_timer_function() -> CoreFunction:
 
 pure func select_stack_result_receive_function() -> CoreFunction:
 	channel_param: CoreParam = channel_result_string_string_param("ch")
-	select_expr: CoreSelect = {arms = [
-			{
-				kind = SelectRecvArm({
-					binder = named_var("value"),
-					elem_type = result_string_string_type(),
-					channel = param_var_expr(channel_param),
-				}),
-				body = VoidExpr(VoidType, SyntheticSourceLoc),
-				loc = SyntheticSourceLoc
-			},
-		]}
+	select_expr: List[CoreSelectArm] = [
+		{
+			kind = SelectRecvArm({
+				binder = named_var("value"),
+				elem_type = result_string_string_type(),
+				channel = param_var_expr(channel_param),
+			}),
+			body = VoidExpr(VoidType, SyntheticSourceLoc),
+			loc = SyntheticSourceLoc
+		},
+	]
 
 	{
 		name = "wait_for_result",
@@ -16146,15 +16212,19 @@ pure func dict_remove_builtin_function() -> CoreFunction:
 
 
 pure func empty_string_set_function() -> CoreFunction:
-	alloc: CoreSetAlloc = {constructor = StringHashContainerConstructor}
-
 	{
 		name = "empty_string_set",
 		source_module = None,
 		type_params = [],
 		params = [],
 		return_type = set_string_type(),
-		body = Some(SetAllocExpr(alloc, set_string_type(), SyntheticSourceLoc)),
+		body = Some(
+			SetAllocExpr(
+				StringHashContainerConstructor,
+				set_string_type(),
+				SyntheticSourceLoc,
+			),
+		),
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = 127,
@@ -20298,6 +20368,12 @@ tests: TestSuite = {
 			test_emit_main_with_source_args_uses_c_entrypoint_signature,
 		),
 		("emit profiled main enables report", test_emit_profiled_main_enables_report),
+		("emit profile disabled omits hooks", test_emit_profile_disabled_omits_hooks),
+		("emit prepared program boundary", test_emit_prepared_program_boundary),
+		(
+			"emit unsupported global returns structured error",
+			test_emit_unsupported_global_returns_structured_error,
+		),
 		("emit identity function with Int param", test_emit_identity_function_with_int_param),
 		("emit profiled named function", test_emit_profiled_named_function),
 		("emit closure param function signature", test_emit_closure_param_function_signature),

@@ -43,6 +43,9 @@ for rows marked **Not comparable** or **Blocked**.
 |-----------|--------|-------|
 | `paradigms` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; current focus is intra-Blorp paradigm comparison. |
 | `virtual_threads` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; current focus is fiber spawn, join, park, and wake scaling. |
+| `compiler_typecheck_memory` | Compiler diagnostic | Invokes the production `typecheck_graph` bridge with bounded nested record types and explicitly typed local bindings. It exposes separate controls for type depth, aggregate probes, primitive binding probes, primitive storage probes, recursive declaration resource scans, and graph width, validates all streamed typed artifacts, and is excluded from `bench.sh all`. |
+| `compiler_typecheck_replay` | Compiler diagnostic | Replays an exact captured production `typecheck_graph` request against an isolated helper. It hashes the request, replay, and helper; enforces timeout and memory bounds; supports target/module-prefix slicing; validates streamed artifact order and shape; keeps responses file-backed; and is excluded from `bench.sh all`. |
+| `compiler_backend_memory` | Compiler diagnostic | Replays an explicitly captured production `emit_core_c` request against one renderer helper. It hashes the request and helper, enforces a process timeout, refuses large requests without an explicit acknowledgement, validates emitted C, and is excluded from `bench.sh all`. |
 | `compiler_perceus_memory` | Compiler diagnostic | Invokes the production `emit_core_c` bridge with a generated, bounded Core fixture. It varies irrelevant managed globals while keeping reachable worker functions and body shape fixed, validates emitted C, and is excluded from `bench.sh all`. |
 
 ## Audit Rules
