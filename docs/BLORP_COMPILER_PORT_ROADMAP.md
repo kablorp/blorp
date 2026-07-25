@@ -2308,8 +2308,8 @@ Blorp references:
 - existing `compiler_core_traverse.brp`
 - existing `compiler_core_json.brp`
 - future `compiler_core_debug.brp`
-- existing `compiler_core_desugar.brp` for the first prepared-Core-compatible
-  desugar slice
+- existing `compiler_core_desugar.brp` for the implementation-complete
+  prepared-Core-compatible desugar pass
 - future `compiler_core_ssa.brp`
 - future `compiler_core_mono.brp`
 - future `compiler_core_synth.brp`
@@ -2333,13 +2333,18 @@ Implementation steps:
 
 - Port stages in exact `run_core_passes` order. Move the production boundary
   left by one stage or a tightly coupled pair only after parity passes.
-- `compiler_core_desugar.brp` currently ports the string binary-operator slice
+- `compiler_core_desugar.brp` implements the prepared-Core-compatible behavior
   from `compiler/lib/core_desugar.ml`: string `+`, `==`, and `!=` become
-  `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`.
-  It recursively traverses Core function/global bodies and the prepared
-  container/control-flow nodes available through Core JSON. Record-update and
-  string-interpolation desugaring remain closed until equivalent Blorp Core
-  sugar nodes or direct lowering targets exist.
+  `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`; exact
+  `target = target + suffix` assignments become `blorp_string_append`.
+  `compiler_core_traverse.brp` provides exhaustive bottom-up child traversal,
+  including raw matches, resource scopes, debug blocks, and later Core
+  containers. Record updates and string interpolation do not require sugar
+  variants in this model: `compiler_core_lower.brp` already lowers them
+  directly into ordinary Core expressions.
+- Keep OCaml desugar production-authoritative until the contiguous
+  debug/desugar/SSA boundary moves. Implementation parity alone is not a
+  production cutover.
 - Add `run_core_pipeline` support for each newly ported stage so tests can
   compare one Core JSON input against OCaml and Blorp outputs.
 - Keep public stage names stable: lower, debug, desugar, mono, synth, match,
@@ -2356,6 +2361,9 @@ Edge cases:
 - Debug blocks are retained only for debug/test paths.
 - Desugar and SSA must preserve mutable-local semantics without introducing
   shared mutable references.
+- Desugar must use the shared exhaustive traversal rather than maintaining a
+  second list of Core containers. `SeqExpr` traversal must remain iterative so
+  large generated statement blocks do not exhaust the compiler stack.
 - Monomorphization must use selected callable ids, module import tables, type
   aliases, dim constraints, and list layout facts.
 - Match compilation must preserve pattern semantics, fallbacks, and source
