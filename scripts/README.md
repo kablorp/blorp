@@ -183,9 +183,9 @@ which reads the immutable release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-`BLORP_BOOTSTRAP_LAYOUT=single` is reserved for the current legacy pin; every
-new pin must use `toolchain` so the cached public command has all private
-workers and prepared bridges beside it.
+`BLORP_BOOTSTRAP_LAYOUT=single` remains supported only for historical
+manifests; every active pin must use `toolchain` so the cached public command
+has all private workers and prepared bridges beside it.
 
 Both helper builds call the normal `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read

@@ -87,6 +87,11 @@ case "$BLORP_BOOTSTRAP_LAYOUT" in
 		;;
 esac
 
+if [ "$BLORP_BOOTSTRAP_LAYOUT" != "toolchain" ]; then
+	echo "FAIL: $bootstrap_manifest must pin the complete compiler toolchain" >&2
+	exit 1
+fi
+
 if [[ ! "$BLORP_BOOTSTRAP_TAG" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "FAIL: $bootstrap_manifest must pin an immutable dev revision" >&2
 	exit 1
