@@ -339,6 +339,7 @@ unicode: String = "Hello \u{1F600}"   -- Unicode escape (1-6 hex digits)
 ```
 
 Capacity-aware construction uses the normal `String` type. Capacity is a performance hint, not observable behavior.
+Use `+` for ordinary concatenation and `+=` when accumulating into a mutable string.
 
 ```blorp
 import:
@@ -347,7 +348,7 @@ import:
 var row: String = string(80)
 row = row.append_char('#')
 row = row.append_int(42)
-row = row.append_str(" done")
+row += " done"
 ```
 
 ### Multiline Strings

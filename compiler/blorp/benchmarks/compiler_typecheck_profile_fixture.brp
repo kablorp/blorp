@@ -1,0 +1,174 @@
+-- Bounded in-process workload for profiling the self-hosted typechecker.
+import:
+	../src/stage_05_types/compiler_context: CompilerModuleOrigin(CompilerUserModule)
+	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedGraph,
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		compiler_typecheck_graph,
+
+
+record CompilerTypecheckBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	type_depth: Int,
+	probes_per_module: Int
+}
+
+
+record CompilerTypecheckBenchmarkResult {
+	artifact_count: Int,
+	source_declaration_count: Int,
+	typed_declaration_count: Int,
+	error_count: Int,
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func benchmark_module_name(module_index: Int) -> String:
+	"bench/typecheck_profile_" + module_index.to_string()
+
+
+private pure func benchmark_type_name(module_index: Int, type_index: Int) -> String:
+	"BenchM" + module_index.to_string() + "Shape" + type_index.to_string()
+
+
+private pure func benchmark_module_source(
+	module_index: Int,
+	type_depth: Int,
+	probes_per_module: Int,
+) -> String:
+	var declarations: List[String] = []
+
+	for type_index in 0..type_depth:
+		field_type: String = if type_index == 0:
+			"Int"
+		else:
+			benchmark_type_name(module_index, type_index - 1)
+
+		declarations = declarations.append(
+			"record " + benchmark_type_name(
+				module_index,
+				type_index,
+			) + " {value: " + field_type + "}",
+		)
+
+	for probe_index in 0..probes_per_module:
+		type_index: Int = ((probe_index + 1) * type_depth - 1) / probes_per_module
+		probe_type: String = benchmark_type_name(module_index, type_index)
+		declarations = declarations.append(
+			"pure func bench_m" + module_index.to_string() + "_probe_" + probe_index.to_string() + "(value: " + probe_type + ") -> " + probe_type + ":\n" + "\tcopy: " + probe_type + " = value\n" + "\tcopy",
+		)
+
+	declarations.join("\n\n") + "\n"
+
+
+private pure func benchmark_module(
+	module_index: Int,
+	type_depth: Int,
+	probes_per_module: Int,
+) -> TypecheckImportModule:
+	module_name: String = benchmark_module_name(module_index)
+
+	{
+		path = "/bench/typecheck_profile_" + module_index.to_string() + ".brp",
+		module_name = module_name,
+		module_path = module_name,
+		text = benchmark_module_source(module_index, type_depth, probes_per_module),
+		origin = CompilerUserModule
+	}
+
+
+pure func compiler_typecheck_benchmark_request(
+	config: CompilerTypecheckBenchmarkConfig,
+) -> TypecheckGraphRequest:
+	var modules: List[TypecheckImportModule] = []
+	var module_targets: List[String] = []
+
+	for module_index in 0..config.module_count:
+		module = benchmark_module(module_index, config.type_depth, config.probes_per_module)
+		modules = modules.append(module)
+		module_targets = module_targets.append(module.module_path)
+
+	{
+		target = {
+			path = "/bench/typecheck_profile_main.brp",
+			module_name = "bench/typecheck_profile_main",
+			module_path = "bench/typecheck_profile_main",
+			text = "func main(args: List[String]) -> Int:\n\t0\n",
+			origin = CompilerUserModule
+		},
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+private pure func typechecked_graph_error_count(graph: CompilerTypecheckedGraph) -> Int:
+	var count: Int = graph.target.errors.length()
+
+	for module in graph.modules:
+		count += module.errors.length()
+
+	count
+
+
+private pure func typechecked_graph_declaration_count(graph: CompilerTypecheckedGraph) -> Int:
+	var count: Int = graph.target.typed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.typed_program.decls.length()
+
+	count
+
+
+private pure func typechecked_graph_source_declaration_count(
+	graph: CompilerTypecheckedGraph,
+) -> Int:
+	var count: Int = graph.target.parsed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.parsed_program.decls.length()
+
+	count
+
+
+pure func compiler_typecheck_benchmark(
+	config: CompilerTypecheckBenchmarkConfig,
+) -> CompilerTypecheckBenchmarkResult:
+	request: TypecheckGraphRequest = compiler_typecheck_benchmark_request(config)
+	expected_artifact_count: Int = config.module_count + 1
+	expected_declaration_count: Int = config.module_count * (config.type_depth + config.probes_per_module) + 1
+	var artifact_count: Int = 0
+	var source_declaration_count: Int = 0
+	var typed_declaration_count: Int = 0
+	var error_count: Int = 0
+	var checksum: Int = 0
+	var workload_valid: Bool = config.iterations > 0
+
+	for _ in 0..config.iterations:
+		graph: CompilerTypecheckedGraph = compiler_typecheck_graph(request)
+		artifact_count = graph.modules.length() + 1
+		source_declaration_count = typechecked_graph_source_declaration_count(graph)
+		typed_declaration_count = typechecked_graph_declaration_count(graph)
+		error_count += typechecked_graph_error_count(graph)
+		workload_valid = (
+			workload_valid
+			and artifact_count == expected_artifact_count
+			and source_declaration_count == expected_declaration_count
+			and typed_declaration_count == expected_declaration_count
+		)
+
+		checksum += artifact_count + source_declaration_count + typed_declaration_count
+
+	{
+		artifact_count = artifact_count,
+		source_declaration_count = source_declaration_count,
+		typed_declaration_count = typed_declaration_count,
+		error_count = error_count,
+		checksum = checksum,
+		workload_valid = workload_valid
+	}

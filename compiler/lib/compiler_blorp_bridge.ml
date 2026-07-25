@@ -168,6 +168,7 @@ type cli_package_options = {
 
 type cli_frontend_module_origin =
   | CliFrontendUserModule
+  | CliFrontendGeneratedModule
   | CliFrontendStdModule
   | CliFrontendSourcePackageModule of string
   | CliFrontendPkgModule of string
@@ -566,6 +567,8 @@ let parse_sources_request_json ?(phase = RawParsedProgram) items =
 
 let cli_frontend_module_origin_json = function
   | CliFrontendUserModule -> Lsp_json.Object [ ("kind", Lsp_json.String "user") ]
+  | CliFrontendGeneratedModule ->
+      Lsp_json.Object [ ("kind", Lsp_json.String "generated") ]
   | CliFrontendStdModule -> Lsp_json.Object [ ("kind", Lsp_json.String "std") ]
   | CliFrontendSourcePackageModule package ->
       Lsp_json.Object
@@ -1430,6 +1433,7 @@ let cli_frontend_module_origin_field origin =
   let* kind = string_response_field "kind" origin in
   match kind with
   | "user" -> Ok CliFrontendUserModule
+  | "generated" -> Ok CliFrontendGeneratedModule
   | "std" -> Ok CliFrontendStdModule
   | "source_package" ->
       let* package_alias = string_response_field "package" origin in

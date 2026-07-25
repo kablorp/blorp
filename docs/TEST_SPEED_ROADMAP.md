@@ -552,6 +552,19 @@ passing result without changing selection or assertions.
 **Goal:** stop the OCaml TestRunner from generating source and then re-entering
 the Blorp CLI/frontend through a second process and serialized module graph.
 
+**Incremental status (2026-07-24):** Blorp now owns tested selector and run-all
+harness constructors plus an explicit generated-module origin. The source graph
+can add one generated root to an existing parsed graph while retaining the
+already parsed test and dependency modules. A regression deletes the original
+test files before extension to prove they are not reread, then verifies exact
+module identity, bridge serialization, and typechecking from the retained
+graph. The extension rejects distinct retained files that still share one
+downstream module name; path-aware typecheck identities and the duplicate-name
+regression remain prerequisites for production routing. Production
+`Test_runner` routing therefore remains on the OCaml constructors until the
+next slice resolves that identity boundary, switches one harness path, and
+measures frontend graph counts.
+
 **Target architecture:**
 
 1. Blorp discovers or receives the selected TestSuite modules.
