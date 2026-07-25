@@ -5,6 +5,7 @@ import:
 		CoreCallKind(BuiltinCall),
 		CoreDecl(FunctionDecl, GlobalDecl),
 		CoreExpr(
+			AssignExpr,
 			BinaryExpr,
 			CallExpr,
 			LetExpr,
@@ -47,6 +48,14 @@ pure func named_var(name: String) -> CoreVar:
 	}
 
 
+pure func named_var_with_uniq(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = None
+	}
+
+
 pure func string_lit(value: String) -> CoreExpr:
 	LiteralExpr(StringLiteral(value), string_type(), SyntheticSourceLoc)
 
@@ -68,46 +77,46 @@ pure func core_programs_equal(left: CoreProgram, right: CoreProgram) -> Bool:
 
 
 pure func builtin_call(name: String, args: List[CoreExpr], typ: CoreType) -> CoreExpr:
-	CallExpr(BuiltinCall(name), VoidExpr(VoidType, SyntheticSourceLoc), args, typ, SyntheticSourceLoc)
+	CallExpr(
+		BuiltinCall(name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		args,
+		typ,
+		SyntheticSourceLoc,
+	)
 
 
 func test_desugars_string_add_to_concat_call() -> Bool:
-	expr = BinaryExpr(
-		AddOp,
-		string_lit("a"),
-		string_lit("b"),
+	expr = BinaryExpr(AddOp, string_lit("a"), string_lit("b"), string_type(), SyntheticSourceLoc)
+	expected = builtin_call(
+		"blorp_string_concat",
+		[string_lit("a"), string_lit("b")],
 		string_type(),
-		SyntheticSourceLoc,
 	)
-	expected = builtin_call("blorp_string_concat", [string_lit("a"), string_lit("b")], string_type())
 
 	core_exprs_equal(desugar_expr(expr), expected)
 
 
 func test_desugars_string_equal_to_builtin_call() -> Bool:
-	expr = BinaryExpr(
-		EqualOp,
-		string_lit("a"),
-		string_lit("b"),
+	expr = BinaryExpr(EqualOp, string_lit("a"), string_lit("b"), bool_type(), SyntheticSourceLoc)
+	expected = builtin_call(
+		"blorp_string_eq",
+		[string_lit("a"), string_lit("b")],
 		bool_type(),
-		SyntheticSourceLoc,
 	)
-	expected = builtin_call("blorp_string_eq", [string_lit("a"), string_lit("b")], bool_type())
 
 	core_exprs_equal(desugar_expr(expr), expected)
 
 
 func test_desugars_string_not_equal_to_not_builtin_call() -> Bool:
-	expr = BinaryExpr(
-		NotEqualOp,
-		string_lit("a"),
-		string_lit("b"),
-		bool_type(),
-		SyntheticSourceLoc,
-	)
+	expr = BinaryExpr(NotEqualOp, string_lit("a"), string_lit("b"), bool_type(), SyntheticSourceLoc)
 	expected = UnaryExpr(
 		NotOp,
-		builtin_call("blorp_string_eq", [string_lit("a"), string_lit("b")], bool_type()),
+		builtin_call(
+			"blorp_string_eq",
+			[string_lit("a"), string_lit("b")],
+			bool_type(),
+		),
 		bool_type(),
 		SyntheticSourceLoc,
 	)
@@ -116,13 +125,7 @@ func test_desugars_string_not_equal_to_not_builtin_call() -> Bool:
 
 
 func test_leaves_non_string_add_as_binary_expr() -> Bool:
-	expr = BinaryExpr(
-		AddOp,
-		int_var("a"),
-		int_var("b"),
-		int_type(),
-		SyntheticSourceLoc,
-	)
+	expr = BinaryExpr(AddOp, int_var("a"), int_var("b"), int_type(), SyntheticSourceLoc)
 
 	core_exprs_equal(desugar_expr(expr), expr)
 
@@ -132,21 +135,120 @@ func test_desugars_nested_string_add_inside_let() -> Bool:
 		named_var("message"),
 		False,
 		string_type(),
-		BinaryExpr(
-			AddOp,
-			string_lit("a"),
-			string_lit("b"),
-			string_type(),
-			SyntheticSourceLoc,
-		),
+		BinaryExpr(AddOp, string_lit("a"), string_lit("b"), string_type(), SyntheticSourceLoc),
 		string_var("message"),
 	)
 	expected = LetExpr(
 		named_var("message"),
 		False,
 		string_type(),
-		builtin_call("blorp_string_concat", [string_lit("a"), string_lit("b")], string_type()),
+		builtin_call(
+			"blorp_string_concat",
+			[string_lit("a"), string_lit("b")],
+			string_type(),
+		),
 		string_var("message"),
+	)
+
+	core_exprs_equal(desugar_expr(expr), expected)
+
+
+func test_desugars_string_accumulator_assignment_to_append() -> Bool:
+	expr = AssignExpr(
+		named_var("out"),
+		BinaryExpr(
+			AddOp,
+			string_var("out"),
+			string_var("suffix"),
+			string_type(),
+			SyntheticSourceLoc,
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected = AssignExpr(
+		named_var("out"),
+		builtin_call(
+			"blorp_string_append",
+			[string_var("out"), string_var("suffix")],
+			string_type(),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(desugar_expr(expr), expected)
+
+
+func test_keeps_non_accumulator_string_assignment_as_concat() -> Bool:
+	expr = AssignExpr(
+		named_var("out"),
+		BinaryExpr(
+			AddOp,
+			string_var("prefix"),
+			string_var("suffix"),
+			string_type(),
+			SyntheticSourceLoc,
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected = AssignExpr(
+		named_var("out"),
+		builtin_call(
+			"blorp_string_concat",
+			[string_var("prefix"), string_var("suffix")],
+			string_type(),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(desugar_expr(expr), expected)
+
+
+func test_keeps_distinct_string_variable_assignment_as_concat() -> Bool:
+	source = VarExpr(
+		named_var_with_uniq("out", 1),
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	expr = AssignExpr(
+		named_var("out"),
+		BinaryExpr(AddOp, source, string_var("suffix"), string_type(), SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected = AssignExpr(
+		named_var("out"),
+		builtin_call(
+			"blorp_string_concat",
+			[source, string_var("suffix")],
+			string_type(),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(desugar_expr(expr), expected)
+
+
+func test_keeps_malformed_string_accumulator_assignment_as_concat() -> Bool:
+	expr = AssignExpr(
+		named_var("out"),
+		BinaryExpr(AddOp, string_var("out"), string_var("suffix"), int_type(), SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected = AssignExpr(
+		named_var("out"),
+		builtin_call(
+			"blorp_string_concat",
+			[string_var("out"), string_var("suffix")],
+			int_type(),
+		),
+		VoidType,
+		SyntheticSourceLoc,
 	)
 
 	core_exprs_equal(desugar_expr(expr), expected)
@@ -222,6 +324,22 @@ tests: TestSuite = {
 		),
 		("leaves non string add as binary expr", test_leaves_non_string_add_as_binary_expr),
 		("desugars nested string add inside let", test_desugars_nested_string_add_inside_let),
+		(
+			"desugars string accumulator assignment to append",
+			test_desugars_string_accumulator_assignment_to_append,
+		),
+		(
+			"keeps non accumulator string assignment as concat",
+			test_keeps_non_accumulator_string_assignment_as_concat,
+		),
+		(
+			"keeps distinct string variable assignment as concat",
+			test_keeps_distinct_string_variable_assignment_as_concat,
+		),
+		(
+			"keeps malformed string accumulator assignment as concat",
+			test_keeps_malformed_string_accumulator_assignment_as_concat,
+		),
 		(
 			"desugars program function and global bodies",
 			test_desugars_program_function_and_global_bodies,

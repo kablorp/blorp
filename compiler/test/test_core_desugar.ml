@@ -246,6 +246,139 @@ let test_desugar_counter_resets () =
 let str_flags = { sf_multiline = false; sf_raw = false }
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string
 
+(** [out = out + suffix] reuses the overwritten string through the
+    COW-consuming append builtin. *)
+let test_desugar_string_accumulator_assignment () =
+  let target = Var.named "out" in
+  let assignment =
+    mk
+      (CAssign
+         ( target,
+           mk
+             (CBin
+                ( Add,
+                  cvar "out" ty_string,
+                  cvar "suffix" ty_string ))
+             ty_string ))
+      (TyNamed ("Void", []))
+  in
+  let body =
+    [ wrap_in_func assignment ]
+    |> Blorp.Core_desugar.desugar_program |> get_body
+  in
+  match body.desc with
+  | CAssign
+      ( assigned,
+        {
+          desc =
+            CCall
+              ( CKBuiltin "blorp_string_append",
+                _,
+                [ { desc = CVar source; _ }; { desc = CVar suffix; _ } ] );
+          _;
+        } ) ->
+      Alcotest.(check bool) "assignment target" true (Var.equal target assigned);
+      Alcotest.(check bool) "append source" true (Var.equal target source);
+      Alcotest.(check string) "suffix" "suffix" suffix.vname
+  | _ -> Alcotest.fail "string accumulator assignment should use append"
+
+(** [out = prefix + suffix] must remain ordinary concatenation because
+    overwriting [out] does not consume [prefix]. *)
+let test_desugar_non_accumulator_string_assignment () =
+  let assignment =
+    mk
+      (CAssign
+         ( Var.named "out",
+           mk
+             (CBin
+                ( Add,
+                  cvar "prefix" ty_string,
+                  cvar "suffix" ty_string ))
+             ty_string ))
+      (TyNamed ("Void", []))
+  in
+  let body =
+    [ wrap_in_func assignment ]
+    |> Blorp.Core_desugar.desugar_program |> get_body
+  in
+  match body.desc with
+  | CAssign
+      ( _,
+        {
+          desc =
+            CCall
+              ( CKBuiltin "blorp_string_concat",
+                _,
+                [ { desc = CVar prefix; _ }; _ ] );
+          _;
+        } ) ->
+      Alcotest.(check string) "concat source" "prefix" prefix.vname
+  | _ -> Alcotest.fail "non-accumulator assignment should remain concat"
+
+(** Equal source names are insufficient: hygienically distinct variables must
+    not be treated as the overwritten accumulator. *)
+let test_desugar_distinct_string_variable_assignment () =
+  let target = Var.named "out" in
+  let source = { target with vuniq = 1 } in
+  let assignment =
+    mk
+      (CAssign
+         ( target,
+           mk
+             (CBin (Add, mk (CVar source) ty_string, cvar "suffix" ty_string))
+             ty_string ))
+      (TyNamed ("Void", []))
+  in
+  let body =
+    [ wrap_in_func assignment ]
+    |> Blorp.Core_desugar.desugar_program |> get_body
+  in
+  match body.desc with
+  | CAssign
+      ( _,
+        {
+          desc =
+            CCall
+              ( CKBuiltin "blorp_string_concat",
+                _,
+                [ { desc = CVar actual_source; _ }; _ ] );
+          _;
+        } ) ->
+      Alcotest.(check int) "source uniqueness" 1 actual_source.vuniq
+  | _ -> Alcotest.fail "distinct source variable should remain concat"
+
+(** Malformed hand-built Core must not acquire a consuming ownership contract.
+    The normal typed pipeline never produces a non-String result here. *)
+let test_desugar_malformed_string_accumulator_assignment () =
+  let target = Var.named "out" in
+  let assignment =
+    mk
+      (CAssign
+         ( target,
+           mk
+             (CBin
+                ( Add,
+                  cvar "out" ty_string,
+                  cvar "suffix" ty_string ))
+             ty_int ))
+      (TyNamed ("Void", []))
+  in
+  let body =
+    [ wrap_in_func assignment ]
+    |> Blorp.Core_desugar.desugar_program |> get_body
+  in
+  match body.desc with
+  | CAssign
+      ( _,
+        {
+          desc = CCall (CKBuiltin "blorp_string_concat", _, _);
+          ty;
+          _;
+        } ) ->
+      Alcotest.(check bool) "preserves malformed result type" true
+        (Blorp.Types.types_equal ty ty_int)
+  | _ -> Alcotest.fail "malformed accumulator assignment should remain concat"
+
 (** "hello" → just a string literal *)
 let test_desugar_interp_single_lit () =
   let e = mk (CStringInterp ([ IPLit "hello" ], false)) ty_string in
@@ -544,6 +677,14 @@ let suite =
       ] );
     ( "string_interp",
       [
+        Alcotest.test_case "accumulator_assignment" `Quick
+          test_desugar_string_accumulator_assignment;
+        Alcotest.test_case "non_accumulator_assignment" `Quick
+          test_desugar_non_accumulator_string_assignment;
+        Alcotest.test_case "distinct_variable_assignment" `Quick
+          test_desugar_distinct_string_variable_assignment;
+        Alcotest.test_case "malformed_accumulator_assignment" `Quick
+          test_desugar_malformed_string_accumulator_assignment;
         Alcotest.test_case "single_lit" `Quick test_desugar_interp_single_lit;
         Alcotest.test_case "single_string" `Quick
           test_desugar_interp_single_string_expr;
