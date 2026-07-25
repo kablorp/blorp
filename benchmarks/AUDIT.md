@@ -35,7 +35,7 @@ for rows marked **Not comparable** or **Blocked**.
 | `reverse_complement` | blorp, Go, OCaml, Python | Comparable | Same fixed three-sequence FASTA input, repeat factor, complement table, line width, headers, total-nucleotide checksum, and output. No C variant. |
 | `compiler_ast` | blorp, Go, OCaml | Provisional | Same source-level recursive AST shape, rewrite pass count, and checksum. Provisional because representation choices differ by host language and this row is intended to model self-hosting pressure rather than a canonical external benchmark. |
 | `compiler_symbols` | blorp, Go, OCaml | Provisional | Same nested scope shape, symbol naming, lookup rounds, and checksum. Provisional because map implementations differ: Blorp uses `Dict`, Go uses `map`, and OCaml uses a persistent `Map`. |
-| `compiler_emit` | blorp, Go, OCaml | Provisional | Same generated-program shape and checksum. Provisional because Go and OCaml use builder/buffer APIs while Blorp currently uses repeated string construction, intentionally exposing a self-hosting risk. |
+| `compiler_emit` | blorp, Go, OCaml | Provisional | Same generated-program shape and checksum. Blorp uses capacity-aware `+=` accumulation; Go and OCaml use their native builder/buffer APIs. The benchmark remains provisional because it models self-hosting pressure rather than a canonical external workload. |
 
 ## Auxiliary Benchmarks
 

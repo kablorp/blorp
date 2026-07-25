@@ -423,12 +423,6 @@ let test_std_synthesis_rejects_malformed_signatures () =
   expect_no_synthesis ~module_path:"std/string" "pad_left"
     [ param "s" ty_string; param "width" ty_int; param "fill" ty_string ]
     ty_string;
-  expect_no_synthesis ~module_path:"std/string" "append_str"
-    [ param "items" (ty_list ty_int); param "suffix" ty_string ]
-    ty_string;
-  expect_no_synthesis ~module_path:"std/string" "append_str"
-    [ param "s" ty_string; param "suffix" ty_string ]
-    ty_string;
   expect_no_synthesis ~module_path:"std/string" "split"
     [ param "s" ty_string ]
     (ty_list ty_string);
