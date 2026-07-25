@@ -45,7 +45,7 @@ import:
 
 union CliCompileExecution:
 	CliCompileFrontendFailed(List[String])
-	CliCompileArtifact(SemanticMiddleRequest, BuildArtifact, List[CliCoreObservation])
+	CliCompileArtifact(SemanticMiddleRequest, BuildArtifact, List[CliCoreObservation], String)
 	CliCompileStopped(SemanticMiddleRequest, String, String, List[CliCoreObservation])
 	CliCompileSemanticFailed(SemanticMiddleRequest, List[SemanticMiddleDiagnostic])
 	CliCompileProtocolFailed(SemanticMiddleRequest, String)
@@ -57,7 +57,8 @@ union CliCompileExecution:
 record CliPreparedCompileExecution {
 	request: SemanticMiddleRequest,
 	configuration: BuildArtifactConfiguration,
-	late_stages: List[CliLateCoreStageRequest]
+	late_stages: List[CliLateCoreStageRequest],
+	typed_program_json: String
 }
 
 
@@ -153,8 +154,8 @@ private pure func artifact_configuration(
 		runtime_requirement = runtime_requirement,
 		native_features = graph_native_features(graph),
 		source = {
-			path = request.target.path,
-			module_name = request.target.module_name
+			path = request.target_path,
+			module_name = request.target_module_name
 		},
 		compatibility = compatibility
 	}
@@ -180,6 +181,7 @@ private pure func emit_compile_artifact(
 	prepared_core: PreparedCoreProgram,
 	observations: List[CliCoreObservation],
 	configuration: BuildArtifactConfiguration,
+	typed_program_json: String,
 ) -> CliCompileExecution:
 	match prepared_core:
 		PreparedCore(program):
@@ -190,7 +192,12 @@ private pure func emit_compile_artifact(
 				Ok(emission):
 					match build_artifact(program, emission, configuration):
 						Ok(artifact):
-							CliCompileArtifact(request, artifact, observations)
+							CliCompileArtifact(
+								request,
+								artifact,
+								observations,
+								typed_program_json,
+							)
 						Err(error):
 							CliCompileBuildArtifactFailed(
 								request,
@@ -205,6 +212,7 @@ private pure func finish_decoded_compile_execution(
 	response: SemanticMiddleResponse,
 	configuration: BuildArtifactConfiguration,
 	late_stages: List[CliLateCoreStageRequest],
+	typed_program_json: String,
 ) -> CliCompileExecution:
 	match response:
 		SemanticMiddleCompiled(core, observations):
@@ -219,6 +227,7 @@ private pure func finish_decoded_compile_execution(
 						completed_core,
 						completed_observations,
 						configuration,
+						typed_program_json,
 					)
 				CliLateCoreStopped(stage_name, rendered, stopped_observations):
 					CliCompileStopped(request, stage_name, rendered, stopped_observations)
@@ -238,10 +247,17 @@ private pure func finish_compile_execution(
 	response_value: JsonValue,
 	configuration: BuildArtifactConfiguration,
 	late_stages: List[CliLateCoreStageRequest],
+	typed_program_json: String,
 ) -> CliCompileExecution:
 	match decode_semantic_middle_response_value(response_value):
 		Ok(response):
-			finish_decoded_compile_execution(request, response, configuration, late_stages)
+			finish_decoded_compile_execution(
+				request,
+				response,
+				configuration,
+				late_stages,
+				typed_program_json,
+			)
 		Err(error):
 			CliCompileProtocolFailed(request, semantic_middle_protocol_error_message(error))
 
@@ -255,6 +271,7 @@ pure func finish_prepared_compile_execution(
 		response,
 		prepared.configuration,
 		prepared.late_stages,
+		prepared.typed_program_json,
 	)
 
 
@@ -265,7 +282,7 @@ pure func prepare_compile_plan(
 		plan.options.dump_core_after,
 		plan.options.stop_after,
 	)
-	request ?= compile_frontend_graph(
+	frontend ?= compile_frontend_graph(
 		plan.graph,
 		plan.options.debug,
 		True,
@@ -273,6 +290,7 @@ pure func prepare_compile_plan(
 		stage_requests.semantic_observations,
 		stage_requests.semantic_stop,
 	)
+	request = frontend.request
 
 	Ok({
 		request = request,
@@ -283,13 +301,15 @@ pure func prepare_compile_plan(
 			compile_compatibility(plan.options),
 		),
 		late_stages = stage_requests.late_stages,
+		typed_program_json = frontend.typed_program_json
 	})
 
 
 pure func prepare_run_plan(
 	plan: CliRunSourcePlan,
 ) -> Result[CliPreparedCompileExecution, List[String]]:
-	request ?= compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None)
+	frontend ?= compile_frontend_graph(plan.graph, plan.options.debug, True, False, [], None)
+	request = frontend.request
 
 	Ok({
 		request = request,
@@ -300,6 +320,7 @@ pure func prepare_run_plan(
 			run_compatibility(plan.options),
 		),
 		late_stages = [],
+		typed_program_json = frontend.typed_program_json
 	})
 
 
@@ -314,6 +335,7 @@ pure func execute_compile_plan(
 				response_value,
 				prepared.configuration,
 				prepared.late_stages,
+				prepared.typed_program_json,
 			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)
@@ -330,6 +352,7 @@ pure func execute_run_plan(
 				response_value,
 				prepared.configuration,
 				prepared.late_stages,
+				prepared.typed_program_json,
 			)
 		Err(errors):
 			CliCompileFrontendFailed(errors)

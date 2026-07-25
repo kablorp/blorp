@@ -124,7 +124,6 @@ let test_subst_tyvar_always_binds () =
 (* ============================================================================
    End-to-end infer_expr via [Typecheck.typecheck] on tiny source programs.
 
-   Pattern cribbed from test_core_lower.ml:test_lower_real_source.
    Each test parses a short source string, runs the full type-checker, and
    asserts properties of the typed AST. These tests pin down the observable
    outcome of [Infer.build_subst] at actual call sites.

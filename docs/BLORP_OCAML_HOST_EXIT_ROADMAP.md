@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-21.
+Status checked against code on 2026-07-24.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -9,13 +9,15 @@ OCaml compiler host:
 2. writing generated artifacts, invoking the host C compiler, and running the
    resulting binary.
 
-The semantic middle is a separate migration concern. Until Core lowering and
-the early/middle Core passes are ported, one narrow OCaml worker may remain:
+The semantic middle is a separate migration concern. Core lowering is now
+Blorp-owned; until the early/middle Core passes are ported, one narrow OCaml
+worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
-  -> one versioned typed-program request
-  -> OCaml Core-lowering/early-middle worker
+  -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
+  -> one versioned prepared-Core request
+  -> OCaml early/middle Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -153,8 +155,9 @@ Exit condition:
 
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
-Status: implemented on this branch. The private worker is built but is not yet
-called by the production Blorp CLI; that cutover remains in later checkpoints.
+Status: implemented and authoritative for normal `compile` and `run`. The
+private worker receives strict prepared Core schema 2; no source or typed AST
+crosses this boundary.
 
 New Blorp file:
 
@@ -172,7 +175,9 @@ The request should be a typed record equivalent to:
 SemanticMiddleRequest
   schema_version and required capabilities
   target_module
-  typed_modules
+  prepared_core
+  next_definition_id
+  main_and_module_import_bindings
   debug_mode
   require_main
   invariant_checks
@@ -196,20 +201,18 @@ Core JSON.
 
 Implementation:
 
-1. Reuse the typed-program JSON vocabulary in
-   `compiler_typed_ast_json.brp`; do not nest the current CLI artifact.
-2. Include every typed dependency needed by OCaml Core lowering. The worker
-   must not receive import paths and call `Modules.load_module`.
+1. Use the phase-specific Core vocabulary in `compiler_core_json.brp`; do not
+   nest the current CLI artifact or typed-program JSON.
+2. Assemble every dependency into one prepared Core graph in Blorp. The worker
+   must not receive source paths and call `Modules.load_module`.
 3. Preserve stable callable ids, module-qualified type identities, selected
-   call metadata, CTFE status, source locations, import bindings, and layout
-   facts. Validate those invariants before spawning the worker.
+   call metadata, source locations, import bindings, FFI policy, and initial
+   layout facts. Validate those invariants before spawning the worker.
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Move the remaining relevant body of
-   `Pipeline.compile_preloaded_graph_with_blorp_bridge` into a worker entry
-   function that performs only typed-AST decode, OCaml Core lowering, and the
-   still-OCaml early/middle passes.
+5. Keep the worker entry function limited to strict prepared-Core decode and
+   the still-OCaml early/middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
    stderr. It accepts no public CLI flags. The Blorp process client is added in
@@ -806,8 +809,9 @@ Deferred solely for the pinned bootstrap wrapper:
 
 Do not delete yet:
 
-- OCaml Core lowering and early/middle passes used by
-  `blorp-ocaml-middle`;
+- OCaml early/middle passes used by `blorp-ocaml-middle`;
+- OCaml Core lowering retained solely by the pinned-bootstrap wrapper and
+  direct in-memory compatibility tests;
 - their behavior-focused tests until the corresponding semantic stage ports;
 - bridge decoders required solely by the pinned bootstrap, unless the
   bootstrap ratchet has removed that requirement; or

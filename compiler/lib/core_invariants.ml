@@ -259,7 +259,7 @@ let check_call_ownership_contracts_at (stage : Core_stage.t)
 
 let registry_for_program (prog : Core.core_program) : Codegen_types.registry =
   let reg = Codegen_types.create_registry () in
-  Core_flatten.register_types reg prog;
+  Core_registry.register_types reg prog;
   reg
 
 (** Resource-safety invariants only need alias expansion. Avoid the full codegen
@@ -1356,12 +1356,23 @@ type raw_tensor_storage_guard = {
   rtsg_kind : Core.tensor_unboxed_scalar;
 }
 
+let raw_tensor_kind_of_storage_pred = function
+  | "tensor_is_f64_storage" -> Some Core.TensorFloat64Elements
+  | "tensor_is_f32_storage" -> Some Core.TensorFloat32Elements
+  | "tensor_is_i64_storage" -> Some Core.TensorInt64Elements
+  | _ -> None
+
+let raw_tensor_kind_of_raw_get = function
+  | "tensor_get_f64_raw_unchecked" -> Some Core.TensorFloat64Elements
+  | "tensor_get_f32_raw_unchecked" -> Some Core.TensorFloat32Elements
+  | "tensor_get_i64_raw_unchecked" -> Some Core.TensorInt64Elements
+  | _ -> None
+
 let guarded_raw_tensor_storage_source cond =
   match cond.Core.desc with
   | Core.CCall (Core.CKIntrinsic pred_name, _, [ pred_source ]) -> (
       match
-        ( Core_specialize.raw_tensor_kind_of_storage_pred pred_name,
-          pred_source.desc )
+        (raw_tensor_kind_of_storage_pred pred_name, pred_source.desc)
       with
       | Some pred_kind, Core.CVar pred_var ->
           Some { rtsg_source_var = pred_var; rtsg_kind = pred_kind }
@@ -1391,7 +1402,7 @@ type raw_tensor_get_call =
 let classify_raw_tensor_get_call e =
   match e.Core.desc with
   | Core.CCall (Core.CKIntrinsic name, _, args) -> (
-      match Core_specialize.raw_tensor_kind_of_raw_get name with
+      match raw_tensor_kind_of_raw_get name with
       | None -> NotRawTensorGet
       | Some kind -> (
           match args with

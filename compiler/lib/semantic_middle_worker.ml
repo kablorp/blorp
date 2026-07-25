@@ -1,35 +1,34 @@
-(** Private typed-AST to pre-DCE Core worker.
+(** Private prepared-Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
-    and backend. The protocol is phase-specific: callers supply post-CTFE typed
-    programs, and successful requests return the Core program immediately
+    and backend. The protocol is phase-specific: callers supply lowered,
+    flattened, FFI-annotated, list-layout-annotated Core, and successful
+    requests return the Core program immediately
     before Blorp-owned DCE. This module does not read source files, interpret
     CLI arguments, emit C, write artifacts, or execute child processes. *)
 
-let schema_version = 1
+let schema_version = 2
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let typed_phase = "post_ctfe"
+let core_phase = "prepared"
 
 type stage = Core_stage.t
 
 type capability =
-  | PostCtfeTyped
+  | PreparedCore
   | PreDceCore
   | RenderedStageObservations
 
 type protocol_error = { code : string; message : string }
 
-type typed_unit = {
-  path : string;
-  module_name : string;
-  typed_program : Typed_ast.program;
-  import_bindings : Session.import_binding list;
-}
-
 type request = {
-  target : typed_unit;
-  modules : typed_unit list;
+  target_path : string;
+  target_module : string;
+  core : Core.core_program;
+  foreign_includes : string list;
+  next_def_id : int;
+  import_bindings : Session.import_binding list;
+  module_imports : (string * Session.import_binding list) list;
   debug : bool;
   require_main : bool;
   check_invariants : bool;
@@ -130,15 +129,15 @@ let semantic_middle_stage = function
 let stage_name = Core_stage.to_string
 
 let capability_name = function
-  | PostCtfeTyped -> "typed_ast_post_ctfe"
+  | PreparedCore -> "core_pre_middle"
   | PreDceCore -> "core_pre_dce"
   | RenderedStageObservations -> "rendered_stage_observations"
 
 let supported_capabilities =
-  [ PostCtfeTyped; PreDceCore; RenderedStageObservations ]
+  [ PreparedCore; PreDceCore; RenderedStageObservations ]
 
 let decode_capability = function
-  | Lsp_json.String "typed_ast_post_ctfe" -> Ok PostCtfeTyped
+  | Lsp_json.String "core_pre_middle" -> Ok PreparedCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
   | Lsp_json.String "rendered_stage_observations" ->
       Ok RenderedStageObservations
@@ -168,17 +167,11 @@ let decode_import_binding value =
   let* original_name = optional_string_field "original_name" value in
   Ok { Session.local_name; module_path; original_name }
 
-let decode_typed_unit value =
-  let* path = string_field "path" value in
+let decode_module_imports value =
   let* module_name = string_field "module" value in
-  let* typed_program_json = field "typed_program" value in
   let* import_binding_values = array_field "import_bindings" value in
   let* import_bindings = decode_list decode_import_binding import_binding_values in
-  match Typed_ast_json.decode_typed_program typed_program_json with
-  | Ok typed_program -> Ok { path; module_name; typed_program; import_bindings }
-  | Error error ->
-      protocol_error "invalid_typed_program"
-        (path ^ ": " ^ Typed_ast_json.decode_error_to_string error)
+  Ok (module_name, import_bindings)
 
 let require_equal ~code ~field_name ~expected actual =
   if String.equal actual expected then Ok ()
@@ -203,15 +196,26 @@ let decode_request value =
       require_equal ~code:"unsupported_kind" ~field_name:"kind"
         ~expected:request_kind kind
     in
-    let* phase = string_field "typed_phase" value in
+    let* phase = string_field "core_phase" value in
     let* () =
-      require_equal ~code:"unsupported_typed_phase" ~field_name:"typed_phase"
-        ~expected:typed_phase phase
+      require_equal ~code:"unsupported_core_phase" ~field_name:"core_phase"
+        ~expected:core_phase phase
     in
-    let* target_json = field "target" value in
-    let* target = decode_typed_unit target_json in
-    let* module_values = array_field "modules" value in
-    let* modules = decode_list decode_typed_unit module_values in
+    let* target_path = string_field "target_path" value in
+    let* target_module = string_field "target_module" value in
+    let* core_json = field "core" value in
+    let* decoded =
+      match Core_pre_middle_json.decode_program core_json with
+      | Ok decoded -> Ok decoded
+      | Error error ->
+          protocol_error "invalid_pre_middle_core"
+            (Core_pre_middle_json.decode_error_to_string error)
+    in
+    let* next_def_id = int_field "next_def_id" value in
+    let* import_binding_values = array_field "import_bindings" value in
+    let* import_bindings = decode_list decode_import_binding import_binding_values in
+    let* module_import_values = array_field "module_imports" value in
+    let* module_imports = decode_list decode_module_imports module_import_values in
     let* debug = bool_field "debug" value in
     let* require_main = bool_field "require_main" value in
     let* check_invariants = bool_field "check_invariants" value in
@@ -231,8 +235,13 @@ let decode_request value =
     in
     Ok
       {
-        target;
-        modules;
+        target_path;
+        target_module;
+        core = decoded.core;
+        foreign_includes = decoded.foreign_includes;
+        next_def_id;
+        import_bindings;
+        module_imports;
         debug;
         require_main;
         check_invariants;
@@ -240,12 +249,13 @@ let decode_request value =
         stop_after;
       }
 
-let program_has_top_level_main typed_program =
-  Typed_ast.program_ast typed_program
-  |> List.exists (fun decl ->
-         match decl.Ast.decl_desc with
-         | Ast.DFunc { func_name = Some "main"; _ } -> true
-         | _ -> false)
+let program_has_top_level_main program =
+  List.exists
+    (fun decl ->
+      match decl.Core.cd_desc with
+      | Core.CDFunc func -> Core.is_program_entrypoint func
+      | _ -> false)
+    program
 
 let render_core program =
   match program with [] -> "<empty Core program>" | _ -> Core.pp_program_indented program
@@ -268,22 +278,14 @@ let diagnostic_of_core_error target_path (error : Core_error.t) =
 let failure_diagnostic ?path code message =
   { code; message; path; line = 0; column = 0; help = None }
 
-let core_module_input (unit : typed_unit) : Core_pipeline.typed_module_input =
-  {
-    typed_module_name = unit.module_name;
-    typed_module_program = unit.typed_program;
-    typed_module_import_bindings = unit.import_bindings;
-  }
-
 let run_request_in_session request =
-  if request.require_main && not (program_has_top_level_main request.target.typed_program)
-  then
+  if request.require_main && not (program_has_top_level_main request.core) then
     Failed
       [
         {
           code = "missing_main";
           message = "cannot compile runnable source without a main function";
-          path = Some request.target.path;
+          path = Some request.target_path;
           line = 1;
           column = 1;
           help =
@@ -304,12 +306,11 @@ let run_request_in_session request =
         if should_stop then raise (Stopped_with_snapshot (stage, rendered)))
     in
     try
-      let modules = List.map core_module_input request.modules in
-      let prepared =
-        Core_pipeline.prepare_typed_with_module_inputs
-          ~main_import_bindings:request.target.import_bindings
-          ~main_module_name:request.target.module_name ~modules
-          request.target.typed_program
+      let reg = Codegen_types.create_registry () in
+      Core_registry.register_types reg request.core;
+      let import_aliases, module_imports =
+        Core_imports.tables_of_bindings
+          ~main_import_bindings:request.import_bindings request.module_imports
       in
       let on_stage =
         Core_pipeline.make_stage_hook ~check_invariants:request.check_invariants
@@ -317,21 +318,19 @@ let run_request_in_session request =
       in
       let backend_input =
         Core_pipeline.run_core_passes ~on_stage
-          ~reg:prepared.prepared_registry
-          ~import_aliases:prepared.prepared_import_aliases
-          ~module_imports:prepared.prepared_module_imports ~debug:request.debug
-          prepared.prepared_core
+          ~reg ~import_aliases ~module_imports ~debug:request.debug request.core
       in
       let observations = List.rev !observations_rev in
       (match
-         Core_emit_blorp_c.program_json ~reg:prepared.prepared_registry
+         Core_emit_blorp_c.program_json
+           ~foreign_includes:request.foreign_includes ~reg
            backend_input.blorp_tail_input
        with
       | Ok core -> Compiled { core; observations }
       | Error error ->
           Failed
             [
-              failure_diagnostic ~path:request.target.path "core_projection"
+              failure_diagnostic ~path:request.target_path "core_projection"
                 (Core_emit_blorp_c.unsupported_to_string error);
             ])
     with
@@ -339,11 +338,14 @@ let run_request_in_session request =
         Stopped
           { stage; rendered; observations = List.rev !observations_rev }
     | Core_error.Core_error error ->
-        Failed [ diagnostic_of_core_error request.target.path error ]
+        Failed [ diagnostic_of_core_error request.target_path error ]
 
 let run_request request =
   let session = Session.create () in
-  Session.with_current session (fun () -> run_request_in_session request)
+  Session.with_current session (fun () ->
+      Session.reset_core_counters session;
+      Session.reserve_def_id_floor session request.next_def_id;
+      run_request_in_session request)
 
 let observation_json observation =
   Lsp_json.Object

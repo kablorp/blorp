@@ -53,31 +53,6 @@ let tensor_parts ?reg ty =
 
 let is_tensor_type ?reg ty = Option.is_some (tensor_type ?reg ty)
 
-type loop_index_bound = {
-  lib_var : var;
-  lib_lower_nonnegative : bool;
-  lib_upper_exclusive : int option;
-}
-
-type specialize_env = { loop_index_bounds : loop_index_bound list }
-
-let empty_specialize_env = { loop_index_bounds = [] }
-
-type raw_tensor_view = {
-  rtv_tensor : var;
-  rtv_tensor_ty : Ast.type_expr;
-  rtv_ptr : var;
-  rtv_kind : tensor_unboxed_scalar;
-  rtv_needs_unique : bool;
-}
-
-let raw_view_counter = ref 0
-
-let fresh_raw_view_name prefix =
-  let id = !raw_view_counter in
-  incr raw_view_counter;
-  Printf.sprintf "__tensor_raw_view_%s_%d" prefix id
-
 type tensor_arithmetic_op =
   | TensorAdd
   | TensorSub
@@ -547,138 +522,42 @@ let tensor_has_elem ?reg name ty =
       | Ast.TyNamed (got, _) -> got = name
       | _ -> false)
 
-let int_literal_value e =
-  match e.desc with CLit (Ast.LitInt n) -> Some (Int64.to_int n) | _ -> None
-
-let find_loop_index_bound env v =
-  List.find_opt (fun bound -> Var.equal bound.lib_var v) env.loop_index_bounds
-
-let rec expr_is_nonnegative env e =
-  match int_literal_value e with
-  | Some n -> n >= 0
-  | None -> (
-      match e.desc with
-      | CVar v -> (
-          match find_loop_index_bound env v with
-          | Some bound -> bound.lib_lower_nonnegative
-          | None -> false)
-      | CBin (Ast.Add, l, r) ->
-          expr_is_nonnegative env l && expr_is_nonnegative env r
-      | _ -> false)
-
-let loop_index_bound_for_range env binder iter =
-  match iter.desc with
-  | CRange (start, stop) ->
-      Some
-        {
-          lib_var = binder.loop_var;
-          lib_lower_nonnegative = expr_is_nonnegative env start;
-          lib_upper_exclusive = int_literal_value stop;
-        }
-  | _ -> None
-
-let tensor_first_dim ?reg ty =
-  match tensor_parts ?reg ty with
-  | Some (_, Ast.TyConstInt n :: _) -> Some n
-  | _ -> None
-
-let loop_proves_tensor_index_in_bounds ?reg env tensor idx =
-  match idx.desc with
-  | CVar v -> (
-      match (find_loop_index_bound env v, tensor_first_dim ?reg tensor.ty) with
-      | ( Some
-            { lib_lower_nonnegative = true; lib_upper_exclusive = Some stop; _ },
-          Some dim ) ->
-          stop <= dim
-      | _ -> false)
+let blorp_owned_checked_get_name = function
+  | "blorp_checked_get" | "blorp_matrix_checked_get"
+  | "blorp_tensor3_checked_get" | "blorp_tensor4_checked_get"
+  | "blorp_tensor5_checked_get" ->
+      true
   | _ -> false
 
-let tensor_fast_read_intrinsics_of_kind = function
-  | TensorFloat64Elements ->
-      ("tensor_is_f64_storage", TensorFloat64Elements, "tensor_get_f64")
-  | TensorFloat32Elements ->
-      ("tensor_is_f32_storage", TensorFloat32Elements, "tensor_get_f32")
-  | TensorInt64Elements ->
-      ("tensor_is_i64_storage", TensorInt64Elements, "tensor_get_i64")
+let blorp_owns_numeric_checked_get ~reg name result_ty =
+  blorp_owned_checked_get_name name
+  && Option.is_some
+       (Core_layout_type.tensor_checked_get_access_of_type ~reg result_ty)
 
-let tensor_fast_read_intrinsics ?reg ty =
-  let reg = effective_reg reg in
-  match Core_layout_type.tensor_raw_scalar_kind_of_type ~reg ty with
-  | Some kind -> Some (tensor_fast_read_intrinsics_of_kind kind)
-  | None -> None
+let blorp_owns_typed_checked_set name tensor_ty =
+  (name = "blorp_checked_set" || name = "blorp_matrix_checked_set")
+  && (tensor_has_elem "Int" tensor_ty || tensor_has_elem "Float" tensor_ty
+     || tensor_has_elem "Float32" tensor_ty)
 
-let raw_tensor_kind_of_storage_pred = function
-  | "tensor_is_f64_storage" -> Some TensorFloat64Elements
-  | "tensor_is_f32_storage" -> Some TensorFloat32Elements
-  | "tensor_is_i64_storage" -> Some TensorInt64Elements
-  | _ -> None
+let blorp_owns_numeric_tensor_fill ~reg name result_ty =
+  (name = "blorp_vector_new_fill" || name = "blorp_matrix_new_fill")
+  && (tensor_has_elem ~reg "Int" result_ty
+     || tensor_has_elem ~reg "Float" result_ty
+     || tensor_has_elem ~reg "Float32" result_ty)
 
-let raw_tensor_kind_of_raw_get = function
-  | "tensor_get_f64_raw_unchecked" -> Some TensorFloat64Elements
-  | "tensor_get_f32_raw_unchecked" -> Some TensorFloat32Elements
-  | "tensor_get_i64_raw_unchecked" -> Some TensorInt64Elements
-  | _ -> None
+let blorp_owns_unary_tensor_math ~reg name receiver_ty =
+  (name = "blorp_vector_norm" || name = "blorp_vector_sqrt"
+  || name = "blorp_vector_exp" || name = "blorp_vector_log")
+  && (tensor_has_elem ~reg "Float" receiver_ty
+     || tensor_has_elem ~reg "Float32" receiver_ty
+     || tensor_has_elem ~reg "Float16" receiver_ty)
 
-let raw_tensor_kind_of_vector_set_builtin = function
-  | "blorp_vector_set_inplace_f64" -> Some TensorFloat64Elements
-  | "blorp_vector_set_inplace_f32" -> Some TensorFloat32Elements
-  | "blorp_vector_set_inplace_i64" -> Some TensorInt64Elements
-  | _ -> None
-
-let raw_tensor_storage_pred_intrinsic kind =
-  let pred, _, _ = tensor_fast_read_intrinsics_of_kind kind in
-  pred
-
-let tensor_raw_view_source_name tensor =
-  match tensor.desc with CVar var -> Some (Var.to_c_name var) | _ -> None
-
-let bounds_proven_tensor_read ?reg env e tensor idx =
-  match tensor_raw_view_source_name tensor with
-  | None -> None
-  | Some _ when not (loop_proves_tensor_index_in_bounds ?reg env tensor idx) ->
-      None
-  | Some source_name -> (
-      match tensor_fast_read_intrinsics ?reg e.ty with
-    | None -> None
-    | Some (storage_pred_intr, raw_kind, safe_get_intr) ->
-        let void_ty = Ast.TyNamed ("Void", []) in
-        let dummy = { e with desc = CVoid; ty = void_ty } in
-        let storage_ok =
-          {
-            e with
-            desc = CCall (CKIntrinsic storage_pred_intr, dummy, [ tensor ]);
-            ty = Ast.TyNamed ("Bool", []);
-          }
-        in
-        let raw_view = Var.named (fresh_raw_view_name source_name) in
-        let raw_read =
-          {
-            e with
-            desc =
-              CTensorRawRead
-                { trr_view = raw_view; trr_kind = raw_kind; trr_index = idx };
-          }
-        in
-        let fast_read =
-          {
-            e with
-            desc =
-              CTensorRawViewLet
-                ( {
-                    trv_var = raw_view;
-                    trv_kind = raw_kind;
-                    trv_source = tensor;
-                  },
-                  raw_read );
-          }
-        in
-        let safe_read =
-          {
-            e with
-            desc = CCall (CKIntrinsic safe_get_intr, dummy, [ tensor; idx ]);
-          }
-        in
-        Some { e with desc = CIf (storage_ok, fast_read, safe_read) })
+let blorp_owns_tensor_reduction ~reg name receiver_ty =
+  (name = "blorp_max" || name = "blorp_min")
+  && (tensor_has_elem ~reg "Int" receiver_ty
+     || tensor_has_elem ~reg "Float" receiver_ty
+     || tensor_has_elem ~reg "Float32" receiver_ty
+     || tensor_has_elem ~reg "Float16" receiver_ty)
 
 let ty_bool = Ast.TyNamed ("Bool", [])
 let ty_void = Ast.TyNamed ("Void", [])
@@ -780,311 +659,6 @@ let rewrite_tensor_get_or_match ~reg e scrut tree =
           Some { e with desc = CIf (in_bounds, read, default) }
       | _ -> None)
   | _ -> None
-
-let is_raw_view_ok_var v =
-  String.length v.vname >= String.length "__tensor_raw_view_ok_"
-  && String.sub v.vname 0 (String.length "__tensor_raw_view_ok_")
-     = "__tensor_raw_view_ok_"
-
-let var_is_blocked blocked v = List.exists (fun b -> Var.equal b v) blocked
-
-let raw_tensor_kind_of_guarded_read e =
-  let guarded_source = function
-    | {
-        desc =
-          CCall
-            (CKIntrinsic storage_pred, _, [ ({ desc = CVar pred_v; _ } as t) ]);
-        _;
-      } -> (
-        match raw_tensor_kind_of_storage_pred storage_pred with
-        | Some pred_kind -> Some (t, pred_v, pred_kind)
-        | None -> None)
-    | _ -> None
-  in
-  match e.desc with
-  | CIf (cond, fast_read, _safe) -> (
-      match guarded_source cond with
-      | None -> None
-      | Some (t, pred_v, pred_kind) -> (
-          match fast_read.desc with
-          | CCall (CKIntrinsic raw_get, _, [ { desc = CVar raw_v; _ }; idx ])
-            -> (
-              match raw_tensor_kind_of_raw_get raw_get with
-              | Some raw_kind
-                when Var.equal pred_v raw_v && pred_kind = raw_kind ->
-                  Some (t, idx, raw_kind)
-              | _ -> None)
-          | CTensorRawViewLet
-              ( { trv_var; trv_kind; trv_source = { desc = CVar source_v; _ } },
-                {
-                  desc =
-                    CTensorRawRead { trr_view; trr_kind; trr_index = idx; _ };
-                  _;
-                } )
-            when Var.equal pred_v source_v && Var.equal trv_var trr_view
-                 && pred_kind = trv_kind && trv_kind = trr_kind ->
-              Some (t, idx, trr_kind)
-          | _ -> None))
-  | _ -> None
-
-let add_raw_tensor_view blocked views tensor kind needs_unique =
-  match tensor.desc with
-  | CVar v when not (var_is_blocked blocked v) ->
-      let rec add acc = function
-        | [] ->
-            Some
-              (List.rev
-                 ({
-                    rtv_tensor = v;
-                    rtv_tensor_ty = tensor.ty;
-                    rtv_ptr = Var.named (fresh_raw_view_name (Var.to_c_name v));
-                    rtv_kind = kind;
-                    rtv_needs_unique = needs_unique;
-                  }
-                 :: acc))
-        | existing :: rest when Var.equal existing.rtv_tensor v ->
-            if existing.rtv_kind <> kind then None
-            else
-              let merged =
-                {
-                  existing with
-                  rtv_needs_unique = existing.rtv_needs_unique || needs_unique;
-                }
-              in
-              Some (List.rev_append acc (merged :: rest))
-        | existing :: rest -> add (existing :: acc) rest
-      in
-      add [] views
-  | _ -> Some views
-
-let body_env_for_loop env binder iter =
-  match loop_index_bound_for_range env binder iter with
-  | Some bound -> { loop_index_bounds = bound :: env.loop_index_bounds }
-  | None -> env
-
-let rec collect_raw_tensor_views ?reg env blocked views e =
-  let collect_child acc child =
-    collect_raw_tensor_views ?reg env blocked acc child
-  in
-  let collect_child_opt acc child =
-    match acc with None -> None | Some views -> collect_child views child
-  in
-  let collect_children views e =
-    Core.fold_immediate_children collect_child_opt (Some views) e
-  in
-  match e.desc with
-  | CLet (b, _body) when is_raw_view_ok_var b.bind_var -> Some views
-  | CBorrowLet (b, _body) when is_raw_view_ok_var b.borrow_var ->
-      (* A nested raw-view loop already owns this subtree's fast/fallback
-         split. Do not hoist its fallback patterns again into an outer loop. *)
-      Some views
-  | CLet (b, body) ->
-      Option.bind (collect_raw_tensor_views ?reg env blocked views b.bind_rhs)
-        (fun views ->
-          collect_raw_tensor_views ?reg env (b.bind_var :: blocked) views body)
-  | CBorrowLet (b, body) ->
-      Option.bind (collect_raw_tensor_views ?reg env blocked views b.borrow_rhs)
-        (fun views ->
-          collect_raw_tensor_views ?reg env (b.borrow_var :: blocked) views body)
-  | CResourceScope _ ->
-      (* Resource scopes are semantic cleanup boundaries. Do not hoist raw
-         tensor views from acquisition/body/cleanup into an enclosing loop. *)
-      Some views
-  | CFor (binder, iter, body) ->
-      Option.bind (collect_raw_tensor_views ?reg env blocked views iter)
-        (fun views ->
-          let body_env = body_env_for_loop env binder iter in
-          collect_raw_tensor_views ?reg body_env
-            (binder.loop_var :: blocked)
-            views body)
-  | CAssign
-      ( assign_v,
-        ({
-           desc =
-             CCall
-               ( CKBuiltin set_name,
-                 _,
-                 [ ({ desc = CVar arr_v; _ } as arr); idx; value ] );
-           _;
-         } as rhs) ) -> (
-      let base =
-        Option.bind (collect_raw_tensor_views ?reg env blocked views value)
-          (fun views -> collect_raw_tensor_views ?reg env blocked views idx)
-      in
-      match (base, raw_tensor_kind_of_vector_set_builtin set_name) with
-      | Some views, Some kind
-        when Var.equal assign_v arr_v
-             && loop_proves_tensor_index_in_bounds ?reg env arr idx ->
-          add_raw_tensor_view blocked views arr kind true
-      | Some views, _ -> collect_children views rhs
-      | None, _ -> None)
-  | _ -> (
-      match raw_tensor_kind_of_guarded_read e with
-      | Some (tensor, idx, kind) ->
-          Option.bind (collect_raw_tensor_views ?reg env blocked views idx)
-            (fun views -> add_raw_tensor_view blocked views tensor kind false)
-      | None -> collect_children views e)
-
-let find_raw_tensor_view blocked views tensor kind =
-  match tensor.desc with
-  | CVar v when not (var_is_blocked blocked v) ->
-      List.find_opt
-        (fun view -> Var.equal view.rtv_tensor v && view.rtv_kind = kind)
-        views
-  | _ -> None
-
-let raw_tensor_ptr_read loc view idx result_ty =
-  mk_core ~loc ~ty:result_ty
-    (CTensorRawRead
-       { trr_view = view.rtv_ptr; trr_kind = view.rtv_kind; trr_index = idx })
-
-let raw_tensor_ptr_write loc view idx value =
-  mk_void ~loc
-    (CTensorRawWrite
-       {
-         trw_view = view.rtv_ptr;
-         trw_kind = view.rtv_kind;
-         trw_index = idx;
-         trw_value = value;
-       })
-
-let rec rewrite_raw_tensor_view_body ?reg env blocked views e =
-  let rewrite = rewrite_raw_tensor_view_body ?reg env blocked views in
-  match raw_tensor_kind_of_guarded_read e with
-  | Some (tensor, idx, kind) -> (
-      match find_raw_tensor_view blocked views tensor kind with
-      | Some view -> raw_tensor_ptr_read e.loc view (rewrite idx) e.ty
-      | None -> map_children rewrite e)
-  | None -> (
-      match e.desc with
-      | CLet (b, body) ->
-          let rhs' = rewrite b.bind_rhs in
-          let body' =
-            rewrite_raw_tensor_view_body ?reg env (b.bind_var :: blocked) views
-              body
-          in
-          { e with desc = CLet ({ b with bind_rhs = rhs' }, body') }
-      | CBorrowLet (b, body) ->
-          let rhs' = rewrite b.borrow_rhs in
-          let body' =
-            rewrite_raw_tensor_view_body ?reg env (b.borrow_var :: blocked)
-              views body
-          in
-          { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
-      | CResourceScope _ ->
-          (* Do not rewrite reads inside cleanup scopes to use a raw view that
-             was proven and bound outside the resource lifetime boundary. *)
-          e
-      | CFor (binder, iter, body) ->
-          let iter' = rewrite iter in
-          let body_env = body_env_for_loop env binder iter' in
-          let body' =
-            rewrite_raw_tensor_view_body ?reg body_env
-              (binder.loop_var :: blocked)
-              views body
-          in
-          { e with desc = CFor (binder, iter', body') }
-      | CAssign
-          ( assign_v,
-            {
-              desc =
-                CCall
-                  ( CKBuiltin set_name,
-                    _,
-                    [ ({ desc = CVar arr_v; _ } as arr); idx; value ] );
-              _;
-            } ) -> (
-          match raw_tensor_kind_of_vector_set_builtin set_name with
-          | Some kind
-            when Var.equal assign_v arr_v
-                 && loop_proves_tensor_index_in_bounds ?reg env arr idx -> (
-              match find_raw_tensor_view blocked views arr kind with
-              | Some view ->
-                  let idx' = rewrite idx in
-                  let value' = rewrite value in
-                  let store = raw_tensor_ptr_write e.loc view idx' value' in
-                  { e with desc = CSeq (store, mk_void ~loc:e.loc CVoid) }
-              | None -> map_children rewrite e)
-          | _ -> map_children rewrite e)
-      | _ -> map_children rewrite e)
-
-let raw_tensor_view_condition loc view =
-  let tensor = cvar ~loc view.rtv_tensor view.rtv_tensor_ty in
-  let storage_ok =
-    mk_core ~loc ~ty:ty_bool
-      (CCall
-         ( CKIntrinsic (raw_tensor_storage_pred_intrinsic view.rtv_kind),
-           dummy_callee loc,
-           [ tensor ] ))
-  in
-  if not view.rtv_needs_unique then storage_ok
-  else
-    let unique_ok =
-      mk_core ~loc ~ty:ty_bool
-        (CCall (CKIntrinsic "tensor_is_unique", dummy_callee loc, [ tensor ]))
-    in
-    mk_core ~loc ~ty:ty_bool (CLog (Ast.And, storage_ok, unique_ok))
-
-let combine_raw_tensor_view_conditions loc views =
-  match views with
-  | [] -> None
-  | first :: rest ->
-      let first_cond = raw_tensor_view_condition loc first in
-      Some
-        (List.fold_left
-           (fun acc view ->
-             mk_core ~loc ~ty:ty_bool
-               (CLog (Ast.And, acc, raw_tensor_view_condition loc view)))
-           first_cond rest)
-
-let bind_raw_tensor_views loc views body =
-  List.fold_right
-    (fun view body ->
-      let tensor = cvar ~loc view.rtv_tensor view.rtv_tensor_ty in
-      {
-        body with
-        desc =
-          CTensorRawViewLet
-            ( {
-                trv_var = view.rtv_ptr;
-                trv_kind = view.rtv_kind;
-                trv_source = tensor;
-              },
-              body );
-      })
-    views body
-
-let maybe_add_raw_tensor_view_loop ?reg env loop =
-  match loop.desc with
-  | CFor _ -> (
-      match collect_raw_tensor_views ?reg env [] [] loop with
-      | None | Some [] -> loop
-      | Some views -> (
-          match combine_raw_tensor_view_conditions loop.loc views with
-          | None -> loop
-          | Some condition ->
-              let ok_var = Var.named (fresh_raw_view_name "ok") in
-              let ok_expr = cvar ~loc:loop.loc ok_var ty_bool in
-              let fast_loop =
-                rewrite_raw_tensor_view_body ?reg env [] views loop
-                |> bind_raw_tensor_views loop.loc views
-              in
-              let guarded =
-                mk_void ~loc:loop.loc (CIf (ok_expr, fast_loop, loop))
-              in
-              {
-                loop with
-                desc =
-                  CLet
-                    ( {
-                        bind_var = ok_var;
-                        bind_mut = false;
-                        bind_ty = ty_bool;
-                        bind_rhs = condition;
-                      },
-                      guarded );
-              }))
-  | _ -> loop
 
 let packed_tensor_elem_width_bytes ~reg ty =
   match tensor_parts ~reg ty with
@@ -1493,26 +1067,14 @@ let refine_immediate_dict_constructor ~reg key value dict_expr =
       }
   | _ -> dict_expr
 
-let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
+let rec specialize_expr ~reg (e : core) : core =
   let is_tensor_type ty = is_tensor_type ~reg ty in
   let tensor_parts ty = tensor_parts ~reg ty in
   let tensor_elem_type ~loc ~context ty =
     tensor_elem_type ~reg ~loc ~context ty
   in
   let tensor_has_elem name ty = tensor_has_elem ~reg name ty in
-  let bounds_proven_tensor_read env e tensor idx =
-    bounds_proven_tensor_read ~reg env e tensor idx
-  in
-  let e =
-    match e.desc with
-    | CFor (binder, iter, body) ->
-        let iter' = specialize_expr ~env ~reg iter in
-        let body_env = body_env_for_loop env binder iter' in
-        let body' = specialize_expr ~env:body_env ~reg body in
-        maybe_add_raw_tensor_view_loop ~reg body_env
-          { e with desc = CFor (binder, iter', body') }
-    | _ -> map_children (specialize_expr ~env ~reg) e
-  in
+  let e = map_children (specialize_expr ~reg) e in
   match e.desc with
   | CBox (inner, source_ty)
     when should_rewrite_cbox_to_borrow_cast ~reg inner source_ty ->
@@ -1553,9 +1115,18 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       | "blorp_bytes_from_hex"
         when returns_nullable_managed_option ~reg e.ty ->
           { e with desc = CCall (CKBuiltin (c ^ "_nullable"), callee, [ arg ]) }
-      | "sqrt" | "exp" | "log" | "abs" | "blorp_vector_norm"
-      | "blorp_vector_exp" | "blorp_vector_log" | "blorp_vector_sqrt"
-      | "blorp_vector_abs"
+      | ( "blorp_vector_norm" | "blorp_vector_sqrt" | "blorp_vector_exp"
+        | "blorp_vector_log" )
+        when blorp_owns_unary_tensor_math ~reg c arg.ty ->
+          (* Width-specific unary tensor math dispatch is authoritative in the
+             Blorp-owned tensor specialization pass. *)
+          e
+      | ("blorp_max" | "blorp_min")
+        when blorp_owns_tensor_reduction ~reg c arg.ty ->
+          (* Numeric tensor reduction dispatch is authoritative in the
+             Blorp-owned tensor specialization pass. *)
+          e
+      | "sqrt" | "exp" | "log" | "abs" | "blorp_vector_abs"
         when is_tensor_type arg.ty -> (
           let elem_ty =
             tensor_elem_type ~loc:e.loc
@@ -1596,41 +1167,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                   callee,
                   [ arg; int_lit e.loc elem_layout_code ] );
           }
-      | "blorp_length" -> (
-          let dummy =
-            { arg with desc = CVoid; ty = Ast.TyNamed ("Void", []) }
-          in
-          let intrinsic_name =
-            match normalize_type arg.ty with
-            | Ast.TyNamed ("List", _) -> Some "list_len"
-            | Ast.TyNamed ("String", _) -> Some "string_len"
-            | Ast.TyNamed ("Dict", _) -> Some "dict_len"
-            | Ast.TyNamed ("Set", _) -> Some "set_len"
-            | Ast.TyNamed ("Bytes", _) -> Some "bytes_len"
-            | Ast.TyNamed ("StringSlice", _) -> Some "slice_len"
-            | ty when is_tensor_type ty -> Some "tensor_len"
-            | _ -> None
-          in
-          (* Check for compile-time known dim → constant fold *)
-          let const_len =
-            match tensor_parts arg.ty with
-            | Some (_, Ast.TyConstInt n :: _) -> Some n
-            | _ -> None
-          in
-          match const_len with
-          | Some n ->
-              (* Constant-fold: length(v) → n when dim is compile-time known *)
-              { e with desc = CLit (Ast.LitInt (Int64.of_int n)) }
-          | None -> (
-              match intrinsic_name with
-              | Some name ->
-                  { e with desc = CCall (CKIntrinsic name, dummy, [ arg ]) }
-              | None -> e))
-      | "blorp_vector_len" ->
-          let dummy =
-            { arg with desc = CVoid; ty = Ast.TyNamed ("Void", []) }
-          in
-          { e with desc = CCall (CKIntrinsic "tensor_len", dummy, [ arg ]) }
       | "blorp_tensor_transpose" ->
           (* transpose(m) where m: T[#M, #N] — inject dim args.
               blorp_tensor_transpose(mat, rows, cols) at runtime. *)
@@ -2083,6 +1619,12 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
               (* The outer [when] guard requires at least one operand to
               be a tensor; this branch is unreachable. *)
               e))
+  | CCall (CKBuiltin c, _, _)
+    when blorp_owns_numeric_checked_get ~reg c e.ty ->
+      (* Preserve the semantic call through the Core JSON handoff. The
+         Blorp-owned tensor specialization pass has the canonical result type
+         and owns numeric checked-read dispatch. *)
+      e
   | CCall (CKBuiltin c, callee, args)
     when c = "blorp_checked_get"
          || c = "blorp_matrix_checked_get"
@@ -2106,17 +1648,11 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         | _ -> None
       in
       let ranked_checked_get_shape_builtin name =
-        let base =
-          match name with
-          | "blorp_tensor3_checked_get" -> "blorp_tensor3_checked_get_shape"
-          | "blorp_tensor4_checked_get" -> "blorp_tensor4_checked_get_shape"
-          | "blorp_tensor5_checked_get" -> "blorp_tensor5_checked_get_shape"
-          | _ -> name
-        in
-        match normalize_type result_ty with
-        | Ast.TyNamed ("Float", _) -> base ^ "_f64"
-        | Ast.TyNamed ("Float32", _) -> base ^ "_f32"
-        | _ -> base
+        match name with
+        | "blorp_tensor3_checked_get" -> "blorp_tensor3_checked_get_shape"
+        | "blorp_tensor4_checked_get" -> "blorp_tensor4_checked_get_shape"
+        | "blorp_tensor5_checked_get" -> "blorp_tensor5_checked_get_shape"
+        | _ -> name
       in
       let static_tensor_dims ty =
         match tensor_parts ty with
@@ -2136,32 +1672,22 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             | Some dims when List.length dims = rank ->
                 let builtin = ranked_checked_get_shape_builtin c in
                 let call_args = arr :: (List.map mk_int dims @ indices) in
-                let returns_primitive =
-                  String.ends_with ~suffix:"_f64" builtin
-                  || String.ends_with ~suffix:"_f32" builtin
-                in
                 let call =
                   {
                     e with
                     desc = CCall (CKBuiltin builtin, callee, call_args);
-                    ty = (if returns_primitive then result_ty else raw_ptr_ty);
+                    ty = raw_ptr_ty;
                   }
                 in
-                if returns_primitive then Some call
-                else if is_pointer then
+                if is_pointer then
                   Some { e with desc = CCast (call, result_ty) }
                 else Some { e with desc = CUnbox (call, result_ty) }
             | _ -> None)
         | _ -> None
       in
-      let typed_unchecked_intrinsic =
-        Core_layout_type.tensor_checked_get_access_of_type ~reg result_ty
-        |> Option.map (fun access -> access.Core_layout_type.tcga_get_intrinsic)
-      in
-      (* Try to eliminate bounds checks for 1D primitive checked_get calls.
-         Managed element reads keep the runtime path because checked_get returns
-         an alias borrowed from the vector; Perceus must make any needed
-         ownership copy explicit. *)
+      (* Preserve the existing literal-bounds optimization for remaining
+         non-pointer value layouts. Managed element reads keep the runtime path
+         because checked_get returns an alias borrowed from the vector. *)
       let try_unchecked () =
         if c <> "blorp_checked_get" || is_pointer then None
         else
@@ -2178,39 +1704,21 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                 | _ -> None
               in
               match (dim, idx_val) with
-              | Some n, Some i when i >= 0 && i < n -> (
+              | Some n, Some i when i >= 0 && i < n ->
                   let dummy = { arr with desc = CVoid; ty = void_ty } in
-                  match typed_unchecked_intrinsic with
-                  | Some intr_name ->
-                      Some
-                        {
-                          e with
-                          desc =
-                            CCall (CKIntrinsic intr_name, dummy, [ arr; idx ]);
-                        }
-                  | None ->
-                      let raw =
-                        {
-                          e with
-                          desc =
-                            CCall
-                              ( CKIntrinsic "tensor_get_unchecked",
-                                dummy,
-                                [ arr; idx ] );
-                          ty = raw_ptr_ty;
-                        }
-                      in
-                      if is_pointer then
-                        Some { e with desc = CCast (raw, result_ty) }
-                      else Some { e with desc = CUnbox (raw, result_ty) })
+                  let raw =
+                    {
+                      e with
+                      desc =
+                        CCall
+                          ( CKIntrinsic "tensor_get_unchecked",
+                            dummy,
+                            [ arr; idx ] );
+                      ty = raw_ptr_ty;
+                    }
+                  in
+                  Some { e with desc = CUnbox (raw, result_ty) }
               | _ -> None)
-          | _ -> None
-      in
-      let try_bounds_proven_loop_read () =
-        if c <> "blorp_checked_get" || is_pointer then None
-        else
-          match args with
-          | [ arr; idx ] -> bounds_proven_tensor_read env e arr idx
           | _ -> None
       in
       match try_ranked_shape_call () with
@@ -2218,54 +1726,16 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       | None -> (
           match try_unchecked () with
           | Some optimized -> optimized
-          | None -> (
-              match try_bounds_proven_loop_read () with
-              | Some optimized -> optimized
-              | None -> (
-                  match (normalize_type result_ty, c) with
-                  | Ast.TyNamed ("Float", _), "blorp_checked_get" ->
-                      {
-                        e with
-                        desc =
-                          CCall
-                            (CKBuiltin "blorp_checked_get_f64", callee, args);
-                      }
-                  | Ast.TyNamed ("Float", _), "blorp_matrix_checked_get" ->
-                      {
-                        e with
-                        desc =
-                          CCall
-                            ( CKBuiltin "blorp_matrix_checked_get_f64",
-                              callee,
-                              args );
-                      }
-                  | Ast.TyNamed ("Float32", _), "blorp_checked_get" ->
-                      {
-                        e with
-                        desc =
-                          CCall
-                            (CKBuiltin "blorp_checked_get_f32", callee, args);
-                      }
-                  | Ast.TyNamed ("Float32", _), "blorp_matrix_checked_get" ->
-                      {
-                        e with
-                        desc =
-                          CCall
-                            ( CKBuiltin "blorp_matrix_checked_get_f32",
-                              callee,
-                              args );
-                      }
-                  | _ ->
-                      let raw_call =
-                        {
-                          e with
-                          desc = CCall (CKBuiltin c, callee, args);
-                          ty = raw_ptr_ty;
-                        }
-                      in
-                      if is_pointer then
-                        { e with desc = CCast (raw_call, result_ty) }
-                      else { e with desc = CUnbox (raw_call, result_ty) }))))
+          | None ->
+              let raw_call =
+                {
+                  e with
+                  desc = CCall (CKBuiltin c, callee, args);
+                  ty = raw_ptr_ty;
+                }
+              in
+              if is_pointer then { e with desc = CCast (raw_call, result_ty) }
+              else { e with desc = CUnbox (raw_call, result_ty) }))
   (* multiply: type-dispatch + inject dimension args from types.
      blorp call: multiply(a, b) where a: T[#M,#K], b: T[#K,#N]
      C call: blorp_tensor_matrix_multiply_float(a, b, m, k, n) *)
@@ -2612,27 +2082,12 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         }
       in
       { e with desc = CCast (raw_call, e.ty) }
-  | CCall (CKBuiltin "blorp_vector_new_fill", callee, [ value; size ])
-    when tensor_has_elem "Int" e.ty ->
-      {
-        e with
-        desc =
-          CCall (CKBuiltin "blorp_vector_new_fill_i64", callee, [ value; size ]);
-      }
-  | CCall (CKBuiltin "blorp_vector_new_fill", callee, [ value; size ])
-    when tensor_has_elem "Float" e.ty ->
-      {
-        e with
-        desc =
-          CCall (CKBuiltin "blorp_vector_new_fill_f64", callee, [ value; size ]);
-      }
-  | CCall (CKBuiltin "blorp_vector_new_fill", callee, [ value; size ])
-    when tensor_has_elem "Float32" e.ty ->
-      {
-        e with
-        desc =
-          CCall (CKBuiltin "blorp_vector_new_fill_f32", callee, [ value; size ]);
-      }
+  | CCall (CKBuiltin c, _, _)
+    when blorp_owns_numeric_tensor_fill ~reg c e.ty ->
+      (* Raw scalar vector/matrix fill dispatch is authoritative in the
+         Blorp-owned tensor specialization pass. Packed, boxed, and inline
+         layouts continue through the OCaml branches below. *)
+      e
   | CCall (CKBuiltin "blorp_vector_new_fill", callee, [ value; size ])
     when Option.is_some (packed_tensor_elem_width_bytes ~reg e.ty) ->
       let width =
@@ -2647,36 +2102,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             ( CKBuiltin "blorp_vector_new_fill_packed",
               callee,
               [ value; size; int_lit e.loc width ] );
-      }
-  | CCall (CKBuiltin "blorp_matrix_new_fill", callee, [ value; rows; cols ])
-    when tensor_has_elem "Int" e.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_new_fill_i64",
-              callee,
-              [ value; rows; cols ] );
-      }
-  | CCall (CKBuiltin "blorp_matrix_new_fill", callee, [ value; rows; cols ])
-    when tensor_has_elem "Float" e.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_new_fill_f64",
-              callee,
-              [ value; rows; cols ] );
-      }
-  | CCall (CKBuiltin "blorp_matrix_new_fill", callee, [ value; rows; cols ])
-    when tensor_has_elem "Float32" e.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_new_fill_f32",
-              callee,
-              [ value; rows; cols ] );
       }
   | CCall (CKBuiltin "blorp_matrix_new_fill", callee, [ value; rows; cols ])
     when Option.is_some (packed_tensor_elem_width_bytes ~reg e.ty) ->
@@ -2763,69 +2188,11 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         e with
         desc = CCall (CKBuiltin "blorp_matrix_set_opt_nullable", callee, args);
       }
-  | CCall (CKBuiltin "blorp_checked_set", callee, [ arr; idx; value ])
-    when tensor_has_elem "Int" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_vector_set_inplace_i64",
-              callee,
-              [ arr; idx; value ] );
-      }
-  | CCall (CKBuiltin "blorp_checked_set", callee, [ arr; idx; value ])
-    when tensor_has_elem "Float" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_vector_set_inplace_f64",
-              callee,
-              [ arr; idx; value ] );
-      }
-  | CCall (CKBuiltin "blorp_checked_set", callee, [ arr; idx; value ])
-    when tensor_has_elem "Float32" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_vector_set_inplace_f32",
-              callee,
-              [ arr; idx; value ] );
-      }
-  | CCall
-      (CKBuiltin "blorp_matrix_checked_set", callee, [ arr; row; col; value ])
-    when tensor_has_elem "Int" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_checked_set_i64",
-              callee,
-              [ arr; row; col; value ] );
-      }
-  | CCall
-      (CKBuiltin "blorp_matrix_checked_set", callee, [ arr; row; col; value ])
-    when tensor_has_elem "Float" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_checked_set_f64",
-              callee,
-              [ arr; row; col; value ] );
-      }
-  | CCall
-      (CKBuiltin "blorp_matrix_checked_set", callee, [ arr; row; col; value ])
-    when tensor_has_elem "Float32" arr.ty ->
-      {
-        e with
-        desc =
-          CCall
-            ( CKBuiltin "blorp_matrix_checked_set_f32",
-              callee,
-              [ arr; row; col; value ] );
-      }
+  | CCall (CKBuiltin c, _, ({ ty = tensor_ty; _ } :: _))
+    when blorp_owns_typed_checked_set c tensor_ty ->
+      (* Numeric vector/matrix writes stay semantic until the Blorp-owned
+         tensor specialization pass selects their concrete runtime ABI. *)
+      e
   | CCall (CKBuiltin c, callee, args)
     when c = "blorp_checked_set"
          || c = "blorp_matrix_checked_set"

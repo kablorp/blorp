@@ -28,15 +28,22 @@ Source (.brp)
 +-----------+
     |
     v
++------------------+
+| Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
+|                  |  and initial list layout (stage_08_core_lower)
++------------------+
+    |
+    v
 +----------------+
-| Typed AST JSON |  Temporary production bridge into the OCaml Core pipeline
+| Prepared Core  |  One strict JSON bridge into the OCaml semantic middle
+| bridge         |  (core_pre_middle_json.ml)
 +----------------+
     |
     v
-+------------+
-| Core IR    |  OCaml lowering and early/middle transforms, then the Core JSON
-| pipeline   |  handoff into the supported Blorp-owned backend tail
-+------------+
++---------------+
+| Core IR       |  OCaml early/middle transforms, then the Core JSON handoff
+| middle + tail |  into the Blorp-owned specialization/backend tail
++---------------+
     |
     v
 +------------+
@@ -59,17 +66,25 @@ Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
-During the OCaml-to-Blorp port, the production route first decodes the
-Blorp-owned typed-program artifact into the remaining OCaml Core pipeline. It
-then crosses the Core JSON bridge after the remaining OCaml specialization
-families. Primitive conversion and hash builtins intentionally cross in
-semantic form so Blorp can specialize them before Blorp-owned
-function-reference adaptation.
-Length specialization remains before the bridge because its concrete tensor
-intrinsics feed raw-view formation in the same OCaml pass. Checkpoint 8 in
-`docs/BLORP_COMPILER_PORT_ROADMAP.md` removes the first temporary boundary by
-making Blorp Core lowering authoritative. On the current backend route,
+During the OCaml-to-Blorp port, the production route lowers and assembles the
+typed module graph into prepared Core in Blorp. One phase-specific bridge
+decodes that Core into the remaining OCaml early/middle pipeline; source and
+typed AST do not cross this boundary. The pipeline then crosses the late Core
+JSON bridge after the remaining OCaml specialization families. Primitive
+conversion, hash, length, numeric checked tensor access,
+raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
+bounds-proven tensor access builtins intentionally cross in semantic form so
+Blorp can specialize them before Blorp-owned function-reference adaptation.
+The Core JSON projection expands aliases and canonicalizes `Vector`, `Matrix`,
+`Tensor`, and array spellings to one tensor type, so tensor specialization
+receives canonical shapes, numeric types, and enum types rather than repeating
+registry lookup in Blorp. Length folding and raw-view formation remain one coherent pass because
+the folded static dimension is the fact that proves loop accesses in bounds.
+Checkpoint 8 in `docs/BLORP_COMPILER_PORT_ROADMAP.md` made Blorp Core lowering,
+module flattening, FFI annotation, and initial list layout authoritative for
+normal source commands. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
+`compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
@@ -84,23 +99,41 @@ dumps and stops observe the Blorp-owned tail as Core JSON through the bridge;
 OCaml program callbacks stop at the pre-DCE handoff. C artifact emission is
 owned by the Blorp backend bridge.
 
+Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
+prepared-Core `debug_block` nodes. The strict prepared-Core decoder maps them
+to `CDebugBlock`; `Core_debug` is the single stage that either erases the node
+or retains its body according to the request's debug mode. The post-debug
+invariant rejects any node that survives that decision.
+
+Resource-source loops acquire and scope each resource in Blorp inference and
+Core lowering. The compiler records the exact synthesized loop-item identity
+on the typed scope rather than recognizing generated names. Only the temporary
+typed-AST compatibility projection removes that tagged wrapper before legacy
+OCaml lowering, which keeps both paths at one cleanup owner per resource.
+
+The late-Core projection preserves scoped `let`/`borrow` expressions inside
+closure-call arguments. OCaml fusion may introduce those forms before the
+handoff; the Blorp-owned closure and preparation stages, rather than the
+projection boundary, own their final normalization for C emission.
+
+The pinned-bootstrap wrapper still compiles the Blorp CLI through the legacy
+OCaml typed-AST/Core-lowering entrypoint. That bootstrap trust-root path is
+kept separate from normal source compilation and is not a runtime fallback.
+Direct in-memory OCaml compiler tests also retain the compatibility entrypoint
+until their fixtures move to prepared Core.
+
 ```
-Typed AST
+Blorp Typed AST graph
     |
     v
-+------------+
-| Core_lower |  Mechanical AST → Core IR translation (core_lower.ml)
-+------------+
++----------------------+
+| Core graph prepare   |  Blorp typed AST -> Core, module flattening,
++----------------------+  checked FFI policies, and initial list layout
     |
     v
-+-------------------+
-| Core_ffi_boundary |  Attach checked FFI argument-boundary policies
-+-------------------+  before downstream Core passes
-    |
-    v
-+------------------+
-| Core_list_layout |  Annotate list literals/allocations/handoffs with
-+------------------+  concrete storage layout facts used by later passes
++----------------------+
+| Prepared-Core bridge |  Strict phase decoder; rejects late Core forms
++----------------------+
     |
     v
 +------------+
@@ -173,6 +206,13 @@ Typed AST
 | Blorp primitive specialize |  Conversion and hash builtins become casts or
 +----------------------------+  direct runtime calls
                                 (compiler_core_specialize.brp)
+    |
+    v
++--------------------------+
+| Blorp tensor specialize  |  Fold length; dispatch numeric checked access,
++--------------------------+  raw-scalar fills, unary math, and reductions; form guarded
+                              raw views for bounds-proven loops
+                              (compiler_core_tensor_specialize.brp)
     |
     v
 +--------------------------+
@@ -283,8 +323,8 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_lower.ml` | Typed AST → Core lowering |
-| `core_ffi_boundary.ml` | Checked FFI argument-boundary policies attached before Core transforms |
+| `core_lower.ml` | Compatibility typed AST → Core lowering used only by the bounded bootstrap and legacy in-memory routes |
+| `core_ffi_boundary.ml` | Compatibility checked FFI annotation for those legacy lowering routes |
 | `core_debug.ml` | `debug:` block erasure/retention after lowering |
 | `core_desugar.ml` | Sugar elimination |
 | `core_ssa.ml` | Mutable-local lowering used inside the desugar stage |
@@ -304,14 +344,14 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
-| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff |
+| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff, excluding Blorp-owned primitive, length, numeric checked tensor-access, raw-scalar tensor-fill, and bounds-proven raw-view families |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
-| `core_flatten.ml` | Module prefixing and import-table assembly |
+| `core_flatten.ml` | Compatibility module prefixing for the bounded bootstrap and legacy in-memory routes |
 | `core_invariants.ml` | Stage-boundary invariant checks |
 | `core_pipeline.ml` | Pipeline orchestration, module assembly |
 | `core_error.ml` | Structured errors with phase/location/hint |
@@ -325,6 +365,7 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
 | `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
+| `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
 | `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
@@ -367,8 +408,8 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_lower.ml      # Typed AST → Core IR lowering (require_type invariant)
-│   ├── core_ffi_boundary.ml # Checked FFI argument-boundary policies
+│   ├── core_lower.ml      # Compatibility-only typed AST → Core lowering
+│   ├── core_ffi_boundary.ml # Compatibility-only checked FFI policies
 │   ├── core_debug.ml      # debug: block lowering by build mode
 │   ├── core_desugar.ml    # Core IR sugar elimination
 │   ├── core_ssa.ml        # Mutable-local lowering used by core_desugar
@@ -827,12 +868,13 @@ User-facing subcommands:
 5. **TypeCheck** (`typecheck.ml`, `infer.ml`):
    - Add type checking for new construct
 
-6. **Core lowering** (`core_lower.ml`):
-   - Translate the new AST node into Core IR. If the construct desugars
-     to existing Core, handle it in `core_desugar.ml` instead.
+6. **Core lowering** (`compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`):
+   - Translate the new typed AST node into Core IR. If the construct desugars
+     to existing Core, handle it in the owning Blorp middle-Core pass instead.
    - If the construct has build-mode semantics like `debug:`, represent it
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
+   - Do not add new behavior to compatibility-only `compiler/lib/core_lower.ml`.
 
 7. **Core emission** (`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.

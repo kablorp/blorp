@@ -2476,9 +2476,6 @@ and lower_decl_with_error (d : Ast.decl) lower =
            program."
         "lowering failed for %s: %s" (decl_label d) msg
 
-let lower_typed_expr (typed : Typed_ast.expr) : Core.core =
-  lower_typed_expr_core typed
-
 let lower_typed_decl (typed : Typed_ast.decl) : Core.core_decl =
   lower_typed_decl_core typed
 

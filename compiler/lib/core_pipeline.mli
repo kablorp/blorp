@@ -1,8 +1,8 @@
 (** Core IR compilation pipeline.
 
-    This module is the boundary between typed AST and the Core/backend
-    pipeline. Callers must validate through [Typed_ast] before entering this
-    module. *)
+    Normal source commands enter [run_core_passes] through the strict
+    prepared-Core semantic worker. Typed-program entrypoints are compatibility
+    APIs for the pinned bootstrap and direct in-memory tests. *)
 
 exception Stopped_after of Core_stage.t
 (** Raised by an [on_stage_callback] to stop compilation after a stage. *)
@@ -29,9 +29,7 @@ type typed_module_input = {
   typed_module_program : Typed_ast.program;
   typed_module_import_bindings : Session.import_binding list;
 }
-(** One already-typechecked module supplied explicitly at the typed-to-Core
-    boundary. This avoids coupling semantic-middle execution to the process
-    module cache. *)
+(** Compatibility typed-module input used outside the production source path. *)
 
 type prepared_typed_program = {
   prepared_core : Core.core_program;
@@ -50,8 +48,7 @@ val prepare_typed_with_module_inputs :
   modules:typed_module_input list ->
   Typed_ast.program ->
   prepared_typed_program
-(** Lower explicit typed inputs and construct the registries shared by all
-    semantic-middle passes. *)
+(** Compatibility lowering for pinned-bootstrap and in-memory OCaml callers. *)
 
 val run_core_passes :
   ?import_aliases:(string, string * string) Hashtbl.t ->
@@ -75,7 +72,7 @@ val compile_typed :
   ?check_invariants:bool ->
   Typed_ast.program ->
   string
-(** Compile a typed single-file program to backend output. *)
+(** Compatibility typed single-file compilation; not the normal CLI route. *)
 
 val compile_typed_with_modules :
   ?main_import_bindings:Session.import_binding list ->
@@ -89,5 +86,5 @@ val compile_typed_with_modules :
   ?check_invariants:bool ->
   Typed_ast.program ->
   string * string list * string list
-(** Compile a typed main program plus loaded typed modules. Returns generated
-    output, link flags, and include directories. *)
+(** Compatibility typed graph compilation. Returns generated output, link
+    flags, and include directories. *)

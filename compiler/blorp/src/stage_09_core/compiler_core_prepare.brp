@@ -82,6 +82,7 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictExpr,
 			DictConstructExpr,
@@ -119,6 +120,7 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
+			RawMatchExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -205,7 +207,7 @@ import:
 		CoreTailrecListSpreadLoop,
 		CoreTailrecListSpreadRebind,
 		CoreTensorBoxedLiteral,
-		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTensorLiteral,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
@@ -228,6 +230,7 @@ import:
 		CoreType(
 			BoxedResultType,
 			EnumType,
+			FunctionType,
 			HeapRecordType,
 			NamedType,
 			RangeType,
@@ -474,6 +477,8 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		VoidExpr(typ, loc):
 			typ
+		DebugBlockExpr(body, typ, loc):
+			typ
 		CooperativeCheckpointExpr(typ, loc):
 			typ
 		CallExpr(kind, callee, args, typ, loc):
@@ -630,6 +635,8 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			typ
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			typ
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			typ
 		IfExpr(cond, then_expr, else_expr, typ, loc):
@@ -668,6 +675,8 @@ private pure func primitive_box_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(_, _, _):
 			False
 		EnumType(name):
 			True
@@ -783,6 +792,8 @@ private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			True
 		BoxedResultType(ok_type, err_type):
+			True
+		FunctionType(_, _, _):
 			True
 		HeapRecordType(name):
 			True
@@ -1286,6 +1297,8 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			False
+		FunctionType(_, _, _):
+			False
 		RangeType:
 			True
 		TensorType(info):
@@ -1327,6 +1340,8 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		BoxedResultType(ok_type, err_type):
 			True
+		FunctionType(_, _, _):
+			True
 		HeapRecordType(name):
 			False
 		UnionType(name):
@@ -1352,6 +1367,8 @@ private pure func is_unmanaged_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(_, _, _):
 			False
 		HeapRecordType(name):
 			False
@@ -1406,6 +1423,8 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 			None
 		BoxedResultType(ok_type, err_type):
 			None
+		FunctionType(_, _, _):
+			None
 		RangeType:
 			None
 		TensorType(info):
@@ -1422,6 +1441,8 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			else:
 				pointer_box_storage_needs_release_type(payload)
 		BoxedResultType(ok_type, err_type):
+			True
+		FunctionType(_, _, _):
 			True
 		HeapRecordType(name):
 			True
@@ -1469,6 +1490,8 @@ private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[C
 		StackResultType(ok_type, err_type):
 			None
 		BoxedResultType(ok_type, err_type):
+			None
+		FunctionType(_, _, _):
 			None
 		RangeType:
 			None
@@ -1917,6 +1940,8 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 		VoidExpr(typ, loc):
 			False
+		DebugBlockExpr(body, typ, loc):
+			False
 		CallExpr(kind, callee, args, typ, loc):
 			False
 		BinaryExpr(op, left, right, typ, loc):
@@ -2053,6 +2078,8 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			False
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			False
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			False
 		ResourceScopeExpr(scope, typ, loc):
@@ -2125,6 +2152,12 @@ private pure func prepared_tuple_literal(
 								failed = True
 								break
 						BoxedResultType(ok_type, err_type):
+							elements = elements.append(TuplePointerElement(item))
+							release_mask += int_power_of_two(index)
+
+							if tuple_pointer_expr_needs_retain(item):
+								retain_mask += int_power_of_two(index)
+						FunctionType(_, _, _):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
@@ -2203,6 +2236,8 @@ private pure func prepare_tuple_expr(
 			TupleExpr(prepared_items, typ, loc)
 		BoxedResultType(ok_type, err_type):
 			TupleExpr(prepared_items, typ, loc)
+		FunctionType(_, _, _):
+			TupleExpr(prepared_items, typ, loc)
 		EnumType(name):
 			TupleExpr(prepared_items, typ, loc)
 		ValueRecordType(name):
@@ -2253,7 +2288,7 @@ private pure func static_tensor_dims(dims: List[CoreTensorDim]) -> Option[List[I
 		match dim:
 			TensorStaticDim(value):
 				values = values.append(value)
-			TensorRuntimeDim(name):
+			TensorRuntimeDim(_) | TensorVariadicDim(_) | TensorDimOperation(_, _, _):
 				all_static = False
 				break
 
@@ -2753,6 +2788,8 @@ private pure func prepare_record_expr(
 			RecordExpr(prepared_fields, typ, loc)
 		BoxedResultType(ok_type, err_type):
 			RecordExpr(prepared_fields, typ, loc)
+		FunctionType(_, _, _):
+			RecordExpr(prepared_fields, typ, loc)
 		HeapRecordType(name):
 			match find_heap_record_decl(decls, name):
 				Some(record_decl):
@@ -2812,6 +2849,8 @@ private pure func prepare_record_construct_expr(
 		StackResultType(ok_type, err_type):
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
 		BoxedResultType(ok_type, err_type):
+			RecordConstructExpr(type_name, prepared_fields, typ, loc)
+		FunctionType(_, _, _):
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
 		EnumType(name):
 			RecordConstructExpr(type_name, prepared_fields, typ, loc)
@@ -2883,6 +2922,8 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 			None
 		StackResultType(ok_type, err_type):
 			None
+		FunctionType(_, _, _):
+			None
 		BoxedResultType(ok_type, err_type):
 			None
 		RangeType:
@@ -2917,6 +2958,8 @@ private pure func stack_option_none_value(payload: CoreType) -> String:
 		StackResultType(ok_type, err_type):
 			"{0}"
 		BoxedResultType(ok_type, err_type):
+			"0"
+		FunctionType(_, _, _):
 			"0"
 		RangeType:
 			"0"
@@ -3140,6 +3183,8 @@ private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> 
 		StackResultType(ok_type, err_type):
 			True
 		BoxedResultType(ok_type, err_type):
+			True
+		FunctionType(_, _, _):
 			True
 
 
@@ -3383,6 +3428,8 @@ private pure func prepare_union_construct(
 			prepare_stack_result_construct(kind, args, typ)
 		BoxedResultType(ok_type, err_type):
 			prepare_boxed_result_construct(kind, args)
+		FunctionType(_, _, _):
+			None
 		EnumType(name):
 			None
 		ValueRecordType(name):
@@ -3595,6 +3642,12 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 					clone_core_var_expr(variable, typ, loc)
 		VoidExpr(typ, loc):
 			VoidExpr(clone_core_type(typ), clone_core_source_loc(loc))
+		DebugBlockExpr(body, typ, loc):
+			DebugBlockExpr(
+				prepare_expr(decls, body),
+				clone_core_type(typ),
+				clone_core_source_loc(loc),
+			)
 		CooperativeCheckpointExpr(typ, loc):
 			CooperativeCheckpointExpr(clone_core_type(typ), clone_core_source_loc(loc))
 		CallExpr(kind, callee, args, typ, loc):
@@ -4134,6 +4187,13 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				prepare_expr(decls, scrutinee),
 				prepare_literal_match_cases(decls, cases),
 				prepare_literal_match_fallback(decls, fallback),
+				typ,
+				loc,
+			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				prepare_expr(decls, scrutinee),
+				cases.map(func(case): { case | body = prepare_expr(decls, case.body) }),
 				typ,
 				loc,
 			)

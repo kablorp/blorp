@@ -41,6 +41,7 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
 			DictExpr,
@@ -76,6 +77,7 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
 			RangeExpr,
+			RawMatchExpr,
 			RecordConstructExpr,
 			RecordExpr,
 			ResourceCleanupExitExpr,
@@ -117,7 +119,18 @@ import:
 			LiteralMatchFallbackFail,
 		),
 		CoreMatchBinding,
+		CorePattern(
+			ConstructorPattern,
+			ListPattern,
+			LiteralPattern,
+			NamePattern,
+			OrPattern,
+			QualifiedConstructorPattern,
+			TuplePattern,
+			WildcardPattern,
+		),
 		CorePreClosureConcurrentBinding,
+		CoreRawMatchCase,
 		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -132,6 +145,28 @@ import:
 			TupleStructElement,
 			TupleVoidElement,
 		),
+
+
+pure func core_pattern_bound_names(pattern: CorePattern) -> List[String]:
+	match pattern:
+		NamePattern(name):
+			[name]
+		ConstructorPattern(_, args) | QualifiedConstructorPattern(_, _, args):
+			args.flat_map(core_pattern_bound_names)
+		TuplePattern(items) | OrPattern(items):
+			items.flat_map(core_pattern_bound_names)
+		ListPattern(items, spread):
+			spread_names: List[String] = match spread:
+				Some(spread_pattern):
+					core_pattern_bound_names(spread_pattern)
+				None:
+					[]
+
+			items
+				.flat_map(core_pattern_bound_names)
+				.concat(spread_names)
+		WildcardPattern | LiteralPattern(_):
+			[]
 
 
 private record CoreExprMapContext[C] {
@@ -154,6 +189,16 @@ private pure func map_context_exprs[C](
 		mapped = mapped.append(map_context_expr(context, item))
 
 	mapped
+
+
+private pure func map_context_raw_match_cases[C](
+	cases: List[CoreRawMatchCase],
+	context: CoreExprMapContext[C],
+) -> List[CoreRawMatchCase]:
+	cases.map(func(match_case): {
+			pattern = match_case.pattern,
+			body = map_context_expr(context, match_case.body)
+		})
 
 
 private pure func map_context_optional_expr[C](
@@ -573,13 +618,6 @@ private pure func map_boxed_storage_value(
 	{ value | value = mapper(value.value) }
 
 
-private pure func map_boxed_storage_values(
-	values: List[CoreBoxedStorageValue],
-	mapper: pure (CoreExpr) -> CoreExpr,
-) -> List[CoreBoxedStorageValue]:
-	values.map(func(value): map_boxed_storage_value(value, mapper))
-
-
 private pure func map_dict_entry(
 	entry: CoreDictEntry,
 	mapper: pure (CoreExpr) -> CoreExpr,
@@ -588,27 +626,6 @@ private pure func map_dict_entry(
 		key = map_boxed_storage_value(entry.key, mapper),
 		value = map_boxed_storage_value(entry.value, mapper)
 	}
-
-
-private pure func map_tuple_element(
-	element: CoreTupleElement,
-	mapper: pure (CoreExpr) -> CoreExpr,
-) -> CoreTupleElement:
-	match element:
-		TuplePrimElement(value):
-			TuplePrimElement(mapper(value))
-		TuplePointerElement(value):
-			TuplePointerElement(mapper(value))
-		TupleStructElement(value, c_type):
-			TupleStructElement(mapper(value), c_type)
-		TupleVoidElement:
-			TupleVoidElement
-		TupleFloatElement(value):
-			TupleFloatElement(mapper(value))
-		TupleFloat32Element(value):
-			TupleFloat32Element(mapper(value))
-		TupleFloat16Element(value):
-			TupleFloat16Element(mapper(value))
 
 
 private pure func map_literal_match_case(
@@ -1037,6 +1054,12 @@ private pure func map_core_expr_children_with_map_context[C](
 			expr
 		VoidExpr(typ, loc):
 			expr
+		DebugBlockExpr(body, typ, loc):
+			DebugBlockExpr(
+				map_context_expr(context, body),
+				typ,
+				loc,
+			)
 		CooperativeCheckpointExpr(typ, loc):
 			expr
 		CallExpr(kind, callee, args, typ, loc):
@@ -1586,6 +1609,13 @@ private pure func map_core_expr_children_with_map_context[C](
 				typ,
 				loc,
 			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				map_context_expr(context, scrutinee),
+				map_context_raw_match_cases(cases, context),
+				typ,
+				loc,
+			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				map_context_expr(context, scrutinee),
@@ -1713,15 +1743,313 @@ pure func any_core_expr(
 	found
 
 
-pure func any_core_optional_expr(
-	value: Option[CoreExpr],
-	predicate: pure (CoreExpr) -> Bool,
-) -> Bool:
+private pure func optional_expr_items(value: Option[CoreExpr]) -> List[CoreExpr]:
 	match value:
 		Some(expr):
-			predicate(expr)
+			[expr]
 		None:
-			False
+			[]
+
+
+private pure func boxed_storage_value_items(value: CoreBoxedStorageValue) -> List[CoreExpr]:
+	[value.value]
+
+
+private pure func dict_entry_items(entry: CoreDictEntry) -> List[CoreExpr]:
+	[entry.key.value, entry.value.value]
+
+
+private pure func tuple_element_items(element: CoreTupleElement) -> List[CoreExpr]:
+	match element:
+		TuplePrimElement(value):
+			[value]
+		TuplePointerElement(value):
+			[value]
+		TupleStructElement(value, _):
+			[value]
+		TupleVoidElement:
+			[]
+		TupleFloatElement(value):
+			[value]
+		TupleFloat32Element(value):
+			[value]
+		TupleFloat16Element(value):
+			[value]
+
+
+private pure func literal_match_fallback_items(
+	fallback: CoreLiteralMatchFallback,
+) -> List[CoreExpr]:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			[body]
+		LiteralMatchFallbackBindings(_, body):
+			[body]
+		LiteralMatchFallbackFail:
+			[]
+
+
+private pure func constructor_match_body_items(body: CoreConstructorMatchBody) -> List[CoreExpr]:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			[expr]
+		ConstructorMatchBodyLiteral(match_expr):
+			constructor_literal_match_items(match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			constructor_length_match_items(match_expr)
+
+
+private pure func constructor_literal_match_items(
+	match_expr: CoreConstructorLiteralMatch,
+) -> List[CoreExpr]:
+	match_expr.cases.flat_map(
+		func(match_case): [match_case.body],
+	) + literal_match_fallback_items(match_expr.fallback)
+
+
+private pure func constructor_length_branch_items(
+	branch: CoreConstructorLengthMatchBranch,
+) -> List[CoreExpr]:
+	constructor_match_body_items(branch.body)
+
+
+private pure func constructor_length_match_items(
+	match_expr: CoreConstructorLengthMatch,
+) -> List[CoreExpr]:
+	case_items: List[CoreExpr] = match_expr.cases.flat_map(
+		func(match_case): constructor_length_branch_items(match_case.branch),
+	)
+
+	geq_items: List[CoreExpr] = match match_expr.geq:
+		Some(geq):
+			constructor_length_branch_items(geq.branch)
+		None:
+			[]
+
+	fallback_items: List[CoreExpr] = match match_expr.fallback:
+		Some(branch):
+			constructor_length_branch_items(branch)
+		None:
+			[]
+
+	case_items + geq_items + fallback_items
+
+
+private pure func constructor_match_fallback_items(
+	fallback: CoreConstructorMatchFallback,
+) -> List[CoreExpr]:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			[body]
+		ConstructorMatchFallbackBindings(_, body):
+			[body]
+		ConstructorMatchFallbackFail:
+			[]
+
+
+private pure func select_arm_kind_items(kind: CoreSelectArmKind) -> List[CoreExpr]:
+	match kind:
+		SelectRecvArm(recv):
+			[recv.channel]
+		SelectSealedArm(channel):
+			[channel]
+		SelectAfterArm(timeout):
+			[timeout]
+
+
+-- Returns the direct expression children in source/evaluation order. Analyses
+-- that need to aggregate facts should use this instead of reimplementing a
+-- partial Core traversal beside the canonical child mapper above.
+pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
+	match expr:
+		LiteralExpr(_, _, _):
+			[]
+		VarExpr(_, _, _):
+			[]
+		VoidExpr(_, _):
+			[]
+		DebugBlockExpr(body, _, _):
+			[body]
+		CooperativeCheckpointExpr(_, _):
+			[]
+		CallExpr(_, callee, args, _, _):
+			[callee] + args
+		BinaryExpr(_, left, right, _, _):
+			[left, right]
+		UnaryExpr(_, value, _, _):
+			[value]
+		LogicalExpr(_, left, right, _, _):
+			[left, right]
+		AssignExpr(_, rhs, _, _):
+			[rhs]
+		CastExpr(value, _, _):
+			[value]
+		BoxExpr(box, _, _):
+			[box.value]
+		UnboxExpr(_, value, _, _):
+			[value]
+		FieldExpr(value, _, _, _):
+			[value]
+		TupleFieldExpr(value, _, _, _):
+			[value]
+		TupleExpr(items, _, _):
+			items
+		TupleConstructExpr(construct, _, _):
+			construct.elements.flat_map(tuple_element_items)
+		VectorExpr(items, _, _):
+			items
+		LambdaExpr(_, _, body, _, _, _):
+			[body]
+		ClosureCreateExpr(_, _, _):
+			[]
+		ListConstructExpr(construct, _, _):
+			construct.elements.flat_map(boxed_storage_value_items)
+		ListAllocExpr(alloc, _, _):
+			[alloc.capacity]
+		ListGetExpr(get, _, _):
+			[get.list, get.index]
+		ListHandoffExpr(handoff, _, _):
+			[handoff.source, handoff.capacity, handoff.body]
+		ListHandoffSetOwnedExpr(set, _, _):
+			[set.list, set.index, set.value.value]
+		ListHandoffSetSourceSlotExpr(slot, _, _):
+			[slot.result, slot.out_index, slot.source, slot.source_index]
+		StringByteReadExpr(read, _, _):
+			[read.source, read.index]
+		StringByteWriteExpr(write, _, _):
+			[write.target, write.index, write.byte]
+		StringByteCopyExpr(copy, _, _):
+			[copy.dst, copy.dst_pos, copy.src, copy.src_pos, copy.len]
+		StringSetLenExpr(set_len, _, _):
+			[set_len.target, set_len.len]
+		TensorLiteralExpr(literal, _, _):
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					raw.elements
+				TensorInlineStructLiteralPayload(inline_struct):
+					inline_struct.elements
+		TensorBoxedLiteralExpr(literal, _, _):
+			literal.elements.flat_map(boxed_storage_value_items)
+		TensorPackedLiteralExpr(literal, _, _):
+			literal.elements
+		TensorRawFillExpr(fill, _, _):
+			[fill.value] + fill.dims
+		TensorRawReadExpr(read, _, _):
+			[read.index]
+		TensorRawWriteExpr(write, _, _):
+			[write.index, write.value]
+		TensorRawViewLetExpr(binding, body, _, _):
+			[binding.source, body]
+		DictExpr(entries, _, _):
+			entries.flat_map(func(entry): [entry.key, entry.value])
+		DictConstructExpr(construct, _, _):
+			construct.entries.flat_map(dict_entry_items)
+		SetAllocExpr(_, _, _):
+			[]
+		ListRetainExpr(retain, _, _):
+			[retain.list, retain.value.value]
+		ListSetExpr(set, _, _):
+			[set.list, set.index, set.value.value]
+		ListSwapExpr(swap, _, _):
+			[swap.list, swap.left_index, swap.right_index]
+		RecordExpr(fields, _, _):
+			fields.map(func(field): field.value)
+		RecordConstructExpr(_, fields, _, _):
+			fields.map(func(field): field.value)
+		UnionConstructExpr(construct, _, _):
+			construct.args.flat_map(boxed_storage_value_items)
+		UnionReuseConstructExpr(construct, _, _):
+			[construct.source] + construct.args.flat_map(boxed_storage_value_items)
+		PreClosureDetachExpr(detached, _, _):
+			[detached]
+		DetachExpr(_, _, _):
+			[]
+		DupExpr(_, _, _, body, _, _):
+			[body]
+		DropExpr(_, _, _, body, _, _):
+			[body]
+		LetExpr(_, _, _, rhs, body):
+			[rhs, body]
+		BorrowLetExpr(_, _, rhs, body):
+			[rhs, body]
+		SeqExpr(first, second):
+			[first, second]
+		WhileExpr(cond, body, _, _):
+			[cond, body]
+		BreakExpr(_, _):
+			[]
+		ContinueExpr(_, _):
+			[]
+		ResourceScopeExpr(scope, _, _):
+			[scope.acquire, scope.body, scope.cleanup]
+		ResourceCleanupExitExpr(cleanup_exit, _, _):
+			cleanup_exit.cleanups
+		TailrecLoopExpr(_, _, body, _):
+			[body]
+		TailrecRecurExpr(args, _, _):
+			args
+		TailrecListSpreadLoopExpr(loop, _):
+			[loop.body]
+		TailrecListSpreadRecurExpr(rebinds, _, _, _):
+			rebinds.map(func(rebind): rebind.value)
+		ForRangeExpr(_, start, end_value, body, _, _):
+			[start, end_value, body]
+		ForChannelExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForListExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForStringExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForDictExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForSetExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForStreamExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		ForTensorExpr(loop, _, _):
+			[loop.iterable, loop.body]
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			[loop.iterable, loop.body] + optional_expr_items(loop.timeout) + [loop.limit]
+		ConcurrentlyLoopExpr(loop, _, _):
+			[loop.iterable, loop.body] + optional_expr_items(loop.timeout) + [loop.limit]
+		PreClosureConcurrentExpr(block, _, _):
+			block.bindings.map(
+				func(binding): binding.rhs,
+			) + [block.body] + optional_expr_items(block.timeout)
+		ConcurrentExpr(block, _, _):
+			block.bindings.map(
+				func(binding): binding.rhs,
+			) + [block.body] + optional_expr_items(block.timeout)
+		SelectExpr(select_expr, _, _):
+			select_expr.flat_map(func(arm): select_arm_kind_items(arm.kind) + [arm.body])
+		RangeExpr(start, end_value, _, _):
+			[start, end_value]
+		RawMatchExpr(scrutinee, cases, _, _):
+			[scrutinee] + cases.map(func(match_case): match_case.body)
+		LiteralMatchExpr(scrutinee, cases, fallback, _, _):
+			[
+				scrutinee,
+			] + cases.map(
+				func(match_case): match_case.body,
+			) + literal_match_fallback_items(fallback)
+		AccessorLiteralMatchExpr(scrutinee, _, match_expr, _, _):
+			[scrutinee] + constructor_literal_match_items(match_expr)
+		LengthMatchExpr(scrutinee, _, match_expr, _, _):
+			[scrutinee] + constructor_length_match_items(match_expr)
+		ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
+			[
+				scrutinee,
+			] + cases.flat_map(
+				func(
+					match_case,
+				): constructor_match_body_items(
+					match_case.body,
+				),
+			) + constructor_match_fallback_items(fallback)
+		IfExpr(cond, then_expr, else_expr, _, _):
+			[cond, then_expr, else_expr]
 
 
 pure func any_core_dict_literal_entry_expr(

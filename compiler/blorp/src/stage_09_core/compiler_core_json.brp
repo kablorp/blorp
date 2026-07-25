@@ -47,6 +47,8 @@ private VOID_TYPE_TAG: String = "void"
 
 private NAMED_TYPE_TAG: String = "named"
 
+private FUNCTION_TYPE_TAG: String = "function"
+
 private STACK_RESULT_TYPE_TAG: String = "stack_result"
 
 private BOXED_RESULT_TYPE_TAG: String = "boxed_result"
@@ -66,6 +68,10 @@ private TENSOR_TYPE_TAG: String = "tensor"
 private TENSOR_STATIC_DIM_TAG: String = "static"
 
 private TENSOR_RUNTIME_DIM_TAG: String = "runtime"
+
+private TENSOR_VARIADIC_DIM_TAG: String = "variadic"
+
+private TENSOR_DIM_OPERATION_TAG: String = "operation"
 
 private TUPLE_TYPE_TAG: String = "tuple"
 
@@ -184,6 +190,8 @@ private LITERAL_EXPR_TAG: String = "literal"
 private VAR_EXPR_TAG: String = "var"
 
 private VOID_EXPR_TAG: String = "void"
+
+private DEBUG_BLOCK_EXPR_TAG: String = "debug_block"
 
 private COOPERATIVE_CHECKPOINT_EXPR_TAG: String = "cooperative_checkpoint"
 
@@ -487,6 +495,8 @@ private TENSOR_RUNTIME_READ_F16_TAG: String = "f16"
 
 private RANGE_EXPR_TAG: String = "range"
 
+private RAW_MATCH_EXPR_TAG: String = "raw_match"
+
 private LITERAL_MATCH_EXPR_TAG: String = "literal_match"
 
 private ACCESSOR_LITERAL_MATCH_EXPR_TAG: String = "accessor_literal_match"
@@ -622,6 +632,7 @@ record CoreVar {
 union CoreType:
 	VoidType
 	NamedType(String, List[CoreType])
+	FunctionType(Bool, List[CoreType], CoreType)
 	StackResultType(CoreType, CoreType)
 	BoxedResultType(CoreType, CoreType)
 	EnumType(String)
@@ -633,9 +644,18 @@ union CoreType:
 	TupleType(List[CoreType])
 
 
+enum CoreDimOp:
+	DimAdd
+	DimSubtract
+	DimMultiply
+	DimDivide
+
+
 union CoreTensorDim:
 	TensorStaticDim(Int)
 	TensorRuntimeDim(String)
+	TensorVariadicDim(String)
+	TensorDimOperation(CoreDimOp, CoreTensorDim, CoreTensorDim)
 
 
 record CoreTensorTypeInfo {
@@ -655,6 +675,21 @@ union CoreLiteral:
 	BoolLiteral(Bool)
 	CharLiteral(Int)
 	StringLiteral(String)
+
+
+-- Source patterns remain explicit until the middle Core match pass compiles
+-- them into decision trees. This is a Core phase type, not a typed-AST
+-- passthrough: source spans and inferred binder types have already served
+-- their purpose by this boundary.
+union CorePattern:
+	WildcardPattern
+	NamePattern(String)
+	LiteralPattern(CoreLiteral)
+	ConstructorPattern(String, List[CorePattern])
+	QualifiedConstructorPattern(String, String, List[CorePattern])
+	TuplePattern(List[CorePattern])
+	ListPattern(List[CorePattern], Option[CorePattern])
+	OrPattern(List[CorePattern])
 
 
 union CoreRuntimeUnionArg:
@@ -935,6 +970,7 @@ union CoreExpr:
 	LiteralExpr(CoreLiteral, CoreType, CoreSourceLoc)
 	VarExpr(CoreVar, CoreType, CoreSourceLoc)
 	VoidExpr(CoreType, CoreSourceLoc)
+	DebugBlockExpr(CoreExpr, CoreType, CoreSourceLoc)
 	CooperativeCheckpointExpr(CoreType, CoreSourceLoc)
 	CallExpr(CoreCallKind, CoreExpr, List[CoreExpr], CoreType, CoreSourceLoc)
 	BinaryExpr(CoreBinaryOp, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
@@ -1009,11 +1045,18 @@ union CoreExpr:
 	PreClosureDetachExpr(CoreExpr, CoreType, CoreSourceLoc)
 	SelectExpr(List[CoreSelectArm], CoreType, CoreSourceLoc)
 	RangeExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+	RawMatchExpr(CoreExpr, List[CoreRawMatchCase], CoreType, CoreSourceLoc)
 	LiteralMatchExpr(CoreExpr, List[CoreLiteralMatchCase], CoreLiteralMatchFallback, CoreType, CoreSourceLoc)
 	AccessorLiteralMatchExpr(CoreExpr, CoreReleasePolicy, CoreConstructorLiteralMatch, CoreType, CoreSourceLoc)
 	LengthMatchExpr(CoreExpr, CoreReleasePolicy, CoreConstructorLengthMatch, CoreType, CoreSourceLoc)
 	ConstructorMatchExpr(CoreExpr, CoreReleasePolicy, List[CoreConstructorMatchCase], CoreConstructorMatchFallback, CoreType, CoreSourceLoc)
 	IfExpr(CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+
+
+record CoreRawMatchCase {
+	pattern: CorePattern,
+	body: CoreExpr
+}
 
 
 pure func core_expr_type(expr: CoreExpr) -> CoreType:
@@ -1023,6 +1066,8 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		VarExpr(variable, typ, loc):
 			typ
 		VoidExpr(typ, loc):
+			typ
+		DebugBlockExpr(body, typ, loc):
 			typ
 		CooperativeCheckpointExpr(typ, loc):
 			typ
@@ -1171,6 +1216,8 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		SelectExpr(select_expr, typ, loc):
 			typ
 		RangeExpr(start, end_value, typ, loc):
+			typ
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			typ
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			typ
@@ -1901,6 +1948,7 @@ record CoreFunction {
 
 record CoreGlobal {
 	name: CoreVar,
+	source_module: Option[String],
 	typ: CoreType,
 	init: CoreExpr,
 	is_mutable: Bool,
@@ -2159,6 +2207,26 @@ private pure func int_field(
 			Err(CoreExpectedIntField(path, field_name))
 
 
+private pure func exact_int_field(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[Int, CoreJsonError]:
+	field ?= required_field(value, path, field_name)
+
+	match field:
+		JsonString(text):
+			match text.parse_int():
+				Some(parsed):
+					Ok(parsed)
+				None:
+					Err(CoreExpectedIntField(path, field_name))
+		JsonNumber(number):
+			Ok(to_int(number))
+		_:
+			Err(CoreExpectedIntField(path, field_name))
+
+
 private pure func number_field(
 	value: JsonValue,
 	path: String,
@@ -2411,6 +2479,18 @@ private pure func core_type_list_to_json(items: List[CoreType]) -> JsonValue:
 	JsonVector(items.map(core_type_to_json))
 
 
+private pure func core_dim_op_name(op: CoreDimOp) -> String:
+	match op:
+		DimAdd:
+			"add"
+		DimSubtract:
+			"subtract"
+		DimMultiply:
+			"multiply"
+		DimDivide:
+			"divide"
+
+
 private pure func core_tensor_dim_to_json(dim: CoreTensorDim) -> JsonValue:
 	match dim:
 		TensorStaticDim(value):
@@ -2422,6 +2502,18 @@ private pure func core_tensor_dim_to_json(dim: CoreTensorDim) -> JsonValue:
 			JsonObject([
 				(KIND_FIELD, JsonString(TENSOR_RUNTIME_DIM_TAG)),
 				("name", JsonString(name)),
+			])
+		TensorVariadicDim(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(TENSOR_VARIADIC_DIM_TAG)),
+				("name", JsonString(name)),
+			])
+		TensorDimOperation(op, left, right):
+			JsonObject([
+				(KIND_FIELD, JsonString(TENSOR_DIM_OPERATION_TAG)),
+				("op", JsonString(core_dim_op_name(op))),
+				("left", core_tensor_dim_to_json(left)),
+				("right", core_tensor_dim_to_json(right)),
 			])
 
 
@@ -2441,6 +2533,13 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				(KIND_FIELD, JsonString(NAMED_TYPE_TAG)),
 				("name", JsonString(name)),
 				("args", core_type_list_to_json(args)),
+			])
+		FunctionType(is_pure, params, return_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(FUNCTION_TYPE_TAG)),
+				("pure", JsonBool(is_pure)),
+				("params", core_type_list_to_json(params)),
+				("return_type", core_type_to_json(return_type)),
 			])
 		StackResultType(ok_type, err_type):
 			JsonObject([
@@ -2524,6 +2623,20 @@ private pure func decode_core_type_list(
 			Ok(result)
 
 
+private pure func parse_core_dim_op(name: String, path: String) -> Result[CoreDimOp, CoreJsonError]:
+	match name:
+		"add":
+			Ok(DimAdd)
+		"subtract":
+			Ok(DimSubtract)
+		"multiply":
+			Ok(DimMultiply)
+		"divide":
+			Ok(DimDivide)
+		_:
+			Err(CoreUnsupportedTag(path, name))
+
+
 private pure func decode_core_tensor_dim_json(
 	value: JsonValue,
 	path: String,
@@ -2536,6 +2649,26 @@ private pure func decode_core_tensor_dim_json(
 	else if tag == TENSOR_RUNTIME_DIM_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(TensorRuntimeDim(name))
+	else if tag == TENSOR_VARIADIC_DIM_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(TensorVariadicDim(name))
+	else if tag == TENSOR_DIM_OPERATION_TAG:
+		op_name ?= string_field(value, path, "op")
+		op ?= parse_core_dim_op(
+			op_name,
+			path_field(path, "op"),
+		)
+		left_json ?= object_field(value, path, "left")
+		left ?= decode_core_tensor_dim_json(
+			left_json,
+			path_field(path, "left"),
+		)
+		right_json ?= object_field(value, path, "right")
+		right ?= decode_core_tensor_dim_json(
+			right_json,
+			path_field(path, "right"),
+		)
+		Ok(TensorDimOperation(op, left, right))
 	else:
 		Err(CoreUnsupportedTag(path, tag))
 
@@ -2602,6 +2735,15 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 		name ?= string_field(value, path, "name")
 		args ?= decode_core_type_list(value, path, "args")
 		Ok(NamedType(name, args))
+	else if tag == FUNCTION_TYPE_TAG:
+		is_pure ?= bool_field(value, path, "pure")
+		params ?= decode_core_type_list(value, path, "params")
+		return_json ?= object_field(value, path, "return_type")
+		return_type ?= decode_core_type_json(
+			return_json,
+			path_field(path, "return_type"),
+		)
+		Ok(FunctionType(is_pure, params, return_type))
 	else if tag == STACK_RESULT_TYPE_TAG:
 		ok_json ?= object_field(value, path, "ok_type")
 		err_json ?= object_field(value, path, "err_type")
@@ -2659,7 +2801,7 @@ pure func core_literal_to_json(literal: CoreLiteral) -> JsonValue:
 		IntLiteral(value):
 			JsonObject([
 				(KIND_FIELD, JsonString(INT_LITERAL_TAG)),
-				("value", json_int(value)),
+				("value", JsonString(value.to_string())),
 			])
 		WideIntLiteral(value):
 			JsonObject([
@@ -2706,7 +2848,7 @@ pure func decode_core_literal_json(
 	tag ?= kind_field(value, path)
 
 	if tag == INT_LITERAL_TAG:
-		n ?= int_field(value, path, "value")
+		n ?= exact_int_field(value, path, "value")
 		Ok(IntLiteral(n))
 	else if tag == WIDE_INT_LITERAL_TAG:
 		text ?= string_field(value, path, "value")
@@ -7937,6 +8079,19 @@ private pure func core_expr_void_to_json(typ: CoreType, loc: CoreSourceLoc) -> J
 	])
 
 
+private pure func core_expr_debug_block_to_json(
+	body: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(DEBUG_BLOCK_EXPR_TAG)),
+		("body", core_expr_to_json(body)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_cooperative_checkpoint_to_json(
 	typ: CoreType,
 	loc: CoreSourceLoc,
@@ -8951,6 +9106,79 @@ private pure func core_expr_range_to_json(
 	])
 
 
+private pure func core_pattern_to_json(pattern: CorePattern) -> JsonValue:
+	match pattern:
+		WildcardPattern:
+			JsonObject([(KIND_FIELD, JsonString("wildcard"))])
+		NamePattern(name):
+			JsonObject([
+				(KIND_FIELD, JsonString("name")),
+				("name", JsonString(name)),
+			])
+		LiteralPattern(literal):
+			JsonObject([
+				(KIND_FIELD, JsonString("literal")),
+				("literal", core_literal_to_json(literal)),
+			])
+		ConstructorPattern(name, args):
+			JsonObject([
+				(KIND_FIELD, JsonString("constructor")),
+				("name", JsonString(name)),
+				("args", JsonVector(args.map(core_pattern_to_json))),
+			])
+		QualifiedConstructorPattern(module_name, name, args):
+			JsonObject([
+				(KIND_FIELD, JsonString("qualified_constructor")),
+				("module", JsonString(module_name)),
+				("name", JsonString(name)),
+				("args", JsonVector(args.map(core_pattern_to_json))),
+			])
+		TuplePattern(items):
+			JsonObject([
+				(KIND_FIELD, JsonString("tuple")),
+				("items", JsonVector(items.map(core_pattern_to_json))),
+			])
+		ListPattern(items, spread):
+			spread_json = match spread:
+				Some(pattern):
+					core_pattern_to_json(pattern)
+				None:
+					JsonNull
+
+			JsonObject([
+				(KIND_FIELD, JsonString("list")),
+				("items", JsonVector(items.map(core_pattern_to_json))),
+				("spread", spread_json),
+			])
+		OrPattern(items):
+			JsonObject([
+				(KIND_FIELD, JsonString("or")),
+				("items", JsonVector(items.map(core_pattern_to_json))),
+			])
+
+
+private pure func core_raw_match_case_to_json(match_case: CoreRawMatchCase) -> JsonValue:
+	JsonObject([
+		("pattern", core_pattern_to_json(match_case.pattern)),
+		("body", core_expr_to_json(match_case.body)),
+	])
+
+
+private pure func core_expr_raw_match_to_json(
+	scrutinee: CoreExpr,
+	cases: List[CoreRawMatchCase],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(RAW_MATCH_EXPR_TAG)),
+		("scrutinee", core_expr_to_json(scrutinee)),
+		("cases", JsonVector(cases.map(core_raw_match_case_to_json))),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_literal_match_to_json(
 	scrutinee: CoreExpr,
 	cases: List[CoreLiteralMatchCase],
@@ -9055,6 +9283,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_var_to_json(variable, typ, loc)
 		VoidExpr(typ, loc):
 			core_expr_void_to_json(typ, loc)
+		DebugBlockExpr(body, typ, loc):
+			core_expr_debug_block_to_json(body, typ, loc)
 		CooperativeCheckpointExpr(typ, loc):
 			core_expr_cooperative_checkpoint_to_json(typ, loc)
 		CallExpr(kind, callee, args, typ, loc):
@@ -9203,6 +9433,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_select_to_json(select_expr, typ, loc)
 		RangeExpr(start, end_value, typ, loc):
 			core_expr_range_to_json(start, end_value, typ, loc)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			core_expr_raw_match_to_json(scrutinee, cases, typ, loc)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			core_expr_literal_match_to_json(scrutinee, cases, fallback, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
@@ -9331,6 +9563,28 @@ private pure func decode_core_expr_void_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(VoidExpr(typ, loc))
+
+
+private pure func decode_core_expr_debug_block_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(DebugBlockExpr(body, typ, loc))
 
 
 private pure func decode_core_expr_cooperative_checkpoint_from_json(
@@ -11088,6 +11342,179 @@ private pure func decode_core_expr_range_from_json(
 	Ok(RangeExpr(start, end_value, typ, loc))
 
 
+private pure func decode_core_pattern_list_json(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CorePattern], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var patterns: List[CorePattern] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			match decode_core_pattern_json(
+				item,
+				path_index(
+					path_field(path, field_name),
+					index,
+				),
+			):
+				Ok(pattern):
+					patterns = patterns.append(pattern)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(patterns)
+
+
+private pure func decode_optional_core_pattern_json(
+	value: JsonValue,
+	path: String,
+) -> Result[Option[CorePattern], CoreJsonError]:
+	match value:
+		JsonNull:
+			Ok(None)
+		_:
+			match decode_core_pattern_json(value, path):
+				Ok(pattern):
+					Ok(Some(pattern))
+				Err(error):
+					Err(error)
+
+
+private pure func decode_core_pattern_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CorePattern, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	match tag:
+		"wildcard":
+			Ok(WildcardPattern)
+		"name":
+			name ?= string_field(value, path, "name")
+			Ok(NamePattern(name))
+		"literal":
+			literal_json ?= object_field(value, path, "literal")
+			literal ?= decode_core_literal_json(
+				literal_json,
+				path_field(path, "literal"),
+			)
+			Ok(LiteralPattern(literal))
+		"constructor":
+			name ?= string_field(value, path, "name")
+			args ?= decode_core_pattern_list_json(value, path, "args")
+			Ok(ConstructorPattern(name, args))
+		"qualified_constructor":
+			module_name ?= string_field(value, path, "module")
+			name ?= string_field(value, path, "name")
+			args ?= decode_core_pattern_list_json(value, path, "args")
+			Ok(QualifiedConstructorPattern(module_name, name, args))
+		"tuple":
+			items ?= decode_core_pattern_list_json(value, path, "items")
+			Ok(TuplePattern(items))
+		"list":
+			items ?= decode_core_pattern_list_json(value, path, "items")
+			spread_json ?= object_field(value, path, "spread")
+			spread ?= decode_optional_core_pattern_json(
+				spread_json,
+				path_field(path, "spread"),
+			)
+
+			Ok(ListPattern(items, spread))
+		"or":
+			items ?= decode_core_pattern_list_json(value, path, "items")
+			Ok(OrPattern(items))
+		_:
+			Err(CoreUnsupportedTag(path, tag))
+
+
+private pure func decode_core_raw_match_cases(
+	value: JsonValue,
+	path: String,
+) -> Result[List[CoreRawMatchCase], CoreJsonError]:
+	items ?= array_field(value, path, "cases")
+	var cases: List[CoreRawMatchCase] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			item_path = path_index(
+				path_field(path, "cases"),
+				index,
+			)
+
+			pattern_result = match object_field(item, item_path, "pattern"):
+				Ok(pattern_json):
+					decode_core_pattern_json(
+						pattern_json,
+						path_field(item_path, "pattern"),
+					)
+				Err(error):
+					Err(error)
+
+			match pattern_result:
+				Ok(pattern):
+					match object_field(item, item_path, "body"):
+						Ok(body_json):
+							match decode_core_expr_json(
+								body_json,
+								path_field(item_path, "body"),
+							):
+								Ok(body):
+									cases = cases.append({
+										pattern = pattern,
+										body = body,
+									})
+								Err(error):
+									failure = Some(error)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(cases)
+
+
+private pure func decode_core_expr_raw_match_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	scrutinee_json ?= object_field(value, path, "scrutinee")
+	scrutinee ?= decode_core_expr_json(
+		scrutinee_json,
+		path_field(path, "scrutinee"),
+	)
+	cases ?= decode_core_raw_match_cases(value, path)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok(RawMatchExpr(scrutinee, cases, typ, loc))
+
+
 private pure func decode_core_expr_literal_match_from_json(
 	value: JsonValue,
 	path: String,
@@ -11254,6 +11681,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_var_from_json(value, path)
 	else if tag == VOID_EXPR_TAG:
 		decode_core_expr_void_from_json(value, path)
+	else if tag == DEBUG_BLOCK_EXPR_TAG:
+		decode_core_expr_debug_block_from_json(value, path)
 	else if tag == COOPERATIVE_CHECKPOINT_EXPR_TAG:
 		decode_core_expr_cooperative_checkpoint_from_json(value, path)
 	else if tag == CALL_EXPR_TAG:
@@ -11402,6 +11831,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_select_from_json(value, path)
 	else if tag == RANGE_EXPR_TAG:
 		decode_core_expr_range_from_json(value, path)
+	else if tag == RAW_MATCH_EXPR_TAG:
+		decode_core_expr_raw_match_from_json(value, path)
 	else if tag == LITERAL_MATCH_EXPR_TAG:
 		decode_core_expr_literal_match_from_json(value, path)
 	else if tag == ACCESSOR_LITERAL_MATCH_EXPR_TAG:
@@ -11862,6 +12293,7 @@ pure func core_global_to_json(global: CoreGlobal) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(GLOBAL_TAG)),
 		("name", core_var_to_json(global.name)),
+		("source_module", option_string_to_json(global.source_module)),
 		("type", core_type_to_json(global.typ)),
 		("init", core_expr_to_json(global.init)),
 		("mutable", JsonBool(global.is_mutable)),
@@ -11881,6 +12313,7 @@ pure func decode_core_global_json(
 		name_json,
 		path_field(path, "name"),
 	)
+	source_module ?= decode_optional_string(value, path, "source_module")
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -11903,6 +12336,7 @@ pure func decode_core_global_json(
 
 	Ok({
 		name = name,
+		source_module = source_module,
 		typ = typ,
 		init = init,
 		is_mutable = is_mutable,
