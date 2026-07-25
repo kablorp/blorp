@@ -526,6 +526,7 @@ record CompilerTypedWithBinding {
 	kind: ParsedWithBindingKind,
 	error_map: Option[CompilerTypedWithErrorMap],
 	cleanup_function: Option[String],
+	resource_loop_item_name: Option[String],
 	span: CompilerSourceSpan
 }
 
@@ -569,7 +570,7 @@ union CompilerTypedExpr:
 	CompilerTypedOpaqueIntoExpr(CompilerType, CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedOpaqueFromExpr(CompilerType, CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedRecordExpr(List[CompilerTypedRecordField], CompilerSourceSpan, CompilerTypedExprInfo)
-	CompilerTypedRecordUpdateExpr(CompilerTypedExpr, List[CompilerTypedRecordField], CompilerSourceSpan, CompilerTypedExprInfo)
+	CompilerTypedRecordUpdateExpr(CompilerTypedExpr, List[CompilerTypedRecordField], List[CompilerFieldDecl], CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedFieldAccessExpr(CompilerTypedExpr, ParsedIdentifier, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedLambdaExpr(Bool, List[CompilerTypedLambdaParam], Option[CompilerType], CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
 	CompilerTypedRangeExpr(CompilerTypedExpr, CompilerTypedExpr, CompilerSourceSpan, CompilerTypedExprInfo)
@@ -1503,7 +1504,7 @@ pure func compiler_typed_expr_info(expr: CompilerTypedExpr) -> CompilerTypedExpr
 			info
 		CompilerTypedRecordExpr(_, _, info):
 			info
-		CompilerTypedRecordUpdateExpr(_, _, _, info):
+		CompilerTypedRecordUpdateExpr(_, _, _, _, info):
 			info
 		CompilerTypedFieldAccessExpr(_, _, _, info):
 			info
@@ -1604,8 +1605,8 @@ private pure func compiler_typed_expr_with_info(
 			CompilerTypedOpaqueFromExpr(source_type, inner, span, info)
 		CompilerTypedRecordExpr(fields, span, _):
 			CompilerTypedRecordExpr(fields, span, info)
-		CompilerTypedRecordUpdateExpr(receiver, fields, span, _):
-			CompilerTypedRecordUpdateExpr(receiver, fields, span, info)
+		CompilerTypedRecordUpdateExpr(receiver, fields, record_fields, span, _):
+			CompilerTypedRecordUpdateExpr(receiver, fields, record_fields, span, info)
 		CompilerTypedFieldAccessExpr(receiver, field, span, _):
 			CompilerTypedFieldAccessExpr(receiver, field, span, info)
 		CompilerTypedLambdaExpr(is_pure, params, return_annotation, body, span, _):
@@ -2300,7 +2301,7 @@ pure func compiler_typed_expr_type_error(expr: CompilerTypedExpr) -> Option[Stri
 					compiler_typed_expr_type_error(inner)
 				CompilerTypedRecordExpr(fields, _, _):
 					compiler_typed_record_fields_type_error(fields)
-				CompilerTypedRecordUpdateExpr(receiver, fields, _, _):
+				CompilerTypedRecordUpdateExpr(receiver, fields, _, _, _):
 					match compiler_typed_expr_type_error(receiver):
 						Some(message):
 							Some(message)
@@ -2590,7 +2591,7 @@ pure func compiler_typed_expr_contains_meta(expr: CompilerTypedExpr) -> Bool:
 				compiler_type_contains_meta(source_type) or compiler_typed_expr_contains_meta(inner)
 			CompilerTypedRecordExpr(fields, _, _):
 				fields.any(compiler_typed_record_field_contains_meta)
-			CompilerTypedRecordUpdateExpr(receiver, fields, _, _):
+			CompilerTypedRecordUpdateExpr(receiver, fields, _, _, _):
 				(
 					compiler_typed_expr_contains_meta(receiver)
 					or fields.any(compiler_typed_record_field_contains_meta)
@@ -3005,6 +3006,7 @@ private pure func compiler_zonk_typed_with_binding(
 		kind = binding.kind,
 		error_map = compiler_zonk_optional_typed_with_error_map(context, binding.error_map),
 		cleanup_function = binding.cleanup_function,
+		resource_loop_item_name = binding.resource_loop_item_name,
 		span = binding.span
 	}
 
@@ -3160,10 +3162,14 @@ pure func compiler_zonk_typed_expr(
 				span,
 				info,
 			)
-		CompilerTypedRecordUpdateExpr(receiver, fields, span, _):
+		CompilerTypedRecordUpdateExpr(receiver, fields, record_fields, span, _):
 			CompilerTypedRecordUpdateExpr(
 				compiler_zonk_typed_expr(context, receiver),
 				fields.map(func(field): compiler_zonk_typed_record_field(context, field)),
+				record_fields.map(func(field): {
+						name = field.name,
+						field_type = compiler_zonk_type(context, field.field_type)
+					}),
 				span,
 				info,
 			)
@@ -3510,7 +3516,7 @@ private pure func compiler_typed_expr_resource_dependency_refs(
 			compiler_typed_expr_resource_dependency_refs(context, inner)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_resource_dependency_refs(context, fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_resource_refs(
 				compiler_typed_expr_resource_dependency_refs(context, base),
 				compiler_typed_record_fields_resource_dependency_refs(context, fields),
@@ -3820,7 +3826,7 @@ pure func compiler_typed_expr_impure_call_names(expr: CompilerTypedExpr) -> List
 			compiler_typed_dict_entries_impure_call_names(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_impure_call_names(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_impure_call_names(
 				compiler_typed_expr_impure_call_names(base),
 				compiler_typed_record_fields_impure_call_names(fields),
@@ -4158,7 +4164,7 @@ pure func compiler_typed_expr_module_assign_names(expr: CompilerTypedExpr) -> Li
 			compiler_typed_dict_entries_module_assign_names(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_module_assign_names(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_module_assign_names(
 				compiler_typed_expr_module_assign_names(base),
 				compiler_typed_record_fields_module_assign_names(fields),
@@ -4479,7 +4485,7 @@ pure func compiler_typed_expr_startup_call_names(expr: CompilerTypedExpr) -> Lis
 			compiler_typed_dict_entries_startup_call_names(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_startup_call_names(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_startup_call_names(
 				compiler_typed_expr_startup_call_names(base),
 				compiler_typed_record_fields_startup_call_names(fields),
@@ -4742,7 +4748,7 @@ pure func compiler_typed_expr_has_startup_subscript(expr: CompilerTypedExpr) -> 
 			compiler_typed_dict_entries_have_startup_subscript(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_have_startup_subscript(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			(
 				compiler_typed_expr_has_startup_subscript(base)
 				or compiler_typed_record_fields_have_startup_subscript(fields)
@@ -5119,7 +5125,7 @@ private pure func compiler_typed_expr_has_non_tail_recursive_call_inner(
 			compiler_typed_dict_entries_have_non_tail_recursive_call(entries, function_name)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_have_non_tail_recursive_call(fields, function_name)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			(
 				compiler_typed_expr_has_non_tail_recursive_call_inner(base, function_name, False)
 				or compiler_typed_record_fields_have_non_tail_recursive_call(fields, function_name)
@@ -5470,7 +5476,7 @@ pure func compiler_typed_expr_pure_lambda_impure_call_names(
 			compiler_typed_dict_entries_pure_lambda_impure_call_names(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_pure_lambda_impure_call_names(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_pure_lambda_impure_call_names(
 				compiler_typed_expr_pure_lambda_impure_call_names(base),
 				compiler_typed_record_fields_pure_lambda_impure_call_names(fields),
@@ -5743,7 +5749,7 @@ pure func compiler_typed_expr_debug_block_impure_call_names(
 			compiler_typed_dict_entries_debug_block_impure_call_names(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_debug_block_impure_call_names(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			compiler_append_impure_call_names(
 				compiler_typed_expr_debug_block_impure_call_names(base),
 				compiler_typed_record_fields_debug_block_impure_call_names(fields),
@@ -5882,7 +5888,7 @@ private pure func compiler_typed_expr_has_assignment_inside_debug_block(
 			compiler_typed_dict_entries_have_assignment_inside_debug_block(entries)
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_fields_have_assignment_inside_debug_block(fields)
-		CompilerTypedRecordUpdateExpr(base, fields, _, _):
+		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
 			(
 				compiler_typed_expr_has_assignment_inside_debug_block(base)
 				or compiler_typed_record_fields_have_assignment_inside_debug_block(fields)
@@ -6237,14 +6243,6 @@ private pure func compiler_typed_with_binding_has_debug_block_assignment(
 				False
 
 
-pure func compiler_typed_expr_var_initializer(expr: CompilerTypedExpr) -> Option[CompilerTypedExpr]:
-	match expr:
-		CompilerTypedVarDeclExpr(payload, _):
-			Some(payload.initializer)
-		_:
-			None
-
-
 pure func compiler_typed_expr_var_initializer_widening(
 	expr: CompilerTypedExpr,
 ) -> CompilerTypeWideningDecision:
@@ -6379,7 +6377,7 @@ pure func compiler_typed_expr_record_field_widening(
 	match expr:
 		CompilerTypedRecordExpr(fields, _, _):
 			compiler_typed_record_field_widening(fields, field_name)
-		CompilerTypedRecordUpdateExpr(_, fields, _, _):
+		CompilerTypedRecordUpdateExpr(_, fields, _, _, _):
 			compiler_typed_record_field_widening(fields, field_name)
 		_:
 			CompilerTypeKeep(compiler_type_void())
@@ -15445,6 +15443,7 @@ private pure func compiler_infer_record_update_expr(
 					typed = CompilerTypedRecordUpdateExpr(
 						base_result.expr,
 						fields_result.fields,
+						expected_fields,
 						span,
 						compiler_inferred_info(result_context, base_type),
 					)
@@ -15462,6 +15461,7 @@ private pure func compiler_infer_record_update_expr(
 					typed = CompilerTypedRecordUpdateExpr(
 						base_result.expr,
 						fields_result.fields,
+						[],
 						span,
 						compiler_inferred_info(result_context, compiler_type_void()),
 					)
@@ -15476,6 +15476,7 @@ private pure func compiler_infer_record_update_expr(
 			typed = CompilerTypedRecordUpdateExpr(
 				base_result.expr,
 				fields_result.fields,
+				[],
 				span,
 				compiler_inferred_info(result_context, compiler_type_void()),
 			)
@@ -19787,6 +19788,68 @@ private pure func compiler_for_name_binding_refinement(
 			compiler_unrefined_binding()
 
 
+private pure func compiler_resource_source_parts(
+	typ: CompilerType,
+) -> Option[(CompilerType, CompilerType)]:
+	match typ:
+		CompilerNamedType(name, args):
+			if compiler_is_resource_source_type_name(name):
+				match args:
+					[resource_type, error_type]:
+						Some((compiler_type_copy(resource_type), compiler_type_copy(error_type)))
+					_:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func compiler_resource_loop_item_identifier(
+	label: String,
+	span: CompilerSourceSpan,
+) -> ParsedIdentifier:
+	{
+		text = "__resource_" + label + "_" + span.start_line.to_string() + "_" + span.start_column.to_string(),
+		span = span
+	}
+
+
+private pure func compiler_scope_resource_loop_body(
+	context: CompilerInferContext,
+	name: ParsedIdentifier,
+	item_name: ParsedIdentifier,
+	resource_type: CompilerType,
+	body: CompilerTypedExpr,
+	span: CompilerSourceSpan,
+) -> CompilerTypedExpr:
+	resource_info = compiler_inferred_info(context, resource_type)
+	void_info = compiler_inferred_info(context, compiler_type_void())
+	item_value = CompilerTypedNameExpr(item_name, resource_info)
+
+	discarded_body = if compiler_named_value_type_is(compiler_typed_expr_value_type(body), "Void"):
+		body
+	else:
+		CompilerTypedBlockExpr(
+			[body, CompilerTypedVoidExpr(span, void_info)],
+			span,
+			void_info,
+		)
+
+	binding: CompilerTypedWithBinding = {
+		name = name,
+		annotation = None,
+		value = item_value,
+		kind = ParsedWithPlainBinding,
+		error_map = None,
+		cleanup_function = compiler_with_cleanup_function(context, resource_type),
+		resource_loop_item_name = Some(item_name.text),
+		span = span
+	}
+
+	CompilerTypedWithExpr(binding, discarded_body, span, void_info)
+
+
 private pure func compiler_infer_for_expr(
 	context: CompilerInferContext,
 	binder: ParsedForBinder,
@@ -19861,11 +19924,29 @@ private pure func compiler_infer_for_expr(
 			outer_env = compiler_env_pop_scope(body_result.context.state.env)
 			outer_state = compiler_typecheck_state_with_env(body_result.context.state, outer_env)
 			result_context = compiler_infer_context_with_state(context, outer_state)
+
+			(lowered_binder, lowered_body) = match compiler_resource_source_parts(iter_type):
+				Some((resource_type, _)):
+					item_name = compiler_resource_loop_item_identifier("item", span)
+					(
+						ParsedForNameBinder(item_name),
+						compiler_scope_resource_loop_body(
+							body_result.context,
+							name,
+							item_name,
+							resource_type,
+							body_result.expr,
+							span,
+						),
+					)
+				None:
+					(binder, body_result.expr)
+
 			typed = CompilerTypedForExpr(
-				binder,
+				lowered_binder,
 				iter_result.expr,
 				loop_view,
-				body_result.expr,
+				lowered_body,
 				span,
 				compiler_inferred_info(result_context, compiler_type_void()),
 			)
@@ -21822,6 +21903,7 @@ private pure func compiler_typed_with_binding(
 		kind = binding.kind,
 		error_map = error_map,
 		cleanup_function = cleanup_function,
+		resource_loop_item_name = None,
 		span = binding.span
 	}
 
@@ -22205,11 +22287,29 @@ private pure func compiler_infer_concurrent_for_expr(
 		body,
 	)
 	result_context = compiler_infer_context_with_state(context, body_result.context.state)
+
+	(lowered_name, lowered_body) = match compiler_resource_source_parts(iterable_type):
+		Some((resource_type, _)):
+			item_name = compiler_resource_loop_item_identifier("concurrent_item", span)
+			(
+				item_name,
+				compiler_scope_resource_loop_body(
+					body_result.context,
+					name,
+					item_name,
+					resource_type,
+					body_result.expr,
+					span,
+				),
+			)
+		None:
+			(name, body_result.expr)
+
 	typed = CompilerTypedConcurrentForExpr(
-		name,
+		lowered_name,
 		iterable_result.expr,
 		params_result.params,
-		body_result.expr,
+		lowered_body,
 		span,
 		compiler_inferred_info(result_context, compiler_type_void()),
 	)

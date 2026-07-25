@@ -572,7 +572,8 @@ measures frontend graph counts.
    already loaded frontend graph.
 3. Lexing, parsing, module loading, graph finalization, and graph typechecking
    remain one contiguous Blorp operation.
-4. One typed semantic-middle request crosses the transitional OCaml boundary.
+4. Blorp prepares Core once and sends one semantic-middle request across the
+   transitional OCaml boundary.
 5. The Blorp backend emits C; the command compiles and executes the harness.
 
 **Implementation:**
@@ -590,7 +591,7 @@ measures frontend graph counts.
 - Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
   then delete the superseded generation and bridge entry points once no
   production caller remains.
-- Preserve one bridge: the typed semantic-middle request. Do not introduce a
+- Preserve one bridge: the prepared-Core semantic-middle request. Do not introduce a
   test-only parser bridge or a second graph protocol.
 
 **Tests:**

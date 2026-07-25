@@ -147,10 +147,9 @@ val compile_legacy_direct_source :
     non-trivial cost on large programs); enable it when debugging
     pipeline drift or before risky refactors.
 
-    This direct-source API is a legacy/tooling route. Production source
-    commands should use [compile_preloaded_graph_with_blorp_bridge], which
-    consumes the single Blorp frontend graph and does not return to OCaml
-    parsing/typechecking. Keep new source-command work off this entrypoint. *)
+    This direct-source API is a legacy/tooling route. Normal Blorp CLI source
+    commands prepare Core entirely in Blorp and call the semantic-middle worker
+    directly. Keep new source-command work off this entrypoint. *)
 
 val compile_preloaded_graph_with_blorp_bridge :
   ?debug:bool ->
@@ -170,14 +169,9 @@ val compile_preloaded_graph_with_blorp_bridge :
   preloaded_module_graph:Modules.preloaded_module_graph ->
   unit ->
   (compile_outcome, Ast.compiler_error list) result
-(** Compile through the Blorp-owned source/typecheck frontier.
-
-    This consumes a Blorp frontend module graph, obtains a decoded Blorp
-    typed-program artifact with CTFE already evaluated, populates dependency
-    typed-module caches, and then enters the Core/codegen handoff. Production
-    source-command compilation uses this path. The explicitly legacy direct
-    source API remains for the REPL and other classified tooling until those
-    callers are migrated to the single frontend graph handoff. *)
+(** Compatibility compilation through a Blorp frontend graph followed by
+    OCaml typed-AST lowering. The pinned-bootstrap wrapper and selected
+    in-memory tests still use this path; normal CLI source commands do not. *)
 
 val compile_in_memory_source_with_blorp_bridge :
   ?debug:bool ->

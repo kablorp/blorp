@@ -1,15 +1,14 @@
--- Typed protocol for the one temporary OCaml semantic-middle worker.
+-- Prepared-Core protocol for the one temporary OCaml semantic-middle worker.
 --
 -- Blorp owns the frontend and backend around this boundary. The worker accepts
--- post-CTFE typed programs and returns pre-DCE Core. CLI arguments, source
+-- a lowered, flattened, layout-annotated Core graph and returns pre-DCE Core. CLI arguments, source
 -- discovery, artifact I/O, and process execution do not belong in this shape.
 import:
-	../stage_06_typecheck/compiler_typecheck_decl: CompilerTypedProgram
-	../stage_06_typecheck/compiler_typed_ast_json: compiler_typed_program_to_json
 	compiler_core_json:
 		CoreJsonError,
 		CoreProgram,
 		core_json_error_to_string,
+		core_program_to_json,
 		decode_core_program_json,
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
@@ -19,13 +18,13 @@ import:
 		get_field,
 
 
-SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 1
+SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 2
 
 SEMANTIC_MIDDLE_DOMAIN: String = "compiler_semantic_middle"
 
 private SEMANTIC_MIDDLE_REQUEST_KIND: String = "compile_pre_dce"
 
-private SEMANTIC_MIDDLE_TYPED_PHASE: String = "post_ctfe"
+private SEMANTIC_MIDDLE_CORE_PHASE: String = "prepared"
 
 
 enum SemanticMiddleStage:
@@ -43,7 +42,7 @@ enum SemanticMiddleStage:
 
 
 enum SemanticMiddleCapability:
-	PostCtfeTypedCapability
+	PreparedCoreCapability
 	PreDceCoreCapability
 	RenderedStageObservationsCapability
 
@@ -55,17 +54,19 @@ record SemanticMiddleImportBinding {
 }
 
 
-record SemanticMiddleTypedUnit {
-	path: String,
+record SemanticMiddleModuleImports {
 	module_name: String,
-	typed_program: CompilerTypedProgram,
 	import_bindings: List[SemanticMiddleImportBinding]
 }
 
 
 record SemanticMiddleRequest {
-	target: SemanticMiddleTypedUnit,
-	modules: List[SemanticMiddleTypedUnit],
+	target_path: String,
+	target_module_name: String,
+	core: CoreProgram,
+	next_def_id: Int,
+	import_bindings: List[SemanticMiddleImportBinding],
+	module_imports: List[SemanticMiddleModuleImports],
 	debug: Bool,
 	require_main: Bool,
 	check_invariants: Bool,
@@ -109,9 +110,7 @@ union SemanticMiddleProtocolError:
 	SemanticMiddleInvalidCore(CoreJsonError)
 
 
-pure func semantic_middle_protocol_error_message(
-	error: SemanticMiddleProtocolError,
-) -> String:
+pure func semantic_middle_protocol_error_message(error: SemanticMiddleProtocolError) -> String:
 	match error:
 		SemanticMiddleMissingField(name):
 			"semantic worker response is missing field `${name}`"
@@ -187,12 +186,10 @@ pure func parse_semantic_middle_stage(name: String) -> Option[SemanticMiddleStag
 			None
 
 
-pure func semantic_middle_capability_name(
-	capability: SemanticMiddleCapability,
-) -> String:
+pure func semantic_middle_capability_name(capability: SemanticMiddleCapability) -> String:
 	match capability:
-		PostCtfeTypedCapability:
-			"typed_ast_post_ctfe"
+		PreparedCoreCapability:
+			"core_pre_middle"
 		PreDceCoreCapability:
 			"core_pre_dce"
 		RenderedStageObservationsCapability:
@@ -214,12 +211,10 @@ private pure func semantic_middle_capabilities_include(
 	found
 
 
-pure func parse_semantic_middle_capability(
-	name: String,
-) -> Option[SemanticMiddleCapability]:
+pure func parse_semantic_middle_capability(name: String) -> Option[SemanticMiddleCapability]:
 	match name:
-		"typed_ast_post_ctfe":
-			Some(PostCtfeTypedCapability)
+		"core_pre_middle":
+			Some(PreparedCoreCapability)
 		"core_pre_dce":
 			Some(PreDceCoreCapability)
 		"rendered_stage_observations":
@@ -254,16 +249,16 @@ private pure func semantic_middle_import_binding_to_json(
 	])
 
 
-private pure func semantic_middle_typed_unit_to_json(
-	unit: SemanticMiddleTypedUnit,
+private pure func semantic_middle_module_imports_to_json(
+	module_imports: SemanticMiddleModuleImports,
 ) -> JsonValue:
 	JsonObject([
-		("path", JsonString(unit.path)),
-		("module", JsonString(unit.module_name)),
-		("typed_program", compiler_typed_program_to_json(unit.typed_program)),
+		("module", JsonString(module_imports.module_name)),
 		(
 			"import_bindings",
-			JsonVector(unit.import_bindings.map(semantic_middle_import_binding_to_json)),
+			JsonVector(
+				module_imports.import_bindings.map(semantic_middle_import_binding_to_json),
+			),
 		),
 	])
 
@@ -273,30 +268,28 @@ pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> Jso
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString(SEMANTIC_MIDDLE_REQUEST_KIND)),
-		("typed_phase", JsonString(SEMANTIC_MIDDLE_TYPED_PHASE)),
-		("target", semantic_middle_typed_unit_to_json(request.target)),
-		("modules", JsonVector(request.modules.map(semantic_middle_typed_unit_to_json))),
+		("core_phase", JsonString(SEMANTIC_MIDDLE_CORE_PHASE)),
+		("target_path", JsonString(request.target_path)),
+		("target_module", JsonString(request.target_module_name)),
+		("core", core_program_to_json(request.core)),
+		("next_def_id", JsonNumber(to_float(request.next_def_id))),
+		(
+			"import_bindings",
+			JsonVector(request.import_bindings.map(semantic_middle_import_binding_to_json)),
+		),
+		(
+			"module_imports",
+			JsonVector(request.module_imports.map(semantic_middle_module_imports_to_json)),
+		),
 		("debug", JsonBool(request.debug)),
 		("require_main", JsonBool(request.require_main)),
 		("check_invariants", JsonBool(request.check_invariants)),
-		(
-			"required_capabilities",
-			JsonVector(
-				request.required_capabilities.map(
-					func(capability): JsonString(
-						semantic_middle_capability_name(capability),
-					),
-				),
-			),
-		),
-		(
-			"observations",
-			JsonVector(
-				request.observations.map(
-					func(stage): JsonString(semantic_middle_stage_name(stage)),
-				),
-			),
-		),
+		("required_capabilities", JsonVector(request.required_capabilities.map(
+				func(capability): JsonString(semantic_middle_capability_name(capability)),
+			))),
+		("observations", JsonVector(request.observations.map(
+				func(stage): JsonString(semantic_middle_stage_name(stage)),
+			))),
 		("stop_after", optional_stage_to_json(request.stop_after)),
 	])
 
@@ -377,9 +370,9 @@ private pure func decode_semantic_middle_capability(
 ) -> Result[SemanticMiddleCapability, SemanticMiddleProtocolError]:
 	match as_string(value):
 		Some(name):
-			parse_semantic_middle_capability(name).to_result(
-				SemanticMiddleUnsupportedCapability(name),
-			)
+			parse_semantic_middle_capability(
+				name,
+			).to_result(SemanticMiddleUnsupportedCapability(name))
 		None:
 			Err(SemanticMiddleExpectedField("capabilities", "an array of strings"))
 
@@ -391,9 +384,9 @@ private pure func decode_semantic_middle_capabilities_at(
 	if index >= items.length():
 		Ok([])
 	else:
-		item ?= items.get(index).to_result(
-			SemanticMiddleExpectedField("capabilities", "an array item"),
-		)
+		item ?= items
+			.get(index)
+			.to_result(SemanticMiddleExpectedField("capabilities", "an array item"))
 		capability ?= decode_semantic_middle_capability(item)
 		rest ?= decode_semantic_middle_capabilities_at(items, index + 1)
 		Ok([capability].concat(rest))
@@ -405,8 +398,8 @@ private pure func decode_semantic_middle_capabilities(
 	items ?= array_field(value, "capabilities")
 	capabilities ?= decode_semantic_middle_capabilities_at(items, 0)
 
-	if not semantic_middle_capabilities_include(capabilities, PostCtfeTypedCapability):
-		Err(SemanticMiddleMissingCapability("typed_ast_post_ctfe"))
+	if not semantic_middle_capabilities_include(capabilities, PreparedCoreCapability):
+		Err(SemanticMiddleMissingCapability("core_pre_middle"))
 	else if not semantic_middle_capabilities_include(capabilities, PreDceCoreCapability):
 		Err(SemanticMiddleMissingCapability("core_pre_dce"))
 	else if not semantic_middle_capabilities_include(
@@ -424,7 +417,10 @@ private pure func decode_semantic_middle_observation(
 	stage_name ?= string_field(value, "stage")
 	stage ?= decode_semantic_middle_stage(stage_name)
 	rendered ?= string_field(value, "rendered")
-	Ok({stage = stage, rendered = rendered})
+	Ok({
+		stage = stage,
+		rendered = rendered,
+	})
 
 
 private pure func decode_semantic_middle_observations_at(
@@ -434,9 +430,9 @@ private pure func decode_semantic_middle_observations_at(
 	if index >= items.length():
 		Ok([])
 	else:
-		item ?= items.get(index).to_result(
-			SemanticMiddleExpectedField("observations", "an array item"),
-		)
+		item ?= items
+			.get(index)
+			.to_result(SemanticMiddleExpectedField("observations", "an array item"))
 		observation ?= decode_semantic_middle_observation(item)
 		rest ?= decode_semantic_middle_observations_at(items, index + 1)
 		Ok([observation].concat(rest))
@@ -476,9 +472,9 @@ private pure func decode_semantic_middle_diagnostics_at(
 	if index >= items.length():
 		Ok([])
 	else:
-		item ?= items.get(index).to_result(
-			SemanticMiddleExpectedField("diagnostics", "an array item"),
-		)
+		item ?= items
+			.get(index)
+			.to_result(SemanticMiddleExpectedField("diagnostics", "an array item"))
 		diagnostic ?= decode_semantic_middle_diagnostic(item)
 		rest ?= decode_semantic_middle_diagnostics_at(items, index + 1)
 		Ok([diagnostic].concat(rest))

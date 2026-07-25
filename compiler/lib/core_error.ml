@@ -14,7 +14,7 @@
         (Stage Core_stage.Lower)
         expr.expr_loc
         ~hint:"every expression must be typed before lowering — \
-               run Infer.infer before Core_lower.lower_typed_expr"
+               run inference before entering Core lowering"
         "expression missing type"
     ]}
 

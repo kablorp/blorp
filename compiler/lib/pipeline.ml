@@ -1016,8 +1016,8 @@ let compile_loaded_program ~source_kind ?(debug = false)
           ()
 
 (** Legacy direct-source compile route for callers that still pass raw source.
-    Normal source commands use [compile_preloaded_graph_with_blorp_bridge] so
-    the Blorp frontend graph owns parse/module/typecheck.
+    Normal Blorp CLI source commands prepare Core and call the semantic-middle
+    worker without entering this module's typed-AST lowering path.
 
     Returns either the compiled result or a list of errors.
 

@@ -4,18 +4,29 @@
 import:
 	../stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedModule
 	../stage_06_typecheck/compiler_typecheck_state: CompilerImportBinding
+	../stage_06_typecheck/compiler_typed_ast_json: compiler_typed_program_to_json
+	../stage_08_core_lower/compiler_core_graph_prepare:
+		CompilerCoreGraphUnit,
+		compiler_core_graph_prepare_error_to_string,
+		prepare_core_graph,
 	../stage_09_core/compiler_semantic_worker_protocol:
 		SemanticMiddleCapability(
-			PostCtfeTypedCapability,
+			PreparedCoreCapability,
 			PreDceCoreCapability,
 			RenderedStageObservationsCapability,
 		),
 		SemanticMiddleImportBinding,
+		SemanticMiddleModuleImports,
 		SemanticMiddleRequest,
 		SemanticMiddleStage,
-		SemanticMiddleTypedUnit,
 	compiler_cli_plan: CliFrontendModuleGraph
 	compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
+
+
+record CompiledFrontendGraph {
+	request: SemanticMiddleRequest,
+	typed_program_json: String
+}
 
 
 private pure func semantic_import_binding(
@@ -28,12 +39,19 @@ private pure func semantic_import_binding(
 	}
 
 
-private pure func semantic_typed_unit(module: CompilerTypecheckedModule) -> SemanticMiddleTypedUnit:
+private pure func core_graph_unit(module: CompilerTypecheckedModule) -> CompilerCoreGraphUnit:
 	{
-		path = module.path,
 		module_name = module.module_name,
-		typed_program = module.typed_program,
-		import_bindings = module.import_bindings.map(semantic_import_binding)
+		typed_program = module.typed_program
+	}
+
+
+private pure func semantic_module_imports(
+	module: CompilerTypecheckedModule,
+) -> SemanticMiddleModuleImports:
+	{
+		module_name = module.module_name,
+		import_bindings = module.import_bindings.map(semantic_import_binding),
 	}
 
 
@@ -44,7 +62,7 @@ pure func compile_frontend_graph(
 	check_invariants: Bool,
 	observations: List[SemanticMiddleStage],
 	stop_after: Option[SemanticMiddleStage],
-) -> Result[SemanticMiddleRequest, List[String]]:
+) -> Result[CompiledFrontendGraph, List[String]]:
 	match graph.roots:
 		[root]:
 			typechecked = typecheck_frontend_root(graph, root, debug_mode)
@@ -53,19 +71,44 @@ pure func compile_frontend_graph(
 			if errors.length() != 0:
 				Err(errors)
 			else:
-				Ok({
-					target = semantic_typed_unit(typechecked.target),
-					modules = typechecked.modules.map(semantic_typed_unit),
+				prepared = prepare_core_graph(
+					typechecked.target.typed_program,
+					typechecked.modules.map(core_graph_unit),
+					typechecked.next_def_id,
+				)
+
+				prepared_graph ?= match prepared:
+					Ok(graph):
+						Ok(graph)
+					Err(error):
+						Err([compiler_core_graph_prepare_error_to_string(error)])
+
+				request: SemanticMiddleRequest = {
+					target_path = typechecked.target.path,
+					target_module_name = typechecked.target.module_name,
+					core = prepared_graph.program,
+					next_def_id = prepared_graph.next_def_id,
+					import_bindings = typechecked.target.import_bindings.map(
+						semantic_import_binding,
+					),
+					module_imports = typechecked.modules.map(semantic_module_imports),
 					debug = debug_mode,
 					require_main = require_main,
 					check_invariants = check_invariants,
 					required_capabilities = [
-						PostCtfeTypedCapability,
+						PreparedCoreCapability,
 						PreDceCoreCapability,
 						RenderedStageObservationsCapability,
 					],
 					observations = observations,
 					stop_after = stop_after,
+				}
+
+				Ok({
+					request = request,
+					typed_program_json = compiler_typed_program_to_json(
+						typechecked.target.typed_program,
+					).to_string(),
 				})
 		_:
 			Err(["source compilation requires exactly one root module"])

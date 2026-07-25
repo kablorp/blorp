@@ -72,6 +72,7 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
 			DictExpr,
@@ -109,6 +110,7 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
+			RawMatchExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -161,6 +163,7 @@ import:
 		CoreParam,
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
+		CoreRawMatchCase,
 		CoreRecordFieldValue,
 		CoreReleasePolicy,
 		CoreSelectArm,
@@ -183,6 +186,7 @@ import:
 		CoreType,
 		CoreUnionDecl,
 		CoreVar,
+	compiler_core_traverse: core_pattern_bound_names
 
 
 LAMBDA_NAME_PREFIX: String = "_blorp_clambda_"
@@ -196,8 +200,6 @@ MANGLED_DEF_ID_PREFIX: String = "__def_"
 STATIC_CLOSURE_PREFIX: String = "__sc_"
 
 CLOSURE_TYPE_NAME: String = "Closure"
-
-VOID_TYPE_NAME: String = "Void"
 
 VOID_TYPE: CoreType = VoidType
 
@@ -321,6 +323,12 @@ record ConvertedDictLiteralEntries {
 record ConvertedLiteralMatchCases {
 	state: ClosureState,
 	cases: List[CoreLiteralMatchCase]
+}
+
+
+record ConvertedRawMatchCases {
+	state: ClosureState,
+	cases: List[CoreRawMatchCase]
 }
 
 
@@ -820,6 +828,8 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 			max_var_def_id(current, variable)
 		VoidExpr(typ, loc):
 			current
+		DebugBlockExpr(body, typ, loc):
+			max_expr_def_id(current, body)
 		CooperativeCheckpointExpr(typ, loc):
 			current
 		CallExpr(kind, callee, args, typ, loc):
@@ -1095,6 +1105,13 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 			var result: Int = max_expr_def_id(current, scrutinee)
 			result = max_literal_match_cases_def_id(result, cases)
 			max_literal_match_fallback_def_id(result, fallback)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			var result: Int = max_expr_def_id(current, scrutinee)
+
+			for case in cases:
+				result = max_expr_def_id(result, case.body)
+
+			result
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			var result: Int = max_expr_def_id(current, scrutinee)
 			max_constructor_literal_match_def_id(result, match_expr)
@@ -1559,6 +1576,8 @@ private pure func free_vars_expr(
 			[]
 		VoidExpr(typ, loc):
 			[]
+		DebugBlockExpr(body, typ, loc):
+			free_vars_expr(state, bound, body)
 		CooperativeCheckpointExpr(typ, loc):
 			[]
 		CallExpr(kind, callee, args, typ, loc):
@@ -2043,6 +2062,19 @@ private pure func free_vars_expr(
 				result,
 				free_vars_literal_match_fallback(state, bound, fallback),
 			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
+
+			for case in cases:
+				case_bound: List[String] = bound
+					.concat(core_pattern_bound_names(case.pattern))
+					.unique()
+				result = merge_free_vars(
+					result,
+					free_vars_expr(state, case_bound, case.body),
+				)
+
+			result
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			var result: List[FreeVar] = free_vars_expr(state, bound, scrutinee)
 			merge_free_vars(
@@ -2216,6 +2248,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		VoidExpr(typ, loc):
 			typ
+		DebugBlockExpr(body, typ, loc):
+			typ
 		CooperativeCheckpointExpr(typ, loc):
 			typ
 		CallExpr(kind, callee, args, typ, loc):
@@ -2370,6 +2404,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			typ
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			typ
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, default_body, typ, loc):
 			typ
 		IfExpr(cond, then_expr, else_expr, typ, loc):
@@ -2440,6 +2476,8 @@ private pure func expr_is_var_ref(expr: CoreExpr, variable: CoreVar) -> Bool:
 		LiteralExpr(literal, typ, loc):
 			False
 		VoidExpr(typ, loc):
+			False
+		DebugBlockExpr(body, typ, loc):
 			False
 		CooperativeCheckpointExpr(typ, loc):
 			False
@@ -2594,6 +2632,8 @@ private pure func expr_is_var_ref(expr: CoreExpr, variable: CoreVar) -> Bool:
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			False
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		RawMatchExpr(scrutinee, cases, typ, loc):
 			False
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			False
@@ -2804,6 +2844,8 @@ private pure func core_type_is_void(typ: CoreType) -> Bool:
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
+			False
+		FunctionType(_, _, _):
 			False
 		EnumType(name):
 			False
@@ -3142,6 +3184,8 @@ private pure func sequence_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bo
 
 private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
+		DebugBlockExpr(body, typ, loc):
+			expr_consumes_var(body, variable)
 		CallExpr(kind, callee, args, typ, loc):
 			call_consumes_var(kind, args, variable) or exprs_consume_var(args, variable)
 		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
@@ -3342,6 +3386,16 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 				or literal_match_cases_consume_var(cases, variable)
 				or literal_match_fallback_consumes_var(fallback, variable)
 			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			var found: Bool = expr_consumes_var(scrutinee, variable)
+
+			for case in cases:
+				if not found and not core_pattern_bound_names(case.pattern).contains(variable.name):
+					found = expr_consumes_var(case.body, variable)
+				else:
+					void
+
+			found
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			(
 				expr_consumes_var(scrutinee, variable)
@@ -4544,6 +4598,48 @@ private pure func convert_literal_match_expr(
 	}
 
 
+private pure func convert_raw_match_cases(
+	state: ClosureState,
+	bound: List[String],
+	cases: List[CoreRawMatchCase],
+) -> ConvertedRawMatchCases:
+	var current: ClosureState = state
+	var converted_cases: List[CoreRawMatchCase] = []
+
+	for case in cases:
+		case_bound: List[String] = bound
+			.concat(core_pattern_bound_names(case.pattern))
+			.unique()
+		converted: ConvertedExpr = convert_expr(current, case_bound, case.body)
+		current = converted.state
+		converted_cases = converted_cases.append({ case | body = converted.expr })
+
+	{
+		state = current,
+		cases = converted_cases
+	}
+
+
+private pure func convert_raw_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	cases: List[CoreRawMatchCase],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	cases_converted: ConvertedRawMatchCases = convert_raw_match_cases(
+		scrutinee_converted.state,
+		bound,
+		cases,
+	)
+	{
+		state = cases_converted.state,
+		expr = RawMatchExpr(scrutinee_converted.expr, cases_converted.cases, typ, loc)
+	}
+
+
 private pure func convert_accessor_literal_match_expr(
 	state: ClosureState,
 	bound: List[String],
@@ -4672,6 +4768,8 @@ private pure func convert_expr(
 			convert_borrow_let_expr(state, bound, variable, var_type, rhs, body)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			convert_literal_match_expr(state, bound, scrutinee, cases, fallback, typ, loc)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			convert_raw_match_expr(state, bound, scrutinee, cases, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			convert_accessor_literal_match_expr(
 				state,
@@ -4718,6 +4816,12 @@ private pure func convert_non_spine_expr(
 			{
 				state = state,
 				expr = expr
+			}
+		DebugBlockExpr(body, typ, loc):
+			converted: ConvertedExpr = convert_expr(state, bound, body)
+			{
+				state = converted.state,
+				expr = DebugBlockExpr(converted.expr, typ, loc)
 			}
 		CooperativeCheckpointExpr(typ, loc):
 			{
@@ -5729,6 +5833,8 @@ private pure func convert_non_spine_expr(
 					loc,
 				)
 			}
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			convert_raw_match_expr(state, bound, scrutinee, cases, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
 			match_converted: ConvertedConstructorLiteralMatch = convert_constructor_literal_match(
