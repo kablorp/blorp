@@ -32,6 +32,10 @@ if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_pla
 	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
 	exit 1
 fi
+if ! grep -Fq '[ ! -s "compiler/_build/blorp-cli/blorp_cli_main.c" ]' <<<"$cli_build_plan"; then
+	echo "FAIL: a missing generated C artifact must invalidate the Blorp CLI build" >&2
+	exit 1
+fi
 if ! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must link the generated runtime source provider" >&2
 	exit 1
@@ -40,10 +44,102 @@ if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
 	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
 	exit 1
 fi
+if ! grep -Fq -- '--print-toolchain-dir' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must resolve the pinned complete toolchain" >&2
+	exit 1
+fi
+for bridge_env in \
+	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
+	BLORP_COMPILER_PARSER_BRIDGE_BIN \
+	BLORP_COMPILER_TYPECHECK_BRIDGE_BIN \
+	BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE
+do
+	if ! grep -Fq "$bridge_env" <<<"$cli_build_plan"; then
+		echo "FAIL: the Blorp CLI build must select and hash $bridge_env" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq "sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile" \
+	<<<"$cli_build_plan"
+then
+	echo "FAIL: changes to the Blorp CLI build recipe must invalidate its output" >&2
+	exit 1
+fi
+if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
+	echo "FAIL: install-only Makefile changes must not invalidate the Blorp CLI" >&2
+	exit 1
+fi
+if ! grep -Fq \
+	'new_hash=$(printf '\''%s\n%s\n%s\n'\'' "$source_hash" "$recipe_hash" "$require_prepared_bridge"' \
+	<<<"$cli_build_plan"
+then
+	echo "FAIL: the prepared-bridge policy must participate in the Blorp CLI cache key" >&2
+	exit 1
+fi
+
+if partial_override_output=$( \
+	BLORP_COMPILER_RENDERER_BRIDGE_BIN=/bin/sh \
+	make build-blorp-cli 2>&1 \
+); then
+	echo "FAIL: the Blorp CLI build must reject partial bridge helper overrides" >&2
+	exit 1
+fi
+if ! grep -Fq "bridge helper overrides must be provided together" \
+	<<<"$partial_override_output"
+then
+	echo "FAIL: partial bridge helper overrides must produce a precise diagnostic" >&2
+	exit 1
+fi
+
+if ! grep -Fxq 'hygiene-check: build-blorp-cli' Makefile; then
+	echo "FAIL: hygiene checks must inspect generated C from the current CLI build" >&2
+	exit 1
+fi
+
+stack_check=scripts/check-compiler-bridge-stack-usage
+if ! grep -Fq 'compiler/_build/blorp-cli/blorp_cli_main.c' "$stack_check"; then
+	echo "FAIL: the compiler bridge stack check must inspect the shipped CLI C" >&2
+	exit 1
+fi
+if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
+	echo "FAIL: the compiler bridge stack check must not regenerate isolated C with the bootstrap" >&2
+	exit 1
+fi
 
 install_plan=$(make -n install)
 if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_middle.exe" "./blorp-ocaml-middle"' <<<"$install_plan"; then
 	echo "FAIL: install must place the semantic worker beside the Blorp CLI" >&2
+	exit 1
+fi
+if ! grep -Fq 'bootstrap_toolchain_dir=$("scripts/blorp-compiler-bootstrap" --print-toolchain-dir)' <<<"$install_plan"; then
+	echo "FAIL: install must resolve bridge helpers from the pinned complete toolchain" >&2
+	exit 1
+fi
+if grep -Fq './blorp __compiler-bridge-prepare' <<<"$install_plan"; then
+	echo "FAIL: ordinary install must not attempt an immediate second self-host" >&2
+	exit 1
+fi
+for installed_bridge in \
+	blorp-compiler-renderer \
+	blorp-compiler-parser \
+	blorp-compiler-typecheck
+do
+	if ! grep -Fq "$installed_bridge" <<<"$install_plan"; then
+		echo "FAIL: install must place the pinned $installed_bridge beside the Blorp CLI" >&2
+		exit 1
+	fi
+	if ! grep -Fxq "/$installed_bridge" .gitignore; then
+		echo "FAIL: installed helper /$installed_bridge must be ignored as a build artifact" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq 'scripts/install-compiler-bootstrap-helpers' <<<"$install_plan"
+then
+	echo "FAIL: install must verify and copy the pinned bridge helper generation" >&2
+	exit 1
+fi
+if ! grep -Fq 'installed-bootstrap.id' <<<"$install_plan"; then
+	echo "FAIL: install must record which bootstrap helper generation is installed" >&2
 	exit 1
 fi
 

@@ -37,6 +37,9 @@ if [ "\${1:-}" = "check" ]; then
 fi
 
 if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
+	if [ -n "\${BLORP_TEST_PREPARE_MARKER:-}" ]; then
+		: > "\$BLORP_TEST_PREPARE_MARKER"
+	fi
 	prepare_dir="\${2:-}"
 	if [ -z "\$prepare_dir" ]; then
 		echo "missing prepare directory" >&2
@@ -50,12 +53,22 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 fi
 
 if [ "\${1:-}" = "test" ]; then
+	if [ -n "\${BLORP_TEST_EXPECTED_TOOLCHAIN_DIR:-}" ]; then
+		if [ "\${BLORP_COMPILER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp" ] \
+			|| [ "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-renderer" ] \
+			|| [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-parser" ] \
+			|| [ "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-typecheck" ] \
+			|| [ "\${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}" != "1" ]; then
+			echo "test command did not receive the complete installed bridge toolchain" >&2
+			exit 3
+		fi
+	fi
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
 		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
 	fi
-	exit 1
+	exit "\${BLORP_TEST_COMMAND_EXIT:-1}"
 fi
 
 echo "unexpected fake blorp command: \$*" >&2
@@ -112,6 +125,66 @@ fi
 
 echo "PASS: scripts/test installs the public CLI for Blorp gates"
 
+installed_toolchain=$(cd "$TMP_HARNESS" && pwd -P)
+for executable in \
+	blorp-compiler-renderer \
+	blorp-compiler-parser \
+	blorp-compiler-typecheck
+do
+	cp /bin/sh "$installed_toolchain/$executable"
+done
+
+default_toolchain_output="$TMP_HARNESS/default-toolchain-output.txt"
+unexpected_prepare_marker="$TMP_HARNESS/unexpected-prepare"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_EXPECTED_TOOLCHAIN_DIR="$installed_toolchain" \
+		BLORP_TEST_PREPARE_MARKER="$unexpected_prepare_marker" \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		bash scripts/test runtime --serial
+) > "$default_toolchain_output" 2>&1
+default_toolchain_status=$?
+
+if [ "$default_toolchain_status" -ne 0 ]; then
+	echo "FAIL: scripts/test should use the complete installed bridge toolchain"
+	cat "$default_toolchain_output"
+	exit 1
+fi
+if [ -e "$unexpected_prepare_marker" ]; then
+	echo "FAIL: scripts/test must not rebuild the installed pinned helpers"
+	cat "$default_toolchain_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test uses the complete installed bridge toolchain"
+
+partial_toolchain_output="$TMP_HARNESS/partial-toolchain-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test runtime --serial
+) > "$partial_toolchain_output" 2>&1
+partial_toolchain_status=$?
+
+if [ "$partial_toolchain_status" -eq 0 ]; then
+	echo "FAIL: scripts/test must reject partial bridge helper overrides"
+	cat "$partial_toolchain_output"
+	exit 1
+fi
+if ! grep -Fq "bridge helper overrides must be provided together" \
+	"$partial_toolchain_output"
+then
+	echo "FAIL: scripts/test must explain partial bridge helper overrides"
+	cat "$partial_toolchain_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test rejects partial bridge helper overrides"
+
 if ! grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-memory runtime categories"
 	cat "$TMP_HARNESS/test-command-log.txt"
@@ -143,6 +216,7 @@ write_fake_blorp "$std_check_log"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test std-check --serial
 ) > "$std_check_output_file" 2>&1
 std_check_status=$?
