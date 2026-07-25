@@ -1,0 +1,288 @@
+-- Blorp-owned source construction for generated TestSuite harness modules.
+import:
+	compiler_cli_plan:
+		CliFrontendModuleGraph,
+		CliGeneratedModule,
+		CliGeneratedModuleImport,
+		CliSourceFile,
+	json: JsonValue(JsonString)
+	system: getcwd
+
+
+record GeneratedTestSuiteTarget {
+	path: String,
+	module_name: String
+}
+
+
+private record GeneratedTestHarnessImports {
+	lines: List[String],
+	bindings: List[CliGeneratedModuleImport]
+}
+
+
+private SELECTOR_FILENAME: String = "__suite_selector_harness__.brp"
+
+private SELECTOR_MODULE: String = "__suite_selector_harness__"
+
+private RUN_ALL_FILENAME: String = "__suite_run_all_harness__.brp"
+
+private RUN_ALL_MODULE: String = "__suite_run_all_harness__"
+
+private RUN_ALL_BEGIN_MARKER: String = "__BLORP_SUITE_RUN_ALL_BEGIN__"
+
+private RUN_ALL_END_MARKER: String = "__BLORP_SUITE_RUN_ALL_END__"
+
+
+private pure func without_blorp_extension(path: String) -> String:
+	if path.ends_with(".brp"):
+		path.substring(0, path.length() - 4)
+	else:
+		path
+
+
+private func module_path_for_import(path: String) -> String:
+	base: String = without_blorp_extension(path)
+	cwd_prefix: String = getcwd() + "/"
+
+	relative: String = if base.starts_with(cwd_prefix):
+		base.drop_left(cwd_prefix.length())
+	else if base.starts_with("./"):
+		base.drop_left(2)
+	else:
+		base
+
+	if (
+		not relative.starts_with("/")
+		and not relative.starts_with("./")
+		and not relative.starts_with("../")
+		and not relative.starts_with("std/")
+	):
+		"./" + relative
+	else:
+		relative
+
+
+private pure func source_string_literal(value: String) -> String:
+	JsonString(value).to_string()
+
+
+private func source_from_lines(
+	filename: String,
+	module_name: String,
+	lines: List[String],
+) -> CliSourceFile:
+	{
+		path = getcwd() + "/" + filename,
+		module_name = module_name,
+		source_text = lines.join("\n") + "\n"
+	}
+
+
+private func harness_import_lines(
+	test_targets: List[GeneratedTestSuiteTarget],
+	run_function: String,
+	selector_support: Bool,
+	suite_type_support: Bool,
+) -> GeneratedTestHarnessImports:
+	test_import: String = if suite_type_support:
+		"TestSuite, " + run_function
+	else:
+		run_function
+
+	var lines: List[String] = ["import:", "    std/test: " + test_import]
+	var bindings: List[CliGeneratedModuleImport] = []
+
+	if selector_support:
+		lines = lines.concat([
+			"    std/string: parse_int",
+			"    std/list: get",
+			"    std/option: Option(Some, None)",
+		])
+
+	var index: Int = 0
+
+	for target in test_targets:
+		module_path: String = module_path_for_import(target.path)
+		lines = lines.append("    " + module_path + " as T" + index.to_string())
+		bindings = bindings.append({
+			module_path = module_path,
+			source_path = target.path,
+			source_module = target.module_name,
+		})
+		index += 1
+
+	{
+		lines = lines.concat(["", ""]),
+		bindings = bindings
+	}
+
+
+pure func generated_test_targets_for_paths(
+	graph: CliFrontendModuleGraph,
+	test_paths: List[String],
+) -> Result[List[GeneratedTestSuiteTarget], String]:
+	var targets: List[GeneratedTestSuiteTarget] = []
+	var error: Option[String] = None
+
+	for test_path in test_paths:
+		if error.is_some():
+			break
+
+		var match_count: Int = 0
+		var target: Option[GeneratedTestSuiteTarget] = None
+
+		for source in graph.roots:
+			if source.path == test_path:
+				match_count += 1
+				target = Some({
+					path = source.path,
+					module_name = source.module_name,
+				})
+
+		if match_count == 0:
+			error = Some("test source `" + test_path + "` is absent from the frontend graph roots")
+		else if match_count > 1:
+			error = Some("test source `" + test_path + "` has ambiguous frontend graph identities")
+		else:
+			match target:
+				Some(value):
+					targets = targets.append(value)
+				None:
+					void
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(targets)
+
+
+func generate_suite_selector_module(
+	test_targets: List[GeneratedTestSuiteTarget],
+	leak_check: Bool,
+) -> CliGeneratedModule:
+	run_function: String = if leak_check:
+		"run_suite_leak_check"
+	else:
+		"run_suite"
+
+	harness_imports: GeneratedTestHarnessImports = harness_import_lines(
+		test_targets,
+		run_function,
+		True,
+		False,
+	)
+	var lines: List[String] = harness_imports.lines
+	lines = lines.concat([
+		"func __run_selected(index: Int) -> Bool:",
+		"    match index:",
+	])
+
+	var index: Int = 0
+
+	for _ in test_targets:
+		lines = lines.concat([
+			"        " + index.to_string() + ":",
+			"            " + run_function + "(T" + index.to_string() + ".tests)",
+		])
+		index += 1
+
+	lines = lines.concat([
+		"        _:",
+		"            False",
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"    match get(args, 1):",
+		"        Some(selector):",
+		"            match parse_int(selector):",
+		"                Some(index):",
+		"                    if __run_selected(index):",
+		"                        0",
+		"                    else:",
+		"                        1",
+		"                None:",
+		"                    2",
+		"        None:",
+		"            2",
+	])
+
+	{
+		source = source_from_lines(SELECTOR_FILENAME, SELECTOR_MODULE, lines),
+		imports = harness_imports.bindings
+	}
+
+
+private pure func run_all_message(
+	marker: String,
+	index: Int,
+	phase: String,
+	file: String,
+) -> String:
+	source_string_literal(marker + " " + index.to_string() + " " + phase + file)
+
+
+func generate_suite_run_all_module(
+	test_targets: List[GeneratedTestSuiteTarget],
+	progress_marker: String,
+) -> CliGeneratedModule:
+	harness_imports: GeneratedTestHarnessImports = harness_import_lines(
+		test_targets,
+		"run_suite",
+		False,
+		True,
+	)
+	var lines: List[String] = harness_imports.lines
+
+	var index: Int = 0
+
+	for target in test_targets:
+		file: String = target.path
+		index_text: String = index.to_string()
+		lines = lines.concat([
+			"func __run_suite_" + index_text + "() -> Bool:",
+			"    print_error(" + run_all_message(progress_marker, index, "BEGIN ", file) + ")",
+			"    print(" + run_all_message(RUN_ALL_BEGIN_MARKER, index, "", file) + ")",
+			"    suite: TestSuite = T" + index_text + ".tests",
+			"    passed: Bool = run_suite(suite)",
+			"    if passed:",
+			"        print(" + run_all_message(RUN_ALL_END_MARKER, index, "PASS ", file) + ")",
+			"    else:",
+			"        print(" + run_all_message(RUN_ALL_END_MARKER, index, "FAIL ", file) + ")",
+			"    print_error(" + run_all_message(progress_marker, index, "END ", file) + ")",
+			"    passed",
+			"",
+			"",
+		])
+		index += 1
+
+	lines = lines.concat([
+		"func __run_all_suites() -> Bool:",
+		"    var passed: Bool = True",
+	])
+
+	index = 0
+
+	for _ in test_targets:
+		lines = lines.concat([
+			"    if not __run_suite_" + index.to_string() + "():",
+			"        passed = False",
+		])
+		index += 1
+
+	lines = lines.concat([
+		"    passed",
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"    if __run_all_suites():",
+		"        0",
+		"    else:",
+		"        1",
+	])
+
+	{
+		source = source_from_lines(RUN_ALL_FILENAME, RUN_ALL_MODULE, lines),
+		imports = harness_imports.bindings
+	}

@@ -215,6 +215,7 @@ import:
 		compiler_typed_expr_vector_item_widening,
 		compiler_typed_expr_widening,
 	../src/stage_06_typecheck/compiler_typecheck_state:
+		CompilerResourceShapeTarget(CompilerOneShotStreamShape, CompilerResourceSourceShape),
 		CompilerTypecheckState,
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_empty,
@@ -6537,6 +6538,232 @@ func test_var_decl_rejects_resource_source_function_carrier_binding() -> Bool:
 	)
 
 
+func test_paired_function_carrier_scan_reports_both_capabilities() -> Bool:
+	state = state_with_stream_source_binding_values()
+	mixed_carrier = CompilerFunctionType(
+		True,
+		[compiler_type_option(compiler_type_stream(compiler_type_int()))],
+		compiler_type_option(
+			compiler_type_resource_source(
+				compiler_type_reader(),
+				compiler_type_string(),
+			),
+		),
+	)
+	with_mixed = add_infer_value(state, "mixed_carrier", mixed_carrier)
+	result = compiler_infer_expr(
+		compiler_infer_context(with_mixed),
+		ParsedVarDeclExpr(
+			ident("mixed"),
+			None,
+			ParsedNameExpr(ident("mixed_carrier")),
+			False,
+			source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 2 and result.context.state.errors.any(func(error):
+		error.contains("one-shot stream carrier")
+	) and result.context.state.errors.any(func(error):
+		error.contains("resource source carrier")
+	) and type_shape_memo_has_function_carrier(
+		result.context.state,
+		CompilerOneShotStreamShape,
+		mixed_carrier,
+		True,
+	) and type_shape_memo_has_function_carrier(
+		result.context.state,
+		CompilerResourceSourceShape,
+		mixed_carrier,
+		True,
+	)
+
+
+func test_paired_function_carrier_scan_expands_named_components() -> Bool:
+	state = state_with_stream_source_binding_values()
+	carrier_type = CompilerFunctionType(
+		True,
+		[],
+		compiler_type_option(compiler_type_stream(compiler_type_int())),
+	)
+	named_type = CompilerNamedType("NamedFunctionCarrier", [])
+	with_record = compiler_env_add_record(
+		state.env,
+		"NamedFunctionCarrier",
+		[],
+		[field_decl("next", named_type), field_decl("carrier", carrier_type)],
+		False,
+		False,
+	)
+	with_value = add_infer_value({ state | env = with_record }, "named_carrier", named_type)
+	result = compiler_infer_expr(
+		compiler_infer_context(with_value),
+		ParsedVarDeclExpr(
+			ident("named"),
+			None,
+			ParsedNameExpr(ident("named_carrier")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("one-shot stream carrier")
+		and type_shape_memo_has_function_carrier(
+			result.context.state,
+			CompilerOneShotStreamShape,
+			named_type,
+			True,
+		)
+		and type_shape_memo_has_function_carrier(
+			result.context.state,
+			CompilerResourceSourceShape,
+			named_type,
+			False,
+		)
+	)
+
+
+func test_paired_function_carrier_scan_expands_generic_alias_chains() -> Bool:
+	state = state_with_stream_source_binding_values()
+	with_inner_alias = compiler_env_add_alias(
+		state.env,
+		"InnerCarrierAlias",
+		["T"],
+		CompilerFunctionType(
+			True,
+			[],
+			compiler_type_option(compiler_type_stream(CompilerTypeVar("T"))),
+		),
+	)
+	with_outer_alias = compiler_env_add_alias(
+		with_inner_alias,
+		"OuterCarrierAlias",
+		["T"],
+		compiler_type_option(CompilerNamedType("InnerCarrierAlias", [CompilerTypeVar("T")])),
+	)
+	alias_type = CompilerNamedType("OuterCarrierAlias", [compiler_type_int()])
+	with_value = add_infer_value({ state | env = with_outer_alias }, "aliased_carrier", alias_type)
+	result = compiler_infer_expr(
+		compiler_infer_context(with_value),
+		ParsedVarDeclExpr(
+			ident("aliased"),
+			None,
+			ParsedNameExpr(ident("aliased_carrier")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("one-shot stream carrier")
+		and type_shape_memo_has_function_carrier(
+			result.context.state,
+			CompilerOneShotStreamShape,
+			alias_type,
+			True,
+		)
+		and type_shape_memo_has_function_carrier(
+			result.context.state,
+			CompilerResourceSourceShape,
+			alias_type,
+			False,
+		)
+	)
+
+
+func test_paired_function_carrier_scan_preserves_direct_endpoint_masking() -> Bool:
+	state = state_with_stream_source_binding_values()
+	nested_source_function = CompilerFunctionType(
+		True,
+		[],
+		compiler_type_option(
+			compiler_type_resource_source(
+				compiler_type_reader(),
+				compiler_type_string(),
+			),
+		),
+	)
+	stream_endpoint_carrier = CompilerFunctionType(
+		True,
+		[compiler_type_stream(nested_source_function)],
+		compiler_type_int(),
+	)
+	nested_stream_function = CompilerFunctionType(
+		True,
+		[],
+		compiler_type_option(compiler_type_stream(compiler_type_int())),
+	)
+	source_endpoint_carrier = CompilerFunctionType(
+		True,
+		[compiler_type_resource_source(compiler_type_reader(), nested_stream_function)],
+		compiler_type_int(),
+	)
+	with_stream_endpoint = add_infer_value(
+		state,
+		"stream_endpoint_carrier",
+		stream_endpoint_carrier,
+	)
+	with_source_endpoint = add_infer_value(
+		with_stream_endpoint,
+		"source_endpoint_carrier",
+		source_endpoint_carrier,
+	)
+	stream_result = compiler_infer_expr(
+		compiler_infer_context(with_source_endpoint),
+		ParsedVarDeclExpr(
+			ident("stream_endpoint"),
+			None,
+			ParsedNameExpr(ident("stream_endpoint_carrier")),
+			False,
+			source_span(),
+		),
+	)
+	source_result = compiler_infer_expr(
+		stream_result.context,
+		ParsedVarDeclExpr(
+			ident("source_endpoint"),
+			None,
+			ParsedNameExpr(ident("source_endpoint_carrier")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		type_shape_memo_has_function_carrier(
+			stream_result.context.state,
+			CompilerOneShotStreamShape,
+			stream_endpoint_carrier,
+			False,
+		)
+		and type_shape_memo_has_function_carrier(
+			stream_result.context.state,
+			CompilerResourceSourceShape,
+			stream_endpoint_carrier,
+			True,
+		)
+		and type_shape_memo_has_function_carrier(
+			source_result.context.state,
+			CompilerOneShotStreamShape,
+			source_endpoint_carrier,
+			True,
+		)
+		and type_shape_memo_has_function_carrier(
+			source_result.context.state,
+			CompilerResourceSourceShape,
+			source_endpoint_carrier,
+			False,
+		)
+	)
+
+
 func test_resource_shape_checks_memoize_complete_types() -> Bool:
 	state = add_infer_value(
 		state_with_stream_source_binding_values(),
@@ -6582,12 +6809,162 @@ func test_resource_shape_checks_memoize_complete_types() -> Bool:
 		first.context.state.errors.length() == 1
 		and plain.context.state.errors.length() == 1
 		and repeated.context.state.errors.length() == 2
-		and first_contains_count > 0
-		and first_carrier_count > 0
-		and plain_contains_count > first_contains_count
-		and plain_carrier_count > first_carrier_count
+		and first_contains_count == 2
+		and first.context.state.type_shape_memo.contains_target.any(func(entry):
+			entry.target == CompilerOneShotStreamShape and entry.contains
+		)
+		and first.context.state.type_shape_memo.contains_target.any(func(entry):
+			entry.target == CompilerResourceSourceShape and not entry.contains
+		)
+		and first_carrier_count == 2
+		and plain_contains_count == 4
+		and plain_carrier_count == 4
 		and repeated.context.state.type_shape_memo.contains_target.length() == plain_contains_count
 		and repeated.context.state.type_shape_memo.function_carrier.length() == plain_carrier_count
+	)
+
+
+pure func type_shape_memo_has_contains_target(
+	state: CompilerTypecheckState,
+	target: CompilerResourceShapeTarget,
+	typ: CompilerType,
+	contains: Bool,
+) -> Bool:
+	state.type_shape_memo.contains_target.any(
+		func(
+			entry,
+		): (
+			entry.target == target
+			and compiler_types_equal(entry.typ, typ)
+			and entry.contains == contains
+		),
+	)
+
+
+pure func type_shape_memo_has_function_carrier(
+	state: CompilerTypecheckState,
+	target: CompilerResourceShapeTarget,
+	typ: CompilerType,
+	contains: Bool,
+) -> Bool:
+	state.type_shape_memo.function_carrier.any(
+		func(
+			entry,
+		): (
+			entry.target == target
+			and compiler_types_equal(entry.typ, typ)
+			and entry.contains == contains
+		),
+	)
+
+
+func test_resource_capability_paired_scan_preserves_nested_and_recursive_shapes() -> Bool:
+	nested_stream_source = compiler_type_stream(
+		compiler_type_resource_source(
+			compiler_type_reader(),
+			compiler_type_string(),
+		),
+	)
+	nested_source_stream = compiler_type_resource_source(
+		compiler_type_reader(),
+		compiler_type_stream(compiler_type_int()),
+	)
+	recursive_type = CompilerNamedType("PresenceInner", [])
+	state = state_with_stream_source_binding_values()
+	with_outer = compiler_env_add_record(
+		state.env,
+		"PresenceOuter",
+		[],
+		[
+			field_decl("inner", recursive_type),
+			field_decl("stream", compiler_type_stream(compiler_type_int())),
+		],
+		False,
+		False,
+	)
+	with_inner = compiler_env_add_record(with_outer, "PresenceInner", [], [field_decl(
+				"outer",
+				CompilerNamedType("PresenceOuter", []),
+			)], False, False)
+	with_nested_stream = add_infer_value(
+		{ state | env = with_inner },
+		"nested_stream_source",
+		nested_stream_source,
+	)
+	with_nested_source = add_infer_value(
+		with_nested_stream,
+		"nested_source_stream",
+		nested_source_stream,
+	)
+	with_recursive = add_infer_value(with_nested_source, "recursive_presence", recursive_type)
+	nested_stream_result = compiler_infer_expr(
+		compiler_infer_context(with_recursive),
+		ParsedVarDeclExpr(
+			ident("nested_stream_copy"),
+			None,
+			ParsedNameExpr(ident("nested_stream_source")),
+			False,
+			source_span(),
+		),
+	)
+	nested_source_result = compiler_infer_expr(
+		nested_stream_result.context,
+		ParsedVarDeclExpr(
+			ident("nested_source_copy"),
+			None,
+			ParsedNameExpr(ident("nested_source_stream")),
+			False,
+			source_span(),
+		),
+	)
+	recursive_result = compiler_infer_expr(
+		nested_source_result.context,
+		ParsedVarDeclExpr(
+			ident("recursive_copy"),
+			None,
+			ParsedNameExpr(ident("recursive_presence")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		type_shape_memo_has_contains_target(
+			nested_stream_result.context.state,
+			CompilerOneShotStreamShape,
+			nested_stream_source,
+			True,
+		)
+		and type_shape_memo_has_contains_target(
+			nested_stream_result.context.state,
+			CompilerResourceSourceShape,
+			nested_stream_source,
+			True,
+		)
+		and type_shape_memo_has_contains_target(
+			nested_source_result.context.state,
+			CompilerOneShotStreamShape,
+			nested_source_stream,
+			True,
+		)
+		and type_shape_memo_has_contains_target(
+			nested_source_result.context.state,
+			CompilerResourceSourceShape,
+			nested_source_stream,
+			True,
+		)
+		and type_shape_memo_has_contains_target(
+			recursive_result.context.state,
+			CompilerOneShotStreamShape,
+			recursive_type,
+			True,
+		)
+		and type_shape_memo_has_contains_target(
+			recursive_result.context.state,
+			CompilerResourceSourceShape,
+			recursive_type,
+			False,
+		)
 	)
 
 
@@ -10309,8 +10686,28 @@ tests: TestSuite = {
 			test_var_decl_rejects_resource_source_function_carrier_binding,
 		),
 		(
+			"paired function carrier scan reports both capabilities",
+			test_paired_function_carrier_scan_reports_both_capabilities,
+		),
+		(
+			"paired function carrier scan expands named components",
+			test_paired_function_carrier_scan_expands_named_components,
+		),
+		(
+			"paired function carrier scan expands generic alias chains",
+			test_paired_function_carrier_scan_expands_generic_alias_chains,
+		),
+		(
+			"paired function carrier scan preserves direct endpoint masking",
+			test_paired_function_carrier_scan_preserves_direct_endpoint_masking,
+		),
+		(
 			"resource shape checks memoize complete types",
 			test_resource_shape_checks_memoize_complete_types,
+		),
+		(
+			"resource capability paired scan preserves nested and recursive shapes",
+			test_resource_capability_paired_scan_preserves_nested_and_recursive_shapes,
 		),
 		(
 			"primitive binding skips resource shape memo",

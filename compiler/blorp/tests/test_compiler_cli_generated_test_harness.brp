@@ -1,0 +1,429 @@
+import:
+	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck), CliCompileArgs
+	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_generated_test_harness:
+		GeneratedTestSuiteTarget,
+		generate_suite_run_all_module,
+		generate_suite_selector_module,
+		generated_test_targets_for_paths,
+	../src/stage_12_cli/compiler_cli_plan:
+		CliCompilePlan,
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendGeneratedModule, CliFrontendUserModule),
+		CliGeneratedModule,
+		CliGeneratedModuleImport,
+		CliRunPlan(CliRunCompile),
+	../src/stage_12_cli/compiler_cli_source_graph:
+		frontend_module_graph_for_roots,
+		frontend_module_graph_with_generated_root,
+		parse_cli_sources,
+		read_cli_sources_for_action,
+	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
+	path: normalize
+	system: file_exists, getcwd, mkdir, now_microseconds, remove_dir, remove_file, write_file
+	test: TestSuite, run_suite
+
+
+private pure func check_action(paths: List[String]) -> CliAction:
+	CliCheck({
+		dump_ast = False,
+		dump_typed_ast = False,
+		debug = False,
+		no_format = True,
+		std_dir = None,
+		paths = paths,
+	})
+
+
+private pure func test_suite_source(description: String) -> String:
+	"import:\n" + "    test: TestSuite\n" + "\n" + "\n" + "pure func " + description + "_value() -> Int: 1\n" + "\n" + "\n" + "tests:" + " TestSuite = {\n" + "    description = \"" + description + "\",\n" + "    tests = []\n" + "}\n"
+
+
+private func cleanup(root: String, paths: List[String]) -> Void:
+	for path in paths:
+		_ = remove_file(path)
+
+	_ = remove_dir(root)
+
+
+private func write_text(path: String, source: String) -> Bool:
+	match write_file(path, source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func test_target(path: String) -> GeneratedTestSuiteTarget:
+	{
+		path = path,
+		module_name = path.substring(0, path.length() - 4)
+	}
+
+
+private func test_failure(message: String) -> Bool:
+	print_error(message)
+	False
+
+
+private func frontend_graph_for_paths(
+	paths: List[String],
+) -> Result[CliFrontendModuleGraph, String]:
+	action: CliAction = check_action(paths)
+	sources ?= read_cli_sources_for_action(action, paths)
+	parsed ?= parse_cli_sources(sources)
+	frontend_module_graph_for_roots(action, parsed)
+
+
+private pure func generated_root_is_explicit(graph: CliFrontendModuleGraph) -> Bool:
+	match graph.roots:
+		[root]:
+			match root.origin:
+				CliFrontendGeneratedModule:
+					True
+				_:
+					False
+		_:
+			False
+
+
+private record GeneratedGraphFixture {
+	base: CliFrontendModuleGraph,
+	generated: CliGeneratedModule,
+	extended: CliFrontendModuleGraph,
+	targets: List[GeneratedTestSuiteTarget]
+}
+
+
+private func generated_graph_fixture(paths: List[String]) -> Result[GeneratedGraphFixture, String]:
+	base ?= frontend_graph_for_paths(paths)
+	retained_base: CliFrontendModuleGraph = { base |
+		context = { base.context |
+			std_dir = Some(getcwd() + "/__missing_generated_std_" + now_microseconds().to_string())
+		}
+	}
+	targets ?= generated_test_targets_for_paths(retained_base, paths)
+	generated: CliGeneratedModule = generate_suite_selector_module(targets, False)
+
+	for path in paths:
+		_ = remove_file(path)
+
+	extended ?= frontend_module_graph_with_generated_root(retained_base, generated)
+
+	Ok({
+		base = retained_base,
+		generated = generated,
+		extended = extended,
+		targets = targets,
+	})
+
+
+private pure func compile_options(paths: List[String]) -> CliCompileArgs:
+	{
+		ast_only = False,
+		dump_ast = False,
+		dump_typed_ast = False,
+		dump_core_after = [],
+		dump_file = None,
+		stop_after = None,
+		time_phases = False,
+		check_invariants = False,
+		debug = False,
+		no_format = True,
+		embed_runtime = False,
+		std_dir = None,
+		output = None,
+		files = paths
+	}
+
+
+private pure func serialized_compile_graph(
+	graph: CliFrontendModuleGraph,
+	paths: List[String],
+) -> String:
+	plan: CliCompilePlan = {
+		args = paths,
+		options = compile_options(paths),
+		graph = graph
+	}
+
+	cli_run_plan_to_json(CliRunCompile(plan)).to_string()
+
+
+private func test_selector_harness_matches_existing_protocol() -> Bool:
+	module: CliGeneratedModule = generate_suite_selector_module(
+		[test_target("tests/test_blorp/a.brp"), test_target("tests/test_blorp/b.brp")],
+		False,
+	)
+	source: String = module.source.source_text
+
+	(
+		module.source.path.ends_with("/__suite_selector_harness__.brp")
+		and module.source.module_name == "__suite_selector_harness__"
+		and source.contains("    ./tests/test_blorp/a as T0")
+		and source.contains("    ./tests/test_blorp/b as T1")
+		and source.contains("std/test: run_suite")
+		and source.contains("match get(args, 1):")
+		and source.contains("match parse_int(selector):")
+		and source.contains("func __run_selected(index: Int) -> Bool:\n    match index:")
+		and source.contains("        0:\n            run_suite(T0.tests)")
+		and source.contains("        _:\n            False")
+	)
+
+
+private func test_selector_harness_supports_leak_check() -> Bool:
+	source: String = generate_suite_selector_module(
+		[test_target("tests/test_blorp/a.brp")],
+		True,
+	).source.source_text
+
+	(
+		source.contains("std/test: run_suite_leak_check")
+		and source.contains("run_suite_leak_check(T0.tests)")
+	)
+
+
+private func test_run_all_harness_matches_existing_protocol() -> Bool:
+	source: String = generate_suite_run_all_module(
+		[test_target("tests/test_blorp/a.brp"), test_target("tests/test_blorp/b.brp")],
+		"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce",
+	).source.source_text
+
+	(
+		source.contains("    ./tests/test_blorp/a as T0")
+		and source.contains("    ./tests/test_blorp/b as T1")
+		and source.contains("std/test: TestSuite, run_suite")
+		and source.contains(
+			"print_error(\"__BLORP_SUITE_RUN_ALL_PROGRESS__nonce 0 BEGIN tests/test_blorp/a.brp\")",
+		)
+		and source.contains("print(\"__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp\")")
+		and source.contains("suite: TestSuite = T0.tests")
+		and source.contains("passed: Bool = run_suite(suite)")
+		and source.contains("    if not __run_suite_0():")
+		and source.contains("    if not __run_suite_1():")
+		and not source.contains("match parse_int(selector):")
+	)
+
+
+private func test_generated_root_extends_existing_graph_without_reparsing_modules() -> Bool:
+	root: String = normalize(
+		getcwd() + "/tmp_blorp_generated_harness_graph_" + now_microseconds().to_string(),
+	)
+	first_path: String = root + "/first.brp"
+	second_path: String = root + "/second.brp"
+	_ = remove_file(first_path)
+	_ = remove_file(second_path)
+	_ = remove_dir(root)
+
+	created: Bool = mkdir(root)
+	first_source: String = test_suite_source("first")
+	second_source: String = test_suite_source("second")
+	written: Bool = write_text(first_path, first_source) and write_text(second_path, second_source)
+
+	result: Bool = if not created or not written:
+		False
+	else:
+		match generated_graph_fixture([first_path, second_path]):
+			Err(message):
+				test_failure("graph extension failed: " + message)
+			Ok(fixture):
+				if file_exists(first_path) or file_exists(second_path):
+					test_failure("fixture sources were not deleted")
+				else:
+					graph: CliFrontendModuleGraph = fixture.base
+					generated: CliGeneratedModule = fixture.generated
+					extended: CliFrontendModuleGraph = fixture.extended
+					targets_bound: Bool = (
+						fixture.targets.any(
+							func(
+								target,
+							): target.path == first_path and target.module_name == "first",
+						)
+						and fixture.targets.any(
+							func(
+								target,
+							): target.path == second_path and target.module_name == "second",
+						)
+					)
+
+					explicit_origin: Bool = generated_root_is_explicit(extended)
+					first_reused: Bool = extended.modules.any(
+						func(
+							source,
+						): (
+							source.path == first_path
+							and source.module_name == "first"
+							and source.source_text == first_source
+						),
+					)
+					second_reused: Bool = extended.modules.any(
+						func(
+							source,
+						): (
+							source.path == second_path
+							and source.module_name == "second"
+							and source.source_text == second_source
+						),
+					)
+					first_edges = extended.import_edges.filter(
+						func(
+							edge,
+						): (
+							edge.from_path == generated.source.path
+							and edge.resolved_path == Some(first_path)
+						),
+					)
+					second_edges = extended.import_edges.filter(
+						func(
+							edge,
+						): (
+							edge.from_path == generated.source.path
+							and edge.resolved_path == Some(second_path)
+						),
+					)
+					first_edge: Bool = (
+						first_edges.length() == 1
+						and first_edges.any(
+							func(
+								edge,
+							): (
+								edge.from_module == generated.source.module_name
+								and edge.import_path.ends_with("/first")
+								and edge.resolved_module == Some("first")
+								and edge.resolved_origin == Some(CliFrontendUserModule)
+							),
+						)
+					)
+
+					second_edge: Bool = (
+						second_edges.length() == 1
+						and second_edges.any(
+							func(
+								edge,
+							): (
+								edge.from_module == generated.source.module_name
+								and edge.import_path.ends_with("/second")
+								and edge.resolved_module == Some("second")
+								and edge.resolved_origin == Some(CliFrontendUserModule)
+							),
+						)
+					)
+
+					serialized_origin: Bool = serialized_compile_graph(
+						extended,
+						[first_path, second_path],
+					).contains("\"origin\":{\"kind\":\"generated\"}")
+					var typecheck_errors: List[String] = []
+
+					for root_source in extended.roots:
+						typecheck_errors = typecheck_errors.concat(
+							typechecked_graph_errors(
+								typecheck_frontend_root(
+									extended,
+									root_source,
+									False,
+								),
+							),
+						)
+
+					collisions_rejected: Bool = match graph.roots:
+						[template, ..._]:
+							path_collision: CliFrontendGraphSource = { template |
+								path = generated.source.path
+							}
+							module_collision: CliFrontendGraphSource = { template |
+								module_name = generated.source.module_name
+							}
+							path_collision_graph: CliFrontendModuleGraph = { graph |
+								modules = graph.modules.append(path_collision)
+							}
+							module_collision_graph: CliFrontendModuleGraph = { graph |
+								modules = graph.modules.append(module_collision)
+							}
+
+							path_rejected: Bool = match frontend_module_graph_with_generated_root(
+								path_collision_graph,
+								generated,
+							):
+								Err(message):
+									message.contains("generated module identity collides")
+								Ok(_):
+									False
+
+							module_rejected: Bool = match frontend_module_graph_with_generated_root(
+								module_collision_graph,
+								generated,
+							):
+								Err(message):
+									message.contains("generated module identity collides")
+								Ok(_):
+									False
+
+							path_rejected and module_rejected
+						[]:
+							False
+
+					var ambiguous_imports: List[CliGeneratedModuleImport] = []
+
+					for binding in generated.imports:
+						if binding.source_path == second_path:
+							ambiguous_imports = ambiguous_imports.append(
+								{ binding | source_module = "first" },
+							)
+						else:
+							ambiguous_imports = ambiguous_imports.append(binding)
+
+					ambiguous_generated: CliGeneratedModule = { generated |
+						imports = ambiguous_imports
+					}
+
+					ambiguous_import_rejected: Bool = match frontend_module_graph_with_generated_root(
+						graph,
+						ambiguous_generated,
+					):
+						Err(message):
+							message.contains("distinct sources with the same module identity")
+						Ok(_):
+							False
+
+					if not targets_bound:
+						test_failure("test targets did not preserve graph module identities")
+					else if not explicit_origin:
+						test_failure("generated root did not preserve its explicit origin")
+					else if not first_reused or not second_reused:
+						test_failure("existing parsed source was not retained")
+					else if not first_edge or not second_edge:
+						test_failure("generated import did not bind to the retained graph identity")
+					else if not serialized_origin:
+						test_failure("generated origin did not cross the JSON bridge boundary")
+					else if typecheck_errors.length() != 0:
+						test_failure(
+							"generated graph failed typecheck:\n" + typecheck_errors.join("\n"),
+						)
+					else if not collisions_rejected:
+						test_failure("generated root identity collision was not rejected")
+					else if not ambiguous_import_rejected:
+						test_failure("ambiguous generated import identity was not rejected")
+					else:
+						True
+
+	cleanup(
+		root,
+		[first_path, second_path],
+	)
+	result
+
+
+tests: TestSuite = {
+	description = "Blorp-owned generated test harnesses",
+	tests = [
+		("selector harness protocol", test_selector_harness_matches_existing_protocol),
+		("selector leak-check protocol", test_selector_harness_supports_leak_check),
+		("run-all harness protocol", test_run_all_harness_matches_existing_protocol),
+		(
+			"generated root extends an existing graph",
+			test_generated_root_extends_existing_graph_without_reparsing_modules,
+		),
+	]
+}

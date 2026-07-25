@@ -15,12 +15,15 @@ import:
 		CliFrontendImportEdge,
 		CliFrontendModuleGraph,
 		CliFrontendModuleOrigin(
+			CliFrontendGeneratedModule,
 			CliFrontendPkgModule,
 			CliFrontendSourcePackageModule,
 			CliFrontendStdModule,
 			CliFrontendUserModule,
 		),
 		CliFrontendSourcePackage,
+		CliGeneratedModule,
+		CliGeneratedModuleImport,
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
@@ -1824,6 +1827,160 @@ private func discover_import_sources_for_parsed_sources(
 			})
 
 
+private pure func generated_import_binding(
+	bindings: List[CliGeneratedModuleImport],
+	module_path: String,
+) -> Result[Option[CliGeneratedModuleImport], String]:
+	var found: Option[CliGeneratedModuleImport] = None
+	var count: Int = 0
+
+	for binding in bindings:
+		if binding.module_path == module_path:
+			found = Some(binding)
+			count += 1
+
+	if count > 1:
+		Err("generated module has duplicate binding for import `" + module_path + "`")
+	else:
+		Ok(found)
+
+
+private pure func existing_source_for_generated_import(
+	sources: List[CliFrontendGraphSource],
+	binding: CliGeneratedModuleImport,
+) -> Result[CliFrontendGraphSource, String]:
+	var found: Option[CliFrontendGraphSource] = None
+	var count: Int = 0
+
+	for source in sources:
+		if source.path == binding.source_path and source.module_name == binding.source_module:
+			found = Some(source)
+			count += 1
+
+	if count == 0:
+		Err(
+			"generated import `" + binding.module_path + "` targets an absent graph identity `" + binding.source_module + "` at `" + binding.source_path + "`",
+		)
+	else if count > 1:
+		Err("generated import `" + binding.module_path + "` targets an ambiguous graph identity")
+	else:
+		match found:
+			Some(source):
+				Ok(source)
+			None:
+				Err("internal error: generated import lookup lost its source")
+
+
+private pure func existing_source_for_generated_module_path(
+	sources: List[CliFrontendGraphSource],
+	module_path: String,
+) -> Result[CliFrontendGraphSource, String]:
+	var found: Option[CliFrontendGraphSource] = None
+	var count: Int = 0
+
+	for source in sources:
+		if source.module_name == module_path:
+			found = Some(source)
+			count += 1
+
+	if count == 0:
+		Err("generated import `" + module_path + "` is absent from the retained graph")
+	else if count > 1:
+		Err("generated import `" + module_path + "` has an ambiguous retained graph identity")
+	else:
+		match found:
+			Some(source):
+				Ok(source)
+			None:
+				Err("internal error: generated module lookup lost its source")
+
+
+private pure func ambiguous_generated_import_module(
+	bindings: List[CliGeneratedModuleImport],
+) -> Option[String]:
+	var seen: List[CliGeneratedModuleImport] = []
+	var ambiguous: Option[String] = None
+
+	for binding in bindings:
+		if ambiguous.is_some():
+			break
+
+		if seen.any(
+			func(
+				existing,
+			): (
+				existing.source_module == binding.source_module
+				and existing.source_path != binding.source_path
+			),
+		):
+			ambiguous = Some(binding.source_module)
+		else:
+			seen = seen.append(binding)
+
+	ambiguous
+
+
+private pure func frontend_import_edge_for_existing_source(
+	source: CliParsedSourceFile,
+	module_path: String,
+	target: CliFrontendGraphSource,
+) -> CliFrontendImportEdge:
+	{
+		from_path = source.path,
+		from_module = source.module_name,
+		import_path = module_path,
+		resolved_path = Some(target.path),
+		resolved_module = Some(target.module_name),
+		resolved_origin = Some(target.origin)
+	}
+
+
+private pure func existing_generated_import_target(
+	existing_sources: List[CliFrontendGraphSource],
+	bindings: List[CliGeneratedModuleImport],
+	module_path: String,
+) -> Result[CliFrontendGraphSource, String]:
+	match generated_import_binding(bindings, module_path):
+		Err(message):
+			Err(message)
+		Ok(Some(binding)):
+			existing_source_for_generated_import(existing_sources, binding)
+		Ok(None):
+			existing_source_for_generated_module_path(existing_sources, module_path)
+
+
+private func generated_import_edges(
+	source: CliParsedSourceFile,
+	existing_sources: List[CliFrontendGraphSource],
+	bindings: List[CliGeneratedModuleImport],
+) -> Result[List[CliFrontendImportEdge], String]:
+	var import_edges: List[CliFrontendImportEdge] = []
+	var error: Option[String] = None
+	import_paths ?= parsed_source_import_paths(source)
+
+	for module_path in import_paths:
+		if error.is_some():
+			break
+
+		match existing_generated_import_target(existing_sources, bindings, module_path):
+			Err(message):
+				error = Some(message)
+			Ok(target):
+				import_edges = import_edges.append(
+					frontend_import_edge_for_existing_source(
+						source,
+						module_path,
+						target,
+					),
+				)
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(import_edges)
+
+
 private pure func parsed_source_identities(
 	sources: List[CliParsedSourceFile],
 ) -> List[CliSourceIdentity]:
@@ -1983,6 +2140,55 @@ func frontend_module_graph_for_roots(
 		import_edges = walk.import_edges,
 		diagnostics = setup.diagnostics,
 	})
+
+
+func frontend_module_graph_with_generated_root(
+	graph: CliFrontendModuleGraph,
+	generated_module: CliGeneratedModule,
+) -> Result[CliFrontendModuleGraph, String]:
+	existing_sources: List[CliFrontendGraphSource] = graph.roots.concat(graph.modules)
+	collision: Option[CliFrontendGraphSource] = existing_sources.find(
+		func(
+			source,
+		): (
+			source.path == generated_module.source.path
+			or source.module_name == generated_module.source.module_name
+		),
+	)
+
+	match collision:
+		Some(source):
+			Err(
+				"generated module identity collides with existing graph source `" + source.module_name + "` at `" + source.path + "`",
+			)
+		None:
+			match ambiguous_generated_import_module(generated_module.imports):
+				Some(module_name):
+					Err(
+						"generated imports target distinct sources with the same module identity `" + module_name + "`",
+					)
+				None:
+					generated ?= parse_cli_source(generated_module.source)
+					import_edges ?= generated_import_edges(
+						generated,
+						existing_sources,
+						generated_module.imports,
+					)
+					generated_root: CliFrontendGraphSource = {
+						path = owned_string(generated.path),
+						module_name = owned_string(generated.module_name),
+						source_text = owned_string(generated.source_text),
+						parsed_source = generated.parsed_source,
+						origin = CliFrontendGeneratedModule
+					}
+
+					Ok({
+						context = graph.context,
+						roots = [generated_root],
+						modules = existing_sources,
+						import_edges = graph.import_edges.concat(import_edges),
+						diagnostics = graph.diagnostics,
+					})
 
 
 func parse_cli_source_file_for_action(
