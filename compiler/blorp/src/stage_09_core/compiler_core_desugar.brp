@@ -3,6 +3,10 @@
 -- This first slice covers string binary operators that already exist in the
 -- prepared Core JSON model. Record-update and string-interpolation sugar are
 -- still owned by the OCaml Core model until equivalent Blorp Core shapes exist.
+-- Exact `target = target + suffix` assignments use the COW-consuming string
+-- append builtin so mutable accumulation can reuse uniquely owned storage.
+-- Left-nested additions such as `target = target + a + b` remain unchanged
+-- until a producer-chain lowering can preserve evaluation and ownership.
 import:
 	compiler_core_json:
 		CoreBinaryOp(AddOp, EqualOp, NotEqualOp),
@@ -76,6 +80,7 @@ import:
 		CoreSourceLoc,
 		CoreType(NamedType, VoidType),
 		CoreUnaryOp(NotOp),
+		CoreVar,
 
 
 private pure func core_bool_type() -> CoreType:
@@ -91,6 +96,10 @@ private pure func core_type_is_string(typ: CoreType) -> Bool:
 			)
 		_:
 			False
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq
 
 
 private pure func core_expr_type(expr: CoreExpr) -> CoreType:
@@ -305,7 +314,28 @@ pure func desugar_expr(expr: CoreExpr) -> CoreExpr:
 		LogicalExpr(op, left, right, typ, loc):
 			LogicalExpr(op, desugar_expr(left), desugar_expr(right), typ, loc)
 		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(variable, desugar_expr(rhs), typ, loc)
+			match rhs:
+				BinaryExpr(AddOp, VarExpr(source, source_type, source_loc), suffix, rhs_type, rhs_loc):
+					if (
+						core_vars_equal(variable, source)
+						and core_type_is_string(source_type)
+						and core_type_is_string(rhs_type)
+					):
+						AssignExpr(
+							variable,
+							builtin_call(
+								"blorp_string_append",
+								[VarExpr(source, source_type, source_loc), desugar_expr(suffix)],
+								rhs_type,
+								rhs_loc,
+							),
+							typ,
+							loc,
+						)
+					else:
+						AssignExpr(variable, desugar_expr(rhs), typ, loc)
+				_:
+					AssignExpr(variable, desugar_expr(rhs), typ, loc)
 		FieldExpr(expr_value, field_name, typ, loc):
 			FieldExpr(desugar_expr(expr_value), field_name, typ, loc)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
