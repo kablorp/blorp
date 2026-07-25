@@ -340,6 +340,7 @@ let module_origin_of_cli_frontend_origin =
   let open Compiler_blorp_bridge in
   function
   | CliFrontendUserModule -> Session.User_module
+  | CliFrontendGeneratedModule -> Session.User_module
   | CliFrontendStdModule -> Session.Stdlib_module
   | CliFrontendPkgModule package_id -> Session.native_package_origin package_id
   | CliFrontendSourcePackageModule package_alias ->

@@ -645,6 +645,12 @@ private record CompilerMemoizedTypeShapeCheck {
 }
 
 
+private struct CompilerResourceCapabilityPresence {
+	contains_one_shot_stream: Bool,
+	contains_resource_source: Bool
+}
+
+
 private record CompilerCheckedType {
 	context: CompilerInferContext,
 	typ: CompilerType
@@ -12530,6 +12536,142 @@ private pure func compiler_type_contains_resource_capability_seen(
 			False
 
 
+private pure func compiler_resource_capability_presence_empty(
+
+) -> CompilerResourceCapabilityPresence:
+	{
+		contains_one_shot_stream = False,
+		contains_resource_source = False
+	}
+
+
+private pure func compiler_resource_capability_presence_for_name(
+	name: String,
+) -> CompilerResourceCapabilityPresence:
+	{
+		contains_one_shot_stream = compiler_is_one_shot_stream_type_name(name),
+		contains_resource_source = compiler_is_resource_source_type_name(name)
+	}
+
+
+private pure func compiler_resource_capability_presence_merge(
+	left: CompilerResourceCapabilityPresence,
+	right: CompilerResourceCapabilityPresence,
+) -> CompilerResourceCapabilityPresence:
+	{
+		contains_one_shot_stream = left.contains_one_shot_stream or right.contains_one_shot_stream,
+		contains_resource_source = left.contains_resource_source or right.contains_resource_source
+	}
+
+
+private pure func compiler_resource_capability_presence_is_complete(
+	presence: CompilerResourceCapabilityPresence,
+) -> Bool:
+	presence.contains_one_shot_stream and presence.contains_resource_source
+
+
+private pure func compiler_types_resource_capability_presence_seen(
+	env: CompilerEnv,
+	visited: List[String],
+	types: List[CompilerType],
+) -> CompilerResourceCapabilityPresence:
+	var presence: CompilerResourceCapabilityPresence = compiler_resource_capability_presence_empty()
+
+	for typ in types:
+		presence = compiler_resource_capability_presence_merge(
+			presence,
+			compiler_type_resource_capability_presence_seen(env, visited, typ),
+		)
+
+		if compiler_resource_capability_presence_is_complete(presence):
+			break
+
+	presence
+
+
+private pure func compiler_type_resource_capability_presence_seen(
+	env: CompilerEnv,
+	visited: List[String],
+	typ: CompilerType,
+) -> CompilerResourceCapabilityPresence:
+	resolved = compiler_env_resolve_alias_head(env, typ)
+
+	match resolved:
+		CompilerNamedType(name, args):
+			owned_name: String = compiler_copy_type_scan_name(name)
+			direct_presence = compiler_resource_capability_presence_for_name(owned_name)
+
+			if (
+				compiler_resource_capability_presence_is_complete(direct_presence)
+				or visited.contains(owned_name)
+			):
+				direct_presence
+			else:
+				next_visited: List[String] = visited.append(owned_name)
+
+				nested_presence = match compiler_named_type_component_types(env, owned_name, args):
+					Some(components):
+						compiler_types_resource_capability_presence_seen(
+							env,
+							next_visited,
+							components,
+						)
+					None:
+						compiler_types_resource_capability_presence_seen(env, visited, args)
+
+				compiler_resource_capability_presence_merge(direct_presence, nested_presence)
+		CompilerArrayType(element, dims):
+			element_presence = compiler_type_resource_capability_presence_seen(
+				env,
+				visited,
+				element,
+			)
+
+			if compiler_resource_capability_presence_is_complete(element_presence):
+				element_presence
+			else:
+				compiler_resource_capability_presence_merge(
+					element_presence,
+					compiler_types_resource_capability_presence_seen(env, visited, dims),
+				)
+		CompilerFunctionType(_, _, _):
+			compiler_resource_capability_presence_empty()
+		CompilerTupleType(elements):
+			compiler_types_resource_capability_presence_seen(env, visited, elements)
+		CompilerRangeType(inner):
+			compiler_type_resource_capability_presence_seen(env, visited, inner)
+		CompilerDimOpType(_, left, right):
+			left_presence = compiler_type_resource_capability_presence_seen(env, visited, left)
+
+			if compiler_resource_capability_presence_is_complete(left_presence):
+				left_presence
+			else:
+				compiler_resource_capability_presence_merge(
+					left_presence,
+					compiler_type_resource_capability_presence_seen(env, visited, right),
+				)
+		_:
+			compiler_resource_capability_presence_empty()
+
+
+private pure func compiler_type_resource_capability_presence(
+	env: CompilerEnv,
+	typ: CompilerType,
+) -> CompilerResourceCapabilityPresence:
+	compiler_type_resource_capability_presence_seen(env, [], typ)
+
+
+private pure func compiler_resource_capability_presence_contains_target(
+	presence: CompilerResourceCapabilityPresence,
+	target: CompilerResourceShapeTarget,
+) -> Bool:
+	match target:
+		CompilerOneShotStreamShape:
+			presence.contains_one_shot_stream
+		CompilerResourceSourceShape:
+			presence.contains_resource_source
+
+
 private pure func compiler_type_contains_resource_capability_uncached(
 	env: CompilerEnv,
 	target: CompilerResourceShapeTarget,
@@ -12538,20 +12680,197 @@ private pure func compiler_type_contains_resource_capability_uncached(
 	compiler_type_contains_resource_capability_seen(env, target, [], typ)
 
 
-private pure func compiler_type_endpoint_hides_resource_capability(
+private pure func compiler_resource_capability_presence_without_direct_targets(
+	presence: CompilerResourceCapabilityPresence,
+	direct_presence: CompilerResourceCapabilityPresence,
+) -> CompilerResourceCapabilityPresence:
+	{
+		contains_one_shot_stream = (
+			presence.contains_one_shot_stream
+			and not direct_presence.contains_one_shot_stream
+		),
+		contains_resource_source = (
+			presence.contains_resource_source
+			and not direct_presence.contains_resource_source
+		)
+	}
+
+
+private pure func compiler_function_endpoint_resource_capability_presence(
 	env: CompilerEnv,
-	target: CompilerResourceShapeTarget,
+	visited: List[String],
 	typ: CompilerType,
-) -> Bool:
-	(
-		compiler_type_contains_resource_capability_uncached(env, target, typ)
-		and not compiler_type_is_resource_capability_target(env, target, typ)
-	)
+) -> CompilerResourceCapabilityPresence:
+	resolved = compiler_env_resolve_alias_head(env, typ)
+
+	match resolved:
+		CompilerFunctionType(_, _, _):
+			compiler_type_resource_capability_function_carrier_presence_seen(env, visited, resolved)
+		_:
+			direct_presence = match resolved:
+				CompilerNamedType(name, _):
+					compiler_resource_capability_presence_for_name(
+						compiler_copy_type_scan_name(name),
+					)
+				_:
+					compiler_resource_capability_presence_empty()
+
+			hidden_presence = compiler_resource_capability_presence_without_direct_targets(
+				compiler_type_resource_capability_presence(env, resolved),
+				direct_presence,
+			)
+
+			compiler_resource_capability_presence_merge(
+				hidden_presence,
+				compiler_type_resource_capability_function_carrier_presence_seen(
+					env,
+					visited,
+					resolved,
+				),
+			)
 
 
-private pure func compiler_function_endpoint_has_resource_capability_carrier(
+private pure func compiler_function_endpoints_resource_capability_presence(
 	env: CompilerEnv,
-	target: CompilerResourceShapeTarget,
+	visited: List[String],
+	types: List[CompilerType],
+) -> CompilerResourceCapabilityPresence:
+	var presence: CompilerResourceCapabilityPresence = compiler_resource_capability_presence_empty()
+
+	for typ in types:
+		presence = compiler_resource_capability_presence_merge(
+			presence,
+			compiler_function_endpoint_resource_capability_presence(env, visited, typ),
+		)
+
+		if compiler_resource_capability_presence_is_complete(presence):
+			break
+
+	presence
+
+
+private pure func compiler_types_resource_capability_function_carrier_presence_seen(
+	env: CompilerEnv,
+	visited: List[String],
+	types: List[CompilerType],
+) -> CompilerResourceCapabilityPresence:
+	var presence: CompilerResourceCapabilityPresence = compiler_resource_capability_presence_empty()
+
+	for typ in types:
+		presence = compiler_resource_capability_presence_merge(
+			presence,
+			compiler_type_resource_capability_function_carrier_presence_seen(env, visited, typ),
+		)
+
+		if compiler_resource_capability_presence_is_complete(presence):
+			break
+
+	presence
+
+
+private pure func compiler_type_resource_capability_function_carrier_presence_seen(
+	env: CompilerEnv,
+	visited: List[String],
+	typ: CompilerType,
+) -> CompilerResourceCapabilityPresence:
+	resolved = compiler_env_resolve_alias_head(env, typ)
+
+	match resolved:
+		CompilerFunctionType(_, params, return_type):
+			param_presence = compiler_function_endpoints_resource_capability_presence(
+				env,
+				visited,
+				params,
+			)
+
+			if compiler_resource_capability_presence_is_complete(param_presence):
+				param_presence
+			else:
+				compiler_resource_capability_presence_merge(
+					param_presence,
+					compiler_function_endpoint_resource_capability_presence(
+						env,
+						visited,
+						return_type,
+					),
+				)
+		CompilerNamedType(name, args):
+			owned_name: String = compiler_copy_type_scan_name(name)
+			direct_presence = compiler_resource_capability_presence_for_name(owned_name)
+
+			if visited.contains(owned_name):
+				compiler_resource_capability_presence_empty()
+			else:
+				next_visited: List[String] = visited.append(owned_name)
+
+				nested_presence = match compiler_named_type_component_types(env, owned_name, args):
+					Some(components):
+						compiler_types_resource_capability_function_carrier_presence_seen(
+							env,
+							next_visited,
+							components,
+						)
+					None:
+						compiler_types_resource_capability_function_carrier_presence_seen(
+							env,
+							visited,
+							args,
+						)
+
+				compiler_resource_capability_presence_without_direct_targets(
+					nested_presence,
+					direct_presence,
+				)
+		CompilerArrayType(element, dims):
+			element_presence = compiler_type_resource_capability_function_carrier_presence_seen(
+				env,
+				visited,
+				element,
+			)
+
+			if compiler_resource_capability_presence_is_complete(element_presence):
+				element_presence
+			else:
+				compiler_resource_capability_presence_merge(
+					element_presence,
+					compiler_types_resource_capability_function_carrier_presence_seen(
+						env,
+						visited,
+						dims,
+					),
+				)
+		CompilerTupleType(elements):
+			compiler_types_resource_capability_function_carrier_presence_seen(
+				env,
+				visited,
+				elements,
+			)
+		CompilerRangeType(inner):
+			compiler_type_resource_capability_function_carrier_presence_seen(env, visited, inner)
+		CompilerDimOpType(_, left, right):
+			left_presence = compiler_type_resource_capability_function_carrier_presence_seen(
+				env,
+				visited,
+				left,
+			)
+
+			if compiler_resource_capability_presence_is_complete(left_presence):
+				left_presence
+			else:
+				compiler_resource_capability_presence_merge(
+					left_presence,
+					compiler_type_resource_capability_function_carrier_presence_seen(
+						env,
+						visited,
+						right,
+					),
+				)
+		_:
+			compiler_resource_capability_presence_empty()
+
+
+private pure func compiler_type_has_function_carrier_candidate_seen(
+	env: CompilerEnv,
 	visited: List[String],
 	typ: CompilerType,
 ) -> Bool:
@@ -12559,58 +12878,11 @@ private pure func compiler_function_endpoint_has_resource_capability_carrier(
 
 	match resolved:
 		CompilerFunctionType(_, _, _):
-			compiler_type_contains_resource_capability_function_carrier_seen(
-				env,
-				target,
-				visited,
-				resolved,
-			)
-		_:
-			(
-				compiler_type_endpoint_hides_resource_capability(env, target, resolved)
-				or compiler_type_contains_resource_capability_function_carrier_seen(
-					env,
-					target,
-					visited,
-					resolved,
-				)
-			)
-
-
-private pure func compiler_type_contains_resource_capability_function_carrier_seen(
-	env: CompilerEnv,
-	target: CompilerResourceShapeTarget,
-	visited: List[String],
-	typ: CompilerType,
-) -> Bool:
-	resolved = compiler_env_resolve_alias_head(env, typ)
-
-	match resolved:
-		CompilerFunctionType(_, params, return_type):
-			(
-				params.any(
-					func(
-						param,
-					): compiler_function_endpoint_has_resource_capability_carrier(
-						env,
-						target,
-						visited,
-						param,
-					),
-				)
-				or compiler_function_endpoint_has_resource_capability_carrier(
-					env,
-					target,
-					visited,
-					return_type,
-				)
-			)
+			True
 		CompilerNamedType(name, args):
 			owned_name: String = compiler_copy_type_scan_name(name)
 
-			if compiler_resource_capability_target_matches(target, owned_name):
-				False
-			else if visited.contains(owned_name):
+			if visited.contains(owned_name):
 				False
 			else:
 				next_visited: List[String] = visited.append(owned_name)
@@ -12620,9 +12892,8 @@ private pure func compiler_type_contains_resource_capability_function_carrier_se
 						components.any(
 							func(
 								component,
-							): compiler_type_contains_resource_capability_function_carrier_seen(
+							): compiler_type_has_function_carrier_candidate_seen(
 								env,
-								target,
 								next_visited,
 								component,
 							),
@@ -12631,75 +12902,46 @@ private pure func compiler_type_contains_resource_capability_function_carrier_se
 						args.any(
 							func(
 								arg,
-							): compiler_type_contains_resource_capability_function_carrier_seen(
+							): compiler_type_has_function_carrier_candidate_seen(
 								env,
-								target,
 								visited,
 								arg,
 							),
 						)
 		CompilerArrayType(element, dims):
 			(
-				compiler_type_contains_resource_capability_function_carrier_seen(
-					env,
-					target,
-					visited,
-					element,
-				)
+				compiler_type_has_function_carrier_candidate_seen(env, visited, element)
 				or dims.any(
 					func(
 						dim,
-					): compiler_type_contains_resource_capability_function_carrier_seen(
-						env,
-						target,
-						visited,
-						dim,
-					),
+					): compiler_type_has_function_carrier_candidate_seen(env, visited, dim),
 				)
 			)
 		CompilerTupleType(elements):
 			elements.any(
 				func(
 					element,
-				): compiler_type_contains_resource_capability_function_carrier_seen(
-					env,
-					target,
-					visited,
-					element,
-				),
+				): compiler_type_has_function_carrier_candidate_seen(env, visited, element),
 			)
 		CompilerRangeType(inner):
-			compiler_type_contains_resource_capability_function_carrier_seen(
-				env,
-				target,
-				visited,
-				inner,
-			)
+			compiler_type_has_function_carrier_candidate_seen(env, visited, inner)
 		CompilerDimOpType(_, left, right):
 			(
-				compiler_type_contains_resource_capability_function_carrier_seen(
-					env,
-					target,
-					visited,
-					left,
-				)
-				or compiler_type_contains_resource_capability_function_carrier_seen(
-					env,
-					target,
-					visited,
-					right,
-				)
+				compiler_type_has_function_carrier_candidate_seen(env, visited, left)
+				or compiler_type_has_function_carrier_candidate_seen(env, visited, right)
 			)
 		_:
 			False
 
 
-private pure func compiler_type_contains_resource_capability_function_carrier_uncached(
+private pure func compiler_type_resource_capability_function_carrier_presence(
 	env: CompilerEnv,
-	target: CompilerResourceShapeTarget,
 	typ: CompilerType,
-) -> Bool:
-	compiler_type_contains_resource_capability_function_carrier_seen(env, target, [], typ)
+) -> CompilerResourceCapabilityPresence:
+	if compiler_type_has_function_carrier_candidate_seen(env, [], typ):
+		compiler_type_resource_capability_function_carrier_presence_seen(env, [], typ)
+	else:
+		compiler_resource_capability_presence_empty()
 
 
 private pure func compiler_contains_target_memo_lookup(
@@ -12754,19 +12996,22 @@ private pure func compiler_type_contains_resource_capability(
 				memo = memo
 			}
 		None:
-			contains_capability = compiler_type_contains_resource_capability_uncached(
-				context.state.env,
-				target,
-				typ,
-			)
+			presence = compiler_type_resource_capability_presence(context.state.env, typ)
 			{
-				contains = contains_capability,
-				memo = { memo | contains_target = memo.contains_target.append({
-						target = target,
-						rigid_type_params = [],
-						typ = typ,
-						contains = contains_capability,
-					}) }
+				contains = compiler_resource_capability_presence_contains_target(presence, target),
+				memo = { memo | contains_target = memo.contains_target
+						.append({
+							target = CompilerOneShotStreamShape,
+							rigid_type_params = [],
+							typ = typ,
+							contains = presence.contains_one_shot_stream,
+						})
+						.append({
+							target = CompilerResourceSourceShape,
+							rigid_type_params = [],
+							typ = typ,
+							contains = presence.contains_resource_source,
+						}) }
 			}
 
 
@@ -12784,19 +13029,25 @@ private pure func compiler_type_contains_resource_capability_function_carrier(
 				memo = memo
 			}
 		None:
-			contains_carrier = compiler_type_contains_resource_capability_function_carrier_uncached(
+			presence = compiler_type_resource_capability_function_carrier_presence(
 				context.state.env,
-				target,
 				typ,
 			)
 			{
-				contains = contains_carrier,
-				memo = { memo | function_carrier = memo.function_carrier.append({
-						target = target,
-						rigid_type_params = [],
-						typ = typ,
-						contains = contains_carrier,
-					}) }
+				contains = compiler_resource_capability_presence_contains_target(presence, target),
+				memo = { memo | function_carrier = memo.function_carrier
+						.append({
+							target = CompilerOneShotStreamShape,
+							rigid_type_params = [],
+							typ = typ,
+							contains = presence.contains_one_shot_stream,
+						})
+						.append({
+							target = CompilerResourceSourceShape,
+							rigid_type_params = [],
+							typ = typ,
+							contains = presence.contains_resource_source,
+						}) }
 			}
 
 

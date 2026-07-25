@@ -823,7 +823,8 @@ let is_bootstrap_compile_plan ~output ~filename
   && options.cli_compile_output = Some output
   && options.cli_compile_files = [ filename ]
 
-let run_bootstrap_compile ~output ~filename ~preloaded_module_graph options =
+let run_bootstrap_compile ~profile ~output ~filename ~preloaded_module_graph
+    options =
   if not (is_bootstrap_compile_plan ~output ~filename options) then begin
     prerr_endline
       "Internal error: bootstrap compiler returned an unexpected compile plan";
@@ -832,7 +833,7 @@ let run_bootstrap_compile ~output ~filename ~preloaded_module_graph options =
   else
     match
       Pipeline.compile_preloaded_graph_with_blorp_bridge ~filename
-        ~preloaded_module_graph ()
+        ~preloaded_module_graph ~profile ()
     with
     | Error errors ->
         prerr_endline (format_pipeline_errors ~file:filename errors);
@@ -848,11 +849,14 @@ let run_bootstrap_compile ~output ~filename ~preloaded_module_graph options =
         0
 
 let run_compiler_host_compile_wrapper_command args =
-  match args with
-  | [ "-o"; output; filename ] -> (
+  match Compiler_host_compile_wrapper_args.parse args with
+  | Error usage ->
+      prerr_endline usage;
+      1
+  | Ok request -> (
       match
         Compiler_blorp_bridge.cli_run_via_command ~version:(Version.describe ())
-          [ "compile"; "--no-format"; "-o"; output; filename ]
+          [ "compile"; "--no-format"; "-o"; request.output; request.filename ]
       with
       | Error (_, message) ->
           prerr_endline message;
@@ -861,16 +865,13 @@ let run_compiler_host_compile_wrapper_command args =
           let preloaded_module_graph, options =
             bootstrap_compile_graph_of_cli_frontend_module_graph graph
           in
-          run_bootstrap_compile ~output ~filename ~preloaded_module_graph options
+          run_bootstrap_compile ~profile:request.profile ~output:request.output
+            ~filename:request.filename ~preloaded_module_graph options
       | Ok _ ->
           prerr_endline
             "Internal error: compiler host compile wrapper expected a Blorp \
              frontend compile graph";
           1)
-  | _ ->
-      prerr_endline
-        "Usage: blorp __compiler-host-compile-wrapper -o <out.c> <file.brp>";
-      1
 
 let test_mode_of_cli_frontend =
   let open Compiler_blorp_bridge in

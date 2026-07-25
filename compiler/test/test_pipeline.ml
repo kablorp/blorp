@@ -1375,6 +1375,37 @@ let test_selective_record_import_allows_prelude_field_types () =
                 ("prelude field types should not require explicit imports:\n"
                ^ format_errors errors)))
 
+let test_profiled_preloaded_graph_compile_emits_runtime_hooks () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_profiled_preloaded_graph" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let source = "func main(args: List[String]) -> Int:\n    0\n" in
+          write_file main_path source;
+          let parsed =
+            parse_typecheck_source_for_test ~path:main_path ~module_name:"main"
+          in
+          let preloaded_module_graph =
+            preloaded_graph_for_single_source ~path:main_path ~source ~parsed
+          in
+          match
+            Pipeline.compile_preloaded_graph_with_blorp_bridge
+              ~embed_runtime:false ~profile:true ~filename:main_path
+              ~preloaded_module_graph ()
+          with
+          | Ok (Pipeline.Compiled { c_code; _ }) ->
+              Alcotest.(check bool)
+                "function hooks emitted" true
+                (contains c_code "blorp_profile_start(");
+              Alcotest.(check bool)
+                "profile report emitted" true
+                (contains c_code "atexit(blorp_profile_report)")
+          | Ok (Pipeline.Stopped_at _) ->
+              Alcotest.fail "profiled preloaded graph compile stopped unexpectedly"
+          | Error errors ->
+              Alcotest.fail
+                ("profiled preloaded graph compile failed:\n"
+               ^ format_errors errors)))
+
 let suite =
   [
     ( "module_errors",
@@ -1475,5 +1506,7 @@ let suite =
           test_selective_record_import_allows_unimported_field_type_name;
         Alcotest.test_case "selective record import allows prelude field types"
           `Quick test_selective_record_import_allows_prelude_field_types;
+        Alcotest.test_case "profiled preloaded graph emits runtime hooks" `Quick
+          test_profiled_preloaded_graph_compile_emits_runtime_hooks;
       ] );
   ]

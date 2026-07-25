@@ -1191,6 +1191,50 @@ let test_cli_run_response_decodes_frontend_module_graph () =
   | Ok _ -> Alcotest.fail "expected decoded frontend module graph"
   | Error (_, message) -> Alcotest.fail message
 
+let test_cli_run_response_decodes_generated_frontend_origin () =
+  let response =
+    bridge_success_json
+      (Lsp_json.Object
+         [
+           ("kind", Lsp_json.String "frontend_module_graph");
+           ("command", Lsp_json.String "compile");
+           ( "args",
+             string_array
+               [ "compile"; "--no-format"; "__suite_selector_harness__.brp" ] );
+           ( "options",
+             compile_options_json [ "__suite_selector_harness__.brp" ] );
+           ("context", frontend_graph_context_json ());
+           ( "roots",
+             Lsp_json.Array
+               [
+                 frontend_graph_source
+                   ~origin:(frontend_origin_json "generated")
+                   "__suite_selector_harness__.brp"
+                   "__suite_selector_harness__" "func main(): 0";
+               ] );
+           ("modules", Lsp_json.Array []);
+           ("imports", Lsp_json.Array []);
+           ("diagnostics", Lsp_json.Array []);
+         ])
+  in
+  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
+  | Ok
+      (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
+        {
+          cli_frontend_graph_roots =
+            [
+              {
+                cli_frontend_graph_origin =
+                  Blorp.Compiler_blorp_bridge.CliFrontendGeneratedModule;
+                _;
+              };
+            ];
+          _;
+        }) ->
+      ()
+  | Ok _ -> Alcotest.fail "expected decoded generated frontend origin"
+  | Error (_, message) -> Alcotest.fail message
+
 let test_cli_run_response_rejects_source_run_frontend_graph () =
   let response =
     bridge_success_json
@@ -2162,6 +2206,8 @@ let suite =
           test_cli_run_response_decodes_test_options;
         Alcotest.test_case "CLI run response decodes frontend module graph"
           `Quick test_cli_run_response_decodes_frontend_module_graph;
+        Alcotest.test_case "CLI run response decodes generated frontend origin"
+          `Quick test_cli_run_response_decodes_generated_frontend_origin;
         Alcotest.test_case "CLI run response rejects source run frontend graph"
           `Quick test_cli_run_response_rejects_source_run_frontend_graph;
         Alcotest.test_case

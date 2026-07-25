@@ -86,6 +86,39 @@ These opt-in compiler benchmarks exercise production bridge actions with
 bounded synthetic fixtures. They are not runtime language comparisons and are
 deliberately excluded from `bench.sh all`.
 
+### Typecheck Function Profile
+
+`compiler_typecheck_profile` runs a bounded synthetic graph through
+`compiler_typecheck_graph` in-process with function profiling enabled:
+
+```bash
+benchmarks/compiler_typecheck_profile
+benchmarks/compiler_typecheck_profile 2 2 64 128
+```
+
+The positional controls are iterations, module count, nested type depth, and
+typed probes per module. The default `1 1 64 128` workload is intended for fast
+local comparisons. The runner builds the profiled executable through the
+compiler host's canonical preloaded graph and caches it by compiler, benchmark,
+standard-library, runner, bootstrap/helper, platform, and C-toolchain content.
+The first run for a new key performs the full instrumented build; subsequent
+runs execute the cached binary directly. Benchmark stdout contains one
+`TYPECHECK_PROFILE_BENCH` summary, including `workload_valid=True` only when
+every iteration produced the expected artifact and declaration counts.
+Function and `FLAME:` profile rows are written to stderr. Function times are
+inclusive and overlap along nested call chains, so compare the same rows and
+call counts across revisions rather than adding row percentages or treating
+them as disjoint wall time.
+
+The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
+the repository root and clears std, renderer-source, prepared-helper, and
+legacy parser overrides by default. This keeps one cache key tied to one
+effective compiler graph. For source-level iteration with already prepared
+parser, renderer, and typecheck helpers, set
+`BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide their three
+`BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and
+includes their contents in the artifact cache key.
+
 ### Typecheck Type-Shape Scanning
 
 `compiler_typecheck_memory` generates nested record types and probe functions
