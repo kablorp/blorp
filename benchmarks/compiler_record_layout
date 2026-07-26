@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+host="${BLORP_RECORD_LAYOUT_HOST:-$repo_root/compiler/_build/default/bin/blorp_ocaml_host.exe}"
+source_file="${BLORP_RECORD_LAYOUT_SOURCE:-$repo_root/tests/test_compiler/codegen_audit/should_pass/compiler_record_layout.brp}"
+source_dir=$(CDPATH= cd -- "$(dirname -- "$source_file")" && pwd)
+support_header="${BLORP_RECORD_LAYOUT_SUPPORT_HEADER:-$source_dir/compiler_record_layout_ffi.h}"
+support_source="${BLORP_RECORD_LAYOUT_SUPPORT_SOURCE:-$repo_root/benchmarks/support/compiler_record_layout_ffi.c}"
+cc_command_text="${BLORP_RECORD_LAYOUT_CC:-${CC:-cc}}"
+read -r -a cc_command <<< "$cc_command_text"
+
+usage() {
+	cat <<'EOF'
+Usage: benchmarks/compiler_record_layout
+
+Compile the bounded record-layout fixture through the production backend and
+report generated-C sizeof/alignment values at -O0 and -O2.
+EOF
+}
+
+case "${1:-}" in
+	"")
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "compiler_record_layout: unexpected argument: $1" >&2
+		usage >&2
+		exit 2
+		;;
+esac
+
+if command -v shasum >/dev/null 2>&1; then
+	hash_file() {
+		shasum -a 256 "$1" | awk '{print $1}'
+	}
+elif command -v sha256sum >/dev/null 2>&1; then
+	hash_file() {
+		sha256sum "$1" | awk '{print $1}'
+	}
+else
+	echo "compiler_record_layout requires shasum or sha256sum." >&2
+	exit 1
+fi
+
+if [ "${#cc_command[@]}" -eq 0 ] || ! command -v "${cc_command[0]}" >/dev/null 2>&1; then
+	echo "compiler_record_layout: C compiler command is not available: $cc_command_text" >&2
+	exit 1
+fi
+
+hash_text() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 | awk '{print $1}'
+	else
+		sha256sum | awk '{print $1}'
+	fi
+}
+
+if [ "${BLORP_RECORD_LAYOUT_SKIP_BUILD:-0}" != "1" ]; then
+	make -C "$repo_root" build >/dev/null
+fi
+
+bridge_compiler="${BLORP_COMPILER_BRIDGE_BIN:-}"
+if [ -z "$bridge_compiler" ]; then
+	bridge_compiler=$("$repo_root/scripts/blorp-compiler-bootstrap" --print-path)
+fi
+if [[ "$bridge_compiler" != /* ]]; then
+	bridge_compiler="$PWD/$bridge_compiler"
+fi
+
+export BLORP_COMPILER_BRIDGE_BIN="$bridge_compiler"
+unset \
+	BLORP_COMPILER_BRIDGE_RENDERER_SOURCE \
+	BLORP_COMPILER_PARSER_BRIDGE_BIN \
+	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
+	BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE \
+	BLORP_COMPILER_TYPECHECK_BRIDGE_BIN \
+	BLORP_FRONTEND_PARSER \
+	BLORP_STD
+
+stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-record-layout.XXXXXX")
+trap 'rm -rf "$stage_dir"' EXIT
+
+generated_c="$stage_dir/compiler_record_layout.c"
+probe_c="$stage_dir/compiler_record_layout_probe.c"
+
+cd "$repo_root"
+"$host" __compiler-host-compile-wrapper \
+	-o "$generated_c" \
+	"$source_file" >/dev/null
+
+while IFS= read -r expected_c; do
+	if ! grep -Fq "$expected_c" "$generated_c"; then
+		echo "compiler_record_layout: missing generated C expectation: $expected_c" >&2
+		exit 1
+	fi
+done < <(sed -n 's/^-- EXPECT-C: *//p' "$source_file")
+
+three_flags_type="LayoutThreeFlags"
+mixed_type="LayoutMixed"
+heap_flags_type="LayoutHeapFlags"
+foreign_mixed_type="LayoutForeignMixed"
+
+cp "$generated_c" "$probe_c"
+{
+	printf '\n#include <stddef.h>\n#include <stdio.h>\n'
+	printf '#ifndef BLORP_LAYOUT_OPT\n#define BLORP_LAYOUT_OPT "unknown"\n#endif\n'
+	printf 'static size_t blorp_record_layout_allocator_bytes(size_t size) {\n'
+	printf '  int allocation_class = blorp_pool_class(size);\n'
+	printf '  return allocation_class >= 0 ? blorp_pool_sizes[allocation_class] : size;\n'
+	printf '}\n'
+	printf '__attribute__((constructor)) static void blorp_report_record_layout(void) {\n'
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=three_flags size=%%zu align=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s));\n' \
+		"$three_flags_type" "$three_flags_type" "$three_flags_type"
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=mixed size=%%zu align=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s));\n' \
+		"$mixed_type" "$mixed_type" "$mixed_type"
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu third_offset=%%zu third_size=%%zu payload_offset=%%zu payload_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, second), sizeof(((%s*)0)->second), offsetof(%s, third), sizeof(((%s*)0)->third), offsetof(%s, payload), sizeof(((%s*)0)->payload));\n' \
+		"$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type" "$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type" \
+		"$heap_flags_type" "$heap_flags_type"
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_mixed size=%%zu align=%%zu first_offset=%%zu first_size=%%zu count_offset=%%zu count_size=%%zu second_offset=%%zu second_size=%%zu total_offset=%%zu total_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, count), sizeof(((%s*)0)->count), offsetof(%s, second), sizeof(((%s*)0)->second), offsetof(%s, total), sizeof(((%s*)0)->total));\n' \
+		"$foreign_mixed_type" \
+		"$foreign_mixed_type" "$foreign_mixed_type" \
+		"$foreign_mixed_type" "$foreign_mixed_type" \
+		"$foreign_mixed_type" "$foreign_mixed_type" \
+		"$foreign_mixed_type" "$foreign_mixed_type" \
+		"$foreign_mixed_type" "$foreign_mixed_type"
+	printf '}\n'
+} >> "$probe_c"
+
+git_revision=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf 'unknown')
+if git -C "$repo_root" diff --quiet --ignore-submodules HEAD -- 2>/dev/null \
+	&& [ -z "$(git -C "$repo_root" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+	git_state="clean"
+else
+	git_state="dirty"
+fi
+cc_version=$("${cc_command[@]}" --version 2>&1 | sed -n '1p')
+cc_target=$("${cc_command[@]}" -dumpmachine 2>/dev/null || printf 'unknown')
+
+printf 'RECORD_LAYOUT_META schema=1 platform=%s git_revision=%s git_state=%s source_sha256=%s support_header_sha256=%s support_source_sha256=%s host_sha256=%s bridge_compiler_sha256=%s cc_command_sha256=%s cc_version_sha256=%s cc_target=%s generated_c_sha256=%s\n' \
+	"$(uname -srm | tr ' ' '_')" \
+	"$git_revision" \
+	"$git_state" \
+	"$(hash_file "$source_file")" \
+	"$(hash_file "$support_header")" \
+	"$(hash_file "$support_source")" \
+	"$(hash_file "$host")" \
+	"$(hash_file "$bridge_compiler")" \
+	"$(printf '%s' "$cc_command_text" | hash_text)" \
+	"$(printf '%s' "$cc_version" | hash_text)" \
+	"$(printf '%s' "$cc_target" | tr ' ' '_')" \
+	"$(hash_file "$generated_c")"
+
+for optimization in O0 O2; do
+	binary="$stage_dir/compiler_record_layout_$optimization"
+	"${cc_command[@]}" "-$optimization" -std=gnu11 -fwrapv -pipe -w \
+		-I "$source_dir" \
+		"-DBLORP_LAYOUT_OPT=\"$optimization\"" \
+		"$probe_c" "$support_source" -lm -lpthread -o "$binary"
+	"$binary" | awk '/^RECORD_LAYOUT / { print }'
+done

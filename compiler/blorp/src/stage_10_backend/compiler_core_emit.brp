@@ -323,12 +323,7 @@ import:
 		CoreTaskCaptureKind(TaskCopyCapture, TaskMoveResourceItem, TaskStructuredTaskBorrow),
 		CoreTaskClosure,
 		CoreTensorBoxedLiteral,
-		CoreTensorDim(
-			TensorDimOperation,
-			TensorRuntimeDim,
-			TensorStaticDim,
-			TensorVariadicDim,
-		),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreTensorForElementStorage(
 			TensorForBoxedElement,
 			TensorForInlineStructElement,
@@ -662,6 +657,16 @@ import:
 		TupleRetainElemArgs,
 		render_prepared_tuple_op,
 	compiler_build_artifact: CArtifact
+	compiler_core_emit_record_layout:
+		CompilerCRecordLayout(ForeignAbiLayout, InternalLayout),
+		CompilerCRecordLayoutRegistry,
+		CompilerCValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
+		c_heap_record_field_type,
+		c_heap_record_layout,
+		c_record_layout,
+		c_value_record_field_storage,
+		c_value_record_field_type_is_boolean,
+		classify_c_record_layouts,
 	compiler_core_emit_type_layout as TypeLayout
 	string: string as make_string
 
@@ -4974,6 +4979,57 @@ private pure func foreign_borrow_arg_value(arg: CoreExpr, value: String) -> Stri
 		value
 
 
+private pure func foreign_arg_may_be_packed_boolean_field(arg: CoreExpr) -> Bool:
+	match arg:
+		FieldExpr(_, _, typ, _):
+			c_value_record_field_type_is_boolean(typ)
+		_:
+			False
+
+
+private pure func materialize_foreign_boolean_field_args(
+	args: List[CoreExpr],
+	args_body: CallArgsBody,
+) -> Option[CallArgsBody]:
+	if args.length() != args_body.args.length():
+		None
+	else:
+		var statements: String = args_body.statements
+		var values: List[String] = []
+		var temp_index: Int = args_body.next_temp
+		var failed: Bool = False
+		var index: Int = 0
+
+		for arg in args:
+			if not failed:
+				match args_body.args.get(index):
+					Some(arg_value):
+						if foreign_arg_may_be_packed_boolean_field(arg):
+							temp: String = temp_name("ffi_scalar_arg", temp_index)
+							statements += "  " + c_type_name(
+								core_expr_type(arg),
+							) + " " + temp + " = " + arg_value + ";\n"
+							values = values.append(temp)
+							temp_index += 1
+						else:
+							values = values.append(arg_value)
+					None:
+						failed = True
+						break
+
+			index += 1
+
+		if failed:
+			None
+		else:
+			Some({
+				statements = statements,
+				args = values,
+				cleanup_slots = args_body.cleanup_slots,
+				next_temp = temp_index,
+			})
+
+
 private pure func emit_foreign_borrow_args_body(
 	args: List[CoreExpr],
 	args_body: CallArgsBody,
@@ -5070,12 +5126,13 @@ private pure func emit_foreign_call_args_body(
 	next_temp: Int,
 ) -> Option[ForeignCallArgsBody]:
 	args_body ?= emit_call_args_body(args, next_temp)
+	materialized_args ?= materialize_foreign_boolean_field_args(args, args_body)
 
 	match arg_passing:
 		ForeignBorrowArgs:
-			emit_foreign_borrow_args_body(args, args_body)
+			emit_foreign_borrow_args_body(args, materialized_args)
 		ForeignDefaultArgs(policies):
-			emit_foreign_default_args_body(args, policies, args_body)
+			emit_foreign_default_args_body(args, policies, materialized_args)
 
 
 private pure func emit_foreign_call_body(
@@ -11726,8 +11783,9 @@ private pure func apply_let_cleanup_to_body(
 private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
-			body_consumes_var(scrutinee, variable) or cases.any(
-				func(case): body_consumes_var(case.body, variable),
+			(
+				body_consumes_var(scrutinee, variable)
+				or cases.any(func(case): body_consumes_var(case.body, variable))
 			)
 		CallExpr(kind, callee, args, typ, loc):
 			call_consumes_var(kind, args, variable)
@@ -21443,23 +21501,57 @@ private pure func emit_global_runtime_init_body(
 		})
 
 
-private pure func c_value_record_field_decl(field: CoreValueRecordField) -> String:
-	c_type_name(field.typ) + " " + c_identifier(field.name) + "; "
+private pure func c_value_record_field_decl(
+	field: CoreValueRecordField,
+	layout: CompilerCRecordLayout,
+	has_boolean_neighbor: Bool,
+) -> String:
+	field_name: String = c_identifier(field.name)
+
+	match c_value_record_field_storage(layout, field.typ, has_boolean_neighbor):
+		OrdinaryCValueRecordField(c_type):
+			c_type + " " + field_name + "; "
+		PackedBooleanCValueRecordField:
+			"_Bool " + field_name + " : 1; "
 
 
 private pure func c_value_record_make_param(field: CoreValueRecordField) -> String:
 	c_type_name(field.typ) + " " + c_identifier(field.name)
 
 
-private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> String:
+private pure func value_record_field_at_is_boolean(
+	fields: List[CoreValueRecordField],
+	index: Int,
+) -> Bool:
+	match fields.get(index):
+		Some(field):
+			c_value_record_field_type_is_boolean(field.typ)
+		None:
+			False
+
+
+private pure func emit_value_record_decl(
+	record_decl: CoreValueRecordDecl,
+	layout: CompilerCRecordLayout,
+) -> String:
 	var fields_c: String = ""
 	var params: List[String] = []
 	var init_fields: List[String] = []
+	var field_index: Int = 0
 
 	for field in record_decl.fields:
-		fields_c += c_value_record_field_decl(field)
+		has_boolean_neighbor: Bool = (
+			(
+				field_index > 0
+				and value_record_field_at_is_boolean(record_decl.fields, field_index - 1)
+			)
+			or value_record_field_at_is_boolean(record_decl.fields, field_index + 1)
+		)
+
+		fields_c += c_value_record_field_decl(field, layout, has_boolean_neighbor)
 		params = params.append(c_value_record_make_param(field))
 		init_fields = init_fields.append(c_identifier(field.name))
+		field_index += 1
 
 	param_c: String = if params.length() == 0:
 		"void"
@@ -21471,8 +21563,11 @@ private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> St
 	) + " }; return __r; }\n\n"
 
 
-private pure func heap_record_field_decl(field: CoreHeapRecordField) -> String:
-	"  " + c_type_name(field.typ) + " " + c_identifier(field.name) + ";\n"
+private pure func heap_record_field_decl(
+	field: CoreHeapRecordField,
+	layout: CompilerCRecordLayout,
+) -> String:
+	"  " + c_heap_record_field_type(layout, field.typ) + " " + c_identifier(field.name) + ";\n"
 
 
 private pure func heap_record_make_param(field: CoreHeapRecordField) -> String:
@@ -21525,7 +21620,10 @@ private pure func emit_heap_record_destructor(record_decl: CoreHeapRecordDecl) -
 		""
 
 
-private pure func emit_heap_record_decl(record_decl: CoreHeapRecordDecl) -> String:
+private pure func emit_heap_record_decl(
+	record_decl: CoreHeapRecordDecl,
+	layout: CompilerCRecordLayout,
+) -> String:
 	var fields_c: String = ""
 	var params: List[String] = []
 	var assignments: String = ""
@@ -21533,7 +21631,7 @@ private pure func emit_heap_record_decl(record_decl: CoreHeapRecordDecl) -> Stri
 
 	for field in record_decl.fields:
 		field_name: String = c_identifier(field.name)
-		fields_c += heap_record_field_decl(field)
+		fields_c += heap_record_field_decl(field, layout)
 		params = params.append(heap_record_make_param(field))
 		assignments += "  __rec->" + field_name + " = " + field_name + ";\n"
 
@@ -21964,13 +22062,22 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 	) + constructors_c + reuse_constructors_c
 
 
-private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_value_record_decls(
+	decls: List[CoreDecl],
+	layouts: CompilerCRecordLayoutRegistry,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			ValueRecordDecl(record_decl):
-				c_code = append_emitted_c(c_code, emit_value_record_decl(record_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_value_record_decl(
+						record_decl,
+						c_record_layout(layouts, record_decl.name),
+					),
+				)
 			HeapRecordDecl(record_decl):
 				void
 			EnumDecl(enum_decl):
@@ -22027,13 +22134,22 @@ private pure func emit_heap_record_and_union_forward_decls(decls: List[CoreDecl]
 		c_code + "\n"
 
 
-private pure func emit_heap_record_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_heap_record_decls(
+	decls: List[CoreDecl],
+	layouts: CompilerCRecordLayoutRegistry,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				c_code = append_emitted_c(c_code, emit_heap_record_decl(record_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_heap_record_decl(
+						record_decl,
+						c_heap_record_layout(layouts, record_decl.name),
+					),
+				)
 			ValueRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
@@ -22373,17 +22489,25 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 
 
 private pure func emit_decls(
-	decls: List[CoreDecl],
+	program: CoreProgram,
 	profile_enabled: Bool,
 ) -> Result[String, CoreEmitError]:
+	decls: List[CoreDecl] = program.decls
+	layouts: CompilerCRecordLayoutRegistry = classify_c_record_layouts(program)
 	global_init ?= emit_global_init_function(decls)
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
-	c_code = append_emitted_c(c_code, emit_value_record_decls(decls))
+	c_code = append_emitted_c(
+		c_code,
+		emit_value_record_decls(decls, layouts),
+	)
 	c_code = append_emitted_c(c_code, emit_enum_decls(decls))
 	c_code = append_emitted_c(c_code, emit_generated_stack_option_typedefs(decls))
 	c_code = append_emitted_c(c_code, emit_union_decls(decls))
-	c_code = append_emitted_c(c_code, emit_heap_record_decls(decls))
+	c_code = append_emitted_c(
+		c_code,
+		emit_heap_record_decls(decls, layouts),
+	)
 	c_code = append_emitted_c(c_code, emit_static_closure_forward_decls(decls))
 	c_code = append_emitted_c(c_code, emit_function_forward_decls(decls))
 	c_code = append_emitted_c(c_code, emit_global_decls(decls))
@@ -22411,7 +22535,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	match prepared:
 		PreparedCore(program):
-			decls_c ?= emit_decls(program.decls, profile_enabled)
+			decls_c ?= emit_decls(program, profile_enabled)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 					program.foreign_includes,

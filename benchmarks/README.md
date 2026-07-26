@@ -86,6 +86,24 @@ These opt-in compiler benchmarks exercise production bridge actions with
 bounded synthetic fixtures. They are not runtime language comparisons and are
 deliberately excluded from `bench.sh all`.
 
+### Compiler Record Layout
+
+`compiler_record_layout` compiles a bounded fixture through the production
+backend and reports generated-C `sizeof` and `_Alignof` values at both `-O0`
+and `-O2`. The heap row also reports the allocation bytes selected by the
+runtime's small-object pool:
+
+```bash
+benchmarks/compiler_record_layout
+```
+
+The fixture covers consecutive Boolean fields in a value struct, interleaved
+Boolean and machine-word fields, Boolean fields in a heap record, and a value
+struct reachable from a foreign signature. The runner appends a temporary
+layout reporter to the generated C; it does not modify production sources or
+artifacts. Use it as the fast feedback loop for
+`docs/COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md`.
+
 ### Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through

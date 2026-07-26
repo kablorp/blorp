@@ -168,6 +168,53 @@ if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
 	exit 1
 fi
 
+benchmark_cache=$(mktemp -d "${TMPDIR:-/tmp}/blorp-profile-cache-test.XXXXXX")
+trap 'rm -rf "$benchmark_cache"' EXIT
+mkdir -p "$benchmark_cache/compiler-typecheck-profile/fixed-hash"
+profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/compiler_typecheck_profile"
+printf '#!/usr/bin/env bash\nprintf "PROFILE_CACHE_SMOKE\\n"\n' >"$profile_cache_binary"
+chmod +x "$profile_cache_binary"
+
+make() {
+	:
+}
+
+find() {
+	:
+}
+
+shasum() {
+	if [ "$#" -eq 2 ]; then
+		while IFS= read -r _; do
+			:
+		done
+	fi
+	printf 'fixed-hash  mocked\n'
+}
+
+cc() {
+	printf 'mock cc\n'
+}
+
+uname() {
+	printf 'mock-platform\n'
+}
+
+export -f make find shasum cc uname
+profile_cache_output=$(
+	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
+	BLORP_COMPILER_BRIDGE_BIN=/bin/true \
+	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
+	./benchmarks/compiler_typecheck_profile
+)
+unset -f make find shasum cc uname
+if [ "$profile_cache_output" != "PROFILE_CACHE_SMOKE" ]; then
+	echo "FAIL: compiler_typecheck_profile must support default mode under set -u" >&2
+	exit 1
+fi
+rm -rf "$benchmark_cache"
+trap - EXIT
+
 release_workflow=.github/workflows/release.yml
 if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||

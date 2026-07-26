@@ -162,6 +162,7 @@ hygiene-check:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
+	@tests/test_compiler_record_layout_benchmark.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
 	@tests/test_release_toolchain.sh
