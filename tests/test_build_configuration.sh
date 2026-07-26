@@ -257,6 +257,36 @@ then
 	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
 	exit 1
 fi
+if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "$ci_workflow" ||
+	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_workflow" ||
+	! grep -Fq '>> "$GITHUB_ENV"' "$ci_workflow" ||
+	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_workflow" ||
+	! grep -Fq './blorp __compiler-bridge-prepare' "$ci_workflow" ||
+	! grep -Fq 'name: Select compiler bridge toolchain' "$ci_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}' "$ci_workflow" ||
+	! grep -Fq "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'" "$ci_workflow" ||
+	! grep -Fq 'name: Package tested toolchain' "$ci_workflow" ||
+	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_workflow" ||
+	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_workflow" ||
+	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_workflow" ||
+	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_workflow" ||
+	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_workflow" ||
+	! grep -Fq 'grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}"' "$ci_workflow" ||
+	! grep -Fq 'grep -Fxq "dirty: false"' "$ci_workflow" ||
+	! grep -Fq 'name: Upload tested toolchain archive' "$ci_workflow" ||
+	! grep -Fq 'name: blorp-${{ steps.release-meta.outputs.target }}' "$ci_workflow" ||
+	! grep -Fq 'path: dist/*' "$ci_workflow" ||
+	! grep -Fq 'bash scripts/test --no-build --serial' "$ci_workflow"
+then
+	echo "FAIL: main CI must preserve and qualify the exact compiler it tested for dev releases" >&2
+	exit 1
+fi
+ci_prepare_line=$(grep -nF 'name: Prepare tested compiler bridges' "$ci_workflow" | head -n 1 | cut -d: -f1)
+ci_test_line=$(grep -nF 'name: Run test suites' "$ci_workflow" | head -n 1 | cut -d: -f1)
+if [ "$ci_prepare_line" -ge "$ci_test_line" ]; then
+	echo "FAIL: main CI must prepare the packaged bridge generation before running tests" >&2
+	exit 1
+fi
 
 premerge_workflow=.github/workflows/premerge.yml
 if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
@@ -265,15 +295,39 @@ if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
 fi
 
 release_workflow=.github/workflows/release.yml
+release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
+release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
+if grep -Fq 'workflow_run' <<<"$release_build_job" ||
+	! grep -Fq "github.event_name == 'push'" <<<"$release_build_job" ||
+	! grep -Fq "startsWith(github.ref, 'refs/tags/v')" <<<"$release_build_job"
+then
+	echo "FAIL: successful main CI must not rebuild the tested compiler during release" >&2
+	exit 1
+fi
+if grep -Fq 'make install' <<<"$release_publish_job"; then
+	echo "FAIL: release publishing must not rebuild downloaded CI toolchains" >&2
+	exit 1
+fi
 if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
-	! grep -Fq '"$package_dir/blorp" test' "$release_workflow"
+	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
+	! grep -Fq 'name: Download tested CI binaries' "$release_workflow" ||
+	! grep -Fq 'run-id: ${{ github.event.workflow_run.id }}' "$release_workflow" ||
+	! grep -Fq 'pattern: blorp-*' "$release_workflow" ||
+	! grep -Fq 'merge-multiple: true' "$release_workflow" ||
+	! grep -Fq 'name: Validate release assets' "$release_workflow" ||
+	! grep -Fq 'assets=(dist/*)' <<<"$release_publish_job" ||
+	! grep -Fq 'actual=$(shasum -a 256 "$archive"' <<<"$release_publish_job" ||
+	! grep -Fq '[ "$actual" != "$expected" ]' <<<"$release_publish_job" ||
+	! grep -Fq 'x86_64-unknown-linux-gnu' <<<"$release_publish_job" ||
+	! grep -Fq 'aarch64-unknown-linux-gnu' <<<"$release_publish_job" ||
+	! grep -Fq 'aarch64-apple-darwin' <<<"$release_publish_job"
 then
-	echo "FAIL: release CI must exercise self-hosting and both private workers from the archive" >&2
+	echo "FAIL: release CI must consume tested dev archives and qualify independently versioned tag archives" >&2
 	exit 1
 fi
 

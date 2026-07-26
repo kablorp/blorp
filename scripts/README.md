@@ -30,12 +30,17 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --coverage         # compiler-unit coverage
+scripts/test --no-build         # test the existing installed toolchain
 scripts/test --timings          # print unit cases and generated-suite phases
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
 per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
+`--no-build` is for controlled CI or local workflows that have already run the
+required build and need to preserve that exact toolchain through validation.
+Without it, `scripts/test` continues to build or install its selected compiler
+before running gates.
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.
@@ -297,6 +302,14 @@ Useful environment variables:
 
 The three prepared bridge overrides must be supplied together so one archive
 cannot mix helpers from different compiler generations.
+
+On main, CI builds the compiler once with its final dev release metadata,
+prepares the next compiler bridge generation, runs the normal test gates against
+that complete toolchain, smokes the archive, and uploads it as a workflow
+artifact. The dev release workflow downloads and publishes those exact bytes
+instead of compiling the compiler again. Explicit `v*` tags still build
+independently because the tagged version embedded in the executable differs from
+the dev version tested on main.
 
 `scripts/install-dev` installs the latest moving `dev` release:
 

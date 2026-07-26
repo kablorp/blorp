@@ -63,6 +63,14 @@ if [ "\${1:-}" = "test" ]; then
 			exit 3
 		fi
 	fi
+	if [ -n "\${BLORP_TEST_EXPECTED_RENDERER:-}" ] \
+		&& { [ "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_RENDERER" ] \
+			|| [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_PARSER" ] \
+			|| [ "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TYPECHECK" ]; }
+	then
+		echo "test command did not preserve explicit bridge helper paths" >&2
+		exit 4
+	fi
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
@@ -159,6 +167,87 @@ if [ -e "$unexpected_prepare_marker" ]; then
 fi
 
 echo "PASS: scripts/test uses the complete installed bridge toolchain"
+
+rm -f "$TMP_HARNESS/make-target-log.txt"
+no_build_output="$TMP_HARNESS/no-build-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_EXPECTED_TOOLCHAIN_DIR="$installed_toolchain" \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		bash scripts/test runtime --serial --no-build
+) > "$no_build_output" 2>&1
+no_build_status=$?
+
+if [ "$no_build_status" -ne 0 ]; then
+	echo "FAIL: scripts/test --no-build should exercise an existing toolchain"
+	cat "$no_build_output"
+	exit 1
+fi
+if [ -s "$TMP_HARNESS/make-target-log.txt" ]; then
+	echo "FAIL: scripts/test --no-build must not invoke make"
+	cat "$TMP_HARNESS/make-target-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test can test a prebuilt toolchain without rebuilding it"
+
+external_helpers="$TMP_HARNESS/external-helpers"
+mkdir -p "$external_helpers"
+external_renderer="$external_helpers/renderer"
+external_parser="$external_helpers/parser"
+external_typecheck="$external_helpers/typecheck"
+for executable in "$external_renderer" "$external_parser" "$external_typecheck"; do
+	cp /bin/sh "$executable"
+done
+explicit_helpers_output="$TMP_HARNESS/explicit-helpers-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$external_renderer" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$external_parser" \
+		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$external_typecheck" \
+		BLORP_TEST_EXPECTED_RENDERER="$external_renderer" \
+		BLORP_TEST_EXPECTED_PARSER="$external_parser" \
+		BLORP_TEST_EXPECTED_TYPECHECK="$external_typecheck" \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		bash scripts/test runtime --serial --no-build
+) > "$explicit_helpers_output" 2>&1
+explicit_helpers_status=$?
+
+if [ "$explicit_helpers_status" -ne 0 ]; then
+	echo "FAIL: scripts/test --no-build should preserve explicit helper paths"
+	cat "$explicit_helpers_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test preserves an explicitly selected prebuilt helper generation"
+
+no_build_coverage_output="$TMP_HARNESS/no-build-coverage-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		bash scripts/test --no-build --coverage compiler-unit
+) > "$no_build_coverage_output" 2>&1
+no_build_coverage_status=$?
+
+if [ "$no_build_coverage_status" -eq 0 ]; then
+	echo "FAIL: scripts/test must reject --no-build with --coverage"
+	cat "$no_build_coverage_output"
+	exit 1
+fi
+if ! grep -Fq -- "--no-build cannot be combined with --coverage" \
+	"$no_build_coverage_output"
+then
+	echo "FAIL: incompatible no-build coverage options need a precise diagnostic"
+	cat "$no_build_coverage_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test rejects coverage when builds are disabled"
 
 partial_toolchain_output="$TMP_HARNESS/partial-toolchain-output.txt"
 (
