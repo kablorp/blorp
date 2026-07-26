@@ -420,6 +420,14 @@ private CORE_INT_MIN_MAGNITUDE_DECIMAL: String = "9223372036854775808"
 
 private MICROSECONDS_PER_MILLISECOND: Int = 1000
 
+private PARALLEL_VECTOR_TYPE_NAME: String = "ParallelVector"
+
+private CANONICAL_PARALLEL_VECTOR_TYPE_NAME: String = "std/vector::ParallelVector"
+
+private PARALLEL_MATRIX_TYPE_NAME: String = "ParallelMatrix"
+
+private CANONICAL_PARALLEL_MATRIX_TYPE_NAME: String = "std/matrix::ParallelMatrix"
+
 
 union CompilerCoreLowerError:
 	CompilerCoreLowerUnsupported(String)
@@ -692,16 +700,36 @@ private pure func compiler_core_lower_type_list(
 			Ok(lowered)
 
 
+private pure func compiler_core_lower_tensor_type(
+	element: CompilerType,
+	dims: List[CompilerType],
+) -> Result[CoreType, CompilerCoreLowerError]:
+	element_type ?= compiler_core_lower_type(element)
+	core_dims ?= compiler_core_tensor_dims(dims)
+
+	Ok(TensorType({
+		element_type = element_type,
+		dims = core_dims,
+	}))
+
+
+private pure func malformed_parallel_tensor_type(
+	typ: CompilerType,
+	expected: String,
+) -> Result[CoreType, CompilerCoreLowerError]:
+	Err(
+		CompilerCoreLowerInvalidType(
+			"scoped parallel tensor type " + compiler_type_to_string(
+				typ,
+			) + " must have " + expected,
+		),
+	)
+
+
 pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, CompilerCoreLowerError]:
 	match compiler_array_type_parts(typ):
 		Some((element, dims)):
-			element_type ?= compiler_core_lower_type(element)
-			core_dims ?= compiler_core_tensor_dims(dims)
-
-			Ok(TensorType({
-				element_type = element_type,
-				dims = core_dims,
-			}))
+			compiler_core_lower_tensor_type(element, dims)
 		None:
 			match typ:
 				CompilerNamedType(name, args):
@@ -711,6 +739,33 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 
 					if normalized == TYPE_NAME_VOID and args.length() == 0:
 						Ok(VoidType)
+					else if (
+						name == PARALLEL_VECTOR_TYPE_NAME
+						or name == CANONICAL_PARALLEL_VECTOR_TYPE_NAME
+					):
+						match args:
+							[element, dim]:
+								compiler_core_lower_tensor_type(element, [dim])
+							_:
+								malformed_parallel_tensor_type(
+									typ,
+									"an element type and one dimension",
+								)
+					else if (
+						name == PARALLEL_MATRIX_TYPE_NAME
+						or name == CANONICAL_PARALLEL_MATRIX_TYPE_NAME
+					):
+						match args:
+							[element, rows, columns]:
+								compiler_core_lower_tensor_type(
+									element,
+									[rows, columns],
+								)
+							_:
+								malformed_parallel_tensor_type(
+									typ,
+									"an element type and two dimensions",
+								)
 					else if (
 						normalized == TYPE_NAME_TENSOR
 						or normalized == TYPE_NAME_VECTOR
@@ -724,8 +779,19 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 							),
 						)
 					else:
-						lowered_args ?= compiler_core_lower_type_list(args)
-						Ok(NamedType(normalized, lowered_args))
+						match compiler_core_lower_type_list(args):
+							Ok(lowered_args):
+								Ok(NamedType(normalized, lowered_args))
+							Err(CompilerCoreLowerInvalidType(message)):
+								Err(
+									CompilerCoreLowerInvalidType(
+										"type " + compiler_type_to_string(
+											typ,
+										) + " has an invalid argument: " + message,
+									),
+								)
+							Err(error):
+								Err(error)
 				CompilerTupleType(elements):
 					lowered_elements ?= compiler_core_lower_type_list(elements)
 					Ok(TupleType(lowered_elements))
@@ -2298,6 +2364,12 @@ private pure func lower_typed_lambda_params(
 						typ = param_type,
 						loc = compiler_core_source_loc(param.name.span),
 					})
+				Err(CompilerCoreLowerInvalidType(message)):
+					failure = Some(
+						CompilerCoreLowerInvalidType(
+							"lambda parameter `" + param.name.text + "` has an invalid type: " + message,
+						),
+					)
 				Err(error):
 					failure = Some(error)
 
@@ -4453,12 +4525,21 @@ private pure func compiler_core_lower_param(
 ) -> Result[CoreParam, CompilerCoreLowerError]:
 	match param.binder:
 		ParsedParamNameBinder(name):
-			typ ?= compiler_core_lower_type(param_type)
-			Ok({
-				name = core_var(name.text, None),
-				typ = typ,
-				loc = compiler_core_source_loc(name.span),
-			})
+			match compiler_core_lower_type(param_type):
+				Ok(typ):
+					Ok({
+						name = core_var(name.text, None),
+						typ = typ,
+						loc = compiler_core_source_loc(name.span),
+					})
+				Err(CompilerCoreLowerInvalidType(message)):
+					Err(
+						CompilerCoreLowerInvalidType(
+							"parameter `" + name.text + "` has an invalid type: " + message,
+						),
+					)
+				Err(error):
+					Err(error)
 		_:
 			Err(
 				CompilerCoreLowerInvalidParam(

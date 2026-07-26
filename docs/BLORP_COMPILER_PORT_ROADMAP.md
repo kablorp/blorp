@@ -22,10 +22,10 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> Blorp typecheck / CTFE
   -> Blorp Core lowering / module flattening / FFI boundary / initial list layout
-  -> Blorp debug / desugar / SSA / mono / post-mono list layout
-  -> strict post-mono semantic-middle request
+  -> Blorp debug / desugar / SSA / mono / post-mono list layout / synthesis
+  -> strict post-synthesis semantic-middle request
   -> one blorp-ocaml-middle process
-  -> OCaml Core middle from synth through the remaining registry-dependent
+  -> OCaml Core middle from match through the remaining registry-dependent
      specialization transforms
   -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
      tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
@@ -80,6 +80,9 @@ Current production Core-boundary Blorp files:
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_graph_prepare.brp`
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_ffi_boundary.brp`
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_list_layout.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_early_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_synth.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_synth_*.brp`
 - `compiler/blorp/src/stage_09_core/compiler_semantic_worker_protocol.brp`
 
 Current production backend-tail Blorp files:
@@ -103,15 +106,15 @@ Current OCaml bridge, orchestration, and production-middle files:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/core_post_mono_json.ml`
+- `compiler/lib/core_post_synth_json.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` invokes the remaining OCaml Core middle from
-`Core_synth` after the strict post-mono decoder and invariant checks. It does
-not lower typed AST or run debug, desugar/SSA, mono, or post-mono list layout on
-the normal production source path. The production JSON handoff preserves
+`Core_match` after the strict post-synthesis decoder and invariant checks. It
+does not lower typed AST or run debug, desugar/SSA, mono, post-mono list layout,
+or synthesis on the normal production source path. The production JSON handoff preserves
 concrete conversion, hash, length, numeric checked tensor-access,
 raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
 bounds-proven tensor-access builtins for Blorp specialization. Blorp is
@@ -1937,9 +1940,9 @@ Current progress:
   flattens each module before assembly, keeps the target unprefixed, preserves
   ordered foreign includes, and runs FFI and list-layout annotation exactly
   once before serialization.
-- `compiler_semantic_worker_protocol.brp` schema 3 carries post-mono Core,
+- `compiler_semantic_worker_protocol.brp` schema 4 carries post-synthesis Core,
   import tables, the next definition id, stage observations, and invariant
-  policy. `core_post_mono_json.ml` is a strict phase-specific decoder rather
+  policy. `core_post_synth_json.ml` is a strict phase-specific decoder rather
   than a permissive reuse of the late backend projection.
 - Production lowering covers the finalized typed expression and declaration
   surface, including raw patterns for the middle match compiler, record
@@ -1947,9 +1950,9 @@ Current progress:
   multidimensional enumerate, windows, concurrency, imports, globals, traits,
   impls, aliases, records, unions, and foreign declarations. Source-only or
   malformed typed nodes fail at the boundary instead of falling back to OCaml.
-- The normal CLI path is contiguous Blorp from source reads through post-mono
-  Core. The only OCaml call is the single semantic-middle worker after this
-  boundary, beginning with synthesis.
+- The normal CLI path is contiguous Blorp from source reads through
+  post-synthesis Core. The only OCaml call is the single semantic-middle worker
+  after this boundary, beginning with match compilation.
 
 - `compiler_core_lower.brp` owns typed expression/declaration lowering with
   explicit context state for Core definition ids and source-module ownership.
@@ -1963,13 +1966,13 @@ Current progress:
   helper bodies as parameter-forwarding `BuiltinCall` expressions. It rejects
   inconsistent typed payloads, such as a forward or builtin declaration that
   unexpectedly carries a typed source body. Concrete intrinsic-body synthesis
-  remains in the semantic middle, after this lowering boundary.
+  runs in the Blorp-owned early Core pipeline after monomorphization.
 - Module flattening treats a bodyless std builtin as an implementation-bearing
   callable even though its Core body is deferred. It therefore receives the
   same canonical module identity and forward-declaration deduplication as an
   already-bodied function. Blorp mono creates concrete bodyless copies on
-  demand; the following semantic-middle synthesis stage materializes their
-  intrinsic Core bodies.
+  demand; the following Blorp synthesis stage materializes their intrinsic Core
+  bodies before the semantic-middle boundary.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the production
   boundary strict. Calls
@@ -2218,7 +2221,7 @@ Tests:
 - `compiler/blorp/tests/test_compiler_core_ffi_boundary.brp`
 - `compiler/blorp/tests/test_compiler_core_list_layout.brp`
 - `compiler/blorp/tests/test_compiler_infer.brp`
-- `compiler/test/test_core_post_mono_json.ml`
+- `compiler/test/test_core_post_synth_json.ml`
 - `compiler/test/test_semantic_middle_worker.ml`
 - `compiler/test/test_core_compatibility.ml`
 - `compiler/test/test_core_list_layout.ml`
@@ -2245,12 +2248,13 @@ Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
 Status: the normal compile/run path now executes a contiguous Blorp-owned Core
 prefix through debug lowering, desugar/SSA, monomorphization, and post-mono
-list layout. Schema 3 carries only post-mono Core across the single temporary
+list layout, followed by synthesis. Schema 4 carries only post-synthesis Core
+across the single temporary
 semantic-middle boundary. The OCaml worker validates the completed early-stage
-contracts and starts at `Core_synth`; early Core observations and stops never
-invoke the worker. The retained OCaml debug/desugar/SSA/mono implementations
-serve bootstrap and direct in-memory compatibility entrypoints, not normal
-source compilation.
+contracts and starts at `Core_match`; early Core observations and stops never
+invoke the worker. The retained OCaml debug/desugar/SSA/mono/synth
+implementations serve bootstrap and direct in-memory compatibility entrypoints,
+not normal source compilation.
 
 Blorp DCE is authoritative on the normal production path and the superseded
 OCaml DCE implementation and tests are deleted. First-class function-reference
@@ -2303,6 +2307,10 @@ orchestrator:
 
 The isolated synthesis families currently implemented are:
 
+- `compiler_core_synth_bytes.brp`: concrete `std/bytes` construction, length,
+  checked access, COW updates, slicing, concatenation, fill, search, and
+  bounds-clamped blit. Codec operations remain thin runtime forwards in the
+  forward family. Parameter references preserve full Core identity.
 - `compiler_core_synth_tensor.brp`: the complete vector-reduction family
   (`sum`, `product`, `dot`, `max`, `min`, `mean`, `cumulative_sum`, and
   `scale`). It preserves guarded typed raw views for `Int`, `Float`, and
@@ -2323,20 +2331,26 @@ The isolated synthesis families currently implemented are:
 - `compiler_core_synth_slice.brp`: all current `std/slice` operations,
   including exact byte copying, clamped sub-slices, short-circuit prefix
   comparison, and checked `Option[Char]` construction.
+- `compiler_core_synth.brp`: the single declaration walker and promotion point
+  for completed families. It preserves unhandled builtins and propagates typed
+  synthesis diagnostics. It is the authoritative production synthesis stage.
 
 Each family uses exact module and signature admission. They are body factories;
-only the eventual `compiler_core_synth.brp` orchestrator may walk declarations
-and promote a successfully synthesized builtin to a user function. These
-families are tested but intentionally not wired into production: the bridge
-remains before all synthesis until the remaining bytes/string, list, and
-set/dictionary, vector/matrix parallel families, and the single orchestrator
-have parity.
+only `compiler_core_synth.brp` may walk declarations and promote a successfully
+synthesized builtin to a user function. String, list, set/dictionary, tensor,
+and parallel-tensor families have parity and run before the single semantic
+bridge. The schema-4 worker therefore rejects `synth` observations and starts
+with match compilation.
+
+Hash-collection layout classification uses declaration-derived enum, record,
+union, and type-alias facts. Alias expansion follows generic targets and uses
+the target layout even for source-opaque aliases, matching the former OCaml
+registry behavior. Undeclared named types remain a typed synthesis error rather
+than falling back to a spelling heuristic.
 
 Remaining production OCaml references, in
-`Core_pipeline.run_core_passes_from_post_mono` order:
+`Core_pipeline.run_core_passes_from_post_synth` order:
 
-- `compiler/lib/core_synth.ml`
-  - `synthesize_program`
 - `compiler/lib/core_match.ml`
   - `compile_program`
 - `compiler/lib/core_trait_resolve.ml`
@@ -2356,6 +2370,12 @@ Remaining production OCaml references, in
 - `compiler/lib/core_specialize.ml`
   - `specialize_program`
 
+`compiler/lib/core_synth.ml` is compatibility-only. Generated TestSuite
+harnesses, the pinned-bootstrap wrapper, and direct in-memory OCaml tests still
+enter through `Core_pipeline.run_core_passes`; migrate those callers to the
+prepared post-synthesis boundary before deleting the OCaml synthesis module and
+its remaining implementation-only coverage.
+
 Blorp references:
 
 - existing `compiler_core_traverse.brp`
@@ -2374,10 +2394,8 @@ Blorp references:
   selected-function-specialization, generic-data-specialization, and generic
   trait-implementation-specialization slices plus expression-local
   `std/option` call fusion and checked diagnostics
-- future `compiler_core_synth.brp`, composed from the existing
-  `compiler_core_synth_{float,fixed,forward,slice,tensor}.brp` family modules
-  and the remaining bytes/string, list, set/dictionary, and vector/matrix
-  parallel families
+- existing `compiler_core_synth.brp`, composed from the completed synthesis
+  family modules and authoritative on the normal production path
 - future `compiler_core_match.brp`
 - future `compiler_core_trait_resolve.brp`
 - future `compiler_core_resolve.brp`
@@ -2429,9 +2447,9 @@ Implementation steps:
   variant; forms introduced after SSA are named as such instead of disappearing
   behind a wildcard.
 - The production boundary has moved contiguously through debug, desugar/SSA,
-  mono, and post-mono list layout. Keep their retained OCaml implementations
-  isolated to bootstrap and direct compatibility entrypoints; do not route
-  normal source compilation through them again.
+  mono, post-mono list layout, and synthesis. Keep their retained OCaml
+  implementations isolated to bootstrap and direct compatibility entrypoints;
+  do not route normal source compilation through them again.
 - `compiler_core_mono.brp` now owns the first self-contained
   monomorphization foundation:
   - ordinary value types, scalar tensor dimensions, and variadic dimension
@@ -2701,16 +2719,17 @@ Implementation steps:
   Focused tests cover multi-character parameters, `Self`, one-letter nominal
   negative controls, Core JSON round trips, and the OCaml handoff.
 - `compiler_core_early_pipeline.brp` is the pure contiguous executor for
-  `lower` observation, debug lowering, desugar/SSA, monomorphization, and
-  post-mono list-layout annotation. It owns explicit `next_def_id` state,
-  invariant-before-observation ordering, stage observations/stops, and typed
-  mono/invariant failures. The compile/run CLI calls this executor before
-  constructing the schema-3 post-mono request. The semantic worker accepts
-  only that phase and starts at synth. Early observations and stops are handled
-  entirely in Blorp. Observations use the canonical compact Core JSON
-  projection, the same representation used by Blorp-owned later stages. This
-  intentionally unifies Core snapshots rather than reproducing the temporary
-  OCaml human-readable printer.
+  `lower` observation, debug lowering, desugar/SSA, monomorphization,
+  post-mono list-layout annotation, and synthesis. It owns explicit
+  `next_def_id` state, invariant-before-observation ordering, stage
+  observations/stops, and typed mono/invariant/synthesis failures. The
+  compile/run CLI calls this executor before constructing the schema-4
+  post-synthesis request. The semantic worker accepts only that phase and
+  starts at match. Early observations and stops are handled entirely in Blorp.
+  Observations use the canonical compact Core JSON projection, the same
+  representation used by Blorp-owned later stages. This intentionally unifies
+  Core snapshots rather than reproducing the temporary OCaml human-readable
+  printer.
 - Debug and desugar are no longer variants of the generic late-Core stage
   dispatcher. Their only composed owner is the early executor, while their
   individual pure transforms remain available to focused tests. This prevents

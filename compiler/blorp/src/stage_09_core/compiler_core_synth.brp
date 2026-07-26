@@ -1,0 +1,110 @@
+-- Single post-monomorphization Core synthesis orchestrator.
+--
+-- Family modules only construct bodies. This module alone walks declarations
+-- and promotes a successfully synthesized builtin to an ordinary user
+-- function, keeping the stage transition explicit and testable.
+import:
+	compiler_core_json:
+		CoreDecl(FunctionDecl),
+		CoreExpr,
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreProgram,
+	compiler_core_synth_bytes: synthesize_bytes_body
+	compiler_core_synth_context: CoreSynthContext, core_synth_context
+	compiler_core_synth_error: CoreSynthError
+	compiler_core_synth_fixed: synthesize_fixed_body
+	compiler_core_synth_float: synthesize_float_body
+	compiler_core_synth_forward: synthesize_forward_body
+	compiler_core_synth_hash_collections: synthesize_hash_collection_body
+	compiler_core_synth_list: synthesize_list_body
+	compiler_core_synth_parallel_tensor: synthesize_parallel_tensor_body
+	compiler_core_synth_slice: synthesize_slice_body
+	compiler_core_synth_string: synthesize_string_body
+	compiler_core_synth_tensor: synthesize_tensor_body
+
+
+private pure func synthesize_infallible_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	var body: Option[CoreExpr] = synthesize_bytes_body(function_info)
+
+	if body.is_none():
+		body = synthesize_fixed_body(function_info)
+
+	if body.is_none():
+		body = synthesize_float_body(function_info)
+
+	if body.is_none():
+		body = synthesize_forward_body(function_info)
+
+	if body.is_none():
+		body = synthesize_slice_body(function_info)
+
+	if body.is_none():
+		body = synthesize_string_body(function_info)
+
+	if body.is_none():
+		body = synthesize_list_body(function_info)
+
+	if body.is_none():
+		body = synthesize_parallel_tensor_body(function_info)
+
+	body
+
+
+private pure func synthesize_function(
+	context: CoreSynthContext,
+	function_info: CoreFunction,
+) -> Result[CoreFunction, CoreSynthError]:
+	hash_collection_body ?= synthesize_hash_collection_body(context, function_info)
+	tensor_body ?= synthesize_tensor_body(function_info)
+	var body: Option[CoreExpr] = hash_collection_body
+
+	if body.is_none():
+		body = tensor_body
+
+	if body.is_none():
+		body = synthesize_infallible_body(function_info)
+
+	match body:
+		Some(synthesized):
+			Ok({ function_info |
+					body = Some(synthesized),
+					function_kind = UserFunction
+				})
+		None:
+			Ok(function_info)
+
+
+private pure func synthesize_decl(
+	context: CoreSynthContext,
+	decl: CoreDecl,
+) -> Result[CoreDecl, CoreSynthError]:
+	match decl:
+		FunctionDecl(function_info):
+			synthesized ?= synthesize_function(context, function_info)
+			Ok(FunctionDecl(synthesized))
+		_:
+			Ok(decl)
+
+
+pure func synthesize_program(program: CoreProgram) -> Result[CoreProgram, CoreSynthError]:
+	context: CoreSynthContext = core_synth_context(program)
+	var decls: List[CoreDecl] = []
+	var failure: Option[CoreSynthError] = None
+
+	for decl in program.decls:
+		match synthesize_decl(context, decl):
+			Ok(synthesized):
+				decls = decls.append(synthesized)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				decls = decls,
+				foreign_includes = program.foreign_includes,
+			})

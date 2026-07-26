@@ -1818,6 +1818,13 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
   | Core_stage.Debug -> check_no_debug_blocks_at stage prog
   | Core_stage.Mono ->
       check_no_tyvar_leak prog @ check_selected_direct_mono_contract prog
+  | Core_stage.Synth ->
+      (* Synthesis must preserve the durable debug, sugar, and monomorphization
+         contracts. It may introduce mutable loop state after SSA, so the
+         Desugar-stage mutation check is intentionally not repeated here. *)
+      check_no_debug_blocks_at stage prog
+      @ check_no_sugar prog @ check_no_tyvar_leak prog
+      @ check_selected_direct_mono_contract prog
   (* Sugar and CMatchArms checks run at the pass that should have
      eliminated them AND at Perceus (one stage before emit) as a
      bookend: "eliminated here, still gone there." Catches any
@@ -1851,7 +1858,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_concurrent_semantics_at stage prog
       @ check_cooperative_checkpoints_at stage prog
   (* No invariants drafted for these stages yet: *)
-  | Core_stage.Lower | Core_stage.Synth | Core_stage.TraitResolve
-  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Fusion | Core_stage.Reuse ->
+  | Core_stage.Lower | Core_stage.TraitResolve | Core_stage.Resolve
+  | Core_stage.StdInline | Core_stage.Tailrec | Core_stage.Fusion
+  | Core_stage.Reuse ->
       []

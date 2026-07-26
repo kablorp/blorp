@@ -30,19 +30,19 @@ Source (.brp)
     v
 +------------------+
 | Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
-| + Early Pipeline |  debug, desugar/SSA, mono, and list layout
+| + Early Pipeline |  debug, desugar/SSA, mono, list layout, and synthesis
 |                  |  (stage_08_core_lower, stage_09_core)
 +------------------+
     |
     v
 +------------------+
-| Post-mono bridge |  One strict JSON bridge into the OCaml semantic middle
-|                  |  (core_post_mono_json.ml)
+| Post-synth bridge |  One strict JSON bridge into the OCaml semantic middle
+|                   |  (core_post_synth_json.ml)
 +------------------+
     |
     v
 +---------------+
-| Core IR       |  OCaml synth-through-specialize middle, then the Core JSON
+| Core IR       |  OCaml match-through-specialize middle, then the Core JSON
 | middle + tail |  handoff into the Blorp-owned specialization/backend tail
 +---------------+
     |
@@ -69,11 +69,12 @@ Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the production route lowers and assembles the
 typed module graph, lowers debug blocks and mutable locals, desugars Core,
-monomorphizes generic declarations, and annotates list layouts in Blorp. One
-phase-specific bridge decodes post-mono Core into the remaining OCaml middle;
+monomorphizes generic declarations, annotates list layouts, and synthesizes
+concrete builtin bodies in Blorp. One phase-specific bridge decodes
+post-synthesis Core into the remaining OCaml middle;
 source, typed AST, and pre-mono Core do not cross this boundary. The worker
 validates the post-debug, post-desugar, and post-mono contracts before starting
-at `Core_synth`. The pipeline then crosses the late Core JSON bridge after the
+at `Core_match`. The pipeline then crosses the late Core JSON bridge after the
 remaining OCaml specialization families. Primitive
 conversion, hash, length, numeric checked tensor access,
 raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
@@ -87,8 +88,8 @@ the folded static dimension is the fact that proves loop accesses in bounds.
 Checkpoint 8 in `docs/BLORP_COMPILER_PORT_ROADMAP.md` made Blorp Core lowering,
 module flattening, FFI annotation, and initial list layout authoritative for
 normal source commands. Checkpoint 9 now also makes debug, desugar/SSA,
-monomorphization, and post-mono list layout authoritative before the single
-semantic-middle bridge. On the current backend route,
+monomorphization, post-mono list layout, and synthesis authoritative before the
+single semantic-middle bridge. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
@@ -108,7 +109,7 @@ owned by the Blorp backend bridge.
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
-the request's debug mode. The post-debug invariant runs before the post-mono
+the request's debug mode. The post-debug invariant runs before the post-synth
 bridge and rejects any node that survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
@@ -153,15 +154,15 @@ Blorp Typed AST graph
                     (compiler_core_monomorphize.brp)
     |
     v
-+-----------------------+
-| Post-mono Core bridge |  Strict structural decode plus post-debug,
-+-----------------------+  post-desugar, and post-mono invariant checks
-                           (core_post_mono_json.ml, semantic_middle_worker.ml)
++------------------+
+| Blorp Core synth |  Synthesize concrete builtin bodies and promote each
++------------------+  completed builtin to an ordinary Core function
     |
     v
-+------------+
-| Core_synth |  Re-synthesize monomorphized builtin bodies that became
-+------------+  concrete after mono (core_synth.ml)
++------------------------+
+| Post-synth Core bridge |  Strict structural decode plus post-debug,
++------------------------+  post-desugar, and post-mono invariant checks
+                            (core_post_synth_json.ml, semantic_middle_worker.ml)
     |
     v
 +------------+

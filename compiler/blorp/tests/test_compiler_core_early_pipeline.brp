@@ -4,7 +4,11 @@ import:
 		check_debug_invariants,
 	../src/stage_09_core/compiler_core_early_pipeline:
 		CoreEarlyPipelineConfiguration,
-		CoreEarlyPipelineDiagnostic(CoreEarlyInvariantDiagnostic, CoreEarlyMonoDiagnostic),
+		CoreEarlyPipelineDiagnostic(
+			CoreEarlyInvariantDiagnostic,
+			CoreEarlyMonoDiagnostic,
+			CoreEarlySynthDiagnostic,
+		),
 		CoreEarlyPipelineExecution(
 			CoreEarlyPipelineCompleted,
 			CoreEarlyPipelineFailed,
@@ -16,6 +20,7 @@ import:
 			CoreEarlyDesugarStage,
 			CoreEarlyLowerStage,
 			CoreEarlyMonoStage,
+			CoreEarlySynthStage,
 		),
 		core_early_pipeline_stage_name,
 		core_early_pipeline_stages_equal,
@@ -28,15 +33,18 @@ import:
 		CoreDecl(FunctionDecl),
 		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LiteralExpr, VarExpr, VoidExpr),
 		CoreFunction,
-		CoreFunctionKind(UserFunction),
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreLiteral(StringLiteral),
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(FunctionType, NamedType, TypeParameterType, VoidType),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(FunctionType, NamedType, TensorType, TypeParameterType, VoidType),
 		CoreVar,
 	../src/stage_09_core/compiler_core_mono_specialize:
 		CoreMonoDiagnostic(CoreMonoCannotInferTypeArgument),
+	../src/stage_09_core/compiler_core_synth_error:
+		CoreSynthError(UnsupportedTensorReductionElement),
 	test: TestSuite
 
 
@@ -141,6 +149,7 @@ func test_stage_names_round_trip() -> Bool:
 		CoreEarlyDebugStage,
 		CoreEarlyDesugarStage,
 		CoreEarlyMonoStage,
+		CoreEarlySynthStage,
 	]
 
 	stages.all(pure func(stage):
@@ -362,6 +371,85 @@ func test_pipeline_can_observe_and_stop_at_post_mono_boundary() -> Bool:
 			False
 
 
+func test_pipeline_can_observe_and_stop_at_post_synth_boundary() -> Bool:
+	int_type: CoreType = named_type("Int")
+	bytes_type: CoreType = named_type("Bytes")
+	bytes_length: CoreFunction = {
+		name = "std_bytes__length__mono_fixture",
+		source_module = Some("std/bytes"),
+		type_params = [],
+		params = [param("value", bytes_type)],
+		return_type = int_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 20,
+		loc = SyntheticSourceLoc
+	}
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(bytes_length)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlySynthStage],
+				Some(CoreEarlySynthStage),
+			),
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlySynthStage)
+				and rendered.contains("\"function_kind\":{\"kind\":\"user\"}")
+				and observations.length() == 1
+			)
+		_:
+			False
+
+
+func test_pipeline_returns_synth_diagnostic() -> Bool:
+	string_type: CoreType = named_type("String")
+	tensor_type: CoreType = TensorType({
+		element_type = string_type,
+		dims = [TensorStaticDim(4)],
+	})
+	reduction: CoreFunction = {
+		name = "std_vector__sum__mono_fixture",
+		source_module = Some("std/vector"),
+		type_params = [],
+		params = [param("values", tensor_type)],
+		return_type = string_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 20,
+		loc = SyntheticSourceLoc
+	}
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(reduction)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+		)
+	):
+		CoreEarlyPipelineFailed(CoreEarlySynthDiagnostic(UnsupportedTensorReductionElement(name, element_type, _))):
+			name == "sum" and element_type == string_type
+		_:
+			False
+
+
 func test_pipeline_applies_debug_mode_before_invariant_check() -> Bool:
 	source: CoreProgram = program(
 		[
@@ -423,6 +511,11 @@ tests: TestSuite = {
 			"pipeline can observe and stop at post-mono boundary",
 			test_pipeline_can_observe_and_stop_at_post_mono_boundary,
 		),
+		(
+			"pipeline can observe and stop at post-synth boundary",
+			test_pipeline_can_observe_and_stop_at_post_synth_boundary,
+		),
+		("pipeline returns synth diagnostic", test_pipeline_returns_synth_diagnostic),
 		(
 			"pipeline applies debug mode before invariant check",
 			test_pipeline_applies_debug_mode_before_invariant_check,

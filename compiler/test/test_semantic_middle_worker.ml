@@ -83,11 +83,11 @@ let module_imports_json =
       ("import_bindings", Lsp_json.Array [ import_binding_json ]);
     ]
 
-let request_json ?(schema = 3) ?(domain = "compiler_semantic_middle")
-    ?(core_phase = "post_mono") ?(require_main = false)
+let request_json ?(schema = 4) ?(domain = "compiler_semantic_middle")
+    ?(core_phase = "post_synth") ?(require_main = false)
     ?(core = core_program [])
-    ?(capabilities = [ "core_post_mono"; "core_pre_dce"; "rendered_stage_observations" ])
-    ?(observations = [ "synth"; "fusion" ]) ?stop_after () =
+    ?(capabilities = [ "core_post_synth"; "core_pre_dce"; "rendered_stage_observations" ])
+    ?(observations = [ "match"; "fusion" ]) ?stop_after () =
   Lsp_json.Object
     [
       ("schema", Lsp_json.Int schema);
@@ -143,8 +143,14 @@ let test_rejects_schema_domain_phase_capability_and_stage () =
   expect_decode_error "unsupported_core_phase" (request_json ~core_phase:"prepared" ());
   expect_decode_error "unsupported_capability"
     (request_json ~capabilities:[ "typed_ast_post_ctfe" ] ());
+  expect_decode_error "missing_capability"
+    (request_json
+       ~capabilities:[ "core_pre_dce"; "rendered_stage_observations" ]
+       ());
   expect_decode_error "unsupported_stage"
     (request_json ~observations:[ "lower" ] ());
+  expect_decode_error "unsupported_stage"
+    (request_json ~observations:[ "synth" ] ());
   expect_decode_error "unsupported_stage"
     (request_json ~observations:[ "specialize" ] ())
 
@@ -152,11 +158,11 @@ let test_rejects_missing_and_late_core () =
   expect_decode_error "missing_field"
     (request_json () |> remove_object_field "required_capabilities");
   let late =
-    kind "drop"
+    kind "dup"
       [
         ("var", Lsp_json.Object []);
         ("value_type", int_type);
-        ("release_policy", Lsp_json.String "none");
+        ("retain_policy", Lsp_json.String "none");
         ("body", int_literal 0);
         ("type", int_type);
         ("loc", synthetic_loc);
@@ -170,7 +176,7 @@ let test_rejects_missing_and_late_core () =
           (List.map (fun (name, value) -> if name = "body" then (name, late) else (name, value)) fields)
     | value -> value
   in
-  expect_decode_error "invalid_post_mono_core"
+  expect_decode_error "invalid_post_synth_core"
     (request_json ~core:(core_program [ malformed ]) ())
 
 let response_or_fail request =
@@ -181,7 +187,7 @@ let response_or_fail request =
            (List.map (fun d -> d.Semantic_middle_worker.message) diagnostics))
   | response -> response
 
-let test_post_mono_core_reaches_pre_dce () =
+let test_post_synth_core_reaches_pre_dce () =
   let core =
     core_program ~foreign_includes:[ "boundary_fixture.h" ]
       [
@@ -205,14 +211,13 @@ let test_stop_after_returns_snapshot () =
   let core = core_program [ function_decl "main" 2 ] in
   let request =
     decode_ok
-      (request_json ~core ~observations:[ "synth"; "match" ]
-         ~stop_after:"match" ())
+      (request_json ~core ~observations:[ "match" ] ~stop_after:"match" ())
   in
   match response_or_fail request with
   | Semantic_middle_worker.Stopped { stage; rendered; observations } ->
       Alcotest.(check string) "stage" "match"
         (Semantic_middle_worker.stage_name stage);
-      Alcotest.(check int) "observations" 2 (List.length observations);
+      Alcotest.(check int) "observations" 1 (List.length observations);
       Alcotest.(check bool) "snapshot" true (String.length rendered > 0)
   | Semantic_middle_worker.Compiled _ -> Alcotest.fail "expected stop"
   | Semantic_middle_worker.Failed _ -> assert false
@@ -228,9 +233,9 @@ let test_rejects_core_from_before_debug_lowering () =
       ]
   in
   let core = core_program [ function_decl ~body:debug_body "main" 2 ] in
-  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+  expect_decode_error "invalid_post_synth_core" (request_json ~core ())
 
-let test_rejects_core_from_before_desugar_lowering () =
+let test_accepts_synthesis_introduced_mutable_local () =
   let mutable_let =
     kind "let"
       [
@@ -242,7 +247,7 @@ let test_rejects_core_from_before_desugar_lowering () =
       ]
   in
   let core = core_program [ function_decl ~body:mutable_let "main" 2 ] in
-  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+  ignore (decode_ok (request_json ~core ()))
 
 let test_rejects_core_from_before_monomorphization () =
   let generic_type = type_parameter "T" in
@@ -259,7 +264,7 @@ let test_rejects_core_from_before_monomorphization () =
       ]
   in
   let core = core_program [ function_decl ~body:call "main" 2 ] in
-  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+  expect_decode_error "invalid_post_synth_core" (request_json ~core ())
 
 let test_rejects_closed_call_to_generic_function () =
   let type_param =
@@ -281,7 +286,7 @@ let test_rejects_closed_call_to_generic_function () =
       ]
   in
   let core = core_program [ generic; function_decl ~body:call "main" 2 ] in
-  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+  expect_decode_error "invalid_post_synth_core" (request_json ~core ())
 
 let test_require_main_validation () =
   match Semantic_middle_worker.run_request (decode_ok (request_json ~require_main:true ())) with
@@ -293,7 +298,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 3) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 4) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -301,7 +306,7 @@ let suite =
   [
     ( "protocol",
       [
-        Alcotest.test_case "decode post-mono Core request" `Quick
+        Alcotest.test_case "decode post-synth Core request" `Quick
           test_decode_phase_specific_request;
         Alcotest.test_case "reject incompatible protocol fields" `Quick
           test_rejects_schema_domain_phase_capability_and_stage;
@@ -312,14 +317,14 @@ let suite =
       ] );
     ( "worker",
       [
-        Alcotest.test_case "post-mono Core reaches pre-DCE" `Quick
-          test_post_mono_core_reaches_pre_dce;
+        Alcotest.test_case "post-synth Core reaches pre-DCE" `Quick
+          test_post_synth_core_reaches_pre_dce;
         Alcotest.test_case "stop-after returns snapshot" `Quick
           test_stop_after_returns_snapshot;
         Alcotest.test_case "reject Core from before debug lowering" `Quick
           test_rejects_core_from_before_debug_lowering;
-        Alcotest.test_case "reject Core from before desugar lowering" `Quick
-          test_rejects_core_from_before_desugar_lowering;
+        Alcotest.test_case "accept synthesis-introduced mutable local" `Quick
+          test_accepts_synthesis_introduced_mutable_local;
         Alcotest.test_case "reject Core from before monomorphization" `Quick
           test_rejects_core_from_before_monomorphization;
         Alcotest.test_case "reject closed call to generic function" `Quick

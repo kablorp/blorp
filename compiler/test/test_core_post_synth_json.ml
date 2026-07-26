@@ -113,11 +113,11 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_post_mono_json.decode_program json with
+  match Core_post_synth_json.decode_program json with
   | Ok decoded -> decoded
-  | Error error -> Alcotest.fail (Core_post_mono_json.decode_error_to_string error)
+  | Error error -> Alcotest.fail (Core_post_synth_json.decode_error_to_string error)
 
-let test_decodes_post_mono_program () =
+let test_decodes_post_synth_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -128,25 +128,159 @@ let test_decodes_post_mono_program () =
       Alcotest.(check bool) "has body" true (Option.is_some fn.cf_body)
   | _ -> Alcotest.fail "expected one decoded function"
 
+let decoded_body_exn body =
+  let decoded =
+    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
+  in
+  match decoded.core with
+  | [ { Core.cd_desc = Core.CDFunc { cf_body = Some body; _ }; _ } ] -> body
+  | _ -> Alcotest.fail "expected one decoded function body"
+
 let test_rejects_late_ownership_node () =
-  let late_drop =
-    kind "drop"
+  let late_dup =
+    kind "dup"
       [
         ("var", variable "value");
         ("value_type", int_type);
-        ("release_policy", Lsp_json.String "none");
+        ("retain_policy", Lsp_json.String "none");
         ("body", int_literal 0);
         ("type", int_type);
         ("loc", synthetic_loc);
       ]
   in
-  let json = program [ function_decl ~body:(Some late_drop) "main" 1 ] in
-  match Core_post_mono_json.decode_program json with
-  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-mono boundary"
+  let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
+  match Core_post_synth_json.decode_program json with
+  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-synth boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
-        (Modules.contains error.message "drop")
+        (Modules.contains error.message "dup")
+
+let test_decodes_synthesized_value_forms () =
+  let boxed =
+    kind "box"
+      [
+        ( "box",
+          Lsp_json.Object
+            [
+              ("kind", kind "prim" []);
+              ("value", int_literal 7);
+              ("source_type", int_type);
+            ] );
+        ("type", named_type "Ptr");
+        ("loc", synthetic_loc);
+      ]
+  in
+  let unboxed =
+    kind "unbox"
+      [
+        ("unbox_kind", kind "prim" []);
+        ("expr", typed_variable_expr "boxed" (named_type "Ptr"));
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let cast =
+    kind "cast"
+      [
+        ("expr", int_literal 7);
+        ("type", named_type "Float");
+        ("loc", synthetic_loc);
+      ]
+  in
+  (match (decoded_body_exn boxed).desc with
+  | Core.CBoxTyped { box_kind = Core.BoxPrim; box_source_ty; _ } ->
+      Alcotest.(check bool) "box source type" true
+        (Types.types_equal box_source_ty (Ast.TyNamed ("Int", [])))
+  | _ -> Alcotest.fail "synthesized box did not decode");
+  (match (decoded_body_exn unboxed).desc with
+  | Core.CUnboxTyped
+      { unbox_kind = Core.UnboxPrim; unbox_target_ty; _ } ->
+      Alcotest.(check bool) "unbox target type" true
+        (Types.types_equal unbox_target_ty (Ast.TyNamed ("Int", [])))
+  | _ -> Alcotest.fail "synthesized unbox did not decode");
+  match (decoded_body_exn cast).desc with
+  | Core.CCast (_, target_ty) ->
+      Alcotest.(check bool) "cast target type" true
+        (Types.types_equal target_ty (Ast.TyNamed ("Float", [])))
+  | _ -> Alcotest.fail "synthesized cast did not decode"
+
+let test_decodes_synthesized_binding_and_tensor_forms () =
+  let raw_read =
+    kind "tensor_raw_read"
+      [
+        ( "read",
+          Lsp_json.Object
+            [
+              ("view", variable "raw");
+              ("raw_kind", Lsp_json.String "int64");
+              ("index", int_literal 0);
+            ] );
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let raw_view =
+    kind "tensor_raw_view_let"
+      [
+        ( "binding",
+          Lsp_json.Object
+            [
+              ("variable", variable "raw");
+              ("raw_kind", Lsp_json.String "int64");
+              ("source", typed_variable_expr "values" (named_type "Tensor"));
+            ] );
+        ("body", raw_read);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let dropped =
+    kind "drop"
+      [
+        ("var", variable "owner");
+        ("value_type", named_type "String");
+        ("release_policy", Lsp_json.String "arc");
+        ("body", raw_view);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let borrowed =
+    kind "borrow_let"
+      [
+        ("name", variable "borrowed");
+        ("type", named_type "String");
+        ("rhs", typed_variable_expr "owner" (named_type "String"));
+        ("body", dropped);
+      ]
+  in
+  match (decoded_body_exn borrowed).desc with
+  | Core.CBorrowLet
+      ( _,
+        {
+          desc =
+            Core.CDrop
+              ( _,
+                _,
+                {
+                  desc =
+                    Core.CTensorRawViewLet
+                      ( { trv_kind = Core.TensorInt64Elements; _ },
+                        {
+                          desc =
+                            Core.CTensorRawRead
+                              { trr_kind = Core.TensorInt64Elements; _ };
+                          _
+                        } );
+                  _
+                } );
+          _
+        } ) ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "synthesized borrow/drop/raw tensor forms changed at the boundary"
 
 let test_reports_nested_missing_field_path () =
   let malformed =
@@ -154,7 +288,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_post_mono_json.decode_program json with
+  match Core_post_synth_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -613,8 +747,13 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes post-mono program" `Quick test_decodes_post_mono_program;
-        Alcotest.test_case "rejects late ownership node" `Quick test_rejects_late_ownership_node;
+        Alcotest.test_case "decodes post-synth program" `Quick test_decodes_post_synth_program;
+        Alcotest.test_case "rejects later ownership node" `Quick
+          test_rejects_late_ownership_node;
+        Alcotest.test_case "decodes synthesized value forms" `Quick
+          test_decodes_synthesized_value_forms;
+        Alcotest.test_case "decodes synthesized binding and tensor forms"
+          `Quick test_decodes_synthesized_binding_and_tensor_forms;
         Alcotest.test_case "reports nested field path" `Quick test_reports_nested_missing_field_path;
         Alcotest.test_case "decodes exact int64 literal text" `Quick
           test_decodes_exact_int64_literal_text;

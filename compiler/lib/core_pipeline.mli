@@ -1,7 +1,7 @@
 (** Core IR compilation pipeline.
 
-    Normal source commands enter [run_core_passes_from_post_mono] through the
-    strict post-mono semantic worker. [run_core_passes] and typed-program
+    Normal source commands enter [run_core_passes_from_post_synth] through the
+    strict post-synthesis semantic worker. [run_core_passes] and typed-program
     entrypoints are compatibility APIs for the pinned bootstrap and direct
     in-memory tests. *)
 
@@ -62,7 +62,7 @@ val run_core_passes :
   backend_core_input
 (** Run the complete compatibility Core chain through specialization. *)
 
-val run_core_passes_from_post_mono :
+val run_core_passes_from_post_synth :
   ?import_aliases:(string, string * string) Hashtbl.t ->
   ?module_imports:(string, (string, string * string) Hashtbl.t) Hashtbl.t ->
   on_stage:on_stage_callback ->
@@ -70,8 +70,8 @@ val run_core_passes_from_post_mono :
   reg:Codegen_types.registry ->
   Core.core_program ->
   backend_core_input
-(** Run the production OCaml semantic middle from Blorp-owned post-mono Core
-    through specialization. *)
+(** Run the production OCaml semantic middle from Blorp-owned post-synthesis
+    Core through specialization. *)
 
 val compile_typed :
   ?embed_runtime:bool ->

@@ -1,10 +1,11 @@
-(** Strict structural decoder for the Blorp-owned post-mono Core handoff.
+(** Strict structural decoder for the Blorp-owned post-synthesis Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
     post-desugar, and post-mono semantic invariant checks immediately after
-    this structural decode. Rejecting ownership/backend forms here prevents
-    accidentally running a late pass twice. *)
+    this structural decode. The accepted expression set includes forms created
+    by synthesis, but still rejects later ownership/backend forms so a pass
+    cannot accidentally run twice. *)
 
 type decode_error = { path : string; message : string }
 
@@ -305,7 +306,7 @@ let decode_call_kind path value =
   | "selected_trait" ->
       (* Preserve the typecheck-selected method ID while OCaml trait
          resolution remains production-authoritative. Blorp keeps the richer
-         trait/module identity on its side of the post-mono boundary. *)
+         trait/module identity on its side of the post-synthesis boundary. *)
       let* _trait_name = string_field path "trait_name" value in
       let* _method_name = string_field path "method_name" value in
       let* _module_path = string_field path "module_path" value in
@@ -331,7 +332,7 @@ let decode_call_kind path value =
   | "closure" -> Ok Core.CKClosure
   | _ ->
       error (path_field path "kind")
-        ("call kind `" ^ tag ^ "` is not valid at the post-mono boundary")
+        ("call kind `" ^ tag ^ "` is not valid at the post-synthesis boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -368,6 +369,34 @@ let decode_box_kind path value =
       let* c_type = string_field path "c_type" value in
       Ok (Core.BoxStruct c_type)
   | _ -> error (path_field path "kind") ("unsupported box kind `" ^ tag ^ "`")
+
+let decode_unbox_kind path value =
+  let* tag = kind path value in
+  match tag with
+  | "float" -> Ok Core.UnboxFloat
+  | "float32" -> Ok Core.UnboxFloat32
+  | "float16" -> Ok Core.UnboxFloat16
+  | "int128" -> Ok Core.UnboxInt128
+  | "uint128" -> Ok Core.UnboxUInt128
+  | "pointer" -> Ok Core.UnboxPointer
+  | "prim" -> Ok Core.UnboxPrim
+  | "struct" ->
+      let* c_type = string_field path "c_type" value in
+      Ok (Core.UnboxStruct c_type)
+  | _ -> error (path_field path "kind") ("unsupported unbox kind `" ^ tag ^ "`")
+
+let decode_tensor_raw_scalar path = function
+  | Lsp_json.String "float64" -> Ok Core.TensorFloat64Elements
+  | Lsp_json.String "float32" -> Ok Core.TensorFloat32Elements
+  | Lsp_json.String "int64" -> Ok Core.TensorInt64Elements
+  | Lsp_json.String tag ->
+      error path ("unsupported tensor raw scalar kind `" ^ tag ^ "`")
+  | _ -> error path "expected tensor raw scalar kind string"
+
+let decode_release_policy path = function
+  | Lsp_json.String ("none" | "arc" | "arc_only" | "stack_result") -> Ok ()
+  | Lsp_json.String tag -> error path ("unsupported release policy `" ^ tag ^ "`")
+  | _ -> error path "expected release policy string"
 
 let rec decode_pattern path value =
   let* tag = kind path value in
@@ -445,6 +474,13 @@ let rec decode_expr path value =
       let* variable = decode_var_field path "var" value in
       let* rhs = decode_expr_field path "rhs" value in
       decode_typed_expr path value (Core.CAssign (variable, rhs))
+  | "cast" ->
+      let* inner = decode_expr_field path "expr" value in
+      let* target_ty = decode_type_field path "type" value in
+      let* loc = decode_loc_field path "loc" value in
+      Ok (Core.mk ~loc ~ty:target_ty (Core.CCast (inner, target_ty)))
+  | "box" -> decode_box_expr path value
+  | "unbox" -> decode_unbox_expr path value
   | "field" ->
       let* inner = decode_expr_field path "expr" value in
       let* name = string_field path "field" value in
@@ -485,6 +521,7 @@ let rec decode_expr path value =
       let* fields = list_field decode_record_field path "fields" value in
       decode_typed_expr path value (Core.CRecord fields)
   | "let" -> decode_let_expr path value
+  | "borrow_let" -> decode_borrow_let_expr path value
   | "seq" ->
       let* first = decode_expr_field path "first" value in
       let* second = decode_expr_field path "second" value in
@@ -515,13 +552,16 @@ let rec decode_expr path value =
       decode_typed_expr path value (Core.CDetach { detach_body = body })
   | "pre_closure_concurrent" -> decode_concurrent_expr path value
   | "pre_closure_concurrently_loop" -> decode_concurrently_loop_expr path value
+  | "tensor_raw_read" -> decode_tensor_raw_read_expr path value
+  | "tensor_raw_view_let" -> decode_tensor_raw_view_let_expr path value
+  | "drop" -> decode_drop_expr path value
   | "select" -> decode_select_expr path value
   | "raw_match" -> decode_raw_match_expr path value
   | "literal_match" -> decode_literal_match_expr path value
   | "constructor_match" -> decode_constructor_match_expr path value
   | _ ->
       error (path_field path "kind")
-        ("Core expression `" ^ tag ^ "` is not valid at the post-mono boundary")
+        ("Core expression `" ^ tag ^ "` is not valid at the post-synth boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -537,6 +577,28 @@ and decode_param path value =
   let* cp_ty = decode_type_field path "type" value in
   let* cp_loc = decode_loc_field path "loc" value in
   Ok { Core.cp_name; cp_ty; cp_loc }
+
+and decode_box_expr path value =
+  let* box_json = field path "box" value in
+  let box_path = path_field path "box" in
+  let* kind_json = field box_path "kind" box_json in
+  let* box_kind = decode_box_kind (path_field box_path "kind") kind_json in
+  let* box_value = decode_expr_field box_path "value" box_json in
+  let* box_source_ty = decode_type_field box_path "source_type" box_json in
+  decode_typed_expr path value
+    (Core.CBoxTyped { box_value; box_source_ty; box_kind })
+
+and decode_unbox_expr path value =
+  let* kind_json = field path "unbox_kind" value in
+  let* unbox_kind =
+    decode_unbox_kind (path_field path "unbox_kind") kind_json
+  in
+  let* unbox_value = decode_expr_field path "expr" value in
+  let* unbox_target_ty = decode_type_field path "type" value in
+  let* loc = decode_loc_field path "loc" value in
+  Ok
+    (Core.mk ~loc ~ty:unbox_target_ty
+       (Core.CUnboxTyped { unbox_value; unbox_target_ty; unbox_kind }))
 
 and decode_boxed_value path value =
   let* kind_json = field path "kind" value in
@@ -590,6 +652,50 @@ and decode_let_expr path value =
   Ok
     (Core.mk ~loc:body.loc ~ty:body.ty
        (Core.CLet ({ bind_var; bind_mut; bind_ty; bind_rhs }, body)))
+
+and decode_borrow_let_expr path value =
+  let* borrow_var = decode_var_field path "name" value in
+  let* borrow_ty = decode_type_field path "type" value in
+  let* borrow_rhs = decode_expr_field path "rhs" value in
+  let* body = decode_expr_field path "body" value in
+  Ok
+    (Core.mk ~loc:body.loc ~ty:body.ty
+       (Core.CBorrowLet ({ borrow_var; borrow_ty; borrow_rhs }, body)))
+
+and decode_tensor_raw_read_expr path value =
+  let* read = field path "read" value in
+  let read_path = path_field path "read" in
+  let* trr_view = decode_var_field read_path "view" read in
+  let* kind_json = field read_path "raw_kind" read in
+  let* trr_kind =
+    decode_tensor_raw_scalar (path_field read_path "raw_kind") kind_json
+  in
+  let* trr_index = decode_expr_field read_path "index" read in
+  decode_typed_expr path value
+    (Core.CTensorRawRead { trr_view; trr_kind; trr_index })
+
+and decode_tensor_raw_view_let_expr path value =
+  let* binding = field path "binding" value in
+  let binding_path = path_field path "binding" in
+  let* trv_var = decode_var_field binding_path "variable" binding in
+  let* kind_json = field binding_path "raw_kind" binding in
+  let* trv_kind =
+    decode_tensor_raw_scalar (path_field binding_path "raw_kind") kind_json
+  in
+  let* trv_source = decode_expr_field binding_path "source" binding in
+  let* body = decode_expr_field path "body" value in
+  decode_typed_expr path value
+    (Core.CTensorRawViewLet ({ trv_var; trv_kind; trv_source }, body))
+
+and decode_drop_expr path value =
+  let* variable = decode_var_field path "var" value in
+  let* value_ty = decode_type_field path "value_type" value in
+  let* release_policy = field path "release_policy" value in
+  let* () =
+    decode_release_policy (path_field path "release_policy") release_policy
+  in
+  let* body = decode_expr_field path "body" value in
+  decode_typed_expr path value (Core.CDrop (variable, value_ty, body))
 
 and decode_loop_binder path value =
   let* loop_var = decode_var_field path "var" value in
@@ -896,7 +1002,9 @@ let decode_function_kind path value =
       let* passing_json = field path "arg_passing" value in
       let* arg_passing = decode_foreign_arg_passing (path_field path "arg_passing") passing_json in
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
-  | _ -> error (path_field path "kind") ("function kind `" ^ tag ^ "` is not valid post-mono")
+  | _ ->
+      error (path_field path "kind")
+        ("function kind `" ^ tag ^ "` is not valid post-synthesis")
 
 let decode_function path value =
   let* name = string_field path "name" value in

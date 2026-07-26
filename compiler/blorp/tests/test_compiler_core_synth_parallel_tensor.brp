@@ -1,0 +1,149 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(ClosureCall),
+		CoreExpr(CallExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(FunctionType, NamedType, TensorType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_mono: core_mono_type_equal
+	../src/stage_09_core/compiler_core_synth_parallel_tensor: synthesize_parallel_tensor_body
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+
+pure func core_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = Some(uniq)
+	}
+
+
+pure func same_core_var(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+pure func tensor_type(rank: Int) -> CoreType:
+	if rank == 1:
+		TensorType({
+			element_type = INT_TYPE,
+			dims = [TensorStaticDim(4)],
+		})
+	else:
+		TensorType({
+			element_type = INT_TYPE,
+			dims = [TensorStaticDim(2), TensorStaticDim(3)],
+		})
+
+
+pure func param(name: String, uniq: Int, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name, uniq),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func builtin_function(
+	module_name: String,
+	source_name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func parallel_function(module_name: String, rank: Int, callback_pure: Bool) -> CoreFunction:
+	value_type: CoreType = tensor_type(rank)
+	builtin_function(
+		module_name,
+		"parallel",
+		[param("values", 11, value_type), param(
+				"body",
+				12,
+				FunctionType(callback_pure, [value_type], value_type),
+			)],
+		value_type,
+	)
+
+
+pure func synthesized_call_preserves_identities(
+	function_info: CoreFunction,
+	expected_rank: Int,
+) -> Bool:
+	match synthesize_parallel_tensor_body(function_info):
+		Some(CallExpr(ClosureCall, VarExpr(callee, _, _), args, return_type, _)):
+			match args:
+				[VarExpr(argument, argument_type, _)]:
+					same_core_var(
+						callee,
+						core_var("body", 12),
+					) and same_core_var(
+						argument,
+						core_var("values", 11),
+					) and core_mono_type_equal(
+						argument_type,
+						tensor_type(
+							expected_rank,
+						),
+					) and core_mono_type_equal(return_type, tensor_type(expected_rank))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_synthesizes_parallel_vector_adapter() -> Bool:
+	synthesized_call_preserves_identities(
+		parallel_function("std/vector", 1, True),
+		1,
+	)
+
+
+pure func test_synthesizes_parallel_matrix_adapter() -> Bool:
+	synthesized_call_preserves_identities(
+		parallel_function("std/matrix", 2, True),
+		2,
+	)
+
+
+pure func test_rejects_impure_parallel_callback() -> Bool:
+	synthesize_parallel_tensor_body(parallel_function("std/vector", 1, False)).is_none()
+
+
+pure func test_rejects_wrong_module_and_rank() -> Bool:
+	wrong_module: CoreFunction = parallel_function("std/tensor", 1, True)
+	wrong_rank: CoreFunction = parallel_function("std/vector", 2, True)
+
+	(
+		synthesize_parallel_tensor_body(wrong_module).is_none()
+		and synthesize_parallel_tensor_body(wrong_rank).is_none()
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler parallel tensor Core synthesis",
+	tests = [
+		("synthesizes parallel vector adapter", test_synthesizes_parallel_vector_adapter),
+		("synthesizes parallel matrix adapter", test_synthesizes_parallel_matrix_adapter),
+		("rejects impure parallel callback", test_rejects_impure_parallel_callback),
+		("rejects wrong module and rank", test_rejects_wrong_module_and_rank),
+	]
+}

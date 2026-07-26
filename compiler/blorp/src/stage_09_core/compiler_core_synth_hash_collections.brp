@@ -1,0 +1,3103 @@
+-- Post-monomorphization Core body synthesis for std/set and std/dict.
+--
+-- The synthesized bodies expose probing, COW, ownership, and insertion-order
+-- mechanics to later Core passes. Arbitrary NamedType values are deliberately
+-- rejected: without declaration registry facts, a name alone cannot distinguish
+-- an alias, enum, value record, heap record, or union.
+import:
+	compiler_core_json:
+		CoreBinaryOp(
+			AddOp,
+			DivideOp,
+			EqualOp,
+			GreaterEqualOp,
+			GreaterOp,
+			LessEqualOp,
+			LessOp,
+			MultiplyOp,
+			NotEqualOp,
+		),
+		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, StructBox, UInt128Box),
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			DropExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			SeqExpr,
+			TupleExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreParam,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(
+			Float16Unbox,
+			Float32Unbox,
+			FloatUnbox,
+			Int128Unbox,
+			PointerUnbox,
+			PrimUnbox,
+			StructUnbox,
+			UInt128Unbox,
+		),
+		CoreVar,
+	compiler_core_mono: core_mono_type_equal
+	compiler_core_synth_context:
+		CoreSynthContext,
+		CoreSynthNamedTypeLayout(
+			SynthEnumLayout,
+			SynthHeapRecordLayout,
+			SynthUnionLayout,
+			SynthValueRecordLayout,
+		),
+		core_synth_expand_alias,
+		core_synth_named_type_layout,
+	compiler_core_synth_error:
+		CoreSynthError(HashCollectionInvalidValueType, HashCollectionLayoutUnavailable),
+	compiler_core_synth_name: is_synthesis_candidate, synthesis_source_name
+	compiler_core_type_policy: cleanup_release_policy_for_type
+
+
+private SET_MODULE: String = "std/set"
+
+private DICT_MODULE: String = "std/dict"
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+private SET_LOAD_NUMERATOR: Int = 3
+
+private SET_LOAD_DENOMINATOR: Int = 4
+
+private COLLECTION_GROWTH_FACTOR: Int = 2
+
+private DICT_HASH_FRAGMENT_SHIFT: Int = 57
+
+private DICT_HASH_FRAGMENT_MASK: Int = 127
+
+private DICT_DELETED_METADATA: Int = 128
+
+private DICT_EMPTY_METADATA: Int = 255
+
+private DICT_MISSING_SLOT: Int = -1
+
+private NULL_POINTER: CoreExpr = LiteralExpr(IntLiteral(0), POINTER_TYPE, SyntheticSourceLoc)
+
+private VOID_EXPRESSION: CoreExpr = VoidExpr(VoidType, SyntheticSourceLoc)
+
+private BREAK_EXPRESSION: CoreExpr = BreakExpr(VoidType, SyntheticSourceLoc)
+
+
+enum CoreHashProbeMode:
+	ImmediateHashProbe
+	DispatchedHashProbe
+
+
+union CoreHashPointerLayout:
+	IdentityHashPointer(CoreUnboxKind)
+	BoxedHashPointer(CoreBoxKind, CoreUnboxKind, Bool)
+	CastHashPointer(CoreUnboxKind)
+
+
+-- Keys and values need separate pointer layouts. In particular, the current
+-- runtime ABI casts value-record keys but boxes value-record dictionary values.
+record CoreHashTypeLayoutFacts {
+	probe_mode: CoreHashProbeMode,
+	hash_key_pointer_layout: CoreHashPointerLayout,
+	boxed_value_pointer_layout: CoreHashPointerLayout
+}
+
+
+union CoreHashTypeLayoutDecision:
+	ExactHashTypeLayout(CoreHashTypeLayoutFacts)
+	RegistryHashTypeLayoutRequired(CoreType)
+	InvalidHashValueType(CoreType)
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func parameter_value(param: CoreParam) -> CoreExpr:
+	VarExpr(param.name, param.typ, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func bool_literal(value: Bool) -> CoreExpr:
+	LiteralExpr(BoolLiteral(value), BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), VOID_EXPRESSION, args, return_type, SyntheticSourceLoc)
+
+
+private pure func builtin_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), VOID_EXPRESSION, args, return_type, SyntheticSourceLoc)
+
+
+private pure func closure_call(
+	closure: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(ClosureCall, closure, args, return_type, SyntheticSourceLoc)
+
+
+private pure func binary(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	BinaryExpr(op, left, right, return_type, SyntheticSourceLoc)
+
+
+private pure func logical_and(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(AndOp, left, right, BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func let_expr(
+	name: String,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(core_var(name), is_mutable, typ, rhs, body)
+
+
+private pure func sequence(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	SeqExpr(first, second)
+
+
+private pure func if_expr(
+	condition: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	IfExpr(condition, then_expr, else_expr, return_type, SyntheticSourceLoc)
+
+
+private pure func assignment(name: String, value: CoreExpr) -> CoreExpr:
+	AssignExpr(core_var(name), value, VoidType, SyntheticSourceLoc)
+
+
+private pure func while_expr(condition: CoreExpr, body: CoreExpr) -> CoreExpr:
+	WhileExpr(condition, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func loop_binder(name: String) -> CoreLoopBinder:
+	{
+		variable = core_var(name),
+		typ = INT_TYPE,
+		range_direction = RangeForwardOnly
+	}
+
+
+private pure func for_range(
+	name: String,
+	start: CoreExpr,
+	end_value: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	ForRangeExpr(loop_binder(name), start, end_value, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func not_null(value: CoreExpr) -> CoreExpr:
+	binary(NotEqualOp, value, NULL_POINTER, BOOL_TYPE)
+
+
+private pure func is_integer_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "Int128"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "UInt128"
+	)
+
+
+private pure func is_immediate_integer_name(name: String) -> Bool:
+	is_integer_name(name) and name != "Int128" and name != "UInt128"
+
+
+private pure func is_known_pointer_name(name: String, arity: Int) -> Bool:
+	(
+		(
+			((
+				name == "String"
+				or name == "LiteralString"
+				or name == "Bytes"
+				or name == "Fixed"
+				or name == "StringSlice"
+				or name == "MemStats"
+				or name == "SchedulerStats"
+				or name == "Closure"
+			))
+			and arity == 0
+		)
+		or (
+			((
+				name == "List"
+				or name == "ParallelList"
+				or name == "Set"
+				or name == "Task"
+				or name == "Channel"
+				or name == "Builder"
+				or name == "Slice"
+			))
+			and arity == 1
+		)
+		or (name == "Dict" or name == "ParallelVector" or name == "ParallelMatrix") and arity == 2
+	)
+
+
+pure func classify_hash_collection_type(
+	context: CoreSynthContext,
+	typ: CoreType,
+) -> CoreHashTypeLayoutDecision:
+	match core_synth_expand_alias(context, typ):
+		NamedType(name, args):
+			if args.is_empty() and is_immediate_integer_name(name):
+				ExactHashTypeLayout({
+					probe_mode = ImmediateHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+					boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+				})
+			else if args.is_empty() and (name == "Bool" or name == "Char"):
+				ExactHashTypeLayout({
+					probe_mode = ImmediateHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+					boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+				})
+			else if args.is_empty() and name == "Int128":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(Int128Box, Int128Unbox, True),
+					boxed_value_pointer_layout = BoxedHashPointer(Int128Box, Int128Unbox, True),
+				})
+			else if args.is_empty() and name == "UInt128":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(UInt128Box, UInt128Unbox, True),
+					boxed_value_pointer_layout = BoxedHashPointer(UInt128Box, UInt128Unbox, True),
+				})
+			else if args.is_empty() and name == "Float":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(FloatBox, FloatUnbox, False),
+					boxed_value_pointer_layout = BoxedHashPointer(FloatBox, FloatUnbox, False),
+				})
+			else if args.is_empty() and name == "Float32":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(Float32Box, Float32Unbox, False),
+					boxed_value_pointer_layout = BoxedHashPointer(Float32Box, Float32Unbox, False),
+				})
+			else if args.is_empty() and name == "Float16":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = BoxedHashPointer(Float16Box, Float16Unbox, False),
+					boxed_value_pointer_layout = BoxedHashPointer(Float16Box, Float16Unbox, False),
+				})
+			else if args.is_empty() and name == "Ptr":
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = IdentityHashPointer(PointerUnbox),
+					boxed_value_pointer_layout = IdentityHashPointer(PointerUnbox),
+				})
+			else if is_known_pointer_name(name, args.length()):
+				ExactHashTypeLayout({
+					probe_mode = DispatchedHashProbe,
+					hash_key_pointer_layout = CastHashPointer(PointerUnbox),
+					boxed_value_pointer_layout = CastHashPointer(PointerUnbox),
+				})
+			else:
+				match core_synth_named_type_layout(context, name):
+					Some(SynthEnumLayout):
+						ExactHashTypeLayout({
+							probe_mode = ImmediateHashProbe,
+							hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+							boxed_value_pointer_layout = BoxedHashPointer(
+								PrimBox,
+								PrimUnbox,
+								False,
+							),
+						})
+					Some(SynthValueRecordLayout):
+						ExactHashTypeLayout({
+							probe_mode = DispatchedHashProbe,
+							hash_key_pointer_layout = CastHashPointer(StructUnbox(name)),
+							boxed_value_pointer_layout = BoxedHashPointer(
+								StructBox(name),
+								StructUnbox(name),
+								True,
+							),
+						})
+					Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
+						ExactHashTypeLayout({
+							probe_mode = DispatchedHashProbe,
+							hash_key_pointer_layout = CastHashPointer(PointerUnbox),
+							boxed_value_pointer_layout = CastHashPointer(PointerUnbox),
+						})
+					None:
+						RegistryHashTypeLayoutRequired(typ)
+		EnumType(_):
+			ExactHashTypeLayout({
+				probe_mode = ImmediateHashProbe,
+				hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+				boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+			})
+		ValueRecordType(name):
+			ExactHashTypeLayout({
+				probe_mode = DispatchedHashProbe,
+				hash_key_pointer_layout = CastHashPointer(StructUnbox(name)),
+				boxed_value_pointer_layout = BoxedHashPointer(
+					StructBox(name),
+					StructUnbox(name),
+					True,
+				),
+			})
+		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
+			ExactHashTypeLayout({
+				probe_mode = DispatchedHashProbe,
+				hash_key_pointer_layout = CastHashPointer(PointerUnbox),
+				boxed_value_pointer_layout = CastHashPointer(PointerUnbox),
+			})
+		BoxedResultType(_, _):
+			ExactHashTypeLayout({
+				probe_mode = DispatchedHashProbe,
+				hash_key_pointer_layout = CastHashPointer(PointerUnbox),
+				boxed_value_pointer_layout = CastHashPointer(PointerUnbox),
+			})
+		RangeType:
+			ExactHashTypeLayout({
+				probe_mode = ImmediateHashProbe,
+				hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+				boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
+			})
+		TypeParameterType(_) | SelfType | StackResultType(_, _):
+			RegistryHashTypeLayoutRequired(typ)
+		VoidType:
+			InvalidHashValueType(typ)
+
+
+private pure func exact_layout(
+	context: CoreSynthContext,
+	operation: String,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreHashTypeLayoutFacts, CoreSynthError]:
+	match classify_hash_collection_type(context, typ):
+		ExactHashTypeLayout(layout):
+			Ok(layout)
+		RegistryHashTypeLayoutRequired(missing_type):
+			Err(HashCollectionLayoutUnavailable(operation, missing_type, loc))
+		InvalidHashValueType(invalid_type):
+			Err(HashCollectionInvalidValueType(operation, invalid_type, loc))
+
+
+private pure func exact_release_policy(
+	context: CoreSynthContext,
+	operation: String,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[CoreReleasePolicy, CoreSynthError]:
+	match exact_layout(context, operation, typ, loc):
+		Ok(_):
+			match typ:
+				NamedType(name, args):
+					if (
+						args.is_empty()
+						and ((
+							is_integer_name(name)
+							or name == "Bool"
+							or name == "Char"
+							or name == "Float"
+							or name == "Float32"
+							or name == "Float16"
+							or name == "Ptr"
+							or name == "String"
+							or name == "LiteralString"
+							or name == "Bytes"
+							or name == "Fixed"
+							or name == "Closure"
+						))
+					):
+						Ok(cleanup_release_policy_for_type(typ))
+					else if (
+						(
+							(name == "List" or name == "Set" or name == "Channel")
+							and args.length() == 1
+						)
+						or name == "Dict" and args.length() == 2
+					):
+						Ok(cleanup_release_policy_for_type(typ))
+					else:
+						match core_synth_named_type_layout(context, name):
+							Some(SynthEnumLayout) | Some(SynthValueRecordLayout):
+								Ok(NoReleasePolicy)
+							Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
+								Ok(ArcReleasePolicy)
+							None:
+								Err(HashCollectionLayoutUnavailable(operation, typ, loc))
+				EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
+					Ok(cleanup_release_policy_for_type(typ))
+				TypeParameterType(_) | SelfType | StackResultType(_, _) | VoidType:
+					Err(HashCollectionLayoutUnavailable(operation, typ, loc))
+		Err(error):
+			Err(error)
+
+
+private pure func pointer_argument(
+	layout: CoreHashPointerLayout,
+	value: CoreExpr,
+	source_type: CoreType,
+) -> CoreExpr:
+	match layout:
+		IdentityHashPointer(_):
+			value
+		BoxedHashPointer(box_kind, _, _):
+			BoxExpr(
+				{
+					kind = box_kind,
+					value = value,
+					source_type = source_type
+				},
+				POINTER_TYPE,
+				SyntheticSourceLoc,
+			)
+		CastHashPointer(_):
+			CastExpr(value, POINTER_TYPE, SyntheticSourceLoc)
+
+
+private pure func unbox_pointer(
+	layout: CoreHashPointerLayout,
+	value: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	match layout:
+		IdentityHashPointer(unbox_kind) | BoxedHashPointer(_, unbox_kind, _) | CastHashPointer(unbox_kind):
+			UnboxExpr(unbox_kind, value, result_type, SyntheticSourceLoc)
+
+
+private pure func pointer_temp_needs_release(layout: CoreHashPointerLayout) -> Bool:
+	match layout:
+		BoxedHashPointer(_, _, needs_release):
+			needs_release
+		IdentityHashPointer(_) | CastHashPointer(_):
+			False
+
+
+private pure func hash_probe(
+	mode: CoreHashProbeMode,
+	prefix: String,
+	collection: CoreExpr,
+	key: CoreExpr,
+) -> CoreExpr:
+	match mode:
+		ImmediateHashProbe:
+			intrinsic_call(prefix + "_hash_immediate", [key], INT_TYPE)
+		DispatchedHashProbe:
+			intrinsic_call(
+				prefix + "_hash",
+				[collection, key],
+				INT_TYPE,
+			)
+
+
+private pure func equality_probe(
+	mode: CoreHashProbeMode,
+	prefix: String,
+	collection: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	match mode:
+		ImmediateHashProbe:
+			intrinsic_call(
+				prefix + "_eq_immediate",
+				[left, right],
+				BOOL_TYPE,
+			)
+		DispatchedHashProbe:
+			intrinsic_call(
+				prefix + "_eq",
+				[collection, left, right],
+				BOOL_TYPE,
+			)
+
+
+private pure func set_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[element_type]:
+					if name == "Set":
+						Some(element_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func dict_types(typ: CoreType) -> Option[(CoreType, CoreType)]:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[key_type, value_type]:
+					if name == "Dict":
+						Some((key_type, value_type))
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func list_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[element_type]:
+					if name == "List":
+						Some(element_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func function_signature(typ: CoreType) -> Option[(List[CoreType], CoreType)]:
+	match typ:
+		FunctionType(_, params, return_type):
+			Some((params, return_type))
+		_:
+			None
+
+
+private pure func same_type(left: CoreType, right: CoreType) -> Bool:
+	core_mono_type_equal(left, right)
+
+
+private pure func same_types(left: List[CoreType], right: List[CoreType]) -> Bool:
+	match left:
+		[]:
+			right.is_empty()
+		[left_head, ...left_tail]:
+			match right:
+				[right_head, ...right_tail]:
+					same_type(left_head, right_head) and same_types(left_tail, right_tail)
+				[]:
+					False
+
+
+private pure func set_hash_call(
+	layout: CoreHashTypeLayoutFacts,
+	set_value: CoreExpr,
+	key: CoreExpr,
+) -> CoreExpr:
+	hash_probe(layout.probe_mode, "set", set_value, key)
+
+
+private pure func set_eq_call(
+	layout: CoreHashTypeLayoutFacts,
+	set_value: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	equality_probe(layout.probe_mode, "set", set_value, left, right)
+
+
+private pure func synthesize_set_contains(
+	self: CoreExpr,
+	element: CoreExpr,
+	element_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	let_expr(
+		"__elem",
+		False,
+		POINTER_TYPE,
+		pointer_argument(
+			layout.hash_key_pointer_layout,
+			element,
+			element_type,
+		),
+		let_expr(
+			"__hash",
+			False,
+			INT_TYPE,
+			set_hash_call(
+				layout,
+				self,
+				variable("__elem", POINTER_TYPE),
+			),
+			let_expr(
+				"__bidx",
+				False,
+				INT_TYPE,
+				intrinsic_call(
+					"bit_and",
+					[variable("__hash", INT_TYPE), intrinsic_call("set_mask", [self], INT_TYPE)],
+					INT_TYPE,
+				),
+				let_expr(
+					"__entry",
+					True,
+					POINTER_TYPE,
+					intrinsic_call(
+						"set_bucket",
+						[self, variable("__bidx", INT_TYPE)],
+						POINTER_TYPE,
+					),
+					let_expr(
+						"__found",
+						True,
+						BOOL_TYPE,
+						bool_literal(False),
+						sequence(
+							while_expr(
+								not_null(variable("__entry", POINTER_TYPE)),
+								if_expr(
+									set_eq_call(
+										layout,
+										self,
+										intrinsic_call(
+											"set_entry_key",
+											[variable("__entry", POINTER_TYPE)],
+											POINTER_TYPE,
+										),
+										variable("__elem", POINTER_TYPE),
+									),
+									sequence(
+										assignment("__found", bool_literal(True)),
+										BREAK_EXPRESSION,
+									),
+									assignment(
+										"__entry",
+										intrinsic_call(
+											"set_entry_next",
+											[variable("__entry", POINTER_TYPE)],
+											POINTER_TYPE,
+										),
+									),
+									VoidType,
+								),
+							),
+							variable("__found", BOOL_TYPE),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func set_contains_key(
+	set_value: CoreExpr,
+	key: CoreExpr,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	let_expr(
+		"__hash",
+		False,
+		INT_TYPE,
+		set_hash_call(
+			layout,
+			set_value,
+			key,
+		),
+		let_expr(
+			"__bidx",
+			False,
+			INT_TYPE,
+			intrinsic_call(
+				"bit_and",
+				[variable("__hash", INT_TYPE), intrinsic_call("set_mask", [set_value], INT_TYPE)],
+				INT_TYPE,
+			),
+			let_expr(
+				"__probe",
+				True,
+				POINTER_TYPE,
+				intrinsic_call(
+					"set_bucket",
+					[set_value, variable("__bidx", INT_TYPE)],
+					POINTER_TYPE,
+				),
+				let_expr(
+					"__found",
+					True,
+					BOOL_TYPE,
+					bool_literal(False),
+					sequence(
+						while_expr(
+							logical_and(
+								binary(
+									EqualOp,
+									variable("__found", BOOL_TYPE),
+									bool_literal(False),
+									BOOL_TYPE,
+								),
+								not_null(variable("__probe", POINTER_TYPE)),
+							),
+							if_expr(
+								set_eq_call(
+									layout,
+									set_value,
+									intrinsic_call(
+										"set_entry_key",
+										[variable("__probe", POINTER_TYPE)],
+										POINTER_TYPE,
+									),
+									key,
+								),
+								assignment("__found", bool_literal(True)),
+								assignment(
+									"__probe",
+									intrinsic_call(
+										"set_entry_next",
+										[variable("__probe", POINTER_TYPE)],
+										POINTER_TYPE,
+									),
+								),
+								VoidType,
+							),
+						),
+						variable("__found", BOOL_TYPE),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func set_insert_retained(
+	set_value: CoreExpr,
+	key: CoreExpr,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	insert_key: CoreExpr = variable("__insert_key", POINTER_TYPE)
+	hash: CoreExpr = variable("__insert_hash", INT_TYPE)
+	bucket_index: CoreExpr = variable("__insert_bidx", INT_TYPE)
+	probe: CoreExpr = variable("__insert_probe", POINTER_TYPE)
+	found: CoreExpr = variable("__insert_found", BOOL_TYPE)
+	new_entry: CoreExpr = variable("__insert_new_entry", POINTER_TYPE)
+	old_last: CoreExpr = variable("__insert_old_last", POINTER_TYPE)
+	new_length: CoreExpr = variable("__insert_new_len", INT_TYPE)
+	scan_existing: CoreExpr = while_expr(
+		logical_and(
+			binary(EqualOp, found, bool_literal(False), BOOL_TYPE),
+			not_null(probe),
+		),
+		if_expr(
+			set_eq_call(
+				layout,
+				set_value,
+				intrinsic_call("set_entry_key", [probe], POINTER_TYPE),
+				insert_key,
+			),
+			assignment("__insert_found", bool_literal(True)),
+			assignment(
+				"__insert_probe",
+				intrinsic_call("set_entry_next", [probe], POINTER_TYPE),
+			),
+			VoidType,
+		),
+	)
+	link_bucket: CoreExpr = sequence(
+		intrinsic_call(
+			"set_entry_set_next",
+			[
+				new_entry,
+				intrinsic_call(
+					"set_bucket",
+					[set_value, bucket_index],
+					POINTER_TYPE,
+				),
+			],
+			VoidType,
+		),
+		intrinsic_call(
+			"set_set_bucket",
+			[set_value, bucket_index, new_entry],
+			VoidType,
+		),
+	)
+	link_order: CoreExpr = sequence(
+		intrinsic_call(
+			"set_entry_set_prev_order",
+			[new_entry, old_last],
+			VoidType,
+		),
+		sequence(
+			intrinsic_call(
+				"set_entry_set_next_order",
+				[new_entry, NULL_POINTER],
+				VoidType,
+			),
+			sequence(
+				if_expr(
+					not_null(old_last),
+					intrinsic_call(
+						"set_entry_set_next_order",
+						[old_last, new_entry],
+						VoidType,
+					),
+					intrinsic_call(
+						"set_set_first",
+						[set_value, new_entry],
+						VoidType,
+					),
+					VoidType,
+				),
+				intrinsic_call(
+					"set_set_last",
+					[set_value, new_entry],
+					VoidType,
+				),
+			),
+		),
+	)
+	resize_if_needed: CoreExpr = if_expr(
+		binary(
+			GreaterOp,
+			new_length,
+			binary(
+				DivideOp,
+				binary(
+					MultiplyOp,
+					intrinsic_call("set_capacity", [set_value], INT_TYPE),
+					int_literal(SET_LOAD_NUMERATOR),
+					INT_TYPE,
+				),
+				int_literal(SET_LOAD_DENOMINATOR),
+				INT_TYPE,
+			),
+			BOOL_TYPE,
+		),
+		intrinsic_call(
+			"set_resize",
+			[set_value, binary(
+					MultiplyOp,
+					intrinsic_call("set_capacity", [set_value], INT_TYPE),
+					int_literal(COLLECTION_GROWTH_FACTOR),
+					INT_TYPE,
+				)],
+			VoidType,
+		),
+		VOID_EXPRESSION,
+		VoidType,
+	)
+	insert_new: CoreExpr = sequence(
+		intrinsic_call(
+			"set_retain_key_for",
+			[set_value, insert_key],
+			VoidType,
+		),
+		let_expr(
+			"__insert_new_entry",
+			False,
+			POINTER_TYPE,
+			intrinsic_call(
+				"set_alloc_entry",
+				[insert_key],
+				POINTER_TYPE,
+			),
+			let_expr(
+				"__insert_old_last",
+				False,
+				POINTER_TYPE,
+				intrinsic_call(
+					"set_last",
+					[set_value],
+					POINTER_TYPE,
+				),
+				let_expr(
+					"__insert_new_len",
+					False,
+					INT_TYPE,
+					binary(
+						AddOp,
+						intrinsic_call("set_len", [set_value], INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+					sequence(
+						link_bucket,
+						sequence(
+							link_order,
+							sequence(
+								intrinsic_call(
+									"set_set_len",
+									[set_value, new_length],
+									VoidType,
+								),
+								resize_if_needed,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+	let_expr(
+		"__insert_key",
+		False,
+		POINTER_TYPE,
+		key,
+		let_expr(
+			"__insert_hash",
+			False,
+			INT_TYPE,
+			set_hash_call(
+				layout,
+				set_value,
+				insert_key,
+			),
+			let_expr(
+				"__insert_bidx",
+				False,
+				INT_TYPE,
+				intrinsic_call(
+					"bit_and",
+					[hash, intrinsic_call("set_mask", [set_value], INT_TYPE)],
+					INT_TYPE,
+				),
+				let_expr(
+					"__insert_probe",
+					True,
+					POINTER_TYPE,
+					intrinsic_call(
+						"set_bucket",
+						[set_value, bucket_index],
+						POINTER_TYPE,
+					),
+					let_expr(
+						"__insert_found",
+						True,
+						BOOL_TYPE,
+						bool_literal(False),
+						sequence(
+							scan_existing,
+							if_expr(found, VOID_EXPRESSION, insert_new, VoidType),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_add(
+	self: CoreExpr,
+	element: CoreExpr,
+	set_type: CoreType,
+	element_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	let_expr(
+		"__result",
+		True,
+		set_type,
+		intrinsic_call("set_cow", [self], set_type),
+		sequence(
+			set_insert_retained(
+				variable("__result", set_type),
+				pointer_argument(layout.hash_key_pointer_layout, element, element_type),
+				layout,
+			),
+			variable("__result", set_type),
+		),
+	)
+
+
+private pure func synthesize_set_is_subset(
+	left: CoreExpr,
+	right: CoreExpr,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	scan_one: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call("set_entry_key", [entry], POINTER_TYPE),
+		let_expr(
+			"__found_in_b",
+			False,
+			BOOL_TYPE,
+			set_contains_key(right, key, layout),
+			sequence(
+				if_expr(
+					variable("__found_in_b", BOOL_TYPE),
+					VOID_EXPRESSION,
+					sequence(
+						assignment("__ok", bool_literal(False)),
+						BREAK_EXPRESSION,
+					),
+					VoidType,
+				),
+				assignment(
+					"__entry",
+					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+				),
+			),
+		),
+	)
+	scan: CoreExpr = let_expr(
+		"__entry",
+		True,
+		POINTER_TYPE,
+		intrinsic_call("set_first", [left], POINTER_TYPE),
+		let_expr(
+			"__ok",
+			True,
+			BOOL_TYPE,
+			bool_literal(True),
+			sequence(
+				while_expr(
+					logical_and(
+						variable("__ok", BOOL_TYPE),
+						not_null(entry),
+					),
+					scan_one,
+				),
+				variable("__ok", BOOL_TYPE),
+			),
+		),
+	)
+
+	let_expr(
+		"__a_len",
+		False,
+		INT_TYPE,
+		intrinsic_call("set_len", [left], INT_TYPE),
+		let_expr(
+			"__b_len",
+			False,
+			INT_TYPE,
+			intrinsic_call("set_len", [right], INT_TYPE),
+			if_expr(
+				binary(
+					GreaterOp,
+					variable("__a_len", INT_TYPE),
+					variable("__b_len", INT_TYPE),
+					BOOL_TYPE,
+				),
+				bool_literal(False),
+				scan,
+				BOOL_TYPE,
+			),
+		),
+	)
+
+
+private pure func synthesize_set_selected(
+	left: CoreExpr,
+	right: CoreExpr,
+	result_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+	select_present: Bool,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	found: CoreExpr = variable("__in_b", BOOL_TYPE)
+
+	should_insert: CoreExpr = if select_present:
+		found
+	else:
+		binary(EqualOp, found, bool_literal(False), BOOL_TYPE)
+
+	scan_one: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call("set_entry_key", [entry], POINTER_TYPE),
+		let_expr(
+			"__in_b",
+			False,
+			BOOL_TYPE,
+			set_contains_key(right, key, layout),
+			sequence(
+				if_expr(
+					should_insert,
+					set_insert_retained(result, key, layout),
+					VOID_EXPRESSION,
+					VoidType,
+				),
+				assignment(
+					"__entry",
+					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+				),
+			),
+		),
+	)
+
+	let_expr(
+		"__result",
+		True,
+		result_type,
+		builtin_call(
+			"blorp_set_new",
+			[],
+			result_type,
+		),
+		sequence(
+			intrinsic_call(
+				"set_reserve_for_len",
+				[result, intrinsic_call("set_len", [left], INT_TYPE)],
+				VoidType,
+			),
+			let_expr(
+				"__entry",
+				True,
+				POINTER_TYPE,
+				intrinsic_call("set_first", [left], POINTER_TYPE),
+				sequence(
+					while_expr(not_null(entry), scan_one),
+					result,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_combine(
+	left: CoreExpr,
+	right: CoreExpr,
+	result_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	scan_one: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call("set_entry_key", [entry], POINTER_TYPE),
+		sequence(
+			set_insert_retained(result, key, layout),
+			assignment(
+				"__entry",
+				intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+			),
+		),
+	)
+
+	let_expr(
+		"__result",
+		True,
+		result_type,
+		intrinsic_call(
+			"set_cow",
+			[left],
+			result_type,
+		),
+		sequence(
+			intrinsic_call(
+				"set_reserve_for_len",
+				[result, binary(
+						AddOp,
+						intrinsic_call("set_len", [result], INT_TYPE),
+						intrinsic_call("set_len", [right], INT_TYPE),
+						INT_TYPE,
+					)],
+				VoidType,
+			),
+			let_expr(
+				"__entry",
+				True,
+				POINTER_TYPE,
+				intrinsic_call("set_first", [right], POINTER_TYPE),
+				sequence(
+					while_expr(not_null(entry), scan_one),
+					result,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_map(
+	self: CoreExpr,
+	callback: CoreExpr,
+	result_type: CoreType,
+	element_type: CoreType,
+	result_element_type: CoreType,
+	input_layout: CoreHashTypeLayoutFacts,
+	result_layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	element: CoreExpr = unbox_pointer(input_layout.hash_key_pointer_layout, key, element_type)
+	scan_one: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call("set_entry_key", [entry], POINTER_TYPE),
+		let_expr(
+			"__mapped",
+			False,
+			result_element_type,
+			closure_call(callback, [element], result_element_type),
+			sequence(
+				set_insert_retained(
+					result,
+					pointer_argument(
+						result_layout.hash_key_pointer_layout,
+						variable("__mapped", result_element_type),
+						result_element_type,
+					),
+					result_layout,
+				),
+				assignment(
+					"__entry",
+					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+				),
+			),
+		),
+	)
+
+	let_expr(
+		"__result",
+		True,
+		result_type,
+		builtin_call(
+			"blorp_set_new",
+			[],
+			result_type,
+		),
+		sequence(
+			intrinsic_call(
+				"set_reserve_for_len",
+				[result, intrinsic_call("set_len", [self], INT_TYPE)],
+				VoidType,
+			),
+			let_expr(
+				"__entry",
+				True,
+				POINTER_TYPE,
+				intrinsic_call("set_first", [self], POINTER_TYPE),
+				sequence(
+					while_expr(not_null(entry), scan_one),
+					result,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_filter(
+	self: CoreExpr,
+	predicate: CoreExpr,
+	self_type: CoreType,
+	element_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", self_type)
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	element: CoreExpr = unbox_pointer(layout.hash_key_pointer_layout, key, element_type)
+	scan_one: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call("set_entry_key", [entry], POINTER_TYPE),
+		sequence(
+			if_expr(
+				closure_call(predicate, [element], BOOL_TYPE),
+				set_insert_retained(result, key, layout),
+				VOID_EXPRESSION,
+				VoidType,
+			),
+			assignment(
+				"__entry",
+				intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+			),
+		),
+	)
+
+	let_expr(
+		"__result",
+		True,
+		self_type,
+		builtin_call(
+			"blorp_set_new",
+			[],
+			self_type,
+		),
+		sequence(
+			intrinsic_call(
+				"set_reserve_for_len",
+				[result, intrinsic_call("set_len", [self], INT_TYPE)],
+				VoidType,
+			),
+			let_expr(
+				"__entry",
+				True,
+				POINTER_TYPE,
+				intrinsic_call("set_first", [self], POINTER_TYPE),
+				sequence(
+					while_expr(not_null(entry), scan_one),
+					result,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_fold(
+	self: CoreExpr,
+	initial: CoreExpr,
+	callback: CoreExpr,
+	element_type: CoreType,
+	accumulator_type: CoreType,
+	accumulator_release_policy: CoreReleasePolicy,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	key: CoreExpr = variable("__key", POINTER_TYPE)
+	element: CoreExpr = unbox_pointer(layout.hash_key_pointer_layout, key, element_type)
+	step: CoreExpr = let_expr(
+		"__key",
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"set_entry_key",
+			[entry],
+			POINTER_TYPE,
+		),
+		let_expr(
+			"__next",
+			False,
+			accumulator_type,
+			closure_call(
+				callback,
+				[variable("__acc", accumulator_type), element],
+				accumulator_type,
+			),
+			sequence(
+				DropExpr(
+					core_var("__acc"),
+					accumulator_type,
+					accumulator_release_policy,
+					assignment(
+						"__acc",
+						variable("__next", accumulator_type),
+					),
+					VoidType,
+					SyntheticSourceLoc,
+				),
+				assignment(
+					"__entry",
+					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+				),
+			),
+		),
+	)
+
+	let_expr(
+		"__acc",
+		True,
+		accumulator_type,
+		initial,
+		let_expr(
+			"__entry",
+			True,
+			POINTER_TYPE,
+			intrinsic_call("set_first", [self], POINTER_TYPE),
+			sequence(
+				while_expr(not_null(entry), step),
+				variable("__acc", accumulator_type),
+			),
+		),
+	)
+
+
+private pure func synthesize_set_to_list(self: CoreExpr, result_type: CoreType) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	entry: CoreExpr = variable("__entry", POINTER_TYPE)
+	index: CoreExpr = variable("__i", INT_TYPE)
+	key: CoreExpr = intrinsic_call("set_entry_key", [entry], POINTER_TYPE)
+	scan_one: CoreExpr = sequence(
+		intrinsic_call(
+			"list_retain_for",
+			[result, key],
+			VoidType,
+		),
+		sequence(
+			intrinsic_call(
+				"list_set",
+				[result, index, key],
+				VoidType,
+			),
+			sequence(
+				assignment(
+					"__i",
+					binary(AddOp, index, int_literal(1), INT_TYPE),
+				),
+				assignment(
+					"__entry",
+					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
+				),
+			),
+		),
+	)
+
+	let_expr(
+		"__n",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"set_len",
+			[self],
+			INT_TYPE,
+		),
+		let_expr(
+			"__result",
+			False,
+			result_type,
+			intrinsic_call(
+				"list_alloc",
+				[variable("__n", INT_TYPE)],
+				result_type,
+			),
+			let_expr(
+				"__i",
+				True,
+				INT_TYPE,
+				int_literal(0),
+				let_expr(
+					"__entry",
+					True,
+					POINTER_TYPE,
+					intrinsic_call(
+						"set_first",
+						[self],
+						POINTER_TYPE,
+					),
+					sequence(
+						while_expr(
+							not_null(entry),
+							scan_one,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[result, index],
+								VoidType,
+							),
+							result,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_dict_list(
+	self: CoreExpr,
+	result_type: CoreType,
+	item_intrinsic: String,
+	release_intrinsic: String,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	output_index: CoreExpr = variable("__j", INT_TYPE)
+	slot: CoreExpr = variable("__slot", INT_TYPE)
+	raw_item: CoreExpr = intrinsic_call(
+		item_intrinsic,
+		[self, slot],
+		POINTER_TYPE,
+	)
+	scan_one: CoreExpr = let_expr(
+		"__slot",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_order_get",
+			[self, variable("__i", INT_TYPE)],
+			INT_TYPE,
+		),
+		if_expr(
+			binary(
+				GreaterEqualOp,
+				slot,
+				int_literal(0),
+				BOOL_TYPE,
+			),
+			sequence(
+				intrinsic_call(
+					"list_retain_for",
+					[result, raw_item],
+					VoidType,
+				),
+				sequence(
+					intrinsic_call(
+						"list_set",
+						[result, output_index, raw_item],
+						VoidType,
+					),
+					assignment(
+						"__j",
+						binary(AddOp, output_index, int_literal(1), INT_TYPE),
+					),
+				),
+			),
+			VOID_EXPRESSION,
+			VoidType,
+		),
+	)
+
+	let_expr(
+		"__n",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_len",
+			[self],
+			INT_TYPE,
+		),
+		let_expr(
+			"__result",
+			False,
+			result_type,
+			intrinsic_call(
+				"list_alloc",
+				[variable("__n", INT_TYPE)],
+				result_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_elem_release",
+					[result, intrinsic_call(release_intrinsic, [self], POINTER_TYPE)],
+					VoidType,
+				),
+				let_expr(
+					"__j",
+					True,
+					INT_TYPE,
+					int_literal(0),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							intrinsic_call("dict_order_len", [self], INT_TYPE),
+							scan_one,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[result, output_index],
+								VoidType,
+							),
+							result,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func dict_hash_call(
+	layout: CoreHashTypeLayoutFacts,
+	dict_value: CoreExpr,
+	key: CoreExpr,
+) -> CoreExpr:
+	hash_probe(layout.probe_mode, "dict", dict_value, key)
+
+
+private pure func dict_eq_call(
+	layout: CoreHashTypeLayoutFacts,
+	dict_value: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	equality_probe(layout.probe_mode, "dict", dict_value, left, right)
+
+
+private pure func dict_hash_fragment(hash: CoreExpr) -> CoreExpr:
+	intrinsic_call(
+		"bit_and",
+		[
+			intrinsic_call(
+				"shift_right",
+				[hash, int_literal(DICT_HASH_FRAGMENT_SHIFT)],
+				INT_TYPE,
+			),
+			int_literal(DICT_HASH_FRAGMENT_MASK),
+		],
+		INT_TYPE,
+	)
+
+
+private pure func dict_find_slot(
+	dict_value: CoreExpr,
+	key: CoreExpr,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	lookup_key: CoreExpr = variable("__dict_lookup_key", POINTER_TYPE)
+	hash: CoreExpr = variable("__dict_lookup_hash", INT_TYPE)
+	hash_fragment: CoreExpr = variable("__dict_lookup_h2", INT_TYPE)
+	index: CoreExpr = variable("__dict_lookup_idx", INT_TYPE)
+	found_slot: CoreExpr = variable("__dict_lookup_found_slot", INT_TYPE)
+	probes: CoreExpr = variable("__dict_lookup_probes", INT_TYPE)
+	metadata: CoreExpr = variable("__dict_lookup_meta", INT_TYPE)
+	slot_matches: CoreExpr = logical_and(
+		binary(
+			EqualOp,
+			metadata,
+			hash_fragment,
+			BOOL_TYPE,
+		),
+		dict_eq_call(
+			layout,
+			dict_value,
+			intrinsic_call(
+				"dict_key_at",
+				[dict_value, index],
+				POINTER_TYPE,
+			),
+			lookup_key,
+		),
+	)
+	advance_probe: CoreExpr = sequence(
+		assignment(
+			"__dict_lookup_idx",
+			intrinsic_call(
+				"bit_and",
+				[
+					binary(AddOp, index, int_literal(1), INT_TYPE),
+					intrinsic_call("dict_mask", [dict_value], INT_TYPE),
+				],
+				INT_TYPE,
+			),
+		),
+		assignment(
+			"__dict_lookup_probes",
+			binary(AddOp, probes, int_literal(1), INT_TYPE),
+		),
+	)
+	scan_one: CoreExpr = let_expr(
+		"__dict_lookup_meta",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_meta_get",
+			[dict_value, index],
+			INT_TYPE,
+		),
+		if_expr(
+			slot_matches,
+			sequence(
+				assignment("__dict_lookup_found_slot", index),
+				BREAK_EXPRESSION,
+			),
+			if_expr(
+				binary(EqualOp, metadata, int_literal(DICT_EMPTY_METADATA), BOOL_TYPE),
+				BREAK_EXPRESSION,
+				advance_probe,
+				VoidType,
+			),
+			VoidType,
+		),
+	)
+	scan: CoreExpr = while_expr(
+		binary(
+			LessEqualOp,
+			probes,
+			intrinsic_call("dict_capacity", [dict_value], INT_TYPE),
+			BOOL_TYPE,
+		),
+		scan_one,
+	)
+
+	let_expr(
+		"__dict_lookup_key",
+		False,
+		POINTER_TYPE,
+		key,
+		let_expr(
+			"__dict_lookup_hash",
+			False,
+			INT_TYPE,
+			dict_hash_call(
+				layout,
+				dict_value,
+				lookup_key,
+			),
+			let_expr(
+				"__dict_lookup_h2",
+				False,
+				INT_TYPE,
+				dict_hash_fragment(hash),
+				let_expr(
+					"__dict_lookup_idx",
+					True,
+					INT_TYPE,
+					intrinsic_call(
+						"bit_and",
+						[hash, intrinsic_call("dict_mask", [dict_value], INT_TYPE)],
+						INT_TYPE,
+					),
+					let_expr(
+						"__dict_lookup_found_slot",
+						True,
+						INT_TYPE,
+						int_literal(DICT_MISSING_SLOT),
+						let_expr(
+							"__dict_lookup_probes",
+							True,
+							INT_TYPE,
+							int_literal(0),
+							sequence(scan, found_slot),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_dict_contains(
+	self: CoreExpr,
+	key: CoreExpr,
+	key_type: CoreType,
+	layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	lookup_key: CoreExpr = variable("__dict_contains_key", POINTER_TYPE)
+	hash: CoreExpr = variable("__dict_contains_hash", INT_TYPE)
+	hash_fragment: CoreExpr = variable("__dict_contains_h2", INT_TYPE)
+	index: CoreExpr = variable("__dict_contains_idx", INT_TYPE)
+	probes: CoreExpr = variable("__dict_contains_probes", INT_TYPE)
+	found: CoreExpr = variable("__dict_contains_found", BOOL_TYPE)
+	metadata: CoreExpr = variable("__dict_contains_meta", INT_TYPE)
+	slot_key: CoreExpr = intrinsic_call(
+		"dict_key_at",
+		[self, index],
+		POINTER_TYPE,
+	)
+	slot_matches: CoreExpr = logical_and(
+		binary(EqualOp, metadata, hash_fragment, BOOL_TYPE),
+		dict_eq_call(layout, self, slot_key, lookup_key),
+	)
+	advance_probe: CoreExpr = sequence(
+		assignment(
+			"__dict_contains_idx",
+			intrinsic_call(
+				"bit_and",
+				[
+					binary(AddOp, index, int_literal(1), INT_TYPE),
+					intrinsic_call("dict_mask", [self], INT_TYPE),
+				],
+				INT_TYPE,
+			),
+		),
+		assignment(
+			"__dict_contains_probes",
+			binary(AddOp, probes, int_literal(1), INT_TYPE),
+		),
+	)
+	scan_one: CoreExpr = let_expr(
+		"__dict_contains_meta",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_meta_get",
+			[self, index],
+			INT_TYPE,
+		),
+		if_expr(
+			slot_matches,
+			sequence(
+				assignment("__dict_contains_found", bool_literal(True)),
+				BREAK_EXPRESSION,
+			),
+			if_expr(
+				binary(EqualOp, metadata, int_literal(DICT_EMPTY_METADATA), BOOL_TYPE),
+				BREAK_EXPRESSION,
+				advance_probe,
+				VoidType,
+			),
+			VoidType,
+		),
+	)
+	scan: CoreExpr = while_expr(
+		logical_and(
+			binary(
+				LessEqualOp,
+				probes,
+				intrinsic_call("dict_capacity", [self], INT_TYPE),
+				BOOL_TYPE,
+			),
+			binary(EqualOp, found, bool_literal(False), BOOL_TYPE),
+		),
+		scan_one,
+	)
+
+	let_expr(
+		"__dict_contains_key",
+		False,
+		POINTER_TYPE,
+		pointer_argument(
+			layout.hash_key_pointer_layout,
+			key,
+			key_type,
+		),
+		let_expr(
+			"__dict_contains_hash",
+			False,
+			INT_TYPE,
+			dict_hash_call(
+				layout,
+				self,
+				lookup_key,
+			),
+			let_expr(
+				"__dict_contains_h2",
+				False,
+				INT_TYPE,
+				dict_hash_fragment(hash),
+				let_expr(
+					"__dict_contains_idx",
+					True,
+					INT_TYPE,
+					intrinsic_call(
+						"bit_and",
+						[hash, intrinsic_call("dict_mask", [self], INT_TYPE)],
+						INT_TYPE,
+					),
+					let_expr(
+						"__dict_contains_probes",
+						True,
+						INT_TYPE,
+						int_literal(0),
+						let_expr(
+							"__dict_contains_found",
+							True,
+							BOOL_TYPE,
+							bool_literal(False),
+							sequence(scan, found),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_dict_get_or(
+	self: CoreExpr,
+	key: CoreExpr,
+	default_value: CoreExpr,
+	key_type: CoreType,
+	value_type: CoreType,
+	key_layout: CoreHashTypeLayoutFacts,
+	value_layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	slot: CoreExpr = variable("__dict_get_or_slot", INT_TYPE)
+	raw_value: CoreExpr = variable("__dict_get_or_value", POINTER_TYPE)
+	unboxed_value: CoreExpr = unbox_pointer(
+		value_layout.boxed_value_pointer_layout,
+		raw_value,
+		value_type,
+	)
+
+	found_result: CoreExpr = if pointer_temp_needs_release(value_layout.boxed_value_pointer_layout):
+		let_expr(
+			"__dict_get_or_unboxed",
+			False,
+			value_type,
+			unboxed_value,
+			sequence(
+				intrinsic_call(
+					"dict_release_value_for",
+					[self, raw_value],
+					VoidType,
+				),
+				variable(
+					"__dict_get_or_unboxed",
+					value_type,
+				),
+			),
+		)
+	else:
+		unboxed_value
+
+	found_value: CoreExpr = let_expr(
+		"__dict_get_or_value",
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"dict_value_at",
+			[self, slot],
+			POINTER_TYPE,
+		),
+		sequence(
+			intrinsic_call(
+				"dict_retain_value_for",
+				[self, raw_value],
+				VoidType,
+			),
+			found_result,
+		),
+	)
+
+	let_expr(
+		"__dict_get_or_slot",
+		False,
+		INT_TYPE,
+		dict_find_slot(
+			self,
+			pointer_argument(key_layout.hash_key_pointer_layout, key, key_type),
+			key_layout,
+		),
+		if_expr(
+			binary(GreaterEqualOp, slot, int_literal(0), BOOL_TYPE),
+			found_value,
+			default_value,
+			value_type,
+		),
+	)
+
+
+private pure func synthesize_dict_entries(
+	self: CoreExpr,
+	result_type: CoreType,
+	pair_type: CoreType,
+	key_type: CoreType,
+	value_type: CoreType,
+	key_layout: CoreHashTypeLayoutFacts,
+	value_layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", result_type)
+	output_index: CoreExpr = variable("__j", INT_TYPE)
+	slot: CoreExpr = variable("__dict_entries_slot", INT_TYPE)
+	raw_key: CoreExpr = intrinsic_call(
+		"dict_key_at",
+		[self, slot],
+		POINTER_TYPE,
+	)
+	raw_value: CoreExpr = intrinsic_call(
+		"dict_value_at",
+		[self, slot],
+		POINTER_TYPE,
+	)
+	pair: CoreExpr = TupleExpr(
+		[
+			unbox_pointer(key_layout.hash_key_pointer_layout, raw_key, key_type),
+			unbox_pointer(value_layout.boxed_value_pointer_layout, raw_value, value_type),
+		],
+		pair_type,
+		SyntheticSourceLoc,
+	)
+	scan_one: CoreExpr = let_expr(
+		"__dict_entries_slot",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_order_get",
+			[self, variable("__i", INT_TYPE)],
+			INT_TYPE,
+		),
+		if_expr(
+			binary(
+				GreaterEqualOp,
+				slot,
+				int_literal(0),
+				BOOL_TYPE,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_owned",
+					[result, output_index, pair],
+					VoidType,
+				),
+				assignment(
+					"__j",
+					binary(AddOp, output_index, int_literal(1), INT_TYPE),
+				),
+			),
+			VOID_EXPRESSION,
+			VoidType,
+		),
+	)
+
+	let_expr(
+		"__n",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_len",
+			[self],
+			INT_TYPE,
+		),
+		let_expr(
+			"__result",
+			False,
+			result_type,
+			intrinsic_call(
+				"list_alloc",
+				[variable("__n", INT_TYPE)],
+				result_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_elem_release",
+					[result, intrinsic_call("elem_release_fn", [], POINTER_TYPE)],
+					VoidType,
+				),
+				let_expr(
+					"__j",
+					True,
+					INT_TYPE,
+					int_literal(0),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							intrinsic_call("dict_order_len", [self], INT_TYPE),
+							scan_one,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[result, output_index],
+								VoidType,
+							),
+							result,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func dict_insert_retained(
+	dict_value: CoreExpr,
+	key: CoreExpr,
+	value: CoreExpr,
+	key_layout: CoreHashTypeLayoutFacts,
+	release_value_temp: Bool,
+) -> CoreExpr:
+	insert_key: CoreExpr = variable("__dict_insert_key", POINTER_TYPE)
+	insert_value: CoreExpr = variable("__dict_insert_value", POINTER_TYPE)
+	hash: CoreExpr = variable("__dict_insert_hash", INT_TYPE)
+	hash_fragment: CoreExpr = variable("__dict_insert_h2", INT_TYPE)
+	index: CoreExpr = variable("__dict_insert_idx", INT_TYPE)
+	first_available: CoreExpr = variable("__dict_insert_first_available", INT_TYPE)
+	insert_slot: CoreExpr = variable("__dict_insert_insert_slot", INT_TYPE)
+	found_slot: CoreExpr = variable("__dict_insert_found_slot", INT_TYPE)
+	probes: CoreExpr = variable("__dict_insert_probes", INT_TYPE)
+	metadata: CoreExpr = variable("__dict_insert_meta", INT_TYPE)
+	slot_key: CoreExpr = intrinsic_call(
+		"dict_key_at",
+		[dict_value, index],
+		POINTER_TYPE,
+	)
+	slot_matches: CoreExpr = logical_and(
+		binary(EqualOp, metadata, hash_fragment, BOOL_TYPE),
+		dict_eq_call(key_layout, dict_value, slot_key, insert_key),
+	)
+	choose_insert_slot: CoreExpr = if_expr(
+		binary(GreaterEqualOp, first_available, int_literal(0), BOOL_TYPE),
+		first_available,
+		index,
+		INT_TYPE,
+	)
+	remember_deleted: CoreExpr = if_expr(
+		logical_and(
+			binary(EqualOp, metadata, int_literal(DICT_DELETED_METADATA), BOOL_TYPE),
+			binary(LessOp, first_available, int_literal(0), BOOL_TYPE),
+		),
+		assignment("__dict_insert_first_available", index),
+		VOID_EXPRESSION,
+		VoidType,
+	)
+	advance_probe: CoreExpr = sequence(
+		remember_deleted,
+		sequence(
+			assignment(
+				"__dict_insert_idx",
+				intrinsic_call(
+					"bit_and",
+					[
+						binary(AddOp, index, int_literal(1), INT_TYPE),
+						intrinsic_call("dict_mask", [dict_value], INT_TYPE),
+					],
+					INT_TYPE,
+				),
+			),
+			assignment(
+				"__dict_insert_probes",
+				binary(AddOp, probes, int_literal(1), INT_TYPE),
+			),
+		),
+	)
+	scan_one: CoreExpr = let_expr(
+		"__dict_insert_meta",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_meta_get",
+			[dict_value, index],
+			INT_TYPE,
+		),
+		if_expr(
+			slot_matches,
+			sequence(
+				assignment("__dict_insert_found_slot", index),
+				BREAK_EXPRESSION,
+			),
+			if_expr(
+				binary(EqualOp, metadata, int_literal(DICT_EMPTY_METADATA), BOOL_TYPE),
+				sequence(
+					assignment("__dict_insert_insert_slot", choose_insert_slot),
+					BREAK_EXPRESSION,
+				),
+				advance_probe,
+				VoidType,
+			),
+			VoidType,
+		),
+	)
+	scan: CoreExpr = while_expr(
+		binary(
+			LessEqualOp,
+			probes,
+			intrinsic_call("dict_capacity", [dict_value], INT_TYPE),
+			BOOL_TYPE,
+		),
+		scan_one,
+	)
+	finalize_insert_slot: CoreExpr = if_expr(
+		logical_and(
+			binary(LessOp, insert_slot, int_literal(0), BOOL_TYPE),
+			binary(GreaterEqualOp, first_available, int_literal(0), BOOL_TYPE),
+		),
+		assignment("__dict_insert_insert_slot", first_available),
+		VOID_EXPRESSION,
+		VoidType,
+	)
+	update_existing: CoreExpr = let_expr(
+		"__dict_insert_old_value",
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"dict_value_at",
+			[dict_value, found_slot],
+			POINTER_TYPE,
+		),
+		if_expr(
+			binary(
+				NotEqualOp,
+				variable("__dict_insert_old_value", POINTER_TYPE),
+				insert_value,
+				BOOL_TYPE,
+			),
+			sequence(
+				intrinsic_call(
+					"dict_release_value_for",
+					[dict_value, variable("__dict_insert_old_value", POINTER_TYPE)],
+					VoidType,
+				),
+				sequence(
+					intrinsic_call(
+						"dict_retain_value_for",
+						[dict_value, insert_value],
+						VoidType,
+					),
+					intrinsic_call(
+						"dict_set_value_at",
+						[dict_value, found_slot, insert_value],
+						VoidType,
+					),
+				),
+			),
+			VOID_EXPRESSION,
+			VoidType,
+		),
+	)
+	resize_if_needed: CoreExpr = if_expr(
+		binary(
+			GreaterEqualOp,
+			variable("__dict_insert_new_len", INT_TYPE),
+			intrinsic_call("dict_grow_at", [dict_value], INT_TYPE),
+			BOOL_TYPE,
+		),
+		intrinsic_call(
+			"dict_resize",
+			[dict_value, binary(
+					MultiplyOp,
+					intrinsic_call("dict_capacity", [dict_value], INT_TYPE),
+					int_literal(COLLECTION_GROWTH_FACTOR),
+					INT_TYPE,
+				)],
+			VoidType,
+		),
+		VOID_EXPRESSION,
+		VoidType,
+	)
+	insert_new: CoreExpr = let_expr(
+		"__dict_insert_order_len",
+		False,
+		INT_TYPE,
+		intrinsic_call(
+			"dict_order_len",
+			[dict_value],
+			INT_TYPE,
+		),
+		let_expr(
+			"__dict_insert_new_len",
+			False,
+			INT_TYPE,
+			binary(
+				AddOp,
+				intrinsic_call("dict_len", [dict_value], INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+			let_expr(
+				"__dict_insert_new_order_len",
+				False,
+				INT_TYPE,
+				binary(
+					AddOp,
+					variable("__dict_insert_order_len", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+				sequence(
+					intrinsic_call(
+						"dict_meta_set",
+						[dict_value, insert_slot, hash_fragment],
+						VoidType,
+					),
+					sequence(
+						intrinsic_call(
+							"dict_retain_key_for",
+							[dict_value, insert_key],
+							VoidType,
+						),
+						sequence(
+							intrinsic_call(
+								"dict_retain_value_for",
+								[dict_value, insert_value],
+								VoidType,
+							),
+							sequence(
+								intrinsic_call(
+									"dict_set_key_at",
+									[dict_value, insert_slot, insert_key],
+									VoidType,
+								),
+								sequence(
+									intrinsic_call(
+										"dict_set_value_at",
+										[dict_value, insert_slot, insert_value],
+										VoidType,
+									),
+									sequence(
+										intrinsic_call(
+											"dict_order_index_set",
+											[
+												dict_value,
+												insert_slot,
+												variable("__dict_insert_order_len", INT_TYPE),
+											],
+											VoidType,
+										),
+										sequence(
+											intrinsic_call(
+												"dict_order_set",
+												[
+													dict_value,
+													variable("__dict_insert_order_len", INT_TYPE),
+													insert_slot,
+												],
+												VoidType,
+											),
+											sequence(
+												intrinsic_call(
+													"dict_set_order_len",
+													[
+														dict_value,
+														variable(
+															"__dict_insert_new_order_len",
+															INT_TYPE,
+														),
+													],
+													VoidType,
+												),
+												sequence(
+													intrinsic_call(
+														"dict_set_len",
+														[
+															dict_value,
+															variable(
+																"__dict_insert_new_len",
+																INT_TYPE,
+															),
+														],
+														VoidType,
+													),
+													resize_if_needed,
+												),
+											),
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+	release_temp: CoreExpr = if release_value_temp:
+		intrinsic_call(
+			"dict_release_value_for",
+			[dict_value, insert_value],
+			VoidType,
+		)
+	else:
+		VOID_EXPRESSION
+
+	let_expr(
+		"__dict_insert_key",
+		False,
+		POINTER_TYPE,
+		key,
+		let_expr(
+			"__dict_insert_value",
+			False,
+			POINTER_TYPE,
+			value,
+			let_expr(
+				"__dict_insert_hash",
+				False,
+				INT_TYPE,
+				dict_hash_call(
+					key_layout,
+					dict_value,
+					insert_key,
+				),
+				let_expr(
+					"__dict_insert_h2",
+					False,
+					INT_TYPE,
+					dict_hash_fragment(hash),
+					let_expr(
+						"__dict_insert_idx",
+						True,
+						INT_TYPE,
+						intrinsic_call(
+							"bit_and",
+							[hash, intrinsic_call("dict_mask", [dict_value], INT_TYPE)],
+							INT_TYPE,
+						),
+						let_expr(
+							"__dict_insert_first_available",
+							True,
+							INT_TYPE,
+							int_literal(DICT_MISSING_SLOT),
+							let_expr(
+								"__dict_insert_insert_slot",
+								True,
+								INT_TYPE,
+								int_literal(DICT_MISSING_SLOT),
+								let_expr(
+									"__dict_insert_found_slot",
+									True,
+									INT_TYPE,
+									int_literal(DICT_MISSING_SLOT),
+									let_expr(
+										"__dict_insert_probes",
+										True,
+										INT_TYPE,
+										int_literal(0),
+										sequence(
+											scan,
+											sequence(
+												finalize_insert_slot,
+												sequence(
+													if_expr(
+														binary(
+															GreaterEqualOp,
+															found_slot,
+															int_literal(0),
+															BOOL_TYPE,
+														),
+														update_existing,
+														insert_new,
+														VoidType,
+													),
+													release_temp,
+												),
+											),
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_dict_set(
+	self: CoreExpr,
+	key: CoreExpr,
+	value: CoreExpr,
+	dict_type: CoreType,
+	key_type: CoreType,
+	value_type: CoreType,
+	key_layout: CoreHashTypeLayoutFacts,
+	value_layout: CoreHashTypeLayoutFacts,
+) -> CoreExpr:
+	result: CoreExpr = variable("__result", dict_type)
+
+	let_expr(
+		"__result",
+		True,
+		dict_type,
+		intrinsic_call("dict_cow", [self], dict_type),
+		sequence(
+			dict_insert_retained(
+				result,
+				pointer_argument(key_layout.hash_key_pointer_layout, key, key_type),
+				pointer_argument(value_layout.boxed_value_pointer_layout, value, value_type),
+				key_layout,
+				pointer_temp_needs_release(value_layout.boxed_value_pointer_layout),
+			),
+			result,
+		),
+	)
+
+
+private pure func synthesize_set_named_body(
+	context: CoreSynthContext,
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[Option[CoreExpr], CoreSynthError]:
+	if name == "length":
+		match params:
+			[self]:
+				match set_element_type(self.typ):
+					Some(_):
+						if same_type(return_type, INT_TYPE):
+							Ok(Some(intrinsic_call("set_len", [parameter_value(self)], INT_TYPE)))
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "contains":
+		match params:
+			[self, element]:
+				match set_element_type(self.typ):
+					Some(element_type):
+						if (
+							same_type(element.typ, element_type)
+							and same_type(return_type, BOOL_TYPE)
+						):
+							layout ?= exact_layout(
+								context,
+								"std/set.contains element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_contains(
+										parameter_value(self),
+										parameter_value(element),
+										element_type,
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "add":
+		match params:
+			[self, element]:
+				match set_element_type(self.typ):
+					Some(element_type):
+						if (
+							same_type(element.typ, element_type)
+							and same_type(return_type, self.typ)
+						):
+							layout ?= exact_layout(
+								context,
+								"std/set.add element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_add(
+										parameter_value(self),
+										parameter_value(element),
+										self.typ,
+										element_type,
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "is_subset":
+		match params:
+			[left, right]:
+				match set_element_type(left.typ):
+					Some(element_type):
+						if same_type(right.typ, left.typ) and same_type(return_type, BOOL_TYPE):
+							layout ?= exact_layout(
+								context,
+								"std/set.is_subset element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_is_subset(
+										parameter_value(left),
+										parameter_value(right),
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "difference" or name == "intersect":
+		match params:
+			[left, right]:
+				match set_element_type(left.typ):
+					Some(element_type):
+						if same_type(right.typ, left.typ) and same_type(return_type, left.typ):
+							operation: String = "std/set.${name} element"
+							layout ?= exact_layout(context, operation, element_type, loc)
+							Ok(
+								Some(
+									synthesize_set_selected(
+										parameter_value(left),
+										parameter_value(right),
+										return_type,
+										layout,
+										name == "intersect",
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "combine":
+		match params:
+			[left, right]:
+				match set_element_type(left.typ):
+					Some(element_type):
+						if same_type(right.typ, left.typ) and same_type(return_type, left.typ):
+							layout ?= exact_layout(
+								context,
+								"std/set.combine element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_combine(
+										parameter_value(left),
+										parameter_value(right),
+										return_type,
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "map":
+		match params:
+			[self, callback]:
+				match (
+					set_element_type(self.typ),
+					set_element_type(return_type),
+					function_signature(callback.typ),
+				):
+					(Some(element_type), Some(result_element_type), Some((callback_params, callback_return))):
+						if (
+							same_types(callback_params, [element_type])
+							and same_type(callback_return, result_element_type)
+						):
+							input_layout ?= exact_layout(
+								context,
+								"std/set.map input element",
+								element_type,
+								loc,
+							)
+							result_layout ?= exact_layout(
+								context,
+								"std/set.map result element",
+								result_element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_map(
+										parameter_value(self),
+										parameter_value(callback),
+										return_type,
+										element_type,
+										result_element_type,
+										input_layout,
+										result_layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "filter":
+		match params:
+			[self, predicate]:
+				match (set_element_type(self.typ), function_signature(predicate.typ)):
+					(Some(element_type), Some((predicate_params, predicate_return))):
+						if (
+							same_type(return_type, self.typ)
+							and same_types(predicate_params, [element_type])
+							and same_type(predicate_return, BOOL_TYPE)
+						):
+							layout ?= exact_layout(
+								context,
+								"std/set.filter element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_filter(
+										parameter_value(self),
+										parameter_value(predicate),
+										self.typ,
+										element_type,
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "fold":
+		match params:
+			[self, initial, callback]:
+				match (set_element_type(self.typ), function_signature(callback.typ)):
+					(Some(element_type), Some((callback_params, callback_return))):
+						if (
+							same_type(initial.typ, return_type)
+							and same_types(
+								callback_params,
+								[return_type, element_type],
+							)
+							and same_type(callback_return, return_type)
+						):
+							layout ?= exact_layout(
+								context,
+								"std/set.fold element",
+								element_type,
+								loc,
+							)
+							accumulator_release_policy ?= exact_release_policy(
+								context,
+								"std/set.fold accumulator",
+								return_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_fold(
+										parameter_value(self),
+										parameter_value(initial),
+										parameter_value(callback),
+										element_type,
+										return_type,
+										accumulator_release_policy,
+										layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "to_list":
+		match params:
+			[self]:
+				match (set_element_type(self.typ), list_element_type(return_type)):
+					(Some(element_type), Some(result_element_type)):
+						if same_type(element_type, result_element_type):
+							Ok(Some(synthesize_set_to_list(parameter_value(self), return_type)))
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else:
+		Ok(None)
+
+
+private pure func synthesize_dict_named_body(
+	context: CoreSynthContext,
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Result[Option[CoreExpr], CoreSynthError]:
+	if name == "length":
+		match params:
+			[self]:
+				if dict_types(self.typ).is_some() and same_type(return_type, INT_TYPE):
+					Ok(Some(intrinsic_call("dict_len", [parameter_value(self)], INT_TYPE)))
+				else:
+					Ok(None)
+			_:
+				Ok(None)
+	else if name == "contains":
+		match params:
+			[self, key]:
+				match dict_types(self.typ):
+					Some((key_type, _)):
+						if same_type(key.typ, key_type) and same_type(return_type, BOOL_TYPE):
+							key_layout ?= exact_layout(
+								context,
+								"std/dict.contains key",
+								key_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_dict_contains(
+										parameter_value(self),
+										parameter_value(key),
+										key_type,
+										key_layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "get_or":
+		match params:
+			[self, key, default_value]:
+				match dict_types(self.typ):
+					Some((key_type, value_type)):
+						if (
+							same_type(key.typ, key_type)
+							and same_type(default_value.typ, value_type)
+							and same_type(return_type, value_type)
+						):
+							key_layout ?= exact_layout(
+								context,
+								"std/dict.get_or key",
+								key_type,
+								loc,
+							)
+							value_layout ?= exact_layout(
+								context,
+								"std/dict.get_or value",
+								value_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_dict_get_or(
+										parameter_value(self),
+										parameter_value(key),
+										parameter_value(default_value),
+										key_type,
+										value_type,
+										key_layout,
+										value_layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "set":
+		match params:
+			[self, key, value]:
+				match dict_types(self.typ):
+					Some((key_type, value_type)):
+						if (
+							same_type(key.typ, key_type)
+							and same_type(value.typ, value_type)
+							and same_type(return_type, self.typ)
+						):
+							key_layout ?= exact_layout(context, "std/dict.set key", key_type, loc)
+							value_layout ?= exact_layout(
+								context,
+								"std/dict.set value",
+								value_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_dict_set(
+										parameter_value(self),
+										parameter_value(key),
+										parameter_value(value),
+										self.typ,
+										key_type,
+										value_type,
+										key_layout,
+										value_layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					None:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "keys":
+		match params:
+			[self]:
+				match (dict_types(self.typ), list_element_type(return_type)):
+					(Some((key_type, _)), Some(result_element_type)):
+						if same_type(key_type, result_element_type):
+							Ok(
+								Some(
+									synthesize_dict_list(
+										parameter_value(self),
+										return_type,
+										"dict_key_at",
+										"dict_key_release_fn",
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "values":
+		match params:
+			[self]:
+				match (dict_types(self.typ), list_element_type(return_type)):
+					(Some((_, value_type)), Some(result_element_type)):
+						if same_type(value_type, result_element_type):
+							Ok(
+								Some(
+									synthesize_dict_list(
+										parameter_value(self),
+										return_type,
+										"dict_value_at",
+										"dict_value_release_fn",
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else if name == "entries":
+		match params:
+			[self]:
+				match (dict_types(self.typ), list_element_type(return_type)):
+					(Some((key_type, value_type)), Some(TupleType(pair_types))):
+						if (
+							same_types(
+								pair_types,
+								[key_type, value_type],
+							)
+						):
+							key_layout ?= exact_layout(
+								context,
+								"std/dict.entries key",
+								key_type,
+								loc,
+							)
+							value_layout ?= exact_layout(
+								context,
+								"std/dict.entries value",
+								value_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_dict_entries(
+										parameter_value(self),
+										return_type,
+										TupleType(pair_types),
+										key_type,
+										value_type,
+										key_layout,
+										value_layout,
+									),
+								),
+							)
+						else:
+							Ok(None)
+					_:
+						Ok(None)
+			_:
+				Ok(None)
+	else:
+		Ok(None)
+
+
+pure func synthesize_hash_collection_body(
+	context: CoreSynthContext,
+	function_info: CoreFunction,
+) -> Result[Option[CoreExpr], CoreSynthError]:
+	if not is_synthesis_candidate(function_info):
+		Ok(None)
+	else:
+		match function_info.source_module:
+			Some(module_name):
+				if module_name != SET_MODULE and module_name != DICT_MODULE:
+					Ok(None)
+				else:
+					match synthesis_source_name(function_info):
+						Some(name):
+							if module_name == SET_MODULE:
+								synthesize_set_named_body(
+									context,
+									name,
+									function_info.params,
+									function_info.return_type,
+									function_info.loc,
+								)
+							else:
+								synthesize_dict_named_body(
+									context,
+									name,
+									function_info.params,
+									function_info.return_type,
+									function_info.loc,
+								)
+						None:
+							Ok(None)
+			None:
+				Ok(None)

@@ -1,0 +1,966 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreBoxKind(Int128Box, PrimBox, StructBox),
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall),
+		CoreExpr(BoxExpr, BreakExpr, CallExpr, CastExpr, TupleExpr, UnboxExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			EnumType,
+			FunctionType,
+			NamedType,
+			TupleType,
+			TypeParameterType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(Int128Unbox, PrimUnbox, StructUnbox),
+		CoreVar,
+	../src/stage_09_core/compiler_core_synth_context: CoreSynthContext, empty_core_synth_context
+	../src/stage_09_core/compiler_core_synth_error:
+		CoreSynthError(HashCollectionInvalidValueType, HashCollectionLayoutUnavailable),
+	../src/stage_09_core/compiler_core_synth_hash_collections: synthesize_hash_collection_body
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private INT128_TYPE: CoreType = NamedType("Int128", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+
+pure func core_var(name: String, uniq: Int, def_id: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = Some(def_id)
+	}
+
+
+pure func param(
+	name: String,
+	uniq: Int,
+	def_id: Int,
+	typ: CoreType,
+) -> CoreParam:
+	{
+		name = core_var(name, uniq, def_id),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func set_type(element_type: CoreType) -> CoreType:
+	NamedType("Set", [element_type])
+
+
+pure func dict_type(key_type: CoreType, value_type: CoreType) -> CoreType:
+	NamedType(
+		"Dict",
+		[key_type, value_type],
+	)
+
+
+pure func list_type(element_type: CoreType) -> CoreType:
+	NamedType("List", [element_type])
+
+
+pure func builtin_function(
+	module_name: String,
+	source_name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func exact_var(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+pure func contains_var(expr: CoreExpr, expected: CoreVar) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			(
+				exact_var(variable, expected)
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_var(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_var(child, expected)
+			)
+
+
+pure func contains_intrinsic(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, _, _, _):
+			(
+				name == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_intrinsic(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_intrinsic(child, expected)
+			)
+
+
+pure func contains_builtin(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, _, _, _):
+			(
+				name == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_builtin(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_builtin(child, expected)
+			)
+
+
+pure func contains_closure_call(expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(ClosureCall, _, _, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(contains_closure_call)
+
+
+pure func contains_break(expr: CoreExpr) -> Bool:
+	match expr:
+		BreakExpr(_, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(contains_break)
+
+
+pure func contains_cast(expr: CoreExpr) -> Bool:
+	match expr:
+		CastExpr(_, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(contains_cast)
+
+
+pure func box_kinds_equal(left: CoreBoxKind, right: CoreBoxKind) -> Bool:
+	match left:
+		PrimBox:
+			match right:
+				PrimBox:
+					True
+				_:
+					False
+		Int128Box:
+			match right:
+				Int128Box:
+					True
+				_:
+					False
+		StructBox(left_name):
+			match right:
+				StructBox(right_name):
+					left_name == right_name
+				_:
+					False
+		_:
+			left == right
+
+
+pure func contains_box_kind(expr: CoreExpr, expected: CoreBoxKind) -> Bool:
+	match expr:
+		BoxExpr(box, _, _):
+			(
+				box_kinds_equal(box.kind, expected)
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_box_kind(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_box_kind(child, expected)
+			)
+
+
+pure func unbox_kinds_equal(left: CoreUnboxKind, right: CoreUnboxKind) -> Bool:
+	match left:
+		PrimUnbox:
+			match right:
+				PrimUnbox:
+					True
+				_:
+					False
+		Int128Unbox:
+			match right:
+				Int128Unbox:
+					True
+				_:
+					False
+		StructUnbox(left_name):
+			match right:
+				StructUnbox(right_name):
+					left_name == right_name
+				_:
+					False
+		_:
+			left == right
+
+
+pure func contains_unbox_kind(expr: CoreExpr, expected: CoreUnboxKind) -> Bool:
+	match expr:
+		UnboxExpr(kind, _, _, _):
+			(
+				unbox_kinds_equal(kind, expected)
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_unbox_kind(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_unbox_kind(child, expected)
+			)
+
+
+pure func contains_tuple(expr: CoreExpr) -> Bool:
+	match expr:
+		TupleExpr(_, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(contains_tuple)
+
+
+pure func synthesized_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	match synthesize_hash_collection_body(empty_core_synth_context(), function_info):
+		Ok(body):
+			body
+		Err(_):
+			None
+
+
+pure func all_synthesize(functions: List[CoreFunction]) -> Bool:
+	functions.all(func(function_info):
+		synthesized_body(function_info).is_some()
+	)
+
+
+func all_named_checks(checks: List[(String, Bool)]) -> Bool:
+	var passed: Bool = True
+
+	for (name, check_passed) in checks:
+		if not check_passed:
+			print("  failed check: ${name}")
+			passed = False
+
+	passed
+
+
+pure func test_set_complete_synthesized_family() -> Bool:
+	set_int: CoreType = set_type(INT_TYPE)
+	set_bool: CoreType = set_type(BOOL_TYPE)
+	predicate: CoreType = FunctionType(True, [INT_TYPE], BOOL_TYPE)
+	mapper: CoreType = FunctionType(True, [INT_TYPE], BOOL_TYPE)
+	folder: CoreType = FunctionType(
+		True,
+		[INT_TYPE, INT_TYPE],
+		INT_TYPE,
+	)
+	self: CoreParam = param("self", 11, 101, set_int)
+	other: CoreParam = param("other", 12, 102, set_int)
+	element: CoreParam = param("element", 13, 103, INT_TYPE)
+
+	all_synthesize([
+		builtin_function("std/set", "length", [self], INT_TYPE),
+		builtin_function(
+			"std/set",
+			"contains",
+			[self, element],
+			BOOL_TYPE,
+		),
+		builtin_function(
+			"std/set",
+			"add",
+			[self, element],
+			set_int,
+		),
+		builtin_function(
+			"std/set",
+			"is_subset",
+			[self, other],
+			BOOL_TYPE,
+		),
+		builtin_function(
+			"std/set",
+			"difference",
+			[self, other],
+			set_int,
+		),
+		builtin_function(
+			"std/set",
+			"intersect",
+			[self, other],
+			set_int,
+		),
+		builtin_function(
+			"std/set",
+			"combine",
+			[self, other],
+			set_int,
+		),
+		builtin_function(
+			"std/set",
+			"map",
+			[self, param("mapper", 14, 104, mapper)],
+			set_bool,
+		),
+		builtin_function(
+			"std/set",
+			"filter",
+			[self, param("predicate", 15, 105, predicate)],
+			set_int,
+		),
+		builtin_function(
+			"std/set",
+			"fold",
+			[self, param("initial", 16, 106, INT_TYPE), param("folder", 17, 107, folder)],
+			INT_TYPE,
+		),
+		builtin_function("std/set", "to_list", [self], list_type(INT_TYPE)),
+	])
+
+
+pure func test_set_immediate_probe_cow_and_parameter_identity() -> Bool:
+	set_int: CoreType = set_type(INT_TYPE)
+	self: CoreParam = param("receiver", 31, 301, set_int)
+	element: CoreParam = param("value", 32, 302, INT_TYPE)
+	contains: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[self, element],
+		BOOL_TYPE,
+	)
+	add: CoreFunction = builtin_function(
+		"std/set",
+		"add",
+		[self, element],
+		set_int,
+	)
+
+	match (synthesized_body(contains), synthesized_body(add)):
+		(Some(contains_body), Some(add_body)):
+			(
+				contains_intrinsic(contains_body, "set_hash_immediate")
+				and contains_intrinsic(contains_body, "set_eq_immediate")
+				and contains_box_kind(contains_body, PrimBox)
+				and contains_break(contains_body)
+				and contains_var(contains_body, self.name)
+				and contains_var(contains_body, element.name)
+				and contains_intrinsic(add_body, "set_cow")
+				and contains_intrinsic(add_body, "set_retain_key_for")
+				and contains_intrinsic(add_body, "set_alloc_entry")
+				and contains_intrinsic(add_body, "set_entry_set_prev_order")
+				and contains_intrinsic(add_body, "set_set_last")
+				and contains_intrinsic(add_body, "set_resize")
+				and contains_var(add_body, self.name)
+				and contains_var(add_body, element.name)
+			)
+		_:
+			False
+
+
+pure func test_set_dispatched_and_enum_probe_layouts() -> Bool:
+	string_set: CoreType = set_type(STRING_TYPE)
+	enum_key: CoreType = EnumType("Color")
+	enum_set: CoreType = set_type(enum_key)
+	string_contains: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[param("strings", 41, 401, string_set), param("needle", 42, 402, STRING_TYPE)],
+		BOOL_TYPE,
+	)
+	enum_contains: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[param("colors", 43, 403, enum_set), param("color", 44, 404, enum_key)],
+		BOOL_TYPE,
+	)
+
+	match (synthesized_body(string_contains), synthesized_body(enum_contains)):
+		(Some(string_body), Some(enum_body)):
+			(
+				contains_intrinsic(string_body, "set_hash")
+				and contains_intrinsic(string_body, "set_eq")
+				and contains_cast(string_body)
+				and not contains_intrinsic(string_body, "set_hash_immediate")
+				and contains_intrinsic(enum_body, "set_hash_immediate")
+				and contains_intrinsic(enum_body, "set_eq_immediate")
+				and contains_box_kind(enum_body, PrimBox)
+			)
+		_:
+			False
+
+
+pure func test_set_ordered_builders_and_callbacks() -> Bool:
+	set_int: CoreType = set_type(INT_TYPE)
+	set_bool: CoreType = set_type(BOOL_TYPE)
+	self: CoreParam = param("left", 51, 501, set_int)
+	other: CoreParam = param("right", 52, 502, set_int)
+	mapper: CoreParam = param(
+		"mapper",
+		53,
+		503,
+		FunctionType(True, [INT_TYPE], BOOL_TYPE),
+	)
+	predicate: CoreParam = param(
+		"predicate",
+		54,
+		504,
+		FunctionType(True, [INT_TYPE], BOOL_TYPE),
+	)
+	folder: CoreParam = param(
+		"folder",
+		55,
+		505,
+		FunctionType(
+			True,
+			[INT_TYPE, INT_TYPE],
+			INT_TYPE,
+		),
+	)
+	difference: CoreFunction = builtin_function(
+		"std/set",
+		"difference",
+		[self, other],
+		set_int,
+	)
+	combine: CoreFunction = builtin_function(
+		"std/set",
+		"combine",
+		[self, other],
+		set_int,
+	)
+	map_function: CoreFunction = builtin_function(
+		"std/set",
+		"map",
+		[self, mapper],
+		set_bool,
+	)
+	filter_function: CoreFunction = builtin_function(
+		"std/set",
+		"filter",
+		[self, predicate],
+		set_int,
+	)
+	fold_function: CoreFunction = builtin_function(
+		"std/set",
+		"fold",
+		[self, param("initial", 56, 506, INT_TYPE), folder],
+		INT_TYPE,
+	)
+
+	(
+		match (
+			synthesized_body(difference),
+			synthesized_body(combine),
+			synthesized_body(map_function),
+			synthesized_body(filter_function),
+		):
+			(Some(difference_body), Some(combine_body), Some(map_body), Some(filter_body)):
+				(
+					contains_builtin(difference_body, "blorp_set_new")
+					and contains_intrinsic(difference_body, "set_reserve_for_len")
+					and contains_intrinsic(difference_body, "set_first")
+					and contains_intrinsic(difference_body, "set_entry_next_order")
+					and contains_intrinsic(combine_body, "set_cow")
+					and contains_intrinsic(combine_body, "set_reserve_for_len")
+					and contains_closure_call(map_body)
+					and contains_unbox_kind(map_body, PrimUnbox)
+					and contains_intrinsic(map_body, "set_retain_key_for")
+					and contains_closure_call(filter_body)
+					and contains_var(map_body, mapper.name)
+					and contains_var(filter_body, predicate.name)
+				)
+			_:
+				False
+		and match synthesized_body(fold_function):
+			Some(fold_body):
+				contains_closure_call(fold_body) and contains_var(fold_body, folder.name)
+			None:
+				False
+	)
+
+
+pure func test_set_to_list_preserves_insertion_order_and_ownership() -> Bool:
+	set_int: CoreType = set_type(INT_TYPE)
+	function_info: CoreFunction = builtin_function(
+		"std/set",
+		"to_list",
+		[param("self", 61, 601, set_int)],
+		list_type(INT_TYPE),
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "set_first")
+				and contains_intrinsic(body, "set_entry_next_order")
+				and contains_intrinsic(body, "list_alloc")
+				and contains_intrinsic(body, "list_retain_for")
+				and contains_intrinsic(body, "list_set")
+				and contains_intrinsic(body, "list_set_len")
+			)
+		None:
+			False
+
+
+pure func test_dict_complete_synthesized_family() -> Bool:
+	dict_int_string: CoreType = dict_type(INT_TYPE, STRING_TYPE)
+	self: CoreParam = param("self", 71, 701, dict_int_string)
+	key: CoreParam = param("key", 72, 702, INT_TYPE)
+	value: CoreParam = param("value", 73, 703, STRING_TYPE)
+
+	all_synthesize([
+		builtin_function("std/dict", "length", [self], INT_TYPE),
+		builtin_function(
+			"std/dict",
+			"contains",
+			[self, key],
+			BOOL_TYPE,
+		),
+		builtin_function(
+			"std/dict",
+			"get_or",
+			[self, key, value],
+			STRING_TYPE,
+		),
+		builtin_function(
+			"std/dict",
+			"set",
+			[self, key, value],
+			dict_int_string,
+		),
+		builtin_function("std/dict", "keys", [self], list_type(INT_TYPE)),
+		builtin_function("std/dict", "values", [self], list_type(STRING_TYPE)),
+		builtin_function(
+			"std/dict",
+			"entries",
+			[self],
+			list_type(TupleType([INT_TYPE, STRING_TYPE])),
+		),
+	])
+
+
+pure func test_dict_probe_get_or_and_wide_value_ownership() -> Bool:
+	dict_int_wide: CoreType = dict_type(INT_TYPE, INT128_TYPE)
+	self: CoreParam = param("receiver", 81, 801, dict_int_wide)
+	key: CoreParam = param("lookup", 82, 802, INT_TYPE)
+	default_value: CoreParam = param("default_value", 83, 803, INT128_TYPE)
+	get_or: CoreFunction = builtin_function(
+		"std/dict",
+		"get_or",
+		[self, key, default_value],
+		INT128_TYPE,
+	)
+	set_function: CoreFunction = builtin_function(
+		"std/dict",
+		"set",
+		[self, key, param("new_value", 84, 804, INT128_TYPE)],
+		dict_int_wide,
+	)
+
+	match (synthesized_body(get_or), synthesized_body(set_function)):
+		(Some(get_body), Some(set_body)):
+			(
+				contains_intrinsic(get_body, "dict_hash_immediate")
+				and contains_intrinsic(get_body, "dict_eq_immediate")
+				and contains_intrinsic(get_body, "dict_retain_value_for")
+				and contains_intrinsic(get_body, "dict_release_value_for")
+				and contains_unbox_kind(get_body, Int128Unbox)
+				and contains_break(get_body)
+				and contains_var(get_body, self.name)
+				and contains_var(get_body, key.name)
+				and contains_var(get_body, default_value.name)
+				and contains_box_kind(set_body, Int128Box)
+				and contains_intrinsic(set_body, "dict_release_value_for")
+			)
+		_:
+			False
+
+
+func test_dict_set_cow_update_insert_and_struct_boxing() -> Bool:
+	point_type: CoreType = ValueRecordType("Point")
+	dict_string_point: CoreType = dict_type(STRING_TYPE, point_type)
+	self: CoreParam = param("receiver", 91, 901, dict_string_point)
+	key: CoreParam = param("key", 92, 902, STRING_TYPE)
+	value: CoreParam = param("point", 93, 903, point_type)
+	set_function: CoreFunction = builtin_function(
+		"std/dict",
+		"set",
+		[self, key, value],
+		dict_string_point,
+	)
+
+	match synthesized_body(set_function):
+		Some(body):
+			all_named_checks([
+				("dict_cow", contains_intrinsic(body, "dict_cow")),
+				("dict_hash", contains_intrinsic(body, "dict_hash")),
+				("dict_eq", contains_intrinsic(body, "dict_eq")),
+				("dict_release_value_for", contains_intrinsic(body, "dict_release_value_for")),
+				("dict_retain_key_for", contains_intrinsic(body, "dict_retain_key_for")),
+				("dict_retain_value_for", contains_intrinsic(body, "dict_retain_value_for")),
+				("dict_meta_set", contains_intrinsic(body, "dict_meta_set")),
+				("dict_order_index_set", contains_intrinsic(body, "dict_order_index_set")),
+				("dict_order_set", contains_intrinsic(body, "dict_order_set")),
+				("dict_set_order_len", contains_intrinsic(body, "dict_set_order_len")),
+				("dict_set_len", contains_intrinsic(body, "dict_set_len")),
+				("dict_resize", contains_intrinsic(body, "dict_resize")),
+				("StructBox(Point)", contains_box_kind(body, StructBox("Point"))),
+				("self identity", contains_var(body, self.name)),
+				("key identity", contains_var(body, key.name)),
+				("value identity", contains_var(body, value.name)),
+			])
+		None:
+			False
+
+
+func test_value_record_key_uses_precise_cast_and_unbox_layout() -> Bool:
+	point_type: CoreType = ValueRecordType("Point")
+	dict_point_int: CoreType = dict_type(point_type, INT_TYPE)
+	self: CoreParam = param("receiver", 96, 906, dict_point_int)
+	key: CoreParam = param("point", 97, 907, point_type)
+	contains: CoreFunction = builtin_function(
+		"std/dict",
+		"contains",
+		[self, key],
+		BOOL_TYPE,
+	)
+	entries: CoreFunction = builtin_function(
+		"std/dict",
+		"entries",
+		[self],
+		list_type(TupleType([point_type, INT_TYPE])),
+	)
+
+	match (synthesized_body(contains), synthesized_body(entries)):
+		(Some(contains_body), Some(entries_body)):
+			all_named_checks([
+				("dict_hash", contains_intrinsic(contains_body, "dict_hash")),
+				("dict_eq", contains_intrinsic(contains_body, "dict_eq")),
+				("key cast", contains_cast(contains_body)),
+				("key is not boxed", not contains_box_kind(contains_body, StructBox("Point"))),
+				(
+					"entry StructUnbox(Point)",
+					contains_unbox_kind(entries_body, StructUnbox("Point")),
+				),
+			])
+		_:
+			False
+
+
+func test_dict_materializers_preserve_order_and_value_layouts() -> Bool:
+	point_type: CoreType = ValueRecordType("Point")
+	dict_int_point: CoreType = dict_type(INT_TYPE, point_type)
+	self: CoreParam = param("receiver", 101, 1001, dict_int_point)
+	keys: CoreFunction = builtin_function("std/dict", "keys", [self], list_type(INT_TYPE))
+	values: CoreFunction = builtin_function("std/dict", "values", [self], list_type(point_type))
+	entries: CoreFunction = builtin_function(
+		"std/dict",
+		"entries",
+		[self],
+		list_type(TupleType([INT_TYPE, point_type])),
+	)
+
+	match (synthesized_body(keys), synthesized_body(values), synthesized_body(entries)):
+		(Some(keys_body), Some(values_body), Some(entries_body)):
+			all_named_checks([
+				("keys order length", contains_intrinsic(keys_body, "dict_order_len")),
+				("keys order lookup", contains_intrinsic(keys_body, "dict_order_get")),
+				("key release function", contains_intrinsic(keys_body, "dict_key_release_fn")),
+				(
+					"value release function",
+					contains_intrinsic(values_body, "dict_value_release_fn"),
+				),
+				("value retain", contains_intrinsic(values_body, "list_retain_for")),
+				("entry tuple", contains_tuple(entries_body)),
+				("entry key PrimUnbox", contains_unbox_kind(entries_body, PrimUnbox)),
+				(
+					"entry value StructUnbox(Point)",
+					contains_unbox_kind(entries_body, StructUnbox("Point")),
+				),
+				("entry owned store", contains_intrinsic(entries_body, "list_set_owned")),
+				("entry final length", contains_intrinsic(entries_body, "list_set_len")),
+			])
+		_:
+			False
+
+
+pure func test_hash_collection_synthesis_rejects_wrong_surfaces() -> Bool:
+	set_int: CoreType = set_type(INT_TYPE)
+	wrong_module: CoreFunction = builtin_function(
+		"app/set",
+		"contains",
+		[param("self", 111, 1101, set_int), param("element", 112, 1102, INT_TYPE)],
+		BOOL_TYPE,
+	)
+	wrong_signature: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[param("self", 113, 1103, set_int), param("element", 114, 1104, STRING_TYPE)],
+		BOOL_TYPE,
+	)
+
+	(
+		synthesize_hash_collection_body(empty_core_synth_context(), wrong_module) == Ok(None)
+		and synthesize_hash_collection_body(empty_core_synth_context(), wrong_signature) == Ok(None)
+	)
+
+
+func test_hash_collection_synthesis_reports_missing_layout_facts() -> Bool:
+	unknown_key: CoreType = NamedType("app_types__UnknownKey", [])
+	dict_unknown: CoreType = dict_type(unknown_key, INT_TYPE)
+	function_info: CoreFunction = builtin_function(
+		"std/dict",
+		"contains",
+		[
+			param("self", 121, 1201, dict_unknown),
+			param("key", 122, 1202, unknown_key),
+		],
+		BOOL_TYPE,
+	)
+	generic_set: CoreType = set_type(TypeParameterType("T"))
+	generic_function: CoreFunction = builtin_function(
+		"std/set",
+		"add",
+		[
+			param("self", 123, 1203, generic_set),
+			param("element", 124, 1204, TypeParameterType("T")),
+		],
+		generic_set,
+	)
+
+	dict_error_matches: Bool = match synthesize_hash_collection_body(
+		empty_core_synth_context(),
+		function_info,
+	):
+		Err(HashCollectionLayoutUnavailable(operation, missing_type, _)):
+			operation == "std/dict.contains key" and missing_type == unknown_key
+		_:
+			False
+
+	set_error_matches: Bool = match synthesize_hash_collection_body(
+		empty_core_synth_context(),
+		generic_function,
+	):
+		Err(HashCollectionLayoutUnavailable(operation, missing_type, _)):
+			match missing_type:
+				TypeParameterType(name):
+					operation == "std/set.add element" and name == "T"
+				_:
+					False
+		_:
+			False
+
+	all_named_checks([
+		("dict missing-layout error", dict_error_matches),
+		("set missing-layout error", set_error_matches),
+	])
+
+
+func test_opaque_generic_alias_uses_target_layout() -> Bool:
+	alias_key: CoreType = NamedType("app_types__OpaqueKey", [INT_TYPE])
+	alias_set: CoreType = set_type(alias_key)
+	context: CoreSynthContext = {
+		empty_core_synth_context() |
+		type_aliases = [{
+			name = "app_types__OpaqueKey",
+			type_params = ["T"],
+			target = TypeParameterType("T"),
+			is_opaque = True,
+			loc = SyntheticSourceLoc,
+		}]
+	}
+	function_info: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[
+			param("self", 126, 1206, alias_set),
+			param("element", 127, 1207, alias_key),
+		],
+		BOOL_TYPE,
+	)
+
+	match synthesize_hash_collection_body(context, function_info):
+		Ok(Some(body)):
+			(
+				contains_intrinsic(body, "set_hash_immediate")
+				and contains_intrinsic(body, "set_eq_immediate")
+				and contains_box_kind(body, PrimBox)
+			)
+		_:
+			False
+
+
+pure func test_hash_collection_synthesis_rejects_invalid_value_type() -> Bool:
+	void_type: CoreType = VoidType
+	set_void: CoreType = set_type(void_type)
+	function_info: CoreFunction = builtin_function(
+		"std/set",
+		"add",
+		[param("self", 131, 1301, set_void), param("element", 132, 1302, void_type)],
+		set_void,
+	)
+
+	match synthesize_hash_collection_body(empty_core_synth_context(), function_info):
+		Err(HashCollectionInvalidValueType(operation, invalid_type, _)):
+			operation == "std/set.add element" and invalid_type == void_type
+		_:
+			False
+
+
+pure func test_named_enum_uses_declared_hash_layout() -> Bool:
+	enum_key: CoreType = NamedType("Color", [])
+	enum_set: CoreType = set_type(enum_key)
+	context: CoreSynthContext = { empty_core_synth_context() | enum_type_names = ["Color"] }
+	function_info: CoreFunction = builtin_function(
+		"std/set",
+		"contains",
+		[param("self", 141, 1401, enum_set), param("element", 142, 1402, enum_key)],
+		BOOL_TYPE,
+	)
+
+	match synthesize_hash_collection_body(context, function_info):
+		Ok(Some(body)):
+			(
+				contains_intrinsic(body, "set_hash_immediate")
+				and contains_intrinsic(body, "set_eq_immediate")
+				and contains_box_kind(body, PrimBox)
+			)
+		_:
+			False
+
+
+func test_named_value_record_uses_declared_hash_layout() -> Bool:
+	key_type: CoreType = NamedType("Widget", [])
+	dict_widget: CoreType = dict_type(key_type, INT_TYPE)
+	context: CoreSynthContext = { empty_core_synth_context() |
+		value_record_type_names = ["Widget"]
+	}
+	function_info: CoreFunction = builtin_function(
+		"std/dict",
+		"set",
+		[
+			param("self", 151, 1501, dict_widget),
+			param("key", 152, 1502, key_type),
+			param("value", 153, 1503, INT_TYPE),
+		],
+		dict_widget,
+	)
+	entries_function: CoreFunction = builtin_function(
+		"std/dict",
+		"entries",
+		[param("self", 154, 1504, dict_widget)],
+		list_type(TupleType([key_type, INT_TYPE])),
+	)
+
+	match synthesize_hash_collection_body(context, function_info):
+		Ok(Some(set_body)):
+			match synthesize_hash_collection_body(context, entries_function):
+				Ok(Some(entries_body)):
+					all_named_checks([
+						("named value record key cast", contains_cast(set_body)),
+						(
+							"named value record key unbox",
+							contains_unbox_kind(entries_body, StructUnbox("Widget")),
+						),
+					])
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler Core hash collection synthesis",
+	tests = [
+		("Set complete synthesized family", test_set_complete_synthesized_family),
+		(
+			"Set immediate probe, COW, and parameter identity",
+			test_set_immediate_probe_cow_and_parameter_identity,
+		),
+		("Set dispatched and enum probe layouts", test_set_dispatched_and_enum_probe_layouts),
+		("Set ordered builders and callbacks", test_set_ordered_builders_and_callbacks),
+		(
+			"Set to_list preserves insertion order and ownership",
+			test_set_to_list_preserves_insertion_order_and_ownership,
+		),
+		("Dict complete synthesized family", test_dict_complete_synthesized_family),
+		(
+			"Dict probe, get_or, and wide value ownership",
+			test_dict_probe_get_or_and_wide_value_ownership,
+		),
+		(
+			"Dict set COW, update, insert, and struct boxing",
+			test_dict_set_cow_update_insert_and_struct_boxing,
+		),
+		(
+			"Value record key uses precise cast and unbox layout",
+			test_value_record_key_uses_precise_cast_and_unbox_layout,
+		),
+		(
+			"Dict materializers preserve order and value layouts",
+			test_dict_materializers_preserve_order_and_value_layouts,
+		),
+		(
+			"Hash collection synthesis rejects wrong surfaces",
+			test_hash_collection_synthesis_rejects_wrong_surfaces,
+		),
+		(
+			"Hash collection synthesis reports missing layout facts",
+			test_hash_collection_synthesis_reports_missing_layout_facts,
+		),
+		(
+			"Opaque generic alias uses target layout",
+			test_opaque_generic_alias_uses_target_layout,
+		),
+		(
+			"Hash collection synthesis rejects invalid value type",
+			test_hash_collection_synthesis_rejects_invalid_value_type,
+		),
+		("Named enum uses declared hash layout", test_named_enum_uses_declared_hash_layout),
+		(
+			"Named value record uses declared hash layout",
+			test_named_value_record_uses_declared_hash_layout,
+		),
+	]
+}

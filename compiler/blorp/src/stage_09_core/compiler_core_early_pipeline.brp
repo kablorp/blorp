@@ -7,6 +7,7 @@ import:
 		check_debug_invariants,
 		check_desugar_invariants,
 		check_mono_invariants,
+		check_synth_invariants,
 		core_early_invariant_hint,
 		core_early_invariant_message,
 	compiler_core_early_stages as CoreEarlyStages
@@ -16,6 +17,8 @@ import:
 		core_mono_diagnostic_hint,
 		core_mono_diagnostic_message,
 	compiler_core_monomorphize: monomorphize_program
+	compiler_core_synth: synthesize_program
+	compiler_core_synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
 
 
 enum CoreEarlyPipelineStage:
@@ -23,6 +26,7 @@ enum CoreEarlyPipelineStage:
 	CoreEarlyDebugStage
 	CoreEarlyDesugarStage
 	CoreEarlyMonoStage
+	CoreEarlySynthStage
 
 
 record CoreEarlyPipelineConfiguration {
@@ -55,16 +59,17 @@ record CoreEarlyPipelineOutput {
 union CoreEarlyPipelineDiagnostic:
 	CoreEarlyInvariantDiagnostic(CoreEarlyInvariantViolation)
 	CoreEarlyMonoDiagnostic(CoreMonoDiagnostic)
+	CoreEarlySynthDiagnostic(CoreSynthError)
 
 
-pure func core_early_pipeline_diagnostic_message(
-	diagnostic: CoreEarlyPipelineDiagnostic,
-) -> String:
+pure func core_early_pipeline_diagnostic_message(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
 	match diagnostic:
 		CoreEarlyInvariantDiagnostic(violation):
 			core_early_invariant_message(violation)
 		CoreEarlyMonoDiagnostic(mono_diagnostic):
 			core_mono_diagnostic_message(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_message(synth_error)
 
 
 pure func core_early_pipeline_diagnostic_hint(
@@ -75,6 +80,8 @@ pure func core_early_pipeline_diagnostic_hint(
 			core_early_invariant_hint(violation)
 		CoreEarlyMonoDiagnostic(mono_diagnostic):
 			core_mono_diagnostic_hint(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_hint(synth_error)
 
 
 union CoreEarlyPipelineExecution:
@@ -106,6 +113,8 @@ pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> Strin
 			"desugar"
 		CoreEarlyMonoStage:
 			"mono"
+		CoreEarlySynthStage:
+			"synth"
 
 
 pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipelineStage]:
@@ -118,6 +127,8 @@ pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipel
 			Some(CoreEarlyDesugarStage)
 		"mono":
 			Some(CoreEarlyMonoStage)
+		"synth":
+			Some(CoreEarlySynthStage)
 		_:
 			None
 
@@ -148,6 +159,12 @@ pure func core_early_pipeline_stages_equal(
 		CoreEarlyMonoStage:
 			match right:
 				CoreEarlyMonoStage:
+					True
+				_:
+					False
+		CoreEarlySynthStage:
+			match right:
+				CoreEarlySynthStage:
 					True
 				_:
 					False
@@ -184,6 +201,8 @@ private pure func stage_invariant_violations(
 			check_desugar_invariants(program)
 		CoreEarlyMonoStage:
 			check_mono_invariants(program)
+		CoreEarlySynthStage:
+			check_synth_invariants(program)
 
 
 private pure func finish_stage(
@@ -238,11 +257,25 @@ private pure func run_mono_stage(
 
 			match finish_stage(CoreEarlyMonoStage, mono_state, configuration):
 				CoreEarlyStageContinues(completed):
-					CoreEarlyPipelineCompleted({
-						program = completed.program,
-						next_def_id = completed.next_def_id,
-						observations = completed.observations,
-					})
+					match synthesize_program(completed.program):
+						Err(error):
+							CoreEarlyPipelineFailed(CoreEarlySynthDiagnostic(error))
+						Ok(synthesized):
+							match finish_stage(
+								CoreEarlySynthStage,
+								{ completed | program = synthesized },
+								configuration,
+							):
+								CoreEarlyStageContinues(finished):
+									CoreEarlyPipelineCompleted({
+										program = finished.program,
+										next_def_id = finished.next_def_id,
+										observations = finished.observations,
+									})
+								CoreEarlyStageStops(stage, rendered, observations):
+									CoreEarlyPipelineStopped(stage, rendered, observations)
+								CoreEarlyStageFails(violation):
+									CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
 				CoreEarlyStageStops(stage, rendered, observations):
 					CoreEarlyPipelineStopped(stage, rendered, observations)
 				CoreEarlyStageFails(violation):
