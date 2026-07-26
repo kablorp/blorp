@@ -1,8 +1,9 @@
 (** Core IR compilation pipeline.
 
-    Normal source commands enter [run_core_passes] through the strict
-    prepared-Core semantic worker. Typed-program entrypoints are compatibility
-    APIs for the pinned bootstrap and direct in-memory tests. *)
+    Normal source commands enter [run_core_passes_from_post_mono] through the
+    strict post-mono semantic worker. [run_core_passes] and typed-program
+    entrypoints are compatibility APIs for the pinned bootstrap and direct
+    in-memory tests. *)
 
 exception Stopped_after of Core_stage.t
 (** Raised by an [on_stage_callback] to stop compilation after a stage. *)
@@ -59,7 +60,18 @@ val run_core_passes :
   ?debug:bool ->
   Core.core_program ->
   backend_core_input
-(** Run the OCaml-owned semantic-middle pass sequence through specialization. *)
+(** Run the complete compatibility Core chain through specialization. *)
+
+val run_core_passes_from_post_mono :
+  ?import_aliases:(string, string * string) Hashtbl.t ->
+  ?module_imports:(string, (string, string * string) Hashtbl.t) Hashtbl.t ->
+  on_stage:on_stage_callback ->
+  ?on_stage_event:on_stage_event ->
+  reg:Codegen_types.registry ->
+  Core.core_program ->
+  backend_core_input
+(** Run the production OCaml semantic middle from Blorp-owned post-mono Core
+    through specialization. *)
 
 val compile_typed :
   ?embed_runtime:bool ->

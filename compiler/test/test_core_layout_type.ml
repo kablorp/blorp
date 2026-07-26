@@ -196,6 +196,14 @@ let test_destructor_policy_is_layout_owned () =
        }
     = GeneratedDestructor "Box_destroy");
   Alcotest.(check bool)
+    "source-shaped generic record field has generated destructor" true
+    (Blorp.Core_layout_type.record_destructor_policy ~reg
+       {
+         (record "ParsedBox" [ field "value" (ty "T" []) ]) with
+         record_type_params = [ make_type_param "T" [] ];
+       }
+    = GeneratedDestructor "ParsedBox_destroy");
+  Alcotest.(check bool)
     "float union boxed storage is release-free" true
     (Blorp.Core_layout_type.union_destructor_policy ~reg
        (union "FloatBox" [ ty_float ])
@@ -211,7 +219,16 @@ let test_destructor_policy_is_layout_owned () =
     (Blorp.Core_layout_type.union_destructor_policy ~reg
        ~payload_storage:ErasedUnionPayloadStorage
        (union "Wide" [ ty "Int128" [] ])
-    = GeneratedDestructor "Wide_destroy")
+    = GeneratedDestructor "Wide_destroy");
+  Alcotest.(check bool)
+    "source-shaped generic erased union field needs destructor" true
+    (Blorp.Core_layout_type.union_destructor_policy ~reg
+       ~payload_storage:ErasedUnionPayloadStorage
+       {
+         (union "ParsedOption" [ ty "T" [] ]) with
+         type_params = [ make_type_param "T" [] ];
+       }
+    = GeneratedDestructor "ParsedOption_destroy")
 
 let test_tensor_primitive_storage_is_explicit () =
   let open Blorp.Core_layout_type in

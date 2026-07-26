@@ -1,10 +1,10 @@
-(** Strict decoder for the Blorp-owned prepared-Core handoff.
+(** Strict structural decoder for the Blorp-owned post-mono Core handoff.
 
     This is deliberately separate from the late backend projection in
-    [Core_emit_blorp_c].  The semantic-middle worker accepts only the Core
-    forms produced by checkpoint-8 lowering, flattening, FFI annotation, and
-    initial list-layout annotation.  Rejecting later ownership/backend forms
-    here prevents accidentally running a middle pass twice. *)
+    [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
+    post-desugar, and post-mono semantic invariant checks immediately after
+    this structural decode. Rejecting ownership/backend forms here prevents
+    accidentally running a late pass twice. *)
 
 type decode_error = { path : string; message : string }
 
@@ -124,6 +124,11 @@ let decode_var_field path name value =
 
 let type_param name = Ast.make_type_param name []
 
+let decode_type_param path value =
+  let* name = string_field path "name" value in
+  let* bounds = string_list_field path "bounds" value in
+  Ok (Ast.make_type_param name bounds)
+
 let rec decode_type path value =
   let* tag = kind path value in
   match tag with
@@ -132,6 +137,10 @@ let rec decode_type path value =
       let* name = string_field path "name" value in
       let* args = list_field decode_type path "args" value in
       Ok (Ast.TyNamed (name, args))
+  | "type_parameter" ->
+      let* name = string_field path "name" value in
+      Ok (Ast.TyVar name)
+  | "self" -> Ok Ast.TySelf
   | "function" ->
       let* is_pure = bool_field path "pure" value in
       let* params = list_field decode_type path "params" value in
@@ -286,6 +295,22 @@ let decode_call_kind path value =
   | "selected_direct" ->
       let* id = int_field path "def_id" value in
       Ok (Core.CKSelectedDirect id)
+  | "deferred_trait" ->
+      (* Blorp mono retains this exact dispatch identity. The remaining OCaml
+         trait resolver uses the legacy unknown-call representation, so narrow
+         it only at this explicit handoff. *)
+      let* _trait_name = string_field path "trait_name" value in
+      let* _method_name = string_field path "method_name" value in
+      Ok Core.CKUnknown
+  | "selected_trait" ->
+      (* Preserve the typecheck-selected method ID while OCaml trait
+         resolution remains production-authoritative. Blorp keeps the richer
+         trait/module identity on its side of the post-mono boundary. *)
+      let* _trait_name = string_field path "trait_name" value in
+      let* _method_name = string_field path "method_name" value in
+      let* _module_path = string_field path "module_path" value in
+      let* id = int_field path "def_id" value in
+      Ok (Core.CKSelectedDirect id)
   | "user" ->
       let* name = string_field path "name" value in
       let* id = optional_int_field path "def_id" value in
@@ -306,7 +331,7 @@ let decode_call_kind path value =
   | "closure" -> Ok Core.CKClosure
   | _ ->
       error (path_field path "kind")
-        ("call kind `" ^ tag ^ "` is not valid at the pre-middle boundary")
+        ("call kind `" ^ tag ^ "` is not valid at the post-mono boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -496,7 +521,7 @@ let rec decode_expr path value =
   | "constructor_match" -> decode_constructor_match_expr path value
   | _ ->
       error (path_field path "kind")
-        ("Core expression `" ^ tag ^ "` is not valid at the pre-middle boundary")
+        ("Core expression `" ^ tag ^ "` is not valid at the post-mono boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -871,7 +896,7 @@ let decode_function_kind path value =
       let* passing_json = field path "arg_passing" value in
       let* arg_passing = decode_foreign_arg_passing (path_field path "arg_passing") passing_json in
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
-  | _ -> error (path_field path "kind") ("function kind `" ^ tag ^ "` is not valid pre-middle")
+  | _ -> error (path_field path "kind") ("function kind `" ^ tag ^ "` is not valid post-mono")
 
 let decode_function path value =
   let* name = string_field path "name" value in
@@ -1016,7 +1041,19 @@ and decode_trait_decl path value loc =
 and decode_impl_decl path value loc =
   let* ci_trait = string_field path "trait_name" value in
   let* ci_for_type = decode_type_field path "for_type" value in
+  let* impl_type_params = list_field decode_type_param path "type_params" value in
   let* ci_methods = list_field decode_function path "methods" value in
+  let impl_param_name (param : Ast.type_param_decl) = param.param_name in
+  let add_impl_type_params method_ =
+    let impl_param_names = List.map impl_param_name impl_type_params in
+    let method_type_params =
+      List.filter
+        (fun param -> not (List.mem (impl_param_name param) impl_param_names))
+        method_.Core.cf_type_params
+    in
+    { method_ with Core.cf_type_params = impl_type_params @ method_type_params }
+  in
+  let ci_methods = List.map add_impl_type_params ci_methods in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }
 
 let decode_program value =

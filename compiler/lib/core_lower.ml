@@ -2180,6 +2180,9 @@ and wrap_body_with_pattern_params (body : Core.core)
     [Typed_ast.func_semantic_return_type]. *)
 and lower_func_with_return_ty ?typed_body ?callable_id
     ~(return_ty : Ast.type_expr) (f : Ast.func_decl) : Core.core_func =
+  let instantiate_type_param =
+    Types.instantiate_type_params (Ast.type_param_names f.func_type_params)
+  in
   let name =
     match f.func_name with
     | Some n -> n
@@ -2190,8 +2193,13 @@ and lower_func_with_return_ty ?typed_body ?callable_id
              Core lowering; only lambda expressions are anonymous."
           "function has no name"
   in
-  let params_with_pats = List.map lower_param f.func_params in
+  let params_with_pats =
+    List.map lower_param f.func_params
+    |> List.map (fun ((param : Core.core_param), pattern) ->
+        ({ param with cp_ty = instantiate_type_param param.cp_ty }, pattern))
+  in
   let core_params = List.map fst params_with_pats in
+  let return_ty = instantiate_type_param return_ty in
   let body =
     match f.func_body with
     | FuncNoBody -> None
@@ -2242,6 +2250,7 @@ and lower_func_with_return_ty ?typed_body ?callable_id
         let body' = lower_child_expr body_expr in
         Some (wrap_body_with_pattern_params body' params_with_pats)
   in
+  let body = Option.map (Core.map_types_in_expr instantiate_type_param) body in
   (* Exactly one of: foreign / builtin / user. Foreign wins over builtin,
      matching the prior emit-site precedence. A synthesized IR body demotes
      a builtin to user-kind — matches the prior [... && body = None] gate. *)
@@ -2419,25 +2428,78 @@ and lower_trait_method (m : Ast.trait_method) : Core.core_trait_method =
 
 (** Lower a trait declaration. *)
 and lower_trait (t : Ast.trait_decl) : Core.core_trait =
+  let instantiate_type_param =
+    Types.instantiate_type_params (Ast.type_param_names t.trait_type_params)
+  in
+  let rewrite_method method_ =
+    let method_ = lower_trait_method method_ in
+    {
+      method_ with
+      ctm_params =
+        List.map
+          (fun (param : Core.core_param) ->
+            { param with cp_ty = instantiate_type_param param.cp_ty })
+          method_.ctm_params;
+      ctm_return_ty = Option.map instantiate_type_param method_.ctm_return_ty;
+    }
+  in
   {
     ct_name = t.trait_name;
     ct_type_params = Ast.type_param_names t.trait_type_params;
     ct_supertraits = t.trait_supertraits;
-    ct_methods = List.map lower_trait_method t.trait_methods;
+    ct_methods = List.map rewrite_method t.trait_methods;
   }
 
 (** Lower a top-level declaration after [Typed_ast] validation. *)
 and lower_decl_ast (d : Ast.decl) : Core.core_decl =
+  let rewrite_variant_fields type_params variant =
+    let instantiate_type_param =
+      Types.instantiate_type_params (Ast.type_param_names type_params)
+    in
+    {
+      variant with
+      variant_fields = List.map instantiate_type_param variant.variant_fields;
+    }
+  in
+  let rewrite_record_fields record =
+    let instantiate_type_param =
+      Types.instantiate_type_params
+        (Ast.type_param_names record.record_type_params)
+    in
+    {
+      record with
+      record_fields =
+        List.map
+          (fun field ->
+            { field with field_type = instantiate_type_param field.field_type })
+          record.record_fields;
+    }
+  in
+  let rewrite_alias_target alias =
+    let instantiate_type_param =
+      Types.instantiate_type_params
+        (Ast.type_param_names alias.alias_type_params)
+    in
+    { alias with alias_target = instantiate_type_param alias.alias_target }
+  in
   let desc =
     match d.decl_desc with
     | DFunc f -> Core.CDFunc (lower_func f)
     | DVar v -> Core.CDVar (lower_var v)
     | DImpl i -> Core.CDImpl (lower_impl i)
     | DTrait t -> Core.CDTrait (lower_trait t)
-    | DType t -> Core.CDType t (* pass-through *)
-    | DRecord r -> Core.CDRecord r (* pass-through *)
+    | DType t ->
+        Core.CDType
+          {
+            t with
+            type_variants =
+              List.map
+                (rewrite_variant_fields t.type_params)
+                t.type_variants;
+          }
+    | DRecord r -> Core.CDRecord (rewrite_record_fields r)
     | DImport i -> Core.CDImport i (* pass-through *)
-    | DTypeAlias a -> Core.CDTypeAlias a (* pass-through *)
+    | DTypeAlias a -> Core.CDTypeAlias (rewrite_alias_target a)
     | DPrivate inner -> Core.CDPrivate (lower_decl_ast inner)
   in
   { cd_desc = desc; cd_loc = d.decl_loc; cd_doc = d.decl_doc }
@@ -2448,9 +2510,8 @@ and lower_typed_decl_core (typed : Typed_ast.decl) : Core.core_decl =
     match Typed_ast.decl_view typed with
     | Typed_ast.DeclFunction func -> Core.CDFunc (lower_typed_func func)
     | Typed_ast.DeclVar var -> Core.CDVar (lower_typed_var var)
-    | Typed_ast.DeclRecord record -> Core.CDRecord (Typed_ast.record_ast record)
-    | Typed_ast.DeclTypeAlias alias ->
-        Core.CDTypeAlias (Typed_ast.type_alias_ast alias)
+    | Typed_ast.DeclRecord _ | Typed_ast.DeclTypeAlias _ ->
+        (lower_decl_ast ast_decl).cd_desc
     | Typed_ast.DeclImpl impl -> Core.CDImpl (lower_typed_impl impl)
     | Typed_ast.DeclPrivate inner ->
         Core.CDPrivate (lower_typed_decl_core inner)

@@ -8,7 +8,7 @@ let ty_bool = TyNamed ("Bool", [])
 let ty_char = TyNamed ("Char", [])
 let ty_float = TyNamed ("Float", [])
 let ty_string = TyNamed ("String", [])
-let ty_named_t = TyNamed ("T", [])
+let ty_var_t = TyVar "T"
 let ty_color = TyNamed ("Color", [])
 let ty_count = TyNamed ("Count", [])
 let ty_list elem = TyNamed ("List", [ elem ])
@@ -1815,7 +1815,7 @@ let test_generic_dict_contains_defers_to_post_mono_synthesis () =
     Blorp.Core_intrinsics.synthesize_body ~func_name:"contains"
       ~module_path:"std/dict"
       ~params:
-        [ param "self" (ty_dict ty_named_t ty_named_t); param "key" ty_named_t ]
+        [ param "self" (ty_dict ty_var_t ty_var_t); param "key" ty_var_t ]
       ~return_ty:ty_bool
   in
   Alcotest.(check bool)
@@ -1827,11 +1827,11 @@ let test_generic_dict_set_defers_to_post_mono_synthesis () =
       ~module_path:"std/dict"
       ~params:
         [
-          param "self" (ty_dict ty_named_t ty_named_t);
-          param "key" ty_named_t;
-          param "value" ty_named_t;
+          param "self" (ty_dict ty_var_t ty_var_t);
+          param "key" ty_var_t;
+          param "value" ty_var_t;
         ]
-      ~return_ty:(ty_dict ty_named_t ty_named_t)
+      ~return_ty:(ty_dict ty_var_t ty_var_t)
   in
   Alcotest.(check bool)
     "generic Dict.set should defer" true (Option.is_none body)
@@ -1842,11 +1842,11 @@ let test_generic_dict_get_or_defers_to_post_mono_synthesis () =
       ~module_path:"std/dict"
       ~params:
         [
-          param "self" (ty_dict ty_named_t ty_named_t);
-          param "key" ty_named_t;
-          param "default" ty_named_t;
+          param "self" (ty_dict ty_var_t ty_var_t);
+          param "key" ty_var_t;
+          param "default" ty_var_t;
         ]
-      ~return_ty:ty_named_t
+      ~return_ty:ty_var_t
   in
   Alcotest.(check bool)
     "generic Dict.get_or should defer" true (Option.is_none body)
@@ -3195,7 +3195,7 @@ let test_generic_set_contains_defers_to_post_mono_synthesis () =
   let body =
     Blorp.Core_intrinsics.synthesize_body ~func_name:"contains"
       ~module_path:"std/set"
-      ~params:[ param "self" (ty_set ty_named_t); param "elem" ty_named_t ]
+      ~params:[ param "self" (ty_set ty_var_t); param "elem" ty_var_t ]
       ~return_ty:ty_bool
   in
   Alcotest.(check bool)
@@ -3205,8 +3205,8 @@ let test_generic_set_add_defers_to_post_mono_synthesis () =
   let body =
     Blorp.Core_intrinsics.synthesize_body ~func_name:"add"
       ~module_path:"std/set"
-      ~params:[ param "self" (ty_set ty_named_t); param "elem" ty_named_t ]
-      ~return_ty:(ty_set ty_named_t)
+      ~params:[ param "self" (ty_set ty_var_t); param "elem" ty_var_t ]
+      ~return_ty:(ty_set ty_var_t)
   in
   Alcotest.(check bool)
     "generic Set.add should defer" true (Option.is_none body)
@@ -3215,7 +3215,7 @@ let test_generic_set_bulk_defers_to_post_mono_synthesis () =
   let assert_defers func_name return_ty =
     let body =
       Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path:"std/set"
-        ~params:[ param "a" (ty_set ty_named_t); param "b" (ty_set ty_named_t) ]
+        ~params:[ param "a" (ty_set ty_var_t); param "b" (ty_set ty_var_t) ]
         ~return_ty
     in
     Alcotest.(check bool)
@@ -3223,9 +3223,9 @@ let test_generic_set_bulk_defers_to_post_mono_synthesis () =
       true (Option.is_none body)
   in
   assert_defers "is_subset" ty_bool;
-  assert_defers "difference" (ty_set ty_named_t);
-  assert_defers "intersect" (ty_set ty_named_t);
-  assert_defers "combine" (ty_set ty_named_t)
+  assert_defers "difference" (ty_set ty_var_t);
+  assert_defers "intersect" (ty_set ty_var_t);
+  assert_defers "combine" (ty_set ty_var_t)
 
 let test_generic_set_map_filter_defer_to_post_mono_synthesis () =
   let map_body =
@@ -3233,20 +3233,20 @@ let test_generic_set_map_filter_defer_to_post_mono_synthesis () =
       ~module_path:"std/set"
       ~params:
         [
-          param "self" (ty_set ty_named_t);
-          param "f" (ty_func [ ty_named_t ] ty_named_t);
+          param "self" (ty_set ty_var_t);
+          param "f" (ty_func [ ty_var_t ] ty_var_t);
         ]
-      ~return_ty:(ty_set ty_named_t)
+      ~return_ty:(ty_set ty_var_t)
   in
   let filter_body =
     Blorp.Core_intrinsics.synthesize_body ~func_name:"filter"
       ~module_path:"std/set"
       ~params:
         [
-          param "self" (ty_set ty_named_t);
-          param "pred" (ty_func [ ty_named_t ] ty_bool);
+          param "self" (ty_set ty_var_t);
+          param "pred" (ty_func [ ty_var_t ] ty_bool);
         ]
-      ~return_ty:(ty_set ty_named_t)
+      ~return_ty:(ty_set ty_var_t)
   in
   Alcotest.(check bool)
     "generic Set.map should defer" true (Option.is_none map_body);

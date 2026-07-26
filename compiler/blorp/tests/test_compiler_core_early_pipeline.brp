@@ -1,0 +1,431 @@
+import:
+	../src/stage_09_core/compiler_core_early_invariants:
+		CoreEarlyInvariantViolation(MonoBoxSourceTypeUnresolved),
+		check_debug_invariants,
+	../src/stage_09_core/compiler_core_early_pipeline:
+		CoreEarlyPipelineConfiguration,
+		CoreEarlyPipelineDiagnostic(CoreEarlyInvariantDiagnostic, CoreEarlyMonoDiagnostic),
+		CoreEarlyPipelineExecution(
+			CoreEarlyPipelineCompleted,
+			CoreEarlyPipelineFailed,
+			CoreEarlyPipelineStopped,
+		),
+		CoreEarlyPipelineInput,
+		CoreEarlyPipelineStage(
+			CoreEarlyDebugStage,
+			CoreEarlyDesugarStage,
+			CoreEarlyLowerStage,
+			CoreEarlyMonoStage,
+		),
+		core_early_pipeline_stage_name,
+		core_early_pipeline_stages_equal,
+		parse_core_early_pipeline_stage,
+		run_early_core_pipeline,
+	../src/stage_09_core/compiler_core_json:
+		CoreBinaryOp(AddOp),
+		CoreBoxKind(PrimBox),
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LiteralExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(StringLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, TypeParameterType, VoidType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_mono_specialize:
+		CoreMonoDiagnostic(CoreMonoCannotInferTypeArgument),
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func type_parameter(name: String) -> CoreType:
+	TypeParameterType(name)
+
+
+pure func named_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(
+		named_var(name, None),
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = named_var(name, None),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function(
+	name: String,
+	def_id: Int,
+	type_params: List[String],
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = type_params,
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func selected_call(
+	name: String,
+	def_id: Int,
+	param_types: List[CoreType],
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			named_var(name, Some(def_id)),
+			FunctionType(True, param_types, return_type),
+			SyntheticSourceLoc,
+		),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func configuration(
+	debug_mode: Bool,
+	check_invariants: Bool,
+	observations: List[CoreEarlyPipelineStage],
+	stop_after: Option[CoreEarlyPipelineStage],
+) -> CoreEarlyPipelineConfiguration:
+	{
+		debug = debug_mode,
+		check_invariants = check_invariants,
+		observations = observations,
+		stop_after = stop_after
+	}
+
+
+func test_stage_names_round_trip() -> Bool:
+	stages: List[CoreEarlyPipelineStage] = [
+		CoreEarlyLowerStage,
+		CoreEarlyDebugStage,
+		CoreEarlyDesugarStage,
+		CoreEarlyMonoStage,
+	]
+
+	stages.all(pure func(stage):
+		match parse_core_early_pipeline_stage(core_early_pipeline_stage_name(stage)):
+			Some(parsed):
+				core_early_pipeline_stages_equal(parsed, stage)
+			None:
+				False
+	)
+
+
+func test_pipeline_runs_to_post_mono_and_threads_definition_ids() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	identity: CoreFunction = function(
+		"identity",
+		10,
+		["T"],
+		[param("value", t)],
+		t,
+		variable("value", t),
+	)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		int_type,
+		selected_call("identity", 10, [int_type], [variable("input", int_type)], int_type),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(identity), FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+		)
+	):
+		CoreEarlyPipelineCompleted(output):
+			(
+				output.next_def_id == 101
+				and output.program.decls.length() == 3
+				and output.observations.is_empty()
+			)
+		_:
+			False
+
+
+func test_pipeline_observes_and_stops_before_later_stages() -> Bool:
+	string_type: CoreType = named_type("String")
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		string_type,
+		BinaryExpr(
+			AddOp,
+			LiteralExpr(StringLiteral("a"), string_type, SyntheticSourceLoc),
+			LiteralExpr(StringLiteral("b"), string_type, SyntheticSourceLoc),
+			string_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyLowerStage, CoreEarlyDesugarStage],
+				Some(CoreEarlyDesugarStage),
+			),
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlyDesugarStage)
+				and rendered.contains("blorp_string_concat")
+				and observations.map(
+					pure func(
+						observation,
+					): core_early_pipeline_stage_name(observation.stage),
+				) == ["lower", "desugar"]
+			)
+		_:
+			False
+
+
+func test_pipeline_returns_mono_diagnostic() -> Bool:
+	t: CoreType = type_parameter("T")
+	option_t: CoreType = NamedType("Option", [t])
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		option_t,
+		selected_call("make", 10, [], [], option_t),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(make), FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+		)
+	):
+		CoreEarlyPipelineFailed(CoreEarlyMonoDiagnostic(CoreMonoCannotInferTypeArgument(name, _))):
+			name == "make"
+		_:
+			False
+
+
+func test_pipeline_checks_post_mono_invariants_before_observing_or_stopping() -> Bool:
+	t: CoreType = type_parameter("T")
+	any_type: CoreType = named_type("Any")
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		any_type,
+		BoxExpr(
+			{
+				kind = PrimBox,
+				value = variable("value", t),
+				source_type = t
+			},
+			any_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyMonoStage],
+				Some(CoreEarlyMonoStage),
+			),
+		)
+	):
+		CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(MonoBoxSourceTypeUnresolved(_))):
+			True
+		_:
+			False
+
+
+func test_pipeline_can_observe_and_stop_at_post_mono_boundary() -> Bool:
+	int_type: CoreType = named_type("Int")
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		int_type,
+		variable("value", int_type),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyMonoStage],
+				Some(CoreEarlyMonoStage),
+			),
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlyMonoStage)
+				and rendered.contains("\"name\":\"main\"")
+				and observations.length() == 1
+				and observations
+					.get(0)
+					.map(pure func(observation):
+						core_early_pipeline_stages_equal(observation.stage, CoreEarlyMonoStage)
+					)
+					.get_or(False)
+			)
+		_:
+			False
+
+
+func test_pipeline_applies_debug_mode_before_invariant_check() -> Bool:
+	source: CoreProgram = program(
+		[
+			FunctionDecl(
+				function(
+					"main",
+					20,
+					[],
+					[],
+					VoidType,
+					DebugBlockExpr(
+						VoidExpr(VoidType, SyntheticSourceLoc),
+						VoidType,
+						SyntheticSourceLoc,
+					),
+				),
+			),
+		],
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = source,
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+		)
+	):
+		CoreEarlyPipelineCompleted(output):
+			check_debug_invariants(output.program).is_empty()
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler early Core pipeline",
+	tests = [
+		("stage names round trip", test_stage_names_round_trip),
+		(
+			"pipeline runs to post-mono and threads definition IDs",
+			test_pipeline_runs_to_post_mono_and_threads_definition_ids,
+		),
+		(
+			"pipeline observes and stops before later stages",
+			test_pipeline_observes_and_stops_before_later_stages,
+		),
+		("pipeline returns mono diagnostic", test_pipeline_returns_mono_diagnostic),
+		(
+			"pipeline checks post-mono invariants before observing or stopping",
+			test_pipeline_checks_post_mono_invariants_before_observing_or_stopping,
+		),
+		(
+			"pipeline can observe and stop at post-mono boundary",
+			test_pipeline_can_observe_and_stop_at_post_mono_boundary,
+		),
+		(
+			"pipeline applies debug mode before invariant check",
+			test_pipeline_applies_debug_mode_before_invariant_check,
+		),
+	]
+}

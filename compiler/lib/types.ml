@@ -401,13 +401,6 @@ let rec types_equal (t1 : type_expr) (t2 : type_expr) : bool =
 let strip_type_param_bounds (s : string) : string =
   match String.index_opt s ':' with Some i -> String.sub s 0 i | None -> s
 
-let is_legacy_single_letter_type_param name =
-  String.length name = 1 && name.[0] >= 'A' && name.[0] <= 'Z'
-
-let is_type_param_name s =
-  String.index_opt s ':' <> None
-  || is_legacy_single_letter_type_param (strip_type_param_bounds s)
-
 let is_ascii_upper c = c >= 'A' && c <= 'Z'
 
 let is_ascii_alnum c =
@@ -741,13 +734,6 @@ let apply_type_param_subst subst ty =
         | Some replacement -> replacement
         | None -> (
             match List.assoc_opt (type_param_to_parser_string p) subst with
-            | Some replacement -> replacement
-            | None -> ty))
-    | TyNamed (name, []) as ty when is_type_param_name name -> (
-        match List.assoc_opt name subst with
-        | Some replacement -> replacement
-        | None -> (
-            match List.assoc_opt (strip_type_param_bounds name) subst with
             | Some replacement -> replacement
             | None -> ty))
     | TyNamed (name, args) -> TyNamed (name, List.map go args)

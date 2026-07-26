@@ -280,6 +280,235 @@ let test_tyvar_ignores_builtin_calls () =
   let violations = Core_invariants.check_no_tyvar_leak prog in
   Alcotest.(check int) "no violations for builtin" 0 (List.length violations)
 
+let test_mono_flags_selected_direct_call_to_generic_function () =
+  let generic =
+    {
+      (mk_simple_func ~name:"identity"
+         ~body:(mk (CVar (Var.named "value")) (TyVar "T"))) with
+      cf_type_params = [ Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = TyVar "T";
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_def_id = 77;
+    }
+  in
+  let callee = mk (CVar (var_with_def_id "identity" 77)) ty_fn_int_int in
+  let call =
+    mk_call (CKSelectedDirect 77) callee [ mk (CLit (LitInt 5L)) ty_int ]
+      ty_int
+  in
+  let main =
+    { (mk_simple_func ~name:"main" ~body:call) with cf_def_id = 78 }
+  in
+  let prog = mk_prog [ CDFunc generic; CDFunc main ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Mono prog in
+  Alcotest.(check int)
+    "one generic selected-direct violation" 1 (List.length violations)
+
+let test_mono_allows_selected_direct_call_inside_generic_template () =
+  let call =
+    mk_call (CKSelectedDirect 77)
+      (mk (CVar (var_with_def_id "identity" 77))
+         (TyFunc
+            {
+              params = [ TyVar "T" ];
+              return = TyVar "T";
+              is_pure = true;
+            }))
+      [ mk (CVar (Var.named "value")) (TyVar "T") ]
+      (TyVar "T")
+  in
+  let generic =
+    {
+      (mk_simple_func ~name:"identity" ~body:call) with
+      cf_type_params = [ Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = TyVar "T";
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_def_id = 77;
+    }
+  in
+  let prog = mk_prog [ CDFunc generic ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Mono prog in
+  Alcotest.(check int)
+    "generic template remains available to mono" 0 (List.length violations)
+
+let test_mono_allows_selected_direct_id_collision_with_concrete_function () =
+  let generic =
+    {
+      (mk_simple_func ~name:"module_a__identity"
+         ~body:(mk (CVar (Var.named "value")) (TyVar "T"))) with
+      cf_type_params = [ Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = TyVar "T";
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_def_id = 77;
+    }
+  in
+  let concrete =
+    {
+      (mk_simple_func ~name:"module_b__identity"
+         ~body:(mk (CVar (Var.named "value")) ty_int)) with
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = ty_int;
+            cp_loc = loc;
+          };
+        ];
+      cf_def_id = 77;
+    }
+  in
+  let call =
+    mk_call (CKSelectedDirect 77)
+      (mk
+         (CVar (var_with_def_id "module_b__identity" 77))
+         ty_fn_int_int)
+      [ mk (CLit (LitInt 5L)) ty_int ]
+      ty_int
+  in
+  let main =
+    { (mk_simple_func ~name:"main" ~body:call) with cf_def_id = 78 }
+  in
+  let prog = mk_prog [ CDFunc generic; CDFunc concrete; CDFunc main ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Mono prog in
+  Alcotest.(check int)
+    "unrelated concrete function is not generic" 0 (List.length violations)
+
+let test_mono_flags_selected_direct_call_with_non_variable_callee () =
+  let receiver = mk (CVar (Var.named "decoder")) ty_fn_int_int in
+  let callee = mk (CField (receiver, "decode")) ty_fn_int_int in
+  let call =
+    mk_call (CKSelectedDirect 77) callee [ mk (CLit (LitInt 5L)) ty_int ]
+      ty_int
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Mono prog in
+  Alcotest.(check int)
+    "one non-variable selected-direct violation" 1 (List.length violations)
+
+let lossy_module_identity_program callee_module =
+  let flattened_name = "pkg_a_b__identity" in
+  let generic =
+    {
+      (mk_simple_func ~name:flattened_name
+         ~body:(mk (CVar (Var.named "value")) (TyVar "T"))) with
+      cf_module = Some "pkg/a.b";
+      cf_type_params = [ Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = TyVar "T";
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_def_id = 77;
+    }
+  in
+  let concrete =
+    {
+      generic with
+      cf_module = Some "pkg/a_b";
+      cf_type_params = [];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = ty_int;
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = ty_int;
+      cf_body = Some (mk (CVar (Var.named "value")) ty_int);
+    }
+  in
+  let callee_name = Codegen_names.make_ufcs_name callee_module "identity" in
+  let call =
+    mk_call (CKSelectedDirect 77)
+      (mk (CVar (var_with_def_id callee_name 77)) ty_fn_int_int)
+      [ mk (CLit (LitInt 5L)) ty_int ]
+      ty_int
+  in
+  let main =
+    { (mk_simple_func ~name:"main" ~body:call) with cf_def_id = 78 }
+  in
+  mk_prog [ CDFunc generic; CDFunc concrete; CDFunc main ]
+
+let test_mono_flags_ufcs_call_to_generic_with_lossy_name_collision () =
+  let violations =
+    lossy_module_identity_program "pkg/a.b"
+    |> Core_invariants.run_for_stage Core_stage.Mono
+  in
+  Alcotest.(check int) "UFCS generic target is rejected" 1
+    (List.length violations)
+
+let test_mono_allows_ufcs_call_to_concrete_with_lossy_name_collision () =
+  let violations =
+    lossy_module_identity_program "pkg/a_b"
+    |> Core_invariants.run_for_stage Core_stage.Mono
+  in
+  Alcotest.(check int) "UFCS concrete target is accepted" 0
+    (List.length violations)
+
+let test_mono_flags_ufcs_generic_with_double_underscore_source_name () =
+  let generic =
+    {
+      (mk_simple_func ~name:"std_list__identity__checked"
+         ~body:(mk (CVar (Var.named "value")) (TyVar "T"))) with
+      cf_module = Some "std/list";
+      cf_type_params = [ Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = TyVar "T";
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_def_id = 77;
+    }
+  in
+  let callee_name =
+    Codegen_names.make_ufcs_name "std/list" "identity__checked"
+  in
+  let call =
+    mk_call (CKSelectedDirect 77)
+      (mk (CVar (var_with_def_id callee_name 77)) ty_fn_int_int)
+      [ mk (CLit (LitInt 5L)) ty_int ]
+      ty_int
+  in
+  let main =
+    { (mk_simple_func ~name:"main" ~body:call) with cf_def_id = 78 }
+  in
+  let violations =
+    mk_prog [ CDFunc generic; CDFunc main ]
+    |> Core_invariants.run_for_stage Core_stage.Mono
+  in
+  Alcotest.(check int) "double-underscore UFCS generic is rejected" 1
+    (List.length violations)
+
 (* ============================================================================
    Post-debug: no debug blocks survive
    ============================================================================ *)
@@ -1704,6 +1933,51 @@ let test_resource_scope_contract_flags_union_resource_result () =
         (Modules.contains v.Core_error.msg "resource scope body")
   | _ -> Alcotest.fail "unreachable"
 
+let test_resource_scope_contract_preserves_nominal_component_identity () =
+  let nominal_resource =
+    {
+      type_name = "T";
+      type_params = [];
+      type_variants = [];
+      type_is_enum = false;
+      type_is_builtin = true;
+      type_is_resource = true;
+      type_resource_cleanup = None;
+    }
+  in
+  let generic_record =
+    {
+      record_name = "NominalHolder";
+      record_type_params = [ make_type_param "T" [] ];
+      record_fields =
+        [
+          {
+            field_name = "value";
+            field_type = TyNamed ("T", []);
+            field_loc = loc;
+          };
+        ];
+      record_is_value = false;
+      record_is_builtin = false;
+    }
+  in
+  let body_type = TyNamed ("NominalHolder", [ ty_int ]) in
+  let body = mk (CVar (Var.named "holder")) body_type in
+  let prog =
+    mk_prog
+      [
+        CDType nominal_resource;
+        CDRecord generic_record;
+        CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ~body ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int)
+    "nominal resource is not erased by a parameter-name collision" 1
+    (List.length violations)
+
 let test_final_critical_invariants_allow_resource_scope_when_disabled () =
   let prog =
     mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ())) ]
@@ -1947,6 +2221,23 @@ let suite =
           test_tyvar_flags_unmonomorphized_call;
         Alcotest.test_case "ignores builtin" `Quick
           test_tyvar_ignores_builtin_calls;
+        Alcotest.test_case "flags selected direct call to generic function"
+          `Quick test_mono_flags_selected_direct_call_to_generic_function;
+        Alcotest.test_case "allows selected direct in generic template" `Quick
+          test_mono_allows_selected_direct_call_inside_generic_template;
+        Alcotest.test_case
+          "allows selected direct ID collision with concrete function" `Quick
+          test_mono_allows_selected_direct_id_collision_with_concrete_function;
+        Alcotest.test_case "flags selected direct with non-variable callee"
+          `Quick test_mono_flags_selected_direct_call_with_non_variable_callee;
+        Alcotest.test_case
+          "flags UFCS generic with lossy module-name collision" `Quick
+          test_mono_flags_ufcs_call_to_generic_with_lossy_name_collision;
+        Alcotest.test_case
+          "allows UFCS concrete with lossy module-name collision" `Quick
+          test_mono_allows_ufcs_call_to_concrete_with_lossy_name_collision;
+        Alcotest.test_case "flags UFCS generic with double-underscore member"
+          `Quick test_mono_flags_ufcs_generic_with_double_underscore_source_name;
       ] );
     ( "sugar",
       [
@@ -2129,6 +2420,8 @@ let suite =
           test_resource_scope_contract_flags_record_resource_result;
         Alcotest.test_case "resource scope flags union resource result" `Quick
           test_resource_scope_contract_flags_union_resource_result;
+        Alcotest.test_case "resource scope preserves nominal component identity"
+          `Quick test_resource_scope_contract_preserves_nominal_component_identity;
         Alcotest.test_case "final critical allows resource scope" `Quick
           test_final_critical_invariants_allow_resource_scope_when_disabled;
         Alcotest.test_case "resource scope rejects nonlocal break" `Quick

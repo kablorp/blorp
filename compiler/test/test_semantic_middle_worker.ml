@@ -5,7 +5,33 @@ let kind name fields =
 
 let synthetic_loc = kind "synthetic" []
 let named_type name = kind "named" [ ("name", Lsp_json.String name); ("args", Lsp_json.Array []) ]
+let type_parameter name = kind "type_parameter" [ ("name", Lsp_json.String name) ]
 let int_type = named_type "Int"
+
+let function_type params return_type =
+  kind "function"
+    [
+      ("pure", Lsp_json.Bool true);
+      ("params", Lsp_json.Array params);
+      ("return_type", return_type);
+    ]
+
+let variable name ?def_id () =
+  Lsp_json.Object
+    [
+      ("name", Lsp_json.String name);
+      ("uniq", Lsp_json.Int 0);
+      ( "def_id",
+        Option.fold ~none:Lsp_json.Null ~some:(fun id -> Lsp_json.Int id) def_id );
+    ]
+
+let variable_expr name ?def_id value_type =
+  kind "var"
+    [
+      ("var", variable name ?def_id ());
+      ("type", value_type);
+      ("loc", synthetic_loc);
+    ]
 
 let int_literal value =
   kind "literal"
@@ -15,7 +41,8 @@ let int_literal value =
       ("loc", synthetic_loc);
     ]
 
-let function_decl ?source_module ?(body = int_literal 0) name def_id =
+let function_decl ?source_module ?(type_params = []) ?(body = int_literal 0)
+    name def_id =
   kind "function"
     [
       ("name", Lsp_json.String name);
@@ -23,7 +50,7 @@ let function_decl ?source_module ?(body = int_literal 0) name def_id =
         Option.fold ~none:Lsp_json.Null
           ~some:(fun name -> Lsp_json.String name)
           source_module );
-      ("type_params", Lsp_json.Array []);
+      ("type_params", Lsp_json.Array type_params);
       ("params", Lsp_json.Array []);
       ("return_type", int_type);
       ("body", body);
@@ -56,12 +83,11 @@ let module_imports_json =
       ("import_bindings", Lsp_json.Array [ import_binding_json ]);
     ]
 
-let request_json ?(schema = 2) ?(domain = "compiler_semantic_middle")
-    ?(core_phase = "prepared") ?(require_main = false)
-    ?(debug = false)
+let request_json ?(schema = 3) ?(domain = "compiler_semantic_middle")
+    ?(core_phase = "post_mono") ?(require_main = false)
     ?(core = core_program [])
-    ?(capabilities = [ "core_pre_middle"; "core_pre_dce"; "rendered_stage_observations" ])
-    ?(observations = [ "lower"; "fusion" ]) ?stop_after () =
+    ?(capabilities = [ "core_post_mono"; "core_pre_dce"; "rendered_stage_observations" ])
+    ?(observations = [ "synth"; "fusion" ]) ?stop_after () =
   Lsp_json.Object
     [
       ("schema", Lsp_json.Int schema);
@@ -74,7 +100,6 @@ let request_json ?(schema = 2) ?(domain = "compiler_semantic_middle")
       ("next_def_id", Lsp_json.Int 20);
       ("import_bindings", Lsp_json.Array [ import_binding_json ]);
       ("module_imports", Lsp_json.Array [ module_imports_json ]);
-      ("debug", Lsp_json.Bool debug);
       ("require_main", Lsp_json.Bool require_main);
       ("check_invariants", Lsp_json.Bool true);
       ( "required_capabilities",
@@ -115,11 +140,11 @@ let test_decode_phase_specific_request () =
 let test_rejects_schema_domain_phase_capability_and_stage () =
   expect_decode_error "unsupported_schema" (request_json ~schema:1 ());
   expect_decode_error "unsupported_domain" (request_json ~domain:"compiler_cli" ());
-  expect_decode_error "unsupported_core_phase" (request_json ~core_phase:"post_ctfe" ());
+  expect_decode_error "unsupported_core_phase" (request_json ~core_phase:"prepared" ());
   expect_decode_error "unsupported_capability"
     (request_json ~capabilities:[ "typed_ast_post_ctfe" ] ());
   expect_decode_error "unsupported_stage"
-    (request_json ~observations:[ "dce" ] ());
+    (request_json ~observations:[ "lower" ] ());
   expect_decode_error "unsupported_stage"
     (request_json ~observations:[ "specialize" ] ())
 
@@ -145,7 +170,7 @@ let test_rejects_missing_and_late_core () =
           (List.map (fun (name, value) -> if name = "body" then (name, late) else (name, value)) fields)
     | value -> value
   in
-  expect_decode_error "invalid_pre_middle_core"
+  expect_decode_error "invalid_post_mono_core"
     (request_json ~core:(core_program [ malformed ]) ())
 
 let response_or_fail request =
@@ -156,7 +181,7 @@ let response_or_fail request =
            (List.map (fun d -> d.Semantic_middle_worker.message) diagnostics))
   | response -> response
 
-let test_prepared_core_reaches_pre_dce () =
+let test_post_mono_core_reaches_pre_dce () =
   let core =
     core_program ~foreign_includes:[ "boundary_fixture.h" ]
       [
@@ -179,17 +204,20 @@ let test_prepared_core_reaches_pre_dce () =
 let test_stop_after_returns_snapshot () =
   let core = core_program [ function_decl "main" 2 ] in
   let request =
-    decode_ok (request_json ~core ~observations:[ "lower"; "mono" ] ~stop_after:"mono" ())
+    decode_ok
+      (request_json ~core ~observations:[ "synth"; "match" ]
+         ~stop_after:"match" ())
   in
   match response_or_fail request with
   | Semantic_middle_worker.Stopped { stage; rendered; observations } ->
-      Alcotest.(check string) "stage" "mono" (Semantic_middle_worker.stage_name stage);
+      Alcotest.(check string) "stage" "match"
+        (Semantic_middle_worker.stage_name stage);
       Alcotest.(check int) "observations" 2 (List.length observations);
       Alcotest.(check bool) "snapshot" true (String.length rendered > 0)
   | Semantic_middle_worker.Compiled _ -> Alcotest.fail "expected stop"
   | Semantic_middle_worker.Failed _ -> assert false
 
-let test_debug_stage_owns_prepared_debug_blocks () =
+let test_rejects_core_from_before_debug_lowering () =
   let marker = 987654 in
   let debug_body =
     kind "debug_block"
@@ -200,25 +228,60 @@ let test_debug_stage_owns_prepared_debug_blocks () =
       ]
   in
   let core = core_program [ function_decl ~body:debug_body "main" 2 ] in
-  let rendered_after_debug debug =
-    let request =
-      decode_ok
-        (request_json ~core ~debug ~observations:[] ~stop_after:"debug" ())
-    in
-    match response_or_fail request with
-    | Semantic_middle_worker.Stopped { stage; rendered; _ } ->
-        Alcotest.(check string) "stage" "debug"
-          (Semantic_middle_worker.stage_name stage);
-        rendered
-    | Semantic_middle_worker.Compiled _ -> Alcotest.fail "expected debug-stage stop"
-    | Semantic_middle_worker.Failed _ -> assert false
+  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+
+let test_rejects_core_from_before_desugar_lowering () =
+  let mutable_let =
+    kind "let"
+      [
+        ("name", variable "value" ());
+        ("mutable", Lsp_json.Bool true);
+        ("type", int_type);
+        ("rhs", int_literal 1);
+        ("body", int_literal 2);
+      ]
   in
-  let normal = rendered_after_debug false in
-  let debug = rendered_after_debug true in
-  Alcotest.(check bool) "normal build erases body" false
-    (Modules.contains normal (string_of_int marker));
-  Alcotest.(check bool) "debug build retains body" true
-    (Modules.contains debug (string_of_int marker))
+  let core = core_program [ function_decl ~body:mutable_let "main" 2 ] in
+  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+
+let test_rejects_core_from_before_monomorphization () =
+  let generic_type = type_parameter "T" in
+  let call =
+    kind "call"
+      [
+        ( "call_kind",
+          kind "user"
+            [ ("name", Lsp_json.String "identity"); ("def_id", Lsp_json.Int 1) ] );
+        ("callee", variable_expr "identity" ~def_id:1 (function_type [ generic_type ] generic_type));
+        ("args", Lsp_json.Array [ int_literal 1 ]);
+        ("type", generic_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let core = core_program [ function_decl ~body:call "main" 2 ] in
+  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
+
+let test_rejects_closed_call_to_generic_function () =
+  let type_param =
+    Lsp_json.Object
+      [
+        ("name", Lsp_json.String "T");
+        ("bounds", Lsp_json.Array []);
+      ]
+  in
+  let generic = function_decl ~type_params:[ type_param ] "identity" 1 in
+  let call =
+    kind "call"
+      [
+        ("call_kind", kind "selected_direct" [ ("def_id", Lsp_json.Int 1) ]);
+        ("callee", variable_expr "identity" ~def_id:1 (function_type [ int_type ] int_type));
+        ("args", Lsp_json.Array [ int_literal 1 ]);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let core = core_program [ generic; function_decl ~body:call "main" 2 ] in
+  expect_decode_error "invalid_post_mono_core" (request_json ~core ())
 
 let test_require_main_validation () =
   match Semantic_middle_worker.run_request (decode_ok (request_json ~require_main:true ())) with
@@ -230,7 +293,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 2) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 3) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -238,7 +301,7 @@ let suite =
   [
     ( "protocol",
       [
-        Alcotest.test_case "decode prepared-Core request" `Quick
+        Alcotest.test_case "decode post-mono Core request" `Quick
           test_decode_phase_specific_request;
         Alcotest.test_case "reject incompatible protocol fields" `Quick
           test_rejects_schema_domain_phase_capability_and_stage;
@@ -249,12 +312,18 @@ let suite =
       ] );
     ( "worker",
       [
-        Alcotest.test_case "prepared Core reaches pre-DCE" `Quick
-          test_prepared_core_reaches_pre_dce;
+        Alcotest.test_case "post-mono Core reaches pre-DCE" `Quick
+          test_post_mono_core_reaches_pre_dce;
         Alcotest.test_case "stop-after returns snapshot" `Quick
           test_stop_after_returns_snapshot;
-        Alcotest.test_case "debug stage owns prepared debug blocks" `Quick
-          test_debug_stage_owns_prepared_debug_blocks;
+        Alcotest.test_case "reject Core from before debug lowering" `Quick
+          test_rejects_core_from_before_debug_lowering;
+        Alcotest.test_case "reject Core from before desugar lowering" `Quick
+          test_rejects_core_from_before_desugar_lowering;
+        Alcotest.test_case "reject Core from before monomorphization" `Quick
+          test_rejects_core_from_before_monomorphization;
+        Alcotest.test_case "reject closed call to generic function" `Quick
+          test_rejects_closed_call_to_generic_function;
         Alcotest.test_case "require-main validation" `Quick test_require_main_validation;
       ] );
   ]

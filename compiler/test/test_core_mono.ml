@@ -290,7 +290,7 @@ let test_collect_subst_ignores_identity_bindings () =
     []
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params
          (dict (TyVar "K") (TyVar "V"))
-         (dict (TyNamed ("K", [])) (TyNamed ("V", [])))
+         (dict (TyVar "K") (TyVar "V"))
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params (TyVar "K")
          ty_string
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params (TyVar "V")
@@ -306,10 +306,45 @@ let test_collect_subst_ignores_identity_bindings () =
         (List.assoc_opt "V" subst = Some (st ty_int))
   | None -> Alcotest.fail "identity bindings should not conflict with evidence"
 
+let test_collect_subst_preserves_nominal_type_identity () =
+  let subst =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) (tparams [ "T" ])
+      (TyNamed ("T", [])) ty_int []
+  in
+  Alcotest.(check int)
+    "nominal type is not a parameter binding" 0 (List.length subst)
+
+let test_collect_and_apply_self_substitution () =
+  let subst =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) (tparams [ "Self" ])
+      TySelf ty_int []
+  in
+  Alcotest.(check bool)
+    "Self binding is concrete" true
+    (Blorp.Core_mono.is_concrete_subst subst);
+  Alcotest.(check bool)
+    "Self applies to the receiver type" true
+    (Blorp.Core_mono.apply_subst subst TySelf = ty_int);
+  Alcotest.(check bool)
+    "unresolved Self remains open" true
+    (Blorp.Codegen_types.has_type_vars TySelf)
+
+let test_nominal_type_is_concrete () =
+  Alcotest.(check bool)
+    "one-letter nominal type is concrete" true
+    (Blorp.Core_mono.is_concrete_subst
+       [ ("T", st (TyNamed ("T", []))) ])
+
 let test_apply_subst () =
   let subst = [ ("T", st ty_int) ] in
   let result = Blorp.Core_mono.apply_subst subst (TyVar "T") in
   Alcotest.(check bool) "T → Int" true (result = ty_int)
+
+let test_apply_subst_preserves_nominal_type_identity () =
+  let nominal_t = TyNamed ("T", []) in
+  let result = Blorp.Core_mono.apply_subst [ ("T", st ty_int) ] nominal_t in
+  Alcotest.(check bool)
+    "nominal T remains nominal T" true (result = nominal_t)
 
 let test_apply_subst_nested () =
   let subst = [ ("T", st ty_string) ] in
@@ -645,6 +680,59 @@ let test_mono_two_instantiations () =
     "has Bool spec" true
     (List.mem "identity__mono_Bool" names)
 
+let test_mono_defers_partial_nested_specialization () =
+  let convert =
+    mk_func ~type_params:[ "T"; "U" ] "convert"
+      [ ("value", TyVar "T"); ("fallback", TyVar "U") ]
+      (TyVar "U") (cvar "fallback" (TyVar "U"))
+  in
+  let outer_call_ty =
+    TyFunc
+      {
+        params = [ TyVar "T"; ty_string ];
+        return = ty_string;
+        is_pure = true;
+      }
+  in
+  let outer_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "convert" outer_call_ty,
+           [ cvar "value" (TyVar "T"); cstr "fallback" ] ))
+      ty_string
+  in
+  let outer =
+    mk_func ~type_params:[ "T" ] "outer"
+      [ ("value", TyVar "T") ]
+      ty_string outer_body
+  in
+  let main_call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true }
+  in
+  let main =
+    mk_func "main" [] ty_string
+      (mk (CCall (CKUnknown, cvar "outer" main_call_ty, [ cint 1 ])) ty_string)
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl convert; mk_decl outer; mk_decl main ]
+  in
+  let names =
+    List.filter_map
+      (fun declaration ->
+        match declaration.cd_desc with
+        | CDFunc func -> Some func.cf_name
+        | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "partial inner specialization is not generated" false
+    (List.mem "convert__mono_String" names);
+  Alcotest.(check bool)
+    "inner specialization waits for outer type" true
+    (List.mem "convert__mono_Int_String" names)
+
 let test_mono_repeated_type_param_consistent_call_ok () =
   let same =
     mk_func ~type_params:[ "T" ] "same"
@@ -879,6 +967,39 @@ let test_mono_ufcs_mangled_callee () =
   Alcotest.(check bool)
     "has Char/String specialization" true
     (List.mem "std_option__to_result__mono_String_Char" names)
+
+let test_mono_ufcs_mangled_callee_with_double_underscore_member () =
+  let generic =
+    mk_func ~type_params:[ "T" ] ~module_path:(Some "std/list")
+      "std_list__identity__checked"
+      [ ("value", TyVar "T") ]
+      (TyVar "T") (cvar "value" (TyVar "T"))
+  in
+  let call_type =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let caller_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "__ufcs_std$list__identity__checked" call_type,
+           [ cint 42 ] ))
+      ty_int
+  in
+  let caller = mk_func "caller" [] ty_int caller_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl generic; mk_decl caller ]
+  in
+  let names =
+    List.filter_map
+      (fun decl ->
+        match decl.cd_desc with CDFunc func -> Some func.cf_name | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "has double-underscore member specialization" true
+    (List.mem "std_list__identity__checked__mono_Int" names)
 
 let test_mono_bare_call_prefers_selected_direct_kind_generic () =
   let impure_primary =
@@ -2395,7 +2516,15 @@ let suite =
           test_collect_subst_implicit_trailing_dim_pack;
         Alcotest.test_case "collect_subst_ignores_identity_bindings" `Quick
           test_collect_subst_ignores_identity_bindings;
+        Alcotest.test_case "collect_subst_preserves_nominal_type_identity" `Quick
+          test_collect_subst_preserves_nominal_type_identity;
+        Alcotest.test_case "collect_and_apply_self_substitution" `Quick
+          test_collect_and_apply_self_substitution;
+        Alcotest.test_case "nominal_type_is_concrete" `Quick
+          test_nominal_type_is_concrete;
         Alcotest.test_case "apply" `Quick test_apply_subst;
+        Alcotest.test_case "apply_preserves_nominal_type_identity" `Quick
+          test_apply_subst_preserves_nominal_type_identity;
         Alcotest.test_case "apply_nested" `Quick test_apply_subst_nested;
         Alcotest.test_case "loop_binder" `Quick
           test_subst_core_types_updates_loop_binder;
@@ -2422,6 +2551,8 @@ let suite =
         Alcotest.test_case "runtime_erased_bridge_union_data_layout" `Quick
           test_mono_keeps_runtime_erased_bridge_union_payload_storage;
         Alcotest.test_case "two_instances" `Quick test_mono_two_instantiations;
+        Alcotest.test_case "defers partial nested specialization" `Quick
+          test_mono_defers_partial_nested_specialization;
         Alcotest.test_case "repeated_type_param_consistent_call_ok" `Quick
           test_mono_repeated_type_param_consistent_call_ok;
         Alcotest.test_case "repeated_type_param_conflict_rejected" `Quick
@@ -2431,6 +2562,8 @@ let suite =
         Alcotest.test_case "e2e_pipeline" `Quick test_mono_e2e_pipeline;
         Alcotest.test_case "ufcs_mangled_callee" `Quick
           test_mono_ufcs_mangled_callee;
+        Alcotest.test_case "UFCS member with double underscore" `Quick
+          test_mono_ufcs_mangled_callee_with_double_underscore_member;
         Alcotest.test_case "bare call prefers selected direct kind generic"
           `Quick test_mono_bare_call_prefers_selected_direct_kind_generic;
         Alcotest.test_case "qualified call prefers selected direct kind generic"

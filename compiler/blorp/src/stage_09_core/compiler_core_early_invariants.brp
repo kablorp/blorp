@@ -1,0 +1,333 @@
+-- Invariants for the Core stages that execute before the semantic-middle
+-- boundary. These checks mirror only the currently enabled OCaml contracts;
+-- later-stage ownership and representation checks remain with their stages.
+import:
+	compiler_core_desugar: core_type_is_string
+	compiler_core_json:
+		CoreBinaryOp(AddOp, EqualOp, NotEqualOp),
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LetExpr, UnboxExpr),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		core_expr_type,
+	compiler_core_ssa:
+		CoreAssignmentShape(ControlFlowAssignment, NoAssignment, StraightLineAssignment),
+		classify_assignment_shape,
+	compiler_core_traverse as CoreTraverse
+
+
+union CoreEarlyInvariantViolation:
+	DebugBlockSurvived(CoreSourceLoc)
+	StringOperatorSugarSurvived(String, CoreSourceLoc)
+	MutableLocalWithoutAssignmentSurvived(CoreSourceLoc)
+	StraightLineMutableAssignmentSurvived(CoreSourceLoc)
+	MonoUserCallArgumentTypeUnresolved(String, CoreSourceLoc)
+	MonoUserCallReturnTypeUnresolved(String, CoreSourceLoc)
+	MonoBoxSourceTypeUnresolved(CoreSourceLoc)
+	MonoUnboxTargetTypeUnresolved(CoreSourceLoc)
+
+
+pure func core_early_invariant_stage(violation: CoreEarlyInvariantViolation) -> String:
+	match violation:
+		DebugBlockSurvived(_):
+			"debug"
+		StringOperatorSugarSurvived(_, _):
+			"desugar"
+		MutableLocalWithoutAssignmentSurvived(_):
+			"desugar"
+		StraightLineMutableAssignmentSurvived(_):
+			"desugar"
+		MonoUserCallArgumentTypeUnresolved(_, _):
+			"mono"
+		MonoUserCallReturnTypeUnresolved(_, _):
+			"mono"
+		MonoBoxSourceTypeUnresolved(_):
+			"mono"
+		MonoUnboxTargetTypeUnresolved(_):
+			"mono"
+
+
+pure func core_early_invariant_message(violation: CoreEarlyInvariantViolation) -> String:
+	match violation:
+		DebugBlockSurvived(_):
+			"debug block survived Core debug lowering"
+		StringOperatorSugarSurvived(op, _):
+			"string operator `${op}` survived Core desugaring"
+		MutableLocalWithoutAssignmentSurvived(_):
+			"mutable local binding without assignment survived desugaring"
+		StraightLineMutableAssignmentSurvived(_):
+			"straight-line mutable assignment survived desugaring"
+		MonoUserCallArgumentTypeUnresolved(_, _):
+			"call-site argument contains an unresolved type variable"
+		MonoUserCallReturnTypeUnresolved(_, _):
+			"call-site return type contains an unresolved type variable"
+		MonoBoxSourceTypeUnresolved(_):
+			"box source-type annotation contains an unresolved type variable"
+		MonoUnboxTargetTypeUnresolved(_):
+			"unbox target-type annotation contains an unresolved type variable"
+
+
+pure func core_early_invariant_hint(violation: CoreEarlyInvariantViolation) -> Option[String]:
+	match violation:
+		DebugBlockSurvived(_):
+			Some("Core debug lowering must erase or unwrap every debug block before later passes")
+		StringOperatorSugarSurvived(_, _):
+			Some("Core desugaring must replace string operators with their explicit builtin calls")
+		MutableLocalWithoutAssignmentSurvived(_):
+			Some("Core SSA must convert an unassigned mutable binding into an immutable let")
+		StraightLineMutableAssignmentSurvived(_):
+			Some("Core SSA must rewrite straight-line assignment into versioned immutable lets")
+		MonoUserCallArgumentTypeUnresolved(name, _):
+			Some(
+				"call to user function `${name}` has an argument type that monomorphization did not make concrete",
+			)
+		MonoUserCallReturnTypeUnresolved(name, _):
+			Some(
+				"call to user function `${name}` has a return type that monomorphization did not make concrete",
+			)
+		MonoBoxSourceTypeUnresolved(_):
+			Some((
+					"monomorphization must make a box source annotation concrete before layout "
+					+ "selection"
+				))
+		MonoUnboxTargetTypeUnresolved(_):
+			Some((
+					"monomorphization must make an unbox target annotation concrete before layout "
+					+ "selection"
+				))
+
+
+pure func core_early_invariant_loc(violation: CoreEarlyInvariantViolation) -> CoreSourceLoc:
+	match violation:
+		DebugBlockSurvived(loc):
+			loc
+		MutableLocalWithoutAssignmentSurvived(loc):
+			loc
+		StraightLineMutableAssignmentSurvived(loc):
+			loc
+		MonoBoxSourceTypeUnresolved(loc):
+			loc
+		MonoUnboxTargetTypeUnresolved(loc):
+			loc
+		StringOperatorSugarSurvived(_, loc):
+			loc
+		MonoUserCallArgumentTypeUnresolved(_, loc):
+			loc
+		MonoUserCallReturnTypeUnresolved(_, loc):
+			loc
+
+
+private pure func tensor_dim_has_type_parameter(dim: CoreTensorDim) -> Bool:
+	match dim:
+		TensorRuntimeDim(_) | TensorVariadicDim(_):
+			True
+		TensorDimOperation(_, left, right):
+			tensor_dim_has_type_parameter(left) or tensor_dim_has_type_parameter(right)
+		TensorStaticDim(_):
+			False
+
+
+private pure func core_type_has_type_parameter(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			args.any(core_type_has_type_parameter)
+		TypeParameterType(_) | SelfType:
+			True
+		FunctionType(_, params, return_type):
+			params.any(core_type_has_type_parameter) or core_type_has_type_parameter(return_type)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			core_type_has_type_parameter(value_type) or core_type_has_type_parameter(error_type)
+		TensorType(info):
+			(
+				core_type_has_type_parameter(info.element_type)
+				or info.dims.any(tensor_dim_has_type_parameter)
+			)
+		TupleType(items):
+			items.any(core_type_has_type_parameter)
+		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			False
+
+
+private pure func debug_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViolation]:
+	match expr:
+		DebugBlockExpr(_, _, loc):
+			[DebugBlockSurvived(loc)]
+		_:
+			[]
+
+
+private pure func string_operator_name(op: CoreBinaryOp) -> String:
+	match op:
+		AddOp:
+			"+"
+		EqualOp:
+			"=="
+		NotEqualOp:
+			"!="
+		_:
+			"string operator"
+
+
+private pure func desugar_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViolation]:
+	match expr:
+		BinaryExpr(op, left, _, _, loc):
+			if core_type_is_string(core_expr_type(left)):
+				match op:
+					AddOp | EqualOp | NotEqualOp:
+						[StringOperatorSugarSurvived(string_operator_name(op), loc)]
+					_:
+						[]
+			else:
+				[]
+		LetExpr(variable, True, _, _, body):
+			match classify_assignment_shape(variable.name, body):
+				NoAssignment:
+					[MutableLocalWithoutAssignmentSurvived(SyntheticSourceLoc)]
+				StraightLineAssignment:
+					[StraightLineMutableAssignmentSurvived(SyntheticSourceLoc)]
+				ControlFlowAssignment:
+					[]
+		_:
+			[]
+
+
+private pure func mono_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViolation]:
+	match expr:
+		CallExpr(UserCall(name, _, _), _, args, result_type, loc):
+			var violations: List[CoreEarlyInvariantViolation] = []
+
+			for arg in args:
+				if core_type_has_type_parameter(core_expr_type(arg)):
+					violations = violations.append(MonoUserCallArgumentTypeUnresolved(name, loc))
+
+			if core_type_has_type_parameter(result_type):
+				violations = violations.append(MonoUserCallReturnTypeUnresolved(name, loc))
+
+			violations
+		BoxExpr(box, _, loc):
+			if core_type_has_type_parameter(box.source_type):
+				[MonoBoxSourceTypeUnresolved(loc)]
+			else:
+				[]
+		UnboxExpr(_, _, result_type, loc):
+			if core_type_has_type_parameter(result_type):
+				[MonoUnboxTargetTypeUnresolved(loc)]
+			else:
+				[]
+		_:
+			[]
+
+
+private pure func program_expr_roots(program: CoreProgram) -> List[CoreExpr]:
+	var roots: List[CoreExpr] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				match function.body:
+					Some(body):
+						roots = roots.append(body)
+					None:
+						void
+			GlobalDecl(global):
+				roots = roots.append(global.init)
+			ImplDecl(impl):
+				for method in impl.methods:
+					match method.body:
+						Some(body):
+							roots = roots.append(body)
+						None:
+							void
+			_:
+				void
+
+	roots
+
+
+private pure func program_monomorphic_expr_roots(program: CoreProgram) -> List[CoreExpr]:
+	var roots: List[CoreExpr] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if function.type_params.is_empty():
+					match function.body:
+						Some(body):
+							roots = roots.append(body)
+						None:
+							void
+			GlobalDecl(global):
+				roots = roots.append(global.init)
+			ImplDecl(impl):
+				if impl.type_params.is_empty():
+					for method in impl.methods:
+						if method.type_params.is_empty():
+							match method.body:
+								Some(body):
+									roots = roots.append(body)
+								None:
+									void
+			_:
+				void
+
+	roots
+
+
+private pure func check_expr_roots(
+	roots: List[CoreExpr],
+	check: pure (CoreExpr) -> List[CoreEarlyInvariantViolation],
+) -> List[CoreEarlyInvariantViolation]:
+	var violations: List[CoreEarlyInvariantViolation] = []
+	var pending: List[CoreExpr] = roots
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(expr):
+				violations = violations.concat(check(expr))
+
+				for child in CoreTraverse.immediate_core_expr_children(expr):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	violations
+
+
+private pure func check_program_invariants(
+	program: CoreProgram,
+	check: pure (CoreExpr) -> List[CoreEarlyInvariantViolation],
+) -> List[CoreEarlyInvariantViolation]:
+	check_expr_roots(program_expr_roots(program), check)
+
+
+pure func check_debug_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
+	check_program_invariants(program, debug_violations)
+
+
+pure func check_desugar_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
+	check_program_invariants(program, desugar_violations)
+
+
+pure func check_mono_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
+	check_expr_roots(program_monomorphic_expr_roots(program), mono_violations)

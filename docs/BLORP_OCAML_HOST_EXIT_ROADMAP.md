@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-24.
+Status checked against code on 2026-07-25.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -9,15 +9,16 @@ OCaml compiler host:
 2. writing generated artifacts, invoking the host C compiler, and running the
    resulting binary.
 
-The semantic middle is a separate migration concern. Core lowering is now
-Blorp-owned; until the early/middle Core passes are ported, one narrow OCaml
-worker may remain:
+The semantic middle is a separate migration concern. Core lowering and the
+early Core pipeline through monomorphization are now Blorp-owned; until the
+remaining middle Core passes are ported, one narrow OCaml worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
-  -> one versioned prepared-Core request
-  -> OCaml early/middle Core worker
+  -> Blorp debug, desugar/SSA, mono, and post-mono list layout
+  -> one versioned post-mono Core request
+  -> OCaml synth-through-specialize Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -211,8 +212,8 @@ Implementation:
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Keep the worker entry function limited to strict prepared-Core decode and
-   the still-OCaml early/middle passes.
+5. Keep the worker entry function limited to strict post-mono Core decode,
+   early-stage invariant validation, and the still-OCaml middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
    stderr. It accepts no public CLI flags. The Blorp process client is added in
@@ -809,7 +810,7 @@ Deferred solely for the pinned bootstrap wrapper:
 
 Do not delete yet:
 
-- OCaml early/middle passes used by `blorp-ocaml-middle`;
+- OCaml synth-through-specialize passes used by `blorp-ocaml-middle`;
 - OCaml Core lowering retained solely by the pinned-bootstrap wrapper and
   direct in-memory compatibility tests;
 - their behavior-focused tests until the corresponding semantic stage ports;

@@ -9,9 +9,24 @@ import:
 		CompilerCoreGraphUnit,
 		compiler_core_graph_prepare_error_to_string,
 		prepare_core_graph,
+	../stage_09_core/compiler_core_early_pipeline:
+		CoreEarlyPipelineConfiguration,
+		CoreEarlyPipelineDiagnostic,
+		CoreEarlyPipelineExecution(
+			CoreEarlyPipelineCompleted,
+			CoreEarlyPipelineFailed,
+			CoreEarlyPipelineStopped,
+		),
+		CoreEarlyPipelineInput,
+		CoreEarlyPipelineObservation,
+		CoreEarlyPipelineStage,
+		core_early_pipeline_diagnostic_hint,
+		core_early_pipeline_diagnostic_message,
+		core_early_pipeline_stage_name,
+		run_early_core_pipeline,
 	../stage_09_core/compiler_semantic_worker_protocol:
 		SemanticMiddleCapability(
-			PreparedCoreCapability,
+			PostMonoCoreCapability,
 			PreDceCoreCapability,
 			RenderedStageObservationsCapability,
 		),
@@ -19,14 +34,23 @@ import:
 		SemanticMiddleModuleImports,
 		SemanticMiddleRequest,
 		SemanticMiddleStage,
+	compiler_cli_core_observation: CliCoreObservation
 	compiler_cli_plan: CliFrontendModuleGraph
 	compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
 
 
-record CompiledFrontendGraph {
-	request: SemanticMiddleRequest,
-	typed_program_json: String
-}
+union CompiledFrontendGraph:
+	CompiledFrontendReady(
+		SemanticMiddleRequest,
+		String,
+		List[CliCoreObservation],
+	)
+	CompiledFrontendStopped(
+		String,
+		String,
+		String,
+		List[CliCoreObservation],
+	)
 
 
 private pure func semantic_import_binding(
@@ -55,11 +79,34 @@ private pure func semantic_module_imports(
 	}
 
 
+private pure func early_observation(
+	observation: CoreEarlyPipelineObservation,
+) -> CliCoreObservation:
+	{
+		stage_name = core_early_pipeline_stage_name(observation.stage),
+		rendered = observation.rendered
+	}
+
+
+private pure func early_pipeline_error(
+	diagnostic: CoreEarlyPipelineDiagnostic,
+) -> String:
+	message: String = core_early_pipeline_diagnostic_message(diagnostic)
+
+	match core_early_pipeline_diagnostic_hint(diagnostic):
+		Some(hint):
+			"${message}\nhelp: ${hint}"
+		None:
+			message
+
+
 pure func compile_frontend_graph(
 	graph: CliFrontendModuleGraph,
 	debug_mode: Bool,
 	require_main: Bool,
 	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
 	observations: List[SemanticMiddleStage],
 	stop_after: Option[SemanticMiddleStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
@@ -83,32 +130,54 @@ pure func compile_frontend_graph(
 					Err(error):
 						Err([compiler_core_graph_prepare_error_to_string(error)])
 
-				request: SemanticMiddleRequest = {
-					target_path = typechecked.target.path,
-					target_module_name = typechecked.target.module_name,
-					core = prepared_graph.program,
-					next_def_id = prepared_graph.next_def_id,
-					import_bindings = typechecked.target.import_bindings.map(
-						semantic_import_binding,
-					),
-					module_imports = typechecked.modules.map(semantic_module_imports),
+				early_configuration: CoreEarlyPipelineConfiguration = {
 					debug = debug_mode,
-					require_main = require_main,
 					check_invariants = check_invariants,
-					required_capabilities = [
-						PreparedCoreCapability,
-						PreDceCoreCapability,
-						RenderedStageObservationsCapability,
-					],
-					observations = observations,
-					stop_after = stop_after,
+					observations = early_observations,
+					stop_after = early_stop
+				}
+				early_input: CoreEarlyPipelineInput = {
+					program = prepared_graph.program,
+					next_def_id = prepared_graph.next_def_id
 				}
 
-				Ok({
-					request = request,
-					typed_program_json = compiler_typed_program_to_json(
-						typechecked.target.typed_program,
-					).to_string(),
-				})
+				match run_early_core_pipeline(early_input, early_configuration):
+					CoreEarlyPipelineFailed(diagnostic):
+						Err([early_pipeline_error(diagnostic)])
+					CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+						Ok(CompiledFrontendStopped(
+							typechecked.target.path,
+							core_early_pipeline_stage_name(stage),
+							rendered,
+							completed_observations.map(early_observation),
+						))
+					CoreEarlyPipelineCompleted(output):
+						request: SemanticMiddleRequest = {
+							target_path = typechecked.target.path,
+							target_module_name = typechecked.target.module_name,
+							core = output.program,
+							next_def_id = output.next_def_id,
+							import_bindings = typechecked.target.import_bindings.map(
+								semantic_import_binding,
+							),
+							module_imports = typechecked.modules.map(semantic_module_imports),
+							require_main = require_main,
+							check_invariants = check_invariants,
+							required_capabilities = [
+								PostMonoCoreCapability,
+								PreDceCoreCapability,
+								RenderedStageObservationsCapability,
+							],
+							observations = observations,
+							stop_after = stop_after,
+						}
+
+						Ok(CompiledFrontendReady(
+							request,
+							compiler_typed_program_to_json(
+								typechecked.target.typed_program,
+							).to_string(),
+							output.observations.map(early_observation),
+						))
 		_:
 			Err(["source compilation requires exactly one root module"])

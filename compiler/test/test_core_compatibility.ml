@@ -42,6 +42,60 @@ func main(args: List[String]) -> Int:
       | Some _ -> Alcotest.fail "expected inc to lower to integer addition"
       | None -> Alcotest.fail "expected lowered inc function")
 
+let test_lowers_declared_type_parameters_as_explicit_vars () =
+  Test_helpers.with_isolated_env (fun () ->
+      let typed_ast =
+        Test_helpers.expect_ok_typed
+          {|
+record Box[T] {value: T}
+
+type alias Wrapped[T] = List[T]
+
+pure func identity[T](value: T) -> T:
+	value
+|}
+      in
+      let typed = Test_helpers.expect_valid_typed_program typed_ast in
+      let lowered = Blorp.Core_lower.lower_typed_program typed in
+      let identity =
+        List.find_map
+          (fun declaration ->
+            match declaration.cd_desc with
+            | CDFunc fn when fn.cf_name = "identity" -> Some fn
+            | _ -> None)
+          lowered
+      in
+      let box =
+        List.find_map
+          (fun declaration ->
+            match declaration.cd_desc with
+            | CDRecord record when record.record_name = "Box" -> Some record
+            | _ -> None)
+          lowered
+      in
+      let wrapped =
+        List.find_map
+          (fun declaration ->
+            match declaration.cd_desc with
+            | CDTypeAlias alias when alias.alias_name = "Wrapped" -> Some alias
+            | _ -> None)
+          lowered
+      in
+      match (identity, box, wrapped) with
+      | ( Some
+            {
+              cf_params = [ { cp_ty = TyVar "T"; _ } ];
+              cf_return_ty = TyVar "T";
+              cf_body = Some { desc = CVar _; ty = TyVar "T"; _ };
+              _;
+            },
+          Some { record_fields = [ { field_type = TyVar "T"; _ } ]; _ },
+          Some { alias_target = TyNamed ("List", [ TyVar "T" ]); _ } ) ->
+          ()
+      | _ ->
+          Alcotest.fail
+            "declared type parameters must cross the Core boundary as TyVar")
+
 let test_prefixes_module_owned_type () =
   let record =
     {
@@ -207,6 +261,8 @@ let suite =
       [
         Alcotest.test_case "lowers typed source" `Quick
           test_lowers_typed_source;
+        Alcotest.test_case "lowers declared type parameters as explicit vars"
+          `Quick test_lowers_declared_type_parameters_as_explicit_vars;
         Alcotest.test_case "prefixes module-owned type" `Quick
           test_prefixes_module_owned_type;
         Alcotest.test_case "builds explicit import tables" `Quick

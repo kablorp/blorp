@@ -591,7 +591,7 @@ measures frontend graph counts.
 - Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
   then delete the superseded generation and bridge entry points once no
   production caller remains.
-- Preserve one bridge: the prepared-Core semantic-middle request. Do not introduce a
+- Preserve one bridge: the post-mono Core semantic-middle request. Do not introduce a
   test-only parser bridge or a second graph protocol.
 
 **Tests:**

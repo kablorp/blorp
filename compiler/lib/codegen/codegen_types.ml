@@ -61,8 +61,8 @@ let rec type_key_for_impl (ty : type_expr) : string option =
       if List.length encoded = 1 + List.length dims then
         Some (String.concat "_" (Types.array_head_name :: encoded))
       else None
-  | TyNamed (n, []) when not (Types.is_type_param_name n) -> Some n
-  | TyNamed (n, args) when not (Types.is_type_param_name n) ->
+  | TyNamed (n, []) -> Some n
+  | TyNamed (n, args) ->
       let encoded = List.filter_map type_key_for_impl args in
       if List.length encoded = List.length args then
         Some (String.concat "_" (n :: encoded))
@@ -83,8 +83,7 @@ let rec type_key_for_impl (ty : type_expr) : string option =
 
 (** Does this type still contain any unresolved type variables? *)
 let rec has_type_vars = function
-  | TyVar _ | TyBoundVar _ | TyVarDims _ | TyMeta _ -> true
-  | TyNamed (name, []) when Types.is_type_param_name name -> true
+  | TyVar _ | TyBoundVar _ | TySelf | TyVarDims _ | TyMeta _ -> true
   | TyNamed (_, args) -> List.exists has_type_vars args
   | TyArray (elem, dims) -> has_type_vars elem || List.exists has_type_vars dims
   | TyTuple elems -> List.exists has_type_vars elems
@@ -680,8 +679,6 @@ let type_to_c ~(reg : registry) ty =
                   Types.int_type_to_c name
               | _ when List.mem name Types.all_float_type_names ->
                   Types.float_type_to_c name
-              | _ when Types.is_type_param_name name ->
-                  "void*" (* Type variables type-erased as void* *)
               | _ when Hashtbl.mem reg.enum_types name ->
                   "long" (* Enum types are integer values *)
               | _ when Hashtbl.mem reg.value_records name ->

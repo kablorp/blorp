@@ -85,7 +85,7 @@ let default_suites =
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
   @ suite_group "Core" Test_core.suite
-  @ suite_group "CorePreMiddleJson" Test_core_pre_middle_json.suite
+  @ suite_group "CorePostMonoJson" Test_core_post_mono_json.suite
   @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
   @ suite_group "CoreCompatibility" Test_core_compatibility.suite
   @ suite_group "CoreResolve" Test_core_resolve.suite

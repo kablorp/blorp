@@ -1,0 +1,486 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreBinaryOp(AddOp, GreaterOp, LessOp, MultiplyOp),
+		CoreCallKind(IntrinsicCall),
+		CoreExpr(BinaryExpr, CallExpr, CastExpr, TensorRawReadExpr, TensorRawViewLetExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
+		CoreType(NamedType, TensorType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_synth_name: synthesis_source_name
+	../src/stage_09_core/compiler_core_synth_tensor:
+		CoreSynthError(UnsupportedTensorReductionElement),
+		synthesize_tensor_body,
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+private FLOAT32_TYPE: CoreType = NamedType("Float32", [])
+
+private FLOAT16_TYPE: CoreType = NamedType("Float16", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func tensor_type(element_type: CoreType) -> CoreType:
+	TensorType({
+		element_type = element_type,
+		dims = [TensorStaticDim(4)],
+	})
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func identified_param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = {
+			name = name,
+			uniq = 41,
+			def_id = Some(73)
+		},
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func builtin_function(
+	module_name: String,
+	source_name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func contains_intrinsic(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, _, _, _):
+			(
+				name == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_intrinsic(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_intrinsic(child, expected))
+
+
+pure func contains_binary_op(expr: CoreExpr, expected: CoreBinaryOp) -> Bool:
+	match expr:
+		BinaryExpr(op, _, _, _, _):
+			(
+				op == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_binary_op(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_binary_op(child, expected))
+
+
+pure func bool_as_int(value: Bool) -> Int:
+	if value:
+		1
+	else:
+		0
+
+
+pure func count_intrinsic(expr: CoreExpr, expected: String) -> Int:
+	child_count: Int = immediate_core_expr_children(expr)
+		.map(func(child): count_intrinsic(child, expected))
+		.sum()
+
+	match expr:
+		CallExpr(IntrinsicCall(name), _, _, _, _):
+			bool_as_int(name == expected) + child_count
+		_:
+			child_count
+
+
+pure func count_raw_views(expr: CoreExpr, expected: CoreTensorRawScalarKind) -> Int:
+	child_count: Int = immediate_core_expr_children(expr)
+		.map(func(child): count_raw_views(child, expected))
+		.sum()
+
+	match expr:
+		TensorRawViewLetExpr(binding, _, _, _):
+			bool_as_int(binding.kind == expected) + child_count
+		_:
+			child_count
+
+
+pure func count_raw_reads(expr: CoreExpr, expected: CoreTensorRawScalarKind) -> Int:
+	child_count: Int = immediate_core_expr_children(expr)
+		.map(func(child): count_raw_reads(child, expected))
+		.sum()
+
+	match expr:
+		TensorRawReadExpr(read, _, _):
+			bool_as_int(read.kind == expected) + child_count
+		_:
+			child_count
+
+
+pure func count_casts(expr: CoreExpr) -> Int:
+	child_count: Int = immediate_core_expr_children(expr)
+		.map(count_casts)
+		.sum()
+
+	match expr:
+		CastExpr(_, _, _):
+			1 + child_count
+		_:
+			child_count
+
+
+pure func contains_variable_identity(expr: CoreExpr, expected: CoreVar) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			(
+				variable.name == expected.name
+				and variable.uniq == expected.uniq
+				and variable.def_id == expected.def_id
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_variable_identity(child, expected)
+			)
+
+
+pure func synthesized_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	match synthesize_tensor_body(function_info):
+		Ok(body):
+			body
+		Err(_):
+			None
+
+
+pure func test_sum_float_uses_guarded_raw_view() -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		"sum",
+		[param("items", tensor_type(FLOAT_TYPE))],
+		FLOAT_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_is_f64_storage")
+				and contains_intrinsic(body, "tensor_get_f64")
+				and count_raw_views(body, TensorFloat64Elements) == 1
+				and count_raw_reads(body, TensorFloat64Elements) == 1
+				and count_casts(body) == 0
+				and contains_binary_op(body, AddOp)
+			)
+		None:
+			False
+
+
+pure func test_product_float32_uses_guarded_raw_view() -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		"product",
+		[param("items", tensor_type(FLOAT32_TYPE))],
+		FLOAT32_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_is_f32_storage")
+				and contains_intrinsic(body, "tensor_get_f32")
+				and count_raw_views(body, TensorFloat32Elements) == 1
+				and contains_binary_op(body, MultiplyOp)
+			)
+		None:
+			False
+
+
+pure func test_dot_int_uses_two_raw_views() -> Bool:
+	vector_type: CoreType = tensor_type(INT_TYPE)
+	function_info = builtin_function(
+		"std/vector",
+		"dot",
+		[param("left", vector_type), param("right", vector_type)],
+		INT_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_is_i64_storage")
+				and count_raw_views(body, TensorInt64Elements) == 2
+				and count_raw_reads(body, TensorInt64Elements) == 2
+				and contains_binary_op(body, AddOp)
+				and contains_binary_op(body, MultiplyOp)
+			)
+		None:
+			False
+
+
+pure func test_float16_uses_safe_reader_without_raw_view() -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		"sum",
+		[param("items", tensor_type(FLOAT16_TYPE))],
+		FLOAT16_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_get_f16")
+				and count_raw_views(body, TensorFloat64Elements) == 0
+				and count_raw_views(body, TensorFloat32Elements) == 0
+				and count_raw_views(body, TensorInt64Elements) == 0
+			)
+		None:
+			False
+
+
+pure func min_or_max_body(name: String, op: CoreBinaryOp) -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		name,
+		[param("items", tensor_type(INT_TYPE))],
+		INT_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_len")
+				and count_intrinsic(body, "tensor_get_i64") == 2
+				and contains_binary_op(body, op)
+				and count_raw_views(body, TensorInt64Elements) == 0
+			)
+		None:
+			False
+
+
+pure func test_min_and_max_use_safe_comparison_loops() -> Bool:
+	min_or_max_body("min", LessOp) and min_or_max_body("max", GreaterOp)
+
+
+pure func mean_body(element_type: CoreType) -> Option[CoreExpr]:
+	function_info = builtin_function(
+		"std/vector",
+		"mean",
+		[param("items", tensor_type(element_type))],
+		FLOAT_TYPE,
+	)
+
+	synthesized_body(function_info)
+
+
+pure func test_mean_int_casts_sum_and_length_to_float() -> Bool:
+	match mean_body(INT_TYPE):
+		Some(body):
+			count_casts(body) >= 2
+		None:
+			False
+
+
+pure func test_mean_int_checks_empty_input() -> Bool:
+	match mean_body(INT_TYPE):
+		Some(body):
+			contains_intrinsic(body, "tensor_len")
+		None:
+			False
+
+
+pure func test_cumulative_sum_allocates_and_writes_result() -> Bool:
+	vector_type: CoreType = tensor_type(FLOAT_TYPE)
+	function_info = builtin_function(
+		"std/vector",
+		"cumulative_sum",
+		[param("items", vector_type)],
+		vector_type,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			contains_intrinsic(body, "tensor_alloc") and contains_intrinsic(body, "tensor_set_f64")
+		None:
+			False
+
+
+pure func test_scale_reads_and_writes_concrete_elements() -> Bool:
+	vector_type: CoreType = tensor_type(FLOAT32_TYPE)
+	function_info = builtin_function(
+		"std/vector",
+		"scale",
+		[param("items", vector_type), param("factor", FLOAT32_TYPE)],
+		vector_type,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "tensor_get_f32")
+				and contains_intrinsic(body, "tensor_set_f32")
+				and contains_binary_op(body, MultiplyOp)
+			)
+		None:
+			False
+
+
+pure func test_non_vector_module_is_not_synthesized() -> Bool:
+	function_info = builtin_function(
+		"app/vector",
+		"sum",
+		[param("items", tensor_type(FLOAT_TYPE))],
+		FLOAT_TYPE,
+	)
+
+	synthesized_body(function_info) == None
+
+
+pure func test_tensor_synthesis_rejects_malformed_signatures() -> Bool:
+	int_vector: CoreType = tensor_type(INT_TYPE)
+	float_vector: CoreType = tensor_type(FLOAT_TYPE)
+	wrong_sum = builtin_function("std/vector", "sum", [param("items", int_vector)], FLOAT_TYPE)
+	wrong_dot = builtin_function(
+		"std/vector",
+		"dot",
+		[param("left", int_vector), param("right", float_vector)],
+		INT_TYPE,
+	)
+	wrong_scale = builtin_function(
+		"std/vector",
+		"scale",
+		[param("items", int_vector), param("factor", FLOAT_TYPE)],
+		int_vector,
+	)
+
+	(
+		synthesized_body(wrong_sum) == None
+		and synthesized_body(wrong_dot) == None
+		and synthesized_body(wrong_scale) == None
+	)
+
+
+pure func test_tensor_synthesis_preserves_parameter_identity() -> Bool:
+	items = identified_param("items", tensor_type(INT_TYPE))
+	function_info = builtin_function("std/vector", "sum", [items], INT_TYPE)
+
+	match synthesized_body(function_info):
+		Some(body):
+			contains_variable_identity(body, items.name)
+		None:
+			False
+
+
+pure func test_malformed_unsupported_tensor_signature_is_not_diagnostic() -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		"sum",
+		[param("items", tensor_type(STRING_TYPE)), param("extra", INT_TYPE)],
+		STRING_TYPE,
+	)
+
+	match synthesize_tensor_body(function_info):
+		Ok(None):
+			True
+		_:
+			False
+
+
+pure func test_unsupported_concrete_element_reports_error() -> Bool:
+	function_info = builtin_function(
+		"std/vector",
+		"sum",
+		[param("items", tensor_type(STRING_TYPE))],
+		STRING_TYPE,
+	)
+
+	match synthesize_tensor_body(function_info):
+		Err(UnsupportedTensorReductionElement(name, NamedType(element_name, args), SyntheticSourceLoc)):
+			name == "sum" and element_name == "String" and args.is_empty()
+		_:
+			False
+
+
+pure func test_synthesis_name_uses_explicit_module_boundary() -> Bool:
+	function_info = builtin_function("pkg/a__b", "value__mono_part__pure", [], INT_TYPE)
+	mismatched = { function_info | name = "pkg_other__value__mono_part__mono_fixture" }
+
+	(
+		synthesis_source_name(function_info) == Some("value__mono_part")
+		and synthesis_source_name(mismatched) == None
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler Core tensor synthesis",
+	tests = [
+		("Float sum uses guarded raw view", test_sum_float_uses_guarded_raw_view),
+		("Float32 product uses guarded raw view", test_product_float32_uses_guarded_raw_view),
+		("Int dot uses two raw views", test_dot_int_uses_two_raw_views),
+		("Float16 sum uses safe reader", test_float16_uses_safe_reader_without_raw_view),
+		("min and max use safe loops", test_min_and_max_use_safe_comparison_loops),
+		("Int mean casts to Float", test_mean_int_casts_sum_and_length_to_float),
+		("Int mean checks empty input", test_mean_int_checks_empty_input),
+		("cumulative sum allocates output", test_cumulative_sum_allocates_and_writes_result),
+		("scale reads and writes concrete elements", test_scale_reads_and_writes_concrete_elements),
+		("non-vector sum is not synthesized", test_non_vector_module_is_not_synthesized),
+		(
+			"tensor synthesis rejects malformed signatures",
+			test_tensor_synthesis_rejects_malformed_signatures,
+		),
+		(
+			"tensor synthesis preserves parameter identity",
+			test_tensor_synthesis_preserves_parameter_identity,
+		),
+		(
+			"malformed unsupported tensor signature is not diagnostic",
+			test_malformed_unsupported_tensor_signature_is_not_diagnostic,
+		),
+		(
+			"unsupported tensor element is diagnosed",
+			test_unsupported_concrete_element_reports_error,
+		),
+		(
+			"synthesis names use explicit module boundary",
+			test_synthesis_name_uses_explicit_module_boundary,
+		),
+	]
+}

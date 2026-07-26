@@ -1,11 +1,11 @@
 (** Core IR compilation pipeline.
 
-    Normal source commands enter through [run_core_passes] with prepared Core
-    produced by Blorp lowering, graph flattening, FFI annotation, and initial
-    list layout. The typed-program entrypoints below remain for the pinned
-    bootstrap wrapper and direct in-memory compatibility tests.
+    Normal source commands enter through [run_core_passes_from_post_mono] with
+    Core produced by the Blorp-owned debug, desugar/SSA, mono, and post-mono
+    list-layout stages. [run_core_passes] retains the full early chain only for
+    the pinned bootstrap wrapper and direct in-memory compatibility tests.
 
-    The shared pass chain is:
+    The complete compatibility pass chain is:
     1. [Core_debug] — erase or retain explicit debug blocks
     2. [Core_desugar] + [Core_ssa] — eliminate Core sugar and mutable locals
     3. [Core_mono] — monomorphize generic functions
@@ -183,14 +183,13 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
   then on_stage_event Core_stage.Final;
   match result with Ok c_code -> c_code | Error reason -> failwith reason
 
-(** Run the shared Core-to-Core pass chain starting from an already-lowered,
-    flattened, FFI-annotated, list-layout-annotated [core_program]. Production
-    semantic-worker requests and compatibility typed-program entrypoints join
-    here, so pass ordering cannot drift between them. *)
-let run_core_passes ?(import_aliases = Hashtbl.create 0)
+(** Run the remaining OCaml middle starting from post-mono Core. This is the
+    production semantic-worker entrypoint; debug, desugar/SSA, mono, and the
+    post-mono list-layout annotation have already run in Blorp. *)
+let run_core_passes_from_post_mono ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
-    ?(debug = false) (prog : Core.core_program) : backend_core_input =
+    (prog : Core.core_program) : backend_core_input =
   let observe stage prog =
     on_stage_event stage;
     on_stage stage prog;
@@ -198,15 +197,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
   in
   let run_stage stage pass prog = pass prog |> observe stage in
   let pre_dce =
-    prog |> observe Core_stage.Lower
-    |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
-    |> run_stage Core_stage.Desugar (fun p ->
-        p |> Core_desugar.desugar_program |> Core_ssa.desugar_mut_program)
-    |> run_stage Core_stage.Mono (fun p ->
-        p
-        |> Core_mono.monomorphize_program ~reg ~import_aliases ~module_imports
-        |> Core_list_layout.annotate_program ~reg)
-    |> run_stage Core_stage.Synth (Core_synth.synthesize_program ~reg)
+    prog |> run_stage Core_stage.Synth (Core_synth.synthesize_program ~reg)
     |> run_stage Core_stage.Match Core_match.compile_program
     |> run_stage Core_stage.TraitResolve
          (Core_trait_resolve.resolve_program ~import_aliases ~module_imports)
@@ -224,6 +215,32 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
     |> run_stage Core_stage.Specialize (Core_specialize.specialize_program ~reg)
   in
   { blorp_tail_input = pre_dce }
+
+(** Run the complete compatibility Core chain from prepared Core. Production
+    source compilation enters through [run_core_passes_from_post_mono]; this
+    entrypoint remains for typed in-memory callers until they move to Blorp. *)
+let run_core_passes ?(import_aliases = Hashtbl.create 0)
+    ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
+    ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
+    ?(debug = false) (prog : Core.core_program) : backend_core_input =
+  let observe stage prog =
+    on_stage_event stage;
+    on_stage stage prog;
+    prog
+  in
+  let run_stage stage pass prog = pass prog |> observe stage in
+  let post_mono =
+    prog |> observe Core_stage.Lower
+    |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
+    |> run_stage Core_stage.Desugar (fun p ->
+        p |> Core_desugar.desugar_program |> Core_ssa.desugar_mut_program)
+    |> run_stage Core_stage.Mono (fun p ->
+        p
+        |> Core_mono.monomorphize_program ~reg ~import_aliases ~module_imports
+        |> Core_list_layout.annotate_program ~reg)
+  in
+  run_core_passes_from_post_mono ~import_aliases ~module_imports ~on_stage
+    ~on_stage_event ~reg post_mono
 
 let max_definition_id current candidate =
   match (current, candidate) with

@@ -25,6 +25,7 @@ import:
 		ParsedTraitMethodDecl,
 		ParsedTypeAliasDecl,
 		ParsedTypeExpr(ParsedNamedType),
+		ParsedTypeParamDecl,
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
@@ -42,6 +43,8 @@ import:
 			CompilerConstIntType,
 			CompilerNamedType,
 			CompilerRangeType,
+			CompilerSelfType,
+			CompilerTypeVar,
 			CompilerTupleType,
 		),
 		compiler_function_type,
@@ -178,7 +181,13 @@ import:
 		lower_typed_expr,
 		lower_typed_program,
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(BuiltinCall, SelectedDirectCall, UnknownCall),
+		CoreCallKind(
+			BuiltinCall,
+			DeferredTraitCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			UnknownCall,
+		),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopMoveResourceItem),
 		CoreDecl(
 			EnumDecl,
@@ -239,8 +248,16 @@ import:
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreTensorForElementStorage(TensorForRowSliceElement, TensorForRuntimeReadElement),
 		CoreTensorRuntimeReadHelper(TensorRuntimeReadI64),
-		CoreType(FunctionType, NamedType, RangeType, TupleType, VoidType),
-		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreType(
+			FunctionType,
+			NamedType,
+			RangeType,
+			SelfType,
+			TupleType,
+			TypeParameterType,
+			VoidType,
+		),
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		core_binary_op_to_string,
 		core_box_kind_to_json,
 		core_expr_to_json,
@@ -635,6 +652,14 @@ pure func parsed_union_decl(is_enum: Bool) -> ParsedUnionDecl:
 	}
 
 
+pure func parsed_type_param(name: String) -> ParsedTypeParamDecl:
+	{
+		name = ident(name),
+		bounds = [],
+		span = source_span()
+	}
+
+
 pure func parsed_var_decl() -> ParsedVarDecl:
 	{
 		name = ident("answer"),
@@ -696,6 +721,16 @@ pure func typed_union_info(is_enum: Bool) -> CompilerTypedUnionInfo:
 	{
 		decl = parsed_union_decl(is_enum),
 		variants = variants
+	}
+
+
+pure func typed_generic_union_info() -> CompilerTypedUnionInfo:
+	{
+		decl = { parsed_union_decl(False) | type_params = [parsed_type_param("T")] },
+		variants = [
+			typed_union_variant("First", [CompilerTypeVar("T")], 0, Some(101)),
+			typed_union_variant("Second", [], 1, Some(102)),
+		]
 	}
 
 
@@ -885,6 +920,46 @@ func test_lowers_resolved_local_direct_call() -> Bool:
 	direct_call_lowers_to_selected_direct_call("add_one", 88, CompilerCallableLocal)
 
 
+func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bool:
+	factory = CompilerTypedNameExpr(ident("field"), expr_info(function_type()))
+	factory_call = CompilerTypedCallExpr(
+		factory,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(
+			function_type(),
+			resolved_call_info(
+				"field",
+				CompilerResolvedDirectCall(199, CompilerCallableLocal),
+			),
+		),
+	)
+	expr = CompilerTypedCallExpr(
+		factory_call,
+		[int_expr("6")],
+		source_span(),
+		expr_info_with_resolved(
+			int_type(),
+			resolved_call_info(
+				"field",
+				CompilerResolvedDirectCall(199, CompilerCallableLocal),
+			),
+		),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(UnknownCall, CallExpr(SelectedDirectCall(def_id), _, _, _, _), args, typ, _)):
+			(
+				def_id == 199
+				and args.length() == 1
+				and core_type_to_json(
+					typ,
+				).to_string() == core_type_to_json(core_int_type()).to_string()
+			)
+		_:
+			False
+
+
 func direct_call_lowers_to_unknown_call(
 	callee_name: String,
 	callable_id: Int,
@@ -914,8 +989,60 @@ func direct_call_lowers_to_unknown_call(
 			False
 
 
-func test_lowers_resolved_imported_direct_call_as_unknown() -> Bool:
-	direct_call_lowers_to_unknown_call("external_add", 92, CompilerCallableImported("math"))
+func test_lowers_resolved_imported_direct_call_with_explicit_identity() -> Bool:
+	callee = CompilerTypedNameExpr(ident("external_add"), expr_info(function_type()))
+	resolved = resolved_call_info(
+		"external_add",
+		CompilerResolvedDirectCall(92, CompilerCallableImported("std/list")),
+	)
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, typ, _)):
+			(
+				def_id == 92
+				and variable.name == "__ufcs_std$list__external_add"
+				and args.length() == 1
+				and core_type_to_json(
+					typ,
+				).to_string() == core_type_to_json(core_int_type()).to_string()
+			)
+		_:
+			False
+
+
+func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool:
+	module_receiver = CompilerTypedNameExpr(
+		ident("StdList"),
+		expr_info(CompilerNamedType("Module", [])),
+	)
+	callee = CompilerTypedFieldAccessExpr(
+		module_receiver,
+		ident("external_add"),
+		source_span(),
+		expr_info(function_type()),
+	)
+	resolved = { resolved_call_info(
+		"StdList.external_add",
+		CompilerResolvedDirectCall(92, CompilerCallableImported("std/list")),
+	) | source_name = "external_add" }
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
+			def_id == 92 and variable.name == "__ufcs_std$list__external_add" and args.length() == 1
+		_:
+			False
 
 
 func test_lowers_resolved_constructor_direct_call_as_unknown() -> Bool:
@@ -924,6 +1051,63 @@ func test_lowers_resolved_constructor_direct_call_as_unknown() -> Bool:
 
 func test_lowers_resolved_impl_method_direct_call() -> Bool:
 	direct_call_lowers_to_selected_direct_call("show_int", 94, CompilerCallableImplMethod)
+
+
+func test_lowers_deferred_trait_method_call_with_dispatch_identity() -> Bool:
+	callee = CompilerTypedNameExpr(ident("to_string"), expr_info(function_type()))
+	resolved = resolved_call_info(
+		"to_string",
+		CompilerResolvedTraitMethodCall("Stringable", None),
+	)
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(compiler_type_string(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(DeferredTraitCall(trait_name, method_name), _, args, typ, _)):
+			(
+				trait_name == "Stringable"
+				and method_name == "to_string"
+				and args.length() == 1
+				and core_type_to_json(
+					typ,
+				).to_string() == core_type_to_json(NamedType("String", [])).to_string()
+			)
+		_:
+			False
+
+
+func test_lowers_selected_trait_method_call_with_dispatch_identity() -> Bool:
+	callee = CompilerTypedNameExpr(ident("display"), expr_info(function_type()))
+	resolved = resolved_call_info(
+		"display",
+		CompilerResolvedTraitMethodCall("Display", Some({
+				callable_id = 94,
+				module_path = "std/display",
+			})),
+	)
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(SelectedTraitCall(trait_name, method_name, module_path, def_id), VarExpr(variable, _, _), args, _, _)):
+			(
+				trait_name == "Display"
+				and method_name == "display"
+				and module_path == "std/display"
+				and def_id == 94
+				and variable.name == "__ufcs_std$display__display"
+				and args.length() == 1
+			)
+		_:
+			False
 
 
 func test_lowers_resolved_foreign_direct_call_as_unknown() -> Bool:
@@ -1574,6 +1758,31 @@ func test_lowers_block_local_var_decl_to_let() -> Bool:
 					),
 				)
 			)
+		_:
+			False
+
+
+func test_lowers_local_annotation_from_semantic_initializer_type() -> Bool:
+	semantic_type = CompilerTypeVar("T")
+	payload: CompilerTypedVarDeclPayload = {
+		name = ident("value"),
+		annotation = Some(CompilerNamedType("T", [])),
+		initializer = CompilerTypedNameExpr(ident("input"), expr_info(semantic_type)),
+		is_mutable = False,
+		span = source_span()
+	}
+	expr = CompilerTypedBlockExpr(
+		[
+			CompilerTypedVarDeclExpr(payload, expr_info(compiler_type_void())),
+			CompilerTypedNameExpr(ident("value"), expr_info(semantic_type)),
+		],
+		source_span(),
+		expr_info(semantic_type),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(_, _, TypeParameterType(bind_name), _, VarExpr(_, TypeParameterType(body_name), _))):
+			bind_name == "T" and body_name == "T"
 		_:
 			False
 
@@ -3485,6 +3694,22 @@ func test_lowers_tuple_type() -> Bool:
 			False
 
 
+func test_lowers_type_parameter_with_explicit_identity() -> Bool:
+	match compiler_core_lower_type(CompilerTypeVar("Accumulator")):
+		Ok(TypeParameterType(name)):
+			name == "Accumulator"
+		_:
+			False
+
+
+func test_lowers_self_type_with_explicit_identity() -> Bool:
+	match compiler_core_lower_type(CompilerSelfType):
+		Ok(SelfType):
+			True
+		_:
+			False
+
+
 func test_lowers_function_decl_preserving_callable_id() -> Bool:
 	info: CompilerTypedFunctionInfo = {
 		decl = parsed_function_decl(),
@@ -3877,6 +4102,36 @@ func test_lowers_union_decl_with_typed_payload_storage() -> Bool:
 			False
 
 
+func test_lowers_generic_union_with_semantic_payload_type() -> Bool:
+	context = compiler_core_lower_context(10, None)
+
+	match lower_typed_decl(context, CompilerTypedUnionDecl(typed_generic_union_info())):
+		Ok(result):
+			match result.decl:
+				UnionDecl(union_info):
+					match union_info.variants:
+						[first, _]:
+							match first.fields:
+								[field]:
+									(
+										union_info.type_params == ["T"]
+										and union_info.payload_storage == ErasedUnionPayloadStorage
+										and core_type_to_json(
+											field.typ,
+										).to_string() == core_type_to_json(
+											TypeParameterType("T"),
+										).to_string()
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_lowers_type_alias_decl() -> Bool:
 	info: CompilerTypedTypeAliasInfo = {
 		decl = parsed_type_alias_decl(),
@@ -3958,6 +4213,7 @@ func test_lowers_impl_decl_and_threads_method_context() -> Bool:
 	info: CompilerTypedImplInfo = {
 		decl = parsed_impl_decl(),
 		for_type = int_type(),
+		type_params = [compiler_make_bound_type_param("T", ["Display"])],
 		methods = [method]
 	}
 
@@ -3976,6 +4232,21 @@ func test_lowers_impl_decl_and_threads_method_context() -> Bool:
 								and core_type_to_json(
 									impl_info.for_type,
 								).to_string() == core_type_to_json(core_int_type()).to_string()
+								and impl_info.type_params.length() == 1
+								and impl_info.type_params.get_or(
+									0,
+									{
+										name = "",
+										bounds = []
+									},
+								).name == "T"
+								and impl_info.type_params.get_or(
+									0,
+									{
+										name = "",
+										bounds = []
+									},
+								).bounds == ["Display"]
 								and impl_info.methods.length() == 1
 								and lowered_method.name == "answer"
 								and lowered_method.def_id == 10
@@ -4198,14 +4469,30 @@ tests: TestSuite = {
 		("lowers binary expression", test_lowers_binary_expression),
 		("lowers resolved local direct call", test_lowers_resolved_local_direct_call),
 		(
-			"lowers resolved imported direct call as unknown",
-			test_lowers_resolved_imported_direct_call_as_unknown,
+			"does not apply inner direct identity to returned function call",
+			test_does_not_apply_inner_direct_identity_to_returned_function_call,
+		),
+		(
+			"lowers resolved imported direct call with explicit identity",
+			test_lowers_resolved_imported_direct_call_with_explicit_identity,
+		),
+		(
+			"lowers qualified imported direct call with explicit identity",
+			test_lowers_qualified_imported_direct_call_with_explicit_identity,
 		),
 		(
 			"lowers resolved constructor direct call as unknown",
 			test_lowers_resolved_constructor_direct_call_as_unknown,
 		),
 		("lowers resolved impl method direct call", test_lowers_resolved_impl_method_direct_call),
+		(
+			"lowers deferred trait method call with dispatch identity",
+			test_lowers_deferred_trait_method_call_with_dispatch_identity,
+		),
+		(
+			"lowers selected trait method call with dispatch identity",
+			test_lowers_selected_trait_method_call_with_dispatch_identity,
+		),
 		(
 			"lowers resolved foreign direct call as unknown",
 			test_lowers_resolved_foreign_direct_call_as_unknown,
@@ -4234,6 +4521,10 @@ tests: TestSuite = {
 		),
 		("lowers block expression to sequence", test_lowers_block_expression_to_sequence),
 		("lowers block local var decl to let", test_lowers_block_local_var_decl_to_let),
+		(
+			"lowers local annotation from semantic initializer type",
+			test_lowers_local_annotation_from_semantic_initializer_type,
+		),
 		("lowers tuple destruct in block", test_lowers_tuple_destruct_in_block),
 		("lowers tuple destruct skipping wildcard", test_lowers_tuple_destruct_skipping_wildcard),
 		(
@@ -4303,6 +4594,11 @@ tests: TestSuite = {
 			test_lowers_call_without_resolved_metadata_as_unknown,
 		),
 		("lowers tuple type", test_lowers_tuple_type),
+		(
+			"lowers type parameter with explicit identity",
+			test_lowers_type_parameter_with_explicit_identity,
+		),
+		("lowers Self type with explicit identity", test_lowers_self_type_with_explicit_identity),
 		("flattens canonical module type name", test_flattens_canonical_module_type_name),
 		(
 			"lowers function decl preserving callable id",
@@ -4329,6 +4625,10 @@ tests: TestSuite = {
 		(
 			"lowers union decl with typed payload storage",
 			test_lowers_union_decl_with_typed_payload_storage,
+		),
+		(
+			"lowers generic union with semantic payload type",
+			test_lowers_generic_union_with_semantic_payload_type,
 		),
 		("lowers type alias decl", test_lowers_type_alias_decl),
 		("lowers trait signatures", test_lowers_trait_signatures),

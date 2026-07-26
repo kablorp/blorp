@@ -14,6 +14,7 @@ import:
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
+		semantic_middle_capability_name,
 	../src/stage_10_backend/compiler_build_artifact:
 		BuildNativeFeature(BuildRaylib, BuildTls),
 		BuildOptimization(BuildFast),
@@ -21,10 +22,12 @@ import:
 	../src/stage_12_cli/compiler_cli: run_cli
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
 	../src/stage_12_cli/compiler_cli_compile_execute:
-		CliCompileExecution(CliCompileArtifact),
+		CliCompileExecution(CliCompileArtifact, CliCompileStopped),
+		CliCompilePreparation(CliCompilePreparationReady),
 		execute_compile_plan,
 		execute_run_plan,
 		graph_native_features,
+		prepare_compile_plan,
 	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
 	../src/stage_12_cli/compiler_cli_plan:
 		CliFrontendGraphSource,
@@ -52,7 +55,7 @@ pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_pre_middle"),
+			JsonString("core_post_mono"),
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
@@ -137,6 +140,17 @@ pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
 
 func write_source(path: String) -> Bool:
 	match write_file(path, "func main(args: List[String]) -> Int:\n\t0\n"):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func write_desugar_source(path: String) -> Bool:
+	match write_file(
+		path,
+		"pure func message() -> String:\n" + "\t\"early\" + \"boundary\"\n\n" + "func main(args: List[String]) -> Int:\n" + "\tprint(message())\n" + "\t0\n",
+	):
 		Ok(_):
 			True
 		Err(_):
@@ -325,6 +339,68 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 				False
 
 
+func test_compile_worker_request_starts_after_blorp_mono() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_post_mono.brp"
+	_ = remove_file(path)
+
+	if not write_desugar_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match prepare_compile_plan(compile_plan):
+					Ok(CliCompilePreparationReady(prepared)):
+						rendered: String = core_program_to_json(prepared.request.core).to_string()
+
+						(
+							rendered.contains("blorp_string_concat")
+							and prepared.request.required_capabilities
+								.map(semantic_middle_capability_name)
+								.contains("core_post_mono")
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_early_stop_does_not_consult_worker_response() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_early_stop.brp"
+	_ = remove_file(path)
+
+	if not write_desugar_source(path):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-core-after=desugar",
+			"--stop-after=desugar",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, JsonObject([])):
+					CliCompileStopped(target_path, stage_name, rendered, observations):
+						(
+							target_path == path
+							and stage_name == "desugar"
+							and rendered.contains("blorp_string_concat")
+							and observations.map(
+								func(observation): observation.stage_name,
+							) == ["desugar"]
+						)
+					_:
+						False
+			_:
+				False
+
+
 func test_run_builds_one_typed_request_and_artifact() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_run.brp"
 	_ = remove_file(path)
@@ -456,6 +532,14 @@ tests: TestSuite = {
 		(
 			"compile builds one typed request and artifact",
 			test_compile_builds_one_typed_request_and_artifact,
+		),
+		(
+			"compile worker request starts after Blorp mono",
+			test_compile_worker_request_starts_after_blorp_mono,
+		),
+		(
+			"early stop does not consult worker response",
+			test_early_stop_does_not_consult_worker_response,
 		),
 		(
 			"run builds one typed request and artifact",

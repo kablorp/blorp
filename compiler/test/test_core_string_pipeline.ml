@@ -306,7 +306,8 @@ func main(args: List[String]) -> Int:
         (Option.value ~default:0 !fusion_string_len_calls > 0)
   | Ok (Blorp.Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_fuses_real_composed_length_call () =
   Blorp.Modules.reset ();
@@ -360,7 +361,8 @@ func main(args: List[String]) -> Int:
         (Option.value ~default:0 !fusion_byte_reads > 0)
   | Ok (Blorp.Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let suite =
   [

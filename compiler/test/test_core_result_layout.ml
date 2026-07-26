@@ -84,8 +84,25 @@ let test_generic_payloads_stay_boxed () =
   let meta = meta () in
   expect_boxed "Result[T, Int]"
     (L.classify meta (result (TyVar "T") (ty "Int" [])));
+  expect_boxed "Result[T: Bound, Int]"
+    (L.classify meta
+       (result
+          (TyBoundVar (make_type_param "T" [ "Bound" ]))
+          (ty "Int" [])));
+  expect_boxed "Result[Self, Int]"
+    (L.classify meta (result TySelf (ty "Int" [])));
   expect_boxed "Result[Int, T]"
     (L.classify meta (result (ty "Int" []) (TyVar "T")))
+
+let test_one_letter_nominal_payload_is_not_generic () =
+  match L.classify (meta ()) (result (ty "T" []) (ty "Int" [])) with
+  | L.Unknown_named "T" -> ()
+  | L.Unknown_named other -> Alcotest.failf "expected T, got %s" other
+  | L.Known _ -> Alcotest.fail "unknown nominal payload must not pick a layout"
+  | L.BoxedUnion _ ->
+      Alcotest.fail "one-letter nominal payload must not be treated as generic"
+  | L.Invalid_result_type msg ->
+      Alcotest.failf "expected unknown payload, got invalid Result type: %s" msg
 
 let test_aliases_are_resolved_before_classification () =
   let aliases =
@@ -143,6 +160,8 @@ let suite =
           `Quick test_release_free_float_payloads_use_erased_stack_layout;
         Alcotest.test_case "generic payloads stay boxed" `Quick
           test_generic_payloads_stay_boxed;
+        Alcotest.test_case "one-letter nominal payload is not generic" `Quick
+          test_one_letter_nominal_payload_is_not_generic;
         Alcotest.test_case "aliases are resolved before classification" `Quick
           test_aliases_are_resolved_before_classification;
       ] );

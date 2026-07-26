@@ -15,7 +15,6 @@ let ty_string = TyNamed ("String", [])
 let ty_bytes = TyNamed ("Bytes", [])
 let ty_ptr = TyNamed ("Ptr", [])
 let ty_var_t = TyVar "T"
-let ty_named_t = TyNamed ("T", [])
 let ty_void = TyNamed ("Void", [])
 let tparams names = List.map (fun name -> make_type_param name []) names
 let ty_list_int = TyNamed ("List", [ ty_int ])
@@ -834,23 +833,14 @@ let test_stale_generic_cbox_rewrites_pointer_inner () =
   | _ ->
       Alcotest.fail "stale generic CBox metadata should use pointer inner type"
 
-let test_named_generic_cbox_waits_for_concrete_inner () =
-  let t = cvar "t" ty_named_t in
-  let boxed = mk (CBox (t, ty_named_t)) ty_ptr in
+let test_generic_cbox_waits_for_concrete_inner () =
+  let t = cvar "t" ty_var_t in
+  let boxed = mk (CBox (t, ty_var_t)) ty_ptr in
   match (specialize boxed).desc with
-  | CBox ({ desc = CVar v; _ }, TyNamed ("T", [])) when v.vname = "t" -> ()
+  | CBox ({ desc = CVar v; _ }, TyVar "T") when v.vname = "t" -> ()
   | _ ->
       Alcotest.fail
-        "unresolved named generic CBox should not become a borrowed cast"
-
-let test_named_generic_cbox_rewrites_pointer_inner () =
-  let s = cvar "s" ty_string in
-  let boxed = mk (CBox (s, ty_named_t)) ty_ptr in
-  match (specialize boxed).desc with
-  | CCast ({ desc = CVar v; _ }, TyNamed ("Ptr", [])) when v.vname = "s" -> ()
-  | _ ->
-      Alcotest.fail
-        "named generic CBox metadata should use concrete pointer inner type"
+        "unresolved generic CBox should not become a borrowed cast"
 
 let test_tensor_peel_nonconstant_dims_raise_core_error () =
   let coll =
@@ -1133,10 +1123,8 @@ let suite =
           test_stale_generic_cbox_uses_inner_type;
         Alcotest.test_case "stale_generic_cbox_rewrites_pointer_inner" `Quick
           test_stale_generic_cbox_rewrites_pointer_inner;
-        Alcotest.test_case "named_generic_cbox_waits_for_concrete_inner" `Quick
-          test_named_generic_cbox_waits_for_concrete_inner;
-        Alcotest.test_case "named_generic_cbox_rewrites_pointer_inner" `Quick
-          test_named_generic_cbox_rewrites_pointer_inner;
+        Alcotest.test_case "generic_cbox_waits_for_concrete_inner" `Quick
+          test_generic_cbox_waits_for_concrete_inner;
         Alcotest.test_case "tensor_peel_nonconstant_dims_raise_core_error"
           `Quick test_tensor_peel_nonconstant_dims_raise_core_error;
         Alcotest.test_case "tensor_peel_raw_call_keeps_pointer_type" `Quick

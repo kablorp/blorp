@@ -18,6 +18,7 @@
     - [check_no_ckunknown] — ENABLED (post-specialize and final)
     - [check_no_debug_blocks] — ENABLED (post-debug and final)
     - [check_no_tyvar_leak] — ENABLED (post-mono)
+    - [check_selected_direct_mono_contract] — ENABLED (post-mono)
     - [check_no_sugar] — ENABLED (post-desugar, bookended at Perceus and Final)
     - [check_no_desugarable_mutation] — ENABLED (post-desugar)
     - [check_no_cmatcharms] — ENABLED (post-match, bookended at Perceus and Final)
@@ -334,12 +335,10 @@ let type_contains_resource_named ~reg ~resource_names ~aggregate_components ty =
   let apply_named_subst type_params args tys =
     let subst =
       if List.length type_params = List.length args then
-        List.map2
-          (fun var_name concrete_type -> { Types.var_name; concrete_type })
-          type_params args
+        List.combine type_params args
       else []
     in
-    List.map (Types.apply_subst subst) tys
+    List.map (Types.apply_type_param_subst subst) tys
   in
   let component_types name args =
     match StringMap.find_opt name aggregate_components with
@@ -779,6 +778,80 @@ let check_no_tyvar_leak (prog : Core.core_program) : Core_error.t list =
       | _ -> acc)
     [] prog
   |> List.rev
+
+(** [CKSelectedDirect] is the pre-resolution identity for a direct source
+    function call. After mono, a closed function may only select another
+    closed function, and the callee must still be a direct variable reference.
+    Definition IDs can collide across modules at this boundary, so generic
+    target checks use the same lossless callable-name matching as Core_mono.
+    Generic templates remain in the program as specialization sources, so
+    calls inside those templates are intentionally outside this check. *)
+let check_selected_direct_mono_contract (prog : Core.core_program) :
+    Core_error.t list =
+  let rec collect_decl generic_functions (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc fn when fn.cf_type_params <> [] ->
+        fn :: generic_functions
+    | Core.CDImpl impl ->
+        List.fold_left
+          (fun functions fn ->
+            if fn.Core.cf_type_params = [] then functions
+            else fn :: functions)
+          generic_functions impl.ci_methods
+    | Core.CDPrivate inner -> collect_decl generic_functions inner
+    | _ -> generic_functions
+  in
+  let generic_functions = List.fold_left collect_decl [] prog in
+  let selected_call_targets_generic def_id callee_name =
+    List.exists
+      (fun (func : Core.core_func) ->
+        func.cf_def_id = def_id
+        && Core_callable_identity.selected_callee_matches_function ~callee_name
+             func)
+      generic_functions
+  in
+  let check_expr acc (expr : Core.core) =
+    match expr.desc with
+    | Core.CCall (Core.CKSelectedDirect def_id, callee, _) -> (
+        match callee.desc with
+        | Core.CVar var
+          when selected_call_targets_generic def_id var.vname ->
+            violation_at Core_stage.Mono expr.loc
+              ~hint:
+                "Core_mono must rewrite calls from closed functions to a \
+                 concrete specialization before the post-mono handoff."
+              "selected-direct call from closed code still targets a generic \
+               function"
+            :: acc
+        | Core.CVar _ -> acc
+        | _ ->
+            violation_at Core_stage.Mono expr.loc
+              ~hint:
+                "Only a direct variable callee may carry CKSelectedDirect; a \
+                 call through a returned function or another expression must \
+                 remain CKUnknown until call resolution classifies it."
+              "selected-direct call has a non-variable callee"
+            :: acc)
+    | _ -> acc
+  in
+  let check_func acc (fn : Core.core_func) =
+    if fn.cf_type_params <> [] then acc
+    else
+      match fn.cf_body with
+      | Some body -> Core.fold_tree check_expr acc body
+      | None -> acc
+  in
+  let rec check_decl acc (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc fn -> check_func acc fn
+    | Core.CDVar var -> Core.fold_tree check_expr acc var.cv_init
+    | Core.CDImpl impl -> List.fold_left check_func acc impl.ci_methods
+    | Core.CDPrivate inner -> check_decl acc inner
+    | Core.CDTrait _ | Core.CDType _ | Core.CDRecord _ | Core.CDImport _
+    | Core.CDTypeAlias _ ->
+        acc
+  in
+  List.fold_left check_decl [] prog |> List.rev
 
 (* ============================================================================
    Post-debug: no debug blocks survive
@@ -1743,7 +1816,8 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_no_layoutless_list_alloc_at stage prog
       @ check_raw_tensor_views_at stage prog
   | Core_stage.Debug -> check_no_debug_blocks_at stage prog
-  | Core_stage.Mono -> check_no_tyvar_leak prog
+  | Core_stage.Mono ->
+      check_no_tyvar_leak prog @ check_selected_direct_mono_contract prog
   (* Sugar and CMatchArms checks run at the pass that should have
      eliminated them AND at Perceus (one stage before emit) as a
      bookend: "eliminated here, still gone there." Catches any

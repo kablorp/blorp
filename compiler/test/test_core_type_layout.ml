@@ -337,12 +337,16 @@ let test_alias_inherits_boxed_storage_release_capability () =
     (ty "VecAlias" [])
 
 let test_unknown_named_type_remains_invalid_layout () =
-  match Blorp.Core_type_layout.classify (meta ()) (ty "Mystery" []) with
-  | Unknown_named "Mystery" -> ()
-  | Known _ -> Alcotest.fail "expected Mystery to be unknown"
-  | Unknown_named other -> Alcotest.failf "expected Mystery, got %s" other
-  | Invalid_value_type msg ->
-      Alcotest.failf "expected unknown type, got invalid: %s" msg
+  let expect_unknown name =
+    match Blorp.Core_type_layout.classify (meta ()) (ty name []) with
+    | Unknown_named actual when String.equal actual name -> ()
+    | Known _ -> Alcotest.failf "expected %s to be unknown" name
+    | Unknown_named other -> Alcotest.failf "expected %s, got %s" name other
+    | Invalid_value_type msg ->
+        Alcotest.failf "expected unknown type, got invalid: %s" msg
+  in
+  expect_unknown "Mystery";
+  expect_unknown "T"
 
 let test_erased_storage_box_kind_is_centralized () =
   let reg = Blorp.Codegen_types.create_registry () in
