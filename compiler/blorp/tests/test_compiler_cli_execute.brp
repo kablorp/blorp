@@ -1,6 +1,6 @@
 import:
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(UserCall),
+		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
 		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
 		CoreFunctionKind(UserFunction),
@@ -11,6 +11,7 @@ import:
 		CoreType(NamedType),
 		CoreVar,
 		core_program_to_json,
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
@@ -28,6 +29,8 @@ import:
 		execute_run_plan,
 		graph_native_features,
 		prepare_compile_plan,
+		prepare_compile_plan_with_frontend_policy,
+	../src/stage_12_cli/compiler_cli_compile_frontend: CliFrontendCompilePolicy
 	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
 	../src/stage_12_cli/compiler_cli_plan:
 		CliFrontendGraphSource,
@@ -36,6 +39,7 @@ import:
 		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule, CliFrontendUserModule),
 		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
 	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
+	io: print_error
 	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
 	system: remove_file, temp_dir, write_file
 	test: TestSuite
@@ -155,6 +159,83 @@ func write_desugar_source(path: String) -> Bool:
 			True
 		Err(_):
 			False
+
+
+func write_debug_policy_source(path: String) -> Bool:
+	source: String =
+		|@debug_only
+		|pure func inspect() -> Int:
+		|	7
+		|
+		|pure func debug_policy_marker() -> Void:
+		|	void
+		|
+		|func main(args: List[String]) -> Int:
+		|	value: Int = inspect()
+		|	debug:
+		|		debug_policy_marker()
+		|	value
+
+	match write_file(path, source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func call_targets_def_id(expr: CoreExpr, target_def_id: Int) -> Bool:
+	direct_call: Bool = match expr:
+		CallExpr(SelectedDirectCall(def_id), _, _, _, _):
+			def_id == target_def_id
+		CallExpr(UserCall(_, Some(def_id), _), _, _, _, _):
+			def_id == target_def_id
+		_:
+			False
+
+	(
+		direct_call
+		or immediate_core_expr_children(
+			expr,
+		).any(
+			func(child): call_targets_def_id(child, target_def_id),
+		)
+	)
+
+
+private pure func function_def_id(program: CoreProgram, name: String) -> Option[Int]:
+	program.decls
+		.filter_map(func(decl):
+			match decl:
+				FunctionDecl(function_info):
+					if function_info.name == name:
+						Some(function_info.def_id)
+					else:
+						None
+				_:
+					None
+		)
+		.get(0)
+
+
+private pure func main_calls_def_id(program: CoreProgram, target_def_id: Int) -> Bool:
+	program.decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				(
+					function_info.name == "main"
+					and function_info.body
+						.map(func(body): call_targets_def_id(body, target_def_id))
+						.get_or(False)
+				)
+			_:
+				False
+	)
+
+
+private pure func main_calls_debug_policy_marker(program: CoreProgram) -> Bool:
+	function_def_id(program, "debug_policy_marker")
+		.map(func(def_id): main_calls_def_id(program, def_id))
+		.get_or(False)
 
 
 func test_check_executes_without_host_plan() -> Bool:
@@ -367,6 +448,42 @@ func test_compile_worker_request_starts_after_blorp_synth() -> Bool:
 				False
 
 
+func test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_debug_policy.brp"
+	_ = remove_file(path)
+
+	if not write_debug_policy_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: CliFrontendCompilePolicy = {
+					allow_debug_only_calls = True,
+					retain_debug_blocks = False
+				}
+
+				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
+					Ok(CliCompilePreparationReady(prepared)):
+						if main_calls_debug_policy_marker(prepared.request.core):
+							print_error("debug-policy marker call survived debug-block erasure")
+							False
+						else:
+							True
+					Err(errors):
+						print_error(
+							"policy-aware compile preparation failed:\n" + errors.join("\n"),
+						)
+						False
+					Ok(_):
+						print_error("policy-aware compile preparation stopped unexpectedly")
+						False
+			_:
+				False
+
+
 func test_early_stop_does_not_consult_worker_response() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_early_stop.brp"
 	_ = remove_file(path)
@@ -536,6 +653,10 @@ tests: TestSuite = {
 		(
 			"compile worker request starts after Blorp synthesis",
 			test_compile_worker_request_starts_after_blorp_synth,
+		),
+		(
+			"compile frontend policy allows debug calls while erasing debug blocks",
+			test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks,
 		),
 		(
 			"early stop does not consult worker response",

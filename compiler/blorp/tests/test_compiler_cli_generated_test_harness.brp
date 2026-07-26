@@ -1,6 +1,11 @@
 import:
+	../src/stage_09_core/compiler_semantic_worker_protocol: semantic_middle_capability_name
 	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck), CliCompileArgs
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_compile_execute:
+		CliCompilePreparation(CliCompilePreparationReady),
+		prepare_compile_plan_with_frontend_policy,
+	../src/stage_12_cli/compiler_cli_compile_frontend: CliFrontendCompilePolicy
 	../src/stage_12_cli/compiler_cli_generated_test_harness:
 		GeneratedTestSuiteTarget,
 		generate_suite_run_all_module,
@@ -19,7 +24,6 @@ import:
 		frontend_module_graph_with_generated_root,
 		parse_cli_sources,
 		read_cli_sources_for_action,
-	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
 	path: normalize
 	system: file_exists, getcwd, mkdir, now_microseconds, remove_dir, remove_file, write_file
 	test: TestSuite, run_suite
@@ -314,18 +318,45 @@ private func test_generated_root_extends_existing_graph_without_reparsing_module
 						extended,
 						[first_path, second_path],
 					).contains("\"origin\":{\"kind\":\"generated\"}")
-					var typecheck_errors: List[String] = []
 
-					for root_source in extended.roots:
-						typecheck_errors = typecheck_errors.concat(
-							typechecked_graph_errors(
-								typecheck_frontend_root(
-									extended,
-									root_source,
-									False,
-								),
-							),
-						)
+					frontend_policy: CliFrontendCompilePolicy = {
+						allow_debug_only_calls = True,
+						retain_debug_blocks = True
+					}
+
+					generated_preparation = prepare_compile_plan_with_frontend_policy(
+						{
+							args = [generated.source.path],
+							options = compile_options([generated.source.path]),
+							graph = extended
+						},
+						frontend_policy,
+					)
+
+					generated_compile_errors: List[String] = match generated_preparation:
+						Err(errors):
+							errors
+						Ok(_):
+							[]
+
+					generated_compile_ready: Bool = match generated_preparation:
+						Ok(CliCompilePreparationReady(prepared)):
+							capabilities: List[String] = prepared.request.required_capabilities.map(
+								semantic_middle_capability_name,
+							)
+
+							(
+								prepared.request.target_path == generated.source.path
+								and prepared.request.target_module_name == generated.source.module_name
+								and prepared.request.require_main
+								and capabilities == [
+									"core_post_synth",
+									"core_pre_dce",
+									"rendered_stage_observations",
+								]
+							)
+						_:
+							False
 
 					collisions_rejected: Bool = match graph.roots:
 						[template, ..._]:
@@ -397,9 +428,15 @@ private func test_generated_root_extends_existing_graph_without_reparsing_module
 						test_failure("generated import did not bind to the retained graph identity")
 					else if not serialized_origin:
 						test_failure("generated origin did not cross the JSON bridge boundary")
-					else if typecheck_errors.length() != 0:
+					else if generated_compile_errors.length() != 0:
 						test_failure(
-							"generated graph failed typecheck:\n" + typecheck_errors.join("\n"),
+							"generated graph failed compile preparation:\n" + generated_compile_errors.join(
+								"\n",
+							),
+						)
+					else if not generated_compile_ready:
+						test_failure(
+							"generated graph did not reach the post-synthesis compile boundary",
 						)
 					else if not collisions_rejected:
 						test_failure("generated root identity collision was not rejected")

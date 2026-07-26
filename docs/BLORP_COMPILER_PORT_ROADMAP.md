@@ -1796,6 +1796,13 @@ Current status:
   source policy. The remaining TestRunner migration is orchestration ownership,
   not parser/typechecker parity, and must preserve doctest location remapping,
   process cleanup, and filesystem-isolation behavior.
+- The Blorp-owned generated selector/run-all graph can now be retained after
+  its source files are removed and prepared through the production early Core
+  pipeline to the post-synthesis worker request. Its compile policy represents
+  permission to call debug-only test helpers separately from retention of
+  `debug:` blocks. Production TestRunner routing has not switched yet; the next
+  slice must consume this retained graph rather than adding a test-only parser
+  bridge or serializing generated source back through OCaml.
 
 Typed frontier closure before CTFE:
 
