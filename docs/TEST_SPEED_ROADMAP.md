@@ -566,10 +566,15 @@ erased independently. Test command planning now retains typed execution or
 warmup variants inside Blorp and serializes options only at the temporary OCaml
 host boundary. Blorp-owned discovery now derives `main`, `tests`-binding, and
 doctest facts from parsed declarations and parsed docs rather than source
-substrings. The `tests` binding remains a candidate until type resolution proves
+substrings. It also walks requested files and directories deterministically,
+skips compiler fixture directories during recursive discovery, parses each
+candidate once, retains its `ParsedProgram`, preserves malformed-source
+diagnostics, and assigns typed process/filesystem isolation policy from explicit
+suite roots. The `tests` binding remains a candidate until type resolution proves
 its TestSuite identity. Production `Test_runner` routing remains on the OCaml
-constructors until filesystem discovery and one harness execution path consume
-these facts and the retained graph without rebuilding the frontend.
+constructors until resolved test identity and one harness execution path consume
+these discovered programs and the retained graph without rebuilding the
+frontend.
 
 **Target architecture:**
 

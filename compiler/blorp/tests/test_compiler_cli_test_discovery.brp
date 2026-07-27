@@ -1,9 +1,27 @@
 import:
 	../src/stage_01_file_io/compiler_source: compiler_source_file
-	../src/stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../src/stage_03_parse/compiler_parsed_ast: ParsedProgram, parsed_program_has_errors
 	../src/stage_03_parse/compiler_parser: parse_compiler_source
-	../src/stage_12_cli/compiler_cli_test_discovery: CliTestSourceFeatures, classify_test_source
+	../src/stage_12_cli/compiler_cli_test_discovery:
+		CliTestExecutionIsolation(
+			CliFreshTestFilesystem,
+			CliFreshTestProcess,
+			CliSharedTestProcess,
+		),
+		CliTestSourceFeatures,
+		classify_test_source,
+		discover_test_sources,
+		test_execution_isolation,
+	fs:
+		IOError(NotFound),
+		create_directories,
+		message,
+		resource_path,
+		temporary_directory,
+		write_text_atomic,
 	io: print_error
+	path: join
+	system: temp_dir
 	test: TestSuite
 
 
@@ -78,6 +96,171 @@ func test_classification_reads_private_declarations_and_parsed_docs() -> Bool:
 	expect_features("private and docs", program, features, False, True, True)
 
 
+private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
+	with root ?= temporary_directory(temp_dir(), "blorp_test_discovery_"):
+		root_path: String = root.resource_path()
+		nested: String = root_path.join("nested")
+		skipped: String = root_path.join("should_fail")
+		leak_baselines: String = root_path.join("tests/test_blorp/memory/leak_check_baselines")
+		created_nested ?= create_directories(nested)
+		created_skipped ?= create_directories(skipped)
+		created_leak_baselines ?= create_directories(leak_baselines)
+
+		test_suite_type: String = "Test" + "Suite"
+		suite_source: String = "tests:" + " " + test_suite_type + " = {\n\tdescription = \"suite\",\n\ttests = []\n}\n"
+		doctest_source: String =
+			|---
+			|Example.
+			|
+			|doctests:
+			|	:: true
+			|	True
+			|---
+			|pure func example() -> Bool:
+			|	True
+		ignored_source: String = "tests:" + " " + test_suite_type + " = {\n\tdescription = \"ignored\",\n\ttests = []\n}\n"
+
+		wrote_suite ?= write_text_atomic(
+			root_path.join("a.brp"),
+			suite_source,
+		)
+		wrote_broken ?= write_text_atomic(
+			root_path.join("broken.brp"),
+			"pure func broken(",
+		)
+		wrote_helper ?= write_text_atomic(
+			root_path.join("helper.brp"),
+			"pure func helper() -> Int: 1\n",
+		)
+		wrote_doctest ?= write_text_atomic(
+			nested.join("b.brp"),
+			doctest_source,
+		)
+		wrote_ignored ?= write_text_atomic(
+			skipped.join("ignored.brp"),
+			ignored_source,
+		)
+		wrote_text ?= write_text_atomic(
+			root_path.join("notes.txt"),
+			suite_source,
+		)
+		leak_baseline_path: String = leak_baselines.join("standalone.brp")
+		wrote_leak_baseline ?= write_text_atomic(
+			leak_baseline_path,
+			"func main(args: List[String]) -> Int:\n\t0\n",
+		)
+
+		discovered ?= discover_test_sources(
+			[root_path, root_path.join("a.brp")],
+			root_path,
+			False,
+		)
+		explicit_skipped ?= discover_test_sources([skipped.join("ignored.brp")], root_path, False)
+		explicit_non_blorp ?= discover_test_sources([root_path.join("notes.txt")], root_path, False)
+		with_leak_baseline ?= discover_test_sources([root_path], root_path, True)
+		paths: List[String] = discovered.map(func(source): source.program.source.path)
+		suite_found: Bool = discovered.any(func(source):
+			(
+				source.program.source.path == root_path.join("a.brp")
+				and source.features.has_tests_binding
+				and source.program.source.text == suite_source
+			)
+		)
+		doctest_found: Bool = discovered.any(func(source):
+			source.program.source.path == nested.join("b.brp") and source.features.has_doctests
+		)
+		broken_found: Bool = discovered.any(func(source):
+			(
+				source.program.source.path == root_path.join("broken.brp")
+				and parsed_program_has_errors(source.program)
+				and not source.features.has_tests_binding
+			)
+		)
+		leak_baseline_found: Bool = with_leak_baseline.any(func(source):
+			if source.program.source.path == leak_baseline_path:
+				source.is_leak_baseline_program and match source.isolation:
+					CliFreshTestFilesystem(isolated_root):
+						isolated_root == "tests/test_blorp/memory"
+					_:
+						False
+			else:
+				False
+		)
+		missing_path: String = root_path.join("missing.brp")
+
+		missing_rejected: Bool = match discover_test_sources([missing_path], root_path, False):
+			Err(NotFound(path)):
+				path == missing_path
+			_:
+				False
+
+		Ok(
+			(
+				paths == [
+					root_path.join("a.brp"),
+					root_path.join("broken.brp"),
+					nested.join("b.brp"),
+				]
+				and suite_found
+				and doctest_found
+				and broken_found
+				and explicit_skipped.length() == 1
+				and explicit_non_blorp.length() == 0
+				and leak_baseline_found
+				and missing_rejected
+			),
+		)
+
+
+func test_filesystem_discovery_is_structural_and_deterministic() -> Bool:
+	match exercise_filesystem_discovery():
+		Ok(result):
+			result
+		Err(err):
+			print_error("filesystem discovery failed: " + message(err))
+			False
+
+
+pure func test_execution_isolation_uses_explicit_roots() -> Bool:
+	memory: Bool = match test_execution_isolation(
+		"/workspace/tests/test_blorp/memory/example.brp",
+		"/workspace",
+	):
+		CliFreshTestFilesystem(root):
+			root == "tests/test_blorp/memory"
+		_:
+			False
+
+	concurrency: Bool = match test_execution_isolation(
+		"/workspace/tests/test_blorp/concurrency/example.brp",
+		"/workspace",
+	):
+		CliFreshTestProcess(root):
+			root == "tests/test_blorp/concurrency"
+		_:
+			False
+
+	shared: Bool = match test_execution_isolation(
+		"/workspace/tests/test_blorp/types/example.brp",
+		"/workspace",
+	):
+		CliSharedTestProcess:
+			True
+		_:
+			False
+
+	root_boundary: Bool = match test_execution_isolation(
+		"/workspace/tests/test_blorp/memory_extra/example.brp",
+		"/workspace",
+	):
+		CliSharedTestProcess:
+			True
+		_:
+			False
+
+	memory and concurrency and shared and root_boundary
+
+
 tests: TestSuite = {
 	description = "Blorp CLI test discovery",
 	tests = [
@@ -97,5 +280,10 @@ tests: TestSuite = {
 			"classification reads private declarations and parsed docs",
 			test_classification_reads_private_declarations_and_parsed_docs,
 		),
+		(
+			"filesystem discovery is structural and deterministic",
+			test_filesystem_discovery_is_structural_and_deterministic,
+		),
+		("execution isolation uses explicit roots", test_execution_isolation_uses_explicit_roots),
 	]
 }

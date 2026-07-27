@@ -1810,8 +1810,12 @@ Current status:
 - Blorp test discovery now classifies parsed declarations and docs for `main`,
   a candidate `tests` binding, and doctests. Resolved TestSuite identity belongs
   after module loading/type resolution; it is not guessed from a raw type name.
-  Filesystem discovery and execution still need to consume these facts before
-  the OCaml substring classifiers can be deleted.
+  Deterministic filesystem discovery now reads each candidate once, retains its
+  parsed program, preserves parse failures for diagnostics, skips compiler
+  fixture directories during recursive walks, and represents execution
+  isolation as a typed policy. Production test execution still needs to resolve
+  candidate bindings and consume these discovered programs before the OCaml
+  substring classifiers can be deleted.
 
 Typed frontier closure before CTFE:
 
