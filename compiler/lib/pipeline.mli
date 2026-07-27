@@ -151,28 +151,6 @@ val compile_legacy_direct_source :
     commands prepare Core entirely in Blorp and call the semantic-middle worker
     directly. Keep new source-command work off this entrypoint. *)
 
-val compile_preloaded_graph_with_blorp_bridge :
-  ?debug:bool ->
-  ?allow_debug_only_calls:bool ->
-  ?retain_debug_blocks:bool ->
-  ?embed_runtime:bool ->
-  ?require_main:bool ->
-  ?profile:bool ->
-  ?on_frontend_phase:(frontend_phase -> unit) ->
-  ?on_stage:Core_pipeline.on_stage_callback ->
-  ?on_stage_event:Core_pipeline.on_stage_event ->
-  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
-  ?tail_observation_stages:Core_stage.t list ->
-  ?check_invariants:bool ->
-  ?on_phase_timing:(phase_timing -> unit) ->
-  filename:string ->
-  preloaded_module_graph:Modules.preloaded_module_graph ->
-  unit ->
-  (compile_outcome, Ast.compiler_error list) result
-(** Compatibility compilation through a Blorp frontend graph followed by
-    OCaml typed-AST lowering. The pinned-bootstrap wrapper and selected
-    in-memory tests still use this path; normal CLI source commands do not. *)
-
 val compile_in_memory_source_with_blorp_bridge :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->
@@ -185,7 +163,9 @@ val compile_in_memory_source_with_blorp_bridge :
   (compile_outcome, Ast.compiler_error list) result
 (** Compile supplied user source through the Blorp-owned source and typecheck
     frontier. [filename] provides module/import identity, but the frontend uses
-    [source] even when the file does not exist or has different contents. *)
+    [source] even when the file does not exist or has different contents.
+    This is a compatibility entrypoint for the OCaml test runner; normal source
+    commands compile through the contiguous Blorp pipeline. *)
 
 val compile_generated_test_harness :
   ?debug:bool ->
@@ -199,4 +179,6 @@ val compile_generated_test_harness :
   (compile_outcome, Ast.compiler_error list) result
 (** Compile compiler-generated test scaffolding through the Blorp-owned source
     and typecheck frontier. The harness is not a user source file, so its
-    synthetic imports are not subject to unused-import diagnostics. *)
+    synthetic imports are not subject to unused-import diagnostics. This
+    compatibility entrypoint remains until generated TestSuite harness
+    compilation moves into the Blorp-owned test command. *)

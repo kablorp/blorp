@@ -68,13 +68,22 @@ general host delegation is for commands not yet migrated (`test`, `purify`,
 
 Bootstrapping is now a separate immutable artifact boundary. Release archives
 carry `blorp-bootstrap-compiler`, inherited from the verified pinned toolchain,
-and the build invokes only that artifact's fixed
+plus bootstrap-specific host, parser, typecheck, and renderer executables. The
+launcher selects those helpers explicitly, so the immutable host cannot consume
+the new release's bridge protocols merely because both generations share an
+installation directory. A `blorp-bootstrap-layout` manifest represents this
+bundle explicitly; the tooling does not infer compatibility from neighboring
+filenames. Installed bundles use content-addressed generation directories and
+an atomically replaced active-generation pointer, preventing interrupted or
+concurrent upgrades from mixing their members. The build invokes only that
+artifact's fixed
 `__compiler-host-compile-wrapper` command. The current
 `compiler/bin/blorp_ocaml_host.ml` no longer implements that command or links
-its argument parser. Toolchains published before the dedicated artifact name
-are accepted temporarily by resolving their immutable `blorp-ocaml-host`
-binary as the bootstrap compiler. That name fallback can be deleted after the
-first release containing `blorp-bootstrap-compiler` is pinned.
+its argument parser. Toolchains published before the isolated bundle are
+accepted temporarily by resolving their immutable `blorp-ocaml-host` and
+packaging it with that release's matching helpers. That fallback can be deleted
+after the first release containing the complete, verified isolated bundle is
+pinned on every supported target.
 
 The desired change is not to move the existing CLI-plan protocol into another
 file. The CLI plan must become an internal Blorp value. Only the semantic input
@@ -328,8 +337,9 @@ Deletion completed during Checkpoint J:
   tests.
 
 Compile graph decoding remains in current source only for the in-memory
-test-runner and REPL compatibility routes. The immutable bootstrap compiler
-contains its own already-compiled graph decoder.
+test-runner compatibility route. The REPL separately uses the legacy
+direct-source pipeline. The immutable bootstrap compiler contains its own
+already-compiled graph decoder.
 
 Implemented evidence on 2026-07-13:
 
@@ -830,11 +840,12 @@ without making the migration change depend on its own release.
 
 Status: source-side separation is complete. `compiler/bootstrap.env` is the
 single checked-in release identity consumed by the resolver and CI cache keys.
-Release archives now preserve a dedicated `blorp-bootstrap-compiler`, while
-the resolver supports the old `blorp-ocaml-host` artifact name only for the
-currently pinned immutable toolchain. The pin intentionally remains unchanged
-until release CI publishes and verifies all three target artifacts; rotation
-and removal of the old-name fallback remain separate commits.
+Release archives now preserve a dedicated `blorp-bootstrap-compiler` and its
+matching bootstrap-specific helper generation, while the resolver supports the
+old `blorp-ocaml-host` artifact name only for the currently pinned immutable
+toolchain. The pin intentionally remains unchanged until release CI publishes
+and verifies all three target artifacts; rotation and removal of the old-name
+fallback remain separate commits.
 
 Implementation:
 

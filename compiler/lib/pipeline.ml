@@ -150,8 +150,8 @@ let missing_main_error ~filename =
 
     This is the legacy compatibility path for direct source/tooling entry
     points that do not yet have a Blorp-discovered import closure. Normal CLI
-    compile/check/run paths should pass a [preloaded_module_graph] and use the
-    single frontend graph handoff instead. *)
+    compile/check/run paths prepare the source graph and lowered Core entirely
+    in Blorp and do not call this helper. *)
 let load_modules_after_parse_with_legacy_imports ?on_frontend_phase ?surface
     ~filename program =
   let record phase =
@@ -1065,17 +1065,6 @@ let compile_preloaded_graph_impl ~source_kind ?(debug = false)
             ~program:result.blorp_bridge_source_program
             ~typed_program:result.blorp_bridge_typed_program
             ~main_import_bindings:result.blorp_bridge_import_bindings ())
-
-let compile_preloaded_graph_with_blorp_bridge ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
-    ~preloaded_module_graph () =
-  compile_preloaded_graph_impl ~source_kind:User_source ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ?require_main
-    ?profile ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
-    ~preloaded_module_graph ()
 
 let compile_legacy_direct_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile

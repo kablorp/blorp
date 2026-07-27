@@ -136,7 +136,7 @@ benchmarks/compiler_typecheck_profile 2 2 64 128
 The positional controls are iterations, module count, nested type depth, and
 typed probes per module. The default `1 1 64 128` workload is intended for fast
 local comparisons. The runner builds the profiled executable through the
-compiler host's canonical preloaded graph and caches it by compiler, benchmark,
+public production compiler and caches it by compiler, benchmark,
 standard-library, runner, bootstrap/helper, platform, and C-toolchain content.
 The first run for a new key performs the full instrumented build; subsequent
 runs execute the cached binary directly. Benchmark stdout contains one

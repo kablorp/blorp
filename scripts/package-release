@@ -7,6 +7,9 @@ out_dir="${1:-dist}"
 binary="${BLORP_RELEASE_BINARY:-./blorp}"
 binary_dir=$(dirname "$binary")
 bootstrap_compiler="${BLORP_RELEASE_BOOTSTRAP_COMPILER:-}"
+bootstrap_toolchain_dir="${BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR:-}"
+bootstrap_layout_name="blorp-bootstrap-layout"
+bootstrap_layout_version="isolated-v1"
 ocaml_host="${BLORP_RELEASE_OCAML_HOST:-$binary_dir/blorp-ocaml-host}"
 ocaml_middle="${BLORP_RELEASE_OCAML_MIDDLE:-$binary_dir/blorp-ocaml-middle}"
 renderer_bridge="${BLORP_RELEASE_RENDERER_BRIDGE:-}"
@@ -36,15 +39,80 @@ if [ ! -x "$binary" ]; then
 fi
 if [ -z "$bootstrap_compiler" ]; then
     packaged_bootstrap_compiler="$binary_dir/blorp-bootstrap-compiler"
-    if [ -x "$packaged_bootstrap_compiler" ]; then
+    installed_bootstrap_store="$binary_dir/.blorp-bootstrap"
+    installed_bootstrap_generation=""
+    if [ -f "$installed_bootstrap_store/active" ]; then
+        installed_bootstrap_generation=$(
+            cat "$installed_bootstrap_store/active"
+        )
+    fi
+    installed_bootstrap_dir="$installed_bootstrap_store/$installed_bootstrap_generation"
+    installed_bootstrap_compiler="$installed_bootstrap_dir/blorp-bootstrap-compiler"
+    if [ -x "$packaged_bootstrap_compiler" ] &&
+        [ -x "$installed_bootstrap_compiler" ]
+    then
+        bootstrap_toolchain_dir=$(cd "$installed_bootstrap_dir" && pwd -P)
+        bootstrap_compiler="$bootstrap_toolchain_dir/blorp-bootstrap-compiler"
+    elif [ -x "$packaged_bootstrap_compiler" ]; then
         bootstrap_compiler="$packaged_bootstrap_compiler"
+        if [ -z "$bootstrap_toolchain_dir" ]; then
+            bootstrap_toolchain_dir="$binary_dir"
+        fi
     else
         bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
+        if [ -z "$bootstrap_toolchain_dir" ]; then
+            bootstrap_toolchain_dir=$(
+                scripts/blorp-compiler-bootstrap --print-toolchain-dir
+            )
+        fi
     fi
 fi
 if [ ! -x "$bootstrap_compiler" ]; then
     echo "Release bootstrap compiler not found or not executable: $bootstrap_compiler" >&2
     exit 1
+fi
+if [ -z "$bootstrap_toolchain_dir" ]; then
+    bootstrap_toolchain_dir=$(dirname "$bootstrap_compiler")
+fi
+
+# Legacy bootstrap hosts discover generic sibling bridge names automatically.
+# Keep their matching generation under bootstrap-specific names so packaging a
+# newly built bridge set cannot silently change the immutable compiler.
+bootstrap_bundle_mode=legacy
+if [ "$(basename "$bootstrap_compiler")" = "blorp-bootstrap-compiler" ]; then
+    bootstrap_bundle_mode=dedicated
+    bootstrap_layout_path="$bootstrap_toolchain_dir/$bootstrap_layout_name"
+    if [ ! -f "$bootstrap_layout_path" ] ||
+        [ "$(cat "$bootstrap_layout_path")" != "$bootstrap_layout_version" ]
+    then
+        echo "Release bootstrap bundle has no supported $bootstrap_layout_name manifest." >&2
+        echo "A standalone dedicated compiler cannot prove which bridge generation it requires." >&2
+        exit 1
+    fi
+    for bootstrap_helper in \
+        blorp-bootstrap-host \
+        blorp-bootstrap-renderer \
+        blorp-bootstrap-parser \
+        blorp-bootstrap-typecheck
+    do
+        bootstrap_helper_path="$bootstrap_toolchain_dir/$bootstrap_helper"
+        if [ ! -x "$bootstrap_helper_path" ]; then
+            echo "Release bootstrap bundle is missing executable $bootstrap_helper_path" >&2
+            exit 1
+        fi
+    done
+else
+    for bootstrap_helper in \
+        blorp-compiler-renderer \
+        blorp-compiler-parser \
+        blorp-compiler-typecheck
+    do
+        bootstrap_helper_path="$bootstrap_toolchain_dir/$bootstrap_helper"
+        if [ ! -x "$bootstrap_helper_path" ]; then
+            echo "Legacy release bootstrap bundle is missing executable $bootstrap_helper_path" >&2
+            exit 1
+        fi
+    done
 fi
 if [ ! -x "$ocaml_host" ]; then
     echo "Release OCaml host not found or not executable: $ocaml_host" >&2
@@ -95,7 +163,41 @@ fi
 pkg_dir="$tmp_dir/$archive_base"
 mkdir -p "$pkg_dir"
 cp "$binary" "$pkg_dir/blorp"
-cp "$bootstrap_compiler" "$pkg_dir/blorp-bootstrap-compiler"
+if [ "$bootstrap_bundle_mode" = "dedicated" ]; then
+    cp "$bootstrap_compiler" "$pkg_dir/blorp-bootstrap-compiler"
+    cp "$bootstrap_toolchain_dir/$bootstrap_layout_name" \
+        "$pkg_dir/$bootstrap_layout_name"
+    cp "$bootstrap_toolchain_dir/blorp-bootstrap-host" \
+        "$pkg_dir/blorp-bootstrap-host"
+    cp "$bootstrap_toolchain_dir/blorp-bootstrap-renderer" \
+        "$pkg_dir/blorp-bootstrap-renderer"
+    cp "$bootstrap_toolchain_dir/blorp-bootstrap-parser" \
+        "$pkg_dir/blorp-bootstrap-parser"
+    cp "$bootstrap_toolchain_dir/blorp-bootstrap-typecheck" \
+        "$pkg_dir/blorp-bootstrap-typecheck"
+else
+    cat >"$pkg_dir/blorp-bootstrap-compiler" <<'SH'
+#!/bin/sh
+set -eu
+
+toolchain_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+export BLORP_COMPILER_RENDERER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-renderer"
+export BLORP_COMPILER_PARSER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-parser"
+export BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-typecheck"
+export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
+exec "$toolchain_dir/blorp-bootstrap-host" "$@"
+SH
+    chmod 0755 "$pkg_dir/blorp-bootstrap-compiler"
+    printf '%s\n' "$bootstrap_layout_version" \
+        >"$pkg_dir/$bootstrap_layout_name"
+    cp "$bootstrap_compiler" "$pkg_dir/blorp-bootstrap-host"
+    cp "$bootstrap_toolchain_dir/blorp-compiler-renderer" \
+        "$pkg_dir/blorp-bootstrap-renderer"
+    cp "$bootstrap_toolchain_dir/blorp-compiler-parser" \
+        "$pkg_dir/blorp-bootstrap-parser"
+    cp "$bootstrap_toolchain_dir/blorp-compiler-typecheck" \
+        "$pkg_dir/blorp-bootstrap-typecheck"
+fi
 cp "$ocaml_host" "$pkg_dir/blorp-ocaml-host"
 cp "$ocaml_middle" "$pkg_dir/blorp-ocaml-middle"
 cp "$renderer_bridge" "$pkg_dir/blorp-compiler-renderer"

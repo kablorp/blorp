@@ -257,9 +257,6 @@ OCaml references:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/semantic_middle_worker.ml`
-- `compiler/lib/pipeline.ml`
-  - `compile_preloaded_graph_with_blorp_bridge`
-  - `compile_loaded_program`
 
 Blorp references:
 
@@ -1563,18 +1560,22 @@ Current status:
 - Source-command checks now typecheck the in-memory graph directly in Blorp and
   never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
   wrapper and its duplicate adapter tests have been deleted.
-- `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
-  compile boundary: it consumes the same Blorp frontend graph, decodes the
-  Blorp typed-program artifact, populates dependency typed-module caches, and
-  then enters the shared OCaml Core/codegen handoff without
-  returning to the OCaml typechecker.
+- Normal source commands no longer enter an OCaml preloaded-graph compile API.
+  The obsolete public
+  `Pipeline.compile_preloaded_graph_with_blorp_bridge` wrapper and its five
+  direct wrapper tests are deleted. The meaningful call-identity and profiling
+  regressions now run through the production CLI. The private
+  `compile_preloaded_graph_impl` remains only beneath generated test-harness
+  and direct in-memory compatibility compilation. The REPL reaches the same
+  retained OCaml typed-AST lowering area through the separate legacy
+  direct-source entrypoint.
 - Direct-source `Pipeline.compile_legacy_direct_source`, reusable
   compiler-fixture typechecking, and module-only typecheck APIs are now
   documented in code as legacy/tooling routes. The REPL/test runner use the
-  explicit legacy compile name where they intentionally still depend on OCaml
-  parsing and typechecking. A compiler-unit regression pins that the
-  graph-backed compile bridge consumes the preloaded target source rather than
-  rereading a changed file from disk.
+  explicit compatibility APIs where they intentionally still depend on OCaml
+  typed-AST lowering and early Core. Normal source-command regressions live at
+  the Blorp CLI and compiler-owned Core boundaries instead of preserving a
+  second OCaml graph-compilation surface.
 - The compiler port inventory hygiene check now rejects new references to
   legacy direct-source pipeline entrypoints outside the narrow allowlist
   (`pipeline`, the private OCaml host tooling commands, package checking, REPL,

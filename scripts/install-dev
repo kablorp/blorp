@@ -94,6 +94,17 @@ sha256_file() {
     fi
 }
 
+sha256_stdin() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        echo "Install requires shasum or sha256sum." >&2
+        exit 1
+    fi
+}
+
 target="$(target_triple)"
 asset="blorp-dev-${target}.tar.gz"
 url="https://github.com/${repo}/releases/download/${tag}/${asset}"
@@ -143,15 +154,27 @@ fi
 
 package_dir=$(dirname "$binary_path")
 bootstrap_compiler_path="$package_dir/blorp-bootstrap-compiler"
+bootstrap_layout_name="blorp-bootstrap-layout"
+bootstrap_layout_version="isolated-v1"
+bootstrap_layout_path="$package_dir/$bootstrap_layout_name"
+bootstrap_bundle_names=(
+    blorp-bootstrap-compiler
+    blorp-bootstrap-host
+    blorp-bootstrap-renderer
+    blorp-bootstrap-parser
+    blorp-bootstrap-typecheck
+)
 ocaml_host_path="$package_dir/blorp-ocaml-host"
 ocaml_middle_path="$package_dir/blorp-ocaml-middle"
 renderer_bridge_path="$package_dir/blorp-compiler-renderer"
 parser_bridge_path="$package_dir/blorp-compiler-parser"
 typecheck_bridge_path="$package_dir/blorp-compiler-typecheck"
+has_dedicated_bootstrap=1
 if [ ! -f "$bootstrap_compiler_path" ] && [ -f "$ocaml_host_path" ]; then
     # Immutable releases published before the dedicated artifact name carried
     # the same bootstrap command in their OCaml host.
     bootstrap_compiler_path="$ocaml_host_path"
+    has_dedicated_bootstrap=0
 fi
 if [ ! -f "$bootstrap_compiler_path" ] ||
     [ ! -f "$ocaml_host_path" ] ||
@@ -164,11 +187,60 @@ then
     echo "Expected the public compiler, immutable bootstrap compiler, OCaml workers, and prepared bridge helpers in one directory." >&2
     exit 1
 fi
+if [ "$has_dedicated_bootstrap" -eq 1 ]; then
+    if [ ! -f "$bootstrap_layout_path" ] ||
+        [ "$(cat "$bootstrap_layout_path")" != "$bootstrap_layout_version" ]
+    then
+        echo "Downloaded archive contains an unsupported immutable bootstrap layout." >&2
+        echo "A dedicated compiler without matching generation metadata is unsafe to install." >&2
+        exit 1
+    fi
+    for bootstrap_file in "${bootstrap_bundle_names[@]}"; do
+        if [ ! -f "$package_dir/$bootstrap_file" ]; then
+            echo "Downloaded archive contains an incomplete immutable bootstrap bundle." >&2
+            echo "Missing: $package_dir/$bootstrap_file" >&2
+            exit 1
+        fi
+    done
+fi
 
 mkdir -p "$install_dir"
 install_stage=$(mktemp -d "$install_dir/.blorp-install.XXXXXX")
+bootstrap_stage="$install_stage/bootstrap-generation"
+mkdir -p "$bootstrap_stage"
 cp "$binary_path" "$install_stage/blorp"
-cp "$bootstrap_compiler_path" "$install_stage/blorp-bootstrap-compiler"
+if [ "$has_dedicated_bootstrap" -eq 1 ]; then
+    for bootstrap_file in "${bootstrap_bundle_names[@]}"; do
+        cp "$package_dir/$bootstrap_file" "$bootstrap_stage/$bootstrap_file"
+    done
+    cp "$bootstrap_layout_path" "$bootstrap_stage/$bootstrap_layout_name"
+else
+    cat >"$bootstrap_stage/blorp-bootstrap-compiler" <<'SH'
+#!/bin/sh
+set -eu
+
+toolchain_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+export BLORP_COMPILER_RENDERER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-renderer"
+export BLORP_COMPILER_PARSER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-parser"
+export BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-typecheck"
+export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
+exec "$toolchain_dir/blorp-bootstrap-host" "$@"
+SH
+    cp "$bootstrap_compiler_path" "$bootstrap_stage/blorp-bootstrap-host"
+    cp "$renderer_bridge_path" "$bootstrap_stage/blorp-bootstrap-renderer"
+    cp "$parser_bridge_path" "$bootstrap_stage/blorp-bootstrap-parser"
+    cp "$typecheck_bridge_path" "$bootstrap_stage/blorp-bootstrap-typecheck"
+    printf '%s\n' "$bootstrap_layout_version" \
+        >"$bootstrap_stage/$bootstrap_layout_name"
+fi
+cat >"$install_stage/blorp-bootstrap-compiler" <<'SH'
+#!/bin/sh
+set -eu
+
+install_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+bootstrap_generation=$(cat "$install_dir/.blorp-bootstrap/active")
+exec "$install_dir/.blorp-bootstrap/$bootstrap_generation/blorp-bootstrap-compiler" "$@"
+SH
 cp "$ocaml_host_path" "$install_stage/blorp-ocaml-host"
 cp "$ocaml_middle_path" "$install_stage/blorp-ocaml-middle"
 cp "$renderer_bridge_path" "$install_stage/blorp-compiler-renderer"
@@ -182,9 +254,54 @@ chmod 0755 \
     "$install_stage/blorp-compiler-renderer" \
     "$install_stage/blorp-compiler-parser" \
     "$install_stage/blorp-compiler-typecheck"
+chmod 0755 \
+    "$bootstrap_stage/blorp-bootstrap-compiler" \
+    "$bootstrap_stage/blorp-bootstrap-host" \
+    "$bootstrap_stage/blorp-bootstrap-renderer" \
+    "$bootstrap_stage/blorp-bootstrap-parser" \
+    "$bootstrap_stage/blorp-bootstrap-typecheck"
+chmod 0644 "$bootstrap_stage/$bootstrap_layout_name"
 
-# The private files cannot be activated atomically. Publish the
-# public entry point last so it never precedes the workers it delegates to.
+bootstrap_generation=$(
+    {
+        for bootstrap_file in \
+            "$bootstrap_layout_name" \
+            "${bootstrap_bundle_names[@]}"
+        do
+            printf '%s ' "$bootstrap_file"
+            sha256_file "$bootstrap_stage/$bootstrap_file"
+        done
+    } | sha256_stdin
+)
+bootstrap_store="$install_dir/.blorp-bootstrap"
+bootstrap_generation_dir="$bootstrap_store/$bootstrap_generation"
+mkdir -p "$bootstrap_store"
+if [ -d "$bootstrap_generation_dir" ]; then
+    for bootstrap_file in \
+        "$bootstrap_layout_name" \
+        "${bootstrap_bundle_names[@]}"
+    do
+        if ! cmp "$bootstrap_stage/$bootstrap_file" \
+            "$bootstrap_generation_dir/$bootstrap_file"
+        then
+            echo "Installed bootstrap generation failed content verification: $bootstrap_generation" >&2
+            exit 1
+        fi
+    done
+    rm -rf "$bootstrap_stage"
+else
+    mv "$bootstrap_stage" "$bootstrap_generation_dir"
+fi
+
+# A compiler invocation reads this pointer once through its launcher. Replacing
+# the regular file with rename is the only activation step, so interruption
+# cannot expose a mixed bundle.
+active_link="$bootstrap_store/active"
+active_link_next="$bootstrap_store/.active.$$"
+rm -f "$active_link_next"
+printf '%s\n' "$bootstrap_generation" >"$active_link_next"
+mv -f "$active_link_next" "$active_link"
+
 mv "$install_stage/blorp-bootstrap-compiler" "$install_dir/blorp-bootstrap-compiler"
 mv "$install_stage/blorp-ocaml-host" "$install_dir/blorp-ocaml-host"
 mv "$install_stage/blorp-ocaml-middle" "$install_dir/blorp-ocaml-middle"
@@ -197,7 +314,7 @@ install_stage=""
 
 echo "Installed blorp dev compiler toolchain to $install_dir"
 echo "Public command: $install_dir/blorp"
-echo "Remove the installed blorp and blorp-* private executables from $install_dir to uninstall."
+echo "Remove blorp, blorp-* private executables, and $install_dir/.blorp-bootstrap to uninstall."
 
 case ":$PATH:" in
     *":$install_dir:"*) ;;

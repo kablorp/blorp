@@ -279,8 +279,13 @@ Supported targets:
 - `x86_64-apple-darwin`
 
 `scripts/package-release` packages the public `./blorp` command, the immutable
-bootstrap compiler, private OCaml workers, and prepared compiler bridges into
-a release archive plus a `.sha256` file:
+bootstrap compiler bundle, private OCaml workers, and prepared compiler bridges
+into a release archive plus a `.sha256` file. The bootstrap launcher carries
+bootstrap-specific host, parser, typecheck, and renderer executables so it
+cannot accidentally discover the new release's incompatible bridge generation.
+`blorp-bootstrap-layout` explicitly versions that isolated bundle; a dedicated
+compiler without the manifest is rejected because its helper generation cannot
+be established safely:
 
 ```bash
 scripts/package-release dist
@@ -294,6 +299,8 @@ Useful environment variables:
 - `BLORP_RELEASE_BINARY` selects the binary to package.
 - `BLORP_RELEASE_BOOTSTRAP_COMPILER` selects the immutable compiler used to
   build the next Blorp executable.
+- `BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR` selects the directory containing that
+  compiler's matching helpers when it is not beside the compiler.
 - `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
 - `BLORP_RELEASE_OCAML_MIDDLE` selects the private semantic worker to package.
 - `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.
@@ -304,6 +311,12 @@ Useful environment variables:
 
 The three prepared bridge overrides must be supplied together so one archive
 cannot mix helpers from different compiler generations.
+
+`scripts/install-dev` stores immutable bootstrap bundles in content-addressed
+generation directories under `.blorp-bootstrap/`. It activates one complete
+generation by atomically replacing a small `active` pointer, so an interrupted
+or concurrent upgrade cannot expose a host with only some of its matching
+helpers.
 
 On main, CI builds the compiler once with its final dev release metadata,
 prepares the next compiler bridge generation, runs the normal test gates against

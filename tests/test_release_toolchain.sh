@@ -29,19 +29,45 @@ write_checksum() {
 
 fake_bin="$tmp_dir/release-bin"
 mkdir -p "$fake_bin"
-toolchain_executables=(
+bootstrap_layout_name="blorp-bootstrap-layout"
+bootstrap_layout_version="isolated-v1"
+current_toolchain_executables=(
 	blorp
-	blorp-bootstrap-compiler
 	blorp-ocaml-host
 	blorp-ocaml-middle
 	blorp-compiler-renderer
 	blorp-compiler-parser
 	blorp-compiler-typecheck
 )
+bootstrap_bundle_executables=(
+	blorp-bootstrap-compiler
+	blorp-bootstrap-host
+	blorp-bootstrap-renderer
+	blorp-bootstrap-parser
+	blorp-bootstrap-typecheck
+)
+toolchain_executables=(
+	"${current_toolchain_executables[@]}"
+	"${bootstrap_bundle_executables[@]}"
+)
 for executable in "${toolchain_executables[@]}"; do
 	cp /bin/sh "$fake_bin/$executable"
 done
+printf '%s\n' "$bootstrap_layout_version" \
+	>"$fake_bin/$bootstrap_layout_name"
 cat >"$fake_bin/blorp-bootstrap-compiler" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+toolchain_dir=$(cd "$(dirname "$0")" && pwd -P)
+export BLORP_COMPILER_RENDERER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-renderer"
+export BLORP_COMPILER_PARSER_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-parser"
+export BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$toolchain_dir/blorp-bootstrap-typecheck"
+export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
+exec "$toolchain_dir/blorp-bootstrap-host" "$@"
+SH
+chmod +x "$fake_bin/blorp-bootstrap-compiler"
+cat >"$fake_bin/blorp-bootstrap-host" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -50,6 +76,21 @@ if [ "${1:-}" != "__compiler-host-compile-wrapper" ]; then
 	exit 1
 fi
 shift
+
+for helper in \
+	"${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" \
+	"${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" \
+	"${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}"
+do
+	if [ ! -x "$helper" ]; then
+		echo "bootstrap compiler did not receive its immutable helper generation" >&2
+		exit 1
+	fi
+	if ! grep -Fq '# bootstrap-generation' "$helper"; then
+		echo "bootstrap compiler received a helper from another generation" >&2
+		exit 1
+	fi
+done
 
 output=""
 source_file=""
@@ -79,7 +120,19 @@ if [ -z "$output" ] || [ ! -f "$source_file" ]; then
 fi
 printf 'int main(void) { return 0; }\n' >"$output"
 SH
-chmod +x "$fake_bin/blorp-bootstrap-compiler"
+chmod +x "$fake_bin/blorp-bootstrap-host"
+for bootstrap_helper in \
+	blorp-bootstrap-renderer \
+	blorp-bootstrap-parser \
+	blorp-bootstrap-typecheck
+do
+	cat >"$fake_bin/$bootstrap_helper" <<'SH'
+#!/bin/sh
+# bootstrap-generation
+exit 0
+SH
+	chmod +x "$fake_bin/$bootstrap_helper"
+done
 cat >"$fake_bin/blorp" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -141,6 +194,11 @@ for executable in "${toolchain_executables[@]}"; do
 		fail "packaged $executable must match its release input"
 	fi
 done
+if ! cmp "$fake_bin/$bootstrap_layout_name" \
+	"$extract_dir/$archive_base/$bootstrap_layout_name"
+then
+	fail "release archive must preserve the immutable bootstrap layout manifest"
+fi
 
 bootstrap_smoke_output="$tmp_dir/bootstrap-smoke.c"
 "$extract_dir/$archive_base/blorp-bootstrap-compiler" \
@@ -149,6 +207,50 @@ bootstrap_smoke_output="$tmp_dir/bootstrap-smoke.c"
 	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
 if [ ! -s "$bootstrap_smoke_output" ]; then
 	fail "the packaged bootstrap compiler must compile a source file"
+fi
+
+legacy_bootstrap_source="$tmp_dir/legacy-bootstrap-source"
+mkdir -p "$legacy_bootstrap_source"
+cp "$fake_bin/blorp-bootstrap-host" \
+	"$legacy_bootstrap_source/blorp-ocaml-host"
+cp "$fake_bin/blorp-bootstrap-renderer" \
+	"$legacy_bootstrap_source/blorp-compiler-renderer"
+cp "$fake_bin/blorp-bootstrap-parser" \
+	"$legacy_bootstrap_source/blorp-compiler-parser"
+cp "$fake_bin/blorp-bootstrap-typecheck" \
+	"$legacy_bootstrap_source/blorp-compiler-typecheck"
+for legacy_helper in \
+	blorp-compiler-renderer \
+	blorp-compiler-parser \
+	blorp-compiler-typecheck
+do
+	printf '%s\n' '# legacy-generation' \
+		>>"$legacy_bootstrap_source/$legacy_helper"
+done
+legacy_bundle_release_dir="$tmp_dir/legacy-bundle-dist"
+BLORP_RELEASE_BINARY="$fake_bin/blorp" \
+	BLORP_RELEASE_BOOTSTRAP_COMPILER="$legacy_bootstrap_source/blorp-ocaml-host" \
+	BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR="$legacy_bootstrap_source" \
+	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
+	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
+	BLORP_RELEASE_RENDERER_BRIDGE="$fake_bin/blorp-compiler-renderer" \
+	BLORP_RELEASE_PARSER_BRIDGE="$fake_bin/blorp-compiler-parser" \
+	BLORP_RELEASE_TYPECHECK_BRIDGE="$fake_bin/blorp-compiler-typecheck" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	scripts/package-release "$legacy_bundle_release_dir" >/dev/null
+legacy_bundle_extract_dir="$tmp_dir/extracted-legacy-bundle"
+mkdir -p "$legacy_bundle_extract_dir"
+tar -xzf "$legacy_bundle_release_dir/$archive_base.tar.gz" \
+	-C "$legacy_bundle_extract_dir"
+legacy_bundle_dir="$legacy_bundle_extract_dir/$archive_base"
+legacy_bundle_smoke_output="$tmp_dir/legacy-bundle-smoke.c"
+"$legacy_bundle_dir/blorp-bootstrap-compiler" \
+	__compiler-host-compile-wrapper \
+	-o "$legacy_bundle_smoke_output" \
+	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+if [ ! -s "$legacy_bundle_smoke_output" ]; then
+	fail "a pre-transition bootstrap must be isolated with its own helper generation"
 fi
 
 sibling_release_dir="$tmp_dir/sibling-dist"
@@ -214,6 +316,31 @@ then
 	fail "a missing bootstrap compiler must produce a precise diagnostic"
 fi
 
+incomplete_bootstrap_dir="$tmp_dir/incomplete-bootstrap-bundle"
+mkdir -p "$incomplete_bootstrap_dir"
+cp "$fake_bin/blorp-bootstrap-host" \
+	"$fake_bin/blorp-bootstrap-renderer" \
+	"$fake_bin/blorp-bootstrap-parser" \
+	"$incomplete_bootstrap_dir/"
+cp "$fake_bin/$bootstrap_layout_name" "$incomplete_bootstrap_dir/"
+if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
+	BLORP_RELEASE_BOOTSTRAP_COMPILER="$fake_bin/blorp-bootstrap-compiler" \
+	BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR="$incomplete_bootstrap_dir" \
+	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
+	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	scripts/package-release "$tmp_dir/incomplete-bootstrap-bundle-dist" \
+	>"$tmp_dir/package-incomplete-bootstrap-bundle.output" 2>&1
+then
+	fail "release packaging must reject an incomplete immutable bootstrap bundle"
+fi
+if ! grep -Fq "Release bootstrap bundle is missing executable" \
+	"$tmp_dir/package-incomplete-bootstrap-bundle.output"
+then
+	fail "an incomplete immutable bootstrap bundle must produce a precise diagnostic"
+fi
+
 mock_bin="$tmp_dir/mock-bin"
 downloads="$tmp_dir/downloads"
 mkdir -p "$mock_bin" "$downloads"
@@ -259,19 +386,62 @@ PATH="$mock_bin:$PATH" \
 	BLORP_INSTALL_DIR="$install_dir" \
 	scripts/install-dev >/dev/null
 
-for executable in "${toolchain_executables[@]}"; do
+for executable in "${current_toolchain_executables[@]}"; do
 	if ! cmp "$fake_bin/$executable" "$install_dir/$executable"; then
 		fail "the dev installer must install $executable from the archive"
+	fi
+done
+initial_bootstrap_generation=$(cat "$install_dir/.blorp-bootstrap/active")
+installed_bootstrap_dir="$install_dir/.blorp-bootstrap/$initial_bootstrap_generation"
+for executable in "${bootstrap_bundle_executables[@]}"; do
+	if ! cmp "$fake_bin/$executable" \
+		"$installed_bootstrap_dir/$executable"
+	then
+		fail "the dev installer must install isolated $executable from the archive"
+	fi
+done
+if ! cmp "$fake_bin/$bootstrap_layout_name" \
+	"$installed_bootstrap_dir/$bootstrap_layout_name"
+then
+	fail "the dev installer must install the bootstrap layout manifest"
+fi
+
+installed_repack_dir="$tmp_dir/installed-repack-dist"
+BLORP_RELEASE_BINARY="$install_dir/blorp" \
+	BLORP_RELEASE_RENDERER_BRIDGE="$install_dir/blorp-compiler-renderer" \
+	BLORP_RELEASE_PARSER_BRIDGE="$install_dir/blorp-compiler-parser" \
+	BLORP_RELEASE_TYPECHECK_BRIDGE="$install_dir/blorp-compiler-typecheck" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	scripts/package-release "$installed_repack_dir" >/dev/null
+installed_repack_extract="$tmp_dir/installed-repack"
+mkdir -p "$installed_repack_extract"
+tar -xzf "$installed_repack_dir/$archive_base.tar.gz" \
+	-C "$installed_repack_extract"
+for bootstrap_file in \
+	"$bootstrap_layout_name" \
+	"${bootstrap_bundle_executables[@]}"
+do
+	if ! cmp "$installed_bootstrap_dir/$bootstrap_file" \
+		"$installed_repack_extract/$archive_base/$bootstrap_file"
+	then
+		fail "repackaging an installed toolchain must preserve active $bootstrap_file"
 	fi
 done
 
 pre_transition_root="$tmp_dir/pre-transition/blorp-pre-transition-${release_target}"
 mkdir -p "$pre_transition_root"
-for executable in "${toolchain_executables[@]}"; do
-	if [ "$executable" != "blorp-bootstrap-compiler" ]; then
-		cp "$fake_bin/$executable" "$pre_transition_root/$executable"
-	fi
+for executable in "${current_toolchain_executables[@]}"; do
+	cp "$fake_bin/$executable" "$pre_transition_root/$executable"
 done
+cp "$legacy_bootstrap_source/blorp-ocaml-host" \
+	"$pre_transition_root/blorp-ocaml-host"
+cp "$legacy_bootstrap_source/blorp-compiler-renderer" \
+	"$pre_transition_root/blorp-compiler-renderer"
+cp "$legacy_bootstrap_source/blorp-compiler-parser" \
+	"$pre_transition_root/blorp-compiler-parser"
+cp "$legacy_bootstrap_source/blorp-compiler-typecheck" \
+	"$pre_transition_root/blorp-compiler-typecheck"
 pre_transition_archive="$tmp_dir/pre-transition.tar.gz"
 tar -C "$(dirname "$pre_transition_root")" -czf "$pre_transition_archive" \
 	"$(basename "$pre_transition_root")"
@@ -282,18 +452,60 @@ PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
 	BLORP_INSTALL_DIR="$pre_transition_install" \
 	scripts/install-dev >/dev/null
-if ! cmp "$fake_bin/blorp-ocaml-host" \
-	"$pre_transition_install/blorp-bootstrap-compiler"
+pre_transition_generation=$(
+	cat "$pre_transition_install/.blorp-bootstrap/active"
+)
+pre_transition_bootstrap_dir="$pre_transition_install/.blorp-bootstrap/$pre_transition_generation"
+if ! cmp "$legacy_bootstrap_source/blorp-ocaml-host" \
+	"$pre_transition_bootstrap_dir/blorp-bootstrap-host"
 then
-	fail "the dev installer must preserve an older complete toolchain's compiler command"
+	fail "the dev installer must isolate an older toolchain's bootstrap host"
 fi
-for executable in "${toolchain_executables[@]}"; do
-	if [ "$executable" != "blorp-bootstrap-compiler" ] &&
-		! cmp "$fake_bin/$executable" "$pre_transition_install/$executable"
+for helper_pair in \
+	"blorp-compiler-renderer blorp-bootstrap-renderer" \
+	"blorp-compiler-parser blorp-bootstrap-parser" \
+	"blorp-compiler-typecheck blorp-bootstrap-typecheck"
+do
+	set -- $helper_pair
+	if ! cmp "$legacy_bootstrap_source/$1" \
+		"$pre_transition_bootstrap_dir/$2"
 	then
-		fail "the dev installer must preserve $executable from an older complete toolchain"
+		fail "the dev installer must isolate the older $1"
 	fi
 done
+pre_transition_smoke="$tmp_dir/pre-transition-smoke.c"
+"$pre_transition_install/blorp-bootstrap-compiler" \
+	__compiler-host-compile-wrapper \
+	-o "$pre_transition_smoke" \
+	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+if [ ! -s "$pre_transition_smoke" ]; then
+	fail "the synthesized legacy bootstrap bundle must compile a source file"
+fi
+
+PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
+	BLORP_INSTALL_DIR="$install_dir" \
+	scripts/install-dev >/dev/null
+upgraded_bootstrap_generation=$(cat "$install_dir/.blorp-bootstrap/active")
+if [ "$upgraded_bootstrap_generation" = "$initial_bootstrap_generation" ]; then
+	fail "installing another bootstrap generation must atomically switch the active bundle"
+fi
+for bootstrap_file in \
+	"$bootstrap_layout_name" \
+	"${bootstrap_bundle_executables[@]}"
+do
+	if [ ! -f "$install_dir/.blorp-bootstrap/$initial_bootstrap_generation/$bootstrap_file" ]; then
+		fail "an in-flight compiler must retain its complete previous bootstrap generation"
+	fi
+done
+upgraded_smoke="$tmp_dir/upgraded-bootstrap-smoke.c"
+"$install_dir/blorp-bootstrap-compiler" \
+	__compiler-host-compile-wrapper \
+	-o "$upgraded_smoke" \
+	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+if [ ! -s "$upgraded_smoke" ]; then
+	fail "the atomically activated bootstrap generation must compile a source file"
+fi
 
 legacy_root="$tmp_dir/legacy/blorp-legacy-${release_target}"
 mkdir -p "$legacy_root"
@@ -366,6 +578,9 @@ for executable in "${toolchain_executables[@]}"; do
 		fail "a toolchain bootstrap must cache $executable"
 	fi
 done
+if [ ! -f "$(dirname "$bootstrap_path")/$bootstrap_layout_name" ]; then
+	fail "a toolchain bootstrap must cache the bootstrap layout manifest"
+fi
 
 printf 'corrupted bootstrap compiler\n' \
 	>"$(dirname "$bootstrap_path")/blorp-bootstrap-compiler"
@@ -378,6 +593,19 @@ if ! cmp "$fake_bin/blorp-bootstrap-compiler" \
 	"$(dirname "$bootstrap_path")/blorp-bootstrap-compiler"
 then
 	fail "bootstrap cache validation must repair a corrupted immutable compiler"
+fi
+
+printf 'corrupted bootstrap helper\n' \
+	>"$(dirname "$bootstrap_path")/blorp-bootstrap-parser"
+chmod +x "$(dirname "$bootstrap_path")/blorp-bootstrap-parser"
+PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-compiler-path >/dev/null
+if ! cmp "$fake_bin/blorp-bootstrap-parser" \
+	"$(dirname "$bootstrap_path")/blorp-bootstrap-parser"
+then
+	fail "bootstrap cache validation must repair a corrupted immutable helper"
 fi
 
 printf 'corrupted helper\n' >"$(dirname "$bootstrap_path")/blorp-compiler-parser"
@@ -394,10 +622,8 @@ fi
 
 legacy_toolchain_root="$tmp_dir/legacy-toolchain/$archive_base"
 mkdir -p "$legacy_toolchain_root"
-for executable in "${toolchain_executables[@]}"; do
-	if [ "$executable" != "blorp-bootstrap-compiler" ]; then
-		cp "$fake_bin/$executable" "$legacy_toolchain_root/$executable"
-	fi
+for executable in "${current_toolchain_executables[@]}"; do
+	cp "$fake_bin/$executable" "$legacy_toolchain_root/$executable"
 done
 legacy_toolchain_archive="$tmp_dir/legacy-toolchain.tar.gz"
 tar -C "$(dirname "$legacy_toolchain_root")" -czf "$legacy_toolchain_archive" \

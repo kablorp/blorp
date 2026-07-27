@@ -46,6 +46,11 @@ case "$layout" in
 esac
 toolchain_executables="blorp blorp-ocaml-host blorp-ocaml-middle blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck"
 bootstrap_compiler_executable="blorp-bootstrap-compiler"
+bootstrap_companion_executables="blorp-bootstrap-host blorp-bootstrap-renderer blorp-bootstrap-parser blorp-bootstrap-typecheck"
+bootstrap_artifact_executables="$bootstrap_compiler_executable $bootstrap_companion_executables"
+bootstrap_layout_name="blorp-bootstrap-layout"
+bootstrap_layout_version="isolated-v1"
+bootstrap_artifact_files="$bootstrap_artifact_executables $bootstrap_layout_name"
 
 if [[ ! "$tag" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "Compiler bootstrap tag must be an immutable dev revision: $tag" >&2
@@ -204,15 +209,30 @@ cache_marker_matches() {
 	done
 
 	if grep -q "^file_sha256_${bootstrap_compiler_executable}=" "$marker"; then
-		if [ ! -x "$install_dir/$bootstrap_compiler_executable" ]; then
+		if [ ! -f "$install_dir/$bootstrap_layout_name" ] ||
+			[ "$(cat "$install_dir/$bootstrap_layout_name")" != "$bootstrap_layout_version" ]
+		then
 			return 1
 		fi
-		actual_sha=$(sha256_file "$install_dir/$bootstrap_compiler_executable")
-		if ! grep -Fxq "file_sha256_${bootstrap_compiler_executable}=$actual_sha" "$marker"; then
+		for executable in $bootstrap_artifact_executables; do
+			if [ ! -x "$install_dir/$executable" ]; then
+				return 1
+			fi
+			actual_sha=$(sha256_file "$install_dir/$executable")
+			if ! grep -Fxq "file_sha256_${executable}=$actual_sha" "$marker"; then
+				return 1
+			fi
+		done
+		actual_sha=$(sha256_file "$install_dir/$bootstrap_layout_name")
+		if ! grep -Fxq "file_sha256_${bootstrap_layout_name}=$actual_sha" "$marker"; then
 			return 1
 		fi
-	elif [ -e "$install_dir/$bootstrap_compiler_executable" ]; then
-		return 1
+	else
+		for artifact in $bootstrap_artifact_files; do
+			if [ -e "$install_dir/$artifact" ]; then
+				return 1
+			fi
+		done
 	fi
 }
 
@@ -229,7 +249,7 @@ install_bootstrap() {
 	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
-	trap 'rm -rf "$stage_dir"; for executable in $toolchain_executables $bootstrap_compiler_executable; do rm -f "$install_dir/$executable.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
+	trap 'rm -rf "$stage_dir"; for artifact in $toolchain_executables $bootstrap_artifact_files; do rm -f "$install_dir/$artifact.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
 
 	archive="$stage_dir/$asset"
 	checksum="$archive.sha256"
@@ -269,6 +289,20 @@ install_bootstrap() {
 				exit 1
 			fi
 		done
+		if [ -f "$package_dir/$bootstrap_compiler_executable" ]; then
+			if [ ! -f "$package_dir/$bootstrap_layout_name" ] ||
+				[ "$(cat "$package_dir/$bootstrap_layout_name")" != "$bootstrap_layout_version" ]
+			then
+				echo "Downloaded compiler bootstrap archive contains an unsupported immutable bootstrap layout." >&2
+				exit 1
+			fi
+			for executable in $bootstrap_companion_executables; do
+				if [ ! -f "$package_dir/$executable" ]; then
+					echo "Downloaded compiler bootstrap archive contains an incomplete immutable bootstrap bundle: missing $executable." >&2
+					exit 1
+				fi
+			done
+		fi
 	fi
 
 	mkdir -p "$install_dir"
@@ -278,9 +312,13 @@ install_bootstrap() {
 			chmod 0755 "$install_dir/$executable.tmp.$$"
 		done
 		if [ -f "$package_dir/$bootstrap_compiler_executable" ]; then
-			cp "$package_dir/$bootstrap_compiler_executable" \
-				"$install_dir/$bootstrap_compiler_executable.tmp.$$"
-			chmod 0755 "$install_dir/$bootstrap_compiler_executable.tmp.$$"
+			for executable in $bootstrap_artifact_executables; do
+				cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
+				chmod 0755 "$install_dir/$executable.tmp.$$"
+			done
+			cp "$package_dir/$bootstrap_layout_name" \
+				"$install_dir/$bootstrap_layout_name.tmp.$$"
+			chmod 0644 "$install_dir/$bootstrap_layout_name.tmp.$$"
 		fi
 	else
 		cp "$binary_path" "$binary.tmp.$$"
@@ -300,8 +338,12 @@ install_bootstrap() {
 				echo "file_sha256_${executable}=$actual_sha"
 			done
 			if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
-				actual_sha=$(sha256_file "$install_dir/$bootstrap_compiler_executable.tmp.$$")
-				echo "file_sha256_${bootstrap_compiler_executable}=$actual_sha"
+				for executable in $bootstrap_artifact_executables; do
+					actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
+					echo "file_sha256_${executable}=$actual_sha"
+				done
+				actual_sha=$(sha256_file "$install_dir/$bootstrap_layout_name.tmp.$$")
+				echo "file_sha256_${bootstrap_layout_name}=$actual_sha"
 			fi
 		else
 			actual_sha=$(sha256_file "$binary.tmp.$$")
@@ -316,10 +358,17 @@ install_bootstrap() {
 			fi
 		done
 		if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
+			for executable in $bootstrap_companion_executables; do
+				mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
+			done
+			mv "$install_dir/$bootstrap_layout_name.tmp.$$" \
+				"$install_dir/$bootstrap_layout_name"
 			mv "$install_dir/$bootstrap_compiler_executable.tmp.$$" \
 				"$install_dir/$bootstrap_compiler_executable"
 		else
-			rm -f "$install_dir/$bootstrap_compiler_executable"
+			for artifact in $bootstrap_artifact_files; do
+				rm -f "$install_dir/$artifact"
+			done
 		fi
 		mv "$install_dir/blorp.tmp.$$" "$binary"
 	else
