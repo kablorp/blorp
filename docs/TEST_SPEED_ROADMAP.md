@@ -562,9 +562,14 @@ preparation from the retained graph. The extension rejects generated-root
 collisions and distinct retained files that share one downstream module
 identity. Generated-harness preparation also has an explicit frontend policy:
 test helpers may call debug-only functions while debug blocks are retained or
-erased independently. Production `Test_runner` routing remains on the OCaml
-constructors until one harness execution path consumes this retained graph and
-the bridge-count regression proves it does not rebuild the frontend.
+erased independently. Test command planning now retains typed execution or
+warmup variants inside Blorp and serializes options only at the temporary OCaml
+host boundary. Blorp-owned discovery now derives `main`, `tests`-binding, and
+doctest facts from parsed declarations and parsed docs rather than source
+substrings. The `tests` binding remains a candidate until type resolution proves
+its TestSuite identity. Production `Test_runner` routing remains on the OCaml
+constructors until filesystem discovery and one harness execution path consume
+these facts and the retained graph without rebuilding the frontend.
 
 **Target architecture:**
 
@@ -594,11 +599,19 @@ the bridge-count regression proves it does not rebuild the frontend.
   production caller remains.
 - Preserve one bridge: the post-synthesis Core semantic-middle request. Do not
   introduce a test-only parser bridge or a second graph protocol.
+- Move runtime-cache ownership with harness execution. The Blorp host path and
+  retained OCaml TestRunner currently use distinct cache schemas; moving only
+  `test --warmup-only` would warm an artifact that production tests do not
+  consume.
 
 **Tests:**
 
 - Port selector, run-all, duplicate-name, filtering, diagnostics, and exit-code
   regressions to Blorp-owned tests before deleting their OCaml equivalents.
+- Replace the OCaml `has_top_level_main_source`,
+  `source_declares_testsuite`, and `source_mentions_doctests` heuristics only
+  after production discovery consumes the parsed Blorp facts. Do not port their
+  substring behavior.
 - Add an integration assertion from bridge statistics that one test command
   performs one frontend graph construction and one semantic-middle request for
   each explicit isolation group.

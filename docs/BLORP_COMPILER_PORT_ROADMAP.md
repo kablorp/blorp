@@ -1803,6 +1803,15 @@ Current status:
   `debug:` blocks. Production TestRunner routing has not switched yet; the next
   slice must consume this retained graph rather than adding a test-only parser
   bridge or serializing generated source back through OCaml.
+- Test command plans now carry typed execution or warmup variants throughout
+  the Blorp process and become JSON only when crossing the temporary OCaml host
+  boundary. Runtime-cache warmup must move with TestRunner execution because
+  the Blorp host and retained OCaml runner still use different cache schemas.
+- Blorp test discovery now classifies parsed declarations and docs for `main`,
+  a candidate `tests` binding, and doctests. Resolved TestSuite identity belongs
+  after module loading/type resolution; it is not guessed from a raw type name.
+  Filesystem discovery and execution still need to consume these facts before
+  the OCaml substring classifiers can be deleted.
 
 Typed frontier closure before CTFE:
 

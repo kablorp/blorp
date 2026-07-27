@@ -1,7 +1,10 @@
 import:
 	../src/stage_12_cli/compiler_bridge_protocol: BridgeAction(RunCliAction), BridgeEnvelope
 	../src/stage_12_cli/compiler_cli: handle_cli_run_envelope, run_cli, run_cli_with_version
-	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck)
+	../src/stage_12_cli/compiler_cli_args:
+		CliAction(CliCheck),
+		CliSanitizerMode(CliSanitizeUndefined),
+		CliTestMode(CliTestDocOnly),
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
 	../src/stage_12_cli/compiler_cli_plan:
 		CliCheckTargetExpansion,
@@ -36,6 +39,7 @@ import:
 		),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
+		CliTestRunCommand(CliTestExecute, CliTestWarmup),
 	../src/stage_12_cli/compiler_cli_source_graph:
 		expand_check_targets,
 		frontend_module_graph_for_roots,
@@ -2465,6 +2469,9 @@ func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 func test_run_cli_plans_test_command() -> Bool:
 	test_ok: Bool = match run_cli([
 		"test",
+		"--profile",
+		"--debug",
+		"--leak-check",
 		"--doc",
 		"--repeat",
 		"3",
@@ -2486,36 +2493,86 @@ func test_run_cli_plans_test_command() -> Bool:
 		CliRunSource(_):
 			False
 		CliRunTest(test_plan):
-			options: JsonValue = test_plan.options
+			match test_plan.command:
+				CliTestExecute(options):
+					encoded: JsonValue = cli_run_plan_to_json(CliRunTest(test_plan))
 
-			(
-				test_plan.args == [
-					"test",
-					"--doc",
-					"--repeat",
-					"3",
-					"-j",
-					"8",
-					"--no-cache",
-					"--sanitize=undefined",
-					"--timeout",
-					"5",
-					"--std-dir",
-					"custom-std",
-					"--no-format",
-					"tests",
-				]
-				and json_string_field(options, "kind") == "test"
-				and json_string_field(options, "mode") == "doc"
-				and json_string_field(options, "sanitizer") == "undefined"
-				and json_string_field(options, "std_dir") == "custom-std"
-				and json_bool_field(options, "no_format")
-				and not json_bool_field(options, "cache")
-				and json_int_field(options, "repeat") == 3
-				and json_int_field(options, "jobs") == 8
-				and json_int_field(options, "timeout") == 5
-				and json_array_length_field(options, "paths") == 1
-			)
+					serialized_wire_ok: Bool = match get_field(encoded, "artifact"):
+						Some(artifact):
+							match get_field(artifact, "options"):
+								Some(value):
+									match json_array_item_field(artifact, "args", 0):
+										Some(first_arg):
+											(
+												json_string_field(artifact, "kind") == "test"
+												and json_array_length_field(
+													artifact,
+													"args",
+												) == test_plan.args.length()
+												and as_string(first_arg) == Some("test")
+												and json_string_field(value, "kind") == "test"
+												and json_bool_field(value, "profile")
+												and json_bool_field(value, "debug")
+												and json_bool_field(value, "leak_check")
+												and json_string_field(value, "mode") == "doc"
+												and json_string_field(
+													value,
+													"sanitizer",
+												) == "undefined"
+												and json_string_field(
+													value,
+													"std_dir",
+												) == "custom-std"
+												and json_bool_field(value, "no_format")
+												and not json_bool_field(value, "cache")
+												and json_int_field(value, "repeat") == 3
+												and json_int_field(value, "jobs") == 8
+												and json_int_field(value, "timeout") == 5
+												and json_array_length_field(value, "paths") == 1
+											)
+										None:
+											False
+								None:
+									False
+						None:
+							False
+
+					(
+						test_plan.args == [
+							"test",
+							"--profile",
+							"--debug",
+							"--leak-check",
+							"--doc",
+							"--repeat",
+							"3",
+							"-j",
+							"8",
+							"--no-cache",
+							"--sanitize=undefined",
+							"--timeout",
+							"5",
+							"--std-dir",
+							"custom-std",
+							"--no-format",
+							"tests",
+						]
+						and options.profile
+						and options.debug
+						and options.leak_check
+						and options.mode == CliTestDocOnly
+						and options.sanitizer == Some(CliSanitizeUndefined)
+						and options.std_dir == Some("custom-std")
+						and options.no_format
+						and not options.cache
+						and options.repeat == 3
+						and options.jobs == 8
+						and options.timeout == Some(5)
+						and options.paths == ["tests"]
+						and serialized_wire_ok
+					)
+				CliTestWarmup:
+					False
 		CliRunDelegate(_):
 			False
 		CliRunHandled(_):
@@ -2539,10 +2596,26 @@ func test_run_cli_plans_test_command() -> Bool:
 		CliRunSource(_):
 			False
 		CliRunTest(test_plan):
-			(
-				test_plan.args == ["test", "--warmup-only"]
-				and json_string_field(test_plan.options, "kind") == "test_warmup"
-			)
+			match test_plan.command:
+				CliTestExecute(_):
+					False
+				CliTestWarmup:
+					encoded: JsonValue = cli_run_plan_to_json(CliRunTest(test_plan))
+
+					serialized_wire_ok: Bool = match get_field(encoded, "artifact"):
+						Some(artifact):
+							get_field(artifact, "options")
+								.map(func(value):
+									(
+										json_string_field(artifact, "kind") == "test"
+										and json_string_field(value, "kind") == "test_warmup"
+									)
+								)
+								.get_or(False)
+						None:
+							False
+
+					test_plan.args == ["test", "--warmup-only"] and serialized_wire_ok
 		CliRunDelegate(_):
 			False
 		CliRunHandled(_):
