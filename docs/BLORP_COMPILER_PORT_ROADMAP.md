@@ -130,14 +130,16 @@ The public executable is Blorp-owned through
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. Ordinary `check` makes
 no OCaml call. Ordinary `compile` and `run` call only the private
 `blorp-ocaml-middle` semantic worker; source-command effects stay in Blorp.
-`compiler/bin/blorp_ocaml_host.ml` remains only for non-source commands and the
-explicit pinned-bootstrap compile wrapper.
+`compiler/bin/blorp_ocaml_host.ml` remains only for non-source commands. The
+compiler bootstrap is a separately packaged immutable
+`blorp-bootstrap-compiler` artifact; the current host no longer implements its
+compile command.
 
 The OCaml typed-AST lowering and flattening modules remain compatibility code
-for the pinned-bootstrap wrapper and direct in-memory OCaml compiler tests.
-They are not the normal `compile`/`run` producer. Delete them only after those
-callers are converted to prepared Core; checkpoint 8 does not move the
-bootstrap trust root.
+for test-runner, REPL, and direct in-memory OCaml compiler callers. They are not
+the normal `compile`/`run` producer or part of the current source bootstrap
+implementation. Delete them after those Checkpoint 12 callers are converted to
+prepared Core.
 
 ## Migration Rules
 
@@ -324,8 +326,8 @@ Closed deletion point:
 - OCaml root expansion, source reads, and parser fallback code for normal
   `check`, `compile`, and `run` have been deleted from the shell path. The
   ordinary `check` path now ends in the Blorp frontend without entering OCaml.
-  The pinned bootstrap compile wrapper consumes a Blorp-produced graph through
-  `Pipeline.compile_preloaded_graph_with_blorp_bridge`. The test-only
+  The immutable bootstrap compiler consumes a Blorp-produced graph without
+  linking that compatibility route into the current OCaml host. The test-only
   graph-typecheck wrapper, `Pipeline.compile_parsed` compatibility API, and
   their path-specific tests have been deleted.
 
@@ -561,9 +563,9 @@ Deletion point:
 
 - Delete OCaml module path resolution/loading/cache code after every remaining
   production and tooling caller consumes a Blorp-validated module graph and no
-  longer needs `Modules.load_imports` for non-graph entry points. The pinned
-  bootstrap wrapper already enters through
-  `Pipeline.compile_preloaded_graph_with_blorp_bridge`.
+  longer needs `Modules.load_imports` for non-graph entry points. The immutable
+  bootstrap compiler carries its own frozen graph compatibility path; current
+  source no longer exposes that bootstrap entrypoint.
 
 ## Checkpoint 4: Diagnostics, Session, Types, Env, And Builtins
 
@@ -1890,9 +1892,11 @@ prepared Core now continues directly into the Blorp-owned checkpoint-9 early
 pipeline; it is no longer the process boundary. The semantic worker no longer
 reconstructs typed AST or invokes OCaml Core lowering.
 
-The pinned-bootstrap compile wrapper and direct in-memory OCaml compiler tests
-still use `Core_lower`/`Core_flatten` as compatibility scaffolding. This is a
-separate trust-root path, not a fallback from normal `compile` or `run`.
+Test-runner, REPL, and direct in-memory OCaml compiler callers still use
+`Core_lower`/`Core_flatten` as compatibility scaffolding. The immutable
+bootstrap compiler carries its own already-built implementation and no longer
+keeps this source path live. None of these callers is a fallback from normal
+`compile` or `run`.
 
 OCaml references:
 
@@ -2261,8 +2265,8 @@ Deletion point:
 
 - Normal production ownership has moved, so no new source-command dependency
   may be added to OCaml typed-AST lowering or flattening. Delete
-  `core_lower.ml` and `core_flatten.ml` after the pinned-bootstrap wrapper and
-  direct in-memory compatibility tests are converted to prepared Core. The
+  `core_lower.ml` and `core_flatten.ml` after the test-runner, REPL, and direct
+  in-memory compatibility callers are converted to prepared Core. The
   broad implementation-only OCaml lowering, flattening, and FFI-boundary suites
   were replaced with one focused compatibility-contract suite after their
   authoritative Blorp suites and production prepared-Core boundary were
@@ -2399,10 +2403,11 @@ Remaining production OCaml references, in
   - `specialize_program`
 
 `compiler/lib/core_synth.ml` is compatibility-only. Generated TestSuite
-harnesses, the pinned-bootstrap wrapper, and direct in-memory OCaml tests still
-enter through `Core_pipeline.run_core_passes`; migrate those callers to the
-prepared post-synthesis boundary before deleting the OCaml synthesis module and
-its remaining implementation-only coverage.
+harnesses, REPL compilation, and direct in-memory OCaml tests still enter
+through `Core_pipeline.run_core_passes`; migrate those callers to the prepared
+post-synthesis boundary before deleting the OCaml synthesis module and its
+remaining implementation-only coverage. The immutable bootstrap compiler no
+longer keeps this source module live.
 
 Blorp references:
 
@@ -3038,14 +3043,14 @@ Status: production cutover is complete. Blorp owns source-command artifact
 writing, runtime packaging and caching, host-C invocation, and program
 execution. Pre-DCE and prepared Core are distinct backend-boundary types, so
 the CLI cannot repeat the late ownership pipeline before emission. The
-remaining work is Checkpoint K of the host-exit roadmap: merge and publish this
-architecture from the old immutable bootstrap, then rotate the single
-bootstrap manifest in a separate commit.
+current OCaml host's bootstrap compile command and argument parser are deleted.
+Release archives preserve the old compiler as a separately named immutable
+`blorp-bootstrap-compiler` artifact. The remaining Checkpoint K work is to
+publish and pin that archive, then remove the temporary old-artifact-name
+fallback in a separate commit.
 
 OCaml references:
 
-- `compiler/bin/blorp_ocaml_host.ml`
-  - `run_bootstrap_compile`, used only by the pinned bootstrap wrapper
 - `compiler/lib/test_runner.ml`
   - shared test-command compilation, scheduled for Checkpoint 12
 - `compiler/lib/runtime.c`
@@ -3278,7 +3283,7 @@ The migration is complete when:
 - OCaml no longer owns parser, module graph, typecheck, CTFE, typed AST, Core
   lowering, Core passes, ownership, C emission, CLI command execution, test
   running, package management, REPL, or LSP behavior;
-- remaining OCaml, if any, is limited to a documented bootstrap wrapper with no
-  compiler semantics;
+- no OCaml source remains in the shipped compiler; the separately packaged
+  immutable bootstrap compiler is only a build trust root;
 - `scripts/test`, `compiler-deep`, leak/runtime gates, preview smoke commands,
   and Docker premerge gates pass.

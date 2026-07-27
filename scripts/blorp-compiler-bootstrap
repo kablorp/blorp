@@ -45,6 +45,7 @@ case "$layout" in
 		;;
 esac
 toolchain_executables="blorp blorp-ocaml-host blorp-ocaml-middle blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck"
+bootstrap_compiler_executable="blorp-bootstrap-compiler"
 
 if [[ ! "$tag" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "Compiler bootstrap tag must be an immutable dev revision: $tag" >&2
@@ -90,6 +91,7 @@ Options:
   --print-id             Print the pinned release id without running blorp
   --print-path           Print the resolved executable path without running blorp
   --print-toolchain-dir  Print the verified complete-toolchain directory
+  --print-compiler-path  Print the immutable compiler used to build Blorp itself
   -h, --help             Show this help
 
 Environment:
@@ -200,6 +202,18 @@ cache_marker_matches() {
 			return 1
 		fi
 	done
+
+	if grep -q "^file_sha256_${bootstrap_compiler_executable}=" "$marker"; then
+		if [ ! -x "$install_dir/$bootstrap_compiler_executable" ]; then
+			return 1
+		fi
+		actual_sha=$(sha256_file "$install_dir/$bootstrap_compiler_executable")
+		if ! grep -Fxq "file_sha256_${bootstrap_compiler_executable}=$actual_sha" "$marker"; then
+			return 1
+		fi
+	elif [ -e "$install_dir/$bootstrap_compiler_executable" ]; then
+		return 1
+	fi
 }
 
 install_bootstrap() {
@@ -215,7 +229,7 @@ install_bootstrap() {
 	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
-	trap 'rm -rf "$stage_dir"; for executable in $toolchain_executables; do rm -f "$install_dir/$executable.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
+	trap 'rm -rf "$stage_dir"; for executable in $toolchain_executables $bootstrap_compiler_executable; do rm -f "$install_dir/$executable.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
 
 	archive="$stage_dir/$asset"
 	checksum="$archive.sha256"
@@ -263,6 +277,11 @@ install_bootstrap() {
 			cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
 			chmod 0755 "$install_dir/$executable.tmp.$$"
 		done
+		if [ -f "$package_dir/$bootstrap_compiler_executable" ]; then
+			cp "$package_dir/$bootstrap_compiler_executable" \
+				"$install_dir/$bootstrap_compiler_executable.tmp.$$"
+			chmod 0755 "$install_dir/$bootstrap_compiler_executable.tmp.$$"
+		fi
 	else
 		cp "$binary_path" "$binary.tmp.$$"
 		chmod 0755 "$binary.tmp.$$"
@@ -280,6 +299,10 @@ install_bootstrap() {
 				actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
 				echo "file_sha256_${executable}=$actual_sha"
 			done
+			if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
+				actual_sha=$(sha256_file "$install_dir/$bootstrap_compiler_executable.tmp.$$")
+				echo "file_sha256_${bootstrap_compiler_executable}=$actual_sha"
+			fi
 		else
 			actual_sha=$(sha256_file "$binary.tmp.$$")
 			echo "binary_sha256=$actual_sha"
@@ -292,6 +315,12 @@ install_bootstrap() {
 				mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
 			fi
 		done
+		if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
+			mv "$install_dir/$bootstrap_compiler_executable.tmp.$$" \
+				"$install_dir/$bootstrap_compiler_executable"
+		else
+			rm -f "$install_dir/$bootstrap_compiler_executable"
+		fi
 		mv "$install_dir/blorp.tmp.$$" "$binary"
 	else
 		mv "$binary.tmp.$$" "$binary"
@@ -331,6 +360,25 @@ resolve_bootstrap_toolchain_dir() {
 	dirname "$bootstrap_path"
 }
 
+resolve_bootstrap_compiler_path() {
+	local toolchain_dir dedicated legacy
+
+	toolchain_dir=$(resolve_bootstrap_toolchain_dir)
+	dedicated="$toolchain_dir/$bootstrap_compiler_executable"
+	legacy="$toolchain_dir/blorp-ocaml-host"
+
+	if [ -x "$dedicated" ]; then
+		printf '%s\n' "$dedicated"
+	elif [ -x "$legacy" ]; then
+		# Transition support for immutable toolchains published before the
+		# bootstrap compiler received its own artifact name.
+		printf '%s\n' "$legacy"
+	else
+		echo "Pinned compiler bootstrap does not contain an immutable bootstrap compiler." >&2
+		exit 1
+	fi
+}
+
 case "${1:-}" in
 	--print-tag)
 		printf '%s\n' "$tag"
@@ -346,6 +394,10 @@ case "${1:-}" in
 		;;
 	--print-toolchain-dir)
 		resolve_bootstrap_toolchain_dir
+		exit 0
+		;;
+	--print-compiler-path)
+		resolve_bootstrap_compiler_path
 		exit 0
 		;;
 	-h | --help)

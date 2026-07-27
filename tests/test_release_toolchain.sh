@@ -31,6 +31,7 @@ fake_bin="$tmp_dir/release-bin"
 mkdir -p "$fake_bin"
 toolchain_executables=(
 	blorp
+	blorp-bootstrap-compiler
 	blorp-ocaml-host
 	blorp-ocaml-middle
 	blorp-compiler-renderer
@@ -74,6 +75,7 @@ mkdir -p "$selected_workers"
 cp /bin/sh "$selected_workers/blorp-ocaml-host"
 cp /bin/sh "$selected_workers/blorp-ocaml-middle"
 BLORP_RELEASE_BINARY="$fake_bin/blorp" \
+	BLORP_RELEASE_BOOTSTRAP_COMPILER="$fake_bin/blorp-bootstrap-compiler" \
 	BLORP_RELEASE_OCAML_HOST="$selected_workers/blorp-ocaml-host" \
 	BLORP_RELEASE_OCAML_MIDDLE="$selected_workers/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
@@ -125,6 +127,23 @@ if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	>"$tmp_dir/package-missing-helper.output" 2>&1
 then
 	fail "release packaging must reject a missing private helper"
+fi
+
+if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
+	BLORP_RELEASE_BOOTSTRAP_COMPILER="$tmp_dir/missing-bootstrap-compiler" \
+	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
+	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	scripts/package-release "$tmp_dir/missing-bootstrap-dist" \
+	>"$tmp_dir/package-missing-bootstrap.output" 2>&1
+then
+	fail "release packaging must reject a missing bootstrap compiler"
+fi
+if ! grep -Fq "Release bootstrap compiler not found or not executable" \
+	"$tmp_dir/package-missing-bootstrap.output"
+then
+	fail "a missing bootstrap compiler must produce a precise diagnostic"
 fi
 
 mock_bin="$tmp_dir/mock-bin"
@@ -234,14 +253,34 @@ bootstrap_toolchain_dir=$(PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-toolchain-dir)
+bootstrap_compiler_path=$(PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-compiler-path)
 if [ "$bootstrap_toolchain_dir" != "$(dirname "$bootstrap_path")" ]; then
 	fail "the bootstrap resolver must expose its verified complete-toolchain directory"
+fi
+if [ "$bootstrap_compiler_path" != "$bootstrap_toolchain_dir/blorp-bootstrap-compiler" ]; then
+	fail "the bootstrap resolver must expose the dedicated immutable compiler"
 fi
 for executable in "${toolchain_executables[@]}"; do
 	if [ ! -x "$(dirname "$bootstrap_path")/$executable" ]; then
 		fail "a toolchain bootstrap must cache $executable"
 	fi
 done
+
+printf 'corrupted bootstrap compiler\n' \
+	>"$(dirname "$bootstrap_path")/blorp-bootstrap-compiler"
+chmod +x "$(dirname "$bootstrap_path")/blorp-bootstrap-compiler"
+PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-compiler-path >/dev/null
+if ! cmp "$fake_bin/blorp-bootstrap-compiler" \
+	"$(dirname "$bootstrap_path")/blorp-bootstrap-compiler"
+then
+	fail "bootstrap cache validation must repair a corrupted immutable compiler"
+fi
 
 printf 'corrupted helper\n' >"$(dirname "$bootstrap_path")/blorp-compiler-parser"
 chmod +x "$(dirname "$bootstrap_path")/blorp-compiler-parser"
@@ -253,6 +292,30 @@ if ! cmp "$fake_bin/blorp-compiler-parser" \
 	"$(dirname "$bootstrap_path")/blorp-compiler-parser"
 then
 	fail "bootstrap cache validation must repair a corrupted private helper"
+fi
+
+legacy_toolchain_root="$tmp_dir/legacy-toolchain/$archive_base"
+mkdir -p "$legacy_toolchain_root"
+for executable in "${toolchain_executables[@]}"; do
+	if [ "$executable" != "blorp-bootstrap-compiler" ]; then
+		cp "$fake_bin/$executable" "$legacy_toolchain_root/$executable"
+	fi
+done
+legacy_toolchain_archive="$tmp_dir/legacy-toolchain.tar.gz"
+tar -C "$(dirname "$legacy_toolchain_root")" -czf "$legacy_toolchain_archive" \
+	"$(basename "$legacy_toolchain_root")"
+cp "$legacy_toolchain_archive" "$bootstrap_downloads/$bootstrap_asset"
+write_checksum "$bootstrap_downloads/$bootstrap_asset"
+legacy_toolchain_sha=$(sha256_file "$bootstrap_downloads/$bootstrap_asset")
+write_bootstrap_manifest toolchain "$legacy_toolchain_sha"
+legacy_toolchain_compiler=$(PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/legacy-toolchain-cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-compiler-path)
+if [ "$legacy_toolchain_compiler" != \
+	"$(dirname "$legacy_toolchain_compiler")/blorp-ocaml-host" ]
+then
+	fail "a pre-transition toolchain must use its immutable OCaml host as the bootstrap compiler"
 fi
 
 cp "$legacy_archive" "$bootstrap_downloads/$bootstrap_asset"

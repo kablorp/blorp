@@ -4,10 +4,8 @@ import:
 	../stage_03_parse/compiler_parsed_ast:
 		ParsedProgram,
 		ParsedProgramPhase(TypecheckSourceProgram),
-		parsed_program_phase_name,
 	../stage_03_parse/compiler_parser_bridge as ParserBridge
 	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
-	compiler_bridge_protocol: BRIDGE_DOMAIN, BRIDGE_SCHEMA_VERSION
 	compiler_cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
 	compiler_cli_plan:
 		CliCheckTargetExpansion,
@@ -30,7 +28,7 @@ import:
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 	fs: message, open_read, read_text
 	json:
-		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		JsonValue(JsonNull, JsonObject, JsonString, JsonVector),
 		as_array,
 		as_string,
 		get_field,
@@ -44,10 +42,6 @@ private CURRENT_PACKAGE_STD_COMPAT: String = "preview-1"
 
 private pure func owned_string(text: String) -> String:
 	text.substring(0, text.length())
-
-
-private pure func cli_frontend_ast_phase_name() -> String:
-	parsed_program_phase_name(TypecheckSourceProgram)
 
 
 private pure func absolute_normalized_path(cwd: String, path: String) -> String:
@@ -281,183 +275,56 @@ pure func single_explicit_check_source(
 			None
 
 
-private pure func parse_source_request_value(
-	path: String,
-	module_name: String,
-	source: String,
-) -> JsonValue:
-	JsonObject([
-		("schema", JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))),
-		("domain", JsonString(BRIDGE_DOMAIN)),
-		("action", JsonString("parse_source")),
-		("payload", JsonObject([
-			("path", JsonString(path)),
-			("module", JsonString(module_name)),
-			("text", JsonString(source)),
-			("ast_phase", JsonString(cli_frontend_ast_phase_name())),
-		])),
-	])
-
-
-private pure func parse_source_item_request_value(source: CliSourceFile) -> JsonValue:
-	JsonObject([
-		("path", JsonString(source.path)),
-		("module", JsonString(source.module_name)),
-		("text", JsonString(source.source_text)),
-	])
-
-
-private pure func parse_sources_request_value(sources: List[CliSourceFile]) -> JsonValue:
-	JsonObject([
-		("schema", JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))),
-		("domain", JsonString(BRIDGE_DOMAIN)),
-		("action", JsonString("parse_sources")),
-		("payload", JsonObject([
-			("include_comments", JsonBool(False)),
-			("ast_phase", JsonString(cli_frontend_ast_phase_name())),
-			("sources", JsonVector(sources.map(parse_source_item_request_value))),
-		])),
-	])
-
-
-private pure func parser_artifact(response: JsonValue) -> Result[JsonValue, String]:
-	match get_field(response, "ok"):
-		Some(JsonBool(True)):
-			match get_field(response, "artifact"):
-				Some(artifact):
-					Ok(artifact)
-				None:
-					Err("parser response missing artifact")
-		Some(JsonBool(False)):
-			match get_field(response, "error"):
-				Some(error):
-					match get_field(error, "message"):
-						Some(message):
-							match as_string(message):
-								Some(text):
-									Err(text)
-								None:
-									Err("parser response error message was not a string")
-						None:
-							Err("parser response missing error message")
-				None:
-					Err("parser response missing error object")
-		_:
-			Err("parser response missing ok flag")
-
-
-private pure func parser_string_field(
-	value: JsonValue,
-	field_name: String,
-) -> Result[String, String]:
-	match get_field(value, field_name):
-		Some(field):
-			match as_string(field):
-				Some(text):
-					Ok(text)
-				None:
-					Err("parser response field `" + field_name + "` was not a string")
-		None:
-			Err("parser response missing field `" + field_name + "`")
-
-
-private pure func parser_sources_artifacts(response: JsonValue) -> Result[List[JsonValue], String]:
-	artifact ?= parser_artifact(response)
-
-	match get_field(artifact, "sources"):
-		Some(sources_value):
-			match as_array(sources_value):
-				Some(sources):
-					Ok(sources)
-				None:
-					Err("parser response sources field was not an array")
-		None:
-			Err("parser response missing sources field")
-
-
 func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, String]:
-	response: JsonValue = ParserBridge.handle_request_value(
-		parse_source_request_value(
-			source.path,
-			source.module_name,
-			source.source_text,
-		),
+	artifact = ParserBridge.parsed_source_bridge_artifact(
+		source.path,
+		source.module_name,
+		source.source_text,
+		TypecheckSourceProgram,
+		False,
 	)
-	artifact ?= parser_artifact(response)
 	Ok({
 		path = owned_string(source.path),
 		module_name = owned_string(source.module_name),
 		source_text = owned_string(source.source_text),
-		parsed_source = artifact,
+		parsed_source = artifact.json,
+		typecheck_program = artifact.program,
 	})
 
 
 pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSourceFile:
+	artifact = ParserBridge.parsed_source_bridge_artifact_from_program(
+		program,
+		TypecheckSourceProgram,
+	)
 	{
 		path = owned_string(program.source.path),
 		module_name = owned_string(program.source.module_name),
 		source_text = owned_string(program.source.text),
-		parsed_source = ParserBridge.parsed_source_artifact_from_program(
-			program,
-			TypecheckSourceProgram,
-		)
+		parsed_source = artifact.json,
+		typecheck_program = artifact.program,
 	}
 
 
-private pure func parsed_source_for_artifact(
-	source: CliSourceFile,
-	artifact: JsonValue,
-) -> Result[CliParsedSourceFile, String]:
-	artifact_path ?= parser_string_field(artifact, "path")
-	artifact_module_name ?= parser_string_field(artifact, "module")
-
-	if artifact_path != source.path:
-		Err(
-			"parser response path `" + artifact_path + "` did not match source `" + source.path + "`",
-		)
-	else if artifact_module_name != source.module_name:
-		Err(
-			"parser response module `" + artifact_module_name + "` did not match source `" + source.module_name + "`",
-		)
-	else:
-		Ok({
-			path = owned_string(artifact_path),
-			module_name = owned_string(artifact_module_name),
-			source_text = owned_string(source.source_text),
-			parsed_source = artifact,
-		})
-
-
-private pure func parse_cli_source_artifacts_at(
-	sources: List[CliSourceFile],
-	artifacts: List[JsonValue],
-	index: Int,
-	parsed_sources: List[CliParsedSourceFile],
-) -> Result[List[CliParsedSourceFile], String]:
-	if index >= sources.length():
-		Ok(parsed_sources)
-	else:
-		match (sources.get(index), artifacts.get(index)):
-			(Some(source), Some(artifact)):
-				parsed ?= parsed_source_for_artifact(source, artifact)
-				parse_cli_source_artifacts_at(
-					sources,
-					artifacts,
-					index + 1,
-					parsed_sources.append(parsed),
-				)
-			_:
-				Err("parser response source count did not match request")
-
-
 func parse_cli_sources(sources: List[CliSourceFile]) -> Result[List[CliParsedSourceFile], String]:
-	response: JsonValue = ParserBridge.handle_request_value(parse_sources_request_value(sources))
-	artifacts ?= parser_sources_artifacts(response)
+	var parsed_sources: List[CliParsedSourceFile] = []
+	var error: Option[String] = None
 
-	if artifacts.length() != sources.length():
-		Err("parser response source count did not match request")
-	else:
-		parse_cli_source_artifacts_at(sources, artifacts, 0, [])
+	for source in sources:
+		if error.is_some():
+			break
+
+		match parse_cli_source(source):
+			Ok(parsed):
+				parsed_sources = parsed_sources.append(parsed)
+			Err(message):
+				error = Some(message)
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(parsed_sources)
 
 
 union CliResolvedImportContents:
@@ -1385,13 +1252,24 @@ private func configured_std_module_name(
 			None
 
 
+private pure func parsed_program_with_module_name(
+	program: ParsedProgram,
+	module_name: String,
+) -> ParsedProgram:
+	{ program | source = { program.source | module_name = module_name } }
+
+
 private func normalize_root_module_name(
 	context: CliFrontendGraphContext,
 	source: CliParsedSourceFile,
 ) -> CliParsedSourceFile:
 	match configured_std_module_name(context, source.path):
 		Some(module_name):
-			{ source | module_name = module_name }
+			{
+				source |
+				module_name = module_name,
+				typecheck_program = parsed_program_with_module_name(source.typecheck_program, module_name)
+			}
 		None:
 			source
 
@@ -1433,6 +1311,7 @@ private func frontend_graph_source(
 		module_name = owned_string(source.module_name),
 		source_text = owned_string(source.source_text),
 		parsed_source = source.parsed_source,
+		typecheck_program = source.typecheck_program,
 		origin = frontend_module_origin_for_path(context, source.path, source.module_name)
 	}
 
@@ -2192,6 +2071,7 @@ func frontend_module_graph_with_generated_root(
 						module_name = owned_string(generated.module_name),
 						source_text = owned_string(generated.source_text),
 						parsed_source = generated.parsed_source,
+						typecheck_program = generated.typecheck_program,
 						origin = CliFrontendGeneratedModule
 					}
 

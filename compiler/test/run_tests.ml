@@ -146,8 +146,6 @@ let deep_suites =
   @ suite_group "PackageArtifact" Test_package_artifact.suite
   @ suite_group "PackageConfig" Test_package_config.suite
   @ suite_group "PackageCache" Test_package_cache.suite
-  @ suite_group "CompilerHostCompileWrapperArgs"
-      Test_compiler_host_compile_wrapper_args.suite
   @ suite_group "Pipeline" Test_pipeline.suite
   @ suite_group "TestRunner" Test_test_runner.suite
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite

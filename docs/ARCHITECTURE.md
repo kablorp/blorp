@@ -123,11 +123,11 @@ closure-call arguments. OCaml fusion may introduce those forms before the
 handoff; the Blorp-owned closure and preparation stages, rather than the
 projection boundary, own their final normalization for C emission.
 
-The pinned-bootstrap wrapper still compiles the Blorp CLI through the legacy
-OCaml typed-AST/Core-lowering entrypoint. That bootstrap trust-root path is
-kept separate from normal source compilation and is not a runtime fallback.
-Direct in-memory OCaml compiler tests also retain the compatibility entrypoint
-until their fixtures move to prepared Core.
+The Blorp CLI is built by a separately packaged immutable
+`blorp-bootstrap-compiler`. Its legacy typed-AST/Core-lowering implementation
+is binary trust-root material, not source in the current OCaml host and not a
+runtime fallback. Test-runner, REPL, and direct in-memory OCaml callers still
+retain the source compatibility entrypoint until they move to prepared Core.
 
 ```
 Blorp Typed AST graph

@@ -203,7 +203,7 @@ has all private workers and prepared bridges beside it.
 Fallback helper builds for an explicit custom compiler call the normal
 `compile` command with
 `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
-the old `BLORP_FRONTEND_PARSER` selector. The bootstrap wrapper sets that
+the old `BLORP_FRONTEND_PARSER` selector. The bootstrap resolver sets that
 retired knob only for pinned external bootstrap binaries that still read it, so
 those binaries stay on their built-in parser while compiling bridge helpers.
 
@@ -278,9 +278,9 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` packages the public `./blorp` command and its private
-OCaml workers and prepared compiler bridges into a release archive plus a
-`.sha256` file:
+`scripts/package-release` packages the public `./blorp` command, the immutable
+bootstrap compiler, private OCaml workers, and prepared compiler bridges into
+a release archive plus a `.sha256` file:
 
 ```bash
 scripts/package-release dist
@@ -292,6 +292,8 @@ prepare them before creating the archive.
 Useful environment variables:
 
 - `BLORP_RELEASE_BINARY` selects the binary to package.
+- `BLORP_RELEASE_BOOTSTRAP_COMPILER` selects the immutable compiler used to
+  build the next Blorp executable.
 - `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
 - `BLORP_RELEASE_OCAML_MIDDLE` selects the private semantic worker to package.
 - `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.

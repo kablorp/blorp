@@ -56,6 +56,26 @@ if ! grep -Fq -- '--print-toolchain-dir' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must resolve the pinned complete toolchain" >&2
 	exit 1
 fi
+if ! grep -Fq -- '--print-compiler-path' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must resolve the immutable bootstrap compiler" >&2
+	exit 1
+fi
+if grep -Fq '"compiler/_build/default/bin/blorp_ocaml_host.exe" __compiler-host-compile-wrapper' \
+	<<<"$cli_build_plan"
+then
+	echo "FAIL: the Blorp CLI build must not compile itself through the current OCaml host" >&2
+	exit 1
+fi
+if ! grep -Fq '"$bootstrap_compiler" __compiler-host-compile-wrapper' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must invoke the pinned bootstrap compiler" >&2
+	exit 1
+fi
+if grep -R -Fq '__compiler-host-compile-wrapper' \
+	compiler/bin compiler/blorp/src
+then
+	echo "FAIL: current compiler source must not retain the immutable bootstrap compiler command" >&2
+	exit 1
+fi
 for bridge_env in \
 	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
 	BLORP_COMPILER_PARSER_BRIDGE_BIN \
@@ -275,6 +295,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'name: Package tested toolchain' "$ci_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_workflow" ||
 	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_workflow" ||
+	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_workflow" ||
@@ -375,6 +396,7 @@ if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$release_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
