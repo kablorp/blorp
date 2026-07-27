@@ -833,11 +833,13 @@ translation units.
 ### Main Entry Point
 
 The public `./blorp` executable is built from the Blorp CLI entry point in
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs user-facing command
-planning, source discovery, source reads, parsing, and current frontend graph
-handoffs before invoking the private OCaml host shell
-`compiler/bin/blorp_ocaml_host.ml` for the compiler stages and impure host
-actions that have not yet migrated.
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs
+user-facing command planning, source discovery, source reads, parsing,
+typechecking, Core preparation, backend coordination, and migrated host
+effects. Compile and run cross once into the private OCaml semantic-middle
+worker, then return to Blorp for the remaining Core pipeline, C emission, and
+host effects. Test commands and other unmigrated non-source commands still
+delegate to `compiler/bin/blorp_ocaml_host.ml`.
 
 User-facing subcommands:
 

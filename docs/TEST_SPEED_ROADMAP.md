@@ -575,14 +575,24 @@ typechecked modules against canonical `std/test::TestSuite` identity. The
 resolver consumes the declaration's canonical binding type, so local type
 aliases remain transparent while same-named user records and wrong types cannot
 qualify. Missing, inaccessible private, ambiguous, and invalid-program bindings
-are explicit states. Production `Test_runner` routing remains on the OCaml
-constructors, but compile preparation now has an explicit typecheck-once
+are explicit states. Compile preparation now has an explicit typecheck-once
 boundary: a pure callback can validate suite identities against the coherent
 typed graph before that same graph continues into Core preparation. The raw
 typed graph cannot be paired with a different compile plan. The retained
 generated-harness regression exercises this path after deleting the source
-files. The next slice must route one production harness through it before the
-OCaml constructors can be removed.
+files. Typed planning now constructs the retained single-suite run graph and
+represents every unsupported policy as an explicit fallback.
+
+A production execution prototype was deliberately not enabled. It exposed two
+general compiler defects: first-class local function values lost their
+callable identity before module flattening, and synthesized Option fusion
+pattern binders used a different `CoreVar.uniq` from their references. Both
+defects now have focused regressions and fixes. After those fixes, large
+compiler-owned suites still reveal additional Blorp-pipeline runtime
+miscompilations, and direct reuse of the source-run effect does not preserve
+test timeout, output, status, profiling, or leak-isolation semantics. The next
+slice must provide a test-specific execution/reporting effect and pass
+representative compiler-owned suites before moving the production boundary.
 
 **Target architecture:**
 

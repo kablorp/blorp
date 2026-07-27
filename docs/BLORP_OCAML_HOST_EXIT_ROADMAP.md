@@ -763,8 +763,9 @@ Status: source-command cutover is implemented on this branch. Check makes zero
 OCaml calls; compile/run make one semantic-middle call; all post-worker effects
 are Blorp-owned; source run is unrepresentable in `CliOcamlHostPlan`; and the
 OCaml run effect implementation is deleted. The general host remains for
-unmigrated non-source commands, while the old compile implementation remains
-only behind the explicitly named pinned-bootstrap wrapper.
+unmigrated non-source commands, including test execution. The old compile
+implementation remains only behind the explicitly named pinned-bootstrap
+wrapper.
 
 Implementation order:
 
