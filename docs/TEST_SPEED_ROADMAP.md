@@ -576,8 +576,13 @@ resolver consumes the declaration's canonical binding type, so local type
 aliases remain transparent while same-named user records and wrong types cannot
 qualify. Missing, inaccessible private, ambiguous, and invalid-program bindings
 are explicit states. Production `Test_runner` routing remains on the OCaml
-constructors until one harness execution path consumes these typed results and
-the retained graph without rebuilding the frontend.
+constructors, but compile preparation now has an explicit typecheck-once
+boundary: a pure callback can validate suite identities against the coherent
+typed graph before that same graph continues into Core preparation. The raw
+typed graph cannot be paired with a different compile plan. The retained
+generated-harness regression exercises this path after deleting the source
+files. The next slice must route one production harness through it before the
+OCaml constructors can be removed.
 
 **Target architecture:**
 

@@ -1,10 +1,11 @@
 import:
+	../src/stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedGraph
 	../src/stage_09_core/compiler_semantic_worker_protocol: semantic_middle_capability_name
 	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck), CliCompileArgs
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
 	../src/stage_12_cli/compiler_cli_compile_execute:
 		CliCompilePreparation(CliCompilePreparationReady),
-		prepare_compile_plan_with_frontend_policy,
+		prepare_compile_plan_with_typed_validation,
 	../src/stage_12_cli/compiler_cli_compile_frontend: CliFrontendCompilePolicy
 	../src/stage_12_cli/compiler_cli_generated_test_harness:
 		GeneratedTestSuiteTarget,
@@ -24,6 +25,9 @@ import:
 		frontend_module_graph_with_generated_root,
 		parse_cli_sources,
 		read_cli_sources_for_action,
+	../src/stage_12_cli/compiler_cli_test_discovery:
+		CliTestSuiteBindingResolution(CliTestSuiteBindingResolved),
+		resolve_test_suite_binding,
 	path: normalize
 	system: file_exists, getcwd, mkdir, now_microseconds, remove_dir, remove_file, write_file
 	test: TestSuite, run_suite
@@ -140,6 +144,24 @@ private pure func compile_options(paths: List[String]) -> CliCompileArgs:
 		output = None,
 		files = paths
 	}
+
+
+private pure func validate_test_suite_targets(
+	typechecked: CompilerTypecheckedGraph,
+	targets: List[GeneratedTestSuiteTarget],
+) -> List[String]:
+	targets.flat_map(func(target):
+		match typechecked.modules.find(func(module): module.path == target.path):
+			Some(module):
+				match resolve_test_suite_binding(module):
+					CliTestSuiteBindingResolved:
+						errors: List[String] = []
+						errors
+					_:
+						["`${target.path}` does not export a valid TestSuite binding"]
+			None:
+				["typed graph is missing test module `${target.path}`"]
+	)
 
 
 private pure func serialized_compile_graph(
@@ -321,16 +343,19 @@ private func test_generated_root_extends_existing_graph_without_reparsing_module
 
 					frontend_policy: CliFrontendCompilePolicy = {
 						allow_debug_only_calls = True,
-						retain_debug_blocks = True
+						retain_debug_blocks = False
 					}
 
-					generated_preparation = prepare_compile_plan_with_frontend_policy(
-						{
-							args = [generated.source.path],
-							options = compile_options([generated.source.path]),
-							graph = extended
-						},
-						frontend_policy,
+					test_targets: List[GeneratedTestSuiteTarget] = fixture.targets
+					compile_plan: CliCompilePlan = {
+						args = [generated.source.path],
+						options = compile_options([generated.source.path]),
+						graph = extended
+					}
+					generated_preparation = prepare_compile_plan_with_typed_validation(compile_plan, frontend_policy, pure func(
+						typechecked,
+					):
+						validate_test_suite_targets(typechecked, test_targets)
 					)
 
 					generated_compile_errors: List[String] = match generated_preparation:

@@ -2,7 +2,9 @@
 -- semantic-middle request. Keeping this out of the check executor prevents
 -- Core protocol types from entering the production check program.
 import:
-	../stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedModule
+	../stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedGraph,
+		CompilerTypecheckedModule,
 	../stage_06_typecheck/compiler_typecheck_state: CompilerImportBinding
 	../stage_06_typecheck/compiler_typed_ast_json: compiler_typed_program_to_json
 	../stage_08_core_lower/compiler_core_graph_prepare:
@@ -105,6 +107,30 @@ pure func compile_frontend_graph(
 	observations: List[SemanticMiddleStage],
 	stop_after: Option[SemanticMiddleStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
+	compile_frontend_graph_with_typed_validation(
+		graph,
+		policy,
+		pure func(_): [],
+		require_main,
+		check_invariants,
+		early_observations,
+		early_stop,
+		observations,
+		stop_after,
+	)
+
+
+pure func compile_frontend_graph_with_typed_validation(
+	graph: CliFrontendModuleGraph,
+	policy: CliFrontendCompilePolicy,
+	validate: pure (CompilerTypecheckedGraph) -> List[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+	observations: List[SemanticMiddleStage],
+	stop_after: Option[SemanticMiddleStage],
+) -> Result[CompiledFrontendGraph, List[String]]:
 	match graph.roots:
 		[root]:
 			typechecked = typecheck_frontend_root(graph, root, policy.allow_debug_only_calls)
@@ -113,70 +139,93 @@ pure func compile_frontend_graph(
 			if errors.length() != 0:
 				Err(errors)
 			else:
-				prepared = prepare_core_graph(
-					typechecked.target.typed_program,
-					typechecked.modules.map(core_graph_unit),
-					typechecked.next_def_id,
-				)
+				validation_errors: List[String] = validate(typechecked)
 
-				prepared_graph ?= match prepared:
-					Ok(graph):
-						Ok(graph)
-					Err(error):
-						Err([compiler_core_graph_prepare_error_to_string(error)])
-
-				early_configuration: CoreEarlyPipelineConfiguration = {
-					debug = policy.retain_debug_blocks,
-					check_invariants = check_invariants,
-					observations = early_observations,
-					stop_after = early_stop
-				}
-				early_input: CoreEarlyPipelineInput = {
-					program = prepared_graph.program,
-					next_def_id = prepared_graph.next_def_id
-				}
-
-				match run_early_core_pipeline(early_input, early_configuration):
-					CoreEarlyPipelineFailed(diagnostic):
-						Err([early_pipeline_error(diagnostic)])
-					CoreEarlyPipelineStopped(stage, rendered, completed_observations):
-						Ok(
-							CompiledFrontendStopped(
-								typechecked.target.path,
-								core_early_pipeline_stage_name(stage),
-								rendered,
-								completed_observations.map(early_observation),
-							),
-						)
-					CoreEarlyPipelineCompleted(output):
-						request: SemanticMiddleRequest = {
-							target_path = typechecked.target.path,
-							target_module_name = typechecked.target.module_name,
-							core = output.program,
-							next_def_id = output.next_def_id,
-							import_bindings = typechecked.target.import_bindings.map(
-								semantic_import_binding,
-							),
-							module_imports = typechecked.modules.map(semantic_module_imports),
-							require_main = require_main,
-							check_invariants = check_invariants,
-							required_capabilities = [
-								PostSynthCoreCapability,
-								PreDceCoreCapability,
-								RenderedStageObservationsCapability,
-							],
-							observations = observations,
-							stop_after = stop_after
-						}
-
-						Ok(
-							CompiledFrontendReady(
-								request,
-								compiler_typed_program_to_json(
-									typechecked.target.typed_program,
-								).to_string(),
-								output.observations.map(early_observation),
-							),
-						)
+				if validation_errors.length() != 0:
+					Err(validation_errors)
+				else:
+					compile_validated_typechecked_frontend_graph(
+						typechecked,
+						policy.retain_debug_blocks,
+						require_main,
+						check_invariants,
+						early_observations,
+						early_stop,
+						observations,
+						stop_after,
+					)
 		_:
 			Err(["source compilation requires exactly one root module"])
+
+
+private pure func compile_validated_typechecked_frontend_graph(
+	typechecked: CompilerTypecheckedGraph,
+	retain_debug_blocks: Bool,
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+	observations: List[SemanticMiddleStage],
+	stop_after: Option[SemanticMiddleStage],
+) -> Result[CompiledFrontendGraph, List[String]]:
+	prepared = prepare_core_graph(
+		typechecked.target.typed_program,
+		typechecked.modules.map(core_graph_unit),
+		typechecked.next_def_id,
+	)
+
+	prepared_graph ?= match prepared:
+		Ok(graph):
+			Ok(graph)
+		Err(error):
+			Err([compiler_core_graph_prepare_error_to_string(error)])
+
+	early_configuration: CoreEarlyPipelineConfiguration = {
+		debug = retain_debug_blocks,
+		check_invariants = check_invariants,
+		observations = early_observations,
+		stop_after = early_stop
+	}
+	early_input: CoreEarlyPipelineInput = {
+		program = prepared_graph.program,
+		next_def_id = prepared_graph.next_def_id
+	}
+
+	match run_early_core_pipeline(early_input, early_configuration):
+		CoreEarlyPipelineFailed(diagnostic):
+			Err([early_pipeline_error(diagnostic)])
+		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+			Ok(
+				CompiledFrontendStopped(
+					typechecked.target.path,
+					core_early_pipeline_stage_name(stage),
+					rendered,
+					completed_observations.map(early_observation),
+				),
+			)
+		CoreEarlyPipelineCompleted(output):
+			request: SemanticMiddleRequest = {
+				target_path = typechecked.target.path,
+				target_module_name = typechecked.target.module_name,
+				core = output.program,
+				next_def_id = output.next_def_id,
+				import_bindings = typechecked.target.import_bindings.map(semantic_import_binding),
+				module_imports = typechecked.modules.map(semantic_module_imports),
+				require_main = require_main,
+				check_invariants = check_invariants,
+				required_capabilities = [
+					PostSynthCoreCapability,
+					PreDceCoreCapability,
+					RenderedStageObservationsCapability,
+				],
+				observations = observations,
+				stop_after = stop_after
+			}
+
+			Ok(
+				CompiledFrontendReady(
+					request,
+					compiler_typed_program_to_json(typechecked.target.typed_program).to_string(),
+					output.observations.map(early_observation),
+				),
+			)

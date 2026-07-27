@@ -1817,8 +1817,13 @@ Current status:
   typechecked modules against canonical `std/test::TestSuite` binding identity.
   Local aliases are transparent; private declarations are explicitly
   inaccessible to the imported harness, and same-spelled user types cannot
-  qualify. Production test execution still needs to consume these typed results
-  before the OCaml substring classifiers can be deleted.
+  qualify. Compile preparation now exposes a typecheck-once boundary, allowing
+  a pure callback to validate retained suite modules before the same coherent
+  typed graph continues into Core preparation. The raw typed graph cannot be
+  paired with a different source plan. The generated-harness regression proves
+  this after its source files have been deleted. Production test execution still
+  needs to select this path before the OCaml substring classifiers can be
+  deleted.
 
 Typed frontier closure before CTFE:
 
