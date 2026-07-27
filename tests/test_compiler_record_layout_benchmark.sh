@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner="$repo_root/benchmarks/compiler_record_layout"
+enum_layout_runner="$repo_root/benchmarks/compiler_enum_field_layout"
 stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-record-layout-test.XXXXXX")
 trap 'rm -rf "$stage_dir"' EXIT
 
@@ -11,6 +12,7 @@ fake_source="$stage_dir/fake_source.brp"
 fake_support_header="$stage_dir/fake_support_header.h"
 fake_support_source="$stage_dir/fake_support_source.c"
 missing_expectation_source="$stage_dir/missing_expectation.brp"
+unparsable_enum_record="$stage_dir/unparsable_enum_record.c"
 
 cat > "$fake_host" <<'EOF'
 #!/usr/bin/env bash
@@ -57,11 +59,48 @@ typedef struct {
 } LayoutMixed;
 typedef struct LayoutHeapFlags {
 	long header[2];
+	void* payload;
+	_Bool first : 1;
+	_Bool second : 1;
+	_Bool third : 1;
+} LayoutHeapFlags;
+typedef struct LayoutHeapDenseFlags {
+	long header[2];
+	void* payload;
+	_Bool first : 1;
+	_Bool second : 1;
+	_Bool third : 1;
+	_Bool fourth : 1;
+	_Bool fifth : 1;
+	_Bool sixth : 1;
+	_Bool seventh : 1;
+	_Bool eighth : 1;
+	_Bool ninth : 1;
+} LayoutHeapDenseFlags;
+typedef struct LayoutHeapInterleavedFlags {
+	long header[2];
+	long count;
 	_Bool first;
 	_Bool second;
-	_Bool third;
-	void* payload;
-} LayoutHeapFlags;
+} LayoutHeapInterleavedFlags;
+typedef struct LayoutHeapStates {
+	long header[2];
+	long count;
+	uint8_t first;
+	uint8_t second;
+	uint8_t third;
+} LayoutHeapStates;
+typedef struct LayoutForeignHeapFlags {
+	long header[2];
+	int first;
+	int second;
+	long count;
+} LayoutForeignHeapFlags;
+typedef struct LayoutForeignHeapState {
+	long header[2];
+	long state;
+	long count;
+} LayoutForeignHeapState;
 typedef struct {
 	int first;
 	long count;
@@ -83,6 +122,11 @@ printf '%s\n' 'int fake_support_source;' > "$fake_support_source"
 printf '%s\n' \
 	'-- EXPECT-C: typedef struct MissingLayoutExpectation {' \
 	> "$missing_expectation_source"
+cat > "$unparsable_enum_record" <<'C'
+typedef struct compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia {
+	unsigned char other;
+} compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia;
+C
 
 output=$(
 	BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
@@ -95,8 +139,8 @@ output=$(
 	"$runner"
 )
 
-if [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -ne 9 ]; then
-	echo "FAIL: record layout probe must emit one metadata and eight layout rows" >&2
+if [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -ne 19 ]; then
+	echo "FAIL: record layout probe must emit one metadata and eighteen layout rows" >&2
 	printf '%s\n' "$output" >&2
 	exit 1
 fi
@@ -105,7 +149,12 @@ for mode in O0 O2; do
 	for expected in \
 		"layout=three_flags size=12 align=4 c_type=LayoutThreeFlags" \
 		"layout=mixed size=32 align=8 c_type=LayoutMixed" \
-		"layout=heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 first_offset=16 first_size=1 second_offset=17 second_size=1 third_offset=18 third_size=1 payload_offset=24 payload_size=8 c_type=LayoutHeapFlags" \
+		"layout=heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=LayoutHeapFlags" \
+		"layout=dense_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=LayoutHeapDenseFlags" \
+		"layout=interleaved_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 c_type=LayoutHeapInterleavedFlags" \
+		"layout=heap_states size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 third_offset=26 third_size=1 c_type=LayoutHeapStates" \
+		"layout=foreign_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 first_offset=16 first_size=4 second_offset=20 second_size=4 count_offset=24 count_size=8 c_type=LayoutForeignHeapFlags" \
+		"layout=foreign_heap_state size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 state_offset=16 state_size=8 count_offset=24 count_size=8 c_type=LayoutForeignHeapState" \
 		"layout=foreign_mixed size=32 align=8 first_offset=0 first_size=4 count_offset=8 count_size=8 second_offset=16 second_size=4 total_offset=24 total_size=8 c_type=LayoutForeignMixed"
 	do
 		if ! grep -Fq "RECORD_LAYOUT mode=$mode $expected" <<<"$output"; then
@@ -141,6 +190,24 @@ if ! grep -Fq \
 then
 	echo "FAIL: record layout probe expectation error is incomplete" >&2
 	cat "$stage_dir/missing.err" >&2
+	exit 1
+fi
+
+if "$enum_layout_runner" \
+	--generated-c "$unparsable_enum_record" \
+	>"$stage_dir/unparsable-enum.out" \
+	2>"$stage_dir/unparsable-enum.err"
+then
+	echo "FAIL: enum layout probe must reject a present record with a missing field" >&2
+	exit 1
+fi
+
+if ! grep -Fq \
+	'generated record compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia is missing field kind' \
+	"$stage_dir/unparsable-enum.err"
+then
+	echo "FAIL: enum layout probe missing-field error is incomplete" >&2
+	cat "$stage_dir/unparsable-enum.err" >&2
 	exit 1
 fi
 

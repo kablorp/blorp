@@ -40,6 +40,38 @@ if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
 	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
 	exit 1
 fi
+if ! grep -Fq "find tools/formatter -name '*.brp' -type f -print" <<<"$cli_build_plan"; then
+	echo "FAIL: formatter sources must participate in the Blorp CLI input identity" >&2
+	exit 1
+fi
+if ! grep -Fq '"compiler/_build/default/bin/blorp_ocaml_host.exe" __compiler-bridge-prepare "compiler/_build/blorp-cli/prepared-bridges"' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must prepare current-source bridge helpers before compiling the compiler" >&2
+	exit 1
+fi
+prepare_line=$(grep -Fn '__compiler-bridge-prepare' <<<"$cli_build_plan" | head -1 | cut -d: -f1)
+compile_line=$(grep -Fn '__compiler-host-compile-wrapper' <<<"$cli_build_plan" | head -1 | cut -d: -f1)
+if [ "$prepare_line" -ge "$compile_line" ]; then
+	echo "FAIL: current-source bridge preparation must precede the full compiler host" >&2
+	exit 1
+fi
+for prepared_bridge_binding in \
+	'BLORP_COMPILER_RENDERER_BRIDGE_BIN="compiler/_build/blorp-cli/prepared-bridges/compiler_renderer_bridge.bin"' \
+	'BLORP_COMPILER_PARSER_BRIDGE_BIN="compiler/_build/blorp-cli/prepared-bridges/compiler_parser_bridge.bin"' \
+	'BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="compiler/_build/blorp-cli/prepared-bridges/compiler_typecheck_bridge.bin"'
+do
+	if ! grep -Fq "$prepared_bridge_binding" <<<"$cli_build_plan"; then
+		echo "FAIL: the Blorp CLI build must pass every current-source prepared bridge to the compiler host" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq 'BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must require its current-source prepared bridge helpers" >&2
+	exit 1
+fi
+if ! grep -Fq 'python3 -m unittest tests/test_runtime_allocator_stats.py' Makefile; then
+	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
+	exit 1
+fi
 
 install_plan=$(make -n install)
 if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_middle.exe" "./blorp-ocaml-middle"' <<<"$install_plan"; then

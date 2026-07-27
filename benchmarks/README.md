@@ -90,7 +90,7 @@ deliberately excluded from `bench.sh all`.
 
 `compiler_record_layout` compiles a bounded fixture through the production
 backend and reports generated-C `sizeof` and `_Alignof` values at both `-O0`
-and `-O2`. The heap row also reports the allocation bytes selected by the
+and `-O2`. The heap rows also report the allocation bytes selected by the
 runtime's small-object pool:
 
 ```bash
@@ -98,11 +98,30 @@ benchmarks/compiler_record_layout
 ```
 
 The fixture covers consecutive Boolean fields in a value struct, interleaved
-Boolean and machine-word fields, Boolean fields in a heap record, and a value
-struct reachable from a foreign signature. The runner appends a temporary
-layout reporter to the generated C; it does not modify production sources or
-artifacts. Use it as the fast feedback loop for
-`docs/COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md`.
+Boolean and machine-word fields, three- and nine-field Boolean runs in heap
+records, a source-interleaved internal heap record, compact explicit-enum
+fields in an internal heap record, preserved enum and Boolean fields in
+foreign-reachable heap records, and a value struct reachable from a foreign
+signature. The runner appends a temporary layout reporter to the generated C;
+it does not modify production sources or artifacts. Use it as the fast
+feedback loop for `docs/COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md`.
+
+`compiler_enum_field_layout` reproduces the Slice 8 source inventory and the
+generated compiler-C structural comparison. Inventory mode is read-only and
+does not compile C:
+
+```bash
+benchmarks/compiler_enum_field_layout --inventory
+```
+
+The default mode requires a current
+`compiler/_build/blorp-cli/blorp_cli_main.c`. It compiles that exact artifact
+and a temporary baseline that widens only its emitted one-byte explicit-enum
+fields, then reports every target field and record:
+
+```bash
+benchmarks/compiler_enum_field_layout
+```
 
 ### Typecheck Function Profile
 

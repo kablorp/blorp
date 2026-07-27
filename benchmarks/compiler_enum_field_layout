@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Inventory compiler nullary tags and measure compact enum heap fields."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+DECLARATION_RE = re.compile(
+    r"^(?:private )?(enum|union|record|struct) "
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]+\])?(?::|\s*\{)$"
+)
+AGGREGATE_RE = re.compile(
+    r"^(?:private )?(record|struct) "
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]+\])?\s*\{$"
+)
+FIELD_RE = re.compile(
+    r"^\t([A-Za-z_][A-Za-z0-9_]*):\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*,?\s*$"
+)
+LIST_RE = re.compile(r"\bList\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]")
+TENSOR_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*#")
+REPORT_RE = re.compile(
+    r"^COMPILER_ENUM_LAYOUT record=(\S+) size=(\d+) allocator_bytes=(\d+)$"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class NullaryDeclaration:
+    name: str
+    syntax: str
+    variants: int
+    path: Path
+    line: int
+
+
+@dataclasses.dataclass(frozen=True)
+class FieldSite:
+    enum_name: str
+    enum_syntax: str
+    aggregate_kind: str
+    aggregate_name: str
+    field_name: str
+    path: Path
+    line: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CollectionSite:
+    enum_name: str
+    collection_kind: str
+    path: Path
+    line: int
+
+
+@dataclasses.dataclass(frozen=True)
+class EmittedField:
+    site: FieldSite
+    c_record: str
+    c_type: str
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_files(source_root: Path) -> list[Path]:
+    return sorted(source_root.rglob("*.brp"))
+
+
+def declaration_block(lines: list[str], start: int) -> tuple[list[str], int]:
+    body: list[str] = []
+    index = start + 1
+    while index < len(lines) and (not lines[index] or lines[index][0].isspace()):
+        body.append(lines[index])
+        index += 1
+    return body, index
+
+
+def source_inventory(
+    source_root: Path,
+) -> tuple[
+    dict[str, NullaryDeclaration],
+    list[FieldSite],
+    list[CollectionSite],
+    int,
+]:
+    declarations_by_file: dict[Path, dict[str, str]] = {}
+    nullary: dict[str, NullaryDeclaration] = {}
+
+    for path in source_files(source_root):
+        lines = path.read_text().splitlines()
+        declarations_by_file[path] = {}
+        index = 0
+        while index < len(lines):
+            match = DECLARATION_RE.match(lines[index])
+            if match is None:
+                index += 1
+                continue
+
+            syntax, name = match.groups()
+            declarations_by_file[path][name] = syntax
+            body, next_index = declaration_block(lines, index)
+
+            if syntax == "enum":
+                variants = sum(
+                    1
+                    for line in body
+                    if re.fullmatch(r"\t[A-Za-z_][A-Za-z0-9_]*\s*", line)
+                )
+                nullary[name] = NullaryDeclaration(
+                    name=name,
+                    syntax=syntax,
+                    variants=variants,
+                    path=path,
+                    line=index + 1,
+                )
+            elif syntax == "union":
+                variant_lines = [
+                    line for line in body if re.match(r"^\t[A-Za-z_][A-Za-z0-9_]*", line)
+                ]
+                if variant_lines and all("(" not in line for line in variant_lines):
+                    nullary[name] = NullaryDeclaration(
+                        name=name,
+                        syntax=syntax,
+                        variants=len(variant_lines),
+                        path=path,
+                        line=index + 1,
+                    )
+
+            index = next_index
+
+    fields: list[FieldSite] = []
+    collections: list[CollectionSite] = []
+    shadowed_sites = 0
+
+    for path in source_files(source_root):
+        aggregate: tuple[str, str] | None = None
+        for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+            aggregate_match = AGGREGATE_RE.match(line)
+            if aggregate_match is not None:
+                aggregate = aggregate_match.groups()
+                continue
+            if aggregate is not None and line == "}":
+                aggregate = None
+                continue
+
+            field_match = FIELD_RE.match(line) if aggregate is not None else None
+            if field_match is not None:
+                field_name, type_name = field_match.groups()
+                declaration = nullary.get(type_name)
+                if declaration is not None:
+                    local_kind = declarations_by_file[path].get(type_name)
+                    if local_kind is not None and local_kind != declaration.syntax:
+                        shadowed_sites += 1
+                    else:
+                        fields.append(
+                            FieldSite(
+                                enum_name=type_name,
+                                enum_syntax=declaration.syntax,
+                                aggregate_kind=aggregate[0],
+                                aggregate_name=aggregate[1],
+                                field_name=field_name,
+                                path=path,
+                                line=line_number,
+                            )
+                        )
+
+            for match in LIST_RE.finditer(line):
+                type_name = match.group(1)
+                declaration = nullary.get(type_name)
+                if declaration is None:
+                    continue
+                local_kind = declarations_by_file[path].get(type_name)
+                if local_kind is not None and local_kind != declaration.syntax:
+                    shadowed_sites += 1
+                    continue
+                collections.append(
+                    CollectionSite(type_name, "List", path, line_number)
+                )
+
+            for match in TENSOR_RE.finditer(line):
+                type_name = match.group(1)
+                declaration = nullary.get(type_name)
+                if declaration is None:
+                    continue
+                local_kind = declarations_by_file[path].get(type_name)
+                if local_kind is not None and local_kind != declaration.syntax:
+                    shadowed_sites += 1
+                    continue
+                collections.append(
+                    CollectionSite(type_name, "Tensor", path, line_number)
+                )
+
+    return nullary, fields, collections, shadowed_sites
+
+
+def module_c_name(path: Path, repo_root: Path) -> str:
+    without_suffix = path.relative_to(repo_root).with_suffix("").as_posix()
+    return re.sub(r"[^A-Za-z0-9]", "_", without_suffix)
+
+
+def emitted_fields(
+    generated_c: str,
+    fields: list[FieldSite],
+    repo_root: Path,
+) -> list[EmittedField]:
+    emitted: list[EmittedField] = []
+    for site in fields:
+        if site.aggregate_kind != "record" or site.enum_syntax != "enum":
+            continue
+        c_record = f"{module_c_name(site.path, repo_root)}__{site.aggregate_name}"
+        block_match = re.search(
+            rf"typedef struct {re.escape(c_record)} \{{.*?\n\}} {re.escape(c_record)};",
+            generated_c,
+            re.DOTALL,
+        )
+        if block_match is None:
+            emitted.append(EmittedField(site, c_record, "not_in_cli"))
+            continue
+        field_match = re.search(
+            rf"^\s+([^;]+?)\s+{re.escape(site.field_name)}(?:\s*:\s*1)?;$",
+            block_match.group(0),
+            re.MULTILINE,
+        )
+        if field_match is None:
+            raise RuntimeError(
+                f"generated record {c_record} is missing field {site.field_name}"
+            )
+        c_type = field_match.group(1).strip()
+        emitted.append(EmittedField(site, c_record, c_type))
+    return emitted
+
+
+def widened_baseline(
+    generated_c: str,
+    compact_fields: list[EmittedField],
+) -> str:
+    baseline = generated_c
+    for emitted in compact_fields:
+        record_pattern = re.compile(
+            rf"(typedef struct {re.escape(emitted.c_record)} \{{)(.*?)"
+            rf"(\n\}} {re.escape(emitted.c_record)};)",
+            re.DOTALL,
+        )
+        record_match = record_pattern.search(baseline)
+        if record_match is None:
+            raise RuntimeError(f"missing generated record {emitted.c_record}")
+        body = record_match.group(2)
+        field_pattern = re.compile(
+            rf"^(\s*)uint8_t(\s+{re.escape(emitted.site.field_name)};)$",
+            re.MULTILINE,
+        )
+        widened, replacements = field_pattern.subn(r"\1long\2", body, count=1)
+        if replacements != 1:
+            raise RuntimeError(
+                f"missing compact field {emitted.c_record}.{emitted.site.field_name}"
+            )
+        baseline = (
+            baseline[: record_match.start(2)]
+            + widened
+            + baseline[record_match.end(2) :]
+        )
+    return baseline
+
+
+def layout_reporter(record_names: list[str]) -> str:
+    rows = "\n".join(
+        (
+            f'  printf("COMPILER_ENUM_LAYOUT record={name} size=%zu '
+            f'allocator_bytes=%zu\\n", sizeof({name}), '
+            f"blorp_enum_layout_allocator_bytes(sizeof({name})));"
+        )
+        for name in record_names
+    )
+    return f"""
+
+static size_t blorp_enum_layout_allocator_bytes(size_t size) {{
+  int allocation_class = blorp_pool_class(size);
+  return allocation_class >= 0 ? blorp_pool_sizes[allocation_class] : size;
+}}
+
+__attribute__((constructor)) static void blorp_report_compiler_enum_layout(void) {{
+{rows}
+}}
+"""
+
+
+def run_checked(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def compile_and_measure(
+    source: str,
+    label: str,
+    record_names: list[str],
+    cc_command: list[str],
+    runtime_sources: Path,
+    repo_root: Path,
+    stage_dir: Path,
+) -> tuple[dict[str, tuple[int, int]], Path]:
+    source_path = stage_dir / f"{label}.c"
+    binary_path = stage_dir / label
+    source_path.write_text(source + layout_reporter(record_names))
+    run_checked(
+        cc_command
+        + [
+            "-O0",
+            "-fwrapv",
+            "-pipe",
+            "-w",
+            "-DBLORP_COMPILER_RUNTIME_SOURCES=1",
+            str(source_path),
+            str(runtime_sources),
+            "-lm",
+            "-lpthread",
+            "-o",
+            str(binary_path),
+        ],
+        repo_root,
+    )
+    output = run_checked([str(binary_path), "--help"], repo_root).stdout
+    rows: dict[str, tuple[int, int]] = {}
+    for line in output.splitlines():
+        match = REPORT_RE.match(line)
+        if match is not None:
+            rows[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+    if sorted(rows) != record_names:
+        raise RuntimeError(f"{label} reporter did not emit every target record")
+    return rows, source_path
+
+
+def print_inventory(
+    source_root: Path,
+    nullary: dict[str, NullaryDeclaration],
+    fields: list[FieldSite],
+    collections: list[CollectionSite],
+    shadowed_sites: int,
+    emitted: list[EmittedField],
+) -> None:
+    explicit_fields = [field for field in fields if field.enum_syntax == "enum"]
+    union_fields = [field for field in fields if field.enum_syntax == "union"]
+    print(f"# source_root={source_root}")
+    print("# scope=direct_source_annotations_with_same_file_shadow_exclusion")
+    print("metric\tcount\tdetail")
+    print(
+        f"explicit_enum_declarations\t"
+        f"{sum(item.syntax == 'enum' for item in nullary.values())}\t"
+        "Explicit enum syntax"
+    )
+    print(
+        f"payload_free_union_declarations\t"
+        f"{sum(item.syntax == 'union' for item in nullary.values())}\t"
+        "Union declarations whose variants have no payload"
+    )
+    print(f"nullary_declarations_total\t{len(nullary)}\tExplicit enums plus unions")
+    print(
+        f"same_file_shadowed_sites_excluded\t{shadowed_sites}\t"
+        "Direct field/list/tensor annotations excluded by a same-file declaration"
+    )
+    print(
+        f"direct_nullary_heap_record_fields\t"
+        f"{sum(field.aggregate_kind == 'record' for field in fields)}\t"
+        f"Across {len({(field.path, field.aggregate_name) for field in fields})} records"
+    )
+    print(
+        f"direct_explicit_enum_heap_record_fields\t{len(explicit_fields)}\t"
+        f"Across {len({(field.path, field.aggregate_name) for field in explicit_fields})} records"
+    )
+    print(
+        f"direct_payload_free_union_heap_record_fields\t{len(union_fields)}\t"
+        f"Across {len({(field.path, field.aggregate_name) for field in union_fields})} records"
+    )
+    print(
+        f"direct_nullary_value_struct_fields\t"
+        f"{sum(field.aggregate_kind == 'struct' for field in fields)}\t"
+        "Current value-struct beneficiaries"
+    )
+    list_sites = [site for site in collections if site.collection_kind == "List"]
+    tensor_sites = [site for site in collections if site.collection_kind == "Tensor"]
+    print(
+        f"direct_list_sites\t{len(list_sites)}\t"
+        f"Across {len({site.enum_name for site in list_sites})} nullary types"
+    )
+    print(
+        f"direct_tensor_sites\t{len(tensor_sites)}\t"
+        f"Across {len({site.enum_name for site in tensor_sites})} nullary types"
+    )
+    if emitted:
+        for c_type in ("uint8_t", "long", "not_in_cli"):
+            print(
+                f"retained_cli_explicit_enum_fields_{c_type}\t"
+                f"{sum(field.c_type == c_type for field in emitted)}\t"
+                "Generated CLI field representation"
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Inventory compiler nullary tags or compare generated CLI enum fields "
+            "with a mechanically widened baseline."
+        )
+    )
+    parser.add_argument(
+        "--inventory",
+        action="store_true",
+        help="print the source/generated-C inventory without compiling C",
+    )
+    parser.add_argument(
+        "--generated-c",
+        type=Path,
+        help="generated self-hosted CLI C artifact",
+    )
+    parser.add_argument(
+        "--cc",
+        default=os.environ.get("BLORP_ENUM_LAYOUT_CC", os.environ.get("CC", "cc")),
+        help="C compiler command (default: BLORP_ENUM_LAYOUT_CC, CC, or cc)",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo_root = Path(__file__).resolve().parent.parent
+    source_root = repo_root / "compiler/blorp/src"
+    generated_path = (
+        args.generated_c
+        if args.generated_c is not None
+        else repo_root / "compiler/_build/blorp-cli/blorp_cli_main.c"
+    )
+    runtime_sources = repo_root / "compiler/_build/blorp-cli/compiler_runtime_sources.c"
+
+    nullary, fields, collections, shadowed_sites = source_inventory(source_root)
+    emitted: list[EmittedField] = []
+    generated_c = ""
+    if generated_path.is_file():
+        generated_c = generated_path.read_text()
+        emitted = emitted_fields(generated_c, fields, repo_root)
+
+    if args.inventory:
+        print_inventory(
+            source_root.relative_to(repo_root),
+            nullary,
+            fields,
+            collections,
+            shadowed_sites,
+            emitted,
+        )
+        return 0
+
+    if not generated_path.is_file():
+        raise SystemExit(f"generated compiler C not found: {generated_path}")
+    if not runtime_sources.is_file():
+        raise SystemExit(f"embedded runtime sources not found: {runtime_sources}")
+
+    compact_fields = [field for field in emitted if field.c_type == "uint8_t"]
+    if not compact_fields:
+        raise SystemExit("generated compiler C contains no compact explicit-enum fields")
+    record_names = sorted({field.c_record for field in compact_fields})
+    baseline_c = widened_baseline(generated_c, compact_fields)
+    cc_command = shlex.split(args.cc)
+    if not cc_command:
+        raise SystemExit("empty C compiler command")
+
+    with tempfile.TemporaryDirectory(prefix="blorp-enum-layout.") as stage:
+        stage_dir = Path(stage)
+        current_rows, current_source = compile_and_measure(
+            generated_c,
+            "compact",
+            record_names,
+            cc_command,
+            runtime_sources,
+            repo_root,
+            stage_dir,
+        )
+        baseline_rows, baseline_source = compile_and_measure(
+            baseline_c,
+            "widened",
+            record_names,
+            cc_command,
+            runtime_sources,
+            repo_root,
+            stage_dir,
+        )
+        cc_version = run_checked(cc_command + ["--version"], repo_root).stdout.splitlines()[0]
+        print(f"# platform={platform.system()}_{platform.release()}_{platform.machine()}")
+        print(f"# generated_c={generated_path}")
+        print(f"# generated_c_sha256={sha256(generated_path)}")
+        print(
+            f"# widened_c_sha256="
+            f"{hashlib.sha256(baseline_c.encode()).hexdigest()}"
+        )
+        print(f"# compact_probe_c_sha256={sha256(current_source)}")
+        print(f"# widened_probe_c_sha256={sha256(baseline_source)}")
+        print(f"# cc_command={args.cc}")
+        print(f"# cc_version={cc_version}")
+        print(
+            "# baseline=mechanically_replace_only_the_emitted_uint8_t_"
+            "explicit_enum_fields_with_long"
+        )
+        print("# note=unique_type_structural_totals_not_allocation_frequency_or_peak_rss")
+        print(
+            "row_kind\trecord\tfield\tsource\tbaseline_bytes\tcompact_bytes\t"
+            "baseline_allocator_bytes\tcompact_allocator_bytes"
+        )
+        baseline_size = sum(size for size, _ in baseline_rows.values())
+        current_size = sum(size for size, _ in current_rows.values())
+        baseline_allocator = sum(size for _, size in baseline_rows.values())
+        current_allocator = sum(size for _, size in current_rows.values())
+        print(
+            f"summary\t{len(record_names)}_unique_retained_records\t"
+            f"{len(compact_fields)}_fields\t-\t{baseline_size}\t{current_size}\t"
+            f"{baseline_allocator}\t{current_allocator}"
+        )
+        for name in record_names:
+            print(
+                f"record\t{name}\t-\t-\t{baseline_rows[name][0]}\t"
+                f"{current_rows[name][0]}\t{baseline_rows[name][1]}\t"
+                f"{current_rows[name][1]}"
+            )
+        for emitted_field in sorted(
+            compact_fields,
+            key=lambda field: (
+                field.c_record,
+                field.site.field_name,
+                field.site.path.as_posix(),
+            ),
+        ):
+            site = emitted_field.site
+            print(
+                f"field\t{emitted_field.c_record}\t{site.field_name}\t"
+                f"{site.path.relative_to(repo_root)}:{site.line}\t-\t-\t-\t-"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

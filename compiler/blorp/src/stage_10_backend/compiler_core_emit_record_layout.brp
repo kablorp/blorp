@@ -1,4 +1,4 @@
--- Classify value-record layouts before C emission.
+-- Classify record layouts before C emission.
 --
 -- Foreign ABI exposure is transitive: changing an embedded value record also
 -- changes the containing foreign parameter or result. Keep that distinction
@@ -11,6 +11,7 @@ import:
 	../stage_09_core/compiler_core_json:
 		CoreCallKind(ForeignCall),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl, ValueRecordDecl),
+		CoreEnumDecl,
 		CoreExpr(CallExpr),
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction),
@@ -34,7 +35,7 @@ import:
 		CoreValueRecordDecl,
 		core_expr_type,
 	../stage_09_core/compiler_core_traverse: immediate_core_expr_children
-	compiler_core_emit_type_layout: c_type_name
+	compiler_core_emit_type_layout: c_type_name, runtime_backed_heap_record_c_type
 	set as Sets
 
 
@@ -48,6 +49,14 @@ union CompilerCValueRecordFieldStorage:
 	PackedBooleanCValueRecordField
 
 
+union CompilerCHeapRecordFieldStorage:
+	OrdinaryCHeapRecordField(String)
+	PackedBooleanCHeapRecordField
+
+
+MAX_BYTE_ENUM_TAG: Int = 255
+
+
 pure func c_value_record_field_type_is_boolean(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
@@ -56,15 +65,35 @@ pure func c_value_record_field_type_is_boolean(typ: CoreType) -> Bool:
 			False
 
 
-pure func c_heap_record_field_type(layout: CompilerCRecordLayout, typ: CoreType) -> String:
+pure func c_heap_record_field_storage(
+	registry: CompilerCRecordLayoutRegistry,
+	record_name: String,
+	layout: CompilerCRecordLayout,
+	typ: CoreType,
+	has_boolean_neighbor: Bool,
+) -> CompilerCHeapRecordFieldStorage:
 	match layout:
 		InternalLayout:
 			if c_value_record_field_type_is_boolean(typ):
-				"_Bool"
+				if has_boolean_neighbor:
+					PackedBooleanCHeapRecordField
+				else:
+					OrdinaryCHeapRecordField("_Bool")
 			else:
-				c_type_name(typ)
+				match typ:
+					EnumType(name):
+						match runtime_backed_heap_record_c_type(record_name):
+							Some(_):
+								OrdinaryCHeapRecordField(c_type_name(typ))
+							None:
+								if Sets.contains(registry.byte_sized_enum_names, name):
+									OrdinaryCHeapRecordField("uint8_t")
+								else:
+									OrdinaryCHeapRecordField(c_type_name(typ))
+					_:
+						OrdinaryCHeapRecordField(c_type_name(typ))
 		ForeignAbiLayout:
-			c_type_name(typ)
+			OrdinaryCHeapRecordField(c_type_name(typ))
 
 
 pure func c_value_record_field_storage(
@@ -87,7 +116,8 @@ pure func c_value_record_field_storage(
 
 record CompilerCRecordLayoutRegistry {
 	foreign_abi_value_record_names: Set[String],
-	foreign_abi_heap_record_names: Set[String]
+	foreign_abi_heap_record_names: Set[String],
+	byte_sized_enum_names: Set[String]
 }
 
 
@@ -237,13 +267,33 @@ private pure func append_nested_types(pending: List[CoreType], typ: CoreType) ->
 			pending
 
 
+private pure func enum_decl_uses_byte_tags(enum_decl: CoreEnumDecl) -> Bool:
+	var uses_byte_tags: Bool = enum_decl.variants.length() > 0
+
+	for variant in enum_decl.variants:
+		if variant.tag < 0 or variant.tag > MAX_BYTE_ENUM_TAG:
+			uses_byte_tags = False
+			break
+
+	uses_byte_tags
+
+
 pure func classify_c_record_layouts(program: CoreProgram) -> CompilerCRecordLayoutRegistry:
 	decl_index: CompilerCRecordDeclIndex = build_record_decl_index(program)
 	var foreign_names: Set[String] = Sets.set()
 	var foreign_heap_names: Set[String] = Sets.set()
+	var byte_sized_enum_names: Set[String] = Sets.set()
 	var visited_union_names: Set[String] = Sets.set()
 	var pending: List[CoreType] = foreign_boundary_types(program)
 	var index: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			EnumDecl(enum_decl):
+				if enum_decl_uses_byte_tags(enum_decl):
+					byte_sized_enum_names = Sets.add(byte_sized_enum_names, enum_decl.name)
+			_:
+				void
 
 	while index < pending.length():
 		match pending.get(index):
@@ -291,5 +341,6 @@ pure func classify_c_record_layouts(program: CoreProgram) -> CompilerCRecordLayo
 
 	{
 		foreign_abi_value_record_names = foreign_names,
-		foreign_abi_heap_record_names = foreign_heap_names
+		foreign_abi_heap_record_names = foreign_heap_names,
+		byte_sized_enum_names = byte_sized_enum_names
 	}

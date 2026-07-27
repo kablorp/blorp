@@ -658,10 +658,11 @@ import:
 		render_prepared_tuple_op,
 	compiler_build_artifact: CArtifact
 	compiler_core_emit_record_layout:
+		CompilerCHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
 		CompilerCRecordLayout(ForeignAbiLayout, InternalLayout),
 		CompilerCRecordLayoutRegistry,
 		CompilerCValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
-		c_heap_record_field_type,
+		c_heap_record_field_storage,
 		c_heap_record_layout,
 		c_record_layout,
 		c_value_record_field_storage,
@@ -4979,15 +4980,22 @@ private pure func foreign_borrow_arg_value(arg: CoreExpr, value: String) -> Stri
 		value
 
 
-private pure func foreign_arg_may_be_packed_boolean_field(arg: CoreExpr) -> Bool:
+private pure func foreign_arg_may_have_compact_scalar_field(arg: CoreExpr) -> Bool:
 	match arg:
 		FieldExpr(_, _, typ, _):
-			c_value_record_field_type_is_boolean(typ)
+			if c_value_record_field_type_is_boolean(typ):
+				True
+			else:
+				match typ:
+					EnumType(_):
+						True
+					_:
+						False
 		_:
 			False
 
 
-private pure func materialize_foreign_boolean_field_args(
+private pure func materialize_foreign_compact_scalar_field_args(
 	args: List[CoreExpr],
 	args_body: CallArgsBody,
 ) -> Option[CallArgsBody]:
@@ -5004,7 +5012,7 @@ private pure func materialize_foreign_boolean_field_args(
 			if not failed:
 				match args_body.args.get(index):
 					Some(arg_value):
-						if foreign_arg_may_be_packed_boolean_field(arg):
+						if foreign_arg_may_have_compact_scalar_field(arg):
 							temp: String = temp_name("ffi_scalar_arg", temp_index)
 							statements += "  " + c_type_name(
 								core_expr_type(arg),
@@ -5126,7 +5134,7 @@ private pure func emit_foreign_call_args_body(
 	next_temp: Int,
 ) -> Option[ForeignCallArgsBody]:
 	args_body ?= emit_call_args_body(args, next_temp)
-	materialized_args ?= materialize_foreign_boolean_field_args(args, args_body)
+	materialized_args ?= materialize_foreign_compact_scalar_field_args(args, args_body)
 
 	match arg_passing:
 		ForeignBorrowArgs:
@@ -21534,12 +21542,15 @@ private pure func emit_value_record_decl(
 	record_decl: CoreValueRecordDecl,
 	layout: CompilerCRecordLayout,
 ) -> String:
-	var fields_c: String = ""
+	var source_order_fields_c: String = ""
+	var internal_non_boolean_fields_c: String = ""
+	var internal_boolean_fields_c: String = ""
 	var params: List[String] = []
 	var init_fields: List[String] = []
 	var field_index: Int = 0
 
 	for field in record_decl.fields:
+		field_name: String = c_identifier(field.name)
 		has_boolean_neighbor: Bool = (
 			(
 				field_index > 0
@@ -21548,10 +21559,26 @@ private pure func emit_value_record_decl(
 			or value_record_field_at_is_boolean(record_decl.fields, field_index + 1)
 		)
 
-		fields_c += c_value_record_field_decl(field, layout, has_boolean_neighbor)
+		field_decl: String = c_value_record_field_decl(field, layout, has_boolean_neighbor)
+
+		match layout:
+			InternalLayout:
+				if c_value_record_field_type_is_boolean(field.typ):
+					internal_boolean_fields_c += field_decl
+				else:
+					internal_non_boolean_fields_c += field_decl
+			ForeignAbiLayout:
+				source_order_fields_c += field_decl
+
 		params = params.append(c_value_record_make_param(field))
-		init_fields = init_fields.append(c_identifier(field.name))
+		init_fields = init_fields.append("." + field_name + " = " + field_name)
 		field_index += 1
+
+	fields_c: String = match layout:
+		InternalLayout:
+			internal_non_boolean_fields_c + internal_boolean_fields_c
+		ForeignAbiLayout:
+			source_order_fields_c
 
 	param_c: String = if params.length() == 0:
 		"void"
@@ -21565,13 +21592,39 @@ private pure func emit_value_record_decl(
 
 private pure func heap_record_field_decl(
 	field: CoreHeapRecordField,
+	record_name: String,
+	layouts: CompilerCRecordLayoutRegistry,
 	layout: CompilerCRecordLayout,
+	has_boolean_neighbor: Bool,
 ) -> String:
-	"  " + c_heap_record_field_type(layout, field.typ) + " " + c_identifier(field.name) + ";\n"
+	field_name: String = c_identifier(field.name)
+
+	match c_heap_record_field_storage(
+		layouts,
+		record_name,
+		layout,
+		field.typ,
+		has_boolean_neighbor,
+	):
+		OrdinaryCHeapRecordField(c_type):
+			"  " + c_type + " " + field_name + ";\n"
+		PackedBooleanCHeapRecordField:
+			"  _Bool " + field_name + " : 1;\n"
 
 
 private pure func heap_record_make_param(field: CoreHeapRecordField) -> String:
 	c_type_name(field.typ) + " " + c_identifier(field.name)
+
+
+private pure func heap_record_field_at_is_boolean(
+	fields: List[CoreHeapRecordField],
+	index: Int,
+) -> Bool:
+	match fields.get(index):
+		Some(field):
+			c_value_record_field_type_is_boolean(field.typ)
+		None:
+			False
 
 
 private pure func heap_record_field_release_statement(field: CoreHeapRecordField) -> String:
@@ -21622,18 +21675,59 @@ private pure func emit_heap_record_destructor(record_decl: CoreHeapRecordDecl) -
 
 private pure func emit_heap_record_decl(
 	record_decl: CoreHeapRecordDecl,
+	layouts: CompilerCRecordLayoutRegistry,
 	layout: CompilerCRecordLayout,
 ) -> String:
-	var fields_c: String = ""
+	var source_order_fields_c: String = ""
+	var internal_non_boolean_fields_c: String = ""
+	var internal_boolean_fields_c: String = ""
 	var params: List[String] = []
 	var assignments: String = ""
 	record_c_type: String = c_type_name(HeapRecordType(record_decl.name))
 
+	reorder_internal_boolean_fields: Bool = match layout:
+		InternalLayout:
+			match runtime_backed_heap_record_c_type(record_decl.name):
+				Some(_):
+					False
+				None:
+					True
+		ForeignAbiLayout:
+			False
+
+	var field_index: Int = 0
+
 	for field in record_decl.fields:
 		field_name: String = c_identifier(field.name)
-		fields_c += heap_record_field_decl(field, layout)
+		has_boolean_neighbor: Bool = (
+			field_index > 0 and heap_record_field_at_is_boolean(record_decl.fields, field_index - 1)
+			or heap_record_field_at_is_boolean(record_decl.fields, field_index + 1)
+		)
+
+		field_decl: String = heap_record_field_decl(
+			field,
+			record_decl.name,
+			layouts,
+			layout,
+			has_boolean_neighbor,
+		)
+
+		if reorder_internal_boolean_fields:
+			if c_value_record_field_type_is_boolean(field.typ):
+				internal_boolean_fields_c += field_decl
+			else:
+				internal_non_boolean_fields_c += field_decl
+		else:
+			source_order_fields_c += field_decl
+
 		params = params.append(heap_record_make_param(field))
 		assignments += "  __rec->" + field_name + " = " + field_name + ";\n"
+		field_index += 1
+
+	fields_c: String = if reorder_internal_boolean_fields:
+		internal_non_boolean_fields_c + internal_boolean_fields_c
+	else:
+		source_order_fields_c
 
 	param_c: String = if params.length() == 0:
 		"void"
@@ -22147,6 +22241,7 @@ private pure func emit_heap_record_decls(
 					c_code,
 					emit_heap_record_decl(
 						record_decl,
+						layouts,
 						c_heap_record_layout(layouts, record_decl.name),
 					),
 				)

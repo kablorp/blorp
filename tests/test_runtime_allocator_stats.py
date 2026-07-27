@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -15,6 +16,80 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class RuntimeAllocatorStatsTests(unittest.TestCase):
+    def test_optimized_allocation_does_not_require_frame_pointers(self) -> None:
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            int main(void) {
+                blorp_List* values = blorp_list_new(1);
+                blorp_release(values);
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = Path(temp_name) / "optimized-allocation"
+            compiled = subprocess.run(
+                [
+                    os.environ.get("CC", "cc"),
+                    "-O2",
+                    "-fomit-frame-pointer",
+                    "-w",
+                    f"-I{ROOT / 'compiler' / 'lib'}",
+                    "-x",
+                    "c",
+                    "-",
+                    "-lm",
+                    "-lpthread",
+                    "-o",
+                    str(executable),
+                ],
+                cwd=ROOT,
+                input=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+
+            for setting in (None, "BLORP_TRACE_ALLOCS", "BLORP_LEAK_CHECK"):
+                environment = dict(os.environ)
+                if setting is not None:
+                    environment[setting] = "1"
+                completed = subprocess.run(
+                    [str(executable)],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"{setting or 'default'}: {completed.stderr}",
+                )
+                if setting == "BLORP_TRACE_ALLOCS":
+                    self.assertRegex(
+                        completed.stderr,
+                        r"=== BLORP ALLOCATION TRACE \([1-9][0-9]* total\) ===",
+                    )
+                elif setting == "BLORP_LEAK_CHECK":
+                    leak_summary = re.search(
+                        r"blorp: leak check: ([0-9]+) allocs, "
+                        r"([0-9]+) releases, 0 leaked, 0 bytes",
+                        completed.stderr,
+                    )
+                    self.assertIsNotNone(leak_summary, completed.stderr)
+                    assert leak_summary is not None
+                    allocations, releases = leak_summary.groups()
+                    self.assertEqual(allocations, releases)
+
     def test_allocator_stats_do_not_enable_object_metadata(self) -> None:
         source = textwrap.dedent(
             """\

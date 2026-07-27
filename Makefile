@@ -13,6 +13,10 @@ BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
+BLORP_CLI_PREPARED_BRIDGE_DIR := $(BLORP_CLI_BUILD_DIR)/prepared-bridges
+BLORP_CLI_RENDERER_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_renderer_bridge.bin
+BLORP_CLI_PARSER_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_parser_bridge.bin
+BLORP_CLI_TYPECHECK_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_typecheck_bridge.bin
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_embedded_std.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
@@ -100,6 +104,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 	new_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
+		find tools/formatter -name '*.brp' -type f -print; \
 		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
@@ -109,7 +114,13 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 		tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
 		trap 'rm -f "$$tmp_bin" "$$tmp_hash"' EXIT; \
 		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
-		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-bridge-prepare "$(BLORP_CLI_PREPARED_BRIDGE_DIR)" >/dev/null; \
+		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" \
+			BLORP_COMPILER_RENDERER_BRIDGE_BIN="$(BLORP_CLI_RENDERER_BRIDGE)" \
+			BLORP_COMPILER_PARSER_BRIDGE_BIN="$(BLORP_CLI_PARSER_BRIDGE)" \
+			BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$(BLORP_CLI_TYPECHECK_BRIDGE)" \
+			BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1 \
+			"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
@@ -162,6 +173,7 @@ hygiene-check:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh

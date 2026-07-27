@@ -1,20 +1,20 @@
-# Compiler Boolean Field Layout Roadmap
+# Compiler Compact Field Layout Roadmap
 
-Status: active; Slices 0-3 and 5 implemented locally and Slice 4 evaluated as
-of 2026-07-25; Linux baseline pending.
+Status: active; Slices 0-3, 5-6, 7a, 7b0, 7b1, and 8 implemented locally;
+Slice 4 evaluated and Linux amd64 layout validation completed as of 2026-07-26.
 
-Last checked against the `compile-speed` branch on 2026-07-25.
+Last checked against the `compile-speed` branch on 2026-07-26.
 
-This document is the durable plan and measurement log for compact Boolean
-storage in generated C. Update the status table, evidence, and decision log
-after every accepted or rejected slice so later work does not need to recover
-the reasoning from task history.
+This document is the durable plan and measurement log for compact Boolean and
+explicit-enum field storage in generated C. Update the status table, evidence,
+and decision log after every accepted or rejected slice so later work does not
+need to recover the reasoning from task history.
 
 ## Goal
 
-Reduce compiler memory traffic and aggregate-return overhead by storing Boolean
-record and struct fields compactly while preserving language semantics and C
-foreign-function ABI contracts.
+Reduce compiler memory traffic and aggregate-return overhead by storing
+Boolean and bounded explicit-enum record and struct fields compactly while
+preserving language semantics and C foreign-function ABI contracts.
 
 This is a layout project, not a global change to the computational
 representation of `Bool`. Boolean expressions, normal function parameters and
@@ -29,17 +29,64 @@ designed and released.
 - Consecutive internal value-struct Boolean fields now use one-bit C `_Bool`
   bitfields; isolated Boolean fields remain ordinary `_Bool`. The three-flag
   probe occupies 1 byte instead of its 12-byte baseline.
-- All-nullary enum metadata already drives packed list and tensor storage, but
-  it does not currently affect record or struct fields.
+- Explicit-enum metadata now drives byte storage for eligible internal
+  heap-record fields as well as bounded-width list and tensor storage. Scalar
+  enum values, constructor parameters, and foreign-visible fields remain C
+  `long`.
 - The compiler source currently contains four `struct` declarations. Two have
   Boolean fields, with three Boolean fields in total.
 - The compiler source currently contains approximately 81 `record` types with
   125 Boolean fields. Heap-record layout is therefore the broader memory
   opportunity.
-- Internal heap-record Boolean fields now use ordinary `_Bool`; a measured
-  three-flag object moves from a 64-byte pool allocation to 32 bytes.
-  Foreign-reachable heap records preserve C `int` fields for pure and
-  `@no_copy` pointer borrows.
+- Slice 5 first narrowed internal heap-record Boolean fields to ordinary
+  `_Bool`; a measured three-flag object moved from a 64-byte pool allocation
+  to 32 bytes. Foreign-reachable heap records preserve C `int` fields for pure
+  and `@no_copy` pointer borrows.
+- Consecutive internal heap-record Boolean fields now use one-bit `_Bool`
+  bitfields. A nine-flag-plus-pointer object moves from a 40-byte object in the
+  64-byte pool class to a 32-byte object in the 32-byte class. A clean
+  12-pair renderer replay is latency and peak-RSS neutral.
+- Eligible internal heap records now use a stable Boolean-tail declaration
+  order. A source-interleaved `Bool, Int, Bool` record moves from a 40-byte
+  object in the 64-byte pool class to a 32-byte object in the 32-byte class.
+  Constructor parameters, evaluation, and assignments remain in source order.
+  Foreign and runtime-backed heap records remain physically source ordered.
+- Value-record constructors now use C99 designated initializers. This changes
+  no declaration, call, evaluation, or physical layout, and removes positional
+  coupling before internal value-record declarations are reordered.
+- Eligible internal value records now use a stable Boolean-tail declaration
+  order. The interleaved `Bool, Int, Bool, Int` probe shrinks from 32 to 24
+  bytes. Constructor parameters, designated initialization, and expression
+  evaluation remain source ordered; foreign value records remain physically
+  source ordered with C `int` Boolean fields.
+- A compiler-source field survey found 666 direct `Int` fields, seven `Float`
+  fields, and no direct `Int8`, `UInt8`, `Int16`, `UInt16`, `Float16`, `Int32`,
+  `UInt32`, `Float32`, `Char`, `Int64`, or `UInt64` fields in record
+  declarations. General scalar-width sorting therefore has no demonstrated
+  compiler-memory payoff beyond Boolean-tail ordering today.
+- The corrected compiler-source inventory contains 117 explicit enums and 12
+  payload-free unions. It finds 90 direct explicit-enum fields across 82 heap
+  records, two payload-free-union fields, no value-struct fields, and 52 direct
+  list sites across five enum types.
+- In the retained self-hosted CLI artifact, 75 explicit-enum fields across 67
+  internal heap-record types now use `uint8_t`. A mechanically widened
+  baseline shows nine smaller C record declarations and four runtime allocator
+  class reductions; the one-instance allocator total falls from 4,608 to 4,480
+  bytes. Eight retained fields remain `long`, seven source records are not
+  retained, and payload-free unions remain out of scope.
+- Linux amd64 GCC reports the same O0/O2 candidate layouts as Darwin arm64:
+  the three-flag value record is 1 byte, the mixed value record is 24 bytes,
+  internal heap records remain in the 32-byte allocator class, compact enum
+  fields are one byte at offsets 24-26, and the foreign enum field remains an
+  eight-byte C `long`.
+- The Linux O2 probe exposed unsafe optimized stack walking in allocator
+  instrumentation. Allocation metadata and tracing now capture only the
+  immediate `blorp_alloc` return address; a regression runs allocation,
+  tracing, and leak-check modes with frame pointers omitted.
+- A clean Linux amd64 compiler build now prepares current-source bridge
+  helpers in a short-lived host before the full host compile. The build
+  completed under a 7.75 GiB Docker limit without overlapping the bootstrap
+  compiler's roughly 5 GiB working set with the full OCaml host heap.
 - Adding an observed-but-unconsumed third Boolean to the recursive type-shape
   summary is latency neutral (`+0.065%`) and peak-RSS neutral (`-0.171%`).
   Compact aggregate representation was not the source of the prior regression.
@@ -72,15 +119,18 @@ Relevant implementation:
 
 | Slice | Change | Status | Acceptance evidence |
 |---|---|---|---|
-| 0 | Persistent roadmap and generated-C layout probe | Implemented locally | macOS probe and contract pass; Linux size baseline pending |
+| 0 | Persistent roadmap and generated-C layout probe | Implemented locally | macOS arm64 and Linux amd64 O0/O2 probes and the benchmark contract pass |
 | 1 | Explicit internal versus foreign-ABI value-struct classification | Implemented locally | Direct, alias, and transitive tests pass; generated-C hash unchanged |
 | 2 | Store internal value-struct Boolean fields as `_Bool` | Implemented locally | Three flags shrink from 12 to 3 bytes; live foreign layout and scalar ABI remain unchanged |
-| 3 | Pack consecutive internal value-struct Boolean fields | Implemented locally | Three flags occupy one byte on Darwin arm64; bounded replay is latency neutral; Linux validation pending |
+| 3 | Pack consecutive internal value-struct Boolean fields | Implemented locally | Three flags occupy one byte on Darwin arm64 and Linux amd64; bounded replay is latency neutral |
 | 4 | Re-evaluate the type-shape summary using compact storage | Evaluated; no source change retained | Third-field-only result is neutral; both fused variants regress latency and were removed |
 | 5 | Store heap-record Boolean fields as `_Bool` | Implemented | Internal three-flag object falls from 40 requested/64 allocated bytes to 32/32; foreign pointer ABI and ARC tests pass; bounded emitter latency is -1.35% |
-| 6 | Pack consecutive heap-record Boolean fields | Not started | Object sizes improve without meaningful latency regression |
-| 7 | Reorder internal fields by descending alignment | Not started | Stable layout algorithm, designated initialization, measured size reduction |
-| 8 | Consider compact storage for other nullary enums | Not started | Separate design covering tag widths, invalid values, and FFI |
+| 6 | Pack consecutive heap-record Boolean fields | Implemented locally | Nine-flag object falls from 40 requested/64 allocated bytes to 32/32; clean renderer replay shows no material latency or RSS regression; foreign ABI, compiler tests, C toolchains, sanitizers, and ARC pass |
+| 7a | Move Boolean declarations after non-Boolean declarations in eligible internal heap records | Implemented locally | Source-interleaved object falls from 40 requested/64 allocated bytes to 32/32; clean renderer replay is latency and RSS neutral; foreign and runtime-backed layouts remain source ordered |
+| 7b0 | Use designated initialization for value-record constructors | Implemented locally | Exact artifact diff changes only three constructor lines; physical layout and renderer cost are unchanged; focused tests, C toolchains, sanitizers, and ARC pass |
+| 7b1 | Move Boolean declarations after non-Boolean declarations in eligible internal value records | Implemented locally | Internal mixed value record shrinks from 32 to 24 bytes; exact artifact diff is one declaration line; renderer replay is latency and RSS neutral; foreign layout remains unchanged |
+| 7c | Reorder eligible internal fields by general descending alignment | Deprioritized | No narrow numeric fields in current compiler records; explicit enums are handled separately by Slice 8 and general sorting still requires a nested-layout model |
+| 8 | Store bounded explicit-enum fields compactly in internal heap records | Implemented locally | 75 retained compiler fields use `uint8_t`; nine records shrink and four cross allocator classes; Linux O0/O2 confirms byte fields while scalar and foreign representations remain C `long` |
 
 ## Slice 0: Layout Probe
 
@@ -433,7 +483,7 @@ them by pointer, so foreign-reachable heap records retain their existing C
 field layout. Apply the same two-step progression to internal records:
 
 1. ordinary `_Bool` fields without reordering (Slice 5, implemented);
-2. consecutive `_Bool : 1` bitfields (Slice 6, not started).
+2. consecutive `_Bool : 1` bitfields (Slice 6, implemented locally).
 
 Measure actual object `sizeof`, compiler peak RSS, allocator size-class effects,
 and compilation latency after each step.
@@ -530,10 +580,393 @@ renderer helper's own heap until a later compiler is built by this emitter.
 Raw rows are retained in
 `benchmarks/results/compiler_record_layout_slice5_2026-07-25.tsv`.
 
+### Slice 6: Consecutive Heap-Record Boolean Bitfields
+
+Implemented locally on 2026-07-25. The change remains declaration-only:
+
+- Internal heap-record Boolean fields with an immediately adjacent Boolean
+  field use `_Bool : 1`.
+- Isolated internal heap-record Boolean fields remain ordinary `_Bool`.
+- Foreign-reachable heap records retain ordinary C `int` fields even when
+  multiple Boolean fields are consecutive.
+- The ARC header remains first, field and constructor order remain unchanged,
+  and constructor parameters remain C `int`.
+
+The existing three-flag record remains 32 bytes because its pointer payload
+already begins at offset 24. A separate nine-flag record makes the incremental
+effect measurable:
+
+| Layout | Slice 5 renderer | Slice 6 renderer | Change |
+|---|---:|---:|---:|
+| Heap record with ARC header, nine flags, and one pointer | 40 bytes / 8 | 32 bytes / 8 | 8 bytes smaller (20%) |
+| Runtime small-object pool allocation | 64 bytes | 32 bytes | 32 bytes smaller (50%) |
+| Pointer payload offset | 32 | 24 | 8 bytes earlier |
+
+Clang reports the same result at `-O0` and `-O2`. The values come from the
+exact declarations emitted by both renderers against one captured request.
+The production Slice 6 probe independently reports 32/32 at both optimization
+levels. C does not guarantee bitfield allocation units or physical ordering,
+so the exact size and payload offset are target-specific performance facts,
+not a universal language ABI guarantee. Each supported Clang/GCC target must
+be validated independently; Darwin arm64 and Linux amd64 are now validated.
+
+Generated-C and behavior evidence:
+
+- The Slice 5/Slice 6 artifact diff changes exactly twelve internal heap Bool
+  declarations from `_Bool field;` to `_Bool field : 1;`.
+- Construction, field reads, immutable update, pointer copying, payload ARC,
+  and all nine Boolean values execute successfully.
+- Passing a packed heap field to a foreign scalar function first materializes
+  it in a C `int` temporary.
+- Pure and `@no_copy` foreign heap pointer borrows retain C `int` field
+  storage.
+- The focused type-layout, emitter, DCE, FFI-boundary, and list-layout batches
+  pass 297 tests.
+- Clang's warning gate, GCC 14 at `-O0` and `-O2`, and GCC syntax checking
+  pass. GCC emits only the pre-existing static/inline runtime warning.
+- Clang ASan plus UBSan passes. Runtime leak checking reports 14 allocations,
+  14 releases, zero leaked objects, and zero leaked bytes.
+
+Candidate provenance:
+
+- measurement platform `Darwin 25.5.0 arm64`
+- C compiler `Apple clang 21.0.0 (clang-2100.1.1.101)`
+- C target `arm64-apple-darwin25.5.0`
+- fixture SHA-256
+  `d2fcbf33d7a02980852d843fc5e512a04e259715404639f5df5686b205ab8019`
+- support header SHA-256
+  `a3422089871fd255dbdee68da1a8dc2d014d18b7e19bc1568f4698a8c94142ad`
+- support source SHA-256
+  `718b4f1347ff55063ad08a00fb9bdfe607d01e263da8029afaa80506791c7d45`
+- production generated C SHA-256
+  `2dd6d7212713aae85edc591ec5ad2ce3a03210256ae28a4c9621f347acbda55f`
+- request SHA-256
+  `6ba553c906217607bfc3b75b6d6429677312fa7e1f426ff4c8e55585a6b3d05a`
+- Slice 5 baseline renderer SHA-256
+  `1525c15c654996bfd6975e95a6f24b596dded5abb8d992caed447f3d3ce31785`
+- Slice 6 candidate renderer SHA-256
+  `8673f16d28a4e2e3382b942cd0dbee21f41b1229bdb49aa3670b41826a920e94`
+- Slice 5 response SHA-256
+  `01a554bfc639116a129e97e35c57ae5dd446de6fcffb7c6ff29469bffbb19068`
+- Slice 6 response SHA-256
+  `26e380911c55c49b556f9a6df307984046b2c412dd1b7eb2545ec2d2b5bf632a`
+- Slice 5 emitted artifact C SHA-256
+  `7a6e4a3f999d0ae8dc74830d22b8167159dd5c95e50fa5e4a63ab4b9e0fed051`
+- Slice 6 emitted artifact C SHA-256
+  `a5e18849d06fda99a4f9025e59ab45729acec0d9fcc73a3d7bb65cefcc21c3b3`
+- artifact diff SHA-256
+  `31c640b81788149622b5941e9ff7a27f2c497a89efcd14f61f435e796be559ea`
+
+The normalized reviewed layout rows, target/toolchain identity, and exact
+artifact diff are retained in
+`benchmarks/results/compiler_record_layout_slice6_layout_2026-07-25.tsv` and
+`benchmarks/results/compiler_record_layout_slice6_artifact_2026-07-25.diff`.
+
+One pre-review-fixture six-pair replay was deliberately rejected because
+concurrent external compiler builds inflated absolute times to 0.42-0.63
+seconds and the candidate won only two pairs. Its medians were neutral
+(`-0.12%` elapsed and `-0.06%` RSS), but the variance is too large for
+acceptance. Those rows are retained as diagnostic evidence in
+`benchmarks/results/compiler_record_layout_slice6_contended_2026-07-25.tsv`.
+
+The accepted replay waited for two continuous minutes without compiler
+activity, then ran twelve order-alternated pairs. Activity checks immediately
+before and after every row remained zero, and every response hash matched:
+
+| Metric | Slice 5 renderer | Slice 6 renderer | Difference |
+|---|---:|---:|---:|
+| Median elapsed | 0.328959 s | 0.324972 s | -1.21% |
+| Median peak RSS | 65,568,768 bytes | 65,568,768 bytes | 0 |
+
+The candidate won five of twelve pairs and the median paired delta was
+`+0.000037 s` (`+0.011%`). Treat the aggregate `-1.21%` only as evidence that
+the adjacency check introduces no material regression, not as a compiler
+speedup. Raw rows and activity markers are retained in
+`benchmarks/results/compiler_record_layout_slice6_2026-07-25.tsv`.
+
 ## Slice 7: Alignment-Aware Ordering
 
-Only internal layouts may be reordered. Preserve the ARC header first, then use
-a stable descending-alignment order:
+### Slice 7a: Internal Heap-Record Boolean Tail
+
+Implemented locally on 2026-07-26. This is intentionally narrower than general
+alignment sorting:
+
+- only `InternalLayout` heap records use the new declaration order;
+- runtime-backed records identified by the existing runtime type-layout
+  registry retain source order even when classified as internal;
+- eligible fields are stably partitioned into non-Boolean declarations followed
+  by Boolean declarations;
+- Boolean bitfield eligibility is still calculated from source adjacency, so
+  two formerly isolated flags do not silently become a packed run after moving;
+- the ARC header remains the first physical field;
+- constructor parameters, expression evaluation, named assignments, field
+  reads, immutable updates, and destructor releases remain in source order;
+- foreign-reachable heap records retain source order and C `int` Boolean
+  storage.
+
+The source-interleaved fixture makes the padding reduction observable:
+
+| Layout | Slice 6 renderer | Slice 7a renderer | Change |
+|---|---:|---:|---:|
+| Internal heap record with ARC header and `Bool, Int, Bool` fields | 40 bytes / 8 | 32 bytes / 8 | 8 bytes smaller (20%) |
+| Runtime small-object pool allocation | 64 bytes | 32 bytes | 32 bytes smaller (50%) |
+| Machine-word field offset | 24 | 16 | 8 bytes earlier |
+| Foreign heap record with `Bool, Bool, Int` fields | 32 bytes / 8 | 32 bytes / 8 | Unchanged; offsets remain `16, 20, 24` |
+
+Clang's complete record-layout dump reports these values from the exact
+artifacts emitted by both renderers. The production probe independently reports
+the Slice 7a layouts at `-O0` and `-O2`.
+
+Generated-C and behavior evidence:
+
+- The exact Slice 6/Slice 7a artifact diff contains three internal declaration
+  moves: two pointer payloads and one machine-word field. It changes no field
+  types, constructors, assignments, destructors, foreign declarations, or
+  executable code.
+- A stateful fixture verifies source-order evaluation across the physical
+  partition with `Bool, Int, Bool` expressions.
+- A direct emitter regression verifies that a runtime-backed heap record
+  containing `Bool, Int` remains source ordered.
+- A consecutive-Boolean foreign heap record retains source order and C `int`
+  widths. A direct emitter regression checks the complete declaration order,
+  while the production fixture checks field widths and physical offsets.
+- The focused type-layout, emitter, DCE, FFI-boundary, and list-layout suites
+  pass 299 tests.
+- Clang and GCC 14 syntax checks pass. Generated binaries execute at `-O0` and
+  `-O2`; Clang ASan plus UBSan passes.
+- Runtime ARC accounting reports 15 allocations, 15 releases, zero leaked
+  objects, and zero leaked bytes for the production OCaml-host-generated
+  fixture.
+
+Candidate provenance:
+
+- measurement platform `Darwin 25.5.0 arm64`
+- C compiler `Apple clang 21.0.0 (clang-2100.1.1.101)`
+- C target `arm64-apple-darwin25.5.0`
+- fixture SHA-256
+  `7cc8d925971ee6aa2f8f596eb0e5043005487545f0b2cf89462b4ea83b46ede8`
+- support header SHA-256
+  `7b50dab284aa127ea7de68993c1c83a74bc22d258b82b921c495e33d38647454`
+- support source SHA-256
+  `9733634fa595f4add0c83adf86f8bfb6169867da990a23f43ad25207a810b482`
+- production generated C SHA-256
+  `4c39f0f1602c10359284aee8273dbbdb0f0dc7bb114aa9238965b7c989207c31`
+- request SHA-256
+  `2424d74b8c2c3706c1e46b678ba6ed1512a9550a80b2ba304a12403b785dd2ee`
+- Slice 6 baseline renderer SHA-256
+  `8673f16d28a4e2e3382b942cd0dbee21f41b1229bdb49aa3670b41826a920e94`
+- Slice 7a candidate renderer SHA-256
+  `41f3e646b2884f2a7bf4161a0ea2a82c4b2f4044dc1b486393276acc89d58657`
+- Slice 6 response SHA-256
+  `07ce95b440c901b8f461e1eb796f673d57423ba034d4d1e32c3d2e3bec7d84c8`
+- Slice 7a response SHA-256
+  `ea989de439ddc96078baa642e29d90b6a4a3ee99553b3c2f04b70e246d4c3b1d`
+- Slice 6 emitted artifact C SHA-256
+  `8fac4ba18cbd89a3c9d930a1ae1347e4c5fd6909362eadb0c08b28088a02d1f6`
+- Slice 7a emitted artifact C SHA-256
+  `96d98b2228a855fe35e2c3e3e59ba3785e6a9713a0e43913443abb7991c40cd2`
+- artifact diff SHA-256
+  `c62ab2a60884c85be00ccf9d632fe6c0002b1d49757c47fa446f708f0c6ddb21`
+
+The normalized layout rows, exact artifact diff, and correctness transcript
+are retained in
+`benchmarks/results/compiler_record_layout_slice7a_layout_2026-07-26.tsv` and
+`benchmarks/results/compiler_record_layout_slice7a_artifact_2026-07-26.diff`,
+and
+`benchmarks/results/compiler_record_layout_slice7a_correctness_2026-07-26.txt`.
+
+The accepted replay began after 120 continuous seconds without compiler
+activity and retained twelve order-alternated pairs. Every retained row had
+zero executable-level activity markers and the expected response hash. Six
+earlier rows were conservatively discarded after an external-activity marker:
+
+| Metric | Slice 6 renderer | Slice 7a renderer | Difference |
+|---|---:|---:|---:|
+| Median elapsed | 0.298639 s | 0.298002 s | -0.21% |
+| Median peak RSS | 65,945,600 bytes | 66,011,136 bytes | +65,536 bytes (+0.10%) |
+
+The candidate won six of twelve pairs, and the median paired delta was
+`-0.000153 s` (`-0.051%`). Treat these values as evidence that the stable
+partition and runtime-backed registry check introduce no material renderer
+regression, not as a compiler speedup. Raw rows are retained in
+`benchmarks/results/compiler_record_layout_slice7a_2026-07-26.tsv`.
+
+### Slice 7b: Internal Value-Record Boolean Tail
+
+#### Slice 7b0: Designated Value-Record Initialization
+
+Implemented locally on 2026-07-26 as a representation-neutral prerequisite.
+Every generated value-record constructor now names the destination field:
+
+```c
+LayoutMixed __r = {
+  .first = first,
+  .count = count,
+  .second = second,
+  .total = total
+};
+```
+
+Constructor parameters, argument evaluation, and call sites remain in source
+order. Record declarations and physical layouts also remain unchanged. The
+syntax is standard C99 and is accepted by the supported Clang and GCC
+toolchains.
+
+The exact Slice 7a/Slice 7b0 fixture artifact diff changes only the positional
+initializers for `LayoutThreeFlags`, `LayoutMixed`, and `LayoutForeignMixed`.
+The production layout probe reports the same size, alignment, allocator class,
+and field offsets at `-O0` and `-O2`. The five focused compiler suites pass 299
+tests, and the final emitter suite passes 258 tests after adding review-driven
+coverage for a C-reserved field name. Optimized binaries, Clang ASan plus
+UBSan, and ARC accounting also pass. The exact artifact diff and correctness
+transcript are retained in
+`benchmarks/results/compiler_record_layout_slice7b0_artifact_2026-07-26.diff`
+and
+`benchmarks/results/compiler_record_layout_slice7b0_correctness_2026-07-26.txt`.
+
+Candidate provenance:
+
+- measurement platform `Darwin 25.5.0 arm64`
+- fixture SHA-256
+  `737099885734c39f45aff7443a770132048dafe1166863f05a092e772b96178f`
+- support header SHA-256
+  `7b50dab284aa127ea7de68993c1c83a74bc22d258b82b921c495e33d38647454`
+- support source SHA-256
+  `9733634fa595f4add0c83adf86f8bfb6169867da990a23f43ad25207a810b482`
+- production generated C SHA-256
+  `c0e7f80f1c0e6c60dfb9a16c636e5f0eb9ac66521815e4d5eefc452dea2ef31a`
+- request SHA-256
+  `a0c998d88be17bef0ede186ce9e5a5999c50bcd4a4482f994201504bf40aee8d`
+- Slice 7a baseline renderer SHA-256
+  `41f3e646b2884f2a7bf4161a0ea2a82c4b2f4044dc1b486393276acc89d58657`
+- Slice 7b0 candidate renderer SHA-256
+  `5955d05ad81df7a2e55b257a57f861ff4f032e61ac15d610ccd013b19d068756`
+- Slice 7a response SHA-256
+  `d9c128190da1cc6e6f22735887465c8983284fdc361f651f9fe8fd9d94e17d61`
+- Slice 7b0 response SHA-256
+  `6852f329af3a6c3bfa0cf4ba235e23a841f6918e9fe2a2371f46c213821a9ab1`
+- Slice 7a emitted artifact C SHA-256
+  `dc8b83e7968f47920d73aae1c94b5ee3db87de11e4270e5a56c97d47bbf16db9`
+- Slice 7b0 emitted artifact C SHA-256
+  `022c9e99fa7715659cc8f6eb94d47b6388323f5743a3dc0ae29a64af9dc1b472`
+- artifact diff SHA-256
+  `43e326cc5e2af41fe4801f21d96003f9567fb9f7bfbf01cdd0cd1739011bffc7`
+
+Repeated external compiler builds prevented a continuous two-minute quiet
+window. The accepted replay instead retained complete order-alternated pairs
+only when executable-level activity markers were zero immediately before and
+after every row. The first eight pairs were clean; the marked tail was
+discarded, and four replacement pairs were collected in the next clean gap:
+
+| Metric | Slice 7a renderer | Slice 7b0 renderer | Difference |
+|---|---:|---:|---:|
+| Median elapsed | 0.296899 s | 0.295887 s | -0.34% |
+| Median peak RSS | 66,027,520 bytes | 66,093,056 bytes | +65,536 bytes (+0.10%) |
+
+The candidate won ten of twelve pairs, and the median paired delta was
+`-0.000817 s` (`-0.275%`). Treat this as evidence that designated
+initialization introduces no material renderer regression, not as a compiler
+speedup. The 24 retained rows, activity markers, and response hashes are in
+`benchmarks/results/compiler_record_layout_slice7b0_2026-07-26.tsv`.
+
+#### Slice 7b1: Internal Value-Record Boolean Tail
+
+Implemented locally on 2026-07-26. The emitter applies the same stable
+non-Boolean/Boolean declaration partition used by Slice 7a only to
+`InternalLayout` value records:
+
+- non-Boolean declarations retain their relative source order;
+- Boolean declarations retain their relative source order and move to the
+  physical tail;
+- Boolean bitfield eligibility is still calculated from source adjacency, so
+  this slice does not silently combine formerly isolated fields;
+- constructor parameters and designated initializers remain source ordered;
+- expression evaluation and call sites remain unchanged;
+- `ForeignAbiLayout` value records retain source declaration order and C `int`
+  Boolean fields.
+
+The bounded interleaved fixture demonstrates the layout reduction:
+
+| Layout | Slice 7b0 renderer | Slice 7b1 renderer | Change |
+|---|---:|---:|---:|
+| Internal `Bool, Int, Bool, Int` value record | 32 bytes / 8 | 24 bytes / 8 | 8 bytes smaller (25%) |
+| Foreign mixed value record | 32 bytes / 8 | 32 bytes / 8 | Unchanged; offsets remain `0, 8, 16, 24` |
+
+Clang reports the same result at `-O0` and `-O2`. The exact renderer artifact
+diff changes one line: the internal `LayoutMixed` declaration. It changes no
+field types, constructor parameters, designated initializers, call sites,
+foreign declarations, or executable code.
+
+Generated-C and behavior evidence:
+
+- A direct emitter regression contains identical internal and foreign mixed
+  records, proving the partition is selected by the explicit layout registry
+  rather than the record name.
+- The production fixture uses distinct word values and checks every field
+  through construction, field reads, whole-value copying, a stack `Option`, a
+  boxed `Result`, inline list and tensor storage, and a live foreign
+  value-record round trip. The generated-C contract requires the exact stack
+  `Option` typedef.
+- The focused type-layout, emitter, DCE, FFI-boundary, and list-layout suites
+  pass 301 tests.
+- Clang and GCC syntax checks pass. Generated binaries execute at `-O0` and
+  `-O2`; Clang ASan plus UBSan passes.
+- Runtime ARC accounting reports 18 allocations, 18 releases, zero leaked
+  objects, and zero leaked bytes.
+
+Candidate provenance:
+
+- measurement platform `Darwin 25.5.0 arm64`
+- fixture SHA-256
+  `a0afc75c2ec918ad2e59047c7a392a2acc2fc0e13d717e194f08002bed18e15e`
+- support header SHA-256
+  `7b50dab284aa127ea7de68993c1c83a74bc22d258b82b921c495e33d38647454`
+- support source SHA-256
+  `9733634fa595f4add0c83adf86f8bfb6169867da990a23f43ad25207a810b482`
+- production generated C SHA-256
+  `61fb4fe41e28bd288ac262258966999a9a78d68133e89be993464c63c313ca05`
+- request SHA-256
+  `c6170fbe4fb974d649a563fda371ccf1bab8cb2066bc1e811761daa59dff1a92`
+- Slice 7b0 baseline renderer SHA-256
+  `5955d05ad81df7a2e55b257a57f861ff4f032e61ac15d610ccd013b19d068756`
+- Slice 7b1 candidate renderer SHA-256
+  `6fa0f2d77e59da3571e67d0d2cf55d2635ed2295445bbc9e03913f95d85ccea4`
+- Slice 7b0 response SHA-256
+  `2192ab439db9c2becccba32a54ae292cc6d3e06f947f824cadd8ac06cdc8a46f`
+- Slice 7b1 response SHA-256
+  `04e19425702e389f38e658838186a48bda015deb730b6a807e04235f2fbb76ae`
+- Slice 7b0 emitted artifact C SHA-256
+  `ca8f857d29c001b8a4409707fd1c2e93c877c5e6f12bd062592457d76f82ccd7`
+- Slice 7b1 emitted artifact C SHA-256
+  `1f3158db6a3eb39e01b2d2f1f4ac9e60d2c69d4a327a0189556151c3e49d04c4`
+- artifact diff SHA-256
+  `4f0dd73917583d6a5a04cc61adb07b23ac90acd88de416f44fbf5894ff369e7d`
+
+The accepted replay began after 30 continuous seconds without executable-level
+compiler activity and retained twelve order-alternated pairs. Every row had
+zero activity markers and the expected response hash:
+
+| Metric | Slice 7b0 renderer | Slice 7b1 renderer | Difference |
+|---|---:|---:|---:|
+| Median elapsed | 0.311460 s | 0.311804 s | +0.111% |
+| Median peak RSS | 69,509,120 bytes | 69,378,048 bytes | -131,072 bytes (-0.189%) |
+
+The candidate won eight of twelve pairs, and the median paired delta was
+`-0.000250 s` (`-0.080%`). Treat this as evidence that the stable partition
+introduces no material renderer regression, not as a compiler speedup.
+
+Raw replay rows, normalized layouts, the exact artifact diff, and the
+correctness transcript are retained in
+`benchmarks/results/compiler_record_layout_slice7b1_2026-07-26.tsv`,
+`benchmarks/results/compiler_record_layout_slice7b1_layout_2026-07-26.tsv`,
+`benchmarks/results/compiler_record_layout_slice7b1_artifact_2026-07-26.diff`,
+and
+`benchmarks/results/compiler_record_layout_slice7b1_correctness_2026-07-26.txt`.
+
+### Slice 7c: General Alignment-Aware Ordering
+
+Deprioritized. If future compiler records gain narrower scalar fields, preserve
+the ARC header first and consider a stable descending-alignment order:
 
 ```text
 ARC header
@@ -544,9 +977,138 @@ byte fields
 packed Boolean fields
 ```
 
-Use designated C initializers so physical ordering cannot alter constructor
-argument evaluation or source semantics. Nested value-struct alignment must
-come from an explicit layout model rather than guesses based on type names.
+This broader slice requires an explicit layout model for nested value structs
+rather than guesses based on type names. The current compiler-source field
+survey found no direct 8-, 16-, or 32-bit numeric record fields, so the extra
+model and sorting complexity has no demonstrated compiler-memory benefit today.
+Revisit it only with a concrete affected record and an independent measurement.
+
+### Slice 8: Internal Heap-Record Enum Bytes
+
+Implemented locally on 2026-07-26. The first inventory incorrectly counted
+only payload-free `union` declarations and was discarded. The corrected pass
+counts both explicit `enum` syntax and payload-free unions, and excludes a
+same-name local record that shadowed an imported enum.
+
+This slice is deliberately narrow:
+
+- one registry pass records explicit `CoreEnumDecl` names only when every tag
+  is between 0 and 255;
+- direct `EnumType` fields in `InternalLayout` heap records use `uint8_t`;
+- constructor parameters, ordinary expressions, returns, stack `Option`
+  wrappers, and foreign-visible fields remain C `long`;
+- enum and Boolean field expressions passed to foreign functions are first
+  materialized in scalar C `long`/`int` temporaries, so foreign macros observe
+  the scalar ABI rather than the compact member type;
+- runtime-backed heap records retain scalar enum fields because their physical
+  layouts are owned by runtime C;
+- C functions returning a user enum must return one of its declared tags, as
+  documented in the foreign-function contract;
+- payload-free unions, unresolved named types, value structs, field reordering,
+  bit packing, and wider 16/32-bit enum storage remain separate work.
+
+The retained source inventory is:
+
+| Inventory | Count |
+|---|---:|
+| Explicit enum declarations | 117 |
+| Payload-free union declarations | 12 |
+| Direct explicit-enum heap-record fields | 90 across 82 records |
+| Direct payload-free-union heap-record fields | 2 |
+| Direct nullary value-struct fields | 0 |
+| Direct list/tensor sites | 52 list sites across 5 enums; 0 tensors |
+
+The production fixture contains an ARC header, one machine word, and three
+explicit-enum fields. At both `-O0` and `-O2`, its fields are one byte each and
+the record occupies 32 bytes in the 32-byte pool class; the widened layout
+would occupy 48 bytes in the 64-byte class. A foreign-reachable control keeps
+an eight-byte enum field and 32-byte record. Construction, field reads,
+immutable update, whole-value copying, and a foreign macro boundary are
+exercised.
+
+The generated self-hosted CLI contains 75 compacted fields across 67 retained
+record types. Recompiling that exact generated C after mechanically widening
+only those fields gives:
+
+| Metric | Widened baseline | Compact fields | Change |
+|---|---:|---:|---:|
+| Sum of 67 unique record declaration sizes | 3,720 bytes | 3,632 bytes | -88 bytes (-2.37%) |
+| One-instance runtime pool allocation total | 4,608 bytes | 4,480 bytes | -128 bytes (-2.78%) |
+| Records with smaller `sizeof` | - | 9 | - |
+| Records crossing allocator classes | - | 4 | - |
+
+The retained artifacts identify the exact inputs:
+
+- measurement platform `Darwin 25.5.0 arm64`
+- fixture SHA-256
+  `18c2e4a50f7f39562eda25a1392293d9848e923225b2780d4319298931b7e03a`
+- production generated C SHA-256
+  `2acfdff73034f9f4e19bb85aee0e1ee2c9632dd949a34aca234d0f238c554322`
+- self-hosted CLI generated C SHA-256
+  `7aadcb2dbac28062151fff9b160b27233ad55b920ffc7e71325c1f1308078d5d`
+- mechanically widened CLI C SHA-256
+  `660c38e3eea96a03eaf15c025b125a86305a298b742258feb427eea02c6f0e09`
+- compact structural probe C SHA-256
+  `2453fed9f04382616489e06a0e5cf3f7cbbb2aa27ea52c0a5667ead4fb081b7a`
+- widened structural probe C SHA-256
+  `3e5b80010f873ff54e6d9984ddb3f8d2c36ac134344afbb8feccbabfe3af7867`
+
+Focused verification passes 21 layout tests and all 260 emitter tests. The
+production fixture passes at `-O0` and `-O2` under Apple Clang, at both
+optimization levels under GCC 14, and under Clang ASan plus UBSan. Runtime ARC
+accounting reports 21 allocations, 21 releases, zero leaked objects, and zero
+leaked bytes. Apple AddressSanitizer does not support LeakSanitizer on this
+platform.
+
+Linux amd64 validation uses the same fixture, support files, and production
+backend. GCC 13 at `-O0` and `-O2` reports:
+
+| Layout | Size / alignment | Compact field evidence |
+|---|---:|---|
+| Three consecutive value-struct flags | 1 / 1 | Packed Boolean fields |
+| Internal mixed value record | 24 / 8 | Boolean-tail declaration order |
+| Internal heap enum record | 32 / 8 | Enum fields are one byte at offsets 24, 25, and 26 |
+| Foreign heap enum record | 32 / 8 | Enum field remains eight bytes at offset 16 |
+
+The first optimized Linux probe crashed in `blorp_alloc` because
+`__builtin_return_address(1)` and `(2)` are unsafe when optimized C omits frame
+pointers. Allocator metadata and allocation tracing now capture only level
+zero. The focused runtime regression compiles with
+`-O2 -fomit-frame-pointer` and passes in default, `BLORP_TRACE_ALLOCS=1`, and
+`BLORP_LEAK_CHECK=1` modes on both Linux and macOS.
+
+The initial memory-constrained Linux build also showed that lazily compiling a
+bridge helper while the full OCaml host heap was live could exceed the 7.75 GiB
+Docker limit. `build-blorp-cli` now prepares all three current-source helpers
+first, in a short-lived host process, and requires those exact prepared paths
+and includes self-hosted formatter sources in the outer CLI input identity.
+A clean Linux amd64 build completed in 1,176 seconds.
+Sampled helper-build usage reached approximately 4.9 GiB and released between
+renderer, parser, and typecheck preparations; the final host plus prepared
+renderer remained below the limit. Quality, compiler-unit,
+compiler-unit-deep, and fast compiler gates passed.
+
+The branch-wide compiler-deep gate remains red for pre-existing bootstrap
+parity failures involving unresolved generic/trait calls, inline-struct list
+projection, and imported functions. Those failures reproduce with
+current-source helpers and are distinct from the eliminated OOM condition.
+The earlier Slice 0 audit records the same broader gate as non-green.
+
+This is structural evidence, not an allocation-frequency-weighted whole-build
+memory claim. Two full rebuilds succeeded, but their cache/preparation states
+differed enough that their 4.41 GB and 6.57 GB peaks are not a valid A/B
+comparison. A final correctness rebuild also succeeded in 414.16 seconds with
+6,566,723,584 bytes maximum RSS, but it is not treated as an A/B sample. A
+controlled replay or clean alternating rebuild is required before attributing
+a peak-RSS change to this slice.
+
+The corrected inventory and structural measurements are retained in
+`benchmarks/results/compiler_nullary_enum_inventory_2026-07-26.tsv` and
+`benchmarks/results/compiler_record_layout_slice8_2026-07-26.tsv`. The latter
+is reproduced from a current generated CLI artifact by
+`benchmarks/compiler_enum_field_layout`. The full commands and correctness
+results are retained in
+`benchmarks/results/compiler_record_layout_slice8_correctness_2026-07-26.txt`.
 
 ## Verification Matrix
 
@@ -602,3 +1164,9 @@ first feedback loop.
 | 2026-07-25 | 3 | Accept one-bit `_Bool` fields for consecutive internal value-struct Boolean runs locally; keep Linux validation open | Three consecutive flags shrink 3 to 1 byte; six-pair replay is neutral; Clang/GCC and sanitizer checks pass |
 | 2026-07-25 | 4 | Reject retaining an unused third type-shape Boolean | The representation is neutral but has no standalone benefit |
 | 2026-07-25 | 4 | Reject compact-summary traversal fusion | Both measured variants removed the redundant scan but regressed median latency by 6.792% and 7.168% |
+| 2026-07-25 | 6 | Accept consecutive internal heap Bool bitfields locally; keep Linux validation open | Nine-flag object moves from 40 requested/64 allocated bytes to 32/32; a clean twelve-pair replay is latency and RSS neutral; correctness, ABI, ARC, and sanitizer gates pass |
+| 2026-07-26 | 7a | Accept stable Boolean-tail declaration ordering for eligible internal heap records; keep Linux validation open | Interleaved object moves from 40 requested/64 allocated bytes to 32/32; exact artifact diff contains only three internal declaration moves; twelve-pair replay, correctness, ABI, ARC, and sanitizer evidence are clean |
+| 2026-07-26 | 7b0 | Accept designated value-record constructor initialization as a representation-neutral prerequisite | Exact artifact diff changes only three initializer lines; physical layouts are unchanged; twelve-pair replay is latency and RSS neutral; identifier, toolchain, ARC, and sanitizer checks pass |
+| 2026-07-26 | 7b1 | Accept stable Boolean-tail declaration ordering for eligible internal value records; keep Linux validation open | Internal mixed value record shrinks from 32 to 24 bytes; exact artifact diff changes one declaration line; twelve-pair replay, correctness, foreign ABI, ARC, and sanitizer evidence are clean |
+| 2026-07-26 | 8 | Accept byte storage for declared explicit-enum fields in internal heap records; keep broader enum compaction separate | 75 retained fields compact across 67 records; nine record sizes and four allocator classes improve, while foreign and scalar ABI remain C `long` |
+| 2026-07-26 | Linux validation | Accept the current compact layouts on Linux amd64 and prewarm current-source helpers before the full host compile | O0/O2 layouts match Darwin intent; optimized allocator regression passes; clean build completes under 7.75 GiB without overlapping bootstrap and full-host heaps |
