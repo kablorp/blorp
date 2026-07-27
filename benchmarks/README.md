@@ -210,13 +210,11 @@ against an isolated helper. Capture mode writes the request immediately before
 the OCaml host would start that helper, then deliberately stops:
 
 ```bash
-cd compiler && dune build bin/blorp_ocaml_host.exe
-cd ..
-
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.json")
 output=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.c")
+bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
 BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$capture" \
-  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  "$bootstrap_compiler" \
   __compiler-host-compile-wrapper \
   -o "$output" \
   compiler/blorp/src/stage_06_typecheck/compiler_infer.brp
@@ -241,8 +239,9 @@ capture:
 
 ```bash
 cli_capture=$(mktemp "${TMPDIR:-/tmp}/blorp-cli-typecheck.XXXXXX.json")
+bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
 BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$cli_capture" \
-  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  "$bootstrap_compiler" \
   __compiler-host-compile-wrapper \
   -o "$output" \
   compiler/blorp/src/stage_12_cli/compiler_cli_main.brp

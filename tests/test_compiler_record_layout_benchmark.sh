@@ -7,14 +7,14 @@ enum_layout_runner="$repo_root/benchmarks/compiler_enum_field_layout"
 stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-record-layout-test.XXXXXX")
 trap 'rm -rf "$stage_dir"' EXIT
 
-fake_host="$stage_dir/fake_host"
+fake_compiler="$stage_dir/fake_compiler"
 fake_source="$stage_dir/fake_source.brp"
 fake_support_header="$stage_dir/fake_support_header.h"
 fake_support_source="$stage_dir/fake_support_source.c"
 missing_expectation_source="$stage_dir/missing_expectation.brp"
 unparsable_enum_record="$stage_dir/unparsable_enum_record.c"
 
-cat > "$fake_host" <<'EOF'
+cat > "$fake_compiler" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -32,7 +32,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$output" ]; then
-	echo "fake host: missing -o" >&2
+	echo "fake compiler: missing -o" >&2
 	exit 1
 fi
 
@@ -113,7 +113,7 @@ int main(void) {
 }
 C
 EOF
-chmod +x "$fake_host"
+chmod +x "$fake_compiler"
 printf '%s\n' \
 	'-- EXPECT-C: typedef struct { int first; int second; int third; } LayoutThreeFlags;' \
 	> "$fake_source"
@@ -130,12 +130,12 @@ C
 
 output=$(
 	BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
-	BLORP_RECORD_LAYOUT_HOST="$fake_host" \
+	BLORP_RECORD_LAYOUT_COMPILER="$fake_compiler" \
 	BLORP_RECORD_LAYOUT_SOURCE="$fake_source" \
 	BLORP_RECORD_LAYOUT_SUPPORT_HEADER="$fake_support_header" \
 	BLORP_RECORD_LAYOUT_SUPPORT_SOURCE="$fake_support_source" \
 	BLORP_RECORD_LAYOUT_CC="${CC:-cc} -pipe" \
-	BLORP_COMPILER_BRIDGE_BIN="$fake_host" \
+	BLORP_COMPILER_BRIDGE_BIN="$fake_compiler" \
 	"$runner"
 )
 
@@ -165,19 +165,19 @@ for mode in O0 O2; do
 	done
 done
 
-if ! grep -Eq '^RECORD_LAYOUT_META schema=1 platform=[^ ]+ git_revision=[0-9a-f]{40} git_state=(clean|dirty) source_sha256=[0-9a-f]{64} support_header_sha256=[0-9a-f]{64} support_source_sha256=[0-9a-f]{64} host_sha256=[0-9a-f]{64} bridge_compiler_sha256=[0-9a-f]{64} cc_command_sha256=[0-9a-f]{64} cc_version_sha256=[0-9a-f]{64} cc_target=[^ ]+ generated_c_sha256=[0-9a-f]{64}$' <<<"$output"; then
+if ! grep -Eq '^RECORD_LAYOUT_META schema=2 platform=[^ ]+ git_revision=[0-9a-f]{40} git_state=(clean|dirty) source_sha256=[0-9a-f]{64} support_header_sha256=[0-9a-f]{64} support_source_sha256=[0-9a-f]{64} compiler_sha256=[0-9a-f]{64} bridge_compiler_sha256=[0-9a-f]{64} cc_command_sha256=[0-9a-f]{64} cc_version_sha256=[0-9a-f]{64} cc_target=[^ ]+ generated_c_sha256=[0-9a-f]{64}$' <<<"$output"; then
 	echo "FAIL: record layout probe metadata is incomplete" >&2
 	printf '%s\n' "$output" >&2
 	exit 1
 fi
 
 if BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
-	BLORP_RECORD_LAYOUT_HOST="$fake_host" \
+	BLORP_RECORD_LAYOUT_COMPILER="$fake_compiler" \
 	BLORP_RECORD_LAYOUT_SOURCE="$missing_expectation_source" \
 	BLORP_RECORD_LAYOUT_SUPPORT_HEADER="$fake_support_header" \
 	BLORP_RECORD_LAYOUT_SUPPORT_SOURCE="$fake_support_source" \
 	BLORP_RECORD_LAYOUT_CC="${CC:-cc} -pipe" \
-	BLORP_COMPILER_BRIDGE_BIN="$fake_host" \
+	BLORP_COMPILER_BRIDGE_BIN="$fake_compiler" \
 	"$runner" >"$stage_dir/missing.out" 2>"$stage_dir/missing.err"
 then
 	echo "FAIL: record layout probe must reject missing generated C expectations" >&2

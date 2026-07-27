@@ -1001,6 +1001,7 @@ cd compiler && dune build
 
 Options:
   --ast        Print AST and exit
+  --profile    Emit function-level profiling instrumentation
   -o PATH      Write generated C to PATH
 
 ./blorp run input.brp

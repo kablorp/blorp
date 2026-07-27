@@ -41,6 +41,45 @@ toolchain_executables=(
 for executable in "${toolchain_executables[@]}"; do
 	cp /bin/sh "$fake_bin/$executable"
 done
+cat >"$fake_bin/blorp-bootstrap-compiler" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" != "__compiler-host-compile-wrapper" ]; then
+	echo "unexpected bootstrap compiler command: ${1:-<missing>}" >&2
+	exit 1
+fi
+shift
+
+output=""
+source_file=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--profile)
+			shift
+			;;
+		-o)
+			output="${2:?missing output path}"
+			shift 2
+			;;
+		-*)
+			echo "unexpected bootstrap compiler option: $1" >&2
+			exit 1
+			;;
+		*)
+			source_file="$1"
+			shift
+			;;
+	esac
+done
+
+if [ -z "$output" ] || [ ! -f "$source_file" ]; then
+	echo "bootstrap compiler requires an output and an existing source file" >&2
+	exit 1
+fi
+printf 'int main(void) { return 0; }\n' >"$output"
+SH
+chmod +x "$fake_bin/blorp-bootstrap-compiler"
 cat >"$fake_bin/blorp" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -102,6 +141,35 @@ for executable in "${toolchain_executables[@]}"; do
 		fail "packaged $executable must match its release input"
 	fi
 done
+
+bootstrap_smoke_output="$tmp_dir/bootstrap-smoke.c"
+"$extract_dir/$archive_base/blorp-bootstrap-compiler" \
+	__compiler-host-compile-wrapper \
+	-o "$bootstrap_smoke_output" \
+	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+if [ ! -s "$bootstrap_smoke_output" ]; then
+	fail "the packaged bootstrap compiler must compile a source file"
+fi
+
+sibling_release_dir="$tmp_dir/sibling-dist"
+sibling_prepare_marker="$tmp_dir/sibling-prepare-called"
+BLORP_RELEASE_BINARY="$fake_bin/blorp" \
+	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
+	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	BLORP_TEST_PREPARE_MARKER="$sibling_prepare_marker" \
+	BLORP_TEST_EXPECTED_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
+	BLORP_TEST_EXPECTED_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
+	scripts/package-release "$sibling_release_dir" >/dev/null
+sibling_extract_dir="$tmp_dir/extracted-sibling-release"
+mkdir -p "$sibling_extract_dir"
+tar -xzf "$sibling_release_dir/$archive_base.tar.gz" -C "$sibling_extract_dir"
+if ! cmp "$fake_bin/blorp-bootstrap-compiler" \
+	"$sibling_extract_dir/$archive_base/blorp-bootstrap-compiler"
+then
+	fail "release packaging must prefer a bootstrap compiler beside the release binary"
+fi
 
 if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_RENDERER_BRIDGE="$fake_bin/blorp-compiler-renderer" \
@@ -194,6 +262,36 @@ PATH="$mock_bin:$PATH" \
 for executable in "${toolchain_executables[@]}"; do
 	if ! cmp "$fake_bin/$executable" "$install_dir/$executable"; then
 		fail "the dev installer must install $executable from the archive"
+	fi
+done
+
+pre_transition_root="$tmp_dir/pre-transition/blorp-pre-transition-${release_target}"
+mkdir -p "$pre_transition_root"
+for executable in "${toolchain_executables[@]}"; do
+	if [ "$executable" != "blorp-bootstrap-compiler" ]; then
+		cp "$fake_bin/$executable" "$pre_transition_root/$executable"
+	fi
+done
+pre_transition_archive="$tmp_dir/pre-transition.tar.gz"
+tar -C "$(dirname "$pre_transition_root")" -czf "$pre_transition_archive" \
+	"$(basename "$pre_transition_root")"
+cp "$pre_transition_archive" "$downloads/$dev_asset"
+write_checksum "$downloads/$dev_asset"
+pre_transition_install="$tmp_dir/pre-transition-install"
+PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
+	BLORP_INSTALL_DIR="$pre_transition_install" \
+	scripts/install-dev >/dev/null
+if ! cmp "$fake_bin/blorp-ocaml-host" \
+	"$pre_transition_install/blorp-bootstrap-compiler"
+then
+	fail "the dev installer must preserve an older complete toolchain's compiler command"
+fi
+for executable in "${toolchain_executables[@]}"; do
+	if [ "$executable" != "blorp-bootstrap-compiler" ] &&
+		! cmp "$fake_bin/$executable" "$pre_transition_install/$executable"
+	then
+		fail "the dev installer must preserve $executable from an older complete toolchain"
 	fi
 done
 

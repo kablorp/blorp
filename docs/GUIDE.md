@@ -3745,7 +3745,7 @@ tests/
 | `--dump-core-after`, `--stop-after` | compile | Inspect Core pipeline stages |
 | `--time-phases` | compile | Print compiler phase wall-clock timings |
 | `--debug` | compile, run, test, repl | Enable debug mode |
-| `--profile` | run, test | Show timing information |
+| `--profile` | compile, run, test | Emit or run with function-level timing information |
 | `--release` | run | Compile generated C with `-O2`; default `run` uses `-O0` for fast edit-run cycles |
 | `--threads N` | run | Set max thread pool size |
 | `--timeout N` | run, test | Kill after N seconds (`test` defaults to 30; `0` disables) |

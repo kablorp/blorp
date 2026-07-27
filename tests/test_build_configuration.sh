@@ -76,6 +76,25 @@ then
 	echo "FAIL: current compiler source must not retain the immutable bootstrap compiler command" >&2
 	exit 1
 fi
+for compiler_benchmark in \
+	benchmarks/compiler_record_layout \
+	benchmarks/compiler_typecheck_profile
+do
+	if grep -Fq 'compiler/_build/default/bin/blorp_ocaml_host.exe' \
+		"$compiler_benchmark"
+	then
+		echo "FAIL: $compiler_benchmark must not compile through the current OCaml host" >&2
+		exit 1
+	fi
+	if grep -Fq '__compiler-host-compile-wrapper' "$compiler_benchmark"; then
+		echo "FAIL: $compiler_benchmark must use the current public compiler surface" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'compile --' "$compiler_benchmark"; then
+		echo "FAIL: $compiler_benchmark must compile its fixture with the current Blorp CLI" >&2
+		exit 1
+	fi
+done
 for bridge_env in \
 	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
 	BLORP_COMPILER_PARSER_BRIDGE_BIN \
@@ -296,6 +315,9 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_workflow" ||
 	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_workflow" ||
 	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$ci_workflow" ||
+	! grep -Fq '"$package_dir/blorp-bootstrap-compiler" \' "$ci_workflow" ||
+	! grep -Fq '__compiler-host-compile-wrapper \' "$ci_workflow" ||
+	! grep -Fq 'test -s "$package_root/bootstrap-empty-main.c"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_workflow" ||
@@ -364,6 +386,8 @@ export -f make find shasum cc uname
 profile_cache_output=$(
 	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
 	BLORP_COMPILER_BRIDGE_BIN=/bin/true \
+	BLORP_TYPECHECK_PROFILE_COMPILER=/bin/true \
+	BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
 	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
 	./benchmarks/compiler_typecheck_profile
 )
@@ -397,6 +421,9 @@ if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
 	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$release_workflow" ||
+	! grep -Fq '"$package_dir/blorp-bootstrap-compiler" \' "$release_workflow" ||
+	! grep -Fq '__compiler-host-compile-wrapper \' "$release_workflow" ||
+	! grep -Fq 'test -s "$package_root/bootstrap-empty-main.c"' "$release_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
