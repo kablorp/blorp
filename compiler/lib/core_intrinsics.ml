@@ -1236,20 +1236,43 @@ let option_some option_ty value =
    Tensor reduction helpers
    ================================================================ *)
 
-(** Functions that benefit from post-monomorphization re-synthesis.
-    Only these builtins participate in monomorphization — others
-    continue through the core_specialize CKUnknown dispatch. *)
-let has_post_mono_synthesis (name : string) : bool =
-  match name with
-  | "fold" | "fold_left" | "fold_right" | "sort" | "sort_by" | "sort_desc_by" ->
-      true
-  | "contains" | "add" | "is_subset" | "difference" | "intersect" | "combine"
-  | "map" | "filter" | "get_or" | "entries" ->
-      true
-  | "set" -> true
-  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "cumulative_sum"
-  | "scale" ->
-      true
+(** Generic builtin declarations are retained through monomorphization only
+    when Core can synthesize a concrete implementation after substitution.
+    Other bodyless builtins must remain unresolved for [Core_specialize]. *)
+let has_post_mono_synthesis ~(module_path : string option) (name : string) :
+    bool =
+  match module_path with
+  | Some "std/list" -> (
+      match name with
+      | "get" | "get_or" | "append" | "__unsafe_list_set_index"
+      | "__unsafe_list_swap" | "set" | "__unsafe_list_insert"
+      | "__unsafe_list_remove" | "length" | "__unsafe_list_tail" | "map"
+      | "concurrent" | "__concurrent_timeout_ms" | "filter" | "filter_map"
+      | "fold_left" | "fold_right" | "for_each" | "concat" | "zip" | "all"
+      | "any" | "sort" | "sort_by" | "sort_desc_by" | "binary_search"
+      | "binary_search_by" | "reverse" | "find" | "take" | "drop" | "flatten"
+      | "flat_map" | "map_indexed" | "enumerate" | "intersperse" | "find_index"
+      | "count" | "take_while" | "drop_while" | "partition" | "zip_with"
+      | "unzip" | "repeat" | "range" | "unique" | "min_by" | "max_by"
+      | "windows" | "chunks" | "scan" | "parallel" ->
+          true
+      | _ -> false)
+  | Some "std/set" -> (
+      match name with
+      | "fold" | "contains" | "add" | "is_subset" | "difference" | "intersect"
+      | "combine" | "map" | "filter" ->
+          true
+      | _ -> false)
+  | Some "std/dict" -> (
+      match name with
+      | "contains" | "get_or" | "keys" | "values" | "entries" | "set" -> true
+      | _ -> false)
+  | Some ("std/tensor" | "std/vector" | "std/matrix") -> (
+      match name with
+      | "sum" | "product" | "dot" | "max" | "min" | "mean"
+      | "cumulative_sum" | "scale" ->
+          true
+      | _ -> false)
   | _ -> false
 
 let numeric_tensor_access ?reg (elem : Ast.type_expr) =

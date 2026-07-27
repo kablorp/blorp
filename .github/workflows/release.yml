@@ -1,7 +1,7 @@
 name: Release Binaries
 
-# Publish dev artifacts after CI succeeds on main. Publish immutable tagged
-# releases directly from pushed v* tags.
+# Publish the toolchains preserved by successful main CI. Independently build
+# immutable tagged releases because their embedded version differs from dev.
 on:
   workflow_run:
     workflows: ['CI']
@@ -12,6 +12,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -19,19 +20,11 @@ env:
 
 jobs:
   build:
-    name: Build binary (${{ matrix.os }})
+    name: Build tagged binary (${{ matrix.os }})
     if: >-
       ${{
-        (
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.event == 'push' &&
-          github.event.workflow_run.head_branch == 'main'
-        ) ||
-        (
-          github.event_name == 'push' &&
-          startsWith(github.ref, 'refs/tags/v')
-        )
+        github.event_name == 'push' &&
+        startsWith(github.ref, 'refs/tags/v')
       }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -45,7 +38,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ github.ref }}
 
       - name: Read Blorp compiler bootstrap manifest
         id: compiler-bootstrap
@@ -143,8 +136,24 @@ jobs:
 
       - name: Prepare packaged compiler bridges
         run: |
-          mkdir -p compiler/_build/release-bridges
-          ./blorp __compiler-bridge-prepare compiler/_build/release-bridges
+          set -euo pipefail
+          current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"
+          rm -rf "$current_toolchain"
+          mkdir -p "$current_toolchain" compiler/_build/release-bridges
+          # The current compiler still delegates to private workers beside it.
+          # Stage the complete installed toolchain before compiling its successors.
+          for executable in \
+            blorp \
+            blorp-ocaml-host \
+            blorp-ocaml-middle \
+            blorp-compiler-renderer \
+            blorp-compiler-parser \
+            blorp-compiler-typecheck
+          do
+            cp "$executable" "$current_toolchain/$executable"
+          done
+          BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp" \
+            ./blorp __compiler-bridge-prepare compiler/_build/release-bridges
 
       - name: Package binary
         env:
@@ -159,7 +168,9 @@ jobs:
         shell: bash
         env:
           BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          BLORP_RELEASE_COMMIT: ${{ steps.meta.outputs.source_sha }}
           BLORP_RELEASE_TARGET: ${{ steps.meta.outputs.target }}
+          BLORP_RELEASE_CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
           set -euo pipefail
           package_root=$(mktemp -d "${RUNNER_TEMP}/blorp-package-smoke.XXXXXX")
@@ -169,6 +180,12 @@ jobs:
           package_dir="$package_root/$archive_base"
           source_root="$PWD"
           cd "$package_root"
+          version_output=$("$package_dir/blorp" --version)
+          grep -Fxq "blorp ${BLORP_RELEASE_VERSION}" <<<"$version_output"
+          grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}" <<<"$version_output"
+          grep -Fxq "target: ${BLORP_RELEASE_TARGET}" <<<"$version_output"
+          grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}" <<<"$version_output"
+          grep -Fxq "dirty: false" <<<"$version_output"
           "$package_dir/blorp" check --no-format \
             "$source_root/compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
           "$package_dir/blorp" compile --no-format \
@@ -182,21 +199,27 @@ jobs:
         with:
           name: blorp-${{ steps.meta.outputs.target }}
           path: dist/*
+          compression-level: 0
 
   publish:
     name: Publish release
     needs: build
     if: >-
       ${{
+        always() &&
         (
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.event == 'push' &&
-          github.event.workflow_run.head_branch == 'main'
-        ) ||
-        (
-          github.event_name == 'push' &&
-          startsWith(github.ref, 'refs/tags/v')
+          (
+            github.event_name == 'workflow_run' &&
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.event == 'push' &&
+            github.event.workflow_run.head_branch == 'main' &&
+            needs.build.result == 'skipped'
+          ) ||
+          (
+            github.event_name == 'push' &&
+            startsWith(github.ref, 'refs/tags/v') &&
+            needs.build.result == 'success'
+          )
         )
       }}
     runs-on: ubuntu-latest
@@ -209,7 +232,18 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Download packaged binaries
+      - name: Download tested CI binaries
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: blorp-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download tagged release binaries
+        if: github.event_name == 'push'
         uses: actions/download-artifact@v4
         with:
           pattern: blorp-*
@@ -255,6 +289,46 @@ jobs:
             echo "title=$title"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Validate release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            aarch64-apple-darwin
+          )
+          shopt -s nullglob
+          assets=(dist/*)
+          archives=(dist/blorp-"${version}"-*.tar.gz)
+          checksums=(dist/blorp-"${version}"-*.tar.gz.sha256)
+          if [ ${#assets[@]} -ne $((${#targets[@]} * 2)) ] ||
+            [ ${#archives[@]} -ne ${#targets[@]} ] ||
+            [ ${#checksums[@]} -ne ${#targets[@]} ]
+          then
+            echo "Expected only one archive and checksum for each release target." >&2
+            printf 'Assets: %s\n' "${assets[*]:-none}" >&2
+            printf 'Archives: %s\n' "${archives[*]:-none}" >&2
+            printf 'Checksums: %s\n' "${checksums[*]:-none}" >&2
+            exit 1
+          fi
+
+          for target in "${targets[@]}"; do
+            archive="dist/blorp-${version}-${target}.tar.gz"
+            checksum="${archive}.sha256"
+            if [ ! -f "$archive" ] || [ ! -f "$checksum" ]; then
+              echo "Missing release assets for ${target}." >&2
+              exit 1
+            fi
+            expected=$(awk 'NF { print $1; exit }' "$checksum")
+            actual=$(shasum -a 256 "$archive" | awk '{ print $1 }')
+            if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]] || [ "$actual" != "$expected" ]; then
+              echo "Release checksum mismatch for ${target}." >&2
+              exit 1
+            fi
+          done
 
       - name: Add stable dev asset aliases
         if: ${{ steps.meta.outputs.tag == 'dev' }}

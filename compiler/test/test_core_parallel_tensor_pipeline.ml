@@ -13,8 +13,13 @@ let dim3 = TyConstInt 3
 let dim4 = TyConstInt 4
 let ty_vec elem = TyArray (elem, [ dim4 ])
 let ty_parallel_vec elem = TyNamed ("ParallelVector", [ elem; dim4 ])
+let ty_bridge_parallel_vec elem = TyNamed ("ParallelVector", [ elem; ty_int ])
 let ty_mat elem = TyArray (elem, [ dim2; dim3 ])
 let ty_parallel_mat elem = TyNamed ("ParallelMatrix", [ elem; dim2; dim3 ])
+
+let ty_bridge_parallel_mat elem =
+  TyNamed ("ParallelMatrix", [ elem; ty_int; ty_int ])
+
 let ty_func params return = TyFunc { params; return; is_pure = true }
 let mk ty desc = { desc; ty; loc }
 let cvar name ty = mk ty (CVar (Var.named name))
@@ -93,6 +98,14 @@ let zip_map_call source other f =
 
 let parallel_call source body =
   call_user def_vector_parallel "parallel" [ source; body ] (ty_vec ty_int)
+
+let bridge_parallel_call module_path source body result_ty =
+  let name = Blorp.Codegen_names.make_ufcs_name module_path "parallel" in
+  mk result_ty
+    (CCall
+       ( CKUnknown,
+         cvar name (ty_func [ source.ty; body.ty ] result_ty),
+         [ source; body ] ))
 
 let matrix_map_call source f =
   call_user def_parallel_matrix_map "map" [ source; f ] source.ty
@@ -280,12 +293,43 @@ let test_non_chain_body_is_left_as_vector_parallel_call () =
       Alcotest.failf "expected unfused Vector.parallel call, got %s"
         (Blorp.Core.pp_to_string lowered)
 
+let test_bridge_erased_vector_dimension_still_fuses () =
+  let bridge_chunk = cvar "chunk" (ty_bridge_parallel_vec ty_int) in
+  let body =
+    lambda
+      [ ("chunk", ty_bridge_parallel_vec ty_int) ]
+      (map_call bridge_chunk mapper)
+      (ty_bridge_parallel_vec ty_int)
+  in
+  let lowered =
+    fuse_expr (bridge_parallel_call "std/vector" source body (ty_vec ty_int))
+  in
+  Alcotest.(check string)
+    "builtin" "blorp_vmap_parallel"
+    (lowered_builtin_name lowered)
+
 let test_matrix_map_chain_lowers_to_mmap_parallel () =
   let expr =
     matrix_parallel_expr
       (matrix_map_call (matrix_map_call matrix_chunk mapper) mapper2)
   in
   let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mmap_parallel"
+    (lowered_builtin_name lowered)
+
+let test_bridge_erased_matrix_dimensions_still_fuse () =
+  let bridge_chunk = cvar "mchunk" (ty_bridge_parallel_mat ty_int) in
+  let body =
+    lambda
+      [ ("mchunk", ty_bridge_parallel_mat ty_int) ]
+      (matrix_map_call bridge_chunk mapper)
+      (ty_bridge_parallel_mat ty_int)
+  in
+  let lowered =
+    fuse_expr
+      (bridge_parallel_call "std/matrix" matrix_source body (ty_mat ty_int))
+  in
   Alcotest.(check string)
     "builtin" "blorp_mmap_parallel"
     (lowered_builtin_name lowered)
@@ -381,8 +425,12 @@ let suite =
           `Quick test_distinct_zip_vectors_fall_back_to_indexed_vmap;
         Alcotest.test_case "non_chain_body_is_left_as_vector_parallel_call"
           `Quick test_non_chain_body_is_left_as_vector_parallel_call;
+        Alcotest.test_case "bridge_erased_vector_dimension_still_fuses" `Quick
+          test_bridge_erased_vector_dimension_still_fuses;
         Alcotest.test_case "matrix_map_chain_lowers_to_mmap_parallel" `Quick
           test_matrix_map_chain_lowers_to_mmap_parallel;
+        Alcotest.test_case "bridge_erased_matrix_dimensions_still_fuse" `Quick
+          test_bridge_erased_matrix_dimensions_still_fuse;
         Alcotest.test_case
           "matrix_indexed_chain_lowers_to_indexed_mmap_parallel" `Quick
           test_matrix_indexed_chain_lowers_to_indexed_mmap_parallel;

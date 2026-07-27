@@ -83,10 +83,11 @@ designed and released.
   instrumentation. Allocation metadata and tracing now capture only the
   immediate `blorp_alloc` return address; a regression runs allocation,
   tracing, and leak-check modes with frame pointers omitted.
-- A clean Linux amd64 compiler build now prepares current-source bridge
-  helpers in a short-lived host before the full host compile. The build
-  completed under a 7.75 GiB Docker limit without overlapping the bootstrap
-  compiler's roughly 5 GiB working set with the full OCaml host heap.
+- A clean Linux amd64 compiler build completed under a 7.75 GiB Docker limit
+  after preparing current-source bridge helpers in short-lived processes.
+  The merged build now consumes the pinned release's complete helper
+  generation by default, avoiding those helper compilations entirely; CI can
+  still select a tested current-source generation through explicit paths.
 - Adding an observed-but-unconsumed third Boolean to the recursive type-shape
   summary is latency neutral (`+0.065%`) and peak-RSS neutral (`-0.171%`).
   Compact aggregate representation was not the source of the prior regression.
@@ -1079,20 +1080,23 @@ zero. The focused runtime regression compiles with
 
 The initial memory-constrained Linux build also showed that lazily compiling a
 bridge helper while the full OCaml host heap was live could exceed the 7.75 GiB
-Docker limit. `build-blorp-cli` now prepares all three current-source helpers
-first, in a short-lived host process, and requires those exact prepared paths
-and includes self-hosted formatter sources in the outer CLI input identity.
-A clean Linux amd64 build completed in 1,176 seconds.
-Sampled helper-build usage reached approximately 4.9 GiB and released between
-renderer, parser, and typecheck preparations; the final host plus prepared
-renderer remained below the limit. Quality, compiler-unit,
+Docker limit. Before the complete bootstrap toolchain was available,
+`build-blorp-cli` prepared all three current-source helpers first in
+short-lived host processes. A clean Linux amd64 build completed in 1,176
+seconds. Sampled helper-build usage reached approximately 4.9 GiB and released
+between renderer, parser, and typecheck preparations; the final host plus
+prepared renderer remained below the limit. The build now uses the pinned
+release's verified helper generation by default, eliminating local helper
+compilation while preserving explicit tested-helper overrides for CI.
+Self-hosted formatter sources remain part of the outer CLI input identity.
+Quality, compiler-unit,
 compiler-unit-deep, and fast compiler gates passed.
 
-The branch-wide compiler-deep gate remains red for pre-existing bootstrap
-parity failures involving unresolved generic/trait calls, inline-struct list
-projection, and imported functions. Those failures reproduce with
-current-source helpers and are distinct from the eliminated OOM condition.
-The earlier Slice 0 audit records the same broader gate as non-green.
+After merging the current main branch and resolving the bootstrap parity
+failures, the complete serial local matrix passes 12,123 of 12,123 tests. This
+includes compiler-deep, runtime, leak-check, doctest, and both CLI gates. The
+earlier Slice 0 and Linux-validation red-gate notes are retained as historical
+evidence rather than the current branch status.
 
 This is structural evidence, not an allocation-frequency-weighted whole-build
 memory claim. Two full rebuilds succeeded, but their cache/preparation states
@@ -1169,4 +1173,4 @@ first feedback loop.
 | 2026-07-26 | 7b0 | Accept designated value-record constructor initialization as a representation-neutral prerequisite | Exact artifact diff changes only three initializer lines; physical layouts are unchanged; twelve-pair replay is latency and RSS neutral; identifier, toolchain, ARC, and sanitizer checks pass |
 | 2026-07-26 | 7b1 | Accept stable Boolean-tail declaration ordering for eligible internal value records; keep Linux validation open | Internal mixed value record shrinks from 32 to 24 bytes; exact artifact diff changes one declaration line; twelve-pair replay, correctness, foreign ABI, ARC, and sanitizer evidence are clean |
 | 2026-07-26 | 8 | Accept byte storage for declared explicit-enum fields in internal heap records; keep broader enum compaction separate | 75 retained fields compact across 67 records; nine record sizes and four allocator classes improve, while foreign and scalar ABI remain C `long` |
-| 2026-07-26 | Linux validation | Accept the current compact layouts on Linux amd64 and prewarm current-source helpers before the full host compile | O0/O2 layouts match Darwin intent; optimized allocator regression passes; clean build completes under 7.75 GiB without overlapping bootstrap and full-host heaps |
+| 2026-07-26 | Linux validation | Accept the current compact layouts on Linux amd64 and use the pinned release's verified helpers by default | O0/O2 layouts match Darwin intent; optimized allocator regression passes; clean build completes under 7.75 GiB, and packaged helpers avoid overlapping local helper compilation with the full-host heap while preserving explicit tested-helper overrides |

@@ -4,15 +4,24 @@ import:
 		list_element_needs_release,
 		list_layout_for_type,
 	../src/stage_09_core/compiler_core_json:
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TypeAliasDecl, ValueRecordDecl),
-		CoreExpr(ListAllocExpr, ListConstructExpr, LiteralExpr),
+		CoreBoxKind(PointerBox),
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TypeAliasDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(ListAllocExpr, ListConstructExpr, LiteralExpr, RecordExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(EnumType, NamedType, ValueRecordType, VoidType),
+		CoreType(EnumType, HeapRecordType, NamedType, ValueRecordType, VoidType),
 		CoreVar,
 	test: TestSuite
 
@@ -76,6 +85,63 @@ pure func stale_list_construct(typ: CoreType) -> CoreExpr:
 			elem_needs_release = True
 		},
 		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func stale_value_record_list_construct(list_typ: CoreType, record_typ: CoreType) -> CoreExpr:
+	ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [
+				{
+					kind = PointerBox,
+					value = RecordExpr([], record_typ, SyntheticSourceLoc),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			],
+			elem_needs_release = False
+		},
+		list_typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func stale_enum_list_construct(list_typ: CoreType, enum_typ: CoreType) -> CoreExpr:
+	ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [
+				{
+					kind = PointerBox,
+					value = VarExpr(core_var("TinyZero"), enum_typ, SyntheticSourceLoc),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			],
+			elem_needs_release = False
+		},
+		list_typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func stale_heap_record_list_construct(list_typ: CoreType, record_typ: CoreType) -> CoreExpr:
+	ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [
+				{
+					kind = PointerBox,
+					value = RecordExpr([], record_typ, SyntheticSourceLoc),
+					needs_release = False,
+					transfers_ownership = False
+				},
+			],
+			elem_needs_release = False
+		},
+		list_typ,
 		SyntheticSourceLoc,
 	)
 
@@ -293,6 +359,147 @@ pure func test_annotates_function_global_and_impl_bodies() -> Bool:
 			False
 
 
+pure func test_defers_inline_struct_element_reboxing() -> Bool:
+	record_type: CoreType = ValueRecordType("Point")
+	point_list: CoreType = list_type(record_type)
+	annotated = annotate_list_layouts(empty_program([ValueRecordDecl({
+			name = "Point",
+			type_params = [],
+			fields = [],
+			loc = SyntheticSourceLoc,
+		}), function_decl(
+			"make_points",
+			4,
+			stale_value_record_list_construct(point_list, record_type),
+		)]))
+
+	match annotated.decls:
+		[ValueRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListConstructExpr(construct, _, _)):
+					match (construct.layout, construct.elements):
+						(InlineStructListStorage("Point"), [element]):
+							match element.kind:
+								PointerBox:
+									not element.needs_release
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_defers_inline_enum_element_reboxing() -> Bool:
+	enum_type: CoreType = EnumType("Tiny")
+	tiny_list: CoreType = list_type(enum_type)
+	annotated = annotate_list_layouts(empty_program([
+		EnumDecl({
+			name = "Tiny",
+			type_params = [],
+			variants = [
+				{
+					name = "TinyZero",
+					c_name = "Tiny_Zero",
+					tag = 0,
+					def_id = None
+				},
+			],
+			loc = SyntheticSourceLoc,
+		}),
+		function_decl(
+			"make_tiny",
+			5,
+			stale_enum_list_construct(tiny_list, enum_type),
+		),
+	]))
+
+	match annotated.decls:
+		[EnumDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListConstructExpr(construct, _, _)):
+					match (construct.layout, construct.elements):
+						(InlineListStorage(1), [element]):
+							match element.kind:
+								PointerBox:
+									not element.needs_release
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_repairs_heap_record_element_release_metadata() -> Bool:
+	record_type: CoreType = HeapRecordType("SourceFile")
+	source_list: CoreType = list_type(record_type)
+	annotated = annotate_list_layouts(empty_program([HeapRecordDecl({
+			name = "SourceFile",
+			type_params = [],
+			fields = [],
+			loc = SyntheticSourceLoc,
+		}), function_decl(
+			"make_sources",
+			6,
+			stale_heap_record_list_construct(source_list, record_type),
+		)]))
+
+	match annotated.decls:
+		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListConstructExpr(construct, _, _)):
+					match (construct.layout, construct.elements):
+						(PointerListStorage, [element]):
+							element.needs_release and construct.elem_needs_release
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_repairs_aliased_heap_record_element_release_metadata() -> Bool:
+	record_type: CoreType = HeapRecordType("SourceFile")
+	alias_type: CoreType = named_type("SourceAlias")
+	source_list: CoreType = list_type(alias_type)
+	annotated = annotate_list_layouts(empty_program([TypeAliasDecl({
+			name = "SourceAlias",
+			type_params = [],
+			target = named_type("SourceFile"),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		}), HeapRecordDecl({
+			name = "SourceFile",
+			type_params = [],
+			fields = [],
+			loc = SyntheticSourceLoc,
+		}), function_decl(
+			"make_aliased_sources",
+			7,
+			stale_heap_record_list_construct(source_list, record_type),
+		)]))
+
+	match annotated.decls:
+		[TypeAliasDecl(_), HeapRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListConstructExpr(construct, _, _)):
+					match (construct.layout, construct.elements):
+						(PointerListStorage, [element]):
+							element.needs_release and construct.elem_needs_release
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core list layout",
 	tests = [
@@ -307,6 +514,16 @@ tests: TestSuite = {
 		(
 			"annotates function global and impl bodies",
 			test_annotates_function_global_and_impl_bodies,
+		),
+		("defers inline struct element reboxing", test_defers_inline_struct_element_reboxing),
+		("defers inline enum element reboxing", test_defers_inline_enum_element_reboxing),
+		(
+			"repairs heap record element release metadata",
+			test_repairs_heap_record_element_release_metadata,
+		),
+		(
+			"repairs aliased heap record element release metadata",
+			test_repairs_aliased_heap_record_element_release_metadata,
 		),
 	]
 }

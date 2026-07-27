@@ -864,7 +864,7 @@ let try_fuse_length e =
     when is_string_type source.ty && is_int_value_type e.ty -> (
       match pipeline_of_expr source with
       | Some pipeline -> lower_length pipeline
-      | None -> None)
+      | None -> Some (string_len source))
   | _ -> None
 
 let try_fuse_materialization e =

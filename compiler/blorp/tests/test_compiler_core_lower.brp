@@ -885,6 +885,57 @@ func test_lowers_resolved_local_direct_call() -> Bool:
 	direct_call_lowers_to_selected_direct_call("add_one", 88, CompilerCallableLocal)
 
 
+func test_lowers_local_function_reference_with_callable_id() -> Bool:
+	resolved = resolved_call_info(
+		"owned_json",
+		CompilerResolvedDirectCall(7444, CompilerCallableLocal),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("owned_json"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(VarExpr(variable, _, _)):
+			variable.name == "owned_json" and variable.def_id == Some(7444)
+		_:
+			False
+
+
+func test_lowers_imported_function_reference_with_callable_id() -> Bool:
+	resolved = resolved_call_info(
+		"to_result",
+		CompilerResolvedDirectCall(2180, CompilerCallableImported("std/option")),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("to_result"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(VarExpr(variable, _, _)):
+			variable.name == "std_option__to_result" and variable.def_id == Some(2180)
+		_:
+			False
+
+
+func test_rejects_conflicting_function_reference_ids() -> Bool:
+	resolved = resolved_call_info(
+		"__ufcs_map",
+		CompilerResolvedDirectCall(78, CompilerCallableLocal),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("__ufcs_map#77"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Err(CompilerCoreLowerInvalidCall(message)):
+			message.contains("conflicting callable ids")
+		_:
+			False
+
+
 func direct_call_lowers_to_unknown_call(
 	callee_name: String,
 	callable_id: Int,
@@ -914,8 +965,29 @@ func direct_call_lowers_to_unknown_call(
 			False
 
 
-func test_lowers_resolved_imported_direct_call_as_unknown() -> Bool:
-	direct_call_lowers_to_unknown_call("external_add", 92, CompilerCallableImported("math"))
+func test_lowers_resolved_imported_direct_call() -> Bool:
+	resolved = resolved_call_info(
+		"external_add",
+		CompilerResolvedDirectCall(92, CompilerCallableImported("math")),
+	)
+	callee = CompilerTypedNameExpr(ident("external_add"), expr_info(function_type()))
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
+			(
+				def_id == 92
+				and variable.name == "__ufcs_math__external_add"
+				and variable.def_id.is_none()
+				and args.length() == 1
+			)
+		_:
+			False
 
 
 func test_lowers_resolved_constructor_direct_call_as_unknown() -> Bool:
@@ -1574,6 +1646,41 @@ func test_lowers_block_local_var_decl_to_let() -> Bool:
 					),
 				)
 			)
+		_:
+			False
+
+
+func test_local_binding_uses_resolved_initializer_type() -> Bool:
+	resolved_policy_type: CompilerType = CompilerNamedType("pkg/policy::Policy", [])
+	initializer = CompilerTypedNameExpr(ident("policy_value"), expr_info(resolved_policy_type))
+	payload: CompilerTypedVarDeclPayload = {
+		name = ident("policy"),
+		annotation = Some(CompilerNamedType("Policy", [])),
+		initializer = initializer,
+		is_mutable = False,
+		span = source_span()
+	}
+	expr = CompilerTypedBlockExpr(
+		[
+			CompilerTypedVarDeclExpr(payload, expr_info(compiler_type_void())),
+			CompilerTypedNameExpr(ident("policy"), expr_info(resolved_policy_type)),
+		],
+		source_span(),
+		expr_info(resolved_policy_type),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(_, _, bind_type, rhs, _)):
+			rhs_type: CoreType = match rhs:
+				VarExpr(_, typ, _):
+					typ
+				_:
+					VoidType
+
+			core_types_equal(
+				bind_type,
+				NamedType("pkg_policy__Policy", []),
+			) and core_types_equal(bind_type, rhs_type)
 		_:
 			False
 
@@ -3485,6 +3592,25 @@ func test_lowers_tuple_type() -> Bool:
 			False
 
 
+func test_lowers_const_int_named_type_argument_as_int() -> Bool:
+	parallel_vector_type = CompilerNamedType(
+		"ParallelVector",
+		[compiler_type_int(), CompilerConstIntType(4)],
+	)
+
+	match compiler_core_lower_type(parallel_vector_type):
+		Ok(lowered):
+			core_types_equal(
+				lowered,
+				NamedType(
+					"ParallelVector",
+					[core_int_type(), core_int_type()],
+				),
+			)
+		_:
+			False
+
+
 func test_lowers_function_decl_preserving_callable_id() -> Bool:
 	info: CompilerTypedFunctionInfo = {
 		decl = parsed_function_decl(),
@@ -4198,9 +4324,18 @@ tests: TestSuite = {
 		("lowers binary expression", test_lowers_binary_expression),
 		("lowers resolved local direct call", test_lowers_resolved_local_direct_call),
 		(
-			"lowers resolved imported direct call as unknown",
-			test_lowers_resolved_imported_direct_call_as_unknown,
+			"lowers local function reference with callable id",
+			test_lowers_local_function_reference_with_callable_id,
 		),
+		(
+			"lowers imported function reference with callable id",
+			test_lowers_imported_function_reference_with_callable_id,
+		),
+		(
+			"rejects conflicting function reference ids",
+			test_rejects_conflicting_function_reference_ids,
+		),
+		("lowers resolved imported direct call", test_lowers_resolved_imported_direct_call),
 		(
 			"lowers resolved constructor direct call as unknown",
 			test_lowers_resolved_constructor_direct_call_as_unknown,
@@ -4234,6 +4369,10 @@ tests: TestSuite = {
 		),
 		("lowers block expression to sequence", test_lowers_block_expression_to_sequence),
 		("lowers block local var decl to let", test_lowers_block_local_var_decl_to_let),
+		(
+			"local binding uses resolved initializer type",
+			test_local_binding_uses_resolved_initializer_type,
+		),
 		("lowers tuple destruct in block", test_lowers_tuple_destruct_in_block),
 		("lowers tuple destruct skipping wildcard", test_lowers_tuple_destruct_skipping_wildcard),
 		(
@@ -4303,6 +4442,10 @@ tests: TestSuite = {
 			test_lowers_call_without_resolved_metadata_as_unknown,
 		),
 		("lowers tuple type", test_lowers_tuple_type),
+		(
+			"lowers const int named type argument as int",
+			test_lowers_const_int_named_type_argument_as_int,
+		),
 		("flattens canonical module type name", test_flattens_canonical_module_type_name),
 		(
 			"lowers function decl preserving callable id",

@@ -7,16 +7,17 @@ OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
 OCAML_MIDDLE := compiler/_build/default/bin/blorp_ocaml_middle.exe
 ROOT_OCAML_MIDDLE := ./blorp-ocaml-middle
+ROOT_RENDERER_BRIDGE := ./blorp-compiler-renderer
+ROOT_PARSER_BRIDGE := ./blorp-compiler-parser
+ROOT_TYPECHECK_BRIDGE := ./blorp-compiler-typecheck
 BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
+BLORP_INSTALLED_BOOTSTRAP_ID := $(BLORP_CLI_BUILD_DIR)/installed-bootstrap.id
+BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA := pinned-release-v1
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
-BLORP_CLI_PREPARED_BRIDGE_DIR := $(BLORP_CLI_BUILD_DIR)/prepared-bridges
-BLORP_CLI_RENDERER_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_renderer_bridge.bin
-BLORP_CLI_PARSER_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_parser_bridge.bin
-BLORP_CLI_TYPECHECK_BRIDGE := $(BLORP_CLI_PREPARED_BRIDGE_DIR)/compiler_typecheck_bridge.bin
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_embedded_std.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
@@ -67,6 +68,15 @@ install: build-blorp-cli
 		cp "$(BLORP_CLI_BIN)" ./blorp; \
 		codesign -s - ./blorp 2>/dev/null || true; \
 	fi
+	@set -e; \
+	bootstrap_toolchain_dir=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-toolchain-dir); \
+	bootstrap_id=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-id); \
+	bootstrap_install_id="$$bootstrap_id $(BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA)"; \
+	scripts/install-compiler-bootstrap-helpers \
+		"$$bootstrap_toolchain_dir" \
+		. \
+		"$(BLORP_INSTALLED_BOOTSTRAP_ID)" \
+		"$$bootstrap_install_id"
 
 warm: warm-formatter
 
@@ -98,28 +108,53 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
-	if [ -z "$$bridge_compiler" ]; then \
-		bridge_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
+	renderer_bridge="$${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}"; \
+	parser_bridge="$${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}"; \
+	typecheck_bridge="$${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}"; \
+	require_prepared_bridge="$${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}"; \
+	helper_override_count=0; \
+	for bridge_path in "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
+		if [ -n "$$bridge_path" ]; then helper_override_count=$$((helper_override_count + 1)); fi; \
+	done; \
+	if [ "$$helper_override_count" -ne 0 ] && [ "$$helper_override_count" -ne 3 ]; then \
+		echo "BLORP compiler bridge helper overrides must be provided together." >&2; \
+		exit 1; \
 	fi; \
-	new_hash=$$( { \
+	if [ -z "$$bridge_compiler" ]; then \
+		bootstrap_toolchain_dir=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-toolchain-dir); \
+		bridge_compiler="$$bootstrap_toolchain_dir/blorp"; \
+		if [ "$$helper_override_count" -eq 0 ]; then \
+			renderer_bridge="$$bootstrap_toolchain_dir/blorp-compiler-renderer"; \
+			parser_bridge="$$bootstrap_toolchain_dir/blorp-compiler-parser"; \
+			typecheck_bridge="$$bootstrap_toolchain_dir/blorp-compiler-typecheck"; \
+		fi; \
+	fi; \
+	if [ -n "$$renderer_bridge" ] && [ -n "$$parser_bridge" ] && [ -n "$$typecheck_bridge" ]; then \
+		require_prepared_bridge=1; \
+	fi; \
+	source_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$$bridge_compiler" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		for bridge_path in "$$bridge_compiler" "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
+			if [ -n "$$bridge_path" ]; then printf '%s\n' "$$bridge_path"; fi; \
+		done; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
+	recipe_hash=$$(sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
+	new_hash=$$(printf '%s\n%s\n%s\n' "$$source_hash" "$$recipe_hash" "$$require_prepared_bridge" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
-	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ]; then \
+	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ]; then \
 		echo "Building Blorp CLI"; \
 		tmp_bin="$(BLORP_CLI_BIN).tmp"; \
 		tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
 		trap 'rm -f "$$tmp_bin" "$$tmp_hash"' EXIT; \
 		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
-		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" "$(OCAML_HOST)" __compiler-bridge-prepare "$(BLORP_CLI_PREPARED_BRIDGE_DIR)" >/dev/null; \
 		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" \
-			BLORP_COMPILER_RENDERER_BRIDGE_BIN="$(BLORP_CLI_RENDERER_BRIDGE)" \
-			BLORP_COMPILER_PARSER_BRIDGE_BIN="$(BLORP_CLI_PARSER_BRIDGE)" \
-			BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$(BLORP_CLI_TYPECHECK_BRIDGE)" \
-			BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1 \
+			BLORP_COMPILER_RENDERER_BRIDGE_BIN="$$renderer_bridge" \
+			BLORP_COMPILER_PARSER_BRIDGE_BIN="$$parser_bridge" \
+			BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$$typecheck_bridge" \
+			BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE="$$require_prepared_bridge" \
 			"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
@@ -160,7 +195,7 @@ quality:
 
 quality-full: quality
 
-hygiene-check:
+hygiene-check: build-blorp-cli
 	@if [ -d ocaml ]; then \
 		echo "Retired compiler source directory './ocaml' found."; \
 		echo "Compiler sources live in './compiler'; remove stale generated or copied files."; \
@@ -175,6 +210,7 @@ hygiene-check:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
+	@tests/test_bootstrap_helper_install.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
 	@tests/test_release_toolchain.sh
@@ -268,4 +304,4 @@ docker-premerge-gate-all:
 clean:
 	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(ROOT_OCAML_MIDDLE)" "$(ROOT_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" "$(ROOT_TYPECHECK_BRIDGE)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"

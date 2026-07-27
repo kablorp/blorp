@@ -226,6 +226,16 @@ let test_reverse_then_same_width_replace_length_rewrites () =
     "fused expression uses source length" true
     (count_intrinsic_call "string_len" fused > 0)
 
+let test_plain_string_length_rewrites_to_intrinsic () =
+  let expr = length_call (cvar "s" ty_string) in
+  let fused = P.fuse_expr expr in
+  Alcotest.(check int)
+    "trait-resolved call removed" 0
+    (count_user_call "HasLength_length_String" fused);
+  Alcotest.(check int)
+    "string length intrinsic introduced" 1
+    (count_intrinsic_call "string_len" fused)
+
 let test_bound_reverse_is_not_rewritten_as_pipeline () =
   let source = cvar "s" ty_string in
   let tmp = Var.named "tmp" in
@@ -244,7 +254,7 @@ let test_bound_reverse_is_not_rewritten_as_pipeline () =
   match (P.fuse_expr expr).desc with
   | CLet
       ( binding,
-        { desc = CCall (CKUser ("HasLength_length_String", _), _, _); _ } ) -> (
+        { desc = CCall (CKIntrinsic "string_len", _, _); _ } ) -> (
       match binding.bind_rhs.desc with
       | CCall (CKUser ("std_string__reverse", _), _, _) -> ()
       | _ -> Alcotest.fail "expected bound reverse producer to materialize")
@@ -389,6 +399,8 @@ let suite =
           test_reverse_then_replace_length_is_not_rewritten;
         Alcotest.test_case "reverse_then_same_width_replace_length_rewrites"
           `Quick test_reverse_then_same_width_replace_length_rewrites;
+        Alcotest.test_case "plain_string_length_rewrites_to_intrinsic" `Quick
+          test_plain_string_length_rewrites_to_intrinsic;
         Alcotest.test_case "bound_reverse_is_not_rewritten_as_pipeline" `Quick
           test_bound_reverse_is_not_rewritten_as_pipeline;
         Alcotest.test_case "pipeline_fuses_real_reverse_length_call" `Quick

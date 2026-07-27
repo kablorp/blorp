@@ -979,6 +979,56 @@ let test_mono_qualified_call_prefers_selected_direct_kind_generic () =
         (match kind with CKSelectedDirect _ -> false | _ -> true)
   | _ -> Alcotest.fail "expected rewritten main call"
 
+let test_mono_selected_registered_generic_builtin_is_specialized () =
+  let list_t = TyNamed ("List", [ TyVar "T" ]) in
+  let list_int = TyNamed ("List", [ ty_int ]) in
+  let drop_builtin : core_func =
+    {
+      cf_name = "std_list__drop__pure";
+      cf_module = Some "std/list";
+      cf_type_params = tparams [ "T" ];
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = list_t; cp_loc = loc };
+          { cp_name = Var.named "count"; cp_ty = ty_int; cp_loc = loc };
+        ];
+      cf_return_ty = list_t;
+      cf_body = None;
+      cf_is_pure = true;
+      cf_kind = CFBuiltin;
+      cf_def_id = 713;
+    }
+  in
+  let call_ty =
+    TyFunc
+      {
+        params = [ list_int; ty_int ];
+        return = list_int;
+        is_pure = true;
+      }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 713,
+           cvar "std_list__drop__pure" call_ty,
+           [ cvar "items" list_int; cint 1 ] ))
+      list_int
+  in
+  let main_fn = mk_func "main" [ ("items", list_int) ] list_int main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl drop_builtin; mk_decl main_fn ]
+  in
+  let names =
+    List.filter_map
+      (fun d -> match d.cd_desc with CDFunc f -> Some f.cf_name | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "retains and specializes referenced generic builtin" true
+    (List.mem "std_list__drop__pure__mono_Int" names)
+
 let test_mono_selected_direct_requires_matching_signature () =
   let list_t = TyNamed ("List", [ TyVar "T" ]) in
   let list_string = TyNamed ("List", [ ty_string ]) in
@@ -2435,6 +2485,9 @@ let suite =
           `Quick test_mono_bare_call_prefers_selected_direct_kind_generic;
         Alcotest.test_case "qualified call prefers selected direct kind generic"
           `Quick test_mono_qualified_call_prefers_selected_direct_kind_generic;
+        Alcotest.test_case
+          "selected registered generic builtin is specialized" `Quick
+          test_mono_selected_registered_generic_builtin_is_specialized;
         Alcotest.test_case "selected direct requires matching signature" `Quick
           test_mono_selected_direct_requires_matching_signature;
         Alcotest.test_case "signature guard allows dimension params" `Quick
