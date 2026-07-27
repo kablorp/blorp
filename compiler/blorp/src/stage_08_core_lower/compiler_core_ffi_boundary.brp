@@ -25,7 +25,10 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
-	compiler_core_list_layout: resolve_layout_type
+	compiler_core_list_layout:
+		CoreLayoutTypeIndex,
+		build_layout_type_index,
+		resolve_layout_type_with_index,
 
 
 union CoreFfiBoundaryError:
@@ -83,10 +86,10 @@ private pure func managed_named_type(name: String, args: List[CoreType]) -> Bool
 
 
 private pure func classify_default_arg(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	param: CoreParam,
 ) -> Result[CoreForeignDefaultArgPolicy, CoreFfiBoundaryError]:
-	resolved: CoreType = resolve_layout_type(program, param.typ)
+	resolved: CoreType = resolve_layout_type_with_index(index, param.typ)
 
 	match resolved:
 		NamedType(name, args):
@@ -99,7 +102,7 @@ private pure func classify_default_arg(
 			else if name == "Option" and args.length() == 1:
 				match args.get(0):
 					Some(payload):
-						match resolve_layout_type(program, payload):
+						match resolve_layout_type_with_index(index, payload):
 							EnumType(_) | ValueRecordType(_) | RangeType:
 								Ok(ForeignScalarByValue)
 							NamedType(payload_name, payload_args):
@@ -126,20 +129,20 @@ private pure func classify_default_arg(
 
 
 private pure func classify_default_args(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	params: List[CoreParam],
 ) -> Result[List[CoreForeignDefaultArgPolicy], CoreFfiBoundaryError]:
 	match params:
 		[]:
 			Ok([])
 		[param, ...rest]:
-			policy ?= classify_default_arg(program, param)
-			rest_policies ?= classify_default_args(program, rest)
-			Ok([policy].concat(rest_policies))
+			policy ?= classify_default_arg(index, param)
+			rest_policies ?= classify_default_args(index, rest)
+			Ok([policy] + rest_policies)
 
 
 private pure func annotate_function(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	function_info: CoreFunction,
 ) -> Result[CoreFunction, CoreFfiBoundaryError]:
 	match function_info.function_kind:
@@ -148,7 +151,7 @@ private pure func annotate_function(
 				ForeignBorrowArgs:
 					Ok(function_info)
 				ForeignDefaultArgs(_):
-					policies ?= classify_default_args(program, function_info.params)
+					policies ?= classify_default_args(index, function_info.params)
 					Ok(
 						{ function_info |
 							function_kind = ForeignFunction(
@@ -161,50 +164,51 @@ private pure func annotate_function(
 
 
 private pure func annotate_functions(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	functions: List[CoreFunction],
 ) -> Result[List[CoreFunction], CoreFfiBoundaryError]:
 	match functions:
 		[]:
 			Ok([])
 		[function_info, ...rest]:
-			annotated ?= annotate_function(program, function_info)
-			annotated_rest ?= annotate_functions(program, rest)
-			Ok([annotated].concat(annotated_rest))
+			annotated ?= annotate_function(index, function_info)
+			annotated_rest ?= annotate_functions(index, rest)
+			Ok([annotated] + annotated_rest)
 
 
 private pure func annotate_decl(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	decl: CoreDecl,
 ) -> Result[CoreDecl, CoreFfiBoundaryError]:
 	match decl:
 		FunctionDecl(function_info):
-			annotated ?= annotate_function(program, function_info)
+			annotated ?= annotate_function(index, function_info)
 			Ok(FunctionDecl(annotated))
 		ImplDecl(impl_info):
-			methods ?= annotate_functions(program, impl_info.methods)
+			methods ?= annotate_functions(index, impl_info.methods)
 			Ok(ImplDecl({ impl_info | methods = methods }))
 		_:
 			Ok(decl)
 
 
 private pure func annotate_decls(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	decls: List[CoreDecl],
 ) -> Result[List[CoreDecl], CoreFfiBoundaryError]:
 	match decls:
 		[]:
 			Ok([])
 		[decl, ...rest]:
-			annotated_decl ?= annotate_decl(program, decl)
-			annotated_rest ?= annotate_decls(program, rest)
-			Ok([annotated_decl].concat(annotated_rest))
+			annotated_decl ?= annotate_decl(index, decl)
+			annotated_rest ?= annotate_decls(index, rest)
+			Ok([annotated_decl] + annotated_rest)
 
 
 pure func annotate_ffi_boundaries(
 	program: CoreProgram,
 ) -> Result[CoreProgram, CoreFfiBoundaryError]:
-	decls ?= annotate_decls(program, program.decls)
+	index: CoreLayoutTypeIndex = build_layout_type_index(program)
+	decls ?= annotate_decls(index, program.decls)
 	Ok({
 		decls = decls,
 		foreign_includes = program.foreign_includes,

@@ -44,6 +44,14 @@ if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
 	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
 	exit 1
 fi
+if ! grep -Fq "find tools/formatter -name '*.brp' -type f -print" <<<"$cli_build_plan"; then
+	echo "FAIL: formatter sources must participate in the Blorp CLI input identity" >&2
+	exit 1
+fi
+if ! grep -Fq 'python3 -m unittest tests/test_runtime_allocator_stats.py' Makefile; then
+	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
+	exit 1
+fi
 if ! grep -Fq -- '--print-toolchain-dir' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must resolve the pinned complete toolchain" >&2
 	exit 1
@@ -77,15 +85,10 @@ then
 	exit 1
 fi
 
-if partial_override_output=$( \
-	BLORP_COMPILER_RENDERER_BRIDGE_BIN=/bin/sh \
-	make build-blorp-cli 2>&1 \
-); then
-	echo "FAIL: the Blorp CLI build must reject partial bridge helper overrides" >&2
-	exit 1
-fi
-if ! grep -Fq "bridge helper overrides must be provided together" \
-	<<<"$partial_override_output"
+if ! grep -Fq \
+	'if [ "$helper_override_count" -ne 0 ] && [ "$helper_override_count" -ne 3 ]' \
+	<<<"$cli_build_plan" ||
+	! grep -Fq "bridge helper overrides must be provided together" <<<"$cli_build_plan"
 then
 	echo "FAIL: partial bridge helper overrides must produce a precise diagnostic" >&2
 	exit 1
@@ -303,6 +306,53 @@ if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
 	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
 	exit 1
 fi
+
+benchmark_cache=$(mktemp -d "${TMPDIR:-/tmp}/blorp-profile-cache-test.XXXXXX")
+trap 'rm -rf "$benchmark_cache"' EXIT
+mkdir -p "$benchmark_cache/compiler-typecheck-profile/fixed-hash"
+profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/compiler_typecheck_profile"
+printf '#!/usr/bin/env bash\nprintf "PROFILE_CACHE_SMOKE\\n"\n' >"$profile_cache_binary"
+chmod +x "$profile_cache_binary"
+
+make() {
+	:
+}
+
+find() {
+	:
+}
+
+shasum() {
+	if [ "$#" -eq 2 ]; then
+		while IFS= read -r _; do
+			:
+		done
+	fi
+	printf 'fixed-hash  mocked\n'
+}
+
+cc() {
+	printf 'mock cc\n'
+}
+
+uname() {
+	printf 'mock-platform\n'
+}
+
+export -f make find shasum cc uname
+profile_cache_output=$(
+	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
+	BLORP_COMPILER_BRIDGE_BIN=/bin/true \
+	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
+	./benchmarks/compiler_typecheck_profile
+)
+unset -f make find shasum cc uname
+if [ "$profile_cache_output" != "PROFILE_CACHE_SMOKE" ]; then
+	echo "FAIL: compiler_typecheck_profile must support default mode under set -u" >&2
+	exit 1
+fi
+rm -rf "$benchmark_cache"
+trap - EXIT
 
 release_workflow=.github/workflows/release.yml
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")

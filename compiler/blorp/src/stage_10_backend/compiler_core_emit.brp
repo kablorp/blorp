@@ -662,6 +662,17 @@ import:
 		TupleRetainElemArgs,
 		render_prepared_tuple_op,
 	compiler_build_artifact: CArtifact
+	compiler_core_emit_record_layout:
+		CompilerCHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
+		CompilerCRecordLayout(ForeignAbiLayout, InternalLayout),
+		CompilerCRecordLayoutRegistry,
+		CompilerCValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
+		c_heap_record_field_storage,
+		c_heap_record_layout,
+		c_record_layout,
+		c_value_record_field_storage,
+		c_value_record_field_type_is_boolean,
+		classify_c_record_layouts,
 	compiler_core_emit_type_layout as TypeLayout
 	string: string as make_string
 
@@ -1745,6 +1756,28 @@ private pure func emit_temp_value_body(
 	}
 
 
+private pure func emit_scoped_operand_body(
+	prefix: String,
+	expr: CoreExpr,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	body ?= emit_function_body(expr, next_temp)
+	value ?= required_body_value(body)
+
+	if body.statements == "":
+		Some(body)
+	else:
+		Some(
+			emit_temp_value_body(
+				prefix,
+				core_expr_type(expr),
+				"",
+				statement_expression(body.statements, value),
+				body.next_temp,
+			),
+		)
+
+
 private pure func emit_binary_body(
 	op: CoreBinaryOp,
 	left: CoreExpr,
@@ -1752,9 +1785,9 @@ private pure func emit_binary_body(
 	typ: CoreType,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	left_c ?= emit_function_body(left, next_temp)
+	left_c ?= emit_scoped_operand_body("bin_left", left, next_temp)
 	left_value ?= required_body_value(left_c)
-	right_c ?= emit_function_body(right, left_c.next_temp)
+	right_c ?= emit_scoped_operand_body("bin_right", right, left_c.next_temp)
 	right_value ?= required_body_value(right_c)
 	value ?= c_binary_expr(op, left, right, left_value, right_value)
 
@@ -5002,6 +5035,64 @@ private pure func foreign_borrow_arg_value(arg: CoreExpr, value: String) -> Stri
 		value
 
 
+private pure func foreign_arg_may_have_compact_scalar_field(arg: CoreExpr) -> Bool:
+	match arg:
+		FieldExpr(_, _, typ, _):
+			if c_value_record_field_type_is_boolean(typ):
+				True
+			else:
+				match typ:
+					EnumType(_):
+						True
+					_:
+						False
+		_:
+			False
+
+
+private pure func materialize_foreign_compact_scalar_field_args(
+	args: List[CoreExpr],
+	args_body: CallArgsBody,
+) -> Option[CallArgsBody]:
+	if args.length() != args_body.args.length():
+		None
+	else:
+		var statements: String = args_body.statements
+		var values: List[String] = []
+		var temp_index: Int = args_body.next_temp
+		var failed: Bool = False
+		var index: Int = 0
+
+		for arg in args:
+			if not failed:
+				match args_body.args.get(index):
+					Some(arg_value):
+						if foreign_arg_may_have_compact_scalar_field(arg):
+							temp: String = temp_name("ffi_scalar_arg", temp_index)
+							statements += "  " + c_type_name(
+								core_expr_type(arg),
+							) + " " + temp + " = " + arg_value + ";\n"
+							values = values.append(temp)
+							temp_index += 1
+						else:
+							values = values.append(arg_value)
+					None:
+						failed = True
+						break
+
+			index += 1
+
+		if failed:
+			None
+		else:
+			Some({
+				statements = statements,
+				args = values,
+				cleanup_slots = args_body.cleanup_slots,
+				next_temp = temp_index,
+			})
+
+
 private pure func emit_foreign_borrow_args_body(
 	args: List[CoreExpr],
 	args_body: CallArgsBody,
@@ -5098,12 +5189,13 @@ private pure func emit_foreign_call_args_body(
 	next_temp: Int,
 ) -> Option[ForeignCallArgsBody]:
 	args_body ?= emit_call_args_body(args, next_temp)
+	materialized_args ?= materialize_foreign_compact_scalar_field_args(args, args_body)
 
 	match arg_passing:
 		ForeignBorrowArgs:
-			emit_foreign_borrow_args_body(args, args_body)
+			emit_foreign_borrow_args_body(args, materialized_args)
 		ForeignDefaultArgs(policies):
-			emit_foreign_default_args_body(args, policies, args_body)
+			emit_foreign_default_args_body(args, policies, materialized_args)
 
 
 private pure func emit_foreign_call_body(
@@ -8847,7 +8939,7 @@ private pure func emit_union_payload_arg_body(
 			if body.returns:
 				None
 			else:
-				Some(body)
+				Some(scoped_body_value("union_arg", core_expr_type(arg.value), body))
 		ErasedUnionPayloadStorage:
 			body ?= emit_boxed_pointer_body(arg, next_temp)
 
@@ -12548,7 +12640,7 @@ private pure func emit_tailrec_tail(
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -12557,7 +12649,7 @@ private pure func emit_tailrec_tail(
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -12578,7 +12670,7 @@ private pure func emit_tailrec_tail(
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -12587,7 +12679,7 @@ private pure func emit_tailrec_tail(
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -12607,7 +12699,7 @@ private pure func emit_tailrec_tail(
 			second_c ?= emit_tailrec_tail(params, return_type, second, first_c.next_temp)
 			Some(
 				terminal_body(
-					discard_expr_body(first, first_c) + second_c.statements,
+					scoped_discard_expr_body(first, first_c) + second_c.statements,
 					second_c.next_temp,
 				),
 			)
@@ -13319,7 +13411,7 @@ private pure func emit_tailrec_list_spread_tail(
 				body_c ?= emit_tailrec_list_spread_tail(loop, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -13334,7 +13426,7 @@ private pure func emit_tailrec_list_spread_tail(
 				body_c ?= emit_tailrec_list_spread_tail(loop, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -13348,7 +13440,7 @@ private pure func emit_tailrec_list_spread_tail(
 			second_c ?= emit_tailrec_list_spread_tail(loop, second, first_c.next_temp)
 			Some(
 				terminal_body(
-					discard_expr_body(first, first_c) + second_c.statements,
+					scoped_discard_expr_body(first, first_c) + second_c.statements,
 					second_c.next_temp,
 				),
 			)
@@ -18293,7 +18385,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
+					statements = scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -18302,7 +18394,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
+					statements = scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -18390,7 +18482,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
+					statements = scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -18399,7 +18491,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
+					statements = scoped_discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -21512,23 +21604,76 @@ private pure func emit_global_runtime_init_body(
 		})
 
 
-private pure func c_value_record_field_decl(field: CoreValueRecordField) -> String:
-	c_type_name(field.typ) + " " + c_identifier(field.name) + "; "
+private pure func c_value_record_field_decl(
+	field: CoreValueRecordField,
+	layout: CompilerCRecordLayout,
+	has_boolean_neighbor: Bool,
+) -> String:
+	field_name: String = c_identifier(field.name)
+
+	match c_value_record_field_storage(layout, field.typ, has_boolean_neighbor):
+		OrdinaryCValueRecordField(c_type):
+			c_type + " " + field_name + "; "
+		PackedBooleanCValueRecordField:
+			"_Bool " + field_name + " : 1; "
 
 
 private pure func c_value_record_make_param(field: CoreValueRecordField) -> String:
 	c_type_name(field.typ) + " " + c_identifier(field.name)
 
 
-private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> String:
-	var fields_c: String = ""
+private pure func value_record_field_at_is_boolean(
+	fields: List[CoreValueRecordField],
+	index: Int,
+) -> Bool:
+	match fields.get(index):
+		Some(field):
+			c_value_record_field_type_is_boolean(field.typ)
+		None:
+			False
+
+
+private pure func emit_value_record_decl(
+	record_decl: CoreValueRecordDecl,
+	layout: CompilerCRecordLayout,
+) -> String:
+	var source_order_fields_c: String = ""
+	var internal_non_boolean_fields_c: String = ""
+	var internal_boolean_fields_c: String = ""
 	var params: List[String] = []
 	var init_fields: List[String] = []
+	var field_index: Int = 0
 
 	for field in record_decl.fields:
-		fields_c += c_value_record_field_decl(field)
+		field_name: String = c_identifier(field.name)
+		has_boolean_neighbor: Bool = (
+			(
+				field_index > 0
+				and value_record_field_at_is_boolean(record_decl.fields, field_index - 1)
+			)
+			or value_record_field_at_is_boolean(record_decl.fields, field_index + 1)
+		)
+
+		field_decl: String = c_value_record_field_decl(field, layout, has_boolean_neighbor)
+
+		match layout:
+			InternalLayout:
+				if c_value_record_field_type_is_boolean(field.typ):
+					internal_boolean_fields_c += field_decl
+				else:
+					internal_non_boolean_fields_c += field_decl
+			ForeignAbiLayout:
+				source_order_fields_c += field_decl
+
 		params = params.append(c_value_record_make_param(field))
-		init_fields = init_fields.append(c_identifier(field.name))
+		init_fields = init_fields.append("." + field_name + " = " + field_name)
+		field_index += 1
+
+	fields_c: String = match layout:
+		InternalLayout:
+			internal_non_boolean_fields_c + internal_boolean_fields_c
+		ForeignAbiLayout:
+			source_order_fields_c
 
 	param_c: String = if params.length() == 0:
 		"void"
@@ -21540,12 +21685,41 @@ private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> St
 	) + " }; return __r; }\n\n"
 
 
-private pure func heap_record_field_decl(field: CoreHeapRecordField) -> String:
-	"  " + c_type_name(field.typ) + " " + c_identifier(field.name) + ";\n"
+private pure func heap_record_field_decl(
+	field: CoreHeapRecordField,
+	record_name: String,
+	layouts: CompilerCRecordLayoutRegistry,
+	layout: CompilerCRecordLayout,
+	has_boolean_neighbor: Bool,
+) -> String:
+	field_name: String = c_identifier(field.name)
+
+	match c_heap_record_field_storage(
+		layouts,
+		record_name,
+		layout,
+		field.typ,
+		has_boolean_neighbor,
+	):
+		OrdinaryCHeapRecordField(c_type):
+			"  " + c_type + " " + field_name + ";\n"
+		PackedBooleanCHeapRecordField:
+			"  _Bool " + field_name + " : 1;\n"
 
 
 private pure func heap_record_make_param(field: CoreHeapRecordField) -> String:
 	c_type_name(field.typ) + " " + c_identifier(field.name)
+
+
+private pure func heap_record_field_at_is_boolean(
+	fields: List[CoreHeapRecordField],
+	index: Int,
+) -> Bool:
+	match fields.get(index):
+		Some(field):
+			c_value_record_field_type_is_boolean(field.typ)
+		None:
+			False
 
 
 private pure func heap_record_field_release_statement(field: CoreHeapRecordField) -> String:
@@ -21594,17 +21768,61 @@ private pure func emit_heap_record_destructor(record_decl: CoreHeapRecordDecl) -
 		""
 
 
-private pure func emit_heap_record_decl(record_decl: CoreHeapRecordDecl) -> String:
-	var fields_c: String = ""
+private pure func emit_heap_record_decl(
+	record_decl: CoreHeapRecordDecl,
+	layouts: CompilerCRecordLayoutRegistry,
+	layout: CompilerCRecordLayout,
+) -> String:
+	var source_order_fields_c: String = ""
+	var internal_non_boolean_fields_c: String = ""
+	var internal_boolean_fields_c: String = ""
 	var params: List[String] = []
 	var assignments: String = ""
 	record_c_type: String = c_type_name(HeapRecordType(record_decl.name))
 
+	reorder_internal_boolean_fields: Bool = match layout:
+		InternalLayout:
+			match runtime_backed_heap_record_c_type(record_decl.name):
+				Some(_):
+					False
+				None:
+					True
+		ForeignAbiLayout:
+			False
+
+	var field_index: Int = 0
+
 	for field in record_decl.fields:
 		field_name: String = c_identifier(field.name)
-		fields_c += heap_record_field_decl(field)
+		has_boolean_neighbor: Bool = (
+			field_index > 0 and heap_record_field_at_is_boolean(record_decl.fields, field_index - 1)
+			or heap_record_field_at_is_boolean(record_decl.fields, field_index + 1)
+		)
+
+		field_decl: String = heap_record_field_decl(
+			field,
+			record_decl.name,
+			layouts,
+			layout,
+			has_boolean_neighbor,
+		)
+
+		if reorder_internal_boolean_fields:
+			if c_value_record_field_type_is_boolean(field.typ):
+				internal_boolean_fields_c += field_decl
+			else:
+				internal_non_boolean_fields_c += field_decl
+		else:
+			source_order_fields_c += field_decl
+
 		params = params.append(heap_record_make_param(field))
 		assignments += "  __rec->" + field_name + " = " + field_name + ";\n"
+		field_index += 1
+
+	fields_c: String = if reorder_internal_boolean_fields:
+		internal_non_boolean_fields_c + internal_boolean_fields_c
+	else:
+		source_order_fields_c
 
 	param_c: String = if params.length() == 0:
 		"void"
@@ -22033,13 +22251,22 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 	) + constructors_c + reuse_constructors_c
 
 
-private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_value_record_decls(
+	decls: List[CoreDecl],
+	layouts: CompilerCRecordLayoutRegistry,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			ValueRecordDecl(record_decl):
-				c_code = append_emitted_c(c_code, emit_value_record_decl(record_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_value_record_decl(
+						record_decl,
+						c_record_layout(layouts, record_decl.name),
+					),
+				)
 			HeapRecordDecl(record_decl):
 				void
 			EnumDecl(enum_decl):
@@ -22096,13 +22323,23 @@ private pure func emit_heap_record_and_union_forward_decls(decls: List[CoreDecl]
 		c_code + "\n"
 
 
-private pure func emit_heap_record_decls(decls: List[CoreDecl]) -> String:
+private pure func emit_heap_record_decls(
+	decls: List[CoreDecl],
+	layouts: CompilerCRecordLayoutRegistry,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				c_code = append_emitted_c(c_code, emit_heap_record_decl(record_decl))
+				c_code = append_emitted_c(
+					c_code,
+					emit_heap_record_decl(
+						record_decl,
+						layouts,
+						c_heap_record_layout(layouts, record_decl.name),
+					),
+				)
 			ValueRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
@@ -22442,17 +22679,25 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 
 
 private pure func emit_decls(
-	decls: List[CoreDecl],
+	program: CoreProgram,
 	profile_enabled: Bool,
 ) -> Result[String, CoreEmitError]:
+	decls: List[CoreDecl] = program.decls
+	layouts: CompilerCRecordLayoutRegistry = classify_c_record_layouts(program)
 	global_init ?= emit_global_init_function(decls)
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, emit_heap_record_and_union_forward_decls(decls))
-	c_code = append_emitted_c(c_code, emit_value_record_decls(decls))
+	c_code = append_emitted_c(
+		c_code,
+		emit_value_record_decls(decls, layouts),
+	)
 	c_code = append_emitted_c(c_code, emit_enum_decls(decls))
 	c_code = append_emitted_c(c_code, emit_generated_stack_option_typedefs(decls))
 	c_code = append_emitted_c(c_code, emit_union_decls(decls))
-	c_code = append_emitted_c(c_code, emit_heap_record_decls(decls))
+	c_code = append_emitted_c(
+		c_code,
+		emit_heap_record_decls(decls, layouts),
+	)
 	c_code = append_emitted_c(c_code, emit_static_closure_forward_decls(decls))
 	c_code = append_emitted_c(c_code, emit_function_forward_decls(decls))
 	c_code = append_emitted_c(c_code, emit_global_decls(decls))
@@ -22480,7 +22725,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	match prepared:
 		PreparedCore(program):
-			decls_c ?= emit_decls(program.decls, profile_enabled)
+			decls_c ?= emit_decls(program, profile_enabled)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 					program.foreign_includes,
