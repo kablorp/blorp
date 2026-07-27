@@ -21,6 +21,13 @@ import:
 		ParsedProgram,
 		parsed_program_has_errors,
 	../stage_03_parse/compiler_parser: parse_compiler_source
+	../stage_05_types/compiler_type:
+		CompilerType(CompilerNamedType),
+		compiler_canonical_module_type_name,
+		compiler_types_equal,
+	../stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedModule
+	../stage_06_typecheck/compiler_typecheck_decl:
+		CompilerTypedDecl(CompilerTypedGlobalVarDecl, CompilerTypedPrivateDecl),
 	fs:
 		DirectoryEntry,
 		DirectoryEntryKind(EntryDirectory, EntryFile, EntryOther, EntrySymlink, EntryUnknown),
@@ -46,6 +53,10 @@ private FILESYSTEM_ISOLATED_TEST_ROOTS: List[String] = ["tests/test_blorp/memory
 
 private LEAK_BASELINE_ROOT: String = "tests/test_blorp/memory/leak_check_baselines"
 
+private TEST_SUITE_MODULE: String = "std/test"
+
+private TEST_SUITE_TYPE: String = "TestSuite"
+
 
 record CliTestSourceFeatures {
 	has_main: Bool,
@@ -58,6 +69,15 @@ union CliTestExecutionIsolation:
 	CliSharedTestProcess
 	CliFreshTestProcess(String)
 	CliFreshTestFilesystem(String)
+
+
+union CliTestSuiteBindingResolution:
+	CliTestSuiteBindingResolved
+	CliTestSuiteBindingMissing
+	CliTestSuiteBindingWrongType(CompilerType)
+	CliTestSuiteBindingInaccessible
+	CliTestSuiteBindingAmbiguous
+	CliTestSuiteBindingInvalidProgram
 
 
 record CliDiscoveredTestSource {
@@ -171,6 +191,58 @@ pure func classify_test_source(program: ParsedProgram) -> CliTestSourceFeatures:
 		has_tests_binding = program.decls.any(decl_has_tests_binding),
 		has_doctests = program.decls.any(decl_has_doctests)
 	}
+
+
+private union CliTestSuiteBindingCandidate:
+	PublicTestSuiteBinding(CompilerType)
+	PrivateTestSuiteBinding
+
+
+private pure func test_suite_binding_candidates(
+	decl: CompilerTypedDecl,
+) -> List[CliTestSuiteBindingCandidate]:
+	match decl:
+		CompilerTypedGlobalVarDecl(info):
+			if info.decl.name.text == "tests":
+				[PublicTestSuiteBinding(info.binding_type)]
+			else:
+				[]
+		CompilerTypedPrivateDecl(inner):
+			if test_suite_binding_candidates(inner).length() > 0:
+				[PrivateTestSuiteBinding]
+			else:
+				[]
+		_:
+			[]
+
+
+pure func resolve_test_suite_binding(
+	module: CompilerTypecheckedModule,
+) -> CliTestSuiteBindingResolution:
+	if parsed_program_has_errors(module.parsed_program) or module.errors.length() > 0:
+		CliTestSuiteBindingInvalidProgram
+	else:
+		candidates: List[CliTestSuiteBindingCandidate] = module.typed_program.decls.flat_map(
+			test_suite_binding_candidates,
+		)
+
+		match candidates:
+			[]:
+				CliTestSuiteBindingMissing
+			[PrivateTestSuiteBinding]:
+				CliTestSuiteBindingInaccessible
+			[PublicTestSuiteBinding(binding_type)]:
+				expected: CompilerType = CompilerNamedType(
+					compiler_canonical_module_type_name(TEST_SUITE_MODULE, TEST_SUITE_TYPE),
+					[],
+				)
+
+				if compiler_types_equal(binding_type, expected):
+					CliTestSuiteBindingResolved
+				else:
+					CliTestSuiteBindingWrongType(binding_type)
+			_:
+				CliTestSuiteBindingAmbiguous
 
 
 private func read_directory_entries(path_value: String) -> Result[List[DirectoryEntry], IOError]:

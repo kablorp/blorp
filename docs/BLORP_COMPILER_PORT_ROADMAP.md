@@ -1813,9 +1813,12 @@ Current status:
   Deterministic filesystem discovery now reads each candidate once, retains its
   parsed program, preserves parse failures for diagnostics, skips compiler
   fixture directories during recursive walks, and represents execution
-  isolation as a typed policy. Production test execution still needs to resolve
-  candidate bindings and consume these discovered programs before the OCaml
-  substring classifiers can be deleted.
+  isolation as a typed policy. Candidate bindings now resolve from error-free
+  typechecked modules against canonical `std/test::TestSuite` binding identity.
+  Local aliases are transparent; private declarations are explicitly
+  inaccessible to the imported harness, and same-spelled user types cannot
+  qualify. Production test execution still needs to consume these typed results
+  before the OCaml substring classifiers can be deleted.
 
 Typed frontier closure before CTFE:
 

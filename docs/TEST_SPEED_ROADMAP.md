@@ -570,11 +570,14 @@ substrings. It also walks requested files and directories deterministically,
 skips compiler fixture directories during recursive discovery, parses each
 candidate once, retains its `ParsedProgram`, preserves malformed-source
 diagnostics, and assigns typed process/filesystem isolation policy from explicit
-suite roots. The `tests` binding remains a candidate until type resolution proves
-its TestSuite identity. Production `Test_runner` routing remains on the OCaml
-constructors until resolved test identity and one harness execution path consume
-these discovered programs and the retained graph without rebuilding the
-frontend.
+suite roots. Candidate `tests` bindings can now be resolved from error-free
+typechecked modules against canonical `std/test::TestSuite` identity. The
+resolver consumes the declaration's canonical binding type, so local type
+aliases remain transparent while same-named user records and wrong types cannot
+qualify. Missing, inaccessible private, ambiguous, and invalid-program bindings
+are explicit states. Production `Test_runner` routing remains on the OCaml
+constructors until one harness execution path consumes these typed results and
+the retained graph without rebuilding the frontend.
 
 **Target architecture:**
 

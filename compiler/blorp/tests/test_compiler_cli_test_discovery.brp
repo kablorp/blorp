@@ -2,6 +2,18 @@ import:
 	../src/stage_01_file_io/compiler_source: compiler_source_file
 	../src/stage_03_parse/compiler_parsed_ast: ParsedProgram, parsed_program_has_errors
 	../src/stage_03_parse/compiler_parser: parse_compiler_source
+	../src/stage_04_modules/compiler_module_surface: module_surface_for_program
+	../src/stage_05_types/compiler_type: compiler_type_to_string
+	../src/stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedModule
+	../src/stage_06_typecheck/compiler_typecheck_decl:
+		CompilerTypecheckProgramResult,
+		compiler_typecheck_program,
+	../src/stage_06_typecheck/compiler_typecheck_state: compiler_typecheck_state_empty
+	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck)
+	../src/stage_12_cli/compiler_cli_source_graph:
+		frontend_module_graph_for_roots,
+		parse_cli_sources,
+		read_cli_sources_for_action,
 	../src/stage_12_cli/compiler_cli_test_discovery:
 		CliTestExecutionIsolation(
 			CliFreshTestFilesystem,
@@ -9,9 +21,19 @@ import:
 			CliSharedTestProcess,
 		),
 		CliTestSourceFeatures,
+		CliTestSuiteBindingResolution(
+			CliTestSuiteBindingAmbiguous,
+			CliTestSuiteBindingMissing,
+			CliTestSuiteBindingResolved,
+			CliTestSuiteBindingInaccessible,
+			CliTestSuiteBindingInvalidProgram,
+			CliTestSuiteBindingWrongType,
+		),
 		classify_test_source,
 		discover_test_sources,
+		resolve_test_suite_binding,
 		test_execution_isolation,
+	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
 	fs:
 		IOError(NotFound),
 		create_directories,
@@ -27,6 +49,64 @@ import:
 
 private pure func parse(source: String) -> ParsedProgram:
 	parse_compiler_source(compiler_source_file("test.brp", "test", source))
+
+
+private pure func typed_module(module_name: String, source: String) -> CompilerTypecheckedModule:
+	program: ParsedProgram = parse_compiler_source(
+		compiler_source_file(
+			module_name + ".brp",
+			module_name,
+			source,
+		),
+	)
+	result: CompilerTypecheckProgramResult = compiler_typecheck_program(
+		compiler_typecheck_state_empty(),
+		program,
+	)
+
+	{
+		path = program.source.path,
+		module_name = module_name,
+		module_path = module_name,
+		parsed_program = program,
+		module_surface = module_surface_for_program(program),
+		typed_program = result.program,
+		errors = result.state.errors,
+		import_bindings = [],
+		ctfe_evaluated = False
+	}
+
+
+private pure func check_action(paths: List[String]) -> CliAction:
+	CliCheck({
+		dump_ast = False,
+		dump_typed_ast = False,
+		debug = False,
+		no_format = True,
+		std_dir = Some("std"),
+		paths = paths,
+	})
+
+
+private func resolve_written_test_suite(
+	path_value: String,
+) -> Result[CliTestSuiteBindingResolution, String]:
+	action: CliAction = check_action([path_value])
+	sources ?= read_cli_sources_for_action(action, [path_value])
+	parsed ?= parse_cli_sources(sources)
+	graph ?= frontend_module_graph_for_roots(action, parsed)
+
+	match graph.roots:
+		[root]:
+			typechecked = typecheck_frontend_root(graph, root, False)
+			errors: List[String] = typechecked_graph_errors(typechecked)
+
+			if errors.length() == 0:
+				Ok(resolve_test_suite_binding(typechecked.target))
+			else:
+				Err(errors.join("\n"))
+		_:
+			Err("test identity resolution requires exactly one frontend root")
 
 
 private func expect_features(
@@ -107,7 +187,11 @@ private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
 		created_leak_baselines ?= create_directories(leak_baselines)
 
 		test_suite_type: String = "Test" + "Suite"
-		suite_source: String = "tests:" + " " + test_suite_type + " = {\n\tdescription = \"suite\",\n\ttests = []\n}\n"
+		test_import: String = "import:\n\ttest: " + test_suite_type + "\n\n"
+		suite_value: String = "{\n\tdescription = \"suite\",\n\ttests = []\n}\n"
+		suite_source: String = test_import + "type alias Suite = " + test_suite_type + "\n\n" + "tests: Suite = " + suite_value
+		direct_suite_source: String = test_import + "tests:" + " " + test_suite_type + " = " + suite_value
+		private_suite_source: String = test_import + "private tests:" + " " + test_suite_type + " = " + suite_value
 		doctest_source: String =
 			|---
 			|Example.
@@ -140,6 +224,10 @@ private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
 			skipped.join("ignored.brp"),
 			ignored_source,
 		)
+		direct_suite_path: String = skipped.join("direct_identity.brp")
+		wrote_direct_suite ?= write_text_atomic(direct_suite_path, direct_suite_source)
+		private_suite_path: String = skipped.join("private_identity.brp")
+		wrote_private_suite ?= write_text_atomic(private_suite_path, private_suite_source)
 		wrote_text ?= write_text_atomic(
 			root_path.join("notes.txt"),
 			suite_source,
@@ -194,6 +282,48 @@ private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
 			_:
 				False
 
+		alias_identity_resolved: Bool = match resolve_written_test_suite(root_path.join("a.brp")):
+			Ok(CliTestSuiteBindingResolved):
+				True
+			Ok(resolution):
+				print_error(
+					"expected resolved TestSuite identity, got " + test_suite_resolution_description(
+						resolution,
+					),
+				)
+				False
+			Err(error):
+				print_error("typed TestSuite identity failed:\n" + error)
+				False
+
+		direct_identity_resolved: Bool = match resolve_written_test_suite(direct_suite_path):
+			Ok(CliTestSuiteBindingResolved):
+				True
+			Ok(resolution):
+				print_error(
+					"expected direct TestSuite identity, got " + test_suite_resolution_description(
+						resolution,
+					),
+				)
+				False
+			Err(error):
+				print_error("direct TestSuite identity failed:\n" + error)
+				False
+
+		private_identity_rejected: Bool = match resolve_written_test_suite(private_suite_path):
+			Ok(CliTestSuiteBindingInaccessible):
+				True
+			Ok(resolution):
+				print_error(
+					"expected inaccessible private TestSuite, got " + test_suite_resolution_description(
+						resolution,
+					),
+				)
+				False
+			Err(error):
+				print_error("private TestSuite identity failed:\n" + error)
+				False
+
 		Ok(
 			(
 				paths == [
@@ -208,6 +338,9 @@ private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
 				and explicit_non_blorp.length() == 0
 				and leak_baseline_found
 				and missing_rejected
+				and alias_identity_resolved
+				and direct_identity_resolved
+				and private_identity_rejected
 			),
 		)
 
@@ -261,6 +394,111 @@ pure func test_execution_isolation_uses_explicit_roots() -> Bool:
 	memory and concurrency and shared and root_boundary
 
 
+private pure func test_suite_resolution_description(
+	resolution: CliTestSuiteBindingResolution,
+) -> String:
+	match resolution:
+		CliTestSuiteBindingResolved:
+			"resolved"
+		CliTestSuiteBindingMissing:
+			"missing"
+		CliTestSuiteBindingWrongType(typ):
+			"wrong type " + compiler_type_to_string(typ)
+		CliTestSuiteBindingInaccessible:
+			"inaccessible"
+		CliTestSuiteBindingAmbiguous:
+			"ambiguous"
+		CliTestSuiteBindingInvalidProgram:
+			"invalid program"
+
+
+func test_suite_binding_resolution_uses_valid_typed_modules() -> Bool:
+	test_suite_type: String = "Test" + "Suite"
+	local_source: String = "record " + test_suite_type + " {}\n" + "tests:" + " " + test_suite_type + " = {}\n"
+	local_module: CompilerTypecheckedModule = typed_module("local", local_source)
+	wrong_module: CompilerTypecheckedModule = typed_module("wrong", "tests: Int = 1\n")
+	missing_module: CompilerTypecheckedModule = typed_module(
+		"missing",
+		"pure func helper() -> Int: 1\n",
+	)
+	duplicate_module: CompilerTypecheckedModule = typed_module(
+		"duplicate",
+		"tests: Int = 1\ntests: Int = 2\n",
+	)
+	invalid_module: CompilerTypecheckedModule = typed_module(
+		"invalid",
+		"tests: Int = \"not an integer\"\n",
+	)
+
+	local_resolution: CliTestSuiteBindingResolution = resolve_test_suite_binding(local_module)
+	wrong_resolution: CliTestSuiteBindingResolution = resolve_test_suite_binding(wrong_module)
+	missing_resolution: CliTestSuiteBindingResolution = resolve_test_suite_binding(missing_module)
+	duplicate_resolution: CliTestSuiteBindingResolution = resolve_test_suite_binding(
+		duplicate_module,
+	)
+	invalid_resolution: CliTestSuiteBindingResolution = resolve_test_suite_binding(invalid_module)
+
+	local_same_name: Bool = match local_resolution:
+		CliTestSuiteBindingWrongType(_):
+			True
+		_:
+			False
+
+	wrong_type: Bool = match wrong_resolution:
+		CliTestSuiteBindingWrongType(typ):
+			compiler_type_to_string(typ) == "Int"
+		_:
+			False
+
+	missing: Bool = match missing_resolution:
+		CliTestSuiteBindingMissing:
+			True
+		_:
+			False
+
+	duplicate_ambiguous: Bool = match duplicate_resolution:
+		CliTestSuiteBindingAmbiguous:
+			True
+		_:
+			False
+
+	initializer_invalid: Bool = match invalid_resolution:
+		CliTestSuiteBindingInvalidProgram:
+			invalid_module.errors.length() > 0
+		_:
+			False
+
+	valid_modules_have_no_errors: Bool = (
+		local_module.errors.length() == 0
+		and wrong_module.errors.length() == 0
+		and missing_module.errors.length() == 0
+	)
+
+	matches: Bool = (
+		valid_modules_have_no_errors
+		and local_same_name
+		and wrong_type
+		and missing
+		and duplicate_ambiguous
+		and initializer_invalid
+	)
+
+	if not matches:
+		print_error(
+			"TestSuite resolutions: local=" + test_suite_resolution_description(
+				local_resolution,
+			) + ", wrong=" + test_suite_resolution_description(
+				wrong_resolution,
+			) + ", missing=" + test_suite_resolution_description(
+				missing_resolution,
+			) + ", duplicate=" + test_suite_resolution_description(
+				duplicate_resolution,
+			) + ", invalid=" + test_suite_resolution_description(invalid_resolution),
+		)
+
+	matches
+
+
 tests: TestSuite = {
 	description = "Blorp CLI test discovery",
 	tests = [
@@ -285,5 +523,9 @@ tests: TestSuite = {
 			test_filesystem_discovery_is_structural_and_deterministic,
 		),
 		("execution isolation uses explicit roots", test_execution_isolation_uses_explicit_roots),
+		(
+			"TestSuite binding resolution uses valid typed modules",
+			test_suite_binding_resolution_uses_valid_typed_modules,
+		),
 	]
 }
