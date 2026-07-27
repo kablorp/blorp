@@ -25,6 +25,9 @@ import:
 		compiler_type_subst_entry,
 		compiler_types_compatible_with_params,
 		compiler_types_equal,
+	compiler_type_name_metadata:
+		compiler_is_one_shot_stream_type_name,
+		compiler_is_resource_source_type_name,
 
 
 enum CompilerVarMutability:
@@ -140,6 +143,13 @@ enum CompilerTypeKind:
 	CompilerTypeResource
 
 
+private struct CompilerTypeContainmentSummary {
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
+}
+
+
 record CompilerFieldDecl {
 	name: String,
 	field_type: CompilerType
@@ -182,7 +192,10 @@ record CompilerTypeSymbol {
 	type_params: List[String],
 	variants: List[CompilerVariantDef],
 	type_kind: CompilerTypeKind,
-	contains_resource: Bool
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
 }
 
 
@@ -190,7 +203,10 @@ record CompilerRecordSymbol {
 	type_params: List[String],
 	fields: List[CompilerFieldDecl],
 	is_value: Bool,
-	contains_resource: Bool
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
 }
 
 
@@ -344,7 +360,8 @@ record CompilerEnv {
 	impls: List[CompilerImplInstance],
 	overloads: List[CompilerOverloadSet],
 	ufcs_methods: List[CompilerOverloadSet],
-	next_def_id: Int
+	next_def_id: Int,
+	type_containment_summaries_valid: Bool
 }
 
 
@@ -398,7 +415,8 @@ pure func compiler_env_empty() -> CompilerEnv:
 		impls = [],
 		overloads = [],
 		ufcs_methods = [],
-		next_def_id = 0
+		next_def_id = 0,
+		type_containment_summaries_valid = True
 	}
 
 
@@ -518,13 +536,24 @@ private pure func compiler_scope_lookup(
 
 
 pure func compiler_env_add_symbol(env: CompilerEnv, symbol: CompilerSymbol) -> CompilerEnv:
-	match env.scopes.get(0):
+	shadows_type_binding = match compiler_symbol_is_type_binding(symbol):
+		Some(_):
+			compiler_env_lookup(env, symbol.name).is_some()
+		None:
+			False
+
+	next_env = if shadows_type_binding:
+		{ env | type_containment_summaries_valid = False }
+	else:
+		env
+
+	match next_env.scopes.get(0):
 		Some(current):
 			var scopes: List[CompilerScope] = [compiler_scope_add_symbol(current, symbol)]
 			var index: Int = 1
 
-			while index < env.scopes.length():
-				match env.scopes.get(index):
+			while index < next_env.scopes.length():
+				match next_env.scopes.get(index):
 					Some(scope):
 						scopes = scopes.append(scope)
 					None:
@@ -532,9 +561,9 @@ pure func compiler_env_add_symbol(env: CompilerEnv, symbol: CompilerSymbol) -> C
 
 				index += 1
 
-			{ env | scopes = scopes }
+			{ next_env | scopes = scopes }
 		None:
-			{ env | scopes = [compiler_scope_add_symbol(compiler_empty_scope(), symbol)] }
+			{ next_env | scopes = [compiler_scope_add_symbol(compiler_empty_scope(), symbol)] }
 
 
 pure func compiler_env_lookup_in_current_scope(
@@ -1083,6 +1112,221 @@ pure func compiler_env_is_local_func(env: CompilerEnv, name: String) -> Bool:
 			False
 
 
+private pure func compiler_type_containment_summary_empty() -> CompilerTypeContainmentSummary:
+	{
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+
+
+private pure func compiler_type_containment_summary_unknown() -> CompilerTypeContainmentSummary:
+	-- Only a proven-false summary can skip a recursive scan.
+	{
+		may_contain_function = True,
+		may_contain_one_shot_stream = True,
+		may_contain_resource_source = True
+	}
+
+
+private pure func compiler_type_containment_summary_for_name(
+	name: String,
+) -> CompilerTypeContainmentSummary:
+	{
+		may_contain_function = False,
+		may_contain_one_shot_stream = compiler_is_one_shot_stream_type_name(name),
+		may_contain_resource_source = compiler_is_resource_source_type_name(name)
+	}
+
+
+private pure func compiler_type_containment_summary_merge(
+	left: CompilerTypeContainmentSummary,
+	right: CompilerTypeContainmentSummary,
+) -> CompilerTypeContainmentSummary:
+	{
+		may_contain_function = left.may_contain_function or right.may_contain_function,
+		may_contain_one_shot_stream = (
+			left.may_contain_one_shot_stream
+			or right.may_contain_one_shot_stream
+		),
+		may_contain_resource_source = (
+			left.may_contain_resource_source
+			or right.may_contain_resource_source
+		)
+	}
+
+
+private pure func compiler_type_containment_summary_is_complete(
+	summary: CompilerTypeContainmentSummary,
+) -> Bool:
+	(
+		summary.may_contain_function
+		and summary.may_contain_one_shot_stream
+		and summary.may_contain_resource_source
+	)
+
+
+private pure func compiler_type_symbol_containment_summary(
+	symbol: CompilerTypeSymbol,
+) -> CompilerTypeContainmentSummary:
+	{
+		may_contain_function = symbol.may_contain_function,
+		may_contain_one_shot_stream = symbol.may_contain_one_shot_stream,
+		may_contain_resource_source = symbol.may_contain_resource_source
+	}
+
+
+private pure func compiler_record_symbol_containment_summary(
+	symbol: CompilerRecordSymbol,
+) -> CompilerTypeContainmentSummary:
+	{
+		may_contain_function = symbol.may_contain_function,
+		may_contain_one_shot_stream = symbol.may_contain_one_shot_stream,
+		may_contain_resource_source = symbol.may_contain_resource_source
+	}
+
+
+private pure func compiler_types_containment_summary_seen(
+	env: CompilerEnv,
+	rigid_type_params: List[String],
+	visited: List[String],
+	types: List[CompilerType],
+) -> CompilerTypeContainmentSummary:
+	var summary = compiler_type_containment_summary_empty()
+
+	for typ in types:
+		summary = compiler_type_containment_summary_merge(
+			summary,
+			compiler_type_containment_summary_seen(env, rigid_type_params, visited, typ),
+		)
+
+		if compiler_type_containment_summary_is_complete(summary):
+			break
+
+	summary
+
+
+private pure func compiler_type_containment_summary_seen(
+	env: CompilerEnv,
+	rigid_type_params: List[String],
+	visited: List[String],
+	typ: CompilerType,
+) -> CompilerTypeContainmentSummary:
+	match typ:
+		CompilerFunctionType(_, _, _):
+			{ compiler_type_containment_summary_empty() | may_contain_function = True }
+		CompilerNamedType(name, args):
+			direct = compiler_type_containment_summary_for_name(name)
+
+			if rigid_type_params.contains(name) or visited.contains(name):
+				compiler_type_containment_summary_unknown()
+			else:
+				next_visited = visited.append(name)
+				args_summary = compiler_types_containment_summary_seen(
+					env,
+					rigid_type_params,
+					next_visited,
+					args,
+				)
+
+				binding_summary = match compiler_env_find_type_binding(env, name):
+					Some(CompilerUnionTypeBinding(type_symbol)):
+						compiler_type_symbol_containment_summary(type_symbol)
+					Some(CompilerRecordTypeBinding(record_symbol)):
+						compiler_record_symbol_containment_summary(record_symbol)
+					Some(CompilerAliasTypeBinding(alias_symbol)):
+						compiler_type_containment_summary_seen(
+							env,
+							rigid_type_params,
+							next_visited,
+							alias_symbol.target,
+						)
+					Some(CompilerOpaqueAliasTypeBinding(alias_symbol)):
+						compiler_type_containment_summary_seen(
+							env,
+							rigid_type_params,
+							next_visited,
+							alias_symbol.target,
+						)
+					None:
+						compiler_type_containment_summary_unknown()
+
+				compiler_type_containment_summary_merge(
+					direct,
+					compiler_type_containment_summary_merge(args_summary, binding_summary),
+				)
+		CompilerArrayType(element, dims):
+			compiler_type_containment_summary_merge(
+				compiler_type_containment_summary_seen(env, rigid_type_params, visited, element),
+				compiler_types_containment_summary_seen(env, rigid_type_params, visited, dims),
+			)
+		CompilerTupleType(elements):
+			compiler_types_containment_summary_seen(env, rigid_type_params, visited, elements)
+		CompilerRangeType(inner):
+			compiler_type_containment_summary_seen(env, rigid_type_params, visited, inner)
+		CompilerDimOpType(_, left, right):
+			compiler_type_containment_summary_merge(
+				compiler_type_containment_summary_seen(env, rigid_type_params, visited, left),
+				compiler_type_containment_summary_seen(env, rigid_type_params, visited, right),
+			)
+		CompilerTypeVar(_):
+			compiler_type_containment_summary_unknown()
+		CompilerMetaType(_):
+			compiler_type_containment_summary_unknown()
+		CompilerSelfType:
+			compiler_type_containment_summary_unknown()
+		CompilerVarDimsType(_):
+			compiler_type_containment_summary_unknown()
+		_:
+			compiler_type_containment_summary_empty()
+
+
+private pure func compiler_type_containment_summary(
+	env: CompilerEnv,
+	rigid_type_params: List[String],
+	typ: CompilerType,
+) -> CompilerTypeContainmentSummary:
+	compiler_type_containment_summary_seen(env, rigid_type_params, [], typ)
+
+
+private pure func compiler_variants_containment_summary(
+	env: CompilerEnv,
+	rigid_type_params: List[String],
+	variants: List[CompilerVariantDef],
+) -> CompilerTypeContainmentSummary:
+	var summary = compiler_type_containment_summary_empty()
+
+	for variant in variants:
+		summary = compiler_type_containment_summary_merge(
+			summary,
+			compiler_types_containment_summary_seen(env, rigid_type_params, [], variant.fields),
+		)
+
+		if compiler_type_containment_summary_is_complete(summary):
+			break
+
+	summary
+
+
+private pure func compiler_fields_containment_summary(
+	env: CompilerEnv,
+	rigid_type_params: List[String],
+	fields: List[CompilerFieldDecl],
+) -> CompilerTypeContainmentSummary:
+	var summary = compiler_type_containment_summary_empty()
+
+	for field in fields:
+		summary = compiler_type_containment_summary_merge(
+			summary,
+			compiler_type_containment_summary(env, rigid_type_params, field.field_type),
+		)
+
+		if compiler_type_containment_summary_is_complete(summary):
+			break
+
+	summary
+
+
 pure func compiler_env_add_type_with_constructor_ids(
 	env: CompilerEnv,
 	name: String,
@@ -1093,6 +1337,10 @@ pure func compiler_env_add_type_with_constructor_ids(
 	with_ctors: Bool,
 	constructor_ids: List[Option[Int]],
 ) -> CompilerEnv:
+	containment = compiler_type_containment_summary_merge(
+		compiler_type_containment_summary_for_name(name),
+		compiler_variants_containment_summary(env, type_params, variants),
+	)
 	type_env: CompilerEnv = compiler_env_add_symbol(
 		env,
 		{
@@ -1102,6 +1350,9 @@ pure func compiler_env_add_type_with_constructor_ids(
 				variants = variants,
 				type_kind = type_kind,
 				contains_resource = contains_resource,
+				may_contain_function = containment.may_contain_function,
+				may_contain_one_shot_stream = containment.may_contain_one_shot_stream,
+				may_contain_resource_source = containment.may_contain_resource_source,
 			})
 		},
 	)
@@ -1166,6 +1417,10 @@ pure func compiler_env_add_record(
 	is_value: Bool,
 	contains_resource: Bool,
 ) -> CompilerEnv:
+	containment = compiler_type_containment_summary_merge(
+		compiler_type_containment_summary_for_name(name),
+		compiler_fields_containment_summary(env, type_params, fields),
+	)
 	compiler_env_add_symbol(
 		env,
 		{
@@ -1175,6 +1430,9 @@ pure func compiler_env_add_record(
 				fields = fields,
 				is_value = is_value,
 				contains_resource = contains_resource,
+				may_contain_function = containment.may_contain_function,
+				may_contain_one_shot_stream = containment.may_contain_one_shot_stream,
+				may_contain_resource_source = containment.may_contain_resource_source,
 			})
 		},
 	)
@@ -1269,6 +1527,51 @@ pure func compiler_env_get_type_contains_resource(env: CompilerEnv, name: String
 			record_symbol.contains_resource
 		_:
 			False
+
+
+pure func compiler_env_type_may_contain_function(env: CompilerEnv, name: String) -> Option[Bool]:
+	if not env.type_containment_summaries_valid:
+		None
+	else:
+		match compiler_env_find_type_binding(env, name):
+			Some(CompilerUnionTypeBinding(type_symbol)):
+				Some(type_symbol.may_contain_function)
+			Some(CompilerRecordTypeBinding(record_symbol)):
+				Some(record_symbol.may_contain_function)
+			_:
+				None
+
+
+pure func compiler_env_type_may_contain_one_shot_stream(
+	env: CompilerEnv,
+	name: String,
+) -> Option[Bool]:
+	if not env.type_containment_summaries_valid:
+		None
+	else:
+		match compiler_env_find_type_binding(env, name):
+			Some(CompilerUnionTypeBinding(type_symbol)):
+				Some(type_symbol.may_contain_one_shot_stream)
+			Some(CompilerRecordTypeBinding(record_symbol)):
+				Some(record_symbol.may_contain_one_shot_stream)
+			_:
+				None
+
+
+pure func compiler_env_type_may_contain_resource_source(
+	env: CompilerEnv,
+	name: String,
+) -> Option[Bool]:
+	if not env.type_containment_summaries_valid:
+		None
+	else:
+		match compiler_env_find_type_binding(env, name):
+			Some(CompilerUnionTypeBinding(type_symbol)):
+				Some(type_symbol.may_contain_resource_source)
+			Some(CompilerRecordTypeBinding(record_symbol)):
+				Some(record_symbol.may_contain_resource_source)
+			_:
+				None
 
 
 pure func compiler_env_get_constructor(

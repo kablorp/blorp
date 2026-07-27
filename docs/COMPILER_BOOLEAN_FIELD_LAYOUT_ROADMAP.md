@@ -132,6 +132,7 @@ Relevant implementation:
 | 7b1 | Move Boolean declarations after non-Boolean declarations in eligible internal value records | Implemented locally | Internal mixed value record shrinks from 32 to 24 bytes; exact artifact diff is one declaration line; renderer replay is latency and RSS neutral; foreign layout remains unchanged |
 | 7c | Reorder eligible internal fields by general descending alignment | Deprioritized | No narrow numeric fields in current compiler records; explicit enums are handled separately by Slice 8 and general sorting still requires a nested-layout model |
 | 8 | Store bounded explicit-enum fields compactly in internal heap records | Implemented locally | 75 retained compiler fields use `uint8_t`; nine records shrink and four cross allocator classes; Linux O0/O2 confirms byte fields while scalar and foreign representations remain C `long` |
+| 9 | Cache conservative nominal type-containment summaries | Implemented locally | Six-pair typecheck replay is 7.7% to 37.1% faster on repeated probes, sparse registration overhead is 0.71 ms, and bounded peak RSS is slightly lower |
 
 ## Slice 0: Layout Probe
 
@@ -1114,6 +1115,41 @@ is reproduced from a current generated CLI artifact by
 results are retained in
 `benchmarks/results/compiler_record_layout_slice8_correctness_2026-07-26.txt`.
 
+### Slice 9: Conservative Nominal Containment Summaries
+
+Implemented locally on 2026-07-27. Type and record symbols now retain three
+packed Boolean summaries computed once during registration: whether the
+declaration may contain a function carrier, one-shot stream, or resource
+source. Inference uses only a stored `False` to skip the existing recursive
+shape scans. Generic, unresolved, forward, and recursive shapes store `True`
+and retain the previous scan, so uncertainty cannot become a false negative.
+Any later type-binding replacement invalidates all negative-summary shortcuts.
+
+Six alternating baseline/candidate pairs produced these medians:
+
+| Workload | Baseline | Candidate | Change |
+|---|---:|---:|---:|
+| depth 64, 1 probe | 15.467 ms | 16.181 ms | +4.6% |
+| depth 64, 128 probes | 192.659 ms | 177.895 ms | -7.7% |
+| depth 128, 256 probes | 440.638 ms | 363.100 ms | -17.6% |
+| depth 256, 512 probes | 1,156.848 ms | 727.344 ms | -37.1% |
+
+The sparse result bounds the one-time registration cost at 0.71 ms for this
+fixture. The default profile no longer reports the recursive presence or
+function-candidate scanners among sampled functions. Four alternating
+depth-256 RSS pairs measured 22,839,296-byte baseline and 22,708,224-byte
+candidate medians, a 0.6% reduction rather than a memory regression.
+
+The baseline artifact key is
+`7e4553fe25345631d67c4953b1dab54ac56428ca76bf3f05da4367ac35c9b8c2`; the
+candidate key is
+`35139121a01d2be47243b05a75f572d5117df40be137345eca5201cb3027afaf`.
+Raw samples are retained in
+`benchmarks/results/compiler_typecheck_containment_summary_2026-07-27.tsv` and
+`benchmarks/results/compiler_typecheck_containment_summary_rss_2026-07-27.tsv`.
+Focused environment, inference, declaration, resource, and benchmark suites
+pass. The serial compiler-unit and compiler gates pass 3,006 of 3,006 tests.
+
 ## Verification Matrix
 
 Every representation-changing slice must cover:
@@ -1174,3 +1210,4 @@ first feedback loop.
 | 2026-07-26 | 7b1 | Accept stable Boolean-tail declaration ordering for eligible internal value records; keep Linux validation open | Internal mixed value record shrinks from 32 to 24 bytes; exact artifact diff changes one declaration line; twelve-pair replay, correctness, foreign ABI, ARC, and sanitizer evidence are clean |
 | 2026-07-26 | 8 | Accept byte storage for declared explicit-enum fields in internal heap records; keep broader enum compaction separate | 75 retained fields compact across 67 records; nine record sizes and four allocator classes improve, while foreign and scalar ABI remain C `long` |
 | 2026-07-26 | Linux validation | Accept the current compact layouts on Linux amd64 and use the pinned release's verified helpers by default | O0/O2 layouts match Darwin intent; optimized allocator regression passes; clean build completes under 7.75 GiB, and packaged helpers avoid overlapping local helper compilation with the full-host heap while preserving explicit tested-helper overrides |
+| 2026-07-27 | 9 | Accept conservative nominal containment summaries as negative-only typecheck scan caches | Six-pair medians improve 7.7% to 37.1% as repeated probes deepen; sparse overhead is 0.71 ms; bounded RSS is slightly lower; generic-name and binding-replacement regressions pass |
