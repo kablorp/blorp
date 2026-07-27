@@ -4,6 +4,7 @@
 -- temporary executable, exact child argv/environment, and exit translation.
 import:
 	../stage_10_backend/compiler_build_artifact: BuildArtifact
+	bytes: Bytes
 	compiler_host_c:
 		HostCCompileError,
 		HostCConfiguration,
@@ -15,7 +16,12 @@ import:
 		run_host_c_compilation,
 	fs: IOError, resource_path, temporary_directory
 	process as Process
-	units: Duration
+	units: DataSize, Duration
+
+
+union ProgramRunMode:
+	InteractiveProgramRun
+	CapturedProgramRun(Option[String], DataSize)
 
 
 record ProgramRunRequest {
@@ -25,13 +31,16 @@ record ProgramRunRequest {
 	temporary_root: String,
 	user_arguments: List[String],
 	timeout: Option[Duration],
-	threads: Option[Int]
+	threads: Option[Int],
+	mode: ProgramRunMode
 }
 
 
 record ProgramRunResult {
 	exit: Process.ProcessExit,
-	executable_path: String
+	executable_path: String,
+	stdout: Bytes,
+	stderr: Bytes
 }
 
 
@@ -88,14 +97,28 @@ pure func prepare_program_command(
 	timeout: Option[Duration],
 	threads: Option[Int],
 	leak_check: Bool,
+	mode: ProgramRunMode,
 ) -> Process.ProcessCommand:
-	{ Process.command(executable_path, arguments) |
+	base = { Process.command(executable_path, arguments) |
 		environment = program_environment(threads, leak_check),
-		stdin = Process.InheritStdin,
-		stdout = Process.InheritStream,
-		stderr = Process.InheritStream,
 		timeout = timeout
 	}
+
+	match mode:
+		InteractiveProgramRun:
+			{ base |
+				stdin = Process.InheritStdin,
+				stdout = Process.InheritStream,
+				stderr = Process.InheritStream
+			}
+		CapturedProgramRun(working_directory, capture_limit):
+			{ base |
+				cwd = working_directory,
+				stdin = Process.NullStdin,
+				stdout = Process.CaptureStream,
+				stderr = Process.CaptureStream,
+				capture_limit = Some(capture_limit)
+			}
 
 
 pure func program_exit_status(exit: Process.ProcessExit) -> Int:
@@ -133,6 +156,7 @@ func run_build_artifact(request: ProgramRunRequest) -> Result[ProgramRunResult, 
 			request.timeout,
 			request.threads,
 			request.artifact.compatibility.leak_check,
+			request.mode,
 		)
 
 		match Process.run_command(program):
@@ -140,6 +164,8 @@ func run_build_artifact(request: ProgramRunRequest) -> Result[ProgramRunResult, 
 				Ok({
 					exit = result.exit,
 					executable_path = compiled_path,
+					stdout = result.stdout,
+					stderr = result.stderr,
 				})
 			Err(error):
 				Err(ProgramProcessFailed(error))

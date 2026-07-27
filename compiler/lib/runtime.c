@@ -70,6 +70,7 @@
 #define BLORP_WEBSOCKET_MAX_FRAME_BYTES BLORP_TCP_MAX_READ_BYTES
 #define BLORP_PROCESS_DEFAULT_TIMEOUT_MS (30L * 1000L)
 #define BLORP_PROCESS_KILL_GRACE_MS 100L
+#define BLORP_PROCESS_OUTPUT_DRAIN_GRACE_MS 100L
 #define BLORP_PROCESS_DEFAULT_MAX_OUTPUT_BYTES (16L * 1024L * 1024L)
 #define BLORP_NSEC_PER_MSEC 1000000ULL
 #define BLORP_NSEC_PER_SEC 1000000000ULL
@@ -36583,12 +36584,17 @@ static int __process_poll_timeout_ms(
     bool has_deadline,
     uint64_t deadline_ns,
     bool has_kill_deadline,
-    uint64_t kill_deadline_ns
+    uint64_t kill_deadline_ns,
+    bool has_drain_deadline,
+    uint64_t drain_deadline_ns
 ) {
     uint64_t next_ns = now_ns + 50000000ULL;
     if (has_deadline && deadline_ns < next_ns) next_ns = deadline_ns;
     if (has_kill_deadline && kill_deadline_ns < next_ns) {
         next_ns = kill_deadline_ns;
+    }
+    if (has_drain_deadline && drain_deadline_ns < next_ns) {
+        next_ns = drain_deadline_ns;
     }
     if (next_ns <= now_ns) return 0;
     uint64_t delta_ms = (next_ns - now_ns) / BLORP_NSEC_PER_MSEC;
@@ -36728,7 +36734,9 @@ static void __drain_process_pipes(
             has_kill_deadline = true;
             kill_deadline_ns =
                 blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
-            __process_signal(pid, use_process_group, SIGTERM);
+            if (use_process_group || !state->child_exited) {
+                __process_signal(pid, use_process_group, SIGTERM);
+            }
         }
         if (state->timed_out) {
             __process_close_if_open(&stdout_fd, &out_open);
@@ -36739,7 +36747,9 @@ static void __drain_process_pipes(
             has_kill_deadline = true;
             kill_deadline_ns =
                 blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
-            __process_signal(pid, use_process_group, SIGTERM);
+            if (use_process_group || !state->child_exited) {
+                __process_signal(pid, use_process_group, SIGTERM);
+            }
         }
         if (
             termination_sent &&
@@ -36776,7 +36786,9 @@ static void __drain_process_pipes(
             has_deadline && !termination_sent,
             deadline_ns,
             has_kill_deadline && !kill_sent,
-            kill_deadline_ns
+            kill_deadline_ns,
+            false,
+            0
         );
         int pr = poll(fds, nfds, poll_timeout);
         if (pr < 0) {
@@ -36859,6 +36871,8 @@ static void __run_process_command_io(
     bool kill_sent = false;
     bool has_kill_deadline = false;
     uint64_t kill_deadline_ns = 0;
+    bool has_drain_deadline = false;
+    uint64_t drain_deadline_ns = 0;
     size_t total_output_bytes = 0;
     size_t output_limit =
         max_output_bytes < 0 ? SIZE_MAX : (size_t)max_output_bytes;
@@ -36884,19 +36898,26 @@ static void __run_process_command_io(
             has_kill_deadline = true;
             kill_deadline_ns =
                 blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
-            __process_signal(pid, use_process_group, SIGTERM);
+            has_drain_deadline = true;
+            drain_deadline_ns = blorp_deadline_ns_from_now_ms(
+                BLORP_PROCESS_KILL_GRACE_MS +
+                BLORP_PROCESS_OUTPUT_DRAIN_GRACE_MS
+            );
+            if (use_process_group || !state->child_exited) {
+                __process_signal(pid, use_process_group, SIGTERM);
+            }
         }
         if (state->timed_out) {
             __process_close_if_open(&stdin_fd, &stdin_open);
-            __process_close_if_open(&stdout_fd, &stdout_open);
-            __process_close_if_open(&stderr_fd, &stderr_open);
         }
         if (state->output_limit_exceeded && !termination_sent) {
             termination_sent = true;
             has_kill_deadline = true;
             kill_deadline_ns =
                 blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
-            __process_signal(pid, use_process_group, SIGTERM);
+            if (use_process_group || !state->child_exited) {
+                __process_signal(pid, use_process_group, SIGTERM);
+            }
         }
         if (
             termination_sent &&
@@ -36907,6 +36928,47 @@ static void __run_process_command_io(
         ) {
             kill_sent = true;
             __process_signal(pid, use_process_group, SIGKILL);
+            if (!stdout_open && !stderr_open && state->child_exited) {
+                continue;
+            }
+            if (!has_drain_deadline) {
+                has_drain_deadline = true;
+                drain_deadline_ns = blorp_deadline_ns_from_now_ms(
+                    BLORP_PROCESS_OUTPUT_DRAIN_GRACE_MS
+                );
+            }
+        }
+        if (
+            has_drain_deadline &&
+            now_ns >= drain_deadline_ns
+        ) {
+            if (stdout_open) {
+                __drain_process_fd(
+                    stdout_fd,
+                    &stdout_buffer,
+                    &stdout_open,
+                    output_limit,
+                    &total_output_bytes,
+                    state
+                );
+            }
+            if (stderr_open) {
+                __drain_process_fd(
+                    stderr_fd,
+                    &stderr_buffer,
+                    &stderr_open,
+                    output_limit,
+                    &total_output_bytes,
+                    state
+                );
+            }
+            __process_close_if_open(&stdout_fd, &stdout_open);
+            __process_close_if_open(&stderr_fd, &stderr_open);
+            if (!state->child_exited) {
+                __process_signal(pid, false, SIGKILL);
+                __process_check_child(pid, state, 0);
+            }
+            has_drain_deadline = false;
         }
 
         struct pollfd fds[3];
@@ -36948,7 +37010,9 @@ static void __run_process_command_io(
             has_timeout && !termination_sent,
             deadline_ns,
             has_kill_deadline && !kill_sent,
-            kill_deadline_ns
+            kill_deadline_ns,
+            has_drain_deadline,
+            drain_deadline_ns
         );
         int poll_result = poll(fds, nfds, poll_timeout);
         if (poll_result < 0) {

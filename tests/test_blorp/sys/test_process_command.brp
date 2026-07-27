@@ -4,7 +4,7 @@ import:
 		ProcessEnvironmentChange,
 		ProcessError(InvalidCommand, ProcessOutputLimitExceeded),
 		ProcessExit(Exited, Signaled, TimedOut),
-		ProcessGroup(NewProcessGroup),
+		ProcessGroup(InheritProcessGroup, NewProcessGroup),
 		ProcessStdin(BytesStdin),
 		ProcessStream(NullStream),
 		command,
@@ -12,7 +12,7 @@ import:
 	string: remove_suffix, repeat
 	system: file_exists, getenv, temp_dir
 	test: TestSuite
-	units: from_bytes, milliseconds
+	units: from_bytes, milliseconds, seconds
 
 
 func test_command_preserves_argument_boundaries() -> Bool:
@@ -222,6 +222,74 @@ func test_command_timeout_kills_descendants() -> Bool:
 			False
 
 
+func test_command_timeout_preserves_captured_output() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "trap 'printf terminated; exit 0' TERM; while :; do sleep 1; done"],
+	) | timeout = Some(seconds(2)) }
+
+	match run_command(request):
+		Ok(result):
+			result.exit == TimedOut and result.stdout.to_string() == "terminated"
+		Err(_):
+			False
+
+
+func exercise_inherited_group_timeout_closes_descendant_pipe() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_inherited_process_group_"):
+		started: String = directory.resource_path() + "/descendant-started"
+		marker: String = directory.resource_path() + "/descendant-finished"
+		request = { command(
+			"sh",
+			[
+				"-c",
+				"printf started > \"$1\"; (sleep 4; printf finished > \"$2\") & exit 0",
+				"sh",
+				started,
+				marker,
+			],
+		) |
+			timeout = Some(seconds(2)),
+			process_group = InheritProcessGroup
+		}
+
+		match run_command(request):
+			Err(_):
+				Ok(False)
+			Ok(result):
+				descendant_started: Bool = file_exists(started)
+				returned_before_descendant: Bool = not file_exists(marker)
+
+				match (
+					run_command(
+						command(
+							"sh",
+							["-c", "sleep 2.1"],
+						),
+					)
+				):
+					Err(_):
+						Ok(False)
+					Ok(wait_result):
+						Ok(
+							(
+								result.exit == TimedOut
+								and descendant_started
+								and returned_before_descendant
+								and wait_result.exit == Exited(0)
+								and file_exists(marker)
+							),
+						)
+
+
+func test_inherited_group_timeout_closes_descendant_pipe() -> Bool:
+	match exercise_inherited_group_timeout_closes_descendant_pipe():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Structured process commands",
 	tests = [
@@ -247,6 +315,11 @@ tests: TestSuite = {
 		(
 			"timeout kills descendants after the leader exits",
 			test_command_timeout_kills_descendants,
+		),
+		("timeout preserves captured output", test_command_timeout_preserves_captured_output),
+		(
+			"inherited group timeout closes a descendant-held pipe",
+			test_inherited_group_timeout_closes_descendant_pipe,
 		),
 	]
 }

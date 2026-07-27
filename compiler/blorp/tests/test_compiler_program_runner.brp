@@ -12,18 +12,20 @@ import:
 		HostRuntimeInput(HostEmbeddedRuntime),
 		HostTlsBackend(HostTlsUnsupported),
 	../src/stage_12_cli/compiler_program_runner:
+		ProgramRunMode(CapturedProgramRun, InteractiveProgramRun),
 		ProgramRunRequest,
 		prepare_program_command,
 		program_exit_status,
 		run_build_artifact,
 	compiler_runtime: CompilerRuntimeSources
+	fs: IOError, resource_path, temporary_directory
 	process:
 		ProcessExit(Exited, Signaled, TimedOut),
-		ProcessStdin(InheritStdin),
-		ProcessStream(InheritStream),
+		ProcessStdin(InheritStdin, NullStdin),
+		ProcessStream(CaptureStream, InheritStream),
 	system: file_exists, getenv, temp_dir
 	test: TestSuite
-	units: Duration, mebibytes, milliseconds, seconds
+	units: Duration, data_size_bytes, mebibytes, milliseconds, seconds
 
 
 private pure func build_artifact(code: String, leak_check: Bool) -> BuildArtifact:
@@ -85,7 +87,8 @@ private func run_request(
 		temporary_root = temp_dir(),
 		user_arguments = arguments,
 		timeout = timeout,
-		threads = threads
+		threads = threads,
+		mode = InteractiveProgramRun
 	}
 
 
@@ -96,6 +99,7 @@ pure func test_program_command_preserves_argv_and_child_environment() -> Bool:
 		Some(seconds(3)),
 		Some(7),
 		True,
+		InteractiveProgramRun,
 	)
 
 	stdin_inherited: Bool = match request.stdin:
@@ -134,6 +138,49 @@ pure func test_program_command_preserves_argv_and_child_environment() -> Bool:
 		and stdin_inherited
 		and stdout_inherited
 		and stderr_inherited
+	)
+
+
+pure func test_captured_program_command_is_isolated_and_bounded() -> Bool:
+	request = prepare_program_command(
+		"/tmp/program",
+		[],
+		Some(seconds(3)),
+		None,
+		False,
+		CapturedProgramRun(Some("/tmp/test-cwd"), mebibytes(2)),
+	)
+
+	stdin_is_null: Bool = match request.stdin:
+		NullStdin:
+			True
+		_:
+			False
+
+	stdout_is_captured: Bool = match request.stdout:
+		CaptureStream:
+			True
+		_:
+			False
+
+	stderr_is_captured: Bool = match request.stderr:
+		CaptureStream:
+			True
+		_:
+			False
+
+	capture_limit_is_exact: Bool = match request.capture_limit:
+		Some(limit):
+			data_size_bytes(limit) == data_size_bytes(mebibytes(2))
+		None:
+			False
+
+	(
+		request.cwd == Some("/tmp/test-cwd")
+		and capture_limit_is_exact
+		and stdin_is_null
+		and stdout_is_captured
+		and stderr_is_captured
 	)
 
 
@@ -182,18 +229,72 @@ private func test_program_execution_preserves_args_env_and_cleans_up() -> Bool:
 			)
 
 
+private func exercise_captured_program_in_working_directory() -> Result[Bool, IOError]:
+	with working_directory ?= temporary_directory(temp_dir(), "blorp_program_runner_test_"):
+		code: String =
+			|#include <stdio.h>
+			|#include <unistd.h>
+			|int main(void) {
+			|  char cwd[4096];
+			|  if (!getcwd(cwd, sizeof(cwd))) return 10;
+			|  printf("%s\n", cwd);
+			|  fprintf(stderr, "captured stderr\n");
+			|  return 0;
+			|}
+		request = { run_request(code, [], Some(seconds(5)), None, False) |
+			mode = CapturedProgramRun(Some(working_directory.resource_path()), mebibytes(1))
+		}
+
+		match run_build_artifact(request):
+			Ok(result):
+				Ok((
+						result.exit == Exited(0)
+						and result.stdout
+							.to_string()
+							.trim()
+							.ends_with(working_directory.resource_path())
+						and result.stderr
+							.to_string()
+							.trim() == "captured stderr"
+					))
+			Err(_):
+				Ok(False)
+
+
+private func test_program_execution_captures_separate_streams_in_working_directory() -> Bool:
+	match exercise_captured_program_in_working_directory():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
 private func test_program_timeout_is_distinct() -> Bool:
 	code: String =
+		|#include <signal.h>
 		|#include <unistd.h>
-		|int main(void) {
-		|  sleep(2);
-		|  return 0;
+		|static void terminate(int signal_number) {
+		|  (void)signal_number;
+		|  (void)write(1, "terminated\n", 11);
+		|  _exit(0);
 		|}
-	request = run_request(code, [], Some(milliseconds(20)), None, False)
+		|int main(void) {
+		|  signal(SIGTERM, terminate);
+		|  for (;;) pause();
+		|}
+	request = { run_request(code, [], Some(seconds(2)), None, False) |
+		mode = CapturedProgramRun(None, mebibytes(1))
+	}
 
 	match run_build_artifact(request):
 		Ok(result):
-			result.exit == TimedOut and not file_exists(result.executable_path)
+			(
+				result.exit == TimedOut
+				and result.stdout
+					.to_string()
+					.trim() == "terminated"
+				and not file_exists(result.executable_path)
+			)
 		Err(_):
 			False
 
@@ -205,10 +306,18 @@ tests: TestSuite = {
 			"program command preserves argv and child environment",
 			test_program_command_preserves_argv_and_child_environment,
 		),
+		(
+			"captured command is isolated and bounded",
+			test_captured_program_command_is_isolated_and_bounded,
+		),
 		("program exit status is conventional", test_program_exit_status_is_conventional),
 		(
 			"program execution preserves args, env, and cleanup",
 			test_program_execution_preserves_args_env_and_cleans_up,
+		),
+		(
+			"program execution captures separate streams in working directory",
+			test_program_execution_captures_separate_streams_in_working_directory,
 		),
 		("program timeout is distinct", test_program_timeout_is_distinct),
 	]
