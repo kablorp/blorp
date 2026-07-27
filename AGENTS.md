@@ -244,6 +244,7 @@ scripts/test cli                # CLI smoke and exit-code checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
 scripts/test --coverage         # Compiler-unit coverage report
+scripts/test --no-build         # Test the existing installed toolchain
 scripts/test --timings          # Print unit cases and generated-suite phases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output

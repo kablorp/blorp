@@ -24,6 +24,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute release candidate metadata
+        id: release-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=$(scripts/target-triple)
+          source_sha=$(git rev-parse HEAD)
+          short_sha=${source_sha:0:12}
+          source_version=$(sed -n 's/^let source_version = "\(.*\)"/\1/p' compiler/lib/version.ml)
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            version="${source_version}-dev.${short_sha}"
+            channel="dev"
+          else
+            version="${source_version}-ci.${short_sha}"
+            channel="ci"
+          fi
+
+          {
+            echo "target=$target"
+            echo "source_sha=$source_sha"
+            echo "version=$version"
+            echo "channel=$channel"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "BLORP_BUILD_VERSION=$version"
+            echo "BLORP_BUILD_COMMIT=$source_sha"
+            echo "BLORP_BUILD_TARGET=$target"
+            echo "BLORP_BUILD_CHANNEL=$channel"
+            echo "BLORP_BUILD_DIRTY=false"
+          } >> "$GITHUB_ENV"
+
       - name: Read Blorp compiler bootstrap manifest
         id: compiler-bootstrap
         shell: bash
@@ -70,14 +101,75 @@ jobs:
         uses: actions/cache@v4
         with:
           path: compiler/_build/blorp-cli
-          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/**/*.ml', 'compiler/**/*.mli', 'compiler/**/dune', 'compiler/dune-project', 'compiler/blorp.opam.locked', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
+          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/**/*.ml', 'compiler/**/*.mli', 'compiler/**/dune', 'compiler/dune-project', 'compiler/blorp.opam.locked', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
           restore-keys: |
-            blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
+            blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-
 
       - name: Build compiler
+        env:
+          BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}
+          BLORP_BUILD_COMMIT: ${{ steps.release-meta.outputs.source_sha }}
+          BLORP_BUILD_TARGET: ${{ steps.release-meta.outputs.target }}
+          BLORP_BUILD_CHANNEL: ${{ steps.release-meta.outputs.channel }}
+          BLORP_BUILD_DIRTY: 'false'
         run: opam exec -- make install
 
+      - name: Prepare tested compiler bridges
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"
+          rm -rf "$current_toolchain"
+          mkdir -p "$current_toolchain" compiler/_build/release-bridges
+          # The current compiler still delegates to private workers beside it.
+          # Stage the complete installed toolchain before compiling its successors.
+          for executable in \
+            blorp \
+            blorp-ocaml-host \
+            blorp-ocaml-middle \
+            blorp-compiler-renderer \
+            blorp-compiler-parser \
+            blorp-compiler-typecheck
+          do
+            cp "$executable" "$current_toolchain/$executable"
+          done
+          BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp" \
+            ./blorp __compiler-bridge-prepare compiler/_build/release-bridges
+
+      - name: Select compiler bridge toolchain
+        id: tested-bridges
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            renderer="$PWD/compiler/_build/release-bridges/compiler_renderer_bridge.bin"
+            parser="$PWD/compiler/_build/release-bridges/compiler_parser_bridge.bin"
+            typecheck="$PWD/compiler/_build/release-bridges/compiler_typecheck_bridge.bin"
+          else
+            renderer="$PWD/blorp-compiler-renderer"
+            parser="$PWD/blorp-compiler-parser"
+            typecheck="$PWD/blorp-compiler-typecheck"
+          fi
+          for executable in "$PWD/blorp" "$renderer" "$parser" "$typecheck"; do
+            if [ ! -x "$executable" ]; then
+              echo "Compiler toolchain executable is missing: $executable" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "compiler=$PWD/blorp"
+            echo "renderer=$renderer"
+            echo "parser=$parser"
+            echo "typecheck=$typecheck"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check compiler self-hosting graph
+        env:
+          BLORP_COMPILER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.compiler }}
+          BLORP_COMPILER_RENDERER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.renderer }}
+          BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}
+          BLORP_COMPILER_TYPECHECK_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.typecheck }}
+          BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'
         run: ./blorp check --no-format compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp
 
       - name: Run quality checks
@@ -85,9 +177,64 @@ jobs:
         run: opam exec -- make quality
 
       - name: Run test suites
+        env:
+          BLORP_COMPILER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.compiler }}
+          BLORP_COMPILER_RENDERER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.renderer }}
+          BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}
+          BLORP_COMPILER_TYPECHECK_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.typecheck }}
+          BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'
         run: |
           set -o pipefail
-          opam exec -- env BLORP_TEST_TIMEOUT=30 bash scripts/test --serial 2>&1 | tee test_output.txt
+          opam exec -- env BLORP_TEST_TIMEOUT=30 bash scripts/test --no-build --serial 2>&1 | tee test_output.txt
+
+      - name: Package tested toolchain
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BLORP_RELEASE_VERSION: ${{ steps.release-meta.outputs.version }}
+          BLORP_RELEASE_TARGET: ${{ steps.release-meta.outputs.target }}
+          BLORP_RELEASE_RENDERER_BRIDGE: compiler/_build/release-bridges/compiler_renderer_bridge.bin
+          BLORP_RELEASE_PARSER_BRIDGE: compiler/_build/release-bridges/compiler_parser_bridge.bin
+          BLORP_RELEASE_TYPECHECK_BRIDGE: compiler/_build/release-bridges/compiler_typecheck_bridge.bin
+        run: scripts/package-release dist
+
+      - name: Smoke tested toolchain archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          BLORP_RELEASE_VERSION: ${{ steps.release-meta.outputs.version }}
+          BLORP_RELEASE_COMMIT: ${{ steps.release-meta.outputs.source_sha }}
+          BLORP_RELEASE_TARGET: ${{ steps.release-meta.outputs.target }}
+          BLORP_RELEASE_CHANNEL: ${{ steps.release-meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          package_root=$(mktemp -d "${RUNNER_TEMP}/blorp-package-smoke.XXXXXX")
+          trap 'rm -rf "$package_root"' EXIT
+          archive_base="blorp-${BLORP_RELEASE_VERSION}-${BLORP_RELEASE_TARGET}"
+          tar -xzf "dist/${archive_base}.tar.gz" -C "$package_root"
+          package_dir="$package_root/$archive_base"
+          source_root="$PWD"
+          cd "$package_root"
+          version_output=$("$package_dir/blorp" --version)
+          grep -Fxq "blorp ${BLORP_RELEASE_VERSION}" <<<"$version_output"
+          grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}" <<<"$version_output"
+          grep -Fxq "target: ${BLORP_RELEASE_TARGET}" <<<"$version_output"
+          grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}" <<<"$version_output"
+          grep -Fxq "dirty: false" <<<"$version_output"
+          "$package_dir/blorp" check --no-format \
+            "$source_root/compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
+          "$package_dir/blorp" compile --no-format \
+            -o "$package_root/empty_main.c" \
+            "$source_root/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
+          "$package_dir/blorp" test --no-format --no-cache --timeout 5 \
+            "$source_root/tests/test_blorp/types/test_bool.brp"
+
+      - name: Upload tested toolchain archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blorp-${{ steps.release-meta.outputs.target }}
+          path: dist/*
+          compression-level: 0
 
       - name: Upload test logs
         if: failure()

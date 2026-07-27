@@ -1020,6 +1020,102 @@ let test_resolve_selected_direct_prefers_canonical_name_over_colliding_id () =
       Alcotest.(check (option int)) "current-program def id" (Some 1652) def_id
   | _ -> Alcotest.fail "expected stale selected id to fall back to callee name"
 
+let test_selected_direct_identity_beats_same_named_module_import () =
+  let ty_string = TyNamed ("String", []) in
+  let ty_list_string = TyNamed ("List", [ ty_string ]) in
+  let list_join : core_func =
+    {
+      cf_name = "std_list__join";
+      cf_type_params = [];
+      cf_module = Some "std/list";
+      cf_params =
+        [
+          { cp_name = Var.named "self"; cp_ty = ty_list_string; cp_loc = loc };
+          { cp_name = Var.named "separator"; cp_ty = ty_string; cp_loc = loc };
+        ];
+      cf_return_ty = ty_string;
+      cf_body = Some (cstr "list");
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1275;
+    }
+  in
+  let path_join : core_func =
+    {
+      cf_name = "std_path__join";
+      cf_type_params = [];
+      cf_module = Some "std/path";
+      cf_params =
+        [
+          { cp_name = Var.named "left"; cp_ty = ty_string; cp_loc = loc };
+          { cp_name = Var.named "right"; cp_ty = ty_string; cp_loc = loc };
+        ];
+      cf_return_ty = ty_string;
+      cf_body = Some (cstr "path");
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 3549;
+    }
+  in
+  let call_ty =
+    TyFunc
+      { params = [ ty_list_string; ty_string ]; return = ty_string; is_pure = true }
+  in
+  let call =
+    mk
+      (CCall
+         ( CKSelectedDirect list_join.cf_def_id,
+           cvar "join" call_ty,
+           [ cvar "rest" ty_list_string; cstr "/" ] ))
+      ty_string
+  in
+  let split_module_ref : core_func =
+    {
+      cf_name = "compiler_cli_source_graph__split_module_ref";
+      cf_type_params = [];
+      cf_module = Some "compiler/cli_source_graph";
+      cf_params = [];
+      cf_return_ty = ty_string;
+      cf_body = Some call;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 4000;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc list_join; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc path_join; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc split_module_ref; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let module_imports = Hashtbl.create 1 in
+  let source_graph_imports = Hashtbl.create 1 in
+  Hashtbl.replace source_graph_imports "join" ("std/path", "join");
+  Hashtbl.replace module_imports "compiler/cli_source_graph"
+    source_graph_imports;
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports prog
+  in
+  let body =
+    match resolved with
+    | [ _; _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
+    | _ -> Alcotest.fail "expected list join, path join, and caller"
+  in
+  match body.desc with
+  | CCall
+      ( CKUser (name, def_id),
+        { desc = CVar callee; _ },
+        [ { ty = first_arg_ty; _ }; _ ] ) ->
+      Alcotest.(check string) "selected function" "std_list__join" name;
+      Alcotest.(check (option int)) "selected def id" (Some 1275) def_id;
+      Alcotest.(check string) "callee identity" "std_list__join" callee.vname;
+      Alcotest.(check bool)
+        "list receiver type preserved" true
+        (first_arg_ty = ty_list_string)
+  | _ -> Alcotest.fail "expected selected list join call"
+
 let test_resolve_local_value_shadows_module_alias_call () =
   (* If a local value has the same spelling as an imported module alias,
      qualified field calls on the local value must remain closure calls. The
@@ -2460,6 +2556,9 @@ let suite =
         Alcotest.test_case
           "selected_direct_prefers_canonical_name_over_colliding_id" `Quick
           test_resolve_selected_direct_prefers_canonical_name_over_colliding_id;
+        Alcotest.test_case
+          "selected_direct_identity_beats_same_named_module_import" `Quick
+          test_selected_direct_identity_beats_same_named_module_import;
         Alcotest.test_case "local_value_shadows_module_alias_call" `Quick
           test_resolve_local_value_shadows_module_alias_call;
         Alcotest.test_case "resource_scope_shadows_module_alias_call" `Quick

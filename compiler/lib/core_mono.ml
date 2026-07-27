@@ -1013,6 +1013,7 @@ let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
           && (f.cf_body <> None
              || is_builtin_kind f.cf_kind
                 && Core_intrinsics.has_post_mono_synthesis
+                     ~module_path:f.cf_module
                      (post_mono_synthesis_name f))
         then remember_generic_body f;
         walk rest

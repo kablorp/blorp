@@ -18,6 +18,7 @@
 #   scripts/test compiler-unit compiler  # Multiple gates
 #   scripts/test --serial           # Run selected gates one at a time
 #   scripts/test --coverage         # Compiler-unit coverage report
+#   scripts/test --no-build         # Test the existing installed toolchain
 #   scripts/test --timings          # Print compiler-unit and generated-suite timings
 #   scripts/test --verbose          # Print every child-runner line
 #   scripts/test --log-dir logs     # Save premerge gate logs
@@ -61,6 +62,7 @@ usage() {
 Options:
   --serial       Run selected gates one at a time.
   --coverage     Run compiler-unit tests with coverage instrumentation.
+  --no-build     Use the existing installed toolchain without invoking make.
   --timings      Print compiler-unit cases and generated-suite phase timings.
   --verbose      Stream full child-runner output, including passing tests.
   --quiet        Suppress passing-test output (default).
@@ -75,6 +77,7 @@ EOF
 # Parse arguments
 gates=()
 coverage=false
+skip_build=false
 serial=false
 verbose=false
 timings=false
@@ -84,6 +87,7 @@ while [ $# -gt 0 ]; do
     shift
     case "$arg" in
         --coverage) coverage=true ;;
+        --no-build) skip_build=true ;;
         --timings) timings=true ;;
         --serial) serial=true ;;
         --verbose) verbose=true ;;
@@ -116,6 +120,11 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if $skip_build && $coverage; then
+    echo "Error: --no-build cannot be combined with --coverage because coverage requires instrumented rebuilds." >&2
+    exit 1
+fi
 
 if $timings; then
     export BLORP_TEST_TIMINGS=1
@@ -333,17 +342,21 @@ for gate in "${gates[@]}"; do
 done
 
 build_seconds=0
-build_start_seconds=$(now_seconds)
-if ! make "$build_target"; then
+if $skip_build; then
+    build_seconds=0
+else
+    build_start_seconds=$(now_seconds)
+    if ! make "$build_target"; then
+        build_seconds=$(elapsed_since "$build_start_seconds")
+        echo "Error: compiler build failed; aborting test run." >&2
+        exit 1
+    fi
     build_seconds=$(elapsed_since "$build_start_seconds")
-    echo "Error: compiler build failed; aborting test run." >&2
-    exit 1
 fi
-build_seconds=$(elapsed_since "$build_start_seconds")
 
 bridge_prepare_seconds=0
 configure_compiler_bridge_environment() {
-    local pinned_bridge_bin
+    local helper_override_count helper_path installed_toolchain_dir
 
     if [ -z "${BLORP_COMPILER_BRIDGE_CACHE_DIR:-}" ]; then
         if [ -n "${XDG_CACHE_HOME:-}" ]; then
@@ -355,12 +368,44 @@ configure_compiler_bridge_environment() {
         fi
     fi
 
+    helper_override_count=0
+    for helper_path in \
+        "${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" \
+        "${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" \
+        "${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}"
+    do
+        if [ -n "$helper_path" ]; then
+            helper_override_count=$((helper_override_count + 1))
+        fi
+    done
+
+    if [ "$helper_override_count" -ne 0 ] && [ "$helper_override_count" -ne 3 ]; then
+        echo "Error: Blorp compiler bridge helper overrides must be provided together." >&2
+        exit 1
+    fi
+
     if [ -z "${BLORP_COMPILER_BRIDGE_BIN:-}" ]; then
-        if ! pinned_bridge_bin=$("$script_dir/blorp-compiler-bootstrap" --print-path); then
-            echo "Error: failed to resolve pinned Blorp compiler bootstrap." >&2
+        installed_toolchain_dir=$(pwd -P)
+        if [ ! -x "$installed_toolchain_dir/blorp" ]; then
+            echo "Error: installed Blorp compiler is missing; run make install." >&2
             exit 1
         fi
-        export BLORP_COMPILER_BRIDGE_BIN="$pinned_bridge_bin"
+        export BLORP_COMPILER_BRIDGE_BIN="$installed_toolchain_dir/blorp"
+        if [ "$helper_override_count" -eq 0 ]; then
+            for helper_path in \
+                "$installed_toolchain_dir/blorp-compiler-renderer" \
+                "$installed_toolchain_dir/blorp-compiler-parser" \
+                "$installed_toolchain_dir/blorp-compiler-typecheck"
+            do
+                if [ ! -x "$helper_path" ]; then
+                    echo "Error: installed Blorp compiler helper is missing: $helper_path" >&2
+                    exit 1
+                fi
+            done
+            export BLORP_COMPILER_RENDERER_BRIDGE_BIN="$installed_toolchain_dir/blorp-compiler-renderer"
+            export BLORP_COMPILER_PARSER_BRIDGE_BIN="$installed_toolchain_dir/blorp-compiler-parser"
+            export BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$installed_toolchain_dir/blorp-compiler-typecheck"
+        fi
     fi
 }
 

@@ -85,31 +85,31 @@ print(json.dumps({
 def process_tree_bridge_source() -> str:
     return """#!/usr/bin/env python3
 import os
-import subprocess
-import sys
+import signal
 import time
 from pathlib import Path
 
 started = Path(os.environ["BLORP_FAKE_BRIDGE_STARTED"])
 survived = os.environ["BLORP_FAKE_BRIDGE_SURVIVED"]
 survive_delay = os.environ.get("BLORP_FAKE_BRIDGE_SURVIVE_DELAY", "2")
-child = subprocess.Popen([
-    sys.executable,
-    "-c",
-    (
-        "import signal, sys, time; "
-        "from pathlib import Path; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "Path(sys.argv[1]).write_text('started', encoding='utf-8'); "
-        "time.sleep(float(sys.argv[3])); "
-        "Path(sys.argv[2]).write_text('survived', encoding='utf-8')"
-    ),
-    str(started),
-    survived,
-    survive_delay,
-])
+
+def survive_sigterm(_signum, _frame):
+    # Measure survival from cleanup, not from an earlier launch timestamp.
+    time.sleep(float(survive_delay))
+    Path(survived).write_text("survived", encoding="utf-8")
+
+# Keep the descendant in the renderer's process group without giving the
+# renderer's Python interpreter a Popen object that could own its shutdown.
+child_pid = os.fork()
+if child_pid == 0:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, survive_sigterm)
+    started.write_text("started", encoding="utf-8")
+    time.sleep(5)
+    os._exit(0)
+
 Path(os.environ["BLORP_FAKE_BRIDGE_CHILD_PID"]).write_text(
-    str(child.pid),
+    str(child_pid),
     encoding="utf-8",
 )
 while not started.exists():
@@ -158,6 +158,19 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
         pid = int(pid_path.read_text(encoding="utf-8"))
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
+            status_path = Path(f"/proc/{pid}/stat")
+            try:
+                status = status_path.read_text(encoding="utf-8")
+            except OSError:
+                status = ""
+            closing_parenthesis = status.rfind(")")
+            if closing_parenthesis >= 0:
+                status_fields = status[closing_parenthesis + 1 :].split()
+                # Containers without an init reaper can retain a killed
+                # grandchild as a zombie. It exists, but cannot execute.
+                if status_fields and status_fields[0] == "Z":
+                    return
+
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:

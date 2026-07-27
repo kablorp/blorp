@@ -997,6 +997,57 @@ func test_does_not_apply_inner_direct_identity_to_returned_function_call() -> Bo
 			False
 
 
+func test_lowers_local_function_reference_with_callable_id() -> Bool:
+	resolved = resolved_call_info(
+		"owned_json",
+		CompilerResolvedDirectCall(7444, CompilerCallableLocal),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("owned_json"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(VarExpr(variable, _, _)):
+			variable.name == "owned_json" and variable.def_id == Some(7444)
+		_:
+			False
+
+
+func test_lowers_imported_function_reference_with_callable_id() -> Bool:
+	resolved = resolved_call_info(
+		"to_result",
+		CompilerResolvedDirectCall(2180, CompilerCallableImported("std/option")),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("to_result"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(VarExpr(variable, _, _)):
+			variable.name == "__ufcs_std$option__to_result" and variable.def_id == Some(2180)
+		_:
+			False
+
+
+func test_rejects_conflicting_function_reference_ids() -> Bool:
+	resolved = resolved_call_info(
+		"__ufcs_map",
+		CompilerResolvedDirectCall(78, CompilerCallableLocal),
+	)
+	expr = CompilerTypedNameExpr(
+		ident("__ufcs_map#77"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Err(CompilerCoreLowerInvalidCall(message)):
+			message.contains("conflicting callable ids")
+		_:
+			False
+
+
 func direct_call_lowers_to_unknown_call(
 	callee_name: String,
 	callable_id: Int,
@@ -1078,6 +1129,31 @@ func test_lowers_qualified_imported_direct_call_with_explicit_identity() -> Bool
 	match lower_typed_expr(expr):
 		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
 			def_id == 92 and variable.name == "__ufcs_std$list__external_add" and args.length() == 1
+		_:
+			False
+
+
+func test_lowers_resolved_imported_direct_call() -> Bool:
+	resolved = resolved_call_info(
+		"external_add",
+		CompilerResolvedDirectCall(92, CompilerCallableImported("math")),
+	)
+	callee = CompilerTypedNameExpr(ident("external_add"), expr_info(function_type()))
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(int_type(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, _, _)):
+			(
+				def_id == 92
+				and variable.name == "__ufcs_math__external_add"
+				and variable.def_id.is_none()
+				and args.length() == 1
+			)
 		_:
 			False
 
@@ -1820,6 +1896,41 @@ func test_lowers_local_annotation_from_semantic_initializer_type() -> Bool:
 	match lower_typed_expr(expr):
 		Ok(LetExpr(_, _, TypeParameterType(bind_name), _, VarExpr(_, TypeParameterType(body_name), _))):
 			bind_name == "T" and body_name == "T"
+		_:
+			False
+
+
+func test_local_binding_uses_resolved_initializer_type() -> Bool:
+	resolved_policy_type: CompilerType = CompilerNamedType("pkg/policy::Policy", [])
+	initializer = CompilerTypedNameExpr(ident("policy_value"), expr_info(resolved_policy_type))
+	payload: CompilerTypedVarDeclPayload = {
+		name = ident("policy"),
+		annotation = Some(CompilerNamedType("Policy", [])),
+		initializer = initializer,
+		is_mutable = False,
+		span = source_span()
+	}
+	expr = CompilerTypedBlockExpr(
+		[
+			CompilerTypedVarDeclExpr(payload, expr_info(compiler_type_void())),
+			CompilerTypedNameExpr(ident("policy"), expr_info(resolved_policy_type)),
+		],
+		source_span(),
+		expr_info(resolved_policy_type),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(_, _, bind_type, rhs, _)):
+			rhs_type: CoreType = match rhs:
+				VarExpr(_, typ, _):
+					typ
+				_:
+					VoidType
+
+			core_types_equal(
+				bind_type,
+				NamedType("pkg_policy__Policy", []),
+			) and core_types_equal(bind_type, rhs_type)
 		_:
 			False
 
@@ -3758,11 +3869,13 @@ func test_lowers_parallel_matrix_to_tensor_type() -> Bool:
 
 
 func test_lowers_canonical_parallel_vector_type() -> Bool:
-	match compiler_core_lower_type(
-		CompilerNamedType(
-			"std/vector::ParallelVector",
-			[int_type(), CompilerConstIntType(2)],
-		),
+	match (
+		compiler_core_lower_type(
+			CompilerNamedType(
+				"std/vector::ParallelVector",
+				[int_type(), CompilerConstIntType(2)],
+			),
+		)
 	):
 		Ok(lowered):
 			core_type_to_json(
@@ -3775,11 +3888,13 @@ func test_lowers_canonical_parallel_vector_type() -> Bool:
 
 
 func test_lowers_canonical_parallel_matrix_type() -> Bool:
-	match compiler_core_lower_type(
-		CompilerNamedType(
-			"std/matrix::ParallelMatrix",
-			[int_type(), CompilerConstIntType(2), CompilerConstIntType(3)],
-		),
+	match (
+		compiler_core_lower_type(
+			CompilerNamedType(
+				"std/matrix::ParallelMatrix",
+				[int_type(), CompilerConstIntType(2), CompilerConstIntType(3)],
+			),
+		)
 	):
 		Ok(lowered):
 			core_type_to_json(
@@ -4578,6 +4693,10 @@ tests: TestSuite = {
 			test_does_not_apply_inner_direct_identity_to_returned_function_call,
 		),
 		(
+			"lowers local function reference with callable id",
+			test_lowers_local_function_reference_with_callable_id,
+		),
+		(
 			"lowers resolved imported direct call with explicit identity",
 			test_lowers_resolved_imported_direct_call_with_explicit_identity,
 		),
@@ -4585,6 +4704,15 @@ tests: TestSuite = {
 			"lowers qualified imported direct call with explicit identity",
 			test_lowers_qualified_imported_direct_call_with_explicit_identity,
 		),
+		(
+			"lowers imported function reference with callable id",
+			test_lowers_imported_function_reference_with_callable_id,
+		),
+		(
+			"rejects conflicting function reference ids",
+			test_rejects_conflicting_function_reference_ids,
+		),
+		("lowers resolved imported direct call", test_lowers_resolved_imported_direct_call),
 		(
 			"lowers resolved constructor direct call as unknown",
 			test_lowers_resolved_constructor_direct_call_as_unknown,
@@ -4633,6 +4761,10 @@ tests: TestSuite = {
 		(
 			"lowers local annotation from semantic initializer type",
 			test_lowers_local_annotation_from_semantic_initializer_type,
+		),
+		(
+			"local binding uses resolved initializer type",
+			test_local_binding_uses_resolved_initializer_type,
 		),
 		("lowers tuple destruct in block", test_lowers_tuple_destruct_in_block),
 		("lowers tuple destruct skipping wildcard", test_lowers_tuple_destruct_skipping_wildcard),

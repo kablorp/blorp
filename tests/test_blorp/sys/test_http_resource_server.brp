@@ -27,7 +27,8 @@ http_stream_timeout_ms: Int = 1000
 
 http_client_result_timeout_ms: Int = 5000
 
-http_read_chunk_size: Int = 4096
+-- Intentionally force each HTTP message to span multiple TCP reads.
+http_read_chunk_size: Int = 8
 
 http_listener_backlog: Int = 32
 
@@ -43,23 +44,47 @@ pure func route(req: Request) -> Response:
 
 func client_get(port_num: Int, path: String) -> Result[Bool, TcpError]:
 	remote ?= port(port_num)
+
 	with stream ?= connect_loopback(IPv4, remote):
 		ignored_timeout ?= set_stream_timeout(stream, http_stream_timeout_ms)
 		request: Bytes = ("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n").to_bytes()
 		ignored ?= write_all(stream, request)
-		raw ?= read_chunk(stream, http_read_chunk_size)
-		text: String = raw.to_string()
-		Ok(text.contains("HTTP/1.1 200 OK") and text.contains("handled " + path))
+		var raw: Bytes = "".to_bytes()
+		var reading: Bool = True
+		var read_error: Option[TcpError] = None
+
+		-- format_response adds Connection: close, so EOF frames this response.
+		-- A reusable keep-alive client must honor Content-Length or chunked coding.
+		while reading:
+			match read_chunk(stream, http_read_chunk_size):
+				Ok(chunk):
+					if chunk.length() == 0:
+						reading = False
+					else:
+						raw = raw.append(chunk)
+				Err(err):
+					read_error = Some(err)
+					reading = False
+
+		match read_error:
+			Some(err):
+				Err(err)
+			None:
+				text: String = raw.to_string()
+				Ok(text.contains("HTTP/1.1 200 OK") and text.contains("handled " + path))
 
 
 func detached_client(port: Int, path: String, results: Channel[Bool]):
 	match client_get(port, path):
-		Ok(ok): _ = send(results, ok)
-		Err(_): _ = send(results, False)
+		Ok(ok):
+			_ = send(results, ok)
+		Err(_):
+			_ = send(results, False)
 
 
 func launch_clients(port: Int, count: Int, results: Channel[Bool]):
 	var i: Int = 0
+
 	while i < count:
 		path: String = "/item-${i}"
 		detach detached_client(port, path, results)
@@ -69,6 +94,7 @@ func launch_clients(port: Int, count: Int, results: Channel[Bool]):
 func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
 	var seen: Int = 0
 	var ok: Bool = True
+
 	while seen < count:
 		match recv_timeout(results, http_client_result_timeout_ms):
 			Some(value):
@@ -77,6 +103,7 @@ func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
 			None:
 				ok = False
 				seen = count
+
 	ok
 
 
@@ -86,26 +113,55 @@ func run_resource_http_server(client_count: Int) -> Result[Bool, TcpError]:
 		port_num ?= local_port(listener)
 		results: Channel[Bool] = channel(client_count)
 		launch_clients(port_num, client_count, results)
+
 		for peer in connections_stop_on_error(listener) concurrently(limit: 4):
 			match set_stream_timeout(peer, http_stream_timeout_ms):
 				Ok(_):
-					match read_chunk(peer, http_read_chunk_size):
-						Ok(raw):
-							response: Response = match HTTP.parse_request(raw):
-								Ok(req): route(req)
-								Err(msg): HTTP.error_response(400, msg)
-							match write_all(peer, HTTP.format_response(response)):
-								Ok(_): void
-								Err(_): void
-						Err(_): void
-				Err(_): void
+					var raw: Bytes = "".to_bytes()
+					var reading: Bool = True
+
+					-- TCP reads are arbitrary chunks; wait for the complete HTTP header.
+					-- This smoke sends bodyless GETs; production framing must also
+					-- bound header growth and honor request body framing.
+					while reading:
+						match read_chunk(peer, http_read_chunk_size):
+							Ok(chunk):
+								if chunk.length() == 0:
+									reading = False
+								else:
+									raw = raw.append(chunk)
+									reading = not raw
+										.to_string()
+										.contains("\r\n\r\n")
+							Err(_):
+								reading = False
+
+					response: Response = match HTTP.parse_request(raw):
+						Ok(req):
+							route(req)
+						Err(msg):
+							HTTP.error_response(400, msg)
+
+					match write_all(
+						peer,
+						HTTP.format_response(response),
+					):
+						Ok(_):
+							void
+						Err(_):
+							void
+				Err(_):
+					void
+
 		Ok(collect_client_results(results, client_count))
 
 
 func test_concurrent_resource_http_server() -> Bool:
 	match run_resource_http_server(4):
-		Ok(ok): ok
-		Err(err): is_socket_permission_error(err)
+		Ok(ok):
+			ok
+		Err(err):
+			is_socket_permission_error(err)
 
 
 tests: TestSuite = {

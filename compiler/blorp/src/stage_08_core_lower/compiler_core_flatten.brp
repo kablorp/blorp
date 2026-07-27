@@ -179,10 +179,8 @@ private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
 	match function_info.function_kind:
 		UserFunction:
 			not is_core_ufcs_function_name(function_info.name)
-		-- Std intrinsic bodies are synthesized after mono, but the declaration
-		-- already owns a callable module identity at this boundary.
 		UnresolvedBuiltinFunction:
-			True
+			False
 		BuiltinFunction(c_name):
 			False
 		ForeignFunction(_):
@@ -191,10 +189,13 @@ private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
 			False
 
 
-private pure func has_implementation(function_info: CoreFunction) -> Bool:
+private pure func has_callable_implementation(function_info: CoreFunction) -> Bool:
 	if function_info.body.is_some():
 		True
 	else:
+		-- Source `builtin("std/...")` bodies lower to a bodyless
+		-- UnresolvedBuiltinFunction. They are still implementations; treating
+		-- them as forward declarations can discard the selected overload.
 		match function_info.function_kind:
 			UnresolvedBuiltinFunction:
 				True
@@ -202,14 +203,40 @@ private pure func has_implementation(function_info: CoreFunction) -> Bool:
 				False
 
 
-private pure func has_implemented_callable(functions: List[CoreFunction], name: String) -> Bool:
+private pure func has_user_callable_named(functions: List[CoreFunction], name: String) -> Bool:
+	functions.any(func(candidate):
+		candidate.name == name and is_module_user_callable(candidate)
+	)
+
+
+private pure func is_module_overload_callable(
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> Bool:
+	if is_module_user_callable(function_info):
+		True
+	else:
+		match function_info.function_kind:
+			UnresolvedBuiltinFunction:
+				(
+					not is_core_ufcs_function_name(function_info.name)
+					and has_user_callable_named(functions, function_info.name)
+				)
+			_:
+				False
+
+
+private pure func has_callable_implementation_named(
+	functions: List[CoreFunction],
+	name: String,
+) -> Bool:
 	functions.any(
 		func(
 			candidate,
 		): (
 			candidate.name == name
-			and is_module_user_callable(candidate)
-			and has_implementation(candidate)
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 		),
 	)
 
@@ -221,8 +248,8 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_implementation(candidate)
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 		),
 	)
 	has_impure: Bool = functions.any(
@@ -231,8 +258,8 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and not candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_implementation(candidate)
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 		),
 	)
 
@@ -270,8 +297,8 @@ private pure func callable_target_def_id(
 
 	for candidate in functions:
 		if (
-			is_module_user_callable(candidate)
-			and has_implementation(candidate)
+			is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 			and callable_target_name(module_name, functions, candidate) == target_name
 		):
 			target_def_id = candidate.def_id
@@ -288,8 +315,8 @@ private pure func collect_callable_rewrites(
 
 	functions.filter_map(func(function_info):
 		if (
-			is_module_user_callable(function_info)
-			and has_implemented_callable(functions, function_info.name)
+			is_module_overload_callable(functions, function_info)
+			and has_callable_implementation_named(functions, function_info.name)
 		):
 			Some({
 				source_name = function_info.name,
@@ -1935,7 +1962,7 @@ private pure func function_decl_has_implementation_named(
 	decls.any(func(decl):
 		match decl:
 			FunctionDecl(function_info):
-				function_info.name == name and has_implementation(function_info)
+				function_info.name == name and has_callable_implementation(function_info)
 			_:
 				False
 	)
@@ -1950,11 +1977,8 @@ private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]
 			FunctionDecl(function_info):
 				if not seen_names.contains(function_info.name):
 					if (
-						has_implementation(function_info)
-						or not function_decl_has_implementation_named(
-							decls,
-							function_info.name,
-						)
+						has_callable_implementation(function_info)
+						or not function_decl_has_implementation_named(decls, function_info.name)
 					):
 						seen_names = seen_names.append(function_info.name)
 						result = result.append(decl)

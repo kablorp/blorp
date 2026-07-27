@@ -230,6 +230,13 @@ bootstrap_path=$(PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path)
+bootstrap_toolchain_dir=$(PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-toolchain-dir)
+if [ "$bootstrap_toolchain_dir" != "$(dirname "$bootstrap_path")" ]; then
+	fail "the bootstrap resolver must expose its verified complete-toolchain directory"
+fi
 for executable in "${toolchain_executables[@]}"; do
 	if [ ! -x "$(dirname "$bootstrap_path")/$executable" ]; then
 		fail "a toolchain bootstrap must cache $executable"
@@ -261,6 +268,19 @@ if [ ! -x "$legacy_path" ]; then
 fi
 if [ -e "$(dirname "$legacy_path")/blorp-ocaml-host" ]; then
 	fail "the single bootstrap layout must not invent private helpers"
+fi
+if PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/legacy-bootstrap-cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-toolchain-dir \
+	>"$tmp_dir/single-toolchain-dir.output" 2>&1
+then
+	fail "a single-binary bootstrap must not claim to provide a complete toolchain"
+fi
+if ! grep -Fq "does not provide a complete compiler toolchain" \
+	"$tmp_dir/single-toolchain-dir.output"
+then
+	fail "requesting a toolchain directory from a single bootstrap must explain the mismatch"
 fi
 
 write_bootstrap_manifest toolchain "$legacy_sha"
