@@ -105,6 +105,33 @@ let function_decl ?(body = Some (int_literal 0))
       ("loc", synthetic_loc);
     ]
 
+let union_decl name payload_storage =
+  let variant =
+    Lsp_json.Object
+      [
+        ("name", Lsp_json.String "Value");
+        ("tag", Lsp_json.Int 0);
+        ("def_id", Lsp_json.Int 9);
+        ( "fields",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("type", named_type "String");
+                  ("release_policy", Lsp_json.String "arc");
+                ];
+            ] );
+      ]
+  in
+  kind "union"
+    [
+      ("name", Lsp_json.String name);
+      ("type_params", Lsp_json.Array []);
+      ("payload_storage", Lsp_json.String payload_storage);
+      ("variants", Lsp_json.Array [ variant ]);
+      ("loc", synthetic_loc);
+    ]
+
 let program decls =
   kind "program"
     [
@@ -127,6 +154,21 @@ let test_decodes_post_synth_program () =
       Alcotest.(check int) "def id" 7 fn.cf_def_id;
       Alcotest.(check bool) "has body" true (Option.is_some fn.cf_body)
   | _ -> Alcotest.fail "expected one decoded function"
+
+let test_preserves_union_payload_storage () =
+  let decoded = decode_exn (program [ union_decl "Choice__mono_String" "typed" ]) in
+  Alcotest.(check bool)
+    "decoded payload storage" true
+    (List.assoc_opt "Choice__mono_String" decoded.union_payload_storage
+    = Some Codegen_types.TypedUnionPayloadStorage);
+  let reg = Codegen_types.create_registry () in
+  Core_registry.register_types
+    ~union_payload_storage_overrides:decoded.union_payload_storage reg
+    decoded.core;
+  Alcotest.(check bool)
+    "registry payload storage" true
+    (Codegen_types.union_uses_typed_payload_storage reg
+       "Choice__mono_String")
 
 let decoded_body_exn body =
   let decoded =
@@ -748,6 +790,8 @@ let suite =
     ( "boundary",
       [
         Alcotest.test_case "decodes post-synth program" `Quick test_decodes_post_synth_program;
+        Alcotest.test_case "preserves union payload storage" `Quick
+          test_preserves_union_payload_storage;
         Alcotest.test_case "rejects later ownership node" `Quick
           test_rejects_late_ownership_node;
         Alcotest.test_case "decodes synthesized value forms" `Quick

@@ -52,6 +52,8 @@ private BOOL_TYPE: CoreType = NamedType("Bool", [])
 
 private STRING_TYPE: CoreType = NamedType("String", [])
 
+private SPLIT_SINGLE_BYTE_FIND_MIN_LENGTH: Int = 256
+
 
 private pure func core_var(name: String) -> CoreVar:
 	{
@@ -1152,6 +1154,319 @@ private pure func store_split_segment(
 	)
 
 
+private pure func split_delimiter_fits(position: CoreExpr) -> CoreExpr:
+	binary(
+		LessEqualOp,
+		binary(
+			AddOp,
+			position,
+			variable("__split_dlen", INT_TYPE),
+			INT_TYPE,
+		),
+		variable("__split_slen", INT_TYPE),
+		BOOL_TYPE,
+	)
+
+
+private pure func increment_split_variable(name: String, amount: CoreExpr) -> CoreExpr:
+	assignment(
+		name,
+		binary(
+			AddOp,
+			variable(name, INT_TYPE),
+			amount,
+			INT_TYPE,
+		),
+	)
+
+
+private pure func split_general_count_loop(
+	source: CoreExpr,
+	delimiter: CoreExpr,
+) -> CoreExpr:
+	while_loop(
+		split_delimiter_fits(variable("__split_count_pos", INT_TYPE)),
+		if_expr(
+			compare_needle_at(
+				source,
+				delimiter,
+				variable("__split_count_pos", INT_TYPE),
+				variable("__split_dlen", INT_TYPE),
+				"__split_count",
+			),
+			sequence(
+				increment_split_variable("__split_part_count", int_literal(1)),
+				increment_split_variable(
+					"__split_count_pos",
+					variable("__split_dlen", INT_TYPE),
+				),
+			),
+			increment_split_variable("__split_count_pos", int_literal(1)),
+			VoidType,
+		),
+	)
+
+
+private pure func split_single_byte_find_count_loop(source: CoreExpr) -> CoreExpr:
+	while_loop(
+		binary(
+			LessOp,
+			variable("__split_count_pos", INT_TYPE),
+			variable("__split_slen", INT_TYPE),
+			BOOL_TYPE,
+		),
+		let_expr(
+			"__split_found_pos",
+			False,
+			INT_TYPE,
+			intrinsic_call(
+				"string_find_byte_from",
+				[
+					source,
+					variable("__split_delim_byte", INT_TYPE),
+					variable("__split_count_pos", INT_TYPE),
+				],
+				INT_TYPE,
+			),
+			if_expr(
+				binary(
+					LessOp,
+					variable("__split_found_pos", INT_TYPE),
+					int_literal(0),
+					BOOL_TYPE,
+				),
+				assignment(
+					"__split_count_pos",
+					variable("__split_slen", INT_TYPE),
+				),
+				sequence(
+					increment_split_variable("__split_part_count", int_literal(1)),
+					assignment(
+						"__split_count_pos",
+						binary(
+							AddOp,
+							variable("__split_found_pos", INT_TYPE),
+							int_literal(1),
+							INT_TYPE,
+						),
+					),
+				),
+				VoidType,
+			),
+		),
+	)
+
+
+private pure func split_single_byte_linear_count_loop(source: CoreExpr) -> CoreExpr:
+	while_loop(
+		binary(
+			LessOp,
+			variable("__split_count_pos", INT_TYPE),
+			variable("__split_slen", INT_TYPE),
+			BOOL_TYPE,
+		),
+		if_expr(
+			binary(
+				EqualOp,
+				string_byte(source, variable("__split_count_pos", INT_TYPE)),
+				variable("__split_delim_byte", INT_TYPE),
+				BOOL_TYPE,
+			),
+			sequence(
+				increment_split_variable("__split_part_count", int_literal(1)),
+				increment_split_variable("__split_count_pos", int_literal(1)),
+			),
+			increment_split_variable("__split_count_pos", int_literal(1)),
+			VoidType,
+		),
+	)
+
+
+private pure func split_count_loop(
+	source: CoreExpr,
+	delimiter: CoreExpr,
+) -> CoreExpr:
+	if_expr(
+		binary(
+			EqualOp,
+			variable("__split_dlen", INT_TYPE),
+			int_literal(1),
+			BOOL_TYPE,
+		),
+		let_expr(
+			"__split_delim_byte",
+			False,
+			INT_TYPE,
+			string_byte(delimiter, int_literal(0)),
+			if_expr(
+				binary(
+					GreaterOp,
+					variable("__split_slen", INT_TYPE),
+					int_literal(SPLIT_SINGLE_BYTE_FIND_MIN_LENGTH),
+					BOOL_TYPE,
+				),
+				split_single_byte_find_count_loop(source),
+				split_single_byte_linear_count_loop(source),
+				VoidType,
+			),
+		),
+		split_general_count_loop(source, delimiter),
+		VoidType,
+	)
+
+
+private pure func append_current_split_segment(
+	source: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	let_expr(
+		"__split_segment_len",
+		False,
+		INT_TYPE,
+		binary(
+			SubtractOp,
+			variable("__split_fill_pos", INT_TYPE),
+			variable("__split_segment_start", INT_TYPE),
+			INT_TYPE,
+		),
+		sequence(
+			store_split_segment(
+				source,
+				variable("__split_segment_start", INT_TYPE),
+				variable("__split_segment_len", INT_TYPE),
+				variable("__split_out_index", INT_TYPE),
+				return_type,
+				"__split_segment",
+			),
+			sequence(
+				increment_split_variable("__split_out_index", int_literal(1)),
+				sequence(
+					assignment(
+						"__split_segment_start",
+						binary(
+							AddOp,
+							variable("__split_fill_pos", INT_TYPE),
+							variable("__split_dlen", INT_TYPE),
+							INT_TYPE,
+						),
+					),
+					increment_split_variable(
+						"__split_fill_pos",
+						variable("__split_dlen", INT_TYPE),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func split_single_byte_find_fill_loop(
+	source: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	while_loop(
+		binary(
+			LessOp,
+			variable("__split_fill_pos", INT_TYPE),
+			variable("__split_slen", INT_TYPE),
+			BOOL_TYPE,
+		),
+		let_expr(
+			"__split_found_pos",
+			False,
+			INT_TYPE,
+			intrinsic_call(
+				"string_find_byte_from",
+				[
+					source,
+					variable("__split_delim_byte", INT_TYPE),
+					variable("__split_fill_pos", INT_TYPE),
+				],
+				INT_TYPE,
+			),
+			if_expr(
+				binary(
+					LessOp,
+					variable("__split_found_pos", INT_TYPE),
+					int_literal(0),
+					BOOL_TYPE,
+				),
+				assignment(
+					"__split_fill_pos",
+					variable("__split_slen", INT_TYPE),
+				),
+				sequence(
+					assignment(
+						"__split_fill_pos",
+						variable("__split_found_pos", INT_TYPE),
+					),
+					append_current_split_segment(source, return_type),
+				),
+				VoidType,
+			),
+		),
+	)
+
+
+private pure func split_single_byte_linear_fill_loop(
+	source: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	while_loop(
+		binary(
+			LessOp,
+			variable("__split_fill_pos", INT_TYPE),
+			variable("__split_slen", INT_TYPE),
+			BOOL_TYPE,
+		),
+		if_expr(
+			binary(
+				EqualOp,
+				string_byte(source, variable("__split_fill_pos", INT_TYPE)),
+				variable("__split_delim_byte", INT_TYPE),
+				BOOL_TYPE,
+			),
+			append_current_split_segment(source, return_type),
+			increment_split_variable("__split_fill_pos", int_literal(1)),
+			VoidType,
+		),
+	)
+
+
+private pure func split_single_byte_fill_loop(
+	source: CoreExpr,
+	delimiter: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	if_expr(
+		binary(
+			EqualOp,
+			variable("__split_dlen", INT_TYPE),
+			int_literal(1),
+			BOOL_TYPE,
+		),
+		let_expr(
+			"__split_delim_byte",
+			False,
+			INT_TYPE,
+			string_byte(delimiter, int_literal(0)),
+			if_expr(
+				binary(
+					GreaterOp,
+					variable("__split_slen", INT_TYPE),
+					int_literal(SPLIT_SINGLE_BYTE_FIND_MIN_LENGTH),
+					BOOL_TYPE,
+				),
+				split_single_byte_find_fill_loop(source, return_type),
+				split_single_byte_linear_fill_loop(source, return_type),
+				VoidType,
+			),
+		),
+		void_expr(),
+		VoidType,
+	)
+
+
 private pure func synthesize_split(
 	source: CoreExpr,
 	delimiter: CoreExpr,
@@ -1222,58 +1537,7 @@ private pure func synthesize_split(
 						INT_TYPE,
 						int_literal(0),
 						sequence(
-							while_loop(
-								binary(
-									LessEqualOp,
-									binary(
-										AddOp,
-										variable("__split_count_pos", INT_TYPE),
-										variable("__split_dlen", INT_TYPE),
-										INT_TYPE,
-									),
-									variable("__split_slen", INT_TYPE),
-									BOOL_TYPE,
-								),
-								if_expr(
-									compare_needle_at(
-										source,
-										delimiter,
-										variable("__split_count_pos", INT_TYPE),
-										variable("__split_dlen", INT_TYPE),
-										"__split_count",
-									),
-									sequence(
-										assignment(
-											"__split_part_count",
-											binary(
-												AddOp,
-												variable("__split_part_count", INT_TYPE),
-												int_literal(1),
-												INT_TYPE,
-											),
-										),
-										assignment(
-											"__split_count_pos",
-											binary(
-												AddOp,
-												variable("__split_count_pos", INT_TYPE),
-												variable("__split_dlen", INT_TYPE),
-												INT_TYPE,
-											),
-										),
-									),
-									assignment(
-										"__split_count_pos",
-										binary(
-											AddOp,
-											variable("__split_count_pos", INT_TYPE),
-											int_literal(1),
-											INT_TYPE,
-										),
-									),
-									VoidType,
-								),
-							),
+							split_count_loop(source, delimiter),
 							let_expr(
 								"__split_result",
 								False,
@@ -1299,18 +1563,28 @@ private pure func synthesize_split(
 											INT_TYPE,
 											int_literal(0),
 											sequence(
-												while_loop(
-													binary(
-														LessEqualOp,
-														binary(
-															AddOp,
-															variable("__split_fill_pos", INT_TYPE),
-															variable("__split_dlen", INT_TYPE),
-															INT_TYPE,
-														),
-														variable("__split_slen", INT_TYPE),
-														BOOL_TYPE,
+												sequence(
+													split_single_byte_fill_loop(
+														source,
+														delimiter,
+														return_type,
 													),
+													while_loop(
+														logical(
+															AndOp,
+															binary(
+																NotEqualOp,
+																variable("__split_dlen", INT_TYPE),
+																int_literal(1),
+																BOOL_TYPE,
+															),
+															split_delimiter_fits(
+																variable(
+																	"__split_fill_pos",
+																	INT_TYPE,
+																),
+															),
+														),
 													if_expr(
 														compare_needle_at(
 															source,
@@ -1407,6 +1681,7 @@ private pure func synthesize_split(
 														),
 														VoidType,
 													),
+												),
 												),
 												let_expr(
 													"__split_final_len",

@@ -43,6 +43,11 @@ type prepared_typed_program = {
 type backend_core_input = { blorp_tail_input : Core.core_program }
 (** Core after the OCaml semantic-middle passes and before Blorp-owned DCE. *)
 
+val project_semantic_middle_program : Core.core_program -> Core.core_program
+(** Remove generic monomorphization templates before semantic-middle passes,
+    retaining the generic [Option]/[Result] declarations required by the runtime
+    erased-payload ABI. *)
+
 val prepare_typed_with_module_inputs :
   ?main_import_bindings:Session.import_binding list ->
   ?main_module_name:string ->

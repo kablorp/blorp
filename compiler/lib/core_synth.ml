@@ -5,7 +5,7 @@
     [Core_intrinsics.synthesize_body] to generate IR bodies.
 
     Only targets functions where:
-    - [cf_kind = CFBuiltin] (was builtin with no pre-mono body)
+    - [cf_kind = CFUnresolvedBuiltin] (was builtin with no pre-mono body)
     - [cf_body = None] (synthesis failed pre-mono due to generic types)
     - [cf_type_params = []] (mono has resolved all type params)
 
@@ -66,7 +66,7 @@ let source_name_for_synthesis (f : core_func) : string =
     not applicable. *)
 let try_synthesize ~(reg : Codegen_types.registry) (f : core_func) : core_func =
   if
-    (not (is_builtin_kind f.cf_kind))
+    (not (is_unresolved_builtin_kind f.cf_kind))
     || f.cf_body <> None || f.cf_type_params <> []
   then f
   else

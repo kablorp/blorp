@@ -1,4 +1,21 @@
 import:
+	../src/stage_09_core/compiler_core_json:
+		CoreDecl(
+			FunctionDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, TypeParameterType, VoidType),
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
@@ -23,6 +40,7 @@ import:
 		decode_semantic_middle_response_value,
 		parse_semantic_middle_capability,
 		parse_semantic_middle_stage,
+		project_semantic_middle_program,
 		semantic_middle_capability_name,
 		semantic_middle_request_to_json,
 		semantic_middle_stage_name,
@@ -72,6 +90,152 @@ pure func sample_request() -> SemanticMiddleRequest:
 		observations = [MatchMiddleStage, FusionMiddleStage],
 		stop_after = Some(MatchMiddleStage)
 	}
+
+
+pure func boundary_function(
+	name: String,
+	type_params: List[String],
+	has_body: Bool,
+) -> CoreFunction:
+	body: Option[CoreExpr] = if has_body:
+		Some(VoidExpr(VoidType, SyntheticSourceLoc))
+	else:
+		None
+
+	function_kind: CoreFunctionKind = if has_body:
+		UserFunction
+	else:
+		UnresolvedBuiltinFunction
+
+	{
+		name = name,
+		source_module = None,
+		type_params = type_params,
+		params = [],
+		return_type = VoidType,
+		body = body,
+		is_pure = True,
+		function_kind = function_kind,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func boundary_union(name: String, type_params: List[String]) -> CoreDecl:
+	payload_storage: CoreUnionPayloadStorage = if type_params.is_empty():
+		TypedUnionPayloadStorage
+	else:
+		ErasedUnionPayloadStorage
+
+	UnionDecl({
+		name = name,
+		type_params = type_params,
+		payload_storage = payload_storage,
+		variants = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func boundary_decl_name(decl: CoreDecl) -> String:
+	match decl:
+		FunctionDecl(function_info):
+			"function:${function_info.name}"
+		UnionDecl(union_decl):
+			"union:${union_decl.name}"
+		ValueRecordDecl(record_decl):
+			"value_record:${record_decl.name}"
+		HeapRecordDecl(record_decl):
+			"heap_record:${record_decl.name}"
+		TypeAliasDecl(alias_decl):
+			"alias:${alias_decl.name}"
+		TraitDecl(trait_decl):
+			"trait:${trait_decl.name}"
+		ImplDecl(impl_decl):
+			"impl:${impl_decl.trait_name}"
+		_:
+			"other"
+
+
+pure func test_projects_only_semantic_middle_runtime_declarations() -> Bool:
+	t: CoreType = TypeParameterType("T")
+	source: CoreProgram = {
+		decls = [
+			FunctionDecl(boundary_function("generic", ["T"], True)),
+			FunctionDecl(boundary_function("main", [], True)),
+			FunctionDecl(boundary_function("deferred", [], False)),
+			boundary_union("Container", ["T"]),
+			boundary_union("std_channel__RecvAttempt", ["T"]),
+			boundary_union("Option", ["T"]),
+			boundary_union(
+				"Result",
+				["T", "E"],
+			),
+			boundary_union("Container__mono_Int", []),
+			ValueRecordDecl({
+				name = "Box",
+				type_params = ["T"],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			HeapRecordDecl({
+				name = "Node",
+				type_params = ["T"],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			TypeAliasDecl({
+				name = "Alias",
+				type_params = ["T"],
+				target = t,
+				is_opaque = False,
+				loc = SyntheticSourceLoc,
+			}),
+			TraitDecl({
+				name = "Display",
+				type_params = [],
+				supertraits = [],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			}),
+			ImplDecl({
+				trait_name = "GenericDisplay",
+				for_type = t,
+				type_params = [
+					{
+						name = "T",
+						bounds = []
+					},
+				],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			}),
+			ImplDecl({
+				trait_name = "Display",
+				for_type = NamedType("Int", []),
+				type_params = [],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = ["runtime.h"]
+	}
+	projected: CoreProgram = project_semantic_middle_program(source)
+
+	(
+		projected.decls.map(
+			boundary_decl_name,
+		) == [
+			"function:main",
+			"function:deferred",
+			"union:Option",
+			"union:Result",
+			"union:Container__mono_Int",
+			"alias:Alias",
+			"trait:Display",
+			"impl:Display",
+		]
+		and projected.foreign_includes == ["runtime.h"]
+	)
 
 
 pure func field_string_is(value: JsonValue, name: String, expected: String) -> Bool:
@@ -362,6 +526,10 @@ tests: TestSuite = {
 	tests = [
 		("stage names round trip", test_stage_names_round_trip),
 		("capability names round trip", test_capability_names_round_trip),
+		(
+			"projects only semantic-middle runtime declarations",
+			test_projects_only_semantic_middle_runtime_declarations,
+		),
 		("request JSON is phase specific", test_request_json_is_phase_specific),
 		("decode compiled response", test_decode_compiled_response),
 		("reject malformed Core response", test_rejects_malformed_core_response),

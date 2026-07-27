@@ -4,8 +4,9 @@
 -- and promotes a successfully synthesized builtin to an ordinary user
 -- function, keeping the stage transition explicit and testable.
 import:
+	../stage_08_core_lower/compiler_core_identity: core_module_member_name
 	compiler_core_json:
-		CoreDecl(FunctionDecl),
+		CoreDecl(FunctionDecl, ImplDecl),
 		CoreExpr,
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
@@ -75,6 +76,54 @@ private pure func synthesize_function(
 			Ok(function_info)
 
 
+private pure func qualify_impl_method_for_synthesis(
+	function_info: CoreFunction,
+) -> CoreFunction:
+	match function_info.source_module:
+		Some(module_name):
+			prefix: String = core_module_member_name(module_name, "")
+
+			if function_info.name.starts_with(prefix):
+				function_info
+			else:
+				{ function_info |
+					name = core_module_member_name(module_name, function_info.name)
+				}
+		None:
+			function_info
+
+
+private pure func synthesize_impl_method(
+	context: CoreSynthContext,
+	function_info: CoreFunction,
+) -> Result[CoreFunction, CoreSynthError]:
+	candidate: CoreFunction = qualify_impl_method_for_synthesis(function_info)
+	synthesized ?= synthesize_function(context, candidate)
+	Ok({ synthesized | name = function_info.name })
+
+
+private pure func synthesize_impl_methods(
+	context: CoreSynthContext,
+	methods: List[CoreFunction],
+) -> Result[List[CoreFunction], CoreSynthError]:
+	var synthesized_methods: List[CoreFunction] = []
+	var failure: Option[CoreSynthError] = None
+
+	for method in methods:
+		match synthesize_impl_method(context, method):
+			Ok(synthesized):
+				synthesized_methods = synthesized_methods.append(synthesized)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(synthesized_methods)
+
+
 private pure func synthesize_decl(
 	context: CoreSynthContext,
 	decl: CoreDecl,
@@ -83,6 +132,9 @@ private pure func synthesize_decl(
 		FunctionDecl(function_info):
 			synthesized ?= synthesize_function(context, function_info)
 			Ok(FunctionDecl(synthesized))
+		ImplDecl(impl_info):
+			methods ?= synthesize_impl_methods(context, impl_info.methods)
+			Ok(ImplDecl({ impl_info | methods = methods }))
 		_:
 			Ok(decl)
 

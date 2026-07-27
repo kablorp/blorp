@@ -26,6 +26,7 @@ type request = {
   target_module : string;
   core : Core.core_program;
   foreign_includes : string list;
+  union_payload_storage : (string * Codegen_types.union_payload_storage) list;
   next_def_id : int;
   import_bindings : Session.import_binding list;
   module_imports : (string * Session.import_binding list) list;
@@ -258,6 +259,7 @@ let decode_request value =
             target_module;
             core = decoded.core;
             foreign_includes = decoded.foreign_includes;
+            union_payload_storage = decoded.union_payload_storage;
             next_def_id;
             import_bindings;
             module_imports;
@@ -325,7 +327,9 @@ let run_request_in_session request =
     in
     try
       let reg = Codegen_types.create_registry () in
-      Core_registry.register_types reg request.core;
+      Core_registry.register_types
+        ~union_payload_storage_overrides:request.union_payload_storage reg
+        request.core;
       let import_aliases, module_imports =
         Core_imports.tables_of_bindings
           ~main_import_bindings:request.import_bindings request.module_imports

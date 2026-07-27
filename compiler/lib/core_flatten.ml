@@ -228,8 +228,9 @@ let rewrite_main_imported_type_names_from_bindings
     to match. After this, the IR has a flat namespace with globally
     unique names — no downstream pass needs module awareness.
 
-    Skips for value-level names: builtin and foreign functions (anything
-    other than [CFUser]), and UFCS-mangled names (already encode module).
+    Skips for value-level names: resolved builtin and foreign functions, and
+    UFCS-mangled names (already encode module). Source builtin declarations
+    awaiting synthesis remain module-owned callables and must be flattened.
     Std primitive/prelude ABI type names stay stable; all other std-local type
     declarations are flattened like user module types to avoid same-name layout
     collisions. *)
@@ -246,6 +247,45 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
     | Some _ -> true
     | None -> false
   in
+  let is_module_user_callable (f : Core.core_func) =
+    match f.cf_kind with
+    | Core.CFUser -> true
+    | Core.CFUnresolvedBuiltin -> true
+    | Core.CFBuiltin | Core.CFForeign _ -> false
+  in
+  let has_callable_implementation (f : Core.core_func) =
+    f.cf_body <> None || Core.is_unresolved_builtin_kind f.cf_kind
+  in
+  let rec functions_in_decl (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc func -> [ func ]
+    | Core.CDPrivate inner -> functions_in_decl inner
+    | _ -> []
+  in
+  let functions = List.concat_map functions_in_decl decls in
+  let unresolved_builtin_names = Hashtbl.create 16 in
+  List.iter
+    (fun (func : Core.core_func) ->
+      if Core.is_unresolved_builtin_kind func.cf_kind then
+        Hashtbl.replace unresolved_builtin_names func.cf_name ())
+    functions;
+  let rec materialize_builtin_overload (decl : Core.core_decl) =
+    let cd_desc =
+      match decl.cd_desc with
+      | Core.CDFunc
+          ({ cf_kind = Core.CFUser; cf_body = None; cf_name; _ } as func)
+        when Hashtbl.mem unresolved_builtin_names cf_name ->
+          (* A bodyless declaration paired with source [builtin(...)] is a
+             distinct purity overload of that implementation. Preserve its
+             selected callable id and signature through specialization. *)
+          Core.CDFunc { func with cf_kind = Core.CFUnresolvedBuiltin }
+      | Core.CDPrivate inner ->
+          Core.CDPrivate (materialize_builtin_overload inner)
+      | other -> other
+    in
+    { decl with cd_desc }
+  in
+  let decls = List.map materialize_builtin_overload decls in
   let prefixed_type_name name = prefix ^ "__" ^ name in
   let rewrite_declared_type_name name =
     if Hashtbl.mem local_type_names name then prefixed_type_name name else name
@@ -342,8 +382,8 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
   let rec scan_purity d =
     match d.Core.cd_desc with
     | Core.CDFunc f
-      when f.cf_body <> None
-           && (not (Core.is_builtin_kind f.cf_kind))
+      when has_callable_implementation f
+           && is_module_user_callable f
            && not (should_skip f.cf_name) ->
         let has_pure, has_impure =
           match Hashtbl.find_opt purity_overloads f.cf_name with
@@ -373,8 +413,8 @@ let prefix_module_names ?(import_bindings = []) ?(module_programs = [])
   let rec collect_names d =
     match d.Core.cd_desc with
     | Core.CDFunc f
-      when f.cf_body <> None
-           && (not (Core.is_builtin_kind f.cf_kind))
+      when has_callable_implementation f
+           && is_module_user_callable f
            && not (should_skip f.cf_name) ->
         let src = disambiguate_source f in
         Hashtbl.replace defined src (prefix ^ "__" ^ src)

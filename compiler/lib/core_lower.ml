@@ -2275,7 +2275,7 @@ and lower_func_with_return_ty ?typed_body ?callable_id
           | FuncBuiltinBody _ -> true
           | FuncBodyExpr _ | FuncForeign _ | FuncNoBody -> false
         in
-        if source_is_builtin && has_no_body then CFBuiltin else CFUser
+        if source_is_builtin && has_no_body then CFUnresolvedBuiltin else CFUser
   in
   let cf_def_id =
     match callable_id with

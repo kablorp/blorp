@@ -12,6 +12,7 @@ type decode_error = { path : string; message : string }
 type decoded_program = {
   core : Core.core_program;
   foreign_includes : string list;
+  union_payload_storage : (string * Codegen_types.union_payload_storage) list;
 }
 
 let ( let* ) = Result.bind
@@ -989,7 +990,8 @@ let decode_function_kind path value =
   let* tag = kind path value in
   match tag with
   | "user" -> Ok Core.CFUser
-  | "unresolved_builtin" | "builtin" -> Ok Core.CFBuiltin
+  | "unresolved_builtin" -> Ok Core.CFUnresolvedBuiltin
+  | "builtin" -> Ok Core.CFBuiltin
   | "foreign" ->
       let* c_name = string_field path "c_name" value in
       let* includes = string_list_field path "includes" value in
@@ -1164,13 +1166,40 @@ and decode_impl_decl path value loc =
   let ci_methods = List.map add_impl_type_params ci_methods in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }
 
+let rec decode_union_payload_storage path index = function
+  | [] -> Ok []
+  | value :: rest ->
+      let decl_path = path_index path index in
+      let* tag = kind decl_path value in
+      let* current =
+        if tag = "union" then
+          let* name = string_field decl_path "name" value in
+          let* storage = string_field decl_path "payload_storage" value in
+          match storage with
+          | "typed" -> Ok [ (name, Codegen_types.TypedUnionPayloadStorage) ]
+          | "erased" ->
+              Ok [ (name, Codegen_types.ErasedUnionPayloadStorage) ]
+          | _ ->
+              error (path_field decl_path "payload_storage")
+                ("unsupported union payload storage `" ^ storage ^ "`")
+        else Ok []
+      in
+      let* remaining =
+        decode_union_payload_storage path (index + 1) rest
+      in
+      Ok (current @ remaining)
+
 let decode_program value =
   let path = "program" in
   let* tag = kind path value in
   if tag <> "program" then error (path_field path "kind") "expected Core program"
   else
-    let* core = list_field decode_decl path "decls" value in
+    let* decls = array_field path "decls" value in
+    let* core = decode_list decode_decl (path_field path "decls") 0 decls in
+    let* union_payload_storage =
+      decode_union_payload_storage (path_field path "decls") 0 decls
+    in
     let* foreign_includes = string_list_field path "foreign_includes" value in
-    Ok { core; foreign_includes }
+    Ok { core; foreign_includes; union_payload_storage }
 
 let decode_error_to_string error = error.path ^ ": " ^ error.message

@@ -166,11 +166,11 @@ import:
 		CompilerValueSlot,
 		compiler_widening_reasons_equal,
 	../src/stage_06_typecheck/compiler_infer:
-		CompilerCallableOrigin(CompilerCallableImported),
+		CompilerCallableOrigin(CompilerCallableBuiltin, CompilerCallableImported),
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
 		CompilerInferResult,
-		CompilerResolvedCallTarget(CompilerResolvedDirectCall),
+		CompilerResolvedCallTarget(CompilerResolvedDirectCall, CompilerResolvedTraitMethodCall),
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
 			CompilerTypedBinaryExpr,
@@ -1281,11 +1281,11 @@ pure func state_with_source_parallel_and_builtin() -> CompilerTypecheckState:
 
 
 pure func compiler_type_outer_key() -> CompilerType:
-	CompilerNamedType("K", [])
+	CompilerTypeVar("K")
 
 
 pure func compiler_type_outer_value() -> CompilerType:
-	CompilerNamedType("V", [])
+	CompilerTypeVar("V")
 
 
 pure func compiler_type_outer_pair() -> CompilerType:
@@ -2144,6 +2144,47 @@ pure func state_with_builtin_matrix_binding() -> CompilerTypecheckState:
 	{ state | env = compiler_env_with_builtins(state.env) }
 
 
+pure func state_with_builtin_string_binding() -> CompilerTypecheckState:
+	state = add_infer_value(compiler_typecheck_state_empty(), "value", compiler_type_string())
+	{ state | env = compiler_env_with_builtins(state.env) }
+
+
+pure func state_with_bounded_stringable_binding() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	with_builtins = { state | env = compiler_env_with_builtins(state.env) }
+	with_bound = { with_builtins |
+		env = compiler_env_set_type_param_bounds(
+			with_builtins.env,
+			[compiler_make_bound_type_param("T", ["Stringable"])],
+		)
+	}
+	add_infer_value(with_bound, "generic_value", CompilerTypeVar("T"))
+
+
+pure func resolved_call_targets_trait(result: CompilerInferResult, expected_trait: String) -> Bool:
+	match compiler_typed_expr_resolved_call(result.expr):
+		Some(info):
+			match info.target:
+				CompilerResolvedTraitMethodCall(trait_name, _):
+					trait_name == expected_trait
+				_:
+					False
+		None:
+			False
+
+
+pure func resolved_call_targets_builtin(result: CompilerInferResult) -> Bool:
+	match compiler_typed_expr_resolved_call(result.expr):
+		Some(info):
+			match info.target:
+				CompilerResolvedDirectCall(_, CompilerCallableBuiltin):
+					True
+				_:
+					False
+		None:
+			False
+
+
 func test_int_literal_expected_argument_slot_preserves_semantic_type() -> Bool:
 	ctx = compiler_infer_with_expected_value_slot(
 		compiler_infer_context(compiler_typecheck_state_empty()),
@@ -2370,6 +2411,28 @@ func test_bare_length_dispatches_to_tensor_has_length() -> Bool:
 			CompilerConstIntType(3),
 		)
 	)
+
+
+func test_bare_to_string_uses_builtin_dispatch_for_string() -> Bool:
+	state = state_with_builtin_string_binding()
+	result = compiler_infer_expr(
+		compiler_infer_context(state),
+		call_expr(ParsedNameExpr(ident("to_string")), [ParsedNameExpr(ident("value"))]),
+	)
+
+	result.context.state.errors.length() == 0 and resolved_call_targets_builtin(result)
+
+
+func test_ufcs_to_string_uses_trait_dispatch_for_bounded_generic() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_bounded_stringable_binding()),
+		call_expr(
+			field_access_expr(ParsedNameExpr(ident("generic_value")), "to_string"),
+			[],
+		),
+	)
+
+	result.context.state.errors.length() == 0 and resolved_call_targets_trait(result, "Stringable")
 
 
 func test_matrix_builtin_binds_literal_dimensions() -> Bool:
@@ -3829,7 +3892,7 @@ func test_constructor_identifier_uses_expected_parent_type() -> Bool:
 
 
 func test_constructor_identifier_uses_generic_expected_parent_type() -> Bool:
-	expected = CompilerNamedType("Option", [CompilerNamedType("T", [])])
+	expected = CompilerNamedType("Option", [CompilerTypeVar("T")])
 	result = compiler_infer_expr(
 		compiler_infer_with_expected(
 			compiler_infer_context(state_with_generic_option_type_param()),
@@ -10274,6 +10337,14 @@ tests: TestSuite = {
 		(
 			"bare length dispatches to tensor HasLength",
 			test_bare_length_dispatches_to_tensor_has_length,
+		),
+		(
+			"bare to_string uses builtin dispatch for String",
+			test_bare_to_string_uses_builtin_dispatch_for_string,
+		),
+		(
+			"UFCS to_string uses trait dispatch for bounded generic",
+			test_ufcs_to_string_uses_trait_dispatch_for_bounded_generic,
 		),
 		(
 			"explicit import wins constructor name collision",

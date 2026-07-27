@@ -96,6 +96,113 @@ pure func identity[T](value: T) -> T:
           Alcotest.fail
             "declared type parameters must cross the Core boundary as TyVar")
 
+let test_projects_only_semantic_middle_runtime_declarations () =
+  Test_helpers.with_isolated_env (fun () ->
+      let typed_ast =
+        Test_helpers.expect_ok_typed
+          {|
+union Container[T]:
+	Value(T)
+	Empty
+
+record Box[T] {value: T}
+
+type alias Wrapped[T] = List[T]
+
+pure func identity[T](value: T) -> T:
+	value
+
+pure func concrete(value: Int) -> Int:
+	value
+|}
+      in
+      let typed = Test_helpers.expect_valid_typed_program typed_ast in
+      let lowered = Blorp.Core_lower.lower_typed_program typed in
+      let container =
+        List.find_map
+          (fun declaration ->
+            match declaration.cd_desc with
+            | CDType type_decl when type_decl.type_name = "Container" ->
+                Some type_decl
+            | _ -> None)
+          lowered
+      in
+      let concrete =
+        List.find_map
+          (fun declaration ->
+            match declaration.cd_desc with
+            | CDFunc func when func.cf_name = "concrete" -> Some func
+            | _ -> None)
+          lowered
+      in
+      match (container, concrete) with
+      | Some container, Some concrete ->
+          let option_decl =
+            decl (CDType { container with type_name = "Option" })
+          in
+          let bodyless_decl =
+            decl
+              (CDFunc
+                 {
+                   concrete with
+                   cf_name = "deferred";
+                   cf_body = None;
+                   cf_def_id = concrete.cf_def_id + 1;
+                 })
+          in
+          let projected =
+            Blorp.Core_pipeline.project_semantic_middle_program
+              (option_decl :: bodyless_decl :: lowered)
+          in
+          let has_function name =
+            List.exists
+              (fun declaration ->
+                match declaration.cd_desc with
+                | CDFunc func -> func.cf_name = name
+                | _ -> false)
+              projected
+          in
+          let has_type name =
+            List.exists
+              (fun declaration ->
+                match declaration.cd_desc with
+                | CDType type_decl -> type_decl.type_name = name
+                | _ -> false)
+              projected
+          in
+          let has_record name =
+            List.exists
+              (fun declaration ->
+                match declaration.cd_desc with
+                | CDRecord record_decl -> record_decl.record_name = name
+                | _ -> false)
+              projected
+          in
+          let has_alias name =
+            List.exists
+              (fun declaration ->
+                match declaration.cd_desc with
+                | CDTypeAlias alias_decl -> alias_decl.alias_name = name
+                | _ -> false)
+              projected
+          in
+          Alcotest.(check bool)
+            "generic function is removed" false (has_function "identity");
+          Alcotest.(check bool)
+            "concrete function is retained" true (has_function "concrete");
+          Alcotest.(check bool)
+            "bodyless monomorphic declaration is retained" true
+            (has_function "deferred");
+          Alcotest.(check bool)
+            "generic user union is removed" false (has_type "Container");
+          Alcotest.(check bool)
+            "generic runtime ABI union is retained" true (has_type "Option");
+          Alcotest.(check bool)
+            "generic record template is removed" false (has_record "Box");
+          Alcotest.(check bool)
+            "generic alias metadata is retained" true (has_alias "Wrapped")
+      | _ -> Alcotest.fail "expected lowered generic and concrete declarations")
+
 let test_prefixes_module_owned_type () =
   let record =
     {
@@ -115,6 +222,90 @@ let test_prefixes_module_owned_type () =
         "record identity includes module owner" "pkg_widgets__Widget"
         rewritten.record_name
   | _ -> Alcotest.fail "expected one rewritten record declaration"
+
+let test_prefixes_module_owned_unresolved_builtin () =
+  let function_decl =
+    {
+      cf_name = "fold_left";
+      cf_module = Some "std/list";
+      cf_type_params = [ Blorp.Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "self";
+            cp_ty = ty "List" [ TyVar "T" ];
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_body = None;
+      cf_is_pure = true;
+      cf_kind = CFUnresolvedBuiltin;
+      cf_def_id = 41;
+    }
+  in
+  match
+    Blorp.Core_flatten.prefix_module_names "std/list"
+      [ decl (CDFunc function_decl) ]
+  with
+  | [ { cd_desc = CDFunc rewritten; _ } ] ->
+      Alcotest.(check string)
+        "source builtin keeps its module-owned identity" "std_list__fold_left"
+        rewritten.cf_name
+  | _ -> Alcotest.fail "expected one rewritten builtin declaration"
+
+let test_preserves_forward_builtin_purity_overload () =
+  let function_decl ~def_id ~is_pure ~kind =
+    {
+      cf_name = "fold_right";
+      cf_module = Some "std/list";
+      cf_type_params = [ Blorp.Ast.make_type_param "T" [] ];
+      cf_params =
+        [
+          {
+            cp_name = Var.named "self";
+            cp_ty = ty "List" [ TyVar "T" ];
+            cp_loc = loc;
+          };
+        ];
+      cf_return_ty = TyVar "T";
+      cf_body = None;
+      cf_is_pure = is_pure;
+      cf_kind = kind;
+      cf_def_id = def_id;
+    }
+  in
+  match
+    Blorp.Core_flatten.prefix_module_names "std/list"
+      [
+        decl
+          (CDFunc
+             (function_decl ~def_id:41 ~is_pure:false ~kind:CFUser));
+        decl
+          (CDFunc
+             (function_decl ~def_id:42 ~is_pure:true
+                ~kind:CFUnresolvedBuiltin));
+      ]
+  with
+  | [
+   { cd_desc = CDFunc impure; _ };
+   { cd_desc = CDFunc pure; _ };
+  ] ->
+      Alcotest.(check string)
+        "impure overload keeps primary name" "std_list__fold_right"
+        impure.cf_name;
+      Alcotest.(check bool)
+        "forward overload becomes unresolved builtin" true
+        (impure.cf_kind = CFUnresolvedBuiltin);
+      Alcotest.(check int) "forward overload keeps id" 41 impure.cf_def_id;
+      Alcotest.(check string)
+        "pure overload remains distinct" "std_list__fold_right__pure"
+        pure.cf_name;
+      Alcotest.(check bool)
+        "pure overload remains unresolved builtin" true
+        (pure.cf_kind = CFUnresolvedBuiltin);
+      Alcotest.(check int) "pure overload keeps id" 42 pure.cf_def_id
+  | _ -> Alcotest.fail "expected both builtin purity overloads"
 
 let import_binding ?original_name local_name module_path :
     Blorp.Session.import_binding =
@@ -263,8 +454,14 @@ let suite =
           test_lowers_typed_source;
         Alcotest.test_case "lowers declared type parameters as explicit vars"
           `Quick test_lowers_declared_type_parameters_as_explicit_vars;
+        Alcotest.test_case "projects semantic middle runtime declarations"
+          `Quick test_projects_only_semantic_middle_runtime_declarations;
         Alcotest.test_case "prefixes module-owned type" `Quick
           test_prefixes_module_owned_type;
+        Alcotest.test_case "prefixes module-owned unresolved builtin" `Quick
+          test_prefixes_module_owned_unresolved_builtin;
+        Alcotest.test_case "preserves forward builtin purity overload" `Quick
+          test_preserves_forward_builtin_purity_overload;
         Alcotest.test_case "builds explicit import tables" `Quick
           test_builds_import_tables_from_explicit_bindings;
         Alcotest.test_case "attaches default foreign argument policies" `Quick

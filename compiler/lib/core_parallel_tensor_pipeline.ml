@@ -321,7 +321,11 @@ let plan_of_vector_parallel calls source body result_ty loc =
     when dims_equal dim result_dim -> (
       match lam.lam_params with
       | [ (chunk_var, chunk_ty) ] -> (
-          match parallel_vector_elem_dim chunk_ty with
+          match
+            match parallel_vector_elem_dim chunk_ty with
+            | Some dimensions -> Some dimensions
+            | None -> vector_elem_dim chunk_ty
+          with
           | Some (_, chunk_dim) when parallel_dim_matches dim chunk_dim -> (
               match stages_of_expr calls chunk_var dim lam.lam_body with
               | Some (_ :: _ as stages) ->
@@ -348,7 +352,11 @@ let plan_of_matrix_parallel calls source body result_ty loc =
     when dims_equal rows result_rows && dims_equal cols result_cols -> (
       match lam.lam_params with
       | [ (chunk_var, chunk_ty) ] -> (
-          match parallel_matrix_elem_dims chunk_ty with
+          match
+            match parallel_matrix_elem_dims chunk_ty with
+            | Some dimensions -> Some dimensions
+            | None -> matrix_elem_dims chunk_ty
+          with
           | Some (_, chunk_rows, chunk_cols)
             when parallel_dim_matches rows chunk_rows
                  && parallel_dim_matches cols chunk_cols -> (

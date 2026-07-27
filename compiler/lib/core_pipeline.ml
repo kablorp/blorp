@@ -158,6 +158,41 @@ type backend_core_input = {
           Perceus, reuse, closure, resource/fairness, prepare, and emission. *)
 }
 
+(** Monomorphization retains generic templates so its function, impl, and data
+    worklists can reach a fixpoint. The semantic middle operates on the
+    resulting concrete runtime program, not those templates. [Option] and
+    [Result] are the only generic declarations that cross this boundary because
+    their erased payload layout is part of the runtime ABI. *)
+let project_semantic_middle_program (program : Core.core_program) :
+    Core.core_program =
+  let is_runtime_abi_union (type_decl : Ast.type_decl) =
+    type_decl.type_params <> []
+    && (String.equal type_decl.type_name "Option"
+       || String.equal type_decl.type_name "Result")
+  in
+  let impl_is_generic (impl : Core.core_impl) =
+    Codegen_types.has_type_vars impl.ci_for_type
+    || List.exists
+         (fun (method_func : Core.core_func) ->
+           method_func.cf_type_params <> [])
+         impl.ci_methods
+  in
+  let rec project_decl (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc func when func.cf_type_params <> [] -> None
+    | Core.CDType type_decl
+      when type_decl.type_params <> [] && not (is_runtime_abi_union type_decl) ->
+        None
+    | Core.CDRecord record_decl when record_decl.record_type_params <> [] -> None
+    | Core.CDImpl impl when impl_is_generic impl -> None
+    | Core.CDPrivate inner ->
+        Option.map
+          (fun projected -> { decl with cd_desc = Core.CDPrivate projected })
+          (project_decl inner)
+    | _ -> Some decl
+  in
+  List.filter_map project_decl program
+
 (** Run C emission through the single Blorp backend path. Normal compilation
     hands off after specialization so Blorp owns DCE, consume specialization,
     Perceus, and the complete backend tail. Late-stage CLI observation uses
@@ -190,6 +225,7 @@ let run_core_passes_from_post_synth ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
     (prog : Core.core_program) : backend_core_input =
+  let prog = project_semantic_middle_program prog in
   let observe stage prog =
     on_stage_event stage;
     on_stage stage prog;
@@ -237,6 +273,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
         p
         |> Core_mono.monomorphize_program ~reg ~import_aliases ~module_imports
         |> Core_list_layout.annotate_program ~reg)
+    |> project_semantic_middle_program
     |> run_stage Core_stage.Synth (Core_synth.synthesize_program ~reg)
   in
   run_core_passes_from_post_synth ~import_aliases ~module_imports ~on_stage

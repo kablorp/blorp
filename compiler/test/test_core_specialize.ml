@@ -842,6 +842,68 @@ let test_generic_cbox_waits_for_concrete_inner () =
       Alcotest.fail
         "unresolved generic CBox should not become a borrowed cast"
 
+let test_stack_result_erased_storage_metadata_is_canonicalized () =
+  let result_ty = TyNamed ("Result", [ ty_int; ty_string ]) in
+  let value = cvar "result" result_ty in
+  let boxed_value =
+    {
+      bsv_box =
+        {
+          box_value = value;
+          box_source_ty = result_ty;
+          box_kind = BoxPointer;
+        };
+      bsv_needs_release = false;
+      bsv_transfers_ownership = false;
+    }
+  in
+  let list_ty = TyNamed ("List", [ result_ty ]) in
+  let list_layout =
+    list_pointer_storage ~elem_ty:result_ty
+      ~value_layout:ListElementPointer ~policy:StoragePolicyManagedPointer ()
+  in
+  let list =
+    mk
+      (CListConstruct
+         {
+           lc_layout = list_layout;
+           lc_elems = [ boxed_value ];
+           lc_elem_needs_release = true;
+         })
+      list_ty
+  in
+  let unbox =
+    mk
+      (CUnboxTyped
+         {
+           unbox_value = cvar "raw" ty_ptr;
+           unbox_target_ty = result_ty;
+           unbox_kind = UnboxPointer;
+         })
+      result_ty
+  in
+  (match (specialize list).desc with
+  | CListConstruct
+      {
+        lc_elems =
+          [
+            {
+              bsv_box = { box_kind = BoxStruct "blorp_StackResult"; _ };
+              bsv_needs_release = true;
+              _;
+            };
+          ];
+        _;
+      } ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "stack Result list element should use canonical struct boxing");
+  match (specialize unbox).desc with
+  | CUnboxTyped { unbox_kind = UnboxStruct "blorp_StackResult"; _ } -> ()
+  | _ ->
+      Alcotest.fail "stack Result read should use canonical struct unboxing"
+
 let test_tensor_peel_nonconstant_dims_raise_core_error () =
   let coll =
     cvar "m" (TyNamed ("Tensor", [ ty_int; TyConstInt 2; TyVar "#N" ]))
@@ -1125,6 +1187,9 @@ let suite =
           test_stale_generic_cbox_rewrites_pointer_inner;
         Alcotest.test_case "generic_cbox_waits_for_concrete_inner" `Quick
           test_generic_cbox_waits_for_concrete_inner;
+        Alcotest.test_case
+          "stack_result_erased_storage_metadata_is_canonicalized" `Quick
+          test_stack_result_erased_storage_metadata_is_canonicalized;
         Alcotest.test_case "tensor_peel_nonconstant_dims_raise_core_error"
           `Quick test_tensor_peel_nonconstant_dims_raise_core_error;
         Alcotest.test_case "tensor_peel_raw_call_keeps_pointer_type" `Quick

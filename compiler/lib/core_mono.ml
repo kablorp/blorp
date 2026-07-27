@@ -318,14 +318,19 @@ let rec apply_subst (subst : mono_subst) (ty : Ast.type_expr) : Ast.type_expr =
 
 (** A specialization must close its own callable contract. Its body can still
     contain generic function-reference types; those calls are specialized when
-    [rewrite_func] visits them and are not parameters of [func]. *)
+    [rewrite_func] visits them and are not parameters of [func]. Existential
+    tensor dimensions that are not declared by the function, such as [#Ds...]
+    in a shape-erasing return type, remain valid runtime shape information. *)
 let subst_closes_function_signature (func : core_func) (subst : mono_subst) :
     bool =
   let apply = apply_subst subst in
+  let declared = type_param_decl_names func.cf_type_params in
+  let is_declared name = List.mem (type_param_name name) declared in
   let rec type_is_closed = function
-    | Ast.TyVar _ | Ast.TyBoundVar _ | Ast.TyMeta _ -> false
-    | Ast.TyVarDims "#_" -> true
-    | Ast.TyVarDims _ -> false
+    | Ast.TyVar name | Ast.TyNamed (name, []) -> not (is_declared name)
+    | Ast.TyBoundVar param -> not (is_declared param.param_name)
+    | Ast.TyMeta _ -> false
+    | Ast.TyVarDims name -> not (is_declared name)
     | Ast.TyNamed (_, args) -> List.for_all type_is_closed args
     | Ast.TyArray (elem, dims) ->
         type_is_closed elem && List.for_all type_is_closed dims
@@ -334,7 +339,7 @@ let subst_closes_function_signature (func : core_func) (subst : mono_subst) :
         List.for_all type_is_closed f.params && type_is_closed f.return
     | Ast.TyRange inner -> type_is_closed inner
     | Ast.TyDimOp (_, a, b) -> type_is_closed a && type_is_closed b
-    | Ast.TySelf -> false
+    | Ast.TySelf -> not (List.mem "Self" declared)
     | Ast.TyConstInt _ -> true
   in
   let substituted_type_is_closed ty = type_is_closed (apply ty) in
@@ -1065,10 +1070,37 @@ let register_concrete_union_type ?payload_storage (state : mono_state)
            ~reg:state.reg type_decl)
   end
 
-let concrete_type_args params args =
+let rec type_contains_parameter (parameters : string list)
+    (ty : Ast.type_expr) : bool =
+  let is_parameter name = List.mem (type_param_name name) parameters in
+  match ty with
+  | Ast.TyVar name | Ast.TyNamed (name, []) -> is_parameter name
+  | Ast.TyBoundVar param -> is_parameter param.param_name
+  | Ast.TyVarDims name -> is_parameter name
+  | Ast.TyNamed (_, args) -> List.exists (type_contains_parameter parameters) args
+  | Ast.TyArray (elem, dims) ->
+      type_contains_parameter parameters elem
+      || List.exists (type_contains_parameter parameters) dims
+  | Ast.TyTuple elems -> List.exists (type_contains_parameter parameters) elems
+  | Ast.TyFunc func ->
+      List.exists (type_contains_parameter parameters) func.params
+      || type_contains_parameter parameters func.return
+  | Ast.TyRange inner -> type_contains_parameter parameters inner
+  | Ast.TyDimOp (_, a, b) ->
+      type_contains_parameter parameters a
+      || type_contains_parameter parameters b
+  | Ast.TySelf -> List.mem "Self" parameters
+  | Ast.TyMeta _ | Ast.TyConstInt _ -> false
+
+let concrete_type_args unresolved_parameters params args =
   List.length params = List.length args
   && args <> []
-  && List.for_all (fun arg -> not (Codegen_types.has_type_vars arg)) args
+  && List.for_all
+       (fun arg ->
+         not
+           (Codegen_types.has_type_vars arg
+           || type_contains_parameter unresolved_parameters arg))
+       args
 
 let type_param_subst params args =
   List.map2
@@ -1084,13 +1116,14 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
   in
   if not has_generic_data then prog
   else
-    let rec rewrite_type ty =
+    let rec rewrite_type unresolved_parameters ty =
       match Codegen_types.normalize_type ty with
       | Ast.TyNamed (name, args) -> (
-          let args = List.map rewrite_type args in
+          let args = List.map (rewrite_type unresolved_parameters) args in
           match Hashtbl.find_opt state.generic_records name with
           | Some record_decl
-            when concrete_type_args record_decl.record_type_params args -> (
+            when concrete_type_args unresolved_parameters
+                   record_decl.record_type_params args -> (
               match concrete_generic_data_name name args with
               | Some concrete_name ->
                   ensure_concrete_record record_decl concrete_name args;
@@ -1099,7 +1132,8 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
           | _ -> (
               match Hashtbl.find_opt state.generic_types name with
               | Some type_decl
-                when concrete_type_args type_decl.type_params args -> (
+                when concrete_type_args unresolved_parameters
+                       type_decl.type_params args -> (
                   match concrete_generic_data_name name args with
                   | Some concrete_name ->
                       ensure_concrete_type type_decl concrete_name args;
@@ -1107,18 +1141,25 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
                   | None -> Ast.TyNamed (name, args))
               | _ -> Ast.TyNamed (name, args)))
       | Ast.TyArray (elem, dims) ->
-          Ast.TyArray (rewrite_type elem, List.map rewrite_type dims)
+          Ast.TyArray
+            ( rewrite_type unresolved_parameters elem,
+              List.map (rewrite_type unresolved_parameters) dims )
       | Ast.TyFunc f ->
           Ast.TyFunc
             {
               f with
-              params = List.map rewrite_type f.params;
-              return = rewrite_type f.return;
+              params = List.map (rewrite_type unresolved_parameters) f.params;
+              return = rewrite_type unresolved_parameters f.return;
             }
-      | Ast.TyTuple elems -> Ast.TyTuple (List.map rewrite_type elems)
-      | Ast.TyRange inner -> Ast.TyRange (rewrite_type inner)
+      | Ast.TyTuple elems ->
+          Ast.TyTuple (List.map (rewrite_type unresolved_parameters) elems)
+      | Ast.TyRange inner ->
+          Ast.TyRange (rewrite_type unresolved_parameters inner)
       | Ast.TyDimOp (op, a, b) ->
-          Ast.TyDimOp (op, rewrite_type a, rewrite_type b)
+          Ast.TyDimOp
+            ( op,
+              rewrite_type unresolved_parameters a,
+              rewrite_type unresolved_parameters b )
       | other -> other
     and ensure_concrete_record record_decl concrete_name args =
       if Hashtbl.mem state.generated_record_names concrete_name then ()
@@ -1131,7 +1172,9 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
             (fun (field : Ast.field_decl) ->
               {
                 field with
-                field_type = rewrite_type (apply_subst subst field.field_type);
+                field_type =
+                  rewrite_type []
+                    (apply_subst subst field.field_type);
               })
             record_decl.record_fields
         in
@@ -1167,7 +1210,8 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
                 variant with
                 variant_fields =
                   List.map
-                    (fun field_ty -> rewrite_type (apply_subst subst field_ty))
+                    (fun field_ty ->
+                      rewrite_type [] (apply_subst subst field_ty))
                     variant.variant_fields;
                 variant_def_id = Some (Session.mint_def_id (Session.current ()));
               })
@@ -1198,7 +1242,38 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
           :: state.specialized_types
       end
     in
-    let rewritten = Core.map_types_in_program rewrite_type prog in
+    let rec rewrite_decl (decl : core_decl) =
+      match decl.cd_desc with
+      | CDPrivate inner ->
+          { decl with cd_desc = CDPrivate (rewrite_decl inner) }
+      | _ ->
+          let unresolved_parameters =
+            match decl.cd_desc with
+            | CDFunc func -> type_param_decl_names func.cf_type_params
+            | CDImpl impl ->
+                (* Core receives typechecked types, so only explicit type
+                   variables remain generic here. Treating every capitalized
+                   concrete name as a candidate (for example [String]) keeps
+                   specialized impl receivers in source form while the rest
+                   of the program moves to concrete data names. *)
+                Types.collect_type_vars impl.ci_for_type
+                @ List.concat_map
+                    (fun method_func ->
+                      type_param_decl_names method_func.cf_type_params)
+                    impl.ci_methods
+            | CDTrait trait -> trait.ct_type_params
+            | CDType type_decl -> type_param_decl_names type_decl.type_params
+            | CDRecord record_decl ->
+                type_param_decl_names record_decl.record_type_params
+            | CDTypeAlias alias_decl ->
+                type_param_decl_names alias_decl.alias_type_params
+            | CDVar _ | CDImport _ | CDPrivate _ -> []
+          in
+          Core.map_types_in_decl
+            (rewrite_type unresolved_parameters)
+            decl
+    in
+    let rewritten = List.map rewrite_decl prog in
     rewritten
     @ List.rev state.specialized_records
     @ List.rev state.specialized_types
@@ -1511,7 +1586,14 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
     | _ -> ());
     (match callee.desc with
     | CVar v when not (StringSet.mem v.vname scope) ->
-        enqueue_trait_call_dependencies state v.vname args
+        (* Imported/target-module trait calls carry their module owner in the
+           UFCS callee. Generic impls remain indexed by source method name. *)
+        let method_name =
+          match Codegen_names.parse_ufcs_name v.vname with
+          | Some (_, source_name) -> source_name
+          | None -> v.vname
+        in
+        enqueue_trait_call_dependencies state method_name args
     | _ -> ());
     match callee.desc with
     | CField (obj, field)

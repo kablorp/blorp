@@ -180,7 +180,7 @@ private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
 		UserFunction:
 			not is_core_ufcs_function_name(function_info.name)
 		UnresolvedBuiltinFunction:
-			False
+			True
 		BuiltinFunction(c_name):
 			False
 		ForeignFunction(_):
@@ -203,29 +203,6 @@ private pure func has_callable_implementation(function_info: CoreFunction) -> Bo
 				False
 
 
-private pure func has_user_callable_named(functions: List[CoreFunction], name: String) -> Bool:
-	functions.any(func(candidate):
-		candidate.name == name and is_module_user_callable(candidate)
-	)
-
-
-private pure func is_module_overload_callable(
-	functions: List[CoreFunction],
-	function_info: CoreFunction,
-) -> Bool:
-	if is_module_user_callable(function_info):
-		True
-	else:
-		match function_info.function_kind:
-			UnresolvedBuiltinFunction:
-				(
-					not is_core_ufcs_function_name(function_info.name)
-					and has_user_callable_named(functions, function_info.name)
-				)
-			_:
-				False
-
-
 private pure func has_callable_implementation_named(
 	functions: List[CoreFunction],
 	name: String,
@@ -235,7 +212,7 @@ private pure func has_callable_implementation_named(
 			candidate,
 		): (
 			candidate.name == name
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -248,7 +225,7 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and candidate.is_pure
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -258,7 +235,7 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and not candidate.is_pure
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -274,6 +251,64 @@ private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction
 			_:
 				None
 	)
+
+
+private pure func has_unresolved_builtin_named(
+	functions: List[CoreFunction],
+	name: String,
+) -> Bool:
+	functions.any(func(candidate):
+		if candidate.name != name:
+			False
+		else:
+			match candidate.function_kind:
+				UnresolvedBuiltinFunction:
+					True
+				_:
+					False
+	)
+
+
+private pure func materialize_builtin_overload(
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	match function_info.function_kind:
+		UserFunction:
+			if (
+				function_info.body.is_none()
+				and has_unresolved_builtin_named(functions, function_info.name)
+			):
+				-- A bodyless declaration paired with a source `builtin(...)`
+				-- declaration is another purity overload of that implementation.
+				-- Keep its distinct callable ID and signature so calls selected
+				-- during typechecking can be specialized without guessing.
+				{ function_info | function_kind = UnresolvedBuiltinFunction }
+			else:
+				function_info
+		_:
+			function_info
+
+
+private pure func materialize_builtin_overload_decl(
+	functions: List[CoreFunction],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(materialize_builtin_overload(functions, function_info))
+		_:
+			decl
+
+
+private pure func materialize_builtin_overloads(program: CoreProgram) -> CoreProgram:
+	functions: List[CoreFunction] = top_level_functions(program)
+
+	{ program |
+		decls = program.decls.map(
+			func(decl): materialize_builtin_overload_decl(functions, decl),
+		),
+	}
 
 
 private pure func callable_target_name(
@@ -297,7 +332,7 @@ private pure func callable_target_def_id(
 
 	for candidate in functions:
 		if (
-			is_module_overload_callable(functions, candidate)
+			is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 			and callable_target_name(module_name, functions, candidate) == target_name
 		):
@@ -315,7 +350,7 @@ private pure func collect_callable_rewrites(
 
 	functions.filter_map(func(function_info):
 		if (
-			is_module_overload_callable(functions, function_info)
+			is_module_user_callable(function_info)
 			and has_callable_implementation_named(functions, function_info.name)
 		):
 			Some({
@@ -1989,12 +2024,16 @@ private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]
 
 
 pure func prefix_module_names(module_name: String, program: CoreProgram) -> CoreProgram:
-	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(module_name, program)
-	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(module_name, program)
+	materialized_program: CoreProgram = materialize_builtin_overloads(program)
+	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(
+		module_name,
+		materialized_program,
+	)
+	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(module_name, materialized_program)
 	type_context: CoreTypeRewriteContext = {
-		rewrites = collect_local_type_rewrites(module_name, program),
+		rewrites = collect_local_type_rewrites(module_name, materialized_program),
 	}
-	named_decls: List[CoreDecl] = program.decls.map(
+	named_decls: List[CoreDecl] = materialized_program.decls.map(
 		func(decl): rewrite_decl(module_name, callable_rewrites, global_rewrites, decl),
 	)
 	rewritten_decls: List[CoreDecl] = named_decls.map(
@@ -2002,5 +2041,5 @@ pure func prefix_module_names(module_name: String, program: CoreProgram) -> Core
 	)
 	{
 		decls = deduplicate_functions(rewritten_decls),
-		foreign_includes = program.foreign_includes.map(func(include): include)
+		foreign_includes = materialized_program.foreign_includes.map(func(include): include)
 	}

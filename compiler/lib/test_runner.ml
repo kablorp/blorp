@@ -3042,13 +3042,19 @@ let suite_run_all_eligible_info ~leak_check mode info =
   && info.test_file_execution_isolation = SharedTestProcess
 
 (* Generated compiler TestSuites vary by more than an order of magnitude in
-   source size, so suite count is not a meaningful compile-work boundary. This
-   budget keeps the measured frontend graph for an ordinary group near the
-   successful 16-suite/232 KiB probe while allowing any single larger suite to
-   compile on its own. Harness planning will move with the test command into
-   Blorp; keeping this policy as a pure source-work partition makes that move
-   mechanical. *)
-let combined_harness_source_budget_bytes = 256 * 1024
+   source size, so suite count is not a meaningful compile-work boundary. The
+   ordinary budget keeps a frontend graph near the successful 16-suite/232 KiB
+   probe. Sanitizer instrumentation makes the resulting binary substantially
+   larger and slower, so those harnesses use half the source work. Any single
+   suite may still exceed either budget and compile on its own. Harness planning
+   will move with the test command into Blorp; keeping this policy as a pure
+   source-work partition makes that move mechanical. *)
+let ordinary_combined_harness_source_budget_bytes = 256 * 1024
+let sanitized_combined_harness_source_budget_bytes = 128 * 1024
+
+let combined_harness_source_budget_bytes ~sanitize =
+  if sanitize then sanitized_combined_harness_source_budget_bytes
+  else ordinary_combined_harness_source_budget_bytes
 
 let group_by_source_size_budget ~max_source_bytes ~source_size items =
   if max_source_bytes <= 0 then
@@ -3267,7 +3273,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
         in
         let run_all_groups =
           group_by_source_size_budget
-            ~max_source_bytes:combined_harness_source_budget_bytes
+            ~max_source_bytes:
+              (combined_harness_source_budget_bytes ~sanitize)
             ~source_size:(fun info -> String.length info.test_file_source)
             run_all_infos
         in
@@ -3606,18 +3613,18 @@ let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
       let run_once iteration =
         if repeat > 1 then Printf.printf "\nRepeat %d/%d\n%!" iteration repeat;
         match
-          try_run_suite_selector_tests ~profile ~debug ~sanitizer_mode
-            ?precompiled ~leak_check ~mode ~timeout test_infos
+          try_run_suite_selector_tests ~profile ~debug ~sanitize
+            ~sanitizer_mode ?precompiled ~leak_check ~mode ~timeout test_infos
         with
         | Some result -> result
         | None ->
             if effective_jobs = 1 then
-              run_tests_sequential ~profile ~debug ~sanitizer_mode ?precompiled
-                ~leak_check ~mode ~timeout test_infos
+              run_tests_sequential ~profile ~debug ~sanitize ~sanitizer_mode
+                ?precompiled ~leak_check ~mode ~timeout test_infos
             else
-              run_tests_parallel ~profile ~debug ~sanitizer_mode ?precompiled
-                ~leak_check ~mode ~timeout ~num_workers:effective_jobs
-                test_infos
+              run_tests_parallel ~profile ~debug ~sanitize ~sanitizer_mode
+                ?precompiled ~leak_check ~mode ~timeout
+                ~num_workers:effective_jobs test_infos
       in
       let rec loop iteration =
         let result = run_once iteration in

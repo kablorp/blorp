@@ -1367,6 +1367,11 @@ let test_list_pipeline_exposes_nonempty_stages () =
       | _ -> Alcotest.fail "unexpected ListPipeline shape")
   | None -> Alcotest.fail "expected explicit ListPipeline plan"
 
+let test_list_pipeline_recognizes_compiler_owned_pure_suffix () =
+  Alcotest.(check (option string))
+    "pure monomorphized list function" (Some "filter")
+    (LP.base_list_func_name "std_list__filter__pure__mono_Int")
+
 let suite =
   [
     ( "recognition",
@@ -1492,5 +1497,7 @@ let suite =
           test_list_pipeline_rejects_empty_source_plan;
         Alcotest.test_case "exposes_nonempty_stages" `Quick
           test_list_pipeline_exposes_nonempty_stages;
+        Alcotest.test_case "recognizes_compiler_owned_pure_suffix" `Quick
+          test_list_pipeline_recognizes_compiler_owned_pure_suffix;
       ] );
   ]
