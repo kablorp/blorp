@@ -192,11 +192,55 @@ private pure func has_body(function_info: CoreFunction) -> Bool:
 	function_info.body.is_some()
 
 
-private pure func has_bodied_callable(functions: List[CoreFunction], name: String) -> Bool:
+private pure func has_callable_implementation(function_info: CoreFunction) -> Bool:
+	if has_body(function_info):
+		True
+	else:
+		-- Source `builtin("std/...")` bodies lower to a bodyless
+		-- UnresolvedBuiltinFunction. They are still implementations; treating
+		-- them as forward declarations can discard the selected overload.
+		match function_info.function_kind:
+			UnresolvedBuiltinFunction:
+				True
+			_:
+				False
+
+
+private pure func has_user_callable_named(functions: List[CoreFunction], name: String) -> Bool:
+	functions.any(func(candidate):
+		candidate.name == name and is_module_user_callable(candidate)
+	)
+
+
+private pure func is_module_overload_callable(
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> Bool:
+	if is_module_user_callable(function_info):
+		True
+	else:
+		match function_info.function_kind:
+			UnresolvedBuiltinFunction:
+				(
+					not function_info.name.starts_with(UFCS_PREFIX)
+					and has_user_callable_named(functions, function_info.name)
+				)
+			_:
+				False
+
+
+private pure func has_callable_implementation_named(
+	functions: List[CoreFunction],
+	name: String,
+) -> Bool:
 	functions.any(
 		func(
 			candidate,
-		): candidate.name == name and is_module_user_callable(candidate) and has_body(candidate),
+		): (
+			candidate.name == name
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
+		),
 	)
 
 
@@ -207,8 +251,8 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_body(candidate)
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 		),
 	)
 	has_impure: Bool = functions.any(
@@ -217,8 +261,8 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and not candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_body(candidate)
+			and is_module_overload_callable(functions, candidate)
+			and has_callable_implementation(candidate)
 		),
 	)
 
@@ -260,8 +304,8 @@ private pure func collect_callable_rewrites(
 
 	functions.filter_map(func(function_info):
 		if (
-			is_module_user_callable(function_info)
-			and has_bodied_callable(functions, function_info.name)
+			is_module_overload_callable(functions, function_info)
+			and has_callable_implementation_named(functions, function_info.name)
 		):
 			Some({
 				source_name = function_info.name,
@@ -1052,9 +1096,7 @@ private pure func rewrite_expr(
 		SelectExpr(select_expr, typ, loc):
 			SelectExpr(
 				select_expr.map(
-					func(
-						arm,
-					): rewrite_select_arm(callable_rewrites, global_rewrites, bound, arm),
+					func(arm): rewrite_select_arm(callable_rewrites, global_rewrites, bound, arm),
 				),
 				typ,
 				loc,
@@ -1863,11 +1905,14 @@ private pure func rewrite_decl(
 			decl
 
 
-private pure func function_decl_has_body_named(decls: List[CoreDecl], name: String) -> Bool:
+private pure func function_decl_has_implementation_named(
+	decls: List[CoreDecl],
+	name: String,
+) -> Bool:
 	decls.any(func(decl):
 		match decl:
 			FunctionDecl(function_info):
-				function_info.name == name and has_body(function_info)
+				function_info.name == name and has_callable_implementation(function_info)
 			_:
 				False
 	)
@@ -1882,8 +1927,8 @@ private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]
 			FunctionDecl(function_info):
 				if not seen_names.contains(function_info.name):
 					if (
-						has_body(function_info)
-						or not function_decl_has_body_named(decls, function_info.name)
+						has_callable_implementation(function_info)
+						or not function_decl_has_implementation_named(decls, function_info.name)
 					):
 						seen_names = seen_names.append(function_info.name)
 						result = result.append(decl)

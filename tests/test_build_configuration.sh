@@ -251,6 +251,8 @@ do
 done
 
 ci_workflow=.github/workflows/ci.yml
+required_staged_toolchain='blorp blorp-ocaml-host blorp-ocaml-middle blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck'
+ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
 then
@@ -261,6 +263,8 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_workflow" ||
 	! grep -Fq '>> "$GITHUB_ENV"' "$ci_workflow" ||
 	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_workflow" ||
+	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$ci_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$ci_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$ci_workflow" ||
 	! grep -Fq 'name: Select compiler bridge toolchain' "$ci_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}' "$ci_workflow" ||
@@ -281,6 +285,12 @@ then
 	echo "FAIL: main CI must preserve and qualify the exact compiler it tested for dev releases" >&2
 	exit 1
 fi
+for executable in $required_staged_toolchain; do
+	if ! grep -Fq "            $executable" <<<"$ci_prepare_step"; then
+		echo "FAIL: main CI must stage $executable before preparing compiler bridges" >&2
+		exit 1
+	fi
+done
 ci_prepare_line=$(grep -nF 'name: Prepare tested compiler bridges' "$ci_workflow" | head -n 1 | cut -d: -f1)
 ci_test_line=$(grep -nF 'name: Run test suites' "$ci_workflow" | head -n 1 | cut -d: -f1)
 if [ "$ci_prepare_line" -ge "$ci_test_line" ]; then
@@ -297,6 +307,7 @@ fi
 release_workflow=.github/workflows/release.yml
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
+release_prepare_step=$(sed -n '/name: Prepare packaged compiler bridges/,/name: Package binary/p' "$release_workflow")
 if grep -Fq 'workflow_run' <<<"$release_build_job" ||
 	! grep -Fq "github.event_name == 'push'" <<<"$release_build_job" ||
 	! grep -Fq "startsWith(github.ref, 'refs/tags/v')" <<<"$release_build_job"
@@ -309,6 +320,8 @@ if grep -Fq 'make install' <<<"$release_publish_job"; then
 	exit 1
 fi
 if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
+	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$release_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
@@ -330,5 +343,11 @@ then
 	echo "FAIL: release CI must consume tested dev archives and qualify independently versioned tag archives" >&2
 	exit 1
 fi
+for executable in $required_staged_toolchain; do
+	if ! grep -Fq "            $executable" <<<"$release_prepare_step"; then
+		echo "FAIL: release CI must stage $executable before preparing compiler bridges" >&2
+		exit 1
+	fi
+done
 
 echo "PASS: build and CI cache ownership is explicit"

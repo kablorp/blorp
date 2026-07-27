@@ -3254,14 +3254,36 @@ let test_generic_set_map_filter_defer_to_post_mono_synthesis () =
     "generic Set.filter should defer" true
     (Option.is_none filter_body)
 
-let test_set_bulk_registered_for_post_mono_synthesis () =
+let test_registered_post_mono_synthesis_operations () =
   List.iter
     (fun name ->
       Alcotest.(check bool)
         (Printf.sprintf "%s is post-mono synthesized" name)
         true
-        (Blorp.Core_intrinsics.has_post_mono_synthesis name))
-    [ "is_subset"; "difference"; "intersect"; "combine"; "map"; "filter" ]
+        (Blorp.Core_intrinsics.has_post_mono_synthesis
+           ~module_path:(Some "std/list") name))
+    [
+      "map";
+      "filter";
+      "drop";
+      "any";
+      "concat";
+      "unique";
+      "all";
+      "flat_map";
+    ];
+  Alcotest.(check bool)
+    "same name in unrelated module stays deferred" false
+    (Blorp.Core_intrinsics.has_post_mono_synthesis
+       ~module_path:(Some "std/string") "map");
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (Printf.sprintf "dict %s is post-mono synthesized" name)
+        true
+        (Blorp.Core_intrinsics.has_post_mono_synthesis
+           ~module_path:(Some "std/dict") name))
+    [ "keys"; "values" ]
 
 let test_set_difference_synthesizes_direct_entry_scan () =
   let body =
@@ -3878,8 +3900,8 @@ let suite =
           `Quick test_generic_set_bulk_defers_to_post_mono_synthesis;
         Alcotest.test_case "generic_set_map_filter_defer_to_post_mono_synthesis"
           `Quick test_generic_set_map_filter_defer_to_post_mono_synthesis;
-        Alcotest.test_case "set_bulk_registered_for_post_mono_synthesis" `Quick
-          test_set_bulk_registered_for_post_mono_synthesis;
+        Alcotest.test_case "registered_post_mono_synthesis_operations" `Quick
+          test_registered_post_mono_synthesis_operations;
         Alcotest.test_case "set_difference_synthesizes_direct_entry_scan" `Quick
           test_set_difference_synthesizes_direct_entry_scan;
         Alcotest.test_case "set_intersect_synthesizes_direct_entry_scan" `Quick

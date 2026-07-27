@@ -4058,7 +4058,10 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
         Core_layout_type.list_storage_layout_of_type ~reg tls_list_param.cp_ty
           tls_list_param.cp_loc
       in
-      let* layout = list_storage_layout_json list_layout in
+      let* layout =
+        validated_list_storage_layout_json ~reg (path ^ ".loop.layout")
+          list_layout
+      in
       let* body_value =
         expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".loop.body") tls_body
@@ -4747,7 +4750,9 @@ and for_list_json ~function_names ~consumed_params ~reg enum_names value_record_
     loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
       (path ^ ".binder") binder
   in
-  let* layout_json = list_storage_layout_json layout in
+  let* layout_json =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") layout
+  in
   let* iterable_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
@@ -5213,6 +5218,33 @@ and tensor_runtime_read_helper_tag path = function
          ("body", body_json);
        ])
 
+and require_inline_struct_list_layout_type ~reg path c_type = function
+  | Some element_ty -> (
+      let expected_c_type =
+        match Codegen_types.inline_value_record_c_type ~reg element_ty with
+        | Some c_type -> Some c_type
+        | None -> Codegen_types.stack_option_c_type ~reg element_ty
+      in
+      match expected_c_type with
+      | Some expected_c_type when String.equal expected_c_type c_type -> Ok ()
+      | Some expected_c_type ->
+          unsupported path
+            (Printf.sprintf
+               "inline-struct list layout type %s does not match storage %s"
+               expected_c_type c_type)
+      | None ->
+          unsupported path
+            "inline-struct list layout element has no recognized C representation")
+  | None -> unsupported path "inline-struct list layout without element type"
+
+and require_list_storage_layout_type ~reg path
+    (layout : Core.list_storage_layout) =
+  match layout.lsl_slots with
+  | Core.ListInlineStructStorage c_type ->
+      require_inline_struct_list_layout_type ~reg path c_type
+        layout.lsl_elem_ty
+  | Core.ListPointerStorage | Core.ListInlineStorage _ -> Ok ()
+
 and list_storage_layout_json (layout : Core.list_storage_layout) =
   match layout.lsl_slots with
   | Core.ListPointerStorage -> Ok (kind "pointer" [])
@@ -5223,9 +5255,15 @@ and list_storage_layout_json (layout : Core.list_storage_layout) =
   | Core.ListInlineStructStorage c_type ->
       Ok (kind "inline_struct" [ ("c_type", str c_type) ])
 
+and validated_list_storage_layout_json ~reg path layout =
+  let* () = require_list_storage_layout_type ~reg path layout in
+  list_storage_layout_json layout
+
 and list_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (lc : Core.list_construct) =
-  let* layout = list_storage_layout_json lc.lc_layout in
+  let* layout =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") lc.lc_layout
+  in
   let* elements =
     boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".elements") lc.lc_elems
@@ -5240,7 +5278,9 @@ and list_construct_json ~function_names ~consumed_params ~reg enum_names value_r
 
 and list_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (lit : Core.list_literal) =
-  let* layout = list_storage_layout_json lit.ll_layout in
+  let* layout =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") lit.ll_layout
+  in
   let elems =
     List.map (Core_emit_layout.boxed_storage_value ~reg) lit.ll_elems
   in
@@ -5261,7 +5301,9 @@ and list_literal_json ~function_names ~consumed_params ~reg enum_names value_rec
 
 and list_alloc_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (alloc : Core.list_alloc) =
-  let* layout = list_storage_layout_json alloc.la_layout in
+  let* layout =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") alloc.la_layout
+  in
   let* capacity =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".capacity") alloc.la_capacity
@@ -5283,7 +5325,9 @@ and list_bounds_json = function
 
 and list_get_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (get : Core.list_get) =
-  let* layout = list_storage_layout_json get.lg_layout in
+  let* layout =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") get.lg_layout
+  in
   let* list =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") get.lg_list
@@ -5460,7 +5504,10 @@ and list_handoff_write_order_json = function
 
 and list_handoff_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (handoff : Core.list_handoff) =
-  let* layout = list_storage_layout_json handoff.lh_layout in
+  let* layout =
+    validated_list_storage_layout_json ~reg (path ^ ".layout")
+      handoff.lh_layout
+  in
   let* source =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".source") handoff.lh_source
@@ -5629,7 +5676,9 @@ and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_
     }
   in
   let* () = require_list_set_layout path layout boxed_value in
-  let* layout_json = list_storage_layout_json layout in
+  let* layout_json =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") layout
+  in
   let* list_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list
@@ -5656,7 +5705,9 @@ and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_
 and list_swap_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (layout : Core.list_storage_layout) list left_index
     right_index =
-  let* layout_json = list_storage_layout_json layout in
+  let* layout_json =
+    validated_list_storage_layout_json ~reg (path ^ ".layout") layout
+  in
   let* list_json =
     expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".list") list
@@ -6445,8 +6496,8 @@ and inline_struct_list_unmanaged (layout : Core.list_storage_layout) =
   | Core.StoragePolicyUnknown _ ->
       false
 
-and require_inline_struct_list_element path c_type ~allow_element_release_flag
-    (value : Core.boxed_storage_value) =
+and require_inline_struct_list_element path c_type element_ty
+    ~allow_element_release_flag (value : Core.boxed_storage_value) =
   if value.bsv_needs_release && not allow_element_release_flag then
     unsupported path "managed inline-struct list element"
   else if value.bsv_transfers_ownership && not allow_element_release_flag then
@@ -6460,7 +6511,35 @@ and require_inline_struct_list_element path c_type ~allow_element_release_flag
           (Printf.sprintf
              "inline-struct list element type %s does not match list storage %s"
              value_c_type c_type)
-    | Core.BoxPrim | Core.BoxPointer | Core.BoxVoid | Core.BoxFloat
+    | Core.BoxPointer ->
+        (* This is the pre-prepare representation produced by list-layout
+           annotation. The Blorp-owned pipeline deliberately waits until after
+           Perceus to rewrite it to [BoxStruct], because changing the box kind
+           earlier can hide ownership from that analysis. Final C emission
+           still requires [BoxStruct]; only this JSON handoff accepts the
+           transitional pointer tag. *)
+        if value.bsv_needs_release then
+          unsupported path "managed transitional inline-struct element"
+        else if value.bsv_transfers_ownership then
+          unsupported path "owned transitional inline-struct element transfer"
+        else if
+          not
+            (Types.types_bidirectional value.bsv_box.box_source_ty
+               value.bsv_box.box_value.ty)
+        then unsupported path "transitional inline-struct source/value mismatch"
+        else (
+          match element_ty with
+          | Some expected_ty
+            when Types.types_bidirectional expected_ty
+                   value.bsv_box.box_source_ty ->
+              require_simple_expr (path ^ ".value") value.bsv_box.box_value
+          | Some _ ->
+              unsupported path
+                "transitional inline-struct element/list type mismatch"
+          | None ->
+              unsupported path
+                "transitional inline-struct element without layout type")
+    | Core.BoxPrim | Core.BoxVoid | Core.BoxFloat
     | Core.BoxFloat32 | Core.BoxFloat16 | Core.BoxInt128 | Core.BoxUInt128 ->
         unsupported path "non-struct inline-struct list element"
 
@@ -6482,7 +6561,8 @@ and require_list_construct path (lc : Core.list_construct) =
               let* () =
                 require_inline_struct_list_element
                   (Printf.sprintf "%s.elements[%d]" path index)
-                  c_type ~allow_element_release_flag element
+                  c_type lc.lc_layout.lsl_elem_ty ~allow_element_release_flag
+                  element
               in
               check (index + 1) rest
         in

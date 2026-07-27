@@ -17,7 +17,8 @@
     - Foreign functions become [CKForeign { fc_c_name; fc_arg_passing }].
     - Direct calls carrying typed selected-call ids become
       [CKUser (name, def_id)] once the canonical post-flatten Core name is
-      known. A canonical qualified name wins over a stale module-local id.
+      known. Explicit/canonical identity wins over a stale id; a selected id
+      wins over later lexical import rewriting of a bare name.
     - User functions, constructors, impl methods, and imported source
       functions become [CKUser (name, def_id)] when a def-id is known.
     - Runtime-backed builtins become [CKBuiltin c_name] through the
@@ -159,6 +160,15 @@ let user_call_kind_by_identity (env : env) (callee : core) (args : core list)
   match user_call_kind_by_canonical_name env callee with
   | Some kind -> Some kind
   | None -> user_call_kind_by_def_id ~callee ~args env selected_id
+
+let callee_with_resolved_user_identity (callee : core) (kind : call_kind) : core
+    =
+  match (kind, callee.desc) with
+  | CKUser (name, def_id), CVar v ->
+      { callee with desc = CVar { v with vname = name; vdef_id = def_id } }
+  | CKUser (name, def_id), _ ->
+      { callee with desc = CVar { vname = name; vuniq = 0; vdef_id = def_id } }
+  | _ -> callee
 
 let prefixed_runtime_builtin_call_kind (callee : core) : call_kind option =
   match callee.desc with
@@ -916,26 +926,37 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
   in
   match e.desc with
   | CCall (CKSelectedDirect selected_id, callee, args) ->
-      let callee' = resolve_same callee in
       let args' = List.map resolve_same args in
-      let kind =
-        match try_resolve_explicit_ufcs_call env callee' args' with
-        | Some kind -> kind
+      let selected_kind =
+        match try_resolve_explicit_ufcs_call env callee args' with
+        | Some kind -> Some kind
         | None -> (
+            match prefixed_runtime_builtin_call_kind callee with
+            | Some kind -> Some kind
+            | None ->
+                user_call_kind_by_identity env callee args'
+                  (Some selected_id))
+      in
+      (match selected_kind with
+      | Some kind ->
+          let callee' = callee_with_resolved_user_identity callee kind in
+          { e with desc = CCall (kind, callee', args') }
+      | None ->
+          (* Only unresolved selected calls enter normal lexical resolution.
+             Rewriting the callee first would let a same-named selective import
+             replace the identity already chosen by typechecking. *)
+          let callee' = resolve_same callee in
+          let kind =
             match
-              prefixed_runtime_builtin_call_kind callee'
+              user_call_kind_by_identity env callee' args'
+                (Some selected_id)
             with
             | Some kind -> kind
-            | None -> (
-                match
-                  user_call_kind_by_identity env callee' args'
-                    (Some selected_id)
-                with
-                | Some kind -> kind
-                | None ->
-                    resolve_call_kind ~module_path ~bound env callee' args'))
-      in
-      { e with desc = CCall (kind, callee', args') }
+            | None ->
+                resolve_call_kind ~module_path ~bound env callee' args'
+          in
+          let callee' = callee_with_resolved_user_identity callee' kind in
+          { e with desc = CCall (kind, callee', args') })
   | CCall (CKUnknown, callee, args) ->
       let callee' = resolve_same callee in
       let args' = List.map resolve_same args in
