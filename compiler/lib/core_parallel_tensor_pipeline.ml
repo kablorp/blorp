@@ -132,6 +132,21 @@ let collect_std_calls (prog : core_program) =
 
 let std_call_kind calls def_id = Hashtbl.find_opt calls def_id
 
+let unresolved_parallel_entrypoint callee =
+  match callee.desc with
+  | CVar v -> (
+      match Codegen_names.parse_ufcs_name v.vname with
+      | Some ("std/vector", "parallel") -> Some VectorParallel
+      | Some ("std/matrix", "parallel") -> Some MatrixParallel
+      | _ -> None)
+  | _ -> None
+
+let parallel_entrypoint_kind calls call_kind callee =
+  match call_kind with
+  | CKUser (_, Some def_id) -> std_call_kind calls def_id
+  | CKUnknown -> unresolved_parallel_entrypoint callee
+  | _ -> None
+
 let vector_elem_dim ty =
   match Codegen_types.normalize_type ty with
   | Ast.TyArray (elem_ty, [ dim ]) -> Some (elem_ty, dim)
@@ -155,6 +170,12 @@ let parallel_matrix_elem_dims ty =
 
 let dims_equal a b = a = b
 
+let parallel_dim_matches concrete_dim parallel_dim =
+  (* The Blorp Core bridge preserves tensor dimensions but erases dimension
+     arguments inside named ParallelVector/ParallelMatrix types to Int. The
+     enclosing parallel type makes this marker unambiguous. *)
+  dims_equal concrete_dim parallel_dim || parallel_dim = ty_int
+
 let stage_output_elem_dim expr =
   match parallel_vector_elem_dim expr.ty with
   | Some (elem_ty, dim) -> Some (elem_ty, dim)
@@ -176,7 +197,7 @@ let rec stages_of_expr calls chunk_var dim expr =
               stage_output_elem_dim expr )
           with
           | Some stages, Some (output_ty, output_dim)
-            when dims_equal dim output_dim ->
+            when parallel_dim_matches dim output_dim ->
               Some
                 (stages
                 @ [
@@ -192,7 +213,7 @@ let rec stages_of_expr calls chunk_var dim expr =
               stage_output_elem_dim expr )
           with
           | Some stages, Some (output_ty, output_dim)
-            when dims_equal dim output_dim ->
+            when parallel_dim_matches dim output_dim ->
               Some
                 (stages
                 @ [
@@ -214,7 +235,8 @@ let rec stages_of_expr calls chunk_var dim expr =
           | ( Some stages,
               Some (output_ty, output_dim),
               Some (other_elem_ty, other_dim) )
-            when dims_equal dim output_dim && dims_equal dim other_dim ->
+            when parallel_dim_matches dim output_dim
+                 && dims_equal dim other_dim ->
               Some
                 (stages
                 @ [
@@ -238,7 +260,8 @@ let rec matrix_stages_of_expr calls chunk_var rows cols expr =
               stage_output_elem_dims expr )
           with
           | Some stages, Some (output_ty, output_rows, output_cols)
-            when dims_equal rows output_rows && dims_equal cols output_cols ->
+            when parallel_dim_matches rows output_rows
+                 && parallel_dim_matches cols output_cols ->
               Some
                 (stages
                 @ [
@@ -254,7 +277,8 @@ let rec matrix_stages_of_expr calls chunk_var rows cols expr =
               stage_output_elem_dims expr )
           with
           | Some stages, Some (output_ty, output_rows, output_cols)
-            when dims_equal rows output_rows && dims_equal cols output_cols ->
+            when parallel_dim_matches rows output_rows
+                 && parallel_dim_matches cols output_cols ->
               Some
                 (stages
                 @ [
@@ -276,8 +300,8 @@ let rec matrix_stages_of_expr calls chunk_var rows cols expr =
           | ( Some stages,
               Some (output_ty, output_rows, output_cols),
               Some (other_elem_ty, other_rows, other_cols) )
-            when dims_equal rows output_rows
-                 && dims_equal cols output_cols
+            when parallel_dim_matches rows output_rows
+                 && parallel_dim_matches cols output_cols
                  && dims_equal rows other_rows && dims_equal cols other_cols ->
               Some
                 (stages
@@ -298,7 +322,7 @@ let plan_of_vector_parallel calls source body result_ty loc =
       match lam.lam_params with
       | [ (chunk_var, chunk_ty) ] -> (
           match parallel_vector_elem_dim chunk_ty with
-          | Some (_, chunk_dim) when dims_equal dim chunk_dim -> (
+          | Some (_, chunk_dim) when parallel_dim_matches dim chunk_dim -> (
               match stages_of_expr calls chunk_var dim lam.lam_body with
               | Some (_ :: _ as stages) ->
                   Some
@@ -326,7 +350,8 @@ let plan_of_matrix_parallel calls source body result_ty loc =
       | [ (chunk_var, chunk_ty) ] -> (
           match parallel_matrix_elem_dims chunk_ty with
           | Some (_, chunk_rows, chunk_cols)
-            when dims_equal rows chunk_rows && dims_equal cols chunk_cols -> (
+            when parallel_dim_matches rows chunk_rows
+                 && parallel_dim_matches cols chunk_cols -> (
               match
                 matrix_stages_of_expr calls chunk_var rows cols lam.lam_body
               with
@@ -738,16 +763,16 @@ let lower_matrix_plan plan =
 let rewrite_expr calls expr =
   let rec rewrite e =
     match e.desc with
-    | CCall ((CKUser (_, Some def_id) as kind), callee, [ source; body ])
-      when std_call_kind calls def_id = Some VectorParallel -> (
+    | CCall (kind, callee, [ source; body ])
+      when parallel_entrypoint_kind calls kind callee = Some VectorParallel -> (
         let source = rewrite source in
         match plan_of_vector_parallel calls source body e.ty e.loc with
         | Some plan -> rewrite (lower_plan plan)
         | None ->
             let body = rewrite body in
             { e with desc = CCall (kind, callee, [ source; body ]) })
-    | CCall ((CKUser (_, Some def_id) as kind), callee, [ source; body ])
-      when std_call_kind calls def_id = Some MatrixParallel -> (
+    | CCall (kind, callee, [ source; body ])
+      when parallel_entrypoint_kind calls kind callee = Some MatrixParallel -> (
         let source = rewrite source in
         match plan_of_matrix_parallel calls source body e.ty e.loc with
         | Some plan -> (

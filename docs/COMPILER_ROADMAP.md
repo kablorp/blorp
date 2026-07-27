@@ -11,6 +11,11 @@ detailed OCaml-to-Blorp port plan, including explicit JSON boundaries,
 incremental deletion merge points, and the expectation that compiler stage
 logic is implemented as pure functions wherever possible.
 
+Use
+[COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md](COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md)
+for the incremental generated-C work on compact Boolean aggregate storage,
+foreign-ABI preservation, and alignment-aware internal record layout.
+
 ## Goals
 
 - Represent semantic facts directly instead of recovering them from names,

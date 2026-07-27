@@ -828,8 +828,7 @@ static int __mem_watch_interval = 0;
 static struct { void* addr; long count; size_t bytes; } __blorp_trace_table[BLORP_TRACE_SLOTS];
 static long __blorp_trace_total = 0;
 
-static void __blorp_trace_record(size_t size) {
-    void* caller = __builtin_return_address(1);
+static void __blorp_trace_record(size_t size, void* caller) {
     unsigned long hash = ((unsigned long)caller >> 4) % BLORP_TRACE_SLOTS;
     for (int probe = 0; probe < 16; probe++) {
         unsigned long idx = (hash + probe) % BLORP_TRACE_SLOTS;
@@ -905,6 +904,8 @@ typedef struct blorp_AllocMeta_s {
     blorp_Object* object;
     size_t alloc_size;
     long alloc_site_offset;
+    // Reserved for a future platform unwinder. Nonzero
+    // __builtin_return_address levels are unsafe in optimized builds.
     long alloc_caller_offset;
     unsigned long stats_epoch;
     bool stats_tracked;
@@ -1835,6 +1836,13 @@ void* blorp_alloc(size_t size) {
     void* obj;
     size_t actual_size = size;
     int cls = blorp_pool_class(size);
+    void* alloc_site = NULL;
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__alloc_meta_enabled() || (__blorp_stats_enabled && __blorp_trace_allocs)) {
+        alloc_site = __builtin_extract_return_addr(__builtin_return_address(0));
+    }
+#endif
 
     // Try pool for small objects.
     // Pool is disabled under ASan — ASan tracks malloc/free precisely and the pool's
@@ -1865,12 +1873,16 @@ void* blorp_alloc(size_t size) {
         cls >= 0 ? (uint32_t)cls : BLORP_ALLOC_CLASS_DIRECT,
         actual_size
     );
-    __alloc_meta_set_alloc_site(
-        header,
-        (long)((char*)__builtin_return_address(1) - (char*)(void*)&blorp_alloc),
-        (long)((char*)__builtin_return_address(2) - (char*)(void*)&blorp_alloc)
-    );
-    if (__blorp_stats_enabled && __blorp_trace_allocs) __blorp_trace_record(actual_size);
+    if (__alloc_meta_enabled()) {
+        long alloc_site_offset = alloc_site
+            ? (long)((intptr_t)(uintptr_t)alloc_site -
+                     (intptr_t)(uintptr_t)(void*)&blorp_alloc)
+            : 0;
+        __alloc_meta_set_alloc_site(header, alloc_site_offset, 0);
+    }
+    if (__blorp_stats_enabled && __blorp_trace_allocs) {
+        __blorp_trace_record(actual_size, alloc_site);
+    }
     return obj;
 }
 

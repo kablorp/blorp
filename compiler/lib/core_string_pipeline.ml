@@ -106,7 +106,8 @@ let with_state_length state len =
   | SourceWindow window -> SourceWindow { window with len }
   | LengthOnly _ -> LengthOnly len
 
-let string_len source = intr "string_len" [ source ] ty_int
+let string_len ?(loc = Ast.dummy_loc) source =
+  intr ~loc "string_len" [ source ] ty_int
 
 let string_get_byte source index =
   intr "string_get_byte" [ source; index ] ty_int
@@ -170,23 +171,22 @@ let strip_mono_suffix name =
 let trait_resolved_string_length_name name =
   starts_with ~prefix:"HasLength_length_String" name
 
-let base_string_func_name name =
-  let base = strip_mono_suffix name in
-  let base =
-    match strip_prefix ~prefix:"std_string__" base with
-    | Some rest -> rest
-    | None -> (
-        match strip_prefix ~prefix:"__ufcs_std$string__" base with
-        | Some rest -> rest
-        | None -> base)
-  in
-  match base with
+let supported_string_func_name = function
   | "drop_left" | "drop_right" | "replace" | "reverse" | "substring"
-  | "take_left" | "take_right" | "trim" | "trim_left" | "trim_right" ->
-      Some base
-  | "length" -> Some "length"
-  | _ when trait_resolved_string_length_name base -> Some "length"
+  | "take_left" | "take_right" | "trim" | "trim_left" | "trim_right"
+  | "length" as name ->
+      Some name
   | _ -> None
+
+let base_string_func_name name =
+  let name = strip_mono_suffix name in
+  match strip_prefix ~prefix:"std_string__" name with
+  | Some base -> supported_string_func_name base
+  | None -> (
+      match strip_prefix ~prefix:"__ufcs_std$string__" name with
+      | Some base -> supported_string_func_name base
+      | None ->
+          if trait_resolved_string_length_name name then Some "length" else None)
 
 let call_base_and_args e =
   match e.desc with
@@ -864,7 +864,7 @@ let try_fuse_length e =
     when is_string_type source.ty && is_int_value_type e.ty -> (
       match pipeline_of_expr source with
       | Some pipeline -> lower_length pipeline
-      | None -> None)
+      | None -> Some (string_len ~loc:e.loc source))
   | _ -> None
 
 let try_fuse_materialization e =

@@ -135,6 +135,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 	source_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
+		find tools/formatter -name '*.brp' -type f -print; \
 		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 		for bridge_path in "$$bridge_compiler" "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
 			if [ -n "$$bridge_path" ]; then printf '%s\n' "$$bridge_path"; fi; \
@@ -207,6 +208,8 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
+	@tests/test_compiler_record_layout_benchmark.sh
 	@tests/test_bootstrap_helper_install.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh

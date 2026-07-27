@@ -35,6 +35,7 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
+		CoreTypeAliasDecl,
 	../stage_09_core/compiler_core_traverse: map_core_expr_children
 	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
 
@@ -46,6 +47,48 @@ INLINE_WIDTH_2: Int = 2
 INLINE_WIDTH_4: Int = 4
 
 INLINE_WIDTH_8: Int = 8
+
+
+record CoreLayoutTypeIndex {
+	aliases: Dict[String, CoreTypeAliasDecl],
+	declared_types: Dict[String, CoreType]
+}
+
+
+pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
+	var aliases: Dict[String, CoreTypeAliasDecl] = {}
+	var declared_types: Dict[String, CoreType] = {}
+
+	for decl in program.decls:
+		match decl:
+			TypeAliasDecl(alias_decl):
+				if not aliases.contains(alias_decl.name):
+					aliases = aliases.set(alias_decl.name, alias_decl)
+			EnumDecl(enum_decl):
+				if not declared_types.contains(enum_decl.name):
+					declared_types = declared_types.set(enum_decl.name, EnumType(enum_decl.name))
+			ValueRecordDecl(record_decl):
+				if not declared_types.contains(record_decl.name):
+					declared_types = declared_types.set(
+						record_decl.name,
+						ValueRecordType(record_decl.name),
+					)
+			HeapRecordDecl(record_decl):
+				if not declared_types.contains(record_decl.name):
+					declared_types = declared_types.set(
+						record_decl.name,
+						HeapRecordType(record_decl.name),
+					)
+			UnionDecl(union_decl):
+				if not declared_types.contains(union_decl.name):
+					declared_types = declared_types.set(union_decl.name, UnionType(union_decl.name))
+			_:
+				void
+
+	{
+		aliases = aliases,
+		declared_types = declared_types
+	}
 
 
 private pure func alias_type_argument(
@@ -112,126 +155,99 @@ private pure func substitute_alias_type(
 
 
 private pure func find_alias_expansion(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	name: String,
 	args: List[CoreType],
 ) -> Option[CoreType]:
-	var result: Option[CoreType] = None
-
-	for decl in program.decls:
-		match decl:
-			TypeAliasDecl(alias_decl):
-				if alias_decl.name == name and alias_decl.type_params.length() == args.length():
-					result = Some(
-						substitute_alias_type(
-							alias_decl.target,
-							alias_decl.type_params,
-							args,
-						),
-					)
-					break
-			_:
-				void
-
-	result
+	match index.aliases.get(name):
+		Some(alias_decl):
+			if alias_decl.type_params.length() == args.length():
+				Some(substitute_alias_type(alias_decl.target, alias_decl.type_params, args))
+			else:
+				None
+		None:
+			None
 
 
 private pure func canonical_declared_type(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	name: String,
 	args: List[CoreType],
 ) -> CoreType:
 	if args.length() != 0:
 		NamedType(name, args)
 	else:
-		var result: CoreType = NamedType(name, args)
-
-		for decl in program.decls:
-			match decl:
-				EnumDecl(enum_decl):
-					if enum_decl.name == name:
-						result = EnumType(name)
-						break
-				ValueRecordDecl(record_decl):
-					if record_decl.name == name:
-						result = ValueRecordType(name)
-						break
-				HeapRecordDecl(record_decl):
-					if record_decl.name == name:
-						result = HeapRecordType(name)
-						break
-				UnionDecl(union_decl):
-					if union_decl.name == name:
-						result = UnionType(name)
-						break
-				_:
-					void
-
-		result
+		index.declared_types
+			.get(name)
+			.get_or(NamedType(name, args))
 
 
 private pure func resolve_type(
-	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	typ: CoreType,
 	seen_aliases: List[String],
 ) -> CoreType:
 	match typ:
 		NamedType(name, args):
 			resolved_args: List[CoreType] = args.map(
-				func(arg): resolve_type(program, arg, seen_aliases),
+				func(arg): resolve_type(index, arg, seen_aliases),
 			)
 
 			if seen_aliases.contains(name):
-				canonical_declared_type(program, name, resolved_args)
+				canonical_declared_type(index, name, resolved_args)
 			else:
-				match find_alias_expansion(program, name, resolved_args):
+				match find_alias_expansion(index, name, resolved_args):
 					Some(target):
 						resolve_type(
-							program,
+							index,
 							target,
 							seen_aliases.append(name),
 						)
 					None:
-						canonical_declared_type(program, name, resolved_args)
+						canonical_declared_type(index, name, resolved_args)
 		StackResultType(ok_type, err_type):
 			StackResultType(
-				resolve_type(program, ok_type, seen_aliases),
-				resolve_type(program, err_type, seen_aliases),
+				resolve_type(index, ok_type, seen_aliases),
+				resolve_type(index, err_type, seen_aliases),
 			)
 		BoxedResultType(ok_type, err_type):
 			BoxedResultType(
-				resolve_type(program, ok_type, seen_aliases),
-				resolve_type(program, err_type, seen_aliases),
+				resolve_type(index, ok_type, seen_aliases),
+				resolve_type(index, err_type, seen_aliases),
 			)
 		FunctionType(is_pure, params, return_type):
 			FunctionType(
 				is_pure,
-				params.map(func(param): resolve_type(program, param, seen_aliases)),
-				resolve_type(program, return_type, seen_aliases),
+				params.map(func(param): resolve_type(index, param, seen_aliases)),
+				resolve_type(index, return_type, seen_aliases),
 			)
 		TensorType(info):
 			TensorType(
-				{ info | element_type = resolve_type(program, info.element_type, seen_aliases) },
+				{ info | element_type = resolve_type(index, info.element_type, seen_aliases) },
 			)
 		TupleType(items):
 			TupleType(items.map(
-				func(item): resolve_type(program, item, seen_aliases),
+				func(item): resolve_type(index, item, seen_aliases),
 			))
 		_:
 			typ
 
 
+pure func resolve_layout_type_with_index(index: CoreLayoutTypeIndex, typ: CoreType) -> CoreType:
+	resolve_type(index, typ, [])
+
+
 pure func resolve_layout_type(program: CoreProgram, typ: CoreType) -> CoreType:
-	resolve_type(program, typ, [])
+	resolve_layout_type_with_index(build_layout_type_index(program), typ)
 
 
-private pure func list_element_type(program: CoreProgram, typ: CoreType) -> Option[CoreType]:
-	match resolve_layout_type(program, typ):
+private pure func list_element_type(index: CoreLayoutTypeIndex, typ: CoreType) -> Option[CoreType]:
+	match resolve_layout_type_with_index(index, typ):
 		NamedType(name, args):
 			if name == "List":
 				match args:
 					[element_type]:
-						Some(resolve_layout_type(program, element_type))
+						Some(resolve_layout_type_with_index(index, element_type))
 					_:
 						None
 			else:
@@ -335,9 +351,10 @@ private pure func named_decl_layout(
 
 private pure func list_layout_for_element_type(
 	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	element_type: CoreType,
 ) -> CoreListStorageLayout:
-	element: CoreType = resolve_layout_type(program, element_type)
+	element: CoreType = resolve_layout_type_with_index(index, element_type)
 
 	match element:
 		NamedType(name, args):
@@ -352,8 +369,8 @@ private pure func list_layout_for_element_type(
 						match args:
 							[payload_type]:
 								match TypeLayout.stack_option_c_type(
-									resolve_layout_type(
-										program,
+									resolve_layout_type_with_index(
+										index,
 										payload_type,
 									),
 								):
@@ -383,12 +400,20 @@ private pure func list_layout_for_element_type(
 			PointerListStorage
 
 
-pure func list_layout_for_type(program: CoreProgram, list_type: CoreType) -> CoreListStorageLayout:
-	match list_element_type(program, list_type):
+private pure func list_layout_for_type_with_index(
+	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
+	list_type: CoreType,
+) -> CoreListStorageLayout:
+	match list_element_type(index, list_type):
 		Some(element_type):
-			list_layout_for_element_type(program, element_type)
+			list_layout_for_element_type(program, index, element_type)
 		None:
 			PointerListStorage
+
+
+pure func list_layout_for_type(program: CoreProgram, list_type: CoreType) -> CoreListStorageLayout:
+	list_layout_for_type_with_index(program, build_layout_type_index(program), list_type)
 
 
 private pure func named_pointer_element_needs_release(name: String, args: List[CoreType]) -> Bool:
@@ -423,10 +448,14 @@ private pure func named_decl_needs_release(program: CoreProgram, name: String) -
 	)
 
 
-pure func list_element_needs_release(program: CoreProgram, typ: CoreType) -> Bool:
-	element: CoreType = resolve_layout_type(program, typ)
+private pure func list_element_needs_release_with_index(
+	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+) -> Bool:
+	element: CoreType = resolve_layout_type_with_index(index, typ)
 
-	match list_layout_for_element_type(program, element):
+	match list_layout_for_element_type(program, index, element):
 		InlineListStorage(_):
 			False
 		InlineStructListStorage(_):
@@ -454,8 +483,13 @@ pure func list_element_needs_release(program: CoreProgram, typ: CoreType) -> Boo
 					False
 
 
+pure func list_element_needs_release(program: CoreProgram, typ: CoreType) -> Bool:
+	list_element_needs_release_with_index(program, build_layout_type_index(program), typ)
+
+
 private pure func relayout_list_construct_elements(
 	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	element_type: Option[CoreType],
 	elements: List[CoreBoxedStorageValue],
 ) -> List[CoreBoxedStorageValue]:
@@ -465,55 +499,75 @@ private pure func relayout_list_construct_elements(
 			-- graph needed to distinguish heap records and unions from other
 			-- named types. Repair the per-element ownership metadata together
 			-- with the list-wide layout so Perceus sees one coherent policy.
-			needs_release: Bool = list_element_needs_release(program, element)
-			elements.map(func(value): { value | needs_release = needs_release })
+			needs_release: Bool = list_element_needs_release_with_index(program, index, element)
+			if elements.all(func(value): value.needs_release == needs_release):
+				elements
+			else:
+				elements.map(func(value): { value | needs_release = needs_release })
 		None:
 			elements
 
 
-private pure func relayout_expr(program: CoreProgram, expr: CoreExpr) -> CoreExpr:
+private pure func relayout_expr(
+	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
+	expr: CoreExpr,
+) -> CoreExpr:
 	rewritten_children: CoreExpr = map_core_expr_children(
 		expr,
-		pure func(child): relayout_expr(program, child),
+		pure func(child): relayout_expr(program, index, child),
 	)
 
 	match rewritten_children:
 		ListConstructExpr(construct, typ, loc):
-			element_type: Option[CoreType] = list_element_type(program, typ)
+			element_type: Option[CoreType] = list_element_type(index, typ)
 			ListConstructExpr(
 				{ construct |
-					layout = list_layout_for_type(program, typ),
+					layout = list_layout_for_type_with_index(program, index, typ),
 					elements = relayout_list_construct_elements(
 						program,
+						index,
 						element_type,
 						construct.elements,
 					),
 					elem_needs_release = element_type
-						.map(func(element): list_element_needs_release(program, element))
+						.map(
+							func(
+								element,
+							): list_element_needs_release_with_index(program, index, element),
+						)
 						.get_or(False)
 				},
 				typ,
 				loc,
 			)
 		ListAllocExpr(alloc, typ, loc):
-			element_type: Option[CoreType] = list_element_type(program, typ)
+			element_type: Option[CoreType] = list_element_type(index, typ)
 			ListAllocExpr(
 				{ alloc |
-					layout = list_layout_for_type(program, typ),
+					layout = list_layout_for_type_with_index(program, index, typ),
 					elem_needs_release = element_type
-						.map(func(element): list_element_needs_release(program, element))
+						.map(
+							func(
+								element,
+							): list_element_needs_release_with_index(program, index, element),
+						)
 						.get_or(False)
 				},
 				typ,
 				loc,
 			)
 		ListHandoffExpr(handoff, typ, loc):
-			element_type: Option[CoreType] = list_element_type(program, handoff.result_type)
+			element_type: Option[CoreType] = list_element_type(index, handoff.result_type)
 			ListHandoffExpr(
 				{ handoff |
-					layout = list_layout_for_type(program, handoff.result_type),
+					layout = list_layout_for_type_with_index(program, index, handoff.result_type),
 					elem_needs_release = element_type
-						.map(func(element): list_element_needs_release(program, element))
+						.map(
+							func(
+								element,
+							): list_element_needs_release_with_index(program, index, element),
+						)
 						.get_or(False)
 				},
 				typ,
@@ -525,26 +579,37 @@ private pure func relayout_expr(program: CoreProgram, expr: CoreExpr) -> CoreExp
 
 private pure func relayout_function(
 	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
 	function_info: CoreFunction,
 ) -> CoreFunction:
-	{ function_info | body = function_info.body.map(func(body): relayout_expr(program, body)) }
+	{ function_info |
+		body = function_info.body.map(func(body): relayout_expr(program, index, body))
+	}
 
 
-private pure func relayout_global(program: CoreProgram, global: CoreGlobal) -> CoreGlobal:
-	{ global | init = relayout_expr(program, global.init) }
+private pure func relayout_global(
+	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = relayout_expr(program, index, global.init) }
 
 
-private pure func relayout_decl(program: CoreProgram, decl: CoreDecl) -> CoreDecl:
+private pure func relayout_decl(
+	program: CoreProgram,
+	index: CoreLayoutTypeIndex,
+	decl: CoreDecl,
+) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(relayout_function(program, function_info))
+			FunctionDecl(relayout_function(program, index, function_info))
 		GlobalDecl(global):
-			GlobalDecl(relayout_global(program, global))
+			GlobalDecl(relayout_global(program, index, global))
 		ImplDecl(impl_decl):
 			ImplDecl(
 				{ impl_decl |
 					methods = impl_decl.methods.map(
-						func(method): relayout_function(program, method),
+						func(method): relayout_function(program, index, method),
 					)
 				},
 			)
@@ -553,7 +618,8 @@ private pure func relayout_decl(program: CoreProgram, decl: CoreDecl) -> CoreDec
 
 
 pure func annotate_list_layouts(program: CoreProgram) -> CoreProgram:
+	index: CoreLayoutTypeIndex = build_layout_type_index(program)
 	{
-		decls = program.decls.map(func(decl): relayout_decl(program, decl)),
+		decls = program.decls.map(func(decl): relayout_decl(program, index, decl)),
 		foreign_includes = program.foreign_includes
 	}

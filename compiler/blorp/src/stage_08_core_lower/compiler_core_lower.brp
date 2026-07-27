@@ -395,7 +395,7 @@ import:
 		CoreValueRecordField,
 		CoreVar,
 	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
-	compiler_core_identity: flatten_canonical_core_type_name
+	compiler_core_identity: flatten_canonical_core_type_name, sanitize_core_module_name
 
 
 private UFCS_PREFIX: String = "__ufcs_"
@@ -560,6 +560,13 @@ private pure func trait_method_target_name(module_path: String, source_name: Str
 	UFCS_PREFIX + module_path.replace("/", "$") + "__" + source_name
 
 
+private pure func imported_callable_target_name(
+	module_path: String,
+	source_name: String,
+) -> String:
+	sanitize_core_module_name(module_path) + "__" + source_name
+
+
 private pure func lowered_name_expr_name(
 	name: ParsedIdentifier,
 	info: CompilerTypedExprInfo,
@@ -567,6 +574,8 @@ private pure func lowered_name_expr_name(
 	match info.resolved_call:
 		Some(resolved):
 			match resolved.target:
+				CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
+					imported_callable_target_name(module_path, resolved.source_name)
 				CompilerResolvedTraitMethodCall(_, Some(target)):
 					trait_method_target_name(target.module_path, resolved.source_name)
 				_:
@@ -692,6 +701,27 @@ private pure func compiler_core_lower_type_list(
 			Ok(lowered)
 
 
+private pure func compiler_core_lower_value_type_list(
+	types: List[CompilerType],
+) -> Result[List[CoreType], CompilerCoreLowerError]:
+	var lowered: List[CoreType] = []
+	var failure: Option[CompilerCoreLowerError] = None
+
+	for typ in types:
+		if failure.is_none():
+			match compiler_core_lower_value_type(typ):
+				Ok(lowered_type):
+					lowered = lowered.append(lowered_type)
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(lowered)
+
+
 pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, CompilerCoreLowerError]:
 	match compiler_array_type_parts(typ):
 		Some((element, dims)):
@@ -724,7 +754,7 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 							),
 						)
 					else:
-						lowered_args ?= compiler_core_lower_type_list(args)
+						lowered_args ?= compiler_core_lower_value_type_list(args)
 						Ok(NamedType(normalized, lowered_args))
 				CompilerTupleType(elements):
 					lowered_elements ?= compiler_core_lower_type_list(elements)
@@ -3745,6 +3775,31 @@ private pure func lower_resolved_call_kind(
 			Ok(UnknownCall)
 
 
+private pure func lower_resolved_call_callee(
+	resolved: Option[CompilerResolvedCallInfo],
+	callee: CoreExpr,
+) -> CoreExpr:
+	match (resolved, callee):
+		(
+			Some(info),
+			VarExpr(variable, typ, loc),
+		):
+			match info.target:
+				CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
+					VarExpr(
+						{
+							variable |
+							name = trait_method_target_name(module_path, info.source_name)
+						},
+						typ,
+						loc,
+					)
+				_:
+					VarExpr(variable, typ, loc)
+		_:
+			callee
+
+
 private pure func lower_question_bind_success_type(
 	annotation: Option[CompilerType],
 	rhs_type: CoreType,
@@ -4347,7 +4402,11 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			lowered_right ?= lower_typed_expr(right)
 			Ok(LogicalExpr(compiler_core_logical_op(op), lowered_left, lowered_right, typ, loc))
 		CompilerTypedCallExpr(callee, args, _, info):
-			lowered_callee ?= lower_typed_expr(callee)
+			raw_lowered_callee ?= lower_typed_expr(callee)
+			lowered_callee = lower_resolved_call_callee(
+				info.resolved_call,
+				raw_lowered_callee,
+			)
 			lowered_args ?= lower_typed_exprs(args)
 			call_kind ?= lower_resolved_call_kind(info.resolved_call, lowered_callee)
 			Ok(CallExpr(call_kind, lowered_callee, lowered_args, typ, loc))
