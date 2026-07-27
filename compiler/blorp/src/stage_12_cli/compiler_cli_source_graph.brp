@@ -1,10 +1,12 @@
 -- Source reading, package source resolution, and import graph discovery for the Blorp CLI.
 import:
 	../stage_01_file_io/compiler_embedded_std: embedded_std_source
-	../stage_03_parse/compiler_parsed_ast:
-		ParsedProgram,
-		ParsedProgramPhase(TypecheckSourceProgram),
+	../stage_03_parse/compiler_parsed_ast: ParsedProgram
 	../stage_03_parse/compiler_parser_bridge as ParserBridge
+	../stage_03_parse/compiler_source_ast_finalize:
+		finalized_typecheck_program_ast,
+		finalized_typecheck_program_matches_source,
+	../stage_04_modules/compiler_module_surface: module_surface_for_program
 	../stage_11_format/compiler_format: FormatCommandResult, run_format_command
 	compiler_cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
 	compiler_cli_plan:
@@ -27,11 +29,6 @@ import:
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 	fs: message, open_read, read_text
-	json:
-		JsonValue(JsonNull, JsonObject, JsonString, JsonVector),
-		as_array,
-		as_string,
-		get_field,
 	path: dirname, join, normalize, stem
 	system: file_exists, getcwd, getenv, is_directory, temp_dir, walk_dir
 	toml: TomlValue(TomlArray, TomlString, TomlTable), lookup as toml_lookup, parse as parse_toml
@@ -221,7 +218,7 @@ private func read_cli_source_file(path: String) -> Result[CliSourceFile, String]
 	})
 
 
-private func read_cli_source_file_for_action(
+func read_cli_source_file_for_action(
 	action: CliAction,
 	path: String,
 ) -> Result[CliSourceFile, String]:
@@ -276,11 +273,10 @@ pure func single_explicit_check_source(
 
 
 func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, String]:
-	artifact = ParserBridge.parsed_source_bridge_artifact(
+	artifact = ParserBridge.parsed_typecheck_source_bridge_artifact(
 		source.path,
 		source.module_name,
 		source.source_text,
-		TypecheckSourceProgram,
 		False,
 	)
 	Ok({
@@ -293,16 +289,13 @@ func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, Stri
 
 
 pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSourceFile:
-	artifact = ParserBridge.parsed_source_bridge_artifact_from_program(
-		program,
-		TypecheckSourceProgram,
-	)
+	artifact = ParserBridge.parsed_typecheck_source_bridge_artifact_from_program(program)
 	{
 		path = owned_string(program.source.path),
 		module_name = owned_string(program.source.module_name),
 		source_text = owned_string(program.source.text),
 		parsed_source = artifact.json,
-		typecheck_program = artifact.program,
+		typecheck_program = artifact.program
 	}
 
 
@@ -352,74 +345,26 @@ record CliSourceGraphDiscovery {
 }
 
 
-private pure func json_array_field(
-	value: JsonValue,
-	name: String,
-) -> Result[List[JsonValue], String]:
-	match get_field(value, name):
-		Some(field):
-			match as_array(field):
-				Some(items):
-					Ok(items)
-				None:
-					Err("module surface field `" + name + "` was not an array")
-		None:
-			Err("module surface missing field `" + name + "`")
-
-
-private pure func json_string_field(value: JsonValue, name: String) -> Result[String, String]:
-	match get_field(value, name):
-		Some(field):
-			match as_string(field):
-				Some(text):
-					Ok(text)
-				None:
-					Err("module surface field `" + name + "` was not a string")
-		None:
-			Err("module surface missing field `" + name + "`")
-
-
-private pure func module_surface_import_paths_json(
-	surface: JsonValue,
-) -> Result[List[String], String]:
-	var imports: List[String] = []
-	var error: Option[String] = None
-
-	items ?= json_array_field(surface, "imports")
-
-	for item in items:
-		match error:
-			Some(_):
-				break
-			None:
-				match json_string_field(item, "module_path"):
-					Ok(module_path):
-						imports = imports.append(module_path)
-					Err(message):
-						error = Some(message)
-
-	match error:
-		Some(message):
-			Err(message)
-		None:
-			Ok(imports)
-
-
-private pure func parsed_source_module_surface(
-	source: CliParsedSourceFile,
-) -> Result[JsonValue, String]:
-	match get_field(source.parsed_source, "module_surface"):
-		Some(surface):
-			Ok(surface)
-		None:
-			Err("parsed source `" + source.path + "` missing module_surface")
-
-
 private pure func parsed_source_import_paths(
 	source: CliParsedSourceFile,
 ) -> Result[List[String], String]:
-	surface ?= parsed_source_module_surface(source)
-	module_surface_import_paths_json(surface)
+	program = if finalized_typecheck_program_matches_source(
+		source.typecheck_program,
+		source.path,
+		source.module_name,
+		source.source_text,
+	):
+		finalized_typecheck_program_ast(source.typecheck_program)
+	else:
+		artifact = ParserBridge.parsed_typecheck_source_bridge_artifact(
+			source.path,
+			source.module_name,
+			source.source_text,
+			False,
+		)
+		finalized_typecheck_program_ast(artifact.program)
+
+	Ok(module_surface_for_program(program).import_paths)
 
 
 private pure func action_std_dir(action: CliAction) -> Option[String]:
@@ -1119,9 +1064,9 @@ record CliSourceGraphSetup {
 }
 
 
-private func source_graph_setup_for_sources(
+func source_graph_setup_for_paths(
 	action: CliAction,
-	roots: List[CliParsedSourceFile],
+	root_paths: List[String],
 ) -> CliSourceGraphSetup:
 	var std_dir: Option[String] = action_or_env_std_dir(action)
 	var source_packages: List[CliFrontendSourcePackage] = []
@@ -1132,8 +1077,8 @@ private func source_graph_setup_for_sources(
 	if is_directory(cwd_pkg):
 		package_roots = append_unique_string(package_roots, normalize(cwd_pkg))
 
-	for root in roots:
-		base_dir: String = dirname(root.path)
+	for root_path in root_paths:
+		base_dir: String = dirname(root_path)
 
 		match find_blorp_config_from_dir(base_dir):
 			Some(config_path):
@@ -1163,6 +1108,16 @@ private func source_graph_setup_for_sources(
 		},
 		diagnostics = diagnostics
 	}
+
+
+private func source_graph_setup_for_sources(
+	action: CliAction,
+	roots: List[CliParsedSourceFile],
+) -> CliSourceGraphSetup:
+	source_graph_setup_for_paths(
+		action,
+		roots.map(func(root): root.path),
+	)
 
 
 private pure func source_identity_seen(
@@ -1252,11 +1207,73 @@ private func configured_std_module_name(
 			None
 
 
-private pure func parsed_program_with_module_name(
-	program: ParsedProgram,
+private pure func parsed_source_with_module_name(
+	source: CliParsedSourceFile,
 	module_name: String,
-) -> ParsedProgram:
-	{ program | source = { program.source | module_name = module_name } }
+) -> CliParsedSourceFile:
+	artifact = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		source.path,
+		module_name,
+		source.source_text,
+		False,
+	)
+	{ source |
+		module_name = module_name,
+		parsed_source = artifact.json,
+		typecheck_program = artifact.program
+	}
+
+
+private pure func cli_source_with_module_name(
+	source: CliSourceFile,
+	module_name: String,
+) -> CliSourceFile:
+	{ source | module_name = module_name }
+
+
+private func parse_cli_source_with_context(
+	context: CliFrontendGraphContext,
+	source: CliSourceFile,
+) -> Result[CliParsedSourceFile, String]:
+	match configured_std_module_name(context, source.path):
+		Some(module_name):
+			if module_name == source.module_name:
+				parse_cli_source(source)
+			else:
+				parse_cli_source(cli_source_with_module_name(source, module_name))
+		None:
+			parse_cli_source(source)
+
+
+func parse_cli_source_with_setup(
+	setup: CliSourceGraphSetup,
+	source: CliSourceFile,
+) -> Result[CliParsedSourceFile, String]:
+	parse_cli_source_with_context(setup.context, source)
+
+
+func parse_cli_sources_with_setup(
+	setup: CliSourceGraphSetup,
+	sources: List[CliSourceFile],
+) -> Result[List[CliParsedSourceFile], String]:
+	var parsed_sources: List[CliParsedSourceFile] = []
+	var error: Option[String] = None
+
+	for source in sources:
+		if error.is_some():
+			break
+
+		match parse_cli_source_with_context(setup.context, source):
+			Ok(parsed):
+				parsed_sources = parsed_sources.append(parsed)
+			Err(message):
+				error = Some(message)
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(parsed_sources)
 
 
 private func normalize_root_module_name(
@@ -1265,11 +1282,10 @@ private func normalize_root_module_name(
 ) -> CliParsedSourceFile:
 	match configured_std_module_name(context, source.path):
 		Some(module_name):
-			{
-				source |
-				module_name = module_name,
-				typecheck_program = parsed_program_with_module_name(source.typecheck_program, module_name)
-			}
+			if module_name == source.module_name:
+				source
+			else:
+				parsed_source_with_module_name(source, module_name)
 		None:
 			source
 
@@ -2021,6 +2037,13 @@ func frontend_module_graph_for_roots(
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
 	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
+	frontend_module_graph_for_roots_with_setup(setup, roots)
+
+
+func frontend_module_graph_for_roots_with_setup(
+	setup: CliSourceGraphSetup,
+	roots: List[CliParsedSourceFile],
+) -> Result[CliFrontendModuleGraph, String]:
 	context: CliFrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
 	walk ?= source_graph_walk_for_roots(context, normalized_roots, True)
@@ -2089,4 +2112,5 @@ func parse_cli_source_file_for_action(
 	path: String,
 ) -> Result[CliParsedSourceFile, String]:
 	source ?= read_cli_source_file_for_action(action, path)
-	parse_cli_source(source)
+	setup = source_graph_setup_for_paths(action, [path])
+	parse_cli_source_with_setup(setup, source)

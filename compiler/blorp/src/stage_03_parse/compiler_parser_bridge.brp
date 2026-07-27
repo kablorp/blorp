@@ -26,7 +26,11 @@ import:
 		parsed_program_phase_name,
 	compiler_parsed_ast_json: parsed_program_to_json
 	compiler_parser: parse_compiler_source
-	compiler_source_ast_finalize: finalize_typecheck_source_program
+	compiler_source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalize_typecheck_source_program,
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
 	json:
 		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -49,8 +53,8 @@ private pure func owned_string(text: String) -> String:
 	text.substring(0, text.length())
 
 
-record ParsedSourceBridgeArtifact {
-	program: ParsedProgram,
+record ParsedTypecheckSourceBridgeArtifact {
+	program: FinalizedTypecheckProgram,
 	json: JsonValue
 }
 
@@ -164,17 +168,6 @@ private pure func source_comment_jsons(source: CompilerSourceFile) -> JsonValue:
 	JsonVector(comments)
 
 
-private pure func parsed_program_for_phase(
-	program: ParsedProgram,
-	phase: ParsedProgramPhase,
-) -> ParsedProgram:
-	match phase:
-		RawParsedProgram:
-			program
-		TypecheckSourceProgram:
-			finalize_typecheck_source_program(program)
-
-
 private pure func parsed_source_artifact_fields(
 	program: ParsedProgram,
 	phase: ParsedProgramPhase,
@@ -188,47 +181,66 @@ private pure func parsed_source_artifact_fields(
 	]
 
 
-pure func parsed_source_bridge_artifact_from_program(
-	program: ParsedProgram,
+private pure func parsed_source_bridge_json(
+	source_file: CompilerSourceFile,
 	phase: ParsedProgramPhase,
-) -> ParsedSourceBridgeArtifact:
-	final_program = parsed_program_for_phase(program, phase)
+	program: ParsedProgram,
+	include_comments: Bool,
+) -> JsonValue:
+	var fields: List[(String, JsonValue)] = parsed_source_artifact_fields(program, phase)
+
+	if include_comments:
+		fields = fields.append(("comments", source_comment_jsons(source_file)))
+
+	JsonObject(fields)
+
+
+private pure func parsed_typecheck_source_bridge_artifact_for_program(
+	program: ParsedProgram,
+	include_comments: Bool,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	finalized_program = finalized_typecheck_program(program)
+	parsed_program = finalized_typecheck_program_ast(finalized_program)
+
 	{
-		program = final_program,
-		json = JsonObject(parsed_source_artifact_fields(final_program, phase))
+		program = finalized_program,
+		json = parsed_source_bridge_json(
+			program.source,
+			TypecheckSourceProgram,
+			parsed_program,
+			include_comments,
+		)
 	}
+
+
+pure func parsed_typecheck_source_bridge_artifact_from_program(
+	program: ParsedProgram,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	parsed_typecheck_source_bridge_artifact_for_program(program, False)
+
+
+pure func parsed_typecheck_source_bridge_artifact(
+	path: String,
+	module_name: String,
+	text: String,
+	include_comments: Bool,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	source_file = compiler_source_file(path, module_name, text)
+	parsed_typecheck_source_bridge_artifact_for_program(
+		parse_compiler_source(source_file),
+		include_comments,
+	)
 
 
 pure func parsed_source_artifact_from_program(
 	program: ParsedProgram,
 	phase: ParsedProgramPhase,
 ) -> JsonValue:
-	parsed_source_bridge_artifact_from_program(program, phase).json
-
-
-pure func parsed_source_bridge_artifact(
-	path: String,
-	module_name: String,
-	text: String,
-	phase: ParsedProgramPhase,
-	include_comments: Bool,
-) -> ParsedSourceBridgeArtifact:
-	source_file = compiler_source_file(path, module_name, text)
-	artifact = parsed_source_bridge_artifact_from_program(
-		parse_compiler_source(source_file),
-		phase,
-	)
-
-	if include_comments:
-		{
-			artifact |
-				json = JsonObject(
-					parsed_source_artifact_fields(artifact.program, phase)
-						.append(("comments", source_comment_jsons(source_file))),
-				)
-		}
-	else:
-		artifact
+	match phase:
+		RawParsedProgram:
+			JsonObject(parsed_source_artifact_fields(program, RawParsedProgram))
+		TypecheckSourceProgram:
+			parsed_typecheck_source_bridge_artifact_from_program(program).json
 
 
 private pure func parsed_source_artifact(
@@ -238,7 +250,13 @@ private pure func parsed_source_artifact(
 	phase: ParsedProgramPhase,
 	include_comments: Bool,
 ) -> JsonValue:
-	parsed_source_bridge_artifact(path, module_name, text, phase, include_comments).json
+	match phase:
+		RawParsedProgram:
+			source_file = compiler_source_file(path, module_name, text)
+			program = parse_compiler_source(source_file)
+			parsed_source_bridge_json(source_file, RawParsedProgram, program, include_comments)
+		TypecheckSourceProgram:
+			parsed_typecheck_source_bridge_artifact(path, module_name, text, include_comments).json
 
 
 private pure func parser_retention_stats_json(stats: MemStats) -> JsonValue:
@@ -259,6 +277,7 @@ private func parsed_source_retention_artifact(
 ) -> JsonValue:
 	source_file = compiler_source_file(path, module_name, text)
 	raw_program = parse_compiler_source(source_file)
+
 	program = match phase:
 		RawParsedProgram:
 			raw_program
@@ -410,8 +429,10 @@ func handle_retention_request_value(root: JsonValue, print_live_types: Bool) -> 
 		Ok(envelope):
 			match envelope.action:
 				ParseSourceAction:
-					handle_parse_source_retention(envelope.payload, print_live_types)
-						.get_or_else(dispatch_error_json)
+					handle_parse_source_retention(
+						envelope.payload,
+						print_live_types,
+					).get_or_else(dispatch_error_json)
 				_:
 					dispatch_error_json(UnsupportedBridgeAction(envelope.action))
 		Err(error):

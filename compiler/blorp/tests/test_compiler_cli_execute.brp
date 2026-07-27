@@ -1,8 +1,6 @@
 import:
-	../src/stage_03_parse/compiler_parsed_ast:
-		ParsedProgram,
-		ParsedProgramPhase(TypecheckSourceProgram),
 	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_03_parse/compiler_source_ast_finalize: FinalizedTypecheckProgram
 	../src/stage_09_core/compiler_core_json:
 		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
@@ -46,7 +44,7 @@ import:
 	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
 	io: print_error
 	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
-	system: remove_file, temp_dir, write_file
+	system: mkdir, remove_dir, remove_file, temp_dir, write_file
 	test: TestSuite
 
 
@@ -62,10 +60,8 @@ pure func typecheck_program_fixture(
 	path: String,
 	module_name: String,
 	source: String,
-) -> ParsedProgram:
-	ParserBridge
-		.parsed_source_bridge_artifact(path, module_name, source, TypecheckSourceProgram, False)
-		.program
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
 
 
 pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
@@ -292,6 +288,49 @@ func test_check_reports_imported_module_errors() -> Bool:
 			result.status == 1 and result.stderr.contains("nonexistent_var")
 		_:
 			False
+
+
+func cleanup_configured_std_root(std_dir: String) -> Void:
+	_ = remove_file(std_dir + "/prelude.brp")
+	_ = remove_file(std_dir + "/constants.brp")
+	_ = remove_dir(std_dir)
+
+
+func test_check_configured_std_root_uses_canonical_module_spans() -> Bool:
+	std_dir: String = temp_dir() + "/blorp_cli_execute_configured_library"
+	source_path: String = std_dir + "/constants.brp"
+	cleanup_configured_std_root(std_dir)
+
+	source: String =
+		|ANSWER: Int = 42
+		|
+		|func main(args: List[String]) -> Int:
+		|	ANSWER
+
+	if not ((
+		mkdir(std_dir)
+		and write_file(std_dir + "/prelude.brp", "").is_ok()
+		and write_file(source_path, source).is_ok()
+	)):
+		cleanup_configured_std_root(std_dir)
+		False
+	else:
+		plan = run_cli([
+			"check",
+			"--no-format",
+			"--std-dir",
+			std_dir,
+			source_path,
+		])
+		cleanup_configured_std_root(std_dir)
+
+		match plan:
+			CliRunCheck(check_plan):
+				result = execute_check_plan(check_plan)
+
+				result.status == 0 and result.stderr == ""
+			_:
+				False
 
 
 pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bool:
@@ -662,54 +701,58 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 		roots = [
 			{
 				path = "/project/main.brp",
-					module_name = "main",
-					source_text = "",
-					parsed_source = JsonObject([]),
-					typecheck_program = typecheck_program_fixture("/project/main.brp", "main", ""),
-					origin = CliFrontendUserModule
-				},
+				module_name = "main",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				typecheck_program = typecheck_program_fixture("/project/main.brp", "main", ""),
+				origin = CliFrontendUserModule
+			},
 		],
 		modules = [
 			{
 				path = "/builtin/raylib.brp",
-					module_name = "pkg/raylib/core",
-					source_text = "",
-					parsed_source = JsonObject([]),
-					typecheck_program = typecheck_program_fixture(
-						"/builtin/raylib.brp",
-						"pkg/raylib/core",
-						"",
-					),
-					origin = CliFrontendPkgModule("raylib")
-				},
+				module_name = "pkg/raylib/core",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				typecheck_program = typecheck_program_fixture(
+					"/builtin/raylib.brp",
+					"pkg/raylib/core",
+					"",
+				),
+				origin = CliFrontendPkgModule("raylib")
+			},
 			{
 				path = "/project/std/net/tls.brp",
-					module_name = "std/net/tls",
-					source_text = "",
-					parsed_source = JsonObject([]),
-					typecheck_program = typecheck_program_fixture(
-						"/project/std/net/tls.brp",
-						"std/net/tls",
-						"",
-					),
-					origin = CliFrontendStdModule
-				},
+				module_name = "std/net/tls",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				typecheck_program = typecheck_program_fixture(
+					"/project/std/net/tls.brp",
+					"std/net/tls",
+					"",
+				),
+				origin = CliFrontendStdModule
+			},
 			{
 				path = "/other/raylib.brp",
-					module_name = "not_raylib",
-					source_text = "",
-					parsed_source = JsonObject([]),
-					typecheck_program = typecheck_program_fixture("/other/raylib.brp", "not_raylib", ""),
-					origin = CliFrontendUserModule
-				},
+				module_name = "not_raylib",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				typecheck_program = typecheck_program_fixture(
+					"/other/raylib.brp",
+					"not_raylib",
+					"",
+				),
+				origin = CliFrontendUserModule
+			},
 			{
 				path = "/other/tls.brp",
-					module_name = "std/net/tls",
-					source_text = "",
-					parsed_source = JsonObject([]),
-					typecheck_program = typecheck_program_fixture("/other/tls.brp", "std/net/tls", ""),
-					origin = CliFrontendUserModule
-				},
+				module_name = "std/net/tls",
+				source_text = "",
+				parsed_source = JsonObject([]),
+				typecheck_program = typecheck_program_fixture("/other/tls.brp", "std/net/tls", ""),
+				origin = CliFrontendUserModule
+			},
 		],
 		import_edges = [],
 		diagnostics = []
@@ -723,6 +766,10 @@ tests: TestSuite = {
 	tests = [
 		("check executes without host plan", test_check_executes_without_host_plan),
 		("check reports imported module errors", test_check_reports_imported_module_errors),
+		(
+			"check configured std root uses canonical module spans",
+			test_check_configured_std_root_uses_canonical_module_spans,
+		),
 		(
 			"check visits all roots and reports a shared dependency once",
 			test_check_visits_all_roots_and_reports_shared_dependency_once,
