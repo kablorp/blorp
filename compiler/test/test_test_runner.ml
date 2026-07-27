@@ -1011,6 +1011,17 @@ let test_compilation_groups_follow_source_budget_not_suite_count () =
        ~source_size:(function "large" -> 150 | _ -> 10)
        [ "large"; "small" ])
 
+let test_sanitized_harnesses_use_smaller_source_budget () =
+  let ordinary =
+    Blorp.Test_runner.combined_harness_source_budget_bytes ~sanitize:false
+  in
+  let sanitized =
+    Blorp.Test_runner.combined_harness_source_budget_bytes ~sanitize:true
+  in
+  Alcotest.(check bool)
+    "sanitizer instrumentation lowers the aggregate source budget" true
+    (sanitized < ordinary)
+
 let test_source_text_cache_guard_uses_current_file_contents () =
   with_temp_dir "blorp-source-cache-guard-" (fun dir ->
       let path = Filename.concat dir "sample.brp" in
@@ -1356,6 +1367,8 @@ let suite =
           test_runtime_sensitive_suite_paths_require_process_isolation;
         Alcotest.test_case "source_budget_compilation_groups" `Quick
           test_compilation_groups_follow_source_budget_not_suite_count;
+        Alcotest.test_case "sanitized_harness_source_budget" `Quick
+          test_sanitized_harnesses_use_smaller_source_budget;
         Alcotest.test_case "source_text_cache_guard" `Quick
           test_source_text_cache_guard_uses_current_file_contents;
         Alcotest.test_case "combined_harness_globals_and_result_cache" `Quick

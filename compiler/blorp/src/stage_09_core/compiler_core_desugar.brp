@@ -1,8 +1,8 @@
 -- Early Core desugaring for the Blorp-owned Core pipeline.
 --
--- This first slice covers string binary operators that already exist in the
--- prepared Core JSON model. Record-update and string-interpolation sugar are
--- still owned by the OCaml Core model until equivalent Blorp Core shapes exist.
+-- Blorp Core lowering already materializes record updates and string
+-- interpolation as ordinary Core expressions. This pass removes the remaining
+-- string operator sugar bottom-up from every Core expression container.
 -- Exact `target = target + suffix` assignments use the COW-consuming string
 -- append builtin so mutable accumulation can reuse uniquely owned storage.
 -- Left-nested additions such as `target = target + a + b` remain unchanged
@@ -10,176 +10,53 @@
 import:
 	compiler_core_json:
 		CoreBinaryOp(AddOp, EqualOp, NotEqualOp),
-		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall),
-		CoreDecl(
-			EnumDecl,
-			FunctionDecl,
-			GlobalDecl,
-			HeapRecordDecl,
-			ImplDecl,
-			TraitDecl,
-			TypeAliasDecl,
-			UnionDecl,
-			ValueRecordDecl,
-		),
-		CoreDictLiteralEntry,
-		CoreExpr(
-			AssignExpr,
-			BinaryExpr,
-			BreakExpr,
-			CallExpr,
-			ContinueExpr,
-			DebugBlockExpr,
-			DictExpr,
-			FieldExpr,
-			ForChannelExpr,
-			ForDictExpr,
-			ForListExpr,
-			ForRangeExpr,
-			ForResourceSourceExpr,
-			ForSetExpr,
-			ForStreamExpr,
-			ForStringExpr,
-			ForTensorExpr,
-			IfExpr,
-			LambdaExpr,
-			LetExpr,
-			ListConstructExpr,
-			LiteralExpr,
-			LogicalExpr,
-			PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr,
-			PreClosureDetachExpr,
-			RangeExpr,
-			RecordExpr,
-			SelectExpr,
-			SeqExpr,
-			TupleExpr,
-			TupleFieldExpr,
-			UnaryExpr,
-			VarExpr,
-			VectorExpr,
-			VoidExpr,
-			WhileExpr,
-		),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(AssignExpr, BinaryExpr, CallExpr, SeqExpr, UnaryExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreGlobal,
-		CoreListConstruct,
-		CoreLiteralMatchCase,
-		CoreLiteralMatchFallback(
-			LiteralMatchFallbackBindings,
-			LiteralMatchFallbackBody,
-			LiteralMatchFallbackFail,
-		),
 		CoreProgram,
-		CoreRecordFieldValue,
-		CoreSelectArm,
-		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
-		CoreSelectRecvArm,
 		CoreSourceLoc,
 		CoreType(NamedType, VoidType),
 		CoreUnaryOp(NotOp),
 		CoreVar,
+		core_expr_type,
+	compiler_core_traverse as CoreTraverse
 
 
-private pure func core_bool_type() -> CoreType:
-	NamedType("Bool", [])
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
 
 
-private pure func core_type_is_string(typ: CoreType) -> Bool:
+pure func core_type_is_string(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
-			(
-				(name == "String" or name == "std/string::String" or name == "std_string__String")
-				and args.length() == 0
-			)
+			if args.length() == 0:
+				(
+					name == "String"
+					or name == "LiteralString"
+					or name == "std/string::String"
+					or name == "std_string__String"
+				)
+			else:
+				False
 		_:
 			False
 
 
+pure func core_string_binary_requires_desugar(op: CoreBinaryOp, left_type: CoreType) -> Bool:
+	if not core_type_is_string(left_type):
+		False
+	else:
+		match op:
+			AddOp | EqualOp | NotEqualOp:
+				True
+			_:
+				False
+
+
 private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.uniq == right.uniq
-
-
-private pure func core_expr_type(expr: CoreExpr) -> CoreType:
-	match expr:
-		LiteralExpr(_, typ, _):
-			typ
-		VarExpr(_, typ, _):
-			typ
-		VoidExpr(typ, _):
-			typ
-		DebugBlockExpr(_, typ, _):
-			typ
-		CallExpr(_, _, _, typ, _):
-			typ
-		BinaryExpr(_, _, _, typ, _):
-			typ
-		UnaryExpr(_, _, typ, _):
-			typ
-		LogicalExpr(_, _, _, typ, _):
-			typ
-		AssignExpr(_, _, typ, _):
-			typ
-		FieldExpr(_, _, typ, _):
-			typ
-		TupleFieldExpr(_, _, typ, _):
-			typ
-		TupleExpr(_, typ, _):
-			typ
-		VectorExpr(_, typ, _):
-			typ
-		LambdaExpr(_, _, _, _, typ, _):
-			typ
-		ListConstructExpr(_, typ, _):
-			typ
-		DictExpr(_, typ, _):
-			typ
-		RecordExpr(_, typ, _):
-			typ
-		LetExpr(_, _, _, _, body):
-			core_expr_type(body)
-		SeqExpr(_, second):
-			core_expr_type(second)
-		WhileExpr(_, _, typ, _):
-			typ
-		BreakExpr(typ, _):
-			typ
-		ContinueExpr(typ, _):
-			typ
-		ForRangeExpr(_, _, _, _, typ, _):
-			typ
-		ForChannelExpr(_, typ, _):
-			typ
-		ForListExpr(_, typ, _):
-			typ
-		ForStringExpr(_, typ, _):
-			typ
-		ForDictExpr(_, typ, _):
-			typ
-		ForSetExpr(_, typ, _):
-			typ
-		ForStreamExpr(_, typ, _):
-			typ
-		ForResourceSourceExpr(_, typ, _):
-			typ
-		ForTensorExpr(_, typ, _):
-			typ
-		PreClosureConcurrentlyLoopExpr(_, typ, _):
-			typ
-		PreClosureConcurrentExpr(_, typ, _):
-			typ
-		PreClosureDetachExpr(_, typ, _):
-			typ
-		SelectExpr(_, typ, _):
-			typ
-		RangeExpr(_, _, typ, _):
-			typ
-		IfExpr(_, _, _, typ, _):
-			typ
-		_:
-			VoidType
 
 
 private pure func builtin_call(
@@ -204,7 +81,7 @@ private pure func desugar_string_binary(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	if core_type_is_string(core_expr_type(left)):
+	if core_string_binary_requires_desugar(op, core_expr_type(left)):
 		match op:
 			AddOp:
 				builtin_call(
@@ -217,305 +94,85 @@ private pure func desugar_string_binary(
 				builtin_call(
 					"blorp_string_eq",
 					[left, right],
-					core_bool_type(),
+					named_type("Bool"),
 					loc,
 				)
 			NotEqualOp:
 				eq = builtin_call(
 					"blorp_string_eq",
 					[left, right],
-					core_bool_type(),
+					named_type("Bool"),
 					loc,
 				)
-				UnaryExpr(NotOp, eq, core_bool_type(), loc)
+				UnaryExpr(NotOp, eq, named_type("Bool"), loc)
 			_:
 				BinaryExpr(op, left, right, typ, loc)
 	else:
 		BinaryExpr(op, left, right, typ, loc)
 
 
-private pure func desugar_boxed_value(value: CoreBoxedStorageValue) -> CoreBoxedStorageValue:
-	{ value | value = desugar_expr(value.value) }
-
-
-private pure func desugar_list_construct(construct: CoreListConstruct) -> CoreListConstruct:
-	{ construct | elements = construct.elements.map(desugar_boxed_value) }
-
-
-private pure func desugar_dict_entry(entry: CoreDictLiteralEntry) -> CoreDictLiteralEntry:
-	{
-		key = desugar_expr(entry.key),
-		value = desugar_expr(entry.value)
-	}
-
-
-private pure func desugar_record_field(field: CoreRecordFieldValue) -> CoreRecordFieldValue:
-	{ field | value = desugar_expr(field.value) }
-
-
-private pure func desugar_optional_expr(value: Option[CoreExpr]) -> Option[CoreExpr]:
-	value.map(desugar_expr)
-
-
-private pure func desugar_select_recv(recv: CoreSelectRecvArm) -> CoreSelectRecvArm:
-	{ recv | channel = desugar_expr(recv.channel) }
-
-
-private pure func desugar_select_arm_kind(kind: CoreSelectArmKind) -> CoreSelectArmKind:
-	match kind:
-		SelectRecvArm(recv):
-			SelectRecvArm(desugar_select_recv(recv))
-		SelectSealedArm(channel):
-			SelectSealedArm(desugar_expr(channel))
-		SelectAfterArm(timeout):
-			SelectAfterArm(desugar_expr(timeout))
-
-
-private pure func desugar_select_arm(arm: CoreSelectArm) -> CoreSelectArm:
-	{
-		kind = desugar_select_arm_kind(arm.kind),
-		body = desugar_expr(arm.body),
-		loc = arm.loc
-	}
-
-
-private pure func desugar_literal_match_case(
-	match_case: CoreLiteralMatchCase,
-) -> CoreLiteralMatchCase:
-	{ match_case | body = desugar_expr(match_case.body) }
-
-
-private pure func desugar_literal_match_fallback(
-	fallback: CoreLiteralMatchFallback,
-) -> CoreLiteralMatchFallback:
-	match fallback:
-		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(desugar_expr(body))
-		LiteralMatchFallbackBindings(bindings, body):
-			LiteralMatchFallbackBindings(bindings, desugar_expr(body))
-		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
-
-
-pure func desugar_expr(expr: CoreExpr) -> CoreExpr:
+-- The concat child has already been rewritten when this runs. Matching that
+-- post-desugar shape keeps the ordering aligned with OCaml's bottom-up pass.
+private pure func desugar_accumulator_assignment(expr: CoreExpr) -> CoreExpr:
 	match expr:
-		CallExpr(kind, callee, args, typ, loc):
-			CallExpr(
-				kind,
-				desugar_expr(callee),
-				args.map(desugar_expr),
-				typ,
-				loc,
-			)
-		BinaryExpr(op, left, right, typ, loc):
-			desugar_string_binary(op, desugar_expr(left), desugar_expr(right), typ, loc)
-		UnaryExpr(op, expr_value, typ, loc):
-			UnaryExpr(op, desugar_expr(expr_value), typ, loc)
-		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(op, desugar_expr(left), desugar_expr(right), typ, loc)
 		AssignExpr(variable, rhs, typ, loc):
 			match rhs:
-				BinaryExpr(AddOp, VarExpr(source, source_type, source_loc), suffix, rhs_type, rhs_loc):
-					if (
-						core_vars_equal(variable, source)
-						and core_type_is_string(source_type)
-						and core_type_is_string(rhs_type)
-					):
-						AssignExpr(
-							variable,
-							builtin_call(
-								"blorp_string_append",
-								[VarExpr(source, source_type, source_loc), desugar_expr(suffix)],
-								rhs_type,
-								rhs_loc,
-							),
-							typ,
-							loc,
-						)
+				CallExpr(BuiltinCall(name), _, args, rhs_type, rhs_loc):
+					if name == "blorp_string_concat" and core_type_is_string(rhs_type):
+						match args.get(0):
+							Some(VarExpr(source, source_type, source_loc)):
+								match args.get(1):
+									Some(suffix):
+										if args.length() == 2 and core_vars_equal(variable, source):
+											AssignExpr(
+												variable,
+												builtin_call(
+													"blorp_string_append",
+													[
+														VarExpr(source, source_type, source_loc),
+														suffix,
+													],
+													rhs_type,
+													rhs_loc,
+												),
+												typ,
+												loc,
+											)
+										else:
+											expr
+									None:
+										expr
+							Some(_):
+								expr
+							None:
+								expr
 					else:
-						AssignExpr(variable, desugar_expr(rhs), typ, loc)
+						expr
 				_:
-					AssignExpr(variable, desugar_expr(rhs), typ, loc)
-		FieldExpr(expr_value, field_name, typ, loc):
-			FieldExpr(desugar_expr(expr_value), field_name, typ, loc)
-		TupleFieldExpr(expr_value, field_index, typ, loc):
-			TupleFieldExpr(desugar_expr(expr_value), field_index, typ, loc)
-		TupleExpr(items, typ, loc):
-			TupleExpr(
-				items.map(desugar_expr),
-				typ,
-				loc,
-			)
-		VectorExpr(items, typ, loc):
-			VectorExpr(
-				items.map(desugar_expr),
-				typ,
-				loc,
-			)
-		LambdaExpr(params, return_type, body, is_pure, typ, loc):
-			LambdaExpr(params, return_type, desugar_expr(body), is_pure, typ, loc)
-		ListConstructExpr(construct, typ, loc):
-			ListConstructExpr(desugar_list_construct(construct), typ, loc)
-		DictExpr(entries, typ, loc):
-			DictExpr(
-				entries.map(desugar_dict_entry),
-				typ,
-				loc,
-			)
-		RecordExpr(fields, typ, loc):
-			RecordExpr(
-				fields.map(desugar_record_field),
-				typ,
-				loc,
-			)
-		LetExpr(variable, is_mutable, bind_type, rhs, body):
-			LetExpr(variable, is_mutable, bind_type, desugar_expr(rhs), desugar_expr(body))
-		SeqExpr(first, second):
-			SeqExpr(desugar_expr(first), desugar_expr(second))
-		WhileExpr(condition, body, typ, loc):
-			WhileExpr(desugar_expr(condition), desugar_expr(body), typ, loc)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			ForRangeExpr(
-				binder,
-				desugar_expr(start),
-				desugar_expr(end_value),
-				desugar_expr(body),
-				typ,
-				loc,
-			)
-		ForChannelExpr(for_channel, typ, loc):
-			ForChannelExpr(
-				{
-					binder = for_channel.binder,
-					iterable = desugar_expr(for_channel.iterable),
-					body = desugar_expr(for_channel.body)
-				},
-				typ,
-				loc,
-			)
-		ForListExpr(for_list, typ, loc):
-			ForListExpr(
-				{ for_list |
-					iterable = desugar_expr(for_list.iterable),
-					body = desugar_expr(for_list.body)
-				},
-				typ,
-				loc,
-			)
-		ForStringExpr(for_string, typ, loc):
-			ForStringExpr(
-				{ for_string |
-					iterable = desugar_expr(for_string.iterable),
-					body = desugar_expr(for_string.body)
-				},
-				typ,
-				loc,
-			)
-		ForDictExpr(for_dict, typ, loc):
-			ForDictExpr(
-				{ for_dict |
-					iterable = desugar_expr(for_dict.iterable),
-					body = desugar_expr(for_dict.body)
-				},
-				typ,
-				loc,
-			)
-		ForSetExpr(for_set, typ, loc):
-			ForSetExpr(
-				{ for_set |
-					iterable = desugar_expr(for_set.iterable),
-					body = desugar_expr(for_set.body)
-				},
-				typ,
-				loc,
-			)
-		ForStreamExpr(for_stream, typ, loc):
-			ForStreamExpr(
-				{ for_stream |
-					iterable = desugar_expr(for_stream.iterable),
-					body = desugar_expr(for_stream.body)
-				},
-				typ,
-				loc,
-			)
-		ForResourceSourceExpr(for_resource_source, typ, loc):
-			ForResourceSourceExpr(
-				{ for_resource_source |
-					iterable = desugar_expr(for_resource_source.iterable),
-					body = desugar_expr(for_resource_source.body)
-				},
-				typ,
-				loc,
-			)
-		ForTensorExpr(for_tensor, typ, loc):
-			ForTensorExpr(
-				{ for_tensor |
-					iterable = desugar_expr(for_tensor.iterable),
-					body = desugar_expr(for_tensor.body)
-				},
-				typ,
-				loc,
-			)
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			PreClosureConcurrentlyLoopExpr(
-				{ loop |
-					iterable = desugar_expr(loop.iterable),
-					body = desugar_expr(loop.body),
-					timeout = desugar_optional_expr(loop.timeout),
-					limit = desugar_expr(loop.limit)
-				},
-				typ,
-				loc,
-			)
-		PreClosureConcurrentExpr(block, typ, loc):
-			PreClosureConcurrentExpr(
-				{
-					bindings = block.bindings.map(
-						func(binding): { binding | rhs = desugar_expr(binding.rhs) },
-					),
-					body = desugar_expr(block.body),
-					timeout = desugar_optional_expr(block.timeout),
-					max_threads = block.max_threads
-				},
-				typ,
-				loc,
-			)
-		PreClosureDetachExpr(detached, typ, loc):
-			PreClosureDetachExpr(desugar_expr(detached), typ, loc)
-		SelectExpr(select_expr, typ, loc):
-			SelectExpr(
-				select_expr.map(desugar_select_arm),
-				typ,
-				loc,
-			)
-		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(desugar_expr(start), desugar_expr(end_value), typ, loc)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				desugar_expr(scrutinee),
-				cases.map(desugar_literal_match_case),
-				desugar_literal_match_fallback(fallback),
-				typ,
-				loc,
-			)
-		IfExpr(condition, then_expr, else_expr, typ, loc):
-			IfExpr(
-				desugar_expr(condition),
-				desugar_expr(then_expr),
-				desugar_expr(else_expr),
-				typ,
-				loc,
-			)
+					expr
 		_:
 			expr
 
 
+private pure func rewrite_desugared_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		BinaryExpr(op, left, right, typ, loc):
+			desugar_string_binary(op, left, right, typ, loc)
+		_:
+			desugar_accumulator_assignment(expr)
+
+
+pure func desugar_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, desugar_expr)
+		_:
+			children_desugared = CoreTraverse.map_core_expr_children(expr, desugar_expr)
+			rewrite_desugared_expr(children_desugared)
+
+
 private pure func desugar_function(function: CoreFunction) -> CoreFunction:
-	match function.body:
-		Some(body):
-			{ function | body = Some(desugar_expr(body)) }
-		None:
-			function
+	{ function | body = function.body.map(desugar_expr) }
 
 
 private pure func desugar_global(global: CoreGlobal) -> CoreGlobal:
@@ -528,20 +185,10 @@ private pure func desugar_decl(decl: CoreDecl) -> CoreDecl:
 			FunctionDecl(desugar_function(function))
 		GlobalDecl(global):
 			GlobalDecl(desugar_global(global))
-		EnumDecl(enum_decl):
-			EnumDecl(enum_decl)
-		UnionDecl(union_decl):
-			UnionDecl(union_decl)
-		ValueRecordDecl(record_decl):
-			ValueRecordDecl(record_decl)
-		HeapRecordDecl(record_decl):
-			HeapRecordDecl(record_decl)
-		TypeAliasDecl(alias_decl):
-			TypeAliasDecl(alias_decl)
-		TraitDecl(trait_decl):
-			TraitDecl(trait_decl)
 		ImplDecl(impl_decl):
 			ImplDecl({ impl_decl | methods = impl_decl.methods.map(desugar_function) })
+		_:
+			decl
 
 
 pure func desugar_program(program: CoreProgram) -> CoreProgram:

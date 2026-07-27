@@ -114,6 +114,11 @@ let test_generic_and_nullable_unsafe_payloads_stay_boxed () =
   let meta = meta () in
   expect_known "Option[T]" (L.BoxedUnion L.GenericPayload)
     (L.classify meta (option (TyVar "T")));
+  expect_known "Option[T: Bound]" (L.BoxedUnion L.GenericPayload)
+    (L.classify meta
+       (option (TyBoundVar (make_type_param "T" [ "Bound" ]))));
+  expect_known "Option[Self]" (L.BoxedUnion L.GenericPayload)
+    (L.classify meta (option TySelf));
   expect_known "Option[Ptr]" (L.BoxedUnion L.NullableUnsafePayload)
     (L.classify meta (option (ty "Ptr" [])));
   expect_known "Option[Option[Int]]" (L.BoxedUnion L.NestedOptionPayload)
@@ -147,12 +152,18 @@ let test_aliases_are_resolved_before_classification () =
     (L.classify meta (option (ty "MaybeCount" [])))
 
 let test_unknown_named_payload_fails_closed () =
-  match L.classify (meta ()) (option (ty "Mystery" [])) with
-  | L.Unknown_named "Mystery" -> ()
-  | L.Unknown_named other -> Alcotest.failf "expected Mystery, got %s" other
-  | L.Known _ -> Alcotest.fail "unknown payload must not pick an option layout"
-  | L.Invalid_option_type msg ->
-      Alcotest.failf "expected unknown payload, got invalid option type: %s" msg
+  let expect_unknown name =
+    match L.classify (meta ()) (option (ty name [])) with
+    | L.Unknown_named actual when String.equal actual name -> ()
+    | L.Unknown_named other -> Alcotest.failf "expected %s, got %s" name other
+    | L.Known (L.BoxedUnion L.GenericPayload) ->
+        Alcotest.failf "%s must not be treated as a generic parameter" name
+    | L.Known _ -> Alcotest.fail "unknown payload must not pick an option layout"
+    | L.Invalid_option_type msg ->
+        Alcotest.failf "expected unknown payload, got invalid option type: %s" msg
+  in
+  expect_unknown "Mystery";
+  expect_unknown "T"
 
 let test_non_option_type_is_invalid () =
   match L.classify (meta ()) (ty "Int" []) with

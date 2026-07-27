@@ -30,19 +30,20 @@ Source (.brp)
     v
 +------------------+
 | Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
-|                  |  and initial list layout (stage_08_core_lower)
+| + Early Pipeline |  debug, desugar/SSA, mono, list layout, and synthesis
+|                  |  (stage_08_core_lower, stage_09_core)
 +------------------+
     |
     v
-+----------------+
-| Prepared Core  |  One strict JSON bridge into the OCaml semantic middle
-| bridge         |  (core_pre_middle_json.ml)
-+----------------+
++------------------+
+| Post-synth bridge |  One strict JSON bridge into the OCaml semantic middle
+|                   |  (core_post_synth_json.ml)
++------------------+
     |
     v
 +---------------+
-| Core IR       |  OCaml early/middle transforms, then the Core JSON handoff
-| middle + tail |  into the Blorp-owned specialization/backend tail
+| Core IR       |  OCaml match-through-specialize middle, then the Core JSON
+| middle + tail |  handoff into the Blorp-owned specialization/backend tail
 +---------------+
     |
     v
@@ -67,10 +68,14 @@ late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the production route lowers and assembles the
-typed module graph into prepared Core in Blorp. One phase-specific bridge
-decodes that Core into the remaining OCaml early/middle pipeline; source and
-typed AST do not cross this boundary. The pipeline then crosses the late Core
-JSON bridge after the remaining OCaml specialization families. Primitive
+typed module graph, lowers debug blocks and mutable locals, desugars Core,
+monomorphizes generic declarations, annotates list layouts, and synthesizes
+concrete builtin bodies in Blorp. One phase-specific bridge decodes
+post-synthesis Core into the remaining OCaml middle;
+source, typed AST, and pre-mono Core do not cross this boundary. The worker
+validates the post-debug, post-desugar, and post-mono contracts before starting
+at `Core_match`. The pipeline then crosses the late Core JSON bridge after the
+remaining OCaml specialization families. Primitive
 conversion, hash, length, numeric checked tensor access,
 raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
 bounds-proven tensor access builtins intentionally cross in semantic form so
@@ -82,7 +87,9 @@ registry lookup in Blorp. Length folding and raw-view formation remain one coher
 the folded static dimension is the fact that proves loop accesses in bounds.
 Checkpoint 8 in `docs/BLORP_COMPILER_PORT_ROADMAP.md` made Blorp Core lowering,
 module flattening, FFI annotation, and initial list layout authoritative for
-normal source commands. On the current backend route,
+normal source commands. Checkpoint 9 now also makes debug, desugar/SSA,
+monomorphization, post-mono list layout, and synthesis authoritative before the
+single semantic-middle bridge. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
@@ -100,10 +107,10 @@ OCaml program callbacks stop at the pre-DCE handoff. C artifact emission is
 owned by the Blorp backend bridge.
 
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
-prepared-Core `debug_block` nodes. The strict prepared-Core decoder maps them
-to `CDebugBlock`; `Core_debug` is the single stage that either erases the node
-or retains its body according to the request's debug mode. The post-debug
-invariant rejects any node that survives that decision.
+`DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
+production stage that either erases each node or retains its body according to
+the request's debug mode. The post-debug invariant runs before the post-synth
+bridge and rejects any node that survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
@@ -131,30 +138,31 @@ Blorp Typed AST graph
 +----------------------+  checked FFI policies, and initial list layout
     |
     v
-+----------------------+
-| Prepared-Core bridge |  Strict phase decoder; rejects late Core forms
-+----------------------+
++------------------+
+| Blorp Core debug |  Erase debug: blocks for normal builds, retain for
++------------------+  --debug / blorp test (compiler_core_debug.brp)
     |
     v
-+------------+
-| Core_debug |  Erase debug: blocks for normal builds, retain for
-+------------+  --debug / blorp test (core_debug.ml)
++--------------------+
+| Blorp desugar/SSA |  Eliminate sugar, then lower mutable locals
++--------------------+  (compiler_core_desugar.brp, compiler_core_ssa.brp)
     |
     v
-+--------------+
-| Core_desugar |  Eliminate sugar, then lower mutable locals through
-+--------------+  core_ssa.ml (desugar stage snapshot)
++-----------------+
+| Blorp Core mono |  Monomorphize generic functions and data at concrete
++-----------------+  uses, then refresh list storage layout annotations
+                    (compiler_core_monomorphize.brp)
     |
     v
-+-----------+
-| Core_mono |  Monomorphize generic functions at concrete call sites
-+-----------+  and refresh list storage layout annotations
-              (core_mono.ml, core_list_layout.ml)
++------------------+
+| Blorp Core synth |  Synthesize concrete builtin bodies and promote each
++------------------+  completed builtin to an ordinary Core function
     |
     v
-+------------+
-| Core_synth |  Re-synthesize monomorphized builtin bodies that became
-+------------+  concrete after mono (core_synth.ml)
++------------------------+
+| Post-synth Core bridge |  Strict structural decode plus post-debug,
++------------------------+  post-desugar, and post-mono invariant checks
+                            (core_post_synth_json.ml, semantic_middle_worker.ml)
     |
     v
 +------------+
@@ -825,11 +833,13 @@ translation units.
 ### Main Entry Point
 
 The public `./blorp` executable is built from the Blorp CLI entry point in
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs user-facing command
-planning, source discovery, source reads, parsing, and current frontend graph
-handoffs before invoking the private OCaml host shell
-`compiler/bin/blorp_ocaml_host.ml` for the compiler stages and impure host
-actions that have not yet migrated.
+`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs
+user-facing command planning, source discovery, source reads, parsing,
+typechecking, Core preparation, backend coordination, and migrated host
+effects. Compile and run cross once into the private OCaml semantic-middle
+worker, then return to Blorp for the remaining Core pipeline, C emission, and
+host effects. Test commands and other unmigrated non-source commands still
+delegate to `compiler/bin/blorp_ocaml_host.ml`.
 
 User-facing subcommands:
 

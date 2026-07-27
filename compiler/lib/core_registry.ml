@@ -5,7 +5,15 @@
     Blorp prepared-Core boundary feed the remaining middle passes without
     coupling them to module-name rewriting. *)
 
-let register_types (reg : Codegen_types.registry) (program : Core.core_program) =
+let register_types ?(union_payload_storage_overrides = [])
+    (reg : Codegen_types.registry) (program : Core.core_program) =
+  let union_payload_storage type_decl =
+    match
+      List.assoc_opt type_decl.Ast.type_name union_payload_storage_overrides
+    with
+    | Some storage -> storage
+    | None -> Codegen_types.source_union_payload_storage type_decl
+  in
   let rec seed decl =
     match decl.Core.cd_desc with
     | Core.CDTypeAlias alias ->
@@ -18,7 +26,7 @@ let register_types (reg : Codegen_types.registry) (program : Core.core_program) 
         Codegen_types.register_union_variants reg type_decl.type_name
           type_decl.type_variants;
         Codegen_types.register_union_type reg type_decl.type_name
-          ~payload_storage:(Codegen_types.source_union_payload_storage type_decl)
+          ~payload_storage:(union_payload_storage type_decl)
           ~destructor:
             (Codegen_types.GeneratedDestructor (type_decl.type_name ^ "_destroy"))
     | Core.CDRecord record when record.record_is_builtin -> ()
@@ -36,7 +44,7 @@ let register_types (reg : Codegen_types.registry) (program : Core.core_program) 
     | Core.CDType type_decl
       when (not type_decl.type_is_enum) && not type_decl.type_is_builtin ->
         Codegen_types.register_union_type reg type_decl.type_name
-          ~payload_storage:(Codegen_types.source_union_payload_storage type_decl)
+          ~payload_storage:(union_payload_storage type_decl)
           ~destructor:(Core_layout_type.union_destructor_policy ~reg type_decl)
     | Core.CDRecord record
       when (not record.record_is_value) && not record.record_is_builtin ->

@@ -61,6 +61,31 @@ let combine_assignment_shape a b =
 let combine_assignment_shapes shapes =
   List.fold_left combine_assignment_shape No_assign shapes
 
+(** Split a right-associated [CSeq] spine without using the OCaml call stack.
+    Frames are returned innermost-first so [List.fold_left] can rebuild the
+    original shape while preserving each sequence node's type and location. *)
+let split_sequence_spine (e : core) : (core * core) list * core =
+  let rec loop reversed_frames current =
+    match current.desc with
+    | CSeq (head, tail) ->
+        loop ((current, head) :: reversed_frames) tail
+    | _ -> (reversed_frames, current)
+  in
+  loop [] e
+
+(** Bottom-up map a right-associated sequence in source evaluation order. *)
+let map_sequence_spine (f : core -> core) (e : core) : core =
+  let reversed_frames, final = split_sequence_spine e in
+  let mapped_reversed_frames =
+    List.fold_left
+      (fun mapped (node, head) -> (node, f head) :: mapped)
+      [] (List.rev reversed_frames)
+  in
+  let mapped_final = f final in
+  List.fold_left
+    (fun tail (node, head) -> { node with desc = CSeq (head, tail) })
+    mapped_final mapped_reversed_frames
+
 (** Classify assignments to [name] within [e].
 
     Only direct [CAssign] nodes flowing through [CSeq]/[CLet] are
@@ -78,10 +103,7 @@ let rec classify_assignment_shape (name : string) (e : core) : assignment_shape
       combine_assignment_shape
         (if v.vname = name then Straight_line_assign else No_assign)
         (classify_control_boundary name rhs)
-  | CSeq (a, b) ->
-      combine_assignment_shape
-        (classify_assignment_shape name a)
-        (classify_assignment_shape name b)
+  | CSeq _ -> classify_sequence name e
   | CLet (b, body) ->
       let rhs_shape = classify_assignment_shape name b.bind_rhs in
       if b.bind_var.vname = name then rhs_shape
@@ -176,6 +198,21 @@ and classify_control_boundary (name : string) (e : core) : assignment_shape =
   match classify_assignment_shape name e with
   | No_assign -> No_assign
   | Straight_line_assign | Control_flow_assign -> Control_flow_assign
+
+and classify_sequence (name : string) (e : core) : assignment_shape =
+  let rec loop shape current =
+    match current.desc with
+    | CSeq (head, tail) ->
+        let shape' =
+          combine_assignment_shape shape
+            (classify_assignment_shape name head)
+        in
+        if shape' = Control_flow_assign then shape' else loop shape' tail
+    | _ ->
+        combine_assignment_shape shape
+          (classify_assignment_shape name current)
+  in
+  loop No_assign e
 
 and classify_ctree_control_boundary (name : string) (tree : ctree) :
     assignment_shape =
@@ -284,6 +321,7 @@ let rec subst_var (old_name : string) (new_var : var) (e : core) : core =
       let scrut' = subst_var old_name new_var scrut in
       let tree' = subst_var_ctree old_name new_var tree in
       { e with desc = CMatch (scrut', tree') }
+  | CSeq _ -> map_sequence_spine (subst_var old_name new_var) e
   | _ -> Core.map_children (subst_var old_name new_var) e
 
 and subst_var_ctree (old_name : string) (new_var : var) (tree : ctree) : ctree =
@@ -332,6 +370,12 @@ and subst_var_ctree (old_name : string) (new_var : var) (tree : ctree) : ctree =
             Option.map (subst_var_ctree old_name new_var) ctl_len_default;
         }
 
+(** A rewritten step from a straight-line mutable sequence. The original
+    sequence node preserves source metadata when the spine is rebuilt. *)
+type mutable_body_sequence_step =
+  | Mutable_body_expression of core * core
+  | Mutable_body_binding of core * var * core
+
 (** Desugar straight-line reassignments of [var_name].
     Only handles [CSeq(CAssign(var, rhs), rest)] at the top level.
     Does NOT descend into control flow (CWhile, CFor, CIf, CMatchArms/CMatch) —
@@ -340,30 +384,7 @@ and subst_var_ctree (old_name : string) (new_var : var) (tree : ctree) : ctree =
 let rec desugar_mut_body (var_name : string) (current_ver : var)
     (ty : Ast.type_expr) (e : core) : core =
   match e.desc with
-  | CSeq (a, b) -> (
-      match a.desc with
-      | CAssign (v, rhs) when v.vname = var_name ->
-          (* x = rhs; rest → let x_N = rhs[x→x_prev] in rest
-              Don't subst_var the entire rest — the recursive call
-              handles renaming with the new version as current. *)
-          let rhs' = subst_var var_name current_ver rhs in
-          let new_name = fresh_version var_name in
-          let new_var = Core.Var.named new_name in
-          let b'' = desugar_mut_body var_name new_var ty b in
-          let bind =
-            {
-              Core.bind_var = new_var;
-              bind_mut = false;
-              bind_ty = ty;
-              bind_rhs = rhs';
-            }
-          in
-          { e with desc = CLet (bind, b'') }
-      | _ ->
-          (* Non-assignment head: just substitute and continue *)
-          let a' = subst_var var_name current_ver a in
-          let b' = desugar_mut_body var_name current_ver ty b in
-          { e with desc = CSeq (a', b') })
+  | CSeq _ -> desugar_mut_body_sequence var_name current_ver ty e
   | CLet (b, body) when b.bind_var.vname = var_name ->
       let rhs' = subst_var var_name current_ver b.bind_rhs in
       { e with desc = CLet ({ b with bind_rhs = rhs' }, body) }
@@ -400,9 +421,59 @@ let rec desugar_mut_body (var_name : string) (current_ver : var)
               rs_cleanup = subst_var var_name current_ver scope.rs_cleanup;
             };
       }
+  | CAssign (v, rhs) when v.vname = var_name ->
+      let rhs' = subst_var var_name current_ver rhs in
+      let new_name = fresh_version var_name in
+      let new_var = Core.Var.named new_name in
+      let bind =
+        {
+          Core.bind_var = new_var;
+          bind_mut = false;
+          bind_ty = ty;
+          bind_rhs = rhs';
+        }
+      in
+      let terminal = { e with desc = CVoid } in
+      { e with desc = CLet (bind, terminal) }
   | _ ->
       (* Control flow, terminals, etc.: just substitute references *)
       subst_var var_name current_ver e
+
+and desugar_mut_body_sequence (var_name : string) (current_ver : var)
+    (ty : Ast.type_expr) (e : core) : core =
+  let reversed_frames, final = split_sequence_spine e in
+  let reversed_steps, active_var =
+    List.fold_left
+      (fun (steps, active_var) (node, head) ->
+        match head.desc with
+        | CAssign (v, rhs) when v.vname = var_name ->
+            let rhs' = subst_var var_name active_var rhs in
+            let new_var = Core.Var.named (fresh_version var_name) in
+            (Mutable_body_binding (node, new_var, rhs') :: steps, new_var)
+        | _ ->
+            ( Mutable_body_expression
+                (node, subst_var var_name active_var head)
+              :: steps,
+              active_var ))
+      ([], current_ver) (List.rev reversed_frames)
+  in
+  let rewritten_final = desugar_mut_body var_name active_var ty final in
+  List.fold_left
+    (fun tail step ->
+      match step with
+      | Mutable_body_expression (node, head) ->
+          { node with desc = CSeq (head, tail) }
+      | Mutable_body_binding (node, variable, rhs) ->
+          let bind =
+            {
+              Core.bind_var = variable;
+              bind_mut = false;
+              bind_ty = ty;
+              bind_rhs = rhs;
+            }
+          in
+          { node with desc = CLet (bind, tail) })
+    rewritten_final reversed_steps
 
 (** Top-level mutable var desugaring.
 
@@ -414,29 +485,31 @@ let rec desugar_mut_body (var_name : string) (current_ver : var)
     (where the var is reassigned INSIDE a loop body and read across
     iterations) keep their CAssign form — Perceus will need separate
     handling for those. *)
-let desugar_mut_vars (e : core) : core =
-  Core.transform_bottom_up
-    (fun node ->
-      match node.desc with
-      | CLet (b, body) when b.bind_mut -> (
-          match classify_assignment_shape b.bind_var.vname body with
-          | No_assign ->
-              (* No reassignment — just mark as immutable *)
-              { node with desc = CLet ({ b with bind_mut = false }, body) }
-          | Control_flow_assign ->
-              (* Assignments inside control flow — can't desugar safely *)
-              node
-          | Straight_line_assign ->
-              (* All assignments in straight-line — SSA rename *)
-              let init_name = fresh_version b.bind_var.vname in
-              let init_var = Core.Var.named init_name in
-              let body' =
-                desugar_mut_body b.bind_var.vname init_var b.bind_ty body
-              in
-              let new_bind = { b with bind_var = init_var; bind_mut = false } in
-              { node with desc = CLet (new_bind, body') })
-      | _ -> node)
-    e
+let rec desugar_mut_vars (e : core) : core =
+  let node =
+    match e.desc with
+    | CSeq _ -> map_sequence_spine desugar_mut_vars e
+    | _ -> Core.map_children desugar_mut_vars e
+  in
+  match node.desc with
+  | CLet (b, body) when b.bind_mut -> (
+      match classify_assignment_shape b.bind_var.vname body with
+      | No_assign ->
+          (* No reassignment — just mark as immutable *)
+          { node with desc = CLet ({ b with bind_mut = false }, body) }
+      | Control_flow_assign ->
+          (* Assignments inside control flow — can't desugar safely *)
+          node
+      | Straight_line_assign ->
+          (* All assignments in straight-line — SSA rename *)
+          let init_name = fresh_version b.bind_var.vname in
+          let init_var = Core.Var.named init_name in
+          let body' =
+            desugar_mut_body b.bind_var.vname init_var b.bind_ty body
+          in
+          let new_bind = { b with bind_var = init_var; bind_mut = false } in
+          { node with desc = CLet (new_bind, body') })
+  | _ -> node
 
 (** Desugar mutable vars in a function body. *)
 let desugar_mut_func (f : core_func) : core_func =

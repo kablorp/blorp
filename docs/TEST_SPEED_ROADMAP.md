@@ -552,18 +552,47 @@ passing result without changing selection or assertions.
 **Goal:** stop the OCaml TestRunner from generating source and then re-entering
 the Blorp CLI/frontend through a second process and serialized module graph.
 
-**Incremental status (2026-07-24):** Blorp now owns tested selector and run-all
+**Incremental status (2026-07-26):** Blorp now owns tested selector and run-all
 harness constructors plus an explicit generated-module origin. The source graph
 can add one generated root to an existing parsed graph while retaining the
 already parsed test and dependency modules. A regression deletes the original
 test files before extension to prove they are not reread, then verifies exact
-module identity, bridge serialization, and typechecking from the retained
-graph. The extension rejects distinct retained files that still share one
-downstream module name; path-aware typecheck identities and the duplicate-name
-regression remain prerequisites for production routing. Production
-`Test_runner` routing therefore remains on the OCaml constructors until the
-next slice resolves that identity boundary, switches one harness path, and
-measures frontend graph counts.
+module identity, bridge serialization, typechecking, and post-synthesis Core
+preparation from the retained graph. The extension rejects generated-root
+collisions and distinct retained files that share one downstream module
+identity. Generated-harness preparation also has an explicit frontend policy:
+test helpers may call debug-only functions while debug blocks are retained or
+erased independently. Test command planning now retains typed execution or
+warmup variants inside Blorp and serializes options only at the temporary OCaml
+host boundary. Blorp-owned discovery now derives `main`, `tests`-binding, and
+doctest facts from parsed declarations and parsed docs rather than source
+substrings. It also walks requested files and directories deterministically,
+skips compiler fixture directories during recursive discovery, parses each
+candidate once, retains its `ParsedProgram`, preserves malformed-source
+diagnostics, and assigns typed process/filesystem isolation policy from explicit
+suite roots. Candidate `tests` bindings can now be resolved from error-free
+typechecked modules against canonical `std/test::TestSuite` identity. The
+resolver consumes the declaration's canonical binding type, so local type
+aliases remain transparent while same-named user records and wrong types cannot
+qualify. Missing, inaccessible private, ambiguous, and invalid-program bindings
+are explicit states. Compile preparation now has an explicit typecheck-once
+boundary: a pure callback can validate suite identities against the coherent
+typed graph before that same graph continues into Core preparation. The raw
+typed graph cannot be paired with a different compile plan. The retained
+generated-harness regression exercises this path after deleting the source
+files. Typed planning now constructs the retained single-suite run graph and
+represents every unsupported policy as an explicit fallback.
+
+A production execution prototype was deliberately not enabled. It exposed two
+general compiler defects: first-class local function values lost their
+callable identity before module flattening, and synthesized Option fusion
+pattern binders used a different `CoreVar.uniq` from their references. Both
+defects now have focused regressions and fixes. After those fixes, large
+compiler-owned suites still reveal additional Blorp-pipeline runtime
+miscompilations, and direct reuse of the source-run effect does not preserve
+test timeout, output, status, profiling, or leak-isolation semantics. The next
+slice must provide a test-specific execution/reporting effect and pass
+representative compiler-owned suites before moving the production boundary.
 
 **Target architecture:**
 
@@ -591,13 +620,21 @@ measures frontend graph counts.
 - Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
   then delete the superseded generation and bridge entry points once no
   production caller remains.
-- Preserve one bridge: the prepared-Core semantic-middle request. Do not introduce a
-  test-only parser bridge or a second graph protocol.
+- Preserve one bridge: the post-synthesis Core semantic-middle request. Do not
+  introduce a test-only parser bridge or a second graph protocol.
+- Move runtime-cache ownership with harness execution. The Blorp host path and
+  retained OCaml TestRunner currently use distinct cache schemas; moving only
+  `test --warmup-only` would warm an artifact that production tests do not
+  consume.
 
 **Tests:**
 
 - Port selector, run-all, duplicate-name, filtering, diagnostics, and exit-code
   regressions to Blorp-owned tests before deleting their OCaml equivalents.
+- Replace the OCaml `has_top_level_main_source`,
+  `source_declares_testsuite`, and `source_mentions_doctests` heuristics only
+  after production discovery consumes the parsed Blorp facts. Do not port their
+  substring behavior.
 - Add an integration assertion from bridge statistics that one test command
   performs one frontend graph construction and one semantic-middle request for
   each explicit isolation group.

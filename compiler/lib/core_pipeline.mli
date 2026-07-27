@@ -1,8 +1,9 @@
 (** Core IR compilation pipeline.
 
-    Normal source commands enter [run_core_passes] through the strict
-    prepared-Core semantic worker. Typed-program entrypoints are compatibility
-    APIs for the pinned bootstrap and direct in-memory tests. *)
+    Normal source commands enter [run_core_passes_from_post_synth] through the
+    strict post-synthesis semantic worker. [run_core_passes] and typed-program
+    entrypoints are compatibility APIs for the pinned bootstrap and direct
+    in-memory tests. *)
 
 exception Stopped_after of Core_stage.t
 (** Raised by an [on_stage_callback] to stop compilation after a stage. *)
@@ -42,6 +43,11 @@ type prepared_typed_program = {
 type backend_core_input = { blorp_tail_input : Core.core_program }
 (** Core after the OCaml semantic-middle passes and before Blorp-owned DCE. *)
 
+val project_semantic_middle_program : Core.core_program -> Core.core_program
+(** Remove generic monomorphization templates before semantic-middle passes,
+    retaining the generic [Option]/[Result] declarations required by the runtime
+    erased-payload ABI. *)
+
 val prepare_typed_with_module_inputs :
   ?main_import_bindings:Session.import_binding list ->
   ?main_module_name:string ->
@@ -59,7 +65,18 @@ val run_core_passes :
   ?debug:bool ->
   Core.core_program ->
   backend_core_input
-(** Run the OCaml-owned semantic-middle pass sequence through specialization. *)
+(** Run the complete compatibility Core chain through specialization. *)
+
+val run_core_passes_from_post_synth :
+  ?import_aliases:(string, string * string) Hashtbl.t ->
+  ?module_imports:(string, (string, string * string) Hashtbl.t) Hashtbl.t ->
+  on_stage:on_stage_callback ->
+  ?on_stage_event:on_stage_event ->
+  reg:Codegen_types.registry ->
+  Core.core_program ->
+  backend_core_input
+(** Run the production OCaml semantic middle from Blorp-owned post-synthesis
+    Core through specialization. *)
 
 val compile_typed :
   ?embed_runtime:bool ->

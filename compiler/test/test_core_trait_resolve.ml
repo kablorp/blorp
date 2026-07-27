@@ -175,12 +175,36 @@ let test_resource_scope_binding_shadows_trait_method_body_only () =
             "body trait method was rewritten through resource binding")
   | _ -> Alcotest.fail "expected resource scope"
 
+let test_dispatch_type_facts_preserve_nominal_identity () =
+  let nominal_t = TyNamed ("T", []) in
+  let reg = Blorp.Codegen_types.create_registry () in
+  Alcotest.(check (option string))
+    "nominal T has an impl key" (Some "T")
+    (Blorp.Codegen_types.type_key_for_impl nominal_t);
+  Alcotest.(check bool)
+    "nominal T is concrete" false
+    (Blorp.Codegen_types.has_type_vars nominal_t);
+  Alcotest.(check (option string))
+    "nominal T has a dispatch head" (Some "T")
+    (P.first_arg_type_head [ cvar "value" nominal_t ]);
+  Alcotest.(check (option string))
+    "type parameter has no dispatch head" None
+    (P.first_arg_type_head [ cvar "value" (TyVar "T") ]);
+  Alcotest.(check string)
+    "nominal T keeps its nominal C representation" "T*"
+    (Blorp.Codegen_types.type_to_c ~reg nominal_t);
+  Alcotest.(check string)
+    "type parameter remains erased at the C boundary" "void*"
+    (Blorp.Codegen_types.type_to_c ~reg (TyVar "T"))
+
 let suite =
   [
     ( "selected_direct",
       [
         Alcotest.test_case "trait_method_rewrites_to_impl" `Quick
           test_selected_direct_trait_method_rewrites_to_impl;
+        Alcotest.test_case "dispatch facts preserve nominal identity" `Quick
+          test_dispatch_type_facts_preserve_nominal_identity;
       ] );
     ( "resource_scope",
       [

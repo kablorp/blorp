@@ -9,6 +9,7 @@ import:
 	../stage_05_types/compiler_type: compiler_is_global_abi_type_name, compiler_is_std_module_name
 	../stage_09_core/compiler_core_json:
 		CoreBoxedStorageValue,
+		CoreCallKind(SelectedDirectCall),
 		CoreClosureCreate,
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopMoveResourceItem),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
@@ -119,9 +120,11 @@ import:
 			HeapRecordType,
 			NamedType,
 			RangeType,
+			SelfType,
 			StackResultType,
 			TensorType,
 			TupleType,
+			TypeParameterType,
 			UnionType,
 			ValueRecordType,
 			VoidType,
@@ -131,20 +134,18 @@ import:
 		CoreValueRecordField,
 		CoreVar,
 	../stage_09_core/compiler_core_traverse as CoreTraverse
-	compiler_core_identity: flatten_canonical_core_type_name, sanitize_core_module_name
-
-
-UFCS_PREFIX: String = "__ufcs_"
-
-MODULE_NAME_SEPARATOR: String = "__"
-
-PURE_OVERLOAD_SUFFIX: String = "__pure"
+	compiler_core_identity:
+		core_module_member_name,
+		core_pure_overload_function_name,
+		flatten_canonical_core_type_name,
+		is_core_ufcs_function_name,
 
 
 private record CallableRewrite {
 	source_name: String,
 	def_id: Int,
-	target_name: String
+	target_name: String,
+	target_def_id: Int
 }
 
 
@@ -174,26 +175,22 @@ private record FlattenBoundScope {
 }
 
 
-private pure func is_module_callable(function_info: CoreFunction) -> Bool:
+private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
 	match function_info.function_kind:
 		UserFunction:
-			not function_info.name.starts_with(UFCS_PREFIX)
+			not is_core_ufcs_function_name(function_info.name)
+		UnresolvedBuiltinFunction:
+			True
 		BuiltinFunction(c_name):
 			False
-		UnresolvedBuiltinFunction:
-			not function_info.name.starts_with(UFCS_PREFIX)
 		ForeignFunction(_):
 			False
 		ClosureBodyFunction(_):
 			False
 
 
-private pure func has_body(function_info: CoreFunction) -> Bool:
-	function_info.body.is_some()
-
-
 private pure func has_callable_implementation(function_info: CoreFunction) -> Bool:
-	if has_body(function_info):
+	if function_info.body.is_some():
 		True
 	else:
 		-- Source `builtin("std/...")` bodies lower to a bodyless
@@ -206,13 +203,6 @@ private pure func has_callable_implementation(function_info: CoreFunction) -> Bo
 				False
 
 
-private pure func is_module_overload_callable(
-	functions: List[CoreFunction],
-	function_info: CoreFunction,
-) -> Bool:
-	is_module_callable(function_info)
-
-
 private pure func has_callable_implementation_named(
 	functions: List[CoreFunction],
 	name: String,
@@ -222,7 +212,7 @@ private pure func has_callable_implementation_named(
 			candidate,
 		): (
 			candidate.name == name
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -235,7 +225,7 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and candidate.is_pure
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -245,7 +235,7 @@ private pure func is_paired_purity_overload(functions: List[CoreFunction], name:
 		): (
 			candidate.name == name
 			and not candidate.is_pure
-			and is_module_overload_callable(functions, candidate)
+			and is_module_user_callable(candidate)
 			and has_callable_implementation(candidate)
 		),
 	)
@@ -263,38 +253,111 @@ private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction
 	)
 
 
+private pure func has_unresolved_builtin_named(
+	functions: List[CoreFunction],
+	name: String,
+) -> Bool:
+	functions.any(func(candidate):
+		if candidate.name != name:
+			False
+		else:
+			match candidate.function_kind:
+				UnresolvedBuiltinFunction:
+					True
+				_:
+					False
+	)
+
+
+private pure func materialize_builtin_overload(
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	match function_info.function_kind:
+		UserFunction:
+			if (
+				function_info.body.is_none()
+				and has_unresolved_builtin_named(functions, function_info.name)
+			):
+				-- A bodyless declaration paired with a source `builtin(...)`
+				-- declaration is another purity overload of that implementation.
+				-- Keep its distinct callable ID and signature so calls selected
+				-- during typechecking can be specialized without guessing.
+				{ function_info | function_kind = UnresolvedBuiltinFunction }
+			else:
+				function_info
+		_:
+			function_info
+
+
+private pure func materialize_builtin_overload_decl(
+	functions: List[CoreFunction],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(materialize_builtin_overload(functions, function_info))
+		_:
+			decl
+
+
+private pure func materialize_builtin_overloads(program: CoreProgram) -> CoreProgram:
+	functions: List[CoreFunction] = top_level_functions(program)
+
+	{ program |
+		decls = program.decls.map(
+			func(decl): materialize_builtin_overload_decl(functions, decl),
+		),
+	}
+
+
 private pure func callable_target_name(
-	module_prefix: String,
+	module_name: String,
 	functions: List[CoreFunction],
 	function_info: CoreFunction,
 ) -> String:
-	suffix: String = if (
-		function_info.is_pure
-		and is_paired_purity_overload(functions, function_info.name)
-	):
-		PURE_OVERLOAD_SUFFIX
+	if function_info.is_pure and is_paired_purity_overload(functions, function_info.name):
+		core_pure_overload_function_name(module_name, function_info.name)
 	else:
-		""
+		core_module_member_name(module_name, function_info.name)
 
-	module_prefix + MODULE_NAME_SEPARATOR + function_info.name + suffix
+
+private pure func callable_target_def_id(
+	module_name: String,
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> Int:
+	target_name: String = callable_target_name(module_name, functions, function_info)
+	var target_def_id: Int = function_info.def_id
+
+	for candidate in functions:
+		if (
+			is_module_user_callable(candidate)
+			and has_callable_implementation(candidate)
+			and callable_target_name(module_name, functions, candidate) == target_name
+		):
+			target_def_id = candidate.def_id
+			break
+
+	target_def_id
 
 
 private pure func collect_callable_rewrites(
 	module_name: String,
 	program: CoreProgram,
 ) -> List[CallableRewrite]:
-	module_prefix: String = sanitize_core_module_name(module_name)
 	functions: List[CoreFunction] = top_level_functions(program)
 
 	functions.filter_map(func(function_info):
 		if (
-			is_module_overload_callable(functions, function_info)
+			is_module_user_callable(function_info)
 			and has_callable_implementation_named(functions, function_info.name)
 		):
 			Some({
 				source_name = function_info.name,
 				def_id = function_info.def_id,
-				target_name = callable_target_name(module_prefix, functions, function_info),
+				target_name = callable_target_name(module_name, functions, function_info),
+				target_def_id = callable_target_def_id(module_name, functions, function_info),
 			})
 		else:
 			None
@@ -305,7 +368,7 @@ private pure func collect_global_rewrites(
 	module_name: String,
 	program: CoreProgram,
 ) -> List[GlobalRewrite]:
-	prefix: String = sanitize_core_module_name(module_name) + MODULE_NAME_SEPARATOR
+	prefix: String = core_module_member_name(module_name, "")
 
 	program.decls.filter_map(func(decl):
 		match decl:
@@ -320,16 +383,16 @@ private pure func collect_global_rewrites(
 	)
 
 
-private pure func rewritten_callable_name(
+private pure func find_callable_rewrite(
 	rewrites: List[CallableRewrite],
 	source_name: String,
 	def_id: Int,
-) -> Option[String]:
-	var target: Option[String] = None
+) -> Option[CallableRewrite]:
+	var target: Option[CallableRewrite] = None
 
 	for rewrite in rewrites:
 		if rewrite.source_name == source_name and rewrite.def_id == def_id:
-			target = Some(rewrite.target_name)
+			target = Some(rewrite)
 			break
 
 	target
@@ -383,11 +446,30 @@ private pure func rewrite_var_with_id(
 	variable: CoreVar,
 	def_id: Int,
 ) -> CoreVar:
-	match rewritten_callable_name(rewrites, variable.name, def_id):
-		Some(target_name):
-			{ variable | name = target_name }
+	match find_callable_rewrite(rewrites, variable.name, def_id):
+		Some(rewrite):
+			{ variable |
+				name = rewrite.target_name,
+				def_id = Some(rewrite.target_def_id)
+			}
 		None:
 			variable
+
+
+private pure func rewrite_call_kind(
+	rewrites: List[CallableRewrite],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+) -> CoreCallKind:
+	match (kind, callee):
+		(SelectedDirectCall(def_id), VarExpr(variable, _, _)):
+			match find_callable_rewrite(rewrites, variable.name, def_id):
+				Some(rewrite):
+					SelectedDirectCall(rewrite.target_def_id)
+				None:
+					kind
+		_:
+			kind
 
 
 private pure func rewrite_closure_reference(
@@ -396,9 +478,16 @@ private pure func rewrite_closure_reference(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	match rewritten_callable_name(rewrites, closure.function_name, closure.def_id):
-		Some(target_name):
-			ClosureCreateExpr({ closure | function_name = target_name }, typ, loc)
+	match find_callable_rewrite(rewrites, closure.function_name, closure.def_id):
+		Some(rewrite):
+			ClosureCreateExpr(
+				{ closure |
+					function_name = rewrite.target_name,
+					def_id = rewrite.target_def_id
+				},
+				typ,
+				loc,
+			)
 		None:
 			ClosureCreateExpr(closure, typ, loc)
 
@@ -782,9 +871,19 @@ private pure func rewrite_expr(
 		ContinueExpr(_, _):
 			expr
 		CallExpr(kind, callee, args, typ, loc):
+			rewritten_callee: CoreExpr = match (kind, callee):
+				(SelectedDirectCall(def_id), VarExpr(variable, callee_type, callee_loc)):
+					VarExpr(
+						rewrite_var_with_id(callable_rewrites, variable, def_id),
+						callee_type,
+						callee_loc,
+					)
+				_:
+					rewrite_expr(callable_rewrites, global_rewrites, bound, callee)
+
 			CallExpr(
-				kind,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, callee),
+				rewrite_call_kind(callable_rewrites, kind, callee),
+				rewritten_callee,
 				args.map(func(arg): rewrite_expr(callable_rewrites, global_rewrites, bound, arg)),
 				typ,
 				loc,
@@ -1206,9 +1305,9 @@ private pure func rewrite_top_level_function(
 		function_info,
 	)
 
-	match rewritten_callable_name(callable_rewrites, function_info.name, function_info.def_id):
-		Some(target_name):
-			{ rewritten | name = target_name }
+	match find_callable_rewrite(callable_rewrites, function_info.name, function_info.def_id):
+		Some(rewrite):
+			{ rewritten | name = rewrite.target_name }
 		None:
 			rewritten
 
@@ -1245,7 +1344,7 @@ private pure func module_type_name(module_name: String, source_name: String) -> 
 	if compiler_is_std_module_name(module_name) and compiler_is_global_abi_type_name(source_name):
 		source_name
 	else:
-		sanitize_core_module_name(module_name) + MODULE_NAME_SEPARATOR + source_name
+		core_module_member_name(module_name, source_name)
 
 
 private pure func collect_local_type_rewrites(
@@ -1295,13 +1394,15 @@ private pure func rewritten_type_name(context: CoreTypeRewriteContext, name: Str
 
 private pure func rewrite_core_type(context: CoreTypeRewriteContext, typ: CoreType) -> CoreType:
 	match typ:
-		VoidType | RangeType:
+		VoidType | SelfType | RangeType:
 			typ
 		NamedType(name, args):
 			NamedType(
 				rewritten_type_name(context, name),
 				args.map(func(arg): rewrite_core_type(context, arg)),
 			)
+		TypeParameterType(name):
+			TypeParameterType(name)
 		FunctionType(is_pure, params, return_type):
 			FunctionType(
 				is_pure,
@@ -1923,12 +2024,16 @@ private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]
 
 
 pure func prefix_module_names(module_name: String, program: CoreProgram) -> CoreProgram:
-	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(module_name, program)
-	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(module_name, program)
+	materialized_program: CoreProgram = materialize_builtin_overloads(program)
+	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(
+		module_name,
+		materialized_program,
+	)
+	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(module_name, materialized_program)
 	type_context: CoreTypeRewriteContext = {
-		rewrites = collect_local_type_rewrites(module_name, program),
+		rewrites = collect_local_type_rewrites(module_name, materialized_program),
 	}
-	named_decls: List[CoreDecl] = program.decls.map(
+	named_decls: List[CoreDecl] = materialized_program.decls.map(
 		func(decl): rewrite_decl(module_name, callable_rewrites, global_rewrites, decl),
 	)
 	rewritten_decls: List[CoreDecl] = named_decls.map(
@@ -1936,5 +2041,5 @@ pure func prefix_module_names(module_name: String, program: CoreProgram) -> Core
 	)
 	{
 		decls = deduplicate_functions(rewritten_decls),
-		foreign_includes = program.foreign_includes.map(func(include): include)
+		foreign_includes = materialized_program.foreign_includes.map(func(include): include)
 	}

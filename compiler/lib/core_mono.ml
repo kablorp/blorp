@@ -75,8 +75,8 @@ let mono_subst_binding_opt (name : string) (ty : Ast.type_expr) :
   let ty = Codegen_types.normalize_type ty in
   let is_identity_binding =
     match ty with
-    | Ast.TyVar ty_name | Ast.TyNamed (ty_name, []) ->
-        type_param_name ty_name = name
+    | Ast.TyVar ty_name -> type_param_name ty_name = name
+    | Ast.TySelf -> name = "Self"
     | _ -> false
   in
   if is_identity_binding then None
@@ -117,13 +117,12 @@ let rec collect_subst ~(reg : Codegen_types.registry)
       match mono_subst_binding_opt param.param_name arg_ty with
       | Some binding -> binding :: acc
       | None -> acc)
-  | Ast.TyNamed (name, []), _
-    when List.mem (type_param_name name) type_param_names -> (
-      match mono_subst_binding_opt name arg_ty with
+  | Ast.TySelf, _ when List.mem "Self" type_param_names -> (
+      match mono_subst_binding_opt "Self" arg_ty with
       | Some binding -> binding :: acc
       | None -> acc)
   | Ast.TyNamed (pn, p_args), Ast.TyNamed (an, a_args)
-    when pn = an && not (List.mem pn type_param_names) ->
+    when pn = an ->
       (* Walk positional args, consuming the arg tail at a trailing
          [TyVarDims] to mirror [Types.go_args]. Without the [TyVarDims]
          consumption, a param like [T[#_...]] against an arg
@@ -173,21 +172,15 @@ let rec collect_subst ~(reg : Codegen_types.registry)
       collect_subst ~reg type_params pf.return af.return acc
   | _ -> acc
 
-(** Check if a substitution is concrete — all mapped types are fully resolved.
-    A substitution like [("T", TyNamed("T",[]))] maps a type param to itself,
-    which means the call site still has generic types. Skip these. *)
+(** Check if a substitution is concrete — all mapped types are fully resolved. *)
 let is_concrete_subst (subst : mono_subst) : bool =
   let rec has_tyvars ty =
     match ty with
     | Ast.TyVar _ -> true
     | Ast.TyBoundVar _ -> true
+    | Ast.TySelf -> true
     | Ast.TyMeta _ -> true
     | Ast.TyVarDims _ -> true
-    (* Single uppercase letter TyNamed with no args looks like a type
-       variable (T, V, K, etc.) — reject as non-concrete. Without this,
-       T=V (one type param substituted with another) passes the check
-       and produces mono'd functions with unresolved types. *)
-    | Ast.TyNamed (n, []) when Types.is_type_param_name n -> true
     | Ast.TyNamed (_, args) -> List.exists has_tyvars args
     | Ast.TyArray (elem, dims) -> has_tyvars elem || List.exists has_tyvars dims
     | Ast.TyTuple ts -> List.exists has_tyvars ts
@@ -196,9 +189,8 @@ let is_concrete_subst (subst : mono_subst) : bool =
     | _ -> false
   in
   List.for_all
-    (fun (name, value) ->
+    (fun (_, value) ->
       match value with
-      | SubstType (Ast.TyNamed (n, [])) when n = name -> false
       | SubstType ty -> not (has_tyvars ty)
       | SubstDimPack dims -> List.for_all (fun ty -> not (has_tyvars ty)) dims)
     subst
@@ -207,8 +199,8 @@ let rec has_rigid_type_vars (ty : Ast.type_expr) : bool =
   match ty with
   | Ast.TyVar _ -> true
   | Ast.TyBoundVar _ -> true
+  | Ast.TySelf -> true
   | Ast.TyVarDims _ -> true
-  | Ast.TyNamed (name, []) when Types.is_type_param_name name -> true
   | Ast.TyNamed (_, args) -> List.exists has_rigid_type_vars args
   | Ast.TyArray (elem, dims) ->
       has_rigid_type_vars elem || List.exists has_rigid_type_vars dims
@@ -307,8 +299,7 @@ let rec apply_subst (subst : mono_subst) (ty : Ast.type_expr) : Ast.type_expr =
   | Ast.TyVar name -> ( match lookup_type name with Some t -> t | None -> ty)
   | Ast.TyBoundVar param -> (
       match lookup_type param.param_name with Some t -> t | None -> ty)
-  | Ast.TyNamed (name, []) -> (
-      match lookup_type name with Some t -> t | None -> ty)
+  | Ast.TySelf -> ( match lookup_type "Self" with Some t -> t | None -> ty)
   | Ast.TyNamed (name, args) -> Ast.TyNamed (name, apply_args args)
   | Ast.TyArray (elem, dims) ->
       Types.ty_array (apply_subst subst elem) (apply_args dims)
@@ -324,6 +315,38 @@ let rec apply_subst (subst : mono_subst) (ty : Ast.type_expr) : Ast.type_expr =
   | Ast.TyDimOp (op, a, b) ->
       Ast.TyDimOp (op, apply_subst subst a, apply_subst subst b)
   | _ -> ty
+
+(** A specialization must close its own callable contract. Its body can still
+    contain generic function-reference types; those calls are specialized when
+    [rewrite_func] visits them and are not parameters of [func]. Existential
+    tensor dimensions that are not declared by the function, such as [#Ds...]
+    in a shape-erasing return type, remain valid runtime shape information. *)
+let subst_closes_function_signature (func : core_func) (subst : mono_subst) :
+    bool =
+  let apply = apply_subst subst in
+  let declared = type_param_decl_names func.cf_type_params in
+  let is_declared name = List.mem (type_param_name name) declared in
+  let rec type_is_closed = function
+    | Ast.TyVar name | Ast.TyNamed (name, []) -> not (is_declared name)
+    | Ast.TyBoundVar param -> not (is_declared param.param_name)
+    | Ast.TyMeta _ -> false
+    | Ast.TyVarDims name -> not (is_declared name)
+    | Ast.TyNamed (_, args) -> List.for_all type_is_closed args
+    | Ast.TyArray (elem, dims) ->
+        type_is_closed elem && List.for_all type_is_closed dims
+    | Ast.TyTuple elems -> List.for_all type_is_closed elems
+    | Ast.TyFunc f ->
+        List.for_all type_is_closed f.params && type_is_closed f.return
+    | Ast.TyRange inner -> type_is_closed inner
+    | Ast.TyDimOp (_, a, b) -> type_is_closed a && type_is_closed b
+    | Ast.TySelf -> not (List.mem "Self" declared)
+    | Ast.TyConstInt _ -> true
+  in
+  let substituted_type_is_closed ty = type_is_closed (apply ty) in
+  List.for_all
+    (fun (param : core_param) -> substituted_type_is_closed param.cp_ty)
+    func.cf_params
+  && substituted_type_is_closed func.cf_return_ty
 
 (* ============================================================================
    Name mangling
@@ -788,7 +811,11 @@ let concrete_subst_for_call (state : mono_state) ~(func_name : string)
                to the same concrete type; add an overload or change the \
                function signature if mixed types are intended"
             "Conflicting type arguments for generic function '%s'" func_name
-      | Some subst when subst <> [] && is_concrete_subst subst -> Some subst
+      | Some subst
+        when subst <> []
+             && is_concrete_subst subst
+             && subst_closes_function_signature gf subst ->
+          Some subst
       | Some _ -> None)
 
 let starts_with s prefix =
@@ -801,31 +828,9 @@ let ends_with s suffix =
   let suffix_len = String.length suffix in
   slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
 
-let module_qualified_name (module_path : string) (source_name : string) =
-  let prefix = sanitize_module_name module_path ^ "__" in
-  if starts_with source_name prefix then source_name else prefix ^ source_name
-
-let post_mono_synthesis_name (f : core_func) : string =
-  let source_name =
-    match f.cf_module with
-    | None -> f.cf_name
-    | Some module_path ->
-        let prefix = sanitize_module_name module_path ^ "__" in
-        if starts_with f.cf_name prefix then
-          String.sub f.cf_name (String.length prefix)
-            (String.length f.cf_name - String.length prefix)
-        else f.cf_name
-  in
-  let pure_suffix = "__pure" in
-  if ends_with source_name pure_suffix then
-    String.sub source_name 0
-      (String.length source_name - String.length pure_suffix)
-  else source_name
-
-let generic_body_lookup_name (f : core_func) : string =
-  match f.cf_module with
-  | None -> f.cf_name
-  | Some module_path -> module_qualified_name module_path f.cf_name
+let module_qualified_name = Core_callable_identity.module_qualified_name
+let post_mono_synthesis_name = Core_callable_identity.source_member_name
+let generic_body_lookup_name = Core_callable_identity.declaration_name
 
 let next_option_fusion_temp (state : mono_state) (label : string) : string =
   state.option_fusion_counter <- state.option_fusion_counter + 1;
@@ -1065,10 +1070,37 @@ let register_concrete_union_type ?payload_storage (state : mono_state)
            ~reg:state.reg type_decl)
   end
 
-let concrete_type_args params args =
+let rec type_contains_parameter (parameters : string list)
+    (ty : Ast.type_expr) : bool =
+  let is_parameter name = List.mem (type_param_name name) parameters in
+  match ty with
+  | Ast.TyVar name | Ast.TyNamed (name, []) -> is_parameter name
+  | Ast.TyBoundVar param -> is_parameter param.param_name
+  | Ast.TyVarDims name -> is_parameter name
+  | Ast.TyNamed (_, args) -> List.exists (type_contains_parameter parameters) args
+  | Ast.TyArray (elem, dims) ->
+      type_contains_parameter parameters elem
+      || List.exists (type_contains_parameter parameters) dims
+  | Ast.TyTuple elems -> List.exists (type_contains_parameter parameters) elems
+  | Ast.TyFunc func ->
+      List.exists (type_contains_parameter parameters) func.params
+      || type_contains_parameter parameters func.return
+  | Ast.TyRange inner -> type_contains_parameter parameters inner
+  | Ast.TyDimOp (_, a, b) ->
+      type_contains_parameter parameters a
+      || type_contains_parameter parameters b
+  | Ast.TySelf -> List.mem "Self" parameters
+  | Ast.TyMeta _ | Ast.TyConstInt _ -> false
+
+let concrete_type_args unresolved_parameters params args =
   List.length params = List.length args
   && args <> []
-  && List.for_all (fun arg -> not (Codegen_types.has_type_vars arg)) args
+  && List.for_all
+       (fun arg ->
+         not
+           (Codegen_types.has_type_vars arg
+           || type_contains_parameter unresolved_parameters arg))
+       args
 
 let type_param_subst params args =
   List.map2
@@ -1084,13 +1116,14 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
   in
   if not has_generic_data then prog
   else
-    let rec rewrite_type ty =
+    let rec rewrite_type unresolved_parameters ty =
       match Codegen_types.normalize_type ty with
       | Ast.TyNamed (name, args) -> (
-          let args = List.map rewrite_type args in
+          let args = List.map (rewrite_type unresolved_parameters) args in
           match Hashtbl.find_opt state.generic_records name with
           | Some record_decl
-            when concrete_type_args record_decl.record_type_params args -> (
+            when concrete_type_args unresolved_parameters
+                   record_decl.record_type_params args -> (
               match concrete_generic_data_name name args with
               | Some concrete_name ->
                   ensure_concrete_record record_decl concrete_name args;
@@ -1099,7 +1132,8 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
           | _ -> (
               match Hashtbl.find_opt state.generic_types name with
               | Some type_decl
-                when concrete_type_args type_decl.type_params args -> (
+                when concrete_type_args unresolved_parameters
+                       type_decl.type_params args -> (
                   match concrete_generic_data_name name args with
                   | Some concrete_name ->
                       ensure_concrete_type type_decl concrete_name args;
@@ -1107,18 +1141,25 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
                   | None -> Ast.TyNamed (name, args))
               | _ -> Ast.TyNamed (name, args)))
       | Ast.TyArray (elem, dims) ->
-          Ast.TyArray (rewrite_type elem, List.map rewrite_type dims)
+          Ast.TyArray
+            ( rewrite_type unresolved_parameters elem,
+              List.map (rewrite_type unresolved_parameters) dims )
       | Ast.TyFunc f ->
           Ast.TyFunc
             {
               f with
-              params = List.map rewrite_type f.params;
-              return = rewrite_type f.return;
+              params = List.map (rewrite_type unresolved_parameters) f.params;
+              return = rewrite_type unresolved_parameters f.return;
             }
-      | Ast.TyTuple elems -> Ast.TyTuple (List.map rewrite_type elems)
-      | Ast.TyRange inner -> Ast.TyRange (rewrite_type inner)
+      | Ast.TyTuple elems ->
+          Ast.TyTuple (List.map (rewrite_type unresolved_parameters) elems)
+      | Ast.TyRange inner ->
+          Ast.TyRange (rewrite_type unresolved_parameters inner)
       | Ast.TyDimOp (op, a, b) ->
-          Ast.TyDimOp (op, rewrite_type a, rewrite_type b)
+          Ast.TyDimOp
+            ( op,
+              rewrite_type unresolved_parameters a,
+              rewrite_type unresolved_parameters b )
       | other -> other
     and ensure_concrete_record record_decl concrete_name args =
       if Hashtbl.mem state.generated_record_names concrete_name then ()
@@ -1131,7 +1172,9 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
             (fun (field : Ast.field_decl) ->
               {
                 field with
-                field_type = rewrite_type (apply_subst subst field.field_type);
+                field_type =
+                  rewrite_type []
+                    (apply_subst subst field.field_type);
               })
             record_decl.record_fields
         in
@@ -1167,7 +1210,8 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
                 variant with
                 variant_fields =
                   List.map
-                    (fun field_ty -> rewrite_type (apply_subst subst field_ty))
+                    (fun field_ty ->
+                      rewrite_type [] (apply_subst subst field_ty))
                     variant.variant_fields;
                 variant_def_id = Some (Session.mint_def_id (Session.current ()));
               })
@@ -1198,7 +1242,38 @@ let monomorphize_generic_data (state : mono_state) (prog : core_program) :
           :: state.specialized_types
       end
     in
-    let rewritten = Core.map_types_in_program rewrite_type prog in
+    let rec rewrite_decl (decl : core_decl) =
+      match decl.cd_desc with
+      | CDPrivate inner ->
+          { decl with cd_desc = CDPrivate (rewrite_decl inner) }
+      | _ ->
+          let unresolved_parameters =
+            match decl.cd_desc with
+            | CDFunc func -> type_param_decl_names func.cf_type_params
+            | CDImpl impl ->
+                (* Core receives typechecked types, so only explicit type
+                   variables remain generic here. Treating every capitalized
+                   concrete name as a candidate (for example [String]) keeps
+                   specialized impl receivers in source form while the rest
+                   of the program moves to concrete data names. *)
+                Types.collect_type_vars impl.ci_for_type
+                @ List.concat_map
+                    (fun method_func ->
+                      type_param_decl_names method_func.cf_type_params)
+                    impl.ci_methods
+            | CDTrait trait -> trait.ct_type_params
+            | CDType type_decl -> type_param_decl_names type_decl.type_params
+            | CDRecord record_decl ->
+                type_param_decl_names record_decl.record_type_params
+            | CDTypeAlias alias_decl ->
+                type_param_decl_names alias_decl.alias_type_params
+            | CDVar _ | CDImport _ | CDPrivate _ -> []
+          in
+          Core.map_types_in_decl
+            (rewrite_type unresolved_parameters)
+            decl
+    in
+    let rewritten = List.map rewrite_decl prog in
     rewritten
     @ List.rev state.specialized_records
     @ List.rev state.specialized_types
@@ -1354,20 +1429,31 @@ let lookup_generic_by_def_id (state : mono_state) (def_id : int option) :
     its source name, canonical flattened name, or explicit UFCS identity. *)
 let selected_generic_hit_matches_callee (callee_name : string)
     (hit : generic_hit) : bool =
-  match Codegen_names.parse_ufcs_name callee_name with
-  | None ->
-      String.equal hit.gh_source_name callee_name
-      || String.equal hit.gh_name callee_name
-      || (match hit.gh_module_path with
-         | Some module_path ->
-             String.equal
-               (module_qualified_name module_path hit.gh_source_name)
-               callee_name
-         | None -> false)
-  | Some (module_path, source_name) ->
-      let qualified_name = module_qualified_name module_path source_name in
-      (hit.gh_module_path = Some module_path || hit.gh_name = qualified_name)
-      && hit.gh_source_name = source_name
+  Core_callable_identity.selected_callee_matches_function ~callee_name
+    hit.gh_func
+
+let same_generic_function_identity (left : core_func) (right : core_func) =
+  left.cf_def_id = right.cf_def_id
+  && String.equal left.cf_name right.cf_name
+  && left.cf_module = right.cf_module
+
+let lookup_generic_by_callee_identity (state : mono_state) callee_name =
+  let found = ref None in
+  let ambiguous = ref false in
+  Hashtbl.iter
+    (fun _ func ->
+      if
+        Core_callable_identity.selected_callee_matches_function ~callee_name
+          func
+      then
+        match !found with
+        | None -> found := Some (generic_hit_of_func func)
+        | Some existing
+          when same_generic_function_identity existing.gh_func func ->
+            ()
+        | Some _ -> ambiguous := true)
+    state.generic_bodies;
+  if !ambiguous then None else !found
 
 let lookup_generic_module_func (state : mono_state) (mod_path : string)
     (orig_name : string) : generic_hit option =
@@ -1500,7 +1586,14 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
     | _ -> ());
     (match callee.desc with
     | CVar v when not (StringSet.mem v.vname scope) ->
-        enqueue_trait_call_dependencies state v.vname args
+        (* Imported/target-module trait calls carry their module owner in the
+           UFCS callee. Generic impls remain indexed by source method name. *)
+        let method_name =
+          match Codegen_names.parse_ufcs_name v.vname with
+          | Some (_, source_name) -> source_name
+          | None -> v.vname
+        in
+        enqueue_trait_call_dependencies state method_name args
     | _ -> ());
     match callee.desc with
     | CField (obj, field)
@@ -1632,12 +1725,20 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
               (* UFCS-mangled names are already explicit method targets:
                   __ufcs_std$option__get_or -> std_option__get_or.
                   Resolve those before considering any bare same-name generic. *)
-              match Codegen_names.parse_ufcs_name name with
-              | Some (mod_path, orig_name) -> (
-                  match try_lookup_prefixed_for_mono mod_path orig_name with
-                  | Some _ as hit -> hit
-                  | None -> try_lookup_bare name)
+              let identity_hit =
+                if Core_callable_identity.is_ufcs_name name then
+                  lookup_generic_by_callee_identity state name
+                else None
+              in
+              match identity_hit with
+              | Some hit -> Some hit
               | None -> (
+                  match Codegen_names.parse_ufcs_name name with
+                  | Some (mod_path, orig_name) -> (
+                      match try_lookup_prefixed_for_mono mod_path orig_name with
+                      | Some _ as hit -> hit
+                      | None -> try_lookup_bare name)
+                  | None -> (
                   let import_hit =
                     (* Current module imports are authoritative inside that
                         module. Main-program imports must not leak into std
@@ -1664,7 +1765,7 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
                         else None
                       with
                       | Some _ as hit -> hit
-                      | None -> try_lookup_bare name)))
+                      | None -> try_lookup_bare name))))
         in
         match resolve_name v.vname with
         | Some hit -> (

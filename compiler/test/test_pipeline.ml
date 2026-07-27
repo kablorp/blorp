@@ -397,11 +397,9 @@ let test_blorp_bridge_std_call_and_declaration_share_identity () =
             | None -> Alcotest.fail "resolve-stage callback did not run"
           in
           let source_function_name = "std_channel__try_send_attempt" in
-          let source_id =
-            match find_core_function_def_id resolved source_function_name with
-            | Some id -> id
-            | None -> Alcotest.fail "source channel declaration was not lowered"
-          in
+          Alcotest.(check (option int))
+            "projected boundary omits generic source declaration" None
+            (find_core_function_def_id resolved source_function_name);
           let resolved_name, call_id =
             match
               find_resolved_call_identity resolved source_function_name
@@ -415,10 +413,7 @@ let test_blorp_bridge_std_call_and_declaration_share_identity () =
             | None -> Alcotest.fail "resolved channel declaration was not retained"
           in
           Alcotest.(check int)
-            "resolved call and declaration identity" declaration_id call_id;
-          Alcotest.(check bool)
-            "generated identity is above source identities" true
-            (call_id > source_id)))
+            "resolved call and declaration identity" declaration_id call_id))
 
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -1406,6 +1401,93 @@ let test_profiled_preloaded_graph_compile_emits_runtime_hooks () =
                 ("profiled preloaded graph compile failed:\n"
                ^ format_errors errors)))
 
+let test_generated_harness_compiles_returned_generic_callee () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_generated_returned_generic" (fun dir ->
+          let dependency_path = Filename.concat dir "dependency.brp" in
+          write_file dependency_path
+            "pure func capture[T](value: T) -> () -> T:\n\
+            \    pure func() -> T:\n\
+            \        value\n\n\
+             pure func captured_int() -> Int:\n\
+            \    capture(42)()\n";
+          let harness_path = Filename.concat dir "__generated_harness__.brp" in
+          let harness_source =
+            "import:\n\
+            \    ./dependency: captured_int\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    captured_int()\n"
+          in
+          match
+            Pipeline.compile_generated_test_harness ~embed_runtime:false
+              ~filename:harness_path ~source:harness_source ()
+          with
+          | Ok (Pipeline.Compiled _) -> ()
+          | Ok (Pipeline.Stopped_at stage) ->
+              Alcotest.failf "generated harness stopped after %s"
+                (Core_stage.to_string stage)
+          | Error errors ->
+              Alcotest.fail
+                ("generated harness with returned generic callee failed:\n"
+               ^ format_errors errors)))
+
+let test_generated_harness_compiles_bounded_generic_trait_impl () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_generated_bounded_trait" (fun dir ->
+          let dependency_path = Filename.concat dir "dependency.brp" in
+          write_file dependency_path
+            "record Box[T] {value: T}\n\n\
+             implements Stringable for Box[T:Stringable]:\n\
+            \    pure func to_string[T:Stringable](self: Box[T]) -> String:\n\
+            \        \"Box(\" + self.value.to_string() + \")\"\n\n\
+             pure func render_box() -> String:\n\
+            \    box: Box[String] = {value = \"red\"}\n\
+            \    box.to_string()\n";
+          let harness_path = Filename.concat dir "__generated_harness__.brp" in
+          let harness_source =
+            "import:\n\
+            \    ./dependency: render_box\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    _ = render_box()\n\
+            \    0\n"
+          in
+          match
+            Pipeline.compile_generated_test_harness ~embed_runtime:false
+              ~filename:harness_path ~source:harness_source ()
+          with
+          | Ok (Pipeline.Compiled _) -> ()
+          | Ok (Pipeline.Stopped_at stage) ->
+              Alcotest.failf "generated bounded-trait harness stopped after %s"
+                (Core_stage.to_string stage)
+          | Error errors ->
+              Alcotest.fail
+                ("generated harness with bounded generic trait impl failed:\n"
+               ^ format_errors errors)))
+
+let test_generated_harness_compiles_codec_module () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_pipeline_generated_codec" (fun dir ->
+          let harness_path = Filename.concat dir "__generated_harness__.brp" in
+          let harness_source =
+            "import:\n\
+            \    codec: Value(VInt), field_int\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    _ = field_int(VInt(42), \"value\")\n\
+            \    0\n"
+          in
+          match
+            Pipeline.compile_generated_test_harness ~embed_runtime:false
+              ~filename:harness_path ~source:harness_source ()
+          with
+          | Ok (Pipeline.Compiled _) -> ()
+          | Ok (Pipeline.Stopped_at stage) ->
+              Alcotest.failf "generated codec harness stopped after %s"
+                (Core_stage.to_string stage)
+          | Error errors ->
+              Alcotest.fail
+                ("generated harness importing codec failed:\n"
+               ^ format_errors errors)))
+
 let suite =
   [
     ( "module_errors",
@@ -1508,5 +1590,13 @@ let suite =
           `Quick test_selective_record_import_allows_prelude_field_types;
         Alcotest.test_case "profiled preloaded graph emits runtime hooks" `Quick
           test_profiled_preloaded_graph_compile_emits_runtime_hooks;
+        Alcotest.test_case
+          "generated harness compiles returned generic callee" `Quick
+          test_generated_harness_compiles_returned_generic_callee;
+        Alcotest.test_case
+          "generated harness compiles bounded generic trait impl" `Quick
+          test_generated_harness_compiles_bounded_generic_trait_impl;
+        Alcotest.test_case "generated harness compiles codec module" `Quick
+          test_generated_harness_compiles_codec_module;
       ] );
   ]

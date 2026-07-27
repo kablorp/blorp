@@ -43,10 +43,6 @@ val types_equal : type_expr -> type_expr -> bool
 val strip_type_param_bounds : string -> string
 (** Strip trait bounds from type parameter name: "T:Stringable" -> "T" *)
 
-val is_type_param_name : string -> bool
-(** True for parser-encoded type parameter names that may include inline trait
-    bounds, using the legacy single-uppercase [TyNamed] compatibility rule. *)
-
 val is_valid_named_type_param : string -> bool
 (** True when a type parameter name starts with a capital ASCII letter and
     contains only ASCII letters/digits. Trait bounds may be present. *)

@@ -15,6 +15,17 @@ mkdir -p \
 	"$TMP_HARNESS/tests/test_blorp/types"
 cp scripts/test "$TMP_HARNESS/scripts/test"
 
+cat > "$TMP_HARNESS/scripts/blorp-compiler-bootstrap" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--print-path" ]; then
+	printf '%s\n' "$TMP_HARNESS/pinned-blorp"
+	exit 0
+fi
+exit 2
+SH
+chmod +x "$TMP_HARNESS/scripts/blorp-compiler-bootstrap"
+cp /bin/sh "$TMP_HARNESS/pinned-blorp"
+
 cat > "$TMP_HARNESS/Makefile" <<'MAKE'
 all install build:
 	@printf '%s\n' "$@" >> make-target-log.txt
@@ -53,13 +64,13 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 fi
 
 if [ "\${1:-}" = "test" ]; then
-	if [ -n "\${BLORP_TEST_EXPECTED_TOOLCHAIN_DIR:-}" ]; then
-		if [ "\${BLORP_COMPILER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp" ] \
-			|| [ "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-renderer" ] \
-			|| [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-parser" ] \
-			|| [ "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TOOLCHAIN_DIR/blorp-compiler-typecheck" ] \
+	if [ -n "\${BLORP_TEST_EXPECTED_BOOTSTRAP:-}" ]; then
+		if [ "\${BLORP_COMPILER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_BOOTSTRAP" ] \
+			|| [ ! -n "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" ] \
+			|| [ ! -n "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" ] \
+			|| [ ! -n "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" ] \
 			|| [ "\${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}" != "1" ]; then
-			echo "test command did not receive the complete installed bridge toolchain" >&2
+			echo "test command did not receive current helpers built by the pinned bootstrap" >&2
 			exit 3
 		fi
 	fi
@@ -133,40 +144,31 @@ fi
 
 echo "PASS: scripts/test installs the public CLI for Blorp gates"
 
-installed_toolchain=$(cd "$TMP_HARNESS" && pwd -P)
-for executable in \
-	blorp-compiler-renderer \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck
-do
-	cp /bin/sh "$installed_toolchain/$executable"
-done
-
 default_toolchain_output="$TMP_HARNESS/default-toolchain-output.txt"
-unexpected_prepare_marker="$TMP_HARNESS/unexpected-prepare"
+prepare_marker="$TMP_HARNESS/prepare-marker"
 write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_EXPECTED_TOOLCHAIN_DIR="$installed_toolchain" \
-		BLORP_TEST_PREPARE_MARKER="$unexpected_prepare_marker" \
+		BLORP_TEST_EXPECTED_BOOTSTRAP="$TMP_HARNESS/pinned-blorp" \
+		BLORP_TEST_PREPARE_MARKER="$prepare_marker" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial
 ) > "$default_toolchain_output" 2>&1
 default_toolchain_status=$?
 
 if [ "$default_toolchain_status" -ne 0 ]; then
-	echo "FAIL: scripts/test should use the complete installed bridge toolchain"
+	echo "FAIL: scripts/test should prepare current bridge helpers with the pinned bootstrap"
 	cat "$default_toolchain_output"
 	exit 1
 fi
-if [ -e "$unexpected_prepare_marker" ]; then
-	echo "FAIL: scripts/test must not rebuild the installed pinned helpers"
+if [ ! -e "$prepare_marker" ]; then
+	echo "FAIL: scripts/test must prepare the current bridge helper sources"
 	cat "$default_toolchain_output"
 	exit 1
 fi
 
-echo "PASS: scripts/test uses the complete installed bridge toolchain"
+echo "PASS: scripts/test prepares current bridge helpers with the pinned bootstrap"
 
 rm -f "$TMP_HARNESS/make-target-log.txt"
 no_build_output="$TMP_HARNESS/no-build-output.txt"
@@ -174,7 +176,7 @@ write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_EXPECTED_TOOLCHAIN_DIR="$installed_toolchain" \
+		BLORP_TEST_EXPECTED_BOOTSTRAP="$TMP_HARNESS/pinned-blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
 ) > "$no_build_output" 2>&1
@@ -458,7 +460,7 @@ if [ "$compiler_core_sanitize_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_core_sanitize_command="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_dce.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_ffi_boundary.brp compiler/blorp/tests/test_compiler_core_flatten.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_list_layout.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_pipeline.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resolve.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp compiler/blorp/tests/test_compiler_core_specialize.brp compiler/blorp/tests/test_compiler_core_tensor_specialize.brp compiler/blorp/tests/test_compiler_core_traverse.brp"
+expected_core_sanitize_command="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_dce.brp compiler/blorp/tests/test_compiler_core_debug.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_early_invariants.brp compiler/blorp/tests/test_compiler_core_early_pipeline.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_ffi_boundary.brp compiler/blorp/tests/test_compiler_core_flatten.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_list_layout.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_mono.brp compiler/blorp/tests/test_compiler_core_mono_data.brp compiler/blorp/tests/test_compiler_core_mono_impl.brp compiler/blorp/tests/test_compiler_core_mono_option.brp compiler/blorp/tests/test_compiler_core_mono_specialize.brp compiler/blorp/tests/test_compiler_core_mono_substitute.brp compiler/blorp/tests/test_compiler_core_monomorphize.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_pipeline.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resolve.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp compiler/blorp/tests/test_compiler_core_specialize.brp compiler/blorp/tests/test_compiler_core_ssa.brp compiler/blorp/tests/test_compiler_core_synth.brp compiler/blorp/tests/test_compiler_core_synth_bytes.brp compiler/blorp/tests/test_compiler_core_synth_fixed.brp compiler/blorp/tests/test_compiler_core_synth_float.brp compiler/blorp/tests/test_compiler_core_synth_forward.brp compiler/blorp/tests/test_compiler_core_synth_hash_collections.brp compiler/blorp/tests/test_compiler_core_synth_list.brp compiler/blorp/tests/test_compiler_core_synth_parallel_tensor.brp compiler/blorp/tests/test_compiler_core_synth_slice.brp compiler/blorp/tests/test_compiler_core_synth_string.brp compiler/blorp/tests/test_compiler_core_synth_tensor.brp compiler/blorp/tests/test_compiler_core_tensor_specialize.brp compiler/blorp/tests/test_compiler_core_traverse.brp"
 if ! grep -Fxq "$expected_core_sanitize_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-core-sanitize should use the explicit uncached serial Core file set"
 	cat "$compiler_core_sanitize_output"

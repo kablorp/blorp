@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-24.
+Status checked against code on 2026-07-25.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -9,15 +9,16 @@ OCaml compiler host:
 2. writing generated artifacts, invoking the host C compiler, and running the
    resulting binary.
 
-The semantic middle is a separate migration concern. Core lowering is now
-Blorp-owned; until the early/middle Core passes are ported, one narrow OCaml
-worker may remain:
+The semantic middle is a separate migration concern. Core lowering and the
+early Core pipeline through synthesis are now Blorp-owned; until the
+remaining middle Core passes are ported, one narrow OCaml worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
-  -> one versioned prepared-Core request
-  -> OCaml early/middle Core worker
+  -> Blorp debug, desugar/SSA, mono, post-mono list layout, and synthesis
+  -> one versioned post-synthesis Core request
+  -> OCaml match-through-specialize Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -156,8 +157,8 @@ Exit condition:
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
 Status: implemented and authoritative for normal `compile` and `run`. The
-private worker receives strict prepared Core schema 2; no source or typed AST
-crosses this boundary.
+private worker receives strict post-synthesis Core schema 4 and starts at match
+compilation; no source or typed AST crosses this boundary.
 
 New Blorp file:
 
@@ -211,8 +212,8 @@ Implementation:
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Keep the worker entry function limited to strict prepared-Core decode and
-   the still-OCaml early/middle passes.
+5. Keep the worker entry function limited to strict post-synthesis Core decode,
+   early-stage invariant validation, and the still-OCaml middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
    stderr. It accepts no public CLI flags. The Blorp process client is added in
@@ -762,8 +763,9 @@ Status: source-command cutover is implemented on this branch. Check makes zero
 OCaml calls; compile/run make one semantic-middle call; all post-worker effects
 are Blorp-owned; source run is unrepresentable in `CliOcamlHostPlan`; and the
 OCaml run effect implementation is deleted. The general host remains for
-unmigrated non-source commands, while the old compile implementation remains
-only behind the explicitly named pinned-bootstrap wrapper.
+unmigrated non-source commands, including test execution. The old compile
+implementation remains only behind the explicitly named pinned-bootstrap
+wrapper.
 
 Implementation order:
 
@@ -809,7 +811,8 @@ Deferred solely for the pinned bootstrap wrapper:
 
 Do not delete yet:
 
-- OCaml early/middle passes used by `blorp-ocaml-middle`;
+- OCaml match-through-specialize passes used by `blorp-ocaml-middle`;
+- OCaml synthesis retained by bootstrap and in-memory compatibility callers;
 - OCaml Core lowering retained solely by the pinned-bootstrap wrapper and
   direct in-memory compatibility tests;
 - their behavior-focused tests until the corresponding semantic stage ports;

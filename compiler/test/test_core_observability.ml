@@ -242,7 +242,8 @@ let test_compile_with_modules_uses_same_stage_order () =
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
   | Error errs ->
-      Alcotest.failf "compile_with_modules failed: %d errors" (List.length errs)
+      Alcotest.failf "compile_with_modules failed:\n%s"
+        (Test_helpers.format_errors errs)
 
 let test_pipeline_stopped_returns_tagged_outcome () =
   (* Phase 0.5.2: Pipeline.compile_legacy_direct_source returns Ok (Stopped_at s) instead of
@@ -263,7 +264,8 @@ let test_pipeline_stopped_returns_tagged_outcome () =
   | Ok (Pipeline.Compiled _) ->
       Alcotest.fail "expected Stopped_at, got Compiled"
   | Error errs ->
-      Alcotest.failf "expected Stopped_at, got %d errors" (List.length errs)
+      Alcotest.failf "expected Stopped_at, got errors:\n%s"
+        (Test_helpers.format_errors errs)
 
 let test_pipeline_no_stop_returns_compiled () =
   (* Regression: without on_stage, the outcome is Compiled. *)
@@ -275,7 +277,8 @@ let test_pipeline_no_stop_returns_compiled () =
       Alcotest.(check bool) "c_code non-empty" true (String.length r.c_code > 0)
   | Ok (Pipeline.Stopped_at _) ->
       Alcotest.fail "expected Compiled, got Stopped_at"
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_frontend_phases_fire_before_core () =
   let source = small_source in
@@ -307,7 +310,8 @@ let test_pipeline_frontend_phases_fire_before_core () =
         (List.rev !core_stages <> [])
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_stage_events_fire_without_program_callback () =
   let source = small_source in
@@ -326,7 +330,8 @@ let test_pipeline_stage_events_fire_without_program_callback () =
         (List.rev !core_stages |> List.map Core_stage.to_string)
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_normal_build_removes_debug_block () =
   Blorp.Modules.reset ();
@@ -341,7 +346,8 @@ let test_normal_build_removes_debug_block () =
         (Modules.contains r.c_code "hidden debug marker")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_debug_build_keeps_debug_block () =
   Blorp.Modules.reset ();
@@ -356,7 +362,8 @@ let test_debug_build_keeps_debug_block () =
         (Modules.contains r.c_code "hidden debug marker")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_retain_debug_blocks_keeps_debug_block () =
   Blorp.Modules.reset ();
@@ -371,7 +378,8 @@ let test_retain_debug_blocks_keeps_debug_block () =
         (Modules.contains r.c_code "hidden debug marker")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_filter_map_collect_handoff_reuse () =
   (* Source-level regression for producer handoff: fusion first emits a
@@ -409,7 +417,8 @@ let test_pipeline_filter_map_collect_handoff_reuse () =
         (Modules.contains r.c_code "== NULL && blorp_is_unique")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_float_filter_map_collect_handoff_reuse () =
   (* Generated-C shape coverage for the first non-Int scalar fusion slice.
@@ -455,7 +464,8 @@ let test_pipeline_float_filter_map_collect_handoff_reuse () =
         (Modules.contains r.c_code "blorp_list_handoff_set_owned")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let test_pipeline_string_filter_map_collect_handoff_reuse () =
   (* Generated-C shape coverage for the first managed fusion slice.
@@ -496,7 +506,8 @@ let test_pipeline_string_filter_map_collect_handoff_reuse () =
         (Modules.contains r.c_code "blorp_elem_release_fn")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let suite =
   [

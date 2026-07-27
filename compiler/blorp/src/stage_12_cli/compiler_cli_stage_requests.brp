@@ -1,12 +1,14 @@
 -- Canonical ownership plan for user-requested Core observations and stops.
 --
--- Semantic-middle stages execute in the temporary worker. Late stages execute
--- in Blorp after that worker returns pre-DCE Core. Keeping this split typed
--- prevents a valid CLI stage from being silently dropped at the boundary.
+-- Early stages execute in Blorp before the temporary worker, semantic-middle
+-- stages execute in that worker, and late stages execute in Blorp after it
+-- returns pre-DCE Core. Keeping this split typed prevents a valid CLI stage
+-- from being silently dropped or executed twice at either boundary.
 import:
-	../stage_09_core/compiler_core_pipeline_stage:
-		CorePipelineStage,
-		parse_core_pipeline_stage,
+	../stage_09_core/compiler_core_early_pipeline:
+		CoreEarlyPipelineStage,
+		parse_core_early_pipeline_stage,
+	../stage_09_core/compiler_core_pipeline_stage: CorePipelineStage, parse_core_pipeline_stage
 	../stage_09_core/compiler_semantic_worker_protocol:
 		SemanticMiddleStage,
 		parse_semantic_middle_stage,
@@ -27,6 +29,8 @@ record CliLateCoreStageRequest {
 
 
 record CliCompileStageRequests {
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
 	semantic_observations: List[SemanticMiddleStage],
 	semantic_stop: Option[SemanticMiddleStage],
 	late_stages: List[CliLateCoreStageRequest]
@@ -63,7 +67,10 @@ private pure func semantic_observation_for_name(
 	name: String,
 	observation_names: List[String],
 ) -> List[SemanticMiddleStage]:
-	if observation_names.contains(name):
+	if (
+		observation_names.contains(name)
+		and parse_core_early_pipeline_stage(name).is_none()
+	):
 		match parse_semantic_middle_stage(name):
 			Some(stage):
 				[stage]
@@ -78,42 +85,69 @@ private pure func late_stage_for_name(
 	observation_names: List[String],
 	stop_after: Option[String],
 ) -> List[CliLateCoreStageRequest]:
-	match (
-		parse_core_pipeline_stage(name),
-		late_stage_action(name, observation_names, stop_after),
+	-- A stage can have a Blorp parity implementation before production
+	-- ownership moves. The semantic worker remains authoritative until its
+	-- parser stops claiming the stage, preventing duplicate execution.
+	if (
+		parse_core_early_pipeline_stage(name).is_some()
+		or parse_semantic_middle_stage(name).is_some()
 	):
-		(Some(stage), Some(action)):
-			[{
-				name = name,
-				stage = stage,
-				action = action
-			}]
-		_:
-			[]
+		[]
+	else:
+		match (
+			parse_core_pipeline_stage(name),
+			late_stage_action(name, observation_names, stop_after),
+		):
+			(Some(stage), Some(action)):
+				[
+					{
+						name = name,
+						stage = stage,
+						action = action
+					},
+				]
+			_:
+				[]
 
 
 pure func compile_stage_requests(
 	observation_names: List[String],
 	stop_after: Option[String],
 ) -> CliCompileStageRequests:
+	var early_observations: List[CoreEarlyPipelineStage] = []
 	var semantic_observations: List[SemanticMiddleStage] = []
 	var late_stages: List[CliLateCoreStageRequest] = []
 
 	for name in CORE_STAGE_NAMES:
+		if observation_names.contains(name):
+			match parse_core_early_pipeline_stage(name):
+				Some(stage):
+					early_observations = early_observations.append(stage)
+				None:
+					void
+
 		semantic_observations = semantic_observations.concat(
-			semantic_observation_for_name(name, observation_names),
+			semantic_observation_for_name(
+				name,
+				observation_names,
+			),
 		)
-		late_stages = late_stages.concat(
-			late_stage_for_name(name, observation_names, stop_after),
-		)
+		late_stages = late_stages.concat(late_stage_for_name(name, observation_names, stop_after))
 
 	semantic_stop: Option[SemanticMiddleStage] = match stop_after:
 		Some(name):
 			parse_semantic_middle_stage(name)
 		None:
 			None
+	early_stop: Option[CoreEarlyPipelineStage] = match stop_after:
+		Some(name):
+			parse_core_early_pipeline_stage(name)
+		None:
+			None
 
 	{
+		early_observations = early_observations,
+		early_stop = early_stop,
 		semantic_observations = semantic_observations,
 		semantic_stop = semantic_stop,
 		late_stages = late_stages

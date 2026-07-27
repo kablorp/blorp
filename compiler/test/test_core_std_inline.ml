@@ -474,7 +474,8 @@ func main(args: List[String]) -> Int:
         (Option.value ~default:0 !opaque_cow_transfer_calls > 0)
   | Ok (Blorp.Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
+  | Error errs ->
+      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
 
 let suite =
   [

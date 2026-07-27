@@ -8043,7 +8043,10 @@ and infer_type_name ctx expr args loc =
   match args with
   | [ arg ] ->
       let* arg_ty, arg' = infer_unconstrained_value_expr ctx arg in
-      if Codegen_types.has_type_vars arg_ty then
+      let runtime_ty =
+        Types.instantiate_type_params ctx.rigid_type_params arg_ty
+      in
+      if Codegen_types.has_type_vars runtime_ty then
         (* Defer: leave as a real call. [Core_specialize] folds it post-mono
            when [arg_ty] is concrete for each monomorphized copy. *)
         let callee_ty = ty_func [ arg_ty ] ty_string ~pure:true in
@@ -8069,7 +8072,10 @@ and infer_is_heap ctx expr args loc =
   match args with
   | [ arg ] -> (
       let* arg_ty, arg' = infer_unconstrained_value_expr ctx arg in
-      if Codegen_types.has_type_vars arg_ty then
+      let runtime_ty =
+        Types.instantiate_type_params ctx.rigid_type_params arg_ty
+      in
+      if Codegen_types.has_type_vars runtime_ty then
         let callee_ty = ty_func [ arg_ty ] ty_bool ~pure:true in
         let callee' =
           match expr.expr_desc with
@@ -8081,7 +8087,7 @@ and infer_is_heap ctx expr args loc =
         match
           Core_type_layout.classify_debug_heap_value
             (type_layout_metadata_for_env ctx.env)
-            arg_ty
+            runtime_ty
         with
         | Core_type_layout.DebugHeapValue ->
             let lit_expr =

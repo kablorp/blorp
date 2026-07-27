@@ -142,6 +142,157 @@ let test_multiple_assignments_form_version_chain () =
   | other ->
       Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
 
+let test_terminal_assignment_versions_binding_and_returns_void () =
+  let input = let_ ~mut:true "x" ty_int (cint 1) (assign "x" (cint 2)) in
+  match desugar input with
+  | {
+   desc =
+     CLet
+       ( init,
+         {
+           desc =
+             CLet
+               ( next,
+                 { desc = CVoid; ty = terminal_ty; _ } );
+           _;
+         } );
+   _;
+  } ->
+      Alcotest.(check string) "init version" "x__v0" init.bind_var.vname;
+      Alcotest.(check string) "terminal version" "x__v1" next.bind_var.vname;
+      Alcotest.(check bool) "init immutable" false init.bind_mut;
+      Alcotest.(check bool) "terminal immutable" false next.bind_mut;
+      Alcotest.(check bool) "terminal remains void" true (terminal_ty = ty_void)
+  | other ->
+      Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
+
+let loc_at line = { loc with line; end_line = line }
+
+let sequence_at line head tail =
+  { desc = CSeq (head, tail); ty = tail.ty; loc = loc_at line }
+
+let test_sequence_rewrite_preserves_node_metadata () =
+  let inner = sequence_at 22 cvoid (cvar "x" ty_int) in
+  let body = sequence_at 11 (assign "x" (cint 2)) inner in
+  let input = let_ ~mut:true "x" ty_int (cint 1) body in
+  match desugar input with
+  | {
+   desc =
+     CLet
+       ( _,
+         {
+           desc =
+             CLet
+               ( _,
+                 {
+                   desc = CSeq (_, tail);
+                   ty = inner_ty;
+                   loc = inner_loc;
+                 } );
+           ty = outer_ty;
+           loc = outer_loc;
+         } );
+   _;
+  } ->
+      Alcotest.(check int) "version let keeps outer sequence line" 11
+        outer_loc.line;
+      Alcotest.(check int) "remaining sequence keeps inner line" 22
+        inner_loc.line;
+      Alcotest.(check bool) "version let keeps outer sequence type" true
+        (outer_ty = ty_int);
+      Alcotest.(check bool) "remaining sequence keeps inner type" true
+        (inner_ty = ty_int);
+      Alcotest.(check string) "tail uses current version" "x__v1"
+        (var_name tail)
+  | other ->
+      Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
+
+let deep_sequence_length = 50_000
+
+let repeated_sequence count head final =
+  let body = ref final in
+  for _ = 1 to count do
+    body := seq head !body
+  done;
+  !body
+
+let test_long_assignment_sequence_is_stack_bounded () =
+  let body =
+    repeated_sequence deep_sequence_length (assign "x" (cint 2))
+      (cvar "x" ty_int)
+  in
+  let current = ref (desugar (let_ ~mut:true "x" ty_int (cint 1) body)) in
+  let binding_count = ref 0 in
+  let valid = ref true in
+  let finished = ref false in
+  while not !finished do
+    match !current with
+    | { desc = CLet (binding, tail); _ } ->
+        let expected = Printf.sprintf "x__v%d" !binding_count in
+        if binding.bind_mut || binding.bind_var.vname <> expected then (
+          valid := false;
+          finished := true)
+        else (
+          incr binding_count;
+          current := tail)
+    | tail ->
+        valid := var_name tail = Printf.sprintf "x__v%d" deep_sequence_length;
+        finished := true
+  done;
+  Alcotest.(check bool) "all bindings are versioned without stack growth" true
+    (!valid && !binding_count = deep_sequence_length + 1)
+
+let sequence_vars_are_named expected_name expected_count expr =
+  let current = ref expr in
+  let count = ref 0 in
+  let valid = ref true in
+  let finished = ref false in
+  while not !finished do
+    match !current with
+    | { desc = CSeq (head, tail); _ } ->
+        if var_name head <> expected_name then (
+          valid := false;
+          finished := true)
+        else (
+          incr count;
+          current := tail)
+    | final ->
+        valid := var_name final = expected_name;
+        incr count;
+        finished := true
+  done;
+  !valid && !count = expected_count
+
+let test_nested_sequence_substitution_is_stack_bounded () =
+  let branch =
+    repeated_sequence deep_sequence_length (cvar "x" ty_int)
+      (cvar "x" ty_int)
+  in
+  let control = mk (CIf (cbool true, branch, cvar "x" ty_int)) ty_int in
+  let body = seq (assign "x" (cint 2)) control in
+  let input = let_ ~mut:true "x" ty_int (cint 1) body in
+  match desugar input with
+  | {
+   desc =
+     CLet
+       ( _,
+         {
+           desc =
+             CLet
+               ( _,
+                 { desc = CIf (_, then_branch, else_branch); _ } );
+           _;
+         } );
+   _;
+  } ->
+      Alcotest.(check bool)
+        "nested sequence references latest version without stack growth" true
+        (sequence_vars_are_named "x__v1" (deep_sequence_length + 1)
+           then_branch
+        && var_name else_branch = "x__v1")
+  | other ->
+      Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
+
 let test_nested_let_shadowing_preserves_inner_body () =
   let inner = let_ "x" ty_int (cvar "x" ty_int) (cvar "x" ty_int) in
   let body = seq (assign "x" (cint 2)) inner in
@@ -304,6 +455,14 @@ let suite =
           test_assignment_rhs_uses_previous_version;
         Alcotest.test_case "multiple assignments form version chain" `Quick
           test_multiple_assignments_form_version_chain;
+        Alcotest.test_case "terminal assignment versions and returns void"
+          `Quick test_terminal_assignment_versions_binding_and_returns_void;
+        Alcotest.test_case "sequence rewrite preserves node metadata" `Quick
+          test_sequence_rewrite_preserves_node_metadata;
+        Alcotest.test_case "long assignment sequence is stack bounded" `Quick
+          test_long_assignment_sequence_is_stack_bounded;
+        Alcotest.test_case "nested sequence substitution is stack bounded"
+          `Quick test_nested_sequence_substitution_is_stack_bounded;
         Alcotest.test_case "nested let shadowing" `Quick
           test_nested_let_shadowing_preserves_inner_body;
         Alcotest.test_case "lambda param shadowing" `Quick

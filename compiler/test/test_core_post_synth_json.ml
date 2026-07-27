@@ -5,6 +5,7 @@ let kind name fields =
 
 let synthetic_loc = kind "synthetic" []
 let named_type name = kind "named" [ ("name", Lsp_json.String name); ("args", Lsp_json.Array []) ]
+let type_parameter name = kind "type_parameter" [ ("name", Lsp_json.String name) ]
 let int_type = named_type "Int"
 let void_type = kind "void" []
 
@@ -33,6 +34,24 @@ let variable_expr name =
 
 let typed_variable_expr name typ =
   kind "var" [ ("var", variable name); ("type", typ); ("loc", synthetic_loc) ]
+
+let function_type params return_type =
+  kind "function"
+    [
+      ("pure", Lsp_json.Bool true);
+      ("params", Lsp_json.Array params);
+      ("return_type", return_type);
+    ]
+
+let call_expr call_kind callee args typ =
+  kind "call"
+    [
+      ("call_kind", call_kind);
+      ("callee", callee);
+      ("args", Lsp_json.Array args);
+      ("type", typ);
+      ("loc", synthetic_loc);
+    ]
 
 let loop_binder name typ =
   Lsp_json.Object
@@ -86,6 +105,33 @@ let function_decl ?(body = Some (int_literal 0))
       ("loc", synthetic_loc);
     ]
 
+let union_decl name payload_storage =
+  let variant =
+    Lsp_json.Object
+      [
+        ("name", Lsp_json.String "Value");
+        ("tag", Lsp_json.Int 0);
+        ("def_id", Lsp_json.Int 9);
+        ( "fields",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("type", named_type "String");
+                  ("release_policy", Lsp_json.String "arc");
+                ];
+            ] );
+      ]
+  in
+  kind "union"
+    [
+      ("name", Lsp_json.String name);
+      ("type_params", Lsp_json.Array []);
+      ("payload_storage", Lsp_json.String payload_storage);
+      ("variants", Lsp_json.Array [ variant ]);
+      ("loc", synthetic_loc);
+    ]
+
 let program decls =
   kind "program"
     [
@@ -94,11 +140,11 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_pre_middle_json.decode_program json with
+  match Core_post_synth_json.decode_program json with
   | Ok decoded -> decoded
-  | Error error -> Alcotest.fail (Core_pre_middle_json.decode_error_to_string error)
+  | Error error -> Alcotest.fail (Core_post_synth_json.decode_error_to_string error)
 
-let test_decodes_prepared_program () =
+let test_decodes_post_synth_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -109,25 +155,174 @@ let test_decodes_prepared_program () =
       Alcotest.(check bool) "has body" true (Option.is_some fn.cf_body)
   | _ -> Alcotest.fail "expected one decoded function"
 
+let test_preserves_union_payload_storage () =
+  let decoded = decode_exn (program [ union_decl "Choice__mono_String" "typed" ]) in
+  Alcotest.(check bool)
+    "decoded payload storage" true
+    (List.assoc_opt "Choice__mono_String" decoded.union_payload_storage
+    = Some Codegen_types.TypedUnionPayloadStorage);
+  let reg = Codegen_types.create_registry () in
+  Core_registry.register_types
+    ~union_payload_storage_overrides:decoded.union_payload_storage reg
+    decoded.core;
+  Alcotest.(check bool)
+    "registry payload storage" true
+    (Codegen_types.union_uses_typed_payload_storage reg
+       "Choice__mono_String")
+
+let decoded_body_exn body =
+  let decoded =
+    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
+  in
+  match decoded.core with
+  | [ { Core.cd_desc = Core.CDFunc { cf_body = Some body; _ }; _ } ] -> body
+  | _ -> Alcotest.fail "expected one decoded function body"
+
 let test_rejects_late_ownership_node () =
-  let late_drop =
-    kind "drop"
+  let late_dup =
+    kind "dup"
       [
         ("var", variable "value");
         ("value_type", int_type);
-        ("release_policy", Lsp_json.String "none");
+        ("retain_policy", Lsp_json.String "none");
         ("body", int_literal 0);
         ("type", int_type);
         ("loc", synthetic_loc);
       ]
   in
-  let json = program [ function_decl ~body:(Some late_drop) "main" 1 ] in
-  match Core_pre_middle_json.decode_program json with
-  | Ok _ -> Alcotest.fail "late ownership Core crossed the pre-middle boundary"
+  let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
+  match Core_post_synth_json.decode_program json with
+  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-synth boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
-        (Modules.contains error.message "drop")
+        (Modules.contains error.message "dup")
+
+let test_decodes_synthesized_value_forms () =
+  let boxed =
+    kind "box"
+      [
+        ( "box",
+          Lsp_json.Object
+            [
+              ("kind", kind "prim" []);
+              ("value", int_literal 7);
+              ("source_type", int_type);
+            ] );
+        ("type", named_type "Ptr");
+        ("loc", synthetic_loc);
+      ]
+  in
+  let unboxed =
+    kind "unbox"
+      [
+        ("unbox_kind", kind "prim" []);
+        ("expr", typed_variable_expr "boxed" (named_type "Ptr"));
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let cast =
+    kind "cast"
+      [
+        ("expr", int_literal 7);
+        ("type", named_type "Float");
+        ("loc", synthetic_loc);
+      ]
+  in
+  (match (decoded_body_exn boxed).desc with
+  | Core.CBoxTyped { box_kind = Core.BoxPrim; box_source_ty; _ } ->
+      Alcotest.(check bool) "box source type" true
+        (Types.types_equal box_source_ty (Ast.TyNamed ("Int", [])))
+  | _ -> Alcotest.fail "synthesized box did not decode");
+  (match (decoded_body_exn unboxed).desc with
+  | Core.CUnboxTyped
+      { unbox_kind = Core.UnboxPrim; unbox_target_ty; _ } ->
+      Alcotest.(check bool) "unbox target type" true
+        (Types.types_equal unbox_target_ty (Ast.TyNamed ("Int", [])))
+  | _ -> Alcotest.fail "synthesized unbox did not decode");
+  match (decoded_body_exn cast).desc with
+  | Core.CCast (_, target_ty) ->
+      Alcotest.(check bool) "cast target type" true
+        (Types.types_equal target_ty (Ast.TyNamed ("Float", [])))
+  | _ -> Alcotest.fail "synthesized cast did not decode"
+
+let test_decodes_synthesized_binding_and_tensor_forms () =
+  let raw_read =
+    kind "tensor_raw_read"
+      [
+        ( "read",
+          Lsp_json.Object
+            [
+              ("view", variable "raw");
+              ("raw_kind", Lsp_json.String "int64");
+              ("index", int_literal 0);
+            ] );
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let raw_view =
+    kind "tensor_raw_view_let"
+      [
+        ( "binding",
+          Lsp_json.Object
+            [
+              ("variable", variable "raw");
+              ("raw_kind", Lsp_json.String "int64");
+              ("source", typed_variable_expr "values" (named_type "Tensor"));
+            ] );
+        ("body", raw_read);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let dropped =
+    kind "drop"
+      [
+        ("var", variable "owner");
+        ("value_type", named_type "String");
+        ("release_policy", Lsp_json.String "arc");
+        ("body", raw_view);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let borrowed =
+    kind "borrow_let"
+      [
+        ("name", variable "borrowed");
+        ("type", named_type "String");
+        ("rhs", typed_variable_expr "owner" (named_type "String"));
+        ("body", dropped);
+      ]
+  in
+  match (decoded_body_exn borrowed).desc with
+  | Core.CBorrowLet
+      ( _,
+        {
+          desc =
+            Core.CDrop
+              ( _,
+                _,
+                {
+                  desc =
+                    Core.CTensorRawViewLet
+                      ( { trv_kind = Core.TensorInt64Elements; _ },
+                        {
+                          desc =
+                            Core.CTensorRawRead
+                              { trr_kind = Core.TensorInt64Elements; _ };
+                          _
+                        } );
+                  _
+                } );
+          _
+        } ) ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "synthesized borrow/drop/raw tensor forms changed at the boundary"
 
 let test_reports_nested_missing_field_path () =
   let malformed =
@@ -135,7 +330,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_pre_middle_json.decode_program json with
+  match Core_post_synth_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -163,7 +358,7 @@ let test_decodes_exact_int64_literal_text () =
       Alcotest.(check string) "exact Int64" max_int64 (Int64.to_string value)
   | _ -> Alcotest.fail "exact integer literal did not decode to Core.CLit"
 
-let test_decodes_debug_block_for_first_middle_pass () =
+let test_decodes_invalid_debug_block_for_invariant_diagnostic () =
   let body =
     kind "debug_block"
       [
@@ -183,7 +378,131 @@ let test_decodes_debug_block_for_first_middle_pass () =
    };
   ] ->
       ()
-  | _ -> Alcotest.fail "prepared debug block did not reach Core_debug"
+  | _ -> Alcotest.fail "post-mono debug block was not preserved for invariant diagnostics"
+
+let test_downgrades_deferred_trait_call_for_ocaml_middle () =
+  let callee_type = function_type [ int_type ] int_type in
+  let body =
+    call_expr
+      (kind "deferred_trait"
+         [
+           ("trait_name", Lsp_json.String "Stringable");
+           ("method_name", Lsp_json.String "to_string");
+         ])
+      (typed_variable_expr "to_string" callee_type)
+      [ int_literal 1 ] int_type
+  in
+  let decoded =
+    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
+  in
+  match decoded.core with
+  | [
+   {
+     Core.cd_desc =
+       Core.CDFunc
+         {
+           cf_body =
+             Some
+               {
+                 desc =
+                   Core.CCall
+                     (Core.CKUnknown, _, [ { desc = Core.CLit _; _ } ]);
+                 _;
+               };
+           _;
+         };
+     _;
+   };
+  ] ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "deferred Blorp trait dispatch did not downgrade at the OCaml boundary"
+
+let test_preserves_selected_trait_target_for_ocaml_middle () =
+  let callee_type = function_type [ int_type ] int_type in
+  let body =
+    call_expr
+      (kind "selected_trait"
+         [
+           ("trait_name", Lsp_json.String "Stringable");
+           ("method_name", Lsp_json.String "to_string");
+           ("module_path", Lsp_json.String "std/traits");
+           ("def_id", Lsp_json.Int 41);
+         ])
+      (typed_variable_expr "__ufcs_std$traits__to_string" callee_type)
+      [ int_literal 1 ] int_type
+  in
+  let decoded =
+    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
+  in
+  match decoded.core with
+  | [
+   {
+     Core.cd_desc =
+       Core.CDFunc
+         {
+           cf_body =
+             Some { desc = Core.CCall (Core.CKSelectedDirect 41, _, _); _ };
+           _;
+         };
+     _;
+   };
+  ] ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "selected Blorp trait target did not reach the OCaml middle"
+
+let test_preserves_impl_type_param_bounds_for_remaining_middle () =
+  let impl_decl =
+    kind "impl"
+      [
+        ("trait_name", Lsp_json.String "Display");
+        ("for_type", named_type_with_args "List" [ type_parameter "T" ]);
+        ( "type_params",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "T");
+                  ("bounds", Lsp_json.Array [ Lsp_json.String "Stringable" ]);
+                ];
+            ] );
+        ("methods", Lsp_json.Array [ function_decl "display" 9 ]);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let decoded = decode_exn (program [ impl_decl ]) in
+  match decoded.core with
+  | [
+   {
+     Core.cd_desc =
+	       Core.CDImpl
+	         {
+	           ci_for_type = Ast.TyNamed ("List", [ Ast.TyVar "T" ]);
+	           ci_methods =
+             [
+               {
+                 cf_type_params =
+                   [
+                     {
+                       Ast.param_name = "T";
+                       param_bounds = [ { Generic_params.tr_name = "Stringable" } ];
+                     };
+                   ];
+                 _;
+               };
+             ];
+           _;
+         };
+     _;
+   };
+  ] ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "generic impl bounds were not preserved at the post-mono handoff"
 
 let test_decodes_raw_patterns_for_middle_match_compilation () =
   let constructor =
@@ -271,6 +590,53 @@ let test_preserves_pre_mono_type_structure () =
           } -> ()
       | _ -> Alcotest.fail "pre-monomorphization type structure was erased")
   | _ -> Alcotest.fail "expected one decoded function"
+
+let test_preserves_unresolved_type_identity () =
+  let type_parameter = type_parameter "Accumulator" in
+  let self_type = kind "self" [] in
+  let json =
+    program
+      [
+        kind "function"
+          [
+            ("name", Lsp_json.String "identity");
+            ("module", Lsp_json.Null);
+            ("type_params", Lsp_json.Array [ Lsp_json.String "Accumulator" ]);
+            ( "params",
+              Lsp_json.Array
+                [
+                  Lsp_json.Object
+                    [
+                      ("name", variable "value");
+                      ("type", type_parameter);
+                      ("loc", synthetic_loc);
+                    ];
+                ] );
+            ("return_type", self_type);
+            ("body", Lsp_json.Null);
+            ("pure", Lsp_json.Bool true);
+            ("function_kind", kind "user" []);
+            ("def_id", Lsp_json.Int 5);
+            ("loc", synthetic_loc);
+          ];
+      ]
+  in
+  let decoded = decode_exn json in
+  match decoded.core with
+  | [
+   {
+     Core.cd_desc =
+       Core.CDFunc
+         {
+           cf_params = [ { cp_ty = Ast.TyVar "Accumulator"; _ } ];
+           cf_return_ty = Ast.TySelf;
+           _;
+         };
+     _;
+   };
+  ] ->
+      ()
+  | _ -> Alcotest.fail "unresolved Core type identity changed at the OCaml boundary"
 
 let test_decodes_resource_source_and_tensor_loops () =
   let file_type = named_type "File" in
@@ -423,17 +789,32 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes prepared program" `Quick test_decodes_prepared_program;
-        Alcotest.test_case "rejects late ownership node" `Quick test_rejects_late_ownership_node;
+        Alcotest.test_case "decodes post-synth program" `Quick test_decodes_post_synth_program;
+        Alcotest.test_case "preserves union payload storage" `Quick
+          test_preserves_union_payload_storage;
+        Alcotest.test_case "rejects later ownership node" `Quick
+          test_rejects_late_ownership_node;
+        Alcotest.test_case "decodes synthesized value forms" `Quick
+          test_decodes_synthesized_value_forms;
+        Alcotest.test_case "decodes synthesized binding and tensor forms"
+          `Quick test_decodes_synthesized_binding_and_tensor_forms;
         Alcotest.test_case "reports nested field path" `Quick test_reports_nested_missing_field_path;
         Alcotest.test_case "decodes exact int64 literal text" `Quick
           test_decodes_exact_int64_literal_text;
-        Alcotest.test_case "decodes debug block for first middle pass" `Quick
-          test_decodes_debug_block_for_first_middle_pass;
+        Alcotest.test_case "preserves invalid debug block for invariant diagnostic" `Quick
+          test_decodes_invalid_debug_block_for_invariant_diagnostic;
+        Alcotest.test_case "downgrades deferred trait call for OCaml middle"
+          `Quick test_downgrades_deferred_trait_call_for_ocaml_middle;
+        Alcotest.test_case "preserves selected trait target for OCaml middle"
+          `Quick test_preserves_selected_trait_target_for_ocaml_middle;
+        Alcotest.test_case "preserves impl type parameter bounds for remaining middle"
+          `Quick test_preserves_impl_type_param_bounds_for_remaining_middle;
         Alcotest.test_case "decodes raw match patterns" `Quick
           test_decodes_raw_patterns_for_middle_match_compilation;
         Alcotest.test_case "preserves pre-mono type structure" `Quick
           test_preserves_pre_mono_type_structure;
+        Alcotest.test_case "preserves unresolved type identity" `Quick
+          test_preserves_unresolved_type_identity;
         Alcotest.test_case "decodes resource source and tensor loops" `Quick
           test_decodes_resource_source_and_tensor_loops;
         Alcotest.test_case "decodes concurrent resource item mode" `Quick

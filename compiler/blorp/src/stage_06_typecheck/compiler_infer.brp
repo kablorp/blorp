@@ -285,6 +285,7 @@ import:
 		compiler_type_contains_meta,
 		compiler_type_copy,
 		compiler_type_float,
+		compiler_type_instantiate_type_params,
 		compiler_type_int,
 		compiler_type_list,
 		compiler_type_name_copy,
@@ -912,7 +913,10 @@ private pure func compiler_infer_canonical_expected_type(
 	expected_type: CompilerType,
 ) -> CompilerType:
 	qualified = compiler_resolve_qualified_type_names(context.state.module_aliases, expected_type)
-	compiler_env_resolve_alias(context.state.env, qualified)
+	compiler_type_instantiate_type_params(
+		compiler_env_get_type_params(context.state.env),
+		compiler_env_resolve_alias(context.state.env, qualified),
+	)
 
 
 pure func compiler_infer_with_expected(
@@ -7773,6 +7777,26 @@ private pure func compiler_builtin_symbol_prefers_trait_dispatch(name: String) -
 	].contains(name)
 
 
+private pure func compiler_to_string_prefers_trait_dispatch(
+	receiver_type: CompilerType,
+) -> Bool:
+	match receiver_type:
+		CompilerTypeVar(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_builtin_ufcs_prefers_trait_dispatch(
+	name: String,
+	receiver_type: CompilerType,
+) -> Bool:
+	if name == "to_string":
+		compiler_to_string_prefers_trait_dispatch(receiver_type)
+	else:
+		compiler_builtin_symbol_prefers_trait_dispatch(name)
+
+
 private pure func compiler_infer_name_expr(
 	context: CompilerInferContext,
 	name: ParsedIdentifier,
@@ -11607,34 +11631,18 @@ private pure func compiler_infer_ufcs_call_expr(
 								argument_types,
 							):
 								Some(entry):
-									initial = compiler_infer_ufcs_call_with_receiver_result(
-										context,
-										receiver_result,
-										method,
-										entry,
-										args,
-										span,
-									)
-
-									match initial:
-										Some(result):
-											if result.context.state.errors.length() == context.state.errors.length():
-												Some(result)
-											else:
-												match compiler_retry_ufcs_call_candidates(
-													context,
-													receiver_result,
-													method,
-													entry,
-													args,
-													span,
-												):
-													Some(retried):
-														Some(retried)
-													None:
-														Some(result)
-										None:
-											compiler_retry_ufcs_call_candidates(
+									if (
+										entry.origin == CompilerBuiltinFunc
+										and compiler_builtin_ufcs_prefers_trait_dispatch(
+											method.text,
+											receiver_type,
+										)
+									):
+										-- Preserve the authoritative trait identity instead
+										-- of lowering the builtin fallback as a direct call.
+										None
+									else:
+										initial = compiler_infer_ufcs_call_with_receiver_result(
 												context,
 												receiver_result,
 												method,
@@ -11642,6 +11650,33 @@ private pure func compiler_infer_ufcs_call_expr(
 												args,
 												span,
 											)
+
+										match initial:
+											Some(result):
+												if result.context.state.errors.length() == context.state.errors.length():
+													Some(result)
+												else:
+													match compiler_retry_ufcs_call_candidates(
+														context,
+														receiver_result,
+														method,
+														entry,
+														args,
+														span,
+													):
+														Some(retried):
+															Some(retried)
+														None:
+															Some(result)
+											None:
+												compiler_retry_ufcs_call_candidates(
+													context,
+													receiver_result,
+													method,
+													entry,
+													args,
+													span,
+												)
 								None:
 									None
 		_:

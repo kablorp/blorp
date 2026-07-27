@@ -1,0 +1,343 @@
+-- Pure ownership boundary for the Core stages that precede the temporary
+-- semantic-middle worker. Stage state, diagnostics, observations, and stops
+-- remain explicit so the CLI can move the bridge without duplicating passes.
+import:
+	compiler_core_early_invariants:
+		CoreEarlyInvariantViolation,
+		check_debug_invariants,
+		check_desugar_invariants,
+		check_mono_invariants,
+		check_synth_invariants,
+		core_early_invariant_hint,
+		core_early_invariant_message,
+	compiler_core_early_stages as CoreEarlyStages
+	compiler_core_json: CoreProgram, core_program_to_json
+	compiler_core_mono_specialize:
+		CoreMonoDiagnostic,
+		core_mono_diagnostic_hint,
+		core_mono_diagnostic_message,
+	compiler_core_monomorphize: monomorphize_program
+	compiler_core_synth: synthesize_program
+	compiler_core_synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
+
+
+enum CoreEarlyPipelineStage:
+	CoreEarlyLowerStage
+	CoreEarlyDebugStage
+	CoreEarlyDesugarStage
+	CoreEarlyMonoStage
+	CoreEarlySynthStage
+
+
+record CoreEarlyPipelineConfiguration {
+	debug: Bool,
+	check_invariants: Bool,
+	observations: List[CoreEarlyPipelineStage],
+	stop_after: Option[CoreEarlyPipelineStage]
+}
+
+
+record CoreEarlyPipelineInput {
+	program: CoreProgram,
+	next_def_id: Int
+}
+
+
+record CoreEarlyPipelineObservation {
+	stage: CoreEarlyPipelineStage,
+	rendered: String
+}
+
+
+record CoreEarlyPipelineOutput {
+	program: CoreProgram,
+	next_def_id: Int,
+	observations: List[CoreEarlyPipelineObservation]
+}
+
+
+union CoreEarlyPipelineDiagnostic:
+	CoreEarlyInvariantDiagnostic(CoreEarlyInvariantViolation)
+	CoreEarlyMonoDiagnostic(CoreMonoDiagnostic)
+	CoreEarlySynthDiagnostic(CoreSynthError)
+
+
+pure func core_early_pipeline_diagnostic_message(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
+	match diagnostic:
+		CoreEarlyInvariantDiagnostic(violation):
+			core_early_invariant_message(violation)
+		CoreEarlyMonoDiagnostic(mono_diagnostic):
+			core_mono_diagnostic_message(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_message(synth_error)
+
+
+pure func core_early_pipeline_diagnostic_hint(
+	diagnostic: CoreEarlyPipelineDiagnostic,
+) -> Option[String]:
+	match diagnostic:
+		CoreEarlyInvariantDiagnostic(violation):
+			core_early_invariant_hint(violation)
+		CoreEarlyMonoDiagnostic(mono_diagnostic):
+			core_mono_diagnostic_hint(mono_diagnostic)
+		CoreEarlySynthDiagnostic(synth_error):
+			core_synth_error_hint(synth_error)
+
+
+union CoreEarlyPipelineExecution:
+	CoreEarlyPipelineCompleted(CoreEarlyPipelineOutput)
+	CoreEarlyPipelineStopped(CoreEarlyPipelineStage, String, List[CoreEarlyPipelineObservation])
+	CoreEarlyPipelineFailed(CoreEarlyPipelineDiagnostic)
+
+
+private record CoreEarlyPipelineState {
+	program: CoreProgram,
+	next_def_id: Int,
+	observations: List[CoreEarlyPipelineObservation]
+}
+
+
+private union CoreEarlyStageExecution:
+	CoreEarlyStageContinues(CoreEarlyPipelineState)
+	CoreEarlyStageStops(CoreEarlyPipelineStage, String, List[CoreEarlyPipelineObservation])
+	CoreEarlyStageFails(CoreEarlyInvariantViolation)
+
+
+pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> String:
+	match stage:
+		CoreEarlyLowerStage:
+			"lower"
+		CoreEarlyDebugStage:
+			"debug"
+		CoreEarlyDesugarStage:
+			"desugar"
+		CoreEarlyMonoStage:
+			"mono"
+		CoreEarlySynthStage:
+			"synth"
+
+
+pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipelineStage]:
+	match name:
+		"lower":
+			Some(CoreEarlyLowerStage)
+		"debug":
+			Some(CoreEarlyDebugStage)
+		"desugar":
+			Some(CoreEarlyDesugarStage)
+		"mono":
+			Some(CoreEarlyMonoStage)
+		"synth":
+			Some(CoreEarlySynthStage)
+		_:
+			None
+
+
+pure func core_early_pipeline_stages_equal(
+	left: CoreEarlyPipelineStage,
+	right: CoreEarlyPipelineStage,
+) -> Bool:
+	match left:
+		CoreEarlyLowerStage:
+			match right:
+				CoreEarlyLowerStage:
+					True
+				_:
+					False
+		CoreEarlyDebugStage:
+			match right:
+				CoreEarlyDebugStage:
+					True
+				_:
+					False
+		CoreEarlyDesugarStage:
+			match right:
+				CoreEarlyDesugarStage:
+					True
+				_:
+					False
+		CoreEarlyMonoStage:
+			match right:
+				CoreEarlyMonoStage:
+					True
+				_:
+					False
+		CoreEarlySynthStage:
+			match right:
+				CoreEarlySynthStage:
+					True
+				_:
+					False
+
+
+private pure func stages_include(
+	stages: List[CoreEarlyPipelineStage],
+	target: CoreEarlyPipelineStage,
+) -> Bool:
+	stages.any(pure func(stage): core_early_pipeline_stages_equal(stage, target))
+
+
+private pure func stops_after_stage(
+	stop_after: Option[CoreEarlyPipelineStage],
+	stage: CoreEarlyPipelineStage,
+) -> Bool:
+	match stop_after:
+		Some(target):
+			core_early_pipeline_stages_equal(target, stage)
+		None:
+			False
+
+
+private pure func stage_invariant_violations(
+	stage: CoreEarlyPipelineStage,
+	program: CoreProgram,
+) -> List[CoreEarlyInvariantViolation]:
+	match stage:
+		CoreEarlyLowerStage:
+			[]
+		CoreEarlyDebugStage:
+			check_debug_invariants(program)
+		CoreEarlyDesugarStage:
+			check_desugar_invariants(program)
+		CoreEarlyMonoStage:
+			check_mono_invariants(program)
+		CoreEarlySynthStage:
+			check_synth_invariants(program)
+
+
+private pure func finish_stage(
+	stage: CoreEarlyPipelineStage,
+	state: CoreEarlyPipelineState,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyStageExecution:
+	violations: List[CoreEarlyInvariantViolation] = if configuration.check_invariants:
+		stage_invariant_violations(stage, state.program)
+	else:
+		[]
+
+	match violations.get(0):
+		Some(violation):
+			CoreEarlyStageFails(violation)
+		None:
+			observed: Bool = stages_include(configuration.observations, stage)
+			stopped: Bool = stops_after_stage(configuration.stop_after, stage)
+
+			if observed or stopped:
+				rendered: String = core_program_to_json(state.program).to_string()
+
+				updated_observations: List[CoreEarlyPipelineObservation] = if observed:
+					state.observations.append({
+						stage = stage,
+						rendered = rendered,
+					})
+				else:
+					state.observations
+
+				if stopped:
+					CoreEarlyStageStops(stage, rendered, updated_observations)
+				else:
+					CoreEarlyStageContinues({ state | observations = updated_observations })
+			else:
+				CoreEarlyStageContinues(state)
+
+
+private pure func run_mono_stage(
+	state: CoreEarlyPipelineState,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	match monomorphize_program(state.program, state.next_def_id):
+		Err(diagnostic):
+			CoreEarlyPipelineFailed(CoreEarlyMonoDiagnostic(diagnostic))
+		Ok(specialized):
+			mono_state: CoreEarlyPipelineState = {
+				program = CoreEarlyStages.run_list_layout_stage(specialized.program),
+				next_def_id = specialized.next_def_id,
+				observations = state.observations
+			}
+
+			match finish_stage(CoreEarlyMonoStage, mono_state, configuration):
+				CoreEarlyStageContinues(completed):
+					match synthesize_program(completed.program):
+						Err(error):
+							CoreEarlyPipelineFailed(CoreEarlySynthDiagnostic(error))
+						Ok(synthesized):
+							match finish_stage(
+								CoreEarlySynthStage,
+								{ completed | program = synthesized },
+								configuration,
+							):
+								CoreEarlyStageContinues(finished):
+									CoreEarlyPipelineCompleted({
+										program = finished.program,
+										next_def_id = finished.next_def_id,
+										observations = finished.observations,
+									})
+								CoreEarlyStageStops(stage, rendered, observations):
+									CoreEarlyPipelineStopped(stage, rendered, observations)
+								CoreEarlyStageFails(violation):
+									CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+				CoreEarlyStageStops(stage, rendered, observations):
+					CoreEarlyPipelineStopped(stage, rendered, observations)
+				CoreEarlyStageFails(violation):
+					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
+private pure func run_desugar_stage(
+	state: CoreEarlyPipelineState,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	desugar: CoreEarlyStageExecution = finish_stage(
+		CoreEarlyDesugarStage,
+		{ state | program = CoreEarlyStages.run_desugar_stage(state.program) },
+		configuration,
+	)
+
+	match desugar:
+		CoreEarlyStageContinues(next_state):
+			run_mono_stage(next_state, configuration)
+		CoreEarlyStageStops(stage, rendered, observations):
+			CoreEarlyPipelineStopped(stage, rendered, observations)
+		CoreEarlyStageFails(violation):
+			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
+private pure func run_debug_stage(
+	state: CoreEarlyPipelineState,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	debug_execution: CoreEarlyStageExecution = finish_stage(
+		CoreEarlyDebugStage,
+		{ state | program = CoreEarlyStages.run_debug_stage(state.program, configuration.debug) },
+		configuration,
+	)
+
+	match debug_execution:
+		CoreEarlyStageContinues(next_state):
+			run_desugar_stage(next_state, configuration)
+		CoreEarlyStageStops(stage, rendered, observations):
+			CoreEarlyPipelineStopped(stage, rendered, observations)
+		CoreEarlyStageFails(violation):
+			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
+pure func run_early_core_pipeline(
+	input: CoreEarlyPipelineInput,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	lower: CoreEarlyStageExecution = finish_stage(
+		CoreEarlyLowerStage,
+		{
+			program = input.program,
+			next_def_id = input.next_def_id,
+			observations = []
+		},
+		configuration,
+	)
+
+	match lower:
+		CoreEarlyStageContinues(state):
+			run_debug_stage(state, configuration)
+		CoreEarlyStageStops(stage, rendered, observations):
+			CoreEarlyPipelineStopped(stage, rendered, observations)
+		CoreEarlyStageFails(violation):
+			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))

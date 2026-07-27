@@ -190,8 +190,6 @@ let classify (meta : metadata) (ty : Ast.type_expr) : classification =
             | Ast.TyNamed (name, args) -> (
                 match builtin_layout name with
                 | Some layout -> Known layout
-                | None when Types.is_type_param_name name ->
-                    Known managed_layout
                 | None when meta.is_enum_name name -> Known unmanaged_layout
                 | None when meta.is_value_record_name name ->
                     Known unmanaged_layout

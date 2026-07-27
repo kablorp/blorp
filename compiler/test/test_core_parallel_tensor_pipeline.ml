@@ -162,6 +162,14 @@ let matrix_parallel_expr body =
        [ ("mchunk", ty_parallel_mat ty_int) ]
        body (ty_parallel_mat ty_int))
 
+let normalized_parallel_expr body =
+  parallel_call source
+    (lambda [ ("chunk", ty_vec ty_int) ] body (ty_vec ty_int))
+
+let normalized_matrix_parallel_expr body =
+  matrix_parallel_call matrix_source
+    (lambda [ ("mchunk", ty_mat ty_int) ] body (ty_mat ty_int))
+
 let fuse_expr expr =
   match List.rev (P.fuse_program (std_decls @ [ app_decl expr ])) with
   | { cd_desc = CDFunc f; _ } :: _ -> (
@@ -308,6 +316,14 @@ let test_bridge_erased_vector_dimension_still_fuses () =
     "builtin" "blorp_vmap_parallel"
     (lowered_builtin_name lowered)
 
+let test_normalized_vector_chunk_lowers_to_vmap_parallel () =
+  let normalized_chunk = cvar "chunk" (ty_vec ty_int) in
+  let expr = normalized_parallel_expr (map_call normalized_chunk mapper) in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_vmap_parallel"
+    (lowered_builtin_name lowered)
+
 let test_matrix_map_chain_lowers_to_mmap_parallel () =
   let expr =
     matrix_parallel_expr
@@ -409,6 +425,16 @@ let test_matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap () =
         (contains_intrinsic "tensor_get_unchecked" lam.lam_body)
   | _ -> Alcotest.fail "expected lowered callback lambda"
 
+let test_normalized_matrix_chunk_lowers_to_mmap_parallel () =
+  let normalized_chunk = cvar "mchunk" (ty_mat ty_int) in
+  let expr =
+    normalized_matrix_parallel_expr (matrix_map_call normalized_chunk mapper)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mmap_parallel"
+    (lowered_builtin_name lowered)
+
 let suite =
   [
     ( "fusion",
@@ -427,6 +453,8 @@ let suite =
           `Quick test_non_chain_body_is_left_as_vector_parallel_call;
         Alcotest.test_case "bridge_erased_vector_dimension_still_fuses" `Quick
           test_bridge_erased_vector_dimension_still_fuses;
+        Alcotest.test_case "normalized_vector_chunk_lowers_to_vmap_parallel"
+          `Quick test_normalized_vector_chunk_lowers_to_vmap_parallel;
         Alcotest.test_case "matrix_map_chain_lowers_to_mmap_parallel" `Quick
           test_matrix_map_chain_lowers_to_mmap_parallel;
         Alcotest.test_case "bridge_erased_matrix_dimensions_still_fuse" `Quick
@@ -442,5 +470,7 @@ let suite =
         Alcotest.test_case
           "matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap" `Quick
           test_matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap;
+        Alcotest.test_case "normalized_matrix_chunk_lowers_to_mmap_parallel"
+          `Quick test_normalized_matrix_chunk_lowers_to_mmap_parallel;
       ] );
   ]

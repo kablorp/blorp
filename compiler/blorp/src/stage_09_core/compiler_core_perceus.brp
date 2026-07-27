@@ -18,6 +18,7 @@ import:
 		CoreCallKind(
 			BuiltinCall,
 			ClosureCall,
+			DeferredTraitCall,
 			DictWithCapacityCall,
 			DirectRuntimeCall,
 			FallibleStreamTerminalCall,
@@ -26,6 +27,7 @@ import:
 			ListToStringCall,
 			OperationResultCall,
 			SelectedDirectCall,
+			SelectedTraitCall,
 			TensorParallelCall,
 			UnknownCall,
 			UserCall,
@@ -156,9 +158,11 @@ import:
 			HeapRecordType,
 			NamedType,
 			RangeType,
+			SelfType,
 			StackResultType,
 			TensorType,
 			TupleType,
+			TypeParameterType,
 			UnionType,
 			ValueRecordType,
 			VoidType,
@@ -628,6 +632,8 @@ pure func is_managed_type(env: PerceusEnv, typ: CoreType) -> Bool:
 				or compiler_is_one_shot_stream_type_name(name)
 				or compiler_is_resource_source_type_name(name)
 			)
+		TypeParameterType(_) | SelfType:
+			False
 		HeapRecordType(name):
 			True
 		UnionType(name):
@@ -922,6 +928,10 @@ pure func contract_for_call(
 ) -> Option[OwnershipCallContract]:
 	match kind:
 		UnknownCall:
+			None
+		DeferredTraitCall(trait_name, method_name):
+			None
+		SelectedTraitCall(trait_name, method_name, module_path, def_id):
 			None
 		SelectedDirectCall(def_id):
 			None
@@ -1242,6 +1252,10 @@ private pure func copy_core_type(typ: CoreType) -> CoreType:
 			VoidType
 		NamedType(name, args):
 			NamedType(name, copy_core_types(args))
+		TypeParameterType(name):
+			TypeParameterType(name)
+		SelfType:
+			SelfType
 		StackResultType(ok_type, err_type):
 			StackResultType(copy_core_type(ok_type), copy_core_type(err_type))
 		BoxedResultType(ok_type, err_type):
@@ -1899,10 +1913,14 @@ private pure func summarize_linear_call(
 			summaries: List[OwnershipUseSummary] = match kind:
 				UnknownCall:
 					arg_uses
+				DeferredTraitCall(trait_name, method_name):
+					arg_uses
+				SelectedTraitCall(trait_name, method_name, module_path, def_id):
+					arg_uses
 				SelectedDirectCall(def_id):
 					arg_uses
 				ClosureCall:
-					[summarize_linear_borrow(env, name, callee)] + arg_uses
+					[summarize_linear_borrow(env, name, callee)].concat(arg_uses)
 				BuiltinCall(call_name):
 					arg_uses
 				IntrinsicCall(call_name):
@@ -4505,6 +4523,8 @@ private pure func is_void_core_type(typ: CoreType) -> Bool:
 		VoidType:
 			True
 		NamedType(name, args):
+			False
+		TypeParameterType(_) | SelfType:
 			False
 		StackResultType(ok_type, err_type):
 			False
@@ -10869,7 +10889,7 @@ private pure func normalize_binding_alias_match_results(
 		func(
 			nested_bindings,
 			result,
-		): normalize_scoped_binding_alias_result(env, bindings + nested_bindings, result),
+		): normalize_scoped_binding_alias_result(env, bindings.concat(nested_bindings), result),
 	)
 
 
@@ -14869,7 +14889,7 @@ private pure func normalize_lambda_body_ownership(
 	lambda_env: PerceusEnv = { env | transferable_result_vars = [] }
 	managed_result: Bool = is_managed_type(lambda_env, return_type)
 	global_values: List[CoreParam] = unshadowed_global_values(lambda_env, borrowed_values, body)
-	all_borrowed_values: List[CoreParam] = borrowed_values + global_values
+	all_borrowed_values: List[CoreParam] = borrowed_values.concat(global_values)
 	result: CoreExpr = retain_borrowed_values(lambda_env, all_borrowed_values, return_type, body)
 
 	if managed_result:
@@ -14906,7 +14926,7 @@ private pure func normalize_lambda_expr(
 		params,
 		nested_body,
 	)
-	borrowed_values: List[CoreParam] = params + captures.map(lambda_capture_param)
+	borrowed_values: List[CoreParam] = params.concat(captures.map(lambda_capture_param))
 	normalized_body: CoreExpr = normalize_lambda_body_ownership(
 		env,
 		borrowed_values,

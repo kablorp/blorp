@@ -1072,6 +1072,13 @@ let test_cf_kind_builtin_tag () =
     "builtin tag" true
     (Blorp.Modules.contains out "[builtin]")
 
+let test_cf_kind_unresolved_builtin_tag () =
+  let f = mk_kind_func ~name:"b" ~kind:CFUnresolvedBuiltin in
+  let out = pp_program_indented [ mk_decl (CDFunc f) ] in
+  Alcotest.(check bool)
+    "unresolved builtin tag" true
+    (Blorp.Modules.contains out "[unresolved-builtin]")
+
 let test_cf_kind_foreign_carries_c_name () =
   let k =
     CFForeign
@@ -1240,6 +1247,8 @@ let suite =
         Alcotest.test_case "CFUser — no tag" `Quick test_cf_kind_user_noop_tag;
         Alcotest.test_case "CFBuiltin — [builtin]" `Quick
           test_cf_kind_builtin_tag;
+        Alcotest.test_case "CFUnresolvedBuiltin — [unresolved-builtin]" `Quick
+          test_cf_kind_unresolved_builtin_tag;
         Alcotest.test_case "CFForeign — carries c_name" `Quick
           test_cf_kind_foreign_carries_c_name;
       ] );

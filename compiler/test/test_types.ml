@@ -145,11 +145,6 @@ let test_strip_type_param_bounds () =
   check_string "multi bound" "T"
     (strip_type_param_bounds "T:Stringable+Showable")
 
-let test_is_type_param_name () =
-  check_true "single-letter legacy param" (is_type_param_name "T");
-  check_true "bound-bearing param" (is_type_param_name "T:Stringable");
-  check_false "concrete type name" (is_type_param_name "Text")
-
 (* ============================================================================
    collect_type_vars
    ============================================================================ *)
@@ -270,20 +265,24 @@ let test_apply_subst_self () =
   let result = apply_subst subst TySelf in
   check_true "Self -> Int" (types_equal result ty_int)
 
-let test_apply_type_param_subst_accepts_raw_or_stripped_names () =
+let test_apply_type_param_subst_uses_explicit_type_vars () =
   let subst = [ ("T", ty_int) ] in
   check_true "TyVar with bound uses stripped key"
     (types_equal (apply_type_param_subst subst (TyVar "T:Stringable")) ty_int);
-  check_true "TyNamed with bound uses stripped key"
+  check_true "nested TyVar with bound uses stripped key"
     (types_equal
        (apply_type_param_subst subst
-          (TyNamed ("List", [ TyNamed ("T:Stringable", []) ])))
+          (TyNamed ("List", [ TyVar "T:Stringable" ])))
        (TyNamed ("List", [ ty_int ])));
   let raw_subst = [ ("T:Stringable", ty_string) ] in
   check_true "raw bound-bearing key still works"
     (types_equal
-       (apply_type_param_subst raw_subst (TyNamed ("T:Stringable", [])))
-       ty_string)
+       (apply_type_param_subst raw_subst (TyVar "T:Stringable"))
+       ty_string);
+  check_true "one-letter nominal type remains nominal"
+    (types_equal
+       (apply_type_param_subst subst (TyNamed ("T", [])))
+       (TyNamed ("T", [])))
 
 (* ============================================================================
    unify
@@ -583,10 +582,7 @@ let suite =
     ( "normalize_type_name",
       [ Alcotest.test_case "normalization" `Quick test_normalize_type_name ] );
     ( "strip_type_param_bounds",
-      [
-        Alcotest.test_case "stripping" `Quick test_strip_type_param_bounds;
-        Alcotest.test_case "type param predicate" `Quick test_is_type_param_name;
-      ] );
+      [ Alcotest.test_case "stripping" `Quick test_strip_type_param_bounds ] );
     ( "collect_type_vars",
       [ Alcotest.test_case "collection" `Quick test_collect_type_vars ] );
     ( "instantiate_type_params",
@@ -602,8 +598,8 @@ let suite =
           test_apply_subst_cycle_detection;
         Alcotest.test_case "function type" `Quick test_apply_subst_func;
         Alcotest.test_case "Self" `Quick test_apply_subst_self;
-        Alcotest.test_case "type-param names" `Quick
-          test_apply_type_param_subst_accepts_raw_or_stripped_names;
+        Alcotest.test_case "explicit type-param identities" `Quick
+          test_apply_type_param_subst_uses_explicit_type_vars;
       ] );
     ( "unify",
       [

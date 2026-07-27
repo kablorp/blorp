@@ -1,0 +1,189 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreBinaryOp(DivideOp, MultiplyOp),
+		CoreCallKind(IntrinsicCall),
+		CoreExpr(BinaryExpr, CallExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_synth_fixed: synthesize_fixed_body
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+private FIXED_TYPE: CoreType = NamedType("Fixed", [])
+
+
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func builtin_function(
+	module_name: String,
+	source_name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func contains_intrinsic(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, _, _, _):
+			(
+				name == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_intrinsic(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_intrinsic(child, expected)
+			)
+
+
+pure func contains_binary_op(expr: CoreExpr, expected: CoreBinaryOp) -> Bool:
+	match expr:
+		BinaryExpr(op, _, _, _, _):
+			(
+				op == expected
+				or immediate_core_expr_children(
+					expr,
+				).any(
+					func(child): contains_binary_op(child, expected),
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_binary_op(child, expected)
+			)
+
+
+pure func synthesized_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	synthesize_fixed_body(function_info)
+
+
+pure func test_fixed_field_accessors_use_intrinsics() -> Bool:
+	scale = builtin_function("std/fixed", "get_scale", [param("value", FIXED_TYPE)], INT_TYPE)
+	precision = builtin_function(
+		"std/fixed",
+		"get_precision",
+		[param("value", FIXED_TYPE)],
+		INT_TYPE,
+	)
+
+	match (synthesized_body(scale), synthesized_body(precision)):
+		(Some(scale_body), Some(precision_body)):
+			(
+				contains_intrinsic(scale_body, "fixed_scale")
+				and contains_intrinsic(precision_body, "fixed_precision")
+			)
+		_:
+			False
+
+
+pure func test_fixed_to_int_handles_both_scale_directions() -> Bool:
+	function_info = builtin_function("std/fixed", "to_int", [param("value", FIXED_TYPE)], INT_TYPE)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "fixed_value")
+				and contains_intrinsic(body, "fixed_pow10")
+				and contains_binary_op(body, DivideOp)
+				and contains_binary_op(body, MultiplyOp)
+			)
+		None:
+			False
+
+
+pure func test_fixed_neg_allocates_from_components() -> Bool:
+	function_info = builtin_function("std/fixed", "neg", [param("value", FIXED_TYPE)], FIXED_TYPE)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "fixed_value")
+				and contains_intrinsic(body, "fixed_scale")
+				and contains_intrinsic(body, "fixed_precision")
+				and contains_intrinsic(body, "fixed_alloc")
+			)
+		None:
+			False
+
+
+pure func test_fixed_round_to_rescales_and_allocates() -> Bool:
+	function_info = builtin_function(
+		"std/fixed",
+		"round_to",
+		[param("value", FIXED_TYPE), param("scale", INT_TYPE)],
+		FIXED_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "fixed_pow10")
+				and contains_intrinsic(body, "fixed_alloc")
+				and contains_binary_op(body, DivideOp)
+				and contains_binary_op(body, MultiplyOp)
+			)
+		None:
+			False
+
+
+pure func test_fixed_synthesis_rejects_wrong_module_and_signature() -> Bool:
+	wrong_module = builtin_function("app/fixed", "neg", [param("value", FIXED_TYPE)], FIXED_TYPE)
+	wrong_signature = builtin_function("std/fixed", "neg", [param("value", FLOAT_TYPE)], FIXED_TYPE)
+
+	synthesized_body(wrong_module) == None and synthesized_body(wrong_signature) == None
+
+
+tests: TestSuite = {
+	description = "Compiler Core Fixed synthesis",
+	tests = [
+		("Fixed field accessors use intrinsics", test_fixed_field_accessors_use_intrinsics),
+		(
+			"Fixed to_int handles both scale directions",
+			test_fixed_to_int_handles_both_scale_directions,
+		),
+		("Fixed neg allocates from components", test_fixed_neg_allocates_from_components),
+		("Fixed round_to rescales and allocates", test_fixed_round_to_rescales_and_allocates),
+		(
+			"Fixed synthesis rejects wrong module and signature",
+			test_fixed_synthesis_rejects_wrong_module_and_signature,
+		),
+	]
+}

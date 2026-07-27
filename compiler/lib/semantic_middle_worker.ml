@@ -1,21 +1,21 @@
-(** Private prepared-Core to pre-DCE Core worker.
+(** Private post-synthesis Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
-    and backend. The protocol is phase-specific: callers supply lowered,
-    flattened, FFI-annotated, list-layout-annotated Core, and successful
-    requests return the Core program immediately
-    before Blorp-owned DCE. This module does not read source files, interpret
-    CLI arguments, emit C, write artifacts, or execute child processes. *)
+    and backend. The protocol is phase-specific: callers supply Blorp-owned
+    post-synthesis Core, and successful requests return the Core program
+    immediately before Blorp-owned DCE. This module does not read source files,
+    interpret CLI arguments, emit C, write artifacts, or execute child
+    processes. *)
 
-let schema_version = 2
+let schema_version = 4
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let core_phase = "prepared"
+let core_phase = "post_synth"
 
 type stage = Core_stage.t
 
 type capability =
-  | PreparedCore
+  | PostSynthCore
   | PreDceCore
   | RenderedStageObservations
 
@@ -26,10 +26,10 @@ type request = {
   target_module : string;
   core : Core.core_program;
   foreign_includes : string list;
+  union_payload_storage : (string * Codegen_types.union_payload_storage) list;
   next_def_id : int;
   import_bindings : Session.import_binding list;
   module_imports : (string * Session.import_binding list) list;
-  debug : bool;
   require_main : bool;
   check_invariants : bool;
   observations : stage list;
@@ -117,27 +117,27 @@ let rec decode_list decode = function
       Ok (item :: rest)
 
 let semantic_middle_stage = function
-  | ( Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-    | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
-    | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-    | Core_stage.Fusion ) as stage ->
+  | ( Core_stage.Match | Core_stage.TraitResolve | Core_stage.Resolve
+    | Core_stage.StdInline | Core_stage.Tailrec | Core_stage.Fusion ) as stage ->
       Some stage
-  | Core_stage.Specialize | Core_stage.Dce | Core_stage.ConsumeSpecialize | Core_stage.Perceus
-  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
+  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
+  | Core_stage.Synth | Core_stage.Specialize | Core_stage.Dce
+  | Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
+  | Core_stage.Closure | Core_stage.Final ->
       None
 
 let stage_name = Core_stage.to_string
 
 let capability_name = function
-  | PreparedCore -> "core_pre_middle"
+  | PostSynthCore -> "core_post_synth"
   | PreDceCore -> "core_pre_dce"
   | RenderedStageObservations -> "rendered_stage_observations"
 
 let supported_capabilities =
-  [ PreparedCore; PreDceCore; RenderedStageObservations ]
+  [ PostSynthCore; PreDceCore; RenderedStageObservations ]
 
 let decode_capability = function
-  | Lsp_json.String "core_pre_middle" -> Ok PreparedCore
+  | Lsp_json.String "core_post_synth" -> Ok PostSynthCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
   | Lsp_json.String "rendered_stage_observations" ->
       Ok RenderedStageObservations
@@ -147,6 +147,18 @@ let decode_capability = function
   | _ ->
       protocol_error "invalid_field"
         "field `required_capabilities` must contain strings"
+
+let require_supported_capabilities capabilities =
+  match
+    List.find_opt
+      (fun required -> not (List.mem required capabilities))
+      supported_capabilities
+  with
+  | Some missing ->
+      protocol_error "missing_capability"
+        ("missing required semantic-middle capability `"
+        ^ capability_name missing ^ "`")
+  | None -> Ok ()
 
 let decode_stage = function
   | Lsp_json.String name -> (
@@ -205,24 +217,24 @@ let decode_request value =
     let* target_module = string_field "target_module" value in
     let* core_json = field "core" value in
     let* decoded =
-      match Core_pre_middle_json.decode_program core_json with
+      match Core_post_synth_json.decode_program core_json with
       | Ok decoded -> Ok decoded
       | Error error ->
-          protocol_error "invalid_pre_middle_core"
-            (Core_pre_middle_json.decode_error_to_string error)
+          protocol_error "invalid_post_synth_core"
+            (Core_post_synth_json.decode_error_to_string error)
     in
     let* next_def_id = int_field "next_def_id" value in
     let* import_binding_values = array_field "import_bindings" value in
     let* import_bindings = decode_list decode_import_binding import_binding_values in
     let* module_import_values = array_field "module_imports" value in
     let* module_imports = decode_list decode_module_imports module_import_values in
-    let* debug = bool_field "debug" value in
     let* require_main = bool_field "require_main" value in
     let* check_invariants = bool_field "check_invariants" value in
     let* capability_values = array_field "required_capabilities" value in
-    let* _validated_capabilities =
+    let* validated_capabilities =
       decode_list decode_capability capability_values
     in
+    let* () = require_supported_capabilities validated_capabilities in
     let* observation_values = array_field "observations" value in
     let* observations = decode_list decode_stage observation_values in
     let* stop_after_json = field "stop_after" value in
@@ -233,21 +245,29 @@ let decode_request value =
           let* stage = decode_stage value in
           Ok (Some stage)
     in
-    Ok
-      {
-        target_path;
-        target_module;
-        core = decoded.core;
-        foreign_includes = decoded.foreign_includes;
-        next_def_id;
-        import_bindings;
-        module_imports;
-        debug;
-        require_main;
-        check_invariants;
-        observations;
-        stop_after;
-      }
+    let post_synth_violations =
+      Core_invariants.run_for_stage Core_stage.Synth decoded.core
+    in
+    (match post_synth_violations with
+    | violation :: _ ->
+        protocol_error "invalid_post_synth_core"
+          ("post-synthesis Core invariant failed: " ^ violation.Core_error.msg)
+    | [] ->
+        Ok
+          {
+            target_path;
+            target_module;
+            core = decoded.core;
+            foreign_includes = decoded.foreign_includes;
+            union_payload_storage = decoded.union_payload_storage;
+            next_def_id;
+            import_bindings;
+            module_imports;
+            require_main;
+            check_invariants;
+            observations;
+            stop_after;
+          })
 
 let program_has_top_level_main program =
   List.exists
@@ -307,7 +327,9 @@ let run_request_in_session request =
     in
     try
       let reg = Codegen_types.create_registry () in
-      Core_registry.register_types reg request.core;
+      Core_registry.register_types
+        ~union_payload_storage_overrides:request.union_payload_storage reg
+        request.core;
       let import_aliases, module_imports =
         Core_imports.tables_of_bindings
           ~main_import_bindings:request.import_bindings request.module_imports
@@ -317,8 +339,8 @@ let run_request_in_session request =
           ~user:on_stage
       in
       let backend_input =
-        Core_pipeline.run_core_passes ~on_stage
-          ~reg ~import_aliases ~module_imports ~debug:request.debug request.core
+        Core_pipeline.run_core_passes_from_post_synth ~on_stage
+          ~reg ~import_aliases ~module_imports request.core
       in
       let observations = List.rev !observations_rev in
       (match

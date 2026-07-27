@@ -256,8 +256,7 @@ let collect_registry ~(import_aliases : (string, string * string) Hashtbl.t)
               in
               let head =
                 match Codegen_types.normalize_type first.cp_ty with
-                | Ast.TyNamed (n, _) when not (Types.is_type_param_name n) ->
-                    Some n
+                | Ast.TyNamed (n, _) -> Some n
                 | Ast.TyTuple ts ->
                     Some (Printf.sprintf "Tuple%d" (List.length ts))
                 | _ -> None
@@ -403,7 +402,7 @@ let first_arg_type_head (args : core list) : string option =
   match args with
   | first :: _ -> (
       match Codegen_types.normalize_type first.ty with
-      | Ast.TyNamed (n, _) when not (Types.is_type_param_name n) -> Some n
+      | Ast.TyNamed (n, _) -> Some n
       | Ast.TyTuple ts -> Some (Printf.sprintf "Tuple%d" (List.length ts))
       | _ -> None)
   | [] -> None

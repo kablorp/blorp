@@ -5,6 +5,7 @@
 -- guesses at each allocation or handoff site.
 import:
 	../stage_09_core/compiler_core_json:
+		CoreBoxKind(StructBox),
 		CoreBoxedStorageValue,
 		CoreDecl(
 			EnumDecl,
@@ -28,9 +29,11 @@ import:
 			HeapRecordType,
 			NamedType,
 			RangeType,
+			SelfType,
 			StackResultType,
 			TensorType,
 			TupleType,
+			TypeParameterType,
 			UnionType,
 			ValueRecordType,
 			VoidType,
@@ -118,14 +121,15 @@ private pure func substitute_alias_type(
 	args: List[CoreType],
 ) -> CoreType:
 	match typ:
+		TypeParameterType(name):
+			alias_type_argument(params, args, name).get_or(typ)
+		SelfType:
+			typ
 		NamedType(name, nested_args):
-			if nested_args.length() == 0:
-				alias_type_argument(params, args, name).get_or(typ)
-			else:
-				NamedType(
-					name,
-					nested_args.map(func(arg): substitute_alias_type(arg, params, args)),
-				)
+			NamedType(
+				name,
+				nested_args.map(func(arg): substitute_alias_type(arg, params, args)),
+			)
 		StackResultType(ok_type, err_type):
 			StackResultType(
 				substitute_alias_type(ok_type, params, args),
@@ -479,6 +483,8 @@ private pure func list_element_needs_release_with_index(
 					True
 				TupleType(_):
 					True
+				TypeParameterType(_) | SelfType:
+					False
 				_:
 					False
 
@@ -500,10 +506,19 @@ private pure func relayout_list_construct_elements(
 			-- named types. Repair the per-element ownership metadata together
 			-- with the list-wide layout so Perceus sees one coherent policy.
 			needs_release: Bool = list_element_needs_release_with_index(program, index, element)
-			if elements.all(func(value): value.needs_release == needs_release):
-				elements
-			else:
-				elements.map(func(value): { value | needs_release = needs_release })
+			match resolve_layout_type_with_index(index, element):
+				StackResultType(_, _):
+					elements.map(func(value):
+						{ value |
+							kind = StructBox("blorp_StackResult"),
+							needs_release = needs_release
+						}
+					)
+				_:
+					if elements.all(func(value): value.needs_release == needs_release):
+						elements
+					else:
+						elements.map(func(value): { value | needs_release = needs_release })
 		None:
 			elements
 

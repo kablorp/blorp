@@ -1,0 +1,1287 @@
+-- Monomorphization foundations for Core.
+--
+-- Core represents ordinary type parameters explicitly and tensor dimensions
+-- separately as CoreTensorDim values. Keeping those substitution domains
+-- distinct prevents nominal types or dimensions from entering a parameter's
+-- value-type position.
+import:
+	compiler_core_clone: clone_core_tensor_dim, clone_core_type
+	compiler_core_json:
+		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	list: join
+	string: append_int, string
+
+
+union CoreMonoSubstitutionValue:
+	TypeSubstitution(CoreType)
+	DimSubstitution(CoreTensorDim)
+	DimPackSubstitution(List[CoreTensorDim])
+
+
+type alias CoreMonoSubstitution = List[(String, CoreMonoSubstitutionValue)]
+
+
+private pure func core_dim_op_equal(left: CoreDimOp, right: CoreDimOp) -> Bool:
+	match (left, right):
+		(DimAdd, DimAdd) | (DimSubtract, DimSubtract) | (DimMultiply, DimMultiply) | (DimDivide, DimDivide):
+			True
+		_:
+			False
+
+
+private pure func core_tensor_dim_raw_equal(left: CoreTensorDim, right: CoreTensorDim) -> Bool:
+	match (left, right):
+		(TensorStaticDim(left_value), TensorStaticDim(right_value)):
+			left_value == right_value
+		(TensorRuntimeDim(left_name), TensorRuntimeDim(right_name)):
+			left_name == right_name
+		(TensorVariadicDim(left_name), TensorVariadicDim(right_name)):
+			left_name == right_name
+		(TensorDimOperation(left_op, left_left, left_right), TensorDimOperation(right_op, right_left, right_right)):
+			(
+				core_dim_op_equal(left_op, right_op)
+				and core_tensor_dim_raw_equal(left_left, right_left)
+				and core_tensor_dim_raw_equal(left_right, right_right)
+			)
+		_:
+			False
+
+
+private pure func normalize_dim(dim: CoreTensorDim) -> CoreTensorDim:
+	match dim:
+		TensorDimOperation(op, left, right):
+			normalized_left: CoreTensorDim = normalize_dim(left)
+			normalized_right: CoreTensorDim = normalize_dim(right)
+
+			match (op, normalized_left, normalized_right):
+				(DimAdd, TensorStaticDim(left_value), TensorStaticDim(right_value)):
+					TensorStaticDim(left_value + right_value)
+				(DimSubtract, TensorStaticDim(left_value), TensorStaticDim(right_value)):
+					TensorStaticDim(left_value - right_value)
+				(DimMultiply, TensorStaticDim(left_value), TensorStaticDim(right_value)):
+					TensorStaticDim(left_value * right_value)
+				(DimMultiply, TensorStaticDim(0), _) | (DimMultiply, _, TensorStaticDim(0)):
+					TensorStaticDim(0)
+				(DimDivide, TensorStaticDim(left_value), TensorStaticDim(right_value)):
+					if right_value > 0 and left_value % right_value == 0:
+						TensorStaticDim(left_value / right_value)
+					else if left_value == 0:
+						TensorStaticDim(0)
+					else:
+						TensorDimOperation(op, normalized_left, normalized_right)
+				(DimAdd, TensorDimOperation(DimAdd, nested, TensorStaticDim(first_value)), TensorStaticDim(second_value)):
+					normalize_dim(
+						TensorDimOperation(
+							DimAdd,
+							nested,
+							TensorStaticDim(first_value + second_value),
+						),
+					)
+				(DimAdd, TensorStaticDim(second_value), TensorDimOperation(DimAdd, nested, TensorStaticDim(first_value))):
+					normalize_dim(
+						TensorDimOperation(
+							DimAdd,
+							nested,
+							TensorStaticDim(first_value + second_value),
+						),
+					)
+				(DimSubtract, TensorDimOperation(DimAdd, nested, TensorStaticDim(first_value)), TensorStaticDim(second_value)):
+					normalize_dim(
+						TensorDimOperation(
+							DimAdd,
+							nested,
+							TensorStaticDim(first_value - second_value),
+						),
+					)
+				(DimAdd, TensorDimOperation(DimSubtract, nested, TensorStaticDim(first_value)), TensorStaticDim(second_value)):
+					normalize_dim(
+						TensorDimOperation(
+							DimAdd,
+							nested,
+							TensorStaticDim(second_value - first_value),
+						),
+					)
+				(DimSubtract, TensorDimOperation(DimSubtract, nested, TensorStaticDim(first_value)), TensorStaticDim(second_value)):
+					normalize_dim(
+						TensorDimOperation(
+							DimSubtract,
+							nested,
+							TensorStaticDim(first_value + second_value),
+						),
+					)
+				(DimAdd, normalized_left, TensorStaticDim(0)):
+					normalized_left
+				(DimAdd, TensorStaticDim(0), normalized_right):
+					normalized_right
+				(DimSubtract, normalized_left, TensorStaticDim(0)):
+					normalized_left
+				(DimMultiply, normalized_left, TensorStaticDim(1)):
+					normalized_left
+				(DimMultiply, TensorStaticDim(1), normalized_right):
+					normalized_right
+				(DimDivide, normalized_left, TensorStaticDim(1)):
+					normalized_left
+				(DimSubtract, normalized_left, normalized_right):
+					if core_tensor_dim_raw_equal(normalized_left, normalized_right):
+						TensorStaticDim(0)
+					else:
+						TensorDimOperation(op, normalized_left, normalized_right)
+				_:
+					TensorDimOperation(op, normalized_left, normalized_right)
+		_:
+			dim
+
+
+private pure func core_tensor_dim_equal(left: CoreTensorDim, right: CoreTensorDim) -> Bool:
+	core_tensor_dim_raw_equal(normalize_dim(left), normalize_dim(right))
+
+
+private pure func core_tensor_dims_equal(
+	left: List[CoreTensorDim],
+	right: List[CoreTensorDim],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		while index < left.length():
+			match (left.get(index), right.get(index)):
+				(Some(left_dim), Some(right_dim)):
+					if not core_tensor_dim_equal(left_dim, right_dim):
+						equal = False
+						break
+				_:
+					equal = False
+					break
+
+			index += 1
+
+		equal
+
+
+private pure func core_type_lists_equal(left: List[CoreType], right: List[CoreType]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		while index < left.length():
+			match (left.get(index), right.get(index)):
+				(Some(left_type), Some(right_type)):
+					if not core_mono_type_equal(left_type, right_type):
+						equal = False
+						break
+				_:
+					equal = False
+					break
+
+			index += 1
+
+		equal
+
+
+pure func core_mono_type_equal(left: CoreType, right: CoreType) -> Bool:
+	match (left, right):
+		(VoidType, VoidType) | (RangeType, RangeType):
+			True
+		(NamedType(left_name, left_args), NamedType(right_name, right_args)):
+			left_name == right_name and core_type_lists_equal(left_args, right_args)
+		(TypeParameterType(left_name), TypeParameterType(right_name)):
+			left_name == right_name
+		(SelfType, SelfType):
+			True
+		(StackResultType(left_value, left_error), StackResultType(right_value, right_error)):
+			(
+				core_mono_type_equal(left_value, right_value)
+				and core_mono_type_equal(left_error, right_error)
+			)
+		(BoxedResultType(left_value, left_error), BoxedResultType(right_value, right_error)):
+			(
+				core_mono_type_equal(left_value, right_value)
+				and core_mono_type_equal(left_error, right_error)
+			)
+		(FunctionType(left_pure, left_params, left_return), FunctionType(right_pure, right_params, right_return)):
+			(
+				left_pure == right_pure
+				and core_type_lists_equal(left_params, right_params)
+				and core_mono_type_equal(left_return, right_return)
+			)
+		(EnumType(left_name), EnumType(right_name)):
+			left_name == right_name
+		(ValueRecordType(left_name), ValueRecordType(right_name)):
+			left_name == right_name
+		(HeapRecordType(left_name), HeapRecordType(right_name)):
+			left_name == right_name
+		(UnionType(left_name), UnionType(right_name)):
+			left_name == right_name
+		(TensorType(left_info), TensorType(right_info)):
+			(
+				core_mono_type_equal(left_info.element_type, right_info.element_type)
+				and core_tensor_dims_equal(left_info.dims, right_info.dims)
+			)
+		(TupleType(left_items), TupleType(right_items)):
+			core_type_lists_equal(left_items, right_items)
+		_:
+			False
+
+
+pure func core_mono_substitution_value_equal(
+	left: CoreMonoSubstitutionValue,
+	right: CoreMonoSubstitutionValue,
+) -> Bool:
+	match (left, right):
+		(TypeSubstitution(left_type), TypeSubstitution(right_type)):
+			core_mono_type_equal(left_type, right_type)
+		(DimSubstitution(left_dim), DimSubstitution(right_dim)):
+			core_tensor_dim_equal(left_dim, right_dim)
+		(DimPackSubstitution(left_dims), DimPackSubstitution(right_dims)):
+			core_tensor_dims_equal(left_dims, right_dims)
+		_:
+			False
+
+
+private pure func lookup_substitution(
+	substitution: CoreMonoSubstitution,
+	name: String,
+) -> Option[CoreMonoSubstitutionValue]:
+	var found: Option[CoreMonoSubstitutionValue] = None
+
+	for (binding_name, value) in substitution:
+		if binding_name == name:
+			found = Some(value)
+			break
+
+	found
+
+
+private pure func normalize_dim_list(dims: List[CoreTensorDim]) -> List[CoreTensorDim]:
+	var normalized: List[CoreTensorDim] = []
+
+	for dim in dims:
+		normalized = normalized.append(normalize_dim(dim))
+
+	normalized
+
+
+private pure func normalize_substitution_value(
+	value: CoreMonoSubstitutionValue,
+) -> CoreMonoSubstitutionValue:
+	match value:
+		TypeSubstitution(typ):
+			TypeSubstitution(typ)
+		DimSubstitution(dim):
+			DimSubstitution(normalize_dim(dim))
+		DimPackSubstitution(dims):
+			DimPackSubstitution(normalize_dim_list(dims))
+
+
+private pure func same_substitution_domain(
+	left: CoreMonoSubstitutionValue,
+	right: CoreMonoSubstitutionValue,
+) -> Bool:
+	match (left, right):
+		(TypeSubstitution(_), TypeSubstitution(_)):
+			True
+		(DimSubstitution(_), DimSubstitution(_)):
+			True
+		(DimPackSubstitution(_), DimPackSubstitution(_)):
+			True
+		_:
+			False
+
+
+private pure func substitution_value_contains_parameter(
+	unresolved_type_params: List[String],
+	value: CoreMonoSubstitutionValue,
+) -> Bool:
+	match value:
+		TypeSubstitution(typ):
+			type_contains_parameter(unresolved_type_params, typ)
+		DimSubstitution(dim):
+			dim_contains_parameter(unresolved_type_params, dim)
+		DimPackSubstitution(dims):
+			dims_contain_parameter(unresolved_type_params, dims)
+
+
+private pure func replace_substitution(
+	substitution: CoreMonoSubstitution,
+	name: String,
+	value: CoreMonoSubstitutionValue,
+) -> CoreMonoSubstitution:
+	var replaced: CoreMonoSubstitution = []
+
+	for (binding_name, binding_value) in substitution:
+		if binding_name == name:
+			replaced = replaced.append((binding_name, value))
+		else:
+			replaced = replaced.append((binding_name, binding_value))
+
+	replaced
+
+
+private pure func add_substitution(
+	unresolved_type_params: List[String],
+	substitution: CoreMonoSubstitution,
+	name: String,
+	value: CoreMonoSubstitutionValue,
+) -> Option[CoreMonoSubstitution]:
+	normalized_value: CoreMonoSubstitutionValue = normalize_substitution_value(value)
+
+	match lookup_substitution(substitution, name):
+		Some(existing):
+			normalized_existing: CoreMonoSubstitutionValue = normalize_substitution_value(existing)
+
+			if core_mono_substitution_value_equal(normalized_existing, normalized_value):
+				Some(substitution)
+			else if not same_substitution_domain(normalized_existing, normalized_value):
+				None
+			else if substitution_value_contains_parameter(unresolved_type_params, normalized_value):
+				Some(replace_substitution(substitution, name, normalized_value))
+			else if substitution_value_contains_parameter(
+				unresolved_type_params,
+				normalized_existing,
+			):
+				Some(substitution)
+			else:
+				None
+		None:
+			Some(substitution.append((name, normalized_value)))
+
+
+private pure func is_declared_parameter(type_params: List[String], name: String) -> Bool:
+	type_params.contains(name)
+
+
+private pure func is_dimension_parameter(name: String) -> Bool:
+	name.starts_with("#")
+
+
+private pure func erase_value_refinements_for_mono(typ: CoreType) -> CoreType:
+	match typ:
+		RangeType:
+			NamedType("Int", [])
+		NamedType(name, args):
+			NamedType(name, erase_type_list_refinements_for_mono(args))
+		TypeParameterType(_) | SelfType:
+			typ
+		FunctionType(is_pure, params, return_type):
+			FunctionType(
+				is_pure,
+				erase_type_list_refinements_for_mono(params),
+				erase_value_refinements_for_mono(return_type),
+			)
+		StackResultType(value_type, error_type):
+			StackResultType(
+				erase_value_refinements_for_mono(value_type),
+				erase_value_refinements_for_mono(error_type),
+			)
+		BoxedResultType(value_type, error_type):
+			BoxedResultType(
+				erase_value_refinements_for_mono(value_type),
+				erase_value_refinements_for_mono(error_type),
+			)
+		TensorType(info):
+			TensorType(
+				{ info | element_type = erase_value_refinements_for_mono(info.element_type) },
+			)
+		TupleType(items):
+			TupleType(erase_type_list_refinements_for_mono(items))
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			typ
+
+
+private pure func erase_type_list_refinements_for_mono(types: List[CoreType]) -> List[CoreType]:
+	var erased: List[CoreType] = []
+
+	for typ in types:
+		erased = erased.append(erase_value_refinements_for_mono(typ))
+
+	erased
+
+
+private pure func is_identity_type_binding(name: String, typ: CoreType) -> Bool:
+	match typ:
+		TypeParameterType(arg_name):
+			arg_name == name
+		SelfType:
+			name == "Self"
+		_:
+			False
+
+
+private pure func collect_type_lists(
+	type_params: List[String],
+	unresolved_type_params: List[String],
+	param_types: List[CoreType],
+	arg_types: List[CoreType],
+	substitution: CoreMonoSubstitution,
+) -> Option[CoreMonoSubstitution]:
+	if param_types.length() != arg_types.length():
+		Some(substitution)
+	else:
+		var result: Option[CoreMonoSubstitution] = Some(substitution)
+		var index: Int = 0
+
+		while index < param_types.length():
+			match (param_types.get(index), arg_types.get(index), result):
+				(Some(param_type), Some(arg_type), Some(current)):
+					result = collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_type,
+						arg_type,
+						current,
+					)
+				_:
+					result = None
+
+			match result:
+				Some(_):
+					void
+				None:
+					break
+
+			index += 1
+
+		result
+
+
+private pure func collect_single_dim_substitution(
+	type_params: List[String],
+	unresolved_type_params: List[String],
+	param_dim: CoreTensorDim,
+	arg_dim: CoreTensorDim,
+	substitution: CoreMonoSubstitution,
+) -> Option[CoreMonoSubstitution]:
+	match param_dim:
+		TensorRuntimeDim(name):
+			if is_declared_parameter(type_params, name):
+				if core_tensor_dim_equal(param_dim, arg_dim):
+					if is_declared_parameter(unresolved_type_params, name):
+						add_substitution(
+							unresolved_type_params,
+							substitution,
+							name,
+							DimSubstitution(arg_dim),
+						)
+					else:
+						Some(substitution)
+				else:
+					add_substitution(
+						unresolved_type_params,
+						substitution,
+						name,
+						DimSubstitution(normalize_dim(arg_dim)),
+					)
+			else:
+				Some(substitution)
+		TensorVariadicDim(name):
+			if is_declared_parameter(type_params, name):
+				add_substitution(
+					unresolved_type_params,
+					substitution,
+					name,
+					DimPackSubstitution([arg_dim]),
+				)
+			else:
+				Some(substitution)
+		TensorDimOperation(param_op, param_left, param_right):
+			match arg_dim:
+				TensorDimOperation(arg_op, arg_left, arg_right):
+					if param_op != arg_op:
+						Some(substitution)
+					else:
+						left_result ?= collect_single_dim_substitution(
+							type_params,
+							unresolved_type_params,
+							param_left,
+							arg_left,
+							substitution,
+						)
+						collect_single_dim_substitution(
+							type_params,
+							unresolved_type_params,
+							param_right,
+							arg_right,
+							left_result,
+						)
+				_:
+					Some(substitution)
+		TensorStaticDim(_):
+			Some(substitution)
+
+
+private pure func collect_dim_substitution(
+	type_params: List[String],
+	unresolved_type_params: List[String],
+	param_dims: List[CoreTensorDim],
+	arg_dims: List[CoreTensorDim],
+	substitution: CoreMonoSubstitution,
+) -> Option[CoreMonoSubstitution]:
+	var result: Option[CoreMonoSubstitution] = Some(substitution)
+	var param_index: Int = 0
+	var arg_index: Int = 0
+
+	while param_index < param_dims.length():
+		match param_dims.get(param_index):
+			Some(param_dim):
+				match result:
+					Some(current):
+						match param_dim:
+							TensorVariadicDim(name):
+								if param_index == param_dims.length() - 1:
+									if is_dimension_parameter(name) and name != "#_":
+										remaining_dims: List[CoreTensorDim] = arg_dims.drop(
+											arg_index,
+										)
+
+										match remaining_dims:
+											[TensorVariadicDim(arg_name)]:
+												if (
+													arg_name != name
+													or is_declared_parameter(
+														unresolved_type_params,
+														name,
+													)
+												):
+													result = add_substitution(
+														unresolved_type_params,
+														current,
+														name,
+														DimPackSubstitution(remaining_dims),
+													)
+											_:
+												result = add_substitution(
+													unresolved_type_params,
+													current,
+													name,
+													DimPackSubstitution(remaining_dims),
+												)
+
+									break
+							_:
+								match arg_dims.get(arg_index):
+									Some(arg_dim):
+										result = collect_single_dim_substitution(
+											type_params,
+											unresolved_type_params,
+											param_dim,
+											arg_dim,
+											current,
+										)
+									None:
+										break
+					None:
+						break
+			_:
+				result = None
+				break
+
+		match result:
+			Some(_):
+				void
+			None:
+				break
+
+		param_index += 1
+		arg_index += 1
+
+	result
+
+
+-- Collect evidence by structurally matching a callee parameter type against a
+-- call-site type. type_params names parameters owned by the callee, while
+-- unresolved_type_params names rigid parameters owned by the active caller.
+-- Conflicting closed evidence returns None. Evidence containing a rigid caller
+-- parameter keeps the result open so the outer specialization can retry it.
+-- Ordinary structural mismatches produce no evidence and are left to the
+-- caller's signature guard.
+pure func collect_type_substitution(
+	type_params: List[String],
+	unresolved_type_params: List[String],
+	param_type: CoreType,
+	arg_type: CoreType,
+	substitution: CoreMonoSubstitution,
+) -> Option[CoreMonoSubstitution]:
+	match param_type:
+		TypeParameterType(name):
+			-- A dimension-return value has the runtime representation Int/Range,
+			-- while its shape evidence lives only in CoreTensorDim. Treating the
+			-- value result as TypeSubstitution would conflict with the
+			-- DimSubstitution collected from tensor parameters.
+			if is_dimension_parameter(name):
+				Some(substitution)
+			else if is_declared_parameter(type_params, name):
+				if is_identity_type_binding(name, arg_type):
+					if is_declared_parameter(unresolved_type_params, name):
+						add_substitution(
+							unresolved_type_params,
+							substitution,
+							name,
+							TypeSubstitution(arg_type),
+						)
+					else:
+						Some(substitution)
+				else:
+					add_substitution(
+						unresolved_type_params,
+						substitution,
+						name,
+						TypeSubstitution(erase_value_refinements_for_mono(arg_type)),
+					)
+			else:
+				Some(substitution)
+		SelfType:
+			if is_declared_parameter(type_params, "Self"):
+				add_substitution(
+					unresolved_type_params,
+					substitution,
+					"Self",
+					TypeSubstitution(erase_value_refinements_for_mono(arg_type)),
+				)
+			else:
+				Some(substitution)
+		NamedType(name, param_args):
+			match arg_type:
+				NamedType(arg_name, arg_args):
+					if name == arg_name:
+						collect_type_lists(
+							type_params,
+							unresolved_type_params,
+							param_args,
+							arg_args,
+							substitution,
+						)
+					else:
+						Some(substitution)
+				_:
+					Some(substitution)
+		FunctionType(_, param_params, param_return):
+			match arg_type:
+				FunctionType(_, arg_params, arg_return):
+					params_result ?= collect_type_lists(
+						type_params,
+						unresolved_type_params,
+						param_params,
+						arg_params,
+						substitution,
+					)
+					collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_return,
+						arg_return,
+						params_result,
+					)
+				_:
+					Some(substitution)
+		StackResultType(param_value, param_error):
+			match arg_type:
+				StackResultType(arg_value, arg_error):
+					value_result ?= collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_value,
+						arg_value,
+						substitution,
+					)
+					collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_error,
+						arg_error,
+						value_result,
+					)
+				_:
+					Some(substitution)
+		BoxedResultType(param_value, param_error):
+			match arg_type:
+				BoxedResultType(arg_value, arg_error):
+					value_result ?= collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_value,
+						arg_value,
+						substitution,
+					)
+					collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_error,
+						arg_error,
+						value_result,
+					)
+				_:
+					Some(substitution)
+		TensorType(param_info):
+			match arg_type:
+				TensorType(arg_info):
+					element_result ?= collect_type_substitution(
+						type_params,
+						unresolved_type_params,
+						param_info.element_type,
+						arg_info.element_type,
+						substitution,
+					)
+					collect_dim_substitution(
+						type_params,
+						unresolved_type_params,
+						param_info.dims,
+						arg_info.dims,
+						element_result,
+					)
+				_:
+					Some(substitution)
+		TupleType(param_items):
+			match arg_type:
+				TupleType(arg_items):
+					collect_type_lists(
+						type_params,
+						unresolved_type_params,
+						param_items,
+						arg_items,
+						substitution,
+					)
+				_:
+					Some(substitution)
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			Some(substitution)
+
+
+private pure func apply_dim_substitution_with_active_packs(
+	substitution: CoreMonoSubstitution,
+	active_packs: List[String],
+	dim: CoreTensorDim,
+) -> List[CoreTensorDim]:
+	match dim:
+		TensorRuntimeDim(name):
+			match lookup_substitution(substitution, name):
+				Some(DimSubstitution(substituted_dim)):
+					[clone_core_tensor_dim(substituted_dim)]
+				_:
+					[dim]
+		TensorVariadicDim(name):
+			if active_packs.contains(name):
+				[dim]
+			else:
+				match lookup_substitution(substitution, name):
+					Some(DimPackSubstitution(dims)):
+						var applied: List[CoreTensorDim] = []
+						next_active_packs: List[String] = active_packs.append(name)
+
+						for substituted_dim in dims:
+							applied = applied.concat(
+								apply_dim_substitution_with_active_packs(
+									substitution,
+									next_active_packs,
+									clone_core_tensor_dim(substituted_dim),
+								),
+							)
+
+						applied
+					_:
+						[dim]
+		TensorDimOperation(op, left, right):
+			left_dims = apply_dim_substitution_with_active_packs(substitution, active_packs, left)
+			right_dims = apply_dim_substitution_with_active_packs(substitution, active_packs, right)
+
+			match (left_dims.get(0), right_dims.get(0)):
+				(Some(substituted_left), Some(substituted_right)):
+					[TensorDimOperation(op, substituted_left, substituted_right)]
+				_:
+					[dim]
+		TensorStaticDim(_):
+			[dim]
+
+
+private pure func apply_dim_substitution(
+	substitution: CoreMonoSubstitution,
+	dim: CoreTensorDim,
+) -> List[CoreTensorDim]:
+	apply_dim_substitution_with_active_packs(substitution, [], dim)
+
+
+private pure func apply_dims_substitution(
+	substitution: CoreMonoSubstitution,
+	dims: List[CoreTensorDim],
+) -> List[CoreTensorDim]:
+	var applied: List[CoreTensorDim] = []
+
+	for dim in dims:
+		applied = applied.concat(apply_dim_substitution(substitution, dim))
+
+	applied
+
+
+private pure func apply_type_list_substitution(
+	substitution: CoreMonoSubstitution,
+	types: List[CoreType],
+) -> List[CoreType]:
+	var applied: List[CoreType] = []
+
+	for typ in types:
+		applied = applied.append(apply_type_substitution(substitution, typ))
+
+	applied
+
+
+pure func apply_type_substitution(substitution: CoreMonoSubstitution, typ: CoreType) -> CoreType:
+	match typ:
+		TypeParameterType(name):
+			match lookup_substitution(substitution, name):
+				Some(TypeSubstitution(replacement)):
+					clone_core_type(replacement)
+				_:
+					typ
+		SelfType:
+			match lookup_substitution(substitution, "Self"):
+				Some(TypeSubstitution(replacement)):
+					clone_core_type(replacement)
+				_:
+					typ
+		NamedType(name, args):
+			NamedType(
+				name,
+				apply_type_list_substitution(substitution, args),
+			)
+		FunctionType(is_pure, params, return_type):
+			FunctionType(
+				is_pure,
+				apply_type_list_substitution(substitution, params),
+				apply_type_substitution(substitution, return_type),
+			)
+		StackResultType(value_type, error_type):
+			StackResultType(
+				apply_type_substitution(substitution, value_type),
+				apply_type_substitution(substitution, error_type),
+			)
+		BoxedResultType(value_type, error_type):
+			BoxedResultType(
+				apply_type_substitution(substitution, value_type),
+				apply_type_substitution(substitution, error_type),
+			)
+		TensorType(info):
+			TensorType({
+				element_type = apply_type_substitution(substitution, info.element_type),
+				dims = apply_dims_substitution(substitution, info.dims),
+			})
+		TupleType(items):
+			TupleType(apply_type_list_substitution(substitution, items))
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			typ
+
+
+private pure func dim_contains_parameter(type_params: List[String], dim: CoreTensorDim) -> Bool:
+	match dim:
+		TensorRuntimeDim(name) | TensorVariadicDim(name):
+			is_declared_parameter(type_params, name)
+		TensorDimOperation(_, left, right):
+			dim_contains_parameter(type_params, left) or dim_contains_parameter(type_params, right)
+		TensorStaticDim(_):
+			False
+
+
+private pure func dims_contain_parameter(
+	type_params: List[String],
+	dims: List[CoreTensorDim],
+) -> Bool:
+	var contains: Bool = False
+
+	for dim in dims:
+		if dim_contains_parameter(type_params, dim):
+			contains = True
+			break
+
+	contains
+
+
+private pure func types_contain_parameter(type_params: List[String], types: List[CoreType]) -> Bool:
+	var contains: Bool = False
+
+	for typ in types:
+		if type_contains_parameter(type_params, typ):
+			contains = True
+			break
+
+	contains
+
+
+private pure func type_contains_parameter(type_params: List[String], typ: CoreType) -> Bool:
+	match typ:
+		NamedType(_, args):
+			types_contain_parameter(type_params, args)
+		TypeParameterType(name):
+			is_declared_parameter(type_params, name)
+		SelfType:
+			True
+		FunctionType(_, params, return_type):
+			(
+				types_contain_parameter(type_params, params)
+				or type_contains_parameter(type_params, return_type)
+			)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			(
+				type_contains_parameter(type_params, value_type)
+				or type_contains_parameter(type_params, error_type)
+			)
+		TensorType(info):
+			(
+				type_contains_parameter(type_params, info.element_type)
+				or dims_contain_parameter(type_params, info.dims)
+			)
+		TupleType(items):
+			types_contain_parameter(type_params, items)
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			False
+
+
+pure func core_type_contains_parameter(type_params: List[String], typ: CoreType) -> Bool:
+	type_contains_parameter(type_params, typ)
+
+
+-- The unresolved parameter set belongs to the active caller scope, not merely
+-- the callee being specialized. A substitution such as T -> V must remain
+-- open while V is an unresolved outer parameter.
+pure func is_concrete_substitution(
+	unresolved_type_params: List[String],
+	substitution: CoreMonoSubstitution,
+) -> Bool:
+	var concrete: Bool = True
+
+	for (_, value) in substitution:
+		match value:
+			TypeSubstitution(typ):
+				if type_contains_parameter(unresolved_type_params, typ):
+					concrete = False
+			DimSubstitution(dim):
+				if dim_contains_parameter(unresolved_type_params, dim):
+					concrete = False
+			DimPackSubstitution(dims):
+				if dims_contain_parameter(unresolved_type_params, dims):
+					concrete = False
+
+		if not concrete:
+			break
+
+	concrete
+
+
+-- A call substitution is safe to materialize only when it provides a closed
+-- value for every generic parameter declared by the callee. Checking the
+-- bindings directly is important for dimension parameters: applying a
+-- DimSubstitution does not rewrite a value-level TypeParameterType("#N").
+pure func substitution_closes_parameters(
+	substitution: CoreMonoSubstitution,
+	type_params: List[String],
+) -> Bool:
+	type_params.all(func(name):
+		match lookup_substitution(substitution, name):
+			Some(TypeSubstitution(typ)):
+				not type_contains_parameter(type_params, typ)
+			Some(DimSubstitution(dim)):
+				not dim_contains_parameter(type_params, dim)
+			Some(DimPackSubstitution(dims)):
+				not dims_contain_parameter(type_params, dims)
+			None:
+				False
+	)
+
+
+private pure func encode_dim_op(op: CoreDimOp) -> String:
+	match op:
+		DimAdd:
+			"Add"
+		DimSubtract:
+			"Sub"
+		DimMultiply:
+			"Mul"
+		DimDivide:
+			"Div"
+
+
+private pure func encode_dim(dim: CoreTensorDim) -> Option[String]:
+	match normalize_dim(dim):
+		TensorStaticDim(value):
+			Some("N${value}")
+		TensorDimOperation(op, left, right):
+			left_text ?= encode_dim(left)
+			right_text ?= encode_dim(right)
+			Some(
+				"O${encode_dim_op(op)}${frame_data_encoding(left_text)}${frame_data_encoding(right_text)}",
+			)
+		TensorRuntimeDim(_) | TensorVariadicDim(_):
+			None
+
+
+private pure func core_mono_c_identifier_char(ch: Char) -> Bool:
+	ch >= 'a' and ch <= 'z' or ch >= 'A' and ch <= 'Z' or ch >= '0' and ch <= '9' or ch == '_'
+
+
+private pure func sanitize_core_mono_name(name: String) -> String:
+	var sanitized: String = string(name.length())
+
+	for ch in name:
+		sanitized = if core_mono_c_identifier_char(ch):
+			sanitized.append_char(ch)
+		else:
+			sanitized.append_char('_')
+
+	sanitized
+
+
+-- Escape source identifier characters instead of replacing them. In
+-- particular, an underscore from source is distinct from the separators used
+-- by the structural encoding below.
+private pure func encode_data_identifier(name: String) -> String:
+	var encoded: String = string(name.length())
+
+	for ch in name:
+		encoded = if (
+			ch >= 'a' and ch <= 'z'
+			or ch >= 'A' and ch <= 'Z'
+			or ch >= '0' and ch <= '9'
+		):
+			encoded.append_char(ch)
+		else if ch == '_':
+			encoded + "_u"
+		else:
+			encoded + "_x"
+				.append_int(to_int(ch))
+				.append_char('_')
+
+	encoded
+
+
+private pure func frame_data_encoding(encoded: String) -> String:
+	"${encoded.length()}_${encoded}"
+
+
+private pure func encode_data_types(types: List[CoreType]) -> Option[String]:
+	var result: Option[String] = Some(types
+			.length()
+			.to_string() + "_")
+
+	for typ in types:
+		match (result, encode_data_type(typ)):
+			(Some(encoded), Some(item)):
+				result = Some(encoded + frame_data_encoding(item))
+			_:
+				result = None
+				break
+
+	result
+
+
+private pure func encode_data_dims(dims: List[CoreTensorDim]) -> Option[String]:
+	var result: Option[String] = Some(dims
+			.length()
+			.to_string() + "_")
+
+	for dim in dims:
+		match (result, encode_dim(dim)):
+			(Some(encoded), Some(item)):
+				result = Some(encoded + frame_data_encoding(item))
+			_:
+				result = None
+				break
+
+	result
+
+
+private pure func encode_data_type(typ: CoreType) -> Option[String]:
+	match typ:
+		TypeParameterType(_) | SelfType:
+			None
+		NamedType(name, args):
+			encoded_name: String = encode_data_identifier(name)
+
+			if args.is_empty():
+				Some(encoded_name)
+			else:
+				encoded_args ?= encode_data_types(args)
+				Some("G${frame_data_encoding(encoded_name)}${encoded_args}")
+		FunctionType(is_pure, params, return_type):
+			encoded_params ?= encode_data_types(params)
+			encoded_return ?= encode_data_type(return_type)
+
+			purity: String = if is_pure:
+				"P"
+			else:
+				"I"
+
+			Some("F${purity}${encoded_params}${frame_data_encoding(encoded_return)}")
+		StackResultType(value_type, error_type):
+			encoded_value ?= encode_data_type(value_type)
+			encoded_error ?= encode_data_type(error_type)
+			Some("S${frame_data_encoding(encoded_value)}${frame_data_encoding(encoded_error)}")
+		BoxedResultType(value_type, error_type):
+			encoded_value ?= encode_data_type(value_type)
+			encoded_error ?= encode_data_type(error_type)
+			Some("B${frame_data_encoding(encoded_value)}${frame_data_encoding(encoded_error)}")
+		TensorType(info):
+			encoded_element ?= encode_data_type(info.element_type)
+			encoded_dims ?= encode_data_dims(info.dims)
+			Some("A${frame_data_encoding(encoded_element)}${encoded_dims}")
+		TupleType(items):
+			encoded_items ?= encode_data_types(items)
+			Some("T${encoded_items}")
+		VoidType:
+			Some("Void")
+		EnumType(name):
+			Some("E${frame_data_encoding(encode_data_identifier(name))}")
+		ValueRecordType(name):
+			Some("V${frame_data_encoding(encode_data_identifier(name))}")
+		HeapRecordType(name):
+			Some("H${frame_data_encoding(encode_data_identifier(name))}")
+		UnionType(name):
+			Some("U${frame_data_encoding(encode_data_identifier(name))}")
+		RangeType:
+			Some("Range")
+
+
+private pure func encode_substitution_value(value: CoreMonoSubstitutionValue) -> Option[String]:
+	match value:
+		TypeSubstitution(typ):
+			encoded ?= encode_data_type(typ)
+			Some("T${frame_data_encoding(encoded)}")
+		DimSubstitution(dim):
+			encoded ?= encode_dim(dim)
+			Some("D${frame_data_encoding(encoded)}")
+		DimPackSubstitution(dims):
+			encoded ?= encode_data_dims(dims)
+			Some("P${encoded}")
+
+
+private pure func encode_simple_substitution_value(
+	value: CoreMonoSubstitutionValue,
+) -> Option[String]:
+	match value:
+		TypeSubstitution(NamedType(name, args)):
+			if args.is_empty():
+				Some(encode_data_identifier(name))
+			else:
+				None
+		TypeSubstitution(EnumType(name)) | TypeSubstitution(ValueRecordType(name)) | TypeSubstitution(HeapRecordType(name)) | TypeSubstitution(UnionType(name)):
+			Some(encode_data_identifier(name))
+		TypeSubstitution(RangeType):
+			Some("Range")
+		TypeSubstitution(VoidType):
+			Some("Void")
+		DimSubstitution(dim):
+			match normalize_dim(dim):
+				TensorStaticDim(value):
+					Some(value.to_string())
+				_:
+					None
+		_:
+			None
+
+
+private pure func encode_simple_data_type_names(args: List[CoreType]) -> Option[List[String]]:
+	var encoded: Option[List[String]] = Some([])
+
+	for arg in args:
+		match (encoded, arg):
+			(Some(names), NamedType(name, inner_args)):
+				if inner_args.is_empty():
+					encoded = Some(names.append(encode_data_identifier(name)))
+				else:
+					encoded = None
+					break
+			_:
+				encoded = None
+				break
+
+	encoded
+
+
+-- Data specializations preserve source argument order. Function
+-- specializations below sort named substitutions because their evidence is an
+-- association list; using that policy here would make Pair[A, B] unstable.
+pure func mangle_generic_data_name(source_name: String, args: List[CoreType]) -> Option[String]:
+	if args.is_empty():
+		None
+	else:
+		prefix: String = sanitize_core_mono_name(source_name) + "__mono_"
+
+		match encode_simple_data_type_names(args):
+			Some(encoded_args):
+				Some(prefix + encoded_args.join("_"))
+			None:
+				encoded_args ?= encode_data_types(args)
+				Some(prefix + "data_" + encoded_args)
+
+
+private pure func substitution_name(binding: (String, CoreMonoSubstitutionValue)) -> String:
+	match binding:
+		(name, _):
+			name
+
+
+private pure func encode_substitution_bindings(
+	names: List[String],
+	substitution: CoreMonoSubstitution,
+) -> Option[String]:
+	var encoded: Option[String] = Some("${names.length()}_")
+
+	for name in names:
+		match (encoded, lookup_substitution(substitution, name)):
+			(Some(prefix), Some(value)):
+				match encode_substitution_value(value):
+					Some(encoded_value):
+						encoded = Some(
+							prefix + frame_data_encoding(
+								encode_data_identifier(name),
+							) + frame_data_encoding(encoded_value),
+						)
+					None:
+						encoded = None
+						break
+			_:
+				encoded = None
+				break
+
+	encoded
+
+
+pure func mangle_specialization_name(
+	function_name: String,
+	substitution: CoreMonoSubstitution,
+) -> Option[String]:
+	names: List[String] = substitution
+		.map(substitution_name)
+		.sort()
+
+	if names.length() == 1:
+		name ?= names.get(0)
+		value ?= lookup_substitution(substitution, name)
+
+		match encode_simple_substitution_value(value):
+			Some(encoded):
+				Some("${function_name}__mono_${encoded}")
+			None:
+				encoded ?= encode_substitution_bindings(names, substitution)
+				Some("${function_name}__mono_sig_${encoded}")
+	else:
+		encoded ?= encode_substitution_bindings(names, substitution)
+		Some("${function_name}__mono_sig_${encoded}")

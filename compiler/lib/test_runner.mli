@@ -230,6 +230,11 @@ val group_by_source_size_budget :
 (** Partition items stably by accumulated source work. An item larger than the
     budget forms a one-item group; no item is dropped or reordered. *)
 
+val combined_harness_source_budget_bytes : sanitize:bool -> int
+(** Source-work budget for a combined suite harness. Sanitized harnesses use a
+    smaller budget because instrumentation materially increases their generated
+    code size and execution cost. *)
+
 val source_text_matches_current_file : string -> string option -> bool
 (** True when cached source text, if supplied, still matches the current file
     contents. Used to avoid saving cache entries for stale classified source. *)

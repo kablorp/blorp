@@ -661,10 +661,15 @@ let boxed_storage_requires_release_or_error
 let generated_destructor_name name = name ^ "_destroy"
 
 let record_destructor_policy ?(phase = Core_error.Other "layout_type") ~reg r =
+  let instantiate_field_type =
+    Types.instantiate_type_params
+      (Ast.type_param_names r.Ast.record_type_params)
+  in
   let needs_destructor =
     List.exists
       (fun (fd : Ast.field_decl) ->
-        source_value_requires_release_or_error ~phase ~reg fd.field_type
+        source_value_requires_release_or_error ~phase ~reg
+          (instantiate_field_type fd.field_type)
           fd.field_loc)
       r.Ast.record_fields
   in
@@ -683,6 +688,9 @@ let union_field_requires_destructor_release
 
 let union_destructor_policy ?(phase = Core_error.Other "layout_type")
     ?payload_storage ~reg t =
+  let instantiate_field_type =
+    Types.instantiate_type_params (Ast.type_param_names t.Ast.type_params)
+  in
   let payload_storage =
     match payload_storage with
     | Some storage -> storage
@@ -694,7 +702,8 @@ let union_destructor_policy ?(phase = Core_error.Other "layout_type")
         List.exists
           (fun field_ty ->
             union_field_requires_destructor_release ~phase ~reg payload_storage
-              field_ty v.variant_loc)
+              (instantiate_field_type field_ty)
+              v.variant_loc)
           v.variant_fields)
       t.Ast.type_variants
   in

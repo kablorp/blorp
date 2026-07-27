@@ -47,6 +47,10 @@ private VOID_TYPE_TAG: String = "void"
 
 private NAMED_TYPE_TAG: String = "named"
 
+private TYPE_PARAMETER_TYPE_TAG: String = "type_parameter"
+
+private SELF_TYPE_TAG: String = "self"
+
 private FUNCTION_TYPE_TAG: String = "function"
 
 private STACK_RESULT_TYPE_TAG: String = "stack_result"
@@ -100,6 +104,10 @@ private USER_CALL_TAG: String = "user"
 private UNKNOWN_CALL_TAG: String = "unknown"
 
 private SELECTED_DIRECT_CALL_TAG: String = "selected_direct"
+
+private DEFERRED_TRAIT_CALL_TAG: String = "deferred_trait"
+
+private SELECTED_TRAIT_CALL_TAG: String = "selected_trait"
 
 private FOREIGN_CALL_TAG: String = "foreign"
 
@@ -632,6 +640,8 @@ record CoreVar {
 union CoreType:
 	VoidType
 	NamedType(String, List[CoreType])
+	TypeParameterType(String)
+	SelfType
 	FunctionType(Bool, List[CoreType], CoreType)
 	StackResultType(CoreType, CoreType)
 	BoxedResultType(CoreType, CoreType)
@@ -832,6 +842,8 @@ record CoreDirectRuntimeCall {
 union CoreCallKind:
 	UnknownCall
 	SelectedDirectCall(Int)
+	DeferredTraitCall(String, String)
+	SelectedTraitCall(String, String, String, Int)
 	UserCall(String, Option[Int], List[Int])
 	ForeignCall(String, CoreForeignArgPassing)
 	BuiltinCall(String)
@@ -2056,9 +2068,16 @@ record CoreTraitDecl {
 }
 
 
+record CoreTypeParam {
+	name: String,
+	bounds: List[String]
+}
+
+
 record CoreImplDecl {
 	trait_name: String,
 	for_type: CoreType,
+	type_params: List[CoreTypeParam],
 	methods: List[CoreFunction],
 	loc: CoreSourceLoc
 }
@@ -2534,6 +2553,13 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				("name", JsonString(name)),
 				("args", core_type_list_to_json(args)),
 			])
+		TypeParameterType(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(TYPE_PARAMETER_TYPE_TAG)),
+				("name", JsonString(name)),
+			])
+		SelfType:
+			JsonObject([(KIND_FIELD, JsonString(SELF_TYPE_TAG))])
 		FunctionType(is_pure, params, return_type):
 			JsonObject([
 				(KIND_FIELD, JsonString(FUNCTION_TYPE_TAG)),
@@ -2735,6 +2761,11 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 		name ?= string_field(value, path, "name")
 		args ?= decode_core_type_list(value, path, "args")
 		Ok(NamedType(name, args))
+	else if tag == TYPE_PARAMETER_TYPE_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(TypeParameterType(name))
+	else if tag == SELF_TYPE_TAG:
+		Ok(SelfType)
 	else if tag == FUNCTION_TYPE_TAG:
 		is_pure ?= bool_field(value, path, "pure")
 		params ?= decode_core_type_list(value, path, "params")
@@ -3618,6 +3649,20 @@ pure func core_call_kind_to_json(kind: CoreCallKind) -> JsonValue:
 				(KIND_FIELD, JsonString(SELECTED_DIRECT_CALL_TAG)),
 				("def_id", json_int(def_id)),
 			])
+		DeferredTraitCall(trait_name, method_name):
+			JsonObject([
+				(KIND_FIELD, JsonString(DEFERRED_TRAIT_CALL_TAG)),
+				("trait_name", JsonString(trait_name)),
+				("method_name", JsonString(method_name)),
+			])
+		SelectedTraitCall(trait_name, method_name, module_path, def_id):
+			JsonObject([
+				(KIND_FIELD, JsonString(SELECTED_TRAIT_CALL_TAG)),
+				("trait_name", JsonString(trait_name)),
+				("method_name", JsonString(method_name)),
+				("module_path", JsonString(module_path)),
+				("def_id", json_int(def_id)),
+			])
 		UserCall(name, def_id, consumed_args):
 			JsonObject([
 				(KIND_FIELD, JsonString(USER_CALL_TAG)),
@@ -3687,6 +3732,16 @@ pure func decode_core_call_kind_json(
 	else if tag == SELECTED_DIRECT_CALL_TAG:
 		def_id ?= int_field(value, path, "def_id")
 		Ok(SelectedDirectCall(def_id))
+	else if tag == DEFERRED_TRAIT_CALL_TAG:
+		trait_name ?= string_field(value, path, "trait_name")
+		method_name ?= string_field(value, path, "method_name")
+		Ok(DeferredTraitCall(trait_name, method_name))
+	else if tag == SELECTED_TRAIT_CALL_TAG:
+		trait_name ?= string_field(value, path, "trait_name")
+		method_name ?= string_field(value, path, "method_name")
+		module_path ?= string_field(value, path, "module_path")
+		def_id ?= int_field(value, path, "def_id")
+		Ok(SelectedTraitCall(trait_name, method_name, module_path, def_id))
 	else if tag == USER_CALL_TAG:
 		name ?= string_field(value, path, "name")
 		def_id ?= decode_optional_int(value, path, "def_id")
@@ -12945,9 +13000,65 @@ pure func core_impl_decl_to_json(impl_decl: CoreImplDecl) -> JsonValue:
 		(KIND_FIELD, JsonString(IMPL_DECL_TAG)),
 		("trait_name", JsonString(impl_decl.trait_name)),
 		("for_type", core_type_to_json(impl_decl.for_type)),
+		(
+			"type_params",
+			JsonVector(
+				impl_decl.type_params.map(pure func(param: CoreTypeParam):
+					JsonObject([
+						("name", JsonString(param.name)),
+						("bounds", strings_to_json(param.bounds)),
+					])
+				),
+			),
+		),
 		("methods", JsonVector(impl_decl.methods.map(core_function_to_json))),
 		("loc", source_loc_to_json(impl_decl.loc)),
 	])
+
+
+private pure func decode_core_type_param_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreTypeParam, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	bounds ?= decode_string_list(value, path, "bounds")
+
+	Ok({
+		name = name,
+		bounds = bounds,
+	})
+
+
+private pure func decode_core_type_params(
+	value: JsonValue,
+	path: String,
+) -> Result[List[CoreTypeParam], CoreJsonError]:
+	items ?= array_field(value, path, "type_params")
+	var params: List[CoreTypeParam] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			match decode_core_type_param_json(
+				item,
+				path_index(
+					path_field(path, "type_params"),
+					index,
+				),
+			):
+				Ok(param):
+					params = params.append(param)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(params)
 
 
 pure func decode_core_impl_decl_json(
@@ -12960,6 +13071,7 @@ pure func decode_core_impl_decl_json(
 		for_type_json,
 		path_field(path, "for_type"),
 	)
+	type_params ?= decode_core_type_params(value, path)
 	methods ?= decode_core_functions(value, path, "methods")
 	loc_json ?= object_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
@@ -12970,6 +13082,7 @@ pure func decode_core_impl_decl_json(
 	Ok({
 		trait_name = trait_name,
 		for_type = for_type,
+		type_params = type_params,
 		methods = methods,
 		loc = loc,
 	})

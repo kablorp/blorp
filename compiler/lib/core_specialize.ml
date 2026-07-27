@@ -1067,6 +1067,95 @@ let refine_immediate_dict_constructor ~reg key value dict_expr =
       }
   | _ -> dict_expr
 
+let canonicalize_erased_storage_metadata ~reg (e : core) =
+  let phase = Core_error.Stage Core_stage.Specialize in
+  let canonicalize_box box =
+    {
+      box with
+      box_kind =
+        Core_layout_type.box_kind_of_type ~phase ~reg box.box_source_ty
+          box.box_value.loc;
+    }
+  in
+  let canonicalize_unbox unbox =
+    {
+      unbox with
+      unbox_kind =
+        Core_layout_type.unbox_kind_of_type ~phase ~reg unbox.unbox_target_ty
+          unbox.unbox_value.loc;
+    }
+  in
+  let canonicalize_value value =
+    let box = canonicalize_box value.bsv_box in
+    {
+      value with
+      bsv_box = box;
+      bsv_needs_release =
+        Core_layout_type.boxed_storage_requires_release_or_error ~phase ~reg
+          box.box_source_ty box.box_value.loc;
+    }
+  in
+  let canonicalize_record_field = function
+    | RecordRawField _ as field -> field
+    | RecordErasedField (name, value) ->
+        RecordErasedField (name, canonicalize_value value)
+  in
+  let desc =
+    match e.desc with
+    | CBoxTyped box -> CBoxTyped (canonicalize_box box)
+    | CUnboxTyped unbox -> CUnboxTyped (canonicalize_unbox unbox)
+    | CTupleConstruct tuple ->
+        CTupleConstruct
+          {
+            tuple with
+            tc_elems = List.map canonicalize_value tuple.tc_elems;
+          }
+    | CListConstruct list ->
+        CListConstruct
+          {
+            list with
+            lc_elems = List.map canonicalize_value list.lc_elems;
+          }
+    | CTensorLiteral ({ tl_payload = TensorBoxedElements values; _ } as tensor)
+      ->
+        CTensorLiteral
+          {
+            tensor with
+            tl_payload = TensorBoxedElements (List.map canonicalize_value values);
+          }
+    | CDictConstruct dict ->
+        CDictConstruct
+          {
+            dict with
+            dc_entries =
+              List.map
+                (fun (key, value) ->
+                  (canonicalize_value key, canonicalize_value value))
+                dict.dc_entries;
+          }
+    | CRecordConstruct record ->
+        CRecordConstruct
+          {
+            record with
+            rc_fields =
+              List.map canonicalize_record_field record.rc_fields;
+          }
+    | CUnionConstruct union ->
+        CUnionConstruct
+          {
+            union with
+            uc_args = List.map canonicalize_value union.uc_args;
+          }
+    | CUnionReuseConstruct union ->
+        CUnionReuseConstruct
+          {
+            union with
+            urc_args = List.map canonicalize_value union.urc_args;
+          }
+    | _ -> e.desc
+  in
+  { e with desc }
+
 let rec specialize_expr ~reg (e : core) : core =
   let is_tensor_type ty = is_tensor_type ~reg ty in
   let tensor_parts ty = tensor_parts ~reg ty in
@@ -1074,7 +1163,10 @@ let rec specialize_expr ~reg (e : core) : core =
     tensor_elem_type ~reg ~loc ~context ty
   in
   let tensor_has_elem name ty = tensor_has_elem ~reg name ty in
-  let e = map_children (specialize_expr ~reg) e in
+  let e =
+    map_children (specialize_expr ~reg) e
+    |> canonicalize_erased_storage_metadata ~reg
+  in
   match e.desc with
   | CBox (inner, source_ty)
     when should_rewrite_cbox_to_borrow_cast ~reg inner source_ty ->

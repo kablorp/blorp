@@ -145,8 +145,7 @@ let rec expand_aliases (meta : Core_type_layout.metadata) seen ty =
   | ty -> ty
 
 let is_type_parameter = function
-  | Ast.TyVar _ | Ast.TySelf -> true
-  | Ast.TyNamed (name, []) when Types.is_type_param_name name -> true
+  | Ast.TyVar _ | Ast.TyBoundVar _ | Ast.TySelf -> true
   | _ -> false
 
 let scalar_payload_of_type meta ty =

@@ -77,6 +77,15 @@ let strip_mono_suffix name =
   in
   find 0
 
+let strip_pure_suffix name =
+  let suffix = "__pure" in
+  let suffix_len = String.length suffix in
+  let name_len = String.length name in
+  if name_len >= suffix_len
+     && String.sub name (name_len - suffix_len) suffix_len = suffix
+  then String.sub name 0 (name_len - suffix_len)
+  else name
+
 let supported_list_base_names =
   [
     "filter";
@@ -108,6 +117,7 @@ let base_list_func_name name =
         | Some rest -> rest
         | None -> base)
   in
+  let base = strip_pure_suffix base in
   if List.exists (( = ) base) supported_list_base_names then Some base
   else if trait_resolved_list_length_name base then Some "length"
   else None

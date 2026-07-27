@@ -290,7 +290,7 @@ let test_collect_subst_ignores_identity_bindings () =
     []
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params
          (dict (TyVar "K") (TyVar "V"))
-         (dict (TyNamed ("K", [])) (TyNamed ("V", [])))
+         (dict (TyVar "K") (TyVar "V"))
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params (TyVar "K")
          ty_string
     |> Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) type_params (TyVar "V")
@@ -306,10 +306,45 @@ let test_collect_subst_ignores_identity_bindings () =
         (List.assoc_opt "V" subst = Some (st ty_int))
   | None -> Alcotest.fail "identity bindings should not conflict with evidence"
 
+let test_collect_subst_preserves_nominal_type_identity () =
+  let subst =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) (tparams [ "T" ])
+      (TyNamed ("T", [])) ty_int []
+  in
+  Alcotest.(check int)
+    "nominal type is not a parameter binding" 0 (List.length subst)
+
+let test_collect_and_apply_self_substitution () =
+  let subst =
+    Blorp.Core_mono.collect_subst ~reg:(empty_reg ()) (tparams [ "Self" ])
+      TySelf ty_int []
+  in
+  Alcotest.(check bool)
+    "Self binding is concrete" true
+    (Blorp.Core_mono.is_concrete_subst subst);
+  Alcotest.(check bool)
+    "Self applies to the receiver type" true
+    (Blorp.Core_mono.apply_subst subst TySelf = ty_int);
+  Alcotest.(check bool)
+    "unresolved Self remains open" true
+    (Blorp.Codegen_types.has_type_vars TySelf)
+
+let test_nominal_type_is_concrete () =
+  Alcotest.(check bool)
+    "one-letter nominal type is concrete" true
+    (Blorp.Core_mono.is_concrete_subst
+       [ ("T", st (TyNamed ("T", []))) ])
+
 let test_apply_subst () =
   let subst = [ ("T", st ty_int) ] in
   let result = Blorp.Core_mono.apply_subst subst (TyVar "T") in
   Alcotest.(check bool) "T → Int" true (result = ty_int)
+
+let test_apply_subst_preserves_nominal_type_identity () =
+  let nominal_t = TyNamed ("T", []) in
+  let result = Blorp.Core_mono.apply_subst [ ("T", st ty_int) ] nominal_t in
+  Alcotest.(check bool)
+    "nominal T remains nominal T" true (result = nominal_t)
 
 let test_apply_subst_nested () =
   let subst = [ ("T", st ty_string) ] in
@@ -570,6 +605,30 @@ let test_mono_materializes_generic_union_layout_without_generic_functions () =
         (body.ty = TyNamed ("Choice__mono_String", []))
   | _ -> Alcotest.fail "expected pass_choice function"
 
+let test_mono_does_not_materialize_open_generic_data () =
+  let choice_a_ty = TyNamed ("Choice", [ TyNamed ("A", []) ]) in
+  let generic_identity =
+    mk_func ~type_params:[ "A" ] "identity_choice"
+      [ ("choice", choice_a_ty) ]
+      choice_a_ty (cvar "choice" choice_a_ty)
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [
+        mk_type_decl ~type_params:[ "T" ] "Choice"
+          [ ("Picked", [ TyVar "T" ]); ("Empty", []) ];
+        mk_decl generic_identity;
+      ]
+  in
+  Alcotest.(check bool)
+    "does not materialize data with an unresolved enclosing parameter" false
+    (List.exists
+       (function
+         | { cd_desc = CDType t; _ } ->
+             String.equal t.type_name "Choice__mono_A"
+         | _ -> false)
+       result)
+
 let test_mono_keeps_runtime_erased_bridge_union_payload_storage () =
   let attempt_int_ty = TyNamed ("std_channel__RecvAttempt", [ ty_int ]) in
   let body = cvar "attempt" attempt_int_ty in
@@ -644,6 +703,59 @@ let test_mono_two_instantiations () =
   Alcotest.(check bool)
     "has Bool spec" true
     (List.mem "identity__mono_Bool" names)
+
+let test_mono_defers_partial_nested_specialization () =
+  let convert =
+    mk_func ~type_params:[ "T"; "U" ] "convert"
+      [ ("value", TyVar "T"); ("fallback", TyVar "U") ]
+      (TyVar "U") (cvar "fallback" (TyVar "U"))
+  in
+  let outer_call_ty =
+    TyFunc
+      {
+        params = [ TyVar "T"; ty_string ];
+        return = ty_string;
+        is_pure = true;
+      }
+  in
+  let outer_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "convert" outer_call_ty,
+           [ cvar "value" (TyVar "T"); cstr "fallback" ] ))
+      ty_string
+  in
+  let outer =
+    mk_func ~type_params:[ "T" ] "outer"
+      [ ("value", TyVar "T") ]
+      ty_string outer_body
+  in
+  let main_call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true }
+  in
+  let main =
+    mk_func "main" [] ty_string
+      (mk (CCall (CKUnknown, cvar "outer" main_call_ty, [ cint 1 ])) ty_string)
+  in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl convert; mk_decl outer; mk_decl main ]
+  in
+  let names =
+    List.filter_map
+      (fun declaration ->
+        match declaration.cd_desc with
+        | CDFunc func -> Some func.cf_name
+        | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "partial inner specialization is not generated" false
+    (List.mem "convert__mono_String" names);
+  Alcotest.(check bool)
+    "inner specialization waits for outer type" true
+    (List.mem "convert__mono_Int_String" names)
 
 let test_mono_repeated_type_param_consistent_call_ok () =
   let same =
@@ -750,6 +862,57 @@ let test_mono_materializes_generic_trait_impl () =
         "param concrete" true
         ((List.hd m.cf_params).cp_ty = tuple_int_int)
   | _ -> Alcotest.fail "expected one impl method"
+
+let test_mono_materializes_generic_trait_impl_for_selected_ufcs_call () =
+  let t_param =
+    Blorp.Generic_params.make_bound_type_param "T" [ "Stringable" ]
+  in
+  let box_t = TyNamed ("Box", [ TyBoundVar t_param ]) in
+  let box_string = TyNamed ("Box", [ ty_string ]) in
+  let to_string_impl =
+    mk_func ~type_param_decls:[ t_param ] "to_string"
+      [ ("self", box_t) ]
+      ty_string (cstr "Box")
+  in
+  let call_ty =
+    TyFunc { params = [ box_string ]; return = ty_string; is_pure = true }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 41,
+           cvar "__ufcs_app__to_string" call_ty,
+           [ cvar "box" box_string ] ))
+      ty_string
+  in
+  let main_fn = mk_func "main" [ ("box", box_string) ] ty_string main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [
+        mk_record_decl ~type_params:[ "T" ] "Box" [ ("value", TyVar "T") ];
+        mk_impl "Stringable" box_t [ to_string_impl ];
+        mk_decl main_fn;
+      ]
+  in
+  let has_concrete_impl =
+    List.exists
+      (function
+        | {
+            cd_desc =
+              CDImpl
+                {
+                  ci_trait = "Stringable";
+                  ci_for_type = TyNamed ("Box__mono_String", []);
+                  _;
+                };
+            _;
+          } ->
+            true
+        | _ -> false)
+      result
+  in
+  Alcotest.(check bool)
+    "selected UFCS method uses concrete runtime receiver" true has_concrete_impl
 
 let test_mono_e2e_pipeline () =
   let mk_ast desc ty =
@@ -880,6 +1043,39 @@ let test_mono_ufcs_mangled_callee () =
     "has Char/String specialization" true
     (List.mem "std_option__to_result__mono_String_Char" names)
 
+let test_mono_ufcs_mangled_callee_with_double_underscore_member () =
+  let generic =
+    mk_func ~type_params:[ "T" ] ~module_path:(Some "std/list")
+      "std_list__identity__checked"
+      [ ("value", TyVar "T") ]
+      (TyVar "T") (cvar "value" (TyVar "T"))
+  in
+  let call_type =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let caller_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar "__ufcs_std$list__identity__checked" call_type,
+           [ cint 42 ] ))
+      ty_int
+  in
+  let caller = mk_func "caller" [] ty_int caller_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl generic; mk_decl caller ]
+  in
+  let names =
+    List.filter_map
+      (fun decl ->
+        match decl.cd_desc with CDFunc func -> Some func.cf_name | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "has double-underscore member specialization" true
+    (List.mem "std_list__identity__checked__mono_Int" names)
+
 let test_mono_bare_call_prefers_selected_direct_kind_generic () =
   let impure_primary =
     mk_func ~def_id:701 ~type_params:[ "T" ] "apply"
@@ -995,7 +1191,7 @@ let test_mono_selected_registered_generic_builtin_is_specialized () =
       cf_return_ty = list_t;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 713;
     }
   in
@@ -1178,6 +1374,45 @@ let test_mono_signature_guard_allows_wildcard_dim_pack () =
         (contains_substring v.vname "std_tensor__is_empty__mono_Int")
   | _ -> Alcotest.fail "expected rewritten main call"
 
+let test_mono_allows_existential_return_dimension () =
+  let ty_float = TyNamed ("Float", []) in
+  let parameter_ty = TyArray (ty_float, [ TyVar "#N" ]) in
+  let return_ty = TyArray (ty_float, [ TyVarDims "#Ds" ]) in
+  let erase_dims =
+    mk_func ~type_params:[ "#N" ] ~def_id:93 "erase_dims"
+      [ ("values", parameter_ty) ]
+      return_ty (cvar "values" parameter_ty)
+  in
+  let argument_ty = TyArray (ty_float, [ TyConstInt 5 ]) in
+  let call_ty =
+    TyFunc { params = [ parameter_ty ]; return = return_ty; is_pure = true }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKSelectedDirect 93,
+           cvar "erase_dims" call_ty,
+           [ cvar "values" argument_ty ] ))
+      return_ty
+  in
+  let main_fn = mk_func "main" [ ("values", argument_ty) ] return_ty main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl erase_dims; mk_decl main_fn ]
+  in
+  let main_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
+      result
+  in
+  match main_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      Alcotest.(check string)
+        "rewrites existential-shape call to concrete specialization"
+        "erase_dims__mono_5" v.vname
+  | _ -> Alcotest.fail "expected rewritten main call"
+
 let test_mono_prefixed_runtime_backed_call_resolves_without_mono () =
   let tensor_any = TyArray (TyVar "T", [ TyVarDims "#_" ]) in
   let tensor_int_3 = TyArray (ty_int, [ TyConstInt 3 ]) in
@@ -1193,7 +1428,7 @@ let test_mono_prefixed_runtime_backed_call_resolves_without_mono () =
       cf_return_ty = ty_int;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 91;
     }
   in
@@ -1777,7 +2012,7 @@ let test_mono_selective_import_beats_unqualified_builtin_generic () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -1833,7 +2068,7 @@ let test_mono_module_owned_bare_builtin_generics_keep_distinct_identities () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -1850,7 +2085,7 @@ let test_mono_module_owned_bare_builtin_generics_keep_distinct_identities () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -1914,7 +2149,7 @@ let test_mono_concrete_selective_import_suppresses_unqualified_builtin_generic
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -1977,7 +2212,7 @@ let test_mono_runtime_backed_selective_import_waits_for_resolve () =
       cf_return_ty = TyArray (TyVar "U", [ TyVar "#N" ]);
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -2048,7 +2283,7 @@ let test_mono_selective_import_can_target_unqualified_builtin_generic () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -2104,7 +2339,7 @@ let test_mono_prefixed_ufcs_builtin_generic_rewrites () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -2158,7 +2393,7 @@ let test_mono_ufcs_can_target_bare_module_builtin_generic () =
       cf_return_ty = ty_bool;
       cf_body = None;
       cf_is_pure = true;
-      cf_kind = CFBuiltin;
+      cf_kind = CFUnresolvedBuiltin;
       cf_def_id = 0;
     }
   in
@@ -2445,7 +2680,15 @@ let suite =
           test_collect_subst_implicit_trailing_dim_pack;
         Alcotest.test_case "collect_subst_ignores_identity_bindings" `Quick
           test_collect_subst_ignores_identity_bindings;
+        Alcotest.test_case "collect_subst_preserves_nominal_type_identity" `Quick
+          test_collect_subst_preserves_nominal_type_identity;
+        Alcotest.test_case "collect_and_apply_self_substitution" `Quick
+          test_collect_and_apply_self_substitution;
+        Alcotest.test_case "nominal_type_is_concrete" `Quick
+          test_nominal_type_is_concrete;
         Alcotest.test_case "apply" `Quick test_apply_subst;
+        Alcotest.test_case "apply_preserves_nominal_type_identity" `Quick
+          test_apply_subst_preserves_nominal_type_identity;
         Alcotest.test_case "apply_nested" `Quick test_apply_subst_nested;
         Alcotest.test_case "loop_binder" `Quick
           test_subst_core_types_updates_loop_binder;
@@ -2469,18 +2712,26 @@ let suite =
           test_mono_materializes_generic_record_layout_without_generic_functions;
         Alcotest.test_case "generic_union_data_layout" `Quick
           test_mono_materializes_generic_union_layout_without_generic_functions;
+        Alcotest.test_case "open_generic_data_is_not_materialized" `Quick
+          test_mono_does_not_materialize_open_generic_data;
         Alcotest.test_case "runtime_erased_bridge_union_data_layout" `Quick
           test_mono_keeps_runtime_erased_bridge_union_payload_storage;
         Alcotest.test_case "two_instances" `Quick test_mono_two_instantiations;
+        Alcotest.test_case "defers partial nested specialization" `Quick
+          test_mono_defers_partial_nested_specialization;
         Alcotest.test_case "repeated_type_param_consistent_call_ok" `Quick
           test_mono_repeated_type_param_consistent_call_ok;
         Alcotest.test_case "repeated_type_param_conflict_rejected" `Quick
           test_mono_rejects_conflicting_repeated_type_param_call;
         Alcotest.test_case "generic_trait_impl" `Quick
           test_mono_materializes_generic_trait_impl;
+        Alcotest.test_case "generic_trait_impl_selected_ufcs" `Quick
+          test_mono_materializes_generic_trait_impl_for_selected_ufcs_call;
         Alcotest.test_case "e2e_pipeline" `Quick test_mono_e2e_pipeline;
         Alcotest.test_case "ufcs_mangled_callee" `Quick
           test_mono_ufcs_mangled_callee;
+        Alcotest.test_case "UFCS member with double underscore" `Quick
+          test_mono_ufcs_mangled_callee_with_double_underscore_member;
         Alcotest.test_case "bare call prefers selected direct kind generic"
           `Quick test_mono_bare_call_prefers_selected_direct_kind_generic;
         Alcotest.test_case "qualified call prefers selected direct kind generic"
@@ -2494,6 +2745,8 @@ let suite =
           test_mono_signature_guard_allows_dimension_params;
         Alcotest.test_case "signature guard allows wildcard dim pack" `Quick
           test_mono_signature_guard_allows_wildcard_dim_pack;
+        Alcotest.test_case "allows existential return dimension" `Quick
+          test_mono_allows_existential_return_dimension;
         Alcotest.test_case
           "prefixed runtime-backed call resolves without mono" `Quick
           test_mono_prefixed_runtime_backed_call_resolves_without_mono;

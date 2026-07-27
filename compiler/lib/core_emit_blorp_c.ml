@@ -5917,6 +5917,7 @@ and union_construct_json ~function_names ~consumed_params ~reg enum_names value_
 let function_kind_json (func : Core.core_func) =
   match func.cf_kind with
   | Core.CFUser -> Ok (kind "user" [])
+  | Core.CFUnresolvedBuiltin -> Ok (kind "unresolved_builtin" [])
   | Core.CFBuiltin -> (
       match Core_resolve.builtin_c_name_for_func func with
       | Some c_name -> Ok (kind "builtin" [ ("c_name", str c_name) ])
@@ -5952,7 +5953,7 @@ let collect_foreign_includes (program : Core.core_program) =
     | Core.CDFunc func -> (
         match func.cf_kind with
         | Core.CFForeign { includes; _ } -> List.iter remember includes
-        | Core.CFUser | Core.CFBuiltin -> ())
+        | Core.CFUser | Core.CFUnresolvedBuiltin | Core.CFBuiltin -> ())
     | Core.CDPrivate inner -> visit_decl inner
     | _ -> ()
   in

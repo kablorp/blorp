@@ -1,6 +1,6 @@
 import:
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(UserCall),
+		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
 		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
 		CoreFunctionKind(UserFunction),
@@ -11,9 +11,11 @@ import:
 		CoreType(NamedType),
 		CoreVar,
 		core_program_to_json,
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
+		semantic_middle_capability_name,
 	../src/stage_10_backend/compiler_build_artifact:
 		BuildNativeFeature(BuildRaylib, BuildTls),
 		BuildOptimization(BuildFast),
@@ -21,10 +23,15 @@ import:
 	../src/stage_12_cli/compiler_cli: run_cli
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
 	../src/stage_12_cli/compiler_cli_compile_execute:
-		CliCompileExecution(CliCompileArtifact),
+		CliCompileExecution(CliCompileArtifact, CliCompileStopped),
+		CliCompilePreparation(CliCompilePreparationReady),
 		execute_compile_plan,
 		execute_run_plan,
 		graph_native_features,
+		prepare_compile_plan,
+		prepare_compile_plan_with_frontend_policy,
+		prepare_compile_plan_with_typed_validation,
+	../src/stage_12_cli/compiler_cli_compile_frontend: CliFrontendCompilePolicy
 	../src/stage_12_cli/compiler_cli_execute: execute_check_plan
 	../src/stage_12_cli/compiler_cli_plan:
 		CliFrontendGraphSource,
@@ -33,6 +40,7 @@ import:
 		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule, CliFrontendUserModule),
 		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
 	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
+	io: print_error
 	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
 	system: remove_file, temp_dir, write_file
 	test: TestSuite
@@ -52,7 +60,7 @@ pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_pre_middle"),
+			JsonString("core_post_synth"),
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
@@ -141,6 +149,94 @@ func write_source(path: String) -> Bool:
 			True
 		Err(_):
 			False
+
+
+func write_desugar_source(path: String) -> Bool:
+	match write_file(
+		path,
+		"pure func message() -> String:\n" + "\t\"early\" + \"boundary\"\n\n" + "func main(args: List[String]) -> Int:\n" + "\tprint(message())\n" + "\t0\n",
+	):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func write_debug_policy_source(path: String) -> Bool:
+	source: String =
+		|@debug_only
+		|pure func inspect() -> Int:
+		|	7
+		|
+		|pure func debug_policy_marker() -> Void:
+		|	void
+		|
+		|func main(args: List[String]) -> Int:
+		|	value: Int = inspect()
+		|	debug:
+		|		debug_policy_marker()
+		|	value
+
+	match write_file(path, source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func call_targets_def_id(expr: CoreExpr, target_def_id: Int) -> Bool:
+	direct_call: Bool = match expr:
+		CallExpr(SelectedDirectCall(def_id), _, _, _, _):
+			def_id == target_def_id
+		CallExpr(UserCall(_, Some(def_id), _), _, _, _, _):
+			def_id == target_def_id
+		_:
+			False
+
+	(
+		direct_call
+		or immediate_core_expr_children(
+			expr,
+		).any(
+			func(child): call_targets_def_id(child, target_def_id),
+		)
+	)
+
+
+private pure func function_def_id(program: CoreProgram, name: String) -> Option[Int]:
+	program.decls
+		.filter_map(func(decl):
+			match decl:
+				FunctionDecl(function_info):
+					if function_info.name == name:
+						Some(function_info.def_id)
+					else:
+						None
+				_:
+					None
+		)
+		.get(0)
+
+
+private pure func main_calls_def_id(program: CoreProgram, target_def_id: Int) -> Bool:
+	program.decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				(
+					function_info.name == "main"
+					and function_info.body
+						.map(func(body): call_targets_def_id(body, target_def_id))
+						.get_or(False)
+				)
+			_:
+				False
+	)
+
+
+private pure func main_calls_debug_policy_marker(program: CoreProgram) -> Bool:
+	function_def_id(program, "debug_policy_marker")
+		.map(func(def_id): main_calls_def_id(program, def_id))
+		.get_or(False)
 
 
 func test_check_executes_without_host_plan() -> Bool:
@@ -325,6 +421,136 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 				False
 
 
+func test_compile_worker_request_starts_after_blorp_synth() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_post_synth.brp"
+	_ = remove_file(path)
+
+	if not write_desugar_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match prepare_compile_plan(compile_plan):
+					Ok(CliCompilePreparationReady(prepared)):
+						rendered: String = core_program_to_json(prepared.request.core).to_string()
+
+						(
+							rendered.contains("blorp_string_concat")
+							and prepared.request.required_capabilities
+								.map(semantic_middle_capability_name)
+								.contains("core_post_synth")
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_debug_policy.brp"
+	_ = remove_file(path)
+
+	if not write_debug_policy_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: CliFrontendCompilePolicy = {
+					allow_debug_only_calls = True,
+					retain_debug_blocks = False
+				}
+
+				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
+					Ok(CliCompilePreparationReady(prepared)):
+						if main_calls_debug_policy_marker(prepared.request.core):
+							print_error("debug-policy marker call survived debug-block erasure")
+							False
+						else:
+							True
+					Err(errors):
+						print_error(
+							"policy-aware compile preparation failed:\n" + errors.join("\n"),
+						)
+						False
+					Ok(_):
+						print_error("policy-aware compile preparation stopped unexpectedly")
+						False
+			_:
+				False
+
+
+func test_compile_typed_validation_stops_before_core_preparation() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_typed_validation.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: CliFrontendCompilePolicy = {
+					allow_debug_only_calls = False,
+					retain_debug_blocks = False
+				}
+
+				match (
+					prepare_compile_plan_with_typed_validation(
+						compile_plan,
+						policy,
+						pure func(_): ["typed validation sentinel"],
+					)
+				):
+					Err(errors):
+						errors == ["typed validation sentinel"]
+					Ok(_):
+						False
+			_:
+				False
+
+
+func test_early_stop_does_not_consult_worker_response() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_early_stop.brp"
+	_ = remove_file(path)
+
+	if not write_desugar_source(path):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-core-after=desugar",
+			"--stop-after=desugar",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan, JsonObject([])):
+					CliCompileStopped(target_path, stage_name, rendered, observations):
+						(
+							target_path == path
+							and stage_name == "desugar"
+							and rendered.contains("blorp_string_concat")
+							and observations.map(
+								func(observation): observation.stage_name,
+							) == ["desugar"]
+						)
+					_:
+						False
+			_:
+				False
+
+
 func test_run_builds_one_typed_request_and_artifact() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_run.brp"
 	_ = remove_file(path)
@@ -456,6 +682,22 @@ tests: TestSuite = {
 		(
 			"compile builds one typed request and artifact",
 			test_compile_builds_one_typed_request_and_artifact,
+		),
+		(
+			"compile worker request starts after Blorp synthesis",
+			test_compile_worker_request_starts_after_blorp_synth,
+		),
+		(
+			"compile frontend policy allows debug calls while erasing debug blocks",
+			test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks,
+		),
+		(
+			"compile typed validation stops before Core preparation",
+			test_compile_typed_validation_stops_before_core_preparation,
+		),
+		(
+			"early stop does not consult worker response",
+			test_early_stop_does_not_consult_worker_response,
 		),
 		(
 			"run builds one typed request and artifact",

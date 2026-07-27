@@ -1,6 +1,16 @@
 import:
-	../src/stage_12_cli/compiler_cli_args: CliAction(CliCheck), CliCompileArgs
+	../src/stage_06_typecheck/compiler_typecheck_bridge: CompilerTypecheckedGraph
+	../src/stage_09_core/compiler_semantic_worker_protocol: semantic_middle_capability_name
+	../src/stage_12_cli/compiler_cli_args:
+		CliAction(CliCheck),
+		CliCompileArgs,
+		CliTestArgs,
+		CliTestMode(CliTestAll, CliTestSuiteOnly),
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_compile_execute:
+		CliCompilePreparation(CliCompilePreparationReady),
+		prepare_compile_plan_with_typed_validation,
+	../src/stage_12_cli/compiler_cli_compile_frontend: CliFrontendCompilePolicy
 	../src/stage_12_cli/compiler_cli_generated_test_harness:
 		GeneratedTestSuiteTarget,
 		generate_suite_run_all_module,
@@ -14,12 +24,19 @@ import:
 		CliGeneratedModule,
 		CliGeneratedModuleImport,
 		CliRunPlan(CliRunCompile),
+		CliTestRunCommand(CliTestExecute),
+		CliTestRunPlan,
 	../src/stage_12_cli/compiler_cli_source_graph:
 		frontend_module_graph_for_roots,
 		frontend_module_graph_with_generated_root,
 		parse_cli_sources,
 		read_cli_sources_for_action,
-	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
+	../src/stage_12_cli/compiler_cli_test_discovery:
+		CliTestSuiteBindingResolution(CliTestSuiteBindingResolved),
+		resolve_test_suite_binding,
+	../src/stage_12_cli/compiler_cli_test_plan:
+		CliBlorpTestSuitePlanning(CliBlorpTestSuiteIneligible, CliBlorpTestSuiteReady),
+		plan_blorp_test_suite,
 	path: normalize
 	system: file_exists, getcwd, mkdir, now_microseconds, remove_dir, remove_file, write_file
 	test: TestSuite, run_suite
@@ -138,6 +155,56 @@ private pure func compile_options(paths: List[String]) -> CliCompileArgs:
 	}
 
 
+private pure func test_options(paths: List[String]) -> CliTestArgs:
+	{
+		profile = False,
+		debug = False,
+		sanitizer = None,
+		leak_check = False,
+		no_format = True,
+		timeout = Some(30),
+		jobs = 1,
+		repeat = 1,
+		mode = CliTestSuiteOnly,
+		cache = False,
+		std_dir = None,
+		paths = paths
+	}
+
+
+private pure func suite_test_plan(options: CliTestArgs) -> CliTestRunPlan:
+	{
+		args = ["test"],
+		command = CliTestExecute(options)
+	}
+
+
+private func blorp_suite_plan_is_ineligible(options: CliTestArgs) -> Bool:
+	match plan_blorp_test_suite(suite_test_plan(options)):
+		CliBlorpTestSuiteIneligible:
+			True
+		_:
+			False
+
+
+private pure func validate_test_suite_targets(
+	typechecked: CompilerTypecheckedGraph,
+	targets: List[GeneratedTestSuiteTarget],
+) -> List[String]:
+	targets.flat_map(func(target):
+		match typechecked.modules.find(func(module): module.path == target.path):
+			Some(module):
+				match resolve_test_suite_binding(module):
+					CliTestSuiteBindingResolved:
+						errors: List[String] = []
+						errors
+					_:
+						["`${target.path}` does not export a valid TestSuite binding"]
+			None:
+				["typed graph is missing test module `${target.path}`"]
+	)
+
+
 private pure func serialized_compile_graph(
 	graph: CliFrontendModuleGraph,
 	paths: List[String],
@@ -204,6 +271,96 @@ private func test_run_all_harness_matches_existing_protocol() -> Bool:
 		and source.contains("    if not __run_suite_1():")
 		and not source.contains("match parse_int(selector):")
 	)
+
+
+private func test_single_suite_plan_builds_retained_run_plan() -> Bool:
+	root: String = normalize(
+		getcwd() + "/tmp_blorp_single_suite_plan_" + now_microseconds().to_string(),
+	)
+	path: String = root + "/single.brp"
+	_ = remove_file(path)
+	_ = remove_dir(root)
+
+	created: Bool = mkdir(root)
+	source: String = test_suite_source("single")
+	written: Bool = write_text(path, source)
+	options: CliTestArgs = { test_options([path]) |
+		debug = True,
+		timeout = Some(17)
+	}
+	plan: CliTestRunPlan = suite_test_plan(options)
+
+	result: Bool = if not created or not written:
+		False
+	else:
+		match plan_blorp_test_suite(plan):
+			CliBlorpTestSuiteReady(suite_plan):
+				suite_plan.targets.length() == 1 and suite_plan.targets.any(func(target):
+					target.path == path and target.module_name == "single"
+				) and suite_plan.run_plan.options.debug and suite_plan.run_plan.options.timeout == Some(
+					17,
+				) and suite_plan.run_plan.options.user_args == [
+					"0",
+				] and suite_plan.run_plan.options.files == [
+					suite_plan.run_plan.graph.roots
+						.get(0)
+						.map(func(root): root.path)
+						.get_or(""),
+				] and suite_plan.run_plan.graph.modules.any(func(module):
+					module.path == path and module.source_text == source
+				)
+			_:
+				False
+
+	cleanup(root, [path])
+	result
+
+
+private func test_unsupported_suite_policies_fall_back() -> Bool:
+	options: CliTestArgs = test_options(["suite.brp"])
+
+	(
+		blorp_suite_plan_is_ineligible({ options | cache = True })
+		and blorp_suite_plan_is_ineligible({ options | profile = True })
+		and blorp_suite_plan_is_ineligible({ options | leak_check = True })
+		and blorp_suite_plan_is_ineligible({ options | no_format = False })
+		and blorp_suite_plan_is_ineligible({ options | repeat = 2 })
+		and blorp_suite_plan_is_ineligible(
+			{ options | paths = ["first.brp", "second.brp"] },
+		)
+		and blorp_suite_plan_is_ineligible({ options | mode = CliTestAll })
+	)
+
+
+private func test_suite_directories_fall_back_until_batch_route() -> Bool:
+	root: String = normalize(
+		getcwd() + "/tmp_blorp_suite_directory_plan_" + now_microseconds().to_string(),
+	)
+	first_path: String = root + "/first.brp"
+	second_path: String = root + "/second.brp"
+	_ = remove_file(first_path)
+	_ = remove_file(second_path)
+	_ = remove_dir(root)
+
+	created: Bool = mkdir(root)
+	first_written: Bool = write_text(first_path, test_suite_source("first"))
+	single_suite_falls_back: Bool = (
+		created
+		and first_written
+		and blorp_suite_plan_is_ineligible(test_options([root]))
+	)
+
+	second_written: Bool = write_text(second_path, test_suite_source("second"))
+	multiple_suites_fall_back: Bool = (
+		second_written
+		and blorp_suite_plan_is_ineligible(test_options([root]))
+	)
+
+	cleanup(
+		root,
+		[first_path, second_path],
+	)
+	single_suite_falls_back and multiple_suites_fall_back
 
 
 private func test_generated_root_extends_existing_graph_without_reparsing_modules() -> Bool:
@@ -314,18 +471,48 @@ private func test_generated_root_extends_existing_graph_without_reparsing_module
 						extended,
 						[first_path, second_path],
 					).contains("\"origin\":{\"kind\":\"generated\"}")
-					var typecheck_errors: List[String] = []
 
-					for root_source in extended.roots:
-						typecheck_errors = typecheck_errors.concat(
-							typechecked_graph_errors(
-								typecheck_frontend_root(
-									extended,
-									root_source,
-									False,
-								),
-							),
-						)
+					frontend_policy: CliFrontendCompilePolicy = {
+						allow_debug_only_calls = True,
+						retain_debug_blocks = False
+					}
+
+					test_targets: List[GeneratedTestSuiteTarget] = fixture.targets
+					compile_plan: CliCompilePlan = {
+						args = [generated.source.path],
+						options = compile_options([generated.source.path]),
+						graph = extended
+					}
+					generated_preparation = prepare_compile_plan_with_typed_validation(compile_plan, frontend_policy, pure func(
+						typechecked,
+					):
+						validate_test_suite_targets(typechecked, test_targets)
+					)
+
+					generated_compile_errors: List[String] = match generated_preparation:
+						Err(errors):
+							errors
+						Ok(_):
+							[]
+
+					generated_compile_ready: Bool = match generated_preparation:
+						Ok(CliCompilePreparationReady(prepared)):
+							capabilities: List[String] = prepared.request.required_capabilities.map(
+								semantic_middle_capability_name,
+							)
+
+							(
+								prepared.request.target_path == generated.source.path
+								and prepared.request.target_module_name == generated.source.module_name
+								and prepared.request.require_main
+								and capabilities == [
+									"core_post_synth",
+									"core_pre_dce",
+									"rendered_stage_observations",
+								]
+							)
+						_:
+							False
 
 					collisions_rejected: Bool = match graph.roots:
 						[template, ..._]:
@@ -397,9 +584,15 @@ private func test_generated_root_extends_existing_graph_without_reparsing_module
 						test_failure("generated import did not bind to the retained graph identity")
 					else if not serialized_origin:
 						test_failure("generated origin did not cross the JSON bridge boundary")
-					else if typecheck_errors.length() != 0:
+					else if generated_compile_errors.length() != 0:
 						test_failure(
-							"generated graph failed typecheck:\n" + typecheck_errors.join("\n"),
+							"generated graph failed compile preparation:\n" + generated_compile_errors.join(
+								"\n",
+							),
+						)
+					else if not generated_compile_ready:
+						test_failure(
+							"generated graph did not reach the post-synthesis compile boundary",
 						)
 					else if not collisions_rejected:
 						test_failure("generated root identity collision was not rejected")
@@ -421,6 +614,15 @@ tests: TestSuite = {
 		("selector harness protocol", test_selector_harness_matches_existing_protocol),
 		("selector leak-check protocol", test_selector_harness_supports_leak_check),
 		("run-all harness protocol", test_run_all_harness_matches_existing_protocol),
+		(
+			"single suite plan builds retained run plan",
+			test_single_suite_plan_builds_retained_run_plan,
+		),
+		("unsupported suite policies fall back", test_unsupported_suite_policies_fall_back),
+		(
+			"suite directories fall back until batch route",
+			test_suite_directories_fall_back_until_batch_route,
+		),
 		(
 			"generated root extends an existing graph",
 			test_generated_root_extends_existing_graph_without_reparsing_modules,

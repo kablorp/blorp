@@ -1,0 +1,263 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, TypeParameterType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_mono_specialize:
+		CoreMonoDiagnostic(CoreMonoCannotInferTypeArgument, CoreMonoConflictingTypeArguments),
+		core_mono_diagnostic_hint,
+		core_mono_diagnostic_loc,
+		core_mono_diagnostic_message,
+	../src/stage_09_core/compiler_core_monomorphize: monomorphize_program
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func type_parameter(name: String) -> CoreType:
+	TypeParameterType(name)
+
+
+pure func option_type(value_type: CoreType) -> CoreType:
+	NamedType("Option", [value_type])
+
+
+pure func named_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func source_loc(line: Int) -> CoreSourceLoc:
+	KnownSourceLoc({
+		file = "mono_diagnostic.brp",
+		line = line,
+		column = 3,
+		end_line = line,
+		end_column = 12,
+	})
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = named_var(name, None),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function(
+	name: String,
+	def_id: Int,
+	type_params: List[String],
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = type_params,
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func selected_call(
+	name: String,
+	def_id: Int,
+	param_types: List[CoreType],
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			named_var(name, Some(def_id)),
+			FunctionType(True, param_types, return_type),
+			loc,
+		),
+		args,
+		return_type,
+		loc,
+	)
+
+
+pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(
+		named_var(name, None),
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+func test_reports_conflicting_concrete_evidence() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	string_type: CoreType = named_type("String")
+	same: CoreFunction = function(
+		"same",
+		10,
+		["T"],
+		[param("left", t), param("right", t)],
+		t,
+		variable(
+			"left",
+			t,
+		),
+	)
+	call_loc: CoreSourceLoc = source_loc(7)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		int_type,
+		selected_call(
+			"same",
+			10,
+			[int_type, string_type],
+			[variable("left", int_type), variable("right", string_type)],
+			int_type,
+			call_loc,
+		),
+	)
+
+	match monomorphize_program(program([FunctionDecl(same), FunctionDecl(main)]), 100):
+		Err(CoreMonoConflictingTypeArguments(name, loc)):
+			(
+				name == "same"
+				and loc == call_loc
+				and core_mono_diagnostic_message(
+					CoreMonoConflictingTypeArguments(
+						name,
+						loc,
+					),
+				).contains("Conflicting type arguments")
+				and core_mono_diagnostic_hint(CoreMonoConflictingTypeArguments(name, loc)).is_some()
+			)
+		_:
+			False
+
+
+func test_reports_unresolved_call_in_monomorphic_body() -> Bool:
+	t: CoreType = type_parameter("T")
+	option_t: CoreType = option_type(t)
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	call_loc: CoreSourceLoc = source_loc(11)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		option_t,
+		selected_call("make", 10, [], [], option_t, call_loc),
+	)
+
+	match monomorphize_program(program([FunctionDecl(make), FunctionDecl(main)]), 100):
+		Err(CoreMonoCannotInferTypeArgument(name, loc)):
+			(
+				name == "make"
+				and core_mono_diagnostic_loc(CoreMonoCannotInferTypeArgument(name, loc)) == call_loc
+				and core_mono_diagnostic_message(
+					CoreMonoCannotInferTypeArgument(
+						name,
+						loc,
+					),
+				).contains("Cannot infer type argument")
+			)
+		_:
+			False
+
+
+func test_allows_unresolved_call_in_generic_body() -> Bool:
+	t: CoreType = type_parameter("T")
+	option_t: CoreType = option_type(t)
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	use: CoreFunction = function(
+		"use",
+		20,
+		["T"],
+		[],
+		option_t,
+		selected_call("make", 10, [], [], option_t, source_loc(15)),
+	)
+
+	monomorphize_program(program([FunctionDecl(make), FunctionDecl(use)]), 100).is_ok()
+
+
+func test_accepts_concrete_return_type_evidence() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	option_t: CoreType = option_type(t)
+	option_int: CoreType = option_type(int_type)
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		option_int,
+		selected_call("make", 10, [], [], option_int, source_loc(19)),
+	)
+
+	monomorphize_program(program([FunctionDecl(make), FunctionDecl(main)]), 100).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp compiler monomorphization diagnostics",
+	tests = [
+		("reports conflicting concrete evidence", test_reports_conflicting_concrete_evidence),
+		(
+			"reports unresolved call in monomorphic body",
+			test_reports_unresolved_call_in_monomorphic_body,
+		),
+		("allows unresolved call in generic body", test_allows_unresolved_call_in_generic_body),
+		("accepts concrete return type evidence", test_accepts_concrete_return_type_evidence),
+	]
+}

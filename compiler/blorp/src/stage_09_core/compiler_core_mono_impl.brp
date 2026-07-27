@@ -1,0 +1,735 @@
+-- Demand-driven generic trait-implementation specialization.
+--
+-- Dispatch identity comes from a selected/deferred trait call or the canonical
+-- operation table. Method names alone are never sufficient because unrelated
+-- traits may intentionally use the same name.
+import:
+	../stage_08_core_lower/compiler_core_identity: core_module_member_name, core_ufcs_function_name
+	compiler_core_json:
+		CoreCallKind(BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(BinaryExpr, CallExpr, SeqExpr, UnaryExpr, VarExpr),
+		CoreFunction,
+		CoreImplDecl,
+		CoreProgram,
+		CoreType,
+		CoreTypeParam,
+		CoreVar,
+		core_expr_type,
+	compiler_core_mono:
+		CoreMonoSubstitution,
+		CoreMonoSubstitutionValue(TypeSubstitution),
+		apply_type_substitution,
+		collect_type_substitution,
+		core_type_contains_parameter,
+		is_concrete_substitution,
+		mangle_generic_data_name,
+	compiler_core_mono_specialize: CoreMonoProgramSpecialization
+	compiler_core_mono_substitute: substitute_core_decl_types
+	compiler_core_trait_dispatch:
+		CoreTraitMethodIdentity,
+		core_binary_trait_method,
+		core_builtin_trait_method,
+		core_unary_trait_method,
+	compiler_core_traverse as CoreTraverse
+
+
+private record CoreMonoImplRequest {
+	template: CoreImplDecl,
+	substitution: CoreMonoSubstitution,
+	concrete_for_type: CoreType,
+	key: String
+}
+
+
+private record CoreMonoImplMaterialization {
+	decl: CoreDecl,
+	next_def_id: Int
+}
+
+
+private record CoreMonoMethodIdRewrite {
+	source_name: String,
+	source_module: Option[String],
+	source_def_id: Int,
+	target_def_id: Int
+}
+
+
+-- Callable ids are graph-wide before monomorphization. Target-module methods
+-- intentionally have no source_module, so naming metadata cannot participate
+-- in identity checks here.
+private record CoreMonoImplSelection {
+	def_id: Int
+}
+
+
+private type alias CoreMonoDefIdMap = List[CoreMonoMethodIdRewrite]
+
+
+private pure func impl_type_param_names(impl: CoreImplDecl) -> List[String]:
+	impl.type_params.map(pure func(param): param.name)
+
+
+private pure func method_has_body(method: CoreFunction) -> Bool:
+	method.body.is_some()
+
+
+private pure func impl_has_method(impl: CoreImplDecl, method_name: String) -> Bool:
+	impl.methods.any(pure func(method):
+		method.name == method_name and method_has_body(method)
+	)
+
+
+private pure func impl_has_selected_method(
+	impl: CoreImplDecl,
+	method_name: String,
+	selection: CoreMonoImplSelection,
+) -> Bool:
+	impl.methods.any(pure func(method):
+		(
+			method.name == method_name
+			and method.def_id == selection.def_id
+			and method_has_body(method)
+		)
+	)
+
+
+private pure func generic_impls(program: CoreProgram) -> List[CoreImplDecl]:
+	program.decls.flat_map(pure func(decl) -> List[CoreImplDecl]:
+		match decl:
+			ImplDecl(impl):
+				if impl.type_params.is_empty():
+					[]
+				else:
+					[impl]
+			_:
+				[]
+	)
+
+
+private pure func impl_key(trait_name: String, for_type: CoreType) -> Option[String]:
+	mangle_generic_data_name(trait_name, [for_type])
+
+
+private pure func concrete_impl_keys(program: CoreProgram) -> List[String]:
+	var keys: List[String] = []
+
+	for decl in program.decls:
+		match decl:
+			ImplDecl(impl):
+				if impl.type_params.is_empty():
+					match impl_key(impl.trait_name, impl.for_type):
+						Some(key):
+							if not keys.contains(key):
+								keys = keys.append(key)
+						None:
+							void
+			_:
+				void
+
+	keys
+
+
+private pure func request_key_is_known(
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	key: String,
+) -> Bool:
+	concrete_keys.contains(key) or requests.any(pure func(request): request.key == key)
+
+
+private pure func append_request(
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	request: CoreMonoImplRequest,
+) -> List[CoreMonoImplRequest]:
+	if request_key_is_known(concrete_keys, requests, request.key):
+		requests
+	else:
+		requests.append(request)
+
+
+private pure func candidate_request(
+	impl: CoreImplDecl,
+	unresolved_type_params: List[String],
+	receiver_type: CoreType,
+) -> Option[CoreMonoImplRequest]:
+	type_params: List[String] = impl_type_param_names(impl)
+
+	match collect_type_substitution(
+		type_params,
+		unresolved_type_params,
+		impl.for_type,
+		receiver_type,
+		[],
+	):
+		Some(substitution):
+			concrete_for_type: CoreType = apply_type_substitution(substitution, impl.for_type)
+
+			if (
+				substitution.is_empty()
+				or not is_concrete_substitution(unresolved_type_params, substitution)
+				or core_type_contains_parameter(type_params, concrete_for_type)
+			):
+				None
+			else:
+				match impl_key(impl.trait_name, concrete_for_type):
+					Some(key):
+						Some({
+							template = impl,
+							substitution = substitution,
+							concrete_for_type = concrete_for_type,
+							key = key,
+						})
+					None:
+						None
+		None:
+			None
+
+
+private pure func request_for_trait(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	trait_name: String,
+	method_name: Option[String],
+	selection: Option[CoreMonoImplSelection],
+	receiver_type: CoreType,
+) -> Option[CoreMonoImplRequest]:
+	var found: Option[CoreMonoImplRequest] = None
+	var ambiguous: Bool = False
+
+	for impl in generic_impls:
+		method_matches: Bool = match method_name:
+			Some(name):
+				match selection:
+					Some(selected):
+						impl_has_selected_method(impl, name, selected)
+					None:
+						impl_has_method(impl, name)
+			None:
+				True
+
+		if impl.trait_name == trait_name and method_matches:
+			match candidate_request(impl, unresolved_type_params, receiver_type):
+				Some(request):
+					if not request_key_is_known(concrete_keys, requests, request.key):
+						match found:
+							Some(_):
+								ambiguous = True
+								break
+							None:
+								found = Some(request)
+				None:
+					void
+
+	if ambiguous:
+		None
+	else:
+		found
+
+
+private pure func dispatch_receiver_type(args: List[CoreExpr], result_type: CoreType) -> CoreType:
+	args
+		.get(0)
+		.map(core_expr_type)
+		.get_or(result_type)
+
+
+private pure func request_for_identity(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	identity: CoreTraitMethodIdentity,
+	receiver_type: CoreType,
+) -> Option[CoreMonoImplRequest]:
+	request_for_trait(
+		generic_impls,
+		concrete_keys,
+		requests,
+		unresolved_type_params,
+		identity.trait_name,
+		Some(identity.method_name),
+		None,
+		receiver_type,
+	)
+
+
+private pure func request_for_expr(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> Option[CoreMonoImplRequest]:
+	match expr:
+		CallExpr(DeferredTraitCall(trait_name, method_name), _, args, result_type, _):
+			request_for_trait(
+				generic_impls,
+				concrete_keys,
+				requests,
+				unresolved_type_params,
+				trait_name,
+				Some(method_name),
+				None,
+				dispatch_receiver_type(args, result_type),
+			)
+		CallExpr(SelectedTraitCall(trait_name, method_name, _, def_id), _, args, result_type, _):
+			request_for_trait(
+				generic_impls,
+				concrete_keys,
+				requests,
+				unresolved_type_params,
+				trait_name,
+				Some(method_name),
+				Some({
+					def_id = def_id,
+				}),
+				dispatch_receiver_type(args, result_type),
+			)
+		CallExpr(BuiltinCall(name), _, args, result_type, _):
+			match core_builtin_trait_method(name):
+				Some(identity):
+					request_for_identity(
+						generic_impls,
+						concrete_keys,
+						requests,
+						unresolved_type_params,
+						identity,
+						dispatch_receiver_type(args, result_type),
+					)
+				None:
+					None
+		BinaryExpr(op, left, _, _, _):
+			request_for_identity(
+				generic_impls,
+				concrete_keys,
+				requests,
+				unresolved_type_params,
+				core_binary_trait_method(op),
+				core_expr_type(left),
+			)
+		UnaryExpr(op, operand, _, _):
+			match core_unary_trait_method(op):
+				Some(identity):
+					request_for_identity(
+						generic_impls,
+						concrete_keys,
+						requests,
+						unresolved_type_params,
+						identity,
+						core_expr_type(operand),
+					)
+				None:
+					None
+		_:
+			None
+
+
+private pure func collect_expr_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> List[CoreMonoImplRequest]:
+	var collected: List[CoreMonoImplRequest] = requests
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match request_for_expr(
+					generic_impls,
+					concrete_keys,
+					collected,
+					unresolved_type_params,
+					node,
+				):
+					Some(request):
+						collected = append_request(concrete_keys, collected, request)
+					None:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	collected
+
+
+private pure func collect_function_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	inherited_type_params: List[String],
+	function: CoreFunction,
+) -> List[CoreMonoImplRequest]:
+	match function.body:
+		Some(body):
+				collect_expr_requests(
+					generic_impls,
+					concrete_keys,
+					requests,
+					inherited_type_params.concat(function.type_params),
+					body,
+				)
+		None:
+			requests
+
+
+private pure func collect_impl_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	impl: CoreImplDecl,
+) -> List[CoreMonoImplRequest]:
+	var collected: List[CoreMonoImplRequest] = requests
+	inherited_type_params: List[String] = impl_type_param_names(impl)
+
+	for method in impl.methods:
+		collected = collect_function_requests(
+			generic_impls,
+			concrete_keys,
+			collected,
+			inherited_type_params,
+			method,
+		)
+
+	collected
+
+
+private pure func collect_program_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	program: CoreProgram,
+) -> List[CoreMonoImplRequest]:
+	var requests: List[CoreMonoImplRequest] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				requests = collect_function_requests(
+					generic_impls,
+					concrete_keys,
+					requests,
+					[],
+					function,
+				)
+			GlobalDecl(global):
+				requests = collect_expr_requests(
+					generic_impls,
+					concrete_keys,
+					requests,
+					[],
+					global.init,
+				)
+			ImplDecl(impl):
+				requests = collect_impl_requests(generic_impls, concrete_keys, requests, impl)
+			_:
+				void
+
+	requests
+
+
+private pure func substitution_type(
+	substitution: CoreMonoSubstitution,
+	name: String,
+) -> Option[CoreType]:
+	var result: Option[CoreType] = None
+
+	for binding in substitution:
+		if binding[0] == name:
+			match binding[1]:
+				TypeSubstitution(typ):
+					result = Some(typ)
+				_:
+					void
+
+			break
+
+	result
+
+
+private pure func collect_bound_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	request: CoreMonoImplRequest,
+) -> List[CoreMonoImplRequest]:
+	var collected: List[CoreMonoImplRequest] = requests
+
+	for param in request.template.type_params:
+		match substitution_type(request.substitution, param.name):
+			Some(concrete_type):
+				for trait_name in param.bounds:
+					match request_for_trait(
+						generic_impls,
+						concrete_keys,
+						collected,
+						[],
+						trait_name,
+						None,
+						None,
+						concrete_type,
+					):
+						Some(bound_request):
+							collected = append_request(concrete_keys, collected, bound_request)
+						None:
+							void
+			None:
+				void
+
+	collected
+
+
+private pure func method_reference_name_matches(
+	rewrite: CoreMonoMethodIdRewrite,
+	name: String,
+) -> Bool:
+	if name == rewrite.source_name:
+		True
+	else:
+		match rewrite.source_module:
+			Some(module_path):
+				(
+					name == core_module_member_name(module_path, rewrite.source_name)
+					or name == core_ufcs_function_name(module_path, rewrite.source_name)
+				)
+			None:
+				False
+
+
+private pure func replacement_def_id(
+	mapping: CoreMonoDefIdMap,
+	def_id: Int,
+	name: String,
+) -> Option[Int]:
+	var replacement: Option[Int] = None
+
+	for entry in mapping:
+		if entry.source_def_id == def_id and method_reference_name_matches(entry, name):
+			replacement = Some(entry.target_def_id)
+			break
+
+	replacement
+
+
+private pure func replace_var_def_id(mapping: CoreMonoDefIdMap, variable: CoreVar) -> CoreVar:
+	match variable.def_id:
+		Some(def_id):
+			match replacement_def_id(mapping, def_id, variable.name):
+				Some(replacement):
+					{ variable | def_id = Some(replacement) }
+				None:
+					variable
+		None:
+			variable
+
+
+private pure func rewrite_sequence_method_references(
+	mapping: CoreMonoDefIdMap,
+	expr: CoreExpr,
+) -> CoreExpr:
+	spine = CoreTraverse.split_core_sequence(expr)
+	var preceding_items: List[CoreExpr] = []
+
+	for item in spine.preceding_items:
+		preceding_items = preceding_items.append(rewrite_method_references(mapping, item))
+
+	CoreTraverse.rebuild_core_sequence(
+		{
+			preceding_items = preceding_items,
+			final_item = rewrite_method_references(mapping, spine.final_item)
+		},
+	)
+
+
+private pure func rewrite_method_references(mapping: CoreMonoDefIdMap, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			rewrite_sequence_method_references(mapping, expr)
+		_:
+			children_rewritten: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				mapping,
+				rewrite_method_references,
+			)
+
+			match children_rewritten:
+				VarExpr(variable, typ, loc):
+					VarExpr(
+						replace_var_def_id(mapping, variable),
+						typ,
+						loc,
+					)
+				CallExpr(SelectedDirectCall(def_id), callee, args, typ, loc):
+					match callee:
+						VarExpr(variable, _, _):
+							match replacement_def_id(mapping, def_id, variable.name):
+								Some(replacement):
+									CallExpr(
+										SelectedDirectCall(replacement),
+										callee,
+										args,
+										typ,
+										loc,
+									)
+								None:
+									children_rewritten
+						_:
+							children_rewritten
+				CallExpr(SelectedTraitCall(trait_name, method_name, module_path, def_id), callee, args, typ, loc):
+					match callee:
+						VarExpr(variable, _, _):
+							match replacement_def_id(mapping, def_id, variable.name):
+								Some(replacement):
+									CallExpr(
+										SelectedTraitCall(
+											trait_name,
+											method_name,
+											module_path,
+											replacement,
+										),
+										callee,
+										args,
+										typ,
+										loc,
+									)
+								None:
+									children_rewritten
+						_:
+							children_rewritten
+				_:
+					children_rewritten
+
+
+private pure func method_def_id_mapping(
+	methods: List[CoreFunction],
+	next_def_id: Int,
+) -> CoreMonoDefIdMap:
+	var mapping: CoreMonoDefIdMap = []
+	var current_def_id: Int = next_def_id
+
+	for method in methods:
+		mapping = mapping.append({
+			source_name = method.name,
+			source_module = method.source_module,
+			source_def_id = method.def_id,
+			target_def_id = current_def_id,
+		})
+		current_def_id += 1
+
+	mapping
+
+
+private pure func specialize_method(
+	mapping: CoreMonoDefIdMap,
+	impl_type_params: List[String],
+	method: CoreFunction,
+) -> CoreFunction:
+	def_id: Int = replacement_def_id(mapping, method.def_id, method.name).get_or(method.def_id)
+	body: Option[CoreExpr] = method.body.map(
+		pure func(expr): rewrite_method_references(mapping, expr),
+	)
+
+	{ method |
+		type_params = method.type_params.filter(
+			pure func(name): not impl_type_params.contains(name),
+		),
+		body = body,
+		def_id = def_id
+	}
+
+
+private pure func materialize_request(
+	request: CoreMonoImplRequest,
+	next_def_id: Int,
+) -> CoreMonoImplMaterialization:
+	substituted_decl: CoreDecl = substitute_core_decl_types(
+		request.substitution,
+		ImplDecl(request.template),
+	)
+
+	match substituted_decl:
+		ImplDecl(substituted):
+			impl_type_params: List[String] = impl_type_param_names(request.template)
+			mapping: CoreMonoDefIdMap = method_def_id_mapping(substituted.methods, next_def_id)
+			methods: List[CoreFunction] = substituted.methods.map(pure func(method):
+				specialize_method(mapping, impl_type_params, method)
+			)
+
+			{
+				decl = ImplDecl({ substituted |
+						for_type = request.concrete_for_type,
+						type_params = [],
+						methods = methods
+					}),
+				next_def_id = next_def_id + methods.length()
+			}
+		_:
+			{
+				decl = ImplDecl(request.template),
+				next_def_id = next_def_id
+			}
+
+
+pure func specialize_generic_impls(
+	program: CoreProgram,
+	next_def_id: Int,
+) -> CoreMonoProgramSpecialization:
+	templates: List[CoreImplDecl] = generic_impls(program)
+
+	if templates.is_empty():
+		{
+			program = program,
+			next_def_id = next_def_id
+		}
+	else:
+		concrete_keys: List[String] = concrete_impl_keys(program)
+		var requests: List[CoreMonoImplRequest] = collect_program_requests(
+			templates,
+			concrete_keys,
+			program,
+		)
+		var specialized: List[CoreDecl] = []
+		var request_index: Int = 0
+		var current_def_id: Int = next_def_id
+
+		while request_index < requests.length():
+			match requests.get(request_index):
+				Some(request):
+					materialized: CoreMonoImplMaterialization = materialize_request(
+						request,
+						current_def_id,
+					)
+					current_def_id = materialized.next_def_id
+					specialized = specialized.append(materialized.decl)
+					requests = collect_bound_requests(templates, concrete_keys, requests, request)
+
+					match materialized.decl:
+						ImplDecl(impl):
+							requests = collect_impl_requests(
+								templates,
+								concrete_keys,
+								requests,
+								impl,
+							)
+						_:
+							void
+				None:
+					break
+
+			request_index += 1
+
+		{
+			program = { program | decls = program.decls.concat(specialized) },
+			next_def_id = current_def_id
+		}

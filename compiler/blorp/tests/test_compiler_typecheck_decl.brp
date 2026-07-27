@@ -60,6 +60,7 @@ import:
 		ParsedTraitMethodDecl,
 		ParsedTypeExpr(
 			ParsedArrayType,
+			ParsedBoundedType,
 			ParsedDimLiteralType,
 			ParsedDimNameType,
 			ParsedFunctionType,
@@ -99,6 +100,7 @@ import:
 			CompilerFunctionType,
 			CompilerMetaType,
 			CompilerNamedType,
+			CompilerTypeVar,
 			CompilerVarDimsType,
 		),
 		compiler_canonical_module_type_name,
@@ -297,6 +299,14 @@ pure func string_type() -> ParsedTypeExpr:
 
 pure func generic_named_type(name: String, args: List[ParsedTypeExpr]) -> ParsedTypeExpr:
 	ParsedNamedType(ident(name), args, source_span())
+
+
+pure func bounded_type(name: String, bounds: List[String]) -> ParsedTypeExpr:
+	ParsedBoundedType(
+		ident(name),
+		bounds.map(ident),
+		source_span(),
+	)
 
 
 pure func result_type(ok_type: ParsedTypeExpr, error_type: ParsedTypeExpr) -> ParsedTypeExpr:
@@ -729,6 +739,21 @@ pure func type_alias_decl_with_target(name: String, target: ParsedTypeExpr) -> P
 	TypeAliasParsedDecl({
 		name = ident(name),
 		type_params = [],
+		target = target,
+		is_opaque = False,
+		doc = None,
+		span = source_span(),
+	})
+
+
+pure func generic_type_alias_decl(
+	name: String,
+	type_param_name: String,
+	target: ParsedTypeExpr,
+) -> ParsedDecl:
+	TypeAliasParsedDecl({
+		name = ident(name),
+		type_params = [type_param(type_param_name)],
 		target = target,
 		is_opaque = False,
 		doc = None,
@@ -2166,11 +2191,202 @@ func test_materialize_program_bodies_preserves_implicit_type_params() -> Bool:
 
 	match result.program.decls.get(0):
 		Some(CompilerTypedFunctionDecl(info)):
+			expected = CompilerTypeVar("T")
+
+			body_ok = match info.body:
+				Some(body):
+					(
+						compiler_types_equal(compiler_typed_expr_semantic_type(body), expected)
+						and compiler_types_equal(compiler_typed_expr_value_type(body), expected)
+					)
+				None:
+					False
+
 			(
 				result.state.errors.length() == 0
 				and info.decl.type_params.length() == 0
 				and info.effective_type_params.map(func(param): param.name) == ["T"]
+				and info.param_types.length() == 1
+				and compiler_types_equal(
+					info.param_types.get_or(0, compiler_type_void()),
+					expected,
+				)
+				and compiler_types_equal(info.semantic_return_type, expected)
+				and body_ok
 			)
+		_:
+			False
+
+
+func test_materialize_generic_type_decls_use_explicit_semantic_params() -> Bool:
+	generic_record = RecordParsedDecl({
+		name = ident("Box"),
+		type_params = [type_param("T")],
+		fields = [field_decl("value", named_type("T"))],
+		is_struct = False,
+		doc = None,
+		span = source_span(),
+	})
+	source_program = program([
+		generic_record,
+		result_union_decl(),
+		generic_type_alias_decl("Wrapped", "T", named_type("T")),
+	])
+	state = compiler_typecheck_register_program_type_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(state, source_program)
+	expected = CompilerTypeVar("T")
+
+	record_ok = match result.program.decls.get(0):
+		Some(CompilerTypedRecordDecl(info)):
+			match info.fields.get(0):
+				Some(field):
+					compiler_types_equal(
+						field.source_type,
+						CompilerNamedType("T", []),
+					) and compiler_types_equal(field.semantic_type, expected)
+				None:
+					False
+		_:
+			False
+
+	union_ok = match result.program.decls.get(1):
+		Some(CompilerTypedUnionDecl(info)):
+			match info.variants.get(0):
+				Some(variant):
+					compiler_types_equal(
+						variant.fields.get_or(0, compiler_type_void()),
+						expected,
+					)
+				None:
+					False
+		_:
+			False
+
+	alias_ok = match result.program.decls.get(2):
+		Some(CompilerTypedTypeAliasDecl(info)):
+			compiler_types_equal(
+				info.source_target_type,
+				CompilerNamedType("T", []),
+			) and compiler_types_equal(info.semantic_target_type, expected)
+		_:
+			False
+
+	result.state.errors.length() == 0 and record_ok and union_ok and alias_ok
+
+
+func test_materialize_impl_preserves_type_params_and_bounds() -> Bool:
+	source_program = program([
+		trait_decl("Stringable"),
+		trait_decl("Display"),
+		impl_decl_with_methods(
+			"Display",
+			generic_named_type("List", [bounded_type("T", ["Stringable"])]),
+			[],
+		),
+	])
+	base_state = compiler_typecheck_register_program_impl_decls(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match result.program.decls.get(2):
+		Some(CompilerTypedImplDecl(info)):
+			match info.type_params:
+				[param]:
+					(
+						result.state.errors.length() == 0
+						and param.name == "T"
+						and param.bounds == ["Stringable"]
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_materialize_impl_normalizes_implicit_type_param() -> Bool:
+	source_program = program([
+		trait_decl("Display"),
+		impl_decl_with_methods(
+			"Display",
+			generic_named_type("List", [named_type("T")]),
+			[],
+		),
+	])
+	base_state = compiler_typecheck_register_program_impl_decls(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match result.program.decls.get(1):
+		Some(CompilerTypedImplDecl(info)):
+			result.state.errors.length() == 0 and compiler_types_equal(
+				info.for_type,
+				CompilerNamedType("List", [CompilerTypeVar("T")]),
+			) and info.type_params.map(func(param): param.name) == ["T"]
+		_:
+			False
+
+
+func test_materialize_impl_expands_transparent_generic_alias() -> Bool:
+	source_program = program([
+		trait_decl("Stringable"),
+		trait_decl("Display"),
+		generic_type_alias_decl(
+			"Items",
+			"A",
+			generic_named_type("List", [named_type("A")]),
+		),
+		impl_decl_with_methods(
+			"Display",
+			generic_named_type("Items", [bounded_type("T", ["Stringable"])]),
+			[],
+		),
+	])
+	base_state = compiler_typecheck_register_program_impl_decls(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match result.program.decls.get(3):
+		Some(CompilerTypedImplDecl(info)):
+			result.state.errors.length() == 0 and compiler_types_equal(
+				info.for_type,
+				CompilerNamedType("List", [CompilerTypeVar("T")]),
+			) and info.type_params.map(func(param): param.name) == ["T"]
 		_:
 			False
 
@@ -3643,6 +3859,22 @@ tests: TestSuite = {
 		(
 			"materialize program bodies preserves implicit type params",
 			test_materialize_program_bodies_preserves_implicit_type_params,
+		),
+		(
+			"materialize generic type declarations use explicit semantic params",
+			test_materialize_generic_type_decls_use_explicit_semantic_params,
+		),
+		(
+			"materialize impl preserves type params and bounds",
+			test_materialize_impl_preserves_type_params_and_bounds,
+		),
+		(
+			"materialize impl normalizes implicit type param",
+			test_materialize_impl_normalizes_implicit_type_param,
+		),
+		(
+			"materialize impl expands transparent generic alias",
+			test_materialize_impl_expands_transparent_generic_alias,
 		),
 		(
 			"materialize program bodies resolves function alias return metadata",

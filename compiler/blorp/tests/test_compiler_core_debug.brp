@@ -1,0 +1,248 @@
+import:
+	../src/stage_09_core/compiler_core_debug: lower_expr, lower_program
+	../src/stage_09_core/compiler_core_json:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(CastExpr, DebugBlockExpr, LiteralExpr, SeqExpr, VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreGlobal,
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(KnownSourceLoc),
+		CoreType(NamedType, VoidType),
+		CoreVar,
+		core_expr_to_json,
+		core_program_to_json,
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func source_loc(line: Int) -> CoreSourceLoc:
+	KnownSourceLoc({
+		file = "debug.brp",
+		line = line,
+		column = 1,
+		end_line = line,
+		end_column = 8,
+	})
+
+
+pure func named_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func int_lit(value: Int, line: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), named_type("Int"), source_loc(line))
+
+
+pure func debug_block(body: CoreExpr, line: Int) -> CoreExpr:
+	DebugBlockExpr(body, VoidType, source_loc(line))
+
+
+pure func core_exprs_equal(left: CoreExpr, right: CoreExpr) -> Bool:
+	core_expr_to_json(left).to_string() == core_expr_to_json(right).to_string()
+
+
+pure func core_programs_equal(left: CoreProgram, right: CoreProgram) -> Bool:
+	core_program_to_json(left).to_string() == core_program_to_json(right).to_string()
+
+
+func test_normal_build_erases_debug_block_at_block_location() -> Bool:
+	source = debug_block(
+		int_lit(42, 2),
+		1,
+	)
+	expected = VoidExpr(VoidType, source_loc(1))
+
+	core_exprs_equal(
+		lower_expr(False, source),
+		expected,
+	)
+
+
+func test_debug_build_retains_recursively_lowered_body() -> Bool:
+	body = int_lit(42, 3)
+	source = debug_block(
+		debug_block(body, 2),
+		1,
+	)
+
+	core_exprs_equal(
+		lower_expr(True, source),
+		body,
+	)
+
+
+func test_lowers_debug_block_inside_expression_container() -> Bool:
+	source = CastExpr(
+		debug_block(
+			int_lit(42, 2),
+			1,
+		),
+		named_type("Int"),
+		source_loc(3),
+	)
+	expected = CastExpr(
+		VoidExpr(VoidType, source_loc(1)),
+		named_type("Int"),
+		source_loc(3),
+	)
+
+	core_exprs_equal(
+		lower_expr(False, source),
+		expected,
+	)
+
+
+pure func is_void_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		VoidExpr(VoidType, _):
+			True
+		_:
+			False
+
+
+func test_lowers_deep_sequence_without_exhausting_stack() -> Bool:
+	sequence_depth: Int = 2048
+	var source: CoreExpr = debug_block(
+		int_lit(0, 1),
+		1,
+	)
+	var index: Int = 0
+
+	while index < sequence_depth:
+		source = SeqExpr(
+			debug_block(
+				int_lit(index, 1),
+				1,
+			),
+			source,
+		)
+		index += 1
+
+	var current: CoreExpr = lower_expr(False, source)
+	var lowered_items: Int = 0
+	var all_lowered: Bool = True
+
+	while True:
+		match current:
+			SeqExpr(first, second):
+				if not is_void_expr(first):
+					all_lowered = False
+					break
+
+				lowered_items += 1
+				current = second
+			_:
+				if is_void_expr(current):
+					lowered_items += 1
+				else:
+					all_lowered = False
+
+				break
+
+	all_lowered and lowered_items == sequence_depth + 1
+
+
+pure func sample_function(body: CoreExpr) -> CoreFunction:
+	{
+		name = "debug_method",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 1,
+		loc = source_loc(1)
+	}
+
+
+pure func sample_global(init: CoreExpr) -> CoreGlobal:
+	{
+		name = named_var("debug_global"),
+		source_module = None,
+		typ = VoidType,
+		init = init,
+		is_mutable = False,
+		is_const = False,
+		is_private = False,
+		def_id = 2,
+		loc = source_loc(1)
+	}
+
+
+func test_lowers_function_global_and_impl_method_bodies() -> Bool:
+	source_body = debug_block(
+		int_lit(42, 2),
+		1,
+	)
+	lowered_body = VoidExpr(VoidType, source_loc(1))
+	source: CoreProgram = {
+		decls = [
+			FunctionDecl(sample_function(source_body)),
+			GlobalDecl(sample_global(source_body)),
+			ImplDecl({
+				trait_name = "Debuggable",
+				for_type = named_type("Int"),
+				type_params = [],
+				methods = [sample_function(source_body)],
+				loc = source_loc(1),
+			}),
+		],
+		foreign_includes = ["debug_fixture.h"]
+	}
+	expected: CoreProgram = {
+		decls = [
+			FunctionDecl(sample_function(lowered_body)),
+			GlobalDecl(sample_global(lowered_body)),
+			ImplDecl({
+				trait_name = "Debuggable",
+				for_type = named_type("Int"),
+				type_params = [],
+				methods = [sample_function(lowered_body)],
+				loc = source_loc(1),
+			}),
+		],
+		foreign_includes = ["debug_fixture.h"]
+	}
+
+	core_programs_equal(
+		lower_program(False, source),
+		expected,
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core debug",
+	tests = [
+		(
+			"normal build erases debug block at block location",
+			test_normal_build_erases_debug_block_at_block_location,
+		),
+		(
+			"debug build retains recursively lowered body",
+			test_debug_build_retains_recursively_lowered_body,
+		),
+		(
+			"lowers debug block inside expression container",
+			test_lowers_debug_block_inside_expression_container,
+		),
+		(
+			"lowers deep sequence without exhausting stack",
+			test_lowers_deep_sequence_without_exhausting_stack,
+		),
+		(
+			"lowers function global and impl method bodies",
+			test_lowers_function_global_and_impl_method_bodies,
+		),
+	]
+}

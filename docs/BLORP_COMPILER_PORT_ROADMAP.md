@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-24.
+Status checked against code on 2026-07-25.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -22,10 +22,11 @@ the Blorp executable and ends in Blorp, with an OCaml middle:
 Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> Blorp typecheck / CTFE
   -> Blorp Core lowering / module flattening / FFI boundary / initial list layout
-  -> strict prepared-Core semantic-middle request
+  -> Blorp debug / desugar / SSA / mono / post-mono list layout / synthesis
+  -> strict post-synthesis semantic-middle request
   -> one blorp-ocaml-middle process
-  -> OCaml early/middle Core pipeline and the remaining registry-dependent
-     transforms
+  -> OCaml Core middle from match through the remaining registry-dependent
+     specialization transforms
   -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
      tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
      reduction, and bounds-proven tensor-access builtins preserved
@@ -79,6 +80,9 @@ Current production Core-boundary Blorp files:
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_graph_prepare.brp`
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_ffi_boundary.brp`
 - `compiler/blorp/src/stage_08_core_lower/compiler_core_list_layout.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_early_pipeline.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_synth.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_synth_*.brp`
 - `compiler/blorp/src/stage_09_core/compiler_semantic_worker_protocol.brp`
 
 Current production backend-tail Blorp files:
@@ -102,14 +106,15 @@ Current OCaml bridge, orchestration, and production-middle files:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/core_pre_middle_json.ml`
+- `compiler/lib/core_post_synth_json.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
-`compiler/lib/core_pipeline.ml` still invokes the OCaml early/middle Core
-passes after the strict prepared-Core decoder. It does not lower typed AST on
-the normal production source path. The production JSON handoff preserves
+`compiler/lib/core_pipeline.ml` invokes the remaining OCaml Core middle from
+`Core_match` after the strict post-synthesis decoder and invariant checks. It
+does not lower typed AST or run debug, desugar/SSA, mono, post-mono list layout,
+or synthesis on the normal production source path. The production JSON handoff preserves
 concrete conversion, hash, length, numeric checked tensor-access,
 raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
 bounds-proven tensor-access builtins for Blorp specialization. Blorp is
@@ -1791,6 +1796,34 @@ Current status:
   source policy. The remaining TestRunner migration is orchestration ownership,
   not parser/typechecker parity, and must preserve doctest location remapping,
   process cleanup, and filesystem-isolation behavior.
+- The Blorp-owned generated selector/run-all graph can now be retained after
+  its source files are removed and prepared through the production early Core
+  pipeline to the post-synthesis worker request. Its compile policy represents
+  permission to call debug-only test helpers separately from retention of
+  `debug:` blocks. Production TestRunner routing has not switched yet; the next
+  slice must consume this retained graph rather than adding a test-only parser
+  bridge or serializing generated source back through OCaml.
+- Test command plans now carry typed execution or warmup variants throughout
+  the Blorp process and become JSON only when crossing the temporary OCaml host
+  boundary. Runtime-cache warmup must move with TestRunner execution because
+  the Blorp host and retained OCaml runner still use different cache schemas.
+- Blorp test discovery now classifies parsed declarations and docs for `main`,
+  a candidate `tests` binding, and doctests. Resolved TestSuite identity belongs
+  after module loading/type resolution; it is not guessed from a raw type name.
+  Deterministic filesystem discovery now reads each candidate once, retains its
+  parsed program, preserves parse failures for diagnostics, skips compiler
+  fixture directories during recursive walks, and represents execution
+  isolation as a typed policy. Candidate bindings now resolve from error-free
+  typechecked modules against canonical `std/test::TestSuite` binding identity.
+  Local aliases are transparent; private declarations are explicitly
+  inaccessible to the imported harness, and same-spelled user types cannot
+  qualify. Compile preparation now exposes a typecheck-once boundary, allowing
+  a pure callback to validate retained suite modules before the same coherent
+  typed graph continues into Core preparation. The raw typed graph cannot be
+  paired with a different source plan. The generated-harness regression proves
+  this after its source files have been deleted. Production test execution still
+  needs to select this path before the OCaml substring classifiers can be
+  deleted.
 
 Typed frontier closure before CTFE:
 
@@ -1852,10 +1885,10 @@ Goal: move the boundary from typed AST to lowered Core.
 
 Status: complete for normal production source commands. Blorp now lowers the
 typed target and every typed dependency module, flattens module-owned Core
-identities, applies the checked FFI boundary and initial list layout, and sends
-one strict prepared-Core request to the OCaml semantic-middle worker. The
-worker rejects late ownership/backend nodes and begins at the early/middle Core
-pipeline; it no longer reconstructs typed AST or invokes OCaml Core lowering.
+identities, and applies the checked FFI boundary and initial list layout. That
+prepared Core now continues directly into the Blorp-owned checkpoint-9 early
+pipeline; it is no longer the process boundary. The semantic worker no longer
+reconstructs typed AST or invokes OCaml Core lowering.
 
 The pinned-bootstrap compile wrapper and direct in-memory OCaml compiler tests
 still use `Core_lower`/`Core_flatten` as compatibility scaffolding. This is a
@@ -1935,9 +1968,9 @@ Current progress:
   flattens each module before assembly, keeps the target unprefixed, preserves
   ordered foreign includes, and runs FFI and list-layout annotation exactly
   once before serialization.
-- `compiler_semantic_worker_protocol.brp` schema 2 carries prepared Core,
+- `compiler_semantic_worker_protocol.brp` schema 4 carries post-synthesis Core,
   import tables, the next definition id, stage observations, and invariant
-  policy. `core_pre_middle_json.ml` is a strict phase-specific decoder rather
+  policy. `core_post_synth_json.ml` is a strict phase-specific decoder rather
   than a permissive reuse of the late backend projection.
 - Production lowering covers the finalized typed expression and declaration
   surface, including raw patterns for the middle match compiler, record
@@ -1945,9 +1978,9 @@ Current progress:
   multidimensional enumerate, windows, concurrency, imports, globals, traits,
   impls, aliases, records, unions, and foreign declarations. Source-only or
   malformed typed nodes fail at the boundary instead of falling back to OCaml.
-- The normal CLI path is contiguous Blorp from source reads through prepared
-  Core. The only OCaml call is the single semantic-middle worker, after this
-  checkpoint boundary.
+- The normal CLI path is contiguous Blorp from source reads through
+  post-synthesis Core. The only OCaml call is the single semantic-middle worker
+  after this boundary, beginning with match compilation.
 
 - `compiler_core_lower.brp` owns typed expression/declaration lowering with
   explicit context state for Core definition ids and source-module ownership.
@@ -1961,7 +1994,13 @@ Current progress:
   helper bodies as parameter-forwarding `BuiltinCall` expressions. It rejects
   inconsistent typed payloads, such as a forward or builtin declaration that
   unexpectedly carries a typed source body. Concrete intrinsic-body synthesis
-  remains in the semantic middle, after this lowering boundary.
+  runs in the Blorp-owned early Core pipeline after monomorphization.
+- Module flattening treats a bodyless std builtin as an implementation-bearing
+  callable even though its Core body is deferred. It therefore receives the
+  same canonical module identity and forward-declaration deduplication as an
+  already-bodied function. Blorp mono creates concrete bodyless copies on
+  demand; the following Blorp synthesis stage materializes their intrinsic Core
+  bodies before the semantic-middle boundary.
 - Unsupported typed AST shapes return `CompilerCoreLowerError` instead of
   dropping declarations or falling back implicitly. This keeps the production
   boundary strict. Calls
@@ -2210,7 +2249,7 @@ Tests:
 - `compiler/blorp/tests/test_compiler_core_ffi_boundary.brp`
 - `compiler/blorp/tests/test_compiler_core_list_layout.brp`
 - `compiler/blorp/tests/test_compiler_infer.brp`
-- `compiler/test/test_core_pre_middle_json.ml`
+- `compiler/test/test_core_post_synth_json.ml`
 - `compiler/test/test_semantic_middle_worker.ml`
 - `compiler/test/test_core_compatibility.ml`
 - `compiler/test/test_core_list_layout.ml`
@@ -2235,10 +2274,20 @@ Deletion point:
 
 Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
-Status: Blorp DCE is authoritative on the normal production path and the
-superseded OCaml DCE implementation and tests are deleted. First-class
-function-reference adaptation is also Blorp-authoritative immediately after
-the handoff; its OCaml implementation and tests are deleted. Primitive
+Status: the normal compile/run path now executes a contiguous Blorp-owned Core
+prefix through debug lowering, desugar/SSA, monomorphization, and post-mono
+list layout, followed by synthesis. Schema 4 carries only post-synthesis Core
+across the single temporary
+semantic-middle boundary. The OCaml worker validates the completed early-stage
+contracts and starts at `Core_match`; early Core observations and stops never
+invoke the worker. The retained OCaml debug/desugar/SSA/mono/synth
+implementations serve bootstrap and direct in-memory compatibility entrypoints,
+not normal source compilation.
+
+Blorp DCE is authoritative on the normal production path and the superseded
+OCaml DCE implementation and tests are deleted. First-class function-reference
+adaptation is also Blorp-authoritative immediately after the handoff; its OCaml
+implementation and tests are deleted. Primitive
 conversion and hash specialization is now Blorp-authoritative at that same
 boundary for `blorp_to_int`, `blorp_to_float`, `blorp_to_float32`,
 `blorp_to_float16`, `blorp_to_bool`, `blorp_to_char`, and `blorp_hash`; the
@@ -2264,26 +2313,72 @@ represented explicitly. The four numeric reduction cases now bypass the OCaml
 fallback and their implementation-only test is deleted. The replaced OCaml
 numeric and unary tensor-math dispatch branches, raw-view environment,
 collector, rewriter, global fresh-name counter, and implementation-only tests
-are deleted. The remaining
-early and middle Core stages, including other registry/layout-dependent
-specialization families, are still OCaml-authoritative. Stage parity modules
-must not be counted as migrated until the production pass ordering invokes
-them and the replaced OCaml pass is deleted.
+are deleted. The remaining middle Core stages from synth through the residual
+OCaml specialization families are still OCaml-authoritative. Stage parity
+modules must not be counted as migrated until the production pass ordering
+invokes them.
 
-OCaml references, in `Core_pipeline.run_core_passes` order:
+The synthesis boundary has now been audited against real post-mono programs.
+`Core_synth.synthesize_program` is not only a retry for generic functions:
+Blorp Core lowering deliberately preserves every naked and `std/...` builtin as
+a bodyless function, so the pass also materializes concrete bytes, string,
+scalar-math, list, stream, set, dictionary, and tensor bodies. Port synthesis
+as explicit semantic families behind one eventual `compiler_core_synth.brp`
+orchestrator:
 
-- `compiler/lib/core_debug.ml`
-  - `lower_program`
-- `compiler/lib/core_desugar.ml`
-  - `desugar_program`
-- `compiler/lib/core_ssa.ml`
-  - `desugar_mut_program`
-- `compiler/lib/core_mono.ml`
-  - `monomorphize_program`
-- `compiler/lib/core_list_layout.ml`
-  - `annotate_program`
-- `compiler/lib/core_synth.ml`
-  - `synthesize_program`
+- builtin-wrapper and scalar-math bodies;
+- bytes and string bodies;
+- list and stream bodies;
+- set and dictionary bodies;
+- vector reduction bodies;
+- vector and matrix scoped-parallel adapters.
+
+The isolated synthesis families currently implemented are:
+
+- `compiler_core_synth_bytes.brp`: concrete `std/bytes` construction, length,
+  checked access, COW updates, slicing, concatenation, fill, search, and
+  bounds-clamped blit. Codec operations remain thin runtime forwards in the
+  forward family. Parameter references preserve full Core identity.
+- `compiler_core_synth_tensor.brp`: the complete vector-reduction family
+  (`sum`, `product`, `dot`, `max`, `min`, `mean`, `cumulative_sum`, and
+  `scale`). It preserves guarded typed raw views for `Int`, `Float`, and
+  `Float32`, the safe-reader fallback, Float16's safe-reader-only path, empty
+  reduction behavior, typed output writes, and the unsupported-element
+  diagnostic.
+- `compiler_core_synth_float.brp`: concrete `std/float` unary, binary, `fma`,
+  and classification intrinsic bodies.
+- `compiler_core_synth_forward.brp`: live bodyless `std/...` declarations
+  whose implementation is one runtime or intrinsic call. It covers bytes
+  codecs, fixed constructors/conversions, all ordinary `std/stream` builtins,
+  checked tensor operations and constructors, tensor length, and the
+  matrix runtime primitives. It deliberately excludes explicit `blorp_*`
+  declarations because Blorp lowering already gives those functions bodies.
+- `compiler_core_synth_fixed.brp`: fixed scale/precision access, integer
+  conversion, negation, and rescaling. Together with the forward family this
+  completes current `std/fixed` synthesis.
+- `compiler_core_synth_slice.brp`: all current `std/slice` operations,
+  including exact byte copying, clamped sub-slices, short-circuit prefix
+  comparison, and checked `Option[Char]` construction.
+- `compiler_core_synth.brp`: the single declaration walker and promotion point
+  for completed families. It preserves unhandled builtins and propagates typed
+  synthesis diagnostics. It is the authoritative production synthesis stage.
+
+Each family uses exact module and signature admission. They are body factories;
+only `compiler_core_synth.brp` may walk declarations and promote a successfully
+synthesized builtin to a user function. String, list, set/dictionary, tensor,
+and parallel-tensor families have parity and run before the single semantic
+bridge. The schema-4 worker therefore rejects `synth` observations and starts
+with match compilation.
+
+Hash-collection layout classification uses declaration-derived enum, record,
+union, and type-alias facts. Alias expansion follows generic targets and uses
+the target layout even for source-opaque aliases, matching the former OCaml
+registry behavior. Undeclared named types remain a typed synthesis error rather
+than falling back to a spelling heuristic.
+
+Remaining production OCaml references, in
+`Core_pipeline.run_core_passes_from_post_synth` order:
+
 - `compiler/lib/core_match.ml`
   - `compile_program`
 - `compiler/lib/core_trait_resolve.ml`
@@ -2303,16 +2398,32 @@ OCaml references, in `Core_pipeline.run_core_passes` order:
 - `compiler/lib/core_specialize.ml`
   - `specialize_program`
 
+`compiler/lib/core_synth.ml` is compatibility-only. Generated TestSuite
+harnesses, the pinned-bootstrap wrapper, and direct in-memory OCaml tests still
+enter through `Core_pipeline.run_core_passes`; migrate those callers to the
+prepared post-synthesis boundary before deleting the OCaml synthesis module and
+its remaining implementation-only coverage.
+
 Blorp references:
 
 - existing `compiler_core_traverse.brp`
 - existing `compiler_core_json.brp`
-- future `compiler_core_debug.brp`
-- existing `compiler_core_desugar.brp` for the first prepared-Core-compatible
-  desugar slice
-- future `compiler_core_ssa.brp`
-- future `compiler_core_mono.brp`
-- future `compiler_core_synth.brp`
+- existing `compiler_core_debug.brp` for the implementation-complete debug
+  block erasure/retention pass
+- existing `compiler_core_desugar.brp` for the implementation-complete
+  prepared-Core-compatible desugar pass
+- existing `compiler_core_ssa.brp` for the implementation-complete
+  straight-line mutable-local lowering pass
+- existing `compiler_core_mono.brp`, `compiler_core_mono_substitute.brp`,
+  `compiler_core_mono_specialize.brp`, `compiler_core_mono_data.brp`,
+  `compiler_core_mono_impl.brp`, `compiler_core_mono_option.brp`,
+  `compiler_core_trait_dispatch.brp`, and `compiler_core_monomorphize.brp` for
+  the production-authoritative substitution,
+  selected-function-specialization, generic-data-specialization, and generic
+  trait-implementation-specialization slices plus expression-local
+  `std/option` call fusion and checked diagnostics
+- existing `compiler_core_synth.brp`, composed from the completed synthesis
+  family modules and authoritative on the normal production path
 - future `compiler_core_match.brp`
 - future `compiler_core_trait_resolve.brp`
 - future `compiler_core_resolve.brp`
@@ -2333,14 +2444,325 @@ Implementation steps:
 
 - Port stages in exact `run_core_passes` order. Move the production boundary
   left by one stage or a tightly coupled pair only after parity passes.
-- `compiler_core_desugar.brp` currently ports the string binary-operator slice
+- `compiler_core_debug.brp` implements the prepared-Core-compatible behavior
+  from `compiler/lib/core_debug.ml`: normal builds replace each
+  `DebugBlockExpr` with `VoidExpr` at the block's source location, while debug
+  builds splice in its recursively lowered body. It uses the shared exhaustive
+  traversal and iterative sequence mapping.
+- `compiler_core_desugar.brp` implements the prepared-Core-compatible behavior
   from `compiler/lib/core_desugar.ml`: string `+`, `==`, and `!=` become
-  `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`.
-  It recursively traverses Core function/global bodies and the prepared
-  container/control-flow nodes available through Core JSON. Record-update and
-  string-interpolation desugaring remain closed until equivalent Blorp Core
-  sugar nodes or direct lowering targets exist.
-- Add `run_core_pipeline` support for each newly ported stage so tests can
+  `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`; exact
+  `target = target + suffix` assignments become `blorp_string_append`.
+  `compiler_core_traverse.brp` provides exhaustive bottom-up child traversal,
+  including raw matches, resource scopes, debug blocks, and later Core
+  containers. Record updates and string interpolation do not require sugar
+  variants in this model: `compiler_core_lower.brp` already lowers them
+  directly into ordinary Core expressions.
+- `compiler_core_ssa.brp` implements the prepared-Core-compatible behavior from
+  `compiler/lib/core_ssa.ml`: mutable locals without reassignment become
+  immutable; straight-line assignments become immutable versioned lets; and
+  assignments below control-flow boundaries remain explicit. Lexical
+  substitution respects lets, lambdas, loop binders, raw-match patterns,
+  resource scopes, structured-concurrency binders, and select receive binders.
+  It also handles the compiled constructor-match subset that Core lowering
+  emits directly for `?=` and mapped `with` failures before the general match
+  compilation stage.
+  The fresh-name counter is explicit in expression and program results and is
+  threaded deterministically across sibling expressions and declarations.
+  A terminal assignment becomes a final immutable version binding whose body
+  is `VoidExpr`, so lowering cannot leave an assignment to the renamed source
+  binding. The rewriter explicitly enumerates every current Core expression
+  variant; forms introduced after SSA are named as such instead of disappearing
+  behind a wildcard.
+- The production boundary has moved contiguously through debug, desugar/SSA,
+  mono, post-mono list layout, and synthesis. Keep their retained OCaml
+  implementations isolated to bootstrap and direct compatibility entrypoints;
+  do not route normal source compilation through them again.
+- `compiler_core_mono.brp` now owns the first self-contained
+  monomorphization foundation:
+  - ordinary value types, scalar tensor dimensions, and variadic dimension
+    packs are separate variants, so dimensions cannot enter value-type
+    positions and scalar dimensions cannot be mistaken for packs;
+  - repeated type evidence must agree structurally, while callee-local identity
+    evidence is ignored so a later concrete binding remains possible;
+  - identity evidence is ownership-aware: a caller-owned rigid parameter with
+    the same spelling as a callee parameter remains explicit and open in either
+    evidence order, including scalar dimensions and variadic dimension packs;
+  - dimension parameters ignore erased ordinary value arguments and bind only
+    from dimension positions;
+  - a non-wildcard trailing variadic dimension captures its suffix even when it
+    is an implicit compiler-owned pack rather than a declared callee parameter;
+  - range refinements erase to `Int` when captured as value-type evidence;
+  - nested named, function, result, tensor, and tuple types collect and apply
+    substitutions;
+  - variadic tensor dimensions splice into concrete shapes;
+  - substitutions nested inside a variadic dimension pack are applied before
+    the pack is spliced, with active-pack tracking so direct and indirect
+    substitution cycles remain finite;
+  - concreteness is checked against the active caller's explicit unresolved
+    parameter set rather than guessed from uppercase identifiers;
+  - callee-owned parameters and active caller-owned rigid parameters are
+    separate inputs, and rigid caller evidence keeps a substitution open for a
+    later outer-specialization retry instead of creating a false closed
+    conflict;
+  - specialization names match OCaml's stable spelling: substitution keys are
+    sorted, Core tensors use the canonical `Array_` encoding, concrete
+    dimension arithmetic is reduced, and variadic packs retain a `Dims_`
+    prefix.
+  Recursive helpers keep managed substitution state in ordinary parameters or
+  loop locals; they do not capture it in callbacks under the pinned bootstrap.
+  Applying a managed type or dimension substitution deep-clones the stored Core
+  value before placing it in an owning output slot.
+- `compiler_core_mono_substitute.brp` now applies that substitution
+  exhaustively across the current Core tree:
+  - the shared Core traversal owns a one-pass children-and-type-slots mode, so
+    a node is reconstructed once instead of rebuilding managed lambda, match,
+    task, or handoff fields in a second pass;
+  - ordinary passes select no type mapper, represented directly as `None`;
+    monomorphization supplies `apply_type_substitution` explicitly, avoiding
+    the pinned bootstrap's invalid code generation for a generic identity
+    function value;
+  - all expression result types and embedded box, binder, resource, tailrec,
+    handoff, closure, task, concurrent, select, and compiled-match type slots
+    are rewritten;
+  - function signatures and closure ABIs, globals, union and record fields,
+    aliases, traits, and impl methods are rewritten at declaration level;
+  - normal and sanitizer regressions use complete Core JSON comparisons so the
+    tests do not consume a managed subfield and then reuse its owning record.
+  - declaration substitution is intentionally the widest public API. A
+    program-wide name substitution is unsound because unrelated declarations
+    can independently own the same type-parameter spelling;
+  - expression-bearing declaration fields are computed after signatures and
+    metadata, so a temporary managed substitution remains live without relying
+    on record-update evaluation order;
+  - child-only traversal preserves parameter, capture, accessor, binder, and
+    match-binding metadata directly when no type mapper is present, avoiding
+    ownership-sensitive reconstruction and allocation in existing passes;
+  - focused sanitizer coverage includes closure creation,
+    concurrent/select/task metadata, resource scopes, tail-recursive
+    list-spread metadata, and nested constructor length/literal matches.
+  The discarded two-step prototype failed sanitizer ownership checks because
+  it reconstructed managed nodes once for children and again for type slots.
+  The one-pass traversal is the supported pattern for later metadata-rewriting
+  passes.
+  These modules now own the production `mono` pipeline stage.
+- `compiler_core_mono_specialize.brp` now owns the authoritative-ID function
+  specialization slice:
+  - only `SelectedDirectCall` sites are eligible; artifact-local definition-ID
+    collisions are filtered by explicit callee identity and structural
+    signature, and only multiple remaining candidates are ambiguous;
+  - a generic-aware structural signature guard rejects stale IDs and
+    conflicting argument/return evidence before collecting substitutions;
+  - unresolved caller parameters remain explicit, preventing calls inside an
+    unspecialized generic body from being materialized prematurely;
+  - requests are deduplicated by stable mangled name and drained to a fixpoint,
+    so calls made concrete by an outer specialization enqueue their own
+    specialization;
+  - recursive self-calls are renamed and have their stale selected IDs cleared
+    before the specialized body is rescanned, preventing an infinite worklist;
+    both definition ID and source identity must agree, so a colliding or stale
+    selected ID cannot redirect an unrelated call;
+  - call arguments receive the same concrete substitution as the callee and
+    result, covering argument types inferred from return evidence;
+  - the structural tensor guard accepts symbolic dimension operations that
+    become static from evidence elsewhere and trailing compiler-owned or
+    wildcard dimension packs; substitution collection remains the source of
+    truth for whether the resulting request is concrete;
+  - substitution and call rewriting use iterative traversal for right-associated
+    `SeqExpr` spines, with a 2,048-node regression protecting the compiler
+    stack;
+  - generated definition IDs are explicit input/output state rather than a
+    hidden global counter;
+  - normal and sanitizer tests cover direct, transitive, recursive,
+    conflicting, ambiguous, and imported selected-call behavior.
+  Imported user calls do not require a second name-resolution system in
+  monomorphization. Typechecking already records their callable ID, owning
+  module, and source name. Core lowering now preserves that ID as
+  `SelectedDirectCall` and uses the shared `compiler_core_identity.brp` policy
+  to give both selective-import name callees and qualified module-field callees
+  the same explicit UFCS identity. The module flattener uses that policy for
+  declaration names and atomically remaps the selected-call kind, callee
+  variable, and closure IDs when a forward declaration is replaced by its
+  body, including the Blorp-lowered shape where the callee variable initially
+  has no ID. Because callable IDs are local to frontend artifacts,
+  specialization filters merged candidates by selected ID, explicit source
+  identity, and structural signature before rejecting a genuine ambiguity.
+  UFCS source names are decoded relative to each candidate's exact encoded
+  module prefix, so `__` remains legal in both module segments and source
+  function names. Ordinary and purity-overload declaration names are derived
+  by shared forward-naming helpers; semantic identity is not recovered by
+  stripping a generated suffix.
+  Reconstructing bare or qualified import lookup inside Blorp mono would
+  duplicate earlier resolver state and is not part of the plan.
+- `compiler_core_mono_data.brp` now owns generic record and union
+  specialization:
+  - value-record, heap-record, and non-enum union templates are represented as
+    distinct variants; concrete applications require exact arity and explicit
+    absence of parameters owned by the active declaration;
+  - global ABI declarations such as `Option` and `Result` are excluded through
+    the same explicit ABI-name inventory used by type naming and flattening;
+  - concrete names preserve source argument order. Simple atomic arguments
+    retain readable names, while underscores and nested/non-atomic arguments
+    use escaped, framed structural encodings so distinct applications cannot
+    silently collapse to one request;
+  - transparent aliases are expanded with exact-arity substitution and
+    direct/mutual-cycle protection before template matching. Opaque aliases
+    remain nominal and are not expanded;
+  - request discovery uses declaration-owned types plus every expression
+    result type through `immediate_core_expr_children`, the same canonical type
+    roots used by valid pre-mono Core reachability; metadata-only slots at this
+    boundary are derived from those roots rather than independent type uses;
+  - the existing exhaustive children-and-type-slots mapper rewrites result
+    types and metadata-only types in one ownership-safe reconstruction;
+  - generated declarations are drained to a fixed point, deduplicated by
+    concrete name, dependency-ordered before their parents for C declaration
+    validity, and terminate for direct recursive heap layouts while still
+    materializing nested generic layouts;
+  - specialized heap-record and union fields recompute release policy after
+    substitution. A concrete-name request retains its value/heap/union template
+    kind explicitly, so nested specialized heap records and unions remain
+    managed instead of falling through ordinary unknown-name policy;
+  - ordinary concrete unions select typed payload storage, while the explicit
+    runtime `RecvAttempt` ABI family retains erased payload storage;
+  - variant definition IDs, C names, and tag names are regenerated from an
+    explicit `next_def_id` input/output rather than hidden process state.
+  Core lowering now preserves a generic union field's semantic parameter type
+  even when its physical payload storage is erased; replacing that type with
+  `Any` destroyed the evidence needed by mono. The physical ABI policy is
+  centralized in `compiler_type_name_metadata.brp`; common Core result/release
+  classification now lives in `compiler_core_type_policy.brp`, which lowering,
+  mono, closure ownership, and emission share without an early-stage dependency
+  on a backend renderer module.
+  `compiler_core_monomorphize.brp` composes selected-function and generic-impl
+  specialization to a shared fixpoint before generic-data specialization:
+  generated functions can expose trait demands, and generated impl methods can
+  expose selected generic-function calls. Focused normal and sanitizer tests
+  cover value and heap records, typed and runtime-erased unions, nested and
+  recursive layouts, local expression-only uses, unresolved generic scopes,
+  and the function-to-data handoff.
+- `compiler_core_mono_impl.brp` now owns demand-driven generic trait-impl
+  specialization:
+  - unresolved calls carry `DeferredTraitCall(trait_name, method_name)` through
+    lowering and Core JSON instead of losing trait identity in an unknown call;
+    typechecker-selected calls carry
+    `SelectedTraitCall(trait_name, method_name, module_path, def_id)` so mono can
+    materialize the exact selected generic impl without reconstructing
+    typechecking;
+  - `compiler_core_trait_dispatch.brp` is the single canonical mapping from
+    Core binary operators, unary negation, and `blorp_to_string` to their
+    source trait and method identities;
+  - impl-owned type parameters and normalized trait bounds are preserved from
+    typed declarations through Core lowering and JSON; transparent aliases in
+    impl receiver types are canonicalized at the typed-AST boundary, and bounds
+    are not reconstructed from method signatures;
+  - demands use exact trait, method, and receiver type, reject unresolved
+    caller parameters, fail closed on ambiguous templates, and deduplicate
+    against both queued requests and existing concrete impls;
+  - zero-argument static trait methods use their result type as the receiver;
+  - bound impls and demands found in newly specialized impl bodies are drained
+    to a fixed point;
+  - specialized methods receive fresh definition IDs, and selected direct or
+    selected trait calls plus variable references among those methods are
+    rewritten together. Rewrites require the original ID and explicit
+    name/module identity so a colliding imported callable ID cannot be
+    redirected;
+  - impl-owned type parameters are removed after substitution while
+    method-local generic parameters remain on the specialized method;
+  - generic templates remain in Core while concrete impls are appended, as in
+    the OCaml implementation.
+  The current OCaml handoff validates both explicit trait-call payloads. It
+  preserves a selected call as `CKSelectedDirect def_id`, while a deferred call
+  becomes `CKUnknown` because OCaml trait resolution still owns production
+  dispatch. Removing only that deferred-call downgrade belongs to the later
+  trait-resolution boundary move, not monomorphization.
+- `compiler_core_mono_option.brp` now owns expression-local fusion of the exact
+  selected `std/option` helpers `is_some`, `is_none`, `get_or`, and
+  `get_or_else`:
+  - strict option/default expressions are each bound and evaluated once in
+    source order; a lazy default function is bound once and called only in the
+    `None` arm;
+  - each declaration owner builds a deterministic call-site plan keyed by
+    selected definition ID and full source span. A unique site receives an
+    owner-local generated identity, while duplicate or synthetic-identical
+    sites fail closed to ordinary generic specialization;
+  - same-named non-std functions are never fused, and unsupported arity or
+    carrier shapes retain the ordinary specialization path;
+  - the implementation avoids fixed-length managed-list destructuring because
+    the pinned self-hosted bootstrap miscompiles that ownership pattern; indexed
+    retrieval with `?=` preserves the same invariant safely;
+  - focused normal and sanitizer tests cover strict, lazy, presence,
+    non-std-identity, duplicate-site fallback, ambiguous impls, method-local
+    type parameters, selected impl identity, and colliding callable IDs.
+- `compiler_core_monomorphize.brp` now exposes the complete checked
+  monomorphization entrypoint. After specialization reaches its fixpoint it
+  validates selected generic identities without reconstructing imports:
+  - conflicting closed evidence reports the same mono-stage error and guidance
+    as OCaml;
+  - a selected generic call left in a monomorphic function, global initializer,
+    or concrete impl method reports a cannot-infer diagnostic at the call site;
+  - unresolved calls in generic owners remain valid until their outer
+    specialization supplies concrete evidence;
+  - focused sanitizer tests cover both failures and both negative controls.
+  Monomorphization behavior is parity-complete and production-authoritative.
+- `compiler_core_early_invariants.brp` owns the early invariant contracts
+  before the post-mono boundary:
+  - post-debug Core cannot retain `DebugBlockExpr`;
+  - post-desugar Core cannot retain string-operator sugar or mutable locals
+    that SSA owns;
+  - post-mono Core cannot retain unresolved user-call argument/return types or
+    box/unbox annotations in monomorphic functions, globals, or concrete impl
+    methods;
+  - generic function and impl-method templates are excluded from the post-mono
+    leak check, matching the checked monomorphization entrypoint rather than
+    treating deliberately open owner parameters as errors;
+  - invariant diagnostics carry stage, message, help, and source location.
+    Mutable `LetExpr` currently has no location field in Blorp Core, so those
+    two SSA-contract diagnostics use `SyntheticSourceLoc` instead of guessing
+    a child location.
+  The unresolved-type representation correction is complete:
+  - `CoreType` has distinct `TypeParameterType(String)` and `SelfType`
+    variants, so a one-letter nominal type and a multi-character parameter no
+    longer depend on spelling conventions;
+  - Core lowering constructs those variants from `CompilerTypeVar` and
+    `CompilerSelfType`;
+  - Core JSON uses distinct `type_parameter` and `self` tags, and the
+    post-mono OCaml boundary decodes them back to `Ast.TyVar` and
+    `Ast.TySelf`;
+  - the remaining OCaml Core tail preserves that distinction through alias
+    substitution, monomorphization, impl keys, trait-dispatch heads,
+    Option/Result/ownership layout, and C type selection. Its obsolete
+    `Types.is_type_param_name` compatibility API is deleted; source-parser
+    normalization remains an earlier frontend concern until that code is
+    replaced;
+  - traversal, cloning, flattening, alias substitution, mono substitution and
+    equality, ownership/layout policy, DCE, prepare, Perceus, reuse, and
+    emission classify the variants explicitly;
+  - monomorphization binds only explicit parameter identities. Ordinary
+    `NamedType` values are always nominal, even when their name matches a
+    declaration's type-parameter spelling;
+  - post-mono invariants reject unresolved identities in user-call
+    arguments/returns and box/unbox layout annotations owned by monomorphic
+    functions, globals, and concrete impl methods, while allowing deliberately
+    open generic templates and specialization-owned builtin/closure types.
+  Focused tests cover multi-character parameters, `Self`, one-letter nominal
+  negative controls, Core JSON round trips, and the OCaml handoff.
+- `compiler_core_early_pipeline.brp` is the pure contiguous executor for
+  `lower` observation, debug lowering, desugar/SSA, monomorphization,
+  post-mono list-layout annotation, and synthesis. It owns explicit
+  `next_def_id` state, invariant-before-observation ordering, stage
+  observations/stops, and typed mono/invariant/synthesis failures. The
+  compile/run CLI calls this executor before constructing the schema-4
+  post-synthesis request. The semantic worker accepts only that phase and
+  starts at match. Early observations and stops are handled entirely in Blorp.
+  Observations use the canonical compact Core JSON projection, the same
+  representation used by Blorp-owned later stages. This intentionally unifies
+  Core snapshots rather than reproducing the temporary OCaml human-readable
+  printer.
+- Debug and desugar are no longer variants of the generic late-Core stage
+  dispatcher. Their only composed owner is the early executor, while their
+  individual pure transforms remain available to focused tests. This prevents
+  a caller from selecting a second valid-looking order for the same stages.
+- Add `run_core_pipeline` support for each later newly ported stage so tests can
   compare one Core JSON input against OCaml and Blorp outputs.
 - Keep public stage names stable: lower, debug, desugar, mono, synth, match,
   trait_resolve, resolve, std_inline, tailrec, fusion, specialize, dce.
@@ -2356,8 +2778,39 @@ Edge cases:
 - Debug blocks are retained only for debug/test paths.
 - Desugar and SSA must preserve mutable-local semantics without introducing
   shared mutable references.
-- Monomorphization must use selected callable ids, module import tables, type
-  aliases, dim constraints, and list layout facts.
+- Desugar must use the shared exhaustive traversal rather than maintaining a
+  second list of Core containers. `SeqExpr` traversal must remain iterative so
+  large generated statement blocks do not exhaust the compiler stack.
+- SSA sequence classification, bottom-up rewriting, and version-chain
+  construction must remain iterative over right-associated `SeqExpr` spines.
+  Substitution must use that same iterative sequence traversal even when a
+  sequence is nested below control flow.
+  The still-authoritative OCaml implementation mirrors this property for
+  `CSeq`; focused tests exercise 50,000-node assignment and nested-substitution
+  spines so production safety does not depend on completing the cutover.
+  Recursive rewrite state must stay in ordinary parameters rather than
+  captured closures until the pinned bootstrap's managed-capture lifetime bug
+  is no longer relevant.
+- Monomorphization must use selected callable IDs and explicit canonical
+  module-owned call identities. Import tables belong to typechecking and must
+  not be recreated as a fallback in Core. Type aliases, dimension constraints,
+  and list-layout facts must remain explicit inputs where their corresponding
+  mono behavior requires them.
+- Core's type model deliberately separates tensor dimensions from value types,
+  unlike the OCaml AST type model. Do not recreate the OCaml representation by
+  encoding dimensions as magic `NamedType` values.
+- The current bootstrap cannot emit derived equality for a union containing a
+  managed list (`blorp_list_eq`). Monomorphization therefore uses explicit
+  structural equality for Core types, dimensions, and substitution values.
+  Remove this local workaround only when a shared Core type-comparison module
+  replaces the existing copies in reuse and consume-specialize.
+- A first generic full-tree type-mapper prototype typechecked but failed its
+  sanitizer test while rebuilding a lambda's managed parameter list. Do not
+  land that abstraction based on typechecking alone. The next tree-substitution
+  slice must keep substitution state explicit, avoid sharing managed
+  replacements across owning slots, and pass focused lambda, compiled-match,
+  declaration-family, and sanitizer coverage before it becomes shared
+  infrastructure.
 - Match compilation must preserve pattern semantics, fallbacks, and source
   locations for diagnostics.
 - Trait resolve must handle direct functions, UFCS, imported functions,
@@ -2377,7 +2830,8 @@ Tests:
   - `compiler/test/test_core_desugar.ml`
   - `compiler/test/test_core_ssa.ml`
   - `compiler/test/test_core_mono.ml`
-  - `compiler/test/test_core_synth.ml`
+  - `compiler/test/test_core_intrinsics.ml` (there has never been a dedicated
+    `test_core_synth.ml`; synthesis behavior lives in the intrinsic suite)
   - `compiler/test/test_core_match.ml`
   - `compiler/test/test_core_trait_resolve.ml`
   - `compiler/test/test_core_resolve.ml`
@@ -2389,11 +2843,21 @@ Tests:
   - `compiler/test/test_core_tensor_type.ml`
   - `compiler/test/test_core_tuple_sroa.ml`
   - `compiler/test/test_core_specialize.ml`
-- Add missing focused coverage for `Core_debug.lower_program` when that slice
-  ports.
+- Focused Blorp coverage for `Core_debug.lower_program` must remain aligned
+  with the OCaml normal/debug build behavior until the boundary moves.
+- `compiler/blorp/tests/test_compiler_core_debug.brp`
+- `compiler/blorp/tests/test_compiler_core_ssa.brp`
+  - covers terminal assignments, lexical shadowing, compiled constructor-match
+    bodies, deterministic program-wide names, and both top-level and nested
+    2,048-item sequence spines
 - `tests/test_compiler/codegen_audit/should_pass/core_dce_*.brp`
 - Blorp stage parity tests under `compiler/blorp/tests`.
 - `compiler/blorp/tests/test_compiler_core_desugar.brp`
+- `compiler/blorp/tests/test_compiler_core_synth_tensor.brp`
+- `compiler/blorp/tests/test_compiler_core_synth_float.brp`
+- `compiler/blorp/tests/test_compiler_core_synth_forward.brp`
+- `compiler/blorp/tests/test_compiler_core_synth_fixed.brp`
+- `compiler/blorp/tests/test_compiler_core_synth_slice.brp`
 - `compiler/blorp/tests/test_compiler_core_dce.brp`
 - `tests/test_compiler/codegen_audit/should_pass/blorp_backend_dce.brp`
 

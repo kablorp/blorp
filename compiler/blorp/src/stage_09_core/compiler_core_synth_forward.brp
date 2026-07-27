@@ -1,0 +1,508 @@
+-- Core body synthesis for std builtins that are thin runtime forwards.
+--
+-- Blorp lowering already materializes declarations whose builtin target is an
+-- explicit `blorp_*` symbol. This module therefore contains only declarations
+-- whose source target remains `std/...` through monomorphization and whose
+-- implementation is intentionally one runtime or intrinsic call.
+import:
+	compiler_core_json:
+		CoreCallKind(BuiltinCall, IntrinsicCall),
+		CoreExpr(CallExpr, LiteralExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, TensorType, VoidType),
+	compiler_core_synth_name: is_synthesis_candidate, synthesis_source_name
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+
+private union ForwardTarget:
+	RuntimeForward(String)
+	RuntimeForwardWithTrailingInt(String, Int)
+	IntrinsicForward(String)
+
+
+private pure func type_is_named(typ: CoreType, expected: String) -> Bool:
+	match typ:
+		NamedType(name, _):
+			name == expected
+		VoidType:
+			expected == "Void"
+		_:
+			False
+
+
+private pure func type_is_option_of_named(typ: CoreType, expected: String) -> Bool:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[inner]:
+					name == "Option" and type_is_named(inner, expected)
+				_:
+					False
+		_:
+			False
+
+
+private pure func type_is_function(typ: CoreType) -> Bool:
+	match typ:
+		FunctionType(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func type_is_tensor(typ: CoreType) -> Bool:
+	match typ:
+		TensorType(_):
+			True
+		_:
+			False
+
+
+private pure func param_is_named(params: List[CoreParam], index: Int, expected: String) -> Bool:
+	match params.get(index):
+		Some(param):
+			type_is_named(param.typ, expected)
+		None:
+			False
+
+
+private pure func param_is_function(params: List[CoreParam], index: Int) -> Bool:
+	match params.get(index):
+		Some(param):
+			type_is_function(param.typ)
+		None:
+			False
+
+
+private pure func param_is_tensor(params: List[CoreParam], index: Int) -> Bool:
+	match params.get(index):
+		Some(param):
+			type_is_tensor(param.typ)
+		None:
+			False
+
+
+private pure func bytes_target(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if (
+		name == "from_hex"
+		and params.length() == 1
+		and param_is_named(params, 0, "String")
+		and type_is_option_of_named(return_type, "Bytes")
+	):
+		Some(RuntimeForward("blorp_bytes_from_hex"))
+	else if (
+		name == "encode_utf8"
+		and params.length() == 1
+		and param_is_named(params, 0, "List")
+		and type_is_named(return_type, "Bytes")
+	):
+		Some(RuntimeForward("blorp_encode_utf8"))
+	else if (
+		name == "decode_utf8"
+		and params.length() == 1
+		and param_is_named(params, 0, "Bytes")
+		and type_is_option_of_named(return_type, "List")
+	):
+		Some(RuntimeForward("blorp_decode_utf8"))
+	else:
+		None
+
+
+private pure func fixed_target(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if (
+		name == "fixed"
+		and params.length() == 2
+		and param_is_named(params, 0, "Float")
+		and param_is_named(params, 1, "Int")
+		and type_is_named(return_type, "Fixed")
+	):
+		Some(RuntimeForwardWithTrailingInt("blorp_fixed_new", 18))
+	else if (
+		name == "with_precision"
+		and params.length() == 3
+		and param_is_named(params, 0, "Float")
+		and param_is_named(params, 1, "Int")
+		and param_is_named(params, 2, "Int")
+		and type_is_named(return_type, "Fixed")
+	):
+		Some(RuntimeForward("blorp_fixed_new"))
+	else if (
+		name == "from_int"
+		and params.length() == 2
+		and param_is_named(params, 0, "Int")
+		and param_is_named(params, 1, "Int")
+		and type_is_named(return_type, "Fixed")
+	):
+		Some(RuntimeForwardWithTrailingInt("blorp_fixed_from_int", 18))
+	else if (
+		name == "to_string"
+		and params.length() == 1
+		and param_is_named(params, 0, "Fixed")
+		and type_is_named(return_type, "String")
+	):
+		Some(RuntimeForward("blorp_fixed_to_string"))
+	else if (
+		name == "to_float"
+		and params.length() == 1
+		and param_is_named(params, 0, "Fixed")
+		and type_is_named(return_type, "Float")
+	):
+		Some(RuntimeForward("blorp_fixed_to_float"))
+	else:
+		None
+
+
+private pure func stream_signature_matches(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Bool:
+	if name == "from_list":
+		(
+			params.length() == 1
+			and param_is_named(params, 0, "List")
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "from_range":
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Int")
+			and param_is_named(params, 1, "Int")
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "repeat":
+		params.length() == 1 and type_is_named(return_type, "Stream")
+	else if name == "unfold":
+		(
+			params.length() == 2
+			and param_is_function(params, 1)
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "empty":
+		params.is_empty() and type_is_named(return_type, "Stream")
+	else if (
+		name == "map"
+		or name == "filter"
+		or name == "filter_map"
+		or name == "take_while"
+	):
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Stream")
+			and param_is_function(params, 1)
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "take" or name == "drop":
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Stream")
+			and param_is_named(params, 1, "Int")
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "enumerate":
+		(
+			params.length() == 1
+			and param_is_named(params, 0, "Stream")
+			and type_is_named(return_type, "Stream")
+		)
+	else if name == "collect":
+		(
+			params.length() == 1
+			and param_is_named(params, 0, "Stream")
+			and type_is_named(return_type, "List")
+		)
+	else if name == "fold":
+		(
+			params.length() == 3
+			and param_is_named(params, 0, "Stream")
+			and param_is_function(params, 2)
+		)
+	else if name == "count":
+		(
+			params.length() == 1
+			and param_is_named(params, 0, "Stream")
+			and type_is_named(return_type, "Int")
+		)
+	else if name == "for_each":
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Stream")
+			and param_is_function(params, 1)
+			and type_is_named(return_type, "Void")
+		)
+	else if name == "find":
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Stream")
+			and param_is_function(params, 1)
+			and type_is_named(return_type, "Option")
+		)
+	else if name == "any" or name == "all":
+		(
+			params.length() == 2
+			and param_is_named(params, 0, "Stream")
+			and param_is_function(params, 1)
+			and type_is_named(return_type, "Bool")
+		)
+	else:
+		False
+
+
+private pure func stream_target(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if stream_signature_matches(name, params, return_type):
+		Some(RuntimeForward("blorp_stream_" + name))
+	else:
+		None
+
+
+private pure func tensor_target(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if (
+		name == "vector"
+		and params.length() == 2
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_vector_new_fill"))
+	else if (
+		name == "matrix"
+		and params.length() == 3
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_matrix_new_fill"))
+	else if (
+		name == "tensor3"
+		and params.length() == 4
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor3_new"))
+	else if (
+		name == "tensor4"
+		and params.length() == 5
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor4_new"))
+	else if (
+		name == "tensor5"
+		and params.length() == 6
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor5_new"))
+	else if (
+		name == "checked_get"
+		and params.length() == 2
+		and param_is_tensor(params, 0)
+	):
+		Some(RuntimeForward("blorp_checked_get"))
+	else if (
+		name == "checked_set"
+		and params.length() == 3
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_checked_set"))
+	else if (
+		name == "checked_slice"
+		and params.length() == 3
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_checked_slice"))
+	else if (
+		name == "matrix_checked_get"
+		and params.length() == 3
+		and param_is_tensor(params, 0)
+	):
+		Some(RuntimeForward("blorp_matrix_checked_get"))
+	else if (
+		name == "matrix_checked_set"
+		and params.length() == 4
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_matrix_checked_set"))
+	else if (
+		name == "tensor3_checked_get"
+		and params.length() == 4
+		and param_is_tensor(params, 0)
+	):
+		Some(RuntimeForward("blorp_tensor3_checked_get"))
+	else if (
+		name == "tensor3_checked_set"
+		and params.length() == 5
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor3_checked_set"))
+	else if (
+		name == "tensor4_checked_get"
+		and params.length() == 5
+		and param_is_tensor(params, 0)
+	):
+		Some(RuntimeForward("blorp_tensor4_checked_get"))
+	else if (
+		name == "tensor4_checked_set"
+		and params.length() == 6
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor4_checked_set"))
+	else if (
+		name == "tensor5_checked_get"
+		and params.length() == 6
+		and param_is_tensor(params, 0)
+	):
+		Some(RuntimeForward("blorp_tensor5_checked_get"))
+	else if (
+		name == "tensor5_checked_set"
+		and params.length() == 7
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor5_checked_set"))
+	else if (
+		name == "length"
+		and params.length() == 1
+		and param_is_tensor(params, 0)
+		and type_is_named(return_type, "Int")
+	):
+		Some(IntrinsicForward("tensor_len"))
+	else:
+		None
+
+
+private pure func matrix_target(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if (
+		name == "multiply"
+		and params.length() == 2
+		and param_is_tensor(params, 0)
+		and param_is_tensor(params, 1)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor_matrix_multiply"))
+	else if (
+		name == "transpose"
+		and params.length() == 1
+		and param_is_tensor(params, 0)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor_transpose"))
+	else if (
+		name == "multiply_vector"
+		and params.length() == 2
+		and param_is_tensor(params, 0)
+		and param_is_tensor(params, 1)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor_matrix_vector_multiply"))
+	else if (
+		name == "multiply_transposed_vector"
+		and params.length() == 2
+		and param_is_tensor(params, 0)
+		and param_is_tensor(params, 1)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor_transposed_matrix_vector_multiply"))
+	else if (
+		name == "outer"
+		and params.length() == 2
+		and param_is_tensor(params, 0)
+		and param_is_tensor(params, 1)
+		and type_is_tensor(return_type)
+	):
+		Some(RuntimeForward("blorp_tensor_outer"))
+	else:
+		None
+
+
+private pure func target_for(
+	module_name: String,
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[ForwardTarget]:
+	if module_name == "std/bytes":
+		bytes_target(name, params, return_type)
+	else if module_name == "std/fixed":
+		fixed_target(name, params, return_type)
+	else if module_name == "std/stream":
+		stream_target(name, params, return_type)
+	else if module_name == "std/tensor":
+		tensor_target(name, params, return_type)
+	else if module_name == "std/matrix":
+		matrix_target(name, params, return_type)
+	else:
+		None
+
+
+private pure func param_exprs(params: List[CoreParam]) -> List[CoreExpr]:
+	params.map(func(param):
+		VarExpr(param.name, param.typ, SyntheticSourceLoc)
+	)
+
+
+private pure func call_body(
+	target: ForwardTarget,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreExpr:
+	args: List[CoreExpr] = param_exprs(params)
+
+	match target:
+		RuntimeForward(name):
+			CallExpr(
+				BuiltinCall(name),
+				VoidExpr(VoidType, SyntheticSourceLoc),
+				args,
+				return_type,
+				SyntheticSourceLoc,
+			)
+		RuntimeForwardWithTrailingInt(name, value):
+			CallExpr(
+				BuiltinCall(name),
+				VoidExpr(VoidType, SyntheticSourceLoc),
+				args.append(LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)),
+				return_type,
+				SyntheticSourceLoc,
+			)
+		IntrinsicForward(name):
+			CallExpr(
+				IntrinsicCall(name),
+				VoidExpr(VoidType, SyntheticSourceLoc),
+				args,
+				return_type,
+				SyntheticSourceLoc,
+			)
+
+
+pure func synthesize_forward_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	if not is_synthesis_candidate(function_info):
+		None
+	else:
+		module_name ?= function_info.source_module
+		name ?= synthesis_source_name(function_info)
+		target ?= target_for(module_name, name, function_info.params, function_info.return_type)
+		Some(call_body(target, function_info.params, function_info.return_type))

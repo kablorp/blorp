@@ -1119,7 +1119,7 @@ func inspect[T](x: T):
 |}
       in
       let typed, errors = parse_and_typecheck_module src in
-      check_int "no type errors" 0 (List.length errors);
+      check_no_type_errors errors;
       require_call_payload typed "inspect" "type_name" ty_string;
       ignore (require_direct_resolved_call typed "inspect" "type_name");
       require_call_payload typed "inspect" "is_heap" ty_bool;

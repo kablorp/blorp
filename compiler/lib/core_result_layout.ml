@@ -35,8 +35,7 @@ let rec contains_generic_type = function
   | Ast.TyVar name -> not (Types.Dim.is_var_name name)
   | Ast.TyBoundVar _ -> true
   | Ast.TySelf | Ast.TyVarDims _ | Ast.TyMeta _ -> true
-  | Ast.TyNamed (name, args) ->
-      Types.is_type_param_name name || List.exists contains_generic_type args
+  | Ast.TyNamed (_, args) -> List.exists contains_generic_type args
   | Ast.TyArray (elem, dims) ->
       contains_generic_type elem || List.exists contains_generic_type dims
   | Ast.TyTuple elems -> List.exists contains_generic_type elems

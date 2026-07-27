@@ -199,7 +199,11 @@ import:
 		CompilerTypedUnionVariantInfo,
 		compiler_typed_foreign_arg_passing_borrows,
 		compiler_typed_foreign_link_platform_to_string,
-	../stage_09_core/compiler_core_clone: clone_core_source_loc, clone_core_type, clone_core_var
+	../stage_09_core/compiler_core_clone:
+		clone_core_accessor,
+		clone_core_source_loc,
+		clone_core_type,
+		clone_core_var,
 	../stage_09_core/compiler_core_json:
 		CoreAccessor(
 			BoxedResultErrPayloadAccessor,
@@ -235,7 +239,14 @@ import:
 			VoidBox,
 		),
 		CoreBoxedStorageValue,
-		CoreCallKind(BuiltinCall, IntrinsicCall, SelectedDirectCall, UnknownCall),
+		CoreCallKind(
+			BuiltinCall,
+			DeferredTraitCall,
+			IntrinsicCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			UnknownCall,
+		),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
 		CoreConcurrentlyLoopMoveResourceItem,
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
@@ -381,24 +392,29 @@ import:
 			FunctionType,
 			NamedType,
 			RangeType,
+			SelfType,
 			StackResultType,
 			TensorType,
 			TupleType,
+			TypeParameterType,
 			UnionType,
 			ValueRecordType,
 			VoidType,
 		),
+		CoreTypeParam,
 		CoreUnaryOp(NegateOp, NotOp),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionVariant,
 		CoreValueRecordField,
 		CoreVar,
+	../stage_09_core/compiler_core_type_policy as CoreTypePolicy
 	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
-	compiler_core_identity: flatten_canonical_core_type_name, sanitize_core_module_name
+	compiler_core_identity:
+		core_ufcs_function_name,
+		flatten_canonical_core_type_name,
+		is_core_ufcs_function_name,
 
-
-private UFCS_PREFIX: String = "__ufcs_"
 
 private CALLABLE_ID_SEPARATOR: String = "#"
 
@@ -407,6 +423,14 @@ private CORE_INT_MAX_DECIMAL: String = "9223372036854775807"
 private CORE_INT_MIN_MAGNITUDE_DECIMAL: String = "9223372036854775808"
 
 private MICROSECONDS_PER_MILLISECOND: Int = 1000
+
+private PARALLEL_VECTOR_TYPE_NAME: String = "ParallelVector"
+
+private CANONICAL_PARALLEL_VECTOR_TYPE_NAME: String = "std/vector::ParallelVector"
+
+private PARALLEL_MATRIX_TYPE_NAME: String = "ParallelMatrix"
+
+private CANONICAL_PARALLEL_MATRIX_TYPE_NAME: String = "std/matrix::ParallelMatrix"
 
 
 union CompilerCoreLowerError:
@@ -538,7 +562,7 @@ private pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
 
 
 private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
-	if name.starts_with(UFCS_PREFIX):
+	if is_core_ufcs_function_name(name):
 		hash_index: Int = name.raw_index_of(CALLABLE_ID_SEPARATOR)
 
 		if hash_index < 0:
@@ -556,15 +580,14 @@ private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
 		(name, None)
 
 
-private pure func trait_method_target_name(module_path: String, source_name: String) -> String:
-	UFCS_PREFIX + module_path.replace("/", "$") + "__" + source_name
-
-
-private pure func imported_callable_target_name(
-	module_path: String,
-	source_name: String,
-) -> String:
-	sanitize_core_module_name(module_path) + "__" + source_name
+private pure func resolved_call_explicit_name(resolved: CompilerResolvedCallInfo) -> Option[String]:
+	match resolved.target:
+		CompilerResolvedTraitMethodCall(_, Some(target)):
+			Some(core_ufcs_function_name(target.module_path, resolved.source_name))
+		CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
+			Some(core_ufcs_function_name(module_path, resolved.source_name))
+		_:
+			None
 
 
 private pure func lowered_name_expr_name(
@@ -573,54 +596,84 @@ private pure func lowered_name_expr_name(
 ) -> String:
 	match info.resolved_call:
 		Some(resolved):
-			match resolved.target:
-				CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
-					imported_callable_target_name(module_path, resolved.source_name)
-				CompilerResolvedTraitMethodCall(_, Some(target)):
-					trait_method_target_name(target.module_path, resolved.source_name)
-				_:
-					name.text
+			resolved_call_explicit_name(resolved).get_or(name.text)
 		None:
 			name.text
 
 
-private pure func lowered_name_expr_callable_id(info: CompilerTypedExprInfo) -> Option[Int]:
-	match info.resolved_call:
-		Some(resolved):
-			match resolved.target:
-				CompilerResolvedDirectCall(callable_id, CompilerCallableLocal):
+private pure func resolved_core_decl_callable_id(resolved: CompilerResolvedCallInfo) -> Option[Int]:
+	match resolved.target:
+		CompilerResolvedDirectCall(callable_id, origin):
+			match origin:
+				CompilerCallableLocal:
 					Some(callable_id)
-				CompilerResolvedDirectCall(callable_id, CompilerCallableImported(_)):
+				CompilerCallableImported(_):
+					Some(callable_id)
+				CompilerCallableImplMethod:
 					Some(callable_id)
 				_:
 					None
-		None:
+		CompilerResolvedTraitMethodCall(_, impl_target):
+			match impl_target:
+				Some(target):
+					Some(target.callable_id)
+				None:
+					None
+		_:
 			None
 
 
-private pure func lowered_name_expr_var(
+private pure func lower_name_expr_identity(
 	name: ParsedIdentifier,
 	info: CompilerTypedExprInfo,
-) -> Result[CoreVar, CompilerCoreLowerError]:
-	(clean_name, encoded_def_id) = split_var_callable_id(lowered_name_expr_name(name, info))
-	resolved_def_id: Option[Int] = lowered_name_expr_callable_id(info)
+) -> Result[(String, Option[Int]), CompilerCoreLowerError]:
+	(clean_name, encoded_id) = split_var_callable_id(lowered_name_expr_name(name, info))
 
-	match (encoded_def_id, resolved_def_id):
+	resolved_id: Option[Int] = match info.resolved_call:
+		Some(resolved):
+			resolved_core_decl_callable_id(resolved)
+		None:
+			None
+
+	match (encoded_id, resolved_id):
 		(Some(encoded), Some(resolved)):
 			if encoded == resolved:
-				Ok(core_var(clean_name, Some(resolved)))
+				Ok((clean_name, encoded_id))
 			else:
 				Err(
 					CompilerCoreLowerInvalidCall(
-						"conflicting callable ids for " + clean_name + ": name carried " + encoded.to_string() + " but resolved_call carried " + resolved.to_string(),
+						"conflicting callable ids for ${name.text}: name carried ${encoded} but resolved_call carried ${resolved}",
 					),
 				)
-		(None, Some(resolved)):
-			Ok(core_var(clean_name, Some(resolved)))
-		(Some(encoded), None):
-			Ok(core_var(clean_name, Some(encoded)))
-		(None, None):
-			Ok(core_var(clean_name, None))
+		(Some(_), None):
+			Ok((clean_name, encoded_id))
+		(None, _):
+			Ok((clean_name, resolved_id))
+
+
+private pure func apply_resolved_callee_identity(
+	resolved: Option[CompilerResolvedCallInfo],
+	callee: CoreExpr,
+) -> CoreExpr:
+	match resolved:
+		Some(info):
+			match resolved_call_explicit_name(info):
+				Some(name):
+					match callee:
+						VarExpr(variable, typ, loc):
+							VarExpr({ variable | name = name }, typ, loc)
+						FieldExpr(_, _, typ, loc):
+							VarExpr(
+								core_var(name, None),
+								typ,
+								loc,
+							)
+						_:
+							callee
+				None:
+					callee
+		None:
+			callee
 
 
 private pure func compiler_core_dim_op(op: CompilerDimOp) -> CoreDimOp:
@@ -701,6 +754,32 @@ private pure func compiler_core_lower_type_list(
 			Ok(lowered)
 
 
+private pure func compiler_core_lower_tensor_type(
+	element: CompilerType,
+	dims: List[CompilerType],
+) -> Result[CoreType, CompilerCoreLowerError]:
+	element_type ?= compiler_core_lower_type(element)
+	core_dims ?= compiler_core_tensor_dims(dims)
+
+	Ok(TensorType({
+		element_type = element_type,
+		dims = core_dims,
+	}))
+
+
+private pure func malformed_parallel_tensor_type(
+	typ: CompilerType,
+	expected: String,
+) -> Result[CoreType, CompilerCoreLowerError]:
+	Err(
+		CompilerCoreLowerInvalidType(
+			"scoped parallel tensor type " + compiler_type_to_string(
+				typ,
+			) + " must have " + expected,
+			),
+		)
+
+
 private pure func compiler_core_lower_value_type_list(
 	types: List[CompilerType],
 ) -> Result[List[CoreType], CompilerCoreLowerError]:
@@ -725,13 +804,7 @@ private pure func compiler_core_lower_value_type_list(
 pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, CompilerCoreLowerError]:
 	match compiler_array_type_parts(typ):
 		Some((element, dims)):
-			element_type ?= compiler_core_lower_type(element)
-			core_dims ?= compiler_core_tensor_dims(dims)
-
-			Ok(TensorType({
-				element_type = element_type,
-				dims = core_dims,
-			}))
+			compiler_core_lower_tensor_type(element, dims)
 		None:
 			match typ:
 				CompilerNamedType(name, args):
@@ -741,6 +814,33 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 
 					if normalized == TYPE_NAME_VOID and args.length() == 0:
 						Ok(VoidType)
+					else if (
+						name == PARALLEL_VECTOR_TYPE_NAME
+						or name == CANONICAL_PARALLEL_VECTOR_TYPE_NAME
+					):
+						match args:
+							[element, dim]:
+								compiler_core_lower_tensor_type(element, [dim])
+							_:
+								malformed_parallel_tensor_type(
+									typ,
+									"an element type and one dimension",
+								)
+					else if (
+						name == PARALLEL_MATRIX_TYPE_NAME
+						or name == CANONICAL_PARALLEL_MATRIX_TYPE_NAME
+					):
+						match args:
+							[element, rows, columns]:
+								compiler_core_lower_tensor_type(
+									element,
+									[rows, columns],
+								)
+							_:
+								malformed_parallel_tensor_type(
+									typ,
+									"an element type and two dimensions",
+								)
 					else if (
 						normalized == TYPE_NAME_TENSOR
 						or normalized == TYPE_NAME_VECTOR
@@ -754,17 +854,28 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 							),
 						)
 					else:
-						lowered_args ?= compiler_core_lower_value_type_list(args)
-						Ok(NamedType(normalized, lowered_args))
+						match compiler_core_lower_value_type_list(args):
+							Ok(lowered_args):
+								Ok(NamedType(normalized, lowered_args))
+							Err(CompilerCoreLowerInvalidType(message)):
+								Err(
+									CompilerCoreLowerInvalidType(
+										"type " + compiler_type_to_string(
+											typ,
+										) + " has an invalid argument: " + message,
+									),
+								)
+							Err(error):
+								Err(error)
 				CompilerTupleType(elements):
 					lowered_elements ?= compiler_core_lower_type_list(elements)
 					Ok(TupleType(lowered_elements))
 				CompilerRangeType(_):
 					Ok(RangeType)
 				CompilerTypeVar(name):
-					Ok(NamedType(name, []))
+					Ok(TypeParameterType(name))
 				CompilerSelfType:
-					Ok(NamedType("Self", []))
+					Ok(SelfType)
 				CompilerConstIntType(_):
 					Err(
 						CompilerCoreLowerInvalidType(
@@ -1004,28 +1115,28 @@ private pure func option_payload_accessor(payload_type: CoreType) -> CoreAccesso
 
 
 private pure func result_ok_test(carrier_type: CoreType) -> CoreConstructorMatchTest:
-	if TypeLayout.is_stack_result_type(carrier_type):
+	if CoreTypePolicy.is_stack_result_type(carrier_type):
 		StackResultOkConstructorTest("blorp_StackResult")
 	else:
 		BoxedResultOkConstructorTest
 
 
 private pure func result_err_test(carrier_type: CoreType) -> CoreConstructorMatchTest:
-	if TypeLayout.is_stack_result_type(carrier_type):
+	if CoreTypePolicy.is_stack_result_type(carrier_type):
 		StackResultErrConstructorTest("blorp_StackResult")
 	else:
 		BoxedResultErrConstructorTest
 
 
 private pure func result_ok_accessor(carrier_type: CoreType) -> CoreAccessor:
-	if TypeLayout.is_stack_result_type(carrier_type):
+	if CoreTypePolicy.is_stack_result_type(carrier_type):
 		StackResultOkPayloadAccessor(RootAccessor)
 	else:
 		BoxedResultOkPayloadAccessor(RootAccessor)
 
 
 private pure func result_err_accessor(carrier_type: CoreType) -> CoreAccessor:
-	if TypeLayout.is_stack_result_type(carrier_type):
+	if CoreTypePolicy.is_stack_result_type(carrier_type):
 		StackResultErrPayloadAccessor(RootAccessor)
 	else:
 		BoxedResultErrPayloadAccessor(RootAccessor)
@@ -2328,6 +2439,12 @@ private pure func lower_typed_lambda_params(
 						typ = param_type,
 						loc = compiler_core_source_loc(param.name.span),
 					})
+				Err(CompilerCoreLowerInvalidType(message)):
+					failure = Some(
+						CompilerCoreLowerInvalidType(
+							"lambda parameter `" + param.name.text + "` has an invalid type: " + message,
+						),
+					)
 				Err(error):
 					failure = Some(error)
 
@@ -2460,7 +2577,9 @@ private pure func lower_typed_for_parts(
 	Ok({
 		binder = lowered_binding.binder,
 		iterable = lowered_iterable,
-		iterable_release_policy = TypeLayout.cleanup_release_policy_for_type(iterable_core_type),
+		iterable_release_policy = CoreTypePolicy.cleanup_release_policy_for_type(
+			iterable_core_type,
+		),
 		body = lowered_binding.body,
 	})
 
@@ -3737,7 +3856,7 @@ private pure func lower_user_call_kind(
 				None:
 					Ok(SelectedDirectCall(callable_id))
 		_:
-			Ok(SelectedDirectCall(callable_id))
+			Ok(UnknownCall)
 
 
 private pure func lower_resolved_call_kind(
@@ -3761,12 +3880,19 @@ private pure func lower_resolved_call_kind(
 							lower_user_call_kind(info, callable_id, callee)
 						CompilerCallableForeign:
 							Ok(UnknownCall)
-				CompilerResolvedTraitMethodCall(_, impl_target):
+				CompilerResolvedTraitMethodCall(trait_name, impl_target):
 					match impl_target:
 						Some(target):
-							lower_user_call_kind(info, target.callable_id, callee)
+							Ok(
+								SelectedTraitCall(
+									trait_name,
+									info.callee_name,
+									target.module_path,
+									target.callable_id,
+								),
+							)
 						None:
-							Ok(UnknownCall)
+							Ok(DeferredTraitCall(trait_name, info.callee_name))
 				CompilerResolvedIntrinsicCall:
 					Ok(UnknownCall)
 				CompilerResolvedClosureCall:
@@ -3775,41 +3901,11 @@ private pure func lower_resolved_call_kind(
 			Ok(UnknownCall)
 
 
-private pure func lower_resolved_call_callee(
-	resolved: Option[CompilerResolvedCallInfo],
-	callee: CoreExpr,
-) -> CoreExpr:
-	match (resolved, callee):
-		(
-			Some(info),
-			VarExpr(variable, typ, loc),
-		):
-			match info.target:
-				CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
-					VarExpr(
-						{
-							variable |
-							name = trait_method_target_name(module_path, info.source_name)
-						},
-						typ,
-						loc,
-					)
-				_:
-					VarExpr(variable, typ, loc)
-		_:
-			callee
-
-
 private pure func lower_question_bind_success_type(
-	annotation: Option[CompilerType],
 	rhs_type: CoreType,
 ) -> Result[CoreType, CompilerCoreLowerError]:
-	match annotation:
-		Some(annotated_type):
-			compiler_core_lower_value_type(annotated_type)
-		None:
-			success_type ?= core_carrier_success_type(rhs_type)
-			Ok(clone_core_type(success_type))
+	success_type ?= core_carrier_success_type(rhs_type)
+	Ok(clone_core_type(success_type))
 
 
 private pure func lower_question_bind_success_case(
@@ -3836,7 +3932,7 @@ private pure func lower_question_bind_success_case(
 			{
 				variable = core_var(name.text, None),
 				typ = success_type,
-				accessor = accessor,
+				accessor = clone_core_accessor(accessor),
 				mode = MatchBorrowBindingMode
 			},
 		],
@@ -3886,7 +3982,7 @@ private pure func lower_question_bind_failure_case(
 							{
 								variable = clone_core_var(failure_var),
 								typ = clone_core_type(failure_type),
-								accessor = accessor,
+								accessor = clone_core_accessor(accessor),
 								mode = MatchBorrowBindingMode
 							},
 						],
@@ -3913,7 +4009,6 @@ private pure func lower_question_bind_failure_case(
 
 private pure func lower_typed_question_bind(
 	name: ParsedIdentifier,
-	annotation: Option[CompilerType],
 	rhs: CompilerTypedExpr,
 	span: CompilerSourceSpan,
 	rest: List[CompilerTypedExpr],
@@ -3939,7 +4034,7 @@ private pure func lower_typed_question_bind(
 				),
 			)
 		else:
-			success_type ?= lower_question_bind_success_type(annotation, clone_core_type(rhs_type))
+			success_type ?= lower_question_bind_success_type(clone_core_type(rhs_type))
 			success_body ?= lower_typed_block_expr(
 				rest,
 				clone_core_type(block_type),
@@ -3996,21 +4091,17 @@ private pure func with_resource_name(binding: CompilerTypedWithBinding) -> Strin
 
 
 private pure func with_resource_type(
-	binding: CompilerTypedWithBinding,
+	is_try: Bool,
 	acquisition_type: CoreType,
 ) -> Result[CoreType, CompilerCoreLowerError]:
-	match binding.annotation:
-		Some(annotation):
-			compiler_core_lower_value_type(annotation)
-		None:
-			if compiler_typed_with_binding_is_try(binding):
-				match core_carrier_success_type(acquisition_type):
-					Ok(resource_type):
-						Ok(clone_core_type(resource_type))
-					Err(error):
-						Err(error)
-			else:
-				Ok(clone_core_type(acquisition_type))
+	if is_try:
+		match core_carrier_success_type(acquisition_type):
+			Ok(resource_type):
+				Ok(clone_core_type(resource_type))
+			Err(error):
+				Err(error)
+	else:
+		Ok(clone_core_type(acquisition_type))
 
 
 private pure func resource_cleanup_call(
@@ -4098,8 +4189,8 @@ private pure func lower_with_mapped_failure_case(
 		bindings = [
 			{
 				variable = failure_var,
-				typ = failure_type,
-				accessor = accessor,
+				typ = clone_core_type(failure_type),
+				accessor = clone_core_accessor(accessor),
 				mode = MatchBorrowBindingMode
 			},
 		],
@@ -4146,10 +4237,11 @@ private pure func lower_typed_with(
 	acquisition_type ?= compiler_core_lower_value_type(
 		compiler_typed_expr_value_type(binding.value),
 	)
-	resource_type ?= with_resource_type(binding, clone_core_type(acquisition_type))
+	is_try = compiler_typed_with_binding_is_try(binding)
+	resource_type ?= with_resource_type(is_try, clone_core_type(acquisition_type))
 	lowered_body ?= lower_typed_expr(body)
 
-	if compiler_typed_with_binding_is_try(binding):
+	if is_try:
 		acquisition_kind ?= core_carrier_kind(acquisition_type)
 		result_kind ?= core_carrier_kind(result_type)
 
@@ -4328,8 +4420,8 @@ private pure func lower_typed_block_expr(
 							body,
 						),
 					)
-				CompilerTypedQuestionBindExpr(name, annotation, value, span, _):
-					lower_typed_question_bind(name, annotation, value, span, rest, typ, first_loc)
+				CompilerTypedQuestionBindExpr(name, _, value, span, _):
+					lower_typed_question_bind(name, value, span, rest, typ, first_loc)
 				CompilerTypedTupleDestructExpr(names, value, span, _):
 					lower_typed_tuple_destruct(names, value, span, rest, typ, first_loc)
 				CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
@@ -4355,8 +4447,9 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 
 	match expr:
 		CompilerTypedNameExpr(name, info):
-			variable ?= lowered_name_expr_var(name, info)
-			Ok(VarExpr(variable, typ, loc))
+			identity ?= lower_name_expr_identity(name, info)
+			(clean_name, def_id) = identity
+			Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
 		CompilerTypedIntLiteralExpr(text, _, _):
 			Ok(LiteralExpr(compiler_core_literal_int(text), typ, loc))
 		CompilerTypedFloatLiteralExpr(text, _, _):
@@ -4402,10 +4495,10 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 			lowered_right ?= lower_typed_expr(right)
 			Ok(LogicalExpr(compiler_core_logical_op(op), lowered_left, lowered_right, typ, loc))
 		CompilerTypedCallExpr(callee, args, _, info):
-			raw_lowered_callee ?= lower_typed_expr(callee)
-			lowered_callee = lower_resolved_call_callee(
+			raw_callee ?= lower_typed_expr(callee)
+			lowered_callee: CoreExpr = apply_resolved_callee_identity(
 				info.resolved_call,
-				raw_lowered_callee,
+				raw_callee,
 			)
 			lowered_args ?= lower_typed_exprs(args)
 			call_kind ?= lower_resolved_call_kind(info.resolved_call, lowered_callee)
@@ -4458,15 +4551,11 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 		CompilerTypedSelectExpr(arms, _, _):
 			lowered_arms ?= lower_typed_select_arms(arms)
 			Ok(SelectExpr(lowered_arms, typ, loc))
-		CompilerTypedLambdaExpr(is_pure, params, return_annotation, body, _, _):
+		CompilerTypedLambdaExpr(is_pure, params, _, body, _, _):
 			lowered_params ?= lower_typed_lambda_params(params)
-
-			lowered_return_type ?= match return_annotation:
-				Some(annotation):
-					compiler_core_lower_type(annotation)
-				None:
-					compiler_core_lower_value_type(compiler_typed_expr_value_type(body))
-
+			lowered_return_type ?= compiler_core_lower_value_type(
+				compiler_typed_expr_value_type(body),
+			)
 			lowered_body ?= lower_typed_expr(body)
 			Ok(LambdaExpr(lowered_params, lowered_return_type, lowered_body, is_pure, typ, loc))
 		CompilerTypedBlockExpr(items, _, _):
@@ -4511,12 +4600,21 @@ private pure func compiler_core_lower_param(
 ) -> Result[CoreParam, CompilerCoreLowerError]:
 	match param.binder:
 		ParsedParamNameBinder(name):
-			typ ?= compiler_core_lower_type(param_type)
-			Ok({
-				name = core_var(name.text, None),
-				typ = typ,
-				loc = compiler_core_source_loc(name.span),
-			})
+			match compiler_core_lower_type(param_type):
+				Ok(typ):
+					Ok({
+						name = core_var(name.text, None),
+						typ = typ,
+						loc = compiler_core_source_loc(name.span),
+					})
+				Err(CompilerCoreLowerInvalidType(message)):
+					Err(
+						CompilerCoreLowerInvalidType(
+							"parameter `" + name.text + "` has an invalid type: " + message,
+						),
+					)
+				Err(error):
+					Err(error)
 		_:
 			Err(
 				CompilerCoreLowerInvalidParam(
@@ -4782,7 +4880,7 @@ private pure func lower_heap_record_field(
 	Ok({
 		name = field.name,
 		typ = typ,
-		release_policy = TypeLayout.cleanup_release_policy_for_type(typ),
+		release_policy = CoreTypePolicy.cleanup_release_policy_for_type(typ),
 	})
 
 
@@ -4847,14 +4945,6 @@ private pure func union_variant_tag_c_name(type_name: String, variant_name: Stri
 	"TAG_" + type_name + "_" + variant_name
 
 
-private pure func source_union_runtime_erased_payload_name(name: String) -> Bool:
-	(
-		name == "RecvAttempt"
-		or name == "std/channel::RecvAttempt"
-		or name == "std_channel__RecvAttempt"
-	)
-
-
 private pure func source_union_typed_payload_field_supported(typ: CompilerType) -> Bool:
 	match typ:
 		CompilerNamedType(name, args):
@@ -4900,7 +4990,7 @@ private pure func lower_union_payload_storage(
 ) -> CoreUnionPayloadStorage:
 	if (
 		info.decl.type_params.length() == 0
-		and not source_union_runtime_erased_payload_name(info.decl.name.text)
+		and not CoreTypePolicy.is_runtime_erased_union_payload_type_name(info.decl.name.text)
 		and source_union_typed_payload_supported(info.variants)
 	):
 		TypedUnionPayloadStorage
@@ -4944,27 +5034,17 @@ private pure func lower_enum_variants(
 
 
 private pure func lower_union_field(
-	storage: CoreUnionPayloadStorage,
 	typ: CompilerType,
 ) -> Result[CoreUnionField, CompilerCoreLowerError]:
-	core_type ?= match storage:
-		ErasedUnionPayloadStorage:
-			match typ:
-				CompilerTypeVar(_):
-					Ok(NamedType("Any", []))
-				_:
-					compiler_core_lower_type(typ)
-		TypedUnionPayloadStorage:
-			compiler_core_lower_type(typ)
+	core_type ?= compiler_core_lower_type(typ)
 
 	Ok({
 		typ = core_type,
-		release_policy = TypeLayout.cleanup_release_policy_for_type(core_type),
+		release_policy = CoreTypePolicy.cleanup_release_policy_for_type(core_type),
 	})
 
 
 private pure func lower_union_fields(
-	storage: CoreUnionPayloadStorage,
 	fields: List[CompilerType],
 ) -> Result[List[CoreUnionField], CompilerCoreLowerError]:
 	var lowered: List[CoreUnionField] = []
@@ -4972,7 +5052,7 @@ private pure func lower_union_fields(
 
 	for field in fields:
 		if failure.is_none():
-			match lower_union_field(storage, field):
+			match lower_union_field(field):
 				Ok(lowered_field):
 					lowered = lowered.append(lowered_field)
 				Err(error):
@@ -4987,10 +5067,9 @@ private pure func lower_union_fields(
 
 private pure func lower_union_variant(
 	type_name: String,
-	storage: CoreUnionPayloadStorage,
 	variant: CompilerTypedUnionVariantInfo,
 ) -> Result[CoreUnionVariant, CompilerCoreLowerError]:
-	fields ?= lower_union_fields(storage, variant.fields)
+	fields ?= lower_union_fields(variant.fields)
 
 	Ok({
 		name = variant.name,
@@ -5004,7 +5083,6 @@ private pure func lower_union_variant(
 
 private pure func lower_union_variants(
 	type_name: String,
-	storage: CoreUnionPayloadStorage,
 	variants: List[CompilerTypedUnionVariantInfo],
 ) -> Result[List[CoreUnionVariant], CompilerCoreLowerError]:
 	var lowered: List[CoreUnionVariant] = []
@@ -5012,7 +5090,7 @@ private pure func lower_union_variants(
 
 	for variant in variants:
 		if failure.is_none():
-			match lower_union_variant(type_name, storage, variant):
+			match lower_union_variant(type_name, variant):
 				Ok(lowered_variant):
 					lowered = lowered.append(lowered_variant)
 				Err(error):
@@ -5042,7 +5120,7 @@ private pure func lower_typed_union(
 		})
 	else:
 		storage = lower_union_payload_storage(info)
-		variants ?= lower_union_variants(info.decl.name.text, storage, info.variants)
+		variants ?= lower_union_variants(info.decl.name.text, info.variants)
 		Ok({
 			context = context,
 			decl = UnionDecl({
@@ -5097,7 +5175,7 @@ private pure func lower_typed_trait_methods(
 		[method, ...rest]:
 			lowered ?= lower_typed_trait_method(method)
 			lowered_rest ?= lower_typed_trait_methods(rest)
-			Ok([lowered] + lowered_rest)
+			Ok([lowered].concat(lowered_rest))
 
 
 private pure func lower_typed_trait(
@@ -5150,6 +5228,10 @@ private pure func lower_typed_impl(
 		decl = ImplDecl({
 			trait_name = info.decl.trait_name.text,
 			for_type = for_type,
+			type_params = info.type_params.map(pure func(param) -> CoreTypeParam: {
+					name = param.name,
+					bounds = param.bounds
+				}),
 			methods = methods,
 			loc = compiler_core_source_loc(info.decl.span),
 		}),

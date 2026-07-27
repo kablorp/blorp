@@ -2347,7 +2347,9 @@ let pp_to_string_indented (e : core) : string =
 
 (** Function category. Exactly one of:
     - [CFUser] — user-defined blorp function with a body in [cf_body]
-    - [CFBuiltin] — maps to a C builtin (e.g. [blorp_list_get]); no body
+    - [CFUnresolvedBuiltin] — source [builtin("...")] declaration awaiting
+      post-monomorphization synthesis or builtin resolution; no body
+    - [CFBuiltin] — maps to a known C builtin (e.g. [blorp_list_get]); no body
     - [CFForeign] — FFI declaration; emits a C forward-decl from
       [c_name], pulls in any [includes], and carries [link_flags] /
       source-relative include dirs as pipeline metadata for the C compiler.
@@ -2358,6 +2360,7 @@ let pp_to_string_indented (e : core) : string =
     represented by the Blorp Core model rather than this pre-handoff type. *)
 type cf_kind =
   | CFUser
+  | CFUnresolvedBuiltin
   | CFBuiltin
   | CFForeign of {
       c_name : string;
@@ -2425,12 +2428,16 @@ type core_func = {
       [@no_copy] is represented by [CFForeign.arg_passing], so later phases
       do not need to recover FFI safety semantics from source annotations. *)
 
-(** [is_builtin_kind k] — true iff [k = CFBuiltin]. Helper for the
+(** [is_builtin_kind k] — true iff [k] is either unresolved or resolved
+    builtin Core. Helper for the
     common "is this function a builtin?" check across passes.
     Keeping the predicate in one place documents the answer and avoids
     three-line pattern matches at each call site. *)
 let is_builtin_kind (k : cf_kind) : bool =
-  match k with CFBuiltin -> true | _ -> false
+  match k with CFUnresolvedBuiltin | CFBuiltin -> true | _ -> false
+
+let is_unresolved_builtin_kind (k : cf_kind) : bool =
+  match k with CFUnresolvedBuiltin -> true | _ -> false
 
 (** [is_program_entrypoint f] — true iff [f] is the root module's
     executable entrypoint. Imported module functions named [main] are
@@ -2771,6 +2778,7 @@ let pp_program_indented (prog : core_program) : string =
     let tags =
       match f.cf_kind with
       | CFUser -> ""
+      | CFUnresolvedBuiltin -> " [unresolved-builtin]"
       | CFBuiltin -> " [builtin]"
       | CFForeign { c_name; _ } -> Printf.sprintf " [foreign=%s]" c_name
     in

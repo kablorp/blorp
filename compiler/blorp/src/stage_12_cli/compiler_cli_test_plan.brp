@@ -1,0 +1,137 @@
+-- Typed planning for a candidate Blorp-owned TestSuite execution route.
+--
+-- The route is deliberately narrow. Unsupported policies are represented as
+-- ineligible and continue through the existing OCaml runner. Production test
+-- execution remains on that runner until the candidate plan has a test-specific
+-- effect boundary and passes representative compiler-owned suites.
+import:
+	compiler_cli_args: CliAction(CliTest), CliRunArgs, CliTestArgs, CliTestMode(CliTestSuiteOnly)
+	compiler_cli_generated_test_harness:
+		GeneratedTestSuiteTarget,
+		generate_suite_selector_module,
+		generated_test_targets_for_paths,
+	compiler_cli_plan: CliRunSourcePlan, CliTestRunCommand(CliTestExecute), CliTestRunPlan
+	compiler_cli_source_graph:
+		frontend_module_graph_for_roots,
+		frontend_module_graph_with_generated_root,
+		parsed_cli_source_from_program,
+	compiler_cli_test_discovery:
+		CliDiscoveredTestSource,
+		CliTestExecutionIsolation(CliFreshTestFilesystem),
+		discover_test_sources,
+	fs: message
+	path: normalize
+	system: getcwd
+
+
+record CliBlorpTestSuitePlan {
+	run_plan: CliRunSourcePlan,
+	targets: List[GeneratedTestSuiteTarget]
+}
+
+
+union CliBlorpTestSuitePlanning:
+	CliBlorpTestSuiteIneligible
+	CliBlorpTestSuitePlanningFailed(String)
+	CliBlorpTestSuiteReady(CliBlorpTestSuitePlan)
+
+
+private pure func blorp_suite_route_requested(args: CliTestArgs) -> Bool:
+	(
+		args.mode == CliTestSuiteOnly
+		and not args.profile
+		and not args.leak_check
+		and args.no_format
+		and not args.cache
+		and args.repeat == 1
+		and args.paths.length() == 1
+	)
+
+
+private pure func test_isolation_supported(isolation: CliTestExecutionIsolation) -> Bool:
+	match isolation:
+		CliFreshTestFilesystem(_):
+			False
+		_:
+			True
+
+
+private pure func suite_run_args(args: CliTestArgs, harness_path: String) -> CliRunArgs:
+	{
+		profile = args.profile,
+		debug = args.debug,
+		sanitizer = args.sanitizer,
+		leak_check = args.leak_check,
+		release = False,
+		no_format = True,
+		timeout = args.timeout,
+		threads = None,
+		std_dir = args.std_dir,
+		files = [harness_path],
+		user_args = ["0"]
+	}
+
+
+private pure func requested_path_is_source(args: CliTestArgs, source_path: String) -> Bool:
+	match args.paths:
+		[requested_path]:
+			normalize(requested_path) == normalize(source_path)
+		_:
+			False
+
+
+private pure func source_is_supported(args: CliTestArgs, source: CliDiscoveredTestSource) -> Bool:
+	(
+		source.features.has_tests_binding
+		and not source.features.has_main
+		and not source.is_leak_baseline_program
+		and test_isolation_supported(source.isolation)
+		and requested_path_is_source(args, source.program.source.path)
+	)
+
+
+private func build_blorp_test_suite_plan(
+	plan: CliTestRunPlan,
+	args: CliTestArgs,
+	source: CliDiscoveredTestSource,
+) -> Result[CliBlorpTestSuitePlan, String]:
+	root = parsed_cli_source_from_program(source.program)
+	base ?= frontend_module_graph_for_roots(CliTest(args), [root])
+	targets ?= generated_test_targets_for_paths(base, [source.program.source.path])
+	generated = generate_suite_selector_module(targets, args.leak_check)
+	graph ?= frontend_module_graph_with_generated_root(base, generated)
+
+	Ok({
+		run_plan = {
+			args = plan.args,
+			options = suite_run_args(args, generated.source.path),
+			graph = graph
+		},
+		targets = targets,
+	})
+
+
+func plan_blorp_test_suite(plan: CliTestRunPlan) -> CliBlorpTestSuitePlanning:
+	match plan.command:
+		CliTestExecute(args):
+			if not blorp_suite_route_requested(args):
+				CliBlorpTestSuiteIneligible
+			else:
+				match discover_test_sources(args.paths, getcwd(), args.leak_check):
+					Err(error):
+						CliBlorpTestSuitePlanningFailed("test discovery failed: ${message(error)}")
+					Ok(sources):
+						match sources:
+							[source]:
+								if not source_is_supported(args, source):
+									CliBlorpTestSuiteIneligible
+								else:
+									match build_blorp_test_suite_plan(plan, args, source):
+										Err(error):
+											CliBlorpTestSuitePlanningFailed(error)
+										Ok(suite_plan):
+											CliBlorpTestSuiteReady(suite_plan)
+							_:
+								CliBlorpTestSuiteIneligible
+		_:
+			CliBlorpTestSuiteIneligible

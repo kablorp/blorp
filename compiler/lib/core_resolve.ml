@@ -265,7 +265,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
         | CFForeign { c_name; arg_passing; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
               { fc_c_name = c_name; fc_arg_passing = arg_passing }
-        | CFBuiltin when remember_std_builtin f -> ()
+        | (CFUnresolvedBuiltin | CFBuiltin) when remember_std_builtin f -> ()
         | _ when has_mono_suffix f.cf_name && remember_std_builtin f -> ()
         | _ -> (
             match f.cf_module with
@@ -284,7 +284,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
         | CFForeign { c_name; arg_passing; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
               { fc_c_name = c_name; fc_arg_passing = arg_passing }
-        | CFBuiltin -> ignore (remember_std_builtin f)
+        | CFUnresolvedBuiltin | CFBuiltin -> ignore (remember_std_builtin f)
         | _ -> ())
     | CDImpl i ->
         (* Register impl methods with their mangled names (Trait_method_Type)

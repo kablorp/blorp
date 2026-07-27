@@ -15,7 +15,6 @@ let ty_string = TyNamed ("String", [])
 let ty_bytes = TyNamed ("Bytes", [])
 let ty_ptr = TyNamed ("Ptr", [])
 let ty_var_t = TyVar "T"
-let ty_named_t = TyNamed ("T", [])
 let ty_void = TyNamed ("Void", [])
 let tparams names = List.map (fun name -> make_type_param name []) names
 let ty_list_int = TyNamed ("List", [ ty_int ])
@@ -834,23 +833,76 @@ let test_stale_generic_cbox_rewrites_pointer_inner () =
   | _ ->
       Alcotest.fail "stale generic CBox metadata should use pointer inner type"
 
-let test_named_generic_cbox_waits_for_concrete_inner () =
-  let t = cvar "t" ty_named_t in
-  let boxed = mk (CBox (t, ty_named_t)) ty_ptr in
+let test_generic_cbox_waits_for_concrete_inner () =
+  let t = cvar "t" ty_var_t in
+  let boxed = mk (CBox (t, ty_var_t)) ty_ptr in
   match (specialize boxed).desc with
-  | CBox ({ desc = CVar v; _ }, TyNamed ("T", [])) when v.vname = "t" -> ()
+  | CBox ({ desc = CVar v; _ }, TyVar "T") when v.vname = "t" -> ()
   | _ ->
       Alcotest.fail
-        "unresolved named generic CBox should not become a borrowed cast"
+        "unresolved generic CBox should not become a borrowed cast"
 
-let test_named_generic_cbox_rewrites_pointer_inner () =
-  let s = cvar "s" ty_string in
-  let boxed = mk (CBox (s, ty_named_t)) ty_ptr in
-  match (specialize boxed).desc with
-  | CCast ({ desc = CVar v; _ }, TyNamed ("Ptr", [])) when v.vname = "s" -> ()
+let test_stack_result_erased_storage_metadata_is_canonicalized () =
+  let result_ty = TyNamed ("Result", [ ty_int; ty_string ]) in
+  let value = cvar "result" result_ty in
+  let boxed_value =
+    {
+      bsv_box =
+        {
+          box_value = value;
+          box_source_ty = result_ty;
+          box_kind = BoxPointer;
+        };
+      bsv_needs_release = false;
+      bsv_transfers_ownership = false;
+    }
+  in
+  let list_ty = TyNamed ("List", [ result_ty ]) in
+  let list_layout =
+    list_pointer_storage ~elem_ty:result_ty
+      ~value_layout:ListElementPointer ~policy:StoragePolicyManagedPointer ()
+  in
+  let list =
+    mk
+      (CListConstruct
+         {
+           lc_layout = list_layout;
+           lc_elems = [ boxed_value ];
+           lc_elem_needs_release = true;
+         })
+      list_ty
+  in
+  let unbox =
+    mk
+      (CUnboxTyped
+         {
+           unbox_value = cvar "raw" ty_ptr;
+           unbox_target_ty = result_ty;
+           unbox_kind = UnboxPointer;
+         })
+      result_ty
+  in
+  (match (specialize list).desc with
+  | CListConstruct
+      {
+        lc_elems =
+          [
+            {
+              bsv_box = { box_kind = BoxStruct "blorp_StackResult"; _ };
+              bsv_needs_release = true;
+              _;
+            };
+          ];
+        _;
+      } ->
+      ()
   | _ ->
       Alcotest.fail
-        "named generic CBox metadata should use concrete pointer inner type"
+        "stack Result list element should use canonical struct boxing");
+  match (specialize unbox).desc with
+  | CUnboxTyped { unbox_kind = UnboxStruct "blorp_StackResult"; _ } -> ()
+  | _ ->
+      Alcotest.fail "stack Result read should use canonical struct unboxing"
 
 let test_tensor_peel_nonconstant_dims_raise_core_error () =
   let coll =
@@ -1133,10 +1185,11 @@ let suite =
           test_stale_generic_cbox_uses_inner_type;
         Alcotest.test_case "stale_generic_cbox_rewrites_pointer_inner" `Quick
           test_stale_generic_cbox_rewrites_pointer_inner;
-        Alcotest.test_case "named_generic_cbox_waits_for_concrete_inner" `Quick
-          test_named_generic_cbox_waits_for_concrete_inner;
-        Alcotest.test_case "named_generic_cbox_rewrites_pointer_inner" `Quick
-          test_named_generic_cbox_rewrites_pointer_inner;
+        Alcotest.test_case "generic_cbox_waits_for_concrete_inner" `Quick
+          test_generic_cbox_waits_for_concrete_inner;
+        Alcotest.test_case
+          "stack_result_erased_storage_metadata_is_canonicalized" `Quick
+          test_stack_result_erased_storage_metadata_is_canonicalized;
         Alcotest.test_case "tensor_peel_nonconstant_dims_raise_core_error"
           `Quick test_tensor_peel_nonconstant_dims_raise_core_error;
         Alcotest.test_case "tensor_peel_raw_call_keeps_pointer_type" `Quick
