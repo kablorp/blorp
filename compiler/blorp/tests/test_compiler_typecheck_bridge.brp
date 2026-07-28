@@ -10,6 +10,7 @@ import:
 		compiler_typed_expr_resolved_call,
 	../src/stage_06_typecheck/compiler_typecheck_bridge:
 		CompilerTypecheckedModule,
+		TypecheckGraphRequest,
 		compiler_typecheck_graph,
 		handle_request,
 		stream_typecheck_graph_request_chunks,
@@ -814,6 +815,8 @@ func test_typecheck_graph_chunk_stream_inventories_retained_typed_programs() -> 
 			and entry.contains("selected_modules=1")
 			and entry.contains("ctfe_dependencies=1")
 			and entry.contains("ctfe_selected_overlap=1")
+			and entry.contains("callable_ids=1")
+			and entry.contains("source_definition_ids=0")
 		)
 	)
 	dependency_entry = entries.find(func(entry):
@@ -858,6 +861,36 @@ func test_typecheck_graph_chunk_stream_inventories_retained_typed_programs() -> 
 		and target_artifact_entry.is_some()
 		and target_ownership_entry.is_some()
 	)
+
+
+func test_typecheck_graph_inventory_counts_definition_ids() -> Bool:
+	dep: JsonValue = user_import_module_json(
+		"dep",
+		"dep",
+		"union Choice:\n\tYes\n\tNo\n\npure func helper() -> Int:\n\t1",
+	)
+	target: JsonValue = user_import_module_json(
+		"main",
+		"main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+	entries = chunked_graph_inventory_entries(
+		typecheck_graph_request(
+			target,
+			[dep, dep],
+			[],
+		),
+	)
+	graph_entry = entries.find(func(entry):
+		(
+			entry.starts_with("graph:")
+			and entry.contains("modules=2")
+			and entry.contains("callable_ids=2")
+			and entry.contains("source_definition_ids=2")
+		)
+	)
+
+	graph_entry.is_some()
 
 
 func test_typecheck_graph_reuses_ctfe_artifact_with_rewritten_global() -> Bool:
@@ -2811,6 +2844,73 @@ private pure func typed_union_constructor_id(
 	result
 
 
+private pure func deterministic_definition_id_request() -> TypecheckGraphRequest:
+	{
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tutil\n\nfunc main(args: List[String]) -> Int:\n\tutil.answer()",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "util.brp",
+				module_name = "util",
+				module_path = "util",
+				text = "union Signal:\n\tReady\n\npure func answer() -> Int:\n\t42",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["util"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "util",
+				resolved_module = "util"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+pure func test_typed_graph_definition_ids_are_deterministic() -> Bool:
+	first = compiler_typecheck_graph(deterministic_definition_id_request())
+	second = compiler_typecheck_graph(deterministic_definition_id_request())
+
+	match (
+		typed_module_program(first.modules, "util"),
+		typed_module_program(second.modules, "util"),
+	):
+		(Some(first_util), Some(second_util)):
+			first_main = typed_function_callable_id(first.target.typed_program, "main")
+			second_main = typed_function_callable_id(second.target.typed_program, "main")
+			first_answer = typed_function_callable_id(first_util, "answer")
+			second_answer = typed_function_callable_id(second_util, "answer")
+			first_call = typed_function_body_call_id(first.target.typed_program, "main")
+			second_call = typed_function_body_call_id(second.target.typed_program, "main")
+			first_ready = typed_union_constructor_id(first_util, "Signal", "Ready")
+			second_ready = typed_union_constructor_id(second_util, "Signal", "Ready")
+
+			(
+				first.next_def_id == second.next_def_id
+				and first_main.is_some()
+				and first_answer.is_some()
+				and first_call.is_some()
+				and first_ready.is_some()
+				and first_main == second_main
+				and first_answer == second_answer
+				and first_call == second_call
+				and first_ready == second_ready
+			)
+		_:
+			False
+
+
 pure func test_typed_graph_uses_graph_wide_definition_ids() -> Bool:
 	graph = compiler_typecheck_graph({
 		target = {
@@ -3027,6 +3127,10 @@ tests: TestSuite = {
 			test_typecheck_graph_chunk_stream_inventories_retained_typed_programs,
 		),
 		(
+			"typecheck_graph inventory counts definition ids",
+			test_typecheck_graph_inventory_counts_definition_ids,
+		),
+		(
 			"typecheck_graph reuses CTFE artifact with rewritten global",
 			test_typecheck_graph_reuses_ctfe_artifact_with_rewritten_global,
 		),
@@ -3049,6 +3153,10 @@ tests: TestSuite = {
 		(
 			"typed graph uses graph-wide definition ids",
 			test_typed_graph_uses_graph_wide_definition_ids,
+		),
+		(
+			"typed graph definition ids are deterministic",
+			test_typed_graph_definition_ids_are_deterministic,
 		),
 		(
 			"typed graph UFCS rejects mismatched local generic receiver",
