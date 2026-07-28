@@ -155,14 +155,14 @@ private record NestedConstructorCaseGroup {
 private record PatternMatrixArm {
 	patterns: List[CorePattern],
 	bindings: List[CoreSemanticMatchBinding],
-	body: CoreExpr
+	body: CoreSemanticMatchTree
 }
 
 
 private union ListPatternSequenceArm:
 	ExactListPatternArm(PatternMatrixArm)
 	SpreadListPatternArm(PatternMatrixArm)
-	CatchallListPatternArm(List[CoreSemanticMatchBinding], CoreExpr)
+	CatchallListPatternArm(List[CoreSemanticMatchBinding], CoreSemanticMatchTree)
 
 
 private record ScopedCoreExpr {
@@ -705,6 +705,114 @@ private pure func prepend_semantic_bindings(
 				)
 
 
+private pure func replace_semantic_match_fail(
+	tree: CoreSemanticMatchTree,
+	fallback: CoreSemanticMatchTree,
+) -> CoreSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(_, _):
+			tree
+		SemanticMatchFail:
+			fallback
+		SemanticConstructorMatch(accessor, cases, existing_fallback):
+			SemanticConstructorMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = replace_semantic_match_fail(match_case.body, fallback)
+					},
+				),
+				Some(
+					existing_fallback
+						.map(func(found): replace_semantic_match_fail(found, fallback))
+						.get_or(fallback),
+				),
+			)
+		SemanticLiteralMatch(accessor, cases, existing_fallback):
+			SemanticLiteralMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = replace_semantic_match_fail(match_case.body, fallback)
+					},
+				),
+				replace_semantic_match_fail(existing_fallback, fallback),
+			)
+		SemanticLengthMatch(accessor, cases, geq, existing_fallback):
+			SemanticLengthMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = replace_semantic_match_fail(match_case.body, fallback)
+					},
+				),
+				geq.map(
+					func(
+						found,
+					): { found | body = replace_semantic_match_fail(found.body, fallback) },
+				),
+				Some(
+					existing_fallback
+						.map(func(found): replace_semantic_match_fail(found, fallback))
+						.get_or(fallback),
+				),
+			)
+
+
+private pure func semantic_match_tree_name_may_occur_free(
+	tree: CoreSemanticMatchTree,
+	name: String,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			if bindings.any(func(binding): binding.variable.name == name):
+				False
+			else:
+				core_name_may_occur_free(name, body)
+		SemanticMatchFail:
+			False
+		SemanticConstructorMatch(_, cases, fallback):
+			(
+				cases.any(
+					func(
+						match_case,
+					): semantic_match_tree_name_may_occur_free(match_case.body, name),
+				)
+				or fallback
+					.map(func(found): semantic_match_tree_name_may_occur_free(found, name))
+					.get_or(False)
+			)
+		SemanticLiteralMatch(_, cases, fallback):
+			(
+				cases.any(
+					func(
+						match_case,
+					): semantic_match_tree_name_may_occur_free(match_case.body, name),
+				)
+				or semantic_match_tree_name_may_occur_free(fallback, name)
+			)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			(
+				cases.any(
+					func(
+						match_case,
+					): semantic_match_tree_name_may_occur_free(match_case.body, name),
+				)
+				or geq
+					.map(func(found): semantic_match_tree_name_may_occur_free(found.body, name))
+					.get_or(False)
+				or fallback
+					.map(func(found): semantic_match_tree_name_may_occur_free(found, name))
+					.get_or(False)
+			)
+
+
 private pure func first_non_catchall_index(patterns: List[CorePattern]) -> Option[Int]:
 	var result: Option[Int] = None
 	var index: Int = 0
@@ -1173,14 +1281,14 @@ private pure func tuple_subpattern_tree(
 							binding,
 						): not semantic_accessor_starts_with(accessor, binding.accessor),
 					),
-					body = arm.body,
+					body = SemanticMatchLeaf([], arm.body),
 				})
 			Some(pattern):
 				if is_catchall_pattern(pattern):
 					matrix_arms = matrix_arms.append({
 						patterns = wildcard_patterns(width),
 						bindings = constructor_pattern_bindings(base, constructor, arm.patterns),
-						body = arm.body,
+						body = SemanticMatchLeaf([], arm.body),
 					})
 				else:
 					failed = True
@@ -1230,7 +1338,7 @@ private pure func list_subpattern_tree(
 							arm.body,
 						),
 					),
-					body = arm.body
+					body = SemanticMatchLeaf([], arm.body)
 				}
 
 				if spread.is_some():
@@ -1242,7 +1350,7 @@ private pure func list_subpattern_tree(
 					sequence = sequence.append(
 						CatchallListPatternArm(
 							constructor_pattern_bindings(base, constructor, arm.patterns),
-							arm.body,
+							SemanticMatchLeaf([], arm.body),
 						),
 					)
 				else:
@@ -1266,7 +1374,7 @@ private pure func compile_constructor_group_tree(
 ) -> Option[CoreSemanticMatchTree]:
 	match arms.get(0):
 		Some(arm):
-			if arms.length() == 1 and arm.patterns.all(is_catchall_pattern):
+			if arm.patterns.all(is_catchall_pattern):
 				Some(
 					SemanticMatchLeaf(
 						constructor_pattern_bindings(base, constructor, arm.patterns),
@@ -1608,6 +1716,40 @@ private pure func pattern_matrix_column_has_constructor(
 	found
 
 
+private pure func pattern_matrix_column_has_tuple(
+	arms: List[PatternMatrixArm],
+	position: Int,
+) -> Bool:
+	var found: Bool = False
+
+	for arm in arms:
+		match arm.patterns.get(position):
+			Some(TuplePattern(_)):
+				found = True
+				break
+			_:
+				void
+
+	found
+
+
+private pure func pattern_matrix_column_has_list(
+	arms: List[PatternMatrixArm],
+	position: Int,
+) -> Bool:
+	var found: Bool = False
+
+	for arm in arms:
+		match arm.patterns.get(position):
+			Some(ListPattern(_, _)):
+				found = True
+				break
+			_:
+				void
+
+	found
+
+
 private pure func compile_pattern_matrix_literal_column(
 	kind: PatternMatrixAccessorKind,
 	base: CoreSemanticMatchAccessor,
@@ -1699,6 +1841,216 @@ private pure func compile_pattern_matrix_constructor_column(
 		Some(SemanticConstructorMatch(accessor, cases, Some(default_tree)))
 
 
+private pure func compile_pattern_matrix_tuple_column(
+	kind: PatternMatrixAccessorKind,
+	base: CoreSemanticMatchAccessor,
+	arms: List[PatternMatrixArm],
+	position: Int,
+	fallback: CoreSemanticMatchTree,
+) -> Option[CoreSemanticMatchTree]:
+	accessor: CoreSemanticMatchAccessor = pattern_matrix_accessor(kind, base, position)
+	var result: CoreSemanticMatchTree = fallback
+	var index: Int = arms.length()
+	var failed: Bool = False
+
+	while index > 0:
+		index -= 1
+
+		match arms.get(index):
+			Some(arm):
+				match arm.patterns.get(position):
+					Some(TuplePattern(patterns)):
+						outer_arm: PatternMatrixArm = { arm |
+							patterns = arm.patterns.set(position, WildcardPattern)
+						}
+
+						match compile_pattern_matrix(kind, base, [outer_arm], SemanticMatchFail):
+							Some(continuation):
+								tuple_arm: PatternMatrixArm = {
+									patterns = patterns,
+									bindings = [],
+									body = continuation
+								}
+
+								match compile_pattern_matrix(
+									TuplePatternMatrixAccessors,
+									accessor,
+									[tuple_arm],
+									SemanticMatchFail,
+								):
+									Some(arm_tree):
+										result = replace_semantic_match_fail(arm_tree, result)
+									None:
+										failed = True
+										break
+							None:
+								failed = True
+								break
+					Some(pattern):
+						if is_catchall_pattern(pattern):
+							outer_arm: PatternMatrixArm = { arm |
+								patterns = arm.patterns.set(position, WildcardPattern),
+								bindings = arm.bindings.concat(
+									collect_pattern_bindings(
+										accessor,
+										pattern,
+									),
+								)
+							}
+
+							match compile_pattern_matrix(
+								kind,
+								base,
+								[outer_arm],
+								SemanticMatchFail,
+							):
+								Some(arm_tree):
+									result = replace_semantic_match_fail(arm_tree, result)
+								None:
+									failed = True
+									break
+						else:
+							failed = True
+							break
+					None:
+						failed = True
+						break
+			None:
+				failed = True
+				break
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
+private pure func list_spread_tree_binding(
+	base: CoreSemanticMatchAccessor,
+	fixed_length: Int,
+	spread: Option[CorePattern],
+	body: CoreSemanticMatchTree,
+) -> List[CoreSemanticMatchBinding]:
+	match spread:
+		Some(NamePattern(name)):
+			if semantic_match_tree_name_may_occur_free(body, name):
+				[semantic_binding(
+						name,
+						ListSpreadSemanticMatchAccessor(base, fixed_length),
+					)]
+			else:
+				[]
+		_:
+			[]
+
+
+private pure func compile_pattern_matrix_list_column(
+	kind: PatternMatrixAccessorKind,
+	base: CoreSemanticMatchAccessor,
+	arms: List[PatternMatrixArm],
+	position: Int,
+	fallback: CoreSemanticMatchTree,
+) -> Option[CoreSemanticMatchTree]:
+	accessor: CoreSemanticMatchAccessor = pattern_matrix_accessor(kind, base, position)
+	var result: CoreSemanticMatchTree = fallback
+	var index: Int = arms.length()
+	var failed: Bool = False
+
+	while index > 0:
+		index -= 1
+
+		match arms.get(index):
+			Some(arm):
+				match arm.patterns.get(position):
+					Some(ListPattern(patterns, spread)):
+						outer_arm: PatternMatrixArm = { arm |
+							patterns = arm.patterns.set(position, WildcardPattern)
+						}
+
+						match compile_pattern_matrix(kind, base, [outer_arm], SemanticMatchFail):
+							Some(continuation):
+								list_arm: PatternMatrixArm = {
+									patterns = patterns,
+									bindings = list_spread_tree_binding(
+										accessor,
+										patterns.length(),
+										spread,
+										continuation,
+									),
+									body = continuation
+								}
+
+								match compile_pattern_matrix(
+									ListPatternMatrixAccessors,
+									accessor,
+									[list_arm],
+									SemanticMatchFail,
+								):
+									Some(body):
+										arm_tree: CoreSemanticMatchTree = if spread.is_some():
+											SemanticLengthMatch(accessor, [], Some({
+													minimum_length = patterns.length(),
+													body = body,
+												}), Some(SemanticMatchFail))
+										else:
+											SemanticLengthMatch(
+												accessor,
+												[
+													{
+														length = patterns.length(),
+														body = body
+													},
+												],
+												None,
+												Some(SemanticMatchFail),
+											)
+
+										result = replace_semantic_match_fail(arm_tree, result)
+									None:
+										failed = True
+										break
+							None:
+								failed = True
+								break
+					Some(pattern):
+						if is_catchall_pattern(pattern):
+							outer_arm: PatternMatrixArm = { arm |
+								patterns = arm.patterns.set(position, WildcardPattern),
+								bindings = arm.bindings.concat(
+									collect_pattern_bindings(
+										accessor,
+										pattern,
+									),
+								)
+							}
+
+							match compile_pattern_matrix(
+								kind,
+								base,
+								[outer_arm],
+								SemanticMatchFail,
+							):
+								Some(arm_tree):
+									result = replace_semantic_match_fail(arm_tree, result)
+								None:
+									failed = True
+									break
+						else:
+							failed = True
+							break
+					None:
+						failed = True
+						break
+			None:
+				failed = True
+				break
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
 private pure func compile_pattern_matrix(
 	kind: PatternMatrixAccessorKind,
 	base: CoreSemanticMatchAccessor,
@@ -1719,11 +2071,16 @@ private pure func compile_pattern_matrix(
 							position,
 							fallback,
 						)
+					else if pattern_matrix_column_has_tuple(arms, position):
+						compile_pattern_matrix_tuple_column(kind, base, arms, position, fallback)
+					else if pattern_matrix_column_has_list(arms, position):
+						compile_pattern_matrix_list_column(kind, base, arms, position, fallback)
 					else:
 						None
 				None:
 					Some(
-						SemanticMatchLeaf(
+						prepend_semantic_bindings(
+							first_arm.body,
 							first_arm.bindings.concat(
 								pattern_matrix_bindings(
 									kind,
@@ -1731,7 +2088,6 @@ private pure func compile_pattern_matrix(
 									first_arm.patterns,
 								),
 							),
-							first_arm.body,
 						),
 					)
 		None:
@@ -1758,7 +2114,7 @@ private pure func compile_tuple_match_cases(
 				arms = arms.append({
 					patterns = patterns,
 					bindings = [],
-					body = match_case.body,
+					body = SemanticMatchLeaf([], match_case.body),
 				})
 			_:
 				failed = True
@@ -2232,7 +2588,7 @@ private pure func compile_list_pattern_sequence(
 						failed = True
 						break
 			Some(CatchallListPatternArm(bindings, body)):
-				result = SemanticMatchLeaf(bindings, body)
+				result = prepend_semantic_bindings(body, bindings)
 			None:
 				failed = True
 				break
@@ -2263,7 +2619,7 @@ private pure func compile_list_match_cases(
 				arms = arms.append(ExactListPatternArm({
 					patterns = patterns,
 					bindings = [],
-					body = match_case.body,
+					body = SemanticMatchLeaf([], match_case.body),
 				}))
 			ListPattern(patterns, spread):
 				arms = arms.append(SpreadListPatternArm({
@@ -2274,7 +2630,7 @@ private pure func compile_list_match_cases(
 						spread,
 						match_case.body,
 					),
-					body = match_case.body,
+					body = SemanticMatchLeaf([], match_case.body),
 				}))
 			_:
 				failed = True

@@ -3249,8 +3249,21 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
             unsupported (case_path ^ ".body") "nested literal match"
         | Core.CTSwitchTag _ ->
             unsupported (case_path ^ ".body") "nested constructor match"
-        | Core.CTSwitchLen _ ->
-            unsupported (case_path ^ ".body") "nested length match"
+        | Core.CTSwitchLen _ as subtree ->
+            let nested_match =
+              { expr with desc = Core.CMatch (match_scrutinee, subtree) }
+            in
+            let* body_value =
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
+                union_names enum_constructors (case_path ^ ".body") nested_match
+            in
+            Ok
+              (obj
+                 [
+                   ("literal", literal_value);
+                   ("bindings", arr []);
+                   ("body", body_value);
+                 ])
       in
       let* scrutinee_value =
         expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
@@ -3553,8 +3566,21 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
             else unsupported (case_path ^ ".body") "nested literal match"
         | Core.CTSwitchTag _ ->
             unsupported (case_path ^ ".body") "nested constructor match"
-        | Core.CTSwitchLen _ ->
-            unsupported (case_path ^ ".body") "nested length match"
+        | Core.CTSwitchLen _ as subtree ->
+            let nested_match =
+              { expr with desc = Core.CMatch (match_scrutinee, subtree) }
+            in
+            let* body_value =
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
+                union_names enum_constructors (case_path ^ ".body") nested_match
+            in
+            Ok
+              (obj
+                 [
+                   ("literal", literal_value);
+                   ("bindings", arr []);
+                   ("body", body_value);
+                 ])
       and constructor_match_case_json (match_scrutinee : Core.core) path
           cts_scrut index ctor subtree =
             let case_path = Printf.sprintf "%s.cases[%d]" path index in
@@ -7622,7 +7648,8 @@ and require_literal_match_tree ~reg union_names ~reusable_match_scrutinee
         ~scrut_ty (path ^ ".fallback") ctl_default
   | Core.CTSwitchLit _ -> unsupported path "nested literal match"
   | Core.CTSwitchTag _ -> unsupported path "nested constructor match"
-  | Core.CTSwitchLen _ -> unsupported path "nested length match"
+  | Core.CTSwitchLen _ as subtree ->
+      require_constructor_match_tree ~reg union_names scrut_ty path subtree
 
 and require_tailrec_literal_match_tree ~reg union_names
     ~reusable_match_scrutinee ~scrut_ty path return_ty = function
@@ -7650,7 +7677,8 @@ and require_tailrec_literal_match_tree ~reg union_names
         ctl_default
   | Core.CTSwitchLit _ -> unsupported path "nested literal match"
   | Core.CTSwitchTag _ -> unsupported path "nested constructor match"
-  | Core.CTSwitchLen _ -> unsupported path "nested length match"
+  | Core.CTSwitchLen _ as subtree ->
+      require_constructor_match_tree ~reg union_names scrut_ty path subtree
 
 and require_literal_match_cases ~reg union_names ~reusable_match_scrutinee
     ~scrut_ty path cases =

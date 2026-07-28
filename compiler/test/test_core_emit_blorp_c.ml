@@ -104,6 +104,78 @@ let test_projection_accepts_scoped_closure_call_argument () =
   | Error error ->
       Alcotest.fail (Core_emit_blorp_c.unsupported_to_string error)
 
+let test_projection_accepts_length_match_nested_in_literal_case () =
+  let int_ty = TyNamed ("Int", []) in
+  let string_ty = TyNamed ("String", []) in
+  let list_ty = TyNamed ("List", [ int_ty ]) in
+  let scrutinee_ty = TyTuple [ string_ty; list_ty ] in
+  let scrutinee_var = Var.named "input" in
+  let body =
+    {
+      desc =
+        CMatch
+          ( { desc = CVar scrutinee_var; ty = scrutinee_ty; loc },
+            CTSwitchLit
+              {
+                ctl_scrut = AccTupleField (AccRoot, 0);
+                ctl_cases =
+                  [
+                    ( LitString
+                        ("items", { sf_multiline = false; sf_raw = false }),
+                      CTSwitchLen
+                        {
+                          ctl_len_scrut = AccTupleField (AccRoot, 1);
+                          ctl_len_cases =
+                            [
+                              ( 1,
+                                CTLeaf
+                                  {
+                                    ct_bindings = [];
+                                    ct_body =
+                                      { desc = CLit (LitInt 1L); ty = int_ty; loc };
+                                  } );
+                            ];
+                          ctl_len_geq = None;
+                          ctl_len_default = Some CTFail;
+                        } );
+                  ];
+                ctl_default =
+                  CTLeaf
+                    {
+                      ct_bindings = [];
+                      ct_body = { desc = CLit (LitInt 0L); ty = int_ty; loc };
+                    };
+              } );
+      ty = int_ty;
+      loc;
+    }
+  in
+  let func =
+    {
+      cf_name = "classify";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params =
+        [ { cp_name = scrutinee_var; cp_ty = scrutinee_ty; cp_loc = loc } ];
+      cf_return_ty = int_ty;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 10;
+    }
+  in
+  let program = [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ] in
+  let reg = Codegen_types.create_registry () in
+  match Core_emit_blorp_c.program_json ~reg program with
+  | Ok json ->
+      Alcotest.(check bool)
+        "literal case preserves nested length decision" true
+        (Modules.contains
+           (Lsp_json.to_string json)
+           {|"kind":"length_match"|})
+  | Error error ->
+      Alcotest.fail (Core_emit_blorp_c.unsupported_to_string error)
+
 let deferred_inline_struct_list_program ~layout_c_type ~layout_element_ty
     ~box_source_ty ~value_ty ~needs_release ~transfers_ownership =
   let point_list_ty = TyNamed ("List", [ layout_element_ty ]) in
@@ -270,6 +342,8 @@ let suite =
           test_global_projection_preserves_absent_source_module;
         Alcotest.test_case "scoped closure-call argument" `Quick
           test_projection_accepts_scoped_closure_call_argument;
+        Alcotest.test_case "length match nested in literal case" `Quick
+          test_projection_accepts_length_match_nested_in_literal_case;
         Alcotest.test_case "deferred inline-struct list reboxing" `Quick
           test_projection_accepts_deferred_inline_struct_list_reboxing;
         Alcotest.test_case "deferred stack-option list reboxing" `Quick
