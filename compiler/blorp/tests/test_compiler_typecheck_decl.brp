@@ -193,6 +193,12 @@ pure func source_span() -> CompilerSourceSpan:
 	compiler_source_span(src, cursor, cursor)
 
 
+pure func source_span_at(offset: Int) -> CompilerSourceSpan:
+	src: CompilerSourceFile = source_file()
+	cursor: CompilerCursor = compiler_source_cursor_at(src, offset)
+	compiler_source_span(src, cursor, cursor)
+
+
 pure func ident(text: String) -> ParsedIdentifier:
 	parsed_identifier(text, source_span())
 
@@ -451,6 +457,27 @@ pure func function_body_decl_with_annotations(
 		annotations = annotations,
 		doc = None,
 		span = source_span(),
+	})
+
+
+pure func function_body_decl_with_span(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+	span: CompilerSourceSpan,
+) -> ParsedDecl:
+	FunctionParsedDecl({
+		name = ident(name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = body,
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = span,
 	})
 
 
@@ -2218,6 +2245,119 @@ func test_materialize_program_bodies_preserves_implicit_type_params() -> Bool:
 			False
 
 
+func test_materialize_program_bodies_reuses_registered_function_signature() -> Bool:
+	registered_program = program(
+		[
+			function_body_decl(
+				"identity",
+				[named_param("value", int_type())],
+				Some(int_type()),
+				Some(decl_name_expr("value")),
+			),
+		],
+	)
+	materialized_program = program(
+		[
+			function_body_decl(
+				"identity",
+				[named_param("value", string_type())],
+				Some(string_type()),
+				Some(decl_name_expr("value")),
+			),
+		],
+	)
+	base_state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(
+				compiler_typecheck_state_empty(),
+				registered_program,
+			),
+			registered_program,
+		),
+		registered_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, materialized_program)
+
+	match result.program.decls.get(0):
+		Some(CompilerTypedFunctionDecl(info)):
+			source_return_ok = match info.source_return_type:
+				Some(return_type):
+					compiler_types_equal(return_type, compiler_type_string())
+				None:
+					False
+
+			body_ok = match info.body:
+				Some(body):
+					compiler_types_equal(
+						compiler_typed_expr_semantic_type(body),
+						compiler_type_int(),
+					)
+				None:
+					False
+
+			(
+				result.state.errors.length() == 0
+				and info.param_types.length() == 1
+				and compiler_types_equal(
+					info.param_types.get_or(0, compiler_type_void()),
+					compiler_type_int(),
+				)
+				and source_return_ok
+				and compiler_types_equal(info.semantic_return_type, compiler_type_int())
+				and body_ok
+			)
+		_:
+			False
+
+
+func test_materialize_program_bodies_selects_exact_overload_signature() -> Bool:
+	source_program = program([
+		function_body_decl_with_span(
+			"identity",
+			[named_param("value", int_type())],
+			Some(int_type()),
+			Some(decl_name_expr("value")),
+			source_span_at(0),
+		),
+		function_body_decl_with_span(
+			"identity",
+			[named_param("value", string_type())],
+			Some(string_type()),
+			Some(decl_name_expr("value")),
+			source_span_at(1),
+		),
+	])
+	base_state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+
+	match (result.program.decls.get(0), result.program.decls.get(1)):
+		(Some(CompilerTypedFunctionDecl(first)), Some(CompilerTypedFunctionDecl(second))):
+			callables_ok = match (first.callable_id, second.callable_id):
+				(Some(first_id), Some(second_id)):
+					first_id != second_id
+				_:
+					False
+
+			result.state.errors.length() == 0 and callables_ok and compiler_types_equal(
+				first.param_types.get_or(0, compiler_type_void()),
+				compiler_type_int(),
+			) and compiler_types_equal(
+				first.semantic_return_type,
+				compiler_type_int(),
+			) and compiler_types_equal(
+				second.param_types.get_or(0, compiler_type_void()),
+				compiler_type_string(),
+			) and compiler_types_equal(second.semantic_return_type, compiler_type_string())
+		_:
+			False
+
+
 func test_materialize_generic_type_decls_use_explicit_semantic_params() -> Bool:
 	generic_record = RecordParsedDecl({
 		name = ident("Box"),
@@ -3859,6 +3999,14 @@ tests: TestSuite = {
 		(
 			"materialize program bodies preserves implicit type params",
 			test_materialize_program_bodies_preserves_implicit_type_params,
+		),
+		(
+			"materialize program bodies reuses registered function signature",
+			test_materialize_program_bodies_reuses_registered_function_signature,
+		),
+		(
+			"materialize program bodies selects exact overload signature",
+			test_materialize_program_bodies_selects_exact_overload_signature,
 		),
 		(
 			"materialize generic type declarations use explicit semantic params",

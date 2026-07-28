@@ -95,6 +95,20 @@ do
 		exit 1
 	fi
 done
+if ! grep -Fq \
+	'compiler="${BLORP_TYPECHECK_PROFILE_COMPILER:-$repo_root/compiler/_build/blorp-cli/blorp}"' \
+	benchmarks/compiler_typecheck_profile
+then
+	echo "FAIL: compiler_typecheck_profile must execute the artifact built by build-blorp-cli" >&2
+	exit 1
+fi
+if ! grep -Fq \
+	'compiler/_build/default/bin/blorp_ocaml_middle.exe' \
+	benchmarks/compiler_typecheck_profile
+then
+	echo "FAIL: compiler_typecheck_profile must pair the build artifact with its semantic worker" >&2
+	exit 1
+fi
 for bridge_env in \
 	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
 	BLORP_COMPILER_PARSER_BRIDGE_BIN \
@@ -357,10 +371,6 @@ profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/com
 printf '#!/usr/bin/env bash\nprintf "PROFILE_CACHE_SMOKE\\n"\n' >"$profile_cache_binary"
 chmod +x "$profile_cache_binary"
 
-make() {
-	:
-}
-
 find() {
 	:
 }
@@ -382,16 +392,17 @@ uname() {
 	printf 'mock-platform\n'
 }
 
-export -f make find shasum cc uname
+export -f find shasum cc uname
 profile_cache_output=$(
 	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
-	BLORP_COMPILER_BRIDGE_BIN=/bin/true \
-	BLORP_TYPECHECK_PROFILE_COMPILER=/bin/true \
+	BLORP_COMPILER_BRIDGE_BIN=/usr/bin/true \
+	BLORP_OCAML_MIDDLE_BIN=/usr/bin/true \
+	BLORP_TYPECHECK_PROFILE_COMPILER=/usr/bin/true \
 	BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
 	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
 	./benchmarks/compiler_typecheck_profile
 )
-unset -f make find shasum cc uname
+unset -f find shasum cc uname
 if [ "$profile_cache_output" != "PROFILE_CACHE_SMOKE" ]; then
 	echo "FAIL: compiler_typecheck_profile must support default mode under set -u" >&2
 	exit 1

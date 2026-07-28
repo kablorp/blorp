@@ -131,13 +131,18 @@ benchmarks/compiler_enum_field_layout
 ```bash
 benchmarks/compiler_typecheck_profile
 benchmarks/compiler_typecheck_profile 2 2 64 128
+benchmarks/compiler_typecheck_profile 2 2 64 128 fallback
 ```
 
 The positional controls are iterations, module count, nested type depth, and
-typed probes per module. The default `1 1 64 128` workload is intended for fast
-local comparisons. The runner builds the profiled executable through the
-public production compiler and caches it by compiler, benchmark,
-standard-library, runner, bootstrap/helper, platform, and C-toolchain content.
+typed probes per module. An optional fifth argument selects the parsed-program
+mode: `retained` is the default, while `fallback` exercises the text-parsing
+boundary. The default `1 1 64 128 retained` workload is intended for fast local
+comparisons. The runner builds and directly uses the workspace production
+compiler CLI artifact at `compiler/_build/blorp-cli/blorp`, invokes its public
+`compile --profile` path, and pairs it with the current private semantic worker.
+It caches the profiled executable by compiler, benchmark, standard-library,
+runner, helper, platform, and C-toolchain content.
 The first run for a new key performs the full instrumented build; subsequent
 runs execute the cached binary directly. Benchmark stdout contains one
 `TYPECHECK_PROFILE_BENCH` summary, including `workload_valid=True` only when
@@ -145,13 +150,20 @@ every iteration produced the expected artifact and declaration counts.
 Function and `FLAME:` profile rows are written to stderr. Function times are
 inclusive and overlap along nested call chains, so compare the same rows and
 call counts across revisions rather than adding row percentages or treating
-them as disjoint wall time.
+them as disjoint wall time. Request construction is excluded from
+`elapsed_microseconds` but remains visible in the process-wide function profile;
+use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
+typecheck workload itself.
 
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, renderer-source, prepared-helper, and
 legacy parser overrides by default. This keeps one cache key tied to one
-effective compiler graph. For source-level iteration with already prepared
-parser, renderer, and typecheck helpers, set
+effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
+compiler CLI, and `BLORP_OCAML_MIDDLE_BIN` may override its semantic worker.
+Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building those executables
+separately when repeated source-level measurements should avoid the workspace
+build check. For iteration with already prepared parser, renderer, and
+typecheck helpers, set
 `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide their three
 `BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and
 includes their contents in the artifact cache key.

@@ -133,6 +133,7 @@ Relevant implementation:
 | 7c | Reorder eligible internal fields by general descending alignment | Deprioritized | No narrow numeric fields in current compiler records; explicit enums are handled separately by Slice 8 and general sorting still requires a nested-layout model |
 | 8 | Store bounded explicit-enum fields compactly in internal heap records | Implemented locally | 75 retained compiler fields use `uint8_t`; nine records shrink and four cross allocator classes; Linux O0/O2 confirms byte fields while scalar and foreign representations remain C `long` |
 | 9 | Cache conservative nominal type-containment summaries | Implemented locally | Six-pair typecheck replay is 7.7% to 37.1% faster on repeated probes, sparse registration overhead is 0.71 ms, and bounded peak RSS is slightly lower |
+| 10 | Skip resource-capability scans for proven-empty nominal types | Implemented locally | Six-pair typecheck replay is 9.5% faster at depth 64 and 12.1% faster at depth 128; redundant carrier and capability scans disappear |
 
 ## Slice 0: Layout Probe
 
@@ -1150,6 +1151,40 @@ Raw samples are retained in
 Focused environment, inference, declaration, resource, and benchmark suites
 pass. The serial compiler-unit and compiler gates pass 3,006 of 3,006 tests.
 
+### Slice 10: Proven-Empty Resource Scan Preflight
+
+Implemented locally on 2026-07-27. The resource-capability preflight now asks
+the environment whether a nominal type's valid containment summary proves all
+three relevant properties false. Closed record and union shapes skip carrier,
+one-shot stream, and resource-source scans before allocating shape-memo
+entries. Generic, forward, recursive, missing, direct-resource, and invalidated
+summaries retain the previous conservative path.
+
+Six alternating baseline/candidate pairs produced these medians:
+
+| Workload | Baseline | Candidate | Change |
+|---|---:|---:|---:|
+| depth 64, 128 probes | 233.492 ms | 211.365 ms | -9.5% |
+| depth 128, 256 probes | 518.605 ms | 456.014 ms | -12.1% |
+
+The candidate won all twelve paired runs. In the default profile,
+`compiler_check_resource_capability_binding` fell from 24.755 ms to 4.885 ms
+inclusive, and `compiler_type_requires_resource_capability_scan` fell from
+3.971 ms to 1.760 ms. The 256-call carrier and capability scan rows disappeared
+from the closed-nominal workload.
+
+The baseline artifact key is
+`d17a0c02ce446c28214d90ecdc84cab2f23f397724e57b163bb9f3f0572e1931`; the
+candidate key is
+`f15e6a43e76ec78fe245154c1060441201bc8db081b55d3e3e1e1b4a325d1c45`.
+Raw samples are retained in
+`benchmarks/results/compiler_typecheck_resource_scan_skip_2026-07-27.tsv`.
+The profiling runner was also migrated from the removed current-host wrapper
+command to the built workspace compiler CLI artifact's public
+`compile --profile` path, paired with the current private semantic worker. Its
+request fixture now measures retained parsed programs by default and can select
+fallback text parsing explicitly.
+
 ## Verification Matrix
 
 Every representation-changing slice must cover:
@@ -1211,3 +1246,4 @@ first feedback loop.
 | 2026-07-26 | 8 | Accept byte storage for declared explicit-enum fields in internal heap records; keep broader enum compaction separate | 75 retained fields compact across 67 records; nine record sizes and four allocator classes improve, while foreign and scalar ABI remain C `long` |
 | 2026-07-26 | Linux validation | Accept the current compact layouts on Linux amd64 and use the pinned release's verified helpers by default | O0/O2 layouts match Darwin intent; optimized allocator regression passes; clean build completes under 7.75 GiB, and packaged helpers avoid overlapping local helper compilation with the full-host heap while preserving explicit tested-helper overrides |
 | 2026-07-27 | 9 | Accept conservative nominal containment summaries as negative-only typecheck scan caches | Six-pair medians improve 7.7% to 37.1% as repeated probes deepen; sparse overhead is 0.71 ms; bounded RSS is slightly lower; generic-name and binding-replacement regressions pass |
+| 2026-07-27 | 10 | Accept the proven-empty nominal resource-scan preflight | All twelve paired runs improve; medians fall 9.5% and 12.1%; generic, recursive, direct-resource, missing, and invalidated cases remain conservative |
