@@ -173,6 +173,8 @@ benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --primitive-storage-probes-per-module 512
 benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --resource-scan-depth 64 --resource-scan-probes-per-module 128
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --type-instantiation-depth 32 --type-instantiation-probes-per-module 32
 ```
 
 Aggregate probes sample record types evenly across the full declared chain,
@@ -207,6 +209,11 @@ implementation validation:
 benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --self-resolution-depth 64 --self-resolution-probes-per-module 128
 ```
+
+Type-instantiation probes generate generic function signatures with a deeply
+unchanged concrete tuple, a partially changed tuple, and a nested generic type
+whose complete ancestor path changes. They exercise all three paths through
+`compiler_type_instantiate_type_params`.
 
 Use `--warmup-runs N --runs N` for low-noise comparisons. The bridge and request
 are prepared once, every warmup and measured response is validated, and the
@@ -246,6 +253,17 @@ helper through `./blorp __compiler-bridge-prepare` before starting measurement.
 Bridge preparation is excluded from the reported time. Results include SHA-256
 digests of the bridge and request so saved before/after measurements remain
 auditable.
+
+`compiler_type_instantiation` is the fast preset for generic type
+instantiation work. Its signatures combine unchanged, partially changed, and
+fully changed recursive transforms in the same request:
+
+```bash
+benchmarks/compiler_type_instantiation
+benchmarks/compiler_type_instantiation \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+```
 
 ### Captured Typecheck Replay
 

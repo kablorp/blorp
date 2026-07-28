@@ -138,78 +138,149 @@ pure func compiler_type_copy(typ: CompilerType) -> CompilerType:
 -- initially has the same shape as an ordinary nominal type. Semantic phases
 -- must make that identity explicit before nominal names and generic variables
 -- require different layout or specialization behavior.
+-- List.set clones shared storage on the first changed element, then updates
+-- the unique clone in place. Fully unchanged lists allocate nothing.
+private pure func compiler_type_instantiate_type_param_list_if_changed(
+	type_params: List[String],
+	types: List[CompilerType],
+) -> Option[List[CompilerType]]:
+	var instantiated: List[CompilerType] = types
+	var changed: Bool = False
+	var index: Int = 0
+
+	for typ in types:
+		item_changed: Bool = match compiler_type_instantiate_type_params_if_changed(
+			type_params,
+			typ,
+		):
+			Some(instantiated_type):
+				instantiated = instantiated.set(index, instantiated_type)
+				True
+			None:
+				False
+
+		changed = changed or item_changed
+		index += 1
+
+	if changed:
+		Some(instantiated)
+	else:
+		None
+
+
+private pure func compiler_type_instantiate_type_params_if_changed(
+	type_params: List[String],
+	typ: CompilerType,
+) -> Option[CompilerType]:
+	match typ:
+		CompilerNamedType(name, args):
+			if args.is_empty() and type_params.contains(name):
+				Some(CompilerTypeVar(compiler_type_name_copy(name)))
+			else:
+				match compiler_type_instantiate_type_param_list_if_changed(type_params, args):
+					Some(instantiated_args):
+						Some(CompilerNamedType(compiler_type_name_copy(name), instantiated_args))
+					None:
+						None
+		CompilerArrayType(element, dims):
+			element_result = compiler_type_instantiate_type_params_if_changed(type_params, element)
+			dims_result = compiler_type_instantiate_type_param_list_if_changed(type_params, dims)
+
+			match element_result:
+				Some(instantiated_element):
+					match dims_result:
+						Some(instantiated_dims):
+							Some(CompilerArrayType(instantiated_element, instantiated_dims))
+						None:
+							Some(CompilerArrayType(instantiated_element, dims))
+				None:
+					match dims_result:
+						Some(instantiated_dims):
+							Some(CompilerArrayType(element, instantiated_dims))
+						None:
+							None
+		CompilerFunctionType(is_pure, params, return_type):
+			params_result = compiler_type_instantiate_type_param_list_if_changed(
+				type_params,
+				params,
+			)
+			return_result = compiler_type_instantiate_type_params_if_changed(
+				type_params,
+				return_type,
+			)
+
+			match params_result:
+				Some(instantiated_params):
+					match return_result:
+						Some(instantiated_return):
+							Some(
+								CompilerFunctionType(
+									is_pure,
+									instantiated_params,
+									instantiated_return,
+								),
+							)
+						None:
+							Some(CompilerFunctionType(is_pure, instantiated_params, return_type))
+				None:
+					match return_result:
+						Some(instantiated_return):
+							Some(CompilerFunctionType(is_pure, params, instantiated_return))
+						None:
+							None
+		CompilerTypeVar(_):
+			None
+		CompilerConstIntType(_):
+			None
+		CompilerTupleType(elements):
+			match compiler_type_instantiate_type_param_list_if_changed(type_params, elements):
+				Some(instantiated_elements):
+					Some(CompilerTupleType(instantiated_elements))
+				None:
+					None
+		CompilerSelfType:
+			None
+		CompilerVarDimsType(_):
+			None
+		CompilerRangeType(inner):
+			match compiler_type_instantiate_type_params_if_changed(type_params, inner):
+				Some(instantiated_inner):
+					Some(CompilerRangeType(instantiated_inner))
+				None:
+					None
+		CompilerDimOpType(op, left, right):
+			left_result = compiler_type_instantiate_type_params_if_changed(type_params, left)
+			right_result = compiler_type_instantiate_type_params_if_changed(type_params, right)
+
+			match left_result:
+				Some(instantiated_left):
+					match right_result:
+						Some(instantiated_right):
+							Some(CompilerDimOpType(op, instantiated_left, instantiated_right))
+						None:
+							Some(CompilerDimOpType(op, instantiated_left, right))
+				None:
+					match right_result:
+						Some(instantiated_right):
+							Some(CompilerDimOpType(op, left, instantiated_right))
+						None:
+							None
+		CompilerMetaType(_):
+			None
+
+
 pure func compiler_type_instantiate_type_params(
 	type_params: List[String],
 	typ: CompilerType,
 ) -> CompilerType:
-	match typ:
-		CompilerNamedType(name, args):
-			if args.is_empty() and type_params.contains(name):
-				CompilerTypeVar(compiler_type_name_copy(name))
-			else:
-				var instantiated_args: List[CompilerType] = []
-
-				for arg in args:
-					instantiated_args = instantiated_args.append(
-						compiler_type_instantiate_type_params(type_params, arg),
-					)
-
-				CompilerNamedType(
-					compiler_type_name_copy(name),
-					instantiated_args,
-				)
-		CompilerArrayType(element, dims):
-			var instantiated_dims: List[CompilerType] = []
-
-			for dim in dims:
-				instantiated_dims = instantiated_dims.append(
-					compiler_type_instantiate_type_params(type_params, dim),
-				)
-
-			CompilerArrayType(
-				compiler_type_instantiate_type_params(type_params, element),
-				instantiated_dims,
-			)
-		CompilerFunctionType(is_pure, params, return_type):
-			var instantiated_params: List[CompilerType] = []
-
-			for param in params:
-				instantiated_params = instantiated_params.append(
-					compiler_type_instantiate_type_params(type_params, param),
-				)
-
-			CompilerFunctionType(
-				is_pure,
-				instantiated_params,
-				compiler_type_instantiate_type_params(type_params, return_type),
-			)
-		CompilerTypeVar(name):
-			CompilerTypeVar(compiler_type_name_copy(name))
-		CompilerConstIntType(value):
-			CompilerConstIntType(value)
-		CompilerTupleType(elements):
-			var instantiated_elements: List[CompilerType] = []
-
-			for element in elements:
-				instantiated_elements = instantiated_elements.append(
-					compiler_type_instantiate_type_params(type_params, element),
-				)
-
-			CompilerTupleType(instantiated_elements)
-		CompilerSelfType:
-			CompilerSelfType
-		CompilerVarDimsType(name):
-			CompilerVarDimsType(compiler_type_name_copy(name))
-		CompilerRangeType(inner):
-			CompilerRangeType(compiler_type_instantiate_type_params(type_params, inner))
-		CompilerDimOpType(op, left, right):
-			CompilerDimOpType(
-				op,
-				compiler_type_instantiate_type_params(type_params, left),
-				compiler_type_instantiate_type_params(type_params, right),
-			)
-		CompilerMetaType(meta_id):
-			CompilerMetaType(meta_id)
+	if type_params.is_empty():
+		typ
+	else:
+		match compiler_type_instantiate_type_params_if_changed(type_params, typ):
+			Some(instantiated):
+				instantiated
+			None:
+				typ
 
 
 -- Reconstruct optional types in their owning module so imported callers keep

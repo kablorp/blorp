@@ -111,6 +111,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             resource_scan_probes_per_module=3,
             self_resolution_depth=2,
             self_resolution_probes_per_module=2,
+            type_instantiation_depth=2,
+            type_instantiation_probes_per_module=2,
         )
 
         self.assertEqual(request["action"], "typecheck_graph")
@@ -123,7 +125,7 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             fixture["artifact_order"],
             ["bench/typecheck_0000", "bench/typecheck_0001", "bench/target"],
         )
-        self.assertEqual(fixture["source_declarations"], 37)
+        self.assertEqual(fixture["source_declarations"], 41)
 
         first_source = request["payload"]["modules"][0]["text"]
         self.assertIn("record BenchM0000Shape0002", first_source)
@@ -159,6 +161,14 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             "(value: ((BenchM0000SelfConcrete[((Int, Int), Int)], Int), Int)) -> Int:",
             first_source,
         )
+        self.assertIn(
+            "pure func bench_m0000_instantiate_0001[T]"
+            "(unchanged: ((Int, Int), Int), value: (((Int, Int), Int), T), "
+            "all_changed: List[List[T]])"
+            " -> (((Int, Int), Int), T):",
+            first_source,
+        )
+        self.assertIn("\tvalue", first_source)
 
     def test_benchmark_result_emits_input_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -176,6 +186,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
                 resource_scan_probes_per_module=0,
                 self_resolution_depth=0,
                 self_resolution_probes_per_module=0,
+                type_instantiation_depth=0,
+                type_instantiation_probes_per_module=0,
                 bridge=str(bridge_path),
                 baseline_bridge=None,
                 vmmap=False,
@@ -188,7 +200,19 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 exit_code = self.benchmark.run_benchmark(args)
 
-            request, _ = self.benchmark.fixture_request(1, 1, 1, 0, 0, 0, 0, 0, 0)
+            request, _ = self.benchmark.fixture_request(
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
             request_bytes = json.dumps(
                 request,
                 separators=(",", ":"),
@@ -231,6 +255,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
                 resource_scan_probes_per_module=0,
                 self_resolution_depth=0,
                 self_resolution_probes_per_module=0,
+                type_instantiation_depth=0,
+                type_instantiation_probes_per_module=0,
                 bridge=str(bridge_path),
                 baseline_bridge=None,
                 vmmap=False,
@@ -257,6 +283,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
                 resource_scan_probes_per_module=0,
                 self_resolution_depth=0,
                 self_resolution_probes_per_module=0,
+                type_instantiation_depth=0,
+                type_instantiation_probes_per_module=0,
                 bridge=str(bridge_path),
                 baseline_bridge=str(bridge_path),
                 vmmap=False,
@@ -312,6 +340,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
                 resource_scan_probes_per_module=0,
                 self_resolution_depth=0,
                 self_resolution_probes_per_module=0,
+                type_instantiation_depth=0,
+                type_instantiation_probes_per_module=0,
                 bridge=str(candidate_path),
                 baseline_bridge=str(baseline_path),
                 vmmap=False,
@@ -338,6 +368,8 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
                 resource_scan_probes_per_module=0,
                 self_resolution_depth=0,
                 self_resolution_probes_per_module=0,
+                type_instantiation_depth=0,
+                type_instantiation_probes_per_module=0,
                 bridge=str(bridge_path),
                 baseline_bridge=str(bridge_path),
                 vmmap=False,
