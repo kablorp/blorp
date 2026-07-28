@@ -196,6 +196,50 @@ Resource scan probes place a deeply nested tuple type in function signatures.
 Keep the other fixture dimensions at 1 or 0 when using the final command so
 recursive declaration resource-shape scanning is isolated.
 
+Self-resolution probes generate a trait and implementation whose method
+parameters contain deeply nested `Self` types. The implementation targets a
+local generic record with an equally deep concrete type argument, so both the
+traversed signature and substituted `concrete_type` scale with the requested
+depth. They exercise the production `compiler_resolve_self` path during
+implementation validation:
+
+```bash
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --self-resolution-depth 64 --self-resolution-probes-per-module 128
+```
+
+Use `--warmup-runs N --runs N` for low-noise comparisons. The bridge and request
+are prepared once, every warmup and measured response is validated, and the
+summary reports minimum, median, and maximum elapsed time plus median and
+maximum peak RSS.
+
+Pass two prepared helpers to compare a candidate and baseline in one invocation:
+
+```bash
+benchmarks/compiler_typecheck_memory \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin \
+  --warmup-runs 2 --runs 10
+```
+
+Comparison mode alternates bridge order on every round, requires byte-identical
+responses, requires even warmup and measured run counts, preserves every sample
+and its execution order, and reports median paired latency and peak-RSS
+percentage changes. Negative changes mean the candidate used less time or
+memory than the baseline.
+
+`compiler_type_ownership` is the fast preset for ownership work. It combines
+bounded resource scans and `Self` resolution, performs two warmups and six
+measured runs, and accepts trailing overrides:
+
+```bash
+benchmarks/compiler_type_ownership
+benchmarks/compiler_type_ownership --runs 9 --self-resolution-depth 96
+benchmarks/compiler_type_ownership \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+```
+
 The runner uses `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` when it names a prepared
 helper. `--bridge PATH` overrides it. Otherwise, the runner prepares a cached
 helper through `./blorp __compiler-bridge-prepare` before starting measurement.
