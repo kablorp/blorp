@@ -62,9 +62,9 @@ Current state:
 
 - Typecheck/inference mints callable ids and attaches `resolved_call` metadata
   to calls when the source target is known.
-- `Core_lower` lowers direct resolved calls as `CKSelectedDirect <id>` so Core
-  can use the source-selected target before the canonical post-flatten name is
-  available.
+- Blorp Core lowering preserves direct resolved calls as
+  `CKSelectedDirect <id>` so Core can use the source-selected target before
+  call resolution.
 - `Core_resolve` promotes selected and name-based calls to `CKUser (name,
   Some def_id)` when it can prove the concrete target.
 - The Blorp C emitter already prefers DefId-based C names, but still has a

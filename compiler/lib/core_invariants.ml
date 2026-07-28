@@ -20,7 +20,6 @@
     - [check_no_tyvar_leak] — ENABLED (post-mono)
     - [check_selected_direct_mono_contract] — ENABLED (post-mono)
     - [check_no_sugar] — ENABLED (post-desugar, bookended at Perceus and Final)
-    - [check_no_desugarable_mutation] — ENABLED (post-desugar)
     - [check_no_cmatcharms] — ENABLED (post-match, bookended at Perceus and Final)
     - [check_no_codegen_unprepared_forms] — ENABLED (Final)
     - [check_call_ownership_contracts_at] — ENABLED (Perceus and Final)
@@ -701,7 +700,7 @@ let rec type_has_tyvar (t : Ast.type_expr) : bool =
        tyvar leak surfaces the bug instead of silently hiding it. *)
   | Ast.TyMeta _ | Ast.TyConstInt _ -> false
 
-(** After [Core_mono], user-function call sites should have concrete
+(** After monomorphization, user-function call sites should have concrete
     argument *and* return types. Substituting both is mono's job; a
     tyvar in either position is a specialization miss.
 
@@ -783,7 +782,8 @@ let check_no_tyvar_leak (prog : Core.core_program) : Core_error.t list =
     function call. After mono, a closed function may only select another
     closed function, and the callee must still be a direct variable reference.
     Definition IDs can collide across modules at this boundary, so generic
-    target checks use the same lossless callable-name matching as Core_mono.
+    target checks use the same lossless callable-name matching as the Blorp
+    monomorphizer.
     Generic templates remain in the program as specialization sources, so
     calls inside those templates are intentionally outside this check. *)
 let check_selected_direct_mono_contract (prog : Core.core_program) :
@@ -818,7 +818,7 @@ let check_selected_direct_mono_contract (prog : Core.core_program) :
           when selected_call_targets_generic def_id var.vname ->
             violation_at Core_stage.Mono expr.loc
               ~hint:
-                "Core_mono must rewrite calls from closed functions to a \
+                "monomorphization must rewrite calls from closed functions to a \
                  concrete specialization before the post-mono handoff."
               "selected-direct call from closed code still targets a generic \
                function"
@@ -857,7 +857,7 @@ let check_selected_direct_mono_contract (prog : Core.core_program) :
    Post-debug: no debug blocks survive
    ============================================================================ *)
 
-(** [Core_debug] is the only pass that decides whether [debug:] blocks are
+(** The Blorp debug stage is the only pass that decides whether [debug:] blocks are
     erased or retained. Downstream passes and emitters should never see
     [CDebugBlock]; by then the block is either [CVoid] (normal build) or its
     unwrapped body (debug build). *)
@@ -870,10 +870,10 @@ let check_no_debug_blocks_at (stage : Core_stage.t) (prog : Core.core_program) :
           let v =
             violation_at stage e.loc
               ~hint:
-                "Core_debug should lower every debug block immediately after \
-                 Core_lower. Do not let later passes or emitters decide debug \
+                "the Blorp debug stage should lower every debug block before \
+                 the semantic-middle boundary. Do not let later passes decide debug \
                  build behavior."
-              "debug block survived Core_debug lowering"
+              "debug block survived Blorp debug lowering"
           in
           v :: acc
       | _ -> acc)
@@ -884,8 +884,8 @@ let check_no_debug_blocks_at (stage : Core_stage.t) (prog : Core.core_program) :
    Post-desugar: no sugar constructors survive
    ============================================================================ *)
 
-(** After [Core_desugar], no sugar constructors should survive. [CStringInterp]
-    and [CRecordUpdate] are handled by [Core_desugar]. A surviving sugar node
+(** After Blorp desugaring, no sugar constructors should survive.
+    [CStringInterp] and [CRecordUpdate] are handled before this boundary. A surviving sugar node
     means a lowering/desugaring path missed a case and emit would otherwise
     need a phase-violating fallback. *)
 let check_no_sugar (prog : Core.core_program) : Core_error.t list =
@@ -903,7 +903,7 @@ let check_no_sugar (prog : Core.core_program) : Core_error.t list =
             violation_at Core_stage.Desugar e.loc
               ~hint:
                 (Printf.sprintf
-                   "%s is a sugar constructor — Core_desugar should have \
+                   "%s is a sugar constructor — Blorp desugaring should have \
                     eliminated it before downstream Core passes."
                    n)
               (Printf.sprintf "sugar node %s survived desugaring" n)
@@ -914,52 +914,12 @@ let check_no_sugar (prog : Core.core_program) : Core_error.t list =
   |> List.rev
 
 (* ============================================================================
-   Post-desugar: no desugarable mutable locals survive
-   ============================================================================ *)
-
-(** [Core_ssa] runs as part of the Desugar stage and owns mutable locals
-    that are either never reassigned or reassigned in straight-line code.
-    Control-flow mutation is explicitly out of scope for that pass today,
-    so this invariant flags only the shapes that [Core_ssa] is expected
-    to eliminate. *)
-let check_no_desugarable_mutation (prog : Core.core_program) : Core_error.t list
-    =
-  fold_program
-    (fun acc e ->
-      match e.Core.desc with
-      | Core.CLet (b, body) when b.bind_mut -> (
-          match Core_ssa.classify_assignment_shape b.bind_var.vname body with
-          | Core_ssa.No_assign ->
-              let v =
-                violation_at Core_stage.Desugar e.loc
-                  ~hint:
-                    "Core_ssa should convert var bindings with no reassignment \
-                     into immutable lets during the Desugar stage."
-                  "mutable local binding without assignment survived desugaring"
-              in
-              v :: acc
-          | Core_ssa.Straight_line_assign ->
-              let v =
-                violation_at Core_stage.Desugar e.loc
-                  ~hint:
-                    "Core_ssa should rewrite straight-line reassignment into \
-                     versioned immutable lets during the Desugar stage."
-                  "straight-line mutable assignment survived desugaring"
-              in
-              v :: acc
-          | Core_ssa.Control_flow_assign -> acc)
-      | _ -> acc)
-    [] prog
-  |> List.rev
-
-(* ============================================================================
    Post-match: no raw CMatchArms survives
    ============================================================================ *)
 
-(** After [Core_match], every pattern match should have been compiled
-    from [CMatchArms] into the decision-tree [CMatch] form. A surviving
-    [CMatchArms] means [Core_match]'s [classify_arms] fell through for
-    this shape and emission would hit a dead path. *)
+(** After the Blorp match pass, every pattern match should have been compiled
+    from [CMatchArms] into the decision-tree [CMatch] form. A surviving raw
+    match means the early pipeline violated its post-match boundary. *)
 let check_no_cmatcharms (prog : Core.core_program) : Core_error.t list =
   fold_program
     (fun acc e ->
@@ -968,10 +928,9 @@ let check_no_cmatcharms (prog : Core.core_program) : Core_error.t list =
           let v =
             violation_at Core_stage.Match e.loc
               ~hint:
-                "Core_match should have compiled every CMatchArms into the \
-                 decision-tree CMatch form. A surviving CMatchArms means \
-                 classify_arms fell through — add the missing arm-shape \
-                 handler."
+                "The Blorp match pass must compile every CMatchArms into the \
+                 decision-tree CMatch form before the semantic-middle \
+                 boundary."
               "raw CMatchArms survived match-compilation"
           in
           v :: acc
@@ -1041,7 +1000,7 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
       if parent_id < 0 then
         violation_at stage loc
           ~hint:
-            "Core_lower should assign non-negative task scope ids, with 0 \
+            "Blorp Core lowering should assign non-negative task scope ids, with 0 \
              reserved for the root task scope."
           (Printf.sprintf "%s parent task scope id must be non-negative, got %d"
              subject parent_id)
@@ -1052,7 +1011,7 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
       if child_id <= 0 then
         violation_at stage loc
           ~hint:
-            "Core_lower should assign positive child task scope ids. Scope id \
+            "Blorp Core lowering should assign positive child task scope ids. Scope id \
              0 is reserved for the root task."
           (Printf.sprintf "%s child task scope id must be positive, got %d"
              subject child_id)
@@ -1078,7 +1037,7 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
             let acc =
               violation_at stage b.cb_rhs.loc
                 ~hint:
-                  "Infer/Core_lower should ensure each concurrent result \
+                  "inference and Blorp Core lowering should ensure each concurrent result \
                    binding has a distinct name before Core reaches emission."
                 (Printf.sprintf
                    "duplicate concurrent binding `%s` in concurrent block" name)
@@ -1830,8 +1789,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
      bookend: "eliminated here, still gone there." Catches any
      post-elimination pass that synthesizes the forbidden form. O(n)
      folds, negligible next to Perceus itself. *)
-  | Core_stage.Desugar ->
-      check_no_sugar prog @ check_no_desugarable_mutation prog
+  | Core_stage.Desugar -> check_no_sugar prog
   | Core_stage.Match -> check_no_cmatcharms prog
   | Core_stage.Perceus ->
       check_no_sugar prog @ check_no_cmatcharms prog

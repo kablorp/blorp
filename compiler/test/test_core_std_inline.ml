@@ -111,56 +111,6 @@ let count_user_calls_by_def_id def_id body =
       | _ -> acc)
     0 body
 
-let target_std_list_user_call = function
-  | "std_list__get__mono_Int" | "std_list__get_or__mono_Int" -> true
-  | _ -> false
-
-let append_std_list_user_call = function
-  | "std_list__append__mono_Int" -> true
-  | _ -> false
-
-let opaque_cow_transfer_std_list_user_call = function
-  | "std_list__set__mono_Int" -> true
-  | _ -> false
-
-let count_std_list_user_calls body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CCall (CKUser (name, _), _, _) when target_std_list_user_call name ->
-          acc + 1
-      | _ -> acc)
-    0 body
-
-let count_append_user_calls body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CCall (CKUser (name, _), _, _) when append_std_list_user_call name ->
-          acc + 1
-      | _ -> acc)
-    0 body
-
-let count_opaque_cow_transfer_user_calls body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CCall (CKUser (name, _), _, _)
-        when opaque_cow_transfer_std_list_user_call name ->
-          acc + 1
-      | _ -> acc)
-    0 body
-
-let count_list_intrinsics body =
-  fold_tree
-    (fun acc node ->
-      match node.desc with
-      | CCall (CKIntrinsic name, _, _)
-        when String.starts_with ~prefix:"list_" name ->
-          acc + 1
-      | _ -> acc)
-    0 body
-
 let count_side_effect_calls body =
   fold_tree
     (fun acc node ->
@@ -418,65 +368,6 @@ let test_clones_resource_scope_binding_hygienically () =
       Alcotest.failf "unexpected inlined shape:\n%s"
         (Blorp.Core.pp_to_string body)
 
-let test_pipeline_expands_real_std_list_calls () =
-  Blorp.Modules.reset ();
-  Blorp.Modules.init_module_paths ".";
-  let source =
-    {|
-import:
-    list: get_or, set, append
-
-pure func touch(xs: List[Int]) -> Int:
-    ys: List[Int] = xs.set(0, xs.get_or(0, 0) + 1)
-    zs: List[Int] = ys.append(2)
-    zs.get_or(0, 0)
-
-func main(args: List[String]) -> Int:
-    touch([1, 2, 3])
-|}
-  in
-  let resolved_calls = ref None in
-  let inlined_calls = ref None in
-  let inlined_intrinsics = ref None in
-  let append_calls = ref None in
-  let opaque_cow_transfer_calls = ref None in
-  let on_stage stage program =
-    match (stage, find_func_body "touch" program) with
-    | Blorp.Core_stage.Resolve, Some body ->
-        resolved_calls := Some (count_std_list_user_calls body)
-    | Blorp.Core_stage.StdInline, Some body ->
-        inlined_calls := Some (count_std_list_user_calls body);
-        inlined_intrinsics := Some (count_list_intrinsics body);
-        append_calls := Some (count_append_user_calls body);
-        opaque_cow_transfer_calls :=
-          Some (count_opaque_cow_transfer_user_calls body)
-    | _ -> ()
-  in
-  match
-    Blorp.Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage ~filename:"<test>"
-      ~source ()
-  with
-  | Ok (Blorp.Pipeline.Compiled _) ->
-      Alcotest.(check bool)
-        "resolve stage still has std/list calls" true
-        (Option.value ~default:0 !resolved_calls > 0);
-      Alcotest.(check int)
-        "std_inline removes std/list calls from caller" 0
-        (Option.value ~default:(-1) !inlined_calls);
-      Alcotest.(check bool)
-        "std_inline exposes list intrinsics" true
-        (Option.value ~default:0 !inlined_intrinsics > 0);
-      Alcotest.(check int)
-        "std_inline removes append wrappers from caller" 0
-        (Option.value ~default:(-1) !append_calls);
-      Alcotest.(check bool)
-        "std_inline still leaves other COW transfer wrappers opaque" true
-        (Option.value ~default:0 !opaque_cow_transfer_calls > 0)
-  | Ok (Blorp.Pipeline.Stopped_at s) ->
-      Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs ->
-      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
-
 let suite =
   [
     ( "rewrite",
@@ -499,7 +390,5 @@ let suite =
           test_same_def_id_caller_still_rewrites_body;
         Alcotest.test_case "clones_resource_scope_binding_hygienically" `Quick
           test_clones_resource_scope_binding_hygienically;
-        Alcotest.test_case "pipeline_expands_real_std_list_calls" `Quick
-          test_pipeline_expands_real_std_list_calls;
       ] );
   ]

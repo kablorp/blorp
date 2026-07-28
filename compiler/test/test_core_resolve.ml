@@ -1611,10 +1611,10 @@ let test_resolve_selected_direct_prefixed_runtime_builtin_beats_std_signature ()
   | _ -> Alcotest.fail "expected std signature plus function"
 
 let test_resolve_synthesized_monomorphic_runtime_builtin_stays_builtin () =
-  (* Core_synth gives monomorphized runtime-backed std wrappers a body before
-     this pass. Even if they no longer carry CFBuiltin by then, they must still
-     resolve as CKBuiltin so emission can call the runtime helper directly with
-     layout metadata instead of routing through a user wrapper. *)
+  (* Blorp synthesis gives monomorphized runtime-backed std wrappers a body
+     before this pass. Even if they no longer carry CFBuiltin by then, they
+     must still resolve as CKBuiltin so emission can call the runtime helper
+     directly with layout metadata instead of routing through a user wrapper. *)
   let ty_string = TyNamed ("String", []) in
   let stream_int = TyNamed ("Stream", [ ty_int ]) in
   let stream_string = TyNamed ("Stream", [ ty_string ]) in

@@ -9,6 +9,7 @@ let loc =
 
 let ty_void = TyNamed ("Void", [])
 let ty_string = TyNamed ("String", [])
+let ty_string_slice = TyNamed ("StringSlice", [])
 let ty_widget = TyNamed ("Widget", [])
 let mk desc ty = { desc; ty; loc }
 let cvoid = mk CVoid ty_void
@@ -35,6 +36,17 @@ let call_selected_direct selected_id name args ret_ty =
       }
   in
   mk (CCall (CKSelectedDirect selected_id, cvar name fn_ty, args)) ret_ty
+
+let call_builtin name args ret_ty =
+  let fn_ty =
+    TyFunc
+      {
+        params = List.map (fun arg -> arg.ty) args;
+        return = ret_ty;
+        is_pure = true;
+      }
+  in
+  mk (CCall (CKBuiltin name, cvar name fn_ty, args)) ret_ty
 
 let func ?(name = "main") ?(params = []) ?(ret = ty_string) body =
   {
@@ -96,6 +108,32 @@ let widget_stringable_impl =
          ci_methods = [ method_func ];
        })
 
+let string_slice_stringable_impl =
+  let method_body =
+    mk
+      (CLit (LitString ("slice", { sf_multiline = false; sf_raw = false })))
+      ty_string
+  in
+  let method_func =
+    func ~name:"to_string"
+      ~params:
+        [
+          {
+            cp_name = Var.named "value";
+            cp_ty = ty_string_slice;
+            cp_loc = loc;
+          };
+        ]
+      method_body
+  in
+  decl
+    (CDImpl
+       {
+         ci_trait = "Stringable";
+         ci_for_type = ty_string_slice;
+         ci_methods = [ method_func ];
+       })
+
 let single_body = function
   | [ _; _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
   | _ -> Alcotest.fail "expected trait, impl, and one function"
@@ -124,6 +162,36 @@ let test_selected_direct_trait_method_rewrites_to_impl () =
   | CCall (CKSelectedDirect _, _, _) ->
       Alcotest.fail "selected direct trait method was not rewritten"
   | _ -> Alcotest.fail "expected rewritten trait method call"
+
+let test_to_string_builtin_rewrites_to_string_slice_impl () =
+  let value = cvar "value" ty_string_slice in
+  let body = call_builtin "blorp_to_string" [ value ] ty_string in
+  let main =
+    decl
+      (CDFunc
+         (func
+            ~params:
+              [
+                {
+                  cp_name = Var.named "value";
+                  cp_ty = ty_string_slice;
+                  cp_loc = loc;
+                };
+              ]
+            body))
+  in
+  let resolved =
+    P.resolve_program
+      [ widget_stringable_trait; string_slice_stringable_impl; main ]
+  in
+  match (single_body resolved).desc with
+  | CCall (CKUnknown, { desc = CVar v; _ }, _) ->
+      Alcotest.(check string)
+        "StringSlice to_string resolves to its ordinary impl"
+        "Stringable_to_string_StringSlice" v.vname
+  | CCall (CKBuiltin _, _, _) ->
+      Alcotest.fail "StringSlice impl was left as a builtin call"
+  | _ -> Alcotest.fail "expected rewritten StringSlice to_string call"
 
 let test_resource_scope_binding_shadows_trait_method_body_only () =
   let value = cvar "value" ty_widget in
@@ -203,6 +271,8 @@ let suite =
       [
         Alcotest.test_case "trait_method_rewrites_to_impl" `Quick
           test_selected_direct_trait_method_rewrites_to_impl;
+        Alcotest.test_case "to_string_builtin_rewrites_to_string_slice_impl"
+          `Quick test_to_string_builtin_rewrites_to_string_slice_impl;
         Alcotest.test_case "dispatch facts preserve nominal identity" `Quick
           test_dispatch_type_facts_preserve_nominal_identity;
       ] );

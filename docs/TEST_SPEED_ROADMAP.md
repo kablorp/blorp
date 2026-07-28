@@ -1,6 +1,7 @@
 # Test Speed Roadmap
 
-Status checked against code on 2026-07-15 at commit `41d48dfd`.
+Status refreshed on 2026-07-27. Measurements below remain historical baselines
+unless a later date is attached.
 
 This roadmap captures the current test-speed diagnosis and the intended path to
 make normal test runs faster by doing less duplicate work. The goal is not to
@@ -63,15 +64,28 @@ roughly two dozen times in one sweep. The limit was documented as a correctness
 workaround for three typecheck declaration suites, but the focused
 reproductions below showed that those exceptions had become stale.
 
-The immediate performance problem is therefore repeated whole-program work:
+Before the 2026-07-27 production compiler cutover, the immediate performance
+problem was repeated whole-program work:
 
 1. `Test_runner` discovers tests and generates several run-all harnesses.
-2. Each harness re-enters `Pipeline.compile_generated_test_harness`.
-3. The OCaml host sends an in-memory source through the Blorp CLI/frontend
-   bridge, decodes and finalizes the graph, then invokes the Blorp typecheck
+2. Each harness re-entered the now-deleted
+   `Pipeline.compile_generated_test_harness`.
+3. The OCaml host sent an in-memory source through the Blorp CLI/frontend
+   bridge, decoded and finalized the graph, then invoked the Blorp typecheck
    bridge and remaining compilation stages.
-4. The host C compiler and harness process are invoked for every compiled
+4. The host C compiler and harness process were invoked for every compiled
    group.
+
+That source/C/runtime path is now gone. The OCaml runner still discovers,
+groups, schedules, executes, and reports tests, but every generated harness and
+standalone test is compiled to an executable by the production Blorp binary.
+The old OCaml result cache was removed with that cutover. It learned transitive
+dependencies as an incidental side effect of in-process OCaml compilation;
+after external production compilation, the table was empty and a local import
+could change without invalidating a cached result. Result caching must remain
+off until the production compiler returns an explicit, complete dependency
+manifest. Reconstructing one in the test runner would duplicate module
+resolution and make cache correctness heuristic.
 
 The roadmap below removes that accidental repetition, then removes algorithmic
 work inside the remaining compile. It does not add a result cache or hide the
@@ -557,7 +571,7 @@ harness constructors plus an explicit generated-module origin. The source graph
 can add one generated root to an existing parsed graph while retaining the
 already parsed test and dependency modules. A regression deletes the original
 test files before extension to prove they are not reread, then verifies exact
-module identity, bridge serialization, typechecking, and post-synthesis Core
+module identity, bridge serialization, typechecking, and post-match Core
 preparation from the retained graph. The extension rejects generated-root
 collisions and distinct retained files that share one downstream module
 identity. Generated-harness preparation also has an explicit frontend policy:
@@ -614,18 +628,18 @@ representative compiler-owned suites before moving the production boundary.
 - Add an explicit in-memory module constructor to the Blorp module graph. A
   generated module must have a real source identity and import edges; do not
   infer generated status from a filename or source prefix.
-- Reuse the CLI graph built for the test command. Do not call
-  `Pipeline.compile_generated_test_harness` or
-  `compile_in_memory_source_with_blorp_bridge` for the normal path.
+- Completed: generated harnesses now compile through the production Blorp
+  synthetic-source boundary. The former
+  `Pipeline.compile_generated_test_harness` and
+  `compile_in_memory_source_with_blorp_bridge` entrypoints are deleted.
 - Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
   then delete the superseded generation and bridge entry points once no
   production caller remains.
-- Preserve one bridge: the post-synthesis Core semantic-middle request. Do not
+- Preserve one bridge: the post-match Core semantic-middle request. Do not
   introduce a test-only parser bridge or a second graph protocol.
-- Move runtime-cache ownership with harness execution. The Blorp host path and
-  retained OCaml TestRunner currently use distinct cache schemas; moving only
-  `test --warmup-only` would warm an artifact that production tests do not
-  consume.
+- Completed: runtime-cache ownership moved with harness compilation.
+  `test --warmup-only` compiles a minimal executable through the same Blorp
+  runtime cache consumed by production tests.
 
 **Tests:**
 

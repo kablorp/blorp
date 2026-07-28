@@ -31,7 +31,7 @@ import:
 		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedParam,
-		ParsedParamBinder(ParsedParamNameBinder),
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedTypeParamDecl,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		parsed_function_body_kind,
@@ -56,6 +56,7 @@ import:
 		TYPE_NAME_VECTOR,
 		TYPE_NAME_VOID,
 		compiler_array_type_parts,
+		compiler_canonical_module_type_name,
 		compiler_normalize_type_name,
 		compiler_type_char,
 		compiler_type_int,
@@ -432,6 +433,10 @@ private PARALLEL_MATRIX_TYPE_NAME: String = "ParallelMatrix"
 
 private CANONICAL_PARALLEL_MATRIX_TYPE_NAME: String = "std/matrix::ParallelMatrix"
 
+private TO_STRING_BUILTIN_NAME: String = "to_string"
+
+private TO_STRING_CORE_SENTINEL: String = "blorp_to_string"
+
 
 union CompilerCoreLowerError:
 	CompilerCoreLowerUnsupported(String)
@@ -444,6 +449,24 @@ private union CompilerCoreLowerFunctionBody:
 	CompilerCoreLowerUserFunctionBody(CoreExpr)
 	CompilerCoreLowerForwardDeclaration
 	CompilerCoreLowerBuiltinDeclaration
+
+
+private record CompilerCoreLowerParamDestructure {
+	param: CoreParam,
+	names: List[ParsedIdentifier]
+}
+
+
+private record CompilerCoreLowerParamResult {
+	param: CoreParam,
+	destructure: Option[CompilerCoreLowerParamDestructure]
+}
+
+
+private record CompilerCoreLowerParams {
+	params: List[CoreParam],
+	destructures: List[CompilerCoreLowerParamDestructure]
+}
 
 
 private pure func lowered_function_kind(body: CompilerCoreLowerFunctionBody) -> CoreFunctionKind:
@@ -758,7 +781,7 @@ private pure func compiler_core_lower_tensor_type(
 	element: CompilerType,
 	dims: List[CompilerType],
 ) -> Result[CoreType, CompilerCoreLowerError]:
-	element_type ?= compiler_core_lower_type(element)
+	element_type ?= compiler_core_lower_value_type(element)
 	core_dims ?= compiler_core_tensor_dims(dims)
 
 	Ok(TensorType({
@@ -776,8 +799,8 @@ private pure func malformed_parallel_tensor_type(
 			"scoped parallel tensor type " + compiler_type_to_string(
 				typ,
 			) + " must have " + expected,
-			),
-		)
+		),
+	)
 
 
 private pure func compiler_core_lower_value_type_list(
@@ -868,7 +891,7 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 							Err(error):
 								Err(error)
 				CompilerTupleType(elements):
-					lowered_elements ?= compiler_core_lower_type_list(elements)
+					lowered_elements ?= compiler_core_lower_value_type_list(elements)
 					Ok(TupleType(lowered_elements))
 				CompilerRangeType(_):
 					Ok(RangeType)
@@ -885,8 +908,8 @@ pure func compiler_core_lower_type(typ: CompilerType) -> Result[CoreType, Compil
 						),
 					)
 				CompilerFunctionType(is_pure, params, return_type):
-					lowered_params ?= compiler_core_lower_type_list(params)
-					lowered_return ?= compiler_core_lower_type(return_type)
+					lowered_params ?= compiler_core_lower_value_type_list(params)
+					lowered_return ?= compiler_core_lower_value_type(return_type)
 					Ok(FunctionType(is_pure, lowered_params, lowered_return))
 				CompilerArrayType(_, _):
 					Err(
@@ -2264,7 +2287,10 @@ private pure func compiler_core_timeout_is_int(typ: CompilerType) -> Bool:
 private pure func compiler_core_timeout_is_duration(typ: CompilerType) -> Bool:
 	match typ:
 		CompilerNamedType(name, args):
-			compiler_normalize_type_name(name) == "Duration" and args.length() == 0
+			(
+				name == compiler_canonical_module_type_name("std/units", "Duration")
+				and args.length() == 0
+			)
 		_:
 			False
 
@@ -3859,6 +3885,13 @@ private pure func lower_user_call_kind(
 			Ok(UnknownCall)
 
 
+private pure func lower_builtin_call_kind(info: CompilerResolvedCallInfo) -> CoreCallKind:
+	if info.source_name == TO_STRING_BUILTIN_NAME:
+		BuiltinCall(TO_STRING_CORE_SENTINEL)
+	else:
+		UnknownCall
+
+
 private pure func lower_resolved_call_kind(
 	resolved: Option[CompilerResolvedCallInfo],
 	callee: CoreExpr,
@@ -3871,7 +3904,7 @@ private pure func lower_resolved_call_kind(
 						CompilerCallableLocal:
 							lower_user_call_kind(info, callable_id, callee)
 						CompilerCallableBuiltin:
-							Ok(UnknownCall)
+							Ok(lower_builtin_call_kind(info))
 						CompilerCallableImported(_):
 							lower_user_call_kind(info, callable_id, callee)
 						CompilerCallableConstructor(_):
@@ -3894,7 +3927,10 @@ private pure func lower_resolved_call_kind(
 						None:
 							Ok(DeferredTraitCall(trait_name, info.callee_name))
 				CompilerResolvedIntrinsicCall:
-					Ok(UnknownCall)
+					if info.source_name == "type_name" or info.source_name == "is_heap":
+						Ok(IntrinsicCall(info.source_name))
+					else:
+						Ok(UnknownCall)
 				CompilerResolvedClosureCall:
 					Ok(UnknownCall)
 		None:
@@ -4443,6 +4479,14 @@ private pure func lower_typed_block_expr(
 
 pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, CompilerCoreLowerError]:
 	typ ?= compiler_core_lower_value_type(compiler_typed_expr_value_type(expr))
+
+	lower_typed_expr_as_type(expr, typ)
+
+
+private pure func lower_typed_expr_as_type(
+	expr: CompilerTypedExpr,
+	typ: CoreType,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
 	loc: CoreSourceLoc = compiler_core_source_loc(typed_expr_span(expr))
 
 	match expr:
@@ -4479,7 +4523,7 @@ pure func lower_typed_expr(expr: CompilerTypedExpr) -> Result[CoreExpr, Compiler
 		CompilerTypedOpaqueIntoExpr(_, inner, _, _):
 			lower_typed_expr(inner)
 		CompilerTypedOpaqueFromExpr(_, inner, _, _):
-			lower_typed_expr(inner)
+			lower_typed_expr_as_type(inner, typ)
 		CompilerTypedAssignExpr(name, _, value, _, _):
 			lowered_value ?= lower_typed_expr(value)
 			Ok(AssignExpr(core_var(name.text, None), lowered_value, typ, loc))
@@ -4597,36 +4641,71 @@ private pure func compiler_core_type_param_names(params: List[ParsedTypeParamDec
 private pure func compiler_core_lower_param(
 	param: ParsedParam,
 	param_type: CompilerType,
-) -> Result[CoreParam, CompilerCoreLowerError]:
+	index: Int,
+) -> Result[CompilerCoreLowerParamResult, CompilerCoreLowerError]:
+	typ ?= compiler_core_lower_value_type(param_type)
+
 	match param.binder:
 		ParsedParamNameBinder(name):
-			match compiler_core_lower_type(param_type):
-				Ok(typ):
-					Ok({
-						name = core_var(name.text, None),
-						typ = typ,
-						loc = compiler_core_source_loc(name.span),
-					})
-				Err(CompilerCoreLowerInvalidType(message)):
+			Ok({
+				param = {
+					name = core_var(name.text, None),
+					typ = typ,
+					loc = compiler_core_source_loc(name.span)
+				},
+				destructure = None,
+			})
+		ParsedParamWildcardBinder(span):
+			Ok({
+				param = {
+					name = core_var(
+						"__pattern_param_${index}_${span.start_line}_${span.start_column}",
+						None,
+					),
+					typ = typ,
+					loc = compiler_core_source_loc(span)
+				},
+				destructure = None,
+			})
+		ParsedParamTupleBinder(names, span):
+			match typ:
+				TupleType(field_types):
+					if field_types.length() != names.length():
+						Err(
+							CompilerCoreLowerInvalidParam(
+								"tuple parameter has ${names.length()} names but its type has " + "${field_types.length()} fields",
+							),
+						)
+					else:
+						lowered_param: CoreParam = {
+							name = core_var(
+								"__pattern_param_${index}_${span.start_line}_${span.start_column}",
+								None,
+							),
+							typ = typ,
+							loc = compiler_core_source_loc(span)
+						}
+						Ok({
+							param = lowered_param,
+							destructure = Some({
+								param = lowered_param,
+								names = names,
+							}),
+						})
+				_:
 					Err(
-						CompilerCoreLowerInvalidType(
-							"parameter `" + name.text + "` has an invalid type: " + message,
+						CompilerCoreLowerInvalidParam(
+							"tuple parameter requires a tuple type, got " + compiler_type_to_string(
+								param_type,
+							),
 						),
 					)
-				Err(error):
-					Err(error)
-		_:
-			Err(
-				CompilerCoreLowerInvalidParam(
-					"pattern parameters are not implemented in Blorp Core lowering yet",
-				),
-			)
 
 
 private pure func compiler_core_lower_params(
 	params: List[ParsedParam],
 	param_types: List[CompilerType],
-) -> Result[List[CoreParam], CompilerCoreLowerError]:
+) -> Result[CompilerCoreLowerParams, CompilerCoreLowerError]:
 	if params.length() != param_types.length():
 		Err(CompilerCoreLowerInvalidParam("function parameter count " + params
 					.length()
@@ -4635,15 +4714,22 @@ private pure func compiler_core_lower_params(
 					.to_string()))
 	else:
 		var lowered: List[CoreParam] = []
+		var destructures: List[CompilerCoreLowerParamDestructure] = []
 		var index: Int = 0
 		var failure: Option[CompilerCoreLowerError] = None
 
 		while index < params.length() and failure.is_none():
 			match (params.get(index), param_types.get(index)):
 				(Some(param), Some(param_type)):
-					match compiler_core_lower_param(param, param_type):
+					match compiler_core_lower_param(param, param_type, index):
 						Ok(lowered_param):
-							lowered = lowered.append(lowered_param)
+							lowered = lowered.append(lowered_param.param)
+
+							match lowered_param.destructure:
+								Some(destructure):
+									destructures = destructures.append(destructure)
+								None:
+									void
 						Err(error):
 							failure = Some(error)
 				_:
@@ -4659,12 +4745,48 @@ private pure func compiler_core_lower_params(
 			Some(error):
 				Err(error)
 			None:
-				Ok(lowered)
+				Ok({
+					params = lowered,
+					destructures = destructures,
+				})
+
+
+private pure func lower_param_destructures(
+	destructures: List[CompilerCoreLowerParamDestructure],
+	index: Int,
+	body: CoreExpr,
+) -> Result[CoreExpr, CompilerCoreLowerError]:
+	match destructures.get(index):
+		None:
+			Ok(body)
+		Some(destructure):
+			inner ?= lower_param_destructures(destructures, index + 1, body)
+
+			match destructure.param.typ:
+				TupleType(field_types):
+					lower_tuple_destruct_bindings(
+						destructure.names,
+						0,
+						VarExpr(
+							destructure.param.name,
+							destructure.param.typ,
+							destructure.param.loc,
+						),
+						field_types,
+						inner,
+						destructure.param.loc,
+					)
+				_:
+					Err(
+						CompilerCoreLowerInvalidParam(
+							"validated tuple parameter lost its tuple type during lowering",
+						),
+					)
 
 
 private pure func lower_typed_function_body(
 	info: CompilerTypedFunctionInfo,
-	params: List[CoreParam],
+	params: CompilerCoreLowerParams,
 	return_type: CoreType,
 ) -> Result[CompilerCoreLowerFunctionBody, CompilerCoreLowerError]:
 	match parsed_function_body_kind(info.decl.body):
@@ -4673,7 +4795,12 @@ private pure func lower_typed_function_body(
 				Some(body):
 					match lower_typed_expr(body):
 						Ok(lowered_body):
-							Ok(CompilerCoreLowerUserFunctionBody(lowered_body))
+							wrapped_body ?= lower_param_destructures(
+								params.destructures,
+								0,
+								lowered_body,
+							)
+							Ok(CompilerCoreLowerUserFunctionBody(wrapped_body))
 						Err(error):
 							Err(error)
 				None:
@@ -4709,7 +4836,7 @@ private pure func lower_typed_function_body(
 							Ok(
 								lower_runtime_helper_body(
 									builtin_name,
-									params,
+									params.params,
 									return_type,
 									compiler_core_source_loc(info.decl.span),
 								),
@@ -4721,7 +4848,7 @@ private pure func lower_typed_function_info(
 	info: CompilerTypedFunctionInfo,
 ) -> Result[CompilerCoreLowerFunctionResult, CompilerCoreLowerError]:
 	params ?= compiler_core_lower_params(info.decl.params, info.param_types)
-	return_type ?= compiler_core_lower_type(info.semantic_return_type)
+	return_type ?= compiler_core_lower_value_type(info.semantic_return_type)
 	lowered_function_body ?= lower_typed_function_body(info, params, clone_core_type(return_type))
 
 	body: Option[CoreExpr] = match lowered_function_body:
@@ -4746,7 +4873,7 @@ private pure func lower_typed_function_info(
 			name = info.decl.name.text,
 			source_module = context.source_module,
 			type_params = info.effective_type_params.map(pure func(param): param.name),
-			params = params,
+			params = params.params,
 			return_type = return_type,
 			body = body,
 			is_pure = info.decl.is_pure,
@@ -4773,7 +4900,7 @@ private pure func lower_typed_foreign_function(
 	info: CompilerTypedForeignFunctionInfo,
 ) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
 	params ?= compiler_core_lower_params(info.decl.params, info.param_types)
-	return_type ?= compiler_core_lower_type(info.semantic_return_type)
+	return_type ?= compiler_core_lower_value_type(info.semantic_return_type)
 
 	(next_context, def_id) = match info.callable_id:
 		Some(callable_id):
@@ -4801,7 +4928,7 @@ private pure func lower_typed_foreign_function(
 			name = info.decl.name.text,
 			source_module = context.source_module,
 			type_params = [],
-			params = params,
+			params = params.params,
 			return_type = return_type,
 			body = None,
 			is_pure = info.decl.is_pure,
@@ -4824,7 +4951,7 @@ private pure func lower_typed_global(
 ) -> Result[CompilerCoreLowerDeclResult, CompilerCoreLowerError]:
 	(next_context, def_id) = mint_def_id(context)
 	init ?= lower_typed_expr(info.value)
-	typ ?= compiler_core_lower_type(info.binding_type)
+	typ ?= compiler_core_lower_value_type(info.binding_type)
 
 	Ok({
 		context = next_context,
@@ -5155,11 +5282,11 @@ private pure func lower_typed_trait_method(
 	method: CompilerTypedTraitMethodInfo,
 ) -> Result[CoreTraitMethod, CompilerCoreLowerError]:
 	params ?= compiler_core_lower_params(method.decl.params, method.param_types)
-	return_type ?= compiler_core_lower_type(method.semantic_return_type)
+	return_type ?= compiler_core_lower_value_type(method.semantic_return_type)
 
 	Ok({
 		name = method.decl.name.text,
-		params = params,
+		params = params.params,
 		return_type = return_type,
 		is_pure = method.decl.is_pure,
 		loc = compiler_core_source_loc(method.decl.span),

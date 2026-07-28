@@ -1,21 +1,21 @@
-(** Private post-synthesis Core to pre-DCE Core worker.
+(** Private post-match Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
     and backend. The protocol is phase-specific: callers supply Blorp-owned
-    post-synthesis Core, and successful requests return the Core program
+    post-match Core, and successful requests return the Core program
     immediately before Blorp-owned DCE. This module does not read source files,
     interpret CLI arguments, emit C, write artifacts, or execute child
     processes. *)
 
-let schema_version = 4
+let schema_version = 5
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let core_phase = "post_synth"
+let core_phase = "post_match"
 
 type stage = Core_stage.t
 
 type capability =
-  | PostSynthCore
+  | PostMatchCore
   | PreDceCore
   | RenderedStageObservations
 
@@ -117,11 +117,11 @@ let rec decode_list decode = function
       Ok (item :: rest)
 
 let semantic_middle_stage = function
-  | ( Core_stage.Match | Core_stage.TraitResolve | Core_stage.Resolve
-    | Core_stage.StdInline | Core_stage.Tailrec | Core_stage.Fusion ) as stage ->
+  | ( Core_stage.TraitResolve | Core_stage.Resolve | Core_stage.StdInline
+    | Core_stage.Tailrec | Core_stage.Fusion ) as stage ->
       Some stage
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-  | Core_stage.Synth | Core_stage.Specialize | Core_stage.Dce
+  | Core_stage.Synth | Core_stage.Match | Core_stage.Specialize | Core_stage.Dce
   | Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
   | Core_stage.Closure | Core_stage.Final ->
       None
@@ -129,15 +129,15 @@ let semantic_middle_stage = function
 let stage_name = Core_stage.to_string
 
 let capability_name = function
-  | PostSynthCore -> "core_post_synth"
+  | PostMatchCore -> "core_post_match"
   | PreDceCore -> "core_pre_dce"
   | RenderedStageObservations -> "rendered_stage_observations"
 
 let supported_capabilities =
-  [ PostSynthCore; PreDceCore; RenderedStageObservations ]
+  [ PostMatchCore; PreDceCore; RenderedStageObservations ]
 
 let decode_capability = function
-  | Lsp_json.String "core_post_synth" -> Ok PostSynthCore
+  | Lsp_json.String "core_post_match" -> Ok PostMatchCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
   | Lsp_json.String "rendered_stage_observations" ->
       Ok RenderedStageObservations
@@ -217,11 +217,11 @@ let decode_request value =
     let* target_module = string_field "target_module" value in
     let* core_json = field "core" value in
     let* decoded =
-      match Core_post_synth_json.decode_program core_json with
+      match Core_post_match_json.decode_program core_json with
       | Ok decoded -> Ok decoded
       | Error error ->
-          protocol_error "invalid_post_synth_core"
-            (Core_post_synth_json.decode_error_to_string error)
+          protocol_error "invalid_post_match_core"
+            (Core_post_match_json.decode_error_to_string error)
     in
     let* next_def_id = int_field "next_def_id" value in
     let* import_binding_values = array_field "import_bindings" value in
@@ -245,13 +245,13 @@ let decode_request value =
           let* stage = decode_stage value in
           Ok (Some stage)
     in
-    let post_synth_violations =
-      Core_invariants.run_for_stage Core_stage.Synth decoded.core
+    let post_match_violations =
+      Core_invariants.run_for_stage Core_stage.Match decoded.core
     in
-    (match post_synth_violations with
+    (match post_match_violations with
     | violation :: _ ->
-        protocol_error "invalid_post_synth_core"
-          ("post-synthesis Core invariant failed: " ^ violation.Core_error.msg)
+        protocol_error "invalid_post_match_core"
+          ("post-match Core invariant failed: " ^ violation.Core_error.msg)
     | [] ->
         Ok
           {
@@ -339,7 +339,7 @@ let run_request_in_session request =
           ~user:on_stage
       in
       let backend_input =
-        Core_pipeline.run_core_passes_from_post_synth ~on_stage
+        Core_pipeline.run_core_passes_from_post_match ~on_stage
           ~reg ~import_aliases ~module_imports request.core
       in
       let observations = List.rev !observations_rev in
@@ -365,7 +365,6 @@ let run_request_in_session request =
 let run_request request =
   let session = Session.create () in
   Session.with_current session (fun () ->
-      Session.reset_core_counters session;
       Session.reserve_def_id_floor session request.next_def_id;
       run_request_in_session request)
 

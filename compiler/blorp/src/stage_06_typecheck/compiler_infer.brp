@@ -10785,6 +10785,95 @@ private pure func compiler_refined_builtin_return_type(
 						compiler_type_copy(fallback)
 
 
+private pure func compiler_debug_reflection_name(
+	resolved_call: Option[CompilerResolvedCallInfo],
+) -> Option[String]:
+	match resolved_call:
+		Some(call):
+			match call.target:
+				CompilerResolvedDirectCall(_, CompilerCallableImported("std/debug")):
+					if call.source_name == "type_name" or call.source_name == "is_heap":
+						Some(call.source_name)
+					else:
+						None
+				_:
+					None
+		None:
+			None
+
+
+private pure func compiler_debug_reflection_intrinsic(
+	call: CompilerResolvedCallInfo,
+) -> CompilerResolvedCallInfo:
+	{ call | target = CompilerResolvedIntrinsicCall }
+
+
+private pure func compiler_deferred_debug_reflection_result(
+	context: CompilerInferContext,
+	callee: CompilerTypedExpr,
+	args: List[CompilerTypedExpr],
+	span: CompilerSourceSpan,
+	return_type: CompilerType,
+	call: CompilerResolvedCallInfo,
+) -> CompilerInferResult:
+	intrinsic_call = compiler_debug_reflection_intrinsic(call)
+	callee_info = compiler_typed_expr_info(callee)
+	intrinsic_callee = compiler_typed_expr_with_info(
+		callee,
+		{ callee_info | resolved_call = Some(intrinsic_call) },
+	)
+	compiler_infer_result(
+		context,
+		CompilerTypedCallExpr(
+			intrinsic_callee,
+			args,
+			span,
+			compiler_inferred_call_info(context, return_type, Some(intrinsic_call)),
+		),
+	)
+
+
+private pure func compiler_debug_reflection_result(
+	context: CompilerInferContext,
+	callee: CompilerTypedExpr,
+	args: List[CompilerTypedExpr],
+	span: CompilerSourceSpan,
+	return_type: CompilerType,
+	resolved_call: Option[CompilerResolvedCallInfo],
+) -> Option[CompilerInferResult]:
+	reflection_name ?= compiler_debug_reflection_name(resolved_call)
+	call ?= resolved_call
+
+	match args:
+		[arg]:
+			arg_type = compiler_typed_expr_semantic_type(arg)
+
+			if reflection_name == "type_name" and not compiler_type_contains_type_var(arg_type):
+				Some(
+					compiler_infer_result(
+						context,
+						CompilerTypedStringLiteralExpr(
+							compiler_type_to_string(arg_type),
+							span,
+							compiler_inferred_info(context, compiler_type_string()),
+						),
+					),
+				)
+			else:
+				Some(
+					compiler_deferred_debug_reflection_result(
+						context,
+						callee,
+						args,
+						span,
+						return_type,
+						call,
+					),
+				)
+		_:
+			None
+
+
 private pure func compiler_infer_call_with_callee_result(
 	context: CompilerInferContext,
 	callee_result: CompilerInferResult,
@@ -10917,17 +11006,29 @@ private pure func compiler_infer_call_with_callee_result(
 					resolved_param_types,
 					resolved_return_type,
 				)
-				typed = CompilerTypedCallExpr(
+
+				match compiler_debug_reflection_result(
+					var_dims_bind.context,
 					callee_expr,
 					arg_result.args,
 					span,
-					compiler_inferred_call_info(
-						var_dims_bind.context,
-						resolved_return_type,
-						instantiated_resolved_call,
-					),
-				)
-				compiler_infer_result(var_dims_bind.context, typed)
+					resolved_return_type,
+					instantiated_resolved_call,
+				):
+					Some(result):
+						result
+					None:
+						typed = CompilerTypedCallExpr(
+							callee_expr,
+							arg_result.args,
+							span,
+							compiler_inferred_call_info(
+								var_dims_bind.context,
+								resolved_return_type,
+								instantiated_resolved_call,
+							),
+						)
+						compiler_infer_result(var_dims_bind.context, typed)
 		_:
 			next = compiler_infer_error(
 				compiler_infer_without_expected(callee_result.context),

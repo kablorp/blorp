@@ -10,15 +10,15 @@ OCaml compiler host:
    resulting binary.
 
 The semantic middle is a separate migration concern. Core lowering and the
-early Core pipeline through synthesis are now Blorp-owned; until the
+early Core pipeline through match compilation are now Blorp-owned; until the
 remaining middle Core passes are ported, one narrow OCaml worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
-  -> Blorp debug, desugar/SSA, mono, post-mono list layout, and synthesis
-  -> one versioned post-synthesis Core request
-  -> OCaml match-through-specialize Core worker
+  -> Blorp debug, desugar/SSA, mono, post-mono list layout, synthesis, and match
+  -> one versioned post-match Core request
+  -> OCaml trait-resolve-through-specialize Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -166,8 +166,8 @@ Exit condition:
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
 Status: implemented and authoritative for normal `compile` and `run`. The
-private worker receives strict post-synthesis Core schema 4 and starts at match
-compilation; no source or typed AST crosses this boundary.
+private worker receives strict post-match Core schema 5 and starts at trait
+resolution; no source, typed AST, or raw match crosses this boundary.
 
 New Blorp file:
 
@@ -221,7 +221,7 @@ Implementation:
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Keep the worker entry function limited to strict post-synthesis Core decode,
+5. Keep the worker entry function limited to strict post-match Core decode,
    early-stage invariant validation, and the still-OCaml middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
@@ -615,7 +615,18 @@ Goal: reproduce `Test_runner` compilation behavior in maintainable Blorp code.
 
 Status: implementation complete on this branch. Exact host-C policy, typed
 host/toolchain discovery, the verified runtime CAS, and production compile/run
-assembly are Blorp-owned. Full platform-gate validation remains.
+assembly are Blorp-owned. As of 2026-07-27, tests, doctests, generated
+TestSuite harnesses, warmup, sanitizer/leak runs, and REPL evaluations also
+compile through this production path. The OCaml test runner no longer invokes
+`cc` or maintains a separate runtime cache. Full platform-gate validation
+remains.
+
+The OCaml per-test result cache was also removed during this cutover. Its
+transitive dependency set came from the in-process OCaml module table, which
+external production compilation no longer populates. Keeping it would allow a
+passing result to survive changes to imported local modules. A future cache
+requires the production compiler to return an explicit dependency manifest;
+the runner must not infer that graph independently.
 
 New Blorp files:
 
@@ -623,7 +634,7 @@ New Blorp files:
 - `compiler/blorp/src/stage_12_cli/compiler_runtime_cache.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_platform.brp`
 
-OCaml references to study exactly:
+Historical OCaml references removed after the production cutover:
 
 - `Test_runner.compile_c_from_stdin`
 - `Test_runner.sanitizer_cc_args`
@@ -822,15 +833,15 @@ Completed bootstrap-source deletions:
 - the current build's dependency on the just-built OCaml host for compiling
   the Blorp CLI.
 
+The direct-source and generated in-memory compatibility compilers have been
+deleted, along with the preloaded-graph compile wrapper and their OCaml tests.
+The separately packaged `dev-5331666d5ec5` bootstrap is the build trust root;
+the current OCaml host no longer implements bootstrap compilation.
+
 Do not delete yet:
 
-- OCaml match-through-specialize passes used by `blorp-ocaml-middle`;
-- OCaml synthesis retained by bootstrap and in-memory compatibility callers;
-- OCaml Core lowering retained by test-runner, REPL, and direct in-memory
-  compatibility callers;
-- their behavior-focused tests until the corresponding semantic stage ports;
-- bridge decoders required solely by the pinned bootstrap, unless the
-  bootstrap ratchet has removed that requirement; or
+- OCaml trait-resolve-through-specialize passes used by `blorp-ocaml-middle`;
+- bridge decoders required by the post-match semantic-middle protocol; or
 - OCaml tools still explicitly scheduled in Checkpoint 12 of the main roadmap.
 
 ## Checkpoint K: Ratchet The Bootstrap

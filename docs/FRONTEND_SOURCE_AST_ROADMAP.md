@@ -633,8 +633,8 @@ Functions to remove or shrink:
 - `compiler/lib/ast.ml`
   - keep raw source variants while formatter/LSP/typecheck still need the OCaml
     AST, but update comments that name deleted OCaml passes
-- `compiler/lib/typed_ast.ml`, `compiler/lib/core_lower.ml`, Blorp CTFE IR,
-  and invariant comments
+- `compiler/lib/typed_ast.ml`, Blorp Core lowering/CTFE IR, and invariant
+  comments
   - keep defensive checks for impossible raw nodes if they still protect the
     OCaml middle
   - update messages to name the Blorp source finalizer instead of deleted OCaml

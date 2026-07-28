@@ -137,6 +137,7 @@ import:
 	compiler_core_identity:
 		core_module_member_name,
 		core_pure_overload_function_name,
+		core_ufcs_function_name,
 		flatten_canonical_core_type_name,
 		is_core_ufcs_function_name,
 
@@ -146,6 +147,20 @@ private record CallableRewrite {
 	def_id: Int,
 	target_name: String,
 	target_def_id: Int
+}
+
+
+record CoreCallableAlias {
+	source_name: String,
+	source_def_id: Int,
+	target_name: String,
+	target_def_id: Int
+}
+
+
+record CorePrefixedModule {
+	program: CoreProgram,
+	callable_aliases: List[CoreCallableAlias]
 }
 
 
@@ -2023,7 +2038,27 @@ private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]
 	result
 
 
-pure func prefix_module_names(module_name: String, program: CoreProgram) -> CoreProgram:
+private pure func callable_aliases(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+) -> List[CoreCallableAlias]:
+	rewrites.filter_map(func(rewrite):
+		if rewrite.def_id == rewrite.target_def_id:
+			None
+		else:
+			Some({
+				source_name = core_ufcs_function_name(module_name, rewrite.source_name),
+				source_def_id = rewrite.def_id,
+				target_name = rewrite.target_name,
+				target_def_id = rewrite.target_def_id,
+			})
+	)
+
+
+pure func prefix_module_names_with_aliases(
+	module_name: String,
+	program: CoreProgram,
+) -> CorePrefixedModule:
 	materialized_program: CoreProgram = materialize_builtin_overloads(program)
 	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(
 		module_name,
@@ -2040,6 +2075,70 @@ pure func prefix_module_names(module_name: String, program: CoreProgram) -> Core
 		func(decl): rewrite_decl_types(type_context, decl),
 	)
 	{
-		decls = deduplicate_functions(rewritten_decls),
-		foreign_includes = materialized_program.foreign_includes.map(func(include): include)
+		program = {
+			decls = deduplicate_functions(rewritten_decls),
+			foreign_includes = materialized_program.foreign_includes.map(func(include): include)
+		},
+		callable_aliases = callable_aliases(module_name, callable_rewrites),
 	}
+
+
+pure func prefix_module_names(module_name: String, program: CoreProgram) -> CoreProgram:
+	prefix_module_names_with_aliases(module_name, program).program
+
+
+private pure func callable_alias_rewrite(entry: CoreCallableAlias) -> CallableRewrite:
+	{
+		source_name = entry.source_name,
+		def_id = entry.source_def_id,
+		target_name = entry.target_name,
+		target_def_id = entry.target_def_id,
+	}
+
+
+private pure func rewrite_function_callable_aliases(
+	rewrites: List[CallableRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	bound = bound_with_params({names = []}, function_info.params)
+	{ function_info |
+		body = function_info.body.map(
+			func(body): rewrite_expr(rewrites, [], bound, body),
+		)
+	}
+
+
+private pure func rewrite_decl_callable_aliases(
+	rewrites: List[CallableRewrite],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_function_callable_aliases(rewrites, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global |
+					init = rewrite_expr(rewrites, [], {names = []}, global.init)
+				})
+		ImplDecl(impl_decl):
+			ImplDecl({ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): rewrite_function_callable_aliases(rewrites, method),
+					)
+				})
+		_:
+			decl
+
+
+pure func rewrite_program_callable_aliases(
+	program: CoreProgram,
+	aliases: List[CoreCallableAlias],
+) -> CoreProgram:
+	if aliases.is_empty():
+		program
+	else:
+		rewrites: List[CallableRewrite] = aliases.map(callable_alias_rewrite)
+		{ program |
+			decls = program.decls.map(
+				func(decl): rewrite_decl_callable_aliases(rewrites, decl),
+			)
+		}

@@ -4,8 +4,8 @@
 
     {1 Motivation}
 
-    [Core_lower] emits every [CCall] with [CKUnknown] because it has no
-    notion of the surrounding program. A downstream emitter that needs
+    Blorp lowering leaves [CCall] as [CKUnknown] when it cannot prove the
+    target from frontend metadata. A downstream emitter that needs
     to distinguish user / foreign / builtin / closure calls would
     otherwise have to re-implement name lookups at every call site —
     exactly the coupling that blew up the legacy [Codegen_expr].
@@ -765,7 +765,7 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
          [env.user_funcs] for [_<method>_<type>] — a single step that
          conflated impl lookup with name mangling. It's been moved into
          the [Core_trait_resolve] pass (Phase 3.1), which runs between
-         [Core_mono] and this resolver. By the time we get here, trait
+         Blorp monomorphization and this resolver. By the time we get here, trait
          calls have already been rewritten to their mangled form and
          flow through the normal [user_funcs] lookup above. *)
                                           (* 8. Bare [CVar v] with [TyFunc] type that didn't resolve above.

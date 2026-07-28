@@ -160,9 +160,10 @@ let matrix_builtins =
 let string_prelude_builtins =
   [
     (* substring, starts_with, ends_with, contains, raw_index_of, count,
-     is_numeric, is_ascii, is_blank, is_lower, is_upper → IR in
-     core_intrinsics.ml *)
-    (* trim, repeat, take/drop_left/right, pad, center, trim_chars, raw_last_index_of → IR *)
+       is_numeric, is_ascii, is_blank, is_lower, and is_upper are synthesized
+       by the Blorp Core synthesis stages. *)
+    (* trim, repeat, take/drop_left/right, pad, center, trim_chars, and
+       raw_last_index_of are synthesized there as well. *)
     (* upper/lower stay runtime-backed for Unicode expansion and
        context-sensitive case mappings. *)
     ((N.mod_string, "upper"), "blorp_upper");
@@ -356,8 +357,8 @@ let builtin_c_mapping =
   @ set_builtins
   (* Stream builtins *)
   @ stream_builtins
-  (* Bytes builtins — new, get, set_index, slice, append, length, fill,
-     blit, index_of → IR in core_intrinsics.ml *)
+  (* Bytes operations such as new, get, set_index, slice, append, length, fill,
+     blit, and index_of are synthesized by the Blorp Core synthesis stages. *)
   @ [
       ((N.mod_string, "to_bytes"), "blorp_bytes_from_string");
       ((N.mod_bytes, "to_string"), "blorp_bytes_to_string");

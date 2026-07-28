@@ -19,7 +19,7 @@ import:
 		ParsedImplDecl,
 		ParsedImportDecl,
 		ParsedParam,
-		ParsedParamBinder(ParsedParamNameBinder),
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder),
 		ParsedRecordDecl,
 		ParsedTraitDecl,
 		ParsedTraitMethodDecl,
@@ -368,7 +368,11 @@ pure func resource_source_file_type() -> CompilerType:
 
 
 pure func duration_type() -> CompilerType:
-	CompilerNamedType("Duration", [])
+	CompilerNamedType("std/units::Duration", [])
+
+
+pure func core_duration_type() -> CoreType:
+	NamedType("std_units__Duration", [])
 
 
 pure func concurrency_error_type() -> CompilerType:
@@ -545,6 +549,17 @@ pure func parsed_param(name: String) -> ParsedParam:
 	{
 		binder = ParsedParamNameBinder(ident(name)),
 		type_expr = Some(parsed_type_int()),
+		span = source_span()
+	}
+
+
+pure func parsed_tuple_param(names: List[String]) -> ParsedParam:
+	{
+		binder = ParsedParamTupleBinder(
+			names.map(ident),
+			source_span(),
+		),
+		type_expr = None,
 		span = source_span()
 	}
 
@@ -1227,7 +1242,7 @@ func test_lowers_resolved_foreign_direct_call_as_unknown() -> Bool:
 	direct_call_lowers_to_unknown_call("puts", 95, CompilerCallableForeign)
 
 
-func test_lowers_resolved_intrinsic_call() -> Bool:
+func test_lowers_non_reflection_intrinsic_call_as_unknown() -> Bool:
 	callee = CompilerTypedNameExpr(ident("list_get"), expr_info(function_type()))
 	resolved = resolved_call_info("list_get", CompilerResolvedIntrinsicCall)
 	expr = CompilerTypedCallExpr(
@@ -1244,6 +1259,29 @@ func test_lowers_resolved_intrinsic_call() -> Bool:
 				and core_type_to_json(
 					typ,
 				).to_string() == core_type_to_json(core_int_type()).to_string()
+			)
+		_:
+			False
+
+
+func test_lowers_debug_reflection_intrinsic_call() -> Bool:
+	callee = CompilerTypedNameExpr(ident("type_name"), expr_info(function_type()))
+	resolved = resolved_call_info("type_name", CompilerResolvedIntrinsicCall)
+	expr = CompilerTypedCallExpr(
+		callee,
+		[int_expr("5")],
+		source_span(),
+		expr_info_with_resolved(compiler_type_string(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(IntrinsicCall(name), _, args, typ, _)):
+			(
+				name == "type_name"
+				and args.length() == 1
+				and core_type_to_json(
+					typ,
+				).to_string() == core_type_to_json(NamedType("String", [])).to_string()
 			)
 		_:
 			False
@@ -1267,6 +1305,29 @@ func test_lowers_resolved_builtin_direct_call() -> Bool:
 			(
 				args.length() == 1
 				and core_type_to_json(typ).to_string() == core_type_to_json(VoidType).to_string()
+			)
+		_:
+			False
+
+
+func test_lowers_to_string_builtin_as_trait_dispatch_sentinel() -> Bool:
+	callee = CompilerTypedNameExpr(ident("to_string"), expr_info(function_type()))
+	resolved = resolved_call_info(
+		"to_string",
+		CompilerResolvedDirectCall(91, CompilerCallableBuiltin),
+	)
+	expr = CompilerTypedCallExpr(
+		callee,
+		[tuple_int_bool_expr()],
+		source_span(),
+		expr_info_with_resolved(compiler_type_string(), resolved),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(CallExpr(BuiltinCall(name), _, args, typ, _)):
+			name == "blorp_to_string" and args.length() == 1 and core_types_equal(
+				typ,
+				NamedType("String", []),
 			)
 		_:
 			False
@@ -1739,10 +1800,7 @@ func test_lowers_select_duration_timeout_with_round_up() -> Bool:
 												and core_type_to_json(
 													duration_type_value,
 												).to_string() == core_type_to_json(
-													NamedType(
-														"Duration",
-														[],
-													),
+													core_duration_type(),
 												).to_string()
 												and core_exprs_equal(
 													duration_rhs,
@@ -1752,10 +1810,7 @@ func test_lowers_select_duration_timeout_with_round_up() -> Bool:
 															uniq = 0,
 															def_id = None
 														},
-														NamedType(
-															"Duration",
-															[],
-														),
+														core_duration_type(),
 														compiler_core_source_loc(source_span()),
 													),
 												)
@@ -3570,7 +3625,7 @@ func test_lowers_ascription_to_inner_expression() -> Bool:
 			False
 
 
-func test_lowers_opaque_wrappers_to_inner_expression() -> Bool:
+func test_lowers_opaque_wrappers_to_representation_types() -> Bool:
 	opaque_type = CompilerNamedType("OpaqueInt", [])
 	into_expr = CompilerTypedOpaqueIntoExpr(
 		opaque_type,
@@ -3580,7 +3635,7 @@ func test_lowers_opaque_wrappers_to_inner_expression() -> Bool:
 	)
 	from_expr = CompilerTypedOpaqueFromExpr(
 		opaque_type,
-		int_expr("4"),
+		CompilerTypedNameExpr(ident("opaque"), expr_info(opaque_type)),
 		source_span(),
 		expr_info(int_type()),
 	)
@@ -3598,8 +3653,12 @@ func test_lowers_opaque_wrappers_to_inner_expression() -> Bool:
 						),
 					) and core_exprs_equal(
 						from_lowered,
-						LiteralExpr(
-							IntLiteral(4),
+						VarExpr(
+							{
+								name = "opaque",
+								uniq = 0,
+								def_id = None
+							},
 							core_int_type(),
 							compiler_core_source_loc(source_span()),
 						),
@@ -3951,6 +4010,16 @@ func test_lowers_const_int_named_type_argument_as_int() -> Bool:
 			False
 
 
+func test_lowers_const_int_tuple_element_as_int() -> Bool:
+	match compiler_core_lower_type(
+		CompilerTupleType([CompilerConstIntType(1), compiler_type_string()]),
+	):
+		Ok(TupleType([NamedType(first_name, []), NamedType(second_name, [])])):
+			first_name == "Int" and second_name == "String"
+		_:
+			False
+
+
 func test_lowers_function_decl_preserving_callable_id() -> Bool:
 	info: CompilerTypedFunctionInfo = {
 		decl = parsed_function_decl(),
@@ -3975,6 +4044,59 @@ func test_lowers_function_decl_preserving_callable_id() -> Bool:
 						and func_info.params.length() == 1
 						and func_info.body.is_some()
 					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_tuple_pattern_parameter_bindings() -> Bool:
+	info: CompilerTypedFunctionInfo = {
+		decl = { parsed_function_decl() |
+			params = [parsed_tuple_param(["left", "_"])],
+			return_type = Some(parsed_type_int())
+		},
+		callable_id = Some(43),
+		effective_type_params = [],
+		param_types = [CompilerTupleType([int_type(), compiler_type_bool()])],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(CompilerTypedNameExpr(ident("left"), expr_info(int_type())))
+	}
+
+	match lower_typed_decl(
+		compiler_core_lower_context(100, None),
+		CompilerTypedFunctionDecl(info),
+	):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(function):
+					match (function.params, function.body):
+						([parameter], Some(LetExpr(variable, False, bind_type, rhs, body))):
+							(
+								parameter.name.name.starts_with("__pattern_param_0_")
+								and variable.name == "left"
+								and core_types_equal(bind_type, core_int_type())
+								and match rhs:
+									TupleFieldExpr(VarExpr(source, source_type, _), 0, field_type, _):
+										(
+											source.name == parameter.name.name
+											and core_types_equal(source_type, parameter.typ)
+											and core_types_equal(field_type, core_int_type())
+										)
+									_:
+										False
+								and match body:
+									VarExpr(body_var, body_type, _):
+										(
+											body_var.name == "left"
+											and core_types_equal(body_type, core_int_type())
+										)
+									_:
+										False
+							)
+						_:
+							False
 				_:
 					False
 		Err(_):
@@ -4180,6 +4302,28 @@ func test_lowers_global_decl_minting_def_id() -> Bool:
 							),
 						)
 					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_const_refined_global_binding_as_runtime_int() -> Bool:
+	info: CompilerTypedGlobalVarInfo = {
+		decl = parsed_var_decl(),
+		binding_type = CompilerConstIntType(42),
+		source_type = None,
+		value = int_expr("42")
+	}
+	context = compiler_core_lower_context(10, None)
+
+	match lower_typed_decl(context, CompilerTypedGlobalVarDecl(info)):
+		Ok(result):
+			match result.decl:
+				GlobalDecl(global_info):
+					core_type_to_json(
+						global_info.typ,
+					).to_string() == core_type_to_json(core_int_type()).to_string()
 				_:
 					False
 		Err(_):
@@ -4751,8 +4895,16 @@ tests: TestSuite = {
 			"lowers resolved foreign direct call as unknown",
 			test_lowers_resolved_foreign_direct_call_as_unknown,
 		),
-		("lowers resolved intrinsic call", test_lowers_resolved_intrinsic_call),
+		(
+			"lowers non-reflection intrinsic call as unknown",
+			test_lowers_non_reflection_intrinsic_call_as_unknown,
+		),
+		("lowers debug reflection intrinsic call", test_lowers_debug_reflection_intrinsic_call),
 		("lowers resolved builtin direct call", test_lowers_resolved_builtin_direct_call),
+		(
+			"lowers to_string builtin as trait dispatch sentinel",
+			test_lowers_to_string_builtin_as_trait_dispatch_sentinel,
+		),
 		("lowers resolved closure call", test_lowers_resolved_closure_call),
 		("rejects conflicting encoded call id", test_rejects_conflicting_encoded_call_id),
 		(
@@ -4842,8 +4994,8 @@ tests: TestSuite = {
 		("lowers concurrent resource source for", test_lowers_concurrent_resource_source_for),
 		("lowers ascription to inner expression", test_lowers_ascription_to_inner_expression),
 		(
-			"lowers opaque wrappers to inner expression",
-			test_lowers_opaque_wrappers_to_inner_expression,
+			"lowers opaque wrappers to representation types",
+			test_lowers_opaque_wrappers_to_representation_types,
 		),
 		("lowers assignment expression", test_lowers_assignment_expression),
 		("lowers field access expression", test_lowers_field_access_expression),
@@ -4865,6 +5017,7 @@ tests: TestSuite = {
 			"lowers type parameter with explicit identity",
 			test_lowers_type_parameter_with_explicit_identity,
 		),
+		("lowers const int tuple element as Int", test_lowers_const_int_tuple_element_as_int),
 		("lowers Self type with explicit identity", test_lowers_self_type_with_explicit_identity),
 		(
 			"lowers const int named type argument as int",
@@ -4875,6 +5028,7 @@ tests: TestSuite = {
 			"lowers function decl preserving callable id",
 			test_lowers_function_decl_preserving_callable_id,
 		),
+		("lowers tuple pattern parameter bindings", test_lowers_tuple_pattern_parameter_bindings),
 		("lowers forward function decl", test_lowers_forward_function_decl),
 		(
 			"lowers deferred std builtin function decl",
@@ -4886,6 +5040,10 @@ tests: TestSuite = {
 		),
 		("lowers foreign function metadata", test_lowers_foreign_function_metadata),
 		("lowers global decl minting def id", test_lowers_global_decl_minting_def_id),
+		(
+			"lowers const-refined global binding as runtime Int",
+			test_lowers_const_refined_global_binding_as_runtime_int,
+		),
 		("lowers private global visibility", test_lowers_private_global_visibility),
 		("lowers struct record decl", test_lowers_struct_record_decl),
 		(

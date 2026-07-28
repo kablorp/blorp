@@ -23,12 +23,13 @@
       needs to render [&&]/[||] differently from nested [if/else].
 
     - {b Patterns are preserved.} [CMatchArms] carries [Ast.pattern]
-      directly; decision-tree compilation is a separate pass
-      ([Core_match]) which rewrites it to the compiled [CMatch] form.
+      directly; the Blorp early-Core match pass rewrites it to the compiled
+      [CMatch] form.
 
     - {b Debug lowering is explicit.} [CDebugBlock] records source
-      [debug:] blocks until [Core_debug] either erases them for normal builds
-      or unwraps them for debug builds. Emitters do not decide this policy.
+      [debug:] blocks until the Blorp early-Core pipeline either erases them
+      for normal builds or unwraps them for debug builds. Emitters do not
+      decide this policy.
 
     - {b RC is explicit in late Core.} [CDup] / [CDrop] nodes are inserted
       by the Blorp Perceus pass after specialization and before closure
@@ -194,8 +195,8 @@ let list_pointer_storage ?elem_ty ?value_layout ?policy () =
   list_storage_layout ?elem_ty ?value_layout ?policy ListPointerStorage
 
 let list_storage_layout_release_hint =
-  "list element release policy should be fixed when Core_list_layout builds \
-   the storage descriptor"
+  "list element release policy should be fixed when the Blorp list-layout \
+   stage builds the storage descriptor"
 
 let list_storage_layout_requires_release_or_error ~phase ~loc layout =
   storage_policy_requires_release_or_error ~phase ~loc ~subject:"list element"
@@ -420,13 +421,12 @@ and match_binding = {
   mb_mode : match_binding_mode;
 }
 
-(** A decision tree compiled from a [CMatchArms] by [Core_match].
+(** A decision tree compiled from a [CMatchArms] by the Blorp match pass.
 
     Each internal node represents a runtime test; each leaf carries the
-    bindings to establish before evaluating the user body. The tree is
-    produced by [Core_match.compile_match] and consumed by the Blorp Perceus
-    pass for liveness/drop placement and by the Blorp C emitter for backend
-    output.
+    bindings to establish before evaluating the user body. The tree is consumed
+    by the Blorp Perceus pass for liveness/drop placement and by the Blorp C
+    emitter for backend output.
 
     Design choice: the tree is self-contained with accessors instead
     of raw [core] expressions. Sub-scrutinees are reached via
@@ -504,10 +504,9 @@ and call_kind =
   | CKUnknown
   | CKSelectedDirect of int
       (** A direct source call whose selected [core_func.cf_def_id] came from
-      typed [resolved_call] metadata but whose canonical post-flatten Core
-      name is not available yet. [Core_mono] may use this id for generic body
-      selection; [Core_resolve] must replace it with [CKUser] before
-      specialization/emission. *)
+      typed [resolved_call] metadata. The Blorp monomorphizer uses this id for
+      generic body selection; [Core_resolve] must replace it with [CKUser]
+      before specialization/emission. *)
   | CKUser of string * int option
       (** User-defined function call. The [int option] is the callee's
       [core_func.cf_def_id] when the resolver can identify the target,
@@ -600,22 +599,23 @@ and desc =
           captured by an inner loop. *)
   | CSeq of core * core  (** [e1; e2] — both evaluated, result is [e2] *)
   | CDebugBlock of core
-      (** [debug: ...] — source instrumentation block. [Core_debug] lowers it
-          immediately after [Core_lower] based on the compilation mode, before
-          normal Core desugaring and before any backend sees the program. *)
+      (** [debug: ...] — source instrumentation block. The Blorp early-Core
+          pipeline lowers it based on compilation mode before the
+          post-match OCaml boundary. *)
   (* === Control flow === *)
   | CIf of core * core * core
       (** [if c then t else e] (else is [CVoid] if absent in source) *)
   | CMatchArms of core * (Ast.pattern * core) list
       (** pattern match — raw, pre-decision-tree.
-                                         [Core_match] rewrites every [CMatchArms]
-                                         into the compiled [CMatch] form below.
+                                         The Blorp match pass rewrites every
+                                         [CMatchArms] into the compiled [CMatch]
+                                         form below.
                                          Post-match, a surviving [CMatchArms] is
                                          an invariant violation
                                          (see [Core_invariants.check_no_cmatcharms]). *)
   | CMatch of core * ctree
       (** compiled match: root scrutinee + decision tree.
-                                         This is the canonical post-[Core_match] form. *)
+                                         This is the canonical post-match form. *)
   | CWhile of core * core  (** [while cond { body }] *)
   | CFor of loop_binder * core * core  (** [for v: ty in iter { body }] *)
   | CBreak  (** loop exit *)
@@ -2376,12 +2376,9 @@ type core_func = {
       [None] for main-program functions (not loaded from a module) and for
       test fixtures that bypass the pipeline.
 
-      Populated by [Core_flatten.prefix_module_names] at the point where
-      module identity is still unambiguous. Later passes read this field
-      directly instead of parsing [cf_name] — [sanitize_module_name] is lossy
-      (both ['/'] and ['.'] map to ['_']), so reverse-engineering the module
-      path from the mangled name is incorrect for module names containing
-      underscores (e.g. [std/sorted_map]). *)
+      Populated by Blorp graph preparation while module identity is
+      unambiguous. Later passes read this field directly instead of parsing
+      [cf_name] because C-name sanitization is lossy. *)
   cf_type_params : Ast.type_param_decl list;
   cf_params : core_param list;
   cf_return_ty : Ast.type_expr;
@@ -2389,12 +2386,9 @@ type core_func = {
   cf_is_pure : bool;
   cf_kind : cf_kind;
   cf_def_id : int;
-      (** Canonical Core-IR identity for this function, minted fresh at
-      [Core_lower] / [Core_mono] time via
-      [Session.mint_def_id]. Stays stable through downstream passes —
-      record-update rewrites (e.g. [Core_flatten.prefix_module_names]
-      renaming [cf_name]) preserve [cf_def_id] so the "which function
-      is this?" identity doesn't shift when the name does.
+      (** Canonical Core-IR identity minted by Blorp lowering and
+      monomorphization. It stays stable through downstream passes and naming
+      rewrites.
 
       Used by [Core_resolve] to key [user_funcs] entries and by
       the Blorp C emitter to emit the mangled C symbol for user functions. Typed as
@@ -2457,11 +2451,9 @@ type core_var = {
   cv_is_mutable : bool;
   cv_is_const : bool;
   cv_def_id : int;
-      (** Canonical identity for this global. Minted at [Core_lower] via
-      [Session.mint_def_id], preserved through [Core_flatten]'s
-      record-update rewrite. A4.2 routes this through
-      [Codegen_names.mangle_by_def_id] to emit the C symbol. Same
-      rationale as [core_func.cf_def_id]. *)
+      (** Canonical identity minted by Blorp lowering and preserved through
+      graph preparation. [Codegen_names.mangle_by_def_id] uses it for the C
+      symbol. Same rationale as [core_func.cf_def_id]. *)
 }
 (** A global variable declaration, with its initializer lowered to Core. *)
 

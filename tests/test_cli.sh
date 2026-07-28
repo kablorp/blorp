@@ -256,6 +256,7 @@ timeout_test="$TMPDIR_CLI/timeout_test.brp"
 repeat_test="$TMPDIR_CLI/repeat_test.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
+internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
 profiled_c="$TMPDIR_CLI/profiled.c"
 resolved_identity_prog="$TMPDIR_CLI/resolved_identity.brp"
 late_core_dump="$TMPDIR_CLI/late-core.dump"
@@ -614,6 +615,10 @@ PY
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
+expect_exit "internal synthetic executable build uses production compiler" 0 \
+	"$BLORP_BIN" __compiler-build-synthetic-executable \
+	"$valid_prog" "$valid_prog" "$internal_synthetic_binary"
+expect_exit "internal synthetic executable runs" 0 "$internal_synthetic_binary"
 expect_exit "compile profile success" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profiled_c" "$valid_prog"
 TOTAL=$((TOTAL + 1))

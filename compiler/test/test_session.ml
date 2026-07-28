@@ -211,42 +211,6 @@ let test_assert_in_scope_nested_frames () =
     (Failure "Session.assert_in_scope: no with_current frame active") (fun () ->
       Session.assert_in_scope ())
 
-(* ============================================================================
-   Pipeline-level isolation
-   ============================================================================
-
-   These tests pin the contract that [Pipeline.compile_legacy_direct_source] runs in its own
-   session — the caller's ambient state must be unchanged after the call,
-   and a second compile must not inherit state from the first. This
-   contract is the user-visible payoff of Phase 2.1: today the implicit
-   ambient session is shared across all compiles in a process, leaking
-   [module_cache] / [prelude_modules_loaded] / [load_errors] across what
-   ought to be independent compilations. *)
-
-let trivial_source = "func main(args: List[String]):\n    print(\"hi\")\n"
-
-let bad_import_source =
-  "import:\n\
-  \    nonexistent_module_xyz: foo\n\
-   func main(args: List[String]):\n\
-  \    print(\"x\")\n"
-
-let test_compile_isolates_caller_module_cache () =
-  Test_helpers.with_isolated_env (fun () ->
-      let outer = Session.current () in
-      let starting_cache_size = Hashtbl.length outer.module_cache in
-      let starting_prelude = outer.prelude_modules_loaded in
-      let _ =
-        Pipeline.compile_legacy_direct_source ~filename:"isolation_a.brp" ~source:trivial_source ()
-      in
-      Alcotest.(check int)
-        "caller module_cache unchanged after Pipeline.compile_legacy_direct_source"
-        starting_cache_size
-        (Hashtbl.length outer.module_cache);
-      Alcotest.(check bool)
-        "caller prelude_modules_loaded unchanged" starting_prelude
-        outer.prelude_modules_loaded)
-
 let mentions s needle =
   let nl = String.length needle in
   let sl = String.length s in
@@ -256,30 +220,6 @@ let mentions s needle =
     else find (i + 1)
   in
   nl <= sl && find 0
-
-let test_compile_does_not_inherit_prior_load_errors () =
-  Test_helpers.with_isolated_env (fun () ->
-      (* First compile has a bad import so it populates load_errors. *)
-      let _ =
-        Pipeline.compile_legacy_direct_source ~filename:"isolation_bad.brp" ~source:bad_import_source
-          ()
-      in
-      (* Second compile is clean. Its errors (if any) must not mention the
-       prior compile's nonexistent_module_xyz. *)
-      match
-        Pipeline.compile_legacy_direct_source ~filename:"isolation_good.brp" ~source:trivial_source
-          ()
-      with
-      | Ok _ -> Alcotest.(check pass) "clean second compile" () ()
-      | Error errs ->
-          let stale =
-            List.exists
-              (fun (e : Ast.compiler_error) ->
-                mentions e.message "nonexistent_module_xyz")
-              errs
-          in
-          Alcotest.(check bool)
-            "no stale load errors from prior compile" false stale)
 
 let with_temp_dir prefix f =
   let dir = Filename.temp_file prefix "" in
@@ -1263,14 +1203,6 @@ let test_reusable_reset_preserves_only_parse_cache () =
   s.fresh_meta_counter <- 3;
   s.meta_origin <- [ (1, "T") ];
   Hashtbl.add s.meta_env 1 Types.ty_int;
-  s.lower_destruct_counter <- 1;
-  s.lower_param_counter <- 1;
-  s.lower_question_bind_counter <- 1;
-  s.lower_resource_counter <- 1;
-  s.lower_task_scope_counter <- 4;
-  s.lower_current_task_scope_id <- 2;
-  s.desugar_counter <- 1;
-  s.ssa_mut_counter <- 1;
   Session.reset_compilation_state_preserving_parse_cache s;
   Alcotest.(check bool)
     "parse cache preserved" true
@@ -1299,16 +1231,7 @@ let test_reusable_reset_preserves_only_parse_cache () =
   Alcotest.(check int) "def ids reset" 0 s.def_id_counter;
   Alcotest.(check int) "meta counter reset" 0 s.fresh_meta_counter;
   Alcotest.(check int) "meta origins cleared" 0 (List.length s.meta_origin);
-  Alcotest.(check int) "meta env cleared" 0 (Hashtbl.length s.meta_env);
-  Alcotest.(check int) "lower destruct reset" 0 s.lower_destruct_counter;
-  Alcotest.(check int) "lower param reset" 0 s.lower_param_counter;
-  Alcotest.(check int)
-    "question bind reset" 0 s.lower_question_bind_counter;
-  Alcotest.(check int) "resource reset" 0 s.lower_resource_counter;
-  Alcotest.(check int) "task counter reset" 1 s.lower_task_scope_counter;
-  Alcotest.(check int) "task scope reset" 0 s.lower_current_task_scope_id;
-  Alcotest.(check int) "desugar reset" 0 s.desugar_counter;
-  Alcotest.(check int) "ssa reset" 0 s.ssa_mut_counter
+  Alcotest.(check int) "meta env cleared" 0 (Hashtbl.length s.meta_env)
 
 let test_modules_reset_clears_type_index () =
   let s = Session.create () in
@@ -1593,10 +1516,6 @@ let suite =
       ] );
     ( "pipeline_isolation",
       [
-        Alcotest.test_case "module_cache untouched" `Quick
-          test_compile_isolates_caller_module_cache;
-        Alcotest.test_case "no stale load_errors" `Quick
-          test_compile_does_not_inherit_prior_load_errors;
         Alcotest.test_case "analysis dependency errors" `Quick
           test_typecheck_module_only_reports_dependency_errors;
         Alcotest.test_case "analysis target errors" `Quick

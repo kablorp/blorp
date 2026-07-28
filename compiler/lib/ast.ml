@@ -305,12 +305,12 @@ and expr_desc =
       (** Parser-level compiler-provided body marker.
         [EBuiltin None] — sentinel for [builtin]. The function declaration
         parser converts this to [FuncBuiltinBody (BuiltinIntrinsic, _)] when
-        it is the whole function body; this node should never reach
-        [Core_lower].
+        it is the whole function body; this node should never reach the
+        Blorp-owned Core lowering stage.
         [EBuiltin (Some name)] — [builtin("name")]. Std identities such as
         ["std/list.map"] route through compiler intrinsic synthesis; runtime
-        helper names synthesize a [CCall (CKBuiltin name, ...)] body that
-        forwards all parameters to the named C helper from [FuncBuiltinBody].
+        helper names synthesize a builtin call body that forwards all
+        parameters to the named C helper from [FuncBuiltinBody].
         Distinct from [foreign:] blocks, which are reserved for user-facing
         FFI. *)
   | EFuncDecl of func_decl

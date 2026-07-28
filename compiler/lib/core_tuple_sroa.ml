@@ -278,9 +278,9 @@ and scan_uses arity analysis aliases expr =
       scan_uses arity analysis aliases scrut;
       scan_ctree_uses arity analysis aliases tree
   | CMatchArms _ ->
-      (* This pass normally runs after [Core_match]. If an unsupported arm form
-         survives, keep the tuple heap-allocated rather than reasoning about
-         pattern binder shadowing here. *)
+      (* This pass runs after Blorp match compilation. If a raw arm form
+         survives the boundary, keep the tuple heap-allocated rather than
+         reasoning about pattern binder shadowing here. *)
       mark_escape analysis
   | CConcurrent cb ->
       List.iter

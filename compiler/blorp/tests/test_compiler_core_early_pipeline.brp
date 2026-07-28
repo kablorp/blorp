@@ -19,6 +19,7 @@ import:
 			CoreEarlyDebugStage,
 			CoreEarlyDesugarStage,
 			CoreEarlyLowerStage,
+			CoreEarlyMatchStage,
 			CoreEarlyMonoStage,
 			CoreEarlySynthStage,
 		),
@@ -31,11 +32,21 @@ import:
 		CoreBoxKind(PrimBox),
 		CoreCallKind(SelectedDirectCall),
 		CoreDecl(FunctionDecl),
-		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LiteralExpr, VarExpr, VoidExpr),
+		CoreExpr(
+			BinaryExpr,
+			BoxExpr,
+			CallExpr,
+			DebugBlockExpr,
+			LiteralExpr,
+			RawMatchExpr,
+			VarExpr,
+			VoidExpr,
+		),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
-		CoreLiteral(StringLiteral),
+		CoreLiteral(IntLiteral, StringLiteral),
 		CoreParam,
+		CorePattern(WildcardPattern),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorStaticDim),
@@ -150,6 +161,7 @@ func test_stage_names_round_trip() -> Bool:
 		CoreEarlyDesugarStage,
 		CoreEarlyMonoStage,
 		CoreEarlySynthStage,
+		CoreEarlyMatchStage,
 	]
 
 	stages.all(pure func(stage):
@@ -411,6 +423,50 @@ func test_pipeline_can_observe_and_stop_at_post_synth_boundary() -> Bool:
 			False
 
 
+func test_pipeline_owns_match_compilation_before_worker_boundary() -> Bool:
+	int_type: CoreType = named_type("Int")
+	match_expr: CoreExpr = RawMatchExpr(
+		LiteralExpr(
+			IntLiteral(1),
+			int_type,
+			SyntheticSourceLoc,
+		),
+		[
+			{
+				pattern = WildcardPattern,
+				body = LiteralExpr(IntLiteral(2), int_type, SyntheticSourceLoc)
+			},
+		],
+		int_type,
+		SyntheticSourceLoc,
+	)
+	main: CoreFunction = function("main", 20, [], [], int_type, match_expr)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyMatchStage],
+				Some(CoreEarlyMatchStage),
+			),
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlyMatchStage)
+				and rendered.contains("\"kind\":\"semantic_match\"")
+				and not rendered.contains("\"kind\":\"raw_match\"")
+				and observations.length() == 1
+			)
+		_:
+			False
+
+
 func test_pipeline_returns_synth_diagnostic() -> Bool:
 	string_type: CoreType = named_type("String")
 	tensor_type: CoreType = TensorType({
@@ -514,6 +570,10 @@ tests: TestSuite = {
 		(
 			"pipeline can observe and stop at post-synth boundary",
 			test_pipeline_can_observe_and_stop_at_post_synth_boundary,
+		),
+		(
+			"pipeline owns match compilation before worker boundary",
+			test_pipeline_owns_match_compilation_before_worker_boundary,
 		),
 		("pipeline returns synth diagnostic", test_pipeline_returns_synth_diagnostic),
 		(

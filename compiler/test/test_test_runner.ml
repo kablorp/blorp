@@ -83,22 +83,16 @@ let test_sanitizer_mode_parsing () =
     "rejects unknown sanitizer mode" true
     (sanitizer_mode_of_string "thread" = None)
 
-let test_sanitizer_mode_cc_args () =
+let test_sanitizer_mode_cli_values () =
   let open Blorp.Test_runner in
-  let has arg args = List.exists (( = ) arg) args in
-  let off_args = sanitizer_cc_args SanitizerOff in
-  let address_args = sanitizer_cc_args SanitizerAddressUndefined in
-  let undefined_args = sanitizer_cc_args SanitizerUndefinedOnly in
-  Alcotest.(check (list string)) "off args" [] off_args;
-  Alcotest.(check bool)
-    "address mode includes ASan and UBSan" true
-    (has "-fsanitize=address,undefined" address_args);
-  Alcotest.(check bool)
-    "undefined mode includes UBSan" true
-    (has "-fsanitize=undefined" undefined_args);
-  Alcotest.(check bool)
-    "undefined mode excludes ASan" false
-    (has "-fsanitize=address,undefined" undefined_args)
+  Alcotest.(check string)
+    "off" "off" (sanitizer_mode_to_cli_value SanitizerOff);
+  Alcotest.(check string)
+    "address and undefined" "address"
+    (sanitizer_mode_to_cli_value SanitizerAddressUndefined);
+  Alcotest.(check string)
+    "undefined only" "undefined"
+    (sanitizer_mode_to_cli_value SanitizerUndefinedOnly)
 
 let test_capture_timeout_does_not_wait_for_inherited_pipe () =
   let start = Unix.gettimeofday () in
@@ -611,209 +605,6 @@ let with_isolated_home_preserving_bridge_cache home f =
   with_env Blorp.Compiler_blorp_bridge.renderer_bridge_cache_dir_env bridge_cache
     (fun () -> with_env "HOME" home f)
 
-let shell_quote s =
-  "'" ^ String.concat "'\\''" (String.split_on_char '\'' s) ^ "'"
-
-let test_precompile_runtime_writes_verified_manifest () =
-  Blorp.Test_runner.with_run_artifacts (fun () ->
-      match Blorp.Test_runner.precompile_runtime ~opt:"O0" () with
-      | None -> Alcotest.fail "runtime precompile failed"
-      | Some precompiled ->
-          let dir = Filename.dirname precompiled.runtime_obj in
-          let manifest_path = Filename.concat dir "MANIFEST" in
-          let ready_path = Filename.concat dir "READY" in
-          let manifest = read_whole_file manifest_path in
-          let manifest_lines = String.split_on_char '\n' manifest in
-          Alcotest.(check bool)
-            "ready marker exists" true
-            (Sys.file_exists ready_path);
-          Alcotest.(check bool)
-            "manifest version" true
-            (String.contains manifest '\n'
-            && String.starts_with ~prefix:"runtime-cache-manifest-v1\n" manifest
-            );
-          Alcotest.(check bool)
-            "manifest records runtime.o digest" true
-            (List.exists
-               (( = )
-                  ("runtime.o="
-                  ^ Digest.to_hex (Digest.file precompiled.runtime_obj)))
-               manifest_lines);
-          Alcotest.(check bool)
-            "manifest records runtime.h digest" true
-            (List.exists
-               (( = )
-                  ("runtime.h="
-                  ^ Digest.to_hex (Digest.file precompiled.header_file)))
-               manifest_lines);
-          Alcotest.(check bool)
-            "manifest records TLS backend" true
-            (List.exists
-               (( = )
-                  ("tls_backend="
-                  ^ Blorp.Test_runner.tls_backend_profile_to_string
-                      precompiled.tls_backend))
-               manifest_lines))
-
-let test_tls_backend_profile_env_parsing () =
-  let check_profile label expected value =
-    with_env "BLORP_TLS_BACKEND" value (fun () ->
-        match Blorp.Test_runner.configured_tls_backend_profile () with
-        | Ok actual -> Alcotest.(check bool) label true (actual = expected)
-        | Error msg -> Alcotest.fail msg)
-  in
-  check_profile "default profile" Blorp.Test_runner.TlsUnsupported "unsupported";
-  check_profile "openssl profile" Blorp.Test_runner.TlsOpenSsl "openssl";
-  with_env "BLORP_TLS_BACKEND" "bogus" (fun () ->
-      match Blorp.Test_runner.configured_tls_backend_profile () with
-      | Ok _ -> Alcotest.fail "invalid TLS backend profile accepted"
-      | Error msg ->
-          Alcotest.(check bool)
-            "mentions env var" true
-            (contains_substring msg "BLORP_TLS_BACKEND"))
-
-let test_tls_backend_openssl_args_use_named_configuration () =
-  with_env "BLORP_OPENSSL_CFLAGS" "-I/tmp/blorp-openssl/include -DTEST_TLS"
-    (fun () ->
-      Alcotest.(check (list string))
-        "openssl runtime args include define and configured cflags"
-        [
-          "-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1";
-          "-I/tmp/blorp-openssl/include";
-          "-DTEST_TLS";
-        ]
-        (Blorp.Test_runner.tls_backend_runtime_cc_args
-           Blorp.Test_runner.TlsOpenSsl));
-  with_env "BLORP_OPENSSL_LIBS" "-L/tmp/blorp-openssl/lib -lssl -lcrypto"
-    (fun () ->
-      Alcotest.(check (list string))
-        "openssl link args use configured libs"
-        [ "-L/tmp/blorp-openssl/lib"; "-lssl"; "-lcrypto" ]
-        (Blorp.Test_runner.tls_backend_link_cc_args Blorp.Test_runner.TlsOpenSsl))
-
-let test_precompile_runtime_reuses_verified_cache () =
-  let real_cc =
-    let code, output =
-      Blorp.Test_runner.run_process_capture_timeout ~timeout:None "sh"
-        [ "-c"; "command -v cc" ]
-    in
-    if code <> 0 then Alcotest.fail "could not find cc";
-    String.trim output
-  in
-  with_temp_dir "blorp-runtime-cache-" (fun dir ->
-      let home = Filename.concat dir "home" in
-      let fake_bin = Filename.concat dir "bin" in
-      let log_path = Filename.concat dir "cc.log" in
-      Unix.mkdir home 0o700;
-      Unix.mkdir fake_bin 0o700;
-      let fake_cc = Filename.concat fake_bin "cc" in
-      write_file fake_cc
-        (Printf.sprintf
-           {|#!/bin/sh
-	for arg in "$@"; do
-	    if [ "$arg" = "-c" ]; then
-	        echo compile >> %s
-	        break
-	    fi
-	done
-	exec %s "$@"
-	|}
-	           (shell_quote log_path) (shell_quote real_cc));
-	      Unix.chmod fake_cc 0o755;
-	      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
-	      with_env "HOME" home (fun () ->
-	          with_env "PATH"
-	            (fake_bin ^ ":" ^ old_path)
-	            (fun () ->
-	              Blorp.Test_runner.with_run_artifacts (fun () ->
-	                  let first =
-	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-	                  in
-	                  let second =
-	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-	                  in
-	                  let compile_count =
-	                    if Sys.file_exists log_path then
-	                      read_whole_file log_path |> String.split_on_char '\n'
-	                      |> List.filter (fun line -> String.trim line <> "")
-	                      |> List.length
-	                    else 0
-	                  in
-	                  match (first, second) with
-	                  | Some a, Some b ->
-	                      Alcotest.(check string)
-	                        "same runtime object" a.runtime_obj b.runtime_obj;
-	                      Alcotest.(check int)
-	                        "runtime compiled once" 1 compile_count
-	                  | _ -> Alcotest.fail "runtime precompile failed"))))
-
-let test_precompile_runtime_repairs_incomplete_cache () =
-  let real_cc =
-    let code, output =
-      Blorp.Test_runner.run_process_capture_timeout ~timeout:None "sh"
-        [ "-c"; "command -v cc" ]
-    in
-    if code <> 0 then Alcotest.fail "could not find cc";
-    String.trim output
-  in
-  with_temp_dir "blorp-runtime-cache-repair-" (fun dir ->
-      let home = Filename.concat dir "home" in
-      let fake_bin = Filename.concat dir "bin" in
-      let log_path = Filename.concat dir "cc.log" in
-      Unix.mkdir home 0o700;
-      Unix.mkdir fake_bin 0o700;
-      let fake_cc = Filename.concat fake_bin "cc" in
-      write_file fake_cc
-        (Printf.sprintf
-           {|#!/bin/sh
-	for arg in "$@"; do
-	    if [ "$arg" = "-c" ]; then
-	        echo compile >> %s
-	        break
-	    fi
-	done
-	exec %s "$@"
-	|}
-	           (shell_quote log_path) (shell_quote real_cc));
-	      Unix.chmod fake_cc 0o755;
-	      let old_path = Option.value (Sys.getenv_opt "PATH") ~default:"" in
-	      with_env "HOME" home (fun () ->
-	          with_env "PATH"
-	            (fake_bin ^ ":" ^ old_path)
-	            (fun () ->
-	              Blorp.Test_runner.with_run_artifacts (fun () ->
-	                  let first =
-	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-	                  in
-	                  let first_dir =
-	                    match first with
-	                    | Some p -> Filename.dirname p.runtime_obj
-	                    | None -> Alcotest.fail "initial precompile failed"
-	                  in
-	                  Sys.remove (Filename.concat first_dir "READY");
-	                  let repaired =
-	                    Blorp.Test_runner.precompile_runtime ~opt:"O0" ()
-	                  in
-	                  let compile_count =
-	                    if Sys.file_exists log_path then
-	                      read_whole_file log_path |> String.split_on_char '\n'
-	                      |> List.filter (fun line -> String.trim line <> "")
-	                      |> List.length
-	                    else 0
-	                  in
-	                  match repaired with
-	                  | Some p ->
-	                      Alcotest.(check bool)
-	                        "repaired ready marker" true
-	                        (Sys.file_exists
-	                           (Filename.concat
-	                              (Filename.dirname p.runtime_obj)
-	                              "READY"));
-	                      Alcotest.(check int)
-	                        "runtime recompiled after stale cache" 2
-	                        compile_count
-	                  | None -> Alcotest.fail "repair precompile failed"))))
-
 let test_suite_selector_harness_dispatches_by_index () =
   let source =
     Blorp.Test_runner.generate_suite_selector_harness
@@ -942,7 +733,7 @@ let test_suite_run_all_streams_preserve_stderr_diagnostics () =
 let test_timing_event_has_stable_machine_readable_format () =
   let event : Blorp.Test_runner.timing_event =
     {
-      timing_phase = HarnessFrontendGraph;
+      timing_phase = HarnessPipeline;
       timing_group = "run_all_0";
       timing_suite_count = 4;
       timing_source_count = 4;
@@ -951,7 +742,7 @@ let test_timing_event_has_stable_machine_readable_format () =
   in
   Alcotest.(check string)
     "timing record"
-    "BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 \
+    "BLORP_TEST_TIMING phase=pipeline group=run_all_0 suites=4 sources=4 \
      duration_ms=1234"
     (Blorp.Test_runner.format_timing_event event)
 
@@ -1022,29 +813,7 @@ let test_sanitized_harnesses_use_smaller_source_budget () =
     "sanitizer instrumentation lowers the aggregate source budget" true
     (sanitized < ordinary)
 
-let test_source_text_cache_guard_uses_current_file_contents () =
-  with_temp_dir "blorp-source-cache-guard-" (fun dir ->
-      let path = Filename.concat dir "sample.brp" in
-      write_file path "func main(args: List[String]) -> Int: 0\n";
-      Alcotest.(check bool)
-        "matching source can use cache" true
-        (Blorp.Test_runner.source_text_matches_current_file path
-           (Some "func main(args: List[String]) -> Int: 0\n"));
-      write_file path "func main(args: List[String]) -> Int: 1\n";
-      Alcotest.(check bool)
-        "stale source cannot use cache" false
-        (Blorp.Test_runner.source_text_matches_current_file path
-           (Some "func main(args: List[String]) -> Int: 0\n"));
-      Alcotest.(check bool)
-        "uncached source path remains cache eligible" true
-        (Blorp.Test_runner.source_text_matches_current_file path None);
-      Sys.remove path;
-      Alcotest.(check bool)
-        "deleted file cannot use stale source cache" false
-        (Blorp.Test_runner.source_text_matches_current_file path
-           (Some "func main(args: List[String]) -> Int: 1\n")))
-
-let test_suite_harness_combines_globals_without_result_cache () =
+let test_suite_harness_combines_globals_and_reports_failures () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
       let home = Filename.concat dir "home" in
       Unix.mkdir home 0o700;
@@ -1085,13 +854,7 @@ unused_tests: TestSuite = {
                 Blorp.Test_runner.run_tests ~timeout:(Some 10) ~jobs:1
                   ~cache:true "."
               in
-              let test_results_dir =
-                Filename.concat home ".cache/blorp/cas/test-results"
-              in
               Alcotest.(check int) "combined suite run" 0 code;
-              Alcotest.(check bool)
-                "run-all skips per-file result cache" false
-                (Sys.file_exists test_results_dir);
               write_file
                 (Filename.concat dir "e.brp")
                 (suite_source "e" "False");
@@ -1330,20 +1093,8 @@ let suite =
     ( "sanitizers",
       [
         Alcotest.test_case "mode_parsing" `Quick test_sanitizer_mode_parsing;
-        Alcotest.test_case "mode_cc_args" `Quick test_sanitizer_mode_cc_args;
-      ] );
-    ( "precompiled_runtime",
-      [
-        Alcotest.test_case "writes_verified_manifest" `Quick
-          test_precompile_runtime_writes_verified_manifest;
-        Alcotest.test_case "tls_backend_env_parsing" `Quick
-          test_tls_backend_profile_env_parsing;
-        Alcotest.test_case "tls_backend_openssl_args" `Quick
-          test_tls_backend_openssl_args_use_named_configuration;
-        Alcotest.test_case "reuses_verified_cache" `Quick
-          test_precompile_runtime_reuses_verified_cache;
-        Alcotest.test_case "repairs_incomplete_cache" `Quick
-          test_precompile_runtime_repairs_incomplete_cache;
+        Alcotest.test_case "mode_cli_values" `Quick
+          test_sanitizer_mode_cli_values;
       ] );
     ( "suite_selector_harness",
       [
@@ -1369,10 +1120,8 @@ let suite =
           test_compilation_groups_follow_source_budget_not_suite_count;
         Alcotest.test_case "sanitized_harness_source_budget" `Quick
           test_sanitized_harnesses_use_smaller_source_budget;
-        Alcotest.test_case "source_text_cache_guard" `Quick
-          test_source_text_cache_guard_uses_current_file_contents;
-        Alcotest.test_case "combined_harness_globals_and_result_cache" `Quick
-          test_suite_harness_combines_globals_without_result_cache;
+        Alcotest.test_case "combined_harness_globals_and_failures" `Quick
+          test_suite_harness_combines_globals_and_reports_failures;
         Alcotest.test_case "uses_blorp_frontend" `Quick
           test_suite_harness_uses_blorp_frontend;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick

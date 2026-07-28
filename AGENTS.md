@@ -352,10 +352,9 @@ comparisons with extra defensive parentheses are benign. `-Wunsequenced` and
 `-Wincompatible-pointer-types` warnings are not accepted in the preview warning
 sweep; regressions for those classes live in the codegen audit suite.
 
-`./blorp test --warmup-only` must succeed before parallel gates. The OCaml unit
-suite includes a regression proving the content-addressed precompiled runtime
-cache reuses an existing verified `runtime.o` instead of recompiling C on a
-second lookup.
+`./blorp test --warmup-only` must succeed before parallel gates. Warmup compiles
+a minimal program through the production Blorp executable, populating the same
+Blorp-owned runtime cache used by subsequent test artifacts.
 
 ## CLI Usage
 
@@ -453,15 +452,7 @@ compiler/            # OCaml compiler implementation
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core.ml           # Core IR type definitions and traversal helpers
-    core_lower.ml     # Typed AST → Core IR lowering
-    core_ffi_boundary.ml  # Checked FFI argument-boundary policies
-    core_debug.ml     # debug: block erasure/retention by build mode
-    core_desugar.ml   # Core IR sugar elimination
-    core_ssa.ml       # Mutable-local lowering used by core_desugar
-    core_mono.ml      # Core IR monomorphization
-    core_list_layout.ml  # List storage layout annotation
-    core_synth.ml     # Post-mono body synthesis for concrete builtins
-    core_match.ml     # Core IR pattern match → decision tree
+    core_post_match_json.ml  # Strict Blorp post-match Core decoder
     core_trait_resolve.ml  # Trait-method and overloaded-operator rewrite
     core_resolve.ml   # Core IR call kind resolution
     core_std_inline.ml  # Narrow call-site expansion for compiler-owned std wrappers
@@ -472,15 +463,10 @@ compiler/            # OCaml compiler implementation
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
-    core_consume_specialize.ml  # Core IR consuming-call specialization before Perceus
-    core_perceus.ml   # Core IR Perceus RC insertion
-    core_reuse.ml     # Core IR post-Perceus reuse analysis and prepared union reuse
-    core_resource.ml  # Resource-scope cleanup-exit lowering
-    core_fairness.ml  # Cooperative loop checkpoint insertion
+    core_specialize_fallback.ml  # Narrow fallback for unsupported runtime layouts
     core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client
-    core_pipeline.ml  # Core IR pipeline orchestration
+    core_pipeline.ml  # Remaining post-synthesis OCaml middle orchestration
     core_emit_util.ml, core_emit_layout.ml  # Shared late-backend helpers
-    core_intrinsics.ml  # IR body synthesis for builtins/intrinsics
     core_intrinsic_registry.ml  # Intrinsic manifest and contracts
     core_invariants.ml  # Stage-boundary invariant checks
     core_error.ml     # Core IR structured errors

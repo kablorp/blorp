@@ -85,27 +85,21 @@ let default_suites =
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
   @ suite_group "Core" Test_core.suite
-  @ suite_group "CorePostSynthJson" Test_core_post_synth_json.suite
+  @ suite_group "CorePostMatchJson" Test_core_post_match_json.suite
   @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
-  @ suite_group "CoreCompatibility" Test_core_compatibility.suite
+  @ suite_group "SemanticMiddle" Test_semantic_middle.suite
   @ suite_group "CoreResolve" Test_core_resolve.suite
   @ suite_group "CoreStdInline" Test_core_std_inline.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
-  @ suite_group "CoreMono" Test_core_mono.suite
-  @ suite_group "CoreDesugar" Test_core_desugar.suite
-  @ suite_group "CoreSsa" Test_core_ssa.suite
-  @ suite_group "CoreMatch" Test_core_match.suite
   @ suite_group "CoreTailrec" Test_core_tailrec.suite
   @ suite_group "CoreTraitResolve" Test_core_trait_resolve.suite
-  @ suite_group "CoreIntrinsics" Test_core_intrinsics.suite
   @ suite_group "CoreCollectionPipeline" Test_core_collection_pipeline.suite
   @ suite_group "CoreParallelVectorPipeline"
       Test_core_parallel_tensor_pipeline.suite
   @ suite_group "CoreStringPipeline" Test_core_string_pipeline.suite
   @ suite_group "CoreTupleSroa" Test_core_tuple_sroa.suite
   @ suite_group "CoreLayoutType" Test_core_layout_type.suite
-  @ suite_group "CoreListLayout" Test_core_list_layout.suite
   @ suite_group "CoreTypeLayout" Test_core_type_layout.suite
   @ suite_group "CoreOptionLayout" Test_core_option_layout.suite
   @ suite_group "CoreResultLayout" Test_core_result_layout.suite
@@ -114,7 +108,6 @@ let default_suites =
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
   @ suite_group "CoreStage" Test_core_stage.suite
-  @ suite_group "CoreObservability" Test_core_observability.suite
   @ suite_group "Invariants" Test_invariants.suite
   @ suite_group "IntrinsicContract" Test_intrinsic_contract.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite

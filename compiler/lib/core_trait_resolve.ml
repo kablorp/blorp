@@ -2,8 +2,9 @@
 
     Walks a [core_program] post-monomorphization and rewrites [CCall]
     callees whose bare name is a trait method to the matching impl's
-    mangled name (e.g. [Trait_method_Type]). Runs after [Core_mono] (so
-    receiver types are concrete) and before [Core_resolve] (so the
+    mangled name (e.g. [Trait_method_Type]). Runs after Blorp
+    monomorphization (so receiver types are concrete) and before
+    [Core_resolve] (so the
     rewritten name flows through regular name-lookup).
 
     {1 Why a dedicated pass}

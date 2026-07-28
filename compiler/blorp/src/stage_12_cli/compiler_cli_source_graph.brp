@@ -36,6 +36,10 @@ import:
 
 private CURRENT_PACKAGE_STD_COMPAT: String = "preview-1"
 
+private IMPLICIT_PRELUDE_MODULE: String = "std/prelude"
+
+private IMPLICIT_TUPLE_IMPL_MODULE: String = "std/tuple"
+
 
 private pure func owned_string(text: String) -> String:
 	text.substring(0, text.length())
@@ -1909,16 +1913,18 @@ record CliSourceGraphWalk {
 }
 
 
-private func implicit_prelude_sources(
+private func implicit_std_module_source(
 	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
+	module_name: String,
 ) -> Result[List[CliSourceFile], String]:
-	if roots.any(func(root): root.module_name == "std/prelude"):
+	if roots.any(func(root): root.module_name == module_name):
 		Ok([])
 	else:
 		match context.std_dir:
 			Some(std_dir):
-				path: String = normalize(join(std_dir, "prelude.brp"))
+				std_name: String = strip_prefix("std/", module_name)
+				path: String = normalize(join(std_dir, module_source_filename(std_name)))
 
 				if roots.any(func(root): normalize(root.path) == path) or not file_exists(path):
 					Ok([])
@@ -1926,41 +1932,50 @@ private func implicit_prelude_sources(
 					source ?= read_text_file(
 						path,
 					).map_err(
-						func(err): "failed to read implicit prelude `${path}`: ${err}",
+						func(err): "failed to read implicit compiler module `${path}`: ${err}",
 					)
 
 					Ok(
 						[
 							{
 								path = path,
-								module_name = "std/prelude",
+								module_name = module_name,
 								source_text = source
 							},
 						],
 					)
 			None:
-				match embedded_std_source("std/prelude"):
+				match embedded_std_source(module_name):
 					Some(source):
 						Ok(
 							[
 								{
-									path = "<embedded:std/prelude>",
-									module_name = "std/prelude",
+									path = "<embedded:${module_name}>",
+									module_name = module_name,
 									source_text = source
 								},
 							],
 						)
 					None:
-						Err("embedded standard library is missing `std/prelude`")
+						Err("embedded standard library is missing `${module_name}`")
 
 
-private func implicit_prelude_sources_if_enabled(
+private func implicit_compiler_sources(
+	context: CliFrontendGraphContext,
+	roots: List[CliParsedSourceFile],
+) -> Result[List[CliSourceFile], String]:
+	prelude ?= implicit_std_module_source(context, roots, IMPLICIT_PRELUDE_MODULE)
+	tuple_impls ?= implicit_std_module_source(context, roots, IMPLICIT_TUPLE_IMPL_MODULE)
+	Ok(prelude.concat(tuple_impls))
+
+
+private func implicit_compiler_sources_if_enabled(
 	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
 	enabled: Bool,
 ) -> Result[List[CliSourceFile], String]:
 	if enabled:
-		implicit_prelude_sources(context, roots)
+		implicit_compiler_sources(context, roots)
 	else:
 		Ok([])
 
@@ -1968,14 +1983,18 @@ private func implicit_prelude_sources_if_enabled(
 private func source_graph_walk_for_roots(
 	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
-	include_implicit_prelude: Bool,
+	include_implicit_compiler_sources: Bool,
 ) -> Result[CliSourceGraphWalk, String]:
 	var modules: List[CliParsedSourceFile] = []
 	var import_edges: List[CliFrontendImportEdge] = []
 	var seen_sources: List[CliSourceIdentity] = parsed_source_identities(roots)
-	prelude_sources ?= implicit_prelude_sources_if_enabled(context, roots, include_implicit_prelude)
+	compiler_sources ?= implicit_compiler_sources_if_enabled(
+		context,
+		roots,
+		include_implicit_compiler_sources,
+	)
 
-	for source in prelude_sources:
+	for source in compiler_sources:
 		if not source_identity_seen(seen_sources, source.path, source.module_name):
 			seen_sources = seen_sources.append({
 				path = source.path,
@@ -1985,7 +2004,7 @@ private func source_graph_walk_for_roots(
 	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_sources)
 	seen_sources = initial.seen_sources
 	import_edges = import_edges.concat(initial.import_edges)
-	var pending: List[CliSourceFile] = prelude_sources.concat(initial.sources)
+	var pending: List[CliSourceFile] = compiler_sources.concat(initial.sources)
 	var error: Option[String] = None
 
 	while pending.length() > 0:

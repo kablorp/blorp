@@ -2,13 +2,10 @@ import:
 	../src/stage_09_core/compiler_core_json:
 		CoreAccessor(RootAccessor),
 		CoreBinaryOp(NotEqualOp),
-		CoreCallKind(BuiltinCall, DirectRuntimeCall),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
-		CoreConstructorMatchTest(
-			BoxedResultOkConstructorTest,
-			StackResultOkConstructorTest,
-		),
+		CoreConstructorMatchTest(BoxedResultOkConstructorTest, StackResultOkConstructorTest),
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			BinaryExpr,
@@ -21,11 +18,23 @@ import:
 			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
-		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(BoxedResultType, NamedType, RangeType, StackResultType, VoidType),
+		CoreTensorDim(TensorStaticDim),
+		CoreTensorTypeInfo,
+		CoreType(
+			BoxedResultType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			ValueRecordType,
+			VoidType,
+		),
 		CoreVar,
 		core_expr_to_json,
 	../src/stage_09_core/compiler_core_specialize: specialize_program
@@ -51,6 +60,16 @@ pure func variable(name: String, typ: CoreType) -> CoreExpr:
 pure func builtin_call(name: String, arg: CoreExpr, typ: CoreType) -> CoreExpr:
 	CallExpr(
 		BuiltinCall(name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[arg],
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func intrinsic_call(name: String, arg: CoreExpr, typ: CoreType) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall(name),
 		VoidExpr(VoidType, SyntheticSourceLoc),
 		[arg],
 		typ,
@@ -150,22 +169,27 @@ private pure func expected_result_truthiness(
 				test = test,
 				bindings = [],
 				body = ConstructorMatchBodyExpr(
-					LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc),
+					LiteralExpr(
+						BoolLiteral(True),
+						bool_type,
+						SyntheticSourceLoc,
+					),
 				)
 			},
 		],
 		ConstructorMatchFallbackBody(
-			LiteralExpr(BoolLiteral(False), bool_type, SyntheticSourceLoc),
+			LiteralExpr(
+				BoolLiteral(False),
+				bool_type,
+				SyntheticSourceLoc,
+			),
 		),
 		bool_type,
 		SyntheticSourceLoc,
 	)
 
 
-private pure func specialized_matches(
-	actual: Option[CoreExpr],
-	expected: CoreExpr,
-) -> Bool:
+private pure func specialized_matches(actual: Option[CoreExpr], expected: CoreExpr) -> Bool:
 	match actual:
 		Some(expr):
 			core_expr_to_json(expr).to_string() == core_expr_to_json(expected).to_string()
@@ -184,24 +208,26 @@ pure func test_to_bool_result_layouts() -> Bool:
 	)
 
 	stack_specialized = specialized_body(
-		builtin_call("blorp_to_bool", stack_result, named_type("Bool")),
+		builtin_call(
+			"blorp_to_bool",
+			stack_result,
+			named_type("Bool"),
+		),
 	)
 	boxed_specialized = specialized_body(
-		builtin_call("blorp_to_bool", boxed_result, named_type("Bool")),
+		builtin_call(
+			"blorp_to_bool",
+			boxed_result,
+			named_type("Bool"),
+		),
 	)
 
-	(
-		specialized_matches(
-			stack_specialized,
-			expected_result_truthiness(
-				stack_result,
-				StackResultOkConstructorTest("blorp_StackResult"),
-			),
-		)
-		and specialized_matches(
-			boxed_specialized,
-			expected_result_truthiness(boxed_result, BoxedResultOkConstructorTest),
-		)
+	specialized_matches(
+		stack_specialized,
+		expected_result_truthiness(stack_result, StackResultOkConstructorTest("blorp_StackResult")),
+	) and specialized_matches(
+		boxed_specialized,
+		expected_result_truthiness(boxed_result, BoxedResultOkConstructorTest),
 	)
 
 
@@ -280,6 +306,60 @@ pure func test_hash_dispatches_other_primitive_types() -> Bool:
 	)
 
 
+pure func test_type_name_intrinsic_renders_post_mono_core_types() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = named_type("Float"),
+		dims = [TensorStaticDim(2), TensorStaticDim(3)],
+	})
+	tuple_type: CoreType = TupleType([named_type("Int"), named_type("String")])
+
+	match (
+		specialized_body(
+			intrinsic_call(
+				"type_name",
+				variable("tensor", tensor_type),
+				named_type("String"),
+			),
+		),
+		specialized_body(
+			intrinsic_call(
+				"type_name",
+				variable("tuple", tuple_type),
+				named_type("String"),
+			),
+		),
+	):
+		(Some(LiteralExpr(StringLiteral(tensor_name), _, _)), Some(LiteralExpr(StringLiteral(tuple_name), _, _))):
+			tensor_name == "Float[#2, #3]" and tuple_name == "(Int, String)"
+		_:
+			False
+
+
+pure func is_heap_specializes_to(typ: CoreType, expected: Bool) -> Bool:
+	match specialized_body(intrinsic_call("is_heap", variable("value", typ), named_type("Bool"))):
+		Some(LiteralExpr(BoolLiteral(actual), _, _)):
+			actual == expected
+		_:
+			False
+
+
+pure func test_is_heap_intrinsic_uses_core_ownership_layout() -> Bool:
+	(
+		is_heap_specializes_to(named_type("Int"), False)
+		and is_heap_specializes_to(named_type("String"), True)
+		and is_heap_specializes_to(ValueRecordType("Point"), False)
+		and is_heap_specializes_to(HeapRecordType("Node"), True)
+		and is_heap_specializes_to(
+			StackResultType(named_type("String"), named_type("Int")),
+			True,
+		)
+		and is_heap_specializes_to(
+			StackResultType(named_type("Int"), named_type("Bool")),
+			False,
+		)
+	)
+
+
 pure func test_hash_preserves_unsupported_type_dispatch() -> Bool:
 	match specialized_body(
 		builtin_call(
@@ -319,6 +399,11 @@ tests: TestSuite = {
 		),
 		("Int hash becomes direct runtime call", test_int_hash_becomes_direct_runtime_call),
 		("hash dispatches other primitive types", test_hash_dispatches_other_primitive_types),
+		(
+			"type_name renders post-mono Core types",
+			test_type_name_intrinsic_renders_post_mono_core_types,
+		),
+		("is_heap uses Core ownership layout", test_is_heap_intrinsic_uses_core_ownership_layout),
 		(
 			"hash preserves unsupported type dispatch",
 			test_hash_preserves_unsupported_type_dispatch,

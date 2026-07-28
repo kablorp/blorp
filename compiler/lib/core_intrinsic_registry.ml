@@ -16,16 +16,16 @@
       [compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp]
     - Documentation of its semantics (what it does, not how)
 
-    IR bodies in [core_intrinsics.ml] compose these primitives into
-    higher-level operations (append, remove, starts_with, etc.) that
-    flow through mono, perceus, and emit like normal user code.
+    Blorp synthesis modules under [stage_09_core] compose these primitives
+    into higher-level operations that flow through monomorphization, Perceus,
+    and emission like normal user code.
 
     {1 Adding new intrinsics}
 
     1. Add the entry here with name, arg types, return type, and semantics.
     2. Add the Blorp renderer case in
        [compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp].
-    3. Use it in [core_intrinsics.ml] IR bodies via [intr "name" args ty].
+    3. Use it in the relevant [compiler_core_synth_*.brp] family.
 
     C emission for these intrinsics is owned by the Blorp emitter through the
     Blorp intrinsic renderer module. Do not add a parallel OCaml emission path
@@ -33,15 +33,15 @@
 
     {1 How builtin works}
 
-    When a blorp function is declared [builtin], [core_lower.ml] calls
-    [Core_intrinsics.synthesize_body] to generate its Core IR body. The body
+    When a Blorp function is declared [builtin], Blorp Core lowering and the
+    post-monomorphization synthesis stage generate its Core IR body. The body
     can use:
     - [CKIntrinsic] calls for backend-specific leaf operations
     - [CKBuiltin] calls for opaque C functions (thin wrappers)
     - Normal IR constructs (let, if, for, while, etc.)
 
-    If synthesis returns [None], the function falls through to the standard
-    [CKBuiltin] path using [codegen_builtins.ml] name mappings.
+    A bodyless builtin falls through to the standard [CKBuiltin] path using
+    [codegen_builtins.ml] name mappings.
 
     Some std functions are thin enough that qualified calls can skip both
     generic monomorphization and CKBuiltin dispatch, resolving directly to a
@@ -125,8 +125,8 @@ type ir_backed_std_function = {
     List is a refcounted dynamic array: [header, len, capacity,
     elem_release, data\[\]]. Elements are type-erased to [void*].
 
-    Composed operations built from these (in core_intrinsics.ml):
-    append, set_index, remove, insert, tail, reverse, get. *)
+    The Blorp synthesis stages build composed operations such as append,
+    set_index, remove, insert, tail, reverse, and get from these primitives. *)
 
 let list_intrinsics =
   [
@@ -193,12 +193,9 @@ let list_intrinsics =
     UTF-8 encoded. Byte-level access is safe for prefix/suffix/equality
     comparisons because UTF-8 is a deterministic encoding.
 
-    Composed operations built from these (in core_intrinsics.ml, 29 total):
-    substring, starts_with, ends_with, contains, raw_index_of, count,
-    is_numeric, is_ascii, is_blank, is_lower, is_upper, repeat, reverse,
-    drop_left, take_left, take_right, drop_right, trim, trim_left, trim_right,
-    capitalize, title_case, pad_left, pad_right, center, trim_chars,
-    raw_last_index_of, longest_common_prefix, hamming_distance_raw.
+    The Blorp synthesis stages build composed operations such as substring,
+    prefix/suffix checks, search, trimming, padding, and text classification
+    from these primitives.
 
     Permanent CKBuiltin (not decomposable with current intrinsics):
     - split, split_n, lines, words — build List[String], algorithmically

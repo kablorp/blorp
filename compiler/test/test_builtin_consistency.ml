@@ -450,6 +450,13 @@ let test_type_metadata_splits_operator_and_to_string_fallbacks () =
     "List still has builtin to_string fallback" true
     (Type_metadata.has_builtin_to_string_fallback_type list_int);
   Alcotest.(check bool)
+    "StringSlice dispatches through its Stringable impl" false
+    (Type_metadata.has_builtin_to_string_fallback_type
+       (TyNamed ("StringSlice", [])));
+  Alcotest.(check bool)
+    "Url dispatches through its Stringable impl" false
+    (Type_metadata.has_builtin_to_string_fallback_type (TyNamed ("Url", [])));
+  Alcotest.(check bool)
     "User record has no builtin to_string fallback" false
     (Type_metadata.has_builtin_to_string_fallback_type (TyNamed ("Widget", [])))
 

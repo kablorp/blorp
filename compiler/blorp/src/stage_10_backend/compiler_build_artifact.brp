@@ -10,8 +10,6 @@ import:
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction),
 		CoreProgram,
-		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
-	path: dirname
 
 
 record CArtifact {
@@ -99,6 +97,7 @@ record BuildArtifact {
 record BuildArtifactConfiguration {
 	runtime_requirement: BuildRuntimeRequirement,
 	native_features: List[BuildNativeFeature],
+	include_dirs: List[String],
 	source: BuildSourceIdentity,
 	compatibility: BuildCompatibility
 }
@@ -124,16 +123,8 @@ record BuildCInvocation {
 
 
 private record ForeignBuildMetadata {
-	link_arguments: List[BuildLinkArgument],
-	include_dirs: List[String]
+	link_arguments: List[BuildLinkArgument]
 }
-
-
-private pure func append_unique_string(values: List[String], value: String) -> List[String]:
-	if values.contains(value):
-		values
-	else:
-		values.append(value)
 
 
 private pure func build_platform(platform: String) -> Result[BuildPlatform, BuildArtifactError]:
@@ -186,21 +177,6 @@ private pure func append_link_group(
 	Ok(arguments.concat(group_arguments))
 
 
-private pure func source_include_dirs(function_info: CoreFunction) -> List[String]:
-	match function_info.function_kind:
-		ForeignFunction(foreign_info):
-			if foreign_info.includes.length() == 0:
-				[]
-			else:
-				match function_info.loc:
-					KnownSourceLoc(span):
-						[dirname(span.file)]
-					SyntheticSourceLoc:
-						[]
-		_:
-			[]
-
-
 private pure func append_foreign_function_metadata(
 	metadata: ForeignBuildMetadata,
 	function_info: CoreFunction,
@@ -212,15 +188,7 @@ private pure func append_foreign_function_metadata(
 				foreign_info.link_flags,
 			)
 
-			var include_dirs: List[String] = metadata.include_dirs
-
-			for include_dir in source_include_dirs(function_info):
-				include_dirs = append_unique_string(include_dirs, include_dir)
-
-			Ok({
-				link_arguments = link_arguments,
-				include_dirs = include_dirs,
-			})
+			Ok({link_arguments = link_arguments})
 		_:
 			Ok(metadata)
 
@@ -229,56 +197,104 @@ private pure func append_foreign_link_flags(
 	arguments: List[BuildLinkArgument],
 	link_flags: List[CoreForeignLinkFlag],
 ) -> Result[List[BuildLinkArgument], BuildArtifactError]:
-	match link_flags:
-		[]:
-			Ok(arguments)
-		[link_flag, ...remaining]:
-			platform ?= optional_build_platform(link_flag.platform)
-			next ?= append_link_group(arguments, platform, link_flag.flag)
-			append_foreign_link_flags(next, remaining)
+	var result: List[BuildLinkArgument] = arguments
+	var failure: Option[BuildArtifactError] = None
+
+	for link_flag in link_flags:
+		match optional_build_platform(link_flag.platform):
+			Ok(platform):
+				match append_link_group(result, platform, link_flag.flag):
+					Ok(next):
+						result = next
+					Err(error):
+						failure = Some(error)
+						break
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func append_impl_metadata(
 	metadata: ForeignBuildMetadata,
 	methods: List[CoreFunction],
 ) -> Result[ForeignBuildMetadata, BuildArtifactError]:
-	match methods:
-		[]:
-			Ok(metadata)
-		[method, ...remaining]:
-			next ?= append_foreign_function_metadata(metadata, method)
-			append_impl_metadata(next, remaining)
+	var result: ForeignBuildMetadata = metadata
+	var failure: Option[BuildArtifactError] = None
+
+	for method in methods:
+		match append_foreign_function_metadata(result, method):
+			Ok(next):
+				result = next
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func foreign_build_metadata(
 	decls: List[CoreDecl],
 	initial: ForeignBuildMetadata,
 ) -> Result[ForeignBuildMetadata, BuildArtifactError]:
-	match decls:
-		[]:
-			Ok(initial)
-		[decl, ...remaining]:
-			match decl:
-				FunctionDecl(function_info):
-					next ?= append_foreign_function_metadata(initial, function_info)
-					foreign_build_metadata(remaining, next)
-				ImplDecl(impl_info):
-					next ?= append_impl_metadata(initial, impl_info.methods)
-					foreign_build_metadata(remaining, next)
-				_:
-					foreign_build_metadata(remaining, initial)
+	var metadata: ForeignBuildMetadata = initial
+	var failure: Option[BuildArtifactError] = None
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(function_info):
+				match append_foreign_function_metadata(metadata, function_info):
+					Ok(next):
+						metadata = next
+					Err(error):
+						failure = Some(error)
+						break
+			ImplDecl(impl_info):
+				match append_impl_metadata(metadata, impl_info.methods):
+					Ok(next):
+						metadata = next
+					Err(error):
+						failure = Some(error)
+						break
+			_:
+				void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(metadata)
 
 
 private pure func raw_link_arguments(
 	link_flags: List[String],
 	arguments: List[BuildLinkArgument],
 ) -> Result[List[BuildLinkArgument], BuildArtifactError]:
-	match link_flags:
-		[]:
-			Ok(arguments)
-		[link_flag, ...remaining]:
-			next ?= append_link_group(arguments, None, link_flag)
-			raw_link_arguments(remaining, next)
+	var result: List[BuildLinkArgument] = arguments
+	var failure: Option[BuildArtifactError] = None
+
+	for link_flag in link_flags:
+		match append_link_group(result, None, link_flag):
+			Ok(next):
+				result = next
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 pure func build_artifact(
@@ -288,16 +304,15 @@ pure func build_artifact(
 ) -> Result[BuildArtifact, BuildArtifactError]:
 	initial_arguments ?= raw_link_arguments(emission.link_flags, [])
 
-	initial: ForeignBuildMetadata = {
-		link_arguments = initial_arguments,
-		include_dirs = emission.include_dirs.unique()
-	}
+	initial: ForeignBuildMetadata = {link_arguments = initial_arguments}
 	metadata ?= foreign_build_metadata(program.decls, initial)
 
 	Ok({
 		c_code = emission.c_code,
 		link_arguments = metadata.link_arguments,
-		include_dirs = metadata.include_dirs,
+		include_dirs = emission.include_dirs
+			.concat(configuration.include_dirs)
+			.unique(),
 		runtime_requirement = configuration.runtime_requirement,
 		native_features = configuration.native_features.unique(),
 		source = configuration.source,

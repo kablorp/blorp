@@ -38,18 +38,6 @@ let format_errors errors =
   String.concat "\n"
     (List.map (fun (e : Ast.compiler_error) -> e.message) errors)
 
-let mk_loaded_module ~name ~decls : Session.loaded_module =
-  {
-    name;
-    path = "<test>";
-    origin = Session.User_module;
-    decls;
-    exports = [];
-    surface = None;
-    typed_decls = None;
-    typed_import_bindings = None;
-  }
-
 let program_has_typed_expr (program : Ast.program) : bool =
   let rec expr_is_typed e =
     Option.is_some e.Ast.expr_type
@@ -93,55 +81,6 @@ let test_reusable_typecheck_returns_typed_program () =
             ("expected successful typed typecheck, got:\n"
            ^ format_errors errors))
 
-let test_blorp_bridge_compile_uses_in_memory_source () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_compile_bridge_in_memory_source" (fun dir ->
-          let main_path = Filename.concat dir "main.brp" in
-          let supplied_source =
-            "func main(args: List[String]) -> Int:\n\
-            \    0\n"
-          in
-          write_file main_path
-            "func main(args: List[String]) -> Int:\n    missing_name\n";
-          let observed_timings = ref [] in
-          let on_phase_timing timing =
-            observed_timings := timing :: !observed_timings
-          in
-          match
-            Pipeline.compile_in_memory_source_with_blorp_bridge
-              ~embed_runtime:false ~on_phase_timing ~filename:main_path
-              ~source:supplied_source ()
-          with
-          | Ok (Pipeline.Compiled { c_code; _ }) ->
-              Alcotest.(check bool)
-                "generated C comes from supplied source" true
-                (contains c_code "blorp_main");
-              let timings = List.rev !observed_timings in
-              Alcotest.(check bool)
-                "reports each in-memory compile phase in order" true
-                (List.map
-                   (fun timing -> timing.Pipeline.timing_phase)
-                   timings
-                = [
-                    Pipeline.InMemoryFrontendGraph;
-                    Pipeline.FrontendGraphFinalize;
-                    Pipeline.GraphTypecheck;
-                    Pipeline.SemanticMiddle;
-                    Pipeline.BackendEmission;
-                    Pipeline.CorePipeline;
-                  ]);
-              Alcotest.(check bool)
-                "phase durations are nonnegative" true
-                (List.for_all
-                   (fun timing -> timing.Pipeline.duration_seconds >= 0.0)
-                   timings)
-          | Ok (Pipeline.Stopped_at _) ->
-              Alcotest.fail
-                "in-memory Blorp bridge compile unexpectedly stopped early"
-          | Error errors ->
-              Alcotest.fail
-                ("expected Blorp bridge compile to use supplied source:\n"
-               ^ format_errors errors)))
 
 let test_typecheck_module_only_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
@@ -496,18 +435,6 @@ let test_qualified_only_import_does_not_suppress_bare_missing_name () =
                 "qualified-only import incorrectly made helper.f visible as \
                  bare f"))
 
-let test_core_pipeline_rejects_untyped_loaded_module () =
-  Test_helpers.with_isolated_env (fun () ->
-      let sess = Session.current () in
-      let raw_module = mk_loaded_module ~name:"test/raw" ~decls:[] in
-      Hashtbl.add sess.module_cache raw_module.name raw_module;
-      Test_helpers.check_core_error_raises
-        ~phase:(Core_error.Stage Core_stage.Lower)
-        ~msg_contains:"without typed declarations" (fun () ->
-          ignore
-            (Core_pipeline.compile_typed_with_modules
-               (Test_helpers.expect_valid_typed_program []))))
-
 let test_cross_module_coherence_distinguishes_same_named_local_types () =
   Test_helpers.with_isolated_env (fun () ->
       with_temp_dir "blorp_pipeline_type_identity" (fun dir ->
@@ -653,15 +580,11 @@ let test_aliased_selective_type_imports_keep_original_traits () =
             \    else:\n\
             \        1\n"
           in
-          match
-            Pipeline.compile_legacy_direct_source ~embed_runtime:false ~filename:main_path ~source ()
-          with
-          | Ok (Pipeline.Compiled _) -> ()
-          | Ok (Pipeline.Stopped_at _) ->
-              Alcotest.fail "unexpected stopped compile"
+          match typecheck_ast ~filename:main_path ~source () with
+          | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
-                ("aliased imported type traits did not resolve:\n"
+                ("aliased imported type traits did not typecheck:\n"
                ^ format_errors errors)))
 
 let test_selective_imported_record_type_aliases_module_owned_type () =
@@ -998,12 +921,8 @@ let test_direct_function_import_shadows_unrelated_trait_method () =
             \    else:\n\
             \        1\n"
           in
-          match
-            Pipeline.compile_legacy_direct_source ~embed_runtime:false ~filename:main_path ~source ()
-          with
-          | Ok (Pipeline.Compiled _) -> ()
-          | Ok (Pipeline.Stopped_at _) ->
-              Alcotest.fail "unexpected stopped compile"
+          match typecheck_ast ~filename:main_path ~source () with
+          | Ok _ -> ()
           | Error errors ->
               Alcotest.fail
                 ("direct function import was treated as trait dispatch:\n"
@@ -1098,92 +1017,6 @@ let test_selective_record_import_allows_prelude_field_types () =
                 ("prelude field types should not require explicit imports:\n"
                ^ format_errors errors)))
 
-let test_generated_harness_compiles_returned_generic_callee () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_generated_returned_generic" (fun dir ->
-          let dependency_path = Filename.concat dir "dependency.brp" in
-          write_file dependency_path
-            "pure func capture[T](value: T) -> () -> T:\n\
-            \    pure func() -> T:\n\
-            \        value\n\n\
-             pure func captured_int() -> Int:\n\
-            \    capture(42)()\n";
-          let harness_path = Filename.concat dir "__generated_harness__.brp" in
-          let harness_source =
-            "import:\n\
-            \    ./dependency: captured_int\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    captured_int()\n"
-          in
-          match
-            Pipeline.compile_generated_test_harness ~embed_runtime:false
-              ~filename:harness_path ~source:harness_source ()
-          with
-          | Ok (Pipeline.Compiled _) -> ()
-          | Ok (Pipeline.Stopped_at stage) ->
-              Alcotest.failf "generated harness stopped after %s"
-                (Core_stage.to_string stage)
-          | Error errors ->
-              Alcotest.fail
-                ("generated harness with returned generic callee failed:\n"
-               ^ format_errors errors)))
-
-let test_generated_harness_compiles_bounded_generic_trait_impl () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_generated_bounded_trait" (fun dir ->
-          let dependency_path = Filename.concat dir "dependency.brp" in
-          write_file dependency_path
-            "record Box[T] {value: T}\n\n\
-             implements Stringable for Box[T:Stringable]:\n\
-            \    pure func to_string[T:Stringable](self: Box[T]) -> String:\n\
-            \        \"Box(\" + self.value.to_string() + \")\"\n\n\
-             pure func render_box() -> String:\n\
-            \    box: Box[String] = {value = \"red\"}\n\
-            \    box.to_string()\n";
-          let harness_path = Filename.concat dir "__generated_harness__.brp" in
-          let harness_source =
-            "import:\n\
-            \    ./dependency: render_box\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    _ = render_box()\n\
-            \    0\n"
-          in
-          match
-            Pipeline.compile_generated_test_harness ~embed_runtime:false
-              ~filename:harness_path ~source:harness_source ()
-          with
-          | Ok (Pipeline.Compiled _) -> ()
-          | Ok (Pipeline.Stopped_at stage) ->
-              Alcotest.failf "generated bounded-trait harness stopped after %s"
-                (Core_stage.to_string stage)
-          | Error errors ->
-              Alcotest.fail
-                ("generated harness with bounded generic trait impl failed:\n"
-               ^ format_errors errors)))
-
-let test_generated_harness_compiles_codec_module () =
-  Test_helpers.with_isolated_env (fun () ->
-      with_temp_dir "blorp_pipeline_generated_codec" (fun dir ->
-          let harness_path = Filename.concat dir "__generated_harness__.brp" in
-          let harness_source =
-            "import:\n\
-            \    codec: Value(VInt), field_int\n\n\
-             func main(args: List[String]) -> Int:\n\
-            \    _ = field_int(VInt(42), \"value\")\n\
-            \    0\n"
-          in
-          match
-            Pipeline.compile_generated_test_harness ~embed_runtime:false
-              ~filename:harness_path ~source:harness_source ()
-          with
-          | Ok (Pipeline.Compiled _) -> ()
-          | Ok (Pipeline.Stopped_at stage) ->
-              Alcotest.failf "generated codec harness stopped after %s"
-                (Core_stage.to_string stage)
-          | Error errors ->
-              Alcotest.fail
-                ("generated harness importing codec failed:\n"
-               ^ format_errors errors)))
 
 let suite =
   [
@@ -1194,8 +1027,6 @@ let suite =
           test_direct_std_source_check_does_not_conflict_with_embedded_std;
         Alcotest.test_case "reusable typecheck returns typed program" `Quick
           test_reusable_typecheck_returns_typed_program;
-        Alcotest.test_case "Blorp bridge compile uses in-memory source" `Quick
-          test_blorp_bridge_compile_uses_in_memory_source;
         Alcotest.test_case "typecheck_module_only returns typed program" `Quick
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"
@@ -1226,8 +1057,6 @@ let suite =
         Alcotest.test_case
           "qualified-only import does not suppress bare missing name" `Quick
           test_qualified_only_import_does_not_suppress_bare_missing_name;
-        Alcotest.test_case "core lowering rejects untyped loaded module" `Quick
-          test_core_pipeline_rejects_untyped_loaded_module;
         Alcotest.test_case
           "cross-module coherence distinguishes same-named local types" `Quick
           test_cross_module_coherence_distinguishes_same_named_local_types;
@@ -1274,13 +1103,5 @@ let suite =
           test_selective_record_import_allows_unimported_field_type_name;
         Alcotest.test_case "selective record import allows prelude field types"
           `Quick test_selective_record_import_allows_prelude_field_types;
-        Alcotest.test_case
-          "generated harness compiles returned generic callee" `Quick
-          test_generated_harness_compiles_returned_generic_callee;
-        Alcotest.test_case
-          "generated harness compiles bounded generic trait impl" `Quick
-          test_generated_harness_compiles_bounded_generic_trait_impl;
-        Alcotest.test_case "generated harness compiles codec module" `Quick
-          test_generated_harness_compiles_codec_module;
       ] );
   ]

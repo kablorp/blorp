@@ -101,6 +101,7 @@ import:
 			RecordExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
+			SemanticMatchExpr,
 			SelectExpr,
 			SeqExpr,
 			SetAllocExpr,
@@ -155,6 +156,17 @@ import:
 		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
 		CoreTailrecListSpreadRebind,
 		CoreTaskCapture,
 		CoreTaskClosure,
@@ -1081,19 +1093,19 @@ private pure func map_context_scoped_constructor_match_body(
 				),
 			)
 		ConstructorMatchBodyLiteral(match_expr):
-				ConstructorMatchBodyLiteral(
-					map_context_scoped_constructor_literal_match(
-						context,
-						match_expr,
-					),
-				)
+			ConstructorMatchBodyLiteral(
+				map_context_scoped_constructor_literal_match(
+					context,
+					match_expr,
+				),
+			)
 		ConstructorMatchBodyLength(match_expr):
-				ConstructorMatchBodyLength(
-					map_context_scoped_constructor_length_match(
-						context,
-						match_expr,
-					),
-				)
+			ConstructorMatchBodyLength(
+				map_context_scoped_constructor_length_match(
+					context,
+					match_expr,
+				),
+			)
 
 
 private pure func map_context_scoped_constructor_length_branch(
@@ -1215,9 +1227,7 @@ pure func map_core_match_results_with_context[C](
 		bindings: List[CoreMatchBinding],
 		result: CoreExpr,
 	): mapper(context, bindings, result)
-	result_context: CoreMatchResultMapContext = {
-		mapper = contextual_mapper
-	}
+	result_context: CoreMatchResultMapContext = {mapper = contextual_mapper}
 	scoped_context: ScopedCoreMatchResultMapContext = {
 		result_context = result_context,
 		bindings = []
@@ -1274,6 +1284,67 @@ pure func map_core_match_results(
 	mapper: pure (List[CoreMatchBinding], CoreExpr) -> CoreExpr,
 ) -> CoreExpr:
 	map_core_match_results_with_context(expr, mapper, apply_core_match_result_mapper)
+
+
+private pure func map_context_semantic_match_tree(
+	tree: CoreSemanticMatchTree,
+	context: CoreExprMapContext,
+) -> CoreSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			SemanticMatchLeaf(
+				bindings,
+				map_context_expr(context, body),
+			)
+		SemanticMatchFail:
+			SemanticMatchFail
+		SemanticConstructorMatch(accessor, cases, fallback):
+			SemanticConstructorMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = map_context_semantic_match_tree(match_case.body, context)
+					},
+				),
+				fallback.map(
+					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, context),
+				),
+			)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			SemanticLiteralMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = map_context_semantic_match_tree(match_case.body, context)
+					},
+				),
+				map_context_semantic_match_tree(fallback, context),
+			)
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			SemanticLengthMatch(
+				accessor,
+				cases.map(
+					func(
+						match_case,
+					): { match_case |
+						body = map_context_semantic_match_tree(match_case.body, context)
+					},
+				),
+				geq.map(
+					func(
+						geq_case,
+					): { geq_case |
+						body = map_context_semantic_match_tree(geq_case.body, context)
+					},
+				),
+				fallback.map(
+					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, context),
+				),
+			)
 
 
 private pure func map_core_expr_children_with_map_context(
@@ -2006,6 +2077,13 @@ private pure func map_core_expr_children_with_map_context(
 				map_context_type(context, typ),
 				loc,
 			)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			SemanticMatchExpr(
+				map_context_expr(context, scrutinee),
+				map_context_semantic_match_tree(tree, context),
+				map_context_type(context, typ),
+				loc,
+			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				map_context_expr(context, scrutinee),
@@ -2100,7 +2178,7 @@ pure func map_core_expr_children(
 -- while retaining their own precisely typed recursion context.
 record CoreSequenceSpine {
 	preceding_items: List[CoreExpr],
-	final_item: CoreExpr,
+	final_item: CoreExpr
 }
 
 
@@ -2143,12 +2221,10 @@ pure func map_core_sequence_items(
 	mapper: pure (CoreExpr) -> CoreExpr,
 ) -> CoreExpr:
 	spine: CoreSequenceSpine = split_core_sequence(expr)
-	rebuild_core_sequence(
-		{
-			preceding_items = spine.preceding_items.map(mapper),
-			final_item = mapper(spine.final_item)
-		},
-	)
+	rebuild_core_sequence({
+		preceding_items = spine.preceding_items.map(mapper),
+		final_item = mapper(spine.final_item),
+	})
 
 
 pure func any_core_expr(
@@ -2211,6 +2287,45 @@ private pure func literal_match_fallback_items(
 			[]
 
 
+private pure func semantic_match_tree_items(tree: CoreSemanticMatchTree) -> List[CoreExpr]:
+	match tree:
+		SemanticMatchLeaf(_, body):
+			[body]
+		SemanticMatchFail:
+			[]
+		SemanticConstructorMatch(_, cases, fallback):
+			fallback_items: List[CoreExpr] = match fallback:
+				Some(fallback_tree):
+					semantic_match_tree_items(fallback_tree)
+				None:
+					[]
+
+			cases
+				.flat_map(func(match_case): semantic_match_tree_items(match_case.body))
+				.concat(fallback_items)
+		SemanticLiteralMatch(_, cases, fallback):
+			cases
+				.flat_map(func(match_case): semantic_match_tree_items(match_case.body))
+				.concat(semantic_match_tree_items(fallback))
+		SemanticLengthMatch(_, cases, geq, fallback):
+			geq_items: List[CoreExpr] = match geq:
+				Some(geq_case):
+					semantic_match_tree_items(geq_case.body)
+				None:
+					[]
+
+			fallback_items: List[CoreExpr] = match fallback:
+				Some(fallback_tree):
+					semantic_match_tree_items(fallback_tree)
+				None:
+					[]
+
+			cases
+				.flat_map(func(match_case): semantic_match_tree_items(match_case.body))
+				.concat(geq_items)
+				.concat(fallback_items)
+
+
 private pure func constructor_match_body_items(body: CoreConstructorMatchBody) -> List[CoreExpr]:
 	match body:
 		ConstructorMatchBodyExpr(expr):
@@ -2224,9 +2339,9 @@ private pure func constructor_match_body_items(body: CoreConstructorMatchBody) -
 private pure func constructor_literal_match_items(
 	match_expr: CoreConstructorLiteralMatch,
 ) -> List[CoreExpr]:
-	match_expr.cases.flat_map(
-		func(match_case): [match_case.body],
-	).concat(literal_match_fallback_items(match_expr.fallback))
+	match_expr.cases
+		.flat_map(func(match_case): [match_case.body])
+		.concat(literal_match_fallback_items(match_expr.fallback))
 
 
 private pure func constructor_length_branch_items(
@@ -2254,7 +2369,9 @@ private pure func constructor_length_match_items(
 		None:
 			[]
 
-	case_items.concat(geq_items).concat(fallback_items)
+	case_items
+		.concat(geq_items)
+		.concat(fallback_items)
 
 
 private pure func constructor_match_fallback_items(
@@ -2441,35 +2558,41 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 				.concat(optional_expr_items(loop.timeout))
 				.append(loop.limit)
 		PreClosureConcurrentExpr(block, _, _):
-			block.bindings.map(
-				func(binding): binding.rhs,
-			).append(block.body).concat(optional_expr_items(block.timeout))
+			block.bindings
+				.map(func(binding): binding.rhs)
+				.append(block.body)
+				.concat(optional_expr_items(block.timeout))
 		ConcurrentExpr(block, _, _):
-			block.bindings.map(
-				func(binding): binding.rhs,
-			).append(block.body).concat(optional_expr_items(block.timeout))
+			block.bindings
+				.map(func(binding): binding.rhs)
+				.append(block.body)
+				.concat(optional_expr_items(block.timeout))
 		SelectExpr(select_expr, _, _):
 			select_expr.flat_map(func(arm): select_arm_kind_items(arm.kind).append(arm.body))
 		RangeExpr(start, end_value, _, _):
 			[start, end_value]
 		RawMatchExpr(scrutinee, cases, _, _):
-			[scrutinee].concat(cases.map(func(match_case): match_case.body))
-		LiteralMatchExpr(scrutinee, cases, fallback, _, _):
 			[scrutinee].concat(cases.map(
 				func(match_case): match_case.body,
-			)).concat(literal_match_fallback_items(fallback))
+			))
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			[scrutinee].concat(semantic_match_tree_items(tree))
+		LiteralMatchExpr(scrutinee, cases, fallback, _, _):
+			[scrutinee]
+				.concat(cases.map(
+					func(match_case): match_case.body,
+				))
+				.concat(literal_match_fallback_items(fallback))
 		AccessorLiteralMatchExpr(scrutinee, _, match_expr, _, _):
 			[scrutinee].concat(constructor_literal_match_items(match_expr))
 		LengthMatchExpr(scrutinee, _, match_expr, _, _):
 			[scrutinee].concat(constructor_length_match_items(match_expr))
 		ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
-			[scrutinee].concat(cases.flat_map(
-				func(
-					match_case,
-				): constructor_match_body_items(
-					match_case.body,
-				),
-			)).concat(constructor_match_fallback_items(fallback))
+			[scrutinee]
+				.concat(cases.flat_map(
+					func(match_case): constructor_match_body_items(match_case.body),
+				))
+				.concat(constructor_match_fallback_items(fallback))
 		IfExpr(cond, then_expr, else_expr, _, _):
 			[cond, then_expr, else_expr]
 

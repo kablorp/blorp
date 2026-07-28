@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-25.
+Status checked against code on 2026-07-27.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -23,9 +23,10 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> Blorp typecheck / CTFE
   -> Blorp Core lowering / module flattening / FFI boundary / initial list layout
   -> Blorp debug / desugar / SSA / mono / post-mono list layout / synthesis
-  -> strict post-synthesis semantic-middle request
+  -> Blorp pattern-match decision-tree compilation
+  -> strict post-match semantic-middle request
   -> one blorp-ocaml-middle process
-  -> OCaml Core middle from match through the remaining registry-dependent
+  -> OCaml Core middle from trait resolution through the remaining registry-dependent
      specialization transforms
   -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
      tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
@@ -106,15 +107,16 @@ Current OCaml bridge, orchestration, and production-middle files:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/core_post_synth_json.ml`
+- `compiler/lib/core_post_match_json.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` invokes the remaining OCaml Core middle from
-`Core_match` after the strict post-synthesis decoder and invariant checks. It
-does not lower typed AST or run debug, desugar/SSA, mono, post-mono list layout,
-or synthesis on the normal production source path. The production JSON handoff preserves
+`Core_trait_resolve` after the strict post-match decoder and invariant checks.
+It does not lower typed AST or run debug, desugar/SSA, mono, post-mono list
+layout, synthesis, or match compilation on the normal production source path.
+The production JSON handoff preserves
 concrete conversion, hash, length, numeric checked tensor-access,
 raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
 bounds-proven tensor-access builtins for Blorp specialization. Blorp is
@@ -135,11 +137,11 @@ compiler bootstrap is a separately packaged immutable
 `blorp-bootstrap-compiler` artifact; the current host no longer implements its
 compile command.
 
-The OCaml typed-AST lowering and flattening modules remain compatibility code
-for test-runner, REPL, and direct in-memory OCaml compiler callers. They are not
-the normal `compile`/`run` producer or part of the current source bootstrap
-implementation. Delete them after those Checkpoint 12 callers are converted to
-prepared Core.
+The retired OCaml typed-AST-to-post-match path has been deleted. This
+includes lowering, flattening, FFI annotation, list layout, debug lowering,
+desugar/SSA, monomorphization, builtin-body synthesis, match compilation, and
+their duplicate OCaml implementation suites. The remaining OCaml pipeline has
+one production entrypoint: strict post-match Core.
 
 ## Migration Rules
 
@@ -797,7 +799,7 @@ Deletion point:
 - Delete each OCaml utility module only when all production callers use the
   Blorp equivalent or the module has become a narrow bridge decoder. Do not
   delete `types.ml` or `env.ml` wholesale until `typecheck.ml`, `infer.ml`,
-  `typed_ast.ml`, and `core_lower.ml` no longer consume OCaml type/env values.
+  and `typed_ast.ml` no longer consume OCaml type/env values.
 
 ## Checkpoint 5: Declaration Indexing And Typecheck First Pass
 
@@ -981,8 +983,8 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-Core lowering. Legacy direct `Pipeline.compile_legacy_direct_source`, reusable
-compiler-fixture typechecking, and some tooling/test paths can still use the OCaml
+Core lowering. The legacy direct compile API has been deleted. Reusable
+compiler-fixture typechecking and some tooling paths can still use the OCaml
 parser/typechecker until their callers move to an explicit Blorp frontend graph.
 `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
@@ -1560,27 +1562,21 @@ Current status:
 - Source-command checks now typecheck the in-memory graph directly in Blorp and
   never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
   wrapper and its duplicate adapter tests have been deleted.
+- `std/tuple` is an ambient implementation module alongside the implicit
+  prelude source. The source graph loads it without creating a source-level
+  import, and typecheck registers its impls without exposing a `tuple` alias or
+  unqualified declarations. Tuple trait behavior therefore does not depend on
+  an incidental user import.
 - Normal source commands no longer enter an OCaml preloaded-graph compile API.
-  The obsolete public
-  `Pipeline.compile_preloaded_graph_with_blorp_bridge` wrapper and its five
-  direct wrapper tests are deleted. The meaningful call-identity and profiling
-  regressions now run through the production CLI. The private
-  `compile_preloaded_graph_impl` remains only beneath generated test-harness
-  and direct in-memory compatibility compilation. The REPL reaches the same
-  retained OCaml typed-AST lowering area through the separate legacy
-  direct-source entrypoint.
-- Direct-source `Pipeline.compile_legacy_direct_source`, reusable
-  compiler-fixture typechecking, and module-only typecheck APIs are now
-  documented in code as legacy/tooling routes. The REPL/test runner use the
-  explicit compatibility APIs where they intentionally still depend on OCaml
-  typed-AST lowering and early Core. Normal source-command regressions live at
-  the Blorp CLI and compiler-owned Core boundaries instead of preserving a
-  second OCaml graph-compilation surface.
+  The obsolete public preloaded-graph wrapper, direct-source compiler,
+  generated in-memory compiler, and their OCaml tests are deleted. The
+  meaningful call-identity, profiling, synthetic-source, and harness
+  regressions run through the production CLI or Blorp-owned stage suites.
+- Reusable compiler-fixture typechecking and module-only typecheck APIs remain
+  for explicitly classified tests and tools, not normal source execution.
 - The compiler port inventory hygiene check now rejects new references to
   legacy direct-source pipeline entrypoints outside the narrow allowlist
-  (`pipeline`, the private OCaml host tooling commands, package checking, REPL,
-  and test runner). This keeps normal source-command work on the Blorp frontend
-  graph while the remaining tooling paths are migrated deliberately.
+  while the remaining analysis-only tooling paths are migrated deliberately.
 - Blorp builtin registration now includes the scalar-width conversions,
   bitwise operations, tensor constructors, and channel sealing used by the
   production backend surface. Bare-name lookup scans past declarations owned
@@ -1792,24 +1788,29 @@ Current status:
   a compile-time global rewrite and should continue moving to explicit Blorp
   frontend graphs.
 - The OCaml test runner still owns discovery, `TestSuite`/doctest harness
-  generation, C compilation, and execution, but it no longer re-enters the
-  OCaml source frontend. Generated suite, aggregate, and doctest harnesses use
-  an explicit in-memory Blorp source-graph handoff with generated-source policy;
-  standalone leak-baseline programs use the same handoff with ordinary user
-  source policy. The remaining TestRunner migration is orchestration ownership,
-  not parser/typechecker parity, and must preserve doctest location remapping,
-  process cleanup, and filesystem-isolation behavior.
+  generation, scheduling, execution, and reporting. It no longer owns source,
+  C, or runtime compilation: every standalone test, generated suite, aggregate
+  harness, doctest, sanitizer run, leak run, and warmup program is compiled to
+  an executable by the production Blorp binary through the private synthetic
+  source boundary. The old OCaml in-memory source compiler, direct C compiler,
+  runtime object cache, TLS/link policy, and generated-harness compile policy
+  have been deleted. The remaining TestRunner migration is orchestration
+  ownership and structured diagnostic parity.
+- The production boundary accepts source storage and logical source paths
+  separately. Module resolution therefore uses the test or REPL source
+  identity rather than the temporary storage path, and generated source never
+  re-enters OCaml parsing or typechecking.
+- Test command plans carry the path of the invoking Blorp executable across
+  the temporary OCaml orchestration boundary. `test --warmup-only` compiles a
+  minimal program through that same production path; it does not maintain an
+  independent OCaml runtime cache.
 - The Blorp-owned generated selector/run-all graph can now be retained after
   its source files are removed and prepared through the production early Core
-  pipeline to the post-synthesis worker request. Its compile policy represents
+  pipeline to the post-match worker request. Its compile policy represents
   permission to call debug-only test helpers separately from retention of
   `debug:` blocks. Production TestRunner routing has not switched yet; the next
   slice must consume this retained graph rather than adding a test-only parser
   bridge or serializing generated source back through OCaml.
-- Test command plans now carry typed execution or warmup variants throughout
-  the Blorp process and become JSON only when crossing the temporary OCaml host
-  boundary. Runtime-cache warmup must move with TestRunner execution because
-  the Blorp host and retained OCaml runner still use different cache schemas.
 - Blorp test discovery now classifies parsed declarations and docs for `main`,
   a candidate `tests` binding, and doctests. Resolved TestSuite identity belongs
   after module loading/type resolution; it is not guessed from a raw type name.
@@ -1831,11 +1832,10 @@ Current status:
 Typed frontier closure before CTFE:
 
 - Close or explicitly classify residual OCaml typecheck/parser consumers:
-  `Pipeline.compile_legacy_direct_source`,
   `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
-  LSP/tooling helpers, and the remaining package/REPL routes. TestRunner source
-  compilation is closed; its OCaml work is post-frontend orchestration.
+  LSP/tooling helpers, and the remaining package routes. TestRunner and REPL
+  source compilation are closed; their OCaml work is orchestration.
 - The separate compiler fixture runner still uses
   `Pipeline.typecheck_only_typed_reusing_session` for most `infer` and
   `typecheck` fixtures. This is test-only and is not part of production
@@ -1893,13 +1893,13 @@ prepared Core now continues directly into the Blorp-owned checkpoint-9 early
 pipeline; it is no longer the process boundary. The semantic worker no longer
 reconstructs typed AST or invokes OCaml Core lowering.
 
-Test-runner, REPL, and direct in-memory OCaml compiler callers still use
-`Core_lower`/`Core_flatten` as compatibility scaffolding. The immutable
-bootstrap compiler carries its own already-built implementation and no longer
-keeps this source path live. None of these callers is a fallback from normal
-`compile` or `run`.
+Closure is complete. The OCaml lowering/flattening/FFI/list-layout sources,
+their typed compatibility pipeline entrypoints, and their duplicate
+implementation tests are deleted. The immutable bootstrap compiler is a
+separately packaged artifact and does not keep these source modules live.
 
-OCaml references:
+Retired OCaml reference points (available only in history and old bootstrap
+artifacts):
 
 - `compiler/lib/core_lower.ml`
   - `lower_typed_program`
@@ -1973,19 +1973,19 @@ Current progress:
   flattens each module before assembly, keeps the target unprefixed, preserves
   ordered foreign includes, and runs FFI and list-layout annotation exactly
   once before serialization.
-- `compiler_semantic_worker_protocol.brp` schema 4 carries post-synthesis Core,
+- `compiler_semantic_worker_protocol.brp` schema 5 carries post-match Core,
   import tables, the next definition id, stage observations, and invariant
-  policy. `core_post_synth_json.ml` is a strict phase-specific decoder rather
+  policy. `core_post_match_json.ml` is a strict phase-specific decoder rather
   than a permissive reuse of the late backend projection.
 - Production lowering covers the finalized typed expression and declaration
-  surface, including raw patterns for the middle match compiler, record
+  surface, including raw patterns for Blorp match compilation, record
   updates, resource scopes and resource-source loops, tensor iteration,
   multidimensional enumerate, windows, concurrency, imports, globals, traits,
   impls, aliases, records, unions, and foreign declarations. Source-only or
   malformed typed nodes fail at the boundary instead of falling back to OCaml.
-- The normal CLI path is contiguous Blorp from source reads through
-  post-synthesis Core. The only OCaml call is the single semantic-middle worker
-  after this boundary, beginning with match compilation.
+- The normal CLI path is contiguous Blorp from source reads through post-match
+  Core. The only OCaml call is the single semantic-middle worker after this
+  boundary, beginning with trait resolution.
 
 - `compiler_core_lower.brp` owns typed expression/declaration lowering with
   explicit context state for Core definition ids and source-module ownership.
@@ -2038,6 +2038,11 @@ Current progress:
   forward declarations converge on the bodied callable's qualified name and
   body-preference deduplication removes the declaration-only duplicate, which
   preserves the std pure/impure forward-declaration pattern.
+- Collapsing a bodyless overload onto its implementation also produces an
+  explicit external callable alias. Graph preparation applies those aliases
+  after assembly, keyed by the exact UFCS source name and selected definition
+  id, so imported references converge on the surviving callable without
+  treating a colliding id from another module as equivalent.
 - `compiler_core_flatten.brp` also owns global and type declaration prefixing,
   canonical module type names, declaration deduplication, and exact-reference
   rewriting. It rewrites every module-local type use together with its
@@ -2171,8 +2176,8 @@ Current progress:
   fixed-size slices.
 - Matches lower to `RawMatchExpr` with literal, binding, constructor,
   qualified-constructor, tuple, list/spread, wildcard, and or-pattern shapes.
-  The existing middle match compiler remains the one owner of decision-tree
-  construction.
+  `compiler_core_match.brp` is the production owner of decision-tree
+  construction before the OCaml boundary.
 - Expression value-type lowering now treats `CompilerConstIntType` as a Core
   `Int` value while strict type lowering still rejects dimension literals as
   standalone Core types. This keeps literal-valued expression nodes from
@@ -2186,10 +2191,9 @@ Current progress:
   consumes that schema directly rather than assuming the object shape used by
   the separate late-Core projection.
 - Typed `debug:` blocks survive inference and CTFE validation, lower to an
-  explicit prepared-Core `debug_block`, and decode to OCaml `CDebugBlock`.
-  `Core_debug` remains the single owner of normal-build erasure and debug-build
-  retention, and the existing post-debug invariant prevents the node from
-  leaking into later Blorp ownership or emission passes.
+  explicit prepared-Core `debug_block`, and are erased or retained by the
+  Blorp debug stage before the post-match boundary. The OCaml boundary
+  invariant rejects a leaked debug node.
 - Enum and union declarations now materialize as `CompilerTypedUnionDecl`
   instead of parsed passthrough declarations. The typed shape carries canonical
   variant field types, tags, and constructor def ids from typecheck/env
@@ -2254,40 +2258,31 @@ Tests:
 - `compiler/blorp/tests/test_compiler_core_ffi_boundary.brp`
 - `compiler/blorp/tests/test_compiler_core_list_layout.brp`
 - `compiler/blorp/tests/test_compiler_infer.brp`
-- `compiler/test/test_core_post_synth_json.ml`
+- `compiler/test/test_core_post_match_json.ml`
 - `compiler/test/test_semantic_middle_worker.ml`
-- `compiler/test/test_core_compatibility.ml`
-- `compiler/test/test_core_list_layout.ml`
+- `compiler/test/test_semantic_middle.ml`
 - `tests/test_compiler/codegen_audit/should_pass/foreign_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/concurrent*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/tensor_loop_views_direct.brp`
 
 Deletion point:
 
-- Normal production ownership has moved, so no new source-command dependency
-  may be added to OCaml typed-AST lowering or flattening. Delete
-  `core_lower.ml` and `core_flatten.ml` after the test-runner, REPL, and direct
-  in-memory compatibility callers are converted to prepared Core. The
-  broad implementation-only OCaml lowering, flattening, and FFI-boundary suites
-  were replaced with one focused compatibility-contract suite after their
-  authoritative Blorp suites and production prepared-Core boundary were
-  established. Keep that compact suite until the remaining compatibility
-  source is deleted. This cleanup is independent of checkpoint 8's production
-  boundary.
+- Complete. No OCaml typed-AST, prepared-Core compatibility, or early-Core
+  execution path remains. `test_semantic_middle.ml` tests only the live
+  post-match projection/import boundary.
 
 ## Checkpoint 9: Early And Middle Core Pipeline
 
 Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
 Status: the normal compile/run path now executes a contiguous Blorp-owned Core
-prefix through debug lowering, desugar/SSA, monomorphization, and post-mono
-list layout, followed by synthesis. Schema 4 carries only post-synthesis Core
-across the single temporary
-semantic-middle boundary. The OCaml worker validates the completed early-stage
-contracts and starts at `Core_match`; early Core observations and stops never
-invoke the worker. The retained OCaml debug/desugar/SSA/mono/synth
-implementations serve bootstrap and direct in-memory compatibility entrypoints,
-not normal source compilation.
+prefix through debug lowering, desugar/SSA, monomorphization, post-mono list
+layout, synthesis, and match compilation. Schema 5 carries only post-match Core
+across the single temporary semantic-middle boundary. The OCaml worker
+validates the completed early-stage contracts and starts at
+`Core_trait_resolve`; early Core observations and stops never invoke the
+worker. The superseded OCaml debug/desugar/SSA/mono/synth/match implementations
+and their implementation-only tests are deleted.
 
 Blorp DCE is authoritative on the normal production path and the superseded
 OCaml DCE implementation and tests are deleted. First-class function-reference
@@ -2304,8 +2299,9 @@ formation are also Blorp-authoritative at that boundary. They live together in
 the loop bound used by the raw-access proof; numeric reads select typed or
 erased runtime ABIs and inject static dimensions for ranked access; typed
 vector/matrix writes and `Int`/`Float`/`Float32` fills select concrete runtime
-names; `norm`, `sqrt`, `exp`, and `log` select `Float`, `Float32`, or `Float16`
-runtime ABIs from their tensor receiver; `max` and `min` select `Int`, `Float`,
+names; `norm`, `sqrt`, `exp`, `log`, and `abs` select the runtime ABI from
+their tensor receiver, including imported scalar-math calls that retain
+selected or user-call identity; `max` and `min` select `Int`, `Float`,
 `Float32`, or `Float16` reduction ABIs; and runtime storage plus COW uniqueness
 guards retain the original loop as a fallback. Core JSON canonicalizes aliases
 and all ordinary source tensor spellings before this pass. Packed fills,
@@ -2323,13 +2319,10 @@ OCaml specialization families are still OCaml-authoritative. Stage parity
 modules must not be counted as migrated until the production pass ordering
 invokes them.
 
-The synthesis boundary has now been audited against real post-mono programs.
-`Core_synth.synthesize_program` is not only a retry for generic functions:
-Blorp Core lowering deliberately preserves every naked and `std/...` builtin as
-a bodyless function, so the pass also materializes concrete bytes, string,
-scalar-math, list, stream, set, dictionary, and tensor bodies. Port synthesis
-as explicit semantic families behind one eventual `compiler_core_synth.brp`
-orchestrator:
+The synthesis boundary has been audited against real post-mono programs and is
+production-owned by the `compiler_core_synth*.brp` families. They materialize
+concrete bytes, string, scalar-math, list, stream, set, dictionary, and tensor
+bodies behind the `compiler_core_synth.brp` orchestrator:
 
 - builtin-wrapper and scalar-math bodies;
 - bytes and string bodies;
@@ -2372,8 +2365,8 @@ Each family uses exact module and signature admission. They are body factories;
 only `compiler_core_synth.brp` may walk declarations and promote a successfully
 synthesized builtin to a user function. String, list, set/dictionary, tensor,
 and parallel-tensor families have parity and run before the single semantic
-bridge. The schema-4 worker therefore rejects `synth` observations and starts
-with match compilation.
+bridge. The schema-5 worker therefore rejects early-stage observations,
+including `synth` and `match`, and starts with trait resolution.
 
 Hash-collection layout classification uses declaration-derived enum, record,
 union, and type-alias facts. Alias expansion follows generic targets and uses
@@ -2382,10 +2375,7 @@ registry behavior. Undeclared named types remain a typed synthesis error rather
 than falling back to a spelling heuristic.
 
 Remaining production OCaml references, in
-`Core_pipeline.run_core_passes_from_post_synth` order:
-
-- `compiler/lib/core_match.ml`
-  - `compile_program`
+`Core_pipeline.run_core_passes_from_post_match` order:
 - `compiler/lib/core_trait_resolve.ml`
   - `resolve_program`
 - `compiler/lib/core_resolve.ml`
@@ -2403,12 +2393,10 @@ Remaining production OCaml references, in
 - `compiler/lib/core_specialize.ml`
   - `specialize_program`
 
-`compiler/lib/core_synth.ml` is compatibility-only. Generated TestSuite
-harnesses, REPL compilation, and direct in-memory OCaml tests still enter
-through `Core_pipeline.run_core_passes`; migrate those callers to the prepared
-post-synthesis boundary before deleting the OCaml synthesis module and its
-remaining implementation-only coverage. The immutable bootstrap compiler no
-longer keeps this source module live.
+The OCaml synthesis implementation, the 8,700-line intrinsic-body synthesis
+module it depended on, and their duplicate implementation suite are deleted.
+The sole later-stage layout fallback is isolated in
+`core_specialize_fallback.ml`; general builtin-body synthesis is Blorp-owned.
 
 Blorp references:
 
@@ -2430,7 +2418,8 @@ Blorp references:
   `std/option` call fusion and checked diagnostics
 - existing `compiler_core_synth.brp`, composed from the completed synthesis
   family modules and authoritative on the normal production path
-- future `compiler_core_match.brp`
+- existing `compiler_core_match.brp`, authoritative for production match
+  compilation
 - future `compiler_core_trait_resolve.brp`
 - future `compiler_core_resolve.brp`
 - future `compiler_core_std_inline.brp`
@@ -2448,15 +2437,15 @@ Blorp references:
 
 Implementation steps:
 
-- Port stages in exact `run_core_passes` order. Move the production boundary
-  left by one stage or a tightly coupled pair only after parity passes.
-- `compiler_core_debug.brp` implements the prepared-Core-compatible behavior
-  from `compiler/lib/core_debug.ml`: normal builds replace each
+- Port remaining stages in exact `run_core_passes_from_post_match` order. Move
+  the production boundary right by one stage or a tightly coupled pair only
+  after parity passes.
+- `compiler_core_debug.brp` owns debug lowering: normal builds replace each
   `DebugBlockExpr` with `VoidExpr` at the block's source location, while debug
   builds splice in its recursively lowered body. It uses the shared exhaustive
   traversal and iterative sequence mapping.
-- `compiler_core_desugar.brp` implements the prepared-Core-compatible behavior
-  from `compiler/lib/core_desugar.ml`: string `+`, `==`, and `!=` become
+- `compiler_core_desugar.brp` owns early Core desugaring: string `+`, `==`, and
+  `!=` become
   `blorp_string_concat`, `blorp_string_eq`, and `not blorp_string_eq`; exact
   `target = target + suffix` assignments become `blorp_string_append`.
   `compiler_core_traverse.brp` provides exhaustive bottom-up child traversal,
@@ -2464,8 +2453,8 @@ Implementation steps:
   containers. Record updates and string interpolation do not require sugar
   variants in this model: `compiler_core_lower.brp` already lowers them
   directly into ordinary Core expressions.
-- `compiler_core_ssa.brp` implements the prepared-Core-compatible behavior from
-  `compiler/lib/core_ssa.ml`: mutable locals without reassignment become
+- `compiler_core_ssa.brp` owns mutable-local lowering: mutable locals without
+  reassignment become
   immutable; straight-line assignments become immutable versioned lets; and
   assignments below control-flow boundaries remain explicit. Lexical
   substitution respects lets, lambdas, loop binders, raw-match patterns,
@@ -2667,6 +2656,9 @@ Implementation steps:
   - zero-argument static trait methods use their result type as the receiver;
   - bound impls and demands found in newly specialized impl bodies are drained
     to a fixed point;
+  - builtin `List[T]` string conversion also records the nested `Stringable[T]`
+    demand before synthesis, so the concrete element impl is available when
+    the list body is materialized;
   - specialized methods receive fresh definition IDs, and selected direct or
     selected trait calls plus variable references among those methods are
     rewritten together. Rewrites require the original ID and explicit
@@ -2754,12 +2746,12 @@ Implementation steps:
   negative controls, Core JSON round trips, and the OCaml handoff.
 - `compiler_core_early_pipeline.brp` is the pure contiguous executor for
   `lower` observation, debug lowering, desugar/SSA, monomorphization,
-  post-mono list-layout annotation, and synthesis. It owns explicit
+  post-mono list-layout annotation, synthesis, and match compilation. It owns explicit
   `next_def_id` state, invariant-before-observation ordering, stage
   observations/stops, and typed mono/invariant/synthesis failures. The
-  compile/run CLI calls this executor before constructing the schema-4
-  post-synthesis request. The semantic worker accepts only that phase and
-  starts at match. Early observations and stops are handled entirely in Blorp.
+  compile/run CLI calls this executor before constructing the schema-5
+  post-match request. The semantic worker accepts only that phase and starts at
+  trait resolution. Early observations and stops are handled entirely in Blorp.
   Observations use the canonical compact Core JSON projection, the same
   representation used by Blorp-owned later stages. This intentionally unifies
   Core snapshots rather than reproducing the temporary OCaml human-readable
@@ -2832,13 +2824,7 @@ Edge cases:
 
 Tests:
 
-- Existing OCaml tests to mirror where they exist:
-  - `compiler/test/test_core_desugar.ml`
-  - `compiler/test/test_core_ssa.ml`
-  - `compiler/test/test_core_mono.ml`
-  - `compiler/test/test_core_intrinsics.ml` (there has never been a dedicated
-    `test_core_synth.ml`; synthesis behavior lives in the intrinsic suite)
-  - `compiler/test/test_core_match.ml`
+- Existing OCaml tests for stages still owned by the OCaml middle:
   - `compiler/test/test_core_trait_resolve.ml`
   - `compiler/test/test_core_resolve.ml`
   - `compiler/test/test_core_std_inline.ml`
@@ -2849,8 +2835,7 @@ Tests:
   - `compiler/test/test_core_tensor_type.ml`
   - `compiler/test/test_core_tuple_sroa.ml`
   - `compiler/test/test_core_specialize.ml`
-- Focused Blorp coverage for `Core_debug.lower_program` must remain aligned
-  with the OCaml normal/debug build behavior until the boundary moves.
+- Focused Blorp coverage for debug lowering is authoritative.
 - `compiler/blorp/tests/test_compiler_core_debug.brp`
 - `compiler/blorp/tests/test_compiler_core_ssa.brp`
   - covers terminal assignments, lexical shadowing, compiled constructor-match
@@ -3052,8 +3037,6 @@ fallback in a separate commit.
 
 OCaml references:
 
-- `compiler/lib/test_runner.ml`
-  - shared test-command compilation, scheduled for Checkpoint 12
 - `compiler/lib/runtime.c`
 - `compiler/lib/runtime_decl.c`
 - `compiler/lib/runtime_raylib.c`
@@ -3098,13 +3081,35 @@ Deletion point:
 
 - Complete for ordinary source commands. Delete the narrow OCaml bootstrap
   compile wrapper only after the post-merge compiler release is pinned and no
-  longer requires it. Test-runner process/C compilation remains a separate
-  Checkpoint 12 responsibility.
+  longer requires it. Test and REPL synthetic-source compilation now uses the
+  same Blorp-owned artifact writer, runtime cache, host-C invocation, and
+  executable builder as ordinary `run`.
 
 ## Checkpoint 12: Tools, Test Runner, REPL, LSP, Packages, And Final OCaml Shell
 
 Goal: remove the remaining OCaml compiler/tool shell after compiler semantics
 are Blorp-owned.
+
+Status as of 2026-07-27:
+
+- `test` still delegates discovery, harness construction, scheduling,
+  execution, and reporting to OCaml, but all generated and user source is
+  compiled by the invoking production Blorp executable. OCaml no longer
+  parses/typechecks those sources, emits their C, invokes `cc`, or owns a test
+  runtime cache.
+- `repl` still owns the interactive loop and source accumulation in OCaml, but
+  each accumulated program is compiled by the invoking production Blorp
+  executable through the same synthetic-source boundary.
+- The synthetic-source command is private and build-only. It accepts a
+  temporary source storage path, a distinct logical source path, and an output
+  executable path; this keeps module resolution independent of temporary-file
+  placement.
+- `test --warmup-only` compiles a minimal executable through the production
+  boundary. The removed OCaml runtime-object warmup is not a fallback.
+- The production Blorp typechecker currently returns rendered error strings
+  without source spans. Doctest source maps are retained and unit-tested, but
+  end-to-end doctest type-error remapping must wait for structured typecheck
+  diagnostics. Do not parse rendered diagnostic text to close this gap.
 
 OCaml references:
 
@@ -3128,6 +3133,10 @@ OCaml references:
 
 Blorp references:
 
+- production synthetic-source and executable build boundary:
+  - `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
+  - `compiler/blorp/src/stage_12_cli/compiler_cli_run_effect.brp`
+  - `compiler/blorp/src/stage_12_cli/compiler_program_runner.brp`
 - existing formatter files:
   - `compiler/blorp/src/stage_11_format/compiler_format.brp`
   - `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
@@ -3144,11 +3153,17 @@ Implementation steps:
   reimplement typecheck or parse paths inside tools.
 - Keep formatter on the shared raw parse model.
 - Port purify as a consumer of Blorp typecheck and purity analysis.
-- Port the test runner by reducing work first:
-  - shared compile artifacts,
-  - suite batching,
-  - no unnecessary subprocesses,
-  - robust timeout/process cleanup.
+- Port the remaining test-runner orchestration without reintroducing compiler
+  work:
+  - discovery and typed `TestSuite` classification,
+  - doctest and suite harness construction,
+  - suite batching and scheduling,
+  - timeout/process cleanup,
+  - result framing, caching, and reporting.
+- Introduce one structured diagnostic type shared by parse and typecheck before
+  moving doctest reporting. It must carry source spans through the production
+  synthetic-source boundary so the existing source map can be applied without
+  inspecting rendered strings.
 - Port packages using the source-package dependency rules already used by the
   module graph:
   - manifest parsing,
@@ -3173,7 +3188,8 @@ Edge cases:
 
 - LSP must support multiple open documents without session leakage.
 - Test runner timeouts must clean up process groups and temp files.
-- Doctest source remapping must preserve original file/line diagnostics.
+- Doctest source remapping must preserve original file/line diagnostics once
+  structured typecheck spans are available; until then, keep the gap explicit.
 - Package hashes are content-addressable over raw package file contents and
   relative paths; comments are included because they are file contents.
 - Vendor/fetch must verify hash pins before making cache entries ready.
@@ -3186,6 +3202,7 @@ Tests:
 - `compiler/test/test_doctest_remap.ml`
 - `compiler/test/test_compiler_test_runner.ml`
 - `compiler/blorp/tests/test_compiler_format.brp`
+- `tests/test_cli.sh` private synthetic executable boundary cases
 - `scripts/test doctest cli`
 - manual package fetch/vendor tests with filesystem and local HTTP server
 

@@ -7,13 +7,10 @@ import:
 	compiler_core_json:
 		CoreAccessor(RootAccessor),
 		CoreBinaryOp(EqualOp, NotEqualOp),
-		CoreCallKind(BuiltinCall, DirectRuntimeCall),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
-		CoreConstructorMatchTest(
-			BoxedResultOkConstructorTest,
-			StackResultOkConstructorTest,
-		),
+		CoreConstructorMatchTest(BoxedResultOkConstructorTest, StackResultOkConstructorTest),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
@@ -29,13 +26,14 @@ import:
 			VoidExpr,
 		),
 		CoreFunction,
-		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(BoxedResultType, NamedType, RangeType, StackResultType, VoidType),
 		core_expr_type,
 	compiler_core_traverse as CoreTraverse
+	compiler_core_type_policy as CoreTypePolicy
 
 
 private pure func named_type(name: String) -> CoreType:
@@ -194,14 +192,22 @@ private pure func result_truthiness(
 				constructor = "Ok",
 				accessor = RootAccessor,
 				test = test,
-				bindings = [],
-				body = ConstructorMatchBodyExpr(
-					LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc),
-				)
+			bindings = [],
+			body = ConstructorMatchBodyExpr(
+				LiteralExpr(
+					BoolLiteral(True),
+					bool_type,
+					SyntheticSourceLoc,
+				),
+			)
 			},
 		],
 		ConstructorMatchFallbackBody(
-			LiteralExpr(BoolLiteral(False), bool_type, SyntheticSourceLoc),
+			LiteralExpr(
+				BoolLiteral(False),
+				bool_type,
+				SyntheticSourceLoc,
+			),
 		),
 		bool_type,
 		loc,
@@ -327,34 +333,87 @@ private pure func specialize_primitive_call(expr: CoreExpr) -> CoreExpr:
 			expr
 
 
-private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
+private pure func specialize_reflection_call(
+	managed_type_names: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, args, _, loc):
+			match args:
+				[arg]:
+					arg_type: CoreType = core_expr_type(arg)
+
+					if name == "type_name":
+						LiteralExpr(
+							StringLiteral(CoreTypePolicy.core_type_to_string(arg_type)),
+							named_type("String"),
+							loc,
+						)
+					else if name == "is_heap":
+						LiteralExpr(
+							BoolLiteral(
+								CoreTypePolicy.is_managed_type(
+									managed_type_names,
+									arg_type,
+								),
+							),
+							named_type("Bool"),
+							loc,
+						)
+					else:
+						expr
+				_:
+					expr
+		_:
+			expr
+
+
+private pure func specialize_expr(managed_type_names: List[String], expr: CoreExpr) -> CoreExpr:
 	match expr:
 		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, specialize_expr)
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				func(item): specialize_expr(managed_type_names, item),
+			)
 		_:
 			children_specialized: CoreExpr = CoreTraverse.map_core_expr_children(
 				expr,
-				specialize_expr,
+				func(child): specialize_expr(managed_type_names, child),
 			)
 
-			specialize_primitive_call(children_specialized)
+			specialize_reflection_call(
+				managed_type_names,
+				specialize_primitive_call(children_specialized),
+			)
 
 
-private pure func specialize_function(function_info: CoreFunction) -> CoreFunction:
-	{ function_info | body = function_info.body.map(specialize_expr) }
+private pure func specialize_function(
+	managed_type_names: List[String],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(func(body): specialize_expr(managed_type_names, body))
+	}
 
 
-private pure func specialize_decl(decl: CoreDecl) -> CoreDecl:
+private pure func specialize_decl(managed_type_names: List[String], decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(specialize_function(function_info))
+			FunctionDecl(specialize_function(managed_type_names, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = specialize_expr(global.init) })
+			GlobalDecl({ global | init = specialize_expr(managed_type_names, global.init) })
 		ImplDecl(impl_decl):
-			ImplDecl({ impl_decl | methods = impl_decl.methods.map(specialize_function) })
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): specialize_function(managed_type_names, method),
+					)
+				},
+			)
 		_:
 			decl
 
 
 pure func specialize_program(program: CoreProgram) -> CoreProgram:
-	{ program | decls = program.decls.map(specialize_decl) }
+	managed_type_names = CoreTypePolicy.managed_type_names(program)
+	{ program | decls = program.decls.map(func(decl): specialize_decl(managed_type_names, decl)) }
