@@ -12,10 +12,10 @@
     The registry is created fresh per compilation (and per pipeline invocation).
     No module-global mutable state — callers always pass a registry explicitly.
 
-    Population order: the core pipeline registers aliases, value-record
-    names, and enum types eagerly before monomorphization (see
-    [Core_pipeline.compile_typed_with_modules]). [collect_subst] in
-    [Core_mono] consults aliases via [expand_alias ~reg]. *)
+    Population order: Blorp lowering and monomorphization establish concrete
+    type metadata before the semantic-worker handoff. The OCaml middle rebuilds
+    this registry from decoded post-match Core before running its
+    registry-dependent passes. *)
 
 open Ast
 

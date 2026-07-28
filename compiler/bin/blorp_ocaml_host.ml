@@ -760,21 +760,6 @@ type blorp_cli_frontier =
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
-let bootstrap_compile_graph_of_cli_frontend_module_graph
-    (graph : Compiler_blorp_bridge.cli_frontend_module_graph) =
-  match Modules.finalize_cli_frontend_module_graph graph with
-  | Ok finalized ->
-      ( finalized.Modules.finalized_preloaded_graph,
-        finalized.finalized_compile_options )
-  | Error diagnostics ->
-      let file =
-        match graph.cli_frontend_graph_roots with
-        | root :: _ -> root.cli_frontend_graph_path
-        | [] -> "<cli-frontend-graph>"
-      in
-      prerr_endline (format_pipeline_errors ~file diagnostics);
-      exit 1
-
 let cli_frontier_of_cli_run_result = function
   | Compiler_blorp_bridge.CliRunHandled result ->
       print_string result.Compiler_blorp_bridge.cli_run_stdout;
@@ -782,8 +767,7 @@ let cli_frontier_of_cli_run_result = function
       exit result.Compiler_blorp_bridge.cli_run_status
   | Compiler_blorp_bridge.CliRunFrontendModuleGraph _ ->
       prerr_endline
-        "Internal error: compile plans are accepted only by the bootstrap \
-         compile wrapper";
+        "Internal error: a source compile plan reached the OCaml tool host";
       exit 1
   | Compiler_blorp_bridge.CliRunTestOptions options -> BlorpCliTest options
   | Compiler_blorp_bridge.CliRunPurifyOptions options -> BlorpCliPurify options
@@ -805,73 +789,6 @@ let sanitizer_mode_of_cli_frontend =
   | CliFrontendSanitizeAddressUndefined ->
       Test_runner.SanitizerAddressUndefined
   | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
-
-let is_bootstrap_compile_plan ~output ~filename
-    (options : Compiler_blorp_bridge.cli_compile_options) =
-  (not options.cli_compile_ast_only)
-  && not options.cli_compile_dump_ast
-  && not options.cli_compile_dump_typed_ast
-  && options.cli_compile_dump_core_after = []
-  && options.cli_compile_dump_file = None
-  && options.cli_compile_stop_after = None
-  && not options.cli_compile_time_phases
-  && not options.cli_compile_check_invariants
-  && not options.cli_compile_debug
-  && options.cli_compile_no_format
-  && options.cli_compile_embed_runtime
-  && options.cli_compile_std_dir = None
-  && options.cli_compile_output = Some output
-  && options.cli_compile_files = [ filename ]
-
-let run_bootstrap_compile ~profile ~output ~filename ~preloaded_module_graph
-    options =
-  if not (is_bootstrap_compile_plan ~output ~filename options) then begin
-    prerr_endline
-      "Internal error: bootstrap compiler returned an unexpected compile plan";
-    1
-  end
-  else
-    match
-      Pipeline.compile_preloaded_graph_with_blorp_bridge ~filename
-        ~preloaded_module_graph ~profile ()
-    with
-    | Error errors ->
-        prerr_endline (format_pipeline_errors ~file:filename errors);
-        1
-    | Ok (Pipeline.Stopped_at stage) ->
-        Printf.eprintf
-          "Internal error: bootstrap compilation stopped unexpectedly after %s\n"
-          (Blorp.Core_stage.to_string stage);
-        1
-    | Ok (Pipeline.Compiled { c_code; _ }) ->
-        write_file output c_code;
-        Printf.printf "Generated %s\n" output;
-        0
-
-let run_compiler_host_compile_wrapper_command args =
-  match Compiler_host_compile_wrapper_args.parse args with
-  | Error usage ->
-      prerr_endline usage;
-      1
-  | Ok request -> (
-      match
-        Compiler_blorp_bridge.cli_run_via_command ~version:(Version.describe ())
-          [ "compile"; "--no-format"; "-o"; request.output; request.filename ]
-      with
-      | Error (_, message) ->
-          prerr_endline message;
-          1
-      | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
-          let preloaded_module_graph, options =
-            bootstrap_compile_graph_of_cli_frontend_module_graph graph
-          in
-          run_bootstrap_compile ~profile:request.profile ~output:request.output
-            ~filename:request.filename ~preloaded_module_graph options
-      | Ok _ ->
-          prerr_endline
-            "Internal error: compiler host compile wrapper expected a Blorp \
-             frontend compile graph";
-          1)
 
 let test_mode_of_cli_frontend =
   let open Compiler_blorp_bridge in
@@ -1083,7 +1000,6 @@ let run_package_from_frontier_options
 
 let is_internal_compiler_command = function
   | "__compiler-bridge-prepare" :: _
-  | "__compiler-host-compile-wrapper" :: _
   | "__compiler-run-cli-plan" :: _ ->
       true
   | _ -> false
@@ -1108,8 +1024,6 @@ let rec run_delegate_command args =
   match args with
   | "__compiler-bridge-prepare" :: rest ->
       exit (run_compiler_bridge_prepare_command rest)
-  | "__compiler-host-compile-wrapper" :: rest ->
-      exit (run_compiler_host_compile_wrapper_command rest)
   | "__compiler-run-cli-plan" :: rest ->
       exit (run_compiler_cli_plan_command rest)
   | _ ->

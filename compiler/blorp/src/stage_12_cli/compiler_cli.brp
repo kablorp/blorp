@@ -75,13 +75,14 @@ import:
 	compiler_cli_run_environment: resolve_current_run_args_environment
 	compiler_cli_source_graph:
 		expand_check_targets,
-		frontend_module_graph_for_roots,
+		frontend_module_graph_for_roots_with_setup,
 		frontend_source_for_action,
-		parse_cli_source,
-		parse_cli_source_file_for_action,
-		parse_cli_sources,
+		parse_cli_source_with_setup,
+		parse_cli_sources_with_setup,
+		read_cli_source_file_for_action,
 		read_cli_sources_for_action,
 		single_explicit_check_source,
+		source_graph_setup_for_paths,
 	json: JsonValue, as_array, as_string, get_field
 
 
@@ -145,6 +146,7 @@ private COMPILE_HELP: String =
 	|
 	|Options:
 	|  --ast                     Print AST and exit (no typecheck, no emit)
+	|  --profile                 Emit function-level profiling instrumentation
 	|  --dump-ast                Print AST summary and continue compiling
 	|  --dump-typed-ast          Print typed AST and continue compiling
 	|  --dump-core               Dump Core IR at the final stage
@@ -367,20 +369,28 @@ private func parsed_source_plan_for_action(
 ) -> Option[CliRunPlan]:
 	match frontend_source_for_action(action):
 		Some(path):
-			parsed_source: Result[CliParsedSourceFile, String] = match supplied_source:
+			setup = source_graph_setup_for_paths(action, [path])
+
+			source_result: Result[CliSourceFile, String] = match supplied_source:
 				Some(source):
 					if source.path == path:
-						parse_cli_source(source)
+						Ok(source)
 					else:
 						Err(
 							"payload source path `${source.path}` does not match CLI source `${path}`",
 						)
 				None:
-					parse_cli_source_file_for_action(action, path)
+					read_cli_source_file_for_action(action, path)
+
+			parsed_source: Result[CliParsedSourceFile, String] = match source_result:
+				Ok(source):
+					parse_cli_source_with_setup(setup, source)
+				Err(message):
+					Err(message)
 
 			match parsed_source:
 				Ok(source):
-					match frontend_module_graph_for_roots(action, [source]):
+					match frontend_module_graph_for_roots_with_setup(setup, [source]):
 						Ok(graph):
 							match action:
 								CliCompile(options):
@@ -418,11 +428,19 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 		Ok(expansion):
 			match read_cli_sources_for_action(CliCheck(args), expansion.source_paths):
 				Ok(sources):
+					setup = source_graph_setup_for_paths(
+						CliCheck(args),
+						sources.map(func(source): source.path),
+					)
+
 					match single_explicit_check_source(expansion, sources):
 						Some(source):
-							match parse_cli_source(source):
+							match parse_cli_source_with_setup(setup, source):
 								Ok(parsed):
-									match frontend_module_graph_for_roots(CliCheck(args), [parsed]):
+									match frontend_module_graph_for_roots_with_setup(
+										setup,
+										[parsed],
+									):
 										Ok(graph):
 											CliRunCheck({
 												args = user_args,
@@ -437,10 +455,10 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 							if sources.length() == 0:
 								handled_error(NO_BLORP_FILES_ERROR)
 							else:
-								match parse_cli_sources(sources):
+								match parse_cli_sources_with_setup(setup, sources):
 									Ok(parsed_sources):
-										match frontend_module_graph_for_roots(
-											CliCheck(args),
+										match frontend_module_graph_for_roots_with_setup(
+											setup,
 											parsed_sources,
 										):
 											Ok(graph):

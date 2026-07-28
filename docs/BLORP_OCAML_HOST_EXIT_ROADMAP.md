@@ -10,15 +10,15 @@ OCaml compiler host:
    resulting binary.
 
 The semantic middle is a separate migration concern. Core lowering and the
-early Core pipeline through synthesis are now Blorp-owned; until the
+early Core pipeline through match compilation are now Blorp-owned; until the
 remaining middle Core passes are ported, one narrow OCaml worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
-  -> Blorp debug, desugar/SSA, mono, post-mono list layout, and synthesis
-  -> one versioned post-synthesis Core request
-  -> OCaml match-through-specialize Core worker
+  -> Blorp debug, desugar/SSA, mono, post-mono list layout, synthesis, and match
+  -> one versioned post-match Core request
+  -> OCaml trait-resolve-through-specialize Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -66,15 +66,24 @@ the obsolete OCaml run/C-compiler effect path has been deleted. The remaining
 general host delegation is for commands not yet migrated (`test`, `purify`,
 `package`, `repl`, and `lsp`).
 
-One explicitly named compatibility path remains for bootstrapping:
-`blorp-ocaml-host __compiler-host-compile-wrapper` consumes a serialized
-compile graph in order to build the public Blorp executable with the pinned
-`dev-9f56c40d2b91` compiler. It is not reachable from an installed public
-source command. The wrapper now validates its fixed
-`compile --no-format -o <out.c> <file.brp>` contract and calls the semantic
-pipeline directly. The former generic OCaml compile options, AST/typed-AST
-dumping, Core observation, stage stopping, profiling, and output-selection
-stack has been deleted. Generic host-plan execution rejects compile graphs.
+Bootstrapping is now a separate immutable artifact boundary. Release archives
+carry `blorp-bootstrap-compiler`, inherited from the verified pinned toolchain,
+plus bootstrap-specific host, parser, typecheck, and renderer executables. The
+launcher selects those helpers explicitly, so the immutable host cannot consume
+the new release's bridge protocols merely because both generations share an
+installation directory. A `blorp-bootstrap-layout` manifest represents this
+bundle explicitly; the tooling does not infer compatibility from neighboring
+filenames. Installed bundles use content-addressed generation directories and
+an atomically replaced active-generation pointer, preventing interrupted or
+concurrent upgrades from mixing their members. The build invokes only that
+artifact's fixed
+`__compiler-host-compile-wrapper` command. The current
+`compiler/bin/blorp_ocaml_host.ml` no longer implements that command or links
+its argument parser. Toolchains published before the isolated bundle are
+accepted temporarily by resolving their immutable `blorp-ocaml-host` and
+packaging it with that release's matching helpers. That fallback can be deleted
+after the first release containing the complete, verified isolated bundle is
+pinned on every supported target.
 
 The desired change is not to move the existing CLI-plan protocol into another
 file. The CLI plan must become an internal Blorp value. Only the semantic input
@@ -107,11 +116,11 @@ OCaml-reminted declarations, or restarting generated IDs at zero, is invalid.
 7. **Behavioral parity before deletion.** Exit codes, diagnostics, output,
    cleanup, sanitizer behavior, runtime cache identity, and stage observation
    are observable compiler behavior.
-8. **The pinned bootstrap is immutable.** Keep the user-selected
-   `dev-9f56c40d2b91` bootstrap until an all-green committed revision has
-   published replacement artifacts. Rotate the pin in a later, isolated
-   commit. `compiler/bootstrap.env` is the authoritative release identity for
-   both the wrapper and CI cache keys.
+8. **The pinned bootstrap is immutable.** Keep the release named by
+   `compiler/bootstrap.env` until an all-green committed revision has published
+   replacement artifacts. Rotate the pin in a later, isolated commit. The
+   manifest is the authoritative release identity for both the bootstrap
+   compiler and CI cache keys.
 9. **One identity domain per compile graph.** Source functions, impl methods,
    and constructors receive deterministic graph-wide DefIds in Blorp. Every
    typed module installed in the OCaml middle comes from that graph response,
@@ -157,8 +166,8 @@ Exit condition:
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
 Status: implemented and authoritative for normal `compile` and `run`. The
-private worker receives strict post-synthesis Core schema 4 and starts at match
-compilation; no source or typed AST crosses this boundary.
+private worker receives strict post-match Core schema 5 and starts at trait
+resolution; no source, typed AST, or raw match crosses this boundary.
 
 New Blorp file:
 
@@ -212,7 +221,7 @@ Implementation:
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Keep the worker entry function limited to strict post-synthesis Core decode,
+5. Keep the worker entry function limited to strict post-match Core decode,
    early-stage invariant validation, and the still-OCaml middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
@@ -327,7 +336,10 @@ Deletion completed during Checkpoint J:
 - the OCaml run frontend/options/frontier types and their implementation-only
   tests.
 
-Compile graph decoding remains only for the pinned bootstrap wrapper.
+Compile graph decoding remains in current source only for the in-memory
+test-runner compatibility route. The REPL separately uses the legacy
+direct-source pipeline. The immutable bootstrap compiler contains its own
+already-compiled graph decoder.
 
 Implemented evidence on 2026-07-13:
 
@@ -503,7 +515,7 @@ Tests:
 Exit condition:
 
 - the Blorp artifact writer passes focused parity and failure tests;
-  neither the production path nor the pinned bootstrap wrapper retains the
+  neither the production path nor the immutable bootstrap compiler retains the
   former generic OCaml artifact writer.
 
 Implemented evidence on 2026-07-14:
@@ -814,29 +826,22 @@ Completed deletions:
 - OCaml Core profiling and compile-profile helpers superseded by Blorp-owned
   compile timing.
 
-Deferred solely for the pinned bootstrap wrapper:
+Completed bootstrap-source deletions:
 
-- compile graph decoding;
-- graph finalization into `Modules.preloaded_module_graph`; and
-- the narrow `run_bootstrap_compile` semantic-pipeline call.
+- `run_bootstrap_compile` and the current host's hidden compile-wrapper command;
+- the wrapper argument parser and its implementation-only OCaml tests; and
+- the current build's dependency on the just-built OCaml host for compiling
+  the Blorp CLI.
 
 The direct-source and generated in-memory compatibility compilers have been
-deleted. The pinned-bootstrap wrapper is now the only production caller of
-`Pipeline.compile_preloaded_graph_with_blorp_bridge`. A direct compile probe
-with pinned release `dev-9d291f28ee87` exits 139 on the current
-`compiler_cli_main.brp`; rotate to a bootstrap that passes that probe before
-deleting the wrapper or its early-Core compatibility modules.
+deleted, along with the preloaded-graph compile wrapper and their OCaml tests.
+The separately packaged `dev-5331666d5ec5` bootstrap is the build trust root;
+the current OCaml host no longer implements bootstrap compilation.
 
 Do not delete yet:
 
-- OCaml match-through-specialize passes used by `blorp-ocaml-middle`;
-- OCaml synthesis retained by the pinned bootstrap wrapper and direct
-  compatibility tests;
-- OCaml Core lowering retained solely by the pinned-bootstrap wrapper and its
-  compatibility tests;
-- their behavior-focused tests until the corresponding semantic stage ports;
-- bridge decoders required solely by the pinned bootstrap, unless the
-  bootstrap ratchet has removed that requirement; or
+- OCaml trait-resolve-through-specialize passes used by `blorp-ocaml-middle`;
+- bridge decoders required by the post-match semantic-middle protocol; or
 - OCaml tools still explicitly scheduled in Checkpoint 12 of the main roadmap.
 
 ## Checkpoint K: Ratchet The Bootstrap
@@ -844,11 +849,14 @@ Do not delete yet:
 Goal: publish and consume a compiler that exercises the new architecture
 without making the migration change depend on its own release.
 
-Status: prerequisite complete on this branch. `compiler/bootstrap.env` is now
-the single checked-in release identity consumed by the bootstrap wrapper and
-all CI cache keys. The pin intentionally remains on the previous immutable
-release until this branch is merged and release CI publishes all three target
-artifacts; the actual rotation must be a separate commit.
+Status: source-side separation is complete. `compiler/bootstrap.env` is the
+single checked-in release identity consumed by the resolver and CI cache keys.
+Release archives now preserve a dedicated `blorp-bootstrap-compiler` and its
+matching bootstrap-specific helper generation, while the resolver supports the
+old `blorp-ocaml-host` artifact name only for the currently pinned immutable
+toolchain. The pin intentionally remains unchanged until release CI publishes
+and verifies all three target artifacts; rotation and removal of the old-name
+fallback remain separate commits.
 
 Implementation:
 

@@ -48,7 +48,11 @@ import:
 		ParsedRecordExprField,
 		parsed_program_phase_name,
 	../stage_03_parse/compiler_parser: parse_compiler_source
-	../stage_03_parse/compiler_source_ast_finalize: finalize_typecheck_source_program
+	../stage_03_parse/compiler_source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalize_typecheck_source_program,
+		finalized_typecheck_program_ast,
+		finalized_typecheck_program_matches_source,
 	../stage_04_modules/compiler_module_surface: ModuleSurface, module_surface_for_program
 	../stage_04_modules/compiler_module_surface_json: module_surface_to_json
 	../stage_05_types/compiler_context:
@@ -129,6 +133,7 @@ record TypecheckImportModule {
 	module_name: String,
 	module_path: String,
 	text: String,
+	typecheck_program: Option[FinalizedTypecheckProgram],
 	origin: CompilerModuleOrigin
 }
 
@@ -368,6 +373,7 @@ private pure func import_module_from_json(
 				module_name = module_name,
 				module_path = maybe_module_path.get_or(module_name),
 				text = text,
+				typecheck_program = None,
 				origin = origin,
 			})
 		_:
@@ -552,18 +558,6 @@ private pure func import_binding_to_json(binding: CompilerImportBinding) -> Json
 	])
 
 
-private pure func owned_parsed_decl(decl: ParsedDecl) -> ParsedDecl:
-	decl
-
-
-private pure func parsed_program_with_owned_decls(program: ParsedProgram) -> ParsedProgram:
-	{
-		source = program.source,
-		decls = program.decls.map(owned_parsed_decl),
-		diagnostics = program.diagnostics
-	}
-
-
 private pure func resolved_module_for_import(
 	from_path: String,
 	from_module: String,
@@ -647,26 +641,48 @@ private pure func rewrite_program_import_paths(
 	}
 
 
-private pure func prepare_typecheck_module(
+private pure func parse_typecheck_program_for_module(
 	module: TypecheckImportModule,
-	resolved_imports: List[TypecheckResolvedImport],
-) -> PreparedTypecheckModule:
+) -> ParsedProgram:
 	source_file: CompilerSourceFile = compiler_source_file(
 		module.path,
 		module.module_name,
 		module.text,
 	)
-	raw_program = parse_compiler_source(source_file)
+	finalize_typecheck_source_program(parse_compiler_source(source_file))
+
+
+private pure func typecheck_program_for_module(module: TypecheckImportModule) -> ParsedProgram:
+	match module.typecheck_program:
+		Some(finalized_program):
+			if finalized_typecheck_program_matches_source(
+				finalized_program,
+				module.path,
+				module.module_name,
+				module.text,
+			):
+				finalized_typecheck_program_ast(finalized_program)
+			else:
+				parse_typecheck_program_for_module(module)
+		None:
+			parse_typecheck_program_for_module(module)
+
+
+private pure func prepare_typecheck_module(
+	module: TypecheckImportModule,
+	resolved_imports: List[TypecheckResolvedImport],
+) -> PreparedTypecheckModule:
+	program = typecheck_program_for_module(module)
 	rewritten = rewrite_program_import_paths(
 		module.path,
 		module.module_name,
 		resolved_imports,
-		raw_program,
+		program,
 	)
 
 	{
 		request = module,
-		program = parsed_program_with_owned_decls(finalize_typecheck_source_program(rewritten))
+		program = rewritten
 	}
 
 
@@ -1863,6 +1879,7 @@ private pure func typed_source_artifact(
 			module_name = module_name,
 			module_path = module_name,
 			text = text,
+			typecheck_program = None,
 			origin = origin
 		},
 		resolved_imports,

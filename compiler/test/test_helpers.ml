@@ -130,12 +130,6 @@ let expect_valid_typed_program program =
   | Ok typed -> typed
   | Error _ -> Alcotest.fail "expected test program to satisfy Typed_ast"
 
-let compile_valid_program ?embed_runtime ?profile ?debug ?on_stage
-    ?check_invariants program =
-  Blorp.Core_pipeline.compile_typed ?embed_runtime ?profile ?debug ?on_stage
-    ?check_invariants
-    (expect_valid_typed_program program)
-
 (** Assert source produces at least one error whose message contains [message]. *)
 let expect_error src ~message =
   let _typed, errors = typecheck_src src in

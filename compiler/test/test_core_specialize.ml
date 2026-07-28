@@ -50,6 +50,23 @@ let specialize e =
 
 let specialize_with_reg reg e = Blorp.Core_specialize.specialize_expr ~reg e
 
+let count_intrinsic name expr =
+  fold_tree
+    (fun count node ->
+      match node.desc with
+      | CCall (CKIntrinsic got, _, _) when got = name -> count + 1
+      | _ -> count)
+    0 expr
+
+let count_match_forms expr =
+  fold_tree
+    (fun (raw, compiled) node ->
+      match node.desc with
+      | CMatchArms _ -> (raw + 1, compiled)
+      | CMatch _ -> (raw, compiled + 1)
+      | _ -> (raw, compiled))
+    (0, 0) expr
+
 let int_lit = function
   | { desc = CLit (LitInt n); _ } -> Int64.to_int n
   | _ -> Alcotest.fail "expected integer literal argument"
@@ -591,6 +608,39 @@ let test_stream_filter_map_managed_option_uses_nullable_runtime () =
   in
   expect_builtin "stream filter_map Option[String]"
     "blorp_stream_filter_map_nullable" e
+
+let test_parallel_filter_map_value_record_uses_sequential_fallback () =
+  let reg = Blorp.Codegen_types.create_registry () in
+  Hashtbl.replace reg.value_records "Pair" ();
+  let pair_ty = TyNamed ("Pair", []) in
+  let self_ty = TyNamed ("List", [ ty_int ]) in
+  let result_ty = TyNamed ("List", [ pair_ty ]) in
+  let self = cvar "items" self_ty in
+  let func =
+    cvar "f"
+      (TyFunc
+         {
+           params = [ ty_int ];
+           return = TyNamed ("Option", [ pair_ty ]);
+           is_pure = true;
+         })
+  in
+  let specialized =
+    call_builtin "blorp_filter_map_parallel" [ self; func ] result_ty
+    |> specialize_with_reg reg
+  in
+  Alcotest.(check int)
+    "allocates the fallback result once" 1
+    (count_intrinsic "list_alloc" specialized);
+  Alcotest.(check int)
+    "transfers retained payloads" 1
+    (count_intrinsic "list_set_owned" specialized);
+  Alcotest.(check int)
+    "sets the final result length" 1
+    (count_intrinsic "list_set_len" specialized);
+  let raw_matches, compiled_matches = count_match_forms specialized in
+  Alcotest.(check int) "does not synthesize raw matches" 0 raw_matches;
+  Alcotest.(check int) "synthesizes one compiled match" 1 compiled_matches
 
 let test_stream_map_managed_result_sets_owned_arc_layout () =
   let stream = cvar "s" (TyNamed ("Stream", [ ty_int ])) in
@@ -1136,6 +1186,8 @@ let suite =
           test_float32_vector_set_managed_option_uses_nullable_runtime;
         Alcotest.test_case "stream_filter_map_nullable_managed" `Quick
           test_stream_filter_map_managed_option_uses_nullable_runtime;
+        Alcotest.test_case "parallel_filter_map_value_record_fallback" `Quick
+          test_parallel_filter_map_value_record_uses_sequential_fallback;
         Alcotest.test_case "stream_map_managed_result_sets_owned_arc_layout"
           `Quick test_stream_map_managed_result_sets_owned_arc_layout;
         Alcotest.test_case "stream_map_scalar_result_sets_immediate_layout"

@@ -56,6 +56,59 @@ if ! grep -Fq -- '--print-toolchain-dir' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must resolve the pinned complete toolchain" >&2
 	exit 1
 fi
+if ! grep -Fq -- '--print-compiler-path' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must resolve the immutable bootstrap compiler" >&2
+	exit 1
+fi
+if grep -Fq '"compiler/_build/default/bin/blorp_ocaml_host.exe" __compiler-host-compile-wrapper' \
+	<<<"$cli_build_plan"
+then
+	echo "FAIL: the Blorp CLI build must not compile itself through the current OCaml host" >&2
+	exit 1
+fi
+if ! grep -Fq '"$bootstrap_compiler" __compiler-host-compile-wrapper' <<<"$cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must invoke the pinned bootstrap compiler" >&2
+	exit 1
+fi
+if grep -R -Fq '__compiler-host-compile-wrapper' \
+	compiler/bin compiler/blorp/src
+then
+	echo "FAIL: current compiler source must not retain the immutable bootstrap compiler command" >&2
+	exit 1
+fi
+for compiler_benchmark in \
+	benchmarks/compiler_record_layout \
+	benchmarks/compiler_typecheck_profile
+do
+	if grep -Fq 'compiler/_build/default/bin/blorp_ocaml_host.exe' \
+		"$compiler_benchmark"
+	then
+		echo "FAIL: $compiler_benchmark must not compile through the current OCaml host" >&2
+		exit 1
+	fi
+	if grep -Fq '__compiler-host-compile-wrapper' "$compiler_benchmark"; then
+		echo "FAIL: $compiler_benchmark must use the current public compiler surface" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'compile --' "$compiler_benchmark"; then
+		echo "FAIL: $compiler_benchmark must compile its fixture with the current Blorp CLI" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq \
+	'compiler="${BLORP_TYPECHECK_PROFILE_COMPILER:-$repo_root/compiler/_build/blorp-cli/blorp}"' \
+	benchmarks/compiler_typecheck_profile
+then
+	echo "FAIL: compiler_typecheck_profile must execute the artifact built by build-blorp-cli" >&2
+	exit 1
+fi
+if ! grep -Fq \
+	'compiler/_build/default/bin/blorp_ocaml_middle.exe' \
+	benchmarks/compiler_typecheck_profile
+then
+	echo "FAIL: compiler_typecheck_profile must pair the build artifact with its semantic worker" >&2
+	exit 1
+fi
 for bridge_env in \
 	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
 	BLORP_COMPILER_PARSER_BRIDGE_BIN \
@@ -275,6 +328,10 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'name: Package tested toolchain' "$ci_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_workflow" ||
 	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_workflow" ||
+	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$ci_workflow" ||
+	! grep -Fq '"$package_dir/blorp-bootstrap-compiler" \' "$ci_workflow" ||
+	! grep -Fq '__compiler-host-compile-wrapper \' "$ci_workflow" ||
+	! grep -Fq 'test -s "$package_root/bootstrap-empty-main.c"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_workflow" ||
 	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_workflow" ||
@@ -314,10 +371,6 @@ profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/com
 printf '#!/usr/bin/env bash\nprintf "PROFILE_CACHE_SMOKE\\n"\n' >"$profile_cache_binary"
 chmod +x "$profile_cache_binary"
 
-make() {
-	:
-}
-
 find() {
 	:
 }
@@ -339,14 +392,17 @@ uname() {
 	printf 'mock-platform\n'
 }
 
-export -f make find shasum cc uname
+export -f find shasum cc uname
 profile_cache_output=$(
 	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
-	BLORP_COMPILER_BRIDGE_BIN=/bin/true \
+	BLORP_COMPILER_BRIDGE_BIN=/usr/bin/true \
+	BLORP_OCAML_MIDDLE_BIN=/usr/bin/true \
+	BLORP_TYPECHECK_PROFILE_COMPILER=/usr/bin/true \
+	BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
 	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
 	./benchmarks/compiler_typecheck_profile
 )
-unset -f make find shasum cc uname
+unset -f find shasum cc uname
 if [ "$profile_cache_output" != "PROFILE_CACHE_SMOKE" ]; then
 	echo "FAIL: compiler_typecheck_profile must support default mode under set -u" >&2
 	exit 1
@@ -375,6 +431,10 @@ if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+	! grep -Fq 'test -x "$package_dir/blorp-bootstrap-compiler"' "$release_workflow" ||
+	! grep -Fq '"$package_dir/blorp-bootstrap-compiler" \' "$release_workflow" ||
+	! grep -Fq '__compiler-host-compile-wrapper \' "$release_workflow" ||
+	! grep -Fq 'test -s "$package_root/bootstrap-empty-main.c"' "$release_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||

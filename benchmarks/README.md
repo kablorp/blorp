@@ -131,13 +131,18 @@ benchmarks/compiler_enum_field_layout
 ```bash
 benchmarks/compiler_typecheck_profile
 benchmarks/compiler_typecheck_profile 2 2 64 128
+benchmarks/compiler_typecheck_profile 2 2 64 128 fallback
 ```
 
 The positional controls are iterations, module count, nested type depth, and
-typed probes per module. The default `1 1 64 128` workload is intended for fast
-local comparisons. The runner builds the profiled executable through the
-compiler host's canonical preloaded graph and caches it by compiler, benchmark,
-standard-library, runner, bootstrap/helper, platform, and C-toolchain content.
+typed probes per module. An optional fifth argument selects the parsed-program
+mode: `retained` is the default, while `fallback` exercises the text-parsing
+boundary. The default `1 1 64 128 retained` workload is intended for fast local
+comparisons. The runner builds and directly uses the workspace production
+compiler CLI artifact at `compiler/_build/blorp-cli/blorp`, invokes its public
+`compile --profile` path, and pairs it with the current private semantic worker.
+It caches the profiled executable by compiler, benchmark, standard-library,
+runner, helper, platform, and C-toolchain content.
 The first run for a new key performs the full instrumented build; subsequent
 runs execute the cached binary directly. Benchmark stdout contains one
 `TYPECHECK_PROFILE_BENCH` summary, including `workload_valid=True` only when
@@ -145,13 +150,20 @@ every iteration produced the expected artifact and declaration counts.
 Function and `FLAME:` profile rows are written to stderr. Function times are
 inclusive and overlap along nested call chains, so compare the same rows and
 call counts across revisions rather than adding row percentages or treating
-them as disjoint wall time.
+them as disjoint wall time. Request construction is excluded from
+`elapsed_microseconds` but remains visible in the process-wide function profile;
+use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
+typecheck workload itself.
 
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, renderer-source, prepared-helper, and
 legacy parser overrides by default. This keeps one cache key tied to one
-effective compiler graph. For source-level iteration with already prepared
-parser, renderer, and typecheck helpers, set
+effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
+compiler CLI, and `BLORP_OCAML_MIDDLE_BIN` may override its semantic worker.
+Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building those executables
+separately when repeated source-level measurements should avoid the workspace
+build check. For iteration with already prepared parser, renderer, and
+typecheck helpers, set
 `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide their three
 `BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and
 includes their contents in the artifact cache key.
@@ -173,6 +185,8 @@ benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --primitive-storage-probes-per-module 512
 benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --resource-scan-depth 64 --resource-scan-probes-per-module 128
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --type-instantiation-depth 32 --type-instantiation-probes-per-module 32
 ```
 
 Aggregate probes sample record types evenly across the full declared chain,
@@ -196,12 +210,72 @@ Resource scan probes place a deeply nested tuple type in function signatures.
 Keep the other fixture dimensions at 1 or 0 when using the final command so
 recursive declaration resource-shape scanning is isolated.
 
+Self-resolution probes generate a trait and implementation whose method
+parameters contain deeply nested `Self` types. The implementation targets a
+local generic record with an equally deep concrete type argument, so both the
+traversed signature and substituted `concrete_type` scale with the requested
+depth. They exercise the production `compiler_resolve_self` path during
+implementation validation:
+
+```bash
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --self-resolution-depth 64 --self-resolution-probes-per-module 128
+```
+
+Type-instantiation probes generate generic function signatures with a deeply
+unchanged concrete tuple, a partially changed tuple, and a nested generic type
+whose complete ancestor path changes. They exercise all three paths through
+`compiler_type_instantiate_type_params`.
+
+Use `--warmup-runs N --runs N` for low-noise comparisons. The bridge and request
+are prepared once, every warmup and measured response is validated, and the
+summary reports minimum, median, and maximum elapsed time plus median and
+maximum peak RSS.
+
+Pass two prepared helpers to compare a candidate and baseline in one invocation:
+
+```bash
+benchmarks/compiler_typecheck_memory \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin \
+  --warmup-runs 2 --runs 10
+```
+
+Comparison mode alternates bridge order on every round, requires byte-identical
+responses, requires even warmup and measured run counts, preserves every sample
+and its execution order, and reports median paired latency and peak-RSS
+percentage changes. Negative changes mean the candidate used less time or
+memory than the baseline.
+
+`compiler_type_ownership` is the fast preset for ownership work. It combines
+bounded resource scans and `Self` resolution, performs two warmups and six
+measured runs, and accepts trailing overrides:
+
+```bash
+benchmarks/compiler_type_ownership
+benchmarks/compiler_type_ownership --runs 9 --self-resolution-depth 96
+benchmarks/compiler_type_ownership \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+```
+
 The runner uses `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` when it names a prepared
 helper. `--bridge PATH` overrides it. Otherwise, the runner prepares a cached
 helper through `./blorp __compiler-bridge-prepare` before starting measurement.
 Bridge preparation is excluded from the reported time. Results include SHA-256
 digests of the bridge and request so saved before/after measurements remain
 auditable.
+
+`compiler_type_instantiation` is the fast preset for generic type
+instantiation work. Its signatures combine unchanged, partially changed, and
+fully changed recursive transforms in the same request:
+
+```bash
+benchmarks/compiler_type_instantiation
+benchmarks/compiler_type_instantiation \
+  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+```
 
 ### Captured Typecheck Replay
 
@@ -210,13 +284,11 @@ against an isolated helper. Capture mode writes the request immediately before
 the OCaml host would start that helper, then deliberately stops:
 
 ```bash
-cd compiler && dune build bin/blorp_ocaml_host.exe
-cd ..
-
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.json")
 output=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.c")
+bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
 BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$capture" \
-  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  "$bootstrap_compiler" \
   __compiler-host-compile-wrapper \
   -o "$output" \
   compiler/blorp/src/stage_06_typecheck/compiler_infer.brp
@@ -241,8 +313,9 @@ capture:
 
 ```bash
 cli_capture=$(mktemp "${TMPDIR:-/tmp}/blorp-cli-typecheck.XXXXXX.json")
+bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
 BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$cli_capture" \
-  compiler/_build/default/bin/blorp_ocaml_host.exe \
+  "$bootstrap_compiler" \
   __compiler-host-compile-wrapper \
   -o "$output" \
   compiler/blorp/src/stage_12_cli/compiler_cli_main.brp

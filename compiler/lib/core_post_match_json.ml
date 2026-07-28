@@ -1,11 +1,13 @@
-(** Strict structural decoder for the Blorp-owned post-synthesis Core handoff.
+(** Strict structural decoder for the Blorp-owned post-match Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
-    post-desugar, and post-mono semantic invariant checks immediately after
-    this structural decode. The accepted expression set includes forms created
-    by synthesis, but still rejects later ownership/backend forms so a pass
-    cannot accidentally run twice. *)
+    post-desugar, post-mono, and post-match semantic invariant checks
+    immediately after this structural decode. The accepted expression set
+    includes semantic decision trees created by match compilation and the
+    non-owning constructor test synthesized before that stage. It rejects raw
+    matches and ownership-bearing backend forms so a pass cannot accidentally
+    run twice or lose a release policy during projection. *)
 
 type decode_error = { path : string; message : string }
 
@@ -307,7 +309,7 @@ let decode_call_kind path value =
   | "selected_trait" ->
       (* Preserve the typecheck-selected method ID while OCaml trait
          resolution remains production-authoritative. Blorp keeps the richer
-         trait/module identity on its side of the post-synthesis boundary. *)
+         trait/module identity on its side of the post-match boundary. *)
       let* _trait_name = string_field path "trait_name" value in
       let* _method_name = string_field path "method_name" value in
       let* _module_path = string_field path "module_path" value in
@@ -333,7 +335,7 @@ let decode_call_kind path value =
   | "closure" -> Ok Core.CKClosure
   | _ ->
       error (path_field path "kind")
-        ("call kind `" ^ tag ^ "` is not valid at the post-synthesis boundary")
+        ("call kind `" ^ tag ^ "` is not valid at the post-match boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -398,41 +400,6 @@ let decode_release_policy path = function
   | Lsp_json.String ("none" | "arc" | "arc_only" | "stack_result") -> Ok ()
   | Lsp_json.String tag -> error path ("unsupported release policy `" ^ tag ^ "`")
   | _ -> error path "expected release policy string"
-
-let rec decode_pattern path value =
-  let* tag = kind path value in
-  match tag with
-  | "wildcard" -> Ok Ast.PatWildcard
-  | "name" ->
-      let* name = string_field path "name" value in
-      Ok (Ast.PatVar name)
-  | "literal" ->
-      let* literal_json = field path "literal" value in
-      let* literal = decode_literal (path_field path "literal") literal_json in
-      Ok (Ast.PatLiteral literal)
-  | "constructor" ->
-      let* name = string_field path "name" value in
-      let* args = list_field decode_pattern path "args" value in
-      Ok (Ast.PatConstructor (name, args))
-  | "qualified_constructor" ->
-      let* module_name = string_field path "module" value in
-      let* name = string_field path "name" value in
-      let* args = list_field decode_pattern path "args" value in
-      Ok (Ast.PatQualified (module_name, name, args))
-  | "tuple" ->
-      let* items = list_field decode_pattern path "items" value in
-      let arity = List.length items in
-      if arity < 2 || arity > 4 then error path "tuple pattern must have 2-4 elements"
-      else Ok (Ast.PatTuple items)
-  | "list" ->
-      let* items = list_field decode_pattern path "items" value in
-      let* spread_json = field path "spread" value in
-      let* spread = optional decode_pattern (path_field path "spread") spread_json in
-      Ok (Ast.PatList (items, spread))
-  | "or" ->
-      let* items = list_field decode_pattern path "items" value in
-      Ok (Ast.PatOr items)
-  | _ -> error (path_field path "kind") ("unsupported Core pattern `" ^ tag ^ "`")
 
 let rec decode_expr path value =
   let* tag = kind path value in
@@ -557,12 +524,11 @@ let rec decode_expr path value =
   | "tensor_raw_view_let" -> decode_tensor_raw_view_let_expr path value
   | "drop" -> decode_drop_expr path value
   | "select" -> decode_select_expr path value
-  | "raw_match" -> decode_raw_match_expr path value
-  | "literal_match" -> decode_literal_match_expr path value
-  | "constructor_match" -> decode_constructor_match_expr path value
+  | "semantic_match" -> decode_semantic_match_expr path value
+  | "constructor_match" -> decode_precompiled_constructor_match_expr path value
   | _ ->
       error (path_field path "kind")
-        ("Core expression `" ^ tag ^ "` is not valid at the post-synth boundary")
+        ("Core expression `" ^ tag ^ "` is not valid at the post-match boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -894,34 +860,145 @@ and decode_accessor path value =
       Ok (Core.AccListSpread (parent, offset))
   | _ -> error (path_field path "kind") ("unsupported match accessor `" ^ tag ^ "`")
 
-and decode_raw_match_expr path value =
+and decode_semantic_match_expr path value =
   let* scrutinee = decode_expr_field path "scrutinee" value in
-  let decode_case case_path case =
-    let* pattern_json = field case_path "pattern" case in
-    let* pattern = decode_pattern (path_field case_path "pattern") pattern_json in
-    let* body = decode_expr_field case_path "body" case in
-    Ok (pattern, body)
-  in
-  let* arms = list_field decode_case path "cases" value in
-  decode_typed_expr path value (Core.CMatchArms (scrutinee, arms))
+  let* tree_json = field path "tree" value in
+  let* tree = decode_semantic_match_tree (path_field path "tree") tree_json in
+  decode_typed_expr path value (Core.CMatch (scrutinee, tree))
 
-and decode_literal_match_expr path value =
+and decode_semantic_match_tree path value =
+  let* tag = kind path value in
+  match tag with
+  | "leaf" ->
+      let* bindings = list_field decode_match_binding path "bindings" value in
+      let* body = decode_expr_field path "body" value in
+      Ok (Core.CTLeaf { ct_bindings = bindings; ct_body = body })
+  | "fail" -> Ok Core.CTFail
+  | "constructor" ->
+      let* accessor_json = field path "accessor" value in
+      let* cts_scrut = decode_accessor (path_field path "accessor") accessor_json in
+      let decode_case case_path case =
+        let* constructor = string_field case_path "constructor" case in
+        let* body_json = field case_path "body" case in
+        let* body =
+          decode_semantic_match_tree (path_field case_path "body") body_json
+        in
+        Ok (constructor, body)
+      in
+      let* cts_cases = list_field decode_case path "cases" value in
+      let* fallback_json = field path "fallback" value in
+      let* cts_default =
+        optional decode_semantic_match_tree (path_field path "fallback")
+          fallback_json
+      in
+      Ok (Core.CTSwitchTag { cts_scrut; cts_cases; cts_default })
+  | "literal" ->
+      let* accessor_json = field path "accessor" value in
+      let* ctl_scrut = decode_accessor (path_field path "accessor") accessor_json in
+      let decode_case case_path case =
+        let* literal_json = field case_path "literal" case in
+        let* literal =
+          decode_literal (path_field case_path "literal") literal_json
+        in
+        let* body_json = field case_path "body" case in
+        let* body =
+          decode_semantic_match_tree (path_field case_path "body") body_json
+        in
+        Ok (literal, body)
+      in
+      let* ctl_cases = list_field decode_case path "cases" value in
+      let* fallback_json = field path "fallback" value in
+      let* ctl_default =
+        decode_semantic_match_tree (path_field path "fallback") fallback_json
+      in
+      Ok (Core.CTSwitchLit { ctl_scrut; ctl_cases; ctl_default })
+  | "length" ->
+      let* accessor_json = field path "accessor" value in
+      let* ctl_len_scrut =
+        decode_accessor (path_field path "accessor") accessor_json
+      in
+      let decode_case case_path case =
+        let* length = int_field case_path "length" case in
+        let* body_json = field case_path "body" case in
+        let* body =
+          decode_semantic_match_tree (path_field case_path "body") body_json
+        in
+        Ok (length, body)
+      in
+      let decode_geq geq_path geq =
+        let* minimum_length = int_field geq_path "minimum_length" geq in
+        let* body_json = field geq_path "body" geq in
+        let* body =
+          decode_semantic_match_tree (path_field geq_path "body") body_json
+        in
+        Ok (minimum_length, body)
+      in
+      let* ctl_len_cases = list_field decode_case path "cases" value in
+      let* geq_json = field path "geq" value in
+      let* ctl_len_geq =
+        optional decode_geq (path_field path "geq") geq_json
+      in
+      let* fallback_json = field path "fallback" value in
+      let* ctl_len_default =
+        optional decode_semantic_match_tree (path_field path "fallback")
+          fallback_json
+      in
+      Ok
+        (Core.CTSwitchLen
+           { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default })
+  | _ ->
+      error (path_field path "kind")
+        ("unsupported semantic match tree `" ^ tag ^ "`")
+
+and decode_precompiled_constructor_match_expr path value =
+  let* release_policy =
+    string_field path "scrutinee_release_policy" value
+  in
+  let* () =
+    if release_policy = "none" then Ok ()
+    else
+      error (path_field path "scrutinee_release_policy")
+        "precompiled constructor match must not own its scrutinee"
+  in
   let* scrutinee = decode_expr_field path "scrutinee" value in
   let decode_case case_path case =
-    let* literal_json = field case_path "literal" case in
-    let* literal = decode_literal (path_field case_path "literal") literal_json in
+    let* constructor = string_field case_path "constructor" case in
     let* bindings = list_field decode_match_binding case_path "bindings" case in
-    let* body = decode_expr_field case_path "body" case in
-    Ok (literal, Core.CTLeaf { ct_bindings = bindings; ct_body = body })
+    let* body_json = field case_path "body" case in
+    let* body =
+      decode_precompiled_constructor_match_body
+        (path_field case_path "body") body_json
+    in
+    Ok (constructor, prepend_match_bindings bindings body)
   in
   let* cases = list_field decode_case path "cases" value in
   let* fallback_json = field path "fallback" value in
-  let* fallback = decode_match_fallback (path_field path "fallback") fallback_json in
+  let* fallback =
+    decode_precompiled_match_fallback (path_field path "fallback")
+      fallback_json
+  in
+  let default = match fallback with Core.CTFail -> None | tree -> Some tree in
   decode_typed_expr path value
     (Core.CMatch
-       (scrutinee, Core.CTSwitchLit { ctl_scrut = Core.AccRoot; ctl_cases = cases; ctl_default = fallback }))
+       ( scrutinee,
+         Core.CTSwitchTag
+           {
+             cts_scrut = Core.AccRoot;
+             cts_cases = cases;
+             cts_default = default;
+           } ))
 
-and decode_match_fallback path value =
+and decode_precompiled_constructor_match_body path value =
+  let* tag = kind path value in
+  match tag with
+  | "expr" ->
+      let* body = decode_expr_field path "expr" value in
+      Ok (Core.CTLeaf { ct_bindings = []; ct_body = body })
+  | _ ->
+      error (path_field path "kind")
+        ("precompiled constructor match body `" ^ tag ^ "` is not valid at the post-match boundary")
+
+and decode_precompiled_match_fallback path value =
   let* tag = kind path value in
   match tag with
   | "body" ->
@@ -932,59 +1009,59 @@ and decode_match_fallback path value =
       let* body = decode_expr_field path "body" value in
       Ok (Core.CTLeaf { ct_bindings = bindings; ct_body = body })
   | "fail" -> Ok Core.CTFail
-  | _ -> error (path_field path "kind") ("unsupported match fallback `" ^ tag ^ "`")
+  | _ ->
+      error (path_field path "kind")
+        ("precompiled constructor match fallback `" ^ tag ^ "` is not valid at the post-match boundary")
 
-and prepend_bindings bindings tree =
+and prepend_match_bindings bindings tree =
   match tree with
-  | Core.CTLeaf leaf -> Core.CTLeaf { leaf with ct_bindings = bindings @ leaf.ct_bindings }
+  | Core.CTLeaf leaf ->
+      Core.CTLeaf
+        { leaf with ct_bindings = bindings @ leaf.ct_bindings }
   | Core.CTFail -> Core.CTFail
   | Core.CTSwitchTag switch ->
       Core.CTSwitchTag
         {
           switch with
-          cts_cases = List.map (fun (tag, tree) -> (tag, prepend_bindings bindings tree)) switch.cts_cases;
-          cts_default = Option.map (prepend_bindings bindings) switch.cts_default;
+          cts_cases =
+            List.map
+              (fun (tag, branch) ->
+                (tag, prepend_match_bindings bindings branch))
+              switch.cts_cases;
+          cts_default =
+            Option.map (prepend_match_bindings bindings)
+              switch.cts_default;
         }
   | Core.CTSwitchLit switch ->
       Core.CTSwitchLit
         {
           switch with
-          ctl_cases = List.map (fun (lit, tree) -> (lit, prepend_bindings bindings tree)) switch.ctl_cases;
-          ctl_default = prepend_bindings bindings switch.ctl_default;
+          ctl_cases =
+            List.map
+              (fun (literal, branch) ->
+                (literal, prepend_match_bindings bindings branch))
+              switch.ctl_cases;
+          ctl_default =
+            prepend_match_bindings bindings switch.ctl_default;
         }
   | Core.CTSwitchLen switch ->
       Core.CTSwitchLen
         {
           switch with
-          ctl_len_cases = List.map (fun (n, tree) -> (n, prepend_bindings bindings tree)) switch.ctl_len_cases;
-          ctl_len_geq = Option.map (fun (n, tree) -> (n, prepend_bindings bindings tree)) switch.ctl_len_geq;
-          ctl_len_default = Option.map (prepend_bindings bindings) switch.ctl_len_default;
+          ctl_len_cases =
+            List.map
+              (fun (length, branch) ->
+                (length, prepend_match_bindings bindings branch))
+              switch.ctl_len_cases;
+          ctl_len_geq =
+            Option.map
+              (fun (length, branch) ->
+                (length, prepend_match_bindings bindings branch))
+              switch.ctl_len_geq;
+          ctl_len_default =
+            Option.map (prepend_match_bindings bindings)
+              switch.ctl_len_default;
         }
-
-and decode_constructor_match_expr path value =
-  let* scrutinee = decode_expr_field path "scrutinee" value in
-  let decode_case case_path case =
-    let* constructor = string_field case_path "constructor" case in
-    let* bindings = list_field decode_match_binding case_path "bindings" case in
-    let* body_json = field case_path "body" case in
-    let* body = decode_constructor_match_body (path_field case_path "body") body_json in
-    Ok (constructor, prepend_bindings bindings body)
-  in
-  let* cases = list_field decode_case path "cases" value in
-  let* fallback_json = field path "fallback" value in
-  let* fallback = decode_match_fallback (path_field path "fallback") fallback_json in
-  let default = match fallback with Core.CTFail -> None | tree -> Some tree in
-  decode_typed_expr path value
-    (Core.CMatch
-       (scrutinee, Core.CTSwitchTag { cts_scrut = Core.AccRoot; cts_cases = cases; cts_default = default }))
-
-and decode_constructor_match_body path value =
-  let* tag = kind path value in
-  match tag with
-  | "expr" ->
-      let* body = decode_expr_field path "expr" value in
-      Ok (Core.CTLeaf { ct_bindings = []; ct_body = body })
-  | _ -> error (path_field path "kind") ("nested match body `" ^ tag ^ "` is not yet accepted")
 
 let decode_function_kind path value =
   let* tag = kind path value in
@@ -1006,7 +1083,7 @@ let decode_function_kind path value =
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
   | _ ->
       error (path_field path "kind")
-        ("function kind `" ^ tag ^ "` is not valid post-synthesis")
+        ("function kind `" ^ tag ^ "` is not valid post-match")
 
 let decode_function path value =
   let* name = string_field path "name" value in

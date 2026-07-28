@@ -75,16 +75,11 @@ let container_loop tag binder_type iterable body extra_fields =
   kind tag
     [ (tag, loop); ("type", void_type); ("loc", synthetic_loc) ]
 
-let raw_match_pattern kind_name fields = kind kind_name fields
-
-let raw_match_case pattern body =
-  Lsp_json.Object [ ("pattern", pattern); ("body", body) ]
-
-let raw_match scrutinee cases =
-  kind "raw_match"
+let semantic_match scrutinee tree =
+  kind "semantic_match"
     [
       ("scrutinee", scrutinee);
-      ("cases", Lsp_json.Array cases);
+      ("tree", tree);
       ("type", int_type);
       ("loc", synthetic_loc);
     ]
@@ -140,11 +135,11 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_post_synth_json.decode_program json with
+  match Core_post_match_json.decode_program json with
   | Ok decoded -> decoded
-  | Error error -> Alcotest.fail (Core_post_synth_json.decode_error_to_string error)
+  | Error error -> Alcotest.fail (Core_post_match_json.decode_error_to_string error)
 
-let test_decodes_post_synth_program () =
+let test_decodes_post_match_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -191,8 +186,8 @@ let test_rejects_late_ownership_node () =
       ]
   in
   let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
-  match Core_post_synth_json.decode_program json with
-  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-synth boundary"
+  match Core_post_match_json.decode_program json with
+  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-match boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -330,7 +325,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_post_synth_json.decode_program json with
+  match Core_post_match_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -504,28 +499,209 @@ let test_preserves_impl_type_param_bounds_for_remaining_middle () =
       Alcotest.fail
         "generic impl bounds were not preserved at the post-mono handoff"
 
-let test_decodes_raw_patterns_for_middle_match_compilation () =
-  let constructor =
-    raw_match_pattern "constructor"
+let test_decodes_semantic_match_tree () =
+  let root_accessor = kind "root" [] in
+  let payload_accessor =
+    kind "variant_field"
       [
-        ("name", Lsp_json.String "Some");
-        ( "args",
-          Lsp_json.Array
-            [ raw_match_pattern "name" [ ("name", Lsp_json.String "value") ] ] );
+        ("parent", root_accessor);
+        ("constructor", Lsp_json.String "Some");
+        ("field_index", Lsp_json.Int 0);
       ]
   in
-  let fallback = raw_match_pattern "wildcard" [] in
-  let body =
-    raw_match (variable_expr "input")
-      [ raw_match_case constructor (variable_expr "value"); raw_match_case fallback (int_literal 0) ]
+  let some_leaf =
+    kind "leaf"
+      [
+        ( "bindings",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("variable", variable "value");
+                  ("accessor", payload_accessor);
+                  ("mode", Lsp_json.String "borrow");
+                ];
+            ] );
+        ("body", variable_expr "value");
+      ]
   in
+  let fallback =
+    kind "leaf" [ ("bindings", Lsp_json.Array []); ("body", int_literal 0) ]
+  in
+  let tree =
+    kind "constructor"
+      [
+        ("accessor", root_accessor);
+        ( "cases",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("constructor", Lsp_json.String "Some");
+                  ("body", some_leaf);
+                ];
+            ] );
+        ("fallback", fallback);
+      ]
+  in
+  let body = semantic_match (variable_expr "input") tree in
   let decoded = decode_exn (program [ function_decl ~body:(Some body) "main" 1 ]) in
   match decoded.core with
-  | [ { Core.cd_desc = Core.CDFunc { cf_body = Some { desc = Core.CMatchArms (_, arms); _ }; _ }; _ } ] -> (
-      match arms with
-      | [ (Ast.PatConstructor ("Some", [ Ast.PatVar "value" ]), _); (Ast.PatWildcard, _) ] -> ()
-      | _ -> Alcotest.fail "raw match patterns changed across the Core boundary")
-  | _ -> Alcotest.fail "expected raw Core match arms"
+  | [
+   {
+     Core.cd_desc =
+       Core.CDFunc
+         {
+           cf_body =
+             Some
+               {
+                 desc =
+                   Core.CMatch
+                     ( _,
+                       Core.CTSwitchTag
+                         {
+                           cts_cases =
+                             [
+                               ( "Some",
+                                 Core.CTLeaf
+                                   {
+                                     ct_bindings =
+                                       [
+                                         {
+                                           mb_accessor =
+                                             Core.AccVariantField
+                                               (Core.AccRoot, "Some", 0);
+                                           mb_mode = Core.MatchBorrow;
+                                           _;
+                                         };
+                                       ];
+                                     _;
+                                   } );
+                             ];
+                           cts_default = Some (Core.CTLeaf _);
+                           _;
+                         } );
+                 _;
+               };
+           _;
+         };
+     _;
+   };
+  ] ->
+      ()
+  | _ -> Alcotest.fail "semantic match tree changed across the Core boundary"
+
+let precompiled_constructor_match ?(bindings = []) release_policy =
+  let case =
+    Lsp_json.Object
+      [
+        ("constructor", Lsp_json.String "Some");
+        ("accessor", kind "root" []);
+        ("test", kind "nullable_option" []);
+        ("bindings", Lsp_json.Array bindings);
+        ("body", kind "expr" [ ("expr", int_literal 1) ]);
+      ]
+  in
+  kind "constructor_match"
+    [
+      ("scrutinee", variable_expr "input");
+      ("scrutinee_release_policy", Lsp_json.String release_policy);
+      ("cases", Lsp_json.Array [ case ]);
+      ("fallback", kind "body" [ ("body", int_literal 0) ]);
+      ("type", int_type);
+      ("loc", synthetic_loc);
+    ]
+
+let test_decodes_precompiled_constructor_match () =
+  let body = precompiled_constructor_match "none" in
+  match (decoded_body_exn body).desc with
+  | Core.CMatch
+      ( _,
+        Core.CTSwitchTag
+          {
+            cts_cases = [ ("Some", Core.CTLeaf _) ];
+            cts_default = Some (Core.CTLeaf _);
+            _;
+          } ) ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "precompiled constructor match changed across the post-match boundary"
+
+let test_decodes_specialized_match_accessor () =
+  let binding =
+    Lsp_json.Object
+      [
+        ("variable", variable "value");
+        ("type", int_type);
+        ( "accessor",
+          kind "stack_result_ok_payload" [ ("parent", kind "root" []) ] );
+        ("mode", Lsp_json.String "borrow");
+      ]
+  in
+  let body = precompiled_constructor_match ~bindings:[ binding ] "none" in
+  match (decoded_body_exn body).desc with
+  | Core.CMatch
+      ( _,
+        Core.CTSwitchTag
+          {
+            cts_cases =
+              [
+                ( "Some",
+                  Core.CTLeaf
+                    {
+                      ct_bindings =
+                        [
+                          {
+                            mb_accessor =
+                              Core.AccVariantField (Core.AccRoot, "Ok", 0);
+                            _;
+                          };
+                        ];
+                      _;
+                    } );
+              ];
+            _;
+          } ) ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "specialized match accessor changed across the post-match boundary"
+
+let test_rejects_ownership_bearing_constructor_match () =
+  let body = precompiled_constructor_match "arc" in
+  match
+    Core_post_match_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Ok _ ->
+      Alcotest.fail
+        "ownership-bearing constructor match crossed the post-match boundary"
+  | Error error ->
+      Alcotest.(check string) "path"
+        "program.decls[0].body.scrutinee_release_policy" error.path;
+      Alcotest.(check bool) "diagnostic explains ownership restriction" true
+        (Modules.contains error.message "must not own")
+
+let test_rejects_raw_match () =
+  let body =
+    kind "raw_match"
+      [
+        ("scrutinee", variable_expr "input");
+        ("cases", Lsp_json.Array []);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  match
+    Core_post_match_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Ok _ -> Alcotest.fail "raw match crossed the post-match boundary"
+  | Error error ->
+      Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
+      Alcotest.(check bool) "diagnostic names rejected form" true
+        (Modules.contains error.message "raw_match")
 
 let test_preserves_pre_mono_type_structure () =
   let dim_var name = kind "runtime" [ ("name", Lsp_json.String name) ] in
@@ -789,7 +965,7 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes post-synth program" `Quick test_decodes_post_synth_program;
+        Alcotest.test_case "decodes post-match program" `Quick test_decodes_post_match_program;
         Alcotest.test_case "preserves union payload storage" `Quick
           test_preserves_union_payload_storage;
         Alcotest.test_case "rejects later ownership node" `Quick
@@ -809,8 +985,15 @@ let suite =
           `Quick test_preserves_selected_trait_target_for_ocaml_middle;
         Alcotest.test_case "preserves impl type parameter bounds for remaining middle"
           `Quick test_preserves_impl_type_param_bounds_for_remaining_middle;
-        Alcotest.test_case "decodes raw match patterns" `Quick
-          test_decodes_raw_patterns_for_middle_match_compilation;
+        Alcotest.test_case "decodes semantic match tree" `Quick
+          test_decodes_semantic_match_tree;
+        Alcotest.test_case "decodes precompiled constructor match" `Quick
+          test_decodes_precompiled_constructor_match;
+        Alcotest.test_case "decodes specialized match accessor" `Quick
+          test_decodes_specialized_match_accessor;
+        Alcotest.test_case "rejects ownership-bearing constructor match" `Quick
+          test_rejects_ownership_bearing_constructor_match;
+        Alcotest.test_case "rejects raw match" `Quick test_rejects_raw_match;
         Alcotest.test_case "preserves pre-mono type structure" `Quick
           test_preserves_pre_mono_type_structure;
         Alcotest.test_case "preserves unresolved type identity" `Quick

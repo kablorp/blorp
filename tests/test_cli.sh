@@ -257,6 +257,8 @@ repeat_test="$TMPDIR_CLI/repeat_test.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
 internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
+profiled_c="$TMPDIR_CLI/profiled.c"
+resolved_identity_prog="$TMPDIR_CLI/resolved_identity.brp"
 late_core_dump="$TMPDIR_CLI/late-core.dump"
 late_stopped_c="$TMPDIR_CLI/late-stopped.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
@@ -290,6 +292,22 @@ cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
 	0
+BRP
+
+cat > "$resolved_identity_prog" <<'BRP'
+import:
+	channel: SendAttempt(SendAccepted), try_send_attempt
+
+
+func main(args: List[String]) -> Int:
+	ch: Channel[Int] = channel(1)
+	attempt: SendAttempt = try_send_attempt(ch, 7)
+
+	match attempt:
+		SendAccepted:
+			0
+		_:
+			1
 BRP
 : > "$empty_prog"
 
@@ -601,6 +619,17 @@ expect_exit "internal synthetic executable build uses production compiler" 0 \
 	"$BLORP_BIN" __compiler-build-synthetic-executable \
 	"$valid_prog" "$valid_prog" "$internal_synthetic_binary"
 expect_exit "internal synthetic executable runs" 0 "$internal_synthetic_binary"
+expect_exit "compile profile success" 0 \
+	"$BLORP_BIN" compile --profile --no-format -o "$profiled_c" "$valid_prog"
+TOTAL=$((TOTAL + 1))
+if grep -qF 'blorp_profile_start("main")' "$profiled_c" \
+	&& grep -qF 'atexit(blorp_profile_report)' "$profiled_c"
+then
+	record_pass "compile profile emits runtime hooks"
+else
+	record_fail "compile profile emits runtime hooks" \
+		"missing function-level profile hooks in $profiled_c"
+fi
 expect_exit "compile bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"
@@ -610,7 +639,7 @@ expect_output_contains "compile AST bypasses semantic worker" 0 "Func main" \
 expect_output_contains "compile stops in Blorp-owned Core tail" 0 "stopped after dce" \
 	"$BLORP_BIN" compile --no-format \
 		--dump-core-after=dce --dump-core-file="$late_core_dump" \
-		--stop-after=dce -o "$late_stopped_c" "$valid_prog"
+		--stop-after=dce -o "$late_stopped_c" "$resolved_identity_prog"
 TOTAL=$((TOTAL + 1))
 if [ -f "$late_core_dump" ] \
 	&& grep -qF "===== after dce =====" "$late_core_dump" \
@@ -619,6 +648,57 @@ if [ -f "$late_core_dump" ] \
 else
 	record_fail "compile writes Blorp-owned late Core dump" \
 		"missing or invalid $late_core_dump"
+fi
+TOTAL=$((TOTAL + 1))
+if [ -f "$late_core_dump" ] && python3 - "$late_core_dump" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as dump_file:
+    program = json.loads(next(line for line in dump_file if line.startswith("{")))
+
+target_ids = {
+    declaration["def_id"]
+    for declaration in program["decls"]
+    if declaration.get("kind") == "function"
+    and (
+        declaration.get("name") == "std_channel__try_send_attempt"
+        or declaration.get("name", "").startswith(
+            "std_channel__try_send_attempt__mono_"
+        )
+    )
+}
+main = next(
+    declaration
+    for declaration in program["decls"]
+    if declaration.get("kind") == "function"
+    and declaration.get("name") == "main"
+)
+
+
+def calls_retained_target(value):
+    if isinstance(value, dict):
+        call_kind = value.get("call_kind")
+        if (
+            value.get("kind") == "call"
+            and isinstance(call_kind, dict)
+            and call_kind.get("def_id") in target_ids
+        ):
+            return True
+        return any(calls_retained_target(child) for child in value.values())
+    if isinstance(value, list):
+        return any(calls_retained_target(child) for child in value)
+    return False
+
+
+if not target_ids or not calls_retained_target(main.get("body")):
+    raise SystemExit(1)
+PY
+then
+	record_pass "resolved std call and retained declaration share identity"
+else
+	record_fail "resolved std call and retained declaration share identity" \
+		"no resolved call targeted the retained std declaration in $late_core_dump"
 fi
 TOTAL=$((TOTAL + 1))
 if [ ! -e "$late_stopped_c" ]; then

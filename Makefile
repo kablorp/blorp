@@ -112,6 +112,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 	parser_bridge="$${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}"; \
 	typecheck_bridge="$${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}"; \
 	require_prepared_bridge="$${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}"; \
+	bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-compiler-path); \
 	helper_override_count=0; \
 	for bridge_path in "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
 		if [ -n "$$bridge_path" ]; then helper_override_count=$$((helper_override_count + 1)); fi; \
@@ -136,7 +137,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$(OCAML_HOST)" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 		for bridge_path in "$$bridge_compiler" "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
 			if [ -n "$$bridge_path" ]; then printf '%s\n' "$$bridge_path"; fi; \
 		done; \
@@ -155,7 +156,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 			BLORP_COMPILER_PARSER_BRIDGE_BIN="$$parser_bridge" \
 			BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$$typecheck_bridge" \
 			BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE="$$require_prepared_bridge" \
-			"$(OCAML_HOST)" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+			"$$bootstrap_compiler" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \

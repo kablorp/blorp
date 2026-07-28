@@ -251,32 +251,6 @@ type t = {
   meta_env : (int, type_expr) Hashtbl.t;
       (** Meta-id → its bound type. [None] (i.e. not in the table) = unbound.
       Unbound metas post-inference are "cannot infer" errors. *)
-  (* -- Core IR pass counters (per-compilation scratch state) -- *)
-  mutable lower_destruct_counter : int;
-      (** Next [__dt_N] id used by [Core_lower] when desugaring tuple
-      destructuring patterns into [let __dt = e in …]. *)
-  mutable lower_param_counter : int;
-      (** Next [__p_N] id used by [Core_lower] when generating pattern-
-      parameter temps for nested patterns in function params. *)
-  mutable lower_question_bind_counter : int;
-      (** Next [__qb_N] id used by [Core_lower] when desugaring direct [?=]
-      binds into [CLet]/[CMatchArms] chains. *)
-  mutable lower_resource_counter : int;
-      (** Next [__resource_N] id used by [Core_lower] for anonymous resource
-      guards and internal payload names in fallible resource acquisition. *)
-  mutable lower_task_scope_counter : int;
-      (** Next child task-scope id used by [Core_lower] when lowering
-      structured task-spawning constructs. Scope id 0 is reserved for the
-      root task. *)
-  mutable lower_current_task_scope_id : int;
-      (** Current lexical task scope while [Core_lower] recursively lowers
-      nested task bodies. The root task scope is id 0. *)
-  mutable desugar_counter : int;
-      (** Next fresh-id used by [Core_desugar] for CRecordUpdate
-      temporaries and string-interp rewriting. *)
-  mutable ssa_mut_counter : int;
-      (** Next [_vN] version used by [Core_ssa] to SSA-rename mutable
-      variables during straight-line reassignment unrolling. *)
       (* Lexer state is NOT on the session — see the lexer-state comment
      above the module loading section. *)
 }
@@ -306,42 +280,12 @@ let create () : t =
     fresh_meta_counter = 0;
     meta_origin = [];
     meta_env = Hashtbl.create 64;
-    lower_destruct_counter = 0;
-    lower_param_counter = 0;
-    lower_question_bind_counter = 0;
-    lower_resource_counter = 0;
-    lower_task_scope_counter = 1;
-    lower_current_task_scope_id = 0;
-    desugar_counter = 0;
-    ssa_mut_counter = 0;
   }
 
-(** Reset per-compilation counters. Called by [Core_pipeline] at the
-    start of each compile so fresh-name generation doesn't accumulate
-    across independent invocations within the same process (batch
-    test runner, REPL, long-lived LSP session). *)
-let reset_core_counters (s : t) : unit =
-  s.lower_destruct_counter <- 0;
-  s.lower_param_counter <- 0;
-  s.lower_question_bind_counter <- 0;
-  s.lower_resource_counter <- 0;
-  s.lower_task_scope_counter <- 1;
-  s.lower_current_task_scope_id <- 0;
-  s.desugar_counter <- 0;
-  s.ssa_mut_counter <- 0;
-  (* Reset [def_id_counter] too so repeated compiles of the same source yield
-     identical mangled symbols. Without the reset, a second compile produces
-     shifted DefIds and different C output, breaking stable generated-C audits
-     and any future output-cache checks. Typecheck-time DefIds
-     ([ol_def_id] / [ii_def_id] / [td_def_id]) are not affected —
-     those are minted during module load, which happens before
-     [Core_pipeline.compile_typed] runs. *)
-  s.def_id_counter <- 0
-
 (** Ensure the next generated definition id is at least [floor]. Source
-    definition ids can arrive from a serialized frontend graph rather than
-    this process's counter. The typed-to-Core boundary reserves their range
-    before lowering mints globals, lambdas, and specializations. *)
+    definition ids can arrive from serialized Core rather than this process's
+    counter. The semantic-worker boundary reserves their range before running
+    passes that may mint generated definitions. *)
 let reserve_def_id_floor (s : t) (floor : int) : unit =
   if floor < 0 then invalid_arg "Session.reserve_def_id_floor: negative floor";
   if s.def_id_counter < floor then s.def_id_counter <- floor
@@ -385,7 +329,7 @@ let reset_compilation_state_preserving_parse_cache (s : t) : unit =
   Hashtbl.clear s.ufcs_methods;
   s.builtins_populated <- false;
   reset_meta s;
-  reset_core_counters s
+  s.def_id_counter <- 0
 
 (* ============================================================================
    Trait registry

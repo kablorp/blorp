@@ -505,6 +505,18 @@ private RANGE_EXPR_TAG: String = "range"
 
 private RAW_MATCH_EXPR_TAG: String = "raw_match"
 
+private SEMANTIC_MATCH_EXPR_TAG: String = "semantic_match"
+
+private SEMANTIC_MATCH_LEAF_TAG: String = "leaf"
+
+private SEMANTIC_MATCH_FAIL_TAG: String = "fail"
+
+private SEMANTIC_MATCH_CONSTRUCTOR_TAG: String = "constructor"
+
+private SEMANTIC_MATCH_LITERAL_TAG: String = "literal"
+
+private SEMANTIC_MATCH_LENGTH_TAG: String = "length"
+
 private LITERAL_MATCH_EXPR_TAG: String = "literal_match"
 
 private ACCESSOR_LITERAL_MATCH_EXPR_TAG: String = "accessor_literal_match"
@@ -1058,6 +1070,7 @@ union CoreExpr:
 	SelectExpr(List[CoreSelectArm], CoreType, CoreSourceLoc)
 	RangeExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	RawMatchExpr(CoreExpr, List[CoreRawMatchCase], CoreType, CoreSourceLoc)
+	SemanticMatchExpr(CoreExpr, CoreSemanticMatchTree, CoreType, CoreSourceLoc)
 	LiteralMatchExpr(CoreExpr, List[CoreLiteralMatchCase], CoreLiteralMatchFallback, CoreType, CoreSourceLoc)
 	AccessorLiteralMatchExpr(CoreExpr, CoreReleasePolicy, CoreConstructorLiteralMatch, CoreType, CoreSourceLoc)
 	LengthMatchExpr(CoreExpr, CoreReleasePolicy, CoreConstructorLengthMatch, CoreType, CoreSourceLoc)
@@ -1069,6 +1082,53 @@ record CoreRawMatchCase {
 	pattern: CorePattern,
 	body: CoreExpr
 }
+
+
+union CoreSemanticMatchAccessor:
+	RootSemanticMatchAccessor
+	VariantFieldSemanticMatchAccessor(CoreSemanticMatchAccessor, String, Int)
+	TupleFieldSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
+	ListElementSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
+	ListSpreadSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
+
+
+record CoreSemanticMatchBinding {
+	variable: CoreVar,
+	accessor: CoreSemanticMatchAccessor,
+	mode: CoreMatchBindingMode
+}
+
+
+record CoreSemanticConstructorMatchCase {
+	constructor: String,
+	body: CoreSemanticMatchTree
+}
+
+
+record CoreSemanticLiteralMatchCase {
+	literal: CoreLiteral,
+	body: CoreSemanticMatchTree
+}
+
+
+record CoreSemanticLengthMatchCase {
+	length: Int,
+	body: CoreSemanticMatchTree
+}
+
+
+record CoreSemanticLengthMatchGeq {
+	minimum_length: Int,
+	body: CoreSemanticMatchTree
+}
+
+
+union CoreSemanticMatchTree:
+	SemanticMatchLeaf(List[CoreSemanticMatchBinding], CoreExpr)
+	SemanticMatchFail
+	SemanticConstructorMatch(CoreSemanticMatchAccessor, List[CoreSemanticConstructorMatchCase], Option[CoreSemanticMatchTree])
+	SemanticLiteralMatch(CoreSemanticMatchAccessor, List[CoreSemanticLiteralMatchCase], CoreSemanticMatchTree)
+	SemanticLengthMatch(CoreSemanticMatchAccessor, List[CoreSemanticLengthMatchCase], Option[CoreSemanticLengthMatchGeq], Option[CoreSemanticMatchTree])
 
 
 pure func core_expr_type(expr: CoreExpr) -> CoreType:
@@ -1230,6 +1290,8 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		RangeExpr(start, end_value, typ, loc):
 			typ
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			typ
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			typ
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			typ
@@ -2312,6 +2374,39 @@ private pure func object_field(
 
 private pure func kind_field(value: JsonValue, path: String) -> Result[String, CoreJsonError]:
 	string_field(value, path, KIND_FIELD)
+
+
+private pure func decode_json_array_field[T](
+	value: JsonValue,
+	path: String,
+	field_name: String,
+	decoder: pure (JsonValue, String) -> Result[T, CoreJsonError],
+) -> Result[List[T], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[T] = []
+	var failure: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if failure.is_none():
+			item_path: String = path_index(
+				path_field(path, field_name),
+				index,
+			)
+
+			match decoder(item, item_path):
+				Ok(decoded):
+					result = result.append(decoded)
+				Err(error):
+					failure = Some(error)
+
+		index += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func decode_optional_string(
@@ -9219,6 +9314,115 @@ private pure func core_raw_match_case_to_json(match_case: CoreRawMatchCase) -> J
 	])
 
 
+pure func core_semantic_match_accessor_to_json(accessor: CoreSemanticMatchAccessor) -> JsonValue:
+	match accessor:
+		RootSemanticMatchAccessor:
+			JsonObject([(KIND_FIELD, JsonString(ROOT_ACCESSOR_TAG))])
+		VariantFieldSemanticMatchAccessor(parent, constructor, field_index):
+			JsonObject([
+				(KIND_FIELD, JsonString(VARIANT_FIELD_ACCESSOR_TAG)),
+				("parent", core_semantic_match_accessor_to_json(parent)),
+				("constructor", JsonString(constructor)),
+				("field_index", json_int(field_index)),
+			])
+		TupleFieldSemanticMatchAccessor(parent, index):
+			JsonObject([
+				(KIND_FIELD, JsonString(TUPLE_FIELD_ACCESSOR_TAG)),
+				("parent", core_semantic_match_accessor_to_json(parent)),
+				("index", json_int(index)),
+			])
+		ListElementSemanticMatchAccessor(parent, index):
+			JsonObject([
+				(KIND_FIELD, JsonString(LIST_ELEMENT_ACCESSOR_TAG)),
+				("parent", core_semantic_match_accessor_to_json(parent)),
+				("index", json_int(index)),
+			])
+		ListSpreadSemanticMatchAccessor(parent, offset):
+			JsonObject([
+				(KIND_FIELD, JsonString(LIST_SPREAD_ACCESSOR_TAG)),
+				("parent", core_semantic_match_accessor_to_json(parent)),
+				("offset", json_int(offset)),
+			])
+
+
+private pure func core_semantic_match_binding_to_json(
+	binding: CoreSemanticMatchBinding,
+) -> JsonValue:
+	JsonObject([
+		("variable", core_var_to_json(binding.variable)),
+		("accessor", core_semantic_match_accessor_to_json(binding.accessor)),
+		("mode", core_match_binding_mode_to_json(binding.mode)),
+	])
+
+
+private pure func optional_core_semantic_match_tree_to_json(
+	tree: Option[CoreSemanticMatchTree],
+) -> JsonValue:
+	match tree:
+		Some(existing_tree):
+			core_semantic_match_tree_to_json(existing_tree)
+		None:
+			JsonNull
+
+
+pure func core_semantic_match_tree_to_json(tree: CoreSemanticMatchTree) -> JsonValue:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			JsonObject([
+				(KIND_FIELD, JsonString(SEMANTIC_MATCH_LEAF_TAG)),
+				("bindings", JsonVector(bindings.map(core_semantic_match_binding_to_json))),
+				("body", core_expr_to_json(body)),
+			])
+		SemanticMatchFail:
+			JsonObject([(KIND_FIELD, JsonString(SEMANTIC_MATCH_FAIL_TAG))])
+		SemanticConstructorMatch(accessor, cases, fallback):
+			JsonObject([
+				(KIND_FIELD, JsonString(SEMANTIC_MATCH_CONSTRUCTOR_TAG)),
+				("accessor", core_semantic_match_accessor_to_json(accessor)),
+				("cases", JsonVector(cases.map(
+						func(match_case): JsonObject([
+							("constructor", JsonString(match_case.constructor)),
+							("body", core_semantic_match_tree_to_json(match_case.body)),
+						]),
+					))),
+				("fallback", optional_core_semantic_match_tree_to_json(fallback)),
+			])
+		SemanticLiteralMatch(accessor, cases, fallback):
+			JsonObject([
+				(KIND_FIELD, JsonString(SEMANTIC_MATCH_LITERAL_TAG)),
+				("accessor", core_semantic_match_accessor_to_json(accessor)),
+				("cases", JsonVector(cases.map(
+						func(match_case): JsonObject([
+							("literal", core_literal_to_json(match_case.literal)),
+							("body", core_semantic_match_tree_to_json(match_case.body)),
+						]),
+					))),
+				("fallback", core_semantic_match_tree_to_json(fallback)),
+			])
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			geq_json: JsonValue = match geq:
+				Some(geq_case):
+					JsonObject([
+						("minimum_length", json_int(geq_case.minimum_length)),
+						("body", core_semantic_match_tree_to_json(geq_case.body)),
+					])
+				None:
+					JsonNull
+
+			JsonObject([
+				(KIND_FIELD, JsonString(SEMANTIC_MATCH_LENGTH_TAG)),
+				("accessor", core_semantic_match_accessor_to_json(accessor)),
+				("cases", JsonVector(cases.map(
+						func(match_case): JsonObject([
+							("length", json_int(match_case.length)),
+							("body", core_semantic_match_tree_to_json(match_case.body)),
+						]),
+					))),
+				("geq", geq_json),
+				("fallback", optional_core_semantic_match_tree_to_json(fallback)),
+			])
+
+
 private pure func core_expr_raw_match_to_json(
 	scrutinee: CoreExpr,
 	cases: List[CoreRawMatchCase],
@@ -9229,6 +9433,21 @@ private pure func core_expr_raw_match_to_json(
 		(KIND_FIELD, JsonString(RAW_MATCH_EXPR_TAG)),
 		("scrutinee", core_expr_to_json(scrutinee)),
 		("cases", JsonVector(cases.map(core_raw_match_case_to_json))),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
+private pure func core_expr_semantic_match_to_json(
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(SEMANTIC_MATCH_EXPR_TAG)),
+		("scrutinee", core_expr_to_json(scrutinee)),
+		("tree", core_semantic_match_tree_to_json(tree)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -9490,6 +9709,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_range_to_json(start, end_value, typ, loc)
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			core_expr_raw_match_to_json(scrutinee, cases, typ, loc)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			core_expr_semantic_match_to_json(scrutinee, tree, typ, loc)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			core_expr_literal_match_to_json(scrutinee, cases, fallback, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
@@ -11546,6 +11767,241 @@ private pure func decode_core_raw_match_cases(
 			Ok(cases)
 
 
+private pure func decode_core_semantic_match_accessor_parent(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticMatchAccessor, CoreJsonError]:
+	parent_json ?= object_field(value, path, "parent")
+	decode_core_semantic_match_accessor_json(
+		parent_json,
+		path_field(path, "parent"),
+	)
+
+
+pure func decode_core_semantic_match_accessor_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticMatchAccessor, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == ROOT_ACCESSOR_TAG:
+		Ok(RootSemanticMatchAccessor)
+	else if tag == VARIANT_FIELD_ACCESSOR_TAG:
+		parent ?= decode_core_semantic_match_accessor_parent(value, path)
+		constructor ?= string_field(value, path, "constructor")
+		field_index ?= int_field(value, path, "field_index")
+		Ok(VariantFieldSemanticMatchAccessor(parent, constructor, field_index))
+	else if tag == TUPLE_FIELD_ACCESSOR_TAG:
+		parent ?= decode_core_semantic_match_accessor_parent(value, path)
+		index ?= int_field(value, path, "index")
+		Ok(TupleFieldSemanticMatchAccessor(parent, index))
+	else if tag == LIST_ELEMENT_ACCESSOR_TAG:
+		parent ?= decode_core_semantic_match_accessor_parent(value, path)
+		index ?= int_field(value, path, "index")
+		Ok(ListElementSemanticMatchAccessor(parent, index))
+	else if tag == LIST_SPREAD_ACCESSOR_TAG:
+		parent ?= decode_core_semantic_match_accessor_parent(value, path)
+		offset ?= int_field(value, path, "offset")
+		Ok(ListSpreadSemanticMatchAccessor(parent, offset))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+private pure func decode_core_semantic_match_binding_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticMatchBinding, CoreJsonError]:
+	variable_json ?= object_field(value, path, "variable")
+	variable ?= decode_core_var_json(
+		variable_json,
+		path_field(path, "variable"),
+	)
+	accessor_json ?= object_field(value, path, "accessor")
+	accessor ?= decode_core_semantic_match_accessor_json(
+		accessor_json,
+		path_field(path, "accessor"),
+	)
+	mode_json ?= required_field(value, path, "mode")
+	mode ?= decode_core_match_binding_mode_json(
+		mode_json,
+		path_field(path, "mode"),
+	)
+
+	Ok({
+		variable = variable,
+		accessor = accessor,
+		mode = mode,
+	})
+
+
+private pure func decode_core_semantic_constructor_match_case_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticConstructorMatchCase, CoreJsonError]:
+	constructor ?= string_field(value, path, "constructor")
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_semantic_match_tree_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	Ok({
+		constructor = constructor,
+		body = body,
+	})
+
+
+private pure func decode_core_semantic_literal_match_case_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticLiteralMatchCase, CoreJsonError]:
+	literal_json ?= object_field(value, path, "literal")
+	literal ?= decode_core_literal_json(
+		literal_json,
+		path_field(path, "literal"),
+	)
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_semantic_match_tree_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	Ok({
+		literal = literal,
+		body = body,
+	})
+
+
+private pure func decode_core_semantic_length_match_case_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticLengthMatchCase, CoreJsonError]:
+	length ?= int_field(value, path, "length")
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_semantic_match_tree_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	Ok({
+		length = length,
+		body = body,
+	})
+
+
+private pure func decode_optional_core_semantic_match_tree_json(
+	value: JsonValue,
+	path: String,
+) -> Result[Option[CoreSemanticMatchTree], CoreJsonError]:
+	match value:
+		JsonNull:
+			Ok(None)
+		_:
+			tree ?= decode_core_semantic_match_tree_json(value, path)
+			Ok(Some(tree))
+
+
+private pure func decode_optional_core_semantic_length_match_geq_json(
+	value: JsonValue,
+	path: String,
+) -> Result[Option[CoreSemanticLengthMatchGeq], CoreJsonError]:
+	match value:
+		JsonNull:
+			Ok(None)
+		_:
+			minimum_length ?= int_field(value, path, "minimum_length")
+			body_json ?= object_field(value, path, "body")
+			body ?= decode_core_semantic_match_tree_json(
+				body_json,
+				path_field(path, "body"),
+			)
+			Ok(Some({
+				minimum_length = minimum_length,
+				body = body,
+			}))
+
+
+pure func decode_core_semantic_match_tree_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSemanticMatchTree, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == SEMANTIC_MATCH_LEAF_TAG:
+		bindings ?= decode_json_array_field(
+			value,
+			path,
+			"bindings",
+			decode_core_semantic_match_binding_json,
+		)
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		Ok(SemanticMatchLeaf(bindings, body))
+	else if tag == SEMANTIC_MATCH_FAIL_TAG:
+		Ok(SemanticMatchFail)
+	else if tag == SEMANTIC_MATCH_CONSTRUCTOR_TAG:
+		accessor_json ?= object_field(value, path, "accessor")
+		accessor ?= decode_core_semantic_match_accessor_json(
+			accessor_json,
+			path_field(path, "accessor"),
+		)
+		cases ?= decode_json_array_field(
+			value,
+			path,
+			"cases",
+			decode_core_semantic_constructor_match_case_json,
+		)
+		fallback_json ?= object_field(value, path, "fallback")
+		fallback ?= decode_optional_core_semantic_match_tree_json(
+			fallback_json,
+			path_field(path, "fallback"),
+		)
+		Ok(SemanticConstructorMatch(accessor, cases, fallback))
+	else if tag == SEMANTIC_MATCH_LITERAL_TAG:
+		accessor_json ?= object_field(value, path, "accessor")
+		accessor ?= decode_core_semantic_match_accessor_json(
+			accessor_json,
+			path_field(path, "accessor"),
+		)
+		cases ?= decode_json_array_field(
+			value,
+			path,
+			"cases",
+			decode_core_semantic_literal_match_case_json,
+		)
+		fallback_json ?= object_field(value, path, "fallback")
+		fallback ?= decode_core_semantic_match_tree_json(
+			fallback_json,
+			path_field(path, "fallback"),
+		)
+		Ok(SemanticLiteralMatch(accessor, cases, fallback))
+	else if tag == SEMANTIC_MATCH_LENGTH_TAG:
+		accessor_json ?= object_field(value, path, "accessor")
+		accessor ?= decode_core_semantic_match_accessor_json(
+			accessor_json,
+			path_field(path, "accessor"),
+		)
+		cases ?= decode_json_array_field(
+			value,
+			path,
+			"cases",
+			decode_core_semantic_length_match_case_json,
+		)
+		geq_json ?= object_field(value, path, "geq")
+		geq ?= decode_optional_core_semantic_length_match_geq_json(
+			geq_json,
+			path_field(path, "geq"),
+		)
+		fallback_json ?= object_field(value, path, "fallback")
+		fallback ?= decode_optional_core_semantic_match_tree_json(
+			fallback_json,
+			path_field(path, "fallback"),
+		)
+		Ok(SemanticLengthMatch(accessor, cases, geq, fallback))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 private pure func decode_core_expr_raw_match_from_json(
 	value: JsonValue,
 	path: String,
@@ -11568,6 +12024,33 @@ private pure func decode_core_expr_raw_match_from_json(
 	)
 
 	Ok(RawMatchExpr(scrutinee, cases, typ, loc))
+
+
+private pure func decode_core_expr_semantic_match_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	scrutinee_json ?= object_field(value, path, "scrutinee")
+	scrutinee ?= decode_core_expr_json(
+		scrutinee_json,
+		path_field(path, "scrutinee"),
+	)
+	tree_json ?= object_field(value, path, "tree")
+	tree ?= decode_core_semantic_match_tree_json(
+		tree_json,
+		path_field(path, "tree"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(SemanticMatchExpr(scrutinee, tree, typ, loc))
 
 
 private pure func decode_core_expr_literal_match_from_json(
@@ -11888,6 +12371,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_range_from_json(value, path)
 	else if tag == RAW_MATCH_EXPR_TAG:
 		decode_core_expr_raw_match_from_json(value, path)
+	else if tag == SEMANTIC_MATCH_EXPR_TAG:
+		decode_core_expr_semantic_match_from_json(value, path)
 	else if tag == LITERAL_MATCH_EXPR_TAG:
 		decode_core_expr_literal_match_from_json(value, path)
 	else if tag == ACCESSOR_LITERAL_MATCH_EXPR_TAG:

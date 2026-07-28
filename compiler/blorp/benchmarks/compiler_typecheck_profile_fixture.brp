@@ -1,5 +1,7 @@
 -- Bounded in-process workload for profiling the self-hosted typechecker.
 import:
+	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_03_parse/compiler_source_ast_finalize: FinalizedTypecheckProgram
 	../src/stage_05_types/compiler_context: CompilerModuleOrigin(CompilerUserModule)
 	../src/stage_06_typecheck/compiler_typecheck_bridge:
 		CompilerTypecheckedGraph,
@@ -12,7 +14,8 @@ record CompilerTypecheckBenchmarkConfig {
 	iterations: Int,
 	module_count: Int,
 	type_depth: Int,
-	probes_per_module: Int
+	probes_per_module: Int,
+	retain_parsed_programs: Bool
 }
 
 
@@ -68,14 +71,30 @@ private pure func benchmark_module(
 	module_index: Int,
 	type_depth: Int,
 	probes_per_module: Int,
+	retain_parsed_programs: Bool,
 ) -> TypecheckImportModule:
 	module_name: String = benchmark_module_name(module_index)
+	path: String = "/bench/typecheck_profile_" + module_index.to_string() + ".brp"
+	source: String = benchmark_module_source(module_index, type_depth, probes_per_module)
+
+	typecheck_program: Option[FinalizedTypecheckProgram] = if retain_parsed_programs:
+		Some(
+			ParserBridge.parsed_typecheck_source_bridge_artifact(
+				path,
+				module_name,
+				source,
+				False,
+			).program,
+		)
+	else:
+		None
 
 	{
-		path = "/bench/typecheck_profile_" + module_index.to_string() + ".brp",
+		path = path,
 		module_name = module_name,
 		module_path = module_name,
-		text = benchmark_module_source(module_index, type_depth, probes_per_module),
+		text = source,
+		typecheck_program = typecheck_program,
 		origin = CompilerUserModule
 	}
 
@@ -87,16 +106,38 @@ pure func compiler_typecheck_benchmark_request(
 	var module_targets: List[String] = []
 
 	for module_index in 0..config.module_count:
-		module = benchmark_module(module_index, config.type_depth, config.probes_per_module)
+		module = benchmark_module(
+			module_index,
+			config.type_depth,
+			config.probes_per_module,
+			config.retain_parsed_programs,
+		)
 		modules = modules.append(module)
 		module_targets = module_targets.append(module.module_path)
 
+	target_path: String = "/bench/typecheck_profile_main.brp"
+	target_module: String = "bench/typecheck_profile_main"
+	target_source: String = "func main(args: List[String]) -> Int:\n\t0\n"
+
+	target_program: Option[FinalizedTypecheckProgram] = if config.retain_parsed_programs:
+		Some(
+			ParserBridge.parsed_typecheck_source_bridge_artifact(
+				target_path,
+				target_module,
+				target_source,
+				False,
+			).program,
+		)
+	else:
+		None
+
 	{
 		target = {
-			path = "/bench/typecheck_profile_main.brp",
-			module_name = "bench/typecheck_profile_main",
-			module_path = "bench/typecheck_profile_main",
-			text = "func main(args: List[String]) -> Int:\n\t0\n",
+			path = target_path,
+			module_name = target_module,
+			module_path = target_module,
+			text = target_source,
+			typecheck_program = target_program,
 			origin = CompilerUserModule
 		},
 		modules = modules,
@@ -136,10 +177,10 @@ private pure func typechecked_graph_source_declaration_count(
 	count
 
 
-pure func compiler_typecheck_benchmark(
+pure func compiler_typecheck_benchmark_with_request(
 	config: CompilerTypecheckBenchmarkConfig,
+	request: TypecheckGraphRequest,
 ) -> CompilerTypecheckBenchmarkResult:
-	request: TypecheckGraphRequest = compiler_typecheck_benchmark_request(config)
 	expected_artifact_count: Int = config.module_count + 1
 	expected_declaration_count: Int = config.module_count * (config.type_depth + config.probes_per_module) + 1
 	var artifact_count: Int = 0
@@ -172,3 +213,10 @@ pure func compiler_typecheck_benchmark(
 		checksum = checksum,
 		workload_valid = workload_valid
 	}
+
+
+pure func compiler_typecheck_benchmark(
+	config: CompilerTypecheckBenchmarkConfig,
+) -> CompilerTypecheckBenchmarkResult:
+	request: TypecheckGraphRequest = compiler_typecheck_benchmark_request(config)
+	compiler_typecheck_benchmark_with_request(config, request)

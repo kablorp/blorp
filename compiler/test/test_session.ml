@@ -1203,14 +1203,6 @@ let test_reusable_reset_preserves_only_parse_cache () =
   s.fresh_meta_counter <- 3;
   s.meta_origin <- [ (1, "T") ];
   Hashtbl.add s.meta_env 1 Types.ty_int;
-  s.lower_destruct_counter <- 1;
-  s.lower_param_counter <- 1;
-  s.lower_question_bind_counter <- 1;
-  s.lower_resource_counter <- 1;
-  s.lower_task_scope_counter <- 4;
-  s.lower_current_task_scope_id <- 2;
-  s.desugar_counter <- 1;
-  s.ssa_mut_counter <- 1;
   Session.reset_compilation_state_preserving_parse_cache s;
   Alcotest.(check bool)
     "parse cache preserved" true
@@ -1239,16 +1231,7 @@ let test_reusable_reset_preserves_only_parse_cache () =
   Alcotest.(check int) "def ids reset" 0 s.def_id_counter;
   Alcotest.(check int) "meta counter reset" 0 s.fresh_meta_counter;
   Alcotest.(check int) "meta origins cleared" 0 (List.length s.meta_origin);
-  Alcotest.(check int) "meta env cleared" 0 (Hashtbl.length s.meta_env);
-  Alcotest.(check int) "lower destruct reset" 0 s.lower_destruct_counter;
-  Alcotest.(check int) "lower param reset" 0 s.lower_param_counter;
-  Alcotest.(check int)
-    "question bind reset" 0 s.lower_question_bind_counter;
-  Alcotest.(check int) "resource reset" 0 s.lower_resource_counter;
-  Alcotest.(check int) "task counter reset" 1 s.lower_task_scope_counter;
-  Alcotest.(check int) "task scope reset" 0 s.lower_current_task_scope_id;
-  Alcotest.(check int) "desugar reset" 0 s.desugar_counter;
-  Alcotest.(check int) "ssa reset" 0 s.ssa_mut_counter
+  Alcotest.(check int) "meta env cleared" 0 (Hashtbl.length s.meta_env)
 
 let test_modules_reset_clears_type_index () =
   let s = Session.create () in

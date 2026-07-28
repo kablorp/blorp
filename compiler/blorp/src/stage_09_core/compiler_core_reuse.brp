@@ -124,8 +124,10 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
+			RawMatchExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
+			SemanticMatchExpr,
 			SelectExpr,
 			SeqExpr,
 			SetAllocExpr,
@@ -382,6 +384,8 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			False
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			False
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			False
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			False
@@ -918,6 +922,8 @@ private pure func owner_touched(target: CoreVar, expr: CoreExpr) -> Bool:
 			True
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			True
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			True
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			True
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
@@ -1114,6 +1120,8 @@ private pure func contains_resource_scope(expr: CoreExpr) -> Bool:
 			True
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			True
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			True
 
 
 private pure func exprs_contain_resource_scope(exprs: List[CoreExpr]) -> Bool:
@@ -1191,6 +1199,8 @@ private pure func is_collection_allocation(expr: CoreExpr) -> Bool:
 		CooperativeCheckpointExpr(typ, loc):
 			False
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			False
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			False
 		BinaryExpr(op, left, right, typ, loc):
 			False
@@ -1426,6 +1436,8 @@ private pure func reuse_alloc_rhs(
 			None
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			None
 		BinaryExpr(op, left, right, typ, loc):
 			None
 		UnaryExpr(op, inner, typ, loc):
@@ -1595,6 +1607,8 @@ private pure func consume_handoff_rhs(
 			else:
 				None
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			None
 		LiteralExpr(literal, typ, loc):
 			None
@@ -1769,6 +1783,8 @@ private pure func rewrite_drop_body(
 ) -> Option[CoreExpr]:
 	match body:
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			None
 		LetExpr(variable, is_mutable, value_type, rhs, rest):
 			if owner_touched(dropped_var, rhs) or contains_resource_scope(rhs):
@@ -2001,6 +2017,8 @@ private pure func consume_handoff_in_linear_expr(
 ) -> Option[CoreExpr]:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			None
 		LetExpr(variable, is_mutable, value_type, rhs, rest):
 			match consume_handoff_rhs(dropped_var, dropped_type, rhs):
@@ -2255,6 +2273,14 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		LetExpr(variable, is_mutable, value_type, rhs, body):
 			match body:
 				RawMatchExpr(scrutinee, cases, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				SemanticMatchExpr(scrutinee, tree, typ, loc):
 					LetExpr(
 						variable,
 						is_mutable,
@@ -2568,6 +2594,8 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 				typ,
 				loc,
 			)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
 				rewrite_post_perceus_expr(cond),
@@ -3086,6 +3114,11 @@ pure func result_may_alias_source(
 				result_may_alias_source(source_name, aliases, scrutinee)
 				or cases.any(func(case): result_may_alias_source(source_name, aliases, case.body))
 			)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			CoreTraverse.any_core_expr(
+				CoreTraverse.immediate_core_expr_children(expr),
+				func(child): result_may_alias_source(source_name, aliases, child),
+			)
 		LiteralExpr(literal, typ, loc):
 			False
 		VarExpr(variable, typ, loc):
@@ -3486,6 +3519,8 @@ pure func rewrite_prepared_union_result(
 ) -> Option[CoreExpr]:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
+			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
 			if (
@@ -4229,6 +4264,8 @@ pure func rewrite_prepared_drop_result(
 		match binding_rhs:
 			RawMatchExpr(scrutinee, cases, typ, loc):
 				None
+			SemanticMatchExpr(scrutinee, tree, typ, loc):
+				None
 			ConstructorMatchExpr(source, scrutinee_release_policy, cases, fallback, match_type, match_loc):
 				if core_expr_is_var(source, dropped_var):
 					rewritten_cases ?= rewrite_constructor_match_cases(
@@ -4436,6 +4473,8 @@ private pure func rewrite_prepared_let_drop(
 	match body:
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			None
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			None
 		DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
 			rewrite_prepared_drop_result(
 				decls,
@@ -4620,6 +4659,8 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 				typ,
 				loc,
 			)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			CoreTraverse.map_core_expr_children_with_context(expr, decls, rewrite_prepared_expr)
 		LetExpr(variable, is_mutable, value_type, rhs, body):
 			rewritten_rhs: CoreExpr = rewrite_prepared_expr(decls, rhs)
 			rewritten_body: CoreExpr = rewrite_prepared_expr(decls, body)

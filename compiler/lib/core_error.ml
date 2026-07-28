@@ -11,18 +11,17 @@
       open Core_error
 
       errorf
-        (Stage Core_stage.Lower)
-        expr.expr_loc
-        ~hint:"every expression must be typed before lowering — \
-               run inference before entering Core lowering"
-        "expression missing type"
+        (Stage Core_stage.Specialize)
+        expr.loc
+        ~hint:"resolve every call before specialization"
+        "call target is unresolved"
     ]}
 
     At a compiler boundary, catch [Core_error] and translate its structured
     fields into the boundary's diagnostic type:
 
     {[
-      try Core_lower.lower_typed_program typed_prog
+      try Core_specialize.specialize_program ~reg core_program
       with Core_error { phase; msg; loc; hint } ->
         report_core_error ~phase ~message:msg ~loc ~hint
     ]} *)

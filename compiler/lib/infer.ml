@@ -9326,8 +9326,8 @@ and infer_call ctx expr callee args loc =
                                           (* A3.3 UFCS handoff: encode the selected
                               overload's [ol_def_id] directly in the
                               mangled identifier as a ["#<id>"] suffix.
-                              [Core_lower] strips the suffix into
-                              [Core.var.vdef_id], letting downstream
+                              Blorp Core lowering strips the suffix into the
+                              Core variable definition id, letting downstream
                               passes recover the exact overload identity
                               without a session-level side-channel. Two
                               call sites that select *different*

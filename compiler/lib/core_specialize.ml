@@ -1,9 +1,9 @@
 (** Post-resolve specialization of type-dispatched builtins.
 
-    Runs after [Core_resolve] (calls are tagged) and after [Core_mono]
-    (types are concrete).  Rewrites generic builtins like [blorp_to_int]
-    into [CCast] nodes or concrete builtin names based on the argument
-    type.
+    Runs after [Core_resolve] (calls are tagged) and after Blorp
+    monomorphization (types are concrete). Rewrites generic builtins like
+    [blorp_to_int] into [CCast] nodes or concrete builtin names based on the
+    argument type.
 
     This keeps the backend free of type dispatch: [CCast] reaches emission as
     a C cast, and [CKBuiltin] calls already carry their resolved names. *)
@@ -1939,9 +1939,7 @@ let rec specialize_expr ~reg (e : core) : core =
                   [ self; f; int_lit e.loc elem_needs_release ] );
           }
       | None ->
-          let fallback = Core_intrinsics.list_filter_map self.ty e.ty self f in
-          let ctors = Core_match.collect_constructor_names [] in
-          Core_match.compile_expr ~ctors fallback)
+          Core_specialize_fallback.list_filter_map self.ty e.ty self f)
   (* List parallel maps/zips return a fresh list. Append a runtime flag that
      says whether the erased result slots own ARC-managed storage. This is
      deliberately not pointer classification: value records are unmanaged by

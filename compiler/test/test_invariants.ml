@@ -566,86 +566,6 @@ let test_sugar_check_passes_on_clean_program () =
   let violations = Core_invariants.check_no_sugar prog in
   Alcotest.(check int) "no violations" 0 (List.length violations)
 
-let bind ?(mut = false) name ty rhs =
-  { bind_var = Var.named name; bind_mut = mut; bind_ty = ty; bind_rhs = rhs }
-
-let test_mutation_check_flags_no_assignment_mutable_let () =
-  let body =
-    mk
-      (CLet
-         ( bind ~mut:true "x" ty_int (mk (CLit (LitInt 1L)) ty_int),
-           mk (CVar (Var.named "x")) ty_int ))
-      ty_int
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.check_no_desugarable_mutation prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions mutable binding" true
-        (Modules.contains v.Core_error.msg "mutable local binding");
-      Alcotest.(check bool)
-        "phase tag is Desugar" true
-        (v.Core_error.phase = Core_error.Stage Core_stage.Desugar)
-  | _ -> Alcotest.fail "unreachable"
-
-let test_mutation_check_flags_straight_line_assignment () =
-  let assign =
-    mk (CAssign (Var.named "x", mk (CLit (LitInt 2L)) ty_int)) ty_void
-  in
-  let body =
-    mk
-      (CLet
-         ( bind ~mut:true "x" ty_int (mk (CLit (LitInt 1L)) ty_int),
-           mk (CSeq (assign, mk (CVar (Var.named "x")) ty_int)) ty_int ))
-      ty_int
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.check_no_desugarable_mutation prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
-      Alcotest.(check bool)
-        "mentions straight-line" true
-        (Modules.contains v.Core_error.msg "straight-line mutable assignment")
-  | _ -> Alcotest.fail "unreachable"
-
-let test_mutation_check_allows_control_flow_assignment () =
-  let assign =
-    mk (CAssign (Var.named "x", mk (CLit (LitInt 2L)) ty_int)) ty_void
-  in
-  let branch =
-    mk
-      (CIf (mk (CLit (LitBool true)) ty_bool, assign, mk CVoid ty_void))
-      ty_void
-  in
-  let body =
-    mk
-      (CLet (bind ~mut:true "x" ty_int (mk (CLit (LitInt 1L)) ty_int), branch))
-      ty_void
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.check_no_desugarable_mutation prog in
-  Alcotest.(check int)
-    "control-flow mutation is not this invariant" 0 (List.length violations)
-
-let test_dispatcher_desugar_runs_mutation_check () =
-  let body =
-    mk
-      (CLet
-         ( bind ~mut:true "x" ty_int (mk (CLit (LitInt 1L)) ty_int),
-           mk (CVar (Var.named "x")) ty_int ))
-      ty_int
-  in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.run_for_stage Core_stage.Desugar prog in
-  Alcotest.(check bool)
-    "desugar flags mutable local" true
-    (List.exists
-       (fun v -> Modules.contains v.Core_error.msg "mutable local binding")
-       violations)
-
 (* ============================================================================
    Post-match: no raw CMatchArms survives
    ============================================================================ *)
@@ -1554,35 +1474,6 @@ let test_dispatcher_final_runs_cooperative_checkpoint_check () =
    Pipeline integration: ~check_invariants fires the checks
    ============================================================================ *)
 
-let small_source =
-  {|
-func inc(x: Int) -> Int:
-    x + 1
-
-func main(args: List[String]) -> Int:
-    inc(41)
-|}
-
-let lower_source src =
-  let program = Test_helpers.parse_program src in
-  match Blorp.Typecheck.typecheck_typed program with
-  | Ok typed_program -> typed_program
-  | Error errors ->
-      Alcotest.failf "expected no type errors, got: %s"
-        (String.concat "; "
-           (List.map (fun (e : Blorp.Ast.compiler_error) -> e.message) errors))
-
-let test_pipeline_check_invariants_passes_on_clean_code () =
-  (* The happy path: a well-formed program runs through the pipeline
-     with ~check_invariants:true and produces no Core_error. *)
-  let prog = lower_source small_source in
-  match Core_pipeline.compile_typed ~check_invariants:true prog with
-  | _c_code -> () (* no exception = pass *)
-  | exception Core_error.Core_error err ->
-      Alcotest.failf "unexpected invariant violation [%s]: %s"
-        (Core_error.phase_tag_to_string err.phase)
-        err.msg
-
 let test_make_stage_hook_raises_on_violation () =
   (* Prove [make_stage_hook] runs the invariant check BEFORE the user
      callback. When violations exist, the user callback does NOT fire
@@ -2253,17 +2144,6 @@ let suite =
         Alcotest.test_case "clean passes" `Quick
           test_debug_check_passes_on_clean_program;
       ] );
-    ( "desugarable_mutation",
-      [
-        Alcotest.test_case "flags no-assignment mutable let" `Quick
-          test_mutation_check_flags_no_assignment_mutable_let;
-        Alcotest.test_case "flags straight-line assignment" `Quick
-          test_mutation_check_flags_straight_line_assignment;
-        Alcotest.test_case "allows control-flow assignment" `Quick
-          test_mutation_check_allows_control_flow_assignment;
-        Alcotest.test_case "dispatcher runs mutation check" `Quick
-          test_dispatcher_desugar_runs_mutation_check;
-      ] );
     ( "cmatcharms",
       [
         Alcotest.test_case "flags raw CMatchArms" `Quick
@@ -2384,8 +2264,6 @@ let suite =
       ] );
     ( "pipeline",
       [
-        Alcotest.test_case "clean code passes" `Quick
-          test_pipeline_check_invariants_passes_on_clean_code;
         Alcotest.test_case "hook raises on violation" `Quick
           test_make_stage_hook_raises_on_violation;
         Alcotest.test_case "hook silent when disabled" `Quick
