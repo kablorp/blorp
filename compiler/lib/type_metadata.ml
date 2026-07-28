@@ -113,8 +113,6 @@ let builtin_to_string_scalar_names =
     "Bool";
     "Char";
     "Bytes";
-    "StringSlice";
-    "Url";
     "Fixed";
   ]
 

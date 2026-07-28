@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-25.
+Status checked against code on 2026-07-27.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -1561,6 +1561,11 @@ Current status:
 - Source-command checks now typecheck the in-memory graph directly in Blorp and
   never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
   wrapper and its duplicate adapter tests have been deleted.
+- `std/tuple` is an ambient implementation module alongside the implicit
+  prelude source. The source graph loads it without creating a source-level
+  import, and typecheck registers its impls without exposing a `tuple` alias or
+  unqualified declarations. Tuple trait behavior therefore does not depend on
+  an incidental user import.
 - `Pipeline.compile_preloaded_graph_with_blorp_bridge` is now a bounded
   bootstrap compatibility boundary. Only
   `blorp_ocaml_host __compiler-host-compile-wrapper` calls it in production;
@@ -2025,6 +2030,11 @@ Current progress:
   forward declarations converge on the bodied callable's qualified name and
   body-preference deduplication removes the declaration-only duplicate, which
   preserves the std pure/impure forward-declaration pattern.
+- Collapsing a bodyless overload onto its implementation also produces an
+  explicit external callable alias. Graph preparation applies those aliases
+  after assembly, keyed by the exact UFCS source name and selected definition
+  id, so imported references converge on the surviving callable without
+  treating a colliding id from another module as equivalent.
 - `compiler_core_flatten.brp` also owns global and type declaration prefixing,
   canonical module type names, declaration deduplication, and exact-reference
   rewriting. It rewrites every module-local type use together with its
@@ -2291,8 +2301,9 @@ formation are also Blorp-authoritative at that boundary. They live together in
 the loop bound used by the raw-access proof; numeric reads select typed or
 erased runtime ABIs and inject static dimensions for ranked access; typed
 vector/matrix writes and `Int`/`Float`/`Float32` fills select concrete runtime
-names; `norm`, `sqrt`, `exp`, and `log` select `Float`, `Float32`, or `Float16`
-runtime ABIs from their tensor receiver; `max` and `min` select `Int`, `Float`,
+names; `norm`, `sqrt`, `exp`, `log`, and `abs` select the runtime ABI from
+their tensor receiver, including imported scalar-math calls that retain
+selected or user-call identity; `max` and `min` select `Int`, `Float`,
 `Float32`, or `Float16` reduction ABIs; and runtime storage plus COW uniqueness
 guards retain the original loop as a fallback. Core JSON canonicalizes aliases
 and all ordinary source tensor spellings before this pass. Packed fills,
@@ -2653,6 +2664,9 @@ Implementation steps:
   - zero-argument static trait methods use their result type as the receiver;
   - bound impls and demands found in newly specialized impl bodies are drained
     to a fixed point;
+  - builtin `List[T]` string conversion also records the nested `Stringable[T]`
+    demand before synthesis, so the concrete element impl is available when
+    the list body is materialized;
   - specialized methods receive fresh definition IDs, and selected direct or
     selected trait calls plus variable references among those methods are
     rewritten together. Rewrites require the original ID and explicit

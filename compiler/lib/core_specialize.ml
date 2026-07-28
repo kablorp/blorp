@@ -281,8 +281,6 @@ let specialize_to_string ~reg (e : core) callee arg : core =
         |> tensor_to_string_builtin
       in
       builtin ts_fn
-  | Ast.TyNamed ("StringSlice", _) -> builtin "Stringable_to_string_StringSlice"
-  | Ast.TyNamed ("Url", _) -> builtin "Stringable_to_string_Url"
   | Ast.TyNamed ("Fixed", _) -> builtin "blorp_fixed_to_string"
   | _ ->
       (* No Stringable impl for this type.  The [to_string] sentinel was
