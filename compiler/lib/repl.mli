@@ -5,6 +5,6 @@
     synthetic source program and runs it through the standard compile
     pipeline. *)
 
-val run : debug:bool -> unit
+val run : compiler_path:string -> debug:bool -> unit
 (** Start the REPL loop.  Reads from stdin, writes to stdout/stderr.
     Returns when the user types [:quit], [:q], or Ctrl-D. *)

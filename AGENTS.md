@@ -352,10 +352,9 @@ comparisons with extra defensive parentheses are benign. `-Wunsequenced` and
 `-Wincompatible-pointer-types` warnings are not accepted in the preview warning
 sweep; regressions for those classes live in the codegen audit suite.
 
-`./blorp test --warmup-only` must succeed before parallel gates. The OCaml unit
-suite includes a regression proving the content-addressed precompiled runtime
-cache reuses an existing verified `runtime.o` instead of recompiling C on a
-second lookup.
+`./blorp test --warmup-only` must succeed before parallel gates. Warmup compiles
+a minimal program through the production Blorp executable, populating the same
+Blorp-owned runtime cache used by subsequent test artifacts.
 
 ## CLI Usage
 

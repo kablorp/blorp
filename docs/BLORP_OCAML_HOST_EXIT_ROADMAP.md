@@ -603,7 +603,18 @@ Goal: reproduce `Test_runner` compilation behavior in maintainable Blorp code.
 
 Status: implementation complete on this branch. Exact host-C policy, typed
 host/toolchain discovery, the verified runtime CAS, and production compile/run
-assembly are Blorp-owned. Full platform-gate validation remains.
+assembly are Blorp-owned. As of 2026-07-27, tests, doctests, generated
+TestSuite harnesses, warmup, sanitizer/leak runs, and REPL evaluations also
+compile through this production path. The OCaml test runner no longer invokes
+`cc` or maintains a separate runtime cache. Full platform-gate validation
+remains.
+
+The OCaml per-test result cache was also removed during this cutover. Its
+transitive dependency set came from the in-process OCaml module table, which
+external production compilation no longer populates. Keeping it would allow a
+passing result to survive changes to imported local modules. A future cache
+requires the production compiler to return an explicit dependency manifest;
+the runner must not infer that graph independently.
 
 New Blorp files:
 
@@ -611,7 +622,7 @@ New Blorp files:
 - `compiler/blorp/src/stage_12_cli/compiler_runtime_cache.brp`
 - `compiler/blorp/src/stage_12_cli/compiler_platform.brp`
 
-OCaml references to study exactly:
+Historical OCaml references removed after the production cutover:
 
 - `Test_runner.compile_c_from_stdin`
 - `Test_runner.sanitizer_cc_args`
@@ -809,12 +820,20 @@ Deferred solely for the pinned bootstrap wrapper:
 - graph finalization into `Modules.preloaded_module_graph`; and
 - the narrow `run_bootstrap_compile` semantic-pipeline call.
 
+The direct-source and generated in-memory compatibility compilers have been
+deleted. The pinned-bootstrap wrapper is now the only production caller of
+`Pipeline.compile_preloaded_graph_with_blorp_bridge`. A direct compile probe
+with pinned release `dev-9d291f28ee87` exits 139 on the current
+`compiler_cli_main.brp`; rotate to a bootstrap that passes that probe before
+deleting the wrapper or its early-Core compatibility modules.
+
 Do not delete yet:
 
 - OCaml match-through-specialize passes used by `blorp-ocaml-middle`;
-- OCaml synthesis retained by bootstrap and in-memory compatibility callers;
-- OCaml Core lowering retained solely by the pinned-bootstrap wrapper and
-  direct in-memory compatibility tests;
+- OCaml synthesis retained by the pinned bootstrap wrapper and direct
+  compatibility tests;
+- OCaml Core lowering retained solely by the pinned-bootstrap wrapper and its
+  compatibility tests;
 - their behavior-focused tests until the corresponding semantic stage ports;
 - bridge decoders required solely by the pinned bootstrap, unless the
   bootstrap ratchet has removed that requirement; or

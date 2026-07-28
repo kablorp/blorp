@@ -36,6 +36,14 @@ record ProgramRunRequest {
 }
 
 
+record ProgramBuildRequest {
+	artifact: BuildArtifact,
+	host: HostCConfiguration,
+	runtime: HostRuntimeInput,
+	output_path: String,
+}
+
+
 record ProgramRunResult {
 	exit: Process.ProcessExit,
 	executable_path: String,
@@ -51,6 +59,11 @@ union ProgramRunError:
 	ProgramProcessFailed(Process.ProcessError)
 
 
+union ProgramBuildError:
+	ProgramBuildHostPreparationFailed(HostCPreparationError)
+	ProgramBuildHostCompilationFailed(HostCCompileError)
+
+
 pure func program_run_error_message(error: ProgramRunError) -> String:
 	match error:
 		ProgramTemporaryDirectoryFailed(io_error):
@@ -61,6 +74,14 @@ pure func program_run_error_message(error: ProgramRunError) -> String:
 			host_c_compile_error_message(compile_error)
 		ProgramProcessFailed(process_error):
 			"cannot run compiled program: ${process_error.to_string()}"
+
+
+pure func program_build_error_message(error: ProgramBuildError) -> String:
+	match error:
+		ProgramBuildHostPreparationFailed(preparation_error):
+			host_c_preparation_error_message(preparation_error)
+		ProgramBuildHostCompilationFailed(compile_error):
+			host_c_compile_error_message(compile_error)
 
 
 private pure func program_environment(
@@ -131,24 +152,40 @@ pure func program_exit_status(exit: Process.ProcessExit) -> Int:
 			124
 
 
+func build_artifact_executable(
+	request: ProgramBuildRequest,
+) -> Result[String, ProgramBuildError]:
+	prepared ?= prepare_host_c_compilation(
+		request.artifact,
+		request.output_path,
+		request.host,
+		request.runtime,
+	).map_err(
+		func(error: HostCPreparationError): ProgramBuildHostPreparationFailed(error),
+	)
+
+	run_host_c_compilation(prepared).map_err(
+		func(error: HostCCompileError): ProgramBuildHostCompilationFailed(error),
+	)
+
+
 func run_build_artifact(request: ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError]:
 	with compilation_directory ?= temporary_directory(
 		request.temporary_root,
 		"blorp_run_",
 	) on error => ProgramTemporaryDirectoryFailed(error):
 		executable_path: String = compilation_directory.resource_path() + "/program.bin"
-		prepared ?= prepare_host_c_compilation(
-			request.artifact,
-			executable_path,
-			request.host,
-			request.runtime,
-		).map_err(
-			func(error: HostCPreparationError): ProgramHostPreparationFailed(error),
-		)
-		compiled_path ?= run_host_c_compilation(
-			prepared,
-		).map_err(
-			func(error: HostCCompileError): ProgramHostCompilationFailed(error),
+		compiled_path ?= build_artifact_executable({
+			artifact = request.artifact,
+			host = request.host,
+			runtime = request.runtime,
+			output_path = executable_path,
+		}).map_err(func(error: ProgramBuildError):
+			match error:
+				ProgramBuildHostPreparationFailed(preparation_error):
+					ProgramHostPreparationFailed(preparation_error)
+				ProgramBuildHostCompilationFailed(compile_error):
+					ProgramHostCompilationFailed(compile_error)
 		)
 		program = prepare_program_command(
 			compiled_path,

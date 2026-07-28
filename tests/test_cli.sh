@@ -256,6 +256,7 @@ timeout_test="$TMPDIR_CLI/timeout_test.brp"
 repeat_test="$TMPDIR_CLI/repeat_test.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
+internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
 late_core_dump="$TMPDIR_CLI/late-core.dump"
 late_stopped_c="$TMPDIR_CLI/late-stopped.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
@@ -596,6 +597,10 @@ PY
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
+expect_exit "internal synthetic executable build uses production compiler" 0 \
+	"$BLORP_BIN" __compiler-build-synthetic-executable \
+	"$valid_prog" "$valid_prog" "$internal_synthetic_binary"
+expect_exit "internal synthetic executable runs" 0 "$internal_synthetic_binary"
 expect_exit "compile bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"

@@ -1,13 +1,13 @@
-(** Tests for doctest loc remapping.
+(** Tests for doctest source mapping.
 
     A doctest runs inside a synthetic program built by
     [Test_runner.generate_doctest_program], so any diagnostic the
     compiler emits points at the synthetic source — wrong line numbers,
     wrong snippets relative to the user's real source. These tests
-    guard the end-to-end remap that makes errors land on the original
-    source's line instead.
+    guard the source-map contract needed to make errors land on the
+    original source's line.
 
-    Four invariants:
+    Three invariants:
       1. [extract_doctests_from_doc] preserves per-line origin line
          numbers through its strip/split/filter passes.
       2. [generate_doctest_program] emits a synthetic→original line
@@ -15,8 +15,11 @@
       3. Boilerplate lines (imports, func wrapper, [tests:] struct)
          are absent from the map — we intentionally don't claim a
          false mapping for generator-emitted scaffolding.
-      4. A real doctest compile error surfaces with loc rewritten to
-         the original source file + line.
+
+    Applying this map to production compiler failures requires structured
+    Blorp typecheck diagnostics. The current Blorp frontend returns rendered
+    typecheck strings without source spans, so these tests deliberately do not
+    claim end-to-end remapping yet.
 
     Contract: docstrings are passed in with a [~doc_start_line]. That
     is the 1-based line number of the FIRST content line inside the
@@ -145,6 +148,36 @@ let mk_import_decl ?alias module_name symbols : Ast.decl =
     decl_desc =
       Ast.DImport
         { import_module = module_name; import_symbols; import_alias = alias };
+    decl_loc = Ast.dummy_loc;
+    decl_doc = None;
+  }
+
+
+let mk_union_decl type_name variant_names : Ast.decl =
+  let type_variants =
+    List.mapi
+      (fun variant_tag variant_name : Ast.variant ->
+        {
+          variant_name;
+          variant_fields = [];
+          variant_tag;
+          variant_loc = Ast.dummy_loc;
+          variant_def_id = None;
+        })
+      variant_names
+  in
+  {
+    decl_desc =
+      Ast.DType
+        {
+          type_name;
+          type_params = [];
+          type_variants;
+          type_is_enum = false;
+          type_is_builtin = false;
+          type_is_resource = false;
+          type_resource_cleanup = None;
+        };
     decl_loc = Ast.dummy_loc;
     decl_doc = None;
   }
@@ -318,6 +351,32 @@ let test_generate_program_emits_colon_imports () =
     (contains_substring source "codec {"
     || contains_substring source "heap as H {")
 
+let test_generate_program_imports_union_constructors () =
+  let doc = "doctests:\n    :: constructs error\n    Failed\n" in
+  let source_text =
+    make_source
+      [
+        "---";
+        "doctests:";
+        "    :: constructs error";
+        "    Failed";
+        "---";
+        "pure func ok(): True";
+      ]
+  in
+  let source, _ =
+    Test_runner.generate_doctest_program_with_map
+      ~source_path:"/tmp/errors.brp" ~source_text
+      [
+        mk_union_decl "OperationError" [ "Failed"; "TimedOut" ];
+        mk_func_decl ~name:"ok" ~doc ~decl_line:5;
+      ]
+  in
+  Alcotest.(check bool)
+    "self import includes union constructors" true
+    (contains_substring source
+       "errors: OperationError(Failed, TimedOut), ok")
+
 (* ============================================================================
    find_docstring_start_line: direct unit coverage
    ============================================================================
@@ -403,56 +462,6 @@ let test_find_decl_line_out_of_bounds () =
     (Test_runner.find_docstring_start_line "x\ny\n" 99)
 
 (* ============================================================================
-   remap_loc: end_line is mapped independently
-   ============================================================================ *)
-
-let mk_loc ?(file = "<syn>") ~line ~end_line () : Ast.loc =
-  { Ast.line; column = 1; end_line; end_column = 1; loc_file = Some file }
-
-let test_remap_preserves_multiline_span () =
-  (* When an error spans multiple synthetic lines and BOTH endpoints
-     have origin entries, the remapped loc must carry the mapped
-     [line] and the mapped [end_line] independently. Previously
-     [remap_loc] collapsed end_line to the start's origin — fine for
-     single-line errors (the common case) but silently lost the
-     height of multi-line errors. *)
-  let table : Test_runner.loc_remap_table = Hashtbl.create 4 in
-  Hashtbl.add table 10
-    { Test_runner.original_file = "x.brp"; original_line = 100 };
-  Hashtbl.add table 12
-    { Test_runner.original_file = "x.brp"; original_line = 102 };
-  let loc = mk_loc ~line:10 ~end_line:12 () in
-  let remapped = Test_runner.remap_loc table loc in
-  Alcotest.(check int) "line remapped" 100 remapped.line;
-  Alcotest.(check int) "end_line remapped" 102 remapped.end_line;
-  Alcotest.(check (option string))
-    "file rewritten" (Some "x.brp") remapped.loc_file
-
-let test_remap_end_line_fallback_when_unmapped () =
-  (* If only the start line has an entry (end_line falls on a line
-     the map doesn't know), end_line falls back to the start's
-     mapped line. Losing span height is acceptable; silently
-     pointing [end_line] at a synthetic number is not. *)
-  let table : Test_runner.loc_remap_table = Hashtbl.create 4 in
-  Hashtbl.add table 10
-    { Test_runner.original_file = "x.brp"; original_line = 100 };
-  let loc = mk_loc ~line:10 ~end_line:11 () in
-  let remapped = Test_runner.remap_loc table loc in
-  Alcotest.(check int) "line remapped" 100 remapped.line;
-  Alcotest.(check int) "end_line fallback" 100 remapped.end_line
-
-let test_remap_loc_unmapped_passes_through () =
-  (* A loc whose start line isn't in the table is generator-owned
-     scaffolding. Leave it untouched — don't invent a false mapping. *)
-  let table : Test_runner.loc_remap_table = Hashtbl.create 4 in
-  let loc = mk_loc ~file:"tmp.brp" ~line:7 ~end_line:7 () in
-  let remapped = Test_runner.remap_loc table loc in
-  Alcotest.(check int) "line unchanged" 7 remapped.line;
-  Alcotest.(check int) "end_line unchanged" 7 remapped.end_line;
-  Alcotest.(check (option string))
-    "file unchanged" (Some "tmp.brp") remapped.loc_file
-
-(* ============================================================================
    Suite
    ============================================================================ *)
 
@@ -475,6 +484,8 @@ let suite =
           test_generate_program_excludes_boilerplate;
         Alcotest.test_case "colon imports" `Quick
           test_generate_program_emits_colon_imports;
+        Alcotest.test_case "union constructor imports" `Quick
+          test_generate_program_imports_union_constructors;
       ] );
     ( "find_docstring_start",
       [
@@ -484,14 +495,5 @@ let suite =
         Alcotest.test_case "decl_line = 0" `Quick test_find_decl_line_zero;
         Alcotest.test_case "decl_line out of bounds" `Quick
           test_find_decl_line_out_of_bounds;
-      ] );
-    ( "remap_loc",
-      [
-        Alcotest.test_case "multiline span" `Quick
-          test_remap_preserves_multiline_span;
-        Alcotest.test_case "end_line fallback" `Quick
-          test_remap_end_line_fallback_when_unmapped;
-        Alcotest.test_case "unmapped passes through" `Quick
-          test_remap_loc_unmapped_passes_through;
       ] );
   ]

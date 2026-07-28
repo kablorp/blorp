@@ -974,6 +974,7 @@ let test_cli_run_response_decodes_test_options () =
                  "--no-format";
                  "tests";
                ] );
+           ("compiler_path", Lsp_json.String "/toolchain/blorp");
            ("options", test_options_json [ "tests" ]);
          ])
   in
@@ -1000,6 +1001,8 @@ let test_cli_run_response_decodes_test_options () =
           "tests";
         ]
         options.cli_test_raw_args;
+      Alcotest.(check string)
+        "compiler path" "/toolchain/blorp" options.cli_test_compiler_path;
       Alcotest.(check bool) "profile" true options.cli_test_profile;
       Alcotest.(check bool) "debug" true options.cli_test_debug;
       Alcotest.(check bool) "leak check" true options.cli_test_leak_check;
@@ -1396,13 +1399,18 @@ let test_cli_run_response_decodes_repl_options () =
          [
            ("kind", Lsp_json.String "repl");
            ("args", string_array [ "repl"; "--debug" ]);
+           ("compiler_path", Lsp_json.String "/toolchain/blorp");
            ("debug", Lsp_json.Bool true);
          ])
   in
   match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
   | Ok
       (Blorp.Compiler_blorp_bridge.CliRunReplOptions
-        { cli_repl_raw_args = [ "repl"; "--debug" ]; cli_repl_debug = true }) ->
+        {
+          cli_repl_raw_args = [ "repl"; "--debug" ];
+          cli_repl_compiler_path = "/toolchain/blorp";
+          cli_repl_debug = true;
+        }) ->
       ()
   | Ok _ -> Alcotest.fail "expected decoded CLI repl options"
   | Error (_, message) -> Alcotest.fail message

@@ -75,70 +75,28 @@ let build_source state ~expr_wrap =
 
 (* ── Compilation and execution ────────────────────────────────────── *)
 
-let try_compile_and_run ~debug source =
-  Test_runner.with_run_artifacts (fun () ->
-      if debug then Printf.eprintf "[repl] source:\n%s\n%!" source;
-      Modules.full_reset ();
-      Modules.init_module_paths (Sys.getcwd ());
-      let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
-      let embed_runtime = precompiled = None in
-      match
-        Pipeline.compile_legacy_direct_source ~debug ~embed_runtime
-          ~filename:"<repl>" ~source ()
-      with
-      | Error errors -> Error (Diagnostics.format_errors ~file:"<repl>" errors)
-      | Ok (Pipeline.Stopped_at _) ->
-          (* Unreachable: REPL never supplies ~on_stage, so the pipeline has
-         no stop trigger. If we ever get here, a callback was wired up
-         without updating this branch — fail loud. *)
-          assert false
-      | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
+let try_compile_and_run ~compiler_path ~debug source =
+  Test_runner.with_production_compiler ~compiler_path (fun () ->
+      Test_runner.with_run_artifacts (fun () ->
+          if debug then Printf.eprintf "[repl] source:\n%s\n%!" source;
           let compilation_dir = Test_runner.run_compilation_dir () in
           let bin_file = Filename.concat compilation_dir "program.bin" in
-          let header_file =
-            Option.map (fun p -> p.Test_runner.header_file) precompiled
-          in
-          let pch_file =
-            Option.bind precompiled (fun p -> p.Test_runner.pch_file)
-          in
-          let cc_args =
-            [ "-O2"; "-fwrapv"; "-pipe"; "-w" ]
-            @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
-            @ (match pch_file with
-              | Some pch_f ->
-                  if Lazy.force Test_runner.cc_is_clang then
-                    [ "-include-pch"; pch_f ]
-                  else [ "-include"; pch_f ]
-              | None -> (
-                  match header_file with
-                  | Some h -> [ "-include"; h ]
-                  | None -> []))
-            @ (match precompiled with
-              | Some p -> [ p.Test_runner.runtime_obj ]
-              | None -> [])
-            @ [ "-lm"; "-lpthread" ]
-            @ List.concat_map
-                (fun s -> String.split_on_char ' ' (String.trim s))
-                link_flags
-          in
-          let cc_result, cc_output =
-            Test_runner.compile_c_from_stdin c_code bin_file cc_args
-          in
-          if cc_result <> 0 then
-            if debug then
-              Error
-                ("Internal error: generated C code failed to compile.\n"
-               ^ String.trim cc_output)
-            else Error "Error: could not evaluate expression"
-          else begin
-            let result =
-              Test_runner.run_process_timeout ~timeout:(Some 10) bin_file []
-            in
-            if result = 124 then Error "Evaluation timed out (10s)"
-            else if result <> 0 then
-              Error (Printf.sprintf "Runtime error (exit code %d)" result)
-            else Ok ()
-          end)
+          let logical_path = Filename.concat (Sys.getcwd ()) "__repl__.brp" in
+          match
+            Test_runner.compile_source_to_executable ~debug ~release:true
+              ~logical_path ~source ~output_path:bin_file ()
+          with
+          | Error detail ->
+              if debug then Error detail
+              else Error "Error: could not evaluate expression"
+          | Ok () ->
+              let result =
+                Test_runner.run_process_timeout ~timeout:(Some 10) bin_file []
+              in
+              if result = 124 then Error "Evaluation timed out (10s)"
+              else if result <> 0 then
+                Error (Printf.sprintf "Runtime error (exit code %d)" result)
+              else Ok ()))
 
 (* ── Declaration helpers ──────────────────────────────────────────── *)
 
@@ -499,7 +457,7 @@ let handle_command state cmd =
 (** Try to evaluate an expression with output.
     Typechecks first to determine the expression type, then wraps appropriately.
     Single compile cycle instead of trial-and-error cascade. *)
-let eval_expression ~debug state expr_text =
+let eval_expression ~compiler_path ~debug state expr_text =
   let ty = infer_expr_type state expr_text in
   let wrap =
     match ty with
@@ -509,12 +467,12 @@ let eval_expression ~debug state expr_text =
     | None -> expr_text
   in
   let source = build_source state ~expr_wrap:(Some wrap) in
-  match try_compile_and_run ~debug source with
+  match try_compile_and_run ~compiler_path ~debug source with
   | Ok () -> true
   | Error _ when ty <> None && ty <> Some "String" && ty <> Some "Void" -> (
       (* to_string wrapper failed — fall back to bare expression *)
       let source2 = build_source state ~expr_wrap:(Some expr_text) in
-      match try_compile_and_run ~debug source2 with
+      match try_compile_and_run ~compiler_path ~debug source2 with
       | Ok () -> true
       | Error msg ->
           prerr_endline msg;
@@ -573,7 +531,7 @@ let completions_for_text text =
 
 (* ── Main REPL loop ───────────────────────────────────────────────── *)
 
-let run ~debug =
+let run ~compiler_path ~debug =
   let editor = Line_editor.create () in
   Line_editor.set_hint_fn editor hint_for_text;
   Line_editor.set_completions_fn editor completions_for_text;
@@ -611,7 +569,7 @@ let run ~debug =
                 else { !state with decls = raw_text :: !state.decls }
               in
               let source = build_source candidate ~expr_wrap:None in
-              match try_compile_and_run ~debug source with
+              match try_compile_and_run ~compiler_path ~debug source with
               | Ok () ->
                   state :=
                     { candidate with iteration = candidate.iteration + 1 };
@@ -620,7 +578,7 @@ let run ~debug =
                     program
               | Error msg -> prerr_endline msg)
           | Expression expr_text ->
-              if eval_expression ~debug !state expr_text then
+              if eval_expression ~compiler_path ~debug !state expr_text then
                 state := { !state with iteration = !state.iteration + 1 });
           (* Re-enter raw mode for next input *)
           Line_editor.enter_raw_mode editor

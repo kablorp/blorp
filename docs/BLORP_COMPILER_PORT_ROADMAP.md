@@ -134,9 +134,9 @@ no OCaml call. Ordinary `compile` and `run` call only the private
 explicit pinned-bootstrap compile wrapper.
 
 The OCaml typed-AST lowering and flattening modules remain compatibility code
-for the pinned-bootstrap wrapper and direct in-memory OCaml compiler tests.
-They are not the normal `compile`/`run` producer. Delete them only after those
-callers are converted to prepared Core; checkpoint 8 does not move the
+for the pinned-bootstrap wrapper and its direct compatibility tests. They are
+not the normal `compile`/`run` producer. Delete them only after a newer pinned
+bootstrap compiles the current CLI directly; checkpoint 8 does not move the
 bootstrap trust root.
 
 ## Migration Rules
@@ -982,8 +982,8 @@ Status: closed at the typecheck boundary. Blorp owns the expression-inference
 and second-pass typecheck substrate and can materialize a validated
 typed-program artifact. Production `check`, `compile`, and `run` source
 commands consume that artifact through the single frontend graph handoff before
-Core lowering. Legacy direct `Pipeline.compile_legacy_direct_source`, reusable
-compiler-fixture typechecking, and some tooling/test paths can still use the OCaml
+Core lowering. The legacy direct compile API has been deleted. Reusable
+compiler-fixture typechecking and some tooling paths can still use the OCaml
 parser/typechecker until their callers move to an explicit Blorp frontend graph.
 `compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` now covers literals, identifiers, local
 `var` declarations, block scoping, expected value slots, value ascription flow,
@@ -1561,23 +1561,18 @@ Current status:
 - Source-command checks now typecheck the in-memory graph directly in Blorp and
   never enter the OCaml pipeline. The former test-only OCaml graph-typecheck
   wrapper and its duplicate adapter tests have been deleted.
-- `Pipeline.compile_preloaded_graph_with_blorp_bridge` is the source-command
-  compile boundary: it consumes the same Blorp frontend graph, decodes the
-  Blorp typed-program artifact, populates dependency typed-module caches, and
-  then enters the shared OCaml Core/codegen handoff without
-  returning to the OCaml typechecker.
-- Direct-source `Pipeline.compile_legacy_direct_source`, reusable
-  compiler-fixture typechecking, and module-only typecheck APIs are now
-  documented in code as legacy/tooling routes. The REPL/test runner use the
-  explicit legacy compile name where they intentionally still depend on OCaml
-  parsing and typechecking. A compiler-unit regression pins that the
-  graph-backed compile bridge consumes the preloaded target source rather than
-  rereading a changed file from disk.
-- The compiler port inventory hygiene check now rejects new references to
-  legacy direct-source pipeline entrypoints outside the narrow allowlist
-  (`pipeline`, the private OCaml host tooling commands, package checking, REPL,
-  and test runner). This keeps normal source-command work on the Blorp frontend
-  graph while the remaining tooling paths are migrated deliberately.
+- `Pipeline.compile_preloaded_graph_with_blorp_bridge` is now a bounded
+  bootstrap compatibility boundary. Only
+  `blorp_ocaml_host __compiler-host-compile-wrapper` calls it in production;
+  normal source commands, tests, and the REPL do not.
+- Direct-source and in-memory OCaml compile APIs have been deleted. Reusable
+  compiler-fixture typechecking and module-only typecheck APIs remain for
+  explicitly classified tests and tools, not normal source execution.
+- A direct compile probe against the pinned bootstrap
+  `dev-9d291f28ee87` exits 139 on the current `compiler_cli_main.brp`.
+  Therefore the preloaded-graph wrapper and the early OCaml Core compatibility
+  pipeline cannot be deleted until a newer pinned bootstrap compiles the
+  current CLI directly.
 - Blorp builtin registration now includes the scalar-width conversions,
   bitwise operations, tensor constructors, and channel sealing used by the
   production backend surface. Bare-name lookup scans past declarations owned
@@ -1789,24 +1784,22 @@ Current status:
   a compile-time global rewrite and should continue moving to explicit Blorp
   frontend graphs.
 - The OCaml test runner still owns discovery, `TestSuite`/doctest harness
-  generation, C compilation, and execution, but it no longer re-enters the
-  OCaml source frontend. Generated suite, aggregate, and doctest harnesses use
-  an explicit in-memory Blorp source-graph handoff with generated-source policy;
-  standalone leak-baseline programs use the same handoff with ordinary user
-  source policy. The remaining TestRunner migration is orchestration ownership,
-  not parser/typechecker parity, and must preserve doctest location remapping,
-  process cleanup, and filesystem-isolation behavior.
-- The Blorp-owned generated selector/run-all graph can now be retained after
-  its source files are removed and prepared through the production early Core
-  pipeline to the post-synthesis worker request. Its compile policy represents
-  permission to call debug-only test helpers separately from retention of
-  `debug:` blocks. Production TestRunner routing has not switched yet; the next
-  slice must consume this retained graph rather than adding a test-only parser
-  bridge or serializing generated source back through OCaml.
-- Test command plans now carry typed execution or warmup variants throughout
-  the Blorp process and become JSON only when crossing the temporary OCaml host
-  boundary. Runtime-cache warmup must move with TestRunner execution because
-  the Blorp host and retained OCaml runner still use different cache schemas.
+  generation, scheduling, execution, and reporting. It no longer owns source,
+  C, or runtime compilation: every standalone test, generated suite, aggregate
+  harness, doctest, sanitizer run, leak run, and warmup program is compiled to
+  an executable by the production Blorp binary through the private synthetic
+  source boundary. The old OCaml in-memory source compiler, direct C compiler,
+  runtime object cache, TLS/link policy, and generated-harness compile policy
+  have been deleted. The remaining TestRunner migration is orchestration
+  ownership and structured diagnostic parity.
+- The production boundary accepts source storage and logical source paths
+  separately. Module resolution therefore uses the test or REPL source
+  identity rather than the temporary storage path, and generated source never
+  re-enters OCaml parsing or typechecking.
+- Test command plans carry the path of the invoking Blorp executable across
+  the temporary OCaml orchestration boundary. `test --warmup-only` compiles a
+  minimal program through that same production path; it does not maintain an
+  independent OCaml runtime cache.
 - Blorp test discovery now classifies parsed declarations and docs for `main`,
   a candidate `tests` binding, and doctests. Resolved TestSuite identity belongs
   after module loading/type resolution; it is not guessed from a raw type name.
@@ -1828,11 +1821,10 @@ Current status:
 Typed frontier closure before CTFE:
 
 - Close or explicitly classify residual OCaml typecheck/parser consumers:
-  `Pipeline.compile_legacy_direct_source`,
   `Pipeline.typecheck_only_typed_reusing_session`,
   `Pipeline.typecheck_module_only_typed`, package/source-package checks, the
-  LSP/tooling helpers, and the remaining package/REPL routes. TestRunner source
-  compilation is closed; its OCaml work is post-frontend orchestration.
+  LSP/tooling helpers, and the remaining package routes. TestRunner and REPL
+  source compilation are closed; their OCaml work is orchestration.
 - The separate compiler fixture runner still uses
   `Pipeline.typecheck_only_typed_reusing_session` for most `infer` and
   `typecheck` fixtures. This is test-only and is not part of production
@@ -1890,8 +1882,8 @@ prepared Core now continues directly into the Blorp-owned checkpoint-9 early
 pipeline; it is no longer the process boundary. The semantic worker no longer
 reconstructs typed AST or invokes OCaml Core lowering.
 
-The pinned-bootstrap compile wrapper and direct in-memory OCaml compiler tests
-still use `Core_lower`/`Core_flatten` as compatibility scaffolding. This is a
+The pinned-bootstrap compile wrapper and its direct compatibility tests still
+use `Core_lower`/`Core_flatten` as compatibility scaffolding. This is a
 separate trust-root path, not a fallback from normal `compile` or `run`.
 
 OCaml references:
@@ -2398,11 +2390,11 @@ Remaining production OCaml references, in
 - `compiler/lib/core_specialize.ml`
   - `specialize_program`
 
-`compiler/lib/core_synth.ml` is compatibility-only. Generated TestSuite
-harnesses, the pinned-bootstrap wrapper, and direct in-memory OCaml tests still
-enter through `Core_pipeline.run_core_passes`; migrate those callers to the
-prepared post-synthesis boundary before deleting the OCaml synthesis module and
-its remaining implementation-only coverage.
+`compiler/lib/core_synth.ml` is compatibility-only. The pinned-bootstrap
+wrapper and direct compatibility tests still enter through
+`Core_pipeline.run_core_passes`; move or delete those tests and ratchet the
+bootstrap before deleting the OCaml synthesis module and its remaining
+implementation-only coverage.
 
 Blorp references:
 
@@ -3046,8 +3038,6 @@ OCaml references:
 
 - `compiler/bin/blorp_ocaml_host.ml`
   - `run_bootstrap_compile`, used only by the pinned bootstrap wrapper
-- `compiler/lib/test_runner.ml`
-  - shared test-command compilation, scheduled for Checkpoint 12
 - `compiler/lib/runtime.c`
 - `compiler/lib/runtime_decl.c`
 - `compiler/lib/runtime_raylib.c`
@@ -3092,13 +3082,35 @@ Deletion point:
 
 - Complete for ordinary source commands. Delete the narrow OCaml bootstrap
   compile wrapper only after the post-merge compiler release is pinned and no
-  longer requires it. Test-runner process/C compilation remains a separate
-  Checkpoint 12 responsibility.
+  longer requires it. Test and REPL synthetic-source compilation now uses the
+  same Blorp-owned artifact writer, runtime cache, host-C invocation, and
+  executable builder as ordinary `run`.
 
 ## Checkpoint 12: Tools, Test Runner, REPL, LSP, Packages, And Final OCaml Shell
 
 Goal: remove the remaining OCaml compiler/tool shell after compiler semantics
 are Blorp-owned.
+
+Status as of 2026-07-27:
+
+- `test` still delegates discovery, harness construction, scheduling,
+  execution, and reporting to OCaml, but all generated and user source is
+  compiled by the invoking production Blorp executable. OCaml no longer
+  parses/typechecks those sources, emits their C, invokes `cc`, or owns a test
+  runtime cache.
+- `repl` still owns the interactive loop and source accumulation in OCaml, but
+  each accumulated program is compiled by the invoking production Blorp
+  executable through the same synthetic-source boundary.
+- The synthetic-source command is private and build-only. It accepts a
+  temporary source storage path, a distinct logical source path, and an output
+  executable path; this keeps module resolution independent of temporary-file
+  placement.
+- `test --warmup-only` compiles a minimal executable through the production
+  boundary. The removed OCaml runtime-object warmup is not a fallback.
+- The production Blorp typechecker currently returns rendered error strings
+  without source spans. Doctest source maps are retained and unit-tested, but
+  end-to-end doctest type-error remapping must wait for structured typecheck
+  diagnostics. Do not parse rendered diagnostic text to close this gap.
 
 OCaml references:
 
@@ -3122,6 +3134,10 @@ OCaml references:
 
 Blorp references:
 
+- production synthetic-source and executable build boundary:
+  - `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`
+  - `compiler/blorp/src/stage_12_cli/compiler_cli_run_effect.brp`
+  - `compiler/blorp/src/stage_12_cli/compiler_program_runner.brp`
 - existing formatter files:
   - `compiler/blorp/src/stage_11_format/compiler_format.brp`
   - `compiler/blorp/src/stage_11_format/compiler_format_projection.brp`
@@ -3138,11 +3154,17 @@ Implementation steps:
   reimplement typecheck or parse paths inside tools.
 - Keep formatter on the shared raw parse model.
 - Port purify as a consumer of Blorp typecheck and purity analysis.
-- Port the test runner by reducing work first:
-  - shared compile artifacts,
-  - suite batching,
-  - no unnecessary subprocesses,
-  - robust timeout/process cleanup.
+- Port the remaining test-runner orchestration without reintroducing compiler
+  work:
+  - discovery and typed `TestSuite` classification,
+  - doctest and suite harness construction,
+  - suite batching and scheduling,
+  - timeout/process cleanup,
+  - result framing, caching, and reporting.
+- Introduce one structured diagnostic type shared by parse and typecheck before
+  moving doctest reporting. It must carry source spans through the production
+  synthetic-source boundary so the existing source map can be applied without
+  inspecting rendered strings.
 - Port packages using the source-package dependency rules already used by the
   module graph:
   - manifest parsing,
@@ -3167,7 +3189,8 @@ Edge cases:
 
 - LSP must support multiple open documents without session leakage.
 - Test runner timeouts must clean up process groups and temp files.
-- Doctest source remapping must preserve original file/line diagnostics.
+- Doctest source remapping must preserve original file/line diagnostics once
+  structured typecheck spans are available; until then, keep the gap explicit.
 - Package hashes are content-addressable over raw package file contents and
   relative paths; comments are included because they are file contents.
 - Vendor/fetch must verify hash pins before making cache entries ready.
@@ -3180,6 +3203,7 @@ Tests:
 - `compiler/test/test_doctest_remap.ml`
 - `compiler/test/test_compiler_test_runner.ml`
 - `compiler/blorp/tests/test_compiler_format.brp`
+- `tests/test_cli.sh` private synthetic executable boundary cases
 - `scripts/test doctest cli`
 - manual package fetch/vendor tests with filesystem and local HTTP server
 

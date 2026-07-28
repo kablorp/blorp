@@ -293,118 +293,6 @@ let test_bound_reverse_is_not_rewritten_as_pipeline () =
       Alcotest.failf "expected bound reverse expression to remain, got %s"
         (Blorp.Core.pp_to_string { expr with desc = other })
 
-let rec find_func_body name = function
-  | [] -> None
-  | { cd_desc = CDFunc f; _ } :: _ when f.cf_name = name -> f.cf_body
-  | { cd_desc = CDPrivate inner; _ } :: rest -> (
-      match find_func_body name [ inner ] with
-      | Some _ as found -> found
-      | None -> find_func_body name rest)
-  | _ :: rest -> find_func_body name rest
-
-let test_pipeline_fuses_real_reverse_length_call () =
-  Blorp.Modules.reset ();
-  Blorp.Modules.init_module_paths ".";
-  let source =
-    {|
-import:
-    string: reverse
-
-pure func measure(s: String) -> Int:
-    s.reverse().length()
-
-func main(args: List[String]) -> Int:
-    measure("abcdef")
-|}
-  in
-  let resolve_reverse_calls = ref None in
-  let fusion_reverse_calls = ref None in
-  let fusion_string_len_calls = ref None in
-  let on_stage stage program =
-    match (stage, find_func_body "measure" program) with
-    | Blorp.Core_stage.Resolve, Some body ->
-        resolve_reverse_calls :=
-          Some (count_user_call "std_string__reverse" body)
-    | Blorp.Core_stage.Fusion, Some body ->
-        fusion_reverse_calls :=
-          Some (count_user_call "std_string__reverse" body);
-        fusion_string_len_calls := Some (count_intrinsic_call "string_len" body)
-    | _ -> ()
-  in
-  match
-    Blorp.Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage ~filename:"<test>"
-      ~source ()
-  with
-  | Ok (Blorp.Pipeline.Compiled _) ->
-      Alcotest.(check bool)
-        "resolve stage contains reverse producer" true
-        (Option.value ~default:0 !resolve_reverse_calls > 0);
-      Alcotest.(check int)
-        "fusion removes direct reverse producer" 0
-        (Option.value ~default:(-1) !fusion_reverse_calls);
-      Alcotest.(check bool)
-        "fusion emits direct string length consumer" true
-        (Option.value ~default:0 !fusion_string_len_calls > 0)
-  | Ok (Blorp.Pipeline.Stopped_at s) ->
-      Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs ->
-      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
-
-let test_pipeline_fuses_real_composed_length_call () =
-  Blorp.Modules.reset ();
-  Blorp.Modules.init_module_paths ".";
-  let source =
-    {|
-import:
-    string: replace, take_left, trim
-
-pure func measure() -> Int:
-    "  abacad  "
-        .trim()
-        .take_left(5)
-        .replace("a", "xy")
-        .length()
-
-func main(args: List[String]) -> Int:
-    measure()
-|}
-  in
-  let fusion_trim_calls = ref None in
-  let fusion_take_calls = ref None in
-  let fusion_replace_calls = ref None in
-  let fusion_byte_reads = ref None in
-  let on_stage stage program =
-    match (stage, find_func_body "measure" program) with
-    | Blorp.Core_stage.Fusion, Some body ->
-        fusion_trim_calls := Some (count_user_call "std_string__trim" body);
-        fusion_take_calls := Some (count_user_call "std_string__take_left" body);
-        fusion_replace_calls :=
-          Some (count_user_call "std_string__replace" body);
-        fusion_byte_reads := Some (count_intrinsic_call "string_get_byte" body)
-    | _ -> ()
-  in
-  match
-    Blorp.Pipeline.compile_legacy_direct_source ~embed_runtime:false ~on_stage ~filename:"<test>"
-      ~source ()
-  with
-  | Ok (Blorp.Pipeline.Compiled _) ->
-      Alcotest.(check int)
-        "fusion removes real trim producer" 0
-        (Option.value ~default:(-1) !fusion_trim_calls);
-      Alcotest.(check int)
-        "fusion removes real take_left producer" 0
-        (Option.value ~default:(-1) !fusion_take_calls);
-      Alcotest.(check int)
-        "fusion removes real replace producer" 0
-        (Option.value ~default:(-1) !fusion_replace_calls);
-      Alcotest.(check bool)
-        "fusion scans source bytes directly" true
-        (Option.value ~default:0 !fusion_byte_reads > 0)
-  | Ok (Blorp.Pipeline.Stopped_at s) ->
-      Alcotest.failf "unexpected stop at %s" (Blorp.Core_stage.to_string s)
-  | Error errs ->
-      Alcotest.failf "compile failed:\n%s" (Test_helpers.format_errors errs)
-
 let suite =
   [
     ( "rewrite",
@@ -440,9 +328,5 @@ let suite =
           test_user_defined_length_is_not_rewritten;
         Alcotest.test_case "bound_reverse_is_not_rewritten_as_pipeline" `Quick
           test_bound_reverse_is_not_rewritten_as_pipeline;
-        Alcotest.test_case "pipeline_fuses_real_reverse_length_call" `Quick
-          test_pipeline_fuses_real_reverse_length_call;
-        Alcotest.test_case "pipeline_fuses_real_composed_length_call" `Quick
-          test_pipeline_fuses_real_composed_length_call;
       ] );
   ]

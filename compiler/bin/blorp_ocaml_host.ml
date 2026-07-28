@@ -889,16 +889,30 @@ let auto_format_test_path path =
       (Sys.readdir path)
   else auto_format_user_file path
 
-let warmup_test_artifacts () =
+let warmup_test_artifacts ~compiler_path =
   Test_runner.with_run_artifacts (fun () ->
-      ignore (Test_runner.precompile_runtime ()));
-  0
+      Test_runner.with_production_compiler ~compiler_path (fun () ->
+          let output_path =
+            Test_runner.run_artifact_path ~kind:"test-warmup"
+              ~prefix:"program" ~suffix:".bin"
+          in
+          match
+            Test_runner.compile_source_to_executable ~debug:true
+              ~logical_path:"__test_warmup__.brp"
+              ~source:"func main(args: List[String]) -> Int:\n\t0\n"
+              ~output_path ()
+          with
+          | Ok () -> 0
+          | Error detail ->
+              Printf.eprintf "Error: test compiler warmup failed: %s\n" detail;
+              1))
 
 let run_test_from_frontier_options
     (options : Compiler_blorp_bridge.cli_test_options) =
   match options with
-  | Compiler_blorp_bridge.CliTestWarmupOnlyOptions _ ->
-      warmup_test_artifacts ()
+  | Compiler_blorp_bridge.CliTestWarmupOnlyOptions options ->
+      warmup_test_artifacts
+        ~compiler_path:options.cli_test_compiler_path
   | Compiler_blorp_bridge.CliTestRunOptions options ->
       let timeout =
         match resolve_test_timeout options.cli_test_timeout with
@@ -920,7 +934,9 @@ let run_test_from_frontier_options
           Test_runner.run_tests ~profile:options.cli_test_profile
             ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
             ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
-            ~repeat:options.cli_test_repeat path
+            ~repeat:options.cli_test_repeat
+            ~compiler_path:options.cli_test_compiler_path
+            ?std_dir:options.cli_test_std_dir path
       | [] ->
           prerr_endline "Error: No test path specified";
           1
@@ -928,7 +944,9 @@ let run_test_from_frontier_options
           Test_runner.run_tests_paths ~profile:options.cli_test_profile
             ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
             ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
-            ~repeat:options.cli_test_repeat paths
+            ~repeat:options.cli_test_repeat
+            ~compiler_path:options.cli_test_compiler_path
+            ?std_dir:options.cli_test_std_dir paths
 
 let run_purify_from_frontier_options
     (options : Compiler_blorp_bridge.cli_purify_options) =
@@ -1114,7 +1132,8 @@ and run_frontier = function
   | BlorpCliTest options -> run_test_from_frontier_options options
   | BlorpCliPurify options -> run_purify_from_frontier_options options
   | BlorpCliRepl options ->
-      Repl.run ~debug:options.Compiler_blorp_bridge.cli_repl_debug;
+      Repl.run ~debug:options.Compiler_blorp_bridge.cli_repl_debug
+        ~compiler_path:options.cli_repl_compiler_path;
       0
   | BlorpCliLsp _ -> Lsp_server.run ()
   | BlorpCliPackage options -> run_package_from_frontier_options options

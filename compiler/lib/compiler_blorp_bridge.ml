@@ -120,6 +120,7 @@ type cli_test_mode =
 
 type cli_test_run_options = {
   cli_test_raw_args : string list;
+  cli_test_compiler_path : string;
   cli_test_profile : bool;
   cli_test_debug : bool;
   cli_test_sanitizer : cli_frontend_sanitizer_mode option;
@@ -136,7 +137,10 @@ type cli_test_run_options = {
 
 type cli_test_options =
   | CliTestRunOptions of cli_test_run_options
-  | CliTestWarmupOnlyOptions of { cli_test_warmup_raw_args : string list }
+  | CliTestWarmupOnlyOptions of {
+      cli_test_warmup_raw_args : string list;
+      cli_test_compiler_path : string;
+    }
 
 type cli_purify_options = {
   cli_purify_raw_args : string list;
@@ -147,6 +151,7 @@ type cli_purify_options = {
 
 type cli_repl_options = {
   cli_repl_raw_args : string list;
+  cli_repl_compiler_path : string;
   cli_repl_debug : bool;
 }
 
@@ -1372,7 +1377,7 @@ let decode_cli_compile_options options =
       cli_compile_files;
     }
 
-let decode_cli_test_run_options cli_test_raw_args options =
+let decode_cli_test_run_options cli_test_raw_args cli_test_compiler_path options =
   let* () = require_options_kind "test" options in
   let* cli_test_profile = bool_response_field "profile" options in
   let* cli_test_debug = bool_response_field "debug" options in
@@ -1391,6 +1396,7 @@ let decode_cli_test_run_options cli_test_raw_args options =
     (CliTestRunOptions
        {
          cli_test_raw_args;
+         cli_test_compiler_path;
          cli_test_profile;
          cli_test_debug;
          cli_test_sanitizer;
@@ -1405,12 +1411,16 @@ let decode_cli_test_run_options cli_test_raw_args options =
          cli_test_paths;
        })
 
-let decode_cli_test_options cli_test_raw_args options =
+let decode_cli_test_options cli_test_raw_args cli_test_compiler_path options =
   let* kind = string_response_field "kind" options in
   match kind with
-  | "test" -> decode_cli_test_run_options cli_test_raw_args options
+  | "test" ->
+      decode_cli_test_run_options cli_test_raw_args cli_test_compiler_path
+        options
   | "test_warmup" ->
-      Ok (CliTestWarmupOnlyOptions { cli_test_warmup_raw_args = cli_test_raw_args })
+      Ok
+        (CliTestWarmupOnlyOptions
+           { cli_test_warmup_raw_args = cli_test_raw_args; cli_test_compiler_path })
   | other ->
       Error
         ( "invalid_response",
@@ -1672,8 +1682,11 @@ let cli_run_delegate_response_field artifact =
 let cli_run_test_response_field artifact =
   let* cli_test_raw_args = string_array_field "args" artifact in
   let* () = validate_cli_artifact_command "test" "test" cli_test_raw_args in
+  let* cli_test_compiler_path = string_response_field "compiler_path" artifact in
   let* options = json_response_field "options" artifact in
-  let* cli_test_options = decode_cli_test_options cli_test_raw_args options in
+  let* cli_test_options =
+    decode_cli_test_options cli_test_raw_args cli_test_compiler_path options
+  in
   Ok (CliRunTestOptions cli_test_options)
 
 let cli_run_purify_response_field artifact =
@@ -1690,8 +1703,11 @@ let cli_run_purify_response_field artifact =
 let cli_run_repl_response_field artifact =
   let* cli_repl_raw_args = string_array_field "args" artifact in
   let* () = validate_cli_artifact_command "repl" "repl" cli_repl_raw_args in
+  let* cli_repl_compiler_path = string_response_field "compiler_path" artifact in
   let* cli_repl_debug = bool_response_field "debug" artifact in
-  Ok (CliRunReplOptions { cli_repl_raw_args; cli_repl_debug })
+  Ok
+    (CliRunReplOptions
+       { cli_repl_raw_args; cli_repl_compiler_path; cli_repl_debug })
 
 let cli_run_lsp_response_field artifact =
   let* cli_lsp_raw_args = string_array_field "args" artifact in

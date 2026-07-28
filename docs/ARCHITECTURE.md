@@ -126,8 +126,10 @@ projection boundary, own their final normalization for C emission.
 The pinned-bootstrap wrapper still compiles the Blorp CLI through the legacy
 OCaml typed-AST/Core-lowering entrypoint. That bootstrap trust-root path is
 kept separate from normal source compilation and is not a runtime fallback.
-Direct in-memory OCaml compiler tests also retain the compatibility entrypoint
-until their fixtures move to prepared Core.
+It is the only production caller of the preloaded-graph compatibility
+entrypoint; direct-source and generated in-memory OCaml compile APIs have been
+deleted. Direct compatibility tests remain until the bootstrap can compile the
+current CLI without this wrapper.
 
 ```
 Blorp Typed AST graph
@@ -331,7 +333,7 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_lower.ml` | Compatibility typed AST → Core lowering used only by the bounded bootstrap and legacy in-memory routes |
+| `core_lower.ml` | Compatibility typed AST → Core lowering used only by the bounded bootstrap wrapper |
 | `core_ffi_boundary.ml` | Compatibility checked FFI annotation for those legacy lowering routes |
 | `core_debug.ml` | `debug:` block erasure/retention after lowering |
 | `core_desugar.ml` | Sugar elimination |
@@ -991,8 +993,10 @@ cd compiler && dune build
 - `./blorp` - Main compiler executable (copied from `compiler/_build/`)
 - `./blorp compile file.brp` writes generated C next to the source as
   `file.c` unless `-o PATH` is provided.
-- `./blorp run` and `./blorp test` compile through temporary artifacts managed
-  by the test runner.
+- `./blorp run` compiles, links, and executes through Blorp-owned temporary
+  artifacts. The OCaml test runner still orchestrates `./blorp test`, but each
+  test or generated harness is compiled to an executable by the invoking
+  production Blorp binary.
 
 ### Compiler Flags
 

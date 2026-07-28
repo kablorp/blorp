@@ -170,7 +170,11 @@ import:
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
 		CompilerInferResult,
-		CompilerResolvedCallTarget(CompilerResolvedDirectCall, CompilerResolvedTraitMethodCall),
+		CompilerResolvedCallTarget(
+			CompilerResolvedDirectCall,
+			CompilerResolvedIntrinsicCall,
+			CompilerResolvedTraitMethodCall,
+		),
 		CompilerTypedExpr(
 			CompilerTypedAssignExpr,
 			CompilerTypedBinaryExpr,
@@ -182,6 +186,7 @@ import:
 			CompilerTypedIntLiteralExpr,
 			CompilerTypedForExpr,
 			CompilerTypedNameExpr,
+			CompilerTypedStringLiteralExpr,
 			CompilerTypedSubscriptExpr,
 			CompilerTypedWithExpr,
 		),
@@ -1643,6 +1648,39 @@ pure func state_with_imported_scalar_sqrt_and_tensor() -> CompilerTypecheckState
 			).state
 
 
+pure func state_with_debug_reflection(
+	name: String,
+	return_type: CompilerType,
+	value_type: CompilerType,
+) -> CompilerTypecheckState:
+	state = add_infer_value(compiler_typecheck_state_empty(), "value", value_type)
+
+	match compiler_env_mint_def_id(state.env):
+		(next_env, def_id):
+			symbol = compiler_func_symbol(
+				def_id,
+				CompilerFunctionType(True, [CompilerTypeVar("T")], return_type),
+				[compiler_make_bound_type_param("T", [])],
+				[Some("value")],
+				CompilerPure,
+				CompilerBuiltinFunc,
+				CompilerRejectResourceArgs,
+				Some("std/debug"),
+				[],
+				None,
+				False,
+			)
+			with_function = { state |
+				env = compiler_env_add_func_with_info(next_env, name, symbol)
+			}
+			compiler_typecheck_state_register_imported_name(
+				with_function,
+				name,
+				"std/debug",
+				name,
+			).state
+
+
 pure func state_with_local_scalar_sqrt_and_tensor() -> CompilerTypecheckState:
 	state = state_with_float_tensor_value([CompilerConstIntType(3)])
 	{ state | env = compiler_env_add_func(
@@ -2377,11 +2415,84 @@ func test_imported_builtin_function_reference_preserves_module_origin() -> Bool:
 
 	(
 		result.context.state.errors.length() == 0
+		and compiler_typed_expr_type_error(result.expr).is_none()
 		and match compiler_typed_expr_resolved_call(result.expr):
 			Some(info):
 				match info.target:
 					CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
 						module_path == "std/float" and info.source_name == "sqrt"
+					_:
+						False
+			None:
+				False
+	)
+
+
+func test_concrete_type_name_folds_during_inference() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(
+			state_with_debug_reflection(
+				"type_name",
+				compiler_type_string(),
+				CompilerConstIntType(42),
+			),
+		),
+		call_expr(ParsedNameExpr(ident("type_name")), [ParsedNameExpr(ident("value"))]),
+	)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		CompilerTypedStringLiteralExpr(text, _, _):
+			text == "#42"
+		_:
+			False
+
+
+func test_generic_debug_reflection_defers_as_intrinsic() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(
+			state_with_debug_reflection(
+				"type_name",
+				compiler_type_string(),
+				CompilerTypeVar("T"),
+			),
+		),
+		call_expr(ParsedNameExpr(ident("type_name")), [ParsedNameExpr(ident("value"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and compiler_typed_expr_type_error(result.expr).is_none()
+		and match compiler_typed_expr_resolved_call(result.expr):
+			Some(info):
+				match info.target:
+					CompilerResolvedIntrinsicCall:
+						info.source_name == "type_name"
+					_:
+						False
+			None:
+				False
+	)
+
+
+func test_is_heap_defers_as_intrinsic() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(
+			state_with_debug_reflection(
+				"is_heap",
+				compiler_type_bool(),
+				compiler_type_string(),
+			),
+		),
+		call_expr(ParsedNameExpr(ident("is_heap")), [ParsedNameExpr(ident("value"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and match compiler_typed_expr_resolved_call(result.expr):
+			Some(info):
+				match info.target:
+					CompilerResolvedIntrinsicCall:
+						info.source_name == "is_heap"
 					_:
 						False
 			None:
@@ -10330,6 +10441,15 @@ tests: TestSuite = {
 			"imported builtin function reference preserves module origin",
 			test_imported_builtin_function_reference_preserves_module_origin,
 		),
+		(
+			"concrete type_name folds during inference",
+			test_concrete_type_name_folds_during_inference,
+		),
+		(
+			"generic debug reflection defers as intrinsic",
+			test_generic_debug_reflection_defers_as_intrinsic,
+		),
+		("is_heap defers as intrinsic", test_is_heap_defers_as_intrinsic),
 		(
 			"local scalar math call does not lift over tensor argument",
 			test_local_scalar_math_call_does_not_lift_over_tensor_argument,

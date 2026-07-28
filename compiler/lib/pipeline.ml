@@ -22,8 +22,6 @@ type compile_result = {
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
 type phase_timing_phase =
-  | InMemoryFrontendGraph
-  | FrontendGraphFinalize
   | GraphTypecheck
   | SemanticMiddle
   | BackendEmission
@@ -99,8 +97,6 @@ let bridge_can_read_matching_source ~filename source =
 
 (** Outcome of source compilation. See [pipeline.mli] for rationale. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
-
-type source_kind = User_source | Generated_test_harness
 
 (** Return module loading errors in chronological (load) order.
     [Modules.load_errors] stores them newest-first; reverse here so the
@@ -442,16 +438,11 @@ let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
       Option.iter (fun configure -> configure sess) configure_session;
       k ())
 
-let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
-    ~filename source =
+let parse_and_load_modules ?on_frontend_phase ~filename source =
   let record phase =
     match on_frontend_phase with Some f -> f phase | None -> ()
   in
-  let bridge_read_file =
-    match source_kind with
-    | User_source -> bridge_can_read_matching_source ~filename source
-    | Generated_test_harness -> false
-  in
+  let bridge_read_file = bridge_can_read_matching_source ~filename source in
   match
     Modules.parse_typecheck_source_artifact ~filename ~bridge_read_file source
   with
@@ -466,7 +457,7 @@ let parse_and_load_modules ?on_frontend_phase ?(source_kind = User_source)
 let fresh_builtins_env () = Env_builtins.with_builtins (Env.empty ())
 
 type unused_import_check_scope =
-  | Explicit_target of { module_name : string; source_kind : source_kind }
+  | Explicit_target of string
   | Loaded_dependency of Session.module_origin
 
 let is_prelude_reexport_module = function
@@ -474,9 +465,7 @@ let is_prelude_reexport_module = function
   | _ -> false
 
 let should_check_unused_imports = function
-  | Explicit_target { source_kind = Generated_test_harness; _ } -> false
-  | Explicit_target { module_name; source_kind = User_source } ->
-      not (is_prelude_reexport_module module_name)
+  | Explicit_target module_name -> not (is_prelude_reexport_module module_name)
   | Loaded_dependency Session.User_module -> true
   | Loaded_dependency
       ( Session.Stdlib_module | Session.Package_module _
@@ -845,8 +834,7 @@ let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a
       Modules.init_module_paths (Modules.extract_directory filename);
       k ())
 
-let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
-    =
+let typecheck_loaded_program ~filename ~program ?(debug = false) () =
   (* Type-check loaded modules and surface genuine errors *)
   let module_errors = check_modules ~debug ~allow_debug_only_calls:debug () in
   if module_errors <> [] then Error module_errors
@@ -860,20 +848,17 @@ let typecheck_loaded_program ~source_kind ~filename ~program ?(debug = false) ()
     | Error errors -> Error errors
     | Ok typed_program ->
         let import_errors =
-          unused_import_errors
-            ~scope:(Explicit_target { module_name; source_kind })
-            program
+          unused_import_errors ~scope:(Explicit_target module_name) program
         in
         if import_errors <> [] then Error import_errors else Ok typed_program
 
 let typecheck_only_typed_reusing_session ~sess ~filename ~source
     ?(debug = false) () =
   with_reusable_typecheck_session ~sess filename (fun () ->
-      match parse_and_load_modules ~source_kind:User_source ~filename source with
+      match parse_and_load_modules ~filename source with
       | Error _ as e -> e
       | Ok (program, _base_dir) ->
-          typecheck_loaded_program ~source_kind:User_source ~filename ~program
-            ~debug ())
+          typecheck_loaded_program ~filename ~program ~debug ())
 
 (** Parse and type-check a module, returning the final state and typed program. *)
 let typecheck_module_only_typed_impl ?configure_session ~filename ~source () =
@@ -898,9 +883,7 @@ let typecheck_module_only_typed_impl ?configure_session ~filename ~source () =
             | Ok (state, typed_program) ->
                 let import_errors =
                   unused_import_errors
-                    ~scope:
-                      (Explicit_target
-                         { module_name; source_kind = User_source })
+                    ~scope:(Explicit_target module_name)
                     program
                 in
                 if import_errors <> [] then Error import_errors
@@ -921,14 +904,13 @@ let typecheck_module_only ~filename ~source =
   | Ok (state, typed_program) -> Ok (state, Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
-let compile_typechecked_program ~source_kind ~retain_debug_blocks
-    ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
+let compile_typechecked_program ~retain_debug_blocks ~embed_runtime ~require_main
+    ~profile ?on_stage ?on_stage_event
     ?on_stage_json ?tail_observation_stages ~check_invariants ?on_phase_timing
     ~filename ~program ~typed_program ~main_import_bindings () =
   let module_name = target_module_name filename in
   let import_errors =
-    unused_import_errors ~scope:(Explicit_target { module_name; source_kind })
-      program
+    unused_import_errors ~scope:(Explicit_target module_name) program
   in
   if import_errors <> [] then Error import_errors
   else if require_main && not (program_has_top_level_main program) then
@@ -980,66 +962,8 @@ let compile_typechecked_program ~source_kind ~retain_debug_blocks
             };
           ]
 
-let compile_loaded_program ~source_kind ?(debug = false)
-    ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
-    ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
-    ?on_stage_event ?on_stage_json ?tail_observation_stages
-    ?(check_invariants = false) ~filename ~program () =
-  let allow_debug_only_calls =
-    Option.value allow_debug_only_calls ~default:debug
-  in
-  let retain_debug_blocks = Option.value retain_debug_blocks ~default:debug in
-  let record_frontend phase =
-    match on_frontend_phase with Some f -> f phase | None -> ()
-  in
-  (* Type-check all loaded modules and surface genuine errors *)
-  let module_errors = check_modules ~debug ~allow_debug_only_calls () in
-  record_frontend ModuleTypecheck;
-  if module_errors <> [] then Error module_errors
-  else
-    let module_origin = Modules.module_origin_for_source_file filename in
-    let module_name = target_module_name filename in
-    match
-      Typecheck.typecheck_with_state_typed ~module_origin
-        ~allow_debug_only_calls ~module_name program
-    with
-    | Error blocking_errors ->
-        record_frontend MainTypecheck;
-        Error blocking_errors
-    | Ok (main_state, typed_program) ->
-        record_frontend MainTypecheck;
-        compile_typechecked_program ~source_kind ~retain_debug_blocks
-          ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
-          ?on_stage_json ?tail_observation_stages ~check_invariants ~filename
-          ~program ~typed_program
-          ~main_import_bindings:(List.rev main_state.Typecheck.import_bindings)
-          ()
-
-(** Legacy direct-source compile route for callers that still pass raw source.
-    Normal Blorp CLI source commands prepare Core and call the semantic-middle
-    worker without entering this module's typed-AST lowering path.
-
-    Returns either the compiled result or a list of errors.
-
-    [embed_runtime] — when [true] (the default), the generated C embeds
-    the full runtime. When [false], the caller is expected to link a
-    precompiled runtime object. *)
-let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
-    ?retain_debug_blocks ?(embed_runtime = true) ?(require_main = false)
-    ?(profile = false) ?on_frontend_phase ?on_stage ?on_stage_event
-    ?on_stage_json ?tail_observation_stages ?(check_invariants = false)
-    ~filename ~source () =
-  with_fresh_session filename (fun () ->
-      match parse_and_load_modules ?on_frontend_phase ~source_kind ~filename source with
-      | Error _ as e -> e
-      | Ok (program, _base_dir) ->
-          compile_loaded_program ~source_kind ~debug ?allow_debug_only_calls
-            ?retain_debug_blocks ~embed_runtime ~require_main ~profile
-            ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-            ?tail_observation_stages ~check_invariants ~filename ~program ())
-
-let compile_preloaded_graph_impl ~source_kind ?(debug = false)
-    ?allow_debug_only_calls ?retain_debug_blocks ?(embed_runtime = true)
+let compile_preloaded_graph_impl ?(debug = false) ?allow_debug_only_calls
+    ?retain_debug_blocks ?(embed_runtime = true)
     ?(require_main = false) ?(profile = false) ?on_frontend_phase ?on_stage
     ?on_stage_event ?on_stage_json ?tail_observation_stages
     ?(check_invariants = false) ?on_phase_timing ~filename
@@ -1058,8 +982,8 @@ let compile_preloaded_graph_impl ~source_kind ?(debug = false)
       match typecheck_result with
       | Error _ as error -> error
       | Ok result ->
-          compile_typechecked_program ~source_kind ~retain_debug_blocks
-            ~embed_runtime ~require_main ~profile ?on_stage ?on_stage_event
+          compile_typechecked_program ~retain_debug_blocks ~embed_runtime
+            ~require_main ~profile ?on_stage ?on_stage_event
             ?on_stage_json ?tail_observation_stages ~check_invariants
             ?on_phase_timing ~filename
             ~program:result.blorp_bridge_source_program
@@ -1071,81 +995,8 @@ let compile_preloaded_graph_with_blorp_bridge ?debug ?allow_debug_only_calls
     ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
     ~preloaded_module_graph () =
-  compile_preloaded_graph_impl ~source_kind:User_source ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime ?require_main
-    ?profile ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+  compile_preloaded_graph_impl ?debug ?allow_debug_only_calls
+    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
+    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
     ?tail_observation_stages ?check_invariants ?on_phase_timing ~filename
     ~preloaded_module_graph ()
-
-let compile_legacy_direct_source ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename ~source () =
-  compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
-    ?tail_observation_stages ?check_invariants ~filename ~source ()
-
-let in_memory_source_module_name filename =
-  let basename = Filename.basename filename in
-  if Filename.check_suffix basename ".brp" then
-    String.sub basename 0 (String.length basename - 4)
-  else basename
-
-let in_memory_source_frontend_graph ?on_phase_timing ~filename ~source () =
-  let module_name = in_memory_source_module_name filename in
-  let graph_result =
-    observe_phase_timing on_phase_timing InMemoryFrontendGraph (fun () ->
-        Compiler_blorp_bridge.cli_run_source_via_command ~path:filename
-          ~module_name ~text:source [ "compile"; "--no-format"; filename ])
-  in
-  match graph_result with
-  | Error (_code, message) ->
-      Error [ bridge_error ~filename ~phase:Ast.Parse message ]
-  | Ok (Compiler_blorp_bridge.CliRunFrontendModuleGraph graph) ->
-      observe_phase_timing on_phase_timing FrontendGraphFinalize (fun () ->
-          Modules.finalize_cli_frontend_module_graph graph)
-  | Ok (Compiler_blorp_bridge.CliRunHandled result) ->
-      let message =
-        String.trim
-          (result.cli_run_stderr ^ result.cli_run_stdout)
-      in
-      Error
-        [
-          bridge_error ~filename ~phase:Ast.Parse
-            (if String.equal message "" then
-               "Blorp frontend rejected in-memory source"
-             else message);
-        ]
-  | Ok _ ->
-      Error
-        [
-          bridge_error ~filename ~phase:Ast.Parse
-            "Blorp frontend returned a non-compilation plan for in-memory source";
-        ]
-
-let compile_in_memory_source_impl ~source_kind ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
-  let frontend_result =
-    in_memory_source_frontend_graph ?on_phase_timing ~filename ~source ()
-  in
-  match frontend_result with
-  | Error _ as error -> error
-  | Ok finalized ->
-      compile_preloaded_graph_impl ~source_kind ?debug
-        ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-        ?on_phase_timing
-        ~filename:finalized.Modules.finalized_root.preload_path
-        ~preloaded_module_graph:finalized.finalized_preloaded_graph ()
-
-let compile_in_memory_source_with_blorp_bridge ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
-  compile_in_memory_source_impl ~source_kind:User_source ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?on_phase_timing ~filename ~source ()
-
-let compile_generated_test_harness ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?on_phase_timing ~filename ~source () =
-  compile_in_memory_source_impl ~source_kind:Generated_test_harness ?debug
-    ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?on_phase_timing ~filename ~source ()

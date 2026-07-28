@@ -21,8 +21,6 @@ type compile_result = {
 type frontend_phase = Parse | ModuleLoad | ModuleTypecheck | MainTypecheck
 
 type phase_timing_phase =
-  | InMemoryFrontendGraph
-  | FrontendGraphFinalize
   | GraphTypecheck
   | SemanticMiddle
   | BackendEmission
@@ -89,68 +87,6 @@ val check_modules :
     their typed declarations and import bindings. This is the dependency
     typecheck stage used before checking a target module. *)
 
-val compile_legacy_direct_source :
-  ?debug:bool ->
-  ?allow_debug_only_calls:bool ->
-  ?retain_debug_blocks:bool ->
-  ?embed_runtime:bool ->
-  ?require_main:bool ->
-  ?profile:bool ->
-  ?on_frontend_phase:(frontend_phase -> unit) ->
-  ?on_stage:Core_pipeline.on_stage_callback ->
-  ?on_stage_event:Core_pipeline.on_stage_event ->
-  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
-  ?tail_observation_stages:Core_stage.t list ->
-  ?check_invariants:bool ->
-  filename:string ->
-  source:string ->
-  unit ->
-  (compile_outcome, Ast.compiler_error list) result
-(** Compile a source file through all phases. Returns a [compile_outcome]
-    on success or a list of errors. Typical callers only care about the
-    [Compiled] case; the [Stopped_at] case is returned when an
-    [on_stage] callback raises [Core_pipeline.Stopped_after] (triggered by
-    [--stop-after=STAGE] at the CLI).
-
-    [allow_debug_only_calls] permits direct calls to functions explicitly
-    declared [@debug_only]. When omitted, it follows [debug]. Test harness
-    compilation passes [true] explicitly so reflection assertions remain
-    test-only without depending on source-name heuristics.
-
-    [retain_debug_blocks] keeps [debug:] block bodies in generated code.
-    When omitted, it follows [debug]. Test harness compilation passes [true]
-    explicitly so diagnostic assertions can execute under [blorp test] without
-    turning on verbose compiler diagnostics.
-
-    [on_stage] fires after every Core pipeline stage with the stage marker
-    and the current [core_program]. Used by [--dump-core-after] to print
-    intermediate IR and by [--stop-after] to terminate early. Callbacks
-    that raise [Core_pipeline.Stopped_after] do not propagate the exception
-    outward — this API catches it and returns [Ok (Stopped_at s)].
-
-    [on_stage_event] fires after every Core pipeline stage with only the stage
-    marker. Use it for timing or order observation that must not force Core
-    program snapshots.
-
-    [on_stage_json] fires for Blorp-owned late stages requested through
-    [tail_observation_stages]. These observations are bridge JSON because OCaml
-    no longer owns authoritative Core values after the pre-DCE handoff.
-
-    [require_main] rejects user sources that do not declare a top-level
-    [main] function before Core/codegen. It is intended for runnable entry
-    points such as [blorp run]; analysis-only and C-emission callers can leave
-    it disabled.
-
-    [check_invariants] enables post-stage invariant checks defined in
-    [Core_invariants]. If any check fires, compilation fails with a
-    [Core_error]-tagged diagnostic. Off by default (the checks have
-    non-trivial cost on large programs); enable it when debugging
-    pipeline drift or before risky refactors.
-
-    This direct-source API is a legacy/tooling route. Normal Blorp CLI source
-    commands prepare Core entirely in Blorp and call the semantic-middle worker
-    directly. Keep new source-command work off this entrypoint. *)
-
 val compile_preloaded_graph_with_blorp_bridge :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->
@@ -170,33 +106,5 @@ val compile_preloaded_graph_with_blorp_bridge :
   unit ->
   (compile_outcome, Ast.compiler_error list) result
 (** Compatibility compilation through a Blorp frontend graph followed by
-    OCaml typed-AST lowering. The pinned-bootstrap wrapper and selected
-    in-memory tests still use this path; normal CLI source commands do not. *)
-
-val compile_in_memory_source_with_blorp_bridge :
-  ?debug:bool ->
-  ?allow_debug_only_calls:bool ->
-  ?retain_debug_blocks:bool ->
-  ?embed_runtime:bool ->
-  ?on_phase_timing:(phase_timing -> unit) ->
-  filename:string ->
-  source:string ->
-  unit ->
-  (compile_outcome, Ast.compiler_error list) result
-(** Compile supplied user source through the Blorp-owned source and typecheck
-    frontier. [filename] provides module/import identity, but the frontend uses
-    [source] even when the file does not exist or has different contents. *)
-
-val compile_generated_test_harness :
-  ?debug:bool ->
-  ?allow_debug_only_calls:bool ->
-  ?retain_debug_blocks:bool ->
-  ?embed_runtime:bool ->
-  ?on_phase_timing:(phase_timing -> unit) ->
-  filename:string ->
-  source:string ->
-  unit ->
-  (compile_outcome, Ast.compiler_error list) result
-(** Compile compiler-generated test scaffolding through the Blorp-owned source
-    and typecheck frontier. The harness is not a user source file, so its
-    synthetic imports are not subject to unused-import diagnostics. *)
+    OCaml typed-AST lowering. Only the pinned-bootstrap wrapper uses this path;
+    installed CLI commands and test/REPL synthetic sources do not. *)
