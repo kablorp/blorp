@@ -691,11 +691,8 @@ let test_try_add_trait_stub_replaced_by_decl () =
         "no duplicate entries" 1
         (List.length (List.filter (fun t -> t.td_name = "F") env'.traits))
 
-(* Step 5 (Option D): [trait_method_names_transitive] collects method
-   names declared on a trait AND all names reachable through its
-   supertrait chain. The default-body synthesizer uses this set to
-   know which bare-name calls in a default body refer to trait
-   methods and should be rewritten into UFCS form. *)
+let trait_method_names env trait_name =
+  trait_methods_with_declaring_trait env trait_name |> List.map fst
 
 let test_trait_method_names_no_supertraits () =
   let td =
@@ -723,7 +720,7 @@ let test_trait_method_names_no_supertraits () =
         ]
   in
   let env = add_trait (empty ()) td in
-  let names = trait_method_names_transitive env "T" in
+  let names = trait_method_names env "T" in
   Alcotest.(check (list string))
     "own methods" [ "a"; "b" ] (List.sort compare names)
 
@@ -760,7 +757,7 @@ let test_trait_method_names_walks_supertraits () =
   in
   let env = add_trait (empty ()) super in
   let env = add_trait env child in
-  let names = trait_method_names_transitive env "Child" in
+  let names = trait_method_names env "Child" in
   Alcotest.(check (list string))
     "own + inherited" [ "inherited"; "own" ] (List.sort compare names)
 
@@ -798,14 +795,14 @@ let test_trait_method_names_handles_cycle () =
   in
   let env = add_trait (empty ()) a in
   let env = add_trait env b in
-  let names = trait_method_names_transitive env "A" in
+  let names = trait_method_names env "A" in
   Alcotest.(check (list string))
     "both methods, no hang" [ "fa"; "fb" ] (List.sort compare names)
 
 let test_trait_method_names_missing_trait () =
   Alcotest.(check (list string))
     "unknown trait yields empty" []
-    (trait_method_names_transitive (empty ()) "Nonexistent")
+    (trait_method_names (empty ()) "Nonexistent")
 
 let test_try_add_trait_conflict () =
   (* Both declarations carry provenance (td_module_path = Some) — the

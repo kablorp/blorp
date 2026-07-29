@@ -377,53 +377,6 @@ let test_list_type_is_layout_owned () =
         (Blorp.Types.types_equal info.list_elem_ty ty_int)
   | None -> Alcotest.fail "expected list alias to classify as List"
 
-let test_hash_container_layout_is_layout_owned () =
-  let open Blorp.Core_layout_type in
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Count" ([], ty_int);
-  Hashtbl.replace reg.type_aliases "Counts" ([], ty "Set" [ ty "Count" [] ]);
-  Hashtbl.replace reg.type_aliases "CountDict"
-    ([], ty "Dict" [ ty "Count" []; ty_string ]);
-  Hashtbl.replace reg.value_records "Point" ();
-  Hashtbl.replace reg.type_aliases "PointAlias" ([], ty "Point" []);
-  Blorp.Codegen_types.register_enum_type reg "Tiny"
-    [ variant "Zero" 0; variant "One" 1 ];
-  Hashtbl.replace reg.type_aliases "TinyAlias" ([], ty "Tiny" []);
-  (match set_type ~reg (ty "Counts" []) with
-  | Some set_ty ->
-      Alcotest.(check bool)
-        "set aliases expose canonical element type" true
-        (Blorp.Types.types_equal set_ty.set_elem_ty ty_int)
-  | None -> Alcotest.fail "expected set alias to classify as Set");
-  (match dict_type ~reg (ty "CountDict" []) with
-  | Some dict_ty ->
-      Alcotest.(check bool)
-        "dict aliases expose canonical key type" true
-        (Blorp.Types.types_equal dict_ty.dict_key_ty ty_int);
-      Alcotest.(check bool)
-        "dict aliases expose canonical value type" true
-        (Blorp.Types.types_equal dict_ty.dict_value_ty ty_string)
-  | None -> Alcotest.fail "expected dict alias to classify as Dict");
-  Alcotest.(check bool)
-    "alias int keys use immediate hash probing" true
-    (hash_probe_layout ~reg (ty "Count" []) = HashProbeImmediate);
-  Alcotest.(check bool)
-    "wide integer keys stay dispatched" true
-    (hash_probe_layout ~reg (ty "Int128" []) = HashProbeDispatched);
-  Alcotest.(check bool)
-    "enum aliases use immediate hash probing" true
-    (hash_probe_layout ~reg (ty "TinyAlias" []) = HashProbeImmediate);
-  Alcotest.(check bool)
-    "alias int keys are boxed for void* table arguments" true
-    (hash_key_pointer_argument ~reg (ty "Count" []) = PointerArgumentBox);
-  Alcotest.(check bool)
-    "managed keys are borrowed through casts" true
-    (hash_key_pointer_argument ~reg ty_string = PointerArgumentCast);
-  Alcotest.(check bool)
-    "value-record values are boxed for void* table storage" true
-    (boxed_storage_value_pointer_argument ~reg (ty "PointAlias" [])
-    = PointerArgumentBox)
-
 let test_record_field_erased_storage_is_layout_owned () =
   let reg = Blorp.Codegen_types.create_registry () in
   Alcotest.(check bool)
@@ -707,35 +660,6 @@ let test_tensor_layout_descriptor_records_value_struct_policy () =
     "inline struct tensor storage does not release" true
     (storage_policy_release layout.tsl_policy = StorageNoRelease)
 
-let test_tensor_raw_scalar_abi_is_layout_owned () =
-  let open Blorp.Core in
-  let f64_layout =
-    Blorp.Core_layout_type.tensor_raw_scalar_abi TensorFloat64Elements
-  in
-  Alcotest.(check string)
-    "layout-owned f64 C type" "double" f64_layout.tras_c_type;
-  Alcotest.(check string)
-    "layout-owned f64 storage mode" "BLORP_VECTOR_STORAGE_F64"
-    f64_layout.tras_storage_mode;
-  let f64 =
-    Blorp.Core_layout_type.tensor_raw_scalar_abi TensorFloat64Elements
-  in
-  let f32 =
-    Blorp.Core_layout_type.tensor_raw_scalar_abi TensorFloat32Elements
-  in
-  let i64 = Blorp.Core_layout_type.tensor_raw_scalar_abi TensorInt64Elements in
-  Alcotest.(check string) "f64 C type" "double" f64.tras_c_type;
-  Alcotest.(check string) "f64 pointer C type" "double*" f64.tras_pointer_c_type;
-  Alcotest.(check string)
-    "f64 runtime storage mode" "BLORP_VECTOR_STORAGE_F64" f64.tras_storage_mode;
-  Alcotest.(check string) "f64 elem size" "sizeof(double)" f64.tras_elem_size;
-  Alcotest.(check string) "f32 C type" "float" f32.tras_c_type;
-  Alcotest.(check string)
-    "f32 runtime storage mode" "BLORP_VECTOR_STORAGE_F32" f32.tras_storage_mode;
-  Alcotest.(check string) "i64 C type" "long" i64.tras_c_type;
-  Alcotest.(check string)
-    "i64 runtime storage mode" "BLORP_VECTOR_STORAGE_I64" i64.tras_storage_mode
-
 let test_tensor_raw_scalar_kind_for_type_is_layout_owned () =
   let open Blorp.Core in
   let reg = Blorp.Codegen_types.create_registry () in
@@ -762,43 +686,6 @@ let test_tensor_raw_scalar_kind_for_type_is_layout_owned () =
   Alcotest.(check bool)
     "String has no raw scalar kind" true
     (raw_kind ty_string = None)
-
-let test_tensor_numeric_access_is_layout_owned () =
-  let open Blorp.Core in
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
-  Hashtbl.replace reg.type_aliases "Half" ([], ty "Float16" []);
-  let access ty =
-    Blorp.Core_layout_type.tensor_numeric_access_of_type ~reg ty
-  in
-  Alcotest.(check (option string))
-    "Float uses f64 runtime getter" (Some "tensor_get_f64")
-    (Option.map
-       (fun access -> access.Blorp.Core_layout_type.tna_get_intrinsic)
-       (access ty_float));
-  Alcotest.(check bool)
-    "alias to Float preserves f64 raw access" true
-    (match access (ty "Meters" []) with
-    | Some access -> (
-        Blorp.Types.types_equal access.Blorp.Core_layout_type.tna_value_ty
-          ty_float
-        &&
-        match access.tna_fast_access with
-        | Some fast ->
-            fast.tfna_storage_pred_intr = "tensor_is_f64_storage"
-            && fast.tfna_raw_kind = TensorFloat64Elements
-        | None -> false)
-    | None -> false);
-  Alcotest.(check bool)
-    "Float16 is numeric but has no raw view yet" true
-    (match access (ty "Half" []) with
-    | Some access ->
-        access.tna_get_intrinsic = "tensor_get_f16"
-        && Option.is_none access.tna_fast_access
-    | None -> false);
-  Alcotest.(check bool)
-    "Bool is not a numeric tensor reduction element" true
-    (Option.is_none (access ty_bool))
 
 let test_tensor_checked_get_access_is_layout_owned () =
   let reg = Blorp.Codegen_types.create_registry () in
@@ -890,8 +777,6 @@ let suite =
           test_canonical_type_is_layout_owned;
         Alcotest.test_case "list type is layout-owned" `Quick
           test_list_type_is_layout_owned;
-        Alcotest.test_case "hash container layout is layout-owned" `Quick
-          test_hash_container_layout_is_layout_owned;
         Alcotest.test_case "record field erased storage is layout-owned" `Quick
           test_record_field_erased_storage_is_layout_owned;
         Alcotest.test_case "primitive inline width is layout-owned" `Quick
@@ -914,12 +799,8 @@ let suite =
           test_tensor_layout_descriptor_records_boxed_policy;
         Alcotest.test_case "tensor layout records value struct policy" `Quick
           test_tensor_layout_descriptor_records_value_struct_policy;
-        Alcotest.test_case "tensor raw scalar ABI is layout-owned" `Quick
-          test_tensor_raw_scalar_abi_is_layout_owned;
         Alcotest.test_case "tensor raw scalar kind for type is layout-owned"
           `Quick test_tensor_raw_scalar_kind_for_type_is_layout_owned;
-        Alcotest.test_case "tensor numeric access is layout-owned" `Quick
-          test_tensor_numeric_access_is_layout_owned;
         Alcotest.test_case "tensor checked-get access is layout-owned" `Quick
           test_tensor_checked_get_access_is_layout_owned;
         Alcotest.test_case "tensor runtime read helper is layout-owned" `Quick

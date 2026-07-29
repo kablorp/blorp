@@ -111,12 +111,6 @@ let simple_type name = named_type [ name ]
 let list_type elem = NamedType ([ "List" ], [ elem ])
 let option_type elem = NamedType ([ "Option" ], [ elem ])
 
-let rec accepted_type_shape_to_string = function
-  | NamedType (names, []) -> String.concat "|" names
-  | NamedType (names, args) ->
-      Printf.sprintf "%s[%s]" (String.concat "|" names)
-        (String.concat ", " (List.map accepted_type_shape_to_string args))
-
 let rec accepted_type_shape_matches shape ty =
   match (shape, ty) with
   | NamedType (names, expected_args), Ast.TyNamed (name, actual_args) ->

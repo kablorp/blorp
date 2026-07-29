@@ -51,18 +51,6 @@ let expect_invalid_response_contains expected = function
       Alcotest.fail
         ("expected invalid_response, got " ^ code ^ ": " ^ message)
 
-let with_input_text text f =
-  let path = Filename.temp_file "blorp-bridge-response-" ".jsonl" in
-  Fun.protect
-    ~finally:(fun () -> try Sys.remove path with _ -> ())
-    (fun () ->
-      let output = open_out_bin path in
-      Fun.protect
-        ~finally:(fun () -> close_out output)
-        (fun () -> output_string output text);
-      let input = open_in_bin path in
-      Fun.protect ~finally:(fun () -> close_in input) (fun () -> f input))
-
 let with_env name value f =
   let old = Sys.getenv_opt name in
   Unix.putenv name value;
@@ -82,22 +70,6 @@ let parsed_program_json ?(diagnostics = []) decls =
   Lsp_json.Object
     [
       ("kind", Lsp_json.String "parsed_program");
-      ( "source",
-        Lsp_json.Object
-          [
-            ("kind", Lsp_json.String "source_file");
-            ("path", Lsp_json.String "main.brp");
-            ("module", Lsp_json.String "main");
-            ("text", Lsp_json.String "");
-          ] );
-      ("decls", Lsp_json.Array decls);
-      ("diagnostics", Lsp_json.Array diagnostics);
-    ]
-
-let typed_program_json ?(diagnostics = []) decls =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "typed_program");
       ( "source",
         Lsp_json.Object
           [
@@ -203,26 +175,6 @@ let parsed_ast_artifact ?(ast_phase = "raw_parse") ?comments ?module_surface
     | None -> base_fields
   in
   Lsp_json.Object fields
-
-let compile_options_json files =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "compile");
-      ("ast_only", Lsp_json.Bool false);
-      ("dump_ast", Lsp_json.Bool false);
-      ("dump_typed_ast", Lsp_json.Bool false);
-      ("dump_core_after", Lsp_json.Array []);
-      ("dump_file", Lsp_json.Null);
-      ("stop_after", Lsp_json.Null);
-      ("time_phases", Lsp_json.Bool false);
-      ("check_invariants", Lsp_json.Bool false);
-      ("debug", Lsp_json.Bool false);
-      ("no_format", Lsp_json.Bool true);
-      ("embed_runtime", Lsp_json.Bool true);
-      ("std_dir", Lsp_json.Null);
-      ("output", Lsp_json.Null);
-      ("files", string_array files);
-    ]
 
 let test_options_json paths =
   Lsp_json.Object
@@ -462,46 +414,6 @@ let test_parse_sources_request_can_use_typecheck_phase () =
         "phase" "typecheck_source" (string_field "ast_phase" first)
   | _ -> Alcotest.fail "expected one parse source request item"
 
-let test_typecheck_graph_request_uses_single_graph_envelope () =
-  let target =
-    {
-      Bridge.typecheck_import_path = "src/main.brp";
-      typecheck_import_module_name = "main";
-      typecheck_import_module_path = "main";
-      typecheck_import_text = "import:\n\tdep: answer\n";
-      typecheck_import_origin = Bridge.CliFrontendUserModule;
-    }
-  in
-  let dependency =
-    {
-      Bridge.typecheck_import_path = "src/dep.brp";
-      typecheck_import_module_name = "dep";
-      typecheck_import_module_path = "dep";
-      typecheck_import_text = "pure func answer() -> Int: 1\n";
-      typecheck_import_origin = Bridge.CliFrontendUserModule;
-    }
-  in
-  let request =
-    Bridge.typecheck_graph_request_json_with_policy ~resolved_imports:[]
-      ~allow_debug_only_calls:false ~target ~modules:[ dependency ]
-      ~module_targets:[ "dep" ]
-    |> parse_json_exn
-  in
-  Alcotest.(check string)
-    "action" "typecheck_graph" (string_field "action" request);
-  let payload = field "payload" request in
-  Alcotest.(check string)
-    "target path" "src/main.brp" (string_field "path" (field "target" payload));
-  match array_field "modules" payload with
-  | [ first ] ->
-      Alcotest.(check string)
-        "dependency path" "src/dep.brp" (string_field "path" first);
-      (match array_field "module_targets" payload with
-      | [ Lsp_json.String target ] ->
-          Alcotest.(check string) "module target" "dep" target
-      | _ -> Alcotest.fail "expected one graph module target")
-  | _ -> Alcotest.fail "expected one graph module"
-
 let test_cli_run_request_uses_bridge_envelope () =
   let request =
     Blorp.Compiler_blorp_bridge.cli_run_request_json
@@ -673,171 +585,6 @@ let test_parse_source_response_returns_diagnostics () =
   | Ok (Blorp.Compiler_blorp_bridge.ParsedSource _) ->
       Alcotest.fail "expected parse diagnostics"
   | Error (_, message) -> Alcotest.fail message
-
-let typecheck_artifact ?(ast_phase = "typecheck_source") ?(type_errors = [])
-    ?(import_bindings = []) ?ctfe_status ?comments ?module_surface typed_program =
-  let optional_fields =
-    (match comments with Some value -> [ ("comments", Lsp_json.Array value) ] | None -> [])
-    @ (match ctfe_status with
-      | Some value -> [ ("ctfe_status", Lsp_json.String value) ]
-      | None -> [])
-    @
-    match module_surface with
-    | Some value -> [ ("module_surface", value) ]
-    | None -> []
-  in
-  Lsp_json.Object
-    ([
-       ("ast_phase", Lsp_json.String ast_phase);
-       ("typed_program", typed_program);
-       ("type_errors", string_array type_errors);
-       ("import_bindings", Lsp_json.Array import_bindings);
-     ]
-    @ optional_fields)
-
-let graph_source_artifact path module_name artifact =
-  match artifact with
-  | Lsp_json.Object fields ->
-      Lsp_json.Object
-        (("path", Lsp_json.String path)
-        :: ("module", Lsp_json.String module_name)
-        :: fields)
-  | _ -> assert false
-
-let typecheck_graph_source_artifact path module_name typed_program =
-  typecheck_artifact ~ctfe_status:"evaluated" typed_program
-  |> graph_source_artifact path module_name
-
-let test_typecheck_graph_response_rejects_invalid_ctfe_status () =
-  typecheck_artifact ~ctfe_status:"pending_ocaml" (typed_program_json [])
-  |> graph_source_artifact "main.brp" "main"
-  |> bridge_success_json
-  |> Blorp.Compiler_blorp_bridge.typecheck_graph_source_response_json
-  |> expect_invalid_response_contains "unsupported ctfe_status `pending_ocaml`"
-
-let test_typecheck_graph_response_preserves_errors_for_invalid_typed_tree ()
-    =
-  let invalid_typed_program =
-    typed_program_json
-      [
-        Lsp_json.Object
-          [ ("kind", Lsp_json.String "not_a_decodable_typed_decl") ];
-      ]
-  in
-  let response =
-    typecheck_artifact
-      ~type_errors:[ "Function 'bad' returns wrong type" ] invalid_typed_program
-    |> graph_source_artifact "main.brp" "main"
-    |> bridge_success_json
-  in
-  match Blorp.Compiler_blorp_bridge.typecheck_graph_source_response_json response with
-  | Ok
-      {
-        Bridge.typechecked_graph_artifact =
-          {
-            typechecked_errors = [ "Function 'bad' returns wrong type" ];
-            typechecked_program;
-            typechecked_ctfe_evaluated_by_blorp = false;
-            _;
-          };
-        _;
-      } ->
-      Alcotest.(check int)
-        "fallback typed program decls" 0
-        (List.length (Blorp.Typed_ast.program_decls typechecked_program))
-  | Ok _ -> Alcotest.fail "expected typecheck errors to be preserved"
-  | Error (_, message) -> Alcotest.fail message
-
-let test_typecheck_graph_response_rejects_raw_phase () =
-  typecheck_artifact ~ast_phase:"raw_parse" (typed_program_json [])
-  |> graph_source_artifact "main.brp" "main"
-  |> bridge_success_json
-  |> Blorp.Compiler_blorp_bridge.typecheck_graph_source_response_json
-  |> expect_invalid_response_contains
-       "typecheck_source artifact must have ast_phase typecheck_source"
-
-let test_typecheck_graph_stream_response_decodes_all_artifacts () =
-  let response =
-    String.concat "\n"
-      [
-        bridge_success_json
-          (typecheck_graph_source_artifact "src/dep.brp" "dep"
-             (typed_program_json []));
-        bridge_success_json
-          (typecheck_graph_source_artifact "src/main.brp" "main"
-             (typed_program_json []));
-      ]
-  in
-  match
-    with_input_text response
-      (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
-  with
-  | Ok
-      {
-        Bridge.typechecked_graph_modules =
-          [
-            {
-              typechecked_graph_path = "src/dep.brp";
-              typechecked_graph_module_name = "dep";
-              _;
-            };
-          ];
-        typechecked_graph_target =
-          {
-            typechecked_graph_path = "src/main.brp";
-            typechecked_graph_module_name = "main";
-            _;
-          };
-      } ->
-      ()
-  | Ok _ -> Alcotest.fail "expected one module and one target artifact"
-  | Error (_, message) -> Alcotest.fail message
-
-let test_typecheck_graph_stream_response_requires_target () =
-  bridge_success_json
-    (typecheck_graph_source_artifact "src/dep.brp" "dep"
-       (typed_program_json []))
-  |> fun response ->
-  with_input_text response
-    (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
-  |> expect_invalid_response_contains "expected one target"
-
-let test_typecheck_graph_stream_response_rejects_trailing_artifact () =
-  let artifact path module_name =
-    bridge_success_json
-      (typecheck_graph_source_artifact path module_name (typed_program_json []))
-  in
-  String.concat "\n"
-    [
-      artifact "src/dep.brp" "dep";
-      artifact "src/main.brp" "main";
-      artifact "src/extra.brp" "extra";
-    ]
-  |> fun response ->
-  with_input_text response
-    (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
-  |> expect_invalid_response_contains "trailing artifacts"
-
-let test_typecheck_graph_stream_response_preserves_trailing_error () =
-  let artifact path module_name =
-    bridge_success_json
-      (typecheck_graph_source_artifact path module_name (typed_program_json []))
-  in
-  let response =
-    String.concat "\n"
-      [
-        artifact "src/dep.brp" "dep";
-        artifact "src/main.brp" "main";
-        Bridge.error_response "late_error" "late bridge failure";
-      ]
-  in
-  match
-    with_input_text response
-      (Bridge.typecheck_graph_stream_response_channel ~module_count:1)
-  with
-  | Error ("bridge_error", "late bridge failure") -> ()
-  | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message)
-  | Ok _ -> Alcotest.fail "expected trailing bridge error"
 
 let test_parse_sources_response_decodes_items () =
   let response =
@@ -1027,318 +774,16 @@ let test_cli_run_response_decodes_test_options () =
   | Ok _ -> Alcotest.fail "expected decoded CLI test options"
   | Error (_, message) -> Alcotest.fail message
 
-let frontend_origin_json ?package kind =
-  let fields =
-    [ ("kind", Lsp_json.String kind) ]
-    @
-    match package with
-    | Some value -> [ ("package", Lsp_json.String value) ]
-    | None -> []
-  in
-  Lsp_json.Object fields
-
-let frontend_graph_source ?(ast_phase = "typecheck_source")
-    ?(origin = frontend_origin_json "user") ?(include_module_surface = true)
-    path module_name text =
-  let module_surface =
-    if include_module_surface then Some (module_surface_json module_name)
-    else None
-  in
-  Lsp_json.Object
-    [
-      ("path", Lsp_json.String path);
-      ("module", Lsp_json.String module_name);
-      ("source_text", Lsp_json.String text);
-      ( "parsed_source",
-        parsed_ast_artifact ~ast_phase ?module_surface (parsed_program_json [])
-      );
-      ("origin", origin);
-    ]
-
-let frontend_source_package_json ?(alias = "sample") ?(name = "sample")
-    ?(root = "vendor/sample") ?(source_dir = "vendor/sample/src")
-    ?(exports = [ "sample" ]) () =
-  Lsp_json.Object
-    [
-      ("alias", Lsp_json.String alias);
-      ("name", Lsp_json.String name);
-      ("root", Lsp_json.String root);
-      ("source_dir", Lsp_json.String source_dir);
-      ("exports", string_array exports);
-    ]
-
-let frontend_graph_context_json ?std_dir ?(source_packages = [])
-    ?(package_roots = []) () =
-  Lsp_json.Object
-    [
-      ( "std_dir",
-        match std_dir with
-        | Some path -> Lsp_json.String path
-        | None -> Lsp_json.Null );
-      ("source_packages", Lsp_json.Array source_packages);
-      ("package_roots", string_array package_roots);
-    ]
-
-let frontend_import_edge ?resolved_path ?resolved_module ?resolved_origin
-    ~from_path ~from_module ~import_path () =
-  Lsp_json.Object
-    [
-      ("from_path", Lsp_json.String from_path);
-      ("from_module", Lsp_json.String from_module);
-      ("import_path", Lsp_json.String import_path);
-      ( "resolved_path",
-        match resolved_path with
-        | Some path -> Lsp_json.String path
-        | None -> Lsp_json.Null );
-      ( "resolved_module",
-        match resolved_module with
-        | Some module_name -> Lsp_json.String module_name
-        | None -> Lsp_json.Null );
-      ( "resolved_origin",
-        match resolved_origin with
-        | Some origin -> origin
-        | None -> Lsp_json.Null );
-    ]
-
-let test_cli_run_response_decodes_frontend_module_graph () =
+let test_cli_run_response_marks_source_command_without_decoding_graph () =
   let response =
     bridge_success_json
       (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
-           ("options", compile_options_json [ "src/main.brp" ]);
-           ( "context",
-             frontend_graph_context_json ~std_dir:"custom-std"
-               ~source_packages:[ frontend_source_package_json () ]
-               ~package_roots:[ "pkg" ] () );
-           ( "roots",
-             Lsp_json.Array
-               [
-                 frontend_graph_source "src/main.brp" "main"
-                   "import:\n\t./dep";
-               ] );
-           ( "modules",
-             Lsp_json.Array
-               [
-                 frontend_graph_source "src/dep.brp" "./dep" "func dep(): 1";
-               ] );
-           ( "imports",
-             Lsp_json.Array
-               [
-                 frontend_import_edge ~from_path:"src/main.brp"
-                   ~from_module:"main" ~import_path:"./dep"
-                   ~resolved_path:"src/dep.brp" ~resolved_module:"./dep"
-                   ~resolved_origin:(frontend_origin_json "user") ();
-               ] );
-           ("diagnostics", Lsp_json.Array []);
-         ])
+         [ ("kind", Lsp_json.String "frontend_module_graph") ])
   in
   match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
-        {
-          cli_frontend_graph_args = [ "compile"; "--no-format"; "src/main.brp" ];
-          cli_frontend_graph_compile_options =
-            { cli_compile_files = [ "src/main.brp" ]; _ };
-          cli_frontend_graph_context =
-            {
-              cli_frontend_context_std_dir = Some "custom-std";
-              cli_frontend_context_source_packages =
-                [
-                  {
-                    cli_frontend_source_package_alias = "sample";
-                    cli_frontend_source_package_name = "sample";
-                    cli_frontend_source_package_root = "vendor/sample";
-                    cli_frontend_source_package_source_dir =
-                      "vendor/sample/src";
-                    cli_frontend_source_package_exports = [ "sample" ];
-                  };
-                ];
-              cli_frontend_context_package_roots = [ "pkg" ];
-            };
-          cli_frontend_graph_roots =
-            [
-              {
-                cli_frontend_graph_path = "src/main.brp";
-                cli_frontend_graph_module_name = "main";
-                cli_frontend_graph_origin =
-                  Blorp.Compiler_blorp_bridge.CliFrontendUserModule;
-                _;
-              };
-            ];
-          cli_frontend_graph_modules =
-            [
-              {
-                cli_frontend_graph_path = "src/dep.brp";
-                cli_frontend_graph_module_name = "./dep";
-                cli_frontend_graph_origin =
-                  Blorp.Compiler_blorp_bridge.CliFrontendUserModule;
-                _;
-              };
-            ];
-          cli_frontend_graph_imports =
-            [
-              {
-                cli_frontend_import_from_module = "main";
-                cli_frontend_import_path = "./dep";
-                cli_frontend_import_resolved_path = Some "src/dep.brp";
-                cli_frontend_import_resolved_module = Some "./dep";
-                _;
-              };
-            ];
-          cli_frontend_graph_diagnostics = [];
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded frontend module graph"
+  | Ok Blorp.Compiler_blorp_bridge.CliRunSourceCommand -> ()
+  | Ok _ -> Alcotest.fail "expected source-command marker"
   | Error (_, message) -> Alcotest.fail message
-
-let test_cli_run_response_decodes_generated_frontend_origin () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ( "args",
-             string_array
-               [ "compile"; "--no-format"; "__suite_selector_harness__.brp" ] );
-           ( "options",
-             compile_options_json [ "__suite_selector_harness__.brp" ] );
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [
-                 frontend_graph_source
-                   ~origin:(frontend_origin_json "generated")
-                   "__suite_selector_harness__.brp"
-                   "__suite_selector_harness__" "func main(): 0";
-               ] );
-           ("modules", Lsp_json.Array []);
-           ("imports", Lsp_json.Array []);
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunFrontendModuleGraph
-        {
-          cli_frontend_graph_roots =
-            [
-              {
-                cli_frontend_graph_origin =
-                  Blorp.Compiler_blorp_bridge.CliFrontendGeneratedModule;
-                _;
-              };
-            ];
-          _;
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded generated frontend origin"
-  | Error (_, message) -> Alcotest.fail message
-
-let test_cli_run_response_rejects_source_run_frontend_graph () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "run");
-           ("args", string_array [ "run"; "src/main.brp" ]);
-           ("options", compile_options_json [ "src/main.brp" ]);
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [ frontend_graph_source "src/main.brp" "main" "func main(): 0" ]
-           );
-           ("modules", Lsp_json.Array []);
-           ("imports", Lsp_json.Array []);
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains
-       "unsupported CLI frontend command `run`"
-
-let test_cli_run_response_rejects_frontend_graph_missing_resolved_target () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
-           ("options", compile_options_json [ "src/main.brp" ]);
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [ frontend_graph_source "src/main.brp" "main" "import:\n\t./dep" ]
-           );
-           ("modules", Lsp_json.Array []);
-           ( "imports",
-             Lsp_json.Array
-               [
-                 frontend_import_edge ~from_path:"src/main.brp"
-                   ~from_module:"main" ~import_path:"./dep"
-                   ~resolved_path:"src/dep.brp" ~resolved_module:"./dep"
-                   ~resolved_origin:(frontend_origin_json "user") ();
-               ] );
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "absent from the graph"
-
-let test_cli_run_response_rejects_raw_frontend_graph_source () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
-           ("options", compile_options_json [ "src/main.brp" ]);
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [
-                 frontend_graph_source ~ast_phase:"raw_parse" "src/main.brp"
-                   "main" "func main(args: List[String]) -> Int: 0";
-               ] );
-           ("modules", Lsp_json.Array []);
-           ("imports", Lsp_json.Array []);
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "frontend module graph source must be typecheck_source"
-
-let test_cli_run_response_rejects_frontend_graph_missing_module_surface () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "compile"; "--no-format"; "src/main.brp" ]);
-           ("options", compile_options_json [ "src/main.brp" ]);
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [
-                 frontend_graph_source ~include_module_surface:false
-                   "src/main.brp" "main"
-                   "func main(args: List[String]) -> Int: 0";
-               ] );
-           ("modules", Lsp_json.Array []);
-           ("imports", Lsp_json.Array []);
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains
-       "frontend module graph source must include module_surface"
 
 let test_cli_run_response_rejects_legacy_parsed_source_artifact () =
   let response =
@@ -1356,13 +801,7 @@ let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
   let response =
     bridge_success_json
       (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_options");
-           ("command", Lsp_json.String "compile");
-           ( "args",
-             string_array [ "compile"; "--no-format"; "a.brp" ] );
-           ("options", compile_options_json [ "a.brp" ]);
-         ])
+         [ ("kind", Lsp_json.String "frontend_options") ])
   in
   Blorp.Compiler_blorp_bridge.cli_run_response_json response
   |> expect_invalid_response_contains
@@ -1487,30 +926,6 @@ let test_cli_run_response_decodes_package_vendor_options () =
   | Ok _ -> Alcotest.fail "expected decoded CLI package vendor options"
   | Error (_, message) -> Alcotest.fail message
 
-let test_cli_run_response_rejects_mismatched_frontend_args () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "frontend_module_graph");
-           ("command", Lsp_json.String "compile");
-           ("args", string_array [ "run"; "a.brp" ]);
-           ("options", compile_options_json [ "a.brp" ]);
-           ("context", frontend_graph_context_json ());
-           ( "roots",
-             Lsp_json.Array
-               [
-                 frontend_graph_source "a.brp" "a"
-                   "func main(args: List[String]) -> Int: 0";
-               ] );
-           ("modules", Lsp_json.Array []);
-           ("imports", Lsp_json.Array []);
-           ("diagnostics", Lsp_json.Array []);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "expected `compile`"
-
 let test_cli_run_response_rejects_mismatched_repl_args () =
   let response =
     bridge_success_json
@@ -1567,119 +982,6 @@ let with_temp_dir f =
       in
       remove root)
     (fun () -> f root)
-
-let test_process_stdout_file_waits_and_cleans_up () =
-  with_temp_dir (fun root ->
-      let helper = Filename.concat root "bridge-helper.sh" in
-      let marker = Filename.concat root "helper-finished" in
-      let stdout_path = ref None in
-      write_file helper
-        "#!/bin/sh\nprintf 'first\\nsecond\\n'\nprintf 'done' > \"$1\"\nprintf 'warning' >&2\n";
-      Unix.chmod helper 0o700;
-      let exit_code =
-        Bridge.with_process_stdout_file helper [ marker ] (fun completed ->
-            stdout_path := Some completed.Bridge.process_stdout_path;
-            Alcotest.(check bool)
-              "helper exited before response consumption" true
-              (Sys.file_exists marker);
-            Alcotest.(check string)
-              "file-backed stdout" "first\nsecond\n"
-              (Bridge.read_file completed.process_stdout_path);
-            Alcotest.(check int)
-              "stdout byte count" 13 completed.process_stdout_bytes;
-            Alcotest.(check string)
-              "stderr capture" "warning" completed.process_stderr_output;
-            completed.process_exit_code)
-      in
-      Alcotest.(check int) "process exit code" 0 exit_code;
-      match !stdout_path with
-      | Some path ->
-          Alcotest.(check bool)
-            "stdout file removed after consumer" false (Sys.file_exists path)
-      | None -> Alcotest.fail "expected a file-backed stdout path")
-
-let typecheck_response_helper root response =
-  let response_path = Filename.concat root "typecheck-response.jsonl" in
-  let helper = Filename.concat root "typecheck-helper.sh" in
-  write_file response_path response;
-  write_file helper "#!/bin/sh\ncat \"$BLORP_TEST_RESPONSE\"\n";
-  Unix.chmod helper 0o700;
-  (helper, response_path)
-
-let test_prepared_typecheck_request_decodes_and_cleans_up () =
-  with_temp_dir (fun root ->
-      let response =
-        bridge_success_json
-          (typecheck_graph_source_artifact "src/main.brp" "main"
-             (typed_program_json []))
-      in
-      let helper, response_path = typecheck_response_helper root response in
-      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
-      let request_path = request.request_path in
-      let result =
-        with_env "BLORP_TEST_RESPONSE" response_path (fun () ->
-            Bridge.run_prepared_typecheck_graph_request ~module_count:0
-              (fun () -> Ok helper)
-              request)
-      in
-      (match result with
-      | Ok graph ->
-          Alcotest.(check string)
-            "target path" "src/main.brp"
-            graph.Bridge.typechecked_graph_target.typechecked_graph_path
-      | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message));
-      Alcotest.(check bool)
-        "request removed after successful decode" false
-        (Sys.file_exists request_path))
-
-let test_prepared_typecheck_request_cleans_up_after_decode_error () =
-  with_temp_dir (fun root ->
-      let helper, response_path = typecheck_response_helper root "not json" in
-      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
-      let request_path = request.request_path in
-      let result =
-        with_env "BLORP_TEST_RESPONSE" response_path (fun () ->
-            Bridge.run_prepared_typecheck_graph_request ~module_count:0
-              (fun () -> Ok helper)
-              request)
-      in
-      expect_invalid_response_contains "expected" result;
-      Alcotest.(check bool)
-        "request removed after decode error" false (Sys.file_exists request_path))
-
-let test_prepared_typecheck_request_bounds_process_failure () =
-  with_temp_dir (fun root ->
-      let helper = Filename.concat root "failing-typecheck-helper.sh" in
-      let stdout_path = Filename.concat root "large-stdout" in
-      let stderr_path = Filename.concat root "large-stderr" in
-      let large_output = String.make (Bridge.bridge_error_excerpt_limit + 128) 'x' in
-      write_file stdout_path large_output;
-      write_file stderr_path large_output;
-      write_file helper
-        "#!/bin/sh\ncat \"$BLORP_TEST_STDOUT\"\ncat \"$BLORP_TEST_STDERR\" >&2\nexit 7\n";
-      Unix.chmod helper 0o700;
-      let request = Bridge.prepare_bridge_request ~stats_enabled:false "{}" in
-      let request_path = request.request_path in
-      let result =
-        with_env "BLORP_TEST_STDOUT" stdout_path (fun () ->
-            with_env "BLORP_TEST_STDERR" stderr_path (fun () ->
-                Bridge.run_prepared_typecheck_graph_request ~module_count:0
-                  (fun () -> Ok helper)
-                  request))
-      in
-      (match result with
-      | Error ("bridge_command_failed", message) ->
-          Alcotest.(check bool)
-            "reports helper exit" true (contains message "exited 7");
-          Alcotest.(check bool)
-            "truncates process output" true (contains message "<truncated 128 bytes>");
-          Alcotest.(check bool)
-            "does not return full process output" true
-            (String.length message < String.length large_output * 2)
-      | Error (code, message) -> Alcotest.fail (code ^ ": " ^ message)
-      | Ok _ -> Alcotest.fail "expected typecheck helper failure");
-      Alcotest.(check bool)
-        "request removed after process failure" false (Sys.file_exists request_path))
 
 let test_bridge_helper_compiler_finds_pinned_bootstrap () =
   with_temp_dir (fun root ->
@@ -1766,90 +1068,6 @@ let test_prepared_bridge_request_owns_stats_and_cleanup () =
   Alcotest.(check bool)
     "host heap compacted before bridge resolution" true
     !resolver_saw_compaction
-
-let test_emit_core_capture_writes_request_without_starting_renderer () =
-  with_temp_dir (fun root ->
-      let capture_path = Filename.concat root "captured-request.json" in
-      let marker_path = Filename.concat root "renderer-started" in
-      let helper_path = Filename.concat root "renderer-helper.sh" in
-      write_file helper_path
-        ("#!/bin/sh\nprintf started > " ^ Filename.quote marker_path ^ "\n");
-      Unix.chmod helper_path 0o700;
-      let result =
-        with_env Bridge.capture_emit_core_request_env capture_path (fun () ->
-            with_env Bridge.prepared_renderer_bridge_bin_env helper_path (fun () ->
-                try
-                  ignore
-                    (Bridge.emit_core_c_artifact_exn ~profile:true
-                       (Lsp_json.Object [ ("kind", Lsp_json.String "program") ]));
-                  Alcotest.fail "expected capture-only renderer stop"
-                with Invalid_argument message -> message))
-      in
-      Alcotest.(check bool)
-        "capture reports renderer stop" true
-        (contains result "captured emit_core_c request");
-      Alcotest.(check bool)
-        "capture file exists" true (Sys.file_exists capture_path);
-      Alcotest.(check bool)
-        "renderer was not started" false (Sys.file_exists marker_path);
-      let captured = Bridge.read_file capture_path |> parse_json_exn in
-      (match field "schema" captured with
-      | Lsp_json.Int schema ->
-          Alcotest.(check int) "captured schema" 1 schema
-      | _ -> Alcotest.fail "expected integer JSON field schema");
-      Alcotest.(check string)
-        "captured domain" "compiler" (string_field "domain" captured);
-      Alcotest.(check string)
-        "captured action" "emit_core_c" (string_field "action" captured);
-      let payload = field "payload" captured in
-      Alcotest.(check bool)
-        "captured profile" true (bool_field "profile" payload);
-      match field "core" payload with
-      | Lsp_json.Object fields ->
-          Alcotest.(check string)
-            "captured core" "program"
-            (string_field "kind" (Lsp_json.Object fields))
-      | _ -> Alcotest.fail "expected captured Core object")
-
-
-let test_typecheck_capture_writes_request_without_starting_helper () =
-  with_temp_dir (fun root ->
-      let capture_path = Filename.concat root "captured-typecheck-request.json" in
-      let marker_path = Filename.concat root "typecheck-helper-started" in
-      let helper_path = Filename.concat root "typecheck-helper.sh" in
-      let target =
-        {
-          Bridge.typecheck_import_path = "src/main.brp";
-          typecheck_import_module_name = "main";
-          typecheck_import_module_path = "main";
-          typecheck_import_text = "func main(args: List[String]) -> Int: 0\n";
-          typecheck_import_origin = Bridge.CliFrontendUserModule;
-        }
-      in
-      write_file helper_path
-        ("#!/bin/sh\nprintf started > " ^ Filename.quote marker_path ^ "\n");
-      Unix.chmod helper_path 0o700;
-      let result =
-        with_env Bridge.capture_typecheck_graph_request_env capture_path (fun () ->
-            with_env Bridge.prepared_typecheck_bridge_bin_env helper_path (fun () ->
-                try
-                  ignore
-                    (Bridge.typecheck_graph_via_command_with_policy
-                       ~resolved_imports:[] ~allow_debug_only_calls:false ~target
-                       ~modules:[] ~module_targets:[]);
-                  Alcotest.fail "expected capture-only typecheck stop"
-                with Invalid_argument message -> message))
-      in
-      Alcotest.(check bool)
-        "capture reports helper stop" true
-        (contains result "captured typecheck_graph request");
-      Alcotest.(check bool)
-        "capture file exists" true (Sys.file_exists capture_path);
-      Alcotest.(check bool)
-        "helper was not started" false (Sys.file_exists marker_path);
-      let captured = Bridge.read_file capture_path |> parse_json_exn in
-      Alcotest.(check string)
-        "captured action" "typecheck_graph" (string_field "action" captured))
 
 let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
@@ -2122,29 +1340,6 @@ let test_generated_c_bootstrap_compatibility_preserves_union_tag_checks () =
     "preserves boxed union tag check" true
     (contains rewritten "TAG_compiler_model__Payload_SomeCase")
 
-let transport_suite =
-  [
-    ( "file_backed_typecheck",
-      [
-        Alcotest.test_case "stream decodes all artifacts" `Quick
-          test_typecheck_graph_stream_response_decodes_all_artifacts;
-        Alcotest.test_case "stream requires target" `Quick
-          test_typecheck_graph_stream_response_requires_target;
-        Alcotest.test_case "stream rejects trailing artifact" `Quick
-          test_typecheck_graph_stream_response_rejects_trailing_artifact;
-        Alcotest.test_case "stream preserves trailing error" `Quick
-          test_typecheck_graph_stream_response_preserves_trailing_error;
-        Alcotest.test_case "process waits and cleans up" `Quick
-          test_process_stdout_file_waits_and_cleans_up;
-        Alcotest.test_case "prepared request decodes and cleans up" `Quick
-          test_prepared_typecheck_request_decodes_and_cleans_up;
-        Alcotest.test_case "prepared request cleans decode failure" `Quick
-          test_prepared_typecheck_request_cleans_up_after_decode_error;
-        Alcotest.test_case "prepared request bounds process failure" `Quick
-          test_prepared_typecheck_request_bounds_process_failure;
-      ] );
-  ]
-
 let suite =
   [
     ( "renderer_bridge_build",
@@ -2176,8 +1371,6 @@ let suite =
           test_parse_sources_request_uses_bridge_envelope;
         Alcotest.test_case "parse_sources request can use typecheck phase"
           `Quick test_parse_sources_request_can_use_typecheck_phase;
-        Alcotest.test_case "typecheck_graph request uses one envelope" `Quick
-          test_typecheck_graph_request_uses_single_graph_envelope;
         Alcotest.test_case "CLI run request uses bridge envelope" `Quick
           test_cli_run_request_uses_bridge_envelope;
         Alcotest.test_case "CLI run request can include version context" `Quick
@@ -2195,15 +1388,6 @@ let suite =
           test_parse_source_response_rejects_invalid_module_surface_kind;
         Alcotest.test_case "parse_source response returns diagnostics" `Quick
           test_parse_source_response_returns_diagnostics;
-        Alcotest.test_case
-          "typecheck_graph response rejects invalid CTFE status" `Quick
-          test_typecheck_graph_response_rejects_invalid_ctfe_status;
-        Alcotest.test_case
-          "typecheck_graph response preserves errors for invalid typed tree"
-          `Quick
-          test_typecheck_graph_response_preserves_errors_for_invalid_typed_tree;
-        Alcotest.test_case "typecheck_graph response rejects raw phase" `Quick
-          test_typecheck_graph_response_rejects_raw_phase;
         Alcotest.test_case "parse_sources response decodes items" `Quick
           test_parse_sources_response_decodes_items;
         Alcotest.test_case "CLI run response decodes handled" `Quick
@@ -2212,22 +1396,9 @@ let suite =
           test_cli_run_response_decodes_delegate;
         Alcotest.test_case "CLI run response decodes test options" `Quick
           test_cli_run_response_decodes_test_options;
-        Alcotest.test_case "CLI run response decodes frontend module graph"
-          `Quick test_cli_run_response_decodes_frontend_module_graph;
-        Alcotest.test_case "CLI run response decodes generated frontend origin"
-          `Quick test_cli_run_response_decodes_generated_frontend_origin;
-        Alcotest.test_case "CLI run response rejects source run frontend graph"
-          `Quick test_cli_run_response_rejects_source_run_frontend_graph;
         Alcotest.test_case
-          "CLI run response rejects frontend graph missing resolved target" `Quick
-          test_cli_run_response_rejects_frontend_graph_missing_resolved_target;
-        Alcotest.test_case
-          "CLI run response rejects raw frontend graph source" `Quick
-          test_cli_run_response_rejects_raw_frontend_graph_source;
-        Alcotest.test_case
-          "CLI run response rejects frontend graph missing module surface"
-          `Quick
-          test_cli_run_response_rejects_frontend_graph_missing_module_surface;
+          "CLI run response marks source command without decoding graph" `Quick
+          test_cli_run_response_marks_source_command_without_decoding_graph;
         Alcotest.test_case
           "CLI run response rejects legacy parsed source artifact" `Quick
           test_cli_run_response_rejects_legacy_parsed_source_artifact;
@@ -2244,8 +1415,6 @@ let suite =
           test_cli_run_response_decodes_package_pack_options;
         Alcotest.test_case "CLI run response decodes package vendor options"
           `Quick test_cli_run_response_decodes_package_vendor_options;
-        Alcotest.test_case "CLI run response rejects mismatched frontend args"
-          `Quick test_cli_run_response_rejects_mismatched_frontend_args;
         Alcotest.test_case "CLI run response rejects mismatched repl args"
           `Quick test_cli_run_response_rejects_mismatched_repl_args;
         Alcotest.test_case "CLI run response rejects mismatched package args"
@@ -2258,12 +1427,6 @@ let suite =
           `Quick test_bridge_helper_compiler_rejects_current_executable_override;
         Alcotest.test_case "prepared request owns stats and cleanup" `Quick
           test_prepared_bridge_request_owns_stats_and_cleanup;
-        Alcotest.test_case
-          "emit Core capture writes request without starting renderer" `Quick
-          test_emit_core_capture_writes_request_without_starting_renderer;
-        Alcotest.test_case
-          "typecheck capture writes request without starting helper" `Quick
-          test_typecheck_capture_writes_request_without_starting_helper;
         Alcotest.test_case "cache key includes helper entrypoint" `Quick
           test_bridge_cache_key_includes_helper_entrypoint;
         Alcotest.test_case "cache key includes std sources" `Quick

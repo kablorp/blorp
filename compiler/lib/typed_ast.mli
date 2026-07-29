@@ -186,8 +186,6 @@ val of_ast_expr_with_type_info :
   Ast.expr ->
   (expr, error) result
 
-val of_ast_var_decl_with_source :
-  source_var:Ast.var_decl -> Ast.var_decl -> (var_decl, error) result
 val of_ast_decl : Ast.decl -> (decl, error) result
 
 val of_ast_program :
@@ -218,12 +216,8 @@ val record_info : record_decl -> record_info
 val record_field_infos : record_decl -> record_field_info list
 val type_alias_ast : type_alias_decl -> Ast.type_alias_decl
 val type_alias_info : type_alias_decl -> type_alias_info
-val type_alias_semantic_target_type : type_alias_decl -> Ast.type_expr
 val impl_ast : impl_decl -> Ast.impl_decl
 val impl_methods : impl_decl -> func_decl list
-val make_var_decl : Ast.decl -> var_decl -> decl
-val make_private_decl : Ast.decl -> decl -> decl
-val make_program : decl list -> program
 val decl_ast : decl -> Ast.decl
 val decl_view : decl -> decl_view
 val decl_func : decl -> func_decl option

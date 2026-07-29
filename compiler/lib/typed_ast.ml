@@ -197,7 +197,6 @@ let record_info (record : record_decl) = record.info
 let record_field_infos (record : record_decl) = record.info.field_infos
 let type_alias_ast (alias : type_alias_decl) = alias.ast_alias
 let type_alias_info (alias : type_alias_decl) = alias.info
-let type_alias_semantic_target_type alias = alias.info.semantic_target_ty
 let decl_ast decl = decl.ast_decl
 
 let decl_view decl =
@@ -226,16 +225,6 @@ let loc (expr : expr) = expr.ast.expr_loc
 let type_info (expr : expr) = expr.info
 let impl_ast (impl : impl_decl) = impl.ast_impl
 let impl_methods (impl : impl_decl) = impl.typed_methods
-let make_var_decl ast_decl var = { ast_decl; decl_info = VarDecl var }
-
-let make_private_decl ast_decl inner =
-  { ast_decl; decl_info = PrivateDecl inner }
-
-let make_program typed_decls =
-  {
-    ast_program = List.map (fun decl -> decl.ast_decl) typed_decls;
-    typed_decls;
-  }
 
 let type_info_to_ast (info : type_info) : Ast.expr_type_info =
   {
@@ -1166,8 +1155,6 @@ and validate_record_fields = function
       let* () = validate_record_field field in
       validate_record_fields rest
 
-let of_ast_var_decl_with_source ~source_var ast_var =
-  of_ast_var_decl_with_source_internal ~source_var ast_var
 let of_ast_decl ast_decl = of_ast_decl_with_source ast_decl
 
 let of_ast_program ?callable_id_of_func ast_program =

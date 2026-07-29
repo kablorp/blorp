@@ -259,14 +259,3 @@ let format_error ~file (e : compiler_error) =
 (** Render a list of compiler_errors *)
 let format_errors ~file errors =
   errors |> List.map (format_error ~file) |> String.concat "\n"
-
-(** Legacy format_diagnostic — used by blorp.ml for direct formatting *)
-let format_diagnostic ~file ~loc ~severity ~message =
-  render_diagnostic
-    {
-      diag_severity = severity;
-      diag_message = message;
-      diag_labels = [ make_label ~file loc ];
-      diag_notes = [];
-      diag_help = None;
-    }

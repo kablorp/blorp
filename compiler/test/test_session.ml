@@ -389,101 +389,6 @@ let test_load_imports_uses_module_surface_imports () =
         "returned loaded dependency" [ "./dep" ]
         (List.map (fun (m : Modules.loaded_module) -> m.name) loaded))
 
-let dep_value_surface ?(name = "dep_value") () : Module_surface.t =
-  {
-    module_name = "./dep";
-    imports = [];
-    exports =
-      [
-        {
-          name;
-          kind = Module_surface.Variable;
-          source = Module_surface.Decl 0;
-        };
-      ];
-    private_names = [];
-    private_traits = [];
-  }
-
-let parsed_source_for_graph_test ~path source =
-  match
-    Modules.parse_typecheck_source ~filename:path ~bridge_read_file:false
-      source
-  with
-  | Ok decls -> decls
-  | Error err -> Alcotest.fail ("unexpected parse error: " ^ err.message)
-
-let graph_source_for_test ~module_name ~path ~source ?surface decls :
-    Modules.preloaded_parsed_source =
-  {
-    Modules.preload_module_name = module_name;
-    preload_path = path;
-    preload_origin = Session.User_module;
-    preload_source = source;
-    preload_decls = decls;
-    preload_surface = surface;
-  }
-
-let empty_preloaded_graph_context : Modules.preloaded_module_graph_context =
-  {
-    preload_graph_std_dir = None;
-    preload_graph_source_packages = [];
-    preload_graph_package_roots = [];
-  }
-
-let test_preloaded_module_graph_rejects_invalid_module_surface () =
-  with_temp_dir "blorp_invalid_graph_surface" (fun dir ->
-      let main_path = Filename.concat dir "main.brp" in
-      let dep_path = Filename.concat dir "dep.brp" in
-      let main_source = "import:\n    ./dep: dep_value\n" in
-      let dep_source = "dep_value = 1\n" in
-      write_file main_path main_source;
-      write_file dep_path dep_source;
-      let main_decls =
-        parsed_source_for_graph_test ~path:main_path main_source
-      in
-      let dep_decls = parsed_source_for_graph_test ~path:dep_path dep_source in
-      let graph : Modules.preloaded_module_graph =
-        {
-          preload_graph_context = empty_preloaded_graph_context;
-          preload_graph_sources =
-            [
-              graph_source_for_test ~module_name:"main" ~path:main_path
-                ~source:main_source main_decls;
-              graph_source_for_test ~module_name:"./dep" ~path:dep_path
-                ~source:dep_source
-                ~surface:(dep_value_surface ~name:"wrong_name" ())
-                dep_decls;
-            ];
-          preload_graph_imports =
-            [
-              {
-                preload_import_from_path = main_path;
-                preload_import_from_module = "main";
-                preload_import_path = "./dep";
-                preload_import_resolved_path = Some dep_path;
-                preload_import_resolved_module = Some "./dep";
-                preload_import_resolved_origin = Some Session.User_module;
-              };
-            ];
-        }
-      in
-      let sess = Session.create () in
-      Modules.init_module_paths ~sess dir;
-      Modules.load_preloaded_module_graph ~sess ~target_path:main_path graph;
-      Alcotest.(check bool)
-        "invalid surface not cached" false
-        (Hashtbl.mem sess.parse_cache "./dep");
-      Alcotest.(check bool)
-        "invalid module not loaded" false
-        (Option.is_some (Modules.find_cached ~sess "./dep"));
-      Alcotest.(check bool)
-        "invalid surface diagnostic" true
-        (List.exists
-           (fun (err : Ast.compiler_error) ->
-             mentions err.message "invalid module surface")
-           (Modules.get_load_errors ~sess ())))
-
 let package_name_of_origin = function
   | Session.Native_package_module id -> Some (Session.package_id_name id)
   | Session.Package_module id -> Some (Session.package_id_name id)
@@ -1455,8 +1360,6 @@ let suite =
           test_import_parse_error_does_not_block_sibling_import;
         Alcotest.test_case "load_imports uses module surface imports" `Quick
           test_load_imports_uses_module_surface_imports;
-        Alcotest.test_case "preloaded module graph rejects invalid surface"
-          `Quick test_preloaded_module_graph_rejects_invalid_module_surface;
         Alcotest.test_case "source package alias resolves" `Quick
           test_blorp_toml_source_package_alias_resolves;
         Alcotest.test_case "source package alias can differ from name" `Quick

@@ -461,15 +461,9 @@ val set_type_param_bounds : env -> bound_type_param list -> env
 val has_trait_bound : env -> string -> string -> bool
 (** Check if a type parameter has a specific trait bound *)
 
-val trait_method_names_transitive : env -> string -> string list
-(** All method names reachable from [trait_name] through its own
-    declaration + the transitive supertrait graph. Cycle-safe. Used
-    by default-body synthesis to identify trait-method references
-    that should be rewritten into UFCS form. *)
-
 val trait_methods_with_declaring_trait : env -> string -> (string * string) list
-(** Like [trait_method_names_transitive] but returns each method
-    paired with the trait that declares it. Needed when registering
+(** Returns each reachable method paired with the trait that declares it.
+    Needed when registering
     trait-function bindings for an imported trait that has
     supertraits — each inherited method must bind to its declaring
     trait for correct dispatch. *)

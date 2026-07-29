@@ -765,7 +765,7 @@ let cli_frontier_of_cli_run_result = function
       print_string result.Compiler_blorp_bridge.cli_run_stdout;
       prerr_string result.Compiler_blorp_bridge.cli_run_stderr;
       exit result.Compiler_blorp_bridge.cli_run_status
-  | Compiler_blorp_bridge.CliRunFrontendModuleGraph _ ->
+  | Compiler_blorp_bridge.CliRunSourceCommand ->
       prerr_endline
         "Internal error: a source compile plan reached the OCaml tool host";
       exit 1

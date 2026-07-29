@@ -562,7 +562,6 @@ let ty_void = Ast.TyNamed ("Void", [])
 let mk_core ~loc ~ty desc = { desc; ty; loc }
 let mk_void ~loc desc = mk_core ~loc ~ty:ty_void desc
 let dummy_callee loc = mk_void ~loc CVoid
-let cvar ~loc v ty = mk_core ~loc ~ty (CVar v)
 
 let string_starts_with s prefix =
   let slen = String.length s in

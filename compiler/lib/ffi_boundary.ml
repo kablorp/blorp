@@ -88,11 +88,6 @@ let classify_arg ~(metadata : Core_type_layout.metadata) ~mode ty =
           | Core_type_layout.Invalid_value_type msg ->
               RejectedDefault (InvalidValueType msg)))
 
-let rejected_default_reason_to_string = function
-  | ManagedValue -> "managed value"
-  | UnknownLayout name -> Printf.sprintf "unknown type layout for %s" name
-  | InvalidValueType msg -> msg
-
 let metadata_field_to_string = function
   | ForeignCName -> "C function name"
   | ForeignInclude -> "include path"
@@ -231,13 +226,6 @@ let validate_link_flag flag =
     if List.exists (( = ) "") tokens then
       error ForeignLinkFlag flag "must not contain empty shell-style tokens"
     else validate_link_tokens flag tokens
-
-let link_flag_cc_args flag =
-  match validate_link_flag flag with
-  | Ok _ -> split_link_flag flag
-  | Error err -> invalid_arg (metadata_validation_error_to_string err)
-
-let link_flags_cc_args flags = List.concat_map link_flag_cc_args flags
 
 let collect_validation_error result errors =
   match result with Ok _ -> errors | Error err -> err :: errors

@@ -65,7 +65,6 @@ let suite_group prefix suite =
 
 let default_suites =
   suite_group "TypedAst" Test_typed_ast.suite
-  @ suite_group "TypedAstJson" Test_typed_ast_json.suite
   @ suite_group "Diagnostics" Test_diagnostics.suite
   @ suite_group "LanguageSurface" Test_language_surface.suite
   @ suite_group "TypeMetadataFormat" Test_type_metadata_format.suite
@@ -112,8 +111,6 @@ let default_suites =
   @ suite_group "IntrinsicContract" Test_intrinsic_contract.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite
-  @ suite_group "CompilerBlorpBridgeTransport"
-      Test_compiler_blorp_bridge.transport_suite
 
 let deep_suites =
   (* These suites cross larger compiler boundaries: process/session state, LSP,

@@ -21,26 +21,26 @@ let expect_known_layout name expected actual =
       Alcotest.failf "%s: expected known layout, got invalid type: %s" name msg
 
 let expect_release name expected meta ty =
-  let layout = Blorp.Core_type_layout.layout_or_error meta ty in
-  Alcotest.(check bool)
-    name expected
-    (layout.release = Blorp.Core_type_layout.ArcRelease)
+  match Blorp.Core_type_layout.classify meta ty with
+  | Blorp.Core_type_layout.Known layout ->
+      Alcotest.(check bool)
+        name expected
+        (layout.release = Blorp.Core_type_layout.ArcRelease)
+  | Blorp.Core_type_layout.Unknown_named unknown ->
+      Alcotest.failf "%s: unknown type %s" name unknown
+  | Blorp.Core_type_layout.Invalid_value_type message ->
+      Alcotest.failf "%s: invalid type: %s" name message
 
 let expect_retain name expected meta ty =
-  let layout = Blorp.Core_type_layout.layout_or_error meta ty in
-  Alcotest.(check bool)
-    name expected
-    (layout.retain = Blorp.Core_type_layout.ArcRetain)
-
-let expect_boxed_release name expected meta ty =
-  Alcotest.(check bool)
-    name expected
-    (Blorp.Core_type_layout.boxed_storage_requires_release_or_error meta ty)
-
-let expect_boxed_release_capability name expected meta ty =
-  Alcotest.(check bool)
-    name true
-    (Blorp.Core_type_layout.boxed_storage_release_or_error meta ty = expected)
+  match Blorp.Core_type_layout.classify meta ty with
+  | Blorp.Core_type_layout.Known layout ->
+      Alcotest.(check bool)
+        name expected
+        (layout.retain = Blorp.Core_type_layout.ArcRetain)
+  | Blorp.Core_type_layout.Unknown_named unknown ->
+      Alcotest.failf "%s: unknown type %s" name unknown
+  | Blorp.Core_type_layout.Invalid_value_type message ->
+      Alcotest.failf "%s: invalid type: %s" name message
 
 let test_builtin_layout_is_single_source_of_truth () =
   let open Blorp.Core_type_layout in
@@ -172,36 +172,17 @@ let test_option_int_stack_layout_needs_no_release () =
   expect_release "Option[Int] release" false (meta ())
     (ty "Option" [ ty "Int" [] ])
 
-let test_option_int_boxed_storage_has_arc_release () =
-  let option_int = ty "Option" [ ty "Int" [] ] in
-  expect_release "Option[Int] source value does not require release" false
-    (meta ()) option_int;
-  expect_boxed_release "Option[Int] boxed storage requires release" true
-    (meta ()) option_int;
-  expect_boxed_release_capability "Option[Int] boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease (meta ()) option_int
-
 let test_result_int_bool_stack_layout_needs_no_source_release () =
   let result_int_bool = ty "Result" [ ty "Int" []; ty "Bool" [] ] in
   expect_release "Result[Int, Bool] source value does not require release" false
-    (meta ()) result_int_bool;
-  expect_boxed_release "Result[Int, Bool] boxed storage requires release" true
-    (meta ()) result_int_bool;
-  expect_boxed_release_capability
-    "Result[Int, Bool] boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease (meta ()) result_int_bool
+    (meta ()) result_int_bool
 
 let test_managed_stack_result_layout_requires_source_release () =
   let result_int_string = ty "Result" [ ty "Int" []; ty "String" [] ] in
   expect_release "Result[Int, String] source value requires release" true
     (meta ()) result_int_string;
   expect_retain "Result[Int, String] source value requires retain" true
-    (meta ()) result_int_string;
-  expect_boxed_release "Result[Int, String] boxed storage requires release" true
-    (meta ()) result_int_string;
-  expect_boxed_release_capability
-    "Result[Int, String] boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease (meta ()) result_int_string
+    (meta ()) result_int_string
 
 let test_primitive_stack_options_need_no_source_release () =
   let cases =
@@ -219,10 +200,7 @@ let test_primitive_stack_options_need_no_source_release () =
     (fun (name, option_ty) ->
       expect_release
         (name ^ " source value does not require release")
-        false (meta ()) option_ty;
-      expect_boxed_release
-        (name ^ " boxed storage requires release")
-        true (meta ()) option_ty)
+        false (meta ()) option_ty)
     cases
 
 let test_generated_stack_options_need_no_source_release () =
@@ -240,10 +218,7 @@ let test_generated_stack_options_need_no_source_release () =
     (fun (name, option_ty) ->
       expect_release
         (name ^ " source value does not require release")
-        false meta option_ty;
-      expect_boxed_release
-        (name ^ " boxed storage requires release")
-        true meta option_ty)
+        false meta option_ty)
     cases
 
 let test_option_string_stays_managed () =
@@ -301,40 +276,6 @@ let test_registry_managed_type_requires_destructor_policy () =
   | Some { managed_kind = ManagedHeapRecord; destructor = ArcReleaseOnly } -> ()
   | Some _ -> Alcotest.fail "Widget had the wrong managed type policy"
   | None -> Alcotest.fail "Widget was not registered"
-
-let test_boxed_storage_release_tracks_managed_pointer_values () =
-  expect_boxed_release "String boxed storage release" true (meta ())
-    (ty "String" []);
-  expect_boxed_release "Int boxed storage release" false (meta ()) (ty "Int" [])
-
-let test_boxed_storage_release_tracks_heap_boxed_wide_ints () =
-  expect_release "Int128 source value does not require release" false (meta ())
-    (ty "Int128" []);
-  expect_boxed_release "Int128 boxed storage requires release" true (meta ())
-    (ty "Int128" []);
-  expect_boxed_release_capability "Int128 boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease (meta ()) (ty "Int128" []);
-  expect_release "UInt128 source value does not require release" false (meta ())
-    (ty "UInt128" []);
-  expect_boxed_release "UInt128 boxed storage requires release" true (meta ())
-    (ty "UInt128" []);
-  expect_boxed_release_capability "UInt128 boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease (meta ()) (ty "UInt128" [])
-
-let test_value_record_boxed_storage_has_arc_release () =
-  let meta = meta ~value_records:[ "Vec2" ] () in
-  expect_release "Vec2 source value does not require release" false meta
-    (ty "Vec2" []);
-  expect_boxed_release "Vec2 boxed storage requires release" true meta
-    (ty "Vec2" []);
-  expect_boxed_release_capability "Vec2 boxed storage release capability"
-    Blorp.Core_type_layout.ArcRelease meta (ty "Vec2" [])
-
-let test_alias_inherits_boxed_storage_release_capability () =
-  let aliases = [ ("VecAlias", ([], ty "Vec2" [])) ] in
-  let meta = meta ~value_records:[ "Vec2" ] ~aliases () in
-  expect_boxed_release "value-record alias boxed storage release" true meta
-    (ty "VecAlias" [])
 
 let test_unknown_named_type_remains_invalid_layout () =
   let expect_unknown name =
@@ -574,8 +515,6 @@ let suite =
           `Quick test_debug_heap_classification_uses_layout_metadata;
         Alcotest.test_case "Option[Int] stack layout needs no release" `Quick
           test_option_int_stack_layout_needs_no_release;
-        Alcotest.test_case "Option[Int] boxed storage has ARC release" `Quick
-          test_option_int_boxed_storage_has_arc_release;
         Alcotest.test_case
           "Result[Int, Bool] stack layout needs no source release" `Quick
           test_result_int_bool_stack_layout_needs_no_source_release;
@@ -598,14 +537,6 @@ let suite =
           test_builtin_retain_capability_tracks_arc_layout;
         Alcotest.test_case "registry managed type requires destructor policy"
           `Quick test_registry_managed_type_requires_destructor_policy;
-        Alcotest.test_case "boxed storage release tracks managed pointer values"
-          `Quick test_boxed_storage_release_tracks_managed_pointer_values;
-        Alcotest.test_case "boxed storage release tracks heap-boxed wide ints"
-          `Quick test_boxed_storage_release_tracks_heap_boxed_wide_ints;
-        Alcotest.test_case "value record boxed storage has ARC release" `Quick
-          test_value_record_boxed_storage_has_arc_release;
-        Alcotest.test_case "alias inherits boxed storage release capability"
-          `Quick test_alias_inherits_boxed_storage_release_capability;
         Alcotest.test_case "unknown named type remains invalid layout" `Quick
           test_unknown_named_type_remains_invalid_layout;
         Alcotest.test_case "erased storage box kind is centralized" `Quick

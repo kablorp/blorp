@@ -1150,36 +1150,8 @@ let trait_has_supertrait (env : env) (trait_name : string) (target : string) :
   in
   walk [] trait_name
 
-(** Collect every method name declared on [trait_name] OR any of its
-    transitive supertraits. Used by the default-body synthesizer
-    (Option D / step 5) to decide which bare-name identifier calls
-    inside a synthesized body are trait-method references and should
-    be rewritten into UFCS-dispatch form so they resolve through the
-    impl's methods rather than through the global trait-function
-    table. Duplicates are possible (same method declared at multiple
-    levels of the hierarchy); callers that need a set-view should
-    dedup. Cycle-safe via a visited set — ill-formed supertrait
-    cycles terminate rather than hang. *)
-let trait_method_names_transitive (env : env) (trait_name : string) :
-    string list =
-  let rec walk visited name =
-    if List.mem name visited then []
-    else
-      match get_trait env name with
-      | None -> []
-      | Some td ->
-          let own =
-            List.map (fun (m : trait_method_sig) -> m.tm_name) td.td_methods
-          in
-          let from_supers =
-            List.concat_map (walk (name :: visited)) td.td_supertraits
-          in
-          own @ from_supers
-  in
-  walk [] trait_name
-
-(** Like [trait_method_names_transitive] but pairs each method name
-    with the trait that actually DECLARES it (not the starting trait).
+(** Collect every method name declared on [trait_name] or a transitive
+    supertrait, paired with the trait that actually declares it.
     A method inherited through the supertrait graph is reported under
     its originating trait, which is what [add_trait_function] needs
     for correct dispatch — [base_op] from [trait Derived: Base]

@@ -53,16 +53,22 @@ let test_format_error_prefers_location_file_and_keeps_tabs () =
       check_string "rendered diagnostic" expected
         (Diagnostics.format_error ~file:"fallback.brp" err))
 
-let test_render_diagnostic_multiline_message_and_missing_source () =
+let test_render_diagnostic_handles_multiline_message_and_synthetic_loc () =
   let loc =
     { Ast.line = 0; column = 0; end_line = 0; end_column = 0; loc_file = None }
   in
-  let actual =
-    Diagnostics.format_diagnostic ~file:"synthetic.brp" ~loc
-      ~severity:Diagnostics.Warning ~message:"first line\nsecond line"
+  let diagnostic =
+    {
+      Diagnostics.diag_severity = Warning;
+      diag_message = "first line\nsecond line";
+      diag_labels = [ Diagnostics.make_label ~file:"synthetic.brp" loc ];
+      diag_notes = [];
+      diag_help = None;
+    }
   in
   check_string "synthetic diagnostic"
-    "warning: first line\n    second line\n  --> synthetic.brp\n" actual
+    "warning: first line\n    second line\n  --> synthetic.brp\n"
+    (Diagnostics.render_diagnostic diagnostic)
 
 let suite =
   [
@@ -70,7 +76,8 @@ let suite =
       [
         Alcotest.test_case "format_error uses loc file and tab padding" `Quick
           test_format_error_prefers_location_file_and_keeps_tabs;
-        Alcotest.test_case "format_diagnostic handles synthetic loc" `Quick
-          test_render_diagnostic_multiline_message_and_missing_source;
+        Alcotest.test_case "renderer handles multiline synthetic diagnostics"
+          `Quick
+          test_render_diagnostic_handles_multiline_message_and_synthetic_loc;
       ] );
   ]

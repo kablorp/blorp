@@ -48,27 +48,6 @@ type parse_source_response =
   | ParsedSource of parsed_source
   | ParseSourceDiagnostics of Ast.compiler_error list
 
-type typechecked_source = {
-  typechecked_program : Typed_ast.program;
-  typechecked_errors : string list;
-  typechecked_import_bindings : Session.import_binding list;
-  typechecked_ctfe_evaluated_by_blorp : bool;
-  typechecked_comments : collected_comment list;
-  typechecked_phase : parsed_source_phase;
-  typechecked_module_surface : Module_surface.t option;
-}
-
-type typechecked_graph_source = {
-  typechecked_graph_path : string;
-  typechecked_graph_module_name : string;
-  typechecked_graph_artifact : typechecked_source;
-}
-
-type typechecked_graph = {
-  typechecked_graph_modules : typechecked_graph_source list;
-  typechecked_graph_target : typechecked_graph_source;
-}
-
 type parse_source_batch_request = {
   batch_parse_path : string;
   batch_parse_module_name : string;
@@ -95,23 +74,6 @@ type cli_frontend_sanitizer_mode =
   | CliFrontendSanitizeOff
   | CliFrontendSanitizeAddressUndefined
   | CliFrontendSanitizeUndefined
-
-type cli_compile_options = {
-  cli_compile_ast_only : bool;
-  cli_compile_dump_ast : bool;
-  cli_compile_dump_typed_ast : bool;
-  cli_compile_dump_core_after : Core_stage.t list;
-  cli_compile_dump_file : string option;
-  cli_compile_stop_after : Core_stage.t option;
-  cli_compile_time_phases : bool;
-  cli_compile_check_invariants : bool;
-  cli_compile_debug : bool;
-  cli_compile_no_format : bool;
-  cli_compile_embed_runtime : bool;
-  cli_compile_std_dir : string option;
-  cli_compile_output : string option;
-  cli_compile_files : string list;
-}
 
 type cli_test_mode =
   | CliFrontendTestAll
@@ -171,69 +133,6 @@ type cli_package_options = {
   cli_package_command : cli_package_command;
 }
 
-type cli_frontend_module_origin =
-  | CliFrontendUserModule
-  | CliFrontendGeneratedModule
-  | CliFrontendStdModule
-  | CliFrontendSourcePackageModule of string
-  | CliFrontendPkgModule of string
-
-type typecheck_import_module = {
-  typecheck_import_path : string;
-  typecheck_import_module_name : string;
-  typecheck_import_module_path : string;
-  typecheck_import_text : string;
-  typecheck_import_origin : cli_frontend_module_origin;
-}
-
-type typecheck_resolved_import = {
-  typecheck_resolved_import_from_path : string;
-  typecheck_resolved_import_from_module : string;
-  typecheck_resolved_import_path : string;
-  typecheck_resolved_import_module : string;
-}
-
-type cli_frontend_source_package = {
-  cli_frontend_source_package_alias : string;
-  cli_frontend_source_package_name : string;
-  cli_frontend_source_package_root : string;
-  cli_frontend_source_package_source_dir : string;
-  cli_frontend_source_package_exports : string list;
-}
-
-type cli_frontend_graph_context = {
-  cli_frontend_context_std_dir : string option;
-  cli_frontend_context_source_packages : cli_frontend_source_package list;
-  cli_frontend_context_package_roots : string list;
-}
-
-type cli_frontend_graph_source = {
-  cli_frontend_graph_path : string;
-  cli_frontend_graph_module_name : string;
-  cli_frontend_graph_source_text : string;
-  cli_frontend_graph_parsed_response : parse_source_response;
-  cli_frontend_graph_origin : cli_frontend_module_origin;
-}
-
-type cli_frontend_import_edge = {
-  cli_frontend_import_from_path : string;
-  cli_frontend_import_from_module : string;
-  cli_frontend_import_path : string;
-  cli_frontend_import_resolved_path : string option;
-  cli_frontend_import_resolved_module : string option;
-  cli_frontend_import_resolved_origin : cli_frontend_module_origin option;
-}
-
-type cli_frontend_module_graph = {
-  cli_frontend_graph_args : string list;
-  cli_frontend_graph_compile_options : cli_compile_options;
-  cli_frontend_graph_context : cli_frontend_graph_context;
-  cli_frontend_graph_roots : cli_frontend_graph_source list;
-  cli_frontend_graph_modules : cli_frontend_graph_source list;
-  cli_frontend_graph_imports : cli_frontend_import_edge list;
-  cli_frontend_graph_diagnostics : string list;
-}
-
 type cli_run_handled_result = {
   cli_run_status : int;
   cli_run_stdout : string;
@@ -242,7 +141,7 @@ type cli_run_handled_result = {
 
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
-  | CliRunFrontendModuleGraph of cli_frontend_module_graph
+  | CliRunSourceCommand
   | CliRunTestOptions of cli_test_options
   | CliRunPurifyOptions of cli_purify_options
   | CliRunReplOptions of cli_repl_options
@@ -485,30 +384,6 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
-let emit_core_c_request_json ?(profile = false) core_json =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "emit_core_c");
-         ( "payload",
-           Lsp_json.Object
-             [ ("core", core_json); ("profile", Lsp_json.Bool profile) ] );
-       ])
-
-let run_core_pipeline_request_json ~stage core_json =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "run_core_pipeline");
-         ( "payload",
-           Lsp_json.Object
-             [ ("stage", Lsp_json.String stage); ("core", core_json) ] );
-       ])
-
 let parse_source_request_json_at_phase ~phase ~path ~module_name ~text =
   Lsp_json.to_string
     (Lsp_json.Object
@@ -568,77 +443,6 @@ let parse_sources_request_json ?(phase = RawParsedProgram) items =
                  Lsp_json.Array
                    (List.map (parse_source_batch_item_json ~phase) items) );
              ] );
-       ])
-
-let cli_frontend_module_origin_json = function
-  | CliFrontendUserModule -> Lsp_json.Object [ ("kind", Lsp_json.String "user") ]
-  | CliFrontendGeneratedModule ->
-      Lsp_json.Object [ ("kind", Lsp_json.String "generated") ]
-  | CliFrontendStdModule -> Lsp_json.Object [ ("kind", Lsp_json.String "std") ]
-  | CliFrontendSourcePackageModule package ->
-      Lsp_json.Object
-        [
-          ("kind", Lsp_json.String "source_package");
-          ("package", Lsp_json.String package);
-        ]
-  | CliFrontendPkgModule package ->
-      Lsp_json.Object
-        [
-          ("kind", Lsp_json.String "pkg"); ("package", Lsp_json.String package);
-        ]
-
-let typecheck_import_module_json item =
-  Lsp_json.Object
-    [
-      ("path", Lsp_json.String item.typecheck_import_path);
-      ("module", Lsp_json.String item.typecheck_import_module_name);
-      ("module_path", Lsp_json.String item.typecheck_import_module_path);
-      ("text", Lsp_json.String item.typecheck_import_text);
-      ( "origin",
-        cli_frontend_module_origin_json item.typecheck_import_origin );
-    ]
-
-let typecheck_resolved_import_json item =
-  Lsp_json.Object
-    [
-      ("from_path", Lsp_json.String item.typecheck_resolved_import_from_path);
-      ("from_module", Lsp_json.String item.typecheck_resolved_import_from_module);
-      ("import_path", Lsp_json.String item.typecheck_resolved_import_path);
-      ("resolved_module", Lsp_json.String item.typecheck_resolved_import_module);
-    ]
-
-let typecheck_resolved_imports_field resolved_imports =
-  match resolved_imports with
-  | [] -> []
-  | _ ->
-      [
-        ( "resolved_imports",
-          Lsp_json.Array
-            (List.map typecheck_resolved_import_json resolved_imports) );
-      ]
-
-let typecheck_graph_request_json_with_policy ~resolved_imports
-    ~allow_debug_only_calls ~target ~modules ~module_targets =
-  let payload_fields =
-    [
-      ("target", typecheck_import_module_json target);
-      ( "modules",
-        Lsp_json.Array (List.map typecheck_import_module_json modules) );
-      ( "module_targets",
-        Lsp_json.Array (List.map (fun path -> Lsp_json.String path) module_targets)
-      );
-      ("include_comments", Lsp_json.Bool false);
-      ("allow_debug_only_calls", Lsp_json.Bool allow_debug_only_calls);
-    ]
-    @ typecheck_resolved_imports_field resolved_imports
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "typecheck_graph");
-         ("payload", Lsp_json.Object payload_fields);
        ])
 
 let cli_run_request_json ?version ?source args =
@@ -747,12 +551,6 @@ let render_many_response_field = function
       | None -> Error ("invalid_response", "missing array field `items`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
-type c_artifact = {
-  c_code : string;
-  link_flags : string list;
-  include_dirs : string list;
-}
-
 let string_array_field name = function
   | Lsp_json.Object fields -> (
       match List.assoc_opt name fields with
@@ -823,13 +621,6 @@ let optional_int_response_field name = function
             ("invalid_response", "missing optional number field `" ^ name ^ "`")
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let c_artifact_response_field response =
-  let* artifact = json_response_field "artifact" response in
-  let* c_code = string_response_field "c_code" artifact in
-  let* link_flags = string_array_field "link_flags" artifact in
-  let* include_dirs = string_array_field "include_dirs" artifact in
-  Ok { c_code; link_flags; include_dirs }
 
 let compiler_error_of_parse_diagnostic
     (diagnostic : Parsed_ast_json.parsed_diagnostic) =
@@ -1051,155 +842,6 @@ let parse_sources_response_field response =
 let parse_sources_response_json response_json =
   response_result response_json parse_sources_response_field
 
-let require_typecheck_source_phase artifact =
-  let* phase = parsed_source_phase_response_field artifact in
-  match phase with
-  | TypecheckSourceProgram -> Ok phase
-  | RawParsedProgram ->
-      Error
-        ( "invalid_response",
-          "typecheck_source artifact must have ast_phase typecheck_source" )
-
-let import_binding_response_field = function
-  | Lsp_json.Object _ as value ->
-      let* local_name = string_response_field "local_name" value in
-      let* module_path = string_response_field "module_path" value in
-      let* original_name = optional_string_response_field "original_name" value in
-      Ok Session.{ local_name; module_path; original_name }
-  | _ ->
-      Error
-        ("invalid_response", "import_bindings items must be JSON objects")
-
-let typechecked_ctfe_status_field artifact =
-  let* status = optional_json_response_field "ctfe_status" artifact in
-  match status with
-  | None -> Ok false
-  | Some (Lsp_json.String "evaluated") -> Ok true
-  | Some (Lsp_json.String "not_run") -> Ok false
-  | Some (Lsp_json.String other) ->
-      Error
-        ( "invalid_response",
-          "unsupported ctfe_status `" ^ other ^ "`" )
-  | Some _ ->
-      Error ("invalid_response", "field `ctfe_status` must be a string")
-
-let typechecked_source_artifact_field artifact =
-  let* typechecked_phase = require_typecheck_source_phase artifact in
-  let* typechecked_comments = parse_comments_response_field artifact in
-  let* typechecked_module_surface = module_surface_artifact_field artifact in
-  let* typechecked_errors = string_array_field "type_errors" artifact in
-  let* typechecked_import_bindings =
-    array_response_field_map "import_bindings" import_binding_response_field
-      artifact
-  in
-  let* typechecked_ctfe_evaluated_by_blorp = typechecked_ctfe_status_field artifact in
-  let* typed_program_json = json_response_field "typed_program" artifact in
-  match Typed_ast_json.decode_typed_program typed_program_json with
-  | Ok typechecked_program ->
-      Ok
-        {
-          typechecked_program;
-          typechecked_errors;
-          typechecked_import_bindings;
-          typechecked_ctfe_evaluated_by_blorp;
-          typechecked_comments;
-          typechecked_phase;
-          typechecked_module_surface;
-        }
-  | Error err ->
-      (* Error artifacts may include a best-effort typed tree that failed
-         validation while the typechecker was collecting diagnostics. Surface
-         the diagnostics first; successful artifacts must still decode fully. *)
-      if typechecked_errors <> [] then
-        Ok
-          {
-            typechecked_program = Typed_ast.make_program [];
-            typechecked_errors;
-            typechecked_import_bindings;
-            typechecked_ctfe_evaluated_by_blorp = false;
-            typechecked_comments;
-            typechecked_phase;
-            typechecked_module_surface;
-          }
-      else
-        Error
-          ( "invalid_response",
-            Typed_ast_json.decode_error_to_string err )
-
-let typechecked_graph_source_artifact_field artifact =
-  let* typechecked_graph_path = string_response_field "path" artifact in
-  let* typechecked_graph_module_name = string_response_field "module" artifact in
-  let* typechecked_graph_artifact = typechecked_source_artifact_field artifact in
-  Ok
-    {
-      typechecked_graph_path;
-      typechecked_graph_module_name;
-      typechecked_graph_artifact;
-    }
-
-let typecheck_graph_source_response_json response_json =
-  response_result response_json (fun response ->
-      let* artifact = json_response_field "artifact" response in
-      typechecked_graph_source_artifact_field artifact)
-
-(** Decode the line protocol after the typecheck helper has exited. Only one
-    serialized artifact is retained at a time; decoded module artifacts remain
-    live because the semantic middle consumes the complete typed graph. *)
-let typecheck_graph_stream_response_channel ~module_count channel =
-  let rec next_nonempty_line () =
-    match input_line channel with
-    | line when String.trim line = "" -> next_nonempty_line ()
-    | line -> Some line
-    | exception End_of_file -> None
-  in
-  let rec decode_remaining count =
-    match next_nonempty_line () with
-    | Some line ->
-        let* _ = typecheck_graph_source_response_json line in
-        decode_remaining (count + 1)
-    | None -> Ok count
-  in
-  let rec decode_modules remaining decoded_count acc =
-    if remaining = 0 then
-      match next_nonempty_line () with
-      | None ->
-          Error
-            ( "invalid_response",
-              "typecheck_graph returned no target artifact, expected one target" )
-      | Some target_line ->
-          let* target = typecheck_graph_source_response_json target_line in
-          let* trailing_count = decode_remaining 0 in
-          if trailing_count = 0 then
-            Ok
-              {
-                typechecked_graph_modules = List.rev acc;
-                typechecked_graph_target = target;
-              }
-          else
-            Error
-              ( "invalid_response",
-                Printf.sprintf
-                  "typecheck_graph returned %d trailing artifacts after the target"
-                  trailing_count )
-    else
-      match next_nonempty_line () with
-      | Some line ->
-          let* source = typecheck_graph_source_response_json line in
-          decode_modules (remaining - 1) (decoded_count + 1) (source :: acc)
-      | None ->
-          Error
-            ( "invalid_response",
-              Printf.sprintf
-                "typecheck_graph returned %d artifacts, expected %d modules and one target"
-                decoded_count module_count )
-  in
-  decode_modules module_count 0 []
-
-let require_compile_frontend_command = function
-  | "compile" -> Ok ()
-  | command ->
-      Error ("invalid_response", "unsupported CLI frontend command `" ^ command ^ "`")
-
 let validate_cli_artifact_command artifact_kind expected args =
   match args with
   | command :: _ when String.equal command expected -> Ok ()
@@ -1293,33 +935,6 @@ let optional_sanitizer_response_field name = function
       )
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
-let core_stage_of_cli_string field_name stage_name =
-  match Core_stage.of_string stage_name with
-  | Ok stage -> Ok stage
-  | Error message ->
-      Error
-        ( "invalid_response",
-          "field `" ^ field_name ^ "` has unsupported stage `" ^ stage_name
-          ^ "`: " ^ message )
-
-let core_stage_array_field name value =
-  let* stage_names = string_array_field name value in
-  let rec collect acc = function
-    | [] -> Ok (List.rev acc)
-    | stage_name :: rest ->
-        let* stage = core_stage_of_cli_string name stage_name in
-        collect (stage :: acc) rest
-  in
-  collect [] stage_names
-
-let optional_core_stage_response_field name value =
-  let* stage_name = optional_string_response_field name value in
-  match stage_name with
-  | None -> Ok None
-  | Some stage_name ->
-      let* stage = core_stage_of_cli_string name stage_name in
-      Ok (Some stage)
-
 let require_options_kind expected options =
   let* kind = string_response_field "kind" options in
   if kind = expected then Ok ()
@@ -1328,54 +943,6 @@ let require_options_kind expected options =
       ( "invalid_response",
         "CLI options kind `" ^ kind ^ "` did not match expected `" ^ expected
         ^ "`" )
-
-let decode_cli_compile_options options =
-  let* () = require_options_kind "compile" options in
-  let* cli_compile_ast_only = bool_response_field "ast_only" options in
-  let* cli_compile_dump_ast = bool_response_field "dump_ast" options in
-  let* cli_compile_dump_typed_ast =
-    bool_response_field "dump_typed_ast" options
-  in
-  let* cli_compile_dump_core_after =
-    core_stage_array_field "dump_core_after" options
-  in
-  let* cli_compile_dump_file =
-    optional_string_response_field "dump_file" options
-  in
-  let* cli_compile_stop_after =
-    optional_core_stage_response_field "stop_after" options
-  in
-  let* cli_compile_time_phases = bool_response_field "time_phases" options in
-  let* cli_compile_check_invariants =
-    bool_response_field "check_invariants" options
-  in
-  let* cli_compile_debug = bool_response_field "debug" options in
-  let* cli_compile_no_format = bool_response_field "no_format" options in
-  let* cli_compile_embed_runtime =
-    bool_response_field "embed_runtime" options
-  in
-  let* cli_compile_std_dir =
-    optional_string_response_field "std_dir" options
-  in
-  let* cli_compile_output = optional_string_response_field "output" options in
-  let* cli_compile_files = string_array_field "files" options in
-  Ok
-    {
-      cli_compile_ast_only;
-      cli_compile_dump_ast;
-      cli_compile_dump_typed_ast;
-      cli_compile_dump_core_after;
-      cli_compile_dump_file;
-      cli_compile_stop_after;
-      cli_compile_time_phases;
-      cli_compile_check_invariants;
-      cli_compile_debug;
-      cli_compile_no_format;
-      cli_compile_embed_runtime;
-      cli_compile_std_dir;
-      cli_compile_output;
-      cli_compile_files;
-    }
 
 let decode_cli_test_run_options cli_test_raw_args cli_test_compiler_path options =
   let* () = require_options_kind "test" options in
@@ -1438,234 +1005,6 @@ let decode_cli_purify_options cli_purify_raw_args options =
       cli_purify_verbose;
       cli_purify_paths;
     }
-
-let cli_frontend_module_origin_field origin =
-  let* kind = string_response_field "kind" origin in
-  match kind with
-  | "user" -> Ok CliFrontendUserModule
-  | "generated" -> Ok CliFrontendGeneratedModule
-  | "std" -> Ok CliFrontendStdModule
-  | "source_package" ->
-      let* package_alias = string_response_field "package" origin in
-      Ok (CliFrontendSourcePackageModule package_alias)
-  | "pkg" ->
-      let* package_id = string_response_field "package" origin in
-      Ok (CliFrontendPkgModule package_id)
-  | other ->
-      Error
-        ( "invalid_response",
-          "unsupported frontend module origin `" ^ other ^ "`" )
-
-let optional_cli_frontend_module_origin_field name value =
-  match optional_json_response_field name value with
-  | Error _ as error -> error
-  | Ok None | Ok (Some Lsp_json.Null) -> Ok None
-  | Ok (Some origin) ->
-      let* decoded = cli_frontend_module_origin_field origin in
-      Ok (Some decoded)
-
-let cli_frontend_source_package_field (package : Lsp_json.json) :
-    (cli_frontend_source_package, string * string) result =
-  let* cli_frontend_source_package_alias =
-    string_response_field "alias" package
-  in
-  let* cli_frontend_source_package_name = string_response_field "name" package in
-  let* cli_frontend_source_package_root = string_response_field "root" package in
-  let* cli_frontend_source_package_source_dir =
-    string_response_field "source_dir" package
-  in
-  let* cli_frontend_source_package_exports =
-    string_array_field "exports" package
-  in
-  Ok
-    {
-      cli_frontend_source_package_alias;
-      cli_frontend_source_package_name;
-      cli_frontend_source_package_root;
-      cli_frontend_source_package_source_dir;
-      cli_frontend_source_package_exports;
-    }
-
-let cli_frontend_source_package_list_field (name : string)
-    (value : Lsp_json.json) :
-    (cli_frontend_source_package list, string * string) result =
-  array_response_field_map name cli_frontend_source_package_field value
-
-let cli_frontend_graph_context_field (artifact : Lsp_json.json) :
-    (cli_frontend_graph_context, string * string) result =
-  let* context = json_response_field "context" artifact in
-  let* cli_frontend_context_std_dir =
-    optional_string_response_field "std_dir" context
-  in
-  let* cli_frontend_context_source_packages =
-    cli_frontend_source_package_list_field "source_packages" context
-  in
-  let* cli_frontend_context_package_roots =
-    string_array_field "package_roots" context
-  in
-  Ok
-    {
-      cli_frontend_context_std_dir;
-      cli_frontend_context_source_packages;
-      cli_frontend_context_package_roots;
-    }
-
-let cli_frontend_graph_source_field (source : Lsp_json.json) :
-    (cli_frontend_graph_source, string * string) result =
-  let* cli_frontend_graph_path = string_response_field "path" source in
-  let* cli_frontend_graph_module_name = string_response_field "module" source in
-  let* cli_frontend_graph_source_text =
-    string_response_field "source_text" source
-  in
-  let* parsed_source = json_response_field "parsed_source" source in
-  let* parsed_source_phase = parsed_source_phase_response_field parsed_source in
-  let* () =
-    match parsed_source_phase with
-    | TypecheckSourceProgram -> Ok ()
-    | RawParsedProgram ->
-        Error
-          ( "invalid_response",
-            "frontend module graph source must be typecheck_source, got raw_parse"
-          )
-  in
-  let* cli_frontend_graph_parsed_response =
-    parsed_ast_artifact_field parsed_source
-  in
-  let* () =
-    match cli_frontend_graph_parsed_response with
-    | ParsedSource { parsed_module_surface = Some _; _ }
-    | ParseSourceDiagnostics _ ->
-        Ok ()
-    | ParsedSource { parsed_module_surface = None; _ } ->
-        Error
-          ( "invalid_response",
-            "frontend module graph source must include module_surface" )
-  in
-  let* origin = json_response_field "origin" source in
-  let* cli_frontend_graph_origin = cli_frontend_module_origin_field origin in
-  Ok
-    {
-      cli_frontend_graph_path;
-      cli_frontend_graph_module_name;
-      cli_frontend_graph_source_text;
-      cli_frontend_graph_parsed_response;
-      cli_frontend_graph_origin;
-    }
-
-let cli_frontend_graph_source_list_field (name : string)
-    (artifact : Lsp_json.json) :
-    (cli_frontend_graph_source list, string * string) result =
-  array_response_field_map name cli_frontend_graph_source_field artifact
-
-let cli_frontend_import_edge_field (edge : Lsp_json.json) :
-    (cli_frontend_import_edge, string * string) result =
-  let* cli_frontend_import_from_path = string_response_field "from_path" edge in
-  let* cli_frontend_import_from_module =
-    string_response_field "from_module" edge
-  in
-  let* cli_frontend_import_path = string_response_field "import_path" edge in
-  let* cli_frontend_import_resolved_path =
-    optional_string_response_field "resolved_path" edge
-  in
-  let* cli_frontend_import_resolved_module =
-    optional_string_response_field "resolved_module" edge
-  in
-  let* cli_frontend_import_resolved_origin =
-    optional_cli_frontend_module_origin_field "resolved_origin" edge
-  in
-  Ok
-    {
-      cli_frontend_import_from_path;
-      cli_frontend_import_from_module;
-      cli_frontend_import_path;
-      cli_frontend_import_resolved_path;
-      cli_frontend_import_resolved_module;
-      cli_frontend_import_resolved_origin;
-    }
-
-let cli_frontend_import_edges_field (artifact : Lsp_json.json) :
-    (cli_frontend_import_edge list, string * string) result =
-  array_response_field_map "imports" cli_frontend_import_edge_field artifact
-
-let cli_frontend_graph_diagnostics_field artifact =
-  string_array_field "diagnostics" artifact
-
-let cli_frontend_graph_contains_source sources path module_name =
-  List.exists
-    (fun source ->
-      source.cli_frontend_graph_path = path
-      && source.cli_frontend_graph_module_name = module_name)
-    sources
-
-let validate_cli_frontend_import_edges ~sources edges =
-  let validate_edge edge =
-    match
-      ( edge.cli_frontend_import_resolved_path,
-        edge.cli_frontend_import_resolved_module )
-    with
-    | None, None -> Ok ()
-    | Some path, Some module_name ->
-        if cli_frontend_graph_contains_source sources path module_name then Ok ()
-        else
-          Error
-            ( "invalid_response",
-              "frontend import edge resolved to `" ^ module_name ^ "` at `"
-              ^ path ^ "` but that source is absent from the graph" )
-    | _ ->
-        Error
-          ( "invalid_response",
-            "frontend import edge must provide both resolved_path and \
-             resolved_module, or neither" )
-  in
-  let rec loop = function
-    | [] -> Ok ()
-    | edge :: rest ->
-        let* () = validate_edge edge in
-        loop rest
-  in
-  loop edges
-
-let cli_frontend_module_graph_response_field artifact =
-  let* command_text = string_response_field "command" artifact in
-  let* () = require_compile_frontend_command command_text in
-  let* cli_frontend_graph_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "frontend_module_graph" command_text
-      cli_frontend_graph_args
-  in
-  let* options = json_response_field "options" artifact in
-  let* cli_frontend_graph_compile_options =
-    decode_cli_compile_options options
-  in
-  let* cli_frontend_graph_context =
-    cli_frontend_graph_context_field artifact
-  in
-  let* cli_frontend_graph_roots =
-    cli_frontend_graph_source_list_field "roots" artifact
-  in
-  let* cli_frontend_graph_modules =
-    cli_frontend_graph_source_list_field "modules" artifact
-  in
-  let* cli_frontend_graph_imports = cli_frontend_import_edges_field artifact in
-  let* cli_frontend_graph_diagnostics =
-    cli_frontend_graph_diagnostics_field artifact
-  in
-  let* () =
-    validate_cli_frontend_import_edges
-      ~sources:(cli_frontend_graph_roots @ cli_frontend_graph_modules)
-      cli_frontend_graph_imports
-  in
-  Ok
-    (CliRunFrontendModuleGraph
-       {
-         cli_frontend_graph_args;
-         cli_frontend_graph_compile_options;
-         cli_frontend_graph_context;
-         cli_frontend_graph_roots;
-         cli_frontend_graph_modules;
-         cli_frontend_graph_imports;
-         cli_frontend_graph_diagnostics;
-       })
 
 let cli_run_handled_response_field artifact =
   let* cli_run_status = int_response_field "status" artifact in
@@ -1791,7 +1130,7 @@ let cli_run_response_field response =
   let* kind = string_response_field "kind" artifact in
   match kind with
   | "handled" -> cli_run_handled_response_field artifact
-  | "frontend_module_graph" -> cli_frontend_module_graph_response_field artifact
+  | "frontend_module_graph" -> Ok CliRunSourceCommand
   | "delegate" -> cli_run_delegate_response_field artifact
   | "test" -> cli_run_test_response_field artifact
   | "purify" -> cli_run_purify_response_field artifact
@@ -1847,9 +1186,6 @@ let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
-let capture_emit_core_request_env = "BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST"
-let capture_typecheck_graph_request_env =
-  "BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST"
 let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
 let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
 let typecheck_bridge_source_name =
@@ -1910,21 +1246,6 @@ let read_file_if_exists path =
       (fun () ->
         let len = in_channel_length channel in
         really_input_string channel len)
-
-let read_file_excerpt_if_exists path =
-  if not (Sys.file_exists path) then ""
-  else
-    let channel = open_in_bin path in
-    Fun.protect
-      ~finally:(fun () -> close_in_noerr channel)
-      (fun () ->
-        let len = in_channel_length channel in
-        let excerpt_len = min len bridge_error_excerpt_limit in
-        let excerpt = really_input_string channel excerpt_len in
-        if excerpt_len = len then excerpt
-        else
-          excerpt
-          ^ Printf.sprintf "... <truncated %d bytes>" (len - excerpt_len))
 
 let string_starts_with_at value index prefix =
   let prefix_len = String.length prefix in
@@ -2148,71 +1469,6 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       let stderr_output = read_file_if_exists stderr_path in
       (try Sys.remove stderr_path with _ -> ());
       (Process_status.exit_code status, output, stderr_output)
-
-type completed_file_process = {
-  process_exit_code : int;
-  process_stdout_path : string;
-  process_stdout_bytes : int;
-  process_stderr_output : string;
-  process_stderr_bytes : int;
-}
-
-let close_fd_noerr fd = try Unix.close fd with _ -> ()
-
-let close_owned_fd fd =
-  match !fd with
-  | Some value ->
-      fd := None;
-      close_fd_noerr value
-  | None -> ()
-
-let with_process_stdout_file ?(env = []) ?(unset_env = []) prog args consume =
-  let stdout_path, stdout_fd_value =
-    create_bridge_temp_file "blorp-compiler-bridge-stdout-" ".jsonl"
-      bridge_temp_retry_limit
-  in
-  let stderr_path, stderr_fd_value =
-    try
-      create_bridge_temp_file "blorp-compiler-bridge-stderr-" ".log"
-        bridge_temp_retry_limit
-    with exn ->
-      close_fd_noerr stdout_fd_value;
-      (try Sys.remove stdout_path with _ -> ());
-      raise exn
-  in
-  let stdout_fd = ref (Some stdout_fd_value) in
-  let stderr_fd = ref (Some stderr_fd_value) in
-  Fun.protect
-    ~finally:(fun () ->
-      close_owned_fd stdout_fd;
-      close_owned_fd stderr_fd;
-      (try Sys.remove stdout_path with _ -> ());
-      (try Sys.remove stderr_path with _ -> ()))
-    (fun () ->
-      match Unix.fork () with
-      | 0 -> (
-          try
-            Unix.dup2 stdout_fd_value Unix.stdout;
-            Unix.dup2 stderr_fd_value Unix.stderr;
-            Unix.close stdout_fd_value;
-            Unix.close stderr_fd_value;
-            exec_program prog args (child_environment ~env ~unset_env)
-          with _ -> Unix._exit 127)
-      | pid ->
-          close_owned_fd stdout_fd;
-          close_owned_fd stderr_fd;
-          let status = waitpid_retry pid in
-          let stdout_bytes = (Unix.stat stdout_path).Unix.st_size in
-          let stderr_bytes = (Unix.stat stderr_path).Unix.st_size in
-          let stderr_output = read_file_excerpt_if_exists stderr_path in
-          consume
-            {
-              process_exit_code = Process_status.exit_code status;
-              process_stdout_path = stdout_path;
-              process_stdout_bytes = stdout_bytes;
-              process_stderr_output = stderr_output;
-              process_stderr_bytes = stderr_bytes;
-            })
 
 let default_bridge_helper_compiler () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -2965,17 +2221,6 @@ let parser_bridge_binary () =
         ~source_path:(parser_bridge_source_path ())
         ~compile_env:parser_bridge_helper_compile_env
 
-let typecheck_bridge_binary () =
-  match prepared_bridge_binary_from_env prepared_typecheck_bridge_bin_env with
-  | Some result -> result
-  | None when prepared_bridge_required () ->
-      missing_prepared_bridge_error prepared_typecheck_bridge_bin_env
-  | None ->
-      let* compiler = parser_bridge_helper_compiler () in
-      bridge_binary_for_source typecheck_bridge_cache ~compiler
-        ~source_path:(typecheck_bridge_source_path ())
-        ~compile_env:typecheck_bridge_helper_compile_env
-
 type prepared_bridge_binaries = {
   prepared_renderer_bridge_bin : string;
   prepared_parser_bridge_bin : string;
@@ -3103,35 +2348,6 @@ let run_prepared_bridge_request ?(release_host_heap_before_run = false)
   | Ok output -> output
   | Error (code, message) -> error_response code message
 
-let typecheck_graph_response_file ~module_count path =
-  let channel = open_in_bin path in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr channel)
-    (fun () -> typecheck_graph_stream_response_channel ~module_count channel)
-
-let run_prepared_typecheck_graph_request ~module_count bridge_binary request =
-  with_resolved_prepared_bridge_request bridge_binary request
-    (fun bridge_binary ->
-      let started_at = Unix.gettimeofday () in
-      with_process_stdout_file bridge_binary
-        ~unset_env:[ "BLORP_LEAK_CHECK" ]
-        [ request.request_path ] (fun completed ->
-          log_prepared_bridge_stats request ~bridge_binary
-            ~stdout_bytes:completed.process_stdout_bytes
-            ~stderr_bytes:completed.process_stderr_bytes ~started_at
-            ~exit_code:completed.process_exit_code;
-          if completed.process_exit_code = 0 then
-            typecheck_graph_response_file ~module_count
-              completed.process_stdout_path
-          else
-            Error
-              ( "bridge_command_failed",
-                bridge_process_failure_message request
-                  ~exit_code:completed.process_exit_code
-                  ~stdout:
-                    (read_file_excerpt_if_exists completed.process_stdout_path)
-                  ~stderr:completed.process_stderr_output )))
-
 let run_request_via_blorp_binary ?release_host_heap_before_run bridge_binary
     request_json =
   let stats_enabled = bridge_stats_enabled () in
@@ -3144,11 +2360,6 @@ let run_renderer_request_via_blorp ?release_host_heap_before_run request_json =
 
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
-
-let run_typecheck_graph_request_via_blorp ~module_count request_json =
-  let stats_enabled = bridge_stats_enabled () in
-  run_prepared_typecheck_graph_request ~module_count typecheck_bridge_binary
-    (prepare_bridge_request ~stats_enabled request_json)
 
 let run_cli_request_via_blorp ?version ?source args =
   run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
@@ -3192,34 +2403,6 @@ let render_via_command_exn ~renderer ~op args =
              ^ op)
         | Error (_, message) -> invalid_arg message)
 
-let emit_core_c_artifact_exn ?(profile = false) core_json =
-  let request_json = emit_core_c_request_json ~profile core_json in
-  match Sys.getenv_opt capture_emit_core_request_env with
-  | Some capture_path when not (String.equal capture_path "") ->
-      write_file capture_path request_json;
-      invalid_arg
-        (Printf.sprintf
-           "captured emit_core_c request at %s; renderer was not started because \
-            %s is set"
-           capture_path capture_emit_core_request_env)
-  | _ ->
-      let response_json =
-        run_renderer_request_via_blorp ~release_host_heap_before_run:true
-          request_json
-      in
-      (match response_result response_json c_artifact_response_field with
-      | Ok artifact -> artifact
-      | Error (_, message) -> invalid_arg message)
-
-let run_core_pipeline_core_json_exn ~stage core_json =
-  let response_json =
-    run_renderer_request_via_blorp
-      (run_core_pipeline_request_json ~stage core_json)
-  in
-  match response_result response_json (json_response_field "core") with
-  | Ok transformed_core -> transformed_core
-  | Error (_, message) -> invalid_arg message
-
 let parse_source_via_command_at_phase ~phase ~path ~module_name ~text =
   let response_json =
     run_parser_request_via_blorp
@@ -3240,36 +2423,8 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
   in
   parse_source_response_json response_json
 
-let typecheck_graph_via_command_with_policy ~resolved_imports
-    ~allow_debug_only_calls ~target ~modules ~module_targets =
-  let request_json =
-    typecheck_graph_request_json_with_policy ~resolved_imports
-      ~allow_debug_only_calls ~target ~modules ~module_targets
-  in
-  match Sys.getenv_opt capture_typecheck_graph_request_env with
-  | Some capture_path when not (String.equal capture_path "") ->
-      write_file capture_path request_json;
-      invalid_arg
-        (Printf.sprintf
-           "captured typecheck_graph request at %s; typecheck helper was not \
-            started because %s is set"
-           capture_path capture_typecheck_graph_request_env)
-  | _ ->
-      run_typecheck_graph_request_via_blorp
-        ~module_count:(List.length module_targets) request_json
-
 let cli_run_via_command ?version ?source args =
   run_cli_request_via_blorp ?version ?source args |> cli_run_response_json
-
-let cli_run_source_via_command ~path ~module_name ~text args =
-  cli_run_via_command
-    ~source:
-      {
-        cli_source_path = path;
-        cli_source_module_name = module_name;
-        cli_source_text = text;
-      }
-    args
 
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer

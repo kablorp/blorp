@@ -45,27 +45,9 @@ type source_value_layout_classification =
   | SourceValueUnknownNamed of string
   | SourceValueInvalid of string
 
-type tensor_raw_scalar_abi = private {
-  tras_c_type : string;
-  tras_pointer_c_type : string;
-  tras_storage_mode : string;
-  tras_elem_size : string;
-}
-
 type tensor_runtime_read_helper = private {
   trrh_value_ty : Ast.type_expr;
   trrh_c_helper : string;
-}
-
-type tensor_fast_numeric_access = private {
-  tfna_storage_pred_intr : string;
-  tfna_raw_kind : Core.tensor_unboxed_scalar;
-}
-
-type tensor_numeric_access = private {
-  tna_value_ty : Ast.type_expr;
-  tna_get_intrinsic : string;
-  tna_fast_access : tensor_fast_numeric_access option;
 }
 
 type tensor_checked_get_access = private {
@@ -138,12 +120,6 @@ type list_element_storage = private
   | ListElementPointer
 
 type list_type = private { list_elem_ty : Ast.type_expr }
-type set_type = private { set_elem_ty : Ast.type_expr }
-
-type dict_type = private {
-  dict_key_ty : Ast.type_expr;
-  dict_value_ty : Ast.type_expr;
-}
 
 type tensor_element_storage = private
   | TensorElementRawScalar of Core.tensor_unboxed_scalar
@@ -155,13 +131,6 @@ type boxed_storage_scalar_kind =
   | BoxedStorageInlineScalar
   | BoxedStorageArcBoxedScalar
   | BoxedStorageNonScalar
-
-type pointer_argument_layout =
-  | PointerArgumentIdentity
-  | PointerArgumentBox
-  | PointerArgumentCast
-
-type hash_probe_layout = HashProbeImmediate | HashProbeDispatched
 
 type t = private {
   semantic : Ast.type_expr;
@@ -219,8 +188,6 @@ val union_destructor_policy :
   Ast.type_decl ->
   Codegen_types.managed_destructor
 
-val tensor_raw_scalar_abi : Core.tensor_unboxed_scalar -> tensor_raw_scalar_abi
-
 (* Raw scalar value ABI used by tensor read/write intrinsics. This is not the
    same decision as tensor element storage layout: a value type can have a raw
    scalar read ABI even when a particular tensor producer stores that type in a
@@ -242,14 +209,6 @@ val tensor_runtime_read_helper_of_type :
   reg:Codegen_types.registry ->
   Ast.type_expr ->
   tensor_runtime_read_helper option
-
-(* Numeric tensor access facts used by synthesized vector/tensor loops. This is
-   a semantic-element classification plus the safe runtime getter and optional
-   typed raw-storage fast path. It is deliberately narrower than
-   [tensor_runtime_read_helper_of_type]: reductions currently synthesize only
-   Int, Float, Float32, and Float16. *)
-val tensor_numeric_access_of_type :
-  reg:Codegen_types.registry -> Ast.type_expr -> tensor_numeric_access option
 
 (* Scalar Core getter selected for bounds-proven tensor checked-get
    specialization. This preserves the late-layout decision about which
@@ -316,15 +275,6 @@ val source_value_requires_retain_or_error :
 val boxed_storage_scalar_kind :
   ?reg:Codegen_types.registry -> Ast.type_expr -> boxed_storage_scalar_kind
 
-val hash_key_pointer_argument :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> pointer_argument_layout
-
-val boxed_storage_value_pointer_argument :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> pointer_argument_layout
-
-val hash_probe_layout :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> hash_probe_layout
-
 val primitive_inline_width : Ast.type_expr -> primitive_inline_width
 
 val inline_struct_storage :
@@ -334,8 +284,6 @@ val list_element_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> list_element_storage
 
 val list_type : ?reg:Codegen_types.registry -> Ast.type_expr -> list_type option
-val set_type : ?reg:Codegen_types.registry -> Ast.type_expr -> set_type option
-val dict_type : ?reg:Codegen_types.registry -> Ast.type_expr -> dict_type option
 
 val tensor_element_storage :
   ?reg:Codegen_types.registry -> Ast.type_expr -> tensor_element_storage

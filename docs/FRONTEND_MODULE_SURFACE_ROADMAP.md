@@ -13,10 +13,12 @@ exports, private names, and export source references. OCaml should still own
 semantic typechecking, environment construction, overload resolution, and typed
 semantic export conversion until those stages migrate.
 
-## Current OCaml Behavior Studied
+## OCaml Behavior Studied At The Time
 
-The current implementation is spread across module loading, session state, and
-typechecking:
+The implementation studied for this completed roadmap was spread across module
+loading, session state, and typechecking. Several of these OCaml compatibility
+entrypoints, including the preloaded module-graph loader, were subsequently
+deleted after the production boundary moved to the Blorp-owned graph:
 
 - `compiler/lib/modules.ml`
   - `extract_export_names`

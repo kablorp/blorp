@@ -117,26 +117,6 @@ let test_metadata_rejects_bad_link_character () =
      ASCII letters, digits, '.', '_', '-', and '+'"
     (validate_metadata (foreign ~links:[ (None, "-lssl;touch") ] "native_call"))
 
-let test_link_flags_cc_args_reuses_validation_split () =
-  let open Blorp.Ffi_boundary in
-  Alcotest.(check (list string))
-    "cc args"
-    [
-      "-I/opt/homebrew/opt/openssl@3/include";
-      "-L/opt/homebrew/opt/openssl@3/lib";
-      "-lssl";
-      "-lcrypto";
-      "-framework";
-      "CoreFoundation";
-    ]
-    (link_flags_cc_args
-       [
-         "-I/opt/homebrew/opt/openssl@3/include \
-          -L/opt/homebrew/opt/openssl@3/lib";
-         "-lssl -lcrypto";
-         "-framework CoreFoundation";
-       ])
-
 let suite =
   [
     ( "classify_arg",
@@ -164,7 +144,5 @@ let suite =
           test_metadata_rejects_bad_link_token;
         Alcotest.test_case "rejects bad link character" `Quick
           test_metadata_rejects_bad_link_character;
-        Alcotest.test_case "link args use validated split" `Quick
-          test_link_flags_cc_args_reuses_validation_split;
       ] );
   ]

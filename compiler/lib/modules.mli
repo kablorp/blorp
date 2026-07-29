@@ -44,20 +44,6 @@ type source_package = Session.source_package = {
 (** A root-project source package alias. These are configured from
     [blorp.toml] or directly by package tooling. *)
 
-type preloaded_parsed_source = {
-  preload_module_name : string;
-  preload_path : string;
-  preload_origin : Session.module_origin;
-  preload_source : string;
-  preload_decls : Ast.program;
-  preload_surface : Module_surface.t option;
-}
-(** Parsed source supplied by the Blorp CLI frontend graph for the current
-    compiler invocation. Graph loading resolves imports from explicit graph
-    edges; matching entries can reuse this finalized source AST and module
-    surface without rereading, reparsing, or rediscovering syntactic module
-    facts from declarations. *)
-
 type parsed_source_artifact = {
   source_artifact_program : Ast.program;
   source_artifact_surface : Module_surface.t option;
@@ -66,53 +52,6 @@ type parsed_source_artifact = {
     bridge. Prefer this over plain AST parsing when the caller will immediately
     load imports, because the surface is the authoritative source of syntactic
     import/export/private-name facts. *)
-
-type preloaded_import_edge = {
-  preload_import_from_path : string;
-  preload_import_from_module : string;
-  preload_import_path : string;
-  preload_import_resolved_path : string option;
-  preload_import_resolved_module : string option;
-  preload_import_resolved_origin : Session.module_origin option;
-}
-(** Import edge supplied by the Blorp-owned frontend graph. Resolved edges must
-    point at a source in [preloaded_module_graph.preload_graph_sources].
-    Unresolved edges are accepted only for embedded-std imports while OCaml
-    still owns embedded std storage. *)
-
-type preloaded_module_graph_context = {
-  preload_graph_std_dir : string option;
-  preload_graph_source_packages : source_package list;
-  preload_graph_package_roots : string list;
-}
-(** Module context discovered by the Blorp CLI/source graph. This is applied
-    to the fresh pipeline session before graph loading so package/std policy
-    does not depend on rediscovering project files in the OCaml shell. *)
-
-type preloaded_module_graph = {
-  preload_graph_context : preloaded_module_graph_context;
-  preload_graph_sources : preloaded_parsed_source list;
-  preload_graph_imports : preloaded_import_edge list;
-}
-(** Closed frontend graph supplied by the Blorp CLI. The pipeline consumes this
-    graph directly instead of asking OCaml to resolve and parse the same import
-    tree again. *)
-
-type finalized_cli_frontend_graph = {
-  finalized_preloaded_graph : preloaded_module_graph;
-  finalized_root : preloaded_parsed_source;
-  finalized_compile_options : Compiler_blorp_bridge.cli_compile_options;
-}
-(** A validated CLI frontend graph ready for the typecheck/Core pipeline. The
-    single root is represented directly so downstream callers cannot observe
-    an empty or ambiguous root set. *)
-
-val finalize_cli_frontend_module_graph :
-  Compiler_blorp_bridge.cli_frontend_module_graph ->
-  (finalized_cli_frontend_graph, Ast.compiler_error list) result
-(** Finalize Blorp parser artifacts and resolved import edges without rereading
-    source files. Diagnostics remain structured so executable callers decide
-    how to render them. *)
 
 val add_source_package : ?sess:Session.t -> source_package -> unit
 (** Add or replace a source package alias in the active session. *)
@@ -161,13 +100,6 @@ val load_imports :
     When [surface] is present, its Blorp-produced import list is authoritative;
     [decls] is only a legacy fallback for non-surface callers.
     Returns the list of successfully loaded modules. *)
-
-val load_preloaded_module_graph :
-  ?sess:Session.t -> target_path:string -> preloaded_module_graph -> unit
-(** Load the module dependency closure reachable from [target_path] using only
-    graph-provided sources and import edges. Any missing non-embedded-std edge
-    is recorded as a module-load diagnostic instead of falling back to
-    filesystem discovery. *)
 
 val get_all_modules : ?sess:Session.t -> unit -> loaded_module list
 (** Get all loaded modules in dependency order. *)

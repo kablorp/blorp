@@ -4690,12 +4690,6 @@ and set_alloc_json ~reg path loc (alloc : Core.set_alloc) =
   in
   Ok (obj [ ("constructor", constructor) ])
 
-and borrowed_list_iterable (expr : Core.core) =
-  match expr.desc with
-  | Core.CVar _ -> true
-  | Core.CField (inner, _) -> borrowed_list_iterable inner
-  | _ -> false
-
 and iterable_release_policy_json ~reg (iter : Core.core) =
   if Core_emit_layout.boxed_expr_transfers_ownership ~reg iter then
     release_policy_json ~reg iter.ty
@@ -8436,40 +8430,3 @@ let program_json ?(foreign_includes = []) ~reg (program : Core.core_program) =
          ( "foreign_includes",
            string_list_json (merge_foreign_includes foreign_includes program) );
        ])
-
-type config = {
-  embed_runtime : bool;
-  profile : bool;
-  reg : Codegen_types.registry;
-}
-
-let config_with_embed ~embed_runtime ?(profile = false) ~reg () =
-  { embed_runtime; profile; reg }
-
-let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
-  {
-    artifact with
-    Compiler_blorp_bridge.c_code =
-      Runtime.runtime_code ^ "\n" ^ artifact.Compiler_blorp_bridge.c_code;
-  }
-
-let emit_core_program_to_artifact (config : config)
-    (program : Core.core_program) =
-  let* core_json = program_json ~reg:config.reg program in
-  let artifact =
-    Compiler_blorp_bridge.emit_core_c_artifact_exn
-      ~profile:config.profile core_json
-  in
-  Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
-
-let emit_program_string config program =
-  match emit_core_program_to_artifact config program with
-  | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
-  | Error _ as error -> error
-
-let try_emit_program_string config program =
-  match emit_program_string config program with
-  | Ok _ as ok -> ok
-  | Error error -> Error (unsupported_to_string error)
-
-let try_emit_core_program_string = try_emit_program_string

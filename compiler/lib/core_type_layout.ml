@@ -231,27 +231,6 @@ let classify (meta : metadata) (ty : Ast.type_expr) : classification =
   in
   go [] ty
 
-let layout_or_error ?(phase = Core_error.Other "type_layout")
-    ?(loc = Ast.dummy_loc) (meta : metadata) (ty : Ast.type_expr) :
-    ownership_layout =
-  match classify meta ty with
-  | Known layout -> layout
-  | Unknown_named name ->
-      Core_error.errorf phase loc
-        ~hint:
-          "register the type as a record, value struct, enum, union, builtin \
-           runtime type, or explicit unmanaged FFI type before ownership \
-           analysis"
-        "ownership classifier has no layout for type %s" name
-  | Invalid_value_type msg ->
-      Core_error.errorf phase loc
-        ~hint:"only runtime value types may participate in ownership analysis"
-        "%s" msg
-
-let release_or_error ?(phase = Core_error.Other "type_layout")
-    ?(loc = Ast.dummy_loc) meta ty =
-  (layout_or_error ~phase ~loc meta ty).release
-
 let classify_debug_heap_value (meta : metadata) (ty : Ast.type_expr) :
     debug_heap_classification =
   match classify meta ty with
@@ -271,39 +250,3 @@ let is_boxed_storage_release_free_value_type = function
 let is_arc_boxed_storage_value_type = function
   | Ast.TyNamed (("Int128" | "UInt128"), []) -> true
   | _ -> false
-
-(** Release policy for values after erasure into generic boxed storage. This
-    intentionally differs from source-value ownership: value records are
-    unmanaged by value, but [blorp_box_struct] returns ARC-managed heap storage
-    that container and variant destructors must release. Wide integer source
-    values are unmanaged scalars, but their generic [void*] representation is
-    also an ARC-managed heap box because 128-bit payloads do not fit in a
-    pointer-sized immediate. *)
-let boxed_storage_release_or_error ?(phase = Core_error.Other "type_layout")
-    ?(loc = Ast.dummy_loc) (meta : metadata) (ty : Ast.type_expr) :
-    release_capability =
-  let rec go seen ty =
-    match normalize_for_ownership ty with
-    | ty when is_stack_option_type meta ty -> ArcRelease
-    | ty when is_stack_result_type meta ty -> ArcRelease
-    | ty when is_arc_boxed_storage_value_type ty -> ArcRelease
-    | ty when is_boxed_storage_release_free_value_type ty -> NoReleaseNeeded
-    | Ast.TyNamed (name, _) when meta.is_enum_name name -> NoReleaseNeeded
-    | Ast.TyNamed (name, _) when meta.is_value_record_name name -> ArcRelease
-    | Ast.TyNamed (name, args) -> (
-        match meta.lookup_alias name with
-        | Some (params, target) when not (List.mem name seen) -> (
-            match apply_alias_if_arity_matches params args target with
-            | Some target -> go (name :: seen) target
-            | None -> release_or_error ~phase ~loc meta ty)
-        | Some _ | None -> release_or_error ~phase ~loc meta ty)
-    | ty -> release_or_error ~phase ~loc meta ty
-  in
-  go [] ty
-
-let boxed_storage_requires_release_or_error
-    ?(phase = Core_error.Other "type_layout") ?(loc = Ast.dummy_loc)
-    (meta : metadata) (ty : Ast.type_expr) : bool =
-  match boxed_storage_release_or_error ~phase ~loc meta ty with
-  | ArcRelease -> true
-  | NoReleaseNeeded -> false

@@ -245,8 +245,13 @@ let decode_request value =
           let* stage = decode_stage value in
           Ok (Some stage)
     in
+    (* A post-match handoff must satisfy every durable contract established by
+       the earlier Blorp-owned stages, not only the Match-specific contract.
+       Synth rechecks debug, desugar, and monomorphization invariants while
+       intentionally allowing mutable locals introduced by synthesis. *)
     let post_match_violations =
-      Core_invariants.run_for_stage Core_stage.Match decoded.core
+      Core_invariants.run_for_stage Core_stage.Synth decoded.core
+      @ Core_invariants.run_for_stage Core_stage.Match decoded.core
     in
     (match post_match_violations with
     | violation :: _ ->

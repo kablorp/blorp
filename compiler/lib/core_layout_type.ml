@@ -39,27 +39,9 @@ type source_value_layout_classification =
   | SourceValueUnknownNamed of string
   | SourceValueInvalid of string
 
-type tensor_raw_scalar_abi = {
-  tras_c_type : string;
-  tras_pointer_c_type : string;
-  tras_storage_mode : string;
-  tras_elem_size : string;
-}
-
 type tensor_runtime_read_helper = {
   trrh_value_ty : Ast.type_expr;
   trrh_c_helper : string;
-}
-
-type tensor_fast_numeric_access = {
-  tfna_storage_pred_intr : string;
-  tfna_raw_kind : Core.tensor_unboxed_scalar;
-}
-
-type tensor_numeric_access = {
-  tna_value_ty : Ast.type_expr;
-  tna_get_intrinsic : string;
-  tna_fast_access : tensor_fast_numeric_access option;
 }
 
 type tensor_checked_get_access = {
@@ -129,8 +111,6 @@ type list_element_storage =
   | ListElementPointer
 
 type list_type = { list_elem_ty : Ast.type_expr }
-type set_type = { set_elem_ty : Ast.type_expr }
-type dict_type = { dict_key_ty : Ast.type_expr; dict_value_ty : Ast.type_expr }
 
 type tensor_element_storage =
   | TensorElementRawScalar of Core.tensor_unboxed_scalar
@@ -142,13 +122,6 @@ type boxed_storage_scalar_kind =
   | BoxedStorageInlineScalar
   | BoxedStorageArcBoxedScalar
   | BoxedStorageNonScalar
-
-type pointer_argument_layout =
-  | PointerArgumentIdentity
-  | PointerArgumentBox
-  | PointerArgumentCast
-
-type hash_probe_layout = HashProbeImmediate | HashProbeDispatched
 
 type enum_inline_width =
   | EnumInlineBits of Core.inline_storage_width
@@ -321,45 +294,6 @@ let enum_inline_width ?reg ty =
           | None -> NotInlineEnum)
       | _ -> NotInlineEnum)
 
-let scalar_or_enum_requires_pointer_box ?reg ty =
-  match boxed_storage_scalar_kind ?reg ty with
-  | BoxedStorageInlineScalar | BoxedStorageArcBoxedScalar -> true
-  | BoxedStorageNonScalar -> (
-      match enum_inline_width ?reg ty with
-      | EnumInlineBits _ -> true
-      | NotInlineEnum -> false)
-
-let hash_key_pointer_argument ?reg ty =
-  match canonical_type ?reg ty with
-  | Ast.TyNamed (("Ptr" | "Void"), _) -> PointerArgumentIdentity
-  | Ast.TyVar _ | Ast.TySelf -> PointerArgumentBox
-  | ty when scalar_or_enum_requires_pointer_box ?reg ty -> PointerArgumentBox
-  | _ -> PointerArgumentCast
-
-let boxed_storage_value_pointer_argument ?reg ty =
-  match canonical_type ?reg ty with
-  | Ast.TyNamed (("Ptr" | "Void"), _) -> PointerArgumentIdentity
-  | Ast.TyVar _ | Ast.TySelf -> PointerArgumentBox
-  | ty when scalar_or_enum_requires_pointer_box ?reg ty -> PointerArgumentBox
-  | ty -> (
-      match inline_struct_storage ?reg ty with
-      | InlineStruct { inline_struct_kind = InlineValueRecord; _ } ->
-          PointerArgumentBox
-      | InlineStruct { inline_struct_kind = InlineStackOption; _ }
-      | NotInlineStruct ->
-          PointerArgumentCast)
-
-let hash_probe_layout ?reg ty =
-  match canonical_type ?reg ty with
-  | Ast.TyNamed (("Int128" | "UInt128"), []) -> HashProbeDispatched
-  | Ast.TyNamed (("Int" | "Bool" | "Char"), []) -> HashProbeImmediate
-  | Ast.TyRange _ -> HashProbeImmediate
-  | ty when Types.is_any_integer_type ty -> HashProbeImmediate
-  | ty -> (
-      match enum_inline_width ?reg ty with
-      | EnumInlineBits _ -> HashProbeImmediate
-      | NotInlineEnum -> HashProbeDispatched)
-
 let primitive_inline_width ty =
   match Codegen_types.normalize_type ty with
   | Ast.TyNamed ("Bool", []) -> PrimitiveInlineBits Core.InlineBytes1
@@ -403,17 +337,6 @@ let list_type ?reg ty =
   | Ast.TyNamed ("List", [ elem ]) -> Some { list_elem_ty = elem }
   | _ -> None
 
-let set_type ?reg ty =
-  match canonical_type ?reg ty with
-  | Ast.TyNamed ("Set", [ elem ]) -> Some { set_elem_ty = elem }
-  | _ -> None
-
-let dict_type ?reg ty =
-  match canonical_type ?reg ty with
-  | Ast.TyNamed ("Dict", [ key; value ]) ->
-      Some { dict_key_ty = key; dict_value_ty = value }
-  | _ -> None
-
 let tensor_element_storage ?reg elem_ty =
   let elem_ty = canonical_type ?reg elem_ty in
   match inline_struct_storage ?reg elem_ty with
@@ -433,29 +356,6 @@ let tensor_element_storage ?reg elem_ty =
               | EnumInlineBits width -> TensorElementPackedBits width
               | NotInlineEnum -> TensorElementBoxed)
           | _ -> TensorElementBoxed))
-
-let tensor_raw_scalar_abi = function
-  | Core.TensorFloat64Elements ->
-      {
-        tras_c_type = "double";
-        tras_pointer_c_type = "double*";
-        tras_storage_mode = "BLORP_VECTOR_STORAGE_F64";
-        tras_elem_size = "sizeof(double)";
-      }
-  | Core.TensorFloat32Elements ->
-      {
-        tras_c_type = "float";
-        tras_pointer_c_type = "float*";
-        tras_storage_mode = "BLORP_VECTOR_STORAGE_F32";
-        tras_elem_size = "sizeof(float)";
-      }
-  | Core.TensorInt64Elements ->
-      {
-        tras_c_type = "long";
-        tras_pointer_c_type = "long*";
-        tras_storage_mode = "BLORP_VECTOR_STORAGE_I64";
-        tras_elem_size = "sizeof(long)";
-      }
 
 let tensor_raw_scalar_kind_of_type ~reg ty =
   match canonical_type ~reg ty with
@@ -488,54 +388,6 @@ let tensor_runtime_read_helper_of_type ~reg ty =
     | _ -> None
   in
   Option.map (fun trrh_c_helper -> { trrh_value_ty = ty; trrh_c_helper }) helper
-
-let tensor_numeric_access_of_type ~reg ty =
-  let ty = canonical_type ~reg ty in
-  match ty with
-  | Ast.TyNamed ("Float", []) ->
-      Some
-        {
-          tna_value_ty = ty;
-          tna_get_intrinsic = "tensor_get_f64";
-          tna_fast_access =
-            Some
-              {
-                tfna_storage_pred_intr = "tensor_is_f64_storage";
-                tfna_raw_kind = Core.TensorFloat64Elements;
-              };
-        }
-  | Ast.TyNamed ("Float32", []) ->
-      Some
-        {
-          tna_value_ty = ty;
-          tna_get_intrinsic = "tensor_get_f32";
-          tna_fast_access =
-            Some
-              {
-                tfna_storage_pred_intr = "tensor_is_f32_storage";
-                tfna_raw_kind = Core.TensorFloat32Elements;
-              };
-        }
-  | Ast.TyNamed ("Float16", []) ->
-      Some
-        {
-          tna_value_ty = ty;
-          tna_get_intrinsic = "tensor_get_f16";
-          tna_fast_access = None;
-        }
-  | Ast.TyNamed ("Int", []) ->
-      Some
-        {
-          tna_value_ty = ty;
-          tna_get_intrinsic = "tensor_get_i64";
-          tna_fast_access =
-            Some
-              {
-                tfna_storage_pred_intr = "tensor_is_i64_storage";
-                tfna_raw_kind = Core.TensorInt64Elements;
-              };
-        }
-  | _ -> None
 
 let tensor_checked_get_access_of_type ~reg ty =
   let ty = canonical_type ~reg ty in
