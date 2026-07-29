@@ -5,33 +5,18 @@ import:
 	compiler_core_desugar: core_type_is_string
 	compiler_core_json:
 		CoreBinaryOp(AddOp, EqualOp, NotEqualOp),
-		CoreCallKind(UserCall),
+		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LetExpr, RawMatchExpr, UnboxExpr),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
-		CoreType(
-			BoxedResultType,
-			EnumType,
-			FunctionType,
-			HeapRecordType,
-			NamedType,
-			RangeType,
-			SelfType,
-			StackResultType,
-			TensorType,
-			TupleType,
-			TypeParameterType,
-			UnionType,
-			ValueRecordType,
-			VoidType,
-		),
+		CoreType,
 		core_expr_type,
 	compiler_core_ssa:
 		CoreAssignmentShape(ControlFlowAssignment, NoAssignment, StraightLineAssignment),
 		classify_assignment_shape,
 	compiler_core_traverse as CoreTraverse
+	compiler_core_type_policy as CoreTypePolicy
 
 
 union CoreEarlyInvariantViolation:
@@ -44,6 +29,7 @@ union CoreEarlyInvariantViolation:
 	MonoBoxSourceTypeUnresolved(CoreSourceLoc)
 	MonoUnboxTargetTypeUnresolved(CoreSourceLoc)
 	RawMatchSurvived(CoreSourceLoc)
+	SelectedDirectCallSurvived(Int, CoreSourceLoc)
 
 
 pure func core_early_invariant_stage(violation: CoreEarlyInvariantViolation) -> String:
@@ -66,6 +52,8 @@ pure func core_early_invariant_stage(violation: CoreEarlyInvariantViolation) -> 
 			"mono"
 		RawMatchSurvived(_):
 			"match"
+		SelectedDirectCallSurvived(_, _):
+			"resolve"
 
 
 pure func core_early_invariant_message(violation: CoreEarlyInvariantViolation) -> String:
@@ -88,6 +76,8 @@ pure func core_early_invariant_message(violation: CoreEarlyInvariantViolation) -
 			"unbox target-type annotation contains an unresolved type variable"
 		RawMatchSurvived(_):
 			"raw pattern match survived Core match compilation"
+		SelectedDirectCallSurvived(_, _):
+			"selected direct call survived Core call resolution"
 
 
 pure func core_early_invariant_hint(violation: CoreEarlyInvariantViolation) -> Option[String]:
@@ -120,6 +110,10 @@ pure func core_early_invariant_hint(violation: CoreEarlyInvariantViolation) -> O
 				))
 		RawMatchSurvived(_):
 			Some("Core match compilation must lower every raw match to a semantic decision tree")
+		SelectedDirectCallSurvived(def_id, _):
+			Some(
+				"Core call resolution must classify selected function identity `${def_id.to_string()}` before the semantic-middle boundary",
+			)
 
 
 pure func core_early_invariant_loc(violation: CoreEarlyInvariantViolation) -> CoreSourceLoc:
@@ -142,37 +136,8 @@ pure func core_early_invariant_loc(violation: CoreEarlyInvariantViolation) -> Co
 			loc
 		RawMatchSurvived(loc):
 			loc
-
-
-private pure func tensor_dim_has_type_parameter(dim: CoreTensorDim) -> Bool:
-	match dim:
-		TensorRuntimeDim(_) | TensorVariadicDim(_):
-			True
-		TensorDimOperation(_, left, right):
-			tensor_dim_has_type_parameter(left) or tensor_dim_has_type_parameter(right)
-		TensorStaticDim(_):
-			False
-
-
-private pure func core_type_has_type_parameter(typ: CoreType) -> Bool:
-	match typ:
-		NamedType(name, args):
-			args.any(core_type_has_type_parameter)
-		TypeParameterType(_) | SelfType:
-			True
-		FunctionType(_, params, return_type):
-			params.any(core_type_has_type_parameter) or core_type_has_type_parameter(return_type)
-		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
-			core_type_has_type_parameter(value_type) or core_type_has_type_parameter(error_type)
-		TensorType(info):
-			(
-				core_type_has_type_parameter(info.element_type)
-				or info.dims.any(tensor_dim_has_type_parameter)
-			)
-		TupleType(items):
-			items.any(core_type_has_type_parameter)
-		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
-			False
+		SelectedDirectCallSurvived(_, loc):
+			loc
 
 
 private pure func debug_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViolation]:
@@ -234,20 +199,20 @@ private pure func mono_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViol
 			var violations: List[CoreEarlyInvariantViolation] = []
 
 			for arg in args:
-				if core_type_has_type_parameter(core_expr_type(arg)):
+				if CoreTypePolicy.core_type_has_unresolved_mono_parameters(core_expr_type(arg)):
 					violations = violations.append(MonoUserCallArgumentTypeUnresolved(name, loc))
 
-			if core_type_has_type_parameter(result_type):
+			if CoreTypePolicy.core_type_has_unresolved_mono_parameters(result_type):
 				violations = violations.append(MonoUserCallReturnTypeUnresolved(name, loc))
 
 			violations
 		BoxExpr(box, _, loc):
-			if core_type_has_type_parameter(box.source_type):
+			if CoreTypePolicy.core_type_has_unresolved_mono_parameters(box.source_type):
 				[MonoBoxSourceTypeUnresolved(loc)]
 			else:
 				[]
 		UnboxExpr(_, _, result_type, loc):
-			if core_type_has_type_parameter(result_type):
+			if CoreTypePolicy.core_type_has_unresolved_mono_parameters(result_type):
 				[MonoUnboxTargetTypeUnresolved(loc)]
 			else:
 				[]
@@ -259,6 +224,14 @@ private pure func match_violations(expr: CoreExpr) -> List[CoreEarlyInvariantVio
 	match expr:
 		RawMatchExpr(_, _, _, loc):
 			[RawMatchSurvived(loc)]
+		_:
+			[]
+
+
+private pure func resolve_violations(expr: CoreExpr) -> List[CoreEarlyInvariantViolation]:
+	match expr:
+		CallExpr(SelectedDirectCall(def_id), _, _, _, loc):
+			[SelectedDirectCallSurvived(def_id, loc)]
 		_:
 			[]
 
@@ -368,3 +341,7 @@ pure func check_synth_invariants(program: CoreProgram) -> List[CoreEarlyInvarian
 
 pure func check_match_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
 	check_program_invariants(program, match_violations)
+
+
+pure func check_resolve_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
+	check_program_invariants(program, resolve_violations)

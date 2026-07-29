@@ -60,6 +60,54 @@ let function_decl ?source_module ?(type_params = []) ?(body = int_literal 0)
       ("loc", synthetic_loc);
     ]
 
+let union_variant ?payload_type_parameter name tag =
+  let fields =
+    match payload_type_parameter with
+    | Some parameter ->
+        [
+          Lsp_json.Object
+            [
+              ("type", type_parameter parameter);
+              ("release_policy", Lsp_json.String "none");
+            ];
+        ]
+    | None -> []
+  in
+  Lsp_json.Object
+    [
+      ("name", Lsp_json.String name);
+      ("tag", Lsp_json.Int tag);
+      ("def_id", Lsp_json.Null);
+      ("fields", Lsp_json.Array fields);
+    ]
+
+let union_decl ?(variants = []) ?(payload_storage = "erased") name
+    type_params =
+  kind "union"
+    [
+      ("name", Lsp_json.String name);
+      ("type_params", Lsp_json.Array type_params);
+      ("variants", Lsp_json.Array variants);
+      ("payload_storage", Lsp_json.String payload_storage);
+      ("loc", synthetic_loc);
+    ]
+
+let runtime_option_decl =
+  union_decl "Option" [ Lsp_json.String "T" ]
+    ~variants:
+      [
+        union_variant "Some" 0 ~payload_type_parameter:"T";
+        union_variant "None" 1;
+      ]
+
+let runtime_result_decl =
+  union_decl "Result" [ Lsp_json.String "T"; Lsp_json.String "E" ]
+    ~variants:
+      [
+        union_variant "Ok" 0 ~payload_type_parameter:"T";
+        union_variant "Err" 1 ~payload_type_parameter:"E";
+      ]
+
 let core_program ?(foreign_includes = []) decls =
   kind "program"
     [
@@ -68,26 +116,11 @@ let core_program ?(foreign_includes = []) decls =
         Lsp_json.Array (List.map (fun include_ -> Lsp_json.String include_) foreign_includes) );
     ]
 
-let import_binding_json =
-  Lsp_json.Object
-    [
-      ("local_name", Lsp_json.String "Value");
-      ("module_path", Lsp_json.String "pkg/value");
-      ("original_name", Lsp_json.String "SourceValue");
-    ]
-
-let module_imports_json =
-  Lsp_json.Object
-    [
-      ("module", Lsp_json.String "pkg/client");
-      ("import_bindings", Lsp_json.Array [ import_binding_json ]);
-    ]
-
-let request_json ?(schema = 5) ?(domain = "compiler_semantic_middle")
-    ?(core_phase = "post_match") ?(require_main = false)
+let request_json ?(schema = 7) ?(domain = "compiler_semantic_middle")
+    ?(core_phase = "post_resolve") ?(require_main = false)
     ?(core = core_program [])
-    ?(capabilities = [ "core_post_match"; "core_pre_dce"; "rendered_stage_observations" ])
-    ?(observations = [ "trait_resolve"; "fusion" ]) ?stop_after () =
+    ?(capabilities = [ "core_post_resolve"; "core_pre_dce"; "rendered_stage_observations" ])
+    ?(observations = [ "std_inline"; "fusion" ]) ?stop_after () =
   Lsp_json.Object
     [
       ("schema", Lsp_json.Int schema);
@@ -98,8 +131,6 @@ let request_json ?(schema = 5) ?(domain = "compiler_semantic_middle")
       ("target_module", Lsp_json.String "main");
       ("core", core);
       ("next_def_id", Lsp_json.Int 20);
-      ("import_bindings", Lsp_json.Array [ import_binding_json ]);
-      ("module_imports", Lsp_json.Array [ module_imports_json ]);
       ("require_main", Lsp_json.Bool require_main);
       ("check_invariants", Lsp_json.Bool true);
       ( "required_capabilities",
@@ -128,13 +159,31 @@ let expect_decode_error expected_code json =
   | Ok _ -> Alcotest.fail ("expected protocol error " ^ expected_code)
   | Error error -> Alcotest.(check string) "error code" expected_code error.code
 
+let contains_substring text needle =
+  let text_length = String.length text in
+  let needle_length = String.length needle in
+  let rec search offset =
+    if offset + needle_length > text_length then false
+    else if String.sub text offset needle_length = needle then true
+    else search (offset + 1)
+  in
+  needle_length = 0 || search 0
+
+let expect_decode_error_message_contains expected_code expected_message json =
+  match Semantic_middle_worker.decode_request json with
+  | Ok _ -> Alcotest.fail ("expected protocol error " ^ expected_code)
+  | Error error ->
+      Alcotest.(check string) "error code" expected_code error.code;
+      Alcotest.(check bool)
+        "error message"
+        true
+        (contains_substring error.message expected_message)
+
 let test_decode_phase_specific_request () =
   let request = decode_ok (request_json ()) in
   Alcotest.(check string) "target path" "src/main.brp" request.target_path;
   Alcotest.(check string) "target module" "main" request.target_module;
   Alcotest.(check int) "next def id" 20 request.next_def_id;
-  Alcotest.(check int) "root imports" 1 (List.length request.import_bindings);
-  Alcotest.(check int) "module imports" 1 (List.length request.module_imports);
   Alcotest.(check int) "observations" 2 (List.length request.observations)
 
 let test_rejects_schema_domain_phase_capability_and_stage () =
@@ -176,7 +225,7 @@ let test_rejects_missing_and_late_core () =
           (List.map (fun (name, value) -> if name = "body" then (name, late) else (name, value)) fields)
     | value -> value
   in
-  expect_decode_error "invalid_post_match_core"
+  expect_decode_error "invalid_post_resolve_core"
     (request_json ~core:(core_program [ malformed ]) ())
 
 let response_or_fail request =
@@ -187,7 +236,7 @@ let response_or_fail request =
            (List.map (fun d -> d.Semantic_middle_worker.message) diagnostics))
   | response -> response
 
-let test_post_match_core_reaches_pre_dce () =
+let test_post_resolve_core_reaches_pre_dce () =
   let core =
     core_program ~foreign_includes:[ "boundary_fixture.h" ]
       [
@@ -211,12 +260,12 @@ let test_stop_after_returns_snapshot () =
   let core = core_program [ function_decl "main" 2 ] in
   let request =
     decode_ok
-      (request_json ~core ~observations:[ "trait_resolve" ]
-         ~stop_after:"trait_resolve" ())
+      (request_json ~core ~observations:[ "std_inline" ]
+         ~stop_after:"std_inline" ())
   in
   match response_or_fail request with
   | Semantic_middle_worker.Stopped { stage; rendered; observations } ->
-      Alcotest.(check string) "stage" "trait_resolve"
+      Alcotest.(check string) "stage" "std_inline"
         (Semantic_middle_worker.stage_name stage);
       Alcotest.(check int) "observations" 1 (List.length observations);
       Alcotest.(check bool) "snapshot" true (String.length rendered > 0)
@@ -234,7 +283,7 @@ let test_rejects_core_from_before_debug_lowering () =
       ]
   in
   let core = core_program [ function_decl ~body:debug_body "main" 2 ] in
-  expect_decode_error "invalid_post_match_core" (request_json ~core ())
+  expect_decode_error "invalid_post_resolve_core" (request_json ~core ())
 
 let test_accepts_synthesis_introduced_mutable_local () =
   let mutable_let =
@@ -265,9 +314,10 @@ let test_rejects_core_from_before_monomorphization () =
       ]
   in
   let core = core_program [ function_decl ~body:call "main" 2 ] in
-  expect_decode_error "invalid_post_match_core" (request_json ~core ())
+  expect_decode_error_message_contains "invalid_post_resolve_core"
+    "call to user function \"identity\"" (request_json ~core ())
 
-let test_rejects_closed_call_to_generic_function () =
+let test_rejects_unprojected_generic_function () =
   let type_param =
     Lsp_json.Object
       [
@@ -276,18 +326,47 @@ let test_rejects_closed_call_to_generic_function () =
       ]
   in
   let generic = function_decl ~type_params:[ type_param ] "identity" 1 in
-  let call =
-    kind "call"
-      [
-        ("call_kind", kind "selected_direct" [ ("def_id", Lsp_json.Int 1) ]);
-        ("callee", variable_expr "identity" ~def_id:1 (function_type [ int_type ] int_type));
-        ("args", Lsp_json.Array [ int_literal 1 ]);
-        ("type", int_type);
-        ("loc", synthetic_loc);
+  let core = core_program [ generic; function_decl "main" 2 ] in
+  expect_decode_error "invalid_post_resolve_core" (request_json ~core ())
+
+let test_accepts_runtime_abi_union_templates () =
+  let core =
+    core_program
+      [ runtime_option_decl; runtime_result_decl; function_decl "main" 2 ]
+  in
+  ignore (decode_ok (request_json ~core ()))
+
+let test_rejects_malformed_runtime_abi_union_templates () =
+  let malformed_result =
+    union_decl "Result" [ Lsp_json.String "T"; Lsp_json.String "E" ]
+      ~variants:
+        [
+          union_variant "Ok" 0 ~payload_type_parameter:"T";
+          union_variant "Err" 1 ~payload_type_parameter:"T";
+        ]
+  in
+  let typed_option =
+    union_decl "Option" [ Lsp_json.String "T" ] ~payload_storage:"typed"
+      ~variants:
+        [
+          union_variant "Some" 0 ~payload_type_parameter:"T";
+          union_variant "None" 1;
       ]
   in
-  let core = core_program [ generic; function_decl ~body:call "main" 2 ] in
-  expect_decode_error "invalid_post_match_core" (request_json ~core ())
+  let wrong_option_tags =
+    union_decl "Option" [ Lsp_json.String "T" ]
+      ~variants:
+        [
+          union_variant "Some" 1 ~payload_type_parameter:"T";
+          union_variant "None" 0;
+        ]
+  in
+  expect_decode_error "invalid_post_resolve_core"
+    (request_json ~core:(core_program [ malformed_result ]) ());
+  expect_decode_error "invalid_post_resolve_core"
+    (request_json ~core:(core_program [ typed_option ]) ());
+  expect_decode_error "invalid_post_resolve_core"
+    (request_json ~core:(core_program [ wrong_option_tags ]) ())
 
 let test_require_main_validation () =
   match Semantic_middle_worker.run_request (decode_ok (request_json ~require_main:true ())) with
@@ -299,7 +378,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 5) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 7) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -307,7 +386,7 @@ let suite =
   [
     ( "protocol",
       [
-        Alcotest.test_case "decode post-match Core request" `Quick
+        Alcotest.test_case "decode post-resolution Core request" `Quick
           test_decode_phase_specific_request;
         Alcotest.test_case "reject incompatible protocol fields" `Quick
           test_rejects_schema_domain_phase_capability_and_stage;
@@ -318,8 +397,8 @@ let suite =
       ] );
     ( "worker",
       [
-        Alcotest.test_case "post-match Core reaches pre-DCE" `Quick
-          test_post_match_core_reaches_pre_dce;
+        Alcotest.test_case "post-resolution Core reaches pre-DCE" `Quick
+          test_post_resolve_core_reaches_pre_dce;
         Alcotest.test_case "stop-after returns snapshot" `Quick
           test_stop_after_returns_snapshot;
         Alcotest.test_case "reject Core from before debug lowering" `Quick
@@ -328,8 +407,12 @@ let suite =
           test_accepts_synthesis_introduced_mutable_local;
         Alcotest.test_case "reject Core from before monomorphization" `Quick
           test_rejects_core_from_before_monomorphization;
-        Alcotest.test_case "reject closed call to generic function" `Quick
-          test_rejects_closed_call_to_generic_function;
+        Alcotest.test_case "reject unprojected generic function" `Quick
+          test_rejects_unprojected_generic_function;
+        Alcotest.test_case "accept runtime ABI union templates" `Quick
+          test_accepts_runtime_abi_union_templates;
+        Alcotest.test_case "reject malformed runtime ABI union templates" `Quick
+          test_rejects_malformed_runtime_abi_union_templates;
         Alcotest.test_case "require-main validation" `Quick test_require_main_validation;
       ] );
   ]

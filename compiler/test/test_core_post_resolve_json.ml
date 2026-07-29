@@ -135,11 +135,12 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_post_match_json.decode_program json with
+  match Core_post_resolve_json.decode_program json with
   | Ok decoded -> decoded
-  | Error error -> Alcotest.fail (Core_post_match_json.decode_error_to_string error)
+  | Error error ->
+      Alcotest.fail (Core_post_resolve_json.decode_error_to_string error)
 
-let test_decodes_post_match_program () =
+let test_decodes_post_resolve_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -186,8 +187,10 @@ let test_rejects_late_ownership_node () =
       ]
   in
   let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
-  match Core_post_match_json.decode_program json with
-  | Ok _ -> Alcotest.fail "late ownership Core crossed the post-match boundary"
+  match Core_post_resolve_json.decode_program json with
+  | Ok _ ->
+      Alcotest.fail
+        "late ownership Core crossed the post-resolution boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -325,7 +328,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_post_match_json.decode_program json with
+  match Core_post_resolve_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -375,7 +378,7 @@ let test_decodes_invalid_debug_block_for_invariant_diagnostic () =
       ()
   | _ -> Alcotest.fail "post-mono debug block was not preserved for invariant diagnostics"
 
-let test_downgrades_deferred_trait_call_for_ocaml_middle () =
+let test_rejects_deferred_trait_call_after_blorp_resolution () =
   let callee_type = function_type [ int_type ] int_type in
   let body =
     call_expr
@@ -387,34 +390,39 @@ let test_downgrades_deferred_trait_call_for_ocaml_middle () =
       (typed_variable_expr "to_string" callee_type)
       [ int_literal 1 ] int_type
   in
-  let decoded =
-    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
-  in
-  match decoded.core with
-  | [
-   {
-     Core.cd_desc =
-       Core.CDFunc
-         {
-           cf_body =
-             Some
-               {
-                 desc =
-                   Core.CCall
-                     (Core.CKUnknown, _, [ { desc = Core.CLit _; _ } ]);
-                 _;
-               };
-           _;
-         };
-     _;
-   };
-  ] ->
-      ()
-  | _ ->
-      Alcotest.fail
-        "deferred Blorp trait dispatch did not downgrade at the OCaml boundary"
+  match
+    Core_post_resolve_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Error error ->
+      Alcotest.(check string)
+        "boundary error"
+        "unresolved deferred trait call reached the post-resolution boundary"
+        error.message
+  | Ok _ ->
+      Alcotest.fail "deferred trait dispatch crossed the resolved boundary"
 
-let test_preserves_selected_trait_target_for_ocaml_middle () =
+let test_rejects_selected_direct_call_after_blorp_resolution () =
+  let callee_type = function_type [ int_type ] int_type in
+  let body =
+    call_expr
+      (kind "selected_direct" [ ("def_id", Lsp_json.Int 41) ])
+      (typed_variable_expr "helper" callee_type)
+      [ int_literal 1 ] int_type
+  in
+  match
+    Core_post_resolve_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Error error ->
+      Alcotest.(check string)
+        "boundary error"
+        "unresolved selected direct call reached the post-resolution boundary"
+        error.message
+  | Ok _ ->
+      Alcotest.fail "selected direct call crossed the resolved boundary"
+
+let test_rejects_selected_trait_call_after_blorp_resolution () =
   let callee_type = function_type [ int_type ] int_type in
   let body =
     call_expr
@@ -428,28 +436,19 @@ let test_preserves_selected_trait_target_for_ocaml_middle () =
       (typed_variable_expr "__ufcs_std$traits__to_string" callee_type)
       [ int_literal 1 ] int_type
   in
-  let decoded =
-    decode_exn (program [ function_decl ~body:(Some body) "main" 1 ])
-  in
-  match decoded.core with
-  | [
-   {
-     Core.cd_desc =
-       Core.CDFunc
-         {
-           cf_body =
-             Some { desc = Core.CCall (Core.CKSelectedDirect 41, _, _); _ };
-           _;
-         };
-     _;
-   };
-  ] ->
-      ()
-  | _ ->
-      Alcotest.fail
-        "selected Blorp trait target did not reach the OCaml middle"
+  match
+    Core_post_resolve_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Error error ->
+      Alcotest.(check string)
+        "boundary error"
+        "unresolved selected trait call reached the post-resolution boundary"
+        error.message
+  | Ok _ ->
+      Alcotest.fail "selected trait dispatch crossed the resolved boundary"
 
-let test_preserves_impl_type_param_bounds_for_remaining_middle () =
+let test_rejects_generic_impl_template () =
   let impl_decl =
     kind "impl"
       [
@@ -468,36 +467,13 @@ let test_preserves_impl_type_param_bounds_for_remaining_middle () =
         ("loc", synthetic_loc);
       ]
   in
-  let decoded = decode_exn (program [ impl_decl ]) in
-  match decoded.core with
-  | [
-   {
-     Core.cd_desc =
-	       Core.CDImpl
-	         {
-	           ci_for_type = Ast.TyNamed ("List", [ Ast.TyVar "T" ]);
-	           ci_methods =
-             [
-               {
-                 cf_type_params =
-                   [
-                     {
-                       Ast.param_name = "T";
-                       param_bounds = [ { Generic_params.tr_name = "Stringable" } ];
-                     };
-                   ];
-                 _;
-               };
-             ];
-           _;
-         };
-     _;
-   };
-  ] ->
-      ()
-  | _ ->
-      Alcotest.fail
-        "generic impl bounds were not preserved at the post-mono handoff"
+  match Core_post_resolve_json.decode_program (program [ impl_decl ]) with
+  | Error error ->
+      Alcotest.(check string)
+        "boundary error"
+        "generic impl template is not valid post-resolution"
+        error.message
+  | Ok _ -> Alcotest.fail "generic impl template crossed the runtime boundary"
 
 let test_decodes_semantic_match_tree () =
   let root_accessor = kind "root" [] in
@@ -626,7 +602,7 @@ let test_decodes_precompiled_constructor_match () =
       ()
   | _ ->
       Alcotest.fail
-        "precompiled constructor match changed across the post-match boundary"
+        "precompiled constructor match changed across the post-resolution boundary"
 
 let test_decodes_specialized_match_accessor () =
   let binding =
@@ -666,17 +642,17 @@ let test_decodes_specialized_match_accessor () =
       ()
   | _ ->
       Alcotest.fail
-        "specialized match accessor changed across the post-match boundary"
+        "specialized match accessor changed across the post-resolution boundary"
 
 let test_rejects_ownership_bearing_constructor_match () =
   let body = precompiled_constructor_match "arc" in
   match
-    Core_post_match_json.decode_program
+    Core_post_resolve_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Ok _ ->
       Alcotest.fail
-        "ownership-bearing constructor match crossed the post-match boundary"
+        "ownership-bearing constructor match crossed the post-resolution boundary"
   | Error error ->
       Alcotest.(check string) "path"
         "program.decls[0].body.scrutinee_release_policy" error.path;
@@ -694,10 +670,11 @@ let test_rejects_raw_match () =
       ]
   in
   match
-    Core_post_match_json.decode_program
+    Core_post_resolve_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
-  | Ok _ -> Alcotest.fail "raw match crossed the post-match boundary"
+  | Ok _ ->
+      Alcotest.fail "raw match crossed the post-resolution boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -965,7 +942,8 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes post-match program" `Quick test_decodes_post_match_program;
+        Alcotest.test_case "decodes post-resolution program" `Quick
+          test_decodes_post_resolve_program;
         Alcotest.test_case "preserves union payload storage" `Quick
           test_preserves_union_payload_storage;
         Alcotest.test_case "rejects later ownership node" `Quick
@@ -979,12 +957,14 @@ let suite =
           test_decodes_exact_int64_literal_text;
         Alcotest.test_case "preserves invalid debug block for invariant diagnostic" `Quick
           test_decodes_invalid_debug_block_for_invariant_diagnostic;
-        Alcotest.test_case "downgrades deferred trait call for OCaml middle"
-          `Quick test_downgrades_deferred_trait_call_for_ocaml_middle;
-        Alcotest.test_case "preserves selected trait target for OCaml middle"
-          `Quick test_preserves_selected_trait_target_for_ocaml_middle;
-        Alcotest.test_case "preserves impl type parameter bounds for remaining middle"
-          `Quick test_preserves_impl_type_param_bounds_for_remaining_middle;
+        Alcotest.test_case "rejects deferred trait call after Blorp resolution"
+          `Quick test_rejects_deferred_trait_call_after_blorp_resolution;
+        Alcotest.test_case "rejects selected direct call after Blorp resolution"
+          `Quick test_rejects_selected_direct_call_after_blorp_resolution;
+        Alcotest.test_case "rejects selected trait call after Blorp resolution"
+          `Quick test_rejects_selected_trait_call_after_blorp_resolution;
+        Alcotest.test_case "rejects generic impl template" `Quick
+          test_rejects_generic_impl_template;
         Alcotest.test_case "decodes semantic match tree" `Quick
           test_decodes_semantic_match_tree;
         Alcotest.test_case "decodes precompiled constructor match" `Quick

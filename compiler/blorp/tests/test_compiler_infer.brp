@@ -227,6 +227,7 @@ import:
 		CompilerResourceShapeTarget(CompilerOneShotStreamShape, CompilerResourceSourceShape),
 		CompilerTypecheckState,
 		compiler_typecheck_state_add_known_resource_type_name,
+		compiler_typecheck_state_add_scoped_trait_function,
 		compiler_typecheck_state_empty,
 		compiler_typecheck_state_record_type_home,
 		compiler_typecheck_state_register_imported_name,
@@ -2533,6 +2534,89 @@ func test_bare_to_string_uses_builtin_dispatch_for_string() -> Bool:
 	)
 
 	result.context.state.errors.length() == 0 and resolved_call_targets_builtin(result)
+
+
+func test_scoped_trait_method_wins_builtin_name_collision() -> Bool:
+	state = add_infer_value(
+		add_infer_value(compiler_typecheck_state_empty(), "left", compiler_type_int()),
+		"right",
+		compiler_type_int(),
+	)
+	scoped = compiler_typecheck_state_add_scoped_trait_function(state, "equals", "Equatable")
+	result = compiler_infer_expr(
+		compiler_infer_context(scoped),
+		call_expr(
+			ParsedNameExpr(ident("equals")),
+			[ParsedNameExpr(ident("left")), ParsedNameExpr(ident("right"))],
+		),
+	)
+
+	result.context.state.errors.length() == 0 and resolved_call_targets_trait(result, "Equatable")
+
+
+pure func state_with_imported_equals_in_trait_scope() -> CompilerTypecheckState:
+	state = add_infer_value(
+		add_infer_value(compiler_typecheck_state_empty(), "left", compiler_type_int()),
+		"right",
+		compiler_type_int(),
+	)
+
+	match compiler_env_mint_def_id(state.env):
+		(next_env, def_id):
+			imported_symbol = compiler_func_symbol(
+				def_id,
+				CompilerFunctionType(
+					True,
+					[compiler_type_int(), compiler_type_int()],
+					compiler_type_bool(),
+				),
+				[],
+				[Some("left"), Some("right")],
+				CompilerPure,
+				CompilerUserDefinedFunc,
+				CompilerRejectResourceArgs,
+				Some("helpers/equality"),
+				[],
+				None,
+				False,
+			)
+			with_function = { state |
+				env = compiler_env_add_func_with_info(next_env, "equals", imported_symbol)
+			}
+			imported = compiler_typecheck_state_register_imported_name(
+				with_function,
+				"equals",
+				"helpers/equality",
+				"equals",
+			)
+			compiler_typecheck_state_add_scoped_trait_function(
+				imported.state,
+				"equals",
+				"Equatable",
+			)
+
+
+func test_explicit_import_wins_scoped_trait_method_name() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_imported_equals_in_trait_scope()),
+		call_expr(
+			ParsedNameExpr(ident("equals")),
+			[ParsedNameExpr(ident("left")), ParsedNameExpr(ident("right"))],
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and match compiler_typed_expr_resolved_call(result.expr):
+			Some(info):
+				match info.target:
+					CompilerResolvedDirectCall(_, CompilerCallableImported(module_path)):
+						module_path == "helpers/equality"
+					_:
+						False
+			None:
+				False
+	)
 
 
 func test_ufcs_to_string_uses_trait_dispatch_for_bounded_generic() -> Bool:
@@ -10634,6 +10718,14 @@ tests: TestSuite = {
 		(
 			"bare to_string uses builtin dispatch for String",
 			test_bare_to_string_uses_builtin_dispatch_for_string,
+		),
+		(
+			"scoped trait method wins builtin name collision",
+			test_scoped_trait_method_wins_builtin_name_collision,
+		),
+		(
+			"explicit import wins scoped trait method name",
+			test_explicit_import_wins_scoped_trait_method_name,
 		),
 		(
 			"UFCS to_string uses trait dispatch for bounded generic",

@@ -280,6 +280,149 @@ let test_tyvar_ignores_builtin_calls () =
   let violations = Core_invariants.check_no_tyvar_leak prog in
   Alcotest.(check int) "no violations for builtin" 0 (List.length violations)
 
+let test_tyvar_allows_erased_range_bound () =
+  let range_ty = TyRange (TyVar "#_") in
+  let fn_ty =
+    TyFunc { params = [ range_ty ]; return = ty_int; is_pure = true }
+  in
+  let fn = mk (CVar (Var.named "at")) fn_ty in
+  let arg = mk (CLit (LitInt 0L)) range_ty in
+  let call = mk_call (CKUser ("at", None)) fn [ arg ] ty_int in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "no violations for erased range bound" 0
+    (List.length violations)
+
+let test_tyvar_flags_source_range_bound_variable () =
+  let range_ty = TyRange (TyVar "#N") in
+  let fn_ty =
+    TyFunc { params = [ range_ty ]; return = ty_int; is_pure = true }
+  in
+  let fn = mk (CVar (Var.named "at")) fn_ty in
+  let arg = mk (CLit (LitInt 0L)) range_ty in
+  let call = mk_call (CKUser ("at", None)) fn [ arg ] ty_int in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "one violation for source range variable" 1
+    (List.length violations)
+
+let test_tyvar_allows_runtime_dimension_pack () =
+  let tensor_ty = TyArray (ty_int, [ TyVarDims "#Ds" ]) in
+  let fn_ty =
+    TyFunc { params = [ tensor_ty ]; return = ty_int; is_pure = true }
+  in
+  let fn = mk (CVar (Var.named "length")) fn_ty in
+  let arg = mk (CVar (Var.named "values")) tensor_ty in
+  let call = mk_call (CKUser ("length", Some 10)) fn [ arg ] ty_int in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "no violations for runtime dimension pack" 0
+    (List.length violations)
+
+let test_tyvar_allows_runtime_dimension_wildcard () =
+  let tensor_ty = TyArray (ty_int, [ TyVar "#_" ]) in
+  let fn_ty =
+    TyFunc { params = [ tensor_ty ]; return = ty_int; is_pure = true }
+  in
+  let fn = mk (CVar (Var.named "length")) fn_ty in
+  let arg = mk (CVar (Var.named "values")) tensor_ty in
+  let call = mk_call (CKUser ("length", Some 10)) fn [ arg ] ty_int in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "no violations for runtime dimension wildcard" 0
+    (List.length violations)
+
+let test_tyvar_allows_unused_constructor_return_parameter () =
+  let result_decl =
+    {
+      type_name = "Result";
+      type_params =
+        [ Ast.make_type_param "T" []; Ast.make_type_param "E" [] ];
+      type_variants =
+        [
+          {
+            variant_name = "Ok";
+            variant_fields = [ TyVar "T" ];
+            variant_tag = 0;
+            variant_loc = loc;
+            variant_def_id = Some 42;
+          };
+          {
+            variant_name = "Err";
+            variant_fields = [ TyVar "E" ];
+            variant_tag = 1;
+            variant_loc = loc;
+            variant_def_id = Some 43;
+          };
+        ];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+    }
+  in
+  let return_ty = TyNamed ("Result", [ ty_int; TyVar "E" ]) in
+  let fn_ty =
+    TyFunc { params = [ ty_int ]; return = return_ty; is_pure = true }
+  in
+  let fn = mk (CVar (var_with_def_id "Ok" 42)) fn_ty in
+  let call =
+    mk_call (CKUser ("Ok", Some 42)) fn [ mk (CLit (LitInt 1L)) ty_int ]
+      return_ty
+  in
+  let prog =
+    mk_prog
+      [
+        CDType result_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:call);
+      ]
+  in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "no violations for constructor return" 0
+    (List.length violations)
+
+let test_tyvar_flags_constructor_payload_return_parameter () =
+  let result_decl =
+    {
+      type_name = "Result";
+      type_params =
+        [ Ast.make_type_param "T" []; Ast.make_type_param "E" [] ];
+      type_variants =
+        [
+          {
+            variant_name = "Ok";
+            variant_fields = [ TyVar "T" ];
+            variant_tag = 0;
+            variant_loc = loc;
+            variant_def_id = Some 42;
+          };
+        ];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+    }
+  in
+  let return_ty = TyNamed ("Result", [ TyVar "T"; ty_string ]) in
+  let fn_ty =
+    TyFunc { params = [ ty_int ]; return = return_ty; is_pure = true }
+  in
+  let fn = mk (CVar (var_with_def_id "Ok" 42)) fn_ty in
+  let call =
+    mk_call (CKUser ("Ok", Some 42)) fn [ mk (CLit (LitInt 1L)) ty_int ]
+      return_ty
+  in
+  let prog =
+    mk_prog
+      [
+        CDType result_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:call);
+      ]
+  in
+  let violations = Core_invariants.check_no_tyvar_leak prog in
+  Alcotest.(check int) "one violation for payload parameter" 1
+    (List.length violations)
+
 let test_mono_flags_selected_direct_call_to_generic_function () =
   let generic =
     {
@@ -2112,6 +2255,18 @@ let suite =
           test_tyvar_flags_unmonomorphized_call;
         Alcotest.test_case "ignores builtin" `Quick
           test_tyvar_ignores_builtin_calls;
+        Alcotest.test_case "allows erased range bound" `Quick
+          test_tyvar_allows_erased_range_bound;
+        Alcotest.test_case "flags source range bound variable" `Quick
+          test_tyvar_flags_source_range_bound_variable;
+        Alcotest.test_case "allows runtime dimension pack" `Quick
+          test_tyvar_allows_runtime_dimension_pack;
+        Alcotest.test_case "allows runtime dimension wildcard" `Quick
+          test_tyvar_allows_runtime_dimension_wildcard;
+        Alcotest.test_case "allows unused constructor return parameter" `Quick
+          test_tyvar_allows_unused_constructor_return_parameter;
+        Alcotest.test_case "flags constructor payload return parameter" `Quick
+          test_tyvar_flags_constructor_payload_return_parameter;
         Alcotest.test_case "flags selected direct call to generic function"
           `Quick test_mono_flags_selected_direct_call_to_generic_function;
         Alcotest.test_case "allows selected direct in generic template" `Quick

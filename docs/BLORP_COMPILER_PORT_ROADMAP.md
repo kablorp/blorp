@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-07-27.
+Status checked against code on 2026-07-28.
 
 This is the implementation roadmap for finishing the OCaml-to-Blorp compiler
 migration. The plan moves from the left side of the production pipeline to the
@@ -24,10 +24,12 @@ Blorp executable / CLI planning / source graph discovery / source reads / parse
   -> Blorp Core lowering / module flattening / FFI boundary / initial list layout
   -> Blorp debug / desugar / SSA / mono / post-mono list layout / synthesis
   -> Blorp pattern-match decision-tree compilation
-  -> strict post-match semantic-middle request
+  -> Blorp trait-method and overloaded-operator resolution
+  -> Blorp call-kind, import, constructor, UFCS, and callable-ID resolution
+  -> strict post-resolution semantic-middle request
   -> one blorp-ocaml-middle process
-  -> OCaml Core middle from trait resolution through the remaining registry-dependent
-     specialization transforms
+  -> OCaml Core middle from std wrapper inlining through the remaining
+     registry-dependent specialization transforms
   -> JSON pre-DCE Core with semantic conversion, hash, length, numeric checked
      tensor-access, raw-scalar tensor-fill, unary tensor-math, numeric tensor
      reduction, and bounds-proven tensor-access builtins preserved
@@ -84,6 +86,9 @@ Current production Core-boundary Blorp files:
 - `compiler/blorp/src/stage_09_core/compiler_core_early_pipeline.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_synth.brp`
 - `compiler/blorp/src/stage_09_core/compiler_core_synth_*.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_trait_resolve.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_resolve.brp`
+- `compiler/blorp/src/stage_09_core/compiler_core_builtin_registry.brp`
 - `compiler/blorp/src/stage_09_core/compiler_semantic_worker_protocol.brp`
 
 Current production backend-tail Blorp files:
@@ -107,15 +112,16 @@ Current OCaml bridge, orchestration, and production-middle files:
 
 - `compiler/bin/blorp_ocaml_middle.ml`
 - `compiler/lib/compiler_blorp_bridge.ml`
-- `compiler/lib/core_post_match_json.ml`
+- `compiler/lib/core_post_resolve_json.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/core_ownership.ml`
 - `compiler/lib/core_emit_blorp_c.ml`
 
 `compiler/lib/core_pipeline.ml` invokes the remaining OCaml Core middle from
-`Core_trait_resolve` after the strict post-match decoder and invariant checks.
-It does not lower typed AST or run debug, desugar/SSA, mono, post-mono list
-layout, synthesis, or match compilation on the normal production source path.
+`Core_std_inline` after the strict post-resolution decoder and invariant
+checks. It does not lower typed AST or run debug, desugar/SSA, mono, post-mono
+list layout, synthesis, match compilation, trait resolution, or ordinary call
+resolution on the normal production source path.
 The production JSON handoff preserves
 concrete conversion, hash, length, numeric checked tensor-access,
 raw-scalar tensor-fill, unary tensor-math, numeric tensor-reduction, and
@@ -137,11 +143,13 @@ compiler bootstrap is a separately packaged immutable
 `blorp-bootstrap-compiler` artifact; the current host no longer implements its
 compile command.
 
-The retired OCaml typed-AST-to-post-match path has been deleted. This
+The retired OCaml typed-AST-to-post-resolution path has been deleted. This
 includes lowering, flattening, FFI annotation, list layout, debug lowering,
 desugar/SSA, monomorphization, builtin-body synthesis, match compilation, and
-their duplicate OCaml implementation suites. The remaining OCaml pipeline has
-one production entrypoint: strict post-match Core.
+trait and ordinary call resolution, together with their duplicate OCaml
+implementation suites.
+The remaining OCaml pipeline has one production entrypoint: strict
+post-resolution Core.
 
 ## Migration Rules
 
@@ -182,7 +190,6 @@ OCaml references still needed at this checkpoint:
 - `compiler/lib/modules.ml`
 - `compiler/lib/core_pipeline.ml`
 - `compiler/lib/language_surface.ml`
-- `compiler/lib/core_trait_resolve.ml`
 
 Blorp references:
 
@@ -1456,7 +1463,8 @@ Current status:
 - Blorp has structured typed expression, typed declaration, and
   `CompilerTypedProgram` JSON projections. During this checkpoint, the
   production source-command path consumed this handoff artifact directly before
-  Core lowering; the boundary has since advanced to post-match Core. Typed
+   Core lowering; the boundary has since advanced to post-trait-resolution Core.
+   Typed
   function metadata now carries the registered callable id, so decoded function
   declarations preserve the same direct-call identity Core lowering expects.
 - That typed handoff preserved ordinary loop-view metadata and
@@ -1495,7 +1503,8 @@ Current status:
   expression/declaration coverage remained at that point.
   The decoder independently rejected incoherent explicit-origin and value-slot
   metadata before those artifacts could reach Core lowering. This decoder was
-  deleted after production moved to the later post-match Core boundary.
+   deleted after production moved to the later post-trait-resolution Core
+   boundary.
 - The temporary OCaml typed-program decoder also materialized typed string
   interpolation parts, lambdas, `select`, `while`, ordinary `for` loops
   including tuple binders, `for ... concurrently(...)`, `detach`, and `with`
@@ -1535,7 +1544,7 @@ Current status:
   and `run` before the source-command path moved to the frontend graph bridge.
   CTFE then ran in the Blorp typed-program bridge, with Core lowering on the
   OCaml side. The OCaml client and typed-program decoder were later removed
-  when the handoff advanced to post-match Core.
+   when the handoff advanced to post-trait-resolution Core.
 - Blorp typechecking now centralizes import bookkeeping in
   `compiler_imports.brp`. The single-source typed bridge uses the explicit
   syntax-only import collector so it can report qualified module aliases,
@@ -1806,7 +1815,7 @@ Current status:
   independent OCaml runtime cache.
 - The Blorp-owned generated selector/run-all graph can now be retained after
   its source files are removed and prepared through the production early Core
-  pipeline to the post-match worker request. Its compile policy represents
+  pipeline to the post-resolution worker request. Its compile policy represents
   permission to call debug-only test helpers separately from retention of
   `debug:` blocks. Production TestRunner routing has not switched yet; the next
   slice must consume this retained graph rather than adding a test-only parser
@@ -1974,19 +1983,20 @@ Current progress:
   flattens each module before assembly, keeps the target unprefixed, preserves
   ordered foreign includes, and runs FFI and list-layout annotation exactly
   once before serialization.
-- `compiler_semantic_worker_protocol.brp` schema 5 carries post-match Core,
-  import tables, the next definition id, stage observations, and invariant
-  policy. `core_post_match_json.ml` is a strict phase-specific decoder rather
-  than a permissive reuse of the late backend projection.
+- `compiler_semantic_worker_protocol.brp` schema 7 carries post-resolution
+  Core, the next definition id, stage observations, and invariant policy.
+  Import tables are consumed by Blorp resolution and do not cross the bridge.
+  `core_post_resolve_json.ml` is a strict phase-specific decoder rather than a
+  permissive reuse of the late backend projection.
 - Production lowering covers the finalized typed expression and declaration
   surface, including raw patterns for Blorp match compilation, record
   updates, resource scopes and resource-source loops, tensor iteration,
   multidimensional enumerate, windows, concurrency, imports, globals, traits,
   impls, aliases, records, unions, and foreign declarations. Source-only or
   malformed typed nodes fail at the boundary instead of falling back to OCaml.
-- The normal CLI path is contiguous Blorp from source reads through post-match
-  Core. The only OCaml call is the single semantic-middle worker after this
-  boundary, beginning with trait resolution.
+- The normal CLI path is contiguous Blorp from source reads through
+  post-resolution Core. The only OCaml call is the single semantic-middle
+  worker after this boundary, beginning with std wrapper inlining.
 
 - `compiler_core_lower.brp` owns typed expression/declaration lowering with
   explicit context state for Core definition ids and source-module ownership.
@@ -2024,11 +2034,10 @@ Current progress:
   identities remain unresolved. Name-only `UnknownCall` resolution remains
   closed until module, builtin, foreign, trait, and bound-local registries have
   all been ported.
-- The temporary OCaml `core_resolve.ml` handoff follows the same identity rule:
-  a canonical post-flatten qualified name is resolved before consulting the
-  reverse selected-id index. This prevents a module-local selected id from
-  resolving to an unrelated same-signature function after flattening. The
-  regression belongs to the boundary and can be deleted with OCaml resolve.
+- `compiler_core_resolve.brp` applies the same identity rule to the production
+  path: a canonical post-flatten qualified name is resolved before consulting
+  the reverse selected-id index. This prevents a module-local selected id from
+  resolving to an unrelated same-signature function after flattening.
 - `compiler_core_flatten.brp` now owns callable-name flattening for one lowered
   module. It sanitizes the module path, assigns distinct names to bodied
   pure/impure overloads, records module provenance on top-level functions and
@@ -2193,7 +2202,7 @@ Current progress:
   the separate late-Core projection.
 - Typed `debug:` blocks survive inference and CTFE validation, lower to an
   explicit prepared-Core `debug_block`, and are erased or retained by the
-  Blorp debug stage before the post-match boundary. The OCaml boundary
+  Blorp debug stage before the post-resolution boundary. The OCaml boundary
   invariant rejects a leaked debug node.
 - Enum and union declarations now materialize as `CompilerTypedUnionDecl`
   instead of parsed passthrough declarations. The typed shape carries canonical
@@ -2259,9 +2268,8 @@ Tests:
 - `compiler/blorp/tests/test_compiler_core_ffi_boundary.brp`
 - `compiler/blorp/tests/test_compiler_core_list_layout.brp`
 - `compiler/blorp/tests/test_compiler_infer.brp`
-- `compiler/test/test_core_post_match_json.ml`
+- `compiler/test/test_core_post_resolve_json.ml`
 - `compiler/test/test_semantic_middle_worker.ml`
-- `compiler/test/test_semantic_middle.ml`
 - `tests/test_compiler/codegen_audit/should_pass/foreign_*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/concurrent*.brp`
 - `tests/test_compiler/codegen_audit/should_pass/tensor_loop_views_direct.brp`
@@ -2269,8 +2277,9 @@ Tests:
 Deletion point:
 
 - Complete. No OCaml typed-AST, prepared-Core compatibility, or early-Core
-  execution path remains. `test_semantic_middle.ml` tests only the live
-  post-match projection/import boundary.
+  execution path remains. The Blorp resolver suites own import-resolution
+  coverage; the Blorp semantic-worker protocol suite owns the post-resolution
+  projection contract.
 
 ## Checkpoint 9: Early And Middle Core Pipeline
 
@@ -2278,12 +2287,33 @@ Goal: move the lowered-Core pipeline stages into Blorp from left to right.
 
 Status: the normal compile/run path now executes a contiguous Blorp-owned Core
 prefix through debug lowering, desugar/SSA, monomorphization, post-mono list
-layout, synthesis, and match compilation. Schema 5 carries only post-match Core
-across the single temporary semantic-middle boundary. The OCaml worker
-validates the completed early-stage contracts and starts at
-`Core_trait_resolve`; early Core observations and stops never invoke the
-worker. The superseded OCaml debug/desugar/SSA/mono/synth/match implementations
-and their implementation-only tests are deleted.
+layout, synthesis, match compilation, trait resolution, and ordinary call
+resolution. Schema 7 carries only post-resolution Core across the single
+temporary semantic-middle boundary. The OCaml worker validates the completed
+early-stage contracts and starts at `Core_std_inline`; early Core observations
+and stops never invoke the worker. The superseded OCaml
+debug/desugar/SSA/mono/synth/match/trait-resolution/call-resolution
+implementations and their implementation-only tests are deleted.
+
+`compiler_core_trait_resolve.brp` indexes concrete impls by explicit trait,
+method, and specialized type identity. It rewrites receiver and static-`Self`
+dispatch, overloaded operators, and `to_string` dispatch without rediscovering
+trait identity from names. Calls intentionally owned by later builtin or UFCS
+resolution are normalized only after missing-impl diagnostics run. The strict
+OCaml decoder rejects any surviving deferred or selected trait call, so the
+boundary cannot silently discard trait metadata. Generic impl templates are
+excluded using their declared parameters, unresolved `for_type`, and generic
+method parameters rather than one metadata field alone.
+
+`compiler_core_resolve.brp` builds typed indexes for user, foreign, builtin,
+intrinsic, constructor, imported, module-qualified, and bound-local callable
+identities. It resolves selected IDs before the boundary, uses explicit import
+bindings rather than recovering module ownership from mangled names, and
+preserves only the `UnknownCall` operations deliberately owned by later
+specialization. `compiler_core_builtin_registry.brp` contains the narrow
+runtime/intrinsic mappings still required for bodyless compiler-owned
+declarations. The Blorp Resolve invariant and strict OCaml decoder both reject
+any `SelectedDirectCall` that survives.
 
 Blorp DCE is authoritative on the normal production path and the superseded
 OCaml DCE implementation and tests are deleted. First-class function-reference
@@ -2315,8 +2345,8 @@ represented explicitly. The four numeric reduction cases now bypass the OCaml
 fallback and their implementation-only test is deleted. The replaced OCaml
 numeric and unary tensor-math dispatch branches, raw-view environment,
 collector, rewriter, global fresh-name counter, and implementation-only tests
-are deleted. The remaining middle Core stages from synth through the residual
-OCaml specialization families are still OCaml-authoritative. Stage parity
+are deleted. The remaining middle Core stages from call resolution through the
+residual OCaml specialization families are still OCaml-authoritative. Stage parity
 modules must not be counted as migrated until the production pass ordering
 invokes them.
 
@@ -2366,8 +2396,9 @@ Each family uses exact module and signature admission. They are body factories;
 only `compiler_core_synth.brp` may walk declarations and promote a successfully
 synthesized builtin to a user function. String, list, set/dictionary, tensor,
 and parallel-tensor families have parity and run before the single semantic
-bridge. The schema-5 worker therefore rejects early-stage observations,
-including `synth` and `match`, and starts with trait resolution.
+bridge. The schema-7 worker therefore rejects early-stage observations,
+including `synth`, `match`, `trait_resolve`, and `resolve`, and starts with std
+wrapper inlining.
 
 Hash-collection layout classification uses declaration-derived enum, record,
 union, and type-alias facts. Alias expansion follows generic targets and uses
@@ -2376,11 +2407,7 @@ registry behavior. Undeclared named types remain a typed synthesis error rather
 than falling back to a spelling heuristic.
 
 Remaining production OCaml references, in
-`Core_pipeline.run_core_passes_from_post_match` order:
-- `compiler/lib/core_trait_resolve.ml`
-  - `resolve_program`
-- `compiler/lib/core_resolve.ml`
-  - `resolve_program`
+`Core_pipeline.run_core_passes_from_post_resolve` order:
 - `compiler/lib/core_std_inline.ml`
   - `rewrite_program`
 - `compiler/lib/core_tailrec.ml`
@@ -2421,8 +2448,12 @@ Blorp references:
   family modules and authoritative on the normal production path
 - existing `compiler_core_match.brp`, authoritative for production match
   compilation
-- future `compiler_core_trait_resolve.brp`
-- future `compiler_core_resolve.brp`
+- existing `compiler_core_trait_resolve.brp`, authoritative on the normal
+  production path
+- existing `compiler_core_resolve.brp`, authoritative on the normal production
+  path
+- existing `compiler_core_builtin_registry.brp` for the resolver-owned runtime
+  and intrinsic lookup subset
 - future `compiler_core_std_inline.brp`
 - future `compiler_core_tailrec.brp`
 - future fusion modules
@@ -2438,7 +2469,8 @@ Blorp references:
 
 Implementation steps:
 
-- Port remaining stages in exact `run_core_passes_from_post_match` order. Move
+- Port remaining stages in exact `run_core_passes_from_post_resolve`
+  order. Move
   the production boundary right by one stage or a tightly coupled pair only
   after parity passes.
 - `compiler_core_debug.brp` owns debug lowering: normal builds replace each
@@ -2669,11 +2701,9 @@ Implementation steps:
     method-local generic parameters remain on the specialized method;
   - generic templates remain in Core while concrete impls are appended, as in
     the OCaml implementation.
-  The current OCaml handoff validates both explicit trait-call payloads. It
-  preserves a selected call as `CKSelectedDirect def_id`, while a deferred call
-  becomes `CKUnknown` because OCaml trait resolution still owns production
-  dispatch. Removing only that deferred-call downgrade belongs to the later
-  trait-resolution boundary move, not monomorphization.
+  Blorp trait resolution consumes both explicit trait-call payloads after
+  monomorphization. The post-resolution handoff rejects either payload if
+  one survives, rather than downgrading trait identity during JSON decoding.
 - `compiler_core_mono_option.brp` now owns expression-local fusion of the exact
   selected `std/option` helpers `is_some`, `is_none`, `get_or`, and
   `get_or_else`:
@@ -2747,12 +2777,13 @@ Implementation steps:
   negative controls, Core JSON round trips, and the OCaml handoff.
 - `compiler_core_early_pipeline.brp` is the pure contiguous executor for
   `lower` observation, debug lowering, desugar/SSA, monomorphization,
-  post-mono list-layout annotation, synthesis, and match compilation. It owns explicit
-  `next_def_id` state, invariant-before-observation ordering, stage
-  observations/stops, and typed mono/invariant/synthesis failures. The
-  compile/run CLI calls this executor before constructing the schema-5
-  post-match request. The semantic worker accepts only that phase and starts at
-  trait resolution. Early observations and stops are handled entirely in Blorp.
+  post-mono list-layout annotation, synthesis, match compilation, trait
+  resolution, and ordinary call resolution. It owns explicit `next_def_id` state,
+  invariant-before-observation ordering, stage observations/stops, and typed
+  mono/invariant/synthesis/trait-resolution failures. The compile/run CLI calls
+  this executor before constructing the schema-7 post-resolution request. The
+  semantic worker accepts only that phase and starts at std wrapper inlining.
+  Early observations and stops are handled entirely in Blorp.
   Observations use the canonical compact Core JSON projection, the same
   representation used by Blorp-owned later stages. This intentionally unifies
   Core snapshots rather than reproducing the temporary OCaml human-readable
@@ -2767,8 +2798,8 @@ Implementation steps:
   trait_resolve, resolve, std_inline, tailrec, fusion, specialize, dce.
 - Keep generated-name counters and registries explicit in stage input/output.
 - Port diagnostic rendering with the stage that owns the diagnostic. For
-  example, trait-resolution diagnostic helpers should disappear when
-  trait resolve moves.
+  example, Blorp trait resolution now renders its diagnostic directly and the
+  obsolete OCaml renderer bridge has been deleted.
 - Keep `Core_invariants` coverage available at the boundary until equivalent
   Blorp invariant checks exist.
 
@@ -2826,8 +2857,6 @@ Edge cases:
 Tests:
 
 - Existing OCaml tests for stages still owned by the OCaml middle:
-  - `compiler/test/test_core_trait_resolve.ml`
-  - `compiler/test/test_core_resolve.ml`
   - `compiler/test/test_core_std_inline.ml`
   - `compiler/test/test_core_tailrec.ml`
   - `compiler/test/test_core_string_pipeline.ml`

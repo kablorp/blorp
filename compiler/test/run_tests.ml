@@ -84,15 +84,12 @@ let default_suites =
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
   @ suite_group "Core" Test_core.suite
-  @ suite_group "CorePostMatchJson" Test_core_post_match_json.suite
+  @ suite_group "CorePostResolveJson" Test_core_post_resolve_json.suite
   @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
-  @ suite_group "SemanticMiddle" Test_semantic_middle.suite
-  @ suite_group "CoreResolve" Test_core_resolve.suite
   @ suite_group "CoreStdInline" Test_core_std_inline.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
   @ suite_group "CoreTailrec" Test_core_tailrec.suite
-  @ suite_group "CoreTraitResolve" Test_core_trait_resolve.suite
   @ suite_group "CoreCollectionPipeline" Test_core_collection_pipeline.suite
   @ suite_group "CoreParallelVectorPipeline"
       Test_core_parallel_tensor_pipeline.suite
@@ -110,6 +107,7 @@ let default_suites =
   @ suite_group "Invariants" Test_invariants.suite
   @ suite_group "IntrinsicContract" Test_intrinsic_contract.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
+  @ suite_group "CodegenTypes" Test_codegen_types.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite
 
 let deep_suites =

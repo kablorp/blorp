@@ -13,12 +13,10 @@ val make_stage_hook :
 type backend_core_input = { blorp_tail_input : Core.core_program }
 (** Core after the OCaml semantic middle and before Blorp-owned DCE. *)
 
-val run_core_passes_from_post_match :
-  ?import_aliases:(string, string * string) Hashtbl.t ->
-  ?module_imports:(string, (string, string * string) Hashtbl.t) Hashtbl.t ->
+val run_core_passes_from_post_resolve :
   on_stage:on_stage_callback ->
   ?on_stage_event:on_stage_event ->
   reg:Codegen_types.registry ->
   Core.core_program ->
   backend_core_input
-(** Run production post-match Core through specialization. *)
+(** Run production post-resolution Core through specialization. *)

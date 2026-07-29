@@ -2917,7 +2917,8 @@ type module_impl_method_resolution = {
 
     Matches on the outermost type constructor (via [type_name_for_impl]),
     so [Option[Int]] matches [impl for Option[T]] regardless of element
-    type — consistent with how [Core_trait_resolve] keys its registry. *)
+    type. The later Blorp-owned trait-resolution stage uses the concrete
+    specialized type as its dispatch key. *)
 
 let resolved_trait_of_module_impl_method method_info =
   Some

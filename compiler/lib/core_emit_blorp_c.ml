@@ -5939,7 +5939,7 @@ let function_kind_json (func : Core.core_func) =
   | Core.CFUser -> Ok (kind "user" [])
   | Core.CFUnresolvedBuiltin -> Ok (kind "unresolved_builtin" [])
   | Core.CFBuiltin -> (
-      match Core_resolve.builtin_c_name_for_func func with
+      match Codegen_builtins.c_name_for_core_func func with
       | Some c_name -> Ok (kind "builtin" [ ("c_name", str c_name) ])
       | None -> Ok (kind "unresolved_builtin" []))
   | Core.CFForeign foreign ->

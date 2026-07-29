@@ -11,6 +11,7 @@ import:
 	compiler_core_json:
 		CoreDecl(HeapRecordDecl, UnionDecl),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
+		CoreImplDecl,
 		CoreProgram,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
@@ -57,6 +58,85 @@ CORE_MANAGED_TYPE_NAMES: List[String] = [
 	"FallibleStream",
 	"ResourceSource",
 ]
+
+
+private pure func core_tensor_dim_has_unresolved_parameters(dim: CoreTensorDim) -> Bool:
+	match dim:
+		TensorRuntimeDim(_) | TensorVariadicDim(_):
+			True
+		TensorDimOperation(_, left, right):
+			(
+				core_tensor_dim_has_unresolved_parameters(left)
+				or core_tensor_dim_has_unresolved_parameters(right)
+			)
+		TensorStaticDim(_):
+			False
+
+
+pure func core_type_has_unresolved_parameters(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(_, args):
+			args.any(core_type_has_unresolved_parameters)
+		TypeParameterType(_) | SelfType:
+			True
+		FunctionType(_, params, return_type):
+			(
+				params.any(core_type_has_unresolved_parameters)
+				or core_type_has_unresolved_parameters(return_type)
+			)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			(
+				core_type_has_unresolved_parameters(value_type)
+				or core_type_has_unresolved_parameters(error_type)
+			)
+		TensorType(info):
+			(
+				core_type_has_unresolved_parameters(info.element_type)
+				or info.dims.any(core_tensor_dim_has_unresolved_parameters)
+			)
+		TupleType(items):
+			items.any(core_type_has_unresolved_parameters)
+		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			False
+
+
+-- Post-monomorphization runtime tensor dimensions remain symbolic by design:
+-- TensorRuntimeDim is the source `#_` wildcard and TensorVariadicDim is an
+-- existential shape pack. Generic owner templates are excluded from the mono
+-- invariant separately, so only element and ordinary type parameters are
+-- unresolved at this boundary.
+pure func core_type_has_unresolved_mono_parameters(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(_, args):
+			args.any(core_type_has_unresolved_mono_parameters)
+		TypeParameterType(_) | SelfType:
+			True
+		FunctionType(_, params, return_type):
+			(
+				params.any(core_type_has_unresolved_mono_parameters)
+				or core_type_has_unresolved_mono_parameters(return_type)
+			)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			(
+				core_type_has_unresolved_mono_parameters(value_type)
+				or core_type_has_unresolved_mono_parameters(error_type)
+			)
+		TensorType(info):
+			core_type_has_unresolved_mono_parameters(info.element_type)
+		TupleType(items):
+			items.any(core_type_has_unresolved_mono_parameters)
+		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			False
+
+
+pure func core_impl_is_generic(implementation: CoreImplDecl) -> Bool:
+	(
+		not implementation.type_params.is_empty()
+		or core_type_has_unresolved_parameters(implementation.for_type)
+		or implementation.methods.any(pure func(method):
+			not method.type_params.is_empty()
+		)
+	)
 
 
 pure func is_runtime_erased_union_payload_type_name(name: String) -> Bool:

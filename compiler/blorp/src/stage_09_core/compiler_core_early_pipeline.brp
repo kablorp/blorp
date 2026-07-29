@@ -8,6 +8,7 @@ import:
 		check_desugar_invariants,
 		check_match_invariants,
 		check_mono_invariants,
+		check_resolve_invariants,
 		check_synth_invariants,
 		core_early_invariant_hint,
 		core_early_invariant_message,
@@ -19,8 +20,14 @@ import:
 		core_mono_diagnostic_hint,
 		core_mono_diagnostic_message,
 	compiler_core_monomorphize: monomorphize_program
+	compiler_core_resolve: CoreResolveImportBinding, CoreResolveModuleImports, resolve_core_program
 	compiler_core_synth: synthesize_program
 	compiler_core_synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
+	compiler_core_trait_resolve:
+		CoreTraitResolveDiagnostic,
+		core_trait_resolve_diagnostic_hint,
+		core_trait_resolve_diagnostic_message,
+		resolve_core_traits,
 
 
 enum CoreEarlyPipelineStage:
@@ -30,6 +37,8 @@ enum CoreEarlyPipelineStage:
 	CoreEarlyMonoStage
 	CoreEarlySynthStage
 	CoreEarlyMatchStage
+	CoreEarlyTraitResolveStage
+	CoreEarlyResolveStage
 
 
 record CoreEarlyPipelineConfiguration {
@@ -63,6 +72,7 @@ union CoreEarlyPipelineDiagnostic:
 	CoreEarlyInvariantDiagnostic(CoreEarlyInvariantViolation)
 	CoreEarlyMonoDiagnostic(CoreMonoDiagnostic)
 	CoreEarlySynthDiagnostic(CoreSynthError)
+	CoreEarlyTraitResolveDiagnostic(CoreTraitResolveDiagnostic)
 
 
 pure func core_early_pipeline_diagnostic_message(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
@@ -73,6 +83,8 @@ pure func core_early_pipeline_diagnostic_message(diagnostic: CoreEarlyPipelineDi
 			core_mono_diagnostic_message(mono_diagnostic)
 		CoreEarlySynthDiagnostic(synth_error):
 			core_synth_error_message(synth_error)
+		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
+			core_trait_resolve_diagnostic_message(trait_diagnostic)
 
 
 pure func core_early_pipeline_diagnostic_hint(
@@ -85,6 +97,8 @@ pure func core_early_pipeline_diagnostic_hint(
 			core_mono_diagnostic_hint(mono_diagnostic)
 		CoreEarlySynthDiagnostic(synth_error):
 			core_synth_error_hint(synth_error)
+		CoreEarlyTraitResolveDiagnostic(trait_diagnostic):
+			Some(core_trait_resolve_diagnostic_hint(trait_diagnostic))
 
 
 union CoreEarlyPipelineExecution:
@@ -120,6 +134,10 @@ pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> Strin
 			"synth"
 		CoreEarlyMatchStage:
 			"match"
+		CoreEarlyTraitResolveStage:
+			"trait_resolve"
+		CoreEarlyResolveStage:
+			"resolve"
 
 
 pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipelineStage]:
@@ -136,6 +154,10 @@ pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipel
 			Some(CoreEarlySynthStage)
 		"match":
 			Some(CoreEarlyMatchStage)
+		"trait_resolve":
+			Some(CoreEarlyTraitResolveStage)
+		"resolve":
+			Some(CoreEarlyResolveStage)
 		_:
 			None
 
@@ -181,6 +203,18 @@ pure func core_early_pipeline_stages_equal(
 					True
 				_:
 					False
+		CoreEarlyTraitResolveStage:
+			match right:
+				CoreEarlyTraitResolveStage:
+					True
+				_:
+					False
+		CoreEarlyResolveStage:
+			match right:
+				CoreEarlyResolveStage:
+					True
+				_:
+					False
 
 
 private pure func stages_include(
@@ -218,6 +252,10 @@ private pure func stage_invariant_violations(
 			check_synth_invariants(program)
 		CoreEarlyMatchStage:
 			check_match_invariants(program)
+		CoreEarlyTraitResolveStage:
+			check_match_invariants(program)
+		CoreEarlyResolveStage:
+			check_resolve_invariants(program)
 
 
 private pure func finish_stage(
@@ -228,7 +266,11 @@ private pure func finish_stage(
 	violations: List[CoreEarlyInvariantViolation] = if configuration.check_invariants:
 		stage_invariant_violations(stage, state.program)
 	else:
-		[]
+		match stage:
+			CoreEarlyResolveStage:
+				check_resolve_invariants(state.program)
+			_:
+				[]
 
 	match violations.get(0):
 		Some(violation):
@@ -303,15 +345,36 @@ private pure func run_match_stage(
 		configuration,
 	):
 		CoreEarlyStageContinues(finished):
-			CoreEarlyPipelineCompleted({
-				program = finished.program,
-				next_def_id = finished.next_def_id,
-				observations = finished.observations,
-			})
+			run_trait_resolve_stage(finished, configuration)
 		CoreEarlyStageStops(stage, rendered, observations):
 			CoreEarlyPipelineStopped(stage, rendered, observations)
 		CoreEarlyStageFails(violation):
 			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
+private pure func run_trait_resolve_stage(
+	state: CoreEarlyPipelineState,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	match resolve_core_traits(state.program):
+		Err(diagnostic):
+			CoreEarlyPipelineFailed(CoreEarlyTraitResolveDiagnostic(diagnostic))
+		Ok(resolved):
+			match finish_stage(
+				CoreEarlyTraitResolveStage,
+				{ state | program = resolved },
+				configuration,
+			):
+				CoreEarlyStageContinues(finished):
+					CoreEarlyPipelineCompleted({
+						program = finished.program,
+						next_def_id = finished.next_def_id,
+						observations = finished.observations,
+					})
+				CoreEarlyStageStops(stage, rendered, observations):
+					CoreEarlyPipelineStopped(stage, rendered, observations)
+				CoreEarlyStageFails(violation):
+					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
 
 
 private pure func run_desugar_stage(
@@ -373,3 +436,34 @@ pure func run_early_core_pipeline(
 			CoreEarlyPipelineStopped(stage, rendered, observations)
 		CoreEarlyStageFails(violation):
 			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
+pure func run_early_core_pipeline_with_resolve(
+	input: CoreEarlyPipelineInput,
+	configuration: CoreEarlyPipelineConfiguration,
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreEarlyPipelineExecution:
+	match run_early_core_pipeline(input, configuration):
+		CoreEarlyPipelineCompleted(output):
+			state: CoreEarlyPipelineState = {
+				program = resolve_core_program(output.program, import_bindings, module_imports),
+				next_def_id = output.next_def_id,
+				observations = output.observations
+			}
+
+			match finish_stage(CoreEarlyResolveStage, state, configuration):
+				CoreEarlyStageContinues(finished):
+					CoreEarlyPipelineCompleted({
+						program = finished.program,
+						next_def_id = finished.next_def_id,
+						observations = finished.observations,
+					})
+				CoreEarlyStageStops(stage, rendered, observations):
+					CoreEarlyPipelineStopped(stage, rendered, observations)
+				CoreEarlyStageFails(violation):
+					CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			CoreEarlyPipelineStopped(stage, rendered, observations)
+		CoreEarlyPipelineFailed(diagnostic):
+			CoreEarlyPipelineFailed(diagnostic)

@@ -464,10 +464,9 @@ and ctree =
 
 (** Classification of a call by callee kind.
 
-    [CKUnknown] is what lowering produces — no resolution done yet. A
-    post-lowering pass ([Core_resolve.resolve_program]) can promote
-    these to one of the concrete kinds below, based on a name-lookup
-    env built from the program.
+    [CKUnknown] is what lowering produces — no resolution done yet. The
+    Blorp-owned Core resolve stage promotes these to one of the concrete kinds
+    below based on a name-lookup environment built from the program.
 
     The point of the tag is to keep the Blorp C emitter small: emitters switch
     on [call_kind] instead of re-doing name lookups at every call site.
@@ -505,8 +504,8 @@ and call_kind =
   | CKSelectedDirect of int
       (** A direct source call whose selected [core_func.cf_def_id] came from
       typed [resolved_call] metadata. The Blorp monomorphizer uses this id for
-      generic body selection; [Core_resolve] must replace it with [CKUser]
-      before specialization/emission. *)
+      generic body selection; the Blorp Core resolve stage must replace it with
+      [CKUser] before the post-resolution boundary. *)
   | CKUser of string * int option
       (** User-defined function call. The [int option] is the callee's
       [core_func.cf_def_id] when the resolver can identify the target,
@@ -601,7 +600,7 @@ and desc =
   | CDebugBlock of core
       (** [debug: ...] — source instrumentation block. The Blorp early-Core
           pipeline lowers it based on compilation mode before the
-          post-match OCaml boundary. *)
+          post-resolution OCaml boundary. *)
   (* === Control flow === *)
   | CIf of core * core * core
       (** [if c then t else e] (else is [CVoid] if absent in source) *)
@@ -2380,8 +2379,8 @@ type core_func = {
       monomorphization. It stays stable through downstream passes and naming
       rewrites.
 
-      Used by [Core_resolve] to key [user_funcs] entries and by
-      the Blorp C emitter to emit the mangled C symbol for user functions. Typed as
+      Used by Blorp Core resolution to identify user functions and by the
+      Blorp C emitter to emit the mangled C symbol for user functions. Typed as
       [int] rather than
       [Env_types.def_id] because [core.ml] must stay independent of
       [env_types] (both re-export through higher-level modules).

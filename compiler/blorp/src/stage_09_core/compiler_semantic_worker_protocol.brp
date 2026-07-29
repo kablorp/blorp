@@ -1,7 +1,8 @@
--- Post-match Core protocol for the one temporary OCaml semantic-middle worker.
+-- Post-resolution Core protocol for the one temporary OCaml
+-- semantic-middle worker.
 --
 -- Blorp owns the frontend and backend around this boundary. The worker accepts
--- a match-compiled Core graph and returns pre-DCE Core.
+-- a call-resolved Core graph and returns pre-DCE Core.
 -- CLI arguments, source discovery, artifact I/O, and process execution do not
 -- belong in this shape.
 import:
@@ -9,9 +10,15 @@ import:
 		CoreDecl(EnumDecl, FunctionDecl, HeapRecordDecl, ImplDecl, UnionDecl, ValueRecordDecl),
 		CoreJsonError,
 		CoreProgram,
+		CoreType(TypeParameterType),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionVariant,
 		core_json_error_to_string,
 		core_program_to_json,
 		decode_core_program_json,
+	compiler_core_type_policy: core_impl_is_generic
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -20,90 +27,187 @@ import:
 		get_field,
 
 
-SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 5
+SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 7
 
 SEMANTIC_MIDDLE_DOMAIN: String = "compiler_semantic_middle"
 
 private SEMANTIC_MIDDLE_REQUEST_KIND: String = "compile_pre_dce"
 
-private SEMANTIC_MIDDLE_CORE_PHASE: String = "post_match"
+private SEMANTIC_MIDDLE_CORE_PHASE: String = "post_resolve"
 
 
-private pure func is_global_abi_union_template(name: String) -> Bool:
-	name == "Option" or name == "Result"
+private pure func abi_payload_matches(
+	fields: List[CoreUnionField],
+	expected_type_parameter: Option[String],
+) -> Bool:
+	match expected_type_parameter:
+		Some(expected):
+			if fields.length() != 1:
+				False
+			else:
+				match fields.get(0):
+					Some(field):
+						match field.typ:
+							TypeParameterType(name):
+								name == expected
+							_:
+								False
+					None:
+						False
+		None:
+			fields.is_empty()
 
 
-private pure func project_semantic_middle_decl(decl: CoreDecl) -> Option[CoreDecl]:
+private pure func abi_variant_matches(
+	variant: CoreUnionVariant,
+	expected_name: String,
+	expected_tag: Int,
+	expected_type_parameter: Option[String],
+) -> Bool:
+	(
+		variant.name == expected_name
+		and variant.tag == expected_tag
+		and abi_payload_matches(variant.fields, expected_type_parameter)
+	)
+
+
+private pure func is_global_abi_union_template(union_decl: CoreUnionDecl) -> Bool:
+	has_erased_payload: Bool = match union_decl.payload_storage:
+		ErasedUnionPayloadStorage:
+			True
+		_:
+			False
+
+	if not has_erased_payload:
+		False
+	else if union_decl.name == "Option":
+		if union_decl.type_params != ["T"] or union_decl.variants.length() != 2:
+			False
+		else:
+			match union_decl.variants.get(0):
+				Some(some_variant):
+					match union_decl.variants.get(1):
+						Some(none_variant):
+							(
+								abi_variant_matches(some_variant, "Some", 0, Some("T"))
+								and abi_variant_matches(none_variant, "None", 1, None)
+							)
+						None:
+							False
+				None:
+					False
+	else if union_decl.name == "Result":
+		if union_decl.type_params != ["T", "E"] or union_decl.variants.length() != 2:
+			False
+		else:
+			match union_decl.variants.get(0):
+				Some(ok_variant):
+					match union_decl.variants.get(1):
+						Some(error_variant):
+							(
+								abi_variant_matches(ok_variant, "Ok", 0, Some("T"))
+								and abi_variant_matches(error_variant, "Err", 1, Some("E"))
+							)
+						None:
+							False
+				None:
+					False
+	else:
+		False
+
+
+union SemanticMiddleProjectionError:
+	SemanticMiddleMalformedRuntimeAbiUnion(String)
+
+
+pure func semantic_middle_projection_error_message(error: SemanticMiddleProjectionError) -> String:
+	match error:
+		SemanticMiddleMalformedRuntimeAbiUnion(name):
+			"reserved runtime ABI union `${name}` does not match its required " + "type parameters, variant order, tags, payloads, and erased storage"
+
+
+private pure func project_semantic_middle_decl(
+	decl: CoreDecl,
+) -> Result[Option[CoreDecl], SemanticMiddleProjectionError]:
 	match decl:
 		FunctionDecl(function_info):
 			if function_info.type_params.is_empty():
-				Some(decl)
+				Ok(Some(decl))
 			else:
-				None
+				Ok(None)
 		EnumDecl(enum_decl):
 			if enum_decl.type_params.is_empty():
-				Some(decl)
+				Ok(Some(decl))
 			else:
-				None
+				Ok(None)
 		UnionDecl(union_decl):
-			if union_decl.type_params.is_empty() or is_global_abi_union_template(union_decl.name):
-				Some(decl)
+			if union_decl.type_params.is_empty():
+				Ok(Some(decl))
+			else if union_decl.name == "Option" or union_decl.name == "Result":
+				if is_global_abi_union_template(union_decl):
+					Ok(Some(decl))
+				else:
+					Err(SemanticMiddleMalformedRuntimeAbiUnion(union_decl.name))
 			else:
-				None
+				Ok(None)
 		ValueRecordDecl(record_decl):
 			if record_decl.type_params.is_empty():
-				Some(decl)
+				Ok(Some(decl))
 			else:
-				None
+				Ok(None)
 		HeapRecordDecl(record_decl):
 			if record_decl.type_params.is_empty():
-				Some(decl)
+				Ok(Some(decl))
 			else:
-				None
+				Ok(None)
 		ImplDecl(impl_decl):
-			if impl_decl.type_params.is_empty():
-				Some(decl)
+			if core_impl_is_generic(impl_decl):
+				Ok(None)
 			else:
-				None
+				Ok(Some(decl))
 		_:
-			Some(decl)
+			Ok(Some(decl))
 
 
 -- Monomorphization retains generic templates as specialization sources. The
 -- semantic middle operates only on runtime declarations, except for the global
 -- Option/Result ABI templates that the remaining middle handles explicitly.
-pure func project_semantic_middle_program(program: CoreProgram) -> CoreProgram:
-	{
-		decls = program.decls.filter_map(project_semantic_middle_decl),
-		foreign_includes = program.foreign_includes
-	}
+pure func project_semantic_middle_program(
+	program: CoreProgram,
+) -> Result[CoreProgram, SemanticMiddleProjectionError]:
+	var decls: List[CoreDecl] = []
+	var failure: Option[SemanticMiddleProjectionError] = None
+
+	for decl in program.decls:
+		match project_semantic_middle_decl(decl):
+			Ok(Some(runtime_decl)):
+				decls = decls.append(runtime_decl)
+			Ok(None):
+				void
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				decls = decls,
+				foreign_includes = program.foreign_includes,
+			})
 
 
 enum SemanticMiddleStage:
-	TraitResolveMiddleStage
-	ResolveMiddleStage
 	StdInlineMiddleStage
 	TailrecMiddleStage
 	FusionMiddleStage
 
 
 enum SemanticMiddleCapability:
-	PostMatchCoreCapability
+	PostResolveCoreCapability
 	PreDceCoreCapability
 	RenderedStageObservationsCapability
-
-
-record SemanticMiddleImportBinding {
-	local_name: String,
-	module_path: String,
-	original_name: Option[String]
-}
-
-
-record SemanticMiddleModuleImports {
-	module_name: String,
-	import_bindings: List[SemanticMiddleImportBinding]
-}
 
 
 record SemanticMiddleRequest {
@@ -111,8 +215,6 @@ record SemanticMiddleRequest {
 	target_module_name: String,
 	core: CoreProgram,
 	next_def_id: Int,
-	import_bindings: List[SemanticMiddleImportBinding],
-	module_imports: List[SemanticMiddleModuleImports],
 	require_main: Bool,
 	check_invariants: Bool,
 	required_capabilities: List[SemanticMiddleCapability],
@@ -179,10 +281,6 @@ pure func semantic_middle_protocol_error_message(error: SemanticMiddleProtocolEr
 
 pure func semantic_middle_stage_name(stage: SemanticMiddleStage) -> String:
 	match stage:
-		TraitResolveMiddleStage:
-			"trait_resolve"
-		ResolveMiddleStage:
-			"resolve"
 		StdInlineMiddleStage:
 			"std_inline"
 		TailrecMiddleStage:
@@ -193,10 +291,6 @@ pure func semantic_middle_stage_name(stage: SemanticMiddleStage) -> String:
 
 pure func parse_semantic_middle_stage(name: String) -> Option[SemanticMiddleStage]:
 	match name:
-		"trait_resolve":
-			Some(TraitResolveMiddleStage)
-		"resolve":
-			Some(ResolveMiddleStage)
 		"std_inline":
 			Some(StdInlineMiddleStage)
 		"tailrec":
@@ -209,8 +303,8 @@ pure func parse_semantic_middle_stage(name: String) -> Option[SemanticMiddleStag
 
 pure func semantic_middle_capability_name(capability: SemanticMiddleCapability) -> String:
 	match capability:
-		PostMatchCoreCapability:
-			"core_post_match"
+		PostResolveCoreCapability:
+			"core_post_resolve"
 		PreDceCoreCapability:
 			"core_pre_dce"
 		RenderedStageObservationsCapability:
@@ -234,8 +328,8 @@ private pure func semantic_middle_capabilities_include(
 
 pure func parse_semantic_middle_capability(name: String) -> Option[SemanticMiddleCapability]:
 	match name:
-		"core_post_match":
-			Some(PostMatchCoreCapability)
+		"core_post_resolve":
+			Some(PostResolveCoreCapability)
 		"core_pre_dce":
 			Some(PreDceCoreCapability)
 		"rendered_stage_observations":
@@ -244,44 +338,12 @@ pure func parse_semantic_middle_capability(name: String) -> Option[SemanticMiddl
 			None
 
 
-private pure func optional_string_to_json(value: Option[String]) -> JsonValue:
-	match value:
-		Some(text):
-			JsonString(text)
-		None:
-			JsonNull
-
-
 private pure func optional_stage_to_json(value: Option[SemanticMiddleStage]) -> JsonValue:
 	match value:
 		Some(stage):
 			JsonString(semantic_middle_stage_name(stage))
 		None:
 			JsonNull
-
-
-private pure func semantic_middle_import_binding_to_json(
-	binding: SemanticMiddleImportBinding,
-) -> JsonValue:
-	JsonObject([
-		("local_name", JsonString(binding.local_name)),
-		("module_path", JsonString(binding.module_path)),
-		("original_name", optional_string_to_json(binding.original_name)),
-	])
-
-
-private pure func semantic_middle_module_imports_to_json(
-	module_imports: SemanticMiddleModuleImports,
-) -> JsonValue:
-	JsonObject([
-		("module", JsonString(module_imports.module_name)),
-		(
-			"import_bindings",
-			JsonVector(
-				module_imports.import_bindings.map(semantic_middle_import_binding_to_json),
-			),
-		),
-	])
 
 
 pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> JsonValue:
@@ -294,14 +356,6 @@ pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> Jso
 		("target_module", JsonString(request.target_module_name)),
 		("core", core_program_to_json(request.core)),
 		("next_def_id", JsonNumber(to_float(request.next_def_id))),
-		(
-			"import_bindings",
-			JsonVector(request.import_bindings.map(semantic_middle_import_binding_to_json)),
-		),
-		(
-			"module_imports",
-			JsonVector(request.module_imports.map(semantic_middle_module_imports_to_json)),
-		),
 		("require_main", JsonBool(request.require_main)),
 		("check_invariants", JsonBool(request.check_invariants)),
 		("required_capabilities", JsonVector(request.required_capabilities.map(
@@ -418,8 +472,8 @@ private pure func decode_semantic_middle_capabilities(
 	items ?= array_field(value, "capabilities")
 	capabilities ?= decode_semantic_middle_capabilities_at(items, 0)
 
-	if not semantic_middle_capabilities_include(capabilities, PostMatchCoreCapability):
-		Err(SemanticMiddleMissingCapability("core_post_match"))
+	if not semantic_middle_capabilities_include(capabilities, PostResolveCoreCapability):
+		Err(SemanticMiddleMissingCapability("core_post_resolve"))
 	else if not semantic_middle_capabilities_include(capabilities, PreDceCoreCapability):
 		Err(SemanticMiddleMissingCapability("core_pre_dce"))
 	else if not semantic_middle_capabilities_include(

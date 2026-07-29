@@ -1,9 +1,8 @@
 (** Post-resolve specialization of type-dispatched builtins.
 
-    Runs after [Core_resolve] (calls are tagged) and after Blorp
-    monomorphization (types are concrete). Rewrites generic builtins like
-    [blorp_to_int] into [CCast] nodes or concrete builtin names based on the
-    argument type.
+    Runs after Blorp Core resolution (calls are tagged) and monomorphization
+    (types are concrete). Rewrites generic builtins like [blorp_to_int] into
+    [CCast] nodes or concrete builtin names based on the argument type.
 
     This keeps the backend free of type dispatch: [CCast] reaches emission as
     a C cast, and [CKBuiltin] calls already carry their resolved names. *)
@@ -240,14 +239,14 @@ let specialize_to_string ~reg (e : core) callee arg : core =
   | ty when Types.Dim.is_value_dim ty -> builtin "blorp_to_string"
   | Ast.TyRange _ ->
       (* Refinement types [..#N] erase to [long] at runtime; dispatch
-         through Int's runtime. trait_resolve does not reach [..#N] via
+         through Int's runtime. Trait resolution does not reach [..#N] via
          [Stringable for Int] because the refinement type is distinct. *)
       builtin "blorp_to_string"
   | Ast.TyNamed ("Int128", _) -> builtin "blorp_int128_to_string"
   | Ast.TyNamed ("UInt128", _) -> builtin "blorp_uint128_to_string"
   | ty when Types.is_any_integer_type ty ->
       (* Fallback for integer types that may not have made it through
-         trait_resolve (e.g. post-mono concrete calls that weren't
+         trait resolution (e.g. post-mono concrete calls that weren't
          rewritten because the impl registry entry wasn't in scope at
          the right phase). All sized-integer stdlib impls call
          [blorp_to_string] anyway. *)
@@ -286,8 +285,8 @@ let specialize_to_string ~reg (e : core) callee arg : core =
       (* No Stringable impl for this type.  The [to_string] sentinel was
          registered in [env_builtins] with a [T: Stringable] bound; if we
          reach here, typecheck admitted the call but neither
-         [Core_trait_resolve] (which would have rewritten the callee to a
-         mangled impl name) nor the type-dispatch table above had a
+         the Blorp-owned trait-resolution stage (which would have rewritten
+         the callee to a mangled impl name) nor the type-dispatch table above had a
          rewrite.  That used to silently emit [blorp_to_string(arg)] — the
          runtime function for [Int] — causing an incoherent C warning and
          garbage output.  Fire a structured error instead so the gap is
@@ -340,7 +339,7 @@ let specialize_debug_string ~reg (e : core) callee arg : core =
      debug_string is a universal compiler-synthesized function (no trait,
      no user impls). All primitive arms are reached directly by
      [specialize_debug_string] — unlike [specialize_to_string] where
-     trait_resolve already rewrites to the stdlib impl. *)
+     trait resolution already rewrites to the stdlib impl. *)
   | Ast.TyNamed ("String", _) -> arg
   | Ast.TyNamed ("Int", _) -> builtin "blorp_to_string"
   | ty when Types.Dim.is_value_dim ty -> builtin "blorp_to_string"
@@ -1460,8 +1459,8 @@ let rec specialize_expr ~reg (e : core) : core =
       { e with desc = CCall (CKBuiltin dict_fn, callee, []) }
   (* [equals(a, b)] — trait-method sentinel dispatched by arg type. The
      sentinel [blorp_eq_dispatch] is registered in [Codegen_builtins]
-     purely so [Core_resolve] tags these calls as [CKBuiltin] instead of
-     [CKClosure]; the real dispatch happens here. *)
+     purely so Blorp Core resolution tags these calls as [CKBuiltin] instead
+     of [CKClosure]; the real dispatch happens here. *)
   | CCall (CKBuiltin "blorp_eq_dispatch", _, [ l; r ]) -> (
       let dummy =
         { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
@@ -2326,9 +2325,9 @@ let rec specialize_expr ~reg (e : core) : core =
       else e
   (* [type_name] / [is_heap] from [std/debug]: constant-fold per mono copy.
      Infer defers the fold when the arg type still has type vars (pure func
-     identify[T](x: T): type_name(x)). Core_resolve tags those deferred calls
-     as explicit debug-reflection intrinsics, and post-mono [arg.ty] is
-     concrete for each specialized copy. *)
+     identify[T](x: T): type_name(x)). Blorp Core resolution tags those
+     deferred calls as explicit debug-reflection intrinsics, and post-mono
+     [arg.ty] is concrete for each specialized copy. *)
   | CCall (CKIntrinsic "type_name", _, [ arg ]) ->
       let s = Types.type_to_string arg.ty in
       {

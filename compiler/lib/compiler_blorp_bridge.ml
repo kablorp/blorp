@@ -10,7 +10,6 @@ let schema_version = 1
 let domain = "compiler"
 let core_fairness_renderer = "core_fairness"
 let core_stage_renderer = "core_stage"
-let core_trait_resolve_renderer = "core_trait_resolve"
 let language_surface_renderer = "language_surface"
 
 let ( let* ) result f =
@@ -2429,11 +2428,6 @@ let cli_run_via_command ?version ?source args =
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer
     ~op:"core_stage_unknown_error" [ original; normalized ]
-
-let render_core_trait_resolve_no_impl_hint ~method_name ~type_name ~candidates =
-  render_via_command_exn ~renderer:core_trait_resolve_renderer
-    ~op:"core_trait_resolve_no_impl_hint"
-    [ method_name; type_name; String.concat ";" candidates ]
 
 let () =
   Core_stage.set_unknown_stage_error_renderer render_core_stage_unknown_error

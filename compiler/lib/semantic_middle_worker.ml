@@ -1,21 +1,21 @@
-(** Private post-match Core to pre-DCE Core worker.
+(** Private post-resolution Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
     and backend. The protocol is phase-specific: callers supply Blorp-owned
-    post-match Core, and successful requests return the Core program
+    post-resolution Core, and successful requests return the Core program
     immediately before Blorp-owned DCE. This module does not read source files,
     interpret CLI arguments, emit C, write artifacts, or execute child
     processes. *)
 
-let schema_version = 5
+let schema_version = 7
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let core_phase = "post_match"
+let core_phase = "post_resolve"
 
 type stage = Core_stage.t
 
 type capability =
-  | PostMatchCore
+  | PostResolveCore
   | PreDceCore
   | RenderedStageObservations
 
@@ -28,8 +28,6 @@ type request = {
   foreign_includes : string list;
   union_payload_storage : (string * Codegen_types.union_payload_storage) list;
   next_def_id : int;
-  import_bindings : Session.import_binding list;
-  module_imports : (string * Session.import_binding list) list;
   require_main : bool;
   check_invariants : bool;
   observations : stage list;
@@ -100,15 +98,6 @@ let array_field name value =
   | _ ->
       protocol_error "invalid_field" ("field `" ^ name ^ "` must be an array")
 
-let optional_string_field name value =
-  let* value = field name value in
-  match value with
-  | Lsp_json.Null -> Ok None
-  | Lsp_json.String text -> Ok (Some text)
-  | _ ->
-      protocol_error "invalid_field"
-        ("field `" ^ name ^ "` must be a string or null")
-
 let rec decode_list decode = function
   | [] -> Ok []
   | item :: rest ->
@@ -117,27 +106,27 @@ let rec decode_list decode = function
       Ok (item :: rest)
 
 let semantic_middle_stage = function
-  | ( Core_stage.TraitResolve | Core_stage.Resolve | Core_stage.StdInline
-    | Core_stage.Tailrec | Core_stage.Fusion ) as stage ->
+  | (Core_stage.StdInline | Core_stage.Tailrec | Core_stage.Fusion) as stage ->
       Some stage
   | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-  | Core_stage.Synth | Core_stage.Match | Core_stage.Specialize | Core_stage.Dce
-  | Core_stage.ConsumeSpecialize | Core_stage.Perceus | Core_stage.Reuse
-  | Core_stage.Closure | Core_stage.Final ->
+  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
+  | Core_stage.Resolve
+  | Core_stage.Specialize | Core_stage.Dce | Core_stage.ConsumeSpecialize
+  | Core_stage.Perceus | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
       None
 
 let stage_name = Core_stage.to_string
 
 let capability_name = function
-  | PostMatchCore -> "core_post_match"
+  | PostResolveCore -> "core_post_resolve"
   | PreDceCore -> "core_pre_dce"
   | RenderedStageObservations -> "rendered_stage_observations"
 
 let supported_capabilities =
-  [ PostMatchCore; PreDceCore; RenderedStageObservations ]
+  [ PostResolveCore; PreDceCore; RenderedStageObservations ]
 
 let decode_capability = function
-  | Lsp_json.String "core_post_match" -> Ok PostMatchCore
+  | Lsp_json.String "core_post_resolve" -> Ok PostResolveCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
   | Lsp_json.String "rendered_stage_observations" ->
       Ok RenderedStageObservations
@@ -173,17 +162,89 @@ let decode_stage = function
           protocol_error "unsupported_stage" ("unknown stage `" ^ name ^ "`"))
   | _ -> protocol_error "invalid_field" "stage names must be strings"
 
-let decode_import_binding value =
-  let* local_name = string_field "local_name" value in
-  let* module_path = string_field "module_path" value in
-  let* original_name = optional_string_field "original_name" value in
-  Ok { Session.local_name; module_path; original_name }
+let variant_matches ~name ~tag ~payload_type_parameter
+    (variant : Ast.variant) =
+  let payload_matches =
+    match (variant.variant_fields, payload_type_parameter) with
+    | [ Ast.TyVar actual ], Some expected -> String.equal actual expected
+    | [], None -> true
+    | _ -> false
+  in
+  String.equal variant.variant_name name
+  && variant.variant_tag = tag
+  && payload_matches
 
-let decode_module_imports value =
-  let* module_name = string_field "module" value in
-  let* import_binding_values = array_field "import_bindings" value in
-  let* import_bindings = decode_list decode_import_binding import_binding_values in
-  Ok (module_name, import_bindings)
+let is_runtime_abi_union union_payload_storage (type_decl : Ast.type_decl) =
+  let has_erased_payload =
+    List.assoc_opt type_decl.type_name union_payload_storage
+    = Some Codegen_types.ErasedUnionPayloadStorage
+  in
+  if type_decl.type_is_enum || not has_erased_payload then false
+  else
+    match
+      ( type_decl.type_name,
+        Ast.type_param_names type_decl.type_params,
+        type_decl.type_variants )
+    with
+    | "Option", [ "T" ], [ some_variant; none_variant ] ->
+        variant_matches ~name:"Some" ~tag:0
+          ~payload_type_parameter:(Some "T") some_variant
+        && variant_matches ~name:"None" ~tag:1 ~payload_type_parameter:None
+             none_variant
+    | "Result", [ "T"; "E" ], [ ok_variant; error_variant ] ->
+        variant_matches ~name:"Ok" ~tag:0 ~payload_type_parameter:(Some "T")
+          ok_variant
+        && variant_matches ~name:"Err" ~tag:1
+             ~payload_type_parameter:(Some "E") error_variant
+    | _ -> false
+
+let impl_is_generic (impl : Core.core_impl) =
+  Codegen_types.has_type_vars impl.ci_for_type
+  || List.exists
+       (fun (method_func : Core.core_func) -> method_func.cf_type_params <> [])
+       impl.ci_methods
+
+let rec unprojected_generic_decl union_payload_storage (decl : Core.core_decl) =
+  match decl.cd_desc with
+  | Core.CDFunc func when func.cf_type_params <> [] ->
+      Some ("generic function `" ^ func.cf_name ^ "`")
+  | Core.CDType type_decl
+    when type_decl.type_params <> []
+         && not (is_runtime_abi_union union_payload_storage type_decl) ->
+      Some ("generic type `" ^ type_decl.type_name ^ "`")
+  | Core.CDRecord record_decl when record_decl.record_type_params <> [] ->
+      Some ("generic record `" ^ record_decl.record_name ^ "`")
+  | Core.CDImpl impl when impl_is_generic impl ->
+      Some ("generic impl `" ^ impl.ci_trait ^ "`")
+  | Core.CDPrivate inner -> unprojected_generic_decl union_payload_storage inner
+  | _ -> None
+
+let rec first_unprojected_generic_decl union_payload_storage = function
+  | [] -> None
+  | decl :: rest -> (
+      match unprojected_generic_decl union_payload_storage decl with
+      | Some _ as violation -> violation
+      | None -> first_unprojected_generic_decl union_payload_storage rest)
+
+let validate_runtime_projection union_payload_storage program =
+  match first_unprojected_generic_decl union_payload_storage program with
+  | Some declaration ->
+      protocol_error "invalid_post_resolve_core"
+        ("Blorp semantic-middle projection retained " ^ declaration)
+  | None -> Ok ()
+
+let post_resolve_invariant_message target_path (violation : Core_error.t) =
+  let loc = violation.loc in
+  let path = Option.value loc.loc_file ~default:target_path in
+  let location =
+    if loc.line <= 0 then path
+    else Printf.sprintf "%s:%d:%d" path loc.line loc.column
+  in
+  let hint =
+    Option.fold ~none:"" ~some:(fun value -> " (" ^ value ^ ")") violation.hint
+  in
+  Printf.sprintf "post-resolution Core invariant failed at %s: %s%s" location
+    violation.msg hint
 
 let require_equal ~code ~field_name ~expected actual =
   if String.equal actual expected then Ok ()
@@ -217,17 +278,16 @@ let decode_request value =
     let* target_module = string_field "target_module" value in
     let* core_json = field "core" value in
     let* decoded =
-      match Core_post_match_json.decode_program core_json with
+      match Core_post_resolve_json.decode_program core_json with
       | Ok decoded -> Ok decoded
       | Error error ->
-          protocol_error "invalid_post_match_core"
-            (Core_post_match_json.decode_error_to_string error)
+          protocol_error "invalid_post_resolve_core"
+            (Core_post_resolve_json.decode_error_to_string error)
+    in
+    let* () =
+      validate_runtime_projection decoded.union_payload_storage decoded.core
     in
     let* next_def_id = int_field "next_def_id" value in
-    let* import_binding_values = array_field "import_bindings" value in
-    let* import_bindings = decode_list decode_import_binding import_binding_values in
-    let* module_import_values = array_field "module_imports" value in
-    let* module_imports = decode_list decode_module_imports module_import_values in
     let* require_main = bool_field "require_main" value in
     let* check_invariants = bool_field "check_invariants" value in
     let* capability_values = array_field "required_capabilities" value in
@@ -245,18 +305,18 @@ let decode_request value =
           let* stage = decode_stage value in
           Ok (Some stage)
     in
-    (* A post-match handoff must satisfy every durable contract established by
+    (* A post-resolution handoff must satisfy every durable contract established by
        the earlier Blorp-owned stages, not only the Match-specific contract.
        Synth rechecks debug, desugar, and monomorphization invariants while
        intentionally allowing mutable locals introduced by synthesis. *)
-    let post_match_violations =
+    let post_resolve_violations =
       Core_invariants.run_for_stage Core_stage.Synth decoded.core
       @ Core_invariants.run_for_stage Core_stage.Match decoded.core
     in
-    (match post_match_violations with
+    (match post_resolve_violations with
     | violation :: _ ->
-        protocol_error "invalid_post_match_core"
-          ("post-match Core invariant failed: " ^ violation.Core_error.msg)
+        protocol_error "invalid_post_resolve_core"
+          (post_resolve_invariant_message target_path violation)
     | [] ->
         Ok
           {
@@ -266,8 +326,6 @@ let decode_request value =
             foreign_includes = decoded.foreign_includes;
             union_payload_storage = decoded.union_payload_storage;
             next_def_id;
-            import_bindings;
-            module_imports;
             require_main;
             check_invariants;
             observations;
@@ -335,17 +393,13 @@ let run_request_in_session request =
       Core_registry.register_types
         ~union_payload_storage_overrides:request.union_payload_storage reg
         request.core;
-      let import_aliases, module_imports =
-        Core_imports.tables_of_bindings
-          ~main_import_bindings:request.import_bindings request.module_imports
-      in
       let on_stage =
         Core_pipeline.make_stage_hook ~check_invariants:request.check_invariants
           ~user:on_stage
       in
       let backend_input =
-        Core_pipeline.run_core_passes_from_post_match ~on_stage
-          ~reg ~import_aliases ~module_imports request.core
+        Core_pipeline.run_core_passes_from_post_resolve ~on_stage ~reg
+          request.core
       in
       let observations = List.rev !observations_rev in
       (match

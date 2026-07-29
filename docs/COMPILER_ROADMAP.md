@@ -65,7 +65,7 @@ Current state:
 - Blorp Core lowering preserves direct resolved calls as
   `CKSelectedDirect <id>` so Core can use the source-selected target before
   call resolution.
-- `Core_resolve` promotes selected and name-based calls to `CKUser (name,
+- `compiler_core_resolve.brp` promotes selected and name-based calls to `CKUser (name,
   Some def_id)` when it can prove the concrete target.
 - The Blorp C emitter already prefers DefId-based C names, but still has a
   compatibility fallback for `CKUser (_, None)`.

@@ -17,8 +17,8 @@ type t =
       (** Rewrites trait-method calls ([CCall] to a bare method name) to direct
         calls to the matching impl's mangled name. Runs post-Match so types
         are concrete and pattern compilation is settled; pre-Resolve so the
-        rewritten name flows through regular name-lookup. See
-        [Core_trait_resolve]. *)
+        rewritten name flows through regular name-lookup. The stage is owned
+        by the Blorp early pipeline. *)
   | Resolve
   | StdInline
   | Tailrec

@@ -37,8 +37,8 @@ let prelude_and_module_builtins mod_path entries =
    [builtin("blorp_*")] bodies in their stdlib source files (std/io.brp,
    std/system.brp, std/hash.brp, std/debug.brp, std/random.brp, std/crypto_random.brp,
    std/process.brp, std/memory.brp, std/time.brp, std/string.brp).
-   Dispatch flows through [Core_resolve]'s user_funcs path (prefixed names like
-   [std_io__print]), not through this registry.
+   Dispatch flows through the Blorp Core resolver's user-function path
+   (prefixed names like [std_io__print]), not through this registry.
    ============================================================================ *)
 
 (* Math C passthrough -- function name = C name *)
@@ -340,9 +340,9 @@ let builtin_c_mapping =
   @ string_prelude_builtins
   @ string_internal_builtins
   (* [equals] is an [Equatable] trait method — registered here as a sentinel
-     builtin ([blorp_eq_dispatch]) so [Core_resolve] tags call sites with
-     [CKBuiltin "blorp_eq_dispatch"]. [Core_specialize] then rewrites
-     each call to the correct per-type C function based on arg types. *)
+     builtin ([blorp_eq_dispatch]) so Blorp Core resolution tags call sites
+     with [CKBuiltin "blorp_eq_dispatch"]. [Core_specialize] then rewrites each
+     call to the correct per-type C function based on arg types. *)
   @ [ (("", "equals"), "blorp_eq_dispatch") ]
   (* Regex builtins *)
   @ regex_builtins
@@ -477,3 +477,47 @@ let lookup_prefixed =
   fun prefixed_name ->
     let h = Lazy.force tbl in
     Hashtbl.find_opt h prefixed_name
+
+(** Recover the runtime target of a bodyless Core builtin declaration.
+    Call-site resolution is Blorp-owned; the OCaml emitter still needs this
+    declaration-level lookup while it projects the remaining middle output. *)
+let c_name_for_core_func (func : Core.core_func) =
+  let marker = "__mono_" in
+  let rec strip_mono_suffix_at index =
+    if index + String.length marker > String.length func.cf_name then
+      func.cf_name
+    else if String.sub func.cf_name index (String.length marker) = marker then
+      String.sub func.cf_name 0 index
+    else strip_mono_suffix_at (index + 1)
+  in
+  let source_name = strip_mono_suffix_at 0 in
+  let source_name =
+    match func.cf_module with
+    | None -> source_name
+    | Some module_path ->
+        let prefix = N.sanitize_module_name module_path ^ "__" in
+        if
+          String.length source_name >= String.length prefix
+          && String.sub source_name 0 (String.length prefix) = prefix
+        then
+          String.sub source_name (String.length prefix)
+            (String.length source_name - String.length prefix)
+        else source_name
+  in
+  let pure_suffix = "__pure" in
+  let source_name =
+    if
+      String.length source_name >= String.length pure_suffix
+      && String.sub source_name
+           (String.length source_name - String.length pure_suffix)
+           (String.length pure_suffix)
+         = pure_suffix
+    then
+      String.sub source_name 0
+        (String.length source_name - String.length pure_suffix)
+    else source_name
+  in
+  let module_path = Option.value func.cf_module ~default:"" in
+  match lookup module_path source_name with
+  | Some _ as runtime_name -> runtime_name
+  | None -> if module_path = "" then None else lookup "" source_name

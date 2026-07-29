@@ -571,7 +571,8 @@ harness constructors plus an explicit generated-module origin. The source graph
 can add one generated root to an existing parsed graph while retaining the
 already parsed test and dependency modules. A regression deletes the original
 test files before extension to prove they are not reread, then verifies exact
-module identity, bridge serialization, typechecking, and post-match Core
+module identity, bridge serialization, typechecking, and post-trait-resolution
+Core
 preparation from the retained graph. The extension rejects generated-root
 collisions and distinct retained files that share one downstream module
 identity. Generated-harness preparation also has an explicit frontend policy:
@@ -635,7 +636,7 @@ representative compiler-owned suites before moving the production boundary.
 - Narrow OCaml `Test_runner` to the responsibilities still on the OCaml side,
   then delete the superseded generation and bridge entry points once no
   production caller remains.
-- Preserve one bridge: the post-match Core semantic-middle request. Do not
+- Preserve one bridge: the post-trait-resolution Core semantic-middle request. Do not
   introduce a test-only parser bridge or a second graph protocol.
 - Completed: runtime-cache ownership moved with harness compilation.
   `test --warmup-only` compiles a minimal executable through the same Blorp

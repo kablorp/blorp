@@ -1,6 +1,6 @@
 # Blorp OCaml Host Exit Roadmap
 
-Status checked against code on 2026-07-25.
+Status checked against code on 2026-07-28.
 
 This roadmap removes the two remaining non-semantic responsibilities from the
 OCaml compiler host:
@@ -10,15 +10,16 @@ OCaml compiler host:
    resulting binary.
 
 The semantic middle is a separate migration concern. Core lowering and the
-early Core pipeline through match compilation are now Blorp-owned; until the
+early Core pipeline through trait resolution are now Blorp-owned; until the
 remaining middle Core passes are ported, one narrow OCaml worker may remain:
 
 ```text
 Blorp CLI, files, graph, parse, typecheck, and CTFE
   -> Blorp Core lowering, graph flattening, FFI annotation, and list layout
-  -> Blorp debug, desugar/SSA, mono, post-mono list layout, synthesis, and match
-  -> one versioned post-match Core request
-  -> OCaml trait-resolve-through-specialize Core worker
+  -> Blorp debug, desugar/SSA, mono, post-mono list layout, synthesis, match,
+     trait resolution, and call resolution
+  -> one versioned post-resolution Core request
+  -> OCaml std-inline-through-specialize Core worker
   -> one versioned post-specialize/pre-DCE Core response
   -> Blorp function-reference normalization, late Core pipeline, and C emission
   -> Blorp artifact writer, host C invocation, and program execution
@@ -166,8 +167,9 @@ Exit condition:
 Goal: replace the general CLI-plan handoff with one phase-specific protocol.
 
 Status: implemented and authoritative for normal `compile` and `run`. The
-private worker receives strict post-match Core schema 5 and starts at trait
-resolution; no source, typed AST, or raw match crosses this boundary.
+private worker receives strict post-resolution Core schema 7 and starts at std
+wrapper inlining; no source, typed AST, raw match, unresolved trait call, or
+selected direct call crosses this boundary.
 
 New Blorp file:
 
@@ -221,8 +223,8 @@ Implementation:
 4. Return exactly the pre-DCE Core shape consumed by
    `compiler_core_pipeline.brp`. Keep JSON decoding in
    `compiler_core_json.brp`.
-5. Keep the worker entry function limited to strict post-match Core decode,
-   early-stage invariant validation, and the still-OCaml middle passes.
+5. Keep the worker entry function limited to strict post-resolution Core
+   decode, early-stage invariant validation, and the still-OCaml middle passes.
 6. The worker reads one request from stdin and writes one response to stdout.
    Source diagnostics use the typed response; infrastructure failures use
    stderr. It accepts no public CLI flags. The Blorp process client is added in
@@ -840,8 +842,9 @@ the current OCaml host no longer implements bootstrap compilation.
 
 Do not delete yet:
 
-- OCaml trait-resolve-through-specialize passes used by `blorp-ocaml-middle`;
-- bridge decoders required by the post-match semantic-middle protocol; or
+- OCaml resolve-through-specialize passes used by `blorp-ocaml-middle`;
+- bridge decoders required by the post-resolution semantic-middle
+  protocol; or
 - OCaml tools still explicitly scheduled in Checkpoint 12 of the main roadmap.
 
 ## Checkpoint K: Ratchet The Bootstrap

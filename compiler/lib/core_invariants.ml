@@ -35,6 +35,11 @@
 
 module StringSet = Set.Make (String)
 module StringMap = Map.Make (String)
+module ConstructorIdentityMap = Map.Make (struct
+  type t = string * int
+
+  let compare = Stdlib.compare
+end)
 
 (** Walk every expression in a [core_program]. Visits:
     - function bodies (including nested lambdas)
@@ -74,10 +79,10 @@ let violation_at (stage : Core_stage.t) (loc : Ast.loc) ?hint msg : Core_error.t
    ============================================================================ *)
 
 (** After [Core_specialize], no unresolved [CCall] target may survive.
-    [Core_resolve] is allowed to leave type-dispatched stdlib operations
-    as [CKUnknown] because [Core_specialize] owns those rewrites. Selected
-    direct calls and compiler-owned intrinsics such as bitwise operators and
-    debug reflection must resolve earlier because typed metadata or the
+    Blorp Core resolution may leave type-dispatched stdlib operations as
+    [CKUnknown] because [Core_specialize] owns those rewrites. Selected direct
+    calls and compiler-owned intrinsics such as bitwise operators and debug
+    reflection must resolve before the bridge because typed metadata or the
     intrinsic registry already identifies the target. Past that boundary,
     either form is an unresolved call or a later pass fabricating calls without
     tagging them. *)
@@ -90,10 +95,10 @@ let check_no_ckunknown_at (stage : Core_stage.t) (prog : Core.core_program) :
           let v =
             violation_at stage e.loc
               ~hint:
-                "Core_resolve may leave specialization-owned calls as \
-                 CKUnknown, but Core_specialize must rewrite every one before \
-                 later Core passes or emission. CKSelectedDirect must be \
-                 resolved to CKUser before specialization."
+                "Blorp Core resolution may leave specialization-owned calls \
+                 as CKUnknown, but Core_specialize must rewrite every one \
+                 before later Core passes or emission. CKSelectedDirect must \
+                 be resolved to CKUser before the post-resolution boundary."
               "CCall with unresolved call target reached post-specialize IR"
           in
           v :: acc
@@ -677,28 +682,84 @@ let check_void_boxed_builtin_args_explicit_at (stage : Core_stage.t)
    Post-mono: user-function call arg types are type-variable-free
    ============================================================================ *)
 
-(** Does a type contain any [TyVar] (or [TyVarDims], which is the same
-    concept at the dim-list level)? Looks through the whole tree; a
-    single variable anywhere is a leak. *)
-let rec type_has_tyvar (t : Ast.type_expr) : bool =
+let erased_runtime_shape_type_variable = "#_"
+
+(** Does a type contain an unresolved type variable outside [allowed]?
+    Looks through the whole tree; a single variable anywhere is a leak.
+
+    [Core_post_resolve_json] uses [#_] only for a range whose proven bound was
+    intentionally erased by Blorp Core. It is not an unresolved source type
+    variable, and no middle or backend pass derives a bound from it.
+
+    [TyVarDims] is an existential runtime dimension pack, not an unresolved
+    scalar dimension. It intentionally survives monomorphization for
+    runtime-shaped tensor operations. *)
+let rec type_has_tyvar_except (allowed : StringSet.t) (t : Ast.type_expr) :
+    bool =
   match t with
-  | Ast.TyVar _ -> true
-  | Ast.TyBoundVar _ -> true
-  | Ast.TyVarDims _ -> true
-  | Ast.TyNamed (_, args) -> List.exists type_has_tyvar args
+  | Ast.TyVar name -> not (StringSet.mem name allowed)
+  | Ast.TyBoundVar param -> not (StringSet.mem param.param_name allowed)
+  | Ast.TyVarDims _ -> false
+  | Ast.TyNamed (_, args) -> List.exists (type_has_tyvar_except allowed) args
   | Ast.TyArray (elem, dims) ->
-      type_has_tyvar elem || List.exists type_has_tyvar dims
+      type_has_tyvar_except allowed elem
+      || List.exists (dimension_has_tyvar_except allowed) dims
   | Ast.TyFunc { params; return; _ } ->
-      List.exists type_has_tyvar params || type_has_tyvar return
-  | Ast.TyTuple ts -> List.exists type_has_tyvar ts
-  | Ast.TyRange t -> type_has_tyvar t
-  | Ast.TyDimOp (_, a, b) -> type_has_tyvar a || type_has_tyvar b
+      List.exists (type_has_tyvar_except allowed) params
+      || type_has_tyvar_except allowed return
+  | Ast.TyTuple ts -> List.exists (type_has_tyvar_except allowed) ts
+  | Ast.TyRange (Ast.TyVar name)
+    when name = erased_runtime_shape_type_variable ->
+      false
+  | Ast.TyRange t -> type_has_tyvar_except allowed t
+  | Ast.TyDimOp (_, a, b) ->
+      type_has_tyvar_except allowed a || type_has_tyvar_except allowed b
   | Ast.TySelf ->
       true
       (* Self morally is a type variable here — if it survives past mono,
        something upstream failed to substitute it. Treating it as a
        tyvar leak surfaces the bug instead of silently hiding it. *)
   | Ast.TyMeta _ | Ast.TyConstInt _ -> false
+and dimension_has_tyvar_except allowed = function
+  | Ast.TyVar name when name = erased_runtime_shape_type_variable -> false
+  | dim -> type_has_tyvar_except allowed dim
+
+(** Does a type contain any unresolved type variable? *)
+let type_has_tyvar = type_has_tyvar_except StringSet.empty
+
+(** A union constructor cannot infer type parameters that do not occur in its
+    payload. Those parameters legitimately remain abstract in the constructor
+    call's return type until surrounding context constrains them. Keep that
+    allowance tied to the constructor's canonical identity rather than its
+    spelling so ordinary functions receive no exemption. *)
+let constructor_unbound_return_params (prog : Core.core_program) =
+  let add_type_decl acc (type_decl : Ast.type_decl) =
+    let all_params =
+      Ast.type_param_names type_decl.type_params |> StringSet.of_list
+    in
+    List.fold_left
+      (fun acc (variant : Ast.variant) ->
+        match variant.variant_def_id with
+        | None -> acc
+        | Some def_id ->
+            let payload_params =
+              variant.variant_fields
+              |> List.concat_map Types.collect_type_vars
+              |> StringSet.of_list
+            in
+            let unbound = StringSet.diff all_params payload_params in
+            ConstructorIdentityMap.add
+              (variant.variant_name, def_id)
+              unbound acc)
+      acc type_decl.type_variants
+  in
+  let rec add_decl acc (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDType type_decl -> add_type_decl acc type_decl
+    | Core.CDPrivate inner -> add_decl acc inner
+    | _ -> acc
+  in
+  List.fold_left add_decl ConstructorIdentityMap.empty prog
 
 (** After monomorphization, user-function call sites should have concrete
     argument *and* return types. Substituting both is mono's job; a
@@ -713,10 +774,11 @@ let rec type_has_tyvar (t : Ast.type_expr) : bool =
     resolves them — not mono. A future invariant post-specialize could
     tighten this for closures. *)
 let check_no_tyvar_leak (prog : Core.core_program) : Core_error.t list =
+  let constructor_return_allowances = constructor_unbound_return_params prog in
   fold_program
     (fun acc e ->
       match e.Core.desc with
-      | Core.CCall (Core.CKUser (name, _), _, args) ->
+      | Core.CCall (Core.CKUser (name, def_id), _, args) ->
           let arg_violations =
             List.fold_left
               (fun acc (a : Core.core) ->
@@ -736,7 +798,19 @@ let check_no_tyvar_leak (prog : Core.core_program) : Core_error.t list =
                 else acc)
               acc args
           in
-          if type_has_tyvar e.ty then
+          let allowed_return_params =
+            match def_id with
+            | Some id -> (
+                match
+                  ConstructorIdentityMap.find_opt
+                    (name, id)
+                    constructor_return_allowances
+                with
+                | Some allowed -> allowed
+                | None -> StringSet.empty)
+            | None -> StringSet.empty
+          in
+          if type_has_tyvar_except allowed_return_params e.ty then
             let v =
               violation_at Core_stage.Mono e.loc
                 ~hint:

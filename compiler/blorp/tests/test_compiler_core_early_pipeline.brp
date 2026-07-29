@@ -1,7 +1,8 @@
 import:
 	../src/stage_09_core/compiler_core_early_invariants:
-		CoreEarlyInvariantViolation(MonoBoxSourceTypeUnresolved),
+		CoreEarlyInvariantViolation(MonoBoxSourceTypeUnresolved, SelectedDirectCallSurvived),
 		check_debug_invariants,
+		check_resolve_invariants,
 	../src/stage_09_core/compiler_core_early_pipeline:
 		CoreEarlyPipelineConfiguration,
 		CoreEarlyPipelineDiagnostic(
@@ -21,12 +22,15 @@ import:
 			CoreEarlyLowerStage,
 			CoreEarlyMatchStage,
 			CoreEarlyMonoStage,
+			CoreEarlyResolveStage,
 			CoreEarlySynthStage,
+			CoreEarlyTraitResolveStage,
 		),
 		core_early_pipeline_stage_name,
 		core_early_pipeline_stages_equal,
 		parse_core_early_pipeline_stage,
 		run_early_core_pipeline,
+		run_early_core_pipeline_with_resolve,
 	../src/stage_09_core/compiler_core_json:
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(PrimBox),
@@ -162,6 +166,8 @@ func test_stage_names_round_trip() -> Bool:
 		CoreEarlyMonoStage,
 		CoreEarlySynthStage,
 		CoreEarlyMatchStage,
+		CoreEarlyTraitResolveStage,
+		CoreEarlyResolveStage,
 	]
 
 	stages.all(pure func(stage):
@@ -467,6 +473,102 @@ func test_pipeline_owns_match_compilation_before_worker_boundary() -> Bool:
 			False
 
 
+func test_pipeline_owns_trait_resolution_before_worker_boundary() -> Bool:
+	int_type: CoreType = named_type("Int")
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		int_type,
+		LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
+	)
+
+	match (
+		run_early_core_pipeline(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyTraitResolveStage],
+				Some(CoreEarlyTraitResolveStage),
+			),
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlyTraitResolveStage)
+				and rendered.contains("\"kind\":\"function\"")
+				and observations.length() == 1
+			)
+		_:
+			False
+
+
+func test_pipeline_owns_call_resolution_before_worker_boundary() -> Bool:
+	int_type: CoreType = named_type("Int")
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		int_type,
+		LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
+	)
+
+	match (
+		run_early_core_pipeline_with_resolve(
+			{
+				program = program([FunctionDecl(main)]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[CoreEarlyResolveStage],
+				Some(CoreEarlyResolveStage),
+			),
+			[],
+			[],
+		)
+	):
+		CoreEarlyPipelineStopped(stage, rendered, observations):
+			(
+				core_early_pipeline_stages_equal(stage, CoreEarlyResolveStage)
+				and rendered.contains("\"kind\":\"function\"")
+				and observations.length() == 1
+			)
+		_:
+			False
+
+
+pure func test_resolve_invariant_rejects_selected_direct_calls() -> Bool:
+	int_type: CoreType = named_type("Int")
+	source: CoreProgram = program(
+		[
+			FunctionDecl(
+				function(
+					"main",
+					20,
+					[],
+					[],
+					int_type,
+					selected_call("unresolved", 404, [], [], int_type),
+				),
+			),
+		],
+	)
+
+	match check_resolve_invariants(source):
+		[SelectedDirectCallSurvived(def_id, _)]:
+			def_id == 404
+		_:
+			False
+
+
 func test_pipeline_returns_synth_diagnostic() -> Bool:
 	string_type: CoreType = named_type("String")
 	tensor_type: CoreType = TensorType({
@@ -574,6 +676,18 @@ tests: TestSuite = {
 		(
 			"pipeline owns match compilation before worker boundary",
 			test_pipeline_owns_match_compilation_before_worker_boundary,
+		),
+		(
+			"pipeline owns trait resolution before worker boundary",
+			test_pipeline_owns_trait_resolution_before_worker_boundary,
+		),
+		(
+			"pipeline owns call resolution before worker boundary",
+			test_pipeline_owns_call_resolution_before_worker_boundary,
+		),
+		(
+			"resolve invariant rejects selected direct calls",
+			test_resolve_invariant_rejects_selected_direct_calls,
 		),
 		("pipeline returns synth diagnostic", test_pipeline_returns_synth_diagnostic),
 		(

@@ -5249,7 +5249,8 @@ let rec second_pass (state : check_state) (decls : program) :
            free tyvars) would need monomorphization to produce usable
            bodies — the codegen trait registry skips generic for-types,
            so a synthesized body calling a sibling method would fail at
-           [Core_trait_resolve] with "no impl of `less_than` for `Tuple2`".
+           the later trait-resolution stage with
+           "no impl of `less_than` for `Tuple2`".
            Deferring generic-impl synthesis until the mono pipeline is
            extended to cover it preserves the pre-Step-5 behavior for
            those cases. *)

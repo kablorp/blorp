@@ -2,7 +2,7 @@ import:
 	../src/stage_09_core/compiler_core_json:
 		CoreDecl(FunctionDecl, ImplDecl, ValueRecordDecl),
 		CoreFunction,
-		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
+		CoreFunctionKind(BuiltinFunction, UnresolvedBuiltinFunction),
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -69,13 +69,21 @@ pure func builtin_function(
 	}
 
 
+private pure func function_was_synthesized_kind(kind: CoreFunctionKind) -> Bool:
+	match kind:
+		UnresolvedBuiltinFunction:
+			False
+		_:
+			True
+
+
 pure func function_was_promoted(program: CoreProgram, expected_name: String) -> Bool:
 	match program.decls:
 		[FunctionDecl(function_info)]:
 			(
 				function_info.name == expected_name
 				and function_info.body.is_some()
-				and function_info.function_kind == UserFunction
+				and function_was_synthesized_kind(function_info.function_kind)
 			)
 		_:
 			False
@@ -177,7 +185,10 @@ pure func test_synthesis_uses_program_declarations_for_hash_layout() -> Bool:
 		Ok(result):
 			match result.decls:
 				[ValueRecordDecl(_), FunctionDecl(synthesized)]:
-					synthesized.body.is_some() and synthesized.function_kind == UserFunction
+					(
+						synthesized.body.is_some()
+						and function_was_synthesized_kind(synthesized.function_kind)
+					)
 				_:
 					False
 		Err(_):
@@ -200,6 +211,33 @@ pure func test_synthesis_propagates_family_error() -> Bool:
 		Err(UnsupportedTensorReductionElement(name, element_type, _)):
 			name == "sum" and element_type == STRING_TYPE
 		_:
+			False
+
+
+pure func test_synthesis_records_registry_owned_runtime_identity() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = INT_TYPE,
+		dims = [TensorStaticDim(4)],
+	})
+	function_info: CoreFunction = builtin_function(
+		"std/vector",
+		"max",
+		[param("values", tensor_type)],
+		INT_TYPE,
+	)
+
+	match synthesize_program(program_with(function_info)):
+		Ok(program):
+			match program.decls:
+				[FunctionDecl(synthesized)]:
+					match synthesized.function_kind:
+						BuiltinFunction(runtime_name):
+							synthesized.body.is_some() and runtime_name == "blorp_max"
+						_:
+							False
+				_:
+					False
+		Err(_):
 			False
 
 
@@ -254,7 +292,7 @@ pure func test_synthesis_promotes_concrete_impl_method() -> Bool:
 							(
 								synthesized.name == "length"
 								and synthesized.body.is_some()
-								and synthesized.function_kind == UserFunction
+								and function_was_synthesized_kind(synthesized.function_kind)
 							)
 						_:
 							False
@@ -278,6 +316,10 @@ tests: TestSuite = {
 			test_synthesis_uses_program_declarations_for_hash_layout,
 		),
 		("synthesis propagates family errors", test_synthesis_propagates_family_error),
+		(
+			"synthesis records registry-owned runtime identity",
+			test_synthesis_records_registry_owned_runtime_identity,
+		),
 		("synthesis preserves unhandled builtin", test_synthesis_preserves_unhandled_builtin),
 		("synthesis promotes concrete impl method", test_synthesis_promotes_concrete_impl_method),
 	]

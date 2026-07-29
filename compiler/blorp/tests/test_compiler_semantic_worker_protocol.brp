@@ -13,29 +13,25 @@ import:
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType, TypeParameterType, VoidType),
+		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
+		CoreUnionVariant,
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
 		SemanticMiddleCapability(
-			PostMatchCoreCapability,
+			PostResolveCoreCapability,
 			PreDceCoreCapability,
 			RenderedStageObservationsCapability,
 		),
-		SemanticMiddleImportBinding,
-		SemanticMiddleModuleImports,
+		SemanticMiddleProjectionError(SemanticMiddleMalformedRuntimeAbiUnion),
 		SemanticMiddleProtocolError(SemanticMiddleInvalidCore),
 		SemanticMiddleRequest,
 		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed, SemanticMiddleStopped),
-		SemanticMiddleStage(
-			FusionMiddleStage,
-			ResolveMiddleStage,
-			StdInlineMiddleStage,
-			TailrecMiddleStage,
-			TraitResolveMiddleStage,
-		),
+		SemanticMiddleStage(FusionMiddleStage, StdInlineMiddleStage, TailrecMiddleStage),
 		decode_semantic_middle_response_value,
 		parse_semantic_middle_capability,
 		parse_semantic_middle_stage,
@@ -53,21 +49,6 @@ import:
 	test: TestSuite
 
 
-pure func sample_import_binding() -> SemanticMiddleImportBinding:
-	{
-		local_name = "Value",
-		module_path = "pkg/value",
-		original_name = Some("SourceValue")
-	}
-
-
-pure func sample_module_imports(module_name: String) -> SemanticMiddleModuleImports:
-	{
-		module_name = module_name,
-		import_bindings = [sample_import_binding()]
-	}
-
-
 pure func sample_request() -> SemanticMiddleRequest:
 	{
 		target_path = "src/main.brp",
@@ -77,17 +58,15 @@ pure func sample_request() -> SemanticMiddleRequest:
 			foreign_includes = []
 		},
 		next_def_id = 42,
-		import_bindings = [sample_import_binding()],
-		module_imports = [sample_module_imports("pkg/value")],
 		require_main = True,
 		check_invariants = True,
 		required_capabilities = [
-			PostMatchCoreCapability,
+			PostResolveCoreCapability,
 			PreDceCoreCapability,
 			RenderedStageObservationsCapability,
 		],
-		observations = [TraitResolveMiddleStage, FusionMiddleStage],
-		stop_after = Some(TraitResolveMiddleStage)
+		observations = [StdInlineMiddleStage, FusionMiddleStage],
+		stop_after = Some(StdInlineMiddleStage)
 	}
 
 
@@ -135,6 +114,52 @@ pure func boundary_union(name: String, type_params: List[String]) -> CoreDecl:
 	})
 
 
+pure func abi_union_variant(
+	name: String,
+	tag: Int,
+	payload_type_parameter: Option[String],
+) -> CoreUnionVariant:
+	fields: List[CoreUnionField] = match payload_type_parameter:
+		Some(type_parameter):
+			[
+				{
+					typ = TypeParameterType(type_parameter),
+					release_policy = NoReleasePolicy
+				},
+			]
+		None:
+			[]
+
+	{
+		name = name,
+		c_name = name,
+		tag_c_name = "TAG_${name}",
+		tag = tag,
+		fields = fields,
+		def_id = None
+	}
+
+
+pure func runtime_option_union() -> CoreDecl:
+	UnionDecl({
+		name = "Option",
+		type_params = ["T"],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [abi_union_variant("Some", 0, Some("T")), abi_union_variant("None", 1, None)],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func runtime_result_union() -> CoreDecl:
+	UnionDecl({
+		name = "Result",
+		type_params = ["T", "E"],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [abi_union_variant("Ok", 0, Some("T")), abi_union_variant("Err", 1, Some("E"))],
+		loc = SyntheticSourceLoc,
+	})
+
+
 pure func boundary_decl_name(decl: CoreDecl) -> String:
 	match decl:
 		FunctionDecl(function_info):
@@ -164,11 +189,8 @@ pure func test_projects_only_semantic_middle_runtime_declarations() -> Bool:
 			FunctionDecl(boundary_function("deferred", [], False)),
 			boundary_union("Container", ["T"]),
 			boundary_union("std_channel__RecvAttempt", ["T"]),
-			boundary_union("Option", ["T"]),
-			boundary_union(
-				"Result",
-				["T", "E"],
-			),
+			runtime_option_union(),
+			runtime_result_union(),
 			boundary_union("Container__mono_Int", []),
 			ValueRecordDecl({
 				name = "Box",
@@ -209,6 +231,20 @@ pure func test_projects_only_semantic_middle_runtime_declarations() -> Bool:
 				loc = SyntheticSourceLoc,
 			}),
 			ImplDecl({
+				trait_name = "UnresolvedDisplay",
+				for_type = t,
+				type_params = [],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			}),
+			ImplDecl({
+				trait_name = "GenericMethodDisplay",
+				for_type = NamedType("Int", []),
+				type_params = [],
+				methods = [boundary_function("display", ["T"], True)],
+				loc = SyntheticSourceLoc,
+			}),
+			ImplDecl({
 				trait_name = "Display",
 				for_type = NamedType("Int", []),
 				type_params = [],
@@ -218,23 +254,50 @@ pure func test_projects_only_semantic_middle_runtime_declarations() -> Bool:
 		],
 		foreign_includes = ["runtime.h"]
 	}
-	projected: CoreProgram = project_semantic_middle_program(source)
 
-	(
-		projected.decls.map(
-			boundary_decl_name,
-		) == [
-			"function:main",
-			"function:deferred",
-			"union:Option",
-			"union:Result",
-			"union:Container__mono_Int",
-			"alias:Alias",
-			"trait:Display",
-			"impl:Display",
-		]
-		and projected.foreign_includes == ["runtime.h"]
-	)
+	match project_semantic_middle_program(source):
+		Ok(projected):
+			(
+				projected.decls.map(
+					boundary_decl_name,
+				) == [
+					"function:main",
+					"function:deferred",
+					"union:Option",
+					"union:Result",
+					"union:Container__mono_Int",
+					"alias:Alias",
+					"trait:Display",
+					"impl:Display",
+				]
+				and projected.foreign_includes == ["runtime.h"]
+			)
+		Err(_):
+			False
+
+
+pure func test_rejects_malformed_runtime_abi_templates() -> Bool:
+	source: CoreProgram = {
+		decls = [
+			UnionDecl({
+				name = "Option",
+				type_params = ["T"],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					abi_union_variant("Some", 1, Some("T")),
+					abi_union_variant("None", 0, None),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+	match project_semantic_middle_program(source):
+		Err(SemanticMiddleMalformedRuntimeAbiUnion("Option")):
+			True
+		_:
+			False
 
 
 pure func field_string_is(value: JsonValue, name: String, expected: String) -> Bool:
@@ -286,13 +349,7 @@ pure func field_array_length_is(value: JsonValue, name: String, expected: Int) -
 
 
 pure func test_stage_names_round_trip() -> Bool:
-	stages = [
-		TraitResolveMiddleStage,
-		ResolveMiddleStage,
-		StdInlineMiddleStage,
-		TailrecMiddleStage,
-		FusionMiddleStage,
-	]
+	stages = [StdInlineMiddleStage, TailrecMiddleStage, FusionMiddleStage]
 
 	stages.all(
 		func(stage): parse_semantic_middle_stage(semantic_middle_stage_name(stage)) == Some(stage),
@@ -301,7 +358,7 @@ pure func test_stage_names_round_trip() -> Bool:
 
 pure func test_capability_names_round_trip() -> Bool:
 	capabilities = [
-		PostMatchCoreCapability,
+		PostResolveCoreCapability,
 		PreDceCoreCapability,
 		RenderedStageObservationsCapability,
 	]
@@ -322,7 +379,7 @@ pure func test_request_json_is_phase_specific() -> Bool:
 		field_number_is(value, "schema", SEMANTIC_MIDDLE_SCHEMA_VERSION)
 		and field_string_is(value, "domain", SEMANTIC_MIDDLE_DOMAIN)
 		and field_string_is(value, "kind", "compile_pre_dce")
-		and field_string_is(value, "core_phase", "post_match")
+		and field_string_is(value, "core_phase", "post_resolve")
 		and field_string_is(value, "target_path", "src/main.brp")
 		and field_string_is(value, "target_module", "main")
 		and field_number_is(value, "next_def_id", 42)
@@ -330,9 +387,10 @@ pure func test_request_json_is_phase_specific() -> Bool:
 		and field_bool_is(value, "require_main", True)
 		and field_bool_is(value, "check_invariants", True)
 		and field_array_length_is(value, "required_capabilities", 3)
-		and field_array_length_is(value, "module_imports", 1)
 		and field_array_length_is(value, "observations", 2)
-		and field_string_is(value, "stop_after", "trait_resolve")
+		and field_string_is(value, "stop_after", "std_inline")
+		and get_field(value, "import_bindings").is_none()
+		and get_field(value, "module_imports").is_none()
 		and get_field(value, "args").is_none()
 		and get_field(value, "source_text").is_none()
 	)
@@ -344,13 +402,13 @@ pure func compiled_response_value_with_core(core: JsonValue) -> JsonValue:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_post_match"),
+			JsonString("core_post_resolve"),
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
 		("core", core),
 		("observations", JsonVector([JsonObject([
-				("stage", JsonString("trait_resolve")),
+				("stage", JsonString("std_inline")),
 				("rendered", JsonString("func main")),
 			])])),
 	])
@@ -372,7 +430,7 @@ pure func test_decode_compiled_response() -> Bool:
 					(
 						core.decls.length() == 0
 						and core.foreign_includes.length() == 0
-						and observation.stage == TraitResolveMiddleStage
+						and observation.stage == StdInlineMiddleStage
 						and observation.rendered == "func main"
 					)
 				None:
@@ -401,11 +459,11 @@ pure func test_decode_stopped_response() -> Bool:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("stopped")),
 		("capabilities", JsonVector([
-			JsonString("core_post_match"),
+			JsonString("core_post_resolve"),
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
-		("stage", JsonString("trait_resolve")),
+		("stage", JsonString("tailrec")),
 		("rendered", JsonString("trait-resolve snapshot")),
 		("observations", JsonVector([])),
 	])
@@ -413,7 +471,7 @@ pure func test_decode_stopped_response() -> Bool:
 	match decode_semantic_middle_response_value(value):
 		Ok(SemanticMiddleStopped(stage, rendered, observations)):
 			(
-				stage == TraitResolveMiddleStage
+				stage == TailrecMiddleStage
 				and rendered == "trait-resolve snapshot"
 				and observations.length() == 0
 			)
@@ -429,7 +487,7 @@ pure func test_decode_failed_response() -> Bool:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("failed")),
 		("capabilities", JsonVector([
-			JsonString("core_post_match"),
+			JsonString("core_post_resolve"),
 			JsonString("core_pre_dce"),
 			JsonString("rendered_stage_observations"),
 		])),
@@ -493,7 +551,10 @@ pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
-		("capabilities", JsonVector([JsonString("core_post_match"), JsonString("core_pre_dce")])),
+		("capabilities", JsonVector([
+			JsonString("core_post_resolve"),
+			JsonString("core_pre_dce"),
+		])),
 		("core", JsonObject([])),
 		("observations", JsonVector([])),
 	])
@@ -502,7 +563,7 @@ pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_post_match"),
+			JsonString("core_post_resolve"),
 			JsonString("core_pre_dce"),
 			JsonString("source_loading"),
 		])),
@@ -528,6 +589,7 @@ tests: TestSuite = {
 			"projects only semantic-middle runtime declarations",
 			test_projects_only_semantic_middle_runtime_declarations,
 		),
+		("rejects malformed runtime ABI templates", test_rejects_malformed_runtime_abi_templates),
 		("request JSON is phase specific", test_request_json_is_phase_specific),
 		("decode compiled response", test_decode_compiled_response),
 		("reject malformed Core response", test_rejects_malformed_core_response),

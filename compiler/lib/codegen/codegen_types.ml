@@ -14,7 +14,7 @@
 
     Population order: Blorp lowering and monomorphization establish concrete
     type metadata before the semantic-worker handoff. The OCaml middle rebuilds
-    this registry from decoded post-match Core before running its
+    this registry from decoded post-resolution Core before running its
     registry-dependent passes. *)
 
 open Ast

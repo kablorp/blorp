@@ -1,9 +1,10 @@
-(** Strict structural decoder for the Blorp-owned post-match Core handoff.
+(** Strict structural decoder for the Blorp-owned post-resolution Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
-    post-desugar, post-mono, and post-match semantic invariant checks
-    immediately after this structural decode. The accepted expression set
+    post-desugar, post-mono, post-match, post-trait-resolution, and
+    post-resolution semantic
+    invariant checks immediately after this structural decode. The accepted expression set
     includes semantic decision trees created by match compilation and the
     non-owning constructor test synthesized before that stage. It rejects raw
     matches and ownership-bearing backend forms so a pass cannot accidentally
@@ -297,24 +298,14 @@ let decode_call_kind path value =
   match tag with
   | "unknown" -> Ok Core.CKUnknown
   | "selected_direct" ->
-      let* id = int_field path "def_id" value in
-      Ok (Core.CKSelectedDirect id)
+      error (path_field path "kind")
+        "unresolved selected direct call reached the post-resolution boundary"
   | "deferred_trait" ->
-      (* Blorp mono retains this exact dispatch identity. The remaining OCaml
-         trait resolver uses the legacy unknown-call representation, so narrow
-         it only at this explicit handoff. *)
-      let* _trait_name = string_field path "trait_name" value in
-      let* _method_name = string_field path "method_name" value in
-      Ok Core.CKUnknown
+      error (path_field path "kind")
+        "unresolved deferred trait call reached the post-resolution boundary"
   | "selected_trait" ->
-      (* Preserve the typecheck-selected method ID while OCaml trait
-         resolution remains production-authoritative. Blorp keeps the richer
-         trait/module identity on its side of the post-match boundary. *)
-      let* _trait_name = string_field path "trait_name" value in
-      let* _method_name = string_field path "method_name" value in
-      let* _module_path = string_field path "module_path" value in
-      let* id = int_field path "def_id" value in
-      Ok (Core.CKSelectedDirect id)
+      error (path_field path "kind")
+        "unresolved selected trait call reached the post-resolution boundary"
   | "user" ->
       let* name = string_field path "name" value in
       let* id = optional_int_field path "def_id" value in
@@ -335,7 +326,8 @@ let decode_call_kind path value =
   | "closure" -> Ok Core.CKClosure
   | _ ->
       error (path_field path "kind")
-        ("call kind `" ^ tag ^ "` is not valid at the post-match boundary")
+        ("call kind `" ^ tag
+       ^ "` is not valid at the post-resolution boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -528,7 +520,8 @@ let rec decode_expr path value =
   | "constructor_match" -> decode_precompiled_constructor_match_expr path value
   | _ ->
       error (path_field path "kind")
-        ("Core expression `" ^ tag ^ "` is not valid at the post-match boundary")
+        ("Core expression `" ^ tag
+       ^ "` is not valid at the post-resolution boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -996,7 +989,8 @@ and decode_precompiled_constructor_match_body path value =
       Ok (Core.CTLeaf { ct_bindings = []; ct_body = body })
   | _ ->
       error (path_field path "kind")
-        ("precompiled constructor match body `" ^ tag ^ "` is not valid at the post-match boundary")
+        ("precompiled constructor match body `" ^ tag
+       ^ "` is not valid at the post-resolution boundary")
 
 and decode_precompiled_match_fallback path value =
   let* tag = kind path value in
@@ -1011,7 +1005,8 @@ and decode_precompiled_match_fallback path value =
   | "fail" -> Ok Core.CTFail
   | _ ->
       error (path_field path "kind")
-        ("precompiled constructor match fallback `" ^ tag ^ "` is not valid at the post-match boundary")
+        ("precompiled constructor match fallback `" ^ tag
+       ^ "` is not valid at the post-resolution boundary")
 
 and prepend_match_bindings bindings tree =
   match tree with
@@ -1083,7 +1078,7 @@ let decode_function_kind path value =
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
   | _ ->
       error (path_field path "kind")
-        ("function kind `" ^ tag ^ "` is not valid post-match")
+        ("function kind `" ^ tag ^ "` is not valid post-resolution")
 
 let decode_function path value =
   let* name = string_field path "name" value in
@@ -1229,18 +1224,14 @@ and decode_impl_decl path value loc =
   let* ci_trait = string_field path "trait_name" value in
   let* ci_for_type = decode_type_field path "for_type" value in
   let* impl_type_params = list_field decode_type_param path "type_params" value in
-  let* ci_methods = list_field decode_function path "methods" value in
-  let impl_param_name (param : Ast.type_param_decl) = param.param_name in
-  let add_impl_type_params method_ =
-    let impl_param_names = List.map impl_param_name impl_type_params in
-    let method_type_params =
-      List.filter
-        (fun param -> not (List.mem (impl_param_name param) impl_param_names))
-        method_.Core.cf_type_params
-    in
-    { method_ with Core.cf_type_params = impl_type_params @ method_type_params }
+  let* () =
+    match impl_type_params with
+    | [] -> Ok ()
+    | _ ->
+        error (path_field path "type_params")
+          "generic impl template is not valid post-resolution"
   in
-  let ci_methods = List.map add_impl_type_params ci_methods in
+  let* ci_methods = list_field decode_function path "methods" value in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }
 
 let rec decode_union_payload_storage path index = function
