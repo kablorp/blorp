@@ -194,6 +194,11 @@ type run_artifacts = {
 
 let current_run_artifacts : run_artifacts option ref = ref None
 
+let retain_run_artifacts () =
+  match Sys.getenv_opt "BLORP_TEST_RETAIN_RUN_ARTIFACTS" with
+  | Some "1" -> true
+  | _ -> false
+
 let make_run_artifacts () =
   let base = Filename.concat (Filename.get_temp_dir_name ()) "blorp-runs" in
   ensure_dir base;
@@ -224,7 +229,9 @@ let with_run_artifacts f =
       Fun.protect
         ~finally:(fun () ->
           current_run_artifacts := None;
-          remove_tree artifacts.root)
+          if retain_run_artifacts () then
+            Printf.eprintf "Retained test run artifacts: %s\n%!" artifacts.root
+          else remove_tree artifacts.root)
         f
 
 let run_artifact_path ~kind ~prefix ~suffix =
