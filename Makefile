@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test coverage c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -216,11 +216,6 @@ hygiene-check: build-blorp-cli
 	@tests/test_embed_runtime_generator.sh
 	@tests/test_release_toolchain.sh
 	@tests/test_scripts_test_harness.sh
-	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
-		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
-		echo "Inspect the conflict report before continuing."; \
-		exit 1; \
-	fi
 	@artifacts=$$( \
 		find . \
 			\( -path './.git' -o -path './compiler/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
@@ -232,16 +227,6 @@ hygiene-check: build-blorp-cli
 		echo "$$artifacts"; \
 		exit 1; \
 	fi
-
-# Run compiler-unit tests with coverage report
-coverage:
-	rm -rf compiler/_coverage
-	mkdir -p compiler/_coverage
-	cd compiler && dune build --instrument-with bisect_ppx --force test/run_tests.exe
-	cd compiler && BISECT_FILE=$(CURDIR)/compiler/_coverage/bisect ./_build/default/test/run_tests.exe --scope=default $(RUN_TESTS_ARGS)
-	cd compiler && bisect-ppx-report summary --coverage-path $(CURDIR)/compiler/_coverage
-	cd compiler && bisect-ppx-report html --coverage-path $(CURDIR)/compiler/_coverage
-	@echo "Coverage report: compiler/_coverage/index.html"
 
 c-static-analysis:
 	@command -v clang >/dev/null 2>&1 || { \

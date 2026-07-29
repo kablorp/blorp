@@ -200,10 +200,24 @@ if ! grep -Fq 'installed-bootstrap.id' <<<"$install_plan"; then
 fi
 
 setup_action=.github/actions/setup-cached-ocaml/action.yml
-if grep -Eq '~/.cache/dune|~/Library/Caches/dune' "$setup_action"; then
-	echo "FAIL: the opam dependency cache must not own Dune build artifacts" >&2
+if ! grep -Fq 'name: Cache Dune build artifacts' "$setup_action" ||
+	! grep -Fq '~/.cache/dune' "$setup_action" ||
+	! grep -Fq '~/Library/Caches/dune' "$setup_action" ||
+	! grep -Fq 'key: dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ocaml-compiler }}-${{ github.sha }}' "$setup_action" ||
+	! grep -Fq 'dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ocaml-compiler }}-' "$setup_action"
+then
+	echo "FAIL: cached OCaml setup must own the shared Dune artifact cache" >&2
 	exit 1
 fi
+for workflow in .github/workflows/*.yml; do
+	if grep -Fq 'name: Cache Dune build artifacts' "$workflow" ||
+		grep -Fq '~/.cache/dune' "$workflow" ||
+		grep -Fq '~/Library/Caches/dune' "$workflow"
+	then
+		echo "FAIL: $workflow must use the Dune cache owned by cached OCaml setup" >&2
+		exit 1
+	fi
+done
 
 bootstrap_manifest=compiler/bootstrap.env
 if [ ! -f "$bootstrap_manifest" ]; then
@@ -284,8 +298,8 @@ for workflow in \
 	.github/workflows/benchmarks.yml \
 	.github/workflows/release.yml
 do
-	if ! grep -Fq 'name: Cache Dune build artifacts' "$workflow"; then
-		echo "FAIL: $workflow must cache Dune build artifacts explicitly" >&2
+	if ! grep -Fq 'uses: ./.github/actions/setup-cached-ocaml' "$workflow"; then
+		echo "FAIL: $workflow must prepare the shared OCaml and Dune caches" >&2
 		exit 1
 	fi
 	if grep -Eq 'BLORP_COMPILER_BOOTSTRAP_TAG: dev-[0-9a-f]+' "$workflow"; then

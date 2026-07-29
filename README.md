@@ -39,7 +39,7 @@ A C compiler such as clang or gcc is still required to compile and run Blorp
 programs.
 
 Building from source is mainly useful for compiler development. To do that,
-install OCaml 4.14.x, dune, menhir, and a C compiler such as clang or gcc, then
+install OCaml 4.14.x, dune, and a C compiler such as clang or gcc, then
 run:
 
 ```bash

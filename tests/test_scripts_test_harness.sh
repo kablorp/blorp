@@ -228,29 +228,6 @@ fi
 
 echo "PASS: scripts/test preserves an explicitly selected prebuilt helper generation"
 
-no_build_coverage_output="$TMP_HARNESS/no-build-coverage-output.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		bash scripts/test --no-build --coverage compiler-unit
-) > "$no_build_coverage_output" 2>&1
-no_build_coverage_status=$?
-
-if [ "$no_build_coverage_status" -eq 0 ]; then
-	echo "FAIL: scripts/test must reject --no-build with --coverage"
-	cat "$no_build_coverage_output"
-	exit 1
-fi
-if ! grep -Fq -- "--no-build cannot be combined with --coverage" \
-	"$no_build_coverage_output"
-then
-	echo "FAIL: incompatible no-build coverage options need a precise diagnostic"
-	cat "$no_build_coverage_output"
-	exit 1
-fi
-
-echo "PASS: scripts/test rejects coverage when builds are disabled"
-
 partial_toolchain_output="$TMP_HARNESS/partial-toolchain-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1

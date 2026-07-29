@@ -29,7 +29,6 @@ Useful options:
 scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
-scripts/test --coverage         # compiler-unit coverage
 scripts/test --no-build         # test the existing installed toolchain
 scripts/test --timings          # print unit cases and generated-suite phases
 ```
@@ -42,7 +41,7 @@ required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` continues to build or install its selected compiler
 before running gates.
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
-slow OCaml/Alcotest coverage; it prints the slowest cases and leaves stable
+slow OCaml/Alcotest cases; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.
 With `compiler-deep` and `compiler-blorp-sanitize`, it also records generated
 TestSuite frontend, typecheck, Core, host-C, and execution phases and prints
@@ -132,10 +131,11 @@ Modes:
 GitHub workflows use `.github/actions/setup-cached-ocaml` instead of
 `ocaml/setup-ocaml`. The action restores `~/.opam` before doing setup work,
 installs only the fixed opam binary, and skips `opam install` on an exact cache
-hit. It also enables Dune's shared cache. The cache key includes the concrete
-GitHub runner label, architecture, `OCAML_COMPILER`, and
-`compiler/blorp.opam.locked`; changing the compiler, OS image, architecture, or
-locked dependencies rebuilds the switch once.
+hit. It also owns and enables Dune's shared build-artifact cache, so workflows
+do not repeat that setup. The opam cache key includes the concrete GitHub runner
+label, architecture, `OCAML_COMPILER`, and `compiler/blorp.opam.locked`;
+changing the compiler, OS image, architecture, or locked dependencies rebuilds
+the switch once.
 
 ## Build Lock
 

@@ -18,7 +18,6 @@ scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
 scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test compiler-unit compiler  # Multiple gates
-scripts/test --coverage         # Compiler-unit coverage report
 scripts/test --timings          # Print unit cases and generated-suite phases
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output

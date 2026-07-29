@@ -243,7 +243,6 @@ scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI smoke and exit-code checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
-scripts/test --coverage         # Compiler-unit coverage report
 scripts/test --no-build         # Test the existing installed toolchain
 scripts/test --timings          # Print unit cases and generated-suite phases
 scripts/test --verbose          # Print pass-by-pass child-runner output
@@ -258,7 +257,6 @@ make runtime-test                 # Runtime tests only
 make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
 make compiler-unit-test           # Compiler-internal OCaml/Alcotest unit-shaped tests
 make compiler-unit-deep-test      # Compiler-internal integration-shaped Alcotest tests
-make coverage                     # Compiler-unit coverage
 make quality                      # Hygiene + C static analysis
 make docker-gate                  # Normal test gate in Ubuntu Docker (linux/amd64)
 make docker-premerge-gate         # Premerge gate in Ubuntu Docker (linux/amd64)
@@ -733,7 +731,6 @@ Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github
 ```bash
 make compiler-unit-test      # Run phase-local compiler-internal OCaml/Alcotest tests
 make compiler-unit-deep-test # Run internal integration-shaped Alcotest tests
-make coverage                # Run default compiler-unit coverage, report in compiler/_coverage/index.html
 ```
 
 **Writing new tests:**
@@ -747,11 +744,6 @@ make coverage                # Run default compiler-unit coverage, report in com
 - Edge cases that are hard to trigger via `.brp` integration tests
 - Regression tests for specific compiler bugs
 - Any function exposed via `.mli` interface
-
-**Coverage:**
-- Uses [bisect_ppx](https://github.com/aantron/bisect_ppx) for instrumentation
-- Only the `blorp` library is instrumented (not the test code itself)
-- Run `make coverage` to see current coverage; focus new tests on uncovered paths
 
 **Failures:**
 - All tests should pass
