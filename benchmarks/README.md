@@ -123,7 +123,7 @@ fields, then reports every target field and record:
 benchmarks/compiler_enum_field_layout
 ```
 
-### Typecheck Function Profile
+### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through
 `compiler_typecheck_graph` in-process with function profiling enabled:
@@ -138,7 +138,26 @@ The positional controls are iterations, module count, nested type depth, and
 typed probes per module. An optional fifth argument selects the parsed-program
 mode: `retained` is the default, while `fallback` exercises the text-parsing
 boundary. The default `1 1 64 128 retained` workload is intended for fast local
-comparisons. The runner builds and directly uses the workspace production
+typechecker comparisons.
+
+For frontend-through-typecheck work on the compiler, use the function-heavy
+fixture in fallback mode and keep the retained run as a typecheck-only control:
+
+```bash
+BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
+  benchmarks/compiler_typecheck_profile 5 1 16 256 fallback
+BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
+  benchmarks/compiler_typecheck_profile 5 1 16 256 retained
+```
+
+This shape is closer to the self-hosted inference module's function-to-type
+declaration ratio while remaining a roughly two-second cached feedback loop.
+Use at least three alternating fallback/retained samples and compare medians.
+The 2026-07-27 baseline and bottleneck analysis are recorded in
+`results/compiler_frontend_profile_2026-07-27.md`, with raw elapsed samples in
+the adjacent `.tsv` file.
+
+The runner builds and directly uses the workspace production
 compiler CLI artifact at `compiler/_build/blorp-cli/blorp`, invokes its public
 `compile --profile` path, and pairs it with the current private semantic worker.
 It caches the profiled executable by compiler, benchmark, standard-library,

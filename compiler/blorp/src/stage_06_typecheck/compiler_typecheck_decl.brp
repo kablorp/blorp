@@ -352,15 +352,28 @@ private pure func compiler_canonical_annotation_type(
 	)
 
 
+private pure func compiler_canonical_function_annotation_type(
+	state: CompilerTypecheckState,
+	declared_type_param_names: List[String],
+	typ: CompilerType,
+) -> CompilerType:
+	compiler_canonical_annotation_type(
+		state,
+		compiler_type_instantiate_type_params(declared_type_param_names, typ),
+	)
+
+
 private pure func compiler_canonical_return_type(
 	state: CompilerTypecheckState,
+	declared_type_param_names: List[String],
 	return_type: Option[ParsedTypeExpr],
 ) -> Option[CompilerType]:
 	return_type.map(
 		func(
 			type_expr,
-		): compiler_canonical_annotation_type(
+		): compiler_canonical_function_annotation_type(
 			state,
+			declared_type_param_names,
 			compiler_type_from_parsed_type_expr(type_expr),
 		),
 	)
@@ -519,6 +532,23 @@ private pure func compiler_imported_annotation_type(
 	compiler_canonical_annotation_type(
 		state,
 		compiler_qualify_imported_type(import_state, module_path, local_type_names, typ),
+	)
+
+
+private pure func compiler_imported_function_annotation_type(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	declared_type_param_names: List[String],
+	typ: CompilerType,
+) -> CompilerType:
+	compiler_imported_annotation_type(
+		state,
+		import_state,
+		module_path,
+		local_type_names,
+		compiler_type_instantiate_type_params(declared_type_param_names, typ),
 	)
 
 
@@ -1674,36 +1704,36 @@ private pure func compiler_function_resource_arg_policy(
 	annotations: List[ParsedFunctionAnnotation],
 	body: Option[ParsedExpr],
 ) -> CompilerResourceArgPolicy:
-	var has_resource_param: Bool = False
-	var has_scoped_dependency_param: Bool = False
-
-	for param_type in param_types:
-		if compiler_typecheck_type_contains_resource(
-			compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
-			param_type,
-		):
-			has_resource_param = True
-
-		if compiler_type_contains_scoped_dependency_carrier(param_type):
-			has_scoped_dependency_param = True
-
-		if has_resource_param and has_scoped_dependency_param:
-			break
-
-	if (
-		parsed_function_body_is_builtin(body)
-		and (has_resource_param or has_scoped_dependency_param)
-	):
-		result_policy: CompilerResourceResultPolicy = if compiler_function_resource_result_ordinary(
-			annotations,
-		):
-			CompilerResourceResultOrdinary
-		else:
-			compiler_function_builtin_resource_result_policy(body)
-
-		CompilerAllowResourceArgs(result_policy)
-	else:
+	if not parsed_function_body_is_builtin(body):
 		CompilerRejectResourceArgs
+	else:
+		var has_resource_param: Bool = False
+		var has_scoped_dependency_param: Bool = False
+
+		for param_type in param_types:
+			if compiler_typecheck_type_contains_resource(
+				compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
+				param_type,
+			):
+				has_resource_param = True
+
+			if compiler_type_contains_scoped_dependency_carrier(param_type):
+				has_scoped_dependency_param = True
+
+			if has_resource_param and has_scoped_dependency_param:
+				break
+
+		if has_resource_param or has_scoped_dependency_param:
+			result_policy: CompilerResourceResultPolicy = if compiler_function_resource_result_ordinary(
+				annotations,
+			):
+				CompilerResourceResultOrdinary
+			else:
+				compiler_function_builtin_resource_result_policy(body)
+
+			CompilerAllowResourceArgs(result_policy)
+		else:
+			CompilerRejectResourceArgs
 
 
 private pure func compiler_validate_resource_result_annotation(
@@ -1762,29 +1792,37 @@ private pure func compiler_validate_resource_signature_boundary(
 	state: CompilerTypecheckState,
 	name: String,
 	params: List[ParsedParam],
+	param_types: List[CompilerType],
 	return_type: CompilerType,
 	body: Option[ParsedExpr],
 ) -> CompilerTypecheckState:
-	if parsed_function_body_is_builtin(body):
+	if params.length() != param_types.length():
+		compiler_typecheck_state_add_error(
+			state,
+			"internal typecheck error: semantic parameter count does not match parsed parameter count for function '" + name + "'",
+		)
+	else if parsed_function_body_is_builtin(body):
 		compiler_typecheck_state_copy(state)
 	else:
 		var next = compiler_typecheck_state_copy(state)
+		var param_index: Int = 0
 
-		for param in params:
-			param_type = compiler_canonical_annotation_type(
-				next,
-				compiler_param_type_from_parsed(param),
-			)
-
+		for param_type in param_types:
 			if compiler_typecheck_type_contains_resource(
 				compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
 				param_type,
 			):
-				param_name: String = compiler_param_name_from_parsed(param).get_or("_")
+				param_name: String = match params.get(param_index):
+					Some(param):
+						compiler_param_name_from_parsed(param).get_or("_")
+					None:
+						"_"
 				next = compiler_typecheck_state_add_error(
 					next,
 					"Function '" + name + "' parameter '" + param_name + "' cannot contain a resource type",
 				)
+
+			param_index += 1
 
 		if compiler_typecheck_type_contains_resource(
 			compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
@@ -2300,12 +2338,21 @@ private pure func compiler_register_function_signature(
 	module_path: Option[String],
 	origin: CompilerFuncOrigin,
 ) -> CompilerTypecheckState:
+	declared_type_param_names = compiler_type_param_names(type_params)
 	param_types: List[CompilerType] = compiler_param_types_from_parsed(
 		params,
 	).map(
-		func(param_type): compiler_canonical_annotation_type(state, param_type),
+		func(param_type): compiler_canonical_function_annotation_type(
+			state,
+			declared_type_param_names,
+			param_type,
+		),
 	)
-	resolved_return_type: CompilerType = compiler_canonical_annotation_type(state, return_type)
+	resolved_return_type: CompilerType = compiler_canonical_function_annotation_type(
+		state,
+		declared_type_param_names,
+		return_type,
+	)
 	semantic_dim_constraints: List[(CompilerType, CompilerType)] = compiler_canonical_dim_constraints_from_parsed(
 		state,
 		dim_constraints,
@@ -2425,12 +2472,21 @@ private pure func compiler_effective_function_type_params(
 	state: CompilerTypecheckState,
 	function_decl: ParsedFunctionDecl,
 ) -> List[CompilerBoundTypeParam]:
+	declared_type_param_names = compiler_type_param_names(function_decl.type_params)
 	param_types = compiler_param_types_from_parsed(
 		function_decl.params,
 	).map(
-		func(param_type): compiler_canonical_annotation_type(state, param_type),
+		func(param_type): compiler_canonical_function_annotation_type(
+			state,
+			declared_type_param_names,
+			param_type,
+		),
 	)
-	return_type = compiler_canonical_return_type(state, function_decl.return_type).get_or(
+	return_type = compiler_canonical_return_type(
+		state,
+		declared_type_param_names,
+		function_decl.return_type,
+	).get_or(
 		compiler_type_void(),
 	)
 	compiler_effective_bound_type_params(
@@ -2447,16 +2503,25 @@ private pure func compiler_function_body_signature_from_annotations(
 ) -> CompilerFunctionBodySignature:
 	effective_type_params = compiler_effective_function_type_params(state, function_decl)
 	type_param_names = effective_type_params.map(func(param): param.name)
+	declared_type_param_names = compiler_type_param_names(function_decl.type_params)
 	param_types = compiler_param_types_from_parsed(
 		function_decl.params,
 	).map(
 		func(param_type): compiler_type_instantiate_type_params(
 			type_param_names,
-			compiler_canonical_annotation_type(state, param_type),
+			compiler_canonical_function_annotation_type(
+				state,
+				declared_type_param_names,
+				param_type,
+			),
 		),
 	)
 
-	semantic_return_type = match compiler_canonical_return_type(state, function_decl.return_type):
+	semantic_return_type = match compiler_canonical_return_type(
+		state,
+		declared_type_param_names,
+		function_decl.return_type,
+	):
 		Some(return_type):
 			compiler_type_instantiate_type_params(type_param_names, return_type)
 		None:
@@ -2573,8 +2638,8 @@ private pure func compiler_register_function_signature_with_semantic_types(
 ) -> CompilerTypecheckState:
 	source_func_type: CompilerType = CompilerFunctionType(
 		is_pure,
-		param_types.map(compiler_type_copy),
-		compiler_type_copy(resolved_return_type),
+		param_types,
+		resolved_return_type,
 	)
 	effective_type_params = compiler_effective_bound_type_params(
 		state,
@@ -2612,6 +2677,7 @@ private pure func compiler_register_function_signature_with_semantic_types(
 		compiler_typecheck_state_copy(with_resource_result),
 		name,
 		params,
+		semantic_param_types,
 		semantic_return_type,
 		body,
 	)
@@ -2756,17 +2822,19 @@ private pure func compiler_imported_param_types_from_parsed(
 	import_state: CompilerTypecheckState,
 	module_path: String,
 	local_type_names: List[String],
+	declared_type_param_names: List[String],
 	params: List[ParsedParam],
 ) -> List[CompilerType]:
 	var result: List[CompilerType] = []
 
 	for param_type in compiler_param_types_from_parsed(params):
 		result = result.append(
-			compiler_imported_annotation_type(
+			compiler_imported_function_annotation_type(
 				state,
 				import_state,
 				module_path,
 				local_type_names,
+				declared_type_param_names,
 				param_type,
 			),
 		)
@@ -2781,18 +2849,21 @@ private pure func compiler_register_imported_function_decl(
 	local_type_names: List[String],
 	function_decl: ParsedFunctionDecl,
 ) -> CompilerTypecheckState:
+	declared_type_param_names = compiler_type_param_names(function_decl.type_params)
 	param_types: List[CompilerType] = compiler_imported_param_types_from_parsed(
 		state,
 		import_state,
 		module_path,
 		local_type_names,
+		declared_type_param_names,
 		function_decl.params,
 	)
-	resolved_return_type: CompilerType = compiler_imported_annotation_type(
+	resolved_return_type: CompilerType = compiler_imported_function_annotation_type(
 		state,
 		import_state,
 		module_path,
 		local_type_names,
+		declared_type_param_names,
 		compiler_type_from_optional_parsed_type_expr(function_decl.return_type),
 	)
 	semantic_dim_constraints: List[(CompilerType, CompilerType)] = compiler_imported_dim_constraints_from_parsed(
@@ -2842,6 +2913,7 @@ private pure func compiler_register_imported_foreign_function_decl(
 		import_state,
 		module_path,
 		local_type_names,
+		[],
 		function_decl.params,
 	)
 	resolved_return_type: CompilerType = compiler_imported_annotation_type(
@@ -3221,13 +3293,19 @@ private pure func compiler_impl_method_info_from_decl(
 	module_path: String,
 	method: ParsedFunctionDecl,
 ) -> CompilerImplMethodInfo:
+	declared_type_param_names = compiler_type_param_names(method.type_params)
 	param_types: List[CompilerType] = compiler_param_types_from_parsed(
 		method.params,
 	).map(
-		func(param_type): compiler_canonical_annotation_type(state, param_type),
+		func(param_type): compiler_canonical_function_annotation_type(
+			state,
+			declared_type_param_names,
+			param_type,
+		),
 	)
-	return_type: CompilerType = compiler_canonical_annotation_type(
+	return_type: CompilerType = compiler_canonical_function_annotation_type(
 		state,
+		declared_type_param_names,
 		compiler_type_from_optional_parsed_type_expr(method.return_type),
 	)
 	compiler_impl_method_info_from_semantic_types(
@@ -3297,18 +3375,21 @@ private pure func compiler_imported_impl_method_info_from_decl(
 	local_type_names: List[String],
 	method: ParsedFunctionDecl,
 ) -> CompilerImplMethodInfo:
+	declared_type_param_names = compiler_type_param_names(method.type_params)
 	param_types: List[CompilerType] = compiler_imported_param_types_from_parsed(
 		state,
 		import_state,
 		module_path,
 		local_type_names,
+		declared_type_param_names,
 		method.params,
 	)
-	return_type: CompilerType = compiler_imported_annotation_type(
+	return_type: CompilerType = compiler_imported_function_annotation_type(
 		state,
 		import_state,
 		module_path,
 		local_type_names,
+		declared_type_param_names,
 		compiler_type_from_optional_parsed_type_expr(method.return_type),
 	)
 	compiler_impl_method_info_from_semantic_types(
@@ -4722,6 +4803,7 @@ private pure func compiler_return_types_compatible(
 private pure func compiler_check_function_like_body_result(
 	function_name: String,
 	return_type: Option[CompilerType],
+	value_matches_declared_return: Bool,
 	result: CompilerInferResult,
 ) -> CompilerTypecheckState:
 	found_type = compiler_typed_expr_value_type(result.expr)
@@ -4730,7 +4812,7 @@ private pure func compiler_check_function_like_body_result(
 	match return_type:
 		Some(expected_type):
 			if (
-				compiler_return_types_compatible(result.context.state, expected_type, found_type)
+				value_matches_declared_return
 				or compiler_return_types_compatible(
 					result.context.state,
 					expected_type,
@@ -4925,13 +5007,14 @@ private pure func compiler_type_is_impure_function_type(typ: CompilerType) -> Bo
 private pure func compiler_check_pure_function_callback_params(
 	state: CompilerTypecheckState,
 	function_decl: ParsedFunctionDecl,
+	param_types: List[CompilerType],
 ) -> CompilerTypecheckState:
 	compiler_check_pure_function_like_callback_params(
 		state,
 		function_decl.name.text,
 		function_decl.is_pure,
 		function_decl.params,
-		function_decl.params.map(compiler_param_type_from_parsed),
+		param_types,
 	)
 
 
@@ -5027,17 +5110,13 @@ private pure func compiler_declared_return_value_slot(
 
 
 private pure func compiler_materialize_declared_return_body(
-	state: CompilerTypecheckState,
 	return_type: Option[CompilerType],
 	body: CompilerTypedExpr,
+	value_matches_declared_return: Bool,
 ) -> CompilerTypedExpr:
 	match return_type:
 		Some(expected):
-			if compiler_return_types_compatible(
-				state,
-				expected,
-				compiler_typed_expr_value_type(body),
-			):
+			if value_matches_declared_return:
 				compiler_typed_expr_with_slot(body, compiler_declared_return_value_slot(expected))
 			else:
 				body
@@ -5079,15 +5158,26 @@ private pure func compiler_typecheck_materialize_function_body_with_options(
 				)
 				raw_result = compiler_infer_expr(context, body)
 				result = compiler_finalize_infer_result(raw_result)
+				value_matches_declared_return = match declared_return_type:
+					Some(expected_type):
+						compiler_return_types_compatible(
+							result.context.state,
+							expected_type,
+							compiler_typed_expr_value_type(result.expr),
+						)
+					None:
+						False
 				checked_state = compiler_check_function_like_body_result(
 					function_decl.name.text,
 					declared_return_type,
+					value_matches_declared_return,
 					result,
 				)
 				debug_checked_state = compiler_check_debug_block_body(checked_state, result)
 				callback_checked_state = compiler_check_pure_function_callback_params(
 					debug_checked_state,
 					function_decl,
+					signature.param_types,
 				)
 				lambda_checked_state = compiler_check_nested_pure_lambda_body_calls(
 					callback_checked_state,
@@ -5109,9 +5199,9 @@ private pure func compiler_typecheck_materialize_function_body_with_options(
 					result,
 				)
 				typed_body = compiler_materialize_declared_return_body(
-					result.context.state,
 					declared_return_type,
 					result.expr,
+					value_matches_declared_return,
 				)
 				final_state = compiler_typecheck_with_body_env(signature_state, tail_checked_state)
 				typed_info = compiler_typed_function_info(

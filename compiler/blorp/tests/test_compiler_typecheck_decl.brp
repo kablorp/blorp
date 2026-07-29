@@ -82,6 +82,7 @@ import:
 		compiler_env_get_func_callable_id,
 		compiler_env_get_func_info,
 		compiler_env_get_function_trait,
+		compiler_env_find_impl_method_info,
 		compiler_env_get_module_func_symbol,
 		compiler_env_get_module_var_symbol,
 		compiler_env_get_opaque_alias,
@@ -1279,6 +1280,46 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 			False
 
 
+func test_imported_explicit_type_param_shadows_module_alias() -> Bool:
+	module_decls = [
+		type_alias_decl_with_target(
+			"Callback",
+			function_type(False, [int_type()], int_type()),
+		),
+		generic_function_body_decl(
+			"identity",
+			[type_param("Callback")],
+			[named_param("value", named_type("Callback"))],
+			Some(named_type("Callback")),
+			Some(decl_name_expr("value")),
+			True,
+		),
+	]
+	source_program = program([import_block_decl([import_decl(
+					"model",
+					None,
+					Some([import_symbol("identity", None, [])]),
+				)])])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[importable_module("model", module_decls)],
+	)
+	type_param = CompilerTypeVar("Callback")
+
+	match compiler_env_get_func_info(result.state.env, "identity"):
+		Some((func_type, _, _)):
+			(
+				result.state.errors.length() == 0
+				and compiler_types_equal(
+					func_type,
+					CompilerFunctionType(True, [type_param], type_param),
+				)
+			)
+		None:
+			False
+
+
 func test_current_module_signatures_canonicalize_qualified_import_types() -> Bool:
 	tcp_decls = [union_decl("TcpError", ["Closed"])]
 	source_program = program([
@@ -1686,6 +1727,47 @@ func test_imported_builtin_resource_preserves_cleanup() -> Bool:
 	)
 
 
+func test_imported_resource_function_uses_canonical_parameter_type() -> Bool:
+	module_path = "std/fs"
+	resource_name = "FileReader"
+	function_name = "use_reader"
+	source_program = program([
+		import_block_decl(
+			[import_decl("fs", None, Some([import_symbol(function_name, None, [])]))],
+		),
+		record_decl(resource_name),
+	])
+	result = compiler_typecheck_program_with_import_modules(
+		compiler_typecheck_state_empty(),
+		source_program,
+		[
+			importable_module(
+				module_path,
+				[
+					builtin_resource_type_decl_with_cleanup(
+						resource_name,
+						"blorp_file_close_reader",
+					),
+					function_body_decl(
+						function_name,
+						[named_param("reader", named_type(resource_name))],
+						Some(int_type()),
+						Some(int_expr()),
+					),
+				],
+			),
+		],
+	)
+
+	result.state.errors.any(
+		func(
+			error,
+		): error.contains(
+			"Function 'use_reader' parameter 'reader' cannot contain a resource type",
+		),
+	)
+
+
 func test_registers_type_record_alias_and_constructors() -> Bool:
 	source_program = program([
 		union_decl(
@@ -1876,6 +1958,37 @@ func test_registers_source_function_signature() -> Bool:
 						and origin_ok
 						and debug_ok
 						and callable_ok
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_registers_implicit_type_params_in_signature_order() -> Bool:
+	source_program = program([
+		function_body_decl(
+			"transform",
+			[named_param(
+					"callback",
+					function_type(True, [named_type("T")], named_type("U")),
+				), named_param("fallback", named_type("U"))],
+			Some(result_type(named_type("V"), named_type("T"))),
+			None,
+		),
+	])
+	state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_prescan_program(compiler_typecheck_state_empty(), source_program),
+		source_program,
+	)
+
+	match compiler_env_lookup(state.env, "transform"):
+		Some(symbol):
+			match symbol.kind:
+				CompilerFuncSymbolKind(info):
+					(
+						state.errors.length() == 0
+						and info.type_params.map(func(param): param.name) == ["T", "U", "V"]
 					)
 				_:
 					False
@@ -2483,6 +2596,74 @@ func test_materialize_impl_preserves_type_params_and_bounds() -> Bool:
 			False
 
 
+func test_materialize_impl_method_type_param_shadows_alias() -> Bool:
+	method: ParsedFunctionDecl = {
+		name = ident("identity"),
+		type_params = [type_param("Callback")],
+		params = [named_param("value", named_type("Callback"))],
+		return_type = Some(named_type("Callback")),
+		dim_constraints = [],
+		body = Some(decl_name_expr("value")),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = source_span()
+	}
+	source_program = program([
+		trait_decl("Identity"),
+		type_alias_decl_with_target(
+			"Callback",
+			function_type(False, [int_type()], int_type()),
+		),
+		impl_decl_with_methods("Identity", int_type(), [method]),
+	])
+	base_state = compiler_typecheck_register_program_impl_decls(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(base_state, source_program)
+	type_param = CompilerTypeVar("Callback")
+	registered_method = compiler_env_find_impl_method_info(
+		base_state.env,
+		"Identity",
+		"identity",
+		compiler_type_int(),
+	)
+
+	match (registered_method, result.program.decls.get(2)):
+		(Some(registered), Some(CompilerTypedImplDecl(info))):
+			match info.methods.get(0):
+				Some(method_info):
+					(
+						result.state.errors.length() == 0
+						and compiler_types_equal(
+							registered.func_type,
+							CompilerFunctionType(True, [type_param], type_param),
+						)
+						and compiler_types_equal(
+							method_info.param_types.get_or(0, compiler_type_void()),
+							type_param,
+						)
+						and compiler_types_equal(
+							method_info.semantic_return_type,
+							type_param,
+						)
+					)
+				None:
+					False
+		_:
+			False
+
+
 func test_materialize_impl_normalizes_implicit_type_param() -> Bool:
 	source_program = program([
 		trait_decl("Display"),
@@ -2652,6 +2833,10 @@ func test_materialize_program_bodies_canonicalizes_compatible_declared_return() 
 						and compiler_types_equal(info.semantic_return_type, expected_type)
 						and compiler_types_equal(
 							compiler_typed_expr_semantic_type(body),
+							expected_type,
+						)
+						and compiler_types_equal(
+							compiler_typed_expr_value_type(body),
 							expected_type,
 						)
 					)
@@ -3574,6 +3759,82 @@ func test_check_pure_function_rejects_impure_callback_param() -> Bool:
 	)
 
 
+func test_check_pure_function_rejects_aliased_impure_callback_param() -> Bool:
+	source_program = program([
+		type_alias_decl_with_target(
+			"Callback",
+			function_type(False, [int_type()], int_type()),
+		),
+		function_body_decl_with_purity(
+			"with_callback",
+			[named_param("f", named_type("Callback"))],
+			None,
+			Some(decl_void_expr()),
+			True,
+		),
+	])
+	state = compiler_typecheck_check_program_bodies(
+		compiler_typecheck_register_program_signature_decls(
+			compiler_typecheck_register_program_type_decls(
+				compiler_typecheck_prescan_program(
+					compiler_typecheck_state_empty(),
+					source_program,
+				),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+
+	(
+		state.errors.length() == 1
+		and state.errors
+			.get_or(0, "")
+			.contains("Pure function 'with_callback' has impure callback parameter 'f'")
+	)
+
+
+func test_explicit_type_param_shadows_impure_callback_alias() -> Bool:
+	source_program = program([
+		type_alias_decl_with_target(
+			"Callback",
+			function_type(False, [int_type()], int_type()),
+		),
+		generic_function_body_decl(
+			"with_callback",
+			[type_param("Callback")],
+			[named_param("f", named_type("Callback"))],
+			None,
+			Some(decl_void_expr()),
+			True,
+		),
+	])
+	state = compiler_typecheck_register_program_signature_decls(
+		compiler_typecheck_register_program_type_decls(
+			compiler_typecheck_prescan_program(
+				compiler_typecheck_state_empty(),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = compiler_typecheck_materialize_program_bodies(state, source_program)
+
+	match result.program.decls.get(1):
+		Some(CompilerTypedFunctionDecl(info)):
+			(
+				result.state.errors.length() == 0
+				and compiler_types_equal(
+					info.param_types.get_or(0, compiler_type_void()),
+					CompilerTypeVar("Callback"),
+				)
+			)
+		_:
+			False
+
+
 func test_check_pure_function_allows_pure_callback_param() -> Bool:
 	source_program = program([function_body_decl_with_purity("with_callback", [named_param(
 						"f",
@@ -3953,6 +4214,10 @@ tests: TestSuite = {
 			test_import_modules_register_canonical_signature_types,
 		),
 		(
+			"imported explicit type param shadows module alias",
+			test_imported_explicit_type_param_shadows_module_alias,
+		),
+		(
 			"current module signatures canonicalize qualified import types",
 			test_current_module_signatures_canonicalize_qualified_import_types,
 		),
@@ -3985,6 +4250,10 @@ tests: TestSuite = {
 			test_imported_builtin_resource_preserves_cleanup,
 		),
 		(
+			"imported resource function uses canonical parameter type",
+			test_imported_resource_function_uses_canonical_parameter_type,
+		),
+		(
 			"registers type record alias and constructors",
 			test_registers_type_record_alias_and_constructors,
 		),
@@ -3998,6 +4267,10 @@ tests: TestSuite = {
 		),
 		("opaque alias records type home", test_opaque_alias_records_type_home),
 		("registers source function signature", test_registers_source_function_signature),
+		(
+			"registers implicit type params in signature order",
+			test_registers_implicit_type_params_in_signature_order,
+		),
 		(
 			"registers global var and foreign function signature",
 			test_registers_global_var_and_foreign_function_signature,
@@ -4045,6 +4318,10 @@ tests: TestSuite = {
 		(
 			"materialize impl preserves type params and bounds",
 			test_materialize_impl_preserves_type_params_and_bounds,
+		),
+		(
+			"materialize impl method type param shadows alias",
+			test_materialize_impl_method_type_param_shadows_alias,
 		),
 		(
 			"materialize impl normalizes implicit type param",
@@ -4152,6 +4429,14 @@ tests: TestSuite = {
 		(
 			"check pure function rejects impure callback param",
 			test_check_pure_function_rejects_impure_callback_param,
+		),
+		(
+			"check pure function rejects aliased impure callback param",
+			test_check_pure_function_rejects_aliased_impure_callback_param,
+		),
+		(
+			"explicit type param shadows impure callback alias",
+			test_explicit_type_param_shadows_impure_callback_alias,
 		),
 		(
 			"check pure function allows pure callback param",
