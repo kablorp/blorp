@@ -98,7 +98,7 @@ let check_no_ckunknown_at (stage : Core_stage.t) (prog : Core.core_program) :
                 "Blorp Core resolution may leave specialization-owned calls \
                  as CKUnknown, but Core_specialize must rewrite every one \
                  before later Core passes or emission. CKSelectedDirect must \
-                 be resolved to CKUser before the post-string-fusion boundary."
+                 be resolved to CKUser before the post-collection-fusion boundary."
               "CCall with unresolved call target reached post-specialize IR"
           in
           v :: acc
@@ -684,7 +684,7 @@ let erased_runtime_shape_type_variable = "#_"
 (** Does a type contain an unresolved type variable outside [allowed]?
     Looks through the whole tree; a single variable anywhere is a leak.
 
-    [Core_post_string_fusion_json] uses [#_] only for a range whose proven bound was
+    [Core_post_collection_fusion_json] uses [#_] only for a range whose proven bound was
     intentionally erased by Blorp Core. It is not an unresolved source type
     variable, and no middle or backend pass derives a bound from it.
 

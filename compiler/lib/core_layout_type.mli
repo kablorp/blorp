@@ -127,11 +127,6 @@ type tensor_element_storage = private
   | TensorElementInlineStruct of string
   | TensorElementBoxed
 
-type boxed_storage_scalar_kind =
-  | BoxedStorageInlineScalar
-  | BoxedStorageArcBoxedScalar
-  | BoxedStorageNonScalar
-
 type t = private {
   semantic : Ast.type_expr;
   loc : Ast.loc;
@@ -271,9 +266,6 @@ val source_value_requires_retain_or_error :
   Ast.type_expr ->
   Ast.loc ->
   bool
-
-val boxed_storage_scalar_kind :
-  ?reg:Codegen_types.registry -> Ast.type_expr -> boxed_storage_scalar_kind
 
 val primitive_inline_width : Ast.type_expr -> primitive_inline_width
 

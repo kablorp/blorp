@@ -153,27 +153,6 @@ let test_source_value_release_path_is_layout_owned () =
     "value records need no source release" true
     (release_path (ty "Vec2" []) = Blorp.Core_layout_type.SourceValueNoRelease)
 
-let test_boxed_storage_scalar_kind_is_explicit () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Wide" ([], ty "Int128" []);
-  Alcotest.(check bool)
-    "alias to Int128 is an ARC-boxed scalar" true
-    (match
-       Blorp.Core_layout_type.boxed_storage_scalar_kind ~reg (ty "Wide" [])
-     with
-    | Blorp.Core_layout_type.BoxedStorageArcBoxedScalar -> true
-    | _ -> false);
-  Alcotest.(check bool)
-    "Int is an inline boxed scalar" true
-    (match Blorp.Core_layout_type.boxed_storage_scalar_kind ty_int with
-    | Blorp.Core_layout_type.BoxedStorageInlineScalar -> true
-    | _ -> false);
-  Alcotest.(check bool)
-    "String is not a boxed scalar" true
-    (match Blorp.Core_layout_type.boxed_storage_scalar_kind ty_string with
-    | Blorp.Core_layout_type.BoxedStorageNonScalar -> true
-    | _ -> false)
-
 let test_destructor_policy_is_layout_owned () =
   let open Blorp.Codegen_types in
   let reg = create_registry () in
@@ -761,8 +740,6 @@ let suite =
           test_source_value_layout_classification_is_explicit;
         Alcotest.test_case "source value release path is layout-owned" `Quick
           test_source_value_release_path_is_layout_owned;
-        Alcotest.test_case "boxed storage scalar kind is explicit" `Quick
-          test_boxed_storage_scalar_kind_is_explicit;
         Alcotest.test_case "destructor policy is layout-owned" `Quick
           test_destructor_policy_is_layout_owned;
         Alcotest.test_case "list element storage is layout-owned" `Quick

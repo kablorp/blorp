@@ -1,9 +1,9 @@
-(** Strict structural decoder for the Blorp-owned post-string-fusion Core handoff.
+(** Strict structural decoder for the Blorp-owned post-collection-fusion Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
     post-desugar, post-mono, post-match, post-trait-resolution, and
-    post-resolution, post-std-inline, post-tailrec, and post-string-fusion
+    post-resolution, post-std-inline, post-tailrec, and post-collection-fusion
     semantic invariant checks immediately after this structural decode. The
     accepted expression set includes semantic decision trees created by match
     compilation and the non-owning constructor test synthesized before that
@@ -299,13 +299,13 @@ let decode_call_kind path value =
   | "unknown" -> Ok Core.CKUnknown
   | "selected_direct" ->
       error (path_field path "kind")
-        "unresolved selected direct call reached the post-string-fusion boundary"
+        "unresolved selected direct call reached the post-collection-fusion boundary"
   | "deferred_trait" ->
       error (path_field path "kind")
-        "unresolved deferred trait call reached the post-string-fusion boundary"
+        "unresolved deferred trait call reached the post-collection-fusion boundary"
   | "selected_trait" ->
       error (path_field path "kind")
-        "unresolved selected trait call reached the post-string-fusion boundary"
+        "unresolved selected trait call reached the post-collection-fusion boundary"
   | "user" ->
       let* name = string_field path "name" value in
       let* id = optional_int_field path "def_id" value in
@@ -327,7 +327,7 @@ let decode_call_kind path value =
   | _ ->
       error (path_field path "kind")
         ("call kind `" ^ tag
-       ^ "` is not valid at the post-string-fusion boundary")
+       ^ "` is not valid at the post-collection-fusion boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -348,6 +348,25 @@ let decode_list_slots path value =
       let* c_type = string_field path "c_type" value in
       Ok (Core.ListInlineStructStorage c_type)
   | _ -> error (path_field path "kind") ("unsupported list layout `" ^ tag ^ "`")
+
+let list_element_type = function
+  | Ast.TyNamed (("List" | "ParallelList"), [ elem ]) -> Some elem
+  | _ -> None
+
+let list_storage_layout ty slots elem_needs_release =
+  let value_layout, policy =
+    match slots with
+    | Core.ListInlineStorage width ->
+        (Core.ListElementInlineBits width, Core.StoragePolicyUnmanagedBits)
+    | Core.ListInlineStructStorage c_type ->
+        (Core.ListElementStackStruct c_type, Core.StoragePolicyUnmanagedBits)
+    | Core.ListPointerStorage when elem_needs_release ->
+        (Core.ListElementPointer, Core.StoragePolicyManagedPointer)
+    | Core.ListPointerStorage ->
+        (Core.ListElementBoxedValue, Core.StoragePolicyUnmanagedBits)
+  in
+  Core.list_storage_layout ?elem_ty:(list_element_type ty) ~value_layout
+    ~policy slots
 
 let decode_box_kind path value =
   let* tag = kind path value in
@@ -464,6 +483,7 @@ let rec decode_expr path value =
       decode_typed_expr path value
         (Core.CLambda { lam_params; lam_body = body; lam_return_ty = return_ty; lam_is_pure = is_pure })
   | "list_construct" -> decode_list_construct_expr path value
+  | "list_handoff" -> decode_list_handoff_expr path value
   | "dict" ->
       let decode_entry entry_path entry =
         let* key = decode_expr_field entry_path "key" entry in
@@ -527,7 +547,7 @@ let rec decode_expr path value =
   | _ ->
       error (path_field path "kind")
         ("Core expression `" ^ tag
-       ^ "` is not valid at the post-string-fusion boundary")
+       ^ "` is not valid at the post-collection-fusion boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -664,26 +684,76 @@ and decode_list_construct_expr path value =
   let* slots = decode_list_slots (path_field construct_path "layout") layout_json in
   let* lc_elems = list_field decode_boxed_value construct_path "elements" construct in
   let* lc_elem_needs_release = bool_field construct_path "elem_needs_release" construct in
-  let elem_ty =
-    match ty with Ast.TyNamed (("List" | "ParallelList"), [ elem ]) -> Some elem | _ -> None
-  in
-  let value_layout, policy =
-    match slots with
-    | Core.ListInlineStorage width ->
-        (Core.ListElementInlineBits width, Core.StoragePolicyUnmanagedBits)
-    | Core.ListInlineStructStorage c_type ->
-        (Core.ListElementStackStruct c_type, Core.StoragePolicyUnmanagedBits)
-    | Core.ListPointerStorage when lc_elem_needs_release ->
-        (Core.ListElementPointer, Core.StoragePolicyManagedPointer)
-    | Core.ListPointerStorage ->
-        (Core.ListElementBoxedValue, Core.StoragePolicyUnmanagedBits)
-  in
-  let lc_layout =
-    Core.list_storage_layout ?elem_ty ~value_layout ~policy slots
-  in
+  let lc_layout = list_storage_layout ty slots lc_elem_needs_release in
   Ok
     (Core.mk ~loc ~ty
        (Core.CListConstruct { lc_layout; lc_elems; lc_elem_needs_release }))
+
+and decode_list_handoff_expr path value =
+  let* ty = decode_type_field path "type" value in
+  let* loc = decode_loc_field path "loc" value in
+  let* handoff = field path "handoff" value in
+  let handoff_path = path_field path "handoff" in
+  let* mode = string_field handoff_path "mode" handoff in
+  let* () =
+    if mode = "borrow_fresh" then Ok ()
+    else
+      error (path_field handoff_path "mode")
+        "post-collection-fusion list handoff must use borrow_fresh mode"
+  in
+  let* layout_json = field handoff_path "layout" handoff in
+  let* slots =
+    decode_list_slots (path_field handoff_path "layout") layout_json
+  in
+  let* elem_needs_release =
+    bool_field handoff_path "elem_needs_release" handoff
+  in
+  let* lh_source = decode_expr_field handoff_path "source" handoff in
+  let* lh_source_var = decode_var_field handoff_path "source_var" handoff in
+  let* lh_source_ty = decode_type_field handoff_path "source_type" handoff in
+  let* lh_result_ty = decode_type_field handoff_path "result_type" handoff in
+  let* lh_capacity = decode_expr_field handoff_path "capacity" handoff in
+  let* lh_result_var = decode_var_field handoff_path "result_var" handoff in
+  let* lh_len_var = decode_var_field handoff_path "len_var" handoff in
+  let* lh_out_var = decode_var_field handoff_path "out_var" handoff in
+  let* lh_body = decode_expr_field handoff_path "body" handoff in
+  let* write_order = string_field handoff_path "write_order" handoff in
+  let* () =
+    if write_order = "forward_compacting" then Ok ()
+    else
+      error (path_field handoff_path "write_order")
+        "unsupported collection list handoff write order"
+  in
+  let* () =
+    if Types.types_equal ty lh_result_ty then Ok ()
+    else
+      error (path_field handoff_path "result_type")
+        "list handoff result type does not match expression type"
+  in
+  let* () =
+    if Types.types_equal lh_source.ty lh_source_ty then Ok ()
+    else
+      error (path_field handoff_path "source_type")
+        "list handoff source type does not match source expression"
+  in
+  let lh_layout = list_storage_layout lh_result_ty slots elem_needs_release in
+  Ok
+    (Core.mk ~loc ~ty
+       (Core.CListHandoff
+          {
+            lh_mode = Core.BorrowFresh;
+            lh_layout;
+            lh_source;
+            lh_source_var;
+            lh_source_ty;
+            lh_result_ty;
+            lh_capacity;
+            lh_result_var;
+            lh_len_var;
+            lh_out_var;
+            lh_body;
+            lh_write_order = Core.ForwardCompacting;
+          }))
 
 and decode_let_expr path value =
   let* bind_var = decode_var_field path "name" value in
@@ -1072,7 +1142,7 @@ and decode_precompiled_constructor_match_body path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match body `" ^ tag
-       ^ "` is not valid at the post-string-fusion boundary")
+       ^ "` is not valid at the post-collection-fusion boundary")
 
 and decode_precompiled_match_fallback path value =
   let* tag = kind path value in
@@ -1088,7 +1158,7 @@ and decode_precompiled_match_fallback path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match fallback `" ^ tag
-       ^ "` is not valid at the post-string-fusion boundary")
+       ^ "` is not valid at the post-collection-fusion boundary")
 
 and prepend_match_bindings bindings tree =
   match tree with
@@ -1160,7 +1230,7 @@ let decode_function_kind path value =
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
   | _ ->
       error (path_field path "kind")
-        ("function kind `" ^ tag ^ "` is not valid post-string-fusion")
+        ("function kind `" ^ tag ^ "` is not valid post-collection-fusion")
 
 let decode_function path value =
   let* name = string_field path "name" value in
@@ -1311,7 +1381,7 @@ and decode_impl_decl path value loc =
     | [] -> Ok ()
     | _ ->
         error (path_field path "type_params")
-          "generic impl template is not valid post-string-fusion"
+          "generic impl template is not valid post-collection-fusion"
   in
   let* ci_methods = list_field decode_function path "methods" value in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }

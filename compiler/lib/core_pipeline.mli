@@ -13,10 +13,11 @@ val make_stage_hook :
 type backend_core_input = { blorp_tail_input : Core.core_program }
 (** Core after the OCaml semantic middle and before Blorp-owned DCE. *)
 
-val run_core_passes_from_post_string_fusion :
+val run_core_passes_from_post_collection_fusion :
   on_stage:on_stage_callback ->
   ?on_stage_event:on_stage_event ->
   reg:Codegen_types.registry ->
   Core.core_program ->
   backend_core_input
-(** Run production post-string-fusion Core through specialization. *)
+(** Run production post-collection-fusion Core through the remaining fusion
+    passes and specialization. *)

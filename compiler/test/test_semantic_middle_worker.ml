@@ -116,10 +116,10 @@ let core_program ?(foreign_includes = []) decls =
         Lsp_json.Array (List.map (fun include_ -> Lsp_json.String include_) foreign_includes) );
     ]
 
-let request_json ?(schema = 10) ?(domain = "compiler_semantic_middle")
-    ?(core_phase = "post_string_fusion") ?(require_main = false)
+let request_json ?(schema = 11) ?(domain = "compiler_semantic_middle")
+    ?(core_phase = "post_collection_fusion") ?(require_main = false)
     ?(core = core_program [])
-    ?(capabilities = [ "core_post_string_fusion"; "core_pre_dce"; "rendered_stage_observations" ])
+    ?(capabilities = [ "core_post_collection_fusion"; "core_pre_dce"; "rendered_stage_observations" ])
     ?(observations = [ "fusion" ]) ?stop_after () =
   Lsp_json.Object
     [
@@ -225,7 +225,7 @@ let test_rejects_missing_and_late_core () =
           (List.map (fun (name, value) -> if name = "body" then (name, late) else (name, value)) fields)
     | value -> value
   in
-  expect_decode_error "invalid_post_string_fusion_core"
+  expect_decode_error "invalid_post_collection_fusion_core"
     (request_json ~core:(core_program [ malformed ]) ())
 
 let response_or_fail request =
@@ -236,7 +236,7 @@ let response_or_fail request =
            (List.map (fun d -> d.Semantic_middle_worker.message) diagnostics))
   | response -> response
 
-let test_post_string_fusion_core_reaches_pre_dce () =
+let test_post_collection_fusion_core_reaches_pre_dce () =
   let core =
     core_program ~foreign_includes:[ "boundary_fixture.h" ]
       [
@@ -282,7 +282,7 @@ let test_rejects_core_from_before_debug_lowering () =
       ]
   in
   let core = core_program [ function_decl ~body:debug_body "main" 2 ] in
-  expect_decode_error "invalid_post_string_fusion_core" (request_json ~core ())
+  expect_decode_error "invalid_post_collection_fusion_core" (request_json ~core ())
 
 let test_accepts_synthesis_introduced_mutable_local () =
   let mutable_let =
@@ -313,7 +313,7 @@ let test_rejects_core_from_before_monomorphization () =
       ]
   in
   let core = core_program [ function_decl ~body:call "main" 2 ] in
-  expect_decode_error_message_contains "invalid_post_string_fusion_core"
+  expect_decode_error_message_contains "invalid_post_collection_fusion_core"
     "call to user function \"identity\"" (request_json ~core ())
 
 let test_rejects_unprojected_generic_function () =
@@ -326,7 +326,7 @@ let test_rejects_unprojected_generic_function () =
   in
   let generic = function_decl ~type_params:[ type_param ] "identity" 1 in
   let core = core_program [ generic; function_decl "main" 2 ] in
-  expect_decode_error "invalid_post_string_fusion_core" (request_json ~core ())
+  expect_decode_error "invalid_post_collection_fusion_core" (request_json ~core ())
 
 let test_accepts_runtime_abi_union_templates () =
   let core =
@@ -360,11 +360,11 @@ let test_rejects_malformed_runtime_abi_union_templates () =
           union_variant "None" 0;
         ]
   in
-  expect_decode_error "invalid_post_string_fusion_core"
+  expect_decode_error "invalid_post_collection_fusion_core"
     (request_json ~core:(core_program [ malformed_result ]) ());
-  expect_decode_error "invalid_post_string_fusion_core"
+  expect_decode_error "invalid_post_collection_fusion_core"
     (request_json ~core:(core_program [ typed_option ]) ());
-  expect_decode_error "invalid_post_string_fusion_core"
+  expect_decode_error "invalid_post_collection_fusion_core"
     (request_json ~core:(core_program [ wrong_option_tags ]) ())
 
 let test_require_main_validation () =
@@ -377,7 +377,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 9) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 11) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -385,7 +385,7 @@ let suite =
   [
     ( "protocol",
       [
-        Alcotest.test_case "decode post-string-fusion Core request" `Quick
+        Alcotest.test_case "decode post-collection-fusion Core request" `Quick
           test_decode_phase_specific_request;
         Alcotest.test_case "reject incompatible protocol fields" `Quick
           test_rejects_schema_domain_phase_capability_and_stage;
@@ -396,8 +396,8 @@ let suite =
       ] );
     ( "worker",
       [
-        Alcotest.test_case "post-string-fusion Core reaches pre-DCE" `Quick
-          test_post_string_fusion_core_reaches_pre_dce;
+        Alcotest.test_case "post-collection-fusion Core reaches pre-DCE" `Quick
+          test_post_collection_fusion_core_reaches_pre_dce;
         Alcotest.test_case "stop-after returns snapshot" `Quick
           test_stop_after_returns_snapshot;
         Alcotest.test_case "reject Core from before debug lowering" `Quick

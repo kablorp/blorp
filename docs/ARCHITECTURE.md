@@ -32,15 +32,15 @@ Source (.brp)
 | Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
 | + Early Pipeline |  debug, desugar/SSA, mono, list layout, synthesis,
 |                  |  pattern/trait/call resolution, std wrapper inlining,
-|                  |  tail-recursive loop lowering, and string fusion
+|                  |  tail-recursive loop lowering, and string/collection fusion
 |                  |  (stage_08_core_lower, stage_09_core)
 +------------------+
     |
     v
-+---------------------------+
-| Post-string-fusion bridge |  One strict JSON bridge into the OCaml semantic middle
-|                           |  (core_post_string_fusion_json.ml)
-+---------------------------+
++-------------------------------+
+| Post-collection-fusion bridge |  One strict JSON bridge into the OCaml semantic middle
+|                               |  (core_post_collection_fusion_json.ml)
++-------------------------------+
     |
     v
 +---------------+
@@ -74,8 +74,8 @@ typed module graph, lowers debug blocks and mutable locals, desugars Core,
 monomorphizes generic declarations, annotates list layouts, synthesizes
 concrete builtin bodies, compiles raw matches to semantic decision trees,
 resolves trait dispatch and ordinary call kinds, inlines narrow std wrappers,
-lowers supported self-tail-calls, and fuses supported string pipelines in
-Blorp. One phase-specific bridge decodes post-string-fusion Core into the remaining OCaml
+lowers supported self-tail-calls, and fuses supported string and collection pipelines in
+Blorp. One phase-specific bridge decodes post-collection-fusion Core into the remaining OCaml
 middle; source, typed AST, and pre-mono Core do not cross this boundary. The
 worker validates the completed Blorp early-stage contracts before starting at
 the remaining fusion passes. The pipeline then crosses the late
@@ -114,7 +114,7 @@ Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
 the request's debug mode. The post-debug invariant runs before the
-post-string-fusion bridge and rejects any node that survives that decision.
+post-collection-fusion bridge and rejects any node that survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
@@ -195,18 +195,22 @@ Blorp Typed AST graph
 +--------------------------+  (compiler_core_string_pipeline.brp)
     |
     v
-+---------------------------+
-| Post-string-fusion bridge |  Strict structural decode plus completed early
-+---------------------------+  stage checks (core_post_string_fusion_json.ml,
-                              semantic_middle_worker.ml)
++----------------------------+
+| Blorp collection fusion    |  Fuse supported list/range pipelines into loops
++----------------------------+  (compiler_core_collection_pipeline.brp)
+    |
+    v
++-------------------------------+
+| Post-collection-fusion bridge |  Strict structural decode plus completed early
++-------------------------------+  stage checks (core_post_collection_fusion_json.ml,
+                                  semantic_middle_worker.ml)
     |
     v
 +-------------------+
-| OCaml Core_fusion |  Fuse supported collection/scoped tensor pipelines and
-+-------------------+  tensor updates; scalar-replace non-escaping local tuples
+| OCaml Core_fusion |  Fuse supported scoped tensor pipelines and tensor updates;
++-------------------+  scalar-replace non-escaping local tuples
                        and narrow tuple-return call sites
-                       (core_collection_pipeline.ml,
-                       core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
+                       (core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
                        core_tuple_sroa.ml)
     |
     v
@@ -342,10 +346,10 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_post_string_fusion_json.ml` | Strict decoder for Blorp-owned post-string-fusion Core |
-| `core_collection_pipeline.ml` | Expression-local collection pipeline fusion |
-| `core_collection_producer.ml` | Shared producer metadata for fused collection construction |
-| `core_list_pipeline.ml` | List-specific pipeline rewrite helpers used by collection fusion |
+| `core_post_collection_fusion_json.ml` | Strict decoder for Blorp-owned post-collection-fusion Core |
+| `compiler_core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
+| `compiler_core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
+| `compiler_core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
 | `core_parallel_tensor_pipeline.ml` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
@@ -359,7 +363,7 @@ boxing, or ownership behavior from source spelling.
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_invariants.ml` | Stage-boundary invariant checks |
-| `core_pipeline.ml` | Remaining post-string-fusion OCaml middle orchestration |
+| `core_pipeline.ml` | Remaining post-collection-fusion OCaml middle orchestration |
 | `core_error.ml` | Structured errors with phase/location/hint |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
@@ -419,10 +423,7 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_post_string_fusion_json.ml # Strict Blorp post-string-fusion Core decoder
-│   ├── core_collection_pipeline.ml # Expression-local collection fusion
-│   ├── core_collection_producer.ml # Shared collection producer metadata
-│   ├── core_list_pipeline.ml # List-specific pipeline rewrite helpers
+│   ├── core_post_collection_fusion_json.ml # Strict Blorp post-collection-fusion Core decoder
 │   ├── core_parallel_tensor_pipeline.ml # Scoped vector/matrix pipeline fusion
 │   ├── core_tensor_fusion.ml # Tensor update fusion
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities

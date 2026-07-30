@@ -292,7 +292,7 @@ These remain active but should not grow separate roadmap files.
 - Perceus still performs legacy global-reference repair internally. Resolution
   should own that fact, and ownership passes should consume exact per-body and
   per-lambda reference sets instead of rediscovering them.
-- The post-string-fusion semantic-middle bridge still serializes large Core
+- The post-collection-fusion semantic-middle bridge still serializes large Core
   graphs through a helper process. Finishing that migration should precede
   elaborate bridge-specific optimization.
 

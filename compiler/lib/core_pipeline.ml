@@ -1,11 +1,11 @@
 (** Remaining OCaml Core semantic-middle pipeline.
 
-    Normal source compilation arrives after Blorp-owned string fusion. This
+    Normal source compilation arrives after Blorp-owned collection fusion. This
     module owns the remaining OCaml fusion subpasses and specialization; Blorp
     takes ownership again at the pre-DCE boundary.
 
     The remaining pass chain is:
-    1. collection, scoped-tensor, tensor-update, and tuple pipeline rewrites
+    1. scoped-tensor, tensor-update, and tuple pipeline rewrites
     2. [Core_specialize] — resolve type-dispatched builtins
     3. pre-DCE Core handoff to the Blorp backend
 
@@ -49,9 +49,9 @@ type backend_core_input = {
       (** Pre-DCE Core handed to the Blorp-owned backend tail. *)
 }
 
-(** Run the production OCaml middle from Blorp-owned post-string-fusion Core to
+(** Run the production OCaml middle from Blorp-owned post-collection-fusion Core to
     the pre-DCE backend handoff. *)
-let run_core_passes_from_post_string_fusion ~(on_stage : on_stage_callback)
+let run_core_passes_from_post_collection_fusion ~(on_stage : on_stage_callback)
     ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
     (prog : Core.core_program) : backend_core_input =
   let observe stage prog =
@@ -63,7 +63,6 @@ let run_core_passes_from_post_string_fusion ~(on_stage : on_stage_callback)
   let pre_dce =
     prog |> run_stage Core_stage.Fusion (fun p ->
         p
-        |> Core_collection_pipeline.fuse_program ~reg
         |> Core_parallel_tensor_pipeline.fuse_program
         |> Core_tensor_fusion.fuse_program ~reg
         |> Core_tuple_sroa.rewrite_program ~reg)

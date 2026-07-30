@@ -174,8 +174,8 @@ either work or produce a helpful message.
     core_debug → core_desugar + core_ssa →
     core_mono + core_list_layout → core_synth → core_match →
     core_trait_resolve → core_resolve → core_std_inline → core_tailrec →
-    core_string_pipeline + core_collection_pipeline + core_parallel_tensor_pipeline +
-    core_tensor_fusion + core_tuple_sroa →
+    core_string_pipeline + core_collection_pipeline →
+    core_parallel_tensor_pipeline + core_tensor_fusion + core_tuple_sroa →
     core_specialize → core_dce → core_consume_specialize → core_perceus → core_reuse → core_closure →
     core_resource → core_fairness → compiler_core_prepare → core_reuse(prepared unions) → backend emit
 
@@ -450,8 +450,7 @@ compiler/            # OCaml compiler implementation
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core.ml           # Core IR type definitions and traversal helpers
-    core_post_string_fusion_json.ml  # Strict Blorp post-string-fusion Core decoder
-    core_collection_pipeline.ml  # Core IR collection pipeline fusion
+    core_post_collection_fusion_json.ml  # Strict Blorp post-collection-fusion Core decoder
     core_parallel_tensor_pipeline.ml  # Scoped vector/matrix pipeline fusion
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement

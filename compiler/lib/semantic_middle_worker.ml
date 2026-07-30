@@ -1,21 +1,21 @@
-(** Private post-string-fusion Core to pre-DCE Core worker.
+(** Private post-collection-fusion Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
     and backend. The protocol is phase-specific: callers supply Blorp-owned
-    post-string-fusion Core, and successful requests return the Core program
+    post-collection-fusion Core, and successful requests return the Core program
     immediately before Blorp-owned DCE. This module does not read source files,
     interpret CLI arguments, emit C, write artifacts, or execute child
     processes. *)
 
-let schema_version = 10
+let schema_version = 11
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let core_phase = "post_string_fusion"
+let core_phase = "post_collection_fusion"
 
 type stage = Core_stage.t
 
 type capability =
-  | PostStringFusionCore
+  | PostCollectionFusionCore
   | PreDceCore
   | RenderedStageObservations
 
@@ -117,15 +117,15 @@ let semantic_middle_stage = function
 let stage_name = Core_stage.to_string
 
 let capability_name = function
-  | PostStringFusionCore -> "core_post_string_fusion"
+  | PostCollectionFusionCore -> "core_post_collection_fusion"
   | PreDceCore -> "core_pre_dce"
   | RenderedStageObservations -> "rendered_stage_observations"
 
 let supported_capabilities =
-  [ PostStringFusionCore; PreDceCore; RenderedStageObservations ]
+  [ PostCollectionFusionCore; PreDceCore; RenderedStageObservations ]
 
 let decode_capability = function
-  | Lsp_json.String "core_post_string_fusion" -> Ok PostStringFusionCore
+  | Lsp_json.String "core_post_collection_fusion" -> Ok PostCollectionFusionCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
   | Lsp_json.String "rendered_stage_observations" ->
       Ok RenderedStageObservations
@@ -228,11 +228,11 @@ let rec first_unprojected_generic_decl union_payload_storage = function
 let validate_runtime_projection union_payload_storage program =
   match first_unprojected_generic_decl union_payload_storage program with
   | Some declaration ->
-      protocol_error "invalid_post_string_fusion_core"
+      protocol_error "invalid_post_collection_fusion_core"
         ("Blorp semantic-middle projection retained " ^ declaration)
   | None -> Ok ()
 
-let post_string_fusion_invariant_message target_path (violation : Core_error.t) =
+let post_collection_fusion_invariant_message target_path (violation : Core_error.t) =
   let loc = violation.loc in
   let path = Option.value loc.loc_file ~default:target_path in
   let location =
@@ -242,7 +242,7 @@ let post_string_fusion_invariant_message target_path (violation : Core_error.t) 
   let hint =
     Option.fold ~none:"" ~some:(fun value -> " (" ^ value ^ ")") violation.hint
   in
-  Printf.sprintf "post-string-fusion Core invariant failed at %s: %s%s" location
+  Printf.sprintf "post-collection-fusion Core invariant failed at %s: %s%s" location
     violation.msg hint
 
 let require_equal ~code ~field_name ~expected actual =
@@ -277,11 +277,11 @@ let decode_request value =
     let* target_module = string_field "target_module" value in
     let* core_json = field "core" value in
     let* decoded =
-      match Core_post_string_fusion_json.decode_program core_json with
+      match Core_post_collection_fusion_json.decode_program core_json with
       | Ok decoded -> Ok decoded
       | Error error ->
-          protocol_error "invalid_post_string_fusion_core"
-            (Core_post_string_fusion_json.decode_error_to_string error)
+          protocol_error "invalid_post_collection_fusion_core"
+            (Core_post_collection_fusion_json.decode_error_to_string error)
     in
     let* () =
       validate_runtime_projection decoded.union_payload_storage decoded.core
@@ -304,18 +304,18 @@ let decode_request value =
           let* stage = decode_stage value in
           Ok (Some stage)
     in
-    (* A post-string-fusion handoff must satisfy every durable contract established by
+    (* A post-collection-fusion handoff must satisfy every durable contract established by
        the earlier Blorp-owned stages, not only the Match-specific contract.
        Synth rechecks debug, desugar, and monomorphization invariants while
        intentionally allowing mutable locals introduced by synthesis. *)
-    let post_string_fusion_violations =
+    let post_collection_fusion_violations =
       Core_invariants.run_for_stage Core_stage.Synth decoded.core
       @ Core_invariants.run_for_stage Core_stage.Match decoded.core
     in
-    (match post_string_fusion_violations with
+    (match post_collection_fusion_violations with
     | violation :: _ ->
-        protocol_error "invalid_post_string_fusion_core"
-          (post_string_fusion_invariant_message target_path violation)
+        protocol_error "invalid_post_collection_fusion_core"
+          (post_collection_fusion_invariant_message target_path violation)
     | [] ->
         Ok
           {
@@ -397,7 +397,7 @@ let run_request_in_session request =
           ~user:on_stage
       in
       let backend_input =
-        Core_pipeline.run_core_passes_from_post_string_fusion ~on_stage ~reg
+        Core_pipeline.run_core_passes_from_post_collection_fusion ~on_stage ~reg
           request.core
       in
       let observations = List.rev !observations_rev in

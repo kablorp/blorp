@@ -118,11 +118,6 @@ type tensor_element_storage =
   | TensorElementInlineStruct of string
   | TensorElementBoxed
 
-type boxed_storage_scalar_kind =
-  | BoxedStorageInlineScalar
-  | BoxedStorageArcBoxedScalar
-  | BoxedStorageNonScalar
-
 type enum_inline_width =
   | EnumInlineBits of Core.inline_storage_width
   | NotInlineEnum
@@ -257,14 +252,6 @@ let source_value_requires_release_or_error ?phase ~reg ty loc =
 
 let source_value_requires_retain_or_error ?phase ~reg ty loc =
   source_value_layout_of_type ?phase ~reg ty loc |> source_value_requires_retain
-
-let boxed_storage_scalar_kind ?reg ty =
-  let ty = canonical_type ?reg ty in
-  if Core_type_layout.is_arc_boxed_storage_value_type ty then
-    BoxedStorageArcBoxedScalar
-  else if Core_type_layout.is_boxed_storage_release_free_value_type ty then
-    BoxedStorageInlineScalar
-  else BoxedStorageNonScalar
 
 let inline_struct_storage ?reg ty =
   let reg = registry_or_empty reg in

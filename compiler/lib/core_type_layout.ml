@@ -238,15 +238,3 @@ let classify_debug_heap_value (meta : metadata) (ty : Ast.type_expr) :
   | Known { ownership = Unmanaged; _ } -> DebugStackValue
   | Unknown_named name -> DebugHeapUnknownNamed name
   | Invalid_value_type msg -> DebugHeapInvalidValueType msg
-
-let is_boxed_storage_release_free_value_type = function
-  | Ast.TyNamed (("Float" | "Float32" | "Float16"), []) -> true
-  | Ast.TyNamed (("Int" | "Bool" | "Char"), []) -> true
-  | ty when Types.is_any_integer_type ty -> true
-  | Ast.TyRange _ -> true
-  | ty when Types.Dim.is_value_dim ty -> true
-  | _ -> false
-
-let is_arc_boxed_storage_value_type = function
-  | Ast.TyNamed (("Int128" | "UInt128"), []) -> true
-  | _ -> false

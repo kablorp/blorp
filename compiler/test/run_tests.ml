@@ -84,12 +84,11 @@ let default_suites =
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
   @ suite_group "Core" Test_core.suite
-  @ suite_group "CorePostStringFusionJson"
-      Test_core_post_string_fusion_json.suite
+  @ suite_group "CorePostCollectionFusionJson"
+      Test_core_post_collection_fusion_json.suite
   @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
   @ suite_group "CoreSpecialize" Test_core_specialize.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
-  @ suite_group "CoreCollectionPipeline" Test_core_collection_pipeline.suite
   @ suite_group "CoreParallelVectorPipeline"
       Test_core_parallel_tensor_pipeline.suite
   @ suite_group "CoreTupleSroa" Test_core_tuple_sroa.suite

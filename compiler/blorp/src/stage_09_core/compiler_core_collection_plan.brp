@@ -1,0 +1,356 @@
+-- Recognize resolved std/list producer-consumer chains as validated plans.
+--
+-- This is a structural port of Core_list_pipeline. Construction stays
+-- centralized here so lowering never receives a plan without at least one
+-- transformation stage.
+import:
+	compiler_core_json:
+		CoreCallKind(UnknownCall, UserCall),
+		CoreExpr(CallExpr, VarExpr),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		core_expr_type,
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private MONO_NAME_MARKER: String = "__mono_"
+
+private PURE_NAME_SUFFIX: String = "__pure"
+
+
+union CoreCollectionPipelineSource:
+	CollectionListSource(CoreExpr, CoreType)
+	CollectionRangeSource(CoreExpr, CoreExpr)
+
+
+union CoreCollectionPipelineStage:
+	CollectionFilterStage(CoreExpr, CoreType)
+	CollectionMapStage(CoreExpr, CoreType, CoreType)
+	CollectionFilterMapStage(CoreExpr, CoreType, CoreType, CoreType)
+
+
+enum CoreCollectionPipelineCardinality:
+	CollectionExactCardinality
+	CollectionUpperBoundCardinality
+	CollectionTerminalCardinality
+
+
+union CoreCollectionPipelineSink:
+	CollectionCollectSink(CoreType)
+	CollectionFoldSink(CoreExpr, CoreExpr, CoreType)
+	CollectionLengthSink
+
+
+record CoreNonemptyCollectionPipelineStages {
+	first: CoreCollectionPipelineStage,
+	rest: List[CoreCollectionPipelineStage]
+}
+
+
+record CoreCollectionPipelinePlan {
+	source: CoreCollectionPipelineSource,
+	stage_chain: CoreNonemptyCollectionPipelineStages,
+	sink: CoreCollectionPipelineSink,
+	cardinality: CoreCollectionPipelineCardinality,
+	result_type: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private record CollectedCollectionPipeline {
+	source: CoreCollectionPipelineSource,
+	stages: List[CoreCollectionPipelineStage],
+	cardinality: CoreCollectionPipelineCardinality,
+	element_type: CoreType
+}
+
+
+record CoreCollectionPipelineCall {
+	base: String,
+	args: List[CoreExpr]
+}
+
+
+pure func collection_pipeline_stages(
+	plan: CoreCollectionPipelinePlan,
+) -> List[CoreCollectionPipelineStage]:
+	[plan.stage_chain.first] + plan.stage_chain.rest
+
+
+pure func collection_list_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			if name == "List" and args.length() == 1:
+				args.get(0)
+			else:
+				None
+		_:
+			None
+
+
+private pure func strip_mono_suffix(name: String) -> String:
+	index: Int = name.raw_index_of(MONO_NAME_MARKER)
+
+	if index < 0:
+		name
+	else:
+		name.substring(0, index)
+
+
+private pure func strip_pure_suffix(name: String) -> String:
+	if name.ends_with(PURE_NAME_SUFFIX):
+		name.substring(0, name.length() - PURE_NAME_SUFFIX.length())
+	else:
+		name
+
+
+private pure func strip_prefix(name: String, prefix: String) -> Option[String]:
+	if name.starts_with(prefix):
+		Some(name.substring(prefix.length(), name.length() - prefix.length()))
+	else:
+		None
+
+
+private pure func supported_list_base_name(name: String) -> Option[String]:
+	match name:
+		"filter" | "filter_map" | "map" | "fold_left" | "length" | "range" | "flat_map" | "partition" | "scan" | "sort" | "reverse" | "zip" | "zip_with":
+			Some(name)
+		_:
+			None
+
+
+pure func collection_pipeline_base_name(name: String) -> Option[String]:
+	without_mono: String = strip_mono_suffix(name)
+
+	without_module: String = match strip_prefix(without_mono, "std_list__"):
+		Some(rest):
+			rest
+		None:
+			strip_prefix(without_mono, "__ufcs_std$list__").get_or(without_mono)
+
+	base: String = strip_pure_suffix(without_module)
+
+	match supported_list_base_name(base):
+		Some(supported):
+			Some(supported)
+		None:
+			if base.starts_with("HasLength_length_List"):
+				Some("length")
+			else:
+				None
+
+
+pure func collection_pipeline_call_base_and_args(
+	expr: CoreExpr,
+) -> Option[CoreCollectionPipelineCall]:
+	match expr:
+		CallExpr(call_kind, callee, args, _, _):
+			name: Option[String] = match call_kind:
+				UserCall(user_name, _, _):
+					Some(user_name)
+				UnknownCall:
+					match callee:
+						VarExpr(variable, _, _):
+							Some(variable.name)
+						_:
+							None
+				_:
+					None
+
+			match name:
+				Some(call_name):
+					match collection_pipeline_base_name(call_name):
+						Some(base):
+							Some({
+								base = base,
+								args = args,
+							})
+						None:
+							None
+				None:
+					None
+		_:
+			None
+
+
+private pure func collection_expr_loc(expr: CoreExpr) -> CoreSourceLoc:
+	match expr:
+		CallExpr(_, _, _, _, loc):
+			loc
+		_:
+			SyntheticSourceLoc
+
+
+private pure func update_collection_cardinality(
+	cardinality: CoreCollectionPipelineCardinality,
+	stage: CoreCollectionPipelineStage,
+) -> CoreCollectionPipelineCardinality:
+	match stage:
+		CollectionMapStage(_, _, _):
+			cardinality
+		CollectionFilterStage(_, _) | CollectionFilterMapStage(_, _, _, _):
+			match cardinality:
+				CollectionExactCardinality | CollectionUpperBoundCardinality:
+					CollectionUpperBoundCardinality
+				CollectionTerminalCardinality:
+					CollectionTerminalCardinality
+
+
+private pure func append_collection_stage(
+	collected: CollectedCollectionPipeline,
+	stage: CoreCollectionPipelineStage,
+	output_type: CoreType,
+) -> CollectedCollectionPipeline:
+	{
+		source = collected.source,
+		stages = collected.stages.append(stage),
+		cardinality = update_collection_cardinality(collected.cardinality, stage),
+		element_type = output_type
+	}
+
+
+private pure func collect_collection_pipeline(
+	expr: CoreExpr,
+) -> Option[CollectedCollectionPipeline]:
+	match collection_pipeline_call_base_and_args(expr):
+		Some(call):
+			collect_collection_call(expr, call)
+		None:
+			element_type ?= collection_list_element_type(core_expr_type(expr))
+			Some({
+				source = CollectionListSource(expr, element_type),
+				stages = [],
+				cardinality = CollectionExactCardinality,
+				element_type = element_type,
+			})
+
+
+private pure func collect_collection_call(
+	expr: CoreExpr,
+	call: CoreCollectionPipelineCall,
+) -> Option[CollectedCollectionPipeline]:
+	if call.base == "range" and call.args.length() == 2:
+		start ?= call.args.get(0)
+		stop ?= call.args.get(1)
+		Some({
+			source = CollectionRangeSource(start, stop),
+			stages = [],
+			cardinality = CollectionExactCardinality,
+			element_type = INT_TYPE,
+		})
+	else if call.base == "filter" and call.args.length() == 2:
+		source ?= call.args.get(0)
+		callback ?= call.args.get(1)
+		collected ?= collect_collection_pipeline(source)
+		stage: CoreCollectionPipelineStage = CollectionFilterStage(callback, collected.element_type)
+		Some(append_collection_stage(collected, stage, collected.element_type))
+	else if call.base == "filter_map" and call.args.length() == 2:
+		source ?= call.args.get(0)
+		callback ?= call.args.get(1)
+		collected ?= collect_collection_pipeline(source)
+		output_type ?= collection_list_element_type(core_expr_type(expr))
+		option_type: CoreType = NamedType("Option", [output_type])
+		stage: CoreCollectionPipelineStage = CollectionFilterMapStage(
+			callback,
+			collected.element_type,
+			output_type,
+			option_type,
+		)
+		Some(append_collection_stage(collected, stage, output_type))
+	else if call.base == "map" and call.args.length() == 2:
+		source ?= call.args.get(0)
+		callback ?= call.args.get(1)
+		collected ?= collect_collection_pipeline(source)
+		output_type ?= collection_list_element_type(core_expr_type(expr))
+		stage: CoreCollectionPipelineStage = CollectionMapStage(
+			callback,
+			collected.element_type,
+			output_type,
+		)
+		Some(append_collection_stage(collected, stage, output_type))
+	else:
+		element_type ?= collection_list_element_type(core_expr_type(expr))
+		Some({
+			source = CollectionListSource(expr, element_type),
+			stages = [],
+			cardinality = CollectionExactCardinality,
+			element_type = element_type,
+		})
+
+
+private pure func nonempty_collection_stages(
+	stages: List[CoreCollectionPipelineStage],
+) -> Option[CoreNonemptyCollectionPipelineStages]:
+	match stages:
+		[first, ...rest]:
+			Some({
+				first = first,
+				rest = rest,
+			})
+		[]:
+			None
+
+
+private pure func make_collection_pipeline_plan(
+	source: CoreCollectionPipelineSource,
+	stages: List[CoreCollectionPipelineStage],
+	sink: CoreCollectionPipelineSink,
+	cardinality: CoreCollectionPipelineCardinality,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreCollectionPipelinePlan]:
+	stage_chain ?= nonempty_collection_stages(stages)
+	Some({
+		source = source,
+		stage_chain = stage_chain,
+		sink = sink,
+		cardinality = cardinality,
+		result_type = result_type,
+		loc = loc,
+	})
+
+
+pure func collection_pipeline_plan(expr: CoreExpr) -> Option[CoreCollectionPipelinePlan]:
+	match collection_pipeline_call_base_and_args(expr):
+		Some(call):
+			if call.base == "fold_left" and call.args.length() == 3:
+				source ?= call.args.get(0)
+				initial ?= call.args.get(1)
+				reducer ?= call.args.get(2)
+				collected ?= collect_collection_pipeline(source)
+				make_collection_pipeline_plan(
+					collected.source,
+					collected.stages,
+					CollectionFoldSink(initial, reducer, core_expr_type(expr)),
+					CollectionTerminalCardinality,
+					core_expr_type(expr),
+					collection_expr_loc(expr),
+				)
+			else if call.base == "length" and call.args.length() == 1:
+				source ?= call.args.get(0)
+				collected ?= collect_collection_pipeline(source)
+				make_collection_pipeline_plan(
+					collected.source,
+					collected.stages,
+					CollectionLengthSink,
+					CollectionTerminalCardinality,
+					core_expr_type(expr),
+					collection_expr_loc(expr),
+				)
+			else:
+				collection_collect_plan(expr)
+		None:
+			collection_collect_plan(expr)
+
+
+private pure func collection_collect_plan(expr: CoreExpr) -> Option[CoreCollectionPipelinePlan]:
+	collected ?= collect_collection_pipeline(expr)
+	make_collection_pipeline_plan(
+		collected.source,
+		collected.stages,
+		CollectionCollectSink(core_expr_type(expr)),
+		collected.cardinality,
+		core_expr_type(expr),
+		collection_expr_loc(expr),
+	)
