@@ -839,8 +839,9 @@ Completed bootstrap-source deletions:
 
 The direct-source and generated in-memory compatibility compilers have been
 deleted, along with the preloaded-graph compile wrapper and their OCaml tests.
-The separately packaged `dev-5331666d5ec5` bootstrap is the build trust root;
-the current OCaml host no longer implements bootstrap compilation.
+The separately packaged immutable release named by `compiler/bootstrap.env` is
+the build trust root; the current OCaml host no longer implements bootstrap
+compilation.
 
 Do not delete yet:
 
@@ -858,10 +859,10 @@ Status: source-side separation is complete. `compiler/bootstrap.env` is the
 single checked-in release identity consumed by the resolver and CI cache keys.
 Release archives now preserve a dedicated `blorp-bootstrap-compiler` and its
 matching bootstrap-specific helper generation, while the resolver supports the
-old `blorp-ocaml-host` artifact name only for the currently pinned immutable
-toolchain. The pin intentionally remains unchanged until release CI publishes
-and verifies all three target artifacts; rotation and removal of the old-name
-fallback remain separate commits.
+old `blorp-ocaml-host` artifact name only for historical immutable toolchains.
+The manifest now names the latest revision-specific release whose three target
+artifacts were published and verified. Removal of the old-name fallback remains
+a separate change.
 
 Implementation:
 
