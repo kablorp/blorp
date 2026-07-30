@@ -1,8 +1,8 @@
 # Blorp Docs
 
-The top-level docs are for current, maintained project knowledge. Avoid adding
-long implementation diaries here; use issues, PR descriptions, or commit notes
-for history.
+Top-level documentation is maintained project knowledge. Git history, issues,
+pull requests, benchmark results, and commit messages hold completed
+implementation history.
 
 ## Learning
 
@@ -19,46 +19,21 @@ for history.
   ARC, and copy-on-write behavior.
 - [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) defines the compiler/runtime
   ownership ABI for managed values.
+- [CONCURRENCY_AND_RESOURCES.md](CONCURRENCY_AND_RESOURCES.md) defines
+  structured concurrency, virtual-thread, resource, stream, and networking
+  contracts.
 
 ## Compiler
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) is the source of truth for compiler
-  structure, Core pass order, and backend boundaries.
-- [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) tracks active compiler cleanup,
-  call-resolution, performance, and native-boundary work.
-- [COMPILER_PERCEUS_MEMORY_ROADMAP.md](COMPILER_PERCEUS_MEMORY_ROADMAP.md)
-  records the measured self-hosted compiler memory regression in global
-  reference/ownership handling and the staged plan to replace per-global Core
-  rewrites with resolved identities and per-body reference facts.
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) tracks the
-  aggressive OCaml-to-Blorp compiler migration, including explicit JSON
-  boundaries, current Blorp-owned CLI/parser and Core-tail edges, and
-  deletion-first merge points.
-- [BLORP_OCAML_HOST_EXIT_ROADMAP.md](BLORP_OCAML_HOST_EXIT_ROADMAP.md) is the
-  execution plan for replacing serialized CLI-plan delegation with one narrow
-  semantic-middle worker and moving artifact, C compiler, and program effects
-  into Blorp.
-- [COMPILER_OWNERSHIP_HARDENING_ROADMAP.md](COMPILER_OWNERSHIP_HARDENING_ROADMAP.md)
-  is the active checkpoint-10 plan for stabilizing the focused late-Core
-  surface before resuming production-boundary migration.
-- [FRONTEND_SOURCE_AST_ROADMAP.md](FRONTEND_SOURCE_AST_ROADMAP.md) details the
-  next contiguous frontend slice: raw parse vs typecheck-ready source AST,
-  interpolation finalization, nested function hoisting, and subscript-read
-  desugaring.
-- [FRONTEND_MODULE_SURFACE_ROADMAP.md](FRONTEND_MODULE_SURFACE_ROADMAP.md)
-  tracks the next contiguous frontend slice: Blorp-owned syntactic module
-  imports, exports, private names, and bridge/cache consumption.
-- [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md) records the completed
-  cursor/span parser utility migration, current Blorp frontend parser status,
-  and remaining parser/source-AST cleanup.
-- [TEST_SPEED_ROADMAP.md](TEST_SPEED_ROADMAP.md) tracks test-harness
-  simplification and speed work.
-
-## Runtime And Resources
-
-- [CONCURRENCY_AND_RESOURCES.md](CONCURRENCY_AND_RESOURCES.md) tracks
-  structured concurrency, virtual-thread behavior, scoped resources, streams,
-  and networking resource direction.
+  structure, phase ownership, Core pass order, and backend boundaries.
+- [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) contains current cross-cutting
+  priorities: migration, generated-program performance, compiler/test
+  performance, and semantic cleanup.
+- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) is the
+  detailed execution plan for finishing the OCaml-to-Blorp migration.
+- [STATIC_CONSTANT_EMISSION.md](STATIC_CONSTANT_EMISSION.md) documents the
+  current static constant representation and emission boundary.
 
 ## Releases
 
@@ -66,10 +41,16 @@ for history.
 
 ## Maintenance Rules
 
-- Keep reference docs aligned with implementation and tests in the same change.
-- Prefer one active roadmap per area. If a roadmap becomes mostly completed
-  progress notes, fold remaining decisions into the active roadmap and delete
-  the old file.
-- Link to source files and tests for details that can drift quickly.
-- Do not preserve pre-0.1 compatibility notes unless they help users understand
-  the current behavior.
+- Keep reference docs aligned with implementation and tests in the same
+  change.
+- Keep one concise active roadmap per area. A specialized plan is justified
+  only when it has an active owner, distinct completion criteria, and current
+  implementation work.
+- Delete completed or superseded roadmaps after moving durable contracts into
+  reference docs and remaining work into the active roadmap. Git is the
+  archive.
+- Put raw performance evidence in `benchmarks/results/`; keep only conclusions
+  that affect current decisions in roadmaps.
+- Link to source files and tests for facts that can drift quickly.
+- Do not preserve pre-0.1 compatibility notes unless they explain current
+  behavior.

@@ -1,421 +1,330 @@
 # Compiler Roadmap
 
-Status: active roadmap, reviewed 2026-07-02.
+Status: active, reviewed 2026-07-29.
 
-Use [ARCHITECTURE.md](ARCHITECTURE.md) for the live compiler pipeline and
-[OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the ownership ABI. This file tracks
-the next compiler work that is still valuable enough to keep visible.
+This document contains current compiler priorities only. It is not an
+implementation diary. Completed experiments and superseded plans belong in Git
+history, benchmark result files, issues, or pull requests.
 
-Use [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
-detailed OCaml-to-Blorp port plan, including explicit JSON boundaries,
-incremental deletion merge points, and the expectation that compiler stage
-logic is implemented as pure functions wherever possible.
+Use:
 
-Use
-[COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md](COMPILER_BOOLEAN_FIELD_LAYOUT_ROADMAP.md)
-for the incremental generated-C work on compact Boolean aggregate storage,
-foreign-ABI preservation, and alignment-aware internal record layout.
+- [ARCHITECTURE.md](ARCHITECTURE.md) for the production pipeline and ownership
+  of each stage;
+- [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the compiler/runtime ownership
+  ABI;
+- [MEMORY_MODEL.md](MEMORY_MODEL.md) for user-facing value semantics; and
+- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
+  detailed OCaml-to-Blorp migration sequence and deletion points.
 
-## Goals
+## Outcomes
 
-- Represent semantic facts directly instead of recovering them from names,
-  suffixes, optional payloads, or backend conventions.
-- Keep phase boundaries clear: parser syntax in the parser, semantic decisions
-  in inference/typecheck, representation decisions in Core, and C details in
-  the backend/runtime boundary.
-- Improve compiler-shaped runtime performance without weakening value semantics
-  or deterministic ownership.
-- Keep native boundaries auditable: runtime ABI, FFI metadata, generated C
-  escaping, ownership contracts, and security gates should be explicit.
+The compiler work should produce four outcomes:
 
-## Review Notes
+1. Compiler semantics and tools move to one Blorp-owned production path.
+2. Blorp programs become materially faster without changing source semantics.
+3. Compilation and test feedback become faster by doing less duplicate work.
+4. Semantic, ownership, representation, and native-boundary facts remain
+   explicit and mechanically checked.
 
-No objection to the overall direction. The important correction from reviewing
-the current code is that several roadmap concepts are already partially
-implemented:
+## Priority 1: Finish The OCaml-To-Blorp Migration
 
-- Source-level call metadata exists in `Ast.resolved_call` and typed expression
-  metadata.
-- Core call identity already crosses lowering through `CKSelectedDirect` and
-  `CKUser (name, def_id option)`.
-- Final Core already rejects `CKUnknown` and `CKSelectedDirect`; the remaining
-  work is to remove earlier fallback paths and make diagnostics/tools consume
-  the resolved facts consistently.
-- List producer handoff is already explicit in Core as `CListHandoff` with
-  `BorrowFresh` and `ConsumeReuse`, and the runtime has matching handoff
-  helpers. Reuse work should extend and measure this path, not rediscover reuse
-  from arbitrary loops.
-- The self-hosting path is active in `compiler/blorp` at both ends of the
-  compiler. The left edge owns CLI planning, source target expansion, source
-  graph discovery, source reads, lexing, parsing, and parsed-source artifact
-  encoding for the main source commands. The right edge owns the supported Core
-  tail through reuse, closure conversion, resource cleanup rewriting, fairness
-  checkpoint insertion, final preparation, prepared-union reuse, and C artifact
-  emission. Further migration should expand one of those production edges and
-  delete the matching OCaml implementation, not add optional parallel paths.
-
-## Active Workstreams
-
-### Semantic Call Identity
-
-Current state:
-
-- Typecheck/inference mints callable ids and attaches `resolved_call` metadata
-  to calls when the source target is known.
-- Blorp Core lowering preserves direct resolved calls as
-  `CKSelectedDirect <id>` so Core can use the source-selected target before
-  call resolution.
-- `compiler_core_resolve.brp` promotes selected and name-based calls to `CKUser (name,
-  Some def_id)` when it can prove the concrete target.
-- The Blorp C emitter already prefers DefId-based C names, but still has a
-  compatibility fallback for `CKUser (_, None)`.
-- Purity analysis and `purify` already know how to read resolved call metadata,
-  but still keep parse/env-based fallbacks for unresolved cases.
-
-The transitional layers still let the source AST, typed AST, Core, and tooling
-ask similar questions in different forms:
-
-- Which callable does this bare, qualified, UFCS, trait, operator, or
-  first-class call target?
-- What purity does the selected callable have?
-- Which source name should diagnostics and `purify` cite?
-- Which Core function or impl method should codegen retain and emit?
-
-Direction:
-
-- Treat inference/typecheck as the source-level resolver.
-- Carry stable callable identity through typed metadata where a call has a
-  direct target.
-- Keep closure and first-class calls explicit rather than pretending every call
-  has a direct source declaration.
-- Move `purify`, diagnostics, and Core lowering toward consuming typed
-  resolution facts instead of re-resolving names.
-- Shrink backend name lookup to cases that truly require backend knowledge.
-- Treat `CKUser (_, None)`, UFCS `#<def_id>` suffix parsing, and name-only
-  resolution as migration paths, not the desired steady state.
-
-Implementation order:
-
-1. Add focused compiler-unit coverage that counts or rejects newly introduced
-   `CKUser (_, None)` in resolver paths that should have DefIds.
-2. Tighten source-call coverage for bare, qualified, UFCS, overload-selected,
-   constructor, trait, and closure calls so each case documents whether a
-   concrete callable id should exist.
-3. Move remaining diagnostic and `purify` call classification toward
-   `resolved_call` first, with documented parse-only fallbacks for files that
-   cannot be typed.
-4. Remove legacy UFCS DefId suffix handoff once resolved-call metadata covers
-   the same call shapes.
-5. Remove `CKUser (_, None)` emission fallback when tests prove all user calls
-   reaching emit carry a DefId, except deliberately hand-built test Core.
-
-Required checks:
-
-- `Core_invariants` must keep rejecting `CKUnknown` and `CKSelectedDirect`
-  after specialization and at the final emission boundary.
-- A direct source call with typed `resolved_call` metadata must never lower as a
-  purely unknown call target.
-- UFCS and pure/impure overload resolution should select by callable identity,
-  not by generated-name suffixes.
-- Purity errors should cite the resolved target when one is known.
-
-### Core Pipeline Maintainability
-
-`compiler/lib/core_pipeline.ml` and `compiler/lib/core_stage.ml` are the source
-of truth for pass order. Roadmap work should avoid duplicating that order in
-new long-form docs.
-
-Current priorities:
-
-- Keep `compiler_core_dce.brp` conservative and identity-based. It prunes
-  unreachable emitted functions after generic templates and impl containers
-  have already been removed by the projected Core boundary, and closes the
-  projected type graph before pruning unused data declarations. Backend
-  artifacts are derived from the retained declarations.
-- Add new DCE only when the dependency edge is explicit. If in doubt, retain.
-- Split or instrument large aggregate stages before guessing where compile time
-  is going. The `Fusion` stage currently represents several full-program
-  traversals.
-- Avoid handwritten runtime ABI string maps when a typed operation manifest or
-  intrinsic contract can represent the boundary.
-- Keep final Core invariant checks focused on facts that must never reach C
-  emission: unresolved calls, unconverted closure/concurrency forms, invalid
-  ownership crossings, and unprepared erased storage.
-
-### Compile-Time Constants And CTFE
-
-Desired end state:
-
-- Immutable top-level bindings are constants. `NAME = expr` means the compiler
-  evaluates `expr` at compile time and materializes the result as ordinary
-  immutable global data.
-- There is no special `compile_time:` declaration form. The ordinary constant
-  syntax is the CTFE surface.
-- Mutable top-level `var` bindings are not constants. They must not hide runtime
-  startup work before `main`.
-- There is no expression-level CTFE form, no macros, no type generation, and no
-  second compile-time standard library.
-
-Source semantics:
-
-- Top-level constants evaluate in source order.
-- A constant may reference earlier constants and pure functions.
-- A constant may not reference itself or a later constant. Report this as a
-  dependency error, not as an evaluator accident.
-- Constant initializers must be pure and CTFE-compatible. Unsupported pure
-  operations are compile errors for constants, not runtime fallbacks.
-- Called pure functions may use local mutation, loops, recursion, pattern
-  matching, closures, and deterministic collection/tensor operations supported
-  by CTFE.
-- Visibility remains ordinary declaration visibility: `private NAME = expr`.
-  There is no special block-level visibility.
-
-Architecture:
-
-- Reuse the normal parser, import loading, name resolution, type inference,
-  purity checks, and runtime materialization path. CTFE consumes typed facts; it
-  must not recover semantics from source spelling, generated names, or backend
-  conventions.
-- Run CTFE after typecheck/purity and before Core lowering. Core and codegen
-  should see ordinary immutable global initializers after rewrite.
-- Keep the Blorp CTFE IR in `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_ir.brp` as the
-  evaluator boundary. Typed AST is still too broad for execution, while full
-  Core is broader than CTFE currently needs.
-- Keep compiler-owned std/builtin behavior behind the Blorp CTFE intrinsic
-  layer in `compiler/blorp/src/stage_07_ctfe/compiler_ctfe_intrinsic.brp`. Each supported
-  operation should have a named intrinsic identity and one evaluator entry.
-- Keep top-level initializer policy centralized in
-  `Top_level_initializer`: immutable constants require CTFE; mutable globals
-  reject hidden startup calls.
-- Prefer explicit CTFE value variants and IR call kinds over optional metadata
-  with hidden coupling.
-
-Current checkpoint:
-
-- The OCaml CTFE implementation has been retired. The `typecheck_source` bridge
-  rewrites source-order immutable globals through the Blorp CTFE evaluator and
-  reports unsupported CTFE as frontend diagnostics.
-- Immutable globals are semantically required CTFE now; unsupported pure
-  operations are compile errors instead of best-effort runtime fallbacks.
-- Private constants referenced only by later constants are treated as CTFE
-  scratch and can be omitted from generated runtime data.
-- `compiler_ctfe_ir.brp` classifies expressions, function references, call kinds,
-  constructors, field access, tuple/range access, vectors, lists, dicts,
-  records, and control flow before evaluation.
-- CTFE function values wrap typed functions with lazy cached IR bodies, so
-  unsupported function bodies are rejected only when compile-time evaluation
-  calls them.
-- CTFE environments explicitly distinguish evaluated globals from the current
-  global, later globals, runtime-initialized globals, and imported globals that
-  are not compile-time constants. Dependency diagnostics are no longer lookup
-  misses.
-- Materialization rewrites evaluated scalar, string, tuple, list, vector, dict,
-  record, range, and constructor values back into ordinary typed initializer
-  expressions.
-- CTFE supports enough deterministic std/builtin behavior for useful constants:
-  string byte helpers, list/dict/option/result helpers, vector/tensor literals,
-  tensor constructors, tensor subscript reads, tensor length, and matrix shape
-  counts.
-- Codegen audit coverage checks that CTFE-only builder functions are absent from
-  generated C for materialized constants.
-- `compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp` now dogfoods ordinary
-  top-level constants for derived intrinsic lookup/manifest data.
-- Static emission currently supports strings, pointer-storage lists whose
-  elements are supported static values, integer-like inline primitive literal
-  lists, `List[Float]`, `List[Float32]`, `List[Float16]`, non-generic records,
-  ordinary generic record/struct instantiations, and ordinary concrete generic
-  union constants whose payloads are in the supported static-value subset. It
-  also supports tuple constants whose pointer, primitive literal,
-  floating-point literal, and void erased slots can be emitted as C static
-  initializers, plus stack `Result` constants whose Ok/Err payload slot can use
-  the same static boxed-slot subset.
-  Ordinary generic unions now get concrete instantiated type identities, typed
-  ordinary payload storage, source template pruning, and static emission for
-  supported constant payloads.
-- The old `compile_time:` parser, AST, formatter, LSP, typed AST, and CTFE
-  block expansion paths have been removed.
-
-Next implementation slices:
-
-- Audit std, `compiler/blorp`, examples, and scratch programs for constants
-  that still need CTFE support. Add narrow intrinsics or rewrite the constants;
-  do not reintroduce best-effort runtime fallback.
-- Extend static emission beyond the current string/list/tuple/record/union
-  subset: inline-struct lists, tuple slots that require heap boxes,
-  dicts/sets, tensors, and erased dynamic-boundary values where there is an
-  explicit typed bridge.
-- Keep moving semantic normalization out of the evaluator and into Blorp CTFE IR
-  translation where it can be represented explicitly.
-- Dogfood compiler-owned tables in `compiler/blorp` once ordinary constants can
-  express the required data without a special block.
-
-### Core Pipeline Profiling And Invariants
-
-Implementation order:
-
-1. Measure pass-group time before splitting a stage. The Blorp CLI compile
-   worker already records phase timings; use those measurements before
-   optimizing aggregate stages.
-2. Split the `Fusion` observed stage only if measurements show that string,
-   collection, tensor, or tuple SROA work needs independent visibility.
-3. Keep Blorp-tail-internal safety/finalization passes out of `Core_stage`
-   unless user-facing dump/stop/profile behavior genuinely needs them.
-4. When adding new IR checks, prefer a named invariant in
-   `core_invariants.ml` over local assertions in emit.
-
-### Ownership And Reuse Performance
-
-Self-hosting will stress compiler-shaped data: AST construction, traversal,
-rewriting, and destruction. The important performance gap is structural
-allocation churn, not only atomic reference count overhead.
-
-Current state:
-
-- Perceus inserts explicit `CDup` and `CDrop` ownership operations before
-  reuse.
-- The Blorp reuse pass already upgrades explicit list producer handoffs from
-  `BorrowFresh` to `ConsumeReuse` when it can consume the matching
-  post-Perceus drop.
-- `CListHandoff` carries the source/result variables, capacity, layout, result
-  type, and forward-compacting write policy. Runtime helpers preserve source
-  reads while allowing storage reuse when uniqueness and layout checks pass.
-- Compiler benchmarks now include `compiler_ast`, `compiler_symbols`, and
-  `compiler_emit`, which are the right pressure tests for self-hosting.
-
-Most promising path:
-
-1. Make managed allocation sites visible before reuse without tying the fact to
-   one C representation.
-2. Specialize narrow consuming-call patterns where an owned argument is dead
-   immediately after the call.
-3. Add owned match and field-move semantics for values that can be safely
-   destructured without retaining every payload.
-4. Reuse union and record allocations only when type, layout, and liveness facts
-   are explicit.
-5. Consider compact scalar union variants after the ownership model can prove
-   the representation is safe.
+The migration remains the first architectural priority. It removes duplicated
+implementations, JSON/process boundaries, and the need to reason about two
+ownership models while changing the compiler.
 
 Rules:
 
-- Reuse must be a proven optimization, not a semantic distinction.
-- If a candidate might be observed again, allocate a fresh value.
-- Resource scopes, cancellation cleanup, and external capabilities are reuse
-  barriers unless a later pass has explicit facts that make reuse safe.
-- Every ownership optimization needs leak-check and generated-C inspection for
-  success, early return, and error paths.
+- Move one contiguous production responsibility at a time.
+- Delete the replaced OCaml implementation in the same change when its last
+  production and test caller is gone.
+- Do not add an optional Blorp path beside an authoritative OCaml path.
+- Keep one typed boundary around the remaining semantic middle.
+- Port tools only after the parser, typechecker, and compiler services they
+  consume are Blorp-owned.
+- Keep the immutable released bootstrap separate from the compiler being
+  built.
 
-Implementation order:
+The current boundary, remaining OCaml inventory, exact checkpoints, tests, and
+deletion conditions live only in
+[BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
 
-1. Establish baseline numbers for `compiler_ast`, `compiler_symbols`, and
-   `compiler_emit` with `BENCH_RUNS` high enough to smooth noise, plus Blorp
-   allocation counters where applicable.
-2. Use generated Core and generated C inspection to identify which allocations
-   are still unavoidable versus missing reuse facts.
-3. Extend explicit producer handoff only where the Core node can state the
-   collection family, layout, source/result element ownership, capacity bound,
-   and write-order policy.
-4. Prefer targeted handoffs for common compiler-shaped operations over a
-   general loop-reuse recognizer.
-5. Add regression tests at the ownership boundary: no reuse with later source
-   use, no reuse across closures/tasks/resources, no wrong destructor reuse,
-   and no leak on early return or branchy producer bodies.
+## Priority 2: Runtime Performance Without Surface Changes
 
-Do not optimize by making public borrow-preserving APIs secretly consume their
-receiver. Public API semantics stay simple; compiler-selected reuse remains an
-explicit internal Core boundary.
+Blorp's existing surface already provides strong optimization facts:
+monomorphized generics, purity, immutable values, explicit local mutation,
+structured concurrency, static tensor shapes, and ownership-aware Core. The
+performance plan should exploit those facts rather than add user-visible
+optimization syntax.
 
-### Self-Hosting Slices
+### Planning Targets
 
-Current state:
+These are targets, not measured claims:
 
-- `compiler/blorp` contains the active bridge dispatchers, typed Core JSON
-  codecs, renderer modules, the Blorp CLI planner/source graph frontier, the
-  Blorp lexer/parser, and the supported Core-tail path.
-- OCaml still owns command execution, artifact writing, C compiler invocation,
-  module validation, embedded std/package authority, inference/typecheck, Core
-  lowering, and the middle Core pipeline through Perceus.
-- `compiler/blorp/tests` checks parser, CLI frontier, bridge, renderer, and
-  direct compiler-slice behavior. The detailed deletion-first port plan lives
-  in [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
+| Workload | Realistic improvement over the current compiler |
+| --- | ---: |
+| Broad mixed benchmark suite | 1.5-2x |
+| Strong broad-suite stretch | 2-2.5x |
+| Tight scalar and numeric loops | 1.05-1.3x |
+| String and collection pipelines | 1.5-3x |
+| Closure and higher-order-function-heavy code | 1.3-2.5x |
+| Persistent records, trees, and AST rewrites | 2-5x |
+| Pathological allocation or nonlinear work | 5x or more |
+| Allocation-heavy peak memory | 30-70% lower |
 
-Direction:
+Do not turn these ranges into release claims until the audited benchmark suite
+has comparable before/after results.
 
-- Stop treating Blorp compiler code as optional helper code. New slices should
-  expand a contiguous production pipeline region and delete the corresponding
-  OCaml implementation where practical.
-- Keep one bridge subsystem and one protocol envelope. The current compile path
-  can cross it at the Blorp parser/source frontier and again at the Blorp Core
-  tail while the OCaml middle remains, but new side channels are migration debt.
-- Prefer work that shrinks the OCaml middle from either contiguous edge:
-  parser/source-AST cleanup and typecheck frontier work on the left, or
-  ownership/middle-Core work on the right.
-- Choose slices by OCaml deletion potential, not by ease of adding more Blorp
-  scaffolding.
+### Measurement Contract
 
-Implementation order:
+Before the first optimization slice:
 
-1. Finish parser/source-AST cleanup by retiring remaining parser-adjacent OCaml
-   transforms or making their boundaries explicit.
-2. Move module validation and type infrastructure toward consuming the Blorp
-   frontend module graph directly.
-3. Continue the backend edge through consume-specialize and Perceus so the Core
-   tail handoff can move before ownership insertion.
-4. Delete bridge/bootstrap/template compatibility debt as soon as no active
-   production caller needs it.
-5. Keep stage observation and test-speed work aligned with the production path,
-   not with retired optional implementations.
+1. Record release-mode baselines for the comparable rows in
+   `benchmarks/bench.sh`, including `compiler_ast`, `compiler_symbols`, and
+   `compiler_emit`.
+2. Use at least five timed runs after warmup for latency decisions.
+3. Record output checksums, allocation/release counts where available, peak
+   memory for allocation-heavy rows, generated-C size, compiler revision,
+   target, C compiler, and relevant thread settings.
+4. Store durable raw measurements under `benchmarks/results/`.
+5. Compare one optimization at a time. Do not attribute a combined result to
+   several unmeasured changes.
 
-### Native Boundary And Security
+The broad planning target is a 1.7x mixed-suite improvement with 40-60% fewer
+allocations in allocation-heavy programs. A measured 2x broad-suite
+improvement is a strong result. Larger wins should be described as
+workload-specific.
 
-The active security focus is not a sandbox. It is hardening the compiler-owned
-native boundary:
+### Workstream A: Ownership-Aware Reuse
 
-- runtime C memory safety;
-- OS C-string conversion and embedded-NUL rejection;
-- cryptographic randomness and hash seeding;
-- FFI metadata validation;
-- generated C escaping and name hygiene;
-- explicit ownership contracts for runtime builtins.
+This is the highest-value first target for compiler-shaped programs.
 
-The narrow gate is:
+Current foundations:
 
-```bash
-make security-check
-```
+- Perceus inserts explicit `CDup` and `CDrop`.
+- Read-only parameters borrow rather than retaining on entry.
+- COW-consuming operations use explicit ownership contracts.
+- The reuse pass can consume proven drops and upgrade narrow list, dict, set,
+  and producer-handoff allocations.
 
-Keep this gate focused. Broad fuzzing, sandboxing, package trust, and capability
-policy are separate projects unless they block the current native-boundary
-invariants.
+Next steps:
 
-## Execution Rules
+1. Move legacy global-reference repair out of Perceus and into
+   `compiler_core_resolve`.
+2. Carry exact per-body and per-lambda global-reference facts so ownership
+   scans visit only referenced values.
+3. Re-profile call-contract annotation, borrowed-call protection,
+   aggregate/result retention, summaries, drops, consumed-value balancing,
+   and nested-lambda normalization. Consolidate a traversal only when measured
+   evidence shows it is material.
+4. Make managed allocation sites explicit before reuse analysis.
+5. Specialize calls where an owned argument is dead immediately after the
+   call.
+6. Add owned match and field-move semantics when the source owner is dead.
+7. Reuse compatible record and union storage when type, layout, liveness, and
+   destructor facts are explicit.
+8. Broaden collection handoffs only when Core can state read/write order,
+   element ownership, capacity, and fallback behavior.
 
-- Add a failing parser, typecheck, compiler-unit, runtime, leak, or codegen
-  audit test before changing behavior.
-- Update [GUIDE.md](GUIDE.md) and [GRAMMAR.md](GRAMMAR.md) in the same change
-  when syntax, diagnostics, or user-facing behavior changes.
-- Prefer explicit typed variants, phase-specific records, operation manifests,
-  and Core nodes over booleans, string tags, nullable payloads, or comments that
-  describe invariants the type system could carry.
-- Re-measure performance claims with `benchmarks/bench.sh`, `--profile`,
-  allocation/release counts, or generated C size as appropriate.
-- For compiler-performance work, report the benchmark command, the machine
-  controls that matter (`BENCH_RUNS`, `BENCH_ALLOC_STATS`, thread counts), and
-  at least one before/after number.
+Public borrow-preserving operations must not secretly consume their receivers.
+Reuse is an internal optimization guarded by compile-time liveness and runtime
+uniqueness.
 
-## Near-Term Queue
+### Workstream B: Escape Analysis And Scalar Replacement
 
-1. Build on the completed parser/source-AST ownership cleanup named in
-   [PARSER_API_ROADMAP.md](PARSER_API_ROADMAP.md) by moving the next semantic
-   frontend boundary into Blorp.
-2. Start moving module/type infrastructure behind the Blorp frontend module
-   graph boundary, with direct parity tests before deleting OCaml modules.
-3. Continue the backend edge by completing the Perceus/consume-specialize port
-   and moving the default Core handoff left when leak and stage-parity tests are
-   ready.
-4. Baseline `compiler_ast`, `compiler_symbols`, and `compiler_emit` with timing
-   and allocation counters before large Core or frontend ports.
-5. Add resolver/emitter tests that make accidental `CKUser (_, None)` fallback
-   visible for ordinary source calls.
-6. Audit remaining UFCS DefId suffix paths and decide which source-call shapes
-   still rely on them.
-7. Keep native-boundary hardening inside the existing security gate.
+Heap allocation is currently conservative: record updates construct fresh
+records, captured closures allocate, and vectors are heap-backed.
+
+Implement escape facts for:
+
+- nonescaping records, unions, tuples, and closures;
+- short-lived aggregate temporaries;
+- captured values whose closure does not escape;
+- fixed-shape tensor/vector temporaries; and
+- aggregate values immediately destructured by a match or field read.
+
+Use those facts to stack-allocate, scalar-replace, or eliminate values. Keep
+resource values, task captures, foreign-visible values, recursive storage, and
+unknown closure escapes as barriers.
+
+### Workstream C: Inlining And Closure Devirtualization
+
+Monomorphization already supplies concrete function bodies, but ordinary std
+inlining is narrow and first-class calls often retain the general closure ABI.
+
+Add:
+
+1. direct-call conversion for statically known closure targets;
+2. cost-based inlining for small monomorphic pure functions;
+3. specialization of callback-heavy collection operations; and
+4. post-inline cleanup so C receives simple loops and scalar expressions.
+
+Inlining should be budgeted by generated-C growth. Compile time and artifact
+size are acceptance metrics, not afterthoughts.
+
+### Workstream D: Pipeline And Loop Optimization
+
+Extend the existing string, collection, tensor, and tuple optimization passes
+instead of adding a second optimizer.
+
+Targets:
+
+- fuse common `map`/`filter`/`filter_map`/`fold`/`zip` combinations;
+- remove intermediate strings and builder copies;
+- eliminate proven bounds checks and repeated length reads;
+- hoist loop-invariant ownership and layout checks;
+- expose vectorizable loops and static tensor kernels to C;
+- add Float32/Float16 vector paths where target support justifies them; and
+- avoid fairness work in loops that cannot participate in concurrent
+  scheduling, while preserving structured-concurrency semantics.
+
+Each fusion must preserve callback count, callback order, error behavior,
+resource cleanup, and source-level ownership.
+
+### Workstream E: Representation And Runtime
+
+Continue representation work only when it removes measured traffic:
+
+- inline concrete values across currently erased storage boundaries;
+- compact eligible scalar union payloads;
+- avoid boxes for concrete generic values;
+- improve fixed-shape vector/tensor storage;
+- use thread-local or non-atomic ownership operations only when escape facts
+  prove that an object cannot cross a concurrency boundary; and
+- consider LTO or profile-guided native compilation after generated C is
+  structurally sound.
+
+Allocator tuning, larger freelists, or arenas are not the first lever. Prior
+memory investigations found low fragmentation and excessive object creation;
+reducing work and allocations had much larger impact than changing the
+allocator.
+
+### Evidence That Guides This Plan
+
+Existing compiler workloads show the expected range:
+
+- Removing an irrelevant-global whole-body multiplier made the bounded
+  Perceus fixture about 86% faster and reduced peak RSS about 81%.
+- Cached nominal containment summaries improved repeated deep-type probes by
+  7.7-37.1%.
+- Proven-empty resource scan preflights improved focused probes by 9.5-12.1%.
+- Reusing already-typechecked CTFE artifacts reduced a measured compiler slice
+  by 11.8% and peak RSS by 19.2%.
+
+The lesson is consistent: ordinary local improvements are usually incremental,
+while removing structural rebuilding, intermediate collections, and ownership
+churn can produce multi-fold gains.
+
+## Priority 3: Compilation And Test Feedback
+
+Compiler and test performance must improve without hiding work behind stale
+caches or weakening coverage.
+
+Current direction:
+
+1. Measure cold build, warm build, source check, compiler-owned suite compile,
+   and default/deep gate times from a clean revision.
+2. Use phase timings to identify graph construction, parsing, typechecking,
+   Core stages, JSON/process boundaries, C emission, and native compilation.
+3. Remove duplicate graph preparation, typechecking, serialization, and helper
+   startup where one typed in-process value can cross the next phase.
+4. Complete the compiler migration so large JSON bridge payloads and helper
+   processes disappear rather than optimizing the bridge indefinitely.
+5. Keep normal gates focused and keep expensive coverage explicit in
+   deep/premerge gates.
+6. Batch compiler-owned test suites only at semantic isolation boundaries, not
+   arbitrary file-count thresholds.
+7. Preserve visible cache keys, invalidation inputs, and uncached correctness
+   paths.
+
+When a profile identifies nonlinear symbol, type, or Core traversal, fix the
+algorithm before tuning allocation. Function-body materialization, recursive
+type-shape work, call lookup, and repeated immutable tree rebuilding deserve
+focused scaling fixtures.
+
+## Priority 4: Semantic And Boundary Cleanup
+
+These remain active but should not grow separate roadmap files.
+
+### Stable Call Identity
+
+- Treat inference/typecheck as the source-level call resolver.
+- Carry direct callable identity through typed metadata and Core.
+- Keep closure and first-class calls explicit.
+- Remove name-only and generated-name-suffix fallbacks once coverage proves
+  that ordinary source calls carry definition identities.
+- Make diagnostics and `purify` consume resolved facts rather than re-resolve
+  names.
+
+### Constants And CTFE
+
+- Keep ordinary immutable top-level bindings as the only CTFE surface.
+- Extend static emission for dicts, sets, tensors, inline-struct lists, and
+  explicitly typed erased-boundary values.
+- Keep unsupported constant evaluation as a compile error rather than a hidden
+  runtime fallback.
+- Move semantic normalization into typed CTFE IR instead of inspecting source
+  spelling.
+
+### Native Boundary
+
+- Keep runtime ownership contracts and operation metadata exhaustive.
+- Reject embedded NULs and invalid FFI metadata before C emission.
+- Preserve generated-C escaping, identifier hygiene, sanitizer coverage, and
+  platform-specific ABI tests.
+- Keep security work in `make security-check`; do not mix a broader sandbox or
+  package-trust design into compiler optimization work.
+
+## Known Holes
+
+- The project does not yet have a retained, current broad-suite geometric-mean
+  runtime baseline. The performance ranges above are planning estimates until
+  that baseline exists.
+- `std/parser.brp` keeps `Span` fields flattened because nested record payloads
+  previously corrupted values across generic closure/list boundaries. Do not
+  restore nested cursors without a minimized compiler regression and ownership
+  fix.
+- The production typecheck command still returns rendered diagnostic strings
+  at some tool boundaries. Structured source spans are required before doctest
+  and LSP remapping can be fully Blorp-owned.
+- Closure calls, loop/try/detach liveness, and structured-concurrency result
+  handoff remain conservative ownership boundaries. General reuse or
+  non-atomic RC must not cross them without explicit escape facts.
+- Perceus still performs legacy global-reference repair internally. Resolution
+  should own that fact, and ownership passes should consume exact per-body and
+  per-lambda reference sets instead of rediscovering them.
+- The post-string-fusion semantic-middle bridge still serializes large Core
+  graphs through a helper process. Finishing that migration should precede
+  elaborate bridge-specific optimization.
+
+## Completed Foundations
+
+The following are current architecture, not active roadmaps:
+
+- Blorp-owned parsing, source-AST finalization, and module-surface extraction;
+- the cursor/span parser API;
+- focused late-Core ownership stabilization and sanitizer coverage;
+- compact internal Boolean and explicit-enum field storage with foreign ABI
+  preservation;
+- the bounded irrelevant-global Perceus multiplier correction, while phase
+  ownership of global-reference repair remains active work;
+- explicit normal versus deep test gates and reusable typecheck sessions; and
+- released immutable bootstrap toolchains with checksummed target artifacts.
+
+Maintain their contracts in architecture, ownership, benchmark, and test
+documentation. Do not recreate implementation diaries for them.
+
+## Slice Acceptance
+
+Every roadmap slice must:
+
+1. State one behavioral invariant or measured bottleneck.
+2. Add a failing regression first when behavior changes.
+3. Preserve one authoritative production implementation.
+4. Inspect generated Core or C for ownership, representation, or codegen work.
+5. Record comparable before/after numbers for performance claims.
+6. Pass focused tests, relevant sanitizer/leak gates, `make quality`, and
+   `git diff --check`.
+7. Update current reference documentation in the same change.
+
+If a proposed optimization cannot meet those conditions, narrow it before
+implementation.

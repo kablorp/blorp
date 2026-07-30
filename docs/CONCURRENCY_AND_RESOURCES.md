@@ -1,6 +1,6 @@
 # Concurrency And Resources
 
-Status: current contract plus active roadmap.
+Status: current contract with explicit open design boundaries.
 
 This document consolidates the concurrency, virtual-thread, streaming resource,
 and networking resource direction. Use [GUIDE.md](GUIDE.md) for user-facing

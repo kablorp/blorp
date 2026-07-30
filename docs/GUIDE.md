@@ -1852,7 +1852,8 @@ must come from producer calls rather than copies of existing source locals, and
 must not be discarded or returned from concurrent tasks. The
 sequential iteration syntax for resource sources transfers each produced
 resource into a scoped loop body that owns cleanup. Concurrent resource-source
-iteration is still part of the concurrency and resource roadmap.
+iteration remains an open design boundary and is not supported until ownership
+and cancellation cleanup are explicit.
 `net/tcp.connections_stop_on_error` and
 `net/tcp.connections_continue_on_error` already expose the TCP producer shape as
 ARC-owned source wrappers that borrow their scoped listener and have type
@@ -2676,10 +2677,9 @@ func fiber_example(items: List[Int]) -> List[Result[Int, ConcurrencyError]]:
     )
 ```
 
-Fibers are transparent to user code — no API changes needed. During the
-concurrency migration, `limit` uses the existing scheduler-width machinery; the
-roadmap tightens it into a per-loop active-task cap while keeping statement
-fan-out and value collection as separate source forms.
+Fibers are transparent to user code — no API changes needed. `limit` is the
+per-loop active-task cap; statement fan-out and value collection remain
+separate source forms.
 
 ### Pipeline Example
 
