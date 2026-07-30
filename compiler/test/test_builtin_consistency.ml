@@ -432,34 +432,6 @@ let test_type_metadata_classifies_typechecker_policy () =
     "Bool match space is closed" false
     (Type_metadata.is_open_exhaustiveness_scalar_name "Bool")
 
-let test_type_metadata_splits_operator_and_to_string_fallbacks () =
-  let open Blorp in
-  let open Ast in
-  let list_int = TyNamed ("List", [ TyNamed ("Int", []) ]) in
-  let tensor_int = TyArray (TyNamed ("Int", []), [ TyConstInt 4 ]) in
-  Alcotest.(check bool)
-    "Int has native operator fast path" true
-    (Type_metadata.has_native_operator_fast_path_type (TyNamed ("Int", [])));
-  Alcotest.(check bool)
-    "Tensor has native operator fast path" true
-    (Type_metadata.has_native_operator_fast_path_type tensor_int);
-  Alcotest.(check bool)
-    "List operators must dispatch through traits" false
-    (Type_metadata.has_native_operator_fast_path_type list_int);
-  Alcotest.(check bool)
-    "List still has builtin to_string fallback" true
-    (Type_metadata.has_builtin_to_string_fallback_type list_int);
-  Alcotest.(check bool)
-    "StringSlice dispatches through its Stringable impl" false
-    (Type_metadata.has_builtin_to_string_fallback_type
-       (TyNamed ("StringSlice", [])));
-  Alcotest.(check bool)
-    "Url dispatches through its Stringable impl" false
-    (Type_metadata.has_builtin_to_string_fallback_type (TyNamed ("Url", [])));
-  Alcotest.(check bool)
-    "User record has no builtin to_string fallback" false
-    (Type_metadata.has_builtin_to_string_fallback_type (TyNamed ("Widget", [])))
-
 let test_builtin_metadata_classifies_special_inference () =
   let open Blorp.Builtin_metadata in
   let pp_special_inference fmt = function
@@ -1967,9 +1939,6 @@ let suite =
           `Quick test_builtin_effect_metadata_classifies_typechecker_sets;
         Alcotest.test_case "type metadata classifies typechecker policy" `Quick
           test_type_metadata_classifies_typechecker_policy;
-        Alcotest.test_case
-          "type metadata separates operator and to_string fallbacks" `Quick
-          test_type_metadata_splits_operator_and_to_string_fallbacks;
         Alcotest.test_case "builtin metadata classifies special inference"
           `Quick test_builtin_metadata_classifies_special_inference;
         Alcotest.test_case "builtin metadata registry integrity" `Quick

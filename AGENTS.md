@@ -463,7 +463,6 @@ compiler/            # OCaml compiler implementation
     core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client
     core_pipeline.ml  # Remaining post-synthesis OCaml middle orchestration
     core_emit_util.ml, core_emit_layout.ml  # Shared late-backend helpers
-    core_intrinsic_registry.ml  # Intrinsic manifest and contracts
     core_invariants.ml  # Stage-boundary invariant checks
     core_error.ml     # Core IR structured errors
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck

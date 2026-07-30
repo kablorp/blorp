@@ -178,8 +178,8 @@ let string_prelude_builtins =
     ((N.mod_string, "codepoint_reverse"), "blorp_codepoint_reverse");
   ]
 
-(* String builtins without prelude aliases. Structural length resolves through
-   Core_intrinsic_registry.ir_backed_std_functions, not CKBuiltin. *)
+(* String builtins without prelude aliases. Structural length is resolved by
+   the Blorp Core builtin registry, not CKBuiltin. *)
 let string_internal_builtins =
   [
     ((N.mod_string, "get"), "blorp_string_get_opt");
@@ -452,31 +452,6 @@ let lookup =
   fun module_path func_name ->
     let h = Lazy.force tbl in
     Hashtbl.find_opt h (module_path, func_name)
-
-(** Look up a builtin from the compiler-generated prefixed source name
-    ([std_stream__from_list], [std_dict__get], ...).
-
-    This is intentionally derived from [builtin_c_mapping] rather than
-    guessing from arbitrary prefixes. It exists for the resolver boundary where
-    imported [CVar] children may already have been rewritten to their canonical
-    module-qualified source name before the surrounding [CCall] is tagged. *)
-let lookup_prefixed =
-  let tbl =
-    lazy
-      (let h = Hashtbl.create (List.length builtin_c_mapping) in
-       List.iter
-         (fun ((module_path, func_name), c_name) ->
-           if module_path <> "" then
-             let prefixed =
-               Codegen_names.sanitize_module_name module_path ^ "__" ^ func_name
-             in
-             Hashtbl.replace h prefixed c_name)
-         builtin_c_mapping;
-       h)
-  in
-  fun prefixed_name ->
-    let h = Lazy.force tbl in
-    Hashtbl.find_opt h prefixed_name
 
 (** Recover the runtime target of a bodyless Core builtin declaration.
     Call-site resolution is Blorp-owned; the OCaml emitter still needs this

@@ -164,21 +164,6 @@ let rec zonk_type ?sess (ty : type_expr) : type_expr =
   | TyDimOp (op, a, b) -> TyDimOp (op, zonk_type ~sess a, zonk_type ~sess b)
   | _ -> ty
 
-(** Does [ty] still contain any inference-only metavariable? This is a
-    phase-boundary predicate: typed frontend output must be zonked before Core
-    lowering, and later phases should never see [TyMeta]. *)
-let rec contains_meta (ty : type_expr) : bool =
-  match ty with
-  | TyMeta _ -> true
-  | TyNamed (_, args) -> List.exists contains_meta args
-  | TyArray (elem, dims) -> contains_meta elem || List.exists contains_meta dims
-  | TyFunc { params; return; _ } ->
-      List.exists contains_meta params || contains_meta return
-  | TyTuple elems -> List.exists contains_meta elems
-  | TyRange inner -> contains_meta inner
-  | TyDimOp (_, a, b) -> contains_meta a || contains_meta b
-  | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ -> false
-
 (** Stdlib modules provide a small set of runtime/language ABI type names
     that must remain globally stable. Other std-local records/unions/aliases
     use the same owner-qualified identity as user modules so same-named std
@@ -1223,11 +1208,7 @@ let int_type_range = function
   | "UInt128" -> (Int64.zero, Int64.max_int) (* approximate *)
   | n -> failwith (Printf.sprintf "int_type_range: not an integer type: %s" n)
 
-(** All float type names *)
 let all_float_type_names = [ "Float"; "Float32"; "Float16" ]
-
-(** Check if a type is any float type (Float or Float32) *)
-let is_any_float_type = is_named_type_in all_float_type_names
 
 (** Check if a type is Float32 *)
 let is_float32_type = is_named_type_in [ "Float32" ]

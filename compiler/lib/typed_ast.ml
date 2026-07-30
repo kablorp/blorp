@@ -184,6 +184,7 @@ type error =
   | InvalidTypeInfo of { loc : Ast.loc; context : string; message : string }
 
 let ast (expr : expr) = expr.ast
+let type_info (expr : expr) = expr.info
 let func_ast (func : func_decl) = func.ast_func
 let func_info (func : func_decl) = func.info
 let func_param_infos (func : func_decl) = func.info.param_infos
@@ -209,33 +210,10 @@ let decl_view decl =
   | PrivateDecl inner -> DeclPrivate inner
   | NonFunctionDecl -> DeclOther
 
-let rec decl_func decl =
-  match decl.decl_info with
-  | FunctionDecl func -> Some func
-  | VarDecl _ -> None
-  | RecordDecl _ -> None
-  | TypeAliasDecl _ -> None
-  | ImplDecl _ -> None
-  | PrivateDecl inner -> decl_func inner
-  | NonFunctionDecl -> None
-
 let program_ast program = program.ast_program
 let program_decls program = program.typed_decls
-let loc (expr : expr) = expr.ast.expr_loc
-let type_info (expr : expr) = expr.info
 let impl_ast (impl : impl_decl) = impl.ast_impl
 let impl_methods (impl : impl_decl) = impl.typed_methods
-
-let type_info_to_ast (info : type_info) : Ast.expr_type_info =
-  {
-    source_ty = info.source_ty;
-    semantic_ty = info.semantic_ty;
-    value_ty = info.value_ty;
-    origin = info.origin;
-    widening = info.widening;
-    proofs = info.proofs;
-    resolved_call = info.resolved_call;
-  }
 
 let type_info_of_ast (info : Ast.expr_type_info) : type_info =
   {
@@ -248,9 +226,6 @@ let type_info_of_ast (info : Ast.expr_type_info) : type_info =
     resolved_call = info.resolved_call;
   }
 
-let type_info_source_type (info : type_info) = info.source_ty
-let type_info_origin (info : type_info) = info.origin
-let type_info_proofs (info : type_info) = info.proofs
 let expr_resolved_call (expr : expr) = expr.info.resolved_call
 
 let semantic_type (expr : expr) = expr.info.semantic_ty
@@ -335,23 +310,6 @@ let validate_type_info ~loc ~context (info : type_info) =
   let* () = validate_type_origin ~loc ~context info.origin in
   validate_widening_decision ~loc ~context info
 
-let make_type_info ?source_ty ?(origin = Inferred) ?resolved_call
-    ?(proofs = Type_proof_metadata.unproven_expr) ~loc ~context ~semantic_ty
-    ~value_ty ~widening () =
-  let info =
-    {
-      source_ty;
-      semantic_ty;
-      value_ty;
-      origin;
-      widening;
-      proofs;
-      resolved_call;
-    }
-  in
-  let* () = validate_type_info ~loc ~context info in
-  Ok info
-
 let type_info_from_ast_type_info ~loc ~context (info : Ast.expr_type_info) =
   let typed_info = type_info_of_ast info in
   let* () = validate_type_info ~loc ~context typed_info in
@@ -373,6 +331,9 @@ let of_ast_expr_shallow ?(context = "expression type") ast =
       Ok { ast; info }
   | Some _, None -> Error (MissingExprTypeInfo { loc = ast.expr_loc; context })
 
+(* Known diagnostic gap: this generic preflight runs before declaration-specific
+   shallow validation, so root failures report "expression type". Preserving
+   precise nested contexts requires threading context through the full walk. *)
 let rec validate_expr_tree expr =
   let* _ = of_ast_expr_shallow expr in
   match expr.Ast.expr_desc with
@@ -583,11 +544,6 @@ and func_decl_loc (f : Ast.func_decl) =
   | FuncBuiltinBody (_, loc) -> loc
   | FuncForeign _ | FuncNoBody -> (
       match f.func_params with p :: _ -> p.param_loc | [] -> Ast.dummy_loc)
-
-let of_ast_expr ?(context = "expression type") ast =
-  let* typed = of_ast_expr_shallow ~context ast in
-  let* () = validate_expr_tree ast in
-  Ok typed
 
 let typed_child ?(context = "child expression type") ast =
   of_ast_expr_shallow ~context ast
@@ -904,16 +860,6 @@ let expr_desc (expr : expr) =
       let* func = typed_func_decl func in
       Ok (EFuncDecl func)
 
-let of_ast_expr_with_type_info ?(context = "expression type") ?source_ty ?origin
-    ?resolved_call ?proofs ~semantic_ty ~value_ty ~widening ast =
-  let* info =
-    make_type_info ?source_ty ?origin ?resolved_call ?proofs
-      ~loc:ast.Ast.expr_loc ~context ~semantic_ty ~value_ty ~widening ()
-  in
-  let ast = Ast.with_expr_type_info ast (type_info_to_ast info) in
-  let* () = validate_expr_tree ast in
-  Ok { ast; info }
-
 let validate_variant (variant : Ast.variant) =
   List.fold_left
     (fun acc ty ->
@@ -1154,8 +1100,6 @@ and validate_record_fields = function
   | field :: rest ->
       let* () = validate_record_field field in
       validate_record_fields rest
-
-let of_ast_decl ast_decl = of_ast_decl_with_source ast_decl
 
 let of_ast_program ?callable_id_of_func ast_program =
   let rec validate_decls acc = function

@@ -15,9 +15,9 @@ val typecheck_only_typed_reusing_session :
   ?debug:bool ->
   unit ->
   (Typed_ast.program, Ast.compiler_error list) result
-(** Reuses [sess]'s validated parse cache across calls while resetting all
-    semantic compilation state before each run. Intended for batch test/tool
-    workers that typecheck many independent files in one process. *)
+(** Transitional compatibility entry point for compiler surface fixtures that
+    have not yet migrated to the Blorp frontend. Reuses validated parse entries
+    while resetting semantic state between independent files. *)
 
 val typecheck_module_only :
   filename:string ->

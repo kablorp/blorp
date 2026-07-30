@@ -587,25 +587,6 @@ let test_fold_tree_visits_let () =
   let count = fold_tree (fun acc _ -> acc + 1) 0 e in
   Alcotest.(check int) "5 nodes in let" 5 count
 
-(** fold_tree_bottom_up visits children before parent. *)
-let test_fold_tree_bottom_up_order () =
-  (* Collect node "kinds" (Lit / Bin) in visit order. Children first
-     means both leaves appear before the CBin root. *)
-  let e = mk (CBin (Add, cint 1, cint 2)) ty_int in
-  let kinds =
-    fold_tree_bottom_up
-      (fun acc c ->
-        let k = match c.desc with CLit _ -> "L" | CBin _ -> "B" | _ -> "?" in
-        k :: acc)
-      [] e
-  in
-  (* Reverse so we see the order visits happened *)
-  let order = List.rev kinds in
-  Alcotest.(check bool)
-    "B is last" true
-    (List.nth order (List.length order - 1) = "B");
-  Alcotest.(check int) "3 visits" 3 (List.length order)
-
 (* ============================================================================
    exists_tree: short-circuiting predicate search
    ============================================================================ *)
@@ -649,92 +630,6 @@ let test_exists_tree_short_circuits () =
   (* Root CBin visits once (returns false), then first child is CLit
      which returns true — that's 2 visits. A full walk would be 3. *)
   Alcotest.(check bool) "visits fewer than all nodes" true (!visits < 3)
-
-(* ============================================================================
-   transform_with_env: scope-aware transform
-   ============================================================================ *)
-
-(** The callback receives the current env and returns (rewritten node,
-    env for descendants). Env updates propagate to the subtree. *)
-let test_transform_with_env_updates_env () =
-  (* A trivial "depth counter" env: increment on every node, write the
-     depth onto a dummy field. We can't actually mutate the node, but
-     we can count how many CLit nodes see a depth >= 2. *)
-  let inner = mk (CBin (Add, cint 1, cint 2)) ty_int in
-  let outer = mk (CBin (Add, inner, cint 3)) ty_int in
-  let seen_depths = ref [] in
-  let _ =
-    transform_with_env
-      (fun depth e ->
-        (match e.desc with
-        | CLit _ -> seen_depths := depth :: !seen_depths
-        | _ -> ());
-        (e, depth + 1))
-      0 outer
-  in
-  (* cint 1, cint 2 are 2 deep; cint 3 is 1 deep *)
-  let sorted = List.sort compare !seen_depths in
-  Alcotest.(check (list int)) "literal depths" [ 1; 2; 2 ] sorted
-
-(** Match arms get the same env from their parent match. An env
-    extended in one arm's callback does not leak into siblings —
-    the invariant for scope-tracking passes. *)
-let test_transform_with_env_match_arms_independent () =
-  let scrut = cint 42 in
-  let arm1 = cint 100 in
-  let arm2 = cint 200 in
-  let arms =
-    [ (PatLiteral (LitInt 1L), arm1); (PatLiteral (LitInt 2L), arm2) ]
-  in
-  let root = mk (CMatchArms (scrut, arms)) ty_int in
-  let saw = ref [] in
-  let _ =
-    transform_with_env
-      (fun env e ->
-        (match e.desc with
-        | CLit (LitInt n) -> saw := (env, Int64.to_int n) :: !saw
-        | _ -> ());
-        (* Bump env by the literal value we see, so arms would produce
-       different envs if they weren't independent. *)
-        let new_env =
-          match e.desc with CLit (LitInt n) -> env + Int64.to_int n | _ -> env
-        in
-        (e, new_env))
-      0 root
-  in
-  let pairs = List.sort compare !saw in
-  (* Root match at env=0 (not literal). scrut=42 at env=0. arm bodies
-     (100, 200) at env=0. Pattern literals aren't [core] nodes, so
-     [map_children] doesn't descend into them. *)
-  Alcotest.(check (list (pair int int)))
-    "all body literals see env=0"
-    [ (0, 42); (0, 100); (0, 200) ]
-    pairs
-
-(** Env from a CLet's rhs does NOT leak into the body. Each subtree
-    starts from the env its parent returned. *)
-let test_transform_with_env_branches_independently () =
-  (* CBin (Add, left, right): both children get the same env from the
-     parent. If `left` updates env, `right` still gets parent's env. *)
-  let left = cint 100 in
-  let right = cint 200 in
-  let root = mk (CBin (Add, left, right)) ty_int in
-  let saw = ref [] in
-  let _ =
-    transform_with_env
-      (fun env e ->
-        (match e.desc with
-        | CLit (LitInt n) -> saw := (env, Int64.to_int n) :: !saw
-        | _ -> ());
-        (e, env + 1))
-      0 root
-  in
-  (* Root at env=0. Each child gets env=1 (parent returned 1). *)
-  let pairs = List.sort compare !saw in
-  Alcotest.(check (list (pair int int)))
-    "both children see env=1"
-    [ (1, 100); (1, 200) ]
-    pairs
 
 (* ============================================================================
    Pretty-printer: stable, readable output for debugging and tests
@@ -1183,8 +1078,6 @@ let suite =
         Alcotest.test_case "collects from depth" `Quick
           test_fold_tree_collects_from_depth;
         Alcotest.test_case "visits let" `Quick test_fold_tree_visits_let;
-        Alcotest.test_case "bottom_up_order" `Quick
-          test_fold_tree_bottom_up_order;
       ] );
     ( "exists_tree",
       [
@@ -1192,15 +1085,6 @@ let suite =
         Alcotest.test_case "no match" `Quick test_exists_tree_no_match;
         Alcotest.test_case "short-circuits" `Quick
           test_exists_tree_short_circuits;
-      ] );
-    ( "transform_with_env",
-      [
-        Alcotest.test_case "updates env" `Quick
-          test_transform_with_env_updates_env;
-        Alcotest.test_case "match arms independent" `Quick
-          test_transform_with_env_match_arms_independent;
-        Alcotest.test_case "branches independently" `Quick
-          test_transform_with_env_branches_independently;
       ] );
     ( "pp",
       [

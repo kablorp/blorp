@@ -144,14 +144,18 @@ let test_ckunknown_passes_on_valid_program () =
   let call = mk_call (CKUser ("f", None)) fn [] ty_int in
   let body = call in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.check_no_ckunknown prog in
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Specialize prog
+  in
   Alcotest.(check int) "no violations" 0 (List.length violations)
 
 let test_ckunknown_flags_unresolved_call () =
   let fn = mk (CVar (Var.named "mystery")) ty_int in
   let call = mk_call CKUnknown fn [] ty_int in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
-  let violations = Core_invariants.check_no_ckunknown prog in
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Specialize prog
+  in
   Alcotest.(check int) "one violation" 1 (List.length violations);
   match violations with
   | [ v ] ->
@@ -167,7 +171,9 @@ let test_ckselected_direct_flags_unresolved_call () =
   let fn = mk (CVar (Var.named "selected")) ty_int in
   let call = mk_call (CKSelectedDirect 123) fn [] ty_int in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
-  let violations = Core_invariants.check_no_ckunknown prog in
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Specialize prog
+  in
   Alcotest.(check int) "one violation" 1 (List.length violations);
   match violations with
   | [ v ] ->
@@ -190,7 +196,9 @@ let test_ckunknown_walks_into_nested () =
   in
   let body = mk (CLet (bind, call)) ty_int in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
-  let violations = Core_invariants.check_no_ckunknown prog in
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Specialize prog
+  in
   Alcotest.(check int) "one violation under let" 1 (List.length violations)
 
 let test_layoutless_list_alloc_flags_post_specialize () =

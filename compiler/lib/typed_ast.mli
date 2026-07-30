@@ -172,22 +172,6 @@ type error =
   | UnfinalizedType of { loc : Ast.loc; context : string; ty : Ast.type_expr }
   | InvalidTypeInfo of { loc : Ast.loc; context : string; message : string }
 
-val of_ast_expr : ?context:string -> Ast.expr -> (expr, error) result
-
-val of_ast_expr_with_type_info :
-  ?context:string ->
-  ?source_ty:Ast.type_expr ->
-  ?origin:type_origin ->
-  ?resolved_call:Ast.resolved_call ->
-  ?proofs:Type_proof_metadata.expr_proofs ->
-  semantic_ty:Ast.type_expr ->
-  value_ty:Ast.type_expr ->
-  widening:Type_widening_metadata.decision ->
-  Ast.expr ->
-  (expr, error) result
-
-val of_ast_decl : Ast.decl -> (decl, error) result
-
 val of_ast_program :
   ?callable_id_of_func:(name:string -> loc:Ast.loc -> int option) ->
   Ast.program ->
@@ -200,6 +184,11 @@ val of_ast_program_with_sources :
   (program, error) result
 
 val ast : expr -> Ast.expr
+(* Test seam for checking that the opaque typed payload remains consistent with
+   its canonical AST compatibility payload. Production consumers should use
+   the narrower semantic/value/call accessors below. *)
+val type_info : expr -> type_info
+
 val expr_desc : expr -> (expr_desc, error) result
 val func_ast : func_decl -> Ast.func_decl
 val func_info : func_decl -> func_info
@@ -220,15 +209,8 @@ val impl_ast : impl_decl -> Ast.impl_decl
 val impl_methods : impl_decl -> func_decl list
 val decl_ast : decl -> Ast.decl
 val decl_view : decl -> decl_view
-val decl_func : decl -> func_decl option
 val program_ast : program -> Ast.program
 val program_decls : program -> decl list
-val loc : expr -> Ast.loc
-val type_info : expr -> type_info
-val type_info_to_ast : type_info -> Ast.expr_type_info
-val type_info_source_type : type_info -> Ast.type_expr option
-val type_info_origin : type_info -> type_origin
-val type_info_proofs : type_info -> Type_proof_metadata.expr_proofs
 val expr_resolved_call : expr -> Ast.resolved_call option
 val semantic_type : expr -> Ast.type_expr
 val value_type : expr -> Ast.type_expr

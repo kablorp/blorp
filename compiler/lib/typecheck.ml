@@ -334,13 +334,6 @@ let resource_source_function_carrier_error loc message =
           ordinary data produced from the source.")
     loc message
 
-let register_resource_cleanup_metadata (decl : type_decl) : unit =
-  if decl.type_is_resource then
-    Option.iter
-      (Session.register_resource_cleanup (Session.current ())
-         ~type_name:decl.type_name)
-      decl.type_resource_cleanup
-
 let type_is_scoped_dependency_carrier ty =
   match Types.head_resolve ty with
   | TyNamed (name, _) ->
@@ -496,7 +489,6 @@ let lookup_type_home (state : check_state) (name : string) : string option =
 type module_resource_type_metadata = {
   mrt_name : string;
   mrt_type_params : string list;
-  mrt_cleanup : resource_cleanup option;
 }
 
 let module_resource_types_from_decls (decls : Ast.program) :
@@ -508,7 +500,6 @@ let module_resource_types_from_decls (decls : Ast.program) :
         {
           mrt_name = t.type_name;
           mrt_type_params = Ast.type_param_names t.type_params;
-          mrt_cleanup = t.type_resource_cleanup;
         }
         :: acc
     | _ -> acc
@@ -1277,7 +1268,6 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
           variants ~kind:type_kind ~contains_resource;
     }
   in
-  register_resource_cleanup_metadata decl;
   (* Register the owning module so the orphan-rule check can find the
      type's home. Stdlib primitives like [type Int = builtin] declared
      in std/int.brp land here via their decl's [loc_file]. *)
@@ -2022,18 +2012,9 @@ let register_imported_resource_signature_types ~(module_path : string option)
           (fun env name ->
             match resource_metadata name with
             | None -> env
-            | Some metadata when Env.get_type_kind env name = Some TypeResource
-              ->
-                Option.iter
-                  (Session.register_resource_cleanup (Session.current ())
-                     ~type_name:name)
-                  metadata.mrt_cleanup;
+            | Some _ when Env.get_type_kind env name = Some TypeResource ->
                 env
             | Some metadata ->
-                Option.iter
-                  (Session.register_resource_cleanup (Session.current ())
-                     ~type_name:name)
-                  metadata.mrt_cleanup;
                 Env.add_type ~with_ctors:false ~kind:TypeResource env name
                   metadata.mrt_type_params [])
           state.env names
@@ -4239,13 +4220,12 @@ let check_function_body (state : check_state) (func : func_decl) (_loc : loc) :
           | _ -> (state, FuncBodyExpr typed_body))
       | Error err -> (add_error state err, FuncBodyExpr body))
 
-(** Typecheck re-exports the shared purity helpers for existing callers/tests;
+(** Typecheck re-exports the shared purity helpers used by its implementation;
     the traversal and purity semantics live in [Purity_analysis]. *)
 let is_impure_builtin = Purity_analysis.is_impure_builtin
 
 let parallel_function_name = Purity_analysis.parallel_function_name
 let collect_parallel_calls = Purity_analysis.collect_parallel_calls
-let expr_function_purity = Purity_analysis.expr_function_purity
 let collect_impure_calls = Purity_analysis.collect_impure_calls
 
 (** Check for nested parallelism in a call to a parallel function.
@@ -5792,6 +5772,10 @@ let require_typed_program_for_typecheck ?source_program ?state
   | Ok typed -> Ok typed
   | Error err -> Error [ typed_ast_error_to_compiler_error err ]
 
+(** Transitional typed result for the OCaml compatibility fixture runner.
+    Production compilation uses the Blorp frontend. Keep this paired with
+    [Pipeline.typecheck_only_typed_reusing_session]; both can be deleted once
+    the remaining generic frontend expectations have migrated. *)
 let typecheck_with_state_typed ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
     (check_state * Typed_ast.program, compiler_error list) result =
@@ -5816,7 +5800,7 @@ let typecheck_typed ?module_origin ?(module_name = "")
       ~allow_debug_only_calls program
   with
   | Ok (_state, typed) -> Ok typed
-  | Error _ as e -> e
+  | Error _ as error -> error
 
 let typecheck_with_env_typed ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
@@ -5833,30 +5817,6 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
       with
       | Ok typed -> Ok (typed, state.env)
       | Error errors -> Error (errors, state.env))
-
-let typecheck_with_env ?module_origin ?(module_name = "")
-    ?(allow_debug_only_calls = false) (program : program) :
-    program * compiler_error list * env =
-  match
-    typecheck_with_env_typed ?module_origin ~module_name ~allow_debug_only_calls
-      program
-  with
-  | Ok (typed_program, env) -> (Typed_ast.program_ast typed_program, [], env)
-  | Error (errors, env) -> (program, errors, env)
-
-(** Type check a program, returning typed AST and any errors.
-    The returned program has expr_type annotations populated by type inference.
-    Set [~module_origin:Session.Stdlib_module] to allow stdlib-only [builtin]
-    declarations. [~allow_debug_only_calls] permits direct references to [@debug_only]
-    functions for explicit debug builds and the test harness. *)
-let typecheck ?module_origin ?(module_name = "")
-    ?(allow_debug_only_calls = false) (program : program) :
-    program * compiler_error list =
-  let typed_program, errors, _env =
-    typecheck_with_env ?module_origin ~module_name ~allow_debug_only_calls
-      program
-  in
-  (typed_program, errors)
 
 (** Check that public functions don't expose private types in their signatures. *)
 let check_private_type_leakage (state : check_state) (decls : program) :

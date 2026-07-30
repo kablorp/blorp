@@ -122,7 +122,8 @@ let test_subst_tyvar_always_binds () =
   | None -> Alcotest.fail "unify failed for TyVar T vs Int"
 
 (* ============================================================================
-   End-to-end infer_expr via [Typecheck.typecheck] on tiny source programs.
+   End-to-end infer_expr via [Typecheck.typecheck_with_env_typed] on tiny source
+   programs.
 
    Each test parses a short source string, runs the full type-checker, and
    asserts properties of the typed AST. These tests pin down the observable
@@ -140,12 +141,18 @@ let with_isolated_env (f : unit -> 'a) : 'a =
 
 let parse_and_typecheck source =
   let program = Test_helpers.parse_program source in
-  Blorp.Typecheck.typecheck program
+  match Blorp.Typecheck.typecheck_with_env_typed program with
+  | Ok (typed, _env) -> (Blorp.Typed_ast.program_ast typed, [])
+  | Error (errors, _env) -> (program, errors)
 
 let parse_and_typecheck_std_with_env source =
   let program = Test_helpers.parse_program source in
-  Blorp.Typecheck.typecheck_with_env ~module_origin:Blorp.Session.Stdlib_module
-    program
+  match
+    Blorp.Typecheck.typecheck_with_env_typed
+      ~module_origin:Blorp.Session.Stdlib_module program
+  with
+  | Ok (typed, env) -> (Blorp.Typed_ast.program_ast typed, [], env)
+  | Error (errors, env) -> (program, errors, env)
 
 let parse_and_typecheck_module ?(filename = "test_input.brp") source =
   match Blorp.Pipeline.typecheck_module_only ~filename ~source with

@@ -1,8 +1,11 @@
-(** In-process runner for compiler surface tests.
+(** Runner for compiler surface tests.
 
-    Parser, inference, and typecheck tests run in-process. Formatter and purify
-    tests intentionally exercise the public CLI surface, while the codegen audit
-    keeps its shell runner because it validates generated C with the host C
+    Parser tests and not-yet-migrated inference/typecheck fixtures run through
+    the OCaml compatibility frontend. A fixture marked [RUN-BLORP-CHECK] uses
+    the production Blorp frontend and Blorp-specific expectations. This split is
+    transitional: moving a fixture requires reconciling both semantics and
+    diagnostics, not merely changing the runner. Formatter and purify tests use
+    the public CLI, while codegen audit validates generated C with the host C
     compiler. *)
 
 open Blorp
@@ -412,8 +415,8 @@ let run_typecheck opts context file =
         let source = read_file file in
         match
           Pipeline.typecheck_only_typed_reusing_session
-            ~sess:context.typecheck_session ~filename:file ~source
-            ~debug:false ()
+            ~sess:context.typecheck_session ~filename:file ~source ~debug:false
+            ()
         with
         | Ok _ -> { code = 0; output = "Type checking succeeded.\n" }
         | Error errors ->

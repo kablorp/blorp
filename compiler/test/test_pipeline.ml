@@ -55,13 +55,12 @@ let program_has_typed_expr (program : Ast.program) : bool =
   in
   List.exists decl_has_typed_expr program
 
-let typecheck_typed ~filename ~source ?debug () =
+let typecheck_typed ~filename ~source () =
   let sess = Session.create () in
-  Pipeline.typecheck_only_typed_reusing_session ~sess ~filename ~source ?debug ()
+  Pipeline.typecheck_only_typed_reusing_session ~sess ~filename ~source ()
 
-let typecheck_ast ~filename ~source ?debug () =
-  typecheck_typed ~filename ~source ?debug ()
-  |> Result.map Typed_ast.program_ast
+let typecheck_ast ~filename ~source () =
+  typecheck_typed ~filename ~source () |> Result.map Typed_ast.program_ast
 
 let test_reusable_typecheck_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->

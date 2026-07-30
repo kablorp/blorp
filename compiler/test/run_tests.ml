@@ -105,7 +105,6 @@ let default_suites =
   @ suite_group "DimSolver" Test_dim_solver.suite
   @ suite_group "CoreStage" Test_core_stage.suite
   @ suite_group "Invariants" Test_invariants.suite
-  @ suite_group "IntrinsicContract" Test_intrinsic_contract.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
   @ suite_group "CodegenTypes" Test_codegen_types.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite

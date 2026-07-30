@@ -14,11 +14,11 @@ let test_alias_normalization_retains_purpose_and_source () =
       Blorp.Infer_type_normalization.ArgumentCompatibility source
   in
   check_true "source spelling is retained"
-    (types_equal (Blorp.Infer_type_normalization.source normalized) source);
+    (types_equal normalized.source source);
   check_true "alias is expanded for inference compatibility"
-    (types_equal (Blorp.Infer_type_normalization.normalized normalized) ty_int);
+    (types_equal normalized.normalized ty_int);
   check_true "normalization purpose is retained"
-    (Blorp.Infer_type_normalization.purpose normalized
+    (normalized.purpose
     = Blorp.Infer_type_normalization.ArgumentCompatibility)
 
 let test_canonical_helper_returns_normalized_type () =

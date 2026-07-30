@@ -374,9 +374,12 @@ let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
   let cross_module_errs = loaded_module_coherence_errors () in
   List.rev (List.rev_append cross_module_errs !module_errors)
 
-
-let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a)
-    : 'a =
+(** The following compatibility worker exists only for compiler fixtures whose
+    semantics and diagnostics have not yet migrated to the Blorp frontend. Its
+    parse cache is safe to retain because entries are source-hash validated;
+    semantic state must be reset for every independent fixture. *)
+let with_reusable_typecheck_session ~(sess : Session.t) filename
+    (k : unit -> 'a) : 'a =
   let parent = Session.current () in
   let inherited_std_override =
     if parent == sess then None
@@ -392,7 +395,6 @@ let with_reusable_typecheck_session ~(sess : Session.t) filename (k : unit -> 'a
       k ())
 
 let typecheck_loaded_program ~filename ~program ?(debug = false) () =
-  (* Type-check loaded modules and surface genuine errors *)
   let module_errors = check_modules ~debug ~allow_debug_only_calls:debug () in
   if module_errors <> [] then Error module_errors
   else
@@ -413,7 +415,7 @@ let typecheck_only_typed_reusing_session ~sess ~filename ~source
     ?(debug = false) () =
   with_reusable_typecheck_session ~sess filename (fun () ->
       match parse_and_load_modules ~filename source with
-      | Error _ as e -> e
+      | Error _ as error -> error
       | Ok (program, _base_dir) ->
           typecheck_loaded_program ~filename ~program ~debug ())
 

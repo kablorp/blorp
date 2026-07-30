@@ -67,6 +67,67 @@ let parse_program ?(filename = "test_input.brp") source =
   | Error err ->
       Alcotest.failf "expected source to parse, got: %s" err.Blorp.Ast.message
 
+let typed_decl_of_ast decl =
+  match Blorp.Typed_ast.of_ast_program [ decl ] with
+  | Error error -> Error error
+  | Ok program -> (
+      match Blorp.Typed_ast.program_decls program with
+      | [ typed_decl ] -> Ok typed_decl
+      | _ -> assert false)
+
+let rec typed_decl_func decl =
+  match Blorp.Typed_ast.decl_view decl with
+  | Blorp.Typed_ast.DeclFunction func -> Some func
+  | Blorp.Typed_ast.DeclPrivate inner -> typed_decl_func inner
+  | Blorp.Typed_ast.DeclVar _
+  | Blorp.Typed_ast.DeclRecord _
+  | Blorp.Typed_ast.DeclTypeAlias _
+  | Blorp.Typed_ast.DeclImpl _
+  | Blorp.Typed_ast.DeclOther ->
+      None
+
+let typed_expr_of_ast expr =
+  let var : Blorp.Ast.var_decl =
+    {
+      var_name = Some "__typed_ast_test_value";
+      var_pattern = None;
+      var_type = None;
+      var_value = expr;
+      var_is_mutable = false;
+      var_is_const = false;
+    }
+  in
+  let decl : Blorp.Ast.decl =
+    {
+      decl_desc = DVar var;
+      decl_loc = expr.expr_loc;
+      decl_doc = None;
+    }
+  in
+  match typed_decl_of_ast decl with
+  | Error error -> Error error
+  | Ok typed_decl -> (
+      match Blorp.Typed_ast.decl_view typed_decl with
+      | Blorp.Typed_ast.DeclVar typed_var ->
+          Blorp.Typed_ast.var_value_expr typed_var
+      | _ -> assert false)
+
+let typed_expr_with_type_info ?source_ty ?(origin = Inferred) ?resolved_call
+    ?(proofs = Blorp.Type_proof_metadata.unproven_expr) ~semantic_ty ~value_ty
+    ~widening expr =
+  let info : Blorp.Ast.expr_type_info =
+    {
+      source_ty;
+      semantic_ty;
+      value_ty;
+      origin;
+      widening;
+      proofs;
+      resolved_call;
+    }
+  in
+  typed_expr_of_ast (Blorp.Ast.with_expr_type_info expr info)
+
 let parse_and_typecheck source =
   match
     Blorp.Pipeline.typecheck_module_only ~filename:"test_input.brp" ~source

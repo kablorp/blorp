@@ -89,42 +89,6 @@ let is_struct_scalar_field_type = function
   | ty when Types.is_any_integer_type ty -> true
   | _ -> false
 
-let named_without_args_is names = function
-  | TyNamed (name, []) -> string_member name names
-  | _ -> false
-
-let native_operator_scalar_names =
-  [ "String"; "Bool"; "Char"; "Bytes"; "Fixed"; "Float"; "Float32"; "Float16" ]
-
-let has_native_operator_fast_path_type ty =
-  match Codegen_types.normalize_type ty with
-  | TyArray _ -> true
-  | ty when named_without_args_is native_operator_scalar_names ty -> true
-  | ty when Types.Dim.is_value_dim ty -> true
-  | ty when Types.is_any_integer_type ty -> true
-  | _ -> false
-
-let builtin_to_string_scalar_names =
-  [
-    "String";
-    "Float";
-    "Float32";
-    "Float16";
-    "Bool";
-    "Char";
-    "Bytes";
-    "Fixed";
-  ]
-
-let has_builtin_to_string_fallback_type ty =
-  match Codegen_types.normalize_type ty with
-  | TyArray _ -> true
-  | ty when named_without_args_is builtin_to_string_scalar_names ty -> true
-  | TyNamed ("List", _) -> true
-  | ty when Types.Dim.is_value_dim ty -> true
-  | ty when Types.is_any_integer_type ty -> true
-  | _ -> false
-
 let open_scalar_names =
   [ "Float"; "Float32"; "Float16"; "String"; "Char" ] @ Types.all_int_type_names
 

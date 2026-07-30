@@ -1351,10 +1351,10 @@ let rec transform_bottom_up (f : core -> core) (e : core) : core =
     when a single level is enough (cheap shallow predicates);
     [fold_tree] for anything that cares about descendants.
 
-    For rewriting (not collecting), use [transform_bottom_up] or
-    [transform_with_env]. For short-circuiting predicate searches where
-    "any node matches?" is the question, use [exists_tree] — it stops
-    walking as soon as the predicate returns [true].
+    For rewriting (not collecting), use [transform_bottom_up]. For
+    short-circuiting predicate searches where "any node matches?" is the
+    question, use [exists_tree] — it stops walking as soon as the predicate
+    returns [true].
 
     {b Caveats}:
     - Sibling visit order between an expression's immediate children is
@@ -1377,15 +1377,6 @@ let rec fold_tree (f : 'a -> core -> 'a) (init : 'a) (e : core) : 'a =
   let acc = f init e in
   fold_immediate_children (fold_tree f) acc e
 
-(** [fold_tree_bottom_up f init e] is the bottom-up counterpart of
-    [fold_tree]: visits descendants first, then the root. Use for
-    reductions where a node's contribution depends on its children's
-    accumulated result (e.g. "deepest literal") or where order-sensitive
-    last-write-wins semantics is needed. *)
-let rec fold_tree_bottom_up (f : 'a -> core -> 'a) (init : 'a) (e : core) : 'a =
-  let acc = fold_immediate_children (fold_tree_bottom_up f) init e in
-  f acc e
-
 (** [exists_tree pred e] returns [true] as soon as [pred] holds for any
     node in [e]'s subtree. Short-circuits — does not visit nodes past
     the first match. Use for "does this tree contain …" predicates;
@@ -1404,43 +1395,6 @@ let rec exists_tree (pred : core -> bool) (e : core) : bool =
     in
     !found
   end
-
-(** [transform_with_env f env0 e] is the scope-aware analogue of
-    [transform_bottom_up]. The callback receives the current [env] and
-    returns a pair of [(rewritten_node, env_for_children)]. Each child
-    gets the env its direct parent's call returned. Siblings receive
-    the {b same} env from the parent — env changes don't cross between
-    branches, so an [if] or [CBin]'s two sides stay independent.
-
-    The traversal is top-down: [f] runs on a node {b before} its
-    children. To rewrite bottom-up, apply [f] to the post-recursion
-    result manually inside the callback.
-
-    {b Pitfall for binding-aware passes}: non-recursive [CLet]'s bound
-    name is in scope {b only in the body}, not in the RHS. But
-    [transform_with_env] applies [env'] uniformly to every child via
-    [map_children], so a caller that extends the env on [CLet] will
-    see the rhs with the bound name in scope too — wrong for
-    non-recursive lets. Same pitfall for [CFor] iterators (the var is
-    not in scope in the iterator, only in the body). Passes that
-    care about these boundaries must either hand-roll recursion for
-    binding forms, or split the transform so the rhs/iterator and
-    body get different envs.
-
-    Example (simple depth counter — safe because depth applies
-    uniformly):
-    {[
-      let scope_depth e =
-        transform_with_env (fun depth c ->
-          match c.desc with
-          | CLet _ -> (c, depth + 1)
-          | _     -> (c, depth)
-        ) 0 e
-    ]} *)
-let rec transform_with_env (f : 'env -> core -> core * 'env) (env : 'env)
-    (e : core) : core =
-  let e', env' = f env e in
-  map_children (transform_with_env f env') e'
 
 (* ============================================================================
    Pretty-printer

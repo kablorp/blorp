@@ -25,6 +25,3 @@ type normalized_type = private {
 val make_context : env:Env.env -> unit -> context
 val normalize : context -> purpose -> Ast.type_expr -> normalized_type
 val canonical : context -> purpose -> Ast.type_expr -> Ast.type_expr
-val purpose : normalized_type -> purpose
-val source : normalized_type -> Ast.type_expr
-val normalized : normalized_type -> Ast.type_expr

@@ -851,7 +851,6 @@ OCaml references:
   - `register_imported_name`
   - `add_import_binding`
   - `qualify_imported_type_expr`
-  - `register_resource_cleanup_metadata`
   - `validate_foreign_metadata`
   - `validate_resource_result_annotation`
   - `validate_resource_signature_boundary`

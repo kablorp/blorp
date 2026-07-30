@@ -434,7 +434,6 @@ compiler/
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
 │   ├── core_emit_util.ml  # Shared late-backend helper utilities
-│   ├── core_intrinsic_registry.ml # Intrinsic manifest and contracts
 │   ├── core_invariants.ml # Stage-boundary invariant checks
 │   ├── core_pipeline.ml   # Core IR pipeline orchestration
 │   ├── core_error.ml      # Core IR structured errors
@@ -891,10 +890,16 @@ User-facing subcommands:
 
 3. **Codegen registry** (`codegen/codegen_builtins.ml`):
    - Map the blorp name to its C function name when this is a direct runtime
-     builtin. Compiler-owned helper operations should usually be registered as
-     Core intrinsics in `core_intrinsic_registry.ml`, synthesized through the
-     Blorp `compiler_core_synth_*.brp` families, and covered by
-     `core_ownership.ml` if they touch managed values.
+     builtin.
+   - Register compiler-owned Core intrinsics in `INTRINSIC_SPECS` in
+     `compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp` and
+     synthesize their call sites through the Blorp `compiler_core_synth_*.brp`
+     families.
+   - Define managed-value contracts in
+     `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`. Until the
+     remaining OCaml Core projection is removed, mirror those contracts in
+     `core_ownership.ml`; the default compiler-unit gate checks parity with the
+     canonical Blorp manifest.
 
 4. **Runtime** (`runtime.c` and `runtime_decl.c`):
    - Add the C implementation **and** its forward declaration if the builtin

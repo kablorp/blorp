@@ -77,9 +77,6 @@ val add_package_root : ?sess:Session.t -> string -> unit
     [<root>/foo/bar.brp] and receives package origin [foo]. Bare imports never
     consult package roots. *)
 
-val package_roots : ?sess:Session.t -> unit -> string list
-(** Local package roots configured for this session, in lookup order. *)
-
 val set_std_override : ?sess:Session.t -> string -> unit
 (** Override the embedded std library with a filesystem directory.
     Used by [--std-dir] CLI flag. Takes priority over [BLORP_STD]

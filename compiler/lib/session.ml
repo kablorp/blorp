@@ -160,13 +160,6 @@ type t = {
       without a module source (Option/Result/ConcurrencyError from
       [env_builtins]) stay unregistered here and render bare — matches
       the trait-index pattern. *)
-  resource_cleanup_index : (string, resource_cleanup) Hashtbl.t;
-      (** Canonical resource type name → compiler-owned cleanup metadata.
-
-      Populated by typechecking [resource type] declarations after import
-      canonicalization. Core lowering consumes this registry when turning
-      [with] scopes into cleanup edges. Keeping this metadata here avoids
-      codegen heuristics based on spelling such as [FileReader]. *)
   trait_index : (string, string) Hashtbl.t;
       (** Trait name → canonical name of the module that declared it.
 
@@ -265,7 +258,6 @@ let create () : t =
     module_cache = Hashtbl.create 16;
     parse_cache = Hashtbl.create 16;
     type_index = Hashtbl.create 32;
-    resource_cleanup_index = Hashtbl.create 16;
     trait_index = Hashtbl.create 32;
     std_override_dir = None;
     std_override_active = false;
@@ -304,20 +296,18 @@ let reset_meta (s : t) : unit =
   s.meta_origin <- [];
   Hashtbl.clear s.meta_env
 
-(** Reset one compilation's semantic state while keeping parsed module artifacts.
+(** Reset one compatibility typecheck while preserving source-validated parses.
 
-    This is intentionally stronger than [Modules.reset]. [Modules.reset] only
-    clears the loaded module graph; a long-lived batch worker also has to clear
-    env tables, package/search configuration, std override state, fresh ids, and
-    inference scratch. The parse cache is the only preserved field because its
-    entries are source-hash validated by [Modules] before reuse. *)
+    The compiler surface runner still uses the OCaml frontend for fixtures that
+    have not acquired Blorp-specific expectations. This reset belongs only to
+    that transitional batch worker and can be removed with the runner once all
+    fixtures execute through the Blorp frontend. *)
 let reset_compilation_state_preserving_parse_cache (s : t) : unit =
   s.search_paths <- [];
   s.package_roots <- [];
   s.source_packages <- [];
   Hashtbl.clear s.module_cache;
   Hashtbl.clear s.type_index;
-  Hashtbl.clear s.resource_cleanup_index;
   Hashtbl.clear s.trait_index;
   s.std_override_dir <- None;
   s.std_override_active <- false;
@@ -467,18 +457,6 @@ let find_type_homes (sess : t) (name : string) : string list =
 let find_type_home (sess : t) (name : string) : string option =
   match find_type_homes sess name with [ path ] -> Some path | _ -> None
 
-(** Register cleanup metadata for a resource type. [type_name] should be the
-    canonical name visible to typed Core lowering: local names for the module
-    being typechecked, and [module::Type] names after import canonicalization. *)
-let register_resource_cleanup (sess : t) ~(type_name : string)
-    (cleanup : resource_cleanup) : unit =
-  Hashtbl.replace sess.resource_cleanup_index type_name cleanup
-
-(** Find compiler-owned cleanup metadata for a resource type. *)
-let find_resource_cleanup (sess : t) (type_name : string) :
-    resource_cleanup option =
-  Hashtbl.find_opt sess.resource_cleanup_index type_name
-
 (* ============================================================================
    Ambient "current session"
    ============================================================================
@@ -492,7 +470,7 @@ let find_resource_cleanup (sess : t) (type_name : string) :
 
    Instead, the meta-env-consuming functions in [Types] default to the
    ambient current session when [~sess] is not explicitly passed. The
-   frontend entry points (pipeline compile, [Typecheck.typecheck],
+   frontend entry points (pipeline compile, [Typecheck.typecheck_with_env_typed],
    [Lsp_state] per-document handlers) scope their work with
    [with_current] so every nested call sees the right session.
 
@@ -514,13 +492,6 @@ let find_resource_cleanup (sess : t) (type_name : string) :
     during setup doesn't trip over a [None] ref. *)
 let current_ref : t ref = ref (create ())
 
-(** Depth of nested [with_current] frames currently on the stack.
-    [assert_in_scope] uses this to detect callers that read [current ()]
-    without an explicit frame — those callers are using the long-lived
-    process default, which silently shares state across what should be
-    isolated boundaries. *)
-let scope_depth : int ref = ref 0
-
 (** Get the ambient session. *)
 let current () : t = !current_ref
 
@@ -529,18 +500,6 @@ let current () : t = !current_ref
 let with_current (s : t) (f : unit -> 'a) : 'a =
   let prev = !current_ref in
   current_ref := s;
-  incr scope_depth;
   Fun.protect
-    ~finally:(fun () ->
-      decr scope_depth;
-      current_ref := prev)
+    ~finally:(fun () -> current_ref := prev)
     f
-
-(** Debug guard: raises [Failure] when called outside any [with_current]
-    frame. Catches latent aliasing — every read of the ambient session
-    should be inside a deliberate scope, otherwise the caller is
-    silently reusing the process default. Cheap; called from test
-    fixtures and (eventually) debug builds. *)
-let assert_in_scope () : unit =
-  if !scope_depth = 0 then
-    failwith "Session.assert_in_scope: no with_current frame active"

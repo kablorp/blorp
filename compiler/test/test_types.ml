@@ -421,12 +421,6 @@ let test_integer_type_checks () =
   check_true "UInt8 is unsigned" (is_unsigned_integer_type ty_uint8);
   check_false "Int is not unsigned" (is_unsigned_integer_type ty_int)
 
-let test_float_type_checks () =
-  check_true "Float is float" (is_any_float_type ty_float);
-  check_true "Float32 is float" (is_any_float_type ty_float32);
-  check_true "Float16 is float" (is_any_float_type ty_float16);
-  check_false "Int is not float" (is_any_float_type ty_int)
-
 let test_int_type_to_c () =
   check_string "Int -> long" "long" (int_type_to_c "Int");
   check_string "Int8 -> int8_t" "int8_t" (int_type_to_c "Int8");
@@ -450,26 +444,6 @@ let test_map_type_expr () =
   let ty = TyFunc { params = [ ty_int ]; return = ty_bool; is_pure = true } in
   let result = map_type_expr (fun _ -> None) ty in
   check_true "identity" (types_equal result ty)
-
-let test_contains_meta () =
-  check_true "direct meta" (contains_meta (TyMeta 1));
-  check_true "nested meta in function"
-    (contains_meta
-       (TyFunc
-          {
-            params = [ TyNamed ("List", [ TyMeta 1 ]) ];
-            return =
-              TyArray (ty_int, [ TyDimOp (DimAdd, TyMeta 2, TyConstInt 1) ]);
-            is_pure = true;
-          }));
-  check_false "no meta"
-    (contains_meta
-       (TyFunc
-          {
-            params = [ TyNamed ("List", [ ty_int ]) ];
-            return = TyArray (ty_int, [ TyConstInt 4 ]);
-            is_pure = true;
-          }))
 
 (* ============================================================================
    Dim value/refinement boundary
@@ -633,11 +607,7 @@ let suite =
         Alcotest.test_case "type checks" `Quick test_integer_type_checks;
         Alcotest.test_case "to C" `Quick test_int_type_to_c;
       ] );
-    ( "float types",
-      [ Alcotest.test_case "type checks" `Quick test_float_type_checks ] );
     ("map_type_expr", [ Alcotest.test_case "mapping" `Quick test_map_type_expr ]);
-    ( "contains_meta",
-      [ Alcotest.test_case "predicate" `Quick test_contains_meta ] );
     ( "dim values",
       [
         Alcotest.test_case "scalar dimension refinements exclude variadic packs"

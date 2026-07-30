@@ -407,11 +407,11 @@ let test_recognizes_filter_map_fold () =
   match P.plan_of_expr (filter_map_fold_expr ()) with
   | Some plan -> (
       match
-        ( LP.source plan,
+        ( plan.source,
           LP.stages plan,
-          LP.sink plan,
-          LP.cardinality plan,
-          LP.result_ty plan )
+          plan.sink,
+          plan.cardinality,
+          plan.result_ty )
       with
       | ( LP.SourceList _,
           [ LP.StageFilter _; LP.StageMap _ ],
@@ -426,11 +426,11 @@ let test_recognizes_filter_map_hof_fold () =
   match P.plan_of_expr (filter_map_hof_fold_expr ()) with
   | Some plan -> (
       match
-        ( LP.source plan,
+        ( plan.source,
           LP.stages plan,
-          LP.sink plan,
-          LP.cardinality plan,
-          LP.result_ty plan )
+          plan.sink,
+          plan.cardinality,
+          plan.result_ty )
       with
       | ( LP.SourceList _,
           [ LP.StageFilterMap _ ],
@@ -445,11 +445,11 @@ let test_recognizes_filter_map_hof_collect () =
   match P.plan_of_expr (filter_map_hof_collect_expr ()) with
   | Some plan -> (
       match
-        ( LP.source plan,
+        ( plan.source,
           LP.stages plan,
-          LP.sink plan,
-          LP.cardinality plan,
-          LP.result_ty plan )
+          plan.sink,
+          plan.cardinality,
+          plan.result_ty )
       with
       | ( LP.SourceList _,
           [ LP.StageFilterMap _ ],
@@ -465,7 +465,7 @@ let test_recognizes_range_map_filter () =
   match P.plan_of_expr (range_map_filter_expr ()) with
   | Some plan -> (
       match
-        (LP.source plan, LP.stages plan, LP.sink plan, LP.cardinality plan)
+        (plan.source, LP.stages plan, plan.sink, plan.cardinality)
       with
       | ( LP.SourceRange _,
           [ LP.StageMap _; LP.StageFilter _ ],
@@ -1361,7 +1361,7 @@ let test_list_pipeline_rejects_empty_source_plan () =
 let test_list_pipeline_exposes_nonempty_stages () =
   match LP.plan_of_expr (filter_map_fold_expr ()) with
   | Some plan -> (
-      match (LP.source plan, LP.stages plan, LP.sink plan) with
+      match (plan.source, LP.stages plan, plan.sink) with
       | LP.SourceList _, [ LP.StageFilter _; LP.StageMap _ ], LP.SinkFold _ ->
           ()
       | _ -> Alcotest.fail "unexpected ListPipeline shape")

@@ -15,7 +15,7 @@
     [run_for_stage] wires in checks that are known to pass against
     today's pipeline output:
 
-    - [check_no_ckunknown] — ENABLED (post-specialize and final)
+    - unresolved-call checks — ENABLED (post-specialize and final)
     - [check_no_debug_blocks] — ENABLED (post-debug and final)
     - [check_no_tyvar_leak] — ENABLED (post-mono)
     - [check_selected_direct_mono_contract] — ENABLED (post-mono)
@@ -105,9 +105,6 @@ let check_no_ckunknown_at (stage : Core_stage.t) (prog : Core.core_program) :
       | _ -> acc)
     [] prog
   |> List.rev
-
-let check_no_ckunknown (prog : Core.core_program) : Core_error.t list =
-  check_no_ckunknown_at Core_stage.Specialize prog
 
 let check_no_layoutless_list_alloc_at (stage : Core_stage.t)
     (prog : Core.core_program) : Core_error.t list =

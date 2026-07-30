@@ -256,9 +256,6 @@ let add_package_root ?sess dir =
   if not (List.mem dir s.package_roots) then
     s.package_roots <- dir :: s.package_roots
 
-(** Package roots configured for this session, in lookup order. *)
-let package_roots ?sess () = (sess_of ?sess ()).package_roots
-
 type source_package = Session.source_package = {
   source_package_alias : string;
   source_package_name : string;
@@ -1580,7 +1577,6 @@ let reset ?sess () =
   Hashtbl.clear sess.module_cache;
   Hashtbl.clear sess.type_index;
   Hashtbl.clear sess.trait_index;
-  Hashtbl.clear sess.resource_cleanup_index;
   sess.load_errors <- [];
   sess.prelude_modules_loaded <- false
 

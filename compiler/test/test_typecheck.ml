@@ -12,6 +12,16 @@
 
 open Test_helpers
 
+let typecheck_ast ?module_origin program =
+  match Blorp.Typecheck.typecheck_with_env_typed ?module_origin program with
+  | Ok (typed, _env) -> (Blorp.Typed_ast.program_ast typed, [])
+  | Error (errors, _env) -> (program, errors)
+
+let typecheck_typed program =
+  match Blorp.Typecheck.typecheck_with_env_typed program with
+  | Ok (typed, _env) -> Ok typed
+  | Error (errors, _env) -> Error errors
+
 (* ============================================================================
    Purity
    ============================================================================ *)
@@ -59,7 +69,7 @@ let expect_origin_error src ~module_origin ~message =
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program ->
           let _typed, errors =
-            Blorp.Typecheck.typecheck ~module_origin program
+            typecheck_ast ~module_origin program
           in
           if errors = [] then
             Alcotest.failf
@@ -85,7 +95,7 @@ let expect_origin_ok src ~module_origin =
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program ->
           let _typed, errors =
-            Blorp.Typecheck.typecheck ~module_origin program
+            typecheck_ast ~module_origin program
           in
           if errors <> [] then
             Alcotest.failf "expected typecheck success, got:\n%s"
@@ -146,7 +156,7 @@ func main(args: List[String]) -> Int:
       match Blorp.Modules.parse_typecheck_source ~filename:"typed_api.brp" src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
-          match Blorp.Typecheck.typecheck_typed program with
+          match typecheck_typed program with
           | Ok typed ->
               Alcotest.(check int)
                 "typed decl count" 1
@@ -166,7 +176,7 @@ func main(args: List[String]) -> Int:
       match Blorp.Modules.parse_typecheck_source ~filename:"typed_api_error.brp" src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
-          match Blorp.Typecheck.typecheck_typed program with
+          match typecheck_typed program with
           | Ok _ -> Alcotest.fail "expected type errors"
           | Error errors ->
               Alcotest.(check bool) "has typecheck errors" true (errors <> [])))
@@ -197,7 +207,10 @@ pure func same(x: String) -> String:
                 | _ -> None)
               program
           in
-          match Blorp.Typecheck.typecheck_with_state_typed program with
+          match
+            Blorp.Pipeline.typecheck_module_only_typed
+              ~filename:"callable_overloads.brp" ~source:src
+          with
           | Error errors ->
               Alcotest.failf "expected typed program, got: %s"
                 (Test_helpers.format_errors errors)
@@ -224,7 +237,7 @@ let expect_typed_program ~filename src =
       match Blorp.Modules.parse_typecheck_source ~filename src with
       | Error err -> Alcotest.failf "parse failed: %s" err.message
       | Ok program -> (
-          match Blorp.Typecheck.typecheck_typed program with
+          match typecheck_typed program with
           | Error errors ->
               Alcotest.failf "expected typed program, got: %s"
                 (Test_helpers.format_errors errors)
@@ -398,14 +411,14 @@ let test_expr_function_purity_uses_structured_metadata () =
   let env = (Blorp.Typecheck.init_state ()).env in
   Alcotest.(check bool)
     "bare compatibility mirror ignored" true
-    (Option.is_none (Blorp.Typecheck.expr_function_purity env legacy_expr));
+    (Option.is_none (Blorp.Purity_analysis.expr_function_purity env legacy_expr));
   Alcotest.(check bool)
     "structured function metadata classified" true
-    (Blorp.Typecheck.expr_function_purity env structured_expr
+    (Blorp.Purity_analysis.expr_function_purity env structured_expr
     = Some Blorp.Env.Impure)
 
 let assert_expr_widening ~label expr ~semantic_ty ~value_ty ~reason =
-  match Blorp.Typed_ast.of_ast_expr expr with
+  match Test_helpers.typed_expr_of_ast expr with
   | Error _ -> Alcotest.failf "%s did not validate" label
   | Ok typed_expr -> (
       let info = Blorp.Typed_ast.type_info typed_expr in
@@ -594,17 +607,17 @@ func main(args: List[String]) -> Int:
     ~reason:(Blorp.Type_widening.NumericOperator Blorp.Ast.Add)
 
 let assert_ascription_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
-  match Blorp.Typed_ast.of_ast_expr expr with
+  match Test_helpers.typed_expr_of_ast expr with
   | Error _ -> Alcotest.failf "%s did not validate" label
   | Ok typed_expr ->
       let info = Blorp.Typed_ast.type_info typed_expr in
-      (match Blorp.Typed_ast.type_info_source_type info with
+      (match info.source_ty with
       | Some actual ->
           Alcotest.(check bool)
             (label ^ " source type") true
             (Blorp.Types.types_equal actual source_ty)
       | None -> Alcotest.failf "%s source type missing" label);
-      (match Blorp.Typed_ast.type_info_origin info with
+      (match info.origin with
       | Blorp.Typed_ast.ExplicitAnnotation actual ->
           Alcotest.(check bool)
             (label ^ " origin annotation")
@@ -619,11 +632,11 @@ let assert_ascription_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
         (Blorp.Types.types_equal info.value_ty value_ty)
 
 let assert_expr_source_metadata ~label expr ~source_ty ~semantic_ty ~value_ty =
-  match Blorp.Typed_ast.of_ast_expr expr with
+  match Test_helpers.typed_expr_of_ast expr with
   | Error _ -> Alcotest.failf "%s did not validate" label
   | Ok typed_expr ->
       let info = Blorp.Typed_ast.type_info typed_expr in
-      (match Blorp.Typed_ast.type_info_source_type info with
+      (match info.source_ty with
       | Some actual ->
           Alcotest.(check bool)
             (label ^ " source type") true
@@ -922,11 +935,11 @@ func main(args: List[String]) -> Int:
       decl_doc = None;
     }
   in
-  match Blorp.Typed_ast.of_ast_decl lambda_decl with
+  match Test_helpers.typed_decl_of_ast lambda_decl with
   | Error _ -> Alcotest.fail "lambda did not validate"
   | Ok typed_decl ->
       let typed_lambda =
-        match Blorp.Typed_ast.decl_func typed_decl with
+        match Test_helpers.typed_decl_func typed_decl with
         | Some func -> func
         | None -> Alcotest.fail "lambda declaration did not remain a function"
       in

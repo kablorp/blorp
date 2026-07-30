@@ -146,10 +146,6 @@ val occurs_meta : ?sess:Session.t -> int -> type_expr -> bool
 val zonk_type : ?sess:Session.t -> type_expr -> type_expr
 (** Resolve every [TyMeta] through the env to its final binding. Idempotent. *)
 
-val contains_meta : type_expr -> bool
-(** Does [ty] contain any inference-only [TyMeta]? Used to enforce typed
-    frontend/Core phase boundaries after zonking. *)
-
 val head_resolve : ?sess:Session.t -> type_expr -> type_expr
 (** Head-resolve a type: follow [TyMeta] chains through the session one
     hop at a time, without recursing into arguments. *)
@@ -210,10 +206,6 @@ val int_type_range : string -> int64 * int64
 
 val all_float_type_names : string list
 (** All float type names *)
-
-val is_any_float_type : type_expr -> bool
-(** Check if a type is any float type (Float, Float32, or Float16).
-    Follows [TyMeta] one hop via the ambient session. *)
 
 val is_float32_type : type_expr -> bool
 (** Check if a type is Float32. *)

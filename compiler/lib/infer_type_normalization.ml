@@ -30,6 +30,3 @@ let normalize ctx purpose source =
   { purpose; source; normalized = expand_aliases ctx source }
 
 let canonical ctx purpose source = (normalize ctx purpose source).normalized
-let purpose normalized = normalized.purpose
-let source normalized = normalized.source
-let normalized normalized = normalized.normalized

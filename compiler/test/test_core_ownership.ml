@@ -3,6 +3,8 @@
 open Blorp.Core_ownership
 open Blorp.Core
 
+module Ast = Blorp.Ast
+
 let check_contract label expected actual =
   (match actual with
   | Some contract -> (
@@ -144,6 +146,93 @@ let test_channel_recv_timeout_attempt_borrows_channel () =
   check_contract "blorp_channel_recv_timeout_attempt"
     { args = [ Borrow; Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_channel_recv_timeout_attempt" 2)
+
+let test_channel_runtime_builtin_contract_matrix () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnOwned }
+        (builtin_contract name 1))
+    [
+      "blorp_channel_recv";
+      "blorp_channel_try_recv";
+      "blorp_channel_recv_nullable";
+      "blorp_channel_try_recv_nullable";
+    ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "blorp_channel_recv_int";
+      "blorp_channel_recv_int8";
+      "blorp_channel_recv_int16";
+      "blorp_channel_recv_int32";
+      "blorp_channel_recv_int64";
+      "blorp_channel_recv_uint8";
+      "blorp_channel_recv_uint16";
+      "blorp_channel_recv_uint32";
+      "blorp_channel_recv_uint64";
+      "blorp_channel_recv_float";
+      "blorp_channel_recv_bool";
+      "blorp_channel_recv_char";
+      "blorp_channel_recv_f32";
+      "blorp_channel_recv_f16";
+      "blorp_channel_try_recv_int";
+      "blorp_channel_try_recv_int8";
+      "blorp_channel_try_recv_int16";
+      "blorp_channel_try_recv_int32";
+      "blorp_channel_try_recv_int64";
+      "blorp_channel_try_recv_uint8";
+      "blorp_channel_try_recv_uint16";
+      "blorp_channel_try_recv_uint32";
+      "blorp_channel_try_recv_uint64";
+      "blorp_channel_try_recv_float";
+      "blorp_channel_try_recv_bool";
+      "blorp_channel_try_recv_char";
+      "blorp_channel_try_recv_f32";
+      "blorp_channel_try_recv_f16";
+    ];
+  check_contract "blorp_channel_send"
+    { args = [ Borrow; Retain ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_channel_send" 2);
+  check_contract "blorp_channel_try_send"
+    { args = [ Borrow; Retain ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_channel_try_send" 2);
+  check_contract "blorp_channel_recv_timeout"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_recv_timeout" 2);
+  check_contract "blorp_channel_recv_timeout_nullable"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_recv_timeout_nullable" 2);
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 2))
+    [
+      "blorp_channel_recv_timeout_int";
+      "blorp_channel_recv_timeout_int8";
+      "blorp_channel_recv_timeout_int16";
+      "blorp_channel_recv_timeout_int32";
+      "blorp_channel_recv_timeout_int64";
+      "blorp_channel_recv_timeout_uint8";
+      "blorp_channel_recv_timeout_uint16";
+      "blorp_channel_recv_timeout_uint32";
+      "blorp_channel_recv_timeout_uint64";
+      "blorp_channel_recv_timeout_float";
+      "blorp_channel_recv_timeout_bool";
+      "blorp_channel_recv_timeout_char";
+      "blorp_channel_recv_timeout_f32";
+      "blorp_channel_recv_timeout_f16";
+    ];
+  check_contract "blorp_channel_send_timeout"
+    { args = [ Borrow; Retain; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_channel_send_timeout" 3);
+  check_contract "blorp_channel_seal"
+    { args = [ Borrow ]; result = ReturnVoid }
+    (builtin_contract "blorp_channel_seal" 1)
 
 let check_consuming_finalizer name =
   check_contract name
@@ -710,6 +799,40 @@ let test_string_copy_bytes_borrows () =
   check_contract "string_copy_bytes"
     { args = [ Borrow; Borrow; Borrow; Borrow; Borrow ]; result = ReturnVoid }
     (intrinsic_contract "string_copy_bytes" 5)
+
+let test_string_runtime_builtin_contract_matrix () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnOwned }
+        (builtin_contract name 1))
+    [
+      "blorp_from_char";
+      "blorp_from_chars";
+      "blorp_bytes_from_string";
+      "blorp_base64_encode";
+      "blorp_url_encode";
+      "blorp_url_decode";
+      "blorp_html_escape";
+      "blorp_string_chars";
+      "blorp_string_codepoints";
+      "blorp_codepoint_reverse";
+    ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [ "blorp_parse_int"; "blorp_parse_float"; "blorp_codepoint_length" ];
+  check_contract "blorp_string_get_opt"
+    { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_string_get_opt" 2);
+  check_contract "blorp_string_levenshtein"
+    { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_string_levenshtein" 2);
+  check_contract "blorp_string_lcs"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_string_lcs" 2)
 
 let test_checked_get_borrows_and_aliases () =
   check_contract "blorp_checked_get"
@@ -1356,6 +1479,93 @@ let read_file path =
     ~finally:(fun () -> close_in_noerr ic)
     (fun () -> really_input_string ic (in_channel_length ic))
 
+let intrinsic_arity_from_manifest_expr (expr : Ast.expr) =
+  match expr.expr_desc with
+  | Ast.ECall ({ expr_desc = Ast.EIdent "NoArgs"; _ }, [ _ ]) -> Ok 0
+  | Ast.ECall ({ expr_desc = Ast.EIdent "OneArg"; _ }, [ _ ]) -> Ok 1
+  | Ast.ECall ({ expr_desc = Ast.EIdent "TwoArgs"; _ }, [ _ ]) -> Ok 2
+  | Ast.ECall ({ expr_desc = Ast.EIdent "ThreeArgs"; _ }, [ _ ]) -> Ok 3
+  | _ -> Error "expected NoArgs/OneArg/TwoArgs/ThreeArgs intrinsic wrapper"
+
+let intrinsic_spec_from_manifest_expr (expr : Ast.expr) =
+  match expr.expr_desc with
+  | Ast.ECall
+      ( { expr_desc = Ast.EIdent "intrinsic_spec"; _ },
+        [
+          { expr_desc = Ast.ELiteral (Ast.LitString (name, _)); _ };
+          intrinsic;
+        ] ) -> (
+      match intrinsic_arity_from_manifest_expr intrinsic with
+      | Ok arity -> Ok (name, arity)
+      | Error message -> Error (Printf.sprintf "%s: %s" name message))
+  | _ -> Error "expected intrinsic_spec(name, arity-wrapper)"
+
+let rec intrinsic_manifest_exprs_from_decl (decl : Ast.decl) =
+  match decl.decl_desc with
+  | Ast.DPrivate inner -> intrinsic_manifest_exprs_from_decl inner
+  | Ast.DVar
+      {
+        var_name = Some "INTRINSIC_SPECS";
+        var_value = { expr_desc = Ast.EList specs; _ };
+        _;
+      } ->
+      Some specs
+  | _ -> None
+
+(* Temporary migration invariant: OCaml Core projection still consults
+   [Core_ownership]. Parse the canonical Blorp manifest structurally instead of
+   maintaining another name list; delete this check with the OCaml projection. *)
+let renderer_intrinsic_specs () =
+  let path =
+    find_project_file
+      "compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp"
+  in
+  let sess = Blorp.Session.create () in
+  let program =
+    match
+      Blorp.Modules.parse_raw_source ~sess ~filename:path (read_file path)
+    with
+    | Ok program -> program
+    | Error error ->
+        Alcotest.failf "failed to parse canonical intrinsic manifest: %s"
+          error.message
+  in
+  let manifest_exprs =
+    match List.find_map intrinsic_manifest_exprs_from_decl program with
+    | Some specs -> specs
+    | None -> Alcotest.fail "canonical INTRINSIC_SPECS declaration not found"
+  in
+  List.map
+    (fun expr ->
+      match intrinsic_spec_from_manifest_expr expr with
+      | Ok spec -> spec
+      | Error message ->
+          Alcotest.failf "malformed canonical intrinsic manifest entry: %s"
+            message)
+    manifest_exprs
+
+let test_blorp_intrinsics_have_ocaml_projection_contracts () =
+  let specs = renderer_intrinsic_specs () in
+  Alcotest.(check bool) "canonical Blorp intrinsic manifest is nonempty" true
+    (specs <> []);
+  let missing =
+    specs
+    |> List.filter_map (fun (name, arity) ->
+        match intrinsic_contract name arity with
+        | Some contract -> (
+            match validate_contract contract with
+            | [] -> None
+            | violations ->
+                Some
+                  (Printf.sprintf "%s/%d: %s" name arity
+                     (String.concat "; "
+                        (List.map string_of_contract_violation violations))))
+        | None -> Some (Printf.sprintf "%s/%d: missing" name arity))
+  in
+  Alcotest.(check (list string))
+    "canonical Blorp intrinsics missing OCaml projection ownership contracts"
+    [] missing
+
 let rec ml_files_under dir =
   Sys.readdir dir |> Array.to_list
   |> List.concat_map (fun name ->
@@ -1440,6 +1650,8 @@ let suite =
           test_channel_try_recv_attempt_borrows_channel;
         Alcotest.test_case "channel_recv_timeout_attempt_borrows_channel" `Quick
           test_channel_recv_timeout_attempt_borrows_channel;
+        Alcotest.test_case "channel runtime builtin contract matrix" `Quick
+          test_channel_runtime_builtin_contract_matrix;
         Alcotest.test_case "file_close_finalizers_consume_handles" `Quick
           test_file_close_finalizers_consume_handles;
         Alcotest.test_case "file_path_operations_borrow_paths" `Quick
@@ -1537,6 +1749,8 @@ let suite =
           test_string_find_byte_from_borrows;
         Alcotest.test_case "string_copy_bytes_borrows" `Quick
           test_string_copy_bytes_borrows;
+        Alcotest.test_case "string runtime builtin contract matrix" `Quick
+          test_string_runtime_builtin_contract_matrix;
         Alcotest.test_case "checked_get_borrows_and_aliases" `Quick
           test_checked_get_borrows_and_aliases;
         Alcotest.test_case "ranked_checked_get_shape_contracts" `Quick
@@ -1586,6 +1800,8 @@ let suite =
           test_builtin_contract_table_void_boxed_args_are_supported;
         Alcotest.test_case "builtin_contract_table_rejects_unsupported_arities"
           `Quick test_builtin_contract_table_rejects_unsupported_arities;
+        Alcotest.test_case "Blorp intrinsics have OCaml projection contracts"
+          `Quick test_blorp_intrinsics_have_ocaml_projection_contracts;
         Alcotest.test_case
           "generated_ckbuiltins_have_explicit_ownership_coverage" `Quick
           test_generated_ckbuiltins_have_explicit_ownership_coverage;

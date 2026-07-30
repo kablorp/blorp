@@ -176,41 +176,6 @@ let test_fresh_meta_uses_ambient () =
       ());
   Alcotest.(check int) "ambient session's counter bumped" 1 s.fresh_meta_counter
 
-(* ============================================================================
-   assert_in_scope — debug guard for "no with_current frame is active"
-   ============================================================================
-
-   Per Phase 2.1's deferred follow-up: catch latent aliasing when per-buffer
-   LSP sessions come online. When a caller forgets to wrap its work in
-   [with_current], every nested [Session.current ()] call returns the
-   process-wide default session — silently sharing state across what should
-   be isolated boundaries. [assert_in_scope] gives that mistake a loud
-   failure mode in tests / debug builds. *)
-
-let test_assert_in_scope_raises_outside_frame () =
-  Alcotest.check_raises "raises outside with_current"
-    (Failure "Session.assert_in_scope: no with_current frame active") (fun () ->
-      Session.assert_in_scope ())
-
-let test_assert_in_scope_ok_inside_frame () =
-  let s = Session.create () in
-  Session.with_current s (fun () ->
-      Session.assert_in_scope ();
-      (* must not raise *)
-      Alcotest.(check pass) "in scope" () ())
-
-let test_assert_in_scope_nested_frames () =
-  let outer = Session.create () in
-  let inner = Session.create () in
-  Session.with_current outer (fun () ->
-      Session.assert_in_scope ();
-      Session.with_current inner (fun () -> Session.assert_in_scope ());
-      Session.assert_in_scope () (* still in outer frame *));
-  (* Exited both frames; should raise again *)
-  Alcotest.check_raises "raises after all frames exit"
-    (Failure "Session.assert_in_scope: no with_current frame active") (fun () ->
-      Session.assert_in_scope ())
-
 let mentions s needle =
   let nl = String.length needle in
   let sl = String.length s in
@@ -893,7 +858,7 @@ let test_pkg_root_discovered_from_base_dir () =
       let expected_root = Unix.realpath pkg_root in
       Alcotest.(check bool)
         "package root discovered" true
-        (List.mem expected_root (Modules.package_roots ~sess ())))
+        (List.mem expected_root sess.package_roots))
 
 let test_pkg_import_resolves_with_package_origin () =
   with_temp_dir "blorp_pkg_import" (fun dir ->
@@ -1079,11 +1044,10 @@ let test_reusable_reset_preserves_only_parse_cache () =
   s.search_paths <- [ "/tmp/search" ];
   s.package_roots <- [ "/tmp/pkg" ];
   s.source_packages <- [ pkg ];
-  Hashtbl.add s.module_cache "demo/mod" (mk_loaded_module ~name:"demo/mod" ~decls:[]);
+  Hashtbl.add s.module_cache "demo/mod"
+    (mk_loaded_module ~name:"demo/mod" ~decls:[]);
   Hashtbl.add s.parse_cache "demo/mod" parsed_entry;
   Hashtbl.add s.type_index "Widget" (Session.UniqueTypeHome "demo/mod");
-  Hashtbl.add s.resource_cleanup_index "Widget"
-    (Ast.ResourceCleanupBuiltin "cleanup_widget");
   Hashtbl.add s.trait_index "Renderable" "demo/mod";
   s.std_override_dir <- Some "/tmp/std";
   s.std_override_active <- true;
@@ -1114,9 +1078,6 @@ let test_reusable_reset_preserves_only_parse_cache () =
     (Hashtbl.find_opt s.parse_cache "demo/mod" = Some parsed_entry);
   Alcotest.(check int) "module cache cleared" 0 (Hashtbl.length s.module_cache);
   Alcotest.(check int) "type index cleared" 0 (Hashtbl.length s.type_index);
-  Alcotest.(check int)
-    "resource cleanup index cleared" 0
-    (Hashtbl.length s.resource_cleanup_index);
   Alcotest.(check int) "trait index cleared" 0 (Hashtbl.length s.trait_index);
   Alcotest.(check (list string)) "search paths cleared" [] s.search_paths;
   Alcotest.(check int) "package roots cleared" 0 (List.length s.package_roots);
@@ -1164,32 +1125,6 @@ let test_type_index_preserves_ambiguous_homes () =
   Alcotest.(check (list string))
     "ambiguous type homes" [ "test/a"; "test/b" ]
     (Session.find_type_homes s "Widget")
-
-let test_modules_reset_clears_resource_cleanup_index () =
-  let s = Session.create () in
-  Session.register_resource_cleanup s ~type_name:"Widget"
-    (Ast.ResourceCleanupBuiltin "close_widget");
-  (match Session.find_resource_cleanup s "Widget" with
-  | Some (Ast.ResourceCleanupBuiltin name) ->
-      Alcotest.(check string) "registered cleanup" "close_widget" name
-  | None -> Alcotest.fail "expected registered cleanup");
-  Modules.reset ~sess:s ();
-  Alcotest.(check bool)
-    "resource cleanup cleared" true
-    (Session.find_resource_cleanup s "Widget" = None)
-
-let test_resource_cleanup_registry_isolated_across_sessions () =
-  let s1 = Session.create () in
-  let s2 = Session.create () in
-  Session.register_resource_cleanup s1 ~type_name:"Widget"
-    (Ast.ResourceCleanupBuiltin "close_widget");
-  (match Session.find_resource_cleanup s1 "Widget" with
-  | Some (Ast.ResourceCleanupBuiltin name) ->
-      Alcotest.(check string) "registered cleanup" "close_widget" name
-  | None -> Alcotest.fail "expected registered cleanup");
-  Alcotest.(check bool)
-    "s2 does not see s1 cleanup" true
-    (Session.find_resource_cleanup s2 "Widget" = None)
 
 (* ============================================================================
    DefId minting + UFCS def_id table
@@ -1342,10 +1277,6 @@ let suite =
           test_modules_reset_clears_type_index;
         Alcotest.test_case "ambiguous type homes" `Quick
           test_type_index_preserves_ambiguous_homes;
-        Alcotest.test_case "reset clears resource cleanup index" `Quick
-          test_modules_reset_clears_resource_cleanup_index;
-        Alcotest.test_case "resource cleanup registry isolated" `Quick
-          test_resource_cleanup_registry_isolated_across_sessions;
         Alcotest.test_case "blorp.toml std path" `Quick
           test_blorp_toml_std_path_sets_override;
         Alcotest.test_case "BLORP_STD overrides blorp.toml" `Quick
@@ -1407,15 +1338,6 @@ let suite =
           test_with_current_restores_on_exception;
         Alcotest.test_case "fresh_meta_ambient" `Quick
           test_fresh_meta_uses_ambient;
-      ] );
-    ( "assert_in_scope",
-      [
-        Alcotest.test_case "raises outside frame" `Quick
-          test_assert_in_scope_raises_outside_frame;
-        Alcotest.test_case "ok inside frame" `Quick
-          test_assert_in_scope_ok_inside_frame;
-        Alcotest.test_case "nested frames" `Quick
-          test_assert_in_scope_nested_frames;
       ] );
     ( "pipeline_isolation",
       [
