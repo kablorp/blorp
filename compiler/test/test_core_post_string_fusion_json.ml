@@ -32,6 +32,10 @@ let variable_expr name =
   kind "var"
     [ ("var", variable name); ("type", int_type); ("loc", synthetic_loc) ]
 
+let param name typ =
+  Lsp_json.Object
+    [ ("name", variable name); ("type", typ); ("loc", synthetic_loc) ]
+
 let typed_variable_expr name typ =
   kind "var" [ ("var", variable name); ("type", typ); ("loc", synthetic_loc) ]
 
@@ -135,12 +139,12 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_post_resolve_json.decode_program json with
+  match Core_post_string_fusion_json.decode_program json with
   | Ok decoded -> decoded
   | Error error ->
-      Alcotest.fail (Core_post_resolve_json.decode_error_to_string error)
+      Alcotest.fail (Core_post_string_fusion_json.decode_error_to_string error)
 
-let test_decodes_post_resolve_program () =
+let test_decodes_post_string_fusion_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -174,6 +178,165 @@ let decoded_body_exn body =
   | [ { Core.cd_desc = Core.CDFunc { cf_body = Some body; _ }; _ } ] -> body
   | _ -> Alcotest.fail "expected one decoded function body"
 
+let test_decodes_unmanaged_tailrec_loop () =
+  let recur =
+    kind "tailrec_recur"
+      [
+        ("args", Lsp_json.Array [ variable_expr "next" ]);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let loop =
+    kind "tailrec_loop"
+      [
+        ("params", Lsp_json.Array [ param "value" int_type ]);
+        ("return_type", int_type);
+        ("body", recur);
+        ("loc", synthetic_loc);
+      ]
+  in
+  match (decoded_body_exn loop).Core.desc with
+  | Core.CTailrecLoop
+      (Core.TailrecUnmanagedLoop
+        {
+          tul_params = [ parameter ];
+          tul_return_ty;
+          tul_body =
+            {
+              desc =
+                Core.CTailrecRecur
+                  (Core.TailrecRecur { tr_args = [ _ ] });
+              _;
+            };
+        }) ->
+      Alcotest.(check string) "parameter" "value" parameter.cp_name.vname;
+      Alcotest.(check string)
+        "return type" "Int" (Types.type_to_string tul_return_ty)
+  | _ -> Alcotest.fail "expected decoded unmanaged tailrec loop"
+
+let test_decodes_list_spread_tailrec_loop () =
+  let list_type = named_type_with_args "List" [ int_type ] in
+  let recur =
+    kind "tailrec_list_spread_recur"
+      [
+        ( "rebinds",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("param_index", Lsp_json.Int 1);
+                  ("value", variable_expr "next_acc");
+                ];
+            ] );
+        ("cursor_advance", Lsp_json.Int 1);
+        ("type", int_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let loop =
+    kind "tailrec_list_spread_loop"
+      [
+        ( "loop",
+          Lsp_json.Object
+            [
+              ( "params",
+                Lsp_json.Array
+                  [ param "items" list_type; param "acc" int_type ] );
+              ("return_type", int_type);
+              ("list_index", Lsp_json.Int 0);
+              ("list_param", param "items" list_type);
+              ("cursor", variable "__tailrec_list_index_0");
+              ("layout", kind "pointer" []);
+              ("body", recur);
+            ] );
+        ("loc", synthetic_loc);
+      ]
+  in
+  match (decoded_body_exn loop).Core.desc with
+  | Core.CTailrecLoop
+      (Core.TailrecListSpreadLoop
+        {
+          tls_list_index = 0;
+          tls_list_param;
+          tls_cursor_var;
+          tls_body =
+            {
+              desc =
+                Core.CTailrecRecur
+                  (Core.TailrecListSpreadRecur
+                    {
+                      tr_rebinds = [ (1, _) ];
+                      tr_cursor_advance = 1;
+                    });
+              _;
+            };
+          _;
+        }) ->
+      Alcotest.(check string) "list parameter" "items"
+        tls_list_param.cp_name.vname;
+      Alcotest.(check string) "cursor" "__tailrec_list_index_0"
+        tls_cursor_var.vname
+  | _ -> Alcotest.fail "expected decoded list-spread tailrec loop"
+
+let test_rejects_invalid_list_spread_tailrec_indices () =
+  let list_type = named_type_with_args "List" [ int_type ] in
+  let invalid_loop =
+    kind "tailrec_list_spread_loop"
+      [
+        ( "loop",
+          Lsp_json.Object
+            [
+              ("params", Lsp_json.Array [ param "items" list_type ]);
+              ("return_type", int_type);
+              ("list_index", Lsp_json.Int 1);
+              ("list_param", param "items" list_type);
+              ("cursor", variable "__tailrec_list_index_0");
+              ("layout", kind "pointer" []);
+              ("body", int_literal 0);
+            ] );
+        ("loc", synthetic_loc);
+      ]
+  in
+  match
+    Core_post_string_fusion_json.decode_program
+      (program [ function_decl ~body:(Some invalid_loop) "main" 1 ])
+  with
+  | Error error ->
+      Alcotest.(check string) "path"
+        "program.decls[0].body.loop.list_index" error.path
+  | Ok _ -> Alcotest.fail "invalid tailrec list parameter index was accepted"
+
+let test_rejects_inconsistent_list_spread_tailrec_parameter () =
+  let list_type = named_type_with_args "List" [ int_type ] in
+  let invalid_loop =
+    kind "tailrec_list_spread_loop"
+      [
+        ( "loop",
+          Lsp_json.Object
+            [
+              ("params", Lsp_json.Array [ param "items" list_type ]);
+              ("return_type", int_type);
+              ("list_index", Lsp_json.Int 0);
+              ("list_param", param "other_items" list_type);
+              ("cursor", variable "__tailrec_list_index_0");
+              ("layout", kind "pointer" []);
+              ("body", int_literal 0);
+            ] );
+        ("loc", synthetic_loc);
+      ]
+  in
+  match
+    Core_post_string_fusion_json.decode_program
+      (program [ function_decl ~body:(Some invalid_loop) "main" 1 ])
+  with
+  | Error error ->
+      Alcotest.(check string) "path"
+        "program.decls[0].body.loop.list_param" error.path
+  | Ok _ ->
+      Alcotest.fail
+        "tailrec list parameter inconsistent with the indexed parameter was accepted"
+
 let test_rejects_late_ownership_node () =
   let late_dup =
     kind "dup"
@@ -187,10 +350,10 @@ let test_rejects_late_ownership_node () =
       ]
   in
   let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
-  match Core_post_resolve_json.decode_program json with
+  match Core_post_string_fusion_json.decode_program json with
   | Ok _ ->
       Alcotest.fail
-        "late ownership Core crossed the post-resolution boundary"
+        "late ownership Core crossed the post-string-fusion boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -328,7 +491,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_post_resolve_json.decode_program json with
+  match Core_post_string_fusion_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -391,13 +554,13 @@ let test_rejects_deferred_trait_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_resolve_json.decode_program
+    Core_post_string_fusion_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved deferred trait call reached the post-resolution boundary"
+        "unresolved deferred trait call reached the post-string-fusion boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "deferred trait dispatch crossed the resolved boundary"
@@ -411,13 +574,13 @@ let test_rejects_selected_direct_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_resolve_json.decode_program
+    Core_post_string_fusion_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved selected direct call reached the post-resolution boundary"
+        "unresolved selected direct call reached the post-string-fusion boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "selected direct call crossed the resolved boundary"
@@ -437,13 +600,13 @@ let test_rejects_selected_trait_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_resolve_json.decode_program
+    Core_post_string_fusion_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved selected trait call reached the post-resolution boundary"
+        "unresolved selected trait call reached the post-string-fusion boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "selected trait dispatch crossed the resolved boundary"
@@ -467,11 +630,11 @@ let test_rejects_generic_impl_template () =
         ("loc", synthetic_loc);
       ]
   in
-  match Core_post_resolve_json.decode_program (program [ impl_decl ]) with
+  match Core_post_string_fusion_json.decode_program (program [ impl_decl ]) with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "generic impl template is not valid post-resolution"
+        "generic impl template is not valid post-string-fusion"
         error.message
   | Ok _ -> Alcotest.fail "generic impl template crossed the runtime boundary"
 
@@ -602,7 +765,7 @@ let test_decodes_precompiled_constructor_match () =
       ()
   | _ ->
       Alcotest.fail
-        "precompiled constructor match changed across the post-resolution boundary"
+        "precompiled constructor match changed across the post-string-fusion boundary"
 
 let test_decodes_specialized_match_accessor () =
   let binding =
@@ -642,17 +805,17 @@ let test_decodes_specialized_match_accessor () =
       ()
   | _ ->
       Alcotest.fail
-        "specialized match accessor changed across the post-resolution boundary"
+        "specialized match accessor changed across the post-string-fusion boundary"
 
 let test_rejects_ownership_bearing_constructor_match () =
   let body = precompiled_constructor_match "arc" in
   match
-    Core_post_resolve_json.decode_program
+    Core_post_string_fusion_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Ok _ ->
       Alcotest.fail
-        "ownership-bearing constructor match crossed the post-resolution boundary"
+        "ownership-bearing constructor match crossed the post-string-fusion boundary"
   | Error error ->
       Alcotest.(check string) "path"
         "program.decls[0].body.scrutinee_release_policy" error.path;
@@ -670,11 +833,11 @@ let test_rejects_raw_match () =
       ]
   in
   match
-    Core_post_resolve_json.decode_program
+    Core_post_string_fusion_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Ok _ ->
-      Alcotest.fail "raw match crossed the post-resolution boundary"
+      Alcotest.fail "raw match crossed the post-string-fusion boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -942,8 +1105,17 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes post-resolution program" `Quick
-          test_decodes_post_resolve_program;
+        Alcotest.test_case "decodes post-string-fusion program" `Quick
+          test_decodes_post_string_fusion_program;
+        Alcotest.test_case "decodes unmanaged tailrec loop" `Quick
+          test_decodes_unmanaged_tailrec_loop;
+        Alcotest.test_case "decodes list-spread tailrec loop" `Quick
+          test_decodes_list_spread_tailrec_loop;
+        Alcotest.test_case "rejects invalid list-spread tailrec indices" `Quick
+          test_rejects_invalid_list_spread_tailrec_indices;
+        Alcotest.test_case
+          "rejects inconsistent list-spread tailrec parameter" `Quick
+          test_rejects_inconsistent_list_spread_tailrec_parameter;
         Alcotest.test_case "preserves union payload storage" `Quick
           test_preserves_union_payload_storage;
         Alcotest.test_case "rejects later ownership node" `Quick

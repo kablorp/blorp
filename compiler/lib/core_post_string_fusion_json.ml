@@ -1,14 +1,14 @@
-(** Strict structural decoder for the Blorp-owned post-resolution Core handoff.
+(** Strict structural decoder for the Blorp-owned post-string-fusion Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
     post-desugar, post-mono, post-match, post-trait-resolution, and
-    post-resolution semantic
-    invariant checks immediately after this structural decode. The accepted expression set
-    includes semantic decision trees created by match compilation and the
-    non-owning constructor test synthesized before that stage. It rejects raw
-    matches and ownership-bearing backend forms so a pass cannot accidentally
-    run twice or lose a release policy during projection. *)
+    post-resolution, post-std-inline, post-tailrec, and post-string-fusion
+    semantic invariant checks immediately after this structural decode. The
+    accepted expression set includes semantic decision trees created by match
+    compilation and the non-owning constructor test synthesized before that
+    stage. It rejects raw matches and ownership-bearing backend forms so a pass
+    cannot accidentally run twice or lose a release policy during projection. *)
 
 type decode_error = { path : string; message : string }
 
@@ -299,13 +299,13 @@ let decode_call_kind path value =
   | "unknown" -> Ok Core.CKUnknown
   | "selected_direct" ->
       error (path_field path "kind")
-        "unresolved selected direct call reached the post-resolution boundary"
+        "unresolved selected direct call reached the post-string-fusion boundary"
   | "deferred_trait" ->
       error (path_field path "kind")
-        "unresolved deferred trait call reached the post-resolution boundary"
+        "unresolved deferred trait call reached the post-string-fusion boundary"
   | "selected_trait" ->
       error (path_field path "kind")
-        "unresolved selected trait call reached the post-resolution boundary"
+        "unresolved selected trait call reached the post-string-fusion boundary"
   | "user" ->
       let* name = string_field path "name" value in
       let* id = optional_int_field path "def_id" value in
@@ -327,7 +327,7 @@ let decode_call_kind path value =
   | _ ->
       error (path_field path "kind")
         ("call kind `" ^ tag
-       ^ "` is not valid at the post-resolution boundary")
+       ^ "` is not valid at the post-string-fusion boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -518,10 +518,16 @@ let rec decode_expr path value =
   | "select" -> decode_select_expr path value
   | "semantic_match" -> decode_semantic_match_expr path value
   | "constructor_match" -> decode_precompiled_constructor_match_expr path value
+  | "tailrec_loop" -> decode_tailrec_loop_expr path value
+  | "tailrec_recur" -> decode_tailrec_recur_expr path value
+  | "tailrec_list_spread_loop" ->
+      decode_tailrec_list_spread_loop_expr path value
+  | "tailrec_list_spread_recur" ->
+      decode_tailrec_list_spread_recur_expr path value
   | _ ->
       error (path_field path "kind")
         ("Core expression `" ^ tag
-       ^ "` is not valid at the post-resolution boundary")
+       ^ "` is not valid at the post-string-fusion boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -531,6 +537,82 @@ and decode_typed_expr path value desc =
 and decode_expr_field path name value =
   let* value = field path name value in
   decode_expr (path_field path name) value
+
+and decode_tailrec_loop_expr path value =
+  let* tul_params = list_field decode_param path "params" value in
+  let* tul_return_ty = decode_type_field path "return_type" value in
+  let* tul_body = decode_expr_field path "body" value in
+  let* loc = decode_loc_field path "loc" value in
+  Ok
+    (Core.mk ~loc ~ty:tul_return_ty
+       (Core.CTailrecLoop
+          (Core.TailrecUnmanagedLoop
+             { tul_params; tul_return_ty; tul_body })))
+
+and decode_tailrec_recur_expr path value =
+  let* tr_args = list_field decode_expr path "args" value in
+  decode_typed_expr path value
+    (Core.CTailrecRecur (Core.TailrecRecur { tr_args }))
+
+and decode_tailrec_list_spread_loop_expr path value =
+  let* loop = field path "loop" value in
+  let loop_path = path_field path "loop" in
+  let* tls_params = list_field decode_param loop_path "params" loop in
+  let* tls_return_ty = decode_type_field loop_path "return_type" loop in
+  let* tls_list_index = int_field loop_path "list_index" loop in
+  let* tls_list_param_json = field loop_path "list_param" loop in
+  let* tls_list_param =
+    decode_param (path_field loop_path "list_param") tls_list_param_json
+  in
+  let* tls_cursor_var = decode_var_field loop_path "cursor" loop in
+  let* layout_json = field loop_path "layout" loop in
+  let* _layout = decode_list_slots (path_field loop_path "layout") layout_json in
+  let* tls_body = decode_expr_field loop_path "body" loop in
+  let* loc = decode_loc_field path "loc" value in
+  if tls_list_index < 0 || tls_list_index >= List.length tls_params then
+    error (path_field loop_path "list_index")
+      "tailrec list parameter index is outside the parameter list"
+  else
+    let indexed_param = List.nth tls_params tls_list_index in
+    if
+      (not (Core.Var.equal indexed_param.cp_name tls_list_param.cp_name))
+      || not (Types.types_equal indexed_param.cp_ty tls_list_param.cp_ty)
+    then
+      error (path_field loop_path "list_param")
+        "tailrec list parameter does not match the indexed parameter"
+    else
+      Ok
+        (Core.mk ~loc ~ty:tls_return_ty
+           (Core.CTailrecLoop
+              (Core.TailrecListSpreadLoop
+                 {
+                   tls_params;
+                   tls_return_ty;
+                   tls_list_index;
+                   tls_list_param;
+                   tls_cursor_var;
+                   tls_body;
+                 })))
+
+and decode_tailrec_list_spread_recur_expr path value =
+  let decode_rebind rebind_path rebind =
+    let* param_index = int_field rebind_path "param_index" rebind in
+    let* rebind_value = decode_expr_field rebind_path "value" rebind in
+    if param_index < 0 then
+      error (path_field rebind_path "param_index")
+        "tailrec parameter index must be non-negative"
+    else Ok (param_index, rebind_value)
+  in
+  let* tr_rebinds = list_field decode_rebind path "rebinds" value in
+  let* tr_cursor_advance = int_field path "cursor_advance" value in
+  if tr_cursor_advance < 0 then
+    error (path_field path "cursor_advance")
+      "tailrec list cursor advance must be non-negative"
+  else
+    decode_typed_expr path value
+      (Core.CTailrecRecur
+         (Core.TailrecListSpreadRecur
+            { tr_rebinds; tr_cursor_advance }))
 
 and decode_param path value =
   let* cp_name = decode_var_field path "name" value in
@@ -990,7 +1072,7 @@ and decode_precompiled_constructor_match_body path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match body `" ^ tag
-       ^ "` is not valid at the post-resolution boundary")
+       ^ "` is not valid at the post-string-fusion boundary")
 
 and decode_precompiled_match_fallback path value =
   let* tag = kind path value in
@@ -1006,7 +1088,7 @@ and decode_precompiled_match_fallback path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match fallback `" ^ tag
-       ^ "` is not valid at the post-resolution boundary")
+       ^ "` is not valid at the post-string-fusion boundary")
 
 and prepend_match_bindings bindings tree =
   match tree with
@@ -1078,7 +1160,7 @@ let decode_function_kind path value =
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
   | _ ->
       error (path_field path "kind")
-        ("function kind `" ^ tag ^ "` is not valid post-resolution")
+        ("function kind `" ^ tag ^ "` is not valid post-string-fusion")
 
 let decode_function path value =
   let* name = string_field path "name" value in
@@ -1229,7 +1311,7 @@ and decode_impl_decl path value loc =
     | [] -> Ok ()
     | _ ->
         error (path_field path "type_params")
-          "generic impl template is not valid post-resolution"
+          "generic impl template is not valid post-string-fusion"
   in
   let* ci_methods = list_field decode_function path "methods" value in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }

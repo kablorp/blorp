@@ -23,18 +23,20 @@ import:
 			CoreEarlyMatchStage,
 			CoreEarlyMonoStage,
 			CoreEarlyResolveStage,
+			CoreEarlyStdInlineStage,
 			CoreEarlySynthStage,
+			CoreEarlyTailrecStage,
 			CoreEarlyTraitResolveStage,
 		),
 		core_early_pipeline_stage_name,
 		core_early_pipeline_stages_equal,
 		parse_core_early_pipeline_stage,
 		run_early_core_pipeline,
-		run_early_core_pipeline_with_resolve,
+		run_early_core_pipeline_to_semantic_middle,
 	../src/stage_09_core/compiler_core_json:
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(PrimBox),
-		CoreCallKind(SelectedDirectCall),
+		CoreCallKind(IntrinsicCall, SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			BinaryExpr,
@@ -56,10 +58,12 @@ import:
 		CoreTensorDim(TensorStaticDim),
 		CoreType(FunctionType, NamedType, TensorType, TypeParameterType, VoidType),
 		CoreVar,
+		core_expr_type,
 	../src/stage_09_core/compiler_core_mono_specialize:
 		CoreMonoDiagnostic(CoreMonoCannotInferTypeArgument),
 	../src/stage_09_core/compiler_core_synth_error:
 		CoreSynthError(UnsupportedTensorReductionElement),
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
 	test: TestSuite
 
 
@@ -137,6 +141,45 @@ pure func selected_call(
 	)
 
 
+private pure func user_call(
+	name: String,
+	def_id: Int,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UserCall(name, Some(def_id), []),
+		VarExpr(
+			named_var(name, Some(def_id)),
+			FunctionType(
+				True,
+				args.map(core_expr_type),
+				return_type,
+			),
+			SyntheticSourceLoc,
+		),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func count_intrinsic(name: String, expr: CoreExpr) -> Int:
+	var count: Int = match expr:
+		CallExpr(IntrinsicCall(actual), _, _, _, _):
+			if actual == name:
+				1
+			else:
+				0
+		_:
+			0
+
+	for child in immediate_core_expr_children(expr):
+		count += count_intrinsic(name, child)
+
+	count
+
+
 pure func program(decls: List[CoreDecl]) -> CoreProgram:
 	{
 		decls = decls,
@@ -168,6 +211,8 @@ func test_stage_names_round_trip() -> Bool:
 		CoreEarlyMatchStage,
 		CoreEarlyTraitResolveStage,
 		CoreEarlyResolveStage,
+		CoreEarlyStdInlineStage,
+		CoreEarlyTailrecStage,
 	]
 
 	stages.all(pure func(stage):
@@ -520,7 +565,7 @@ func test_pipeline_owns_call_resolution_before_worker_boundary() -> Bool:
 	)
 
 	match (
-		run_early_core_pipeline_with_resolve(
+		run_early_core_pipeline_to_semantic_middle(
 			{
 				program = program([FunctionDecl(main)]),
 				next_def_id = 100
@@ -648,6 +693,47 @@ func test_pipeline_applies_debug_mode_before_invariant_check() -> Bool:
 			False
 
 
+func test_pipeline_owns_string_fusion_before_worker_boundary() -> Bool:
+	string_type: CoreType = named_type("String")
+	int_type: CoreType = named_type("Int")
+	reversed: CoreExpr = user_call(
+		"std_string__reverse",
+		401,
+		[LiteralExpr(StringLiteral("abc"), string_type, SyntheticSourceLoc)],
+		string_type,
+	)
+	length: CoreExpr = user_call("HasLength_length_String", 402, [reversed], int_type)
+
+	match (
+		run_early_core_pipeline_to_semantic_middle(
+			{
+				program = program([FunctionDecl(function("main", 20, [], [], int_type, length))]),
+				next_def_id = 500
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+			[],
+			[],
+		)
+	):
+		CoreEarlyPipelineCompleted(output):
+			match output.program.decls:
+				[FunctionDecl(function_info)]:
+					match function_info.body:
+						Some(body):
+							count_intrinsic("string_len", body) > 0
+						None:
+							False
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler early Core pipeline",
 	tests = [
@@ -693,6 +779,10 @@ tests: TestSuite = {
 		(
 			"pipeline applies debug mode before invariant check",
 			test_pipeline_applies_debug_mode_before_invariant_check,
+		),
+		(
+			"pipeline owns string fusion before worker boundary",
+			test_pipeline_owns_string_fusion_before_worker_boundary,
 		),
 	]
 }

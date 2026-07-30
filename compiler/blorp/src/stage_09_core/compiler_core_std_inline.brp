@@ -1,0 +1,2595 @@
+-- Narrow call-site expansion for compiler-owned collection wrappers.
+--
+-- This is deliberately not a general inliner. It exposes the ownership and
+-- layout operations in a small set of synthesized std wrappers to the later
+-- Core pipeline. Target identity is the resolved `(name, def_id)` pair; source
+-- spellings alone never authorize expansion.
+import:
+	../stage_08_core_lower/compiler_core_identity: sanitize_core_module_name
+	compiler_core_json:
+		CoreBoxedStorageValue,
+		CoreCallKind(UserCall),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDictLiteralEntry,
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ConstructorMatchExpr,
+			DictExpr,
+			DropExpr,
+			DupExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			LogicalExpr,
+			RangeExpr,
+			RecordExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			TensorLiteralExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleExpr,
+			VarExpr,
+			VectorExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreListConstruct,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc,
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreType,
+		CoreVar,
+	compiler_core_traverse: immediate_core_expr_children, map_core_expr_children
+
+
+private enum StdInlineArgBinding:
+	StdInlineBorrowExisting
+	StdInlineOwnBinding
+	StdInlineSubstituteExisting
+
+
+private record StdInlineTarget {
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	arg_bindings: List[StdInlineArgBinding],
+	body: CoreExpr
+}
+
+
+private record StdInlineRename {
+	original: CoreVar,
+	replacement: CoreVar
+}
+
+
+private record StdInlinePreparedArg {
+	param: CoreParam,
+	binding: StdInlineArgBinding,
+	arg: CoreExpr
+}
+
+
+private record StdInlinePreparedArgs {
+	next_id: Int,
+	renames: List[StdInlineRename],
+	bindings: List[StdInlinePreparedArg]
+}
+
+
+private record StdInlineExprResult {
+	next_id: Int,
+	expr: CoreExpr
+}
+
+
+private record StdInlineExprsResult {
+	next_id: Int,
+	exprs: List[CoreExpr]
+}
+
+
+private record StdInlineBoxedValuesResult {
+	next_id: Int,
+	values: List[CoreBoxedStorageValue]
+}
+
+
+private record StdInlineDictEntriesResult {
+	next_id: Int,
+	entries: List[CoreDictLiteralEntry]
+}
+
+
+private record StdInlineRecordFieldsResult {
+	next_id: Int,
+	fields: List[CoreRecordFieldValue]
+}
+
+
+private record StdInlineOptionalExprResult {
+	next_id: Int,
+	expr: Option[CoreExpr]
+}
+
+
+private record StdInlineConcurrentBindingsResult {
+	next_id: Int,
+	bindings: List[CorePreClosureConcurrentBinding]
+}
+
+
+private record StdInlineSelectArmsResult {
+	next_id: Int,
+	arms: List[CoreSelectArm]
+}
+
+
+private record StdInlineConstructorBodyResult {
+	next_id: Int,
+	body: CoreConstructorMatchBody
+}
+
+
+private record StdInlineConstructorCasesResult {
+	next_id: Int,
+	cases: List[CoreConstructorMatchCase]
+}
+
+
+private record StdInlineConstructorFallbackResult {
+	next_id: Int,
+	fallback: CoreConstructorMatchFallback
+}
+
+
+private record StdInlineLiteralCasesResult {
+	next_id: Int,
+	cases: List[CoreLiteralMatchCase]
+}
+
+
+private record StdInlineLiteralFallbackResult {
+	next_id: Int,
+	fallback: CoreLiteralMatchFallback
+}
+
+
+private record StdInlineLengthBranchResult {
+	next_id: Int,
+	branch: CoreConstructorLengthMatchBranch
+}
+
+
+private record StdInlineExpandedCall {
+	next_id: Int,
+	expr: Option[CoreExpr]
+}
+
+
+private record StdInlineSemanticResult {
+	next_id: Int,
+	tree: CoreSemanticMatchTree
+}
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq
+
+
+private pure func strip_mono_suffix(name: String) -> String:
+	index: Int = name.raw_index_of("__mono_")
+
+	if index < 0:
+		name
+	else:
+		name.substring(0, index)
+
+
+private pure func source_name(function_info: CoreFunction) -> String:
+	without_mono: String = strip_mono_suffix(function_info.name)
+
+	without_module: String = match function_info.source_module:
+		Some(module_name):
+			prefix: String = sanitize_core_module_name(module_name) + "__"
+
+			if without_mono.starts_with(prefix):
+				without_mono.substring(prefix.length(), without_mono.length() - prefix.length())
+			else:
+				without_mono
+		None:
+			without_mono
+
+	if without_module.ends_with("__pure"):
+		without_module.substring(0, without_module.length() - "__pure".length())
+	else:
+		without_module
+
+
+private pure func readonly_bindings(params: List[CoreParam]) -> List[StdInlineArgBinding]:
+	params.map(pure func(_): StdInlineBorrowExisting)
+
+
+private pure func list_bindings(
+	name: String,
+	params: List[CoreParam],
+) -> Option[List[StdInlineArgBinding]]:
+	match name:
+		"length" | "get":
+			Some(readonly_bindings(params))
+		"get_or":
+			if params.length() == 3:
+				Some([
+					StdInlineBorrowExisting,
+					StdInlineBorrowExisting,
+					StdInlineOwnBinding,
+				])
+			else:
+				Some(readonly_bindings(params))
+		"append" | "__unsafe_list_append":
+			if params.is_empty():
+				None
+			else:
+				Some([StdInlineSubstituteExisting].concat(readonly_bindings(params.drop(1))))
+		_:
+			None
+
+
+private pure func tensor_bindings(
+	name: String,
+	params: List[CoreParam],
+) -> Option[List[StdInlineArgBinding]]:
+	if name == "get_or":
+		Some(readonly_bindings(params))
+	else:
+		None
+
+
+private pure func target_bindings(function_info: CoreFunction) -> Option[List[StdInlineArgBinding]]:
+	match function_info.source_module:
+		Some(module_name):
+			match module_name:
+				"std/list":
+					list_bindings(source_name(function_info), function_info.params)
+				"std/tensor":
+					tensor_bindings(source_name(function_info), function_info.params)
+				_:
+					None
+		_:
+			None
+
+
+private pure func collect_targets(program: CoreProgram) -> List[StdInlineTarget]:
+	var targets: List[StdInlineTarget] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match (function_info.body, target_bindings(function_info)):
+					(Some(body), Some(arg_bindings)):
+						if function_info.type_params.is_empty():
+							targets = targets.append({
+								name = function_info.name,
+								def_id = function_info.def_id,
+								params = function_info.params,
+								arg_bindings = arg_bindings,
+								body = body,
+							})
+						else:
+							void
+					_:
+						void
+			_:
+				void
+
+	targets
+
+
+private pure func find_target(
+	targets: List[StdInlineTarget],
+	name: String,
+	def_id: Int,
+) -> Option[StdInlineTarget]:
+	var found: Option[StdInlineTarget] = None
+
+	for target in targets:
+		if target.name == name and target.def_id == def_id:
+			found = Some(target)
+			break
+		else:
+			void
+
+	found
+
+
+private pure func target_is_function(
+	targets: List[StdInlineTarget],
+	function_info: CoreFunction,
+) -> Bool:
+	find_target(targets, function_info.name, function_info.def_id).is_some()
+
+
+private pure func compiler_owned_module(module_name: Option[String]) -> Bool:
+	match module_name:
+		Some(name):
+			name.starts_with("std/") or name.starts_with("pkg/")
+		None:
+			False
+
+
+private pure func renamed_var(renames: List[StdInlineRename], variable: CoreVar) -> CoreVar:
+	var replacement: CoreVar = variable
+
+	for rename in renames:
+		if core_vars_equal(rename.original, variable):
+			replacement = rename.replacement
+			break
+		else:
+			void
+
+	replacement
+
+
+private pure func fresh_var(next_id: Int, variable: CoreVar) -> (Int, CoreVar):
+	fresh_id: Int = next_id + 1
+	(fresh_id, {
+			name = "__std_inline_" + variable.name,
+			uniq = fresh_id,
+			def_id = None
+		})
+
+
+private pure func rename_binder(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	variable: CoreVar,
+) -> (Int, List[StdInlineRename], CoreVar):
+	fresh: (Int, CoreVar) = fresh_var(next_id, variable)
+	(fresh[0], [
+			{
+				original = variable,
+				replacement = fresh[1]
+			},
+		].concat(renames), fresh[1])
+
+
+private pure func rewrite_exprs(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	exprs: List[CoreExpr],
+) -> StdInlineExprsResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreExpr] = []
+
+	for expr in exprs:
+		result: StdInlineExprResult = rewrite_expr(targets, current_id, expr)
+		current_id = result.next_id
+		rewritten = rewritten.append(result.expr)
+
+	{
+		next_id = current_id,
+		exprs = rewritten
+	}
+
+
+private pure func rewrite_binary_children(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	expr: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> StdInlineExprResult:
+	children: StdInlineExprsResult = rewrite_exprs(
+		targets,
+		next_id,
+		[left, right],
+	)
+
+	match (expr, children.exprs):
+		(BinaryExpr(op, _, _, typ, loc), [rewritten_left, rewritten_right]):
+			{
+				next_id = children.next_id,
+				expr = BinaryExpr(op, rewritten_left, rewritten_right, typ, loc)
+			}
+		(LogicalExpr(op, _, _, typ, loc), [rewritten_left, rewritten_right]):
+			{
+				next_id = children.next_id,
+				expr = LogicalExpr(op, rewritten_left, rewritten_right, typ, loc)
+			}
+		_:
+			{
+				next_id = children.next_id,
+				expr = expr
+			}
+
+
+private pure func clone_exprs(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	exprs: List[CoreExpr],
+) -> StdInlineExprsResult:
+	var current_id: Int = next_id
+	var cloned: List[CoreExpr] = []
+
+	for expr in exprs:
+		result: StdInlineExprResult = clone_expr(current_id, renames, expr)
+		current_id = result.next_id
+		cloned = cloned.append(result.expr)
+
+	{
+		next_id = current_id,
+		exprs = cloned
+	}
+
+
+private pure func clone_boxed_values(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	values: List[CoreBoxedStorageValue],
+) -> StdInlineBoxedValuesResult:
+	var current_id: Int = next_id
+	var cloned: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		result: StdInlineExprResult = clone_expr(current_id, renames, value.value)
+		current_id = result.next_id
+		cloned = cloned.append({ value | value = result.expr })
+
+	{
+		next_id = current_id,
+		values = cloned
+	}
+
+
+private pure func rewrite_boxed_values(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	values: List[CoreBoxedStorageValue],
+) -> StdInlineBoxedValuesResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		result: StdInlineExprResult = rewrite_expr(targets, current_id, value.value)
+		current_id = result.next_id
+		rewritten = rewritten.append({ value | value = result.expr })
+
+	{
+		next_id = current_id,
+		values = rewritten
+	}
+
+
+private pure func clone_dict_entries(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	entries: List[CoreDictLiteralEntry],
+) -> StdInlineDictEntriesResult:
+	var current_id: Int = next_id
+	var cloned: List[CoreDictLiteralEntry] = []
+
+	for entry in entries:
+		children: StdInlineExprsResult = clone_exprs(
+			current_id,
+			renames,
+			[entry.key, entry.value],
+		)
+		current_id = children.next_id
+
+		match children.exprs:
+			[key, value]:
+				cloned = cloned.append({ entry |
+						key = key,
+						value = value
+					})
+			_:
+				cloned = cloned.append(entry)
+
+	{
+		next_id = current_id,
+		entries = cloned
+	}
+
+
+private pure func rewrite_dict_entries(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	entries: List[CoreDictLiteralEntry],
+) -> StdInlineDictEntriesResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreDictLiteralEntry] = []
+
+	for entry in entries:
+		children: StdInlineExprsResult = rewrite_exprs(
+			targets,
+			current_id,
+			[entry.key, entry.value],
+		)
+		current_id = children.next_id
+
+		match children.exprs:
+			[key, value]:
+				rewritten = rewritten.append({ entry |
+						key = key,
+						value = value
+					})
+			_:
+				rewritten = rewritten.append(entry)
+
+	{
+		next_id = current_id,
+		entries = rewritten
+	}
+
+
+private pure func clone_record_fields(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	fields: List[CoreRecordFieldValue],
+) -> StdInlineRecordFieldsResult:
+	var current_id: Int = next_id
+	var cloned: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		result: StdInlineExprResult = clone_expr(current_id, renames, field.value)
+		current_id = result.next_id
+		cloned = cloned.append({ field | value = result.expr })
+
+	{
+		next_id = current_id,
+		fields = cloned
+	}
+
+
+private pure func rewrite_record_fields(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	fields: List[CoreRecordFieldValue],
+) -> StdInlineRecordFieldsResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		result: StdInlineExprResult = rewrite_expr(targets, current_id, field.value)
+		current_id = result.next_id
+		rewritten = rewritten.append({ field | value = result.expr })
+
+	{
+		next_id = current_id,
+		fields = rewritten
+	}
+
+
+private pure func clone_optional_expr(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	value: Option[CoreExpr],
+) -> StdInlineOptionalExprResult:
+	match value:
+		Some(expr):
+			result: StdInlineExprResult = clone_expr(next_id, renames, expr)
+			{
+				next_id = result.next_id,
+				expr = Some(result.expr)
+			}
+		None:
+			{
+				next_id = next_id,
+				expr = None
+			}
+
+
+private pure func rewrite_optional_expr(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	value: Option[CoreExpr],
+) -> StdInlineOptionalExprResult:
+	match value:
+		Some(expr):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, expr)
+			{
+				next_id = result.next_id,
+				expr = Some(result.expr)
+			}
+		None:
+			{
+				next_id = next_id,
+				expr = None
+			}
+
+
+private pure func rewrite_concurrent_bindings(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> StdInlineConcurrentBindingsResult:
+	var current_id: Int = next_id
+	var rewritten: List[CorePreClosureConcurrentBinding] = []
+
+	for binding in bindings:
+		result: StdInlineExprResult = rewrite_expr(targets, current_id, binding.rhs)
+		current_id = result.next_id
+		rewritten = rewritten.append({ binding | rhs = result.expr })
+
+	{
+		next_id = current_id,
+		bindings = rewritten
+	}
+
+
+private pure func clone_select_arms(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	arms: List[CoreSelectArm],
+) -> StdInlineSelectArmsResult:
+	var current_id: Int = next_id
+	var cloned: List[CoreSelectArm] = []
+
+	for arm in arms:
+		match arm.kind:
+			SelectRecvArm(recv):
+				channel: StdInlineExprResult = clone_expr(current_id, renames, recv.channel)
+				binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+					channel.next_id,
+					renames,
+					recv.binder,
+				)
+				body: StdInlineExprResult = clone_expr(binder[0], binder[1], arm.body)
+				current_id = body.next_id
+				cloned = cloned.append({ arm |
+						kind = SelectRecvArm({ recv |
+								binder = binder[2],
+								channel = channel.expr
+							}),
+						body = body.expr
+					})
+			SelectSealedArm(channel_expr):
+				children: StdInlineExprsResult = clone_exprs(
+					current_id,
+					renames,
+					[channel_expr, arm.body],
+				)
+				current_id = children.next_id
+
+				match children.exprs:
+					[rewritten_channel, rewritten_body]:
+						cloned = cloned.append({ arm |
+								kind = SelectSealedArm(rewritten_channel),
+								body = rewritten_body
+							})
+					_:
+						cloned = cloned.append(arm)
+			SelectAfterArm(timeout):
+				children: StdInlineExprsResult = clone_exprs(
+					current_id,
+					renames,
+					[timeout, arm.body],
+				)
+				current_id = children.next_id
+
+				match children.exprs:
+					[rewritten_timeout, rewritten_body]:
+						cloned = cloned.append({ arm |
+								kind = SelectAfterArm(rewritten_timeout),
+								body = rewritten_body
+							})
+					_:
+						cloned = cloned.append(arm)
+
+	{
+		next_id = current_id,
+		arms = cloned
+	}
+
+
+private pure func rewrite_select_arms(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	arms: List[CoreSelectArm],
+) -> StdInlineSelectArmsResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreSelectArm] = []
+
+	for arm in arms:
+		kind_expr: CoreExpr = match arm.kind:
+			SelectRecvArm(recv):
+				recv.channel
+			SelectSealedArm(channel):
+				channel
+			SelectAfterArm(timeout):
+				timeout
+
+		children: StdInlineExprsResult = rewrite_exprs(
+			targets,
+			current_id,
+			[kind_expr, arm.body],
+		)
+		current_id = children.next_id
+
+		match children.exprs:
+			[rewritten_kind_expr, rewritten_body]:
+				rewritten_kind: CoreSelectArmKind = match arm.kind:
+					SelectRecvArm(recv):
+						SelectRecvArm({ recv | channel = rewritten_kind_expr })
+					SelectSealedArm(_):
+						SelectSealedArm(rewritten_kind_expr)
+					SelectAfterArm(_):
+						SelectAfterArm(rewritten_kind_expr)
+
+				rewritten = rewritten.append({ arm |
+						kind = rewritten_kind,
+						body = rewritten_body
+					})
+			_:
+				rewritten = rewritten.append(arm)
+
+	{
+		next_id = current_id,
+		arms = rewritten
+	}
+
+
+private pure func rewrite_literal_cases(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	cases: List[CoreLiteralMatchCase],
+) -> StdInlineLiteralCasesResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		body: StdInlineExprResult = rewrite_expr(targets, current_id, match_case.body)
+		current_id = body.next_id
+		rewritten = rewritten.append({ match_case | body = body.expr })
+
+	{
+		next_id = current_id,
+		cases = rewritten
+	}
+
+
+private pure func rewrite_literal_fallback(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	fallback: CoreLiteralMatchFallback,
+) -> StdInlineLiteralFallbackResult:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
+			{
+				next_id = result.next_id,
+				fallback = LiteralMatchFallbackBody(result.expr)
+			}
+		LiteralMatchFallbackBindings(bindings, body):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
+			{
+				next_id = result.next_id,
+				fallback = LiteralMatchFallbackBindings(bindings, result.expr)
+			}
+		LiteralMatchFallbackFail:
+			{
+				next_id = next_id,
+				fallback = fallback
+			}
+
+
+private pure func rewrite_constructor_literal_match(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	match_expr: CoreConstructorLiteralMatch,
+) -> (Int, CoreConstructorLiteralMatch):
+	cases: StdInlineLiteralCasesResult = rewrite_literal_cases(targets, next_id, match_expr.cases)
+	fallback: StdInlineLiteralFallbackResult = rewrite_literal_fallback(
+		targets,
+		cases.next_id,
+		match_expr.fallback,
+	)
+	(fallback.next_id, { match_expr |
+			cases = cases.cases,
+			fallback = fallback.fallback
+		})
+
+
+private pure func rewrite_constructor_body(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	body: CoreConstructorMatchBody,
+) -> StdInlineConstructorBodyResult:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, expr)
+			{
+				next_id = result.next_id,
+				body = ConstructorMatchBodyExpr(result.expr)
+			}
+		ConstructorMatchBodyLiteral(match_expr):
+			result: (Int, CoreConstructorLiteralMatch) = rewrite_constructor_literal_match(
+				targets,
+				next_id,
+				match_expr,
+			)
+			{
+				next_id = result[0],
+				body = ConstructorMatchBodyLiteral(result[1])
+			}
+		ConstructorMatchBodyLength(match_expr):
+			result: (Int, CoreConstructorLengthMatch) = rewrite_constructor_length_match(
+				targets,
+				next_id,
+				match_expr,
+			)
+			{
+				next_id = result[0],
+				body = ConstructorMatchBodyLength(result[1])
+			}
+
+
+private pure func rewrite_constructor_length_branch(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	branch: CoreConstructorLengthMatchBranch,
+) -> StdInlineLengthBranchResult:
+	body: StdInlineConstructorBodyResult = rewrite_constructor_body(targets, next_id, branch.body)
+	{
+		next_id = body.next_id,
+		branch = { branch | body = body.body }
+	}
+
+
+private pure func rewrite_constructor_length_match(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	match_expr: CoreConstructorLengthMatch,
+) -> (Int, CoreConstructorLengthMatch):
+	var current_id: Int = next_id
+	var cases: List[CoreConstructorLengthMatchCase] = []
+
+	for match_case in match_expr.cases:
+		branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
+			targets,
+			current_id,
+			match_case.branch,
+		)
+		current_id = branch.next_id
+		cases = cases.append({ match_case | branch = branch.branch })
+
+	geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(value):
+			branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
+				targets,
+				current_id,
+				value.branch,
+			)
+			current_id = branch.next_id
+			Some({ value | branch = branch.branch })
+		None:
+			None
+
+	fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(value):
+			branch: StdInlineLengthBranchResult = rewrite_constructor_length_branch(
+				targets,
+				current_id,
+				value,
+			)
+			current_id = branch.next_id
+			Some(branch.branch)
+		None:
+			None
+
+	(current_id, { match_expr |
+			cases = cases,
+			geq = geq,
+			fallback = fallback
+		})
+
+
+private pure func rewrite_constructor_cases(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	cases: List[CoreConstructorMatchCase],
+) -> StdInlineConstructorCasesResult:
+	var current_id: Int = next_id
+	var rewritten: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		body: StdInlineConstructorBodyResult = rewrite_constructor_body(
+			targets,
+			current_id,
+			match_case.body,
+		)
+		current_id = body.next_id
+		rewritten = rewritten.append({ match_case | body = body.body })
+
+	{
+		next_id = current_id,
+		cases = rewritten
+	}
+
+
+private pure func rewrite_constructor_fallback(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	fallback: CoreConstructorMatchFallback,
+) -> StdInlineConstructorFallbackResult:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
+			{
+				next_id = result.next_id,
+				fallback = ConstructorMatchFallbackBody(result.expr)
+			}
+		ConstructorMatchFallbackBindings(bindings, body):
+			result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
+			{
+				next_id = result.next_id,
+				fallback = ConstructorMatchFallbackBindings(bindings, result.expr)
+			}
+		ConstructorMatchFallbackFail:
+			{
+				next_id = next_id,
+				fallback = fallback
+			}
+
+
+private pure func clone_semantic_tree(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	tree: CoreSemanticMatchTree,
+) -> StdInlineSemanticResult:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			var current_id: Int = next_id
+			var body_renames: List[StdInlineRename] = renames
+			var cloned_bindings: List[CoreSemanticMatchBinding] = []
+
+			for binding in bindings:
+				binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+					current_id,
+					body_renames,
+					binding.variable,
+				)
+				current_id = binder[0]
+				body_renames = binder[1]
+				cloned_bindings = cloned_bindings.append({ binding | variable = binder[2] })
+
+			body_result: StdInlineExprResult = clone_expr(current_id, body_renames, body)
+			{
+				next_id = body_result.next_id,
+				tree = SemanticMatchLeaf(cloned_bindings, body_result.expr)
+			}
+		SemanticMatchFail:
+			{
+				next_id = next_id,
+				tree = SemanticMatchFail
+			}
+		SemanticConstructorMatch(accessor, cases, fallback):
+			var current_id: Int = next_id
+			var cloned_cases: List[CoreSemanticConstructorMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = clone_semantic_tree(
+					current_id,
+					renames,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				cloned_cases = cloned_cases.append({ match_case | body = body_result.tree })
+
+			cloned_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: StdInlineSemanticResult = clone_semantic_tree(
+						current_id,
+						renames,
+						fallback_tree,
+					)
+					current_id = fallback_result.next_id
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				next_id = current_id,
+				tree = SemanticConstructorMatch(accessor, cloned_cases, cloned_fallback)
+			}
+		SemanticLiteralMatch(accessor, cases, fallback):
+			var current_id: Int = next_id
+			var cloned_cases: List[CoreSemanticLiteralMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = clone_semantic_tree(
+					current_id,
+					renames,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				cloned_cases = cloned_cases.append({ match_case | body = body_result.tree })
+
+			fallback_result: StdInlineSemanticResult = clone_semantic_tree(
+				current_id,
+				renames,
+				fallback,
+			)
+			{
+				next_id = fallback_result.next_id,
+				tree = SemanticLiteralMatch(accessor, cloned_cases, fallback_result.tree)
+			}
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			var current_id: Int = next_id
+			var cloned_cases: List[CoreSemanticLengthMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = clone_semantic_tree(
+					current_id,
+					renames,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				cloned_cases = cloned_cases.append({ match_case | body = body_result.tree })
+
+			cloned_geq: Option[CoreSemanticLengthMatchGeq] = match geq:
+				Some(geq_case):
+					body_result: StdInlineSemanticResult = clone_semantic_tree(
+						current_id,
+						renames,
+						geq_case.body,
+					)
+					current_id = body_result.next_id
+					Some({ geq_case | body = body_result.tree })
+				None:
+					None
+
+			cloned_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: StdInlineSemanticResult = clone_semantic_tree(
+						current_id,
+						renames,
+						fallback_tree,
+					)
+					current_id = fallback_result.next_id
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				next_id = current_id,
+				tree = SemanticLengthMatch(accessor, cloned_cases, cloned_geq, cloned_fallback)
+			}
+
+
+private pure func clone_iterable_loop(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	expr: CoreExpr,
+	binder_variable: CoreVar,
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> StdInlineExprResult:
+	iterable_result: StdInlineExprResult = clone_expr(next_id, renames, iterable)
+	binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+		iterable_result.next_id,
+		renames,
+		binder_variable,
+	)
+	body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], body)
+
+	cloned_expr: CoreExpr = match expr:
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					binder = { loop.binder | variable = binder[2] },
+					iterable = iterable_result.expr,
+					body = body_result.expr
+				},
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+	{
+		next_id = body_result.next_id,
+		expr = cloned_expr
+	}
+
+
+private pure func clone_expr(
+	next_id: Int,
+	renames: List[StdInlineRename],
+	expr: CoreExpr,
+) -> StdInlineExprResult:
+	match expr:
+		VarExpr(variable, typ, loc):
+			{
+				next_id = next_id,
+				expr = VarExpr(
+					renamed_var(renames, variable),
+					typ,
+					loc,
+				)
+			}
+		AssignExpr(variable, rhs, typ, loc):
+			rhs_result: StdInlineExprResult = clone_expr(next_id, renames, rhs)
+			{
+				next_id = rhs_result.next_id,
+				expr = AssignExpr(
+					renamed_var(renames, variable),
+					rhs_result.expr,
+					typ,
+					loc,
+				)
+			}
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_result: StdInlineExprResult = clone_expr(next_id, renames, rhs)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				rhs_result.next_id,
+				renames,
+				variable,
+			)
+			body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], body)
+			{
+				next_id = body_result.next_id,
+				expr = LetExpr(binder[2], is_mutable, typ, rhs_result.expr, body_result.expr)
+			}
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_result: StdInlineExprResult = clone_expr(next_id, renames, rhs)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				rhs_result.next_id,
+				renames,
+				variable,
+			)
+			body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], body)
+			{
+				next_id = body_result.next_id,
+				expr = BorrowLetExpr(binder[2], typ, rhs_result.expr, body_result.expr)
+			}
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_result: StdInlineExprResult = clone_expr(next_id, renames, scope.acquire)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				acquire_result.next_id,
+				renames,
+				scope.variable,
+			)
+			body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], scope.body)
+			cleanup_result: StdInlineExprResult = clone_expr(
+				body_result.next_id,
+				binder[1],
+				scope.cleanup,
+			)
+			{
+				next_id = cleanup_result.next_id,
+				expr = ResourceScopeExpr(
+					{ scope |
+						variable = binder[2],
+						acquire = acquire_result.expr,
+						body = body_result.expr,
+						cleanup = cleanup_result.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		ForRangeExpr(loop_binder, start, end_value, body, typ, loc):
+			bounds: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[start, end_value],
+			)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				bounds.next_id,
+				renames,
+				loop_binder.variable,
+			)
+			body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], body)
+
+			match bounds.exprs:
+				[cloned_start, cloned_end]:
+					{
+						next_id = body_result.next_id,
+						expr = ForRangeExpr(
+							{ loop_binder | variable = binder[2] },
+							cloned_start,
+							cloned_end,
+							body_result.expr,
+							typ,
+							loc,
+						)
+					}
+				_:
+					{
+						next_id = body_result.next_id,
+						expr = expr
+					}
+		ForChannelExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForListExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForStringExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForDictExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForSetExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForStreamExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForResourceSourceExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		ForTensorExpr(loop, _, _):
+			clone_iterable_loop(
+				next_id,
+				renames,
+				expr,
+				loop.binder.variable,
+				loop.iterable,
+				loop.body,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			iterable: StdInlineExprResult = clone_expr(next_id, renames, loop.iterable)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				iterable.next_id,
+				renames,
+				loop.variable,
+			)
+			body: StdInlineExprResult = clone_expr(binder[0], binder[1], loop.body)
+			timeout: StdInlineOptionalExprResult = clone_optional_expr(
+				body.next_id,
+				renames,
+				loop.timeout,
+			)
+			limit: StdInlineExprResult = clone_expr(timeout.next_id, renames, loop.limit)
+			{
+				next_id = limit.next_id,
+				expr = PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						variable = binder[2],
+						iterable = iterable.expr,
+						body = body.expr,
+						timeout = timeout.expr,
+						limit = limit.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		PreClosureConcurrentExpr(block, typ, loc):
+			var current_id: Int = next_id
+			var body_renames: List[StdInlineRename] = renames
+			var bindings: List[CorePreClosureConcurrentBinding] = []
+
+			for binding in block.bindings:
+				rhs: StdInlineExprResult = clone_expr(current_id, renames, binding.rhs)
+				binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+					rhs.next_id,
+					body_renames,
+					binding.variable,
+				)
+				current_id = binder[0]
+				body_renames = binder[1]
+				bindings = bindings.append({ binding |
+						variable = binder[2],
+						rhs = rhs.expr
+					})
+
+			body: StdInlineExprResult = clone_expr(current_id, body_renames, block.body)
+			timeout: StdInlineOptionalExprResult = clone_optional_expr(
+				body.next_id,
+				renames,
+				block.timeout,
+			)
+			{
+				next_id = timeout.next_id,
+				expr = PreClosureConcurrentExpr(
+					{ block |
+						bindings = bindings,
+						body = body.expr,
+						timeout = timeout.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		SelectExpr(arms, typ, loc):
+			result: StdInlineSelectArmsResult = clone_select_arms(next_id, renames, arms)
+			{
+				next_id = result.next_id,
+				expr = SelectExpr(result.arms, typ, loc)
+			}
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			scrutinee_result: StdInlineExprResult = clone_expr(next_id, renames, scrutinee)
+			tree_result: StdInlineSemanticResult = clone_semantic_tree(
+				scrutinee_result.next_id,
+				renames,
+				tree,
+			)
+			{
+				next_id = tree_result.next_id,
+				expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc)
+			}
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			var current_id: Int = next_id
+			var body_renames: List[StdInlineRename] = renames
+			var cloned_params: List[CoreParam] = []
+
+			for parameter in params:
+				binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+					current_id,
+					body_renames,
+					parameter.name,
+				)
+				current_id = binder[0]
+				body_renames = binder[1]
+				cloned_params = cloned_params.append({ parameter | name = binder[2] })
+
+			body_result: StdInlineExprResult = clone_expr(current_id, body_renames, body)
+			{
+				next_id = body_result.next_id,
+				expr = LambdaExpr(cloned_params, return_type, body_result.expr, is_pure, typ, loc)
+			}
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_result: StdInlineExprResult = clone_expr(next_id, renames, binding.source)
+			binder: (Int, List[StdInlineRename], CoreVar) = rename_binder(
+				source_result.next_id,
+				renames,
+				binding.variable,
+			)
+			body_result: StdInlineExprResult = clone_expr(binder[0], binder[1], body)
+			{
+				next_id = body_result.next_id,
+				expr = TensorRawViewLetExpr(
+					{ binding |
+						variable = binder[2],
+						source = source_result.expr
+					},
+					body_result.expr,
+					typ,
+					loc,
+				)
+			}
+		TensorRawReadExpr(read, typ, loc):
+			index_result: StdInlineExprResult = clone_expr(next_id, renames, read.index)
+			{
+				next_id = index_result.next_id,
+				expr = TensorRawReadExpr(
+					{ read |
+						view = renamed_var(renames, read.view),
+						index = index_result.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		TensorRawWriteExpr(write, typ, loc):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[write.index, write.value],
+			)
+
+			match children.exprs:
+				[rewritten_index, rewritten_value]:
+					{
+						next_id = children.next_id,
+						expr = TensorRawWriteExpr(
+							{ write |
+								view = renamed_var(renames, write.view),
+								index = rewritten_index,
+								value = rewritten_value
+							},
+							typ,
+							loc,
+						)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		ListConstructExpr(construct, typ, loc):
+			elements: StdInlineBoxedValuesResult = clone_boxed_values(
+				next_id,
+				renames,
+				construct.elements,
+			)
+			{
+				next_id = elements.next_id,
+				expr = ListConstructExpr({ construct | elements = elements.values }, typ, loc)
+			}
+		DictExpr(entries, typ, loc):
+			cloned_entries: StdInlineDictEntriesResult = clone_dict_entries(
+				next_id,
+				renames,
+				entries,
+			)
+			{
+				next_id = cloned_entries.next_id,
+				expr = DictExpr(cloned_entries.entries, typ, loc)
+			}
+		RecordExpr(fields, typ, loc):
+			cloned_fields: StdInlineRecordFieldsResult = clone_record_fields(
+				next_id,
+				renames,
+				fields,
+			)
+			{
+				next_id = cloned_fields.next_id,
+				expr = RecordExpr(cloned_fields.fields, typ, loc)
+			}
+		TensorLiteralExpr(literal, typ, loc):
+			payload_result: StdInlineExprsResult = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					clone_exprs(next_id, renames, raw.elements)
+				TensorInlineStructLiteralPayload(inline_struct):
+					clone_exprs(next_id, renames, inline_struct.elements)
+
+			cloned_payload: CoreTensorLiteralPayload = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					TensorRawLiteralPayload({ raw | elements = payload_result.exprs })
+				TensorInlineStructLiteralPayload(inline_struct):
+					TensorInlineStructLiteralPayload(
+						{ inline_struct | elements = payload_result.exprs },
+					)
+
+			{
+				next_id = payload_result.next_id,
+				expr = TensorLiteralExpr({ literal | payload = cloned_payload }, typ, loc)
+			}
+		DupExpr(variable, value_type, policy, body, typ, loc):
+			body_result: StdInlineExprResult = clone_expr(next_id, renames, body)
+			{
+				next_id = body_result.next_id,
+				expr = DupExpr(
+					renamed_var(renames, variable),
+					value_type,
+					policy,
+					body_result.expr,
+					typ,
+					loc,
+				)
+			}
+		DropExpr(variable, value_type, policy, body, typ, loc):
+			body_result: StdInlineExprResult = clone_expr(next_id, renames, body)
+			{
+				next_id = body_result.next_id,
+				expr = DropExpr(
+					renamed_var(renames, variable),
+					value_type,
+					policy,
+					body_result.expr,
+					typ,
+					loc,
+				)
+			}
+		CallExpr(kind, callee, args, typ, loc):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[callee].concat(args),
+			)
+
+			match children.exprs:
+				[]:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+				[cloned_callee, ...cloned_args]:
+					{
+						next_id = children.next_id,
+						expr = CallExpr(kind, cloned_callee, cloned_args, typ, loc)
+					}
+		BinaryExpr(op, left, right, typ, loc):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[left, right],
+			)
+
+			match children.exprs:
+				[rewritten_left, rewritten_right]:
+					{
+						next_id = children.next_id,
+						expr = BinaryExpr(op, rewritten_left, rewritten_right, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		LogicalExpr(op, left, right, typ, loc):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[left, right],
+			)
+
+			match children.exprs:
+				[rewritten_left, rewritten_right]:
+					{
+						next_id = children.next_id,
+						expr = LogicalExpr(op, rewritten_left, rewritten_right, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		SeqExpr(first, second):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[first, second],
+			)
+
+			match children.exprs:
+				[rewritten_first, rewritten_second]:
+					{
+						next_id = children.next_id,
+						expr = SeqExpr(rewritten_first, rewritten_second)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			children: StdInlineExprsResult = clone_exprs(
+				next_id,
+				renames,
+				[cond, then_expr, else_expr],
+			)
+
+			match children.exprs:
+				[rewritten_cond, rewritten_then, rewritten_else]:
+					{
+						next_id = children.next_id,
+						expr = IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		_:
+			match immediate_core_expr_children(expr):
+				[child]:
+					child_result: StdInlineExprResult = clone_expr(next_id, renames, child)
+					{
+						next_id = child_result.next_id,
+						expr = map_core_expr_children(expr, pure func(_): child_result.expr)
+					}
+				_:
+					-- Target bodies are post-resolve Core. Their binder-bearing
+					-- forms are handled explicitly above; later-phase containers
+					-- are not legal here.
+					{
+						next_id = next_id,
+						expr = expr
+					}
+
+
+private pure func prepare_args(
+	next_id: Int,
+	params: List[CoreParam],
+	arg_bindings: List[StdInlineArgBinding],
+	args: List[CoreExpr],
+) -> Option[StdInlinePreparedArgs]:
+	if params.length() != args.length() or arg_bindings.length() != args.length():
+		None
+	else:
+		var current_id: Int = next_id
+		var renames: List[StdInlineRename] = []
+		var prepared: List[StdInlinePreparedArg] = []
+		var index: Int = 0
+
+		while index < params.length():
+			match (params.get(index), arg_bindings.get(index), args.get(index)):
+				(Some(param_value), Some(binding), Some(arg)):
+					match (binding, arg):
+						(StdInlineSubstituteExisting, VarExpr(actual, _, _)):
+							renames = [
+								{
+									original = param_value.name,
+									replacement = actual
+								},
+							].concat(renames)
+						_:
+							fresh: (Int, CoreVar) = fresh_var(current_id, param_value.name)
+							current_id = fresh[0]
+							renames = [
+								{
+									original = param_value.name,
+									replacement = fresh[1]
+								},
+							].concat(renames)
+
+							prepared_binding: StdInlineArgBinding = if binding == StdInlineSubstituteExisting:
+								StdInlineOwnBinding
+							else:
+								binding
+
+							prepared = prepared.append({
+								param = { param_value | name = fresh[1] },
+								binding = prepared_binding,
+								arg = arg,
+							})
+				_:
+					void
+
+			index += 1
+
+		Some({
+			next_id = current_id,
+			renames = renames,
+			bindings = prepared,
+		})
+
+
+private pure func arg_is_existing_var(arg: CoreExpr) -> Bool:
+	match arg:
+		VarExpr(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func wrap_args(bindings: List[StdInlinePreparedArg], body: CoreExpr) -> CoreExpr:
+	var wrapped: CoreExpr = body
+
+	for prepared in bindings.reverse():
+		wrapped = if (
+			prepared.binding == StdInlineBorrowExisting
+			and arg_is_existing_var(prepared.arg)
+		):
+			BorrowLetExpr(prepared.param.name, prepared.param.typ, prepared.arg, wrapped)
+		else:
+			LetExpr(prepared.param.name, False, prepared.param.typ, prepared.arg, wrapped)
+
+	wrapped
+
+
+private pure func expand_call(
+	next_id: Int,
+	target: StdInlineTarget,
+	args: List[CoreExpr],
+) -> StdInlineExpandedCall:
+	match prepare_args(next_id, target.params, target.arg_bindings, args):
+		Some(prepared):
+			cloned: StdInlineExprResult = clone_expr(
+				prepared.next_id,
+				prepared.renames,
+				target.body,
+			)
+			{
+				next_id = cloned.next_id,
+				expr = Some(wrap_args(prepared.bindings, cloned.expr))
+			}
+		None:
+			{
+				next_id = next_id,
+				expr = None
+			}
+
+
+private pure func rewrite_semantic_tree(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	tree: CoreSemanticMatchTree,
+) -> StdInlineSemanticResult:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			body_result: StdInlineExprResult = rewrite_expr(targets, next_id, body)
+			{
+				next_id = body_result.next_id,
+				tree = SemanticMatchLeaf(bindings, body_result.expr)
+			}
+		SemanticMatchFail:
+			{
+				next_id = next_id,
+				tree = SemanticMatchFail
+			}
+		SemanticConstructorMatch(accessor, cases, fallback):
+			var current_id: Int = next_id
+			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
+					targets,
+					current_id,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
+
+			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
+						targets,
+						current_id,
+						fallback_tree,
+					)
+					current_id = fallback_result.next_id
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				next_id = current_id,
+				tree = SemanticConstructorMatch(accessor, rewritten_cases, rewritten_fallback)
+			}
+		SemanticLiteralMatch(accessor, cases, fallback):
+			var current_id: Int = next_id
+			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
+					targets,
+					current_id,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
+
+			fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
+				targets,
+				current_id,
+				fallback,
+			)
+			{
+				next_id = fallback_result.next_id,
+				tree = SemanticLiteralMatch(accessor, rewritten_cases, fallback_result.tree)
+			}
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			var current_id: Int = next_id
+			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
+
+			for match_case in cases:
+				body_result: StdInlineSemanticResult = rewrite_semantic_tree(
+					targets,
+					current_id,
+					match_case.body,
+				)
+				current_id = body_result.next_id
+				rewritten_cases = rewritten_cases.append({ match_case | body = body_result.tree })
+
+			rewritten_geq: Option[CoreSemanticLengthMatchGeq] = match geq:
+				Some(geq_case):
+					body_result: StdInlineSemanticResult = rewrite_semantic_tree(
+						targets,
+						current_id,
+						geq_case.body,
+					)
+					current_id = body_result.next_id
+					Some({ geq_case | body = body_result.tree })
+				None:
+					None
+
+			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: StdInlineSemanticResult = rewrite_semantic_tree(
+						targets,
+						current_id,
+						fallback_tree,
+					)
+					current_id = fallback_result.next_id
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				next_id = current_id,
+				tree = SemanticLengthMatch(
+					accessor,
+					rewritten_cases,
+					rewritten_geq,
+					rewritten_fallback,
+				)
+			}
+
+
+private pure func rewrite_iterable_loop(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	expr: CoreExpr,
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> StdInlineExprResult:
+	children: StdInlineExprsResult = rewrite_exprs(
+		targets,
+		next_id,
+		[iterable, body],
+	)
+
+	match children.exprs:
+		[rewritten_iterable, rewritten_body]:
+			rewritten_expr: CoreExpr = match expr:
+				ForChannelExpr(loop, typ, loc):
+					ForChannelExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForListExpr(loop, typ, loc):
+					ForListExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForStringExpr(loop, typ, loc):
+					ForStringExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForDictExpr(loop, typ, loc):
+					ForDictExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForSetExpr(loop, typ, loc):
+					ForSetExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForStreamExpr(loop, typ, loc):
+					ForStreamExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForResourceSourceExpr(loop, typ, loc):
+					ForResourceSourceExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				ForTensorExpr(loop, typ, loc):
+					ForTensorExpr(
+						{ loop |
+							iterable = rewritten_iterable,
+							body = rewritten_body
+						},
+						typ,
+						loc,
+					)
+				_:
+					expr
+
+			{
+				next_id = children.next_id,
+				expr = rewritten_expr
+			}
+		_:
+			{
+				next_id = children.next_id,
+				expr = expr
+			}
+
+
+private pure func rewrite_expr(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	expr: CoreExpr,
+) -> StdInlineExprResult:
+	children_rewritten: StdInlineExprResult = match expr:
+		BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _):
+			rewrite_binary_children(targets, next_id, expr, left, right)
+		SeqExpr(first, second):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[first, second],
+			)
+
+			match children.exprs:
+				[rewritten_first, rewritten_second]:
+					{
+						next_id = children.next_id,
+						expr = SeqExpr(rewritten_first, rewritten_second)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[cond, then_expr, else_expr],
+			)
+
+			match children.exprs:
+				[rewritten_cond, rewritten_then, rewritten_else]:
+					{
+						next_id = children.next_id,
+						expr = IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[rhs, body],
+			)
+
+			match children.exprs:
+				[rewritten_rhs, rewritten_body]:
+					{
+						next_id = children.next_id,
+						expr = LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		BorrowLetExpr(variable, typ, rhs, body):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[rhs, body],
+			)
+
+			match children.exprs:
+				[rewritten_rhs, rewritten_body]:
+					{
+						next_id = children.next_id,
+						expr = BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		ResourceScopeExpr(scope, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[scope.acquire, scope.body, scope.cleanup],
+			)
+
+			match children.exprs:
+				[acquire, body, cleanup]:
+					{
+						next_id = children.next_id,
+						expr = ResourceScopeExpr(
+							{ scope |
+								acquire = acquire,
+								body = body,
+								cleanup = cleanup
+							},
+							typ,
+							loc,
+						)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		TupleExpr(items, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
+			{
+				next_id = children.next_id,
+				expr = TupleExpr(children.exprs, typ, loc)
+			}
+		VectorExpr(items, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(targets, next_id, items)
+			{
+				next_id = children.next_id,
+				expr = VectorExpr(children.exprs, typ, loc)
+			}
+		ListConstructExpr(construct, typ, loc):
+			elements: StdInlineBoxedValuesResult = rewrite_boxed_values(
+				targets,
+				next_id,
+				construct.elements,
+			)
+			{
+				next_id = elements.next_id,
+				expr = ListConstructExpr({ construct | elements = elements.values }, typ, loc)
+			}
+		DictExpr(entries, typ, loc):
+			rewritten_entries: StdInlineDictEntriesResult = rewrite_dict_entries(
+				targets,
+				next_id,
+				entries,
+			)
+			{
+				next_id = rewritten_entries.next_id,
+				expr = DictExpr(rewritten_entries.entries, typ, loc)
+			}
+		RecordExpr(fields, typ, loc):
+			rewritten_fields: StdInlineRecordFieldsResult = rewrite_record_fields(
+				targets,
+				next_id,
+				fields,
+			)
+			{
+				next_id = rewritten_fields.next_id,
+				expr = RecordExpr(rewritten_fields.fields, typ, loc)
+			}
+		TensorLiteralExpr(literal, typ, loc):
+			payload_result: StdInlineExprsResult = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					rewrite_exprs(targets, next_id, raw.elements)
+				TensorInlineStructLiteralPayload(inline_struct):
+					rewrite_exprs(targets, next_id, inline_struct.elements)
+
+			rewritten_payload: CoreTensorLiteralPayload = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					TensorRawLiteralPayload({ raw | elements = payload_result.exprs })
+				TensorInlineStructLiteralPayload(inline_struct):
+					TensorInlineStructLiteralPayload(
+						{ inline_struct | elements = payload_result.exprs },
+					)
+
+			{
+				next_id = payload_result.next_id,
+				expr = TensorLiteralExpr({ literal | payload = rewritten_payload }, typ, loc)
+			}
+		WhileExpr(cond, body, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[cond, body],
+			)
+
+			match children.exprs:
+				[rewritten_cond, rewritten_body]:
+					{
+						next_id = children.next_id,
+						expr = WhileExpr(rewritten_cond, rewritten_body, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		RangeExpr(start, end_value, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[start, end_value],
+			)
+
+			match children.exprs:
+				[rewritten_start, rewritten_end]:
+					{
+						next_id = children.next_id,
+						expr = RangeExpr(rewritten_start, rewritten_end, typ, loc)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[start, end_value, body],
+			)
+
+			match children.exprs:
+				[rewritten_start, rewritten_end, rewritten_body]:
+					{
+						next_id = children.next_id,
+						expr = ForRangeExpr(
+							binder,
+							rewritten_start,
+							rewritten_end,
+							rewritten_body,
+							typ,
+							loc,
+						)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		ForChannelExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForListExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForStringExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForDictExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForSetExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForStreamExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForResourceSourceExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		ForTensorExpr(loop, _, _):
+			rewrite_iterable_loop(targets, next_id, expr, loop.iterable, loop.body)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			iterable: StdInlineExprResult = rewrite_expr(targets, next_id, loop.iterable)
+			body: StdInlineExprResult = rewrite_expr(targets, iterable.next_id, loop.body)
+			timeout: StdInlineOptionalExprResult = rewrite_optional_expr(
+				targets,
+				body.next_id,
+				loop.timeout,
+			)
+			limit: StdInlineExprResult = rewrite_expr(targets, timeout.next_id, loop.limit)
+			{
+				next_id = limit.next_id,
+				expr = PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = iterable.expr,
+						body = body.expr,
+						timeout = timeout.expr,
+						limit = limit.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		PreClosureConcurrentExpr(block, typ, loc):
+			bindings: StdInlineConcurrentBindingsResult = rewrite_concurrent_bindings(
+				targets,
+				next_id,
+				block.bindings,
+			)
+			body: StdInlineExprResult = rewrite_expr(targets, bindings.next_id, block.body)
+			timeout: StdInlineOptionalExprResult = rewrite_optional_expr(
+				targets,
+				body.next_id,
+				block.timeout,
+			)
+			{
+				next_id = timeout.next_id,
+				expr = PreClosureConcurrentExpr(
+					{ block |
+						bindings = bindings.bindings,
+						body = body.expr,
+						timeout = timeout.expr
+					},
+					typ,
+					loc,
+				)
+			}
+		SelectExpr(arms, typ, loc):
+			result: StdInlineSelectArmsResult = rewrite_select_arms(targets, next_id, arms)
+			{
+				next_id = result.next_id,
+				expr = SelectExpr(result.arms, typ, loc)
+			}
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[binding.source, body],
+			)
+
+			match children.exprs:
+				[source, rewritten_body]:
+					{
+						next_id = children.next_id,
+						expr = TensorRawViewLetExpr(
+							{ binding | source = source },
+							rewritten_body,
+							typ,
+							loc,
+						)
+					}
+				_:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			rewritten_scrutinee: StdInlineExprResult = rewrite_expr(targets, next_id, scrutinee)
+			rewritten_cases: StdInlineConstructorCasesResult = rewrite_constructor_cases(
+				targets,
+				rewritten_scrutinee.next_id,
+				cases,
+			)
+			rewritten_fallback: StdInlineConstructorFallbackResult = rewrite_constructor_fallback(
+				targets,
+				rewritten_cases.next_id,
+				fallback,
+			)
+
+			{
+				next_id = rewritten_fallback.next_id,
+				expr = ConstructorMatchExpr(
+					rewritten_scrutinee.expr,
+					release_policy,
+					rewritten_cases.cases,
+					rewritten_fallback.fallback,
+					typ,
+					loc,
+				)
+			}
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			scrutinee_result: StdInlineExprResult = rewrite_expr(targets, next_id, scrutinee)
+			tree_result: StdInlineSemanticResult = rewrite_semantic_tree(
+				targets,
+				scrutinee_result.next_id,
+				tree,
+			)
+			{
+				next_id = tree_result.next_id,
+				expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc)
+			}
+		CallExpr(kind, callee, args, typ, loc):
+			children: StdInlineExprsResult = rewrite_exprs(
+				targets,
+				next_id,
+				[callee].concat(args),
+			)
+
+			match children.exprs:
+				[]:
+					{
+						next_id = children.next_id,
+						expr = expr
+					}
+				[rewritten_callee, ...rewritten_args]:
+					{
+						next_id = children.next_id,
+						expr = CallExpr(kind, rewritten_callee, rewritten_args, typ, loc)
+					}
+		_:
+			match immediate_core_expr_children(expr):
+				[child]:
+					child_result: StdInlineExprResult = rewrite_expr(targets, next_id, child)
+					{
+						next_id = child_result.next_id,
+						expr = map_core_expr_children(expr, pure func(_): child_result.expr)
+					}
+				_:
+					-- Multi-child source forms are handled explicitly above.
+					-- Later-phase forms are not valid inputs to this stage.
+					{
+						next_id = next_id,
+						expr = expr
+					}
+
+	match children_rewritten.expr:
+		CallExpr(UserCall(name, Some(def_id), _), _, args, _, _):
+			match find_target(targets, name, def_id):
+				Some(target):
+					expanded: StdInlineExpandedCall = expand_call(
+						children_rewritten.next_id,
+						target,
+						args,
+					)
+
+					match expanded.expr:
+						Some(inlined):
+							{
+								next_id = expanded.next_id,
+								expr = inlined
+							}
+						None:
+							children_rewritten
+				None:
+					children_rewritten
+		_:
+			children_rewritten
+
+
+private pure func rewrite_function(
+	targets: List[StdInlineTarget],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	if (
+		target_is_function(targets, function_info)
+		or compiler_owned_module(function_info.source_module)
+	):
+		function_info
+	else:
+		match function_info.body:
+			Some(body):
+				{ function_info | body = Some(rewrite_expr(targets, 0, body).expr) }
+			None:
+				function_info
+
+
+private pure func first_target_call(
+	targets: List[StdInlineTarget],
+	expr: CoreExpr,
+) -> Option[(String, CoreSourceLoc)]:
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+	var found: Option[(String, CoreSourceLoc)] = None
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(current):
+				match current:
+					CallExpr(UserCall(name, Some(def_id), _), _, _, _, loc):
+						if find_target(targets, name, def_id).is_some():
+							found = Some((name, loc))
+							break
+						else:
+							void
+					_:
+						void
+
+				pending = pending.concat(immediate_core_expr_children(current))
+			None:
+				break
+
+		index += 1
+
+	found
+
+
+private pure func first_function_target_call(
+	targets: List[StdInlineTarget],
+	function_info: CoreFunction,
+) -> Option[(String, CoreSourceLoc)]:
+	if (
+		target_is_function(targets, function_info)
+		or compiler_owned_module(function_info.source_module)
+	):
+		None
+	else:
+		match function_info.body:
+			Some(body):
+				first_target_call(targets, body)
+			None:
+				None
+
+
+pure func first_uninlined_std_wrapper_call(program: CoreProgram) -> Option[(String, CoreSourceLoc)]:
+	targets: List[StdInlineTarget] = collect_targets(program)
+	var found: Option[(String, CoreSourceLoc)] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				found = first_function_target_call(targets, function_info)
+			ImplDecl(impl):
+				for method in impl.methods:
+					found = first_function_target_call(targets, method)
+
+					if found.is_some():
+						break
+					else:
+						void
+			_:
+				void
+
+		if found.is_some():
+			break
+		else:
+			void
+
+	found
+
+
+pure func inline_std_wrappers(program: CoreProgram) -> CoreProgram:
+	targets: List[StdInlineTarget] = collect_targets(program)
+
+	if targets.is_empty():
+		program
+	else:
+		rewritten_decls: List[CoreDecl] = program.decls.map(pure func(decl):
+			match decl:
+				FunctionDecl(function_info):
+					FunctionDecl(rewrite_function(targets, function_info))
+				ImplDecl(impl):
+					ImplDecl(
+						{ impl |
+							methods = impl.methods.map(
+								pure func(method): rewrite_function(targets, method),
+							)
+						},
+					)
+				GlobalDecl(_):
+					decl
+				_:
+					decl
+		)
+
+		{ program | decls = rewritten_decls }

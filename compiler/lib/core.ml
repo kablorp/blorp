@@ -628,7 +628,7 @@ and desc =
           internal budget. *)
   | CAssign of var * core  (** mutation of a [var]-declared binding *)
   | CTailrecLoop of tailrec_loop
-      (** Explicit tail-recursive self-loop. Produced by [Core_tailrec]
+      (** Explicit tail-recursive self-loop. Produced by the Blorp tailrec pass
           after call resolution and before ownership analysis. *)
   | CTailrecRecur of tailrec_recur
       (** Rebind loop parameters and continue the enclosing [CTailrecLoop].
@@ -2361,7 +2361,7 @@ type core_func = {
     Closure bodies are not legal in this pre-handoff Core model.
     - [cf_is_tailrec] was deleted. [@tail_recursive] is
       validated in [Typecheck]; Core lowers supported resolved self-tail-call
-      shapes in [Core_tailrec] without retaining the source annotation.
+      shapes in the Blorp tailrec pass without retaining the source annotation.
       [@no_copy] is represented by [CFForeign.arg_passing], so later phases
       do not need to recover FFI safety semantics from source annotations. *)
 

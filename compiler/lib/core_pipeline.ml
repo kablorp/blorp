@@ -1,16 +1,13 @@
 (** Remaining OCaml Core semantic-middle pipeline.
 
-    Normal source compilation arrives as post-resolution Core produced by the
-    Blorp frontend. This module owns the contiguous OCaml middle from std
-    wrapper inlining through specialization; Blorp takes ownership again at
-    the pre-DCE boundary.
+    Normal source compilation arrives after Blorp-owned string fusion. This
+    module owns the remaining OCaml fusion subpasses and specialization; Blorp
+    takes ownership again at the pre-DCE boundary.
 
     The remaining pass chain is:
-    1. [Core_std_inline] — expand compiler-owned std wrappers
-    2. [Core_tailrec] — make tail-recursive self-loops explicit
-    3. collection, string, tensor, and tuple pipeline rewrites
-    4. [Core_specialize] — resolve type-dispatched builtins
-    5. pre-DCE Core handoff to the Blorp backend
+    1. collection, scoped-tensor, tensor-update, and tuple pipeline rewrites
+    2. [Core_specialize] — resolve type-dispatched builtins
+    3. pre-DCE Core handoff to the Blorp backend
 
     There is deliberately no typed-AST or prepared-Core compatibility
     entrypoint here. Early Core stages are production Blorp code and are tested
@@ -52,9 +49,9 @@ type backend_core_input = {
       (** Pre-DCE Core handed to the Blorp-owned backend tail. *)
 }
 
-(** Run the production OCaml middle from Blorp-owned post-resolution Core to
+(** Run the production OCaml middle from Blorp-owned post-string-fusion Core to
     the pre-DCE backend handoff. *)
-let run_core_passes_from_post_resolve ~(on_stage : on_stage_callback)
+let run_core_passes_from_post_string_fusion ~(on_stage : on_stage_callback)
     ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
     (prog : Core.core_program) : backend_core_input =
   let observe stage prog =
@@ -64,11 +61,8 @@ let run_core_passes_from_post_resolve ~(on_stage : on_stage_callback)
   in
   let run_stage stage pass prog = pass prog |> observe stage in
   let pre_dce =
-    prog |> run_stage Core_stage.StdInline Core_std_inline.rewrite_program
-    |> run_stage Core_stage.Tailrec (Core_tailrec.lower_program ~reg)
-    |> run_stage Core_stage.Fusion (fun p ->
+    prog |> run_stage Core_stage.Fusion (fun p ->
         p
-        |> Core_string_pipeline.fuse_program ~reg
         |> Core_collection_pipeline.fuse_program ~reg
         |> Core_parallel_tensor_pipeline.fuse_program
         |> Core_tensor_fusion.fuse_program ~reg

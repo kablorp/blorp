@@ -30,20 +30,21 @@ Source (.brp)
     v
 +------------------+
 | Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
-| + Early Pipeline |  debug, desugar/SSA, mono, list layout, synthesis, and
-|                  |  pattern-match, trait-call, and call-kind resolution
+| + Early Pipeline |  debug, desugar/SSA, mono, list layout, synthesis,
+|                  |  pattern/trait/call resolution, std wrapper inlining,
+|                  |  tail-recursive loop lowering, and string fusion
 |                  |  (stage_08_core_lower, stage_09_core)
 +------------------+
     |
     v
-+---------------------+
-| Post-resolve bridge |  One strict JSON bridge into the OCaml semantic middle
-|                     |  (core_post_resolve_json.ml)
-+---------------------+
++---------------------------+
+| Post-string-fusion bridge |  One strict JSON bridge into the OCaml semantic middle
+|                           |  (core_post_string_fusion_json.ml)
++---------------------------+
     |
     v
 +---------------+
-| Core IR       |  OCaml std-inline-through-specialize middle, then Core JSON
+| Core IR       |  OCaml remaining-fusion-through-specialize middle, then Core JSON
 | middle + tail |  handoff into the Blorp-owned specialization/backend tail
 +---------------+
     |
@@ -71,12 +72,13 @@ Core path is the compiler's codegen path.
 During the OCaml-to-Blorp port, the production route lowers and assembles the
 typed module graph, lowers debug blocks and mutable locals, desugars Core,
 monomorphizes generic declarations, annotates list layouts, synthesizes
-concrete builtin bodies, and compiles raw matches to semantic decision trees
-and resolves trait dispatch and ordinary call kinds in Blorp. One
-phase-specific bridge decodes post-resolution Core into the remaining OCaml
+concrete builtin bodies, compiles raw matches to semantic decision trees,
+resolves trait dispatch and ordinary call kinds, inlines narrow std wrappers,
+lowers supported self-tail-calls, and fuses supported string pipelines in
+Blorp. One phase-specific bridge decodes post-string-fusion Core into the remaining OCaml
 middle; source, typed AST, and pre-mono Core do not cross this boundary. The
 worker validates the completed Blorp early-stage contracts before starting at
-`Core_std_inline`. The pipeline then crosses the late
+the remaining fusion passes. The pipeline then crosses the late
 Core JSON bridge after the remaining OCaml specialization families. Primitive
 conversion, hash, length, numeric checked tensor access,
 raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
@@ -111,8 +113,8 @@ owned by the Blorp backend bridge.
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
-the request's debug mode. The post-debug invariant runs before the post-resolution
-bridge and rejects any node that survives that decision.
+the request's debug mode. The post-debug invariant runs before the
+post-string-fusion bridge and rejects any node that survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
@@ -179,28 +181,33 @@ Blorp Typed AST graph
     |
     v
 +--------------------------+
-| Post-resolve Core bridge |  Strict structural decode plus completed early
-+--------------------------+  stage checks (core_post_resolve_json.ml,
+| Blorp Core std inline    |  Expand the narrow allowlist of compiler-owned
++--------------------------+  list/tensor wrappers (compiler_core_std_inline.brp)
+    |
+    v
++-----------------------------+
+| Blorp Core tailrec       |  Lower supported @tail_recursive self-calls into
++-----------------------------+  explicit Core loops (compiler_core_tailrec.brp)
+    |
+    v
++--------------------------+
+| Blorp string fusion      |  Fuse supported string producer/consumer pipelines
++--------------------------+  (compiler_core_string_pipeline.brp)
+    |
+    v
++---------------------------+
+| Post-string-fusion bridge |  Strict structural decode plus completed early
++---------------------------+  stage checks (core_post_string_fusion_json.ml,
                               semantic_middle_worker.ml)
     |
     v
-+-----------------+
-| Core_std_inline |  Expand compiler-owned std wrappers at call sites
-+-----------------+  (core_std_inline.ml)
-    |
-    v
-+--------------+
-| Core_tailrec |  Lower supported @tail_recursive self-calls into explicit Core loops
-+--------------+  (core_tailrec.ml)
-    |
-    v
-+-------------+
-| Core_fusion |  Fuse supported string/collection/scoped tensor pipelines and tensor updates;
-+-------------+  scalar-replace non-escaping local tuples and narrow
-                 tuple-return call sites
-                 (core_string_pipeline.ml, core_collection_pipeline.ml,
-                 core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
-                 core_tuple_sroa.ml)
++-------------------+
+| OCaml Core_fusion |  Fuse supported collection/scoped tensor pipelines and
++-------------------+  tensor updates; scalar-replace non-escaping local tuples
+                       and narrow tuple-return call sites
+                       (core_collection_pipeline.ml,
+                       core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
+                       core_tuple_sroa.ml)
     |
     v
 +-----------------------+
@@ -335,10 +342,7 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_post_resolve_json.ml` | Strict decoder for Blorp-owned post-resolution Core |
-| `core_std_inline.ml` | Narrow call-site expansion for compiler-owned std wrappers |
-| `core_tailrec.ml` | `@tail_recursive` self-call lowering into explicit Core loops |
-| `core_string_pipeline.ml` | Expression-local string producer/consumer fusion |
+| `core_post_string_fusion_json.ml` | Strict decoder for Blorp-owned post-string-fusion Core |
 | `core_collection_pipeline.ml` | Expression-local collection pipeline fusion |
 | `core_collection_producer.ml` | Shared producer metadata for fused collection construction |
 | `core_list_pipeline.ml` | List-specific pipeline rewrite helpers used by collection fusion |
@@ -355,7 +359,7 @@ boxing, or ownership behavior from source spelling.
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_invariants.ml` | Stage-boundary invariant checks |
-| `core_pipeline.ml` | Remaining post-resolution OCaml middle orchestration |
+| `core_pipeline.ml` | Remaining post-string-fusion OCaml middle orchestration |
 | `core_error.ml` | Structured errors with phase/location/hint |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
@@ -369,6 +373,8 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_match.brp` | Authoritative raw-pattern to semantic decision-tree compilation |
 | `compiler/blorp/src/stage_09_core/compiler_core_trait_resolve.brp` | Authoritative trait-method and overloaded-operator resolution |
 | `compiler/blorp/src/stage_09_core/compiler_core_resolve.brp` | Authoritative call-kind, import, constructor, UFCS, and callable-identity resolution |
+| `compiler/blorp/src/stage_09_core/compiler_core_std_inline.brp` | Authoritative narrow expansion of compiler-owned list/tensor wrappers |
+| `compiler/blorp/src/stage_09_core/compiler_core_tailrec.brp` | Authoritative supported self-tail-call lowering into explicit Core loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
 | `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
@@ -413,10 +419,7 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_post_resolve_json.ml # Strict Blorp post-resolution Core decoder
-│   ├── core_std_inline.ml # Narrow call-site expansion for compiler-owned std wrappers
-│   ├── core_tailrec.ml    # @tail_recursive self-call lowering
-│   ├── core_string_pipeline.ml # Expression-local string fusion
+│   ├── core_post_string_fusion_json.ml # Strict Blorp post-string-fusion Core decoder
 │   ├── core_collection_pipeline.ml # Expression-local collection fusion
 │   ├── core_collection_producer.ml # Shared collection producer metadata
 │   ├── core_list_pipeline.ml # List-specific pipeline rewrite helpers
