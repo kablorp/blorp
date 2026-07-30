@@ -116,11 +116,10 @@ let core_program ?(foreign_includes = []) decls =
         Lsp_json.Array (List.map (fun include_ -> Lsp_json.String include_) foreign_includes) );
     ]
 
-let request_json ?(schema = 11) ?(domain = "compiler_semantic_middle")
-    ?(core_phase = "post_collection_fusion") ?(require_main = false)
+let request_json ?(schema = 13) ?(domain = "compiler_semantic_middle")
+    ?(core_phase = "post_tuple_sroa") ?(require_main = false)
     ?(core = core_program [])
-    ?(capabilities = [ "core_post_collection_fusion"; "core_pre_dce"; "rendered_stage_observations" ])
-    ?(observations = [ "fusion" ]) ?stop_after () =
+    ?(capabilities = [ "core_post_tuple_sroa"; "core_pre_dce" ]) () =
   Lsp_json.Object
     [
       ("schema", Lsp_json.Int schema);
@@ -136,12 +135,6 @@ let request_json ?(schema = 11) ?(domain = "compiler_semantic_middle")
       ( "required_capabilities",
         Lsp_json.Array
           (List.map (fun capability -> Lsp_json.String capability) capabilities) );
-      ( "observations",
-        Lsp_json.Array (List.map (fun name -> Lsp_json.String name) observations) );
-      ( "stop_after",
-        match stop_after with
-        | Some stage -> Lsp_json.String stage
-        | None -> Lsp_json.Null );
     ]
 
 let remove_object_field name = function
@@ -183,25 +176,16 @@ let test_decode_phase_specific_request () =
   let request = decode_ok (request_json ()) in
   Alcotest.(check string) "target path" "src/main.brp" request.target_path;
   Alcotest.(check string) "target module" "main" request.target_module;
-  Alcotest.(check int) "next def id" 20 request.next_def_id;
-  Alcotest.(check int) "observations" 1 (List.length request.observations)
+  Alcotest.(check int) "next def id" 20 request.next_def_id
 
-let test_rejects_schema_domain_phase_capability_and_stage () =
-  expect_decode_error "unsupported_schema" (request_json ~schema:1 ());
+let test_rejects_schema_domain_phase_and_capability () =
+  expect_decode_error "unsupported_schema" (request_json ~schema:12 ());
   expect_decode_error "unsupported_domain" (request_json ~domain:"compiler_cli" ());
   expect_decode_error "unsupported_core_phase" (request_json ~core_phase:"prepared" ());
   expect_decode_error "unsupported_capability"
     (request_json ~capabilities:[ "typed_ast_post_ctfe" ] ());
   expect_decode_error "missing_capability"
-    (request_json
-       ~capabilities:[ "core_pre_dce"; "rendered_stage_observations" ]
-       ());
-  expect_decode_error "unsupported_stage"
-    (request_json ~observations:[ "lower" ] ());
-  expect_decode_error "unsupported_stage"
-    (request_json ~observations:[ "synth" ] ());
-  expect_decode_error "unsupported_stage"
-    (request_json ~observations:[ "specialize" ] ())
+    (request_json ~capabilities:[ "core_pre_dce" ] ())
 
 let test_rejects_missing_and_late_core () =
   expect_decode_error "missing_field"
@@ -225,7 +209,7 @@ let test_rejects_missing_and_late_core () =
           (List.map (fun (name, value) -> if name = "body" then (name, late) else (name, value)) fields)
     | value -> value
   in
-  expect_decode_error "invalid_post_collection_fusion_core"
+  expect_decode_error "invalid_post_tuple_sroa_core"
     (request_json ~core:(core_program [ malformed ]) ())
 
 let response_or_fail request =
@@ -236,7 +220,7 @@ let response_or_fail request =
            (List.map (fun d -> d.Semantic_middle_worker.message) diagnostics))
   | response -> response
 
-let test_post_collection_fusion_core_reaches_pre_dce () =
+let test_post_tuple_sroa_core_reaches_pre_dce () =
   let core =
     core_program ~foreign_includes:[ "boundary_fixture.h" ]
       [
@@ -245,30 +229,13 @@ let test_post_collection_fusion_core_reaches_pre_dce () =
       ]
   in
   match response_or_fail (decode_ok (request_json ~core ~require_main:true ())) with
-  | Semantic_middle_worker.Compiled { core; observations } ->
+  | Semantic_middle_worker.Compiled { core } ->
       let rendered = Lsp_json.to_string core in
-      Alcotest.(check int) "observations" 1 (List.length observations);
       Alcotest.(check bool) "root function" true (Modules.contains rendered "main");
       Alcotest.(check bool) "module function" true
         (Modules.contains rendered "pkg_left__value");
       Alcotest.(check bool) "program foreign includes" true
         (Modules.contains rendered "boundary_fixture.h")
-  | Semantic_middle_worker.Stopped _ -> Alcotest.fail "unexpected stop"
-  | Semantic_middle_worker.Failed _ -> assert false
-
-let test_stop_after_returns_snapshot () =
-  let core = core_program [ function_decl "main" 2 ] in
-  let request =
-    decode_ok
-      (request_json ~core ~observations:[ "fusion" ] ~stop_after:"fusion" ())
-  in
-  match response_or_fail request with
-  | Semantic_middle_worker.Stopped { stage; rendered; observations } ->
-      Alcotest.(check string) "stage" "fusion"
-        (Semantic_middle_worker.stage_name stage);
-      Alcotest.(check int) "observations" 1 (List.length observations);
-      Alcotest.(check bool) "snapshot" true (String.length rendered > 0)
-  | Semantic_middle_worker.Compiled _ -> Alcotest.fail "expected stop"
   | Semantic_middle_worker.Failed _ -> assert false
 
 let test_rejects_core_from_before_debug_lowering () =
@@ -282,7 +249,7 @@ let test_rejects_core_from_before_debug_lowering () =
       ]
   in
   let core = core_program [ function_decl ~body:debug_body "main" 2 ] in
-  expect_decode_error "invalid_post_collection_fusion_core" (request_json ~core ())
+  expect_decode_error "invalid_post_tuple_sroa_core" (request_json ~core ())
 
 let test_accepts_synthesis_introduced_mutable_local () =
   let mutable_let =
@@ -313,7 +280,7 @@ let test_rejects_core_from_before_monomorphization () =
       ]
   in
   let core = core_program [ function_decl ~body:call "main" 2 ] in
-  expect_decode_error_message_contains "invalid_post_collection_fusion_core"
+  expect_decode_error_message_contains "invalid_post_tuple_sroa_core"
     "call to user function \"identity\"" (request_json ~core ())
 
 let test_rejects_unprojected_generic_function () =
@@ -326,7 +293,7 @@ let test_rejects_unprojected_generic_function () =
   in
   let generic = function_decl ~type_params:[ type_param ] "identity" 1 in
   let core = core_program [ generic; function_decl "main" 2 ] in
-  expect_decode_error "invalid_post_collection_fusion_core" (request_json ~core ())
+  expect_decode_error "invalid_post_tuple_sroa_core" (request_json ~core ())
 
 let test_accepts_runtime_abi_union_templates () =
   let core =
@@ -360,11 +327,11 @@ let test_rejects_malformed_runtime_abi_union_templates () =
           union_variant "None" 0;
         ]
   in
-  expect_decode_error "invalid_post_collection_fusion_core"
+  expect_decode_error "invalid_post_tuple_sroa_core"
     (request_json ~core:(core_program [ malformed_result ]) ());
-  expect_decode_error "invalid_post_collection_fusion_core"
+  expect_decode_error "invalid_post_tuple_sroa_core"
     (request_json ~core:(core_program [ typed_option ]) ());
-  expect_decode_error "invalid_post_collection_fusion_core"
+  expect_decode_error "invalid_post_tuple_sroa_core"
     (request_json ~core:(core_program [ wrong_option_tags ]) ())
 
 let test_require_main_validation () =
@@ -377,7 +344,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 11) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 13) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -385,10 +352,10 @@ let suite =
   [
     ( "protocol",
       [
-        Alcotest.test_case "decode post-collection-fusion Core request" `Quick
+        Alcotest.test_case "decode post-tuple-SROA Core request" `Quick
           test_decode_phase_specific_request;
         Alcotest.test_case "reject incompatible protocol fields" `Quick
-          test_rejects_schema_domain_phase_capability_and_stage;
+          test_rejects_schema_domain_phase_and_capability;
         Alcotest.test_case "reject missing and late Core" `Quick
           test_rejects_missing_and_late_core;
         Alcotest.test_case "response JSON is versioned" `Quick
@@ -396,10 +363,8 @@ let suite =
       ] );
     ( "worker",
       [
-        Alcotest.test_case "post-collection-fusion Core reaches pre-DCE" `Quick
-          test_post_collection_fusion_core_reaches_pre_dce;
-        Alcotest.test_case "stop-after returns snapshot" `Quick
-          test_stop_after_returns_snapshot;
+        Alcotest.test_case "post-tuple-SROA Core reaches pre-DCE" `Quick
+          test_post_tuple_sroa_core_reaches_pre_dce;
         Alcotest.test_case "reject Core from before debug lowering" `Quick
           test_rejects_core_from_before_debug_lowering;
         Alcotest.test_case "accept synthesis-introduced mutable local" `Quick

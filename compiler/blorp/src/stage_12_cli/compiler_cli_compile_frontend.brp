@@ -27,18 +27,15 @@ import:
 		core_early_pipeline_diagnostic_hint,
 		core_early_pipeline_diagnostic_message,
 		core_early_pipeline_stage_name,
+		finish_early_core_pipeline_after_projection,
 		run_early_core_pipeline_to_semantic_middle,
 	../stage_09_core/compiler_core_resolve: CoreResolveImportBinding, CoreResolveModuleImports
-	../stage_09_core/compiler_semantic_worker_protocol:
-		SemanticMiddleCapability(
-			PostCollectionFusionCoreCapability,
-			PreDceCoreCapability,
-			RenderedStageObservationsCapability,
-		),
-		SemanticMiddleRequest,
-		SemanticMiddleStage,
+	../stage_09_core/compiler_semantic_middle_projection:
 		project_semantic_middle_program,
 		semantic_middle_projection_error_message,
+	../stage_09_core/compiler_semantic_worker_protocol:
+		SemanticMiddleCapability(PostTupleSroaCoreCapability, PreDceCoreCapability),
+		SemanticMiddleRequest,
 	compiler_cli_core_observation: CliCoreObservation
 	compiler_cli_plan: CliFrontendModuleGraph
 	compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
@@ -134,8 +131,6 @@ pure func compile_frontend_graph(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-	observations: List[SemanticMiddleStage],
-	stop_after: Option[SemanticMiddleStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
 	compile_frontend_graph_with_typed_validation(
 		graph,
@@ -145,8 +140,6 @@ pure func compile_frontend_graph(
 		check_invariants,
 		early_observations,
 		early_stop,
-		observations,
-		stop_after,
 	)
 
 
@@ -158,8 +151,6 @@ pure func compile_frontend_graph_with_typed_validation(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-	observations: List[SemanticMiddleStage],
-	stop_after: Option[SemanticMiddleStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
 	match graph.roots:
 		[root]:
@@ -181,8 +172,6 @@ pure func compile_frontend_graph_with_typed_validation(
 						check_invariants,
 						early_observations,
 						early_stop,
-						observations,
-						stop_after,
 					)
 		_:
 			Err(["source compilation requires exactly one root module"])
@@ -195,8 +184,6 @@ private pure func compile_validated_typechecked_frontend_graph(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-	observations: List[SemanticMiddleStage],
-	stop_after: Option[SemanticMiddleStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
 	prepared = prepare_core_graph(
 		typechecked.target.typed_program,
@@ -245,27 +232,39 @@ private pure func compile_validated_typechecked_frontend_graph(
 				Err(error):
 					Err([semantic_middle_projection_error_message(error)])
 
-			request: SemanticMiddleRequest = {
-				target_path = typechecked.target.path,
-				target_module_name = typechecked.target.module_name,
-				core = projected_program,
-				next_def_id = output.next_def_id,
-				require_main = require_main,
-				check_invariants = check_invariants,
-				required_capabilities = [
-					PostCollectionFusionCoreCapability,
-					PreDceCoreCapability,
-					RenderedStageObservationsCapability,
-				],
-				observations = observations,
-				stop_after = stop_after
-			}
+			match finish_early_core_pipeline_after_projection(
+				{ output | program = projected_program },
+				early_configuration,
+			):
+				CoreEarlyPipelineFailed(diagnostic):
+					Err([early_pipeline_error(diagnostic)])
+				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
+					Ok(
+						CompiledFrontendStopped(
+							typechecked.target.path,
+							core_early_pipeline_stage_name(stage),
+							rendered,
+							completed_observations.map(early_observation),
+						),
+					)
+				CoreEarlyPipelineCompleted(completed):
+					request: SemanticMiddleRequest = {
+						target_path = typechecked.target.path,
+						target_module_name = typechecked.target.module_name,
+						core = completed.program,
+						next_def_id = completed.next_def_id,
+						require_main = require_main,
+						check_invariants = check_invariants,
+						required_capabilities = [PostTupleSroaCoreCapability, PreDceCoreCapability]
+					}
 
-			Ok(
-				CompiledFrontendReady(
-					request,
-					compiler_typed_program_to_json(typechecked.target.typed_program).to_string(),
-					typechecked_graph_source_include_dirs(typechecked),
-					output.observations.map(early_observation),
-				),
-			)
+					Ok(
+						CompiledFrontendReady(
+							request,
+							compiler_typed_program_to_json(
+								typechecked.target.typed_program,
+							).to_string(),
+							typechecked_graph_source_include_dirs(typechecked),
+							completed.observations.map(early_observation),
+						),
+					)

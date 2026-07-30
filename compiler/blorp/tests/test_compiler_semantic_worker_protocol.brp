@@ -19,26 +19,20 @@ import:
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionVariant,
+	../src/stage_09_core/compiler_semantic_middle_projection:
+		SemanticMiddleProjectionError(SemanticMiddleMalformedRuntimeAbiUnion),
+		project_semantic_middle_program,
 	../src/stage_09_core/compiler_semantic_worker_protocol:
 		SEMANTIC_MIDDLE_DOMAIN,
 		SEMANTIC_MIDDLE_SCHEMA_VERSION,
-		SemanticMiddleCapability(
-			PostCollectionFusionCoreCapability,
-			PreDceCoreCapability,
-			RenderedStageObservationsCapability,
-		),
-		SemanticMiddleProjectionError(SemanticMiddleMalformedRuntimeAbiUnion),
+		SemanticMiddleCapability(PostTupleSroaCoreCapability, PreDceCoreCapability),
 		SemanticMiddleProtocolError(SemanticMiddleInvalidCore),
 		SemanticMiddleRequest,
-		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed, SemanticMiddleStopped),
-		SemanticMiddleStage(FusionMiddleStage),
+		SemanticMiddleResponse(SemanticMiddleCompiled, SemanticMiddleFailed),
 		decode_semantic_middle_response_value,
 		parse_semantic_middle_capability,
-		parse_semantic_middle_stage,
-		project_semantic_middle_program,
 		semantic_middle_capability_name,
 		semantic_middle_request_to_json,
-		semantic_middle_stage_name,
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -60,13 +54,7 @@ pure func sample_request() -> SemanticMiddleRequest:
 		next_def_id = 42,
 		require_main = True,
 		check_invariants = True,
-		required_capabilities = [
-			PostCollectionFusionCoreCapability,
-			PreDceCoreCapability,
-			RenderedStageObservationsCapability,
-		],
-		observations = [FusionMiddleStage],
-		stop_after = Some(FusionMiddleStage)
+		required_capabilities = [PostTupleSroaCoreCapability, PreDceCoreCapability]
 	}
 
 
@@ -348,20 +336,8 @@ pure func field_array_length_is(value: JsonValue, name: String, expected: Int) -
 			False
 
 
-pure func test_stage_names_round_trip() -> Bool:
-	stages = [FusionMiddleStage]
-
-	stages.all(
-		func(stage): parse_semantic_middle_stage(semantic_middle_stage_name(stage)) == Some(stage),
-	)
-
-
 pure func test_capability_names_round_trip() -> Bool:
-	capabilities = [
-		PostCollectionFusionCoreCapability,
-		PreDceCoreCapability,
-		RenderedStageObservationsCapability,
-	]
+	capabilities = [PostTupleSroaCoreCapability, PreDceCoreCapability]
 
 	capabilities.all(
 		func(
@@ -379,16 +355,16 @@ pure func test_request_json_is_phase_specific() -> Bool:
 		field_number_is(value, "schema", SEMANTIC_MIDDLE_SCHEMA_VERSION)
 		and field_string_is(value, "domain", SEMANTIC_MIDDLE_DOMAIN)
 		and field_string_is(value, "kind", "compile_pre_dce")
-		and field_string_is(value, "core_phase", "post_collection_fusion")
+		and field_string_is(value, "core_phase", "post_tuple_sroa")
 		and field_string_is(value, "target_path", "src/main.brp")
 		and field_string_is(value, "target_module", "main")
 		and field_number_is(value, "next_def_id", 42)
 		and get_field(value, "debug").is_none()
 		and field_bool_is(value, "require_main", True)
 		and field_bool_is(value, "check_invariants", True)
-		and field_array_length_is(value, "required_capabilities", 3)
-		and field_array_length_is(value, "observations", 1)
-		and field_string_is(value, "stop_after", "fusion")
+		and field_array_length_is(value, "required_capabilities", 2)
+		and get_field(value, "observations").is_none()
+		and get_field(value, "stop_after").is_none()
 		and get_field(value, "import_bindings").is_none()
 		and get_field(value, "module_imports").is_none()
 		and get_field(value, "args").is_none()
@@ -402,15 +378,10 @@ pure func compiled_response_value_with_core(core: JsonValue) -> JsonValue:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
+			JsonString("core_post_tuple_sroa"),
 			JsonString("core_pre_dce"),
-			JsonString("rendered_stage_observations"),
 		])),
 		("core", core),
-		("observations", JsonVector([JsonObject([
-				("stage", JsonString("fusion")),
-				("rendered", JsonString("func main")),
-			])])),
 	])
 
 
@@ -424,17 +395,8 @@ pure func compiled_response_value() -> JsonValue:
 
 pure func test_decode_compiled_response() -> Bool:
 	match decode_semantic_middle_response_value(compiled_response_value()):
-		Ok(SemanticMiddleCompiled(core, observations)):
-			match observations.get(0):
-				Some(observation):
-					(
-						core.decls.length() == 0
-						and core.foreign_includes.length() == 0
-						and observation.stage == FusionMiddleStage
-						and observation.rendered == "func main"
-					)
-				None:
-					False
+		Ok(SemanticMiddleCompiled(core)):
+			core.decls.length() == 0 and core.foreign_includes.length() == 0
 		Ok(_):
 			False
 		Err(_):
@@ -453,43 +415,14 @@ pure func test_rejects_malformed_core_response() -> Bool:
 			False
 
 
-pure func test_decode_stopped_response() -> Bool:
-	value = JsonObject([
-		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
-		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
-		("kind", JsonString("stopped")),
-		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
-			JsonString("core_pre_dce"),
-			JsonString("rendered_stage_observations"),
-		])),
-		("stage", JsonString("fusion")),
-		("rendered", JsonString("trait-resolve snapshot")),
-		("observations", JsonVector([])),
-	])
-
-	match decode_semantic_middle_response_value(value):
-		Ok(SemanticMiddleStopped(stage, rendered, observations)):
-			(
-				stage == FusionMiddleStage
-				and rendered == "trait-resolve snapshot"
-				and observations.length() == 0
-			)
-		Ok(_):
-			False
-		Err(_):
-			False
-
-
 pure func test_decode_failed_response() -> Bool:
 	value = JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("failed")),
 		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
+			JsonString("core_post_tuple_sroa"),
 			JsonString("core_pre_dce"),
-			JsonString("rendered_stage_observations"),
 		])),
 		("diagnostics", JsonVector([JsonObject([
 				("code", JsonString("core_lower")),
@@ -521,14 +454,13 @@ pure func test_decode_failed_response() -> Bool:
 			False
 
 
-pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
+pure func test_rejects_wrong_schema_domain_kind_and_capability() -> Bool:
 	wrong_schema = JsonObject([
-		("schema", JsonNumber(99.0)),
+		("schema", JsonNumber(12.0)),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([])),
 		("core", JsonObject([])),
-		("observations", JsonVector([])),
 	])
 	wrong_domain = JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
@@ -536,45 +468,39 @@ pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([])),
 		("core", JsonObject([])),
-		("observations", JsonVector([])),
 	])
-	wrong_stage = JsonObject([
+	wrong_kind = JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("stopped")),
-		("capabilities", JsonVector([])),
-		("stage", JsonString("dce")),
-		("rendered", JsonString("unsupported")),
-		("observations", JsonVector([])),
+		("capabilities", JsonVector([
+			JsonString("core_post_tuple_sroa"),
+			JsonString("core_pre_dce"),
+		])),
 	])
 	missing_capability = JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
-		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
-			JsonString("core_pre_dce"),
-		])),
+		("capabilities", JsonVector([JsonString("core_pre_dce")])),
 		("core", JsonObject([])),
-		("observations", JsonVector([])),
 	])
 	unknown_capability = JsonObject([
 		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
+			JsonString("core_post_tuple_sroa"),
 			JsonString("core_pre_dce"),
 			JsonString("source_loading"),
 		])),
 		("core", JsonObject([])),
-		("observations", JsonVector([])),
 	])
 
 	(
 		decode_semantic_middle_response_value(wrong_schema).is_err()
 		and decode_semantic_middle_response_value(wrong_domain).is_err()
-		and decode_semantic_middle_response_value(wrong_stage).is_err()
+		and decode_semantic_middle_response_value(wrong_kind).is_err()
 		and decode_semantic_middle_response_value(missing_capability).is_err()
 		and decode_semantic_middle_response_value(unknown_capability).is_err()
 	)
@@ -583,7 +509,6 @@ pure func test_rejects_wrong_schema_domain_and_stage() -> Bool:
 tests: TestSuite = {
 	description = "Blorp semantic-middle worker protocol",
 	tests = [
-		("stage names round trip", test_stage_names_round_trip),
 		("capability names round trip", test_capability_names_round_trip),
 		(
 			"projects only semantic-middle runtime declarations",
@@ -593,8 +518,10 @@ tests: TestSuite = {
 		("request JSON is phase specific", test_request_json_is_phase_specific),
 		("decode compiled response", test_decode_compiled_response),
 		("reject malformed Core response", test_rejects_malformed_core_response),
-		("decode stopped response", test_decode_stopped_response),
 		("decode failed response", test_decode_failed_response),
-		("reject wrong schema domain and stage", test_rejects_wrong_schema_domain_and_stage),
+		(
+			"reject wrong schema, domain, kind, and capability",
+			test_rejects_wrong_schema_domain_kind_and_capability,
+		),
 	]
 }

@@ -1,0 +1,205 @@
+-- Fuse the narrow tensor add-scaled assignment shape before specialization.
+-- Unsupported expressions remain unchanged for ordinary tensor arithmetic.
+import:
+	compiler_core_json:
+		CoreBinaryOp(AddOp, MultiplyOp),
+		CoreCallKind(BuiltinCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(AssignExpr, BinaryExpr, CallExpr, LiteralExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreProgram,
+		CoreSourceLoc,
+		CoreType(NamedType, TensorType, VoidType),
+		CoreVar,
+		core_expr_type,
+		core_var_equal,
+	compiler_core_mono: core_mono_type_equal
+	compiler_core_traverse: map_core_expr_children
+
+
+private VOID_TYPE: CoreType = VoidType
+
+
+private enum CoreTensorFusionElementKind:
+	TensorFusionFloat64
+	TensorFusionFloat32
+
+
+private record CoreTensorFusionOperand {
+	expr: CoreExpr,
+	element_kind: CoreTensorFusionElementKind,
+	typ: CoreType
+}
+
+
+private record CoreTensorFusionScaledInput {
+	input: CoreTensorFusionOperand,
+	scale: CoreExpr
+}
+
+
+private pure func tensor_element_kind(typ: CoreType) -> Option[CoreTensorFusionElementKind]:
+	match typ:
+		NamedType("Float", []):
+			Some(TensorFusionFloat64)
+		NamedType("Float32", []):
+			Some(TensorFusionFloat32)
+		_:
+			None
+
+
+private pure func tensor_operand(expr: CoreExpr) -> Option[CoreTensorFusionOperand]:
+	typ: CoreType = core_expr_type(expr)
+
+	match typ:
+		TensorType(info):
+			element_kind ?= tensor_element_kind(info.element_type)
+			Some({
+				expr = expr,
+				element_kind = element_kind,
+				typ = typ,
+			})
+		_:
+			None
+
+
+private pure func stable_tensor_input(expr: CoreExpr) -> Option[CoreTensorFusionOperand]:
+	match expr:
+		VarExpr(_, _, _):
+			tensor_operand(expr)
+		_:
+			None
+
+
+private pure func stable_scalar(
+	element_kind: CoreTensorFusionElementKind,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	scalar_kind ?= tensor_element_kind(core_expr_type(expr))
+
+	if scalar_kind != element_kind:
+		None
+	else:
+		match expr:
+			LiteralExpr(_, _, _) | VarExpr(_, _, _):
+				Some(expr)
+			_:
+				None
+
+
+private pure func scaled_tensor_input(expr: CoreExpr) -> Option[CoreTensorFusionScaledInput]:
+	match expr:
+		BinaryExpr(MultiplyOp, left, right, _, _):
+			match stable_tensor_input(left):
+				Some(input):
+					scale ?= stable_scalar(input.element_kind, right)
+					Some({
+						input = input,
+						scale = scale,
+					})
+				None:
+					input ?= stable_tensor_input(right)
+					scale ?= stable_scalar(input.element_kind, left)
+					Some({
+						input = input,
+						scale = scale,
+					})
+		_:
+			None
+
+
+private pure func target_type(target: CoreVar, expr: CoreExpr) -> Option[CoreType]:
+	match expr:
+		VarExpr(variable, typ, _):
+			if core_var_equal(variable, target):
+				Some(typ)
+			else:
+				None
+		_:
+			None
+
+
+private pure func runtime_name(kind: CoreTensorFusionElementKind) -> String:
+	match kind:
+		TensorFusionFloat64:
+			"blorp_tensor_add_scaled_f64_cow"
+		TensorFusionFloat32:
+			"blorp_tensor_add_scaled_f32_cow"
+
+
+private pure func fuse_add_scaled_assignment(
+	target: CoreVar,
+	rhs: CoreExpr,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match rhs:
+		BinaryExpr(AddOp, left, right, _, _):
+			var target_typ: Option[CoreType] = target_type(target, left)
+			var scaled_side: CoreExpr = right
+
+			if target_typ.is_none():
+				target_typ = target_type(target, right)
+				scaled_side = left
+
+			target_type_value ?= target_typ
+			target_operand ?= tensor_operand(VarExpr(target, target_type_value, loc))
+			scaled ?= scaled_tensor_input(scaled_side)
+
+			if (
+				target_operand.element_kind != scaled.input.element_kind
+				or not core_mono_type_equal(target_operand.typ, scaled.input.typ)
+			):
+				None
+			else:
+				Some(
+					CallExpr(
+						BuiltinCall(runtime_name(target_operand.element_kind)),
+						VoidExpr(
+							VOID_TYPE,
+							loc,
+						),
+						[target_operand.expr, scaled.input.expr, scaled.scale],
+						target_type_value,
+						loc,
+					),
+				)
+		_:
+			None
+
+
+pure func fuse_tensor_update_expr(expr: CoreExpr) -> CoreExpr:
+	rewritten: CoreExpr = map_core_expr_children(expr, fuse_tensor_update_expr)
+
+	match rewritten:
+		AssignExpr(target, rhs, typ, loc):
+			match fuse_add_scaled_assignment(target, rhs, loc):
+				Some(fused):
+					AssignExpr(target, fused, typ, loc)
+				None:
+					rewritten
+		_:
+			rewritten
+
+
+private pure func fuse_tensor_update_function(function_info: CoreFunction) -> CoreFunction:
+	{ function_info | body = function_info.body.map(fuse_tensor_update_expr) }
+
+
+private pure func fuse_tensor_update_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(fuse_tensor_update_function(function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = fuse_tensor_update_expr(global.init) })
+		ImplDecl(implementation):
+			ImplDecl(
+				{ implementation |
+					methods = implementation.methods.map(fuse_tensor_update_function)
+				},
+			)
+		_:
+			decl
+
+
+pure func fuse_tensor_update_program(program: CoreProgram) -> CoreProgram:
+	{ program | decls = program.decls.map(fuse_tensor_update_decl) }

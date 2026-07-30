@@ -450,10 +450,7 @@ compiler/            # OCaml compiler implementation
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core.ml           # Core IR type definitions and traversal helpers
-    core_post_collection_fusion_json.ml  # Strict Blorp post-collection-fusion Core decoder
-    core_parallel_tensor_pipeline.ml  # Scoped vector/matrix pipeline fusion
-    core_tensor_fusion.ml  # Core IR tensor update fusion
-    core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
+    core_post_tuple_sroa_json.ml  # Strict Blorp post-tuple-SROA Core decoder
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
     core_specialize_fallback.ml  # Narrow fallback for unsupported runtime layouts
     core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client

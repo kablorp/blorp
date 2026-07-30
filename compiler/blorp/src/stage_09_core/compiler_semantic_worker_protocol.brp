@@ -1,24 +1,17 @@
--- Post-collection-fusion Core protocol for the one temporary OCaml
+-- Post-tuple-SROA Core protocol for the one temporary OCaml
 -- semantic-middle worker.
 --
 -- Blorp owns the frontend and backend around this boundary. The worker accepts
--- a call-resolved, std-inlined, tailrec-lowered, collection-fused Core graph and
--- returns pre-DCE Core. CLI arguments, source discovery, artifact I/O, and
--- process execution do not belong in this shape.
+-- a projected, tuple-scalar-replaced Core graph and returns pre-DCE Core.
+-- CLI arguments, source discovery, artifact I/O, and process execution do not
+-- belong in this shape.
 import:
 	compiler_core_json:
-		CoreDecl(EnumDecl, FunctionDecl, HeapRecordDecl, ImplDecl, UnionDecl, ValueRecordDecl),
 		CoreJsonError,
 		CoreProgram,
-		CoreType(TypeParameterType),
-		CoreUnionDecl,
-		CoreUnionField,
-		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
-		CoreUnionVariant,
 		core_json_error_to_string,
 		core_program_to_json,
 		decode_core_program_json,
-	compiler_core_type_policy: core_impl_is_generic
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -27,185 +20,18 @@ import:
 		get_field,
 
 
-SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 11
+SEMANTIC_MIDDLE_SCHEMA_VERSION: Int = 13
 
 SEMANTIC_MIDDLE_DOMAIN: String = "compiler_semantic_middle"
 
 private SEMANTIC_MIDDLE_REQUEST_KIND: String = "compile_pre_dce"
 
-private SEMANTIC_MIDDLE_CORE_PHASE: String = "post_collection_fusion"
-
-
-private pure func abi_payload_matches(
-	fields: List[CoreUnionField],
-	expected_type_parameter: Option[String],
-) -> Bool:
-	match expected_type_parameter:
-		Some(expected):
-			if fields.length() != 1:
-				False
-			else:
-				match fields.get(0):
-					Some(field):
-						match field.typ:
-							TypeParameterType(name):
-								name == expected
-							_:
-								False
-					None:
-						False
-		None:
-			fields.is_empty()
-
-
-private pure func abi_variant_matches(
-	variant: CoreUnionVariant,
-	expected_name: String,
-	expected_tag: Int,
-	expected_type_parameter: Option[String],
-) -> Bool:
-	(
-		variant.name == expected_name
-		and variant.tag == expected_tag
-		and abi_payload_matches(variant.fields, expected_type_parameter)
-	)
-
-
-private pure func is_global_abi_union_template(union_decl: CoreUnionDecl) -> Bool:
-	has_erased_payload: Bool = match union_decl.payload_storage:
-		ErasedUnionPayloadStorage:
-			True
-		_:
-			False
-
-	if not has_erased_payload:
-		False
-	else if union_decl.name == "Option":
-		if union_decl.type_params != ["T"] or union_decl.variants.length() != 2:
-			False
-		else:
-			match union_decl.variants.get(0):
-				Some(some_variant):
-					match union_decl.variants.get(1):
-						Some(none_variant):
-							(
-								abi_variant_matches(some_variant, "Some", 0, Some("T"))
-								and abi_variant_matches(none_variant, "None", 1, None)
-							)
-						None:
-							False
-				None:
-					False
-	else if union_decl.name == "Result":
-		if union_decl.type_params != ["T", "E"] or union_decl.variants.length() != 2:
-			False
-		else:
-			match union_decl.variants.get(0):
-				Some(ok_variant):
-					match union_decl.variants.get(1):
-						Some(error_variant):
-							(
-								abi_variant_matches(ok_variant, "Ok", 0, Some("T"))
-								and abi_variant_matches(error_variant, "Err", 1, Some("E"))
-							)
-						None:
-							False
-				None:
-					False
-	else:
-		False
-
-
-union SemanticMiddleProjectionError:
-	SemanticMiddleMalformedRuntimeAbiUnion(String)
-
-
-pure func semantic_middle_projection_error_message(error: SemanticMiddleProjectionError) -> String:
-	match error:
-		SemanticMiddleMalformedRuntimeAbiUnion(name):
-			"reserved runtime ABI union `${name}` does not match its required " + "type parameters, variant order, tags, payloads, and erased storage"
-
-
-private pure func project_semantic_middle_decl(
-	decl: CoreDecl,
-) -> Result[Option[CoreDecl], SemanticMiddleProjectionError]:
-	match decl:
-		FunctionDecl(function_info):
-			if function_info.type_params.is_empty():
-				Ok(Some(decl))
-			else:
-				Ok(None)
-		EnumDecl(enum_decl):
-			if enum_decl.type_params.is_empty():
-				Ok(Some(decl))
-			else:
-				Ok(None)
-		UnionDecl(union_decl):
-			if union_decl.type_params.is_empty():
-				Ok(Some(decl))
-			else if union_decl.name == "Option" or union_decl.name == "Result":
-				if is_global_abi_union_template(union_decl):
-					Ok(Some(decl))
-				else:
-					Err(SemanticMiddleMalformedRuntimeAbiUnion(union_decl.name))
-			else:
-				Ok(None)
-		ValueRecordDecl(record_decl):
-			if record_decl.type_params.is_empty():
-				Ok(Some(decl))
-			else:
-				Ok(None)
-		HeapRecordDecl(record_decl):
-			if record_decl.type_params.is_empty():
-				Ok(Some(decl))
-			else:
-				Ok(None)
-		ImplDecl(impl_decl):
-			if core_impl_is_generic(impl_decl):
-				Ok(None)
-			else:
-				Ok(Some(decl))
-		_:
-			Ok(Some(decl))
-
-
--- Monomorphization retains generic templates as specialization sources. The
--- semantic middle operates only on runtime declarations, except for the global
--- Option/Result ABI templates that the remaining middle handles explicitly.
-pure func project_semantic_middle_program(
-	program: CoreProgram,
-) -> Result[CoreProgram, SemanticMiddleProjectionError]:
-	var decls: List[CoreDecl] = []
-	var failure: Option[SemanticMiddleProjectionError] = None
-
-	for decl in program.decls:
-		match project_semantic_middle_decl(decl):
-			Ok(Some(runtime_decl)):
-				decls = decls.append(runtime_decl)
-			Ok(None):
-				void
-			Err(error):
-				failure = Some(error)
-				break
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok({
-				decls = decls,
-				foreign_includes = program.foreign_includes,
-			})
-
-
-enum SemanticMiddleStage:
-	FusionMiddleStage
+private SEMANTIC_MIDDLE_CORE_PHASE: String = "post_tuple_sroa"
 
 
 enum SemanticMiddleCapability:
-	PostCollectionFusionCoreCapability
+	PostTupleSroaCoreCapability
 	PreDceCoreCapability
-	RenderedStageObservationsCapability
 
 
 record SemanticMiddleRequest {
@@ -215,15 +41,7 @@ record SemanticMiddleRequest {
 	next_def_id: Int,
 	require_main: Bool,
 	check_invariants: Bool,
-	required_capabilities: List[SemanticMiddleCapability],
-	observations: List[SemanticMiddleStage],
-	stop_after: Option[SemanticMiddleStage]
-}
-
-
-record SemanticMiddleObservation {
-	stage: SemanticMiddleStage,
-	rendered: String
+	required_capabilities: List[SemanticMiddleCapability]
 }
 
 
@@ -238,8 +56,7 @@ record SemanticMiddleDiagnostic {
 
 
 union SemanticMiddleResponse:
-	SemanticMiddleCompiled(CoreProgram, List[SemanticMiddleObservation])
-	SemanticMiddleStopped(SemanticMiddleStage, String, List[SemanticMiddleObservation])
+	SemanticMiddleCompiled(CoreProgram)
 	SemanticMiddleFailed(List[SemanticMiddleDiagnostic])
 
 
@@ -249,7 +66,6 @@ union SemanticMiddleProtocolError:
 	SemanticMiddleUnsupportedSchema(Int)
 	SemanticMiddleUnsupportedDomain(String)
 	SemanticMiddleUnsupportedKind(String)
-	SemanticMiddleUnsupportedStage(String)
 	SemanticMiddleUnsupportedCapability(String)
 	SemanticMiddleMissingCapability(String)
 	SemanticMiddleInvalidCore(CoreJsonError)
@@ -267,8 +83,6 @@ pure func semantic_middle_protocol_error_message(error: SemanticMiddleProtocolEr
 			"semantic worker returned unsupported domain `${domain}`"
 		SemanticMiddleUnsupportedKind(kind):
 			"semantic worker returned unsupported response kind `${kind}`"
-		SemanticMiddleUnsupportedStage(stage):
-			"semantic worker returned unsupported stage `${stage}`"
 		SemanticMiddleUnsupportedCapability(capability):
 			"semantic worker returned unsupported capability `${capability}`"
 		SemanticMiddleMissingCapability(capability):
@@ -277,28 +91,12 @@ pure func semantic_middle_protocol_error_message(error: SemanticMiddleProtocolEr
 			"semantic worker returned invalid Core: ${core_json_error_to_string(core_error)}"
 
 
-pure func semantic_middle_stage_name(stage: SemanticMiddleStage) -> String:
-	match stage:
-		FusionMiddleStage:
-			"fusion"
-
-
-pure func parse_semantic_middle_stage(name: String) -> Option[SemanticMiddleStage]:
-	match name:
-		"fusion":
-			Some(FusionMiddleStage)
-		_:
-			None
-
-
 pure func semantic_middle_capability_name(capability: SemanticMiddleCapability) -> String:
 	match capability:
-		PostCollectionFusionCoreCapability:
-			"core_post_collection_fusion"
+		PostTupleSroaCoreCapability:
+			"core_post_tuple_sroa"
 		PreDceCoreCapability:
 			"core_pre_dce"
-		RenderedStageObservationsCapability:
-			"rendered_stage_observations"
 
 
 private pure func semantic_middle_capabilities_include(
@@ -318,22 +116,12 @@ private pure func semantic_middle_capabilities_include(
 
 pure func parse_semantic_middle_capability(name: String) -> Option[SemanticMiddleCapability]:
 	match name:
-		"core_post_collection_fusion":
-			Some(PostCollectionFusionCoreCapability)
+		"core_post_tuple_sroa":
+			Some(PostTupleSroaCoreCapability)
 		"core_pre_dce":
 			Some(PreDceCoreCapability)
-		"rendered_stage_observations":
-			Some(RenderedStageObservationsCapability)
 		_:
 			None
-
-
-private pure func optional_stage_to_json(value: Option[SemanticMiddleStage]) -> JsonValue:
-	match value:
-		Some(stage):
-			JsonString(semantic_middle_stage_name(stage))
-		None:
-			JsonNull
 
 
 pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> JsonValue:
@@ -351,10 +139,6 @@ pure func semantic_middle_request_to_json(request: SemanticMiddleRequest) -> Jso
 		("required_capabilities", JsonVector(request.required_capabilities.map(
 				func(capability): JsonString(semantic_middle_capability_name(capability)),
 			))),
-		("observations", JsonVector(request.observations.map(
-				func(stage): JsonString(semantic_middle_stage_name(stage)),
-			))),
-		("stop_after", optional_stage_to_json(request.stop_after)),
 	])
 
 
@@ -423,12 +207,6 @@ private pure func optional_string_field(
 			Err(SemanticMiddleExpectedField(name, "a string or null"))
 
 
-private pure func decode_semantic_middle_stage(
-	name: String,
-) -> Result[SemanticMiddleStage, SemanticMiddleProtocolError]:
-	parse_semantic_middle_stage(name).to_result(SemanticMiddleUnsupportedStage(name))
-
-
 private pure func decode_semantic_middle_capability(
 	value: JsonValue,
 ) -> Result[SemanticMiddleCapability, SemanticMiddleProtocolError]:
@@ -462,51 +240,12 @@ private pure func decode_semantic_middle_capabilities(
 	items ?= array_field(value, "capabilities")
 	capabilities ?= decode_semantic_middle_capabilities_at(items, 0)
 
-	if not semantic_middle_capabilities_include(capabilities, PostCollectionFusionCoreCapability):
-		Err(SemanticMiddleMissingCapability("core_post_collection_fusion"))
+	if not semantic_middle_capabilities_include(capabilities, PostTupleSroaCoreCapability):
+		Err(SemanticMiddleMissingCapability("core_post_tuple_sroa"))
 	else if not semantic_middle_capabilities_include(capabilities, PreDceCoreCapability):
 		Err(SemanticMiddleMissingCapability("core_pre_dce"))
-	else if not semantic_middle_capabilities_include(
-		capabilities,
-		RenderedStageObservationsCapability,
-	):
-		Err(SemanticMiddleMissingCapability("rendered_stage_observations"))
 	else:
 		Ok(capabilities)
-
-
-private pure func decode_semantic_middle_observation(
-	value: JsonValue,
-) -> Result[SemanticMiddleObservation, SemanticMiddleProtocolError]:
-	stage_name ?= string_field(value, "stage")
-	stage ?= decode_semantic_middle_stage(stage_name)
-	rendered ?= string_field(value, "rendered")
-	Ok({
-		stage = stage,
-		rendered = rendered,
-	})
-
-
-private pure func decode_semantic_middle_observations_at(
-	items: List[JsonValue],
-	index: Int,
-) -> Result[List[SemanticMiddleObservation], SemanticMiddleProtocolError]:
-	if index >= items.length():
-		Ok([])
-	else:
-		item ?= items
-			.get(index)
-			.to_result(SemanticMiddleExpectedField("observations", "an array item"))
-		observation ?= decode_semantic_middle_observation(item)
-		rest ?= decode_semantic_middle_observations_at(items, index + 1)
-		Ok([observation].concat(rest))
-
-
-private pure func decode_semantic_middle_observations(
-	value: JsonValue,
-) -> Result[List[SemanticMiddleObservation], SemanticMiddleProtocolError]:
-	items ?= array_field(value, "observations")
-	decode_semantic_middle_observations_at(items, 0)
 
 
 private pure func decode_semantic_middle_diagnostic(
@@ -580,16 +319,9 @@ pure func decode_semantic_middle_response_value(
 
 			match decode_core_program_json(core_value):
 				Ok(core):
-					observations ?= decode_semantic_middle_observations(value)
-					Ok(SemanticMiddleCompiled(core, observations))
+					Ok(SemanticMiddleCompiled(core))
 				Err(error):
 					Err(SemanticMiddleInvalidCore(error))
-		"stopped":
-			stage_name ?= string_field(value, "stage")
-			stage ?= decode_semantic_middle_stage(stage_name)
-			rendered ?= string_field(value, "rendered")
-			observations ?= decode_semantic_middle_observations(value)
-			Ok(SemanticMiddleStopped(stage, rendered, observations))
 		"failed":
 			diagnostics ?= decode_semantic_middle_diagnostics(value)
 			Ok(SemanticMiddleFailed(diagnostics))

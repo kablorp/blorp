@@ -1,0 +1,601 @@
+import:
+	../src/stage_08_core_lower/compiler_core_identity: core_module_member_name
+	../src/stage_09_core/compiler_core_json:
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall, UnknownCall, UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LambdaExpr, LetExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(FunctionType, NamedType, RangeType, TensorType, VoidType),
+		CoreVar,
+		core_expr_type,
+	../src/stage_09_core/compiler_core_mono: core_mono_type_equal
+	../src/stage_09_core/compiler_core_parallel_tensor_pipeline: fuse_parallel_tensor_program
+	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+TY_INT: CoreType = NamedType("Int", [])
+
+TY_VOID: CoreType = VoidType
+
+VECTOR_INT: CoreType = TensorType({
+	element_type = TY_INT,
+	dims = [TensorStaticDim(4)],
+})
+
+MATRIX_INT: CoreType = TensorType({
+	element_type = TY_INT,
+	dims = [TensorStaticDim(2), TensorStaticDim(3)],
+})
+
+DEF_VECTOR_PARALLEL: Int = 1
+
+DEF_PARALLEL_VECTOR_MAP: Int = 2
+
+DEF_PARALLEL_VECTOR_MAP_INDEXED: Int = 3
+
+DEF_PARALLEL_VECTOR_ZIP_MAP: Int = 4
+
+DEF_MATRIX_PARALLEL: Int = 5
+
+DEF_PARALLEL_MATRIX_MAP: Int = 6
+
+DEF_PARALLEL_MATRIX_MAP_INDEXED: Int = 7
+
+DEF_PARALLEL_MATRIX_ZIP_MAP: Int = 8
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func function_type(params: List[CoreType], return_type: CoreType) -> CoreType:
+	FunctionType(True, params, return_type)
+
+
+private pure func callback(name: String, params: List[CoreType], return_type: CoreType) -> CoreExpr:
+	variable(
+		name,
+		function_type(params, return_type),
+	)
+
+
+private pure func lambda(
+	params: List[CoreParam],
+	body: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	LambdaExpr(
+		params,
+		return_type,
+		body,
+		True,
+		function_type(
+			params.map(pure func(param: CoreParam): param.typ),
+			return_type,
+		),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func user_call(
+	def_id: Int,
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UserCall(name, Some(def_id), []),
+		variable(
+			name,
+			function_type(
+				args.map(core_expr_type),
+				return_type,
+			),
+		),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func std_function(module_name: String, name: String, def_id: Int) -> CoreFunction:
+	{
+		name = core_module_member_name(module_name, name) + "__mono_sig_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = [],
+		return_type = TY_VOID,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func program_decls(app: CoreDecl) -> List[CoreDecl]:
+	[
+		FunctionDecl(std_function("std/vector", "parallel", DEF_VECTOR_PARALLEL)),
+		FunctionDecl(std_function("std/parallel_vector", "map", DEF_PARALLEL_VECTOR_MAP)),
+		FunctionDecl(
+			std_function(
+				"std/parallel_vector",
+				"map_indexed",
+				DEF_PARALLEL_VECTOR_MAP_INDEXED,
+			),
+		),
+		FunctionDecl(std_function("std/parallel_vector", "zip_map", DEF_PARALLEL_VECTOR_ZIP_MAP)),
+		FunctionDecl(std_function("std/matrix", "parallel", DEF_MATRIX_PARALLEL)),
+		FunctionDecl(std_function("std/parallel_matrix", "map", DEF_PARALLEL_MATRIX_MAP)),
+		FunctionDecl(
+			std_function(
+				"std/parallel_matrix",
+				"map_indexed",
+				DEF_PARALLEL_MATRIX_MAP_INDEXED,
+			),
+		),
+		FunctionDecl(std_function("std/parallel_matrix", "zip_map", DEF_PARALLEL_MATRIX_ZIP_MAP)),
+		app,
+	]
+
+
+private pure func app_function(body: CoreExpr) -> CoreFunction:
+	{
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = core_expr_type(body),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 100,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func fuse_expr(expr: CoreExpr) -> CoreExpr:
+	program: CoreProgram = {
+		decls = program_decls(FunctionDecl(app_function(expr))),
+		foreign_includes = []
+	}
+	fused: CoreProgram = fuse_parallel_tensor_program(program)
+	var body: Option[CoreExpr] = None
+
+	for decl in fused.decls:
+		match decl:
+			FunctionDecl(function_info):
+				if function_info.name == "main":
+					body = function_info.body
+					break
+			_:
+				void
+
+	body.get_or(VoidExpr(TY_VOID, SyntheticSourceLoc))
+
+
+private pure func vector_map(source: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_VECTOR_MAP,
+		"map",
+		[source, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func vector_map_indexed(source: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_VECTOR_MAP_INDEXED,
+		"map_indexed",
+		[source, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func vector_zip_map(source: CoreExpr, other: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_VECTOR_ZIP_MAP,
+		"zip_map",
+		[source, other, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func vector_parallel(body: CoreExpr) -> CoreExpr:
+	source: CoreExpr = variable("values", VECTOR_INT)
+	user_call(
+		DEF_VECTOR_PARALLEL,
+		"parallel",
+		[source, lambda([param("chunk", VECTOR_INT)], body, VECTOR_INT)],
+		VECTOR_INT,
+	)
+
+
+private pure func matrix_map(source: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_MATRIX_MAP,
+		"map",
+		[source, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func matrix_map_indexed(source: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_MATRIX_MAP_INDEXED,
+		"map_indexed",
+		[source, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func matrix_zip_map(source: CoreExpr, other: CoreExpr, mapper: CoreExpr) -> CoreExpr:
+	user_call(
+		DEF_PARALLEL_MATRIX_ZIP_MAP,
+		"zip_map",
+		[source, other, mapper],
+		core_expr_type(source),
+	)
+
+
+private pure func matrix_parallel(body: CoreExpr) -> CoreExpr:
+	source: CoreExpr = variable("matrix_values", MATRIX_INT)
+	user_call(
+		DEF_MATRIX_PARALLEL,
+		"parallel",
+		[source, lambda([param("mchunk", MATRIX_INT)], body, MATRIX_INT)],
+		MATRIX_INT,
+	)
+
+
+private pure func builtin_name(expr: CoreExpr) -> String:
+	match expr:
+		CallExpr(BuiltinCall(name), _, _, _, _):
+			name
+		_:
+			""
+
+
+private pure func lowered_callback(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(BuiltinCall(_), _, args, _, _):
+			args
+				.get(args.length() - 1)
+				.get_or(VoidExpr(TY_VOID, SyntheticSourceLoc))
+		_:
+			VoidExpr(TY_VOID, SyntheticSourceLoc)
+
+
+private pure func contains_intrinsic(expr: CoreExpr, name: String) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(actual), _, _, _, _):
+			if actual == name:
+				True
+			else:
+				immediate_core_expr_children(
+					expr,
+				).any(
+					pure func(child: CoreExpr): contains_intrinsic(child, name),
+				)
+		_:
+			immediate_core_expr_children(
+				expr,
+			).any(
+				pure func(child: CoreExpr): contains_intrinsic(child, name),
+			)
+
+
+private pure func callback_arity(expr: CoreExpr) -> Int:
+	match lowered_callback(expr):
+		LambdaExpr(params, _, _, _, _, _):
+			params.length()
+		_:
+			-1
+
+
+private pure func callback_param_has_type(expr: CoreExpr, index: Int, expected: CoreType) -> Bool:
+	match lowered_callback(expr):
+		LambdaExpr(params, _, _, _, _, _):
+			params
+				.get(index)
+				.map(pure func(param: CoreParam): core_mono_type_equal(param.typ, expected))
+				.get_or(False)
+		_:
+			False
+
+
+func test_vector_map_chain_lowers_to_parallel_map() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	mapper2: CoreExpr = callback("mapper2", [TY_INT], TY_INT)
+	lowered: CoreExpr = fuse_expr(vector_parallel(vector_map(vector_map(chunk, mapper), mapper2)))
+	builtin_name(lowered) == "blorp_vmap_parallel"
+
+
+func test_vector_indexed_chain_lowers_to_indexed_parallel_map() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	indexed: CoreExpr = callback(
+		"indexed",
+		[RangeType, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		vector_parallel(vector_map_indexed(vector_map(chunk, mapper), indexed)),
+	)
+	builtin_name(lowered) == "blorp_vmap_indexed_parallel" and callback_arity(lowered) == 2
+
+
+func test_vector_single_zip_uses_parallel_zip() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	other: CoreExpr = variable("other", VECTOR_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	zip_only: CoreExpr = vector_zip_map(chunk, other, zipper)
+	zip_expr: CoreExpr = vector_map(zip_only, mapper)
+	lowered: CoreExpr = fuse_expr(vector_parallel(zip_expr))
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_vzip_parallel"
+		and callback_arity(lowered) == 2
+		and not contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+func test_vector_reused_zip_uses_one_parallel_zip() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	other: CoreExpr = variable("other", VECTOR_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	zipper2: CoreExpr = callback(
+		"zipper2",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		vector_parallel(vector_zip_map(vector_zip_map(chunk, other, zipper), other, zipper2)),
+	)
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_vzip_parallel"
+		and not contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+func test_vector_distinct_zips_fall_back_to_indexed_map() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	other: CoreExpr = variable("other", VECTOR_INT)
+	other2: CoreExpr = variable("other2", VECTOR_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	zipper2: CoreExpr = callback(
+		"zipper2",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		vector_parallel(vector_zip_map(vector_zip_map(chunk, other, zipper), other2, zipper2)),
+	)
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_vmap_indexed_parallel"
+		and contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+func test_vector_non_chain_body_is_unchanged() -> Bool:
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	mapped: CoreExpr = vector_map(chunk, mapper)
+	body: CoreExpr = LetExpr(
+		core_var("tmp"),
+		False,
+		VECTOR_INT,
+		mapped,
+		variable("tmp", VECTOR_INT),
+	)
+	lowered: CoreExpr = fuse_expr(vector_parallel(body))
+
+	match lowered:
+		CallExpr(UserCall(_, Some(def_id), _), _, _, _, _):
+			def_id == DEF_VECTOR_PARALLEL
+		_:
+			False
+
+
+func test_unknown_parallel_entrypoint_is_not_guessed() -> Bool:
+	source: CoreExpr = variable("values", VECTOR_INT)
+	chunk: CoreExpr = variable("chunk", VECTOR_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	body: CoreExpr = lambda(
+		[param("chunk", VECTOR_INT)],
+		vector_map(chunk, mapper),
+		VECTOR_INT,
+	)
+	callee_name: String = core_module_member_name("std/vector", "parallel")
+	expr: CoreExpr = CallExpr(
+		UnknownCall,
+		variable(
+			callee_name,
+			function_type(
+				[VECTOR_INT, core_expr_type(body)],
+				VECTOR_INT,
+			),
+		),
+		[source, body],
+		VECTOR_INT,
+		SyntheticSourceLoc,
+	)
+
+	match fuse_expr(expr):
+		CallExpr(UnknownCall, _, _, _, _):
+			True
+		_:
+			False
+
+
+func test_matrix_map_chain_lowers_to_parallel_map() -> Bool:
+	chunk: CoreExpr = variable("mchunk", MATRIX_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	mapper2: CoreExpr = callback("mapper2", [TY_INT], TY_INT)
+	lowered: CoreExpr = fuse_expr(matrix_parallel(matrix_map(matrix_map(chunk, mapper), mapper2)))
+	builtin_name(lowered) == "blorp_mmap_parallel"
+
+
+func test_matrix_indexed_chain_lowers_to_indexed_parallel_map() -> Bool:
+	chunk: CoreExpr = variable("mchunk", MATRIX_INT)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	indexed: CoreExpr = callback(
+		"indexed",
+		[RangeType, RangeType, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		matrix_parallel(matrix_map_indexed(matrix_map(chunk, mapper), indexed)),
+	)
+	builtin_name(lowered) == "blorp_mmap_indexed_parallel" and callback_arity(lowered) == 3
+
+
+func test_matrix_single_zip_uses_parallel_zip() -> Bool:
+	chunk: CoreExpr = variable("mchunk", MATRIX_INT)
+	other: CoreExpr = variable("matrix_other", MATRIX_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	lowered: CoreExpr = fuse_expr(
+		matrix_parallel(matrix_map(matrix_zip_map(chunk, other, zipper), mapper)),
+	)
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_mzip_parallel"
+		and callback_arity(lowered) == 2
+		and not contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+func test_matrix_indexed_zip_uses_indexed_parallel_zip() -> Bool:
+	chunk: CoreExpr = variable("mchunk", MATRIX_INT)
+	other: CoreExpr = variable("matrix_other", MATRIX_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	indexed: CoreExpr = callback(
+		"indexed",
+		[RangeType, RangeType, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		matrix_parallel(matrix_map_indexed(matrix_zip_map(chunk, other, zipper), indexed)),
+	)
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_mzip_indexed_parallel"
+		and callback_arity(lowered) == 4
+		and not contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+func test_matrix_distinct_zips_use_flat_indexed_map() -> Bool:
+	chunk: CoreExpr = variable("mchunk", MATRIX_INT)
+	other: CoreExpr = variable("matrix_other", MATRIX_INT)
+	other2: CoreExpr = variable("matrix_other2", MATRIX_INT)
+	zipper: CoreExpr = callback(
+		"zipper",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	zipper2: CoreExpr = callback(
+		"zipper2",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	lowered: CoreExpr = fuse_expr(
+		matrix_parallel(matrix_zip_map(matrix_zip_map(chunk, other, zipper), other2, zipper2)),
+	)
+	callback_expr: CoreExpr = lowered_callback(lowered)
+
+	(
+		builtin_name(lowered) == "blorp_mmap_flat_indexed_parallel"
+		and callback_arity(lowered) == 4
+		and callback_param_has_type(lowered, 2, TY_INT)
+		and contains_intrinsic(callback_expr, "tensor_get_unchecked")
+	)
+
+
+tests: TestSuite = {
+	description = "Core parallel tensor pipeline",
+	tests = [
+		("vector map chain lowers to parallel map", test_vector_map_chain_lowers_to_parallel_map),
+		(
+			"vector indexed chain lowers to indexed parallel map",
+			test_vector_indexed_chain_lowers_to_indexed_parallel_map,
+		),
+		("vector single zip uses parallel zip", test_vector_single_zip_uses_parallel_zip),
+		("vector reused zip uses one parallel zip", test_vector_reused_zip_uses_one_parallel_zip),
+		(
+			"vector distinct zips fall back to indexed map",
+			test_vector_distinct_zips_fall_back_to_indexed_map,
+		),
+		("vector non-chain body is unchanged", test_vector_non_chain_body_is_unchanged),
+		(
+			"unknown parallel entrypoint is not guessed",
+			test_unknown_parallel_entrypoint_is_not_guessed,
+		),
+		("matrix map chain lowers to parallel map", test_matrix_map_chain_lowers_to_parallel_map),
+		(
+			"matrix indexed chain lowers to indexed parallel map",
+			test_matrix_indexed_chain_lowers_to_indexed_parallel_map,
+		),
+		("matrix single zip uses parallel zip", test_matrix_single_zip_uses_parallel_zip),
+		(
+			"matrix indexed zip uses indexed parallel zip",
+			test_matrix_indexed_zip_uses_indexed_parallel_zip,
+		),
+		(
+			"matrix distinct zips use flat indexed map",
+			test_matrix_distinct_zips_use_flat_indexed_map,
+		),
+	]
+}

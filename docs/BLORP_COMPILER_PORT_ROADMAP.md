@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status: active, checked against code on 2026-07-29.
+Status: active, checked against code on 2026-07-30.
 
 This is the detailed execution plan for deleting the remaining OCaml compiler
 and tool implementation. It records only the current boundary, remaining
@@ -21,10 +21,11 @@ Blorp CLI / source graph / source reads / parse
   -> Blorp Core lowering / flattening / FFI boundary / list layout
   -> Blorp debug / desugar / SSA / mono / synthesis / match
   -> Blorp trait and call resolution / std inline / tailrec
-  -> Blorp string and collection fusion
-  -> strict post-collection-fusion request
+  -> Blorp string, collection, parallel-tensor, and tensor-update fusion
+  -> Blorp runtime-declaration projection / tuple SROA
+  -> strict post-tuple-SROA request
   -> one private blorp-ocaml-middle process
-  -> remaining OCaml tensor fusion, tuple SROA, and specialization
+  -> remaining OCaml specialization
   -> strict pre-DCE Core response
   -> Blorp specialization / DCE / consume specialization / Perceus / reuse
   -> Blorp closure / resource / fairness / final preparation / C emission
@@ -91,18 +92,15 @@ C emission, eliminating `blorp-ocaml-middle`.
 
 ### Current Boundary
 
-Blorp emits strict post-collection-fusion Core. OCaml decodes it, runs the
-remaining tensor fusion, tuple SROA, and registry/layout-dependent
-specialization, then returns strict pre-DCE Core. Blorp owns all later stages.
+Blorp projects runtime declarations and emits strict post-tuple-SROA Core.
+OCaml decodes it, runs registry/layout-dependent specialization, then returns
+strict pre-DCE Core. Blorp owns all later stages.
 
 The remaining implementation is represented by the `middle_core` inventory
 group, especially:
 
 - `compiler/bin/blorp_ocaml_middle.ml`;
 - `compiler/lib/core_pipeline.ml`;
-- `compiler/lib/core_parallel_tensor_pipeline.ml`;
-- `compiler/lib/core_tensor_fusion.ml`;
-- `compiler/lib/core_tuple_sroa.ml`;
 - `compiler/lib/core_specialize.ml`; and
 - `compiler/lib/core_specialize_fallback.ml`.
 
@@ -117,8 +115,8 @@ group, especially:
 4. Compare stage dumps and generated C on collection pipelines, tensor
    pipelines, tuple-return scalar replacement, generic specialization, and
    unsupported-layout fallback cases.
-5. Route the production pipeline directly from Blorp collection fusion through
-   the remaining Blorp middle stages to specialization/DCE.
+5. Route the production pipeline directly from Blorp tuple SROA through the
+   remaining Blorp middle stages to specialization/DCE.
 6. Delete the OCaml worker, decoder, orchestration, replaced pass modules, and
    implementation-only tests.
 7. Remove the worker from build, release, cache, and bootstrap toolchain

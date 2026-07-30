@@ -2,6 +2,7 @@
 -- semantic-middle worker. Stage state, diagnostics, observations, and stops
 -- remain explicit so the CLI can move the bridge without duplicating passes.
 import:
+	compiler_core_collection_pipeline: fuse_collection_program
 	compiler_core_early_invariants:
 		CoreEarlyInvariantViolation,
 		check_debug_invariants,
@@ -14,7 +15,6 @@ import:
 		core_early_invariant_hint,
 		core_early_invariant_message,
 	compiler_core_early_stages as CoreEarlyStages
-	compiler_core_collection_pipeline: fuse_collection_program
 	compiler_core_json: CoreProgram, core_program_to_json
 	compiler_core_match: compile_program
 	compiler_core_mono_specialize:
@@ -22,17 +22,20 @@ import:
 		core_mono_diagnostic_hint,
 		core_mono_diagnostic_message,
 	compiler_core_monomorphize: monomorphize_program
+	compiler_core_parallel_tensor_pipeline: fuse_parallel_tensor_program
 	compiler_core_resolve: CoreResolveImportBinding, CoreResolveModuleImports, resolve_core_program
 	compiler_core_std_inline: inline_std_wrappers
 	compiler_core_string_pipeline: fuse_string_program
 	compiler_core_synth: synthesize_program
 	compiler_core_synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
 	compiler_core_tailrec: lower_tailrec_program
+	compiler_core_tensor_fusion: fuse_tensor_update_program
 	compiler_core_trait_resolve:
 		CoreTraitResolveDiagnostic,
 		core_trait_resolve_diagnostic_hint,
 		core_trait_resolve_diagnostic_message,
 		resolve_core_traits,
+	compiler_core_tuple_sroa: rewrite_tuple_sroa_program
 
 
 enum CoreEarlyPipelineStage:
@@ -46,6 +49,7 @@ enum CoreEarlyPipelineStage:
 	CoreEarlyResolveStage
 	CoreEarlyStdInlineStage
 	CoreEarlyTailrecStage
+	CoreEarlyFusionStage
 
 
 record CoreEarlyPipelineConfiguration {
@@ -149,6 +153,8 @@ pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> Strin
 			"std_inline"
 		CoreEarlyTailrecStage:
 			"tailrec"
+		CoreEarlyFusionStage:
+			"fusion"
 
 
 pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipelineStage]:
@@ -173,6 +179,8 @@ pure func parse_core_early_pipeline_stage(name: String) -> Option[CoreEarlyPipel
 			Some(CoreEarlyStdInlineStage)
 		"tailrec":
 			Some(CoreEarlyTailrecStage)
+		"fusion":
+			Some(CoreEarlyFusionStage)
 		_:
 			None
 
@@ -242,6 +250,12 @@ pure func core_early_pipeline_stages_equal(
 					True
 				_:
 					False
+		CoreEarlyFusionStage:
+			match right:
+				CoreEarlyFusionStage:
+					True
+				_:
+					False
 
 
 private pure func stages_include(
@@ -287,6 +301,8 @@ private pure func stage_invariant_violations(
 			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
 		CoreEarlyTailrecStage:
 			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
+		CoreEarlyFusionStage:
+			check_resolve_invariants(program).concat(check_std_inline_invariants(program))
 
 
 private pure func finish_stage(
@@ -305,6 +321,10 @@ private pure func finish_stage(
 					state.program,
 				).concat(check_std_inline_invariants(state.program))
 			CoreEarlyTailrecStage:
+				check_resolve_invariants(
+					state.program,
+				).concat(check_std_inline_invariants(state.program))
+			CoreEarlyFusionStage:
 				check_resolve_invariants(
 					state.program,
 				).concat(check_std_inline_invariants(state.program))
@@ -477,6 +497,32 @@ pure func run_early_core_pipeline(
 			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
 
 
+-- Generic templates are projected out between tensor fusion and tuple SROA.
+-- Keeping this continuation explicit prevents the user-visible Fusion snapshot
+-- from observing a different declaration set than the semantic worker receives.
+pure func finish_early_core_pipeline_after_projection(
+	output: CoreEarlyPipelineOutput,
+	configuration: CoreEarlyPipelineConfiguration,
+) -> CoreEarlyPipelineExecution:
+	state: CoreEarlyPipelineState = {
+		program = rewrite_tuple_sroa_program(output.program),
+		next_def_id = output.next_def_id,
+		observations = output.observations
+	}
+
+	match finish_stage(CoreEarlyFusionStage, state, configuration):
+		CoreEarlyStageContinues(completed):
+			CoreEarlyPipelineCompleted({
+				program = completed.program,
+				next_def_id = completed.next_def_id,
+				observations = completed.observations,
+			})
+		CoreEarlyStageStops(stage, rendered, observations):
+			CoreEarlyPipelineStopped(stage, rendered, observations)
+		CoreEarlyStageFails(violation):
+			CoreEarlyPipelineFailed(CoreEarlyInvariantDiagnostic(violation))
+
+
 pure func run_early_core_pipeline_to_semantic_middle(
 	input: CoreEarlyPipelineInput,
 	configuration: CoreEarlyPipelineConfiguration,
@@ -508,7 +554,9 @@ pure func run_early_core_pipeline_to_semantic_middle(
 									CoreEarlyPipelineCompleted({
 										program = completed.program
 											.fuse_string_program()
-											.fuse_collection_program(),
+											.fuse_collection_program()
+											.fuse_parallel_tensor_program()
+											.fuse_tensor_update_program(),
 										next_def_id = completed.next_def_id,
 										observations = completed.observations,
 									})

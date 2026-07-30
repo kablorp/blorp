@@ -1,23 +1,20 @@
-(** Private post-collection-fusion Core to pre-DCE Core worker.
+(** Private post-tuple-SROA Core to pre-DCE Core worker.
 
     This is the one temporary OCaml boundary between the Blorp-owned frontend
     and backend. The protocol is phase-specific: callers supply Blorp-owned
-    post-collection-fusion Core, and successful requests return the Core program
+    post-tuple-SROA Core, and successful requests return the Core program
     immediately before Blorp-owned DCE. This module does not read source files,
     interpret CLI arguments, emit C, write artifacts, or execute child
     processes. *)
 
-let schema_version = 11
+let schema_version = 13
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
-let core_phase = "post_collection_fusion"
-
-type stage = Core_stage.t
+let core_phase = "post_tuple_sroa"
 
 type capability =
-  | PostCollectionFusionCore
+  | PostTupleSroaCore
   | PreDceCore
-  | RenderedStageObservations
 
 type protocol_error = { code : string; message : string }
 
@@ -30,11 +27,7 @@ type request = {
   next_def_id : int;
   require_main : bool;
   check_invariants : bool;
-  observations : stage list;
-  stop_after : stage option;
 }
-
-type observation = { stage : stage; rendered : string }
 
 type diagnostic = {
   code : string;
@@ -46,18 +39,8 @@ type diagnostic = {
 }
 
 type response =
-  | Compiled of {
-      core : Lsp_json.json;
-      observations : observation list;
-    }
-  | Stopped of {
-      stage : stage;
-      rendered : string;
-      observations : observation list;
-    }
+  | Compiled of { core : Lsp_json.json }
   | Failed of diagnostic list
-
-exception Stopped_with_snapshot of stage * string
 
 let ( let* ) = Result.bind
 
@@ -105,30 +88,15 @@ let rec decode_list decode = function
       let* rest = decode_list decode rest in
       Ok (item :: rest)
 
-let semantic_middle_stage = function
-  | Core_stage.Fusion as stage -> Some stage
-  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
-  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
-  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
-  | Core_stage.Specialize | Core_stage.Dce | Core_stage.ConsumeSpecialize
-  | Core_stage.Perceus | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final ->
-      None
-
-let stage_name = Core_stage.to_string
-
 let capability_name = function
-  | PostCollectionFusionCore -> "core_post_collection_fusion"
+  | PostTupleSroaCore -> "core_post_tuple_sroa"
   | PreDceCore -> "core_pre_dce"
-  | RenderedStageObservations -> "rendered_stage_observations"
 
-let supported_capabilities =
-  [ PostCollectionFusionCore; PreDceCore; RenderedStageObservations ]
+let supported_capabilities = [ PostTupleSroaCore; PreDceCore ]
 
 let decode_capability = function
-  | Lsp_json.String "core_post_collection_fusion" -> Ok PostCollectionFusionCore
+  | Lsp_json.String "core_post_tuple_sroa" -> Ok PostTupleSroaCore
   | Lsp_json.String "core_pre_dce" -> Ok PreDceCore
-  | Lsp_json.String "rendered_stage_observations" ->
-      Ok RenderedStageObservations
   | Lsp_json.String name ->
       protocol_error "unsupported_capability"
         ("unsupported semantic-middle capability `" ^ name ^ "`")
@@ -147,19 +115,6 @@ let require_supported_capabilities capabilities =
         ("missing required semantic-middle capability `"
         ^ capability_name missing ^ "`")
   | None -> Ok ()
-
-let decode_stage = function
-  | Lsp_json.String name -> (
-      match Core_stage.of_string name with
-      | Ok stage -> (
-          match semantic_middle_stage stage with
-          | Some stage -> Ok stage
-          | None ->
-              protocol_error "unsupported_stage"
-                ("stage `" ^ name ^ "` is outside the semantic middle"))
-      | Error _ ->
-          protocol_error "unsupported_stage" ("unknown stage `" ^ name ^ "`"))
-  | _ -> protocol_error "invalid_field" "stage names must be strings"
 
 let variant_matches ~name ~tag ~payload_type_parameter
     (variant : Ast.variant) =
@@ -228,11 +183,11 @@ let rec first_unprojected_generic_decl union_payload_storage = function
 let validate_runtime_projection union_payload_storage program =
   match first_unprojected_generic_decl union_payload_storage program with
   | Some declaration ->
-      protocol_error "invalid_post_collection_fusion_core"
+      protocol_error "invalid_post_tuple_sroa_core"
         ("Blorp semantic-middle projection retained " ^ declaration)
   | None -> Ok ()
 
-let post_collection_fusion_invariant_message target_path (violation : Core_error.t) =
+let post_tuple_sroa_invariant_message target_path (violation : Core_error.t) =
   let loc = violation.loc in
   let path = Option.value loc.loc_file ~default:target_path in
   let location =
@@ -242,7 +197,7 @@ let post_collection_fusion_invariant_message target_path (violation : Core_error
   let hint =
     Option.fold ~none:"" ~some:(fun value -> " (" ^ value ^ ")") violation.hint
   in
-  Printf.sprintf "post-collection-fusion Core invariant failed at %s: %s%s" location
+  Printf.sprintf "post-tuple-SROA Core invariant failed at %s: %s%s" location
     violation.msg hint
 
 let require_equal ~code ~field_name ~expected actual =
@@ -277,11 +232,11 @@ let decode_request value =
     let* target_module = string_field "target_module" value in
     let* core_json = field "core" value in
     let* decoded =
-      match Core_post_collection_fusion_json.decode_program core_json with
+      match Core_post_tuple_sroa_json.decode_program core_json with
       | Ok decoded -> Ok decoded
       | Error error ->
-          protocol_error "invalid_post_collection_fusion_core"
-            (Core_post_collection_fusion_json.decode_error_to_string error)
+          protocol_error "invalid_post_tuple_sroa_core"
+            (Core_post_tuple_sroa_json.decode_error_to_string error)
     in
     let* () =
       validate_runtime_projection decoded.union_payload_storage decoded.core
@@ -294,28 +249,18 @@ let decode_request value =
       decode_list decode_capability capability_values
     in
     let* () = require_supported_capabilities validated_capabilities in
-    let* observation_values = array_field "observations" value in
-    let* observations = decode_list decode_stage observation_values in
-    let* stop_after_json = field "stop_after" value in
-    let* stop_after =
-      match stop_after_json with
-      | Lsp_json.Null -> Ok None
-      | value ->
-          let* stage = decode_stage value in
-          Ok (Some stage)
-    in
-    (* A post-collection-fusion handoff must satisfy every durable contract established by
+    (* A post-tuple-SROA handoff must satisfy every durable contract established by
        the earlier Blorp-owned stages, not only the Match-specific contract.
        Synth rechecks debug, desugar, and monomorphization invariants while
        intentionally allowing mutable locals introduced by synthesis. *)
-    let post_collection_fusion_violations =
+    let post_tuple_sroa_violations =
       Core_invariants.run_for_stage Core_stage.Synth decoded.core
       @ Core_invariants.run_for_stage Core_stage.Match decoded.core
     in
-    (match post_collection_fusion_violations with
+    (match post_tuple_sroa_violations with
     | violation :: _ ->
-        protocol_error "invalid_post_collection_fusion_core"
-          (post_collection_fusion_invariant_message target_path violation)
+        protocol_error "invalid_post_tuple_sroa_core"
+          (post_tuple_sroa_invariant_message target_path violation)
     | [] ->
         Ok
           {
@@ -327,8 +272,6 @@ let decode_request value =
             next_def_id;
             require_main;
             check_invariants;
-            observations;
-            stop_after;
           })
 
 let program_has_top_level_main program =
@@ -338,9 +281,6 @@ let program_has_top_level_main program =
       | Core.CDFunc func -> Core.is_program_entrypoint func
       | _ -> false)
     program
-
-let render_core program =
-  match program with [] -> "<empty Core program>" | _ -> Core.pp_program_indented program
 
 let diagnostic_of_core_error target_path (error : Core_error.t) =
   let path =
@@ -376,17 +316,6 @@ let run_request_in_session request =
         };
       ]
   else
-    let observations_rev = ref [] in
-    let requested stage = List.exists (( = ) stage) request.observations in
-    let on_stage stage program =
-      let should_observe = requested stage in
-      let should_stop = request.stop_after = Some stage in
-      if should_observe || should_stop then (
-        let rendered = render_core program in
-        if should_observe then
-          observations_rev := { stage; rendered } :: !observations_rev;
-        if should_stop then raise (Stopped_with_snapshot (stage, rendered)))
-    in
     try
       let reg = Codegen_types.create_registry () in
       Core_registry.register_types
@@ -394,19 +323,18 @@ let run_request_in_session request =
         request.core;
       let on_stage =
         Core_pipeline.make_stage_hook ~check_invariants:request.check_invariants
-          ~user:on_stage
+          ~user:(fun _ _ -> ())
       in
       let backend_input =
-        Core_pipeline.run_core_passes_from_post_collection_fusion ~on_stage ~reg
+        Core_pipeline.run_core_passes_from_post_tuple_sroa ~on_stage ~reg
           request.core
       in
-      let observations = List.rev !observations_rev in
       (match
          Core_emit_blorp_c.program_json
            ~foreign_includes:request.foreign_includes ~reg
            backend_input.blorp_tail_input
        with
-      | Ok core -> Compiled { core; observations }
+      | Ok core -> Compiled { core }
       | Error error ->
           Failed
             [
@@ -414,9 +342,6 @@ let run_request_in_session request =
                 (Core_emit_blorp_c.unsupported_to_string error);
             ])
     with
-    | Stopped_with_snapshot (stage, rendered) ->
-        Stopped
-          { stage; rendered; observations = List.rev !observations_rev }
     | Core_error.Core_error error ->
         Failed [ diagnostic_of_core_error request.target_path error ]
 
@@ -425,13 +350,6 @@ let run_request request =
   Session.with_current session (fun () ->
       Session.reserve_def_id_floor session request.next_def_id;
       run_request_in_session request)
-
-let observation_json observation =
-  Lsp_json.Object
-    [
-      ("stage", Lsp_json.String (stage_name observation.stage));
-      ("rendered", Lsp_json.String observation.rendered);
-    ]
 
 let diagnostic_json diagnostic =
   Lsp_json.Object
@@ -463,20 +381,8 @@ let response_json response =
                 supported_capabilities) )
       :: fields)
   in
-  let observations_json observations =
-    Lsp_json.Array (List.map observation_json observations)
-  in
   match response with
-  | Compiled { core; observations } ->
-      envelope "compiled"
-        [ ("core", core); ("observations", observations_json observations) ]
-  | Stopped { stage; rendered; observations } ->
-      envelope "stopped"
-        [
-          ("stage", Lsp_json.String (stage_name stage));
-          ("rendered", Lsp_json.String rendered);
-          ("observations", observations_json observations);
-        ]
+  | Compiled { core } -> envelope "compiled" [ ("core", core) ]
   | Failed diagnostics ->
       envelope "failed"
         [ ("diagnostics", Lsp_json.Array (List.map diagnostic_json diagnostics)) ]

@@ -19,6 +19,7 @@ import:
 		CoreEarlyPipelineStage(
 			CoreEarlyDebugStage,
 			CoreEarlyDesugarStage,
+			CoreEarlyFusionStage,
 			CoreEarlyLowerStage,
 			CoreEarlyMatchStage,
 			CoreEarlyMonoStage,
@@ -30,6 +31,7 @@ import:
 		),
 		core_early_pipeline_stage_name,
 		core_early_pipeline_stages_equal,
+		finish_early_core_pipeline_after_projection,
 		parse_core_early_pipeline_stage,
 		run_early_core_pipeline,
 		run_early_core_pipeline_to_semantic_middle,
@@ -43,8 +45,11 @@ import:
 			BoxExpr,
 			CallExpr,
 			DebugBlockExpr,
+			FieldExpr,
+			LetExpr,
 			LiteralExpr,
 			RawMatchExpr,
+			TupleExpr,
 			VarExpr,
 			VoidExpr,
 		),
@@ -56,7 +61,7 @@ import:
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorStaticDim),
-		CoreType(FunctionType, NamedType, TensorType, TypeParameterType, VoidType),
+		CoreType(FunctionType, NamedType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreVar,
 		core_expr_type,
 	../src/stage_09_core/compiler_core_mono_specialize:
@@ -213,6 +218,7 @@ func test_stage_names_round_trip() -> Bool:
 		CoreEarlyResolveStage,
 		CoreEarlyStdInlineStage,
 		CoreEarlyTailrecStage,
+		CoreEarlyFusionStage,
 	]
 
 	stages.all(pure func(stage):
@@ -734,6 +740,63 @@ func test_pipeline_owns_string_fusion_before_worker_boundary() -> Bool:
 			False
 
 
+func test_pipeline_owns_tuple_sroa_after_runtime_projection() -> Bool:
+	int_type: CoreType = named_type("Int")
+	pair_type: CoreType = TupleType([int_type, int_type])
+	pair_var: CoreVar = named_var("pair", None)
+	body: CoreExpr = LetExpr(
+		pair_var,
+		False,
+		pair_type,
+		TupleExpr(
+			[
+				LiteralExpr(IntLiteral(20), int_type, SyntheticSourceLoc),
+				LiteralExpr(IntLiteral(22), int_type, SyntheticSourceLoc),
+			],
+			pair_type,
+			SyntheticSourceLoc,
+		),
+		FieldExpr(
+			VarExpr(pair_var, pair_type, SyntheticSourceLoc),
+			"0",
+			int_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (
+		run_early_core_pipeline_to_semantic_middle(
+			{
+				program = program([FunctionDecl(function("main", 20, [], [], int_type, body))]),
+				next_def_id = 100
+			},
+			configuration(
+				False,
+				True,
+				[],
+				None,
+			),
+			[],
+			[],
+		)
+	):
+		CoreEarlyPipelineCompleted(output):
+			match finish_early_core_pipeline_after_projection(
+				output,
+				configuration(False, True, [CoreEarlyFusionStage], Some(CoreEarlyFusionStage)),
+			):
+				CoreEarlyPipelineStopped(stage, rendered, observations):
+					(
+						core_early_pipeline_stages_equal(stage, CoreEarlyFusionStage)
+						and observations.length() == 1
+						and rendered.contains("$blorp$tuple_sroa$element$")
+					)
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler early Core pipeline",
 	tests = [
@@ -783,6 +846,10 @@ tests: TestSuite = {
 		(
 			"pipeline owns string fusion before worker boundary",
 			test_pipeline_owns_string_fusion_before_worker_boundary,
+		),
+		(
+			"pipeline owns tuple SROA after runtime projection",
+			test_pipeline_owns_tuple_sroa_after_runtime_projection,
 		),
 	]
 }

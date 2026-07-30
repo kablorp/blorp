@@ -32,19 +32,21 @@ Source (.brp)
 | Core Preparation |  Blorp lowering, graph flattening, checked FFI boundary,
 | + Early Pipeline |  debug, desugar/SSA, mono, list layout, synthesis,
 |                  |  pattern/trait/call resolution, std wrapper inlining,
-|                  |  tail-recursive loop lowering, and string/collection fusion
+|                  |  tail-recursive loop lowering, string/collection fusion,
+|                  |  parallel-tensor fusion, tensor-update fusion, runtime
+|                  |  declaration projection, and tuple scalar replacement
 |                  |  (stage_08_core_lower, stage_09_core)
 +------------------+
     |
     v
 +-------------------------------+
-| Post-collection-fusion bridge |  One strict JSON bridge into the OCaml semantic middle
-|                               |  (core_post_collection_fusion_json.ml)
+| Post-tuple-SROA bridge        |  One strict JSON bridge into the OCaml semantic middle
+|                               |  (core_post_tuple_sroa_json.ml)
 +-------------------------------+
     |
     v
 +---------------+
-| Core IR       |  OCaml remaining-fusion-through-specialize middle, then Core JSON
+| Core IR       |  OCaml specialization middle, then Core JSON
 | middle + tail |  handoff into the Blorp-owned specialization/backend tail
 +---------------+
     |
@@ -74,12 +76,14 @@ typed module graph, lowers debug blocks and mutable locals, desugars Core,
 monomorphizes generic declarations, annotates list layouts, synthesizes
 concrete builtin bodies, compiles raw matches to semantic decision trees,
 resolves trait dispatch and ordinary call kinds, inlines narrow std wrappers,
-lowers supported self-tail-calls, and fuses supported string and collection pipelines in
-Blorp. One phase-specific bridge decodes post-collection-fusion Core into the remaining OCaml
+lowers supported self-tail-calls, fuses supported string, collection,
+parallel-tensor, and tensor-update pipelines, projects runtime declarations,
+and scalar-replaces eligible tuples in Blorp. One phase-specific
+bridge decodes post-tuple-SROA Core into the remaining OCaml
 middle; source, typed AST, and pre-mono Core do not cross this boundary. The
 worker validates the completed Blorp early-stage contracts before starting at
-the remaining fusion passes. The pipeline then crosses the late
-Core JSON bridge after the remaining OCaml specialization families. Primitive
+specialization. The pipeline then crosses the late Core JSON bridge after the
+remaining OCaml specialization families. Primitive
 conversion, hash, length, numeric checked tensor access,
 raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
 bounds-proven tensor access builtins intentionally cross in semantic form so
@@ -114,7 +118,7 @@ Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
 the request's debug mode. The post-debug invariant runs before the
-post-collection-fusion bridge and rejects any node that survives that decision.
+post-tuple-SROA bridge and rejects any node that survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
@@ -123,9 +127,8 @@ typed-AST compatibility projection removes that tagged wrapper before legacy
 OCaml lowering, which keeps both paths at one cleanup owner per resource.
 
 The late-Core projection preserves scoped `let`/`borrow` expressions inside
-closure-call arguments. OCaml fusion may introduce those forms before the
-handoff; the Blorp-owned closure and preparation stages, rather than the
-projection boundary, own their final normalization for C emission.
+closure-call arguments. The Blorp-owned closure and preparation stages, rather
+than the projection boundary, own their final normalization for C emission.
 
 The Blorp CLI is built by a separately packaged immutable
 `blorp-bootstrap-compiler`. Its legacy typed-AST/Core-lowering implementation
@@ -201,17 +204,25 @@ Blorp Typed AST graph
     |
     v
 +-------------------------------+
-| Post-collection-fusion bridge |  Strict structural decode plus completed early
-+-------------------------------+  stage checks (core_post_collection_fusion_json.ml,
-                                  semantic_middle_worker.ml)
+| Blorp parallel tensor fusion  |  Fuse scoped vector/matrix parallel pipelines
++-------------------------------+  (compiler_core_parallel_tensor_pipeline.brp)
     |
     v
-+-------------------+
-| OCaml Core_fusion |  Fuse supported scoped tensor pipelines and tensor updates;
-+-------------------+  scalar-replace non-escaping local tuples
-                       and narrow tuple-return call sites
-                       (core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
-                       core_tuple_sroa.ml)
++-------------------------------+
+| Blorp tensor update fusion    |  Fuse supported add-scaled tensor updates
++-------------------------------+  (compiler_core_tensor_fusion.brp)
+    |
+    v
++-------------------------------+
+| Blorp tuple SROA              |  Scalar-replace non-escaping local tuples and
++-------------------------------+  narrow tuple-return call sites
+                                  (compiler_core_tuple_sroa.brp)
+    |
+    v
++-------------------------------+
+| Post-tuple-SROA bridge        |  Strict structural decode plus completed early
++-------------------------------+  stage checks (core_post_tuple_sroa_json.ml,
+                                  semantic_middle_worker.ml)
     |
     v
 +-----------------------+
@@ -346,14 +357,13 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_post_collection_fusion_json.ml` | Strict decoder for Blorp-owned post-collection-fusion Core |
+| `core_post_tuple_sroa_json.ml` | Strict decoder for Blorp-owned post-tuple-SROA Core |
 | `compiler_core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
 | `compiler_core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
 | `compiler_core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
-| `core_parallel_tensor_pipeline.ml` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
-| `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
+| `compiler_core_parallel_tensor_pipeline.brp` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
+| `compiler_core_tensor_fusion.brp` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
-| `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff, excluding Blorp-owned primitive, length, numeric checked tensor-access, raw-scalar tensor-fill, and bounds-proven raw-view families |
 | `core_specialize_fallback.ml` | Sequential fallback for specialization cases without a direct runtime layout ABI |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
@@ -363,7 +373,7 @@ boxing, or ownership behavior from source spelling.
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
 | `core_invariants.ml` | Stage-boundary invariant checks |
-| `core_pipeline.ml` | Remaining post-collection-fusion OCaml middle orchestration |
+| `core_pipeline.ml` | Remaining post-tuple-SROA OCaml middle orchestration |
 | `core_error.ml` | Structured errors with phase/location/hint |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
@@ -379,6 +389,7 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_resolve.brp` | Authoritative call-kind, import, constructor, UFCS, and callable-identity resolution |
 | `compiler/blorp/src/stage_09_core/compiler_core_std_inline.brp` | Authoritative narrow expansion of compiler-owned list/tensor wrappers |
 | `compiler/blorp/src/stage_09_core/compiler_core_tailrec.brp` | Authoritative supported self-tail-call lowering into explicit Core loops |
+| `compiler/blorp/src/stage_09_core/compiler_core_tuple_sroa.brp` | Authoritative scalar replacement for non-escaping local tuples and narrow unmanaged tuple-return call sites |
 | `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
 | `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
@@ -423,11 +434,8 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_post_collection_fusion_json.ml # Strict Blorp post-collection-fusion Core decoder
-│   ├── core_parallel_tensor_pipeline.ml # Scoped vector/matrix pipeline fusion
-│   ├── core_tensor_fusion.ml # Tensor update fusion
+│   ├── core_post_tuple_sroa_json.ml # Strict Blorp post-tuple-SROA Core decoder
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
-│   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Remaining registry/layout-dependent builtin specialization
 │   ├── core_specialize_fallback.ml # Narrow unsupported-layout fallback
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics

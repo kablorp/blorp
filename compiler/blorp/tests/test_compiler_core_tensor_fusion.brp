@@ -1,0 +1,224 @@
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreBinaryOp(AddOp, MultiplyOp),
+		CoreCallKind(BuiltinCall, UserCall),
+		CoreExpr(AssignExpr, BinaryExpr, CallExpr, LiteralExpr, VarExpr, VoidExpr),
+		CoreLiteral(FloatLiteral),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(FunctionType, NamedType, TensorType, VoidType),
+		CoreVar,
+	../src/stage_09_core/compiler_core_tensor_fusion: fuse_tensor_update_expr
+	test: TestSuite
+
+
+TY_FLOAT: CoreType = NamedType("Float", [])
+
+TY_FLOAT32: CoreType = NamedType("Float32", [])
+
+TY_INT: CoreType = NamedType("Int", [])
+
+TY_VOID: CoreType = VoidType
+
+
+private pure func core_var(name: String) -> CoreVar:
+	core_var_with_def_id(name, None)
+
+
+private pure func core_var_with_def_id(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+private pure func tensor_type(element_type: CoreType, length: Int) -> CoreType:
+	TensorType({
+		element_type = element_type,
+		dims = [TensorStaticDim(length)],
+	})
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func float_literal(value: Float, typ: CoreType) -> CoreExpr:
+	LiteralExpr(FloatLiteral(value), typ, SyntheticSourceLoc)
+
+
+private pure func add_scaled_assignment(
+	element_type: CoreType,
+	length: Int,
+	input_length: Int,
+) -> CoreExpr:
+	add_scaled_assignment_with_order(element_type, length, input_length, True, True)
+
+
+private pure func add_scaled_assignment_with_order(
+	element_type: CoreType,
+	length: Int,
+	input_length: Int,
+	target_first: Bool,
+	input_first: Bool,
+) -> CoreExpr:
+	target_type: CoreType = tensor_type(element_type, length)
+	input_type: CoreType = tensor_type(element_type, input_length)
+	target: CoreExpr = variable("target", target_type)
+	input: CoreExpr = variable("input", input_type)
+	scale: CoreExpr = float_literal(0.5, element_type)
+
+	scaled_left: CoreExpr = if input_first:
+		input
+	else:
+		scale
+
+	scaled_right: CoreExpr = if input_first:
+		scale
+	else:
+		input
+
+	scaled: CoreExpr = BinaryExpr(
+		MultiplyOp,
+		scaled_left,
+		scaled_right,
+		input_type,
+		SyntheticSourceLoc,
+	)
+
+	add_left: CoreExpr = if target_first:
+		target
+	else:
+		scaled
+
+	add_right: CoreExpr = if target_first:
+		scaled
+	else:
+		target
+
+	AssignExpr(
+		core_var("target"),
+		BinaryExpr(AddOp, add_left, add_right, target_type, SyntheticSourceLoc),
+		TY_VOID,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func fused_builtin_name(expr: CoreExpr) -> Option[String]:
+	match fuse_tensor_update_expr(expr):
+		AssignExpr(_, CallExpr(BuiltinCall(name), _, args, _, _), _, _):
+			if args.length() == 3:
+				Some(name)
+			else:
+				None
+		_:
+			None
+
+
+func test_float_add_scaled_update_fuses() -> Bool:
+	fused_builtin_name(
+		add_scaled_assignment(
+			TY_FLOAT,
+			4,
+			4,
+		),
+	) == Some("blorp_tensor_add_scaled_f64_cow")
+
+
+func test_float32_add_scaled_update_fuses() -> Bool:
+	fused_builtin_name(
+		add_scaled_assignment(
+			TY_FLOAT32,
+			4,
+			4,
+		),
+	) == Some("blorp_tensor_add_scaled_f32_cow")
+
+
+func test_commuted_add_and_multiply_update_fuses() -> Bool:
+	fused_builtin_name(
+		add_scaled_assignment_with_order(
+			TY_FLOAT,
+			4,
+			4,
+			False,
+			False,
+		),
+	) == Some("blorp_tensor_add_scaled_f64_cow")
+
+
+func test_mismatched_shapes_do_not_fuse() -> Bool:
+	fused_builtin_name(add_scaled_assignment(TY_FLOAT, 4, 3)).is_none()
+
+
+func test_non_floating_tensor_does_not_fuse() -> Bool:
+	fused_builtin_name(add_scaled_assignment(TY_INT, 4, 4)).is_none()
+
+
+func test_unstable_tensor_input_does_not_fuse() -> Bool:
+	target_type: CoreType = tensor_type(TY_FLOAT, 4)
+	target: CoreExpr = variable("target", target_type)
+	input: CoreExpr = CallExpr(
+		UserCall("make_input", Some(12), []),
+		VoidExpr(TY_VOID, SyntheticSourceLoc),
+		[],
+		target_type,
+		SyntheticSourceLoc,
+	)
+	scaled: CoreExpr = BinaryExpr(
+		MultiplyOp,
+		input,
+		float_literal(0.5, TY_FLOAT),
+		target_type,
+		SyntheticSourceLoc,
+	)
+	assignment: CoreExpr = AssignExpr(
+		core_var("target"),
+		BinaryExpr(AddOp, target, scaled, target_type, SyntheticSourceLoc),
+		TY_VOID,
+		SyntheticSourceLoc,
+	)
+	fused_builtin_name(assignment).is_none()
+
+
+func test_target_identity_ignores_callable_metadata() -> Bool:
+	target_type: CoreType = tensor_type(TY_FLOAT, 4)
+	target_ref: CoreExpr = VarExpr(
+		core_var_with_def_id("target", Some(12)),
+		target_type,
+		SyntheticSourceLoc,
+	)
+	input: CoreExpr = variable("input", target_type)
+	scaled: CoreExpr = BinaryExpr(
+		MultiplyOp,
+		input,
+		float_literal(0.5, TY_FLOAT),
+		target_type,
+		SyntheticSourceLoc,
+	)
+	assignment: CoreExpr = AssignExpr(
+		core_var_with_def_id("target", None),
+		BinaryExpr(AddOp, target_ref, scaled, target_type, SyntheticSourceLoc),
+		TY_VOID,
+		SyntheticSourceLoc,
+	)
+
+	fused_builtin_name(assignment) == Some("blorp_tensor_add_scaled_f64_cow")
+
+
+tests: TestSuite = {
+	description = "Core tensor update fusion",
+	tests = [
+		("Float add-scaled update fuses", test_float_add_scaled_update_fuses),
+		("Float32 add-scaled update fuses", test_float32_add_scaled_update_fuses),
+		("commuted add and multiply update fuses", test_commuted_add_and_multiply_update_fuses),
+		("mismatched shapes do not fuse", test_mismatched_shapes_do_not_fuse),
+		("non-floating tensor does not fuse", test_non_floating_tensor_does_not_fuse),
+		("unstable tensor input does not fuse", test_unstable_tensor_input_does_not_fuse),
+		(
+			"target identity ignores callable metadata",
+			test_target_identity_ignores_callable_metadata,
+		),
+	]
+}

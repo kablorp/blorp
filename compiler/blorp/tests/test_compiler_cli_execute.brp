@@ -2,7 +2,7 @@ import:
 	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
 	../src/stage_03_parse/compiler_source_ast_finalize: FinalizedTypecheckProgram
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(SelectedDirectCall, UserCall),
+		CoreCallKind(BuiltinCall, SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
 		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
 		CoreFunctionKind(UserFunction),
@@ -70,12 +70,10 @@ pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
 		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
 		("kind", JsonString("compiled")),
 		("capabilities", JsonVector([
-			JsonString("core_post_collection_fusion"),
+			JsonString("core_post_tuple_sroa"),
 			JsonString("core_pre_dce"),
-			JsonString("rendered_stage_observations"),
 		])),
 		("core", core),
-		("observations", JsonVector([])),
 	])
 
 
@@ -196,6 +194,28 @@ func write_tailrec_source(path: String) -> Bool:
 			False
 
 
+func write_parallel_fusion_source(path: String) -> Bool:
+	source: String =
+		|import:
+		|	vector: ParallelVector, parallel
+		|
+		|func main(args: List[String]) -> Int:
+		|	values: Int[#4] = {1, 2, 3, 4}
+		|	mapped: Int[#4] = values.parallel(pure func(chunk: ParallelVector[Int, #4]):
+		|		chunk
+		|			.map(pure func(value: Int) -> Int: value + 1)
+		|			.map(pure func(value: Int) -> Int: value * 2)
+		|	)
+		|	mapped[3]
+		|
+
+	match write_file(path, source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
 func write_debug_policy_source(path: String) -> Bool:
 	source: String =
 		|@debug_only
@@ -234,6 +254,34 @@ private pure func call_targets_def_id(expr: CoreExpr, target_def_id: Int) -> Boo
 		).any(
 			func(child): call_targets_def_id(child, target_def_id),
 		)
+	)
+
+
+private pure func contains_builtin_call(expr: CoreExpr, name: String) -> Bool:
+	direct_call: Bool = match expr:
+		CallExpr(BuiltinCall(actual), _, _, _, _):
+			actual == name
+		_:
+			False
+
+	(
+		direct_call
+		or immediate_core_expr_children(expr).any(func(child): contains_builtin_call(child, name))
+	)
+
+
+private pure func main_contains_builtin(program: CoreProgram, name: String) -> Bool:
+	program.decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				(
+					function_info.name == "main"
+					and function_info.body
+						.map(func(body): contains_builtin_call(body, name))
+						.get_or(False)
+				)
+			_:
+				False
 	)
 
 
@@ -508,7 +556,7 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 						(
 							request.target_path == path
 							and request.core.decls.length() > 0
-							and request.required_capabilities.length() == 3
+							and request.required_capabilities.length() == 2
 							and request.require_main
 							and artifact.c_code.length() > 0
 							and artifact.runtime_requirement == BuildEmbeddedRuntime
@@ -521,8 +569,8 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 				False
 
 
-func test_compile_worker_request_starts_after_blorp_collection_fusion() -> Bool:
-	path: String = temp_dir() + "/blorp_cli_execute_post_collection_fusion.brp"
+func test_compile_worker_request_starts_after_blorp_tuple_sroa() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_post_tuple_sroa.brp"
 	_ = remove_file(path)
 
 	if not write_tailrec_source(path):
@@ -545,8 +593,29 @@ func test_compile_worker_request_starts_after_blorp_collection_fusion() -> Bool:
 							and not rendered.contains("\"kind\":\"selected_direct\"")
 							and prepared.request.required_capabilities
 								.map(semantic_middle_capability_name)
-								.contains("core_post_collection_fusion")
+								.contains("core_post_tuple_sroa")
 						)
+					_:
+						False
+			_:
+				False
+
+
+func test_compile_worker_request_contains_parallel_tensor_fusion() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_parallel_tensor_fusion.brp"
+	_ = remove_file(path)
+
+	if not write_parallel_fusion_source(path):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match prepare_compile_plan(compile_plan):
+					Ok(CliCompilePreparationReady(prepared)):
+						main_contains_builtin(prepared.request.core, "blorp_vmap_parallel")
 					_:
 						False
 			_:
@@ -807,8 +876,12 @@ tests: TestSuite = {
 			test_compile_builds_one_typed_request_and_artifact,
 		),
 		(
-			"compile worker request starts after Blorp collection fusion",
-			test_compile_worker_request_starts_after_blorp_collection_fusion,
+			"compile worker request starts after Blorp tuple SROA",
+			test_compile_worker_request_starts_after_blorp_tuple_sroa,
+		),
+		(
+			"compile worker request contains parallel tensor fusion",
+			test_compile_worker_request_contains_parallel_tensor_fusion,
 		),
 		(
 			"compile frontend policy allows debug calls while erasing debug blocks",

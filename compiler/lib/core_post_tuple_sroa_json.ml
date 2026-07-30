@@ -1,9 +1,9 @@
-(** Strict structural decoder for the Blorp-owned post-collection-fusion Core handoff.
+(** Strict structural decoder for the Blorp-owned post-tuple-SROA Core handoff.
 
     This is deliberately separate from the late backend projection in
     [Core_emit_blorp_c]. The semantic-middle worker performs the post-debug,
     post-desugar, post-mono, post-match, post-trait-resolution, and
-    post-resolution, post-std-inline, post-tailrec, and post-collection-fusion
+    post-resolution, post-std-inline, post-tailrec, and post-tuple-SROA
     semantic invariant checks immediately after this structural decode. The
     accepted expression set includes semantic decision trees created by match
     compilation and the non-owning constructor test synthesized before that
@@ -299,13 +299,13 @@ let decode_call_kind path value =
   | "unknown" -> Ok Core.CKUnknown
   | "selected_direct" ->
       error (path_field path "kind")
-        "unresolved selected direct call reached the post-collection-fusion boundary"
+        "unresolved selected direct call reached the post-tuple-SROA boundary"
   | "deferred_trait" ->
       error (path_field path "kind")
-        "unresolved deferred trait call reached the post-collection-fusion boundary"
+        "unresolved deferred trait call reached the post-tuple-SROA boundary"
   | "selected_trait" ->
       error (path_field path "kind")
-        "unresolved selected trait call reached the post-collection-fusion boundary"
+        "unresolved selected trait call reached the post-tuple-SROA boundary"
   | "user" ->
       let* name = string_field path "name" value in
       let* id = optional_int_field path "def_id" value in
@@ -327,7 +327,7 @@ let decode_call_kind path value =
   | _ ->
       error (path_field path "kind")
         ("call kind `" ^ tag
-       ^ "` is not valid at the post-collection-fusion boundary")
+       ^ "` is not valid at the post-tuple-SROA boundary")
 
 let decode_inline_width path = function
   | 1 -> Ok Core.InlineBytes1
@@ -547,7 +547,7 @@ let rec decode_expr path value =
   | _ ->
       error (path_field path "kind")
         ("Core expression `" ^ tag
-       ^ "` is not valid at the post-collection-fusion boundary")
+       ^ "` is not valid at the post-tuple-SROA boundary")
 
 and decode_typed_expr path value desc =
   let* ty = decode_type_field path "type" value in
@@ -699,7 +699,7 @@ and decode_list_handoff_expr path value =
     if mode = "borrow_fresh" then Ok ()
     else
       error (path_field handoff_path "mode")
-        "post-collection-fusion list handoff must use borrow_fresh mode"
+        "post-tuple-SROA list handoff must use borrow_fresh mode"
   in
   let* layout_json = field handoff_path "layout" handoff in
   let* slots =
@@ -1142,7 +1142,7 @@ and decode_precompiled_constructor_match_body path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match body `" ^ tag
-       ^ "` is not valid at the post-collection-fusion boundary")
+       ^ "` is not valid at the post-tuple-SROA boundary")
 
 and decode_precompiled_match_fallback path value =
   let* tag = kind path value in
@@ -1158,7 +1158,7 @@ and decode_precompiled_match_fallback path value =
   | _ ->
       error (path_field path "kind")
         ("precompiled constructor match fallback `" ^ tag
-       ^ "` is not valid at the post-collection-fusion boundary")
+       ^ "` is not valid at the post-tuple-SROA boundary")
 
 and prepend_match_bindings bindings tree =
   match tree with
@@ -1230,7 +1230,7 @@ let decode_function_kind path value =
       Ok (Core.CFForeign { c_name; includes; link_flags; arg_passing })
   | _ ->
       error (path_field path "kind")
-        ("function kind `" ^ tag ^ "` is not valid post-collection-fusion")
+        ("function kind `" ^ tag ^ "` is not valid post-tuple-SROA")
 
 let decode_function path value =
   let* name = string_field path "name" value in
@@ -1381,7 +1381,7 @@ and decode_impl_decl path value loc =
     | [] -> Ok ()
     | _ ->
         error (path_field path "type_params")
-          "generic impl template is not valid post-collection-fusion"
+          "generic impl template is not valid post-tuple-SROA"
   in
   let* ci_methods = list_field decode_function path "methods" value in
   Ok { Core.cd_desc = Core.CDImpl { ci_trait; ci_for_type; ci_methods }; cd_loc = loc; cd_doc = None }

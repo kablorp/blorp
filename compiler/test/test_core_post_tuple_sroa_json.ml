@@ -142,12 +142,12 @@ let program decls =
     ]
 
 let decode_exn json =
-  match Core_post_collection_fusion_json.decode_program json with
+  match Core_post_tuple_sroa_json.decode_program json with
   | Ok decoded -> decoded
   | Error error ->
-      Alcotest.fail (Core_post_collection_fusion_json.decode_error_to_string error)
+      Alcotest.fail (Core_post_tuple_sroa_json.decode_error_to_string error)
 
-let test_decodes_post_collection_fusion_program () =
+let test_decodes_post_tuple_sroa_program () =
   let decoded = decode_exn (program [ function_decl "main" 7 ]) in
   Alcotest.(check (list string)) "foreign includes" [ "fixture.h" ]
     decoded.foreign_includes;
@@ -212,7 +212,7 @@ let collection_list_handoff ?(mode = "borrow_fresh")
 
 let expect_collection_handoff_error ~path ~message body =
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
@@ -376,7 +376,7 @@ let test_rejects_invalid_list_spread_tailrec_indices () =
       ]
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some invalid_loop) "main" 1 ])
   with
   | Error error ->
@@ -404,7 +404,7 @@ let test_rejects_inconsistent_list_spread_tailrec_parameter () =
       ]
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some invalid_loop) "main" 1 ])
   with
   | Error error ->
@@ -427,10 +427,10 @@ let test_rejects_late_ownership_node () =
       ]
   in
   let json = program [ function_decl ~body:(Some late_dup) "main" 1 ] in
-  match Core_post_collection_fusion_json.decode_program json with
+  match Core_post_tuple_sroa_json.decode_program json with
   | Ok _ ->
       Alcotest.fail
-        "late ownership Core crossed the post-collection-fusion boundary"
+        "late ownership Core crossed the post-tuple-SROA boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -568,7 +568,7 @@ let test_reports_nested_missing_field_path () =
       [ ("literal", kind "int" []); ("type", int_type); ("loc", synthetic_loc) ]
   in
   let json = program [ function_decl ~body:(Some malformed) "main" 1 ] in
-  match Core_post_collection_fusion_json.decode_program json with
+  match Core_post_tuple_sroa_json.decode_program json with
   | Ok _ -> Alcotest.fail "malformed literal decoded"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.literal.value" error.path
@@ -631,13 +631,13 @@ let test_rejects_deferred_trait_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved deferred trait call reached the post-collection-fusion boundary"
+        "unresolved deferred trait call reached the post-tuple-SROA boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "deferred trait dispatch crossed the resolved boundary"
@@ -651,13 +651,13 @@ let test_rejects_selected_direct_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved selected direct call reached the post-collection-fusion boundary"
+        "unresolved selected direct call reached the post-tuple-SROA boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "selected direct call crossed the resolved boundary"
@@ -677,13 +677,13 @@ let test_rejects_selected_trait_call_after_blorp_resolution () =
       [ int_literal 1 ] int_type
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "unresolved selected trait call reached the post-collection-fusion boundary"
+        "unresolved selected trait call reached the post-tuple-SROA boundary"
         error.message
   | Ok _ ->
       Alcotest.fail "selected trait dispatch crossed the resolved boundary"
@@ -707,11 +707,11 @@ let test_rejects_generic_impl_template () =
         ("loc", synthetic_loc);
       ]
   in
-  match Core_post_collection_fusion_json.decode_program (program [ impl_decl ]) with
+  match Core_post_tuple_sroa_json.decode_program (program [ impl_decl ]) with
   | Error error ->
       Alcotest.(check string)
         "boundary error"
-        "generic impl template is not valid post-collection-fusion"
+        "generic impl template is not valid post-tuple-SROA"
         error.message
   | Ok _ -> Alcotest.fail "generic impl template crossed the runtime boundary"
 
@@ -842,7 +842,7 @@ let test_decodes_precompiled_constructor_match () =
       ()
   | _ ->
       Alcotest.fail
-        "precompiled constructor match changed across the post-collection-fusion boundary"
+        "precompiled constructor match changed across the post-tuple-SROA boundary"
 
 let test_decodes_specialized_match_accessor () =
   let binding =
@@ -882,17 +882,17 @@ let test_decodes_specialized_match_accessor () =
       ()
   | _ ->
       Alcotest.fail
-        "specialized match accessor changed across the post-collection-fusion boundary"
+        "specialized match accessor changed across the post-tuple-SROA boundary"
 
 let test_rejects_ownership_bearing_constructor_match () =
   let body = precompiled_constructor_match "arc" in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Ok _ ->
       Alcotest.fail
-        "ownership-bearing constructor match crossed the post-collection-fusion boundary"
+        "ownership-bearing constructor match crossed the post-tuple-SROA boundary"
   | Error error ->
       Alcotest.(check string) "path"
         "program.decls[0].body.scrutinee_release_policy" error.path;
@@ -910,11 +910,11 @@ let test_rejects_raw_match () =
       ]
   in
   match
-    Core_post_collection_fusion_json.decode_program
+    Core_post_tuple_sroa_json.decode_program
       (program [ function_decl ~body:(Some body) "main" 1 ])
   with
   | Ok _ ->
-      Alcotest.fail "raw match crossed the post-collection-fusion boundary"
+      Alcotest.fail "raw match crossed the post-tuple-SROA boundary"
   | Error error ->
       Alcotest.(check string) "path" "program.decls[0].body.kind" error.path;
       Alcotest.(check bool) "diagnostic names rejected form" true
@@ -1182,8 +1182,8 @@ let suite =
   [
     ( "boundary",
       [
-        Alcotest.test_case "decodes post-collection-fusion program" `Quick
-          test_decodes_post_collection_fusion_program;
+        Alcotest.test_case "decodes post-tuple-SROA program" `Quick
+          test_decodes_post_tuple_sroa_program;
         Alcotest.test_case "decodes collection list handoff" `Quick
           test_decodes_collection_list_handoff;
         Alcotest.test_case "rejects invalid collection list handoff contract"

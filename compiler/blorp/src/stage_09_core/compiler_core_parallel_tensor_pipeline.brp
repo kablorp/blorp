@@ -1,0 +1,1241 @@
+-- Recognize scoped ParallelVector and ParallelMatrix producer chains and lower
+-- each supported chain to one runtime parallel call. Unsupported shapes remain
+-- unchanged so the synthesized std wrapper stays the correctness fallback.
+import:
+	compiler_core_json:
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall, UserCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(CallExpr, LambdaExpr, LetExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim,
+		CoreType(FunctionType, NamedType, RangeType, TensorType, VoidType),
+		CoreVar,
+		core_expr_type,
+		core_var_equal,
+	compiler_core_mono: core_mono_type_equal
+	compiler_core_synth_name: synthesis_source_name
+	compiler_core_traverse: map_core_expr_children
+
+
+private VOID_TYPE: CoreType = VoidType
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private INDEX_TYPE: CoreType = RangeType
+
+private COMPILER_LOCAL_PREFIX: String = "$blorp$parallel_tensor$"
+
+
+private enum CoreParallelStdCallKind:
+	VectorParallelCall
+	ParallelVectorMapCall
+	ParallelVectorMapIndexedCall
+	ParallelVectorZipMapCall
+	MatrixParallelCall
+	ParallelMatrixMapCall
+	ParallelMatrixMapIndexedCall
+	ParallelMatrixZipMapCall
+
+
+private union CoreParallelPipelineStageKind:
+	ParallelMapStage(CoreExpr)
+	ParallelMapIndexedStage(CoreExpr)
+	ParallelZipMapStage(CoreExpr, CoreType, CoreExpr)
+
+
+private record CoreParallelPipelineStage {
+	kind: CoreParallelPipelineStageKind,
+	output_type: CoreType
+}
+
+
+private record CoreParallelStdCall {
+	def_id: Int,
+	kind: CoreParallelStdCallKind
+}
+
+
+private record CoreVectorShape {
+	element_type: CoreType,
+	dim: CoreTensorDim
+}
+
+
+private record CoreMatrixShape {
+	element_type: CoreType,
+	rows: CoreTensorDim,
+	cols: CoreTensorDim
+}
+
+
+private record CoreParallelVectorPlan {
+	source: CoreExpr,
+	source_element_type: CoreType,
+	stages: List[CoreParallelPipelineStage],
+	result_type: CoreType,
+	result_element_type: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private record CoreParallelMatrixPlan {
+	source: CoreExpr,
+	source_element_type: CoreType,
+	stages: List[CoreParallelPipelineStage],
+	result_type: CoreType,
+	result_element_type: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private record CoreParallelZipRuntimePlan {
+	other: CoreExpr,
+	element_type: CoreType
+}
+
+
+private record CoreParallelFreshVar {
+	variable: CoreVar,
+	next_fresh: Int
+}
+
+
+private record CoreParallelLowering {
+	expr: CoreExpr,
+	next_fresh: Int
+}
+
+
+private record CoreParallelCallArgs {
+	source: CoreExpr,
+	body: CoreExpr
+}
+
+
+private pure func parallel_call_args(args: List[CoreExpr]) -> Option[CoreParallelCallArgs]:
+	if args.length() != 2:
+		None
+	else:
+		source ?= args.get(0)
+		body ?= args.get(1)
+		Some({
+			source = source,
+			body = body,
+		})
+
+
+private pure func tensor_dims_equal(left: CoreTensorDim, right: CoreTensorDim) -> Bool:
+	core_mono_type_equal(TensorType({
+			element_type = VOID_TYPE,
+			dims = [left],
+		}), TensorType({
+			element_type = VOID_TYPE,
+			dims = [right],
+		}))
+
+
+private pure func vector_shape(typ: CoreType) -> Option[CoreVectorShape]:
+	match typ:
+		TensorType(info):
+			match info.dims:
+				[dim]:
+					Some({
+						element_type = info.element_type,
+						dim = dim,
+					})
+				_:
+					None
+		_:
+			None
+
+
+private pure func matrix_shape(typ: CoreType) -> Option[CoreMatrixShape]:
+	match typ:
+		TensorType(info):
+			match info.dims:
+				[rows, cols]:
+					Some({
+						element_type = info.element_type,
+						rows = rows,
+						cols = cols,
+					})
+				_:
+					None
+		_:
+			None
+
+
+private pure func classify_std_function(
+	function_info: CoreFunction,
+) -> Option[CoreParallelStdCallKind]:
+	module_name ?= function_info.source_module
+	source_name ?= synthesis_source_name(function_info)
+
+	match (module_name, source_name):
+		("std/vector", "parallel"):
+			Some(VectorParallelCall)
+		("std/parallel_vector", "map"):
+			Some(ParallelVectorMapCall)
+		("std/parallel_vector", "map_indexed"):
+			Some(ParallelVectorMapIndexedCall)
+		("std/parallel_vector", "zip_map"):
+			Some(ParallelVectorZipMapCall)
+		("std/matrix", "parallel"):
+			Some(MatrixParallelCall)
+		("std/parallel_matrix", "map"):
+			Some(ParallelMatrixMapCall)
+		("std/parallel_matrix", "map_indexed"):
+			Some(ParallelMatrixMapIndexedCall)
+		("std/parallel_matrix", "zip_map"):
+			Some(ParallelMatrixZipMapCall)
+		_:
+			None
+
+
+private pure func collect_std_calls(program: CoreProgram) -> List[CoreParallelStdCall]:
+	program.decls.filter_map(pure func(decl: CoreDecl):
+		match decl:
+			FunctionDecl(function_info):
+				classify_std_function(function_info).map(pure func(kind: CoreParallelStdCallKind):
+					{
+						def_id = function_info.def_id,
+						kind = kind
+					}
+				)
+			_:
+				None
+	)
+
+
+private pure func std_call_kind(
+	calls: List[CoreParallelStdCall],
+	def_id: Int,
+) -> Option[CoreParallelStdCallKind]:
+	var found: Option[CoreParallelStdCallKind] = None
+
+	for call in calls:
+		if call.def_id == def_id:
+			found = Some(call.kind)
+			break
+
+	found
+
+
+private pure func parallel_entrypoint_kind(
+	calls: List[CoreParallelStdCall],
+	call_kind: CoreCallKind,
+) -> Option[CoreParallelStdCallKind]:
+	match call_kind:
+		UserCall(_, Some(def_id), _):
+			std_call_kind(calls, def_id)
+		_:
+			None
+
+
+private pure func vector_stages(
+	calls: List[CoreParallelStdCall],
+	chunk: CoreVar,
+	dim: CoreTensorDim,
+	expr: CoreExpr,
+) -> Option[List[CoreParallelPipelineStage]]:
+	match expr:
+		VarExpr(variable, _, _):
+			if core_var_equal(variable, chunk):
+				Some([])
+			else:
+				None
+		CallExpr(UserCall(_, Some(def_id), _), _, args, typ, _):
+			if args.length() == 3:
+				input ?= args.get(0)
+				other ?= args.get(1)
+				callback ?= args.get(2)
+				input_stages ?= vector_stages(calls, chunk, dim, input)
+				output ?= vector_shape(typ)
+				other_shape ?= vector_shape(core_expr_type(other))
+
+				match std_call_kind(calls, def_id):
+					Some(ParallelVectorZipMapCall):
+						if (
+							not tensor_dims_equal(dim, output.dim)
+							or not tensor_dims_equal(dim, other_shape.dim)
+						):
+							None
+						else:
+							Some(input_stages.append({
+								kind = ParallelZipMapStage(
+									other,
+									other_shape.element_type,
+									callback,
+								),
+								output_type = output.element_type,
+							}))
+					_:
+						None
+			else:
+				if args.length() == 2:
+					input ?= args.get(0)
+					callback ?= args.get(1)
+					input_stages ?= vector_stages(calls, chunk, dim, input)
+					output ?= vector_shape(typ)
+
+					if not tensor_dims_equal(dim, output.dim):
+						None
+					else:
+						match std_call_kind(calls, def_id):
+							Some(ParallelVectorMapCall):
+								Some(input_stages.append({
+									kind = ParallelMapStage(callback),
+									output_type = output.element_type,
+								}))
+							Some(ParallelVectorMapIndexedCall):
+								Some(input_stages.append({
+									kind = ParallelMapIndexedStage(callback),
+									output_type = output.element_type,
+								}))
+							_:
+								None
+				else:
+					None
+		_:
+			None
+
+
+private pure func matrix_stages(
+	calls: List[CoreParallelStdCall],
+	chunk: CoreVar,
+	rows: CoreTensorDim,
+	cols: CoreTensorDim,
+	expr: CoreExpr,
+) -> Option[List[CoreParallelPipelineStage]]:
+	match expr:
+		VarExpr(variable, _, _):
+			if core_var_equal(variable, chunk):
+				Some([])
+			else:
+				None
+		CallExpr(UserCall(_, Some(def_id), _), _, args, typ, _):
+			if args.length() == 3:
+				input ?= args.get(0)
+				other ?= args.get(1)
+				callback ?= args.get(2)
+				input_stages ?= matrix_stages(calls, chunk, rows, cols, input)
+				output ?= matrix_shape(typ)
+				other_shape ?= matrix_shape(core_expr_type(other))
+
+				match std_call_kind(calls, def_id):
+					Some(ParallelMatrixZipMapCall):
+						if (
+							not tensor_dims_equal(rows, output.rows)
+							or not tensor_dims_equal(cols, output.cols)
+							or not tensor_dims_equal(rows, other_shape.rows)
+							or not tensor_dims_equal(cols, other_shape.cols)
+						):
+							None
+						else:
+							Some(input_stages.append({
+								kind = ParallelZipMapStage(
+									other,
+									other_shape.element_type,
+									callback,
+								),
+								output_type = output.element_type,
+							}))
+					_:
+						None
+			else:
+				if args.length() == 2:
+					input ?= args.get(0)
+					callback ?= args.get(1)
+					input_stages ?= matrix_stages(calls, chunk, rows, cols, input)
+					output ?= matrix_shape(typ)
+
+					if (
+						not tensor_dims_equal(rows, output.rows)
+						or not tensor_dims_equal(cols, output.cols)
+					):
+						None
+					else:
+						match std_call_kind(calls, def_id):
+							Some(ParallelMatrixMapCall):
+								Some(input_stages.append({
+									kind = ParallelMapStage(callback),
+									output_type = output.element_type,
+								}))
+							Some(ParallelMatrixMapIndexedCall):
+								Some(input_stages.append({
+									kind = ParallelMapIndexedStage(callback),
+									output_type = output.element_type,
+								}))
+							_:
+								None
+				else:
+					None
+		_:
+			None
+
+
+private pure func vector_plan(
+	calls: List[CoreParallelStdCall],
+	source: CoreExpr,
+	body: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreParallelVectorPlan]:
+	source_shape ?= vector_shape(core_expr_type(source))
+	result_shape ?= vector_shape(result_type)
+
+	if not tensor_dims_equal(source_shape.dim, result_shape.dim):
+		None
+	else:
+		match body:
+			LambdaExpr(params, _, lambda_body, _, _, _):
+				if params.length() != 1:
+					None
+				else:
+					chunk ?= params.get(0)
+					chunk_shape ?= vector_shape(chunk.typ)
+
+					if not tensor_dims_equal(source_shape.dim, chunk_shape.dim):
+						None
+					else:
+						stages ?= vector_stages(calls, chunk.name, source_shape.dim, lambda_body)
+
+						if stages.is_empty():
+							None
+						else:
+							Some({
+								source = source,
+								source_element_type = source_shape.element_type,
+								stages = stages,
+								result_type = result_type,
+								result_element_type = result_shape.element_type,
+								loc = loc,
+							})
+			_:
+				None
+
+
+private pure func matrix_plan(
+	calls: List[CoreParallelStdCall],
+	source: CoreExpr,
+	body: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreParallelMatrixPlan]:
+	source_shape ?= matrix_shape(core_expr_type(source))
+	result_shape ?= matrix_shape(result_type)
+
+	if (
+		not tensor_dims_equal(source_shape.rows, result_shape.rows)
+		or not tensor_dims_equal(source_shape.cols, result_shape.cols)
+	):
+		None
+	else:
+		match body:
+			LambdaExpr(params, _, lambda_body, _, _, _):
+				if params.length() != 1:
+					None
+				else:
+					chunk ?= params.get(0)
+					chunk_shape ?= matrix_shape(chunk.typ)
+
+					if (
+						not tensor_dims_equal(source_shape.rows, chunk_shape.rows)
+						or not tensor_dims_equal(source_shape.cols, chunk_shape.cols)
+					):
+						None
+					else:
+						stages ?= matrix_stages(
+							calls,
+							chunk.name,
+							source_shape.rows,
+							source_shape.cols,
+							lambda_body,
+						)
+
+						if stages.is_empty():
+							None
+						else:
+							Some({
+								source = source,
+								source_element_type = source_shape.element_type,
+								stages = stages,
+								result_type = result_type,
+								result_element_type = result_shape.element_type,
+								loc = loc,
+							})
+			_:
+				None
+
+
+private pure func stages_need_index(stages: List[CoreParallelPipelineStage]) -> Bool:
+	stages.any(pure func(stage: CoreParallelPipelineStage):
+		match stage.kind:
+			ParallelMapStage(_):
+				False
+			ParallelMapIndexedStage(_) | ParallelZipMapStage(_, _, _):
+				True
+	)
+
+
+private pure func stages_have_indexed_map(stages: List[CoreParallelPipelineStage]) -> Bool:
+	stages.any(pure func(stage: CoreParallelPipelineStage):
+		match stage.kind:
+			ParallelMapIndexedStage(_):
+				True
+			_:
+				False
+	)
+
+
+private pure func stages_have_zip(stages: List[CoreParallelPipelineStage]) -> Bool:
+	stages.any(pure func(stage: CoreParallelPipelineStage):
+		match stage.kind:
+			ParallelZipMapStage(_, _, _):
+				True
+			_:
+				False
+	)
+
+
+private pure func same_zip_source(left: CoreExpr, right: CoreExpr) -> Bool:
+	match (left, right):
+		(VarExpr(left_var, _, _), VarExpr(right_var, _, _)):
+			core_var_equal(left_var, right_var)
+		_:
+			False
+
+
+private pure func zip_runtime_plan(
+	stages: List[CoreParallelPipelineStage],
+	allow_indexed_map: Bool,
+) -> Option[CoreParallelZipRuntimePlan]:
+	var selected: Option[CoreParallelZipRuntimePlan] = None
+	var supported: Bool = True
+
+	for stage in stages:
+		match stage.kind:
+			ParallelMapStage(_):
+				void
+			ParallelMapIndexedStage(_):
+				if not allow_indexed_map:
+					supported = False
+					break
+			ParallelZipMapStage(other, element_type, _):
+				match selected:
+					None:
+						selected = Some({
+							other = other,
+							element_type = element_type,
+						})
+					Some(zip):
+						if (
+							not same_zip_source(zip.other, other)
+							or not core_mono_type_equal(zip.element_type, element_type)
+						):
+							supported = False
+							break
+
+	if supported:
+		selected
+	else:
+		None
+
+
+private pure func fresh_var(label: String, next_fresh: Int) -> CoreParallelFreshVar:
+	{
+		variable = {
+			name = COMPILER_LOCAL_PREFIX + label + "$" + next_fresh.to_string(),
+			uniq = next_fresh,
+			def_id = None
+		},
+		next_fresh = next_fresh + 1
+	}
+
+
+private pure func variable(name: CoreVar, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+	VarExpr(name, typ, loc)
+
+
+private pure func void_expr(loc: CoreSourceLoc) -> CoreExpr:
+	VoidExpr(VOID_TYPE, loc)
+
+
+private pure func closure_call(
+	callback: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(ClosureCall, callback, args, return_type, loc)
+
+
+private pure func builtin_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), void_expr(loc), args, return_type, loc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_expr(loc), args, return_type, loc)
+
+
+private pure func lambda_expr(
+	params: List[CoreParam],
+	body: CoreExpr,
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	LambdaExpr(
+		params,
+		return_type,
+		body,
+		True,
+		FunctionType(
+			True,
+			params.map(pure func(param: CoreParam): param.typ),
+			return_type,
+		),
+		loc,
+	)
+
+
+private pure func let_expr(
+	binding: CoreVar,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(binding, False, typ, rhs, body)
+
+
+private pure func apply_vector_stage(
+	stage: CoreParallelPipelineStage,
+	current: CoreExpr,
+	index: Option[CoreExpr],
+	zip_value: Option[CoreExpr],
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match stage.kind:
+		ParallelMapStage(callback):
+			closure_call(callback, [current], stage.output_type, loc)
+		ParallelMapIndexedStage(callback):
+			match index:
+				Some(index_expr):
+					closure_call(
+						callback,
+						[index_expr, current],
+						stage.output_type,
+						loc,
+					)
+				None:
+					current
+		ParallelZipMapStage(other, other_element_type, callback):
+			match zip_value:
+				Some(other_element):
+					closure_call(
+						callback,
+						[current, other_element],
+						stage.output_type,
+						loc,
+					)
+				None:
+					match index:
+						Some(index_expr):
+							other_element: CoreExpr = intrinsic_call(
+								"tensor_get_unchecked",
+								[other, index_expr],
+								other_element_type,
+								loc,
+							)
+							closure_call(
+								callback,
+								[current, other_element],
+								stage.output_type,
+								loc,
+							)
+						None:
+							current
+
+
+private pure func build_vector_callback_body(
+	stages: List[CoreParallelPipelineStage],
+	current: CoreExpr,
+	index: Option[CoreExpr],
+	zip_value: Option[CoreExpr],
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> CoreParallelLowering:
+	match stages:
+		[]:
+			{
+				expr = current,
+				next_fresh = next_fresh
+			}
+		[stage]:
+			{
+				expr = apply_vector_stage(stage, current, index, zip_value, loc),
+				next_fresh = next_fresh
+			}
+		[stage, ...rest]:
+			rhs: CoreExpr = apply_vector_stage(stage, current, index, zip_value, loc)
+			stage_fresh: CoreParallelFreshVar = fresh_var("stage", next_fresh)
+			lowered: CoreParallelLowering = build_vector_callback_body(
+				rest,
+				variable(stage_fresh.variable, core_expr_type(rhs), loc),
+				index,
+				zip_value,
+				loc,
+				stage_fresh.next_fresh,
+			)
+			{
+				expr = let_expr(stage_fresh.variable, core_expr_type(rhs), rhs, lowered.expr),
+				next_fresh = lowered.next_fresh
+			}
+
+
+private pure func lower_vector_plan(plan: CoreParallelVectorPlan) -> CoreExpr:
+	value_fresh: CoreParallelFreshVar = fresh_var("value", 0)
+	value: CoreExpr = variable(value_fresh.variable, plan.source_element_type, plan.loc)
+
+	match zip_runtime_plan(plan.stages, False):
+		Some(zip):
+			zip_fresh: CoreParallelFreshVar = fresh_var("zip", value_fresh.next_fresh)
+			zip_value: CoreExpr = variable(zip_fresh.variable, zip.element_type, plan.loc)
+			body: CoreParallelLowering = build_vector_callback_body(
+				plan.stages,
+				value,
+				None,
+				Some(zip_value),
+				plan.loc,
+				zip_fresh.next_fresh,
+			)
+			callback: CoreExpr = lambda_expr(
+				[
+					{
+						name = value_fresh.variable,
+						typ = plan.source_element_type,
+						loc = plan.loc
+					},
+					{
+						name = zip_fresh.variable,
+						typ = zip.element_type,
+						loc = plan.loc
+					},
+				],
+				body.expr,
+				plan.result_element_type,
+				plan.loc,
+			)
+			builtin_call(
+				"blorp_vzip_parallel",
+				[plan.source, zip.other, callback],
+				plan.result_type,
+				plan.loc,
+			)
+		None:
+			if stages_need_index(plan.stages):
+				index_fresh: CoreParallelFreshVar = fresh_var("index", value_fresh.next_fresh)
+				index: CoreExpr = variable(index_fresh.variable, INDEX_TYPE, plan.loc)
+				body: CoreParallelLowering = build_vector_callback_body(
+					plan.stages,
+					value,
+					Some(index),
+					None,
+					plan.loc,
+					index_fresh.next_fresh,
+				)
+				callback: CoreExpr = lambda_expr(
+					[
+						{
+							name = index_fresh.variable,
+							typ = INDEX_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = value_fresh.variable,
+							typ = plan.source_element_type,
+							loc = plan.loc
+						},
+					],
+					body.expr,
+					plan.result_element_type,
+					plan.loc,
+				)
+				builtin_call(
+					"blorp_vmap_indexed_parallel",
+					[plan.source, callback],
+					plan.result_type,
+					plan.loc,
+				)
+			else:
+				body: CoreParallelLowering = build_vector_callback_body(
+					plan.stages,
+					value,
+					None,
+					None,
+					plan.loc,
+					value_fresh.next_fresh,
+				)
+				callback: CoreExpr = lambda_expr(
+					[
+						{
+							name = value_fresh.variable,
+							typ = plan.source_element_type,
+							loc = plan.loc
+						},
+					],
+					body.expr,
+					plan.result_element_type,
+					plan.loc,
+				)
+				builtin_call(
+					"blorp_vmap_parallel",
+					[plan.source, callback],
+					plan.result_type,
+					plan.loc,
+				)
+
+
+private pure func apply_matrix_stage(
+	stage: CoreParallelPipelineStage,
+	current: CoreExpr,
+	row: CoreExpr,
+	col: CoreExpr,
+	flat_index: Option[CoreExpr],
+	zip_value: Option[CoreExpr],
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match stage.kind:
+		ParallelMapStage(callback):
+			closure_call(callback, [current], stage.output_type, loc)
+		ParallelMapIndexedStage(callback):
+			closure_call(
+				callback,
+				[row, col, current],
+				stage.output_type,
+				loc,
+			)
+		ParallelZipMapStage(other, other_element_type, callback):
+			match zip_value:
+				Some(other_element):
+					closure_call(
+						callback,
+						[current, other_element],
+						stage.output_type,
+						loc,
+					)
+				None:
+					match flat_index:
+						Some(index):
+							other_element: CoreExpr = intrinsic_call(
+								"tensor_get_unchecked",
+								[other, index],
+								other_element_type,
+								loc,
+							)
+							closure_call(
+								callback,
+								[current, other_element],
+								stage.output_type,
+								loc,
+							)
+						None:
+							current
+
+
+private pure func build_matrix_callback_body(
+	stages: List[CoreParallelPipelineStage],
+	current: CoreExpr,
+	row: CoreExpr,
+	col: CoreExpr,
+	flat_index: Option[CoreExpr],
+	zip_value: Option[CoreExpr],
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> CoreParallelLowering:
+	match stages:
+		[]:
+			{
+				expr = current,
+				next_fresh = next_fresh
+			}
+		[stage]:
+			{
+				expr = apply_matrix_stage(stage, current, row, col, flat_index, zip_value, loc),
+				next_fresh = next_fresh
+			}
+		[stage, ...rest]:
+			rhs: CoreExpr = apply_matrix_stage(stage, current, row, col, flat_index, zip_value, loc)
+			stage_fresh: CoreParallelFreshVar = fresh_var("mstage", next_fresh)
+			lowered: CoreParallelLowering = build_matrix_callback_body(
+				rest,
+				variable(stage_fresh.variable, core_expr_type(rhs), loc),
+				row,
+				col,
+				flat_index,
+				zip_value,
+				loc,
+				stage_fresh.next_fresh,
+			)
+			{
+				expr = let_expr(stage_fresh.variable, core_expr_type(rhs), rhs, lowered.expr),
+				next_fresh = lowered.next_fresh
+			}
+
+
+private pure func lower_matrix_plan(plan: CoreParallelMatrixPlan) -> CoreExpr:
+	value_fresh: CoreParallelFreshVar = fresh_var("mvalue", 0)
+	value: CoreExpr = variable(value_fresh.variable, plan.source_element_type, plan.loc)
+
+	match zip_runtime_plan(plan.stages, True):
+		Some(zip):
+			if stages_have_indexed_map(plan.stages):
+				row_fresh: CoreParallelFreshVar = fresh_var("row", value_fresh.next_fresh)
+				col_fresh: CoreParallelFreshVar = fresh_var("col", row_fresh.next_fresh)
+				zip_fresh: CoreParallelFreshVar = fresh_var("mzip", col_fresh.next_fresh)
+				row: CoreExpr = variable(row_fresh.variable, INDEX_TYPE, plan.loc)
+				col: CoreExpr = variable(col_fresh.variable, INDEX_TYPE, plan.loc)
+				zip_value: CoreExpr = variable(zip_fresh.variable, zip.element_type, plan.loc)
+				body: CoreParallelLowering = build_matrix_callback_body(
+					plan.stages,
+					value,
+					row,
+					col,
+					None,
+					Some(zip_value),
+					plan.loc,
+					zip_fresh.next_fresh,
+				)
+				callback: CoreExpr = lambda_expr(
+					[
+						{
+							name = row_fresh.variable,
+							typ = INDEX_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = col_fresh.variable,
+							typ = INDEX_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = value_fresh.variable,
+							typ = plan.source_element_type,
+							loc = plan.loc
+						},
+						{
+							name = zip_fresh.variable,
+							typ = zip.element_type,
+							loc = plan.loc
+						},
+					],
+					body.expr,
+					plan.result_element_type,
+					plan.loc,
+				)
+				builtin_call(
+					"blorp_mzip_indexed_parallel",
+					[plan.source, zip.other, callback],
+					plan.result_type,
+					plan.loc,
+				)
+			else:
+				zip_fresh: CoreParallelFreshVar = fresh_var("mzip", value_fresh.next_fresh)
+				zip_value: CoreExpr = variable(zip_fresh.variable, zip.element_type, plan.loc)
+				body: CoreParallelLowering = build_vector_callback_body(
+					plan.stages,
+					value,
+					None,
+					Some(zip_value),
+					plan.loc,
+					zip_fresh.next_fresh,
+				)
+				callback: CoreExpr = lambda_expr(
+					[
+						{
+							name = value_fresh.variable,
+							typ = plan.source_element_type,
+							loc = plan.loc
+						},
+						{
+							name = zip_fresh.variable,
+							typ = zip.element_type,
+							loc = plan.loc
+						},
+					],
+					body.expr,
+					plan.result_element_type,
+					plan.loc,
+				)
+				builtin_call(
+					"blorp_mzip_parallel",
+					[plan.source, zip.other, callback],
+					plan.result_type,
+					plan.loc,
+				)
+		None:
+			if stages_have_zip(plan.stages):
+				row_fresh: CoreParallelFreshVar = fresh_var("row", value_fresh.next_fresh)
+				col_fresh: CoreParallelFreshVar = fresh_var("col", row_fresh.next_fresh)
+				flat_fresh: CoreParallelFreshVar = fresh_var("flat", col_fresh.next_fresh)
+				row: CoreExpr = variable(row_fresh.variable, INDEX_TYPE, plan.loc)
+				col: CoreExpr = variable(col_fresh.variable, INDEX_TYPE, plan.loc)
+				flat_index: CoreExpr = variable(flat_fresh.variable, INT_TYPE, plan.loc)
+				body: CoreParallelLowering = build_matrix_callback_body(
+					plan.stages,
+					value,
+					row,
+					col,
+					Some(flat_index),
+					None,
+					plan.loc,
+					flat_fresh.next_fresh,
+				)
+				callback: CoreExpr = lambda_expr(
+					[
+						{
+							name = row_fresh.variable,
+							typ = INDEX_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = col_fresh.variable,
+							typ = INDEX_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = flat_fresh.variable,
+							typ = INT_TYPE,
+							loc = plan.loc
+						},
+						{
+							name = value_fresh.variable,
+							typ = plan.source_element_type,
+							loc = plan.loc
+						},
+					],
+					body.expr,
+					plan.result_element_type,
+					plan.loc,
+				)
+				builtin_call(
+					"blorp_mmap_flat_indexed_parallel",
+					[plan.source, callback],
+					plan.result_type,
+					plan.loc,
+				)
+			else:
+				if stages_need_index(plan.stages):
+					row_fresh: CoreParallelFreshVar = fresh_var("row", value_fresh.next_fresh)
+					col_fresh: CoreParallelFreshVar = fresh_var("col", row_fresh.next_fresh)
+					row: CoreExpr = variable(row_fresh.variable, INDEX_TYPE, plan.loc)
+					col: CoreExpr = variable(col_fresh.variable, INDEX_TYPE, plan.loc)
+					body: CoreParallelLowering = build_matrix_callback_body(
+						plan.stages,
+						value,
+						row,
+						col,
+						None,
+						None,
+						plan.loc,
+						col_fresh.next_fresh,
+					)
+					callback: CoreExpr = lambda_expr(
+						[
+							{
+								name = row_fresh.variable,
+								typ = INDEX_TYPE,
+								loc = plan.loc
+							},
+							{
+								name = col_fresh.variable,
+								typ = INDEX_TYPE,
+								loc = plan.loc
+							},
+							{
+								name = value_fresh.variable,
+								typ = plan.source_element_type,
+								loc = plan.loc
+							},
+						],
+						body.expr,
+						plan.result_element_type,
+						plan.loc,
+					)
+					builtin_call(
+						"blorp_mmap_indexed_parallel",
+						[plan.source, callback],
+						plan.result_type,
+						plan.loc,
+					)
+				else:
+					body: CoreParallelLowering = build_vector_callback_body(
+						plan.stages,
+						value,
+						None,
+						None,
+						plan.loc,
+						value_fresh.next_fresh,
+					)
+					callback: CoreExpr = lambda_expr(
+						[
+							{
+								name = value_fresh.variable,
+								typ = plan.source_element_type,
+								loc = plan.loc
+							},
+						],
+						body.expr,
+						plan.result_element_type,
+						plan.loc,
+					)
+					builtin_call(
+						"blorp_mmap_parallel",
+						[plan.source, callback],
+						plan.result_type,
+						plan.loc,
+					)
+
+
+private pure func rewrite_parallel_tensor_expr(
+	calls: List[CoreParallelStdCall],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(call_kind, callee, args, result_type, loc):
+			match parallel_call_args(args):
+				Some(call_args):
+					entrypoint: Option[CoreParallelStdCallKind] = parallel_entrypoint_kind(
+						calls,
+						call_kind,
+					)
+
+					match entrypoint:
+						Some(VectorParallelCall):
+							rewritten_source: CoreExpr = rewrite_parallel_tensor_expr(
+								calls,
+								call_args.source,
+							)
+
+							match vector_plan(
+								calls,
+								rewritten_source,
+								call_args.body,
+								result_type,
+								loc,
+							):
+								Some(plan):
+									rewrite_parallel_tensor_expr(calls, lower_vector_plan(plan))
+								None:
+									CallExpr(
+										call_kind,
+										callee,
+										[
+											rewritten_source,
+											rewrite_parallel_tensor_expr(calls, call_args.body),
+										],
+										result_type,
+										loc,
+									)
+						Some(MatrixParallelCall):
+							rewritten_source: CoreExpr = rewrite_parallel_tensor_expr(
+								calls,
+								call_args.source,
+							)
+
+							match matrix_plan(
+								calls,
+								rewritten_source,
+								call_args.body,
+								result_type,
+								loc,
+							):
+								Some(plan):
+									rewrite_parallel_tensor_expr(calls, lower_matrix_plan(plan))
+								None:
+									CallExpr(
+										call_kind,
+										callee,
+										[
+											rewritten_source,
+											rewrite_parallel_tensor_expr(calls, call_args.body),
+										],
+										result_type,
+										loc,
+									)
+						_:
+							map_core_expr_children(
+								expr,
+								pure func(
+									child: CoreExpr,
+								): rewrite_parallel_tensor_expr(calls, child),
+							)
+				None:
+					map_core_expr_children(
+						expr,
+						pure func(child: CoreExpr): rewrite_parallel_tensor_expr(calls, child),
+					)
+		_:
+			map_core_expr_children(
+				expr,
+				pure func(child: CoreExpr): rewrite_parallel_tensor_expr(calls, child),
+			)
+
+
+private pure func rewrite_parallel_tensor_function(
+	calls: List[CoreParallelStdCall],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(
+			pure func(body: CoreExpr): rewrite_parallel_tensor_expr(calls, body),
+		)
+	}
+
+
+private pure func rewrite_parallel_tensor_decl(
+	calls: List[CoreParallelStdCall],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_parallel_tensor_function(calls, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = rewrite_parallel_tensor_expr(calls, global.init) })
+		ImplDecl(implementation):
+			ImplDecl(
+				{ implementation |
+					methods = implementation.methods.map(
+						pure func(
+							method: CoreFunction,
+						): rewrite_parallel_tensor_function(calls, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func fuse_parallel_tensor_program(program: CoreProgram) -> CoreProgram:
+	calls: List[CoreParallelStdCall] = collect_std_calls(program)
+
+	if calls.is_empty():
+		program
+	else:
+		{ program |
+			decls = program.decls.map(
+				pure func(decl: CoreDecl): rewrite_parallel_tensor_decl(calls, decl),
+			)
+		}
