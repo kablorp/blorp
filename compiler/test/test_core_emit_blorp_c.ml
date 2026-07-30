@@ -41,6 +41,113 @@ let test_global_projection_preserves_absent_source_module () =
     "absent source module remains explicit" true
     (Modules.contains projected {|"source_module":null|})
 
+let test_projection_preserves_record_update_carrier () =
+  let int_ty = TyNamed ("Int", []) in
+  let point_ty = TyNamed ("Point", []) in
+  let point_var = Var.named "point" in
+  let body =
+    {
+      desc =
+        CRecordUpdate
+          ( { desc = CVar point_var; ty = point_ty; loc },
+            [
+              ("x", { desc = CLit (LitInt 10L); ty = int_ty; loc });
+              ( "y",
+                {
+                  desc =
+                    CField
+                      ({ desc = CVar point_var; ty = point_ty; loc }, "y");
+                  ty = int_ty;
+                  loc;
+                } );
+            ] );
+      ty = point_ty;
+      loc;
+    }
+  in
+  let func =
+    {
+      cf_name = "update_point";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [ { cp_name = point_var; cp_ty = point_ty; cp_loc = loc } ];
+      cf_return_ty = point_ty;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 9;
+    }
+  in
+  let point_decl =
+    {
+      record_name = "Point";
+      record_type_params = [];
+      record_fields =
+        [
+          { field_name = "x"; field_type = int_ty; field_loc = loc };
+          { field_name = "y"; field_type = int_ty; field_loc = loc };
+        ];
+      record_is_value = true;
+      record_is_builtin = false;
+    }
+  in
+  let program =
+    [
+      { cd_desc = CDRecord point_decl; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let reg = Codegen_types.create_registry () in
+  match Core_emit_blorp_c.program_json ~reg program with
+  | Ok json ->
+      let projected = Lsp_json.to_string json in
+      Alcotest.(check bool)
+        "record update tag" true
+        (Modules.contains projected {|"kind":"record_update"|});
+      Alcotest.(check bool)
+        "record update base" true
+        (Modules.contains projected {|"base":{"kind":"var"|});
+      Alcotest.(check bool)
+        "complete checked field shape" true
+        (Modules.contains projected {|"field":"y"|})
+  | Error error ->
+      Alcotest.fail (Core_emit_blorp_c.unsupported_to_string error)
+
+let test_projection_rejects_non_variable_record_update_base () =
+  let point_ty = TyNamed ("Point", []) in
+  let body =
+    {
+      desc =
+        CRecordUpdate
+          ({ desc = CLit (LitInt 1L); ty = point_ty; loc }, []);
+      ty = point_ty;
+      loc;
+    }
+  in
+  let func =
+    {
+      cf_name = "bad_update";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = point_ty;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 10;
+    }
+  in
+  let program = [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ] in
+  let reg = Codegen_types.create_registry () in
+  match Core_emit_blorp_c.program_json ~reg program with
+  | Ok _ -> Alcotest.fail "expected non-variable record update base rejection"
+  | Error error ->
+      Alcotest.(check bool)
+        "variable requirement" true
+        (Modules.contains
+           (Core_emit_blorp_c.unsupported_to_string error)
+           "record update base must be a variable expression")
+
 let test_projection_accepts_scoped_closure_call_argument () =
   let string_ty = TyNamed ("String", []) in
   let closure_ty =
@@ -340,6 +447,10 @@ let suite =
           test_global_projection_preserves_source_module;
         Alcotest.test_case "absent global source module" `Quick
           test_global_projection_preserves_absent_source_module;
+        Alcotest.test_case "record update carrier" `Quick
+          test_projection_preserves_record_update_carrier;
+        Alcotest.test_case "rejects non-variable record update base" `Quick
+          test_projection_rejects_non_variable_record_update_base;
         Alcotest.test_case "scoped closure-call argument" `Quick
           test_projection_accepts_scoped_closure_call_argument;
         Alcotest.test_case "length match nested in literal case" `Quick

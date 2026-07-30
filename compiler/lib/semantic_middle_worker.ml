@@ -7,7 +7,7 @@
     interpret CLI arguments, emit C, write artifacts, or execute child
     processes. *)
 
-let schema_version = 13
+let schema_version = 14
 let protocol_domain = "compiler_semantic_middle"
 let request_kind = "compile_pre_dce"
 let core_phase = "post_tuple_sroa"

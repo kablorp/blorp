@@ -1049,11 +1049,11 @@ p: Person = {name = "Alice", age = 30}
 -- Field access
 name: String = p.name
 
--- Record update (COW: mutates in-place when unique, copies when shared)
+-- Record update creates a new logical value.
 p2: Person = {p | age = 31}
 p3: Person = {p | name = "Bob", age = 25}
 
--- Self-update pattern: guaranteed in-place mutation (refcount is 1)
+-- An eligible self-update may reuse storage when the old value is unique.
 var player: Person = {name = "Alice", age = 30}
 player = { player | age = player.age + 1 }
 ```
@@ -2865,7 +2865,9 @@ Blorp's value semantics guarantee that **cyclic data structures cannot exist**. 
 The key properties that prevent cycles:
 
 1. **All assignment copies.** `x = y` creates an independent value. COW defers the physical copy, but the semantics are always "independent values."
-2. **Record update creates a new record.** `{ a | field = val }` produces a fresh record; it does not mutate `a`.
+2. **Record update creates a new logical value.** `{ a | field = val }` does
+   not mutate the value observed through `a`; an eligible self-replacement may
+   reuse storage only when no live alias can observe that optimization.
 3. **No mutable references.** There is no way to point two values at each other after construction.
 4. **Closures capture by value.** A closure gets its own copy of captured variables, not a reference back to the original.
 

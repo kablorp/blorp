@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+compiler="${BLORP_RECORD_UPDATE_COMPILER:-$repo_root/blorp}"
+source_file="$repo_root/benchmarks/blorp/profiles/record_update_allocations.brp"
+expected_allocations="${BLORP_RECORD_UPDATE_EXPECT_ALLOCATIONS:-1}"
+expected_releases="${BLORP_RECORD_UPDATE_EXPECT_RELEASES:-0}"
+expected_current_objects="${BLORP_RECORD_UPDATE_EXPECT_CURRENT_OBJECTS:-1}"
+measure_only="${BLORP_RECORD_UPDATE_MEASURE_ONLY:-0}"
+
+if [ "${BLORP_RECORD_UPDATE_SKIP_BUILD:-0}" != "1" ]; then
+	make -C "$repo_root" all >/dev/null
+fi
+
+if [ ! -x "$compiler" ]; then
+	echo "compiler_record_update_allocations: compiler is not executable: $compiler" >&2
+	exit 1
+fi
+
+output=$(
+	cd "$repo_root"
+	BLORP_TRACK_STATS=1 "$compiler" run --no-format "$source_file"
+)
+
+result=$(printf '%s\n' "$output" | sed -n '1p')
+allocations=$(printf '%s\n' "$output" | sed -n '2p')
+releases=$(printf '%s\n' "$output" | sed -n '3p')
+current_objects=$(printf '%s\n' "$output" | sed -n '4p')
+bytes_allocated=$(printf '%s\n' "$output" | sed -n '5p')
+line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+
+for value in "$result" "$allocations" "$releases" "$current_objects" "$bytes_allocated"; do
+	if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+		echo "compiler_record_update_allocations: malformed probe output:" >&2
+		printf '%s\n' "$output" >&2
+		exit 1
+	fi
+done
+
+if [ "$line_count" -ne 5 ] || [ "$result" -ne 100100 ]; then
+	echo "compiler_record_update_allocations: record-update result changed:" >&2
+	printf '%s\n' "$output" >&2
+	exit 1
+fi
+
+if [ "$measure_only" != "0" ] && [ "$measure_only" != "1" ]; then
+	echo "compiler_record_update_allocations: BLORP_RECORD_UPDATE_MEASURE_ONLY must be 0 or 1" >&2
+	exit 1
+fi
+
+if [ "$measure_only" != "1" ] && [ "$allocations" -ne "$expected_allocations" ]; then
+	echo "compiler_record_update_allocations: expected $expected_allocations allocations, got $allocations" >&2
+	exit 1
+fi
+
+if [ "$releases" -ne "$expected_releases" ]; then
+	echo "compiler_record_update_allocations: expected $expected_releases releases, got $releases" >&2
+	exit 1
+fi
+
+if [ "$current_objects" -ne "$expected_current_objects" ]; then
+	echo "compiler_record_update_allocations: expected $expected_current_objects current objects, got $current_objects" >&2
+	exit 1
+fi
+
+printf 'RECORD_UPDATE_ALLOCATIONS schema=1 iterations=100000 result=%s allocations=%s releases=%s current_objects=%s bytes_allocated=%s\n' \
+	"$result" "$allocations" "$releases" "$current_objects" "$bytes_allocated"

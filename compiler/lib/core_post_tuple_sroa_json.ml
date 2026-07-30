@@ -500,6 +500,20 @@ let rec decode_expr path value =
       in
       let* fields = list_field decode_record_field path "fields" value in
       decode_typed_expr path value (Core.CRecord fields)
+  | "record_update" ->
+      let decode_record_field field_path field =
+        let* name = string_field field_path "name" field in
+        let* item = decode_expr_field field_path "value" field in
+        Ok (name, item)
+      in
+      let* base = decode_expr_field path "base" value in
+      let* fields = list_field decode_record_field path "fields" value in
+      (match base.Core.desc with
+      | Core.CVar _ ->
+          decode_typed_expr path value (Core.CRecordUpdate (base, fields))
+      | _ ->
+          error (path_field path "base")
+            "record update base must be a variable expression")
   | "let" -> decode_let_expr path value
   | "borrow_let" -> decode_borrow_let_expr path value
   | "seq" ->
@@ -1409,6 +1423,196 @@ let rec decode_union_payload_storage path index = function
       in
       Ok (current @ remaining)
 
+type record_storage =
+  | ValueRecordStorage
+  | HeapRecordStorage
+
+let same_record_storage left right =
+  match (left, right) with
+  | ValueRecordStorage, ValueRecordStorage
+  | HeapRecordStorage, HeapRecordStorage ->
+      true
+  | _ -> false
+
+let decode_record_type_shape shapes path value =
+  let* tag = kind path value in
+  let* name = string_field path "name" value in
+  match tag with
+  | "value_record" -> Ok (name, ValueRecordStorage)
+  | "heap_record" -> Ok (name, HeapRecordStorage)
+  | "named" -> (
+      match Hashtbl.find_opt shapes name with
+      | Some storage -> Ok (name, storage)
+      | None ->
+          error path
+            (Printf.sprintf
+               "record update type `%s` has no matching record declaration"
+               name))
+  | _ ->
+      error path
+        "record update type must identify a declared value or heap record"
+
+let validate_record_update_storage_shapes
+    (program : decoded_program) value =
+  let shapes = Hashtbl.create 16 in
+  let rec collect_decl (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDRecord record ->
+        Hashtbl.replace shapes record.record_name
+          (if record.record_is_value then ValueRecordStorage
+           else HeapRecordStorage)
+    | Core.CDPrivate inner -> collect_decl inner
+    | _ -> ()
+  in
+  List.iter collect_decl program.core;
+  let validate_update path update =
+    let* result_type = field path "type" update in
+    let result_type_path = path_field path "type" in
+    let* result_name, result_storage =
+      decode_record_type_shape shapes result_type_path result_type
+    in
+    let* base = field path "base" update in
+    let base_path = path_field path "base" in
+    let* base_type = field base_path "type" base in
+    let base_type_path = path_field base_path "type" in
+    let* base_name, base_storage =
+      decode_record_type_shape shapes base_type_path base_type
+    in
+    if
+      not
+        (String.equal base_name result_name
+        && same_record_storage base_storage result_storage)
+    then
+      error base_type_path
+        "record update base and result must have the same record type and storage"
+    else
+      match Hashtbl.find_opt shapes result_name with
+      | Some declared_storage
+        when same_record_storage declared_storage result_storage ->
+          Ok ()
+      | Some _ ->
+          let storage_name =
+            match result_storage with
+            | ValueRecordStorage -> "value-record"
+            | HeapRecordStorage -> "heap-record"
+          in
+          error result_type_path
+            (Printf.sprintf
+               "record update type `%s` has no matching %s declaration"
+               result_name storage_name)
+      | None ->
+          error result_type_path
+            (Printf.sprintf
+               "record update type `%s` has no matching record declaration"
+               result_name)
+  in
+  let rec validate_tree path = function
+    | Lsp_json.Object fields as object_value ->
+        let* () =
+          match List.assoc_opt "kind" fields with
+          | Some (Lsp_json.String "record_update") ->
+              validate_update path object_value
+          | _ -> Ok ()
+        in
+        let rec validate_fields = function
+          | [] -> Ok ()
+          | (name, child) :: rest ->
+              let* () = validate_tree (path_field path name) child in
+              validate_fields rest
+        in
+        validate_fields fields
+    | Lsp_json.Array items ->
+        let rec validate_items index = function
+          | [] -> Ok ()
+          | child :: rest ->
+              let* () = validate_tree (path_index path index) child in
+              validate_items (index + 1) rest
+        in
+        validate_items 0 items
+    | _ -> Ok ()
+  in
+  validate_tree "program" value
+
+let validate_record_update_shapes (program : decoded_program) =
+  let shapes = Hashtbl.create 16 in
+  let rec collect_decl (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDRecord record ->
+        Hashtbl.replace shapes record.record_name
+          (List.map (fun field -> field.Ast.field_name) record.record_fields)
+    | Core.CDPrivate inner -> collect_decl inner
+    | _ -> ()
+  in
+  List.iter collect_decl program.core;
+  let validate_expr path expr =
+    let violation =
+      Core.fold_tree
+        (fun existing node ->
+          match existing with
+          | Some _ -> existing
+          | None -> (
+              match node.Core.desc with
+              | Core.CRecordUpdate (_, fields) -> (
+                  match node.ty with
+                  | Ast.TyNamed (record_name, _) -> (
+                      let actual = List.map fst fields in
+                      match Hashtbl.find_opt shapes record_name with
+                      | Some expected when actual = expected -> None
+                      | Some _ ->
+                          Some
+                            (Printf.sprintf
+                               "record update for `%s` must contain every \
+                                declared field exactly once in declaration \
+                                order"
+                               record_name)
+                      | None ->
+                          Some
+                            (Printf.sprintf
+                               "record update type `%s` has no matching record \
+                                declaration"
+                               record_name))
+                  | _ ->
+                      Some
+                        "record update type must be a value or heap record")
+              | _ -> None))
+        None expr
+    in
+    match violation with
+    | Some message -> error path message
+    | None -> Ok ()
+  in
+  let rec validate_decl index (decl : Core.core_decl) =
+    let path = Printf.sprintf "program.decls[%d]" index in
+    match decl.cd_desc with
+    | Core.CDFunc { cf_body = Some body; _ } ->
+        validate_expr (path ^ ".body") body
+    | Core.CDVar global -> validate_expr (path ^ ".init") global.cv_init
+    | Core.CDImpl impl ->
+        let rec validate_methods method_index = function
+          | [] -> Ok ()
+          | method_ :: rest ->
+              let* () =
+                match method_.Core.cf_body with
+                | Some body ->
+                    validate_expr
+                      (Printf.sprintf "%s.methods[%d].body" path method_index)
+                      body
+                | None -> Ok ()
+              in
+              validate_methods (method_index + 1) rest
+        in
+        validate_methods 0 impl.ci_methods
+    | Core.CDPrivate inner -> validate_decl index inner
+    | _ -> Ok ()
+  in
+  let rec validate_decls index = function
+    | [] -> Ok ()
+    | decl :: rest ->
+        let* () = validate_decl index decl in
+        validate_decls (index + 1) rest
+  in
+  validate_decls 0 program.core
+
 let decode_program value =
   let path = "program" in
   let* tag = kind path value in
@@ -1420,6 +1624,9 @@ let decode_program value =
       decode_union_payload_storage (path_field path "decls") 0 decls
     in
     let* foreign_includes = string_list_field path "foreign_includes" value in
-    Ok { core; foreign_includes; union_payload_storage }
+    let program = { core; foreign_includes; union_payload_storage } in
+    let* () = validate_record_update_storage_shapes program value in
+    let* () = validate_record_update_shapes program in
+    Ok program
 
 let decode_error_to_string error = error.path ^ ": " ^ error.message

@@ -6,9 +6,20 @@
 import:
 	../stage_09_core/compiler_core_json: CoreProgram, core_program_to_json
 	../stage_09_core/compiler_core_pipeline:
-		PreparedCoreProgram,
+		PreparedCoreProgram(PreparedCore),
 		run_core_pipeline_stage,
 		run_pre_dce_tail,
+	../stage_09_core/compiler_core_pipeline_stage:
+		CorePipelineStage(
+			ClosureStage,
+			FinalStage,
+			PerceusStage,
+			PostClosureTailStage,
+			PostPerceusTailStage,
+			PreClosureTailStage,
+			ReuseStage,
+		),
+	../stage_09_core/compiler_core_record_update: record_update_carrier_survives
 	compiler_cli_core_observation: CliCoreObservation
 	compiler_cli_stage_requests:
 		CliLateCoreStageAction(
@@ -16,12 +27,13 @@ import:
 			ObserveLateCoreStage,
 			StopLateCoreStage,
 		),
-		CliLateCoreStageRequest
+		CliLateCoreStageRequest,
 
 
 union CliLateCoreExecution:
 	CliLateCoreCompleted(PreparedCoreProgram, List[CliCoreObservation])
 	CliLateCoreStopped(String, String, List[CliCoreObservation])
+	CliLateCoreFailed(String, String)
 
 
 private pure func observes_late_stage(action: CliLateCoreStageAction) -> Bool:
@@ -44,35 +56,83 @@ private pure func stops_at_late_stage(action: CliLateCoreStageAction) -> Bool:
 			False
 
 
+private pure func requires_materialized_record_updates(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PerceusStage:
+			True
+		PostPerceusTailStage:
+			True
+		PreClosureTailStage:
+			True
+		ReuseStage:
+			True
+		ClosureStage:
+			True
+		PostClosureTailStage:
+			True
+		FinalStage:
+			True
+		_:
+			False
+
+
+pure func late_core_record_update_invariant(
+	stage: CorePipelineStage,
+	program: CoreProgram,
+) -> Option[String]:
+	if requires_materialized_record_updates(stage) and record_update_carrier_survives(program):
+		Some("record update survived ownership normalization")
+	else:
+		None
+
+
 pure func execute_late_core_stages(
 	pre_dce_core: CoreProgram,
 	observations: List[CliCoreObservation],
 	stages: List[CliLateCoreStageRequest],
+	check_invariants: Bool,
 ) -> CliLateCoreExecution:
 	match stages:
 		[]:
-			CliLateCoreCompleted(
-				run_pre_dce_tail(pre_dce_core),
-				observations,
-			)
+			completed: PreparedCoreProgram = run_pre_dce_tail(pre_dce_core)
+
+			match completed:
+				PreparedCore(program):
+					match late_core_record_update_invariant(FinalStage, program):
+						Some(detail):
+							CliLateCoreFailed("final", detail)
+						None:
+							CliLateCoreCompleted(completed, observations)
 		[stage, ...remaining]:
 			transformed: CoreProgram = run_core_pipeline_stage(stage.stage, pre_dce_core)
-			rendered: String = core_program_to_json(transformed).to_string()
-			updated_observations: List[CliCoreObservation] = if observes_late_stage(
-				stage.action,
-			):
-				observations.append({
-					stage_name = stage.name,
-					rendered = rendered
-				})
-			else:
-				observations
 
-			if stops_at_late_stage(stage.action):
-				CliLateCoreStopped(stage.name, rendered, updated_observations)
+			invariant_error: Option[String] = if check_invariants:
+				late_core_record_update_invariant(stage.stage, transformed)
 			else:
-				execute_late_core_stages(
-					pre_dce_core,
-					updated_observations,
-					remaining,
-				)
+				None
+
+			match invariant_error:
+				Some(detail):
+					CliLateCoreFailed(stage.name, detail)
+				None:
+					rendered: String = core_program_to_json(transformed).to_string()
+
+					updated_observations: List[CliCoreObservation] = if observes_late_stage(
+						stage.action,
+					):
+						observations.append({
+							stage_name = stage.name,
+							rendered = rendered,
+						})
+					else:
+						observations
+
+					if stops_at_late_stage(stage.action):
+						CliLateCoreStopped(stage.name, rendered, updated_observations)
+					else:
+						execute_late_core_stages(
+							pre_dce_core,
+							updated_observations,
+							remaining,
+							check_invariants,
+						)

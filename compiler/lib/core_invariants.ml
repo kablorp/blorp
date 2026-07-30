@@ -955,17 +955,15 @@ let check_no_debug_blocks_at (stage : Core_stage.t) (prog : Core.core_program) :
    Post-desugar: no sugar constructors survive
    ============================================================================ *)
 
-(** After Blorp desugaring, no sugar constructors should survive.
-    [CStringInterp] and [CRecordUpdate] are handled before this boundary. A surviving sugar node
-    means a lowering/desugaring path missed a case and emit would otherwise
-    need a phase-violating fallback. *)
+(** After Blorp desugaring, string interpolation should not survive. Record
+    updates remain explicit through the semantic-middle bridge so the
+    Blorp-owned ownership tail can retain their allocation provenance. *)
 let check_no_sugar (prog : Core.core_program) : Core_error.t list =
   fold_program
     (fun acc e ->
       let name_opt =
         match e.Core.desc with
         | Core.CStringInterp _ -> Some "CStringInterp"
-        | Core.CRecordUpdate _ -> Some "CRecordUpdate"
         | _ -> None
       in
       match name_opt with
@@ -981,6 +979,31 @@ let check_no_sugar (prog : Core.core_program) : Core_error.t list =
           in
           v :: acc
       | None -> acc)
+    [] prog
+  |> List.rev
+
+(* ============================================================================
+   Perceus ingress: record updates have been classified for ownership
+   ============================================================================ *)
+
+(** Record updates remain explicit through the semantic-middle bridge, but the
+    Blorp-owned ownership tail must classify them as fresh construction or
+    runtime-guarded reuse before Perceus assigns retain/drop behavior. A
+    surviving carrier would bypass that ownership decision and is therefore
+    invalid at Perceus and later boundaries. *)
+let check_no_record_updates_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CRecordUpdate _ ->
+          violation_at stage e.loc
+            ~hint:
+              "The Blorp record-update normalization pass must classify every \
+               record update before Perceus ownership analysis."
+            "record update survived ownership normalization"
+          :: acc
+      | _ -> acc)
     [] prog
   |> List.rev
 
@@ -1864,6 +1887,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
   | Core_stage.Match -> check_no_cmatcharms prog
   | Core_stage.Perceus ->
       check_no_sugar prog @ check_no_cmatcharms prog
+      @ check_no_record_updates_at stage prog
       @ check_raw_tensor_views_at stage prog (* bookend *)
       @ check_call_ownership_contracts_at stage prog
       @ check_resource_scope_contracts_at stage prog
@@ -1871,6 +1895,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
   | Core_stage.Final ->
       check_no_debug_blocks_at stage prog
       @ check_no_sugar prog @ check_no_cmatcharms prog
+      @ check_no_record_updates_at stage prog
       @ check_no_ckunknown_at stage prog
       @ check_no_layoutless_list_alloc_at stage prog
       @ check_no_codegen_unprepared_forms_at stage prog

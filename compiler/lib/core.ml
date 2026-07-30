@@ -10,9 +10,10 @@
       types is invalid. This is the key difference from [Ast.expr], which
       allows [expr_type = None].
 
-    - {b Smaller than AST.} Syntactic sugar ([ERecordUpdate], [EStringInterp],
-      [ESubscript*]) is desugared during lowering. Core is the
-      minimum set of nodes the backend needs to emit correct code.
+    - {b Smaller than AST.} Most syntactic sugar ([EStringInterp],
+      [ESubscript*]) is desugared during lowering. Record updates retain a
+      narrow explicit carrier until ownership analysis so the late Core tail
+      can distinguish update provenance from ordinary record construction.
 
     - {b Let-normal sequencing.} Statement sequencing uses [CLet] (for
       bindings) and [CSeq] (for discarded intermediate results). Blocks
@@ -550,7 +551,12 @@ and desc =
   | CRecord of (string * core) list  (** [{field = val, ...}] *)
   | CRecordConstruct of record_construct
   | CRecordUpdate of core * (string * core) list
-      (** [{ base | f = v, ... }] — sugar, desugar pass eliminates later *)
+      (** [{ base | f = v, ... }]. This explicit carrier preserves update
+          provenance through the semantic-middle bridge. The base must be a
+          variable and the fields are the complete checked record shape in
+          declaration order. The Blorp late-Core tail classifies it as fresh
+          construction or a runtime-guarded self-replacement reuse candidate
+          before ownership analysis. *)
   | CRange of core * core  (** [start..end] (exclusive) *)
   | CLambda of lambda  (** anonymous function *)
   (* === Computation === *)

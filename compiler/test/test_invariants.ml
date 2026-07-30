@@ -694,8 +694,8 @@ let test_debug_check_passes_on_clean_program () =
   Alcotest.(check int) "no violations" 0 (List.length violations)
 
 (* ============================================================================
-   Post-desugar: no sugar nodes (CStringInterp / CRecordUpdate). The dispatcher
-   also runs this check at Desugar and Perceus as a bookend.
+   Post-desugar: no string interpolation sugar. Record updates remain explicit
+   through the semantic-middle bridge for the Blorp-owned ownership tail.
    ============================================================================ *)
 
 let test_sugar_check_flags_cstringinterp () =
@@ -716,6 +716,61 @@ let test_sugar_check_passes_on_clean_program () =
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
   let violations = Core_invariants.check_no_sugar prog in
   Alcotest.(check int) "no violations" 0 (List.length violations)
+
+let test_sugar_check_allows_record_update_carrier () =
+  let point_ty = TyNamed ("Point", []) in
+  let base = mk (CVar (Var.named "point")) point_ty in
+  let update =
+    mk
+      (CRecordUpdate (base, [ ("x", mk (CLit (LitInt 1L)) ty_int) ]))
+      point_ty
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:update) ] in
+  let violations = Core_invariants.check_no_sugar prog in
+  Alcotest.(check int) "record update remains explicit" 0 (List.length violations)
+
+let record_update_program () =
+  let point_ty = TyNamed ("Point", []) in
+  let base = mk (CVar (Var.named "point")) point_ty in
+  let update =
+    mk
+      (CRecordUpdate (base, [ ("x", mk (CLit (LitInt 1L)) ty_int) ]))
+      point_ty
+  in
+  mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:update) ]
+
+let test_record_update_check_allows_pre_perceus_carrier () =
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Dce (record_update_program ())
+  in
+  Alcotest.(check int) "record update remains explicit" 0
+    (List.length violations)
+
+let test_record_update_check_rejects_perceus_carrier () =
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Perceus (record_update_program ())
+  in
+  match violations with
+  | [ violation ] ->
+      Alcotest.(check bool)
+        "mentions ownership normalization" true
+        (Modules.contains violation.Core_error.msg "ownership normalization");
+      Alcotest.(check bool)
+        "phase tag is Perceus" true
+        (violation.Core_error.phase = Core_error.Stage Core_stage.Perceus)
+  | _ -> Alcotest.fail "expected one record-update violation at Perceus"
+
+let test_record_update_check_rejects_final_carrier () =
+  let violations =
+    Core_invariants.run_for_stage Core_stage.Final (record_update_program ())
+  in
+  Alcotest.(check bool)
+    "record update rejected at Final" true
+    (List.exists
+       (fun violation ->
+         Modules.contains violation.Core_error.msg "ownership normalization"
+         && violation.Core_error.phase = Core_error.Stage Core_stage.Final)
+       violations)
 
 (* ============================================================================
    Post-match: no raw CMatchArms survives
@@ -2299,6 +2354,14 @@ let suite =
           test_sugar_check_flags_cstringinterp;
         Alcotest.test_case "clean passes" `Quick
           test_sugar_check_passes_on_clean_program;
+        Alcotest.test_case "allows record update carrier" `Quick
+          test_sugar_check_allows_record_update_carrier;
+        Alcotest.test_case "allows record update before Perceus" `Quick
+          test_record_update_check_allows_pre_perceus_carrier;
+        Alcotest.test_case "rejects record update at Perceus" `Quick
+          test_record_update_check_rejects_perceus_carrier;
+        Alcotest.test_case "rejects record update at Final" `Quick
+          test_record_update_check_rejects_final_carrier;
       ] );
     ( "debug",
       [

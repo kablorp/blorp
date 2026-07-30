@@ -1,0 +1,305 @@
+-- Preserve record-update intent through the semantic-middle bridge, then
+-- classify it immediately before ownership analysis. A canonical mutable
+-- self-update transfers the target's old owner into RecordReuseExpr. Every
+-- other update recovers the existing fresh-construction form.
+import:
+	compiler_core_json:
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl),
+		CoreExpr(
+			AssignExpr,
+			LetExpr,
+			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			SeqExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreSourceLoc,
+		CoreType(HeapRecordType),
+		CoreVar,
+	compiler_core_traverse as CoreTraverse
+
+
+private pure func same_var(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func same_heap_record_type(left: CoreType, right: CoreType) -> Bool:
+	match (left, right):
+		(HeapRecordType(left_name), HeapRecordType(right_name)):
+			left_name == right_name
+		_:
+			False
+
+
+private pure func replace_var(expr: CoreExpr, source: CoreVar, replacement: CoreVar) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				func(item): replace_var(item, source, replacement),
+			)
+		_:
+			mapped: CoreExpr = CoreTraverse.map_core_expr_children(
+				expr,
+				func(child): replace_var(child, source, replacement),
+			)
+
+			match mapped:
+				VarExpr(variable, typ, loc):
+					if same_var(variable, source):
+						VarExpr(replacement, typ, loc)
+					else:
+						mapped
+				_:
+					mapped
+
+
+private pure func replace_record_field_var(
+	field: CoreRecordFieldValue,
+	source: CoreVar,
+	replacement: CoreVar,
+) -> CoreRecordFieldValue:
+	{ field | value = replace_var(field.value, source, replacement) }
+
+
+private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
+	match expr:
+		AssignExpr(variable, _, _, _):
+			if same_var(variable, target):
+				True
+			else:
+				CoreTraverse
+					.immediate_core_expr_children(expr)
+					.any(func(child): expr_assigns_var(child, target))
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+
+			(
+				spine.preceding_items.any(func(item): expr_assigns_var(item, target))
+				or expr_assigns_var(spine.final_item, target)
+			)
+		_:
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.any(func(child): expr_assigns_var(child, target))
+
+
+private pure func record_fields_assign_var(
+	fields: List[CoreRecordFieldValue],
+	target: CoreVar,
+) -> Bool:
+	fields.any(func(field): expr_assigns_var(field.value, target))
+
+
+private pure func declared_heap_record_names(decls: List[CoreDecl]) -> List[String]:
+	var names: List[String] = []
+
+	for decl in decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				names = names.append(record_decl.name)
+			_:
+				void
+
+	names
+
+
+private pure func declared_heap_record_type(record_names: List[String], typ: CoreType) -> Bool:
+	match typ:
+		HeapRecordType(name):
+			record_names.contains(name)
+		_:
+			False
+
+
+private pure func materialize_record_update(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordExpr(fields, typ, loc)
+		_:
+			expr
+
+
+private pure func materialize_mapped_record_update(
+	record_names: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	materialize_record_update(CoreTraverse.map_core_expr_children(
+			expr,
+			func(child): prepare_record_update_expr(record_names, child),
+		))
+
+
+private pure func prepare_canonical_record_update(
+	record_names: List[String],
+	expr: CoreExpr,
+	target: CoreVar,
+	update_base: CoreVar,
+	binding_type: CoreType,
+	source: CoreVar,
+	source_type: CoreType,
+	source_loc: CoreSourceLoc,
+	body: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match body:
+		RecordUpdateExpr(base, fields, result_type, update_loc):
+			match base:
+				VarExpr(carrier_base, carrier_base_type, _):
+					if (
+						same_var(target, source)
+						and same_var(update_base, carrier_base)
+						and same_heap_record_type(binding_type, source_type)
+						and same_heap_record_type(binding_type, carrier_base_type)
+						and same_heap_record_type(binding_type, result_type)
+						and declared_heap_record_type(record_names, result_type)
+						and not record_fields_assign_var(fields, target)
+					):
+						prepared_fields: List[CoreRecordFieldValue] = fields.map(
+							func(
+								field,
+							): { field |
+								value = prepare_record_update_expr(record_names, field.value)
+							},
+						)
+						reused_fields: List[CoreRecordFieldValue] = prepared_fields.map(
+							func(field): replace_record_field_var(field, update_base, target),
+						)
+
+						AssignExpr(
+							target,
+							RecordReuseExpr(
+								VarExpr(target, source_type, source_loc),
+								reused_fields,
+								result_type,
+								update_loc,
+							),
+							typ,
+							loc,
+						)
+					else:
+						materialize_mapped_record_update(record_names, expr)
+				_:
+					materialize_mapped_record_update(record_names, expr)
+		_:
+			materialize_mapped_record_update(record_names, expr)
+
+
+private pure func prepare_record_update_expr(
+	record_names: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				func(item): prepare_record_update_expr(record_names, item),
+			)
+		AssignExpr(target, rhs, typ, loc):
+			match rhs:
+				LetExpr(update_base, False, binding_type, initial, body):
+					match initial:
+						VarExpr(source, source_type, source_loc):
+							prepare_canonical_record_update(
+								record_names,
+								expr,
+								target,
+								update_base,
+								binding_type,
+								source,
+								source_type,
+								source_loc,
+								body,
+								typ,
+								loc,
+							)
+						_:
+							materialize_mapped_record_update(record_names, expr)
+				_:
+					materialize_mapped_record_update(record_names, expr)
+		_:
+			materialize_mapped_record_update(record_names, expr)
+
+
+private pure func lower_record_update_function(
+	record_names: List[String],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	body: Option[CoreExpr] = match function_info.body:
+		Some(expr):
+			Some(prepare_record_update_expr(record_names, expr))
+		None:
+			None
+
+	{ function_info | body = body }
+
+
+private pure func lower_record_update_decl(record_names: List[String], decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(lower_record_update_function(record_names, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = prepare_record_update_expr(record_names, global.init) })
+		ImplDecl(impl):
+			ImplDecl(
+				{ impl |
+					methods = impl.methods.map(
+						func(method): lower_record_update_function(record_names, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func lower_record_updates_for_ownership(program: CoreProgram) -> CoreProgram:
+	record_names: List[String] = declared_heap_record_names(program.decls)
+	{ program |
+		decls = program.decls.map(func(decl): lower_record_update_decl(record_names, decl))
+	}
+
+
+private pure func expr_contains_record_update(expr: CoreExpr) -> Bool:
+	match expr:
+		RecordUpdateExpr(_, _, _, _):
+			True
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+
+			(
+				spine.preceding_items.any(expr_contains_record_update)
+				or expr_contains_record_update(spine.final_item)
+			)
+		_:
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.any(expr_contains_record_update)
+
+
+private pure func function_contains_record_update(function_info: CoreFunction) -> Bool:
+	match function_info.body:
+		Some(body):
+			expr_contains_record_update(body)
+		None:
+			False
+
+
+private pure func decl_contains_record_update(decl: CoreDecl) -> Bool:
+	match decl:
+		FunctionDecl(function_info):
+			function_contains_record_update(function_info)
+		GlobalDecl(global):
+			expr_contains_record_update(global.init)
+		ImplDecl(impl):
+			impl.methods.any(function_contains_record_update)
+		_:
+			False
+
+
+pure func record_update_carrier_survives(program: CoreProgram) -> Bool:
+	program.decls.any(decl_contains_record_update)

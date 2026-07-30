@@ -130,6 +130,24 @@ The late-Core projection preserves scoped `let`/`borrow` expressions inside
 closure-call arguments. The Blorp-owned closure and preparation stages, rather
 than the projection boundary, own their final normalization for C emission.
 
+Record updates also cross the semantic-middle bridge as explicit
+`RecordUpdateExpr` nodes. Lowering evaluates the source receiver once, binds it
+to a temporary, and stores that variable plus the complete checked field list
+in declaration order. This preserves update provenance and makes ownership
+normalization total after monomorphization without rediscovering record shape.
+At Perceus ingress, a canonical mutable self-replacement becomes
+`RecordReuseExpr`; every other carrier becomes ordinary fresh record
+construction. Perceus transfers the replaced binding's owner into the reuse
+node and retains managed field aliases as needed. The post-Perceus reuse pass
+also recognizes an adjacent same-type `RecordExpr`/ARC-drop pair, where the
+source owner is provably dead after every replacement field has been evaluated,
+and replaces that pair with `RecordReuseExpr`. This covers dead chained-update
+temporaries without guessing about source syntax or liveness. The backend
+evaluates fields before consuming the source and reuses the old allocation only
+when its runtime reference count is unique; otherwise it constructs a fresh
+record. This changes allocation counts without changing source-level value
+semantics.
+
 The Blorp CLI is built by a separately packaged immutable
 `blorp-bootstrap-compiler`. Its legacy typed-AST/Core-lowering implementation
 is binary trust-root material, not source in the current OCaml host and not a

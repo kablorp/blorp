@@ -121,6 +121,8 @@ import:
 			RangeExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
@@ -312,6 +314,10 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 		ListSwapExpr(swap, typ, loc):
 			False
 		RecordExpr(fields, typ, loc):
+			False
+		RecordUpdateExpr(base, fields, typ, loc):
+			False
+		RecordReuseExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -712,6 +718,35 @@ private pure func record_fields_touch_var(
 	touched
 
 
+private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
+	match expr:
+		AssignExpr(variable, rhs, typ, loc):
+			if core_var_equal(variable, target):
+				True
+			else:
+				CoreTraverse
+					.immediate_core_expr_children(expr)
+					.any(func(child): expr_assigns_var(child, target))
+		SeqExpr(first, second):
+			spine = CoreTraverse.split_core_sequence(expr)
+
+			(
+				spine.preceding_items.any(func(item): expr_assigns_var(item, target))
+				or expr_assigns_var(spine.final_item, target)
+			)
+		_:
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.any(func(child): expr_assigns_var(child, target))
+
+
+private pure func record_fields_assign_var(
+	fields: List[CoreRecordFieldValue],
+	target: CoreVar,
+) -> Bool:
+	fields.any(func(field): expr_assigns_var(field.value, target))
+
+
 private pure func exprs_touch_var(exprs: List[CoreExpr], target: CoreVar) -> Bool:
 	CoreTraverse.any_core_expr(exprs, func(expr): owner_touched(target, expr))
 
@@ -843,6 +878,10 @@ private pure func owner_touched(target: CoreVar, expr: CoreExpr) -> Bool:
 			)
 		RecordExpr(fields, typ, loc):
 			record_fields_touch_var(fields, target)
+		RecordUpdateExpr(base, fields, typ, loc):
+			owner_touched(target, base) or record_fields_touch_var(fields, target)
+		RecordReuseExpr(source, fields, typ, loc):
+			owner_touched(target, source) or record_fields_touch_var(fields, target)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_touch_var(fields, target)
 		UnionConstructExpr(construct, typ, loc):
@@ -1052,6 +1091,10 @@ private pure func contains_resource_scope(expr: CoreExpr) -> Bool:
 			contains_resource_scope(swap.list)
 		RecordExpr(fields, typ, loc):
 			False
+		RecordUpdateExpr(base, fields, typ, loc):
+			contains_resource_scope(base)
+		RecordReuseExpr(source, fields, typ, loc):
+			contains_resource_scope(source)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -1271,6 +1314,10 @@ private pure func is_collection_allocation(expr: CoreExpr) -> Bool:
 		ListSwapExpr(swap, typ, loc):
 			False
 		RecordExpr(fields, typ, loc):
+			False
+		RecordUpdateExpr(base, fields, typ, loc):
+			False
+		RecordReuseExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -1508,6 +1555,10 @@ private pure func reuse_alloc_rhs(
 			None
 		RecordExpr(fields, typ, loc):
 			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -1696,6 +1747,10 @@ private pure func consume_handoff_rhs(
 			None
 		RecordExpr(fields, typ, loc):
 			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -1773,6 +1828,56 @@ private pure func consume_handoff_rhs(
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			None
 		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+private pure func heap_record_reuse_compatible(
+	dropped_type: CoreType,
+	allocation_type: CoreType,
+) -> Bool:
+	match (dropped_type, allocation_type):
+		(HeapRecordType(dropped_name), HeapRecordType(allocation_name)):
+			dropped_name == allocation_name
+		_:
+			False
+
+
+private pure func is_arc_release_policy(release_policy: CoreReleasePolicy) -> Bool:
+	match release_policy:
+		ArcReleasePolicy:
+			True
+		_:
+			False
+
+
+-- This rewrite runs after Perceus, so the adjacent DropExpr proves that the
+-- source owner survives every field evaluation and dies with the fresh result.
+-- RecordReuseExpr preserves that order: fields first, source consumption last.
+private pure func reuse_dropped_record_rhs(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	release_policy: CoreReleasePolicy,
+	rhs: CoreExpr,
+) -> Option[CoreExpr]:
+	match rhs:
+		RecordExpr(fields, allocation_type, loc):
+			if (
+				heap_record_reuse_compatible(dropped_type, allocation_type)
+				and is_arc_release_policy(release_policy)
+				and not record_fields_assign_var(fields, dropped_var)
+				and not contains_resource_scope(rhs)
+			):
+				Some(
+					RecordReuseExpr(
+						var_expr(dropped_var, dropped_type),
+						fields,
+						allocation_type,
+						loc,
+					),
+				)
+			else:
+				None
+		_:
 			None
 
 
@@ -1937,6 +2042,10 @@ private pure func rewrite_drop_body(
 		ListSwapExpr(swap, typ, loc):
 			None
 		RecordExpr(fields, typ, loc):
+			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -2196,6 +2305,10 @@ private pure func consume_handoff_in_linear_expr(
 			None
 		RecordExpr(fields, typ, loc):
 			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -2294,21 +2407,30 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 							Some(handoff):
 								rewrite_post_perceus_expr(handoff)
 							None:
-								match consume_handoff_in_linear_expr(
+								match reuse_dropped_record_rhs(
 									dropped_var,
 									dropped_type,
+									release_policy,
 									rhs,
 								):
 									Some(rewritten_rhs):
 										rewrite_post_perceus_expr(rewritten_rhs)
 									None:
-										LetExpr(
-											variable,
-											is_mutable,
-											value_type,
-											rewrite_post_perceus_expr(rhs),
-											rewrite_post_perceus_expr(body),
-										)
+										match consume_handoff_in_linear_expr(
+											dropped_var,
+											dropped_type,
+											rhs,
+										):
+											Some(rewritten_rhs):
+												rewrite_post_perceus_expr(rewritten_rhs)
+											None:
+												LetExpr(
+													variable,
+													is_mutable,
+													value_type,
+													rewrite_post_perceus_expr(rhs),
+													rewrite_post_perceus_expr(body),
+												)
 					else:
 						LetExpr(
 							variable,
@@ -2458,6 +2580,10 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 				ListSwapExpr(swap, typ, loc):
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
 				RecordExpr(fields, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RecordUpdateExpr(base, fields, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RecordReuseExpr(source, fields, typ, loc):
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
 				RecordConstructExpr(type_name, fields, typ, loc):
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
@@ -2641,7 +2767,7 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		VectorExpr(items, typ, loc):
 			expr
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ClosureCreateExpr(closure, typ, loc):
 			expr
 		ListConstructExpr(construct, typ, loc):
@@ -2651,7 +2777,7 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		ListGetExpr(get, typ, loc):
 			expr
 		ListHandoffExpr(handoff, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ListHandoffSetOwnedExpr(set, typ, loc):
 			expr
 		ListHandoffSetSourceSlotExpr(set, typ, loc):
@@ -2677,7 +2803,7 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		TensorRawWriteExpr(write, typ, loc):
 			expr
 		TensorRawViewLetExpr(binding, body, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		DictConstructExpr(construct, typ, loc):
 			expr
 		DictExpr(entries, typ, loc):
@@ -2692,6 +2818,10 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 			expr
 		RecordExpr(fields, typ, loc):
 			expr
+		RecordUpdateExpr(base, fields, typ, loc):
+			expr
+		RecordReuseExpr(source, fields, typ, loc):
+			expr
 		RecordConstructExpr(type_name, fields, typ, loc):
 			expr
 		UnionConstructExpr(construct, typ, loc):
@@ -2699,67 +2829,74 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		UnionReuseConstructExpr(construct, typ, loc):
 			expr
 		PreClosureDetachExpr(detached, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		DetachExpr(detached, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			DupExpr(variable, value_type, retain_policy, rewrite_post_perceus_expr(body), typ, loc)
 		WhileExpr(cond, body, typ, loc):
-			expr
+			WhileExpr(rewrite_post_perceus_expr(cond), rewrite_post_perceus_expr(body), typ, loc)
 		BreakExpr(typ, loc):
 			expr
 		ContinueExpr(typ, loc):
 			expr
 		ResourceScopeExpr(scope, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ResourceCleanupExitExpr(exit, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		TailrecLoopExpr(params, return_type, body, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		TailrecRecurExpr(args, typ, loc):
 			expr
 		TailrecListSpreadLoopExpr(loop, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
 			expr
-		ForRangeExpr(binder, start, end, step, typ, loc):
-			expr
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				rewrite_post_perceus_expr(start),
+				rewrite_post_perceus_expr(end_value),
+				rewrite_post_perceus_expr(body),
+				typ,
+				loc,
+			)
 		ForChannelExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForListExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForStringExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForDictExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForSetExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForStreamExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForResourceSourceExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ForTensorExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ConcurrentlyLoopExpr(loop, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		PreClosureConcurrentExpr(block, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ConcurrentExpr(block, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		SelectExpr(selection, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		RangeExpr(start, end, typ, loc):
 			expr
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			expr
+			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 
 
 pure func rewrite_post_perceus_function(func_info: CoreFunction) -> CoreFunction:
@@ -3216,6 +3353,16 @@ pure func result_may_alias_source(
 			True
 		RecordExpr(fields, typ, loc):
 			record_fields_may_alias_source(source_name, aliases, fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, base)
+				or record_fields_may_alias_source(source_name, aliases, fields)
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, source)
+				or record_fields_may_alias_source(source_name, aliases, fields)
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_may_alias_source(source_name, aliases, fields)
 		UnionConstructExpr(construct, typ, loc):
@@ -3690,6 +3837,10 @@ pure func rewrite_prepared_union_result(
 		ListSwapExpr(swap, typ, loc):
 			None
 		RecordExpr(fields, typ, loc):
+			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(record_type_name, fields, typ, loc):
 			None
@@ -4384,6 +4535,10 @@ pure func rewrite_prepared_drop_result(
 				None
 			RecordExpr(fields, typ, loc):
 				None
+			RecordUpdateExpr(base, fields, typ, loc):
+				None
+			RecordReuseExpr(source, fields, typ, loc):
+				None
 			RecordConstructExpr(type_name, fields, typ, loc):
 				None
 			UnionConstructExpr(construct, typ, loc):
@@ -4577,6 +4732,10 @@ private pure func rewrite_prepared_let_drop(
 		ListSwapExpr(swap, typ, loc):
 			None
 		RecordExpr(fields, typ, loc):
+			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -4808,6 +4967,10 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 		ListSwapExpr(swap, typ, loc):
 			expr
 		RecordExpr(fields, typ, loc):
+			expr
+		RecordUpdateExpr(base, fields, typ, loc):
+			expr
+		RecordReuseExpr(source, fields, typ, loc):
 			expr
 		RecordConstructExpr(type_name, fields, typ, loc):
 			expr

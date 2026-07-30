@@ -123,6 +123,39 @@ fields, then reports every target field and record:
 benchmarks/compiler_enum_field_layout
 ```
 
+### Record Update Allocations
+
+`compiler_record_update_allocations` runs a bounded, uniquely owned heap-record
+update loop through the production compiler and reports runtime allocation
+counters:
+
+```bash
+benchmarks/compiler_record_update_allocations
+BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
+  benchmarks/compiler_record_update_allocations
+```
+
+The normal invocation asserts the optimized one-allocation baseline. Override
+`BLORP_RECORD_UPDATE_EXPECT_ALLOCATIONS` to lock in a new expected count. Set
+`BLORP_RECORD_UPDATE_MEASURE_ONLY=1` while intentionally measuring an
+optimization that is expected to change the count. Both probes always assert
+their release and live-object baselines; use
+`BLORP_RECORD_UPDATE_EXPECT_RELEASES` and
+`BLORP_RECORD_UPDATE_EXPECT_CURRENT_OBJECTS` only when intentionally changing
+those lifecycle counts.
+
+`compiler_record_update_temporary_reuse_allocations` measures a nested update in
+the same loop. The source form historically allocated two records per
+iteration. The probe asserts `100001` allocations for 100,000 iterations: one
+initial record plus one fallback allocation per iteration, with the dead outer
+temporary reusing the inner update's storage.
+
+```bash
+benchmarks/compiler_record_update_temporary_reuse_allocations
+BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
+  benchmarks/compiler_record_update_temporary_reuse_allocations
+```
+
 ### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through

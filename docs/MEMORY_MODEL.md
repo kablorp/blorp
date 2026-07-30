@@ -8,8 +8,10 @@ blorp aims to minimize the mental load of memory management while maximizing und
 - **`var` means rebinding, not mutation.** You point a name at a new value — the old value is semantically untouched.
 - **COW containers mutate when they can.** Under the hood, lists, strings,
   tensors, dicts, sets, and other runtime-owned buffers can skip a copy when
-  uniquely owned. Plain record update is not a COW path today; it constructs a
-  new record.
+  uniquely owned. A heap-record update that replaces the same mutable binding
+  can also reuse its allocation when the previous record is uniquely owned.
+  Chained updates may reuse an intermediate record after the compiler proves
+  that the intermediate dies at the next update.
 
 That's it. The rest of this document is details.
 
@@ -93,34 +95,38 @@ the managed payload pointer for `Some` and `NULL` for `None`, not a heap
 
 ### Records
 
-Records are heap-allocated. Update syntax constructs a new record:
+Records are heap-allocated. Update syntax produces a new record value:
 
 ```blorp
 record Point { x: Int, y: Int }
 
 p: Point = { x = 1, y = 2 }
-q: Point = { p | x = 10 }      -- allocates a new Point, copies all fields
+q: Point = { p | x = 10 }      -- p remains live, so q uses a fresh allocation
 -- p is still { x = 1, y = 2 }
 -- q is { x = 10, y = 2 }
 ```
 
-All record updates currently materialize a fresh record object, even when you
-rebind the same variable. Unchanged managed fields are retained as needed, and
-the previous record is released by normal ownership cleanup. Collection COW is a
-separate runtime optimization; do not rely on in-place record update for
-performance.
+The compiler recognizes the canonical mutable self-replacement form. If the old
+record is uniquely owned at runtime, the generated code releases its old managed
+fields and installs the complete new field set in the same allocation. If an
+alias is still live, it allocates a fresh record and releases only the replaced
+binding's ownership. After ownership insertion, the compiler may also reuse a
+same-type record that is dropped immediately after all replacement fields are
+evaluated. Other update shapes continue to construct a fresh record. These are
+allocation optimizations only: source-level value semantics do not expose
+object identity, and correctness must not depend on whether reuse occurs.
 
 ```blorp
 var state: GameState = { score = 0, lives = 3, level = 1 }
-state = { state | score = state.score + 10 }   -- constructs a new GameState
+state = { state | score = state.score + 10 }   -- reuses storage when state is unique
 ```
 
-Aliasing remains safe because update syntax always produces a distinct record:
+Aliasing remains safe because a shared record fails the uniqueness check:
 
 ```blorp
 original: Point = { x = 1, y = 2 }
 var working: Point = original
-working = { working | x = 99 }         -- constructs a new Point
+working = { working | x = 99 }         -- original is live, so this allocates
 -- original is still { x = 1, y = 2 }
 ```
 
@@ -217,9 +223,11 @@ for event in events:
 state
 ```
 
-Each iteration allocates a new `GameState`. This is the cost of record immutability — but records are typically small, so the copy is cheap.
-For hot loops over large state, keep the changing fields in local variables or a
-collection designed for COW updates, then build the record at the boundary.
+When `state` is uniquely owned, this canonical self-replacement reuses its
+allocation after the initial record. Keeping another live alias forces a fresh
+allocation for that iteration. For hot loops where aliases are unavoidable,
+keep changing fields in local variables or a collection designed for COW
+updates, then build the record at the boundary.
 
 ### Accumulating with fold
 
@@ -283,14 +291,14 @@ total: Int = numbers.fold_left(0, func(acc, n): acc + n)
 ### 4. Chained record updates in a hot loop
 
 ```blorp
--- CLEAR, but allocates a new Point each iteration today
+-- The initial Point allocates; uniquely owned self-updates reuse it.
 var p: Point = { x = 0, y = 0 }
 for i in range(0, 1000000):
     p = { p | x = p.x + 1 }
 ```
 
-If the record update is on a hot path, use separate local variables or a more
-appropriate data structure:
+Keeping aliases to `p` across the update forces fresh allocations. Separate
+primitive locals remain useful when that ownership shape cannot be avoided:
 
 ```blorp
 -- no record allocation in the loop
@@ -355,10 +363,16 @@ const long x__1 = x + 1;   // mangled name, RHS uses old x
 })
 ```
 
-`CRecordUpdate` is desugared before emission into a temporary binding for the
-base plus a normal record constructor call. Generated C may include retains and
-drops around managed unchanged fields, but it does not use a record-specific COW
-branch.
+Core lowering evaluates the update base once into a temporary and carries that
+variable plus the complete record field shape in `CRecordUpdate`. At Perceus
+ingress, canonical mutable self-replacement becomes `RecordReuseExpr`; other
+updates become normal record constructors. After Perceus makes liveness and
+release policy explicit, the reuse pass also converts a same-type record
+constructor followed immediately by an ARC drop of its source into
+`RecordReuseExpr`. The reuse form emits a runtime uniqueness branch that updates
+the old allocation or constructs a fresh one, with Perceus retains protecting
+managed fields in either path. Replacement fields are evaluated before the
+source is consumed.
 
 **Record alias (retain):**
 ```c
@@ -519,7 +533,7 @@ Pointer-typed captures (strings, lists, records) copy the pointer, not the data.
 |---------|-----------|---------|
 | `var x = x + 1` | New value, same name | Overwrites stack slot |
 | `list.append(4)` | Returns a new list | Mutates in place if unique, copies if shared |
-| `{ rec \| field = v }` | New record with one field changed | Constructs a fresh record today |
+| `{ rec \| field = v }` | New record with one field changed | Eligible self-replacement reuses unique storage; otherwise allocates |
 | `v.set_index(i, x)` | `Option` of a new vector | Mutates in place if unique, copies if shared |
 | Closure capture | Snapshot of values at creation time | Static closure for zero captures; inline env with retained managed captures otherwise |
 | Memory management | Automatic, don't think about it | Perceus-style refcounting; objects freed at refcount 0 |

@@ -4417,7 +4417,31 @@ let rec expr_json ~function_names ~consumed_params ~reg enum_names
       let* alloc_json = set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc in
       let* fields = typed [ ("alloc", alloc_json) ] in
       Ok (kind "set_alloc" fields)
-  | Core.CRecordUpdate _ -> unsupported path "record update"
+  | Core.CRecordUpdate (base, updates) ->
+      let* () =
+        match base.Core.desc with
+        | Core.CVar _ -> Ok ()
+        | _ ->
+            unsupported (path ^ ".base")
+              "record update base must be a variable expression"
+      in
+      let* base_json =
+        expr_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".base") base
+      in
+      let* fields_value =
+        result_list updates (fun index (name, value) ->
+            let field_path = Printf.sprintf "%s.fields[%d]" path index in
+            let* value_json =
+              expr_json ~function_names ~consumed_params ~reg enum_names
+                value_record_names heap_record_names union_names
+                enum_constructors (field_path ^ ".value") value
+            in
+            Ok (obj [ ("name", str name); ("value", value_json) ]))
+      in
+      let* fields = typed [ ("base", base_json); ("fields", fields_value) ] in
+      Ok (kind "record_update" fields)
   | Core.CLambda lambda ->
       let* params =
         closure_params_json ~reg enum_names value_record_names heap_record_names
@@ -6269,6 +6293,15 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CSetAlloc alloc -> require_set_alloc path alloc
   | Core.CListConstruct lc -> require_list_construct path lc
   | Core.CRecord fields -> require_record_literal path expr.ty fields
+  | Core.CRecordUpdate (base, updates) ->
+      let* () =
+        match base.Core.desc with
+        | Core.CVar _ -> Ok ()
+        | _ ->
+            unsupported (path ^ ".base")
+              "record update base must be a variable expression"
+      in
+      require_record_literal path expr.ty updates
   | Core.CRecordConstruct rc -> require_record_construct path rc
   | Core.CUnionConstruct uc -> require_union_construct path uc
   | Core.CLambda _ -> Ok ()
@@ -7054,6 +7087,15 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_list_construct_body ~reg union_names path lc
   | Core.CRecord fields ->
       require_record_literal_body ~reg union_names path expr.ty fields
+  | Core.CRecordUpdate (base, updates) ->
+      let* () =
+        match base.Core.desc with
+        | Core.CVar _ -> Ok ()
+        | _ ->
+            unsupported (path ^ ".base")
+              "record update base must be a variable expression"
+      in
+      require_record_literal_body ~reg union_names path expr.ty updates
   | Core.CRecordConstruct rc ->
       require_record_construct_body ~reg union_names path rc
   | Core.CUnionConstruct uc ->

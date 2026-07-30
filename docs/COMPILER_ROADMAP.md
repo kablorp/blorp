@@ -131,8 +131,12 @@ uniqueness.
 
 ### Workstream B: Escape Analysis And Scalar Replacement
 
-Heap allocation is currently conservative: record updates construct fresh
-records, captured closures allocate, and vectors are heap-backed.
+Heap allocation remains conservative: non-self record updates generally
+construct fresh records, captured closures allocate, and vectors are
+heap-backed. Canonical uniquely owned heap-record self-replacements can already
+reuse their allocation. Post-Perceus reuse also eliminates a same-type fresh
+record when its source is dropped immediately after field evaluation, covering
+dead intermediates in chained updates without escape analysis.
 
 Implement escape facts for:
 
@@ -289,6 +293,10 @@ These remain active but should not grow separate roadmap files.
 - Closure calls, loop/try/detach liveness, and structured-concurrency result
   handoff remain conservative ownership boundaries. General reuse or
   non-atomic RC must not cross them without explicit escape facts.
+- A mutable assignment nested inside a record-update field initializer can leak
+  one overwritten record owner on the fresh-construction fallback path. Record
+  reuse rejects this shape, but Perceus still needs a general nested-assignment
+  balancing fix before it can be optimized.
 - Perceus still performs legacy global-reference repair internally. Resolution
   should own that fact, and ownership passes should consume exact per-body and
   per-lambda reference sets instead of rediscovering them.

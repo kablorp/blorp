@@ -82,6 +82,8 @@ import:
 			RawMatchExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -115,15 +117,19 @@ import:
 			VoidExpr,
 			WhileExpr,
 		),
+		CoreForList,
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
 		CoreListHandoffMode(BorrowFreshHandoff, ConsumeReuseHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreRawMatchCase,
-		CoreReleasePolicy(ArcReleasePolicy),
+		CoreRecordFieldValue,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSemanticMatchTree(
 			SemanticConstructorMatch,
 			SemanticLengthMatch,
@@ -132,7 +138,7 @@ import:
 			SemanticMatchLeaf,
 		),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(NamedType, UnionType, VoidType),
+		CoreType(HeapRecordType, NamedType, UnionType, VoidType),
 		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
@@ -185,8 +191,28 @@ pure func dict_int_string_type() -> CoreType:
 	)
 
 
+pure func heap_record_type(name: String) -> CoreType:
+	HeapRecordType(name)
+
+
 pure func int_expr(value: Int) -> CoreExpr:
 	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func bool_expr(value: Bool) -> CoreExpr:
+	LiteralExpr(
+		BoolLiteral(value),
+		NamedType("Bool", []),
+		SyntheticSourceLoc,
+	)
+
+
+pure func range_loop_binder() -> CoreLoopBinder:
+	{
+		variable = named_var("index"),
+		typ = int_type(),
+		range_direction = RangeForwardOnly
+	}
 
 
 pure func expr_union_field() -> CoreUnionField:
@@ -403,7 +429,11 @@ pure func dropped_allocation_expr(
 	)
 
 
-pure func list_handoff_expr(source_var: CoreVar, result_var: CoreVar) -> CoreExpr:
+pure func list_handoff_expr_with_body(
+	source_var: CoreVar,
+	result_var: CoreVar,
+	body: CoreExpr,
+) -> CoreExpr:
 	ListHandoffExpr(
 		{
 			mode = BorrowFreshHandoff,
@@ -417,11 +447,19 @@ pure func list_handoff_expr(source_var: CoreVar, result_var: CoreVar) -> CoreExp
 			result_var = result_var,
 			len_var = unique_var("__lh_len", 21),
 			out_var = unique_var("__lh_out", 22),
-			body = VoidExpr(VoidType, SyntheticSourceLoc),
+			body = body,
 			write_order = ForwardCompactingHandoff
 		},
 		list_int_type(),
 		SyntheticSourceLoc,
+	)
+
+
+pure func list_handoff_expr(source_var: CoreVar, result_var: CoreVar) -> CoreExpr:
+	list_handoff_expr_with_body(
+		source_var,
+		result_var,
+		VoidExpr(VoidType, SyntheticSourceLoc),
 	)
 
 
@@ -443,6 +481,51 @@ pure func dropped_handoff_expr() -> CoreExpr:
 			SyntheticSourceLoc,
 		),
 	)
+
+
+pure func record_fields(value: CoreExpr) -> List[CoreRecordFieldValue]:
+	[
+		{
+			name = "value",
+			value = value
+		},
+	]
+
+
+pure func dropped_record_result_expr(
+	source_var: CoreVar,
+	result_var: CoreVar,
+	source_type: CoreType,
+	result_type: CoreType,
+	release_policy: CoreReleasePolicy,
+	fields: List[CoreRecordFieldValue],
+) -> CoreExpr:
+	LetExpr(
+		result_var,
+		False,
+		result_type,
+		RecordExpr(fields, result_type, SyntheticSourceLoc),
+		DropExpr(
+			source_var,
+			source_type,
+			release_policy,
+			VarExpr(result_var, result_type, SyntheticSourceLoc),
+			result_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func top_record_reuse_source(expr: CoreExpr) -> Option[CoreVar]:
+	match expr:
+		RecordReuseExpr(source, fields, typ, loc):
+			match source:
+				VarExpr(variable, source_type, source_loc):
+					Some(variable)
+				_:
+					None
+		_:
+			None
 
 
 pure func intrinsic_name_from_kind(kind: CoreCallKind) -> Option[String]:
@@ -566,6 +649,10 @@ pure func top_intrinsic_name(expr: CoreExpr) -> Option[String]:
 		ListSwapExpr(swap, typ, loc):
 			None
 		RecordExpr(fields, typ, loc):
+			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -743,6 +830,10 @@ pure func top_let_rhs_intrinsic_name(expr: CoreExpr) -> Option[String]:
 			None
 		RecordExpr(fields, typ, loc):
 			None
+		RecordUpdateExpr(base, fields, typ, loc):
+			None
+		RecordReuseExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -918,6 +1009,10 @@ pure func top_handoff_is_consume_reuse(expr: CoreExpr) -> Bool:
 		ListSwapExpr(swap, typ, loc):
 			False
 		RecordExpr(fields, typ, loc):
+			False
+		RecordUpdateExpr(base, fields, typ, loc):
+			False
+		RecordReuseExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -1187,7 +1282,7 @@ pure func count_reuse(expr: CoreExpr) -> Int:
 		ListGetExpr(get, typ, loc):
 			0
 		ListHandoffExpr(handoff, typ, loc):
-			0
+			count_reuse(handoff.source) + count_reuse(handoff.capacity) + count_reuse(handoff.body)
 		ListHandoffSetOwnedExpr(set, typ, loc):
 			0
 		ListHandoffSetSourceSlotExpr(set, typ, loc):
@@ -1226,6 +1321,10 @@ pure func count_reuse(expr: CoreExpr) -> Int:
 			0
 		RecordExpr(fields, typ, loc):
 			0
+		RecordUpdateExpr(base, fields, typ, loc):
+			0
+		RecordReuseExpr(source, fields, typ, loc):
+			1
 		RecordConstructExpr(type_name, fields, typ, loc):
 			0
 		PreClosureDetachExpr(detached, typ, loc):
@@ -1245,7 +1344,7 @@ pure func count_reuse(expr: CoreExpr) -> Int:
 		ForChannelExpr(loop, typ, loc):
 			0
 		ForListExpr(loop, typ, loc):
-			0
+			count_reuse(loop.iterable) + count_reuse(loop.body)
 		ForStringExpr(loop, typ, loc):
 			0
 		ForDictExpr(loop, typ, loc):
@@ -1381,12 +1480,270 @@ pure func test_upgrades_post_handoff_drop() -> Bool:
 	top_handoff_is_consume_reuse(rewritten)
 
 
+pure func test_rewrites_dead_heap_record_allocation() -> Bool:
+	source_var: CoreVar = named_var("old")
+	result_var: CoreVar = named_var("next")
+	record_type: CoreType = heap_record_type("Counter")
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		dropped_record_result_expr(
+			source_var,
+			result_var,
+			record_type,
+			record_type,
+			ArcReleasePolicy,
+			record_fields(int_expr(2)),
+		),
+	)
+
+	match top_record_reuse_source(rewritten):
+		Some(variable):
+			variable.name == source_var.name and variable.uniq == source_var.uniq
+		None:
+			False
+
+
+pure func test_rewrites_dead_heap_record_allocation_that_reads_source() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		dropped_record_result_expr(
+			source_var,
+			result_var,
+			record_type,
+			record_type,
+			ArcReleasePolicy,
+			record_fields(
+				FieldExpr(
+					VarExpr(source_var, record_type, SyntheticSourceLoc),
+					"value",
+					int_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		),
+	)
+
+	top_record_reuse_source(rewritten) == Some(source_var)
+
+
+pure func test_rewrites_dead_heap_record_allocation_in_while_body() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		WhileExpr(
+			bool_expr(True),
+			dropped_record_result_expr(
+				source_var,
+				result_var,
+				record_type,
+				record_type,
+				ArcReleasePolicy,
+				record_fields(int_expr(2)),
+			),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	count_reuse(rewritten) == 1
+
+
+pure func test_rewrites_dead_heap_record_allocation_in_range_body() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		ForRangeExpr(
+			range_loop_binder(),
+			int_expr(0),
+			int_expr(10),
+			dropped_record_result_expr(
+				source_var,
+				result_var,
+				record_type,
+				record_type,
+				ArcReleasePolicy,
+				record_fields(int_expr(2)),
+			),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	count_reuse(rewritten) == 1
+
+
+pure func test_rewrites_dead_heap_record_allocation_in_list_body() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	loop: CoreForList = {
+		binder = range_loop_binder(),
+		layout = InlineListStorage(8),
+		iterable = list_var_expr(named_var("items")),
+		iterable_release_policy = NoReleasePolicy,
+		body = dropped_record_result_expr(
+			source_var,
+			result_var,
+			record_type,
+			record_type,
+			ArcReleasePolicy,
+			record_fields(int_expr(2)),
+		)
+	}
+	rewritten: CoreExpr = rewrite_post_perceus_expr(ForListExpr(loop, VoidType, SyntheticSourceLoc))
+
+	count_reuse(rewritten) == 1
+
+
+pure func test_rewrites_dead_heap_record_allocation_in_constructor_match() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	match_body: CoreExpr = dropped_record_result_expr(
+		source_var,
+		result_var,
+		record_type,
+		record_type,
+		ArcReleasePolicy,
+		record_fields(int_expr(2)),
+	)
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		ConstructorMatchExpr(
+			expr_var_expr(expr_var()),
+			NoReleasePolicy,
+			[add_case([], match_body)],
+			ConstructorMatchFallbackFail,
+			record_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	count_reuse(rewritten) == 1
+
+
+pure func test_rewrites_dead_heap_record_allocation_in_list_handoff_body() -> Bool:
+	source_var: CoreVar = unique_var("__record_update", 17)
+	result_var: CoreVar = named_var("__cdrop___record_update")
+	record_type: CoreType = heap_record_type("Counter")
+	handoff_body: CoreExpr = dropped_record_result_expr(
+		source_var,
+		result_var,
+		record_type,
+		record_type,
+		ArcReleasePolicy,
+		record_fields(int_expr(2)),
+	)
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		list_handoff_expr_with_body(
+			named_var("items"),
+			named_var("results"),
+			handoff_body,
+		),
+	)
+
+	count_reuse(rewritten) == 1
+
+
+pure func test_rejects_dead_record_allocation_with_different_type() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		dropped_record_result_expr(
+			named_var("old"),
+			named_var("next"),
+			heap_record_type("Counter"),
+			heap_record_type("OtherCounter"),
+			ArcReleasePolicy,
+			record_fields(int_expr(2)),
+		),
+	)
+
+	top_record_reuse_source(rewritten) == None
+
+
+pure func test_rejects_dead_record_allocation_without_arc_drop() -> Bool:
+	record_type: CoreType = heap_record_type("Counter")
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		dropped_record_result_expr(
+			named_var("old"),
+			named_var("next"),
+			record_type,
+			record_type,
+			NoReleasePolicy,
+			record_fields(int_expr(2)),
+		),
+	)
+
+	top_record_reuse_source(rewritten) == None
+
+
+pure func test_rejects_dead_record_allocation_that_assigns_source() -> Bool:
+	source_var: CoreVar = named_var("old")
+	record_type: CoreType = heap_record_type("Counter")
+	assign_source: CoreExpr = AssignExpr(
+		source_var,
+		VarExpr(source_var, record_type, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		dropped_record_result_expr(
+			source_var,
+			named_var("next"),
+			record_type,
+			record_type,
+			ArcReleasePolicy,
+			record_fields(SeqExpr(assign_source, int_expr(2))),
+		),
+	)
+
+	top_record_reuse_source(rewritten) == None
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core reuse",
 	tests = [
 		("rewrites dead list allocation", test_rewrites_dead_list_allocation),
 		("rewrites dead set allocation", test_rewrites_dead_set_allocation),
 		("rewrites dead dict allocation", test_rewrites_dead_dict_allocation),
+		("rewrites dead heap-record allocation", test_rewrites_dead_heap_record_allocation),
+		(
+			"rewrites dead heap-record allocation that reads its source",
+			test_rewrites_dead_heap_record_allocation_that_reads_source,
+		),
+		(
+			"rewrites dead heap-record allocation in a while body",
+			test_rewrites_dead_heap_record_allocation_in_while_body,
+		),
+		(
+			"rewrites dead heap-record allocation in a range body",
+			test_rewrites_dead_heap_record_allocation_in_range_body,
+		),
+		(
+			"rewrites dead heap-record allocation in a list body",
+			test_rewrites_dead_heap_record_allocation_in_list_body,
+		),
+		(
+			"rewrites dead heap-record allocation in a constructor match",
+			test_rewrites_dead_heap_record_allocation_in_constructor_match,
+		),
+		(
+			"rewrites dead heap-record allocation in a list handoff body",
+			test_rewrites_dead_heap_record_allocation_in_list_handoff_body,
+		),
+		(
+			"rejects dead record allocation with a different type",
+			test_rejects_dead_record_allocation_with_different_type,
+		),
+		(
+			"rejects dead record allocation without an ARC drop",
+			test_rejects_dead_record_allocation_without_arc_drop,
+		),
+		(
+			"rejects dead record allocation that assigns its source",
+			test_rejects_dead_record_allocation_that_assigns_source,
+		),
 		("upgrades post handoff drop", test_upgrades_post_handoff_drop),
 		("rewrites owned union match result", test_rewrites_owned_union_match_result),
 		("rejects borrowed union match fields", test_rejects_borrowed_union_match_fields),

@@ -229,6 +229,7 @@ import:
 			RawMatchExpr,
 			RangeExpr,
 			RecordExpr,
+			RecordUpdateExpr,
 			ResourceScopeExpr,
 			SeqExpr,
 			SelectExpr,
@@ -3816,7 +3817,7 @@ func test_lowers_record_expression() -> Bool:
 			False
 
 
-func test_lowers_record_update_without_core_sugar() -> Bool:
+func test_lowers_record_update_with_explicit_core_intent() -> Bool:
 	record_type = CompilerNamedType("Point", [])
 	base = CompilerTypedNameExpr(ident("point"), expr_info(record_type))
 	update: CompilerTypedRecordField = {
@@ -3843,28 +3844,67 @@ func test_lowers_record_update_without_core_sugar() -> Bool:
 	)
 
 	match lower_typed_expr(expr):
-		Ok(LetExpr(temp, False, _, VarExpr(base_var, _, _), RecordExpr(fields, _, _))):
+		Ok(LetExpr(temp, False, _, VarExpr(base_var, _, _), RecordUpdateExpr(VarExpr(update_base, _, _), fields, _, _))):
 			match (fields.get(0), fields.get(1)):
-				(Some(first), Some(second)):
-					match first.value:
+				(Some(retained), Some(replacement)):
+					retained_uses_temp: Bool = match retained.value:
 						FieldExpr(VarExpr(field_base, _, _), "x", _, _):
-							(
-								base_var.name == "point"
-								and field_base == temp
-								and second.name == "y"
-								and core_exprs_equal(
-									second.value,
-									LiteralExpr(
-										IntLiteral(9),
-										core_int_type(),
-										compiler_core_source_loc(source_span()),
-									),
-								)
-							)
+							field_base == temp
 						_:
 							False
+
+					(
+						base_var.name == "point"
+						and update_base == temp
+						and fields.length() == 2
+						and retained.name == "x"
+						and retained_uses_temp
+						and replacement.name == "y"
+						and core_exprs_equal(
+							replacement.value,
+							LiteralExpr(
+								IntLiteral(9),
+								core_int_type(),
+								compiler_core_source_loc(source_span()),
+							),
+						)
+					)
 				_:
 					False
+		_:
+			False
+
+
+func test_rejects_record_update_without_checked_shape() -> Bool:
+	record_type = CompilerNamedType("Point", [])
+	expr = CompilerTypedRecordUpdateExpr(
+		CompilerTypedNameExpr(ident("point"), expr_info(record_type)),
+		[],
+		[],
+		source_span(),
+		expr_info(compiler_type_void()),
+	)
+
+	match lower_typed_expr(expr):
+		Err(CompilerCoreLowerInvalidType(message)):
+			message.contains("missing its checked record shape")
+		_:
+			False
+
+
+func test_lowers_declared_empty_record_update_shape() -> Bool:
+	record_type = CompilerNamedType("Empty", [])
+	expr = CompilerTypedRecordUpdateExpr(
+		CompilerTypedNameExpr(ident("empty"), expr_info(record_type)),
+		[],
+		[],
+		source_span(),
+		expr_info(record_type),
+	)
+
+	match lower_typed_expr(expr):
+		Ok(LetExpr(_, False, _, _, RecordUpdateExpr(VarExpr(_, _, _), fields, _, _))):
+			fields.is_empty()
 		_:
 			False
 
@@ -5002,7 +5042,18 @@ tests: TestSuite = {
 		("lowers tuple field access expression", test_lowers_tuple_field_access_expression),
 		("lowers range expression", test_lowers_range_expression),
 		("lowers record expression", test_lowers_record_expression),
-		("lowers record update without Core sugar", test_lowers_record_update_without_core_sugar),
+		(
+			"lowers record update with explicit Core intent",
+			test_lowers_record_update_with_explicit_core_intent,
+		),
+		(
+			"rejects record update without checked shape",
+			test_rejects_record_update_without_checked_shape,
+		),
+		(
+			"lowers declared empty record update shape",
+			test_lowers_declared_empty_record_update_shape,
+		),
 		(
 			"lowers call without resolved metadata as unknown",
 			test_lowers_call_without_resolved_metadata_as_unknown,

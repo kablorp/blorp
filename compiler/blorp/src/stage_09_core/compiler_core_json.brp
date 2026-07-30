@@ -315,6 +315,10 @@ private LIST_HANDOFF_WRITE_ORDER_FORWARD_COMPACTING_TAG: String = "forward_compa
 
 private RECORD_EXPR_TAG: String = "record"
 
+private RECORD_UPDATE_EXPR_TAG: String = "record_update"
+
+private RECORD_REUSE_EXPR_TAG: String = "record_reuse"
+
 private RECORD_CONSTRUCT_EXPR_TAG: String = "record_construct"
 
 private UNION_CONSTRUCT_EXPR_TAG: String = "union_construct"
@@ -1041,6 +1045,8 @@ union CoreExpr:
 	ListSetExpr(CoreListSet, CoreType, CoreSourceLoc)
 	ListSwapExpr(CoreListSwap, CoreType, CoreSourceLoc)
 	RecordExpr(List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	RecordUpdateExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	RecordReuseExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordConstructExpr(String, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	UnionConstructExpr(CoreUnionConstruct, CoreType, CoreSourceLoc)
 	UnionReuseConstructExpr(CoreUnionReuseConstruct, CoreType, CoreSourceLoc)
@@ -1226,6 +1232,10 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		ListSwapExpr(swap, typ, loc):
 			typ
 		RecordExpr(fields, typ, loc):
+			typ
+		RecordUpdateExpr(base, fields, typ, loc):
+			typ
+		RecordReuseExpr(source, fields, typ, loc):
 			typ
 		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
@@ -2172,6 +2182,8 @@ record CoreProgram {
 union CoreJsonError:
 	CoreMissingField(String, String)
 	CoreExpectedObject(String)
+	CoreExpectedVariableExpr(String)
+	CoreInvalidRecordUpdateShape(String, String)
 	CoreExpectedObjectField(String, String)
 	CoreExpectedStringField(String, String)
 	CoreExpectedIntField(String, String)
@@ -8803,6 +8815,36 @@ private pure func core_expr_record_to_json(
 	])
 
 
+private pure func core_expr_record_update_to_json(
+	base: CoreExpr,
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(RECORD_UPDATE_EXPR_TAG)),
+		("base", core_expr_to_json(base)),
+		("fields", core_record_fields_to_json(fields)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
+private pure func core_expr_record_reuse_to_json(
+	source: CoreExpr,
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(RECORD_REUSE_EXPR_TAG)),
+		("source", core_expr_to_json(source)),
+		("fields", core_record_fields_to_json(fields)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_record_construct_to_json(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
@@ -9645,6 +9687,10 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_list_swap_to_json(swap, typ, loc)
 		RecordExpr(fields, typ, loc):
 			core_expr_record_to_json(fields, typ, loc)
+		RecordUpdateExpr(base, fields, typ, loc):
+			core_expr_record_update_to_json(base, fields, typ, loc)
+		RecordReuseExpr(source, fields, typ, loc):
+			core_expr_record_reuse_to_json(source, fields, typ, loc)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			core_expr_record_construct_to_json(type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
@@ -10837,6 +10883,147 @@ private pure func decode_core_expr_record_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(RecordExpr(fields, typ, loc))
+
+
+private pure func decode_core_expr_record_update_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	base_json ?= object_field(value, path, "base")
+	base ?= decode_core_expr_json(
+		base_json,
+		path_field(path, "base"),
+	)
+	fields ?= decode_core_record_fields(value, path, "fields")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	match base:
+		VarExpr(_, base_type, _):
+			match (base_type, typ):
+				(ValueRecordType(base_name), ValueRecordType(result_name)):
+					if base_name == result_name:
+						Ok(RecordUpdateExpr(base, fields, typ, loc))
+					else:
+						Err(
+							CoreInvalidRecordUpdateShape(
+								path_field(
+									path_field(path, "base"),
+									"type",
+								),
+								"record update base and result must have the same record type",
+							),
+						)
+				(HeapRecordType(base_name), HeapRecordType(result_name)):
+					if base_name == result_name:
+						Ok(RecordUpdateExpr(base, fields, typ, loc))
+					else:
+						Err(
+							CoreInvalidRecordUpdateShape(
+								path_field(
+									path_field(path, "base"),
+									"type",
+								),
+								"record update base and result must have the same record type",
+							),
+						)
+				(_, ValueRecordType(_)):
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(
+								path_field(path, "base"),
+								"type",
+							),
+							"record update base and result must have the same record type and storage",
+						),
+					)
+				(_, HeapRecordType(_)):
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(
+								path_field(path, "base"),
+								"type",
+							),
+							"record update base and result must have the same record type and storage",
+						),
+					)
+				_:
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(path, "type"),
+							"record update type must be a value or heap record",
+						),
+					)
+		_:
+			Err(CoreExpectedVariableExpr(path_field(path, "base")))
+
+
+private pure func decode_core_expr_record_reuse_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	source_json ?= object_field(value, path, "source")
+	source ?= decode_core_expr_json(
+		source_json,
+		path_field(path, "source"),
+	)
+	fields ?= decode_core_record_fields(value, path, "fields")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	match source:
+		VarExpr(_, source_type, _):
+			match typ:
+				HeapRecordType(result_name):
+					match source_type:
+						HeapRecordType(source_name):
+							if source_name == result_name:
+								Ok(RecordReuseExpr(source, fields, typ, loc))
+							else:
+								Err(
+									CoreInvalidRecordUpdateShape(
+										path_field(
+											path_field(path, "source"),
+											"type",
+										),
+										"record reuse source and result must have the same heap-record type",
+									),
+								)
+						_:
+							Err(
+								CoreInvalidRecordUpdateShape(
+									path_field(
+										path_field(path, "source"),
+										"type",
+									),
+									"record reuse source type must be a heap record",
+								),
+							)
+				_:
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(path, "type"),
+							"record reuse type must be a heap record",
+						),
+					)
+		_:
+			Err(CoreExpectedVariableExpr(path_field(path, "source")))
 
 
 private pure func decode_core_expr_record_construct_from_json(
@@ -12307,6 +12494,10 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_list_swap_from_json(value, path)
 	else if tag == RECORD_EXPR_TAG:
 		decode_core_expr_record_from_json(value, path)
+	else if tag == RECORD_UPDATE_EXPR_TAG:
+		decode_core_expr_record_update_from_json(value, path)
+	else if tag == RECORD_REUSE_EXPR_TAG:
+		decode_core_expr_record_reuse_from_json(value, path)
 	else if tag == RECORD_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_record_construct_from_json(value, path)
 	else if tag == UNION_CONSTRUCT_EXPR_TAG:
@@ -13679,6 +13870,249 @@ pure func core_program_to_json(program: CoreProgram) -> JsonValue:
 	])
 
 
+private union CoreJsonRecordStorage:
+	JsonValueRecordStorage
+	JsonHeapRecordStorage
+
+
+private record CoreJsonRecordShape {
+	name: String,
+	storage: CoreJsonRecordStorage,
+	field_names: List[String]
+}
+
+
+private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJsonRecordShape]:
+	var shapes: List[CoreJsonRecordShape] = []
+
+	for decl in decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				shapes = shapes.append({
+					name = record_decl.name,
+					storage = JsonValueRecordStorage,
+					field_names = record_decl.fields.map(func(field): field.name),
+				})
+			HeapRecordDecl(record_decl):
+				shapes = shapes.append({
+					name = record_decl.name,
+					storage = JsonHeapRecordStorage,
+					field_names = record_decl.fields.map(func(field): field.name),
+				})
+			_:
+				void
+
+	shapes
+
+
+private pure func optional_json_object_kind(fields: List[(String, JsonValue)]) -> Option[String]:
+	var result: Option[String] = None
+
+	for (name, value) in fields:
+		if name == KIND_FIELD:
+			match value:
+				JsonString(kind):
+					result = Some(kind)
+				_:
+					void
+
+			break
+
+	result
+
+
+private pure func string_lists_equal(left: List[String], right: List[String]) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_head, ...left_tail], [right_head, ...right_tail]):
+			left_head == right_head and string_lists_equal(left_tail, right_tail)
+		_:
+			False
+
+
+private pure func same_record_storage(
+	left: CoreJsonRecordStorage,
+	right: CoreJsonRecordStorage,
+) -> Bool:
+	match (left, right):
+		(JsonValueRecordStorage, JsonValueRecordStorage):
+			True
+		(JsonHeapRecordStorage, JsonHeapRecordStorage):
+			True
+		_:
+			False
+
+
+private pure func record_shape_matches(
+	shape: CoreJsonRecordShape,
+	record_name: String,
+	storage: CoreJsonRecordStorage,
+) -> Bool:
+	shape.name == record_name and same_record_storage(shape.storage, storage)
+
+
+private pure func record_update_field_names(
+	value: JsonValue,
+	path: String,
+) -> Result[List[String], CoreJsonError]:
+	field_values ?= array_field(value, path, "fields")
+	var names: List[String] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for field_value in field_values:
+		match error:
+			Some(_):
+				void
+			None:
+				match string_field(
+					field_value,
+					path_index(
+						path_field(path, "fields"),
+						index,
+					),
+					"name",
+				):
+					Ok(name):
+						names = names.append(name)
+					Err(field_error):
+						error = Some(field_error)
+
+		index += 1
+
+	match error:
+		Some(field_error):
+			Err(field_error)
+		None:
+			Ok(names)
+
+
+private pure func validate_record_update_json_shape(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	type_value ?= object_field(value, path, "type")
+	type_path: String = path_field(path, "type")
+	type_tag ?= kind_field(type_value, type_path)
+
+	if type_tag != VALUE_RECORD_TYPE_TAG and type_tag != HEAP_RECORD_TYPE_TAG:
+		Err(CoreInvalidRecordUpdateShape(path, "record update type must be a value or heap record"))
+	else:
+		record_name ?= string_field(type_value, type_path, "name")
+		actual_names ?= record_update_field_names(value, path)
+
+		expected_storage: CoreJsonRecordStorage = if type_tag == HEAP_RECORD_TYPE_TAG:
+			JsonHeapRecordStorage
+		else:
+			JsonValueRecordStorage
+
+		match shapes.find(func(shape): record_shape_matches(shape, record_name, expected_storage)):
+			Some(shape):
+				if string_lists_equal(actual_names, shape.field_names):
+					Ok(void)
+				else:
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(path, "fields"),
+							"record update for `${record_name}` must contain every declared field exactly once in declaration order",
+						),
+					)
+			None:
+				missing_detail: String = if type_tag == HEAP_RECORD_TYPE_TAG:
+					"record update type `${record_name}` has no matching heap-record declaration"
+				else:
+					"record update type `${record_name}` has no matching value-record declaration"
+
+				Err(CoreInvalidRecordUpdateShape(path_field(path, "type"), missing_detail))
+
+
+private pure func validate_record_reuse_json_shape(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	type_value ?= object_field(value, path, "type")
+	type_path: String = path_field(path, "type")
+	type_tag ?= kind_field(type_value, type_path)
+
+	if type_tag != HEAP_RECORD_TYPE_TAG:
+		Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type must be a heap record"))
+	else:
+		validate_record_update_json_shape(value, path, shapes)
+
+
+private pure func validate_record_update_json_tree(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	match value:
+		JsonObject(fields):
+			current_valid ?= match optional_json_object_kind(fields):
+				Some(kind):
+					if kind == RECORD_UPDATE_EXPR_TAG:
+						validate_record_update_json_shape(value, path, shapes)
+					else if kind == RECORD_REUSE_EXPR_TAG:
+						validate_record_reuse_json_shape(value, path, shapes)
+					else:
+						Ok(void)
+				None:
+					Ok(void)
+
+			var error: Option[CoreJsonError] = None
+
+			for (name, child) in fields:
+				match error:
+					Some(_):
+						void
+					None:
+						match validate_record_update_json_tree(
+							child,
+							path_field(path, name),
+							shapes,
+						):
+							Ok(_):
+								void
+							Err(child_error):
+								error = Some(child_error)
+
+			match error:
+				Some(child_error):
+					Err(child_error)
+				None:
+					Ok(void)
+		JsonVector(items):
+			var error: Option[CoreJsonError] = None
+			var index: Int = 0
+
+			for child in items:
+				match error:
+					Some(_):
+						void
+					None:
+						match validate_record_update_json_tree(
+							child,
+							path_index(path, index),
+							shapes,
+						):
+							Ok(_):
+								void
+							Err(child_error):
+								error = Some(child_error)
+
+				index += 1
+
+			match error:
+				Some(child_error):
+					Err(child_error)
+				None:
+					Ok(void)
+		_:
+			Ok(void)
+
+
 pure func decode_core_program_json(value: JsonValue) -> Result[CoreProgram, CoreJsonError]:
 	path: String = "program"
 	tag ?= kind_field(value, path)
@@ -13688,6 +14122,11 @@ pure func decode_core_program_json(value: JsonValue) -> Result[CoreProgram, Core
 	else:
 		decls ?= decode_core_decls(value, path, "decls")
 		foreign_includes ?= decode_string_list(value, path, "foreign_includes")
+		record_updates_valid ?= validate_record_update_json_tree(
+			value,
+			path,
+			core_json_record_shapes(decls),
+		)
 		Ok({
 			decls = decls,
 			foreign_includes = foreign_includes,
@@ -13700,6 +14139,10 @@ pure func core_json_error_to_string(error: CoreJsonError) -> String:
 			"missing Core JSON field at ${path}: ${field_name}"
 		CoreExpectedObject(path):
 			"Core JSON value at ${path} must be an object"
+		CoreExpectedVariableExpr(path):
+			"Core JSON value at ${path} must be a variable expression"
+		CoreInvalidRecordUpdateShape(path, detail):
+			"invalid Core record update at ${path}: ${detail}"
 		CoreExpectedObjectField(path, field_name):
 			"Core JSON field at ${path} must be an object: ${field_name}"
 		CoreExpectedStringField(path, field_name):

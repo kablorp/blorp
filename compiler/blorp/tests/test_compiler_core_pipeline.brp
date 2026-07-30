@@ -1,14 +1,27 @@
 import:
 	../src/stage_09_core/compiler_core_json:
 		CoreCallKind(SelectedDirectCall),
-		CoreDecl(FunctionDecl),
-		CoreExpr(CallExpr, ListConstructExpr, LiteralExpr, VarExpr),
+		CoreDecl(FunctionDecl, HeapRecordDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			CallExpr,
+			FieldExpr,
+			LetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordUpdateExpr,
+			SeqExpr,
+			VarExpr,
+		),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(IntLiteral),
 		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(NamedType),
+		CoreType(HeapRecordType, NamedType, ValueRecordType, VoidType),
 		CoreVar,
 		core_program_to_json,
 	../src/stage_09_core/compiler_core_pipeline:
@@ -16,8 +29,11 @@ import:
 		run_core_pipeline_stage,
 		run_pre_dce_tail,
 	../src/stage_09_core/compiler_core_pipeline_stage:
-		CorePipelineStage(SpecializeStage),
+		CorePipelineStage(DceStage, PerceusStage, SpecializeStage),
 		parse_core_pipeline_stage,
+	../src/stage_09_core/compiler_core_record_update:
+		lower_record_updates_for_ownership,
+		record_update_carrier_survives,
 	test: TestSuite
 
 
@@ -115,6 +131,496 @@ pure func test_specialize_stage_is_late_core_owned() -> Bool:
 	parse_core_pipeline_stage("specialize") == Some(SpecializeStage)
 
 
+pure func record_update_program() -> CoreProgram:
+	point_type: CoreType = ValueRecordType("Point")
+	point_var: CoreVar = {
+		name = "point",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = RecordUpdateExpr(
+		VarExpr(
+			point_var,
+			point_type,
+			SyntheticSourceLoc,
+		),
+		[
+			{
+				name = "x",
+				value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+			},
+			{
+				name = "y",
+				value = FieldExpr(
+					VarExpr(point_var, point_type, SyntheticSourceLoc),
+					"y",
+					int_type(),
+					SyntheticSourceLoc,
+				)
+			},
+		],
+		point_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl({
+				name = "Point",
+				type_params = [],
+				fields = [
+					{
+						name = "x",
+						typ = int_type()
+					},
+					{
+						name = "y",
+						typ = int_type()
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl({
+				name = "main",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = point_var,
+						typ = point_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = point_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 3,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+	program
+
+
+pure func test_dce_preserves_record_update_for_ownership() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			DceStage,
+			record_update_program(),
+		),
+	).to_string()
+
+	json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_update_normalization_preserves_complete_field_shape() -> Bool:
+	match lower_record_updates_for_ownership(record_update_program()).decls:
+		[ValueRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(RecordExpr(fields, _, _)):
+					match (fields.get(0), fields.get(1)):
+						(Some(first), Some(second)):
+							first_is_replacement: Bool = match first.value:
+								LiteralExpr(IntLiteral(10), _, _):
+									True
+								_:
+									False
+
+							second_uses_base: Bool = match second.value:
+								FieldExpr(VarExpr(base, _, _), "y", _, _):
+									base.name == "point"
+								_:
+									False
+
+							(
+								fields.length() == 2
+								and first.name == "x"
+								and first_is_replacement
+								and second.name == "y"
+								and second_uses_base
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func heap_record_update_program_without_decl() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("Box__mono_Int")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	body: CoreExpr = RecordUpdateExpr(
+		box_ref,
+		[
+			{
+				name = "count",
+				value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+			},
+			{
+				name = "label",
+				value = FieldExpr(
+					box_ref,
+					"label",
+					NamedType("String", []),
+					SyntheticSourceLoc,
+				)
+			},
+		],
+		box_type,
+		SyntheticSourceLoc,
+	)
+
+	{
+		decls = [
+			FunctionDecl({
+				name = "update_box",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 4,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_record_update_normalization_is_total_after_monomorphization() -> Bool:
+	match lower_record_updates_for_ownership(heap_record_update_program_without_decl()).decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(RecordExpr(fields, HeapRecordType("Box__mono_Int"), _)):
+					match (fields.get(0), fields.get(1)):
+						(Some(first), Some(second)):
+							first_is_replacement: Bool = match first.value:
+								LiteralExpr(IntLiteral(11), _, _):
+									True
+								_:
+									False
+
+							second_uses_base: Bool = match second.value:
+								FieldExpr(VarExpr(base, _, _), "label", _, _):
+									base.name == "box"
+								_:
+									False
+
+							(
+								fields.length() == 2
+								and first.name == "count"
+								and first_is_replacement
+								and second.name == "label"
+								and second_uses_base
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_perceus_materializes_record_update_for_ownership() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			record_update_program(),
+		),
+	).to_string()
+
+	(
+		not json.contains("\"kind\":\"record_update\"")
+		and json.contains("\"kind\":\"record\"")
+		and json.contains("\"field\":\"y\"")
+	)
+
+
+pure func counter_box_decl() -> CoreDecl:
+	HeapRecordDecl({
+		name = "CounterBox",
+		type_params = [],
+		fields = [
+			{
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "limit",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func heap_record_self_update_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 5,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_self_update_program(),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func heap_record_self_update_with_target_assignment_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = SeqExpr(
+						AssignExpr(box_var, update_base_ref, VoidType, SyntheticSourceLoc),
+						LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc),
+					)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = {
+		decls = [
+			counter_box_decl(),
+			FunctionDecl({
+				name = "update_counter_box_with_target_assignment",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = VoidType,
+				body = Some(AssignExpr(box_var, update, VoidType, SyntheticSourceLoc)),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 6,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+	program
+
+
+pure func test_record_reuse_rejects_fields_that_assign_the_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_self_update_with_target_assignment_program(),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_requires_matching_heap_record_declaration() -> Bool:
+	program: CoreProgram = heap_record_self_update_program()
+
+	match program.decls:
+		[HeapRecordDecl(_), function_decl]:
+			without_record_decl: CoreProgram = {
+				decls = [function_decl],
+				foreign_includes = []
+			}
+			json: String = core_program_to_json(
+				lower_record_updates_for_ownership(without_record_decl),
+			).to_string()
+
+			(
+				json.contains("\"kind\":\"record\"")
+				and not json.contains("\"kind\":\"record_reuse\"")
+				and not json.contains("\"kind\":\"record_update\"")
+			)
+		_:
+			False
+
+
+pure func test_record_reuse_classification_rejects_ordinary_let_assignment() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	temporary_var: CoreVar = {
+		name = "temporary",
+		uniq = 1,
+		def_id = None
+	}
+	body: CoreExpr = AssignExpr(
+		box_var,
+		LetExpr(
+			temporary_var,
+			False,
+			box_type,
+			RecordConstructExpr("CounterBox", [], box_type, SyntheticSourceLoc),
+			VarExpr(temporary_var, box_type, SyntheticSourceLoc),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("ordinary_let_assignment", 7, body)],
+		foreign_includes = []
+	}
+	json: String = core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
+
+	(
+		json.contains("\"kind\":\"record_construct\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_update_normalization_handles_long_sequence_spines() -> Bool:
+	var body: CoreExpr = LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc)
+
+	for index in 0..4096:
+		body = SeqExpr(
+			LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc),
+			body,
+		)
+
+	program: CoreProgram = {
+		decls = [function_decl("long_sequence", 8, body)],
+		foreign_includes = []
+	}
+
+	not record_update_carrier_survives(lower_record_updates_for_ownership(program))
+
+
 tests: TestSuite = {
 	description = "Blorp compiler contiguous Core pipeline",
 	tests = [
@@ -127,5 +633,41 @@ tests: TestSuite = {
 			test_named_list_layout_stage_relayouts_list_nodes,
 		),
 		("specialize stage is late-Core owned", test_specialize_stage_is_late_core_owned),
+		(
+			"DCE preserves record update for ownership",
+			test_dce_preserves_record_update_for_ownership,
+		),
+		(
+			"record update normalization preserves complete field shape",
+			test_record_update_normalization_preserves_complete_field_shape,
+		),
+		(
+			"record update normalization is total after monomorphization",
+			test_record_update_normalization_is_total_after_monomorphization,
+		),
+		(
+			"Perceus materializes record update for ownership",
+			test_perceus_materializes_record_update_for_ownership,
+		),
+		(
+			"Perceus marks heap-record self update for reuse",
+			test_perceus_marks_heap_record_self_update_for_reuse,
+		),
+		(
+			"record reuse rejects fields that assign the target",
+			test_record_reuse_rejects_fields_that_assign_the_target,
+		),
+		(
+			"record reuse requires matching heap-record declaration",
+			test_record_reuse_requires_matching_heap_record_declaration,
+		),
+		(
+			"record-reuse classification rejects ordinary let assignment",
+			test_record_reuse_classification_rejects_ordinary_let_assignment,
+		),
+		(
+			"record-update normalization handles long sequence spines",
+			test_record_update_normalization_handles_long_sequence_spines,
+		),
 	]
 }

@@ -12,6 +12,12 @@ let void_type = kind "void" []
 let named_type_with_args name args =
   kind "named" [ ("name", Lsp_json.String name); ("args", Lsp_json.Array args) ]
 
+let value_record_type name =
+  kind "value_record" [ ("name", Lsp_json.String name) ]
+
+let heap_record_type name =
+  kind "heap_record" [ ("name", Lsp_json.String name) ]
+
 let variable ?def_id name =
   Lsp_json.Object
     [
@@ -107,6 +113,22 @@ let function_decl ?(body = Some (int_literal 0))
       ("loc", synthetic_loc);
     ]
 
+let value_record_decl name fields =
+  let field (field_name, field_type) =
+    Lsp_json.Object
+      [
+        ("name", Lsp_json.String field_name);
+        ("type", field_type);
+      ]
+  in
+  kind "value_record"
+    [
+      ("name", Lsp_json.String name);
+      ("type_params", Lsp_json.Array []);
+      ("fields", Lsp_json.Array (List.map field fields));
+      ("loc", synthetic_loc);
+    ]
+
 let union_decl name payload_storage =
   let variant =
     Lsp_json.Object
@@ -180,6 +202,179 @@ let decoded_body_exn body =
   match decoded.core with
   | [ { Core.cd_desc = Core.CDFunc { cf_body = Some body; _ }; _ } ] -> body
   | _ -> Alcotest.fail "expected one decoded function body"
+
+let test_decodes_record_update_carrier () =
+  let point_type = value_record_type "Point" in
+  let body =
+    kind "record_update"
+      [
+        ("base", typed_variable_expr "point" point_type);
+        ( "fields",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "x");
+                  ("value", int_literal 10);
+                ];
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "y");
+                  ( "value",
+                    kind "field"
+                      [
+                        ("expr", typed_variable_expr "point" point_type);
+                        ("field", Lsp_json.String "y");
+                        ("type", int_type);
+                        ("loc", synthetic_loc);
+                      ] );
+                ];
+            ] );
+        ("type", point_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let decoded =
+    decode_exn
+      (program
+         [
+           value_record_decl "Point" [ ("x", int_type); ("y", int_type) ];
+           function_decl ~body:(Some body) "main" 1;
+         ])
+  in
+  let decoded_body =
+    match decoded.core with
+    | [ _; { Core.cd_desc = Core.CDFunc { cf_body = Some body; _ }; _ } ] ->
+        body
+    | _ -> Alcotest.fail "expected record declaration and function body"
+  in
+  match decoded_body.Core.desc with
+  | Core.CRecordUpdate
+      ( { Core.desc = Core.CVar base; _ },
+        [
+          ("x", { Core.desc = Core.CLit (Ast.LitInt 10L); _ });
+          ("y", { Core.desc = Core.CField (_, "y"); _ });
+        ] ) ->
+      Alcotest.(check string) "base" "point" base.Core.vname
+  | _ -> Alcotest.fail "record update changed across the Core boundary"
+
+let test_rejects_partial_record_update_shape () =
+  let point_type = value_record_type "Point" in
+  let body =
+    kind "record_update"
+      [
+        ("base", typed_variable_expr "point" point_type);
+        ( "fields",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "x");
+                  ("value", int_literal 10);
+                ];
+            ] );
+        ("type", point_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  match
+    Core_post_tuple_sroa_json.decode_program
+      (program
+         [
+           value_record_decl "Point" [ ("x", int_type); ("y", int_type) ];
+           function_decl ~body:(Some body) "main" 1;
+         ])
+  with
+  | Error error ->
+      let message =
+        Core_post_tuple_sroa_json.decode_error_to_string error
+      in
+      Alcotest.(check bool)
+        "body path" true
+        (Modules.contains message "program.decls[1].body");
+      Alcotest.(check bool)
+        "complete field requirement" true
+        (Modules.contains message "every declared field")
+  | Ok _ -> Alcotest.fail "expected partial record update shape rejection"
+
+let test_rejects_non_variable_record_update_base () =
+  let point_type = value_record_type "Point" in
+  let body =
+    kind "record_update"
+      [
+        ("base", int_literal 1);
+        ("fields", Lsp_json.Array []);
+        ("type", point_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  match
+    Core_post_tuple_sroa_json.decode_program
+      (program [ function_decl ~body:(Some body) "main" 1 ])
+  with
+  | Error error ->
+      let message =
+        Core_post_tuple_sroa_json.decode_error_to_string error
+      in
+      Alcotest.(check bool)
+        "base path" true
+        (Modules.contains message ".body.base");
+      Alcotest.(check bool)
+        "variable requirement" true
+        (Modules.contains message "must be a variable expression")
+  | Ok _ -> Alcotest.fail "expected non-variable record update base rejection"
+
+let record_update_fixture ~base_type ~result_type =
+  kind "record_update"
+    [
+      ("base", typed_variable_expr "point" base_type);
+      ( "fields",
+        Lsp_json.Array
+          [
+            Lsp_json.Object
+              [
+                ("name", Lsp_json.String "x");
+                ("value", int_literal 10);
+              ];
+            Lsp_json.Object
+              [
+                ("name", Lsp_json.String "y");
+                ("value", int_literal 20);
+              ];
+          ] );
+      ("type", result_type);
+      ("loc", synthetic_loc);
+    ]
+
+let expect_record_update_error ~path_fragment ~message_fragment body =
+  match
+    Core_post_tuple_sroa_json.decode_program
+      (program
+         [
+           value_record_decl "Point" [ ("x", int_type); ("y", int_type) ];
+           function_decl ~body:(Some body) "main" 1;
+         ])
+  with
+  | Error error ->
+      Alcotest.(check bool)
+        "path" true
+        (Modules.contains error.path path_fragment);
+      Alcotest.(check bool)
+        "message" true
+        (Modules.contains error.message message_fragment)
+  | Ok _ -> Alcotest.fail "expected record update type rejection"
+
+let test_rejects_record_update_storage_mismatched_with_declaration () =
+  let heap_point = heap_record_type "Point" in
+  expect_record_update_error ~path_fragment:".body.type"
+    ~message_fragment:"heap-record declaration"
+    (record_update_fixture ~base_type:heap_point ~result_type:heap_point)
+
+let test_rejects_record_update_base_storage_mismatch () =
+  expect_record_update_error ~path_fragment:".body.base.type"
+    ~message_fragment:"same record type"
+    (record_update_fixture ~base_type:(heap_record_type "Point")
+       ~result_type:(value_record_type "Point"))
 
 let collection_list_handoff ?(mode = "borrow_fresh")
     ?(write_order = "forward_compacting") ?source_type ?result_type
@@ -1186,6 +1381,17 @@ let suite =
           test_decodes_post_tuple_sroa_program;
         Alcotest.test_case "decodes collection list handoff" `Quick
           test_decodes_collection_list_handoff;
+        Alcotest.test_case "decodes record update carrier" `Quick
+          test_decodes_record_update_carrier;
+        Alcotest.test_case "rejects partial record update shape" `Quick
+          test_rejects_partial_record_update_shape;
+        Alcotest.test_case "rejects non-variable record update base" `Quick
+          test_rejects_non_variable_record_update_base;
+        Alcotest.test_case
+          "rejects record update storage mismatched with declaration" `Quick
+          test_rejects_record_update_storage_mismatched_with_declaration;
+        Alcotest.test_case "rejects record update base storage mismatch" `Quick
+          test_rejects_record_update_base_storage_mismatch;
         Alcotest.test_case "rejects invalid collection list handoff contract"
           `Quick test_rejects_invalid_collection_list_handoff_contract;
         Alcotest.test_case "decodes unmanaged tailrec loop" `Quick

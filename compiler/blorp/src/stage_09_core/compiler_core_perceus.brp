@@ -96,6 +96,8 @@ import:
 			PreClosureDetachExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -1338,6 +1340,10 @@ private pure func copy_expr(expr: CoreExpr) -> CoreExpr:
 			VectorExpr(copy_exprs(items), copy_core_type(typ), loc)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(copy_record_fields(fields), copy_core_type(typ), loc)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(copy_expr(base), copy_record_fields(fields), copy_core_type(typ), loc)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(copy_expr(source), copy_record_fields(fields), copy_core_type(typ), loc)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			RecordConstructExpr(type_name, copy_record_fields(fields), copy_core_type(typ), loc)
 		ListConstructExpr(construct, typ, loc):
@@ -3489,6 +3495,16 @@ private pure func summarize_linear_ownership_uses(
 			summarize_exprs(env, name, items)
 		RecordExpr(fields, typ, loc):
 			summarize_record_fields(env, name, fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_linear_ownership_uses(env, name, base),
+				summarize_record_fields(env, name, fields),
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_record_fields(env, name, fields),
+				summarize_linear_ownership_uses(env, name, source),
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			summarize_record_fields(env, name, fields)
 		ListConstructExpr(construct, typ, loc):
@@ -4037,6 +4053,10 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			count_uses_in_exprs(name, items)
 		RecordExpr(fields, typ, loc):
 			count_uses_in_record_fields(name, fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			count_uses(name, base) + count_uses_in_record_fields(name, fields)
+		RecordReuseExpr(source, fields, typ, loc):
+			count_uses(name, source) + count_uses_in_record_fields(name, fields)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			count_uses_in_record_fields(name, fields)
 		ListConstructExpr(construct, typ, loc):
@@ -4374,6 +4394,10 @@ pure func is_linear(expr: CoreExpr) -> Bool:
 			exprs_are_linear(items)
 		RecordExpr(fields, typ, loc):
 			record_fields_are_linear(fields)
+		RecordUpdateExpr(base, fields, typ, loc):
+			is_linear(base) and record_fields_are_linear(fields)
+		RecordReuseExpr(source, fields, typ, loc):
+			is_linear(source) and record_fields_are_linear(fields)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_are_linear(fields)
 		ListConstructExpr(construct, typ, loc):
@@ -9389,6 +9413,32 @@ private pure func protect_repeated_consumes(
 				copy_core_type(typ),
 				loc,
 			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				protect_repeated_consumes(env, target, target_type, base, in_repeated_context),
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				protect_repeated_consumes(env, target, target_type, source, in_repeated_context),
+				protect_repeated_record_fields(
+					env,
+					target,
+					target_type,
+					fields,
+					in_repeated_context,
+				),
+				copy_core_type(typ),
+				loc,
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			RecordConstructExpr(
 				type_name,
@@ -10156,6 +10206,10 @@ private pure func is_owned_temporary_with_names(
 			VectorExpr(items, result_type, loc):
 				True
 			RecordExpr(fields, result_type, loc):
+				True
+			RecordUpdateExpr(base, fields, result_type, loc):
+				True
+			RecordReuseExpr(source, fields, result_type, loc):
 				True
 			RecordConstructExpr(type_name, fields, result_type, loc):
 				True
@@ -11111,6 +11165,22 @@ private pure func rewrite_aggregate_with_owned_field_aliases(
 				fields,
 			)
 			RecordExpr(rewritten_fields, owned_type, loc)
+		RecordUpdateExpr(base, fields, typ, loc):
+			owned_type: CoreType = copy_core_type(typ)
+			rewritten_base: CoreExpr = insert_drops_expr_inner(env, base)
+			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
+				env,
+				fields,
+			)
+			RecordUpdateExpr(rewritten_base, rewritten_fields, owned_type, loc)
+		RecordReuseExpr(source, fields, typ, loc):
+			owned_type: CoreType = copy_core_type(typ)
+			rewritten_source: CoreExpr = insert_drops_expr_inner(env, source)
+			rewritten_fields: List[CoreRecordFieldValue] = retain_direct_field_alias_record_fields(
+				env,
+				fields,
+			)
+			RecordReuseExpr(rewritten_source, rewritten_fields, owned_type, loc)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			owned_type_name: String = type_name
 			owned_type: CoreType = copy_core_type(typ)
@@ -11679,6 +11749,10 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		RecordExpr(fields, typ, loc):
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
+		RecordUpdateExpr(base, fields, typ, loc):
+			rewrite_aggregate_with_owned_field_aliases(env, expr)
+		RecordReuseExpr(source, fields, typ, loc):
+			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		ListConstructExpr(construct, typ, loc):
@@ -11773,6 +11847,20 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 			)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(
+				rewrite_record_fields(env, fields),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				insert_drops_expr_inner(env, base),
+				rewrite_record_fields(env, fields),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				insert_drops_expr_inner(env, source),
 				rewrite_record_fields(env, fields),
 				copy_core_type(typ),
 				loc,
@@ -13608,6 +13696,10 @@ private pure func retain_borrowed_aggregate_value_with_temp(
 			nested_safe_value
 		RecordExpr(fields, typ, loc):
 			nested_safe_value
+		RecordUpdateExpr(base, fields, typ, loc):
+			nested_safe_value
+		RecordReuseExpr(source, fields, typ, loc):
+			nested_safe_value
 		RecordConstructExpr(type_name, fields, typ, loc):
 			nested_safe_value
 		ListConstructExpr(construct, typ, loc):
@@ -14068,6 +14160,20 @@ private pure func protect_borrowed_param_calls(
 				copy_core_type(typ),
 				loc,
 			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				protect_borrowed_param_calls(env, param, base),
+				protect_borrowed_param_call_record_fields(env, param, fields),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				protect_borrowed_param_calls(env, param, source),
+				protect_borrowed_param_call_record_fields(env, param, fields),
+				copy_core_type(typ),
+				loc,
+			)
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			TensorBoxedLiteralExpr(
 				{ literal |
@@ -14495,6 +14601,20 @@ private pure func retain_borrowed_param_aggregate_members(
 			)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(
+				retain_borrowed_aggregate_record_fields(env, param, fields),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				retain_borrowed_param_aggregate_members(env, param, base),
+				retain_borrowed_aggregate_record_fields(env, param, fields),
+				copy_core_type(typ),
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				retain_borrowed_param_aggregate_members(env, param, source),
 				retain_borrowed_aggregate_record_fields(env, param, fields),
 				copy_core_type(typ),
 				loc,

@@ -8,6 +8,9 @@ let named_type name = kind "named" [ ("name", Lsp_json.String name); ("args", Ls
 let type_parameter name = kind "type_parameter" [ ("name", Lsp_json.String name) ]
 let int_type = named_type "Int"
 
+let value_record_type name =
+  kind "value_record" [ ("name", Lsp_json.String name) ]
+
 let function_type params return_type =
   kind "function"
     [
@@ -57,6 +60,31 @@ let function_decl ?source_module ?(type_params = []) ?(body = int_literal 0)
       ("pure", Lsp_json.Bool false);
       ("function_kind", kind "user" []);
       ("def_id", Lsp_json.Int def_id);
+      ("loc", synthetic_loc);
+    ]
+
+let value_record_decl name fields =
+  let field (field_name, field_type) =
+    Lsp_json.Object
+      [
+        ("name", Lsp_json.String field_name);
+        ("type", field_type);
+      ]
+  in
+  kind "value_record"
+    [
+      ("name", Lsp_json.String name);
+      ("type_params", Lsp_json.Array []);
+      ("fields", Lsp_json.Array (List.map field fields));
+      ("loc", synthetic_loc);
+    ]
+
+let field_expr base field_name field_type =
+  kind "field"
+    [
+      ("expr", base);
+      ("field", Lsp_json.String field_name);
+      ("type", field_type);
       ("loc", synthetic_loc);
     ]
 
@@ -116,7 +144,7 @@ let core_program ?(foreign_includes = []) decls =
         Lsp_json.Array (List.map (fun include_ -> Lsp_json.String include_) foreign_includes) );
     ]
 
-let request_json ?(schema = 13) ?(domain = "compiler_semantic_middle")
+let request_json ?(schema = 14) ?(domain = "compiler_semantic_middle")
     ?(core_phase = "post_tuple_sroa") ?(require_main = false)
     ?(core = core_program [])
     ?(capabilities = [ "core_post_tuple_sroa"; "core_pre_dce" ]) () =
@@ -238,6 +266,74 @@ let test_post_tuple_sroa_core_reaches_pre_dce () =
         (Modules.contains rendered "boundary_fixture.h")
   | Semantic_middle_worker.Failed _ -> assert false
 
+let test_record_update_reaches_pre_dce () =
+  let point_type = value_record_type "Point" in
+  let record_fields x y =
+    Lsp_json.Array
+      [
+        Lsp_json.Object
+          [ ("name", Lsp_json.String "x"); ("value", int_literal x) ];
+        Lsp_json.Object
+          [ ("name", Lsp_json.String "y"); ("value", int_literal y) ];
+      ]
+  in
+  let initial =
+    kind "record"
+      [
+        ("fields", record_fields 1 2);
+        ("type", point_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let update =
+    let base = variable_expr "point" point_type in
+    kind "record_update"
+      [
+        ("base", base);
+        ( "fields",
+          Lsp_json.Array
+            [
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "x");
+                  ("value", int_literal 10);
+                ];
+              Lsp_json.Object
+                [
+                  ("name", Lsp_json.String "y");
+                  ("value", field_expr base "y" int_type);
+                ];
+            ] );
+        ("type", point_type);
+        ("loc", synthetic_loc);
+      ]
+  in
+  let body =
+    kind "let"
+      [
+        ("name", variable "point" ());
+        ("mutable", Lsp_json.Bool false);
+        ("type", point_type);
+        ("rhs", initial);
+        ( "body",
+          kind "seq"
+            [ ("first", update); ("second", int_literal 0) ] );
+      ]
+  in
+  let core =
+    core_program
+      [
+        value_record_decl "Point" [ ("x", int_type); ("y", int_type) ];
+        function_decl ~body "main" 2;
+      ]
+  in
+  match response_or_fail (decode_ok (request_json ~core ())) with
+  | Semantic_middle_worker.Compiled { core } ->
+      Alcotest.(check bool)
+        "record update remains explicit" true
+        (Modules.contains (Lsp_json.to_string core) {|"kind":"record_update"|})
+  | Semantic_middle_worker.Failed _ -> assert false
+
 let test_rejects_core_from_before_debug_lowering () =
   let marker = 987654 in
   let debug_body =
@@ -344,7 +440,7 @@ let test_require_main_validation () =
 let test_response_json_is_versioned () =
   let response = response_or_fail (decode_ok (request_json ())) in
   let json = Semantic_middle_worker.response_json response in
-  Alcotest.(check (option int)) "schema" (Some 13) (Lsp_json.get_int "schema" json);
+  Alcotest.(check (option int)) "schema" (Some 14) (Lsp_json.get_int "schema" json);
   Alcotest.(check (option string)) "domain" (Some "compiler_semantic_middle")
     (Lsp_json.get_string "domain" json)
 
@@ -365,6 +461,8 @@ let suite =
       [
         Alcotest.test_case "post-tuple-SROA Core reaches pre-DCE" `Quick
           test_post_tuple_sroa_core_reaches_pre_dce;
+        Alcotest.test_case "record update reaches pre-DCE" `Quick
+          test_record_update_reaches_pre_dce;
         Alcotest.test_case "reject Core from before debug lowering" `Quick
           test_rejects_core_from_before_debug_lowering;
         Alcotest.test_case "accept synthesis-introduced mutable local" `Quick
