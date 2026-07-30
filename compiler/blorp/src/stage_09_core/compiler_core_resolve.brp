@@ -43,6 +43,7 @@ import:
 			AssignExpr,
 			BorrowLetExpr,
 			CallExpr,
+			CastExpr,
 			ConcurrentExpr,
 			ConcurrentlyLoopExpr,
 			ConstructorMatchExpr,
@@ -180,6 +181,12 @@ private record CoreProgramResolution {
 private record CoreGlobalValueResolveContext {
 	resolutions: CoreProgramResolution,
 	scope: List[String]
+}
+
+
+private record CoreGlobalValueCastLayer {
+	typ: CoreType,
+	loc: CoreSourceLoc
 }
 
 
@@ -1338,8 +1345,44 @@ private pure func resolve_call_kind(
 -- a newly extended scope while a sibling child still uses it. Pass an
 -- independent list into the recursive dispatcher because that bootstrap also
 -- consumes one reference from the scope argument while compiling the large
--- non-spine match. Calls and right-associated sequences stay in this small
--- dispatcher so their depth does not multiply that match's generated-C frame.
+-- non-spine match. Calls, casts, and right-associated sequences stay in this
+-- small dispatcher so their depth does not multiply that match's generated-C
+-- frame. Casts also rebuild iteratively because source programs can contain
+-- long explicit conversion spines.
+private pure func resolve_global_value_cast_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var layers: List[CoreGlobalValueCastLayer] = []
+	var current: CoreExpr = expr
+
+	while True:
+		match current:
+			CastExpr(value, typ, loc):
+				layers = layers.append({
+					typ = typ,
+					loc = loc,
+				})
+				current = value
+			_:
+				break
+
+	var resolved: CoreExpr = resolve_global_value_expr(resolutions, copy_scope(scope), current)
+	var index: Int = layers.length() - 1
+
+	while index >= 0:
+		match layers.get(index):
+			Some(layer):
+				resolved = CastExpr(resolved, layer.typ, layer.loc)
+			None:
+				void
+
+		index -= 1
+
+	resolved
+
+
 private pure func resolve_global_value_expr(
 	resolutions: CoreProgramResolution,
 	scope: List[String],
@@ -1422,6 +1465,8 @@ private pure func resolve_global_value_expr(
 				else_expr,
 			)
 			IfExpr(resolved_cond, resolved_then, resolved_else, typ, loc)
+		CastExpr(_, _, _):
+			resolve_global_value_cast_expr(resolutions, scope, expr)
 		_:
 			context: CoreGlobalValueResolveContext = {
 				resolutions = resolutions,

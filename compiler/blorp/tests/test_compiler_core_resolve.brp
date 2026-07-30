@@ -27,6 +27,7 @@ import:
 			AssignExpr,
 			BorrowLetExpr,
 			CallExpr,
+			CastExpr,
 			ConcurrentExpr,
 			ConcurrentlyLoopExpr,
 			ConstructorMatchExpr,
@@ -82,7 +83,7 @@ import:
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreRetainPolicy(NoRetainPolicy),
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
-		CoreSourceLoc(SyntheticSourceLoc),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
 		CoreTaskClosure,
 		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTensorRawScalarKind(TensorInt64Elements),
@@ -843,6 +844,90 @@ pure func deep_if_global_is_resolved(
 				False
 
 
+pure func deep_cast_type(index: Int) -> CoreType:
+	if index % 2 == 0:
+		int_type()
+	else:
+		bool_type()
+
+
+pure func deep_cast_loc(index: Int) -> CoreSourceLoc:
+	KnownSourceLoc({
+		file = "deep_cast.brp",
+		line = index + 1,
+		column = index + 2,
+		end_line = index + 1,
+		end_column = index + 3,
+	})
+
+
+pure func nested_casts(final_expr: CoreExpr, depth: Int) -> CoreExpr:
+	var result: CoreExpr = final_expr
+	var index: Int = 0
+
+	while index < depth:
+		result = CastExpr(result, deep_cast_type(index), deep_cast_loc(index))
+		index += 1
+
+	result
+
+
+pure func deep_cast_global_is_resolved(
+	expr: CoreExpr,
+	global_name: String,
+	global_id: Int,
+	expected_depth: Int,
+) -> Bool:
+	var current: CoreExpr = expr
+	var resolved_casts: Int = 0
+	var valid: Bool = True
+
+	while resolved_casts < expected_depth and valid:
+		match current:
+			CastExpr(value, typ, loc):
+				expected_index: Int = expected_depth - resolved_casts - 1
+
+				expected_type_name: String = if expected_index % 2 == 0:
+					"Int"
+				else:
+					"Bool"
+
+				type_matches: Bool = match typ:
+					NamedType(name, args):
+						name == expected_type_name and args.length() == 0
+					_:
+						False
+
+				loc_matches: Bool = match loc:
+					KnownSourceLoc(span):
+						(
+							span.file == "deep_cast.brp"
+							and span.line == expected_index + 1
+							and span.column == expected_index + 2
+							and span.end_line == expected_index + 1
+							and span.end_column == expected_index + 3
+						)
+					_:
+						False
+
+				if type_matches and loc_matches:
+					current = value
+					resolved_casts += 1
+				else:
+					valid = False
+			_:
+				valid = False
+
+	if not valid or resolved_casts != expected_depth:
+		False
+	else:
+		match current:
+			VarExpr(variable, typ, loc):
+				variable.name == global_name and variable.def_id == Some(global_id)
+			_:
+				False
+
+
 pure func nested_tuples(final_expr: CoreExpr, depth: Int) -> CoreExpr:
 	var result: CoreExpr = final_expr
 	var index: Int = 0
@@ -854,7 +939,7 @@ pure func nested_tuples(final_expr: CoreExpr, depth: Int) -> CoreExpr:
 	result
 
 
-pure func deep_tuple_global_is_resolved(
+pure func nested_tuple_global_is_resolved(
 	expr: CoreExpr,
 	global_name: String,
 	global_id: Int,
@@ -990,7 +1075,7 @@ pure func test_deep_global_resolution_spines_are_stack_bounded() -> Bool:
 			False
 
 
-pure func test_deep_generic_global_resolution_is_stack_bounded() -> Bool:
+pure func test_deep_cast_global_resolution_is_stack_bounded() -> Bool:
 	depth: Int = 256
 	global_name: String = "answer"
 	global_id: Int = 148
@@ -999,14 +1084,38 @@ pure func test_deep_generic_global_resolution_is_stack_bounded() -> Bool:
 		function_decl(
 			"main",
 			149,
-			nested_tuples(var_expr(global_name), depth),
+			nested_casts(var_expr(global_name), depth),
 		),
 	])
 	resolved: CoreProgram = resolve_global_value_refs(input)
 
 	match function_body(resolved, "main"):
 		Some(body):
-			deep_tuple_global_is_resolved(body, global_name, global_id, depth)
+			deep_cast_global_is_resolved(body, global_name, global_id, depth)
+		None:
+			False
+
+
+-- Keep this bounded until List[CoreExpr] element destruction is iterative.
+-- A deeper tuple chain otherwise tests recursive teardown rather than the
+-- generic resolver traversal this fixture is meant to cover.
+pure func test_nested_tuple_global_resolution_uses_generic_mapping() -> Bool:
+	depth: Int = 16
+	global_name: String = "tuple_answer"
+	global_id: Int = 150
+	input: CoreProgram = program([
+		global_decl(global_name, global_id, int_literal(42)),
+		function_decl(
+			"tuple_main",
+			151,
+			nested_tuples(var_expr(global_name), depth),
+		),
+	])
+	resolved: CoreProgram = resolve_global_value_refs(input)
+
+	match function_body(resolved, "tuple_main"):
+		Some(body):
+			nested_tuple_global_is_resolved(body, global_name, global_id, depth)
 		None:
 			False
 
@@ -2850,8 +2959,12 @@ tests: TestSuite = {
 			test_deep_global_resolution_spines_are_stack_bounded,
 		),
 		(
-			"deep generic global resolution is stack bounded",
-			test_deep_generic_global_resolution_is_stack_bounded,
+			"deep cast global resolution is stack bounded",
+			test_deep_cast_global_resolution_is_stack_bounded,
+		),
+		(
+			"nested tuple global resolution uses generic mapping",
+			test_nested_tuple_global_resolution_uses_generic_mapping,
 		),
 		("resolves unique selected direct call", test_resolves_unique_selected_direct_call),
 		(

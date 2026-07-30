@@ -6,6 +6,7 @@ import:
 			AssignExpr,
 			CallExpr,
 			FieldExpr,
+			IfExpr,
 			LetExpr,
 			ListConstructExpr,
 			LiteralExpr,
@@ -17,7 +18,7 @@ import:
 		),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -39,6 +40,10 @@ import:
 
 pure func int_type() -> CoreType:
 	NamedType("Int", [])
+
+
+pure func bool_type() -> CoreType:
+	NamedType("Bool", [])
 
 
 pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
@@ -465,6 +470,332 @@ pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
 	)
 
 
+pure func counter_box_update_from(
+	box_var: CoreVar,
+	update_base_var: CoreVar,
+	count: Int,
+	limit: Int,
+) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+
+	LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		VarExpr(
+			box_var,
+			box_type,
+			SyntheticSourceLoc,
+		),
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(count), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(limit), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func heap_record_branch_self_update_program(
+	mixed_else: Bool,
+	mutating_condition: Bool,
+	nested_else: Bool,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	then_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	else_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	nested_else_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+
+	flat_else_expr: CoreExpr = if mixed_else:
+		box_ref
+	else:
+		counter_box_update_from(box_var, else_base_var, 12, 22)
+
+	else_expr: CoreExpr = if nested_else:
+		IfExpr(
+			LiteralExpr(BoolLiteral(False), bool_type(), SyntheticSourceLoc),
+			flat_else_expr,
+			counter_box_update_from(box_var, nested_else_base_var, 14, 24),
+			box_type,
+			SyntheticSourceLoc,
+		)
+	else:
+		flat_else_expr
+
+	condition: CoreExpr = if mutating_condition:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	update: CoreExpr = IfExpr(
+		condition,
+		counter_box_update_from(box_var, then_base_var, 11, 21),
+		else_expr,
+		box_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "branch_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 10,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_if_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_branch_self_update_program(False, False, False),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_perceus_reuses_nested_if_branch_self_updates() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_branch_self_update_program(False, False, True),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 3
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_if_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_branch_self_update_program(
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_if_condition_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_branch_self_update_program(
+				False,
+				True,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func heap_record_nested_self_update_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	inner_base_var: CoreVar = {
+		name = "__record_update",
+		uniq = 1,
+		def_id = None
+	}
+	outer_base_var: CoreVar = {
+		name = "__record_update",
+		uniq = 2,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	inner_base_ref: CoreExpr = VarExpr(inner_base_var, box_type, SyntheticSourceLoc)
+	outer_base_ref: CoreExpr = VarExpr(outer_base_var, box_type, SyntheticSourceLoc)
+	inner_update: CoreExpr = LetExpr(
+		inner_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			inner_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(inner_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	nested_update: CoreExpr = LetExpr(
+		outer_base_var,
+		False,
+		box_type,
+		inner_update,
+		RecordUpdateExpr(
+			outer_base_ref,
+			[
+				{
+					name = "count",
+					value = FieldExpr(outer_base_ref, "count", int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(21), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, nested_update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "nested_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 9,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_nested_heap_record_self_update_stages_one_reuse() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_nested_self_update_program(),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 1
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"record\"")
+		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$1$0\"")
+		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$0\"")
+	)
+
+
 pure func heap_record_self_update_with_target_assignment_program() -> CoreProgram:
 	box_type: CoreType = HeapRecordType("CounterBox")
 	box_var: CoreVar = {
@@ -652,6 +983,23 @@ tests: TestSuite = {
 		(
 			"Perceus marks heap-record self update for reuse",
 			test_perceus_marks_heap_record_self_update_for_reuse,
+		),
+		(
+			"Perceus reuses heap-record self update in every if branch",
+			test_perceus_reuses_heap_record_self_update_in_every_if_branch,
+		),
+		(
+			"Perceus reuses nested if branch self updates",
+			test_perceus_reuses_nested_if_branch_self_updates,
+		),
+		("record reuse rejects mixed if branches", test_record_reuse_rejects_mixed_if_branches),
+		(
+			"record reuse rejects if condition that assigns target",
+			test_record_reuse_rejects_if_condition_that_assigns_target,
+		),
+		(
+			"nested heap-record self update stages one reuse",
+			test_nested_heap_record_self_update_stages_one_reuse,
 		),
 		(
 			"record reuse rejects fields that assign the target",

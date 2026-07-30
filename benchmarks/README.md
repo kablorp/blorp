@@ -145,15 +145,29 @@ their release and live-object baselines; use
 those lifecycle counts.
 
 `compiler_record_update_temporary_reuse_allocations` measures a nested update in
-the same loop. The source form historically allocated two records per
-iteration. The probe asserts `100001` allocations for 100,000 iterations: one
-initial record plus one fallback allocation per iteration, with the dead outer
-temporary reusing the inner update's storage.
+the same loop. The source form historically required one fallback allocation
+per iteration after reusing the dead outer temporary: `100001` allocations and
+`100000` releases for 100,000 iterations. Nested mutable self-updates now stage
+their field values and reuse the original record once, so the probe asserts one
+initial allocation, no loop releases, and one live result.
 
 ```bash
 benchmarks/compiler_record_update_temporary_reuse_allocations
 BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
   benchmarks/compiler_record_update_temporary_reuse_allocations
+```
+
+`compiler_record_update_branch_allocations` measures alternating mutable
+self-updates selected by an `if` expression. The source form historically
+retained the old owner in both branches, causing `100001` allocations and
+`100000` releases for 100,000 iterations. When every branch updates from the
+same owner, the ownership preparation pass now transfers that owner within each
+branch, so the probe asserts one initial allocation and no loop releases.
+
+```bash
+benchmarks/compiler_record_update_branch_allocations
+BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
+  benchmarks/compiler_record_update_branch_allocations
 ```
 
 ### Frontend and Typecheck Function Profile
