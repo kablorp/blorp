@@ -95,24 +95,110 @@ loop.
    typed-expression validation are now measured independently, and finalization
    reuses its canonical zonked value slot for coherent mirrored type fields.
    Malformed mirrors are still zonked independently so validation can report
-   them. The next low-risk target is combining the two always-on typed-expression
-   validation traversals without weakening their diagnostics.
-2. Signature registration remains the best low-risk target. The ordinary
-   non-builtin resource-policy scan and resource-boundary parameter
-   re-canonicalization have been removed, and its temporary source function type
-   now shares immutable parameter and return values instead of deep-copying
-   them. Simple resource-scan context reuse was rejected after it reproducibly
-   caused a SIGSEGV: the scan consumes its context under the generated ownership
-   model. Removing the remaining state/context copies therefore requires
-   ownership-aware result threading and is not a low-risk candidate.
-3. Lexing is the largest non-typecheck phase. `scan_one` calls multi-character
-   prefix checks for tokens whose first character cannot match; first-character
-   guards are a narrow candidate to measure.
-4. Typed-program validation is material but protects compiler invariants.
-   Prefer combining redundant typed-expression traversals over disabling the
-   checks.
+   them. A recursive struct that combined the two validation traversals was
+   measured and rejected; keep the specialized `Bool` and `Option[String]`
+   traversals until the ownership cost of aggregate returns is addressed.
+2. Signature registration is no longer a low-risk latency target. The completed
+   aggregate production measurement found 0.045% fewer instructions on the CLI
+   request and no measurable wall-time change. The remaining state/context
+   copies require ownership-aware result threading.
+3. Lexing is the largest non-typecheck phase. First-character guards in
+   `scan_one` remove impossible docstring, comment, and raw-string prefix probes.
+   Measure symbol dispatch separately before replacing its ordered prefix chain.
+4. `scan_symbol_or_error` remains the next narrow lexer target. It currently
+   attempts operators beginning with unrelated characters; dispatching on the
+   already-peeked character can reduce those probes without changing token
+   precedence.
 5. Add independently controlled depth, declaration-count, and graph-width
    fixtures before using this benchmark as an algorithmic scaling gate.
+
+## Typed-Expression Validation Experiment
+
+The typed-program validator previously called
+`compiler_typed_expr_contains_meta` and then
+`compiler_typed_expr_type_error`. A one-pass experiment returned a stack struct
+containing `Option[String]` and `Bool`, preserved meta-error precedence, and
+passed the focused infer and declaration suites.
+
+The implementation was still rejected. Six alternating five-iteration samples
+of the retained function-heavy fixture averaged 1,264.744 ms for the combined
+traversal and 1,166.525 ms for the two specialized traversals, an 8.4%
+regression. The profiled validation envelope was also substantially slower.
+Returning and merging the string-bearing aggregate at every recursive node
+cost more than the eliminated walk under the generated ownership model. No
+source changes from this experiment were retained. Raw samples are in
+`compiler_typed_expr_validation_profiled_2026-07-29.tsv`.
+
+## Lexer First-Character Guard Result
+
+`scan_one` now checks the already-peeked character before probing docstring,
+comment, raw-string, or raw-pipe prefixes. Recognition order and the prefix
+helpers themselves are unchanged.
+
+On one iteration of the retained function-heavy fixture, structural counts
+changed as follows:
+
+| Operation | Baseline | Candidate | Change |
+|-----------|----------|-----------|--------|
+| `starts_with` calls | 38,839 | 21,473 | -17,366 (-44.7%) |
+| docstring-delimiter probes | 4,478 | 257 | -4,221 (-94.3%) |
+| raw-pipe-block probes | 4,478 | 16 | -4,462 (-99.6%) |
+
+The original whole-process comparison is retained in
+`compiler_lexer_first_character_guards_profiled_2026-07-29.tsv`, but it does
+not establish a latency result. The fixture repeats typechecking while lexing
+only twice during request setup, so its 20-iteration process counters do not
+amplify this lexer change. The operation counts above are the evidence for
+retaining the narrow guards; a dedicated repeated-lexing fixture is still
+needed for a production latency claim.
+
+## Grouped Lexer Dispatch Experiment
+
+Grouping the two `'-'` branches and the two `'r'` branches under one outer
+character check preserved behavior, including standalone `-` symbols and
+identifier near-misses such as `r`, `rawish`, and `record`. The focused lexer
+suite passed all 25 tests.
+
+The source-level simplification was rejected because its generated result was
+larger and it did not measure faster. At `-O0`, `scan_one` grew from 4,732 to
+5,128 bytes, from 1,183 to 1,282 static instructions, from 193 to 205 branch
+sites, and from 111 to 124 call sites. Ten alternating direct profiler pairs
+were also mixed: the grouped candidate averaged 0.52% slower in `compiler_lex`
+and 0.60% slower in `scan_one`. The larger lowering is consistent with nested
+aggregate-return branches duplicating ownership cleanup. Keep the flat
+short-circuit guards until that control flow lowers more compactly. Raw samples
+are in `compiler_lexer_grouped_dispatch_profiled_2026-07-29.tsv`.
+
+## Module-Surface Accumulation Result
+
+`module_surface_exports` and `module_surface_private_names` now accumulate
+symbols into one uniquely owned list instead of recursively concatenating each
+declaration's additions. Source order and decoded declaration indexes are
+preserved.
+
+The A/B artifacts were generated from base revision `a0a1b138`. The candidate
+contains the module-surface accumulation patch later committed in `7bd4db16`;
+the baseline retains the recursive accumulation. Each row is one process
+invocation of:
+
+```text
+BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
+  benchmarks/compiler_typecheck_profile 1 1 16 WIDTH retained
+```
+
+Two order-alternated samples at each width produced these phase-local means:
+
+| Width | Recursive | Iterative | Reduction | Speedup |
+|------:|----------:|----------:|----------:|--------:|
+| 256 | 1.679 ms | 0.557 ms | 66.8% | 3.01x |
+| 512 | 4.180 ms | 1.067 ms | 74.5% | 3.92x |
+| 1024 | 13.137 ms | 2.097 ms | 84.0% | 6.27x |
+
+Every run reported `workload_valid=True` with the expected checksum. Complete
+artifact keys, binary SHA-256s, fixture configuration, host information, and
+raw timings are in
+`compiler_module_surface_accumulation_profiled_2026-07-29.tsv`. These results
+establish a phase-local scaling improvement, not an end-to-end latency claim.
 
 ## Signature Registration Result
 
