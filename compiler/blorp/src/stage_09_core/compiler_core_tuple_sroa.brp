@@ -124,6 +124,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreParam,
 		CorePreClosureConcurrentBinding,
@@ -1876,14 +1877,24 @@ private pure func tuple_return_elements_from_body(
 	scope: List[TupleReturnScopeBinding],
 	body: CoreExpr,
 ) -> Option[List[TupleReturnExpr]]:
+	-- Keep nested payload checks explicit. The current constructor decision-tree
+	-- compiler can lose later payload tests when cases share an earlier literal.
 	maybe_elements: Option[List[CoreExpr]] = match body:
 		TupleExpr(tuple_elements, _, _):
 			Some(tuple_elements)
-		LetExpr(variable_name, False, _, TupleExpr(tuple_elements, _, _), VarExpr(result, _, _)):
-			if core_var_equal(variable_name, result):
-				Some(tuple_elements)
-			else:
-				None
+		LetExpr(variable_name, False, _, rhs, next_body):
+			match rhs:
+				TupleExpr(tuple_elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								Some(tuple_elements)
+							else:
+								None
+						_:
+							None
+				_:
+					None
 		_:
 			None
 
@@ -1946,29 +1957,41 @@ private pure func tuple_return_summary_from_body(
 	match body:
 		TupleExpr(elements, _, _):
 			finish_tuple_return_summary(layout_types, params, scope, locals, elements)
-		LetExpr(variable_name, False, _, TupleExpr(elements, _, _), VarExpr(result, _, _)):
-			if core_var_equal(variable_name, result):
-				finish_tuple_return_summary(layout_types, params, scope, locals, elements)
-			else:
-				None
 		LetExpr(variable_name, False, typ, rhs, next_body):
-			if core_type_is_known_unmanaged(layout_types, typ):
-				summary_rhs ?= tuple_return_expr_of_core(layout_types, scope, rhs)
-				tuple_return_summary_from_body(
-					layout_types,
-					params,
-					scope.append({
-						variable = variable_name,
-						reference = TupleReturnLocalReference(locals.length()),
-					}),
-					locals.append({
-						rhs = summary_rhs,
-						typ = typ,
-					}),
-					next_body,
-				)
-			else:
-				None
+			match rhs:
+				TupleExpr(elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								finish_tuple_return_summary(
+									layout_types,
+									params,
+									scope,
+									locals,
+									elements,
+								)
+							else:
+								None
+						_:
+							None
+				_:
+					if core_type_is_known_unmanaged(layout_types, typ):
+						summary_rhs ?= tuple_return_expr_of_core(layout_types, scope, rhs)
+						tuple_return_summary_from_body(
+							layout_types,
+							params,
+							scope.append({
+								variable = variable_name,
+								reference = TupleReturnLocalReference(locals.length()),
+							}),
+							locals.append({
+								rhs = summary_rhs,
+								typ = typ,
+							}),
+							next_body,
+						)
+					else:
+						None
 		IfExpr(cond, then_body, else_body, _, _):
 			summary_cond ?= tuple_return_expr_of_core(layout_types, scope, cond)
 			then_elements ?= tuple_return_elements_from_body(layout_types, scope, then_body)
@@ -2608,6 +2631,11 @@ private record TupleSroaSelectArmsRewrite {
 }
 
 
+private union TupleSroaLogicalTask:
+	RewriteTupleSroaLogicalTask(CoreExpr)
+	RebuildTupleSroaLogicalTask(CoreLogicalOp, CoreType, CoreSourceLoc)
+
+
 private pure func rewrite_tuple_sroa_exprs(
 	context: TupleSroaContext,
 	items: List[CoreExpr],
@@ -2949,6 +2977,111 @@ private pure func rewrite_tuple_sroa_semantic_tree(
 			}
 
 
+-- Source-level `and` and `or` chains become deep logical trees. This pass has
+-- a large generated C frame, so recurse only at non-logical boundaries and
+-- keep the logical subtree itself on an explicit work stack.
+private pure func rewrite_tuple_sroa_logical_expr(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	var tasks: List[TupleSroaLogicalTask] = [RewriteTupleSroaLogicalTask(expr)]
+	var task_count: Int = 1
+	var rewritten: List[CoreExpr] = []
+	var rewritten_count: Int = 0
+	var current: Int = next_fresh
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					RewriteTupleSroaLogicalTask(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: TupleSroaLogicalTask = RebuildTupleSroaLogicalTask(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: TupleSroaLogicalTask = RewriteTupleSroaLogicalTask(
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: TupleSroaLogicalTask = RewriteTupleSroaLogicalTask(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+									context,
+									current_expr,
+									current,
+								)
+
+								rewritten = if rewritten_count < rewritten.length():
+									rewritten.set(rewritten_count, result.expr)
+								else:
+									rewritten.append(result.expr)
+
+								rewritten_count += 1
+								current = result.next_fresh
+					RebuildTupleSroaLogicalTask(op, typ, loc):
+						match (
+							rewritten.get(rewritten_count - 2),
+							rewritten.get(rewritten_count - 1),
+						):
+							(Some(left), Some(right)):
+								rewritten = rewritten.set(
+									rewritten_count - 2,
+									LogicalExpr(op, left, right, typ, loc),
+								)
+								rewritten_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and rewritten_count == 1:
+		match rewritten.get(0):
+			Some(result):
+				{
+					expr = result,
+					next_fresh = current
+				}
+			None:
+				{
+					expr = expr,
+					next_fresh = next_fresh
+				}
+	else:
+		{
+			expr = expr,
+			next_fresh = next_fresh
+		}
+
+
 private pure func rewrite_tuple_sroa_expr_from(
 	context: TupleSroaContext,
 	expr: CoreExpr,
@@ -2993,17 +3126,8 @@ private pure func rewrite_tuple_sroa_expr_from(
 				expr = UnaryExpr(op, result.expr, typ, loc),
 				next_fresh = result.next_fresh
 			}
-		LogicalExpr(op, left, right, typ, loc):
-			left_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, left, next_fresh)
-			right_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
-				context,
-				right,
-				left_result.next_fresh,
-			)
-			{
-				expr = LogicalExpr(op, left_result.expr, right_result.expr, typ, loc),
-				next_fresh = right_result.next_fresh
-			}
+		LogicalExpr(_, _, _, _, _):
+			rewrite_tuple_sroa_logical_expr(context, expr, next_fresh)
 		AssignExpr(variable_name, rhs, typ, loc):
 			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
 			{

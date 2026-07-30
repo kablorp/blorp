@@ -11,6 +11,7 @@ import:
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
+			LogicalExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			ResourceScopeExpr,
@@ -24,6 +25,7 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
+		CoreLogicalOp(AndOp),
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreParam,
 		CoreProgram,
@@ -53,6 +55,8 @@ TY_PAIR: CoreType = TupleType([TY_INT, TY_INT])
 TY_STRING_PAIR: CoreType = TupleType([TY_STRING, TY_INT])
 
 TY_BOX: CoreType = HeapRecordType("Box")
+
+DEEP_LOGICAL_LENGTH: Int = 512
 
 
 private pure func core_var(name: String) -> CoreVar:
@@ -765,6 +769,150 @@ func test_managed_tuple_return_call_is_unchanged() -> Bool:
 			False
 
 
+private pure func tuple_return_after_scalar_let_program() -> CoreProgram:
+	local: CoreVar = core_var("local")
+	make_pair: CoreDecl = function_decl(
+		"make_pair_after_let",
+		44,
+		[],
+		TY_PAIR,
+		LetExpr(
+			local,
+			False,
+			TY_INT,
+			int_literal(40),
+			TupleExpr(
+				[variable_with_identity(local, TY_INT), int_literal(2)],
+				TY_PAIR,
+				SyntheticSourceLoc,
+			),
+		),
+	)
+	call: CoreExpr = CallExpr(
+		UserCall("make_pair_after_let", Some(44), []),
+		variable(
+			"make_pair_after_let",
+			function_type([], TY_PAIR),
+		),
+		[],
+		TY_PAIR,
+		SyntheticSourceLoc,
+	)
+	caller: CoreDecl = function_decl(
+		"caller_after_let",
+		45,
+		[],
+		TY_INT,
+		immutable_let(
+			"pair",
+			TY_PAIR,
+			call,
+			field(
+				variable("pair", TY_PAIR),
+				"0",
+				TY_INT,
+			),
+		),
+	)
+
+	program([make_pair, caller])
+
+
+func test_tuple_return_summary_traverses_scalar_let() -> Bool:
+	rewritten: CoreProgram = rewrite_tuple_sroa_program(tuple_return_after_scalar_let_program())
+
+	match function_body_at(rewritten, 1):
+		Some(LetExpr(local, False, _, LiteralExpr(IntLiteral(40), _, _), LetExpr(first_element, False, _, VarExpr(first_source, _, _), LetExpr(_, False, _, LiteralExpr(IntLiteral(2), _, _), VarExpr(result, _, _))))):
+			core_var_equal(first_source, local) and core_var_equal(result, first_element)
+		None:
+			False
+		_:
+			False
+
+
+private pure func deep_left_logical_expr() -> CoreExpr:
+	var result: CoreExpr = bool_literal(True)
+	var index: Int = 0
+
+	while index < DEEP_LOGICAL_LENGTH:
+		result = LogicalExpr(
+			AndOp,
+			result,
+			bool_literal(index % 2 == 0),
+			TY_BOOL,
+			SyntheticSourceLoc,
+		)
+		index += 1
+
+	result
+
+
+private pure func left_logical_depth(expr: CoreExpr) -> Int:
+	var current: CoreExpr = expr
+	var depth: Int = 0
+	var valid: Bool = True
+
+	while valid:
+		match current:
+			LogicalExpr(AndOp, left, _, _, _):
+				depth += 1
+				current = left
+			LiteralExpr(BoolLiteral(_), _, _):
+				break
+			_:
+				valid = False
+
+	if valid:
+		depth
+	else:
+		-1
+
+
+func test_deep_logical_rewrite_is_stack_bounded() -> Bool:
+	rewritten: CoreExpr = rewrite_tuple_sroa_expr(deep_left_logical_expr())
+	left_logical_depth(rewritten) == DEEP_LOGICAL_LENGTH
+
+
+func test_logical_rewrite_preserves_left_to_right_fresh_order() -> Bool:
+	bool_pair_type: CoreType = TupleType([TY_BOOL, TY_BOOL])
+	left: CoreExpr = field(
+		TupleExpr(
+			[bool_literal(True), bool_literal(False)],
+			bool_pair_type,
+			SyntheticSourceLoc,
+		),
+		"0",
+		TY_BOOL,
+	)
+	right: CoreExpr = field(
+		TupleExpr(
+			[bool_literal(False), bool_literal(True)],
+			bool_pair_type,
+			SyntheticSourceLoc,
+		),
+		"1",
+		TY_BOOL,
+	)
+	rewritten: CoreExpr = rewrite_tuple_sroa_expr(
+		LogicalExpr(
+			AndOp,
+			left,
+			right,
+			TY_BOOL,
+			SyntheticSourceLoc,
+		),
+	)
+
+	generated_binding_names(
+		rewritten,
+	) == [
+		"$blorp$tuple_sroa$element$0",
+		"$blorp$tuple_sroa$element$1",
+		"$blorp$tuple_sroa$element$2",
+		"$blorp$tuple_sroa$element$3",
+	]
+
+
 func test_generated_bindings_are_program_wide_unique() -> Bool:
 	left: CoreExpr = field(
 		TupleExpr(
@@ -854,6 +1002,15 @@ tests: TestSuite = {
 			test_unmanaged_tuple_return_call_scalar_replaced,
 		),
 		("managed tuple return call is unchanged", test_managed_tuple_return_call_is_unchanged),
+		(
+			"tuple return summary traverses scalar let",
+			test_tuple_return_summary_traverses_scalar_let,
+		),
+		("deep logical rewrite is stack bounded", test_deep_logical_rewrite_is_stack_bounded),
+		(
+			"logical rewrite preserves left-to-right fresh order",
+			test_logical_rewrite_preserves_left_to_right_fresh_order,
+		),
 		(
 			"generated bindings are program-wide unique",
 			test_generated_bindings_are_program_wide_unique,
