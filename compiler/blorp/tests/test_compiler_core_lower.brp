@@ -89,6 +89,7 @@ import:
 			CompilerTypedDebugBlockExpr,
 			CompilerTypedDetachExpr,
 			CompilerTypedFieldAccessExpr,
+			CompilerTypedFloatLiteralExpr,
 			CompilerTypedForExpr,
 			CompilerTypedIfExpr,
 			CompilerTypedIntLiteralExpr,
@@ -243,7 +244,14 @@ import:
 		CoreForeignArgPassing(ForeignDefaultArgs),
 		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
 		CoreListStorageLayout(InlineListStorage),
-		CoreLiteral(BoolLiteral, IntLiteral, WideIntLiteral),
+		CoreLiteral(
+			BoolLiteral,
+			FloatInfinityLiteral,
+			FloatNanLiteral,
+			FloatNegInfinityLiteral,
+			IntLiteral,
+			WideIntLiteral,
+		),
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
 		CorePattern(ConstructorPattern, LiteralPattern, NamePattern, WildcardPattern),
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -503,6 +511,10 @@ pure func resolved_call_info(
 
 pure func int_expr(text: String) -> CompilerTypedExpr:
 	CompilerTypedIntLiteralExpr(text, source_span(), expr_info(int_type()))
+
+
+pure func float_expr(text: String) -> CompilerTypedExpr:
+	CompilerTypedFloatLiteralExpr(text, source_span(), expr_info(CompilerNamedType("Float", [])))
 
 
 pure func bool_expr(value: Bool) -> CompilerTypedExpr:
@@ -789,6 +801,18 @@ func test_lowers_int_literal_with_known_location() -> Bool:
 			)
 			core_exprs_equal(expr, expected)
 		Err(_):
+			False
+
+
+func test_lowers_special_float_literals() -> Bool:
+	match (
+		lower_typed_expr(float_expr("inf")),
+		lower_typed_expr(float_expr("-inf")),
+		lower_typed_expr(float_expr("nan")),
+	):
+		(Ok(LiteralExpr(FloatInfinityLiteral, _, _)), Ok(LiteralExpr(FloatNegInfinityLiteral, _, _)), Ok(LiteralExpr(FloatNanLiteral, _, _))):
+			True
+		_:
 			False
 
 
@@ -2157,7 +2181,7 @@ func test_lowers_tuple_destruct_skipping_wildcard() -> Bool:
 			False
 
 
-func test_lowers_question_bind_option_to_constructor_match() -> Bool:
+func test_lowers_question_bind_option_to_raw_match() -> Bool:
 	rhs = CompilerTypedNameExpr(ident("maybe"), expr_info(option_int_type()))
 	question = CompilerTypedQuestionBindExpr(
 		ident("value"),
@@ -2176,8 +2200,7 @@ func test_lowers_question_bind_option_to_constructor_match() -> Bool:
 	match lower_typed_expr(expr):
 		Ok(LetExpr(temp_var, is_mutable, bind_type, bind_rhs, body)):
 			match body:
-				ConstructorMatchExpr(scrutinee, release_policy, cases, _, typ, _):
-					-- This post-return traversal detects escaped match data whose owner was released.
+				RawMatchExpr(scrutinee, cases, typ, _):
 					json = core_expr_to_json(body).to_string()
 
 					scrutinee_ok: Bool = match scrutinee:
@@ -2207,13 +2230,12 @@ func test_lowers_question_bind_option_to_constructor_match() -> Bool:
 						)
 						and scrutinee_ok
 						and cases.length() == 2
-						and core_release_policy_to_string(release_policy) == "none"
 						and core_types_equal(typ, core_option_int_type())
-						and json.contains("\"kind\":\"constructor_match\"")
-						and json.contains("\"constructor\":\"Some\"")
-						and json.contains("\"constructor\":\"None\"")
-						and json.contains("\"kind\":\"stack_option_some\"")
-						and json.contains("\"kind\":\"stack_option_none\"")
+						and json.contains("\"kind\":\"raw_match\"")
+						and json.contains("\"name\":\"Some\"")
+						and json.contains("\"name\":\"None\"")
+						and not json.contains("\"kind\":\"stack_option_some\"")
+						and not json.contains("\"kind\":\"stack_option_none\"")
 						and json.contains("blorp_option_none")
 					)
 				_:
@@ -2222,7 +2244,7 @@ func test_lowers_question_bind_option_to_constructor_match() -> Bool:
 			False
 
 
-func test_lowers_question_bind_result_to_constructor_match() -> Bool:
+func test_lowers_question_bind_result_to_raw_match() -> Bool:
 	rhs = CompilerTypedNameExpr(ident("maybe"), expr_info(result_int_string_type()))
 	question = CompilerTypedQuestionBindExpr(
 		ident("value"),
@@ -2241,7 +2263,7 @@ func test_lowers_question_bind_result_to_constructor_match() -> Bool:
 	match lower_typed_expr(expr):
 		Ok(LetExpr(temp_var, is_mutable, bind_type, bind_rhs, body)):
 			match body:
-				ConstructorMatchExpr(scrutinee, release_policy, cases, _, typ, _):
+				RawMatchExpr(scrutinee, cases, typ, _):
 					json = core_expr_to_json(body).to_string()
 
 					scrutinee_ok: Bool = match scrutinee:
@@ -2271,13 +2293,12 @@ func test_lowers_question_bind_result_to_constructor_match() -> Bool:
 						)
 						and scrutinee_ok
 						and cases.length() == 2
-						and core_release_policy_to_string(release_policy) == "none"
 						and core_types_equal(typ, core_result_int_string_type())
-						and json.contains("\"kind\":\"constructor_match\"")
-						and json.contains("\"constructor\":\"Ok\"")
-						and json.contains("\"constructor\":\"Err\"")
-						and json.contains("\"kind\":\"stack_result_ok\"")
-						and json.contains("\"kind\":\"stack_result_err\"")
+						and json.contains("\"kind\":\"raw_match\"")
+						and json.contains("\"name\":\"Ok\"")
+						and json.contains("\"name\":\"Err\"")
+						and not json.contains("\"kind\":\"stack_result_ok\"")
+						and not json.contains("\"kind\":\"stack_result_err\"")
 						and json.contains("blorp_result_err")
 						and json.contains("__qb_failure")
 					)
@@ -2367,9 +2388,9 @@ func test_lowers_result_with_try_to_resource_match() -> Bool:
 
 			(
 				json.contains("\"kind\":\"let\"")
-				and json.contains("\"kind\":\"constructor_match\"")
-				and json.contains("\"constructor\":\"Ok\"")
-				and json.contains("\"constructor\":\"Err\"")
+				and json.contains("\"kind\":\"raw_match\"")
+				and json.contains("\"name\":\"Ok\"")
+				and json.contains("\"name\":\"Err\"")
 				and json.contains("\"kind\":\"resource_scope\"")
 				and json.contains("blorp_file_close")
 				and json.contains("blorp_result_err")
@@ -4873,6 +4894,7 @@ tests: TestSuite = {
 	description = "Blorp compiler Core lowering",
 	tests = [
 		("lowers int literal with known location", test_lowers_int_literal_with_known_location),
+		("lowers special float literals", test_lowers_special_float_literals),
 		("lowers debug block for Core debug", test_lowers_debug_block_for_core_debug),
 		(
 			"lowers wide int literal when it does not fit Int",
@@ -4981,14 +5003,8 @@ tests: TestSuite = {
 		),
 		("lowers tuple destruct in block", test_lowers_tuple_destruct_in_block),
 		("lowers tuple destruct skipping wildcard", test_lowers_tuple_destruct_skipping_wildcard),
-		(
-			"lowers question bind Option to constructor match",
-			test_lowers_question_bind_option_to_constructor_match,
-		),
-		(
-			"lowers question bind Result to constructor match",
-			test_lowers_question_bind_result_to_constructor_match,
-		),
+		("lowers question bind Option to raw match", test_lowers_question_bind_option_to_raw_match),
+		("lowers question bind Result to raw match", test_lowers_question_bind_result_to_raw_match),
 		("lowers plain with to resource scope", test_lowers_plain_with_to_resource_scope),
 		("lowers plain with fallback close", test_lowers_plain_with_fallback_close),
 		("lowers Result with try to resource match", test_lowers_result_with_try_to_resource_match),

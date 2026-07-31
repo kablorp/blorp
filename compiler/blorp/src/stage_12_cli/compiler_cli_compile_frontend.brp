@@ -1,6 +1,6 @@
--- Compile/run projection from a typed CLI source graph to the one temporary
--- semantic-middle request. Keeping this out of the check executor prevents
--- Core protocol types from entering the production check program.
+-- Compile/run projection from a typed CLI source graph to contiguous Core.
+-- Keeping this out of the check executor prevents backend-only Core types from
+-- entering the production check program.
 import:
 	../stage_06_typecheck/compiler_typecheck_bridge:
 		CompilerTypecheckedGraph,
@@ -28,22 +28,28 @@ import:
 		core_early_pipeline_diagnostic_message,
 		core_early_pipeline_stage_name,
 		finish_early_core_pipeline_after_projection,
-		run_early_core_pipeline_to_semantic_middle,
+		run_early_core_pipeline_to_runtime_projection,
+	../stage_09_core/compiler_core_json: CoreDecl(FunctionDecl), CoreFunction, CoreProgram
 	../stage_09_core/compiler_core_resolve: CoreResolveImportBinding, CoreResolveModuleImports
-	../stage_09_core/compiler_semantic_middle_projection:
-		project_semantic_middle_program,
-		semantic_middle_projection_error_message,
-	../stage_09_core/compiler_semantic_worker_protocol:
-		SemanticMiddleCapability(PostTupleSroaCoreCapability, PreDceCoreCapability),
-		SemanticMiddleRequest,
+	../stage_09_core/compiler_core_runtime_projection:
+		core_runtime_projection_error_message,
+		project_runtime_program,
 	compiler_cli_core_observation: CliCoreObservation
 	compiler_cli_plan: CliFrontendModuleGraph
 	compiler_cli_typecheck: typecheck_frontend_root, typechecked_graph_errors
 	path: dirname
 
 
+record CliCoreCompilation {
+	target_path: String,
+	target_module_name: String,
+	program: CoreProgram,
+	check_invariants: Bool
+}
+
+
 union CompiledFrontendGraph:
-	CompiledFrontendReady(SemanticMiddleRequest, String, List[String], List[CliCoreObservation])
+	CompiledFrontendReady(CliCoreCompilation, String, List[String], List[CliCoreObservation])
 	CompiledFrontendStopped(String, String, String, List[CliCoreObservation])
 
 
@@ -122,6 +128,24 @@ private pure func early_pipeline_error(diagnostic: CoreEarlyPipelineDiagnostic) 
 			"${message}\nhelp: ${hint}"
 		None:
 			message
+
+
+private pure func function_is_program_entrypoint(function_info: CoreFunction) -> Bool:
+	function_info.name == "main" and function_info.source_module.is_none()
+
+
+private pure func program_has_top_level_main(program: CoreProgram) -> Bool:
+	program.decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				function_is_program_entrypoint(function_info)
+			_:
+				False
+	)
+
+
+private pure func missing_main_error(path: String) -> String:
+	"${path}:1:1: error[missing_main]: cannot compile runnable source without a main function\nhelp: Add a top-level `main` function, or use a check-only command for library source."
 
 
 pure func compile_frontend_graph(
@@ -208,7 +232,7 @@ private pure func compile_validated_typechecked_frontend_graph(
 		next_def_id = prepared_graph.next_def_id
 	}
 
-	match run_early_core_pipeline_to_semantic_middle(
+	match run_early_core_pipeline_to_runtime_projection(
 		early_input,
 		early_configuration,
 		typechecked.target.import_bindings.map(core_resolve_import_binding),
@@ -226,11 +250,11 @@ private pure func compile_validated_typechecked_frontend_graph(
 				),
 			)
 		CoreEarlyPipelineCompleted(output):
-			projected_program ?= match project_semantic_middle_program(output.program):
+			projected_program ?= match project_runtime_program(output.program):
 				Ok(program):
 					Ok(program)
 				Err(error):
-					Err([semantic_middle_projection_error_message(error)])
+					Err([core_runtime_projection_error_message(error)])
 
 			match finish_early_core_pipeline_after_projection(
 				{ output | program = projected_program },
@@ -248,23 +272,23 @@ private pure func compile_validated_typechecked_frontend_graph(
 						),
 					)
 				CoreEarlyPipelineCompleted(completed):
-					request: SemanticMiddleRequest = {
-						target_path = typechecked.target.path,
-						target_module_name = typechecked.target.module_name,
-						core = completed.program,
-						next_def_id = completed.next_def_id,
-						require_main = require_main,
-						check_invariants = check_invariants,
-						required_capabilities = [PostTupleSroaCoreCapability, PreDceCoreCapability]
-					}
+					if require_main and not program_has_top_level_main(completed.program):
+						Err([missing_main_error(typechecked.target.path)])
+					else:
+						compilation: CliCoreCompilation = {
+							target_path = typechecked.target.path,
+							target_module_name = typechecked.target.module_name,
+							program = completed.program,
+							check_invariants = check_invariants
+						}
 
-					Ok(
-						CompiledFrontendReady(
-							request,
-							compiler_typed_program_to_json(
-								typechecked.target.typed_program,
-							).to_string(),
-							typechecked_graph_source_include_dirs(typechecked),
-							completed.observations.map(early_observation),
-						),
-					)
+						Ok(
+							CompiledFrontendReady(
+								compilation,
+								compiler_typed_program_to_json(
+									typechecked.target.typed_program,
+								).to_string(),
+								typechecked_graph_source_include_dirs(typechecked),
+								completed.observations.map(early_observation),
+							),
+						)

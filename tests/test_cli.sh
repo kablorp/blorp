@@ -256,6 +256,8 @@ timeout_test="$TMPDIR_CLI/timeout_test.brp"
 repeat_test="$TMPDIR_CLI/repeat_test.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
+invariant_at_a_glance_c="$TMPDIR_CLI/invariant-at-a-glance.c"
+invariant_concurrent_duration_c="$TMPDIR_CLI/invariant-concurrent-duration.c"
 internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
 profiled_c="$TMPDIR_CLI/profiled.c"
 resolved_identity_prog="$TMPDIR_CLI/resolved_identity.brp"
@@ -615,6 +617,13 @@ PY
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
+expect_exit "compile prepared program with invariants" 0 \
+	"$BLORP_BIN" compile --check-invariants --no-format \
+		-o "$invariant_at_a_glance_c" examples/at_a_glance.brp
+expect_exit "compile typed-duration concurrency with invariants" 0 \
+	"$BLORP_BIN" compile --check-invariants --no-format \
+		-o "$invariant_concurrent_duration_c" \
+		tests/test_compiler/infer/should_pass/concurrent_duration_timeout.brp
 expect_exit "internal synthetic executable build uses production compiler" 0 \
 	"$BLORP_BIN" __compiler-build-synthetic-executable \
 	"$valid_prog" "$valid_prog" "$internal_synthetic_binary"
@@ -633,8 +642,7 @@ fi
 expect_exit "compile bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"
-expect_output_contains "compile AST bypasses semantic worker" 0 "Func main" \
-	env BLORP_OCAML_MIDDLE_BIN="$TMPDIR_CLI/missing-ocaml-middle" \
+expect_output_contains "compile AST remains in Blorp frontend" 0 "Func main" \
 	"$BLORP_BIN" compile --no-format --ast "$valid_prog"
 expect_output_contains "compile stops in Blorp-owned Core tail" 0 "stopped after dce" \
 	"$BLORP_BIN" compile --no-format \
@@ -734,11 +742,12 @@ expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_pro
 expect_exit "run bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
+expect_output_contains "run reports configured host discovery failure" 1 \
+	"host toolchain discovery failed" \
+	env CC="$TMPDIR_CLI/missing-cc" \
+	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 
 if $run_deep_checks; then
-	expect_output_contains "compile reports missing semantic worker" 1 "semantic worker failure" \
-		env BLORP_OCAML_MIDDLE_BIN="$TMPDIR_CLI/missing-ocaml-middle" \
-		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/missing-middle.c" "$valid_prog"
 	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
 	expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"

@@ -281,16 +281,13 @@ let test_typecheck_bridge_compile_env_supports_pinned_bootstrap () =
     "retired bootstrap parser selector" (Some "ocaml")
     (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
 
-let test_bridge_helper_compile_env_isolates_pinned_workers () =
+let test_bridge_helper_compile_env_isolates_pinned_host () =
   let unset_env =
     Blorp.Compiler_blorp_bridge.bridge_helper_compile_unset_env
   in
   Alcotest.(check bool)
     "does not override pinned OCaml host" true
-    (List.mem "BLORP_OCAML_HOST_BIN" unset_env);
-  Alcotest.(check bool)
-    "does not override pinned OCaml middle worker" true
-    (List.mem "BLORP_OCAML_MIDDLE_BIN" unset_env)
+    (List.mem "BLORP_OCAML_HOST_BIN" unset_env)
 
 let test_parse_source_request_uses_bridge_envelope () =
   let request =
@@ -1357,7 +1354,7 @@ let suite =
         Alcotest.test_case "typecheck helper env supports pinned bootstrap"
           `Quick test_typecheck_bridge_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "helper env isolates pinned workers" `Quick
-          test_bridge_helper_compile_env_isolates_pinned_workers;
+          test_bridge_helper_compile_env_isolates_pinned_host;
         Alcotest.test_case "parse_source request uses bridge envelope" `Quick
           test_parse_source_request_uses_bridge_envelope;
         Alcotest.test_case "parse_source file request omits source text" `Quick

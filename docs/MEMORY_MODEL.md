@@ -112,8 +112,13 @@ fields and installs the complete new field set in the same allocation. If an
 alias is still live, it allocates a fresh record and releases only the replaced
 binding's ownership. After ownership insertion, the compiler may also reuse a
 same-type record that is dropped immediately after all replacement fields are
-evaluated. Other update shapes continue to construct a fresh record. These are
-allocation optimizations only: source-level value semantics do not expose
+evaluated. An exhaustive top-level `if` or literal/constructor `match` can
+transfer the same mutable owner when every returning branch independently
+qualifies, the condition does not replace that owner, and a match scrutinee does
+not touch it. Nested projected literal decisions follow the same rule: every
+nested result and fallback must return the same record type and transfer the
+owner. Other update shapes continue to construct a fresh record. These
+are allocation optimizations only: source-level value semantics do not expose
 object identity, and correctness must not depend on whether reuse occurs.
 
 ```blorp

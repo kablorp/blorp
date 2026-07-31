@@ -1371,7 +1371,6 @@ let bridge_helper_compile_unset_env =
     prepared_parser_bridge_bin_env;
     prepared_typecheck_bridge_bin_env;
     "BLORP_OCAML_HOST_BIN";
-    "BLORP_OCAML_MIDDLE_BIN";
   ]
 
 type bridge_helper_compiler_source =

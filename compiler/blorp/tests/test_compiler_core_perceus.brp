@@ -41,7 +41,9 @@ import:
 			BinaryExpr,
 			BorrowLetExpr,
 			CallExpr,
+			CastExpr,
 			ClosureCreateExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			PreClosureConcurrentExpr,
 			ConstructorMatchExpr,
@@ -53,6 +55,7 @@ import:
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
+			ListGetExpr,
 			ListRetainExpr,
 			ListSetExpr,
 			LengthMatchExpr,
@@ -75,6 +78,7 @@ import:
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(UserFunction),
+		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
@@ -89,7 +93,7 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreRecordFieldValue,
-		CoreReleasePolicy(NoReleasePolicy, StackResultReleasePolicy),
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
@@ -809,8 +813,12 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 			drop_count_for(name, cond) + drop_count_for(name, body)
 		ForListExpr(loop, typ, loc):
 			drop_count_for(name, loop.iterable) + drop_count_for(name, loop.body)
+		DebugBlockExpr(body, typ, loc):
+			drop_count_for(name, body)
 		BinaryExpr(op, left, right, typ, loc):
 			drop_count_for(name, left) + drop_count_for(name, right)
+		ListGetExpr(get, typ, loc):
+			drop_count_for(name, get.list) + drop_count_for(name, get.index)
 		CallExpr(kind, callee, args, typ, loc):
 			drop_count_for(name, callee) + drop_count_in_args(name, args)
 		AssignExpr(variable, rhs, typ, loc):
@@ -1029,6 +1037,8 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			dup_count_for(name, cond) + dup_count_for(name, body)
 		ForListExpr(loop, typ, loc):
 			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
+		DebugBlockExpr(body, typ, loc):
+			dup_count_for(name, body)
 		BinaryExpr(op, left, right, typ, loc):
 			dup_count_for(name, left) + dup_count_for(name, right)
 		UnaryExpr(op, inner, typ, loc):
@@ -1045,6 +1055,8 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			dup_count_for(name, owner)
 		TupleFieldExpr(owner, field_index, typ, loc):
 			dup_count_for(name, owner)
+		ListGetExpr(get, typ, loc):
+			dup_count_for(name, get.list) + dup_count_for(name, get.index)
 		CallExpr(kind, callee, args, typ, loc):
 			dup_count_for(name, callee) + dup_count_in_args(name, args)
 		AssignExpr(variable, rhs, typ, loc):
@@ -2408,7 +2420,7 @@ pure func test_managed_field_of_owned_temporary_return_is_retained() -> Bool:
 
 	match function_body(rewritten, "node_items"):
 		Some(body):
-			dup_count_for("__owned_result", body) == 1
+			dup_count_for("$blorp$perceus$owned_result", body) == 1
 		None:
 			False
 
@@ -3989,7 +4001,7 @@ pure func test_prepared_list_retain_owns_alias_binding_result() -> Bool:
 		),
 	)
 
-	dup_count_for("__owned_result", rewritten) == 0
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
 
 
 pure func test_list_set_owned_transfers_managed_element() -> Bool:
@@ -4668,7 +4680,7 @@ pure func test_mutable_alias_assignment_retains_exactly_once() -> Bool:
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
 
 	(
-		dup_count_for("__owned_result", rewritten) == 1
+		dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
 		and dup_count_for("__assign_xs_0_0", rewritten) == 0
 	)
 
@@ -4764,6 +4776,430 @@ pure func test_mutable_sequential_assignments_release_each_replaced_owner() -> B
 	rewritten: CoreExpr = insert_drops_expr(empty_env(), expr)
 
 	drop_count_for("xs", rewritten) == 3 and dup_count_for("xs", rewritten) == 0
+
+
+pure func assignment_box_value(value: Int) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	RecordConstructExpr(
+		"AssignmentBox",
+		[
+			{
+				name = "value",
+				value = int_expr(value)
+			},
+		],
+		box_type,
+		SyntheticSourceLoc,
+	)
+
+
+pure func nested_assignment_record_rhs(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	RecordExpr(
+		[
+			{
+				name = "first",
+				value = first
+			},
+			{
+				name = "second",
+				value = second
+			},
+		],
+		HeapRecordType("AssignmentBox"),
+		SyntheticSourceLoc,
+	)
+
+
+pure func rewritten_nested_assignment_record(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	body: CoreExpr = AssignExpr(
+		named_var("box"),
+		nested_assignment_record_rhs(first, second),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("box"),
+			True,
+			box_type,
+			var_expr("source", box_type),
+			body,
+		),
+	)
+
+
+pure func test_nested_record_assignment_after_consume_releases_final_slot_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	consume: CoreExpr = user_call_expr(
+		"consume_box",
+		None,
+		[0],
+		[var_expr("box", box_type)],
+		void_type(),
+	)
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(consume, assign)
+
+	drop_count_for("box", rewritten) == 3 and dup_count_for("box", rewritten) == 1
+
+
+pure func test_nested_record_consume_after_assignment_preserves_slot_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	consume: CoreExpr = user_call_expr(
+		"consume_box",
+		None,
+		[0],
+		[var_expr("box", box_type)],
+		void_type(),
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(assign, consume)
+
+	drop_count_for("box", rewritten) == 3 and dup_count_for("box", rewritten) == 1
+
+
+pure func test_multiple_nested_record_assignments_release_each_slot_owner() -> Bool:
+	first_assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	second_assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(2),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(first_assign, second_assign)
+
+	drop_count_for("box", rewritten) == 4 and dup_count_for("box", rewritten) == 0
+
+
+pure func test_nested_record_assignment_under_binary_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = BinaryExpr(
+		EqualOp,
+		SeqExpr(assign, int_expr(1)),
+		int_expr(1),
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func test_nested_record_assignment_under_list_get_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = ListGetExpr(
+		{
+			layout = PointerListStorage,
+			list = var_expr("values", list_int_type()),
+			index = SeqExpr(assign, int_expr(0)),
+			bounds = ProvenListAccess
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func test_nested_record_assignment_under_literal_match_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = LiteralMatchExpr(int_expr(1), [literal_case(
+				IntLiteral(1),
+				[],
+				SeqExpr(assign, int_expr(1)),
+			)], LiteralMatchFallbackBody(int_expr(0)), int_type(), SyntheticSourceLoc)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func test_nested_record_assignment_under_accessor_literal_match_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = AccessorLiteralMatchExpr(
+		int_expr(1),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = int_type(),
+			cases = [literal_case(
+					IntLiteral(1),
+					[],
+					SeqExpr(assign, int_expr(1)),
+				)],
+			fallback = LiteralMatchFallbackBody(int_expr(0)),
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func test_nested_record_assignment_under_length_match_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"values",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [
+				{
+					length = 1,
+					branch = constructor_length_branch(
+						[],
+						ConstructorMatchBodyExpr(SeqExpr(assign, int_expr(1))),
+					)
+				},
+			],
+			geq = None,
+			fallback = Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(0)))),
+			result_type = int_type(),
+			loc = SyntheticSourceLoc
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func test_nested_record_assignment_under_resource_scope_releases_slot_owner() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped: CoreExpr = ResourceScopeExpr(
+		{
+			variable = named_var("resource"),
+			typ = int_type(),
+			acquire = int_expr(1),
+			body = SeqExpr(assign, int_expr(1)),
+			cleanup = VoidExpr(void_type(), SyntheticSourceLoc)
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_record(wrapped, int_expr(0))
+
+	drop_count_for("box", rewritten) == 3
+
+
+pure func rewritten_nested_assignment_call(
+	args: List[CoreExpr],
+	consumed_args: List[Int],
+) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	body: CoreExpr = AssignExpr(
+		named_var("box"),
+		user_call_expr("consume_assignment_box", None, consumed_args, args, box_type),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("box"),
+			True,
+			box_type,
+			var_expr("source", box_type),
+			body,
+		),
+	)
+
+
+pure func test_same_call_assignment_before_consume_retains_evaluated_argument() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_call(
+		[assign, var_expr("box", box_type)],
+		[1],
+	)
+
+	(
+		drop_count_for("box", rewritten) == 3
+		and dup_count_for("box", rewritten) == 0
+		and dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
+	)
+
+
+pure func test_same_call_consume_before_assignment_retains_evaluated_argument() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_call(
+		[var_expr("box", box_type), assign],
+		[0],
+	)
+
+	(
+		drop_count_for("box", rewritten) == 3
+		and dup_count_for("box", rewritten) == 0
+		and dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
+	)
+
+
+pure func has_branch_local_owned_result_retain(expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			(
+				has_branch_local_owned_result_retain(callee)
+				or args.any(func(arg): has_branch_local_owned_result_retain(arg))
+			)
+		IfExpr(cond, then_expr, else_expr, result_type, if_loc):
+			(
+				(
+					dup_count_for("$blorp$perceus$owned_result", then_expr) == 1
+					and dup_count_for("$blorp$perceus$owned_result", else_expr) == 0
+				)
+				or has_branch_local_owned_result_retain(cond)
+				or has_branch_local_owned_result_retain(then_expr)
+				or has_branch_local_owned_result_retain(else_expr)
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			has_branch_local_owned_result_retain(rhs) or has_branch_local_owned_result_retain(body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			has_branch_local_owned_result_retain(rhs) or has_branch_local_owned_result_retain(body)
+		SeqExpr(first, second):
+			(
+				has_branch_local_owned_result_retain(first)
+				or has_branch_local_owned_result_retain(second)
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			has_branch_local_owned_result_retain(rhs)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			has_branch_local_owned_result_retain(body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			has_branch_local_owned_result_retain(body)
+		_:
+			False
+
+
+pure func test_same_call_mixed_conditional_retains_only_borrowed_branch() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	mixed: CoreExpr = IfExpr(
+		bool_expr(True),
+		var_expr("box", box_type),
+		assignment_box_value(2),
+		box_type,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_call(
+		[assign, mixed],
+		[1],
+	)
+
+	has_branch_local_owned_result_retain(rewritten)
+
+
+pure func test_same_call_debug_wrapped_alias_retains_evaluated_argument() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	assign: CoreExpr = AssignExpr(
+		named_var("box"),
+		assignment_box_value(1),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	wrapped_alias: CoreExpr = DebugBlockExpr(
+		var_expr("box", box_type),
+		box_type,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewritten_nested_assignment_call(
+		[wrapped_alias, assign],
+		[0],
+	)
+
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
+
+
+pure func test_mutable_mixed_assignment_retains_only_borrowed_branch() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	mixed: CoreExpr = IfExpr(
+		bool_expr(True),
+		var_expr("box", box_type),
+		assignment_box_value(1),
+		box_type,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		empty_env(),
+		LetExpr(
+			named_var("box"),
+			True,
+			box_type,
+			var_expr("source", box_type),
+			AssignExpr(named_var("box"), mixed, void_type(), SyntheticSourceLoc),
+		),
+	)
+
+	has_branch_local_owned_result_retain(rewritten)
 
 
 pure func test_mutable_assignment_in_branch_releases_replaced_owner() -> Bool:
@@ -5304,6 +5740,64 @@ pure func test_consuming_for_list_body_retains_owner_for_each_iteration() -> Boo
 		and dup_count_for("xs", rewritten) == 1
 		and top_let_for_list_body_has_dup("xs", rewritten)
 	)
+
+
+pure func test_released_for_list_field_iterable_is_retained() -> Bool:
+	holder_type: CoreType = HeapRecordType("Holder")
+	loop: CoreExpr = ForListExpr(
+		{
+			binder = {
+				variable = named_var("item"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = FieldExpr(
+				var_expr("holder", holder_type),
+				"items",
+				list_int_type(),
+				SyntheticSourceLoc,
+			),
+			iterable_release_policy = ArcReleasePolicy,
+			body = VoidExpr(void_type(), SyntheticSourceLoc)
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), loop)
+
+	match rewritten:
+		ForListExpr(rewritten_loop, _, _):
+			dup_count_for("$blorp$perceus$owned_result", rewritten_loop.iterable) == 1
+		_:
+			False
+
+
+pure func test_unreleased_for_list_field_iterable_stays_borrowed() -> Bool:
+	holder_type: CoreType = HeapRecordType("Holder")
+	loop: CoreExpr = ForListExpr(
+		{
+			binder = {
+				variable = named_var("item"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = FieldExpr(
+				var_expr("holder", holder_type),
+				"items",
+				list_int_type(),
+				SyntheticSourceLoc,
+			),
+			iterable_release_policy = NoReleasePolicy,
+			body = VoidExpr(void_type(), SyntheticSourceLoc)
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), loop)
+
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
 
 
 pure func test_borrowed_for_list_item_is_retained_in_aggregate() -> Bool:
@@ -6659,7 +7153,7 @@ pure func test_consuming_field_argument_gets_owned_alias() -> Bool:
 		LetExpr(variable, False, typ, rhs, body):
 			(
 				variable.name == "__cow_arg_0"
-				and dup_count_for("__owned_result", rhs) == 1
+				and dup_count_for("$blorp$perceus$owned_result", rhs) == 1
 				and match body:
 					CallExpr(kind, callee, [VarExpr(arg, arg_type, arg_loc)], result_type, call_loc):
 						arg.name == "__cow_arg_0"
@@ -6692,7 +7186,7 @@ pure func test_consuming_collection_equality_field_gets_owned_alias() -> Bool:
 		LetExpr(variable, False, typ, rhs, body):
 			(
 				variable.name == "__equality_arg_0"
-				and dup_count_for("__owned_result", rhs) == 1
+				and dup_count_for("$blorp$perceus$owned_result", rhs) == 1
 				and match body:
 					BinaryExpr(EqualOp, VarExpr(arg, arg_type, arg_loc), right, typ, binary_loc):
 						arg.name == "__equality_arg_0"
@@ -6752,9 +7246,9 @@ pure func test_assignment_alias_rhs_becomes_owned() -> Bool:
 		AssignExpr(target, BorrowLetExpr(temp, typ, rhs, body), assign_type, loc):
 			(
 				target.name == "target"
-				and temp.name == "__owned_result"
-				and dup_count_for("__owned_result", body) == 1
-				and drop_count_for("__owned_result", body) == 0
+				and temp.name == "$blorp$perceus$owned_result"
+				and dup_count_for("$blorp$perceus$owned_result", body) == 1
+				and drop_count_for("$blorp$perceus$owned_result", body) == 0
 			)
 		_:
 			False
@@ -6773,7 +7267,7 @@ pure func test_assignment_owned_let_result_is_not_retained() -> Bool:
 		AssignExpr(named_var("target"), rhs, void_type(), SyntheticSourceLoc),
 	)
 
-	dup_count_for("__owned_result", rewritten) == 0
+	dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
 
 
 pure func test_alias_binding_retains_source_owner() -> Bool:
@@ -6860,7 +7354,10 @@ pure func test_branch_alias_binding_normalizes_rhs_ownership() -> Bool:
 
 	match rewritten:
 		LetExpr(variable, False, typ, normalized_rhs, body):
-			variable.name == "alias" and dup_count_for("__owned_result", normalized_rhs) == 1
+			(
+				variable.name == "alias"
+				and dup_count_for("$blorp$perceus$owned_result", normalized_rhs) == 1
+			)
 		_:
 			False
 
@@ -6890,7 +7387,10 @@ pure func test_match_field_alias_binding_normalizes_rhs_ownership() -> Bool:
 
 	match rewritten:
 		LetExpr(variable, False, typ, normalized_rhs, body):
-			variable.name == "selected" and dup_count_for("__owned_result", normalized_rhs) == 1
+			(
+				variable.name == "selected"
+				and dup_count_for("$blorp$perceus$owned_result", normalized_rhs) == 1
+			)
 		_:
 			False
 
@@ -8251,6 +8751,41 @@ pure func test_unboxed_aliasing_call_drops_borrowed_owned_temporary() -> Bool:
 	drop_count_for("__borrow_arg_0", rewritten) == 1
 
 
+pure func test_cast_unboxed_aliasing_call_drops_borrowed_owned_temporary() -> Bool:
+	int_tensor_type: CoreType = TensorType({
+		element_type = int_type(),
+		dims = [TensorStaticDim(2), TensorStaticDim(3)],
+	})
+	row_type: CoreType = TensorType({
+		element_type = int_type(),
+		dims = [TensorStaticDim(3)],
+	})
+	erased_type: CoreType = NamedType("Ptr", [])
+	row: CoreExpr = CastExpr(
+		call_expr(
+			"blorp_tensor_slice_row",
+			[var_expr("matrix", int_tensor_type), int_expr(0), int_expr(3), int_expr(3)],
+			erased_type,
+		),
+		row_type,
+		SyntheticSourceLoc,
+	)
+	read: CoreExpr = call_expr(
+		"blorp_checked_get",
+		[row, int_expr(0)],
+		erased_type,
+	)
+	wrapped: CoreExpr = UnboxExpr(
+		PrimUnbox,
+		CastExpr(read, erased_type, SyntheticSourceLoc),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(empty_env(), wrapped)
+
+	drop_count_for("__borrow_arg_0", rewritten) == 1
+
+
 pure func test_borrowed_owned_temporary_under_unmanaged_borrow_is_dropped() -> Bool:
 	read: CoreDecl = function_decl(
 		"read",
@@ -8675,7 +9210,7 @@ pure func test_explicit_retain_owns_pointer_unbox_result() -> Bool:
 
 	match function_body(program, "retained_dict_value"):
 		Some(rewritten):
-			dup_count_for("__owned_result", rewritten) == 0
+			dup_count_for("$blorp$perceus$owned_result", rewritten) == 0
 		None:
 			False
 
@@ -9595,6 +10130,62 @@ tests: TestSuite = {
 			test_mutable_sequential_assignments_release_each_replaced_owner,
 		),
 		(
+			"nested record assignment after consume releases final slot owner",
+			test_nested_record_assignment_after_consume_releases_final_slot_owner,
+		),
+		(
+			"nested record consume after assignment preserves slot owner",
+			test_nested_record_consume_after_assignment_preserves_slot_owner,
+		),
+		(
+			"multiple nested record assignments release each slot owner",
+			test_multiple_nested_record_assignments_release_each_slot_owner,
+		),
+		(
+			"nested record assignment under binary releases slot owner",
+			test_nested_record_assignment_under_binary_releases_slot_owner,
+		),
+		(
+			"nested record assignment under list get releases slot owner",
+			test_nested_record_assignment_under_list_get_releases_slot_owner,
+		),
+		(
+			"nested record assignment under literal match releases slot owner",
+			test_nested_record_assignment_under_literal_match_releases_slot_owner,
+		),
+		(
+			"nested record assignment under accessor literal match releases slot owner",
+			test_nested_record_assignment_under_accessor_literal_match_releases_slot_owner,
+		),
+		(
+			"nested record assignment under length match releases slot owner",
+			test_nested_record_assignment_under_length_match_releases_slot_owner,
+		),
+		(
+			"nested record assignment under resource scope releases slot owner",
+			test_nested_record_assignment_under_resource_scope_releases_slot_owner,
+		),
+		(
+			"same call assignment before consume retains evaluated argument",
+			test_same_call_assignment_before_consume_retains_evaluated_argument,
+		),
+		(
+			"same call consume before assignment retains evaluated argument",
+			test_same_call_consume_before_assignment_retains_evaluated_argument,
+		),
+		(
+			"same call mixed conditional retains only borrowed branch",
+			test_same_call_mixed_conditional_retains_only_borrowed_branch,
+		),
+		(
+			"same call debug wrapped alias retains evaluated argument",
+			test_same_call_debug_wrapped_alias_retains_evaluated_argument,
+		),
+		(
+			"mutable mixed assignment retains only borrowed branch",
+			test_mutable_mixed_assignment_retains_only_borrowed_branch,
+		),
+		(
 			"mutable assignment in branch releases replaced owner",
 			test_mutable_assignment_in_branch_releases_replaced_owner,
 		),
@@ -9653,6 +10244,14 @@ tests: TestSuite = {
 		(
 			"consuming for-list body retains owner for each iteration",
 			test_consuming_for_list_body_retains_owner_for_each_iteration,
+		),
+		(
+			"released for-list field iterable is retained",
+			test_released_for_list_field_iterable_is_retained,
+		),
+		(
+			"unreleased for-list field iterable stays borrowed",
+			test_unreleased_for_list_field_iterable_stays_borrowed,
 		),
 		(
 			"borrowed for-list item is retained in aggregate",
@@ -9969,6 +10568,10 @@ tests: TestSuite = {
 		(
 			"unboxed aliasing call drops borrowed owned temporary",
 			test_unboxed_aliasing_call_drops_borrowed_owned_temporary,
+		),
+		(
+			"cast-unboxed aliasing call drops borrowed owned temporary",
+			test_cast_unboxed_aliasing_call_drops_borrowed_owned_temporary,
 		),
 		(
 			"borrowed owned temporary under unmanaged borrow is dropped",

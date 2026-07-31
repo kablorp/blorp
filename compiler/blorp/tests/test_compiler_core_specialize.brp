@@ -9,18 +9,24 @@ import:
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			BinaryExpr,
+			BoxExpr,
 			CallExpr,
 			CastExpr,
 			ConstructorMatchExpr,
 			FieldExpr,
+			IfExpr,
 			LiteralExpr,
+			SemanticMatchExpr,
 			VarExpr,
 			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(BoolLiteral, FloatLiteral, IntLiteral, StringLiteral),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, VariantFieldSemanticMatchAccessor),
+		CoreSemanticMatchTree(SemanticConstructorMatch, SemanticMatchLeaf),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorStaticDim),
 		CoreTensorTypeInfo,
@@ -58,10 +64,14 @@ pure func variable(name: String, typ: CoreType) -> CoreExpr:
 
 
 pure func builtin_call(name: String, arg: CoreExpr, typ: CoreType) -> CoreExpr:
+	builtin_call_args(name, [arg], typ)
+
+
+pure func builtin_call_args(name: String, args: List[CoreExpr], typ: CoreType) -> CoreExpr:
 	CallExpr(
 		BuiltinCall(name),
 		VoidExpr(VoidType, SyntheticSourceLoc),
-		[arg],
+		args,
 		typ,
 		SyntheticSourceLoc,
 	)
@@ -132,6 +142,20 @@ pure func test_float_width_conversions() -> Bool:
 		specialized_body(builtin_call("blorp_to_float16", value, NamedType("Float16", []))),
 	):
 		(Some(CastExpr(_, NamedType("Float", []), _)), Some(CastExpr(_, NamedType("Float32", []), _)), Some(CastExpr(_, NamedType("Float16", []), _))):
+			True
+		_:
+			False
+
+
+pure func test_bool_enum_conversions() -> Bool:
+	value: CoreExpr = variable("value", EnumType("Bool"))
+
+	match (
+		specialized_body(builtin_call("blorp_to_int", value, named_type("Int"))),
+		specialized_body(builtin_call("blorp_to_float", value, named_type("Float"))),
+		specialized_body(builtin_call("blorp_to_bool", value, named_type("Bool"))),
+	):
+		(Some(CastExpr(VarExpr(_, EnumType("Bool"), _), NamedType("Int", []), _)), Some(CastExpr(CastExpr(VarExpr(_, EnumType("Bool"), _), NamedType("Int", []), _), NamedType("Float", []), _)), Some(VarExpr(_, EnumType("Bool"), _))):
 			True
 		_:
 			False
@@ -251,6 +275,120 @@ pure func test_specialization_recurses_through_nested_calls() -> Bool:
 
 	match specialized_body(outer):
 		Some(CastExpr(CastExpr(_, NamedType("Float", []), _), NamedType("Int", []), _)):
+			True
+		_:
+			False
+
+
+pure func test_specialization_recurses_through_semantic_match_leaf() -> Bool:
+	body: CoreExpr = SemanticMatchExpr(
+		LiteralExpr(BoolLiteral(True), named_type("Bool"), SyntheticSourceLoc),
+		SemanticMatchLeaf(
+			[],
+			builtin_call(
+				"blorp_to_int",
+				variable("value", named_type("Float")),
+				named_type("Int"),
+			),
+		),
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match specialized_body(body):
+		Some(SemanticMatchExpr(_, SemanticMatchLeaf(_, CastExpr(_, NamedType("Int", []), _)), _, _)):
+			True
+		_:
+			False
+
+
+private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr) -> CoreExpr:
+	payload: CoreVar = core_var("payload")
+	array_type: CoreType = TensorType({
+		element_type = return_type,
+		dims = [TensorStaticDim(4)],
+	})
+
+	SemanticMatchExpr(
+		builtin_call_args(
+			"blorp_vector_get_opt",
+			[variable("values", array_type), variable("index", named_type("Int"))],
+			NamedType(
+				"Option",
+				[return_type],
+			),
+		),
+		SemanticConstructorMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					constructor = "Some",
+					body = SemanticMatchLeaf(
+						[
+							{
+								variable = payload,
+								accessor = VariantFieldSemanticMatchAccessor(
+									RootSemanticMatchAccessor,
+									"Some",
+									0,
+								),
+								mode = MatchBorrowBindingMode
+							},
+						],
+						VarExpr(
+							payload,
+							return_type,
+							SyntheticSourceLoc,
+						),
+					)
+				},
+				{
+					constructor = "None",
+					body = SemanticMatchLeaf([], default)
+				},
+			],
+			None,
+		),
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_tensor_get_or_match_uses_direct_storage_reads() -> Bool:
+	int_default: CoreExpr = LiteralExpr(IntLiteral(0), named_type("Int"), SyntheticSourceLoc)
+	point_type: CoreType = ValueRecordType("Point")
+	point_default: CoreExpr = variable("default_point", point_type)
+
+	match (
+		specialized_body(tensor_get_or_match(named_type("Int"), int_default)),
+		specialized_body(tensor_get_or_match(point_type, point_default)),
+	):
+		(Some(IfExpr(_, CallExpr(IntrinsicCall("tensor_get_i64"), _, [_, _], _, _), _, _, _)), Some(IfExpr(_, CallExpr(IntrinsicCall("tensor_get_unchecked"), _, [_, _], _, _), _, _, _))):
+			True
+		_:
+			False
+
+
+pure func test_program_specialization_boxes_dict_int_key() -> Bool:
+	dict_type: CoreType = NamedType(
+		"Dict",
+		[named_type("Int"), NamedType("List", [HeapRecordType("CoreFunction")])],
+	)
+	result_type: CoreType = NamedType(
+		"Option",
+		[NamedType("List", [HeapRecordType("CoreFunction")])],
+	)
+
+	match (
+		specialized_body(
+			builtin_call_args(
+				"blorp_dict_get",
+				[variable("functions", dict_type), variable("def_id", named_type("Int"))],
+				result_type,
+			),
+		)
+	):
+		Some(CallExpr(BuiltinCall("blorp_dict_get_nullable"), _, [_, BoxExpr(_, _, _)], _, _)):
 			True
 		_:
 			False
@@ -397,12 +535,25 @@ tests: TestSuite = {
 	tests = [
 		("to_int identity and casts", test_to_int_identity_and_casts),
 		("float width conversions", test_float_width_conversions),
+		("Bool enum conversions", test_bool_enum_conversions),
 		("to_bool Int and Option", test_to_bool_int_and_option),
 		("to_bool Float uses nonzero comparison", test_to_bool_float_uses_nonzero_comparison),
 		("to_bool Result layouts", test_to_bool_result_layouts),
 		(
 			"specialization recurses through nested calls",
 			test_specialization_recurses_through_nested_calls,
+		),
+		(
+			"specialization recurses through semantic match leaf",
+			test_specialization_recurses_through_semantic_match_leaf,
+		),
+		(
+			"tensor get_or match uses direct storage reads",
+			test_tensor_get_or_match_uses_direct_storage_reads,
+		),
+		(
+			"program specialization boxes Dict[Int] keys",
+			test_program_specialization_boxes_dict_int_key,
 		),
 		(
 			"String to_int becomes direct runtime call",

@@ -172,6 +172,18 @@ import:
 		CoreReleasePolicy,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
 		CoreSourceLoc,
 		CoreTailrecListSpreadRebind,
 		CoreTaskCapture,
@@ -184,6 +196,7 @@ import:
 			TupleFloatElement,
 			TuplePointerElement,
 			TuplePrimElement,
+			TupleStackResultElement,
 			TupleStructElement,
 			TupleVoidElement,
 		),
@@ -212,6 +225,13 @@ VOID_TYPE: CoreType = VoidType
 record FreeVar {
 	name: String,
 	typ: CoreType
+}
+
+
+record FunctionValueSignature {
+	param_types: List[CoreType],
+	return_type: CoreType,
+	is_pure: Bool
 }
 
 
@@ -278,6 +298,24 @@ record ConvertedExpr {
 record ConvertedExprs {
 	state: ClosureState,
 	exprs: List[CoreExpr]
+}
+
+
+record ConvertedSemanticMatchTree {
+	state: ClosureState,
+	tree: CoreSemanticMatchTree
+}
+
+
+record ConvertedOptionalSemanticMatchTree {
+	state: ClosureState,
+	tree: Option[CoreSemanticMatchTree]
+}
+
+
+record ConvertedOptionalSemanticLengthGeq {
+	state: ClosureState,
+	geq: Option[CoreSemanticLengthMatchGeq]
 }
 
 
@@ -440,6 +478,13 @@ record FunctionIndexes {
 }
 
 
+private pure func functions_for_def_id(
+	functions_by_id: Dict[Int, List[CoreFunction]],
+	def_id: Int,
+) -> Option[List[CoreFunction]]:
+	functions_by_id.get(def_id)
+
+
 private pure func max_int(left: Int, right: Int) -> Int:
 	if left > right:
 		left
@@ -477,10 +522,31 @@ private pure func var_from_name(name: String) -> CoreVar:
 
 private pure func is_closure_value_type(typ: CoreType) -> Bool:
 	match typ:
+		FunctionType(is_pure, params, return_type):
+			True
 		NamedType(name, args):
 			name == CLOSURE_TYPE_NAME and args.length() == 0
 		_:
 			False
+
+
+private pure func function_value_signature(
+	typ: CoreType,
+	target: CoreFunction,
+) -> FunctionValueSignature:
+	match typ:
+		FunctionType(is_pure, params, return_type):
+			{
+				param_types = params,
+				return_type = return_type,
+				is_pure = is_pure
+			}
+		_:
+			{
+				param_types = target.params.map(func(param): param.typ),
+				return_type = target.return_type,
+				is_pure = target.is_pure
+			}
 
 
 private pure func task_capture_moves_env_slot(capture: CoreTaskCapture) -> Bool:
@@ -596,6 +662,8 @@ private pure func max_tuple_element_def_id(current: Int, element: CoreTupleEleme
 		TuplePointerElement(expr):
 			max_expr_def_id(current, expr)
 		TupleStructElement(expr, c_type):
+			max_expr_def_id(current, expr)
+		TupleStackResultElement(expr):
 			max_expr_def_id(current, expr)
 		TupleVoidElement:
 			current
@@ -1229,6 +1297,8 @@ private pure func free_vars_tuple_element(
 		TuplePointerElement(expr):
 			free_vars_expr(state, bound, expr)
 		TupleStructElement(expr, c_type):
+			free_vars_expr(state, bound, expr)
+		TupleStackResultElement(expr):
 			free_vars_expr(state, bound, expr)
 		TupleVoidElement:
 			[]
@@ -2788,6 +2858,8 @@ private pure func tuple_element_consumes_var(element: CoreTupleElement, variable
 			expr_consumes_var(expr, variable)
 		TupleStructElement(expr, c_type):
 			expr_consumes_var(expr, variable)
+		TupleStackResultElement(expr):
+			expr_consumes_var(expr, variable)
 		TupleVoidElement:
 			False
 		TupleFloatElement(expr):
@@ -3701,8 +3773,10 @@ private pure func function_target_for_var(
 
 	match variable.def_id:
 		Some(def_id):
-			candidates: List[CoreFunction] = state.functions_by_id
-				.get(def_id)
+			candidates: List[CoreFunction] = functions_for_def_id(
+				state.functions_by_id,
+				def_id,
+			)
 				.get_or([])
 			var exact: Option[CoreFunction] = None
 
@@ -3765,20 +3839,21 @@ private pure func adapt_var_expr(
 			Some(target):
 				match function_ref_call_kind(target):
 					Some(call_kind):
+						signature: FunctionValueSignature = function_value_signature(typ, target)
 						var params: List[CoreParam] = []
 						var args: List[CoreExpr] = []
 						var index: Int = 0
 
-						for target_param in target.params:
+						for param_type in signature.param_types:
 							param_variable: CoreVar = var_from_name(
 								"__eta_arg_" + index.to_string(),
 							)
 							params = params.append({
 								name = param_variable,
-								typ = target_param.typ,
+								typ = param_type,
 								loc = loc,
 							})
-							args = args.append(VarExpr(param_variable, target_param.typ, loc))
+							args = args.append(VarExpr(param_variable, param_type, loc))
 							index += 1
 
 						fresh: FreshHoistedName = next_eta_name(state)
@@ -3803,9 +3878,11 @@ private pure func adapt_var_expr(
 							source_module = fresh.state.current_module,
 							type_params = [],
 							params = params,
-							return_type = target.return_type,
-							body = Some(CallExpr(call_kind, callee, args, target.return_type, loc)),
-							is_pure = target.is_pure,
+							return_type = signature.return_type,
+							body = Some(
+								CallExpr(call_kind, callee, args, signature.return_type, loc),
+							),
+							is_pure = signature.is_pure,
 							function_kind = ClosureBodyFunction(abi),
 							def_id = fresh.def_id,
 							loc = loc
@@ -4051,6 +4128,12 @@ private pure func convert_tuple_element(
 			{
 				state = converted.state,
 				element = TupleStructElement(converted.expr, c_type)
+			}
+		TupleStackResultElement(expr):
+			converted: ConvertedExpr = convert_expr(state, bound, expr)
+			{
+				state = converted.state,
+				element = TupleStackResultElement(converted.expr)
 			}
 		TupleVoidElement:
 			{
@@ -4726,6 +4809,206 @@ private pure func convert_accessor_literal_match_expr(
 	}
 
 
+private pure func add_bound_semantic_match_bindings(
+	bound: List[String],
+	bindings: List[CoreSemanticMatchBinding],
+) -> List[String]:
+	var result: List[String] = copy_names(bound)
+
+	for binding in bindings:
+		result = add_bound_var(result, binding.variable)
+
+	result
+
+
+private pure func convert_optional_semantic_match_tree(
+	state: ClosureState,
+	bound: List[String],
+	tree: Option[CoreSemanticMatchTree],
+) -> ConvertedOptionalSemanticMatchTree:
+	match tree:
+		Some(value):
+			converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(state, bound, value)
+			{
+				state = converted.state,
+				tree = Some(converted.tree)
+			}
+		None:
+			{
+				state = state,
+				tree = None
+			}
+
+
+private pure func convert_semantic_constructor_cases(
+	state: ClosureState,
+	bound: List[String],
+	cases: List[CoreSemanticConstructorMatchCase],
+) -> (ClosureState, List[CoreSemanticConstructorMatchCase]):
+	var current: ClosureState = state
+	var converted_cases: List[CoreSemanticConstructorMatchCase] = []
+
+	for match_case in cases:
+		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			current,
+			bound,
+			match_case.body,
+		)
+		current = converted.state
+		converted_cases = converted_cases.append({ match_case | body = converted.tree })
+
+	(current, converted_cases)
+
+
+private pure func convert_semantic_literal_cases(
+	state: ClosureState,
+	bound: List[String],
+	cases: List[CoreSemanticLiteralMatchCase],
+) -> (ClosureState, List[CoreSemanticLiteralMatchCase]):
+	var current: ClosureState = state
+	var converted_cases: List[CoreSemanticLiteralMatchCase] = []
+
+	for match_case in cases:
+		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			current,
+			bound,
+			match_case.body,
+		)
+		current = converted.state
+		converted_cases = converted_cases.append({ match_case | body = converted.tree })
+
+	(current, converted_cases)
+
+
+private pure func convert_semantic_length_cases(
+	state: ClosureState,
+	bound: List[String],
+	cases: List[CoreSemanticLengthMatchCase],
+) -> (ClosureState, List[CoreSemanticLengthMatchCase]):
+	var current: ClosureState = state
+	var converted_cases: List[CoreSemanticLengthMatchCase] = []
+
+	for match_case in cases:
+		converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+			current,
+			bound,
+			match_case.body,
+		)
+		current = converted.state
+		converted_cases = converted_cases.append({ match_case | body = converted.tree })
+
+	(current, converted_cases)
+
+
+private pure func convert_optional_semantic_length_geq(
+	state: ClosureState,
+	bound: List[String],
+	geq: Option[CoreSemanticLengthMatchGeq],
+) -> ConvertedOptionalSemanticLengthGeq:
+	match geq:
+		Some(value):
+			converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+				state,
+				bound,
+				value.body,
+			)
+			{
+				state = converted.state,
+				geq = Some({ value | body = converted.tree })
+			}
+		None:
+			{
+				state = state,
+				geq = None
+			}
+
+
+private pure func convert_semantic_match_tree(
+	state: ClosureState,
+	bound: List[String],
+	tree: CoreSemanticMatchTree,
+) -> ConvertedSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			converted: ConvertedExpr = convert_expr(
+				state,
+				add_bound_semantic_match_bindings(bound, bindings),
+				body,
+			)
+			{
+				state = converted.state,
+				tree = SemanticMatchLeaf(bindings, converted.expr)
+			}
+		SemanticMatchFail:
+			{
+				state = state,
+				tree = tree
+			}
+		SemanticConstructorMatch(accessor, cases, fallback):
+			(cases_state, converted_cases) = convert_semantic_constructor_cases(state, bound, cases)
+			converted_fallback: ConvertedOptionalSemanticMatchTree = convert_optional_semantic_match_tree(
+				cases_state,
+				bound,
+				fallback,
+			)
+			{
+				state = converted_fallback.state,
+				tree = SemanticConstructorMatch(accessor, converted_cases, converted_fallback.tree)
+			}
+		SemanticLiteralMatch(accessor, cases, fallback):
+			(cases_state, converted_cases) = convert_semantic_literal_cases(state, bound, cases)
+			converted_fallback: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+				cases_state,
+				bound,
+				fallback,
+			)
+			{
+				state = converted_fallback.state,
+				tree = SemanticLiteralMatch(accessor, converted_cases, converted_fallback.tree)
+			}
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			(cases_state, converted_cases) = convert_semantic_length_cases(state, bound, cases)
+			converted_geq: ConvertedOptionalSemanticLengthGeq = convert_optional_semantic_length_geq(
+				cases_state,
+				bound,
+				geq,
+			)
+			converted_fallback: ConvertedOptionalSemanticMatchTree = convert_optional_semantic_match_tree(
+				converted_geq.state,
+				bound,
+				fallback,
+			)
+			{
+				state = converted_fallback.state,
+				tree = SemanticLengthMatch(
+					accessor,
+					converted_cases,
+					converted_geq.geq,
+					converted_fallback.tree,
+				)
+			}
+
+
+private pure func convert_semantic_match_expr(
+	state: ClosureState,
+	bound: List[String],
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> ConvertedExpr:
+	scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
+	tree_converted: ConvertedSemanticMatchTree = convert_semantic_match_tree(
+		scrutinee_converted.state,
+		bound,
+		tree,
+	)
+	{
+		state = tree_converted.state,
+		expr = SemanticMatchExpr(scrutinee_converted.expr, tree_converted.tree, typ, loc)
+	}
+
+
 private pure func convert_length_match_expr(
 	state: ClosureState,
 	bound: List[String],
@@ -4830,10 +5113,7 @@ private pure func convert_expr(
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			convert_raw_match_expr(state, bound, scrutinee, cases, typ, loc)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			{
-				state = state,
-				expr = expr
-			}
+			convert_semantic_match_expr(state, bound, scrutinee, tree, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			convert_accessor_literal_match_expr(
 				state,
@@ -5922,10 +6202,7 @@ private pure func convert_non_spine_expr(
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			convert_raw_match_expr(state, bound, scrutinee, cases, typ, loc)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			{
-				state = state,
-				expr = expr
-			}
+			convert_semantic_match_expr(state, bound, scrutinee, tree, typ, loc)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			scrutinee_converted: ConvertedExpr = convert_expr(state, bound, scrutinee)
 			match_converted: ConvertedConstructorLiteralMatch = convert_constructor_literal_match(
@@ -6148,8 +6425,10 @@ private pure func index_function(
 	{
 		by_id = indexes.by_id.set(
 			func_info.def_id,
-			indexes.by_id
-				.get(func_info.def_id)
+			functions_for_def_id(
+				indexes.by_id,
+				func_info.def_id,
+			)
 				.get_or([])
 				.append(func_info),
 		),

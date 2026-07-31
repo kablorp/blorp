@@ -34,7 +34,6 @@ bootstrap_layout_version="isolated-v1"
 current_toolchain_executables=(
 	blorp
 	blorp-ocaml-host
-	blorp-ocaml-middle
 	blorp-compiler-renderer
 	blorp-compiler-parser
 	blorp-compiler-typecheck
@@ -142,10 +141,6 @@ if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
 		echo "prepare did not receive the selected OCaml host" >&2
 		exit 1
 	fi
-	if [ "${BLORP_OCAML_MIDDLE_BIN:-}" != "${BLORP_TEST_EXPECTED_OCAML_MIDDLE:?}" ]; then
-		echo "prepare did not receive the selected OCaml middle worker" >&2
-		exit 1
-	fi
 	mkdir -p "$2"
 	cp /bin/sh "$2/compiler_renderer_bridge.bin"
 	cp /bin/sh "$2/compiler_parser_bridge.bin"
@@ -165,16 +160,13 @@ prepare_marker="$tmp_dir/prepare-called"
 selected_workers="$tmp_dir/selected-workers"
 mkdir -p "$selected_workers"
 cp /bin/sh "$selected_workers/blorp-ocaml-host"
-cp /bin/sh "$selected_workers/blorp-ocaml-middle"
 BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_BOOTSTRAP_COMPILER="$fake_bin/blorp-bootstrap-compiler" \
 	BLORP_RELEASE_OCAML_HOST="$selected_workers/blorp-ocaml-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$selected_workers/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	BLORP_TEST_PREPARE_MARKER="$prepare_marker" \
 	BLORP_TEST_EXPECTED_OCAML_HOST="$selected_workers/blorp-ocaml-host" \
-	BLORP_TEST_EXPECTED_OCAML_MIDDLE="$selected_workers/blorp-ocaml-middle" \
 	scripts/package-release "$release_dir" >/dev/null
 if [ ! -e "$prepare_marker" ]; then
 	fail "release packaging without bridge overrides must prepare one coherent bridge set"
@@ -232,7 +224,6 @@ BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_BOOTSTRAP_COMPILER="$legacy_bootstrap_source/blorp-ocaml-host" \
 	BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR="$legacy_bootstrap_source" \
 	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	BLORP_RELEASE_RENDERER_BRIDGE="$fake_bin/blorp-compiler-renderer" \
 	BLORP_RELEASE_PARSER_BRIDGE="$fake_bin/blorp-compiler-parser" \
 	BLORP_RELEASE_TYPECHECK_BRIDGE="$fake_bin/blorp-compiler-typecheck" \
@@ -257,12 +248,10 @@ sibling_release_dir="$tmp_dir/sibling-dist"
 sibling_prepare_marker="$tmp_dir/sibling-prepare-called"
 BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	BLORP_TEST_PREPARE_MARKER="$sibling_prepare_marker" \
 	BLORP_TEST_EXPECTED_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_TEST_EXPECTED_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	scripts/package-release "$sibling_release_dir" >/dev/null
 sibling_extract_dir="$tmp_dir/extracted-sibling-release"
 mkdir -p "$sibling_extract_dir"
@@ -290,7 +279,6 @@ fi
 
 if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_OCAML_HOST="$tmp_dir/missing-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	scripts/package-release "$tmp_dir/incomplete-dist" \
@@ -302,7 +290,6 @@ fi
 if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_BOOTSTRAP_COMPILER="$tmp_dir/missing-bootstrap-compiler" \
 	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	scripts/package-release "$tmp_dir/missing-bootstrap-dist" \
@@ -327,7 +314,6 @@ if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_BOOTSTRAP_COMPILER="$fake_bin/blorp-bootstrap-compiler" \
 	BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR="$incomplete_bootstrap_dir" \
 	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_RELEASE_OCAML_MIDDLE="$fake_bin/blorp-ocaml-middle" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	scripts/package-release "$tmp_dir/incomplete-bootstrap-bundle-dist" \

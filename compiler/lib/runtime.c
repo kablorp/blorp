@@ -18745,7 +18745,7 @@ static bool blorp_dict_key_eq_float(void* a, void* b) {
 // ---------------------------------------------------------------------------
 // Typed wrappers around the dict-internal hashers, callable from generated
 // blorp code via the `hash()` trait method. The wrappers match blorp's
-// C calling convention (typed args, `long` return) so [Core_specialize]
+// C calling convention (typed args, `long` return) so Core specialization
 // can emit a direct function call without casting. The underlying hash is
 // seeded wyhash / SplitMix on primitive bit-patterns — HashDoS-resistant
 // but NOT cryptographic. For SHA-256 and friends see std/hash.brp.
@@ -26599,10 +26599,10 @@ blorp_List* blorp_zip_parallel_with(
 blorp_List* blorp_list_drop(blorp_List* list, long n) {
     if (!list) return blorp_list_new(0);
     long start = n < 0 ? 0 : n;
-    if (start >= list->len) return blorp_list_new_layout(0, list->storage_mode, list->elem_size);
-    long new_len = list->len - start;
+    long new_len = start >= list->len ? 0 : list->len - start;
     blorp_List* result = blorp_list_new_layout(new_len, list->storage_mode, list->elem_size);
     result->elem_release = list->elem_release;
+    if (new_len == 0) return result;
     size_t stride = blorp_list_stride(list);
     memcpy(result->data, (char*)list->data + start * stride, new_len * stride);
     if (result->storage_mode == BLORP_LIST_STORAGE_POINTER && result->elem_release) {
@@ -37264,83 +37264,6 @@ static bool __process_make_pipe(int pipe_fds[2]) {
     return true;
 }
 
-typedef enum {
-    BLORP_PROCESS_PROGRAM_NOT_FOUND,
-    BLORP_PROCESS_PROGRAM_EXECUTABLE,
-    BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE
-} blorp_ProcessProgramLookup;
-
-static blorp_ProcessProgramLookup __process_path_lookup(const char* path) {
-    if (!path || path[0] == '\0') return BLORP_PROCESS_PROGRAM_NOT_FOUND;
-    struct stat info;
-    if (stat(path, &info) != 0) return BLORP_PROCESS_PROGRAM_NOT_FOUND;
-    if (access(path, X_OK) == 0) return BLORP_PROCESS_PROGRAM_EXECUTABLE;
-    return BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE;
-}
-
-static const char* __process_default_path(char* buf, size_t buf_len) {
-#if defined(_CS_PATH)
-    if (buf && buf_len > 0) {
-        size_t len = confstr(_CS_PATH, buf, buf_len);
-        if (len > 0 && len < buf_len) return buf;
-    }
-#else
-    (void)buf;
-    (void)buf_len;
-#endif
-    return "/bin:/usr/bin";
-}
-
-static blorp_ProcessProgramLookup __process_program_lookup(
-    const char* program
-) {
-    if (!program || program[0] == '\0') return BLORP_PROCESS_PROGRAM_NOT_FOUND;
-    if (strchr(program, '/')) return __process_path_lookup(program);
-
-    char default_path_buf[1024];
-    const char* path = getenv("PATH");
-    if (!path || path[0] == '\0') {
-        path = __process_default_path(default_path_buf, sizeof(default_path_buf));
-    }
-
-    size_t program_len = strlen(program);
-    const char* part = path;
-    bool found_non_executable = false;
-    while (true) {
-        const char* end = strchr(part, ':');
-        size_t dir_len = end ? (size_t)(end - part) : strlen(part);
-        size_t candidate_len =
-            dir_len == 0
-                ? program_len
-                : blorp_checked_add(blorp_checked_add(dir_len, 1), program_len);
-        char* candidate =
-            (char*)blorp_malloc_checked(blorp_checked_add(candidate_len, 1));
-        if (dir_len == 0) {
-            memcpy(candidate, program, program_len + 1);
-        } else {
-            memcpy(candidate, part, dir_len);
-            candidate[dir_len] = '/';
-            memcpy(candidate + dir_len + 1, program, program_len + 1);
-        }
-        blorp_ProcessProgramLookup lookup = __process_path_lookup(candidate);
-        free(candidate);
-        if (lookup == BLORP_PROCESS_PROGRAM_EXECUTABLE) return lookup;
-        if (lookup == BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE) {
-            found_non_executable = true;
-        }
-        if (!end) break;
-        part = end + 1;
-    }
-    return found_non_executable
-        ? BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE
-        : BLORP_PROCESS_PROGRAM_NOT_FOUND;
-}
-
-static bool __process_program_is_resolvable(const char* program) {
-    return __process_program_lookup(program) ==
-        BLORP_PROCESS_PROGRAM_EXECUTABLE;
-}
-
 static void* __process_error_result(
     blorp_String* out_str,
     blorp_String* err_str,
@@ -37617,23 +37540,6 @@ void* blorp_process_run_command_raw(
         );
         goto cleanup;
     }
-    blorp_ProcessProgramLookup lookup =
-        __process_program_lookup(executable);
-    if (lookup == BLORP_PROCESS_PROGRAM_NOT_FOUND) {
-        result = __process_command_error_string(
-            BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND,
-            blorp_string_from_buf_size(executable, strlen(executable))
-        );
-        goto cleanup;
-    }
-    if (lookup == BLORP_PROCESS_PROGRAM_NOT_EXECUTABLE) {
-        result = __process_command_error(
-            BLORP_PROCESS_ERROR_SPAWN_FAILED,
-            "program is not executable"
-        );
-        goto cleanup;
-    }
-
     argv = (char**)blorp_malloc_checked(
         sizeof(char*) * ((size_t)argc + 2)
     );
@@ -38033,11 +37939,6 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     }
     argv[argc + 1] = NULL;
 
-    if (!__process_program_is_resolvable(prog)) {
-        __free_argv(argv, argc + 1);
-        return (void*)blorp_result_err_cstr("program not found");
-    }
-
     // Create pipes for stdout and stderr
     int stdout_pipe[2], stderr_pipe[2];
     if (pipe(stdout_pipe) != 0) {
@@ -38098,7 +37999,9 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         __free_argv(argv, argc + 1);
-        return (void*)blorp_result_err_cstr("spawn failed");
+        return (void*)blorp_result_err_cstr(
+            err == ENOENT ? "program not found" : "spawn failed"
+        );
     }
 
     blorp_String* out_str = NULL;
@@ -38196,11 +38099,6 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
     }
     argv[argc + 1] = NULL;
 
-    if (!__process_program_is_resolvable(prog)) {
-        __free_argv(argv, argc + 1);
-        return (void*)blorp_result_err_cstr("program not found");
-    }
-
     fflush(stdout);
     fflush(stderr);
 
@@ -38208,7 +38106,9 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
     int err = posix_spawnp(&pid, prog, NULL, NULL, argv, environ);
     if (err != 0) {
         __free_argv(argv, argc + 1);
-        return (void*)blorp_result_err_cstr("spawn failed");
+        return (void*)blorp_result_err_cstr(
+            err == ENOENT ? "program not found" : "spawn failed"
+        );
     }
 
     int status = 0;

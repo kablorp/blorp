@@ -23,18 +23,15 @@ Blorp CLI / source graph / source reads / parse
   -> Blorp trait and call resolution / std inline / tailrec
   -> Blorp string, collection, parallel-tensor, and tensor-update fusion
   -> Blorp runtime-declaration projection / tuple SROA
-  -> strict post-tuple-SROA request
-  -> one private blorp-ocaml-middle process
-  -> remaining OCaml specialization
-  -> strict pre-DCE Core response
-  -> Blorp specialization / DCE / consume specialization / Perceus / reuse
+  -> Blorp value, collection, and tensor specialization
+  -> Blorp DCE / consume specialization / Perceus / reuse
   -> Blorp closure / resource / fairness / final preparation / C emission
   -> Blorp artifact writing / runtime cache / host C / optional execution
 ```
 
-Ordinary `check` makes no OCaml call. `compile` and `run` cross only the
-phase-specific semantic-middle boundary. The OCaml host remains for `test`,
-`purify`, `repl`, `lsp`, and package commands.
+Ordinary `check`, `compile`, and `run` make no OCaml call. Their compilation
+pipeline is one contiguous Blorp call graph. The OCaml host remains for
+`test`, `purify`, `repl`, `lsp`, and package commands.
 
 The immutable compiler named by `compiler/bootstrap.env` is a build trust root,
 not part of the compiler being migrated.
@@ -46,8 +43,8 @@ not part of the compiler being migrated.
 3. Route production through the Blorp implementation before deleting OCaml.
 4. Delete replaced OCaml implementation and implementation-only tests in the
    same change.
-5. Keep JSON and process boundaries phase-specific; use typed values inside a
-   phase.
+5. Keep remaining JSON and process boundaries command-specific; use typed
+   values inside compilation.
 6. Do not add optional parallel implementations or source-spelling heuristics.
 7. Preserve existing definition IDs, ownership facts, diagnostics, stage
    observations, and deterministic output.
@@ -85,41 +82,43 @@ slice.
 
 ## Checkpoint 1: Remove The Semantic Middle
 
+Status: implementation complete; full cross-platform validation pending.
+
 ### Goal
 
 Make Blorp own the contiguous Core pipeline from source lowering through final
 C emission, eliminating `blorp-ocaml-middle`.
 
-### Current Boundary
+### Result
 
-Blorp projects runtime declarations and emits strict post-tuple-SROA Core.
-OCaml decodes it, runs registry/layout-dependent specialization, then returns
-strict pre-DCE Core. Blorp owns all later stages.
+The CLI carries a typed `CoreProgram` directly from tuple SROA into the
+Blorp-owned late pipeline. Specialization builds one declaration/layout index
+per program and composes value, collection/stream, and tensor current-node
+rewrites under one recursive traversal. Runtime declaration projection remains
+a normal Core pass; it is no longer a serialization boundary.
 
-The remaining implementation is represented by the `middle_core` inventory
-group, especially:
+The private middle executable, protocol/client, strict OCaml decoder, OCaml
+pipeline, specializer/fallback, emitter/projection, representation helpers,
+invariants, registry helpers, and implementation-only tests have been deleted.
+Build, release, install, CI, and benchmark wiring no longer expects
+`blorp-ocaml-middle`.
 
-- `compiler/bin/blorp_ocaml_middle.ml`;
-- `compiler/lib/core_pipeline.ml`;
-- `compiler/lib/core_specialize.ml`; and
-- `compiler/lib/core_specialize_fallback.ml`.
+### Completed Execution
 
-### Execution
-
-1. Capture focused Core inputs for each remaining pass family and assert exact
+1. Captured focused Core inputs for each remaining pass family and asserted exact
    semantic output, not only generated-C success.
-2. Extend the corresponding Blorp Core pass or add the narrow missing pass in
+2. Extended the corresponding Blorp Core pass or added the narrow missing pass in
    the existing `stage_09_core` pipeline.
-3. Preserve pass order in one pipeline manifest; do not duplicate orchestration
+3. Preserved pass order in one pipeline manifest without duplicating orchestration
    in the CLI or bridge.
 4. Compare stage dumps and generated C on collection pipelines, tensor
    pipelines, tuple-return scalar replacement, generic specialization, and
    unsupported-layout fallback cases.
-5. Route the production pipeline directly from Blorp tuple SROA through the
+5. Routed the production pipeline directly from Blorp tuple SROA through the
    remaining Blorp middle stages to specialization/DCE.
-6. Delete the OCaml worker, decoder, orchestration, replaced pass modules, and
+6. Deleted the OCaml worker, decoder, orchestration, replaced pass modules, and
    implementation-only tests.
-7. Remove the worker from build, release, cache, and bootstrap toolchain
+7. Removed the worker from build, release, cache, and bootstrap toolchain
    manifests.
 
 ### Required Edge Cases
@@ -150,8 +149,8 @@ for every representation-changing case.
 
 ### Deletion Condition
 
-No production command starts `blorp-ocaml-middle`, and no OCaml module performs
-a Core-to-Core semantic transformation.
+Met: no production command starts `blorp-ocaml-middle`, and no OCaml module
+performs a Core-to-Core semantic transformation.
 
 ## Dependency Waves After The Semantic Middle
 
@@ -160,7 +159,7 @@ gates. Their remaining files form a consumer graph: tools still consume OCaml
 parser and type-system facades, while some frontend and tool modules still
 consume representation helpers.
 
-After checkpoint 1, migrate one semantic or tool consumer, delete the
+With checkpoint 1 cut over, migrate one semantic or tool consumer, delete the
 representation/frontend dependencies that became unreachable, and repeat.
 Never retain a mirror merely to make an inventory group disappear in one later
 batch, and never port an orphaned dependency whose last consumer can be
@@ -341,7 +340,7 @@ toolchain used only to build it.
 ### Execution
 
 1. Delete process clients, JSON codecs, and cache keys for retired parser,
-   typecheck, semantic-middle, renderer, and host boundaries.
+   typecheck, renderer, and host boundaries.
 2. Keep only serialization that is a public artifact/protocol or an explicit
    test fixture.
 3. Remove old executable-name and environment-selector fallbacks after the

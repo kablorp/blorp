@@ -5,8 +5,6 @@
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
-OCAML_MIDDLE := compiler/_build/default/bin/blorp_ocaml_middle.exe
-ROOT_OCAML_MIDDLE := ./blorp-ocaml-middle
 ROOT_RENDERER_BRIDGE := ./blorp-compiler-renderer
 ROOT_PARSER_BRIDGE := ./blorp-compiler-parser
 ROOT_TYPECHECK_BRIDGE := ./blorp-compiler-typecheck
@@ -58,11 +56,6 @@ install: build-blorp-cli
 		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
 		codesign -s - "$(ROOT_OCAML_HOST)" 2>/dev/null || true; \
 	fi
-	@if [ ! -f "$(ROOT_OCAML_MIDDLE)" ] || [ "$(OCAML_MIDDLE)" -nt "$(ROOT_OCAML_MIDDLE)" ]; then \
-		rm -f "$(ROOT_OCAML_MIDDLE)"; \
-		cp "$(OCAML_MIDDLE)" "$(ROOT_OCAML_MIDDLE)"; \
-		codesign -s - "$(ROOT_OCAML_MIDDLE)" 2>/dev/null || true; \
-	fi
 	@if [ ! -f ./blorp ] || [ "$(BLORP_CLI_BIN)" -nt ./blorp ]; then \
 		rm -f ./blorp; \
 		cp "$(BLORP_CLI_BIN)" ./blorp; \
@@ -96,7 +89,7 @@ $(BLORP_EMBEDDED_STD_SOURCE): compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
-	cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe
+	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for compiler stages that have not yet moved across the boundary.
@@ -211,6 +204,8 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
+	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
+	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@tests/test_bootstrap_helper_install.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
@@ -290,4 +285,4 @@ docker-premerge-gate-all:
 clean:
 	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(ROOT_OCAML_MIDDLE)" "$(ROOT_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" "$(ROOT_TYPECHECK_BRIDGE)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(ROOT_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" "$(ROOT_TYPECHECK_BRIDGE)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"

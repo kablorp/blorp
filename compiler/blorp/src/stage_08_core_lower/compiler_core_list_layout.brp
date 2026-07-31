@@ -4,6 +4,7 @@
 -- Later passes consume the explicit layout instead of repeating type-name
 -- guesses at each allocation or handoff site.
 import:
+	../stage_09_core/compiler_core_c_type_layout as TypeLayout
 	../stage_09_core/compiler_core_json:
 		CoreBoxKind(StructBox),
 		CoreBoxedStorageValue,
@@ -17,11 +18,22 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreExpr(ListAllocExpr, ListConstructExpr, ListHandoffExpr),
+		CoreExpr(ForListExpr, ListAllocExpr, ListConstructExpr, ListHandoffExpr),
 		CoreFunction,
 		CoreGlobal,
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreProgram,
+		CoreTensorForElementStorage(
+			TensorForBoxedElement,
+			TensorForInlineStructElement,
+			TensorForRuntimeReadElement,
+		),
+		CoreTensorRuntimeReadHelper(
+			TensorRuntimeReadF16,
+			TensorRuntimeReadF32,
+			TensorRuntimeReadF64,
+			TensorRuntimeReadI64,
+		),
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -39,8 +51,8 @@ import:
 			VoidType,
 		),
 		CoreTypeAliasDecl,
+		core_expr_type,
 	../stage_09_core/compiler_core_traverse: map_core_expr_children
-	../stage_10_backend/compiler_core_emit_type_layout as TypeLayout
 
 
 INLINE_WIDTH_1: Int = 1
@@ -257,7 +269,7 @@ pure func resolve_layout_type(program: CoreProgram, typ: CoreType) -> CoreType:
 private pure func list_element_type(index: CoreLayoutTypeIndex, typ: CoreType) -> Option[CoreType]:
 	match resolve_layout_type_with_index(index, typ):
 		NamedType(name, args):
-			if name == "List":
+			if name == "List" or name == "ParallelList":
 				match args:
 					[element_type]:
 						Some(resolve_layout_type_with_index(index, element_type))
@@ -298,6 +310,65 @@ private pure func primitive_inline_width(name: String) -> Option[Int]:
 		Some(INLINE_WIDTH_8)
 	else:
 		None
+
+
+pure func tensor_for_element_storage_for_canonical_type(
+	element_type: CoreType,
+) -> CoreTensorForElementStorage:
+	match element_type:
+		NamedType(name, args):
+			if args.length() != 0:
+				TensorForBoxedElement(TypeLayout.c_type_name(element_type))
+			else if name == "Float":
+				TensorForRuntimeReadElement({
+					value_c_type = TypeLayout.c_type_name(element_type),
+					helper = TensorRuntimeReadF64,
+				})
+			else if name == "Float32":
+				TensorForRuntimeReadElement({
+					value_c_type = TypeLayout.c_type_name(element_type),
+					helper = TensorRuntimeReadF32,
+				})
+			else if name == "Float16":
+				TensorForRuntimeReadElement({
+					value_c_type = TypeLayout.c_type_name(element_type),
+					helper = TensorRuntimeReadF16,
+				})
+			else if (
+				name == "Int"
+				or name == "Int8"
+				or name == "Int16"
+				or name == "Int32"
+				or name == "Int64"
+				or name == "UInt8"
+				or name == "UInt16"
+				or name == "UInt32"
+				or name == "UInt64"
+				or name == "Bool"
+				or name == "Char"
+			):
+				TensorForRuntimeReadElement({
+					value_c_type = TypeLayout.c_type_name(element_type),
+					helper = TensorRuntimeReadI64,
+				})
+			else:
+				TensorForBoxedElement(TypeLayout.c_type_name(element_type))
+		RangeType | EnumType(_):
+			TensorForRuntimeReadElement({
+				value_c_type = TypeLayout.c_type_name(element_type),
+				helper = TensorRuntimeReadI64,
+			})
+		ValueRecordType(_):
+			TensorForInlineStructElement(TypeLayout.c_type_name(element_type))
+		_:
+			TensorForBoxedElement(TypeLayout.c_type_name(element_type))
+
+
+pure func tensor_for_element_storage_for_type(
+	program: CoreProgram,
+	element_type: CoreType,
+) -> CoreTensorForElementStorage:
+	tensor_for_element_storage_for_canonical_type(resolve_layout_type(program, element_type))
 
 
 private pure func enum_inline_width(program: CoreProgram, name: String) -> Option[Int]:
@@ -594,6 +665,18 @@ private pure func relayout_expr(
 							): list_element_needs_release_with_index(program, index, element),
 						)
 						.get_or(False)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(for_list, typ, loc):
+			ForListExpr(
+				{ for_list |
+					layout = list_layout_for_type_with_index(
+						program,
+						index,
+						core_expr_type(for_list.iterable),
+					)
 				},
 				typ,
 				loc,

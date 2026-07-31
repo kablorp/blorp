@@ -4,6 +4,7 @@
 -- The emitter should consume prepared Core instead of discovering source-level
 -- constructs such as record literals and primitive tuple literals itself.
 import:
+	../stage_08_core_lower/compiler_core_list_layout: tensor_for_element_storage_for_canonical_type
 	compiler_core_clone: clone_core_literal, clone_core_source_loc, clone_core_type, clone_core_var
 	compiler_core_json:
 		CoreBoxKind(
@@ -214,7 +215,13 @@ import:
 		CoreTailrecListSpreadRebind,
 		CoreTensorBoxedLiteral,
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
-		CoreTensorForElementStorage(TensorForRawScalarElement),
+		CoreTensorForElementStorage(
+			TensorForBoxedElement,
+			TensorForInlineStructElement,
+			TensorForRawScalarElement,
+			TensorForRowSliceElement,
+			TensorForRuntimeReadElement,
+		),
 		CoreTensorLiteral,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
 		CoreTensorLiteralShape(TensorStaticShape, TensorVectorLength),
@@ -231,6 +238,7 @@ import:
 			TuplePointerElement,
 			TuplePrimElement,
 			TupleStructElement,
+			TupleStackResultElement,
 			TupleVoidElement,
 		),
 		CoreType(
@@ -264,6 +272,8 @@ import:
 		CoreValueRecordDecl,
 		CoreVar,
 		clone_tensor_for_element_storage,
+	compiler_core_mono: core_mono_type_equal
+	compiler_core_specialize_layout: generic_hash_container_type_name
 	compiler_core_traverse as CoreTraverse
 	compiler_core_type_policy: is_stack_result_type
 
@@ -855,7 +865,11 @@ private pure func boxed_storage_type_needs_release(typ: CoreType, kind: CoreBoxK
 
 
 private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBoxKind) -> Bool:
-	boxed_storage_type_needs_release(expr_type(expr), kind)
+	match expr:
+		BoxExpr(box, _, _):
+			boxed_storage_type_needs_release(box.source_type, box.kind)
+		_:
+			boxed_storage_type_needs_release(expr_type(expr), kind)
 
 
 private pure func boxed_storage_value_for_expr(expr: CoreExpr) -> CoreBoxedStorageValue:
@@ -889,6 +903,8 @@ private pure func prepare_tuple_elements(
 				prepared = prepared.append(TuplePointerElement(prepare_expr(decls, value)))
 			TupleStructElement(value, c_type):
 				prepared = prepared.append(TupleStructElement(prepare_expr(decls, value), c_type))
+			TupleStackResultElement(value):
+				prepared = prepared.append(TupleStackResultElement(prepare_expr(decls, value)))
 			TupleVoidElement:
 				prepared = prepared.append(TupleVoidElement)
 			TupleFloatElement(value):
@@ -1366,7 +1382,7 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 		VoidType:
 			False
 		EnumType(name):
-			False
+			True
 		ValueRecordType(name):
 			False
 		HeapRecordType(name):
@@ -1728,6 +1744,8 @@ private pure func tensor_expr_raw_kind(
 			tensor_fill_raw_kind(name)
 		CallExpr(DirectRuntimeCall(call), callee, args, typ, loc):
 			tensor_fill_raw_kind(call.name)
+		DupExpr(_, _, _, body, _, _):
+			tensor_expr_raw_kind(env, body)
 		_:
 			None
 
@@ -1798,6 +1816,7 @@ private pure func raw_scalar_tensor_element_storage_or(
 private pure func tensor_for_element_storage_after_raw_proof(
 	env: List[TensorStorageBinding],
 	iterable: CoreExpr,
+	element_type: CoreType,
 	storage: CoreTensorForElementStorage,
 ) -> CoreTensorForElementStorage:
 	match storage:
@@ -1807,14 +1826,12 @@ private pure func tensor_for_element_storage_after_raw_proof(
 				result_first_dim = row_slice.result_first_dim,
 				runtime_derived = row_slice.runtime_derived,
 			})
-		TensorForInlineStructElement(c_type):
-			raw_scalar_tensor_element_storage_or(env, iterable, storage)
-		TensorForRawScalarElement(raw_kind):
-			raw_scalar_tensor_element_storage_or(env, iterable, storage)
-		TensorForRuntimeReadElement(runtime_read):
-			raw_scalar_tensor_element_storage_or(env, iterable, storage)
-		TensorForBoxedElement(value_c_type):
-			raw_scalar_tensor_element_storage_or(env, iterable, storage)
+		TensorForInlineStructElement(_) | TensorForRawScalarElement(_) | TensorForRuntimeReadElement(_) | TensorForBoxedElement(_):
+			raw_scalar_tensor_element_storage_or(
+				env,
+				iterable,
+				tensor_for_element_storage_for_canonical_type(element_type),
+			)
 
 
 private pure func annotate_tensor_storage_expr(
@@ -1950,6 +1967,7 @@ private pure func annotate_tensor_storage_expr(
 			element_storage: CoreTensorForElementStorage = tensor_for_element_storage_after_raw_proof(
 				env,
 				annotated_iterable,
+				for_tensor.binder.typ,
 				for_tensor.element_storage,
 			)
 
@@ -2269,8 +2287,8 @@ private pure func prepared_tuple_literal(
 							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
 						StackResultType(ok_type, err_type):
-							failed = True
-							break
+							elements = elements.append(TupleStackResultElement(item))
+							release_mask += int_power_of_two(index)
 						HeapRecordType(name):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
@@ -2679,66 +2697,6 @@ private pure func dict_key_value_types(typ: CoreType) -> Option[DictKeyValueType
 			None
 
 
-private pure func generic_hash_container_type_name(name: String) -> Bool:
-	match name:
-		"Int":
-			True
-		"Int8":
-			True
-		"Int16":
-			True
-		"Int32":
-			True
-		"Int64":
-			True
-		"Int128":
-			True
-		"UInt8":
-			True
-		"UInt16":
-			True
-		"UInt32":
-			True
-		"UInt64":
-			True
-		"UInt128":
-			True
-		"Bool":
-			True
-		"Char":
-			True
-		"Option":
-			True
-		"Result":
-			True
-		"List":
-			True
-		"Dict":
-			True
-		"Set":
-			True
-		"Tensor":
-			True
-		"Vector":
-			True
-		"Matrix":
-			True
-		"Bytes":
-			True
-		"Tuple2":
-			True
-		"Tuple3":
-			True
-		"Tuple4":
-			True
-		"LiteralString":
-			True
-		"StringSlice":
-			True
-		_:
-			False
-
-
 private pure func enum_decl_name_matches(decl: CoreDecl, name: String) -> Bool:
 	match decl:
 		EnumDecl(enum_decl):
@@ -3101,6 +3059,83 @@ private pure func constructor_c_name(name: String, def_id: Option[Int]) -> Strin
 			name
 
 
+private pure func stack_option_scalar_payload_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, type_args):
+			(
+				type_args.is_empty()
+				and ((
+					name == "Int"
+					or name == "Int8"
+					or name == "Int16"
+					or name == "Int32"
+					or name == "Int64"
+					or name == "UInt8"
+					or name == "UInt16"
+					or name == "UInt32"
+					or name == "UInt64"
+					or name == "Float"
+					or name == "Float32"
+					or name == "Float16"
+					or name == "Bool"
+					or name == "Char"
+					or name == "Int128"
+					or name == "UInt128"
+				))
+			)
+		EnumType(_):
+			True
+		_:
+			False
+
+
+private pure func restore_stack_option_payload_type(
+	payload: CoreType,
+	value: CoreExpr,
+	erased_value: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	value_type: CoreType = expr_type(value)
+
+	if core_mono_type_equal(value_type, payload):
+		value
+	else if (
+		stack_option_scalar_payload_type(value_type)
+		and stack_option_scalar_payload_type(payload)
+	):
+		CastExpr(value, payload, loc)
+	else:
+		erased_value
+
+
+private pure func stack_option_payload_arg(payload: CoreType, arg: CoreExpr) -> CoreExpr:
+	match arg:
+		CastExpr(value, cast_type, loc):
+			match cast_type:
+				NamedType(name, type_args):
+					if name == "Ptr" and type_args.is_empty():
+						restore_stack_option_payload_type(payload, value, arg, loc)
+					else:
+						arg
+				_:
+					arg
+		BoxExpr(box, _, loc):
+			match box.kind:
+				PrimBox:
+					restore_stack_option_payload_type(payload, box.value, arg, loc)
+				_:
+					arg
+		_:
+			arg
+
+
+private pure func stack_option_payload_args(
+	payload: CoreType,
+	args: List[CoreExpr],
+) -> List[CoreBoxedStorageValue]:
+	args.map(func(arg): boxed_storage_value_for_expr(stack_option_payload_arg(payload, arg)))
+
+
 private pure func prepare_stack_option_construct(
 	kind: CoreCallKind,
 	args: List[CoreExpr],
@@ -3119,7 +3154,7 @@ private pure func prepare_stack_option_construct(
 							payload_storage = TypedUnionPayloadStorage,
 							uses_release_mask = False,
 							release_mask = 0,
-							args = boxed_storage_values_for_exprs(args),
+							args = stack_option_payload_args(payload, args),
 						})
 					None:
 						if is_nullable_option_payload_type(payload):

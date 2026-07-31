@@ -1027,9 +1027,10 @@ let with_builtins (env : env) : env =
       ~purity:Pure ~origin:Builtin ()
   in
   (* tensor_peel: single-index peel on multi-dim tensors. Emitted by infer
-     when checked_get would return a sub-tensor (not a scalar). Core_specialize
-     rewrites the 2-arg form into blorp_tensor_slice_row with the concrete
-     row_size / result_first_dim extracted from the collection's type. *)
+     when checked_get would return a sub-tensor (not a scalar). Blorp Core
+     specialization rewrites the 2-arg form into blorp_tensor_slice_row with
+     the concrete row_size / result_first_dim extracted from the collection's
+     type. *)
   let env =
     add_func env "tensor_peel"
       (ty_func [ TyVar "T"; ty_int ] (TyVar "T") ~pure:true)

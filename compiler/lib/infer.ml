@@ -8048,8 +8048,8 @@ and infer_type_name ctx expr args loc =
         Types.instantiate_type_params ctx.rigid_type_params arg_ty
       in
       if Codegen_types.has_type_vars runtime_ty then
-        (* Defer: leave as a real call. [Core_specialize] folds it post-mono
-           when [arg_ty] is concrete for each monomorphized copy. *)
+        (* Defer: leave as a real call. Blorp Core specialization folds it
+           post-mono when [arg_ty] is concrete for each monomorphized copy. *)
         let callee_ty = ty_func [ arg_ty ] ty_string ~pure:true in
         let callee' =
           match expr.expr_desc with

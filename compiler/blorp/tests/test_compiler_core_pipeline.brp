@@ -1,28 +1,64 @@
 import:
 	../src/stage_09_core/compiler_core_json:
-		CoreCallKind(SelectedDirectCall),
+		CoreAccessor(RootAccessor),
+		CoreBoxKind(FloatBox),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, SelectedDirectCall),
+		CoreConstructorLengthMatch,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreConstructorMatchTest(
+			BoolFalseConstructorTest,
+			BoolTrueConstructorTest,
+			BoxedResultOkConstructorTest,
+		),
 		CoreDecl(FunctionDecl, HeapRecordDecl, ValueRecordDecl),
 		CoreExpr(
 			AssignExpr,
+			BoxExpr,
 			CallExpr,
+			ConstructorMatchExpr,
 			FieldExpr,
 			IfExpr,
 			LetExpr,
 			ListConstructExpr,
 			LiteralExpr,
+			LiteralMatchExpr,
 			RecordConstructExpr,
 			RecordExpr,
 			RecordUpdateExpr,
+			SemanticMatchExpr,
 			SeqExpr,
 			VarExpr,
+			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
+		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(HeapRecordType, NamedType, ValueRecordType, VoidType),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(BoxedResultType, HeapRecordType, NamedType, TensorType, ValueRecordType, VoidType),
 		CoreVar,
 		core_program_to_json,
 	../src/stage_09_core/compiler_core_pipeline:
@@ -38,12 +74,39 @@ import:
 	test: TestSuite
 
 
+private enum RecordReuseFallbackFixture:
+	FailRecordReuseFallback
+	BodyRecordReuseFallback
+	BindingsRecordReuseFallback
+
+
 pure func int_type() -> CoreType:
 	NamedType("Int", [])
 
 
 pure func bool_type() -> CoreType:
 	NamedType("Bool", [])
+
+
+pure func record_reuse_fallback_bindings() -> List[CoreMatchBinding]:
+	[
+		{
+			variable = {
+				name = "matched_value",
+				uniq = 99,
+				def_id = None
+			},
+			typ = bool_type(),
+			accessor = RootAccessor,
+			mode = MatchBorrowBindingMode
+		},
+	]
+
+
+pure func preserves_record_reuse_fallback_binding(json: String) -> Bool:
+	json.contains(
+		"\"bindings\":[{\"variable\":{\"name\":\"matched_value\",\"uniq\":99,\"def_id\":null},\"type\":{\"kind\":\"named\",\"name\":\"Bool\",\"args\":[]},\"accessor\":{\"kind\":\"root\"},\"mode\":\"borrow\"}]",
+	)
 
 
 pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
@@ -95,6 +158,106 @@ pure func test_pre_dce_tail_resolves_selected_direct_call() -> Bool:
 			core_program_to_json(prepared).to_string()
 
 	json.contains("\"call_kind\":{\"kind\":\"user\"") and not json.contains("selected_direct")
+
+
+pure func test_pre_dce_tail_projects_semantic_matches() -> Bool:
+	subject: CoreVar = {
+		name = "subject",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = SemanticMatchExpr(
+		VarExpr(
+			subject,
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		SemanticLiteralMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					literal = IntLiteral(7),
+					body = SemanticMatchLeaf(
+						[],
+						LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+					)
+				},
+			],
+			SemanticMatchLeaf(
+				[],
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+			),
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("classify", 3, body)],
+		foreign_includes = []
+	}
+
+	json: String = match run_pre_dce_tail(program):
+		PreparedCore(prepared):
+			core_program_to_json(prepared).to_string()
+
+	json.contains("\"kind\":\"literal_match\"") and not json.contains("\"kind\":\"semantic_match\"")
+
+
+pure func test_pre_dce_tail_preserves_erased_float_argument_box() -> Bool:
+	float_type: CoreType = NamedType("Float", [])
+	vector_type: CoreType = TensorType({
+		element_type = float_type,
+		dims = [TensorStaticDim(4)],
+	})
+	call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_vector_set_cow_nullable"),
+		VoidExpr(
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[
+			VarExpr(
+				{
+					name = "values",
+					uniq = 0,
+					def_id = None
+				},
+				vector_type,
+				SyntheticSourceLoc,
+			),
+			LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+			VarExpr(
+				{
+					name = "value",
+					uniq = 0,
+					def_id = None
+				},
+				float_type,
+				SyntheticSourceLoc,
+			),
+		],
+		NamedType(
+			"Option",
+			[vector_type],
+		),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, call)],
+		foreign_includes = []
+	}
+
+	match run_pre_dce_tail(program):
+		PreparedCore(prepared):
+			match prepared.decls:
+				[FunctionDecl(function_info)]:
+					match function_info.body:
+						Some(CallExpr(DirectRuntimeCall(runtime), _, [_, _, BoxExpr(box, NamedType("Ptr", []), _)], _, _)):
+							runtime.name == "blorp_vector_set_cow_nullable" and box.kind == FloatBox
+						_:
+							False
+				_:
+					False
 
 
 pure func test_named_list_layout_stage_relayouts_list_nodes() -> Bool:
@@ -675,6 +838,772 @@ pure func test_record_reuse_rejects_if_condition_that_assigns_target() -> Bool:
 	)
 
 
+pure func heap_record_match_self_update_program(
+	mixed_false_case: Bool,
+	mutating_scrutinee: Bool,
+	malformed_result_type: Bool,
+	fallback_fixture: RecordReuseFallbackFixture,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	true_case: CoreConstructorMatchCase = {
+		constructor = "True",
+		accessor = RootAccessor,
+		test = BoolTrueConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(counter_box_update_from(box_var, true_base_var, 11, 21))
+	}
+
+	false_body: CoreExpr = if mixed_false_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	false_case: CoreConstructorMatchCase = {
+		constructor = "False",
+		accessor = RootAccessor,
+		test = BoolFalseConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(false_body)
+	}
+
+	match_cases: List[CoreConstructorMatchCase] = match fallback_fixture:
+		FailRecordReuseFallback:
+			[true_case, false_case]
+		_:
+			[true_case]
+
+	match_fallback: CoreConstructorMatchFallback = match fallback_fixture:
+		BodyRecordReuseFallback:
+			ConstructorMatchFallbackBody(false_body)
+		BindingsRecordReuseFallback:
+			ConstructorMatchFallbackBindings(record_reuse_fallback_bindings(), false_body)
+		FailRecordReuseFallback:
+			ConstructorMatchFallbackFail
+
+	scrutinee: CoreExpr = if mutating_scrutinee:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	match_result_type: CoreType = if malformed_result_type:
+		int_type()
+	else:
+		box_type
+
+	update: CoreExpr = ConstructorMatchExpr(
+		scrutinee,
+		NoReleasePolicy,
+		match_cases,
+		match_fallback,
+		match_result_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 11,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_constructor_match_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_match_self_update_program(False, False, False, FailRecordReuseFallback),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_constructor_match_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				True,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_constructor_match_scrutinee_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				False,
+				True,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_constructor_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				False,
+				False,
+				True,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_constructor_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_match_self_update_program(
+					False,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+
+		binding_preserved: Bool = match fallback_fixture:
+			BindingsRecordReuseFallback:
+				preserves_record_reuse_fallback_binding(json)
+			_:
+				True
+
+		valid = valid and json.count("\"kind\":\"record_reuse\"") == 2 and binding_preserved
+
+	valid
+
+
+pure func test_record_reuse_rejects_mixed_constructor_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_match_self_update_program(
+					True,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+		valid = valid and not json.contains("\"kind\":\"record_reuse\"")
+
+	valid
+
+
+pure func heap_record_literal_match_self_update_program(
+	mixed_false_case: Bool,
+	mutating_scrutinee: Bool,
+	malformed_result_type: Bool,
+	fallback_fixture: RecordReuseFallbackFixture,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	scrutinee_var: CoreVar = {
+		name = "__blorp_match_scrutinee",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	true_case: CoreLiteralMatchCase = {
+		literal = BoolLiteral(True),
+		bindings = [],
+		body = counter_box_update_from(box_var, true_base_var, 11, 21)
+	}
+
+	false_body: CoreExpr = if mixed_false_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	false_case: CoreLiteralMatchCase = {
+		literal = BoolLiteral(False),
+		bindings = [],
+		body = false_body
+	}
+
+	match_cases: List[CoreLiteralMatchCase] = match fallback_fixture:
+		FailRecordReuseFallback:
+			[true_case, false_case]
+		_:
+			[true_case]
+
+	match_fallback: CoreLiteralMatchFallback = match fallback_fixture:
+		BodyRecordReuseFallback:
+			LiteralMatchFallbackBody(false_body)
+		BindingsRecordReuseFallback:
+			LiteralMatchFallbackBindings(record_reuse_fallback_bindings(), false_body)
+		FailRecordReuseFallback:
+			LiteralMatchFallbackFail
+
+	scrutinee_value: CoreExpr = if mutating_scrutinee:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	match_result_type: CoreType = if malformed_result_type:
+		int_type()
+	else:
+		box_type
+
+	update: CoreExpr = LetExpr(
+		scrutinee_var,
+		False,
+		bool_type(),
+		scrutinee_value,
+		LiteralMatchExpr(
+			VarExpr(scrutinee_var, bool_type(), SyntheticSourceLoc),
+			match_cases,
+			match_fallback,
+			match_result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "literal_match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 12,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_literal_match_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_literal_match_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				True,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_literal_match_scrutinee_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				False,
+				True,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_literal_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				False,
+				False,
+				True,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_literal_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_literal_match_self_update_program(
+					False,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+
+		binding_preserved: Bool = match fallback_fixture:
+			BindingsRecordReuseFallback:
+				preserves_record_reuse_fallback_binding(json)
+			_:
+				True
+
+		valid = valid and json.count("\"kind\":\"record_reuse\"") == 2 and binding_preserved
+
+	valid
+
+
+pure func test_record_reuse_rejects_mixed_literal_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_literal_match_self_update_program(
+					True,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+		valid = valid and not json.contains("\"kind\":\"record_reuse\"")
+
+	valid
+
+
+pure func heap_record_nested_literal_match_self_update_program(
+	mixed_inner_case: Bool,
+	use_inner_fallback: Bool,
+	malformed_inner_result_type: Bool,
+	use_inner_length_match: Bool,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	outer_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+
+	inner_false_body: CoreExpr = if mixed_inner_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	inner_cases: List[CoreLiteralMatchCase] = if use_inner_fallback:
+		[
+			{
+				literal = BoolLiteral(True),
+				bindings = [],
+				body = counter_box_update_from(box_var, true_base_var, 11, 21)
+			},
+		]
+	else:
+		[
+			{
+				literal = BoolLiteral(True),
+				bindings = [],
+				body = counter_box_update_from(box_var, true_base_var, 11, 21)
+			},
+			{
+				literal = BoolLiteral(False),
+				bindings = [],
+				body = inner_false_body
+			},
+		]
+
+	inner_fallback: CoreLiteralMatchFallback = if use_inner_fallback:
+		LiteralMatchFallbackBody(inner_false_body)
+	else:
+		LiteralMatchFallbackFail
+
+	inner_result_type: CoreType = if malformed_inner_result_type:
+		int_type()
+	else:
+		box_type
+
+	inner_match: CoreConstructorLiteralMatch = {
+		accessor = RootAccessor,
+		scrutinee_type = bool_type(),
+		cases = inner_cases,
+		fallback = inner_fallback,
+		result_type = inner_result_type,
+		loc = SyntheticSourceLoc
+	}
+	inner_length_match: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 0,
+				branch = {
+					bindings = [],
+					body = ConstructorMatchBodyExpr(
+						counter_box_update_from(
+							box_var,
+							true_base_var,
+							11,
+							21,
+						),
+					)
+				}
+			},
+		],
+		geq = None,
+		fallback = None,
+		result_type = box_type,
+		loc = SyntheticSourceLoc
+	}
+
+	outer_true_body: CoreConstructorMatchBody = if use_inner_length_match:
+		ConstructorMatchBodyLength(inner_length_match)
+	else:
+		ConstructorMatchBodyLiteral(inner_match)
+
+	outer_true_case: CoreConstructorMatchCase = {
+		constructor = "True",
+		accessor = RootAccessor,
+		test = BoolTrueConstructorTest,
+		bindings = [],
+		body = outer_true_body
+	}
+	outer_false_case: CoreConstructorMatchCase = {
+		constructor = "False",
+		accessor = RootAccessor,
+		test = BoolFalseConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(counter_box_update_from(box_var, outer_base_var, 13, 23))
+	}
+	update: CoreExpr = ConstructorMatchExpr(
+		LiteralExpr(
+			BoolLiteral(True),
+			bool_type(),
+			SyntheticSourceLoc,
+		),
+		NoReleasePolicy,
+		[outer_true_case, outer_false_case],
+		ConstructorMatchFallbackFail,
+		box_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "nested_literal_match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 13,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_record_reuse_supports_nested_literal_match_results() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	json.count("\"kind\":\"record_reuse\"") == 3 and not json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_reuse_rejects_mixed_nested_literal_match_results() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				True,
+				False,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_nested_literal_match_fallback_result() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	json.count("\"kind\":\"record_reuse\"") == 3 and not json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_reuse_rejects_mixed_nested_literal_match_fallback_result() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				True,
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_nested_literal_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				True,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_nested_length_match_body() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				True,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
 pure func heap_record_nested_self_update_program() -> CoreProgram:
 	box_type: CoreType = HeapRecordType("CounterBox")
 	box_var: CoreVar = {
@@ -959,6 +1888,11 @@ tests: TestSuite = {
 			"pre-DCE tail resolves selected direct call",
 			test_pre_dce_tail_resolves_selected_direct_call,
 		),
+		("pre-DCE tail projects semantic matches", test_pre_dce_tail_projects_semantic_matches),
+		(
+			"pre-DCE tail preserves erased Float argument box",
+			test_pre_dce_tail_preserves_erased_float_argument_box,
+		),
 		(
 			"named list-layout stage relayouts list nodes",
 			test_named_list_layout_stage_relayouts_list_nodes,
@@ -996,6 +1930,78 @@ tests: TestSuite = {
 		(
 			"record reuse rejects if condition that assigns target",
 			test_record_reuse_rejects_if_condition_that_assigns_target,
+		),
+		(
+			"Perceus reuses heap-record self update in every constructor-match branch",
+			test_perceus_reuses_heap_record_self_update_in_every_constructor_match_branch,
+		),
+		(
+			"record reuse rejects mixed constructor-match branches",
+			test_record_reuse_rejects_mixed_constructor_match_branches,
+		),
+		(
+			"record reuse rejects constructor-match scrutinee that assigns target",
+			test_record_reuse_rejects_constructor_match_scrutinee_that_assigns_target,
+		),
+		(
+			"record reuse rejects malformed constructor-match result type",
+			test_record_reuse_rejects_malformed_constructor_match_result_type,
+		),
+		(
+			"record reuse supports constructor-match fallback variants",
+			test_record_reuse_supports_constructor_match_fallback_variants,
+		),
+		(
+			"record reuse rejects mixed constructor-match fallback variants",
+			test_record_reuse_rejects_mixed_constructor_match_fallback_variants,
+		),
+		(
+			"Perceus reuses heap-record self update in every literal-match branch",
+			test_perceus_reuses_heap_record_self_update_in_every_literal_match_branch,
+		),
+		(
+			"record reuse rejects mixed literal-match branches",
+			test_record_reuse_rejects_mixed_literal_match_branches,
+		),
+		(
+			"record reuse rejects literal-match scrutinee that assigns target",
+			test_record_reuse_rejects_literal_match_scrutinee_that_assigns_target,
+		),
+		(
+			"record reuse rejects malformed literal-match result type",
+			test_record_reuse_rejects_malformed_literal_match_result_type,
+		),
+		(
+			"record reuse supports literal-match fallback variants",
+			test_record_reuse_supports_literal_match_fallback_variants,
+		),
+		(
+			"record reuse rejects mixed literal-match fallback variants",
+			test_record_reuse_rejects_mixed_literal_match_fallback_variants,
+		),
+		(
+			"record reuse supports nested literal-match results",
+			test_record_reuse_supports_nested_literal_match_results,
+		),
+		(
+			"record reuse rejects mixed nested literal-match results",
+			test_record_reuse_rejects_mixed_nested_literal_match_results,
+		),
+		(
+			"record reuse supports nested literal-match fallback result",
+			test_record_reuse_supports_nested_literal_match_fallback_result,
+		),
+		(
+			"record reuse rejects mixed nested literal-match fallback result",
+			test_record_reuse_rejects_mixed_nested_literal_match_fallback_result,
+		),
+		(
+			"record reuse rejects malformed nested literal-match result type",
+			test_record_reuse_rejects_malformed_nested_literal_match_result_type,
+		),
+		(
+			"record reuse rejects nested length-match body",
+			test_record_reuse_rejects_nested_length_match_body,
 		),
 		(
 			"nested heap-record self update stages one reuse",

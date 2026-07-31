@@ -552,7 +552,7 @@ and desc =
   | CRecordConstruct of record_construct
   | CRecordUpdate of core * (string * core) list
       (** [{ base | f = v, ... }]. This explicit carrier preserves update
-          provenance through the semantic-middle bridge. The base must be a
+          provenance through representation-neutral Core. The base must be a
           variable and the fields are the complete checked record shape in
           declaration order. The Blorp late-Core tail classifies it as fresh
           construction or a runtime-guarded self-replacement reuse candidate
@@ -605,8 +605,7 @@ and desc =
   | CSeq of core * core  (** [e1; e2] — both evaluated, result is [e2] *)
   | CDebugBlock of core
       (** [debug: ...] — source instrumentation block. The Blorp early-Core
-          pipeline lowers it based on compilation mode before the
-          post-resolution OCaml boundary. *)
+          pipeline lowers it based on compilation mode. *)
   (* === Control flow === *)
   | CIf of core * core * core
       (** [if c then t else e] (else is [CVoid] if absent in source) *)
@@ -615,9 +614,7 @@ and desc =
                                          The Blorp match pass rewrites every
                                          [CMatchArms] into the compiled [CMatch]
                                          form below.
-                                         Post-match, a surviving [CMatchArms] is
-                                         an invariant violation
-                                         (see [Core_invariants.check_no_cmatcharms]). *)
+                                         Post-match, no [CMatchArms] may survive. *)
   | CMatch of core * ctree
       (** compiled match: root scrutinee + decision tree.
                                          This is the canonical post-match form. *)
@@ -662,7 +659,7 @@ and desc =
       (** [for v in iter concurrently(...): ...] *)
   | CDetach of detach_expr  (** [detach expr] *)
   | CSelect of select_expr  (** [select: ...] channel/timer wait. *)
-  (* === Type operations (inserted by Core_specialize) === *)
+  (* === Type operations inserted by Blorp Core specialization === *)
   | CCast of core * Ast.type_expr
       (** Numeric type coercion, e.g.
                                          Float→Int. Emits as C cast. *)

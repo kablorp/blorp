@@ -1,16 +1,16 @@
 -- Blorp-owned Core-to-Core pipeline slices.
 --
--- This module is the home for contiguous IR stage ownership after the OCaml
--- handoff. The bridge should decode protocol JSON and call these pure
--- functions; pass ordering should live here instead of in the dispatcher or C
--- emitter.
+-- This module owns contiguous late-Core pass ordering. Pass ordering belongs
+-- here rather than in CLI dispatch or C emission.
 import:
+	compiler_core_backend_projection as CoreBackendProjection
 	compiler_core_closure as CoreClosure
 	compiler_core_consume_specialize as CoreConsumeSpecialize
 	compiler_core_dce as CoreDce
 	compiler_core_early_stages as CoreEarlyStages
 	compiler_core_fairness: insert_cooperative_checkpoints
 	compiler_core_json: CoreProgram
+	compiler_core_match_projection as CoreMatchProjection
 	compiler_core_perceus as CorePerceus
 	compiler_core_pipeline_stage:
 		CorePipelineStage(
@@ -83,9 +83,12 @@ pure func run_dce_stage(program: CoreProgram) -> CoreProgram:
 
 
 pure func run_specialize_stage(program: CoreProgram) -> CoreProgram:
-	primitive_specialized: CoreProgram = CoreSpecialize.specialize_program(program)
-	tensor_specialized: CoreProgram = CoreTensorSpecialize.specialize_program(primitive_specialized)
-	CoreClosure.adapt_function_refs_program(tensor_specialized)
+	function_refs_adapted: CoreProgram = CoreClosure.adapt_function_refs_program(program)
+	tensor_specialized: CoreProgram = CoreTensorSpecialize.specialize_program(function_refs_adapted)
+
+	-- Keep ABI specialization last: earlier normalizers rebuild expression
+	-- trees and must not reintroduce unboxed erased-runtime arguments.
+	CoreSpecialize.specialize_program(tensor_specialized)
 
 
 pure func run_perceus_stage(program: CoreProgram) -> CoreProgram:
@@ -107,7 +110,9 @@ pure func run_post_dce_tail(program: CoreProgram) -> CoreProgram:
 pure func run_pre_dce_tail(program: CoreProgram) -> PreparedCoreProgram:
 	function_refs_adapted: CoreProgram = run_specialize_stage(program)
 	resolved_program: CoreProgram = CoreResolve.resolve_callable_id_calls(function_refs_adapted)
-	PreparedCore(run_post_dce_tail(run_dce_stage(resolved_program)))
+	backend_projected: CoreProgram = CoreBackendProjection.project_backend_calls(resolved_program)
+	match_projected: CoreProgram = CoreMatchProjection.project_backend_matches(backend_projected)
+	PreparedCore(run_post_dce_tail(run_dce_stage(match_projected)))
 
 
 pure func run_core_pipeline_stage(stage: CorePipelineStage, program: CoreProgram) -> CoreProgram:

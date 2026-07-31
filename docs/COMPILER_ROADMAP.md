@@ -38,7 +38,8 @@ Rules:
 - Delete the replaced OCaml implementation in the same change when its last
   production and test caller is gone.
 - Do not add an optional Blorp path beside an authoritative OCaml path.
-- Keep one typed boundary around the remaining semantic middle.
+- Keep compilation typed and in-process; remaining command delegation must not
+  reintroduce a Core boundary.
 - Port tools only after the parser, typechecker, and compiler services they
   consume are Blorp-owned.
 - Keep the immutable released bootstrap separate from the compiler being
@@ -293,16 +294,12 @@ These remain active but should not grow separate roadmap files.
 - Closure calls, loop/try/detach liveness, and structured-concurrency result
   handoff remain conservative ownership boundaries. General reuse or
   non-atomic RC must not cross them without explicit escape facts.
-- A mutable assignment nested inside a record-update field initializer can leak
-  one overwritten record owner on the fresh-construction fallback path. Record
-  reuse rejects this shape, but Perceus still needs a general nested-assignment
-  balancing fix before it can be optimized.
 - Perceus still performs legacy global-reference repair internally. Resolution
   should own that fact, and ownership passes should consume exact per-body and
   per-lambda reference sets instead of rediscovering them.
-- The post-tuple-SROA semantic-middle bridge still serializes large Core
-  graphs through a helper process. Finishing that migration should precede
-  elaborate bridge-specific optimization.
+- Compile and run now remain in one contiguous Blorp pipeline through C
+  emission. Keep future optimization in that typed path rather than
+  reintroducing a serialized Core boundary.
 
 ## Completed Foundations
 

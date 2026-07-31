@@ -384,9 +384,9 @@ This boundary is deliberately stronger than a raw allocation rewrite:
 ## Required Invariants
 
 These invariants define the ownership safety bar. Stable checks belong in
-`core_invariants.ml`; the final Core boundary always rejects the small set of
-forms that must never reach emission, and `--check-invariants` enables broader
-stage-boundary checks during development.
+the owning Blorp Core stage and its invariant module; the final Core boundary
+always rejects the small set of forms that must never reach emission, and
+`--check-invariants` enables broader stage-boundary checks during development.
 
 - No managed owned temporary is passed to a caller-preserving call slot without a
   post-call drop.

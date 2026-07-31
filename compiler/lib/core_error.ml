@@ -18,13 +18,7 @@
     ]}
 
     At a compiler boundary, catch [Core_error] and translate its structured
-    fields into the boundary's diagnostic type:
-
-    {[
-      try Core_specialize.specialize_program ~reg core_program
-      with Core_error { phase; msg; loc; hint } ->
-        report_core_error ~phase ~message:msg ~loc ~hint
-    ]} *)
+    fields into the boundary's diagnostic type. *)
 
 (** Where in the compiler an error was produced. Stage-level errors
     carry a [Core_stage.t] so they round-trip with the observability

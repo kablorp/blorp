@@ -39,16 +39,11 @@ Source (.brp)
 +------------------+
     |
     v
-+-------------------------------+
-| Post-tuple-SROA bridge        |  One strict JSON bridge into the OCaml semantic middle
-|                               |  (core_post_tuple_sroa_json.ml)
-+-------------------------------+
-    |
-    v
-+---------------+
-| Core IR       |  OCaml specialization middle, then Core JSON
-| middle + tail |  handoff into the Blorp-owned specialization/backend tail
-+---------------+
++------------------+
+| Late Core        |  Blorp specialization, DCE, ownership, reuse, closure,
+| + preparation    |  resource/fairness, and final representation preparation
+|                  |  (stage_09_core)
++------------------+
     |
     v
 +------------+
@@ -71,33 +66,21 @@ Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
-During the OCaml-to-Blorp port, the production route lowers and assembles the
+The production route lowers and assembles the
 typed module graph, lowers debug blocks and mutable locals, desugars Core,
 monomorphizes generic declarations, annotates list layouts, synthesizes
 concrete builtin bodies, compiles raw matches to semantic decision trees,
 resolves trait dispatch and ordinary call kinds, inlines narrow std wrappers,
 lowers supported self-tail-calls, fuses supported string, collection,
 parallel-tensor, and tensor-update pipelines, projects runtime declarations,
-and scalar-replaces eligible tuples in Blorp. One phase-specific
-bridge decodes post-tuple-SROA Core into the remaining OCaml
-middle; source, typed AST, and pre-mono Core do not cross this boundary. The
-worker validates the completed Blorp early-stage contracts before starting at
-specialization. The pipeline then crosses the late Core JSON bridge after the
-remaining OCaml specialization families. Primitive
-conversion, hash, length, numeric checked tensor access,
-raw-scalar tensor fills, unary tensor math, numeric tensor reductions, and
-bounds-proven tensor access builtins intentionally cross in semantic form so
-Blorp can specialize them before Blorp-owned function-reference adaptation.
-The Core JSON projection expands aliases and canonicalizes `Vector`, `Matrix`,
-`Tensor`, and array spellings to one tensor type, so tensor specialization
-receives canonical shapes, numeric types, and enum types rather than repeating
-registry lookup in Blorp. Length folding and raw-view formation remain one coherent pass because
-the folded static dimension is the fact that proves loop accesses in bounds.
-Checkpoint 8 in `docs/BLORP_COMPILER_PORT_ROADMAP.md` made Blorp Core lowering,
-module flattening, FFI annotation, and initial list layout authoritative for
-normal source commands. Checkpoint 9 now also makes debug, desugar/SSA,
-monomorphization, post-mono list layout, and synthesis authoritative before the
-single semantic-middle bridge. On the current backend route,
+and scalar-replaces eligible tuples in Blorp. The same typed `CoreProgram`
+continues directly into value, collection/stream, and tensor specialization;
+no process or JSON boundary exists inside compilation. A shared specialization
+layout builds alias, declaration, ownership, and runtime-layout facts once per
+program. Independent current-node specialization families compose under one
+recursive traversal. Length folding and raw-view formation remain one coherent
+pass because the folded static dimension is the fact that proves loop accesses
+in bounds. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
 `compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
@@ -110,15 +93,14 @@ single semantic-middle bridge. On the current backend route,
 `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`, and
 `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` own the contiguous tail through C
 artifact generation. CLI `dce`/`consume-specialize`/`perceus`/`reuse`/`closure`/`final`
-dumps and stops observe the Blorp-owned tail as Core JSON through the bridge;
-OCaml program callbacks stop at the pre-DCE handoff. C artifact emission is
-owned by the Blorp backend bridge.
+dumps and stops render snapshots from the Blorp-owned pipeline. C artifact
+emission is owned by the Blorp backend.
 
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
-the request's debug mode. The post-debug invariant runs before the
-post-tuple-SROA bridge and rejects any node that survives that decision.
+the request's debug mode. The post-debug invariant rejects any node that
+survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
@@ -130,18 +112,21 @@ The late-Core projection preserves scoped `let`/`borrow` expressions inside
 closure-call arguments. The Blorp-owned closure and preparation stages, rather
 than the projection boundary, own their final normalization for C emission.
 
-Record updates also cross the semantic-middle bridge as explicit
-`RecordUpdateExpr` nodes. Lowering evaluates the source receiver once, binds it
+Record updates remain explicit `RecordUpdateExpr` nodes until ownership
+normalization. Lowering evaluates the source receiver once, binds it
 to a temporary, and stores that variable plus the complete checked field list
 in declaration order. This preserves update provenance and makes ownership
 normalization total after monomorphization without rediscovering record shape.
 At Perceus ingress, a canonical mutable self-replacement becomes
 `RecordReuseExpr`; every other carrier becomes ordinary fresh record
 construction. Perceus transfers the replaced binding's owner into the reuse
-node and retains managed field aliases as needed. The post-Perceus reuse pass
-also recognizes an adjacent same-type `RecordExpr`/ARC-drop pair, where the
-source owner is provably dead after every replacement field has been evaluated,
-and replaces that pair with `RecordReuseExpr`. This covers dead chained-update
+node and retains managed field aliases as needed. Exhaustive top-level `if`,
+literal-match, and constructor-match results transfer the owner only when every
+returning branch independently qualifies, the condition cannot replace that
+owner, and a match scrutinee cannot touch it. The post-Perceus reuse pass also
+recognizes an adjacent same-type `RecordExpr`/ARC-drop pair, where the source
+owner is provably dead after every replacement field has been evaluated, and
+replaces that pair with `RecordReuseExpr`. This covers dead chained-update
 temporaries without guessing about source syntax or liveness. The backend
 evaluates fields before consuming the source and reuses the old allocation only
 when its runtime reference count is unique; otherwise it constructs a fresh
@@ -238,26 +223,9 @@ Blorp Typed AST graph
     |
     v
 +-------------------------------+
-| Post-tuple-SROA bridge        |  Strict structural decode plus completed early
-+-------------------------------+  stage checks (core_post_tuple_sroa_json.ml,
-                                  semantic_middle_worker.ml)
-    |
-    v
-+-----------------------+
-| OCaml Core_specialize |  Remaining registry/layout-dependent builtin
-+-----------------------+  specialization, including to_string and containers
-                          (core_specialize.ml)
-    |
-    v
-+--------------------------+
-| JSON handoff (supported) |  Supported pre-DCE Core enters the
-+--------------------------+  contiguous Blorp-owned backend
-    |
-    v
-+----------------------------+
-| Blorp primitive specialize |  Conversion and hash builtins become casts or
-+----------------------------+  direct runtime calls
-                                (compiler_core_specialize.brp)
+| Blorp Core specialization     |  One indexed traversal dispatches primitive,
++-------------------------------+  value, collection/stream, and tensor runtime
+                                  layouts (compiler_core_specialize*.brp)
     |
     v
 +--------------------------+
@@ -362,9 +330,9 @@ Observed Core snapshot
   After prefixing, no downstream pass needs module awareness.
 - **Explicit erased-storage boundaries** — intentionally dynamic runtime slots
   use `void*`, but the choice of how a typed value crosses that boundary is
-  centralized in `core_layout_type.ml`. `compiler_core_prepare.brp` rewrites
-  final Core to explicit box/unbox nodes before emission; the JSON bridge gets
-  the remaining projection-time layout facts from `core_emit_layout.ml`.
+  explicit in Blorp Core layout and specialization policy.
+  `compiler_core_prepare.brp` rewrites final Core to explicit box/unbox nodes
+  before emission.
 
 The emitter contract follows from those principles: backend-specific emission
 must consume explicit Core nodes and metadata rather than recovering layout,
@@ -375,23 +343,15 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `core.ml` | IR type definitions, traversal helpers, pretty-printer |
-| `core_post_tuple_sroa_json.ml` | Strict decoder for Blorp-owned post-tuple-SROA Core |
 | `compiler_core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
 | `compiler_core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
 | `compiler_core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
 | `compiler_core_parallel_tensor_pipeline.brp` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
 | `compiler_core_tensor_fusion.brp` | Tensor update fusion before ownership insertion |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
-| `core_specialize.ml` | Remaining registry/layout-dependent builtin specialization before the Core JSON handoff, excluding Blorp-owned primitive, length, numeric checked tensor-access, raw-scalar tensor-fill, and bounds-proven raw-view families |
-| `core_specialize_fallback.ml` | Sequential fallback for specialization cases without a direct runtime layout ABI |
 | `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
-| `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
-| `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation and bridge projection helpers |
-| `core_invariants.ml` | Stage-boundary invariant checks |
-| `core_pipeline.ml` | Remaining post-tuple-SROA OCaml middle orchestration |
 | `core_error.ml` | Structured errors with phase/location/hint |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
@@ -400,7 +360,7 @@ boxing, or ownership behavior from source spelling.
 | File | Purpose |
 |------|---------|
 | `compiler/blorp/src/stage_12_cli/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
-| `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
+| `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core model and dump codec |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
 | `compiler/blorp/src/stage_09_core/compiler_core_match.brp` | Authoritative raw-pattern to semantic decision-tree compilation |
 | `compiler/blorp/src/stage_09_core/compiler_core_trait_resolve.brp` | Authoritative trait-method and overloaded-operator resolution |
@@ -408,7 +368,11 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_std_inline.brp` | Authoritative narrow expansion of compiler-owned list/tensor wrappers |
 | `compiler/blorp/src/stage_09_core/compiler_core_tailrec.brp` | Authoritative supported self-tail-call lowering into explicit Core loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_tuple_sroa.brp` | Authoritative scalar replacement for non-escaping local tuples and narrow unmanaged tuple-return call sites |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Authoritative primitive conversion and hash specialization after the handoff |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Single recursive specialization driver and primitive/reflection specialization |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize_layout.brp` | Shared indexed alias, declaration, ownership, and runtime-layout facts |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize_value.brp` | Stringification, equality, and value-box specialization |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize_collection.brp` | Collection, hash-container, Option ABI, stream, and fallback specialization |
+| `compiler/blorp/src/stage_09_core/compiler_core_specialize_tensor_dispatch.brp` | Residual tensor arithmetic, matrix, access, fill, and result-layout dispatch |
 | `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
 | `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
 | `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
@@ -452,20 +416,12 @@ compiler/
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_post_tuple_sroa_json.ml # Strict Blorp post-tuple-SROA Core decoder
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
-│   ├── core_specialize.ml # Remaining registry/layout-dependent builtin specialization
-│   ├── core_specialize_fallback.ml # Narrow unsupported-layout fallback
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
-│   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_layout_type.ml # Layout metadata and erased-storage policy
 │   ├── core_option_layout.ml # Option representation selection
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
-│   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
-│   ├── core_emit_util.ml  # Shared late-backend helper utilities
-│   ├── core_invariants.ml # Stage-boundary invariant checks
-│   ├── core_pipeline.ml   # Core IR pipeline orchestration
 │   ├── core_error.ml      # Core IR structured errors
 │   ├── language_surface.ml # Shared source-language surface facts
 │   ├── pipeline.ml        # Top-level compilation pipeline orchestration
@@ -853,10 +809,10 @@ The public `./blorp` executable is built from the Blorp CLI entry point in
 `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs
 user-facing command planning, source discovery, source reads, parsing,
 typechecking, Core preparation, backend coordination, and migrated host
-effects. Compile and run cross once into the private OCaml semantic-middle
-worker, then return to Blorp for the remaining Core pipeline, C emission, and
-host effects. Test commands and other unmigrated non-source commands still
-delegate to `compiler/bin/blorp_ocaml_host.ml`.
+effects. Compile and run remain in Blorp through Core specialization, C
+emission, artifact publication, and optional execution. Test commands and
+other unmigrated non-source commands still delegate to
+`compiler/bin/blorp_ocaml_host.ml`.
 
 User-facing subcommands:
 

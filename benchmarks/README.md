@@ -170,6 +170,28 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
   benchmarks/compiler_record_update_branch_allocations
 ```
 
+`compiler_record_update_match_allocations` measures the same alternating
+self-updates selected by an exhaustive Boolean `match`. Reuse is valid only
+when every returning literal branch transfers the same mutable owner.
+
+```bash
+benchmarks/compiler_record_update_match_allocations
+BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
+  benchmarks/compiler_record_update_match_allocations
+```
+
+`compiler_record_update_nested_match_allocations` exercises the projected
+decision tree for nested constructor and literal patterns. Every nested leaf
+must transfer the same mutable owner before the compiler can reuse it. The
+record includes managed `String` fields so the probe also checks that retained
+field aliases do not force fresh record allocations.
+
+```bash
+benchmarks/compiler_record_update_nested_match_allocations
+BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
+  benchmarks/compiler_record_update_nested_match_allocations
+```
+
 ### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through
@@ -206,7 +228,7 @@ the adjacent `.tsv` file.
 
 The runner builds and directly uses the workspace production
 compiler CLI artifact at `compiler/_build/blorp-cli/blorp`, invokes its public
-`compile --profile` path, and pairs it with the current private semantic worker.
+`compile --profile` path, and exercises the contiguous Blorp Core pipeline.
 It caches the profiled executable by compiler, benchmark, standard-library,
 runner, helper, platform, and C-toolchain content.
 The first run for a new key performs the full instrumented build; subsequent
@@ -225,10 +247,9 @@ The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, renderer-source, prepared-helper, and
 legacy parser overrides by default. This keeps one cache key tied to one
 effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
-compiler CLI, and `BLORP_OCAML_MIDDLE_BIN` may override its semantic worker.
-Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building those executables
-separately when repeated source-level measurements should avoid the workspace
-build check. For iteration with already prepared parser, renderer, and
+compiler CLI. Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that
+executable separately when repeated source-level measurements should avoid the
+workspace build check. For iteration with already prepared parser, renderer, and
 typecheck helpers, set
 `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide their three
 `BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and

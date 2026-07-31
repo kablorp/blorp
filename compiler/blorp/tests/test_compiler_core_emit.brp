@@ -252,6 +252,7 @@ import:
 			TupleFloatElement,
 			TuplePointerElement,
 			TuplePrimElement,
+			TupleStackResultElement,
 			TupleStructElement,
 		),
 		CoreType(
@@ -1414,6 +1415,10 @@ pure func stack_result_box_string_type() -> CoreType:
 
 pure func stack_result_int_string_prepared_type() -> CoreType:
 	StackResultType(int_type(), string_type())
+
+
+pure func stack_result_tuple_type() -> CoreType:
+	TupleType([stack_result_int_string_prepared_type()])
 
 
 pure func stack_result_arg(value: CoreExpr) -> CoreBoxedStorageValue:
@@ -6744,6 +6749,73 @@ pure func point_tuple_field_function() -> CoreFunction:
 	}
 
 
+pure func stack_result_tuple_construct_function() -> CoreFunction:
+	result_var: CoreVar = named_var("result")
+	result_type: CoreType = stack_result_int_string_prepared_type()
+
+	{
+		name = "stack_result_tuple",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = result_var,
+				typ = result_type,
+				loc = SyntheticSourceLoc
+			},
+		],
+		return_type = stack_result_tuple_type(),
+		body = Some(
+			TupleConstructExpr(
+				{
+					elements = [
+						TupleStackResultElement(
+							VarExpr(
+								result_var,
+								result_type,
+								SyntheticSourceLoc,
+							),
+						),
+					],
+					release_mask = 1,
+					retain_mask = 0
+				},
+				stack_result_tuple_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 293,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func stack_result_tuple_field_function() -> CoreFunction:
+	pair_var: CoreVar = named_var("pair")
+	pair_expr: CoreExpr = VarExpr(pair_var, stack_result_tuple_type(), SyntheticSourceLoc)
+	result_type: CoreType = stack_result_int_string_prepared_type()
+
+	{
+		name = "stack_result_tuple_field",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = pair_var,
+				typ = stack_result_tuple_type(),
+				loc = SyntheticSourceLoc
+			},
+		],
+		return_type = result_type,
+		body = Some(TupleFieldExpr(pair_expr, 0, result_type, SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 294,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func nullable_option_match_function() -> CoreFunction:
 	value_var: CoreVar = named_var("value")
 	some_case: CoreConstructorMatchCase = {
@@ -11067,9 +11139,7 @@ pure func test_emit_stack_result_option_payload_boxes_stack_option() -> Bool:
 	(
 		artifact.c_code.contains("blorp_StackResult make_result_option(void)")
 		and artifact.c_code.contains(".release_mask = 1UL")
-		and artifact.c_code.contains(
-			"blorp_box_struct(&__box_struct_value, sizeof(blorp_StackOption_Int))",
-		)
+		and artifact.c_code.contains("blorp_box_struct(&__box, sizeof(blorp_StackOption_Int))")
 		and not artifact.c_code.contains("(void*)((blorp_StackOption_Int)")
 	)
 
@@ -17673,6 +17743,38 @@ pure func borrow_let_string_alias_function() -> CoreFunction:
 	}
 
 
+pure func compiler_owned_result_temp_hygiene_function() -> CoreFunction:
+	source_param: CoreParam = string_param("__owned_result")
+	temp_var: CoreVar = named_var("$blorp$perceus$owned_result")
+
+	{
+		name = "compiler_owned_result_temp_hygiene",
+		source_module = None,
+		type_params = [],
+		params = [source_param],
+		return_type = string_type(),
+		body = Some(
+			BorrowLetExpr(
+				temp_var,
+				string_type(),
+				param_var_expr(source_param),
+				DupExpr(
+					temp_var,
+					string_type(),
+					ArcRetainPolicy,
+					VarExpr(temp_var, string_type(), SyntheticSourceLoc),
+					string_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 901,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func let_bytes_direct_return_function() -> CoreFunction:
 	input_param: CoreParam = bytes_param("input")
 	payload_var: CoreVar = named_var("payload")
@@ -18100,6 +18202,31 @@ pure func test_emit_struct_tuple_construct() -> Bool:
 				"return (*(Point*)((char*)(((blorp_Tuple*)pair)->elem[0]) + "
 				+ "sizeof(blorp_Object)));"
 			))
+	)
+
+
+pure func test_emit_stack_result_tuple_construct() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl(stack_result_tuple_construct_function()),
+			FunctionDecl(stack_result_tuple_field_function()),
+		],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+
+	(
+		artifact.c_code.contains("blorp_box_stack_result(blorp_stack_result_retain_value(result))")
+		and artifact.c_code.contains("blorp_tuple_set_rc(__tup_tuple, 1UL);")
+		and artifact.c_code.contains(
+			"blorp_StackResult stack_result_tuple_field(blorp_Tuple* pair)",
+		)
+		and artifact.c_code.contains((
+				"blorp_StackResult __borrowed_result_pair_0 = (*(blorp_StackResult*)((char*)(((bl"
+				+ "orp_Tuple*)pair)->elem[0]) + sizeof(blorp_Object)));"
+			))
+		and artifact.c_code.contains("blorp_stack_result_retain(__borrowed_result_pair_0);")
+		and artifact.c_code.contains("return __borrowed_result_pair_0;")
 	)
 
 
@@ -19394,12 +19521,11 @@ pure func test_emit_tensor_packed_matrix_checked_set() -> Bool:
 
 	(
 		artifact.c_code.contains("blorp_Vector* set_packed_cell(blorp_Vector* grid)")
-		and artifact.c_code.contains("void* __set_value_tensor_set = (void*)(long)(2);")
-		and artifact.c_code.contains((
-				"blorp_Vector* __set_result_tensor_set = blorp_matrix_checked_set(grid, 1, 1, "
-				+ "__set_value_tensor_set);"
-			))
-		and not artifact.c_code.contains("blorp_release(__set_value_tensor_set)")
+		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&grid);")
+		and artifact.c_code.contains(
+			"return blorp_matrix_checked_set(grid, 1, 1, (void*)(long)(2));",
+		)
+		and not artifact.c_code.contains("blorp_release((void*)(long)(2))")
 	)
 
 
@@ -19411,12 +19537,10 @@ pure func test_emit_float16_tensor_set_does_not_release_immediate_box() -> Bool:
 	artifact: CArtifact = emit_core_program_c_artifact(program)
 
 	(
-		artifact.c_code.contains("void* __set_value_tensor_set = blorp_box_float16(2.5);")
-		and artifact.c_code.contains((
-				"blorp_Vector* __set_result_tensor_set = blorp_checked_set(values, 1, "
-				+ "__set_value_tensor_set);"
-			))
-		and not artifact.c_code.contains("blorp_release(__set_value_tensor_set)")
+		artifact.c_code.contains("blorp_Vector* set_float16_value(blorp_Vector* values)")
+		and artifact.c_code.contains("blorp_task_cleanup_pop_slot(&values);")
+		and artifact.c_code.contains("return blorp_checked_set(values, 1, blorp_box_float16(2.5));")
+		and not artifact.c_code.contains("blorp_release(blorp_box_float16(2.5))")
 	)
 
 
@@ -19465,14 +19589,17 @@ pure func test_emit_tensor_raw_scalar_for_loop() -> Bool:
 		decls = [FunctionDecl(tensor_raw_scalar_for_function())],
 		foreign_includes = []
 	}
-	artifact: CArtifact = emit_core_program_c_artifact(program)
 
-	(
-		artifact.c_code.contains("long sum_tensor_raw_values(blorp_Vector* items)")
-		and artifact.c_code.contains("long* __iter_raw_0 = (long*)__iter_0->data;")
-		and artifact.c_code.contains("long value = (long)__iter_raw_0[__i_0];")
-		and not artifact.c_code.contains("blorp_vector_read_i64(__iter_0, __i_0)")
-	)
+	match try_emit_prepared_core_program_c_artifact_with_profile(PreparedCore(program), False):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("long sum_tensor_raw_values(blorp_Vector* items)")
+				and artifact.c_code.contains("long* __iter_raw_0 = (long*)__iter_0->data;")
+				and artifact.c_code.contains("long value = (long)__iter_raw_0[__i_0];")
+				and not artifact.c_code.contains("blorp_vector_read_i64(__iter_0, __i_0)")
+			)
+		Err(_):
+			False
 
 
 pure func test_emit_tensor_row_slice_for_loop() -> Bool:
@@ -19850,11 +19977,26 @@ pure func test_emit_let_transfer_tail_balances_alias_cleanup() -> Bool:
 		and not artifact.c_code.contains(
 			"blorp_CancelCleanupFrame __blorp_cleanup___std_inline___result;",
 		)
-		and not artifact.c_code.contains("blorp_retain(__owned_result);")
+		and not artifact.c_code.contains("blorp_retain(__blorp_internal_perceus_owned_result);")
 		and not artifact.c_code.contains("blorp_release(__std_inline___result);")
 		and not artifact.c_code.contains(
 			"blorp_CancelCleanupFrame __blorp_cleanup___cdrop___std_inline_elem;",
 		)
+	)
+
+
+pure func test_emit_compiler_owned_result_temp_is_hygienic() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(compiler_owned_result_temp_hygiene_function())],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+
+	(
+		artifact.c_code.contains(
+			"blorp_String* __blorp_internal_perceus_owned_result = __owned_result;",
+		)
+		and not artifact.c_code.contains("blorp_String* __owned_result = __owned_result;")
 	)
 
 
@@ -21272,6 +21414,7 @@ tests: TestSuite = {
 		),
 		("emit tuple construct and field access", test_emit_tuple_construct_and_field_access),
 		("emit struct tuple construct", test_emit_struct_tuple_construct),
+		("emit stack Result tuple construct", test_emit_stack_result_tuple_construct),
 		("emit managed tuple construct", test_emit_managed_tuple_construct),
 		("emit float tuple construct", test_emit_float_tuple_construct),
 		("emit pointer tuple field access", test_emit_pointer_tuple_field_access),
@@ -21447,6 +21590,10 @@ tests: TestSuite = {
 		(
 			"emit let transfer tail balances alias cleanup",
 			test_emit_let_transfer_tail_balances_alias_cleanup,
+		),
+		(
+			"emit compiler-owned result temp is hygienic",
+			test_emit_compiler_owned_result_temp_is_hygienic,
 		),
 		("emit tuple literal preparation", test_emit_tuple_literal_preparation),
 		("emit value record construct expression", test_emit_value_record_construct_expression),

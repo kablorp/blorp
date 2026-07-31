@@ -4,20 +4,10 @@ import:
 	../src/stage_09_core/compiler_core_json:
 		CoreCallKind(BuiltinCall, SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl),
-		CoreExpr(CallExpr, LetExpr, LiteralExpr, VarExpr),
-		CoreFunctionKind(UserFunction),
-		CoreLiteral(IntLiteral, StringLiteral),
-		CoreParam,
+		CoreExpr(CallExpr),
 		CoreProgram,
-		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(NamedType),
-		CoreVar,
 		core_program_to_json,
 	../src/stage_09_core/compiler_core_traverse: immediate_core_expr_children
-	../src/stage_09_core/compiler_semantic_worker_protocol:
-		SEMANTIC_MIDDLE_DOMAIN,
-		SEMANTIC_MIDDLE_SCHEMA_VERSION,
-		semantic_middle_capability_name,
 	../src/stage_10_backend/compiler_build_artifact:
 		BuildNativeFeature(BuildRaylib, BuildTls),
 		BuildOptimization(BuildFast),
@@ -43,17 +33,9 @@ import:
 		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
 	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
 	io: print_error
-	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector), get_field
+	json: JsonValue(JsonObject), get_field
 	system: mkdir, remove_dir, remove_file, temp_dir, write_file
 	test: TestSuite
-
-
-pure func compiled_response_fixture() -> JsonValue:
-	compiled_response_fixture_with_core(JsonObject([
-		("kind", JsonString("program")),
-		("decls", JsonVector([])),
-		("foreign_includes", JsonVector([])),
-	]))
 
 
 pure func typecheck_program_fixture(
@@ -62,93 +44,6 @@ pure func typecheck_program_fixture(
 	source: String,
 ) -> FinalizedTypecheckProgram:
 	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
-
-
-pure func compiled_response_fixture_with_core(core: JsonValue) -> JsonValue:
-	JsonObject([
-		("schema", JsonNumber(to_float(SEMANTIC_MIDDLE_SCHEMA_VERSION))),
-		("domain", JsonString(SEMANTIC_MIDDLE_DOMAIN)),
-		("kind", JsonString("compiled")),
-		("capabilities", JsonVector([
-			JsonString("core_post_tuple_sroa"),
-			JsonString("core_pre_dce"),
-		])),
-		("core", core),
-	])
-
-
-pure func named_var(name: String) -> CoreVar:
-	{
-		name = name,
-		uniq = 0,
-		def_id = None
-	}
-
-
-pure func function_decl(
-	name: String,
-	def_id: Int,
-	params: List[CoreParam],
-	return_type: CoreType,
-	body: CoreExpr,
-) -> CoreDecl:
-	FunctionDecl({
-		name = name,
-		source_module = None,
-		type_params = [],
-		params = params,
-		return_type = return_type,
-		body = Some(body),
-		is_pure = True,
-		function_kind = UserFunction,
-		def_id = def_id,
-		loc = SyntheticSourceLoc,
-	})
-
-
-pure func mutable_string_owner_pre_dce_program() -> CoreProgram:
-	desc: CoreVar = named_var("desc")
-	read: CoreVar = named_var("read")
-	string_type: CoreType = NamedType("String", [])
-	int_type: CoreType = NamedType("Int", [])
-	read_param: CoreParam = {
-		name = named_var("value"),
-		typ = string_type,
-		loc = SyntheticSourceLoc
-	}
-
-	{
-		decls = [function_decl(
-				"read",
-				2,
-				[read_param],
-				int_type,
-				LiteralExpr(IntLiteral(1), int_type, SyntheticSourceLoc),
-			), function_decl(
-				"main",
-				1,
-				[],
-				int_type,
-				LetExpr(
-					desc,
-					True,
-					string_type,
-					LiteralExpr(StringLiteral("description"), string_type, SyntheticSourceLoc),
-					CallExpr(
-						UserCall("read", Some(2), []),
-						VarExpr(
-							read,
-							NamedType("Function", []),
-							SyntheticSourceLoc,
-						),
-						[VarExpr(desc, string_type, SyntheticSourceLoc)],
-						int_type,
-						SyntheticSourceLoc,
-					),
-				),
-			)],
-		foreign_includes = []
-	}
 
 
 func write_source(path: String) -> Bool:
@@ -539,7 +434,7 @@ pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
 	typechecked.modules.length() == 0
 
 
-func test_compile_builds_one_typed_request_and_artifact() -> Bool:
+func test_compile_builds_one_core_compilation_and_artifact() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_compile.brp"
 	_ = remove_file(path)
 
@@ -551,13 +446,11 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 
 		match plan:
 			CliRunCompile(compile_plan):
-				match execute_compile_plan(compile_plan, compiled_response_fixture()):
-					CliCompileArtifact(request, artifact, _, _):
+				match execute_compile_plan(compile_plan):
+					CliCompileArtifact(compilation, artifact, _, _):
 						(
-							request.target_path == path
-							and request.core.decls.length() > 0
-							and request.required_capabilities.length() == 2
-							and request.require_main
+							compilation.target_path == path
+							and compilation.program.decls.length() > 0
 							and artifact.c_code.length() > 0
 							and artifact.runtime_requirement == BuildEmbeddedRuntime
 							and artifact.source.path == path
@@ -569,7 +462,7 @@ func test_compile_builds_one_typed_request_and_artifact() -> Bool:
 				False
 
 
-func test_compile_worker_request_starts_after_blorp_tuple_sroa() -> Bool:
+func test_compile_core_starts_after_blorp_tuple_sroa() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_post_tuple_sroa.brp"
 	_ = remove_file(path)
 
@@ -583,7 +476,9 @@ func test_compile_worker_request_starts_after_blorp_tuple_sroa() -> Bool:
 			CliRunCompile(compile_plan):
 				match prepare_compile_plan(compile_plan):
 					Ok(CliCompilePreparationReady(prepared)):
-						rendered: String = core_program_to_json(prepared.request.core).to_string()
+						rendered: String = core_program_to_json(
+							prepared.compilation.program,
+						).to_string()
 
 						(
 							rendered.contains("blorp_string_concat")
@@ -591,9 +486,6 @@ func test_compile_worker_request_starts_after_blorp_tuple_sroa() -> Bool:
 							and rendered.contains("\"kind\":\"tailrec_loop\"")
 							and rendered.contains("\"kind\":\"tailrec_recur\"")
 							and not rendered.contains("\"kind\":\"selected_direct\"")
-							and prepared.request.required_capabilities
-								.map(semantic_middle_capability_name)
-								.contains("core_post_tuple_sroa")
 						)
 					_:
 						False
@@ -601,7 +493,7 @@ func test_compile_worker_request_starts_after_blorp_tuple_sroa() -> Bool:
 				False
 
 
-func test_compile_worker_request_contains_parallel_tensor_fusion() -> Bool:
+func test_compile_core_contains_parallel_tensor_fusion() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_parallel_tensor_fusion.brp"
 	_ = remove_file(path)
 
@@ -615,7 +507,7 @@ func test_compile_worker_request_contains_parallel_tensor_fusion() -> Bool:
 			CliRunCompile(compile_plan):
 				match prepare_compile_plan(compile_plan):
 					Ok(CliCompilePreparationReady(prepared)):
-						main_contains_builtin(prepared.request.core, "blorp_vmap_parallel")
+						main_contains_builtin(prepared.compilation.program, "blorp_vmap_parallel")
 					_:
 						False
 			_:
@@ -641,7 +533,7 @@ func test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks(
 
 				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
 					Ok(CliCompilePreparationReady(prepared)):
-						if main_calls_debug_policy_marker(prepared.request.core):
+						if main_calls_debug_policy_marker(prepared.compilation.program):
 							print_error("debug-policy marker call survived debug-block erasure")
 							False
 						else:
@@ -690,7 +582,7 @@ func test_compile_typed_validation_stops_before_core_preparation() -> Bool:
 				False
 
 
-func test_early_stop_does_not_consult_worker_response() -> Bool:
+func test_early_stop_returns_before_late_core() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_early_stop.brp"
 	_ = remove_file(path)
 
@@ -708,7 +600,7 @@ func test_early_stop_does_not_consult_worker_response() -> Bool:
 
 		match plan:
 			CliRunCompile(compile_plan):
-				match execute_compile_plan(compile_plan, JsonObject([])):
+				match execute_compile_plan(compile_plan):
 					CliCompileStopped(target_path, stage_name, rendered, observations):
 						(
 							target_path == path
@@ -724,7 +616,7 @@ func test_early_stop_does_not_consult_worker_response() -> Bool:
 				False
 
 
-func test_run_builds_one_typed_request_and_artifact() -> Bool:
+func test_run_builds_one_core_compilation_and_artifact() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_execute_run.brp"
 	_ = remove_file(path)
 
@@ -743,41 +635,16 @@ func test_run_builds_one_typed_request_and_artifact() -> Bool:
 			CliRunSource(run_plan):
 				encoded = cli_run_plan_to_json(plan)
 
-				match execute_run_plan(run_plan, compiled_response_fixture()):
-					CliCompileArtifact(request, artifact, _, _):
+				match execute_run_plan(run_plan):
+					CliCompileArtifact(compilation, artifact, _, _):
 						(
 							get_field(encoded, "error").is_some()
-							and request.target_path == path
-							and request.core.decls.length() > 0
-							and request.require_main
+							and compilation.target_path == path
+							and compilation.program.decls.length() > 0
 							and artifact.c_code.length() > 0
 							and artifact.runtime_requirement == BuildExternalRuntime
 							and artifact.compatibility.profile
 						)
-					_:
-						False
-			_:
-				False
-
-
-func test_compile_emits_completed_core_without_repeating_late_pipeline() -> Bool:
-	path: String = temp_dir() + "/blorp_cli_execute_prepared_core.brp"
-	_ = remove_file(path)
-
-	if not write_source(path):
-		False
-	else:
-		plan = run_cli(["compile", "--no-format", path])
-		_ = remove_file(path)
-		response: JsonValue = compiled_response_fixture_with_core(
-			core_program_to_json(mutable_string_owner_pre_dce_program()),
-		)
-
-		match plan:
-			CliRunCompile(compile_plan):
-				match execute_compile_plan(compile_plan, response):
-					CliCompileArtifact(_, artifact, _, _):
-						artifact.c_code.count("blorp_release(desc);") == 1
 					_:
 						False
 			_:
@@ -872,16 +739,16 @@ tests: TestSuite = {
 			test_check_root_only_returns_no_dependency_artifacts,
 		),
 		(
-			"compile builds one typed request and artifact",
-			test_compile_builds_one_typed_request_and_artifact,
+			"compile builds one Core compilation and artifact",
+			test_compile_builds_one_core_compilation_and_artifact,
 		),
 		(
-			"compile worker request starts after Blorp tuple SROA",
-			test_compile_worker_request_starts_after_blorp_tuple_sroa,
+			"compile Core starts after Blorp tuple SROA",
+			test_compile_core_starts_after_blorp_tuple_sroa,
 		),
 		(
-			"compile worker request contains parallel tensor fusion",
-			test_compile_worker_request_contains_parallel_tensor_fusion,
+			"compile Core contains parallel tensor fusion",
+			test_compile_core_contains_parallel_tensor_fusion,
 		),
 		(
 			"compile frontend policy allows debug calls while erasing debug blocks",
@@ -891,17 +758,10 @@ tests: TestSuite = {
 			"compile typed validation stops before Core preparation",
 			test_compile_typed_validation_stops_before_core_preparation,
 		),
+		("early stop returns before late Core", test_early_stop_returns_before_late_core),
 		(
-			"early stop does not consult worker response",
-			test_early_stop_does_not_consult_worker_response,
-		),
-		(
-			"run builds one typed request and artifact",
-			test_run_builds_one_typed_request_and_artifact,
-		),
-		(
-			"compile emits prepared Core without repeating the late pipeline",
-			test_compile_emits_completed_core_without_repeating_late_pipeline,
+			"run builds one Core compilation and artifact",
+			test_run_builds_one_core_compilation_and_artifact,
 		),
 		("native features come from typed graph", test_native_features_come_from_typed_graph),
 	]

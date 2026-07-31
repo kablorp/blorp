@@ -1,10 +1,10 @@
 (** Core pipeline stage enum, shared by [--dump-core-after] and
     [--stop-after] CLI flags.
 
-    Adding a stage means: add a variant, update [all] and [to_string],
-    insert the matching hook in [Core_pipeline]. The unit tests in
-    [test_core_stage.ml] round-trip every variant, so forgetting a
-    [to_string] update fails fast. *)
+    Adding a stage means: add a variant, update [all] and [to_string], and
+    update the Blorp Core pipeline dispatcher. The unit tests in
+    [test_core_stage.ml] round-trip every variant, so forgetting a [to_string]
+    update fails fast. *)
 
 type t =
   | Lower
@@ -33,9 +33,7 @@ type t =
       (** [Final] is a synonym for "after every Core pass" and is the
         default when [--dump-core] is given without an argument. *)
 
-(* Stage enum is pure data (parsed, rendered, enumerated by tests and
-   tools). The control-flow exception that callbacks raise to stop the
-   pipeline lives next to [on_stage_callback] in [Core_pipeline]. *)
+(* Stage enum is pure data parsed and rendered by the remaining OCaml host. *)
 
 let all =
   [

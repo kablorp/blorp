@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 build_plan=$(make -n build)
-expected_ocaml_build='cd compiler && dune build bin/blorp_ocaml_host.exe bin/blorp_ocaml_middle.exe'
+expected_ocaml_build='cd compiler && dune build bin/blorp_ocaml_host.exe'
 if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
 	echo "FAIL: make build must target only the private OCaml host executables" >&2
 	printf '%s\n' "$build_plan" >&2
@@ -102,11 +102,8 @@ then
 	echo "FAIL: compiler_typecheck_profile must execute the artifact built by build-blorp-cli" >&2
 	exit 1
 fi
-if ! grep -Fq \
-	'compiler/_build/default/bin/blorp_ocaml_middle.exe' \
-	benchmarks/compiler_typecheck_profile
-then
-	echo "FAIL: compiler_typecheck_profile must pair the build artifact with its semantic worker" >&2
+if grep -Fq 'blorp_ocaml_middle' benchmarks/compiler_typecheck_profile; then
+	echo "FAIL: compiler_typecheck_profile must not depend on a retired semantic worker" >&2
 	exit 1
 fi
 for bridge_env in \
@@ -163,8 +160,8 @@ if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
 fi
 
 install_plan=$(make -n install)
-if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_middle.exe" "./blorp-ocaml-middle"' <<<"$install_plan"; then
-	echo "FAIL: install must place the semantic worker beside the Blorp CLI" >&2
+if grep -Fq 'blorp-ocaml-middle' <<<"$install_plan"; then
+	echo "FAIL: install must not retain the retired semantic worker" >&2
 	exit 1
 fi
 if ! grep -Fq 'bootstrap_toolchain_dir=$("scripts/blorp-compiler-bootstrap" --print-toolchain-dir)' <<<"$install_plan"; then
@@ -321,7 +318,7 @@ do
 done
 
 ci_workflow=.github/workflows/ci.yml
-required_staged_toolchain='blorp blorp-ocaml-host blorp-ocaml-middle blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck'
+required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck'
 ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
@@ -410,7 +407,6 @@ export -f find shasum cc uname
 profile_cache_output=$(
 	BLORP_BENCHMARK_CACHE_DIR="$benchmark_cache" \
 	BLORP_COMPILER_BRIDGE_BIN=/usr/bin/true \
-	BLORP_OCAML_MIDDLE_BIN=/usr/bin/true \
 	BLORP_TYPECHECK_PROFILE_COMPILER=/usr/bin/true \
 	BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
 	BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \

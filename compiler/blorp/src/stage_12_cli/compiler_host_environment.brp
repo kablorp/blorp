@@ -3,14 +3,14 @@
 -- The production helper reads process environment only to construct the input
 -- record. All downstream compilation receives the resulting typed context.
 import:
-	../stage_10_backend/compiler_build_artifact:
-		BuildPlatform(BuildLinux, BuildMacos),
+	../stage_10_backend/compiler_build_artifact: BuildPlatform(BuildLinux, BuildMacos)
 	compiler_host_c:
+		HostCCompiler,
 		HostCCompilerFamily(HostOtherCompiler),
 		HostTlsBackend(HostTlsOpenSsl, HostTlsUnsupported),
 		HostTlsConfiguration,
 	compiler_platform:
-		HostPlatformError,
+		HostPlatformError(HostArgumentListInvalid),
 		HostToolchain,
 		HostToolchainProbe,
 		discover_host_toolchain,
@@ -19,8 +19,12 @@ import:
 		parse_host_arguments,
 		parse_host_tls_backend,
 		probe_host_arguments,
-	system: getenv, temp_dir
+	path: join
+	system: file_exists, getenv, temp_dir
 	units: DataSize, Duration
+
+
+private DEFAULT_HOST_PROGRAM_PATH: String = "/bin:/usr/bin"
 
 
 record CompilerHostEnvironmentInput {
@@ -50,6 +54,43 @@ record CompilerHostEnvironment {
 	cache_root: String,
 	raylib_prefix: Option[String]
 }
+
+
+pure func host_program_candidates(program: String, executable_path: Option[String]) -> List[String]:
+	if program.contains("/"):
+		[program]
+	else:
+		executable_path
+			.get_or(DEFAULT_HOST_PROGRAM_PATH)
+			.split(":")
+			.map(func(directory): join(directory, program))
+
+
+pure func parse_host_compiler_command(
+	command: Option[String],
+) -> Result[HostCCompiler, HostPlatformError]:
+	arguments ?= parse_host_arguments(command.get_or("cc"))
+
+	match arguments.get(0):
+		Some(program):
+			Ok({
+				program = program,
+				prefix_arguments = arguments.drop(1),
+				family = HostOtherCompiler,
+			})
+		None:
+			Err(HostArgumentListInvalid("C compiler command is empty"))
+
+
+private func resolve_host_program(program: String, executable_path: Option[String]) -> String:
+	var resolved: Option[String] = None
+
+	for candidate in host_program_candidates(program, executable_path):
+		if file_exists(candidate):
+			resolved = Some(candidate)
+			break
+
+	resolved.get_or(program)
 
 
 private func configured_arguments(
@@ -113,7 +154,11 @@ private func discover_raylib_prefix(
 ) -> Option[String]:
 	match probe.input.raylib_prefix:
 		Some(prefix):
-			if prefix.trim().length() == 0:
+			if (
+				prefix
+					.trim()
+					.length() == 0
+			):
 				None
 			else:
 				Some(prefix)
@@ -125,12 +170,14 @@ private func discover_raylib_prefix(
 					BuildLinux:
 						None
 					BuildMacos:
-						match probe_host_arguments(
-							"raylib Homebrew prefix",
-							probe.brew_program,
-							["--prefix", "raylib"],
-							probe.toolchain.timeout,
-							probe.toolchain.capture_limit,
+						match (
+							probe_host_arguments(
+								"raylib Homebrew prefix",
+								probe.brew_program,
+								["--prefix", "raylib"],
+								probe.toolchain.timeout,
+								probe.toolchain.capture_limit,
+							)
 						):
 							Ok(prefixes):
 								match prefixes:
@@ -166,6 +213,8 @@ func current_compiler_host_environment(
 	timeout: Option[Duration],
 	capture_limit: DataSize,
 ) -> Result[CompilerHostEnvironment, HostPlatformError]:
+	executable_path: Option[String] = getenv("PATH")
+	configured_compiler ?= parse_host_compiler_command(getenv("CC"))
 	environment_input: CompilerHostEnvironmentInput = {
 		tls_backend = getenv("BLORP_TLS_BACKEND"),
 		openssl_compile_arguments = getenv("BLORP_OPENSSL_CFLAGS"),
@@ -178,12 +227,10 @@ func current_compiler_host_environment(
 		discover_raylib_prefix = discover_raylib
 	}
 	toolchain: HostToolchainProbe = {
-		compiler = {
-			program = "cc",
-			prefix_arguments = [],
-			family = HostOtherCompiler
+		compiler = { configured_compiler |
+			program = resolve_host_program(configured_compiler.program, executable_path)
 		},
-		uname_program = "uname",
+		uname_program = resolve_host_program("uname", executable_path),
 		timeout = timeout,
 		capture_limit = capture_limit
 	}
@@ -192,5 +239,5 @@ func current_compiler_host_environment(
 		input = environment_input,
 		toolchain = toolchain,
 		pkg_config_program = "pkg-config",
-		brew_program = "brew"
+		brew_program = "brew",
 	})

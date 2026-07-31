@@ -5,6 +5,7 @@
 -- same typed CoreProgram -> raw CArtifact boundary. Build metadata is completed
 -- separately by compiler_build_artifact.
 import:
+	../stage_09_core/compiler_core_c_type_layout as TypeLayout
 	../stage_09_core/compiler_core_json:
 		CoreAccessor(
 			BoxedStackResultErrPayloadAccessor,
@@ -366,6 +367,7 @@ import:
 			TupleFloatElement,
 			TuplePointerElement,
 			TuplePrimElement,
+			TupleStackResultElement,
 			TupleStructElement,
 			TupleVoidElement,
 		),
@@ -412,6 +414,7 @@ import:
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreVar,
+	../stage_09_core/compiler_core_match_projection: project_backend_matches
 	../stage_09_core/compiler_core_ownership:
 		OwnershipCallContract,
 		OwnershipResultMode(ReturnOwned),
@@ -678,7 +681,6 @@ import:
 		c_value_record_field_storage,
 		c_value_record_field_type_is_boolean,
 		classify_c_record_layouts,
-	compiler_core_emit_type_layout as TypeLayout
 	string: string as make_string
 
 
@@ -1001,7 +1003,13 @@ private pure func emit_function_inventory(func_info: CoreFunction) -> String:
 private pure func emit_unsupported_function_error(func_info: CoreFunction) -> String:
 	"/* unsupported function " + func_info.name + " kind=" + function_kind_label(
 		func_info.function_kind,
-	) + " def_id=" + func_info.def_id.to_string() + " */\n#error \"Blorp backend could not emit function body: " + func_info.name + "\"\n"
+	) + " def_id=" + func_info.def_id.to_string() + " child_path=" + func_info.body
+		.map(unsupported_expr_child_path)
+		.get_or("") + " child_kind=" + func_info.body
+		.map(unsupported_expr_child_kind)
+		.get_or(
+			"",
+		) + " */\n#error \"Blorp backend could not emit function body: " + func_info.name + "\"\n"
 
 
 private ENTRYPOINT_FUNCTION_NAME: String = "main"
@@ -6277,6 +6285,9 @@ private pure func emit_tuple_element_box(element: CoreTupleElement) -> Option[St
 			Some(
 				"({ " + c_type + " __box_struct_value = " + value_c + "; blorp_box_struct(&__box_struct_value, sizeof(" + c_type + ")); })",
 			)
+		TupleStackResultElement(value):
+			value_c ?= emit_simple_expr(value)
+			Some("blorp_box_stack_result(blorp_stack_result_retain_value(" + value_c + "))")
 		TupleVoidElement:
 			Some("(void*)0")
 		TupleFloatElement(value):
@@ -6428,6 +6439,19 @@ private pure func emit_tuple_element_box_body(
 					statements = value_body.statements + "  " + c_type + " " + struct_tmp + " = " + value_c + ";\n",
 					value = "blorp_box_struct(&" + struct_tmp + ", sizeof(" + c_type + "))",
 					next_temp = value_body.next_temp + 1,
+					returns = False,
+				})
+		TupleStackResultElement(value):
+			value_body ?= emit_function_body(value, next_temp)
+
+			if value_body.returns:
+				None
+			else:
+				value_c ?= required_body_value(value_body)
+				Some({
+					statements = value_body.statements,
+					value = "blorp_box_stack_result(blorp_stack_result_retain_value(" + value_c + "))",
+					next_temp = value_body.next_temp,
 					returns = False,
 				})
 		TupleVoidElement:
@@ -9637,7 +9661,7 @@ private pure func emit_tuple_field_access(
 					TypeParameterType(_) | SelfType:
 						None
 					StackResultType(ok_type, err_type):
-						None
+						boxed_storage_value_source(element_c, typ)
 					BoxedResultType(ok_type, err_type):
 						None
 					FunctionType(is_pure, param_types, return_type):
@@ -19150,6 +19174,68 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			emit_if_body(cond, then_expr, else_expr, typ, loc, next_temp)
 
 
+private pure func unsupported_expr_child_path(expr: CoreExpr) -> String:
+	children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
+	var child_index: Int = 0
+	var path: String = ""
+
+	for child in children:
+		if path.is_empty() and emit_function_body(child, 0).is_none():
+			child_path: String = unsupported_expr_child_path(child)
+
+			path = if child_path.is_empty():
+				child_index.to_string()
+			else:
+				child_index.to_string() + "." + child_path
+
+		child_index += 1
+
+	path
+
+
+private pure func unsupported_expr_child_kind(expr: CoreExpr) -> String:
+	children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
+	var kind: String = ""
+
+	for child in children:
+		if kind.is_empty() and emit_function_body(child, 0).is_none():
+			kind = unsupported_expr_child_kind(child)
+		else:
+			void
+
+	match kind:
+		"":
+			match expr:
+				RawMatchExpr(_, _, _, _):
+					"raw_match"
+				SemanticMatchExpr(_, _, _, _):
+					"semantic_match"
+				DebugBlockExpr(_, _, _):
+					"debug_block"
+				VectorExpr(_, _, _):
+					"vector"
+				LambdaExpr(_, _, _, _, _, _):
+					"lambda"
+				DictExpr(_, _, _):
+					"dict"
+				RecordUpdateExpr(_, _, _, _):
+					"record_update"
+				TailrecRecurExpr(_, _, _):
+					"tailrec_recur"
+				TailrecListSpreadRecurExpr(_, _, _, _):
+					"tailrec_list_spread_recur"
+				PreClosureDetachExpr(_, _, _):
+					"pre_closure_detach"
+				PreClosureConcurrentlyLoopExpr(_, _, _):
+					"pre_closure_concurrently_loop"
+				PreClosureConcurrentExpr(_, _, _):
+					"pre_closure_concurrent"
+				_:
+					"nested_emission"
+		found:
+			found
+
+
 private pure func union_type_name(typ: CoreType) -> Option[String]:
 	match typ:
 		UnionType(name):
@@ -20630,6 +20716,8 @@ private pure func static_tuple_element_supported(element: CoreTupleElement) -> B
 			True
 		TupleStructElement(value, c_type):
 			False
+		TupleStackResultElement(value):
+			False
 		TupleFloatElement(value):
 			match static_float64_tuple_initializer(value):
 				Some(initializer):
@@ -21150,6 +21238,8 @@ private pure func static_tuple_element_initializer(
 			})
 		TupleStructElement(value, c_type):
 			None
+		TupleStackResultElement(value):
+			None
 		TupleFloatElement(value):
 			init ?= static_float64_tuple_initializer(value)
 			Some({
@@ -21210,6 +21300,8 @@ private pure func static_tuple_element_release_bit(index: Int, element: CoreTupl
 			0
 		TupleStructElement(value, c_type):
 			0
+		TupleStackResultElement(value):
+			int_power_of_two(index)
 		TupleFloatElement(value):
 			0
 		TupleFloat32Element(value):
@@ -22923,10 +23015,11 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	match prepared:
 		PreparedCore(program):
-			decls_c ?= emit_decls(program, profile_enabled)
+			projected: CoreProgram = project_backend_matches(program)
+			decls_c ?= emit_decls(projected, profile_enabled)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
-					program.foreign_includes,
+					projected.foreign_includes,
 				) + decls_c,
 				link_flags = [],
 				include_dirs = [],

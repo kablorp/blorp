@@ -152,7 +152,7 @@ let matrix_builtins =
   ]
 
 (* Matrix kernels resolve through the module-aware builtin table to placeholder
-   C names. [Core_specialize] then rewrites those placeholders to the
+   C names. Blorp Core specialization rewrites those placeholders to the
    element-typed runtime entry and appends static dimensions. Keep them
    module-scoped here so matrix-specific names never resolve as bare builtins. *)
 
@@ -321,7 +321,7 @@ let builtin_c_mapping =
       ((N.mod_tensor, "set_index"), "blorp_vector_set_cow");
       ((N.mod_vector, "clear"), "blorp_vector_clear");
       ((N.mod_vector, "zip"), "blorp_vector_zip");
-      (* Element-specific vector reductions are selected in Core_specialize.
+      (* Element-specific vector reductions are selected in Blorp Core specialization.
          Resolving these directly to the Int runtime would erase the tensor
          element type before that phase can choose the correct ABI. *)
       ((N.mod_vector, "max"), "blorp_max");
@@ -334,15 +334,15 @@ let builtin_c_mapping =
       ((N.mod_vector, "map"), "blorp_vector_map");
     ]
   (* Matrix builtins — matrix/vector and outer-multiply kernels dispatch through
-     [Core_specialize]'s tensor-kernel specialization. *)
+     Blorp tensor-kernel specialization. *)
   @ matrix_builtins
   (* String builtins *)
   @ string_prelude_builtins
   @ string_internal_builtins
   (* [equals] is an [Equatable] trait method — registered here as a sentinel
      builtin ([blorp_eq_dispatch]) so Blorp Core resolution tags call sites
-     with [CKBuiltin "blorp_eq_dispatch"]. [Core_specialize] then rewrites each
-     call to the correct per-type C function based on arg types. *)
+     with [CKBuiltin "blorp_eq_dispatch"]. Blorp Core specialization then
+     rewrites each call to the correct per-type C function based on arg types. *)
   @ [ (("", "equals"), "blorp_eq_dispatch") ]
   (* Regex builtins *)
   @ regex_builtins

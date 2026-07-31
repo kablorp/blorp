@@ -1,0 +1,117 @@
+-- Runtime representation policy for Result[T, E].
+--
+-- Concrete payloads with known layouts use the stack Result ABI. Generic or
+-- otherwise unknown payloads retain the boxed union ABI until specialization
+-- can make their storage explicit.
+import:
+	../stage_08_core_lower/compiler_core_list_layout: CoreLayoutTypeIndex
+	compiler_core_json:
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	compiler_core_specialize_layout:
+		CoreSpecializeLayout,
+		resolve_specialize_type,
+		specialize_type_is_managed,
+	compiler_core_type_policy: core_type_has_unresolved_parameters
+
+
+enum CoreResultRuntimeRepresentation:
+	StackResultRepresentation
+	BoxedResultRepresentation
+
+
+private pure func immediate_result_payload_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "Float"
+		or name == "Float32"
+		or name == "Float16"
+		or name == "Bool"
+		or name == "Char"
+		or name == "Ptr"
+		or name == "Port"
+		-- ConcurrencyError is a prelude union whose declaration is installed
+		-- by the frontend rather than materialized as a Core declaration.
+		or name == "ConcurrencyError"
+	)
+
+
+private pure func declared_result_payload_has_known_layout(
+	type_index: CoreLayoutTypeIndex,
+	name: String,
+) -> Bool:
+	match type_index.declared_types.get(name):
+		Some(EnumType(_)):
+			True
+		Some(ValueRecordType(_)):
+			True
+		Some(HeapRecordType(_)):
+			True
+		Some(UnionType(_)):
+			True
+		_:
+			False
+
+
+private pure func result_payload_has_known_layout(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Bool:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	if core_type_has_unresolved_parameters(resolved):
+		False
+	else:
+		match resolved:
+			NamedType(name, args):
+				if name == "Module":
+					False
+				else if args.is_empty() and immediate_result_payload_name(name):
+					True
+				else:
+					(
+						specialize_type_is_managed(layout, resolved)
+						or declared_result_payload_has_known_layout(layout.types, name)
+					)
+			TypeParameterType(_) | SelfType:
+				False
+			VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+				True
+			FunctionType(_, _, _) | StackResultType(_, _) | BoxedResultType(_, _) | TensorType(_) | TupleType(_):
+				True
+
+
+pure func result_runtime_representation(
+	layout: CoreSpecializeLayout,
+	ok_type: CoreType,
+	err_type: CoreType,
+) -> CoreResultRuntimeRepresentation:
+	if (
+		result_payload_has_known_layout(layout, ok_type)
+		and result_payload_has_known_layout(layout, err_type)
+	):
+		StackResultRepresentation
+	else:
+		BoxedResultRepresentation

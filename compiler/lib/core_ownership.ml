@@ -314,6 +314,10 @@ let intrinsic_contract name arity =
   | "slice_source" -> fixed arity [ Borrow ] (ReturnAliasOfArg 0)
   | "slice_start" | "slice_len" -> borrowed 1 ReturnPrimitive
   | "slice_alloc" -> borrowed 3 ReturnOwned
+  | "memory_is_unique_heap" | "memory_is_unique_stack"
+  | "memory_refcount_heap" | "memory_refcount_stack"
+  | "memory_size_of_heap" | "memory_size_of_stack" ->
+      borrowed 1 ReturnPrimitive
   (* Tensor and fixed-value primitives. Tensor element reads are primitive
      except the raw unchecked pointer read, which aliases tensor storage. *)
   | "tensor_len" | "tensor_capacity" | "tensor_is_word_storage"

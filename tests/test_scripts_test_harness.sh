@@ -5,6 +5,48 @@ set -u
 
 cd "$(dirname "$0")/.."
 
+expected_core_sanitize_root_count=54
+actual_core_sanitize_root_count=$(awk 'NF { count += 1 } END { print count + 0 }' \
+	scripts/compiler-core-sanitize-roots.txt)
+if [ "$actual_core_sanitize_root_count" -ne "$expected_core_sanitize_root_count" ]; then
+	echo "FAIL: compiler Core sanitizer manifest should contain $expected_core_sanitize_root_count roots"
+	exit 1
+fi
+
+duplicate_core_sanitize_roots=$(sort scripts/compiler-core-sanitize-roots.txt | uniq -d)
+if [ -n "$duplicate_core_sanitize_roots" ]; then
+	echo "FAIL: compiler Core sanitizer manifest should not contain duplicate roots"
+	echo "$duplicate_core_sanitize_roots"
+	exit 1
+fi
+
+while IFS= read -r root; do
+	[ -n "$root" ] || continue
+	if [ ! -f "$root" ]; then
+		echo "FAIL: compiler Core sanitizer root does not exist: $root"
+		exit 1
+	fi
+done < scripts/compiler-core-sanitize-roots.txt
+
+required_core_sanitize_roots=(
+	compiler/blorp/tests/test_compiler_core_c_type_layout.brp
+	compiler/blorp/tests/test_compiler_core_early_invariants.brp
+	compiler/blorp/tests/test_compiler_core_fairness.brp
+	compiler/blorp/tests/test_compiler_core_late_invariants.brp
+	compiler/blorp/tests/test_compiler_core_match_projection.brp
+	compiler/blorp/tests/test_compiler_core_perceus.brp
+	compiler/blorp/tests/test_compiler_core_pipeline.brp
+	compiler/blorp/tests/test_compiler_core_prepare.brp
+	compiler/blorp/tests/test_compiler_core_resource.brp
+	compiler/blorp/tests/test_compiler_core_reuse.brp
+)
+for root in "${required_core_sanitize_roots[@]}"; do
+	if ! grep -Fxq "$root" scripts/compiler-core-sanitize-roots.txt; then
+		echo "FAIL: compiler Core sanitizer manifest is missing required root: $root"
+		exit 1
+	fi
+done
+
 TMP_HARNESS=$(mktemp -d "${TMPDIR:-/tmp}/blorp_script_harness.XXXXXX") || exit 1
 trap 'rm -rf "$TMP_HARNESS"' EXIT
 
@@ -14,6 +56,7 @@ mkdir -p \
 	"$TMP_HARNESS/tests/test_blorp/memory" \
 	"$TMP_HARNESS/tests/test_blorp/types"
 cp scripts/test "$TMP_HARNESS/scripts/test"
+cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 
 cat > "$TMP_HARNESS/scripts/blorp-compiler-bootstrap" <<SH
 #!/usr/bin/env bash
@@ -437,7 +480,10 @@ if [ "$compiler_core_sanitize_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_core_sanitize_command="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/test_compiler_core_clone.brp compiler/blorp/tests/test_compiler_core_closure.brp compiler/blorp/tests/test_compiler_core_consume_specialize.brp compiler/blorp/tests/test_compiler_core_dce.brp compiler/blorp/tests/test_compiler_core_debug.brp compiler/blorp/tests/test_compiler_core_desugar.brp compiler/blorp/tests/test_compiler_core_early_invariants.brp compiler/blorp/tests/test_compiler_core_early_pipeline.brp compiler/blorp/tests/test_compiler_core_emit.brp compiler/blorp/tests/test_compiler_core_emit_type_layout.brp compiler/blorp/tests/test_compiler_core_fairness.brp compiler/blorp/tests/test_compiler_core_ffi_boundary.brp compiler/blorp/tests/test_compiler_core_flatten.brp compiler/blorp/tests/test_compiler_core_json.brp compiler/blorp/tests/test_compiler_core_list_layout.brp compiler/blorp/tests/test_compiler_core_lower.brp compiler/blorp/tests/test_compiler_core_mono.brp compiler/blorp/tests/test_compiler_core_mono_data.brp compiler/blorp/tests/test_compiler_core_mono_impl.brp compiler/blorp/tests/test_compiler_core_mono_option.brp compiler/blorp/tests/test_compiler_core_mono_specialize.brp compiler/blorp/tests/test_compiler_core_mono_substitute.brp compiler/blorp/tests/test_compiler_core_monomorphize.brp compiler/blorp/tests/test_compiler_core_ownership.brp compiler/blorp/tests/test_compiler_core_perceus.brp compiler/blorp/tests/test_compiler_core_pipeline.brp compiler/blorp/tests/test_compiler_core_prepare.brp compiler/blorp/tests/test_compiler_core_resolve.brp compiler/blorp/tests/test_compiler_core_resource.brp compiler/blorp/tests/test_compiler_core_reuse.brp compiler/blorp/tests/test_compiler_core_specialize.brp compiler/blorp/tests/test_compiler_core_ssa.brp compiler/blorp/tests/test_compiler_core_synth.brp compiler/blorp/tests/test_compiler_core_synth_bytes.brp compiler/blorp/tests/test_compiler_core_synth_fixed.brp compiler/blorp/tests/test_compiler_core_synth_float.brp compiler/blorp/tests/test_compiler_core_synth_forward.brp compiler/blorp/tests/test_compiler_core_synth_hash_collections.brp compiler/blorp/tests/test_compiler_core_synth_list.brp compiler/blorp/tests/test_compiler_core_synth_parallel_tensor.brp compiler/blorp/tests/test_compiler_core_synth_slice.brp compiler/blorp/tests/test_compiler_core_synth_string.brp compiler/blorp/tests/test_compiler_core_synth_tensor.brp compiler/blorp/tests/test_compiler_core_tensor_specialize.brp compiler/blorp/tests/test_compiler_core_trait_resolve.brp compiler/blorp/tests/test_compiler_core_traverse.brp"
+expected_core_sanitize_prefix="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout"
+expected_core_sanitize_roots=$(tr '\n' ' ' < scripts/compiler-core-sanitize-roots.txt)
+expected_core_sanitize_roots=${expected_core_sanitize_roots% }
+expected_core_sanitize_command="$expected_core_sanitize_prefix $expected_core_sanitize_roots"
 if ! grep -Fxq "$expected_core_sanitize_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-core-sanitize should use the explicit uncached serial Core file set"
 	cat "$compiler_core_sanitize_output"

@@ -84,9 +84,6 @@ let default_suites =
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
   @ suite_group "Core" Test_core.suite
-  @ suite_group "CorePostTupleSroaJson" Test_core_post_tuple_sroa_json.suite
-  @ suite_group "CoreEmitBlorpC" Test_core_emit_blorp_c.suite
-  @ suite_group "CoreSpecialize" Test_core_specialize.suite
   @ suite_group "CoreTensorType" Test_core_tensor_type.suite
   @ suite_group "CoreLayoutType" Test_core_layout_type.suite
   @ suite_group "CoreTypeLayout" Test_core_type_layout.suite
@@ -97,7 +94,6 @@ let default_suites =
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
   @ suite_group "CoreStage" Test_core_stage.suite
-  @ suite_group "Invariants" Test_invariants.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
   @ suite_group "CodegenTypes" Test_codegen_types.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite
@@ -130,7 +126,6 @@ let deep_suites =
   @ suite_group "TestRunner" Test_test_runner.suite
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite
   @ suite_group "CompilerBlorpBridge" Test_compiler_blorp_bridge.suite
-  @ suite_group "SemanticMiddleWorker" Test_semantic_middle_worker.suite
 
 let suites_for_scope = function
   | Default -> default_suites

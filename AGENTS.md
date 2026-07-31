@@ -105,8 +105,8 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/lib/core_pipeline.ml`, `compiler/lib/core_stage.ml`, `docs/ARCHITECTURE.md`, and `compiler/bin/blorp.ml`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/lib/dim_solver.ml`, `compiler/lib/infer.ml`, `compiler/lib/core_specialize.ml`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
+- For pipeline questions, start with `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`, `compiler/lib/core_stage.ml`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/lib/dim_solver.ml`, `compiler/lib/infer.ml`, `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
 
@@ -450,13 +450,8 @@ compiler/            # OCaml compiler implementation
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core.ml           # Core IR type definitions and traversal helpers
-    core_post_tuple_sroa_json.ml  # Strict Blorp post-tuple-SROA Core decoder
-    core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
-    core_specialize_fallback.ml  # Narrow fallback for unsupported runtime layouts
-    core_emit_blorp_c.ml  # Core JSON projection and Blorp bridge client
-    core_pipeline.ml  # Remaining post-synthesis OCaml middle orchestration
-    core_emit_util.ml, core_emit_layout.ml  # Shared late-backend helpers
-    core_invariants.ml  # Stage-boundary invariant checks
+    core_ownership.ml  # Remaining OCaml ownership-contract consumers
+    core_layout_type.ml  # Remaining OCaml layout consumers
     core_error.ml     # Core IR structured errors
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck
     codegen/      # Shared codegen utilities used by the core-emit pipeline

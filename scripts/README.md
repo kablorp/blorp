@@ -302,7 +302,6 @@ Useful environment variables:
 - `BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR` selects the directory containing that
   compiler's matching helpers when it is not beside the compiler.
 - `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
-- `BLORP_RELEASE_OCAML_MIDDLE` selects the private semantic worker to package.
 - `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.
 - `BLORP_RELEASE_PARSER_BRIDGE` selects the prepared parser bridge.
 - `BLORP_RELEASE_TYPECHECK_BRIDGE` selects the prepared typecheck bridge.
@@ -351,7 +350,6 @@ Remove the dev binary with:
 rm -f \
   "$HOME/.local/bin/blorp" \
   "$HOME/.local/bin/blorp-ocaml-host" \
-  "$HOME/.local/bin/blorp-ocaml-middle" \
   "$HOME/.local/bin/blorp-compiler-renderer" \
   "$HOME/.local/bin/blorp-compiler-parser" \
   "$HOME/.local/bin/blorp-compiler-typecheck"

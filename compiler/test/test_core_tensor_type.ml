@@ -74,59 +74,6 @@ let test_floating_scalar_classification_is_explicit () =
     "Int has no floating fusion scalar" true
     (Blorp.Core_tensor_type.floating_scalar_of_type ~reg ty_int = None)
 
-let project_type reg typ =
-  let names = Blorp.Core_emit_blorp_c.StringSet.empty in
-  match
-    Blorp.Core_emit_blorp_c.type_json ~reg names names names names "type" typ
-  with
-  | Ok json -> Blorp.Lsp_json.to_string json
-  | Error error ->
-      Alcotest.fail (Blorp.Core_emit_blorp_c.unsupported_to_string error)
-
-let test_projection_canonicalizes_ordinary_tensor_spellings () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  let expected_vector =
-    {|{"kind":"tensor","info":{"element_type":{"kind":"named","name":"Float32","args":[]},"dims":[{"kind":"static","value":4}]}}|}
-  in
-  let vector_spellings =
-    [
-      ty "Vector" [ ty_float32; dim 4 ];
-      ty "Tensor" [ ty_float32; dim 4 ];
-      TyArray (ty_float32, [ dim 4 ]);
-    ]
-  in
-  List.iter
-    (fun typ ->
-      Alcotest.(check string)
-        "ordinary vector spelling projects as tensor" expected_vector
-        (project_type reg typ))
-    vector_spellings;
-  Alcotest.(check string)
-    "matrix spelling preserves both dimensions"
-    {|{"kind":"tensor","info":{"element_type":{"kind":"named","name":"Float","args":[]},"dims":[{"kind":"static","value":2},{"kind":"static","value":3}]}}|}
-    (project_type reg (ty "Matrix" [ ty_float; dim 2; dim 3 ]))
-
-let test_projection_expands_tensor_aliases () =
-  let reg = registry_with_aliases () in
-  Alcotest.(check string)
-    "aliases project as their canonical tensor type"
-    {|{"kind":"tensor","info":{"element_type":{"kind":"named","name":"Float","args":[]},"dims":[{"kind":"static","value":3}]}}|}
-    (project_type reg (ty "Positions" []))
-
-let test_projection_normalizes_zero_dim_tensor_to_scalar () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Alcotest.(check string)
-    "zero-dimensional tensor projects as its scalar element"
-    {|{"kind":"named","name":"Int","args":[]}|}
-    (project_type reg (ty "Tensor" [ ty_int ]))
-
-let test_projection_keeps_parallel_tensor_views_distinct () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Alcotest.(check string)
-    "parallel view is not projected as ordinary tensor storage"
-    {|{"kind":"named","name":"ParallelVector","args":[{"kind":"named","name":"Float","args":[]},{"kind":"named","name":"Int","args":[]}]}|}
-    (project_type reg (ty "ParallelVector" [ ty_float; dim 4 ]))
-
 let suite =
   [
     ( "facts",
@@ -139,13 +86,5 @@ let suite =
           test_same_static_shape_ignores_element_type;
         Alcotest.test_case "floating scalar classification is explicit" `Quick
           test_floating_scalar_classification_is_explicit;
-        Alcotest.test_case "projection canonicalizes tensor spellings" `Quick
-          test_projection_canonicalizes_ordinary_tensor_spellings;
-        Alcotest.test_case "projection expands tensor aliases" `Quick
-          test_projection_expands_tensor_aliases;
-        Alcotest.test_case "projection normalizes 0D tensor to scalar" `Quick
-          test_projection_normalizes_zero_dim_tensor_to_scalar;
-        Alcotest.test_case "projection preserves parallel tensor views" `Quick
-          test_projection_keeps_parallel_tensor_views_distinct;
       ] );
   ]
