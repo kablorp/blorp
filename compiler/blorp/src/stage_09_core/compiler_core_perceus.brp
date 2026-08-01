@@ -212,6 +212,7 @@ record PerceusEnv {
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	global_values: List[PerceusGlobal],
+	global_value_indices_by_name: Dict[String, List[Int]],
 	function_definitions: List[CoreDefinitionIdentity],
 	constructor_definitions: List[CoreDefinitionIdentity],
 	nullary_constructor_definitions: List[CoreDefinitionIdentity],
@@ -255,6 +256,7 @@ pure func empty_env() -> PerceusEnv:
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
 		global_values = [],
+		global_value_indices_by_name = {},
 		function_definitions = [],
 		constructor_definitions = [],
 		nullary_constructor_definitions = [],
@@ -504,6 +506,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 	var global_values: List[PerceusGlobal] = []
+	var global_value_indices_by_name: Dict[String, List[Int]] = {}
 	var nullary_constructor_definitions: List[CoreDefinitionIdentity] = []
 
 	for decl in program.decls:
@@ -575,6 +578,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					None:
 						void
 			GlobalDecl(global):
+				global_index: Int = global_values.length()
 				perceus_global: PerceusGlobal = {
 					value = {
 						name = { global.name | def_id = Some(global.def_id) },
@@ -584,6 +588,13 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					is_mutable = global.is_mutable
 				}
 				global_values = global_values.append(perceus_global)
+				indices_with_name: List[Int] = global_value_indices_by_name
+					.get(global.name.name)
+					.get_or([])
+				global_value_indices_by_name = global_value_indices_by_name.set(
+					global.name.name,
+					indices_with_name.append(global_index),
+				)
 			_:
 				void
 
@@ -592,6 +603,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		global_values = global_values,
+		global_value_indices_by_name = global_value_indices_by_name,
 		function_definitions = CoreClosure.capture_function_definitions(program),
 		constructor_definitions = CoreClosure.capture_constructor_definitions(program),
 		nullary_constructor_definitions = nullary_constructor_definitions,
@@ -17465,14 +17477,29 @@ private pure func global_is_unshadowed(
 	)
 
 
-private pure func global_is_referenced(value_reads: List[CoreVar], global: PerceusGlobal) -> Bool:
-	match global.value.name.def_id:
-		Some(_):
-			value_reads.any(
-				func(variable): core_vars_have_same_definition(variable, global.value.name),
-			)
-		None:
-			False
+private pure func global_candidate_indices(
+	env: PerceusEnv,
+	value_reads: List[CoreVar],
+) -> List[Int]:
+	var result: List[Int] = []
+
+	for value_read in value_reads:
+		match env.global_value_indices_by_name.get(value_read.name):
+			Some(indices_with_name):
+				for global_index in indices_with_name:
+					match env.global_values.get(global_index):
+						Some(global):
+							if core_vars_have_same_definition(value_read, global.value.name):
+								result = result.append(global_index)
+								break
+							else:
+								void
+						None:
+							void
+			None:
+				void
+
+	result.sort()
 
 
 private pure func unshadowed_global_values(
@@ -17483,19 +17510,15 @@ private pure func unshadowed_global_values(
 	value_reads: List[CoreVar] = CoreDce.value_references(body).resolved_reads
 	var result: List[CoreParam] = []
 
-	for global in env.global_values:
-		already_selected: Bool = result.any(
-			func(value): core_vars_have_same_definition(value.name, global.value.name),
-		)
-
-		if (
-			global_is_referenced(value_reads, global)
-			and global_is_unshadowed(shadowing_values, global)
-			and not already_selected
-		):
-			result = result.append(global.value)
-		else:
-			void
+	for global_index in global_candidate_indices(env, value_reads):
+		match env.global_values.get(global_index):
+			Some(global):
+				if global_is_unshadowed(shadowing_values, global):
+					result = result.append(global.value)
+				else:
+					void
+			None:
+				void
 
 	result
 

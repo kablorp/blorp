@@ -494,21 +494,26 @@ responses stay file-backed until the renderer has exited.
 ### Perceus Global Scanning
 
 `compiler_perceus_memory` generates a bounded Core program with managed globals
-that are irrelevant to moderately sized function bodies, sends it through the
-production `emit_core_c` bridge action, validates the emitted C, and reports
-request size, elapsed time, and peak memory:
+and moderately sized function bodies, sends it through the production
+`emit_core_c` bridge action, validates the emitted C, and reports request size,
+generated-C SHA-256, elapsed time, and peak memory. Each function reads 32
+globals by default so the fixture measures both reference discovery and the
+width of the global table:
 
 ```bash
 benchmarks/compiler_perceus_memory
 benchmarks/compiler_perceus_memory --globals 24
 benchmarks/compiler_perceus_memory --globals 384
+benchmarks/compiler_perceus_memory --global-reads-per-function 0
 ```
 
-The function count and body shape stay fixed when comparing those last two
-commands, isolating the cost of irrelevant globals. The runner uses
-`BLORP_COMPILER_RENDERER_BRIDGE_BIN` when it names a prepared helper; otherwise
-it prepares a cached helper through `./blorp __compiler-bridge-prepare` before
-starting measurement. Bridge preparation is excluded from the reported time.
+The function count, body shape, and referenced-global count stay fixed when
+varying `--globals`, isolating the cost of irrelevant globals beyond the
+referenced set. Set `--global-reads-per-function 0` to measure bodies with no
+global references. The runner uses `BLORP_COMPILER_RENDERER_BRIDGE_BIN` when it
+names a prepared helper; otherwise it prepares a cached helper through `./blorp
+__compiler-bridge-prepare` before starting measurement. Bridge preparation is
+excluded from the reported time.
 
 On macOS, all compiler memory diagnostics accept `--vmmap` to sample physical
 footprint, `MALLOC_SMALL`, and allocation count when `vmmap` exposes those

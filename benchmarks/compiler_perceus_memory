@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -18,10 +19,11 @@ from pathlib import Path
 from typing import Any
 
 
-FIXTURE_VERSION = 1
+FIXTURE_VERSION = 2
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
 DEFAULT_BODY_LEAVES = 64
+DEFAULT_GLOBAL_READS_PER_FUNCTION = 32
 RENDERER_BRIDGE_ENV = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
@@ -66,6 +68,7 @@ def global_decl(index: int) -> JsonObject:
     return {
         "kind": "global",
         "name": core_var(name, def_id),
+        "source_module": None,
         "type": named_type("String"),
         "init": literal_expr("string", f"global-{index:04d}", "String"),
         "mutable": False,
@@ -92,10 +95,30 @@ def user_function(name: str, def_id: int, body: JsonObject) -> JsonObject:
     }
 
 
-def worker_decl(index: int, def_id: int, body_leaves: int) -> JsonObject:
-    body = seq_expr(
-        [literal_expr("int", leaf, "Int") for leaf in range(body_leaves)]
+def global_ref_expr(index: int) -> JsonObject:
+    return {
+        "kind": "var",
+        "var": core_var(f"BENCH_UNUSED_GLOBAL_{index:04d}", index + 1),
+        "type": named_type("String"),
+        "loc": synthetic_loc(),
+    }
+
+
+def worker_decl(
+    index: int,
+    def_id: int,
+    body_leaves: int,
+    global_reads_per_function: int,
+) -> JsonObject:
+    literal_count = body_leaves - global_reads_per_function
+    expressions = [
+        global_ref_expr(global_index)
+        for global_index in range(global_reads_per_function)
+    ]
+    expressions.extend(
+        literal_expr("int", leaf, "Int") for leaf in range(literal_count)
     )
+    body = seq_expr(expressions)
     return user_function(f"bench_worker_{index:04d}", def_id, body)
 
 
@@ -121,11 +144,17 @@ def fixture_request(
     global_count: int,
     function_count: int,
     body_leaves: int,
+    global_reads_per_function: int,
 ) -> tuple[JsonObject, JsonObject]:
     globals_json = [global_decl(index) for index in range(global_count)]
     first_function_id = global_count + 1
     functions_json = [
-        worker_decl(index, first_function_id + index, body_leaves)
+        worker_decl(
+            index,
+            first_function_id + index,
+            body_leaves,
+            global_reads_per_function,
+        )
         for index in range(function_count)
     ]
     main_expressions = [
@@ -273,6 +302,13 @@ def positive_int(value: str) -> int:
     return result
 
 
+def nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return result
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -315,7 +351,11 @@ def prepared_renderer_bridge(root: Path, out_dir: Path, explicit: str | None) ->
     return path
 
 
-def validate_response(response_path: Path, global_count: int, function_count: int) -> int:
+def validate_response(
+    response_path: Path,
+    global_count: int,
+    function_count: int,
+) -> tuple[int, str]:
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as error:
@@ -340,7 +380,8 @@ def validate_response(response_path: Path, global_count: int, function_count: in
         raise RuntimeError(
             "generated C is missing fixture declarations: " + ", ".join(missing_names)
         )
-    return len(c_code.encode("utf-8"))
+    encoded_c = c_code.encode("utf-8")
+    return len(encoded_c), hashlib.sha256(encoded_c).hexdigest()
 
 
 def print_metrics(metrics: JsonObject, as_json: bool) -> None:
@@ -353,11 +394,13 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
         "globals",
         "functions",
         "body_leaves",
+        "global_reads_per_function",
         "declarations",
         "input_expression_nodes",
         "request_bytes",
         "response_bytes",
         "generated_c_bytes",
+        "generated_c_sha256",
         "elapsed_seconds",
         "peak_rss_bytes",
         "physical_footprint_bytes",
@@ -381,6 +424,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             args.globals,
             args.functions,
             args.body_leaves,
+            args.global_reads_per_function,
         )
         request_path = temp_dir / "request.json"
         response_path = temp_dir / "response.json"
@@ -413,7 +457,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 f"renderer bridge exited with {metrics['exit_code']}: {stderr}"
             )
 
-        generated_c_bytes = validate_response(
+        generated_c_bytes, generated_c_sha256 = validate_response(
             response_path,
             args.globals,
             args.functions,
@@ -424,6 +468,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "globals": args.globals,
                 "functions": args.functions,
                 "body_leaves": args.body_leaves,
+                "global_reads_per_function": args.global_reads_per_function,
                 "declarations": len(core_program["decls"]),
                 "input_expression_nodes": input_expression_count(
                     args.globals,
@@ -433,6 +478,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "request_bytes": request_path.stat().st_size,
                 "response_bytes": response_path.stat().st_size,
                 "generated_c_bytes": generated_c_bytes,
+                "generated_c_sha256": generated_c_sha256,
                 "verified": True,
             }
         )
@@ -448,12 +494,17 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Measure the production emit_core_c path with many managed globals "
-            "that are irrelevant to moderately sized function bodies."
+            "and moderately sized function bodies containing resolved global reads."
         )
     )
     parser.add_argument("--globals", type=positive_int, default=DEFAULT_GLOBALS)
     parser.add_argument("--functions", type=positive_int, default=DEFAULT_FUNCTIONS)
     parser.add_argument("--body-leaves", type=positive_int, default=DEFAULT_BODY_LEAVES)
+    parser.add_argument(
+        "--global-reads-per-function",
+        type=nonnegative_int,
+        default=DEFAULT_GLOBAL_READS_PER_FUNCTION,
+    )
     parser.add_argument(
         "--bridge",
         help=f"prepared renderer bridge; defaults to ${RENDERER_BRIDGE_ENV} or prepares one",
@@ -465,6 +516,11 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--json", action="store_true", help="print metrics as JSON")
     args = parser.parse_args(argv)
+
+    if args.global_reads_per_function >= args.body_leaves:
+        parser.error("--global-reads-per-function must be less than --body-leaves")
+    if args.global_reads_per_function > args.globals:
+        parser.error("--global-reads-per-function cannot exceed --globals")
 
     if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
         parser.error("--vmmap requires macOS vmmap")
