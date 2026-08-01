@@ -8,6 +8,10 @@ on:
 env:
   OCAML_COMPILER: ocaml-base-compiler.4.14.2
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   benchmarks:
     name: Benchmarks (Linux)
@@ -18,20 +22,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Read Blorp compiler bootstrap manifest
-        id: compiler-bootstrap
-        shell: bash
-        run: echo "tag=$(scripts/blorp-compiler-bootstrap --print-tag)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Blorp compiler bootstrap
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/blorp/compiler-bootstrap
-          key: blorp-compiler-bootstrap-v2-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Prewarm Blorp compiler bootstrap
-        run: scripts/blorp-compiler-bootstrap --print-path
 
       - name: Install system libraries
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev m4 pkg-config
@@ -47,24 +37,44 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Cache Blorp compiler bridge helpers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/blorp/compiler-bridge
-          key: blorp-compiler-bridge-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
-          restore-keys: |
-            blorp-compiler-bridge-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Cache generated Blorp CLI
-        uses: actions/cache@v4
-        with:
-          path: compiler/_build/blorp-cli
-          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/**/*.ml', 'compiler/**/*.mli', 'compiler/**/dune', 'compiler/dune-project', 'compiler/blorp.opam.locked', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
-          restore-keys: |
-            blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Build compiler
-        run: opam exec -- make install
+      - name: Download tested compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          target=$(scripts/target-triple)
+          run_json=$(gh run list --workflow CI --commit "$sha" --status success --limit 20 --json databaseId,event,headSha)
+          run_id=$(jq -r --arg sha "$sha" '.[] | select(.event == "push" and .headSha == $sha) | .databaseId' <<<"$run_json" | head -n 1)
+          if [ -z "$run_id" ]; then
+            echo "No successful CI toolchain is available for $sha." >&2
+            exit 1
+          fi
+          artifact_dir=$(mktemp -d "${RUNNER_TEMP}/blorp-benchmark-toolchain.XXXXXX")
+          gh run download "$run_id" --name "blorp-$target" --dir "$artifact_dir"
+          archive=$(find "$artifact_dir" -name "blorp-*-$target.tar.gz" -type f -print -quit)
+          if [ -z "$archive" ]; then
+            echo "The CI toolchain artifact for $sha has no $target archive." >&2
+            exit 1
+          fi
+          tar -xzf "$archive" -C "$artifact_dir"
+          binary_path=$(find "$artifact_dir" -type f -name blorp -print -quit)
+          if [ -z "$binary_path" ]; then
+            echo "The CI toolchain artifact for $sha has no public compiler." >&2
+            exit 1
+          fi
+          package_dir=$(dirname "$binary_path")
+          for executable in \
+            blorp \
+            blorp-ocaml-host \
+            blorp-compiler-renderer \
+            blorp-compiler-parser \
+            blorp-compiler-typecheck
+          do
+            cp "$package_dir/$executable" .
+            chmod +x "$executable"
+          done
+          ./blorp --version | grep -F "commit: $sha"
 
       - name: Run benchmarks
         run: |

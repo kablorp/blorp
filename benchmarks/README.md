@@ -366,27 +366,17 @@ benchmarks/compiler_type_instantiation \
 
 ### Captured Typecheck Replay
 
-`compiler_typecheck_replay` runs one exact production `typecheck_graph` request
-against an isolated helper. Capture mode writes the request immediately before
-the OCaml host would start that helper, then deliberately stops:
+`compiler_typecheck_replay` runs one previously captured production
+`typecheck_graph` request against an isolated helper. The former OCaml-host
+capture hook was retired when production typechecking moved into the public
+Blorp compiler. A replacement must be a structured compiler dump mode; until
+that exists, the runner can replay existing local captures but cannot create a
+new authoritative capture. Keep captures local because they contain source text
+and local paths. First typecheck only the target while retaining its full
+prepared graph context, then typecheck the complete selected module graph:
 
 ```bash
-capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.json")
-output=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck.XXXXXX.c")
-bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
-BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$capture" \
-  "$bootstrap_compiler" \
-  __compiler-host-compile-wrapper \
-  -o "$output" \
-  compiler/blorp/src/stage_06_typecheck/compiler_infer.brp
-```
-
-The capture command is expected to exit nonzero, and it must not create the
-requested output. Keep captures local: they contain source text and local
-paths. First typecheck only the target while retaining its full prepared graph
-context, then typecheck the complete selected module graph:
-
-```bash
+capture=/path/to/existing-typecheck-graph-request.json
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 60 --memory-limit 4G --json
 benchmarks/compiler_typecheck_replay "$capture" \
@@ -394,26 +384,16 @@ benchmarks/compiler_typecheck_replay "$capture" \
 ```
 
 `--module PATH` selects one original module target plus the request target and
-can be repeated to form a narrow module set. `--first N` selects a prefix.
-The `--retention-slice` preset specifically requires a `compiler_cli_main`
-capture:
+can be repeated to form a narrow module set. `--first N` selects a prefix. The
+`--retention-slice` preset specifically requires an existing
+`compiler_cli_main` capture and selects the known CTFE trigger plus its six
+retained dependencies:
 
 ```bash
-cli_capture=$(mktemp "${TMPDIR:-/tmp}/blorp-cli-typecheck.XXXXXX.json")
-bootstrap_compiler=$(scripts/blorp-compiler-bootstrap --print-compiler-path)
-BLORP_COMPILER_CAPTURE_TYPECHECK_GRAPH_REQUEST="$cli_capture" \
-  "$bootstrap_compiler" \
-  __compiler-host-compile-wrapper \
-  -o "$output" \
-  compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
-
+cli_capture=/path/to/existing-compiler-cli-typecheck-request.json
 benchmarks/compiler_typecheck_replay "$cli_capture" \
   --retention-slice --timeout 60 --memory-limit 4G
 ```
-
-As with the generic capture, the host command is expected to stop nonzero
-before creating `"$output"`. The preset selects the known CTFE trigger plus its
-six retained dependencies.
 
 This is the fast feedback loop for graph-retention work. With a prepared helper
 it completes in roughly 20 seconds on the development machine, instead of

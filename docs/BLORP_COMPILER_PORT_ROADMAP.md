@@ -344,14 +344,21 @@ has emptied `parser`, `ctfe`, `type_system`, `ownership`, `final_core`, and
 Leave one shipped Blorp executable and one immutable external bootstrap
 toolchain used only to build it.
 
+### Current Rough Edge
+
+The packaged typecheck worker appears to be consumed only by diagnostic
+benchmarks and bulk bridge preparation, not by a production OCaml-hosted
+command. Keep it until benchmark-specific preparation is separated and a
+reachability regression proves the release toolchain no longer needs it.
+
 ### Execution
 
 1. Delete process clients, JSON codecs, and cache keys for retired parser,
    typecheck, renderer, and host boundaries.
 2. Keep only serialization that is a public artifact/protocol or an explicit
    test fixture.
-3. Remove old executable-name and environment-selector fallbacks after the
-   pinned bootstrap no longer requires them.
+3. Remove old executable-name and environment-selector fallbacks after their
+   remaining OCaml-hosted tool consumers move.
 4. Publish and verify a complete release before rotating
    `compiler/bootstrap.env`.
 5. Build from a fresh bootstrap cache on macOS ARM64, Linux x86_64, and Linux
@@ -360,9 +367,8 @@ toolchain used only to build it.
 
 ### Deletion Condition
 
-The `bridge` group is empty. The released toolchain contains the public Blorp
-binary and only the bootstrap artifacts required by the documented build
-trust boundary.
+The `bridge` group is empty. The released toolchain contains one public Blorp
+binary; that same binary becomes the external build trust root when pinned.
 
 ## Cross-Cutting Validation
 
@@ -413,6 +419,6 @@ The migration is complete when:
   ownership, C emission, artifact, runtime-cache, host-C, or tool behavior;
 - the OCaml production inventory is empty;
 - no retired compiler bridge or helper is shipped;
-- the immutable bootstrap compiler is only an external build trust root; and
+- the pinned public Blorp compiler is the only external build trust root; and
 - normal, deep, sanitizer, leak, quality, preview, and cross-platform gates
   pass.

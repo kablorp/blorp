@@ -37,20 +37,11 @@ tag="$BLORP_BOOTSTRAP_TAG"
 version="$BLORP_BOOTSTRAP_VERSION"
 layout="$BLORP_BOOTSTRAP_LAYOUT"
 
-case "$layout" in
-	single | toolchain) ;;
-	*)
-		echo "Compiler bootstrap manifest has unsupported layout: $layout" >&2
-		exit 1
-		;;
-esac
+if [ "$layout" != "toolchain" ]; then
+	echo "Compiler bootstrap manifest has unsupported layout: $layout" >&2
+	exit 1
+fi
 toolchain_executables="blorp blorp-ocaml-host blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck"
-bootstrap_compiler_executable="blorp-bootstrap-compiler"
-bootstrap_companion_executables="blorp-bootstrap-host blorp-bootstrap-renderer blorp-bootstrap-parser blorp-bootstrap-typecheck"
-bootstrap_artifact_executables="$bootstrap_compiler_executable $bootstrap_companion_executables"
-bootstrap_layout_name="blorp-bootstrap-layout"
-bootstrap_layout_version="isolated-v1"
-bootstrap_artifact_files="$bootstrap_artifact_executables $bootstrap_layout_name"
 
 if [[ ! "$tag" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "Compiler bootstrap tag must be an immutable dev revision: $tag" >&2
@@ -96,7 +87,6 @@ Options:
   --print-id             Print the pinned release id without running blorp
   --print-path           Print the resolved executable path without running blorp
   --print-toolchain-dir  Print the verified complete-toolchain directory
-  --print-compiler-path  Print the immutable compiler used to build Blorp itself
   -h, --help             Show this help
 
 Environment:
@@ -192,12 +182,6 @@ cache_marker_matches() {
 		return 1
 	fi
 
-	if [ "$layout" = "single" ]; then
-		actual_sha=$(sha256_file "$binary")
-		grep -Fxq "binary_sha256=$actual_sha" "$marker"
-		return
-	fi
-
 	for executable in $toolchain_executables; do
 		if [ ! -x "$install_dir/$executable" ]; then
 			return 1
@@ -207,33 +191,6 @@ cache_marker_matches() {
 			return 1
 		fi
 	done
-
-	if grep -q "^file_sha256_${bootstrap_compiler_executable}=" "$marker"; then
-		if [ ! -f "$install_dir/$bootstrap_layout_name" ] ||
-			[ "$(cat "$install_dir/$bootstrap_layout_name")" != "$bootstrap_layout_version" ]
-		then
-			return 1
-		fi
-		for executable in $bootstrap_artifact_executables; do
-			if [ ! -x "$install_dir/$executable" ]; then
-				return 1
-			fi
-			actual_sha=$(sha256_file "$install_dir/$executable")
-			if ! grep -Fxq "file_sha256_${executable}=$actual_sha" "$marker"; then
-				return 1
-			fi
-		done
-		actual_sha=$(sha256_file "$install_dir/$bootstrap_layout_name")
-		if ! grep -Fxq "file_sha256_${bootstrap_layout_name}=$actual_sha" "$marker"; then
-			return 1
-		fi
-	else
-		for artifact in $bootstrap_artifact_files; do
-			if [ -e "$install_dir/$artifact" ]; then
-				return 1
-			fi
-		done
-	fi
 }
 
 install_bootstrap() {
@@ -249,7 +206,7 @@ install_bootstrap() {
 	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
-	trap 'rm -rf "$stage_dir"; for artifact in $toolchain_executables $bootstrap_artifact_files; do rm -f "$install_dir/$artifact.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
+	trap 'rm -rf "$stage_dir"; for artifact in $toolchain_executables; do rm -f "$install_dir/$artifact.tmp.$$"; done; rm -f "$marker.tmp.$$"' EXIT
 
 	archive="$stage_dir/$asset"
 	checksum="$archive.sha256"
@@ -282,48 +239,18 @@ install_bootstrap() {
 	fi
 
 	package_dir=$(dirname "$binary_path")
-	if [ "$layout" = "toolchain" ]; then
-		for executable in $toolchain_executables; do
-			if [ ! -f "$package_dir/$executable" ]; then
-				echo "Downloaded compiler bootstrap archive is missing $executable." >&2
-				exit 1
-			fi
-		done
-		if [ -f "$package_dir/$bootstrap_compiler_executable" ]; then
-			if [ ! -f "$package_dir/$bootstrap_layout_name" ] ||
-				[ "$(cat "$package_dir/$bootstrap_layout_name")" != "$bootstrap_layout_version" ]
-			then
-				echo "Downloaded compiler bootstrap archive contains an unsupported immutable bootstrap layout." >&2
-				exit 1
-			fi
-			for executable in $bootstrap_companion_executables; do
-				if [ ! -f "$package_dir/$executable" ]; then
-					echo "Downloaded compiler bootstrap archive contains an incomplete immutable bootstrap bundle: missing $executable." >&2
-					exit 1
-				fi
-			done
+	for executable in $toolchain_executables; do
+		if [ ! -f "$package_dir/$executable" ]; then
+			echo "Downloaded compiler bootstrap archive is missing $executable." >&2
+			exit 1
 		fi
-	fi
+	done
 
 	mkdir -p "$install_dir"
-	if [ "$layout" = "toolchain" ]; then
-		for executable in $toolchain_executables; do
-			cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
-			chmod 0755 "$install_dir/$executable.tmp.$$"
-		done
-		if [ -f "$package_dir/$bootstrap_compiler_executable" ]; then
-			for executable in $bootstrap_artifact_executables; do
-				cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
-				chmod 0755 "$install_dir/$executable.tmp.$$"
-			done
-			cp "$package_dir/$bootstrap_layout_name" \
-				"$install_dir/$bootstrap_layout_name.tmp.$$"
-			chmod 0644 "$install_dir/$bootstrap_layout_name.tmp.$$"
-		fi
-	else
-		cp "$binary_path" "$binary.tmp.$$"
-		chmod 0755 "$binary.tmp.$$"
-	fi
+	for executable in $toolchain_executables; do
+		cp "$package_dir/$executable" "$install_dir/$executable.tmp.$$"
+		chmod 0755 "$install_dir/$executable.tmp.$$"
+	done
 
 	{
 		echo "repo=$repo"
@@ -332,48 +259,18 @@ install_bootstrap() {
 		echo "layout=$layout"
 		echo "target=$target"
 		echo "archive_sha256=$archive_sha"
-		if [ "$layout" = "toolchain" ]; then
-			for executable in $toolchain_executables; do
-				actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
-				echo "file_sha256_${executable}=$actual_sha"
-			done
-			if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
-				for executable in $bootstrap_artifact_executables; do
-					actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
-					echo "file_sha256_${executable}=$actual_sha"
-				done
-				actual_sha=$(sha256_file "$install_dir/$bootstrap_layout_name.tmp.$$")
-				echo "file_sha256_${bootstrap_layout_name}=$actual_sha"
-			fi
-		else
-			actual_sha=$(sha256_file "$binary.tmp.$$")
-			echo "binary_sha256=$actual_sha"
-		fi
+		for executable in $toolchain_executables; do
+			actual_sha=$(sha256_file "$install_dir/$executable.tmp.$$")
+			echo "file_sha256_${executable}=$actual_sha"
+		done
 	} > "$marker.tmp.$$"
 
-	if [ "$layout" = "toolchain" ]; then
-		for executable in $toolchain_executables; do
-			if [ "$executable" != "blorp" ]; then
-				mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
-			fi
-		done
-		if [ -f "$install_dir/$bootstrap_compiler_executable.tmp.$$" ]; then
-			for executable in $bootstrap_companion_executables; do
-				mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
-			done
-			mv "$install_dir/$bootstrap_layout_name.tmp.$$" \
-				"$install_dir/$bootstrap_layout_name"
-			mv "$install_dir/$bootstrap_compiler_executable.tmp.$$" \
-				"$install_dir/$bootstrap_compiler_executable"
-		else
-			for artifact in $bootstrap_artifact_files; do
-				rm -f "$install_dir/$artifact"
-			done
+	for executable in $toolchain_executables; do
+		if [ "$executable" != "blorp" ]; then
+			mv "$install_dir/$executable.tmp.$$" "$install_dir/$executable"
 		fi
-		mv "$install_dir/blorp.tmp.$$" "$binary"
-	else
-		mv "$binary.tmp.$$" "$binary"
-	fi
+	done
+	mv "$install_dir/blorp.tmp.$$" "$binary"
 	mv "$marker.tmp.$$" "$marker"
 	rm -rf "$stage_dir"
 	trap - EXIT
@@ -400,32 +297,8 @@ resolve_bootstrap_path() {
 resolve_bootstrap_toolchain_dir() {
 	local bootstrap_path
 
-	if [ "$layout" != "toolchain" ]; then
-		echo "Pinned compiler bootstrap $tag does not provide a complete compiler toolchain." >&2
-		exit 1
-	fi
-
 	bootstrap_path=$(resolve_bootstrap_path)
 	dirname "$bootstrap_path"
-}
-
-resolve_bootstrap_compiler_path() {
-	local toolchain_dir dedicated legacy
-
-	toolchain_dir=$(resolve_bootstrap_toolchain_dir)
-	dedicated="$toolchain_dir/$bootstrap_compiler_executable"
-	legacy="$toolchain_dir/blorp-ocaml-host"
-
-	if [ -x "$dedicated" ]; then
-		printf '%s\n' "$dedicated"
-	elif [ -x "$legacy" ]; then
-		# Transition support for immutable toolchains published before the
-		# bootstrap compiler received its own artifact name.
-		printf '%s\n' "$legacy"
-	else
-		echo "Pinned compiler bootstrap does not contain an immutable bootstrap compiler." >&2
-		exit 1
-	fi
 }
 
 case "${1:-}" in
@@ -445,10 +318,6 @@ case "${1:-}" in
 		resolve_bootstrap_toolchain_dir
 		exit 0
 		;;
-	--print-compiler-path)
-		resolve_bootstrap_compiler_path
-		exit 0
-		;;
 	-h | --help)
 		usage
 		exit 0
@@ -457,13 +326,5 @@ esac
 
 bootstrap_path=$(resolve_bootstrap_path)
 cd "$repo_root"
-
-# Compatibility for pinned external bootstraps that still read
-# BLORP_FRONTEND_PARSER. Current compiler sessions do not use this variable for
-# normal source parsing, but older bootstrap binaries must stay on their built-in
-# OCaml parser while compiling bridge helpers in renderer-helper mode.
-if [ "${BLORP_COMPILER_RENDERER_HELPER:-}" = "1" ] && [ -z "${BLORP_FRONTEND_PARSER:-}" ]; then
-	export BLORP_FRONTEND_PARSER=ocaml
-fi
 
 exec "$bootstrap_path" "$@"

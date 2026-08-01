@@ -157,10 +157,10 @@ Backend renderer/Core requests use a compiled
 use `compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
 imports stay separate so the backend helper stays bootstrap-small.
 
-`make install` uses the pinned complete toolchain to build the current public
-compiler and installs the pinned renderer, parser, and typecheck helpers beside
-`./blorp`. This is a one-generation bootstrap boundary: an ordinary build does
-not require the newly built compiler to compile its own backend immediately.
+`make install` invokes the pinned release's public `blorp compile` command to
+build the current public compiler. It also installs the pinned renderer, parser,
+and typecheck workers beside `./blorp` for commands that still delegate to the
+OCaml host. Those workers are not part of compilation itself.
 Installation compares every helper byte-for-byte with the verified release
 copy, so rerunning `make install` repairs missing or corrupted helpers without
 rewriting an unchanged generation.
@@ -196,16 +196,12 @@ release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-`BLORP_BOOTSTRAP_LAYOUT=single` remains supported only for historical
-manifests; every active pin must use `toolchain` so the cached public command
-has all private workers and prepared bridges beside it.
+Every active pin uses the `toolchain` layout so the cached public command has
+the private OCaml host workers beside it for delegated commands.
 
-Fallback helper builds for an explicit custom compiler call the normal
-`compile` command with
-`BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source parsing does not read
-the old `BLORP_FRONTEND_PARSER` selector. The bootstrap resolver sets that
-retired knob only for pinned external bootstrap binaries that still read it, so
-those binaries stay on their built-in parser while compiling bridge helpers.
+Fallback helper builds for an explicit custom compiler call its normal
+`compile` command with `BLORP_COMPILER_RENDERER_HELPER=1`. Normal compiler source
+parsing does not read the retired `BLORP_FRONTEND_PARSER` selector.
 
 Tests use the complete installed compiler toolchain: the current public CLI and
 the pinned prepared helper generation. Compiler-owned Blorp suites exercise
@@ -278,14 +274,10 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` packages the public `./blorp` command, the immutable
-bootstrap compiler bundle, private OCaml workers, and prepared compiler bridges
-into a release archive plus a `.sha256` file. The bootstrap launcher carries
-bootstrap-specific host, parser, typecheck, and renderer executables so it
-cannot accidentally discover the new release's incompatible bridge generation.
-`blorp-bootstrap-layout` explicitly versions that isolated bundle; a dedicated
-compiler without the manifest is rejected because its helper generation cannot
-be established safely:
+`scripts/package-release` packages the public `./blorp` command, the private
+OCaml host, and the current renderer, parser, and typecheck workers into a
+release archive plus a `.sha256` file. The public binary is also the immutable
+compiler used when that release is later pinned as the bootstrap:
 
 ```bash
 scripts/package-release dist
@@ -297,10 +289,6 @@ prepare them before creating the archive.
 Useful environment variables:
 
 - `BLORP_RELEASE_BINARY` selects the binary to package.
-- `BLORP_RELEASE_BOOTSTRAP_COMPILER` selects the immutable compiler used to
-  build the next Blorp executable.
-- `BLORP_RELEASE_BOOTSTRAP_TOOLCHAIN_DIR` selects the directory containing that
-  compiler's matching helpers when it is not beside the compiler.
 - `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
 - `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.
 - `BLORP_RELEASE_PARSER_BRIDGE` selects the prepared parser bridge.
@@ -311,11 +299,9 @@ Useful environment variables:
 The three prepared bridge overrides must be supplied together so one archive
 cannot mix helpers from different compiler generations.
 
-`scripts/install-dev` stores immutable bootstrap bundles in content-addressed
-generation directories under `.blorp-bootstrap/`. It activates one complete
-generation by atomically replacing a small `active` pointer, so an interrupted
-or concurrent upgrade cannot expose a host with only some of its matching
-helpers.
+`scripts/install-dev` verifies the complete five-executable toolchain before
+staging and installing it. Private workers are installed before the public
+binary so a completed installation always exposes one release generation.
 
 On main, CI builds the compiler once with its final dev release metadata,
 prepares the next compiler bridge generation, runs the normal test gates against

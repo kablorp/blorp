@@ -134,10 +134,10 @@ when its runtime reference count is unique; otherwise it constructs a fresh
 record. This changes allocation counts without changing source-level value
 semantics.
 
-The Blorp CLI is built by a separately packaged immutable
-`blorp-bootstrap-compiler`. Its legacy typed-AST/Core-lowering implementation
-is binary trust-root material, not source in the current OCaml host and not a
-runtime fallback. The test runner and REPL invoke the production Blorp
+The Blorp CLI is built by invoking the pinned release's public `blorp compile`
+command. That immutable release binary is build trust-root material, not a
+second bootstrap-only implementation and not a runtime fallback. The test
+runner and REPL invoke the production Blorp
 executable for synthetic source; no direct-source, preloaded-graph, or generated
 in-memory OCaml compilation entrypoint remains.
 

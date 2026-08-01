@@ -87,12 +87,12 @@ compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 $(BLORP_EMBEDDED_STD_SOURCE): compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp && mv $@.tmp $@
 
-# Build the OCaml compiler
+# Build the private OCaml command host.
 build: compiler/lib/embedded_std.ml
 	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
-# for compiler stages that have not yet moved across the boundary.
+# for commands such as purify, package, REPL, and LSP.
 $(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp && mv $@.tmp $@
@@ -100,43 +100,18 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/l
 build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
-	bridge_compiler="$${BLORP_COMPILER_BRIDGE_BIN:-}"; \
-	renderer_bridge="$${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}"; \
-	parser_bridge="$${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}"; \
-	typecheck_bridge="$${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}"; \
-	require_prepared_bridge="$${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}"; \
-	bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-compiler-path); \
-	helper_override_count=0; \
-	for bridge_path in "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
-		if [ -n "$$bridge_path" ]; then helper_override_count=$$((helper_override_count + 1)); fi; \
-	done; \
-	if [ "$$helper_override_count" -ne 0 ] && [ "$$helper_override_count" -ne 3 ]; then \
-		echo "BLORP compiler bridge helper overrides must be provided together." >&2; \
-		exit 1; \
-	fi; \
-	if [ -z "$$bridge_compiler" ]; then \
-		bootstrap_toolchain_dir=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-toolchain-dir); \
-		bridge_compiler="$$bootstrap_toolchain_dir/blorp"; \
-		if [ "$$helper_override_count" -eq 0 ]; then \
-			renderer_bridge="$$bootstrap_toolchain_dir/blorp-compiler-renderer"; \
-			parser_bridge="$$bootstrap_toolchain_dir/blorp-compiler-parser"; \
-			typecheck_bridge="$$bootstrap_toolchain_dir/blorp-compiler-typecheck"; \
-		fi; \
-	fi; \
-	if [ -n "$$renderer_bridge" ] && [ -n "$$parser_bridge" ] && [ -n "$$typecheck_bridge" ]; then \
-		require_prepared_bridge=1; \
+	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
+	if [ -z "$$bootstrap_compiler" ]; then \
+		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
 	source_hash=$$( { \
 		find compiler/blorp/src -name '*.brp' -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
-		for bridge_path in "$$bridge_compiler" "$$renderer_bridge" "$$parser_bridge" "$$typecheck_bridge"; do \
-			if [ -n "$$bridge_path" ]; then printf '%s\n' "$$bridge_path"; fi; \
-		done; \
 	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
 	recipe_hash=$$(sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
-	new_hash=$$(printf '%s\n%s\n%s\n' "$$source_hash" "$$recipe_hash" "$$require_prepared_bridge" | shasum -a 256 | awk '{print $$1}'); \
+	new_hash=$$(printf '%s\n%s\n' "$$source_hash" "$$recipe_hash" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ]; then \
 		echo "Building Blorp CLI"; \
@@ -144,12 +119,7 @@ build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_
 		tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
 		trap 'rm -f "$$tmp_bin" "$$tmp_hash"' EXIT; \
 		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
-		BLORP_COMPILER_BRIDGE_BIN="$$bridge_compiler" \
-			BLORP_COMPILER_RENDERER_BRIDGE_BIN="$$renderer_bridge" \
-			BLORP_COMPILER_PARSER_BRIDGE_BIN="$$parser_bridge" \
-			BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$$typecheck_bridge" \
-			BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE="$$require_prepared_bridge" \
-			"$$bootstrap_compiler" __compiler-host-compile-wrapper -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+		"$$bootstrap_compiler" compile --no-format -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
