@@ -572,6 +572,24 @@ pure func union_variant(
 	}
 
 
+pure func result_union_decl(
+	ok_def_id: Int,
+	err_def_id: Int,
+	ok_type: CoreType,
+	err_type: CoreType,
+) -> CoreDecl:
+	UnionDecl({
+		name = "Result",
+		type_params = [],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [
+			union_variant("Ok", 0, Some(ok_def_id), [union_field(ok_type)]),
+			union_variant("Err", 1, Some(err_def_id), [union_field(err_type)]),
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
 pure func decl_env_program() -> CoreProgram:
 	{
 		decls = [
@@ -586,7 +604,7 @@ pure func decl_env_program() -> CoreProgram:
 				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [
-					union_variant("Leaf", 0, None, []),
+					union_variant("Leaf", 0, Some(41), []),
 					union_variant(
 						"Node",
 						1,
@@ -2218,27 +2236,21 @@ pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 	missing_def_id: Int = 404
 
 	contract_is(
-		lookup_constructor_call_contract(env, "Node", None, 2),
+		lookup_constructor_call_contract(env, "Node", Some(42), 2),
 		[TransferArg, TransferArg],
 		ReturnOwned,
 	) and contract_is(
-		contract_for_call(
+		contract_for_call(env, UserCall("Node", Some(42), []), 2, UnionType("Tree")),
+		[TransferArg, TransferArg],
+		ReturnOwned,
+	) and contract_is_none(
+		lookup_constructor_call_contract(
 			env,
-			UserCall(
-				"WrongNameButSameDefId",
-				Some(42),
-				[],
-			),
+			"Node",
+			Some(missing_def_id),
 			2,
-			UnionType("Tree"),
 		),
-		[TransferArg, TransferArg],
-		ReturnOwned,
-	) and contract_is(
-		lookup_constructor_call_contract(env, "Node", Some(missing_def_id), 2),
-		[TransferArg, TransferArg],
-		ReturnOwned,
-	) and contract_is_none(lookup_constructor_call_contract(env, "Node", None, 3))
+	) and contract_is_none(lookup_constructor_call_contract(env, "Node", None, 2))
 
 
 pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
@@ -2247,36 +2259,66 @@ pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
 
 	(
 		contract_is_none(contract_for_call(env, UserCall("Node", None, []), 1, UnionType("Tree")))
-		and contract_is(
+		and contract_is_none(
 			contract_for_call(
 				env,
 				UserCall("Node", None, []),
 				1,
 				boxed_string_type(),
 			),
-			[TransferArg],
-			ReturnOwned,
 		)
 		and contract_is(
 			contract_for_call(
 				env,
-				UserCall("WrongNameButSameDefId", Some(99), []),
+				UserCall("Node", Some(99), []),
 				1,
 				NamedType("BoxedString", []),
 			),
 			[TransferArg],
 			ReturnOwned,
 		)
-		and contract_is(
+		and contract_is_none(
 			contract_for_call(
 				env,
 				UserCall("Node", Some(missing_def_id), []),
 				2,
 				UnionType("Tree"),
 			),
-			[TransferArg, TransferArg],
-			ReturnOwned,
 		)
+		and contract_is_none(
+			contract_for_call(
+				env,
+				UserCall("WrongNameButSameDefId", Some(99), []),
+				1,
+				NamedType("BoxedString", []),
+			),
+		)
+	)
+
+
+pure func test_stack_result_constructor_contract_requires_exact_identity() -> Bool:
+	result_type: CoreType = StackResultType(int_type(), string_type())
+	env: PerceusEnv = build_env({
+		decls = [result_union_decl(1207, 1208, int_type(), string_type())],
+		foreign_includes = [],
+	})
+
+	contract_is(
+		contract_for_call(
+			env,
+			UserCall("Ok", Some(1207), []),
+			1,
+			result_type,
+		),
+		[TransferArg],
+		ReturnOwned,
+	) and contract_is_none(
+		contract_for_call(
+			env,
+			UserCall("ordinary", Some(1207), []),
+			1,
+			result_type,
+		),
 	)
 
 
@@ -3587,7 +3629,11 @@ pure func test_result_propagation_balances_reserved_consumed_parameter_owner() -
 		),
 	)
 	rewritten: CoreProgram = insert_drops_program({
-		decls = [consume_or_error, decode_key],
+		decls = [
+			result_union_decl(1207, 1208, int_type(), string_type()),
+			consume_or_error,
+			decode_key,
+		],
 		foreign_includes = [],
 	})
 
@@ -4661,6 +4707,186 @@ pure func test_mutable_assignment_releases_old_and_final_owners() -> Bool:
 		and dup_count_for("xs", rewritten) == 0
 		and has_drop_before_assign_for("xs", rewritten)
 	)
+
+
+pure func test_nullary_constructor_binding_is_not_retained() -> Bool:
+	tree_type: CoreType = UnionType("Tree")
+	leaf_constructor: CoreExpr = VarExpr(
+		{
+			name = "Leaf",
+			uniq = 0,
+			def_id = Some(41)
+		},
+		tree_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("value"),
+		False,
+		tree_type,
+		leaf_constructor,
+		var_expr("value", tree_type),
+	)
+	base: CoreProgram = decl_env_program()
+	rewritten: CoreProgram = insert_drops_program({
+		decls = base.decls.append(function_decl("return_leaf", 225, [], tree_type, body)),
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "return_leaf"):
+		Some(rewritten_body):
+			dup_count_for("Leaf", rewritten_body) == 0
+		None:
+			False
+
+
+pure func test_projected_nullary_constructor_binding_is_not_retained() -> Bool:
+	tree_type: CoreType = UnionType("Tree")
+	projected_constructor_name: String = "__def_41_Leaf"
+	leaf_constructor: CoreExpr = VarExpr(
+		{
+			name = projected_constructor_name,
+			uniq = 0,
+			def_id = Some(41)
+		},
+		tree_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("value"),
+		False,
+		tree_type,
+		leaf_constructor,
+		var_expr("value", tree_type),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [UnionDecl({
+				name = "Tree",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					{ union_variant("Leaf", 0, Some(41), []) |
+						c_name = projected_constructor_name
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}), function_decl("return_projected_leaf", 229, [], tree_type, body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "return_projected_leaf"):
+		Some(rewritten_body):
+			dup_count_for(projected_constructor_name, rewritten_body) == 0
+		None:
+			False
+
+
+pure func test_resolved_nonconstructor_with_constructor_name_is_retained() -> Bool:
+	tree_type: CoreType = UnionType("Tree")
+	leaf_constructor: CoreExpr = VarExpr(
+		{
+			name = "Leaf",
+			uniq = 0,
+			def_id = Some(999)
+		},
+		tree_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("value"),
+		False,
+		tree_type,
+		leaf_constructor,
+		var_expr("value", tree_type),
+	)
+	base: CoreProgram = decl_env_program()
+	rewritten: CoreProgram = insert_drops_program({
+		decls = base.decls.append(
+			function_decl(
+				"return_nonconstructor_leaf",
+				226,
+				[],
+				tree_type,
+				body,
+			),
+		),
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "return_nonconstructor_leaf"):
+		Some(rewritten_body):
+			dup_count_for("Leaf", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_resolved_nonconstructor_with_constructor_id_is_retained() -> Bool:
+	tree_type: CoreType = UnionType("Tree")
+	branch_value: CoreExpr = VarExpr(
+		{
+			name = "branch",
+			uniq = 0,
+			def_id = Some(41)
+		},
+		tree_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		named_var("value"),
+		False,
+		tree_type,
+		branch_value,
+		var_expr("value", tree_type),
+	)
+	base: CoreProgram = decl_env_program()
+	rewritten: CoreProgram = insert_drops_program({
+		decls = base.decls.append(
+			function_decl(
+				"return_nonconstructor_branch",
+				228,
+				[],
+				tree_type,
+				body,
+			),
+		),
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "return_nonconstructor_branch"):
+		Some(rewritten_body):
+			dup_count_for("branch", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_shadowed_nullary_constructor_name_is_retained() -> Bool:
+	tree_type: CoreType = UnionType("Tree")
+	body: CoreExpr = LetExpr(
+		named_var("copied"),
+		False,
+		tree_type,
+		var_expr("Leaf", tree_type),
+		var_expr("copied", tree_type),
+	)
+	base: CoreProgram = decl_env_program()
+	rewritten: CoreProgram = insert_drops_program({
+		decls = base.decls.append(
+			function_decl(
+				"copy_shadowed_leaf",
+				227,
+				[core_param("Leaf", tree_type)],
+				tree_type,
+				body,
+			),
+		),
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "copy_shadowed_leaf"):
+		Some(rewritten_body):
+			dup_count_for("Leaf", rewritten_body) == 1
+		None:
+			False
 
 
 pure func test_mutable_alias_assignment_retains_exactly_once() -> Bool:
@@ -9331,7 +9557,7 @@ pure func test_borrowed_match_binding_is_retained_in_stack_result_constructor() 
 		result_type,
 	)
 	program: CoreProgram = insert_drops_program({
-		decls = [UnionDecl({
+		decls = [result_union_decl(62609, 62610, int_type(), payload_type), UnionDecl({
 				name = "WorkError",
 				type_params = [],
 				payload_storage = ErasedUnionPayloadStorage,
@@ -9836,6 +10062,10 @@ tests: TestSuite = {
 			test_constructor_contracts_are_scoped_by_return_type,
 		),
 		(
+			"stack result constructor contract requires exact identity",
+			test_stack_result_constructor_contract_requires_exact_identity,
+		),
+		(
 			"consumed user call contract transfers declared args",
 			test_consumed_user_call_contract_transfers_declared_args,
 		),
@@ -10108,6 +10338,26 @@ tests: TestSuite = {
 		(
 			"mutable assignment releases old and final owners",
 			test_mutable_assignment_releases_old_and_final_owners,
+		),
+		(
+			"nullary constructor binding is not retained",
+			test_nullary_constructor_binding_is_not_retained,
+		),
+		(
+			"projected nullary constructor binding is not retained",
+			test_projected_nullary_constructor_binding_is_not_retained,
+		),
+		(
+			"resolved nonconstructor with constructor name is retained",
+			test_resolved_nonconstructor_with_constructor_name_is_retained,
+		),
+		(
+			"resolved nonconstructor with constructor id is retained",
+			test_resolved_nonconstructor_with_constructor_id_is_retained,
+		),
+		(
+			"shadowed nullary constructor name is retained",
+			test_shadowed_nullary_constructor_name_is_retained,
 		),
 		(
 			"mutable alias assignment retains exactly once",

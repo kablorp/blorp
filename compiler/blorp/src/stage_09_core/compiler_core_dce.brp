@@ -208,10 +208,23 @@ private enum DceFactCollectionMode:
 	CollectValueReferences
 
 
+private record DceConstructorReference {
+	name: String,
+	def_id: Int
+}
+
+
+private record DceConstructorIdentity {
+	parent_type_name: String,
+	def_id: Int
+}
+
+
 record DceFacts {
 	mode: DceFactCollectionMode,
 	function_ids: List[Int],
 	function_names: List[String],
+	constructor_references: List[DceConstructorReference],
 	global_names: List[String],
 	value_reads: List[CoreVar],
 	value_invalidations: List[CoreVar],
@@ -245,6 +258,17 @@ private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
 				facts
 			else:
 				{ facts | function_names = facts.function_names.append(name) }
+		CollectValueReferences:
+			facts
+
+
+private pure func add_constructor_reference(facts: DceFacts, name: String, def_id: Int) -> DceFacts:
+	match facts.mode:
+		CollectReachabilityFacts:
+			{ facts | constructor_references = facts.constructor_references.append({
+					name = name,
+					def_id = def_id,
+				}) }
 		CollectValueReferences:
 			facts
 
@@ -395,7 +419,11 @@ private pure func collect_call_kind(facts: DceFacts, kind: CoreCallKind) -> DceF
 		SelectedDirectCall(def_id):
 			add_function_id(facts, def_id)
 		UserCall(name, Some(def_id), consumed_args):
-			add_function_id(facts, def_id)
+			add_constructor_reference(
+				add_function_id(facts, def_id),
+				name,
+				def_id,
+			)
 		UserCall(name, None, consumed_args):
 			{ facts | fail_closed = True }
 		DictWithCapacityCall(constructor):
@@ -685,6 +713,7 @@ private pure func collect_expr(facts: DceFacts, expr: CoreExpr) -> DceFacts:
 			mode = typed_facts.mode,
 			function_ids = typed_facts.function_ids,
 			function_names = typed_facts.function_names,
+			constructor_references = typed_facts.constructor_references,
 			global_names = typed_facts.global_names,
 			value_reads = typed_facts.value_reads,
 			value_invalidations = typed_facts.value_invalidations,
@@ -1077,6 +1106,7 @@ pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 			mode = CollectValueReferences,
 			function_ids = [],
 			function_names = [],
+			constructor_references = [],
 			global_names = [],
 			value_reads = [],
 			value_invalidations = [],
@@ -1114,6 +1144,7 @@ private pure func function_is_prunable(function_info: CoreFunction) -> Bool:
 record DceReachabilityIndex {
 	functions_by_id: Dict[Int, List[CoreFunction]],
 	function_ids_by_name: Dict[String, List[Int]],
+	constructors_by_name: Dict[String, List[DceConstructorIdentity]],
 	globals_by_name: Dict[String, CoreGlobal],
 	type_decls_by_name: Dict[String, List[CoreDecl]]
 }
@@ -1127,6 +1158,7 @@ private pure func function_facts_for_id(
 		mode = CollectReachabilityFacts,
 		function_ids = [],
 		function_names = [],
+		constructor_references = [],
 		global_names = [],
 		value_reads = [],
 		value_invalidations = [],
@@ -1180,9 +1212,45 @@ private pure func compiler_core_dce_type_decl_name(decl: CoreDecl) -> Option[Str
 			None
 
 
+private pure func add_constructor_identity(
+	constructors_by_name: Dict[String, List[DceConstructorIdentity]],
+	name: String,
+	parent_type_name: String,
+	def_id: Int,
+) -> Dict[String, List[DceConstructorIdentity]]:
+	constructors_by_name.set(
+		name,
+		constructors_by_name
+			.get(name)
+			.get_or([])
+			.append({
+				parent_type_name = parent_type_name,
+				def_id = def_id,
+			}),
+	)
+
+
+private pure func add_type_decl(
+	type_decls_by_name: Dict[String, List[CoreDecl]],
+	decl: CoreDecl,
+) -> Dict[String, List[CoreDecl]]:
+	match compiler_core_dce_type_decl_name(decl):
+		Some(name):
+			type_decls_by_name.set(
+				name,
+				type_decls_by_name
+					.get(name)
+					.get_or([])
+					.append(decl),
+			)
+		None:
+			type_decls_by_name
+
+
 private pure func build_reachability_index(program_value: CoreProgram) -> DceReachabilityIndex:
 	var functions_by_id: Dict[Int, List[CoreFunction]] = {}
 	var function_ids_by_name: Dict[String, List[Int]] = {}
+	var constructors_by_name: Dict[String, List[DceConstructorIdentity]] = {}
 	var globals_by_name: Dict[String, CoreGlobal] = {}
 	var type_decls_by_name: Dict[String, List[CoreDecl]] = {}
 
@@ -1207,22 +1275,41 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 				-- Preserve the original first-declaration lookup behavior.
 				if not globals_by_name.contains(global.name.name):
 					globals_by_name = globals_by_name.set(global.name.name, global)
+			EnumDecl(enum_info):
+				for variant in enum_info.variants:
+					match variant.def_id:
+						Some(def_id):
+							constructors_by_name = add_constructor_identity(
+								constructors_by_name,
+								variant.name,
+								enum_info.name,
+								def_id,
+							)
+						None:
+							void
+
+				type_decls_by_name = add_type_decl(type_decls_by_name, decl)
+			UnionDecl(union_info):
+				for variant in union_info.variants:
+					match variant.def_id:
+						Some(def_id):
+							constructors_by_name = add_constructor_identity(
+								constructors_by_name,
+								variant.name,
+								union_info.name,
+								def_id,
+							)
+						None:
+							void
+
+				type_decls_by_name = add_type_decl(type_decls_by_name, decl)
 			_:
-				match compiler_core_dce_type_decl_name(decl):
-					Some(name):
-						type_decls_by_name = type_decls_by_name.set(
-							name,
-							type_decls_by_name
-								.get(name)
-								.get_or([])
-								.append(decl),
-						)
-					None:
-						void
+				type_decls_by_name = add_type_decl(type_decls_by_name, decl)
 
 	{
 		functions_by_id = functions_by_id,
 		function_ids_by_name = function_ids_by_name,
+		constructors_by_name = constructors_by_name,
 		globals_by_name = globals_by_name,
 		type_decls_by_name = type_decls_by_name
 	}
@@ -1330,6 +1417,21 @@ private pure func apply_reachability_facts(
 					reachable = reachable.append(def_id)
 					reachable_set = Sets.add(reachable_set, def_id)
 
+		for reference in facts.constructor_references:
+			for constructor in (
+				index.constructors_by_name
+					.get(reference.name)
+					.get_or([])
+			):
+				if (
+					constructor.def_id == reference.def_id
+					and not Sets.contains(reachable_type_set, constructor.parent_type_name)
+				):
+					reachable_types = reachable_types.append(constructor.parent_type_name)
+					reachable_type_set = Sets.add(reachable_type_set, constructor.parent_type_name)
+				else:
+					void
+
 		for name in facts.global_names:
 			if (
 				index.globals_by_name.contains(name)
@@ -1398,6 +1500,7 @@ private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoot
 									mode = CollectReachabilityFacts,
 									function_ids = [],
 									function_names = [],
+									constructor_references = [],
 									global_names = [],
 									value_reads = [],
 									value_invalidations = [],
@@ -1446,6 +1549,7 @@ private pure func collect_type_root_facts(
 		mode = CollectReachabilityFacts,
 		function_ids = [],
 		function_names = [],
+		constructor_references = [],
 		global_names = [],
 		value_reads = [],
 		value_invalidations = [],
@@ -1513,6 +1617,7 @@ private pure func close_type_reachability(
 					mode = CollectReachabilityFacts,
 					function_ids = [],
 					function_names = [],
+					constructor_references = [],
 					global_names = [],
 					value_reads = [],
 					value_invalidations = [],

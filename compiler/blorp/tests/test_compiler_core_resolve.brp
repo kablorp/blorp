@@ -394,6 +394,12 @@ pure func resolve_without_imports(input: CoreProgram) -> CoreProgram:
 
 
 pure func call_expr(name: String, callee_type: CoreType, args: List[CoreExpr]) -> CoreExpr:
+	return_type: CoreType = match callee_type:
+		FunctionType(_, _, result_type):
+			result_type
+		_:
+			int_type()
+
 	CallExpr(
 		UnknownCall,
 		VarExpr(
@@ -402,7 +408,7 @@ pure func call_expr(name: String, callee_type: CoreType, args: List[CoreExpr]) -
 			SyntheticSourceLoc,
 		),
 		args,
-		int_type(),
+		return_type,
 		SyntheticSourceLoc,
 	)
 
@@ -416,6 +422,10 @@ pure func int_function_type(param_count: Int) -> CoreType:
 		index += 1
 
 	FunctionType(True, params, int_type())
+
+
+pure func constructor_function_type(params: List[CoreType], parent_type: CoreType) -> CoreType:
+	FunctionType(True, params, parent_type)
 
 
 pure func resolved_call_kind(input: CoreProgram) -> Option[CoreCallKind]:
@@ -2820,7 +2830,12 @@ pure func test_value_reference_does_not_resolve_to_imported_function() -> Bool:
 
 
 pure func test_resolves_constructor_call() -> Bool:
-	call: CoreExpr = call_expr("Box", int_function_type(1), [int_literal(1)])
+	container_type: CoreType = NamedType("Container", [])
+	call: CoreExpr = call_expr(
+		"Box",
+		constructor_function_type([int_type()], container_type),
+		[int_literal(1)],
+	)
 	resolved: CoreProgram = resolve_without_imports(program([
 		function_decl("main", 1, call),
 		payload_union_decl("Container", "Box", 7),
@@ -2829,14 +2844,238 @@ pure func test_resolves_constructor_call() -> Bool:
 	resolved_user_call_is(resolved, "Box", Some(7))
 
 
-pure func test_nullary_constructor_stays_unmangled() -> Bool:
-	call: CoreExpr = call_expr("Empty", int_function_type(0), [])
+pure func test_nullary_constructor_call_keeps_identity() -> Bool:
+	container_type: CoreType = NamedType("Container", [])
+	call: CoreExpr = call_expr(
+		"Empty",
+		constructor_function_type([], container_type),
+		[],
+	)
 	resolved: CoreProgram = resolve_without_imports(program([
 		function_decl("main", 1, call),
 		enum_decl("Container", "Empty", 7),
 	]))
 
-	resolved_user_call_is(resolved, "Empty", None)
+	resolved_user_call_is(resolved, "Empty", Some(7))
+
+
+pure func test_resolves_synthetic_constructor_call_from_result_type() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	call: CoreExpr = CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var("Some", None),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[int_literal(1)],
+		option_type,
+		SyntheticSourceLoc,
+	)
+	resolved: CoreProgram = resolve_callable_id_calls(program([
+		function_decl("main", 1, call),
+		payload_union_decl("Option", "Some", 7),
+	]))
+
+	resolved_user_call_is(resolved, "Some", Some(7))
+
+
+pure func test_resolves_synthetic_constructor_call_from_enum_result_type() -> Bool:
+	container_type: CoreType = EnumType("Container")
+	call: CoreExpr = CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var("Empty", None),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[],
+		container_type,
+		SyntheticSourceLoc,
+	)
+	resolved: CoreProgram = resolve_callable_id_calls(program([
+		function_decl("main", 1, call),
+		enum_decl("Container", "Empty", 7),
+	]))
+
+	resolved_user_call_is(resolved, "Empty", Some(7))
+
+
+pure func test_resolves_synthetic_constructor_call_from_union_result_type() -> Bool:
+	container_type: CoreType = UnionType("Container")
+	call: CoreExpr = CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var("Box", None),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[int_literal(1)],
+		container_type,
+		SyntheticSourceLoc,
+	)
+	resolved: CoreProgram = resolve_callable_id_calls(program([
+		function_decl("main", 1, call),
+		payload_union_decl("Container", "Box", 7),
+	]))
+
+	resolved_user_call_is(resolved, "Box", Some(7))
+
+
+pure func call_has_definition(expr: CoreExpr, definition_id: Int) -> Bool:
+	match expr:
+		CallExpr(UserCall(_, def_id, _), _, _, _, _):
+			def_id == Some(definition_id)
+		_:
+			False
+
+
+pure func same_named_constructors_resolve(first_decl: CoreDecl, second_decl: CoreDecl) -> Bool:
+	first_type: CoreType = NamedType("First", [])
+	second_type: CoreType = NamedType("Second", [])
+	resolved: CoreProgram = resolve_without_imports(program([
+		function_decl(
+			"first_value",
+			1,
+			VarExpr(
+				core_var("Empty", None),
+				first_type,
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl(
+			"second_value",
+			2,
+			VarExpr(
+				core_var("Empty", None),
+				second_type,
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl(
+			"first_call",
+			3,
+			call_expr(
+				"Empty",
+				constructor_function_type([], first_type),
+				[],
+			),
+		),
+		function_decl(
+			"second_call",
+			4,
+			call_expr(
+				"Empty",
+				constructor_function_type([], second_type),
+				[],
+			),
+		),
+		first_decl,
+		second_decl,
+	]))
+
+	match (
+		function_body(resolved, "first_value"),
+		function_body(resolved, "second_value"),
+		function_body(resolved, "first_call"),
+		function_body(resolved, "second_call"),
+	):
+		(Some(first_value), Some(second_value), Some(first_call), Some(second_call)):
+			(
+				var_has_definition(first_value, 7)
+				and var_has_definition(second_value, 8)
+				and call_has_definition(first_call, 7)
+				and call_has_definition(second_call, 8)
+			)
+		_:
+			False
+
+
+pure func test_same_named_constructors_resolve_by_type_in_declaration_order() -> Bool:
+	same_named_constructors_resolve(
+		enum_decl("First", "Empty", 7),
+		enum_decl("Second", "Empty", 8),
+	)
+
+
+pure func test_same_named_constructors_resolve_by_type_in_reverse_order() -> Bool:
+	same_named_constructors_resolve(
+		enum_decl("Second", "Empty", 8),
+		enum_decl("First", "Empty", 7),
+	)
+
+
+pure func test_resolves_bare_nullary_constructor_value() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	resolved: CoreProgram = resolve_without_imports(program([
+		function_decl(
+			"main",
+			1,
+			VarExpr(
+				core_var("None", None),
+				option_type,
+				SyntheticSourceLoc,
+			),
+		),
+		enum_decl("Option", "None", 2),
+	]))
+
+	match main_body(resolved):
+		Some(VarExpr(variable, typ, _)):
+			variable.name == "None" and variable.def_id == Some(2) and typ == option_type
+		_:
+			False
+
+
+pure func test_canonicalizes_preassembly_constructor_identity() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	resolved: CoreProgram = resolve_without_imports(program([
+		function_decl(
+			"main",
+			1,
+			VarExpr(
+				core_var("None", Some(999)),
+				option_type,
+				SyntheticSourceLoc,
+			),
+		),
+		enum_decl("Option", "None", 2),
+	]))
+
+	match main_body(resolved):
+		Some(VarExpr(variable, typ, _)):
+			variable.name == "None" and variable.def_id == Some(2) and typ == option_type
+		_:
+			False
+
+
+pure func test_lexical_binding_shadows_nullary_constructor_value() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	resolved: CoreProgram = resolve_without_imports(program([
+		function_decl_with_params(
+			"main",
+			1,
+			[
+				{
+					name = core_var("None", Some(999)),
+					typ = option_type,
+					loc = SyntheticSourceLoc
+				},
+			],
+			VarExpr(
+				core_var("None", Some(999)),
+				option_type,
+				SyntheticSourceLoc,
+			),
+		),
+		enum_decl("Option", "None", 2),
+	]))
+
+	match main_body(resolved):
+		Some(VarExpr(variable, typ, _)):
+			variable.name == "None" and variable.def_id == Some(999) and typ == option_type
+		_:
+			False
 
 
 pure func test_preserves_unresolved_imported_function_call() -> Bool:
@@ -2940,7 +3179,7 @@ pure func test_rewrites_qualified_nullary_constructor_value() -> Bool:
 
 	match main_body(resolved):
 		Some(VarExpr(variable, typ, _)):
-			variable.name == "None" and variable.def_id.is_none() and typ == option_type
+			variable.name == "None" and variable.def_id == Some(2) and typ == option_type
 		_:
 			False
 
@@ -3088,7 +3327,36 @@ tests: TestSuite = {
 			test_value_reference_does_not_resolve_to_imported_function,
 		),
 		("resolves constructor call", test_resolves_constructor_call),
-		("nullary constructor stays unmangled", test_nullary_constructor_stays_unmangled),
+		("nullary constructor call keeps identity", test_nullary_constructor_call_keeps_identity),
+		(
+			"resolves synthetic constructor call from result type",
+			test_resolves_synthetic_constructor_call_from_result_type,
+		),
+		(
+			"resolves synthetic constructor call from enum result type",
+			test_resolves_synthetic_constructor_call_from_enum_result_type,
+		),
+		(
+			"resolves synthetic constructor call from union result type",
+			test_resolves_synthetic_constructor_call_from_union_result_type,
+		),
+		(
+			"same-named constructors resolve by type in declaration order",
+			test_same_named_constructors_resolve_by_type_in_declaration_order,
+		),
+		(
+			"same-named constructors resolve by type in reverse order",
+			test_same_named_constructors_resolve_by_type_in_reverse_order,
+		),
+		("resolves bare nullary constructor value", test_resolves_bare_nullary_constructor_value),
+		(
+			"canonicalizes preassembly constructor identity",
+			test_canonicalizes_preassembly_constructor_identity,
+		),
+		(
+			"lexical binding shadows nullary constructor value",
+			test_lexical_binding_shadows_nullary_constructor_value,
+		),
 		(
 			"preserves unresolved imported function call",
 			test_preserves_unresolved_imported_function_call,

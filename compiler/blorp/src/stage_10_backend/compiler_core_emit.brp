@@ -414,7 +414,6 @@ import:
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreVar,
-	../stage_09_core/compiler_core_match_projection: project_backend_matches
 	../stage_09_core/compiler_core_ownership:
 		OwnershipCallContract,
 		OwnershipResultMode(ReturnOwned),
@@ -4133,7 +4132,7 @@ private pure func boxed_fill_value_expr(
 	source_type: CoreType,
 	raw_value: String,
 ) -> Option[String]:
-	boxed_pointer_value_from_c(kind, source_type, raw_value)
+	boxed_pointer_value_from_c(kind, source_type, raw_value, False)
 
 
 private pure func emit_boxed_vector_fill_call(box: CoreBoxOp, size: CoreExpr) -> Option[String]:
@@ -6574,6 +6573,7 @@ private pure func boxed_pointer_value_from_c(
 	kind: CoreBoxKind,
 	source_type: CoreType,
 	value_c: String,
+	source_already_retained: Bool,
 ) -> Option[String]:
 	match kind:
 		PrimBox:
@@ -6594,7 +6594,7 @@ private pure func boxed_pointer_value_from_c(
 			Some("blorp_box_uint128(" + value_c + ")")
 		StructBox(c_type):
 			if is_stack_result_type(source_type):
-				Some("blorp_box_stack_result(blorp_stack_result_retain_value(" + value_c + "))")
+				Some(emit_stack_result_box(value_c, source_already_retained))
 			else:
 				Some(
 					"({ " + c_type + " __box_struct_value = " + value_c + "; blorp_box_struct(&__box_struct_value, sizeof(" + c_type + ")); })",
@@ -6603,7 +6603,33 @@ private pure func boxed_pointer_value_from_c(
 
 private pure func emit_boxed_pointer_value(value: CoreBoxedStorageValue) -> Option[String]:
 	value_c ?= emit_simple_expr(value.value)
-	boxed_pointer_value_from_c(value.kind, core_expr_type(value.value), value_c)
+	boxed_pointer_value_from_c(
+		value.kind,
+		core_expr_type(value.value),
+		value_c,
+		expr_retains_stack_result(value.value),
+	)
+
+
+private pure func expr_retains_stack_result(expr: CoreExpr) -> Bool:
+	match expr:
+		DupExpr(variable, value_type, StackResultRetainPolicy, body, typ, loc):
+			match body:
+				VarExpr(returned, return_type, return_loc):
+					core_vars_equal(variable, returned)
+				_:
+					False
+		_:
+			False
+
+
+private pure func emit_stack_result_box(value_c: String, source_already_retained: Bool) -> String:
+	retained_value: String = if source_already_retained:
+		value_c
+	else:
+		"blorp_stack_result_retain_value(" + value_c + ")"
+
+	"blorp_box_stack_result(" + retained_value + ")"
 
 
 private pure func emit_boxed_pointer_body(
@@ -6687,7 +6713,10 @@ private pure func emit_boxed_pointer_body(
 						value_c ?= required_body_value(value_body)
 
 						value_expr: String = if is_stack_result_type(core_expr_type(value.value)):
-							"blorp_box_stack_result(blorp_stack_result_retain_value(" + value_c + "))"
+							emit_stack_result_box(
+								value_c,
+								expr_retains_stack_result(value.value),
+							)
 						else:
 							"({ " + c_type + " __box_struct_value = " + value_c + "; blorp_box_struct(&__box_struct_value, sizeof(" + c_type + ")); })"
 
@@ -9949,7 +9978,12 @@ private pure func emit_box_expr(box: CoreBoxOp) -> Option[String]:
 			Some("(void*)" + value_c)
 		StructBox(c_type):
 			if is_stack_result_type(box.source_type):
-				Some("blorp_box_stack_result(blorp_stack_result_retain_value(" + value_c + "))")
+				Some(
+					emit_stack_result_box(
+						value_c,
+						expr_retains_stack_result(box.value),
+					),
+				)
 			else:
 				Some(
 					"({ " + c_type + " __box = " + value_c + "; blorp_box_struct(&__box, sizeof(" + c_type + ")); })",
@@ -23015,11 +23049,10 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 ) -> Result[CArtifact, CoreEmitError]:
 	match prepared:
 		PreparedCore(program):
-			projected: CoreProgram = project_backend_matches(program)
-			decls_c ?= emit_decls(projected, profile_enabled)
+			decls_c ?= emit_decls(program, profile_enabled)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
-					projected.foreign_includes,
+					program.foreign_includes,
 				) + decls_c,
 				link_flags = [],
 				include_dirs = [],

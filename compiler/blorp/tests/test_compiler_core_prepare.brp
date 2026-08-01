@@ -69,6 +69,7 @@ import:
 			StackResultType,
 			TensorType,
 			TupleType,
+			TypeParameterType,
 			UnionType,
 			ValueRecordType,
 			VoidType,
@@ -468,9 +469,94 @@ pure func choice_union_decl() -> CoreUnionDecl:
 	}
 
 
+pure func option_union_decl() -> CoreUnionDecl:
+	{
+		name = "Option",
+		type_params = ["T"],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [
+			{
+				name = "Some",
+				c_name = "__def_42259_Some",
+				tag_c_name = "TAG_Option_Some",
+				tag = 0,
+				fields = [no_release_union_field(TypeParameterType("T"))],
+				def_id = Some(42259)
+			},
+			{
+				name = "None",
+				c_name = "__def_42260_None",
+				tag_c_name = "TAG_Option_None",
+				tag = 1,
+				fields = [],
+				def_id = Some(42260)
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func result_union_decl() -> CoreUnionDecl:
+	{
+		name = "Result",
+		type_params = ["T", "E"],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [
+			{
+				name = "Ok",
+				c_name = "__def_42261_Ok",
+				tag_c_name = "TAG_Result_Ok",
+				tag = 0,
+				fields = [no_release_union_field(TypeParameterType("T"))],
+				def_id = Some(42261)
+			},
+			{
+				name = "Err",
+				c_name = "__def_42262_Err",
+				tag_c_name = "TAG_Result_Err",
+				tag = 1,
+				fields = [no_release_union_field(TypeParameterType("E"))],
+				def_id = Some(42262)
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func program_with_body(body: CoreExpr, return_type: CoreType) -> CoreProgram:
 	{
 		decls = [FunctionDecl(identity_function(body, return_type))],
+		foreign_includes = []
+	}
+
+
+pure func program_with_option_body(body: CoreExpr, return_type: CoreType) -> CoreProgram:
+	{
+		decls = [
+			UnionDecl(option_union_decl()),
+			FunctionDecl(identity_function(body, return_type)),
+		],
+		foreign_includes = []
+	}
+
+
+pure func program_with_result_body(body: CoreExpr, return_type: CoreType) -> CoreProgram:
+	{
+		decls = [
+			UnionDecl(result_union_decl()),
+			FunctionDecl(identity_function(body, return_type)),
+		],
+		foreign_includes = []
+	}
+
+
+pure func program_with_option_and_choice_body(body: CoreExpr, return_type: CoreType) -> CoreProgram:
+	{
+		decls = [
+			UnionDecl(option_union_decl()),
+			UnionDecl(choice_union_decl()),
+			FunctionDecl(identity_function(body, return_type)),
+		],
 		foreign_includes = []
 	}
 
@@ -497,6 +583,51 @@ pure func program_with_choice_body(body: CoreExpr) -> CoreProgram:
 
 pure func programs_equal(left: CoreProgram, right: CoreProgram) -> Bool:
 	core_program_to_json(left).to_string() == core_program_to_json(right).to_string()
+
+
+pure func prepared_constructor_name(program: CoreProgram) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in prepare_program(program).decls:
+		match decl:
+			FunctionDecl(function_info):
+				match function_info.body:
+					Some(UnionConstructExpr(construct, _, _)):
+						result = Some(construct.constructor_name)
+						break
+					_:
+						void
+			_:
+				void
+
+	result
+
+
+pure func constructor_alias_call(
+	name: String,
+	def_id: Int,
+	arg: CoreExpr,
+	typ: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UserCall(
+			name,
+			Some(def_id),
+			[],
+		),
+		VarExpr(
+			{
+				name = name,
+				uniq = 0,
+				def_id = Some(def_id)
+			},
+			typ,
+			SyntheticSourceLoc,
+		),
+		[arg],
+		typ,
+		SyntheticSourceLoc,
+	)
 
 
 pure func int_literal(value: Int) -> CoreExpr:
@@ -723,7 +854,222 @@ pure func prepared_nullable_option_string_some(value: String) -> CoreExpr:
 
 
 pure func option_string_none() -> CoreExpr:
-	VarExpr(named_var("None"), option_string_type(), SyntheticSourceLoc)
+	VarExpr(
+		{
+			name = "None",
+			uniq = 0,
+			def_id = Some(42260)
+		},
+		option_string_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_prepare_preserves_resolved_nonconstructor_named_none() -> Bool:
+	source: CoreProgram = program_with_option_body(
+		VarExpr(
+			{
+				name = "None",
+				uniq = 0,
+				def_id = Some(999)
+			},
+			option_string_type(),
+			SyntheticSourceLoc,
+		),
+		option_string_type(),
+	)
+	programs_equal(prepare_program(source), source)
+
+
+pure func test_prepare_preserves_option_call_with_wrong_definition() -> Bool:
+	call: CoreExpr = CallExpr(
+		UserCall(
+			"Some",
+			Some(999),
+			[],
+		),
+		VarExpr(
+			{
+				name = "Some",
+				uniq = 0,
+				def_id = Some(999)
+			},
+			option_int_type(),
+			SyntheticSourceLoc,
+		),
+		[int_literal(7)],
+		option_int_type(),
+		SyntheticSourceLoc,
+	)
+	source: CoreProgram = program_with_option_body(call, option_int_type())
+	programs_equal(prepare_program(source), source)
+
+
+pure func test_prepare_preserves_result_calls_with_wrong_definition() -> Bool:
+	stack_call: CoreExpr = CallExpr(
+		UserCall(
+			"Ok",
+			Some(999),
+			[],
+		),
+		VarExpr(
+			{
+				name = "Ok",
+				uniq = 0,
+				def_id = Some(999)
+			},
+			result_int_string_type(),
+			SyntheticSourceLoc,
+		),
+		[int_literal(7)],
+		result_int_string_type(),
+		SyntheticSourceLoc,
+	)
+	boxed_call: CoreExpr = CallExpr(
+		UserCall(
+			"Ok",
+			Some(999),
+			[],
+		),
+		VarExpr(
+			{
+				name = "Ok",
+				uniq = 0,
+				def_id = Some(999)
+			},
+			boxed_result_int_string_type(),
+			SyntheticSourceLoc,
+		),
+		[int_literal(7)],
+		boxed_result_int_string_type(),
+		SyntheticSourceLoc,
+	)
+	stack_source: CoreProgram = program_with_result_body(stack_call, result_int_string_type())
+	boxed_source: CoreProgram = program_with_result_body(boxed_call, boxed_result_int_string_type())
+
+	(
+		programs_equal(prepare_program(stack_source), stack_source)
+		and programs_equal(prepare_program(boxed_source), boxed_source)
+	)
+
+
+pure func test_prepare_converts_result_builtins_without_source_decl() -> Bool:
+	stack_type: CoreType = stack_result_int_string_type()
+	boxed_type: CoreType = boxed_result_int_string_type()
+	stack_source: CoreProgram = program_with_body(
+		CallExpr(
+			BuiltinCall("blorp_result_err"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[string_literal("stack")],
+			stack_type,
+			SyntheticSourceLoc,
+		),
+		stack_type,
+	)
+	boxed_source: CoreProgram = program_with_body(
+		CallExpr(
+			BuiltinCall("blorp_result_err"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[string_literal("boxed")],
+			boxed_type,
+			SyntheticSourceLoc,
+		),
+		boxed_type,
+	)
+
+	stack_prepared: Bool = match prepare_program(stack_source).decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(UnionConstructExpr(construct, _, _)):
+					construct.constructor_name == "Err"
+				_:
+					False
+		_:
+			False
+
+	boxed_prepared: Bool = match prepare_program(boxed_source).decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(UnionConstructExpr(construct, _, _)):
+					construct.constructor_name == "Err"
+				_:
+					False
+		_:
+			False
+
+	stack_prepared and boxed_prepared
+
+
+pure func test_prepare_preserves_union_call_with_wrong_definition() -> Bool:
+	call: CoreExpr = CallExpr(
+		UserCall(
+			"Picked",
+			Some(999),
+			[],
+		),
+		VarExpr(
+			{
+				name = "Picked",
+				uniq = 0,
+				def_id = Some(999)
+			},
+			choice_type(),
+			SyntheticSourceLoc,
+		),
+		[int_literal(7)],
+		choice_type(),
+		SyntheticSourceLoc,
+	)
+	source: CoreProgram = program_with_choice_body(call)
+	programs_equal(prepare_program(source), source)
+
+
+pure func test_prepare_canonicalizes_constructor_c_name_aliases() -> Bool:
+	option_name: String = prepared_constructor_name(
+		program_with_option_body(
+			constructor_alias_call("__def_42259_Some", 42259, int_literal(7), option_int_type()),
+			option_int_type(),
+		),
+	).get_or("")
+	stack_result_name: String = prepared_constructor_name(
+		program_with_result_body(
+			constructor_alias_call(
+				"__def_42261_Ok",
+				42261,
+				int_literal(7),
+				result_int_string_type(),
+			),
+			result_int_string_type(),
+		),
+	).get_or("")
+	boxed_result_name: String = prepared_constructor_name(
+		program_with_result_body(
+			constructor_alias_call(
+				"__def_42261_Ok",
+				42261,
+				int_literal(7),
+				boxed_result_int_string_type(),
+			),
+			boxed_result_int_string_type(),
+		),
+	).get_or("")
+	union_name: String = prepared_constructor_name(
+		program_with_choice_body(
+			constructor_alias_call(
+				"__def_44_Picked",
+				44,
+				int_literal(7),
+				choice_type(),
+			),
+		),
+	).get_or("")
+
+	(
+		option_name == "Some"
+		and stack_result_name == "Ok"
+		and boxed_result_name == "Ok"
+		and union_name == "Picked"
+	)
 
 
 pure func prepared_nullable_option_string_none() -> CoreExpr:
@@ -1057,14 +1403,14 @@ pure func stack_option_some_call() -> CoreExpr:
 	CallExpr(
 		UserCall(
 			"Some",
-			None,
+			Some(42259),
 			[],
 		),
 		VarExpr(
 			{
 				name = "Some",
 				uniq = 0,
-				def_id = None
+				def_id = Some(42259)
 			},
 			option_int_type(),
 			SyntheticSourceLoc,
@@ -1081,14 +1427,14 @@ pure func nullable_option_choice_some_call() -> CoreExpr:
 	CallExpr(
 		UserCall(
 			"Some",
-			None,
+			Some(42259),
 			[],
 		),
 		VarExpr(
 			{
 				name = "Some",
 				uniq = 0,
-				def_id = None
+				def_id = Some(42259)
 			},
 			option_choice_type(),
 			SyntheticSourceLoc,
@@ -1148,14 +1494,14 @@ pure func erased_stack_option_some_call() -> CoreExpr:
 	CallExpr(
 		UserCall(
 			"Some",
-			None,
+			Some(42259),
 			[],
 		),
 		VarExpr(
 			{
 				name = "Some",
 				uniq = 0,
-				def_id = None
+				def_id = Some(42259)
 			},
 			option_int_type(),
 			SyntheticSourceLoc,
@@ -1296,14 +1642,14 @@ pure func stack_result_ok_call() -> CoreExpr:
 	CallExpr(
 		UserCall(
 			"Ok",
-			None,
+			Some(42261),
 			[],
 		),
 		VarExpr(
 			{
 				name = "Ok",
 				uniq = 0,
-				def_id = None
+				def_id = Some(42261)
 			},
 			result_int_string_type(),
 			SyntheticSourceLoc,
@@ -1339,14 +1685,14 @@ pure func boxed_result_ok_call() -> CoreExpr:
 	CallExpr(
 		UserCall(
 			"Ok",
-			None,
+			Some(42261),
 			[],
 		),
 		VarExpr(
 			{
 				name = "Ok",
 				uniq = 0,
-				def_id = None
+				def_id = Some(42261)
 			},
 			boxed_result_int_string_type(),
 			SyntheticSourceLoc,
@@ -1603,12 +1949,12 @@ pure func test_prepare_converts_test_suite_pair_tuple_literal() -> Bool:
 
 pure func test_prepare_converts_nullable_option_tuple_literal() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_body(
 			option_string_pair_tuple_literal(),
 			option_string_pair_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(
+	expected: CoreProgram = program_with_option_body(
 		prepared_option_string_pair_tuple_literal(),
 		option_string_pair_type(),
 	)
@@ -1743,24 +2089,30 @@ pure func test_prepare_converts_union_constructor_call() -> Bool:
 
 pure func test_prepare_converts_stack_option_some_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_body(
 			stack_option_some_call(),
 			option_int_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(prepared_stack_option_some(), option_int_type())
+	expected: CoreProgram = program_with_option_body(
+		prepared_stack_option_some(),
+		option_int_type(),
+	)
 
 	programs_equal(actual, expected)
 
 
 pure func test_prepare_removes_erased_stack_option_payload_cast() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_body(
 			erased_stack_option_some_call(),
 			option_int_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(prepared_stack_option_some(), option_int_type())
+	expected: CoreProgram = program_with_option_body(
+		prepared_stack_option_some(),
+		option_int_type(),
+	)
 
 	programs_equal(actual, expected)
 
@@ -1795,12 +2147,12 @@ pure func test_prepare_boxes_stack_result_tuple_element() -> Bool:
 
 pure func test_prepare_converts_nullable_option_union_some_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_and_choice_body(
 			nullable_option_choice_some_call(),
 			option_choice_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(
+	expected: CoreProgram = program_with_option_and_choice_body(
 		prepared_nullable_option_choice_some(),
 		option_choice_type(),
 	)
@@ -1810,12 +2162,12 @@ pure func test_prepare_converts_nullable_option_union_some_call() -> Bool:
 
 pure func test_prepare_boxes_nested_nullable_option_some_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_body(
 			nested_nullable_option_some_none_call(),
 			option_option_string_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(
+	expected: CoreProgram = program_with_option_body(
 		prepared_nested_nullable_option_some_none(),
 		option_option_string_type(),
 	)
@@ -1825,12 +2177,12 @@ pure func test_prepare_boxes_nested_nullable_option_some_call() -> Bool:
 
 pure func test_prepare_converts_boxed_option_stack_result_some_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_option_body(
 			boxed_option_stack_result_some_call(),
 			option_stack_result_int_string_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(
+	expected: CoreProgram = program_with_option_body(
 		prepared_boxed_option_stack_result_some(),
 		option_stack_result_int_string_type(),
 	)
@@ -1840,24 +2192,27 @@ pure func test_prepare_converts_boxed_option_stack_result_some_call() -> Bool:
 
 pure func test_prepare_converts_stack_result_ok_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_result_body(
 			stack_result_ok_call(),
 			result_int_string_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(prepared_stack_result_ok(), result_int_string_type())
+	expected: CoreProgram = program_with_result_body(
+		prepared_stack_result_ok(),
+		result_int_string_type(),
+	)
 
 	programs_equal(actual, expected)
 
 
 pure func test_prepare_converts_boxed_result_ok_call() -> Bool:
 	actual: CoreProgram = prepare_program(
-		program_with_body(
+		program_with_result_body(
 			boxed_result_ok_call(),
 			boxed_result_int_string_type(),
 		),
 	)
-	expected: CoreProgram = program_with_body(
+	expected: CoreProgram = program_with_result_body(
 		prepared_boxed_result_ok(),
 		boxed_result_int_string_type(),
 	)
@@ -1988,10 +2343,10 @@ pure func test_prepare_boxes_pointer_stack_result_list_after_ownership() -> Bool
 		list_type,
 		SyntheticSourceLoc,
 	)
-	actual: CoreProgram = prepare_program(program_with_body(body, list_type))
+	actual: CoreProgram = prepare_program(program_with_result_body(body, list_type))
 
 	match actual.decls:
-		[FunctionDecl(function_info)]:
+		[UnionDecl(_), FunctionDecl(function_info)]:
 			match function_info.body:
 				Some(ListConstructExpr(construct, _, _)):
 					match construct.elements:
@@ -2119,6 +2474,30 @@ tests: TestSuite = {
 		("prepare recurses into call arguments", test_prepare_recurses_into_call_arguments),
 		("prepare converts union constructor call", test_prepare_converts_union_constructor_call),
 		("prepare converts stack Option Some call", test_prepare_converts_stack_option_some_call),
+		(
+			"prepare preserves resolved nonconstructor named None",
+			test_prepare_preserves_resolved_nonconstructor_named_none,
+		),
+		(
+			"prepare preserves Option call with wrong definition",
+			test_prepare_preserves_option_call_with_wrong_definition,
+		),
+		(
+			"prepare preserves Result calls with wrong definition",
+			test_prepare_preserves_result_calls_with_wrong_definition,
+		),
+		(
+			"prepare converts Result builtins without source declaration",
+			test_prepare_converts_result_builtins_without_source_decl,
+		),
+		(
+			"prepare preserves union call with wrong definition",
+			test_prepare_preserves_union_call_with_wrong_definition,
+		),
+		(
+			"prepare canonicalizes constructor C name aliases",
+			test_prepare_canonicalizes_constructor_c_name_aliases,
+		),
 		(
 			"prepare removes erased stack Option payload cast",
 			test_prepare_removes_erased_stack_option_payload_cast,

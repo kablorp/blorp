@@ -5,7 +5,7 @@ set -u
 
 cd "$(dirname "$0")/.."
 
-expected_core_sanitize_root_count=54
+expected_core_sanitize_root_count=55
 actual_core_sanitize_root_count=$(awk 'NF { count += 1 } END { print count + 0 }' \
 	scripts/compiler-core-sanitize-roots.txt)
 if [ "$actual_core_sanitize_root_count" -ne "$expected_core_sanitize_root_count" ]; then
@@ -30,6 +30,7 @@ done < scripts/compiler-core-sanitize-roots.txt
 
 required_core_sanitize_roots=(
 	compiler/blorp/tests/test_compiler_core_c_type_layout.brp
+	compiler/blorp/tests/test_compiler_core_closure_identity.brp
 	compiler/blorp/tests/test_compiler_core_early_invariants.brp
 	compiler/blorp/tests/test_compiler_core_fairness.brp
 	compiler/blorp/tests/test_compiler_core_late_invariants.brp

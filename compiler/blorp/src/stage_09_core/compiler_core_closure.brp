@@ -55,6 +55,7 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
+		CoreDefinitionIdentity,
 		CoreDictEntry,
 		CoreDictLiteralEntry,
 		CoreEnumDecl,
@@ -283,8 +284,8 @@ record ClosureState {
 	current_module: Option[String],
 	functions_by_id: Dict[Int, List[CoreFunction]],
 	functions_by_name: Dict[String, List[CoreFunction]],
-	function_names: List[String],
-	constructor_names: List[String],
+	function_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity],
 	hoisted: List[CoreDecl]
 }
 
@@ -586,6 +587,32 @@ private pure func closure_captures_from_task_captures(
 
 private pure func contains_name(names: List[String], name: String) -> Bool:
 	names.contains(name)
+
+
+private pure func definition_identity_exists(
+	definitions: List[CoreDefinitionIdentity],
+	name: String,
+	def_id: Int,
+) -> Bool:
+	var found: Bool = False
+
+	for definition in definitions:
+		if definition.name == name and definition.def_id == def_id:
+			found = True
+			break
+
+	found
+
+
+private pure func variable_references_definition(
+	variable: CoreVar,
+	definitions: List[CoreDefinitionIdentity],
+) -> Bool:
+	match variable.def_id:
+		Some(def_id):
+			definition_identity_exists(definitions, variable.name, def_id)
+		None:
+			False
 
 
 private pure func copy_names(names: List[String]) -> List[String]:
@@ -1653,9 +1680,9 @@ private pure func free_vars_expr(
 		VarExpr(variable, typ, loc):
 			if contains_name(bound, variable.name):
 				[]
-			else if contains_name(state.constructor_names, variable.name):
+			else if variable_references_definition(variable, state.constructor_definitions):
 				[]
-			else if contains_name(state.function_names, variable.name):
+			else if variable_references_definition(variable, state.function_definitions):
 				[]
 			else:
 				free_var: FreeVar = {
@@ -2263,37 +2290,22 @@ private pure func next_task_name(state: ClosureState) -> FreshHoistedName:
 	}
 
 
-private pure func capture_is_allowed(
-	state: ClosureState,
-	capturable: List[String],
-	name: String,
-) -> Bool:
-	(
-		not contains_name(state.constructor_names, name)
-		and not contains_name(state.function_names, name)
-	)
-
-
 private pure func captures_from_body(
 	state: ClosureState,
-	capturable: List[String],
 	local_bound: List[String],
 	body: CoreExpr,
 ) -> List[FreeVar]:
 	var result: List[FreeVar] = []
 
 	for free_var in free_vars_expr(state, local_bound, body):
-		if capture_is_allowed(state, capturable, free_var.name):
-			result = add_free_var(result, free_var.name, free_var.typ)
-		else:
-			void
+		result = add_free_var(result, free_var.name, free_var.typ)
 
 	result
 
 
 pure func lambda_runtime_captures(
-	function_names: List[String],
-	constructor_names: List[String],
+	function_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity],
 	params: List[CoreParam],
 	body: CoreExpr,
 ) -> List[CoreClosureCapture]:
@@ -2306,28 +2318,26 @@ pure func lambda_runtime_captures(
 		current_module = None,
 		functions_by_id = {},
 		functions_by_name = {},
-		function_names = function_names,
-		constructor_names = constructor_names,
+		function_definitions = function_definitions,
+		constructor_definitions = constructor_definitions,
 		hoisted = []
 	}
 
-	closure_captures_from_free_vars(
-		captures_from_body(
-			state,
-			[],
-			add_bound_params([], params),
-			body,
-		),
-	)
+	closure_captures_from_free_vars(captures_from_body(state, add_bound_params([], params), body))
 
 
 pure func lambda_has_runtime_captures(
-	function_names: List[String],
-	constructor_names: List[String],
+	function_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity],
 	params: List[CoreParam],
 	body: CoreExpr,
 ) -> Bool:
-	lambda_runtime_captures(function_names, constructor_names, params, body).length() > 0
+	lambda_runtime_captures(
+		function_definitions,
+		constructor_definitions,
+		params,
+		body,
+	).length() > 0
 
 
 private pure func core_sequence_type(expr: CoreExpr) -> CoreType:
@@ -3776,8 +3786,7 @@ private pure func function_target_for_var(
 			candidates: List[CoreFunction] = functions_for_def_id(
 				state.functions_by_id,
 				def_id,
-			)
-				.get_or([])
+			).get_or([])
 			var exact: Option[CoreFunction] = None
 
 			for candidate in candidates:
@@ -3828,7 +3837,7 @@ private pure func adapt_var_expr(
 		state.mode == ConvertClosures
 		or not is_closure_value_type(typ)
 		or contains_name(bound, variable.name)
-		or contains_name(state.constructor_names, variable.name)
+		or variable_references_definition(variable, state.constructor_definitions)
 	):
 		{
 			state = state,
@@ -3880,7 +3889,13 @@ private pure func adapt_var_expr(
 							params = params,
 							return_type = signature.return_type,
 							body = Some(
-								CallExpr(call_kind, callee, args, signature.return_type, loc),
+								CallExpr(
+									call_kind,
+									callee,
+									args,
+									signature.return_type,
+									loc,
+								),
 							),
 							is_pure = signature.is_pure,
 							function_kind = ClosureBodyFunction(abi),
@@ -3925,7 +3940,6 @@ private pure func hoist_lambda(
 ) -> HoistedClosureCreate:
 	free_vars: List[FreeVar] = captures_from_body(
 		state,
-		capturable,
 		add_bound_params([], params),
 		body,
 	)
@@ -4016,7 +4030,7 @@ private pure func hoist_copy_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(state, capturable, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(state, local_bound, body)
 	captures: List[CoreTaskCapture] = task_captures_from_free_vars(free_vars, TaskCopyCapture)
 	hoist_task(state, capturable, local_bound, body, return_type, captures, loc)
 
@@ -4031,7 +4045,7 @@ private pure func hoist_loop_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(state, capturable, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(state, local_bound, body)
 	captures: List[CoreTaskCapture] = task_captures_for_loop(free_vars, loop_variable, item_mode)
 	hoist_task(state, capturable, local_bound, body, return_type, captures, loc)
 
@@ -6347,31 +6361,56 @@ private pure func max_program_def_id(program: CoreProgram) -> Int:
 	result
 
 
-private pure func add_name_once(names: List[String], name: String) -> List[String]:
-	if contains_name(names, name):
-		names
-	else:
-		names.append(name)
+private pure func add_definition_once(
+	definitions: List[CoreDefinitionIdentity],
+	name: String,
+	def_id: Option[Int],
+) -> List[CoreDefinitionIdentity]:
+	match def_id:
+		Some(value):
+			if definition_identity_exists(definitions, name, value):
+				definitions
+			else:
+				definitions.append({
+					name = name,
+					def_id = value,
+				})
+		None:
+			definitions
 
 
-private pure func builtin_constructor_names() -> List[String]:
-	["Some", "None", "Ok", "Err", "True", "False", "Timeout", "TaskFailed", "Cancelled", "NULL"]
+private pure func add_constructor_definition_aliases(
+	definitions: List[CoreDefinitionIdentity],
+	name: String,
+	c_name: String,
+	def_id: Option[Int],
+) -> List[CoreDefinitionIdentity]:
+	-- Backend projection rewrites constructor values to c_name before closure conversion.
+	with_source_name: List[CoreDefinitionIdentity] = add_definition_once(definitions, name, def_id)
+	add_definition_once(with_source_name, c_name, def_id)
 
 
-pure func capture_constructor_names(program: CoreProgram) -> List[String]:
-	var names: List[String] = builtin_constructor_names()
+pure func capture_constructor_definitions(program: CoreProgram) -> List[CoreDefinitionIdentity]:
+	var definitions: List[CoreDefinitionIdentity] = []
 
 	for decl in program.decls:
 		match decl:
 			EnumDecl(enum_decl):
 				for variant in enum_decl.variants:
-					names = add_name_once(names, variant.name)
-					names = add_name_once(names, variant.c_name)
+					definitions = add_constructor_definition_aliases(
+						definitions,
+						variant.name,
+						variant.c_name,
+						variant.def_id,
+					)
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
-					names = add_name_once(names, variant.name)
-					names = add_name_once(names, variant.c_name)
-					names = add_name_once(names, variant.tag_c_name)
+					definitions = add_constructor_definition_aliases(
+						definitions,
+						variant.name,
+						variant.c_name,
+						variant.def_id,
+					)
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -6387,16 +6426,20 @@ pure func capture_constructor_names(program: CoreProgram) -> List[String]:
 			ImplDecl(impl_decl):
 				void
 
-	names
+	definitions
 
 
-pure func capture_function_names(program: CoreProgram) -> List[String]:
-	var names: List[String] = []
+pure func capture_function_definitions(program: CoreProgram) -> List[CoreDefinitionIdentity]:
+	var definitions: List[CoreDefinitionIdentity] = []
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(func_info):
-				names = add_name_once(names, func_info.name)
+				definitions = add_definition_once(
+					definitions,
+					func_info.name,
+					Some(func_info.def_id),
+				)
 			GlobalDecl(global):
 				void
 			EnumDecl(enum_decl):
@@ -6413,9 +6456,9 @@ pure func capture_function_names(program: CoreProgram) -> List[String]:
 				void
 			ImplDecl(impl_decl):
 				for method in impl_decl.methods:
-					names = add_name_once(names, method.name)
+					definitions = add_definition_once(definitions, method.name, Some(method.def_id))
 
-	names
+	definitions
 
 
 private pure func index_function(
@@ -6425,10 +6468,7 @@ private pure func index_function(
 	{
 		by_id = indexes.by_id.set(
 			func_info.def_id,
-			functions_for_def_id(
-				indexes.by_id,
-				func_info.def_id,
-			)
+			functions_for_def_id(indexes.by_id, func_info.def_id)
 				.get_or([])
 				.append(func_info),
 		),
@@ -6472,8 +6512,8 @@ private pure func initial_state(program: CoreProgram, mode: ClosurePassMode) -> 
 		current_module = None,
 		functions_by_id = indexes.by_id,
 		functions_by_name = indexes.by_name,
-		function_names = capture_function_names(program),
-		constructor_names = capture_constructor_names(program),
+		function_definitions = capture_function_definitions(program),
+		constructor_definitions = capture_constructor_definitions(program),
 		hoisted = []
 	}
 

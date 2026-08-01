@@ -11,6 +11,7 @@ import:
 	compiler_core_json:
 		CoreAccessor(ListSpreadAccessor, RootAccessor),
 		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(
 			BuiltinCall,
@@ -49,6 +50,7 @@ import:
 		),
 		CoreConstructorMatchTest,
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
+		CoreDefinitionIdentity,
 		CoreDictEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
@@ -207,12 +209,12 @@ record PerceusGlobal {
 
 record PerceusEnv {
 	managed_type_names: List[String],
-	constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]],
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	global_values: List[PerceusGlobal],
-	function_names: List[String],
-	constructor_names: List[String],
+	function_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity],
+	nullary_constructor_definitions: List[CoreDefinitionIdentity],
 	direct_user_call_contracts_by_name: Dict[String, List[Int]],
 	user_call_contracts_by_name: Dict[String, List[Int]],
 	user_call_contract_layers_by_name: List[Dict[String, List[Int]]],
@@ -250,12 +252,12 @@ private union TemporaryBindingContractPlan:
 pure func empty_env() -> PerceusEnv:
 	{
 		managed_type_names = CoreTypePolicy.CORE_MANAGED_TYPE_NAMES,
-		constructor_contracts_by_name = {},
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
 		global_values = [],
-		function_names = [],
-		constructor_names = [],
+		function_definitions = [],
+		constructor_definitions = [],
+		nullary_constructor_definitions = [],
 		direct_user_call_contracts_by_name = {},
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
@@ -476,13 +478,33 @@ private pure func lookup_direct_user_call_contract(
 			None
 
 
+private pure func append_constructor_identity_aliases(
+	definitions: List[CoreDefinitionIdentity],
+	name: String,
+	c_name: String,
+	def_id: Int,
+) -> List[CoreDefinitionIdentity]:
+	with_source_name: List[CoreDefinitionIdentity] = definitions.append({
+		name = name,
+		def_id = def_id,
+	})
+
+	if c_name == name:
+		with_source_name
+	else:
+		with_source_name.append({
+			name = c_name,
+			def_id = def_id,
+		})
+
+
 pure func build_env(program: CoreProgram) -> PerceusEnv:
 	managed_type_names: List[String] = CoreTypePolicy.managed_type_names(program)
-	var constructor_contracts_by_name: Dict[String, List[ConstructorCallContract]] = {}
 	var constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]] = {}
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 	var global_values: List[PerceusGlobal] = []
+	var nullary_constructor_definitions: List[CoreDefinitionIdentity] = []
 
 	for decl in program.decls:
 		match decl:
@@ -490,7 +512,18 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 				for variant in union_decl.variants:
 					arity: Int = variant.fields.length()
 
-					if arity > 0:
+					if arity == 0:
+						match variant.def_id:
+							Some(def_id):
+								nullary_constructor_definitions = append_constructor_identity_aliases(
+									nullary_constructor_definitions,
+									variant.name,
+									variant.c_name,
+									def_id,
+								)
+							None:
+								void
+					else:
 						entry: ConstructorCallContract = {
 							parent_type_name = union_decl.name,
 							name = variant.name,
@@ -500,19 +533,6 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 								result = ReturnOwned
 							}
 						}
-
-						contracts_with_name: List[ConstructorCallContract] = match constructor_contracts_by_name.get(
-							entry.name,
-						):
-							Some(contracts):
-								contracts
-							None:
-								[]
-
-						constructor_contracts_by_name = constructor_contracts_by_name.set(
-							entry.name,
-							contracts_with_name.append(entry),
-						)
 
 						contracts_with_parent: List[ConstructorCallContract] = match constructor_contracts_by_parent_name.get(
 							entry.parent_type_name,
@@ -543,8 +563,6 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 								)
 							None:
 								void
-					else:
-						void
 			HeapRecordDecl(record_decl):
 				void
 			FunctionDecl(func_info):
@@ -571,12 +589,12 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 
 	{
 		managed_type_names = managed_type_names,
-		constructor_contracts_by_name = constructor_contracts_by_name,
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		global_values = global_values,
-		function_names = CoreClosure.capture_function_names(program),
-		constructor_names = CoreClosure.capture_constructor_names(program),
+		function_definitions = CoreClosure.capture_function_definitions(program),
+		constructor_definitions = CoreClosure.capture_constructor_definitions(program),
+		nullary_constructor_definitions = nullary_constructor_definitions,
 		direct_user_call_contracts_by_name = direct_user_call_contracts_by_name,
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
@@ -588,6 +606,21 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 
 pure func is_managed_type(env: PerceusEnv, typ: CoreType) -> Bool:
 	CoreTypePolicy.is_managed_type(env.managed_type_names, typ)
+
+
+private pure func is_nullary_constructor_reference(env: PerceusEnv, variable: CoreVar) -> Bool:
+	match variable.def_id:
+		Some(def_id):
+			var found: Bool = False
+
+			for definition in env.nullary_constructor_definitions:
+				if definition.name == variable.name and definition.def_id == def_id:
+					found = True
+					break
+
+			found
+		None:
+			False
 
 
 private pure func retain_policy_for_type(typ: CoreType) -> CoreRetainPolicy:
@@ -646,8 +679,9 @@ private pure func constructor_parent_is_known(env: PerceusEnv, parent_type_name:
 	env.constructor_contracts_by_parent_name.contains(parent_type_name)
 
 
-private pure func constructor_contract_by_def_id(
+private pure func constructor_contract_by_identity(
 	env: PerceusEnv,
+	name: String,
 	def_id: Int,
 	arg_count: Int,
 ) -> Option[OwnershipCallContract]:
@@ -661,30 +695,7 @@ private pure func constructor_contract_by_def_id(
 
 	-- Unscoped lookup preserves the historical last matching declaration.
 	for entry in entries:
-		if contract_matches_arity(entry.contract, arg_count):
-			found = Some(entry.contract)
-		else:
-			void
-
-	found
-
-
-private pure func constructor_contract_by_name(
-	env: PerceusEnv,
-	name: String,
-	arg_count: Int,
-) -> Option[OwnershipCallContract]:
-	var found: Option[OwnershipCallContract] = None
-
-	entries: List[ConstructorCallContract] = match env.constructor_contracts_by_name.get(name):
-		Some(contracts):
-			contracts
-		None:
-			[]
-
-	-- Unscoped lookup preserves the historical last matching declaration.
-	for entry in entries:
-		if contract_matches_arity(entry.contract, arg_count):
+		if entry.name == name and contract_matches_arity(entry.contract, arg_count):
 			found = Some(entry.contract)
 		else:
 			void
@@ -699,8 +710,6 @@ private pure func constructor_contract_by_return_type(
 	def_id: Option[Int],
 	arg_count: Int,
 ) -> Option[OwnershipCallContract]:
-	var by_def_id: Option[OwnershipCallContract] = None
-
 	entries: List[ConstructorCallContract] = match env.constructor_contracts_by_parent_name.get(
 		parent_type_name,
 	):
@@ -709,35 +718,24 @@ private pure func constructor_contract_by_return_type(
 		None:
 			[]
 
-	-- Parent buckets retain program order for the scoped first-match behavior.
 	match def_id:
 		Some(value):
+			var found: Option[OwnershipCallContract] = None
+
 			for entry in entries:
 				if (
 					entry.def_id == Some(value)
+					and entry.name == name
 					and contract_matches_arity(entry.contract, arg_count)
 				):
-					by_def_id = Some(entry.contract)
-					break
-				else:
-					void
-		None:
-			void
-
-	match by_def_id:
-		Some(contract):
-			Some(contract)
-		None:
-			var by_name: Option[OwnershipCallContract] = None
-
-			for entry in entries:
-				if entry.name == name and contract_matches_arity(entry.contract, arg_count):
-					by_name = Some(entry.contract)
+					found = Some(entry.contract)
 					break
 				else:
 					void
 
-			by_name
+			found
+		None:
+			None
 
 
 private pure func lookup_return_type_constructor_call_contract(
@@ -749,9 +747,9 @@ private pure func lookup_return_type_constructor_call_contract(
 ) -> Option[OwnershipCallContract]:
 	match return_type:
 		StackResultType(_, _):
-			result_constructor_contract(env, name, arg_count, return_type)
+			result_constructor_contract(env, name, def_id, arg_count, return_type)
 		BoxedResultType(_, _):
-			result_constructor_contract(env, name, arg_count, return_type)
+			result_constructor_contract(env, name, def_id, arg_count, return_type)
 		_:
 			match optional_constructor_parent_name(return_type):
 				Some(parent_type_name):
@@ -769,16 +767,22 @@ private pure func lookup_return_type_constructor_call_contract(
 private pure func result_constructor_contract(
 	env: PerceusEnv,
 	name: String,
+	def_id: Option[Int],
 	arg_count: Int,
 	return_type: CoreType,
 ) -> Option[OwnershipCallContract]:
-	if arg_count == 1 and env.constructor_names.contains(name):
-		Some({
-			args = transfer_args(arg_count),
-			result = result_mode_for_type(env, return_type),
-		})
-	else:
-		None
+	match def_id:
+		Some(value):
+			match constructor_contract_by_identity(env, name, value, arg_count):
+				Some(_):
+					Some({
+						args = transfer_args(arg_count),
+						result = result_mode_for_type(env, return_type),
+					})
+				None:
+					None
+		None:
+			None
 
 
 private pure func return_type_has_known_constructor_parent(
@@ -800,13 +804,9 @@ pure func lookup_constructor_call_contract(
 ) -> Option[OwnershipCallContract]:
 	match def_id:
 		Some(value):
-			match constructor_contract_by_def_id(env, value, arg_count):
-				Some(contract):
-					Some(contract)
-				None:
-					constructor_contract_by_name(env, name, arg_count)
+			constructor_contract_by_identity(env, name, value, arg_count)
 		None:
-			constructor_contract_by_name(env, name, arg_count)
+			None
 
 
 private pure func projected_or_unresolved_user_call_contract(
@@ -872,9 +872,8 @@ pure func contract_for_call(
 		BuiltinCall(name):
 			builtin_contract(name, arg_count)
 		UserCall(name, def_id, consumed_args):
-			-- Constructor calls also arrive as UserCall. Exact constructor identity
-			-- wins; otherwise a registered specialization is stronger evidence than
-			-- merely returning a known union type.
+			-- Constructor calls also arrive as UserCall. Only a resolved constructor
+			-- identity may select a constructor ownership contract.
 			match lookup_return_type_constructor_call_contract(
 				env,
 				name,
@@ -1984,6 +1983,8 @@ private pure func summarize_linear_borrow(
 			summarize_linear_borrow(env, name, owner)
 		CastExpr(inner, typ, loc):
 			summarize_linear_borrow(env, name, inner)
+		BoxExpr(box_op, typ, loc):
+			summarize_linear_borrow(env, name, box_op.value)
 		UnboxExpr(kind, inner, typ, loc):
 			summarize_linear_borrow(env, name, inner)
 		_:
@@ -3512,7 +3513,11 @@ private pure func summarize_linear_ownership_uses(
 		CastExpr(inner, typ, loc):
 			summarize_linear_borrow(env, name, inner)
 		BoxExpr(box_op, typ, loc):
-			summarize_linear_borrow(env, name, box_op.value)
+			match box_op.kind:
+				PointerBox:
+					summarize_linear_ownership_uses(env, name, box_op.value)
+				_:
+					summarize_linear_borrow(env, name, box_op.value)
 		UnboxExpr(kind, inner, typ, loc):
 			summarize_linear_borrow(env, name, inner)
 		FieldExpr(owner, field, typ, loc):
@@ -7599,7 +7604,10 @@ private pure func assignment_result_returns_alias(
 				Some(aliases):
 					aliases
 				None:
-					is_managed_type(env, typ)
+					(
+						is_managed_type(env, typ)
+						and not is_nullary_constructor_reference(env, variable)
+					)
 		FieldExpr(owner, field, typ, loc):
 			is_managed_type(env, typ)
 		TupleFieldExpr(owner, field_index, typ, loc):
@@ -12725,8 +12733,8 @@ private pure func is_owned_temporary_with_names(
 				True
 			LambdaExpr(params, return_type, body, is_pure, result_type, loc):
 				CoreClosure.lambda_has_runtime_captures(
-					env.function_names,
-					env.constructor_names,
+					env.function_definitions,
+					env.constructor_definitions,
 					params,
 					body,
 				)
@@ -12744,8 +12752,8 @@ private pure func is_immortal_closure_expr(env: PerceusEnv, expr: CoreExpr) -> B
 	match expr:
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			not CoreClosure.lambda_has_runtime_captures(
-				env.function_names,
-				env.constructor_names,
+				env.function_definitions,
+				env.constructor_definitions,
 				params,
 				body,
 			)
@@ -13487,14 +13495,17 @@ private pure func normalize_binding_alias_rhs(
 	else:
 		match rhs:
 			VarExpr(variable, typ, loc):
-				DupExpr(
-					copy_core_var(variable),
-					copy_core_type(bind_type),
-					retain_policy_for_type(bind_type),
-					rhs,
-					copy_core_type(bind_type),
-					loc,
-				)
+				if is_nullary_constructor_reference(env, variable):
+					rhs
+				else:
+					DupExpr(
+						copy_core_var(variable),
+						copy_core_type(bind_type),
+						retain_policy_for_type(bind_type),
+						rhs,
+						copy_core_type(bind_type),
+						loc,
+					)
 			FieldExpr(owner, field, typ, loc):
 				if is_owned_temporary_expr(env, owner):
 					bind_owned_temporary_field_projection(env, rhs)
@@ -17550,8 +17561,8 @@ private pure func normalize_lambda_expr(
 ) -> CoreExpr:
 	nested_body: CoreExpr = normalize_lambda_result_aliases(env, body)
 	captures: List[CoreClosureCapture] = CoreClosure.lambda_runtime_captures(
-		env.function_names,
-		env.constructor_names,
+		env.function_definitions,
+		env.constructor_definitions,
 		params,
 		nested_body,
 	)

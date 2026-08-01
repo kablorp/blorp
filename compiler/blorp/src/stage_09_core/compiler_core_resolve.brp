@@ -123,7 +123,8 @@ record CoreResolveModuleImports {
 
 private record CoreCallableIdentity {
 	name: String,
-	def_id: Int
+	def_id: Int,
+	constructor_type_name: Option[String]
 }
 
 
@@ -160,7 +161,7 @@ private record CoreCallResolveEnv {
 	global_types: Dict[String, CoreType],
 	foreign_functions: Dict[String, CoreForeignTarget],
 	builtin_functions: Dict[String, String],
-	constructors: Dict[String, CoreConstructorTarget],
+	constructors: Dict[String, List[CoreConstructorTarget]],
 	import_bindings: Dict[String, CoreResolveImportBinding],
 	module_imports: Dict[String, Dict[String, CoreResolveImportBinding]],
 	module_paths: List[String]
@@ -444,27 +445,16 @@ private pure func remember_constructor(
 	type_name: String,
 	def_id: Option[Int],
 ) -> CoreCallResolveEnv:
-	var next: CoreCallResolveEnv = { env | constructors = env.constructors.set(
+	existing: List[CoreConstructorTarget] = env.constructors
+		.get(name)
+		.get_or([])
+	{ env | constructors = env.constructors.set(
 			name,
-			{
+			existing.append({
 				type_name = type_name,
-				def_id = def_id
-			},
+				def_id = def_id,
+			}),
 		) }
-
-	match def_id:
-		Some(id):
-			remember_user_function(
-				next,
-				{
-					name = name,
-					def_id = id,
-					params = [],
-					return_type = NamedType("", [])
-				},
-			)
-		None:
-			next
 
 
 private pure func import_index(
@@ -531,20 +521,10 @@ private pure func collect_call_resolve_env(
 				env = { env | global_types = env.global_types.set(global.name.name, global.typ) }
 			EnumDecl(enum_decl):
 				for variant in enum_decl.variants:
-					env = remember_constructor(env, variant.name, enum_decl.name, None)
+					env = remember_constructor(env, variant.name, enum_decl.name, variant.def_id)
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
-					constructor_def_id: Option[Int] = if variant.fields.is_empty():
-						None
-					else:
-						variant.def_id
-
-					env = remember_constructor(
-						env,
-						variant.name,
-						union_decl.name,
-						constructor_def_id,
-					)
+					env = remember_constructor(env, variant.name, union_decl.name, variant.def_id)
 			ImplDecl(impl_decl):
 				if not core_type_has_unresolved_parameters(impl_decl.for_type):
 					match core_trait_impl_type_key(impl_decl.for_type):
@@ -788,12 +768,77 @@ private pure func core_type_name(typ: CoreType) -> String:
 			""
 
 
+private pure func constructor_parent_type_name(typ: CoreType) -> Option[String]:
+	match typ:
+		NamedType(name, _):
+			Some(name)
+		EnumType(name) | UnionType(name):
+			Some(name)
+		_:
+			None
+
+
 private pure func is_function_type(typ: CoreType) -> Bool:
 	match typ:
 		FunctionType(_, _, _):
 			True
 		_:
 			False
+
+
+private pure func constructor_target_matches_type(
+	target: CoreConstructorTarget,
+	typ: CoreType,
+) -> Bool:
+	constructor_parent_type_name(typ) == Some(target.type_name)
+
+
+private pure func constructor_target_for_type(
+	env: CoreCallResolveEnv,
+	name: String,
+	typ: CoreType,
+) -> Option[CoreConstructorTarget]:
+	var selected: Option[CoreConstructorTarget] = None
+	var ambiguous: Bool = False
+
+	for target in (
+		env.constructors
+			.get(name)
+			.get_or([])
+	):
+		if constructor_target_matches_type(target, typ):
+			match selected:
+				Some(existing):
+					if existing.def_id != target.def_id:
+						ambiguous = True
+					else:
+						void
+				None:
+					selected = Some(target)
+		else:
+			void
+
+	if ambiguous:
+		None
+	else:
+		selected
+
+
+private pure func constructor_target_for_call(
+	env: CoreCallResolveEnv,
+	name: String,
+	callee: CoreExpr,
+	return_type: CoreType,
+) -> Option[CoreConstructorTarget]:
+	match constructor_target_for_type(env, name, return_type):
+		Some(target):
+			Some(target)
+		None:
+			match core_expr_type(callee):
+				FunctionType(_, _, callee_return_type):
+					constructor_target_for_type(env, name, callee_return_type)
+				typ:
+					constructor_target_for_type(env, name, typ)
 
 
 private pure func selected_type_matches(expected: CoreType, actual: CoreType) -> Bool:
@@ -1132,6 +1177,7 @@ private pure func unknown_var_call_kind(
 	variable: CoreVar,
 	callee: CoreExpr,
 	args: List[CoreExpr],
+	return_type: CoreType,
 ) -> CoreCallKind:
 	name: String = variable.name
 
@@ -1193,9 +1239,14 @@ private pure func unknown_var_call_kind(
 			void
 
 		if result.is_none():
-			result = env.constructors
-				.get(name)
-				.map(func(constructor): UserCall(name, constructor.def_id, []))
+			result = constructor_target_for_call(
+				env,
+				name,
+				callee,
+				return_type,
+			).map(
+				func(constructor): UserCall(name, constructor.def_id, []),
+			)
 		else:
 			void
 
@@ -1256,6 +1307,7 @@ private pure func unknown_field_call_kind(
 	field: String,
 	callee: CoreExpr,
 	args: List[CoreExpr],
+	return_type: CoreType,
 ) -> CoreCallKind:
 	match owner:
 		VarExpr(variable, _, _):
@@ -1265,9 +1317,14 @@ private pure func unknown_field_call_kind(
 				else:
 					UnknownCall
 			else:
-				var result: Option[CoreCallKind] = env.constructors
-					.get(field)
-					.map(func(constructor): UserCall(field, constructor.def_id, []))
+				var result: Option[CoreCallKind] = constructor_target_for_call(
+					env,
+					field,
+					callee,
+					return_type,
+				).map(
+					func(constructor): UserCall(field, constructor.def_id, []),
+				)
 
 				if result.is_none():
 					result = user_call_by_id(env, variable.def_id, callee, args)
@@ -1303,6 +1360,7 @@ private pure func resolve_call_kind(
 	kind: CoreCallKind,
 	callee: CoreExpr,
 	args: List[CoreExpr],
+	return_type: CoreType,
 ) -> CoreCallKind:
 	match kind:
 		SelectedDirectCall(selected_id):
@@ -1335,13 +1393,31 @@ private pure func resolve_call_kind(
 												UnknownCall,
 												callee,
 												args,
+												return_type,
 											)
 		UnknownCall:
 			match callee:
 				VarExpr(variable, _, _):
-					unknown_var_call_kind(env, module_path, scope, variable, callee, args)
+					unknown_var_call_kind(
+						env,
+						module_path,
+						scope,
+						variable,
+						callee,
+						args,
+						return_type,
+					)
 				FieldExpr(owner, field, _, _):
-					unknown_field_call_kind(env, module_path, scope, owner, field, callee, args)
+					unknown_field_call_kind(
+						env,
+						module_path,
+						scope,
+						owner,
+						field,
+						callee,
+						args,
+						return_type,
+					)
 				_:
 					if is_function_type(core_expr_type(callee)):
 						ClosureCall
@@ -1442,6 +1518,7 @@ private pure func resolve_global_value_expr(
 						kind,
 						classification_callee,
 						resolved_args,
+						typ,
 					)
 				None:
 					kind
@@ -1559,19 +1636,6 @@ private pure func imported_variable_target(
 							})
 
 
-private pure func constructor_target_matches_type(
-	target: CoreConstructorTarget,
-	typ: CoreType,
-) -> Bool:
-	match typ:
-		NamedType(name, _):
-			name == target.type_name
-		EnumType(name) | UnionType(name):
-			name == target.type_name
-		_:
-			False
-
-
 private pure func resolve_program_variable(
 	resolutions: CoreProgramResolution,
 	scope: List[String],
@@ -1595,8 +1659,18 @@ private pure func resolve_program_variable(
 									{ variable | def_id = Some(target.def_id) }
 								None:
 									global_variable
-						else:
+						else if resolutions.global_values.contains(variable.name):
 							global_variable
+						else:
+							match constructor_target_for_type(env, variable.name, typ):
+								Some(target):
+									-- Module-graph assembly may assign an imported constructor
+									-- reference before assigning the canonical declaration ID.
+									-- This is the last scope-aware boundary where that identity
+									-- can be normalized without confusing lexical shadowing.
+									{ variable | def_id = target.def_id }
+								None:
+									global_variable
 			None:
 				global_variable
 
@@ -1644,20 +1718,17 @@ private pure func resolve_qualified_value(
 									loc,
 								)
 							else:
-								match env.constructors.get(field):
+								match constructor_target_for_type(env, field, typ):
 									Some(constructor):
-										if constructor_target_matches_type(constructor, typ):
-											VarExpr(
-												{
-													name = field,
-													uniq = 0,
-													def_id = constructor.def_id
-												},
-												typ,
-												loc,
-											)
-										else:
-											FieldExpr(owner, field, typ, loc)
+										VarExpr(
+											{
+												name = field,
+												uniq = 0,
+												def_id = constructor.def_id
+											},
+											typ,
+											loc,
+										)
 									None:
 										FieldExpr(owner, field, typ, loc)
 						None:
@@ -2242,6 +2313,34 @@ private pure func callable_identity_exists(
 	found
 
 
+private pure func constructor_callable_for_type(
+	callables: List[CoreCallableIdentity],
+	callee_name: String,
+	return_type: CoreType,
+) -> Option[CoreCallableIdentity]:
+	type_name ?= constructor_parent_type_name(return_type)
+	var selected: Option[CoreCallableIdentity] = None
+	var ambiguous: Bool = False
+
+	for callable in callables:
+		if callable.name == callee_name and callable.constructor_type_name == Some(type_name):
+			match selected:
+				Some(existing):
+					if existing.def_id != callable.def_id:
+						ambiguous = True
+					else:
+						void
+				None:
+					selected = Some(callable)
+		else:
+			void
+
+	if type_name.is_empty() or ambiguous:
+		None
+	else:
+		selected
+
+
 private pure func call_selected_id(kind: CoreCallKind, callee_id: Option[Int]) -> Option[Int]:
 	match kind:
 		SelectedDirectCall(def_id):
@@ -2270,10 +2369,11 @@ private pure func resolved_callable_kind(
 	callables: List[CoreCallableIdentity],
 	kind: CoreCallKind,
 	callee: CoreExpr,
+	return_type: CoreType,
 ) -> CoreCallKind:
 	match callee:
 		VarExpr(variable, _, _):
-			match call_selected_id(kind, variable.def_id):
+			resolved_by_id: CoreCallKind = match call_selected_id(kind, variable.def_id):
 				Some(def_id):
 					if call_id_agrees_with_callee(kind, variable.def_id, def_id):
 						if callable_identity_exists(callables, variable.name, def_id):
@@ -2284,6 +2384,16 @@ private pure func resolved_callable_kind(
 						kind
 				None:
 					kind
+
+			match resolved_by_id:
+				UnknownCall:
+					match constructor_callable_for_type(callables, variable.name, return_type):
+						Some(constructor):
+							UserCall(variable.name, Some(constructor.def_id), [])
+						None:
+							UnknownCall
+				_:
+					resolved_by_id
 		_:
 			kind
 
@@ -2296,12 +2406,18 @@ private pure func resolve_callable_id_call_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	resolved_kind: CoreCallKind = resolved_callable_kind(callables, kind, callee)
+	resolved_kind: CoreCallKind = resolved_callable_kind(callables, kind, callee, typ)
 	resolve_child: pure (CoreExpr) -> CoreExpr = pure func(child):
 		resolve_callable_id_expr(callables, child)
 	resolved_args: List[CoreExpr] = args.map(resolve_child)
 	resolved_callee: CoreExpr = resolve_child(callee)
-	CallExpr(resolved_kind, resolved_callee, resolved_args, typ, loc)
+	CallExpr(
+		resolved_kind,
+		resolved_user_callee(resolved_callee, resolved_kind),
+		resolved_args,
+		typ,
+		loc,
+	)
 
 
 private pure func resolve_callable_id_expr(
@@ -2336,6 +2452,7 @@ private pure func program_callables(program: CoreProgram) -> List[CoreCallableId
 				callables = callables.append({
 					name = function_info.name,
 					def_id = function_info.def_id,
+					constructor_type_name = None,
 				})
 			EnumDecl(enum_decl):
 				for variant in enum_decl.variants:
@@ -2344,6 +2461,7 @@ private pure func program_callables(program: CoreProgram) -> List[CoreCallableId
 							callables = callables.append({
 								name = variant.name,
 								def_id = def_id,
+								constructor_type_name = Some(enum_decl.name),
 							})
 						None:
 							void
@@ -2354,6 +2472,7 @@ private pure func program_callables(program: CoreProgram) -> List[CoreCallableId
 							callables = callables.append({
 								name = variant.name,
 								def_id = def_id,
+								constructor_type_name = Some(union_decl.name),
 							})
 						None:
 							void

@@ -384,17 +384,74 @@ private pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option
 	result
 
 
-private pure func find_union_variant(
+private pure func union_variant_accepts_name(
+	variant: CoreUnionVariant,
+	constructor_name: String,
+) -> Bool:
+	variant.name == constructor_name or variant.c_name == constructor_name
+
+
+private pure func union_variant_matches_reference(
+	variant: CoreUnionVariant,
+	constructor_name: String,
+	def_id: Option[Int],
+) -> Bool:
+	if not union_variant_accepts_name(variant, constructor_name):
+		False
+	else:
+		match (def_id, variant.def_id):
+			(Some(reference_id), Some(constructor_id)):
+				reference_id == constructor_id
+			_:
+				False
+
+
+private pure func find_union_variant_by_reference(
 	union_decl: CoreUnionDecl,
 	constructor_name: String,
+	def_id: Option[Int],
 ) -> Option[CoreUnionVariant]:
 	var result: Option[CoreUnionVariant] = None
 
 	for variant in union_decl.variants:
-		if variant.name == constructor_name:
+		if union_variant_matches_reference(variant, constructor_name, def_id):
 			result = Some(variant)
+			break
 
 	result
+
+
+private pure func canonical_union_constructor_name(
+	decls: List[CoreDecl],
+	type_name: String,
+	constructor_name: String,
+	def_id: Option[Int],
+) -> Option[String]:
+	match find_union_decl(decls, type_name):
+		Some(union_decl):
+			match find_union_variant_by_reference(union_decl, constructor_name, def_id):
+				Some(variant):
+					Some(variant.name)
+				None:
+					None
+		None:
+			None
+
+
+private pure func variable_is_union_constructor(
+	decls: List[CoreDecl],
+	type_name: String,
+	variable: CoreVar,
+) -> Bool:
+	match find_union_decl(decls, type_name):
+		Some(union_decl):
+			match find_union_variant_by_reference(union_decl, variable.name, variable.def_id):
+				Some(variant):
+					variant.fields.is_empty()
+				None:
+					False
+		None:
+			False
 
 
 private pure func find_record_field(
@@ -3136,104 +3193,110 @@ private pure func stack_option_payload_args(
 	args.map(func(arg): boxed_storage_value_for_expr(stack_option_payload_arg(payload, arg)))
 
 
+private pure func prepare_stack_option_constructor(
+	constructor_name: String,
+	def_id: Option[Int],
+	args: List[CoreExpr],
+	payload: CoreType,
+) -> Option[CoreUnionConstruct]:
+	if constructor_name == "Some" and args.length() == 1:
+		match stack_option_representation(payload, STACK_OPTION_SOME_TAG):
+			Some(representation):
+				Some({
+					type_name = "Option",
+					constructor_name = "Some",
+					constructor_c_name = "Some",
+					representation = StackOptionRepresentation(representation),
+					payload_storage = TypedUnionPayloadStorage,
+					uses_release_mask = False,
+					release_mask = 0,
+					args = stack_option_payload_args(payload, args),
+				})
+			None:
+				if is_nullable_option_payload_type(payload):
+					Some({
+						type_name = "Option",
+						constructor_name = "Some",
+						constructor_c_name = "Some",
+						representation = NullableOptionRepresentation,
+						payload_storage = TypedUnionPayloadStorage,
+						uses_release_mask = False,
+						release_mask = 0,
+						args = boxed_storage_values_for_exprs(args),
+					})
+				else:
+					boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
+
+					Some({
+						type_name = "Option",
+						constructor_name = "Some",
+						constructor_c_name = constructor_c_name(constructor_name, def_id),
+						representation = BoxedOptionRepresentation,
+						payload_storage = ErasedUnionPayloadStorage,
+						uses_release_mask = True,
+						release_mask = release_mask_for_boxed_args(boxed_args),
+						args = boxed_args,
+					})
+	else if constructor_name == "None" and args.length() == 0:
+		match stack_option_representation(payload, STACK_OPTION_NONE_TAG):
+			Some(representation):
+				Some({
+					type_name = "Option",
+					constructor_name = "None",
+					constructor_c_name = "None",
+					representation = StackOptionRepresentation(representation),
+					payload_storage = TypedUnionPayloadStorage,
+					uses_release_mask = False,
+					release_mask = 0,
+					args = [],
+				})
+			None:
+				if is_nullable_option_payload_type(payload):
+					Some({
+						type_name = "Option",
+						constructor_name = "None",
+						constructor_c_name = "None",
+						representation = NullableOptionRepresentation,
+						payload_storage = TypedUnionPayloadStorage,
+						uses_release_mask = False,
+						release_mask = 0,
+						args = [],
+					})
+				else:
+					Some({
+						type_name = "Option",
+						constructor_name = "None",
+						constructor_c_name = constructor_c_name(constructor_name, def_id),
+						representation = BoxedOptionRepresentation,
+						payload_storage = TypedUnionPayloadStorage,
+						uses_release_mask = False,
+						release_mask = 0,
+						args = [],
+					})
+	else:
+		None
+
+
 private pure func prepare_stack_option_construct(
+	decls: List[CoreDecl],
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	payload: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	match kind:
 		UserCall(constructor_name, def_id, consumed_args):
-			if constructor_name == "Some" and args.length() == 1:
-				match stack_option_representation(payload, STACK_OPTION_SOME_TAG):
-					Some(representation):
-						Some({
-							type_name = "Option",
-							constructor_name = "Some",
-							constructor_c_name = "Some",
-							representation = StackOptionRepresentation(representation),
-							payload_storage = TypedUnionPayloadStorage,
-							uses_release_mask = False,
-							release_mask = 0,
-							args = stack_option_payload_args(payload, args),
-						})
-					None:
-						if is_nullable_option_payload_type(payload):
-							Some({
-								type_name = "Option",
-								constructor_name = "Some",
-								constructor_c_name = "Some",
-								representation = NullableOptionRepresentation,
-								payload_storage = TypedUnionPayloadStorage,
-								uses_release_mask = False,
-								release_mask = 0,
-								args = boxed_storage_values_for_exprs(args),
-							})
-						else:
-							boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
-								args,
-							)
-
-							Some({
-								type_name = "Option",
-								constructor_name = "Some",
-								constructor_c_name = constructor_c_name(constructor_name, def_id),
-								representation = BoxedOptionRepresentation,
-								payload_storage = ErasedUnionPayloadStorage,
-								uses_release_mask = True,
-								release_mask = release_mask_for_boxed_args(boxed_args),
-								args = boxed_args,
-							})
-			else if constructor_name == "None" and args.length() == 0:
-				match stack_option_representation(payload, STACK_OPTION_NONE_TAG):
-					Some(representation):
-						Some({
-							type_name = "Option",
-							constructor_name = "None",
-							constructor_c_name = "None",
-							representation = StackOptionRepresentation(representation),
-							payload_storage = TypedUnionPayloadStorage,
-							uses_release_mask = False,
-							release_mask = 0,
-							args = [],
-						})
-					None:
-						if is_nullable_option_payload_type(payload):
-							Some({
-								type_name = "Option",
-								constructor_name = "None",
-								constructor_c_name = "None",
-								representation = NullableOptionRepresentation,
-								payload_storage = TypedUnionPayloadStorage,
-								uses_release_mask = False,
-								release_mask = 0,
-								args = [],
-							})
-						else:
-							Some({
-								type_name = "Option",
-								constructor_name = "None",
-								constructor_c_name = constructor_c_name(constructor_name, def_id),
-								representation = BoxedOptionRepresentation,
-								payload_storage = TypedUnionPayloadStorage,
-								uses_release_mask = False,
-								release_mask = 0,
-								args = [],
-							})
-			else:
-				None
+			canonical_name ?= canonical_union_constructor_name(
+				decls,
+				"Option",
+				constructor_name,
+				def_id,
+			)
+			prepare_stack_option_constructor(canonical_name, def_id, args, payload)
 		BuiltinCall(name):
 			if name == "blorp_option_some":
-				prepare_stack_option_construct(
-					UserCall("Some", None, []),
-					args,
-					payload,
-				)
+				prepare_stack_option_constructor("Some", None, args, payload)
 			else if name == "blorp_option_none":
-				prepare_stack_option_construct(
-					UserCall("None", None, []),
-					args,
-					payload,
-				)
+				prepare_stack_option_constructor("None", None, args, payload)
 			else:
 				None
 		ForeignCall(name, arg_passing):
@@ -3338,57 +3401,64 @@ private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> 
 			True
 
 
+private pure func prepare_stack_result_constructor(
+	constructor_name: String,
+	args: List[CoreExpr],
+	typ: CoreType,
+) -> Option[CoreUnionConstruct]:
+	tag ?= stack_result_tag(constructor_name)
+	payload_type ?= stack_result_payload_type(constructor_name, typ)
+
+	if args.length() == 1 and stack_result_payload_has_erased_storage(payload_type):
+		boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
+
+		release_mask: Int = match boxed_args:
+			[payload]:
+				if payload.needs_release:
+					1
+				else:
+					0
+			_:
+				0
+
+		Some({
+			type_name = "Result",
+			constructor_name = constructor_name,
+			constructor_c_name = constructor_name,
+			representation = StackResultRepresentation({
+				result_type = "blorp_StackResult",
+				tag = tag,
+				release_mask = release_mask,
+			}),
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = release_mask,
+			args = boxed_args,
+		})
+	else:
+		None
+
+
 private pure func prepare_stack_result_construct(
+	decls: List[CoreDecl],
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	match kind:
 		UserCall(constructor_name, def_id, consumed_args):
-			tag ?= stack_result_tag(constructor_name)
-			payload_type ?= stack_result_payload_type(constructor_name, typ)
-
-			if args.length() == 1 and stack_result_payload_has_erased_storage(payload_type):
-				boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
-
-				release_mask: Int = match boxed_args:
-					[payload]:
-						if payload.needs_release:
-							1
-						else:
-							0
-					_:
-						0
-
-				Some({
-					type_name = "Result",
-					constructor_name = constructor_name,
-					constructor_c_name = constructor_name,
-					representation = StackResultRepresentation({
-						result_type = "blorp_StackResult",
-						tag = tag,
-						release_mask = release_mask,
-					}),
-					payload_storage = TypedUnionPayloadStorage,
-					uses_release_mask = False,
-					release_mask = release_mask,
-					args = boxed_args,
-				})
-			else:
-				None
+			canonical_name ?= canonical_union_constructor_name(
+				decls,
+				"Result",
+				constructor_name,
+				def_id,
+			)
+			prepare_stack_result_constructor(canonical_name, args, typ)
 		BuiltinCall(name):
 			if name == "blorp_result_ok":
-				prepare_stack_result_construct(
-					UserCall("Ok", None, []),
-					args,
-					typ,
-				)
+				prepare_stack_result_constructor("Ok", args, typ)
 			else if name == "blorp_result_err":
-				prepare_stack_result_construct(
-					UserCall("Err", None, []),
-					args,
-					typ,
-				)
+				prepare_stack_result_constructor("Err", args, typ)
 			else:
 				None
 		ForeignCall(name, arg_passing):
@@ -3429,40 +3499,48 @@ private pure func boxed_result_constructor_c_name(constructor_name: String) -> O
 			None
 
 
+private pure func prepare_boxed_result_constructor(
+	constructor_name: String,
+	args: List[CoreExpr],
+) -> Option[CoreUnionConstruct]:
+	constructor_c_name ?= boxed_result_constructor_c_name(constructor_name)
+
+	if args.length() == 1:
+		boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
+
+		Some({
+			type_name = "Result",
+			constructor_name = constructor_name,
+			constructor_c_name = constructor_c_name,
+			representation = GenericUnionRepresentation,
+			payload_storage = ErasedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = release_mask_for_boxed_args(boxed_args),
+			args = boxed_args,
+		})
+	else:
+		None
+
+
 private pure func prepare_boxed_result_construct(
+	decls: List[CoreDecl],
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 ) -> Option[CoreUnionConstruct]:
 	match kind:
 		UserCall(constructor_name, def_id, consumed_args):
-			constructor_c_name ?= boxed_result_constructor_c_name(constructor_name)
-
-			if args.length() == 1:
-				boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
-
-				Some({
-					type_name = "Result",
-					constructor_name = constructor_name,
-					constructor_c_name = constructor_c_name,
-					representation = GenericUnionRepresentation,
-					payload_storage = ErasedUnionPayloadStorage,
-					uses_release_mask = False,
-					release_mask = release_mask_for_boxed_args(boxed_args),
-					args = boxed_args,
-				})
-			else:
-				None
+			canonical_name ?= canonical_union_constructor_name(
+				decls,
+				"Result",
+				constructor_name,
+				def_id,
+			)
+			prepare_boxed_result_constructor(canonical_name, args)
 		BuiltinCall(name):
 			if name == "blorp_result_ok":
-				prepare_boxed_result_construct(
-					UserCall("Ok", None, []),
-					args,
-				)
+				prepare_boxed_result_constructor("Ok", args)
 			else if name == "blorp_result_err":
-				prepare_boxed_result_construct(
-					UserCall("Err", None, []),
-					args,
-				)
+				prepare_boxed_result_constructor("Err", args)
 			else:
 				None
 		ForeignCall(name, arg_passing):
@@ -3505,7 +3583,11 @@ private pure func prepare_union_construct(
 				UserCall(constructor_name, def_id, consumed_args):
 					match find_union_decl(decls, type_name):
 						Some(union_decl):
-							match find_union_variant(union_decl, constructor_name):
+							match find_union_variant_by_reference(
+								union_decl,
+								constructor_name,
+								def_id,
+							):
 								Some(variant):
 									if variant.fields.length() == args.length():
 										boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
@@ -3523,7 +3605,7 @@ private pure func prepare_union_construct(
 
 										Some({
 											type_name = type_name,
-											constructor_name = constructor_name,
+											constructor_name = variant.name,
 											constructor_c_name = variant.c_name,
 											representation = GenericUnionRepresentation,
 											payload_storage = union_decl.payload_storage,
@@ -3569,7 +3651,7 @@ private pure func prepare_union_construct(
 			if name == "Option":
 				match type_args:
 					[payload]:
-						prepare_stack_option_construct(kind, args, payload)
+						prepare_stack_option_construct(decls, kind, args, payload)
 					[]:
 						None
 					[first, second, ...rest]:
@@ -3577,7 +3659,7 @@ private pure func prepare_union_construct(
 			else if name == "Result":
 				match type_args:
 					[ok_type, err_type]:
-						prepare_stack_result_construct(kind, args, typ)
+						prepare_stack_result_construct(decls, kind, args, typ)
 					[]:
 						None
 					[only]:
@@ -3589,9 +3671,9 @@ private pure func prepare_union_construct(
 		TypeParameterType(_) | SelfType:
 			None
 		StackResultType(ok_type, err_type):
-			prepare_stack_result_construct(kind, args, typ)
+			prepare_stack_result_construct(decls, kind, args, typ)
 		BoxedResultType(ok_type, err_type):
-			prepare_boxed_result_construct(kind, args)
+			prepare_boxed_result_construct(decls, kind, args)
 		FunctionType(_, _, _):
 			None
 		EnumType(name):
@@ -3780,9 +3862,10 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 					if name == "Option":
 						match type_args:
 							[payload]:
-								if variable.name == "None":
+								if variable_is_union_constructor(decls, "Option", variable):
 									match prepare_stack_option_construct(
-										UserCall("None", None, []),
+										decls,
+										UserCall("None", variable.def_id, []),
 										[],
 										payload,
 									):
