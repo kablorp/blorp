@@ -61,7 +61,8 @@ Native Binary
 
 ### Core IR Pipeline
 
-Codegen is a pipeline over a typed intermediate representation (`core.ml`).
+Codegen is a pipeline over the typed `CoreProgram` representation defined in
+`compiler_core_json.brp`.
 Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
@@ -104,9 +105,9 @@ survives that decision.
 
 Resource-source loops acquire and scope each resource in Blorp inference and
 Core lowering. The compiler records the exact synthesized loop-item identity
-on the typed scope rather than recognizing generated names. Only the temporary
-typed-AST compatibility projection removes that tagged wrapper before legacy
-OCaml lowering, which keeps both paths at one cleanup owner per resource.
+on the typed scope rather than recognizing generated names. Blorp Core lowering
+consumes that tagged identity, keeping one cleanup owner per resource without a
+name-based heuristic.
 
 The late-Core projection preserves scoped `let`/`borrow` expressions inside
 closure-call arguments. The Blorp-owned closure and preparation stages, rather
@@ -342,17 +343,15 @@ boxing, or ownership behavior from source spelling.
 
 | File | Purpose |
 |------|---------|
-| `core.ml` | IR type definitions, traversal helpers, pretty-printer |
+| `compiler_core_json.brp` | Core IR type definitions and serialization |
 | `compiler_core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
 | `compiler_core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
 | `compiler_core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
 | `compiler_core_parallel_tensor_pipeline.brp` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
 | `compiler_core_tensor_fusion.brp` | Tensor update fusion before ownership insertion |
-| `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
-| `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
-| `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
-| `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_error.ml` | Structured errors with phase/location/hint |
+| `compiler_core_specialize_layout.brp` | Final collection, tensor, option, and erased-storage layout selection |
+| `compiler_core_c_type_layout.brp`, `compiler_core_result_layout.brp` | C layout selection for option/result values |
+| `compiler_core_ownership.brp` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
 **Blorp compiler key files:**
@@ -415,14 +414,8 @@ compiler/
 │   │   ├── codegen_names.ml     # C name mangling (UFCS, modules)
 │   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
 │   │   └── codegen_builtins.ml  # Builtin function registry
-│   ├── core.ml            # Core IR type definitions and traversal helpers
-│   ├── core_tensor_type.ml # Tensor type/dimension utilities
-│   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
-│   ├── core_layout_type.ml # Layout metadata and erased-storage policy
-│   ├── core_option_layout.ml # Option representation selection
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
-│   ├── core_error.ml      # Core IR structured errors
 │   ├── language_surface.ml # Shared source-language surface facts
 │   ├── pipeline.ml        # Top-level compilation pipeline orchestration
 │   ├── runtime.c          # Embedded C runtime (ARC, collections, IO)
@@ -541,8 +534,8 @@ Token and keyword shapes are defined in `compiler/blorp/src/stage_02_lex/compile
 
 ### Blorp Parser (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`)
 
-Blorp parser that builds the parsed source AST used by the OCaml middle
-pipeline:
+Blorp parser that builds the parsed source AST consumed by module loading,
+typechecking, Core lowering, and compiler tooling:
 
 **Key rules**:
 - `program` - Top-level declarations
@@ -556,20 +549,16 @@ pipeline:
 a + b -> add(a, b)
 ```
 
-The parser helper serializes parsed source artifacts through
-`compiler/blorp/src/stage_03_parse/compiler_parsed_ast_json.brp`. Each artifact carries
-`ast_phase`, `parsed_ast`, a Blorp-owned syntactic `module_surface`, and
-optional `comments`. OCaml decodes the AST in
-`compiler/lib/parsed_ast_json.ml`, decodes and validates the module surface in
-`compiler/lib/module_surface.ml`, then continues with module loading,
-typechecking, Core lowering, and later stages. CLI frontend module graph
-sources are required to use `typecheck_source` artifacts with module surfaces.
-The graph also carries the module-loading context used during Blorp-side import
-discovery: explicit std override, source-package aliases, and local `pkg/`
-roots. The OCaml CLI frontier applies that context before seeding its parse
-cache so graph-driven `check`, `compile`, and `run` do not depend on a second
-config scan for the same policy.
-Typed semantic exports remain in the OCaml typechecker until that stage moves.
+Remaining delegated OCaml tools can receive serialized parsed source artifacts
+through `compiler_parsed_ast_json.brp`. Each artifact carries `ast_phase`,
+`parsed_ast`, a Blorp-owned syntactic `module_surface`, and optional `comments`;
+`parsed_ast_json.ml` and `module_surface.ml` decode that tool boundary. Normal
+`check`, `compile`, and `run` keep parsed values inside the Blorp pipeline.
+
+The production module graph carries the module-loading context used during
+Blorp import discovery: explicit std override, source-package aliases, and
+local `pkg/` roots. The Blorp CLI applies that context once when preparing the
+graph, so compilation does not depend on a second configuration scan.
 
 ### AST (`ast.ml`)
 
@@ -882,10 +871,8 @@ User-facing subcommands:
      synthesize their call sites through the Blorp `compiler_core_synth_*.brp`
      families.
    - Define managed-value contracts in
-     `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`. Until the
-     remaining OCaml Core projection is removed, mirror those contracts in
-     `core_ownership.ml`; the default compiler-unit gate checks parity with the
-     canonical Blorp manifest.
+     `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`, the single
+     source of truth consumed by the Blorp Core and backend stages.
 
 4. **Runtime** (`runtime.c` and `runtime_decl.c`):
    - Add the C implementation **and** its forward declaration if the builtin

@@ -449,10 +449,9 @@ compiler/            # OCaml compiler implementation
     runtime_decl.c    # Runtime forward declarations
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
-    core.ml           # Core IR type definitions and traversal helpers
-    core_ownership.ml  # Remaining OCaml ownership-contract consumers
-    core_layout_type.ml  # Remaining OCaml layout consumers
-    core_error.ml     # Core IR structured errors
+    core_result_layout.ml  # Remaining OCaml Result layout consumers
+    core_type_layout.ml  # Remaining OCaml ownership/layout consumers
+    core_stage.ml     # Shared Core stage names for CLI tooling
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck
     codegen/      # Shared codegen utilities used by the core-emit pipeline
       codegen_names.ml     # C name mangling (UFCS, modules)

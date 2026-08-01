@@ -1668,15 +1668,62 @@ let optimized_option_abi_cases =
   direct_optimized_option_abi_cases @ specialized_optimized_option_abi_cases
 
 let optimized_option_policy_c_return reg meta ty =
-  match Blorp.Core_option_layout.classify meta ty with
-  | Known (StackScalar _ | StackValueRecord _) ->
-      Blorp.Codegen_types.stack_option_c_type ~reg ty
-  | Known NullableManagedPointer ->
-      Option.map
-        (Blorp.Codegen_types.type_to_c ~reg)
-        (Blorp.Core_option_layout.nullable_managed_payload_type meta ty)
-  | Known (BoxedUnion _) -> None
-  | Unknown_named _ | Invalid_option_type _ -> None
+  match Blorp.Codegen_types.stack_option_c_type ~reg ty with
+  | Some _ as c_ty -> c_ty
+  | None -> (
+      match Blorp.Codegen_types.expand_alias ~reg ty with
+      | Blorp.Ast.TyNamed ("Option", [ payload ]) -> (
+          match payload with
+          | Blorp.Ast.TyNamed ("Option", _)
+          | Blorp.Ast.TyVar _
+          | Blorp.Ast.TyBoundVar _
+          | Blorp.Ast.TySelf ->
+              None
+          | payload when Blorp.Core_type_layout.is_stack_result_type meta payload
+            ->
+              None
+          | payload -> (
+              match Blorp.Core_type_layout.classify meta payload with
+              | Known { ownership = Managed; _ } ->
+                  Some (Blorp.Codegen_types.type_to_c ~reg payload)
+              | Known { ownership = Unmanaged; _ }
+              | Unknown_named _
+              | Invalid_value_type _ ->
+                  None))
+      | _ -> None)
+
+let test_optimized_option_policy_boundaries () =
+  let reg = Blorp.Codegen_types.create_registry () in
+  Hashtbl.replace reg.type_aliases "Count" ([], ty "Int");
+  Hashtbl.replace reg.type_aliases "MaybeCount"
+    ([], option_ty (ty "Count"));
+  Blorp.Codegen_types.register_managed_type reg "Widget"
+    {
+      managed_kind = Blorp.Codegen_types.ManagedHeapRecord;
+      destructor = Blorp.Codegen_types.ArcReleaseOnly;
+    };
+  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
+  let check name expected ty =
+    Alcotest.(check (option string))
+      name expected (optimized_option_policy_c_return reg meta ty)
+  in
+  check "primitive Option" (Some "blorp_StackOption_Int")
+    (option_ty (ty "Int"));
+  check "aliased primitive Option" (Some "blorp_StackOption_Int")
+    (ty "MaybeCount");
+  check "managed builtin Option" (Some "blorp_String*")
+    (option_ty (ty "String"));
+  check "managed custom Option" (Some "Widget*")
+    (option_ty (ty "Widget"));
+  check "nested Option remains boxed" None
+    (option_ty (option_ty (ty "String")));
+  check "stack Result payload remains boxed" None
+    (option_ty (Blorp.Ast.TyNamed ("Result", [ ty "Int"; ty "Bool" ])));
+  check "unsafe pointer payload remains boxed" None (option_ty (ty "Ptr"));
+  check "generic payload remains boxed" None
+    (option_ty (Blorp.Ast.TyVar "T"));
+  check "unknown payload is not classified" None
+    (option_ty (ty "UnknownPayload"))
 
 let runtime_return_for_case reg meta case =
   let policy_return =
@@ -2004,5 +2051,7 @@ let suite =
         Alcotest.test_case
           "optimized Option runtime builtins have matching C ABI" `Quick
           test_optimized_option_runtime_builtins_have_matching_c_abi;
+        Alcotest.test_case "optimized Option policy boundaries" `Quick
+          test_optimized_option_policy_boundaries;
       ] );
   ]

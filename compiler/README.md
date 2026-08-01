@@ -1,8 +1,9 @@
 # blorp Compiler
 
-This directory contains the compiler implementation. The frontend, middle
-pipeline, and runtime shell are still largely OCaml, while the formatter,
-bridge, and growing backend-tail slices live in `compiler/blorp/`.
+This directory contains the compiler implementation. Normal `check`,
+`compile`, and `run` commands use the contiguous Blorp-owned frontend, Core
+pipeline, and backend under `compiler/blorp/`. OCaml remains as a private host
+for delegated test, package, REPL, LSP, and purify commands.
 
 ## Quick Start
 
@@ -37,9 +38,9 @@ compiler/
 │   ├── modules.ml            # Import resolution and module loading
 │   ├── infer.ml              # Bidirectional type inference
 │   ├── typecheck.ml          # Type checking, purity, exhaustiveness
-│   ├── core.ml               # Core IR definitions
-│   ├── core_ownership.ml     # Ownership contracts for calls/intrinsics
-│   ├── core_*.ml             # Core data and remaining host-side layout facts
+│   ├── core_result_layout.ml # Remaining host-side Result layout facts
+│   ├── core_type_layout.ml   # Remaining host-side ownership/layout facts
+│   ├── core_stage.ml         # Shared Core stage names for CLI tooling
 │   ├── codegen/              # Shared backend naming/type/builtin helpers
 │   ├── lsp/                  # Language server implementation
 │   ├── runtime.c             # Embedded default C runtime
@@ -57,11 +58,10 @@ compiler/
 ```
 Source (.brp)
   → lex/parse
-  → interpolation desugar + module loading
-  → subscript desugar + infer/typecheck
-  → OCaml Core lowering and early/middle transforms
-  → Blorp-owned function-reference adaptation, DCE, Perceus, reuse,
-    closure conversion, final preparation, and C emission
+  → module graph + infer/typecheck + CTFE
+  → Core lowering, desugaring, specialization, and resolution
+  → DCE, Perceus, reuse, closure conversion, and final preparation
+  → C emission
   → C compiler
   → native binary
 ```

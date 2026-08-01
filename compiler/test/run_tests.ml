@@ -83,13 +83,8 @@ let default_suites =
   @ suite_group "Env" Test_env.suite
   @ suite_group "Typecheck" Test_typecheck.suite
   @ suite_group "FfiBoundary" Test_ffi_boundary.suite
-  @ suite_group "Core" Test_core.suite
-  @ suite_group "CoreTensorType" Test_core_tensor_type.suite
-  @ suite_group "CoreLayoutType" Test_core_layout_type.suite
   @ suite_group "CoreTypeLayout" Test_core_type_layout.suite
-  @ suite_group "CoreOptionLayout" Test_core_option_layout.suite
   @ suite_group "CoreResultLayout" Test_core_result_layout.suite
-  @ suite_group "CoreOwnership" Test_core_ownership.suite
   @ suite_group "OperationResultMetadata" Test_operation_result_metadata.suite
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite

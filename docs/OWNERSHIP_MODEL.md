@@ -2,11 +2,9 @@
 
 This document defines the compiler-facing ownership model for managed values,
 Perceus reference-count insertion, and copy-on-write (COW). It is the semantic
-contract that `core_ownership.ml`, `compiler_core_perceus.brp`,
-`compiler_core_reuse.brp`, `core_emit_layout.ml`, Core intrinsics, and the C
-runtime must implement. Perceus and reuse are production Blorp stages; the
-remaining OCaml modules provide contracts and layout facts before the pre-DCE
-handoff.
+contract that `compiler_core_ownership.brp`, `compiler_core_perceus.brp`,
+`compiler_core_reuse.brp`, final Core preparation and emission, Core
+intrinsics, and the C runtime must implement.
 
 The user-facing memory model is documented in `docs/MEMORY_MODEL.md`. This file
 is lower level: it defines the ownership ABI used by compiler phases.
@@ -30,7 +28,7 @@ earliest layer that has enough information.
 | Layer | Currently enforced |
 |-------|--------------------|
 | Typecheck / inference | Source-level purity, closure capture restrictions, match exhaustiveness, and surface typing for ownership-sensitive operations. |
-| Core ownership contracts | Malformed builtin/intrinsic contracts are rejected by `core_ownership.ml` instead of being interpreted ad hoc by callers. |
+| Core ownership contracts | Malformed builtin/intrinsic contracts are rejected by `compiler_core_ownership.brp` instead of being interpreted ad hoc by callers. |
 | Core preparation and invariants | Final Core must make erased `void*` storage crossings explicit with typed box/unbox nodes where required; unresolved fallback representation choices are rejected before emit. |
 | Perceus / reuse | Managed values receive explicit `CDup` / `CDrop`, and reuse rewrites are limited to proven post-drop, unique-owner candidates. |
 | Runtime | Reference counts, COW uniqueness checks, and reuse helpers preserve the dynamic ownership ABI. |
@@ -151,9 +149,9 @@ The compiler must reject or fail invariants for malformed contracts, for example
 `ReturnAliasOfArg i` pointing to a consuming argument, or `ReturnBorrowed`
 without any caller-preserved argument to anchor its lifetime.
 
-`core_ownership.ml` owns these checks. `validate_contract` reports malformed
-ABI entries, and the contract constructor fails fast for declarations that
-would let a borrowed result alias an argument the caller no longer owns.
+`compiler_core_ownership.brp` owns these checks. `contract_is_well_formed`
+rejects ABI entries that would let a borrowed result alias an argument the
+caller no longer owns.
 
 ## Source-Level Function Boundary
 
@@ -372,7 +370,7 @@ This boundary is deliberately stronger than a raw allocation rewrite:
 | Phase | Ownership responsibility |
 |-------|--------------------------|
 | Lowering | Preserve source semantics in Core. Do not insert retain/release. |
-| Core intrinsics/synthesis | Emit Core shapes whose ownership behavior matches `core_ownership.ml`; emit producer handoff regions only in `BorrowFresh` mode. |
+| Core intrinsics/synthesis | Emit Core shapes whose ownership behavior matches `compiler_core_ownership.brp`; emit producer handoff regions only in `BorrowFresh` mode. |
 | Ownership contracts | Provide the single source of truth for call modes and result modes. |
 | Perceus | Convert ownership facts into `CDup` / `CDrop`; do not invent runtime ABI rules locally. |
 | Reuse analysis/rewrite | Read post-Perceus `CDrop` facts to identify safe allocation-reuse candidates; upgrade explicit producer handoffs to `ConsumeReuse` only by consuming the matching drop; rewrite only through explicit runtime COW/reuse boundaries after uniqueness and allocation compatibility are proven. |

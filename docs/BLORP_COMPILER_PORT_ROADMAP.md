@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status: active, checked against code on 2026-07-30.
+Status: active, checked against code on 2026-07-31.
 
 This is the detailed execution plan for deleting the remaining OCaml compiler
 and tool implementation. It records only the current boundary, remaining
@@ -64,7 +64,6 @@ machine-checked list of production OCaml sources. Every tracked production
 | `bridge` | Process/JSON boundary clients and decoders; delete after no OCaml phase boundary remains |
 | `backend` | C names, types, layout helpers, and Core projection; delete after Blorp owns all final representation policy |
 | `final_core` | Option/result/tensor/hash-container layout policy; delete after no OCaml consumer selects runtime storage |
-| `ownership` | OCaml ownership contract mirror; delete after middle/backend OCaml consumers are gone |
 | `middle_core` | Remaining semantic worker, Core model, fusion, specialization, and orchestration |
 | `lowering` | Ratchet: source-to-Core lowering is Blorp-owned and must not return to OCaml |
 | `ctfe` | Remaining top-level initializer facade; delete after no OCaml type/tool path consumes it |
@@ -172,6 +171,14 @@ deleted.
 Make Blorp the only owner of ownership contracts, final Core layout, boxing,
 runtime operation selection, and C naming. Remove each OCaml mirror when its
 last semantic or tool consumer moves.
+
+### Current Progress
+
+The OCaml Core model, structured Core errors, ownership contracts, tensor and
+erased-storage layout helpers, Option layout policy, and their
+implementation-only tests have been deleted. Their production responsibilities
+are owned by the Blorp Core pipeline. The remaining `final_core` files are
+narrow type/layout helpers still consumed by host-side ABI and tooling paths.
 
 ### Execution
 
