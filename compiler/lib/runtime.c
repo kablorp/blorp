@@ -2106,9 +2106,18 @@ static blorp_IoWaiter* blorp_io_waiter_new(
     return waiter;
 }
 
-static void blorp_io_waiter_retain(blorp_IoWaiter* waiter) {
+// The parked operation owns the initial waiter reference. Reactor slots,
+// deadlines, and ready lists hold secondary references while they can access
+// the waiter asynchronously. Model only the operation reference for Clang's
+// path-sensitive analyzer: it does not understand atomic reference counts and
+// otherwise treats a valid secondary release as the final free.
+static void blorp_io_waiter_shared_retain(blorp_IoWaiter* waiter) {
+#if defined(__clang_analyzer__)
+    (void)waiter;
+#else
     if (!waiter) return;
     atomic_fetch_add_explicit(&waiter->refcount, 1, memory_order_relaxed);
+#endif
 }
 
 // Deadline expiry and cancellation must target the exact parked operation.
@@ -2137,19 +2146,28 @@ static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
     free(waiter);
 }
 
+static void blorp_io_waiter_shared_release(blorp_IoWaiter* waiter) {
+#if defined(__clang_analyzer__)
+    (void)waiter;
+#else
+    blorp_io_waiter_release(waiter);
+#endif
+}
+
 static blorp_IoWaiterList blorp_io_waiter_list_empty(void) {
     return (blorp_IoWaiterList){ .head = NULL, .tail = NULL, .count = 0 };
 }
 
-static void blorp_io_waiter_list_push(
+static void blorp_io_waiter_list_push_owned(
     blorp_IoWaiterList* list,
     blorp_IoWaiter* waiter
 ) {
-    if (!list || !waiter) return;
-    // Ready lists cross from the reactor/deadline path back to the parked
-    // fiber. Hold a list reference so the fiber cannot free the waiter while
-    // the reactor is still counting or walking the ready list.
-    blorp_io_waiter_retain(waiter);
+    if (!list || !waiter) {
+        fprintf(stderr, "blorp: invalid owned IO waiter transfer (bug)\n");
+        abort();
+    }
+    // Consume the installed-slot reference. The ready list now keeps the
+    // waiter alive until wake_all releases that same reference.
     waiter->next = NULL;
     if (list->tail) {
         list->tail->next = waiter;
@@ -2227,7 +2245,7 @@ static blorp_IoInstallWaiterResult blorp_tcp_inner_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
-    blorp_io_waiter_retain(waiter);
+    blorp_io_waiter_shared_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_tcp(inner);
     waiter->next = NULL;
@@ -2252,7 +2270,7 @@ static int blorp_tcp_inner_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
     blorp_io_deadline_queue_remove(waiter);
-    blorp_io_waiter_release(waiter);
+    blorp_io_waiter_shared_release(waiter);
     return 1;
 }
 
@@ -2322,8 +2340,7 @@ static void blorp_tcp_inner_extract_waiter_slot_locked(
     waiter->wake_reason = reason;
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
-    blorp_io_waiter_list_push(waiters, waiter);
-    blorp_io_waiter_release(waiter);
+    blorp_io_waiter_list_push_owned(waiters, waiter);
 }
 
 static blorp_IoWaiterList blorp_tcp_inner_extract_waiters_locked(
@@ -3929,6 +3946,8 @@ static int blorp_utf8_encoded_len(int32_t cp) {
 
 // Unicode default case mapping tables generated from Python
 // unicodedata 16.0.0. Keep in sync with Python-style String casing tests.
+enum { BLORP_UNICODE_CASE_MAPPING_CAPACITY = 3 };
+
 typedef struct {
     int32_t start;
     int32_t end;
@@ -3938,8 +3957,13 @@ typedef struct {
 typedef struct {
     int32_t codepoint;
     uint8_t length;
-    int32_t mapping[3];
+    int32_t mapping[BLORP_UNICODE_CASE_MAPPING_CAPACITY];
 } blorp_unicode_case_special;
+
+typedef struct {
+    uint8_t length;
+    int32_t codepoints[BLORP_UNICODE_CASE_MAPPING_CAPACITY];
+} blorp_unicode_case_mapping;
 
 typedef struct {
     int32_t codepoint;
@@ -6124,7 +6148,13 @@ static bool blorp_codepoint_in_ranges(int32_t cp, const blorp_unicode_case_range
     return false;
 }
 
-static bool blorp_unicode_case_lookup(int32_t cp, const blorp_unicode_case_range* ranges, size_t range_count, const blorp_unicode_case_special* specials, size_t special_count, int32_t out[3], uint8_t* out_len) {
+static blorp_unicode_case_mapping blorp_unicode_case_lookup(
+    int32_t cp,
+    const blorp_unicode_case_range* ranges,
+    size_t range_count,
+    const blorp_unicode_case_special* specials,
+    size_t special_count
+) {
     size_t lo = 0;
     size_t hi = special_count;
     while (lo < hi) {
@@ -6134,11 +6164,19 @@ static bool blorp_unicode_case_lookup(int32_t cp, const blorp_unicode_case_range
         } else if (cp > specials[mid].codepoint) {
             lo = mid + 1;
         } else {
-            *out_len = specials[mid].length;
-            out[0] = specials[mid].mapping[0];
-            out[1] = specials[mid].mapping[1];
-            out[2] = specials[mid].mapping[2];
-            return true;
+            if (specials[mid].length == 0 ||
+                specials[mid].length > BLORP_UNICODE_CASE_MAPPING_CAPACITY) {
+                fprintf(stderr, "blorp: invalid Unicode case mapping table (bug)\n");
+                abort();
+            }
+            return (blorp_unicode_case_mapping){
+                .length = specials[mid].length,
+                .codepoints = {
+                    specials[mid].mapping[0],
+                    specials[mid].mapping[1],
+                    specials[mid].mapping[2]
+                }
+            };
         }
     }
 
@@ -6151,19 +6189,17 @@ static bool blorp_unicode_case_lookup(int32_t cp, const blorp_unicode_case_range
         } else if (cp > ranges[mid].end) {
             lo = mid + 1;
         } else {
-            *out_len = 1;
-            out[0] = cp + ranges[mid].delta;
-            out[1] = 0;
-            out[2] = 0;
-            return true;
+            return (blorp_unicode_case_mapping){
+                .length = 1,
+                .codepoints = {cp + ranges[mid].delta, 0, 0}
+            };
         }
     }
 
-    *out_len = 1;
-    out[0] = cp;
-    out[1] = 0;
-    out[2] = 0;
-    return false;
+    return (blorp_unicode_case_mapping){
+        .length = 1,
+        .codepoints = {cp, 0, 0}
+    };
 }
 
 static bool blorp_utf8_decode_span(const blorp_String* s, long pos, blorp_utf8_span* span) {
@@ -6263,21 +6299,34 @@ static blorp_String* blorp_ascii_case_map(const blorp_String* s, bool upper) {
     return result;
 }
 
-static void blorp_case_mapping_for_span(const blorp_utf8_span* spans, long count, long index, bool upper, int32_t out[3], uint8_t* out_len) {
+static blorp_unicode_case_mapping blorp_case_mapping_for_span(
+    const blorp_utf8_span* spans,
+    long count,
+    long index,
+    bool upper
+) {
     int32_t cp = spans[index].codepoint;
     if (!upper && cp == 0x03A3 && blorp_is_final_sigma_context(spans, count, index)) {
-        *out_len = 1;
-        out[0] = 0x03C2;
-        out[1] = 0;
-        out[2] = 0;
-        return;
+        return (blorp_unicode_case_mapping){
+            .length = 1,
+            .codepoints = {0x03C2, 0, 0}
+        };
     }
 
     if (upper) {
-        blorp_unicode_case_lookup(cp, blorp_upper_ranges, sizeof(blorp_upper_ranges) / sizeof(blorp_upper_ranges[0]), blorp_upper_specials, sizeof(blorp_upper_specials) / sizeof(blorp_upper_specials[0]), out, out_len);
-    } else {
-        blorp_unicode_case_lookup(cp, blorp_lower_ranges, sizeof(blorp_lower_ranges) / sizeof(blorp_lower_ranges[0]), blorp_lower_specials, sizeof(blorp_lower_specials) / sizeof(blorp_lower_specials[0]), out, out_len);
+        return blorp_unicode_case_lookup(
+            cp,
+            blorp_upper_ranges,
+            sizeof(blorp_upper_ranges) / sizeof(blorp_upper_ranges[0]),
+            blorp_upper_specials,
+            sizeof(blorp_upper_specials) / sizeof(blorp_upper_specials[0]));
     }
+    return blorp_unicode_case_lookup(
+        cp,
+        blorp_lower_ranges,
+        sizeof(blorp_lower_ranges) / sizeof(blorp_lower_ranges[0]),
+        blorp_lower_specials,
+        sizeof(blorp_lower_specials) / sizeof(blorp_lower_specials[0]));
 }
 
 static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
@@ -6299,12 +6348,12 @@ static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
             out_len = blorp_checked_add(out_len, (size_t)spans[i].length);
             continue;
         }
-        int32_t mapped[3] = {0, 0, 0};
-        uint8_t mapped_len = 0;
-        blorp_case_mapping_for_span(spans, count, i, upper, mapped, &mapped_len);
-        for (uint8_t j = 0; j < mapped_len; j++) {
+        blorp_unicode_case_mapping mapped =
+            blorp_case_mapping_for_span(spans, count, i, upper);
+        for (uint8_t j = 0; j < mapped.length; j++) {
             out_len = blorp_checked_add(
-                out_len, (size_t)blorp_utf8_encoded_len(mapped[j]));
+                out_len,
+                (size_t)blorp_utf8_encoded_len(mapped.codepoints[j]));
         }
     }
 
@@ -6320,12 +6369,11 @@ static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
             write += (size_t)spans[i].length;
             continue;
         }
-        int32_t mapped[3] = {0, 0, 0};
-        uint8_t mapped_len = 0;
-        blorp_case_mapping_for_span(spans, count, i, upper, mapped, &mapped_len);
-        for (uint8_t j = 0; j < mapped_len; j++) {
+        blorp_unicode_case_mapping mapped =
+            blorp_case_mapping_for_span(spans, count, i, upper);
+        for (uint8_t j = 0; j < mapped.length; j++) {
             unsigned char encoded[4];
-            int len = blorp_utf8_encode(mapped[j], encoded);
+            int len = blorp_utf8_encode(mapped.codepoints[j], encoded);
             memcpy(result->data + write, encoded, (size_t)len);
             write += (size_t)len;
         }
@@ -17717,7 +17765,7 @@ static blorp_IoInstallWaiterResult blorp_udp_socket_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
-    blorp_io_waiter_retain(waiter);
+    blorp_io_waiter_shared_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_udp(socket);
     waiter->next = NULL;
@@ -17743,7 +17791,7 @@ static int blorp_udp_socket_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&socket->mutex);
     blorp_io_deadline_queue_remove(waiter);
-    blorp_io_waiter_release(waiter);
+    blorp_io_waiter_shared_release(waiter);
     return 1;
 }
 
@@ -17760,8 +17808,7 @@ static void blorp_udp_socket_extract_waiter_slot_locked(
     waiter->wake_reason = reason;
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
-    blorp_io_waiter_list_push(waiters, waiter);
-    blorp_io_waiter_release(waiter);
+    blorp_io_waiter_list_push_owned(waiters, waiter);
 }
 
 static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
@@ -22183,7 +22230,7 @@ static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters) {
                 blorp_io_wake_reason_to_fiber_cause(waiter->wake_reason),
                 "io waiter wake");
         }
-        blorp_io_waiter_release(waiter);
+        blorp_io_waiter_shared_release(waiter);
         waiter = next;
     }
 }
@@ -22331,7 +22378,7 @@ static blorp_IoDeadlineEntry blorp_io_deadline_entry_empty(void) {
 static void blorp_io_deadline_entry_release(blorp_IoDeadlineEntry* entry) {
     if (!entry) return;
     blorp_io_wait_owner_release(entry->owner);
-    if (entry->waiter) blorp_io_waiter_release(entry->waiter);
+    if (entry->waiter) blorp_io_waiter_shared_release(entry->waiter);
     entry->owner = blorp_io_wait_owner_none();
     entry->waiter = NULL;
 }
@@ -22395,7 +22442,7 @@ static void blorp_io_deadline_queue_insert(
     blorp_io_deadline_heap_reserve(__blorp_io_deadline_queue.len + 1);
     size_t idx = __blorp_io_deadline_queue.len++;
     __blorp_io_deadline_queue.items[idx] = waiter;
-    blorp_io_waiter_retain(waiter);
+    blorp_io_waiter_shared_retain(waiter);
     blorp_io_wait_owner_retain(owner);
     waiter->deadline_index = (long)idx;
     waiter->deadline_queued = true;
