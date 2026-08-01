@@ -6660,38 +6660,50 @@ blorp_String* blorp_uint128_to_string(unsigned __int128 v) {
     return blorp_string_from_buf(buf + pos, len);
 }
 
+static blorp_String* blorp_nonfinite_float_to_string(double f) {
+    if (isnan(f)) {
+        return blorp_string_from_buf("nan", 3);
+    }
+    if (signbit(f)) {
+        return blorp_string_from_buf("-inf", 4);
+    }
+    return blorp_string_from_buf("inf", 3);
+}
+
 blorp_String* blorp_float_to_string(double f) {
+    if (!isfinite(f)) {
+        return blorp_nonfinite_float_to_string(f);
+    }
+
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", f);
 
-    if (isfinite(f)) {
-        uint64_t original_bits = 0;
-        memcpy(&original_bits, &f, sizeof(original_bits));
-        bool exact = false;
+    uint64_t original_bits = 0;
+    memcpy(&original_bits, &f, sizeof(original_bits));
+    bool exact = false;
 
-        if (len > 0 && len < (int)sizeof(buf)) {
+    if (len > 0 && len < (int)sizeof(buf)) {
+        char* end = NULL;
+        double parsed = strtod(buf, &end);
+        uint64_t parsed_bits = 0;
+        memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
+        exact = end == buf + len && original_bits == parsed_bits;
+    }
+
+    /* Preserve the established, human-readable %g form whenever it is
+       already exact. Otherwise increase significant digits until the
+       decimal text round-trips to the same IEEE double. */
+    if (!exact) {
+        for (int precision = 7; precision <= DBL_DECIMAL_DIG; precision++) {
+            len = snprintf(buf, sizeof(buf), "%.*g", precision, f);
+            if (len <= 0 || len >= (int)sizeof(buf)) continue;
+
             char* end = NULL;
             double parsed = strtod(buf, &end);
             uint64_t parsed_bits = 0;
             memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
-            exact = end == buf + len && original_bits == parsed_bits;
-        }
 
-        /* Preserve the established, human-readable %g form whenever it is
-           already exact. Otherwise increase significant digits until the
-           decimal text round-trips to the same IEEE double. */
-        if (!exact) {
-            for (int precision = 7; precision <= DBL_DECIMAL_DIG; precision++) {
-                len = snprintf(buf, sizeof(buf), "%.*g", precision, f);
-                if (len <= 0 || len >= (int)sizeof(buf)) continue;
-
-                char* end = NULL;
-                double parsed = strtod(buf, &end);
-                uint64_t parsed_bits = 0;
-                memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
-
-                if (end == buf + len && original_bits == parsed_bits) break;
-            }
+            if (end == buf + len && original_bits == parsed_bits) break;
         }
     }
 
@@ -6700,6 +6712,10 @@ blorp_String* blorp_float_to_string(double f) {
 }
 
 blorp_String* blorp_format_float(double f, long decimals) {
+    if (!isfinite(f)) {
+        return blorp_nonfinite_float_to_string(f);
+    }
+
     char buf[350]; /* DBL_MAX with 20 decimals needs ~332 chars */
     if (decimals < 0) decimals = 0;
     if (decimals > 20) decimals = 20;
@@ -6710,6 +6726,10 @@ blorp_String* blorp_format_float(double f, long decimals) {
 }
 
 blorp_String* blorp_float32_to_string(float f) {
+    if (!isfinite((double)f)) {
+        return blorp_nonfinite_float_to_string((double)f);
+    }
+
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", (double)f);
     if (len < 0) len = 0;
@@ -6718,6 +6738,10 @@ blorp_String* blorp_float32_to_string(float f) {
 
 #ifdef __FLT16_MAX__
 blorp_String* blorp_float16_to_string(_Float16 f) {
+    if (!isfinite((double)f)) {
+        return blorp_nonfinite_float_to_string((double)f);
+    }
+
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", (double)f);
     if (len < 0) len = 0;
