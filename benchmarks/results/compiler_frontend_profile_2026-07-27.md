@@ -93,10 +93,10 @@ loop.
 
 1. Function body materialization is the dominant envelope. Finalization and
    typed-expression validation are now measured independently, and finalization
-   reuses its canonical zonked value slot for coherent mirrored type fields.
-   Malformed mirrors are still zonked independently so validation can report
-   them. A recursive struct that combined the two validation traversals was
-   measured and rejected; keep the specialized `Bool` and `Option[String]`
+   stores semantic and runtime value types only in its canonical value slot.
+   Accessors derive both views from that slot, so malformed mirrors are no longer
+   representable. A recursive struct that combined the two validation traversals
+   was measured and rejected; keep the specialized `Bool` and `Option[String]`
    traversals until the ownership cost of aggregate returns is addressed.
 2. Signature registration is no longer a low-risk latency target. The completed
    aggregate production measurement found 0.045% fewer instructions on the CLI
@@ -500,3 +500,194 @@ semantic worker
 `535ac8dd3398144d1b5b13bbb22122e5db1a5af7db919670308bacc6ecc0dd6e`,
 and bootstrap bridge
 `5c0d99b9ca8da35c2e5d008bc1ca08ec9b6eda2dd8de8010a686a43079bbaa88`.
+
+## Compact Typed-Expression Metadata Result
+
+`CompilerTypedExprInfo` previously retained `semantic_type` and `value_type`
+beside the canonical `CompilerValueSlot` that already contains the semantic
+type and widening decision. The mirrors have been removed. Named accessors now
+derive both type views from the slot, and typed-AST JSON continues to emit the
+same fields for artifact compatibility. Finalization zonks the slot once rather
+than conditionally maintaining three representations. Validation still checks
+the slot's internal semantic/decision invariant, while cross-representation
+incoherence is now unrepresentable.
+
+The retained bridge replay used identical parser and renderer binaries and
+alternated baseline and compact typecheck workers. Responses were byte-identical.
+
+| Workload | Baseline elapsed | Compact elapsed | Paired change | Baseline RSS | Compact RSS |
+|----------|------------------|-----------------|---------------|--------------|-------------|
+| default, 20 runs | 144.765 ms | 143.602 ms | -1.16% | 12,271,616 bytes | 12,353,536 bytes |
+| wide, 10 runs | 569.830 ms | 572.147 ms | -0.79% | 25,165,824 bytes | 25,223,168 bytes |
+| `compiler_infer.brp`, 5 pairs | 12.73 s | 12.90 s | -0.24% | 590,512,128 bytes | 590,397,440 bytes |
+
+The absolute and paired timing directions disagree in the wider samples, and
+RSS changes are below one percent, so these measurements do not establish a
+whole-frontend latency or peak-RSS improvement. A `vmmap` sample of the wide
+replay reported the same 247,013 allocations for both workers but reduced the
+`MALLOC_SMALL` reservation from 37,748,736 bytes to 33,554,432 bytes (36 MiB to
+32 MiB). Physical footprint was effectively flat (20,656,947 versus 20,552,089
+bytes). The supported conclusion is narrower: the typed-expression model owns
+two fewer recursive type values per node, reserves less small-allocation space
+under the wide fixture, and has a single representable source of truth.
+
+The baseline typecheck bridge SHA-256 is
+`86781ef422c97f6f1c9792bfbf1b08d286226157fbc0b6691bf5cbcc97eeda8f`.
+The compact bridge SHA-256 is
+`4b46b5578ab43ca8a456e828b7418e30040cb0816dfdd5ffa9bcfc739d2208be`.
+
+## Canonical Return Alias Boundary Result
+
+Function signatures canonicalize annotations during registration, and finalized
+typed-expression slots carry canonical semantic and value types. Return
+compatibility nevertheless resolved both inputs through the complete alias
+reconstruction traversal on every function body. The comparison is now an
+environment-free canonical boundary: it accepts the in-scope type-parameter
+names plus the two canonical types and calls structural compatibility directly.
+Focused coverage verifies nested generic function-alias expansion before this
+boundary and forwarding a call result through an alias-typed return.
+
+Five profiled A/B pairs used the retained function-heavy workload with five
+iterations per sample:
+
+| Operation | Baseline | Canonical boundary | Change |
+|-----------|----------|--------------------|--------|
+| `compiler_env_resolve_alias` calls | 11,705 | 9,135 | -2,570 (-22.0%) |
+| return compatibility calls | 1,285 | 1,285 | unchanged |
+| return compatibility inclusive time | 34.565 ms | 18.437 ms | -46.7% |
+
+The exact call reduction is two full alias resolutions for each compatibility
+check. As in earlier function-profile experiments, instrumentation distorted the
+complete workload: every candidate sample was slower, with an 11.7% paired
+median regression. That result is not production latency evidence. Raw samples
+are in `compiler_return_alias_boundary_profiled_2026-08-01.tsv`.
+
+A fair unprofiled bridge comparison then built baseline and candidate workers
+from the same pinned bootstrap and alternated 20 measured runs after two
+warmups:
+
+| Measurement | Baseline median | Canonical boundary median | Paired change |
+|-------------|-----------------|---------------------------|---------------|
+| elapsed | 91.798 ms | 91.509 ms | -0.68% |
+| peak RSS | 12,763,136 bytes | 12,730,368 bytes | -0.26% |
+
+The 1,282,207-byte responses were byte-identical. The supported conclusion is
+reduced redundant work and a clearer canonical-type contract, not a measurable
+whole-worker speedup or memory reduction. Broader alias caching should wait for
+an alias-heavy scaling fixture with expanded-node and reconstructed-node counts.
+Aggregate replay evidence is in
+`compiler_return_alias_boundary_unprofiled_2026-08-01.tsv`.
+
+The baseline source is commit `53002113`, with
+`compiler_typecheck_decl.brp` SHA-256
+`88e9408c70ea094a9ded29b822fb7a6245bac33bfef1effa3c3a69e84510af69`.
+The candidate source SHA-256 is
+`fcd2f16635c2a4d1cc95af41b258fec46ccfb8fb88fe7960d7c3477999d364fd`.
+
+## Alias Target Sharing Result
+
+Full alias resolution copied every immutable alias target before passing it to
+pure substitution, which then either shared or reconstructed that value before
+the resolver traversed it again. Alias targets are immutable environment data,
+and the head-only resolver already passes them directly to the same substitution
+function. Full resolution now follows that established ownership boundary.
+
+An `alias` mode in `compiler_typecheck_profile` provides a deterministic fast
+feedback loop. The measured workload performed 2,560 resolutions through a
+16-alias chain whose final structural target contained 129 nodes. It validated
+all results while reporting 40,960 logical alias expansions and 330,240 logical
+result nodes.
+
+Five alternating profiled pairs produced:
+
+| Measurement | Baseline median | Shared-target median | Change |
+|-------------|-----------------|----------------------|--------|
+| defensive copy calls | 737,424 | 368,784 | -368,640 (-50.0%) |
+| resolver-node visits | 371,200 | 371,200 | unchanged |
+| alias expansions | 40,960 | 40,960 | unchanged |
+| full resolver inclusive time | 309.731 ms | 250.164 ms | -19.2% |
+| alias workload elapsed | 511.705 ms | 449.520 ms | -12.15% |
+
+Every elapsed pair improved, between 11.3% and 12.5%. The 368,640-call reduction
+is exact: each resolution no longer copies the 129-node final target plus the 15
+one-node intermediate alias targets. Required alias expansion and resolver
+traversal counts are unchanged. Raw samples are in
+`compiler_alias_target_copy_profiled_2026-08-01.tsv`.
+
+A fair unprofiled full-worker comparison alternated 20 measured runs after two
+warmups on the existing typecheck-memory fixture:
+
+| Measurement | Baseline median | Shared-target median | Paired change |
+|-------------|-----------------|----------------------|---------------|
+| elapsed | 91.505 ms | 91.301 ms | -0.30% |
+| peak RSS | 12,763,136 bytes | 12,763,136 bytes | -0.13% |
+
+The 1,282,207-byte responses were byte-identical. The supported conclusion is a
+material improvement for alias-heavy resolution, with no measurable change to
+the broad worker fixture. This slice adds sharing, not a cache, and preserves
+cycle handling and final structural reconstruction. Aggregate replay evidence
+is in `compiler_alias_target_copy_unprofiled_2026-08-01.tsv`.
+
+The baseline `compiler_env.brp` SHA-256 is
+`05032f39d76b7b5ebe9da5f839c38f89b3d995a0842e911abe08d01b9434e3e5`;
+the candidate is
+`05b247381222497c29a1fdcdeb3580441afc8e5208c7329b034e899f2388d000`.
+The corresponding profiled artifact SHA-256 values are
+`a6bf048979af630404eadd36588cf6c610f0da81a8b6662cca4409d310b6eb8f`
+and `ab60a7314fc8ed2c2ac108792e9a0bf158cecf8f4a4f090e70a30c161b5e0fc2`.
+
+## Alias Registration Sharing Result
+
+Transparent alias registration deep-copied the immutable target before storing
+it in the persistent environment. Registration now retains the target directly,
+matching the sharing boundary used by other immutable compiler values. Opaque
+alias registration still copies its target; this slice does not change that
+nominal boundary.
+
+The new `alias-register` workload constructs one 129-node structural target,
+then registers it under 16 names in each of 256 fresh environments. Target
+construction is outside the timed region. The timed workload includes one
+validating lookup and structural comparison per environment, so the elapsed row
+below is registration plus validation. Ten alternating profiled pairs produced:
+
+| Measurement | Baseline median | Shared-target median | Change |
+|-------------|-----------------|----------------------|--------|
+| defensive copy calls | 561,408 | 33,024 | -528,384 (-94.1%) |
+| alias registrations | 4,096 | 4,096 | unchanged |
+| registration-plus-validation elapsed | 117.721 ms | 30.069 ms | -74.5% |
+
+The call reduction is exact: 4,096 registrations no longer reconstruct the
+129-node target, removing 528,384 recursive copy calls. The remaining 33,024
+calls come from one 129-node validating lookup per iteration. All ten combined
+elapsed pairs improved, between 73.1% and 77.3%. The isolated
+`compiler_env_add_alias` profile row fell from a 59.939 ms median to 5.649 ms.
+Raw measurements are in
+`compiler_alias_registration_copy_profiled_2026-08-01.tsv`.
+
+A fair whole-worker comparison alternated 20 runs after two warmups using
+workers built from the same post-merge compiler and pinned bootstrap:
+
+| Measurement | Baseline median | Shared-target median | Paired change |
+|-------------|-----------------|----------------------|---------------|
+| elapsed | 92.954 ms | 93.475 ms | +0.22% |
+| peak RSS | 12,763,136 bytes | 12,713,984 bytes | -0.39% |
+
+The 1,282,207-byte responses were byte-identical. Both whole-worker differences
+are noise-level, as expected for a fixture that does little alias registration.
+The supported conclusion is a material reduction in work for alias-heavy
+registration, not a measurable broad typecheck speedup. Aggregate replay
+evidence is in
+`compiler_alias_registration_copy_unprofiled_2026-08-01.tsv`.
+
+The production baseline is merge commit `5d38ca2d` plus the same uncommitted
+`alias-register` harness used by the candidate. The measured fixture and runner
+SHA-256 values are
+`c70a7c64e9a36087f43ba07232e63f023abf5e2d95e2fe30cd9d477bbed70c9f`
+and `30f3b66f30ea652028e1f3cb1def5a1070afc856eeb523a48400c2eb4ed99c6d`.
+The baseline `compiler_env.brp` SHA-256 is
+`05b247381222497c29a1fdcdeb3580441afc8e5208c7329b034e899f2388d000`.
+The candidate source SHA-256 is
+`9c927b757e824a969b9434a339b169433d061ff630a0791fc4e3abf088a80fd6`.
+The baseline and candidate typecheck worker SHA-256 values are
+`91621e11f1e273bc930cc3bc4b1e37e33ffb492cde49d6d8e47b9c88581cd4cb`
+and `f2d3fa6c80978dc157d6b049633c52e9156ad42c89bcdf46e72eecf0831f379a`.

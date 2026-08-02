@@ -243,6 +243,41 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+Use `alias` mode to isolate full alias expansion without parsing or graph-wide
+typechecking work:
+
+```bash
+BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
+  benchmarks/compiler_typecheck_profile 20 16 64 128 alias
+```
+
+In this mode the positional controls are iterations, alias-chain depth,
+structural target depth, and resolutions per iteration. The
+`ALIAS_RESOLUTION_PROFILE_BENCH` summary reports logical alias expansions and
+result nodes. Pair those values with the profile call counts for
+`compiler_env_resolve_alias_seen`, `compiler_apply_subst`, and
+`compiler_env_copy_type` to distinguish required traversal from defensive
+reconstruction. The fixture is deterministic and validates every resolved type
+against the structural target.
+
+Use `alias-register` mode to isolate the persistent-environment boundary that
+stores transparent alias targets:
+
+```bash
+BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
+  benchmarks/compiler_typecheck_profile 256 16 64 1 alias-register
+```
+
+The positional controls are iterations, aliases per fresh environment, and
+structural target depth; the fourth numeric argument is ignored but retained so
+the workload selector remains the fifth argument. Target construction is
+excluded from elapsed time. The timed workload includes registration plus one
+validating lookup and structural comparison per environment. The summary
+reports logical registrations and the recursive copy nodes attributable to
+baseline registration. Subtract candidate from baseline
+`compiler_env_copy_type` calls to isolate those registration copies; the
+remaining calls belong to validation.
+
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, renderer-source, prepared-helper, and
 legacy parser overrides by default. This keeps one cache key tied to one
