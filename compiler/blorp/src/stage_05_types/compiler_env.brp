@@ -254,9 +254,10 @@ record CompilerSymbolLookup {
 }
 
 
-record CompilerScope {
+private record CompilerScope {
 	symbols: List[CompilerSymbol],
-	symbols_by_name: Dict[String, List[Int]]
+	symbols_by_name: Dict[String, List[Int]],
+	function_indexes_by_callable_id: Dict[Int, Int]
 }
 
 
@@ -368,7 +369,8 @@ record CompilerEnv {
 private pure func compiler_empty_scope() -> CompilerScope:
 	{
 		symbols = [],
-		symbols_by_name = {}
+		symbols_by_name = {},
+		function_indexes_by_callable_id = {}
 	}
 
 
@@ -472,12 +474,19 @@ private pure func compiler_scope_add_symbol(
 		.get(symbol.name)
 		.get_or([])
 
+	function_indexes = match symbol.kind:
+		CompilerFuncSymbolKind(func_symbol):
+			scope.function_indexes_by_callable_id.set(func_symbol.callable_id, symbol_index)
+		_:
+			scope.function_indexes_by_callable_id
+
 	{ scope |
 		symbols = scope.symbols.append(symbol),
 		symbols_by_name = scope.symbols_by_name.set(
 			symbol.name,
 			[symbol_index].concat(name_candidates),
-		)
+		),
+		function_indexes_by_callable_id = function_indexes
 	}
 
 
@@ -1084,7 +1093,11 @@ pure func compiler_env_find_func_named_by_def_id(
 	var result: Option[CompilerFuncSymbol] = None
 
 	for scope in env.scopes:
-		for index in scope.symbols_by_name.get(name).get_or([]):
+		for index in (
+			scope.symbols_by_name
+				.get(name)
+				.get_or([])
+		):
 			match scope.symbols.get(index):
 				Some(symbol):
 					match symbol.kind:
@@ -1950,10 +1963,7 @@ private pure func compiler_env_resolve_alias_seen(
 								type_params,
 								resolved_args,
 							)
-							substituted: CompilerType = compiler_apply_subst(
-								subst,
-								target,
-							)
+							substituted: CompilerType = compiler_apply_subst(subst, target)
 							compiler_env_resolve_alias_seen(
 								env,
 								seen.append(name),
@@ -3228,6 +3238,28 @@ pure func compiler_env_find_ufcs_method_by_def_id(
 					None
 
 
+private pure func compiler_scope_find_func_by_def_id(
+	scope: CompilerScope,
+	def_id: Int,
+) -> Option[CompilerFuncSymbol]:
+	match scope.function_indexes_by_callable_id.get(def_id):
+		Some(index):
+			match scope.symbols.get(index):
+				Some(symbol):
+					match symbol.kind:
+						CompilerFuncSymbolKind(func_symbol):
+							if func_symbol.callable_id == def_id:
+								Some(compiler_func_symbol_copy(func_symbol))
+							else:
+								None
+						_:
+							None
+				None:
+					None
+		None:
+			None
+
+
 pure func compiler_env_find_func_by_def_id(
 	env: CompilerEnv,
 	def_id: Int,
@@ -3235,17 +3267,12 @@ pure func compiler_env_find_func_by_def_id(
 	var result: Option[CompilerFuncSymbol] = None
 
 	for scope in env.scopes:
-		for symbol in compiler_scope_symbols_in_lookup_order(scope):
-			match symbol.kind:
-				CompilerFuncSymbolKind(func_symbol):
-					if func_symbol.callable_id == def_id:
-						result = Some(compiler_func_symbol_copy(func_symbol))
-						break
-				_:
-					void
-
-		if result.is_some():
-			break
+		match compiler_scope_find_func_by_def_id(scope, def_id):
+			Some(func_symbol):
+				result = Some(func_symbol)
+				break
+			None:
+				void
 
 	result
 

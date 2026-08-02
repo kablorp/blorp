@@ -117,8 +117,26 @@ import:
 	../src/stage_06_typecheck/compiler_imports:
 		CompilerImportableModule,
 		CompilerImportableModuleSurface,
+		CompilerImportableSignatureDecl(
+			CompilerImportableForeignFunctionDecl,
+			CompilerImportableFunctionDecl,
+			CompilerImportableTraitDecl,
+			CompilerImportableVarDecl,
+		),
+		CompilerImportableTypeDecl(
+			CompilerImportableBuiltinTypeDecl,
+			CompilerImportableRecordDecl,
+			CompilerImportableTypeAliasDecl,
+			CompilerImportableUnionDecl,
+		),
 		compiler_importable_module,
+		compiler_importable_module_declared_imports,
+		compiler_importable_module_impl_decls,
+		compiler_importable_module_local_type_names,
+		compiler_importable_module_path,
+		compiler_importable_module_signature_decls,
 		compiler_importable_module_surface,
+		compiler_importable_module_type_decls,
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerExprTypeOrigin(CompilerInferredOrigin),
 		CompilerTypedExpr(CompilerTypedForExpr, CompilerTypedIntLiteralExpr),
@@ -814,7 +832,7 @@ pure func impl_decl_with_methods(
 	})
 
 
-pure func foreign_block_decl(function_name: String) -> ParsedDecl:
+pure func foreign_block_visibility_decl(function_name: String, is_private: Bool) -> ParsedDecl:
 	ForeignBlockParsedDecl(
 		[],
 		[
@@ -824,13 +842,17 @@ pure func foreign_block_decl(function_name: String) -> ParsedDecl:
 				return_type = int_type(),
 				c_name = None,
 				is_pure = False,
-				is_private = False,
+				is_private = is_private,
 				annotations = [],
 				span = source_span()
 			},
 		],
 		source_span(),
 	)
+
+
+pure func foreign_block_decl(function_name: String) -> ParsedDecl:
+	foreign_block_visibility_decl(function_name, False)
 
 
 pure func foreign_block_with_metadata_decl() -> ParsedDecl:
@@ -932,6 +954,74 @@ pure func importable_module(
 		CompilerSourcePackageModule("test"),
 		module_surface_for_program(program(decls)),
 		decls,
+	)
+
+
+private pure func importable_type_decl_name(decl: CompilerImportableTypeDecl) -> String:
+	match decl:
+		CompilerImportableRecordDecl(record_decl):
+			record_decl.name.text
+		CompilerImportableUnionDecl(union_decl):
+			union_decl.name.text
+		CompilerImportableBuiltinTypeDecl(type_decl):
+			type_decl.name.text
+		CompilerImportableTypeAliasDecl(alias_decl):
+			alias_decl.name.text
+
+
+private pure func importable_signature_decl_name(decl: CompilerImportableSignatureDecl) -> String:
+	match decl:
+		CompilerImportableFunctionDecl(function_decl):
+			function_decl.name.text
+		CompilerImportableVarDecl(var_decl):
+			var_decl.name.text
+		CompilerImportableForeignFunctionDecl(function_decl):
+			function_decl.name.text
+		CompilerImportableTraitDecl(trait_decl):
+			trait_decl.name.text
+
+
+func test_importable_module_precomputes_interface_facts() -> Bool:
+	module = importable_module(
+		"types",
+		[
+			import_block_decl([import_decl("dep", None, None)]),
+			record_decl("Widget"),
+			union_decl(
+				"MaybeWidget",
+				["Present", "Missing"],
+			),
+			builtin_type_decl("BuiltinThing", False),
+			type_alias_decl("WidgetId", False),
+			function_decl("make_widget"),
+			var_decl("default_widget_id"),
+			foreign_block_decl("native_widget_id"),
+			foreign_block_visibility_decl("hidden_native_widget_id", True),
+			trait_decl("Display"),
+			impl_decl_with_methods("Display", int_type(), []),
+			PrivateParsedDecl(record_decl("HiddenWidget"), source_span()),
+			PrivateParsedDecl(function_decl("hidden_widget"), source_span()),
+		],
+	)
+	local_type_names = compiler_importable_module_local_type_names(module)
+	declared_imports = compiler_importable_module_declared_imports(module)
+	type_decls = compiler_importable_module_type_decls(module)
+	signature_decls = compiler_importable_module_signature_decls(module)
+	impl_decls = compiler_importable_module_impl_decls(module)
+
+	(
+		local_type_names == ["BuiltinThing", "HiddenWidget", "MaybeWidget", "Widget", "WidgetId"]
+		and declared_imports.length() == 1
+		and declared_imports
+			.get(0)
+			.map(func(imported): imported.module_path) == Some("dep")
+		and type_decls.map(
+			importable_type_decl_name,
+		) == ["Widget", "MaybeWidget", "BuiltinThing", "WidgetId"]
+		and signature_decls.map(
+			importable_signature_decl_name,
+		) == ["make_widget", "default_widget_id", "native_widget_id", "Display"]
+		and impl_decls.map(func(impl_decl): impl_decl.trait_name.text) == ["Display"]
 	)
 
 
@@ -1152,10 +1242,12 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 
 	(
 		reachable.length() == 2
-		and reachable.any(func(module): module.module_path == "dep")
-		and reachable.any(func(module): module.module_path == "transitive")
-		and not reachable.any(func(module): module.module_path == "decl")
-		and not reachable.any(func(module): module.module_path == "unrelated")
+		and reachable.any(func(module): compiler_importable_module_path(module) == "dep")
+		and reachable.any(func(module): compiler_importable_module_path(module) == "transitive")
+		and not reachable.any(func(module): compiler_importable_module_path(module) == "decl")
+		and not reachable.any(func(module):
+			compiler_importable_module_path(module) == "unrelated"
+		)
 	)
 
 
@@ -4160,6 +4252,10 @@ func test_check_mutable_global_initializer_allows_lambda_body_call() -> Bool:
 tests: TestSuite = {
 	description = "Compiler typecheck declaration pre-scan",
 	tests = [
+		(
+			"importable module precomputes interface facts",
+			test_importable_module_precomputes_interface_facts,
+		),
 		(
 			"prescan collects top-level names and resources",
 			test_prescan_collects_top_level_names_and_resources,

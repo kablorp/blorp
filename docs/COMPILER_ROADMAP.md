@@ -226,6 +226,10 @@ caches or weakening coverage.
 
 Current direction:
 
+The measured plan to replace repeated imported-declaration reconstruction with
+one resolved semantic interface per module is tracked in
+[`RESOLVED_MODULE_INTERFACES_ROADMAP.md`](RESOLVED_MODULE_INTERFACES_ROADMAP.md).
+
 1. Measure cold build, warm build, source check, compiler-owned suite compile,
    and default/deep gate times from a clean revision.
 2. Use phase timings to identify graph construction, parsing, typechecking,

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 3 ]; then
+	echo "usage: compiler_blorp_benchmark_runner NAME SOURCE profile|plain [ARGS...]" >&2
+	exit 2
+fi
+
+benchmark_name=$1
+source_file=$2
+instrumentation=$3
+shift 3
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+cc_path=$(command -v cc)
+compiler="${BLORP_COMPILER_BENCHMARK_COMPILER:-${BLORP_TYPECHECK_PROFILE_COMPILER:-$repo_root/compiler/_build/blorp-cli/blorp}}"
+
+case "$instrumentation" in
+	plain|profile)
+		;;
+	*)
+		echo "instrumentation must be 'plain' or 'profile'" >&2
+		exit 2
+		;;
+esac
+
+if command -v shasum >/dev/null 2>&1; then
+	hash_command=(shasum -a 256)
+elif command -v sha256sum >/dev/null 2>&1; then
+	hash_command=(sha256sum)
+else
+	echo "compiler benchmark runner requires shasum or sha256sum" >&2
+	exit 1
+fi
+
+skip_build="${BLORP_COMPILER_BENCHMARK_SKIP_BUILD:-${BLORP_TYPECHECK_PROFILE_SKIP_BUILD:-0}}"
+if [ "$skip_build" != "1" ]; then
+	make -C "$repo_root" all >/dev/null
+fi
+if [[ "$compiler" != /* ]]; then
+	compiler="$PWD/$compiler"
+fi
+if [ ! -x "$compiler" ]; then
+	echo "compiler benchmark runner requires an executable compiler: $compiler" >&2
+	exit 1
+fi
+if [ ! -f "$source_file" ]; then
+	echo "compiler benchmark source does not exist: $source_file" >&2
+	exit 1
+fi
+
+bridge_compiler="${BLORP_COMPILER_BRIDGE_BIN:-}"
+if [ -z "$bridge_compiler" ]; then
+	bridge_compiler=$("$repo_root/scripts/blorp-compiler-bootstrap" --print-path)
+fi
+if [[ "$bridge_compiler" != /* ]]; then
+	bridge_compiler="$PWD/$bridge_compiler"
+fi
+
+export BLORP_COMPILER_BRIDGE_BIN="$bridge_compiler"
+unset \
+	BLORP_COMPILER_BRIDGE_RENDERER_SOURCE \
+	BLORP_COMPILER_RENDERER_HELPER \
+	BLORP_FRONTEND_PARSER \
+	BLORP_STD
+
+prepared_bridge_files=()
+if [ "${BLORP_BENCHMARK_USE_PREPARED_BRIDGES:-0}" = "1" ]; then
+	for bridge_variable in \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN
+	do
+		prepared_bridge="${!bridge_variable:-}"
+		if [ -n "$prepared_bridge" ] && [[ "$prepared_bridge" != /* ]]; then
+			prepared_bridge="$PWD/$prepared_bridge"
+		fi
+		if [ -z "$prepared_bridge" ] || [ ! -x "$prepared_bridge" ]; then
+			echo "prepared bridge mode requires executable parser and renderer bridges" >&2
+			exit 1
+		fi
+		printf -v "$bridge_variable" '%s' "$prepared_bridge"
+		export "$bridge_variable"
+		prepared_bridge_files+=("$prepared_bridge")
+	done
+	export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
+else
+	unset \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN \
+		BLORP_COMPILER_RENDERER_BRIDGE_BIN \
+		BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE
+fi
+cd "$repo_root"
+
+cache_input_files=(
+	"$0"
+	"$source_file"
+	"$compiler"
+	"$bridge_compiler"
+	"$cc_path"
+	"$repo_root/blorp.toml"
+)
+if [ "${BLORP_BENCHMARK_USE_PREPARED_BRIDGES:-0}" = "1" ]; then
+	cache_input_files+=("${prepared_bridge_files[@]}")
+fi
+cache_root="${BLORP_BENCHMARK_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/blorp/benchmarks}"
+input_hash=$(
+	{
+		find \
+			"$repo_root/compiler/blorp/src" \
+			"$repo_root/compiler/blorp/benchmarks" \
+			"$repo_root/std" \
+			-type f -name '*.brp' \
+			-exec "${hash_command[@]}" {} +
+		"${hash_command[@]}" "${cache_input_files[@]}"
+		printf 'benchmark=%s\ninstrumentation=%s\nplatform=%s\n' \
+			"$benchmark_name" "$instrumentation" "$(uname -srm)"
+		"$cc_path" --version
+	} |
+		LC_ALL=C sort |
+		"${hash_command[@]}" |
+		awk '{print $1}'
+)
+artifact_dir="$cache_root/$benchmark_name/$input_hash"
+binary="$artifact_dir/$benchmark_name"
+
+if [ ! -x "$binary" ]; then
+	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-benchmark.XXXXXX")
+	trap 'rm -rf "$stage_dir"' EXIT
+
+	compile_args=(compile --no-format)
+	cc_optimization=-O2
+	if [ "$instrumentation" = "profile" ]; then
+		compile_args+=(--profile)
+		cc_optimization=-O0
+	fi
+	"$compiler" "${compile_args[@]}" -o "$stage_dir/$benchmark_name.c" "$source_file" >/dev/null
+	"$cc_path" "$cc_optimization" -fwrapv -pipe -w \
+		"$stage_dir/$benchmark_name.c" -lm -lpthread -o "$stage_dir/$benchmark_name"
+
+	mkdir -p "$artifact_dir"
+	mv "$stage_dir/$benchmark_name" "$binary"
+	trap - EXIT
+	rm -rf "$stage_dir"
+fi
+
+if [ "${1:-}" = "--" ]; then
+	shift
+fi
+
+exec "$binary" "$@"

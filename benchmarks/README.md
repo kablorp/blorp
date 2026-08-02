@@ -278,6 +278,42 @@ baseline registration. Subtract candidate from baseline
 `compiler_env_copy_type` calls to isolate those registration copies; the
 remaining calls belong to validation.
 
+### Import Graph Profile
+
+`compiler_import_graph_profile` is the fast control for import-environment
+work. Unlike `compiler_typecheck_profile`, it constructs real resolved import
+edges. The default graph has 30 modules, 32 functions per module, and a fan-out
+of 20, producing 420 resolved imports and 13,440 imported-function registration
+opportunities per iteration:
+
+```bash
+benchmarks/compiler_import_graph_profile
+benchmarks/compiler_import_graph_profile 3 30 32 20 fallback
+```
+
+The positional controls are iterations, module count, functions per module,
+import fan-out, and parsed-program mode. The benchmark validates artifact,
+declaration, resolved-import, and import-binding counts on every iteration and
+prints `workload_valid=True` only when the complete graph matches those
+invariants without type errors. Every generated module calls every imported
+callable through its qualified module alias, so dropping or mis-registering an
+imported signature fails the workload rather than appearing as a speedup.
+Request construction is reported separately from measured graph typechecking.
+
+This runner is deliberately uninstrumented and optimized by default. A cached
+invocation takes roughly two seconds on the development machine. Compiler-source
+changes invalidate the executable and require compiling the benchmark again;
+that cold build remains material and must not be included in benchmark samples.
+Use `BLORP_IMPORT_GRAPH_PROFILE_FUNCTIONS=1` only when exact function call counts
+are needed. Function instrumentation is too expensive and intrusive for the
+per-edit timing loop.
+
+Both frontend benchmark wrappers use `compiler_blorp_benchmark_runner` for
+compiler selection, bridge isolation, content-addressed artifacts, and native C
+flags. `BLORP_COMPILER_BENCHMARK_COMPILER` and
+`BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` are the generic controls; the older
+`BLORP_TYPECHECK_PROFILE_*` names remain supported for the existing profile.
+
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, renderer-source, prepared-helper, and
 legacy parser overrides by default. This keeps one cache key tied to one
@@ -455,6 +491,15 @@ rather than receiving an inferred value. Helper preparation is excluded from
 the measurement, while stdout and stderr remain file-backed. Without `--bridge`
 or `BLORP_TYPECHECK_BENCHMARK_WORKER`, the runner builds the same disposable
 benchmark worker used by `compiler_typecheck_memory`.
+
+Timestamped helper markers additionally populate `checkpoint_elapsed_microseconds`,
+`module_checkpoint_elapsed_microseconds`, `phase_marker_counts`, and
+`module_phase_marker_counts`. Each same-module interval is attributed to the
+checkpoint that ends it and is also retained as
+`elapsed_since_previous_checkpoint_microseconds` in the timeline. Intervals
+between one module's final checkpoint and the next module's start are excluded.
+Older helpers without timestamps remain replayable; their checkpoint timing
+maps are empty rather than inferred from process sampling.
 
 The memory limit uses an address-space limit on Linux and a sampled RSS
 watchdog on macOS. Linux allocation-limit failures are not distinguishable from

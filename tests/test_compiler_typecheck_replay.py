@@ -731,6 +731,83 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             5,
         )
 
+    def test_checkpoint_timing_uses_same_module_trace_intervals(self) -> None:
+        markers = [
+            (
+                "typecheck_start",
+                "main",
+                {"timestamp_microseconds": 100},
+            ),
+            (
+                "typecheck_import_decls_complete",
+                "main",
+                {"timestamp_microseconds": 160},
+            ),
+            (
+                "typecheck_bodies_complete",
+                "main",
+                {"timestamp_microseconds": 250},
+            ),
+        ]
+
+        timeline, checkpoint_totals, module_checkpoint_totals = (
+            self.replay.checkpoint_interval_summary(markers)
+        )
+
+        self.assertNotIn("elapsed_since_previous_checkpoint_microseconds", timeline[0])
+        self.assertEqual(
+            timeline[1]["elapsed_since_previous_checkpoint_microseconds"], 60
+        )
+        self.assertEqual(
+            timeline[2]["elapsed_since_previous_checkpoint_microseconds"], 90
+        )
+        self.assertEqual(
+            checkpoint_totals,
+            {
+                "typecheck_import_decls_complete": 60,
+                "typecheck_bodies_complete": 90,
+            },
+        )
+        self.assertEqual(
+            module_checkpoint_totals["main"],
+            checkpoint_totals,
+        )
+        phase_counts, module_phase_counts = self.replay.phase_marker_counts(markers)
+        self.assertEqual(
+            phase_counts,
+            {
+                "typecheck_start": 1,
+                "typecheck_import_decls_complete": 1,
+                "typecheck_bodies_complete": 1,
+            },
+        )
+        self.assertEqual(module_phase_counts["main"], phase_counts)
+
+    def test_checkpoint_timing_does_not_cross_module_boundaries(self) -> None:
+        markers = [
+            ("typecheck_complete", "dep", {"timestamp_microseconds": 100}),
+            ("typecheck_start", "main", {"timestamp_microseconds": 500}),
+            ("typecheck_prelude_complete", "main", {"timestamp_microseconds": 560}),
+        ]
+
+        timeline, checkpoint_totals, module_checkpoint_totals = (
+            self.replay.checkpoint_interval_summary(markers)
+        )
+
+        self.assertNotIn(
+            "elapsed_since_previous_checkpoint_microseconds",
+            timeline[1],
+        )
+        self.assertEqual(
+            timeline[2]["elapsed_since_previous_checkpoint_microseconds"],
+            60,
+        )
+        self.assertEqual(checkpoint_totals, {"typecheck_prelude_complete": 60})
+        self.assertEqual(
+            module_checkpoint_totals,
+            {"main": {"typecheck_prelude_complete": 60}},
+        )
+
     def test_address_space_limit_failure_is_reported_as_indeterminate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             temp_dir = Path(temp_name)

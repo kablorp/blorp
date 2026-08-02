@@ -1,0 +1,419 @@
+-- Bounded in-process workload for import-heavy typechecker changes.
+import:
+	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_03_parse/compiler_source_ast_finalize: FinalizedTypecheckProgram
+	../src/stage_05_types/compiler_context: CompilerModuleOrigin(CompilerUserModule)
+	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedGraph,
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckResolvedImport,
+		compiler_typecheck_graph,
+
+
+record CompilerImportGraphBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	functions_per_module: Int,
+	import_fanout: Int,
+	retain_parsed_programs: Bool
+}
+
+
+record CompilerImportGraphBenchmarkResult {
+	artifact_count: Int,
+	source_declaration_count: Int,
+	typed_declaration_count: Int,
+	resolved_import_count: Int,
+	import_binding_count: Int,
+	imported_function_registration_pressure: Int,
+	error_count: Int,
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func benchmark_module_path(module_index: Int) -> String:
+	"bench/import_graph_profile_" + module_index.to_string()
+
+
+private pure func benchmark_module_file(module_index: Int) -> String:
+	"/bench/import_graph_profile_" + module_index.to_string() + ".brp"
+
+
+private pure func benchmark_function_name(module_index: Int, function_index: Int) -> String:
+	"import_graph_m" + module_index.to_string() + "_function_" + function_index.to_string()
+
+
+private pure func benchmark_qualified_function_call(
+	module_index: Int,
+	function_index: Int,
+	argument: String,
+) -> String:
+	"import_graph_profile_" + module_index.to_string() + "." + benchmark_function_name(
+		module_index,
+		function_index,
+	) + "(" + argument + ")"
+
+
+private pure func benchmark_module_import_indexes(
+	module_index: Int,
+	import_fanout: Int,
+) -> List[Int]:
+	start: Int = if import_fanout < module_index:
+		module_index - import_fanout
+	else:
+		0
+
+	var indexes: List[Int] = []
+	var index: Int = start
+
+	while index < module_index:
+		indexes = indexes.append(index)
+		index += 1
+
+	indexes
+
+
+private pure func benchmark_import_block(module_indexes: List[Int]) -> String:
+	if module_indexes.length() == 0:
+		""
+	else:
+		lines = module_indexes.map(func(module_index): "\t" + benchmark_module_path(module_index))
+		"import:\n" + lines.join("\n")
+
+
+private pure func benchmark_module_source(
+	module_index: Int,
+	functions_per_module: Int,
+	import_fanout: Int,
+) -> String:
+	var declarations: List[String] = []
+	imported_module_indexes = benchmark_module_import_indexes(module_index, import_fanout)
+	import_block = benchmark_import_block(imported_module_indexes)
+
+	if import_block.length() > 0:
+		declarations = declarations.append(import_block)
+
+	for function_index in 0..functions_per_module:
+		imported_calls = imported_module_indexes.map(func(imported_module_index):
+			benchmark_qualified_function_call(imported_module_index, function_index, "value")
+		)
+		body_terms = ["value"]
+			.concat(imported_calls)
+			.append((module_index + function_index).to_string())
+		declarations = declarations.append(
+			"pure func " + benchmark_function_name(
+				module_index,
+				function_index,
+			) + "(value: Int) -> Int:\n\t" + body_terms.join(" + "),
+		)
+
+	declarations.join("\n\n") + "\n"
+
+
+private pure func benchmark_retained_program(
+	path: String,
+	module_name: String,
+	source: String,
+	retain_parsed_programs: Bool,
+) -> Option[FinalizedTypecheckProgram]:
+	if retain_parsed_programs:
+		Some(
+			ParserBridge.parsed_typecheck_source_bridge_artifact(
+				path,
+				module_name,
+				source,
+				False,
+			).program,
+		)
+	else:
+		None
+
+
+private pure func benchmark_module(
+	module_index: Int,
+	functions_per_module: Int,
+	import_fanout: Int,
+	retain_parsed_programs: Bool,
+) -> TypecheckImportModule:
+	module_path = benchmark_module_path(module_index)
+	path = benchmark_module_file(module_index)
+	source = benchmark_module_source(module_index, functions_per_module, import_fanout)
+
+	{
+		path = path,
+		module_name = module_path,
+		module_path = module_path,
+		text = source,
+		typecheck_program = benchmark_retained_program(
+			path,
+			module_path,
+			source,
+			retain_parsed_programs,
+		),
+		origin = CompilerUserModule
+	}
+
+
+private pure func benchmark_resolved_import(
+	from_path: String,
+	from_module: String,
+	imported_module_index: Int,
+) -> TypecheckResolvedImport:
+	import_path = benchmark_module_path(imported_module_index)
+
+	{
+		from_path = from_path,
+		from_module = from_module,
+		import_path = import_path,
+		resolved_module = import_path
+	}
+
+
+private pure func benchmark_module_resolved_imports(
+	module_index: Int,
+	import_fanout: Int,
+) -> List[TypecheckResolvedImport]:
+	benchmark_module_import_indexes(
+		module_index,
+		import_fanout,
+	).map(
+		func(
+			imported_module_index,
+		): benchmark_resolved_import(
+			benchmark_module_file(module_index),
+			benchmark_module_path(module_index),
+			imported_module_index,
+		),
+	)
+
+
+private pure func benchmark_target_probe_name(module_index: Int) -> String:
+	"probe_import_graph_module_" + module_index.to_string()
+
+
+private pure func benchmark_target_probe_source(
+	module_index: Int,
+	functions_per_module: Int,
+) -> String:
+	function_indexes: List[Int] = (0..functions_per_module).to_list()
+	calls = function_indexes.map(func(function_index):
+		benchmark_qualified_function_call(module_index, function_index, "0")
+	)
+	"pure func " + benchmark_target_probe_name(module_index) + "() -> Int:\n\t" + calls.join(" + ")
+
+
+private pure func benchmark_target_source(module_count: Int, functions_per_module: Int) -> String:
+	module_indexes: List[Int] = if module_count > 0:
+		(0..module_count).to_list()
+	else:
+		[]
+
+	import_block = benchmark_import_block(module_indexes)
+	probe_decls = module_indexes.map(func(module_index):
+		benchmark_target_probe_source(module_index, functions_per_module)
+	)
+	probe_calls = module_indexes.map(func(module_index):
+		benchmark_target_probe_name(module_index) + "()"
+	)
+
+	main_result = if probe_calls.length() > 0:
+		probe_calls.join(" + ")
+	else:
+		"0"
+
+	main_decl = "func main(args: List[String]) -> Int:\n\t" + main_result
+	declarations = probe_decls.append(main_decl)
+
+	if import_block.length() > 0:
+		import_block + "\n\n" + declarations.join("\n\n") + "\n"
+	else:
+		declarations.join("\n\n") + "\n"
+
+
+pure func compiler_import_graph_benchmark_request(
+	config: CompilerImportGraphBenchmarkConfig,
+) -> TypecheckGraphRequest:
+	var modules: List[TypecheckImportModule] = []
+	var module_targets: List[String] = []
+	var resolved_imports: List[TypecheckResolvedImport] = []
+
+	for module_index in 0..config.module_count:
+		module = benchmark_module(
+			module_index,
+			config.functions_per_module,
+			config.import_fanout,
+			config.retain_parsed_programs,
+		)
+		modules = modules.append(module)
+		module_targets = module_targets.append(module.module_path)
+		resolved_imports = resolved_imports.concat(
+			benchmark_module_resolved_imports(
+				module_index,
+				config.import_fanout,
+			),
+		)
+
+	target_path = "/bench/import_graph_profile_main.brp"
+	target_module = "bench/import_graph_profile_main"
+	target_source = benchmark_target_source(config.module_count, config.functions_per_module)
+
+	for module_index in 0..config.module_count:
+		resolved_imports = resolved_imports.append(
+			benchmark_resolved_import(
+				target_path,
+				target_module,
+				module_index,
+			),
+		)
+
+	{
+		target = {
+			path = target_path,
+			module_name = target_module,
+			module_path = target_module,
+			text = target_source,
+			typecheck_program = benchmark_retained_program(
+				target_path,
+				target_module,
+				target_source,
+				config.retain_parsed_programs,
+			),
+			origin = CompilerUserModule
+		},
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = resolved_imports,
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+private pure func typechecked_graph_error_count(graph: CompilerTypecheckedGraph) -> Int:
+	var count: Int = graph.target.errors.length()
+
+	for module in graph.modules:
+		count += module.errors.length()
+
+	count
+
+
+private pure func typechecked_graph_declaration_count(graph: CompilerTypecheckedGraph) -> Int:
+	var count: Int = graph.target.typed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.typed_program.decls.length()
+
+	count
+
+
+private pure func typechecked_graph_source_declaration_count(
+	graph: CompilerTypecheckedGraph,
+) -> Int:
+	var count: Int = graph.target.parsed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.parsed_program.decls.length()
+
+	count
+
+
+private pure func typechecked_graph_import_binding_count(graph: CompilerTypecheckedGraph) -> Int:
+	var count: Int = graph.target.import_bindings.length()
+
+	for module in graph.modules:
+		count += module.import_bindings.length()
+
+	count
+
+
+private pure func expected_resolved_import_count(module_count: Int, import_fanout: Int) -> Int:
+	var count: Int = module_count
+
+	for module_index in 0..module_count:
+		count += benchmark_module_import_indexes(module_index, import_fanout).length()
+
+	count
+
+
+private pure func expected_declaration_count(
+	module_count: Int,
+	functions_per_module: Int,
+	import_fanout: Int,
+) -> Int:
+	module_import_blocks: Int = if import_fanout > 0 and module_count > 0:
+		module_count - 1
+	else:
+		0
+
+	target_import_blocks: Int = if module_count > 0:
+		1
+	else:
+		0
+
+	module_count * functions_per_module + module_import_blocks + target_import_blocks + module_count + 1
+
+
+pure func compiler_import_graph_benchmark_with_request(
+	config: CompilerImportGraphBenchmarkConfig,
+	request: TypecheckGraphRequest,
+) -> CompilerImportGraphBenchmarkResult:
+	expected_artifact_count: Int = config.module_count + 1
+	expected_declarations = expected_declaration_count(
+		config.module_count,
+		config.functions_per_module,
+		config.import_fanout,
+	)
+	expected_imports = expected_resolved_import_count(config.module_count, config.import_fanout)
+	var artifact_count: Int = 0
+	var source_declaration_count: Int = 0
+	var typed_declaration_count: Int = 0
+	var import_binding_count: Int = 0
+	var error_count: Int = 0
+	var checksum: Int = 0
+	var workload_valid: Bool = (
+		config.iterations > 0
+		and config.module_count > 0
+		and config.functions_per_module > 0
+		and config.import_fanout >= 0
+	)
+
+	for _ in 0..config.iterations:
+		graph = compiler_typecheck_graph(request)
+		artifact_count = graph.modules.length() + 1
+		source_declaration_count = typechecked_graph_source_declaration_count(graph)
+		typed_declaration_count = typechecked_graph_declaration_count(graph)
+		import_binding_count = typechecked_graph_import_binding_count(graph)
+		iteration_error_count = typechecked_graph_error_count(graph)
+		error_count += iteration_error_count
+		workload_valid = (
+			workload_valid
+			and iteration_error_count == 0
+			and artifact_count == expected_artifact_count
+			and source_declaration_count == expected_declarations
+			and typed_declaration_count == expected_declarations
+			and request.resolved_imports.length() == expected_imports
+			and import_binding_count == expected_imports
+		)
+
+		checksum += artifact_count + source_declaration_count + typed_declaration_count + request.resolved_imports.length() + import_binding_count
+
+	{
+		artifact_count = artifact_count,
+		source_declaration_count = source_declaration_count,
+		typed_declaration_count = typed_declaration_count,
+		resolved_import_count = request.resolved_imports.length(),
+		import_binding_count = import_binding_count,
+		imported_function_registration_pressure = request.resolved_imports.length() * config.functions_per_module,
+		error_count = error_count,
+		checksum = checksum,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_import_graph_benchmark(
+	config: CompilerImportGraphBenchmarkConfig,
+) -> CompilerImportGraphBenchmarkResult:
+	request = compiler_import_graph_benchmark_request(config)
+	compiler_import_graph_benchmark_with_request(config, request)

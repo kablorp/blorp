@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compiler_typecheck_worker import TYPECHECK_WORKER_ENV, prepare_typecheck_worker
 
 
-METRIC_VERSION = 2
+METRIC_VERSION = 3
 DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_UNCONFIRMED_REQUEST_BYTES = 16 * 1024 * 1024
 TRACE_ENV = "BLORP_COMPILER_TYPECHECK_TRACE"
@@ -42,6 +42,7 @@ MEMSTAT_FIELDS = (
     "current_objects",
     "bytes_allocated",
 )
+TRACE_NUMERIC_FIELDS = ("timestamp_microseconds", *MEMSTAT_FIELDS)
 COMPILER_CLI_RETENTION_SLICE = (
     "std/string",
     "std/parser",
@@ -183,14 +184,61 @@ def read_phase_markers(path: Path) -> list[tuple[str, str, dict[str, int]]]:
         phase = fields.get("phase")
         module = fields.get("module")
         if phase and module:
-            memstats: dict[str, int] = {}
-            for name in MEMSTAT_FIELDS:
+            numeric_fields: dict[str, int] = {}
+            for name in TRACE_NUMERIC_FIELDS:
                 try:
-                    memstats[name] = int(fields[name])
+                    numeric_fields[name] = int(fields[name])
                 except (KeyError, ValueError):
                     pass
-            result.append((phase, module, memstats))
+            result.append((phase, module, numeric_fields))
     return result
+
+
+def marker_memstats(fields: dict[str, int]) -> dict[str, int]:
+    return {name: fields[name] for name in MEMSTAT_FIELDS if name in fields}
+
+
+def checkpoint_interval_summary(
+    markers: list[tuple[str, str, dict[str, int]]],
+) -> tuple[list[JsonObject], dict[str, int], dict[str, dict[str, int]]]:
+    timeline: list[JsonObject] = []
+    checkpoint_totals: dict[str, int] = {}
+    module_checkpoint_totals: dict[str, dict[str, int]] = {}
+    previous_timestamp: int | None = None
+    previous_module: str | None = None
+
+    for phase, module, fields in markers:
+        item: JsonObject = {"phase": phase, "module": module, **fields}
+        timestamp = fields.get("timestamp_microseconds")
+        if (
+            timestamp is not None
+            and previous_timestamp is not None
+            and module == previous_module
+            and timestamp >= previous_timestamp
+        ):
+            elapsed = timestamp - previous_timestamp
+            item["elapsed_since_previous_checkpoint_microseconds"] = elapsed
+            checkpoint_totals[phase] = checkpoint_totals.get(phase, 0) + elapsed
+            module_totals = module_checkpoint_totals.setdefault(module, {})
+            module_totals[phase] = module_totals.get(phase, 0) + elapsed
+        if timestamp is not None:
+            previous_timestamp = timestamp
+            previous_module = module
+        timeline.append(item)
+
+    return timeline, checkpoint_totals, module_checkpoint_totals
+
+
+def phase_marker_counts(
+    markers: list[tuple[str, str, dict[str, int]]],
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    phase_counts: dict[str, int] = {}
+    module_phase_counts: dict[str, dict[str, int]] = {}
+    for phase, module, _fields in markers:
+        phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        module_counts = module_phase_counts.setdefault(module, {})
+        module_counts[phase] = module_counts.get(phase, 0) + 1
+    return phase_counts, module_phase_counts
 
 
 def decode_inventory_field(value: str) -> str:
@@ -444,10 +492,11 @@ def measurement_worker(argv: list[str]) -> int:
                 markers = read_phase_markers(stderr_path)
                 if len(markers) > seen_markers:
                     new_markers = markers[seen_markers:]
-                    for phase, module, memstats in new_markers:
+                    for phase, module, fields in new_markers:
+                        memstats = marker_memstats(fields)
                         merge_max_counters(phase_memstats, phase, memstats)
                         merge_max_counters(module_memstats, module, memstats)
-                    current_phase, current_module, _memstats = markers[-1]
+                    current_phase, current_module, _fields = markers[-1]
                     seen_markers = len(markers)
 
                 rss = process_rss_bytes(process.pid)
@@ -488,21 +537,18 @@ def measurement_worker(argv: list[str]) -> int:
     peak_rss = max(peak_sampled_rss, normalized_max_rss_bytes())
     final_markers = read_phase_markers(stderr_path)
     inventory = read_inventory(stderr_path)
-    for phase, module, memstats in final_markers:
+    for phase, module, fields in final_markers:
+        memstats = marker_memstats(fields)
         merge_max_counters(phase_memstats, phase, memstats)
         merge_max_counters(module_memstats, module, memstats)
-    phase_timeline = [
-        {
-            "phase": phase,
-            "module": module,
-            **memstats,
-        }
-        for phase, module, memstats in final_markers
-    ]
+    phase_timeline, checkpoint_elapsed, module_checkpoint_elapsed = (
+        checkpoint_interval_summary(final_markers)
+    )
+    phase_counts, module_phase_counts = phase_marker_counts(final_markers)
     allocator_samples = [
-        memstats
-        for _phase, _module, memstats in final_markers
-        if "bytes_allocated" in memstats
+        marker_memstats(fields)
+        for _phase, _module, fields in final_markers
+        if "bytes_allocated" in fields
     ]
     allocator_stats_available = (
         not args.allocator_stats_enabled
@@ -543,6 +589,10 @@ def measurement_worker(argv: list[str]) -> int:
         "phase_memstats_max": phase_memstats,
         "module_memstats_max": module_memstats,
         "phase_timeline": phase_timeline,
+        "checkpoint_elapsed_microseconds": checkpoint_elapsed,
+        "module_checkpoint_elapsed_microseconds": module_checkpoint_elapsed,
+        "phase_marker_counts": phase_counts,
+        "module_phase_marker_counts": module_phase_counts,
         "phase_markers": len(final_markers),
         "inventory_available": bool(inventory),
         "inventory": inventory,
