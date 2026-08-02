@@ -346,10 +346,10 @@ toolchain used only to build it.
 
 ### Current Boundary
 
-The standalone typecheck worker is benchmark-owned and no longer participates
-in bulk bridge preparation, installation, CI test setup, or release packaging.
-Production typechecking remains in the public Blorp compiler. The shipped
-renderer and parser helpers are the remaining compiler worker boundaries.
+The standalone typecheck and backend workers are benchmark-owned and no longer
+participate in bridge preparation, installation, CI test setup, or release
+packaging. Production typechecking and backend emission remain in the public
+Blorp compiler. The parser helper is the only shipped compiler worker boundary.
 
 ### Execution
 

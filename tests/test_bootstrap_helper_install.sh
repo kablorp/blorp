@@ -18,13 +18,14 @@ install_dir="$tmp_dir/install"
 stamp_path="$tmp_dir/state/installed-bootstrap.id"
 installer="$PWD/scripts/install-compiler-bootstrap-helpers"
 helpers=(
-	blorp-compiler-renderer
 	blorp-compiler-parser
 )
 
 mkdir -p "$toolchain_dir" "$install_dir"
 printf 'retired installed worker\n' > "$install_dir/blorp-compiler-typecheck"
 chmod +x "$install_dir/blorp-compiler-typecheck"
+printf 'retired renderer worker\n' > "$install_dir/blorp-compiler-renderer"
+chmod +x "$install_dir/blorp-compiler-renderer"
 for helper in "${helpers[@]}"; do
 	printf 'first generation: %s\n' "$helper" > "$toolchain_dir/$helper"
 	chmod +x "$toolchain_dir/$helper"
@@ -33,6 +34,9 @@ done
 "$installer" "$toolchain_dir" "$install_dir" "$stamp_path" "dev-first schema-v1"
 if [ -e "$install_dir/blorp-compiler-typecheck" ]; then
 	fail "installation did not remove the retired typecheck worker"
+fi
+if [ -e "$install_dir/blorp-compiler-renderer" ]; then
+	fail "installation did not remove the retired renderer worker"
 fi
 
 for helper in "${helpers[@]}"; do
@@ -55,12 +59,12 @@ then
 	fail "installation did not repair a missing helper"
 fi
 
-printf 'corrupt\n' > "$install_dir/blorp-compiler-renderer"
-chmod +x "$install_dir/blorp-compiler-renderer"
+printf 'corrupt\n' > "$install_dir/blorp-compiler-parser"
+chmod +x "$install_dir/blorp-compiler-parser"
 "$installer" "$toolchain_dir" "$install_dir" "$stamp_path" "dev-first schema-v1"
 if ! cmp -s \
-	"$toolchain_dir/blorp-compiler-renderer" \
-	"$install_dir/blorp-compiler-renderer"
+	"$toolchain_dir/blorp-compiler-parser" \
+	"$install_dir/blorp-compiler-parser"
 then
 	fail "installation trusted the stamp instead of repairing corrupted helper bytes"
 fi

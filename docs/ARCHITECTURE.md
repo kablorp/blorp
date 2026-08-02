@@ -303,9 +303,9 @@ Blorp-owned final-tail route:
 Post-Perceus Core
     |
     v
-+-------------------+
-| run_core_pipeline |  Bridge action used for requested reuse/closure/final
-+-------------------+  Core JSON snapshots and CLI stop/dump behavior
++-------------------------+
+| run_core_pipeline_stage |  Direct Blorp pipeline call for requested
++-------------------------+  reuse/closure/final snapshots and CLI stop/dump behavior
     |
     v
 +-------+
@@ -358,7 +358,7 @@ boxing, or ownership behavior from source spelling.
 
 | File | Purpose |
 |------|---------|
-| `compiler/blorp/src/stage_12_cli/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
+| `compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp` | Remaining parser and CLI-planning worker for OCaml-hosted commands |
 | `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core model and dump codec |
 | `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
 | `compiler/blorp/src/stage_09_core/compiler_core_match.brp` | Authoritative raw-pattern to semantic decision-tree compilation |

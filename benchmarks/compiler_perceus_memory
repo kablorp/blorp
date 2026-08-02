@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import platform
 import re
 import resource
@@ -18,13 +17,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compiler_backend_worker import BACKEND_WORKER_ENV, prepare_backend_worker
+
 
 FIXTURE_VERSION = 2
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
 DEFAULT_BODY_LEAVES = 64
 DEFAULT_GLOBAL_READS_PER_FUNCTION = 32
-RENDERER_BRIDGE_ENV = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
 
@@ -313,44 +314,6 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def prepared_renderer_bridge(root: Path, out_dir: Path, explicit: str | None) -> Path:
-    candidate = explicit or os.environ.get(RENDERER_BRIDGE_ENV)
-    if candidate:
-        path = Path(candidate).expanduser().resolve()
-        if not path.is_file():
-            raise RuntimeError(f"renderer bridge does not exist: {path}")
-        return path
-
-    blorp = root / "blorp"
-    if not blorp.is_file():
-        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
-
-    result = subprocess.run(
-        [str(blorp), "__compiler-bridge-prepare", str(out_dir)],
-        cwd=root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
-
-    values = {}
-    for line in result.stdout.splitlines():
-        name, separator, value = line.partition("=")
-        if separator:
-            values[name] = value
-    candidate = values.get(RENDERER_BRIDGE_ENV)
-    if not candidate:
-        raise RuntimeError("bridge preparation did not report the renderer helper")
-    path = Path(candidate).resolve()
-    if not path.is_file():
-        raise RuntimeError(f"prepared renderer bridge does not exist: {path}")
-    return path
-
-
 def validate_response(
     response_path: Path,
     global_count: int,
@@ -359,16 +322,16 @@ def validate_response(
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as error:
-        raise RuntimeError(f"renderer bridge returned invalid JSON: {error}") from error
+        raise RuntimeError(f"backend benchmark worker returned invalid JSON: {error}") from error
 
     if response.get("ok") is not True:
-        raise RuntimeError(f"renderer bridge failed: {response.get('error', response)}")
+        raise RuntimeError(f"backend benchmark worker failed: {response.get('error', response)}")
     artifact = response.get("artifact")
     if not isinstance(artifact, dict):
-        raise RuntimeError("renderer bridge response is missing an artifact")
+        raise RuntimeError("backend benchmark worker response is missing an artifact")
     c_code = artifact.get("c_code")
     if not isinstance(c_code, str) or not c_code:
-        raise RuntimeError("renderer bridge artifact is missing generated C")
+        raise RuntimeError("backend benchmark worker artifact is missing generated C")
 
     expected_names = ["BENCH_UNUSED_GLOBAL_0000", "bench_worker_0000", "main"]
     if global_count > 1:
@@ -418,7 +381,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         temp_dir = Path(temp_name)
         bridge_dir = temp_dir / "bridge"
         bridge_dir.mkdir()
-        bridge = prepared_renderer_bridge(root, bridge_dir, args.bridge)
+        bridge = prepare_backend_worker(root, bridge_dir, args.bridge)
 
         request, core_program = fixture_request(
             args.globals,
@@ -454,7 +417,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if metrics["exit_code"] != 0:
             stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
             raise RuntimeError(
-                f"renderer bridge exited with {metrics['exit_code']}: {stderr}"
+                f"backend benchmark worker exited with {metrics['exit_code']}: {stderr}"
             )
 
         generated_c_bytes, generated_c_sha256 = validate_response(
@@ -507,7 +470,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--bridge",
-        help=f"prepared renderer bridge; defaults to ${RENDERER_BRIDGE_ENV} or prepares one",
+        help=f"backend benchmark worker; defaults to ${BACKEND_WORKER_ENV} or builds one",
     )
     parser.add_argument(
         "--vmmap",

@@ -212,22 +212,22 @@ let comment_json ~text ~line ~column ~trailing =
       ("trailing", Lsp_json.Bool trailing);
     ]
 
-let test_renderer_bridge_compile_renames_generated_main () =
+let test_bridge_worker_compile_renames_generated_main () =
   let args =
-    Blorp.Compiler_blorp_bridge.renderer_bridge_compile_object_args
+    Blorp.Compiler_blorp_bridge.bridge_worker_compile_object_args
       ~c_path:"bridge.c" ~obj_path:"bridge.o"
   in
   Alcotest.(check bool)
     "generated bridge main is renamed" true
     (List.exists
        (( = )
-          ("-Dmain=" ^ Blorp.Compiler_blorp_bridge.renderer_bridge_user_main_symbol))
+          ("-Dmain=" ^ Blorp.Compiler_blorp_bridge.bridge_worker_user_main_symbol))
        args);
   Alcotest.(check bool) "compiles to object" true (List.exists (( = ) "-c") args)
 
-let test_renderer_bridge_link_uses_wrapper_main () =
+let test_bridge_worker_link_uses_wrapper_main () =
   let args =
-    Blorp.Compiler_blorp_bridge.renderer_bridge_link_args ~obj_path:"bridge.o"
+    Blorp.Compiler_blorp_bridge.bridge_worker_link_args ~obj_path:"bridge.o"
       ~wrapper_path:"bridge_main.c" ~bin_path:"bridge.bin"
   in
   Alcotest.(check bool)
@@ -240,8 +240,8 @@ let test_renderer_bridge_link_uses_wrapper_main () =
     "links pthread for stack wrapper" true
     (List.exists (( = ) "-lpthread") args)
 
-let test_renderer_bridge_wrapper_sets_explicit_stack () =
-  let source = Blorp.Compiler_blorp_bridge.renderer_bridge_wrapper_source () in
+let test_bridge_worker_wrapper_sets_explicit_stack () =
+  let source = Blorp.Compiler_blorp_bridge.bridge_worker_wrapper_source () in
   Alcotest.(check bool)
     "sets pthread stack size" true
     (contains source "pthread_attr_setstacksize");
@@ -249,25 +249,13 @@ let test_renderer_bridge_wrapper_sets_explicit_stack () =
     "uses configured stack size" true
     (contains source
        (string_of_int
-          Blorp.Compiler_blorp_bridge.renderer_bridge_stack_size_bytes));
+          Blorp.Compiler_blorp_bridge.bridge_worker_stack_size_bytes));
   Alcotest.(check bool)
     "calls renamed generated entrypoint" true
-    (contains source Blorp.Compiler_blorp_bridge.renderer_bridge_user_main_symbol)
+    (contains source Blorp.Compiler_blorp_bridge.bridge_worker_user_main_symbol)
 
 let test_bridge_helper_compile_env_supports_pinned_bootstrap () =
   let env = Blorp.Compiler_blorp_bridge.bridge_helper_compile_env in
-  Alcotest.(check (option string))
-    "renderer helper marker" (Some "1")
-    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
-  Alcotest.(check (option string))
-    "retired bootstrap parser selector" (Some "ocaml")
-    (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
-
-let test_parser_bridge_compile_env_supports_pinned_bootstrap () =
-  let env = Blorp.Compiler_blorp_bridge.parser_bridge_helper_compile_env in
-  Alcotest.(check (option string))
-    "renderer helper marker" (Some "1")
-    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
   Alcotest.(check (option string))
     "retired bootstrap parser selector" (Some "ocaml")
     (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
@@ -987,9 +975,9 @@ let test_bridge_helper_compiler_finds_pinned_bootstrap () =
         Blorp.Compiler_blorp_bridge.locate_bridge_helper_compiler
           ~bridge_bin:None [ deeper_dir ]
       with
-      | Ok compiler ->
+      | Ok compiler_path ->
           Alcotest.(check string)
-            "bootstrap path" bootstrap compiler.Bridge.helper_compiler_path
+            "bootstrap path" bootstrap compiler_path
       | Error message -> Alcotest.fail message)
 
 let test_bridge_helper_compiler_respects_explicit_override () =
@@ -997,10 +985,9 @@ let test_bridge_helper_compiler_respects_explicit_override () =
     Blorp.Compiler_blorp_bridge.locate_bridge_helper_compiler
       ~bridge_bin:(Some "/tmp/custom-blorp") [ "/does/not/exist" ]
   with
-  | Ok compiler ->
+  | Ok compiler_path ->
       Alcotest.(check string)
-        "explicit bridge binary" "/tmp/custom-blorp"
-        compiler.Bridge.helper_compiler_path
+        "explicit bridge binary" "/tmp/custom-blorp" compiler_path
   | Error message -> Alcotest.fail message
 
 let test_bridge_helper_compiler_rejects_current_executable_override () =
@@ -1008,23 +995,23 @@ let test_bridge_helper_compiler_rejects_current_executable_override () =
     Blorp.Compiler_blorp_bridge.locate_bridge_helper_compiler
       ~bridge_bin:(Some Sys.executable_name) [ "/does/not/exist" ]
   with
-  | Ok compiler ->
+  | Ok compiler_path ->
       Alcotest.fail
         ("expected current executable override to be rejected, got "
-       ^ compiler.Blorp.Compiler_blorp_bridge.helper_compiler_path)
+       ^ compiler_path)
   | Error message ->
       Alcotest.(check bool)
         "mentions current executable" true
         (contains message "current compiler executable")
 
 let test_prepared_bridge_request_owns_stats_and_cleanup () =
-  let request_json = {|{"action":"emit_core_c"}|} in
+  let request_json = {|{"action":"parse_source"}|} in
   let prepared = Bridge.prepare_bridge_request ~stats_enabled:true request_json in
   let request_path = prepared.request_path in
   Alcotest.(check bool) "request file exists" true (Sys.file_exists request_path);
   (match prepared.request_stats with
   | Some stats ->
-      Alcotest.(check string) "request action" "emit_core_c" stats.request_action;
+      Alcotest.(check string) "request action" "parse_source" stats.request_action;
       Alcotest.(check int)
         "request bytes" (String.length request_json) stats.request_bytes
   | None -> Alcotest.fail "expected bridge request stats");
@@ -1044,18 +1031,10 @@ let test_prepared_bridge_request_owns_stats_and_cleanup () =
   Alcotest.(check bool)
     "disabled stats are absent" true
     (Option.is_none without_stats.request_stats);
-  let compactions_before = (Gc.quick_stat ()).compactions in
-  let resolver_saw_compaction = ref false in
   ignore
-    (Bridge.run_prepared_bridge_request ~release_host_heap_before_run:true
-       (fun () ->
-         resolver_saw_compaction :=
-           (Gc.quick_stat ()).compactions > compactions_before;
-         Error "missing prepared bridge")
-       without_stats);
-  Alcotest.(check bool)
-    "host heap compacted before bridge resolution" true
-    !resolver_saw_compaction
+    (Bridge.run_prepared_bridge_request
+       (fun () -> Error "missing prepared bridge")
+       without_stats)
 
 let test_bridge_cache_key_includes_helper_entrypoint () =
   with_temp_dir (fun root ->
@@ -1064,7 +1043,7 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       let src_dir = Filename.concat blorp_dir "src" in
       let cli_dir = Filename.concat src_dir "stage_12_cli" in
       let program = Filename.concat root "blorp" in
-      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
+      let alternate_source = Filename.concat cli_dir "compiler_alternate_worker.brp" in
       let parser_source =
         Filename.concat cli_dir "compiler_parser_bridge_cli.brp"
       in
@@ -1073,13 +1052,13 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       mkdir src_dir;
       mkdir cli_dir;
       write_file program "#!/usr/bin/env bash\n";
-      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file alternate_source "func main(args: List[String]) -> Int: 0\n";
       write_file parser_source "func main(args: List[String]) -> Int: 0\n";
       let backend =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:alternate_source
       in
       let parser =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:parser_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:parser_source
       in
       Alcotest.(check bool)
         "backend and parser helpers use distinct cache keys" true
@@ -1093,7 +1072,7 @@ let test_bridge_cache_key_includes_std_sources () =
       let cli_dir = Filename.concat src_dir "stage_12_cli" in
       let std_dir = Filename.concat root "std" in
       let program = Filename.concat root "blorp" in
-      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
+      let alternate_source = Filename.concat cli_dir "compiler_alternate_worker.brp" in
       let std_source = Filename.concat std_dir "prelude.brp" in
       mkdir compiler_dir;
       mkdir blorp_dir;
@@ -1101,14 +1080,14 @@ let test_bridge_cache_key_includes_std_sources () =
       mkdir cli_dir;
       mkdir std_dir;
       write_file program "#!/usr/bin/env bash\n";
-      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file alternate_source "func main(args: List[String]) -> Int: 0\n";
       write_file std_source "pure func helper() -> Int: 1\n";
       let before =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:alternate_source
       in
       write_file std_source "pure func helper() -> Int: 2\n";
       let after =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:alternate_source
       in
       Alcotest.(check bool)
         "std source edits invalidate helper cache" true
@@ -1122,7 +1101,7 @@ let test_bridge_cache_key_includes_all_compiler_stages () =
       let cli_dir = Filename.concat src_dir "stage_12_cli" in
       let lex_dir = Filename.concat src_dir "stage_02_lex" in
       let program = Filename.concat root "blorp" in
-      let backend_source = Filename.concat cli_dir "compiler_bridge_cli.brp" in
+      let alternate_source = Filename.concat cli_dir "compiler_alternate_worker.brp" in
       let lex_source = Filename.concat lex_dir "compiler_token.brp" in
       mkdir compiler_dir;
       mkdir blorp_dir;
@@ -1130,14 +1109,14 @@ let test_bridge_cache_key_includes_all_compiler_stages () =
       mkdir cli_dir;
       mkdir lex_dir;
       write_file program "#!/usr/bin/env bash\n";
-      write_file backend_source "func main(args: List[String]) -> Int: 0\n";
+      write_file alternate_source "func main(args: List[String]) -> Int: 0\n";
       write_file lex_source "enum TokenA: One\n";
       let before =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:alternate_source
       in
       write_file lex_source "enum TokenA: One, Two\n";
       let after =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
+        Bridge.bridge_worker_cache_parts ~program ~source_path:alternate_source
       in
       Alcotest.(check bool)
         "non-entrypoint compiler stage edits invalidate helper cache" true
@@ -1147,10 +1126,10 @@ let test_prepared_bridge_binary_env_accepts_existing_file () =
   with_temp_dir (fun root ->
       let bin = Filename.concat root "prepared-bridge.bin" in
       write_file bin "#!/usr/bin/env bash\n";
-      with_env Bridge.prepared_renderer_bridge_bin_env bin (fun () ->
+      with_env Bridge.prepared_parser_bridge_bin_env bin (fun () ->
           match
             Bridge.prepared_bridge_binary_from_env
-              Bridge.prepared_renderer_bridge_bin_env
+              Bridge.prepared_parser_bridge_bin_env
           with
           | Some (Ok path) ->
               Alcotest.(check string) "prepared bridge path" bin path
@@ -1160,10 +1139,10 @@ let test_prepared_bridge_binary_env_accepts_existing_file () =
 
 let test_prepared_bridge_binary_env_rejects_missing_file () =
   let missing = "/tmp/blorp-prepared-bridge-does-not-exist" in
-  with_env Bridge.prepared_renderer_bridge_bin_env missing (fun () ->
+  with_env Bridge.prepared_parser_bridge_bin_env missing (fun () ->
       match
         Bridge.prepared_bridge_binary_from_env
-          Bridge.prepared_renderer_bridge_bin_env
+          Bridge.prepared_parser_bridge_bin_env
       with
       | Some (Error message) ->
           Alcotest.(check bool)
@@ -1180,21 +1159,21 @@ let test_prepared_bridge_binary_finds_sibling_helper () =
       mkdir path_dir;
       mkdir work_dir;
       let host = Filename.concat path_dir "blorp-ocaml-host" in
-      let helper = Filename.concat path_dir "blorp-compiler-renderer" in
-      let cwd_helper = Filename.concat work_dir "blorp-compiler-renderer" in
+      let helper = Filename.concat path_dir "blorp-compiler-parser" in
+      let cwd_helper = Filename.concat work_dir "blorp-compiler-parser" in
       write_file host "#!/usr/bin/env bash\n";
       write_file helper "#!/usr/bin/env bash\n";
       write_file cwd_helper "#!/usr/bin/env bash\n";
       Unix.chmod host 0o700;
       Unix.chmod helper 0o700;
       Unix.chmod cwd_helper 0o700;
-      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
+      with_env Bridge.prepared_parser_bridge_bin_env "" (fun () ->
           with_env "PATH" path_dir (fun () ->
               with_current_directory work_dir (fun () ->
                   match
                     Bridge.prepared_bridge_binary_from_env
                       ~current_executable:"blorp-ocaml-host"
-                      Bridge.prepared_renderer_bridge_bin_env
+                      Bridge.prepared_parser_bridge_bin_env
                   with
                   | Some (Ok path) ->
                       Alcotest.(check string) "PATH-resolved sibling" helper path
@@ -1212,7 +1191,7 @@ let test_prepared_bridge_binary_does_not_mix_path_installations () =
       let first_host = Filename.concat first_dir "blorp-ocaml-host" in
       let second_host = Filename.concat second_dir "blorp-ocaml-host" in
       let second_helper =
-        Filename.concat second_dir "blorp-compiler-renderer"
+        Filename.concat second_dir "blorp-compiler-parser"
       in
       write_file first_host "#!/usr/bin/env bash\n";
       write_file second_host "#!/usr/bin/env bash\n";
@@ -1220,12 +1199,12 @@ let test_prepared_bridge_binary_does_not_mix_path_installations () =
       Unix.chmod first_host 0o700;
       Unix.chmod second_host 0o700;
       Unix.chmod second_helper 0o700;
-      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
+      with_env Bridge.prepared_parser_bridge_bin_env "" (fun () ->
           with_env "PATH" (first_dir ^ ":" ^ second_dir) (fun () ->
               match
                 Bridge.prepared_bridge_binary_from_env
                   ~current_executable:"blorp-ocaml-host"
-                  Bridge.prepared_renderer_bridge_bin_env
+                  Bridge.prepared_parser_bridge_bin_env
               with
               | None -> ()
               | Some (Ok path) ->
@@ -1233,27 +1212,27 @@ let test_prepared_bridge_binary_does_not_mix_path_installations () =
                     ("must not use a helper from another installation: " ^ path)
               | Some (Error message) -> Alcotest.fail message)))
 
-let test_renderer_bridge_binary_prefers_prepared_env () =
+let test_parser_bridge_binary_prefers_prepared_env () =
   with_temp_dir (fun root ->
-      let bin = Filename.concat root "prepared-renderer.bin" in
+      let bin = Filename.concat root "prepared-parser.bin" in
       write_file bin "#!/usr/bin/env bash\n";
-      with_env Bridge.prepared_renderer_bridge_bin_env bin (fun () ->
-          match Bridge.renderer_bridge_binary () with
-          | Ok path -> Alcotest.(check string) "prepared renderer path" bin path
+      with_env Bridge.prepared_parser_bridge_bin_env bin (fun () ->
+          match Bridge.parser_bridge_binary () with
+          | Ok path -> Alcotest.(check string) "prepared parser path" bin path
           | Error message ->
-              Alcotest.fail ("unexpected prepared renderer error: " ^ message)))
+              Alcotest.fail ("unexpected prepared parser error: " ^ message)))
 
-let test_renderer_bridge_binary_requires_prepared_env () =
+let test_parser_bridge_binary_requires_prepared_env () =
   with_env Bridge.require_prepared_bridge_env "1" (fun () ->
-      with_env Bridge.prepared_renderer_bridge_bin_env "" (fun () ->
-          match Bridge.renderer_bridge_binary () with
+      with_env Bridge.prepared_parser_bridge_bin_env "" (fun () ->
+          match Bridge.parser_bridge_binary () with
           | Error message ->
               Alcotest.(check bool)
-                "reports missing required prepared renderer" true
-                (contains message Bridge.prepared_renderer_bridge_bin_env)
+                "reports missing required prepared parser" true
+                (contains message Bridge.prepared_parser_bridge_bin_env)
           | Ok path ->
               Alcotest.fail
-                ("unexpected fallback renderer helper path: " ^ path)))
+                ("unexpected fallback parser helper path: " ^ path)))
 
 let test_generated_c_bootstrap_compatibility_adds_forward_typedefs () =
   let source =
@@ -1320,18 +1299,16 @@ let test_generated_c_bootstrap_compatibility_preserves_union_tag_checks () =
 
 let suite =
   [
-    ( "renderer_bridge_build",
+    ( "parser_bridge_build",
       [
         Alcotest.test_case "renames generated main" `Quick
-          test_renderer_bridge_compile_renames_generated_main;
+          test_bridge_worker_compile_renames_generated_main;
         Alcotest.test_case "links wrapper main" `Quick
-          test_renderer_bridge_link_uses_wrapper_main;
+          test_bridge_worker_link_uses_wrapper_main;
         Alcotest.test_case "wrapper sets explicit stack" `Quick
-          test_renderer_bridge_wrapper_sets_explicit_stack;
+          test_bridge_worker_wrapper_sets_explicit_stack;
         Alcotest.test_case "helper compile env supports pinned bootstrap" `Quick
           test_bridge_helper_compile_env_supports_pinned_bootstrap;
-        Alcotest.test_case "parser helper env supports pinned bootstrap" `Quick
-          test_parser_bridge_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "helper env isolates pinned workers" `Quick
           test_bridge_helper_compile_env_isolates_pinned_host;
         Alcotest.test_case "parse_source request uses bridge envelope" `Quick
@@ -1417,10 +1394,10 @@ let suite =
           test_prepared_bridge_binary_finds_sibling_helper;
         Alcotest.test_case "prepared bridge does not mix PATH installations"
           `Quick test_prepared_bridge_binary_does_not_mix_path_installations;
-        Alcotest.test_case "renderer helper prefers prepared env" `Quick
-          test_renderer_bridge_binary_prefers_prepared_env;
-        Alcotest.test_case "renderer helper requires prepared env" `Quick
-          test_renderer_bridge_binary_requires_prepared_env;
+        Alcotest.test_case "parser helper prefers prepared env" `Quick
+          test_parser_bridge_binary_prefers_prepared_env;
+        Alcotest.test_case "parser helper requires prepared env" `Quick
+          test_parser_bridge_binary_requires_prepared_env;
         Alcotest.test_case "bootstrap compatibility adds forward typedefs"
           `Quick test_generated_c_bootstrap_compatibility_adds_forward_typedefs;
         Alcotest.test_case "bootstrap compatibility rewrites enum payload checks"

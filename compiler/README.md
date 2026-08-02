@@ -40,7 +40,6 @@ compiler/
 │   ├── typecheck.ml          # Type checking, purity, exhaustiveness
 │   ├── core_result_layout.ml # Remaining host-side Result layout facts
 │   ├── core_type_layout.ml   # Remaining host-side ownership/layout facts
-│   ├── core_stage.ml         # Shared Core stage names for CLI tooling
 │   ├── codegen/              # Shared backend naming/type/builtin helpers
 │   ├── lsp/                  # Language server implementation
 │   ├── runtime.c             # Embedded default C runtime

@@ -88,7 +88,6 @@ let default_suites =
   @ suite_group "OperationResultMetadata" Test_operation_result_metadata.suite
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
-  @ suite_group "CoreStage" Test_core_stage.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
   @ suite_group "CodegenTypes" Test_codegen_types.suite
   @ suite_group "CodegenNames" Test_codegen_names.suite

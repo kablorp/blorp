@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Contract tests for the benchmark-only typecheck worker builder."""
+"""Contract tests for the benchmark-only compiler worker builder and adapters."""
 
 from __future__ import annotations
 
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -14,17 +15,20 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
+BUILDER_MODULE_PATH = ROOT / "benchmarks" / "compiler_benchmark_worker.py"
 MODULE_PATH = ROOT / "benchmarks" / "compiler_typecheck_worker.py"
+BACKEND_MODULE_PATH = ROOT / "benchmarks" / "compiler_backend_worker.py"
 
 
-def load_worker_module():
+def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(
-        "compiler_typecheck_worker_builder",
-        MODULE_PATH,
+        name,
+        path,
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not load typecheck worker builder")
+        raise RuntimeError(f"could not load benchmark worker module: {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -32,7 +36,9 @@ def load_worker_module():
 class CompilerTypecheckWorkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.worker = load_worker_module()
+        cls.builder = load_module("compiler_benchmark_worker", BUILDER_MODULE_PATH)
+        cls.worker = load_module("compiler_typecheck_worker_builder", MODULE_PATH)
+        cls.backend = load_module("compiler_backend_worker_builder", BACKEND_MODULE_PATH)
 
     def test_explicit_worker_must_be_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -62,7 +68,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                     worker_path.write_text("worker", encoding="utf-8")
                     worker_path.chmod(0o755)
 
-            with mock.patch.object(self.worker, "_run", side_effect=fake_run) as run:
+            with mock.patch.object(self.builder, "_run", side_effect=fake_run) as run:
                 worker_path = self.worker.prepare_typecheck_worker(
                     root,
                     output_dir,
@@ -81,10 +87,34 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                 object_command,
             )
             self.assertIn(
-                f"pthread_attr_setstacksize(&attr, (size_t){self.worker.WORKER_STACK_SIZE_BYTES})",
+                f"pthread_attr_setstacksize(&attr, (size_t){self.builder.WORKER_STACK_SIZE_BYTES})",
                 wrapper,
             )
             self.assertEqual(worker_path, output_dir / "compiler_typecheck_worker")
+
+    def test_backend_adapter_selects_backend_worker_contract(self) -> None:
+        expected = Path("/tmp/backend-worker")
+        with mock.patch.object(
+            self.backend,
+            "prepare_benchmark_worker",
+            return_value=expected,
+        ) as prepare:
+            actual = self.backend.prepare_backend_worker(
+                ROOT,
+                Path("/tmp/output"),
+                None,
+            )
+
+        self.assertEqual(actual, expected)
+        prepare.assert_called_once_with(
+            ROOT,
+            Path("/tmp/output"),
+            None,
+            env_name=self.backend.BACKEND_WORKER_ENV,
+            source_path=self.backend.WORKER_SOURCE,
+            worker_name=self.backend.WORKER_NAME,
+            main_symbol=self.backend.WORKER_MAIN_SYMBOL,
+        )
 
     def test_builder_links_and_runs_worker_with_system_c_compiler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

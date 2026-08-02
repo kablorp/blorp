@@ -1,16 +1,8 @@
-(** Single JSON transfer point for Blorp-owned compiler policies, parser
-    artifacts, and downstream compile artifacts.
-
-    Renderer JSON requests are served by [compiler/blorp/src/stage_12_cli/compiler_bridge.brp]
-    through the hidden bridge command. During a cold bridge-helper compile,
-    helper mode serves only the narrow OCaml callers that still need static
-    table rows before the helper binary exists. *)
+(** JSON transfer point for the Blorp-owned parser and CLI planner still used
+    by OCaml-hosted commands. *)
 
 let schema_version = 1
 let domain = "compiler"
-let core_fairness_renderer = "core_fairness"
-let core_stage_renderer = "core_stage"
-let language_surface_renderer = "language_surface"
 
 let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
@@ -361,28 +353,6 @@ let error_message_response_field = function
       | None -> Error ("invalid_response", "missing error object"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
-let render_item_json (op, args) =
-  Lsp_json.Object
-    [
-      ("op", Lsp_json.String op);
-      ("args", Lsp_json.Array (List.map json_string args));
-    ]
-
-let render_many_request_json ~renderer items =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "render_many");
-         ( "payload",
-           Lsp_json.Object
-             [
-               ("renderer", Lsp_json.String renderer);
-               ("items", Lsp_json.Array (List.map render_item_json items));
-             ] );
-       ])
-
 let parse_source_request_json_at_phase ~phase ~path ~module_name ~text =
   Lsp_json.to_string
     (Lsp_json.Object
@@ -517,37 +487,6 @@ let array_response_field_map (name : string)
 
 let optional_json_response_field name = function
   | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
-  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let render_many_response_field = function
-  | Lsp_json.Object fields -> (
-      match List.assoc_opt "items" fields with
-      | Some (Lsp_json.Array values) ->
-          let parse_item = function
-            | Lsp_json.Object item_fields -> (
-                match
-                  ( List.assoc_opt "op" item_fields,
-                    List.assoc_opt "text" item_fields )
-                with
-                | Some (Lsp_json.String op), Some (Lsp_json.String text) ->
-                    Ok (op, text)
-                | _ ->
-                    Error
-                      ( "invalid_response",
-                        "render_many items must contain string op and text" ))
-            | _ ->
-                Error
-                  ("invalid_response", "render_many items must be JSON objects")
-          in
-          let rec collect acc = function
-            | [] -> Ok (List.rev acc)
-            | value :: rest ->
-                let* item = parse_item value in
-                collect (item :: acc) rest
-          in
-          collect [] values
-      | Some _ -> Error ("invalid_response", "field `items` must be an array")
-      | None -> Error ("invalid_response", "missing array field `items`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let string_array_field name = function
@@ -1142,77 +1081,23 @@ let cli_run_response_field response =
 let cli_run_response_json response_json =
   response_result response_json cli_run_response_field
 
-let language_surface_bootstrap_rows = Language_surface_data.rows
-
-let core_fairness_bootstrap_rows =
-  [
-    ("fairness_body_checkpoint", "true");
-    ("fairness_body_seq_checkpoint", "true");
-    ("fairness_body_other", "false");
-  ]
-
-let render_zero_arg_bootstrap_item ~label ~rows op args =
-  if args <> [] then
-    invalid_arg
-      (Printf.sprintf "%s %s expected 0 arg(s), got %d" label op
-         (List.length args));
-  match List.assoc_opt op rows with
-  | Some text -> (op, text)
-  | None -> invalid_arg ("unsupported " ^ label ^ ": " ^ op)
-
-let render_many_for_renderer_helper_exn ~renderer items =
-  if String.equal renderer language_surface_renderer then
-    List.map
-      (fun (op, args) ->
-        render_zero_arg_bootstrap_item ~label:"language surface op"
-          ~rows:language_surface_bootstrap_rows op args)
-      items
-  else if String.equal renderer core_fairness_renderer then
-    List.map
-      (fun (op, args) ->
-        render_zero_arg_bootstrap_item ~label:"fairness op"
-          ~rows:core_fairness_bootstrap_rows op args)
-      items
-  else
-    invalid_arg
-      ("renderer " ^ renderer
-     ^ " is not available while compiling the Blorp bridge helper")
-
-let renderer_bridge_helper_env = "BLORP_COMPILER_RENDERER_HELPER"
-let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
-let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
-let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
+let bridge_worker_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
-let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
 let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
-    (renderer_bridge_helper_env, "1");
     (* Only pinned external bootstrap binaries read this retired selector.
        Current compiler sessions do not use it, but direct bootstrap-binary
        helper builds still need to stay on the bootstrap's built-in parser. *)
     ("BLORP_FRONTEND_PARSER", "ocaml");
   ]
 
-let parser_bridge_helper_compile_env = bridge_helper_compile_env
-
-let renderer_bridge_cache :
-    (string * string * string * string * string) option ref =
-  ref None
-
 let parser_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
-let render_command_cache : (string, string) Hashtbl.t = Hashtbl.create 512
-
 let bridge_temp_retry_limit = 32
-
-let running_inside_renderer_bridge_helper () =
-  match Sys.getenv_opt renderer_bridge_helper_env with
-  | Some "1" -> true
-  | _ -> false
 
 let read_all_fd fd =
   let buf = Buffer.create 4096 in
@@ -1359,19 +1244,9 @@ let compiler_bootstrap_script_name = "scripts/blorp-compiler-bootstrap"
 let bridge_helper_compile_unset_env =
   [
     compiler_bridge_bin_env;
-    prepared_renderer_bridge_bin_env;
     prepared_parser_bridge_bin_env;
     "BLORP_OCAML_HOST_BIN";
   ]
-
-type bridge_helper_compiler_source =
-  | PinnedBootstrapScript
-  | ExplicitBootstrapOverride
-
-type bridge_helper_compiler = {
-  helper_compiler_path : string;
-  helper_compiler_source : bridge_helper_compiler_source;
-}
 
 let existing_executable_candidates prog =
   executable_candidates prog |> List.filter Sys.file_exists
@@ -1400,11 +1275,10 @@ let validate_explicit_bridge_helper_override path =
     Error
       (Printf.sprintf
          "%s must point to a bootstrap-capable Blorp compiler, not the current \
-          compiler executable `%s`. Provide prepared helper binaries with %s \
-          and %s, or unset %s to use %s."
-         compiler_bridge_bin_env path prepared_renderer_bridge_bin_env
-         prepared_parser_bridge_bin_env compiler_bridge_bin_env
-         compiler_bootstrap_script_name)
+          compiler executable `%s`. Provide a prepared helper binary with %s, \
+          or unset %s to use %s."
+         compiler_bridge_bin_env path prepared_parser_bridge_bin_env
+         compiler_bridge_bin_env compiler_bootstrap_script_name)
   else Ok ()
 
 let locate_bridge_helper_compiler ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
@@ -1412,19 +1286,10 @@ let locate_bridge_helper_compiler ?(bridge_bin = Sys.getenv_opt compiler_bridge_
   match bridge_bin with
   | Some path when path <> "" ->
       let* () = validate_explicit_bridge_helper_override path in
-      Ok
-        {
-          helper_compiler_path = path;
-          helper_compiler_source = ExplicitBootstrapOverride;
-        }
+      Ok path
   | _ -> (
       match find_upwards_from starts compiler_bootstrap_script_name with
-      | Some path ->
-          Ok
-            {
-              helper_compiler_path = path;
-              helper_compiler_source = PinnedBootstrapScript;
-            }
+      | Some path -> Ok path
       | None ->
           Error
             (Printf.sprintf
@@ -1458,25 +1323,9 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       (try Sys.remove stderr_path with _ -> ());
       (Process_status.exit_code status, output, stderr_output)
 
-let default_bridge_helper_compiler () =
-  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  locate_bridge_helper_compiler starts
-
 let parser_bridge_helper_compiler () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
   locate_bridge_helper_compiler starts
-
-let renderer_bridge_source_path () =
-  match Sys.getenv_opt renderer_bridge_source_env with
-  | Some path when path <> "" -> path
-  | _ -> (
-      let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-      match find_upwards_from starts renderer_bridge_source_name with
-      | Some path -> path
-      | None ->
-          invalid_arg
-            (Printf.sprintf "cannot locate Blorp renderer bridge source %s"
-               renderer_bridge_source_name))
 
 let parser_bridge_source_path () =
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -1487,23 +1336,22 @@ let parser_bridge_source_path () =
         (Printf.sprintf "cannot locate Blorp parser bridge source %s"
            parser_bridge_source_name)
 
-let renderer_bridge_temp_dir_retry_limit = 32
+let bridge_worker_temp_dir_retry_limit = 32
 
-let renderer_bridge_stack_link_args () =
+let bridge_worker_stack_link_args () =
   if String.equal (Platform.current ()) "macos" then
     [ "-Wl,-stack_size,0x4000000" ]
   else []
 
-(* The self-hosted bridge currently decodes and emits large Core JSON through
-   generated recursive functions with large C stack frames. Keep the bridge
-   stack explicit until those generated frames are made smaller; relying on the
-   platform default stack makes Linux CI crash on large compiler/blorp payloads. *)
-let renderer_bridge_stack_size_bytes = 256 * 1024 * 1024
-let renderer_bridge_user_main_symbol = "__blorp_renderer_bridge_user_main"
+(* The self-hosted parser worker traverses large serialized compiler values
+   through generated recursive functions. Keep its stack explicit until those
+   generated frames are smaller; the platform default is insufficient in CI. *)
+let bridge_worker_stack_size_bytes = 256 * 1024 * 1024
+let bridge_worker_user_main_symbol = "__blorp_compiler_worker_main"
 
-let renderer_bridge_common_cc_flags = [ "-O0"; "-fwrapv"; "-pipe"; "-w" ]
+let bridge_worker_common_cc_flags = [ "-O0"; "-fwrapv"; "-pipe"; "-w" ]
 
-let renderer_bridge_wrapper_source () =
+let bridge_worker_wrapper_source () =
   Printf.sprintf
     {c|#include <pthread.h>
 #include <stddef.h>
@@ -1515,10 +1363,10 @@ typedef struct {
     int argc;
     char **argv;
     int result;
-} blorp_renderer_bridge_main_args;
+} blorp_compiler_worker_main_args;
 
-static void *blorp_renderer_bridge_main_entry(void *raw) {
-    blorp_renderer_bridge_main_args *args = (blorp_renderer_bridge_main_args *)raw;
+static void *blorp_compiler_worker_main_entry(void *raw) {
+    blorp_compiler_worker_main_args *args = (blorp_compiler_worker_main_args *)raw;
     args->result = %s(args->argc, args->argv);
     return NULL;
 }
@@ -1526,7 +1374,7 @@ static void *blorp_renderer_bridge_main_entry(void *raw) {
 int main(int argc, char **argv) {
     pthread_attr_t attr;
     pthread_t thread;
-    blorp_renderer_bridge_main_args args = { argc, argv, 1 };
+    blorp_compiler_worker_main_args args = { argc, argv, 1 };
 
     if (pthread_attr_init(&attr) != 0) {
         return %s(argc, argv);
@@ -1537,7 +1385,7 @@ int main(int argc, char **argv) {
         return %s(argc, argv);
     }
 
-    if (pthread_create(&thread, &attr, blorp_renderer_bridge_main_entry, &args) != 0) {
+    if (pthread_create(&thread, &attr, blorp_compiler_worker_main_entry, &args) != 0) {
         pthread_attr_destroy(&attr);
         return %s(argc, argv);
     }
@@ -1549,27 +1397,27 @@ int main(int argc, char **argv) {
     return args.result;
 }
 |c}
-    renderer_bridge_user_main_symbol renderer_bridge_user_main_symbol
-    renderer_bridge_user_main_symbol renderer_bridge_stack_size_bytes
-    renderer_bridge_user_main_symbol renderer_bridge_user_main_symbol
+    bridge_worker_user_main_symbol bridge_worker_user_main_symbol
+    bridge_worker_user_main_symbol bridge_worker_stack_size_bytes
+    bridge_worker_user_main_symbol bridge_worker_user_main_symbol
 
-let renderer_bridge_compile_object_args ~c_path ~obj_path =
-  renderer_bridge_common_cc_flags
+let bridge_worker_compile_object_args ~c_path ~obj_path =
+  bridge_worker_common_cc_flags
   @ [
-      "-Dmain=" ^ renderer_bridge_user_main_symbol;
+      "-Dmain=" ^ bridge_worker_user_main_symbol;
       "-c";
       c_path;
       "-o";
       obj_path;
     ]
 
-let renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path =
-  renderer_bridge_common_cc_flags
+let bridge_worker_link_args ~obj_path ~wrapper_path ~bin_path =
+  bridge_worker_common_cc_flags
   @ [ obj_path; wrapper_path ]
-  @ renderer_bridge_stack_link_args ()
+  @ bridge_worker_stack_link_args ()
   @ [ "-lm"; "-lpthread"; "-o"; bin_path ]
 
-type renderer_bridge_cache_parts = {
+type bridge_worker_cache_parts = {
   bridge_key : string;
   bridge_entrypoint : string;
   bridge_source_digest : string;
@@ -1579,16 +1427,16 @@ type renderer_bridge_cache_parts = {
   bridge_os : string;
 }
 
-let renderer_bridge_cc_identity =
+let bridge_worker_cc_identity =
   lazy
     (let code, output, stderr_output =
        run_process_capture "cc" [ "--version" ]
      in
      String.concat "\000" [ string_of_int code; output; stderr_output ])
 
-let renderer_bridge_cache_root () =
+let bridge_worker_cache_root () =
   let root =
-    match Sys.getenv_opt renderer_bridge_cache_dir_env with
+    match Sys.getenv_opt bridge_worker_cache_dir_env with
     | Some path when path <> "" -> path
     | _ ->
         let home =
@@ -1599,20 +1447,20 @@ let renderer_bridge_cache_root () =
   ensure_dir root;
   root
 
-let renderer_bridge_cache_parts ~program ~source_path =
+let bridge_worker_cache_parts ~program ~source_path =
   let entrypoint = Filename.basename source_path in
   let source_digest = bridge_source_tree_digest source_path in
   let program_digest = file_digest program in
-  let cc_digest = string_digest (Lazy.force renderer_bridge_cc_identity) in
+  let cc_digest = string_digest (Lazy.force bridge_worker_cc_identity) in
   let link_args_digest =
-    renderer_bridge_stack_link_args () |> String.concat "\000" |> string_digest
+    bridge_worker_stack_link_args () |> String.concat "\000" |> string_digest
   in
   let os = Sys.os_type in
   let bridge_key =
     string_digest
       (String.concat "\000"
          [
-           "compiler-renderer-bridge-cache-v4";
+           "compiler-worker-cache-v1";
            entrypoint;
            source_digest;
            program_digest;
@@ -1631,22 +1479,22 @@ let renderer_bridge_cache_parts ~program ~source_path =
     bridge_os = os;
   }
 
-let renderer_bridge_cache_dir cache_root key =
-  Filename.concat cache_root ("compiler-renderer-bridge-" ^ key)
+let bridge_worker_cache_dir cache_root key =
+  Filename.concat cache_root ("compiler-worker-" ^ key)
 
-let renderer_bridge_bin_path dir = Filename.concat dir "bridge.bin"
-let renderer_bridge_c_path dir = Filename.concat dir "bridge.c"
-let renderer_bridge_obj_path dir = Filename.concat dir "bridge.o"
-let renderer_bridge_wrapper_path dir = Filename.concat dir "bridge_main.c"
-let renderer_bridge_manifest_path dir = Filename.concat dir "MANIFEST"
-let renderer_bridge_ready_path dir = Filename.concat dir "READY"
-let renderer_bridge_lock_path cache_root key =
-  Filename.concat cache_root (".compiler-renderer-bridge-" ^ key ^ ".lock")
+let bridge_worker_bin_path dir = Filename.concat dir "bridge.bin"
+let bridge_worker_c_path dir = Filename.concat dir "bridge.c"
+let bridge_worker_obj_path dir = Filename.concat dir "bridge.o"
+let bridge_worker_wrapper_path dir = Filename.concat dir "bridge_main.c"
+let bridge_worker_manifest_path dir = Filename.concat dir "MANIFEST"
+let bridge_worker_ready_path dir = Filename.concat dir "READY"
+let bridge_worker_lock_path cache_root key =
+  Filename.concat cache_root (".compiler-worker-" ^ key ^ ".lock")
 
-let renderer_bridge_manifest parts ~binary_path =
+let bridge_worker_manifest parts ~binary_path =
   String.concat "\n"
     [
-      "compiler-renderer-bridge-cache-v4";
+      "compiler-worker-cache-v1";
       "key=" ^ parts.bridge_key;
       "entrypoint=" ^ parts.bridge_entrypoint;
       "source=" ^ parts.bridge_source_digest;
@@ -1658,27 +1506,27 @@ let renderer_bridge_manifest parts ~binary_path =
       "";
     ]
 
-let renderer_bridge_cache_verified parts dir =
-  let binary_path = renderer_bridge_bin_path dir in
-  Sys.file_exists (renderer_bridge_ready_path dir)
+let bridge_worker_cache_verified parts dir =
+  let binary_path = bridge_worker_bin_path dir in
+  Sys.file_exists (bridge_worker_ready_path dir)
   && Sys.file_exists binary_path
   &&
     try
-      read_file (renderer_bridge_manifest_path dir)
-      = renderer_bridge_manifest parts ~binary_path
+      read_file (bridge_worker_manifest_path dir)
+      = bridge_worker_manifest parts ~binary_path
     with _ -> false
 
-let write_renderer_bridge_cache_markers parts dir =
-  let binary_path = renderer_bridge_bin_path dir in
+let write_bridge_worker_cache_markers parts dir =
+  let binary_path = bridge_worker_bin_path dir in
   write_file
-    (renderer_bridge_manifest_path dir)
-    (renderer_bridge_manifest parts ~binary_path);
-  write_file (renderer_bridge_ready_path dir) "ready\n"
+    (bridge_worker_manifest_path dir)
+    (bridge_worker_manifest parts ~binary_path);
+  write_file (bridge_worker_ready_path dir) "ready\n"
 
-let rec create_renderer_bridge_stage_dir cache_root attempts_left =
+let rec create_bridge_worker_stage_dir cache_root attempts_left =
   let marker =
     Filename.concat cache_root
-      (Printf.sprintf ".compiler-renderer-bridge-stage-%d-%d" (Unix.getpid ())
+      (Printf.sprintf ".compiler-worker-stage-%d-%d" (Unix.getpid ())
          (Random.bits () land 0x3fffffff))
   in
   try
@@ -1686,16 +1534,16 @@ let rec create_renderer_bridge_stage_dir cache_root attempts_left =
     marker
   with
   | Unix.Unix_error (Unix.EEXIST, _, _) when attempts_left > 0 ->
-      create_renderer_bridge_stage_dir cache_root (attempts_left - 1)
+      create_bridge_worker_stage_dir cache_root (attempts_left - 1)
   | exn ->
       remove_path_noerr marker;
       raise exn
 
-let publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir =
+let publish_bridge_worker_cache_dir parts ~stage_dir ~final_dir =
   let rec publish attempts =
-    if renderer_bridge_cache_verified parts final_dir then begin
+    if bridge_worker_cache_verified parts final_dir then begin
       remove_path_noerr stage_dir;
-      Ok (renderer_bridge_bin_path final_dir)
+      Ok (bridge_worker_bin_path final_dir)
     end
     else if Sys.file_exists final_dir && attempts < 2 then begin
       remove_path_noerr final_dir;
@@ -1704,11 +1552,11 @@ let publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir =
     else
       try
         Unix.rename stage_dir final_dir;
-        if renderer_bridge_cache_verified parts final_dir then
-          Ok (renderer_bridge_bin_path final_dir)
+        if bridge_worker_cache_verified parts final_dir then
+          Ok (bridge_worker_bin_path final_dir)
         else begin
           remove_path_noerr final_dir;
-          Error "published Blorp renderer bridge cache did not verify"
+          Error "published Blorp compiler worker cache did not verify"
         end
       with
       | Unix.Unix_error ((Unix.EEXIST | Unix.ENOTEMPTY), _, _) when attempts < 2
@@ -1717,7 +1565,7 @@ let publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir =
       | exn ->
           remove_path_noerr stage_dir;
           Error
-            (Printf.sprintf "failed to publish Blorp renderer bridge cache: %s"
+            (Printf.sprintf "failed to publish Blorp compiler worker cache: %s"
                (Printexc.to_string exn))
   in
   publish 0
@@ -1945,10 +1793,9 @@ let apply_generated_c_bootstrap_compatibility path =
 
 let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_dir
     ~bin_path =
-  let program = compiler.helper_compiler_path in
-  let c_path = renderer_bridge_c_path stage_dir in
-  let obj_path = renderer_bridge_obj_path stage_dir in
-  let wrapper_path = renderer_bridge_wrapper_path stage_dir in
+  let c_path = bridge_worker_c_path stage_dir in
+  let obj_path = bridge_worker_obj_path stage_dir in
+  let wrapper_path = bridge_worker_wrapper_path stage_dir in
   Fun.protect
     ~finally:(fun () ->
       List.iter
@@ -1956,7 +1803,7 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
         [ c_path; obj_path; wrapper_path ])
     (fun () ->
       let compile_code, compile_output, compile_stderr =
-        run_process_capture program
+        run_process_capture compiler
           ~env:compile_env
           ~unset_env:bridge_helper_compile_unset_env
           [ "compile"; "--no-format"; "-o"; c_path; source_path ]
@@ -1968,10 +1815,10 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
              (String.trim (compile_output ^ compile_stderr)))
       else
         let () = apply_generated_c_bootstrap_compatibility c_path in
-        let () = write_file wrapper_path (renderer_bridge_wrapper_source ()) in
+        let () = write_file wrapper_path (bridge_worker_wrapper_source ()) in
         let obj_code, obj_output, obj_stderr =
           run_process_capture "cc"
-            (renderer_bridge_compile_object_args ~c_path ~obj_path)
+            (bridge_worker_compile_object_args ~c_path ~obj_path)
         in
         if obj_code <> 0 then
           Error
@@ -1982,7 +1829,7 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
         else
           let cc_code, cc_output, cc_stderr =
             run_process_capture "cc"
-              (renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path)
+              (bridge_worker_link_args ~obj_path ~wrapper_path ~bin_path)
           in
           if cc_code <> 0 then
             Error
@@ -2038,8 +1885,8 @@ let rec lockf_retry fd command size =
   try Unix.lockf fd command size
   with Unix.Unix_error (Unix.EINTR, _, _) -> lockf_retry fd command size
 
-let with_renderer_bridge_cache_lock cache_root key f =
-  let lock_path = renderer_bridge_lock_path cache_root key in
+let with_bridge_worker_cache_lock cache_root key f =
+  let lock_path = bridge_worker_lock_path cache_root key in
   let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
   Fun.protect
     ~finally:(fun () -> Unix.close fd)
@@ -2050,20 +1897,20 @@ let with_renderer_bridge_cache_lock cache_root key f =
           try lockf_retry fd Unix.F_ULOCK 0 with _ -> ())
         f)
 
-let compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
+let compile_bridge_worker_binary ~compiler ~source_path ~cache_root
     ~compile_env parts =
-  let final_dir = renderer_bridge_cache_dir cache_root parts.bridge_key in
-  if renderer_bridge_cache_verified parts final_dir then
-    Ok (renderer_bridge_bin_path final_dir)
-  else with_renderer_bridge_cache_lock cache_root parts.bridge_key (fun () ->
-    if renderer_bridge_cache_verified parts final_dir then
-      Ok (renderer_bridge_bin_path final_dir)
+  let final_dir = bridge_worker_cache_dir cache_root parts.bridge_key in
+  if bridge_worker_cache_verified parts final_dir then
+    Ok (bridge_worker_bin_path final_dir)
+  else with_bridge_worker_cache_lock cache_root parts.bridge_key (fun () ->
+    if bridge_worker_cache_verified parts final_dir then
+      Ok (bridge_worker_bin_path final_dir)
     else
     let stage_dir =
-      create_renderer_bridge_stage_dir cache_root
-        renderer_bridge_temp_dir_retry_limit
+      create_bridge_worker_stage_dir cache_root
+        bridge_worker_temp_dir_retry_limit
     in
-    let bin_path = renderer_bridge_bin_path stage_dir in
+    let bin_path = bridge_worker_bin_path stage_dir in
     match
       compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
         ~stage_dir ~bin_path
@@ -2072,12 +1919,12 @@ let compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
         remove_path_noerr stage_dir;
         Error message
     | Ok _ ->
-        write_renderer_bridge_cache_markers parts stage_dir;
-        publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir)
+        write_bridge_worker_cache_markers parts stage_dir;
+        publish_bridge_worker_cache_dir parts ~stage_dir ~final_dir)
 
 let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
-  let cache_root = renderer_bridge_cache_root () in
-  let program = compiler.helper_compiler_path in
+  let cache_root = bridge_worker_cache_root () in
+  let program = compiler in
   match !cache_ref with
   | Some (cached_program, cached_source, cached_root, _cached_key, cached_binary)
     when String.equal cached_program program
@@ -2086,9 +1933,9 @@ let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
          && Sys.file_exists cached_binary ->
       Ok cached_binary
   | _ -> (
-      let cache_parts = renderer_bridge_cache_parts ~program ~source_path in
+      let cache_parts = bridge_worker_cache_parts ~program ~source_path in
       match
-        compile_renderer_bridge_binary ~compiler ~source_path ~cache_root
+        compile_bridge_worker_binary ~compiler ~source_path ~cache_root
           ~compile_env cache_parts
       with
       | Ok binary ->
@@ -2099,9 +1946,7 @@ let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
       | Error _ as error -> error)
 
 let prepared_bridge_sibling_name env_name =
-  if String.equal env_name prepared_renderer_bridge_bin_env then
-    Some "blorp-compiler-renderer"
-  else if String.equal env_name prepared_parser_bridge_bin_env then
+  if String.equal env_name prepared_parser_bridge_bin_env then
     Some "blorp-compiler-parser"
   else None
 
@@ -2176,17 +2021,6 @@ let missing_prepared_bridge_error env_name =
        "%s=1 requires %s to point to a prepared Blorp bridge helper binary"
        require_prepared_bridge_env env_name)
 
-let renderer_bridge_binary () =
-  match prepared_bridge_binary_from_env prepared_renderer_bridge_bin_env with
-  | Some result -> result
-  | None when prepared_bridge_required () ->
-      missing_prepared_bridge_error prepared_renderer_bridge_bin_env
-  | None ->
-      let* compiler = default_bridge_helper_compiler () in
-      bridge_binary_for_source renderer_bridge_cache ~compiler
-        ~source_path:(renderer_bridge_source_path ())
-        ~compile_env:bridge_helper_compile_env
-
 let parser_bridge_binary () =
   match prepared_bridge_binary_from_env prepared_parser_bridge_bin_env with
   | Some result -> result
@@ -2196,40 +2030,18 @@ let parser_bridge_binary () =
       let* compiler = parser_bridge_helper_compiler () in
       bridge_binary_for_source parser_bridge_cache ~compiler
         ~source_path:(parser_bridge_source_path ())
-        ~compile_env:parser_bridge_helper_compile_env
+        ~compile_env:bridge_helper_compile_env
 
-type prepared_bridge_binaries = {
-  prepared_renderer_bridge_bin : string;
-  prepared_parser_bridge_bin : string;
-}
-
-let prepare_bridge_binaries ~out_dir =
+let prepare_parser_bridge_binary ~out_dir =
   ensure_dir out_dir;
-  let* compiler = default_bridge_helper_compiler () in
-  let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
+  let* compiler = parser_bridge_helper_compiler () in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
-  let* cached_renderer_path =
-    bridge_binary_for_source renderer_bridge_cache ~compiler
-      ~source_path:(renderer_bridge_source_path ())
-      ~compile_env:bridge_helper_compile_env
-  in
   let* cached_parser_path =
     bridge_binary_for_source parser_bridge_cache ~compiler
       ~source_path:(parser_bridge_source_path ())
-      ~compile_env:parser_bridge_helper_compile_env
+      ~compile_env:bridge_helper_compile_env
   in
-  let* renderer_path =
-    copy_binary_to_path ~source_path:cached_renderer_path
-      ~dest_path:renderer_bin
-  in
-  let* parser_path =
-    copy_binary_to_path ~source_path:cached_parser_path ~dest_path:parser_bin
-  in
-  Ok
-    {
-      prepared_renderer_bridge_bin = renderer_path;
-      prepared_parser_bridge_bin = parser_path;
-    }
+  copy_binary_to_path ~source_path:cached_parser_path ~dest_path:parser_bin
 
 type bridge_request_stats = {
   request_action : string;
@@ -2260,16 +2072,10 @@ let prepare_bridge_request ~stats_enabled request_json =
     request_error_excerpt;
   }
 
-let with_resolved_prepared_bridge_request
-    ?(release_host_heap_before_run = false) bridge_binary request run =
+let with_resolved_prepared_bridge_request bridge_binary request run =
   Fun.protect
     ~finally:(fun () -> try Sys.remove request.request_path with _ -> ())
     (fun () ->
-      (* The Core emitter builds an independent Blorp representation of a
-         compiler-sized request. Release dead frontend and OCaml Core heap
-         chunks before resolving or starting that helper so both compilers do
-         not consume physical memory concurrently on a cold cache. *)
-      if release_host_heap_before_run then Gc.compact ();
       match bridge_binary () with
       | Error message -> Error ("bridge_command_failed", message)
       | Ok bridge_binary -> run bridge_binary)
@@ -2290,11 +2096,9 @@ let bridge_process_failure_message request ~exit_code ~stdout ~stderr =
     (String.trim (stdout ^ stderr))
     request.request_error_excerpt
 
-let run_prepared_bridge_request ?(release_host_heap_before_run = false)
-    bridge_binary request =
+let run_prepared_bridge_request bridge_binary request =
   match
-    with_resolved_prepared_bridge_request ~release_host_heap_before_run
-      bridge_binary request (fun bridge_binary ->
+    with_resolved_prepared_bridge_request bridge_binary request (fun bridge_binary ->
         let started_at = Unix.gettimeofday () in
         let exit_code, output, stderr_output =
           run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
@@ -2313,60 +2117,16 @@ let run_prepared_bridge_request ?(release_host_heap_before_run = false)
   | Ok output -> output
   | Error (code, message) -> error_response code message
 
-let run_request_via_blorp_binary ?release_host_heap_before_run bridge_binary
-    request_json =
+let run_request_via_blorp_binary bridge_binary request_json =
   let stats_enabled = bridge_stats_enabled () in
-  run_prepared_bridge_request ?release_host_heap_before_run bridge_binary
+  run_prepared_bridge_request bridge_binary
     (prepare_bridge_request ~stats_enabled request_json)
-
-let run_renderer_request_via_blorp ?release_host_heap_before_run request_json =
-  run_request_via_blorp_binary ?release_host_heap_before_run
-    renderer_bridge_binary request_json
 
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
 
 let run_cli_request_via_blorp ?version ?source args =
   run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
-
-let render_cache_key ~renderer ~op args =
-  let buf = Buffer.create 128 in
-  let add_part part =
-    Buffer.add_string buf (string_of_int (String.length part));
-    Buffer.add_char buf ':';
-    Buffer.add_string buf part;
-    Buffer.add_char buf ';'
-  in
-  add_part renderer;
-  add_part op;
-  List.iter add_part args;
-  Buffer.contents buf
-
-let render_via_command_exn ~renderer ~op args =
-  if running_inside_renderer_bridge_helper () then
-    match render_many_for_renderer_helper_exn ~renderer [ (op, args) ] with
-    | [ (_, text) ] -> text
-    | _ ->
-        invalid_arg
-          ("invalid renderer helper response for " ^ renderer ^ ":" ^ op)
-  else
-    let cache_key = render_cache_key ~renderer ~op args in
-    match Hashtbl.find_opt render_command_cache cache_key with
-    | Some text -> text
-    | None -> (
-        let response_json =
-          run_renderer_request_via_blorp
-            (render_many_request_json ~renderer [ (op, args) ])
-        in
-        match response_result response_json render_many_response_field with
-        | Ok [ (_, text) ] ->
-            Hashtbl.replace render_command_cache cache_key text;
-            text
-        | Ok _ ->
-            invalid_arg
-              ("invalid renderer response for single item " ^ renderer ^ ":"
-             ^ op)
-        | Error (_, message) -> invalid_arg message)
 
 let parse_source_via_command_at_phase ~phase ~path ~module_name ~text =
   let response_json =
@@ -2390,10 +2150,3 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
 
 let cli_run_via_command ?version ?source args =
   run_cli_request_via_blorp ?version ?source args |> cli_run_response_json
-
-let render_core_stage_unknown_error original normalized =
-  render_via_command_exn ~renderer:core_stage_renderer
-    ~op:"core_stage_unknown_error" [ original; normalized ]
-
-let () =
-  Core_stage.set_unknown_stage_error_renderer render_core_stage_unknown_error

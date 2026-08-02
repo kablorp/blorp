@@ -105,7 +105,7 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`, `compiler/lib/core_stage.ml`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`.
+- For pipeline questions, start with `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`, `compiler/blorp/src/stage_09_core/compiler_core_pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`.
 - For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/lib/dim_solver.ml`, `compiler/lib/infer.ml`, `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
@@ -451,7 +451,6 @@ compiler/            # OCaml compiler implementation
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core_result_layout.ml  # Remaining OCaml Result layout consumers
     core_type_layout.ml  # Remaining OCaml ownership/layout consumers
-    core_stage.ml     # Shared Core stage names for CLI tooling
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck
     codegen/      # Shared codegen utilities used by the core-emit pipeline
       codegen_names.ml     # C name mangling (UFCS, modules)

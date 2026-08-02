@@ -19,11 +19,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compiler_backend_worker import BACKEND_WORKER_ENV, prepare_backend_worker
+
 
 METRIC_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 60.0
 MAX_UNCONFIRMED_REQUEST_BYTES = 16 * 1024 * 1024
-RENDERER_BRIDGE_ENV = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 WORKER_FLAG = "--measurement-worker"
 VALIDATE_FLAG = "--validate-request"
 POLL_SECONDS = 0.1
@@ -253,44 +255,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def prepared_renderer_bridge(root: Path, out_dir: Path, explicit: str | None) -> Path:
-    candidate = explicit or os.environ.get(RENDERER_BRIDGE_ENV)
-    if candidate:
-        path = Path(candidate).expanduser().resolve()
-        if not path.is_file():
-            raise RuntimeError(f"renderer bridge does not exist: {path}")
-        return path
-
-    blorp = root / "blorp"
-    if not blorp.is_file():
-        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
-
-    result = subprocess.run(
-        [str(blorp), "__compiler-bridge-prepare", str(out_dir)],
-        cwd=root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"failed to prepare compiler bridge: {detail}")
-
-    values = {}
-    for line in result.stdout.splitlines():
-        name, separator, value = line.partition("=")
-        if separator:
-            values[name] = value
-    candidate = values.get(RENDERER_BRIDGE_ENV)
-    if not candidate:
-        raise RuntimeError("bridge preparation did not report the renderer helper")
-    path = Path(candidate).resolve()
-    if not path.is_file():
-        raise RuntimeError(f"prepared renderer bridge does not exist: {path}")
-    return path
-
-
 def validate_request(request_path: Path) -> None:
     try:
         request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -330,17 +294,17 @@ def validate_response(response_path: Path) -> int:
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as error:
-        raise RuntimeError(f"renderer bridge returned invalid JSON: {error}") from error
+        raise RuntimeError(f"backend benchmark worker returned invalid JSON: {error}") from error
 
     if not isinstance(response, dict) or response.get("ok") is not True:
         detail = response.get("error", response) if isinstance(response, dict) else response
-        raise RuntimeError(f"renderer bridge failed: {detail}")
+        raise RuntimeError(f"backend benchmark worker failed: {detail}")
     artifact = response.get("artifact")
     if not isinstance(artifact, dict):
-        raise RuntimeError("renderer bridge response is missing an artifact")
+        raise RuntimeError("backend benchmark worker response is missing an artifact")
     c_code = artifact.get("c_code")
     if not isinstance(c_code, str) or not c_code:
-        raise RuntimeError("renderer bridge artifact is missing generated C")
+        raise RuntimeError("backend benchmark worker artifact is missing generated C")
     return len(c_code.encode("utf-8"))
 
 
@@ -448,7 +412,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
 
         bridge_dir = temp_dir / "bridge"
         bridge_dir.mkdir()
-        bridge = prepared_renderer_bridge(root, bridge_dir, args.bridge)
+        bridge = prepare_backend_worker(root, bridge_dir, args.bridge)
         bridge_sha256 = sha256_file(bridge)
 
         response_path = temp_dir / "response.json"
@@ -475,7 +439,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if sha256_file(request_path) != request_sha256:
             raise RuntimeError("replay request changed during measurement")
         if sha256_file(bridge) != bridge_sha256:
-            raise RuntimeError("renderer bridge changed during measurement")
+            raise RuntimeError("backend benchmark worker changed during measurement")
 
         metrics.update(
             {
@@ -533,13 +497,13 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Replay one captured production emit_core_c request against an "
-            "isolated renderer bridge."
+            "isolated backend benchmark worker."
         )
     )
     parser.add_argument("request", help="captured emit_core_c request JSON")
     parser.add_argument(
         "--bridge",
-        help=f"prepared renderer bridge; defaults to ${RENDERER_BRIDGE_ENV} or prepares one",
+        help=f"backend benchmark worker; defaults to ${BACKEND_WORKER_ENV} or builds one",
     )
     parser.add_argument(
         "--timeout",

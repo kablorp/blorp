@@ -1,0 +1,139 @@
+-- Benchmark-only JSON adapter for replaying backend emission in isolation.
+import:
+	../src/stage_09_core/compiler_core_json:
+		CoreProgram,
+		core_json_error_to_string,
+		decode_core_program_json,
+	../src/stage_10_backend/compiler_artifact_json: c_artifact_to_json
+	../src/stage_10_backend/compiler_build_artifact: CArtifact
+	../src/stage_10_backend/compiler_core_emit:
+		core_emit_error_message,
+		try_emit_core_program_c_artifact_with_profile,
+	../src/stage_12_cli/compiler_bridge_protocol:
+		BridgeProtocolError,
+		bridge_error_json,
+		bridge_failure_json,
+		bridge_success_json,
+		decode_bridge_envelope_header,
+		decode_bridge_payload,
+	json: JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector), get_field
+
+
+union BackendBridgeError:
+	ProtocolError(BridgeProtocolError)
+	UnsupportedAction(String)
+	ExpectedRequestField(String, String)
+	CoreJsonFailure(String)
+	EmitFailure(String)
+
+
+private pure func error_code(error: BackendBridgeError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid_request"
+		UnsupportedAction(_):
+			"unsupported_action"
+		ExpectedRequestField(_, _):
+			"invalid_request"
+		CoreJsonFailure(_):
+			"invalid_request"
+		EmitFailure(_):
+			"emit_error"
+
+
+private pure func error_message(error: BackendBridgeError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid bridge request"
+		UnsupportedAction(action):
+			"unsupported backend benchmark action: ${action}"
+		ExpectedRequestField(field_name, expected):
+			"field `${field_name}` must be ${expected}"
+		CoreJsonFailure(message):
+			message
+		EmitFailure(message):
+			message
+
+
+private pure func error_json(error: BackendBridgeError) -> JsonValue:
+	match error:
+		ProtocolError(protocol_error):
+			bridge_error_json(protocol_error)
+		_:
+			bridge_failure_json(error_code(error), error_message(error))
+
+
+private pure func json_field(
+	value: JsonValue,
+	field_name: String,
+	expected: String,
+) -> Result[JsonValue, BackendBridgeError]:
+	get_field(value, field_name).to_result(ExpectedRequestField(field_name, expected))
+
+
+private pure func optional_bool_field(
+	value: JsonValue,
+	field_name: String,
+	default_value: Bool,
+) -> Result[Bool, BackendBridgeError]:
+	match get_field(value, field_name):
+		Some(field):
+			match field:
+				JsonBool(flag):
+					Ok(flag)
+				JsonNull:
+					Err(ExpectedRequestField(field_name, "a boolean"))
+				JsonNumber(_):
+					Err(ExpectedRequestField(field_name, "a boolean"))
+				JsonString(_):
+					Err(ExpectedRequestField(field_name, "a boolean"))
+				JsonVector(_):
+					Err(ExpectedRequestField(field_name, "a boolean"))
+				JsonObject(_):
+					Err(ExpectedRequestField(field_name, "a boolean"))
+		None:
+			Ok(default_value)
+
+
+private pure func decode_core_program(
+	core_json: JsonValue,
+) -> Result[CoreProgram, BackendBridgeError]:
+	decode_core_program_json(
+		core_json,
+	).map_err(
+		func(error): CoreJsonFailure(core_json_error_to_string(error)),
+	)
+
+
+private pure func emit_core_c_artifact(
+	program: CoreProgram,
+	profile: Bool,
+) -> Result[CArtifact, BackendBridgeError]:
+	try_emit_core_program_c_artifact_with_profile(
+		program,
+		profile,
+	).map_err(
+		func(error): EmitFailure(core_emit_error_message(error)),
+	)
+
+
+private pure func handle_emit_core_c(body: JsonValue) -> Result[JsonValue, BackendBridgeError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	profile ?= optional_bool_field(body, "profile", False)
+	program ?= decode_core_program(core_json)
+	artifact ?= emit_core_c_artifact(program, profile)
+	Ok(bridge_success_json(c_artifact_to_json(artifact)))
+
+
+private pure func dispatch_request(root: JsonValue) -> Result[JsonValue, BackendBridgeError]:
+	header ?= decode_bridge_envelope_header(root).map_err(func(error): ProtocolError(error))
+
+	if header.action_name != "emit_core_c":
+		Err(UnsupportedAction(header.action_name))
+	else:
+		body ?= decode_bridge_payload(root).map_err(func(error): ProtocolError(error))
+		handle_emit_core_c(body)
+
+
+pure func handle_request_value(root: JsonValue) -> JsonValue:
+	dispatch_request(root).get_or_else(error_json)

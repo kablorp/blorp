@@ -40,17 +40,6 @@ let test_generated_language_surface_contains_required_prelude_methods () =
   Alcotest.(check bool) "parallel matrix UFCS module generated" true
     (List.mem "parallel_matrix" ufcs_modules)
 
-let test_renderer_helper_uses_generated_language_surface_rows () =
-  let requested =
-    List.map (fun (name, _row) -> (name, [])) Language_surface_data.rows
-  in
-  let rendered =
-    Compiler_blorp_bridge.render_many_for_renderer_helper_exn
-      ~renderer:Compiler_blorp_bridge.language_surface_renderer requested
-  in
-  Alcotest.(check (list (pair string string)))
-    "language surface renderer rows" Language_surface_data.rows rendered
-
 let suite =
   [
     ( "data",
@@ -63,8 +52,5 @@ let suite =
         Alcotest.test_case
           "generated language surface contains required prelude methods" `Quick
           test_generated_language_surface_contains_required_prelude_methods;
-        Alcotest.test_case
-          "renderer helper uses generated language surface rows" `Quick
-          test_renderer_helper_uses_generated_language_surface_rows;
       ] );
   ]

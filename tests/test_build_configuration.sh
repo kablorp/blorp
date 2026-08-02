@@ -151,6 +151,10 @@ then
 	echo "FAIL: benchmark CI must compile, link, and run the benchmark-only typecheck worker" >&2
 	exit 1
 fi
+if grep -Fq 'blorp-compiler-renderer' .github/workflows/benchmarks.yml; then
+	echo "FAIL: benchmark CI must not stage the retired renderer worker" >&2
+	exit 1
+fi
 if ! grep -Fq 'name: Test benchmark-only typecheck worker' \
 	.github/workflows/ci.yml ||
 	! grep -Fq 'benchmarks/compiler_typecheck_memory \' \
@@ -233,10 +237,7 @@ if grep -Fq './blorp __compiler-bridge-prepare' <<<"$install_plan"; then
 	echo "FAIL: ordinary install must not attempt an immediate second self-host" >&2
 	exit 1
 fi
-for installed_bridge in \
-	blorp-compiler-renderer \
-	blorp-compiler-parser
-do
+for installed_bridge in blorp-compiler-parser; do
 	if ! grep -Fq "$installed_bridge" scripts/install-compiler-bootstrap-helpers; then
 		echo "FAIL: the worker installer must place pinned $installed_bridge beside the Blorp CLI" >&2
 		exit 1
@@ -389,7 +390,7 @@ then
 fi
 
 ci_workflow=.github/workflows/ci.yml
-required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-renderer blorp-compiler-parser'
+required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
 ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
@@ -442,10 +443,15 @@ for production_path in \
 	scripts/package-release \
 	scripts/install-dev \
 	.github/workflows/ci.yml \
-	.github/workflows/release.yml
+	.github/workflows/release.yml \
+	.github/workflows/benchmarks.yml
 do
 	if grep -Eq 'BLORP_(COMPILER|RELEASE)_TYPECHECK_BRIDGE|compiler_typecheck_bridge[.]bin' "$production_path"; then
 		echo "FAIL: $production_path must not retain the benchmark-only typecheck worker" >&2
+		exit 1
+	fi
+	if grep -Eq 'BLORP_(COMPILER|RELEASE)_RENDERER_BRIDGE|compiler_renderer_bridge[.]bin' "$production_path"; then
+		echo "FAIL: $production_path must not retain the benchmark-only renderer worker" >&2
 		exit 1
 	fi
 done

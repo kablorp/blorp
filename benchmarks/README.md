@@ -315,15 +315,15 @@ flags. `BLORP_COMPILER_BENCHMARK_COMPILER` and
 `BLORP_TYPECHECK_PROFILE_*` names remain supported for the existing profile.
 
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
-the repository root and clears std, renderer-source, prepared-helper, and
-legacy parser overrides by default. This keeps one cache key tied to one
+the repository root and clears std, prepared-parser, and legacy parser
+overrides by default. This keeps one cache key tied to one
 effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
 compiler CLI. Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that
 executable separately when repeated source-level measurements should avoid the
-workspace build check. For iteration with already prepared parser and renderer
-helpers, set `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide both
-`BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and
-includes their contents in the artifact cache key.
+workspace build check. For iteration with an already prepared parser worker,
+set `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide
+`BLORP_COMPILER_PARSER_BRIDGE_BIN`. That mode requires an executable worker and
+includes its contents in the artifact cache key.
 
 ### Typecheck Type-Shape Scanning
 
@@ -518,8 +518,8 @@ samples and macOS elapsed time as diagnostic.
 ### Captured Backend Replay
 
 `compiler_backend_memory` replays one production `emit_core_c` request against
-an isolated renderer helper. Capture mode writes the request and deliberately
-stops before resolving or starting the renderer:
+an isolated benchmark-owned backend worker. Capture mode writes the request and
+deliberately stops before starting the worker:
 
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
@@ -530,7 +530,7 @@ BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
 
 The capture command exits nonzero after reporting the saved path. Its test
 timeout does not govern compilation; safety comes from capture mode stopping
-before renderer execution. Capture still runs the compiler frontend and middle
+before worker execution. Capture still runs the compiler frontend and middle
 once and materializes the serialized request. Keep captured requests local:
 they contain the lowered program and source paths, can be large, and should not
 be committed.
@@ -555,7 +555,7 @@ sampled macOS physical-footprint and allocator metrics. In `--vmmap` mode,
 value; use sampled `physical_footprint_bytes` instead. Full request validation
 runs in a short-lived process and releases its JSON heap before bridge
 preparation or replay. Bridge preparation is excluded from measurement, and
-responses stay file-backed until the renderer has exited.
+responses stay file-backed until the worker has exited.
 
 ### Perceus Global Scanning
 
@@ -576,10 +576,9 @@ benchmarks/compiler_perceus_memory --global-reads-per-function 0
 The function count, body shape, and referenced-global count stay fixed when
 varying `--globals`, isolating the cost of irrelevant globals beyond the
 referenced set. Set `--global-reads-per-function 0` to measure bodies with no
-global references. The runner uses `BLORP_COMPILER_RENDERER_BRIDGE_BIN` when it
-names a prepared helper; otherwise it prepares a cached helper through `./blorp
-__compiler-bridge-prepare` before starting measurement. Bridge preparation is
-excluded from the reported time.
+global references. The runner uses `BLORP_BACKEND_BENCHMARK_WORKER` when it
+names a prepared worker; otherwise it builds the benchmark-owned worker before
+starting measurement. Worker construction is excluded from the reported time.
 
 On macOS, all compiler memory diagnostics accept `--vmmap` to sample physical
 footprint, `MALLOC_SMALL`, and allocation count when `vmmap` exposes those

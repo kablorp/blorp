@@ -586,7 +586,7 @@ let with_env name value f =
 
 let default_bridge_cache_dir () =
   match
-    Sys.getenv_opt Blorp.Compiler_blorp_bridge.renderer_bridge_cache_dir_env
+    Sys.getenv_opt Blorp.Compiler_blorp_bridge.bridge_worker_cache_dir_env
   with
   | Some path when path <> "" -> path
   | _ ->
@@ -602,7 +602,7 @@ let default_bridge_cache_dir () =
 
 let with_isolated_home_preserving_bridge_cache home f =
   let bridge_cache = default_bridge_cache_dir () in
-  with_env Blorp.Compiler_blorp_bridge.renderer_bridge_cache_dir_env bridge_cache
+  with_env Blorp.Compiler_blorp_bridge.bridge_worker_cache_dir_env bridge_cache
     (fun () -> with_env "HOME" home f)
 
 let test_suite_selector_harness_dispatches_by_index () =

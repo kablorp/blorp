@@ -26,14 +26,11 @@ let write_file path contents =
 let run_compiler_bridge_prepare_command args =
   match args with
   | [ out_dir ] -> (
-      match Compiler_blorp_bridge.prepare_bridge_binaries ~out_dir with
-      | Ok prepared ->
-          Printf.printf "%s=%s\n"
-            Compiler_blorp_bridge.prepared_renderer_bridge_bin_env
-            prepared.prepared_renderer_bridge_bin;
+      match Compiler_blorp_bridge.prepare_parser_bridge_binary ~out_dir with
+      | Ok parser_path ->
           Printf.printf "%s=%s\n"
             Compiler_blorp_bridge.prepared_parser_bridge_bin_env
-            prepared.prepared_parser_bridge_bin;
+            parser_path;
           0
       | Error message ->
           prerr_endline ("Error: " ^ message);
