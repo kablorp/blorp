@@ -103,7 +103,6 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 	mkdir -p "\$prepare_dir"
 	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=\$prepare_dir/compiler_renderer_bridge.bin"
 	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
-	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=\$prepare_dir/compiler_typecheck_bridge.bin"
 	exit 0
 fi
 
@@ -112,7 +111,6 @@ if [ "\${1:-}" = "test" ]; then
 		if [ "\${BLORP_COMPILER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_BOOTSTRAP" ] \
 			|| [ ! -n "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" ] \
 			|| [ ! -n "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" ] \
-			|| [ ! -n "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" ] \
 			|| [ "\${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}" != "1" ]; then
 			echo "test command did not receive current helpers built by the pinned bootstrap" >&2
 			exit 3
@@ -120,8 +118,7 @@ if [ "\${1:-}" = "test" ]; then
 	fi
 	if [ -n "\${BLORP_TEST_EXPECTED_RENDERER:-}" ] \
 		&& { [ "\${BLORP_COMPILER_RENDERER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_RENDERER" ] \
-			|| [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_PARSER" ] \
-			|| [ "\${BLORP_COMPILER_TYPECHECK_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_TYPECHECK" ]; }
+			|| [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_PARSER" ]; }
 	then
 		echo "test command did not preserve explicit bridge helper paths" >&2
 		exit 4
@@ -149,7 +146,6 @@ write_fake_blorp "$check_log"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test runtime --serial
 ) > "$output_file" 2>&1
 status=$?
@@ -243,8 +239,7 @@ external_helpers="$TMP_HARNESS/external-helpers"
 mkdir -p "$external_helpers"
 external_renderer="$external_helpers/renderer"
 external_parser="$external_helpers/parser"
-external_typecheck="$external_helpers/typecheck"
-for executable in "$external_renderer" "$external_parser" "$external_typecheck"; do
+for executable in "$external_renderer" "$external_parser"; do
 	cp /bin/sh "$executable"
 done
 explicit_helpers_output="$TMP_HARNESS/explicit-helpers-output.txt"
@@ -255,10 +250,8 @@ write_fake_blorp "$check_log"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$external_renderer" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$external_parser" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$external_typecheck" \
 		BLORP_TEST_EXPECTED_RENDERER="$external_renderer" \
 		BLORP_TEST_EXPECTED_PARSER="$external_parser" \
-		BLORP_TEST_EXPECTED_TYPECHECK="$external_typecheck" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
 ) > "$explicit_helpers_output" 2>&1
@@ -328,7 +321,6 @@ write_fake_blorp "$std_check_log"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test std-check --serial
 ) > "$std_check_output_file" 2>&1
 std_check_status=$?
@@ -365,7 +357,6 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 	mkdir -p "\$prepare_dir"
 	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=\$prepare_dir/compiler_renderer_bridge.bin"
 	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
-	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=\$prepare_dir/compiler_typecheck_bridge.bin"
 	exit 0
 fi
 
@@ -388,7 +379,6 @@ compiler_blorp_sanitize_output="$TMP_HARNESS/compiler-blorp-sanitize-output.txt"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-blorp-sanitize --serial
 ) > "$compiler_blorp_sanitize_output" 2>&1
 compiler_blorp_sanitize_status=$?
@@ -440,7 +430,6 @@ compiler_blorp_output="$TMP_HARNESS/compiler-blorp-output.txt"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-deep --serial --timings
 ) > "$compiler_blorp_output" 2>&1
 compiler_blorp_status=$?
@@ -470,7 +459,6 @@ compiler_core_sanitize_output="$TMP_HARNESS/compiler-core-sanitize-output.txt"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-core-sanitize --serial
 ) > "$compiler_core_sanitize_output" 2>&1
 compiler_core_sanitize_status=$?
@@ -614,7 +602,6 @@ if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
 	mkdir -p "$prepare_dir"
 	echo "BLORP_COMPILER_RENDERER_BRIDGE_BIN=$prepare_dir/compiler_renderer_bridge.bin"
 	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=$prepare_dir/compiler_parser_bridge.bin"
-	echo "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN=$prepare_dir/compiler_typecheck_bridge.bin"
 	exit 0
 fi
 
@@ -647,7 +634,6 @@ generated_timing_log_dir="$TMP_HARNESS/generated-timing-logs"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_RENDERER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_TYPECHECK_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-blorp-sanitize --serial --timings \
 			--log-dir "$generated_timing_log_dir"
 ) > "$generated_timing_output_file" 2>&1

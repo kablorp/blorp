@@ -272,15 +272,6 @@ let test_parser_bridge_compile_env_supports_pinned_bootstrap () =
     "retired bootstrap parser selector" (Some "ocaml")
     (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
 
-let test_typecheck_bridge_compile_env_supports_pinned_bootstrap () =
-  let env = Blorp.Compiler_blorp_bridge.typecheck_bridge_helper_compile_env in
-  Alcotest.(check (option string))
-    "renderer helper marker" (Some "1")
-    (List.assoc_opt Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env env);
-  Alcotest.(check (option string))
-    "retired bootstrap parser selector" (Some "ocaml")
-    (List.assoc_opt "BLORP_FRONTEND_PARSER" env)
-
 let test_bridge_helper_compile_env_isolates_pinned_host () =
   let unset_env =
     Blorp.Compiler_blorp_bridge.bridge_helper_compile_unset_env
@@ -1077,9 +1068,6 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       let parser_source =
         Filename.concat cli_dir "compiler_parser_bridge_cli.brp"
       in
-      let typecheck_source =
-        Filename.concat cli_dir "compiler_typecheck_bridge_cli.brp"
-      in
       mkdir compiler_dir;
       mkdir blorp_dir;
       mkdir src_dir;
@@ -1087,22 +1075,15 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       write_file program "#!/usr/bin/env bash\n";
       write_file backend_source "func main(args: List[String]) -> Int: 0\n";
       write_file parser_source "func main(args: List[String]) -> Int: 0\n";
-      write_file typecheck_source "func main(args: List[String]) -> Int: 0\n";
       let backend =
         Bridge.renderer_bridge_cache_parts ~program ~source_path:backend_source
       in
       let parser =
         Bridge.renderer_bridge_cache_parts ~program ~source_path:parser_source
       in
-      let typecheck =
-        Bridge.renderer_bridge_cache_parts ~program ~source_path:typecheck_source
-      in
       Alcotest.(check bool)
         "backend and parser helpers use distinct cache keys" true
-        (backend.bridge_key <> parser.bridge_key);
-      Alcotest.(check bool)
-        "parser and typecheck helpers use distinct cache keys" true
-        (parser.bridge_key <> typecheck.bridge_key))
+        (backend.bridge_key <> parser.bridge_key))
 
 let test_bridge_cache_key_includes_std_sources () =
   with_temp_dir (fun root ->
@@ -1351,8 +1332,6 @@ let suite =
           test_bridge_helper_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "parser helper env supports pinned bootstrap" `Quick
           test_parser_bridge_compile_env_supports_pinned_bootstrap;
-        Alcotest.test_case "typecheck helper env supports pinned bootstrap"
-          `Quick test_typecheck_bridge_compile_env_supports_pinned_bootstrap;
         Alcotest.test_case "helper env isolates pinned workers" `Quick
           test_bridge_helper_compile_env_isolates_pinned_host;
         Alcotest.test_case "parse_source request uses bridge envelope" `Quick

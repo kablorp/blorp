@@ -32,7 +32,6 @@ toolchain_executables=(
 	blorp-ocaml-host
 	blorp-compiler-renderer
 	blorp-compiler-parser
-	blorp-compiler-typecheck
 )
 
 fake_bin="$tmp_dir/release-bin"
@@ -41,8 +40,7 @@ mkdir -p "$fake_bin" "$prepared_workers"
 cp /bin/sh "$fake_bin/blorp-ocaml-host"
 for worker in \
 	blorp-compiler-renderer \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck
+	blorp-compiler-parser
 do
 	printf '#!/bin/sh\n# current %s\nexit 0\n' "$worker" >"$fake_bin/$worker"
 	chmod +x "$fake_bin/$worker"
@@ -63,8 +61,6 @@ case "${1:-}" in
 			"$2/compiler_renderer_bridge.bin"
 		cp "${BLORP_TEST_WORKER_DIR:?}/blorp-compiler-parser" \
 			"$2/compiler_parser_bridge.bin"
-		cp "${BLORP_TEST_WORKER_DIR:?}/blorp-compiler-typecheck" \
-			"$2/compiler_typecheck_bridge.bin"
 		: >"${BLORP_TEST_PREPARE_MARKER:?}"
 		exit 0
 		;;
@@ -122,6 +118,9 @@ for executable in "${toolchain_executables[@]}"; do
 		fail "release archive must contain executable $executable"
 	fi
 done
+if [ -e "$package_dir/blorp-compiler-typecheck" ]; then
+	fail "release archive must not contain the benchmark-only typecheck worker"
+fi
 if ! cmp "$fake_bin/blorp" "$package_dir/blorp" ||
 	! cmp "$fake_bin/blorp-ocaml-host" "$package_dir/blorp-ocaml-host"
 then
@@ -147,8 +146,7 @@ override_dir="$tmp_dir/override-workers"
 mkdir -p "$override_dir"
 for worker in \
 	blorp-compiler-renderer \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck
+	blorp-compiler-parser
 do
 	printf '#!/bin/sh\n# override %s\nexit 0\n' "$worker" >"$override_dir/$worker"
 	chmod +x "$override_dir/$worker"
@@ -158,7 +156,6 @@ BLORP_RELEASE_BINARY="$fake_bin/blorp" \
 	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
 	BLORP_RELEASE_RENDERER_BRIDGE="$override_dir/blorp-compiler-renderer" \
 	BLORP_RELEASE_PARSER_BRIDGE="$override_dir/blorp-compiler-parser" \
-	BLORP_RELEASE_TYPECHECK_BRIDGE="$override_dir/blorp-compiler-typecheck" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
 	scripts/package-release "$override_release_dir" >/dev/null
@@ -167,8 +164,7 @@ mkdir -p "$override_extract"
 tar -xzf "$override_release_dir/$archive_base.tar.gz" -C "$override_extract"
 for worker in \
 	blorp-compiler-renderer \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck
+	blorp-compiler-parser
 do
 	if ! cmp "$override_dir/$worker" "$override_extract/$archive_base/$worker"; then
 		fail "release packaging must preserve the selected $worker"
@@ -232,11 +228,15 @@ write_checksum "$downloads/$dev_asset"
 install_dir="$tmp_dir/install"
 mkdir -p "$install_dir/.blorp-bootstrap/old-generation"
 printf 'retired launcher\n' >"$install_dir/blorp-bootstrap-compiler"
+printf 'retired typecheck worker\n' >"$install_dir/blorp-compiler-typecheck"
 printf 'retired bundle\n' >"$install_dir/.blorp-bootstrap/old-generation/worker"
 PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
 	BLORP_INSTALL_DIR="$install_dir" \
 	scripts/install-dev >/dev/null
+if [ -e "$install_dir/blorp-compiler-typecheck" ]; then
+	fail "dev installation did not remove the retired typecheck worker"
+fi
 for executable in "${toolchain_executables[@]}"; do
 	if [ ! -x "$install_dir/$executable" ]; then
 		fail "the dev installer must install $executable"

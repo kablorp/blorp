@@ -284,17 +284,17 @@ legacy parser overrides by default. This keeps one cache key tied to one
 effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
 compiler CLI. Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that
 executable separately when repeated source-level measurements should avoid the
-workspace build check. For iteration with already prepared parser, renderer, and
-typecheck helpers, set
-`BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide their three
+workspace build check. For iteration with already prepared parser and renderer
+helpers, set `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide both
 `BLORP_COMPILER_*_BRIDGE_BIN` paths. That mode requires executable helpers and
 includes their contents in the artifact cache key.
 
 ### Typecheck Type-Shape Scanning
 
 `compiler_typecheck_memory` generates nested record types and probe functions
-with explicitly typed local bindings. It sends them through the production
-`typecheck_graph` action and validates every streamed typed artifact:
+with explicitly typed local bindings. It sends them through a benchmark-only
+`typecheck_graph` transport backed by the production Blorp typechecker and
+validates every streamed typed artifact:
 
 ```bash
 benchmarks/compiler_typecheck_memory
@@ -358,8 +358,8 @@ Pass two prepared helpers to compare a candidate and baseline in one invocation:
 
 ```bash
 benchmarks/compiler_typecheck_memory \
-  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
-  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin \
+  --bridge /tmp/candidate/compiler_typecheck_worker \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_worker \
   --warmup-runs 2 --runs 10
 ```
 
@@ -377,16 +377,20 @@ measured runs, and accepts trailing overrides:
 benchmarks/compiler_type_ownership
 benchmarks/compiler_type_ownership --runs 9 --self-resolution-depth 96
 benchmarks/compiler_type_ownership \
-  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
-  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+  --bridge /tmp/candidate/compiler_typecheck_worker \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_worker
 ```
 
-The runner uses `BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` when it names a prepared
-helper. `--bridge PATH` overrides it. Otherwise, the runner prepares a cached
-helper through `./blorp __compiler-bridge-prepare` before starting measurement.
-Bridge preparation is excluded from the reported time. Results include SHA-256
-digests of the bridge and request so saved before/after measurements remain
-auditable.
+The runner uses `BLORP_TYPECHECK_BENCHMARK_WORKER` when it names an existing
+worker. `--bridge PATH` overrides it. Otherwise, the runner builds a disposable
+worker from `compiler/blorp/benchmarks/compiler_typecheck_worker.brp` with the
+current `./blorp`. Worker construction is excluded from the reported time.
+Results include SHA-256 digests of the worker and request so saved before/after
+measurements remain auditable.
+
+The benchmark CI workflow runs the smallest fixture without an override before
+the standard suite. That smoke compiles and links the real worker, executes it,
+and validates its streamed response on each benchmark platform.
 
 `compiler_type_instantiation` is the fast preset for generic type
 instantiation work. Its signatures combine unchanged, partially changed, and
@@ -395,20 +399,20 @@ fully changed recursive transforms in the same request:
 ```bash
 benchmarks/compiler_type_instantiation
 benchmarks/compiler_type_instantiation \
-  --bridge /tmp/candidate/compiler_typecheck_bridge.bin \
-  --baseline-bridge /tmp/baseline/compiler_typecheck_bridge.bin
+  --bridge /tmp/candidate/compiler_typecheck_worker \
+  --baseline-bridge /tmp/baseline/compiler_typecheck_worker
 ```
 
 ### Captured Typecheck Replay
 
 `compiler_typecheck_replay` runs one previously captured production
-`typecheck_graph` request against an isolated helper. The former OCaml-host
-capture hook was retired when production typechecking moved into the public
-Blorp compiler. A replacement must be a structured compiler dump mode; until
-that exists, the runner can replay existing local captures but cannot create a
-new authoritative capture. Keep captures local because they contain source text
-and local paths. First typecheck only the target while retaining its full
-prepared graph context, then typecheck the complete selected module graph:
+`typecheck_graph` request against an isolated benchmark worker. The former
+OCaml-host capture hook was retired when production typechecking moved into the
+public Blorp compiler. A replacement must be a structured compiler dump mode;
+until that exists, the runner can replay existing local captures but cannot
+create a new authoritative capture. Keep captures local because they contain
+source text and local paths. First typecheck only the target while retaining its
+full prepared graph context, then typecheck the complete selected module graph:
 
 ```bash
 capture=/path/to/existing-typecheck-graph-request.json
@@ -430,7 +434,7 @@ benchmarks/compiler_typecheck_replay "$cli_capture" \
   --retention-slice --timeout 60 --memory-limit 4G
 ```
 
-This is the fast feedback loop for graph-retention work. With a prepared helper
+This is the fast feedback loop for graph-retention work. With a prepared worker
 it completes in roughly 20 seconds on the development machine, instead of
 running the unsafe 145-artifact graph. The runner enables a low-overhead
 structural inventory by default. It reports parsed graph size, retained CTFE
@@ -444,11 +448,13 @@ typechecks in the artifact import environment and the graph target is not
 reachable through its explicit import closure.
 Use `--no-inventory` for an otherwise identical RSS/timing control run.
 
-The result also records request, replay, and helper hashes; artifact order and
+The result also records request, replay, and worker hashes; artifact order and
 count; response size and hash; elapsed time; peak RSS; and sampled peak RSS by
 phase and module. Phases shorter than the sampling interval can be absent
 rather than receiving an inferred value. Helper preparation is excluded from
-the measurement, while stdout and stderr remain file-backed.
+the measurement, while stdout and stderr remain file-backed. Without `--bridge`
+or `BLORP_TYPECHECK_BENCHMARK_WORKER`, the runner builds the same disposable
+benchmark worker used by `compiler_typecheck_memory`.
 
 The memory limit uses an address-space limit on Linux and a sampled RSS
 watchdog on macOS. Linux allocation-limit failures are not distinguishable from
@@ -460,7 +466,7 @@ for headline before/after RSS or timing comparisons.
 
 On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
 helper leader process. This is appropriate for the current single-process
-typecheck helper, but it perturbs elapsed time and would omit any future child
+typecheck worker, but it perturbs elapsed time and would omit any future child
 processes. Use the global peak as the memory comparison and treat per-phase
 samples and macOS elapsed time as diagnostic.
 

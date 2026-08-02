@@ -344,12 +344,12 @@ has emptied `parser`, `ctfe`, `type_system`, `ownership`, `final_core`, and
 Leave one shipped Blorp executable and one immutable external bootstrap
 toolchain used only to build it.
 
-### Current Rough Edge
+### Current Boundary
 
-The packaged typecheck worker appears to be consumed only by diagnostic
-benchmarks and bulk bridge preparation, not by a production OCaml-hosted
-command. Keep it until benchmark-specific preparation is separated and a
-reachability regression proves the release toolchain no longer needs it.
+The standalone typecheck worker is benchmark-owned and no longer participates
+in bulk bridge preparation, installation, CI test setup, or release packaging.
+Production typechecking remains in the public Blorp compiler. The shipped
+renderer and parser helpers are the remaining compiler worker boundaries.
 
 ### Execution
 

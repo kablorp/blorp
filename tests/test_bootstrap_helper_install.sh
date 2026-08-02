@@ -20,16 +20,20 @@ installer="$PWD/scripts/install-compiler-bootstrap-helpers"
 helpers=(
 	blorp-compiler-renderer
 	blorp-compiler-parser
-	blorp-compiler-typecheck
 )
 
 mkdir -p "$toolchain_dir" "$install_dir"
+printf 'retired installed worker\n' > "$install_dir/blorp-compiler-typecheck"
+chmod +x "$install_dir/blorp-compiler-typecheck"
 for helper in "${helpers[@]}"; do
 	printf 'first generation: %s\n' "$helper" > "$toolchain_dir/$helper"
 	chmod +x "$toolchain_dir/$helper"
 done
 
 "$installer" "$toolchain_dir" "$install_dir" "$stamp_path" "dev-first schema-v1"
+if [ -e "$install_dir/blorp-compiler-typecheck" ]; then
+	fail "installation did not remove the retired typecheck worker"
+fi
 
 for helper in "${helpers[@]}"; do
 	if [ ! -x "$install_dir/$helper" ] ||
@@ -61,8 +65,16 @@ then
 	fail "installation trusted the stamp instead of repairing corrupted helper bytes"
 fi
 
-rm "$install_dir/blorp-compiler-typecheck"
-mkdir "$install_dir/blorp-compiler-typecheck"
+retired_typecheck_worker="$toolchain_dir/blorp-compiler-typecheck"
+printf 'retired benchmark worker\n' > "$retired_typecheck_worker"
+chmod +x "$retired_typecheck_worker"
+"$installer" "$toolchain_dir" "$install_dir" "$stamp_path" "dev-first schema-v1"
+if [ -e "$install_dir/blorp-compiler-typecheck" ]; then
+	fail "installation copied the benchmark-only typecheck worker"
+fi
+
+rm "$install_dir/blorp-compiler-parser"
+mkdir "$install_dir/blorp-compiler-parser"
 if "$installer" \
 	"$toolchain_dir" \
 	"$install_dir" \
@@ -77,7 +89,7 @@ if ! grep -Fq "Refusing to replace non-regular compiler helper target" \
 then
 	fail "non-regular helper rejection did not explain the invalid target"
 fi
-rm -rf "$install_dir/blorp-compiler-typecheck"
+rm -rf "$install_dir/blorp-compiler-parser"
 "$installer" "$toolchain_dir" "$install_dir" "$stamp_path" "dev-first schema-v1"
 
 for helper in "${helpers[@]}"; do

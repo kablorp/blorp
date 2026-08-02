@@ -1183,12 +1183,9 @@ let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
 let renderer_bridge_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_renderer_bridge_bin_env = "BLORP_COMPILER_RENDERER_BRIDGE_BIN"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
-let prepared_typecheck_bridge_bin_env = "BLORP_COMPILER_TYPECHECK_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
 let renderer_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp"
 let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
-let typecheck_bridge_source_name =
-  "compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (renderer_bridge_helper_env, "1");
@@ -1199,17 +1196,12 @@ let bridge_helper_compile_env =
   ]
 
 let parser_bridge_helper_compile_env = bridge_helper_compile_env
-let typecheck_bridge_helper_compile_env = bridge_helper_compile_env
 
 let renderer_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
 let parser_bridge_cache :
-    (string * string * string * string * string) option ref =
-  ref None
-
-let typecheck_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
 
@@ -1369,7 +1361,6 @@ let bridge_helper_compile_unset_env =
     compiler_bridge_bin_env;
     prepared_renderer_bridge_bin_env;
     prepared_parser_bridge_bin_env;
-    prepared_typecheck_bridge_bin_env;
     "BLORP_OCAML_HOST_BIN";
   ]
 
@@ -1409,11 +1400,10 @@ let validate_explicit_bridge_helper_override path =
     Error
       (Printf.sprintf
          "%s must point to a bootstrap-capable Blorp compiler, not the current \
-          compiler executable `%s`. Provide prepared helper binaries with %s, \
-          %s, and %s, or unset %s to use %s."
+          compiler executable `%s`. Provide prepared helper binaries with %s \
+          and %s, or unset %s to use %s."
          compiler_bridge_bin_env path prepared_renderer_bridge_bin_env
-         prepared_parser_bridge_bin_env prepared_typecheck_bridge_bin_env
-         compiler_bridge_bin_env
+         prepared_parser_bridge_bin_env compiler_bridge_bin_env
          compiler_bootstrap_script_name)
   else Ok ()
 
@@ -1496,15 +1486,6 @@ let parser_bridge_source_path () =
       invalid_arg
         (Printf.sprintf "cannot locate Blorp parser bridge source %s"
            parser_bridge_source_name)
-
-let typecheck_bridge_source_path () =
-  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match find_upwards_from starts typecheck_bridge_source_name with
-  | Some path -> path
-  | None ->
-      invalid_arg
-        (Printf.sprintf "cannot locate Blorp typecheck bridge source %s"
-           typecheck_bridge_source_name)
 
 let renderer_bridge_temp_dir_retry_limit = 32
 
@@ -2122,8 +2103,6 @@ let prepared_bridge_sibling_name env_name =
     Some "blorp-compiler-renderer"
   else if String.equal env_name prepared_parser_bridge_bin_env then
     Some "blorp-compiler-parser"
-  else if String.equal env_name prepared_typecheck_bridge_bin_env then
-    Some "blorp-compiler-typecheck"
   else None
 
 let executable_candidate_can_run path =
@@ -2222,7 +2201,6 @@ let parser_bridge_binary () =
 type prepared_bridge_binaries = {
   prepared_renderer_bridge_bin : string;
   prepared_parser_bridge_bin : string;
-  prepared_typecheck_bridge_bin : string;
 }
 
 let prepare_bridge_binaries ~out_dir =
@@ -2230,7 +2208,6 @@ let prepare_bridge_binaries ~out_dir =
   let* compiler = default_bridge_helper_compiler () in
   let renderer_bin = Filename.concat out_dir "compiler_renderer_bridge.bin" in
   let parser_bin = Filename.concat out_dir "compiler_parser_bridge.bin" in
-  let typecheck_bin = Filename.concat out_dir "compiler_typecheck_bridge.bin" in
   let* cached_renderer_path =
     bridge_binary_for_source renderer_bridge_cache ~compiler
       ~source_path:(renderer_bridge_source_path ())
@@ -2241,11 +2218,6 @@ let prepare_bridge_binaries ~out_dir =
       ~source_path:(parser_bridge_source_path ())
       ~compile_env:parser_bridge_helper_compile_env
   in
-  let* cached_typecheck_path =
-    bridge_binary_for_source typecheck_bridge_cache ~compiler
-      ~source_path:(typecheck_bridge_source_path ())
-      ~compile_env:typecheck_bridge_helper_compile_env
-  in
   let* renderer_path =
     copy_binary_to_path ~source_path:cached_renderer_path
       ~dest_path:renderer_bin
@@ -2253,15 +2225,10 @@ let prepare_bridge_binaries ~out_dir =
   let* parser_path =
     copy_binary_to_path ~source_path:cached_parser_path ~dest_path:parser_bin
   in
-  let* typecheck_path =
-    copy_binary_to_path ~source_path:cached_typecheck_path
-      ~dest_path:typecheck_bin
-  in
   Ok
     {
       prepared_renderer_bridge_bin = renderer_path;
       prepared_parser_bridge_bin = parser_path;
-      prepared_typecheck_bridge_bin = typecheck_path;
     }
 
 type bridge_request_stats = {

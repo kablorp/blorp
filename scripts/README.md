@@ -153,17 +153,19 @@ scripts/with-build-lock make quality
 
 Backend renderer/Core requests use a compiled
 `compiler/blorp/src/stage_12_cli/compiler_bridge_cli.brp` helper. Parser requests use
-`compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp`, and typed-frontend requests
-use `compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp`. Parser and typecheck
-imports stay separate so the backend helper stays bootstrap-small.
+`compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp`. Production
+typechecking runs in the public Blorp compiler. The standalone typecheck protocol
+entrypoint is retained only as `compiler/blorp/benchmarks/compiler_typecheck_worker.brp`
+for isolated memory and replay benchmarks.
 
 `make install` invokes the pinned release's public `blorp compile` command to
 build the current public compiler. It also installs the pinned renderer, parser,
-and typecheck workers beside `./blorp` for commands that still delegate to the
+and parser workers beside `./blorp` for commands that still delegate to the
 OCaml host. Those workers are not part of compilation itself.
 Installation compares every helper byte-for-byte with the verified release
 copy, so rerunning `make install` repairs missing or corrupted helpers without
-rewriting an unchanged generation.
+rewriting an unchanged generation. Upgrading removes the retired
+`blorp-compiler-typecheck` executable from the install directory.
 Compiler-owned Blorp tests still exercise current helper source. Release
 qualification must separately prove that the candidate can prepare the next
 helper generation before that release becomes the bootstrap.
@@ -174,8 +176,7 @@ that need compiler bridges (`compiler-deep`, `std-check`, `runtime`, `leak`,
 `compiler-unit-deep`, and fast `compiler` runs skip this setup. The harness
 exports
 `BLORP_COMPILER_RENDERER_BRIDGE_BIN`,
-`BLORP_COMPILER_PARSER_BRIDGE_BIN`, and
-`BLORP_COMPILER_TYPECHECK_BRIDGE_BIN` so every selected gate executes those
+and `BLORP_COMPILER_PARSER_BRIDGE_BIN` so every selected gate executes those
 helpers directly. Individual tests do not compile helpers on first use; the
 harness also sets
 `BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
@@ -212,7 +213,7 @@ compiler without prepared helper overrides, `scripts/test` can instead resolve
 or build helpers through the content-addressed bridge cache. Set
 `BLORP_COMPILER_BRIDGE_STARTUP_DIR` to keep the prepared helper binaries in a
 specific directory for inspection; otherwise the run-local directory is removed
-when the test script exits. Renderer, parser, and typecheck helper overrides must
+when the test script exits. Renderer and parser helper overrides must
 always be provided together so one compiler session cannot mix generations.
 
 Useful compiler bootstrap commands:
@@ -275,7 +276,7 @@ Supported targets:
 - `x86_64-apple-darwin`
 
 `scripts/package-release` packages the public `./blorp` command, the private
-OCaml host, and the current renderer, parser, and typecheck workers into a
+OCaml host, and the current renderer and parser workers into a
 release archive plus a `.sha256` file. The public binary is also the immutable
 compiler used when that release is later pinned as the bootstrap:
 
@@ -292,14 +293,13 @@ Useful environment variables:
 - `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
 - `BLORP_RELEASE_RENDERER_BRIDGE` selects the prepared renderer bridge.
 - `BLORP_RELEASE_PARSER_BRIDGE` selects the prepared parser bridge.
-- `BLORP_RELEASE_TYPECHECK_BRIDGE` selects the prepared typecheck bridge.
 - `BLORP_RELEASE_VERSION` overrides the version in the asset name.
 - `BLORP_RELEASE_TARGET` overrides the target triple in the asset name.
 
-The three prepared bridge overrides must be supplied together so one archive
+The two prepared bridge overrides must be supplied together so one archive
 cannot mix helpers from different compiler generations.
 
-`scripts/install-dev` verifies the complete five-executable toolchain before
+`scripts/install-dev` verifies the complete four-executable toolchain before
 staging and installing it. Private workers are installed before the public
 binary so a completed installation always exposes one release generation.
 
@@ -337,6 +337,5 @@ rm -f \
   "$HOME/.local/bin/blorp" \
   "$HOME/.local/bin/blorp-ocaml-host" \
   "$HOME/.local/bin/blorp-compiler-renderer" \
-  "$HOME/.local/bin/blorp-compiler-parser" \
-  "$HOME/.local/bin/blorp-compiler-typecheck"
+  "$HOME/.local/bin/blorp-compiler-parser"
 ```

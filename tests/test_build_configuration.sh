@@ -114,6 +114,37 @@ if grep -Fq 'blorp_ocaml_middle' benchmarks/compiler_typecheck_profile; then
 	echo "FAIL: compiler_typecheck_profile must not depend on a retired semantic worker" >&2
 	exit 1
 fi
+if [ ! -f compiler/blorp/benchmarks/compiler_typecheck_worker.brp ] ||
+	[ -e compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp ]
+then
+	echo "FAIL: the standalone typecheck worker must be owned by compiler benchmarks" >&2
+	exit 1
+fi
+for typecheck_runner in \
+	benchmarks/compiler_typecheck_memory \
+	benchmarks/compiler_typecheck_replay
+do
+	if ! grep -Fq 'from compiler_typecheck_worker import' "$typecheck_runner" ||
+		grep -Fq '__compiler-bridge-prepare' "$typecheck_runner"
+	then
+		echo "FAIL: $typecheck_runner must prepare its benchmark worker without the production bridge command" >&2
+		exit 1
+	fi
+done
+if ! grep -Fq 'benchmarks/compiler_typecheck_memory \' \
+	.github/workflows/benchmarks.yml
+then
+	echo "FAIL: benchmark CI must compile, link, and run the benchmark-only typecheck worker" >&2
+	exit 1
+fi
+if ! grep -Fq 'name: Test benchmark-only typecheck worker' \
+	.github/workflows/ci.yml ||
+	! grep -Fq 'benchmarks/compiler_typecheck_memory \' \
+	.github/workflows/ci.yml
+then
+	echo "FAIL: required CI must compile, link, and run the benchmark-only typecheck worker" >&2
+	exit 1
+fi
 for obsolete_build_input in \
 	BLORP_COMPILER_BRIDGE_BIN \
 	BLORP_COMPILER_RENDERER_BRIDGE_BIN \
@@ -190,8 +221,7 @@ if grep -Fq './blorp __compiler-bridge-prepare' <<<"$install_plan"; then
 fi
 for installed_bridge in \
 	blorp-compiler-renderer \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck
+	blorp-compiler-parser
 do
 	if ! grep -Fq "$installed_bridge" scripts/install-compiler-bootstrap-helpers; then
 		echo "FAIL: the worker installer must place pinned $installed_bridge beside the Blorp CLI" >&2
@@ -202,6 +232,12 @@ do
 		exit 1
 	fi
 done
+if grep -Eq 'cp .*blorp-compiler-typecheck|mv .*blorp-compiler-typecheck' \
+	scripts/install-compiler-bootstrap-helpers
+then
+	echo "FAIL: the worker installer must not publish the benchmark-only typecheck worker" >&2
+	exit 1
+fi
 if ! grep -Fq 'scripts/install-compiler-bootstrap-helpers' <<<"$install_plan"
 then
 	echo "FAIL: install must verify and copy the pinned bridge helper generation" >&2
@@ -339,7 +375,7 @@ then
 fi
 
 ci_workflow=.github/workflows/ci.yml
-required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-renderer blorp-compiler-parser blorp-compiler-typecheck'
+required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-renderer blorp-compiler-parser'
 ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
 	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
@@ -384,6 +420,18 @@ fi
 for executable in $required_staged_toolchain; do
 	if ! grep -Fq "            $executable" <<<"$ci_prepare_step"; then
 		echo "FAIL: main CI must stage $executable before preparing compiler bridges" >&2
+		exit 1
+	fi
+done
+for production_path in \
+	scripts/test \
+	scripts/package-release \
+	scripts/install-dev \
+	.github/workflows/ci.yml \
+	.github/workflows/release.yml
+do
+	if grep -Eq 'BLORP_(COMPILER|RELEASE)_TYPECHECK_BRIDGE|compiler_typecheck_bridge[.]bin' "$production_path"; then
+		echo "FAIL: $production_path must not retain the benchmark-only typecheck worker" >&2
 		exit 1
 	fi
 done

@@ -7,7 +7,6 @@ OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
 ROOT_OCAML_HOST := ./blorp-ocaml-host
 ROOT_RENDERER_BRIDGE := ./blorp-compiler-renderer
 ROOT_PARSER_BRIDGE := ./blorp-compiler-parser
-ROOT_TYPECHECK_BRIDGE := ./blorp-compiler-typecheck
 BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/compiler_cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
@@ -172,7 +171,9 @@ hygiene-check: build-blorp-cli
 	@scripts/check-std-builtins
 	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
+	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_typecheck_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
@@ -258,4 +259,4 @@ docker-premerge-gate-all:
 clean:
 	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(ROOT_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" "$(ROOT_TYPECHECK_BRIDGE)" compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(ROOT_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" ./blorp-compiler-typecheck compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"

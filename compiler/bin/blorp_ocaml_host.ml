@@ -34,9 +34,6 @@ let run_compiler_bridge_prepare_command args =
           Printf.printf "%s=%s\n"
             Compiler_blorp_bridge.prepared_parser_bridge_bin_env
             prepared.prepared_parser_bridge_bin;
-          Printf.printf "%s=%s\n"
-            Compiler_blorp_bridge.prepared_typecheck_bridge_bin_env
-            prepared.prepared_typecheck_bridge_bin;
           0
       | Error message ->
           prerr_endline ("Error: " ^ message);
