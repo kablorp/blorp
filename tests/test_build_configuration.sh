@@ -84,34 +84,48 @@ then
 	echo "FAIL: current compiler source must not retain the immutable bootstrap compiler command" >&2
 	exit 1
 fi
+direct_compiler_benchmark=benchmarks/compiler_record_layout
+if grep -Fq 'compiler/_build/default/bin/blorp_ocaml_host.exe' \
+	"$direct_compiler_benchmark" ||
+	grep -Fq '__compiler-host-compile-wrapper' "$direct_compiler_benchmark" ||
+	! grep -Fq 'compile --' "$direct_compiler_benchmark"
+then
+	echo "FAIL: $direct_compiler_benchmark must compile through the current public CLI" >&2
+	exit 1
+fi
+
+compiler_benchmark_runner=benchmarks/compiler_blorp_benchmark_runner
 for compiler_benchmark in \
-	benchmarks/compiler_record_layout \
+	benchmarks/compiler_import_graph_profile \
 	benchmarks/compiler_typecheck_profile
 do
-	if grep -Fq 'compiler/_build/default/bin/blorp_ocaml_host.exe' \
+	if ! grep -Eq '^exec "[$]script_dir/compiler_blorp_benchmark_runner" \\$' \
 		"$compiler_benchmark"
 	then
-		echo "FAIL: $compiler_benchmark must not compile through the current OCaml host" >&2
+		echo "FAIL: $compiler_benchmark must delegate compilation to the shared runner" >&2
 		exit 1
 	fi
-	if grep -Fq '__compiler-host-compile-wrapper' "$compiler_benchmark"; then
-		echo "FAIL: $compiler_benchmark must use the current public compiler surface" >&2
-		exit 1
-	fi
-	if ! grep -Fq 'compile --' "$compiler_benchmark"; then
-		echo "FAIL: $compiler_benchmark must compile its fixture with the current Blorp CLI" >&2
+	if grep -Eq \
+		'compiler/_build/default/bin/blorp_ocaml_host[.]exe|__compiler-host-compile-wrapper|blorp_ocaml_middle' \
+		"$compiler_benchmark"
+	then
+		echo "FAIL: $compiler_benchmark must not retain retired OCaml compiler paths" >&2
 		exit 1
 	fi
 done
-if ! grep -Fq \
-	'compiler="${BLORP_TYPECHECK_PROFILE_COMPILER:-$repo_root/compiler/_build/blorp-cli/blorp}"' \
-	benchmarks/compiler_typecheck_profile
+if grep -Fq 'compiler/_build/default/bin/blorp_ocaml_host.exe' \
+	"$compiler_benchmark_runner" ||
+	grep -Fq '__compiler-host-compile-wrapper' "$compiler_benchmark_runner" ||
+	grep -Fq 'blorp_ocaml_middle' "$compiler_benchmark_runner"
 then
-	echo "FAIL: compiler_typecheck_profile must execute the artifact built by build-blorp-cli" >&2
+	echo "FAIL: the shared compiler benchmark runner must not use retired OCaml compiler paths" >&2
 	exit 1
 fi
-if grep -Fq 'blorp_ocaml_middle' benchmarks/compiler_typecheck_profile; then
-	echo "FAIL: compiler_typecheck_profile must not depend on a retired semantic worker" >&2
+if ! grep -Eq \
+	'^compiler=.*[$]repo_root/compiler/_build/blorp-cli/blorp' \
+	"$compiler_benchmark_runner"
+then
+	echo "FAIL: the shared compiler benchmark runner must default to the current Blorp CLI" >&2
 	exit 1
 fi
 if [ ! -f compiler/blorp/benchmarks/compiler_typecheck_worker.brp ] ||
@@ -451,7 +465,7 @@ fi
 benchmark_cache=$(mktemp -d "${TMPDIR:-/tmp}/blorp-profile-cache-test.XXXXXX")
 trap 'rm -rf "$benchmark_cache"' EXIT
 mkdir -p "$benchmark_cache/compiler-typecheck-profile/fixed-hash"
-profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/compiler_typecheck_profile"
+profile_cache_binary="$benchmark_cache/compiler-typecheck-profile/fixed-hash/compiler-typecheck-profile"
 printf '#!/usr/bin/env bash\nprintf "PROFILE_CACHE_SMOKE\\n"\n' >"$profile_cache_binary"
 chmod +x "$profile_cache_binary"
 
@@ -491,6 +505,126 @@ if [ "$profile_cache_output" != "PROFILE_CACHE_SMOKE" ]; then
 	exit 1
 fi
 rm -rf "$benchmark_cache"
+trap - EXIT
+
+benchmark_contract_root=$(mktemp -d "${TMPDIR:-/tmp}/blorp-benchmark-contract.XXXXXX")
+trap 'rm -rf "$benchmark_contract_root"' EXIT
+benchmark_fake_bin="$benchmark_contract_root/bin"
+mkdir -p "$benchmark_fake_bin"
+
+cat >"$benchmark_fake_bin/compiler" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${BLORP_FAKE_COMPILER_ARGS:?}"
+printf '%s\n' "$@" >"$BLORP_FAKE_COMPILER_ARGS"
+output=
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "-o" ]; then
+		shift
+		output=${1:-}
+	fi
+	shift
+done
+if [ -z "$output" ]; then
+	echo "fake compiler did not receive -o" >&2
+	exit 1
+fi
+printf 'int main(void) { return 0; }\n' >"$output"
+SH
+
+cat >"$benchmark_fake_bin/cc" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--version" ]; then
+	printf 'fake cc 1.0\n'
+	exit 0
+fi
+: "${BLORP_FAKE_CC_ARGS:?}"
+printf '%s\n' "$@" >"$BLORP_FAKE_CC_ARGS"
+output=
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "-o" ]; then
+		shift
+		output=${1:-}
+	fi
+	shift
+done
+if [ -z "$output" ]; then
+	echo "fake C compiler did not receive -o" >&2
+	exit 1
+fi
+printf '#!/usr/bin/env bash\nprintf "BENCHMARK_CONTRACT_SMOKE\\n"\n' >"$output"
+chmod +x "$output"
+SH
+
+cat >"$benchmark_fake_bin/shasum" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -eq 2 ]; then
+	while IFS= read -r _; do
+		:
+	done
+fi
+printf 'fixed-hash  mocked\n'
+SH
+chmod +x \
+	"$benchmark_fake_bin/compiler" \
+	"$benchmark_fake_bin/cc" \
+	"$benchmark_fake_bin/shasum"
+
+assert_compiler_benchmark_contract() {
+	contract_name=$1
+	benchmark_entrypoint=$2
+	expected_source=$3
+	expected_profile=$4
+	expected_cc_optimization=$5
+	compiler_args="$benchmark_contract_root/$contract_name.compiler-args"
+	cc_args="$benchmark_contract_root/$contract_name.cc-args"
+	benchmark_output=$(
+		PATH="$benchmark_fake_bin:$PATH" \
+		BLORP_BENCHMARK_CACHE_DIR="$benchmark_contract_root/cache-$contract_name" \
+		BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
+		BLORP_COMPILER_BENCHMARK_COMPILER="$benchmark_fake_bin/compiler" \
+		BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+		BLORP_COMPILER_BRIDGE_BIN=/usr/bin/true \
+		BLORP_FAKE_CC_ARGS="$cc_args" \
+		BLORP_FAKE_COMPILER_ARGS="$compiler_args" \
+		"$benchmark_entrypoint"
+	)
+	if [ "$benchmark_output" != "BENCHMARK_CONTRACT_SMOKE" ] ||
+		[ "$(sed -n '1p' "$compiler_args")" != "compile" ] ||
+		! grep -Fxq -- '--no-format' "$compiler_args" ||
+		! grep -Fxq "$expected_source" "$compiler_args" ||
+		! grep -Fxq -- "$expected_cc_optimization" "$cc_args"
+	then
+		echo "FAIL: $benchmark_entrypoint must compile its expected fixture through the public CLI" >&2
+		exit 1
+	fi
+	if [ "$expected_profile" = "profile" ]; then
+		if ! grep -Fxq -- '--profile' "$compiler_args"; then
+			echo "FAIL: $benchmark_entrypoint must enable compiler profiling" >&2
+			exit 1
+		fi
+	elif grep -Fxq -- '--profile' "$compiler_args"; then
+		echo "FAIL: $benchmark_entrypoint must not enable compiler profiling by default" >&2
+		exit 1
+	fi
+}
+
+assert_compiler_benchmark_contract \
+	import-graph \
+	./benchmarks/compiler_import_graph_profile \
+	"$PWD/compiler/blorp/benchmarks/compiler_import_graph_profile.brp" \
+	plain \
+	-O2
+assert_compiler_benchmark_contract \
+	typecheck \
+	./benchmarks/compiler_typecheck_profile \
+	"$PWD/compiler/blorp/benchmarks/compiler_typecheck_profile.brp" \
+	profile \
+	-O0
+
+rm -rf "$benchmark_contract_root"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
