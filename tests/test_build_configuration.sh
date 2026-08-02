@@ -637,8 +637,12 @@ release_workflow=.github/workflows/release.yml
 ci_build_step=$(sed -n '/name: Build compiler/,/name: Prepare tested compiler bridges/p' .github/workflows/ci.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
+release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
 release_compiler_build_step=$(sed -n '/name: Build compiler/,/name: Prepare packaged compiler bridges/p' "$release_workflow")
 release_prepare_step=$(sed -n '/name: Prepare packaged compiler bridges/,/name: Package binary/p' "$release_workflow")
+release_dev_source_step=$(sed -n '/name: Check dev release authorization/,/name: Validate release assets/p' "$release_workflow")
+release_immutable_dev_step=$(sed -n '/name: Publish immutable dev release/,/name: Publish moving dev release/p' "$release_workflow")
+release_moving_dev_step=$(sed -n '/name: Publish moving dev release/,/name: Publish tagged release/p' "$release_workflow")
 if grep -Fq 'workflow_run' <<<"$release_build_job" ||
 	! grep -Fq "github.event_name == 'push'" <<<"$release_build_job" ||
 	! grep -Fq "startsWith(github.ref, 'refs/tags/v')" <<<"$release_build_job"
@@ -650,6 +654,18 @@ if grep -Eq '(^|[[:space:]])make([[:space:]]+[^[:space:]]+)*[[:space:]]+install(
 	<<<"$release_publish_job"
 then
 	echo "FAIL: release publishing must not rebuild downloaded CI toolchains" >&2
+	exit 1
+fi
+if ! grep -Fq "'blorp-dev-release'" <<<"$release_publish_job" ||
+	! grep -Fq "format('blorp-tag-release-{0}', github.ref_name)" <<<"$release_publish_job" ||
+	! grep -Fq 'cancel-in-progress: false' <<<"$release_publish_job" ||
+	! grep -Fq 'actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=1' <<<"$release_dev_ci_step" ||
+	! grep -Fq 'echo "run_id=$run_id"' <<<"$release_dev_ci_step" ||
+	! grep -Fq 'echo "source_sha=$source_sha"' <<<"$release_dev_ci_step" ||
+	! grep -Fq 'ref: ${{ steps.dev-ci.outputs.source_sha || github.ref }}' <<<"$release_publish_job" ||
+	! grep -Fq 'run-id: ${{ steps.dev-ci.outputs.run_id }}' <<<"$release_publish_job"
+then
+	echo "FAIL: queued dev publishers must resolve the latest successful tested toolchain" >&2
 	exit 1
 fi
 for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
@@ -672,7 +688,7 @@ if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
 	! grep -Fq 'name: Download tested CI binaries' "$release_workflow" ||
-	! grep -Fq 'run-id: ${{ github.event.workflow_run.id }}' "$release_workflow" ||
+	! grep -Fq 'run-id: ${{ steps.dev-ci.outputs.run_id }}' "$release_workflow" ||
 	! grep -Fq 'pattern: blorp-*' "$release_workflow" ||
 	! grep -Fq 'merge-multiple: true' "$release_workflow" ||
 	! grep -Fq 'name: Validate release assets' "$release_workflow" ||
@@ -690,6 +706,34 @@ if grep -Fq 'blorp-bootstrap-compiler' "$release_workflow" ||
 	grep -Fq '__compiler-host-compile-wrapper' "$release_workflow"
 then
 	echo "FAIL: release CI must not retain the retired bootstrap helper bundle" >&2
+	exit 1
+fi
+if ! grep -Fq 'git fetch --quiet --no-tags origin main' <<<"$release_dev_source_step" ||
+	! grep -Fq 'git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows' <<<"$release_dev_source_step" ||
+	! grep -Fq 'echo "publish=false" >> "$GITHUB_OUTPUT"' <<<"$release_dev_source_step" ||
+	! grep -Fq "steps.dev-source.outputs.publish == 'true'" <<<"$release_immutable_dev_step" ||
+	! grep -Fq "steps.dev-source.outputs.publish == 'true'" <<<"$release_moving_dev_step"
+then
+	echo "FAIL: superseded main CI runs must not publish dev release tags" >&2
+	exit 1
+fi
+for dev_release_step in "$release_immutable_dev_step" "$release_moving_dev_step"; do
+	if ! grep -Fq 'workflow_files_match_main()' <<<"$dev_release_step" ||
+		! grep -Fq 'git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows' <<<"$dev_release_step" ||
+		! grep -Fq 'if ! push_output=$(git push' <<<"$dev_release_step"
+	then
+		echo "FAIL: dev tag pushes must recheck main and handle a concurrent superseding push" >&2
+		exit 1
+	fi
+done
+moving_push_line=$(grep -nF 'if ! push_output=$(git push -f origin dev' <<<"$release_moving_dev_step" | cut -d: -f1 || true)
+moving_delete_line=$(grep -nF 'gh release delete dev --yes' <<<"$release_moving_dev_step" | cut -d: -f1 || true)
+if [ -z "$moving_push_line" ] ||
+	[ -z "$moving_delete_line" ] ||
+	[ "$moving_push_line" -ge "$moving_delete_line" ] ||
+	grep -Fq -- '--cleanup-tag' <<<"$release_moving_dev_step"
+then
+	echo "FAIL: moving dev must preserve the previous release until its tag moves" >&2
 	exit 1
 fi
 for executable in $required_staged_toolchain; do

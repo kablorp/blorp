@@ -229,20 +229,52 @@ jobs:
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Dev runs may be coalesced while one publisher is active. Each surviving
+    # run resolves the latest successful CI below, so pending replacement cannot
+    # publish an older toolchain. Versioned tags use independent groups.
+    concurrency:
+      group: >-
+        ${{
+          github.event_name == 'workflow_run' &&
+          'blorp-dev-release' ||
+          format('blorp-tag-release-{0}', github.ref_name)
+        }}
+      cancel-in-progress: false
 
     steps:
+      - name: Resolve latest successful main CI
+        id: dev-ci
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_ci=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=1")
+          run_id=$(jq -r '.workflow_runs[0].id // empty' <<<"$latest_ci")
+          source_sha=$(jq -r '.workflow_runs[0].head_sha // empty' <<<"$latest_ci")
+          if [ -z "$run_id" ] || [ -z "$source_sha" ]; then
+            echo "Could not resolve the latest successful main CI run." >&2
+            exit 1
+          fi
+          {
+            echo "run_id=$run_id"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ steps.dev-ci.outputs.source_sha || github.ref }}
 
       - name: Download tested CI binaries
         if: github.event_name == 'workflow_run'
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.dev-ci.outputs.run_id }}
           pattern: blorp-*
           merge-multiple: true
           path: dist
@@ -294,6 +326,30 @@ jobs:
             echo "title=$title"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Check dev release authorization
+        id: dev-source
+        if: ${{ steps.meta.outputs.tag == 'dev' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="${{ steps.meta.outputs.source_sha }}"
+          git fetch --quiet --no-tags origin main
+          current_main_sha=$(git rev-parse FETCH_HEAD)
+
+          if git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "Could not compare release workflow files with current main." >&2
+              exit 1
+            fi
+            # GITHUB_TOKEN cannot create refs for a successful commit after its
+            # workflow tree diverges from the default branch.
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Superseded dev release::Skipping $source_sha because its workflows differ from current main."
+          fi
 
       - name: Validate release assets
         shell: bash
@@ -384,7 +440,11 @@ jobs:
           fi
 
       - name: Publish immutable dev release
-        if: ${{ steps.meta.outputs.tag == 'dev' }}
+        if: >-
+          ${{
+            steps.meta.outputs.tag == 'dev' &&
+            steps.dev-source.outputs.publish == 'true'
+          }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -392,6 +452,12 @@ jobs:
           set -euo pipefail
           snapshot_tag="${{ steps.meta.outputs.snapshot_tag }}"
           source_sha="${{ steps.meta.outputs.source_sha }}"
+
+          workflow_files_match_main() {
+            git fetch --quiet --no-tags origin main || return 2
+            current_main_sha=$(git rev-parse FETCH_HEAD) || return 2
+            git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows
+          }
 
           existing_tag_sha=$(git ls-remote --tags origin "refs/tags/${snapshot_tag}" | awk 'NR == 1 {print $1}')
           if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$source_sha" ]; then
@@ -408,7 +474,21 @@ jobs:
 
           if [ -z "$existing_tag_sha" ]; then
             git tag "$snapshot_tag" "$source_sha"
-            git push origin "$snapshot_tag"
+            if ! push_output=$(git push origin "$snapshot_tag" 2>&1); then
+              if workflow_files_match_main; then
+                printf '%s\n' "$push_output" >&2
+                exit 1
+              else
+                status=$?
+                if [ "$status" -eq 1 ]; then
+                  echo "::notice title=Superseded dev release::Skipping $snapshot_tag because main changed its workflow files during publication."
+                  exit 0
+                fi
+                printf '%s\n' "$push_output" >&2
+                echo "Could not recheck release workflow files against current main." >&2
+                exit 1
+              fi
+            fi
           fi
 
           gh release create "$snapshot_tag" dist/* \
@@ -418,16 +498,46 @@ jobs:
             --notes-file release-notes.md
 
       - name: Publish moving dev release
-        if: ${{ steps.meta.outputs.tag == 'dev' }}
+        if: >-
+          ${{
+            steps.meta.outputs.tag == 'dev' &&
+            steps.dev-source.outputs.publish == 'true'
+          }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release delete dev --yes --cleanup-tag || true
-          git tag -f dev "${{ steps.meta.outputs.source_sha }}"
-          git push -f origin dev
+          source_sha="${{ steps.meta.outputs.source_sha }}"
+
+          workflow_files_match_main() {
+            git fetch --quiet --no-tags origin main || return 2
+            current_main_sha=$(git rev-parse FETCH_HEAD) || return 2
+            git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows
+          }
+
+          git tag -f dev "$source_sha"
+          if ! push_output=$(git push -f origin dev 2>&1); then
+            if workflow_files_match_main; then
+              printf '%s\n' "$push_output" >&2
+              exit 1
+            else
+              status=$?
+              if [ "$status" -eq 1 ]; then
+                echo "::notice title=Superseded dev release::Not moving dev because main changed its workflow files during publication."
+                exit 0
+              fi
+              printf '%s\n' "$push_output" >&2
+              echo "Could not recheck release workflow files against current main." >&2
+              exit 1
+            fi
+          fi
+
+          if gh release view dev >/dev/null 2>&1; then
+            gh release delete dev --yes
+          fi
           gh release create dev dist/* \
+            --verify-tag \
             --prerelease \
             --latest=false \
             --title "${{ steps.meta.outputs.title }}" \
