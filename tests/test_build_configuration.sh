@@ -12,6 +12,10 @@ if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi
+if grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
+	echo "FAIL: make build must not compile the public Blorp CLI" >&2
+	exit 1
+fi
 
 all_plan=$(make -n all)
 if grep -Fq './blorp format --check' <<<"$all_plan"; then
@@ -20,6 +24,10 @@ if grep -Fq './blorp format --check' <<<"$all_plan"; then
 fi
 
 cli_build_plan=$(make -n build-blorp-cli)
+if grep -Fxq "$expected_ocaml_build" <<<"$cli_build_plan"; then
+	echo "FAIL: make build-blorp-cli must not build the private OCaml host" >&2
+	exit 1
+fi
 if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
 	exit 1
@@ -153,6 +161,21 @@ if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
 fi
 
 install_plan=$(make -n install)
+if ! grep -Fxq "$expected_ocaml_build" <<<"$install_plan"; then
+	echo "FAIL: install must retain the private OCaml command host" >&2
+	exit 1
+fi
+if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$install_plan"; then
+	echo "FAIL: install must retain the public Blorp CLI build" >&2
+	exit 1
+fi
+if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_host.exe" "./blorp-ocaml-host"' \
+	<<<"$install_plan" ||
+	! grep -Fq 'cp "compiler/_build/blorp-cli/blorp" ./blorp' <<<"$install_plan"
+then
+	echo "FAIL: install must publish both the private host and public CLI" >&2
+	exit 1
+fi
 if grep -Fq 'blorp-ocaml-middle' <<<"$install_plan"; then
 	echo "FAIL: install must not retain the retired semantic worker" >&2
 	exit 1
@@ -423,8 +446,10 @@ rm -rf "$benchmark_cache"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
+ci_build_step=$(sed -n '/name: Build compiler/,/name: Prepare tested compiler bridges/p' .github/workflows/ci.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
+release_compiler_build_step=$(sed -n '/name: Build compiler/,/name: Prepare packaged compiler bridges/p' "$release_workflow")
 release_prepare_step=$(sed -n '/name: Prepare packaged compiler bridges/,/name: Package binary/p' "$release_workflow")
 if grep -Fq 'workflow_run' <<<"$release_build_job" ||
 	! grep -Fq "github.event_name == 'push'" <<<"$release_build_job" ||
@@ -433,10 +458,21 @@ then
 	echo "FAIL: successful main CI must not rebuild the tested compiler during release" >&2
 	exit 1
 fi
-if grep -Fq 'make install' <<<"$release_publish_job"; then
+if grep -Eq '(^|[[:space:]])make([[:space:]]+[^[:space:]]+)*[[:space:]]+install([[:space:]]|$)' \
+	<<<"$release_publish_job"
+then
 	echo "FAIL: release publishing must not rebuild downloaded CI toolchains" >&2
 	exit 1
 fi
+for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
+	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$compiler_build_step" ||
+		! grep -Fq 'opam exec -- make -j2 install' <<<"$compiler_build_step" ||
+		! grep -Fq 'opam exec -- make install' <<<"$compiler_build_step"
+	then
+		echo "FAIL: Linux compiler builds must use two Make jobs with a serial fallback" >&2
+		exit 1
+	fi
+done
 if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$release_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$release_workflow" ||

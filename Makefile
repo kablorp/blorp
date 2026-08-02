@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -50,7 +50,7 @@ all: install
 # Only copy when build outputs are newer. Installed root binaries may be
 # ad-hoc signed on macOS, so byte-for-byte comparison against unsigned outputs
 # would recopy on every make and invalidate mtime-based caches.
-install: build-blorp-cli
+install: build-ocaml-host build-blorp-cli
 	@if [ ! -f "$(ROOT_OCAML_HOST)" ] || [ "$(OCAML_HOST)" -nt "$(ROOT_OCAML_HOST)" ]; then \
 		rm -f "$(ROOT_OCAML_HOST)"; \
 		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
@@ -87,8 +87,11 @@ compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 $(BLORP_EMBEDDED_STD_SOURCE): compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp && mv $@.tmp $@
 
-# Build the private OCaml command host.
-build: compiler/lib/embedded_std.ml
+# Build the private OCaml command host. Keep `build` as the established alias,
+# while allowing the public compiler and private host to build independently.
+build: build-ocaml-host
+
+build-ocaml-host: compiler/lib/embedded_std.ml
 	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
@@ -97,7 +100,7 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/l
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp && mv $@.tmp $@
 
-build-blorp-cli: build $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
+build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
