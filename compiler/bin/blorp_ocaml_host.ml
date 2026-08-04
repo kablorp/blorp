@@ -2,26 +2,8 @@
     completed the Blorp migration. *)
 
 open Blorp
-module StringMap = Map.Make (String)
-module IntSet = Set.Make (Int)
-module IntMap = Map.Make (Int)
-
-type purify_candidate = {
-  candidate_id : int;
-  candidate_name : string;
-  candidate_decl_loc : Ast.loc;
-  candidate_signature : Typecheck.checked_func_signature;
-  candidate_func : Ast.func_decl;
-  candidate_body : Ast.expr;
-}
 
 let read_file = Modules.read_file
-
-let write_file path contents =
-  let channel = open_out path in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr channel)
-    (fun () -> output_string channel contents)
 
 let run_compiler_bridge_prepare_command args =
   match args with
@@ -38,9 +20,6 @@ let run_compiler_bridge_prepare_command args =
   | _ ->
       prerr_endline "Usage: blorp __compiler-bridge-prepare <out-dir>";
       1
-
-(** Format a list of pipeline errors for display *)
-let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
 
 (** Resolve timeout: CLI flag overrides env vars, checked in order. *)
 let resolve_timeout_from_env env_names cli_timeout =
@@ -90,342 +69,6 @@ let auto_format_user_file filename =
   if not is_std then
     match Compiler_blorp_bridge.cli_run_via_command [ "format"; filename ] with
     | Ok _ | Error _ -> ()
-
-let line_start_offsets source =
-  let starts = ref [ 0 ] in
-  String.iteri
-    (fun index ch ->
-      if ch = '\n' then starts := (index + 1) :: !starts)
-    source;
-  Array.of_list (List.rev !starts)
-
-let offset_of_loc source line_starts (loc : Ast.loc) =
-  if loc.line <= 0 || loc.line > Array.length line_starts then 0
-  else
-    let line_start = line_starts.(loc.line - 1) in
-    min (String.length source) (line_start + max 0 (loc.column - 1))
-
-let is_identifier_char = function
-  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
-  | _ -> false
-
-let keyword_at source offset keyword =
-  let source_len = String.length source in
-  let keyword_len = String.length keyword in
-  let next = offset + keyword_len in
-  if offset < 0 || next > source_len then false
-  else
-    let left_boundary =
-      offset = 0 || not (is_identifier_char source.[offset - 1])
-    in
-    let right_boundary =
-      next >= source_len || not (is_identifier_char source.[next])
-    in
-    String.sub source offset keyword_len = keyword
-    && left_boundary && right_boundary
-
-let find_last_keyword_between source ~start ~stop keyword =
-  let source_len = String.length source in
-  let keyword_len = String.length keyword in
-  let start = max 0 (min source_len start) in
-  let stop = max start (min source_len stop) in
-  let rec loop offset found =
-    if offset + keyword_len > stop then found
-    else
-      let found =
-        if keyword_at source offset keyword then Some offset else found
-      in
-      loop (offset + 1) found
-  in
-  loop start None
-
-let purify_candidate_func_offset source line_starts candidate =
-  let start = offset_of_loc source line_starts candidate.candidate_decl_loc in
-  let stop = offset_of_loc source line_starts candidate.candidate_body.expr_loc in
-  (* Declaration locs may start at docstrings or annotations. The body loc is
-     after the header, so the last `func` keyword in this bounded range is the
-     declaration keyword we need to mark pure. *)
-  match find_last_keyword_between source ~start ~stop "func" with
-  | Some offset -> Ok offset
-  | None ->
-      Error
-        (Printf.sprintf
-           "could not locate `func` keyword for purify candidate `%s` near \
-            %d:%d"
-           candidate.candidate_name candidate.candidate_decl_loc.line
-           candidate.candidate_decl_loc.column)
-
-let purify_rewrite_offsets source candidates =
-  let line_starts = line_start_offsets source in
-  let rec collect offsets = function
-    | [] -> Ok (List.sort_uniq compare offsets |> List.rev)
-    | candidate :: rest -> (
-        match purify_candidate_func_offset source line_starts candidate with
-        | Ok offset -> collect (offset :: offsets) rest
-        | Error _ as error -> error)
-  in
-  collect [] candidates
-
-let insert_pure_markers source offsets =
-  List.fold_left
-    (fun current offset ->
-      String.sub current 0 offset
-      ^ "pure "
-      ^ String.sub current offset (String.length current - offset))
-    source offsets
-
-let rewrite_source_with_pure_markers source candidates =
-  match purify_rewrite_offsets source candidates with
-  | Error _ as error -> error
-  | Ok offsets -> Ok (insert_pure_markers source offsets)
-
-(** Purify a file by automatically marking eligible functions as 'pure'. *)
-let purify_file ?(dry_run = false) ?(verbose = false) filename =
-  let source = read_file filename in
-  match Pipeline.typecheck_module_only_typed ~filename ~source with
-  | Error errors ->
-      prerr_endline (format_pipeline_errors ~file:filename errors);
-      -1
-  | Ok (state, typed_analysis_program) -> (
-      let analysis_program = Typed_ast.program_ast typed_analysis_program in
-      let env = Typecheck.get_state_env state in
-      let module_aliases = Typecheck.get_state_module_aliases state in
-
-      let rec collect_funcs acc (decls : Ast.program) =
-        List.fold_left
-          (fun acc decl ->
-            match decl.Ast.decl_desc with
-            | Ast.DFunc f -> (f, decl.Ast.decl_loc) :: acc
-            | Ast.DPrivate inner -> collect_funcs acc [ inner ]
-            | _ -> acc)
-          acc decls
-      in
-      let funcs = collect_funcs [] analysis_program |> List.rev in
-
-      let with_pure_assumptions candidates env =
-        List.fold_left
-          (fun acc candidate ->
-            let sig_ = candidate.candidate_signature in
-            Env.add_func acc candidate.candidate_name sig_.cfs_func_type
-              ~callable_id:candidate.candidate_id
-              ~type_params:sig_.cfs_effective_type_params
-              ~param_names:sig_.cfs_param_names ~purity:Env.Pure
-              ~origin:sig_.cfs_origin ?module_path:sig_.cfs_module_path
-              ~dim_constraints:sig_.cfs_dim_constraints
-              ?loop_producer:sig_.cfs_loop_producer
-              ~debug_only:sig_.cfs_debug_only ())
-          env candidates
-      in
-
-      let add_func_params env func =
-        List.fold_left
-          (fun acc (p : Ast.param) ->
-            match (p.Ast.param_name, p.Ast.param_type) with
-            | Some name, Some ty -> Env.add_var acc name ty ()
-            | _ -> acc)
-          env func.Ast.func_params
-      in
-
-      let has_global_mutation body func =
-        let is_param name =
-          List.exists
-            (fun (p : Ast.param) -> p.Ast.param_name = Some name)
-            func.Ast.func_params
-        in
-        let rec walk expr =
-          match expr.Ast.expr_desc with
-          | Ast.EAssign (name, _) -> (
-              match Env.lookup env name with
-              | Some { kind = Env.VarSymbol { mutability = Env.Mutable; _ }; _ }
-                when not (is_param name) ->
-                  true
-              | _ -> List.exists walk (Ast.expr_children expr))
-          | _ -> List.exists walk (Ast.expr_children expr)
-        in
-        walk body
-      in
-
-      let has_impure_callback_param func =
-        List.exists
-          (fun (p : Ast.param) ->
-            match p.Ast.param_type with
-            | Some ty -> Env.is_impure_function_type env ty
-            | _ -> false)
-          func.Ast.func_params
-      in
-
-      let name_counts =
-        List.fold_left
-          (fun counts ((func : Ast.func_decl), _) ->
-            match func.Ast.func_name with
-            | Some name ->
-                let count =
-                  match StringMap.find_opt name counts with
-                  | Some count -> count
-                  | None -> 0
-                in
-                StringMap.add name (count + 1) counts
-            | None -> counts)
-          StringMap.empty funcs
-      in
-      let has_unique_name name =
-        match StringMap.find_opt name name_counts with
-        | Some 1 -> true
-        | _ -> false
-      in
-
-      let local_candidates =
-        List.fold_right
-          (fun ((func : Ast.func_decl), loc) acc ->
-            match
-              (func.Ast.func_name, Ast.func_body_expr_opt func.Ast.func_body)
-            with
-            | Some name, Some body
-              when has_unique_name name
-                   && (not func.Ast.func_is_pure)
-                   && (not (Ast.func_has_builtin_body func))
-                   && (not (Ast.func_is_foreign func))
-                   && (not (has_impure_callback_param func))
-                   && (not (has_global_mutation body func))
-                   && not (Typecheck.has_concurrency body) -> (
-                match
-                  ( Typecheck.get_state_func_callable_id state ~name ~loc,
-                    Typecheck.checked_func_signature_of_func state func )
-                with
-                | Some id, Some signature ->
-                    {
-                      candidate_id = id;
-                      candidate_name = name;
-                      candidate_decl_loc = loc;
-                      candidate_signature = signature;
-                      candidate_func = func;
-                      candidate_body = body;
-                    }
-                    :: acc
-                | _ -> acc)
-            | _ -> acc)
-          funcs []
-      in
-      let local_candidate_ids =
-        List.fold_left
-          (fun ids candidate -> IntSet.add candidate.candidate_id ids)
-          IntSet.empty local_candidates
-      in
-      let local_candidate_id_list = IntSet.elements local_candidate_ids in
-      let local_candidate_id_by_name =
-        List.fold_left
-          (fun ids candidate ->
-            StringMap.add candidate.candidate_name candidate.candidate_id ids)
-          StringMap.empty local_candidates
-      in
-
-      let collect_local_calls body =
-        Purity_analysis.collect_matching_calls
-          ~match_call:(fun name callee loc _args ->
-            if Purity_analysis.is_module_qualified_call callee module_aliases
-            then []
-            else
-              match StringMap.find_opt name local_candidate_id_by_name with
-              | Some id -> [ Purity_analysis.call_ref ~called_id:id name loc ]
-              | None -> [])
-          ~match_resolved_call:(fun resolved _callee loc _args ->
-            match Ast.resolved_call_concrete_callable_id resolved with
-            | Some id when IntSet.mem id local_candidate_ids ->
-                Some [ Purity_analysis.call_ref ~called_id:id "<local>" loc ]
-            | Some _ | None -> Some [])
-          ~enter_lambda:(fun func -> func.Ast.func_is_pure)
-          body
-        |> List.fold_left
-             (fun ids (call : Purity_analysis.call_ref) ->
-               match call.called_id with
-               | Some id -> IntSet.add id ids
-               | None -> ids)
-             IntSet.empty
-      in
-
-      let dependency_map =
-        List.fold_left
-          (fun deps candidate ->
-            IntMap.add candidate.candidate_id
-              (collect_local_calls candidate.candidate_body)
-              deps)
-          IntMap.empty local_candidates
-      in
-
-      let has_external_blocker candidate =
-        let test_env = env |> with_pure_assumptions local_candidates in
-        let test_env = add_func_params test_env candidate.candidate_func in
-        Typecheck.collect_impure_calls ~prefer_env_purity:true ~strict:true
-          ~assume_pure_callable_ids:local_candidate_id_list test_env
-          module_aliases candidate.candidate_body
-        <> []
-      in
-
-      let externally_viable =
-        List.fold_left
-          (fun acc candidate ->
-            if has_external_blocker candidate then acc
-            else IntSet.add candidate.candidate_id acc)
-          IntSet.empty local_candidates
-      in
-
-      let rec prune_by_dependencies viable =
-        let next =
-          IntSet.filter
-            (fun id ->
-              let deps =
-                match IntMap.find_opt id dependency_map with
-                | Some deps -> deps
-                | None -> IntSet.empty
-              in
-              IntSet.for_all (fun dep -> IntSet.mem dep viable) deps)
-            viable
-        in
-        if IntSet.equal next viable then viable else prune_by_dependencies next
-      in
-      let purifiable_ids = prune_by_dependencies externally_viable in
-      let purifiable_candidates =
-        local_candidates
-        |> List.filter (fun candidate ->
-               IntSet.mem candidate.candidate_id purifiable_ids)
-      in
-      let ordered_names =
-        purifiable_candidates |> List.map (fun candidate -> candidate.candidate_name)
-      in
-
-      match ordered_names with
-      | [] ->
-          if verbose then
-            Printf.printf "No functions to purify in %s.\n" filename;
-          0
-      | names -> (
-          if dry_run then begin
-            Printf.printf
-              "[DRY-RUN] Functions that could be purified in %s: %s\n" filename
-              (String.concat ", " names);
-            List.length names
-          end
-          else
-            match rewrite_source_with_pure_markers source purifiable_candidates with
-            | Error message ->
-                prerr_endline message;
-                -1
-            | Ok rewritten -> (
-                match
-                  Pipeline.typecheck_module_only_typed ~filename ~source:rewritten
-                with
-                | Error errors ->
-                    prerr_endline (format_pipeline_errors ~file:filename errors);
-                    -1
-                | Ok _ ->
-                    (* Preserve the user's source layout and comments. The full
-                       formatter is available as an explicit `blorp format`
-                       command; purify only needs to insert proven-safe `pure`
-                       markers. *)
-                    write_file filename rewritten;
-                    Printf.printf "Purified %d function(s) in %s\n"
-                      (List.length names) filename;
-                    List.length names)))
 
 let package_pin_overlap left right =
   match
@@ -737,19 +380,10 @@ let package_vendor_all_from_config () =
           | error :: rest -> Error (String.concat "\n" (error :: rest))
           | [] -> Ok (List.rev !vendored, List.rev !skipped_local)))
 
-let rec collect_brp_files path =
-  if Sys.is_directory path then
-    let files = try Sys.readdir path with _ -> [||] in
-    Array.to_list files |> List.sort String.compare
-    |> List.map (fun f -> Filename.concat path f)
-    |> List.map collect_brp_files |> List.flatten
-  else if Filename.check_suffix path ".brp" then [ path ]
-  else []
 
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
-  | BlorpCliPurify of Compiler_blorp_bridge.cli_purify_options
   | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
@@ -764,7 +398,6 @@ let cli_frontier_of_cli_run_result = function
         "Internal error: a source compile plan reached the OCaml tool host";
       exit 1
   | Compiler_blorp_bridge.CliRunTestOptions options -> BlorpCliTest options
-  | Compiler_blorp_bridge.CliRunPurifyOptions options -> BlorpCliPurify options
   | Compiler_blorp_bridge.CliRunReplOptions options -> BlorpCliRepl options
   | Compiler_blorp_bridge.CliRunLspOptions options -> BlorpCliLsp options
   | Compiler_blorp_bridge.CliRunPackageOptions options ->
@@ -859,35 +492,6 @@ let run_test_from_frontier_options
             ~compiler_path:options.cli_test_compiler_path
             ?std_dir:options.cli_test_std_dir paths
 
-let run_purify_from_frontier_options
-    (options : Compiler_blorp_bridge.cli_purify_options) =
-  let all_files =
-    List.map collect_brp_files options.cli_purify_paths |> List.flatten
-  in
-  match all_files with
-  | [] ->
-      prerr_endline "Error: No input files specified";
-      1
-  | files ->
-      let results =
-        List.map
-          (purify_file ~dry_run:options.cli_purify_dry_run
-             ~verbose:options.cli_purify_verbose)
-          files
-      in
-      let total_purified =
-        List.fold_left (fun acc r -> acc + max 0 r) 0 results
-      in
-      let files_modified =
-        List.filter (fun r -> r > 0) results |> List.length
-      in
-      if
-        (not options.cli_purify_dry_run)
-        && (files_modified > 1 || (files_modified = 1 && List.length files > 1))
-      then
-        Printf.printf "Total: Purified %d function(s) across %d file(s).\n"
-          total_purified files_modified;
-      if List.exists (fun r -> r < 0) results then 1 else 0
 
 let run_package_from_frontier_options
     (options : Compiler_blorp_bridge.cli_package_options) =
@@ -1038,7 +642,6 @@ and run_compiler_cli_plan_command args =
 and run_frontier = function
   | BlorpCliDelegate args -> run_delegate_command args
   | BlorpCliTest options -> run_test_from_frontier_options options
-  | BlorpCliPurify options -> run_purify_from_frontier_options options
   | BlorpCliRepl options ->
       Repl.run ~debug:options.Compiler_blorp_bridge.cli_repl_debug
         ~compiler_path:options.cli_repl_compiler_path;

@@ -94,7 +94,7 @@ build-ocaml-host: compiler/lib/embedded_std.ml
 	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
-# for commands such as purify, package, REPL, and LSP.
+# for commands such as test, package, REPL, and LSP.
 $(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp && mv $@.tmp $@

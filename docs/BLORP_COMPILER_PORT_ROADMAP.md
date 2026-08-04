@@ -29,9 +29,9 @@ Blorp CLI / source graph / source reads / parse
   -> Blorp artifact writing / runtime cache / host C / optional execution
 ```
 
-Ordinary `check`, `compile`, and `run` make no OCaml call. Their compilation
-pipeline is one contiguous Blorp call graph. The OCaml host remains for
-`test`, `purify`, `repl`, `lsp`, and package commands.
+Ordinary `check`, `compile`, `run`, and `purify` make no OCaml call. Their
+compilation and analysis pipelines are contiguous Blorp call graphs. The OCaml
+host remains for `test`, `repl`, `lsp`, and package commands.
 
 The immutable compiler named by `compiler/bootstrap.env` is a build trust root,
 not part of the compiler being migrated.
@@ -272,12 +272,15 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 
 ### Current State
 
-- `check`, `compile`, `run`, and `format` are Blorp-owned.
+- `check`, `compile`, `run`, `format`, and `purify` are Blorp-owned.
+- `purify` consumes resolved callable identities and typed purity requirements,
+  computes module-local recursive candidate sets, rewrites parser-owned keyword
+  spans, and validates every proposed rewrite before writing.
 - `test` planning/discovery has Blorp candidate code, but production execution
   still delegates to the OCaml runner. The candidate is not production-ready:
   it lacks the test-specific execution/reporting effect and representative
   compiler-suite parity.
-- `purify`, `repl`, `lsp`, and package commands delegate to the OCaml host.
+- `repl`, `lsp`, and package commands delegate to the OCaml host.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.
 
@@ -288,18 +291,16 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
    `TestSuite` identity, doctest extraction, harness construction, semantic
    isolation groups, scheduling, timeout/process cleanup, caching, and result
    framing before changing production routing.
-2. **Purify:** consume resolved Blorp purity/call facts; retain a raw-parse path
-   only where typed input is intentionally unavailable.
-3. **Packages:** manifest validation, source validation, content hashing,
+2. **Packages:** manifest validation, source validation, content hashing,
    artifact pack/unpack, cache publication, fetch, and vendor.
-4. **LSP:** diagnostics, symbols, hover, completion, signature help,
+3. **LSP:** diagnostics, symbols, hover, completion, signature help,
    references, declarations/definitions, inlay hints, and formatting over
    shared parse/typecheck outputs.
-5. **REPL:** interactive input and history over the ordinary Blorp compile/run
+4. **REPL:** interactive input and history over the ordinary Blorp compile/run
    services.
-6. Delete the host dispatcher and every tool module after its public command
+5. Delete the host dispatcher and every tool module after its public command
    and tests have moved.
-7. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
+6. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
    made unreachable by the moved tools.
 
 ### Tool Invariants

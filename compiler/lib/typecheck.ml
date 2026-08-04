@@ -156,7 +156,6 @@ let loop_producer_of_registered_func ~(module_path : string option)
   | _ -> None
 
 let get_state_env state = state.env
-let get_state_module_aliases state = state.module_aliases
 
 let get_state_func_callable_id state ~name ~loc =
   Hashtbl.find_opt state.func_callable_ids (func_callable_key ~name loc)
@@ -4378,14 +4377,6 @@ let validate_debug_usage (state : check_state) (body : expr) : check_state =
         List.fold_left (walk ~in_debug) st (expr_children expr)
   in
   walk ~in_debug:false state body
-
-(** Check if an expression contains concurrent blocks or for ... concurrently.
-    Used by the purify command to reject functions with concurrency. *)
-let rec has_concurrency (expr : expr) : bool =
-  match expr.expr_desc with
-  | EConcurrent _ | EConcurrentlyLoop _ | ESelect _ -> true
-  | ELambda _ -> false (* don't recurse into nested lambdas *)
-  | _ -> List.exists has_concurrency (expr_children expr)
 
 (** Report impure calls as errors for a pure function/lambda *)
 let report_impure_calls state ~func_name ~help_msg impure_calls =

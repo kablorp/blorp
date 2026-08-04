@@ -106,8 +106,7 @@ type loaded_module_typecheck_result =
   | LoadedModuleErrors of Ast.compiler_error list
 
 (** Type-check a single loaded module and format the errors the pipeline should
-    surface. Shared by full compilation and analysis-only entry points so tools
-    like [purify] do not silently proceed with an invalid dependency graph. *)
+    surface. Shared by full compilation and OCaml analysis-only entry points. *)
 let typecheck_loaded_module ?(debug = false) ?(allow_debug_only_calls = false)
     (m : Modules.loaded_module) =
   let state, typed_decls, errors =

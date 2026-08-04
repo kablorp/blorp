@@ -194,15 +194,6 @@ let test_options_json paths =
       ("paths", string_array paths);
     ]
 
-let purify_options_json paths =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "purify");
-      ("dry_run", Lsp_json.Bool true);
-      ("verbose", Lsp_json.Bool true);
-      ("paths", string_array paths);
-    ]
-
 let comment_json ~text ~line ~column ~trailing =
   Lsp_json.Object
     [
@@ -783,30 +774,6 @@ let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
   |> expect_invalid_response_contains
        "unsupported CLI run artifact kind `frontend_options`"
 
-let test_cli_run_response_decodes_purify_options () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "purify");
-           ( "args",
-             string_array [ "purify"; "--dry-run"; "--verbose"; "src" ] );
-           ("options", purify_options_json [ "src" ]);
-         ])
-  in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunPurifyOptions
-        {
-          cli_purify_raw_args = [ "purify"; "--dry-run"; "--verbose"; "src" ];
-          cli_purify_dry_run = true;
-          cli_purify_verbose = true;
-          cli_purify_paths = [ "src" ];
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI purify options"
-  | Error (_, message) -> Alcotest.fail message
-
 let test_cli_run_response_decodes_repl_options () =
   let response =
     bridge_success_json
@@ -1358,8 +1325,6 @@ let suite =
         Alcotest.test_case
           "CLI run response rejects legacy frontend options artifact" `Quick
           test_cli_run_response_rejects_legacy_frontend_options_artifact;
-        Alcotest.test_case "CLI run response decodes purify options" `Quick
-          test_cli_run_response_decodes_purify_options;
         Alcotest.test_case "CLI run response decodes repl options" `Quick
           test_cli_run_response_decodes_repl_options;
         Alcotest.test_case "CLI run response decodes lsp options" `Quick

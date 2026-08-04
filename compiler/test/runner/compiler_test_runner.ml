@@ -246,6 +246,11 @@ let collect_cases selection =
       |> List.map (fun file -> { kind = PurifyShouldNotPurify; file }))
     @ (sorted_brp_files "tests/test_compiler/purify/should_rewrite"
       |> List.map (fun file -> { kind = PurifyShouldRewrite; file }))
+    @ [
+        (* Builtin bodies declare runtime implementations; their syntax does
+           not establish purity. Use a real std module so builtins are enabled. *)
+        { kind = PurifyShouldNotPurify; file = "std/crypto_random.brp" };
+      ]
   in
   let surface_cases =
     parser_pass @ parser_fail @ checked "typecheck" @ checked "infer"

@@ -1832,11 +1832,23 @@ private pure func compiler_resolved_call_infos_equal(
 	)
 
 
+private pure func compiler_direct_callable_resolution(
+	callee: CompilerTypedExpr,
+) -> Option[CompilerResolvedCallInfo]:
+	match callee:
+		CompilerTypedNameExpr(_, _):
+			compiler_typed_expr_resolved_call(callee)
+		CompilerTypedFieldAccessExpr(_, _, _, _):
+			compiler_typed_expr_resolved_call(callee)
+		_:
+			None
+
+
 private pure func compiler_typed_call_resolved_metadata_error(
 	callee: CompilerTypedExpr,
 	call_info: CompilerTypedExprInfo,
 ) -> Option[String]:
-	match compiler_typed_expr_resolved_call(callee):
+	match compiler_direct_callable_resolution(callee):
 		Some(callee_call):
 			match call_info.resolved_call:
 				Some(call_call):
@@ -1847,7 +1859,25 @@ private pure func compiler_typed_call_resolved_metadata_error(
 				None:
 					Some("call expression missing resolved-call metadata from callee")
 		None:
-			None
+			match call_info.resolved_call:
+				Some(call):
+					match call.target:
+						CompilerResolvedClosureCall:
+							match compiler_typed_expr_semantic_type(callee):
+								CompilerFunctionType(is_pure, _, _):
+									if compiler_purities_equal(
+										call.purity,
+										compiler_purity_from_bool(is_pure),
+									):
+										None
+									else:
+										Some("indirect call resolved-call purity must match callee")
+								_:
+									None
+						_:
+							Some("indirect call must have closure resolved-call metadata")
+				None:
+					Some("call expression is missing resolved-call metadata")
 
 
 pure func compiler_typed_expr_info_type_error(info: CompilerTypedExprInfo) -> Option[String]:
@@ -3447,6 +3477,22 @@ private pure func compiler_binding_origin_for_initializer(
 		CompilerLetBinding
 
 
+record CompilerPurityRequirement {
+	name: String,
+	callable_id: Option[Int]
+}
+
+
+private pure func compiler_purity_requirement(
+	name: String,
+	callable_id: Option[Int],
+) -> CompilerPurityRequirement:
+	{
+		name = name,
+		callable_id = callable_id
+	}
+
+
 private pure func compiler_append_impure_call_names(
 	names: List[String],
 	extra: List[String],
@@ -3459,152 +3505,164 @@ private pure func compiler_append_impure_call_names(
 	result
 
 
-private pure func compiler_typed_expr_list_impure_call_names(
+private pure func compiler_append_purity_requirements(
+	requirements: List[CompilerPurityRequirement],
+	extra: List[CompilerPurityRequirement],
+) -> List[CompilerPurityRequirement]:
+	var result = requirements
+
+	for requirement in extra:
+		result = result.append(requirement)
+
+	result
+
+
+private pure func compiler_typed_expr_list_purity_requirements(
 	exprs: List[CompilerTypedExpr],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for expr in exprs:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(expr),
+			compiler_typed_expr_purity_requirements(expr),
 		)
 
 	result
 
 
-private pure func compiler_typed_dict_entries_impure_call_names(
+private pure func compiler_typed_dict_entries_purity_requirements(
 	entries: List[CompilerTypedDictEntry],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for entry in entries:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(entry.key),
+			compiler_typed_expr_purity_requirements(entry.key),
 		)
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(entry.value),
+			compiler_typed_expr_purity_requirements(entry.value),
 		)
 
 	result
 
 
-private pure func compiler_typed_record_fields_impure_call_names(
+private pure func compiler_typed_record_fields_purity_requirements(
 	fields: List[CompilerTypedRecordField],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for field in fields:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(field.value),
+			compiler_typed_expr_purity_requirements(field.value),
 		)
 
 	result
 
 
-private pure func compiler_typed_concurrent_params_impure_call_names(
+private pure func compiler_typed_concurrent_params_purity_requirements(
 	params: List[CompilerTypedConcurrentParam],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for param in params:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(param.value),
+			compiler_typed_expr_purity_requirements(param.value),
 		)
 
 	result
 
 
-private pure func compiler_typed_concurrent_bindings_impure_call_names(
+private pure func compiler_typed_concurrent_bindings_purity_requirements(
 	bindings: List[CompilerTypedConcurrentBinding],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for binding in bindings:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(binding.value),
+			compiler_typed_expr_purity_requirements(binding.value),
 		)
 
 	result
 
 
-private pure func compiler_typed_with_binding_impure_call_names(
+private pure func compiler_typed_with_binding_purity_requirements(
 	binding: CompilerTypedWithBinding,
-) -> List[String]:
-	result = compiler_typed_expr_impure_call_names(binding.value)
+) -> List[CompilerPurityRequirement]:
+	result = compiler_typed_expr_purity_requirements(binding.value)
 
 	match binding.error_map:
 		Some(mapper):
-			compiler_append_impure_call_names(
+			compiler_append_purity_requirements(
 				result,
-				compiler_typed_expr_impure_call_names(mapper.value),
+				compiler_typed_expr_purity_requirements(mapper.value),
 			)
 		None:
 			result
 
 
-private pure func compiler_typed_interpolation_parts_impure_call_names(
+private pure func compiler_typed_interpolation_parts_purity_requirements(
 	parts: List[CompilerTypedStringInterpolationPart],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for part in parts:
 		match part:
 			CompilerTypedInterpolationLiteral(_):
 				void
 			CompilerTypedInterpolationExpr(expr):
-				result = compiler_append_impure_call_names(
+				result = compiler_append_purity_requirements(
 					result,
-					compiler_typed_expr_impure_call_names(expr),
+					compiler_typed_expr_purity_requirements(expr),
 				)
 
 	result
 
 
-private pure func compiler_typed_match_cases_impure_call_names(
+private pure func compiler_typed_match_cases_purity_requirements(
 	cases: List[CompilerTypedMatchCase],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for case in cases:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(case.body),
+			compiler_typed_expr_purity_requirements(case.body),
 		)
 
 	result
 
 
-private pure func compiler_typed_select_arm_kind_impure_call_names(
+private pure func compiler_typed_select_arm_kind_purity_requirements(
 	kind: CompilerTypedSelectArmKind,
-) -> List[String]:
+) -> List[CompilerPurityRequirement]:
 	match kind:
 		CompilerTypedSelectReceiveArm(_, _, channel):
-			compiler_typed_expr_impure_call_names(channel)
+			compiler_typed_expr_purity_requirements(channel)
 		CompilerTypedSelectSealedArm(_, channel):
-			compiler_typed_expr_impure_call_names(channel)
+			compiler_typed_expr_purity_requirements(channel)
 		CompilerTypedSelectAfterArm(timeout):
-			compiler_typed_expr_impure_call_names(timeout)
+			compiler_typed_expr_purity_requirements(timeout)
 
 
-private pure func compiler_typed_select_arms_impure_call_names(
+private pure func compiler_typed_select_arms_purity_requirements(
 	arms: List[CompilerTypedSelectArm],
-) -> List[String]:
-	var result: List[String] = []
+) -> List[CompilerPurityRequirement]:
+	var result: List[CompilerPurityRequirement] = []
 
 	for arm in arms:
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_select_arm_kind_impure_call_names(arm.kind),
+			compiler_typed_select_arm_kind_purity_requirements(arm.kind),
 		)
-		result = compiler_append_impure_call_names(
+		result = compiler_append_purity_requirements(
 			result,
-			compiler_typed_expr_impure_call_names(arm.body),
+			compiler_typed_expr_purity_requirements(arm.body),
 		)
 
 	result
@@ -3618,179 +3676,204 @@ private pure func compiler_impure_function_value_name(callee: CompilerTypedExpr)
 			"<impure function value>"
 
 
-private pure func compiler_call_expr_impure_call_name(
+private pure func compiler_call_expr_purity_requirements(
 	callee: CompilerTypedExpr,
 	info: CompilerTypedExprInfo,
-) -> List[String]:
+) -> List[CompilerPurityRequirement]:
 	match info.resolved_call:
 		Some(call):
 			if compiler_purities_equal(call.purity, CompilerImpure):
-				[call.callee_name]
+				[
+					compiler_purity_requirement(
+						call.callee_name,
+						compiler_resolved_call_callable_id(call),
+					),
+				]
 			else:
 				[]
 		None:
 			match compiler_typed_expr_semantic_type(callee):
 				CompilerFunctionType(False, _, _):
-					[compiler_impure_function_value_name(callee)]
+					[compiler_purity_requirement(compiler_impure_function_value_name(callee), None)]
 				_:
 					[]
 
 
-pure func compiler_typed_expr_impure_call_names(expr: CompilerTypedExpr) -> List[String]:
+private pure func compiler_for_iterable_purity_requirements(
+	iterable: CompilerTypedExpr,
+) -> List[CompilerPurityRequirement]:
+	compiler_for_iterable_impure_call_name(
+		iterable,
+	).map(
+		func(name): compiler_purity_requirement(name, None),
+	)
+
+
+pure func compiler_typed_expr_purity_requirements(
+	expr: CompilerTypedExpr,
+) -> List[CompilerPurityRequirement]:
 	match expr:
 		CompilerTypedUnaryExpr(_, inner, _, _):
-			compiler_typed_expr_impure_call_names(inner)
+			compiler_typed_expr_purity_requirements(inner)
 		CompilerTypedBinaryExpr(_, left, right, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(left),
-				compiler_typed_expr_impure_call_names(right),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(left),
+				compiler_typed_expr_purity_requirements(right),
 			)
 		CompilerTypedLogicalExpr(_, left, right, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(left),
-				compiler_typed_expr_impure_call_names(right),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(left),
+				compiler_typed_expr_purity_requirements(right),
 			)
 		CompilerTypedCallExpr(callee, args, _, info):
-			with_callee = compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(callee),
-				compiler_typed_expr_list_impure_call_names(args),
+			with_callee = compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(callee),
+				compiler_typed_expr_list_purity_requirements(args),
 			)
-			compiler_append_impure_call_names(
+			compiler_append_purity_requirements(
 				with_callee,
-				compiler_call_expr_impure_call_name(callee, info),
+				compiler_call_expr_purity_requirements(callee, info),
 			)
 		CompilerTypedTupleExpr(items, _, _):
-			compiler_typed_expr_list_impure_call_names(items)
+			compiler_typed_expr_list_purity_requirements(items)
 		CompilerTypedTupleDestructExpr(_, value, _, _):
-			compiler_typed_expr_impure_call_names(value)
+			compiler_typed_expr_purity_requirements(value)
 		CompilerTypedAssignExpr(_, _, value, _, _):
-			compiler_typed_expr_impure_call_names(value)
+			compiler_typed_expr_purity_requirements(value)
 		CompilerTypedSubscriptExpr(receiver, indices, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(receiver),
-				compiler_typed_expr_list_impure_call_names(indices),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(receiver),
+				compiler_typed_expr_list_purity_requirements(indices),
 			)
 		CompilerTypedSubscriptAssignExpr(_, receiver, indices, value, _, _):
-			with_indices = compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(receiver),
-				compiler_typed_expr_list_impure_call_names(indices),
+			with_indices = compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(receiver),
+				compiler_typed_expr_list_purity_requirements(indices),
 			)
-			compiler_append_impure_call_names(
+			compiler_append_purity_requirements(
 				with_indices,
-				compiler_typed_expr_impure_call_names(value),
+				compiler_typed_expr_purity_requirements(value),
 			)
 		CompilerTypedListExpr(items, _, _):
-			compiler_typed_expr_list_impure_call_names(items)
+			compiler_typed_expr_list_purity_requirements(items)
 		CompilerTypedVectorExpr(items, _, _):
-			compiler_typed_expr_list_impure_call_names(items)
+			compiler_typed_expr_list_purity_requirements(items)
 		CompilerTypedDictExpr(entries, _, _):
-			compiler_typed_dict_entries_impure_call_names(entries)
+			compiler_typed_dict_entries_purity_requirements(entries)
 		CompilerTypedRecordExpr(fields, _, _):
-			compiler_typed_record_fields_impure_call_names(fields)
+			compiler_typed_record_fields_purity_requirements(fields)
 		CompilerTypedRecordUpdateExpr(base, fields, _, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(base),
-				compiler_typed_record_fields_impure_call_names(fields),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(base),
+				compiler_typed_record_fields_purity_requirements(fields),
 			)
 		CompilerTypedFieldAccessExpr(receiver, _, _, _):
-			compiler_typed_expr_impure_call_names(receiver)
+			compiler_typed_expr_purity_requirements(receiver)
 		CompilerTypedLambdaExpr(is_pure, _, _, body, _, _):
 			if is_pure:
-				compiler_typed_expr_impure_call_names(body)
+				compiler_typed_expr_purity_requirements(body)
 			else:
 				[]
 		CompilerTypedRangeExpr(start_expr, end_expr, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(start_expr),
-				compiler_typed_expr_impure_call_names(end_expr),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(start_expr),
+				compiler_typed_expr_purity_requirements(end_expr),
 			)
 		CompilerTypedIfExpr(condition, then_branch, else_branch, _, _):
-			with_then = compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(condition),
-				compiler_typed_expr_impure_call_names(then_branch),
+			with_then = compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(condition),
+				compiler_typed_expr_purity_requirements(then_branch),
 			)
 
 			match else_branch:
 				Some(branch):
-					compiler_append_impure_call_names(
+					compiler_append_purity_requirements(
 						with_then,
-						compiler_typed_expr_impure_call_names(branch),
+						compiler_typed_expr_purity_requirements(branch),
 					)
 				None:
 					with_then
 		CompilerTypedMatchExpr(scrutinee, cases, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(scrutinee),
-				compiler_typed_match_cases_impure_call_names(cases),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(scrutinee),
+				compiler_typed_match_cases_purity_requirements(cases),
 			)
 		CompilerTypedSelectExpr(arms, _, _):
-			compiler_append_impure_call_names(
-				["select"],
-				compiler_typed_select_arms_impure_call_names(arms),
+			compiler_append_purity_requirements(
+				[compiler_purity_requirement("select", None)],
+				compiler_typed_select_arms_purity_requirements(arms),
 			)
 		CompilerTypedWhileExpr(condition, body, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_expr_impure_call_names(condition),
-				compiler_typed_expr_impure_call_names(body),
+			compiler_append_purity_requirements(
+				compiler_typed_expr_purity_requirements(condition),
+				compiler_typed_expr_purity_requirements(body),
 			)
 		CompilerTypedForExpr(_, iterable, _, body, _, _):
-			with_iterable = compiler_append_impure_call_names(
-				compiler_for_iterable_impure_call_name(iterable),
-				compiler_typed_expr_impure_call_names(iterable),
+			with_iterable = compiler_append_purity_requirements(
+				compiler_for_iterable_purity_requirements(iterable),
+				compiler_typed_expr_purity_requirements(iterable),
 			)
-			compiler_append_impure_call_names(
+			compiler_append_purity_requirements(
 				with_iterable,
-				compiler_typed_expr_impure_call_names(body),
+				compiler_typed_expr_purity_requirements(body),
 			)
 		CompilerTypedConcurrentBlockExpr(params, bindings, _, _):
-			compiler_append_impure_call_names(
-				["concurrent"],
-				compiler_append_impure_call_names(
-					compiler_typed_concurrent_params_impure_call_names(params),
-					compiler_typed_concurrent_bindings_impure_call_names(bindings),
+			compiler_append_purity_requirements(
+				[compiler_purity_requirement("concurrent", None)],
+				compiler_append_purity_requirements(
+					compiler_typed_concurrent_params_purity_requirements(params),
+					compiler_typed_concurrent_bindings_purity_requirements(bindings),
 				),
 			)
 		CompilerTypedConcurrentForExpr(_, iterable, params, body, _, _):
-			with_iterable = compiler_append_impure_call_names(
-				["for ... concurrently"],
-				compiler_typed_expr_impure_call_names(iterable),
+			with_iterable = compiler_append_purity_requirements(
+				[compiler_purity_requirement("for ... concurrently", None)],
+				compiler_typed_expr_purity_requirements(iterable),
 			)
-			with_params = compiler_append_impure_call_names(
+			with_params = compiler_append_purity_requirements(
 				with_iterable,
-				compiler_typed_concurrent_params_impure_call_names(params),
+				compiler_typed_concurrent_params_purity_requirements(params),
 			)
-			compiler_append_impure_call_names(
+			compiler_append_purity_requirements(
 				with_params,
-				compiler_typed_expr_impure_call_names(body),
+				compiler_typed_expr_purity_requirements(body),
 			)
 		CompilerTypedDetachExpr(body, _, _):
-			compiler_append_impure_call_names(
-				["detach"],
-				compiler_typed_expr_impure_call_names(body),
+			compiler_append_purity_requirements(
+				[compiler_purity_requirement("detach", None)],
+				compiler_typed_expr_purity_requirements(body),
 			)
 		CompilerTypedAscriptionExpr(inner, _, _, _):
-			compiler_typed_expr_impure_call_names(inner)
+			compiler_typed_expr_purity_requirements(inner)
 		CompilerTypedOpaqueIntoExpr(_, inner, _, _):
-			compiler_typed_expr_impure_call_names(inner)
+			compiler_typed_expr_purity_requirements(inner)
 		CompilerTypedOpaqueFromExpr(_, inner, _, _):
-			compiler_typed_expr_impure_call_names(inner)
+			compiler_typed_expr_purity_requirements(inner)
 		CompilerTypedBlockExpr(items, _, _):
-			compiler_typed_expr_list_impure_call_names(items)
+			compiler_typed_expr_list_purity_requirements(items)
 		CompilerTypedWithExpr(binding, body, _, _):
-			compiler_append_impure_call_names(
-				compiler_typed_with_binding_impure_call_names(binding),
-				compiler_typed_expr_impure_call_names(body),
+			compiler_append_purity_requirements(
+				compiler_typed_with_binding_purity_requirements(binding),
+				compiler_typed_expr_purity_requirements(body),
 			)
 		CompilerTypedDebugBlockExpr(body, _, _):
-			compiler_typed_expr_impure_call_names(body)
+			compiler_typed_expr_purity_requirements(body)
 		CompilerTypedVarDeclExpr(payload, _):
-			compiler_typed_expr_impure_call_names(payload.initializer)
+			compiler_typed_expr_purity_requirements(payload.initializer)
 		CompilerTypedQuestionBindExpr(_, _, value, _, _):
-			compiler_typed_expr_impure_call_names(value)
+			compiler_typed_expr_purity_requirements(value)
 		CompilerTypedStringInterpolationPartsExpr(parts, _, _, _):
-			compiler_typed_interpolation_parts_impure_call_names(parts)
+			compiler_typed_interpolation_parts_purity_requirements(parts)
 		_:
 			[]
+
+
+pure func compiler_typed_expr_impure_call_names(expr: CompilerTypedExpr) -> List[String]:
+	compiler_typed_expr_purity_requirements(
+		expr,
+	).map(
+		func(requirement): requirement.name,
+	)
 
 
 private pure func compiler_append_module_assign_names(
@@ -9164,7 +9247,7 @@ private pure func compiler_call_argument_assignable_context(
 			Some(assignable_context)
 		None:
 			match compiler_elementwise_tensor_element_type(
-				compiler_typed_expr_resolved_call(callee),
+				compiler_direct_callable_resolution(callee),
 				found,
 			):
 				Some(element_type):
@@ -9636,7 +9719,7 @@ private pure func compiler_overload_argument_type(
 
 	lambda_body_is_pure = match typed:
 		CompilerTypedLambdaExpr(False, _, _, body, _, _):
-			compiler_typed_expr_impure_call_names(body).length() == 0
+			compiler_typed_expr_purity_requirements(body).is_empty()
 		_:
 			False
 
@@ -9894,7 +9977,7 @@ private pure func compiler_callee_bound_type_params(
 	context: CompilerInferContext,
 	callee: CompilerTypedExpr,
 ) -> List[CompilerBoundTypeParam]:
-	match compiler_typed_expr_resolved_call(callee):
+	match compiler_direct_callable_resolution(callee):
 		Some(resolved_call):
 			match compiler_resolved_entry_bound_type_params(context, resolved_call):
 				Some(type_params):
@@ -9932,7 +10015,7 @@ private pure func compiler_check_call_trait_bounds_for_params(
 	bound_params: List[CompilerBoundTypeParam],
 	subst: List[CompilerTypeSubstEntry],
 ) -> CompilerInferContext:
-	callee_name = match compiler_typed_expr_resolved_call(callee):
+	callee_name = match compiler_direct_callable_resolution(callee):
 		Some(info):
 			info.callee_name
 		None:
@@ -10693,10 +10776,23 @@ private pure func compiler_infer_call_with_callee_result(
 		compiler_infer_context_with_state(context, callee_result.context.state),
 		compiler_typed_expr_value_type(callee_result.expr),
 	)
-	resolved_call = compiler_typed_expr_resolved_call(callee_result.expr)
+	-- Resolved-call metadata on a call expression describes the call that
+	-- produced its value. It does not identify a subsequently invoked function
+	-- value. Only direct callable references may carry their resolution into
+	-- this call; all other callable values are closure calls.
+	resolved_call: Option[CompilerResolvedCallInfo] = compiler_direct_callable_resolution(
+		callee_result.expr,
+	)
 
 	match callee_type:
 		CompilerFunctionType(is_pure, raw_params, raw_return_type):
+			-- Calls consume the canonical callable type. Keep the source type and
+			-- origin on the callee, but make the typed IR self-contained so later
+			-- invariant checks do not need the alias environment.
+			callable_callee = compiler_typed_expr_with_slot(
+				callee_result.expr,
+				compiler_keep_value_slot(callee_type),
+			)
 			initial_resolved_call = match resolved_call:
 				Some(_):
 					resolved_call
@@ -10705,7 +10801,7 @@ private pure func compiler_infer_call_with_callee_result(
 
 			self_resolution = compiler_resolve_trait_self_call(
 				compiler_infer_context_with_state(context, callee_result.context.state),
-				callee_result.expr,
+				callable_callee,
 				args,
 				is_pure,
 				raw_params,
@@ -13584,7 +13680,7 @@ private pure func compiler_infer_lambda_expr(
 	result_context = compiler_infer_context_with_state(context, outer_state)
 	inferred_pure = (
 		is_pure
-		or expected_pure and compiler_typed_expr_impure_call_names(body_result.expr).length() == 0
+		or expected_pure and compiler_typed_expr_purity_requirements(body_result.expr).is_empty()
 	)
 
 	function_type = CompilerFunctionType(

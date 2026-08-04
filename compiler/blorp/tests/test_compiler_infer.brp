@@ -171,6 +171,7 @@ import:
 		CompilerExprTypeOrigin(CompilerExplicitAnnotationOrigin, CompilerInferredOrigin),
 		CompilerInferResult,
 		CompilerResolvedCallTarget(
+			CompilerResolvedClosureCall,
 			CompilerResolvedDirectCall,
 			CompilerResolvedIntrinsicCall,
 			CompilerResolvedTraitMethodCall,
@@ -213,6 +214,7 @@ import:
 		compiler_typed_expr_info,
 		compiler_typed_expr_list_item_widening,
 		compiler_typed_expr_origin,
+		compiler_typed_expr_purity_requirements,
 		compiler_typed_expr_record_field_widening,
 		compiler_typed_expr_resolved_call,
 		compiler_typed_expr_semantic_type,
@@ -303,6 +305,7 @@ pure func float_expr(text: String) -> ParsedExpr:
 pure func function_decl_expr(name: String, body: ParsedExpr) -> ParsedExpr:
 	ParsedFunctionDeclExpr({
 		name = ident(name),
+		keyword_span = Some(source_span()),
 		type_params = [],
 		params = [],
 		return_type = Some(named_type("Int")),
@@ -622,6 +625,23 @@ pure func state_with_impure_tick_func() -> CompilerTypecheckState:
 			"tick",
 			CompilerFunctionType(True, [compiler_type_int()], compiler_type_int()),
 			CompilerImpure,
+			CompilerUserDefinedFunc,
+		) }
+
+
+pure func state_with_pure_action_factory() -> CompilerTypecheckState:
+	state = compiler_typecheck_state_empty()
+	action_type: CompilerType = CompilerFunctionType(
+		False,
+		[compiler_type_int()],
+		compiler_type_int(),
+	)
+
+	{ state | env = compiler_env_add_func(
+			state.env,
+			"get_action",
+			CompilerFunctionType(True, [], action_type),
+			CompilerPure,
 			CompilerUserDefinedFunc,
 		) }
 
@@ -3364,6 +3384,72 @@ func test_concurrent_and_detach_traversals_include_nested_impure_calls() -> Bool
 	)
 
 
+func test_impure_call_requirements_preserve_callable_identity() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_impure_tick_func()),
+		call_expr(ParsedNameExpr(ident("tick")), [int_expr("1")]),
+	)
+	requirements = compiler_typed_expr_purity_requirements(result.expr)
+
+	match compiler_typed_expr_resolved_call(result.expr):
+		Some(call):
+			match requirements:
+				[requirement]:
+					(
+						result.context.state.errors.length() == 0
+						and requirement.name == "tick"
+						and requirement.callable_id == compiler_resolved_call_callable_id(call)
+						and compiler_typed_expr_impure_call_names(result.expr) == ["tick"]
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_calling_returned_impure_closure_records_closure_requirement() -> Bool:
+	result = compiler_infer_expr(
+		compiler_infer_context(state_with_pure_action_factory()),
+		call_expr(
+			call_expr(ParsedNameExpr(ident("get_action")), []),
+			[int_expr("1")],
+		),
+	)
+	requirements = compiler_typed_expr_purity_requirements(result.expr)
+
+	stale_metadata_rejected: Bool = match result.expr:
+		CompilerTypedCallExpr(callee, args, span, info):
+			stale = CompilerTypedCallExpr(
+				callee,
+				args,
+				span,
+				{ info | resolved_call = compiler_typed_expr_resolved_call(callee) },
+			)
+			compiler_typed_expr_type_error(
+				stale,
+			) == Some("indirect call must have closure resolved-call metadata")
+		_:
+			False
+
+	match (compiler_typed_expr_resolved_call(result.expr), requirements):
+		(Some(call), [requirement]):
+			(
+				result.context.state.errors.length() == 0
+				and compiler_typed_expr_type_error(result.expr) == None
+				and call.purity == CompilerImpure
+				and match call.target:
+					CompilerResolvedClosureCall:
+						True
+					_:
+						False
+				and requirement.name == "<closure>"
+				and requirement.callable_id == None
+				and stale_metadata_rejected
+			)
+		_:
+			False
+
+
 func test_detach_rejects_stream_capture() -> Bool:
 	result = compiler_infer_expr(
 		compiler_infer_context(state_with_stream_source_binding_values()),
@@ -5133,12 +5219,54 @@ func test_direct_call_accepts_function_type_alias_value() -> Bool:
 		call_expr(ParsedNameExpr(ident("parse_int")), [int_expr("1")]),
 	)
 
+	purity_mismatch_rejected: Bool = match result.expr:
+		CompilerTypedCallExpr(callee, args, span, info):
+			mismatched_call = match info.resolved_call:
+				Some(call):
+					Some({ call | purity = CompilerImpure })
+				None:
+					None
+
+			mismatched = CompilerTypedCallExpr(
+				callee,
+				args,
+				span,
+				{ info | resolved_call = mismatched_call },
+			)
+			compiler_typed_expr_type_error(
+				mismatched,
+			) == Some("indirect call resolved-call purity must match callee")
+		_:
+			False
+
+	direct_result = compiler_infer_expr(
+		compiler_infer_context(state_with_add_one_func()),
+		call_expr(ParsedNameExpr(ident("add_one")), [int_expr("1")]),
+	)
+
+	stale_metadata_rejected: Bool = match result.expr:
+		CompilerTypedCallExpr(callee, args, span, info):
+			stale = CompilerTypedCallExpr(
+				callee,
+				args,
+				span,
+				{ info | resolved_call = compiler_typed_expr_resolved_call(direct_result.expr) },
+			)
+			compiler_typed_expr_type_error(
+				stale,
+			) == Some("indirect call must have closure resolved-call metadata")
+		_:
+			False
+
 	(
 		result.context.state.errors.length() == 0
+		and compiler_typed_expr_type_error(result.expr) == None
 		and compiler_types_equal(
 			compiler_typed_expr_semantic_type(result.expr),
 			compiler_type_int(),
 		)
+		and purity_mismatch_rejected
+		and stale_metadata_rejected
 	)
 
 
@@ -5276,16 +5404,13 @@ func test_typed_expr_type_error_rejects_missing_call_metadata() -> Bool:
 		_:
 			result.expr
 
-	result.context.state.errors.length() == 0 and match compiler_typed_expr_type_error(result.expr):
-		None:
-			True
-		Some(_):
-			(
-				False
-				and compiler_typed_expr_type_error(
-					bad_expr,
-				) == Some("call expression missing resolved-call metadata from callee")
-			)
+	(
+		result.context.state.errors.length() == 0
+		and compiler_typed_expr_type_error(result.expr) == None
+		and compiler_typed_expr_type_error(
+			bad_expr,
+		) == Some("call expression missing resolved-call metadata from callee")
+	)
 
 
 func test_qualified_module_call_records_resolved_metadata() -> Bool:
@@ -10844,6 +10969,14 @@ tests: TestSuite = {
 		(
 			"concurrent and detach traversals include nested impure calls",
 			test_concurrent_and_detach_traversals_include_nested_impure_calls,
+		),
+		(
+			"impure call requirements preserve callable identity",
+			test_impure_call_requirements_preserve_callable_identity,
+		),
+		(
+			"calling returned impure closure records closure requirement",
+			test_calling_returned_impure_closure_records_closure_requirement,
 		),
 		("detach rejects stream capture", test_detach_rejects_stream_capture),
 		("detach rejects resource source capture", test_detach_rejects_resource_source_capture),

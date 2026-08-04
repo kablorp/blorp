@@ -95,13 +95,6 @@ type cli_test_options =
       cli_test_compiler_path : string;
     }
 
-type cli_purify_options = {
-  cli_purify_raw_args : string list;
-  cli_purify_dry_run : bool;
-  cli_purify_verbose : bool;
-  cli_purify_paths : string list;
-}
-
 type cli_repl_options = {
   cli_repl_raw_args : string list;
   cli_repl_compiler_path : string;
@@ -134,7 +127,6 @@ type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunSourceCommand
   | CliRunTestOptions of cli_test_options
-  | CliRunPurifyOptions of cli_purify_options
   | CliRunReplOptions of cli_repl_options
   | CliRunLspOptions of cli_lsp_options
   | CliRunPackageOptions of cli_package_options
@@ -931,19 +923,6 @@ let decode_cli_test_options cli_test_raw_args cli_test_compiler_path options =
         ( "invalid_response",
           "unsupported CLI test options kind `" ^ other ^ "`" )
 
-let decode_cli_purify_options cli_purify_raw_args options =
-  let* () = require_options_kind "purify" options in
-  let* cli_purify_dry_run = bool_response_field "dry_run" options in
-  let* cli_purify_verbose = bool_response_field "verbose" options in
-  let* cli_purify_paths = string_array_field "paths" options in
-  Ok
-    {
-      cli_purify_raw_args;
-      cli_purify_dry_run;
-      cli_purify_verbose;
-      cli_purify_paths;
-    }
-
 let cli_run_handled_response_field artifact =
   let* cli_run_status = int_response_field "status" artifact in
   let* cli_run_stdout = string_response_field "stdout" artifact in
@@ -965,17 +944,6 @@ let cli_run_test_response_field artifact =
     decode_cli_test_options cli_test_raw_args cli_test_compiler_path options
   in
   Ok (CliRunTestOptions cli_test_options)
-
-let cli_run_purify_response_field artifact =
-  let* cli_purify_raw_args = string_array_field "args" artifact in
-  let* () =
-    validate_cli_artifact_command "purify" "purify" cli_purify_raw_args
-  in
-  let* options = json_response_field "options" artifact in
-  let* cli_purify_options =
-    decode_cli_purify_options cli_purify_raw_args options
-  in
-  Ok (CliRunPurifyOptions cli_purify_options)
 
 let cli_run_repl_response_field artifact =
   let* cli_repl_raw_args = string_array_field "args" artifact in
@@ -1071,7 +1039,6 @@ let cli_run_response_field response =
   | "frontend_module_graph" -> Ok CliRunSourceCommand
   | "delegate" -> cli_run_delegate_response_field artifact
   | "test" -> cli_run_test_response_field artifact
-  | "purify" -> cli_run_purify_response_field artifact
   | "repl" -> cli_run_repl_response_field artifact
   | "lsp" -> cli_run_lsp_response_field artifact
   | "package" -> cli_run_package_response_field artifact

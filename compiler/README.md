@@ -2,8 +2,9 @@
 
 This directory contains the compiler implementation. Normal `check`,
 `compile`, and `run` commands use the contiguous Blorp-owned frontend, Core
-pipeline, and backend under `compiler/blorp/`. OCaml remains as a private host
-for delegated test, package, REPL, LSP, and purify commands.
+pipeline, and backend under `compiler/blorp/`. Purify also runs entirely in
+Blorp over the typed frontend. OCaml remains as a private host for delegated
+test, package, REPL, and LSP commands.
 
 ## Quick Start
 
