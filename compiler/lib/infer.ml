@@ -2932,7 +2932,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
   match Modules.find_cached module_path with
   | None -> None
   | Some m -> (
-      let arg_head = Codegen_types.type_name_for_impl arg_ty in
+      let arg_head = Types.impl_type_head_name arg_ty in
       match arg_head with
       | None -> None
       | Some arg_type_name -> (
@@ -2995,11 +2995,11 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
                 None
             | Typed_ast.DeclImpl typed_impl
               when not
-                     (Codegen_types.has_type_vars
+                     (Types.has_type_variables
                         (Typed_ast.impl_ast typed_impl).impl_for_type) -> (
                 let impl = Typed_ast.impl_ast typed_impl in
                 match
-                  Codegen_types.type_name_for_impl (qualify impl.impl_for_type)
+                  Types.impl_type_head_name (qualify impl.impl_for_type)
                 with
                 | Some impl_type_name when impl_type_name = arg_type_name ->
                     List.find_map
@@ -3021,7 +3021,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
             | DPrivate _ -> None (* private impls don't export *)
             | DImpl impl when List.mem impl.impl_trait private_traits -> None
             | DImpl impl
-              when not (Codegen_types.has_type_vars impl.impl_for_type) -> (
+              when not (Types.has_type_variables impl.impl_for_type) -> (
                 (* Only non-generic impls. Generic impls (e.g.
                     [implements HasLength for Dict[K, V]:]) route through
                     the existing monomorphization path — their method
@@ -3029,7 +3029,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
                     call site, which this simple lookup can't provide
                     correctly. *)
                 match
-                  Codegen_types.type_name_for_impl (qualify impl.impl_for_type)
+                  Types.impl_type_head_name (qualify impl.impl_for_type)
                 with
                 | Some impl_type_name when impl_type_name = arg_type_name ->
                     (* Find the named method on this impl. *)
@@ -8047,7 +8047,7 @@ and infer_type_name ctx expr args loc =
       let runtime_ty =
         Types.instantiate_type_params ctx.rigid_type_params arg_ty
       in
-      if Codegen_types.has_type_vars runtime_ty then
+      if Types.has_type_variables runtime_ty then
         (* Defer: leave as a real call. Blorp Core specialization folds it
            post-mono when [arg_ty] is concrete for each monomorphized copy. *)
         let callee_ty = ty_func [ arg_ty ] ty_string ~pure:true in
@@ -8076,7 +8076,7 @@ and infer_is_heap ctx expr args loc =
       let runtime_ty =
         Types.instantiate_type_params ctx.rigid_type_params arg_ty
       in
-      if Codegen_types.has_type_vars runtime_ty then
+      if Types.has_type_variables runtime_ty then
         let callee_ty = ty_func [ arg_ty ] ty_bool ~pure:true in
         let callee' =
           match expr.expr_desc with
@@ -10017,9 +10017,8 @@ and infer_call ctx expr callee args loc =
                                 let is_ew =
                                   match callee_name with
                                   | Some n ->
-                                      List.mem n
-                                        Codegen_builtins
-                                        .elementwise_tensor_functions
+                                      Builtin_metadata
+                                      .is_elementwise_tensor_function n
                                   | None -> false
                                 in
                                 is_ew
@@ -10297,8 +10296,7 @@ and infer_call ctx expr callee args loc =
             let instantiated_return =
               let is_elementwise_math =
                 match callee_name with
-                | Some n ->
-                    List.mem n Codegen_builtins.elementwise_tensor_functions
+                | Some n -> Builtin_metadata.is_elementwise_tensor_function n
                 | None -> false
               in
               if is_elementwise_math && List.length arg_types = 1 then

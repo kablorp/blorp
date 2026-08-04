@@ -278,3 +278,7 @@ let is_parallel_boundary name = has_effect name Parallel_boundary
 
 let special_inference name =
   match find name with Some d -> d.special_inference | None -> None
+
+let is_elementwise_tensor_function = function
+  | "sqrt" | "abs" | "exp" | "log" -> true
+  | _ -> false

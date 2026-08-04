@@ -57,11 +57,11 @@ let require_contains label content needle =
 let std_source_path_for_module module_path = module_path ^ ".brp"
 
 let source_module_path = function
-  | StdDns -> Blorp.Codegen_names.mod_dns
-  | StdTcp -> Blorp.Codegen_names.mod_tcp
-  | StdTls -> Blorp.Codegen_names.mod_tls
-  | StdUdp -> Blorp.Codegen_names.mod_udp
-  | StdWebSocket -> Blorp.Codegen_names.mod_websocket
+  | StdDns -> "std/net/dns"
+  | StdTcp -> "std/net/tcp"
+  | StdTls -> "std/net/tls"
+  | StdUdp -> "std/net/udp"
+  | StdWebSocket -> "std/net/websocket"
   | StdFs -> "std/fs"
 
 let std_source_decls_cache : (string, Blorp.Ast.program) Hashtbl.t =
@@ -1189,7 +1189,12 @@ let test_fallible_stream_sources_are_manifested () =
        fallible_stream_sources);
   List.iter
     (fun (name, error_domain, arguments) ->
-      match find_fallible_stream_source name with
+      match
+        List.find_opt
+          (fun (source : fallible_stream_source) ->
+            source.builtin_name = name)
+          fallible_stream_sources
+      with
       | None -> Alcotest.failf "missing fallible stream source %s" name
       | Some source ->
           Alcotest.(check string)
@@ -1231,7 +1236,12 @@ let test_fallible_stream_terminals_are_manifested () =
        fallible_stream_terminals);
   List.iter
     (fun (name, result_c_type, payload, arguments, void_boxed_args) ->
-      match find_fallible_stream_terminal name with
+      match
+        List.find_opt
+          (fun (terminal : fallible_stream_terminal) ->
+            terminal.builtin_name = name)
+          fallible_stream_terminals
+      with
       | None -> Alcotest.failf "missing fallible stream terminal %s" name
       | Some terminal ->
           Alcotest.(check string)

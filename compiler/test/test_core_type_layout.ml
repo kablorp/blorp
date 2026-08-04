@@ -264,19 +264,6 @@ let test_builtin_retain_capability_tracks_arc_layout () =
   expect_retain "String retain" true (meta ()) (ty "String" []);
   expect_retain "Int retain" false (meta ()) (ty "Int" [])
 
-let test_registry_managed_type_requires_destructor_policy () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  let open Blorp.Codegen_types in
-  Blorp.Codegen_types.register_managed_type reg "Widget"
-    { managed_kind = ManagedHeapRecord; destructor = ArcReleaseOnly };
-  Alcotest.(check bool)
-    "Widget is managed" true
-    (Blorp.Codegen_types.is_managed_type reg "Widget");
-  match Blorp.Codegen_types.managed_type_info reg "Widget" with
-  | Some { managed_kind = ManagedHeapRecord; destructor = ArcReleaseOnly } -> ()
-  | Some _ -> Alcotest.fail "Widget had the wrong managed type policy"
-  | None -> Alcotest.fail "Widget was not registered"
-
 let test_unknown_named_type_remains_invalid_layout () =
   let expect_unknown name =
     match Blorp.Core_type_layout.classify (meta ()) (ty name []) with
@@ -323,8 +310,6 @@ let suite =
           test_alias_inherits_release_capability;
         Alcotest.test_case "builtin retain capability tracks ARC layout" `Quick
           test_builtin_retain_capability_tracks_arc_layout;
-        Alcotest.test_case "registry managed type requires destructor policy"
-          `Quick test_registry_managed_type_requires_destructor_policy;
         Alcotest.test_case "unknown named type remains invalid layout" `Quick
           test_unknown_named_type_remains_invalid_layout;
       ] );

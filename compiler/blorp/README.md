@@ -77,11 +77,6 @@ frontend cleanup should retire parser-adjacent OCaml transforms, expand focused
 fixture coverage for current syntax, and keep parser/source-AST ownership
 contiguous with the CLI source-graph frontier.
 
-`compiler_diagnostic.brp` is the general pure diagnostic renderer for the
-Blorp-owned compiler substrate. It renders Rust-style source diagnostics from
-explicit source text rather than reading files during formatting, so later
-typecheck and environment slices can keep error rendering deterministic and
-phase-local.
 `compiler_type.brp` is the first semantic type substrate: it mirrors the
 current OCaml type constructors for named, array/tensor, function, tuple,
 dimension, range, `Self`, and inference-meta forms, and provides pure display,
@@ -112,10 +107,6 @@ returning a sorted unique list.
 trait references, bounded type parameters, parser-source spelling, and param
 name extraction. Later Env/typecheck slices should use this representation
 instead of encoding bounds in raw strings.
-`compiler_type_metadata.brp` ports type-policy facts used by typecheck and Core
-resolution: recursion storage, primitive module homes, struct scalar eligibility,
-native operator fast paths, builtin to-string fallbacks, and constructor-space
-classification.
 `compiler_env.brp` ports the explicit frontend environment substrate as a pure
 value: lexical scopes, symbols, aliases, type/record/constructor lookup,
 trait functions, trait defs, impls, overloads, UFCS methods, resource policies,

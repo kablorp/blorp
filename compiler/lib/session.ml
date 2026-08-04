@@ -274,14 +274,6 @@ let create () : t =
     meta_env = Hashtbl.create 64;
   }
 
-(** Ensure the next generated definition id is at least [floor]. Source
-    definition ids can arrive from serialized Core rather than this process's
-    counter. The semantic-worker boundary reserves their range before running
-    passes that may mint generated definitions. *)
-let reserve_def_id_floor (s : t) (floor : int) : unit =
-  if floor < 0 then invalid_arg "Session.reserve_def_id_floor: negative floor";
-  if s.def_id_counter < floor then s.def_id_counter <- floor
-
 (** Mint a fresh [def_id] from the session counter. Monotonic within
     a session; a new session starts from 0. See [Env_types.def_id]. *)
 let mint_def_id (s : t) : Env_types.def_id =

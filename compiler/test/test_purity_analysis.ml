@@ -120,6 +120,17 @@ let test_assumed_callable_id_overrides_resolved_call () =
       in
       check_int "no impure calls" 0 (List.length refs))
 
+let test_parse_ufcs_name_decodes_module_path () =
+  Alcotest.(check (option (pair string string)))
+    "ufcs name"
+    (Some ("std/list", "get"))
+    (Blorp.Call_resolution.parse_ufcs_name "__ufcs_std$list__get")
+
+let test_parse_ufcs_name_rejects_non_ufcs_name () =
+  Alcotest.(check (option (pair string string)))
+    "non ufcs name" None
+    (Blorp.Call_resolution.parse_ufcs_name "__def_1_std_list_get")
+
 let suite =
   [
     ( "resolved calls",
@@ -132,5 +143,12 @@ let suite =
           `Quick test_prefer_env_purity_does_not_override_resolved_call;
         Alcotest.test_case "assumed callable id overrides resolved call" `Quick
           test_assumed_callable_id_overrides_resolved_call;
+      ] );
+    ( "UFCS names",
+      [
+        Alcotest.test_case "decodes module path" `Quick
+          test_parse_ufcs_name_decodes_module_path;
+        Alcotest.test_case "rejects non-UFCS name" `Quick
+          test_parse_ufcs_name_rejects_non_ufcs_name;
       ] );
   ]

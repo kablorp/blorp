@@ -111,17 +111,6 @@ let simple_type name = named_type [ name ]
 let list_type elem = NamedType ([ "List" ], [ elem ])
 let option_type elem = NamedType ([ "Option" ], [ elem ])
 
-let rec accepted_type_shape_matches shape ty =
-  match (shape, ty) with
-  | NamedType (names, expected_args), Ast.TyNamed (name, actual_args) ->
-      List.mem name names
-      && List.length expected_args = List.length actual_args
-      && List.for_all2 accepted_type_shape_matches expected_args actual_args
-  | _ -> false
-
-let success_payload_accepts_type payload ty =
-  accepted_type_shape_matches payload.accepted_type ty
-
 let tcp_error_mapping =
   {
     accepted_type_names =
@@ -905,12 +894,6 @@ let fallible_stream_sources =
       [ ArgBorrow; ArgBorrow ];
   ]
 
-let find_fallible_stream_source builtin_name =
-  List.find_opt
-    (fun (source : fallible_stream_source) ->
-      source.builtin_name = builtin_name)
-    fallible_stream_sources
-
 let fallible_stream_find_terminal_names =
   [
     "blorp_fallible_stream_find_raw";
@@ -958,12 +941,6 @@ let fallible_stream_terminals =
         "blorp_fallible_stream_all_raw" "blorp_FallibleStreamBoolResult"
         StreamPayloadBool [ ArgBorrow; ArgBorrow ];
     ]
-
-let find_fallible_stream_terminal builtin_name =
-  List.find_opt
-    (fun (terminal : fallible_stream_terminal) ->
-      terminal.builtin_name = builtin_name)
-    fallible_stream_terminals
 
 let resource_result_policy builtin_name =
   find_result_bridge builtin_name

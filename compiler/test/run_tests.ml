@@ -89,8 +89,6 @@ let default_suites =
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
   @ suite_group "DoctestRemap" Test_doctest_remap.suite
-  @ suite_group "CodegenTypes" Test_codegen_types.suite
-  @ suite_group "CodegenNames" Test_codegen_names.suite
 
 let deep_suites =
   (* These suites cross larger compiler boundaries: process/session state, LSP,

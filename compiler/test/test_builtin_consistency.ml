@@ -1,206 +1,5 @@
-(** Consistency checks between [Codegen_builtins.builtin_c_mapping] and
-    [Env_builtins.with_builtins].
-
-    These two registries answer different questions — codegen's table maps
-    [(module_path, name)] to emitted C symbol; env's registrations say
-    which names typecheck can see (as builtin functions or trait methods).
-    They must agree on at least the set of names, or we get silent drift:
-
-    - If a name is in codegen but not in env: typecheck errors with
-      "Undefined identifier" even though the call would work post-codegen.
-      This is what the [is_genuine_type_error] filter used to paper over;
-      removing it exposed asin/acos/cbrt as trait-method gaps.
-    - If a name is in env but not in codegen: typecheck accepts the call,
-      then codegen emits an unresolved symbol → C linker error.
-
-    Scope: prelude-accessible entries ([module_path = ""]) only. Module-
-    scoped entries ([module_path = "std/list"], etc.) are validated by the
-    module loader against each module's own .brp signature file. *)
-
-(** Names registered in codegen without an env counterpart.
-
-    This list reflects the CURRENT state of drift. It's a visible TODO
-    queue — the ideal is an empty list. Each group below has a disposition:
-
-    - {b Should be registered in env as a trait method}: math functions that
-      belong on [FloatingPoint] (mirroring [sin]/[cos]) but haven't been
-      lifted yet.
-
-    - {b Should be removed from codegen prelude}: module-scoped functions
-      that shouldn't be prelude-accessible per [std/prelude.brp]. The
-      [("", name)] codegen entries are unreachable after the
-      [is_genuine_type_error] filter removal — typecheck rejects the call
-      before codegen sees it. Cleanup is safe but mechanical.
-
-    - {b Pending type-level design}: a few codegen-only helpers whose blorp
-      signature is ambiguous (e.g. polymorphic on dim types).
-
-    When fixing: register in env_builtins or remove from codegen_builtins,
-    then remove from this list. *)
-let codegen_only_prelude_names =
-  [
-    (* --- Float constant builtins — these are [private pure func] with
-     [builtin] bodies in std/float.brp, backing the exported [INFINITY],
-     [NEG_INFINITY], and [NAN] constant initializers. They're called
-     unqualified during std/float.brp's top-level evaluation; the codegen
-     prelude entry resolves the bare name. Not true drift — the private-
-     function convention is how blorp currently implements module-scoped
-     builtin primitives. --- *)
-    "infinity";
-    "nan_value";
-    "neg_infinity";
-  ]
-
-let exception_set =
-  lazy
-    (let s = Hashtbl.create (List.length codegen_only_prelude_names) in
-     List.iter (fun n -> Hashtbl.replace s n ()) codegen_only_prelude_names;
-     s)
-
-(** Is [name] visible to typecheck via [env]? *)
-let is_env_visible (env : Blorp.Env.env) (name : string) : bool =
-  Option.is_some (Blorp.Env.get_func_info env name)
-  || Option.is_some (Blorp.Env.get_function_trait env name)
-
-(** Every prelude-accessible codegen entry must either be env-visible or
-    listed in [codegen_only_prelude_names]. New drift will surface here;
-    clear the drift by registering in env_builtins (or removing from
-    the prelude portion of codegen's builtin map) and deleting the exception. *)
-let test_prelude_entries_registered () =
-  let sess = Blorp.Session.create () in
-  Blorp.Session.with_current sess (fun () ->
-      let env = Blorp.Env_builtins.with_builtins (Blorp.Env.empty ()) in
-      let exceptions = Lazy.force exception_set in
-      let drift =
-        List.filter_map
-          (fun ((mod_path, name), _c_name) ->
-            if mod_path <> "" then None
-            else if is_env_visible env name then None
-            else if Hashtbl.mem exceptions name then None
-            else Some name)
-          Blorp.Codegen_builtins.builtin_c_mapping
-        |> List.sort_uniq String.compare
-      in
-      if drift <> [] then
-        Alcotest.failf
-          "New prelude-accessible codegen-builtin names missing from \
-           env_builtins:\n\
-          \  %s\n\n\
-           Fix by either:\n\
-          \  (a) Register in env_builtins.ml (add_func or add_trait_function)\n\
-          \  (b) Remove the prelude entry from codegen_builtins.ml if the name \
-           shouldn't be prelude\n\
-          \  (c) Add to codegen_only_prelude_names in this file with a \
-           category comment"
-          (String.concat "\n  " drift))
-
-(** Keep the exception list honest: every entry must still appear in
-    codegen. A removed codegen entry whose exception lingers is a cleanup
-    that should happen now, not a "might be needed someday". *)
-let test_exception_list_not_stale () =
-  let codegen_names =
-    List.filter_map
-      (fun ((mod_path, name), _) -> if mod_path = "" then Some name else None)
-      Blorp.Codegen_builtins.builtin_c_mapping
-    |> List.sort_uniq String.compare
-  in
-  let codegen_set = Hashtbl.create (List.length codegen_names) in
-  List.iter (fun n -> Hashtbl.replace codegen_set n ()) codegen_names;
-  let stale =
-    List.filter
-      (fun name -> not (Hashtbl.mem codegen_set name))
-      codegen_only_prelude_names
-    |> List.sort_uniq String.compare
-  in
-  if stale <> [] then
-    Alcotest.failf
-      "Stale entries in codegen_only_prelude_names — no longer in codegen:\n\
-      \  %s\n\n\
-       Remove these from the exception list."
-      (String.concat "\n  " stale)
-
-let test_list_ir_functions_not_shadowed_by_codegen_builtins () =
-  let ir_functions =
-    [
-      "all";
-      "any";
-      "count";
-      "drop_while";
-      "filter";
-      "filter_map";
-      "find";
-      "find_index";
-      "flat_map";
-      "fold_left";
-      "fold_right";
-      "for_each";
-      "get_or";
-      "map";
-      "map_indexed";
-      "max_by";
-      "min_by";
-      "partition";
-      "scan";
-      "set";
-      "sort";
-      "sort_by";
-      "sort_desc_by";
-      "take_while";
-      "zip_with";
-    ]
-  in
-  let shadowed =
-    List.filter
-      (fun name ->
-        Option.is_some (Blorp.Codegen_builtins.lookup "std/list" name))
-      ir_functions
-  in
-  if shadowed <> [] then
-    Alcotest.failf
-      "List functions with synthesized IR bodies should resolve through \
-       std/list source functions, not Codegen_builtins:\n\
-      \  %s"
-      (String.concat "\n  " shadowed)
-
-let test_builtin_lookup_uses_exact_module_paths () =
-  Alcotest.(check (option string))
-    "registered raylib alias resolves" (Some "blorp_raylib_init_window")
-    (Blorp.Codegen_builtins.lookup "../games/raylib" "init_window");
-  Alcotest.(check (option string))
-    "arbitrary basename match does not resolve" None
-    (Blorp.Codegen_builtins.lookup "/tmp/not-a-blorp-module/raylib"
-       "init_window")
-
-let test_vector_minmax_lookup_preserves_type_dispatch () =
-  List.iter
-    (fun (name, expected) ->
-      Alcotest.(check (option string))
-        ("std/vector " ^ name) (Some expected)
-        (Blorp.Codegen_builtins.lookup "std/vector" name))
-    [ ("max", "blorp_max"); ("min", "blorp_min") ]
-
-let test_channel_builtins_have_matching_prelude_and_module_entries () =
-  List.iter
-    (fun (name, expected) ->
-      Alcotest.(check (option string))
-        ("prelude " ^ name) (Some expected)
-        (Blorp.Codegen_builtins.lookup "" name);
-      Alcotest.(check (option string))
-        ("std/channel " ^ name) (Some expected)
-        (Blorp.Codegen_builtins.lookup "std/channel" name))
-    [
-      ("sleep", "blorp_sleep");
-      ("yield_now", "blorp_yield_now");
-      ("max_threads", "blorp_max_threads");
-      ("channel", "blorp_channel_new");
-      ("send", "blorp_channel_send");
-      ("recv", "blorp_channel_recv");
-      ("try_send", "blorp_channel_try_send");
-      ("try_recv", "blorp_channel_try_recv");
-      ("recv_timeout", "blorp_channel_recv_timeout");
-      ("send_timeout", "blorp_channel_send_timeout");
-      ("seal", "blorp_channel_seal");
-    ]
+(** Consistency checks for compiler-visible builtin metadata and the runtime C
+    ABI still consumed by the OCaml-hosted tools. *)
 
 let test_builtin_effect_metadata_classifies_typechecker_sets () =
   let open Blorp.Builtin_metadata in
@@ -1441,301 +1240,6 @@ let test_sized_integer_conversions_have_runtime_c_abi () =
         (contains_substring runtime signature))
     conversions
 
-type runtime_definition_check = Check_runtime_definition | Decl_only
-
-type optimized_option_abi_case = {
-  symbol : string;
-  return_ty : Blorp.Ast.type_expr;
-  params : string;
-  runtime_return_override : string option;
-  definition_check : runtime_definition_check;
-}
-
-let ty name = Blorp.Ast.TyNamed (name, [])
-let option_ty payload = Blorp.Ast.TyNamed ("Option", [ payload ])
-
-let tensor_ty elem dims =
-  Blorp.Ast.TyArray (elem, List.map (fun n -> Blorp.Ast.TyConstInt n) dims)
-
-let variadic_tensor_ty elem =
-  Blorp.Ast.TyArray (elem, [ Blorp.Ast.TyVarDims "Ds" ])
-
-let primitive_option_payloads =
-  [
-    (ty "Int", "int");
-    (ty "Int8", "int8");
-    (ty "Int16", "int16");
-    (ty "Int32", "int32");
-    (ty "Int64", "int64");
-    (ty "UInt8", "uint8");
-    (ty "UInt16", "uint16");
-    (ty "UInt32", "uint32");
-    (ty "UInt64", "uint64");
-    (ty "Float", "float");
-    (ty "Bool", "bool");
-    (ty "Char", "char");
-    (ty "Float32", "f32");
-    (ty "Float16", "f16");
-  ]
-
-let primitive_option_family_cases prefix params =
-  List.map
-    (fun (payload_ty, suffix) ->
-      {
-        symbol = prefix ^ suffix;
-        return_ty = option_ty payload_ty;
-        params;
-        runtime_return_override = None;
-        definition_check = Decl_only;
-      })
-    primitive_option_payloads
-
-let direct_optimized_option_abi_cases =
-  [
-    {
-      symbol = "blorp_option_div_int";
-      return_ty = option_ty (ty "Int");
-      params = "long a, long b";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_option_mod_int";
-      return_ty = option_ty (ty "Int");
-      params = "long a, long b";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_assert_shape";
-      return_ty = option_ty (variadic_tensor_ty (Blorp.Ast.TyVar "T"));
-      params = "blorp_Vector* tensor, long expected_len";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_string_get_opt";
-      return_ty = option_ty (ty "Char");
-      params = "const blorp_String* s, long index";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_parse_int";
-      return_ty = option_ty (ty "Int");
-      params = "blorp_String* s";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_parse_float";
-      return_ty = option_ty (ty "Float");
-      params = "blorp_String* s";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_bytes_from_hex";
-      return_ty = option_ty (ty "Bytes");
-      params = "const blorp_String* s";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_base64_decode";
-      return_ty = option_ty (ty "String");
-      params = "const blorp_String* s";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_time_parse";
-      return_ty = option_ty (ty "Int");
-      params = "const blorp_String* s, const blorp_String* fmt";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_time_from_iso";
-      return_ty = option_ty (ty "Int");
-      params = "const blorp_String* s";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_getenv";
-      return_ty = option_ty (ty "String");
-      params = "const blorp_String* name";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_read_line";
-      return_ty = option_ty (ty "String");
-      params = "void";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-    {
-      symbol = "blorp_input";
-      return_ty = option_ty (ty "String");
-      params = "blorp_String* prompt";
-      runtime_return_override = None;
-      definition_check = Check_runtime_definition;
-    };
-  ]
-
-let specialized_optimized_option_abi_cases =
-  primitive_option_family_cases "blorp_vector_get_opt_"
-    "blorp_Vector* arr, long index"
-  @ primitive_option_family_cases "blorp_matrix_get_opt_"
-      "blorp_Vector* arr, long row, long col"
-  @ primitive_option_family_cases "blorp_dict_get_"
-      "blorp_Dict* dict, void* key"
-  @ primitive_option_family_cases "blorp_channel_recv_" "void* c"
-  @ primitive_option_family_cases "blorp_channel_try_recv_" "void* c"
-  @ primitive_option_family_cases "blorp_channel_recv_timeout_"
-      "void* c, long timeout_ms"
-  @ primitive_option_family_cases "blorp_stream_find_"
-      "blorp_Stream* stream, blorp_Closure* pred"
-  @ [
-      {
-        symbol = "blorp_vector_get_nullable";
-        return_ty = option_ty (ty "String");
-        params = "blorp_Vector* arr, long index";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_matrix_get_nullable";
-        return_ty = option_ty (ty "String");
-        params = "blorp_Vector* arr, long row, long col";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_vector_set_cow_nullable";
-        return_ty = option_ty (tensor_ty (ty "String") [ 4 ]);
-        params = "blorp_Vector* arr, long index, void* value";
-        runtime_return_override = None;
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_vector_set_cow_nullable_f32";
-        return_ty = option_ty (tensor_ty (ty "Float32") [ 4 ]);
-        params = "blorp_Vector* arr, long index, float value";
-        runtime_return_override = None;
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_dict_get_nullable";
-        return_ty = option_ty (ty "String");
-        params = "blorp_Dict* dict, void* key";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_channel_recv_nullable";
-        return_ty = option_ty (ty "String");
-        params = "void* c";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_channel_try_recv_nullable";
-        return_ty = option_ty (ty "String");
-        params = "void* c";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_channel_recv_timeout_nullable";
-        return_ty = option_ty (ty "String");
-        params = "void* c, long timeout_ms";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-      {
-        symbol = "blorp_stream_find_nullable";
-        return_ty = option_ty (ty "String");
-        params = "blorp_Stream* stream, blorp_Closure* pred";
-        runtime_return_override = Some "void*";
-        definition_check = Decl_only;
-      };
-    ]
-
-let optimized_option_abi_cases =
-  direct_optimized_option_abi_cases @ specialized_optimized_option_abi_cases
-
-let optimized_option_policy_c_return reg meta ty =
-  match Blorp.Codegen_types.stack_option_c_type ~reg ty with
-  | Some _ as c_ty -> c_ty
-  | None -> (
-      match Blorp.Codegen_types.expand_alias ~reg ty with
-      | Blorp.Ast.TyNamed ("Option", [ payload ]) -> (
-          match payload with
-          | Blorp.Ast.TyNamed ("Option", _)
-          | Blorp.Ast.TyVar _
-          | Blorp.Ast.TyBoundVar _
-          | Blorp.Ast.TySelf ->
-              None
-          | payload when Blorp.Core_type_layout.is_stack_result_type meta payload
-            ->
-              None
-          | payload -> (
-              match Blorp.Core_type_layout.classify meta payload with
-              | Known { ownership = Managed; _ } ->
-                  Some (Blorp.Codegen_types.type_to_c ~reg payload)
-              | Known { ownership = Unmanaged; _ }
-              | Unknown_named _
-              | Invalid_value_type _ ->
-                  None))
-      | _ -> None)
-
-let test_optimized_option_policy_boundaries () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.type_aliases "Count" ([], ty "Int");
-  Hashtbl.replace reg.type_aliases "MaybeCount"
-    ([], option_ty (ty "Count"));
-  Blorp.Codegen_types.register_managed_type reg "Widget"
-    {
-      managed_kind = Blorp.Codegen_types.ManagedHeapRecord;
-      destructor = Blorp.Codegen_types.ArcReleaseOnly;
-    };
-  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
-  let check name expected ty =
-    Alcotest.(check (option string))
-      name expected (optimized_option_policy_c_return reg meta ty)
-  in
-  check "primitive Option" (Some "blorp_StackOption_Int")
-    (option_ty (ty "Int"));
-  check "aliased primitive Option" (Some "blorp_StackOption_Int")
-    (ty "MaybeCount");
-  check "managed builtin Option" (Some "blorp_String*")
-    (option_ty (ty "String"));
-  check "managed custom Option" (Some "Widget*")
-    (option_ty (ty "Widget"));
-  check "nested Option remains boxed" None
-    (option_ty (option_ty (ty "String")));
-  check "stack Result payload remains boxed" None
-    (option_ty (Blorp.Ast.TyNamed ("Result", [ ty "Int"; ty "Bool" ])));
-  check "unsafe pointer payload remains boxed" None (option_ty (ty "Ptr"));
-  check "generic payload remains boxed" None
-    (option_ty (Blorp.Ast.TyVar "T"));
-  check "unknown payload is not classified" None
-    (option_ty (ty "UnknownPayload"))
-
-let runtime_return_for_case reg meta case =
-  let policy_return =
-    match optimized_option_policy_c_return reg meta case.return_ty with
-    | Some c_ty -> c_ty
-    | None ->
-        Alcotest.failf "%s does not use an optimized Option ABI" case.symbol
-  in
-  match case.runtime_return_override with
-  | Some c_ty -> c_ty
-  | None -> policy_return
-
 let all_std_blorp_files () =
   let rec collect dir =
     Sys.readdir dir |> Array.to_list |> List.sort String.compare
@@ -1751,15 +1255,6 @@ type std_parse_item = {
   std_parse_path : string;
   std_parse_module_name : string;
   std_parse_source : string;
-}
-
-type direct_runtime_option_return =
-  string * string * string * string
-  (** source path, source function name, runtime symbol, expected C return type *)
-
-type std_source_inventory = {
-  declared_type_names : (string, unit) Hashtbl.t;
-  direct_runtime_option_returns : direct_runtime_option_return list;
 }
 
 let std_module_name_for_path path =
@@ -1826,46 +1321,22 @@ let parse_std_inventory_sources items =
                 rendered)
         items responses
 
-let build_std_source_inventory () =
+let build_std_declared_type_names () =
   let names = Hashtbl.create 64 in
-  let reg = Blorp.Codegen_types.create_registry () in
-  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
-  let direct_option_returns = ref [] in
-  let rec record_decl path ~public decl =
+  let rec record_decl decl =
     match (decl : Blorp.Ast.decl).decl_desc with
     | DType t -> Hashtbl.replace names t.type_name ()
     | DRecord r -> Hashtbl.replace names r.record_name ()
     | DTypeAlias a -> Hashtbl.replace names a.alias_name ()
-    | DFunc
-        {
-          func_name = Some func_name;
-          func_return_type = Some return_ty;
-          func_body = FuncBuiltinBody (BuiltinRuntimeHelper symbol, _);
-          _;
-        }
-      when public -> (
-        match optimized_option_policy_c_return reg meta return_ty with
-        | Some expected_c_return ->
-            direct_option_returns :=
-              (path, func_name, symbol, expected_c_return)
-              :: !direct_option_returns
-        | None -> ())
-    | DPrivate inner -> record_decl path ~public:false inner
+    | DPrivate inner -> record_decl inner
     | _ -> ()
   in
   all_std_blorp_files () |> List.map std_parse_item
   |> parse_std_inventory_sources
-  |> List.iter (fun (path, decls) ->
-      List.iter (record_decl path ~public:true) decls);
-  {
-    declared_type_names = names;
-    direct_runtime_option_returns = List.rev !direct_option_returns;
-  }
+  |> List.iter (fun (_path, decls) -> List.iter record_decl decls);
+  names
 
-let std_source_inventory = lazy (build_std_source_inventory ())
-
-let std_declared_type_names () =
-  (Lazy.force std_source_inventory).declared_type_names
+let std_declared_type_names = lazy (build_std_declared_type_names ())
 
 let test_public_abi_types_have_std_anchors () =
   (* LiteralString is intentionally omitted: it is a compile-time refinement
@@ -1910,7 +1381,7 @@ let test_public_abi_types_have_std_anchors () =
       "Void";
     ]
   in
-  let declared = std_declared_type_names () in
+  let declared = Lazy.force std_declared_type_names in
   let missing =
     List.filter (fun name -> not (Hashtbl.mem declared name)) required
   in
@@ -1918,70 +1389,10 @@ let test_public_abi_types_have_std_anchors () =
     Alcotest.failf "Public ABI types must have source anchors in std/:\n  %s"
       (String.concat "\n  " missing)
 
-let direct_runtime_option_returns_in_std () =
-  (Lazy.force std_source_inventory).direct_runtime_option_returns
-
-let test_optimized_option_runtime_builtins_have_matching_c_abi () =
-  let runtime_decl =
-    read_first_existing
-      [
-        "compiler/lib/runtime_decl.c";
-        "../lib/runtime_decl.c";
-        "lib/runtime_decl.c";
-      ]
-  in
-  let runtime =
-    read_first_existing
-      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
-  in
-  let reg = Blorp.Codegen_types.create_registry () in
-  let meta = Blorp.Core_type_layout.metadata_for_registry reg in
-  let known_symbols =
-    optimized_option_abi_cases
-    |> List.map (fun case -> case.symbol)
-    |> List.sort_uniq String.compare
-  in
-  let missing_direct_cases =
-    direct_runtime_option_returns_in_std ()
-    |> List.filter (fun (_path, _func_name, symbol, _expected_c_return) ->
-        not (List.mem symbol known_symbols))
-  in
-  if missing_direct_cases <> [] then
-    Alcotest.failf
-      "Direct stdlib runtime builtins returning optimized Option need explicit \
-       ABI cases:\n\
-      \  %s"
-      (missing_direct_cases
-      |> List.map (fun (path, func_name, symbol, expected_c_return) ->
-          Printf.sprintf "%s:%s -> %s (%s)" path func_name symbol
-            expected_c_return)
-      |> String.concat "\n  ");
-  List.iter
-    (fun case ->
-      let return_c_ty = runtime_return_for_case reg meta case in
-      let signature =
-        Printf.sprintf "%s %s(%s)" return_c_ty case.symbol case.params
-      in
-      Alcotest.(check bool)
-        ("runtime_decl " ^ case.symbol)
-        true
-        (contains_substring runtime_decl (signature ^ ";"));
-      match case.definition_check with
-      | Check_runtime_definition ->
-          Alcotest.(check bool)
-            ("runtime " ^ case.symbol) true
-            (contains_substring runtime signature)
-      | Decl_only -> ())
-    optimized_option_abi_cases
-
 let suite =
   [
-    ( "prelude_entries",
+    ( "metadata_and_runtime_abi",
       [
-        Alcotest.test_case "all prelude codegen entries are env-visible" `Quick
-          test_prelude_entries_registered;
-        Alcotest.test_case "exception list not stale" `Quick
-          test_exception_list_not_stale;
         Alcotest.test_case "builtin effect metadata classifies typechecker sets"
           `Quick test_builtin_effect_metadata_classifies_typechecker_sets;
         Alcotest.test_case "type metadata classifies typechecker policy" `Quick
@@ -1990,16 +1401,6 @@ let suite =
           `Quick test_builtin_metadata_classifies_special_inference;
         Alcotest.test_case "builtin metadata registry integrity" `Quick
           test_builtin_metadata_registry_integrity;
-        Alcotest.test_case
-          "list IR functions are not shadowed by codegen builtins" `Quick
-          test_list_ir_functions_not_shadowed_by_codegen_builtins;
-        Alcotest.test_case "builtin lookup uses exact module paths" `Quick
-          test_builtin_lookup_uses_exact_module_paths;
-        Alcotest.test_case "vector minmax lookup preserves type dispatch"
-          `Quick test_vector_minmax_lookup_preserves_type_dispatch;
-        Alcotest.test_case
-          "channel builtins have matching prelude and module entries" `Quick
-          test_channel_builtins_have_matching_prelude_and_module_entries;
         Alcotest.test_case "list IR HOFs have no runtime C ABI" `Quick
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick
@@ -2048,10 +1449,5 @@ let suite =
           test_wide_integer_boxes_are_arc_managed;
         Alcotest.test_case "sized integer conversions have runtime C ABI" `Quick
           test_sized_integer_conversions_have_runtime_c_abi;
-        Alcotest.test_case
-          "optimized Option runtime builtins have matching C ABI" `Quick
-          test_optimized_option_runtime_builtins_have_matching_c_abi;
-        Alcotest.test_case "optimized Option policy boundaries" `Quick
-          test_optimized_option_policy_boundaries;
       ] );
   ]

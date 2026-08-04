@@ -421,11 +421,6 @@ let test_integer_type_checks () =
   check_true "UInt8 is unsigned" (is_unsigned_integer_type ty_uint8);
   check_false "Int is not unsigned" (is_unsigned_integer_type ty_int)
 
-let test_int_type_to_c () =
-  check_string "Int -> long" "long" (int_type_to_c "Int");
-  check_string "Int8 -> int8_t" "int8_t" (int_type_to_c "Int8");
-  check_string "UInt64 -> uint64_t" "uint64_t" (int_type_to_c "UInt64")
-
 (* ============================================================================
    map_type_expr
    ============================================================================ *)
@@ -605,7 +600,6 @@ let suite =
     ( "integer types",
       [
         Alcotest.test_case "type checks" `Quick test_integer_type_checks;
-        Alcotest.test_case "to C" `Quick test_int_type_to_c;
       ] );
     ("map_type_expr", [ Alcotest.test_case "mapping" `Quick test_map_type_expr ]);
     ( "dim values",

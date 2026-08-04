@@ -15,6 +15,7 @@ type callee_resolution = {
 }
 
 val strip_callable_id_suffix : string -> string
+val parse_ufcs_name : string -> (string * string) option
 
 val callable_origin_of_env :
   module_path:string option -> Env.func_origin -> Ast.callable_origin

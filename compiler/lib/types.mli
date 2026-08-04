@@ -86,6 +86,15 @@ val collect_type_param_candidates : type_expr -> string list
 val map_type_expr : (type_expr -> type_expr option) -> type_expr -> type_expr
 (** Generic recursive mapper for type expressions (bottom-up, single-pass) *)
 
+val normalize_builtin_type : type_expr -> type_expr
+(** Normalize source-level builtin aliases and refinements for semantic lookup. *)
+
+val impl_type_head_name : type_expr -> string option
+(** Return the concrete outer type name used to index trait implementations. *)
+
+val has_type_variables : type_expr -> bool
+(** Whether a type still contains unresolved type variables. *)
+
 val instantiate_type_params : string list -> type_expr -> type_expr
 (** Instantiate type parameter names as TyVar in a type expression *)
 
@@ -198,23 +207,14 @@ val is_signed_integer_type : type_expr -> bool
 val is_unsigned_integer_type : type_expr -> bool
 (** Check if a type is an unsigned integer type. *)
 
-val int_type_to_c : string -> string
-(** Map integer type name to C type string *)
-
 val int_type_range : string -> int64 * int64
 (** Range for compile-time literal checking *)
-
-val all_float_type_names : string list
-(** All float type names *)
 
 val is_float32_type : type_expr -> bool
 (** Check if a type is Float32. *)
 
 val is_float16_type : type_expr -> bool
 (** Check if a type is Float16. *)
-
-val float_type_to_c : string -> string
-(** Map float type name to C type string *)
 
 val ty_list : type_expr -> type_expr
 (** Create a List type *)
@@ -229,11 +229,6 @@ val is_global_abi_type_name : string -> bool
 (** True for type names whose runtime/language ABI is intentionally global.
     Stdlib modules may declare these without receiving a module-qualified
     identity; all other std types remain module-owned. *)
-
-val is_runtime_erased_payload_union_type_name : string -> bool
-(** True for union types whose payloads are constructed from runtime-erased
-    [void*] slots and therefore must keep erased payload storage until a
-    dedicated typed bridge exists. *)
 
 val canonical_module_type_name : module_path:string -> string -> string
 (** Canonical frontend identity for a type owned by a module. Stdlib ABI

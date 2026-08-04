@@ -46,14 +46,6 @@ let metadata ?(is_managed_name = fun _ -> false)
     ?(lookup_alias = fun _ -> None) () =
   { is_managed_name; is_value_record_name; is_enum_name; lookup_alias }
 
-let metadata_for_registry (reg : Codegen_types.registry) =
-  metadata
-    ~is_managed_name:(Codegen_types.is_managed_type reg)
-    ~is_value_record_name:(fun name -> Hashtbl.mem reg.value_records name)
-    ~is_enum_name:(fun name -> Hashtbl.mem reg.enum_types name)
-    ~lookup_alias:(fun name -> Hashtbl.find_opt reg.type_aliases name)
-    ()
-
 let layout_for_ownership = function
   | Managed -> { ownership = Managed; retain = ArcRetain; release = ArcRelease }
   | Unmanaged ->
@@ -99,8 +91,7 @@ let builtin_layout = function
 let apply_alias_subst params args body =
   let subst = List.combine params args in
   List.fold_left
-    (fun acc (param, arg) ->
-      Codegen_types.apply_codegen_subst [ (param, arg) ] acc)
+    (fun acc (param, arg) -> Types.apply_type_param_subst [ (param, arg) ] acc)
     body subst
 
 let apply_alias_if_arity_matches params args target =
@@ -172,9 +163,6 @@ let stack_result_layout (meta : metadata) (ty : Ast.type_expr) :
   | Core_result_layout.BoxedUnion _ | Core_result_layout.Unknown_named _
   | Core_result_layout.Invalid_result_type _ ->
       None
-
-let is_stack_result_type (meta : metadata) (ty : Ast.type_expr) : bool =
-  stack_result_layout meta ty <> None
 
 let classify (meta : metadata) (ty : Ast.type_expr) : classification =
   let rec go seen ty =

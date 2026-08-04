@@ -15,7 +15,7 @@ let source_call_name (name : string) : string =
     | Some idx -> String.sub name 0 idx
     | None -> name
   in
-  match Codegen_names.parse_ufcs_name without_def_id with
+  match Call_resolution.parse_ufcs_name without_def_id with
   | Some (_module_path, source_name) -> source_name
   | None -> without_def_id
 

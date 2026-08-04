@@ -239,12 +239,6 @@ let global_abi_type_names =
 
 let is_global_abi_type_name name = List.mem name global_abi_type_names
 
-let runtime_erased_payload_union_type_names =
-  [ "RecvAttempt"; "std/channel::RecvAttempt"; "std_channel__RecvAttempt" ]
-
-let is_runtime_erased_payload_union_type_name name =
-  List.mem name runtime_erased_payload_union_type_names
-
 let canonical_module_type_separator = "::"
 
 let canonical_module_type_name ~(module_path : string) (type_name : string) :
@@ -445,6 +439,40 @@ let rec map_type_expr (f : type_expr -> type_expr option) (ty : type_expr) :
     | other -> other
   in
   match f ty' with Some r -> r | None -> ty'
+
+(** Normalize source-level builtin aliases and refinements to the semantic type
+    used for trait lookup and runtime classification. *)
+let normalize_builtin_type ty =
+  map_type_expr
+    (function
+      | TyNamed (("Vector" | "Matrix"), args) ->
+          Some (TyNamed ("Tensor", args))
+      | TyNamed ("Tensor", [ elem ]) -> Some elem
+      | TyNamed ("LiteralString", []) -> Some (TyNamed ("String", []))
+      | _ -> None)
+    ty
+
+(** Return the concrete outer type name used to index trait implementations. *)
+let impl_type_head_name ty =
+  match normalize_builtin_type ty with
+  | TyArray _ -> Some array_head_name
+  | TyNamed (name, _) -> Some name
+  | TyTuple elems -> Some (Printf.sprintf "Tuple%d" (List.length elems))
+  | _ -> None
+
+(** True when a type still contains variables that must be resolved before
+    selecting a concrete implementation. *)
+let rec has_type_variables = function
+  | TyVar _ | TyBoundVar _ | TySelf | TyVarDims _ | TyMeta _ -> true
+  | TyNamed (_, args) -> List.exists has_type_variables args
+  | TyArray (elem, dims) ->
+      has_type_variables elem || List.exists has_type_variables dims
+  | TyTuple elems -> List.exists has_type_variables elems
+  | TyFunc { params; return; _ } ->
+      List.exists has_type_variables params || has_type_variables return
+  | TyRange inner -> has_type_variables inner
+  | TyDimOp (_, a, b) -> has_type_variables a || has_type_variables b
+  | TyConstInt _ -> false
 
 (** Collect free type variable names from a type expression.
     Handles both TyVar("T") from OCaml-constructed types and
@@ -1179,21 +1207,6 @@ let is_signed_integer_type ty = is_named_type_in signed_int_type_names ty
 (** Check if a type is an unsigned integer type. *)
 let is_unsigned_integer_type ty = is_named_type_in unsigned_int_type_names ty
 
-(** Map integer type name to C type string *)
-let int_type_to_c = function
-  | "Int" -> "long"
-  | "Int8" -> "int8_t"
-  | "Int16" -> "int16_t"
-  | "Int32" -> "int32_t"
-  | "Int64" -> "long"
-  | "Int128" -> "__int128"
-  | "UInt8" -> "uint8_t"
-  | "UInt16" -> "uint16_t"
-  | "UInt32" -> "uint32_t"
-  | "UInt64" -> "uint64_t"
-  | "UInt128" -> "unsigned __int128"
-  | n -> failwith (Printf.sprintf "int_type_to_c: not an integer type: %s" n)
-
 (** Range for compile-time literal checking. Int128/UInt128 use Int64 bounds as approximation. *)
 let int_type_range = function
   | "Int8" -> (Int64.of_int (-128), Int64.of_int 127)
@@ -1208,20 +1221,11 @@ let int_type_range = function
   | "UInt128" -> (Int64.zero, Int64.max_int) (* approximate *)
   | n -> failwith (Printf.sprintf "int_type_range: not an integer type: %s" n)
 
-let all_float_type_names = [ "Float"; "Float32"; "Float16" ]
-
 (** Check if a type is Float32 *)
 let is_float32_type = is_named_type_in [ "Float32" ]
 
 (** Check if a type is Float16 *)
 let is_float16_type = is_named_type_in [ "Float16" ]
-
-(** Map float type name to C type string *)
-let float_type_to_c = function
-  | "Float" -> "double"
-  | "Float32" -> "float"
-  | "Float16" -> "_Float16"
-  | n -> failwith (Printf.sprintf "float_type_to_c: not a float type: %s" n)
 
 (** Create a List type *)
 let ty_list elem = TyNamed ("List", [ elem ])
