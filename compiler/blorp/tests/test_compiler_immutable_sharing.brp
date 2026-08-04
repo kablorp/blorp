@@ -1,0 +1,187 @@
+import:
+	../src/stage_05_types/compiler_env:
+		CompilerFuncOrigin(CompilerUserDefinedFunc),
+		CompilerPurity(CompilerPure),
+		CompilerResourceArgPolicy(CompilerRejectResourceArgs),
+		CompilerTraitDef,
+		compiler_env_add_trait,
+		compiler_env_empty,
+		compiler_env_get_trait,
+		compiler_func_symbol,
+		compiler_trait_def,
+		compiler_trait_method_sig,
+	../src/stage_05_types/compiler_generic_params: compiler_make_bound_type_param
+	../src/stage_05_types/compiler_type:
+		CompilerType(
+			CompilerArrayType,
+			CompilerConstIntType,
+			CompilerFunctionType,
+			CompilerNamedType,
+		),
+		compiler_type_bool,
+		compiler_type_int,
+		compiler_type_string,
+		compiler_types_equal,
+	memory: get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+private pure func runtime_owned_string(text: String) -> String:
+	text.substring(0, text.length())
+
+
+private pure func nested_type_with_runtime_owned_names() -> CompilerType:
+	CompilerNamedType(runtime_owned_string("List"), [CompilerArrayType(
+				CompilerNamedType(runtime_owned_string("String"), []),
+				[CompilerConstIntType(4)],
+			)])
+
+
+private pure func trait_lookup_after_environment_release() -> Option[CompilerTraitDef]:
+	nested_type = nested_type_with_runtime_owned_names()
+	method = compiler_trait_method_sig(
+		runtime_owned_string("render"),
+		[nested_type],
+		nested_type,
+		True,
+	)
+	env = compiler_env_add_trait(
+		compiler_env_empty(),
+		compiler_trait_def(
+			103,
+			runtime_owned_string("Renderable"),
+			[runtime_owned_string("Stringable")],
+			[method],
+		),
+	)
+
+	compiler_env_get_trait(env, "Renderable")
+
+
+func test_trait_lookup_shares_without_deep_copy() -> Bool:
+	nested_type: CompilerType = CompilerNamedType(
+		"List",
+		[CompilerArrayType(compiler_type_string(), [CompilerConstIntType(4)])],
+	)
+	method = compiler_trait_method_sig("render", [nested_type], nested_type, True)
+	env = compiler_env_add_trait(
+		compiler_env_empty(),
+		compiler_trait_def(101, "Renderable", ["Stringable"], [method]),
+	)
+	reset_mem_stats()
+	found = compiler_env_get_trait(env, "Renderable")
+	stats = get_mem_stats()
+
+	match found:
+		Some(trait_def):
+			(
+				stats.total_allocations <= 1
+				and trait_def.name == "Renderable"
+				and trait_def.supertraits == ["Stringable"]
+				and match trait_def.methods.get(0):
+					Some(found_method):
+						found_method.name == "render" and compiler_types_equal(
+							found_method.params.get_or(0, compiler_type_int()),
+							nested_type,
+						) and compiler_types_equal(found_method.return_type, nested_type)
+					None:
+						False
+			)
+		None:
+			False
+
+
+func test_trait_lookup_retains_dynamic_values_and_preserves_cow() -> Bool:
+	expected_type: CompilerType = CompilerNamedType(
+		"List",
+		[CompilerArrayType(compiler_type_string(), [CompilerConstIntType(4)])],
+	)
+
+	match trait_lookup_after_environment_release():
+		Some(trait_def):
+			extended_methods = trait_def.methods.append(
+				compiler_trait_method_sig(
+					"extra",
+					[],
+					compiler_type_int(),
+					True,
+				),
+			)
+
+			match trait_def.methods.get(0):
+				Some(method):
+					(
+						trait_def.name == "Renderable"
+						and trait_def.supertraits == ["Stringable"]
+						and method.name == "render"
+						and compiler_types_equal(
+							method.params.get_or(0, compiler_type_int()),
+							expected_type,
+						)
+						and compiler_types_equal(method.return_type, expected_type)
+						and trait_def.methods.length() == 1
+						and extended_methods.length() == 2
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_function_symbol_shares_nested_values_without_deep_copy() -> Bool:
+	nested_type: CompilerType = CompilerFunctionType(
+		True,
+		[CompilerNamedType("List", [nested_type_with_runtime_owned_names()])],
+		compiler_type_bool(),
+	)
+	type_params = [compiler_make_bound_type_param("T", [])]
+	param_names = [Some("value")]
+	dim_constraints = [(nested_type, nested_type)]
+	reset_mem_stats()
+	symbol = compiler_func_symbol(
+		102,
+		nested_type,
+		type_params,
+		param_names,
+		CompilerPure,
+		CompilerUserDefinedFunc,
+		CompilerRejectResourceArgs,
+		None,
+		dim_constraints,
+		None,
+		False,
+	)
+	stats = get_mem_stats()
+
+	constraint_preserved = match symbol.dim_constraints.get(0):
+		Some(constraint):
+			(
+				compiler_types_equal(constraint[0], nested_type)
+				and compiler_types_equal(constraint[1], nested_type)
+			)
+		None:
+			False
+
+	(
+		stats.total_allocations <= 1
+		and compiler_types_equal(symbol.func_type, nested_type)
+		and symbol.type_params.length() == 1
+		and symbol.param_names == param_names
+		and constraint_preserved
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler immutable sharing",
+	tests = [
+		("trait lookup shares without deep copy", test_trait_lookup_shares_without_deep_copy),
+		(
+			"trait lookup retains dynamic values and preserves COW",
+			test_trait_lookup_retains_dynamic_values_and_preserves_cow,
+		),
+		(
+			"function symbol shares nested values without deep copy",
+			test_function_symbol_shares_nested_values_without_deep_copy,
+		),
+	]
+}

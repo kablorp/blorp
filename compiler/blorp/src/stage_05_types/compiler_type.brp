@@ -5,6 +5,9 @@ enum CompilerDimOp:
 	CompilerDimDivide
 
 
+-- Compiler types are immutable values. Phase boundaries share these trees and
+-- rely on ARC to retain them; only a transformation that changes a node should
+-- rebuild that node.
 union CompilerType:
 	CompilerNamedType(String, List[CompilerType])
 	CompilerArrayType(CompilerType, List[CompilerType])
@@ -91,49 +94,6 @@ pure func compiler_type_list(element: CompilerType) -> CompilerType:
 	CompilerNamedType("List", [element])
 
 
--- Semantic type transforms often keep both input and output live. Allocate an
--- independent name so rebuilding a CompilerType cannot borrow a matched
--- variant's string through the bootstrapped compiler's generated ownership.
-pure func compiler_type_name_copy(name: String) -> String:
-	name.substring(0, name.length())
-
-
-pure func compiler_type_copy(typ: CompilerType) -> CompilerType:
-	match typ:
-		CompilerNamedType(name, args):
-			CompilerNamedType(
-				compiler_type_name_copy(name),
-				args.map(compiler_type_copy),
-			)
-		CompilerArrayType(element, dims):
-			CompilerArrayType(
-				compiler_type_copy(element),
-				dims.map(compiler_type_copy),
-			)
-		CompilerFunctionType(is_pure, params, return_type):
-			CompilerFunctionType(
-				is_pure,
-				params.map(compiler_type_copy),
-				compiler_type_copy(return_type),
-			)
-		CompilerTypeVar(name):
-			CompilerTypeVar(compiler_type_name_copy(name))
-		CompilerConstIntType(value):
-			CompilerConstIntType(value)
-		CompilerTupleType(elements):
-			CompilerTupleType(elements.map(compiler_type_copy))
-		CompilerSelfType:
-			CompilerSelfType
-		CompilerVarDimsType(name):
-			CompilerVarDimsType(compiler_type_name_copy(name))
-		CompilerRangeType(inner):
-			CompilerRangeType(compiler_type_copy(inner))
-		CompilerDimOpType(op, left, right):
-			CompilerDimOpType(op, compiler_type_copy(left), compiler_type_copy(right))
-		CompilerMetaType(meta_id):
-			CompilerMetaType(meta_id)
-
-
 -- Parsed annotations retain source spelling, so an unbounded type parameter
 -- initially has the same shape as an ordinary nominal type. Semantic phases
 -- must make that identity explicit before nominal names and generic variables
@@ -175,11 +135,11 @@ private pure func compiler_type_instantiate_type_params_if_changed(
 	match typ:
 		CompilerNamedType(name, args):
 			if args.is_empty() and type_params.contains(name):
-				Some(CompilerTypeVar(compiler_type_name_copy(name)))
+				Some(CompilerTypeVar(name))
 			else:
 				match compiler_type_instantiate_type_param_list_if_changed(type_params, args):
 					Some(instantiated_args):
-						Some(CompilerNamedType(compiler_type_name_copy(name), instantiated_args))
+						Some(CompilerNamedType(name, instantiated_args))
 					None:
 						None
 		CompilerArrayType(element, dims):
@@ -281,16 +241,6 @@ pure func compiler_type_instantiate_type_params(
 				instantiated
 			None:
 				typ
-
-
--- Reconstruct optional types in their owning module so imported callers keep
--- the canonical CompilerType identity through self-hosted generic inference.
-pure func compiler_optional_type_copy(value: Option[CompilerType]) -> Option[CompilerType]:
-	match value:
-		Some(typ):
-			Some(compiler_type_copy(typ))
-		None:
-			None
 
 
 pure func compiler_type_contains_meta(typ: CompilerType) -> Bool:
@@ -523,7 +473,7 @@ pure func compiler_qualify_module_local_types(
 			):
 				compiler_canonical_module_type_name(module_path, name)
 			else:
-				compiler_type_name_copy(name)
+				name
 
 			CompilerNamedType(
 				next_name,
@@ -573,7 +523,7 @@ pure func compiler_qualify_module_local_types(
 				compiler_qualify_module_local_types(module_path, local_type_names, right),
 			)
 		_:
-			compiler_type_copy(typ)
+			typ
 
 
 pure func compiler_display_type_name(name: String) -> String:
